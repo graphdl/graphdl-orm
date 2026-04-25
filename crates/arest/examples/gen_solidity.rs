@@ -17,22 +17,6 @@ use arest::parse_forml2;
 use arest::ast;
 use arest::generators::solidity;
 
-// The bundled metamodel readings. User readings parse on top of these
-// so SM wiring like "State Machine Definition 'Order' is for Noun 'Order'"
-// resolves with the correct role nouns (State Machine Definition, Noun)
-// rather than collapsing to two Order roles.
-const METAMODEL_READINGS: &[(&str, &str)] = &[
-    ("core",          include_str!("../../../readings/core.md")),
-    ("state",         include_str!("../../../readings/state.md")),
-    ("instances",     include_str!("../../../readings/instances.md")),
-    ("outcomes",      include_str!("../../../readings/outcomes.md")),
-    ("validation",    include_str!("../../../readings/validation.md")),
-    ("evolution",     include_str!("../../../readings/evolution.md")),
-    ("organizations", include_str!("../../../readings/organizations.md")),
-    ("agents",        include_str!("../../../readings/agents.md")),
-    ("ui",            include_str!("../../../readings/ui.md")),
-];
-
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -52,7 +36,12 @@ fn main() {
     // metamodel can redeclare its own nouns across files. The guard is
     // only needed for user-domain compiles.
     parse_forml2::set_bootstrap_mode(true);
-    let meta_state = METAMODEL_READINGS.iter().fold(ast::Object::phi(), |acc, (name, text)| {
+    // The bundled metamodel readings. User readings parse on top of these
+    // so SM wiring like "State Machine Definition 'Order' is for Noun 'Order'"
+    // resolves with the correct role nouns (State Machine Definition, Noun)
+    // rather than collapsing to two Order roles.
+    let meta_state = arest::metamodel_readings().into_iter().fold(ast::Object::phi(), |acc, r| {
+        let (name, text) = (r.0, r.1);
         match parse_forml2::parse_to_state_from(text, &acc) {
             Ok(parsed) => ast::merge_states(&acc, &parsed),
             Err(e) => {

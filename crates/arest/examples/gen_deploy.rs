@@ -15,18 +15,6 @@ use std::path::PathBuf;
 use arest::parse_forml2;
 use arest::ast;
 
-const METAMODEL_READINGS: &[(&str, &str)] = &[
-    ("core",          include_str!("../../../readings/core.md")),
-    ("state",         include_str!("../../../readings/state.md")),
-    ("instances",     include_str!("../../../readings/instances.md")),
-    ("outcomes",      include_str!("../../../readings/outcomes.md")),
-    ("validation",    include_str!("../../../readings/validation.md")),
-    ("evolution",     include_str!("../../../readings/evolution.md")),
-    ("organizations", include_str!("../../../readings/organizations.md")),
-    ("agents",        include_str!("../../../readings/agents.md")),
-    ("ui",            include_str!("../../../readings/ui.md")),
-];
-
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -42,7 +30,8 @@ fn main() {
     }
 
     parse_forml2::set_bootstrap_mode(true);
-    let meta_state = METAMODEL_READINGS.iter().fold(ast::Object::phi(), |acc, (name, text)| {
+    let meta_state = arest::metamodel_readings().into_iter().fold(ast::Object::phi(), |acc, r| {
+        let (name, text) = (r.0, r.1);
         parse_forml2::parse_to_state_from(text, &acc)
             .map(|p| ast::merge_states(&acc, &p))
             .unwrap_or_else(|e| {
