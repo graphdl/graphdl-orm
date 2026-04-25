@@ -576,6 +576,22 @@ fn kernel_run_uefi(
         None => println!("  virtio-net: no device / init failed"),
     }
 
+    // #359: hand the discovered virtio-net device to smoltcp. Mirrors
+    // the BIOS arm's wiring (main.rs `kernel_run`):
+    //   `net::init(try_init_virtio_net().map(VirtioPhy::new))`
+    // — wraps the NIC in the `smoltcp::phy::Device` adapter, builds
+    // the Interface + SocketSet behind a Mutex, and registers the
+    // DHCPv4 socket so a real lease drops in once a server responds.
+    // When no virtio-net is present the call falls back to a Loopback
+    // device bound to 127.0.0.1/8, so the in-guest HTTP smoke (#360)
+    // still has a reachable address. Must run BEFORE any
+    // `register_http` so the listener has a live `NetState` to attach
+    // to. Polling-only — the timer IRQ doesn't drive smoltcp yet (the
+    // BIOS arm runs the same way for now).
+    let virtio_phy = virtio_net_dev.map(crate::virtio::VirtioPhy::new);
+    crate::net::init(virtio_phy);
+    println!("  net:      smoltcp interface live (DHCPv4 pending)");
+
     let virtio_blk_dev = crate::virtio::try_init_virtio_blk();
     match &virtio_blk_dev {
         Some(d) => {
