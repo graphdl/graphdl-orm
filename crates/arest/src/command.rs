@@ -1598,6 +1598,154 @@ pub fn wine_prefix_for_json(state: &ast::Object, body: &str) -> String {
     }
 }
 
+// =====================================================================
+// wine_app_by_name (#503) — name → (app id, prefix Directory) lookup
+//                           the `arest run "App Name"` CLI dispatches on
+// =====================================================================
+//
+// Sibling of `wine_prefix_for` above. Where `wine_prefix_for` takes an
+// already-resolved Wine App slug and returns its prefix Directory,
+// `wine_app_by_name` takes whatever string the user typed at the
+// command line (`arest run "Notepad++"` — display title; or
+// `arest run "notepad-plus-plus"` — the slug itself, i.e. the
+// `.Name` reference mode value) and resolves it into the same
+// (app id, prefix Directory id) pair.
+//
+// Two acceptance paths:
+//
+//   1. Exact match against the Wine App's `.Name` reference value
+//      (its slug). Per #481 the slug is the cell-binding subject for
+//      every `Wine App` fact (e.g. `Wine_App_has_Compat_Rating`'s
+//      `Wine App` binding key). We collect the distinct slugs from
+//      whichever mandatory-cardinality cell is present; the `Wine App
+//      has Compat Rating` constraint guarantees `Wine_App_has_Compat_Rating`
+//      carries one fact per declared app. (The spec brief mentioned
+//      a `Wine_App_has_Name` cell — that cell does not actually exist
+//      because Wine App's reference scheme is arity-1, so no compound-
+//      ref decomposition fires; the slug is recovered from the subject
+//      bindings of any populated cell instead. Honours OOOO's #481
+//      finding that `instance_fact_field_cells` keys instance-fact
+//      bindings by the bare noun name `Wine App`, not by a fuller
+//      role reference.)
+//
+//   2. Exact match against the human-readable display title (the
+//      `display- Title` value, e.g. `'Notepad++'`). The parser today
+//      mis-buckets this into a malformed cell name `has display-
+//      Title 'Notepad++'` (the verb-token-fallback branch in
+//      `translate_instance_facts_with_ft_ids` when no canonical
+//      `Wine_App_has_Title` FT is recognised); we walk those
+//      malformed cell names to recover the (slug, title) pairs.
+//      Once the parser learns to fold display- titles into a clean
+//      `Wine_App_has_Title` cell this branch can collapse to a
+//      one-line lookup.
+//
+// Both paths return `(app_id, prefix_dir_id)` so the caller can hand
+// both to the Platform fns (`zip_directory(prefix_id)`,
+// `wine_prefix_for(app_id)`, future winetricks-bootstrap). Returns
+// `None` if neither path matches; the CLI's near-name suggester
+// (Levenshtein over the slug + title set, see `crates/arest/src/cli/run.rs`)
+// runs as the fallback.
+//
+// Read-only: no state mutation, no Platform fn calls.
+
+/// Return every Wine App slug declared in the population, sorted.
+///
+/// Pulls from `Wine_App_has_Compat_Rating` (the mandatory-cardinality
+/// cell — "Each Wine App has exactly one Compat Rating." in
+/// `readings/compat/wine.md`), so every declared app contributes
+/// exactly one entry. Falls back to scanning every cell whose facts
+/// carry a `Wine App` binding when the Compat Rating cell is empty
+/// (e.g. an in-flight migration where the rating fact-type has been
+/// renamed but the apps are still in the population).
+pub fn wine_app_ids(state: &ast::Object) -> Vec<String> {
+    let mut seen: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+    let cell = ast::fetch_or_phi("Wine_App_has_Compat_Rating", state);
+    if let Some(seq) = cell.as_seq() {
+        for fact in seq.iter() {
+            if let Some(slug) = ast::binding(fact, "Wine App") {
+                if !slug.is_empty() {
+                    seen.insert(slug.to_string());
+                }
+            }
+        }
+    }
+    if seen.is_empty() {
+        // Fallback: scan every cell for `Wine App` subject bindings.
+        for (_name, contents) in ast::cells_iter(state) {
+            if let Some(seq) = contents.as_seq() {
+                for fact in seq.iter() {
+                    if let Some(slug) = ast::binding(fact, "Wine App") {
+                        if !slug.is_empty() {
+                            seen.insert(slug.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out: Vec<String> = seen.into_iter().collect();
+    out.sort();
+    out
+}
+
+/// Return the display title for a Wine App slug, if one was declared.
+///
+/// Walks the mis-bucketed `has display- Title '<Title>'` cells the
+/// parser currently emits (see the module-level note above).
+/// Returns `None` if no matching cell is found OR if the slug isn't
+/// a known Wine App.
+pub fn wine_app_display_title(state: &ast::Object, slug: &str) -> Option<String> {
+    for (name, contents) in ast::cells_iter(state) {
+        // Cell name shape: `has display- Title '<actual title>'`
+        let prefix = "has display- Title '";
+        if !name.starts_with(prefix) || !name.ends_with('\'') {
+            continue;
+        }
+        let title = &name[prefix.len()..name.len() - 1];
+        if let Some(seq) = contents.as_seq() {
+            for fact in seq.iter() {
+                if ast::binding(fact, "Wine App") == Some(slug) {
+                    return Some(title.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a user-supplied name into a `(slug, prefix Directory id)`
+/// pair, or `None` on miss.
+///
+/// Tries (in order) exact match against the `.Name` reference (slug)
+/// and exact match against the display title. Returns `None` when
+/// neither matches; the CLI fallback layer (`cli::run::suggest_near_name`)
+/// then runs Levenshtein over the same (slug + title) set to surface a
+/// "did you mean…" hint.
+///
+/// Pairs `wine_prefix_for` with the slug to produce the prefix
+/// Directory id alongside the slug, so callers (the future Wine
+/// runtime layer in #504) can hand both to Platform fns without a
+/// second cell read.
+pub fn wine_app_by_name(state: &ast::Object, name: &str) -> Option<(String, String)> {
+    let known = wine_app_ids(state);
+    // Path 1: exact slug.
+    if known.iter().any(|id| id == name) {
+        let prefix = wine_prefix_for(state, name)?;
+        return Some((name.to_string(), prefix));
+    }
+    // Path 2: exact display title (case-sensitive match against the
+    // mis-bucketed `has display- Title '<X>'` cell names).
+    for slug in &known {
+        if let Some(title) = wine_app_display_title(state, slug) {
+            if title == name {
+                let prefix = wine_prefix_for(state, slug)?;
+                return Some((slug.clone(), prefix));
+            }
+        }
+    }
+    None
+}
+
 // -- Tests ------------------------------------------------------------
 
 #[cfg(test)]
@@ -2752,4 +2900,193 @@ Each Order is created by exactly one User.
             );
         }
     }
+
+    // ── wine_app_by_name (#503) ────────────────────────────────────────
+
+    /// Build a minimal D containing two Wine Apps, each with the
+    /// hand-pushed `Wine_App_has_Compat_Rating` and
+    /// `Wine_App_has_prefix_Directory` bindings the readings would
+    /// produce. Mirrors the shape `instance_fact_field_cells` emits
+    /// (subject keyed by the `Wine App` noun name) so the lookup
+    /// helper can operate on a synthesized state without paying the
+    /// full readings parse cost.
+    fn seeded_wine_app_state() -> ast::Object {
+        let d = ast::Object::phi();
+        // notepad-plus-plus
+        let d = ast::cell_push(
+            "Wine_App_has_Compat_Rating",
+            ast::fact_from_pairs(&[
+                ("Wine App", "notepad-plus-plus"),
+                ("Compat Rating", "gold"),
+            ]),
+            &d,
+        );
+        let d = ast::cell_push(
+            "Wine_App_has_prefix_Directory",
+            ast::fact_from_pairs(&[
+                ("Wine App", "notepad-plus-plus"),
+                ("Directory", "notepad-plus-plus-prefix"),
+            ]),
+            &d,
+        );
+        let d = ast::cell_push(
+            "has display- Title 'Notepad++'",
+            ast::fact_from_pairs(&[
+                ("Wine App", "notepad-plus-plus"),
+                ("has display- Title 'Notepad++'", ""),
+            ]),
+            &d,
+        );
+        // photoshop-cs6
+        let d = ast::cell_push(
+            "Wine_App_has_Compat_Rating",
+            ast::fact_from_pairs(&[
+                ("Wine App", "photoshop-cs6"),
+                ("Compat Rating", "gold"),
+            ]),
+            &d,
+        );
+        let d = ast::cell_push(
+            "Wine_App_has_prefix_Directory",
+            ast::fact_from_pairs(&[
+                ("Wine App", "photoshop-cs6"),
+                ("Directory", "photoshop-cs6-prefix"),
+            ]),
+            &d,
+        );
+        ast::cell_push(
+            "has display- Title 'Adobe Photoshop CS6'",
+            ast::fact_from_pairs(&[
+                ("Wine App", "photoshop-cs6"),
+                ("has display- Title 'Adobe Photoshop CS6'", ""),
+            ]),
+            &d,
+        )
+    }
+
+    #[test]
+    fn wine_app_ids_returns_distinct_sorted_slugs() {
+        let state = seeded_wine_app_state();
+        let ids = wine_app_ids(&state);
+        assert_eq!(ids, vec!["notepad-plus-plus".to_string(),
+                             "photoshop-cs6".to_string()]);
+    }
+
+    #[test]
+    fn wine_app_ids_empty_for_phi_state() {
+        let state = ast::Object::phi();
+        assert!(wine_app_ids(&state).is_empty());
+    }
+
+    #[test]
+    fn wine_app_by_name_resolves_exact_slug() {
+        let state = seeded_wine_app_state();
+        assert_eq!(
+            wine_app_by_name(&state, "notepad-plus-plus"),
+            Some(("notepad-plus-plus".to_string(),
+                  "notepad-plus-plus-prefix".to_string())),
+        );
+        assert_eq!(
+            wine_app_by_name(&state, "photoshop-cs6"),
+            Some(("photoshop-cs6".to_string(),
+                  "photoshop-cs6-prefix".to_string())),
+        );
+    }
+
+    #[test]
+    fn wine_app_by_name_resolves_display_title() {
+        let state = seeded_wine_app_state();
+        // Display title — falls through to the `has display- Title '<X>'`
+        // cell scan.
+        assert_eq!(
+            wine_app_by_name(&state, "Notepad++"),
+            Some(("notepad-plus-plus".to_string(),
+                  "notepad-plus-plus-prefix".to_string())),
+        );
+        assert_eq!(
+            wine_app_by_name(&state, "Adobe Photoshop CS6"),
+            Some(("photoshop-cs6".to_string(),
+                  "photoshop-cs6-prefix".to_string())),
+        );
+    }
+
+    #[test]
+    fn wine_app_by_name_returns_none_for_unknown() {
+        let state = seeded_wine_app_state();
+        assert!(wine_app_by_name(&state, "nope").is_none());
+        assert!(wine_app_by_name(&state, "Notpad++").is_none());
+    }
+
+    #[test]
+    fn wine_app_display_title_returns_none_for_unknown_slug() {
+        let state = seeded_wine_app_state();
+        assert!(wine_app_display_title(&state, "no-such-app").is_none());
+    }
+
+    /// End-to-end: load wine.md (with filesystem.md preloaded for the
+    /// `Directory` noun) and confirm `wine_app_by_name` resolves both
+    /// known slugs and known display titles. Mirrors the shape of
+    /// `wine_prefix_for_resolves_every_seeded_wine_app` above.
+    #[cfg(feature = "compat-readings")]
+    #[test]
+    fn wine_app_by_name_resolves_every_seeded_wine_app() {
+        let filesystem_md = include_str!("../../../readings/os/filesystem.md");
+        let wine_md = include_str!("../../../readings/compat/wine.md");
+        let fs_state = crate::parse_forml2::parse_to_state(filesystem_md)
+            .expect("filesystem.md must parse cleanly");
+        let state = crate::parse_forml2::parse_to_state_from(wine_md, &fs_state)
+            .expect("wine.md must parse cleanly with filesystem.md preloaded");
+
+        // Slug lookups — the .Name reference value resolves directly.
+        let slug_expectations: &[(&str, &str)] = &[
+            ("notepad-plus-plus",  "notepad-plus-plus-prefix"),
+            ("office-2016-word",   "office-2016-word-prefix"),
+            ("photoshop-cs6",      "photoshop-cs6-prefix"),
+            ("autohotkey-v1",      "autohotkey-v1-prefix"),
+            ("notion-desktop",     "notion-desktop-prefix"),
+            ("total-commander",    "total-commander-prefix"),
+            ("vscode",             "vscode-prefix"),
+            ("spotify",            "spotify-prefix"),
+            ("steam-windows",      "steam-windows-prefix"),
+            ("7-zip",              "7-zip-prefix"),
+        ];
+        for (slug, expected_dir) in slug_expectations {
+            let resolved = wine_app_by_name(&state, slug);
+            assert_eq!(
+                resolved.as_ref().map(|(s, d)| (s.as_str(), d.as_str())),
+                Some((*slug, *expected_dir)),
+                "slug `{slug}` must resolve via wine_app_by_name",
+            );
+        }
+
+        // Display-title lookups — the human-readable name resolves to
+        // the same (slug, prefix) pair via the title-scan path.
+        let title_expectations: &[(&str, &str, &str)] = &[
+            ("Notepad++",                  "notepad-plus-plus", "notepad-plus-plus-prefix"),
+            ("Microsoft Word 2016",        "office-2016-word",  "office-2016-word-prefix"),
+            ("Adobe Photoshop CS6",        "photoshop-cs6",     "photoshop-cs6-prefix"),
+            ("AutoHotkey 1.x",             "autohotkey-v1",     "autohotkey-v1-prefix"),
+            ("Notion",                     "notion-desktop",    "notion-desktop-prefix"),
+            ("Total Commander",            "total-commander",   "total-commander-prefix"),
+            ("Visual Studio Code",         "vscode",            "vscode-prefix"),
+            ("Spotify",                    "spotify",           "spotify-prefix"),
+            ("Steam (Windows client)",     "steam-windows",     "steam-windows-prefix"),
+            ("7-Zip",                      "7-zip",             "7-zip-prefix"),
+        ];
+        for (title, expected_slug, expected_dir) in title_expectations {
+            let resolved = wine_app_by_name(&state, title);
+            assert_eq!(
+                resolved.as_ref().map(|(s, d)| (s.as_str(), d.as_str())),
+                Some((*expected_slug, *expected_dir)),
+                "display title `{title}` must resolve via wine_app_by_name",
+            );
+        }
+
+        // Unknown name — neither slug nor title.
+        assert!(wine_app_by_name(&state, "no-such-app").is_none());
+        // Typo — exact match miss; the CLI's Levenshtein layer handles
+        // suggestion separately.
+        assert!(wine_app_by_name(&state, "Notpad++").is_none());
+    }
+
 }
