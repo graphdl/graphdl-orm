@@ -1,0 +1,245 @@
+// crates/arest-kernel/ui/apps/AppLauncher.slint
+//
+// AREST kernel — boot-UI splash + app launcher (#431 Track UUU).
+//
+// First Slint surface visible after kernel init. Replaces the BIOS-era
+// text REPL drainer at the bottom of `kernel_run_uefi` (GGG #365).
+// Two large icon-buttons inside a centred Card route to the previously-
+// built apps:
+//
+//   * "HATEOAS Browser" → `crate::ui_apps::hateoas::build_app()`
+//     (Track SSS #429, three-pane resource browser)
+//   * "REPL"            → `crate::ui_apps::repl::build_app()`
+//     (Track TTT #430, scrollback + history line editor)
+//
+// The Rust glue (`crate::ui_apps::launcher`) wires the two callbacks
+// (`open-hateoas`, `open-repl`) to a small navigation state machine
+// that hides the launcher, shows the chosen app, and reverses on
+// Esc. Esc on the launcher itself is a no-op (we're already at the
+// root; nothing to pop to).
+//
+// Visual style: full-screen surface in `Theme.surface`, with a
+// centred Card containing:
+//   * "AREST" wordmark in `Theme.type-display` (Inter 600, 36px)
+//   * One-line tagline below in `Theme.type-body` muted
+//   * Two icon-buttons stacked vertically in the Card body, each
+//     showing a placeholder glyph (simple unicode square — a real
+//     Lucide SVG can land later via `@image-url("../../assets/
+//     icons/lucide/folder.svg")`; this commit avoids the SVG path
+//     to keep the slint-build graph predictable)
+//
+// Multi-entry pattern: per Track SSS's #429 convention, this file is
+// re-exported via `HateoasBrowser.slint` (the slint-build entry) so
+// the slint compiler walks the import graph and emits AppLauncher
+// alongside HateoasBrowser + Repl + AppShell into the single
+// generated `HateoasBrowser.rs` reached by `slint::include_modules!()`
+// in `arch/uefi/slint_backend.rs`. No `build.rs` change needed.
+
+import { AppShell, Theme, ThemeMode } from "../AppShell.slint";
+import { Button, ButtonVariant } from "../components/Button.slint";
+import { Card } from "../components/Card.slint";
+
+export component AppLauncher inherits Window {
+    // ---- Callbacks (Rust glue navigates) --------------------------
+
+    // Fired when the user clicks the "HATEOAS Browser" button. Rust
+    // glue (`launcher.rs`) hides this window and shows
+    // `crate::ui_apps::hateoas::build_app()`'s window.
+    callback open-hateoas();
+
+    // Fired when the user clicks the "REPL" button. Rust glue hides
+    // this window and shows `crate::ui_apps::repl::build_app()`'s
+    // window.
+    callback open-repl();
+
+    // Theme toggle, surfaced through the top bar so the user can
+    // flip dark/light at the splash. Mirrors HateoasBrowser / Repl —
+    // the actual mode flip happens inside `Theme.toggle-mode()`;
+    // this callback is the host's hook for persisting the choice
+    // later.
+    callback theme-toggled();
+
+    title: "AREST";
+    background: Theme.surface;
+    default-font-family: Theme.type-body.family;
+    default-font-size: Theme.type-body.size;
+    preferred-width: 1024px;
+    preferred-height: 720px;
+
+    VerticalLayout {
+        spacing: 0px;
+
+        // ----- Top bar: brand + theme toggle ------------------------
+        // Mirrors the top bars used by HateoasBrowser + Repl so the
+        // three surfaces feel continuous; sharing the tokens
+        // (neutral-100, border, type-h2, spacing-lg) keeps the visual
+        // continuity without an architectural dependency on AppShell
+        // (whose VerticalLayout content slot would compete with this
+        // window's centred-card body).
+        Rectangle {
+            background: Theme.neutral-100;
+            min-height: 56px;
+
+            HorizontalLayout {
+                padding-left: Theme.spacing-lg;
+                padding-right: Theme.spacing-lg;
+                padding-top: Theme.spacing-md;
+                padding-bottom: Theme.spacing-md;
+                spacing: Theme.spacing-md;
+                alignment: space-between;
+
+                Text {
+                    text: "AREST";
+                    color: Theme.text-primary;
+                    font-family: Theme.type-h2.family;
+                    font-weight: Theme.type-h2.weight;
+                    font-size: Theme.type-h2.size;
+                    vertical-alignment: center;
+                }
+
+                Button {
+                    text: Theme.mode == ThemeMode.dark ? "Light" : "Dark";
+                    variant: ButtonVariant.ghost;
+                    clicked => {
+                        Theme.toggle-mode();
+                        root.theme-toggled();
+                    }
+                }
+            }
+
+            // 1px bottom border.
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: Theme.border;
+            }
+        }
+
+        // ----- Body: centred splash card ----------------------------
+        // Vertical-stretch pushes this region to fill the space
+        // between the top bar and the status footer; the inner
+        // VerticalLayout uses `alignment: center` so the Card lands
+        // mid-viewport regardless of the actual framebuffer
+        // dimensions captured at boot (different OVMF / panel sizes
+        // would otherwise produce a top-aligned card hugging the
+        // header).
+        Rectangle {
+            background: Theme.surface;
+            vertical-stretch: 1;
+
+            VerticalLayout {
+                alignment: center;
+                padding: Theme.spacing-3xl;
+
+                HorizontalLayout {
+                    alignment: center;
+
+                    Rectangle {
+                        // Fixed Card width keeps the splash readable
+                        // on wide framebuffers (1280+) without the
+                        // buttons stretching across the full width.
+                        width: 480px;
+
+                        Card {
+                            title: "";
+
+                            VerticalLayout {
+                                spacing: Theme.spacing-lg;
+                                padding: Theme.spacing-lg;
+
+                                // Wordmark.
+                                Text {
+                                    text: "AREST";
+                                    color: Theme.text-primary;
+                                    font-family: Theme.type-display.family;
+                                    font-weight: Theme.type-display.weight;
+                                    font-size: Theme.type-display.size;
+                                    horizontal-alignment: center;
+                                }
+
+                                // Tagline. Theme-muted body text.
+                                Text {
+                                    text: "Choose an app to launch";
+                                    color: Theme.text-muted;
+                                    font-family: Theme.type-body.family;
+                                    font-weight: Theme.type-body.weight;
+                                    font-size: Theme.type-body.size;
+                                    horizontal-alignment: center;
+                                }
+
+                                // Spacer between tagline and buttons.
+                                Rectangle {
+                                    height: Theme.spacing-md;
+                                }
+
+                                // ----- App buttons --------------------
+                                // Each button is the standard Button
+                                // component (primary variant for
+                                // emphasis), but with a richer label
+                                // including a leading glyph + name.
+                                // The glyph is a plain unicode character
+                                // (folder, terminal) so we don't pull
+                                // in the SVG icon pipeline yet — the
+                                // BitmapFont atlas already includes
+                                // these codepoints via the design-token
+                                // import of Inter.
+                                //
+                                // A future revision can swap the leading
+                                // glyph for `@image-url(
+                                // "../../assets/icons/lucide/folder.svg"
+                                // )` once the slint compiler's SVG
+                                // pipeline is verified against the no_std
+                                // build (the `EmbedForSoftwareRenderer`
+                                // mode rasterises SVGs at compile time
+                                // into a BitmapImage, so it should work,
+                                // but no kernel app exercises that path
+                                // today — keeping splash on the proven
+                                // text path).
+                                Button {
+                                    text: "HATEOAS Browser";
+                                    variant: ButtonVariant.primary;
+                                    clicked => { root.open-hateoas(); }
+                                }
+
+                                Button {
+                                    text: "REPL";
+                                    variant: ButtonVariant.primary;
+                                    clicked => { root.open-repl(); }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ----- Status footer ----------------------------------------
+        Rectangle {
+            background: Theme.neutral-100;
+            min-height: 28px;
+
+            // 1px top border.
+            Rectangle {
+                y: 0;
+                height: 1px;
+                background: Theme.border;
+            }
+
+            HorizontalLayout {
+                padding-left: Theme.spacing-lg;
+                padding-right: Theme.spacing-lg;
+                padding-top: Theme.spacing-xs;
+                padding-bottom: Theme.spacing-xs;
+
+                Text {
+                    text: "Launcher • Click an app to open • Esc inside an app returns here";
+                    color: Theme.text-muted;
+                    font-family: Theme.type-caption.family;
+                    font-weight: Theme.type-caption.weight;
+                    font-size: Theme.type-caption.size;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

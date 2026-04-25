@@ -56,12 +56,23 @@ import { List, ListItem } from "../components/List.slint";
 // AppShell — keeps the kernel on a single slint-build invocation
 // without a build.rs change.
 import { Repl } from "./Repl.slint";
+// Track UUU #431: same re-export trick for the boot launcher splash.
+// Pulling AppLauncher into this entry's import graph causes the slint
+// compiler to emit `AppLauncher` into the generated
+// `HateoasBrowser.rs`, so `crate::arch::uefi::slint_backend::
+// AppLauncher` is reachable from `crate::ui_apps::launcher` without
+// adding a second `slint_build::compile_with_config` call to
+// `build.rs` (Slint v1.16's `SLINT_INCLUDE_GENERATED` env var only
+// keeps the LAST compiled file reachable through `include_modules!()`,
+// so a second build call would clobber HateoasBrowser).
+import { AppLauncher } from "./AppLauncher.slint";
 
 // Re-export AppShell + Theme so the existing slint_backend.rs smoke
 // test (which constructs `AppShell::new()` after `slint::include_modules!()`)
 // keeps compiling without touching that file. `Repl` is re-exported
-// for `crate::ui_apps::repl` (Track TTT #430) for the same reason.
-export { AppShell, Theme, ThemeMode, Repl }
+// for `crate::ui_apps::repl` (Track TTT #430) and `AppLauncher` for
+// `crate::ui_apps::launcher` (Track UUU #431) for the same reason.
+export { AppShell, Theme, ThemeMode, Repl, AppLauncher }
 
 // The HATEOAS browser window. The Rust glue (`ui_apps::hateoas`) sets
 // the four `*-model` properties from `system::with_state`, and the

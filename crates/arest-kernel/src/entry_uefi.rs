@@ -1198,49 +1198,41 @@ fn kernel_run_uefi(
     // keyboard REPL online (#183)" line so a smoke harness can
     // pattern-match the same family of phrases on either path.
     println!("  repl:     line-buffered keyboard REPL online (#183/#365)");
-    println!("  next:        kernel_run handoff (step 4d)");
+    println!("  ui:       launcher running (HATEOAS + REPL)");
     println!();
 
-    // Print initial prompt — REPL is now live.
+    // Track GGG #365 used to print "next: kernel_run handoff
+    // (step 4d)" here and then enter a `loop { read_keystroke();
+    // repl::process_key(ch); net::poll(); pause }` drainer that
+    // never returned. Track UUU #431 replaces that with the Slint
+    // boot launcher: the AppLauncher splash routes to the previously
+    // built HateoasBrowser (#429 / SSS) and Repl (#430 / TTT) Slint
+    // apps. Keystrokes now route through
+    // `arch::uefi::slint_input::drain_keyboard_into_slint_window`
+    // (Track QQ #428) — the BIOS-style `repl::process_key` direct
+    // path is no longer called from this entry point. The text
+    // REPL surface is now reachable as the Slint REPL app inside
+    // the launcher.
+    //
+    // `repl::init()` is still called above (via the banner line) —
+    // it sets up the static line buffer that `repl::dispatch` and
+    // `repl::evaluate_line` both consume; nothing in the call chain
+    // changed there. The Slint REPL app calls `repl::evaluate_line`
+    // for each submitted line; the BIOS-style `repl::process_key`
+    // shim stays available for any future caller (e.g. a serial-
+    // console fallback).
     crate::repl::init();
 
-    // Drain loop: pull `DecodedKey::Unicode` entries off the
-    // keyboard ring and forward them to the REPL's line editor.
-    // `read_keystroke()` is non-blocking and returns `None` when
-    // the ring is empty; in the smoke harness (no keyboard input
-    // wired) this loop just spins forever on `pause`, which is
-    // fine — the boot banners above prove the bring-up worked.
-    //
-    // We deliberately do NOT call `arch::halt_forever()` here:
-    // that helper just `pause`-loops with no ring drain, so a
-    // human typing into QEMU's serial would never reach the REPL.
-    // This loop is the same shape `halt_forever` will eventually
-    // grow once the BIOS arm widens its idle path to drain shared
-    // ring buffers; until then it stays scoped to the UEFI entry.
-    //
-    // `RawKey` variants (function keys, arrows, etc.) are
-    // intentionally dropped — the REPL line editor only handles
-    // Unicode characters today, matching the BIOS path's filter
-    // in `arch::x86_64::interrupts::keyboard_handler`.
-    loop {
-        if let Some(pc_keyboard::DecodedKey::Unicode(ch)) =
-            crate::arch::keyboard::read_keystroke()
-        {
-            crate::repl::process_key(ch);
-        }
-        // #360 follow-up: drive smoltcp + the HTTP listener every
-        // tick of the drainer. Mirrors the BIOS arm's
-        // `arch::x86_64::halt_forever` shape (which busy-polls
-        // `net::poll()` because the keyboard IRQ is the only PIC
-        // line unmasked there). Without this, the listener
-        // registered above silently sits in `Listen` forever and
-        // generic `/api/*` routes would never reach
-        // `arest_http_handler`. Cheap when idle: `poll` early-
-        // returns when no socket woke up.
-        crate::net::poll();
-        // SAFETY: `pause` is documented as always safe; it hints
-        // the CPU that this loop is busy-waiting, reducing power
-        // draw and SMT-sibling contention without blocking IRQs.
-        unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
-    }
+    // Hand off to the Slint event loop. `launcher::run(...)` never
+    // returns. The framebuffer descriptor here is the same one the
+    // gop banner above logged; passing it down (rather than
+    // re-reading from `framebuffer::info()`) keeps the launcher's
+    // `FramebufferBackend` independent of the `framebuffer` module's
+    // singleton — the launcher writes to the GOP MMIO directly via
+    // its own `*mut u8` view, and `framebuffer` retains its
+    // `&'static mut [u8]` for any pre-launcher draws (the paint
+    // smoke + Doom blit smoke above already ran).
+    crate::ui_apps::launcher::run(
+        gop_w, gop_h, gop_stride, gop_fmt_idx, gop_ptr,
+    );
 }

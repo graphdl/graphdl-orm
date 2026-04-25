@@ -23,4 +23,5 @@
 // screen at boot.
 
 pub mod hateoas;
+pub mod launcher;
 pub mod repl;
