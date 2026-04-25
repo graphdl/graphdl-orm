@@ -393,7 +393,7 @@ fn drive_http(listener: &mut HttpListener, sockets: &mut SocketSet<'static>) {
 
     // (4) Try to parse; on success dispatch handler and queue response.
     //
-    // Three dispatch arms, checked in order:
+    // Five dispatch arms, checked in order:
     //   a. `/file/{id}/content` (#403) — handled by `file_serve::try_serve`,
     //      which produces fully-serialised HTTP/1.1 wire bytes (200/206/
     //      404/405/416/500). Bypasses the `Handler` chain because the
@@ -407,8 +407,18 @@ fn drive_http(listener: &mut HttpListener, sockets: &mut SocketSet<'static>) {
     //      the canonical `http::parse_request` doesn't capture it.
     //      Same wire-bytes-bypass story as (a) since 201 Created carries
     //      a dynamic `Location` header that the static `Response`
-    //      builder can't emit.
-    //   c. Anything else — falls through to the registered `Handler` fn,
+    //      builder can't emit. Now also handles chunked-mode init when
+    //      the multipart body declares a `total` form field instead of
+    //      shipping a `file` part.
+    //   c. `PUT /file/{id}/chunk?offset=N` (#445) —
+    //      `file_upload::try_serve_chunk`. Streams region-backed bytes
+    //      onto the disk slot allocated at chunked-init time. Also
+    //      reads the optional `Content-Range` header off the raw
+    //      buffer (canonical `parse_request` ignores it).
+    //   d. `GET /file/{id}/upload-state` (#445) —
+    //      `file_upload::try_serve_upload_state`. Resume probe; reports
+    //      the upload's highest contiguous byte for client-side resume.
+    //   e. Anything else — falls through to the registered `Handler` fn,
     //      which serialises via `Response::to_wire()`.
     let parsed = match http::parse_request(&listener.rx_buf) {
         Ok(Some(req)) => Ok(req),
@@ -436,7 +446,42 @@ fn drive_http(listener: &mut HttpListener, sockets: &mut SocketSet<'static>) {
                     ) {
                         UploadOutcome::Response(bytes) => bytes,
                         UploadOutcome::NotApplicable => {
-                            (listener.handler)(&req).to_wire()
+                            // PUT /file/{id}/chunk?offset=N — second
+                            // half of the resumable-upload protocol
+                            // (#445). Looks up the in-memory upload
+                            // session keyed by `{id}`, writes the body
+                            // bytes at `offset`, and either advances
+                            // the high-water mark (204) or seals the
+                            // file (200) on the last chunk.
+                            let cr = file_upload::extract_content_range_header(
+                                &listener.rx_buf,
+                            );
+                            match file_upload::try_serve_chunk(
+                                &req.method,
+                                &req.path,
+                                &req.body,
+                                cr.as_deref(),
+                            ) {
+                                UploadOutcome::Response(bytes) => bytes,
+                                UploadOutcome::NotApplicable => {
+                                    // GET /file/{id}/upload-state — the
+                                    // resume probe (#445). Returns the
+                                    // in-flight session's high-water mark
+                                    // for in-progress uploads, or the
+                                    // sealed File's size for completed
+                                    // ones.
+                                    match file_upload::try_serve_upload_state(
+                                        &req.method,
+                                        &req.path,
+                                        crate::system::state(),
+                                    ) {
+                                        UploadOutcome::Response(bytes) => bytes,
+                                        UploadOutcome::NotApplicable => {
+                                            (listener.handler)(&req).to_wire()
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
