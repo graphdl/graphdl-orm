@@ -129,6 +129,23 @@ mod pci;
 mod repl;
 mod system;
 
+// `linuxkpi` (#460 Track AAAA, foundation for the AREST-on-real-
+// hardware epic #459). FreeBSD-style Linux kernel API shim that lets
+// unmodified Linux C drivers link against AREST primitives. Off by
+// default behind the `linuxkpi` cargo feature — same gate shape as
+// VVV's #456 doom-feature pattern. Default kernel builds skip the C
+// compile of the vendored Linux source (vendor/linux/) entirely, so
+// the .efi footprint and AGPL-3.0-or-later license story stay
+// unchanged. Opting in via `--features linuxkpi` brings in the
+// vendored `drivers/virtio/virtio_input.c` (GPL-2.0-only) which is
+// FSF-compatible with AGPL-3.0-or-later. Foundation slice ships
+// clean linkage only — actual driver discovery / event flow is
+// #459b. Available on x86_64 UEFI only (the C compile for the
+// vendored Linux source assumes amd64 calling convention; ARM
+// arms can opt in as a future track).
+#[cfg(all(target_os = "uefi", target_arch = "x86_64", feature = "linuxkpi"))]
+pub mod linuxkpi;
+
 // `block` / `block_storage` / `virtio` reach `x86_64::structures::
 // paging::Translate` via `arch::memory::with_page_table`, plus the
 // PCI transport. All three are x86_64-only today; aarch64 / armv7
