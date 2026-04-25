@@ -394,6 +394,26 @@ impl UefiSlintPlatform {
     pub fn take_window(&self) -> Option<Rc<MinimalSoftwareWindow>> {
         self.window.borrow_mut().take()
     }
+
+    /// Build a platform that hands out a caller-supplied
+    /// `MinimalSoftwareWindow`. Sibling of `new()` for callers that
+    /// already hold an `Rc<MinimalSoftwareWindow>` they want to
+    /// share with `draw_if_needed`-side rendering. Used by the
+    /// boot launcher (#431 Track UUU) so the Rust super-loop and
+    /// Slint's `create_window_adapter` agree on the same physical
+    /// surface — both ends end up cloning the same `Rc`, so the
+    /// renderer's `render_by_line` writes into the dirty region
+    /// the active component just marked.
+    ///
+    /// The window is taken as-is; the caller is responsible for
+    /// calling `MinimalSoftwareWindow::set_size` (or accepting the
+    /// default) before constructing components. Typical wiring:
+    /// build the window with `MinimalSoftwareWindow::new(buffer
+    /// type)`, set its size to the framebuffer dimensions, then
+    /// hand a clone here.
+    pub fn with_window(window: Rc<MinimalSoftwareWindow>) -> Self {
+        Self { window: RefCell::new(Some(window)) }
+    }
 }
 
 impl Platform for UefiSlintPlatform {
@@ -449,6 +469,34 @@ impl Platform for UefiSlintPlatform {
 // safe, not Sync-safe).
 unsafe impl Send for FramebufferBackend {}
 unsafe impl Sync for FramebufferBackend {}
+
+/// Forwarding `LineBufferProvider` impl for a `&mut FramebufferBackend`.
+///
+/// Slint's `SoftwareRenderer::render_by_line` consumes the
+/// `LineBufferProvider` argument by value (`impl LineBufferProvider`),
+/// which would force the caller to either re-construct the backend
+/// every frame (re-allocating the scratch buffer) or use a wrapper
+/// struct. Implementing the trait for `&mut FramebufferBackend` lets
+/// the boot launcher's super-loop (#431 Track UUU) hold the backend
+/// once outside the loop and pass `&mut backend` into
+/// `render_by_line` each iteration, with the renderer borrowing the
+/// scratch via `&mut self -> &mut **self` in `process_line`. No
+/// per-frame allocation, same trait surface.
+impl LineBufferProvider for &mut FramebufferBackend {
+    type TargetPixel = PremultipliedRgbaColor;
+
+    fn process_line(
+        &mut self,
+        line: usize,
+        range: Range<usize>,
+        render_fn: impl FnOnce(&mut [Self::TargetPixel]),
+    ) {
+        // Forward to the inner impl. `*self` is `&mut FramebufferBackend`;
+        // the `(*self)` deref + method call routes to the by-value
+        // `process_line` defined above, with the same borrow semantics.
+        (*self).process_line(line, range, render_fn);
+    }
+}
 
 #[cfg(test)]
 mod tests {
