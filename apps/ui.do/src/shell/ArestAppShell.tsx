@@ -21,6 +21,7 @@ import { AppShell } from '@mdxui/app'
 import type { NavGroup, NavItem, UserIdentity } from '@mdxui/app'
 import { useArestResources, useExternalSystems } from '../resources'
 import { EntityOverworldMenu } from '../views'
+import { Folder } from '../lib/icons'
 
 export interface ArestAppShellProps {
   /** AREST worker base URL. */
@@ -94,7 +95,14 @@ export function ArestAppShell(props: ArestAppShellProps): ReactElement {
   const { resources, isLoading } = useArestResources({ baseUrl, app, filter: nounScope })
   const { resources: externalResources, systems: externalSystems } = useExternalSystems({ baseUrl, app })
   const basePath = config.basePath ?? ''
-  const navigation: NavGroup[] = [resourcesToNavGroup(resources, basePath)]
+  const prefix = basePath.endsWith('/') ? basePath.slice(0, -1) : basePath
+  // #405 — top-of-sidebar Quick group surfaces the bespoke /files
+  // browser ahead of the auto-discovered Resources list.
+  const quickGroup: NavGroup = {
+    label: 'Quick',
+    items: [{ title: 'Files', url: `${prefix}/files`, icon: Folder }],
+  }
+  const navigation: NavGroup[] = [quickGroup, resourcesToNavGroup(resources, basePath)]
   if (externalSystems.length > 0) {
     navigation.push(externalResourcesToNavGroup(externalResources, basePath))
   }

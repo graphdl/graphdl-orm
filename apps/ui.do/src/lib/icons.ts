@@ -22,6 +22,15 @@ export {
   File,
   FileText,
   FileCode,
+  FileImage,
+  FileVideo,
+  // No FileAudio in lucide-react v1; alias Music to that semantic role.
+  Music as FileAudio,
+  FileType,
+  // Lucide has no dedicated 'FilePdf' — `FileType` is the closest match
+  // and is re-exported under a semantic alias for callers that key by
+  // mime-type (application/pdf → FilePdf).
+  FileType as FilePdf,
   Folder,
   FolderOpen,
   FolderPlus,

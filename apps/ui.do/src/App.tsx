@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactElement } from 'react'
-import { BrowserRouter } from 'react-router-dom'
+import { BrowserRouter, Route } from 'react-router-dom'
 import { QueryClientProvider } from '@tanstack/react-query'
 import { Admin, AdminRouter, Resource } from '@mdxui/admin'
 import { AREST_BASE_URL } from './env'
@@ -8,6 +8,7 @@ import { createArestQueryBridge, createArestQueryClient } from './query'
 import { ArestAppShell } from './shell'
 import { useBranding } from './branding'
 import { useArestResources } from './resources'
+import { FileBrowser } from './views/files'
 
 /**
  * Production shell for ui.do / support.auto.dev.
@@ -118,7 +119,17 @@ function AdminRoot({ baseUrl, app, name, nounScope, domain, onDomainChange, prov
             options={r.options}
           />
         ))}
-        <AdminRouter />
+        <AdminRouter>
+          {/*
+           * #405 — bespoke file browser sits alongside the auto-
+           * generated /file CRUD routes. The shell renders the same
+           * three-route shape (root / dir-open / file-selected) so
+           * deep links survive navigation.
+           */}
+          <Route path="files" element={<FileBrowser baseUrl={baseUrl} />} />
+          <Route path="files/:directoryId" element={<FileBrowser baseUrl={baseUrl} />} />
+          <Route path="files/:directoryId/:fileId" element={<FileBrowser baseUrl={baseUrl} />} />
+        </AdminRouter>
       </Admin>
       {/* Dev aid — expose providers on window for console pokes. */}
       <ProvidersDebug providers={providersDebug} />
