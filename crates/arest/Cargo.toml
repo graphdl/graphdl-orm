@@ -75,6 +75,14 @@ os-readings = []
 # their own org / agent definitions can leave this off; the kernel
 # enables it for the demo-out-of-the-box experience.
 templates = []
+# `compat-readings` (#463) — Windows-via-Wine compat substrate
+# (readings/compat/wine.md). Defines the Wine App noun + per-app
+# DLL overrides / registry tweaks / winetricks recipes / Compat
+# Rating as FORML facts. Future `arest run "App Name"` (#462c)
+# compiles this state into a Wine prefix; ProtonDB ingest (#462e)
+# folds external reports into the same graph. Off by default —
+# workers that aren't running Wine apps shouldn't pay the bake cost.
+compat-readings = []
 default = ["wit", "debug-def", "std-deps", "parallel", "core", "ui-readings", "os-readings", "templates"]
 wit = ["dep:wit-bindgen"]
 cloudflare = ["dep:wasm-bindgen", "dep:console_error_panic_hook"]
