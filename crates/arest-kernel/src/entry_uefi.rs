@@ -37,25 +37,28 @@
 
 #![cfg(target_os = "uefi")]
 
-use linked_list_allocator::LockedHeap;
+use talc::{ClaimOnOom, Span, Talc, Talck};
 use uefi::prelude::*;
 use uefi::boot::{AllocateType, MemoryType};
 use uefi::mem::memory_map::MemoryMapOwned;
 
 use crate::println;
 
-// Global allocator. Uses a `LockedHeap` rather than
-// `uefi::allocator::Allocator` so the heap SURVIVES ExitBootServices
-// — uefi-rs's allocator is backed by `BootServices::allocate_pool`,
-// which faults after EBS.
+// Global allocator. Uses `talc` (`Talck<spin::Mutex<()>, ClaimOnOom>`)
+// rather than `uefi::allocator::Allocator` so the heap SURVIVES
+// ExitBootServices — uefi-rs's allocator is backed by
+// `BootServices::allocate_pool`, which faults after EBS.
 //
 // The BIOS arm uses the same crate for the same reason (see
 // `allocator.rs`); this keeps the kernel's Box/Vec/String codepaths
-// identical on both boot targets.
+// identical on both boot targets. The talc swap (#440 / #443) replaces
+// `linked_list_allocator::LockedHeap`, which trips a "Freed node
+// aliases existing hole" assertion under wasmi `Memory::grow` realloc
+// churn during Doom's `Z_Init` (#376 follow-up).
 //
 // Heap-backing strategy under #376: the heap region is allocated via
 // `boot::allocate_pages(AnyPages, LOADER_DATA, ...)` at the very top
-// of `efi_main`, then the `LockedHeap` is init'd against that
+// of `efi_main`, then the `Talck` is init'd against that
 // firmware-allocated range. Originally the heap lived in a static
 // `.bss` byte array (16 MiB); when #376 wired the Doom WASM
 // instantiate path, wasmi's parsing of the 4.35 MiB doom.wasm
@@ -102,7 +105,7 @@ use crate::println;
 // The 48 MiB heap survives `ExitBootServices`: the firmware's
 // `allocate_pages` returns memory typed `LOADER_DATA`, which per the
 // UEFI spec belongs to the OS loader/kernel and is preserved across
-// the EBS handoff. `LockedHeap::init` records the raw pointer + size
+// the EBS handoff. `Talck::lock().claim(Span)` records the raw region
 // once; no subsequent `allocate_pool` calls are needed.
 //
 // The `init()` call runs at the TOP of `efi_main` — immediately
@@ -113,14 +116,21 @@ use crate::println;
 const HEAP_SIZE: usize = 32 * 1024 * 1024;
 const HEAP_PAGES: usize = HEAP_SIZE / 4096;
 
+// `ClaimOnOom::empty()` starts the allocator with no backing region;
+// the explicit `claim(Span::from_base_size(...))` below in `efi_main`
+// attaches the firmware-allocated heap pages once `boot::allocate_pages`
+// returns. Wrapped in `Talck` (talc's `lock_api`-backed `GlobalAlloc`
+// adapter) over a `spin::Mutex<()>` — `spin` is already in the kernel's
+// deps for the `SerialPort` singleton, so this picks up no new transitive.
 #[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
+static ALLOCATOR: Talck<spin::Mutex<()>, ClaimOnOom> =
+    Talc::new(unsafe { ClaimOnOom::new(Span::empty()) }).lock();
 
 /// Raw COM1 byte writer for diagnostic output that must work even
 /// before / after the heap is up. Same shape as the panic_handler's
 /// `RawCom1` — busy-polls THR-empty between bytes so slow consoles
 /// don't drop characters. Used to surface heap-init failures
-/// (allocate_pages OOM, LockedHeap::init refusal) before any
+/// (allocate_pages OOM, Talck claim refusal) before any
 /// `println!`-routed output is possible.
 fn raw_com1_str(s: &str) {
     use x86_64::instructions::port::Port;
@@ -151,7 +161,7 @@ fn raw_com1_str(s: &str) {
 /// Busy-polls the LSR's THR-empty bit between each byte so slow
 /// consoles don't drop characters. `writeln!` via core::fmt
 /// handles formatting without alloc — panic inside alloc would
-/// otherwise deadlock on the LockedHeap mutex.
+/// otherwise deadlock on the Talck mutex.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     use core::fmt::Write;
@@ -220,13 +230,13 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 #[entry]
 fn efi_main() -> Status {
     // Heap init MUST be the first thing — the global allocator is an
-    // empty LockedHeap; the first alloc call before init() would
-    // panic. Subsequent `println!` and any uefi-rs internal alloc
-    // work (transcoding format args to UCS-2, for example) all route
-    // through this heap.
+    // empty Talck; the first alloc call before claim() would panic
+    // (ClaimOnOom would then trigger but with an empty span). Subsequent
+    // `println!` and any uefi-rs internal alloc work (transcoding format
+    // args to UCS-2, for example) all route through this heap.
     //
     // Strategy: ask the firmware for a 48 MiB CONVENTIONAL region via
-    // `boot::allocate_pages` and init the LockedHeap there. The
+    // `boot::allocate_pages` and init the Talck there. The
     // firmware is the only thing that knows the full memory map this
     // early in boot, so its allocator is the right tool. The returned
     // region is typed `LOADER_DATA`, which UEFI guarantees survives
@@ -269,16 +279,19 @@ fn efi_main() -> Status {
         }
     };
     // SAFETY: `allocate_pages` returns a `NonNull<u8>` to a fresh,
-    // page-aligned, exclusive 48 MiB region. No other code holds a
+    // page-aligned, exclusive 32 MiB region. No other code holds a
     // pointer into it — we just got it from the firmware. The
-    // `LockedHeap::init` call records the raw pointer + size; the
+    // `Talck::lock().claim(Span)` call records the raw region; the
     // borrow checker doesn't see this as an aliased mutable borrow
     // because the heap pages are typed-as-raw memory, not a Rust
     // owned object.
     unsafe {
-        ALLOCATOR.lock().init(heap_ptr.as_ptr(), HEAP_SIZE);
+        ALLOCATOR
+            .lock()
+            .claim(Span::from_base_size(heap_ptr.as_ptr(), HEAP_SIZE))
+            .expect("heap claim");
     }
-    raw_com1_str("heap: LockedHeap::init OK\n");
+    raw_com1_str("heap: Talck claim OK\n");
 
     crate::arch::init_console();
 
@@ -786,12 +799,12 @@ fn kernel_run_uefi(
     }
 
     // Post-EBS heap smoke (step 4d wave 3, 5b74f2a). `uefi::allocator`
-    // would fault here because BootServices is gone; our static-BSS
-    // `LockedHeap` keeps serving allocations. Building a Vec and
-    // summing it proves both the heap init from pre-EBS carried
-    // through AND `format!` on the post-EBS 16550 path still works.
-    // Sum of 0..16 is 120 — the host-side smoke asserts that exact
-    // number.
+    // would fault here because BootServices is gone; our `Talck`
+    // (#443) keeps serving allocations on the firmware-allocated
+    // 32 MiB region claimed pre-EBS. Building a Vec and summing it
+    // proves both the heap init from pre-EBS carried through AND
+    // `format!` on the post-EBS 16550 path still works. Sum of 0..16
+    // is 120 — the host-side smoke asserts that exact number.
     let test_vec: alloc::vec::Vec<u32> = (0..16u32).collect();
     let sum: u32 = test_vec.iter().sum();
     println!("  alloc:    post-EBS heap live (sum 0..16 = {sum})");
@@ -913,21 +926,15 @@ fn kernel_run_uefi(
     // catch the OutOfFuel trap as a successful "yield" -- the first
     // frame should already have landed by then.
     //
-    // KNOWN LIMITATION (#376 follow-up): on this build, initGame
-    // panics inside Doom's Z_Init zone allocator with a
-    // `linked_list_allocator` "Freed node aliases existing hole"
-    // assertion. The host heap is `linked_list_allocator::LockedHeap`
-    // backed by a 32 MiB region from `boot::allocate_pages`; wasmi's
-    // `Memory::grow` reallocs interact poorly with the linked-list
-    // freelist's bookkeeping under Doom's WAD-load alloc churn,
-    // surfacing as a host-side allocator panic before tickGame can
-    // be reached. The "calling initGame" banner is emitted; the
-    // "calling tickGame" / "first drawFrame landed" banners are only
-    // reached if initGame returns or yields cleanly. Tracked under
-    // #378 for sustained gameplay; resolved by switching the host
-    // allocator to one that handles realloc churn without freelist
-    // corruption (e.g. `talc` or a slab allocator) -- both touch
-    // Cargo.toml so they're outside this commit's ownership.
+    // RESOLVED (#440 / #443): the previous "Freed node aliases existing
+    // hole" panic from `linked_list_allocator` under Doom's Z_Init churn
+    // cleared once the host heap was swapped to
+    // `talc::Talck<spin::Mutex<()>, ClaimOnOom>` (this file's
+    // `#[global_allocator]`, above). Talc's free-list bookkeeping is
+    // robust to wasmi's `Memory::grow` realloc patterns where
+    // linked_list_allocator-0.10's was not. tickGame can now be reached;
+    // landing the first host-shim drawFrame is what unblocks #378
+    // (Doom main loop).
     if !crate::doom_bin::DOOM_WASM.is_empty() {
         const DOOM_FUEL: u64 = 200_000_000;
         let doom_module = wasmi::Module::new(&doom_engine, crate::doom_bin::DOOM_WASM)
