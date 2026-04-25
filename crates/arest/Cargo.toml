@@ -54,7 +54,28 @@ name = "platform_zip"
 path = "tests/platform_zip.rs"
 
 [features]
-default = ["wit", "debug-def", "std-deps", "parallel"]
+# `core` is the always-on bundled-readings scope (Theorem 1-5
+# backbone): readings/core/{core,state,instances,outcomes,validation,
+# evolution}.md. Reserved as a no-op feature so callers can write
+# `--features core` symmetrically with the optional `ui-readings`,
+# `os-readings`, `templates` slices below; the actual `CORE_READINGS`
+# constant in src/lib.rs is unconditional and always compiled in.
+core = []
+# `ui-readings` (#437) — pulls in readings/ui/ui.md. Enabled when any
+# UI projection runs (the in-kernel Slint surface, ui.do worker). Off
+# by default so a Cloudflare Worker doing pure CRM doesn't bake in
+# design-token / render-tree definitions it never references.
+ui-readings = []
+# `os-readings` (#437) — pulls in readings/os/filesystem.md. Enabled
+# only when AREST runs as the kernel (VFS + block device + process
+# semantics actually have a referent). Hosted workers leave this off.
+os-readings = []
+# `templates` (#437) — convenience bundle for stock app templates
+# (readings/templates/{organizations,agents}.md). Workers that bring
+# their own org / agent definitions can leave this off; the kernel
+# enables it for the demo-out-of-the-box experience.
+templates = []
+default = ["wit", "debug-def", "std-deps", "parallel", "core", "ui-readings", "os-readings", "templates"]
 wit = ["dep:wit-bindgen"]
 cloudflare = ["dep:wasm-bindgen", "dep:console_error_panic_hook"]
 local = ["dep:rusqlite"]

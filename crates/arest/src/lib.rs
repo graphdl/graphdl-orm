@@ -682,35 +682,100 @@ fn allocate(state: ast::Object, defs: Vec<(String, ast::Func)>) -> u32 {
 
 // ── SYSTEM is the only function ─────────────────────────────────────
 
-/// Bundled metamodel readings. Compiled into the binary at build time.
-/// Loaded by `create_impl` so every fresh domain starts with the
-/// self-describing metamodel available. Use `create_bare_impl` to skip
-/// the auto-load when experimenting with a replacement core.
-///
-/// Load order matters: core defines the base object types (Noun, Fact
-/// Schema, Role, Constraint) that every later reading references.
-pub const METAMODEL_READINGS: &[(&str, &str)] = &[
-    ("core",          include_str!("../../../readings/core.md")),
-    ("state",         include_str!("../../../readings/state.md")),
-    ("instances",     include_str!("../../../readings/instances.md")),
-    ("outcomes",      include_str!("../../../readings/outcomes.md")),
-    ("validation",    include_str!("../../../readings/validation.md")),
-    ("evolution",     include_str!("../../../readings/evolution.md")),
-    ("organizations", include_str!("../../../readings/organizations.md")),
-    ("agents",        include_str!("../../../readings/agents.md")),
-    ("ui",            include_str!("../../../readings/ui.md")),
-    ("filesystem",    include_str!("../../../readings/filesystem.md")),
+// ── Bundled metamodel readings ──────────────────────────────────────
+//
+// Pre-#437 every AREST build paid for every reading via a single
+// `METAMODEL_READINGS` constant. A Cloudflare Worker doing only a CRM
+// app got `os/filesystem.md` baked in for no reason, and any future
+// kernel-only window-manager readings would leak into hosted
+// deployments.
+//
+// The corpus is now split into four scoped slices, each gated on a
+// Cargo feature in `arest`'s manifest:
+//
+//   * `CORE_READINGS`     — Theorem 1-5 backbone (always included).
+//   * `UI_READINGS`       — UI surfaces; gated on `ui-readings`.
+//   * `OS_READINGS`       — OS-only nouns; gated on `os-readings`.
+//   * `TEMPLATE_READINGS` — stock app templates; gated on `templates`.
+//
+// The pre-#437 `METAMODEL_READINGS` constant is replaced by the
+// `metamodel_readings()` runtime assembler, which folds the enabled
+// slices in the original load order (core → templates → ui → os) so
+// existing call sites (`metamodel_corpus`, `metamodel_state`,
+// `create_impl`) compile unchanged. The Cloudflare Worker enables
+// only what its app needs; `arest-kernel` opts into all three
+// optional scopes (`ui-readings`, `os-readings`, `templates`).
+//
+// Load order matters: core defines the base object types (Noun, Fact
+// Schema, Role, Constraint) that every later reading references.
+
+/// Theorem 1-5 backbone readings. ALWAYS compiled in — there is no
+/// build of `arest` without these. They sit in `readings/core/` so the
+/// scoping is also visible on disk.
+pub const CORE_READINGS: &[(&str, &str)] = &[
+    ("core",          include_str!("../../../readings/core/core.md")),
+    ("state",         include_str!("../../../readings/core/state.md")),
+    ("instances",     include_str!("../../../readings/core/instances.md")),
+    ("outcomes",      include_str!("../../../readings/core/outcomes.md")),
+    ("validation",    include_str!("../../../readings/core/validation.md")),
+    ("evolution",     include_str!("../../../readings/core/evolution.md")),
 ];
+
+/// UI surface readings (design tokens, render tree, themes). Included
+/// when any UI projection runs — the in-kernel Slint surface or the
+/// hosted ui.do worker.
+#[cfg(feature = "ui-readings")]
+pub const UI_READINGS: &[(&str, &str)] = &[
+    ("ui",            include_str!("../../../readings/ui/ui.md")),
+];
+
+/// OS-only nouns. Included only when AREST runs as the kernel, where
+/// VFS / block-device / process semantics actually have a referent.
+/// Hosted Cloudflare Workers leave this slice off.
+#[cfg(feature = "os-readings")]
+pub const OS_READINGS: &[(&str, &str)] = &[
+    ("filesystem",    include_str!("../../../readings/os/filesystem.md")),
+];
+
+/// Stock app templates / examples (Organization, Agent). Convenience
+/// bundle for callers that want the demo nouns preloaded; hosted
+/// workers that bring their own templates can leave this off.
+#[cfg(feature = "templates")]
+pub const TEMPLATE_READINGS: &[(&str, &str)] = &[
+    ("organizations", include_str!("../../../readings/templates/organizations.md")),
+    ("agents",        include_str!("../../../readings/templates/agents.md")),
+];
+
+/// Feature-gated assembly of the bundled metamodel slices. Order
+/// matches the pre-#437 layout: core → templates → ui → os, so the
+/// metamodel state cache (`METAMODEL_STATE`) merges them in a way
+/// that preserves Noun/FactType references between slices.
+///
+/// Built at runtime from `&'static` slice references — there's no
+/// allocation or copying of reading bodies, just a `Vec<&'static
+/// (&str, &str)>` containing pointers into the `.rodata` segments.
+#[cfg(not(feature = "no_std"))]
+pub fn metamodel_readings() -> Vec<&'static (&'static str, &'static str)> {
+    let mut out: Vec<&'static (&'static str, &'static str)> = Vec::new();
+    out.extend(CORE_READINGS.iter());
+    #[cfg(feature = "templates")]
+    { out.extend(TEMPLATE_READINGS.iter()); }
+    #[cfg(feature = "ui-readings")]
+    { out.extend(UI_READINGS.iter()); }
+    #[cfg(feature = "os-readings")]
+    { out.extend(OS_READINGS.iter()); }
+    out
+}
 
 /// The bundled metamodel concatenated into a single corpus, with
 /// blank-line separators between files. Used to preload the checker
 /// so a user app corpus doesn't flag metamodel-declared nouns
 /// (Noun, FactType, Domain, App, …) as undeclared. Deterministic —
-/// the fold is over the `METAMODEL_READINGS` table in declaration
-/// order, matching `create_impl`'s load order.
+/// the fold is over `metamodel_readings()`, which assembles the
+/// feature-gated slices in `create_impl`'s load order.
 #[cfg(not(feature = "no_std"))]
 pub fn metamodel_corpus() -> String {
-    METAMODEL_READINGS.iter().fold(String::new(), |mut acc, (_, text)| {
+    metamodel_readings().iter().fold(String::new(), |mut acc, (_, text)| {
         acc.push_str(text);
         acc.push_str("\n\n");
         acc
@@ -846,8 +911,12 @@ fn metamodel_state() -> &'static ast::Object {
         }
         let _guard = BootstrapGuard::enter();
 
-        // Fold all 9 readings into a single merged state (parser only).
-        let merged = METAMODEL_READINGS.iter().fold(ast::Object::phi(), |acc, (name, text)| {
+        // Fold every enabled metamodel reading into a single merged
+        // state (parser only). The set of slices that contributes
+        // depends on the enabled features (`ui-readings`, `os-readings`,
+        // `templates`); `metamodel_readings()` assembles them in the
+        // canonical load order (core → templates → ui → os).
+        let merged = metamodel_readings().iter().fold(ast::Object::phi(), |acc, (name, text)| {
             let parsed = parse_forml2::parse_to_state_from(text, &acc)
                 .unwrap_or_else(|e| panic!("metamodel parse failed at readings/{}.md: {}", name, e));
             ast::merge_states(&acc, &parsed)
