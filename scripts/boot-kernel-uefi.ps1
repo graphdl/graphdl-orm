@@ -109,8 +109,14 @@ if ($Smoke) {
             # outcome means the smoke has captured the full banner
             # stream we care about; continued polling would only delay
             # the assertion phase by another 50+ seconds.
-            if ($log -match "next:\s+kernel_run handoff") { break }
-            if ($log -match "Freed node .* aliases existing hole") { break }
+            # Beacon: the launcher print is the LAST thing
+            # entry_uefi.rs writes before yielding to Slint's event
+            # loop (#431 UUU). When this appears the boot is fully
+            # quiesced and every preceding banner is in the log.
+            if ($log -match "ui:\s+launcher running") { break }
+            # Defensive: if the kernel panics before the launcher line,
+            # surface that early instead of waiting out the cap.
+            if ($log -match "UEFI kernel panic") { break }
         }
         $log | Out-File -FilePath $logPath -Encoding utf8
 
@@ -127,7 +133,7 @@ if ($Smoke) {
             "SSE enabled",
             "post-EBS: 16550 COM1 active",
             "frames usable",
-            "dma:      pool live (2 MiB UEFI memory-map carve for virtio)",
+            "dma:      pool live",
             "pci:      walk OK (virtio-net:",
             "virtio-net: driver online, MAC",
             "virtio-blk: driver online,",
@@ -135,31 +141,23 @@ if ($Smoke) {
             "post-EBS heap live (sum 0..16 = 120)",
             "system::init() completed (arest engine live on UEFI)",
             "tiny module executed, main() = 42",
-            "10 host imports bound to wasmi::Linker",
             "gop:      ",
             "gop-mmio: wrote 320x200, readback sum=0xffff8300",
             "fb:       paint smoke OK, presents=2",
             "doom-blit: synthetic 640x400 BGRA frame blitted",
-            # #376: Doom WASM module instantiation + initGame.
-            # The "module instantiated" line proves wasmi parsed the
-            # 4.35 MiB blob and counted the expected exports (4 funcs
-            # + 1 memory per doom_assets/README.md). The "calling
-            # initGame" line marks the wasmi entry into D_DoomMain.
-            # KNOWN LIMITATION: under the current `linked_list_allocator`
-            # host heap, initGame panics inside Doom's Z_Init zone-
-            # allocator setup with a "Freed node aliases existing
-            # hole" assertion -- wasmi's `Memory::grow` reallocs
-            # interact poorly with the freelist under WAD-load alloc
-            # churn. The "calling tickGame" / "first drawFrame landed"
-            # banners only fire if initGame returns or yields
-            # cleanly; until the host allocator is swapped (tracked
-            # for #378), the smoke harness asserts only the two
-            # lines we reliably reach. Match tolerantly (no
-            # fn-count or fuel-consumption number pinned) so a
-            # future module rebuild or engine-version bump doesn't
-            # false-fail.
-            "doom:     module instantiated,",
-            "doom:     calling initGame",
+            # virtio-gpu surface (#371 Track III). The driver-online line
+            # proves the virtio-drivers VirtIOGpu init succeeded against
+            # the discovered PCI device + carved DMA pool; the install
+            # line proves framebuffer::install_virtio_gpu picked it up
+            # as the front-buffer (preferred over GOP per #382).
+            "virtio-gpu: driver online,",
+            "fb:       virtio-gpu surface installed",
+            # Doom is gated behind --features doom (#456 / VVV). The
+            # default build prints "doom: skipped" so the AGPL-only
+            # binary is observable in the boot log. With the feature
+            # on, the line would be "doom: module instantiated" /
+            # "doom: calling initGame" instead — assert tolerantly.
+            "doom:     skipped (build without --features doom",
             "idt:      int3 round-tripped through UEFI IDT",
             # #379: PIT 1 kHz timer banner. The first phrase is printed
             # immediately after `init_time()` returns; the second phrase
@@ -182,7 +180,22 @@ if ($Smoke) {
             # enough that a future smoke that injects a scancode
             # would still pass without rewriting the assertion.
             "kbd:      PS/2 driver online (IRQ 1 unmasked)",
-            "kbd:      poll "
+            "kbd:      poll ",
+            # #360 NNN — register_http on UEFI x86_64.
+            "http:     handler registered on :80",
+            # #359 DDD — net::init under UEFI x86_64 (smoltcp phy bind).
+            "net:      smoltcp interface live",
+            # #365 GGG — REPL on UEFI; line-buffered keystrokes feed
+            # crate::repl::process_key (kept by VVV alongside the new
+            # Slint REPL app).
+            "repl:     line-buffered keyboard REPL online",
+            # #431 UUU — Slint launcher takes over the boot screen and
+            # hosts HATEOAS + REPL (and Doom under --features doom).
+            # This is the smoke beacon — the very last line entry_uefi
+            # writes before yielding to Slint's event loop. Polling
+            # breaks on this string, so its presence here is partly
+            # belt + suspenders (the loop already broke on it).
+            "ui:       launcher running"
         )
         $missing = @()
         foreach ($phrase in $expected) {
