@@ -41,7 +41,7 @@
 // retries against a freshly-booted tenant rather than silently
 // losing the upload.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -86,6 +86,32 @@ const MAX_CHUNK_BYTES: usize = INLINE_THRESHOLD;
 /// the slot ceiling fail at init with 413.
 const MAX_REGION_BYTES: u64 = BLOB_SLOT_BYTES;
 
+/// Idempotency-Key TTL (#446). Cache entries expire this far past
+/// `arch::time::now_ms()`'s reading at insert time. 24h gives every
+/// realistic retry window (mobile drops, server reboots, client
+/// back-off chains) a stable resolution while staying short enough
+/// that a stale entry can't pin a long-dead File id forever.
+const IDEMPOTENCY_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Maximum live entries in the IDEMPOTENCY map (#446). Bounded so a
+/// burst of unique keys can't grow the map without limit. When full,
+/// the LRU entry (smallest `last_seen_ms`) is evicted to make room
+/// — adequate for the request rates the kernel sees today.
+const IDEMPOTENCY_MAX_ENTRIES: usize = 1024;
+
+/// Per-upload progress event ring depth (#447). One ring per file
+/// id in the PROGRESS_EVENTS map; older events fall off the front
+/// when the ring fills. 64 events covers a 256 KiB upload at the
+/// 4 KiB CHUNK_SIZE_HINT cadence with no drops.
+const PROGRESS_RING_DEPTH: usize = 64;
+
+/// Minimum bytes required for the first-chunk MIME sniff (#448).
+/// Mirrors the engine-side `detect_mime` table's window — no
+/// signature in the table extends past 512 bytes, so a shorter
+/// prefix wouldn't gain accuracy. Smaller first chunks defer to
+/// the closing seal-step sniff.
+const MIME_SNIFF_MIN_BYTES: usize = 512;
+
 /// Outcome of `try_serve` — see file_serve.rs for the convention.
 pub enum ServeOutcome {
     /// Wire-formatted HTTP/1.1 response, ready to write straight onto
@@ -114,12 +140,46 @@ pub enum ServeOutcome {
 ///     accept the upload so the route is exercisable in early-boot
 ///     smoke tests, deferring directory-existence checks to the
 ///     persistence track.
+///
+/// Idempotency-aware shim: forwards to `try_serve_idempotent` with
+/// `idempotency_key = None`. The current `net.rs::drive_http` call
+/// site doesn't surface request headers to this module yet; once
+/// Track NNN's `register_http` (#360) lands, the dispatch layer
+/// can re-scan the raw rx_buf for `Idempotency-Key` and call
+/// `try_serve_idempotent` directly. Until then, retries from the
+/// live wire create fresh File ids.
+// TODO(#446): once net.rs grows an `Idempotency-Key` extractor
+// (mirror of `extract_content_type_header`), route the live POST
+// dispatch through `try_serve_idempotent` so retries collapse on
+// the wire. Today only the in-process tests reach the cache path.
 pub fn try_serve(
     method: &str,
     path: &str,
     content_type: Option<&str>,
     body: &[u8],
     state: Option<&Object>,
+) -> ServeOutcome {
+    try_serve_idempotent(method, path, content_type, body, state, None)
+}
+
+/// Idempotency-aware variant of `try_serve` (#446). When
+/// `idempotency_key` is `Some`, the function probes IDEMPOTENCY for
+/// a fresh entry and short-circuits with the cached response when
+/// it finds one — so a retried POST returns the same File id rather
+/// than allocating a new one. After a successful 2xx response, the
+/// wire bytes are recorded against the key for the TTL window.
+///
+/// `idempotency_key = None` is identical to the legacy `try_serve`
+/// path — no cache reads, no cache writes — so the existing
+/// callers see no behaviour change while net.rs catches up to the
+/// new entry point.
+pub fn try_serve_idempotent(
+    method: &str,
+    path: &str,
+    content_type: Option<&str>,
+    body: &[u8],
+    state: Option<&Object>,
+    idempotency_key: Option<&str>,
 ) -> ServeOutcome {
     // Strip a `?query` suffix so a future link generator that adds
     // cache-busters still routes here. Kept symmetric with
@@ -132,6 +192,14 @@ pub fn try_serve(
         // Path matched but method is wrong — surface a 405 so the
         // assets/dispatch chain doesn't re-claim a /file URL.
         return ServeOutcome::Response(method_not_allowed());
+    }
+
+    // #446: probe before parsing so a retry of a successful upload
+    // returns the cached response without re-walking multipart.
+    if let Some(key) = idempotency_key {
+        if let Some(cached) = lookup_idempotent(key) {
+            return ServeOutcome::Response(cached);
+        }
     }
 
     // 413 immediately on oversized bodies before walking the parser.
@@ -221,9 +289,18 @@ pub fn try_serve(
         }
         let filename = filename_field.unwrap_or("");
         let mime = mime_field.unwrap_or("application/octet-stream");
-        return ServeOutcome::Response(begin_chunked_upload(
+        let response = begin_chunked_upload(
             state, directory_id, filename, mime, total,
-        ));
+        );
+        // #446: cache the chunked-init response on success so a
+        // retry yields the same file_id + region rather than
+        // allocating a second region under the same key.
+        if let Some(key) = idempotency_key {
+            if is_2xx_response(&response) {
+                record_idempotent(key, &response);
+            }
+        }
+        return ServeOutcome::Response(response);
     }
 
     let file_part = match file_part {
@@ -280,7 +357,11 @@ pub fn try_serve(
         return ServeOutcome::Response(internal_error(msg));
     }
 
-    ServeOutcome::Response(created_response(&file_id))
+    let response = created_response(&file_id);
+    if let Some(key) = idempotency_key {
+        record_idempotent(key, &response);
+    }
+    ServeOutcome::Response(response)
 }
 
 // ── Chunked-upload init ────────────────────────────────────────────
@@ -359,6 +440,7 @@ fn begin_chunked_upload(
             mime_hint: mime.to_string(),
             sniff_window: Vec::new(),
             complete: false,
+            mime_promoted: false,
         },
     );
 
@@ -389,11 +471,47 @@ fn begin_chunked_upload(
 //     misaligned with the upload's high-water mark.
 //   * 404 Not Found when the file id has no active upload session.
 //   * 500 Internal Server Error on disk I/O failure.
+///
+/// Idempotency-aware shim: forwards to `try_serve_chunk_idempotent`
+/// with `idempotency_key = None`, preserving the existing
+/// `net::drive_http` call signature. See `try_serve` for the
+/// matching shim on the POST entry.
+// TODO(#446): once net.rs grows an `Idempotency-Key` extractor,
+// route the live PUT dispatch through `try_serve_chunk_idempotent`
+// so retried chunks yield the cached completion response.
 pub fn try_serve_chunk(
     method: &str,
     path: &str,
     body: &[u8],
     content_range: Option<&str>,
+) -> ServeOutcome {
+    try_serve_chunk_idempotent(method, path, body, content_range, None)
+}
+
+/// Idempotency-aware variant of `try_serve_chunk` (#446). When
+/// `idempotency_key` is `Some`, the function probes IDEMPOTENCY for
+/// a fresh entry and short-circuits with the cached chunk-completion
+/// response when one matches — the typical retry case after a
+/// transient network blip on the final chunk. Caches the response
+/// only on the sealing 200 OK; intermediate 204 No Contents aren't
+/// cached because they encode a state-machine position, not a
+/// resource creation that retries should idempotently restore.
+///
+/// Also wires:
+///   * #447 — enqueues a `ProgressEvent` after every successful
+///     write (intermediate or final). The SSE handler at
+///     `try_serve_progress` drains the queue.
+///   * #448 — when `offset == 0` and `body.len() >= 512`, sniffs
+///     the leading bytes via `detect_mime` and rewrites the
+///     `File_has_MimeType` fact when the sniffed type differs from
+///     the placeholder. Subsequent chunks skip the sniff via the
+///     `mime_promoted` flag on UploadState.
+pub fn try_serve_chunk_idempotent(
+    method: &str,
+    path: &str,
+    body: &[u8],
+    content_range: Option<&str>,
+    idempotency_key: Option<&str>,
 ) -> ServeOutcome {
     let (path_only, query) = split_query(path);
     let file_id = match parse_chunk_path(path_only) {
@@ -405,6 +523,14 @@ pub fn try_serve_chunk(
     }
     if body.len() > MAX_CHUNK_BYTES {
         return ServeOutcome::Response(payload_too_large());
+    }
+
+    // #446: probe before parsing offset / locking UPLOADS so a retry
+    // doesn't briefly wedge the in-memory session-map mutex.
+    if let Some(key) = idempotency_key {
+        if let Some(cached) = lookup_idempotent(key) {
+            return ServeOutcome::Response(cached);
+        }
     }
 
     let offset = match parse_chunk_offset(query, content_range) {
@@ -438,6 +564,21 @@ pub fn try_serve_chunk(
         ));
     }
 
+    // #448: snapshot whether this is the first chunk and the leading
+    // window has enough bytes to sniff. Promotion fires *after* the
+    // disk write succeeds, so a write failure doesn't leave the
+    // SYSTEM fact ahead of the on-disk state. Anything shorter than
+    // MIME_SNIFF_MIN_BYTES on the first chunk falls through to the
+    // closing seal-step sniff.
+    let first_chunk_sniff: Option<&'static str> = if offset == 0
+        && !st.mime_promoted
+        && body.len() >= MIME_SNIFF_MIN_BYTES
+    {
+        Some(detect_mime(&body[..MIME_SNIFF_MIN_BYTES]))
+    } else {
+        None
+    };
+
     if !body.is_empty() {
         if let Err(msg) = write_chunk_to_region(st, offset, body) {
             return ServeOutcome::Response(internal_error(msg));
@@ -449,6 +590,31 @@ pub fn try_serve_chunk(
             st.sniff_window.extend_from_slice(&body[..take]);
         }
         st.highest_contiguous_byte = end;
+        // #447: enqueue a progress event for any SSE subscriber on
+        // /file/{file_id}/progress. The function is total-aware so
+        // the UI can render a percentage without a separate fetch.
+        enqueue_progress(file_id, st.highest_contiguous_byte, st.total);
+    }
+
+    // #448: promote the sniffed MIME type onto the SYSTEM fact when
+    // it differs from the placeholder mime_hint. Sets mime_promoted
+    // so subsequent chunks don't re-walk the apply() path. Rewrites
+    // only the File_has_MimeType cell (via cell_filter + cell_push)
+    // — the other four facts stay intact, keeping the placeholder
+    // ContentRef live until the closing seal step swaps it.
+    if let Some(sniffed) = first_chunk_sniff {
+        if sniffed != st.mime_hint.as_str() {
+            let pre_state = crate::system::state().cloned().unwrap_or_else(Object::phi);
+            let new_state = update_mime_fact(&pre_state, file_id, sniffed);
+            if let Err(msg) = crate::system::apply(new_state) {
+                return ServeOutcome::Response(internal_error(msg));
+            }
+            st.mime_hint = sniffed.to_string();
+        }
+        // Mark promoted whether or not the type changed — the
+        // sniff-window has the bytes it needs and re-running the
+        // detector each chunk is wasted work.
+        st.mime_promoted = true;
     }
 
     // Last chunk → seal the upload, return 200.
@@ -488,9 +654,21 @@ pub fn try_serve_chunk(
         let final_size_for_response = final_size;
         let id_for_response = file_id.to_string();
         uploads.remove(file_id);
-        return ServeOutcome::Response(chunk_complete_response(
+        // #447: emit a final marker on the progress queue so an SSE
+        // subscriber knows to close. The drain-side handler
+        // recognises `bytes_written == total_bytes` and writes the
+        // `event: complete\ndata: {}\n\n` framing.
+        enqueue_progress(&id_for_response, final_size_for_response, final_size_for_response);
+        let response = chunk_complete_response(
             &id_for_response, final_size_for_response,
-        ));
+        );
+        // Cache the sealing response — a retry on the final chunk
+        // is the canonical idempotent case (client lost the 200 to
+        // a network blip and is retrying the last PUT).
+        if let Some(key) = idempotency_key {
+            record_idempotent(key, &response);
+        }
+        return ServeOutcome::Response(response);
     }
 
     ServeOutcome::Response(no_content_response())
@@ -548,11 +726,30 @@ fn write_chunk_to_region(st: &UploadState, offset: u64, chunk: &[u8]) -> Result<
 //
 // 404 when neither an in-flight session nor a known File exists for
 // the id.
+//
+// As of #447, this entry point also dispatches `GET /file/{id}/
+// progress` — the SSE handler — by chaining to `try_serve_progress`
+// before its own match runs. The chain lives here (rather than in
+// `net.rs::drive_http`) because file_upload.rs owns the upload-
+// related route family; net.rs's existing arm calls
+// `try_serve_upload_state` for any GET that fell through the chunk
+// dispatch, so the progress route lands automatically without
+// touching net.rs. Once Track NNN's #360 register_http surfaces a
+// dedicated route table, the SSE handler can register itself
+// directly and this chain can be unwound.
 pub fn try_serve_upload_state(
     method: &str,
     path: &str,
     state: Option<&Object>,
 ) -> ServeOutcome {
+    // #447: SSE progress handler chains in here. NotApplicable means
+    // the path didn't match `/file/{id}/progress` — fall through to
+    // upload-state's own match.
+    match try_serve_progress(method, path) {
+        ServeOutcome::Response(bytes) => return ServeOutcome::Response(bytes),
+        ServeOutcome::NotApplicable => {} // fall through
+    }
+
     let (path_only, _) = split_query(path);
     let file_id = match parse_upload_state_path(path_only) {
         Some(id) => id,
@@ -677,9 +874,268 @@ struct UploadState {
     /// between the seal and the map remove) report `complete: true`.
     #[allow(dead_code)]
     complete: bool,
+    /// #448: marks that the first-chunk MIME sniff has run. Set
+    /// after the sniff fires (whether or not the type changed) so
+    /// subsequent chunks don't re-walk `detect_mime` / re-write the
+    /// `File_has_MimeType` fact. The closing seal still runs the
+    /// detector against the full `sniff_window` as a final pass —
+    /// typically a no-op once promoted.
+    mime_promoted: bool,
 }
 
 static UPLOADS: Mutex<BTreeMap<String, UploadState>> = Mutex::new(BTreeMap::new());
+
+// ── Idempotency-Key cache (#446) ───────────────────────────────────
+//
+// Maps a client-supplied `Idempotency-Key` header value to the
+// previously-issued response bytes for a successful POST /file or
+// PUT /file/{id}/chunk. A retry under the same key returns the
+// cached response verbatim — same File id, same Location header,
+// same status — instead of allocating a new id (POST) or re-walking
+// the seal pipeline (PUT).
+//
+// Keying simplification: the entry is keyed on the header value
+// alone. The fully-correct shape is `(client-id, key)` so two
+// clients can't trample each other's keyspace, but the kernel
+// doesn't have a stable client identity yet — `net::drive_http`
+// runs one connection at a time and doesn't expose the remote
+// address to the request pipeline. The header-only key is safe in
+// single-tenant deployments (the kernel's only deployment shape
+// today) and degrades gracefully when multi-tenancy lands: that
+// change pairs with extending the key to a tuple, which only
+// requires updating this module.
+//
+// Bounds:
+//   * Per-entry expiry: `IDEMPOTENCY_TTL_MS` (24h) past the entry's
+//     insert time, measured against `arch::time::now_ms()`. Lookup
+//     evicts an expired entry before returning a cache miss.
+//   * Total entries: `IDEMPOTENCY_MAX_ENTRIES` (1024). When full,
+//     the least-recently-touched entry (smallest `last_seen_ms`) is
+//     dropped. Lookup updates `last_seen_ms` on hit so the cache
+//     follows the actual retry pattern.
+
+/// One IDEMPOTENCY map entry. The cached `response` is the wire
+/// bytes the server originally sent — including status line,
+/// headers, and body — so a retry replays the exact response.
+struct IdempotencyEntry {
+    response: Vec<u8>,
+    expires_at_ms: u64,
+    last_seen_ms: u64,
+}
+
+static IDEMPOTENCY: Mutex<BTreeMap<String, IdempotencyEntry>> =
+    Mutex::new(BTreeMap::new());
+
+/// Probe IDEMPOTENCY for `key`. Returns the cached response bytes
+/// on a fresh hit (after refreshing the entry's `last_seen_ms`),
+/// or `None` for either a miss or an expired entry. Expired entries
+/// are dropped on encounter so the map self-cleans without a
+/// separate sweep task.
+fn lookup_idempotent(key: &str) -> Option<Vec<u8>> {
+    let now = idempotency_now_ms();
+    let mut map = IDEMPOTENCY.lock();
+    let hit = match map.get_mut(key) {
+        Some(entry) if entry.expires_at_ms > now => {
+            entry.last_seen_ms = now;
+            Some(entry.response.clone())
+        }
+        Some(_) => None, // expired — fall through to remove
+        None => return None,
+    };
+    if hit.is_none() {
+        map.remove(key);
+    }
+    hit
+}
+
+/// Insert (or refresh) an IDEMPOTENCY entry for `key`. If the map
+/// is at `IDEMPOTENCY_MAX_ENTRIES` and `key` is new, the LRU entry
+/// (smallest `last_seen_ms`) is evicted to make room.
+fn record_idempotent(key: &str, response: &[u8]) {
+    let now = idempotency_now_ms();
+    let mut map = IDEMPOTENCY.lock();
+    if map.len() >= IDEMPOTENCY_MAX_ENTRIES && !map.contains_key(key) {
+        // O(n) over n=1024 is fine at the request rates the kernel
+        // sees today.
+        if let Some(victim) = map
+            .iter()
+            .min_by_key(|(_, e)| e.last_seen_ms)
+            .map(|(k, _)| k.clone())
+        {
+            map.remove(&victim);
+        }
+    }
+    map.insert(
+        key.to_string(),
+        IdempotencyEntry {
+            response: response.to_vec(),
+            expires_at_ms: now.saturating_add(IDEMPOTENCY_TTL_MS),
+            last_seen_ms: now,
+        },
+    );
+}
+
+/// Wall-clock reading for IDEMPOTENCY TTL/LRU bookkeeping. Routes
+/// through `arch::time::now_ms()` on the kernel target. The test
+/// build uses a per-call monotonic counter so LRU ordering still
+/// works without an arch dep.
+#[cfg(not(test))]
+fn idempotency_now_ms() -> u64 {
+    crate::arch::time::now_ms()
+}
+
+#[cfg(test)]
+fn idempotency_now_ms() -> u64 {
+    static CTR: AtomicU64 = AtomicU64::new(1);
+    CTR.fetch_add(1, Ordering::Relaxed)
+}
+
+/// True iff `response` starts with an `HTTP/1.1 2xx` status line.
+/// Used to skip caching error responses — caching a 400/413/503
+/// would freeze a transient failure into a permanent one for any
+/// client that retries under the same key.
+fn is_2xx_response(response: &[u8]) -> bool {
+    response.starts_with(b"HTTP/1.1 2")
+}
+
+/// Look up the `Idempotency-Key` header value (case-insensitive) in
+/// a buffered HTTP/1.1 request. Mirrors
+/// `extract_content_type_header` / `extract_content_range_header`.
+/// Public so a future net.rs revision can extract the header and
+/// pass it into `try_serve_idempotent` /
+/// `try_serve_chunk_idempotent`.
+// `#[allow(dead_code)]` until net.rs grows the matching call site.
+// Mirrors the existing pattern (extract_content_type_header,
+// extract_content_range_header) which have live callers in
+// `net::drive_http`; once Track NNN's #360 register_http surfaces
+// a dispatch table that re-scans rx_buf for this header, the
+// allow can be dropped.
+#[allow(dead_code)]
+pub fn extract_idempotency_key_header(buf: &[u8]) -> Option<String> {
+    extract_named_header(buf, "idempotency-key")
+}
+
+// ── Per-upload progress events (#447) ──────────────────────────────
+//
+// Each chunk write enqueues a ProgressEvent into the per-file ring
+// in PROGRESS_EVENTS. The SSE handler at `try_serve_progress`
+// drains the ring and writes the events as `text/event-stream`
+// wire bytes with `\n\n` framing. The ring is bounded at
+// PROGRESS_RING_DEPTH (64) — a slow / disconnected subscriber
+// can't pin unbounded memory; older events fall off the front
+// when the ring fills.
+//
+// Lifecycle: enqueues happen via `enqueue_progress`; the handler
+// drains via `drain_progress`. Once an upload completes (the seal
+// step in `try_serve_chunk_idempotent` enqueues the final event)
+// the ring is left in place for any straggler GET — a future
+// commit can prune completed rings on a periodic sweep.
+
+#[derive(Clone, Copy)]
+struct ProgressEvent {
+    bytes_written: u64,
+    total_bytes: u64,
+}
+
+static PROGRESS_EVENTS: Mutex<BTreeMap<String, VecDeque<ProgressEvent>>> =
+    Mutex::new(BTreeMap::new());
+
+/// Enqueue a ProgressEvent for `file_id`. If the per-file ring is
+/// at `PROGRESS_RING_DEPTH`, the oldest event is dropped to make
+/// room (front-drop semantics). Called from
+/// `try_serve_chunk_idempotent` after each successful chunk write.
+fn enqueue_progress(file_id: &str, bytes_written: u64, total_bytes: u64) {
+    let mut events = PROGRESS_EVENTS.lock();
+    let ring = events
+        .entry(file_id.to_string())
+        .or_insert_with(VecDeque::new);
+    if ring.len() >= PROGRESS_RING_DEPTH {
+        ring.pop_front();
+    }
+    ring.push_back(ProgressEvent {
+        bytes_written,
+        total_bytes,
+    });
+}
+
+/// Drain all pending events for `file_id`. Returns an empty `Vec`
+/// if no events are queued.
+fn drain_progress(file_id: &str) -> Vec<ProgressEvent> {
+    let mut events = PROGRESS_EVENTS.lock();
+    match events.get_mut(file_id) {
+        Some(ring) => ring.drain(..).collect(),
+        None => Vec::new(),
+    }
+}
+
+/// HTTP `GET /file/{id}/progress` (#447). Returns
+/// `text/event-stream` wire bytes containing all currently-queued
+/// progress events for `{id}`. Path-only function — the existing
+/// dispatch chain in `net::drive_http` reaches it through
+/// `try_serve_upload_state`, which now chains to it before its
+/// own match (so the new GET path is reachable on the live wire
+/// without a net.rs touch).
+///
+/// SSE shape choice (polled-each-GET, not held-open): the kernel's
+/// HTTP listener is single-shot per connection — `drive_http`
+/// parses one request, queues one response, and closes the socket.
+/// Holding a connection open across the response loop would
+/// require a rewrite of the listener state machine. The polled-
+/// each-GET shape fits the existing surface cleanly: each GET
+/// drains the queue and writes whatever events are pending, plus a
+/// `Last-Event-ID` header so the client knows where it left off.
+/// EventSource's reconnect logic does the right thing — it'll
+/// re-poll automatically. When the upload completes (closing event
+/// has `bytes_written == total_bytes`), the response includes a
+/// final `event: complete\ndata: {}\n\n` frame.
+pub fn try_serve_progress(method: &str, path: &str) -> ServeOutcome {
+    let (path_only, _) = split_query(path);
+    let file_id = match parse_progress_path(path_only) {
+        Some(id) => id,
+        None => return ServeOutcome::NotApplicable,
+    };
+    if method != "GET" {
+        return ServeOutcome::Response(method_not_allowed_progress());
+    }
+    let events = drain_progress(file_id);
+    ServeOutcome::Response(progress_sse_response(file_id, &events))
+}
+
+/// Extract `{id}` from `/file/{id}/progress`. Symmetric with
+/// `parse_chunk_path` and `parse_upload_state_path`.
+fn parse_progress_path(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/file/")?;
+    let id = rest.strip_suffix("/progress")?;
+    if id.is_empty() || id.contains('/') {
+        return None;
+    }
+    Some(id)
+}
+
+// ── First-chunk MIME promotion (#448) ──────────────────────────────
+
+/// Replace the `File_has_MimeType` fact for `file_id` with one
+/// whose MimeType binding is `mime`. Implemented as `cell_filter`
+/// (drops the existing fact for this file id) followed by
+/// `cell_push` (adds the new one) so the cell ends up with exactly
+/// one MimeType fact per file id — no duplicates, no reordering of
+/// facts for unrelated files. The other four File facts (Name /
+/// ContentRef / Size / is_in_Directory) are untouched, so the
+/// placeholder ContentRef the chunked-init step planted stays live
+/// until the closing seal step swaps it for `<REGION,base,len>`.
+fn update_mime_fact(state: &Object, file_id: &str, mime: &str) -> Object {
+    let target_file_id = file_id.to_string();
+    let filtered = ast::cell_filter(
+        "File_has_MimeType",
+        move |fact| ast::binding(fact, "File") != Some(&target_file_id),
+        state,
+    );
+    ast::cell_push(
+        "File_has_MimeType",
+        fact_from_pairs(&[("File", file_id), ("MimeType", mime)]),
+        &filtered,
+    )
+}
 
 /// Look up `File_has_Size` for `file_id`. Mirrors `file_serve`'s
 /// lookup_mime / lookup_content_ref shape.
@@ -1310,6 +1766,84 @@ fn method_not_allowed_upload_state() -> Vec<u8> {
     push_header(&mut out, "Connection", "close");
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(body);
+    out
+}
+
+fn method_not_allowed_progress() -> Vec<u8> {
+    let body = b"only GET is supported on /file/{id}/progress\n";
+    let mut out = Vec::with_capacity(128 + body.len());
+    push_status(&mut out, 405, "Method Not Allowed");
+    push_header(&mut out, "Allow", "GET");
+    push_header(&mut out, "Content-Type", "text/plain; charset=utf-8");
+    push_header(&mut out, "Content-Length", &format!("{}", body.len()));
+    push_header(&mut out, "Connection", "close");
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(body);
+    out
+}
+
+/// Render a polled SSE response for `/file/{id}/progress` (#447).
+/// Each `ProgressEvent` becomes one `data: {...}\n\n` frame; the
+/// closing event (`bytes_written == total_bytes` with `total_bytes
+/// > 0` so empty-upload doesn't fire it) is additionally promoted
+/// to an `event: complete\ndata: {}\n\n` frame so a subscriber can
+/// branch on the SSE event name without parsing the JSON body.
+///
+/// Wire shape per SSE spec (https://html.spec.whatwg.org/#server-
+/// sent-events): `Content-Type: text/event-stream`. The polled-
+/// each-GET shape this listener uses sets Content-Length so the
+/// existing single-shot `drive_http` close-after-write loop sees a
+/// terminated response. The browser EventSource handles both shapes
+/// (held-open or polled-with-Content-Length) transparently.
+///
+/// `Last-Event-ID` (in response headers) is the highest
+/// `bytes_written` value in this batch — clients reconnect with
+/// `Last-Event-ID:` in the request, and the next GET resumes after
+/// that point. Today the kernel doesn't honour the request header
+/// (the queue is drain-only), but emitting it keeps the wire shape
+/// EventSource-compliant.
+fn progress_sse_response(file_id: &str, events: &[ProgressEvent]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(128 * (events.len() + 1));
+    let mut last_id: u64 = 0;
+    let mut completed = false;
+    for ev in events {
+        body.extend_from_slice(b"id: ");
+        body.extend_from_slice(format!("{}", ev.bytes_written).as_bytes());
+        body.extend_from_slice(b"\n");
+        body.extend_from_slice(b"data: ");
+        body.extend_from_slice(
+            format!(
+                "{{\"file_id\":\"{}\",\"bytes_written\":{},\"total_bytes\":{}}}",
+                file_id, ev.bytes_written, ev.total_bytes,
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(b"\n\n");
+        if ev.total_bytes > 0 && ev.bytes_written >= ev.total_bytes {
+            completed = true;
+        }
+        if ev.bytes_written > last_id {
+            last_id = ev.bytes_written;
+        }
+    }
+    if completed {
+        body.extend_from_slice(b"event: complete\ndata: {}\n\n");
+    } else if events.is_empty() {
+        // Comment-only keepalive when no events are queued — keeps
+        // the polled connection cheap and signals "no progress yet"
+        // without inventing a custom event name.
+        body.extend_from_slice(b": keepalive\n\n");
+    }
+
+    let mut out = Vec::with_capacity(192 + body.len());
+    push_status(&mut out, 200, "OK");
+    push_header(&mut out, "Content-Type", "text/event-stream");
+    push_header(&mut out, "Cache-Control", "no-cache");
+    push_header(&mut out, "Last-Event-ID", &format!("{}", last_id));
+    push_header(&mut out, "Content-Length", &format!("{}", body.len()));
+    push_header(&mut out, "Connection", "close");
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&body);
     out
 }
 
@@ -2287,6 +2821,7 @@ mod tests {
             mime_hint: "application/octet-stream".to_string(),
             sniff_window: Vec::new(),
             complete: false,
+            mime_promoted: false,
         });
     }
 
@@ -2378,5 +2913,395 @@ mod tests {
         let s = core::str::from_utf8(&bytes).unwrap();
         assert!(s.starts_with("HTTP/1.1 416 Range Not Satisfiable\r\n"));
         assert!(s.contains("Content-Range: bytes */100"));
+    }
+
+    // ── Idempotency-Key tests (#446) ──────────────────────────────────
+
+    /// A retried POST under the same idempotency key returns the
+    /// cached response verbatim — same File id, same Location header,
+    /// same JSON body. Without the cache, a second POST would mint a
+    /// fresh `file-upload-N` id.
+    #[test]
+    fn idempotency_hit_returns_cached_response() {
+        crate::system::init();
+        // Use a unique key per test run so prior test runs don't
+        // shadow the new entry. The IDEMPOTENCY map is process-
+        // global since it lives behind a static Mutex.
+        let key = "test-idempotency-hit-446";
+        IDEMPOTENCY.lock().remove(key);
+
+        let body = synth_multipart("BNDRY", "first.txt", b"hello", "dir-1");
+        let r1 = match try_serve_idempotent(
+            "POST", "/file",
+            Some("multipart/form-data; boundary=BNDRY"),
+            &body, None,
+            Some(key),
+        ) {
+            ServeOutcome::Response(b) => b,
+            _ => panic!("expected Response on first POST"),
+        };
+        // The retry should get the *same* bytes back — including the
+        // file id. We don't even pass a body the second time; the
+        // cache short-circuits before parsing anything.
+        let r2 = match try_serve_idempotent(
+            "POST", "/file",
+            Some("multipart/form-data; boundary=BNDRY"),
+            // Different body, same key — cache should hide the change.
+            b"different-body-but-same-key",
+            None, Some(key),
+        ) {
+            ServeOutcome::Response(b) => b,
+            _ => panic!("expected Response on retry"),
+        };
+        assert_eq!(r1, r2, "idempotency replay must return identical bytes");
+        IDEMPOTENCY.lock().remove(key);
+    }
+
+    /// A miss followed by an expired-entry encounter returns `None`
+    /// and removes the stale entry. Today's synthetic clock advances
+    /// monotonically per call; we feed an entry whose `expires_at_ms`
+    /// is `0` to model already-expired state.
+    #[test]
+    fn idempotency_expired_entry_returns_none() {
+        let key = "test-idempotency-expired-446";
+        IDEMPOTENCY.lock().insert(key.to_string(), IdempotencyEntry {
+            response: b"HTTP/1.1 200 OK\r\n\r\n".to_vec(),
+            expires_at_ms: 0, // already expired against any positive clock
+            last_seen_ms: 0,
+        });
+        assert!(lookup_idempotent(key).is_none(), "expired entry must miss");
+        assert!(!IDEMPOTENCY.lock().contains_key(key), "expired entry must be evicted on miss");
+    }
+
+    /// `record_idempotent` evicts the LRU entry when the map is at
+    /// the cap. Drives the cap down (via direct insert) to make the
+    /// test cheap, then asserts the oldest entry is the one kicked
+    /// out by a fresh insert.
+    #[test]
+    fn idempotency_lru_eviction_drops_oldest() {
+        // Clear out any pre-existing entries so the map state is
+        // deterministic within this test.
+        IDEMPOTENCY.lock().clear();
+        // Record N + 1 entries where N == IDEMPOTENCY_MAX_ENTRIES.
+        // We can't drive the loop that high in a unit test (that's
+        // 1024 inserts) — instead, reach into the map manually for
+        // the first MAX entries and let `record_idempotent` insert
+        // the (MAX+1)th, which should evict the LRU entry.
+        for i in 0..IDEMPOTENCY_MAX_ENTRIES {
+            // Synthetic ascending last_seen_ms — entry "0" is the
+            // oldest, entry "(MAX-1)" is the newest.
+            IDEMPOTENCY.lock().insert(
+                alloc::format!("eviction-key-{}", i),
+                IdempotencyEntry {
+                    response: b"HTTP/1.1 200 OK\r\n\r\n".to_vec(),
+                    expires_at_ms: u64::MAX, // never expire
+                    last_seen_ms: (i + 1) as u64,
+                },
+            );
+        }
+        assert_eq!(IDEMPOTENCY.lock().len(), IDEMPOTENCY_MAX_ENTRIES);
+        // New key triggers an LRU eviction. Per LRU semantics, the
+        // first entry (smallest last_seen_ms = 1) gets dropped.
+        record_idempotent("eviction-trigger-new", b"HTTP/1.1 201 Created\r\n\r\n");
+        let map = IDEMPOTENCY.lock();
+        assert!(!map.contains_key("eviction-key-0"), "LRU entry must be evicted");
+        assert!(map.contains_key("eviction-trigger-new"), "fresh entry must land");
+        assert_eq!(map.len(), IDEMPOTENCY_MAX_ENTRIES, "size cap holds");
+    }
+
+    /// `is_2xx_response` distinguishes 2xx from 4xx / 5xx so the
+    /// IDEMPOTENCY caching path can skip error responses (caching
+    /// a 503 would freeze a transient failure into a permanent
+    /// one for any client retrying with the same key).
+    #[test]
+    fn is_2xx_response_filters_correctly() {
+        assert!(is_2xx_response(b"HTTP/1.1 200 OK\r\n\r\n"));
+        assert!(is_2xx_response(b"HTTP/1.1 201 Created\r\n\r\n"));
+        assert!(is_2xx_response(b"HTTP/1.1 204 No Content\r\n\r\n"));
+        assert!(!is_2xx_response(b"HTTP/1.1 400 Bad Request\r\n\r\n"));
+        assert!(!is_2xx_response(b"HTTP/1.1 413 Payload Too Large\r\n\r\n"));
+        assert!(!is_2xx_response(b"HTTP/1.1 503 Service Unavailable\r\n\r\n"));
+        assert!(!is_2xx_response(b""));
+    }
+
+    /// `extract_idempotency_key_header` reads the header value the
+    /// way the other `extract_*_header` helpers do — case-insensitive,
+    /// whitespace-stripped.
+    #[test]
+    fn extract_idempotency_key_header_present() {
+        let req = b"POST /file HTTP/1.1\r\n\
+                    Host: arest\r\n\
+                    Idempotency-Key: client-supplied-uuid-abc\r\n\
+                    Content-Length: 0\r\n\
+                    \r\n";
+        assert_eq!(
+            extract_idempotency_key_header(req).as_deref(),
+            Some("client-supplied-uuid-abc"),
+        );
+    }
+
+    #[test]
+    fn extract_idempotency_key_header_case_insensitive() {
+        let req = b"POST /file HTTP/1.1\r\n\
+                    IDEMPOTENCY-key: ABC\r\n\
+                    \r\n";
+        assert_eq!(
+            extract_idempotency_key_header(req).as_deref(),
+            Some("ABC"),
+        );
+    }
+
+    #[test]
+    fn extract_idempotency_key_header_absent() {
+        let req = b"POST /file HTTP/1.1\r\nHost: arest\r\n\r\n";
+        assert!(extract_idempotency_key_header(req).is_none());
+    }
+
+    // ── SSE progress tests (#447) ─────────────────────────────────────
+
+    #[test]
+    fn parse_progress_path_extracts_id() {
+        assert_eq!(parse_progress_path("/file/abc/progress"), Some("abc"));
+        assert_eq!(parse_progress_path("/file/file-upload-7/progress"), Some("file-upload-7"));
+    }
+
+    #[test]
+    fn parse_progress_path_rejects_other_shapes() {
+        assert_eq!(parse_progress_path("/file/abc"), None);
+        assert_eq!(parse_progress_path("/file//progress"), None);
+        assert_eq!(parse_progress_path("/file/abc/progress/extra"), None);
+        assert_eq!(parse_progress_path("/file/abc/upload-state"), None);
+        assert_eq!(parse_progress_path("/file/abc/chunk"), None);
+    }
+
+    /// `enqueue_progress` should append to the per-file ring; a
+    /// drain returns the events in FIFO order. Tests the per-file
+    /// keyed-map shape stays isolated across distinct file ids.
+    #[test]
+    fn enqueue_then_drain_returns_events_in_order() {
+        let id_a = "test-progress-enqueue-a";
+        let id_b = "test-progress-enqueue-b";
+        PROGRESS_EVENTS.lock().remove(id_a);
+        PROGRESS_EVENTS.lock().remove(id_b);
+
+        enqueue_progress(id_a, 100, 1000);
+        enqueue_progress(id_a, 200, 1000);
+        enqueue_progress(id_b, 50, 500); // unrelated file
+        enqueue_progress(id_a, 300, 1000);
+
+        let drained = drain_progress(id_a);
+        assert_eq!(drained.len(), 3, "all three events for id_a");
+        assert_eq!(drained[0].bytes_written, 100);
+        assert_eq!(drained[1].bytes_written, 200);
+        assert_eq!(drained[2].bytes_written, 300);
+        // id_b's ring must be untouched by the id_a drain.
+        let drained_b = drain_progress(id_b);
+        assert_eq!(drained_b.len(), 1, "id_b ring isolated");
+        assert_eq!(drained_b[0].bytes_written, 50);
+    }
+
+    /// When the per-file ring fills, the oldest event is dropped to
+    /// make room for the new one (front-drop). Bounds memory under
+    /// a slow / disconnected SSE subscriber.
+    #[test]
+    fn enqueue_drops_oldest_when_ring_full() {
+        let id = "test-progress-front-drop";
+        PROGRESS_EVENTS.lock().remove(id);
+        // Push DEPTH+2 events; only the last DEPTH should survive.
+        for i in 0..(PROGRESS_RING_DEPTH + 2) {
+            enqueue_progress(id, i as u64, PROGRESS_RING_DEPTH as u64);
+        }
+        let drained = drain_progress(id);
+        assert_eq!(drained.len(), PROGRESS_RING_DEPTH);
+        // The first surviving event should have bytes_written == 2
+        // (the first two were dropped to make room for the last two).
+        assert_eq!(drained[0].bytes_written, 2);
+        assert_eq!(drained.last().unwrap().bytes_written, (PROGRESS_RING_DEPTH + 1) as u64);
+    }
+
+    /// SSE wire format — exactly one `\n\n`-delimited frame per event,
+    /// each with `data: ` + JSON body. The `id:` line and
+    /// `Last-Event-ID` header carry the `bytes_written` cursor so a
+    /// reconnecting client can resume.
+    #[test]
+    fn sse_wire_format_proper_framing() {
+        let events = alloc::vec![
+            ProgressEvent { bytes_written: 4096, total_bytes: 16384 },
+            ProgressEvent { bytes_written: 8192, total_bytes: 16384 },
+        ];
+        let bytes = progress_sse_response("file-x", &events);
+        let s = core::str::from_utf8(&bytes).unwrap();
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(s.contains("Content-Type: text/event-stream"));
+        assert!(s.contains("Cache-Control: no-cache"));
+        assert!(s.contains("Last-Event-ID: 8192"), "Last-Event-ID tracks the highest cursor: {}", s);
+        // Each event ends in \n\n per SSE spec.
+        let body_start = s.find("\r\n\r\n").expect("header/body separator") + 4;
+        let body = &s[body_start..];
+        // Expect: "id: 4096\ndata: {...}\n\nid: 8192\ndata: {...}\n\n"
+        assert!(body.contains("id: 4096\ndata: {\"file_id\":\"file-x\",\"bytes_written\":4096,\"total_bytes\":16384}\n\n"),
+                "first frame: {}", body);
+        assert!(body.contains("id: 8192\ndata: {\"file_id\":\"file-x\",\"bytes_written\":8192,\"total_bytes\":16384}\n\n"),
+                "second frame: {}", body);
+        // No trailing `event: complete` since neither event hit total.
+        assert!(!body.contains("event: complete"), "no complete event yet: {}", body);
+    }
+
+    /// When the closing event has `bytes_written == total_bytes`,
+    /// the response includes a `event: complete\ndata: {}\n\n` frame
+    /// so an EventSource subscriber can branch on the SSE event name
+    /// without parsing the JSON body.
+    #[test]
+    fn sse_wire_includes_complete_event_on_seal() {
+        let events = alloc::vec![
+            ProgressEvent { bytes_written: 8192, total_bytes: 16384 },
+            ProgressEvent { bytes_written: 16384, total_bytes: 16384 },
+        ];
+        let bytes = progress_sse_response("file-y", &events);
+        let s = core::str::from_utf8(&bytes).unwrap();
+        assert!(s.contains("event: complete\ndata: {}\n\n"), "complete frame: {}", s);
+    }
+
+    /// An empty drain returns a comment-only `: keepalive\n\n` so the
+    /// polled connection doesn't 404 / 204 and the EventSource client
+    /// stays subscribed. Helps the UI distinguish "no events yet" from
+    /// "session vanished".
+    #[test]
+    fn sse_wire_empty_drain_emits_keepalive() {
+        let bytes = progress_sse_response("file-z", &[]);
+        let s = core::str::from_utf8(&bytes).unwrap();
+        let body_start = s.find("\r\n\r\n").expect("header/body separator") + 4;
+        let body = &s[body_start..];
+        assert_eq!(body, ": keepalive\n\n");
+    }
+
+    /// `try_serve_progress` returns NotApplicable on paths that
+    /// don't match `/file/{id}/progress`, so the chain in
+    /// `try_serve_upload_state` falls through cleanly.
+    #[test]
+    fn try_serve_progress_unrelated_path_passes_through() {
+        match try_serve_progress("GET", "/api/welcome") {
+            ServeOutcome::NotApplicable => {}
+            _ => panic!("expected NotApplicable"),
+        }
+    }
+
+    #[test]
+    fn try_serve_progress_wrong_method_405() {
+        match try_serve_progress("POST", "/file/abc/progress") {
+            ServeOutcome::Response(bytes) => {
+                let s = core::str::from_utf8(&bytes).unwrap();
+                assert!(s.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
+                assert!(s.contains("Allow: GET"));
+            }
+            _ => panic!("expected Response"),
+        }
+    }
+
+    /// `try_serve_upload_state` chains to `try_serve_progress` first,
+    /// so a GET on `/file/{id}/progress` must yield SSE wire bytes
+    /// (not a 404 from the upload-state lookup arm).
+    #[test]
+    fn try_serve_upload_state_chains_to_progress() {
+        // No active upload, no events queued — should still return
+        // a 200 with the keepalive comment, not a 404.
+        let id = "test-progress-chain-id";
+        PROGRESS_EVENTS.lock().remove(id);
+        let path = alloc::format!("/file/{}/progress", id);
+        match try_serve_upload_state("GET", &path, None) {
+            ServeOutcome::Response(bytes) => {
+                let s = core::str::from_utf8(&bytes).unwrap();
+                assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "should chain to progress: {}", s);
+                assert!(s.contains("Content-Type: text/event-stream"));
+            }
+            _ => panic!("expected Response from chained progress handler"),
+        }
+    }
+
+    // ── First-chunk MIME promotion tests (#448) ───────────────────────
+
+    /// `update_mime_fact` removes any existing File_has_MimeType
+    /// fact for the file id and pushes a single fresh one — net
+    /// effect is exactly one MimeType fact per file id, regardless
+    /// of how many times the function is called.
+    #[test]
+    fn update_mime_fact_replaces_existing_mime() {
+        let phi = Object::phi();
+        // Pre-state has MimeType=octet-stream (placeholder from
+        // chunked-init) plus a sibling Name fact that should be
+        // untouched.
+        let pre = ast::cell_push(
+            "File_has_MimeType",
+            fact_from_pairs(&[("File", "f-1"), ("MimeType", "application/octet-stream")]),
+            &phi,
+        );
+        let pre = ast::cell_push(
+            "File_has_Name",
+            fact_from_pairs(&[("File", "f-1"), ("Name", "image.bin")]),
+            &pre,
+        );
+        // Apply the sniffed promotion.
+        let next = update_mime_fact(&pre, "f-1", "image/png");
+        // MimeType cell now has exactly one fact for f-1, with the
+        // promoted type.
+        let mime_cell = ast::fetch_or_phi("File_has_MimeType", &next);
+        let seq = mime_cell.as_seq().expect("MimeType cell exists");
+        let f1_facts: Vec<_> = seq.iter()
+            .filter(|f| ast::binding(f, "File") == Some("f-1"))
+            .collect();
+        assert_eq!(f1_facts.len(), 1, "exactly one MimeType fact post-promotion");
+        assert_eq!(ast::binding(f1_facts[0], "MimeType"), Some("image/png"));
+        // Name fact unaffected.
+        let name_cell = ast::fetch_or_phi("File_has_Name", &next);
+        let name_seq = name_cell.as_seq().expect("Name cell exists");
+        assert!(name_seq.iter().any(|f| {
+            ast::binding(f, "File") == Some("f-1")
+                && ast::binding(f, "Name") == Some("image.bin")
+        }), "Name fact preserved");
+    }
+
+    /// Other files' MimeType facts must not be touched by an
+    /// update for one file id.
+    #[test]
+    fn update_mime_fact_isolates_per_file_id() {
+        let phi = Object::phi();
+        let pre = ast::cell_push(
+            "File_has_MimeType",
+            fact_from_pairs(&[("File", "other"), ("MimeType", "text/plain")]),
+            &phi,
+        );
+        let pre = ast::cell_push(
+            "File_has_MimeType",
+            fact_from_pairs(&[("File", "target"), ("MimeType", "application/octet-stream")]),
+            &pre,
+        );
+        let next = update_mime_fact(&pre, "target", "image/jpeg");
+        let mime_cell = ast::fetch_or_phi("File_has_MimeType", &next);
+        let seq = mime_cell.as_seq().expect("MimeType cell exists");
+        // Other file's fact preserved.
+        assert!(seq.iter().any(|f| {
+            ast::binding(f, "File") == Some("other")
+                && ast::binding(f, "MimeType") == Some("text/plain")
+        }), "other file's fact preserved");
+        // Target file's fact promoted.
+        let target_facts: Vec<_> = seq.iter()
+            .filter(|f| ast::binding(f, "File") == Some("target"))
+            .collect();
+        assert_eq!(target_facts.len(), 1);
+        assert_eq!(ast::binding(target_facts[0], "MimeType"), Some("image/jpeg"));
+    }
+
+    /// MIME_SNIFF_MIN_BYTES of PNG-magic should detect as image/png
+    /// even when the placeholder mime_hint is application/octet-
+    /// stream. This is the core sniff-overrides-spoofed-Content-Type
+    /// behaviour #448 ships.
+    #[test]
+    fn mime_sniff_overrides_octet_stream_placeholder() {
+        let mut buf = alloc::vec![0u8; MIME_SNIFF_MIN_BYTES];
+        buf[..8].copy_from_slice(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+        let sniffed = detect_mime(&buf[..MIME_SNIFF_MIN_BYTES]);
+        assert_eq!(sniffed, "image/png");
+        assert_ne!(sniffed, "application/octet-stream",
+                   "sniffed type must override the placeholder");
     }
 }
