@@ -47,11 +47,21 @@ import { AppShell, Theme, ThemeMode } from "../AppShell.slint";
 import { Button, ButtonVariant } from "../components/Button.slint";
 import { Card } from "../components/Card.slint";
 import { List, ListItem } from "../components/List.slint";
+// Track TTT #430: pull the REPL toolkit's Slint surface into the
+// import graph so the slint-build entry (this file) emits the `Repl`
+// component into the same generated `HateoasBrowser.rs` reached by
+// `slint::include_modules!()` in `arch/uefi/slint_backend.rs`. The
+// re-export below makes `Repl` visible to the Rust glue at
+// `crate::arch::uefi::slint_backend::Repl`. Same trick used for
+// AppShell — keeps the kernel on a single slint-build invocation
+// without a build.rs change.
+import { Repl } from "./Repl.slint";
 
 // Re-export AppShell + Theme so the existing slint_backend.rs smoke
 // test (which constructs `AppShell::new()` after `slint::include_modules!()`)
-// keeps compiling without touching that file.
-export { AppShell, Theme, ThemeMode }
+// keeps compiling without touching that file. `Repl` is re-exported
+// for `crate::ui_apps::repl` (Track TTT #430) for the same reason.
+export { AppShell, Theme, ThemeMode, Repl }
 
 // The HATEOAS browser window. The Rust glue (`ui_apps::hateoas`) sets
 // the four `*-model` properties from `system::with_state`, and the

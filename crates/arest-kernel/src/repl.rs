@@ -88,6 +88,29 @@ pub fn process_key(ch: char) {
     }
 }
 
+/// Evaluate one line of input and return the response as a `String`,
+/// without routing through the `print!` sink.
+///
+/// This is the GUI entry point — used by `crate::ui_apps::repl`
+/// (Track TTT #430) to bridge a Slint TextInput's `accepted` callback
+/// to the same dispatch table that the BIOS-era `process_key` ISR
+/// shim (used by `crate::entry_uefi`'s drainer loop, GGG #365) calls
+/// when it sees `\n`. Both paths agree on the result: any side-effect
+/// of the command (e.g. `quit` halting the kernel) happens inside
+/// `dispatch`; the printable response is what comes out the return.
+///
+/// The shim trims the line to match `process_key`'s `dispatch(line.
+/// trim())` semantics, so callers can pass raw input from a text
+/// field without having to strip whitespace themselves.
+///
+/// Note: `dispatch` itself is the same function the ISR uses — this
+/// is a deliberate parallel surface, not a refactor. Keeping
+/// `process_key` unchanged means GGG's #365 wiring in `entry_uefi.rs`
+/// keeps working without coordination from this track.
+pub fn evaluate_line(line: &str) -> String {
+    dispatch(line.trim())
+}
+
 /// Dispatch a trimmed input line and return a response string.
 ///
 /// Built-in commands are handled directly. The arest engine is not
@@ -152,5 +175,42 @@ pub fn dispatch(line: &str) -> String {
                  to enable expression evaluation. Type `help` for commands."
             )
         }
+    }
+}
+
+// `arest-kernel`'s bin target has `test = false` (Cargo.toml), so these
+// `#[cfg(test)]` cases are reachable only when the crate is re-shaped
+// into a lib for hosted testing — same pattern as `system.rs`,
+// `file_serve.rs`, and `ui_apps::hateoas`. They document the intent
+// of `evaluate_line` (the GUI shim Track TTT #430 added) and form a
+// smoke battery for the day the kernel grows a lib facade.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evaluate_line_trims_whitespace() {
+        // Leading/trailing whitespace must not change command lookup.
+        assert_eq!(evaluate_line("  help  "), evaluate_line("help"));
+    }
+
+    #[test]
+    fn evaluate_line_help_lists_commands() {
+        let out = evaluate_line("help");
+        assert!(out.contains("help"), "help mention missing: {out}");
+        assert!(out.contains("heap"), "heap mention missing: {out}");
+    }
+
+    #[test]
+    fn evaluate_line_unknown_reports_unknown() {
+        let out = evaluate_line("zzfrobnicate");
+        assert!(out.contains("unknown command"), "missing unknown marker: {out}");
+        assert!(out.contains("zzfrobnicate"), "missing echo of input: {out}");
+    }
+
+    #[test]
+    fn evaluate_line_empty_returns_empty() {
+        assert!(evaluate_line("").is_empty());
+        assert!(evaluate_line("   ").is_empty());
     }
 }
