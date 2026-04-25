@@ -2,15 +2,24 @@
  * FileList — center column of the file browser.
  *
  * Lists Files inside the currently-selected Directory. Columns:
- * Name (with mime-typed icon), Size, Modified, Tags (chips). Sortable
- * by name / size / modified via the column headers. Filtered by the
- * AND-combined selected tag set passed in by the parent FileBrowser.
+ * Select-checkbox (#406), Name (with mime-typed icon), Size, Modified,
+ * Tags (chips). Sortable by name / size / modified via the column
+ * headers. Filtered by the AND-combined selected tag set passed in
+ * by the parent FileBrowser.
  *
  * Pure tokens-based styling — no inline colors, no inline px outside
  * the SPACING grid (we lean on the `xs` / `sm` / `md` / `lg` Tailwind
  * scale that mirrors SpacingToken).
+ *
+ * Multi-select column (#406):
+ *   - Header checkbox = master toggle (all-on / all-off / indeterminate).
+ *   - Per-row checkbox toggles individual selection without affecting
+ *     the preview-pin (which still follows clicks on the row body).
+ *   - Click on the row body honours Shift / Ctrl-Meta modifiers and
+ *     defers to the supplied selection.click handler. Without
+ *     modifiers it falls through to the legacy onSelect (preview pin).
  */
-import { useMemo, useState, type ComponentType, type ReactElement } from 'react'
+import { useEffect, useMemo, useRef, useState, type ComponentType, type MouseEvent as ReactMouseEvent, type ReactElement } from 'react'
 import { useArestList } from '../../hooks/useArestResource'
 import { cn } from '../../lib/utils'
 import {
@@ -24,6 +33,7 @@ import {
   SortAsc,
   SortDesc,
 } from '../../lib/icons'
+import type { FileSelectionApi } from './useFileSelection'
 
 export interface FileRow {
   id: string
@@ -48,8 +58,22 @@ export interface FileListProps {
   tagFilter: Set<string>
   /** Currently-selected file id (highlights the row). */
   selectedFileId?: string | null
-  /** Click handler — receives the clicked file id. */
+  /** Click handler — receives the clicked file id (preview pin). */
   onSelect: (id: string) => void
+  /**
+   * Optional multi-select API (#406). When supplied the FileList
+   * renders the leading checkbox column + drives the visible-id
+   * window for shift-range. When omitted the legacy single-select
+   * behaviour is preserved.
+   */
+  selection?: FileSelectionApi
+  /**
+   * Optional callback fired with the array of File rows currently
+   * visible (post sort + tag filter). Lets the parent compute things
+   * like "tags present on the selection" without re-running the same
+   * query path. Stable identity within a render frame.
+   */
+  onVisibleRowsChange?: (rows: ReadonlyArray<FileRow>) => void
 }
 
 type IconComponent = ComponentType<{ size?: number; className?: string }>
@@ -87,7 +111,15 @@ function formatDate(iso: string | null | undefined): string {
   return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
 }
 
-export function FileList({ baseUrl, directoryId, tagFilter, selectedFileId, onSelect }: FileListProps): ReactElement {
+export function FileList({
+  baseUrl,
+  directoryId,
+  tagFilter,
+  selectedFileId,
+  onSelect,
+  selection,
+  onVisibleRowsChange,
+}: FileListProps): ReactElement {
   const [sort, setSort] = useState<SortState>({ field: 'name', order: 'asc' })
 
   // Server-side filter on parent_id when a directory is selected. The
@@ -124,6 +156,17 @@ export function FileList({ baseUrl, directoryId, tagFilter, selectedFileId, onSe
     return sorted
   }, [allRows, directoryId, tagFilter, sort])
 
+  // Push the visible row order into the selection API + the optional
+  // parent callback. The selection ref-only update means re-renders
+  // don't fire here just because the visible order changed.
+  const lastVisibleIdsRef = useRef<string>('')
+  useEffect(() => {
+    const ids = rows.map((r) => r.id)
+    selection?.setVisibleIds(ids)
+    onVisibleRowsChange?.(rows)
+    lastVisibleIdsRef.current = ids.join('|')
+  }, [rows, selection, onVisibleRowsChange])
+
   const toggleSort = (field: SortField) => {
     setSort((prev) =>
       prev.field === field
@@ -132,11 +175,39 @@ export function FileList({ baseUrl, directoryId, tagFilter, selectedFileId, onSe
     )
   }
 
+  // Master checkbox visual state — drive aria-checked from the
+  // selection API. When selection is undefined the column is hidden.
+  const masterRef = useRef<HTMLInputElement | null>(null)
+  useEffect(() => {
+    if (!masterRef.current || !selection) return
+    masterRef.current.indeterminate = selection.someVisibleSelected
+  }, [selection, selection?.someVisibleSelected])
+
+  const showCheckboxes = Boolean(selection)
+  const colCount = showCheckboxes ? 5 : 4
+
   return (
     <div data-testid="file-list" className="h-full overflow-y-auto">
       <table className="w-full border-collapse text-body">
         <thead className="sticky top-0 bg-neutral-100 border-b border-border">
           <tr>
+            {showCheckboxes && selection ? (
+              <th
+                scope="col"
+                className="px-md py-sm w-[32px]"
+                data-testid="file-list-master-cell"
+              >
+                <input
+                  ref={masterRef}
+                  type="checkbox"
+                  data-testid="file-list-master-checkbox"
+                  aria-label="Select all visible files"
+                  checked={selection.allVisibleSelected}
+                  onChange={() => selection.toggleAllVisible()}
+                  className="cursor-pointer accent-accent"
+                />
+              </th>
+            ) : null}
             <SortHeader label="Name" field="name" sort={sort} onClick={toggleSort} />
             <SortHeader label="Size" field="size" sort={sort} onClick={toggleSort} align="right" />
             <SortHeader label="Modified" field="modified" sort={sort} onClick={toggleSort} />
@@ -146,26 +217,59 @@ export function FileList({ baseUrl, directoryId, tagFilter, selectedFileId, onSe
         <tbody>
           {rows.length === 0 ? (
             <tr>
-              <td colSpan={4} className="px-md py-lg text-center text-text-muted text-body-sm" data-testid="file-list-empty">
+              <td colSpan={colCount} className="px-md py-lg text-center text-text-muted text-body-sm" data-testid="file-list-empty">
                 {list.isLoading ? 'Loading…' : 'No files in this directory.'}
               </td>
             </tr>
           ) : (
             rows.map((row) => {
               const Icon = pickFileIcon(row.mime_type)
-              const isSelected = row.id === selectedFileId
+              const isPreviewPinned = row.id === selectedFileId
+              const isMultiSelected = selection?.has(row.id) ?? false
               return (
                 <tr
                   key={row.id}
                   data-testid={`file-row-${row.id}`}
-                  data-selected={isSelected ? 'true' : 'false'}
-                  onClick={() => onSelect(row.id)}
+                  data-selected={isPreviewPinned ? 'true' : 'false'}
+                  data-multi-selected={isMultiSelected ? 'true' : 'false'}
+                  onClick={(e: ReactMouseEvent<HTMLTableRowElement>) => {
+                    const shift = e.shiftKey
+                    const meta = e.ctrlKey || e.metaKey
+                    if (selection && (shift || meta)) {
+                      // Suppress text-selection caused by shift-click before
+                      // the modifier branch fires. Plain clicks on the row
+                      // body still fall through to the preview pin.
+                      e.preventDefault()
+                      selection.click(row.id, { shift, meta })
+                      return
+                    }
+                    if (selection) {
+                      selection.click(row.id, {})
+                    }
+                    onSelect(row.id)
+                  }}
                   className={cn(
                     'cursor-pointer border-b border-border transition-colors duration-fast',
                     'hover:bg-neutral-200',
-                    isSelected && 'bg-accent/10',
+                    isMultiSelected && 'bg-accent/10',
+                    isPreviewPinned && 'bg-accent/20',
                   )}
                 >
+                  {showCheckboxes && selection ? (
+                    <td
+                      className="px-md py-sm w-[32px]"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <input
+                        type="checkbox"
+                        data-testid={`file-row-checkbox-${row.id}`}
+                        aria-label={`Select ${row.name}`}
+                        checked={isMultiSelected}
+                        onChange={() => selection.toggle(row.id)}
+                        className="cursor-pointer accent-accent"
+                      />
+                    </td>
+                  ) : null}
                   <td className="px-md py-sm">
                     <span className="inline-flex items-center gap-sm">
                       <Icon size={16} className="text-text-muted shrink-0" />

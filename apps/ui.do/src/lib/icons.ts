@@ -47,6 +47,18 @@ export {
   Copy,
 } from 'lucide-react'
 
+// Bulk file ops (#406) ------------------------------------------------------
+// Move-folder lives in lucide-react v1 as `FolderInput` (and the
+// alternative `FolderSymlink`); we re-export under the AREST-semantic
+// alias `Move` so call sites can write <Move /> without leaking the
+// Lucide surface name. Tag / Tags are the singular/plural pair used by
+// the BulkToolbar's Tag… and Untag… buttons.
+export {
+  FolderInput as Move,
+  Tag,
+  Tags,
+} from 'lucide-react'
+
 // HATEOAS browser ------------------------------------------------------------
 export {
   Link,
