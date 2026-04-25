@@ -154,6 +154,20 @@ fn apply_named(name: &str, body: &[u8]) -> Vec<u8> {
     serialise(&out)
 }
 
+/// Borrow the baked SYSTEM state, if `init` has run. Returns `None`
+/// during pre-init or in test contexts that bypass `init()`.
+///
+/// Exposed so a route handler that needs to walk the cell graph
+/// directly (rather than ρ-applying through a named def) can do so
+/// without re-fetching every cell as serialised bytes. The first
+/// caller is `file_serve::try_serve` (#403): looking up
+/// `File_has_ContentRef` / `File_has_MimeType` for an arbitrary File
+/// id requires raw cell access — `apply_named` would only return a
+/// debug-formatted Seq for the cell's fact list.
+pub fn state() -> Option<&'static Object> {
+    SYSTEM.get()
+}
+
 /// Turn an Object into wire bytes. Atoms pass through; everything
 /// else renders via the Debug fallback so the handler always has
 /// something to send, even for shapes we haven't explicitly
