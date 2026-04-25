@@ -1081,12 +1081,65 @@ fn kernel_run_uefi(
         println!("  doom:     WASM binary absent (fresh clone), skipping instantiate");
     }
 
+    // #365: REPL on UEFI x86_64 — full #183 BIOS parity. The IDT
+    // (#363), keyboard IRQ pipeline (#364), and 1 kHz PIT (#379)
+    // are all live above; the only missing piece for the BIOS REPL
+    // surface was a drainer that pulls decoded keystrokes off the
+    // `arch::uefi::keyboard` ring and feeds them to `repl::process_key`.
+    //
+    // Why a poll loop here rather than calling `repl::process_key`
+    // straight from the IRQ 1 handler (the BIOS path's shape):
+    //   * The BIOS arm's `keyboard_handler` (arch/x86_64/interrupts.rs)
+    //     decodes the scancode inline, then calls `repl::process_key`
+    //     before returning. The UEFI arm (arch/uefi/interrupts.rs)
+    //     intentionally splits decode + REPL dispatch — the IRQ
+    //     handler only enqueues onto a `DecodedKey` ring, leaving
+    //     the dispatch to a kernel-thread-style drainer here. That
+    //     keeps the ISR work bounded (no `print!` lock held under
+    //     the PIC mask) and matches the same shape the Doom input
+    //     ring uses today.
+    //   * `repl::process_key` itself is target-agnostic — it talks
+    //     to `print!` (which routes through the arch _print sink,
+    //     i.e. the post-EBS COM1 16550 here) and a static line
+    //     buffer. Both work identically on UEFI.
+    //
+    // Banner format mirrors the BIOS arm's "repl: line-buffered
+    // keyboard REPL online (#183)" line so a smoke harness can
+    // pattern-match the same family of phrases on either path.
+    println!("  repl:     line-buffered keyboard REPL online (#183/#365)");
     println!("  next:        kernel_run handoff (step 4d)");
+    println!();
 
-    // Scaffold halt — via the facade so the call site is identical
-    // to the BIOS arm's bottom-of-kernel_run. Step 4d wires
-    // `kernel_run(phys_offset)` once the shared body subsystems are
-    // UEFI-capable; until then the entry parks here after proving
-    // the page-table + frame-allocator singletons are live.
-    crate::arch::halt_forever()
+    // Print initial prompt — REPL is now live.
+    crate::repl::init();
+
+    // Drain loop: pull `DecodedKey::Unicode` entries off the
+    // keyboard ring and forward them to the REPL's line editor.
+    // `read_keystroke()` is non-blocking and returns `None` when
+    // the ring is empty; in the smoke harness (no keyboard input
+    // wired) this loop just spins forever on `pause`, which is
+    // fine — the boot banners above prove the bring-up worked.
+    //
+    // We deliberately do NOT call `arch::halt_forever()` here:
+    // that helper just `pause`-loops with no ring drain, so a
+    // human typing into QEMU's serial would never reach the REPL.
+    // This loop is the same shape `halt_forever` will eventually
+    // grow once the BIOS arm widens its idle path to drain shared
+    // ring buffers; until then it stays scoped to the UEFI entry.
+    //
+    // `RawKey` variants (function keys, arrows, etc.) are
+    // intentionally dropped — the REPL line editor only handles
+    // Unicode characters today, matching the BIOS path's filter
+    // in `arch::x86_64::interrupts::keyboard_handler`.
+    loop {
+        if let Some(pc_keyboard::DecodedKey::Unicode(ch)) =
+            crate::arch::keyboard::read_keystroke()
+        {
+            crate::repl::process_key(ch);
+        }
+        // SAFETY: `pause` is documented as always safe; it hints
+        // the CPU that this loop is busy-waiting, reducing power
+        // draw and SMT-sibling contention without blocking IRQs.
+        unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+    }
 }
