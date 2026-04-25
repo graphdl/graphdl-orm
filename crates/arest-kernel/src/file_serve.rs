@@ -104,11 +104,19 @@ pub fn try_serve_with(
     range_header: Option<&str>,
     state: Option<&Object>,
 ) -> ServeOutcome {
-    // Strip a `?query` suffix so a future link generator that adds
-    // cache-busters still routes here.
-    let path = path.split('?').next().unwrap_or(path);
+    // Split the `?query` off the path. Path-matching only sees the
+    // route portion; `force_download` is the one query-param we
+    // currently honour (?download=1 → Content-Disposition:
+    // attachment instead of the default inline).
+    let (path_only, query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
+    let force_download = query
+        .map(|q| q.split('&').any(|kv| kv == "download=1" || kv == "download"))
+        .unwrap_or(false);
 
-    let file_id = match parse_file_content_path(path) {
+    let file_id = match parse_file_content_path(path_only) {
         Some(id) => id,
         None => return ServeOutcome::NotApplicable,
     };
@@ -136,6 +144,10 @@ pub fn try_serve_with(
         // them apart from outside, so collapse both into 404.
         None => return ServeOutcome::Response(not_found(file_id)),
     };
+    // File_has_Name is optional in principle (the kernel never
+    // rejects a File without one) — fall back to the id so the
+    // Content-Disposition filename is always populated.
+    let file_name = lookup_name(file_id, state).unwrap_or_else(|| file_id.to_string());
     let cref_atom = match lookup_content_ref(file_id, state) {
         Some(s) => s,
         None => return ServeOutcome::Response(not_found(file_id)),
@@ -179,7 +191,7 @@ pub fn try_serve_with(
                 Method::Head => Vec::new(),
             };
             ServeOutcome::Response(success_response(
-                &mime, total_len, start, end, is_partial, body,
+                &mime, &file_name, force_download, total_len, start, end, is_partial, body,
             ))
         }
         Err(()) => ServeOutcome::Response(internal_error(
@@ -212,6 +224,20 @@ fn lookup_mime(file_id: &str, state: &Object) -> Option<String> {
     cell.as_seq()?.iter().find_map(|fact| {
         if ast::binding(fact, "File") == Some(file_id) {
             ast::binding(fact, "MimeType").map(|s| s.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// Look up `File_has_Name` for `file_id`. Used to populate the
+/// `Content-Disposition` `filename=` parameter (#409). Optional —
+/// callers fall back to the id when the fact is missing.
+fn lookup_name(file_id: &str, state: &Object) -> Option<String> {
+    let cell = ast::fetch_or_phi("File_has_Name", state);
+    cell.as_seq()?.iter().find_map(|fact| {
+        if ast::binding(fact, "File") == Some(file_id) {
+            ast::binding(fact, "Name").map(|s| s.to_string())
         } else {
             None
         }
@@ -455,8 +481,15 @@ fn sector_span(byte_len: u64) -> u64 {
 /// 200/206 success. `is_partial` selects the status line. `start`/`end`
 /// are inclusive byte positions used to populate `Content-Range` on a
 /// 206 response. `body` is empty for HEAD requests.
+///
+/// `file_name` populates `Content-Disposition`'s `filename=` parameter
+/// (#409). `force_download` flips disposition from `inline` to
+/// `attachment` so the browser's download dialog fires. The `?download`
+/// query param at the route level is what sets it.
 fn success_response(
     mime: &str,
+    file_name: &str,
+    force_download: bool,
     total_len: u64,
     start: u64,
     end: u64,
@@ -478,6 +511,12 @@ fn success_response(
     push_header(&mut out, "Content-Type", mime);
     push_header(&mut out, "Content-Length", &format!("{}", content_length));
     push_header(&mut out, "Accept-Ranges", "bytes");
+    let disposition = if force_download { "attachment" } else { "inline" };
+    push_header(
+        &mut out,
+        "Content-Disposition",
+        &format!("{}; filename=\"{}\"", disposition, escape_filename(file_name)),
+    );
     if is_partial {
         push_header(
             &mut out,
@@ -488,6 +527,27 @@ fn success_response(
     push_header(&mut out, "Connection", "close");
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(&body);
+    out
+}
+
+/// Sanitize a filename for inclusion in the `Content-Disposition`
+/// `filename="..."` parameter. Strips control bytes + escapes the
+/// only two characters that have header-level meaning: `\` and `"`.
+/// Non-ASCII passes through; clients that need full RFC 5987
+/// `filename*=UTF-8''...` encoding can negotiate via a future
+/// query-param.
+fn escape_filename(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        match c {
+            '\\' | '"' => {
+                out.push('\\');
+                out.push(c);
+            }
+            c if (c as u32) < 0x20 || c == '\x7f' => {}
+            c => out.push(c),
+        }
+    }
     out
 }
 
@@ -790,10 +850,40 @@ mod tests {
                 assert!(s.contains("Content-Type: text/plain"));
                 assert!(s.contains("Content-Length: 5"));
                 assert!(s.contains("Accept-Ranges: bytes"));
+                // #409: Content-Disposition with the file id as
+                // fallback filename (no File_has_Name fact in this
+                // fixture). Default disposition is `inline`.
+                assert!(s.contains("Content-Disposition: inline; filename=\"a\""));
                 assert!(bytes.ends_with(b"Hello"));
             }
             _ => panic!("expected Response"),
         }
+    }
+
+    #[test]
+    fn try_serve_get_force_download() {
+        // #409: ?download=1 flips disposition to attachment.
+        let state = build_state_with_file("b", "text/plain", "48656c6c6f");
+        let out = try_serve("GET", "/file/b/content?download=1", None, Some(&state));
+        match out {
+            ServeOutcome::Response(bytes) => {
+                let s = core::str::from_utf8(&bytes).unwrap();
+                assert!(s.contains("Content-Disposition: attachment; filename=\"b\""));
+            }
+            _ => panic!("expected Response"),
+        }
+    }
+
+    #[test]
+    fn escape_filename_strips_control_and_escapes_quote() {
+        // Header-significant chars are backslash-escaped; control
+        // bytes silently dropped.
+        assert_eq!(escape_filename("hello.txt"), "hello.txt");
+        assert_eq!(escape_filename("hello\"world.txt"), "hello\\\"world.txt");
+        assert_eq!(escape_filename("a\\b.txt"), "a\\\\b.txt");
+        assert_eq!(escape_filename("ab\x00cd\x7fef"), "abcdef");
+        // Non-ASCII passes through (RFC 5987 filename* is a follow-up).
+        assert_eq!(escape_filename("résumé.pdf"), "résumé.pdf");
     }
 
     #[test]
