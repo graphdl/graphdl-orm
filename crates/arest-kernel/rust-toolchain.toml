@@ -13,6 +13,10 @@
 # crate only.
 
 [toolchain]
-channel = "nightly"
+# Pinned to a known-good nightly (last verified 2026-04-21). Plain
+# `nightly` drifts and the latest may break the kernel build (verified
+# against the UEFI Docker pipeline). Bump intentionally after smoke-
+# verifying all three UEFI targets + --features doom on the new date.
+channel = "nightly-2026-04-21"
 components = ["rust-src"]
-targets = ["x86_64-unknown-none", "x86_64-unknown-uefi", "aarch64-unknown-uefi"]
+targets = ["x86_64-unknown-uefi", "aarch64-unknown-uefi"]
