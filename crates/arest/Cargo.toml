@@ -42,6 +42,17 @@ name = "cluster_udp"
 path = "tests/cluster_udp.rs"
 required-features = ["cluster"]
 
+# Platform `zip_directory` / `unzip_file` (#404). The implementation
+# lives in `src/platform/zip.rs` but is not yet declared as
+# `pub mod platform;` in `lib.rs` (engine-owner agent wires that in
+# a follow-up); meanwhile this test binary `#[path]`-includes the
+# file directly so the codec round-trip is gated on every CI run.
+# Listed explicitly because `autotests = false` disables the
+# per-file auto-target detection.
+[[test]]
+name = "platform_zip"
+path = "tests/platform_zip.rs"
+
 [features]
 default = ["wit", "debug-def", "std-deps", "parallel"]
 wit = ["dep:wit-bindgen"]
