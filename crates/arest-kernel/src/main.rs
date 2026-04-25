@@ -28,7 +28,14 @@
 
 #![no_std]
 #![no_main]
-#![cfg_attr(not(target_os = "uefi"), feature(abi_x86_interrupt))]
+// abi_x86_interrupt is needed on any x86_64 target that installs an IDT
+// with `extern "x86-interrupt" fn` handlers — both the BIOS arm
+// (arch::x86_64::interrupts) and the UEFI arm's IDT (#363). Widened
+// from the BIOS-only gate so arch::uefi::interrupts compiles.
+#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
+// naked_functions stays BIOS-only — its only current caller is the
+// syscall / userspace ring-3 iretq descent (#333), which is gated out
+// of the UEFI build. Widen if/when a UEFI syscall path lands.
 #![cfg_attr(not(target_os = "uefi"), feature(naked_functions))]
 
 extern crate alloc;
