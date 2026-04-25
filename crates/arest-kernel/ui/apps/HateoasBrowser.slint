@@ -66,13 +66,24 @@ import { Repl } from "./Repl.slint";
 // keeps the LAST compiled file reachable through `include_modules!()`,
 // so a second build call would clobber HateoasBrowser).
 import { AppLauncher } from "./AppLauncher.slint";
+// Track VVV #455: same re-export trick for the third app icon. The
+// Doom Window is conditionally launched from the launcher when the
+// `feature = "doom"` cargo gate is on (`crate::ui_apps::launcher`'s
+// `set_show_doom(true)` call); the Slint type is always emitted into
+// the generated module so the `crate::arch::uefi::slint_backend::
+// Doom` symbol stays reachable regardless of the feature. The Rust
+// glue at `crate::ui_apps::doom` is itself feature-gated, so the
+// kernel binary doesn't grow the WASM-driver weight when the feature
+// is off — only the Slint codegen for the unused Window survives.
+import { Doom } from "./Doom.slint";
 
 // Re-export AppShell + Theme so the existing slint_backend.rs smoke
 // test (which constructs `AppShell::new()` after `slint::include_modules!()`)
 // keeps compiling without touching that file. `Repl` is re-exported
-// for `crate::ui_apps::repl` (Track TTT #430) and `AppLauncher` for
-// `crate::ui_apps::launcher` (Track UUU #431) for the same reason.
-export { AppShell, Theme, ThemeMode, Repl, AppLauncher }
+// for `crate::ui_apps::repl` (Track TTT #430), `AppLauncher` for
+// `crate::ui_apps::launcher` (Track UUU #431), and `Doom` for
+// `crate::ui_apps::doom` (Track VVV #455) for the same reason.
+export { AppShell, Theme, ThemeMode, Repl, AppLauncher, Doom }
 
 // The HATEOAS browser window. The Rust glue (`ui_apps::hateoas`) sets
 // the four `*-model` properties from `system::with_state`, and the

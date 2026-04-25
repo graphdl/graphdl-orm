@@ -52,12 +52,29 @@ export component AppLauncher inherits Window {
     // window.
     callback open-repl();
 
+    // Fired when the user clicks the "Doom" button. Rust glue hides
+    // this window and shows `crate::ui_apps::doom::build_app()`'s
+    // window. Only reachable when `show-doom` is true (Rust sets it
+    // when `cfg(feature = "doom")` is on — see `launcher.rs`).
+    callback open-doom();
+
     // Theme toggle, surfaced through the top bar so the user can
     // flip dark/light at the splash. Mirrors HateoasBrowser / Repl —
     // the actual mode flip happens inside `Theme.toggle-mode()`;
     // this callback is the host's hook for persisting the choice
     // later.
     callback theme-toggled();
+
+    // ---- Inputs (driven by the Rust glue) -------------------------
+
+    // Whether to show the "Doom" button row. The Slint side has no
+    // `cfg` of its own, so we expose this as a property and Rust
+    // sets it true when the kernel is built with `--features doom`
+    // (Track VVV #455 + #456). When false (default kernel build,
+    // AGPL-3.0-or-later only), the row is omitted from the layout
+    // entirely so the splash card stays the same height as the
+    // pre-#455 two-app splash.
+    in property <bool> show-doom: false;
 
     title: "AREST";
     background: Theme.surface;
@@ -205,6 +222,22 @@ export component AppLauncher inherits Window {
                                     text: "REPL";
                                     variant: ButtonVariant.primary;
                                     clicked => { root.open-repl(); }
+                                }
+
+                                // Track VVV #455: Doom row, only
+                                // visible when the kernel was built
+                                // with `--features doom`. Slint
+                                // doesn't have `cfg` so the Rust
+                                // glue (`launcher.rs`) sets the
+                                // `show-doom` property at startup;
+                                // the `if` here drops the button
+                                // out of layout entirely when off,
+                                // preserving the visual spacing of
+                                // the pre-#455 splash.
+                                if root.show-doom : Button {
+                                    text: "Doom";
+                                    variant: ButtonVariant.primary;
+                                    clicked => { root.open-doom(); }
                                 }
                             }
                         }

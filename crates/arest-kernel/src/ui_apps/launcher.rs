@@ -90,15 +90,24 @@ use crate::arch::uefi::slint_backend::{
 };
 use crate::arch::uefi::slint_input::drain_keyboard_into_slint_window;
 use crate::ui_apps::{hateoas, repl};
+#[cfg(feature = "doom")]
+use crate::ui_apps::doom;
 
 /// Which Slint surface is currently visible. Driven by the
-/// open-hateoas / open-repl callbacks (forward) and the Esc intercept
-/// in `drain_keyboard_with_esc_intercept` (back).
+/// open-hateoas / open-repl / open-doom callbacks (forward) and the
+/// Esc intercept in `drain_keyboard_with_esc_intercept` (back). The
+/// `Doom` variant is unconditional in the enum so the navigation
+/// state machine doesn't fork on `cfg`; the actual transition into
+/// `Active::Doom` is gated behind `cfg(feature = "doom")` at the
+/// callback registration site below — when the feature is off the
+/// state can never reach Doom because `open-doom` is never wired.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Active {
     Launcher,
     Hateoas,
     Repl,
+    #[cfg(feature = "doom")]
+    Doom,
 }
 
 /// Shared mutable navigation state. The Rust closures wired into
@@ -212,7 +221,7 @@ pub fn run(
         FramebufferBackend::new(gop_ptr as *mut u8, gop_w, gop_h, gop_stride, pixel_order)
     };
 
-    // Construct all three windows up front so navigation is just a
+    // Construct every app up front so navigation is just a
     // show/hide swap (no per-click constructor cost). Their
     // callbacks/state stay live for the lifetime of the kernel.
     let launcher = AppLauncher::new()
@@ -221,6 +230,17 @@ pub fn run(
         .expect("HateoasBrowser construction failed");
     let repl_app = repl::build_app()
         .expect("Repl construction failed");
+    // Track VVV (#455 + #456): Doom is feature-gated. When the
+    // feature is off, `doom_app` is never constructed and the
+    // launcher's `open-doom` callback is never wired (so the Slint
+    // side's `show-doom` stays false and the button row is omitted
+    // from layout entirely — see `AppLauncher.slint`'s `if
+    // root.show-doom` block).
+    #[cfg(feature = "doom")]
+    let mut doom_app = doom::build_app()
+        .expect("Doom construction failed");
+    #[cfg(feature = "doom")]
+    launcher.set_show_doom(true);
 
     let nav: NavState = Rc::new(RefCell::new(Active::Launcher));
 
@@ -249,6 +269,23 @@ pub fn run(
             let _ = launcher.hide();
             let _ = repl_window.show();
             *nav.borrow_mut() = Active::Repl;
+        });
+    }
+    // Track VVV #455: Doom open callback. Only registered when the
+    // feature is on; otherwise the Slint side's button row stays
+    // hidden (see `set_show_doom(true)` above) and the callback is
+    // never invoked. The shape mirrors the Hateoas / Repl wiring.
+    #[cfg(feature = "doom")]
+    {
+        let nav = nav.clone();
+        let launcher_weak = launcher.as_weak();
+        let doom_weak = doom_app.window.as_weak();
+        launcher.on_open_doom(move || {
+            let Some(launcher) = launcher_weak.upgrade() else { return };
+            let Some(doom_window) = doom_weak.upgrade() else { return };
+            let _ = launcher.hide();
+            let _ = doom_window.show();
+            *nav.borrow_mut() = Active::Doom;
         });
     }
     // Theme toggle is a passive forward — Theme.toggle-mode() has
@@ -292,6 +329,34 @@ pub fn run(
             Active::Repl => {
                 if drain_keyboard_with_esc_intercept(&repl_app.window.window()) {
                     let _ = repl_app.window.hide();
+                    let _ = launcher.show();
+                    *nav.borrow_mut() = Active::Launcher;
+                }
+            }
+            // Track VVV #455: when Doom is active the keystroke
+            // path forks. The keyboard ring is single-consumer
+            // (`arch::uefi::keyboard::read_keystroke` is `pop_front`,
+            // no peek API), so the launcher can't both intercept
+            // Esc AND let a Slint dispatch happen — only one
+            // consumer wins each ring entry. We give Doom's own
+            // drainer (`DoomApp::drain_keystrokes_intercept_esc`)
+            // exclusive access to the ring while Active::Doom: it
+            // pops every pending entry, drops Esc (returning
+            // `true` to signal back-to-launcher), translates
+            // every other key via `crate::doom::translate_decoded_key`,
+            // and dispatches synthetic press/release pairs against
+            // the guest's `reportKeyDown` / `reportKeyUp` exports
+            // — same shape `crate::doom::pump_keys_into_guest`
+            // uses on the standalone path, but with the Esc check
+            // moved here so the launcher can route back. The
+            // Doom Window itself receives no Slint key events; it
+            // shows whatever the WASM guest renders, no Slint-
+            // side input wiring needed (the Window's FocusScope
+            // rejects any keystroke that somehow reaches it).
+            #[cfg(feature = "doom")]
+            Active::Doom => {
+                if doom_app.drain_keystrokes_intercept_esc() {
+                    let _ = doom_app.window.hide();
                     let _ = launcher.show();
                     *nav.borrow_mut() = Active::Launcher;
                 }
