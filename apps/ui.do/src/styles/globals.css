@@ -1,0 +1,65 @@
+/*
+ * Global styles for ui.do.
+ *
+ * Layers Tailwind's base/components/utilities directives on top of the
+ * AREST design-system CSS variables. Variables hold HSL triplets (no
+ * `hsl()` wrapper) so Tailwind's `<alpha-value>` plug-in can compose
+ * `hsl(var(--color-accent) / 0.5)` for utilities like `bg-accent/50`.
+ *
+ * Dark theme is the default (lives on `:root`); `.light` on <html> or
+ * <body> flips to the light palette. The JS theme switcher (Track to
+ * follow) toggles that class via Tailwind's `darkMode: "class"`.
+ *
+ * Hex → HSL values precomputed from readings/ui/design.md.
+ */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Modern Minimal Dark — default theme. */
+  --color-neutral-50: 240 4.8% 4.1%;     /* #0A0A0B */
+  --color-neutral-100: 240 8.1% 7.3%;    /* #111114 */
+  --color-neutral-200: 240 8.8% 11.2%;   /* #1A1A1F */
+  --color-neutral-700: 240 6.1% 64.9%;   /* #A0A0AB */
+  --color-neutral-900: 240 11.1% 96.5%;  /* #F5F5F7 */
+
+  --color-surface: 240 8.1% 7.3%;        /* #111114 — same as neutral-100 */
+  --color-primary: 240 11.1% 96.5%;      /* #F5F5F7 */
+  --color-secondary: 240 6.1% 64.9%;     /* #A0A0AB */
+  --color-text-primary: 240 11.1% 96.5%; /* #F5F5F7 */
+  --color-text-muted: 240 6.1% 64.9%;    /* #A0A0AB */
+  --color-border: 240 7.3% 16.1%;        /* #26262C */
+  --color-accent: 251.8 100% 68%;        /* #7C5CFF */
+  --color-success: 158.1 64.4% 51.6%;    /* #34D399 */
+  --color-warning: 37.7 92.1% 50.2%;     /* #F59E0B */
+  --color-danger: 0 84.2% 60.2%;         /* #EF4444 */
+  --color-info: 198.4 93.2% 59.6%;       /* #38BDF8 */
+
+  /* Overlay carries fixed alpha — exposed as a direct color value. */
+  --color-overlay: rgba(0, 0, 0, 0.6);   /* #00000099 */
+}
+
+.light {
+  /* Modern Minimal Light. */
+  --color-neutral-50: 0 0% 100%;         /* #FFFFFF */
+  --color-neutral-100: 240 11.1% 98.2%;  /* #FAFAFB */
+  --color-neutral-200: 240 7.1% 94.5%;   /* #F0F0F2 */
+  --color-neutral-700: 240 5.2% 33.9%;   /* #52525B */
+  --color-neutral-900: 240 4.8% 4.1%;    /* #0A0A0B */
+
+  --color-surface: 0 0% 100%;            /* #FFFFFF */
+  --color-primary: 240 4.8% 4.1%;        /* #0A0A0B */
+  --color-secondary: 240 5.2% 33.9%;     /* #52525B */
+  --color-text-primary: 240 4.8% 4.1%;   /* #0A0A0B */
+  --color-text-muted: 240 5.2% 33.9%;    /* #52525B */
+  --color-border: 240 5.9% 90%;          /* #E4E4E7 */
+  --color-accent: 250.1 77% 57.5%;       /* #5B3FE6 */
+  --color-success: 161.4 93.5% 30.4%;    /* #059669 */
+  --color-warning: 32.1 94.6% 43.7%;     /* #D97706 */
+  --color-danger: 0 72.2% 50.6%;         /* #DC2626 */
+  --color-info: 200.4 98% 39.4%;         /* #0284C7 */
+
+  --color-overlay: rgba(0, 0, 0, 0.2);   /* #00000033 */
+}

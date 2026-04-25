@@ -1,6 +1,7 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
 import { App } from './App'
+import './styles/globals.css'
 
 /**
  * Boot entry for ui.do. Mounts the placeholder <App /> into #root.
