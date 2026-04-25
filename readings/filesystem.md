@@ -15,12 +15,46 @@ Tag(.id) is an entity type.
 MimeType is a value type.
 Size is a value type.
 ContentRef is a value type.
-  <!-- TODO(#397d): resolve ContentRef encoding. Intended shape is a
-       tagged union of Inline(bytes) and RegionRef(base_sector, len);
-       the concrete value-type decomposition (subtype partition? facet
-       pattern? paired lexical encoding?) belongs in #397d once the
-       block-storage region API lands. Until then ContentRef is an
-       opaque scalar. -->
+  <!-- ContentRef is a tagged Object value (#401). The concrete shape
+       is a 2- or 3-element FFP sequence whose head atom selects the
+       discriminant, mirroring the existing `<CELL, name, contents>`
+       convention (see crates/arest/src/ast.rs CELL_TAG):
+
+         Inline path     <INLINE, hex-bytes>
+         Region path     <REGION, base-sector, byte-len>
+
+       INLINE / REGION are atom literals; hex-bytes is a lowercase
+       ASCII hexadecimal encoding of the raw blob (chosen over base64
+       so the value is readable in serial logs and survives a freeze /
+       thaw round-trip without an alphabet dependency); base-sector
+       and byte-len are decimal-string atoms (u64). Total wire form:
+
+         <INLINE, "deadbeef">
+         <REGION, "8192", "131072">
+
+       The 64 KiB inline cap is the encoder's hard switch — at or
+       below 64 KiB the encoder emits Inline, above it allocates a
+       region via `arest_kernel::block_storage::alloc_region` and
+       emits Region. The cap is one DO write payload, comfortable Vec
+       resize bound, and small enough that a typical row-shape store
+       stays compact even when many cells live inline.
+
+       The region path is backed by a fixed slot table in
+       `arest_kernel::block_storage` — 256 slots × 256 KiB each =
+       64 MiB max region-backed blob storage, on a virtio-blk disk
+       sized to cover sector 8192 + 256 × 512 = sector 139264 (≥ 80
+       MiB). Smaller disks fail allocation with `Error::OutOfRange`
+       and the consumer must fall back to inline-or-fail. The
+       free-list is in-memory only this commit; rebuild-from-File-
+       table on mount lands in a follow-up.
+
+       No Object variant was added for blob bytes; the encoding
+       sits inside the existing Object::Atom + Object::Seq surface
+       so the 55 pattern-match sites across the engine continue to
+       compile unchanged. The encoder/decoder lives in the file-ops
+       layer (`crates/arest/src/blob.rs`) where it is wired by the
+       consumer that lands File create/read; this commit ships the
+       on-disk allocator + the encoding spec only. -->
 
 ## Readings
 
