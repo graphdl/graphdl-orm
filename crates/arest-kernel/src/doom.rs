@@ -132,7 +132,8 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use wasmi::Linker;
+use pc_keyboard::{DecodedKey, KeyCode};
+use wasmi::{Instance, Linker, Store};
 
 use crate::block::BLOCK_SECTOR_SIZE;
 use crate::block_storage::{self, RegionHandle};
@@ -1115,4 +1116,443 @@ fn crc32_bytes(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+// ── Keyboard pump (#377) ────────────────────────────────────────────
+//
+// Track EE landed `arch::uefi::keyboard` (commit 8d9c14e) — a 64-slot
+// ring of `pc_keyboard::DecodedKey` populated by the IRQ 1 handler.
+// jacobenget/doom.wasm v0.1.0 takes key events through TWO EXPORTS,
+// not imports:
+//
+//   reportKeyDown(doomKey: i32) -> ()
+//   reportKeyUp  (doomKey: i32) -> ()
+//
+// `doomKey` is in [0, 255]: ASCII for printable characters (a-z is
+// 97-122 per the header), and special `KEY_*` constants for everything
+// else. The KEY_* values come from doomgeneric/doomkeys.h; the binary
+// also re-exports them as i32 const globals so a host could discover
+// them at instantiate time, but the header pins the numeric values
+// (0xae for KEY_RIGHTARROW, 0xa3 for KEY_FIRE, etc.) so we hard-code
+// the subset we need rather than walking globals at boot. This matches
+// what the BIOS arm's `arch::x86_64::input::key_code` already does
+// (and where the constants below are sourced from).
+//
+// The mechanism is host-push, not guest-poll: the Doom game loop
+// expects `reportKeyDown` / `reportKeyUp` to have updated the engine's
+// internal key-state array BEFORE `tickGame` is called for the next
+// frame. The intended call order from the per-frame driver in
+// `kernel_run` (once #376 lands) is:
+//
+//   loop {
+//       doom::pump_keys_into_guest(&mut store, &instance)?;
+//       tick_game.call(&mut store, ())?;
+//       // sleep until next 35Hz tick
+//   }
+//
+// ── Press/release fidelity gap ──────────────────────────────────────
+//
+// The keyboard ring buffer stores `DecodedKey` (post-`pc-keyboard`
+// translation), NOT `KeyEvent` (pre-translation, with `KeyState::Down`
+// / `KeyState::Up`). That's a one-way collapse — by the time a
+// keystroke lands on the ring, the press/release distinction has been
+// erased. The BIOS arm sidesteps this by stashing `KeyEvent` directly
+// (see `arch::x86_64::input::DoomKeyEvent` — `Pressed(u8)` /
+// `Released(u8)`), but the UEFI ring was sized for the #365 REPL pump,
+// which only cares about decoded chars.
+//
+// Workaround in this commit: synthesize a press-then-release pair for
+// each `DecodedKey` we drain. Same trick the BIOS arm uses for
+// `KeyState::SingleShot` — Doom's input layer treats a paired
+// down/up as a momentary tap, which is correct for menu navigation
+// (Escape, arrows, Enter) and for any one-frame fire input but WRONG
+// for held-key behavior:
+//   * holding W/Up to walk forward will instead step one tile per
+//     scancode auto-repeat;
+//   * holding LCtrl/Fire will fire-once-per-scancode, not full-auto;
+//   * holding Shift to run will not actually run.
+//
+// This is acceptable for a smoke / menu / one-shot demo (#377's goal:
+// prove the pipeline lights up), not for full gameplay.
+//
+// TODO(#377): The proper fix needs Track EE to extend
+// `arch::uefi::keyboard` with a parallel `KeyEvent` ring (or a
+// per-key state-edge log) so this pump can route real Down/Up
+// transitions. Proposed API on the keyboard side:
+//
+//     pub fn read_key_event() -> Option<pc_keyboard::KeyEvent>;
+//     pub fn pending_events() -> usize;
+//
+// implemented by stashing the raw `KeyEvent` from `kb.add_byte` into a
+// second `VecDeque<KeyEvent>` alongside the existing `DecodedKey`
+// ring. Once that lands, `pump_keys_into_guest` drops the
+// down-then-up synthesis and dispatches each event individually
+// against `reportKeyDown` or `reportKeyUp`.
+
+/// Doom key constants (subset of doomgeneric/doomkeys.h reachable from
+/// a PS/2 keyboard). Mirrors `arch::x86_64::input::key_code` exactly —
+/// kept duplicated here rather than reaching across the BIOS-arm
+/// module gate (`arch::x86_64::input` is gated on
+/// `not(target_os = "uefi")`, so it isn't reachable from this UEFI
+/// build).
+///
+/// `#[allow(dead_code)]` because some of these constants
+/// (KEY_F1..KEY_F10, KEY_PAUSE, KEY_RALT, etc.) are only reached
+/// through the `translate_decoded_key` match arms — which Rust's
+/// dead-code analysis treats as unreachable until the kernel_run
+/// handoff (#376) wires `pump_keys_into_guest`. Mirrors the same
+/// `#[allow(dead_code)]` already on `doom_assets.rs::DOOM_WASM` for
+/// the exact same "scaffolded for the next sub-task" reason.
+#[allow(dead_code)]
+mod doom_key {
+    pub const KEY_RIGHTARROW: u8 = 0xae;
+    pub const KEY_LEFTARROW:  u8 = 0xac;
+    pub const KEY_UPARROW:    u8 = 0xad;
+    pub const KEY_DOWNARROW:  u8 = 0xaf;
+    pub const KEY_USE:        u8 = 0xa2;
+    pub const KEY_FIRE:       u8 = 0xa3;
+    pub const KEY_ESCAPE:     u8 = 27;
+    pub const KEY_ENTER:      u8 = 13;
+    pub const KEY_TAB:        u8 = 9;
+    pub const KEY_BACKSPACE:  u8 = 0x7f;
+    pub const KEY_RSHIFT:     u8 = 0xb6;
+    pub const KEY_RALT:       u8 = 0xb8;
+    pub const KEY_F1:         u8 = 0xbb;
+    pub const KEY_F2:         u8 = 0xbc;
+    pub const KEY_F3:         u8 = 0xbd;
+    pub const KEY_F4:         u8 = 0xbe;
+    pub const KEY_F5:         u8 = 0xbf;
+    pub const KEY_F6:         u8 = 0xc0;
+    pub const KEY_F7:         u8 = 0xc1;
+    pub const KEY_F8:         u8 = 0xc2;
+    pub const KEY_F9:         u8 = 0xc3;
+    pub const KEY_F10:        u8 = 0xc4;
+    pub const KEY_PAUSE:      u8 = 0xff;
+}
+
+/// Translate a `pc_keyboard::DecodedKey` into a Doom key byte
+/// (`doomKey` in the doom_wasm.h vocabulary). Returns `None` for keys
+/// Doom doesn't care about (e.g. caps lock LED toggle, media keys,
+/// numpad arithmetic). The BIOS arm has the equivalent table over
+/// `KeyEvent::code` in `arch::x86_64::input::translate_keycode`; this
+/// one operates on `DecodedKey` because that's what the UEFI keyboard
+/// ring stores (Track EE / commit 8d9c14e).
+///
+/// Per the doom_wasm.h header at jacobenget/doom.wasm@24bb772:
+///   "If the key in question naturally produces a printable ASCII
+///   character: the `doomKey` associated with the key is the ASCII
+///   code for that printable character (e.g. 'a' through 'z' have
+///   `doomKey` value 97 through 122)."
+///
+/// So lowercase letters / digits / symbols pass straight through as
+/// their byte. `pc_keyboard::layouts::Us104Key` (the layout the
+/// keyboard ring is configured with) emits these as
+/// `DecodedKey::Unicode` already.
+///
+/// Control characters that `Us104Key` emits as `DecodedKey::Unicode`:
+///   * Escape -> 0x1B  (matches KEY_ESCAPE = 27)
+///   * Tab    -> 0x09  (matches KEY_TAB = 9)
+///   * Enter  -> 0x0A  (REMAP -> KEY_ENTER = 13 / 0x0D — the layout
+///                       emits LF, Doom expects CR)
+///   * Backspace -> 0x08  (REMAP -> KEY_BACKSPACE = 0x7F)
+///   * Spacebar -> 0x20  (REMAP -> KEY_USE = 0xA2 — Doom's "use" /
+///                         door-open binding)
+///
+/// Special keys that `Us104Key` emits as `DecodedKey::RawKey`
+/// (arrows, modifiers, F-keys) translate via the same table the BIOS
+/// arm uses. ASCII letters from the Unicode path are lowercased — the
+/// header is explicit that 97-122 (lowercase) is the canonical
+/// representation, and Doom's input layer uppercases internally for
+/// any binding that cares.
+///
+/// `#[allow(dead_code)]` because the only caller is
+/// `pump_keys_into_guest`, which is itself scaffolded for the
+/// kernel_run handoff (#376).
+#[allow(dead_code)]
+fn translate_decoded_key(key: DecodedKey) -> Option<u8> {
+    use doom_key::*;
+    match key {
+        DecodedKey::Unicode(ch) => match ch {
+            // Control-character remaps — see comment above.
+            '\u{0008}' => Some(KEY_BACKSPACE),
+            '\u{000A}' | '\u{000D}' => Some(KEY_ENTER),
+            ' ' => Some(KEY_USE),
+            // Pass-through ASCII printables. Lowercase letters land
+            // here directly; uppercase letters (when shift is held)
+            // get downcast so the `doomKey` always matches the
+            // lowercase ASCII code per the header's contract.
+            c if c.is_ascii() => {
+                let b = c as u32 as u8;
+                if b.is_ascii_uppercase() {
+                    Some(b.to_ascii_lowercase())
+                } else if b.is_ascii_graphic() || b == b'\t' || b == 0x1B {
+                    // Includes Tab (0x09) and Escape (0x1B), which
+                    // Us104Key emits as Unicode controls and Doom's
+                    // numeric values for KEY_TAB / KEY_ESCAPE happen
+                    // to match the raw control-character bytes.
+                    Some(b)
+                } else {
+                    None
+                }
+            }
+            // Non-ASCII Unicode (e.g. AltGr-composed glyphs) — Doom
+            // can't represent these in the [0, 255] doomKey space, so
+            // drop. The header is explicit that out-of-range calls
+            // are logged-and-ignored on the guest side; cleaner to
+            // not call at all than to send a value that the guest
+            // would reject.
+            _ => None,
+        },
+        DecodedKey::RawKey(code) => match code {
+            // Cursor keys drive player movement.
+            KeyCode::ArrowUp    => Some(KEY_UPARROW),
+            KeyCode::ArrowDown  => Some(KEY_DOWNARROW),
+            KeyCode::ArrowLeft  => Some(KEY_LEFTARROW),
+            KeyCode::ArrowRight => Some(KEY_RIGHTARROW),
+
+            // Modifiers. LCtrl / RCtrl = fire (Doom tradition);
+            // Spacebar already mapped to KEY_USE above on the Unicode
+            // path; LShift / RShift = run; LAlt / RAltGr = strafe.
+            KeyCode::LControl | KeyCode::RControl => Some(KEY_FIRE),
+            KeyCode::LShift   | KeyCode::RShift   => Some(KEY_RSHIFT),
+            KeyCode::LAlt     | KeyCode::RAltGr   => Some(KEY_RALT),
+
+            // Function keys for menu shortcuts (F2 = save, F3 = load,
+            // F5 = detail, F11 = brightness, etc. inside Doom). The
+            // header doesn't define KEY_F11 / KEY_F12 so we cap at
+            // F10; F11/F12 fall through to None.
+            KeyCode::F1  => Some(KEY_F1),
+            KeyCode::F2  => Some(KEY_F2),
+            KeyCode::F3  => Some(KEY_F3),
+            KeyCode::F4  => Some(KEY_F4),
+            KeyCode::F5  => Some(KEY_F5),
+            KeyCode::F6  => Some(KEY_F6),
+            KeyCode::F7  => Some(KEY_F7),
+            KeyCode::F8  => Some(KEY_F8),
+            KeyCode::F9  => Some(KEY_F9),
+            KeyCode::F10 => Some(KEY_F10),
+
+            KeyCode::PauseBreak => Some(KEY_PAUSE),
+
+            _ => None,
+        },
+    }
+}
+
+/// Drain every pending decoded keystroke off the UEFI keyboard ring
+/// (`arch::uefi::keyboard`, Track EE / commit 8d9c14e) and forward
+/// each one to the Doom guest as a synthetic press-then-release pair
+/// against the guest's `reportKeyDown` / `reportKeyUp` exports.
+///
+/// Intended call site: the per-frame driver in `kernel_run` (the
+/// #376 follow-up to the entry_uefi.rs binding smoke), once between
+/// every `tickGame` so the engine sees fresh key-state edges before
+/// the next render. Returns `Ok(n)` where `n` is the number of
+/// keystrokes pumped, or `Err(wasmi::Error)` if the export lookup or
+/// invocation fails — the caller is expected to bail to the panic
+/// path on `Err` since a missing export means the guest module isn't
+/// the binary the shim was reconciled against.
+///
+/// ── Press/release synthesis ────────────────────────────────────────
+///
+/// See the module-level "Press/release fidelity gap" comment above.
+/// Briefly: the keyboard ring stores `DecodedKey` (post-translation,
+/// no Down/Up state) so we can't dispatch real edges. We send a
+/// down-then-up pair per event — fine for menu / one-shot inputs,
+/// wrong for held movement / fire / run. Tracked under #377 as a
+/// follow-up that needs Track EE to expose a sibling `KeyEvent` ring.
+///
+/// ── Failure handling ───────────────────────────────────────────────
+///
+/// Out-of-range key bytes (the doom_wasm.h header allows [0, 255] but
+/// our `u8 -> i32` widen always lands inside that range) are silently
+/// accepted by the guest's logged-error path; we don't need to clamp
+/// here. Untranslatable `DecodedKey` values (returned `None` from
+/// `translate_decoded_key` — caps lock, media keys, F11 / F12) are
+/// dropped without dispatch.
+///
+/// ── Ring drain semantics ───────────────────────────────────────────
+///
+/// We drain ALL pending events in one call, not just one. The
+/// keyboard ring is bounded at 64 slots and drops oldest under back-
+/// pressure (see `arch::uefi::keyboard::handle_scancode`); calling
+/// this once per 35 Hz tic with a typical typing rate of ~10 keys/s
+/// means we'll see at most 1-2 events per drain, well below the cap.
+/// Worst case (user holds a key with auto-repeat, ring fills to 64
+/// before we drain): we dispatch 64 events to the guest in a tight
+/// loop, which is microseconds; no risk of starving the next tic.
+///
+/// `#[allow(dead_code)]` because no caller exists yet — this is the
+/// scaffold the #376 kernel_run handoff will reach. Drops the allow
+/// attribute the moment the per-frame driver lands.
+#[allow(dead_code)]
+pub fn pump_keys_into_guest<T>(
+    store: &mut Store<T>,
+    instance: &Instance,
+) -> Result<usize, wasmi::Error> {
+    // Resolve both exports once per call. `get_typed_func` validates
+    // the (param, result) shape against the imported binary, so a
+    // signature drift between doom_wasm.h and the bake would surface
+    // here as `Err(_)` rather than a silent runtime mis-call.
+    let report_down = instance
+        .get_typed_func::<i32, ()>(&*store, "reportKeyDown")?;
+    let report_up = instance
+        .get_typed_func::<i32, ()>(&*store, "reportKeyUp")?;
+
+    let mut pumped: usize = 0;
+    while let Some(decoded) = crate::arch::keyboard::read_keystroke() {
+        let Some(doom_key) = translate_decoded_key(decoded) else {
+            // Untranslatable — drop without dispatch; see contract
+            // comment above.
+            continue;
+        };
+        let key_i32 = doom_key as i32;
+        // Down then up — synthesize a tap. See the module-level
+        // "Press/release fidelity gap" comment for why this is a
+        // workaround until Track EE exposes a `KeyEvent` ring.
+        report_down.call(&mut *store, key_i32)?;
+        report_up.call(&mut *store, key_i32)?;
+        pumped += 1;
+    }
+    Ok(pumped)
+}
+
+#[cfg(test)]
+mod tests {
+    // The kernel binary doesn't run tests (`test = false` in
+    // Cargo.toml), and this module is gated behind
+    // `cfg(target_os = "uefi", target_arch = "x86_64")` which the
+    // host-side `cargo test` can't satisfy directly. Tests live here
+    // for two reasons:
+    //   1. Documentation — the asserts are an executable spec for the
+    //      translate table, easier to read than the match arms in
+    //      `translate_decoded_key`.
+    //   2. Future-proofing — when the kernel grows a UEFI test
+    //      harness, these light up automatically.
+
+    use super::*;
+    use pc_keyboard::{DecodedKey, KeyCode};
+
+    #[test]
+    fn ascii_letter_lowercase_pass_through() {
+        assert_eq!(translate_decoded_key(DecodedKey::Unicode('a')), Some(b'a'));
+        assert_eq!(translate_decoded_key(DecodedKey::Unicode('z')), Some(b'z'));
+        assert_eq!(translate_decoded_key(DecodedKey::Unicode('m')), Some(b'm'));
+    }
+
+    #[test]
+    fn ascii_letter_uppercase_downcased() {
+        // Header: "the keys 'a' through 'z' have a `doomKey` value of
+        // 97 through 122, respectively". So shift+A still emits 0x61
+        // (lowercase 'a'), not 0x41.
+        assert_eq!(translate_decoded_key(DecodedKey::Unicode('A')), Some(b'a'));
+        assert_eq!(translate_decoded_key(DecodedKey::Unicode('Z')), Some(b'z'));
+    }
+
+    #[test]
+    fn ascii_digits_pass_through() {
+        assert_eq!(translate_decoded_key(DecodedKey::Unicode('0')), Some(b'0'));
+        assert_eq!(translate_decoded_key(DecodedKey::Unicode('9')), Some(b'9'));
+    }
+
+    #[test]
+    fn control_character_remaps() {
+        // Backspace: Us104Key emits 0x08, Doom expects 0x7F.
+        assert_eq!(
+            translate_decoded_key(DecodedKey::Unicode('\u{0008}')),
+            Some(0x7F),
+        );
+        // Enter: Us104Key emits 0x0A (LF), Doom expects 0x0D.
+        assert_eq!(
+            translate_decoded_key(DecodedKey::Unicode('\u{000A}')),
+            Some(13),
+        );
+        assert_eq!(
+            translate_decoded_key(DecodedKey::Unicode('\u{000D}')),
+            Some(13),
+        );
+        // Spacebar -> KEY_USE.
+        assert_eq!(
+            translate_decoded_key(DecodedKey::Unicode(' ')),
+            Some(0xA2),
+        );
+        // Escape and Tab — control chars whose Doom code matches the
+        // raw byte (KEY_ESCAPE = 27 = 0x1B; KEY_TAB = 9 = 0x09).
+        assert_eq!(
+            translate_decoded_key(DecodedKey::Unicode('\u{001B}')),
+            Some(27),
+        );
+        assert_eq!(
+            translate_decoded_key(DecodedKey::Unicode('\u{0009}')),
+            Some(9),
+        );
+    }
+
+    #[test]
+    fn arrow_keys_translate() {
+        assert_eq!(
+            translate_decoded_key(DecodedKey::RawKey(KeyCode::ArrowUp)),
+            Some(0xAD),
+        );
+        assert_eq!(
+            translate_decoded_key(DecodedKey::RawKey(KeyCode::ArrowDown)),
+            Some(0xAF),
+        );
+        assert_eq!(
+            translate_decoded_key(DecodedKey::RawKey(KeyCode::ArrowLeft)),
+            Some(0xAC),
+        );
+        assert_eq!(
+            translate_decoded_key(DecodedKey::RawKey(KeyCode::ArrowRight)),
+            Some(0xAE),
+        );
+    }
+
+    #[test]
+    fn modifiers_translate() {
+        // LCtrl / RCtrl -> KEY_FIRE.
+        assert_eq!(
+            translate_decoded_key(DecodedKey::RawKey(KeyCode::LControl)),
+            Some(0xA3),
+        );
+        assert_eq!(
+            translate_decoded_key(DecodedKey::RawKey(KeyCode::RControl)),
+            Some(0xA3),
+        );
+        // LShift / RShift -> KEY_RSHIFT.
+        assert_eq!(
+            translate_decoded_key(DecodedKey::RawKey(KeyCode::LShift)),
+            Some(0xB6),
+        );
+        assert_eq!(
+            translate_decoded_key(DecodedKey::RawKey(KeyCode::RShift)),
+            Some(0xB6),
+        );
+    }
+
+    #[test]
+    fn function_keys_translate() {
+        assert_eq!(
+            translate_decoded_key(DecodedKey::RawKey(KeyCode::F1)),
+            Some(0xBB),
+        );
+        assert_eq!(
+            translate_decoded_key(DecodedKey::RawKey(KeyCode::F10)),
+            Some(0xC4),
+        );
+    }
+
+    #[test]
+    fn unsupported_keys_drop() {
+        // Non-ASCII Unicode — drop.
+        assert_eq!(translate_decoded_key(DecodedKey::Unicode('é')), None);
+        // F11 / F12 — header doesn't define them, drop.
+        assert_eq!(translate_decoded_key(DecodedKey::RawKey(KeyCode::F11)), None);
+        assert_eq!(translate_decoded_key(DecodedKey::RawKey(KeyCode::F12)), None);
+        // Caps lock LED toggle — drop.
+        assert_eq!(
+            translate_decoded_key(DecodedKey::RawKey(KeyCode::CapsLock)),
+            None,
+        );
+    }
 }
