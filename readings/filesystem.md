@@ -1,8 +1,8 @@
 # AREST Filesystem: File, Directory, Tag
 
-Foundation nouns for the file-browser domain (epic #397). This commit
-is declarative only — no constraints yet; ring-acyclic Directory and
-other invariants land in #399.
+Foundation nouns for the file-browser domain (epic #397). The nouns
+and binary facts were declared in #398; the ring-acyclic parentage
+plus mandatory File containment invariants land in #399 (this file).
 
 ## Entity Types
 
@@ -73,8 +73,8 @@ Directory has parent Directory.
      "Directory has parent Directory" above. The alternative reading
      "Directory is in Directory" would cover the same fact population
      and is intentionally omitted to keep a single source of truth for
-     the containment edge. #399 will attach the ring-acyclic constraint
-     to "Directory has parent Directory". -->
+     the containment edge. The ring-acyclic constraint is attached
+     under "## Ring Constraints" below. -->
 
 ### Tag
 
@@ -93,6 +93,18 @@ File has-tag Tag.
   It is possible that some Tag is applied to more than one File.
   For each pair of File and Tag, that File has-tag that Tag at most once.
 
+## Constraints
+
+<!-- Mandatory File-in-Directory containment is already declared by the
+     `Each File is in exactly one Directory.` line under "File has in
+     Directory" above (forml2-grammar: 'exactly one' → Uniqueness +
+     Mandatory Role on the File side). No extra sentence needed here. -->
+
+## Ring Constraints
+
+No Directory has parent itself.
+No Directory may cycle back to itself via one or more traversals through has parent.
+
 ## Derivation Rules
 
 * File has Size iff File has ContentRef and Size is the byte-length of ContentRef.
@@ -100,4 +112,4 @@ File has-tag Tag.
 ## Instance Facts
 
 Domain 'filesystem' has Access 'public'.
-Domain 'filesystem' has Description 'File-browser foundation (epic #397). Declares the File, Directory, and Tag nouns and their binary facts. Constraints (ring-acyclic Directory parentage, mandatory File containment) land in #399.'.
+Domain 'filesystem' has Description 'File-browser foundation (epic #397). Declares the File, Directory, and Tag nouns and their binary facts plus the containment invariants (ring-acyclic Directory parentage, mandatory File-in-Directory containment) added in #399.'.
