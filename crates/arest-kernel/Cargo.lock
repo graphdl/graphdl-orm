@@ -137,6 +137,7 @@ dependencies = [
  "slint-build",
  "smoltcp",
  "spin",
+ "talc",
  "uart_16550",
  "uefi",
  "virtio-drivers",
@@ -4311,6 +4312,15 @@ dependencies = [
  "grid",
  "serde",
  "slotmap",
+]
+
+[[package]]
+name = "talc"
+version = "4.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3ae828aa394de34c7de08f522d1b86bd1c182c668d27da69caadda00590f26d"
+dependencies = [
+ "lock_api",
 ]
 
 [[package]]
