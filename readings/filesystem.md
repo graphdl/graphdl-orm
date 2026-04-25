@@ -147,3 +147,35 @@ No Directory may cycle back to itself via one or more traversals through has par
 
 Domain 'filesystem' has Access 'public'.
 Domain 'filesystem' has Description 'File-browser foundation (epic #397). Declares the File, Directory, and Tag nouns and their binary facts plus the containment invariants (ring-acyclic Directory parentage, mandatory File-in-Directory containment) added in #399.'.
+
+<!-- Platform functions: zip / unzip over Directory subtrees (#404)
+
+     Two engine-level Platform functions live in
+     `crates/arest/src/platform/zip.rs`:
+
+       zip_directory(dir_id) -> File
+         Walks the Directory subtree rooted at `dir_id`, encodes
+         every File's bytes as ZIP entries keyed by their
+         tree-relative path, registers a new File holding the
+         resulting archive at `dir_id`'s parent (or `dir_id` itself
+         when `dir_id` is a root). Stored-only compression today
+         (method 0); deflate is a follow-up that swaps the data
+         segment encoder/decoder. The on-wire LFH/CDH/EOCD shape is
+         identical between stored and deflated entries — no caller-
+         visible API change when deflate lands.
+
+       unzip_file(file_id, target_dir_id) -> ()
+         Reads `file_id`'s bytes, parses the ZIP central directory,
+         materialises each entry as a fresh File / Directory under
+         `target_dir_id`. Path entries ending in `/` become
+         Directories; other entries become Files with their decoded
+         bytes. Intermediate parent Directories are synthesised on
+         demand so unordered archives still unpack cleanly.
+
+     Both funnel through `command::apply_command_defs(CreateEntity)`
+     — the same path the HTTP `create:File` handler uses — so
+     derivations (Size = byte-length of ContentRef per the
+     "## Derivation Rules" section above) and validations fire
+     exactly as they would from a normal create. No bypass of the
+     standard cell-write API. -->
+
