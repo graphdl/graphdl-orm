@@ -1,0 +1,294 @@
+# crates/arest-kernel-image/Dockerfile.uefi-armv7
+#
+# armv7 sibling of `Dockerfile.uefi-aarch64` and `Dockerfile.uefi`.
+# Builds the arest-kernel as a 32-bit ARM PE32+ UEFI executable
+# (custom target JSON `arest-kernel-armv7-uefi.json` from Track I,
+# commit 12e4640) and boots it under qemu-system-arm + ArmVirtPkg
+# firmware (the 32-bit ARM counterpart of AAVMF / OVMF). Mirrors the
+# aarch64 UEFI Dockerfile structure so `boot-kernel-uefi-armv7.ps1`
+# can reuse the same `docker run --rm` + `-serial stdio` model.
+#
+# Compiles the same source tree the other UEFI builds use; the
+# `--target ./arest-kernel-armv7-uefi.json` switch + the `-Z build-std`
+# rebuild of core/compiler_builtins/alloc activates the armv7-gated
+# code paths (`arch::armv7::_print` via PL011 MMIO, the MSVC-ARM CRT
+# shims, the armv7 memory init, the virtio_mmio module's armv7 arm,
+# and the runtime harness in `entry_uefi_armv7.rs`). No separate
+# armv7 source tree exists — cross-arch from the start per #344.
+#
+# Usage from repo root:
+#   docker build -t arest-kernel-uefi-armv7 \
+#                -f crates/arest-kernel-image/Dockerfile.uefi-armv7 .
+#   docker run --rm arest-kernel-uefi-armv7
+#
+# What you see (kernel-side — once a virtio-blk-capable firmware is in
+# place; see KNOWN BLOCKER below):
+#   ... ArmVirtPkg's own banners ...
+#   AREST kernel - armv7-UEFI scaffold
+#     target: armv7-unknown-uefi (custom target JSON)
+#     pre-EBS:  PL011 MMIO active at 0x0900_0000
+#     post-EBS: PL011 MMIO survives ...
+#     mem:      N frames usable (M MiB) ...
+#     dma:      pool live (2 MiB UEFI memory-map carve for virtio)
+#     virtio-mmio: walk OK (virtio-net: slot N @ 0x..., virtio-blk: slot N @ 0x...)
+#     virtio-net: driver online, MAC ...
+#     virtio-blk: driver online, N sectors (M KiB), read-write
+#     next:   ExitBootServices + memory map (follow-ups)
+#   ... kernel halts in a wfi-loop; Ctrl-C the container to exit ...
+#
+# KNOWN BLOCKER (#389 final report):
+#   The Debian `qemu-efi-arm` package (version 2022.11-6+deb12u2 on
+#   bookworm) ships an AAVMF32_CODE.fd that does NOT include the
+#   VirtIO Block / FAT / Partition Table / Loaded-Image-Protocol
+#   driver chain. Verified via `strings -a AAVMF32_CODE.fd | grep -i
+#   virtio` returning zero matches (cf. `qemu-efi-aarch64`'s
+#   AAVMF_CODE.fd which contains the full VirtioBlkDxe + Fat + Part
+#   set). At runtime BdsDxe finds the virtio-blk-device but logs
+#   `Boot0002 "UEFI Non-Block Boot Device" from VenHw(...): Unsupported`
+#   and falls back to PXE (also unconfigured), then halts. `-kernel`
+#   doesn't help — the firmware's PE32+ loader needs the same chain
+#   to wrap the kernel as a Loaded Image.
+#
+#   The kernel itself is correct: `cargo +nightly build --target
+#   ./arest-kernel-armv7-uefi.json -Z build-std=core,compiler_builtins,alloc
+#   -Z unstable-options -Z json-target-spec` produces a valid PE32+
+#   `.efi` that this Dockerfile happily stages onto a FAT ESP, and
+#   the entry harness in `entry_uefi_armv7.rs` is wave-for-wave
+#   identical to the proven `entry_uefi_aarch64.rs`. The boot wall is
+#   purely on the firmware side.
+#
+#   Resolution paths (any of):
+#     1. Switch to a fuller ArmVirtPkg32 build (e.g. EDK2 nightly
+#        `Build/ArmVirtQemu-ARM/RELEASE_GCC5/FV/QEMU_EFI.fd` —
+#        confirmed to include VirtioBlkDxe). Brief explicitly cautions
+#        against pulling a "random EDK2 build" without provenance, so
+#        this needs a follow-up that pins to a specific verified
+#        EDK2 tag + sha.
+#     2. Boot via U-Boot's UEFI sub-system (u-boot.bin loaded with
+#        `-bios`, then `bootefi` from a virtio-blk shell command) —
+#        u-boot includes virtio-blk + fat + partition out of the box.
+#     3. Bypass UEFI entirely with a hand-rolled `_start` for
+#        `armv7a-none-eabi`. Defeats the whole point of #344's
+#        cross-arch UEFI shape, so likely a non-starter.
+#
+#   None of these can land in this commit without dragging in either
+#   external EDK2 binaries or a U-Boot dep. Documenting the blocker
+#   per the brief's instructions; the smoke harness will fail until
+#   one of the above lands.
+
+FROM rust:latest AS builder
+
+# Pinned nightly + rust-src + the UEFI targets the other arms use,
+# kept in the install set so this layer is cache-compatible with the
+# aarch64 / x86_64 Dockerfiles' builders. armv7 doesn't get a
+# `rustup target add` because rustc has no built-in `armv7-unknown-uefi`
+# triple — the build below uses the in-repo custom target JSON +
+# `-Z build-std` to rebuild the sysroot.
+#
+# Pin: nightly-2026-04-21. The compiler_builtins crate vendored with
+# nightly-2026-04-22 onward routes a libm `hypot::as_hypot_denorm`
+# code path through an f64→u64 cast that LLVM's ARM-MSVC backend
+# lowers to `__dtou64`, a libcall the current `arch::armv7::msvc_shims`
+# does not yet provide. Track BB's #388 verification (commit 16dc5d5)
+# and Track I's #386 verification (commit 12e4640) both ran on the
+# 04-21 toolchain; pinning here keeps the Docker build reproducible
+# against the same compiler_builtins those verifications relied on.
+# Once the shim catches up in a follow-up commit (msvc_shims.rs
+# `__dtou64` analogue of the existing `__dtoi64`), this pin can drop
+# back to plain `nightly`.
+ARG RUST_NIGHTLY=nightly-2026-04-21
+RUN rustup toolchain install ${RUST_NIGHTLY} --profile minimal \
+    && rustup default ${RUST_NIGHTLY} \
+    && rustup component add rust-src --toolchain ${RUST_NIGHTLY} \
+    && rustup component add llvm-tools-preview --toolchain ${RUST_NIGHTLY} \
+    && rustup target add x86_64-unknown-none --toolchain ${RUST_NIGHTLY} \
+    && rustup target add x86_64-unknown-uefi --toolchain ${RUST_NIGHTLY} \
+    && rustup target add aarch64-unknown-uefi --toolchain ${RUST_NIGHTLY} \
+    && ln -sf /usr/local/rustup/toolchains/${RUST_NIGHTLY}-x86_64-unknown-linux-gnu /usr/local/rustup/toolchains/nightly-x86_64-unknown-linux-gnu
+
+WORKDIR /build
+
+# Source copy layout matches Dockerfile.uefi-aarch64 exactly so layer
+# caching applies across both builds on the same host.
+COPY crates/arest-kernel/Cargo.toml crates/arest-kernel/Cargo.toml
+COPY crates/arest-kernel/build.rs   crates/arest-kernel/build.rs
+COPY crates/arest-kernel/src/       crates/arest-kernel/src/
+COPY crates/arest-kernel/rust-toolchain.toml crates/arest-kernel/rust-toolchain.toml
+# The custom target JSON for armv7-unknown-uefi (Track I, #386,
+# commit 12e4640). Lives next to Cargo.toml so the relative path
+# `./arest-kernel-armv7-uefi.json` resolves the same way it does for
+# a developer running `cargo +nightly build` from the crate root on
+# their host.
+COPY crates/arest-kernel/arest-kernel-armv7-uefi.json crates/arest-kernel/arest-kernel-armv7-uefi.json
+
+# ui.do bundle — #266 baked-assets path is arch-neutral; the armv7
+# kernel's `entry_uefi_armv7.rs` doesn't reference `assets` yet, but
+# `build.rs` baking still needs the directory to exist.
+COPY apps/ui.do/dist/ apps/ui.do/dist/
+
+# arest engine sources + readings — arch-neutral, same as the aarch64
+# Dockerfile.
+COPY crates/arest/Cargo.toml crates/arest/Cargo.toml
+COPY crates/arest/src/       crates/arest/src/
+COPY readings/               readings/
+
+# Build the armv7 UEFI .efi. The custom target JSON + `-Z build-std`
+# combination rebuilds core/compiler_builtins/alloc against the
+# `armv7-unknown-uefi` triple (rustc has no built-in target for it,
+# so a custom `.json` + sysroot rebuild is required). The
+# `-Z unstable-options -Z json-target-spec` pair tells nightly to
+# accept the JSON spec rather than treating it as a path-only triple.
+#
+# Dev profile (no `--release`) — matches Track I's verification
+# invocation in commit 12e4640's final report and Track BB's #388
+# verification in commit 16dc5d5. The release profile triggers
+# additional libm code paths in compiler_builtins (notably
+# `libm_math::hypot::as_hypot_denorm`'s f64→u64 cast) which the
+# LLVM ARM-MSVC backend lowers to `__dtou64` — a libcall the current
+# `arch::armv7::msvc_shims` does not yet provide. The dev profile
+# elides those paths via dead-code analysis. Once the shim catches
+# up in a follow-up commit, this build can move to `--release` for
+# the smaller .efi footprint.
+#
+# Output lands at
+# target/arest-kernel-armv7-uefi/debug/arest-kernel.efi.
+RUN cd crates/arest-kernel \
+    && cargo +nightly build \
+        --target ./arest-kernel-armv7-uefi.json \
+        -Z build-std=core,compiler_builtins,alloc \
+        -Z unstable-options \
+        -Z json-target-spec
+
+# ── Runtime stage: qemu-system-arm + ArmVirtPkg + FAT staging tools ──
+FROM debian:bookworm-slim AS runner
+
+# qemu-system-arm   : `qemu-system-arm` (32-bit ARM virt, ARMv7)
+#                     binary. This is the 32-bit counterpart of
+#                     `qemu-system-aarch64`; it exposes a separate
+#                     `-machine virt` variant tailored for the 32-bit
+#                     ISA (different memory map vs the aarch64 virt
+#                     machine in some details, but the PL011 UART and
+#                     virtio-mmio slots sit at the same physical
+#                     addresses on both — same `hw/arm/virt.c` driver).
+# qemu-efi-arm      : `/usr/share/AAVMF/AAVMF32_CODE.fd` +
+#                     `AAVMF32_VARS.fd` — ArmVirtPkg compiled for
+#                     32-bit ARM. The 32-bit ARM analogue of
+#                     `qemu-efi-aarch64`'s `AAVMF_CODE.fd`. Verified
+#                     present on debian:bookworm-slim:
+#                       $ apt-cache search qemu-efi
+#                       qemu-efi-arm - UEFI firmware for 32-bit ARM ...
+#                       $ dpkg -L qemu-efi-arm | grep '\.fd$'
+#                       /usr/share/AAVMF/AAVMF32_CODE.fd
+#                       /usr/share/AAVMF/AAVMF32_VARS.fd
+#                     File name is `AAVMF32_CODE.fd` (NOT
+#                     `QEMU_EFI-arm.fd` as some upstream EDK2 builds
+#                     ship it) — Debian's packaging renames to keep
+#                     the AAVMF prefix consistent with the aarch64
+#                     package's `AAVMF_CODE.fd`.
+# ipxe-qemu         : `/usr/lib/ipxe/qemu/efi-virtio.rom` — iPXE ROM
+#                     QEMU's virtio devices load on init. Mirrors the
+#                     aarch64 Dockerfile (without it qemu-system-arm
+#                     aborts: `failed to find romfile efi-virtio.rom`).
+# dosfstools+mtools : FAT ESP staging (same as Dockerfile.uefi-aarch64).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    qemu-system-arm \
+    qemu-efi-arm \
+    ipxe-qemu \
+    dosfstools \
+    mtools \
+    && rm -rf /var/lib/apt/lists/*
+
+# Stage the armv7 .efi at the firmware's default boot path. The
+# `EFI/BOOT/<arch>.EFI` convention is the same shape OVMF and AAVMF
+# use, but on 32-bit ARM the canonical entry name is `BOOTARM.EFI`
+# (not `BOOTAA64.EFI` — that's the aarch64 convention). The
+# ArmVirtPkg firmware probes that name on the ESP and loads it.
+COPY --from=builder \
+     /build/crates/arest-kernel/target/arest-kernel-armv7-uefi/debug/arest-kernel.efi \
+     /arest-kernel.efi
+
+# 64 MiB FAT image (same size as aarch64's — uefi-disk.img's shape is
+# arch-neutral; only the entry filename differs).
+RUN dd if=/dev/zero of=/uefi-disk.img bs=1M count=64 status=none \
+    && mkfs.fat -F 32 /uefi-disk.img >/dev/null \
+    && mmd -i /uefi-disk.img ::/EFI \
+    && mmd -i /uefi-disk.img ::/EFI/BOOT \
+    && mcopy -i /uefi-disk.img /arest-kernel.efi ::/EFI/BOOT/BOOTARM.EFI
+
+# Separate raw disk image for the virtio-blk persistence device
+# (armv7 parity with the aarch64 arm's #369 path). 1 MiB,
+# zero-initialised — the armv7 kernel's boot harness only reads
+# capacity + readonly off the virtio-blk driver (not the full mount /
+# round-trip path — `block_storage` is cfg-gated on x86_64), so a
+# zero-filled image is all we need.
+RUN dd if=/dev/zero of=/disk.img bs=1M count=1 status=none
+
+# Boot under qemu-system-arm + ArmVirtPkg:
+#   -machine virt           QEMU's generic 32-bit ARM virtual machine.
+#                           virtio-mmio slots at 0x0a00_0000 + 0x200*n
+#                           + PL011 UART at 0x0900_0000 (same physical
+#                           layout as the aarch64 virt machine — same
+#                           `hw/arm/virt.c` driver underneath, just a
+#                           different ISA on top).
+#   -cpu cortex-a15         ARMv7-A reference core. The custom target
+#                           JSON's `llvm-target = thumbv7a-pc-windows-
+#                           msvc` matches; cortex-a15 has VFPv4 + NEON
+#                           which the JSON's `+vfp3,+neon` features
+#                           exercise.
+#   -m 256M                 Guest RAM. Same as aarch64 — fits the
+#                           16 MiB kernel heap + DMA pool + UEFI
+#                           firmware comfortably.
+#   -bios ...AAVMF32_CODE.fd
+#                           Combined ArmVirtPkg code+vars for 32-bit
+#                           ARM. Varstore persistence irrelevant for
+#                           smokes (we boot fresh every container).
+#   -drive ...,if=none,id=esp + -device virtio-blk-device,drive=esp
+#                           ESP as a virtio-blk device, attached via
+#                           MMIO transport. The aarch64 Dockerfile
+#                           uses `if=virtio` which on QEMU defaults
+#                           to virtio-blk-pci on the aarch64 virt
+#                           machine — AAVMF (64-bit) handles PCI
+#                           virtio-blk fine, but ArmVirtPkg (32-bit)
+#                           does not include the virtio-blk-pci
+#                           driver in its boot path (it logs
+#                           "PciRoot(0x0)/Pci(0x1,0x0): Unsupported"
+#                           and falls back to PXE). Forcing the
+#                           virtio-blk-DEVICE form attaches via MMIO,
+#                           which ArmVirtPkg32 boots from. Same
+#                           transport our kernel uses post-EBS for the
+#                           data disk below.
+#   -netdev user,...        SLiRP user-mode NAT, no host-port
+#                           forwards (the armv7 arm has no HTTP
+#                           listener on this boot — banner-only).
+#   -device virtio-net-device,netdev=net0
+#                           virtio-net attached via MMIO (not PCI).
+#                           Same convention as the aarch64 virt
+#                           machine — `-device virtio-*-device`
+#                           routes through MMIO, our scanner walks
+#                           MMIO slots only.
+#   -drive ...id=disk0      Raw image for the virtio-blk data device.
+#                           Independent from the ESP above.
+#   -device virtio-blk-device,drive=disk0
+#                           virtio-blk attached via MMIO. QEMU picks
+#                           the next free slot after the ESP device.
+#   -serial stdio           PL011 output to QEMU stdout. Our
+#                           `arch::armv7::_print` writes MMIO directly
+#                           to 0x0900_0000 = PL011 UARTDR, which QEMU
+#                           wires to `-serial stdio`.
+#   -display none           Headless.
+#   -no-reboot / -no-shutdown
+#                           Exit on fault rather than loop.
+CMD ["qemu-system-arm", \
+     "-machine", "virt", \
+     "-cpu", "cortex-a15", \
+     "-m", "256M", \
+     "-bios", "/usr/share/AAVMF/AAVMF32_CODE.fd", \
+     "-drive", "format=raw,file=/uefi-disk.img,if=none,id=esp", \
+     "-device", "virtio-blk-device,drive=esp", \
+     "-netdev", "user,id=net0", \
+     "-device", "virtio-net-device,netdev=net0", \
+     "-drive", "file=/disk.img,format=raw,if=none,id=disk0", \
+     "-device", "virtio-blk-device,drive=disk0", \
+     "-serial", "stdio", \
+     "-display", "none", \
+     "-no-reboot", "-no-shutdown"]

@@ -76,7 +76,19 @@
 
 pub mod memory;
 mod msvc_shims;
-mod runtime_stub;
+// `runtime_stub` was the compile-only `#[global_allocator]` +
+// `#[panic_handler]` + `efi_main` placeholder that kept the armv7
+// build linking before the runtime harness landed. As of #389 the
+// real entry harness in `crate::entry_uefi_armv7` supplies all three
+// items (a static-BSS LockedHeap, a PL011 panic handler, and a
+// uefi-rs `#[entry]`-decorated `efi_main`); the stub's items now
+// collide with the real ones, so the `mod runtime_stub;` declaration
+// is elided. The source file itself remains in place to minimise the
+// per-arch touch surface in this commit — a follow-up cleanup commit
+// can delete it. This matches the explicit retirement plan in
+// `runtime_stub.rs`'s own header ("at which point this file goes
+// away (or shrinks to a no-op marker module)").
+// mod runtime_stub;
 mod serial;
 
 // `_print` is the callee of the crate-wide `print!` / `println!`
