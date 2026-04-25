@@ -58,6 +58,15 @@ export component AppLauncher inherits Window {
     // when `cfg(feature = "doom")` is on — see `launcher.rs`).
     callback open-doom();
 
+    // Fired when the user clicks the "Keyboard" button (Track QQQQ
+    // #465). Rust glue hides this window and shows
+    // `crate::ui_apps::keyboard::build_app()`'s window. Always
+    // available — the on-screen QWERTY is the foundation for the
+    // touch-only "phone shape" milestone (boot-kernel-uefi.ps1
+    // -Smoke under QEMU with no host keyboard), so the button row
+    // is unconditional rather than feature-gated like Doom.
+    callback open-keyboard();
+
     // Theme toggle, surfaced through the top bar so the user can
     // flip dark/light at the splash. Mirrors HateoasBrowser / Repl —
     // the actual mode flip happens inside `Theme.toggle-mode()`;
@@ -238,6 +247,19 @@ export component AppLauncher inherits Window {
                                     text: "Doom";
                                     variant: ButtonVariant.primary;
                                     clicked => { root.open-doom(); }
+                                }
+
+                                // Track QQQQ #465: virtual keyboard
+                                // row. Always shown (no cargo
+                                // feature gate — the on-screen
+                                // QWERTY is the path to making
+                                // AREST usable on a touch-only
+                                // display under QEMU, so it ships
+                                // in the default build).
+                                Button {
+                                    text: "Keyboard";
+                                    variant: ButtonVariant.primary;
+                                    clicked => { root.open-keyboard(); }
                                 }
                             }
                         }

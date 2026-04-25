@@ -14,10 +14,10 @@
 // This module is the lowest-risk adapter slice: Slint is already
 // kernel-resident (no linuxkpi shim involved), so we just walk the
 // MMM #436 component surface (`ui/components/{Button,Input,Card,
-// List,Dialog}.slint`) plus the four launcher app symbols
-// (`ui/apps/{AppLauncher,HateoasBrowser,Repl,Doom}.slint` from
-// SSS/TTT/UUU/VVV) and emit the FORML 2 facts that mirror the
-// readings.
+// List,Dialog}.slint`) plus the five launcher app symbols
+// (`ui/apps/{AppLauncher,HateoasBrowser,Repl,Doom,Keyboard}.slint`
+// from SSS/TTT/UUU/VVV/QQQQ) and emit the FORML 2 facts that mirror
+// the readings.
 //
 // # Spec coverage
 //
@@ -356,7 +356,7 @@ struct LauncherAppSpec {
     description: &'static str,
 }
 
-/// Hard-coded launcher app specs. The four .slint files under
+/// Hard-coded launcher app specs. The five .slint files under
 /// `ui/apps/` define these. Each one is a Window-derived
 /// component instantiated by the matching `crate::ui_apps::<name>::
 /// build_app()` (or `crate::ui_apps::launcher::run` for
@@ -391,6 +391,18 @@ fn launcher_apps() -> Vec<LauncherAppSpec> {
             name: "doom",
             slint_symbol: "Doom",
             description: "Doom WASM guest surface (#455 + #456, Track VVV; --features doom).",
+        },
+        // From `ui/apps/Keyboard.slint` — touch-driven on-screen
+        // QWERTY (Track QQQQ #465). Always loadable; the
+        // foundation for AREST being usable on a touch-only
+        // display under QEMU. Touch / pointer events on key cells
+        // synthesise `DecodedKey::Unicode(c)` values onto the
+        // kernel keyboard ring via
+        // `arch::uefi::keyboard::push_keystroke`.
+        LauncherAppSpec {
+            name: "keyboard",
+            slint_symbol: "Keyboard",
+            description: "Touch-driven on-screen QWERTY virtual keyboard (#465, Track QQQQ).",
         },
     ]
 }
@@ -748,12 +760,15 @@ mod tests {
         assert_eq!(cell_count(&state, "ComponentRole_requires_Notice"), 3);
     }
 
-    /// Four launcher apps emit the LaunchableApp facts.
+    /// Five launcher apps emit the LaunchableApp facts.
+    /// Track QQQQ #465 added the Keyboard surface to the four
+    /// originally registered (AppLauncher, HateoasBrowser, Repl,
+    /// Doom).
     #[test]
-    fn four_launcher_apps_register_symbols() {
+    fn five_launcher_apps_register_symbols() {
         let state = build_slint_component_state(&Object::phi());
-        assert_eq!(cell_count(&state, "LaunchableApp_has_Symbol"), 4);
-        assert_eq!(cell_count(&state, "LaunchableApp_has_Description"), 4);
+        assert_eq!(cell_count(&state, "LaunchableApp_has_Symbol"), 5);
+        assert_eq!(cell_count(&state, "LaunchableApp_has_Description"), 5);
     }
 
     /// Sanity: the Button binding ID matches DDDD's reading

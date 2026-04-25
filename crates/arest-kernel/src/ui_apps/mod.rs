@@ -23,6 +23,7 @@
 // screen at boot.
 
 pub mod hateoas;
+pub mod keyboard;
 pub mod launcher;
 pub mod registry;
 pub mod repl;
