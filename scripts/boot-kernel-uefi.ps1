@@ -122,7 +122,8 @@ if ($Smoke) {
             "gop:      ",
             "gop-mmio: wrote 320x200, readback sum=0xffff8300",
             "fb:       paint smoke OK, presents=2",
-            "doom-blit: synthetic 640x400 BGRA frame blitted"
+            "doom-blit: synthetic 640x400 BGRA frame blitted",
+            "idt:      int3 round-tripped through UEFI IDT"
         )
         $missing = @()
         foreach ($phrase in $expected) {

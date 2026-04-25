@@ -18,23 +18,37 @@
 //     offset (= 0 on UEFI — firmware identity-maps).
 //
 // What's deliberately NOT here yet:
-//   * `init_gdt_and_interrupts` — will land alongside step 4d proper
-//     (kernel_run handoff) once the kernel-body subsystems that depend
-//     on them (virtio / net / blk / repl) are UEFI-capable. Until then
-//     the entry halts after proving the page-table singleton is live.
+//   * GDT / TSS reprogramming — firmware's GDT and CR3 stay live
+//     through boot. The IDT below installs without touching
+//     descriptor tables; #344f scope picks up GDT replacement when
+//     hardware IRQs (PIT timer + PS/2 keyboard) need a TSS-backed
+//     IST stack switch.
+//   * 8259 PIC / APIC programming — `init_interrupts` populates only
+//     the CPU-exception slots (#BP, #DF). Hardware-IRQ vector wiring
+//     is #344f.
 //
 // What this commit adds (step 4d prep):
-//   * `enable_sse`, `breakpoint`, `halt_forever` — CPU-level
-//     primitives identical in shape to the x86_64 arm. Both
-//     `x86_64-unknown-none` and `x86_64-unknown-uefi` run on the same
-//     silicon, so these are target-os-agnostic; they live in each
-//     arm rather than a shared sub-module to match the existing
-//     per-arm structure. Pre-requisite for any UEFI kernel_run path
-//     that touches floating-point (wasmi's f32/f64 ops — #270/#271).
+//   * `enable_sse`, `halt_forever` — CPU-level primitives identical in
+//     shape to the x86_64 arm. Both `x86_64-unknown-none` and
+//     `x86_64-unknown-uefi` run on the same silicon, so these are
+//     target-os-agnostic; they live in each arm rather than a shared
+//     sub-module to match the existing per-arm structure. Pre-requisite
+//     for any UEFI kernel_run path that touches floating-point
+//     (wasmi's f32/f64 ops — #270/#271).
+//
+// What #363 adds:
+//   * `interrupts` module — kernel-owned IDT for the UEFI x86_64 path.
+//     `init_interrupts()` builds + `lidt`-loads a `Once<InterruptDescriptorTable>`
+//     populated with breakpoint + double-fault handlers. `breakpoint()`
+//     fires `int3` so the boot banner can prove the IDT is live via a
+//     round-trip smoke. Re-exported here so the entry calls
+//     `arch::init_interrupts()` / `arch::breakpoint()` target-agnostically.
 
+pub mod interrupts;
 pub mod memory;
 mod serial;
 
+pub use interrupts::{breakpoint, init_interrupts};
 pub use serial::{_print, switch_to_post_ebs_serial};
 
 /// Initialise the architecture's console. Under UEFI the firmware has
@@ -82,17 +96,6 @@ pub fn enable_sse() {
         cr4.insert(Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE);
         Cr4::write(cr4);
     }
-}
-
-/// Fire a software breakpoint (`int3`). Same function the BIOS arm
-/// exposes; proves the IDT — once step 4d lands one under UEFI —
-/// routes CPU exceptions back through the handler chain.
-///
-/// Today this faults with a double-fault because no UEFI-owned IDT
-/// has replaced the firmware's post-ExitBootServices; do not call
-/// until step 4d installs one.
-pub fn breakpoint() {
-    ::x86_64::instructions::interrupts::int3();
 }
 
 /// Drive the kernel's idle loop. Unlike the BIOS arm's
