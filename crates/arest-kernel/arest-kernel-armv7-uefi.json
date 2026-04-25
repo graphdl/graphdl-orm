@@ -15,8 +15,11 @@
   "features": "+vfp3,+neon",
   "is-like-msvc": true,
   "is-like-windows": true,
-  "linker": "rust-lld",
-  "linker-flavor": "msvc-lld",
+  "link-env": [
+    "BASH_ENV=src/post_link_armv7.sh"
+  ],
+  "linker": "bash",
+  "linker-flavor": "msvc",
   "linker-is-gnu": false,
   "lld-flavor": "link",
   "llvm-floatabi": "hard",
