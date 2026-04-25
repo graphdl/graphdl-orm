@@ -510,6 +510,65 @@ server.registerTool(
   },
 )
 
+// ── select_component (#493): AI agents query the Component registry ──
+//
+// Composes UIs by description rather than by toolkit knowledge. Routes
+// through to the engine-side handler (command::select_component) via
+// the `select_component` system intercept added in lib.rs. Mirrors
+// `query`'s request/response shape — JSON in, JSON list out — so an
+// LLM tool call can spell:
+//
+//   select_component({
+//     intent: "I need a date picker",
+//     constraints: { touch: true, a11y: ["screen_reader"], theme: "dark" }
+//   })
+//
+// and get back a ranked list of {component, role, toolkit, symbol,
+// score} records. Selection is metamodel-resident (HHHH's #492 rules
+// re-implemented in Rust for sub-millisecond latency); picks are
+// reproducible across runs.
+server.registerTool(
+  'select_component',
+  {
+    description: 'Select a UI Component implementation by intent and MonoView constraints. Returns a ranked list of (component, toolkit, symbol, score) tuples drawn from the Component registry. Scoring mirrors the metamodel selection rules (touch / density / a11y / theme / surface tier / kernel-resident preferences). Use when an AI agent needs to compose a UI without knowing toolkit names.',
+    inputSchema: {
+      intent: z.string().describe('Natural-language description of the widget you need (e.g. "I need a date picker"). Matched by case-insensitive substring against the Component Role.'),
+      interaction_mode: z.enum(['pointer', 'keyboard', 'touch']).optional().describe('MonoView interaction mode'),
+      density: z.enum(['compact', 'regular', 'spacious']).optional().describe('MonoView density scale'),
+      a11y: z.array(z.string()).optional().describe('A11y profiles, e.g. ["screen_reader", "high-contrast"]'),
+      theme: z.string().optional().describe('Theme mode, e.g. "dark"'),
+      surface: z.enum(['backdrop', 'panel', 'overlay', 'drop-shadow']).optional().describe('Surface tier'),
+      touch: z.boolean().optional().describe('Convenience: sets interaction_mode="touch" when true'),
+      limit: z.number().optional().describe('Max results to return (default 5)'),
+    },
+  },
+  async ({ intent, interaction_mode, density, a11y, theme, surface, touch, limit }) => {
+    const constraints: Record<string, any> = {}
+    if (interaction_mode !== undefined) constraints.interactionMode = interaction_mode
+    if (density !== undefined) constraints.density = density
+    if (a11y !== undefined) constraints.a11y = a11y
+    if (theme !== undefined) constraints.theme = theme
+    if (surface !== undefined) constraints.surface = surface
+    if (touch !== undefined) constraints.touch = touch
+    if (limit !== undefined) constraints.limit = limit
+    const body = JSON.stringify({ intent: intent || '', constraints })
+    if (AREST_MODE === 'local') {
+      const raw = await systemCall('select_component', body)
+      try {
+        const parsed = JSON.parse(raw)
+        return textResult(parsed ?? [])
+      } catch {
+        return textResult({ raw })
+      }
+    }
+    const data = await httpRequest('/arest/default/select_component', {
+      method: 'POST',
+      body,
+    })
+    return textResult(data)
+  },
+)
+
 // =====================================================================
 // EVOLUTION — governed self-modification via Domain Change
 // =====================================================================
