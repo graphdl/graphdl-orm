@@ -11,11 +11,11 @@
 // `aarch64-unknown-uefi` target uses. Under that linker flavor LLVM's
 // ARM backend lowers a handful of operations to Microsoft-CRT-named
 // helper calls — `__rt_udiv`, `__rt_udiv64`, `__rt_sdiv`, `__chkstk`,
-// `__u64tod`, `__u64tos`, `__i64tod`, `__i64tos`, `__dtoi64` — that
-// the standard `compiler_builtins` crate only provides under their
-// AEABI / cross-platform names (`__udivsi3`, `__udivdi3`, `__divsi3`,
-// `__floatundidf`, `__floatundisf`, `__floatdidf`, `__floatdisf`,
-// `__fixdfdi`).
+// `__u64tod`, `__u64tos`, `__i64tod`, `__i64tos`, `__dtoi64`,
+// `__dtou64` — that the standard `compiler_builtins` crate only
+// provides under their AEABI / cross-platform names (`__udivsi3`,
+// `__udivdi3`, `__divsi3`, `__floatundidf`, `__floatundisf`,
+// `__floatdidf`, `__floatdisf`, `__fixdfdi`, `__fixunsdfdi`).
 //
 // On Microsoft's own toolchain those CRT helpers come from
 // `armrt.lib` / VC++ runtime. We don't link any MSVC CRT (a UEFI
@@ -65,6 +65,7 @@ unsafe extern "C" {
     fn __floatdidf(i: i64) -> f64;
     fn __floatdisf(i: i64) -> f32;
     fn __fixdfdi(f: f64) -> i64;
+    fn __fixunsdfdi(f: f64) -> u64;
 }
 
 /// MSVC ARM unsigned 32-bit divide. Microsoft argument order is
@@ -128,6 +129,24 @@ pub unsafe extern "C" fn __i64tos(i: i64) -> f32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn __dtoi64(f: f64) -> i64 {
     unsafe { __fixdfdi(f) }
+}
+
+/// MSVC ARM `f64 → u64`. Backed by compiler_builtins's `__fixunsdfdi`
+/// ("fix unsigned df di" — convert f64 to u64). Sibling of `__dtoi64`
+/// for the unsigned destination type.
+///
+/// Why this shim exists: nightlies from 2026-04-22 onward route a
+/// `compiler_builtins::libm_math::hypot::as_hypot_denorm` code path
+/// through an f64→u64 cast that LLVM's ARM-MSVC backend lowers to
+/// `__dtou64`. Before this shim, the arch::armv7 build had to be
+/// pinned to nightly-2026-04-21 (or kept on the dev profile, which
+/// dead-code-eliminates the path) to avoid an undefined-symbol link
+/// error against `__dtou64`. With this shim the toolchain pin in
+/// `Dockerfile.uefi-armv7` can drop back to plain `nightly` and the
+/// `--release` profile becomes available again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn __dtou64(f: f64) -> u64 {
+    unsafe { __fixunsdfdi(f) }
 }
 
 // ---------------------------------------------------------------------------
