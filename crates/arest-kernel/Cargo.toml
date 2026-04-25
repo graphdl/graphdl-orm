@@ -156,6 +156,48 @@ uefi = { version = "0.34", features = ["alloc", "logger"] }
 # needing std. `no_std` default — we supply the `alloc` global.
 [target.'cfg(all(target_os = "uefi", target_arch = "x86_64"))'.dependencies]
 wasmi = { version = "0.50", default-features = false, features = ["hash-collections"] }
+# Slint UI toolkit (#426) — picked over egui per the Track II
+# decision recorded in `docs/24-ui-toolkit-decision.md` (commit
+# `75f1022`). Same gating story as wasmi: only the UEFI x86_64
+# build wires Slint into a render path, and pulling Slint into the
+# BIOS (`x86_64-unknown-none`) image overflows the bootloader-stage
+# loader budget. Aarch64 UEFI is still scaffold (no framebuffer
+# backend yet), so it stays out of that arm too. The feature
+# selection follows Slint's own MCU/no_std recipe
+# (https://docs.rs/slint/latest/slint/docs/mcu/index.html):
+#   default-features = false   — drops every std-pulling backend
+#   compat-1-2                 — opt into the 1.2-stable API surface
+#   unsafe-single-threaded     — replace `thread_local!` with raw
+#                                statics; sound because the kernel
+#                                drives Slint from a single CPU at
+#                                boot (no SMP scheduler yet)
+#   libm                       — pure-Rust libm for f32/f64 math
+#                                without libc / libstd
+#   renderer-software          — CPU-side rasteriser writing into a
+#                                caller-provided framebuffer; the
+#                                UEFI GOP backend lands in #427
+# The framebuffer backend (#427) and the input/event-pump adapter
+# (#428) wire this dependency into the kernel; this commit only
+# adds it to the build graph.
+slint = { version = "1.16", default-features = false, features = [
+    "compat-1-2",
+    "unsafe-single-threaded",
+    "libm",
+    "renderer-software",
+] }
+
+# Slint compile-time helper (#426). The `slint!` macro and any
+# future `.slint` files have to be processed at build time —
+# `slint-build` is what `build.rs` calls into to do that and to
+# embed images / fonts via `EmbedResourcesKind::EmbedForSoftwareRenderer`.
+# Gated to the same UEFI x86_64 cfg as the runtime crate above so
+# the BIOS / aarch64 / armv7 builds don't pull it in (it's a host
+# build crate but cargo still resolves it for every target unless
+# we gate it). No `.slint` files exist yet — those land in #436 —
+# but the build dep needs to be in the graph so the runtime crate
+# resolves cleanly.
+[target.'cfg(all(target_os = "uefi", target_arch = "x86_64"))'.build-dependencies]
+slint-build = "1.16"
 
 # aarch64-unknown-uefi specific deps (#344 cross-arch scaffold). The
 # aarch64 UEFI arm today is compile-only: a banner via PL011 MMIO at
