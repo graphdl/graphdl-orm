@@ -130,13 +130,17 @@
 
 #![cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 
+use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
 use pc_keyboard::{DecodedKey, KeyCode};
+use smoltcp::wire::IpEndpoint;
+use spin::Mutex;
 use wasmi::{Instance, Linker, Store};
 
 use crate::block::BLOCK_SECTOR_SIZE;
 use crate::block_storage::{self, RegionHandle};
+use crate::net::{self, UdpSocketHandle};
 
 /// Host-side callbacks the doomgeneric-wasm guest expects. Every
 /// method corresponds to one WASM import across four import-module
@@ -264,6 +268,68 @@ pub trait DoomHost {
     /// the `call_indirect` trap surfaces back up through the wasmi
     /// `Result`.
     fn on_error_message(&mut self, message: &str);
+
+    // --- networking (#385) -----------------------------------------
+    //
+    // Doom's classic NetGame protocol uses UDP — one packet per tic
+    // (~70 B payload) over a small set of statically-configured peer
+    // endpoints. The 10 imports above (loading / runtimeControl / ui
+    // / gameSaving / console) cover single-player; these three add
+    // multiplayer wiring once the WASM grows the matching imports.
+    //
+    // jacobenget/doom.wasm v0.1.0 (the artifact baked under
+    // `doom_assets/doom.wasm`) does NOT actually import these — its
+    // surface is single-player only. The trait methods + linker
+    // registrations below are forward-looking: a future drop-in WASM
+    // (rebuilt from doomgeneric with `D_USE_NETWORKING=1`, or any
+    // other multiplayer-capable port) will resolve to these imports
+    // without requiring another round of host-shim work. wasmi's
+    // `Linker` ignores defs the module doesn't import, so the surface
+    // is a no-op cost on today's binary.
+    //
+    // The conjectured WASM ABI mirrors the C-style `D_PollNetworkState`
+    // / `D_NetSendPacket` shape doomgeneric's NetGame layer expects:
+    //
+    //   net_send_packet(buf_ptr: i32,
+    //                   buf_len: i32,
+    //                   peer_idx: i32) -> i32
+    //     Hand `buf_len` bytes from guest memory at `buf_ptr` to the
+    //     UDP socket targeting peer `peer_idx`. Returns bytes
+    //     enqueued (== buf_len on success, 0 on full ring or
+    //     out-of-range peer).
+    //
+    //   net_recv_packet(buf_ptr: i32,
+    //                   buf_max: i32,
+    //                   out_peer: i32) -> i32
+    //     Pop the next pending UDP packet (if any) into guest memory
+    //     at `buf_ptr` (capped at `buf_max` bytes), and write the
+    //     source peer index back to `out_peer`. Returns the byte
+    //     count (0 if the ring is empty).
+    //
+    //   net_peer_count() -> i32
+    //     The number of remote peers configured at boot.
+
+    /// `networking.net_send_packet`. Enqueue one outbound packet to
+    /// peer `peer_idx`. Returns the byte count enqueued (== payload
+    /// length on success, 0 if the peer index is out of range or the
+    /// transmit ring is full). Non-blocking: actual transmission
+    /// happens on the next `net::poll()` tick. The trampoline owns
+    /// guest-memory translation; this method receives the already-
+    /// copied `&[u8]`.
+    fn net_send_packet(&mut self, payload: &[u8], peer_idx: i32) -> i32;
+
+    /// `networking.net_recv_packet`. Pop one pending inbound packet
+    /// (if any) into `buf`, returning `Some((bytes_written,
+    /// peer_idx))` on success and `None` when the ring is empty. The
+    /// trampoline copies the result back into guest memory and
+    /// writes `peer_idx` to the guest's `out_peer` pointer.
+    fn net_recv_packet(&mut self, buf: &mut [u8]) -> Option<(usize, i32)>;
+
+    /// `networking.net_peer_count`. The number of remote peers
+    /// configured at boot. The host populates this via
+    /// [`set_doom_peers`]; until that runs the count is 0 and the
+    /// guest's NetGame layer falls through to single-player mode.
+    fn net_peer_count(&mut self) -> i32;
 }
 
 /// Default in-kernel implementation of [`DoomHost`]. Side-effect
@@ -323,16 +389,45 @@ pub trait DoomHost {
 ///     guest use the copy embedded in its own rodata (jacobenget/
 ///     doom.wasm v0.1.0 ships the Shareware WAD inline — see
 ///     doom_assets/README.md's "WAD bundling" note).
-pub struct KernelDoomHost;
+pub struct KernelDoomHost {
+    /// UDP socket handle for Doom multiplayer (#385). Bound lazily on
+    /// the first `net_send_packet` (or via the per-frame drain pass
+    /// in `crate::ui_apps::doom`) so a single-player session that
+    /// never touches the net imports doesn't pay the smoltcp socket
+    /// allocation cost. `None` until first use; `Some(handle)`
+    /// thereafter.
+    udp_handle: Option<UdpSocketHandle>,
+    /// In-memory inbound packet ring. Populated by the per-frame
+    /// timer's `udp_recv_from` drain pass (see
+    /// `crate::ui_apps::doom`); drained by the WASM-visible
+    /// `net_recv_packet` import. Wrapped in `spin::Mutex` so the
+    /// drain pass and the WASM call (both single-threaded but
+    /// re-entrant within the same poll cycle) serialise safely.
+    /// Bounded at `INBOUND_RING_CAP` slots; oldest dropped under
+    /// back-pressure.
+    inbound: Mutex<VecDeque<InboundPacket>>,
+}
+
+/// One pending inbound UDP packet — the payload bytes plus the
+/// resolved peer index (from the boot-time `PEERS` table). Stored
+/// as a heap `Vec<u8>` so the inbound ring's storage scales with
+/// actual traffic rather than reserving the worst-case 1500 bytes
+/// per slot.
+struct InboundPacket {
+    payload: Vec<u8>,
+    peer_idx: i32,
+}
 
 impl KernelDoomHost {
-    /// Construct a fresh host. No initialization state yet — each
-    /// impl method will stand up whatever subsystem it fronts on
-    /// first call. Kept as an explicit constructor so future growth
-    /// (embedded WAD offsets, save-slot allocator, etc.) has a
+    /// Construct a fresh host. UDP socket starts unbound; lazy-binds
+    /// on first net call. Kept as an explicit constructor so future
+    /// growth (embedded WAD offsets, save-slot allocator, etc.) has a
     /// single entry point.
     pub const fn new() -> Self {
-        Self
+        Self {
+            udp_handle: None,
+            inbound: Mutex::new(VecDeque::new()),
+        }
     }
 }
 
@@ -605,14 +700,87 @@ impl DoomHost for KernelDoomHost {
         // would later set a severity level.
         crate::println!("doom: ERROR: {}", message);
     }
+
+    fn net_send_packet(&mut self, payload: &[u8], peer_idx: i32) -> i32 {
+        // Resolve the peer endpoint from the boot-time table. An
+        // out-of-range index drops the packet (return 0); the
+        // guest's NetGame layer handles this as a transient drop and
+        // retries on the next tic.
+        let Some(peer) = peer_at(peer_idx) else { return 0 };
+        // Lazy-bind the UDP socket on first send. `net::udp_bind`
+        // returns `Err(NotInitialised)` if `net::init` hasn't run
+        // yet — drop the packet silently in that case (the boot
+        // smoke runs `net::init` before the launcher constructs the
+        // Doom app, but a future arch arm that skips `net::init`
+        // would surface here as a perma-zero send count).
+        let handle = match self.ensure_socket() {
+            Some(h) => h,
+            None => return 0,
+        };
+        match net::udp_send_to(handle, peer, payload) {
+            Ok(()) => payload.len() as i32,
+            Err(_) => 0,
+        }
+    }
+
+    fn net_recv_packet(&mut self, buf: &mut [u8]) -> Option<(usize, i32)> {
+        // Drained packets land in `inbound`; the per-frame timer in
+        // `ui_apps::doom` does the smoltcp-side `udp_recv_from` pass
+        // and pushes there. Pop one and copy out.
+        let mut queue = self.inbound.lock();
+        let Some(packet) = queue.pop_front() else { return None };
+        let n = core::cmp::min(buf.len(), packet.payload.len());
+        buf[..n].copy_from_slice(&packet.payload[..n]);
+        Some((n, packet.peer_idx))
+    }
+
+    fn net_peer_count(&mut self) -> i32 {
+        peer_count() as i32
+    }
 }
 
-/// Register all 10 Doom host-shim imports against a `Linker<T>` where
+impl KernelDoomHost {
+    /// Push one already-translated inbound packet onto the host's
+    /// in-memory ring. Called by the per-frame timer in
+    /// `crate::ui_apps::doom` after draining via
+    /// `crate::net::udp_recv_from`. The guest pops via
+    /// `net_recv_packet` on its next tic.
+    pub fn push_inbound_packet(&self, payload: Vec<u8>, peer_idx: i32) {
+        let mut queue = self.inbound.lock();
+        // Bound the queue at INBOUND_RING_CAP; drop the oldest under
+        // back-pressure so a stuck guest can't OOM the host.
+        if queue.len() >= INBOUND_RING_CAP {
+            queue.pop_front();
+        }
+        queue.push_back(InboundPacket { payload, peer_idx });
+    }
+
+    /// Returns the UDP socket handle the host uses for Doom traffic,
+    /// binding lazily on first call. `None` if `net::init` hasn't
+    /// run yet (the boot smoke wires `net::init` before the launcher
+    /// constructs `DoomApp` — see `entry_uefi.rs`'s init order — but
+    /// a stripped-down arch arm could surface here as a `None` and
+    /// the host shim degrades to perma-zero sends).
+    pub fn ensure_socket(&mut self) -> Option<UdpSocketHandle> {
+        if self.udp_handle.is_none() {
+            self.udp_handle = net::udp_bind(DOOM_NET_PORT).ok();
+        }
+        self.udp_handle
+    }
+}
+
+/// Register all 13 Doom host-shim imports against a `Linker<T>` where
 /// `T` is the store-data type implementing [`DoomHost`]. Each import
 /// is looked up under its WASM module namespace
-/// (`loading` / `runtimeControl` / `ui` / `gameSaving` / `console`)
-/// and name, wrapped via `Linker::func_wrap` so wasmi's `IntoFunc`
-/// machinery handles the parameter / return marshaling.
+/// (`loading` / `runtimeControl` / `ui` / `gameSaving` / `console` /
+/// `networking`) and name, wrapped via `Linker::func_wrap` so wasmi's
+/// `IntoFunc` machinery handles the parameter / return marshaling.
+///
+/// The `networking.*` trio (#385) is forward-looking — jacobenget/
+/// doom.wasm v0.1.0 (today's bake) doesn't import them. wasmi
+/// silently ignores `Linker` defs the module never asks for, so
+/// these registrations are no-ops on the current binary; a future
+/// drop-in WASM with multiplayer wiring resolves them automatically.
 ///
 /// The function-type signatures here are reconciled against the
 /// authoritative jacobenget/doom.wasm v0.1.0 (commit dc94345)
@@ -944,6 +1112,184 @@ pub fn bind_doom_imports<T: DoomHost + 'static>(linker: &mut Linker<T>) {
             },
         )
         .expect("doom: duplicate import console.onErrorMessage");
+
+    // networking.* (#385)
+    //
+    // The three multiplayer imports. jacobenget/doom.wasm v0.1.0
+    // does NOT actually import these — registering them is a no-op
+    // for today's bake (wasmi's `Linker::instantiate` ignores defs
+    // the module doesn't import). They're kept registered so a
+    // future drop-in WASM with multiplayer support resolves cleanly
+    // without touching `bind_doom_imports`.
+    //
+    // The conjectured ABI mirrors doomgeneric's NetGame entry
+    // points (see the trait method docs above). All pointer / count
+    // arguments are i32 (`wasm32` pointer width); `peer_idx` is i32
+    // signed because the guest treats the index as `int` in C.
+    //
+    // `net_send_packet(buf_ptr, buf_len, peer_idx) -> i32` —
+    // returns bytes sent.
+    linker
+        .func_wrap(
+            "networking",
+            "net_send_packet",
+            |mut caller: wasmi::Caller<'_, T>,
+             buf_ptr: i32,
+             buf_len: i32,
+             peer_idx: i32|
+             -> i32 {
+                let Ok(len) = usize::try_from(buf_len) else { return 0 };
+                let memory = match caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                {
+                    Some(m) => m,
+                    None => return 0,
+                };
+                let mut payload = vec![0u8; len];
+                if memory
+                    .read(&caller, buf_ptr as usize, &mut payload)
+                    .is_err()
+                {
+                    return 0;
+                }
+                caller.data_mut().net_send_packet(&payload, peer_idx)
+            },
+        )
+        .expect("doom: duplicate import networking.net_send_packet");
+
+    // `net_recv_packet(buf_ptr, buf_max, out_peer) -> i32` —
+    // returns bytes copied (0 if no pending packet). Trampoline
+    // owns guest-memory translation: builds a host-side scratch
+    // buffer sized to `buf_max`, hands the slice to the trait
+    // method to fill, then copies the written bytes plus the peer
+    // index back into guest memory at `buf_ptr` / `out_peer`.
+    linker
+        .func_wrap(
+            "networking",
+            "net_recv_packet",
+            |mut caller: wasmi::Caller<'_, T>,
+             buf_ptr: i32,
+             buf_max: i32,
+             out_peer: i32|
+             -> i32 {
+                let Ok(max) = usize::try_from(buf_max) else { return 0 };
+                let mut scratch = vec![0u8; max];
+                let result = caller.data_mut().net_recv_packet(&mut scratch);
+                let Some((n, peer_idx)) = result else { return 0 };
+                let memory = match caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                {
+                    Some(m) => m,
+                    None => return 0,
+                };
+                if memory
+                    .write(&mut caller, buf_ptr as usize, &scratch[..n])
+                    .is_err()
+                {
+                    return 0;
+                }
+                if memory
+                    .write(&mut caller, out_peer as usize, &peer_idx.to_le_bytes())
+                    .is_err()
+                {
+                    return 0;
+                }
+                n as i32
+            },
+        )
+        .expect("doom: duplicate import networking.net_recv_packet");
+
+    // `net_peer_count() -> i32` — number of configured peers.
+    linker
+        .func_wrap(
+            "networking",
+            "net_peer_count",
+            |mut caller: wasmi::Caller<'_, T>| -> i32 {
+                caller.data_mut().net_peer_count()
+            },
+        )
+        .expect("doom: duplicate import networking.net_peer_count");
+}
+
+// ── Multiplayer peer table (#385) ──────────────────────────────────
+//
+// Doom's classic NetGame layer expects a small set of statically-
+// configured peer endpoints — one entry per remote player, indexed
+// 0..N. The host writes the table once at boot (via [`set_doom_peers`]
+// from the launcher / kernel cmd-line parse, currently TBD) and the
+// guest's `net_peer_count` / `net_send_packet` calls read through it.
+//
+// For the smoke test today the table is empty (peer count 0), which
+// makes `net_peer_count() -> 0` and the guest's NetGame layer falls
+// through to single-player mode. A real two-QEMU bridge test would
+// hard-code the table at boot:
+//
+//   crate::doom::set_doom_peers(alloc::vec![
+//       smoltcp::wire::IpEndpoint::new(
+//           smoltcp::wire::IpAddress::v4(10, 0, 2, 16), 5029),
+//       smoltcp::wire::IpEndpoint::new(
+//           smoltcp::wire::IpAddress::v4(10, 0, 2, 17), 5029),
+//   ]);
+//
+// (10.0.2.x being QEMU's user-mode default subnet; 5029 is Doom's
+// classic NetGame port.) A future cmd-line / config-UI surface would
+// populate this from a `PEERS=...` boot arg; out of scope for this
+// commit.
+
+/// UDP port Doom multiplayer binds — the classic NetGame port.
+const DOOM_NET_PORT: u16 = 5029;
+
+/// Inbound packet ring cap. Bounded so a stuck guest (one that
+/// stops calling `net_recv_packet`) can't OOM the host. 256 packets
+/// at the worst-case 1500 B/payload caps the ring at ~384 KiB —
+/// well clear of the kernel heap budget.
+const INBOUND_RING_CAP: usize = 256;
+
+/// Boot-time peer table. Populated by [`set_doom_peers`]; defaults
+/// to empty (single-player). Indexed by `peer_idx` per the NetGame
+/// ABI in the trait method docs above.
+static PEERS: Mutex<Vec<IpEndpoint>> = Mutex::new(Vec::new());
+
+/// Replace the boot-time peer table. Intended call site: the
+/// launcher / kernel cmd-line parser, before `bind_doom_imports`
+/// runs. Calling this after the guest has started is racy with the
+/// guest's `net_peer_count` reads — fine for the boot-once /
+/// reconfigure-never path that's all we need today.
+pub fn set_doom_peers(peers: Vec<IpEndpoint>) {
+    *PEERS.lock() = peers;
+}
+
+/// Resolve a peer index to its endpoint, or `None` if out of range.
+fn peer_at(idx: i32) -> Option<IpEndpoint> {
+    if idx < 0 {
+        return None;
+    }
+    let i = idx as usize;
+    let table = PEERS.lock();
+    table.get(i).copied()
+}
+
+/// Count of configured peers — drives the guest's
+/// `net_peer_count() -> i32` import.
+fn peer_count() -> usize {
+    PEERS.lock().len()
+}
+
+/// Reverse lookup — find the peer index for an `IpEndpoint` that
+/// matches an entry in the boot-time `PEERS` table. Returns `-1`
+/// for an unknown peer (the guest's NetGame layer treats this as
+/// a "drop" signal). Used by the per-frame UDP drain pass in
+/// `crate::ui_apps::doom` to label inbound packets with the peer
+/// index the guest expects.
+pub fn peer_index_of(endpoint: IpEndpoint) -> i32 {
+    let table = PEERS.lock();
+    table
+        .iter()
+        .position(|p| *p == endpoint)
+        .map(|i| i as i32)
+        .unwrap_or(-1)
 }
 
 // ── Save-slot persistence (#375) ────────────────────────────────────

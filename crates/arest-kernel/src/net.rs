@@ -24,12 +24,13 @@
 // one — the HTTP server can be smoke-tested against `127.0.0.1`
 // inside the kernel before any external packet flows exist.
 
+use alloc::vec;
 use alloc::vec::Vec;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Loopback, Medium};
-use smoltcp::socket::{dhcpv4, tcp};
+use smoltcp::socket::{dhcpv4, tcp, udp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Cidr};
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Cidr};
 use spin::Mutex;
 
 // `file_serve` / `file_upload` reach into `crate::block_storage`, which
@@ -563,4 +564,229 @@ pub fn dhcp_lease() -> Option<DhcpLease> {
 /// `net:` only prints when `init` has run.
 pub fn is_online() -> bool {
     NET.lock().is_some()
+}
+
+// ── UDP socket helpers (#385 — Doom multiplayer scaffold) ──────────
+//
+// Doom's classic NetGame protocol uses UDP on port 5029 for inter-
+// peer chatter (one packet per tic, ~70 B/payload, 35 Hz target).
+// jacobenget/doom.wasm v0.1.0 (the artifact baked under
+// `doom_assets/doom.wasm`) does NOT actually expose `net_send_packet`
+// / `net_recv_packet` / `net_peer_count` imports — its 10-import
+// surface is exclusively single-player (verified by parsing the
+// binary's import section and against the imports table in
+// `doom_assets/README.md`). The UDP plumbing here is therefore
+// forward-looking: it exposes the kernel-side sockets so a future
+// drop-in WASM (rebuilt from doomgeneric with `D_USE_NETWORKING=1`)
+// can route through smoltcp without re-touching `net.rs`. The Doom
+// host shim in `crate::doom` registers the matching `net_*` host
+// imports unconditionally — wasmi's `Linker` ignores defs the module
+// doesn't import, so the surface is harmless on today's binary.
+//
+// Why mirror TCP rather than thread a separate stack: smoltcp's
+// `SocketSet` is socket-kind-polymorphic, so a UDP socket lives in
+// the same set as the existing TCP listener and DHCP client.
+// `iface.poll(...)` already advances every socket in the set on each
+// `net::poll()` tick — UDP gets driven for free.
+//
+// Buffer sizing rationale: 16 packets × 1500 bytes per ring (rx +
+// tx) per socket. 1500 is the standard Ethernet MTU; Doom's typical
+// per-tic packet is well under that (~70 B) so 16 packets covers
+// roughly half a second of buffered backlog at the 35 Hz tic rate
+// without dropping. Total per-socket footprint:
+//   metadata: 16 * size_of::<udp::PacketMetadata>() ≈ 256 B
+//   payload:  16 * 1500                              = 24_000 B
+// times two (rx + tx) ≈ 48 KiB. Trivial against the 8 MiB DMA pool
+// (#443) and the kernel heap.
+
+/// Errors surfaced by the UDP helpers below. Maps smoltcp's per-call
+/// errors onto a single shared shape so the call site doesn't have to
+/// match against the three different error types
+/// (`udp::BindError` / `udp::SendError` / `udp::RecvError`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpError {
+    /// `net::init` has not been called yet.
+    NotInitialised,
+    /// smoltcp refused the bind (port == 0, or the socket was
+    /// already open).
+    BindRefused,
+    /// The transmit ring is full. Caller should retry on a later
+    /// `net::poll()` tick.
+    SendBufferFull,
+    /// Destination address (or local port) is unspecified.
+    Unaddressable,
+    /// The receive buffer was too small for the next pending packet
+    /// — smoltcp dropped it. Caller should resize.
+    RecvBufferTooSmall,
+}
+
+/// Opaque handle returned by [`udp_bind`]. Wraps smoltcp's
+/// `SocketHandle` (which is itself a `usize` index into the
+/// `SocketSet`) so callers don't have to import smoltcp to thread
+/// the handle through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpSocketHandle(SocketHandle);
+
+/// Bind a UDP socket to `port` on every local address. Returns a
+/// handle the caller threads through `udp_send_to` / `udp_recv_from`.
+///
+/// Mirrors the shape of [`register_http`] — allocates the rx + tx
+/// rings on the heap (so they're `'static`-lifetime, which is what
+/// `SocketSet<'static>` requires), constructs the smoltcp socket,
+/// and adds it to the global socket set.
+///
+/// 16 packets × 1500 bytes per ring per direction (see module-level
+/// rationale above). Both rings live for the lifetime of the
+/// socket — there is no `udp_close` helper today because the only
+/// caller (the Doom host shim) keeps its socket open for the full
+/// boot lifetime; if a future caller needs short-lived sockets, add
+/// `udp_close(handle)` that drops the socket from the set.
+pub fn udp_bind(port: u16) -> Result<UdpSocketHandle, UdpError> {
+    const PACKET_COUNT: usize = 16;
+    const PACKET_BYTES: usize = 1500;
+
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(UdpError::NotInitialised)?;
+
+    // smoltcp's UDP buffers are heterogeneous: a metadata ring
+    // (one entry per pending packet, holding length + source
+    // endpoint) plus a payload ring (the packed packet bytes).
+    // `Vec<udp::PacketMetadata>` and `Vec<u8>` both coerce into
+    // `ManagedSlice<'_, _>` via `Into`, satisfying the
+    // `udp::PacketBuffer::new` bound. Vec ownership keeps the
+    // buffers `'static`-lifetime, matching the static `SocketSet`.
+    let rx_meta = vec![udp::PacketMetadata::EMPTY; PACKET_COUNT];
+    let rx_payload = vec![0u8; PACKET_COUNT * PACKET_BYTES];
+    let tx_meta = vec![udp::PacketMetadata::EMPTY; PACKET_COUNT];
+    let tx_payload = vec![0u8; PACKET_COUNT * PACKET_BYTES];
+
+    let rx_buffer = udp::PacketBuffer::new(rx_meta, rx_payload);
+    let tx_buffer = udp::PacketBuffer::new(tx_meta, tx_payload);
+    let mut socket = udp::Socket::new(rx_buffer, tx_buffer);
+    socket.bind(port).map_err(|_| UdpError::BindRefused)?;
+
+    let handle = state.sockets.add(socket);
+    Ok(UdpSocketHandle(handle))
+}
+
+/// Enqueue one UDP packet for transmission to `peer`. Non-blocking:
+/// the bytes land in the smoltcp tx ring and the next `net::poll()`
+/// tick frames them into Ethernet packets and hands them to the
+/// `KernelDevice` for transmission.
+///
+/// Returns `Err(SendBufferFull)` when the tx ring is saturated —
+/// caller can retry on a later `poll()`. `send_slice` does NOT
+/// block (the underlying `tx_buffer.enqueue` either takes a slot
+/// from the ring or returns `Full` immediately), so there's no
+/// concern about the call site stalling the kernel super-loop.
+pub fn udp_send_to(
+    handle: UdpSocketHandle,
+    peer: IpEndpoint,
+    payload: &[u8],
+) -> Result<(), UdpError> {
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(UdpError::NotInitialised)?;
+    let socket = state.sockets.get_mut::<udp::Socket>(handle.0);
+    socket.send_slice(payload, peer).map_err(|e| match e {
+        udp::SendError::BufferFull => UdpError::SendBufferFull,
+        udp::SendError::Unaddressable => UdpError::Unaddressable,
+    })
+}
+
+/// Non-blocking dequeue of the next pending UDP packet. Returns
+/// `Ok(Some((n, peer)))` with the packet length and source endpoint
+/// when one is pending, `Ok(None)` when the receive ring is empty.
+///
+/// `recv_slice` returns `Truncated` if `buf` is smaller than the
+/// pending packet — we surface that as `RecvBufferTooSmall` so the
+/// caller can resize. The packet is dropped on truncation (smoltcp
+/// behaviour); the caller should size `buf` to the maximum expected
+/// payload (1500 bytes for Ethernet MTU) to avoid silent loss.
+pub fn udp_recv_from(
+    handle: UdpSocketHandle,
+    buf: &mut [u8],
+) -> Result<Option<(usize, IpEndpoint)>, UdpError> {
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(UdpError::NotInitialised)?;
+    let socket = state.sockets.get_mut::<udp::Socket>(handle.0);
+    match socket.recv_slice(buf) {
+        Ok((n, meta)) => Ok(Some((n, meta.endpoint))),
+        Err(udp::RecvError::Exhausted) => Ok(None),
+        Err(udp::RecvError::Truncated) => Err(UdpError::RecvBufferTooSmall),
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────
+//
+// `arest-kernel`'s bin target has `test = false` (Cargo.toml L47),
+// so these `#[cfg(test)]` cases are reachable only when the crate is
+// re-shaped into a lib for hosted testing — same convention the
+// other no_std modules (`doom.rs`, `system.rs`, etc.) use. They
+// document the intended UDP contract and exercise smoltcp's
+// loopback path end-to-end so a future test harness can assert the
+// round-trip works without an external NIC.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bind a UDP socket on the loopback interface and round-trip a
+    /// packet through it. Verifies the four-call contract:
+    ///   1. `init(None)` brings up loopback at 127.0.0.1/8.
+    ///   2. `udp_bind(5029)` returns a handle.
+    ///   3. `udp_send_to(handle, 127.0.0.1:5029, b"hello")` enqueues.
+    ///   4. After one `poll()`, `udp_recv_from(handle, &mut buf)`
+    ///      returns the same bytes from the loopback endpoint.
+    ///
+    /// Skipped on the bin target (`test = false`) — included as
+    /// executable documentation of the intended behaviour for a
+    /// future hosted-test harness.
+    #[test]
+    fn udp_loopback_roundtrip() {
+        init(None);
+        let handle = udp_bind(5029).expect("udp_bind on loopback");
+
+        // Send. The 127.0.0.1 endpoint matches the address we
+        // assigned to loopback in `init` so smoltcp's routing
+        // accepts the packet for delivery back to ourselves.
+        let peer = IpEndpoint::new(IpAddress::v4(127, 0, 0, 1), 5029);
+        udp_send_to(handle, peer, b"hello").expect("udp_send_to");
+
+        // Drive the stack — smoltcp's loopback device frames the
+        // tx-ring entry and immediately delivers it to the rx ring
+        // via the same `Device` instance. A single `poll()` is
+        // enough; both the send-side framing and the receive-side
+        // dispatch happen inside one `iface.poll` invocation.
+        for _ in 0..4 {
+            poll();
+        }
+
+        // Receive. `udp_recv_from` should return the exact bytes
+        // from the originating endpoint.
+        let mut buf = [0u8; 32];
+        let result = udp_recv_from(handle, &mut buf).expect("udp_recv_from");
+        let (n, src) = result.expect("packet present");
+        assert_eq!(&buf[..n], b"hello");
+        assert_eq!(src.port, 5029);
+    }
+
+    /// `udp_recv_from` returns `Ok(None)` when the rx ring is empty.
+    /// Documents the non-blocking contract — callers can poll-and-
+    /// drain in a loop without worrying about stalls.
+    #[test]
+    fn udp_recv_returns_none_when_empty() {
+        init(None);
+        let handle = udp_bind(5030).expect("udp_bind");
+        let mut buf = [0u8; 32];
+        let result = udp_recv_from(handle, &mut buf).expect("udp_recv_from");
+        assert!(result.is_none());
+    }
+
+    /// Out-of-range bind (port == 0) returns `BindRefused`.
+    #[test]
+    fn udp_bind_zero_port_refused() {
+        init(None);
+        let err = udp_bind(0).expect_err("port 0 must refuse");
+        assert_eq!(err, UdpError::BindRefused);
+    }
 }
