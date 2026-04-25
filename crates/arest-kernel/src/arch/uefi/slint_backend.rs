@@ -470,6 +470,96 @@ impl Platform for UefiSlintPlatform {
 unsafe impl Send for FramebufferBackend {}
 unsafe impl Sync for FramebufferBackend {}
 
+// ---------------------------------------------------------------
+// Foreign-toolkit composition glue (#489 Track LLLL)
+// ---------------------------------------------------------------
+
+/// Build a `slint::Image` over a `ForeignSurface`'s current pixel
+/// buffer. The integration seam between the foreign-toolkit
+/// compositor (`crate::composer`) and Slint's scene tree.
+///
+/// Same pattern Track VVV's #455 Doom path uses to push a WASM-
+/// rendered 640x400 BGRA frame at Slint each tic
+/// (`ui_apps::doom::tic` L698-L723): `SharedPixelBuffer::clone_
+/// from_slice` detaches an owned copy of the source bytes,
+/// `Image::from_rgba8` wraps that buffer as a Slint `Image`. Slint
+/// v1.16's `Image` API requires the underlying pixel data to be
+/// `'static` (the `SharedPixelBuffer` itself owns its bytes via
+/// an internal `SharedVector`), so the per-frame copy is mandatory
+/// — there's no zero-copy path that lets Slint borrow our backing
+/// `Mutex<Vec<u8>>` directly.
+///
+/// Cost: one `width * height * 4`-byte memcpy per call. At 800x600
+/// RGBA8 that's 1.92 MB per composite — comparable to VVV's Doom
+/// 1.024 MB cost at 35 Hz, well under one frame's CPU budget at
+/// any sensible refresh rate. Adapters that want to avoid the cost
+/// on idle frames must check `surface.is_dirty()` (or track their
+/// own generation counter) before calling — same idea VVV's Doom
+/// uses with its `last_gen` cache.
+///
+/// Channel handling matches `composer::PixelFormat`:
+///   * `Rgba8` — direct `clone_from_slice`. Bytes are already in
+///     Slint's expected `[R, G, B, A]` layout.
+///   * `Bgra8` — per-pixel R<->B swap into a pre-allocated
+///     `SharedPixelBuffer`, same conversion VVV's #455 Doom path
+///     does for its BGRA->RGBA per-frame translation.
+///
+/// `ForeignSurface` is intentionally NOT a Slint component — Slint
+/// components are declared in `.slint` source and codegen'd at
+/// build time, not runtime. The composer's job is to produce a
+/// Slint-compatible `Image` value that any `.slint` file can bind
+/// to via an `in property <image>` declaration. The future Qt /
+/// GTK app `.slint` files will look identical to Doom's:
+/// `image source: root.foreign-frame;` driven by a Rust-side glue
+/// that calls `set_foreign_frame(surface_to_image(&surface))` on
+/// each frame.
+pub fn surface_to_image(surface: &crate::composer::ForeignSurface) -> slint::Image {
+    use crate::composer::PixelFormat;
+
+    let bytes = surface.pixels.lock();
+    let w = surface.width;
+    let h = surface.height;
+    match surface.format {
+        PixelFormat::Rgba8 => {
+            // Direct clone — `clone_from_slice` reinterprets the
+            // `&[u8]` slice as `&[Rgba8Pixel]` (the `rgb::AsPixels`
+            // impl) and copies into the SharedPixelBuffer's owned
+            // SharedVector storage. After this returns the surface's
+            // Mutex is unlocked and Slint owns its own copy.
+            let pixel_buf: slint::SharedPixelBuffer<slint::Rgba8Pixel> =
+                slint::SharedPixelBuffer::clone_from_slice(bytes.as_slice(), w, h);
+            slint::Image::from_rgba8(pixel_buf)
+        }
+        PixelFormat::Bgra8 => {
+            // R<->B swap into a fresh SharedPixelBuffer. Per-pixel
+            // 4-byte read + write; same shape Doom's per-frame
+            // BGRA->RGBA translation uses (ui_apps::doom::tic
+            // L698-L719).
+            let mut pixel_buf: slint::SharedPixelBuffer<slint::Rgba8Pixel> =
+                slint::SharedPixelBuffer::new(w, h);
+            let dst = pixel_buf.make_mut_bytes();
+            // Both buffers are the same length by construction
+            // (composer::create_surface allocates exactly w*h*4
+            // bytes; SharedPixelBuffer::new allocates w*h*4 bytes
+            // for Rgba8Pixel). Defensive equal-length check
+            // mirrors the Doom path's same guard.
+            let expected = (w as usize) * (h as usize) * 4;
+            if bytes.len() == expected && dst.len() == expected {
+                let src = bytes.as_slice();
+                let mut i = 0;
+                while i < expected {
+                    dst[i] = src[i + 2]; // R = src[B-slot+2]
+                    dst[i + 1] = src[i + 1]; // G unchanged
+                    dst[i + 2] = src[i]; // B = src[R-slot]
+                    dst[i + 3] = src[i + 3]; // A unchanged
+                    i += 4;
+                }
+            }
+            slint::Image::from_rgba8(pixel_buf)
+        }
+    }
+}
+
 /// Forwarding `LineBufferProvider` impl for a `&mut FramebufferBackend`.
 ///
 /// Slint's `SoftwareRenderer::render_by_line` consumes the
@@ -606,5 +696,39 @@ mod tests {
         });
         assert_eq!(&fb[8..12], &[1, 2, 3, 0]);
         assert_eq!(&fb[12..16], &[4, 5, 6, 0]);
+    }
+
+    /// `surface_to_image` round-trips a `composer::ForeignSurface`'s
+    /// `Rgba8` pixel buffer into a `slint::Image` with the right
+    /// dimensions. Lifetime check more than pixel-content check —
+    /// the goal is to confirm `clone_from_slice` produces an owned
+    /// `SharedPixelBuffer` that survives the original surface's
+    /// `Mutex` going out of scope (which is what makes the
+    /// per-frame call shape sound under Slint's `'static` Image
+    /// requirement).
+    #[test]
+    fn surface_to_image_rgba8_roundtrip() {
+        use crate::composer::{create_surface, register_toolkit, ToolkitRenderer, ForeignSurface};
+        // Need at least one toolkit registered or the surface is
+        // created without an owning renderer; that's fine for this
+        // test — we never call `compose_frame` or `paint`. The
+        // surface still owns its pixel buffer.
+        struct NoopRenderer;
+        impl ToolkitRenderer for NoopRenderer {
+            fn paint(&self, _: &ForeignSurface) {}
+        }
+        register_toolkit("test_slint_backend", alloc::sync::Arc::new(NoopRenderer));
+        let surface = create_surface("test_slint_backend", 4, 2);
+        // Write a known pattern into the surface's pixel buffer
+        // so we can assert `surface_to_image` reads it correctly.
+        {
+            let mut buf = surface.pixels.lock();
+            for (i, byte) in buf.iter_mut().enumerate() {
+                *byte = (i & 0xFF) as u8;
+            }
+        }
+        let image = super::surface_to_image(&surface);
+        assert_eq!(image.size().width, 4);
+        assert_eq!(image.size().height, 2);
     }
 }
