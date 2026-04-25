@@ -33,6 +33,7 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Cid
 use spin::Mutex;
 
 use crate::file_serve::{self, ServeOutcome};
+use crate::file_upload::{self, ServeOutcome as UploadOutcome};
 use crate::http;
 use crate::virtio::VirtioPhy;
 
@@ -392,7 +393,7 @@ fn drive_http(listener: &mut HttpListener, sockets: &mut SocketSet<'static>) {
 
     // (4) Try to parse; on success dispatch handler and queue response.
     //
-    // Two dispatch arms:
+    // Three dispatch arms, checked in order:
     //   a. `/file/{id}/content` (#403) — handled by `file_serve::try_serve`,
     //      which produces fully-serialised HTTP/1.1 wire bytes (200/206/
     //      404/405/416/500). Bypasses the `Handler` chain because the
@@ -400,7 +401,14 @@ fn drive_http(listener: &mut HttpListener, sockets: &mut SocketSet<'static>) {
     //      File's `mime_type`) and may need `Content-Range` headers, both
     //      of which the static-`Content-Type` `http::Response` can't
     //      express.
-    //   b. Anything else — falls through to the registered `Handler` fn,
+    //   b. `POST /file` (#444) — handled by `file_upload::try_serve`,
+    //      the write-side sibling of (a). Re-scans the raw rx_buf for
+    //      the `Content-Type` header (multipart boundary lives there);
+    //      the canonical `http::parse_request` doesn't capture it.
+    //      Same wire-bytes-bypass story as (a) since 201 Created carries
+    //      a dynamic `Location` header that the static `Response`
+    //      builder can't emit.
+    //   c. Anything else — falls through to the registered `Handler` fn,
     //      which serialises via `Response::to_wire()`.
     let parsed = match http::parse_request(&listener.rx_buf) {
         Ok(Some(req)) => Ok(req),
@@ -418,7 +426,19 @@ fn drive_http(listener: &mut HttpListener, sockets: &mut SocketSet<'static>) {
             ) {
                 ServeOutcome::Response(bytes) => bytes,
                 ServeOutcome::NotApplicable => {
-                    (listener.handler)(&req).to_wire()
+                    let ct = file_upload::extract_content_type_header(&listener.rx_buf);
+                    match file_upload::try_serve(
+                        &req.method,
+                        &req.path,
+                        ct.as_deref(),
+                        &req.body,
+                        crate::system::state(),
+                    ) {
+                        UploadOutcome::Response(bytes) => bytes,
+                        UploadOutcome::NotApplicable => {
+                            (listener.handler)(&req).to_wire()
+                        }
+                    }
                 }
             }
         }

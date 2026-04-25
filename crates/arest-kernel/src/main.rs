@@ -176,6 +176,16 @@ mod block_storage;
 // `block_storage::reserve_region` for region-backed blobs.
 #[cfg(target_arch = "x86_64")]
 mod file_serve;
+// `file_upload` (#444): HTTP `POST /file` route. Sibling write side
+// of `file_serve` — accepts a single-part `multipart/form-data` upload
+// with a `directory_id` form field, sniffs MIME on the bytes, and
+// builds the File noun's five facts (Name / MimeType / ContentRef /
+// Size / is_in_Directory). Bodies > 64 KiB return 413 pointing at
+// the chunked-PUT route (#445, future track). Same x86_64-only gating
+// as `file_serve` for symmetry — the cell-write pipeline mirrors the
+// reader's lookup pipeline.
+#[cfg(target_arch = "x86_64")]
+mod file_upload;
 #[cfg(target_arch = "x86_64")]
 mod net;
 #[cfg(not(target_os = "uefi"))]
