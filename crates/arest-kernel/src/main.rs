@@ -121,6 +121,15 @@ mod arch;
 // and lands alongside the kernel_run handoff.
 mod assets;
 mod dma;
+// `fonts` / `icons` (#433 + #434) — vendored design-system bytes. Each
+// is a leaf module that exposes `pub static &'static [u8]` slices via
+// `include_bytes!` against `assets/fonts/` and `assets/icons/lucide/`,
+// plus an `icons::by_name` lookup keyed on `readings/ui/design.md`'s
+// IconToken naming. Arch-neutral (no syscalls, no port I/O), so they
+// sit alongside the other arch-neutral modules with no cfg gate. Slint
+// kernel UI wire-up lands at #436.
+pub mod fonts;
+pub mod icons;
 mod framebuffer;
 mod http;
 // `pci` / `repl` reach `x86_64::instructions::port::Port` +
@@ -194,6 +203,13 @@ mod syscall;
 mod userspace;
 #[cfg(target_arch = "x86_64")]
 mod virtio;
+// virtio-gpu wrapper (#371). Sibling of `virtio` (net + blk) — wraps
+// `virtio_drivers::device::gpu::VirtIOGpu` with the same `KernelHal` +
+// `PioCam` PCI transport infrastructure. Same x86_64-only gating as
+// `virtio` and `pci` because the PCI walker / port I/O backing aren't
+// available on aarch64 / armv7 yet.
+#[cfg(target_arch = "x86_64")]
+mod virtio_gpu;
 // virtio-mmio transport for aarch64 + armv7 UEFI (#368/#369 aarch64,
 // #388 armv7 widening). Sibling of the x86_64 `virtio` module (which
 // is PCI-based). QEMU's `virt` machine — both the aarch64 and the
