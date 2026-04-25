@@ -1012,7 +1012,7 @@ fn release_impl(handle: u32) {
 fn is_read_only_op(key: &str) -> bool {
     matches!(
         key,
-        "debug" | "audit" | "verify_signature" | "snapshots"
+        "debug" | "audit" | "verify_signature" | "snapshots" | "select_component"
     )
     || key.starts_with("list:")
     || key.starts_with("get:")
@@ -1393,6 +1393,21 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     if key == "external_browse" {
         let snapshot = tenant.read().snapshot_d();
         return external::external_browse_json(input, &snapshot);
+    }
+
+    // ── #493 select_component intercept ─────────────────────────────
+    //
+    //   system(h, "select_component", <JSON body>) → <JSON list> | "⊥"
+    //
+    // Body shape: `{"intent": "...", "constraints": {...}}`. Routes to
+    // command::select_component_json which scores the seeded Component
+    // population (HHHH's #492 rules) and returns ranked
+    // SelectedComponent records. Read-only: same intercept pattern as
+    // external_browse — JSON in, JSON out, no FFP parse and no state
+    // mutation.
+    if key == "select_component" {
+        let snapshot = tenant.read().snapshot_d();
+        return command::select_component_json(&snapshot, input);
     }
 
     // ── Read-only dispatch path ─────────────────────────────────────
