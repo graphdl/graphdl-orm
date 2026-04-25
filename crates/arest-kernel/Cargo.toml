@@ -207,17 +207,31 @@ slint = { version = "1.16", default-features = false, features = [
     "renderer-software",
 ] }
 
-# Slint compile-time helper (#426). The `slint!` macro and any
-# future `.slint` files have to be processed at build time —
-# `slint-build` is what `build.rs` calls into to do that and to
-# embed images / fonts via `EmbedResourcesKind::EmbedForSoftwareRenderer`.
-# Gated to the same UEFI x86_64 cfg as the runtime crate above so
-# the BIOS / aarch64 / armv7 builds don't pull it in (it's a host
-# build crate but cargo still resolves it for every target unless
-# we gate it). No `.slint` files exist yet — those land in #436 —
-# but the build dep needs to be in the graph so the runtime crate
-# resolves cleanly.
-[target.'cfg(all(target_os = "uefi", target_arch = "x86_64"))'.build-dependencies]
+# Slint compile-time helper (#426 / #436 / #452). The `.slint` files
+# under `ui/` are compiled by `build.rs` (Track QQQ #452) via
+# `slint_build::compile_with_config(...)` with
+# `EmbedResourcesKind::EmbedForSoftwareRenderer`. That mode pre-
+# rasterises glyph atlases into `BitmapFont` statics that the slint
+# compiler's emitted codegen wires into each component's init via
+# `Renderer::register_bitmap_font(&BITMAP_FONT_DATA)` — the only
+# no_std-friendly font path in slint v1.16 (`register_font_from_memory`
+# is std-only, gated by the `systemfonts` feature we deliberately do
+# not enable on the MCU recipe above).
+#
+# Unconditional `[build-dependencies]`, NOT `[target.cfg(...).build-
+# dependencies]`. Cargo evaluates build-dep cfg expressions against
+# the *host* triple (Windows / Linux), not the target — so the prior
+# `[target.'cfg(all(target_os = "uefi", target_arch = "x86_64"))'.build-
+# dependencies]` gate (Track MMM #436's followup note, commit
+# `0b32b17`) silently kept slint-build out of the build script's dep
+# graph, which forced the inline `slint::slint!{}` proc-macro
+# workaround and blocked compile-time font baking. slint-build is a
+# host-side compiler crate; it does not link into the `.efi` image, so
+# the unconditional gate has no impact on BIOS / aarch64 / armv7
+# builds beyond pulling the slint compiler into their host build
+# graph (which is already resolved unconditionally for the runtime
+# `slint` crate's transitive deps anyway).
+[build-dependencies]
 slint-build = "1.16"
 
 # aarch64-unknown-uefi specific deps (#344 cross-arch scaffold). The
