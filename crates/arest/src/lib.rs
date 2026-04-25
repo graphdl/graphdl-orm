@@ -699,6 +699,7 @@ pub const METAMODEL_READINGS: &[(&str, &str)] = &[
     ("organizations", include_str!("../../../readings/organizations.md")),
     ("agents",        include_str!("../../../readings/agents.md")),
     ("ui",            include_str!("../../../readings/ui.md")),
+    ("filesystem",    include_str!("../../../readings/filesystem.md")),
 ];
 
 /// The bundled metamodel concatenated into a single corpus, with
