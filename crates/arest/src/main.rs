@@ -41,6 +41,8 @@ mod ast;
 #[allow(dead_code)]
 mod types;
 #[allow(dead_code)]
+mod fol;
+#[allow(dead_code)]
 mod compile;
 #[allow(dead_code)]
 mod evaluate;
