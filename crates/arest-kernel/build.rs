@@ -196,16 +196,49 @@ fn main() {
     // rasterised data, not TrueType.
     let ui_dir = manifest_dir.join("ui");
     if ui_dir.is_dir() {
-        let app_shell = ui_dir.join("AppShell.slint");
-        if app_shell.is_file() {
+        // Compile entry: `ui/apps/HateoasBrowser.slint` (Track SSS #429).
+        //
+        // Why HateoasBrowser is the compile entry instead of AppShell:
+        // `slint::include_modules!()` is keyed off a single
+        // `SLINT_INCLUDE_GENERATED` env var that `slint_build::
+        // compile_with_config` rewrites on every call (see
+        // slint-build/lib.rs L535 in v1.16.1) — only the LAST
+        // compiled file is reachable through `include_modules!()`. To
+        // keep both `AppShell` (Track MMM #436's root) and
+        // `HateoasBrowser` (this commit) reachable from the single
+        // `slint::include_modules!()` site in
+        // `arch/uefi/slint_backend.rs`, the new file is the compile
+        // entry: it imports + re-exports AppShell so AppShell stays
+        // emitted into the same generated `.rs` (the slint compiler
+        // walks the full import graph and codegens every reachable
+        // exported component).
+        //
+        // If a future track adds a third app, it should follow the
+        // same pattern — add itself to a master entry .slint that
+        // re-exports the previous entries, and update the path here.
+        // (Or refactor to `compile_with_output_path` and synthesise
+        // a top-level shim in build.rs that `mod`s every generated
+        // file by name; see slint-build L551 for that API.)
+        let entry = ui_dir.join("apps").join("HateoasBrowser.slint");
+        let app_shell_fallback = ui_dir.join("AppShell.slint");
+        if entry.is_file() {
+            let config = slint_build::CompilerConfiguration::new()
+                .embed_resources(slint_build::EmbedResourcesKind::EmbedForSoftwareRenderer);
+            slint_build::compile_with_config("ui/apps/HateoasBrowser.slint", config)
+                .expect("slint_build::compile_with_config(ui/apps/HateoasBrowser.slint) failed");
+        } else if app_shell_fallback.is_file() {
+            // Fallback to the pre-#429 entry point so a hypothetical
+            // future revert (or a partial checkout that drops
+            // ui/apps/) still lands a usable AppShell into
+            // `slint::include_modules!()`.
             let config = slint_build::CompilerConfiguration::new()
                 .embed_resources(slint_build::EmbedResourcesKind::EmbedForSoftwareRenderer);
             slint_build::compile_with_config("ui/AppShell.slint", config)
                 .expect("slint_build::compile_with_config(ui/AppShell.slint) failed");
         } else {
             println!(
-                "cargo:warning=ui/AppShell.slint not found at {} — skipping slint-build invocation",
-                app_shell.display(),
+                "cargo:warning=neither ui/apps/HateoasBrowser.slint nor ui/AppShell.slint found under {} — skipping slint-build invocation",
+                ui_dir.display(),
             );
         }
     }

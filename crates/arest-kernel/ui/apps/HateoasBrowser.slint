@@ -1,0 +1,298 @@
+// crates/arest-kernel/ui/apps/HateoasBrowser.slint
+//
+// AREST kernel — first Slint app: HATEOAS resource browser (#429).
+//
+// "HATEOAS is the text interface" (per the user's earlier insight on
+// the read-side metamodel surface). This window is the Slint
+// equivalent of `curl /api/{noun}` for the live kernel SYSTEM state:
+//
+//   * Left column  — Resources sidebar listing every Noun the
+//     metamodel knows about (Directory, File, Tag, Color, …).
+//     Built by the Rust glue from `system::with_state` by walking
+//     cell names that look like `<Noun>_has_<Attribute>` and
+//     deduplicating on the leading <Noun> token.
+//
+//   * Centre column — instance list for the selected Noun. Each row
+//     is a clickable summary of one fact (or one instance, when the
+//     Rust glue has bucketed by binding).
+//
+//   * Right column — detail panel for the selected instance. Shows
+//     every binding (key/value pair) and every fact in which the
+//     instance appears as a value.
+//
+// Top bar: breadcrumbs + back button. The Rust glue keeps a
+// navigation stack (`Vec<Breadcrumb>` in the `BrowserState`) so each
+// click into a deeper resource pushes onto the breadcrumb trail and
+// the back callback pops.
+//
+// All design tokens come from `Theme` (Track YY's #432 design.md
+// → MMM's #436 Slint surface). Base components (`Button`, `Card`,
+// `List`/`ListItem`) come from MMM's `ui/components/`. AppShell is
+// pulled in as a transitive import + re-export so the existing
+// slint_backend.rs smoke test (which constructs `AppShell::new()`)
+// keeps compiling.
+//
+// Multi-entry note: `slint::include_modules!()` is keyed off a single
+// `SLINT_INCLUDE_GENERATED` env var written by the last
+// `slint_build::compile_with_config` call (see slint-build/lib.rs L535
+// in v1.16.1). To keep both `AppShell` and `HateoasBrowser` reachable
+// from one `include_modules!()` site, this file is the new compile
+// entry — it transitively imports AppShell.slint (which imports
+// theme + Button) plus the two extra components HateoasBrowser uses
+// directly (Card, List). The slint compiler walks the full import
+// graph and emits both `AppShell` and `HateoasBrowser` Rust structs
+// into one generated `HateoasBrowser.rs` file.
+
+import { AppShell, Theme, ThemeMode } from "../AppShell.slint";
+import { Button, ButtonVariant } from "../components/Button.slint";
+import { Card } from "../components/Card.slint";
+import { List, ListItem } from "../components/List.slint";
+
+// Re-export AppShell + Theme so the existing slint_backend.rs smoke
+// test (which constructs `AppShell::new()` after `slint::include_modules!()`)
+// keeps compiling without touching that file.
+export { AppShell, Theme, ThemeMode }
+
+// The HATEOAS browser window. The Rust glue (`ui_apps::hateoas`) sets
+// the four `*-model` properties from `system::with_state`, and the
+// callbacks are wired to the navigation-stack mutators on the Rust
+// side.
+export component HateoasBrowser inherits Window {
+    // ---- Inputs (driven by the Rust glue) ---------------------------
+
+    // Sidebar: every Noun the metamodel knows about (sorted).
+    in property <[string]> resources;
+    // Index of the selected Noun in `resources`. -1 = nothing picked
+    // (initial render, before any click).
+    in property <int> selected-resource-index: -1;
+
+    // Instance list for the selected Noun. Each entry is a one-line
+    // summary built by the Rust glue (typically `Name = "value"` or
+    // the first binding's value).
+    in property <[string]> instances;
+    in property <int> selected-instance-index: -1;
+
+    // Detail panel: each line is one binding (`role = value`) or one
+    // back-reference (`appears in <Cell> as <role>`). The Rust glue
+    // formats these as plain strings; the Slint side just renders.
+    in property <[string]> detail-lines;
+
+    // Breadcrumbs across the top. Each entry is one navigation step's
+    // display label (e.g. "Resources", "File", "file_42"). The Rust
+    // glue rebuilds this whenever the navigation stack changes.
+    in property <[string]> breadcrumbs;
+    // Window status text (current resource name, instance count, etc.).
+    in property <string> status-text: "Ready";
+
+    // ---- Callbacks (Rust glue mutates state, then re-pushes models) -
+
+    // Sidebar row clicked. Argument is the index into `resources`.
+    callback resource-selected(int);
+    // Instance row clicked in the centre column. Argument is the index
+    // into `instances`.
+    callback instance-selected(int);
+    // Back button on the breadcrumb bar.
+    callback back-clicked();
+    // Theme toggle, surfaced through AppShell. Forwarded so a host
+    // that owns the window can re-render in response if needed.
+    callback theme-toggled();
+
+    title: "AREST — HATEOAS Browser";
+    background: Theme.surface;
+    default-font-family: Theme.type-body.family;
+    default-font-size: Theme.type-body.size;
+    preferred-width: 1100px;
+    preferred-height: 760px;
+
+    VerticalLayout {
+        spacing: 0px;
+
+        // ----- Top bar: breadcrumbs + back + theme toggle -------------
+        // Mirrors AppShell's top bar styling so the two surfaces feel
+        // continuous; we don't *embed* AppShell here because AppShell's
+        // status footer + content slot would compete with this app's
+        // own three-pane layout. Sharing the tokens (neutral-100,
+        // border, type-h2, spacing-lg) keeps the visual continuity
+        // without an architectural dependency.
+        Rectangle {
+            background: Theme.neutral-100;
+            min-height: 56px;
+
+            HorizontalLayout {
+                padding-left: Theme.spacing-lg;
+                padding-right: Theme.spacing-lg;
+                padding-top: Theme.spacing-md;
+                padding-bottom: Theme.spacing-md;
+                spacing: Theme.spacing-md;
+                alignment: space-between;
+
+                // Breadcrumb chain on the left. Slint `for` over the
+                // model produces one Text per crumb; a separator " / "
+                // is rendered as a sibling Text after each (except the
+                // last — Slint doesn't have an `if last` guard inside
+                // `for`, so the trailing separator is harmless).
+                HorizontalLayout {
+                    spacing: Theme.spacing-sm;
+                    alignment: start;
+
+                    Button {
+                        text: "Back";
+                        variant: ButtonVariant.ghost;
+                        enabled: root.breadcrumbs.length > 1;
+                        clicked => { root.back-clicked(); }
+                    }
+
+                    for crumb[idx] in root.breadcrumbs : Text {
+                        text: idx == 0 ? crumb : " / " + crumb;
+                        color: idx == root.breadcrumbs.length - 1
+                            ? Theme.text-primary
+                            : Theme.text-muted;
+                        font-family: Theme.type-h3.family;
+                        font-weight: idx == root.breadcrumbs.length - 1
+                            ? Theme.type-h3.weight
+                            : 400;
+                        font-size: Theme.type-h3.size;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Button {
+                    text: Theme.mode == ThemeMode.dark ? "Light" : "Dark";
+                    variant: ButtonVariant.ghost;
+                    clicked => {
+                        Theme.toggle-mode();
+                        root.theme-toggled();
+                    }
+                }
+            }
+
+            // 1px bottom border.
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: Theme.border;
+            }
+        }
+
+        // ----- Three-pane body: Resources / Instances / Detail -------
+        Rectangle {
+            background: Theme.surface;
+            vertical-stretch: 1;
+
+            HorizontalLayout {
+                padding: Theme.spacing-lg;
+                spacing: Theme.spacing-lg;
+
+                // ---- Pane 1: Resources sidebar ---------------------
+                Rectangle {
+                    width: 240px;
+                    Card {
+                        title: "Resources";
+                        // Empty-state hint when the metamodel has no
+                        // user-discoverable cells yet (fresh boot
+                        // before any def has run, or a phi state).
+                        if root.resources.length == 0 : Text {
+                            text: "(no resources discovered)";
+                            color: Theme.text-muted;
+                            font-family: Theme.type-body-sm.family;
+                            font-size: Theme.type-body-sm.size;
+                        }
+                        if root.resources.length > 0 : List {
+                            items: root.resources;
+                            selected-index: root.selected-resource-index;
+                            item-clicked(idx, value) => {
+                                root.resource-selected(idx);
+                            }
+                        }
+                    }
+                }
+
+                // ---- Pane 2: Instance list -------------------------
+                Rectangle {
+                    horizontal-stretch: 1;
+                    Card {
+                        title: root.selected-resource-index >= 0
+                            ? "Instances"
+                            : "Pick a resource";
+                        if root.selected-resource-index < 0 : Text {
+                            text: "Click a resource on the left to list its instances.";
+                            color: Theme.text-muted;
+                            font-family: Theme.type-body.family;
+                            font-size: Theme.type-body.size;
+                            wrap: word-wrap;
+                        }
+                        if root.selected-resource-index >= 0
+                           && root.instances.length == 0 : Text {
+                            text: "(no facts yet)";
+                            color: Theme.text-muted;
+                            font-family: Theme.type-body-sm.family;
+                            font-size: Theme.type-body-sm.size;
+                        }
+                        if root.selected-resource-index >= 0
+                           && root.instances.length > 0 : List {
+                            items: root.instances;
+                            selected-index: root.selected-instance-index;
+                            item-clicked(idx, value) => {
+                                root.instance-selected(idx);
+                            }
+                        }
+                    }
+                }
+
+                // ---- Pane 3: Detail panel --------------------------
+                Rectangle {
+                    width: 320px;
+                    Card {
+                        title: root.selected-instance-index >= 0
+                            ? "Detail"
+                            : "Detail";
+                        if root.detail-lines.length == 0 : Text {
+                            text: "Click an instance to inspect its bindings and back-references.";
+                            color: Theme.text-muted;
+                            font-family: Theme.type-body.family;
+                            font-size: Theme.type-body.size;
+                            wrap: word-wrap;
+                        }
+                        for line[idx] in root.detail-lines : Text {
+                            text: line;
+                            color: Theme.text-primary;
+                            font-family: Theme.type-code.family;
+                            font-weight: Theme.type-code.weight;
+                            font-size: Theme.type-code.size;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ----- Status footer ----------------------------------------
+        Rectangle {
+            background: Theme.neutral-100;
+            min-height: 28px;
+
+            // 1px top border.
+            Rectangle {
+                y: 0;
+                height: 1px;
+                background: Theme.border;
+            }
+
+            HorizontalLayout {
+                padding-left: Theme.spacing-lg;
+                padding-right: Theme.spacing-lg;
+                padding-top: Theme.spacing-xs;
+                padding-bottom: Theme.spacing-xs;
+
+                Text {
+                    text: root.status-text;
+                    color: Theme.text-muted;
+                    font-family: Theme.type-caption.family;
+                    font-weight: Theme.type-caption.weight;
+                    font-size: Theme.type-caption.size;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}
