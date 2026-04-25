@@ -55,6 +55,7 @@
 
 #![allow(dead_code)]
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::collections::BTreeSet;
 use alloc::format;
@@ -68,6 +69,7 @@ use arest::ast::{self, Object};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use crate::arch::uefi::slint_backend::HateoasBrowser;
+use crate::system::SubscriberId;
 
 /// Convenience alias — every Slint `[string]` property is bridged
 /// through a `ModelRc<SharedString>` backed by a `VecModel`. Pulled
@@ -118,14 +120,33 @@ impl Breadcrumb {
 /// `on_back_clicked` can each take their own clone of the `Rc` and
 /// mutate the state independently — every callback mutates and then
 /// re-pushes the `*-model` properties via `redraw`.
+///
+/// `subscriber_id` (#458) is the handle returned by
+/// `system::subscribe_changes` for the live-update handler we
+/// register in `build_app`. Stored here so the Drop impl can
+/// `system::unsubscribe(id)` when the last `Rc` clone drops, which
+/// happens when the HateoasBrowser window itself is dropped (the
+/// Slint callback closures hold the only `Rc` clones outside of
+/// `build_app`'s local; dropping the window drops the closures,
+/// which drops the `Rc`s, which fires this Drop). `Option<...>`
+/// because `BrowserState::new` runs before the subscription is
+/// registered — the `Some(...)` set lands once we know the id.
 struct BrowserState {
     /// Navigation stack. Always non-empty; index 0 is `Root`.
     stack: Vec<Breadcrumb>,
+    /// `system::subscribe_changes` handle. `None` until
+    /// `build_app` finishes registering the live-update handler;
+    /// `Some(id)` for the rest of the BrowserState's life. The
+    /// `Drop` impl unsubscribes when set.
+    subscriber_id: Option<SubscriberId>,
 }
 
 impl BrowserState {
     fn new() -> Self {
-        Self { stack: alloc::vec![Breadcrumb::Root] }
+        Self {
+            stack: alloc::vec![Breadcrumb::Root],
+            subscriber_id: None,
+        }
     }
 
     /// Top-of-stack — what the user is currently looking at.
@@ -146,6 +167,27 @@ impl BrowserState {
     fn pop(&mut self) {
         if self.stack.len() > 1 {
             self.stack.pop();
+        }
+    }
+}
+
+/// Drop the change-subscription registered by `build_app` so the
+/// `system::SUBSCRIBERS` registry doesn't grow unbounded across
+/// app re-launches. Today the kernel constructs HateoasBrowser
+/// once at boot and never tears it down, so this Drop is dormant
+/// in production — but the cleanup discipline matches the spec
+/// (#458) and a hypothetical "close app and re-open" path
+/// (potential future #431 follow-up) won't leak handler entries.
+///
+/// Idempotent — `system::unsubscribe` is a no-op on an unknown
+/// id, and `subscriber_id` is only set once in `build_app`. If
+/// the registration ever fails to land (impossible today —
+/// `subscribe_changes` is infallible), Drop sees `None` and
+/// silently returns.
+impl Drop for BrowserState {
+    fn drop(&mut self) {
+        if let Some(id) = self.subscriber_id.take() {
+            crate::system::unsubscribe(id);
         }
     }
 }
@@ -493,6 +535,53 @@ impl Snapshot {
     }
 }
 
+// ── Live-update plumbing (#458) ────────────────────────────────────
+//
+// The `system::subscribe_changes` handler signature (`Fn(&[String])
+// + Send + Sync`) forces every captured value to be `Send + Sync`.
+// `slint::Weak<HateoasBrowser>` is `Send + Sync` under the kernel's
+// `unsafe-single-threaded` slint feature (see slint v1.16
+// i-slint-core/src/api.rs line 1174-1177 — `unsafe impl Send` /
+// `unsafe impl Sync` for `Weak<T: StrongHandle>` are gated on
+// `feature = "std"` OR `feature = "unsafe-single-threaded"`, and
+// the kernel selects the latter in Cargo.toml L205). But
+// `alloc::rc::Weak<RefCell<BrowserState>>` (the natural shape for
+// passing the BrowserState into the handler without keeping it
+// alive) is NOT `Send + Sync` — `Rc` is intentionally `!Send`.
+//
+// `SendSyncWeak` newtype + manual `unsafe impl Send + Sync` is the
+// kernel-equivalent of slint's own gated impls. The kernel runs
+// single-threaded at boot (no SMP scheduler — see
+// `arch/uefi/slint_backend.rs` L460-471 for the same pattern
+// applied to `FramebufferBackend`), so there is no actual
+// cross-thread access happening; the markers are sound under our
+// concurrency model. They unblock storing the `Rc::Weak` alongside
+// `slint::Weak` in the handler's capture set.
+struct SendSyncWeak<T: ?Sized>(alloc::rc::Weak<T>);
+
+impl<T: ?Sized> SendSyncWeak<T> {
+    /// Upgrade through the inner `alloc::rc::Weak`. Method form
+    /// (rather than direct `.0.upgrade()`) so the closure captures
+    /// `self: SendSyncWeak<T>` (which IS `Send + Sync` via the
+    /// unsafe impls below) instead of `Weak<T>` (which is not).
+    /// Rust's disjoint-capture inference looks at fields rather
+    /// than the whole struct when a closure body accesses `.0`,
+    /// so the field-level `Send + Sync` bound on `Weak<T>` would
+    /// fail at the closure-trait-bound check site if we let
+    /// callers reach for `.0` directly.
+    fn upgrade(&self) -> Option<Rc<T>> {
+        self.0.upgrade()
+    }
+}
+
+// SAFETY: kernel is single-threaded (mirrors the pattern used for
+// `FramebufferBackend` in `arch/uefi/slint_backend.rs`). The handler
+// is invoked from `system::apply`, which runs on the same super-loop
+// thread that mutates the BrowserState through Slint callbacks; no
+// real cross-thread access occurs.
+unsafe impl<T: ?Sized> Send for SendSyncWeak<T> {}
+unsafe impl<T: ?Sized> Sync for SendSyncWeak<T> {}
+
 // ── Public constructor ────────────────────────────────────────────
 
 /// Construct the HATEOAS browser window and wire its callbacks.
@@ -593,6 +682,143 @@ pub fn build_app() -> Result<HateoasBrowser, slint::PlatformError> {
     // to a `ThemePref` cell) has a place to land. Today: no-op.
     {
         window.on_theme_toggled(|| {});
+    }
+
+    // ── Live updates (#458) ────────────────────────────────────────
+    //
+    // Register a `system::subscribe_changes` handler that re-snaps
+    // and redraws when the SYSTEM state mutates (the kernel-side
+    // mirror of ui.do's SSE-driven TanStack Query cache invalidation
+    // path from BroadcastDO #220 + #234). Without this, the browser
+    // is pull-only — it only re-snaps on user navigation, so a
+    // `POST /file` from the wire while the user is staring at the
+    // File detail panel goes unseen until they click around.
+    //
+    // What the handler captures:
+    //   * `Weak<HateoasBrowser>` — Slint's `as_weak()` produces a
+    //     `Send + Sync` weak ref under the kernel's
+    //     `unsafe-single-threaded` slint feature. Upgraded inside
+    //     the handler; if the upgrade fails (window already
+    //     dropped), the handler self-unsubscribes via the captured
+    //     id and returns. The id is captured indirectly through a
+    //     `OnceCell`-shaped `Mutex<Option<SubscriberId>>` because
+    //     the id isn't known until `subscribe_changes` returns.
+    //   * `SendSyncWeak<RefCell<BrowserState>>` — a Weak-shaped
+    //     reference to the BrowserState so the handler doesn't
+    //     keep the state alive (which would prevent BrowserState's
+    //     Drop impl from ever firing). Wrapped in the `SendSyncWeak`
+    //     newtype so it satisfies the closure's `Send + Sync` bound
+    //     under the kernel's single-threaded model.
+    //
+    // What the handler does:
+    //   1. Upgrades the `slint::Weak` — if the window is gone, take
+    //      the SubscriberId and unsubscribe self. The handler can't
+    //      easily call `unsubscribe` on its own id from inside its
+    //      own invocation without the snapshot pattern in
+    //      `system::deliver_changes` — and that pattern (Arc-clone
+    //      under brief lock, release lock, invoke) is exactly what
+    //      makes self-unsubscribe safe (system.rs lines 395-422).
+    //   2. Upgrades the `Rc::Weak<BrowserState>` — if the state is
+    //      gone, same behaviour: unsubscribe self and exit.
+    //   3. Reads the currently-displayed Noun from the BrowserState
+    //      stack. If `Root` (no Noun selected), every redraw is
+    //      worthwhile because the resources sidebar might gain a
+    //      new entry — fall through to redraw unconditionally on
+    //      Root.
+    //   4. Otherwise, intersect the changed-cells slice with the
+    //      `<Noun>_has_*` pattern. If no overlap, the change
+    //      doesn't affect the current view — bail out without
+    //      redrawing. (Stricter optimisation: also check
+    //      back-references for the Instance case. Skipped for now
+    //      — back-reference cells are also `<OtherNoun>_has_*`
+    //      shaped, so a strict noun-prefix match would miss them;
+    //      we redraw on any change unrelated to the current Noun
+    //      for now and revisit when the cell-name diff path grows
+    //      role metadata.)
+    //   5. Calls `redraw(&window, &state.borrow())`. This is
+    //      sound on the same thread that owns the Slint window
+    //      (the super-loop in `ui_apps::launcher::run`) — and
+    //      `system::apply` is called from `net::poll()` which the
+    //      same super-loop drives, so the handler always runs on
+    //      the UI thread. No `slint::invoke_from_event_loop`
+    //      hop is needed (and would in fact fail —
+    //      `UefiSlintPlatform` deliberately does not implement
+    //      `Platform::new_event_loop_proxy`, see
+    //      `arch/uefi/slint_backend.rs` and `ui_apps/launcher.rs`
+    //      L62-65 for the rationale; `invoke_from_event_loop`
+    //      returns `EventLoopError::NoEventLoopProvider` without
+    //      a proxy).
+    {
+        // `Mutex<Option<SubscriberId>>` shape for the deferred id
+        // capture. The handler needs to know its own id (so it can
+        // unsubscribe-self when the window/state Weak fails), but
+        // the id isn't available until `subscribe_changes` returns.
+        // `Arc<Mutex<...>>` clone is `Send + Sync`; the handler
+        // holds one clone, the `build_app` body holds the other and
+        // populates it after subscription.
+        let id_slot: alloc::sync::Arc<spin::Mutex<Option<SubscriberId>>> =
+            alloc::sync::Arc::new(spin::Mutex::new(None));
+        let window_weak = window.as_weak();
+        let state_weak = SendSyncWeak(Rc::downgrade(&state));
+        let id_slot_handler = id_slot.clone();
+        let id = crate::system::subscribe_changes(Box::new(move |changed: &[String]| {
+            // 1. Window still alive?
+            let Some(window) = window_weak.upgrade() else {
+                if let Some(my_id) = id_slot_handler.lock().take() {
+                    crate::system::unsubscribe(my_id);
+                }
+                return;
+            };
+            // 2. BrowserState still alive? Go through
+            //    `SendSyncWeak::upgrade` rather than `.0.upgrade()`
+            //    so the closure captures the wrapper (Send + Sync)
+            //    instead of disjoint-capturing the inner
+            //    `Rc::Weak` field (which is !Send + !Sync).
+            let Some(state_rc) = state_weak.upgrade() else {
+                if let Some(my_id) = id_slot_handler.lock().take() {
+                    crate::system::unsubscribe(my_id);
+                }
+                return;
+            };
+            // 3. What Noun is the user looking at?
+            let active_noun: Option<String> = {
+                let s = state_rc.borrow();
+                s.stack.iter().rev().find_map(|c| match c {
+                    Breadcrumb::Noun { noun } => Some(noun.clone()),
+                    Breadcrumb::Instance { noun, .. } => Some(noun.clone()),
+                    Breadcrumb::Root => None,
+                })
+            };
+            // 4. Filter: only redraw when the changed cells touch
+            //    the current Noun's `<Noun>_has_*` cells. On Root
+            //    (no Noun selected) we always redraw because the
+            //    resources sidebar itself derives from the full
+            //    cell set — a brand-new Noun appearing requires
+            //    a sidebar refresh that pure noun-prefix matching
+            //    would miss.
+            let needs_redraw = match active_noun.as_deref() {
+                None => true, // Root view — every change matters.
+                Some(noun) => {
+                    let prefix = alloc::format!("{noun}_has_");
+                    changed.iter().any(|name| name.starts_with(&prefix))
+                }
+            };
+            if !needs_redraw {
+                return;
+            }
+            // 5. Re-snapshot + push to Slint properties.
+            //    We're already on the UI thread (super-loop drives
+            //    both `net::poll` -> `system::apply` and Slint
+            //    paint), so direct property mutation is safe.
+            redraw(&window, &state_rc.borrow());
+        }));
+        // Park the id in two places:
+        //   * `id_slot` so the handler can unsubscribe-self on
+        //     dead-weak.
+        //   * `BrowserState::subscriber_id` so the Drop impl can
+        //     unsubscribe when the BrowserState is dropped.
+        *id_slot.lock() = Some(id);
+        state.borrow_mut().subscriber_id = Some(id);
     }
 
     Ok(window)
