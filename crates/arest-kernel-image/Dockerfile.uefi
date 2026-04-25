@@ -57,6 +57,15 @@ COPY crates/arest-kernel/rust-toolchain.toml crates/arest-kernel/rust-toolchain.
 # baked assets.
 COPY apps/ui.do/dist/ apps/ui.do/dist/
 
+# Doom assets (#372/#383/#376) — `build.rs` bakes `doom.wasm` and
+# `doom1.wad` into the kernel ELF when present, otherwise falls
+# back to empty `&[]` slices. The UEFI smoke (#376) instantiates
+# the WASM module and calls `initGame` + `tickGame` to land the
+# first `drawFrame`, so without these assets staged in the build
+# context the kernel would print "WASM binary absent" instead of
+# the four `doom:` banner phrases the smoke harness asserts.
+COPY crates/arest-kernel/doom_assets/ crates/arest-kernel/doom_assets/
+
 # arest engine sources + readings — same as the BIOS path, the
 # kernel links the engine in no_std mode for either target.
 COPY crates/arest/Cargo.toml crates/arest/Cargo.toml

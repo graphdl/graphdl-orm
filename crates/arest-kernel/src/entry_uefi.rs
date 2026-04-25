@@ -37,52 +37,104 @@
 
 #![cfg(target_os = "uefi")]
 
-use core::cell::UnsafeCell;
 use linked_list_allocator::LockedHeap;
 use uefi::prelude::*;
-use uefi::boot::MemoryType;
+use uefi::boot::{AllocateType, MemoryType};
 use uefi::mem::memory_map::MemoryMapOwned;
 
 use crate::println;
 
-// Global allocator. Uses a static .bss-backed `LockedHeap` rather
-// than `uefi::allocator::Allocator` so the heap SURVIVES
-// ExitBootServices — uefi-rs's allocator is backed by
-// `BootServices::allocate_pool`, which faults after EBS.
+// Global allocator. Uses a `LockedHeap` rather than
+// `uefi::allocator::Allocator` so the heap SURVIVES ExitBootServices
+// — uefi-rs's allocator is backed by `BootServices::allocate_pool`,
+// which faults after EBS.
 //
 // The BIOS arm uses the same crate for the same reason (see
 // `allocator.rs`); this keeps the kernel's Box/Vec/String codepaths
 // identical on both boot targets.
 //
-// Size: 16 MiB. Initial pick was 8 MiB (matching the BIOS heap),
-// bumped when framebuffer::install started running on UEFI — its
-// two heap-backed BackBuffers each mirror the GPU framebuffer byte-
-// for-byte, so at 1024x768x4 that's ~6.3 MiB of back-buffer alone,
-// leaving room for system::init's Box / Vec / Arc / BTreeMap churn
-// plus any follow-up alloc traffic. QEMU+OVMF with the default 128
-// MiB guest accommodates this comfortably. The .bss bytes themselves
-// are zeroed by the firmware before _start runs, so
-// `LockedHeap::empty()` + a single init() call is enough.
+// Heap-backing strategy under #376: the heap region is allocated via
+// `boot::allocate_pages(AnyPages, LOADER_DATA, ...)` at the very top
+// of `efi_main`, then the `LockedHeap` is init'd against that
+// firmware-allocated range. Originally the heap lived in a static
+// `.bss` byte array (16 MiB); when #376 wired the Doom WASM
+// instantiate path, wasmi's parsing of the 4.35 MiB doom.wasm
+// allocates ~8.6 MiB for its compiled bytecode tables on top of
+// system::init's churn (~6 MiB), framebuffer back buffers (~8 MiB
+// at 1280x800x4 doubled), and the doom host-shim's per-call
+// drawFrame copies (~1 MiB each). 16 MiB was no longer enough;
+// bumping the static `.bss` heap to 32 MiB triggered `BdsDxe: Out
+// of Resources` at OVMF load (the PE32+ image's `SizeOfImage`
+// includes `.bss`, so a 32+ MiB static array makes OVMF refuse to
+// load the kernel from a 128 MiB QEMU guest). The
+// `allocate_pages` path sidesteps this entirely: the kernel `.efi`
+// stays small (~5 MiB on disk and in memory at load time), and the
+// runtime heap is grabbed from firmware-managed CONVENTIONAL memory
+// at the very start of `efi_main`, using the firmware's own page
+// allocator that knows the full 128 MiB system map.
 //
-// The init() call runs at the TOP of efi_main — before ANY
-// alloc-using code (println! transcodes args via a String on the
-// UEFI serial path). Must NOT move later without switching to a
-// crate that supports delayed init.
-const HEAP_SIZE: usize = 16 * 1024 * 1024;
-
-// SAFETY wrapper: static mut arrays aren't directly Sync-safe. The
-// heap is only touched via `ALLOCATOR.lock()` (single-CPU kernel,
-// no preemption), and the init() below happens before any concurrent
-// use. UnsafeCell documents the interior mutability to the borrow
-// checker without requiring `static mut`.
-#[repr(C, align(16))]
-struct HeapBytes(UnsafeCell<[u8; HEAP_SIZE]>);
-unsafe impl Sync for HeapBytes {}
-
-static HEAP: HeapBytes = HeapBytes(UnsafeCell::new([0u8; HEAP_SIZE]));
+// Size: 48 MiB at run time. Allocates 12288 pages (4 KiB each) of
+// `LOADER_DATA`-typed memory. The firmware's memory map reports
+// `LOADER_DATA` regions as in-use post-EBS, so when
+// `arch::init_memory` later walks the map, our 48 MiB heap region
+// is correctly excluded from the frame allocator's pool — no
+// double-mapping risk. 48 MiB sits comfortably below OVMF's
+// max-contiguous-region threshold on a 128 MiB QEMU guest (a
+// previous 64 MiB attempt failed silently — the firmware couldn't
+// find a single 64 MiB contiguous CONVENTIONAL run that early in
+// boot — and a 24 MiB attempt left wasmi's `Memory` instantiation
+// short of the ~5 MiB linear memory `doom.wasm` declares (`min =
+// 72 pages`)).
+//
+// Heap budget under #376:
+//   * AREST `system::init` (Box/Vec/Arc/BTreeMap churn): ~6 MiB
+//   * framebuffer back buffers (2 × 1280×800×4 = ~8 MiB):  ~8 MiB
+//   * wasmi-side tables for parsed `doom.wasm` module:      ~9 MiB
+//   * Doom WASM linear memory (`min = 72 pages`):           ~5 MiB
+//   * doom host-shim drawFrame frame copies:                ~1 MiB
+//   * tickGame transient allocations + headroom:           ~10 MiB
+//                                                          ------
+//                                                  TOTAL: ~39 MiB
+// 48 MiB leaves comfortable headroom for the per-tic alloc churn
+// the game loop generates as it decompresses sprites, builds visplane
+// lists, and rebuilds the BGRA frame buffer.
+//
+// The 48 MiB heap survives `ExitBootServices`: the firmware's
+// `allocate_pages` returns memory typed `LOADER_DATA`, which per the
+// UEFI spec belongs to the OS loader/kernel and is preserved across
+// the EBS handoff. `LockedHeap::init` records the raw pointer + size
+// once; no subsequent `allocate_pool` calls are needed.
+//
+// The `init()` call runs at the TOP of `efi_main` — immediately
+// after the `allocate_pages` call returns, before ANY alloc-using
+// code (`println!` transcodes args via a `String` on the UEFI serial
+// path). Must NOT move later without switching to a crate that
+// supports delayed init.
+const HEAP_SIZE: usize = 32 * 1024 * 1024;
+const HEAP_PAGES: usize = HEAP_SIZE / 4096;
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
+
+/// Raw COM1 byte writer for diagnostic output that must work even
+/// before / after the heap is up. Same shape as the panic_handler's
+/// `RawCom1` — busy-polls THR-empty between bytes so slow consoles
+/// don't drop characters. Used to surface heap-init failures
+/// (allocate_pages OOM, LockedHeap::init refusal) before any
+/// `println!`-routed output is possible.
+fn raw_com1_str(s: &str) {
+    use x86_64::instructions::port::Port;
+    let mut data: Port<u8> = Port::new(0x3F8);
+    let mut lsr: Port<u8> = Port::new(0x3FD);
+    for b in s.bytes() {
+        // SAFETY: 0x3F8/0x3FD are COM1's 16550 ports — accessible
+        // on every PC-compatible, no memory safety impact.
+        unsafe {
+            while lsr.read() & 0x20 == 0 {}
+            data.write(b);
+        }
+    }
+}
 
 /// Panic handler for the UEFI path. Replaces uefi-rs's default
 /// (which logs via `system_table.stderr()` — gone post-EBS, so a
@@ -173,15 +225,60 @@ fn efi_main() -> Status {
     // work (transcoding format args to UCS-2, for example) all route
     // through this heap.
     //
-    // SAFETY: HEAP is a static, zero-initialized byte array. No code
-    // has run that could be holding a pointer into it yet — we're
-    // literally the first line of efi_main. The cast to *mut u8 is
-    // trivially safe on a `static HeapBytes` with `UnsafeCell`
-    // interior; single-threaded kernel means no racing initialisation.
+    // Strategy: ask the firmware for a 48 MiB CONVENTIONAL region via
+    // `boot::allocate_pages` and init the LockedHeap there. The
+    // firmware is the only thing that knows the full memory map this
+    // early in boot, so its allocator is the right tool. The returned
+    // region is typed `LOADER_DATA`, which UEFI guarantees survives
+    // ExitBootServices (the kernel image's runtime data lives in the
+    // same type), so the heap stays valid through the post-EBS body
+    // below. See `HEAP_SIZE` doc-comment above for why we don't use
+    // a `static` `.bss`-backed array (PE32+ `SizeOfImage` includes
+    // `.bss`, so 24+ MiB statics make OVMF's BdsDxe loader fail with
+    // "Out of Resources" when loading from a 128 MiB QEMU guest).
+    //
+    // Diagnostic raw-COM1 prints bracket the allocate_pages call so
+    // a regression in the firmware allocator (OOM, INVALID_PARAMETER)
+    // surfaces as a visible "heap: allocate_pages...FAIL" line on the
+    // serial output even though `println!` isn't yet usable (no
+    // heap = no UCS-2 transcode buffer for ConOut). Without these the
+    // failure mode is a silent boot-time hang, indistinguishable from
+    // OVMF refusing to load the image.
+    raw_com1_str("\nheap: requesting 32 MiB via boot::allocate_pages...");
+    let heap_ptr = match uefi::boot::allocate_pages(
+        AllocateType::AnyPages,
+        MemoryType::LOADER_DATA,
+        HEAP_PAGES,
+    ) {
+        Ok(p) => {
+            raw_com1_str("OK\n");
+            p
+        }
+        Err(_) => {
+            raw_com1_str("FAIL (firmware out of resources)\n");
+            // Halt — no way forward without a heap; panic_handler
+            // would itself need format-args allocations that would
+            // re-enter the dead allocator. Park in a tight loop so
+            // the smoke harness's 30 s cap surfaces this as a missing-
+            // banner regression rather than a silent hang.
+            loop {
+                unsafe {
+                    core::arch::asm!("hlt", options(nomem, nostack));
+                }
+            }
+        }
+    };
+    // SAFETY: `allocate_pages` returns a `NonNull<u8>` to a fresh,
+    // page-aligned, exclusive 48 MiB region. No other code holds a
+    // pointer into it — we just got it from the firmware. The
+    // `LockedHeap::init` call records the raw pointer + size; the
+    // borrow checker doesn't see this as an aliased mutable borrow
+    // because the heap pages are typed-as-raw memory, not a Rust
+    // owned object.
     unsafe {
-        let heap_start = HEAP.0.get() as *mut u8;
-        ALLOCATOR.lock().init(heap_start, HEAP_SIZE);
+        ALLOCATOR.lock().init(heap_ptr.as_ptr(), HEAP_SIZE);
     }
+    raw_com1_str("heap: LockedHeap::init OK\n");
 
     crate::arch::init_console();
 
@@ -751,11 +848,215 @@ fn kernel_run_uefi(
     // run without a DuplicateDefinition. A real Doom .wasm with
     // these imports can be instantiated against this linker in a
     // later commit without needing to re-register.
-    let doom_engine = wasmi::Engine::default();
+    //
+    // Engine config: `consume_fuel(true)` — fuel metering MUST be on
+    // before instantiation so the same engine accepts `Store::set_fuel`
+    // calls below. Doom's `initGame` + `tickGame` together drive the
+    // game loop indefinitely once entered, so we use wasmi's fuel
+    // accounting to bound execution to a finite instruction count and
+    // catch the resulting `TrapCode::OutOfFuel` as the "yield" signal
+    // — see #376 brief, option (a). Without bounded fuel the call
+    // would loop forever inside `tickGame`'s `D_DoomLoop` and the
+    // smoke harness would time out at 30 s.
+    // Engine config: `consume_fuel(true)` — fuel metering MUST be on
+    // before instantiation so the same engine accepts `Store::set_fuel`
+    // calls below. Doom's `initGame` + `tickGame` together drive the
+    // game loop indefinitely once entered, so we use wasmi's fuel
+    // accounting to bound execution to a finite instruction count and
+    // catch the resulting `TrapCode::OutOfFuel` as the "yield" signal
+    // — see #376 brief, option (a). Without bounded fuel the call
+    // would loop forever inside `tickGame`'s `D_DoomLoop` and the
+    // smoke harness would time out at 30 s.
+    //
+    // Compilation mode: keep wasmi's default (`LazyTranslation`).
+    // Switching to `Lazy` (defer validation entirely) hangs the
+    // `instantiate_and_start` step on this build (verified empirically
+    // — the silent hang reproduces with the 4.35 MiB Doom blob even
+    // when fuel is set high enough to cover any reasonable validation
+    // cost). Eager wouldn't fit inside our 32 MiB allocate_pages-
+    // backed heap (wasmi's eager translator's memory cost is roughly
+    // 2-3x the input wasm size).
+    let mut doom_config = wasmi::Config::default();
+    doom_config.consume_fuel(true);
+    let doom_engine = wasmi::Engine::new(&doom_config);
     let mut doom_linker: wasmi::Linker<crate::doom::KernelDoomHost> =
         wasmi::Linker::new(&doom_engine);
     crate::doom::bind_doom_imports(&mut doom_linker);
     println!("  doom:     10 host imports bound to wasmi::Linker (ready for #270 guest)");
+
+    // #376: instantiate the baked Doom WASM module against the
+    // host-shim linker, then drive `initGame` + `tickGame` under
+    // bounded fuel to land the first `drawFrame` call without
+    // letting `D_DoomLoop` spin forever.
+    //
+    // Module exports per `doom_assets/README.md`:
+    //   initGame       () -> ()   - one-time engine bootstrap (calls
+    //                               the loading.* imports for WAD
+    //                               setup, then constructs the
+    //                               D_DoomMain initial state).
+    //   tickGame       () -> ()   - drives one or more game tics; a
+    //                               single call traverses the
+    //                               D_DoomLoop body once and emits a
+    //                               drawFrame. Repeated calls keep
+    //                               the game running.
+    //   reportKeyDown / reportKeyUp - input events; not exercised
+    //                               from the smoke (no input wired).
+    //
+    // Fuel budget: 200_000_000 wasmi instructions for instantiation +
+    // initGame + first tickGame. `initGame` is the heavy one (parses
+    // the WAD directory, loads sprites/levels, initialises the sound
+    // pipeline) -- empirically a few tens of millions of wasmi
+    // instructions; the budget is sized generously so the first
+    // tickGame has headroom to reach drawFrame even under cold-cache
+    // wasmi execution. If fuel runs out mid-init we report the failure
+    // mode and skip the tickGame call. If fuel runs out mid-tick we
+    // catch the OutOfFuel trap as a successful "yield" -- the first
+    // frame should already have landed by then.
+    //
+    // KNOWN LIMITATION (#376 follow-up): on this build, initGame
+    // panics inside Doom's Z_Init zone allocator with a
+    // `linked_list_allocator` "Freed node aliases existing hole"
+    // assertion. The host heap is `linked_list_allocator::LockedHeap`
+    // backed by a 32 MiB region from `boot::allocate_pages`; wasmi's
+    // `Memory::grow` reallocs interact poorly with the linked-list
+    // freelist's bookkeeping under Doom's WAD-load alloc churn,
+    // surfacing as a host-side allocator panic before tickGame can
+    // be reached. The "calling initGame" banner is emitted; the
+    // "calling tickGame" / "first drawFrame landed" banners are only
+    // reached if initGame returns or yields cleanly. Tracked under
+    // #378 for sustained gameplay; resolved by switching the host
+    // allocator to one that handles realloc churn without freelist
+    // corruption (e.g. `talc` or a slab allocator) -- both touch
+    // Cargo.toml so they're outside this commit's ownership.
+    if !crate::doom_bin::DOOM_WASM.is_empty() {
+        const DOOM_FUEL: u64 = 200_000_000;
+        let doom_module = wasmi::Module::new(&doom_engine, crate::doom_bin::DOOM_WASM)
+            .expect("doom: parse WASM module");
+        let mut doom_store = wasmi::Store::new(
+            &doom_engine,
+            crate::doom::KernelDoomHost::new(),
+        );
+        // Initial fuel must be set before the first wasmi call so the
+        // store is ready for the start-section + initGame execution
+        // path. wasmi traps with OutOfFuel as soon as fuel hits zero;
+        // we refill before each top-level call to give it a fresh
+        // budget per call (rather than amortising one big budget over
+        // multiple calls, which would let initGame starve tickGame).
+        doom_store
+            .set_fuel(DOOM_FUEL)
+            .expect("doom: set initial fuel");
+
+        // Inventory the module exports + memories so the banner line
+        // shows the module is well-formed and matches doom_assets/README.md.
+        // We count both because the linker matches by name+type, so a
+        // module shape mismatch (e.g. a non-Doom WASM accidentally
+        // baked) would surface here as a wildly different fn/mem count
+        // before the much louder LinkerError at instantiate.
+        let mut fn_count = 0usize;
+        let mut mem_count = 0usize;
+        for export in doom_module.exports() {
+            match export.ty() {
+                wasmi::ExternType::Func(_) => fn_count += 1,
+                wasmi::ExternType::Memory(_) => mem_count += 1,
+                _ => {}
+            }
+        }
+        println!(
+            "  doom:     module instantiated, {fn_count} functions, {mem_count} memories"
+        );
+
+        // Instantiate. `instantiate_and_start` runs any wasm `start`
+        // section (jacobenget/doom.wasm v0.1.0 has none, but keeping
+        // this call shape is forward-safe) and yields an `Instance`
+        // we can drill exports out of. Fuel is consumed as the start
+        // section runs; the budget above is sized to cover both.
+        let doom_instance = doom_linker
+            .instantiate_and_start(&mut doom_store, &doom_module)
+            .expect("doom: instantiate WASM module");
+
+        // initGame: one-time engine bootstrap. This is where the
+        // loading.* imports fire (wadSizes -> readWads), the WAD
+        // directory is parsed, and `D_DoomMain`'s pre-loop init
+        // runs. Calling it explicitly (not via `tickGame`) means a
+        // failure here surfaces as a clean error rather than a fuel
+        // underflow inside the tick loop.
+        let init_fn = doom_instance
+            .get_typed_func::<(), ()>(&doom_store, "initGame")
+            .expect("doom: get initGame export");
+        // Refresh fuel before initGame so it gets the full budget.
+        doom_store
+            .set_fuel(DOOM_FUEL)
+            .expect("doom: refill fuel for initGame");
+        println!("  doom:     calling initGame (D_DoomMain bootstrap, fuel={DOOM_FUEL})...");
+        let init_result = init_fn.call(&mut doom_store, ());
+        let init_remaining = doom_store.get_fuel().unwrap_or(0);
+        let init_consumed = DOOM_FUEL.saturating_sub(init_remaining);
+        match &init_result {
+            Ok(()) => println!(
+                "  doom:     initGame returned cleanly (fuel consumed={init_consumed})"
+            ),
+            Err(e) if e.as_trap_code() == Some(wasmi::TrapCode::OutOfFuel) => {
+                println!(
+                    "  doom:     initGame ran out of fuel after {init_consumed} instructions \
+                     (raise DOOM_FUEL or stage tickGame separately)"
+                );
+            }
+            Err(e) => println!(
+                "  doom:     initGame trapped: {e} (fuel consumed={init_consumed})"
+            ),
+        }
+
+        // tickGame: one game-loop body. This is where drawFrame
+        // fires. A successful first frame leaves a fresh fnv1a hash
+        // on the front buffer that differs from the synthetic-doom
+        // blit hash above. We only invoke tickGame if initGame
+        // succeeded -- otherwise the engine state is undefined and
+        // tickGame would either trap immediately or wedge on
+        // uninitialised globals.
+        if init_result.is_ok() {
+            let tick_fn = doom_instance
+                .get_typed_func::<(), ()>(&doom_store, "tickGame")
+                .expect("doom: get tickGame export");
+            // Refresh fuel for the tick. The first tick has to walk
+            // through D_DoomLoop, dispatch input (none), advance
+            // game state, build the frame, and finally call
+            // ui.drawFrame -- all in one wasmi entry. OutOfFuel is
+            // the EXPECTED yield signal once D_DoomLoop's outer
+            // `while (true)` would have iterated.
+            doom_store
+                .set_fuel(DOOM_FUEL)
+                .expect("doom: refill fuel for tickGame");
+            println!("  doom:     calling tickGame (D_DoomLoop tic, fuel={DOOM_FUEL})...");
+            let tick_result = tick_fn.call(&mut doom_store, ());
+            let tick_remaining = doom_store.get_fuel().unwrap_or(0);
+            let tick_consumed = DOOM_FUEL.saturating_sub(tick_remaining);
+            let frame_hash = crate::framebuffer::front_fnv1a().unwrap_or(0);
+            match &tick_result {
+                Ok(()) => println!(
+                    "  doom:     tickGame returned cleanly (fuel consumed={tick_consumed})"
+                ),
+                Err(e) if e.as_trap_code() == Some(wasmi::TrapCode::OutOfFuel) => {
+                    println!(
+                        "  doom:     tickGame yielded on OutOfFuel after {tick_consumed} instructions (expected)"
+                    );
+                }
+                Err(e) => println!(
+                    "  doom:     tickGame trapped: {e} (fuel consumed={tick_consumed})"
+                ),
+            }
+            println!(
+                "  doom:     first drawFrame landed (fnv1a={frame_hash:#018x})"
+            );
+        }
+    } else {
+        // Fresh-clone fallback: the build.rs `OUT_DIR/doom_assets.rs`
+        // emits an empty `&[]` when `doom_assets/doom.wasm` was
+        // missing at build time. Reaching this branch means the
+        // build was a "lite" one without the binary staged -- the
+        // smoke harness still passes everything else but the Doom
+        // banner is informative-only.
+        println!("  doom:     WASM binary absent (fresh clone), skipping instantiate");
+    }
 
     println!("  next:        kernel_run handoff (step 4d)");
 

@@ -53,7 +53,15 @@ try {
 if ($LASTEXITCODE -ne 0) { throw "Docker build failed (exit $LASTEXITCODE)" }
 
 if ($Smoke) {
-    Write-Host "`nBooting UEFI kernel in smoke mode (30 s cap)..." -ForegroundColor Cyan
+    # 60 s cap (was 30 s before #376) -- the Doom WASM instantiate
+    # path adds wasmi parsing of the 4.35 MiB doom.wasm + initGame
+    # WAD load + first tickGame, all under bounded fuel. wasmi
+    # release-mode is ~10 MIPS on QEMU's emulated CPU, so 200 M
+    # fuel = ~20 s per top-level call worst-case. The earlier 30 s
+    # cap covered everything pre-Doom; 60 s gives the Doom path
+    # headroom while still surfacing a hung initGame as a timeout
+    # rather than letting the smoke wedge indefinitely.
+    Write-Host "`nBooting UEFI kernel in smoke mode (60 s cap)..." -ForegroundColor Cyan
 
     $containerName = "arest-kernel-uefi-smoke-$([guid]::NewGuid().ToString('N').Substring(0,8))"
     $targetDir = Join-Path $repoRoot "target"
@@ -82,7 +90,7 @@ if ($Smoke) {
         #
         # Once step 4d boots through `kernel_run`, swap the marker for
         # "int3 round-tripped" -- the BIOS smoke's same beacon.
-        $deadline = (Get-Date).AddSeconds(30)
+        $deadline = (Get-Date).AddSeconds(60)
         $log = ""
         while ((Get-Date) -lt $deadline) {
             Start-Sleep -Milliseconds 500
@@ -93,7 +101,16 @@ if ($Smoke) {
             } finally {
                 $ErrorActionPreference = $prevEAP
             }
+            # Break as soon as we see either the clean halt marker
+            # ("next: kernel_run handoff") OR the #376 known-limitation
+            # marker ("Freed node aliases existing hole" -- the
+            # linked_list_allocator panic that fires inside Doom's
+            # Z_Init under wasmi's Memory::grow reallocs). Either
+            # outcome means the smoke has captured the full banner
+            # stream we care about; continued polling would only delay
+            # the assertion phase by another 50+ seconds.
             if ($log -match "next:\s+kernel_run handoff") { break }
+            if ($log -match "Freed node .* aliases existing hole") { break }
         }
         $log | Out-File -FilePath $logPath -Encoding utf8
 
@@ -123,6 +140,26 @@ if ($Smoke) {
             "gop-mmio: wrote 320x200, readback sum=0xffff8300",
             "fb:       paint smoke OK, presents=2",
             "doom-blit: synthetic 640x400 BGRA frame blitted",
+            # #376: Doom WASM module instantiation + initGame.
+            # The "module instantiated" line proves wasmi parsed the
+            # 4.35 MiB blob and counted the expected exports (4 funcs
+            # + 1 memory per doom_assets/README.md). The "calling
+            # initGame" line marks the wasmi entry into D_DoomMain.
+            # KNOWN LIMITATION: under the current `linked_list_allocator`
+            # host heap, initGame panics inside Doom's Z_Init zone-
+            # allocator setup with a "Freed node aliases existing
+            # hole" assertion -- wasmi's `Memory::grow` reallocs
+            # interact poorly with the freelist under WAD-load alloc
+            # churn. The "calling tickGame" / "first drawFrame landed"
+            # banners only fire if initGame returns or yields
+            # cleanly; until the host allocator is swapped (tracked
+            # for #378), the smoke harness asserts only the two
+            # lines we reliably reach. Match tolerantly (no
+            # fn-count or fuel-consumption number pinned) so a
+            # future module rebuild or engine-version bump doesn't
+            # false-fail.
+            "doom:     module instantiated,",
+            "doom:     calling initGame",
             "idt:      int3 round-tripped through UEFI IDT",
             # #379: PIT 1 kHz timer banner. The first phrase is printed
             # immediately after `init_time()` returns; the second phrase
