@@ -50,7 +50,7 @@ $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 try {
     docker build -t arest-kernel-boot-img `
-        -f "$repoRoot\crates\arest-kernel-image\Dockerfile.boot-img" `
+        -f "$repoRoot\crates\arest-kernel\Dockerfile.boot-img" `
         $repoRoot
 } finally {
     $ErrorActionPreference = $prevEAP
@@ -126,4 +126,4 @@ Write-Host "Next step (#393): fastboot boot $bootImgHostPath" -ForegroundColor D
 Write-Host "Note: the kernel slot inside the boot.img has no ARM64 boot header" -ForegroundColor DarkGray
 Write-Host "      (the PE32+ flatten step drops the entry-point metadata) so" -ForegroundColor DarkGray
 Write-Host "      the bootloader will reject it until that header is added." -ForegroundColor DarkGray
-Write-Host "      See crates/arest-kernel-image/boot-img-README.md." -ForegroundColor DarkGray
+Write-Host "      See crates/arest-kernel/boot-img-README.md." -ForegroundColor DarkGray

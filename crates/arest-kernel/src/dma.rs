@@ -27,18 +27,15 @@
 //
 // ── Pure-logic design ───────────────────────────────────────────────
 // Everything in this file is `u64`-addressed, no x86_64 intrinsics,
-// no statics, no page-table access. The choice is deliberate: the
-// host-side integration tests in `crates/arest-kernel-image/tests/
-// dma_pool.rs` `#[path]`-include this source directly so the bump
-// and carve logic can be exercised on the host target with `cargo
-// test`. Glue that actually talks to paging / frames / virtio-drivers
-// lives in `virtio.rs` and `memory.rs`.
+// no statics, no page-table access. Glue that actually talks to
+// paging / frames / virtio-drivers lives in `virtio.rs` and
+// `memory.rs`.
 //
 // ── Not in scope ────────────────────────────────────────────────────
 // * SMP-safe locking — single-core kernel, the `spin::Mutex` that
 //   guards the pool in `virtio.rs` is enough.
 // * IOMMU / VT-d — QEMU's SLiRP doesn't use it; HAL `share`/`unshare`
-//   remain identity translations against the bootloader's offset map.
+//   remain identity translations against the firmware-mapped offset.
 // * Free — the bump cursor is one-way; `Hal::dma_dealloc` is a no-op
 //   for the same reason it already is against the boot allocator.
 

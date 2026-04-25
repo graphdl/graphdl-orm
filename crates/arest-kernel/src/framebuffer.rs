@@ -1,15 +1,17 @@
 // crates/arest-kernel/src/framebuffer.rs
 //
 // Triple-buffered linear framebuffer with damage tracking. Sits on
-// top of the bootloader-provided `BootInfo.framebuffer` byte slice
-// (the "front" buffer — what the display reads). Drawing API writes
-// to one of two heap-allocated back buffers; `present()` copies the
-// dirty rect from the active back buffer onto the front buffer and
-// swaps to the other back. Three buffers total → producer never
-// stalls waiting for the consumer (would matter if we had vsync
-// signalling; without it, triple == double for stall behaviour but
-// the chain is in place for when virtio-gpu or a real display
-// controller lands and starts gating present() on flips).
+// top of a firmware-mapped front buffer byte slice (UEFI
+// `GraphicsOutputProtocol` on most arms; virtio-gpu DMA-backed
+// surface on the x86_64 UEFI virtio-gpu path — see
+// `install_virtio_gpu`). Drawing API writes to one of two heap-
+// allocated back buffers; `present()` copies the dirty rect from
+// the active back buffer onto the front buffer and swaps to the
+// other back. Three buffers total → producer never stalls waiting
+// for the consumer (would matter if we had vsync signalling;
+// without it, triple == double for stall behaviour but the chain
+// is in place for when virtio-gpu or a real display controller
+// lands and starts gating present() on flips).
 //
 // Drawing pipeline:
 //   1. caller code calls `framebuffer::with_back(|back| back.draw_*())`
@@ -35,20 +37,64 @@
 //   * `front_fnv1a()` / `back_fnv1a()` — FNV-1a hash of the
 //                    respective buffer for smoke-test assertions.
 //
-// Why no virtio-gpu yet (#269): the bootloader-provided framebuffer
-// already gives a usable surface under QEMU's default `-vga std`
-// (1280x720x24bpp typical). virtio-gpu is the right answer for a
-// production GPU stack but unnecessary for the boot-time graphics
-// demo path that #270/#271 want — those can run against the BIOS
-// framebuffer the bootloader already hands us.
+// virtio-gpu (#371) is the production GPU stack — see
+// `install_virtio_gpu` for the DMA-backed surface install path.
+// The firmware-mapped GOP framebuffer is the fallback when no
+// virtio-gpu device is present, and the demo path that #270/#271
+// drove (Doom blit + paint smoke).
 
 use alloc::{vec, vec::Vec};
-use bootloader_api::info::{FrameBufferInfo, PixelFormat};
 use spin::Mutex;
 
-/// Singleton driver state. `None` until `init` runs and `None`
-/// forever if the bootloader didn't provide a framebuffer
-/// (text-mode boot).
+/// Pixel layout of the firmware-mapped surface. Tracks the variants
+/// the kernel actually populates from `GraphicsOutputProtocol`'s
+/// `PixelFormat` (UEFI §12.9): RGB / BGR linear pixel buffers, plus a
+/// greyscale fallback the draw helpers honour. `Bitmask` and `BltOnly`
+/// surfaces flow through the `Unknown` arm — `write_pixel` becomes a
+/// no-op rather than corrupting the surface.
+///
+/// Variant order + naming kept stable from the prior `bootloader_api::
+/// info::PixelFormat` alias used while the BIOS path was alive (#380),
+/// so `entry_uefi.rs`'s `match gop_fmt_idx` arms keep compiling without
+/// touching the GOP-format table they were tuned against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PixelFormat {
+    /// `[R, G, B]` byte order at each pixel slot.
+    Rgb,
+    /// `[B, G, R]` byte order at each pixel slot.
+    Bgr,
+    /// 8-bit greyscale (`U8`). Single channel; draw helpers average
+    /// `(r + g + b) / 3` for write.
+    U8,
+    /// Unmapped / reserved variants (Bitmask, BltOnly). Draw helpers
+    /// silently skip writes rather than corrupting the surface.
+    Unknown,
+}
+
+/// Surface metadata for the firmware-mapped framebuffer. Same field
+/// shape the prior `bootloader_api::info::FrameBufferInfo` carried, so
+/// the UEFI entries that constructed it from `GraphicsOutputProtocol`
+/// keep compiling without touching the constructor sites.
+///
+/// `byte_len` / `width` / `height` / `stride` / `bytes_per_pixel`
+/// follow the GOP convention: `stride` is in pixels (not bytes), and
+/// `bytes_per_pixel * stride * height` is `byte_len` exactly when the
+/// firmware-reported surface is contiguous (which it is for both OVMF
+/// and AAVMF on QEMU virt — see UEFI §12.9 PixelsPerScanLine).
+#[derive(Clone, Copy, Debug)]
+pub struct FrameBufferInfo {
+    pub byte_len: usize,
+    pub width: usize,
+    pub height: usize,
+    pub pixel_format: PixelFormat,
+    pub bytes_per_pixel: usize,
+    pub stride: usize,
+}
+
+/// Singleton driver state. `None` until `install` (or
+/// `install_virtio_gpu`) runs and `None` forever if the firmware
+/// didn't supply a framebuffer (text-mode boot).
 static FB: Mutex<Option<Driver>> = Mutex::new(None);
 
 /// 24-bit RGB colour. Channel order at the wire is decided by the
@@ -214,12 +260,13 @@ impl BackBuffer {
     /// black-filled once at boot, then blit the central rect each
     /// frame).
     ///
-    /// Pixel format: 3bpp and 4bpp Bgr/Rgb target surfaces supported.
-    /// 3bpp covers bootloader_api 0.11 under BIOS + `-vga std`; 4bpp
-    /// covers GOP under UEFI (UEFI §12.9 mandates a reserved byte
-    /// after the RGB triple, so every GOP-reachable boot reports
-    /// bpp=4). Other formats are a no-op (same policy `write_pixel`
-    /// follows — never corrupt the surface).
+    /// Pixel format: 4bpp Bgr/Rgb target surfaces (UEFI §12.9
+    /// mandates a reserved byte after the RGB triple, so every
+    /// GOP-reachable boot reports bpp=4). 3bpp surfaces are also
+    /// supported for the legacy text-mode framebuffer shape OVMF
+    /// occasionally reports under `-vga std`. Other formats are a
+    /// no-op (same policy `write_pixel` follows — never corrupt
+    /// the surface).
     ///
     /// On 4bpp target surfaces the trailing reserved byte is zeroed;
     /// GOP firmware + QEMU's GPU both ignore it, so the colour stays
@@ -247,7 +294,7 @@ impl BackBuffer {
         let swap_rb = match info.pixel_format {
             PixelFormat::Bgr => false,
             PixelFormat::Rgb => true,
-            _ => return,
+            PixelFormat::U8 | PixelFormat::Unknown => return,
         };
 
         // Centered placement. `saturating_sub` guards against
@@ -302,10 +349,9 @@ impl BackBuffer {
 }
 
 /// Channel-layout-aware pixel write. Bgr is what QEMU's standard
-/// VGA reports under bootloader_api 0.11; Rgb covers physical
-/// hardware that swaps the byte order. U8 is a greyscale fallback;
-/// other formats are silently skipped rather than corrupting the
-/// surface.
+/// VGA / OVMF GOP reports; Rgb covers physical hardware that swaps
+/// the byte order. U8 is a greyscale fallback; Unknown / unmapped
+/// formats are silently skipped rather than corrupting the surface.
 fn write_pixel(slot: &mut [u8], format: PixelFormat, c: Color) {
     match format {
         PixelFormat::Rgb => { slot[0] = c.r; slot[1] = c.g; slot[2] = c.b; }
@@ -313,7 +359,7 @@ fn write_pixel(slot: &mut [u8], format: PixelFormat, c: Color) {
         PixelFormat::U8  => {
             slot[0] = ((u16::from(c.r) + u16::from(c.g) + u16::from(c.b)) / 3) as u8;
         }
-        _ => {}
+        PixelFormat::Unknown => {}
     }
 }
 
@@ -352,9 +398,9 @@ struct Driver {
 /// Where the front buffer's bytes ultimately end up.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FrontBackend {
-    /// Firmware-mapped MMIO surface (BIOS bootloader_api framebuffer
-    /// or UEFI GraphicsOutputProtocol). The GPU reads it on its own
-    /// vsync; nothing more for `present()` to do.
+    /// Firmware-mapped MMIO surface (UEFI GraphicsOutputProtocol).
+    /// The GPU reads it on its own vsync; nothing more for
+    /// `present()` to do.
     Gop,
     /// virtio-gpu DMA-backed 2D resource attached to scanout 0 (#371).
     /// `present()` calls `virtio_gpu::flush_active_surface()` to
@@ -399,12 +445,12 @@ impl Driver {
 }
 
 /// Install the front buffer + allocate two heap-backed back
-/// buffers. Caller hands in the bootloader-provided byte slice
+/// buffers. Caller hands in the firmware-provided byte slice
 /// (raw ptr + length) plus the format metadata.
 ///
 /// # Safety
 ///
-/// `buffer_ptr` + `buffer_len` must describe the live bootloader-
+/// `buffer_ptr` + `buffer_len` must describe the live firmware-
 /// mapped framebuffer region (lives `'static` for the kernel's
 /// boot). No other code may hold a reference to those bytes when
 /// this is called.
@@ -468,7 +514,7 @@ pub unsafe fn install_virtio_gpu(
 }
 
 /// Surface metadata, lock-free. `None` if the driver wasn't
-/// initialised (text-mode boot).
+/// installed (text-mode boot).
 pub fn info() -> Option<FrameBufferInfo> {
     FB.lock().as_ref().map(|d| d.info)
 }

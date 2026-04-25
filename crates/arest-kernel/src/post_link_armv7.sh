@@ -42,7 +42,7 @@
 #     normal script-execution phase.
 #
 # Why a one-byte patch and not a linker-flavor swap (option 3 from
-# the bisect path documented in `crates/arest-kernel-image/
+# the bisect path documented in `crates/arest-kernel/
 # Dockerfile.uefi-armv7`):
 #   * `rust-lld -flavor link /machine:thumb` -> `error: unknown
 #     /machine argument: thumb`. lld-link only accepts `arm` for

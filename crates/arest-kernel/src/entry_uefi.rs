@@ -1,39 +1,23 @@
 // crates/arest-kernel/src/entry_uefi.rs
 //
-// UEFI entry point (#344). Only compiled for `target_os = "uefi"` —
-// the BIOS path (`x86_64-unknown-none`) keeps its `bootloader_api`
-// entry in `main.rs`'s top-level gated body.
+// UEFI x86_64 entry point. Only compiled for `target_os = "uefi"` +
+// `target_arch = "x86_64"`. Owns the post-#380 boot pipeline now
+// that the BIOS path is gone.
 //
-// Step 1 scaffold: bring the kernel up under UEFI far enough to
-// prove `uefi-rs` links, `#[entry]` wires a `_start` symbol the
-// firmware picks up, and `ConOut` reaches the serial console. The
-// real arch-neutral `kernel_run(BootInfo)` lands after step 2 of the
-// pivot (arch trait extraction) — this file stays tiny until then.
+// Pipeline:
+//   #[entry] efi_main
+//     ├─ heap init (talc against `boot::allocate_pages` 48 MiB)
+//     ├─ pre-EBS banner via firmware ConOut (`arch::uefi::serial`)
+//     ├─ GraphicsOutputProtocol capture (gop_w/gop_h/etc.)
+//     ├─ boot::exit_boot_services
+//     ├─ post-EBS 16550 COM1 cutover
+//     └─ kernel_run_uefi(memory_map, gop_*) -> arch-neutral kernel
+//        body: init_memory, DMA pool, virtio, block, AREST engine,
+//        wasmi (under `feature = "doom"`), Slint launcher, REPL.
 //
-// What this gives us today:
-//   * `cargo build --target x86_64-unknown-uefi --release` produces
-//     an `EFI` executable.
-//   * Boot under QEMU-OVMF:
-//       qemu-system-x86_64 -bios OVMF.fd -kernel arest-kernel.efi
-//     prints the AREST scaffold banner via firmware ConOut.
-//   * BIOS path is untouched — existing x86_64-unknown-none build
-//     still produces the same kernel image.
-//   * `println!` (#344 step 3) routes through `arch::_print`, whose
-//     UEFI implementation (`arch::uefi::serial::_print`) writes via
-//     ConOut. Same macro the BIOS path uses — no UEFI-specific
-//     printing call sites in shared kernel code.
-//
-// What this does not do yet (tracked in #344 follow-up commits):
-//   * ExitBootServices + hand-off to `kernel_run` (step 4).
-//   * Real arch serial driver post-ExitBootServices (16550 on
-//     x86_64-uefi → COM1 in QEMU; PL011 on aarch64-uefi → virt
-//     pl011 in QEMU). Until then `_print` writes silently no-op
-//     after firmware services tear down.
-//   * Populate a `BootInfo` from UEFI GetMemoryMap + Graphics Output
-//     Protocol, so `memory::init` / the framebuffer work the same
-//     way the BIOS path does (step 4).
-//   * aarch64-unknown-uefi — this entry is target-agnostic, but the
-//     kernel body below the arch trait doesn't exist yet (step 5).
+// `println!` routes through `arch::_print` (uefi-rs ConOut pre-EBS,
+// raw 16550 COM1 post-EBS); same macro the aarch64 / armv7 entries
+// use — no UEFI-specific printing call sites in shared kernel code.
 
 #![cfg(target_os = "uefi")]
 
@@ -224,9 +208,8 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 ///      allocator singletons behind the same accessor surface the
 ///      BIOS arm publishes, and print a post-init banner proving
 ///      the page-table singleton is live.
-///   7. Halt. Step 4d (kernel_run handoff) wires the arch-neutral
-///      kernel body once its subsystems (virtio / net / blk / repl)
-///      drop their `cfg(not(target_os = "uefi"))` gates.
+///   7. Halt. The arch-neutral kernel body drives the rest of boot
+///      via `kernel_run_uefi` (defined below).
 #[entry]
 fn efi_main() -> Status {
     // Heap init MUST be the first thing — the global allocator is an
@@ -392,11 +375,9 @@ fn efi_main() -> Status {
 /// the rest of boot: memory init, DMA pool, virtio, block, the
 /// AREST engine, wasmi, and the Doom shim binding.
 ///
-/// Sibling of the BIOS arm's `main.rs::kernel_run(phys_offset)` —
-/// same arch-neutral tail, just parameterised differently because
-/// the UEFI path has the firmware memory map + a captured GOP
-/// framebuffer descriptor to feed in, where the BIOS path gets
-/// those via `bootloader_api::BootInfo`.
+/// Parameterised on the firmware memory map + captured GOP
+/// framebuffer descriptor — both populated in `efi_main` before
+/// `boot::exit_boot_services` invalidates the firmware tables.
 fn kernel_run_uefi(
     memory_map: MemoryMapOwned,
     gop_w: usize,
@@ -739,19 +720,19 @@ fn kernel_run_uefi(
         // BltOnly has none; Bitmask's channel offsets would require
         // a PixelFormat::Unknown construction we don't yet populate.
         let fb_info = match gop_fmt_idx {
-            0 => Some(bootloader_api::info::FrameBufferInfo {
+            0 => Some(crate::framebuffer::FrameBufferInfo {
                 byte_len: gop_size,
                 width: gop_w,
                 height: gop_h,
-                pixel_format: bootloader_api::info::PixelFormat::Rgb,
+                pixel_format: crate::framebuffer::PixelFormat::Rgb,
                 bytes_per_pixel: 4,
                 stride: gop_stride,
             }),
-            1 => Some(bootloader_api::info::FrameBufferInfo {
+            1 => Some(crate::framebuffer::FrameBufferInfo {
                 byte_len: gop_size,
                 width: gop_w,
                 height: gop_h,
-                pixel_format: bootloader_api::info::PixelFormat::Bgr,
+                pixel_format: crate::framebuffer::PixelFormat::Bgr,
                 bytes_per_pixel: 4,
                 stride: gop_stride,
             }),
@@ -878,11 +859,11 @@ fn kernel_run_uefi(
                 // channel order, no separate stride). Build the
                 // FrameBufferInfo to match — the existing write_pixel
                 // Bgr arm + 4bpp blit_doom_frame paths Just Work.
-                let info = bootloader_api::info::FrameBufferInfo {
+                let info = crate::framebuffer::FrameBufferInfo {
                     byte_len: fb_len,
                     width: w as usize,
                     height: h as usize,
-                    pixel_format: bootloader_api::info::PixelFormat::Bgr,
+                    pixel_format: crate::framebuffer::PixelFormat::Bgr,
                     bytes_per_pixel: 4,
                     stride: w as usize,
                 };

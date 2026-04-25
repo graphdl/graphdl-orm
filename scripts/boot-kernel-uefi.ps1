@@ -46,7 +46,7 @@ Write-Host "Building UEFI kernel image (Docker)..." -ForegroundColor Cyan
 $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 try {
-    docker build -t arest-kernel-uefi -f "$repoRoot\crates\arest-kernel-image\Dockerfile.uefi" $repoRoot
+    docker build -t arest-kernel-uefi -f "$repoRoot\crates\arest-kernel\Dockerfile.uefi" $repoRoot
 } finally {
     $ErrorActionPreference = $prevEAP
 }

@@ -1,4 +1,4 @@
-# crates/arest-kernel-image/Dockerfile.uefi-aarch64
+# crates/arest-kernel/Dockerfile.uefi-aarch64
 #
 # aarch64 sibling of `Dockerfile.uefi`. Builds the arest-kernel as an
 # aarch64 PE32+ UEFI executable and boots it under QEMU-aarch64 +
@@ -14,7 +14,7 @@
 #
 # Usage from repo root:
 #   docker build -t arest-kernel-uefi-aarch64 \
-#                -f crates/arest-kernel-image/Dockerfile.uefi-aarch64 .
+#                -f crates/arest-kernel/Dockerfile.uefi-aarch64 .
 #   docker run --rm arest-kernel-uefi-aarch64
 #
 # What you see (scaffold-only today):
@@ -31,8 +31,6 @@ FROM rust:latest AS builder
 # this layer is cache-compatible with the x86 Dockerfile's builder.
 RUN rustup toolchain install nightly --profile minimal \
     && rustup component add rust-src --toolchain nightly \
-    && rustup component add llvm-tools-preview --toolchain nightly \
-    && rustup target add x86_64-unknown-none --toolchain nightly \
     && rustup target add x86_64-unknown-uefi --toolchain nightly \
     && rustup target add aarch64-unknown-uefi --toolchain nightly
 
@@ -56,7 +54,7 @@ COPY crates/arest/src/       crates/arest/src/
 COPY readings/               readings/
 
 # Build the aarch64 UEFI .efi. Override the kernel's default target
-# (`x86_64-unknown-none` from .cargo/config.toml) with --target.
+# (`x86_64-unknown-uefi` from .cargo/config.toml) with --target.
 # Output lands at target/aarch64-unknown-uefi/release/arest-kernel.efi.
 RUN cd crates/arest-kernel \
     && cargo +nightly build --target aarch64-unknown-uefi --release

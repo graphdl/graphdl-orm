@@ -1,14 +1,15 @@
 # crates/arest-kernel/.cargo/config.toml
 #
-# Default build for arest-kernel is bare-metal x86_64 under the stable
-# `x86_64-unknown-none` target (no std, no libc, no host OS). The
-# target comes with rustup via `rustup target add x86_64-unknown-none`
-# and works on the stable toolchain.
+# Default build for arest-kernel is UEFI x86_64 — the only kernel
+# target after #380 deprecated the BIOS path (`x86_64-unknown-none` +
+# rust-osdev `bootloader` Multiboot2 stage). UEFI requires nightly
+# (see rust-toolchain.toml) for the `abi_x86_interrupt` feature.
 #
-# Override per-invocation with --target for a host build — useful
-# during development for quick `cargo check` on unit tests, though
-# the kernel's core logic is no_std and most checks only make sense
-# on the bare-metal target.
+# Override per-invocation with --target for the aarch64 / armv7
+# UEFI arms or a host build:
+#   cargo +nightly check --target aarch64-unknown-uefi
+#   cargo +nightly check --target ./arest-kernel-armv7-uefi.json \
+#       -Z build-std=core,alloc,compiler_builtins -Z unstable-options
 
 [build]
-target = "x86_64-unknown-none"
+target = "x86_64-unknown-uefi"

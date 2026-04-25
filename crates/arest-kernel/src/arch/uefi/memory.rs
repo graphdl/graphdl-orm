@@ -1,10 +1,9 @@
 // crates/arest-kernel/src/arch/uefi/memory.rs
 //
 // Page-table access and physical frame allocation for the UEFI boot
-// path (#344 step 4c). Parallels `arch::x86_64::memory` but consumes
-// the UEFI-provided `MemoryMapOwned` rather than `bootloader_api`'s
-// `BootInfo`, so the two paths can feed the same downstream accessor
-// API (`with_page_table`, `with_frame_allocator`, `usable_frame_count`).
+// path (#344 step 4c). Consumes the UEFI-provided `MemoryMapOwned`
+// and feeds the kernel-side accessor API (`with_page_table`,
+// `with_frame_allocator`, `usable_frame_count`).
 //
 // UEFI post-ExitBootServices state (x86_64):
 //   * CPU is in 64-bit long mode, paging on, CR3 points at a 4-level
@@ -182,13 +181,6 @@ fn carve_from_memory_map(
 ///
 /// # Panics
 /// Panics if `init()` has not been called yet.
-//
-// Unused until step 4d wires `kernel_run` on the UEFI path — the BIOS
-// arm's `with_page_table` is reached via `map_user_page` /
-// `userspace::launch_test_payload`, both `cfg(not(target_os = "uefi"))`
-// gated today. Keeping the helper here (rather than adding it in step
-// 4d) makes the arch surface symmetric between BIOS and UEFI right
-// now, which matters for the shared kernel body call sites.
 #[allow(dead_code)]
 pub fn with_page_table<R>(f: impl FnOnce(&mut OffsetPageTable<'static>) -> R) -> R {
     let mut guard = PAGE_TABLE.lock();
@@ -208,10 +200,7 @@ pub fn with_frame_allocator<R>(f: impl FnOnce(&mut UefiFrameAllocator) -> R) -> 
 /// was carved at boot. Returns `None` when `init()` ran on a memory
 /// map where no reclaimable region (`CONVENTIONAL` or post-EBS
 /// `BOOT_SERVICES_*`) fit the configured pool size —
-/// `virtio::KernelHal::dma_alloc` then panics, same graceful-fail
-/// behavior the BIOS arm has. Same signature as
-/// `arch::x86_64::memory::with_dma_pool` so `virtio.rs` compiles
-/// against either arm's `arch::memory::` re-export.
+/// `virtio::KernelHal::dma_alloc` then panics.
 pub fn with_dma_pool<R>(f: impl FnOnce(&mut DmaPool) -> R) -> Option<R> {
     let mut guard = DMA_POOL.lock();
     guard.as_mut().map(f)
@@ -287,9 +276,7 @@ pub struct UefiFrameAllocator {
 // exclusively and mediate all access through the `spin::Mutex` around
 // the singleton. Concurrent CPUs (SMP bring-up) are not online until
 // well after `init()` returns. Wrapping is what every other no_std
-// OS doing the same firmware-handoff does (redox, rCore), and the
-// BIOS arm's equivalent `&'static MemoryRegions` only skips the
-// declaration because `bootloader_api` already `impl`'s `Send` itself.
+// OS doing the same firmware-handoff does (redox, rCore).
 unsafe impl Send for UefiFrameAllocator {}
 
 impl UefiFrameAllocator {

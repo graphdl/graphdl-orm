@@ -1,4 +1,4 @@
-# crates/arest-kernel-image/Dockerfile.boot-img
+# crates/arest-kernel/Dockerfile.boot-img
 #
 # Wraps the aarch64-unknown-uefi kernel into an Android boot.img
 # (header v0) so it can be flashed with `fastboot boot boot.img` on
@@ -44,7 +44,7 @@
 #
 # Usage from repo root:
 #   docker build -t arest-kernel-boot-img \
-#                -f crates/arest-kernel-image/Dockerfile.boot-img .
+#                -f crates/arest-kernel/Dockerfile.boot-img .
 #   docker create --name boot-img-extract arest-kernel-boot-img
 #   docker cp boot-img-extract:/boot.img target/boot.img
 #   docker rm boot-img-extract
@@ -58,8 +58,6 @@ FROM rust:latest AS builder
 
 RUN rustup toolchain install nightly --profile minimal \
     && rustup component add rust-src --toolchain nightly \
-    && rustup component add llvm-tools-preview --toolchain nightly \
-    && rustup target add x86_64-unknown-none --toolchain nightly \
     && rustup target add x86_64-unknown-uefi --toolchain nightly \
     && rustup target add aarch64-unknown-uefi --toolchain nightly
 

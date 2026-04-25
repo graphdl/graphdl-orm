@@ -1,4 +1,4 @@
-# crates/arest-kernel-image/Dockerfile.uefi-armv7
+# crates/arest-kernel/Dockerfile.uefi-armv7
 #
 # armv7 sibling of `Dockerfile.uefi-aarch64` and `Dockerfile.uefi`.
 # Builds the arest-kernel as a 32-bit ARM PE32+ UEFI executable
@@ -18,7 +18,7 @@
 #
 # Usage from repo root:
 #   docker build -t arest-kernel-uefi-armv7 \
-#                -f crates/arest-kernel-image/Dockerfile.uefi-armv7 .
+#                -f crates/arest-kernel/Dockerfile.uefi-armv7 .
 #   docker run --rm arest-kernel-uefi-armv7
 #
 # What you see (kernel-side — virtio-blk-capable firmware is now in
@@ -181,8 +181,6 @@ ARG RUST_NIGHTLY=nightly-2026-04-21
 RUN rustup toolchain install ${RUST_NIGHTLY} --profile minimal \
     && rustup default ${RUST_NIGHTLY} \
     && rustup component add rust-src --toolchain ${RUST_NIGHTLY} \
-    && rustup component add llvm-tools-preview --toolchain ${RUST_NIGHTLY} \
-    && rustup target add x86_64-unknown-none --toolchain ${RUST_NIGHTLY} \
     && rustup target add x86_64-unknown-uefi --toolchain ${RUST_NIGHTLY} \
     && rustup target add aarch64-unknown-uefi --toolchain ${RUST_NIGHTLY} \
     && ln -sf /usr/local/rustup/toolchains/${RUST_NIGHTLY}-x86_64-unknown-linux-gnu /usr/local/rustup/toolchains/nightly-x86_64-unknown-linux-gnu
