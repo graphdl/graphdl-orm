@@ -26,3 +26,4 @@
 
 pub mod zip;
 pub mod mime;
+pub mod search;
