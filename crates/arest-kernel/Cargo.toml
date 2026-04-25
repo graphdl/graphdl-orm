@@ -25,6 +25,18 @@ license = "AGPL-3.0-or-later"
 # ring-3 test payload that exercises the syscall gate, then halts via
 # QEMU isa-debug-exit. When off (default), behavior is unchanged.
 ring3-smoke = []
+# Enables the Doom launcher app + its WASM-backed game loop (#455 +
+# #456 Track VVV). Off by default because the baked
+# jacobenget/doom.wasm v0.1.0 binary is GPL-2.0 (per #396 license
+# decision); the default kernel build ships AGPL-3.0-or-later only.
+# Opting in via `--features doom` brings in the Doom WASM
+# instantiation path, registers the third app icon in the boot
+# launcher, and reaches `crate::doom::*` host shims. Pulls in no
+# extra deps (the wasmi engine + doom_assets bytes are already
+# unconditionally available on the UEFI x86_64 build); the gate is
+# pure source-level so the .efi footprint matches the licensing
+# story. See `crates/arest-kernel/doom_assets/README.md`.
+doom = []
 default = []
 
 [[bin]]

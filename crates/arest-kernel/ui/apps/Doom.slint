@@ -1,0 +1,194 @@
+// crates/arest-kernel/ui/apps/Doom.slint
+//
+// AREST kernel — third Slint app: Doom (#455 Track VVV).
+//
+// Joins HATEOAS (Track SSS #429) and REPL (Track TTT #430) as the
+// third launchable app inside Track UUU's #431 boot launcher. Mirrors
+// their Window-derived shape so the launcher's show/hide navigation
+// (`MinimalSoftwareWindow` swap, see `ui_apps::launcher`) treats Doom
+// the same way: Esc returns to the launcher, key events route to the
+// Slint Window via Track QQ's #428 keyboard drainer.
+//
+// Layout: a single `Image` filling the body that displays the WASM
+// guest's framebuffer. The Rust glue (`crate::ui_apps::doom::build_app`)
+// drives the per-frame loop:
+//   1. pump pending keystrokes into the guest
+//      (`crate::doom::pump_keys_into_guest`),
+//   2. call the guest's `tickGame` export,
+//   3. capture the BGRA-ordered 640x400 framebuffer the guest's
+//      `drawFrame` host-import received,
+//   4. wrap the captured bytes in a `slint::Image::from_rgba8` (after
+//      a BGRA -> RGBA channel swap; see `ui_apps::doom` for the
+//      conversion rationale and Doom's pixel layout citation),
+//   5. set the `frame` property here so the Image element repaints.
+//
+// The Image fills the centre area; outside the 640x400 native frame
+// the Theme background shows through. `image-fit: contain` preserves
+// the aspect ratio if the framebuffer is wider than 640x400 (the
+// WASM Doom guest is hard-coded to 640x400 per
+// `doom_assets/README.md`).
+//
+// Multi-entry pattern: per Track SSS's #429 convention, this file
+// is re-exported via `HateoasBrowser.slint` (the slint-build entry)
+// so the slint compiler walks the import graph and emits Doom
+// alongside HateoasBrowser + Repl + AppShell + AppLauncher into the
+// single generated `HateoasBrowser.rs` reached by
+// `slint::include_modules!()` in `arch/uefi/slint_backend.rs`. No
+// build.rs change needed.
+
+import { AppShell, Theme, ThemeMode } from "../AppShell.slint";
+import { Button, ButtonVariant } from "../components/Button.slint";
+
+export component Doom inherits Window {
+    // ---- Inputs (driven by the Rust glue) -------------------------
+
+    // Per-frame Doom framebuffer, as an RGBA8 image. The Rust glue
+    // re-binds this every tic by calling
+    // `set_frame(slint::Image::from_rgba8(SharedPixelBuffer))`. When
+    // the guest hasn't run yet (initial render) the property is the
+    // default empty image and the Image element shows a transparent
+    // surface — the Theme background fills the area instead.
+    in property <image> frame;
+
+    // Status text shown in the footer ("Doom — Esc to return", or
+    // an init-state hint while the guest is bootstrapping). Rust
+    // glue updates this from the per-frame loop so the user sees
+    // when the WASM module has reached the first tick.
+    in property <string> status-text: "Loading Doom WASM...";
+
+    // ---- Callbacks (Rust glue mutates state) ----------------------
+
+    // Theme toggle, surfaced through the top bar so the user can
+    // flip dark/light from inside Doom too. Mirrors the other apps;
+    // the actual mode flip happens inside `Theme.toggle-mode()` in
+    // the Slint handler. The host's hook for persisting the choice
+    // later is the matching `on_theme_toggled` registration.
+    callback theme-toggled();
+
+    title: "AREST — Doom";
+    background: Theme.surface;
+    default-font-family: Theme.type-body.family;
+    default-font-size: Theme.type-body.size;
+    preferred-width: 1024px;
+    preferred-height: 720px;
+    forward-focus: focus-scope;
+
+    VerticalLayout {
+        spacing: 0px;
+
+        // ----- Top bar: title + theme toggle ------------------------
+        // Mirrors HateoasBrowser / REPL / Launcher styling so all four
+        // surfaces feel continuous; sharing the tokens (neutral-100,
+        // border, type-h2, spacing-lg) keeps the visual continuity
+        // without an architectural dependency on AppShell (whose
+        // VerticalLayout content slot would compete with this app's
+        // image-centric body).
+        Rectangle {
+            background: Theme.neutral-100;
+            min-height: 56px;
+
+            HorizontalLayout {
+                padding-left: Theme.spacing-lg;
+                padding-right: Theme.spacing-lg;
+                padding-top: Theme.spacing-md;
+                padding-bottom: Theme.spacing-md;
+                spacing: Theme.spacing-md;
+                alignment: space-between;
+
+                Text {
+                    text: "Doom";
+                    color: Theme.text-primary;
+                    font-family: Theme.type-h2.family;
+                    font-weight: Theme.type-h2.weight;
+                    font-size: Theme.type-h2.size;
+                    vertical-alignment: center;
+                }
+
+                Button {
+                    text: Theme.mode == ThemeMode.dark ? "Light" : "Dark";
+                    variant: ButtonVariant.ghost;
+                    clicked => {
+                        Theme.toggle-mode();
+                        root.theme-toggled();
+                    }
+                }
+            }
+
+            // 1px bottom border.
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: Theme.border;
+            }
+        }
+
+        // ----- Body: Doom framebuffer -------------------------------
+        // The actual Doom render surface. `image-fit: contain` keeps
+        // the 4:2.5 (640x400) aspect ratio centred regardless of the
+        // host framebuffer dimensions captured at boot — different
+        // OVMF / panel sizes paint the same Doom view with letter-
+        // boxing on the long axis. A FocusScope wraps the Image so
+        // the launcher's keyboard drainer (Track QQ #428) routes key
+        // events here while this Window is shown; without a focus
+        // target Slint would silently drop key dispatches.
+        Rectangle {
+            background: #000000;
+            vertical-stretch: 1;
+
+            focus-scope := FocusScope {
+                // We don't need to react to specific keys here — the
+                // `crate::ui_apps::doom` per-frame loop calls
+                // `crate::doom::pump_keys_into_guest` which drains
+                // the same `arch::uefi::keyboard` ring directly.
+                // The FocusScope just exists so Slint accepts the
+                // keyboard dispatch (otherwise the key events would
+                // bubble to nothing and Esc-to-launcher would still
+                // work — the launcher intercepts Esc before
+                // dispatch — but other keys would be silently lost
+                // before reaching the doom pump).
+                key-pressed(event) => {
+                    // Reject so the launcher's intercept can still
+                    // see the keystroke and the Rust-side keyboard
+                    // ring stays the source of truth.
+                    return reject;
+                }
+
+                Image {
+                    source: root.frame;
+                    image-fit: contain;
+                    width: parent.width;
+                    height: parent.height;
+                }
+            }
+        }
+
+        // ----- Status footer ----------------------------------------
+        Rectangle {
+            background: Theme.neutral-100;
+            min-height: 28px;
+
+            // 1px top border.
+            Rectangle {
+                y: 0;
+                height: 1px;
+                background: Theme.border;
+            }
+
+            HorizontalLayout {
+                padding-left: Theme.spacing-lg;
+                padding-right: Theme.spacing-lg;
+                padding-top: Theme.spacing-xs;
+                padding-bottom: Theme.spacing-xs;
+
+                Text {
+                    text: root.status-text;
+                    color: Theme.text-muted;
+                    font-family: Theme.type-caption.family;
+                    font-weight: Theme.type-caption.weight;
+                    font-size: Theme.type-caption.size;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

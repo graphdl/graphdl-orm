@@ -1265,11 +1265,16 @@ mod doom_key {
 /// representation, and Doom's input layer uppercases internally for
 /// any binding that cares.
 ///
-/// `#[allow(dead_code)]` because the only caller is
+/// `#[allow(dead_code)]` because callers used to be limited to
 /// `pump_keys_into_guest`, which is itself scaffolded for the
-/// kernel_run handoff (#376).
+/// kernel_run handoff (#376). Track VVV (#455) added a second
+/// caller — `crate::ui_apps::doom::DoomApp::drain_keystrokes_intercept_esc`
+/// — which needs to translate-then-dispatch one key at a time so
+/// the launcher's super-loop can intercept Esc BEFORE the
+/// keystroke reaches the guest's `reportKeyDown` export. `pub`
+/// because that caller lives in a sibling module.
 #[allow(dead_code)]
-fn translate_decoded_key(key: DecodedKey) -> Option<u8> {
+pub fn translate_decoded_key(key: DecodedKey) -> Option<u8> {
     use doom_key::*;
     match key {
         DecodedKey::Unicode(ch) => match ch {

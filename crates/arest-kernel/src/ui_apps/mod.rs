@@ -25,3 +25,10 @@
 pub mod hateoas;
 pub mod launcher;
 pub mod repl;
+// Doom (#455 + #456 Track VVV). Gated behind `feature = "doom"`
+// because the wasmi-instantiated jacobenget/doom.wasm v0.1.0 binary
+// is GPL-2.0; the default kernel build ships AGPL-3.0-or-later only
+// (#396). With the feature off, the app submodule is absent from the
+// crate graph and `launcher.rs` skips the Doom button row.
+#[cfg(feature = "doom")]
+pub mod doom;

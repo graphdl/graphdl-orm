@@ -969,6 +969,19 @@ fn kernel_run_uefi(
     // these imports can be instantiated against this linker in a
     // later commit without needing to re-register.
     //
+    // Track VVV (#455 + #456): everything below is gated behind
+    // `cfg(feature = "doom")` so the default kernel build (AGPL-3.0-
+    // or-later) does not reach the GPL-2.0 jacobenget/doom.wasm
+    // path. `--features doom` opts in. The interactive Doom app
+    // (third icon in the launcher splash) lives in
+    // `crate::ui_apps::doom` and is the new home for the
+    // initGame -> tickGame -> drawFrame pump that this smoke
+    // proved out at boot. We keep the boot-time smoke too so the
+    // banner stream still shows the WASM pipeline lighting up
+    // before the user reaches the launcher.
+    #[cfg(feature = "doom")]
+    {
+    //
     // Engine config: `consume_fuel(true)` — fuel metering MUST be on
     // before instantiation so the same engine accepts `Store::set_fuel`
     // calls below. Doom's `initGame` + `tickGame` together drive the
@@ -1171,6 +1184,16 @@ fn kernel_run_uefi(
         // banner is informative-only.
         println!("  doom:     WASM binary absent (fresh clone), skipping instantiate");
     }
+    } // end #[cfg(feature = "doom")] block
+
+    #[cfg(not(feature = "doom"))]
+    {
+        // Default kernel build — Doom WASM (GPL-2.0) is gated out per
+        // #396 / Track VVV. The launcher (#431) renders only the
+        // HATEOAS + REPL icons; rebuilding with `--features doom`
+        // brings the third icon in.
+        println!("  doom:     skipped (build without --features doom; AGPL-3.0-or-later only)");
+    }
 
     // #365: REPL on UEFI x86_64 — full #183 BIOS parity. The IDT
     // (#363), keyboard IRQ pipeline (#364), and 1 kHz PIT (#379)
@@ -1198,6 +1221,9 @@ fn kernel_run_uefi(
     // keyboard REPL online (#183)" line so a smoke harness can
     // pattern-match the same family of phrases on either path.
     println!("  repl:     line-buffered keyboard REPL online (#183/#365)");
+    #[cfg(feature = "doom")]
+    println!("  ui:       launcher running (HATEOAS + REPL + Doom)");
+    #[cfg(not(feature = "doom"))]
     println!("  ui:       launcher running (HATEOAS + REPL)");
     println!();
 
