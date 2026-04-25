@@ -17,7 +17,7 @@ name = "arest-kernel"
 version = "0.1.0"
 edition = "2021"
 description = "AREST bare-metal kernel for x86_64"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 
 [features]
 # Enables the ring-3 smoke test boot path (Sec-6). When on, kernel_main

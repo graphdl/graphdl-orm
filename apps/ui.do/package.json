@@ -2,6 +2,7 @@
   "name": "@arest/ui.do",
   "version": "0.0.1",
   "private": true,
+  "license": "MIT",
   "description": "AREST front-end — mdxui admin shell backed by direct calls to the AREST worker's /arest/* surface.",
   "type": "module",
   "scripts": {
