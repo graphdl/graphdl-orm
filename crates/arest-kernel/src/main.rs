@@ -51,6 +51,15 @@ extern crate alloc;
 mod entry_uefi;
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 mod entry_uefi_aarch64;
+// armv7 UEFI entry (#346d / #389). Sibling of `entry_uefi_aarch64` —
+// the runtime harness for the 32-bit ARM UEFI build. Pre-EBS banner
+// via PL011 MMIO + ExitBootServices + arch::init_memory + virtio-mmio
+// scan + driver bring-up. Replaces the compile-only stubs in
+// `arch::armv7::runtime_stub` (which was always documented as a
+// placeholder until this entry harness landed). Same `#[entry]` macro
+// the aarch64 / x86_64 arms use.
+#[cfg(all(target_os = "uefi", target_arch = "arm"))]
+mod entry_uefi_armv7;
 
 // Doom WASM host-shim (#270/#271). Publishes the `DoomHost` trait
 // and the `bind_doom_imports` helper that registers the 10 guest-
