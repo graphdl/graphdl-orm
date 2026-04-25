@@ -70,6 +70,26 @@ linuxkpi = []
 # exist (foundation slice #460 was driver-mode focused), the stub keeps
 # the module compile-clean and the registration still emits the facts.
 qt-adapter = []
+# gtk-adapter (#488 Track IIII, third adapter slice). Loads
+# libgtk-4.so.1 + libgobject-2.0.so.0 + libglib-2.0.so.0 via the
+# linuxkpi shim's library-loading path and registers the 12 GTK 4
+# widget classes (GtkButton / GtkEntry / GtkListView / GtkCalendar /
+# GtkDialog / GtkPicture / GtkScale / GtkDropDown / GtkProgressBar /
+# GtkCheckButton / GtkNotebook / GtkBox) as `Component` cells via
+# `ImplementationBinding` facts (mirroring DDDD's #485 declarations
+# in `readings/ui/components.md`). After this feature is enabled,
+# AREST apps can compose GTK widgets just like Slint and Qt widgets
+# — all at the metamodel level. Off by default because the typical
+# kernel build host (Windows + UEFI cross-compile) has no libgtk-4
+# to dlopen, so the loader falls back to a `LibraryNotFound` stub
+# and Component cells populate with class-name string Symbols only
+# (null GType pointers per the same constraint GGGG documented for
+# the Qt adapter). Composition + selection (real widget rendering)
+# lands in #489-#491. No extra deps — the loader rides on linuxkpi's
+# library-loading path; if that path doesn't yet exist (foundation
+# slice #460 was driver-mode focused), the stub keeps the module
+# compile-clean and the registration still emits the facts.
+gtk-adapter = []
 default = []
 
 [[bin]]
