@@ -162,6 +162,40 @@ Wine Prefix Path is a value type.
        a *directory* path so the slash keeps the join with relative
        sub-paths (`drive_c/users/wineuser/...`) total. -->
 
+Installer URL is a value type.
+  <!-- Source location of the Wine App's installer binary. Either an
+       `http(s)://` / `file://` URL the `installer_fetch` module
+       passes to `curl` / `Invoke-WebRequest`, or a host-filesystem
+       path for pre-staged binaries (licensed apps where the upstream
+       URL sits behind a login wall). The runtime layer (#505)
+       caches the fetched binary under
+       `<prefix>/drive_c/_install/<filename>`; re-runs short-circuit
+       on the cached file. -->
+
+Installer Filename is a value type.
+  <!-- Cache-side filename for the fetched installer (e.g.
+       `npp-installer.exe`, `SteamSetup.exe`, `SpotifyFullSetup.exe`).
+       Decoupled from the URL because URLs may use redirect tokens or
+       query strings that don't yield a stable filename, and because
+       the installer-runner subprocess takes the local path directly.
+       The cache key is `(prefix Directory, filename)`; two Wine Apps
+       cannot share a prefix Directory by construction (#481), so
+       this is uniqueness-safe. -->
+
+Install Status is a value type.
+  The possible values of Install Status are
+    'Downloaded', 'Installing', 'Installed', 'Failed'.
+  <!-- State-machine state for the per-app install lifecycle (#505,
+       #212). Transitions: nothing → Downloaded (binary fetched but
+       wine not yet run) → Installing (in-progress / blocked, e.g.
+       fetcher unavailable on PATH) → Installed (wine ran, marker
+       written) → Failed (non-zero exit). The state is materialised
+       as a sequence of facts in the `Wine App install Status` cell
+       — one fact per transition, the final state being the last
+       fact. Mirrors the Process state-machine-as-derivation pattern
+       (#212) so the runtime layer can re-derive the current state
+       from the fact stream rather than maintain a side index. -->
+
 ## Fact Types
 
 ### Wine App
@@ -320,6 +354,38 @@ Wine App has Wine Prefix Path.
        follows transitively from `No two Wine Apps share the same
        Name`; restating it here makes the disjoint-prefix invariant
        readable at the constraint surface. -->
+
+### Installer fetch + run (#505)
+
+Wine App has Installer URL.
+  Each Wine App has at most one Installer URL.
+  <!-- Source location of the installer binary. Either a URL the
+       fetcher hands to curl / Invoke-WebRequest, or a host-filesystem
+       path for pre-staged binaries. The orchestrator
+       (`cli::wine_install`) reads this fact at `arest run` time and
+       transitions to `Installing` if absent. Free multiplicity-of-1
+       (at most one) so the readings can express 'no installer
+       declared yet' without violating an obligatory constraint;
+       authors who need it mandatory layer that on top per-app. -->
+
+Wine App has Installer Filename.
+  Each Wine App has at most one Installer Filename.
+  <!-- Cache-side filename for the fetched binary
+       (`<prefix>/drive_c/_install/<filename>`). Companion to
+       Installer URL — URLs with redirects or query strings don't
+       yield stable filenames, and the wine-runner subprocess takes
+       the local path directly. -->
+
+Wine App has Install Status.
+  <!-- State-machine fact stream for the per-app install lifecycle
+       (#505 / #212). Each transition pushes one fact onto the
+       `Wine_App_install_status` cell; the final state is the last
+       fact in the cell. Free multiplicity (no `at most one` clause)
+       so the entire transition history is materialised — a Failed
+       state followed by a re-run that lands on Installed leaves
+       both facts in place, with Installed dominating because it is
+       most recent. The runtime layer (#506) reads the last fact to
+       decide whether to launch. -->
 
 ## Constraints
 
@@ -877,3 +943,61 @@ External System 'protondb' has Kind 'rest'.
   <!-- The ingest pipeline (#462e) walks the per-app reports endpoint
        and folds each user's compat rating into the Wine App graph.
        Auth header is omitted — the public endpoints are unauth. -->
+
+### Installer fetch + run instance facts (#505)
+
+<!-- Installer URLs + cache filenames for the 10 Wine Apps declared
+     above. URLs point at upstream-hosted installer binaries (or
+     pre-staged paths for licensed apps where the upstream URL sits
+     behind a login wall). The runtime layer (#505,
+     `cli::wine_install`) consumes these via the
+     `Wine_App_has_Installer_URL` / `Wine_App_has_Installer_Filename`
+     cells.
+
+     End-to-end validation in the unit suite uses Notepad++ because
+     its installer is small (~4MB) and unauthed. The other nine are
+     declared for completeness; their actual fetch + run paths are
+     exercised at smoke-test time, not unit-test time.
+
+     Note the URL pins point at specific versions where the upstream
+     publishes per-version download paths (Notepad++, Notion, VSCode,
+     Spotify) and at floating "latest" paths where the publisher
+     does not (Steam, AutoHotkey). For licensed-only apps (Office,
+     Photoshop) the URL is a host-filesystem path the user populates
+     out-of-band; the fetcher copies rather than downloads. -->
+
+Wine App 'notepad-plus-plus' has Installer URL 'https://github.com/notepad-plus-plus/notepad-plus-plus/releases/download/v8.6.4/npp.8.6.4.Installer.exe'.
+Wine App 'notepad-plus-plus' has Installer Filename 'npp.8.6.4.Installer.exe'.
+
+Wine App 'office-2016-word' has Installer URL '/var/wine/staged/office-2016-setup.exe'.
+Wine App 'office-2016-word' has Installer Filename 'office-2016-setup.exe'.
+  <!-- Office requires a licensed installer; the URL field carries a
+       host-filesystem path the user populates out-of-band. The
+       fetcher copies (rather than downloads) when the value parses
+       as a path rather than a URL. -->
+
+Wine App 'photoshop-cs6' has Installer URL '/var/wine/staged/photoshop-cs6-setup.exe'.
+Wine App 'photoshop-cs6' has Installer Filename 'photoshop-cs6-setup.exe'.
+  <!-- Pre-staged like Office; Photoshop CS6 is no longer
+       publicly downloadable from Adobe. -->
+
+Wine App 'autohotkey-v1' has Installer URL 'https://www.autohotkey.com/download/ahk-install.exe'.
+Wine App 'autohotkey-v1' has Installer Filename 'ahk-install.exe'.
+
+Wine App 'notion-desktop' has Installer URL 'https://www.notion.so/desktop/windows/download'.
+Wine App 'notion-desktop' has Installer Filename 'Notion-Setup.exe'.
+
+Wine App 'total-commander' has Installer URL 'https://www.ghisler.com/download/tcmd1100x32_64.exe'.
+Wine App 'total-commander' has Installer Filename 'tcmd1100x32_64.exe'.
+
+Wine App 'vscode' has Installer URL 'https://code.visualstudio.com/sha/download?build=stable&os=win32-x64-user'.
+Wine App 'vscode' has Installer Filename 'VSCodeUserSetup-x64.exe'.
+
+Wine App 'spotify' has Installer URL 'https://download.scdn.co/SpotifyFullSetup.exe'.
+Wine App 'spotify' has Installer Filename 'SpotifyFullSetup.exe'.
+
+Wine App 'steam-windows' has Installer URL 'https://cdn.cloudflare.steamstatic.com/client/installer/SteamSetup.exe'.
+Wine App 'steam-windows' has Installer Filename 'SteamSetup.exe'.
+
+Wine App '7-zip' has Installer URL 'https://www.7-zip.org/a/7z2407-x64.exe'.
+Wine App '7-zip' has Installer Filename '7z2407-x64.exe'.
