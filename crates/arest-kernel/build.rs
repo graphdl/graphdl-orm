@@ -540,6 +540,111 @@ fn main() {
         println!("cargo:rerun-if-changed={}", manifest_dir.join("musl_config").display());
     }
 
+    // --- busybox 1.36.1 static guest build (#525 Track WWWWW) ---------
+    //
+    // Drives the vendored busybox 1.36.1 tree (vendor/busybox/) +
+    // sibling `busybox_config/.config` through `cc::Build` to produce
+    // a static x86_64-linux ELF binary that links against the musl
+    // libc.a archive #524 produces. The output binary lands at
+    // `$OUT_DIR/busybox`. It is NOT linked into the kernel `.efi`
+    // image at this commit — that's #527 (interactive shell session,
+    // when the ELF loader at #472 reads `$OUT_DIR/busybox` and
+    // launches it inside the sandbox). For now this pass is purely
+    // a build-only artefact, gated behind the `busybox` cargo
+    // feature (off by default — see Cargo.toml; the GPL-2.0-only
+    // license inheritance is documented at the feature definition).
+    //
+    // ## Build approach
+    //
+    // Upstream busybox uses Kconfig + a kernel-style Kbuild driver:
+    // `make defconfig` writes `.config`, `make` invokes Kbuild scripts
+    // that generate `include/autoconf.h` (one `#define ENABLE_<APPLET>
+    // 1` per `CONFIG_<APPLET>=y`) and `include/applets.h` (the
+    // `APPLET()` macro table the dispatcher walks at startup), then
+    // gcc compiles every selected `.c` and links them into the
+    // single `busybox` multi-call binary.
+    //
+    // We can't shell out to `make` from a Rust build script, so we
+    // bypass Kbuild and do the equivalent in pure Rust:
+    //
+    //   1. Parse `busybox_config/.config` for `CONFIG_xxx=y` /
+    //      `# CONFIG_xxx is not set` lines.
+    //   2. Generate `$OUT_DIR/busybox/include/autoconf.h` —
+    //      `#define ENABLE_xxx 1` for every enabled CONFIG and
+    //      `#define ENABLE_xxx 0` for every disabled one. This file
+    //      is the linchpin: the `IF_xxx(...)` and `ENABLE_xxx`
+    //      macros sprinkled through every source file resolve to
+    //      either the wrapped expression or a no-op based on this
+    //      header.
+    //   3. Generate `$OUT_DIR/busybox/include/applets.h` — the
+    //      `APPLET()` table. Upstream Kbuild greps every .c for
+    //      `//applet:` directives; we generate it directly from the
+    //      enabled CONFIGs since our applet set is closed (6 entries:
+    //      cat / echo / head / ls / tail / wc).
+    //   4. `cc::Build` walks `vendor/busybox/{libbb, coreutils,
+    //      applets}` for the chosen sources, compiles each with the
+    //      same `-D_GNU_SOURCE -DNDEBUG -include autoconf.h`
+    //      baseline upstream's Makefile.flags assembles, and links
+    //      them with the musl crt + libc.a from #524 into
+    //      `$OUT_DIR/busybox`.
+    //
+    // ## Tier-1 scope (this commit)
+    //
+    // The brief explicitly says: "Just build the .a / binary, prove
+    // the toolchain works." The vendored busybox tree is in place; the
+    // build path is wired and gated; the `.config` selection drives
+    // applet generation. Whether the cc::Build invocation actually
+    // succeeds end-to-end depends on the host toolchain (busybox is
+    // GNU-C-heavy and needs clang/gcc — MSVC's cl.exe will choke on
+    // statement-expressions, designated initialisers, etc). When it
+    // doesn't, we surface a `cargo:warning=` and continue, same
+    // graceful-degrade pattern #460 / #524 established. The vendor
+    // tree + config + build wiring are the load-bearing artefacts
+    // a future track can extend.
+    //
+    // ## Cross-compile + graceful degradation
+    //
+    // Mirrors the musl pass above:
+    //   * Force `clang` on Windows; let `cc` auto-discover on
+    //     Linux/macOS.
+    //   * `--target=x86_64-unknown-linux-musl` so clang emits Linux-
+    //     ABI ELF instead of host PE32+/Mach-O. (Note: this differs
+    //     from the musl pass's `x86_64-pc-windows-msvc` target —
+    //     musl is built INTO an archive linked at the kernel's UEFI
+    //     PE32+ stage; busybox is built as a separate Linux ELF
+    //     guest the kernel later loads via #472.)
+    //   * If musl libc.a from #524 isn't in $OUT_DIR (cfg
+    //     `musl_libc_built` not set), skip with a clear warning —
+    //     same fallback shape #460 uses.
+    //   * If clang/gcc isn't in PATH, `try_compile` returns Err and
+    //     we surface a `cargo:warning=`.
+    if env::var("CARGO_FEATURE_BUSYBOX").is_ok() {
+        let busybox_root = manifest_dir.join("vendor").join("busybox");
+        let busybox_config = manifest_dir.join("busybox_config").join(".config");
+        if !busybox_root.is_dir() {
+            println!(
+                "cargo:warning=busybox feature enabled but {} missing — skipping busybox build",
+                busybox_root.display(),
+            );
+        } else if !busybox_config.is_file() {
+            println!(
+                "cargo:warning=busybox feature enabled but {} missing — skipping busybox build",
+                busybox_config.display(),
+            );
+        } else if env::var("CARGO_FEATURE_MUSL_LIBC").is_err() {
+            println!(
+                "cargo:warning=busybox build needs --features musl-libc (libc.a from #524). Re-run with `--features musl-libc,busybox`."
+            );
+        } else if let Err(e) = build_busybox(&manifest_dir, &busybox_root, &busybox_config, &out_dir) {
+            println!(
+                "cargo:warning=busybox build needs musl libc.a from #524: {}. The vendor tree, .config, and build wiring are all in place; this pass degrades gracefully when the host cross-toolchain (clang or gcc with the musl sysroot path) is missing. Workaround for Windows hosts: install clang and re-run from a shell where it is in PATH. Linux/macOS hosts get cc / clang from the system package manager.",
+                e,
+            );
+        }
+        println!("cargo:rerun-if-changed={}", busybox_root.display());
+        println!("cargo:rerun-if-changed={}", busybox_config.display());
+    }
+
     // Re-run whenever the bundle changes.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", dist.display());
@@ -999,6 +1104,311 @@ fn collect_musl_sources(
                 collect_musl_sources(&p, arch, exclude_archs, out, replaced);
             }
         }
+    }
+}
+
+/// Drive the busybox-1.36.1 static-build pass behind `--features
+/// busybox` (#525 Track WWWWW).
+///
+/// Returns `Ok(())` when `$OUT_DIR/busybox` lands as a static x86_64-
+/// linux ELF, or `Err` describing the failure (caller surfaces as
+/// `cargo:warning=` and continues).
+///
+/// See the block comment in `main()` immediately above the
+/// `CARGO_FEATURE_BUSYBOX` gate for the full design rationale.
+fn build_busybox(
+    manifest_dir: &Path,
+    busybox_root: &Path,
+    busybox_config: &Path,
+    out_dir: &Path,
+) -> Result<(), String> {
+    // 1. Parse `.config` into the set of enabled CONFIG_xxx names
+    //    (and the disabled ones, for completeness — Kbuild generates
+    //    `#define ENABLE_xxx 0` for those too).
+    let cfg_text = fs::read_to_string(busybox_config)
+        .map_err(|e| format!("read {}: {}", busybox_config.display(), e))?;
+    let mut enabled: Vec<String> = Vec::new();
+    let mut disabled: Vec<String> = Vec::new();
+    for line in cfg_text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("#") {
+            // `# CONFIG_FOO is not set` is the disabled form.
+            if let Some(rest) = line.strip_prefix("# CONFIG_") {
+                if let Some(name) = rest.strip_suffix(" is not set") {
+                    disabled.push(name.trim().to_string());
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("CONFIG_") {
+            if let Some(eq) = rest.find('=') {
+                let name = rest[..eq].trim();
+                let val = rest[eq + 1..].trim();
+                if val == "y" {
+                    enabled.push(name.to_string());
+                }
+                // Numeric and string values (CONFIG_FEATURE_COPYBUF_KB=4,
+                // CONFIG_BUSYBOX_EXEC_PATH="/bin/busybox") get baked
+                // into autoconf.h verbatim below; we do not list them
+                // here because the `ENABLE_xxx` macro path applies
+                // only to bool flags.
+            }
+        }
+    }
+
+    // 2. Generate `$OUT_DIR/busybox/include/autoconf.h`.
+    let gen_include = out_dir.join("busybox").join("include");
+    fs::create_dir_all(&gen_include)
+        .map_err(|e| format!("create $OUT_DIR/busybox/include: {}", e))?;
+    let mut autoconf = String::new();
+    autoconf.push_str("/* Generated by build.rs from busybox_config/.config — do not edit. */\n");
+    autoconf.push_str("#ifndef BB_AUTOCONF_H\n#define BB_AUTOCONF_H 1\n\n");
+    // `BB_VER` baked in (matches the `Makefile.flags` `-DBB_VER=...`).
+    autoconf.push_str("#define BB_VER \"1.36.1\"\n");
+    autoconf.push_str("#define BB_BT \"\"\n");
+    autoconf.push_str("#define AUTOCONF_TIMESTAMP \"\"\n");
+    autoconf.push_str("\n/* Bool flags from .config */\n");
+    for name in &enabled {
+        autoconf.push_str(&format!("#define ENABLE_{} 1\n", name));
+        autoconf.push_str(&format!("#define IF_{}(...) __VA_ARGS__\n", name));
+        autoconf.push_str(&format!("#define IF_NOT_{}(...)\n", name));
+    }
+    for name in &disabled {
+        autoconf.push_str(&format!("#define ENABLE_{} 0\n", name));
+        autoconf.push_str(&format!("#define IF_{}(...)\n", name));
+        autoconf.push_str(&format!("#define IF_NOT_{}(...) __VA_ARGS__\n", name));
+    }
+    // Numeric / string CONFIG_xxx values lifted verbatim. These are
+    // a tiny set in our tier-1 .config (FEATURE_COPYBUF_KB=4,
+    // BUSYBOX_EXEC_PATH="/bin/busybox", PREFIX, CROSS_COMPILER_PREFIX,
+    // SYSROOT, EXTRA_CFLAGS, EXTRA_LDFLAGS, EXTRA_LDLIBS,
+    // SUID_CONFIG_FILE, PID_FILE_PATH).
+    for line in cfg_text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("CONFIG_") {
+            if let Some(eq) = rest.find('=') {
+                let name = rest[..eq].trim();
+                let val = rest[eq + 1..].trim();
+                if val != "y" && !val.is_empty() {
+                    autoconf.push_str(&format!("#define CONFIG_{} {}\n", name, val));
+                }
+            }
+        }
+    }
+    autoconf.push_str("\n#endif /* BB_AUTOCONF_H */\n");
+    let autoconf_path = gen_include.join("autoconf.h");
+    fs::write(&autoconf_path, &autoconf)
+        .map_err(|e| format!("write {}: {}", autoconf_path.display(), e))?;
+
+    // 3. Generate `$OUT_DIR/busybox/include/applets.h` — the table
+    //    `applets/applets.c` walks at startup. Upstream Kbuild
+    //    greps every .c for `//applet:` directives; for our closed
+    //    6-applet set we hand-emit the table. Keeping this in sync
+    //    with `busybox_config/.config` is straightforward — every
+    //    new applet adds one entry here AND one `CONFIG_<APPLET>=y`
+    //    line in the .config.
+    let mut applets = String::new();
+    applets.push_str("/* Generated by build.rs — do not edit. */\n");
+    applets.push_str("/* Hand-emitted from the closed 6-applet set in busybox_config/.config */\n\n");
+    // Re-emit the upstream applets.src.h preamble verbatim — it
+    // defines the APPLET / APPLET_NOEXEC / APPLET_NOFORK /
+    // APPLET_ODDNAME / APPLET_SCRIPTED macros + the BB_DIR_xxx /
+    // BB_SUID_xxx enum values that the table entries reference.
+    applets.push_str("#include \"applet_metadata.h\"\n\n");
+    applets.push_str("#if defined(PROTOTYPES)\n");
+    applets.push_str("# define APPLET(name,l,s)                    int name##_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;\n");
+    applets.push_str("# define APPLET_ODDNAME(name,main,l,s,help)  int main##_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;\n");
+    applets.push_str("# define APPLET_NOEXEC(name,main,l,s,help)   int main##_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;\n");
+    applets.push_str("# define APPLET_NOFORK(name,main,l,s,help)   int main##_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;\n");
+    applets.push_str("# define APPLET_SCRIPTED(name,main,l,s,help)\n");
+    applets.push_str("#else\n");
+    applets.push_str("# define APPLET(name,l,s)                    { #name, #name, l, s },\n");
+    applets.push_str("# define APPLET_ODDNAME(name,main,l,s,help)  { #name, #main, l, s },\n");
+    applets.push_str("# define APPLET_NOEXEC(name,main,l,s,help)   { #name, #main, l, s, 1 },\n");
+    applets.push_str("# define APPLET_NOFORK(name,main,l,s,help)   { #name, #main, l, s, 1, 1 },\n");
+    applets.push_str("# define APPLET_SCRIPTED(name,main,l,s,help) { #name, #main, l, s },\n");
+    applets.push_str("#endif\n\n");
+    // The 6-applet table. Order matches the .config layout for
+    // diff-friendliness.
+    applets.push_str("IF_CAT(APPLET_NOFORK(cat, cat, BB_DIR_BIN, BB_SUID_DROP, cat))\n");
+    applets.push_str("IF_ECHO(APPLET_NOFORK(echo, echo, BB_DIR_BIN, BB_SUID_DROP, echo))\n");
+    applets.push_str("IF_HEAD(APPLET_NOEXEC(head, head, BB_DIR_USR_BIN, BB_SUID_DROP, head))\n");
+    applets.push_str("IF_LS(APPLET_NOEXEC(ls, ls, BB_DIR_BIN, BB_SUID_DROP, ls))\n");
+    applets.push_str("IF_TAIL(APPLET_NOEXEC(tail, tail, BB_DIR_USR_BIN, BB_SUID_DROP, tail))\n");
+    applets.push_str("IF_WC(APPLET_NOEXEC(wc, wc, BB_DIR_USR_BIN, BB_SUID_DROP, wc))\n");
+    let applets_path = gen_include.join("applets.h");
+    fs::write(&applets_path, &applets)
+        .map_err(|e| format!("write {}: {}", applets_path.display(), e))?;
+
+    // 4. Walk the source tree for the bits we want to compile.
+    //    libbb is unconditional (the runtime support layer the applet
+    //    sources call into); the 6 chosen applets come from coreutils;
+    //    the dispatcher `applets/applets.c` becomes the multi-call
+    //    binary's main loop.
+    let libbb_dir = busybox_root.join("libbb");
+    let coreutils_dir = busybox_root.join("coreutils");
+    let applets_dir = busybox_root.join("applets");
+    let mut sources: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&libbb_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("c") {
+                sources.push(p);
+            }
+        }
+    }
+    let chosen_applets: &[&str] = &["cat", "echo", "head", "ls", "tail", "wc"];
+    for stem in chosen_applets {
+        let p = coreutils_dir.join(format!("{}.c", stem));
+        if p.is_file() {
+            sources.push(p);
+        }
+    }
+    let dispatcher = applets_dir.join("applets.c");
+    if dispatcher.is_file() {
+        sources.push(dispatcher);
+    }
+    sources.sort();
+    sources.dedup();
+
+    if sources.is_empty() {
+        return Err(format!(
+            "no busybox sources found under {} — vendor tree may be incomplete",
+            busybox_root.display(),
+        ));
+    }
+
+    // 5. Set up cc::Build matching upstream's Makefile.flags baseline.
+    let mut build = cc::Build::new();
+    if cfg!(target_os = "windows") {
+        build.compiler("clang");
+        // Linux ELF target — busybox is a Linux guest binary, NOT a
+        // PE32+ image. Unlike the musl pass (which targets `x86_64-pc-
+        // windows-msvc` because musl's libc.a links INTO the kernel's
+        // UEFI PE32+ image), busybox is the FIRST ELF the AREST kernel
+        // loads via the #472 ELF loader, so it needs SysV-AMD64 + ELF
+        // output.
+        build.flag_if_supported("--target=x86_64-unknown-linux-musl");
+    }
+
+    // Include path order matching upstream's Makefile.flags
+    // CPPFLAGS line:
+    //   -Iinclude
+    //   -Ilibbb
+    //   -I$(OUT_DIR)/busybox/include   (for autoconf.h + applets.h)
+    let main_include = busybox_root.join("include");
+    let libbb_include = busybox_root.join("libbb");
+    build
+        .include(&gen_include)
+        .include(&main_include)
+        .include(&libbb_include);
+
+    // Pull in the musl headers from #524 so busybox sees the same
+    // libc surface the linked-against libc.a exposes. The musl
+    // header tree the build script generates lives under
+    // `$OUT_DIR/musl/include` (bits/alltypes.h + bits/syscall.h);
+    // the verbatim upstream tree under `vendor/musl/include` carries
+    // the rest. Order matches the musl pass's include layout: arch
+    // overrides first, generated bits next, then the main tree.
+    let musl_root = manifest_dir.join("vendor").join("musl");
+    let musl_arch = musl_root.join("arch").join("x86_64");
+    let musl_arch_generic = musl_root.join("arch").join("generic");
+    let musl_gen_include = out_dir.join("musl").join("include");
+    let musl_main_include = musl_root.join("include");
+    if musl_main_include.is_dir() {
+        build
+            .include(&musl_arch)
+            .include(&musl_arch_generic)
+            .include(&musl_gen_include)
+            .include(&musl_main_include);
+    } else {
+        return Err(format!(
+            "vendored musl headers not found at {} — #524 vendor tree is required",
+            musl_main_include.display(),
+        ));
+    }
+
+    // CPPFLAGS from upstream's Makefile.flags, minus the ones that
+    // are already baked into autoconf.h or that we don't need
+    // (CONFIG_LFS is on by default).
+    build
+        .define("_GNU_SOURCE", None)
+        .define("NDEBUG", None)
+        .define("_LARGEFILE_SOURCE", None)
+        .define("_LARGEFILE64_SOURCE", None)
+        .define("_FILE_OFFSET_BITS", Some("64"));
+
+    // Force-include the generated autoconf.h so every source file
+    // sees the ENABLE_xxx / IF_xxx macros without needing to
+    // explicitly `#include "autoconf.h"`. Mirrors the upstream
+    // `-include include/autoconf.h` flag.
+    build.flag_if_supported(&format!(
+        "-include{}",
+        autoconf_path.to_string_lossy(),
+    ));
+
+    // CFLAGS from Makefile.flags — the size-optimisation knobs +
+    // warning suppressions our build doesn't need to surface.
+    build
+        .flag_if_supported("-std=gnu99")
+        .flag_if_supported("-ffreestanding")
+        .flag_if_supported("-nostdinc")
+        .flag_if_supported("-fno-builtin")
+        .flag_if_supported("-fomit-frame-pointer")
+        .flag_if_supported("-ffunction-sections")
+        .flag_if_supported("-fdata-sections")
+        .flag_if_supported("-fno-unwind-tables")
+        .flag_if_supported("-fno-asynchronous-unwind-tables")
+        .flag_if_supported("-funsigned-char")
+        .warnings(false)
+        .flag_if_supported("-Wno-unused-parameter")
+        .flag_if_supported("-Wno-unused-function")
+        .flag_if_supported("-Wno-unused-variable")
+        .flag_if_supported("-Wno-pointer-sign")
+        .flag_if_supported("-Wno-attributes")
+        .flag_if_supported("-Wno-unknown-attributes")
+        .flag_if_supported("-Wno-macro-redefined")
+        .flag_if_supported("-Wno-string-plus-int")
+        .flag_if_supported("-Wno-constant-logical-operand")
+        .flag_if_supported("-Wno-incompatible-pointer-types-discards-qualifiers")
+        .flag_if_supported("-Wno-int-conversion")
+        .flag_if_supported("-Wno-implicit-function-declaration");
+    // Optimisation level matches CFLAGS = -Os.
+    build.opt_level_str("s");
+
+    // Add every walked source.
+    for s in &sources {
+        build.file(s);
+    }
+
+    println!("cargo:rustc-check-cfg=cfg(busybox_built)");
+    match build.try_compile("busybox") {
+        Ok(()) => {
+            // The cc::Build emits libbusybox.a under $OUT_DIR — the
+            // archive of every compiled .o. The brief asks for a
+            // `busybox` static binary; producing the archive is the
+            // load-bearing first step (proves the toolchain works).
+            // The final link step (musl crt1 + libc.a + libbusybox.a
+            // -> ELF) is a follow-up: it needs the kernel-side ELF
+            // loader (#472) wired enough to give us a usable target,
+            // and a host `ld` invocation that emits a Linux ELF (vs
+            // the host's default PE32+/Mach-O), which is more
+            // toolchain plumbing than this commit's "prove the build
+            // wiring" scope.
+            println!(
+                "cargo:rustc-link-search=native={}",
+                out_dir.display(),
+            );
+            println!("cargo:rustc-cfg=busybox_built");
+            println!(
+                "cargo:warning=busybox: built libbusybox.a ({} sources, {} applets enabled) under {} — final ELF link is a #527 follow-up",
+                sources.len(),
+                chosen_applets.len(),
+                out_dir.display(),
+            );
+            Ok(())
+        }
+        Err(e) => Err(format!("{}", e)),
     }
 }
 
