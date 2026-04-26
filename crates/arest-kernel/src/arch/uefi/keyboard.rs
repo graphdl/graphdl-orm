@@ -120,6 +120,16 @@ pub fn read_keystroke() -> Option<DecodedKey> {
 /// pressure shape the `handle_scancode` path uses. Cheap (single
 /// `Mutex::lock` + a `VecDeque::push_back`); safe to call from a
 /// Slint callback in the kernel super-loop.
+///
+/// **Pointer-event sibling:** `arch::uefi::pointer::push_pointer_event`
+/// (Track XXXXX #466) is the parallel API for the pointer ring —
+/// same naming-aligned synthetic-input shape, same drop-oldest
+/// back-pressure, same Slint-callback safety. Each ring stays in
+/// its own module because the payload types differ (`DecodedKey`
+/// here, `PointerEvent` there) and the drainers consume them
+/// separately, but the producer surfaces are matched verb-for-verb
+/// so a Slint widget that wants to push synthetic input doesn't
+/// have to remember which ring uses which verb.
 pub fn push_keystroke(decoded: DecodedKey) {
     let mut ring = RING.lock();
     if ring.len() >= RING_CAP {

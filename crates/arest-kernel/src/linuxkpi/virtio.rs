@@ -586,6 +586,56 @@ pub extern "C" fn virtio_device_ready(_vdev: *mut VirtioDevice) {}
 #[no_mangle]
 pub extern "C" fn virtio_reset_device(_vdev: *mut VirtioDevice) {}
 
+// ── Discovery ──────────────────────────────────────────────────────
+
+/// Number of registered virtio-input devices. Returns 0 when the
+/// `INPUTS` map hasn't been initialised (no `linuxkpi::init()` call)
+/// or when `virtio_find_vqs` has not yet succeeded for any vdev.
+///
+/// Used by the launcher-side boot detection (Track XXXXX #466) to
+/// decide whether the kernel should default the active MonoView's
+/// InteractionMode to 'touch' (which the design-system tokens
+/// derive into the spacious DensityScale per `readings/ui/monoview.md`'s
+/// derivation rule). A device count of 1 is the keyboard-only case;
+/// 2+ implies the QEMU CMD line wired a `-device virtio-tablet-pci`
+/// alongside the keyboard (per `Dockerfile.uefi`'s default), and
+/// the launcher should switch into touch mode to match the
+/// hardware shape.
+pub fn input_device_count() -> usize {
+    INPUTS
+        .get()
+        .map(|map| map.lock().len())
+        .unwrap_or(0)
+}
+
+/// True when at least one of the registered virtio-input devices is
+/// likely a tablet (absolute-positioning pointer device). On the
+/// foundation slice we don't yet read VIRTIO_INPUT_CFG_EV_BITS to
+/// discriminate keyboards from tablets at the per-device level
+/// (see `entry_uefi.rs`'s discovery loop comment for the rationale —
+/// the rcore `virtio-drivers` crate doesn't expose the raw config-
+/// space EV_BITS query through `VirtIOInput`'s public surface), so
+/// the heuristic mirrors the same enumeration-order convention the
+/// boot banner uses: keyboard first, tablet second per
+/// `Dockerfile.uefi`'s `-device virtio-keyboard-pci -device
+/// virtio-tablet-pci` ordering. Two-or-more registered devices →
+/// the second is the tablet.
+///
+/// Returns `false` when:
+///   * `INPUTS` hasn't been initialised yet (`linuxkpi::init()` has
+///     not run — pre-boot or non-linuxkpi build path).
+///   * Fewer than 2 devices have been registered (keyboard-only
+///     boot, or the build path that hits the `-ENODEV` foundation-
+///     mode branch in `virtio_find_vqs` and never registers a
+///     `DeviceState`).
+///
+/// Cheap: one map-len read under a brief Mutex acquire. Designed to
+/// be called once at boot from the launcher's bootstrap (post-
+/// `system::init`, pre-super-loop) — not per-frame.
+pub fn has_tablet() -> bool {
+    input_device_count() >= 2
+}
+
 // ── Callback dispatch ──────────────────────────────────────────────
 
 /// Poll every registered virtio-input device, drain pending events
@@ -787,6 +837,25 @@ mod tests {
     fn poll_all_vqs_empty_is_noop() {
         init();
         poll_all_vqs();
+    }
+
+    /// `has_tablet()` returns `false` when no devices have been
+    /// registered (pre-boot, or the foundation-mode `-ENODEV` path
+    /// where `virtio_find_vqs` never builds a `DeviceState`).
+    /// `input_device_count()` agrees by returning 0 in the same
+    /// state — Track XXXXX #466's launcher-side touch-mode detection
+    /// relies on both reading "no devices" rather than panicking on
+    /// the empty map.
+    #[test]
+    fn has_tablet_with_no_devices_is_false() {
+        init();
+        // INPUTS may carry leftover state from sibling tests in this
+        // module; assert `has_tablet` agrees with `input_device_count`
+        // rather than asserting an absolute count, so test order
+        // doesn't matter. Both functions read the same map under the
+        // same lock so they always agree.
+        let count = input_device_count();
+        assert_eq!(has_tablet(), count >= 2);
     }
 
     /// `virtqueue_add_inbuf` returns -ENODEV without an attached
