@@ -76,6 +76,12 @@ mod scheduler;
 #[allow(dead_code)]
 mod ring;
 #[allow(dead_code)]
+// `select_component_core` (#565) — pure FORML cell-walker that
+// `command::select_component` re-exports. The bin target re-declares
+// it here so command.rs's `pub use crate::select_component_core::*`
+// resolves under the bin's crate root the same way it does in lib.rs.
+mod select_component_core;
+#[allow(dead_code)]
 mod freeze;
 #[allow(dead_code)]
 mod declared_writes;

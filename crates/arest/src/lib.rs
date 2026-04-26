@@ -119,6 +119,14 @@ pub mod ring;
 // can reach `apply_with_declared_writes` / `prune_to_declared` as
 // pure helpers without re-implementing them.
 pub mod declared_writes;
+// `select_component_core` is the pure FORML cell-walker for the #493
+// MCP verb (no I/O, no global state, no serde). Lifted out of the
+// no_std gate (#565) so the kernel cell-renderer (#511) can call the
+// engine version directly instead of porting the logic. The thin
+// std-only wrappers (Command enum + JSON adapter) stay in
+// `command.rs`; the core sits here so it compiles into the kernel
+// image.
+pub mod select_component_core;
 #[cfg(not(feature = "no_std"))]
 pub mod check;
 // Storage-1: pluggable StorageBackend trait + in-mem/local-fs impls.
