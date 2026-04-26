@@ -47,14 +47,16 @@ COPY crates/arest-kernel/Cargo.toml crates/arest-kernel/Cargo.toml
 COPY crates/arest-kernel/build.rs crates/arest-kernel/build.rs
 COPY crates/arest-kernel/src/ crates/arest-kernel/src/
 COPY crates/arest-kernel/rust-toolchain.toml crates/arest-kernel/rust-toolchain.toml
-# Slint UI surface (#436 + #429-#431 + #455) — build.rs's slint-build
-# pass compiles ui/apps/HateoasBrowser.slint as the entry; that
-# file imports + re-exports AppLauncher / Repl / Doom / theme so
-# the slint compiler walks the import graph and emits all
-# component types into one $OUT_DIR/HateoasBrowser.rs which
-# slint_backend.rs picks up via include_modules!(). Without
-# `ui/` staged the macro expands empty and ui_apps fails to
-# resolve the component types.
+# Slint UI surface (#436 + #431 + #455 + #465 + #510) — build.rs's
+# slint-build pass compiles ui/apps/UnifiedRepl.slint as the entry
+# (per #510 / EPIC #496, which merged the prior HateoasBrowser +
+# Repl entries into a single UnifiedRepl panel and made it the
+# slint-build entry). That file imports + re-exports AppLauncher /
+# Doom / Keyboard / AppShell / theme so the slint compiler walks
+# the import graph and emits all component types into one
+# $OUT_DIR/UnifiedRepl.rs which slint_backend.rs picks up via
+# include_modules!(). Without `ui/` staged the macro expands empty
+# and ui_apps fails to resolve the component types.
 COPY crates/arest-kernel/ui/ crates/arest-kernel/ui/
 # Vendored fonts + Lucide icons (#433 + #434) — referenced by the
 # `import "../assets/fonts/Inter-Regular.ttf";` directives in

@@ -1,0 +1,432 @@
+// crates/arest-kernel/ui/apps/UnifiedRepl.slint
+//
+// AREST kernel — Unified REPL panel (#510, EPIC #496).
+//
+// Foundational structural merge of HateoasBrowser (Track SSS #429)
+// and Repl (Track TTT #430) into a single Slint surface. The
+// motivation, per the user's vision in #496:
+//
+//   "the repl should be easy to use. It should render the system as
+//    the current screen of an app so that the user is never lost. It
+//    provides SYSTEM calls, but it should be easy to navigate the
+//    system using its own principles"
+//
+// THIS commit lands ONLY the structural merge: a two-pane layout that
+// co-locates today's HATEOAS resource browser (left) and today's REPL
+// scrollback + prompt (right) in one Window. The follow-up sub-tasks
+// (#511 cell-as-screen, #512 navigation actions, #513 SYSTEM-as-actions,
+// etc.) layer the cross-pane behaviours on top.
+//
+// # Layout
+//
+//   * Top bar: title + theme toggle (mirrors the prior single-app
+//     surfaces — same neutral-100 background, type-h2 wordmark, ghost
+//     theme button).
+//   * Body: HorizontalLayout of two panes.
+//       - Left pane (HATEOAS browse, ~520px): three sub-columns
+//         (Resources sidebar, Instances list, Detail panel) — same
+//         shape HateoasBrowser.slint shipped.
+//       - Right pane (REPL, fills remaining width): scrollback Card
+//         on top, prompt + TextInput row at the bottom — same shape
+//         Repl.slint shipped.
+//   * Status footer: Combined view (resource count + scrollback line
+//     count + brief navigation hint).
+//
+// # Multi-entry pattern
+//
+// This file is the new slint-build COMPILE ENTRY (build.rs L222 area
+// + Dockerfile.uefi L54 area). It re-exports every Window-derived
+// component the kernel ships (AppLauncher, Doom, Keyboard) so the
+// slint compiler walks the import graph and emits all Window types
+// into one generated `UnifiedRepl.rs` reached by
+// `slint::include_modules!()` in `arch/uefi/slint_backend.rs`. The
+// previously-separate HateoasBrowser + Repl files are deleted in this
+// commit; only `UnifiedRepl` here exposes both their callback
+// surfaces (now unified on a single component).
+
+import { AppShell, Theme, ThemeMode } from "../AppShell.slint";
+import { Button, ButtonVariant } from "../components/Button.slint";
+import { Card } from "../components/Card.slint";
+import { List, ListItem } from "../components/List.slint";
+// Re-exported launcher app surfaces. The slint compiler walks these
+// imports and emits each Window-derived component into the single
+// generated `UnifiedRepl.rs`. The launcher (Track UUU #431) instantiates
+// these by name from `crate::arch::uefi::slint_backend::*`.
+import { AppLauncher } from "./AppLauncher.slint";
+import { Doom } from "./Doom.slint";
+import { Keyboard } from "./Keyboard.slint";
+
+// Re-export AppShell + Theme + the launcher apps so existing callsites
+// (slint_backend.rs's smoke test for AppShell, and `crate::ui_apps::
+// {launcher,doom,keyboard}` for the three side apps) keep compiling
+// without touching the generated symbol path.
+export { AppShell, Theme, ThemeMode, AppLauncher, Doom, Keyboard }
+
+export component UnifiedRepl inherits Window {
+    // ---- HATEOAS-side inputs (left pane, mirrors HateoasBrowser) ----
+
+    // Sidebar: every Noun the metamodel knows about (sorted).
+    in property <[string]> resources;
+    // Index of the selected Noun in `resources`. -1 = nothing picked.
+    in property <int> selected-resource-index: -1;
+
+    // Instance list for the selected Noun.
+    in property <[string]> instances;
+    in property <int> selected-instance-index: -1;
+
+    // Detail panel: each line is one binding (`role = value`) or one
+    // back-reference. Rust glue formats; Slint just renders.
+    in property <[string]> detail-lines;
+
+    // Breadcrumbs across the top of the left pane.
+    in property <[string]> breadcrumbs;
+
+    // ---- REPL-side inputs (right pane, mirrors Repl) ----------------
+
+    // Scrollback: each entry is one rendered line of REPL output. The
+    // Rust glue caps the model at ~1000 entries (oldest dropped).
+    in property <[string]> scrollback;
+
+    // Prompt prefix shown at the start of the input row.
+    in property <string> prompt: "arest> ";
+
+    // Two-way binding to the live TextInput contents. Up/Down (history
+    // walk) updates this from Rust; user keystrokes update from Slint.
+    in-out property <string> current-input;
+
+    // ---- Combined status text --------------------------------------
+
+    // Footer status text — Rust glue renders a combined summary.
+    in property <string> status-text: "Ready";
+
+    // ---- HATEOAS-side callbacks ------------------------------------
+
+    // Sidebar row clicked. Argument is the index into `resources`.
+    callback resource-selected(int);
+    // Instance row clicked. Argument is the index into `instances`.
+    callback instance-selected(int);
+    // Back button on the breadcrumb bar.
+    callback back-clicked();
+
+    // ---- REPL-side callbacks ---------------------------------------
+
+    // Enter pressed in the input row. Argument is the just-submitted
+    // line. Rust glue echoes prompt+line, evaluates, pushes response,
+    // updates history, and clears `current-input`.
+    callback submit(string);
+    // Ctrl+L pressed in the input row. Rust clears scrollback.
+    callback clear();
+    // Up arrow — walk one step into the past.
+    callback history-prev();
+    // Down arrow — walk one step toward the present.
+    callback history-next();
+
+    // ---- Window chrome ----------------------------------------------
+
+    // Theme toggle from the top bar.
+    callback theme-toggled();
+
+    title: "AREST — Unified REPL";
+    background: Theme.surface;
+    default-font-family: Theme.type-body.family;
+    default-font-size: Theme.type-body.size;
+    preferred-width: 1280px;
+    preferred-height: 800px;
+    forward-focus: input;
+
+    VerticalLayout {
+        spacing: 0px;
+
+        // ----- Top bar: breadcrumbs + back + theme toggle -----------
+        Rectangle {
+            background: Theme.neutral-100;
+            min-height: 56px;
+
+            HorizontalLayout {
+                padding-left: Theme.spacing-lg;
+                padding-right: Theme.spacing-lg;
+                padding-top: Theme.spacing-md;
+                padding-bottom: Theme.spacing-md;
+                spacing: Theme.spacing-md;
+                alignment: space-between;
+
+                HorizontalLayout {
+                    spacing: Theme.spacing-sm;
+                    alignment: start;
+
+                    Button {
+                        text: "Back";
+                        variant: ButtonVariant.ghost;
+                        enabled: root.breadcrumbs.length > 1;
+                        clicked => { root.back-clicked(); }
+                    }
+
+                    Text {
+                        text: "REPL";
+                        color: Theme.text-primary;
+                        font-family: Theme.type-h2.family;
+                        font-weight: Theme.type-h2.weight;
+                        font-size: Theme.type-h2.size;
+                        vertical-alignment: center;
+                    }
+
+                    for crumb[idx] in root.breadcrumbs : Text {
+                        text: idx == 0 ? "  " + crumb : " / " + crumb;
+                        color: idx == root.breadcrumbs.length - 1
+                            ? Theme.text-primary
+                            : Theme.text-muted;
+                        font-family: Theme.type-h3.family;
+                        font-weight: idx == root.breadcrumbs.length - 1
+                            ? Theme.type-h3.weight
+                            : 400;
+                        font-size: Theme.type-h3.size;
+                        vertical-alignment: center;
+                    }
+                }
+
+                Button {
+                    text: Theme.mode == ThemeMode.dark ? "Light" : "Dark";
+                    variant: ButtonVariant.ghost;
+                    clicked => {
+                        Theme.toggle-mode();
+                        root.theme-toggled();
+                    }
+                }
+            }
+
+            // 1px bottom border.
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: Theme.border;
+            }
+        }
+
+        // ----- Body: two panes (HATEOAS browse | REPL prompt) -------
+        Rectangle {
+            background: Theme.surface;
+            vertical-stretch: 1;
+
+            HorizontalLayout {
+                padding: Theme.spacing-lg;
+                spacing: Theme.spacing-lg;
+
+                // ===== LEFT PANE: HATEOAS browse ====================
+                // Same three-pane shape HateoasBrowser shipped, but
+                // collapsed into a fixed-width column so the right
+                // pane (REPL) gets the rest of the surface.
+                Rectangle {
+                    width: 520px;
+
+                    HorizontalLayout {
+                        spacing: Theme.spacing-md;
+
+                        // ---- Pane 1a: Resources sidebar ------------
+                        Rectangle {
+                            width: 160px;
+                            Card {
+                                title: "Resources";
+                                if root.resources.length == 0 : Text {
+                                    text: "(no resources)";
+                                    color: Theme.text-muted;
+                                    font-family: Theme.type-body-sm.family;
+                                    font-size: Theme.type-body-sm.size;
+                                }
+                                if root.resources.length > 0 : List {
+                                    items: root.resources;
+                                    selected-index: root.selected-resource-index;
+                                    item-clicked(idx, value) => {
+                                        root.resource-selected(idx);
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---- Pane 1b: Instance list ----------------
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            Card {
+                                title: root.selected-resource-index >= 0
+                                    ? "Instances"
+                                    : "Pick a resource";
+                                if root.selected-resource-index < 0 : Text {
+                                    text: "Click a resource to list its instances.";
+                                    color: Theme.text-muted;
+                                    font-family: Theme.type-body.family;
+                                    font-size: Theme.type-body.size;
+                                    wrap: word-wrap;
+                                }
+                                if root.selected-resource-index >= 0
+                                   && root.instances.length == 0 : Text {
+                                    text: "(no facts yet)";
+                                    color: Theme.text-muted;
+                                    font-family: Theme.type-body-sm.family;
+                                    font-size: Theme.type-body-sm.size;
+                                }
+                                if root.selected-resource-index >= 0
+                                   && root.instances.length > 0 : List {
+                                    items: root.instances;
+                                    selected-index: root.selected-instance-index;
+                                    item-clicked(idx, value) => {
+                                        root.instance-selected(idx);
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---- Pane 1c: Detail panel -----------------
+                        Rectangle {
+                            width: 200px;
+                            Card {
+                                title: "Detail";
+                                if root.detail-lines.length == 0 : Text {
+                                    text: "Click an instance.";
+                                    color: Theme.text-muted;
+                                    font-family: Theme.type-body.family;
+                                    font-size: Theme.type-body.size;
+                                    wrap: word-wrap;
+                                }
+                                for line[idx] in root.detail-lines : Text {
+                                    text: line;
+                                    color: Theme.text-primary;
+                                    font-family: Theme.type-code.family;
+                                    font-weight: Theme.type-code.weight;
+                                    font-size: Theme.type-code.size;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ===== RIGHT PANE: REPL prompt + scrollback =========
+                Rectangle {
+                    horizontal-stretch: 1;
+
+                    VerticalLayout {
+                        spacing: Theme.spacing-md;
+
+                        // ---- Scrollback panel ----------------------
+                        Rectangle {
+                            vertical-stretch: 1;
+                            Card {
+                                title: "REPL";
+                                scroll := Flickable {
+                                    // Coarse 20px per line — matches
+                                    // Repl.slint's original estimate
+                                    // (Theme.type-code.line-height).
+                                    viewport-height: root.scrollback.length * 20px;
+
+                                    VerticalLayout {
+                                        spacing: 0px;
+
+                                        if root.scrollback.length == 0 : Text {
+                                            text: "(scrollback empty — type a command and press Enter)";
+                                            color: Theme.text-muted;
+                                            font-family: Theme.type-body-sm.family;
+                                            font-size: Theme.type-body-sm.size;
+                                        }
+
+                                        for line in root.scrollback : Text {
+                                            text: line;
+                                            color: Theme.text-primary;
+                                            font-family: Theme.type-code.family;
+                                            font-weight: Theme.type-code.weight;
+                                            font-size: Theme.type-code.size;
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---- Input row -----------------------------
+                        // Same shape as Repl.slint's input frame.
+                        input-frame := Rectangle {
+                            background: Theme.neutral-100;
+                            border-color: input.has-focus ? Theme.accent : Theme.border;
+                            border-width: 1px;
+                            border-radius: 6px;
+                            min-height: 36px;
+
+                            animate border-color { duration: Theme.motion-fast; easing: ease-in-out; }
+
+                            HorizontalLayout {
+                                padding-left: Theme.spacing-md;
+                                padding-right: Theme.spacing-md;
+                                padding-top: Theme.spacing-sm;
+                                padding-bottom: Theme.spacing-sm;
+                                spacing: Theme.spacing-sm;
+
+                                Text {
+                                    text: root.prompt;
+                                    color: Theme.accent;
+                                    font-family: Theme.type-code.family;
+                                    font-weight: Theme.type-code.weight;
+                                    font-size: Theme.type-code.size;
+                                    vertical-alignment: center;
+                                }
+
+                                input := TextInput {
+                                    text <=> root.current-input;
+                                    color: Theme.text-primary;
+                                    font-family: Theme.type-code.family;
+                                    font-weight: Theme.type-code.weight;
+                                    font-size: Theme.type-code.size;
+                                    single-line: true;
+
+                                    accepted => {
+                                        root.submit(self.text);
+                                    }
+
+                                    key-pressed(event) => {
+                                        if (event.text == Key.UpArrow) {
+                                            root.history-prev();
+                                            return accept;
+                                        } else if (event.text == Key.DownArrow) {
+                                            root.history-next();
+                                            return accept;
+                                        } else if (event.modifiers.control && event.text == "l") {
+                                            root.clear();
+                                            return accept;
+                                        }
+                                        return reject;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ----- Status footer ----------------------------------------
+        Rectangle {
+            background: Theme.neutral-100;
+            min-height: 28px;
+
+            // 1px top border.
+            Rectangle {
+                y: 0;
+                height: 1px;
+                background: Theme.border;
+            }
+
+            HorizontalLayout {
+                padding-left: Theme.spacing-lg;
+                padding-right: Theme.spacing-lg;
+                padding-top: Theme.spacing-xs;
+                padding-bottom: Theme.spacing-xs;
+
+                Text {
+                    text: root.status-text;
+                    color: Theme.text-muted;
+                    font-family: Theme.type-caption.family;
+                    font-weight: Theme.type-caption.weight;
+                    font-size: Theme.type-caption.size;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}
