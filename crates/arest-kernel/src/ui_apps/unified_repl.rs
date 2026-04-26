@@ -54,6 +54,7 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use crate::arch::uefi::slint_backend::UnifiedRepl;
 use crate::system::SubscriberId;
+use crate::ui_apps::actions::{self, SystemAction};
 use crate::ui_apps::cell_renderer::{self, CurrentCell, RenderedScreen};
 use crate::ui_apps::navigation::NavigationTarget;
 
@@ -138,6 +139,16 @@ struct UnifiedReplState {
     // Recomputed on every `redraw` so live cell-graph updates are
     // reflected in subsequent click handling.
     nav_targets: Vec<NavigationTarget>,
+
+    // SYSTEM calls as actions on current screen (#513, EPIC #496).
+    // Cache of the most recently rendered action catalogue, indexed
+    // by the same ordering the Slint surface displays. The click
+    // handler reads `system_actions[idx]` and dispatches the SYSTEM
+    // verb with `default_args` pre-bound from the cell context.
+    // Recomputed on every `redraw` so live cell-graph updates are
+    // reflected in subsequent click handling — same shape as
+    // `nav_targets` above.
+    system_actions: Vec<SystemAction>,
 }
 
 impl UnifiedReplState {
@@ -151,6 +162,7 @@ impl UnifiedReplState {
             pending_input: String::new(),
             current_cell: CurrentCell::Root,
             nav_targets: Vec::new(),
+            system_actions: Vec::new(),
         }
     }
 
@@ -569,6 +581,7 @@ impl Snapshot {
                     "(SYSTEM not initialised — call system::init() first)".to_string(),
                 ],
                 navigation: Vec::new(),
+                actions: Vec::new(),
             },
         }
     }
@@ -655,6 +668,7 @@ fn redraw(window: &UnifiedRepl, ui: &mut UnifiedReplState) {
     let snapshot = crate::system::with_state(|s| Snapshot::collect(s, ui));
     let snap = snapshot.unwrap_or_else(Snapshot::empty);
     ui.nav_targets = snap.rendered.navigation.clone();
+    ui.system_actions = snap.rendered.actions.clone();
 
     // ---- HATEOAS pane ----
     let resources_model: StringModel = ModelRc::new(VecModel::from_iter(
@@ -718,6 +732,20 @@ fn redraw(window: &UnifiedRepl, ui: &mut UnifiedReplState) {
             .map(|t| SharedString::from(t.label.as_str())),
     ));
     window.set_navigation_targets(nav_labels_model);
+
+    // ---- SYSTEM calls as actions on current screen (#513) ----
+    // Mirrors the navigation push above. Each row is one `SystemAction`
+    // derived from the cell graph + the SYSTEM verb namespace; clicks
+    // dispatch the verb with `default_args` pre-bound from the cell
+    // context. The Slint side keys clicks by index into the cached
+    // `system_actions` vector — same stability story as nav targets.
+    let action_labels_model: StringModel = ModelRc::new(VecModel::from_iter(
+        snap.rendered
+            .actions
+            .iter()
+            .map(|a| SharedString::from(a.label.as_str())),
+    ));
+    window.set_system_actions(action_labels_model);
 
     // ---- Combined status footer ----
     let combined_status = format!(
@@ -797,6 +825,16 @@ impl UnifiedReplApp {
     /// `redraw` it reflects the cell-graph-derived row count.
     pub fn navigation_target_count(&self) -> usize {
         self.state.borrow().nav_targets.len()
+    }
+
+    /// Read-only access to the cached SYSTEM-action catalogue length
+    /// (#513). Same accounting story as `navigation_target_count`:
+    /// `0` after construction (no live SYSTEM snapshot), refreshed
+    /// after the first `redraw`. Useful for tests that want to
+    /// confirm the action surface is wired without driving the full
+    /// Slint event loop.
+    pub fn system_action_count(&self) -> usize {
+        self.state.borrow().system_actions.len()
     }
 }
 
@@ -962,6 +1000,38 @@ pub fn build_app() -> Result<UnifiedReplApp, slint::PlatformError> {
                 let label = target.label();
                 s.set_current_cell(target);
                 s.push_line(format!("Now showing: {label}"));
+            }
+            redraw(&window, &mut state.borrow_mut());
+        });
+    }
+
+    // SYSTEM calls as actions on current screen (#513). One row per
+    // entry in the cached `system_actions`; clicking row N invokes
+    // the corresponding SYSTEM verb with the action's pre-bound
+    // `default_args`. Result string is pushed to scrollback so the
+    // user sees both the canonical verb form (the action label) and
+    // the dispatch result without leaving the REPL surface.
+    //
+    // Cache + dispatch round-trip: the Slint side passes an index
+    // that's always valid for the most-recent redraw because (1) the
+    // action catalogue is recomputed on every redraw, and (2) the
+    // Slint surface only fires this callback against the labels the
+    // kernel last pushed. An out-of-bounds index from a stale Slint
+    // event after a state swap is handled with a graceful no-op.
+    {
+        let weak = window.as_weak();
+        let state = state.clone();
+        window.on_action_invoked(move |idx| {
+            let Some(window) = weak.upgrade() else { return };
+            let action: Option<SystemAction> = {
+                let s = state.borrow();
+                s.system_actions.get(idx as usize).cloned()
+            };
+            let Some(action) = action else { return };
+            let result = actions::dispatch_action(&action);
+            {
+                let mut s = state.borrow_mut();
+                s.push_line(result);
             }
             redraw(&window, &mut state.borrow_mut());
         });
@@ -1504,5 +1574,50 @@ mod tests {
         let s = UnifiedReplState::new();
         assert!(s.nav_targets.get(0).is_none());
         assert!(s.nav_targets.get(usize::MAX).is_none());
+    }
+
+    // ---- SYSTEM calls as actions (#513) coverage ------------------
+
+    #[test]
+    fn new_state_starts_with_empty_system_actions() {
+        // Mirror the nav cache invariant: before any redraw the
+        // action cache is empty so the click handler gracefully
+        // no-ops on out-of-bounds indices.
+        let s = UnifiedReplState::new();
+        assert!(s.system_actions.is_empty());
+    }
+
+    #[test]
+    fn system_actions_cache_drives_dispatch_round_trip() {
+        // Simulate what `on_action_invoked` does: read an action out
+        // of the cache by index, hand it to `actions::dispatch_action`,
+        // and observe the returned annotation line. Mirrors the
+        // `nav_targets_cache_drives_set_current_cell_jump` shape.
+        use crate::ui_apps::actions::{SystemAction, SystemVerb};
+
+        let mut s = UnifiedReplState::new();
+        s.system_actions = vec![
+            SystemAction::new(
+                SystemVerb::ApplyCreate,
+                vec![("noun".to_string(), "File".to_string())],
+            ),
+            SystemAction::new(
+                SystemVerb::Fetch,
+                vec![("name".to_string(), "File_has_Name".to_string())],
+            ),
+        ];
+
+        // Picking row 0 (ApplyCreate) returns an annotation that
+        // reflects the canonical verb form.
+        let action = s.system_actions[0].clone();
+        let line = crate::ui_apps::actions::dispatch_action(&action);
+        assert!(line.contains("apply create File"), "unexpected: {line}");
+    }
+
+    #[test]
+    fn system_actions_out_of_bounds_index_no_op_safe() {
+        let s = UnifiedReplState::new();
+        assert!(s.system_actions.get(0).is_none());
+        assert!(s.system_actions.get(usize::MAX).is_none());
     }
 }

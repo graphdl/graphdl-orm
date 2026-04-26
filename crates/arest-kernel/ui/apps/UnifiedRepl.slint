@@ -142,6 +142,26 @@ export component UnifiedRepl inherits Window {
     // `CurrentCell` jump via its cached navigation-target vector.
     in property <[string]> navigation-targets;
 
+    // ---- SYSTEM calls as actions on current screen (#513) ----------
+    //
+    // The third leg of the cell-graph HATEOAS triangle: navigation
+    // answers "where can I go from here?", actions answers "what
+    // SYSTEM calls can I make from here?". Each action IS a cell of
+    // the implicit fact type
+    //   `<current_cell> has system_action <Verb, Args>`
+    // computed from the FT graph + the SYSTEM verb namespace
+    // (apply / transition / fetch / FetchOrPhi / Store / Def /
+    // Platform / Native — see #161). Each entry is a pre-formatted
+    // label like "[create] apply create File" or "[transition]
+    // transition OrderSM::o1 submitted"; clicks fire `action-invoked`
+    // with the row index, and the kernel dispatches the verb with
+    // the cached `default_args` pre-bound from cell context.
+    //
+    // The free-text REPL still works (typed verb invocations); the
+    // action panel is the *canonical* surface — each row is a SYSTEM
+    // call grounded in the current cell, ready to dispatch.
+    in property <[string]> system-actions;
+
     // ---- Combined status text --------------------------------------
 
     // Footer status text — Rust glue renders a combined summary.
@@ -172,6 +192,12 @@ export component UnifiedRepl inherits Window {
     // index into `navigation-targets`. Kernel resolves the index via
     // its cached navigation-target vector and updates `current-cell`.
     callback navigation-target-selected(int);
+    // SYSTEM action row clicked (#513). Argument is the index into
+    // `system-actions`. Kernel resolves the index via its cached
+    // SystemAction vector, dispatches the verb with the action's
+    // pre-bound `default_args`, and pushes the result line to
+    // scrollback. See `actions::dispatch_action`.
+    callback action-invoked(int);
 
     // ---- Window chrome ----------------------------------------------
 
@@ -444,6 +470,36 @@ export component UnifiedRepl inherits Window {
                                     items: root.navigation-targets;
                                     item-clicked(idx, value) => {
                                         root.navigation-target-selected(idx);
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---- SYSTEM actions on current screen ------
+                        // SYSTEM calls as actions (#513, EPIC #496).
+                        // Third leg of the cell-graph HATEOAS triangle:
+                        // every screen surfaces its set of SYSTEM verb
+                        // affordances (apply create / update / destroy /
+                        // remove fact / transition / fetch / store / def /
+                        // platform / native), each pre-bound with default
+                        // args from the cell context. Clicks dispatch
+                        // through the kernel's existing Func-application
+                        // path; the result line lands in REPL scrollback.
+                        Rectangle {
+                            min-height: 80px;
+                            Card {
+                                title: "Actions";
+                                if root.system-actions.length == 0 : Text {
+                                    text: "(no SYSTEM actions for this cell — try the REPL prompt below)";
+                                    color: Theme.text-muted;
+                                    font-family: Theme.type-body-sm.family;
+                                    font-size: Theme.type-body-sm.size;
+                                    wrap: word-wrap;
+                                }
+                                if root.system-actions.length > 0 : List {
+                                    items: root.system-actions;
+                                    item-clicked(idx, value) => {
+                                        root.action-invoked(idx);
                                     }
                                 }
                             }

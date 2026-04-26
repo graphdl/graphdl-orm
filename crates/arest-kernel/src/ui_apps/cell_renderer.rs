@@ -89,6 +89,7 @@ use alloc::vec::Vec;
 
 use arest::ast::{self, Object};
 
+use crate::ui_apps::actions::{self, SystemAction};
 use crate::ui_apps::navigation::{self, NavigationTarget};
 
 // ── Cell-type discriminator ────────────────────────────────────────
@@ -495,6 +496,13 @@ pub struct RenderedScreen {
     /// ordering is stable across redraws (enforced by
     /// `navigation::compute_navigation_targets`).
     pub navigation: Vec<NavigationTarget>,
+    /// Action catalogue for this screen (#513) — every SYSTEM verb
+    /// surfaced as a clickable affordance on the current cell, with
+    /// default args pre-bound from cell context. Each entry corresponds
+    /// to one row in the right-pane action list. The Slint side keys
+    /// clicks by index into this vector; ordering is stable across
+    /// redraws (enforced by `actions::compute_actions`).
+    pub actions: Vec<SystemAction>,
 }
 
 /// Render the current cell into a `RenderedScreen` ready to push
@@ -509,11 +517,13 @@ pub fn render_current_cell(cell: &CurrentCell, state: &Object) -> RenderedScreen
     let selected = select_component_for(cell.intent(), state);
     let fields = project_cell_fields(cell, state);
     let navigation = navigation::compute_navigation_targets(cell, state);
+    let actions = actions::compute_actions(cell, state);
     RenderedScreen {
         cell_label: cell.label(),
         selected,
         fields,
         navigation,
+        actions,
     }
 }
 
@@ -866,6 +876,44 @@ mod tests {
             r.navigation.is_empty(),
             "missing cell must yield empty navigation: {:?}",
             r.navigation,
+        );
+    }
+
+    // ── SYSTEM calls as actions on current screen (#513) ──────────
+
+    #[test]
+    fn render_root_emits_action_per_noun() {
+        // SYSTEM calls as actions (#513): every noun the system knows
+        // about appears as an `apply create` affordance off the Root
+        // screen + a `def` introspection action.
+        let state = synth_user_facts();
+        let r = render_current_cell(&CurrentCell::Root, &state);
+        let labels: Vec<&str> = r.actions.iter().map(|a| a.label.as_str()).collect();
+        assert!(
+            labels.iter().any(|l| l.contains("apply create File")),
+            "Root actions must include create File: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn render_instance_emits_update_and_destroy_actions() {
+        // Instance screens always offer update + destroy.
+        let state = synth_user_facts();
+        let r = render_current_cell(
+            &CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into(),
+            },
+            &state,
+        );
+        let labels: Vec<&str> = r.actions.iter().map(|a| a.label.as_str()).collect();
+        assert!(
+            labels.iter().any(|l| l.contains("apply update File::f1")),
+            "Instance actions must include update: {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("apply destroy File::f1")),
+            "Instance actions must include destroy: {labels:?}"
         );
     }
 }
