@@ -106,9 +106,18 @@ pub mod generators;
 pub mod quota;
 #[cfg(not(feature = "no_std"))]
 pub mod scheduler;
-#[cfg(not(feature = "no_std"))]
+// `ring` (#188) is the bounded ring buffer primitive — pure alloc,
+// uses only `alloc::collections::VecDeque`. Lifted out of the no_std
+// gate (#565) so kernel code (e.g. arest-kernel breadcrumb history,
+// FPGA audit-log generator) can reuse the engine primitive instead
+// of hand-rolling a parallel VecDeque<T>.
 pub mod ring;
-#[cfg(not(feature = "no_std"))]
+// `declared_writes` is cfg-aware end-to-end: the std build provides a
+// thread_local capability stack (`std::thread_local!`); the no_std
+// build exposes no-op shims (`push_caps`/`is_store_allowed` always
+// permit). Lifted out of the no_std gate (#565) so kernel-side code
+// can reach `apply_with_declared_writes` / `prune_to_declared` as
+// pure helpers without re-implementing them.
 pub mod declared_writes;
 #[cfg(not(feature = "no_std"))]
 pub mod check;
