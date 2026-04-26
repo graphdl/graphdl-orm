@@ -63,6 +63,13 @@ mod parse_forml2_stage2;
 #[allow(dead_code)]
 mod load_reading;
 #[allow(dead_code)]
+// `load_reading_core` (#586) — pure-FORML core extracted from
+// `load_reading`. The bin re-declares it so command.rs's
+// `crate::load_reading_core::*` paths resolve under the bin's
+// crate root the same way they do in lib.rs (matching the pattern
+// already in place for `select_component_core`).
+mod load_reading_core;
+#[allow(dead_code)]
 // verbalize module deleted (#211)
 // mod arest was deleted in 5aa1f7e (GraphDL → AREST rebrand).
 // The Command enum + apply_command_defs entry points moved to
