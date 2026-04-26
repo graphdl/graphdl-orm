@@ -56,6 +56,12 @@
 pub mod interrupts;
 pub mod keyboard;
 pub mod memory;
+// x86_64-specific modules — GDT / TSS / SYSCALL MSR / SYSCALL entry
+// stub. The contents are reachable only on x86_64 silicon (they
+// program architecturally-x86 features); kept under a sub-directory
+// so the per-arch boundary is visible at the path level. See the
+// sub-module's docstring for the boot-path orchestration.
+pub mod x86_64;
 // Pointer event ring (#460 Track AAAA, foundation for #459b virtio-
 // input wiring). Sibling of `keyboard.rs` — same ring shape, different
 // payload (`PointerEvent` instead of `DecodedKey`). Fed by the
@@ -161,6 +167,31 @@ pub fn enable_sse() {
         cr4.insert(Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE);
         Cr4::write(cr4);
     }
+}
+
+/// Install the x86_64 ring-3 userspace gate (#552). Stands up the
+/// GDT (kernel + user code/data segments), TSS (RSP0 + IST stacks),
+/// and SYSCALL/SYSRET MSRs so a `syscall` instruction from ring 3
+/// traps into `crate::syscall::dispatch::dispatch` via the entry
+/// stub in `x86_64::syscall_entry`.
+///
+/// After this returns, `process::trampoline::invoke` can `iretq`
+/// into ring 3 at a loaded ELF binary's entry point and the
+/// resulting userspace `syscall` instructions are routed to the
+/// kernel handler. Without this call, every `iretq` to ring 3
+/// faults on the first selector load and every `syscall`
+/// instruction traps as #UD.
+///
+/// Must run AFTER `init_memory()` (the TSS module needs the global
+/// allocator live) and AFTER `init_interrupts()` (the GDT install
+/// is independent of the IDT, but the boot-banner shape calls them
+/// in interleaved order; following that order keeps the smoke
+/// harness stable).
+///
+/// Idempotent — `Once`-guarded internally; calling twice is a
+/// no-op.
+pub fn install_userspace_gate() {
+    x86_64::install_userspace_gate();
 }
 
 /// Drive the kernel's idle loop. Unlike the BIOS arm's
