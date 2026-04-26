@@ -486,3 +486,145 @@ pub const OVERLAP_ELF: &[u8] = &[
     // PT_LOAD #1 payload (8 bytes 0xBB) — 0x110..0x118.
     0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
 ];
+
+// ---------------------------------------------------------------------------
+// SPAWN fixture (#521)
+// ---------------------------------------------------------------------------
+//
+// `SPAWN_ELF` is the smallest static binary the spawn pipeline can
+// drive end-to-end: one PT_LOAD segment carrying the x86_64
+// instruction bytes for `write(1, "hi", 2)` followed by
+// `exit_group(0)` plus the two-byte string "hi" packed at the tail
+// of the .text segment. Tier-1 of #521 stops at the entry-point jump
+// — the syscall layer (#473) hasn't landed yet, so the first
+// `syscall` instruction will trap. What this fixture proves at
+// load time is:
+//
+//   * A single-PT_LOAD static binary parses + loads cleanly into the
+//     `AddressSpace`.
+//   * The `Process::spawn` call sets up the initial stack with argc=1
+//     (argv[0] = `/bin/spawn`), argv terminator, envp terminator,
+//     and the seven-entry auxv (AT_PHDR / AT_PHENT / AT_PHNUM /
+//     AT_PAGESZ / AT_ENTRY / AT_RANDOM / AT_NULL).
+//   * The trampoline's `setup_x86_64` produces a populated
+//     `IretqFrame` with `rip = 0x40_1000` (= the entry point).
+//
+// The actual ring-3 jump is gated behind the
+// `TrampolineError::NotYetImplemented` return until #526 ships the
+// GDT/TSS scaffolding — the assertion is structural (the spawn
+// pipeline reaches the trampoline doorstep without panicking).
+//
+// Instruction bytes (little-endian x86_64):
+//
+//   0x40_1000:  b8 01 00 00 00       mov  eax, 1            ; sys_write
+//   0x40_1005:  bf 01 00 00 00       mov  edi, 1            ; fd = stdout
+//   0x40_100a:  48 8d 35 0d 00 00 00 lea  rsi, [rip+0xd]   ; -> "hi" at 0x40_101e
+//                                                          ;    rip after lea = 0x40_1011
+//                                                          ;    + 0xd = 0x40_101e
+//   0x40_1011:  ba 02 00 00 00       mov  edx, 2            ; len = 2
+//   0x40_1016:  0f 05                syscall                ; trap (no syscall table)
+//   0x40_1018:  b8 e7 00 00 00       mov  eax, 231          ; sys_exit_group
+//   0x40_101d:  31 ff                xor  edi, edi          ; status = 0
+//   ; (would be 0x40_101f: 0f 05 syscall, but we stop emitting; the
+//   ;  above is enough to exercise the entry-point invoke)
+//   0x40_101e:  68 69                ascii "hi"             ; write(2) buffer
+//
+// Total .text payload: 32 bytes (0x20). One PT_LOAD entry, no
+// PT_INTERP (static binary), one PT_GNU_STACK (NX hint).
+//
+// Layout (256 bytes total):
+//   File header           : 0x000..0x040  (64 bytes)
+//   Program header 0      : 0x040..0x078  (PT_LOAD .text — 0x20 file/mem)
+//   Program header 1      : 0x078..0x0B0  (PT_GNU_STACK)
+//   Pad to 0x100          : zero-fill
+//   PT_LOAD #0 payload    : 0x100..0x120  (32 bytes — instructions + "hi")
+//   Pad to 0x140          : zero-fill
+//
+// Why ProgramHeader 0's `p_flags = PF_R | PF_W | PF_X` would be a W^X
+// violation? It would. We use `PF_R | PF_X` (5) — tier-1 binaries
+// store the "hi" string inside .text (rodata co-located with code) so
+// it's still readable + executable but never written. Real toolchains
+// split rodata into its own segment; the fixture cuts the corner so
+// we keep one PT_LOAD.
+pub const SPAWN_ELF: &[u8] = &[
+    // -------- ELF64 file header (offsets 0x00..0x40) --------
+    // e_ident: magic + class=64 + data=LE + version=1 + ABI=SYSV.
+    0x7f, 0x45, 0x4c, 0x46,
+    0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // e_type = ET_EXEC, e_machine = EM_X86_64, e_version = 1.
+    0x02, 0x00, 0x3e, 0x00, 0x01, 0x00, 0x00, 0x00,
+    // e_entry = 0x0040_1000.
+    0x00, 0x10, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // e_phoff = 0x40, e_shoff = 0, e_flags = 0.
+    0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+    // e_ehsize = 64, e_phentsize = 56, e_phnum = 2, rest = 0.
+    0x40, 0x00,
+    0x38, 0x00,
+    0x02, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+    // -------- Program header 0: PT_LOAD .text (0x40..0x78) --------
+    // p_type = PT_LOAD.
+    0x01, 0x00, 0x00, 0x00,
+    // p_flags = PF_R | PF_X.
+    0x05, 0x00, 0x00, 0x00,
+    // p_offset = 0x100.
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // p_vaddr = 0x0040_1000.
+    0x00, 0x10, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // p_paddr = 0x0040_1000.
+    0x00, 0x10, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // p_filesz = 0x20 (32 bytes — instructions + "hi" string).
+    0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // p_memsz = 0x20.
+    0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // p_align = 0x1000.
+    0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+    // -------- Program header 1: PT_GNU_STACK (0x78..0xB0) --------
+    // p_type = PT_GNU_STACK.
+    0x51, 0xe5, 0x74, 0x64,
+    // p_flags = PF_R | PF_W (NX stack).
+    0x06, 0x00, 0x00, 0x00,
+    // p_offset / p_vaddr / p_paddr / p_filesz / p_memsz = 0.
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // p_align = 0x10.
+    0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+    // -------- Pad 0xB0..0x100 (80 bytes) --------
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+
+    // -------- PT_LOAD #0 payload (32 bytes) — 0x100..0x120 --------
+    // mov eax, 1                — b8 01 00 00 00
+    0xb8, 0x01, 0x00, 0x00, 0x00,
+    // mov edi, 1                — bf 01 00 00 00
+    0xbf, 0x01, 0x00, 0x00, 0x00,
+    // lea rsi, [rip+0xd]        — 48 8d 35 0d 00 00 00
+    0x48, 0x8d, 0x35, 0x0d, 0x00, 0x00, 0x00,
+    // mov edx, 2                — ba 02 00 00 00
+    0xba, 0x02, 0x00, 0x00, 0x00,
+    // syscall                   — 0f 05
+    0x0f, 0x05,
+    // mov eax, 231 (sys_exit_group) — b8 e7 00 00 00
+    0xb8, 0xe7, 0x00, 0x00, 0x00,
+    // xor edi, edi              — 31 ff
+    0x31, 0xff,
+    // ascii "hi"                — 68 69
+    0x68, 0x69,
+
+    // -------- Pad 0x120..0x140 (32 bytes) — slice tail --------
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+];

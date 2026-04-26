@@ -1,9 +1,13 @@
 // crates/arest-kernel/src/process/mod.rs
 //
-// `process` — Linux-process foundation (#472 epic). First slice is
+// `process` — Linux-process foundation (#472 epic). First slice was
 // #518: ELF64 header + program-header parsing into a `ParsedElf`
-// value. No memory mapping yet, no relocations yet, no syscall ABI
-// yet — those land in #472b / #472c / #472d respectively.
+// value. Second slice (#519 + #520) added the in-memory
+// `AddressSpace` model + `load_segments(&ParsedElf, &[u8])` that
+// walks PT_LOAD entries into page-aligned heap allocations. Third
+// slice (#521 — this commit) ships the `Process` struct + the
+// initial-stack builder + the privilege-transition trampoline so a
+// freshly-loaded binary can be brought to the doorstep of ring 3.
 //
 // Why a top-level `process` module
 // --------------------------------
@@ -17,8 +21,8 @@
 // already calls itself "FreeBSD-style Linux kernel API shim"); they
 // need their own module tree.
 //
-// Loader slice scope (#519 + #520, second commit)
-// ------------------------------------------------
+// Loader slice scope (#519 + #520)
+// --------------------------------
 // `elf` (the parser, foundation #518) plus `address_space` (the
 // in-memory representation of a loaded process — owns one
 // `LoadedSegment` per PT_LOAD, page-aligned heap allocation, drop-
@@ -26,29 +30,48 @@
 // consumes a parsed header + the original blob, returns a populated
 // `AddressSpace`. PT_INTERP detection (#520) is folded in — the
 // loader rejects dynamic binaries up front with
-// `LoaderError::DynamicLoaderRequired`. The relocation engine #472c
-// and the syscall trampoline #472d follow as separate sibling
-// submodules.
+// `LoaderError::DynamicLoaderRequired`.
+//
+// Spawn slice scope (#521 — this commit)
+// --------------------------------------
+// Three new submodules: `process` (the `Process` struct holding
+// pid / address_space / fd_table / state, plus `Process::spawn` that
+// orchestrates the spawn pipeline), `stack` (the System V AMD64 PSABI
+// initial-stack builder — argv / envp / auxv layout per spec), and
+// `trampoline` (the privilege-transition shim that sets up the iretq
+// frame and would `iretq` to ring 3 once #526's GDT/TSS scaffolding
+// + #527's page-table install land). The trampoline currently fails
+// at the actual ring-3 jump because those prerequisites are pending;
+// the entire SETUP path is exercised end-to-end + unit-tested.
 //
 // Gating
 // ------
-// Available unconditionally — the parser has no syscall surface, no
-// arch-specific intrinsics, no Linux-only headers. Pure byte-slice
-// arithmetic on a `&[u8]`. The downstream loader will need a
-// per-arch carve path (page-table flags differ x86_64 vs aarch64),
-// at which point that submodule will get its own `cfg(target_arch)`
-// gate; the parser stays portable.
+// `elf` and `address_space` are available unconditionally — pure
+// byte-slice arithmetic. `process` and `stack` are also unconditional
+// (no arch-specific intrinsics — the System V auxv numeric constants
+// are arch-agnostic per the generic ABI supplement). `trampoline`
+// has per-arch `cfg(target_arch = "...")` arms: x86_64 returns
+// `NotYetImplemented` (waiting on #526 + #527); aarch64 / armv7
+// return `UnsupportedArch`; the host-target arm (cargo test on
+// Windows / Linux / Darwin) also returns `UnsupportedArch` so the
+// crate compiles + the unit tests run cross-platform.
 
 #![allow(dead_code)]
 
 pub mod address_space;
 pub mod elf;
+pub mod process;
+pub mod stack;
+pub mod trampoline;
 
 // Re-exports for the call site that wants the loader as a one-liner.
-// Keeps the cross-module path short for the eventual #521 trampoline:
-//   use crate::process::{load_segments, AddressSpace};
+// Keeps the cross-module path short for the eventual #525 ld-musl:
+//   use crate::process::{load_segments, AddressSpace, Process};
 pub use address_space::{AddressSpace, LoadedSegment, LoaderError, SegmentPerm};
 pub use elf::{load_segments, LoadOrParseError};
+pub use process::{FdEntry, Process, ProcessState, SpawnError};
+pub use stack::{AuxvEntry, AuxvType, InitialStack, StackBuilder, StackError};
+pub use trampoline::{IretqFrame, TrampolineError};
 
 #[cfg(test)]
 pub mod test_fixtures;
