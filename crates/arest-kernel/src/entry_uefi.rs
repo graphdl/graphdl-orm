@@ -406,6 +406,20 @@ fn kernel_run_uefi(
     // `sti` is on.
     crate::arch::init_interrupts();
 
+    // #585: stand up the ring-3 userspace gate (GDT with USER_CS /
+    // USER_SS, TSS with RSP0 + IST stacks, SYSCALL/SYSRET MSRs).
+    // Without this, any subsequent `Process::spawn` would triple-
+    // fault on the first selector load because the firmware-
+    // inherited GDT does not contain ring-3 segments and IA32_LSTAR
+    // is uninitialised. Helper is `Once`-guarded; safe to call
+    // exactly once here. Must run AFTER `init_memory()` (TSS uses
+    // the global allocator) and AFTER `init_interrupts()` (banner
+    // ordering convention; the install itself is independent of the
+    // IDT). See `arch::uefi::x86_64::install_userspace_gate` for
+    // the GDT → TSS → SYSCALL-MSR sequence the helper drives.
+    crate::arch::install_userspace_gate();
+    println!("  gate:     ring-3 userspace gate online (GDT/TSS/SYSCALL MSRs)");
+
     // #379: bring the 1 kHz monotonic ms timer online. PIC remap +
     // PIT divisor + `sti`. Must run AFTER init_interrupts so the
     // IRQ 0 vector is populated before the first tick fires.
