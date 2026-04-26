@@ -1402,6 +1402,57 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         return external::external_browse_json(input, &snapshot);
     }
 
+    // ── #555 SystemVerb::LoadReading intercept ─────────────────────
+    //
+    //   system(h, "load_reading:<name>", <markdown body>) → <JSON envelope>
+    //
+    // Runtime peer of the bake-time `metamodel_readings()` assembler.
+    // Walks the full Stage-1 + Stage-2 parse pipeline against the
+    // current cell graph, runs the constraint validation pass, and
+    // commits the new noun / fact-type / derivation cells to the live
+    // DOMAINS state on success.
+    //
+    // Gate: same `RegisterMode` as `register:<name>` — the verb is
+    // refused outright unless the tenant has been flipped to
+    // `Privileged` by an admin (boot path / CLI). Default `Untrusted`
+    // protects an accidentally-exposed system_impl frontend from
+    // remote schema mutation.
+    //
+    // Envelope shape (success):
+    //   {"ok":true,"name":"<name>","addedNouns":[…],
+    //    "addedFactTypes":[…],"addedDerivations":[…]}
+    //
+    // Envelope shape (failure):
+    //   {"ok":false,"name":"<name>","error":"<error-class>",
+    //    "violations":[{"constraintId":…,"detail":…}, …]}
+    if let Some(name) = key.strip_prefix("load_reading:") {
+        if tenant.read().register_mode != RegisterMode::Privileged {
+            return r#"{"ok":false,"error":"disallowed","detail":"runtime LoadReading is gated by register_mode; flip to Privileged via set_register_mode"}"#.to_string();
+        }
+        let policy = crate::load_reading::LoadReadingPolicy::AllowAll;
+        // Snapshot under read lock first; on success escalate to write
+        // for atomic replace_d. Mirrors the snapshot/rollback path.
+        let snapshot = tenant.read().snapshot_d();
+        let outcome = match crate::load_reading::load_reading(&snapshot, name, input, policy) {
+            Ok(o) => o,
+            Err(err) => {
+                return load_reading_error_envelope(name, &err);
+            }
+        };
+        // Compile defs from merged state and commit. Using replace_d
+        // because LoadReading is a structural change (new cells +
+        // possibly new defs from compile_to_defs_state).
+        let mut defs = crate::compile::compile_to_defs_state(&outcome.new_state);
+        defs.push(("compile".to_string(), ast::Func::Platform("compile".to_string())));
+        defs.push(("apply".to_string(), ast::Func::Platform("apply_command".to_string())));
+        defs.push(("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())));
+        defs.push(("audit".to_string(), ast::Func::Platform("audit".to_string())));
+        let new_d = ast::defs_to_state(&defs, &outcome.new_state);
+        let mut st = tenant.write();
+        st.replace_d(new_d);
+        return load_reading_success_envelope(name, &outcome.report);
+    }
+
     // ── #493 select_component intercept ─────────────────────────────
     //
     //   system(h, "select_component", <JSON body>) → <JSON list> | "⊥"
@@ -1585,6 +1636,103 @@ fn classify_writer_result(result: &ast::Object) -> WriterResult {
         };
     }
     WriterResult::NoCommit { response: result.to_json_string() }
+}
+
+// ── #555 LoadReading envelope helpers ───────────────────────────────
+//
+// JSON envelopes for the `system(h, "load_reading:<name>", body)`
+// verb. Hand-rolled instead of via serde_json so the success path
+// stays allocation-light (no derive on `LoadReport`) and the failure
+// path can encode the structured `LoadError` variants by name. The
+// caller-side downstream tasks (#560-#564) will parse this back; the
+// shape is the contract.
+
+#[cfg(not(feature = "no_std"))]
+fn load_reading_success_envelope(
+    name: &str,
+    report: &crate::load_reading::LoadReport,
+) -> String {
+    let nouns = json_string_array(&report.added_nouns);
+    let fts = json_string_array(&report.added_fact_types);
+    let derivs = json_string_array(&report.added_derivations);
+    format!(
+        r#"{{"ok":true,"name":{},"addedNouns":{},"addedFactTypes":{},"addedDerivations":{}}}"#,
+        json_string(name), nouns, fts, derivs,
+    )
+}
+
+#[cfg(not(feature = "no_std"))]
+fn load_reading_error_envelope(name: &str, err: &crate::load_reading::LoadError) -> String {
+    use crate::load_reading::LoadError;
+    let (class, detail, violations_json): (&str, String, String) = match err {
+        LoadError::Disallowed => (
+            "disallowed",
+            "host policy refused this load (LoadReadingPolicy::Deny)".to_string(),
+            "[]".to_string(),
+        ),
+        LoadError::EmptyBody => (
+            "empty_body",
+            "reading body is empty".to_string(),
+            "[]".to_string(),
+        ),
+        LoadError::InvalidName(msg) => ("invalid_name", msg.clone(), "[]".to_string()),
+        LoadError::ParseError(msg) => ("parse_error", msg.clone(), "[]".to_string()),
+        LoadError::DeonticViolation(diags) => {
+            let inner: Vec<String> = diags
+                .iter()
+                .map(|d| {
+                    format!(
+                        r#"{{"reading":{},"message":{},"line":{}}}"#,
+                        json_string(&d.reading),
+                        json_string(&d.message),
+                        d.line,
+                    )
+                })
+                .collect();
+            (
+                "deontic_violation",
+                format!("{} deontic violation(s)", diags.len()),
+                format!("[{}]", inner.join(",")),
+            )
+        }
+    };
+    format!(
+        r#"{{"ok":false,"name":{},"error":{},"detail":{},"violations":{}}}"#,
+        json_string(name),
+        json_string(class),
+        json_string(&detail),
+        violations_json,
+    )
+}
+
+/// Encode a Rust string as a JSON string literal — quotes + escapes.
+/// Hand-rolled for the envelope helpers above; the engine's
+/// `to_json_string` Object method covers FFP shapes, not bare strings.
+#[cfg(not(feature = "no_std"))]
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(not(feature = "no_std"))]
+fn json_string_array(items: &[String]) -> String {
+    let inner: Vec<String> = items.iter().map(|s| json_string(s)).collect();
+    format!("[{}]", inner.join(","))
 }
 
 // ── WIT Component exports ───────────────────────────────────────────
@@ -2736,6 +2884,96 @@ Order has total.
         let result = system_impl(h, "register:bad", "not valid hex");
         assert_eq!(result, "⊥",
             "register: with malformed hex payload must return ⊥; got {result}");
+        release_impl(h);
+    }
+
+    // ── #555 system(h, "load_reading:<name>", body) verb ──────────
+
+    /// Untrusted tenant (default) must refuse `load_reading:*` outright
+    /// and emit a structured `disallowed` envelope instead of "⊥". The
+    /// envelope shape lets downstream target adapters (#560-#564) tell
+    /// "policy refused" apart from "engine error".
+    #[test]
+    fn system_load_reading_is_gated_untrusted_by_default() {
+        let h = create_bare_impl();
+        let result = system_impl(h, "load_reading:my-app", "Customer(.Name) is an entity type.");
+        assert!(
+            result.contains(r#""ok":false"#),
+            "untrusted tenant must reject; got {result}"
+        );
+        assert!(
+            result.contains(r#""error":"disallowed""#),
+            "envelope must carry the disallowed class; got {result}"
+        );
+
+        // Noun cell must be unchanged after the refused call.
+        let d = peek(h).expect("handle live");
+        let nouns = ast::fetch_or_phi("Noun", &d);
+        let names: Vec<String> = nouns.as_seq()
+            .map(|s| s.iter().filter_map(|f| ast::binding(f, "name").map(String::from)).collect())
+            .unwrap_or_default();
+        assert!(
+            !names.contains(&"Customer".to_string()),
+            "Customer must not appear in Noun cell after refused load; got {names:?}"
+        );
+        release_impl(h);
+    }
+
+    /// After flipping to Privileged, a valid body loads, the success
+    /// envelope carries the added noun list, and the live state has
+    /// the new noun in its Noun cell.
+    #[test]
+    fn system_load_reading_succeeds_after_privileged_flip() {
+        let h = create_bare_impl();
+        super::set_register_mode(h, super::RegisterMode::Privileged);
+        let result = system_impl(
+            h,
+            "load_reading:my-app",
+            "Customer(.Name) is an entity type.",
+        );
+        assert!(
+            result.contains(r#""ok":true"#),
+            "privileged tenant must accept; got {result}"
+        );
+        assert!(
+            result.contains(r#""addedNouns":["Customer"]"#),
+            "envelope must include the added noun; got {result}"
+        );
+
+        // Live state has Customer in the Noun cell.
+        let d = peek(h).expect("handle live");
+        let nouns = ast::fetch_or_phi("Noun", &d);
+        let names: Vec<String> = nouns.as_seq()
+            .map(|s| s.iter().filter_map(|f| ast::binding(f, "name").map(String::from)).collect())
+            .unwrap_or_default();
+        assert!(
+            names.contains(&"Customer".to_string()),
+            "Customer must appear in Noun cell after successful load; got {names:?}"
+        );
+        release_impl(h);
+    }
+
+    /// Empty body on a Privileged tenant rejects with the
+    /// `empty_body` envelope class.
+    #[test]
+    fn system_load_reading_rejects_empty_body() {
+        let h = create_bare_impl();
+        super::set_register_mode(h, super::RegisterMode::Privileged);
+        let result = system_impl(h, "load_reading:my-app", "");
+        assert!(result.contains(r#""ok":false"#));
+        assert!(result.contains(r#""error":"empty_body""#));
+        release_impl(h);
+    }
+
+    /// Malformed FORML rejects with `parse_error` and the parser's
+    /// error string surfaces in the `detail` field.
+    #[test]
+    fn system_load_reading_rejects_parse_error() {
+        let h = create_bare_impl();
+        super::set_register_mode(h, super::RegisterMode::Privileged);
+        let result = system_impl(h, "load_reading:bad", "each(.X) is an entity type.\n");
+        assert!(result.contains(r#""ok":false"#));
+        assert!(result.contains(r#""error":"parse_error""#));
         release_impl(h);
     }
 
