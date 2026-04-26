@@ -176,6 +176,17 @@ mod pci;
 mod repl;
 mod system;
 
+// `process` (#518 Track TTTT, foundation for the Linux-process
+// spawn epic #472). ELF64 header + program-header parser today;
+// loader (#472b), relocations (#472c), and syscall trampoline
+// (#472d) follow as sibling submodules. Available unconditionally —
+// the parser has no syscall surface, no arch-specific intrinsics,
+// no Linux-only headers. Pure byte-slice arithmetic on a `&[u8]`.
+// The downstream loader will gain `cfg(target_arch)` gates per arch
+// when its page-table-flag carve path lands; the parser stays
+// portable.
+pub mod process;
+
 // `linuxkpi` (#460 Track AAAA, foundation for the AREST-on-real-
 // hardware epic #459). FreeBSD-style Linux kernel API shim that lets
 // unmodified Linux C drivers link against AREST primitives. Off by
