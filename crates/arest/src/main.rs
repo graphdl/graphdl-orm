@@ -89,6 +89,12 @@ mod crypto;
 mod external;
 #[allow(dead_code)]
 mod generators;
+// CLI subcommand handlers (#543) — `arest run <app>`. Mirrors the
+// `mod <name>;` re-declaration pattern the rest of this bin uses to
+// pull in lib modules without an `arest::` import (which would alias
+// the bin and lib under the same crate name).
+#[allow(dead_code)]
+mod cli;
 
 // =========================================================================
 // SQLite persistence (feature = "local")
@@ -306,6 +312,44 @@ fn load_and_compile(conn: &rusqlite::Connection) -> ast::Object {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // ── Subcommand dispatch ────────────────────────────────────────────
+    // Subcommands are detected before flag parsing so they can have
+    // their own argv conventions (a free-form app name with embedded
+    // dashes / spaces would otherwise collide with --flags here).
+    // Matched subcommands consume the rest of argv and return their
+    // own exit code; unmatched first args fall through to the legacy
+    // single-arg form (`arest <readings_dir>` etc.) below.
+    if let Some(verb) = args.first() {
+        if verb == "run" {
+            // `arest run <app-name>` (#543) — resolve a Wine App name to
+            // its (slug, prefix Directory) pair via wine_app_by_name.
+            // Read-only; doesn't load --db, doesn't compile, doesn't
+            // execve `wine`. Wine prefix bootstrap lands in #504.
+            #[cfg(feature = "compat-readings")]
+            {
+                let rest: Vec<String> = args.iter().skip(1).cloned().collect();
+                // `metamodel_readings()` hands back &'static (&str, &str)
+                // pointing into .rodata; flatten to owned (&str, &str)
+                // pairs so dispatch's slice signature lines up with what
+                // the unit tests pass too.
+                let readings: Vec<(&str, &str)> = arest::metamodel_readings()
+                    .into_iter()
+                    .map(|(n, t)| (*n, *t))
+                    .collect();
+                let mut stdout = std::io::stdout();
+                let mut stderr = std::io::stderr();
+                let code = cli::run::dispatch(&rest, &readings, &mut stdout, &mut stderr);
+                std::process::exit(code);
+            }
+            #[cfg(not(feature = "compat-readings"))]
+            {
+                eprintln!("`arest run` requires the `compat-readings` feature.");
+                eprintln!("  cargo run --bin arest-cli --features compat-readings -- run \"App Name\"");
+                std::process::exit(2);
+            }
+        }
+    }
 
     // Parse flags.
     let no_validate = args.iter().any(|a| a == "--no-validate");

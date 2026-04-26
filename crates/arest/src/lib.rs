@@ -91,6 +91,11 @@ pub mod parse_forml2_stage2;
 // verbalize.rs deleted — zero production callers, tests were self-referential.
 #[cfg(not(feature = "no_std"))]
 pub mod command;
+// CLI subcommand handlers (#543) — `arest run <app>`, future
+// `arest install`, etc. std-only because the dispatchers print to
+// stdout/stderr and read process argv.
+#[cfg(not(feature = "no_std"))]
+pub mod cli;
 #[cfg(not(feature = "no_std"))]
 pub mod crypto;
 #[cfg(not(feature = "no_std"))]
