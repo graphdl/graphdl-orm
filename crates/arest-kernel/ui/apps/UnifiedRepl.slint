@@ -126,6 +126,22 @@ export component UnifiedRepl inherits Window {
     in property <string> current-cell-symbol;
     in property <[string]> current-cell-fields;
 
+    // ---- Navigation actions as cells (#512, EPIC #496) -------------
+    //
+    // HATEOAS via the cell graph itself: every screen exposes a list
+    // of "navigate to X" affordances derived from the FT graph (roles
+    // → joinable cells, derivations → consumed/produced cells, SM →
+    // next-state hop). The Rust glue computes the list via
+    // `cell_renderer::render_current_cell` (which delegates to
+    // `navigation::compute_navigation_targets`) and sends one row per
+    // target through this property.
+    //
+    // Each entry is a pre-formatted label (e.g. "[role] File",
+    // "[instance] File/f1"). Clicks fire `navigation-target-selected`
+    // with the row index — the kernel side resolves the index into a
+    // `CurrentCell` jump via its cached navigation-target vector.
+    in property <[string]> navigation-targets;
+
     // ---- Combined status text --------------------------------------
 
     // Footer status text — Rust glue renders a combined summary.
@@ -152,6 +168,10 @@ export component UnifiedRepl inherits Window {
     callback history-prev();
     // Down arrow — walk one step toward the present.
     callback history-next();
+    // Navigation affordance row clicked (#512). Argument is the
+    // index into `navigation-targets`. Kernel resolves the index via
+    // its cached navigation-target vector and updates `current-cell`.
+    callback navigation-target-selected(int);
 
     // ---- Window chrome ----------------------------------------------
 
@@ -396,6 +416,35 @@ export component UnifiedRepl inherits Window {
                                     font-weight: Theme.type-code.weight;
                                     font-size: Theme.type-code.size;
                                     wrap: word-wrap;
+                                }
+                            }
+                        }
+
+                        // ---- Navigation targets (HATEOAS) ----------
+                        // Navigation actions as cells (#512, EPIC #496).
+                        // Every screen exposes its own catalogue of
+                        // legal next moves derived from the FT graph
+                        // (roles → joinable cells, derivations →
+                        // consumed/produced cells, SM → next-state).
+                        // Each row is one clickable affordance —
+                        // clicks jump the current cell to the chosen
+                        // target.
+                        Rectangle {
+                            min-height: 80px;
+                            Card {
+                                title: "Navigate";
+                                if root.navigation-targets.length == 0 : Text {
+                                    text: "(no navigation targets — this cell is a leaf)";
+                                    color: Theme.text-muted;
+                                    font-family: Theme.type-body-sm.family;
+                                    font-size: Theme.type-body-sm.size;
+                                    wrap: word-wrap;
+                                }
+                                if root.navigation-targets.length > 0 : List {
+                                    items: root.navigation-targets;
+                                    item-clicked(idx, value) => {
+                                        root.navigation-target-selected(idx);
+                                    }
                                 }
                             }
                         }

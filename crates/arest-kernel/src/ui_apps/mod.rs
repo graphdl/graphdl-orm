@@ -33,6 +33,14 @@ pub mod registry;
 // project the cell's data into a list of human-readable lines for
 // the typed-surface area. Consumed by `unified_repl`.
 pub mod cell_renderer;
+// Navigation actions as cells (#512, EPIC #496). Companion to
+// `cell_renderer`: every screen IS a cell, every "navigate to X"
+// affordance IS *also* a cell. The catalogue of legal next moves
+// from a screen is computed by walking the FT graph (roles → joinable
+// cells, derivations → consumed/produced cells, SM → next-state hop)
+// rather than hand-listed per screen. Consumed by `unified_repl`'s
+// right-pane navigation list.
+pub mod navigation;
 // Unified REPL (#510, EPIC #496). Foundational structural merge of
 // the previous `hateoas` (Track SSS #429) + `repl` (Track TTT #430)
 // modules into a single panel — left pane drives the HATEOAS browse

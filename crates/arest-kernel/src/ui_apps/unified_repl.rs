@@ -55,6 +55,7 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use crate::arch::uefi::slint_backend::UnifiedRepl;
 use crate::system::SubscriberId;
 use crate::ui_apps::cell_renderer::{self, CurrentCell, RenderedScreen};
+use crate::ui_apps::navigation::NavigationTarget;
 
 /// Convenience alias — every Slint `[string]` property is bridged
 /// through a `ModelRc<SharedString>` backed by a `VecModel`. Same
@@ -129,6 +130,14 @@ struct UnifiedReplState {
     // `nav_stack` already maintains, but typed: nav_stack is the
     // breadcrumb trail; current_cell is the live target.
     current_cell: CurrentCell,
+
+    // Navigation actions as cells (#512, EPIC #496). Cache of the most
+    // recently rendered navigation catalogue, indexed by the same
+    // ordering the Slint surface displays. The click handler reads
+    // `nav_targets[idx]` to translate a click into a cell-jump.
+    // Recomputed on every `redraw` so live cell-graph updates are
+    // reflected in subsequent click handling.
+    nav_targets: Vec<NavigationTarget>,
 }
 
 impl UnifiedReplState {
@@ -141,6 +150,7 @@ impl UnifiedReplState {
             history_idx: None,
             pending_input: String::new(),
             current_cell: CurrentCell::Root,
+            nav_targets: Vec::new(),
         }
     }
 
@@ -558,6 +568,7 @@ impl Snapshot {
                 fields: vec![
                     "(SYSTEM not initialised — call system::init() first)".to_string(),
                 ],
+                navigation: Vec::new(),
             },
         }
     }
@@ -634,9 +645,16 @@ impl Snapshot {
 /// Pushes both the HATEOAS pane's models AND the REPL pane's
 /// scrollback in a single call so callbacks can mutate either side
 /// and call `redraw` once.
-fn redraw(window: &UnifiedRepl, ui: &UnifiedReplState) {
+///
+/// Takes `&mut` because the navigation catalogue (#512) is cached on
+/// the state struct so the click handler can resolve "row N clicked"
+/// to a `CurrentCell` jump deterministically; the cache is refreshed
+/// every redraw so live cell-graph updates are reflected on the
+/// next click.
+fn redraw(window: &UnifiedRepl, ui: &mut UnifiedReplState) {
     let snapshot = crate::system::with_state(|s| Snapshot::collect(s, ui));
     let snap = snapshot.unwrap_or_else(Snapshot::empty);
+    ui.nav_targets = snap.rendered.navigation.clone();
 
     // ---- HATEOAS pane ----
     let resources_model: StringModel = ModelRc::new(VecModel::from_iter(
@@ -685,6 +703,21 @@ fn redraw(window: &UnifiedRepl, ui: &UnifiedReplState) {
         snap.rendered.fields.iter().map(SharedString::from),
     ));
     window.set_current_cell_fields(fields_model);
+
+    // ---- Navigation actions as cells (#512) ----
+    // Each affordance row in the right pane corresponds to one
+    // `NavigationTarget` derived from the cell graph. The Slint side
+    // keys clicks by index into this vector — `compute_navigation_targets`
+    // sorts deterministically so successive redraws emit identical
+    // orderings, and the click handler resolves index → target via
+    // the cached `nav_targets` field on `UnifiedReplState`.
+    let nav_labels_model: StringModel = ModelRc::new(VecModel::from_iter(
+        snap.rendered
+            .navigation
+            .iter()
+            .map(|t| SharedString::from(t.label.as_str())),
+    ));
+    window.set_navigation_targets(nav_labels_model);
 
     // ---- Combined status footer ----
     let combined_status = format!(
@@ -756,6 +789,15 @@ impl UnifiedReplApp {
     pub fn current_cell_label(&self) -> String {
         self.state.borrow().current_cell.label()
     }
+
+    /// Read-only access to the cached navigation-target catalogue
+    /// length (#512). After construction this is `0` because no
+    /// `crate::system::with_state` snapshot has populated it yet
+    /// (the smoke-test platform has no SYSTEM); after the first live
+    /// `redraw` it reflects the cell-graph-derived row count.
+    pub fn navigation_target_count(&self) -> usize {
+        self.state.borrow().nav_targets.len()
+    }
 }
 
 /// Construct the Unified REPL window and wire its callbacks.
@@ -772,7 +814,7 @@ pub fn build_app() -> Result<UnifiedReplApp, slint::PlatformError> {
 
     // Initial paint — populates every Slint property from the empty
     // state before any user interaction.
-    redraw(&window, &state.borrow());
+    redraw(&window, &mut state.borrow_mut());
     window.set_prompt(SharedString::from("arest> "));
 
     // ---- HATEOAS pane callbacks ----------------------------------
@@ -793,7 +835,7 @@ pub fn build_app() -> Result<UnifiedReplApp, slint::PlatformError> {
             s.nav_stack.truncate(1);
             s.nav_push(Breadcrumb::Noun { noun });
             drop(s);
-            redraw(&window, &state.borrow());
+            redraw(&window, &mut state.borrow_mut());
         });
     }
 
@@ -825,7 +867,7 @@ pub fn build_app() -> Result<UnifiedReplApp, slint::PlatformError> {
             }
             s.nav_push(Breadcrumb::Instance { noun, instance });
             drop(s);
-            redraw(&window, &state.borrow());
+            redraw(&window, &mut state.borrow_mut());
         });
     }
 
@@ -836,7 +878,7 @@ pub fn build_app() -> Result<UnifiedReplApp, slint::PlatformError> {
         window.on_back_clicked(move || {
             let Some(window) = weak.upgrade() else { return };
             state.borrow_mut().nav_pop();
-            redraw(&window, &state.borrow());
+            redraw(&window, &mut state.borrow_mut());
         });
     }
 
@@ -855,7 +897,7 @@ pub fn build_app() -> Result<UnifiedReplApp, slint::PlatformError> {
                 s.submit(&prompt, line_owned);
             }
             window.set_current_input(SharedString::from(""));
-            redraw(&window, &state.borrow());
+            redraw(&window, &mut state.borrow_mut());
         });
     }
 
@@ -866,7 +908,7 @@ pub fn build_app() -> Result<UnifiedReplApp, slint::PlatformError> {
         window.on_clear(move || {
             let Some(window) = weak.upgrade() else { return };
             state.borrow_mut().clear_scrollback();
-            redraw(&window, &state.borrow());
+            redraw(&window, &mut state.borrow_mut());
         });
     }
 
@@ -894,6 +936,34 @@ pub fn build_app() -> Result<UnifiedReplApp, slint::PlatformError> {
             if let Some(text) = new_input {
                 window.set_current_input(SharedString::from(text));
             }
+        });
+    }
+
+    // Navigation actions as cells (#512). One affordance row per
+    // entry in the cached `nav_targets`; clicking row N jumps the
+    // current cell to `nav_targets[N].target`. The cache is refreshed
+    // on every `redraw` so the Slint side and the click handler stay
+    // in sync — the index the Slint side passes is always valid for
+    // the cache the kernel last filled.
+    {
+        let weak = window.as_weak();
+        let state = state.clone();
+        window.on_navigation_target_selected(move |idx| {
+            let Some(window) = weak.upgrade() else { return };
+            let target: Option<CurrentCell> = {
+                let s = state.borrow();
+                s.nav_targets
+                    .get(idx as usize)
+                    .map(|t| t.target.clone())
+            };
+            let Some(target) = target else { return };
+            {
+                let mut s = state.borrow_mut();
+                let label = target.label();
+                s.set_current_cell(target);
+                s.push_line(format!("Now showing: {label}"));
+            }
+            redraw(&window, &mut state.borrow_mut());
         });
     }
 
@@ -940,7 +1010,7 @@ pub fn build_app() -> Result<UnifiedReplApp, slint::PlatformError> {
             if !needs_redraw {
                 return;
             }
-            redraw(&window, &state_rc.borrow());
+            redraw(&window, &mut state_rc.borrow_mut());
         }));
         *id_slot.lock() = Some(id);
         state.borrow_mut().subscriber_id = Some(id);
@@ -1374,5 +1444,65 @@ mod tests {
         let mut s = UnifiedReplState::new();
         s.submit("> ", "noun File".to_string());
         assert_eq!(s.history, vec!["noun File".to_string()]);
+    }
+
+    // ---- Navigation actions as cells (#512) coverage --------------
+
+    #[test]
+    fn new_state_starts_with_empty_nav_targets() {
+        // Before any redraw the cache is empty — the click handler
+        // gracefully no-ops when given an out-of-bounds index.
+        let s = UnifiedReplState::new();
+        assert!(s.nav_targets.is_empty());
+    }
+
+    #[test]
+    fn nav_targets_cache_drives_set_current_cell_jump() {
+        // Simulate what `on_navigation_target_selected` does: read a
+        // target out of the cache by index and `set_current_cell` to
+        // it. The cell-as-screen invariant says the breadcrumb trail
+        // is rebuilt for Noun / Instance variants.
+        use crate::ui_apps::navigation::{NavigationKind, NavigationTarget};
+
+        let mut s = UnifiedReplState::new();
+        // Pre-populate the cache as if a redraw had filled it.
+        s.nav_targets = vec![
+            NavigationTarget::new(
+                CurrentCell::Noun { noun: "File".into() },
+                NavigationKind::Instance,
+            ),
+            NavigationTarget::new(
+                CurrentCell::Instance {
+                    noun: "File".into(),
+                    instance: "f1".into(),
+                },
+                NavigationKind::Instance,
+            ),
+        ];
+
+        // Picking row 1 (Instance) should rebuild the breadcrumb to
+        // Root → Noun(File) → Instance(File/f1).
+        let target = s.nav_targets[1].target.clone();
+        s.set_current_cell(target);
+        assert_eq!(s.nav_stack.len(), 3);
+        assert!(matches!(s.nav_stack[1], Breadcrumb::Noun { .. }));
+        assert!(matches!(s.nav_stack[2], Breadcrumb::Instance { .. }));
+        assert_eq!(
+            s.current_cell,
+            CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn nav_targets_out_of_bounds_index_no_op_safe() {
+        // The Slint click handler reads `nav_targets.get(idx)`; an
+        // out-of-bounds index (stale Slint event after a state swap)
+        // must be handled without panic. Mirror that lookup pattern.
+        let s = UnifiedReplState::new();
+        assert!(s.nav_targets.get(0).is_none());
+        assert!(s.nav_targets.get(usize::MAX).is_none());
     }
 }
