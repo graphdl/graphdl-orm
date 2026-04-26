@@ -78,6 +78,16 @@ pub mod help;
 // half of the introspection loop (`help` answers "what kind of
 // screen"; `violations` answers "what's broken").
 pub mod violations;
+// Command palette — fuzzy search over (cells × actions × navigation)
+// reachable from the current screen (#515, EPIC #496). Aggregates the
+// `cells_iter` cell list, `actions::compute_actions`, and
+// `navigation::compute_navigation_targets` into one catalogue,
+// fuzzy-matches against a query string, and renders ranked hits
+// with the cell-nav syntax to dispatch each. REPL command surface
+// today (`palette <query>` / `pal <query>`); the visual Cmd-K
+// overlay reuses the same catalogue + scoring once the Slint side
+// gains a modal component.
+pub mod palette;
 // Unified REPL (#510, EPIC #496). Foundational structural merge of
 // the previous `hateoas` (Track SSS #429) + `repl` (Track TTT #430)
 // modules into a single panel — left pane drives the HATEOAS browse
