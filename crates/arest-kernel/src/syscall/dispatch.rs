@@ -52,7 +52,9 @@
 // unknown syscall is logged rather than silently failing — but for
 // tier-1 the negative return is enough.
 
+use crate::syscall::close;
 use crate::syscall::exit;
+use crate::syscall::openat;
 use crate::syscall::write;
 
 /// Linux errno value for "Bad file descriptor". Returned by `write`
@@ -81,6 +83,13 @@ pub const EINVAL: i64 = 22;
 /// clean "this kernel can't" rather than silent failure.
 pub const ENOSYS: i64 = 38;
 
+/// Linux x86_64 syscall number for `close(fd)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_close` (= 3).
+/// The vendored musl tree confirms the same value at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_close`. Routes to
+/// `close::handle`, which releases the per-process fd-table slot.
+pub const SYS_CLOSE: u64 = 3;
+
 /// Linux x86_64 syscall number for `write(fd, buf, count)`. Source:
 /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_write`. The
 /// vendored musl tree carries the same value at
@@ -105,6 +114,18 @@ pub const SYS_EXIT: u64 = 60;
 /// `SYS_EXIT`; both route to `exit::handle`.
 pub const SYS_EXIT_GROUP: u64 = 231;
 
+/// Linux x86_64 syscall number for
+/// `openat(int dirfd, const char *pathname, int flags, mode_t mode)`.
+/// Source: `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_openat`
+/// (= 257). The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_openat`. Modern
+/// libc (glibc 2.26+, musl 1.0.3+) implements `open(2)` as
+/// `openat(AT_FDCWD, ...)` so this is the canonical open-side
+/// surface. Routes to `openat::handle`, which resolves the path
+/// against the synthetic-fs table (`/proc/*` etc) then the File-cell
+/// graph (#398) and allocates a per-process fd.
+pub const SYS_OPENAT: u64 = 257;
+
 /// The dispatch entry point. Match on `rax` and forward the argument
 /// registers (rdi / rsi / rdx / r10 / r8 / r9) to the per-syscall
 /// handler. Handlers that take fewer than six args simply ignore the
@@ -128,12 +149,14 @@ pub fn dispatch(
     rdi: u64,
     rsi: u64,
     rdx: u64,
-    _r10: u64,
+    r10: u64,
     _r8: u64,
     _r9: u64,
 ) -> i64 {
     match rax {
         SYS_WRITE => write::handle(rdi, rsi, rdx),
+        SYS_CLOSE => close::handle(rdi as i32),
+        SYS_OPENAT => openat::handle(rdi as i32, rsi, rdx as u32, r10 as u32),
         SYS_EXIT | SYS_EXIT_GROUP => {
             // exit / exit_group both transition the Process state
             // machine to `Exited` and must never return. The handler's
@@ -195,6 +218,20 @@ mod tests {
     #[test]
     fn sys_exit_group_number_matches_linux_uapi() {
         assert_eq!(SYS_EXIT_GROUP, 231);
+    }
+
+    /// `SYS_OPENAT` is 257 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_openat`.
+    #[test]
+    fn sys_openat_number_matches_linux_uapi() {
+        assert_eq!(SYS_OPENAT, 257);
+    }
+
+    /// `SYS_CLOSE` is 3 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_close`.
+    #[test]
+    fn sys_close_number_matches_linux_uapi() {
+        assert_eq!(SYS_CLOSE, 3);
     }
 
     /// Unknown syscall numbers return `-ENOSYS`. musl + glibc both
