@@ -126,6 +126,34 @@ compositor-test = []
 # is FSF-compatible with AREST's AGPL-3.0-or-later umbrella per the
 # license-list matrix.
 musl-libc = []
+# busybox (#525 Track WWWWW). Builds the vendored busybox 1.36.1 tree
+# (`vendor/busybox/`) into a static x86_64-linux ELF binary that links
+# against musl libc.a (#524). The applet selection — only `ls`, `cat`,
+# `echo`, `wc`, `head`, `tail` — is driven by
+# `busybox_config/.config`, sibling to `musl_config/`. Off by default
+# for two reasons:
+#
+#   1. License: busybox is GPL-2.0-only (see vendor/busybox/LICENSE),
+#      which is NOT compatible with AREST's default AGPL-3.0-or-later
+#      umbrella per the FSF compatibility matrix (AGPL-3.0+ can carry
+#      GPL-2.0+ or GPL-3.0+ code, NOT GPL-2.0-only). The user has
+#      accepted GPL feature-gating for tier-2 artefacts (per the #396
+#      Doom decision in `crates/arest-kernel/doom_assets/README.md`):
+#      the .efi kernel image stays AGPL-only; busybox ships as a
+#      separate guest payload built into `$OUT_DIR/busybox` for the
+#      ELF loader (#472, when the gate is fully wired) to launch.
+#
+#   2. Build cost: the busybox build pass is large (~150 libbb sources
+#      + 6 applet sources + 6 crt files); on a fresh clone it adds ~30
+#      seconds to the cold compile. Default builds skip it entirely.
+#
+# Pulling in the feature also requires `--features musl-libc` to be
+# set so the libc.a archive is in `$OUT_DIR/`. The build script
+# guards on the `musl_libc_built` cfg signal that #524 emits and
+# emits a `cargo:warning=` if it's missing, mirroring the
+# graceful-degrade pattern #460 / #524 established for hosts without
+# a working cross-compiler.
+busybox = []
 default = []
 
 [lib]
