@@ -1,0 +1,1125 @@
+// crates/arest-kernel/src/ui_apps/actions.rs
+//
+// SYSTEM calls as actions on the current screen (#513, EPIC #496).
+//
+// VVVV (#511) landed cell-as-screen rendering and ZZZZ (#512) landed
+// navigation actions as cells. The third leg of the cell-graph
+// HATEOAS triangle, per #496:
+//
+//   "It provides SYSTEM calls, but it should be easy to navigate the
+//    system using its own principles"
+//
+// Navigation answers "where can I go from here?". Actions answer
+// "what can I do here?" — and every "do" is a SYSTEM verb (apply,
+// transition, fetch, FetchOrPhi, Store, Def, Platform, Native — the
+// Func primitive set in `arest::ast::Func`). Clicking an action row
+// dispatches the verb against the current cell context, with default
+// arguments pre-bound from the cell's data (the property-binding
+// principle PPPP introduced in #491: cell value ↔ widget input).
+//
+// # Conceptual model — every action IS a cell
+//
+// Each `SystemAction` produced here corresponds to a *fact* of the
+// implicit fact type:
+//
+//     <CurrentCellRef> has system_action <Verb, Args>
+//
+// Same shape ZZZZ used for navigation: the action catalogue is
+// computed from the cell graph rather than hand-listed per screen,
+// and the kind tag preserves provenance (Apply / Transition /
+// Fetch / Store / Def / Platform). The free-text REPL still works
+// (typed verb invocations); the action panel is the *canonical*
+// surface — each action row IS a SYSTEM call grounded in cell
+// context, ready to dispatch.
+//
+// # Per-cell-type action mapping
+//
+// Mirrors the matrix in #513's task scope:
+//
+//   * Root            — `apply create <Noun>` per known noun;
+//                       `Def` to introspect a noun's FactType graph.
+//   * Noun            — `apply create <Noun>` (open the form);
+//                       `apply destroy <Noun>::<id>` per instance;
+//                       `Fetch <Noun>_has_…` to inspect any FT cell.
+//   * Instance        — `apply update <Noun>::<id>` (edit form);
+//                       `apply destroy <Noun>::<id>`;
+//                       `transition <SM>::<id> <next-state>` per SM
+//                       fact whose `forResource` matches the instance.
+//   * FactCell        — `apply remove fact <fact-id>` per fact in cell;
+//                       `Fetch <cell_name>` to inspect raw contents.
+//   * ComponentInstance — `apply update Component_property <name>`
+//                       per declared property of the Component.
+//
+// Each `SystemAction` carries `default_args` — pre-bound parameters
+// from the current cell context. Free-text REPL input is still valid
+// (the user can type the same verb manually), but the canonical
+// surface is one click per row with the args already filled in.
+//
+// # Why a separate module
+//
+// The derivation logic mirrors `navigation.rs` in shape: pure
+// function over `&Object` returning owned data, sorted/deduped for
+// stable click-by-index dispatch. Extending `cell_renderer.rs` would
+// crowd out the rendering rule. The two modules read the same
+// `Object` shape but have orthogonal concerns: `navigation` answers
+// "what cells can I reach?"; `actions` answers "what SYSTEM calls
+// can I make?". Both feed into `RenderedScreen` so the typed-surface
+// area picks them up in one redraw.
+
+#![allow(dead_code)]
+
+use alloc::collections::BTreeSet;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec;
+use alloc::vec::Vec;
+
+use arest::ast::{self, Func, Object};
+
+use crate::ui_apps::cell_renderer::CurrentCell;
+
+// ── SystemAction ───────────────────────────────────────────────────
+
+/// One legal "SYSTEM call from this screen" affordance derived from
+/// the cell graph + the current cell context. Each action IS a cell
+/// of the implicit fact type
+/// `<current_cell> has system_action <Verb, Args>`. The renderer
+/// surfaces these as clickable rows; the click handler dispatches the
+/// SYSTEM verb with `default_args` pre-bound from cell context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemAction {
+    /// The SYSTEM verb to dispatch when the affordance fires.
+    pub verb: SystemVerb,
+    /// Default arguments pre-bound from the cell context. The
+    /// dispatcher splices these into the verb invocation; the user
+    /// can override any of them via the (future) parameter editor in
+    /// the action panel. Format: ordered list of (param_name, value)
+    /// pairs so the dispatcher and the editor agree on positional
+    /// semantics.
+    pub default_args: Vec<(String, String)>,
+    /// Human-readable label for the affordance row. Composed by the
+    /// constructor from verb + first-arg hint so the Slint side
+    /// doesn't need to do any string assembly. Kept stable across
+    /// redraws (sorted by `compute_actions`) so click-by-index works.
+    pub label: String,
+}
+
+impl SystemAction {
+    /// Construct an action with auto-derived label. The label format
+    /// is `[<verb-prefix>] <verb-text>` where `verb-text` is the
+    /// canonical free-text REPL form a power user would type
+    /// (e.g. `apply create File`, `transition Order::o1 submit`),
+    /// so the action panel doubles as documentation for the REPL.
+    pub fn new(verb: SystemVerb, default_args: Vec<(String, String)>) -> Self {
+        let prefix = verb.label_prefix();
+        let text = verb.canonical_text(&default_args);
+        let label = format!("[{prefix}] {text}");
+        Self { verb, default_args, label }
+    }
+}
+
+/// SYSTEM verb space (#161). Mirrors the kernel-accessible
+/// `arest::ast::Func` primitives PLUS the high-level "apply" verb
+/// (the host crate's `command::Command`). The host crate's full
+/// `Command` enum is `cfg(not(feature = "no_std"))`-gated (see
+/// VVVV's #511 finding); on the kernel side we represent the same
+/// surface as a flat enum and dispatch through `system_impl` (the
+/// in-kernel verb dispatcher used by the legacy REPL).
+///
+/// Provenance / per-screen filter:
+///   * Apply is the highest-level verb — create / update / destroy /
+///     remove / transition. The dispatcher unpacks the kind from the
+///     first arg.
+///   * Transition is sugar for `Apply { kind: Transition, … }` so
+///     the action panel can surface it distinctly per SM fact.
+///   * Fetch / FetchOrPhi / Store / Def / Platform / Native map
+///     1-1 onto `arest::ast::Func` variants of the same name —
+///     they're the cell-level read/write primitives.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SystemVerb {
+    /// `apply create <Noun> { … }` — instantiate a new Noun.
+    ApplyCreate,
+    /// `apply update <Noun>::<id>` — edit an existing instance.
+    ApplyUpdate,
+    /// `apply destroy <Noun>::<id>` — delete an instance.
+    ApplyDestroy,
+    /// `apply remove fact <fact-id>` — drop one fact from a cell.
+    ApplyRemoveFact,
+    /// `transition <SM>::<id> <next-state>` — fire a SM transition.
+    Transition,
+    /// `fetch <cell_name>` — read a cell, ⊥ if absent.
+    Fetch,
+    /// `fetch_or_phi <cell_name>` — read a cell, φ if absent.
+    FetchOrPhi,
+    /// `store <cell_name> <contents>` — write a cell.
+    Store,
+    /// `def <name>` — introspect a definition.
+    Def,
+    /// `platform <name>` — invoke a Platform primitive by name.
+    Platform,
+    /// `native <name>` — invoke a Native escape-hatch closure.
+    Native,
+}
+
+impl SystemVerb {
+    /// Short tag shown in the action label.
+    pub fn label_prefix(&self) -> &'static str {
+        match self {
+            SystemVerb::ApplyCreate => "create",
+            SystemVerb::ApplyUpdate => "update",
+            SystemVerb::ApplyDestroy => "destroy",
+            SystemVerb::ApplyRemoveFact => "remove",
+            SystemVerb::Transition => "transition",
+            SystemVerb::Fetch => "fetch",
+            SystemVerb::FetchOrPhi => "fetch?",
+            SystemVerb::Store => "store",
+            SystemVerb::Def => "def",
+            SystemVerb::Platform => "platform",
+            SystemVerb::Native => "native",
+        }
+    }
+
+    /// Canonical REPL text for this verb + args, suitable for the
+    /// action label and (later) for the parameter editor's preview
+    /// strip. Mirrors what a power user would type in the free-text
+    /// REPL to get the same effect.
+    pub fn canonical_text(&self, args: &[(String, String)]) -> String {
+        let arg_value = |key: &str| -> String {
+            args.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        match self {
+            SystemVerb::ApplyCreate => {
+                let noun = arg_value("noun");
+                format!("apply create {noun}")
+            }
+            SystemVerb::ApplyUpdate => {
+                let noun = arg_value("noun");
+                let id = arg_value("id");
+                format!("apply update {noun}::{id}")
+            }
+            SystemVerb::ApplyDestroy => {
+                let noun = arg_value("noun");
+                let id = arg_value("id");
+                format!("apply destroy {noun}::{id}")
+            }
+            SystemVerb::ApplyRemoveFact => {
+                let cell = arg_value("cell");
+                let fact = arg_value("fact");
+                format!("apply remove fact {cell}#{fact}")
+            }
+            SystemVerb::Transition => {
+                let sm = arg_value("sm");
+                let id = arg_value("id");
+                let next = arg_value("next");
+                format!("transition {sm}::{id} {next}")
+            }
+            SystemVerb::Fetch => {
+                let name = arg_value("name");
+                format!("fetch {name}")
+            }
+            SystemVerb::FetchOrPhi => {
+                let name = arg_value("name");
+                format!("fetch_or_phi {name}")
+            }
+            SystemVerb::Store => {
+                let name = arg_value("name");
+                format!("store {name}")
+            }
+            SystemVerb::Def => {
+                let name = arg_value("name");
+                format!("def {name}")
+            }
+            SystemVerb::Platform => {
+                let name = arg_value("name");
+                format!("platform {name}")
+            }
+            SystemVerb::Native => {
+                let name = arg_value("name");
+                format!("native {name}")
+            }
+        }
+    }
+}
+
+// ── Public entry ───────────────────────────────────────────────────
+
+/// Walk the cell graph and return every SYSTEM call surfaced as an
+/// action on `current_cell`. Pure function — `with_state` callers
+/// can drop the read lock the moment this returns.
+///
+/// Result is sorted (verb then label) so successive redraws emit
+/// identical orderings; the Slint side relies on the index into this
+/// vector to identify which action the user clicked.
+pub fn compute_actions(current_cell: &CurrentCell, state: &Object) -> Vec<SystemAction> {
+    let mut out = match current_cell {
+        CurrentCell::Root => actions_for_root(state),
+        CurrentCell::Noun { noun } => actions_for_noun(noun, state),
+        CurrentCell::Instance { noun, instance } => {
+            actions_for_instance(noun, instance, state)
+        }
+        CurrentCell::FactCell { cell_name } => actions_for_fact_cell(cell_name, state),
+        CurrentCell::ComponentInstance { component_id } => {
+            actions_for_component_instance(component_id, state)
+        }
+    };
+
+    // Stable, deterministic ordering. The Slint side keys clicks by
+    // index; the kernel must emit the same order on every redraw.
+    out.sort_by(|a, b| a.verb.cmp(&b.verb).then_with(|| a.label.cmp(&b.label)));
+    // Dedupe identical (verb, label) pairs that two different walks
+    // produce.
+    out.dedup_by(|a, b| a.verb == b.verb && a.label == b.label);
+    out
+}
+
+// ── Per-cell-type action derivation ────────────────────────────────
+
+/// Root actions: `apply create <Noun>` per known noun + a `Def`
+/// introspection action per noun. Mirrors `actions_for_root` in
+/// shape to `targets_for_root`: one row per noun, derived from
+/// `discover_nouns`.
+fn actions_for_root(state: &Object) -> Vec<SystemAction> {
+    let mut out: Vec<SystemAction> = Vec::new();
+    for noun in discover_nouns(state) {
+        out.push(SystemAction::new(
+            SystemVerb::ApplyCreate,
+            vec![("noun".to_string(), noun.clone())],
+        ));
+        out.push(SystemAction::new(
+            SystemVerb::Def,
+            vec![("name".to_string(), format!("resolve:{noun}"))],
+        ));
+    }
+    out
+}
+
+/// Noun actions: a `create` form-opener for the noun + a per-instance
+/// `destroy` action + a `fetch?` row per FT cell the noun owns.
+fn actions_for_noun(noun: &str, state: &Object) -> Vec<SystemAction> {
+    let mut out: Vec<SystemAction> = Vec::new();
+
+    // Open the create form for this noun.
+    out.push(SystemAction::new(
+        SystemVerb::ApplyCreate,
+        vec![("noun".to_string(), noun.to_string())],
+    ));
+
+    // Destroy each instance.
+    for instance in instances_of(noun, state) {
+        out.push(SystemAction::new(
+            SystemVerb::ApplyDestroy,
+            vec![
+                ("noun".to_string(), noun.to_string()),
+                ("id".to_string(), instance),
+            ],
+        ));
+    }
+
+    // Inspect each owned FT cell via FetchOrPhi.
+    let prefix = format!("{noun}_has_");
+    let cells: BTreeSet<String> = ast::cells_iter(state)
+        .into_iter()
+        .filter_map(|(cn, _)| {
+            if cn.starts_with(&prefix[..]) && !cn.contains(':') {
+                Some(cn.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for cell_name in cells {
+        out.push(SystemAction::new(
+            SystemVerb::FetchOrPhi,
+            vec![("name".to_string(), cell_name)],
+        ));
+    }
+
+    out
+}
+
+/// Instance actions: `apply update <Noun>::<id>`, `apply destroy
+/// <Noun>::<id>`, plus a `transition` row per next-state reachable
+/// from the SM fact (when one exists for this instance).
+fn actions_for_instance(
+    noun: &str,
+    instance: &str,
+    state: &Object,
+) -> Vec<SystemAction> {
+    let mut out: Vec<SystemAction> = Vec::new();
+
+    // Update + Destroy — the canonical Instance verbs.
+    out.push(SystemAction::new(
+        SystemVerb::ApplyUpdate,
+        vec![
+            ("noun".to_string(), noun.to_string()),
+            ("id".to_string(), instance.to_string()),
+        ],
+    ));
+    out.push(SystemAction::new(
+        SystemVerb::ApplyDestroy,
+        vec![
+            ("noun".to_string(), noun.to_string()),
+            ("id".to_string(), instance.to_string()),
+        ],
+    ));
+
+    // State machine: per next-state transition. Emits one action
+    // per next-state hop the SM has registered. #514 will specialise
+    // this further (one button per outgoing transition with the
+    // event name); #513 lays the foundation by surfacing the verb at
+    // all when an SM fact applies. The "next" arg is left empty when
+    // no Transition cell binds the next-state list — the user can
+    // still fire the verb manually with their own next-state.
+    if let Some(sm_id) = state_machine_for(noun, instance, state) {
+        let next_states = next_states_for(&sm_id, state);
+        if next_states.is_empty() {
+            out.push(SystemAction::new(
+                SystemVerb::Transition,
+                vec![
+                    ("sm".to_string(), sm_id.clone()),
+                    ("id".to_string(), instance.to_string()),
+                    ("next".to_string(), String::new()),
+                ],
+            ));
+        } else {
+            for next in next_states {
+                out.push(SystemAction::new(
+                    SystemVerb::Transition,
+                    vec![
+                        ("sm".to_string(), sm_id.clone()),
+                        ("id".to_string(), instance.to_string()),
+                        ("next".to_string(), next),
+                    ],
+                ));
+            }
+        }
+    }
+
+    out
+}
+
+/// Fact-cell actions: `apply remove fact <id>` per fact in the cell
+/// + a single `fetch` action to inspect the raw contents. The
+/// "remove fact" rows give the user a per-row delete affordance
+/// without leaving the cell view.
+fn actions_for_fact_cell(cell_name: &str, state: &Object) -> Vec<SystemAction> {
+    let mut out: Vec<SystemAction> = Vec::new();
+
+    // Always offer raw fetch as a baseline introspection action.
+    out.push(SystemAction::new(
+        SystemVerb::Fetch,
+        vec![("name".to_string(), cell_name.to_string())],
+    ));
+
+    // Per-fact remove. We use the fact's index into the cell as the
+    // synthetic id (the engine doesn't carry a stable per-fact id
+    // today — #513 surfaces the affordance, #514+ may seed a
+    // ProvenanceId if needed).
+    let cell = ast::fetch_or_phi(cell_name, state);
+    if let Some(facts) = cell.as_seq() {
+        for (idx, _fact) in facts.iter().enumerate() {
+            out.push(SystemAction::new(
+                SystemVerb::ApplyRemoveFact,
+                vec![
+                    ("cell".to_string(), cell_name.to_string()),
+                    ("fact".to_string(), idx.to_string()),
+                ],
+            ));
+        }
+    }
+
+    out
+}
+
+/// Component-instance actions: `apply update Component_property
+/// <name>` per declared property of the Component. Mirrors the
+/// "edit each prop" affordance the prior `project_component_instance`
+/// only listed read-only.
+fn actions_for_component_instance(
+    component_id: &str,
+    state: &Object,
+) -> Vec<SystemAction> {
+    let mut out: Vec<SystemAction> = Vec::new();
+    let comp_root = component_id.split('.').next().unwrap_or(component_id);
+
+    let prop_cell = ast::fetch_or_phi(
+        "Component_has_Property_of_PropertyType_with_PropertyDefault",
+        state,
+    );
+    let Some(facts) = prop_cell.as_seq() else {
+        return out;
+    };
+    for fact in facts {
+        if !ast::binding_matches(fact, "Component", comp_root) {
+            continue;
+        }
+        let Some(name) = ast::binding(fact, "PropertyName") else {
+            continue;
+        };
+        out.push(SystemAction::new(
+            SystemVerb::ApplyUpdate,
+            vec![
+                ("noun".to_string(), "Component_property".to_string()),
+                ("id".to_string(), format!("{component_id}#{name}")),
+            ],
+        ));
+    }
+    out
+}
+
+// ── Cell-graph helpers (pure over &Object) ────────────────────────
+
+/// Sorted, deduplicated set of Noun names — same shape as
+/// `navigation::discover_nouns`. Filtered to skip `:`-shards and
+/// the synthetic `D` cell.
+fn discover_nouns(state: &Object) -> Vec<String> {
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for (cell_name, _) in ast::cells_iter(state) {
+        if cell_name.contains(':') {
+            continue;
+        }
+        let Some((noun, _)) = cell_name.split_once("_has_") else {
+            continue;
+        };
+        if noun == "D" {
+            continue;
+        }
+        set.insert(noun.to_string());
+    }
+    set.into_iter().collect()
+}
+
+/// Distinct instance identifiers for `noun` — every value bound to
+/// the noun's role across every cell of the form `<Noun>_has_…`.
+/// Mirrors `navigation::instances_of`.
+fn instances_of(noun: &str, state: &Object) -> Vec<String> {
+    let prefix = format!("{noun}_has_");
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for (cell_name, contents) in ast::cells_iter(state) {
+        if !cell_name.starts_with(&prefix[..]) {
+            continue;
+        }
+        let Some(facts) = contents.as_seq() else {
+            continue;
+        };
+        for fact in facts {
+            if let Some(id) = ast::binding(fact, noun) {
+                set.insert(id.to_string());
+            }
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// Look up the SM identifier for a (noun, instance) pair if any
+/// `StateMachine_has_currentlyInStatus` fact references the instance
+/// (either as the SM itself or as the `forResource`). Returns the SM
+/// identifier so the action panel can populate the `transition` verb's
+/// `sm` arg.
+fn state_machine_for(noun: &str, instance: &str, state: &Object) -> Option<String> {
+    let cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", state);
+    let facts = cell.as_seq()?;
+    facts.iter().find_map(|fact| {
+        if ast::binding_matches(fact, "forResource", instance) {
+            ast::binding(fact, "State Machine").map(|s| s.to_string())
+        } else if ast::binding_matches(fact, "State Machine", instance) {
+            Some(instance.to_string())
+        } else if ast::binding_matches(fact, noun, instance) {
+            ast::binding(fact, "State Machine").map(|s| s.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// Enumerate next-state values reachable from the SM's transition
+/// table. Reads `Transition_is_to_Status` (the canonical
+/// transition-target cell shape) and returns every `Status` value.
+/// Returns an empty Vec when no transition cell is present — the
+/// caller emits a single Transition action with empty `next` so the
+/// user can still type a next state manually.
+fn next_states_for(sm_id: &str, state: &Object) -> Vec<String> {
+    let cell = ast::fetch_or_phi("Transition_is_to_Status", state);
+    let Some(facts) = cell.as_seq() else {
+        return Vec::new();
+    };
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for fact in facts {
+        // The transition fact may also bind a SM Definition or a
+        // Noun; we accept any fact that mentions the SM id in any
+        // role position (the SM cell shape varies by version) AND
+        // emit the Status. Conservative: when no SM filter matches,
+        // drop the row (avoid spuriously listing every transition).
+        let Some(pairs) = fact.as_seq() else { continue };
+        let mentions_sm = pairs.iter().any(|p| {
+            let Some(items) = p.as_seq() else { return false };
+            items.len() == 2 && items[1].as_atom() == Some(sm_id)
+        });
+        if !mentions_sm {
+            continue;
+        }
+        if let Some(status) = ast::binding(fact, "Status") {
+            set.insert(status.to_string());
+        }
+    }
+    set.into_iter().collect()
+}
+
+// ── Dispatch (action invocation → SYSTEM call) ────────────────────
+
+/// Dispatch a SystemAction against the in-kernel SYSTEM and return
+/// the result as a human-readable line for the REPL scrollback. This
+/// is the kernel-side translation of the action panel click into the
+/// existing `Func`-application path the legacy REPL uses.
+///
+/// The dispatcher is intentionally narrow on the foundation slice:
+/// every verb resolves through `crate::system::with_state` + a
+/// single `ast::apply` (the same shape `system::apply_named` /
+/// `system::fetch_named` use). Verbs that mutate state (Apply*,
+/// Transition, Store) are no-ops on the foundation slice — they
+/// return a "would dispatch" annotation describing what the call
+/// would have done, so the REPL scrollback shows the user the
+/// effect without committing it. The full mutation path lands when
+/// the host-side `command::apply_command` becomes reachable from
+/// the kernel (#515+ wiring through Platform).
+pub fn dispatch_action(action: &SystemAction) -> String {
+    let summary = action.verb.canonical_text(&action.default_args);
+    match action.verb {
+        // Read-only verbs: actually dispatch through the kernel's
+        // existing fetch path so the user sees real cell contents.
+        SystemVerb::Fetch | SystemVerb::FetchOrPhi => {
+            let name = action
+                .default_args
+                .iter()
+                .find(|(k, _)| k == "name")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            if name.is_empty() {
+                return format!("[action] {summary} → (missing name)");
+            }
+            let bytes = crate::system::fetch_named(&name);
+            let body = core::str::from_utf8(&bytes)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| format!("({} bytes)", bytes.len()));
+            format!("[action] {summary} → {body}")
+        }
+        // Def is a fetch into the def cell; same shape as Fetch but
+        // explicit about the verb in the result line.
+        SystemVerb::Def => {
+            let name = action
+                .default_args
+                .iter()
+                .find(|(k, _)| k == "name")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            if name.is_empty() {
+                return format!("[action] {summary} → (missing name)");
+            }
+            // Defs live in the D cell as `D_has_<name>` shards; the
+            // ρ-dispatch path uses FetchOrPhi(<name, D>) to look one
+            // up. Mirror that.
+            let bytes = crate::system::fetch_named(&name);
+            let body = core::str::from_utf8(&bytes)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| format!("({} bytes)", bytes.len()));
+            format!("[action] {summary} → def: {body}")
+        }
+        // Mutating verbs: would-dispatch on the foundation slice.
+        // The verb survives the round-trip through Func::* primitives
+        // so a future commit can plumb `system::apply` here without
+        // changing the action enumeration shape.
+        SystemVerb::ApplyCreate
+        | SystemVerb::ApplyUpdate
+        | SystemVerb::ApplyDestroy
+        | SystemVerb::ApplyRemoveFact
+        | SystemVerb::Transition
+        | SystemVerb::Store => {
+            format!("[action] {summary} → (would dispatch — foundation slice is read-only)")
+        }
+        // Platform / Native: dispatch path resolves the named
+        // primitive through `Func::Platform(name)` / the Fn1 closure
+        // registered in the host. On the kernel-only build the
+        // registries are empty by default, so this is structurally
+        // identical to a fetch into a missing def cell.
+        SystemVerb::Platform | SystemVerb::Native => {
+            let name = action
+                .default_args
+                .iter()
+                .find(|(k, _)| k == "name")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            // Construct the Func and apply it to phi against current
+            // state to exercise the same dispatch path the wire uses.
+            let _func = match action.verb {
+                SystemVerb::Platform => Func::Platform(name.clone()),
+                SystemVerb::Native => Func::Id, // Native carries an Fn1; can't reconstruct from a name. Fall back to Id.
+                _ => Func::Id,
+            };
+            let result = crate::system::with_state(|st| {
+                ast::apply(&_func, &Object::phi(), st)
+            });
+            match result {
+                Some(obj) => format!("[action] {summary} → {obj:?}"),
+                None => format!("[action] {summary} → (system not initialised)"),
+            }
+        }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arest::ast::{cell_push, fact_from_pairs};
+
+    /// Synthetic state mirroring `navigation::tests::synth_state` so
+    /// the action expectations dovetail with the navigation tests.
+    fn synth_state() -> Object {
+        let s = Object::phi();
+        let s = cell_push(
+            "File_has_Name",
+            fact_from_pairs(&[("File", "f1"), ("Name", "alpha.txt")]),
+            &s,
+        );
+        let s = cell_push(
+            "File_has_Name",
+            fact_from_pairs(&[("File", "f2"), ("Name", "beta.txt")]),
+            &s,
+        );
+        let s = cell_push(
+            "File_has_MimeType",
+            fact_from_pairs(&[("File", "f1"), ("MimeType", "text/plain")]),
+            &s,
+        );
+        let s = cell_push(
+            "Tag_has_Label",
+            fact_from_pairs(&[("Tag", "t1"), ("Label", "important")]),
+            &s,
+        );
+        let s = cell_push(
+            "Tag_is_on_File",
+            fact_from_pairs(&[("Tag", "t1"), ("File", "f1")]),
+            &s,
+        );
+        let s = cell_push(
+            "StateMachine_has_currentlyInStatus",
+            fact_from_pairs(&[
+                ("State Machine", "OrderSM"),
+                ("currentlyInStatus", "draft"),
+                ("forResource", "f1"),
+            ]),
+            &s,
+        );
+        cell_push(
+            "Transition_is_to_Status",
+            fact_from_pairs(&[
+                ("State Machine", "OrderSM"),
+                ("Status", "submitted"),
+            ]),
+            &s,
+        )
+    }
+
+    // ── SystemVerb label prefixes ─────────────────────────────────
+
+    #[test]
+    fn system_verb_label_prefixes_distinct() {
+        let verbs = [
+            SystemVerb::ApplyCreate,
+            SystemVerb::ApplyUpdate,
+            SystemVerb::ApplyDestroy,
+            SystemVerb::ApplyRemoveFact,
+            SystemVerb::Transition,
+            SystemVerb::Fetch,
+            SystemVerb::FetchOrPhi,
+            SystemVerb::Store,
+            SystemVerb::Def,
+            SystemVerb::Platform,
+            SystemVerb::Native,
+        ];
+        let mut prefixes: Vec<&str> = verbs.iter().map(|v| v.label_prefix()).collect();
+        prefixes.sort();
+        prefixes.dedup();
+        assert_eq!(prefixes.len(), verbs.len(), "prefixes must be distinct");
+    }
+
+    #[test]
+    fn system_action_label_combines_prefix_and_text() {
+        let action = SystemAction::new(
+            SystemVerb::ApplyCreate,
+            vec![("noun".to_string(), "File".to_string())],
+        );
+        assert_eq!(action.label, "[create] apply create File");
+    }
+
+    #[test]
+    fn canonical_text_formats_each_verb() {
+        let cases: &[(SystemVerb, Vec<(String, String)>, &str)] = &[
+            (
+                SystemVerb::ApplyCreate,
+                vec![("noun".to_string(), "File".to_string())],
+                "apply create File",
+            ),
+            (
+                SystemVerb::ApplyUpdate,
+                vec![
+                    ("noun".to_string(), "File".to_string()),
+                    ("id".to_string(), "f1".to_string()),
+                ],
+                "apply update File::f1",
+            ),
+            (
+                SystemVerb::ApplyDestroy,
+                vec![
+                    ("noun".to_string(), "File".to_string()),
+                    ("id".to_string(), "f1".to_string()),
+                ],
+                "apply destroy File::f1",
+            ),
+            (
+                SystemVerb::Transition,
+                vec![
+                    ("sm".to_string(), "OrderSM".to_string()),
+                    ("id".to_string(), "o1".to_string()),
+                    ("next".to_string(), "submitted".to_string()),
+                ],
+                "transition OrderSM::o1 submitted",
+            ),
+            (
+                SystemVerb::Fetch,
+                vec![("name".to_string(), "File_has_Name".to_string())],
+                "fetch File_has_Name",
+            ),
+        ];
+        for (verb, args, want) in cases {
+            let got = verb.canonical_text(args);
+            assert_eq!(got, *want, "verb {verb:?} formatted as {got}, want {want}");
+        }
+    }
+
+    // ── Root actions ──────────────────────────────────────────────
+
+    #[test]
+    fn root_actions_include_create_per_noun() {
+        let state = synth_state();
+        let actions = compute_actions(&CurrentCell::Root, &state);
+        let creates: Vec<&str> = actions
+            .iter()
+            .filter(|a| a.verb == SystemVerb::ApplyCreate)
+            .map(|a| a.label.as_str())
+            .collect();
+        assert!(
+            creates.iter().any(|l| l.contains("apply create File")),
+            "missing File: {creates:?}"
+        );
+        assert!(
+            creates.iter().any(|l| l.contains("apply create Tag")),
+            "missing Tag: {creates:?}"
+        );
+    }
+
+    #[test]
+    fn root_actions_include_def_per_noun() {
+        let state = synth_state();
+        let actions = compute_actions(&CurrentCell::Root, &state);
+        let defs: Vec<&str> = actions
+            .iter()
+            .filter(|a| a.verb == SystemVerb::Def)
+            .map(|a| a.label.as_str())
+            .collect();
+        assert!(
+            defs.iter().any(|l| l.contains("resolve:File")),
+            "missing resolve:File def: {defs:?}"
+        );
+    }
+
+    // ── Noun actions ──────────────────────────────────────────────
+
+    #[test]
+    fn noun_actions_include_create_form_opener() {
+        let state = synth_state();
+        let actions = compute_actions(
+            &CurrentCell::Noun { noun: "File".into() },
+            &state,
+        );
+        let creates: Vec<&SystemAction> = actions
+            .iter()
+            .filter(|a| a.verb == SystemVerb::ApplyCreate)
+            .collect();
+        assert_eq!(creates.len(), 1, "one create form opener: {creates:?}");
+        assert_eq!(creates[0].default_args[0].1, "File");
+    }
+
+    #[test]
+    fn noun_actions_include_destroy_per_instance() {
+        let state = synth_state();
+        let actions = compute_actions(
+            &CurrentCell::Noun { noun: "File".into() },
+            &state,
+        );
+        let destroys: BTreeSet<String> = actions
+            .iter()
+            .filter(|a| a.verb == SystemVerb::ApplyDestroy)
+            .filter_map(|a| {
+                a.default_args
+                    .iter()
+                    .find(|(k, _)| k == "id")
+                    .map(|(_, v)| v.clone())
+            })
+            .collect();
+        assert!(destroys.contains("f1"), "missing f1: {destroys:?}");
+        assert!(destroys.contains("f2"), "missing f2: {destroys:?}");
+    }
+
+    #[test]
+    fn noun_actions_include_fetch_per_owned_ft_cell() {
+        let state = synth_state();
+        let actions = compute_actions(
+            &CurrentCell::Noun { noun: "File".into() },
+            &state,
+        );
+        let fetches: BTreeSet<String> = actions
+            .iter()
+            .filter(|a| a.verb == SystemVerb::FetchOrPhi)
+            .filter_map(|a| {
+                a.default_args
+                    .iter()
+                    .find(|(k, _)| k == "name")
+                    .map(|(_, v)| v.clone())
+            })
+            .collect();
+        assert!(
+            fetches.contains("File_has_Name"),
+            "missing File_has_Name: {fetches:?}"
+        );
+        assert!(
+            fetches.contains("File_has_MimeType"),
+            "missing File_has_MimeType: {fetches:?}"
+        );
+    }
+
+    // ── Instance actions ──────────────────────────────────────────
+
+    #[test]
+    fn instance_actions_include_update_and_destroy() {
+        let state = synth_state();
+        let actions = compute_actions(
+            &CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into(),
+            },
+            &state,
+        );
+        assert!(
+            actions.iter().any(|a| a.verb == SystemVerb::ApplyUpdate
+                && a.default_args.iter().any(|(k, v)| k == "id" && v == "f1")),
+            "missing update for f1: {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| a.verb == SystemVerb::ApplyDestroy
+                && a.default_args.iter().any(|(k, v)| k == "id" && v == "f1")),
+            "missing destroy for f1: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn instance_actions_include_transition_per_next_state_when_sm_present() {
+        let state = synth_state();
+        let actions = compute_actions(
+            &CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into(),
+            },
+            &state,
+        );
+        let transitions: Vec<&SystemAction> = actions
+            .iter()
+            .filter(|a| a.verb == SystemVerb::Transition)
+            .collect();
+        assert!(
+            !transitions.is_empty(),
+            "f1 has SM, expected at least one transition: {actions:?}"
+        );
+        // Transition fact in synth has Status=submitted bound to OrderSM.
+        assert!(
+            transitions.iter().any(|a| a
+                .default_args
+                .iter()
+                .any(|(k, v)| k == "next" && v == "submitted")),
+            "missing submitted next-state: {transitions:?}"
+        );
+    }
+
+    #[test]
+    fn instance_actions_omit_transition_when_no_sm() {
+        let state = synth_state();
+        // f2 is a File but no StateMachine_has_currentlyInStatus fact
+        // references it.
+        let actions = compute_actions(
+            &CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f2".into(),
+            },
+            &state,
+        );
+        assert!(
+            !actions.iter().any(|a| a.verb == SystemVerb::Transition),
+            "no transition expected for f2: {actions:?}"
+        );
+    }
+
+    // ── FactCell actions ──────────────────────────────────────────
+
+    #[test]
+    fn fact_cell_actions_include_fetch_baseline() {
+        let state = synth_state();
+        let actions = compute_actions(
+            &CurrentCell::FactCell {
+                cell_name: "Tag_is_on_File".into(),
+            },
+            &state,
+        );
+        assert!(
+            actions.iter().any(|a| a.verb == SystemVerb::Fetch),
+            "missing baseline fetch: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn fact_cell_actions_include_remove_per_fact() {
+        let state = synth_state();
+        let actions = compute_actions(
+            &CurrentCell::FactCell {
+                cell_name: "File_has_Name".into(),
+            },
+            &state,
+        );
+        let removes: Vec<&SystemAction> = actions
+            .iter()
+            .filter(|a| a.verb == SystemVerb::ApplyRemoveFact)
+            .collect();
+        // synth has two File_has_Name facts → two remove rows.
+        assert_eq!(removes.len(), 2, "expected 2 remove rows: {removes:?}");
+    }
+
+    // ── ComponentInstance actions ─────────────────────────────────
+
+    #[test]
+    fn component_instance_actions_skip_when_no_props() {
+        let state = synth_state();
+        let actions = compute_actions(
+            &CurrentCell::ComponentInstance {
+                component_id: "list.slint".into(),
+            },
+            &state,
+        );
+        // No Component_has_Property_… facts in synth → empty.
+        assert!(
+            actions.is_empty(),
+            "no props → no actions: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn component_instance_actions_include_update_per_property() {
+        let s = synth_state();
+        let s = cell_push(
+            "Component_has_Property_of_PropertyType_with_PropertyDefault",
+            fact_from_pairs(&[
+                ("Component", "list"),
+                ("PropertyName", "items"),
+                ("PropertyType", "list"),
+                ("PropertyDefault", ""),
+            ]),
+            &s,
+        );
+        let actions = compute_actions(
+            &CurrentCell::ComponentInstance {
+                component_id: "list.slint".into(),
+            },
+            &s,
+        );
+        let updates: Vec<&SystemAction> = actions
+            .iter()
+            .filter(|a| a.verb == SystemVerb::ApplyUpdate)
+            .collect();
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0]
+            .default_args
+            .iter()
+            .any(|(k, v)| k == "id" && v == "list.slint#items"));
+    }
+
+    // ── Determinism / dedup ───────────────────────────────────────
+
+    #[test]
+    fn actions_order_is_stable() {
+        let state = synth_state();
+        let a = compute_actions(&CurrentCell::Root, &state);
+        let b = compute_actions(&CurrentCell::Root, &state);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn actions_dedupe_identical_verb_label_pairs() {
+        let state = synth_state();
+        let actions = compute_actions(&CurrentCell::Root, &state);
+        let mut seen: BTreeSet<(SystemVerb, String)> = BTreeSet::new();
+        for a in &actions {
+            let key = (a.verb.clone(), a.label.clone());
+            assert!(
+                seen.insert(key),
+                "duplicate (verb, label) pair: {} -> {:?}",
+                a.label,
+                a.verb
+            );
+        }
+    }
+
+    // ── Dispatch ──────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_action_produces_annotation_for_mutating_verbs() {
+        let action = SystemAction::new(
+            SystemVerb::ApplyCreate,
+            vec![("noun".to_string(), "File".to_string())],
+        );
+        let line = dispatch_action(&action);
+        assert!(line.contains("[action]"));
+        assert!(line.contains("apply create File"));
+        assert!(line.contains("foundation slice"));
+    }
+
+    #[test]
+    fn dispatch_action_round_trips_fetch_via_system_impl() {
+        // Round-trip: ensure the fetch path actually goes through
+        // `crate::system::fetch_named` and produces a non-empty
+        // result line. We can't assert the cell contents without
+        // initialising SYSTEM (which requires the global one-shot
+        // init the kernel boot path runs); the round-trip here
+        // verifies the dispatch wiring is structurally sound — the
+        // returned string contains the canonical annotation.
+        let action = SystemAction::new(
+            SystemVerb::Fetch,
+            vec![("name".to_string(), "Probe_cell".to_string())],
+        );
+        let line = dispatch_action(&action);
+        assert!(line.starts_with("[action]"));
+        assert!(line.contains("fetch Probe_cell"));
+    }
+
+    #[test]
+    fn dispatch_action_with_missing_required_arg_reports_gracefully() {
+        let action = SystemAction {
+            verb: SystemVerb::Fetch,
+            default_args: Vec::new(),
+            label: "[fetch] fetch ".to_string(),
+        };
+        let line = dispatch_action(&action);
+        assert!(line.contains("missing name"));
+    }
+}

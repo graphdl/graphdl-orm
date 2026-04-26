@@ -41,6 +41,16 @@ pub mod cell_renderer;
 // rather than hand-listed per screen. Consumed by `unified_repl`'s
 // right-pane navigation list.
 pub mod navigation;
+// SYSTEM calls as actions on the current screen (#513, EPIC #496).
+// Third leg of the cell-graph HATEOAS triangle: `cell_renderer` says
+// "what does this cell look like?", `navigation` says "what cells can
+// I reach from here?", and `actions` says "what SYSTEM calls can I
+// make from here?". Each action IS a cell of the implicit fact type
+// `<current_cell> has system_action <Verb, Args>`; the catalogue is
+// computed by walking the FT graph + the verb namespace rather than
+// hand-listed per screen. Consumed by `unified_repl`'s right-pane
+// action list.
+pub mod actions;
 // Unified REPL (#510, EPIC #496). Foundational structural merge of
 // the previous `hateoas` (Track SSS #429) + `repl` (Track TTT #430)
 // modules into a single panel — left pane drives the HATEOAS browse
