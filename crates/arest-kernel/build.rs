@@ -427,6 +427,119 @@ fn main() {
         }
     }
 
+    // --- musl libc static archive (#524 Track DDDDD) -----------------
+    //
+    // Builds the vendored musl 1.2.5 source tree (#523, WWWW) into a
+    // freestanding `libc.a` static archive under `$OUT_DIR/`. The
+    // archive is NOT linked into the kernel `.efi` binary at this
+    // commit — that's #525 onward, when the busybox / ash / hello-
+    // world tracks build static Linux ELF guests that link against
+    // it. For now this pass is a build-only artifact, gated on the
+    // `musl-libc` cargo feature (off by default — see Cargo.toml).
+    //
+    // ## Build approach
+    //
+    // Upstream musl is normally configured via its `./configure` +
+    // `make` (see vendor/musl/INSTALL). For our embedded use we
+    // bypass that and drive `cc::Build` directly, mirroring what
+    // the upstream Makefile does:
+    //
+    //   * Generate `bits/alltypes.h` and `bits/syscall.h` from the
+    //     architecture-specific `.in` templates via the `mkalltypes
+    //     .sed` rules and the trivial `__NR_xxx -> SYS_xxx` sed-
+    //     rewrite the Makefile inlines.
+    //   * Walk `vendor/musl/src/<subsys>/*.c` and the architecture
+    //     overrides under `vendor/musl/src/<subsys>/x86_64/*.[csS]`,
+    //     dropping any base file that has an x86_64 replacement
+    //     (the Makefile's `REPLACED_OBJS = $(sort $(subst /$(ARCH)/,
+    //     /,$(ARCH_OBJS)))` line).
+    //   * Compile each source with the same `-std=c99 -ffreestanding
+    //     -nostdinc -D_XOPEN_SOURCE=700` baseline and the same
+    //     include path order (`musl_config -> arch/x86_64 ->
+    //     arch/generic -> $OUT_DIR/musl/include -> src/include ->
+    //     src/internal -> include`) the upstream `CFLAGS_ALL`
+    //     assembles.
+    //   * Use `cc::Build::compile()` to produce a single static
+    //     archive (`libc.a` under `$OUT_DIR/`).
+    //
+    // ## Cross-compile + graceful degradation
+    //
+    // Mirrors the linuxkpi gate above — on a Windows host, we force
+    // `clang` and `--target=x86_64-pc-windows-msvc` (UEFI uses the
+    // Microsoft x64 ABI on x86_64; clang accepts that target while
+    // still building Linux-ABI source as long as the source itself
+    // doesn't mention SysV-specific ABI quirks, which musl's
+    // freestanding C99 baseline avoids except via the per-arch
+    // syscall_arch.h inline asm — and that inline asm IS Linux ABI
+    // because the syscall instruction itself is, regardless of the
+    // host PE32+ link). On Linux/macOS hosts, `cc::Build::compile`
+    // auto-discovers the system `cc` / `clang`.
+    //
+    // If no compatible toolchain is in PATH, `cc::Build::try_compile`
+    // returns Err and we surface a `cargo:warning=` instead of
+    // breaking the build — same pattern as #460.
+    //
+    // ## Syscall surface
+    //
+    // musl's `__syscallN` thunks (vendor/musl/arch/x86_64/syscall_arch
+    // .h) drop a `syscall` instruction with the Linux x86_64 number
+    // in RAX and arguments in RDI/RSI/RDX/R10/R8/R9. AREST's
+    // SYSCALL/SYSRET handler is wired to dispatch by RAX through the
+    // same Linux x86_64 number table the vendored
+    // `arch/x86_64/bits/syscall.h.in` defines (see musl_config/
+    // syscall.h for the override hook when AREST diverges). Tracks
+    // #507 / #497..#502 (none landed yet) are responsible for
+    // implementing each individual syscall on the AREST side; until
+    // those land, calls into musl that hit an unimplemented number
+    // will return -ENOSYS at runtime, not fail at link time.
+    //
+    // ## What gets compiled vs not
+    //
+    // Walks `vendor/musl/src/<every-subsys>/` for both base `.c` and
+    // x86_64 overrides under `<subsys>/x86_64/*.[csS]`. Skips:
+    //
+    //   * `src/malloc/oldmalloc/` (Makefile picks `mallocng` by
+    //     default via `MALLOC_DIR = mallocng`).
+    //   * `crt/`, `ldso/` (CRT objects + dynamic linker — those
+    //     belong in separate archives upstream and aren't part of
+    //     `libc.a`; #525-onward will pull crt1.o etc. as separate
+    //     `cc::Build` invocations when actually linking guests).
+    //   * `compat/` (legacy time32 wrappers — only relevant for the
+    //     i386 / arm32 arms; x86_64 is time64-native).
+    //   * Per-arch overrides for non-x86_64 architectures (`/aarch64
+    //     /`, `/arm/`, `/i386/`, `/mips*/`, `/powerpc*/`, `/riscv*/`,
+    //     `/s390x/`, `/loongarch64/`, `/sh/`, `/m68k/`, `/microblaze
+    //     /`, `/or1k/`).
+    //
+    // ## Verification
+    //
+    //   cargo check -p arest-kernel --target x86_64-unknown-uefi
+    //     -> default build (musl-libc OFF) — must pass cleanly.
+    //   cargo build -p arest-kernel --target x86_64-unknown-uefi
+    //     --features musl-libc
+    //     -> compiles the musl tree; emits `libc.a` under
+    //        $OUT_DIR. May emit warnings about missing toolchain
+    //        (Windows host without clang) or per-file musl-build
+    //        warnings — those are non-fatal; we surface only fatal
+    //        toolchain-discovery failure as a `cargo:warning=`.
+    if env::var("CARGO_FEATURE_MUSL_LIBC").is_ok() {
+        let musl_root = manifest_dir.join("vendor").join("musl");
+        let arch = "x86_64";
+        if !musl_root.is_dir() {
+            println!(
+                "cargo:warning=musl-libc feature enabled but {} missing — skipping musl C compile",
+                musl_root.display(),
+            );
+        } else if let Err(e) = build_musl_libc(&manifest_dir, &musl_root, &out_dir, arch) {
+            println!(
+                "cargo:warning=musl-libc cc::Build skipped: {}. Future static guest builds (busybox / ash / hello-world, #525 onward) will need a working cross-compiler in PATH. Workaround for Windows hosts: install clang or run cargo from a Visual Studio Developer PowerShell so cl.exe is in PATH (cc auto-detects vcvars from there). Linux/macOS hosts get cc / clang from the system package manager.",
+                e,
+            );
+        }
+        println!("cargo:rerun-if-changed={}", musl_root.display());
+        println!("cargo:rerun-if-changed={}", manifest_dir.join("musl_config").display());
+    }
+
     // Re-run whenever the bundle changes.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", dist.display());
@@ -454,6 +567,439 @@ fn abs_include_path(path: &Path) -> String {
         .to_string_lossy()
         .replace('\\', "/");
     abs.strip_prefix("//?/").unwrap_or(&abs).to_string()
+}
+
+/// Drive the musl-libc compile pass behind `--features musl-libc`
+/// (#524 Track DDDDD).
+///
+/// Returns `Ok(())` when `libc.a` lands under `$OUT_DIR/`, or `Err`
+/// when the toolchain discovery / source-walk hit a fatal problem
+/// (caller surfaces as `cargo:warning=` and continues).
+///
+/// See the block comment in `main()` immediately above the
+/// `CARGO_FEATURE_MUSL_LIBC` gate for the full design rationale.
+fn build_musl_libc(
+    manifest_dir: &Path,
+    musl_root: &Path,
+    out_dir: &Path,
+    arch: &str,
+) -> Result<(), String> {
+    // 1. Generate the two headers the upstream Makefile generates:
+    //    `bits/alltypes.h` and `bits/syscall.h`. Both land under
+    //    `$OUT_DIR/musl/include/bits/` so the compile pass can
+    //    reach them via `-I$OUT_DIR/musl/include` (matching the
+    //    upstream `-Iobj/include`).
+    let gen_root = out_dir.join("musl").join("include").join("bits");
+    fs::create_dir_all(&gen_root)
+        .map_err(|e| format!("create $OUT_DIR/musl/include/bits: {}", e))?;
+    generate_alltypes_h(musl_root, &gen_root, arch)?;
+    generate_syscall_h(musl_root, &gen_root, arch)?;
+
+    // 2. Walk the source tree.
+    let mut sources: Vec<PathBuf> = Vec::new();
+    let mut replaced: Vec<String> = Vec::new();
+    let exclude_archs: &[&str] = &[
+        "aarch64", "arm", "i386", "loongarch64", "m68k", "microblaze",
+        "mips", "mips64", "mipsn32", "or1k", "powerpc", "powerpc64",
+        "riscv32", "riscv64", "s390x", "sh",
+        // x32 is x86_64-with-ILP32 — a different ABI from the
+        // SysV-AMD64 LP64 we target. INSTALL flags it as
+        // experimental upstream; skip its overrides too.
+        "x32",
+        // Skip the upstream pre-mallocng allocator. The Makefile's
+        // MALLOC_DIR=mallocng default makes oldmalloc sit unused
+        // upstream too; `subsys_dirs` already routes us to mallocng,
+        // but the recursive walker would otherwise descend into
+        // oldmalloc/* if a future subsys grew an `oldmalloc` dir.
+        "oldmalloc",
+    ];
+    let src_root = musl_root.join("src");
+    let mut subsys_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&src_root) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let name = match p.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+            // src/include/ and src/internal/ have headers + per-arch
+            // subdirs; src/internal/ also has .c files (defsysinfo,
+            // emulate_wait4, libc, ...) which the upstream Makefile
+            // pulls in via the `src/*/*.c` glob — so include them.
+            if name == "include" {
+                continue; // headers only
+            }
+            if name == "malloc" {
+                // Only the mallocng subdir, per Makefile's
+                // `MALLOC_DIR = mallocng` default.
+                subsys_dirs.push(p.join("mallocng"));
+                continue;
+            }
+            subsys_dirs.push(p);
+        }
+    }
+    for subsys in &subsys_dirs {
+        collect_musl_sources(subsys, arch, exclude_archs, &mut sources, &mut replaced);
+    }
+    sources.sort();
+    sources.dedup();
+
+    if sources.is_empty() {
+        return Err(format!(
+            "no musl sources found under {} — vendor tree may be incomplete",
+            src_root.display(),
+        ));
+    }
+
+    // 3. Set up the cc::Build invocation matching upstream's
+    //    CFLAGS_ALL.
+    let mut build = cc::Build::new();
+
+    // Force clang on Windows for the same reason the linuxkpi pass
+    // does — MSVC's cl.exe cannot drive musl's GNU-C source (inline
+    // asm, statement-expressions, attributes). On Linux/macOS, let
+    // cc auto-discover.
+    if cfg!(target_os = "windows") {
+        build.compiler("clang");
+    }
+
+    // Include path order, identical to upstream's CFLAGS_ALL line in
+    // `Makefile`:
+    //   -Imusl_config (AREST overrides, FIRST so they win on conflict)
+    //   -Iarch/$(ARCH)
+    //   -Iarch/generic
+    //   -I$(OUT_DIR)/musl/src/internal (would be obj/src/internal)
+    //   -Isrc/include
+    //   -Isrc/internal
+    //   -I$(OUT_DIR)/musl/include   (would be obj/include — for the
+    //                                generated bits/alltypes.h +
+    //                                bits/syscall.h)
+    //   -Iinclude
+    let arch_dir = musl_root.join("arch").join(arch);
+    let arch_generic = musl_root.join("arch").join("generic");
+    let gen_include_dir = out_dir.join("musl").join("include");
+    let src_include = musl_root.join("src").join("include");
+    let src_internal = musl_root.join("src").join("internal");
+    let main_include = musl_root.join("include");
+    let musl_config_dir = manifest_dir.join("musl_config");
+    build
+        .include(&musl_config_dir)
+        .include(&arch_dir)
+        .include(&arch_generic)
+        .include(&src_include)
+        .include(&src_internal)
+        .include(&gen_include_dir)
+        .include(&main_include);
+
+    // CFLAGS_C99FSE: -std=c99 -ffreestanding -nostdinc
+    // CFLAGS_ALL adds -D_XOPEN_SOURCE=700.
+    build
+        .flag_if_supported("-std=c99")
+        .flag_if_supported("-ffreestanding")
+        .flag_if_supported("-nostdinc")
+        .flag_if_supported("-fno-builtin")
+        .define("_XOPEN_SOURCE", Some("700"));
+
+    // Cross-target flag for the Windows host case. Linux/macOS hosts
+    // building for x86_64-pc-linux-gnu (the default cc target) end
+    // up emitting Linux ABI directly, which is what musl wants.
+    if cfg!(target_os = "windows") {
+        // UEFI target uses Microsoft x64 ABI; clang emits PE32+
+        // objects compatible with the .efi link. The musl-internal
+        // syscall asm still uses the SysV `syscall` instruction —
+        // that's fine because the `syscall` opcode is identical
+        // regardless of which ABI's calling-convention sets up its
+        // arguments; what matters at runtime is that the AREST
+        // syscall handler picks them out of RAX/RDI/RSI/RDX/R10/R8/R9
+        // exactly the way musl placed them.
+        build.flag_if_supported("--target=x86_64-pc-windows-msvc");
+    }
+
+    // Suppress noise that would otherwise drown the build log. Musl
+    // source is clean upstream but emits standard C99-isms our
+    // wrapper doesn't care about.
+    build
+        .warnings(false)
+        .flag_if_supported("-Wno-unknown-attributes")
+        .flag_if_supported("-Wno-attributes")
+        .flag_if_supported("-Wno-unused-parameter")
+        .flag_if_supported("-Wno-unused-function")
+        .flag_if_supported("-Wno-unused-variable")
+        .flag_if_supported("-Wno-pointer-sign")
+        .flag_if_supported("-Wno-missing-braces")
+        .flag_if_supported("-Wno-parentheses")
+        .flag_if_supported("-Wno-uninitialized")
+        .flag_if_supported("-Wno-sign-compare")
+        // Musl heavily uses GCC's `__attribute__((may_alias))` on its
+        // word-stride string ops; clang accepts but warns on -Wcast-
+        // align in some templates.
+        .flag_if_supported("-Wno-cast-align")
+        // Some musl headers define both __NR_xxx and SYS_xxx; the
+        // generated bits/syscall.h re-emits SYS_xxx via sed which can
+        // collide with the kernel-headers stub if a future track adds
+        // one. Silence the resulting -Wmacro-redefined.
+        .flag_if_supported("-Wno-macro-redefined");
+
+    // Optimisation level matches CFLAGS_AUTO = -Os -pipe.
+    build.opt_level_str("s");
+
+    // Pull in the AREST-specific syscall + arch overrides via
+    // -include, AFTER the per-arch syscall.h so any redefine wins.
+    // arch.h is pulled in early (before musl arch headers).
+    let arch_override = musl_config_dir.join("arch.h");
+    let syscall_override = musl_config_dir.join("syscall.h");
+    if arch_override.is_file() {
+        build.flag_if_supported(&format!(
+            "-include{}",
+            arch_override.to_string_lossy(),
+        ));
+    }
+    if syscall_override.is_file() {
+        build.flag_if_supported(&format!(
+            "-include{}",
+            syscall_override.to_string_lossy(),
+        ));
+    }
+
+    // Add every walked source.
+    for s in &sources {
+        build.file(s);
+    }
+
+    println!("cargo:rustc-check-cfg=cfg(musl_libc_built)");
+    match build.try_compile("c") {
+        Ok(()) => {
+            // cc::Build emits libc.a (or `libc.lib` on MSVC, but
+            // since we forced clang above on Windows we still get
+            // libc.a) under $OUT_DIR. Surface the search path so
+            // future tracks (#525 busybox / ash / hello-world) can
+            // pull it in via `-l static=c`.
+            println!(
+                "cargo:rustc-link-search=native={}",
+                out_dir.display(),
+            );
+            println!("cargo:rustc-cfg=musl_libc_built");
+            // Don't `cargo:rustc-link-lib=` here — the kernel binary
+            // doesn't link musl yet (#524 brief: "Do NOT actually
+            // link musl into the kernel binary yet — that's #525
+            // onward"). The archive sits in $OUT_DIR waiting for a
+            // future static-guest build to consume it.
+            println!(
+                "cargo:warning=musl-libc: built libc.a ({} sources, {} arch-overridden) under {}",
+                sources.len(),
+                replaced.len(),
+                out_dir.display(),
+            );
+            Ok(())
+        }
+        Err(e) => Err(format!("{}", e)),
+    }
+}
+
+/// Generate `bits/alltypes.h` from the per-arch + generic templates,
+/// applying the same sed transforms upstream's `tools/mkalltypes.sed`
+/// applies in the Makefile's `obj/include/bits/alltypes.h` rule.
+fn generate_alltypes_h(
+    musl_root: &Path,
+    gen_root: &Path,
+    arch: &str,
+) -> Result<(), String> {
+    let arch_in = musl_root.join("arch").join(arch).join("bits").join("alltypes.h.in");
+    let generic_in = musl_root.join("include").join("alltypes.h.in");
+    let mut combined = String::new();
+    combined.push_str(
+        &fs::read_to_string(&arch_in)
+            .map_err(|e| format!("read {}: {}", arch_in.display(), e))?,
+    );
+    combined.push('\n');
+    combined.push_str(
+        &fs::read_to_string(&generic_in)
+            .map_err(|e| format!("read {}: {}", generic_in.display(), e))?,
+    );
+    let transformed = mkalltypes(&combined);
+    let out_path = gen_root.join("alltypes.h");
+    fs::write(&out_path, transformed)
+        .map_err(|e| format!("write {}: {}", out_path.display(), e))?;
+    Ok(())
+}
+
+/// Apply the upstream `tools/mkalltypes.sed` rules in pure Rust.
+///
+/// The sed file rewrites three macro lines:
+///
+///   TYPEDEF <ty> <name>;
+///     -> guarded `typedef <ty> <name>;` with __NEED_/__DEFINED_
+///        gates.
+///   STRUCT  <name> <body>;
+///     -> guarded `struct <name> <body>;` with __NEED_struct_/__DEFINED_
+///        struct_ gates.
+///   UNION   <name> <body>;
+///     -> guarded `union <name> <body>;` with the analogous gates.
+///
+/// All other lines pass through unchanged. The produced header is
+/// identical (modulo trailing whitespace) to what `sed -f
+/// tools/mkalltypes.sed` would emit when run on the concatenation of
+/// `arch/$(ARCH)/bits/alltypes.h.in` and `include/alltypes.h.in`.
+fn mkalltypes(input: &str) -> String {
+    let mut out = String::new();
+    for line in input.lines() {
+        let trimmed = line.trim_end_matches(';');
+        if let Some(rest) = line.strip_prefix("TYPEDEF ") {
+            // "TYPEDEF <ty...> <name>;"
+            let body = rest.trim_end_matches(';').trim();
+            if let Some(idx) = body.rfind(' ') {
+                let ty = body[..idx].trim();
+                let name = body[idx + 1..].trim();
+                out.push_str(&format!(
+                    "#if defined(__NEED_{name}) && !defined(__DEFINED_{name})\n\
+                     typedef {ty} {name};\n\
+                     #define __DEFINED_{name}\n\
+                     #endif\n\n",
+                    name = name,
+                    ty = ty,
+                ));
+                continue;
+            }
+        } else if let Some(rest) = line.strip_prefix("STRUCT ") {
+            let body = rest.trim_end_matches(';').trim();
+            if let Some(idx) = body.find(' ') {
+                let name = body[..idx].trim();
+                let rest = body[idx + 1..].trim();
+                out.push_str(&format!(
+                    "#if defined(__NEED_struct_{name}) && !defined(__DEFINED_struct_{name})\n\
+                     struct {name} {rest};\n\
+                     #define __DEFINED_struct_{name}\n\
+                     #endif\n\n",
+                    name = name,
+                    rest = rest,
+                ));
+                continue;
+            }
+        } else if let Some(rest) = line.strip_prefix("UNION ") {
+            let body = rest.trim_end_matches(';').trim();
+            if let Some(idx) = body.find(' ') {
+                let name = body[..idx].trim();
+                let rest = body[idx + 1..].trim();
+                out.push_str(&format!(
+                    "#if defined(__NEED_union_{name}) && !defined(__DEFINED_union_{name})\n\
+                     union {name} {rest};\n\
+                     #define __DEFINED_union_{name}\n\
+                     #endif\n\n",
+                    name = name,
+                    rest = rest,
+                ));
+                continue;
+            }
+        }
+        let _ = trimmed; // currently unused; placeholder for future.
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Generate `bits/syscall.h`, applying the Makefile's two-line rule:
+///
+///   cp arch/$ARCH/bits/syscall.h.in obj/include/bits/syscall.h
+///   sed -n -e 's/__NR_/SYS_/p' < ... >> obj/include/bits/syscall.h
+///
+/// I.e. emit the original `__NR_xxx` definitions verbatim, then
+/// re-emit each as a `SYS_xxx` alias.
+fn generate_syscall_h(
+    musl_root: &Path,
+    gen_root: &Path,
+    arch: &str,
+) -> Result<(), String> {
+    let in_path = musl_root.join("arch").join(arch).join("bits").join("syscall.h.in");
+    let in_text = fs::read_to_string(&in_path)
+        .map_err(|e| format!("read {}: {}", in_path.display(), e))?;
+    let mut out = String::new();
+    out.push_str(&in_text);
+    if !in_text.ends_with('\n') {
+        out.push('\n');
+    }
+    for line in in_text.lines() {
+        if let Some(rest) = line.strip_prefix("#define __NR_") {
+            out.push_str("#define SYS_");
+            out.push_str(rest);
+            out.push('\n');
+        }
+    }
+    let out_path = gen_root.join("syscall.h");
+    fs::write(&out_path, out)
+        .map_err(|e| format!("write {}: {}", out_path.display(), e))?;
+    Ok(())
+}
+
+/// Walk `subsys_dir` for base `.c` source plus per-arch overrides
+/// under `subsys_dir/<arch>/*.[csS]`.
+///
+/// Mirrors the upstream Makefile's
+///   ARCH_GLOBS = src/<subsys>/$(ARCH)/*.[csS]
+///   REPLACED_OBJS = $(sort $(subst /$(ARCH)/,/,$(ARCH_OBJS)))
+/// rule: every base file whose stem matches an arch-override is
+/// dropped in favour of the override. Files under any other arch's
+/// subdirectory are skipped entirely.
+fn collect_musl_sources(
+    subsys_dir: &Path,
+    arch: &str,
+    exclude_archs: &[&str],
+    out: &mut Vec<PathBuf>,
+    replaced: &mut Vec<String>,
+) {
+    let arch_dir = subsys_dir.join(arch);
+    let mut arch_stems: Vec<String> = Vec::new();
+    if arch_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&arch_dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if !p.is_file() {
+                    continue;
+                }
+                let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
+                if matches!(ext, "c" | "s" | "S") {
+                    if let Some(stem) = p.file_stem().and_then(|x| x.to_str()) {
+                        arch_stems.push(stem.to_string());
+                    }
+                    out.push(p);
+                }
+            }
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(subsys_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_file() {
+                let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
+                if ext == "c" {
+                    if let Some(stem) = p.file_stem().and_then(|x| x.to_str()) {
+                        if arch_stems.iter().any(|s| s == stem) {
+                            replaced.push(format!("{}/{}.c", subsys_dir.display(), stem));
+                            continue;
+                        }
+                        out.push(p);
+                    }
+                }
+            } else if p.is_dir() {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name == arch {
+                    continue; // already handled
+                }
+                if exclude_archs.contains(&name) {
+                    continue; // foreign arch
+                }
+                // Other subdir (e.g. mallocng's `glue.h`-only nested
+                // dir, or src/internal/i386/ which we excluded above
+                // by the foreign-arch check). Walk one level deeper
+                // for mallocng-style nested .c files.
+                collect_musl_sources(&p, arch, exclude_archs, out, replaced);
+            }
+        }
+    }
 }
 
 fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
