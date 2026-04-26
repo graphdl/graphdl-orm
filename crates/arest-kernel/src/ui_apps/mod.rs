@@ -59,6 +59,14 @@ pub mod actions;
 // IS a cell sequence — bookmarks are facts (a future task wires them
 // into the cell graph), history is a ring buffer (#188 primitive).
 pub mod breadcrumb;
+// Help derived from the current screen (#517, EPIC #496). Pure
+// function over `&CurrentCell` returning a `Vec<String>` of help-text
+// lines for the unified REPL to dump into scrollback when the user
+// types `help` or `?`. Cell-type-aware: explains what kind of screen
+// the user is on, what verbs apply, what navigation is reachable, and
+// the REPL's own cell-nav command surface. Closes the introspection
+// loop the breadcrumb (#516) opens — every screen self-describes.
+pub mod help;
 // Unified REPL (#510, EPIC #496). Foundational structural merge of
 // the previous `hateoas` (Track SSS #429) + `repl` (Track TTT #430)
 // modules into a single panel — left pane drives the HATEOAS browse

@@ -425,7 +425,18 @@ impl UnifiedReplState {
         self.push_line(format!("{prompt}{line}"));
 
         let trimmed = line.trim();
-        if let Some(cell) = parse_cell_nav(trimmed) {
+        // #517: screen-aware help intercept. Runs before the cell-nav
+        // parser AND before the legacy `crate::repl::evaluate_line`
+        // dispatcher so `help` and `?` pick up the cell-type-aware
+        // body from `crate::ui_apps::help::screen_help` regardless of
+        // what the legacy REPL's static help would have said. Other
+        // legacy verbs (`heap`, `quit`, …) still flow through unchanged.
+        let lower = trimmed.to_ascii_lowercase();
+        if lower == "help" || lower == "?" {
+            for help_line in crate::ui_apps::help::screen_help(&self.current_cell) {
+                self.push_line(help_line);
+            }
+        } else if let Some(cell) = parse_cell_nav(trimmed) {
             let label = cell.label();
             self.set_current_cell(cell);
             self.push_line(format!("Now showing: {label}"));
