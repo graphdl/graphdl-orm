@@ -1,4 +1,4 @@
-// `arest run "App Name"` — CLI subcommand dispatcher (#543, #504).
+// `arest run "App Name"` — CLI subcommand dispatcher (#543, #504, #505).
 //
 // Reads the bundled metamodel readings (`crate::metamodel_readings()`),
 // folds them into a `crate::ast::Object` state, and resolves the
@@ -6,9 +6,11 @@
 //
 // On hit: prints the resolved `(slug, prefix Directory id)` pair,
 // then invokes `crate::cli::wine_bootstrap::bootstrap_prefix` to
-// apply winetricks recipes / DLL overrides / registry keys. Returns
-// exit code 0 if every fact-driven mutation succeeded; 3 if at least
-// one winetricks recipe failed.
+// apply winetricks recipes / DLL overrides / registry keys; then
+// invokes `crate::cli::wine_install::install_app` to fetch the
+// installer binary and run it under wine. Returns exit code 0 if
+// every fact-driven mutation succeeded; 3 if a winetricks recipe
+// failed; 4 if the installer install transitioned to `Failed`.
 // On miss: prints a "did you mean…?" suggestion based on Levenshtein
 // distance over the slug + display-title set, returns exit code 1.
 // On missing argument: prints usage, returns exit code 2.
@@ -22,12 +24,13 @@
 //
 // The actual `wine_app_by_name` lookup lives in `command.rs` (#503,
 // `637c333`). This module supplies the CLI layer: argv parsing, state
-// loading, output formatting, the near-name suggestion fallback, and
-// the bootstrap dispatch. Actual installer-binary execution and the
-// per-app launch wrapper land in #505 / #506.
+// loading, output formatting, and the bootstrap + install dispatch.
+// The per-app launch wrapper (actual app launch, telemetry, monitor)
+// lands in #506.
 
 use crate::ast;
 use crate::cli::wine_bootstrap;
+use crate::cli::wine_install;
 use crate::command;
 
 /// Top-level entry point used by `main.rs`. Takes the residual argv
@@ -41,10 +44,13 @@ use crate::command;
 /// child process.
 ///
 /// Exit codes:
-///   * 0 — resolved + bootstrap succeeded (or no facts to apply).
+///   * 0 — resolved + bootstrap + install succeeded (or no facts to
+///         apply / install staged for next run).
 ///   * 1 — name not found in the readings.
 ///   * 2 — usage error (no app name supplied).
 ///   * 3 — bootstrap surfaced one or more recipe failures.
+///   * 4 — install transitioned to `Failed` (fetch error or
+///         non-zero installer exit code).
 pub fn dispatch<O: std::io::Write, E: std::io::Write>(
     args: &[String],
     readings: &[(&str, &str)],
@@ -115,7 +121,26 @@ pub fn dispatch_with_prefix_root<O: std::io::Write, E: std::io::Write>(
             };
             let _ = writeln!(out, "  prefix path: {}", prefix_path.display());
             let _ = write!(out, "{}", wine_bootstrap::format_report(&bootstrap, &slug));
-            if !bootstrap.all_succeeded() { 3 } else { 0 }
+            if !bootstrap.all_succeeded() {
+                return 3;
+            }
+
+            // #505: fetch the installer binary + run it under wine.
+            // The install module reads `Wine_App_has_Installer_URL` /
+            // `Wine_App_has_Installer_Filename` from the same FORML
+            // state. A `Failed` outcome maps to exit code 4; any
+            // other terminal state (Installed / Downloaded /
+            // Installing) is treated as success — the prefix is
+            // valid even if the install is staged.
+            let install = match wine_install::install_app(&state, &slug, &prefix_path, None) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = writeln!(err, "Install failed: {}", e);
+                    return 4;
+                }
+            };
+            let _ = write!(out, "{}", wine_install::format_report(&install, &slug));
+            if install.status == wine_install::InstallStatus::Failed { 4 } else { 0 }
         }
         None => {
             let suggestions = near_name_suggestions(&state, name, 3);
@@ -641,5 +666,55 @@ mod tests {
         assert!(err_text.contains("No Wine App matches 'xxxxxxxxxxxx'."));
         // No suggestion line.
         assert!(!err_text.contains("Did you mean"), "expected no suggestion, got: {}", err_text);
+    }
+
+    /// #505 wiring: dispatch must print the install-report block
+    /// after the bootstrap block. Confirms `wine_install::format_report`
+    /// is reached for an app that has Installer URL declared in
+    /// the bundled wine.md.
+    #[cfg(feature = "compat-readings")]
+    #[test]
+    fn dispatch_prints_install_report_for_notepad_plus_plus() {
+        let readings: Vec<(&str, &str)> = crate::metamodel_readings()
+            .into_iter()
+            .map(|(n, t)| (*n, *t))
+            .collect();
+        let root = test_prefix_root("dispatch-install-report-npp");
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let _code = dispatch_with_prefix_root(
+            &["notepad-plus-plus".to_string()], &readings, &root, &mut out, &mut err,
+        );
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(out_text.contains("Installing Wine app 'notepad-plus-plus'"),
+                "expected install report header; got: {}", out_text);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Idempotency: when the `_install_complete` marker is already
+    /// present, dispatch must report `(already installed; ...)` and
+    /// exit 0 without spawning anything network-bound.
+    #[cfg(feature = "compat-readings")]
+    #[test]
+    fn dispatch_idempotent_install_with_marker() {
+        let readings: Vec<(&str, &str)> = crate::metamodel_readings()
+            .into_iter()
+            .map(|(n, t)| (*n, *t))
+            .collect();
+        let root = test_prefix_root("dispatch-idempotent-install");
+        // Pre-stage the marker to short-circuit the whole install path.
+        let prefix = root.join("notepad-plus-plus-prefix");
+        std::fs::create_dir_all(prefix.join("drive_c")).unwrap();
+        std::fs::write(prefix.join("drive_c").join("_install_complete"), b"").unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = dispatch_with_prefix_root(
+            &["notepad-plus-plus".to_string()], &readings, &root, &mut out, &mut err,
+        );
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(out_text.contains("(already installed"),
+                "expected already-installed marker note; got: {}", out_text);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

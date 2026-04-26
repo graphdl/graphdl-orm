@@ -10,7 +10,9 @@
 //             prefix, then calls `wine_bootstrap::bootstrap_prefix`
 //             to apply winetricks recipes / DLL overrides / registry
 //             keys derived from the FORML facts in
-//             `readings/compat/wine.md`.
+//             `readings/compat/wine.md`, then calls
+//             `wine_install::install_app` to fetch + run the
+//             installer binary under wine.
 //   * `wine_bootstrap` — orchestrates the prefix bootstrap by walking
 //             `Wine_App_requires_Required_Component` cells (winetricks
 //             recipes), `requires DLL Override of` legacy cells (DLL
@@ -23,6 +25,18 @@
 //             `[Software\\Wine\\DllOverrides]` blocks into the
 //             prefix's `system.reg` and `@="<value>"` keys into
 //             `system.reg` / `user.reg` per the registry root.
+//   * `wine_install` (#505) — installer fetch + install orchestrator.
+//             Resolves Installer URL / Filename from the FORML facts,
+//             fetches the binary into `<prefix>/drive_c/_install/`,
+//             runs it under wine, transitions the install state
+//             machine. Idempotent via `_install_complete` marker.
+//   * `installer_fetch` (#505) — subprocess wrapper around curl /
+//             PowerShell `Invoke-WebRequest` for the binary download;
+//             also handles local-path copies for pre-staged
+//             installers.
+//   * `installer_run` (#505) — subprocess wrapper for `wine
+//             <installer>`; captures stdout + stderr to
+//             `<prefix>/drive_c/_install_log` for debugging.
 //
 // Future verbs (`arest install`, `arest exec`, …) plug in here so
 // main.rs doesn't grow another giant `match` arm per subcommand.
@@ -35,3 +49,9 @@ pub mod wine_bootstrap;
 pub mod wine_overrides;
 #[cfg(not(feature = "no_std"))]
 pub mod winetricks;
+#[cfg(not(feature = "no_std"))]
+pub mod wine_install;
+#[cfg(not(feature = "no_std"))]
+pub mod installer_fetch;
+#[cfg(not(feature = "no_std"))]
+pub mod installer_run;
