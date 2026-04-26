@@ -60,6 +60,8 @@
 
 use alloc::vec::Vec;
 
+use super::address_space::{perm_from_p_flags, AddressSpace, LoaderError};
+
 // -- Constants from the ELF64 spec ----------------------------------
 //
 // Pulled directly from the System V ABI Edition 4.1 + AMD64 PSABI
@@ -468,6 +470,134 @@ pub fn parse(bytes: &[u8]) -> Result<ParsedElf, ElfError> {
     })
 }
 
+// -- Loader (#519, #520) -------------------------------------------
+//
+// `load_segments` is the second slice of the #472 epic — it consumes
+// the parser's `ParsedElf` plus the original ELF blob and produces an
+// in-memory `AddressSpace` ready for the trampoline (#521) to install
+// into a real page table.
+//
+// Composition shape mirrors the parser: returns a typed `Result<...,
+// LoadOrParseError>` so a single call site can branch on parser-side
+// vs. loader-side failures without string-matching. The error enum
+// flattens `ElfError` and `LoaderError` into one — neither is `Display`
+// today, but both are `Copy + PartialEq` so callers stash them, log
+// them, and react.
+//
+// PT_INTERP detection (#520, folded into this commit per the task
+// description) lives in this same function: the moment the parser
+// hands us a `SegmentKind::Interp`, we error out with
+// `LoaderError::DynamicLoaderRequired` rather than try to chase the
+// interpreter path. Tier-1 only hosts statically-linked binaries; the
+// musl-based dynamic loader path lands in #522 (WWWW's parallel
+// vendor/musl/ track).
+
+/// Errors `load_segments` can return. Wraps both parser-side
+/// `ElfError` (for blob structural issues) and loader-side
+/// `LoaderError` (for semantic / resource issues) so a single call
+/// site can branch by variant. Stays `Copy` for the same reason as
+/// its components.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadOrParseError {
+    /// The parser rejected the input — see `ElfError` variants.
+    Parse(ElfError),
+    /// The parser succeeded but the loader rejected a per-segment
+    /// invariant (overlap, BSS shape, W^X, OOM, dynamic-linker).
+    Load(LoaderError),
+}
+
+impl From<ElfError> for LoadOrParseError {
+    fn from(e: ElfError) -> Self {
+        LoadOrParseError::Parse(e)
+    }
+}
+
+impl From<LoaderError> for LoadOrParseError {
+    fn from(e: LoaderError) -> Self {
+        LoadOrParseError::Load(e)
+    }
+}
+
+/// Load every PT_LOAD segment from `parsed` into a fresh `AddressSpace`,
+/// using `bytes` as the source of segment payloads.
+///
+/// The function:
+///   1. Refuses dynamically-linked binaries up front (PT_INTERP
+///      present → `LoaderError::DynamicLoaderRequired`, #520).
+///   2. Iterates PT_LOAD entries in the parser-yielded order.
+///   3. For each entry: derives the permission from `p_flags`,
+///      slices the file content from `bytes[p_offset..p_offset+p_filesz]`,
+///      hands them to `AddressSpace::push_segment` which page-aligns
+///      the allocation, copies the file content, and zeros the BSS.
+///   4. Detects overlap on push (push_segment's invariant); the
+///      first overlap returns `LoaderError::OverlappingSegments`
+///      and the partial AddressSpace is dropped (every previously-
+///      pushed segment's allocation is reclaimed via `Drop`).
+///
+/// `bytes` is the same `&[u8]` the caller fed into `parse(...)` —
+/// the parser already validated `[p_offset, p_offset + p_filesz)`
+/// fits the slice for every PT_LOAD (elf.rs:424), so the slicing
+/// here is bounds-safe by construction. We re-check the length
+/// defensively — a future refactor could change the parser's
+/// validation surface without touching this site.
+pub fn load_segments(
+    parsed: &ParsedElf,
+    bytes: &[u8],
+) -> Result<AddressSpace, LoadOrParseError> {
+    // #520: PT_INTERP detection. Static binaries have no PT_INTERP;
+    // dynamically-linked ones name the loader (typically
+    // `/lib64/ld-linux-x86-64.so.2`). The musl-based loader (#522)
+    // will replace this branch with "thread the interpreter through
+    // a recursive load_segments call against the loader's own ELF".
+    if parsed.interp_segment().is_some() {
+        return Err(LoaderError::DynamicLoaderRequired.into());
+    }
+
+    let mut address_space = AddressSpace::new(parsed.entry);
+
+    for ph in parsed.load_segments() {
+        // Derive the permission shape. W^X violations and bare PF_X
+        // are rejected before we allocate — no point carving pages
+        // we'll just drop.
+        let perm = perm_from_p_flags(ph.flags)?;
+
+        // Slice the file content out of the ELF blob. The parser
+        // already bounds-checked this for PT_LOAD entries with
+        // non-zero filesz (elf.rs:424). For zero-filesz segments
+        // (.bss-only sections), `file_content` is an empty slice and
+        // `push_segment` zeros the entire `mem_size`.
+        let file_content: &[u8] = if ph.filesz == 0 {
+            &[]
+        } else {
+            // Defensive bounds re-check — see function-level comment.
+            let off = ph.offset as usize;
+            let sz = ph.filesz as usize;
+            let end = off
+                .checked_add(sz)
+                .ok_or(LoadOrParseError::Parse(ElfError::SegmentOutOfBounds))?;
+            if end > bytes.len() {
+                return Err(LoadOrParseError::Parse(ElfError::SegmentOutOfBounds));
+            }
+            &bytes[off..end]
+        };
+
+        // mem_size as usize. ELF stores it as u64; on 64-bit hosts
+        // (every UEFI target) the cast is loss-free, but a 32-bit
+        // unit-test host needs the explicit conversion to detect a
+        // segment that wouldn't fit the address space anyway.
+        let mem_size = match usize_from_u64(ph.memsz) {
+            Some(v) => v,
+            None => {
+                return Err(LoaderError::AddressSpaceTooLarge.into());
+            }
+        };
+
+        address_space.push_segment(ph.vaddr, mem_size, perm, file_content)?;
+    }
+
+    Ok(address_space)
+}
+
 // -- Internal helpers ----------------------------------------------
 //
 // All four take a slice that the caller has *already* bounded (every
@@ -713,5 +843,133 @@ mod tests {
         buf[..TINY_ELF.len()].copy_from_slice(TINY_ELF);
         buf[54] = 0x40; // e_phentsize = 64
         assert_eq!(parse(&buf), Err(ElfError::BadPhentSize));
+    }
+
+    // -- Loader tests (#519 + #520) --------------------------------
+    //
+    // The loader builds on the parser — every test here parses
+    // `LOADER_ELF` / `INTERP_ELF` / `OVERLAP_ELF` first, then calls
+    // `load_segments` against the parsed result. The fixtures live
+    // in `test_fixtures.rs`; the parser tests above use the same
+    // module so the fixtures stay reusable.
+
+    use crate::process::address_space::SegmentPerm;
+    use crate::process::test_fixtures::{INTERP_ELF, LOADER_ELF, OVERLAP_ELF};
+
+    /// LOADER_ELF loads cleanly: two PT_LOAD segments materialise
+    /// in the address space, in the order the parser yielded them.
+    #[test]
+    fn load_segments_loader_elf_two_segments() {
+        let elf = parse(LOADER_ELF).expect("LOADER_ELF must parse");
+        let address_space = load_segments(&elf, LOADER_ELF).expect("load must succeed");
+        assert_eq!(address_space.entry_point, 0x0040_1000);
+        assert_eq!(address_space.segments.len(), 2);
+        assert_eq!(address_space.segments[0].vaddr, 0x0040_1000);
+        assert_eq!(address_space.segments[0].mem_size, 0x10);
+        assert_eq!(address_space.segments[0].file_size, 0x10);
+        assert_eq!(address_space.segments[0].perm, SegmentPerm::ReadExecute);
+        assert_eq!(address_space.segments[1].vaddr, 0x0040_2000);
+        assert_eq!(address_space.segments[1].mem_size, 0x20);
+        assert_eq!(address_space.segments[1].file_size, 0x08);
+        assert_eq!(address_space.segments[1].perm, SegmentPerm::ReadWrite);
+    }
+
+    /// File content lands at the head of the segment's allocation —
+    /// distinct payload bytes (0xAA / 0xBB) round-trip from the ELF
+    /// blob through the loader's copy.
+    #[test]
+    fn load_segments_copies_file_content() {
+        let elf = parse(LOADER_ELF).expect("LOADER_ELF must parse");
+        let address_space = load_segments(&elf, LOADER_ELF).expect("load must succeed");
+
+        // .text segment: 16 bytes of 0xAA at the head, no BSS.
+        let text = address_space.segments[0].pages_view();
+        assert_eq!(&text[..0x10], &[0xaa; 0x10]);
+
+        // .data segment: 8 bytes of 0xBB at the head, then 24 bytes
+        // of zero (BSS). The fixture's payload byte is deliberately
+        // 0xBB (non-zero) so a successful copy is distinguishable
+        // from leftover BSS-zero.
+        let data = address_space.segments[1].pages_view();
+        assert_eq!(&data[..0x08], &[0xbb; 0x08]);
+    }
+
+    /// BSS region (mem_size - file_size bytes after the file content)
+    /// is zeroed. This is the most-likely-to-regress invariant of the
+    /// loader: if the page allocation isn't zero-init'd and the loader
+    /// "forgets" to zero the BSS, a static binary's `.bss` would carry
+    /// whatever bytes happened to be on the heap previously.
+    #[test]
+    fn load_segments_zeros_bss() {
+        let elf = parse(LOADER_ELF).expect("LOADER_ELF must parse");
+        let address_space = load_segments(&elf, LOADER_ELF).expect("load must succeed");
+
+        // .data segment's BSS = mem_size 0x20 - file_size 0x08 = 0x18 bytes.
+        let data = address_space.segments[1].pages_view();
+        for (i, byte) in data[0x08..0x20].iter().enumerate() {
+            assert_eq!(
+                *byte, 0,
+                "BSS byte {} (offset 0x{:x}) is 0x{:02x}, expected zero",
+                i,
+                0x08 + i,
+                byte
+            );
+        }
+    }
+
+    /// PT_INTERP-bearing binary is rejected with
+    /// `LoaderError::DynamicLoaderRequired` (#520). The fixture's
+    /// PT_INTERP entry names `/lib64/ld-linux-x86-64.so.2`; static
+    /// binaries have no PT_INTERP. Tier-1 doesn't yet host a
+    /// dynamic loader.
+    #[test]
+    fn load_segments_rejects_pt_interp() {
+        let elf = parse(INTERP_ELF).expect("INTERP_ELF must parse");
+        let err = load_segments(&elf, INTERP_ELF).unwrap_err();
+        assert_eq!(err, LoadOrParseError::Load(LoaderError::DynamicLoaderRequired));
+    }
+
+    /// Overlapping PT_LOAD segments are rejected with
+    /// `LoaderError::OverlappingSegments`. OVERLAP_ELF places the
+    /// .data segment at vaddr 0x0040_1008 — inside the .text
+    /// segment's [0x0040_1000, 0x0040_1010) range.
+    #[test]
+    fn load_segments_rejects_overlapping_segments() {
+        let elf = parse(OVERLAP_ELF).expect("OVERLAP_ELF must parse");
+        let err = load_segments(&elf, OVERLAP_ELF).unwrap_err();
+        assert_eq!(err, LoadOrParseError::Load(LoaderError::OverlappingSegments));
+    }
+
+    /// TINY_ELF (parser fixture) loads fine — its PT_LOAD payload
+    /// is 16 bytes of zero at offset 0x100. This proves the loader
+    /// works against the parser's existing fixture too, not just
+    /// the new loader-specific ones.
+    #[test]
+    fn load_segments_tiny_elf_works() {
+        let elf = parse(TINY_ELF).expect("TINY_ELF must parse");
+        let address_space = load_segments(&elf, TINY_ELF).expect("load must succeed");
+        assert_eq!(address_space.entry_point, 0x0040_1000);
+        assert_eq!(address_space.segments.len(), 1);
+        assert_eq!(address_space.segments[0].vaddr, 0x0040_1000);
+        assert_eq!(address_space.segments[0].perm, SegmentPerm::ReadExecute);
+    }
+
+    /// `LoadOrParseError::Parse` flows through when the upstream
+    /// parser failed. We can't readily produce a "parsed but the
+    /// underlying bytes got truncated" case without rebuilding the
+    /// fixture; this test just confirms the `From<ElfError>` impl
+    /// composes a `LoadOrParseError::Parse(...)` variant correctly.
+    #[test]
+    fn load_or_parse_error_from_elf_error() {
+        let err: LoadOrParseError = ElfError::BadMagic.into();
+        assert_eq!(err, LoadOrParseError::Parse(ElfError::BadMagic));
+    }
+
+    /// `LoadOrParseError::Load` flows through from any LoaderError
+    /// — same shape test as the ElfError one above, for symmetry.
+    #[test]
+    fn load_or_parse_error_from_loader_error() {
+        let err: LoadOrParseError = LoaderError::OverlappingSegments.into();
+        assert_eq!(err, LoadOrParseError::Load(LoaderError::OverlappingSegments));
     }
 }
