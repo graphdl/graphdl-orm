@@ -61,6 +61,7 @@
 pub mod address_space;
 pub mod elf;
 pub mod fd_table;
+pub mod futex_table;
 pub mod process;
 pub mod stack;
 pub mod trampoline;
