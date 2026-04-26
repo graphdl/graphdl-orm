@@ -89,20 +89,12 @@ pub fn dispatch_with_prefix_root<O: std::io::Write, E: std::io::Write>(
 
     let state = build_state(readings);
 
-    // Two-stage resolve. `wine_app_by_name` (command.rs #503) handles the
-    // canonical lookup paths: exact slug match, plus the legacy
-    // mis-bucketed `has display- Title 'X'` cell scan that the parser
-    // emits when no canonical title FT is recognised. Under the full
-    // bundled metamodel (compat-readings + os-readings + ui-readings +
-    // templates + core all loaded), the parser DOES recognise the
-    // `Wine App has display- Title.` FT and emits a clean
-    // `Wine_App_has_display-_Title` cell instead — which the legacy
-    // path never reads. The local `resolve_by_clean_title_cell` covers
-    // that case so the CLI works in both partial-metamodel (the
-    // command.rs unit-test fixture) and full-metamodel (the bundled
-    // arest-cli runtime) state shapes.
-    let resolved = command::wine_app_by_name(&state, name)
-        .or_else(|| resolve_by_clean_title_cell(&state, name));
+    // #553 collapse: `command::wine_app_by_name` now reads both the
+    // canonical `Wine_App_has_display-_Title` cell (emitted under the
+    // full bundled metamodel) and the legacy mis-bucketed
+    // `has display- Title 'X'` cells (used by the partial-metamodel
+    // unit-test fixtures), so the local fallback is no longer needed.
+    let resolved = command::wine_app_by_name(&state, name);
 
     match resolved {
         Some((slug, prefix_dir_id)) => {
@@ -190,42 +182,18 @@ pub fn wine_prefix_root_from_env() -> std::path::PathBuf {
 }
 
 /// Locate the raw `wine.md` text inside the loaded readings, falling
-/// back to `""` if the slice isn't present. The bootstrap module needs
-/// the raw text to recover the third role of the ternary `requires
-/// DLL Override / requires Registry Key` facts (the parser drops the
-/// `with X 'Y'` tail; see comments in `cli::wine_overrides`).
+/// back to `""` if the slice isn't present. Pre-#553 the bootstrap
+/// module needed the raw text to recover the third role of ternary
+/// `requires DLL Override / requires Registry Key` facts; with the
+/// parser fix in place that recovery is moot. The helper is retained
+/// as a no-op-friendly accessor so callers that still hand the raw
+/// text through the legacy `bootstrap_prefix` parameter compile
+/// unchanged.
 pub fn compat_wine_md_text<'a>(readings: &'a [(&str, &str)]) -> &'a str {
     readings.iter()
         .find(|(name, _)| *name == "wine")
         .map(|(_, text)| *text)
         .unwrap_or("")
-}
-
-/// Fallback resolver for the canonical `Wine_App_has_display-_Title`
-/// cell. Pairs with `command::wine_app_by_name`'s legacy-path scan:
-/// where that helper reads the parser's mis-bucketed
-/// `has display- Title 'X'` cells, this one reads the clean cell the
-/// parser emits when the `Wine App has display- Title.` fact-type
-/// declaration is in scope (which it is under the full bundled
-/// metamodel).
-///
-/// Returns `(slug, prefix Directory id)` on hit, `None` on miss.
-/// Defers prefix lookup to `command::wine_prefix_for` so a slug
-/// without a `Wine App has prefix Directory` binding still misses
-/// (the runtime layer in #504 needs the prefix; surfacing a
-/// title-only resolution would just push the failure downstream).
-fn resolve_by_clean_title_cell(state: &ast::Object, name: &str) -> Option<(String, String)> {
-    let cell = ast::fetch_or_phi("Wine_App_has_display-_Title", state);
-    let seq = cell.as_seq()?;
-    for fact in seq.iter() {
-        let title = ast::binding(fact, "Title")?;
-        if title == name {
-            let slug = ast::binding(fact, "Wine App")?.to_string();
-            let prefix = command::wine_prefix_for(state, &slug)?;
-            return Some((slug, prefix));
-        }
-    }
-    None
 }
 
 /// Plain-text usage string. Kept terse — full `--help` output lives
@@ -297,11 +265,12 @@ pub fn build_state(readings: &[(&str, &str)]) -> ast::Object {
 /// Surface up to `limit` near-name suggestions for a missed lookup.
 ///
 /// The candidate set is the union of every Wine App slug
-/// (`wine_app_ids`) and every display title — sourced both from
-/// `command::wine_app_display_title` (legacy mis-bucketed cells) and
-/// from the canonical `Wine_App_has_display-_Title` cell the parser
-/// emits when the FT declaration is in scope. Dedupes on label so
-/// the same title doesn't appear twice when both paths populate.
+/// (`wine_app_ids`) and every display title resolved through
+/// `command::wine_app_display_title`. Post-#553 that helper reads
+/// both the canonical `Wine_App_has_display-_Title` cell (full
+/// metamodel) and the legacy mis-bucketed cells (partial-metamodel
+/// fixtures), so a single pass through the slug list captures every
+/// declared title.
 ///
 /// Ranks by Levenshtein distance and returns the top `limit` entries
 /// with distance ≤ a threshold proportional to the input length (so a
@@ -318,20 +287,6 @@ pub fn near_name_suggestions(state: &ast::Object, name: &str, limit: usize) -> V
             }
         }
     }
-    // Also harvest titles from the clean `Wine_App_has_display-_Title`
-    // cell — present under the full metamodel where the FT is parsed.
-    let cell = ast::fetch_or_phi("Wine_App_has_display-_Title", state);
-    if let Some(seq) = cell.as_seq() {
-        for fact in seq.iter() {
-            if let Some(title) = ast::binding(fact, "Title") {
-                let t = title.to_string();
-                if !candidates.iter().any(|c| c == &t) {
-                    candidates.push(t);
-                }
-            }
-        }
-    }
-
     rank_near_names(name, &candidates, limit)
 }
 

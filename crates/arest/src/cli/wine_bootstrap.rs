@@ -18,6 +18,15 @@
 //      `<prefix>/user.reg` (HKCU) or `<prefix>/system.reg` (HKLM /
 //      HKCR / HKU), also via `wine_overrides`.
 //
+// As of #553 every read above goes through the canonical per-FT
+// cell (`Wine_App_requires_Required_Component`,
+// `Wine_App_requires_dll_override_of_DLL_Name_with_DLL_Behavior`,
+// `Wine_App_requires_registry_key_at_Registry_Path_with_Registry_Value`,
+// `Required_Component_Anchor_has_recipe_of_Required_Component`,
+// `Required_Component_Anchor_has_win64-_recipe_of_Required_Component`).
+// The legacy raw-text recovery path is gone — the parser now
+// preserves the third role of each ternary instance fact.
+//
 // **Architecture transitivity**: when the app's Prefix Architecture
 // is `'win64'` and the Required Component anchor declares a
 // `win64- Recipe`, the win64 variant is substituted automatically
@@ -79,19 +88,24 @@ impl BootstrapReport {
     }
 }
 
-/// Walk the facts for `app_id` in `state` (parsed) + `wine_md_text`
-/// (raw, used to recover ternary roles the parser drops) and apply
-/// them to the prefix at `prefix_dir`. Returns a `BootstrapReport`
+/// Walk the facts for `app_id` in `state` (parsed) and apply them to
+/// the prefix at `prefix_dir`. Returns a `BootstrapReport`
 /// summarising the work done.
 ///
 /// `winetricks_path` is forwarded to `winetricks::apply_recipe`; pass
 /// `None` to use the host's PATH-resolved binary.
 ///
+/// `_wine_md_text` is unused as of #553 — every fact source now
+/// resolves through the canonical per-FT cells. Kept as a parameter
+/// so callers (`cli::run::dispatch`) don't need a coordinated change
+/// in the same release; remove on the follow-up pass after the
+/// signature settles in downstream consumers.
+///
 /// Idempotent: re-running with the same fact set produces the same
 /// final state (no double-installs, no duplicated registry blocks).
 pub fn bootstrap_prefix(
     state: &ast::Object,
-    wine_md_text: &str,
+    _wine_md_text: &str,
     app_id: &str,
     prefix_dir: &Path,
     winetricks_path: Option<&Path>,
@@ -123,11 +137,11 @@ pub fn bootstrap_prefix(
     }
 
     // 2. DLL Overrides → system.reg.
-    let dll_count = wine_overrides::apply_dll_overrides(wine_md_text, app_id, prefix_dir)?;
+    let dll_count = wine_overrides::apply_dll_overrides(state, app_id, prefix_dir)?;
     report.dll_overrides_written = dll_count;
 
     // 3. Registry Keys → user.reg / system.reg.
-    let reg_count = wine_overrides::apply_registry_keys(wine_md_text, app_id, prefix_dir)?;
+    let reg_count = wine_overrides::apply_registry_keys(state, app_id, prefix_dir)?;
     report.registry_keys_written = reg_count;
 
     Ok(report)
@@ -466,12 +480,43 @@ mod tests {
         assert!(report.all_succeeded());
     }
 
+    /// Push a `(Wine App, DLL Name, DLL Behavior)` ternary fact onto the
+    /// canonical #553 cell. Helper for the bootstrap fixture tests
+    /// since the raw-text recovery path is gone.
+    fn push_dll_override(s: ast::Object, app: &str, dll: &str, behavior: &str) -> ast::Object {
+        ast::cell_push(
+            "Wine_App_requires_dll_override_of_DLL_Name_with_DLL_Behavior",
+            ast::fact_from_pairs(&[
+                ("Wine App",     app),
+                ("DLL Name",     dll),
+                ("DLL Behavior", behavior),
+            ]),
+            &s,
+        )
+    }
+
+    /// Push a `(Wine App, Registry Path, Registry Value)` ternary onto
+    /// the canonical #553 registry-key cell. Path string preserves
+    /// the markdown-source double backslashes — `parse_registry_keys_from_state`
+    /// collapses them on read.
+    fn push_registry_key(s: ast::Object, app: &str, path: &str, value: &str) -> ast::Object {
+        ast::cell_push(
+            "Wine_App_requires_registry_key_at_Registry_Path_with_Registry_Value",
+            ast::fact_from_pairs(&[
+                ("Wine App",       app),
+                ("Registry Path",  path),
+                ("Registry Value", value),
+            ]),
+            &s,
+        )
+    }
+
     #[test]
-    fn bootstrap_prefix_writes_dll_overrides_from_raw_text() {
-        let state = seeded_state();
+    fn bootstrap_prefix_writes_dll_overrides_from_canonical_cell() {
+        let state = push_dll_override(
+            seeded_state(), "office-2016-word", "riched20.dll", "native");
         let tmp = tempdir();
-        let raw = "Wine App 'office-2016-word' requires DLL Override of DLL Name 'riched20.dll' with DLL Behavior 'native'.\n";
-        let report = bootstrap_prefix(&state, raw, "office-2016-word", &tmp, None)
+        let report = bootstrap_prefix(&state, "", "office-2016-word", &tmp, None)
             .expect("bootstrap must succeed");
         assert_eq!(report.dll_overrides_written, 1);
         let body = std::fs::read_to_string(tmp.join("system.reg")).expect("system.reg written");
@@ -479,11 +524,12 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_prefix_writes_registry_keys_from_raw_text() {
-        let state = seeded_state();
+    fn bootstrap_prefix_writes_registry_keys_from_canonical_cell() {
+        let state = push_registry_key(
+            seeded_state(), "spotify",
+            r"HKCU\\Software\\Spotify\\CrashReporter", "disabled");
         let tmp = tempdir();
-        let raw = "Wine App 'spotify' requires Registry Key at Registry Path 'HKCU\\\\Software\\\\Spotify\\\\CrashReporter' with Registry Value 'disabled'.\n";
-        let report = bootstrap_prefix(&state, raw, "spotify", &tmp, None)
+        let report = bootstrap_prefix(&state, "", "spotify", &tmp, None)
             .expect("bootstrap must succeed");
         assert_eq!(report.registry_keys_written, 1);
         let body = std::fs::read_to_string(tmp.join("user.reg")).expect("user.reg written");
@@ -493,12 +539,12 @@ mod tests {
 
     #[test]
     fn bootstrap_prefix_idempotent_against_filesystem() {
-        let state = seeded_state();
+        let state = push_dll_override(
+            seeded_state(), "office-2016-word", "riched20.dll", "native");
         let tmp = tempdir();
-        let raw = "Wine App 'office-2016-word' requires DLL Override of DLL Name 'riched20.dll' with DLL Behavior 'native'.\n";
-        bootstrap_prefix(&state, raw, "office-2016-word", &tmp, None).expect("first run");
+        bootstrap_prefix(&state, "", "office-2016-word", &tmp, None).expect("first run");
         let body1 = std::fs::read_to_string(tmp.join("system.reg")).unwrap();
-        bootstrap_prefix(&state, raw, "office-2016-word", &tmp, None).expect("second run");
+        bootstrap_prefix(&state, "", "office-2016-word", &tmp, None).expect("second run");
         let body2 = std::fs::read_to_string(tmp.join("system.reg")).unwrap();
         assert_eq!(body1, body2, "second bootstrap must produce byte-identical state");
     }
