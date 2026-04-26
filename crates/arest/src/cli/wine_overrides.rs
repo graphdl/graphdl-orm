@@ -10,13 +10,15 @@
 //     'P' with Registry Value 'V'`) — split by root key (HKCU vs HKLM)
 //     and written to `user.reg` / `system.reg` respectively.
 //
-// Both fact types are FORML 2 ternaries; the third role (Behavior /
-// Value) is currently dropped by the stage-1 parser (see
-// `_reports/wine_dump_cells` introspection — only the first two roles
-// land in cells; the `with X 'Y'` tail is lost). The bootstrap layer
-// therefore reads the raw wine.md reading text alongside the parsed
-// state to recover the full ternary tuples for the `requires` ↔
-// `with` pairs, then emits the matching .reg fragments.
+// Both fact types are FORML 2 ternaries. After #553 the stage-2
+// parser preserves all three role bindings on the canonical
+// per-FT cells (`Wine_App_requires_dll_override_of_DLL_Name_with_DLL_Behavior`
+// and `Wine_App_requires_registry_key_at_Registry_Path_with_Registry_Value`),
+// so the parsers below simply walk those cells. The legacy
+// raw-text fallback (`parse_dll_overrides_from_text` /
+// `parse_registry_keys_from_text`) is retained for the unit-test
+// fixtures that exercise the recipe parsing without paying the
+// full readings-parse cost.
 //
 // Idempotent: the writers replace the entire `[Software\\Wine\\
 // DllOverrides]` section block on every run rather than appending,
@@ -33,10 +35,17 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// Apply every DLL override declared for `app_id` in `wine_md_text` to
-/// the prefix at `prefix_path`. Returns the number of override entries
+use crate::ast;
+
+/// Apply every DLL override declared for `app_id` in `state` to the
+/// prefix at `prefix_path`. Returns the number of override entries
 /// applied (zero if the app has none, which is the common case for
 /// platinum-rated apps).
+///
+/// Reads from the canonical
+/// `Wine_App_requires_dll_override_of_DLL_Name_with_DLL_Behavior`
+/// cell (the parser's #553 emission for the ternary FT
+/// `Wine App requires DLL Override of DLL Name with DLL Behavior.`).
 ///
 /// The prefix's `system.reg` is rewritten with a fresh
 /// `[Software\\Wine\\DllOverrides]` section assembled from the
@@ -44,11 +53,11 @@ use std::path::Path;
 /// verbatim. If `system.reg` doesn't exist yet (fresh prefix),
 /// a minimal one is created with just the overrides section.
 pub fn apply_dll_overrides(
-    wine_md_text: &str,
+    state: &ast::Object,
     app_id: &str,
     prefix_path: &Path,
 ) -> std::io::Result<usize> {
-    let overrides = parse_dll_overrides(wine_md_text, app_id);
+    let overrides = parse_dll_overrides_from_state(state, app_id);
     if overrides.is_empty() {
         return Ok(0);
     }
@@ -60,16 +69,21 @@ pub fn apply_dll_overrides(
     Ok(overrides.len())
 }
 
-/// Apply every registry key declared for `app_id` in `wine_md_text` to
-/// the prefix at `prefix_path`. Returns the number of registry keys
+/// Apply every registry key declared for `app_id` in `state` to the
+/// prefix at `prefix_path`. Returns the number of registry keys
 /// applied. HKCU keys go to `user.reg`; HKLM / HKCR / HKU keys go to
 /// `system.reg`. Other roots are skipped with a logged warning.
+///
+/// Reads from the canonical
+/// `Wine_App_requires_registry_key_at_Registry_Path_with_Registry_Value`
+/// cell (the parser's #553 emission for the ternary FT
+/// `Wine App requires Registry Key at Registry Path with Registry Value.`).
 pub fn apply_registry_keys(
-    wine_md_text: &str,
+    state: &ast::Object,
     app_id: &str,
     prefix_path: &Path,
 ) -> std::io::Result<usize> {
-    let keys = parse_registry_keys(wine_md_text, app_id);
+    let keys = parse_registry_keys_from_state(state, app_id);
     if keys.is_empty() {
         return Ok(0);
     }
@@ -114,11 +128,41 @@ pub struct DllOverride {
     pub behavior: String,
 }
 
-/// Parse all `Wine App 'X' requires DLL Override of DLL Name 'D' with DLL Behavior 'B'`
-/// instance facts for `app_id` from the raw reading text. Returns a
-/// deterministic BTreeMap (DLL stem → behavior) so re-runs produce
-/// byte-identical output.
-pub fn parse_dll_overrides(wine_md_text: &str, app_id: &str) -> BTreeMap<String, String> {
+/// Parse all DLL Override facts for `app_id` from the canonical
+/// `Wine_App_requires_dll_override_of_DLL_Name_with_DLL_Behavior` cell
+/// in `state`. Returns a deterministic BTreeMap (DLL stem → behavior)
+/// so re-runs produce byte-identical output.
+///
+/// The cell is the #553 ternary-fact emission. Each fact carries
+/// `(Wine App, <slug>) (DLL Name, <name>) (DLL Behavior, <behavior>)`.
+pub fn parse_dll_overrides_from_state(
+    state: &ast::Object,
+    app_id: &str,
+) -> BTreeMap<String, String> {
+    let cell = ast::fetch_or_phi(
+        "Wine_App_requires_dll_override_of_DLL_Name_with_DLL_Behavior",
+        state);
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    let Some(seq) = cell.as_seq() else { return out };
+    for fact in seq.iter() {
+        if ast::binding(fact, "Wine App") != Some(app_id) { continue; }
+        let Some(dll_name) = ast::binding(fact, "DLL Name") else { continue };
+        let behavior = ast::binding(fact, "DLL Behavior").unwrap_or("");
+        let dll_stem = dll_name.strip_suffix(".dll").unwrap_or(dll_name);
+        out.insert(dll_stem.to_string(), behavior_to_wine_format(behavior));
+    }
+    out
+}
+
+/// Legacy raw-text DLL Override parser. Retained for the fixture-
+/// driven unit tests in this module that bypass the readings parse
+/// and exercise the .reg writers directly. Production callers go
+/// through `apply_dll_overrides`, which now reads the canonical cell
+/// via `parse_dll_overrides_from_state` (#553).
+pub fn parse_dll_overrides_from_text(
+    wine_md_text: &str,
+    app_id: &str,
+) -> BTreeMap<String, String> {
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     let needle_app = format!("Wine App '{}' requires DLL Override of DLL Name '", app_id);
     for line in wine_md_text.lines() {
@@ -167,10 +211,54 @@ pub struct RegistryKey {
     pub value: String,
 }
 
-/// Parse all `Wine App 'X' requires Registry Key at Registry Path 'P' with Registry Value 'V'`
-/// instance facts for `app_id`. Returns the keys in source order so
-/// the resulting `.reg` file rewrites idempotently.
-pub fn parse_registry_keys(wine_md_text: &str, app_id: &str) -> Vec<RegistryKey> {
+/// Parse all Registry Key facts for `app_id` from the canonical
+/// `Wine_App_requires_registry_key_at_Registry_Path_with_Registry_Value`
+/// cell in `state`. Returns the keys in cell-order so the resulting
+/// `.reg` file rewrites idempotently.
+///
+/// The cell is the #553 ternary-fact emission. Each fact carries
+/// `(Wine App, <slug>) (Registry Path, <p>) (Registry Value, <v>)`.
+/// The `<p>` from the parser still carries the markdown-source
+/// double backslashes (`HKCU\\\\Software\\\\X`); we collapse them
+/// here to single backslashes before splitting on the root key.
+pub fn parse_registry_keys_from_state(
+    state: &ast::Object,
+    app_id: &str,
+) -> Vec<RegistryKey> {
+    let cell = ast::fetch_or_phi(
+        "Wine_App_requires_registry_key_at_Registry_Path_with_Registry_Value",
+        state);
+    let mut out: Vec<RegistryKey> = Vec::new();
+    let Some(seq) = cell.as_seq() else { return out };
+    for fact in seq.iter() {
+        if ast::binding(fact, "Wine App") != Some(app_id) { continue; }
+        let Some(raw_path) = ast::binding(fact, "Registry Path") else { continue };
+        let value = ast::binding(fact, "Registry Value").unwrap_or("");
+        // `HKCU\\Software\\X` — strip the duplicate backslashes.
+        let unescaped = raw_path.replace("\\\\", "\\");
+        let mut parts = unescaped.splitn(2, '\\');
+        let root = parts.next().unwrap_or("").to_string();
+        let subpath = parts.next().unwrap_or("").to_string();
+        if root.is_empty() || subpath.is_empty() {
+            continue;
+        }
+        out.push(RegistryKey {
+            root,
+            subpath,
+            value: value.to_string(),
+        });
+    }
+    out
+}
+
+/// Legacy raw-text Registry Key parser. Retained for the fixture-
+/// driven unit tests in this module. Production callers go through
+/// `apply_registry_keys`, which now reads the canonical cell via
+/// `parse_registry_keys_from_state` (#553).
+pub fn parse_registry_keys_from_text(
+    wine_md_text: &str,
+    app_id: &str,
+) -> Vec<RegistryKey> {
     let mut out: Vec<RegistryKey> = Vec::new();
     let needle_app = format!("Wine App '{}' requires Registry Key at Registry Path '", app_id);
     for line in wine_md_text.lines() {
@@ -308,16 +396,55 @@ Wine App 'spotify' requires Registry Key at Registry Path 'HKCU\\Software\\Spoti
 Wine App 'fictional-app' requires Registry Key at Registry Path 'HKLM\\Software\\Fictional\\X' with Registry Value 'on'.
 "#;
 
+    /// Hand-build a state with the canonical #553 ternary cells for
+    /// the SAMPLE_MD entries so the apply_* tests can exercise the
+    /// post-fix code path without paying a full readings-parse cost.
+    fn sample_state() -> ast::Object {
+        let mut s = ast::Object::phi();
+        let dll_cell = "Wine_App_requires_dll_override_of_DLL_Name_with_DLL_Behavior";
+        for (app, name, behavior) in &[
+            ("photoshop-cs6",    "msvcr120.dll", "native"),
+            ("office-2016-word", "riched20.dll", "native"),
+            ("steam-windows",    "dwrite.dll",   "disabled"),
+            ("steam-windows",    "msxml3.dll",   "native"),
+            ("steam-windows",    "msxml6.dll",   "native"),
+        ] {
+            s = ast::cell_push(dll_cell, ast::fact_from_pairs(&[
+                ("Wine App",     *app),
+                ("DLL Name",     *name),
+                ("DLL Behavior", *behavior),
+            ]), &s);
+        }
+        let reg_cell = "Wine_App_requires_registry_key_at_Registry_Path_with_Registry_Value";
+        // Cell facts mirror the parser shape: backslashes are
+        // preserved exactly as they came from the markdown source
+        // (double-backslashes here, single-backslash after the
+        // `parse_registry_keys_from_state` strip).
+        s = ast::cell_push(reg_cell, ast::fact_from_pairs(&[
+            ("Wine App",       "spotify"),
+            ("Registry Path",  r"HKCU\\Software\\Spotify\\CrashReporter"),
+            ("Registry Value", "disabled"),
+        ]), &s);
+        s = ast::cell_push(reg_cell, ast::fact_from_pairs(&[
+            ("Wine App",       "fictional-app"),
+            ("Registry Path",  r"HKLM\\Software\\Fictional\\X"),
+            ("Registry Value", "on"),
+        ]), &s);
+        s
+    }
+
     #[test]
-    fn parse_dll_overrides_strips_dll_suffix() {
-        let out = parse_dll_overrides(SAMPLE_MD, "photoshop-cs6");
+    fn parse_dll_overrides_from_state_strips_dll_suffix() {
+        let state = sample_state();
+        let out = parse_dll_overrides_from_state(&state, "photoshop-cs6");
         assert_eq!(out.get("msvcr120").map(String::as_str), Some("native"));
         assert_eq!(out.len(), 1);
     }
 
     #[test]
-    fn parse_dll_overrides_returns_multiple_entries() {
-        let out = parse_dll_overrides(SAMPLE_MD, "steam-windows");
+    fn parse_dll_overrides_from_state_returns_multiple_entries() {
+        let state = sample_state();
+        let out = parse_dll_overrides_from_state(&state, "steam-windows");
         // BTreeMap iteration is sorted; assert all three present.
         assert_eq!(out.len(), 3);
         assert_eq!(out.get("dwrite").map(String::as_str), Some(""));   // disabled → empty
@@ -326,9 +453,19 @@ Wine App 'fictional-app' requires Registry Key at Registry Path 'HKLM\\Software\
     }
 
     #[test]
-    fn parse_dll_overrides_returns_empty_for_unknown_app() {
-        let out = parse_dll_overrides(SAMPLE_MD, "nonexistent");
+    fn parse_dll_overrides_from_state_returns_empty_for_unknown_app() {
+        let state = sample_state();
+        let out = parse_dll_overrides_from_state(&state, "nonexistent");
         assert!(out.is_empty());
+    }
+
+    /// Legacy raw-text parser smoke test — confirms the fallback
+    /// retained for fixture-only callers still parses the reading
+    /// shape correctly.
+    #[test]
+    fn parse_dll_overrides_from_text_smoke() {
+        let out = parse_dll_overrides_from_text(SAMPLE_MD, "photoshop-cs6");
+        assert_eq!(out.get("msvcr120").map(String::as_str), Some("native"));
     }
 
     #[test]
@@ -340,8 +477,9 @@ Wine App 'fictional-app' requires Registry Key at Registry Path 'HKLM\\Software\
     }
 
     #[test]
-    fn parse_registry_keys_splits_root_and_subpath() {
-        let out = parse_registry_keys(SAMPLE_MD, "spotify");
+    fn parse_registry_keys_from_state_splits_root_and_subpath() {
+        let state = sample_state();
+        let out = parse_registry_keys_from_state(&state, "spotify");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].root, "HKCU");
         assert_eq!(out[0].subpath, r"Software\Spotify\CrashReporter");
@@ -349,9 +487,18 @@ Wine App 'fictional-app' requires Registry Key at Registry Path 'HKLM\\Software\
     }
 
     #[test]
-    fn parse_registry_keys_returns_empty_for_unknown_app() {
-        let out = parse_registry_keys(SAMPLE_MD, "nonexistent");
+    fn parse_registry_keys_from_state_returns_empty_for_unknown_app() {
+        let state = sample_state();
+        let out = parse_registry_keys_from_state(&state, "nonexistent");
         assert!(out.is_empty());
+    }
+
+    /// Legacy raw-text parser smoke test for registry keys.
+    #[test]
+    fn parse_registry_keys_from_text_smoke() {
+        let out = parse_registry_keys_from_text(SAMPLE_MD, "spotify");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].root, "HKCU");
     }
 
     #[test]
@@ -404,7 +551,8 @@ Wine App 'fictional-app' requires Registry Key at Registry Path 'HKLM\\Software\
     #[test]
     fn apply_dll_overrides_writes_system_reg() {
         let tmp = tempdir();
-        let n = apply_dll_overrides(SAMPLE_MD, "photoshop-cs6", &tmp).expect("apply must succeed");
+        let state = sample_state();
+        let n = apply_dll_overrides(&state, "photoshop-cs6", &tmp).expect("apply must succeed");
         assert_eq!(n, 1);
         let body = std::fs::read_to_string(tmp.join("system.reg")).expect("system.reg written");
         assert!(body.contains("[Software\\\\Wine\\\\DllOverrides]"));
@@ -414,7 +562,8 @@ Wine App 'fictional-app' requires Registry Key at Registry Path 'HKLM\\Software\
     #[test]
     fn apply_dll_overrides_returns_zero_for_no_overrides() {
         let tmp = tempdir();
-        let n = apply_dll_overrides(SAMPLE_MD, "notepad-plus-plus", &tmp).expect("apply must succeed");
+        let state = sample_state();
+        let n = apply_dll_overrides(&state, "notepad-plus-plus", &tmp).expect("apply must succeed");
         assert_eq!(n, 0, "platinum app with no overrides must return 0; no file write");
         // No system.reg created when there's nothing to write.
         assert!(!tmp.join("system.reg").exists());
@@ -423,9 +572,10 @@ Wine App 'fictional-app' requires Registry Key at Registry Path 'HKLM\\Software\
     #[test]
     fn apply_dll_overrides_idempotent_on_disk() {
         let tmp = tempdir();
-        let n1 = apply_dll_overrides(SAMPLE_MD, "steam-windows", &tmp).expect("first apply");
+        let state = sample_state();
+        let n1 = apply_dll_overrides(&state, "steam-windows", &tmp).expect("first apply");
         let body1 = std::fs::read_to_string(tmp.join("system.reg")).unwrap();
-        let n2 = apply_dll_overrides(SAMPLE_MD, "steam-windows", &tmp).expect("second apply");
+        let n2 = apply_dll_overrides(&state, "steam-windows", &tmp).expect("second apply");
         let body2 = std::fs::read_to_string(tmp.join("system.reg")).unwrap();
         assert_eq!(n1, n2);
         assert_eq!(body1, body2, "second apply must produce byte-identical system.reg");
@@ -434,7 +584,8 @@ Wine App 'fictional-app' requires Registry Key at Registry Path 'HKLM\\Software\
     #[test]
     fn apply_registry_keys_routes_hkcu_to_user_reg() {
         let tmp = tempdir();
-        let n = apply_registry_keys(SAMPLE_MD, "spotify", &tmp).expect("apply must succeed");
+        let state = sample_state();
+        let n = apply_registry_keys(&state, "spotify", &tmp).expect("apply must succeed");
         assert_eq!(n, 1);
         let body = std::fs::read_to_string(tmp.join("user.reg")).expect("user.reg must exist");
         assert!(body.contains("[HKCU\\\\Software\\\\Spotify\\\\CrashReporter]"));
@@ -447,7 +598,8 @@ Wine App 'fictional-app' requires Registry Key at Registry Path 'HKLM\\Software\
     #[test]
     fn apply_registry_keys_routes_hklm_to_system_reg() {
         let tmp = tempdir();
-        let n = apply_registry_keys(SAMPLE_MD, "fictional-app", &tmp).expect("apply must succeed");
+        let state = sample_state();
+        let n = apply_registry_keys(&state, "fictional-app", &tmp).expect("apply must succeed");
         assert_eq!(n, 1);
         let body = std::fs::read_to_string(tmp.join("system.reg")).expect("system.reg must exist");
         assert!(body.contains("[HKLM\\\\Software\\\\Fictional\\\\X]"));
@@ -456,9 +608,10 @@ Wine App 'fictional-app' requires Registry Key at Registry Path 'HKLM\\Software\
     #[test]
     fn apply_registry_keys_idempotent() {
         let tmp = tempdir();
-        apply_registry_keys(SAMPLE_MD, "spotify", &tmp).expect("first apply");
+        let state = sample_state();
+        apply_registry_keys(&state, "spotify", &tmp).expect("first apply");
         let body1 = std::fs::read_to_string(tmp.join("user.reg")).unwrap();
-        apply_registry_keys(SAMPLE_MD, "spotify", &tmp).expect("second apply");
+        apply_registry_keys(&state, "spotify", &tmp).expect("second apply");
         let body2 = std::fs::read_to_string(tmp.join("user.reg")).unwrap();
         assert_eq!(body1, body2);
     }

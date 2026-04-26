@@ -1039,6 +1039,13 @@ impl Drop for StmtIndexGuard {
 ///   objectNoun = role 1's head noun (if present)
 ///   objectValue = role 1's literal (if present)
 ///
+/// Ternary+ instance facts (`Wine App 'X' requires DLL Override of
+/// DLL Name 'D' with DLL Behavior 'B'`, etc.) extend this with one
+/// pair of `roleNNoun` / `roleNValue` bindings per additional role
+/// (N starts at 2). #553 — without these, the third role's literal
+/// was silently dropped, forcing CLI consumers to re-parse the raw
+/// markdown to recover it.
+///
 /// Unary instance-facts (value assertions like `Customer 'alice' is
 /// active`) currently emit with empty objectNoun/objectValue.
 #[cfg(feature = "std-deps")]
@@ -1047,14 +1054,20 @@ pub fn translate_instance_facts(classified_state: &Object) -> Vec<Object> {
 }
 
 /// Variant that can resolve `fieldName` to a canonical FT id when the
-/// (subject, verb, object) triple matches a declared Fact Type. The
-/// caller supplies the already-translated FactType ids; when the
-/// constructed canonical id is among them, it wins; otherwise fall
-/// back to the raw verb token. Legacy exhibits the same behavior —
-/// `Constraint Type 'AC' has Name 'Acyclic'` resolves to
+/// (subject, verb, object[, roleN…]) tuple matches a declared Fact
+/// Type. The caller supplies the already-translated FactType ids;
+/// when the constructed canonical id is among them, it wins; otherwise
+/// fall back to the raw verb token. Legacy exhibits the same
+/// behavior — `Constraint Type 'AC' has Name 'Acyclic'` resolves to
 /// `Constraint_Type_has_Name` because the FT is declared, but
 /// `HTTP Method 'DELETE' has Name 'DELETE'` stays on `has` because no
 /// `HTTP Method has Name` FT is declared.
+///
+/// For ternary+ shapes the canonical id is built from the statement
+/// text itself (via `fact_type_id_from_reading` after stripping the
+/// per-role literals), so it picks up the inter-role verb chunks
+/// (`with`, `at`, `and …`) that the per-statement Verb cell only
+/// records for the role-0 ↔ role-1 gap.
 #[cfg(feature = "std-deps")]
 pub fn translate_instance_facts_with_ft_ids(
     classified_state: &Object,
@@ -1075,29 +1088,99 @@ pub fn translate_instance_facts_with_ft_ids(
             .map(|(n, lit)| (n.as_str(), lit.as_deref().unwrap_or("")))
             .unwrap_or(("", ""));
 
-        let canonical = if object_noun.is_empty() {
-            alloc::format!("{}_{}",
-                subject_noun.replace(' ', "_"),
-                verb.to_lowercase().replace(' ', "_"))
+        // Canonical id construction. For unary / binary shapes this
+        // mirrors the legacy `subject_verb[_object]` munge. For
+        // ternary+ shapes we recover the canonical FT reading from
+        // the statement text (literals stripped) and route it through
+        // `fact_type_id_from_reading` so the inter-role verb tokens
+        // (e.g. ` with `, ` at `, ` and `) survive. Lower-arity facts
+        // keep the cheap path — no statement-text walk needed.
+        let canonical = if roles.len() <= 2 {
+            if object_noun.is_empty() {
+                alloc::format!("{}_{}",
+                    subject_noun.replace(' ', "_"),
+                    verb.to_lowercase().replace(' ', "_"))
+            } else {
+                alloc::format!("{}_{}_{}",
+                    subject_noun.replace(' ', "_"),
+                    verb.to_lowercase().replace(' ', "_"),
+                    object_noun.replace(' ', "_"))
+            }
         } else {
-            alloc::format!("{}_{}_{}",
-                subject_noun.replace(' ', "_"),
-                verb.to_lowercase().replace(' ', "_"),
-                object_noun.replace(' ', "_"))
+            // Strip role literals from the statement text to recover
+            // the canonical FT reading shape, then build the id.
+            let text = statement_text(classified_state, stmt_id)
+                .unwrap_or_default();
+            let role_nouns: Vec<String> = roles.iter()
+                .map(|(n, _)| n.clone()).collect();
+            let reading = strip_role_literals(&text, &roles);
+            fact_type_id_from_reading(&reading, &role_nouns)
         };
         let field_name: String = if declared_ft_ids.iter().any(|id| *id == canonical) {
             canonical
         } else {
             verb.clone()
         };
-        out.push(fact_from_pairs(&[
-            ("subjectNoun",  subject_noun.as_str()),
-            ("subjectValue", subject_value),
-            ("fieldName",    field_name.as_str()),
-            ("objectNoun",   object_noun),
-            ("objectValue",  object_value),
-        ]));
+        // Build the (key, value) list for the InstanceFact fact.
+        // Keep the legacy 5-pair prefix verbatim so cells consumers
+        // (compile.rs::extract_facts_from_pop, ring constraint span
+        // resolver, etc.) keep their existing reads. Append one
+        // (`roleNNoun`, `roleNValue`) pair per additional role.
+        let mut pairs: Vec<(String, String)> = Vec::with_capacity(5 + 2 * roles.len().saturating_sub(2));
+        pairs.push(("subjectNoun".to_string(),  subject_noun.clone()));
+        pairs.push(("subjectValue".to_string(), subject_value.to_string()));
+        pairs.push(("fieldName".to_string(),    field_name.clone()));
+        pairs.push(("objectNoun".to_string(),   object_noun.to_string()));
+        pairs.push(("objectValue".to_string(),  object_value.to_string()));
+        for (i, (n, lit)) in roles.iter().enumerate().skip(2) {
+            pairs.push((alloc::format!("role{}Noun", i),  n.clone()));
+            pairs.push((alloc::format!("role{}Value", i), lit.clone().unwrap_or_default()));
+        }
+        let pair_refs: Vec<(&str, &str)> = pairs.iter()
+            .map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        out.push(fact_from_pairs(&pair_refs));
     }
+    out
+}
+
+/// Strip every role literal (the `'value'` slice that follows a role
+/// noun) from `text`, recovering the FT-reading-shaped string. Used
+/// by `translate_instance_facts_with_ft_ids` to build a canonical id
+/// for ternary+ instance facts via `fact_type_id_from_reading`.
+///
+/// Walks the role list in declaration order so repeated nouns (ring
+/// shapes) match distinct positions; each successive scan starts at
+/// the previous strip's end. Roles without literals are passed
+/// through unchanged.
+#[cfg(feature = "std-deps")]
+fn strip_role_literals(text: &str, roles: &[(String, Option<String>)]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (noun, lit) in roles {
+        let Some(rel) = text[cursor..].find(noun.as_str()) else {
+            // Reading doesn't align with roles — return original text
+            // and let the canonical-id fallback handle it.
+            out.push_str(&text[cursor..]);
+            return out;
+        };
+        let abs_noun = cursor + rel;
+        let after_noun = abs_noun + noun.len();
+        // Copy text up to and including the noun.
+        out.push_str(&text[cursor..after_noun]);
+        cursor = after_noun;
+        // If a literal follows (whitespace + `'…'`), skip it.
+        if let Some(_lit_str) = lit {
+            let tail = &text[cursor..];
+            let after_ws = tail.trim_start();
+            let ws_len = tail.len() - after_ws.len();
+            if after_ws.starts_with('\'') {
+                if let Some(end) = after_ws[1..].find('\'') {
+                    cursor += ws_len + 1 + end + 1;
+                }
+            }
+        }
+    }
+    out.push_str(&text[cursor..]);
     out
 }
 
@@ -2844,6 +2927,12 @@ fn compound_ref_component_cells(
 /// The object key is `objectNoun` when non-empty, else falls back to
 /// `fieldName` — matches the attribute-style path in `emit_instance_fact`.
 ///
+/// For ternary+ instance facts (#553) the per-field cell fact also
+/// carries one `(roleNNoun, roleNValue)` pair per additional role
+/// (`role2Noun` / `role2Value`, `role3Noun` / `role3Value`, …) so
+/// downstream readers can `binding(fact, "DLL Behavior")` directly
+/// without re-parsing the raw markdown.
+///
 /// Returns `(cell_name, facts)` pairs the caller merges into the
 /// final cell map.
 #[cfg(feature = "std-deps")]
@@ -2858,10 +2947,30 @@ fn instance_fact_field_cells(instance_facts: &[Object]) -> Vec<(String, Vec<Obje
         let object_value = binding(f, "objectValue").unwrap_or("");
         if subject_noun.is_empty() { continue; }
         let object_key = if object_noun.is_empty() { field_name } else { object_noun };
-        let fact = fact_from_pairs(&[
-            (subject_noun, subject_value),
-            (object_key, object_value),
-        ]);
+        // Base: the legacy 2-pair shape (subject + object). Extra
+        // roles are appended in declared order; their key is the
+        // role's head noun (mirrors how the binary path keys the
+        // object by `objectNoun`).
+        let mut pairs: Vec<(String, String)> = Vec::with_capacity(2);
+        pairs.push((subject_noun.to_string(),  subject_value.to_string()));
+        pairs.push((object_key.to_string(),    object_value.to_string()));
+        // Walk roleNNoun / roleNValue starting at N=2 until the
+        // sequence breaks (a missing roleNNoun ends the chain). One
+        // pair per additional role; key is the role noun, value is
+        // the role's literal.
+        let mut n: usize = 2;
+        loop {
+            let noun_key = alloc::format!("role{}Noun", n);
+            let value_key = alloc::format!("role{}Value", n);
+            let Some(noun) = binding(f, &noun_key) else { break };
+            if noun.is_empty() { break; }
+            let value = binding(f, &value_key).unwrap_or("");
+            pairs.push((noun.to_string(), value.to_string()));
+            n += 1;
+        }
+        let pair_refs: Vec<(&str, &str)> = pairs.iter()
+            .map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let fact = fact_from_pairs(&pair_refs);
         out.entry(field_name.to_string()).or_default().push(fact);
     }
     out.into_iter().collect()
@@ -3349,6 +3458,135 @@ mod tests {
         let classified = classify_statements(&stmt, &grammar_state());
         let facts = super::translate_instance_facts(&classified);
         assert!(facts.is_empty(), "got {:?}", facts);
+    }
+
+    /// #553 — ternary instance facts must preserve the third role's
+    /// noun + literal in the InstanceFact cell. Mirrors wine.md's
+    /// `Wine App requires DLL Override of DLL Name 'D' with DLL
+    /// Behavior 'B'` shape: three roles, all three with literals,
+    /// three matched declared nouns.
+    #[test]
+    fn translate_instance_facts_emits_third_role_for_ternary() {
+        let stmt = stage1_state(
+            "s1",
+            "Wine App 'office-2016-word' requires DLL Override of \
+             DLL Name 'riched20.dll' with DLL Behavior 'native'.",
+            &["Wine App", "DLL Name", "DLL Behavior"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let facts = super::translate_instance_facts(&classified);
+        assert_eq!(facts.len(), 1, "expected 1 instance fact; got {:?}", facts);
+        let f = &facts[0];
+        assert_eq!(binding(f, "subjectNoun"),  Some("Wine App"));
+        assert_eq!(binding(f, "subjectValue"), Some("office-2016-word"));
+        assert_eq!(binding(f, "objectNoun"),   Some("DLL Name"));
+        assert_eq!(binding(f, "objectValue"),  Some("riched20.dll"));
+        // The third role: noun + literal must survive the parse.
+        assert_eq!(binding(f, "role2Noun"),    Some("DLL Behavior"));
+        assert_eq!(binding(f, "role2Value"),   Some("native"));
+    }
+
+    /// #553 — ternary instance facts whose canonical 3-role FT id is
+    /// declared resolve `fieldName` to that id (not the bare verb).
+    /// Confirms the FT-resolution path now considers all three roles
+    /// when constructing the canonical id to match against.
+    #[test]
+    fn translate_instance_facts_with_ft_ids_resolves_canonical_for_ternary() {
+        let stmt = stage1_state(
+            "s1",
+            "Wine App 'office-2016-word' requires DLL Override of \
+             DLL Name 'riched20.dll' with DLL Behavior 'native'.",
+            &["Wine App", "DLL Name", "DLL Behavior"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let canonical_id =
+            "Wine_App_requires_dll_override_of_DLL_Name_with_DLL_Behavior".to_string();
+        let facts = super::translate_instance_facts_with_ft_ids(
+            &classified, &[canonical_id.clone()]);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(binding(&facts[0], "fieldName"), Some(canonical_id.as_str()));
+    }
+
+    /// #553 end-to-end: parse the real `readings/compat/wine.md`
+    /// (with filesystem.md preloaded so `Directory` is in scope) and
+    /// confirm the canonical 3-role cells are emitted with all three
+    /// role bindings. The bundled steam-windows / spotify / notion-
+    /// desktop instance facts cover DLL Override, Registry Key, and
+    /// Environment Variable shapes respectively.
+    #[cfg(feature = "compat-readings")]
+    #[test]
+    fn ternary_instance_facts_land_in_canonical_cells_via_real_parse() {
+        let filesystem_md = include_str!("../../../readings/os/filesystem.md");
+        let wine_md = include_str!("../../../readings/compat/wine.md");
+        let fs_state = crate::parse_forml2::parse_to_state(filesystem_md)
+            .expect("filesystem.md must parse");
+        let state = crate::parse_forml2::parse_to_state_from(wine_md, &fs_state)
+            .expect("wine.md must parse");
+
+        // DLL Override: steam-windows requires dwrite.dll = disabled.
+        let dll_cell = crate::ast::fetch_or_phi(
+            "Wine_App_requires_dll_override_of_DLL_Name_with_DLL_Behavior",
+            &state);
+        let dll_seq = dll_cell.as_seq()
+            .expect("ternary DLL Override cell must be populated");
+        let dwrite = dll_seq.iter().find(|f| {
+            crate::ast::binding(f, "Wine App") == Some("steam-windows")
+                && crate::ast::binding(f, "DLL Name") == Some("dwrite.dll")
+        }).expect("dwrite override fact must be present");
+        assert_eq!(crate::ast::binding(dwrite, "DLL Behavior"), Some("disabled"),
+            "third role must survive in the canonical cell");
+
+        // Registry Key: spotify CrashReporter = disabled.
+        let reg_cell = crate::ast::fetch_or_phi(
+            "Wine_App_requires_registry_key_at_Registry_Path_with_Registry_Value",
+            &state);
+        let reg_seq = reg_cell.as_seq()
+            .expect("ternary Registry Key cell must be populated");
+        let spot = reg_seq.iter().find(|f| {
+            crate::ast::binding(f, "Wine App") == Some("spotify")
+        }).expect("spotify registry fact must be present");
+        assert_eq!(crate::ast::binding(spot, "Registry Path"),
+            Some("HKCU\\\\Software\\\\Spotify\\\\CrashReporter"));
+        assert_eq!(crate::ast::binding(spot, "Registry Value"), Some("disabled"));
+
+        // Environment Variable: notion-desktop WINEDLLOVERRIDES = libglesv2=b.
+        let env_cell = crate::ast::fetch_or_phi(
+            "Wine_App_requires_environment_variable_with_Env_Var_Name_and_Env_Var_Value",
+            &state);
+        let env_seq = env_cell.as_seq()
+            .expect("ternary Environment Variable cell must be populated");
+        let nv = env_seq.iter().find(|f| {
+            crate::ast::binding(f, "Wine App") == Some("notion-desktop")
+                && crate::ast::binding(f, "Env Var Name") == Some("WINEDLLOVERRIDES")
+        }).expect("notion-desktop WINEDLLOVERRIDES fact must be present");
+        assert_eq!(crate::ast::binding(nv, "Env Var Value"), Some("libglesv2=b"));
+    }
+
+    /// #553 — `instance_fact_field_cells` must propagate the third
+    /// role into the per-field cell so downstream readers (CLI / .reg
+    /// writers) can `binding(fact, "DLL Behavior")` instead of
+    /// re-parsing the raw markdown.
+    #[test]
+    fn instance_fact_field_cells_includes_third_role_binding() {
+        // Build a single InstanceFact that carries all three roles
+        // (mirrors what translate_instance_facts now emits).
+        let inst = fact_from_pairs(&[
+            ("subjectNoun",  "Wine App"),
+            ("subjectValue", "office-2016-word"),
+            ("fieldName",    "Wine_App_requires_dll_override_of_DLL_Name_with_DLL_Behavior"),
+            ("objectNoun",   "DLL Name"),
+            ("objectValue",  "riched20.dll"),
+            ("role2Noun",    "DLL Behavior"),
+            ("role2Value",   "native"),
+        ]);
+        let cells = super::instance_fact_field_cells(&[inst]);
+        let (_name, facts) = cells.iter()
+            .find(|(n, _)| n ==
+                "Wine_App_requires_dll_override_of_DLL_Name_with_DLL_Behavior")
+            .expect("expected per-field cell for the canonical FT id");
+        assert_eq!(facts.len(), 1);
+        let f = &facts[0];
+        assert_eq!(binding(f, "Wine App"),     Some("office-2016-word"));
+        assert_eq!(binding(f, "DLL Name"),     Some("riched20.dll"));
+        assert_eq!(binding(f, "DLL Behavior"), Some("native"));
     }
 
     #[test]

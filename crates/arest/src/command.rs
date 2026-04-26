@@ -1597,13 +1597,35 @@ pub fn wine_app_ids(state: &ast::Object) -> Vec<String> {
 
 /// Return the display title for a Wine App slug, if one was declared.
 ///
-/// Walks the mis-bucketed `has display- Title '<Title>'` cells the
-/// parser currently emits (see the module-level note above).
-/// Returns `None` if no matching cell is found OR if the slug isn't
-/// a known Wine App.
+/// First reads the canonical `Wine_App_has_display-_Title` cell —
+/// the parser's standard emission for `Wine App has display- Title.`
+/// once the FT is in scope (full bundled metamodel). Falls back to
+/// the legacy mis-bucketed `has display- Title '<Title>'` cells for
+/// partial-metamodel states (the command-module unit-test fixture
+/// shape that pre-dates the FT being declared).
+///
+/// Returns `None` if no matching binding is found in either source
+/// OR if the slug isn't a known Wine App.
 pub fn wine_app_display_title(state: &ast::Object, slug: &str) -> Option<String> {
+    // Canonical cell: emitted by the parser when the
+    // `Wine App has display- Title.` FT is in scope. Each fact carries
+    // `(Wine App, <slug>) (Title, <title>)`.
+    let canonical = ast::fetch_or_phi("Wine_App_has_display-_Title", state);
+    if let Some(seq) = canonical.as_seq() {
+        for fact in seq.iter() {
+            if ast::binding(fact, "Wine App") == Some(slug) {
+                if let Some(title) = ast::binding(fact, "Title") {
+                    return Some(title.to_string());
+                }
+            }
+        }
+    }
+    // Fallback: legacy mis-bucketed cells of the form
+    // `has display- Title '<actual title>'`. Pre-FT-declaration states
+    // (and the command-module unit-test fixture) populate this shape;
+    // production callers under the bundled metamodel hit the
+    // canonical-cell branch above first.
     for (name, contents) in ast::cells_iter(state) {
-        // Cell name shape: `has display- Title '<actual title>'`
         let prefix = "has display- Title '";
         if !name.starts_with(prefix) || !name.ends_with('\'') {
             continue;
