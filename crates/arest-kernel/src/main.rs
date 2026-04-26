@@ -201,6 +201,16 @@ pub mod process;
 // so cargo check passes cleanly on every UEFI arch arm.
 pub mod synthetic_fs;
 
+// `syscall` (#507 Track GGGGG). Linux ABI syscall handler dispatch
+// table for tier-1 binaries. SYS_WRITE (1) routes to crate::print!,
+// SYS_EXIT/EXIT_GROUP (60/231) marks the current Process::Exited.
+// The `pub mod syscall;` declaration was lost during a concurrent-
+// commit index-contamination event when GGGGG's commit cd5d146
+// accidentally swept HHHHH's `pub mod synthetic_fs;` line instead
+// of its own — the on-disk syscall/ tree was always present, just
+// never declared. Backfilled here.
+pub mod syscall;
+
 // `linuxkpi` (#460 Track AAAA, foundation for the AREST-on-real-
 // hardware epic #459). FreeBSD-style Linux kernel API shim that lets
 // unmodified Linux C drivers link against AREST primitives. Off by
