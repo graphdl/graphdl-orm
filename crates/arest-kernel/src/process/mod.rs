@@ -17,13 +17,18 @@
 // already calls itself "FreeBSD-style Linux kernel API shim"); they
 // need their own module tree.
 //
-// Foundation slice scope (#518, this commit)
-// ------------------------------------------
-// Just `elf` — the parser. The next-slice loader (#472b) will land
-// `process::loader`; the relocation engine #472c lands
-// `process::relocate`; the syscall trampoline #472d lands
-// `process::syscall`. Each is a sibling submodule that consumes the
-// types the parser produces.
+// Loader slice scope (#519 + #520, second commit)
+// ------------------------------------------------
+// `elf` (the parser, foundation #518) plus `address_space` (the
+// in-memory representation of a loaded process — owns one
+// `LoadedSegment` per PT_LOAD, page-aligned heap allocation, drop-
+// reclaims). `elf::load_segments(&ParsedElf, &[u8])` is the bridge:
+// consumes a parsed header + the original blob, returns a populated
+// `AddressSpace`. PT_INTERP detection (#520) is folded in — the
+// loader rejects dynamic binaries up front with
+// `LoaderError::DynamicLoaderRequired`. The relocation engine #472c
+// and the syscall trampoline #472d follow as separate sibling
+// submodules.
 //
 // Gating
 // ------
@@ -36,7 +41,14 @@
 
 #![allow(dead_code)]
 
+pub mod address_space;
 pub mod elf;
+
+// Re-exports for the call site that wants the loader as a one-liner.
+// Keeps the cross-module path short for the eventual #521 trampoline:
+//   use crate::process::{load_segments, AddressSpace};
+pub use address_space::{AddressSpace, LoadedSegment, LoaderError, SegmentPerm};
+pub use elf::{load_segments, LoadOrParseError};
 
 #[cfg(test)]
 pub mod test_fixtures;
