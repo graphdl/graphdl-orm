@@ -89,6 +89,8 @@ use alloc::vec::Vec;
 
 use arest::ast::{self, Object};
 
+use crate::ui_apps::navigation::{self, NavigationTarget};
+
 // ── Cell-type discriminator ────────────────────────────────────────
 
 /// The "current cell" the unified REPL is rendering. Every screen IS
@@ -463,9 +465,16 @@ fn project_component_instance(component_id: &str, state: &Object) -> Vec<String>
 // ── Top-level render: cell + selected component + projected fields ─
 
 /// Render a single screen. Bundles the typed-surface header
-/// (selected Component) with the projected field list — the Slint
-/// side reads each field off `RenderedScreen` and pushes them into
-/// the property bag.
+/// (selected Component) with the projected field list AND the
+/// derived navigation catalogue — the Slint side reads each field
+/// off `RenderedScreen` and pushes them into the property bag.
+///
+/// Navigation actions as cells (#512, EPIC #496): the `navigation`
+/// vector holds every legal "navigate to X" affordance for this
+/// screen, computed by `navigation::compute_navigation_targets`
+/// from the FT graph itself. The Slint side renders them as
+/// clickable rows in the right pane; clicks fire a callback with
+/// the index into this vector.
 #[derive(Debug, Clone)]
 pub struct RenderedScreen {
     /// Human-friendly cell name (the title of the typed surface).
@@ -479,18 +488,32 @@ pub struct RenderedScreen {
     /// shown alongside the typed surface header (transparency: the
     /// user can always see what data drives the surface).
     pub fields: Vec<String>,
+    /// Navigation catalogue for this screen — every "navigate to X"
+    /// affordance derived from the cell graph. Each entry corresponds
+    /// to one clickable row in the right-pane navigation list. The
+    /// Slint side keys clicks by index into this vector, so the
+    /// ordering is stable across redraws (enforced by
+    /// `navigation::compute_navigation_targets`).
+    pub navigation: Vec<NavigationTarget>,
 }
 
 /// Render the current cell into a `RenderedScreen` ready to push
 /// into the Slint property bag. Pure function — the `with_state`
 /// caller drops the read lock the moment this returns.
+///
+/// Bundles three derivations: the Component selection (#511), the
+/// field projection (#511), and the navigation-target catalogue
+/// (#512). All three read the same `Object` slice; computing them
+/// in one call lets the caller hold the read lock once.
 pub fn render_current_cell(cell: &CurrentCell, state: &Object) -> RenderedScreen {
     let selected = select_component_for(cell.intent(), state);
     let fields = project_cell_fields(cell, state);
+    let navigation = navigation::compute_navigation_targets(cell, state);
     RenderedScreen {
         cell_label: cell.label(),
         selected,
         fields,
+        navigation,
     }
 }
 
@@ -786,5 +809,63 @@ mod tests {
         );
         assert!(r.selected.is_none(), "no Component registered → fallback");
         assert!(r.fields.iter().any(|l| l.contains("Foo=f")));
+    }
+
+    // ── Navigation actions as cells (#512) ────────────────────────
+
+    #[test]
+    fn render_root_emits_navigation_target_per_noun() {
+        // Navigation actions as cells (#512): every noun the system
+        // knows about appears as a "navigate to X" affordance off the
+        // Root screen. The catalogue is computed from the cell graph,
+        // not hand-listed.
+        let state = synth_user_facts();
+        let r = render_current_cell(&CurrentCell::Root, &state);
+        // synth_user_facts seeds a File noun + Component-related cells.
+        let labels: Vec<&str> = r.navigation.iter().map(|t| t.label.as_str()).collect();
+        assert!(
+            labels.iter().any(|l| l.contains("File")),
+            "Root navigation must include the File noun: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn render_instance_emits_type_navigation_target() {
+        // Instance screens always offer a "back to type" affordance.
+        let state = synth_user_facts();
+        let r = render_current_cell(
+            &CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into(),
+            },
+            &state,
+        );
+        assert!(
+            r.navigation.iter().any(|t| matches!(
+                &t.target,
+                CurrentCell::Noun { noun } if noun == "File"
+            )),
+            "Instance navigation must include a Noun(File) target: {:?}",
+            r.navigation,
+        );
+    }
+
+    #[test]
+    fn render_includes_empty_navigation_for_unknown_cell() {
+        // A FactCell that doesn't exist in state has no facts to walk;
+        // the navigation catalogue is empty (the Slint side renders
+        // "no navigation targets — this cell is a leaf").
+        let state = Object::phi();
+        let r = render_current_cell(
+            &CurrentCell::FactCell {
+                cell_name: "Bogus_cell".into(),
+            },
+            &state,
+        );
+        assert!(
+            r.navigation.is_empty(),
+            "missing cell must yield empty navigation: {:?}",
+            r.navigation,
+        );
     }
 }
