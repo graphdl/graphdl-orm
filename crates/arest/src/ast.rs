@@ -1217,7 +1217,11 @@ pub fn defs_to_state(defs: &[(String, Func)], state: &Object) -> Object {
 /// `*` in the allow-list acts as a wildcard — emitted by compile for
 /// system defs (kernel helpers, cache invalidation) that legitimately
 /// touch any cell. User-authored readings never emit "*".
-#[cfg(not(feature = "no_std"))]
+// `declared_writes` is now reachable under no_std (#565) — its no_std
+// shims make `push_caps` a no-op so the kernel-side hook is harmless
+// (capabilities are unrestricted under the kernel because user-code is
+// not yet a threat surface there). The earlier cfg gate on this fn
+// was a holdover from when `pub mod declared_writes;` was std-only.
 fn defs_writes_scope(def_name: &str, d: &Object) -> Option<crate::declared_writes::CapGuard> {
     let key = alloc::format!("allowed_writes:{}", def_name);
     let cell = fetch(&key, d);
@@ -1229,11 +1233,6 @@ fn defs_writes_scope(def_name: &str, d: &Object) -> Option<crate::declared_write
     // Only Bottom / non-seq skips enforcement.
     Some(crate::declared_writes::push_caps(frame))
 }
-
-// TODO(session-2026-04-21 ring-3 lane): no_std stub removed — it
-// referenced `crate::declared_writes::CapGuard` which is gated out of
-// the kernel build. Sec-5 owner to decide whether a kernel-side
-// capability type is needed; for now the sole caller is cfg-gated.
 
 /// Rewrite a Func to a smaller equivalent form before reduction.
 ///
@@ -1864,10 +1863,11 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
             match x.as_seq() {
                 Some(items) if items.len() == 3 => {
                     match items[0].as_atom() {
-                        // TODO(session-2026-04-21 ring-3 lane): declared_writes
-                        // is gated out of no_std; restrict this arm to std
-                        // until Sec-5 picks a kernel-side policy.
-                        #[cfg(not(feature = "no_std"))]
+                        // declared_writes is now no_std-reachable (#565);
+                        // its no_std shim returns true unconditionally
+                        // (kernel runs only compile-authored code, no
+                        // user-code threat surface), so this arm is a
+                        // no-op there but enforces caps under std.
                         Some(name) if !crate::declared_writes::is_store_allowed(name) =>
                             Object::Bottom,
                         Some(name) => store(name, items[1].clone(), &items[2]),
@@ -2051,7 +2051,8 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                     // as a Seq of atom cell names, scope the body under
                     // those caps. Absent cell = unrestricted (legacy
                     // behavior, preserves the established baseline).
-                    #[cfg(not(feature = "no_std"))]
+                    // Now no_std-reachable (#565) — kernel build's
+                    // shimmed `push_caps` is a no-op so this is safe.
                     let _caps_guard = defs_writes_scope(name, d);
                     apply(&metacompose(&obj, d), x, d)
                 }
