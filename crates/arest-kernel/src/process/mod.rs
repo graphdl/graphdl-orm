@@ -60,6 +60,7 @@
 
 pub mod address_space;
 pub mod elf;
+pub mod fd_table;
 pub mod process;
 pub mod stack;
 pub mod trampoline;
@@ -70,8 +71,8 @@ pub mod trampoline;
 pub use address_space::{AddressSpace, LoadedSegment, LoaderError, SegmentPerm};
 pub use elf::{load_segments, LoadOrParseError};
 pub use process::{
-    current_process_install, current_process_mut, current_process_uninstall, FdEntry,
-    Process, ProcessState, SpawnError,
+    current_process_fd_table, current_process_install, current_process_mut,
+    current_process_uninstall, FdEntry, Process, ProcessState, SpawnError,
 };
 pub use stack::{AuxvEntry, AuxvType, InitialStack, StackBuilder, StackError};
 pub use trampoline::{IretqFrame, TrampolineError};

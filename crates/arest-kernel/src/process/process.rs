@@ -56,6 +56,7 @@ use arest::ast::{cell_push, fact_from_pairs, Object};
 
 use super::address_space::AddressSpace;
 use super::elf::ELF64_PHENT_SIZE;
+use super::fd_table::FdTable;
 use super::stack::{AuxvEntry, AuxvType, InitialStack, StackBuilder, StackError};
 use super::trampoline::{self, TrampolineError};
 
@@ -178,6 +179,16 @@ pub struct Process {
     /// can push past the current high-water mark; `Closed` slots
     /// are re-usable.
     pub fd_table: Vec<FdEntry>,
+    /// Open-file table for fds ≥ 3 (the open()-side surface
+    /// introduced by `openat` (#498) + `close` (#498)). The standard
+    /// streams (fd 0 / 1 / 2) live on `fd_table` above for backwards
+    /// compat with GGGGG's write handler; this richer table holds the
+    /// per-fd backing entry (File-cell-backed or synthetic-fs-backed)
+    /// for everything `openat` opens. The future `read` handler (#499)
+    /// will look up entries here to source bytes; the future fd-table
+    /// unification (post-#499) folds the legacy `Vec<FdEntry>` into
+    /// this type.
+    pub open_fds: FdTable,
     /// Construction / spawn / running / failed state. Drives the
     /// future scheduler's "is this process schedulable" check (#530).
     pub state: ProcessState,
@@ -216,6 +227,7 @@ impl Process {
             pid,
             address_space,
             fd_table,
+            open_fds: FdTable::new(),
             state: ProcessState::Created,
             initial_stack: None,
             exit_status: None,
@@ -497,6 +509,36 @@ pub fn current_process_install(proc: Process) {
 /// (#530) to reap exited processes.
 pub fn current_process_uninstall() -> Option<Process> {
     CURRENT_PROCESS.lock().take()
+}
+
+/// Run a closure against the currently-installed Process's open-fd
+/// table (the richer `FdTable` introduced by openat + close, #498).
+/// Sibling of `current_process_mut` — same closure shape, same lock
+/// discipline, scoped to the per-process fd table so the openat /
+/// close / read handlers don't have to ferry an `Option<&mut Process>`
+/// through their bodies just to reach the table.
+///
+/// The closure receives `Option<&mut FdTable>` — `Some` when a
+/// process is installed, `None` when not (kernel boot before any
+/// spawn, or the test suite's "uninstall fired between tests" state).
+/// The caller is responsible for handling `None` — typically by
+/// returning `-EBADF` or `-ENOSYS` to userspace per Linux's
+/// "syscall called before any process is live" convention.
+///
+/// Returns whatever the closure returns — typed `R` so the call
+/// site can extract values out of the locked region without a
+/// `mem::take`-style dance.
+///
+/// Holds the singleton's `spin::Mutex` for the duration of the
+/// closure. Don't park / await inside the closure — same constraint
+/// as `current_process_mut`. The lock is released when the closure
+/// returns; no async in the kernel today.
+pub fn current_process_fd_table<F, R>(f: F) -> R
+where
+    F: FnOnce(Option<&mut FdTable>) -> R,
+{
+    let mut guard = CURRENT_PROCESS.lock();
+    f(guard.as_mut().map(|p| &mut p.open_fds))
 }
 
 #[cfg(test)]

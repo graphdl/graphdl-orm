@@ -55,8 +55,10 @@
 
 #![allow(dead_code)]
 
+pub mod close;
 pub mod dispatch;
 pub mod exit;
+pub mod openat;
 pub mod write;
 
 // Re-export the dispatcher as the public surface — this is what the
@@ -65,3 +67,4 @@ pub mod write;
 // import path short so the entry-side asm shim doesn't have to
 // reach four modules deep.
 pub use dispatch::{dispatch, EBADF, EFAULT, EINVAL};
+pub use openat::{AT_FDCWD, EACCES, EMFILE, ENOENT, O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY};
