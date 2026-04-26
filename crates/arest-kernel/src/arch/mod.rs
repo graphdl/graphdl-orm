@@ -55,6 +55,30 @@ pub mod armv7;
 #[allow(unused_imports)]
 pub use armv7::*;
 
+// Host-target arm (#579 Track QQQQQ — extract `lib.rs` so `cargo test
+// --lib` runs the inline `#[cfg(test)]` modules). On any non-UEFI
+// target — `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`,
+// `aarch64-apple-darwin` — the kernel modules that reach
+// `crate::print!` / `crate::println!` (e.g. `crate::syscall::write::do_write`,
+// `crate::block::*`, `crate::virtio::*` — though most virtio / block
+// callers are themselves UEFI-gated) need a `_print` symbol to resolve
+// against. The stub swallows the format args; tests that observe stdout
+// inject their own sink (see `syscall::write::do_write`'s `&mut dyn
+// FnMut(&[u8])` parameter) so this stub is unreachable from the test
+// runner. Lives here rather than in a sibling `arch::host` submodule
+// because there's nothing else host-specific the kernel needs to publish
+// — `init_console` / `init_memory` / `halt_forever` etc. are only ever
+// called from the per-arch UEFI entry harnesses, never from
+// crate-neutral code.
+#[cfg(not(target_os = "uefi"))]
+pub fn _print(_args: core::fmt::Arguments<'_>) {
+    // No-op — host tests inject their own sinks where they care about
+    // stdout. The presence of this symbol is what matters: it makes
+    // `crate::print!` / `crate::println!` macro expansion type-check
+    // on the host target so non-test code that reaches the macros
+    // (e.g. `syscall::write`'s production sink) compiles cleanly.
+}
+
 /// Crate-wide `print!`. Routes to `$crate::arch::_print`, which is
 /// supplied by the active arch arm above.
 #[macro_export]

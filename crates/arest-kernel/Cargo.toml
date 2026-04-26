@@ -128,9 +128,29 @@ compositor-test = []
 musl-libc = []
 default = []
 
+[lib]
+# #579 Track QQQQQ — extracted lib facade so `cargo test --lib -p
+# arest-kernel` runs the inline `#[cfg(test)]` modules scattered
+# through `process/`, `syscall/`, `synthetic_fs/`, `composer.rs`,
+# `component_binding.rs`, etc. Pre-extract, the crate was bin-only
+# (`[[bin]] test = false`, no `[lib]` target) and the inline tests
+# silently never ran. The lib is the canonical module tree; the bin
+# (`[[bin]]` below) is a thin shim that `use arest_kernel as _;` to
+# drag the lib's `_start` symbol into the linked `.efi` image.
+#
+# `name = "arest_kernel"` — Rust crate names use underscores; matches
+# the Cargo convention (kebab-case package name → snake_case crate
+# name). Test runners reach the lib as `arest_kernel::*`.
+name = "arest_kernel"
+path = "src/lib.rs"
+
 [[bin]]
 name = "arest-kernel"
 path = "src/main.rs"
+# `test = false` — the bin is `#![no_main]` and ships only on UEFI
+# targets (firmware-loaded `.efi` image). It can't be tested as a
+# normal Rust test binary; the `[lib]` target above is what `cargo
+# test --lib` runs instead.
 test = false
 bench = false
 
