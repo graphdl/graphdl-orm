@@ -1047,6 +1047,24 @@ fn kernel_run_uefi(
     crate::system::init();
     println!("  engine:   system::init() completed (arest engine live on UEFI)");
 
+    // #560 (DynRdg-T1): walk the loaded-readings ring on the
+    // persistence disk and report how many records would replay.
+    // The actual reading-application pass is a no-op today because
+    // `arest::load_reading::load_reading` is gated behind
+    // `not(feature = "no_std")` and the kernel uses the no_std
+    // feature; once #564 surfaces a no_std-compatible apply hook,
+    // the same code path picks up every persisted record without
+    // any disk-format change. Errors here are best-effort: a
+    // missing virtio-blk device or a corrupt ring just yields a
+    // banner line — boot continues against the bake-time metamodel
+    // only.
+    match crate::load_reading_persist::replay_from_disk() {
+        Ok(n) => println!(
+            "  readings: {n} dynamically-loaded reading record(s) found in persistence ring"
+        ),
+        Err(e) => println!("  readings: persistence ring unavailable ({e})"),
+    }
+
     // Step 4d wave 5: wasmi runtime smoke. UEFI-only — the BIOS
     // bootloader can't load a kernel image the wasmi-linking binary
     // produces (triple-faults pre-_start, 5e8a15e). Loads a hand-
