@@ -420,6 +420,16 @@ fn kernel_run_uefi(
     crate::arch::install_userspace_gate();
     println!("  gate:     ring-3 userspace gate online (GDT/TSS/SYSCALL MSRs)");
 
+    // #569: register the x86_64 hardware entropy source (RDSEED with
+    // RDRAND fallback) into `arest::entropy`'s global slot. Must run
+    // BEFORE any csprng-touching code path — `random_bytes` would
+    // otherwise resolve against an uninstalled slot and panic. The
+    // CPUID probe inside the install is constant-time; no-op on
+    // vintage CPUs (the source then reports HardwareUnavailable until
+    // the EFI_RNG_PROTOCOL fallback in #571 chains in).
+    crate::arch::install_entropy();
+    println!("  entropy:  x86_64 hardware RNG (RDSEED + RDRAND) installed");
+
     // #379: bring the 1 kHz monotonic ms timer online. PIC remap +
     // PIT divisor + `sti`. Must run AFTER init_interrupts so the
     // IRQ 0 vector is populated before the first tick fires.

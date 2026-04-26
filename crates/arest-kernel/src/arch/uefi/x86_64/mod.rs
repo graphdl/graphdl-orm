@@ -25,6 +25,12 @@
 //   * `syscall_entry` — naked asm stub IA32_LSTAR points at; saves
 //                        user state, calls the dispatcher, returns
 //                        via IRETQ.
+//   * `entropy`       — RDSEED + RDRAND-backed `EntropySource` for
+//                        `arest::entropy`'s global slot (#569). Probes
+//                        CPUID at construction; `install_entropy()`
+//                        below registers it during boot so `csprng`
+//                        / AT_RANDOM / `getrandom` see real-random
+//                        bytes from the silicon RNG.
 //
 // Boot path
 // ---------
@@ -46,6 +52,7 @@
 // guard means the unit tests can drive it from multiple `#[test]`
 // fns without conflict.
 
+pub mod entropy;
 pub mod gdt;
 pub mod syscall_entry;
 pub mod syscall_msr;
@@ -71,4 +78,25 @@ pub fn install_userspace_gate() {
     // 3. Wire the SYSCALL MSRs so a `syscall` from ring 3 traps
     //    into our entry stub.
     syscall_msr::install(syscall_entry::syscall_entry as *const () as u64);
+}
+
+/// Register the x86_64 hardware entropy source (RDSEED with RDRAND
+/// fallback) into `arest::entropy`'s process-wide slot (#569). After
+/// this returns, `arest::csprng::random_bytes` — and every downstream
+/// consumer (AT_RANDOM stack canary in #575, `getrandom` syscall in
+/// #577, etc.) — sees real-random bytes from the silicon RNG instead
+/// of the deterministic placeholder the slot defaults to.
+///
+/// The CPUID probe runs once during construction, so calling this
+/// from boot has constant cost regardless of whether the host CPU
+/// has RDSEED. On vintage silicon with neither instruction, the
+/// installed source still resolves but every `fill()` reports
+/// `EntropyError::HardwareUnavailable` — leaving the door open for
+/// the UEFI EFI_RNG_PROTOCOL fallback (#571) to chain in.
+///
+/// Idempotent at the install-side level (re-installing replaces the
+/// previously-registered source per `arest::entropy::install`'s
+/// docstring), but the boot path calls this exactly once.
+pub fn install_entropy() {
+    arest::entropy::install(alloc::boxed::Box::new(entropy::X86_64HwEntropy::new()));
 }

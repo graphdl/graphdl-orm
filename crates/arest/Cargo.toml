@@ -166,8 +166,20 @@ wasmi = { version = "0.50", optional = true }
 # so the no_std / kernel build doesn't pull in serde through hashbrown.
 hashbrown = { version = "0.14" }
 spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex", "rwlock", "once"] }
-
+# getrandom (#574): host-OS entropy adapter (`cli/entropy_host.rs`).
+# Wraps Linux `getrandom(2)`, FreeBSD `getrandom(2)`, macOS
+# `arc4random_buf(3)`, and Windows `BCryptGenRandom` behind a single
+# `getrandom::getrandom(&mut buf)` call so the CLI doesn't grow a
+# `cfg(target_os)` switch. Tiny dep (~200 lines + thin syscall shims),
+# unconditional because every host CLI build needs it; wasm and bare-
+# metal targets that don't link the std bin won't pull it in via the
+# lib's no_std feature path. Pinned at 0.2 (same major as everything
+# else in the ecosystem currently depends on).
 [dev-dependencies]
+
+# getrandom: gated on non-UEFI; emits compile_error! on *-unknown-uefi
+[target."cfg(not(target_os = \"uefi\"))".dependencies]
+getrandom = "0.2"
 
 [profile.release]
 opt-level = 2
