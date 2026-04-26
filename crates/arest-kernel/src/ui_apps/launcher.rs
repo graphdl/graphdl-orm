@@ -85,6 +85,7 @@ use slint::ComponentHandle;
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
 
 use crate::arch::uefi::keyboard;
+use crate::arch::uefi::pointer;
 use crate::arch::uefi::slint_backend::{
     AppLauncher, FramebufferBackend, FramebufferPixelOrder, UefiSlintPlatform,
 };
@@ -338,6 +339,32 @@ pub fn run(
     // tick per frame; not currently a concern under the boot wiring).
     toolkit_loop::register_default_pumps();
 
+    // Track XXXXX #466: touch-mode auto-derivation. When the boot
+    // detected a virtio-tablet alongside the keyboard (per
+    // `linuxkpi::virtio::has_tablet`), push a `MonoView_has_default_
+    // Interaction_Mode 'touch'` fact for every kernel-side MonoView
+    // instance via `system::apply`. The readings checker then
+    // derives the cascade automatically:
+    //
+    //   `MonoView has default Interaction Mode 'touch'`  ⇒
+    //   `MonoView has default Density Scale 'spacious'`  ⇒
+    //   `MonoView has default A11y Profile 'reduced-motion'` ⇒
+    //   every Region in that MonoView gets Transition Style 'none'.
+    //
+    // (per `readings/ui/monoview.md` derivation rules at lines 196-205.)
+    //
+    // The Slint widgets then read the cascaded design tokens through
+    // the design-system `theme.slint` cells (LLLL #483 + EEEE #461)
+    // and re-layout with 44 px hit targets / spacious row pixels —
+    // matching the `Hit Target Size` and `row- Pixels` values defined
+    // for the touch / spacious values in the same reading.
+    //
+    // Idempotent at the SYSTEM-state level: applying the same touch
+    // facts twice leaves the cell contents byte-identical, so the
+    // `subscribe_changes` diff returns an empty changed-set on the
+    // re-apply path and downstream consumers see no spurious churn.
+    apply_touch_mode_if_tablet_present();
+
     // Track #510: the unified REPL is the default landing app per the
     // EPIC #496 vision ("the system as the current screen"). Show it
     // first so the user lands in the merged HATEOAS-browse + REPL-
@@ -357,6 +384,31 @@ pub fn run(
     // — UEFI has no orderly shutdown path beyond `firmware::reboot`
     // (which we don't reach), and `kernel_run_uefi` is `-> !`.
     loop {
+        // 0. linuxkpi housekeeping. Drains the workqueue ring (any
+        //    `queue_work` calls a Linux driver issued from IRQ /
+        //    callback context get to run on the foreground here) and
+        //    polls every registered virtio-input device so EV_KEY /
+        //    EV_REL / EV_ABS events flow from the device's vring
+        //    into AREST's `arch::uefi::keyboard` / `arch::uefi::
+        //    pointer` rings (see `linuxkpi::virtio::poll_all_vqs`
+        //    for the translation chain — it routes through AAAA's
+        //    `linuxkpi::input::input_event` thunk which writes to
+        //    both rings). Steps 1 + 1b below then consume what the
+        //    poll just produced. Both calls are cheap when idle
+        //    (workqueue empty → one ring-empty check; INPUTS empty
+        //    → one map-empty check), so the always-on placement
+        //    here matches `crate::net::poll()`'s shape at step 3.
+        //
+        //    Gated on `feature = "linuxkpi"` to match the `mod linuxkpi`
+        //    gate in `lib.rs`. Default kernel builds elide both calls;
+        //    the `--features linuxkpi` build (Dockerfile.uefi RUN line)
+        //    opts in.
+        #[cfg(feature = "linuxkpi")]
+        {
+            crate::linuxkpi::tick();
+            crate::linuxkpi::virtio::poll_all_vqs();
+        }
+
         // 1. Drain the keyboard ring. When an app is active, intercept
         //    Esc for back-to-launcher; otherwise forward all keys to
         //    the active Slint window via the existing
@@ -446,6 +498,66 @@ pub fn run(
             }
         }
         } // end of `else` from `drain_keyboard_into_focused_toolkit_pump`
+
+        // 1b. Drain the pointer ring (Track XXXXX #466). Ring entries
+        //     come from `linuxkpi::input::input_event` (which AAAA's
+        //     #460 already wired for EV_REL / EV_ABS / EV_KEY-in-the-
+        //     BTN-range), populated this tick by `poll_all_vqs` at
+        //     step 0. Translates each `pointer::PointerEvent` into a
+        //     `slint::WindowEvent::Pointer*` and dispatches at the
+        //     currently-active app's `slint::Window` — same shape the
+        //     keyboard arms above use, but with pointer payload.
+        //
+        //     Why dispatch at the active app's window rather than
+        //     Slint's "focused window" abstraction: the launcher
+        //     drives a single `MinimalSoftwareWindow` (the only
+        //     surface UEFI's GOP gives us — see the file-top comment
+        //     "Multi-window navigation in a single MinimalSoftwareWindow"),
+        //     and Slint's per-component focus is internal to whichever
+        //     `slint::Window` the navigation state currently has
+        //     `show()`n. Routing pointer events through the same
+        //     active-arm switch the keyboard drains use keeps
+        //     focus state aligned without us having to query Slint's
+        //     internal focus chain.
+        //
+        //     Esc-equivalent for pointer: none. Pointer events don't
+        //     have a back-to-launcher interpretation today (the
+        //     launcher splash exposes app-icon TouchAreas that drive
+        //     the existing `on_open_*` callbacks; pressing them
+        //     navigates forward). A future "long-press to escape"
+        //     gesture would belong in this drain helper.
+        //
+        //     Doom: pointer events are dropped when `Active::Doom` is
+        //     active. The Doom WASM guest renders its own surface
+        //     and has no Slint-side input plumbing — same shape the
+        //     existing keyboard drain takes for the Doom arm
+        //     (`DoomApp::drain_keystrokes_intercept_esc` is the only
+        //     consumer; pointer would need a parallel synthesis path
+        //     into the Doom guest's input exports, which is out of
+        //     #466's scope and lives behind the #468 hardware-touch
+        //     follow-up).
+        match active_now {
+            Active::Launcher => {
+                drain_pointer_into_slint_window(&launcher.window());
+            }
+            Active::UnifiedRepl => {
+                drain_pointer_into_slint_window(&unified_repl_app.window.window());
+            }
+            Active::Keyboard => {
+                drain_pointer_into_slint_window(&keyboard_app.window.window());
+            }
+            #[cfg(feature = "doom")]
+            Active::Doom => {
+                // Drain + drop. The Doom WASM guest renders its own
+                // surface; routing pointer events into it would
+                // require a Slint→Doom-input translation path that
+                // belongs in #468 (real touchscreen driver) not #466
+                // (touch-aware MonoView for the kernel-side Slint
+                // apps). Drain so leftover entries don't queue up
+                // for the next non-Doom arm.
+                pointer::drain(|_| {});
+            }
+        }
 
         // 2. Slint-side timer + animation tick. Slint reads
         //    `arch::time::now_ms()` via `Platform::duration_since_start`
@@ -632,4 +744,285 @@ fn drain_keyboard_with_esc_intercept(window: &slint::Window) -> bool {
         }
     }
     esc_seen
+}
+
+/// Track XXXXX #466: drain every pending `pointer::PointerEvent` and
+/// dispatch each as a `slint::WindowEvent::Pointer*` to `window`.
+///
+/// Maintains a per-call `(cursor_x, cursor_y)` accumulator so the
+/// `EV_REL` deltas + `EV_ABS` snapshots that AAAA's #460 input
+/// translation produced (one ring entry per axis — see
+/// `linuxkpi::input::input_event` for the per-event-type mapping)
+/// resolve to a single Slint logical position for each motion edge.
+/// Sync barriers (`PointerEvent::Sync`) are the cue to flush a
+/// `PointerMoved` event with the latest accumulated position; this
+/// matches the way Linux input drivers emit "one EV_SYN per logical
+/// frame of motion" and the way Slint's `WindowEvent::PointerMoved`
+/// expects one event per change.
+///
+/// Button events (`PointerEvent::Button`) translate to
+/// `WindowEvent::PointerPressed` / `PointerReleased` immediately —
+/// no accumulator gating, since the button-state-edge AAAA's
+/// translation produced is already the discrete event Slint expects.
+/// The `button` field carries the Linux input-event `BTN_*` code
+/// which we map to Slint's `PointerEventButton`:
+///
+///   * `BTN_LEFT (0x110)`   → `PointerEventButton::Left`
+///   * `BTN_RIGHT (0x111)`  → `PointerEventButton::Right`
+///   * `BTN_MIDDLE (0x112)` → `PointerEventButton::Middle`
+///   * `BTN_TOUCH (0x14a)`  → `PointerEventButton::Left`
+///                            (touchscreens emit BTN_TOUCH for finger-
+///                            down; mapping to Left is what Slint's
+///                            own touch handling already does in
+///                            i-slint-core/input.rs ~line 1664).
+///   * everything else      → `PointerEventButton::Other`
+///
+/// Scroll wheel (`PointerEvent::Scroll`) translates to
+/// `WindowEvent::PointerScrolled` with `delta_y` carrying the
+/// detent count and `delta_x` zero (REL_HWHEEL — horizontal scroll
+/// — isn't yet wired through AAAA's translation table).
+///
+/// Single-pass, non-blocking. Returns immediately when the ring is
+/// empty. Errors from `try_dispatch_event` are swallowed because
+/// the variants this helper emits are infallible against the
+/// current Slint surface — same rationale `slint_input.rs`
+/// documents for the keyboard drain.
+fn drain_pointer_into_slint_window(window: &slint::Window) {
+    use pointer::PointerEvent as P;
+    use slint::LogicalPosition;
+    use slint::platform::{PointerEventButton, WindowEvent};
+
+    // Cursor accumulator. Start at (0, 0) — the first AbsMove pins
+    // both axes; subsequent RelMove deltas are summed into the
+    // accumulator. This matches the cumulative semantics Slint's
+    // `WindowEvent::PointerMoved` expects (the position field is
+    // absolute, not delta).
+    //
+    // The accumulator is per-call rather than a static so a
+    // hypothetical future where the launcher restarts the loop
+    // (it doesn't today — `run` is `-> !`) would not carry stale
+    // state across reboots. The cost is one move-per-axis pair to
+    // re-build the accumulator from EV_ABS the next time the user
+    // touches the device, which is bounded by one frame of input.
+    let mut cx: i32 = 0;
+    let mut cy: i32 = 0;
+    let mut moved = false;
+
+    pointer::drain(|event| {
+        match event {
+            P::RelMove { dx, dy } => {
+                cx = cx.saturating_add(dx);
+                cy = cy.saturating_add(dy);
+                moved = true;
+            }
+            P::AbsMove { x, y } => {
+                // EV_ABS comes through as one ring entry per axis
+                // (X-only or Y-only — the other axis carries 0).
+                // The convention AAAA's `linuxkpi::input::input_event`
+                // adopted: `AbsMove { x: value, y: 0 }` for ABS_X,
+                // `AbsMove { x: 0, y: value }` for ABS_Y. Snap the
+                // accumulator to whichever axis carries a non-zero
+                // value; if both are zero (unlikely — would mean
+                // both EV_ABS axes resolved to 0) write through
+                // both. This handles the realistic device output
+                // without a per-axis state machine.
+                if x != 0 {
+                    cx = x;
+                }
+                if y != 0 {
+                    cy = y;
+                }
+                if x == 0 && y == 0 {
+                    cx = 0;
+                    cy = 0;
+                }
+                moved = true;
+            }
+            P::Sync => {
+                // Flush accumulated motion as one PointerMoved event.
+                // Most virtio-input devices emit EV_SYN once per
+                // logical frame; the Slint surface gets one motion
+                // edge per frame's worth of EV_REL/EV_ABS events.
+                if moved {
+                    let _ = window.try_dispatch_event(
+                        WindowEvent::PointerMoved {
+                            position: LogicalPosition::new(cx as f32, cy as f32),
+                        },
+                    );
+                    moved = false;
+                }
+            }
+            P::Button { button, pressed } => {
+                let slint_button = match button {
+                    0x110 => PointerEventButton::Left,   // BTN_LEFT
+                    0x111 => PointerEventButton::Right,  // BTN_RIGHT
+                    0x112 => PointerEventButton::Middle, // BTN_MIDDLE
+                    // BTN_TOUCH (0x14a) — touchscreens emit this on
+                    // finger-down. Slint's i-slint-core/input.rs
+                    // already maps multitouch's first-finger-down
+                    // to MouseEvent::Pressed { button: Left }; we
+                    // mirror that mapping here so a virtio-tablet
+                    // tap looks like a left-click to widgets that
+                    // only listen for Left.
+                    0x14a => PointerEventButton::Left,
+                    _ => PointerEventButton::Other,
+                };
+                // Position carries the most recent accumulated
+                // position. A button event without a prior motion
+                // event would carry (0, 0) which is a sane default
+                // for the launcher's splash buttons (their
+                // TouchAreas would not be hit, so the click is a
+                // silent no-op rather than an unexpected dispatch).
+                let position = LogicalPosition::new(cx as f32, cy as f32);
+                let event = if pressed {
+                    WindowEvent::PointerPressed { position, button: slint_button }
+                } else {
+                    WindowEvent::PointerReleased { position, button: slint_button }
+                };
+                let _ = window.try_dispatch_event(event);
+            }
+            P::Scroll { delta } => {
+                // REL_WHEEL is a vertical scroll detent. Slint's
+                // `PointerScrolled` carries logical-pixel deltas
+                // for both axes; we shape the detent value into
+                // the y-axis (a common HID convention is one detent
+                // per ~120 logical pixels of scroll, but Slint's
+                // widget consumers — e.g. ScrollView — interpret
+                // the delta as raw pixels of scroll, not detents).
+                // Emitting the raw detent count keeps the surface
+                // honest with what AAAA's translation produced;
+                // the consumer's pixel-rate tuning lives at the
+                // widget level.
+                let position = LogicalPosition::new(cx as f32, cy as f32);
+                let _ = window.try_dispatch_event(
+                    WindowEvent::PointerScrolled {
+                        position,
+                        delta_x: 0.0,
+                        delta_y: delta as f32,
+                    },
+                );
+            }
+        }
+    });
+
+    // If motion was accumulated but no Sync barrier arrived this
+    // frame, still flush a PointerMoved so the cursor doesn't lag
+    // a frame behind the device. This handles devices that emit
+    // EV_REL without an immediate EV_SYN (rare but observed under
+    // some virtio-tablet QEMU configurations on the boot smoke).
+    if moved {
+        let _ = window.try_dispatch_event(
+            WindowEvent::PointerMoved {
+                position: LogicalPosition::new(cx as f32, cy as f32),
+            },
+        );
+    }
+}
+
+/// Track XXXXX #466: at boot, when the linuxkpi virtio-input shim
+/// detected a tablet device, push the touch InteractionMode fact
+/// for every kernel-side MonoView so the readings checker derives
+/// the spacious DensityScale (and reduced-motion A11y profile) for
+/// the running surface.
+///
+/// Layered facts pushed (one per MonoView instance defined in
+/// `readings/ui/monoview.md` § Instance Facts):
+///
+///   `MonoView_has_default_Interaction_Mode { MonoView, InteractionMode }`
+///
+/// for `MonoView ∈ { 'hateoas', 'repl', 'file-browser', 'settings' }`
+/// with `InteractionMode = 'touch'`. The reading's derivation rule
+///
+///   + MonoView has default Density Scale 'spacious'
+///       if MonoView has default Interaction Mode 'touch'.
+///
+/// then cascades the spacious row-Pixels (44 px) and the
+/// minimum Hit Target Size (44 px) values through the design-token
+/// surface that Slint widgets read on layout. The Slint side does
+/// not have to branch on InteractionMode — it reads the cascaded
+/// DensityScale row-Pixels and Hit Target Size cells directly.
+///
+/// `system::apply` returns `Err` only when `system::init()` hasn't
+/// run yet (a programmer error — `entry_uefi.rs` calls `system::
+/// init` before `launcher::run`). On error we log + bail rather
+/// than panic so the boot log surfaces the regression without
+/// taking down the kernel.
+///
+/// Gated on `feature = "linuxkpi"` because `linuxkpi::virtio::
+/// has_tablet` is only available under that gate (the `mod linuxkpi`
+/// declaration in `lib.rs` is `cfg(all(target_os = "uefi",
+/// target_arch = "x86_64", feature = "linuxkpi"))`). On non-linuxkpi
+/// builds the function is a stub no-op — the kernel keeps the
+/// app-default `pointer` interaction mode every MonoView declares
+/// in its instance facts.
+///
+/// Idempotent at the SYSTEM-state level: the same touch fact pushed
+/// twice produces a byte-identical cell, so `subscribe_changes`
+/// reports an empty diff on the second call. Callers can re-invoke
+/// without worrying about duplicate facts (the duplicate would in
+/// principle be a `cell_push` problem — it's a `Seq` append — but
+/// the `system::apply` callers cluster at boot and only fire once
+/// per boot lifecycle today; re-evaluating on hot-plug is a future
+/// concern out of scope here).
+fn apply_touch_mode_if_tablet_present() {
+    #[cfg(all(target_os = "uefi", target_arch = "x86_64", feature = "linuxkpi"))]
+    {
+        if !crate::linuxkpi::virtio::has_tablet() {
+            crate::println!(
+                "  ui:       launcher: no virtio-tablet — keeping pointer interaction mode"
+            );
+            return;
+        }
+        crate::println!(
+            "  ui:       launcher: virtio-tablet present — switching MonoViews to touch interaction"
+        );
+        push_touch_mode_facts();
+    }
+    // Non-linuxkpi build path. The kernel never sees a virtio-input
+    // tablet on this build (the C-side discovery wiring is gated out),
+    // so default `pointer` interaction mode is preserved by leaving
+    // SYSTEM untouched.
+    #[cfg(not(all(target_os = "uefi", target_arch = "x86_64", feature = "linuxkpi")))]
+    {
+        // Inline-no-op so the launcher's bootstrap flow stays
+        // structurally identical across the two cfg arms.
+    }
+}
+
+/// Helper for `apply_touch_mode_if_tablet_present`. Pushed out of
+/// the parent because the cfg-gated body above would otherwise grow
+/// non-trivially and obscure the cfg-gating control flow. The body
+/// is unconditional (no cfg gates inside) — it gets called only
+/// from the cfg-on path of the parent.
+///
+/// Pushes one `MonoView_has_default_Interaction_Mode` fact per
+/// MonoView instance the readings define, then `system::apply`s
+/// the layered state in a single shot so the diff seen by
+/// subscribers is one transaction rather than four.
+#[cfg(all(target_os = "uefi", target_arch = "x86_64", feature = "linuxkpi"))]
+fn push_touch_mode_facts() {
+    use arest::ast::{cell_push, fact_from_pairs, Object};
+
+    let monoviews: &[&str] = &["hateoas", "repl", "file-browser", "settings"];
+    let new_state = crate::system::with_state(|state| {
+        let mut acc = state.clone();
+        for mv in monoviews {
+            acc = cell_push(
+                "MonoView_has_default_Interaction_Mode",
+                fact_from_pairs(&[
+                    ("MonoView", mv),
+                    ("InteractionMode", "touch"),
+                ]),
+                &acc,
+            );
+        }
+        acc
+    })
+    .unwrap_or_else(Object::phi);
+
+    if let Err(msg) = crate::system::apply(new_state) {
+        crate::println!(
+            "  ui:       launcher: touch-mode apply failed ({msg}) — keeping prior interaction mode"
+        );
+    }
 }

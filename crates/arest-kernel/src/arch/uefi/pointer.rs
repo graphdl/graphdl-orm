@@ -114,3 +114,57 @@ pub fn drain<F: FnMut(PointerEvent)>(mut f: F) {
         f(e);
     }
 }
+
+/// Push one event onto the ring. Naming-aligned alias of `push` —
+/// mirrors the `push_keystroke` API on `arch::uefi::keyboard` so
+/// every synthetic-input feeder (Slint touch handler, virtio-input
+/// driver, future on-screen pointer cell) reads as a symmetric
+/// pair `push_keystroke` / `push_pointer_event` without callers
+/// having to remember which ring uses which verb.
+///
+/// The `push_keystroke` companion (Track QQQQ #465) lives on
+/// `arch::uefi::keyboard`; the rationale comment there explains why
+/// the existing IRQ-driven push path co-exists with a parallel
+/// synthetic-input push (single Mutex, drop-oldest under back-
+/// pressure, safe to call from a Slint callback in the kernel
+/// super-loop). Same shape applies here — `push_pointer_event` is a
+/// thin re-export of `push` so #466 Track XXXXX's launcher-side
+/// pointer drain has a verb that visually matches the keystroke
+/// drain it sits alongside.
+pub fn push_pointer_event(event: PointerEvent) {
+    push(event);
+}
+
+// ── Tests ──────────────────────────────────────────────────────────
+//
+// Kernel `[[bin]]` runs with `test = false` (Cargo.toml L98), so
+// `cargo test` does not exercise these — they document the ring
+// invariants the launcher-side drainer relies on (`push_pointer_event`
+// is a no-data-loss alias of `push`; `drain` walks FIFO; `pending`
+// counts unconsumed entries).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `push_pointer_event` is wire-compatible with `push`: a value
+    /// pushed via the alias comes back through `read_event` byte-for-
+    /// byte. The launcher-side `drain_pointer_into_focused_window`
+    /// helper (Track XXXXX #466) relies on this — a Slint touch
+    /// handler that synthesises a `PointerEvent::Button` via the
+    /// alias must be observable to the next super-loop tick's drain.
+    #[test]
+    fn push_pointer_event_round_trips_through_read() {
+        // Drain any leftover entries from prior tests — RING is a
+        // module-level static and previous runs may have left
+        // entries unconsumed.
+        while read_event().is_some() {}
+
+        push_pointer_event(PointerEvent::AbsMove { x: 42, y: 17 });
+        match read_event() {
+            Some(PointerEvent::AbsMove { x: 42, y: 17 }) => {}
+            other => panic!("expected AbsMove(42, 17), got {:?}", other),
+        }
+        assert!(read_event().is_none());
+    }
+}
