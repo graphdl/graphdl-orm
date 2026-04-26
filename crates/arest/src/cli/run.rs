@@ -1,37 +1,69 @@
-// `arest run "App Name"` — CLI subcommand dispatcher (#543).
+// `arest run "App Name"` — CLI subcommand dispatcher (#543, #504).
 //
 // Reads the bundled metamodel readings (`crate::metamodel_readings()`),
 // folds them into a `crate::ast::Object` state, and resolves the
 // user-supplied app name via `crate::command::wine_app_by_name`.
 //
-// On hit: prints the resolved `(slug, prefix Directory id)` pair to
-// stdout, returns exit code 0.
+// On hit: prints the resolved `(slug, prefix Directory id)` pair,
+// then invokes `crate::cli::wine_bootstrap::bootstrap_prefix` to
+// apply winetricks recipes / DLL overrides / registry keys. Returns
+// exit code 0 if every fact-driven mutation succeeded; 3 if at least
+// one winetricks recipe failed.
 // On miss: prints a "did you mean…?" suggestion based on Levenshtein
 // distance over the slug + display-title set, returns exit code 1.
 // On missing argument: prints usage, returns exit code 2.
 //
-// Read-only against state — no Wine prefix bootstrap, no winetricks
-// invocation, no actual `wine` execve. Those land in #504 (Wine
-// runtime layer); this module only resolves the name → (slug, prefix)
-// mapping the runtime layer needs.
+// The bootstrap step writes into `<root>/<prefix-dir-id>/` where
+// `<root>` is the AREST data root (defaults to a per-process scratch
+// dir under `std::env::temp_dir()` — production wiring to
+// `/var/wine/` lands when the runtime layer (#506) launches the app).
+// The current dispatcher prints the prefix path it bootstrapped so
+// downstream callers can locate the artefacts.
 //
 // The actual `wine_app_by_name` lookup lives in `command.rs` (#503,
 // `637c333`). This module supplies the CLI layer: argv parsing, state
-// loading, output formatting, and the near-name suggestion fallback.
+// loading, output formatting, the near-name suggestion fallback, and
+// the bootstrap dispatch. Actual installer-binary execution and the
+// per-app launch wrapper land in #505 / #506.
 
 use crate::ast;
+use crate::cli::wine_bootstrap;
 use crate::command;
 
 /// Top-level entry point used by `main.rs`. Takes the residual argv
 /// (everything after `run`), the readings sources to fold into state,
-/// and a writer for both stdout and stderr.
+/// and a writer for both stdout and stderr. Reads the prefix root
+/// from the `AREST_WINE_PREFIX_ROOT` env var (default:
+/// `<temp>/arest/wine-prefixes/`).
 ///
 /// Returns the process exit code. Writers receive the formatted output
 /// so unit tests can assert on the printed text without spawning a
 /// child process.
+///
+/// Exit codes:
+///   * 0 — resolved + bootstrap succeeded (or no facts to apply).
+///   * 1 — name not found in the readings.
+///   * 2 — usage error (no app name supplied).
+///   * 3 — bootstrap surfaced one or more recipe failures.
 pub fn dispatch<O: std::io::Write, E: std::io::Write>(
     args: &[String],
     readings: &[(&str, &str)],
+    out: &mut O,
+    err: &mut E,
+) -> i32 {
+    let prefix_root = wine_prefix_root_from_env();
+    dispatch_with_prefix_root(args, readings, &prefix_root, out, err)
+}
+
+/// Variant of `dispatch` that takes an explicit `prefix_root` instead
+/// of reading the `AREST_WINE_PREFIX_ROOT` env var. Used by unit
+/// tests so they can isolate per-test scratch directories without
+/// stomping on the process-global env (which is racy across threads).
+/// The production main.rs path goes through `dispatch`.
+pub fn dispatch_with_prefix_root<O: std::io::Write, E: std::io::Write>(
+    args: &[String],
+    readings: &[(&str, &str)],
+    prefix_root: &std::path::Path,
     out: &mut O,
     err: &mut E,
 ) -> i32 {
@@ -61,9 +93,29 @@ pub fn dispatch<O: std::io::Write, E: std::io::Write>(
         .or_else(|| resolve_by_clean_title_cell(&state, name));
 
     match resolved {
-        Some((slug, prefix_dir)) => {
-            let _ = writeln!(out, "{}", format_resolution(&slug, &prefix_dir));
-            0
+        Some((slug, prefix_dir_id)) => {
+            let _ = writeln!(out, "{}", format_resolution(&slug, &prefix_dir_id));
+
+            // #504: walk the FORML compat facts and apply them to the
+            // physical prefix on disk. The prefix dir lives under
+            // `<prefix_root>/<prefix_dir_id>/` — the kernel-side
+            // mount under `/var/wine/` arrives with #506 (launch +
+            // monitor). Print the absolute path so downstream tooling
+            // (and the user) can locate it.
+            let prefix_path = prefix_root.join(&prefix_dir_id);
+            let raw_wine_md = compat_wine_md_text(readings);
+            let bootstrap = match wine_bootstrap::bootstrap_prefix(
+                &state, raw_wine_md, &slug, &prefix_path, None,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = writeln!(err, "Bootstrap failed: {}", e);
+                    return 3;
+                }
+            };
+            let _ = writeln!(out, "  prefix path: {}", prefix_path.display());
+            let _ = write!(out, "{}", wine_bootstrap::format_report(&bootstrap, &slug));
+            if !bootstrap.all_succeeded() { 3 } else { 0 }
         }
         None => {
             let suggestions = near_name_suggestions(&state, name, 3);
@@ -71,6 +123,29 @@ pub fn dispatch<O: std::io::Write, E: std::io::Write>(
             1
         }
     }
+}
+
+/// Per-host root under which Wine prefixes are materialised. Defaults
+/// to `<temp>/arest/wine-prefixes/` so unit tests + a fresh user
+/// install never accidentally touch `/var/wine`. The kernel layer
+/// (#506) overrides this via the `AREST_WINE_PREFIX_ROOT` env var.
+pub fn wine_prefix_root_from_env() -> std::path::PathBuf {
+    if let Some(root) = std::env::var_os("AREST_WINE_PREFIX_ROOT") {
+        return std::path::PathBuf::from(root);
+    }
+    std::env::temp_dir().join("arest").join("wine-prefixes")
+}
+
+/// Locate the raw `wine.md` text inside the loaded readings, falling
+/// back to `""` if the slice isn't present. The bootstrap module needs
+/// the raw text to recover the third role of the ternary `requires
+/// DLL Override / requires Registry Key` facts (the parser drops the
+/// `with X 'Y'` tail; see comments in `cli::wine_overrides`).
+pub fn compat_wine_md_text<'a>(readings: &'a [(&str, &str)]) -> &'a str {
+    readings.iter()
+        .find(|(name, _)| *name == "wine")
+        .map(|(_, text)| *text)
+        .unwrap_or("")
 }
 
 /// Fallback resolver for the canonical `Wine_App_has_display-_Title`
@@ -373,7 +448,11 @@ mod tests {
 
     /// End-to-end test against the real bundled wine.md corpus.
     /// Gated on `compat-readings` because the slice is conditionally
-    /// included via `crate::COMPAT_READINGS`.
+    /// included via `crate::COMPAT_READINGS`. Uses
+    /// `dispatch_with_prefix_root` so each test owns a distinct
+    /// scratch directory without manipulating the process-global
+    /// `AREST_WINE_PREFIX_ROOT` env var (which would race across
+    /// libtest's parallel test threads).
     #[cfg(feature = "compat-readings")]
     #[test]
     fn dispatch_resolves_known_display_title() {
@@ -381,13 +460,19 @@ mod tests {
             .into_iter()
             .map(|(n, t)| (*n, *t))
             .collect();
+        let root = test_prefix_root("dispatch-display-title");
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
-        let code = dispatch(&["Notepad++".to_string()], &readings, &mut out, &mut err);
+        let code = dispatch_with_prefix_root(
+            &["Notepad++".to_string()], &readings, &root, &mut out, &mut err,
+        );
         assert_eq!(code, 0, "stderr was: {}", String::from_utf8_lossy(&err));
         let out_text = String::from_utf8(out).unwrap();
         assert!(out_text.contains("slug=notepad-plus-plus"), "got: {}", out_text);
         assert!(out_text.contains("prefix=notepad-plus-plus-prefix"), "got: {}", out_text);
+        // Bootstrap progress block is also printed.
+        assert!(out_text.contains("Bootstrapping Wine prefix"), "got: {}", out_text);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(feature = "compat-readings")]
@@ -397,12 +482,132 @@ mod tests {
             .into_iter()
             .map(|(n, t)| (*n, *t))
             .collect();
+        let root = test_prefix_root("dispatch-slug");
         let mut out: Vec<u8> = Vec::new();
         let mut err: Vec<u8> = Vec::new();
-        let code = dispatch(&["notepad-plus-plus".to_string()], &readings, &mut out, &mut err);
+        let code = dispatch_with_prefix_root(
+            &["notepad-plus-plus".to_string()], &readings, &root, &mut out, &mut err,
+        );
         assert_eq!(code, 0);
         let out_text = String::from_utf8(out).unwrap();
         assert!(out_text.contains("slug=notepad-plus-plus"));
+        assert!(out_text.contains("Bootstrapping Wine prefix"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Bootstrap a non-trivial app (Steam Windows: Required Components +
+    /// DLL Overrides) and verify the resulting `system.reg` contains
+    /// the expected entries. Confirms the run-dispatch → bootstrap →
+    /// wine_overrides chain end-to-end.
+    #[cfg(feature = "compat-readings")]
+    #[test]
+    fn dispatch_bootstraps_steam_windows_prefix() {
+        let readings: Vec<(&str, &str)> = crate::metamodel_readings()
+            .into_iter()
+            .map(|(n, t)| (*n, *t))
+            .collect();
+        let root = test_prefix_root("dispatch-steam-bootstrap");
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = dispatch_with_prefix_root(
+            &["steam-windows".to_string()], &readings, &root, &mut out, &mut err,
+        );
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(out_text.contains("DLL overrides: 3 written"), "got: {}", out_text);
+        let reg_path = root.join("steam-windows-prefix").join("system.reg");
+        let body = std::fs::read_to_string(&reg_path)
+            .unwrap_or_else(|e| panic!("system.reg at {:?} must exist: {}", reg_path, e));
+        assert!(body.contains("\"dwrite\"=\"\""), "got: {}", body);
+        assert!(body.contains("\"msxml3\"=\"native\""), "got: {}", body);
+        assert!(body.contains("\"msxml6\"=\"native\""), "got: {}", body);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Spotify writes an HKCU registry key. Confirms registry keys
+    /// at HKCU land in `user.reg`, not `system.reg`.
+    #[cfg(feature = "compat-readings")]
+    #[test]
+    fn dispatch_bootstraps_spotify_registry_key() {
+        let readings: Vec<(&str, &str)> = crate::metamodel_readings()
+            .into_iter()
+            .map(|(n, t)| (*n, *t))
+            .collect();
+        let root = test_prefix_root("dispatch-spotify-registry");
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let code = dispatch_with_prefix_root(
+            &["spotify".to_string()], &readings, &root, &mut out, &mut err,
+        );
+        assert_eq!(code, 0, "stderr: {}", String::from_utf8_lossy(&err));
+        let user_reg = std::fs::read_to_string(
+            root.join("spotify-prefix").join("user.reg")
+        ).expect("user.reg must exist");
+        assert!(user_reg.contains("[HKCU\\\\Software\\\\Spotify\\\\CrashReporter]"),
+                "got user.reg: {}", user_reg);
+        assert!(user_reg.contains("@=\"disabled\""));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Re-running `arest run` against the same app must produce a
+    /// byte-identical prefix state — the idempotency invariant the
+    /// bootstrap module promises.
+    #[cfg(feature = "compat-readings")]
+    #[test]
+    fn dispatch_idempotent_bootstrap() {
+        let readings: Vec<(&str, &str)> = crate::metamodel_readings()
+            .into_iter()
+            .map(|(n, t)| (*n, *t))
+            .collect();
+        let root = test_prefix_root("dispatch-idempotent");
+        let mut out1: Vec<u8> = Vec::new();
+        let mut err1: Vec<u8> = Vec::new();
+        let _ = dispatch_with_prefix_root(
+            &["office-2016-word".to_string()], &readings, &root, &mut out1, &mut err1,
+        );
+        let body1 = std::fs::read_to_string(
+            root.join("office-2016-word-prefix").join("system.reg")
+        ).unwrap();
+        let mut out2: Vec<u8> = Vec::new();
+        let mut err2: Vec<u8> = Vec::new();
+        let _ = dispatch_with_prefix_root(
+            &["office-2016-word".to_string()], &readings, &root, &mut out2, &mut err2,
+        );
+        let body2 = std::fs::read_to_string(
+            root.join("office-2016-word-prefix").join("system.reg")
+        ).unwrap();
+        assert_eq!(body1, body2, "second run must produce byte-identical system.reg");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `compat_wine_md_text` returns the wine.md slice when present,
+    /// empty string otherwise. Smoke tests for the helper.
+    #[test]
+    fn compat_wine_md_text_returns_slice_when_present() {
+        let readings: &[(&str, &str)] = &[
+            ("core", "core body"),
+            ("wine", "wine body"),
+            ("ui",   "ui body"),
+        ];
+        assert_eq!(compat_wine_md_text(readings), "wine body");
+    }
+
+    #[test]
+    fn compat_wine_md_text_returns_empty_when_absent() {
+        let readings: &[(&str, &str)] = &[("core", "core body")];
+        assert_eq!(compat_wine_md_text(readings), "");
+    }
+
+    /// Carve out a fresh per-test scratch directory under the system
+    /// tempdir. The label keeps directories distinct so the parallel
+    /// test runner doesn't have two tests fighting over the same
+    /// path. Each test should remove the dir on exit.
+    fn test_prefix_root(label: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let path = std::env::temp_dir().join(format!("arest-run-test-{}-{}", pid, label));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("temp prefix root create");
+        path
     }
 
     #[cfg(feature = "compat-readings")]
