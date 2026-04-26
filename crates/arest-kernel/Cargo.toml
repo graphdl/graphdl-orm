@@ -104,6 +104,28 @@ gtk-adapter = []
 # GTK (#488) adapters can call into it once their loader.rs stops
 # returning LibraryNotFound.
 compositor-test = []
+# musl-libc (#524 Track DDDDD, foundation for the user-space ELF epic
+# kicked off by WWWW's #523 vendoring of musl 1.2.5 under
+# `vendor/musl/`). Enables the `cc::Build` pass in build.rs that walks
+# the vendored musl source tree and produces a static `libc.a` archive
+# under `$OUT_DIR/`. The archive is NOT linked into the kernel `.efi`
+# binary at this commit — that's #525 onward (busybox / ash / hello-
+# world build tracks). For now the feature is a build-only artifact,
+# consumed by future static-binary builds that want to link against
+# AREST's syscall surface (which matches Linux's x86_64 numbering;
+# see musl_config/syscall.h for the override hook).
+#
+# Off by default for the same reasons `linuxkpi` is: pulls in a host
+# C cross-compiler (clang or gcc with `-target x86_64-pc-windows-msvc`
+# on Windows, plain `cc` on Linux/macOS), which a typical fresh-clone
+# Windows host doesn't have. When the cross-compiler is missing, the
+# build script emits `cargo:warning=` and continues — same graceful-
+# degrade pattern as #460 / linuxkpi.
+#
+# License inheritance: musl is MIT (see vendor/musl/COPYRIGHT), which
+# is FSF-compatible with AREST's AGPL-3.0-or-later umbrella per the
+# license-list matrix.
+musl-libc = []
 default = []
 
 [[bin]]
