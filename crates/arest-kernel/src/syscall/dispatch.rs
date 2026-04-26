@@ -54,6 +54,7 @@
 
 use crate::syscall::close;
 use crate::syscall::exit;
+use crate::syscall::futex;
 use crate::syscall::openat;
 use crate::syscall::write;
 
@@ -126,6 +127,19 @@ pub const SYS_EXIT_GROUP: u64 = 231;
 /// graph (#398) and allocates a per-process fd.
 pub const SYS_OPENAT: u64 = 257;
 
+/// Linux x86_64 syscall number for `futex(uaddr, futex_op, val,
+/// timeout, uaddr2, val3)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_futex` (= 202).
+/// The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_futex`. The
+/// foundational primitive for any glibc/musl-built threaded binary's
+/// pthread_mutex / pthread_cond implementation — userspace does the
+/// fast-path CAS, falls into the kernel only on contention. Routes
+/// to `futex::handle`, which dispatches on the operation discriminant
+/// (FUTEX_WAIT for the cornerstone block path, FUTEX_WAKE stubbed
+/// pending #545, all others -ENOSYS). Per #544 (Track YYYYY).
+pub const SYS_FUTEX: u64 = 202;
+
 /// The dispatch entry point. Match on `rax` and forward the argument
 /// registers (rdi / rsi / rdx / r10 / r8 / r9) to the per-syscall
 /// handler. Handlers that take fewer than six args simply ignore the
@@ -150,13 +164,21 @@ pub fn dispatch(
     rsi: u64,
     rdx: u64,
     r10: u64,
-    _r8: u64,
-    _r9: u64,
+    r8: u64,
+    r9: u64,
 ) -> i64 {
     match rax {
         SYS_WRITE => write::handle(rdi, rsi, rdx),
         SYS_CLOSE => close::handle(rdi as i32),
         SYS_OPENAT => openat::handle(rdi as i32, rsi, rdx as u32, r10 as u32),
+        SYS_FUTEX => {
+            // futex(uaddr, futex_op, val, timeout, uaddr2, val3) per
+            // `vendor/musl/arch/x86_64/syscall_arch.h:__syscall6`.
+            // Tier-1 only handles FUTEX_WAIT (block on value match) +
+            // a FUTEX_WAKE stub; #544 (Track YYYYY) ships this slice,
+            // #545 ships the real WAKE, #546+ ship REQUEUE / PI futex.
+            futex::handle(rdi, rsi as u32, rdx as u32, r10, r8, r9 as u32)
+        }
         SYS_EXIT | SYS_EXIT_GROUP => {
             // exit / exit_group both transition the Process state
             // machine to `Exited` and must never return. The handler's
@@ -232,6 +254,26 @@ mod tests {
     #[test]
     fn sys_close_number_matches_linux_uapi() {
         assert_eq!(SYS_CLOSE, 3);
+    }
+
+    /// `SYS_FUTEX` is 202 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_futex`.
+    #[test]
+    fn sys_futex_number_matches_linux_uapi() {
+        assert_eq!(SYS_FUTEX, 202);
+    }
+
+    /// `futex(NULL, FUTEX_WAIT, 0, ...)` returns -EFAULT — null
+    /// uaddr is not a valid futex address. Verifies the dispatcher
+    /// routes SYS_FUTEX (202) to the futex handler and the handler's
+    /// null-pointer guard fires.
+    #[test]
+    fn dispatch_futex_null_uaddr_returns_efault() {
+        // SYS_FUTEX = 202, uaddr = 0, op = FUTEX_WAIT (0), val = 0,
+        // timeout = 0, uaddr2 = 0, val3 = 0. Handler should reject
+        // before deref.
+        let result = dispatch(SYS_FUTEX, 0, 0, 0, 0, 0, 0);
+        assert_eq!(result, -14); // -EFAULT
     }
 
     /// Unknown syscall numbers return `-ENOSYS`. musl + glibc both

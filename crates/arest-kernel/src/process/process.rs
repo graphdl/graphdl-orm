@@ -102,6 +102,23 @@ pub enum ProcessState {
     /// stashed in `Process::exit_status` for the future
     /// `waitpid`-like surface (#531) to consume.
     Exited,
+    /// Userspace called `futex(uaddr, FUTEX_WAIT, val, ...)` and the
+    /// memory-compare check passed (`*uaddr == val`), so the kernel
+    /// parked the process on the per-uaddr wait queue
+    /// (`process::futex_table::FUTEX_TABLE`). The carried `u64` is the
+    /// userspace virtual address of the futex word — `FUTEX_WAKE`
+    /// (#545) uses it to identify which queue to drain when a peer
+    /// process posts a wake.
+    ///
+    /// Set by `crate::syscall::futex::handle` (#544) via the
+    /// `current_process_mut` accessor below. The Process stays in
+    /// this state until a peer's FUTEX_WAKE drains the queue and the
+    /// scheduler (#530) transitions it back to `Running` — for tier-1
+    /// (no scheduler yet) the state is observable but the kernel still
+    /// returns to the trampoline doorstep, which keeps the surface
+    /// honest about "the process asked to block" without requiring the
+    /// full park-then-resume mechanism.
+    BlockedFutex(u64),
 }
 
 /// File-descriptor table entry. Tier-1 shape — just a tag plus an
@@ -365,11 +382,17 @@ impl Process {
             fact_from_pairs(&[("Process", process_id), ("Pid", &pid_atom)]),
             state,
         );
+        // BlockedFutex is rendered as "BlockedFutex" without the
+        // uaddr — the cell shape stays a single string for forward-
+        // compat with the existing Process_has_State consumers (the
+        // uaddr is recorded separately in the future #545's
+        // Futex_has_Waiter cell once that handler lands).
         let state_atom = match self.state {
             ProcessState::Created => "Created",
             ProcessState::Running => "Running",
             ProcessState::SpawnFailed => "SpawnFailed",
             ProcessState::Exited => "Exited",
+            ProcessState::BlockedFutex(_) => "BlockedFutex",
         };
         s = cell_push(
             "Process_has_State",
