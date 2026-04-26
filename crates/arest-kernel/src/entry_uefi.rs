@@ -1341,23 +1341,24 @@ fn kernel_run_uefi(
     // pattern-match the same family of phrases on either path.
     println!("  repl:     line-buffered keyboard REPL online (#183/#365)");
     #[cfg(feature = "doom")]
-    println!("  ui:       launcher running (HATEOAS + REPL + Doom)");
+    println!("  ui:       launcher running (Unified REPL + Doom)");
     #[cfg(not(feature = "doom"))]
-    println!("  ui:       launcher running (HATEOAS + REPL)");
+    println!("  ui:       launcher running (Unified REPL)");
     println!();
 
     // Track GGG #365 used to print "next: kernel_run handoff
     // (step 4d)" here and then enter a `loop { read_keystroke();
     // repl::process_key(ch); net::poll(); pause }` drainer that
-    // never returned. Track UUU #431 replaces that with the Slint
-    // boot launcher: the AppLauncher splash routes to the previously
-    // built HateoasBrowser (#429 / SSS) and Repl (#430 / TTT) Slint
-    // apps. Keystrokes now route through
+    // never returned. Track UUU #431 replaced that with the Slint
+    // boot launcher; #510 / EPIC #496 then merged the previously-
+    // separate HateoasBrowser (#429 / SSS) + Repl (#430 / TTT) Slint
+    // apps into a single Unified REPL panel that is now the default
+    // landing app. Keystrokes route through
     // `arch::uefi::slint_input::drain_keyboard_into_slint_window`
     // (Track QQ #428) — the BIOS-style `repl::process_key` direct
     // path is no longer called from this entry point. The text
-    // REPL surface is now reachable as the Slint REPL app inside
-    // the launcher.
+    // REPL surface is reachable as the right pane of the Unified
+    // REPL app.
     //
     // `repl::init()` is still called above (via the banner line) —
     // it sets up the static line buffer that `repl::dispatch` and

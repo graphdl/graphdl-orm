@@ -14,10 +14,11 @@
 // This module is the lowest-risk adapter slice: Slint is already
 // kernel-resident (no linuxkpi shim involved), so we just walk the
 // MMM #436 component surface (`ui/components/{Button,Input,Card,
-// List,Dialog}.slint`) plus the five launcher app symbols
-// (`ui/apps/{AppLauncher,HateoasBrowser,Repl,Doom,Keyboard}.slint`
-// from SSS/TTT/UUU/VVV/QQQQ) and emit the FORML 2 facts that mirror
-// the readings.
+// List,Dialog}.slint`) plus the four launcher app symbols
+// (`ui/apps/{AppLauncher,UnifiedRepl,Doom,Keyboard}.slint`
+// from UUU/#510/VVV/QQQQ) and emit the FORML 2 facts that mirror
+// the readings. Track #510 / EPIC #496 merged the prior
+// HateoasBrowser + Repl entries into a single UnifiedRepl symbol.
 //
 // # Spec coverage
 //
@@ -356,7 +357,7 @@ struct LauncherAppSpec {
     description: &'static str,
 }
 
-/// Hard-coded launcher app specs. The five .slint files under
+/// Hard-coded launcher app specs. The four .slint files under
 /// `ui/apps/` define these. Each one is a Window-derived
 /// component instantiated by the matching `crate::ui_apps::<name>::
 /// build_app()` (or `crate::ui_apps::launcher::run` for
@@ -364,25 +365,21 @@ struct LauncherAppSpec {
 fn launcher_apps() -> Vec<LauncherAppSpec> {
     vec![
         // From `ui/apps/AppLauncher.slint` — splash + app launcher.
-        // SSS/TTT/UUU's #431 anchor.
+        // UUU's #431 anchor.
         LauncherAppSpec {
             name: "app-launcher",
             slint_symbol: "AppLauncher",
             description: "Boot UI splash with app picker (#431, Track UUU).",
         },
-        // From `ui/apps/HateoasBrowser.slint` — three-pane
-        // resource browser (Track SSS #429).
+        // From `ui/apps/UnifiedRepl.slint` (#510, EPIC #496) — the
+        // structural merge of the prior HateoasBrowser (Track SSS
+        // #429) + Repl (Track TTT #430) apps. Two-pane: HATEOAS
+        // resource browse on the left, REPL prompt + scrollback on
+        // the right. Default landing app under the launcher.
         LauncherAppSpec {
-            name: "hateoas-browser",
-            slint_symbol: "HateoasBrowser",
-            description: "Three-pane resource browser over the live SYSTEM state (#429, Track SSS).",
-        },
-        // From `ui/apps/Repl.slint` — REPL toolkit (Track TTT
-        // #430). Scrollback + history line editor.
-        LauncherAppSpec {
-            name: "repl",
-            slint_symbol: "Repl",
-            description: "REPL with scrollback + history (#430, Track TTT).",
+            name: "unified-repl",
+            slint_symbol: "UnifiedRepl",
+            description: "Unified panel: HATEOAS browse (left) + REPL prompt + scrollback (right) (#510, EPIC #496).",
         },
         // From `ui/apps/Doom.slint` — Doom WASM guest surface
         // (Track VVV #455 + #456). Only loadable when
@@ -760,15 +757,17 @@ mod tests {
         assert_eq!(cell_count(&state, "ComponentRole_requires_Notice"), 3);
     }
 
-    /// Five launcher apps emit the LaunchableApp facts.
+    /// Four launcher apps emit the LaunchableApp facts.
     /// Track QQQQ #465 added the Keyboard surface to the four
     /// originally registered (AppLauncher, HateoasBrowser, Repl,
-    /// Doom).
+    /// Doom). Track #510 / EPIC #496 then merged HateoasBrowser +
+    /// Repl into UnifiedRepl, dropping the count back to 4
+    /// (AppLauncher, UnifiedRepl, Doom, Keyboard).
     #[test]
-    fn five_launcher_apps_register_symbols() {
+    fn four_launcher_apps_register_symbols() {
         let state = build_slint_component_state(&Object::phi());
-        assert_eq!(cell_count(&state, "LaunchableApp_has_Symbol"), 5);
-        assert_eq!(cell_count(&state, "LaunchableApp_has_Description"), 5);
+        assert_eq!(cell_count(&state, "LaunchableApp_has_Symbol"), 4);
+        assert_eq!(cell_count(&state, "LaunchableApp_has_Description"), 4);
     }
 
     /// Sanity: the Button binding ID matches DDDD's reading

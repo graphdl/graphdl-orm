@@ -90,26 +90,29 @@ use crate::arch::uefi::slint_backend::{
 };
 use crate::arch::uefi::slint_input::drain_keyboard_into_slint_window;
 use crate::toolkit_loop;
-use crate::ui_apps::{hateoas, keyboard as kbd_app, repl};
+use crate::ui_apps::{keyboard as kbd_app, unified_repl};
 #[cfg(feature = "doom")]
 use crate::ui_apps::doom;
 
 /// Which Slint surface is currently visible. Driven by the
-/// open-hateoas / open-repl / open-doom / open-keyboard callbacks
-/// (forward) and the Esc intercept in
-/// `drain_keyboard_with_esc_intercept` (back). The `Doom` variant is
-/// unconditional in the enum so the navigation state machine doesn't
-/// fork on `cfg`; the actual transition into `Active::Doom` is gated
-/// behind `cfg(feature = "doom")` at the callback registration site
-/// below — when the feature is off the state can never reach Doom
-/// because `open-doom` is never wired. The `Keyboard` variant
-/// (Track QQQQ #465) is always available; the on-screen QWERTY is
-/// the foundation for the touch-only "phone shape" milestone.
+/// open-unified-repl / open-doom / open-keyboard callbacks (forward)
+/// and the Esc intercept in `drain_keyboard_with_esc_intercept`
+/// (back). The `Doom` variant is unconditional in the enum so the
+/// navigation state machine doesn't fork on `cfg`; the actual
+/// transition into `Active::Doom` is gated behind `cfg(feature =
+/// "doom")` at the callback registration site below — when the
+/// feature is off the state can never reach Doom because `open-doom`
+/// is never wired. The `Keyboard` variant (Track QQQQ #465) is always
+/// available; the on-screen QWERTY is the foundation for the touch-
+/// only "phone shape" milestone.
+///
+/// Track #510 (this commit): the prior `Hateoas` + `Repl` variants
+/// are folded into a single `UnifiedRepl` variant — both panes live
+/// in one Window now (`crate::ui_apps::unified_repl`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Active {
     Launcher,
-    Hateoas,
-    Repl,
+    UnifiedRepl,
     Keyboard,
     #[cfg(feature = "doom")]
     Doom,
@@ -231,10 +234,9 @@ pub fn run(
     // callbacks/state stay live for the lifetime of the kernel.
     let launcher = AppLauncher::new()
         .expect("AppLauncher::new() failed under installed Slint platform");
-    let hateoas_window = hateoas::build_app()
-        .expect("HateoasBrowser construction failed");
-    let repl_app = repl::build_app()
-        .expect("Repl construction failed");
+    // Track #510: HateoasBrowser + Repl merged into UnifiedRepl.
+    let unified_repl_app = unified_repl::build_app()
+        .expect("UnifiedRepl construction failed");
     // Track QQQQ #465: virtual keyboard. Always constructed (no
     // feature gate); the on-screen QWERTY is the path to making
     // AREST usable on a touch-only display under QEMU. Touch / pointer
@@ -255,33 +257,27 @@ pub fn run(
     #[cfg(feature = "doom")]
     launcher.set_show_doom(true);
 
-    let nav: NavState = Rc::new(RefCell::new(Active::Launcher));
+    // Track #510: the unified REPL is the default landing app. Boot
+    // straight into it instead of the launcher splash so the user
+    // lands in the "system as current screen" surface immediately.
+    let nav: NavState = Rc::new(RefCell::new(Active::UnifiedRepl));
 
-    // Wire the launcher's two open-* callbacks. Each one swaps the
+    // Wire the launcher's open-* callbacks. Each one swaps the
     // visible Slint Window: hide the launcher, show the chosen app,
     // and update `nav` so the keyboard pump knows where to route Esc.
+    //
+    // Track #510: HateoasBrowser + Repl merged into one
+    // `open-unified-repl` callback fed by `UnifiedRepl`.
     {
         let nav = nav.clone();
         let launcher_weak = launcher.as_weak();
-        let hateoas_weak = hateoas_window.as_weak();
-        launcher.on_open_hateoas(move || {
+        let unified_weak = unified_repl_app.window.as_weak();
+        launcher.on_open_unified_repl(move || {
             let Some(launcher) = launcher_weak.upgrade() else { return };
-            let Some(hateoas) = hateoas_weak.upgrade() else { return };
+            let Some(unified) = unified_weak.upgrade() else { return };
             let _ = launcher.hide();
-            let _ = hateoas.show();
-            *nav.borrow_mut() = Active::Hateoas;
-        });
-    }
-    {
-        let nav = nav.clone();
-        let launcher_weak = launcher.as_weak();
-        let repl_weak = repl_app.window.as_weak();
-        launcher.on_open_repl(move || {
-            let Some(launcher) = launcher_weak.upgrade() else { return };
-            let Some(repl_window) = repl_weak.upgrade() else { return };
-            let _ = launcher.hide();
-            let _ = repl_window.show();
-            *nav.borrow_mut() = Active::Repl;
+            let _ = unified.show();
+            *nav.borrow_mut() = Active::UnifiedRepl;
         });
     }
     // Track QQQQ #465: Keyboard open callback. Always wired (no
@@ -342,12 +338,18 @@ pub fn run(
     // tick per frame; not currently a concern under the boot wiring).
     toolkit_loop::register_default_pumps();
 
-    // Show the launcher first. Until this returns Ok, the
-    // MinimalSoftwareWindow has no visible component and
-    // `draw_if_needed` would no-op.
-    launcher
+    // Track #510: the unified REPL is the default landing app per the
+    // EPIC #496 vision ("the system as the current screen"). Show it
+    // first so the user lands in the merged HATEOAS-browse + REPL-
+    // prompt surface immediately — the launcher splash is reachable
+    // by pressing Esc inside the unified panel.
+    //
+    // Until `show()` returns Ok the MinimalSoftwareWindow has no
+    // visible component and `draw_if_needed` would no-op.
+    unified_repl_app
+        .window
         .show()
-        .expect("AppLauncher::show() failed");
+        .expect("UnifiedRepl::show() failed");
 
     // Super-loop. Per Slint's mcu.md (lines 200-245), this is the
     // canonical no-event-loop main loop: drain input, advance
@@ -384,16 +386,10 @@ pub fn run(
                 // — Slint will silently drop unhandled keys.
                 drain_keyboard_into_slint_window(&launcher.window());
             }
-            Active::Hateoas => {
-                if drain_keyboard_with_esc_intercept(&hateoas_window.window()) {
-                    let _ = hateoas_window.hide();
-                    let _ = launcher.show();
-                    *nav.borrow_mut() = Active::Launcher;
-                }
-            }
-            Active::Repl => {
-                if drain_keyboard_with_esc_intercept(&repl_app.window.window()) {
-                    let _ = repl_app.window.hide();
+            // Track #510: HateoasBrowser + Repl merged into UnifiedRepl.
+            Active::UnifiedRepl => {
+                if drain_keyboard_with_esc_intercept(&unified_repl_app.window.window()) {
+                    let _ = unified_repl_app.window.hide();
                     let _ = launcher.show();
                     *nav.borrow_mut() = Active::Launcher;
                 }

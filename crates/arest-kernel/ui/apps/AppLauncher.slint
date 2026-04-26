@@ -42,15 +42,14 @@ import { Card } from "../components/Card.slint";
 export component AppLauncher inherits Window {
     // ---- Callbacks (Rust glue navigates) --------------------------
 
-    // Fired when the user clicks the "HATEOAS Browser" button. Rust
+    // Fired when the user clicks the "Unified REPL" button. Rust
     // glue (`launcher.rs`) hides this window and shows
-    // `crate::ui_apps::hateoas::build_app()`'s window.
-    callback open-hateoas();
-
-    // Fired when the user clicks the "REPL" button. Rust glue hides
-    // this window and shows `crate::ui_apps::repl::build_app()`'s
-    // window.
-    callback open-repl();
+    // `crate::ui_apps::unified_repl::build_app()`'s window. The
+    // unified panel co-locates the HATEOAS resource browse (left
+    // pane) and the REPL prompt + scrollback (right pane) — replaces
+    // the prior separate `open-hateoas` + `open-repl` callbacks per
+    // #510 / EPIC #496.
+    callback open-unified-repl();
 
     // Fired when the user clicks the "Doom" button. Rust glue hides
     // this window and shows `crate::ui_apps::doom::build_app()`'s
@@ -221,16 +220,15 @@ export component AppLauncher inherits Window {
                                 // but no kernel app exercises that path
                                 // today — keeping splash on the proven
                                 // text path).
+                                // Track #510 / EPIC #496: HATEOAS
+                                // Browser + REPL merged into one
+                                // unified panel. The previous two
+                                // separate buttons are collapsed into
+                                // this single icon.
                                 Button {
-                                    text: "HATEOAS Browser";
+                                    text: "Unified REPL";
                                     variant: ButtonVariant.primary;
-                                    clicked => { root.open-hateoas(); }
-                                }
-
-                                Button {
-                                    text: "REPL";
-                                    variant: ButtonVariant.primary;
-                                    clicked => { root.open-repl(); }
+                                    clicked => { root.open-unified-repl(); }
                                 }
 
                                 // Track VVV #455: Doom row, only
