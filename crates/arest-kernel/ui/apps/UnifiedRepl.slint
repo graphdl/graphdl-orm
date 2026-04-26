@@ -153,14 +153,25 @@ export component UnifiedRepl inherits Window {
     // (apply / transition / fetch / FetchOrPhi / Store / Def /
     // Platform / Native — see #161). Each entry is a pre-formatted
     // label like "[create] apply create File" or "[transition]
-    // transition OrderSM::o1 submitted"; clicks fire `action-invoked`
-    // with the row index, and the kernel dispatches the verb with
-    // the cached `default_args` pre-bound from cell context.
+    // advance (\u{2192} middle)"; clicks fire `action-invoked` with
+    // the row index, and the kernel dispatches the verb with the
+    // cached `default_args` pre-bound from cell context.
     //
     // The free-text REPL still works (typed verb invocations); the
     // action panel is the *canonical* surface — each row is a SYSTEM
     // call grounded in the current cell, ready to dispatch.
+    //
+    // State-machine surface (#514): for any Instance with a SM, the
+    // Action Card surfaces one button per legal outgoing transition
+    // (labelled by the transition's event name). Disabled transitions
+    // (guard violations) render greyed out + the violation text shows
+    // on hover. The disabled state + tooltip travel via the parallel
+    // `system-action-enabled` and `system-action-tooltips` arrays —
+    // index-aligned with `system-actions` so the per-row template can
+    // pick the right `enabled` / tooltip without separate book-keeping.
     in property <[string]> system-actions;
+    in property <[bool]> system-action-enabled;
+    in property <[string]> system-action-tooltips;
 
     // ---- "You are here" breadcrumb + back/forward (#516, EPIC #496) -
     //
@@ -601,6 +612,13 @@ export component UnifiedRepl inherits Window {
                         // args from the cell context. Clicks dispatch
                         // through the kernel's existing Func-application
                         // path; the result line lands in REPL scrollback.
+                        //
+                        // State-machine surface (#514): for any Instance
+                        // with a SM, the Action Card surfaces one button
+                        // per legal outgoing transition labelled by the
+                        // transition's event name. Disabled transitions
+                        // (guard violations) render greyed out + show
+                        // their violation text in a hover tooltip.
                         Rectangle {
                             min-height: 80px;
                             Card {
@@ -612,10 +630,101 @@ export component UnifiedRepl inherits Window {
                                     font-size: Theme.type-body-sm.size;
                                     wrap: word-wrap;
                                 }
-                                if root.system-actions.length > 0 : List {
-                                    items: root.system-actions;
-                                    item-clicked(idx, value) => {
-                                        root.action-invoked(idx);
+                                if root.system-actions.length > 0 : VerticalLayout {
+                                    spacing: 0px;
+                                    for value[idx] in root.system-actions : action-row := Rectangle {
+                                        // Resolve enabled / tooltip from
+                                        // the parallel arrays; default to
+                                        // "enabled, no tooltip" so older
+                                        // call sites that haven't pushed
+                                        // the new arrays still render
+                                        // (graceful degradation).
+                                        property <bool> row-enabled:
+                                            idx < root.system-action-enabled.length
+                                                ? root.system-action-enabled[idx]
+                                                : true;
+                                        property <string> row-tooltip:
+                                            idx < root.system-action-tooltips.length
+                                                ? root.system-action-tooltips[idx]
+                                                : "";
+                                        min-height: 32px;
+                                        background: row-touch.has-hover && row-enabled
+                                            ? Theme.neutral-200
+                                            : transparent;
+                                        border-radius: 4px;
+                                        animate background {
+                                            duration: Theme.motion-fast;
+                                            easing: ease-in-out;
+                                        }
+                                        HorizontalLayout {
+                                            padding-left: Theme.spacing-md;
+                                            padding-right: Theme.spacing-md;
+                                            padding-top: Theme.spacing-xs;
+                                            padding-bottom: Theme.spacing-xs;
+                                            Text {
+                                                text: value;
+                                                // Greyed-out colour for
+                                                // disabled rows so the
+                                                // user can see at a
+                                                // glance which actions
+                                                // are blocked. The
+                                                // tooltip carries the
+                                                // explanation on hover.
+                                                color: action-row.row-enabled
+                                                    ? Theme.text-primary
+                                                    : Theme.text-muted;
+                                                font-family: Theme.type-body.family;
+                                                font-weight: Theme.type-body.weight;
+                                                font-size: Theme.type-body.size;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+                                        // Hover tooltip surface — renders
+                                        // only when the row is disabled
+                                        // AND the user is hovering, so
+                                        // enabled rows behave like a
+                                        // standard List item. The tooltip
+                                        // floats above the row to keep
+                                        // the layout stable.
+                                        if !action-row.row-enabled && row-touch.has-hover : Rectangle {
+                                            x: 0;
+                                            y: action-row.height;
+                                            width: action-row.width;
+                                            background: Theme.neutral-100;
+                                            border-color: Theme.border;
+                                            border-width: 1px;
+                                            border-radius: 4px;
+                                            z: 100;
+                                            HorizontalLayout {
+                                                padding-left: Theme.spacing-sm;
+                                                padding-right: Theme.spacing-sm;
+                                                padding-top: Theme.spacing-xs;
+                                                padding-bottom: Theme.spacing-xs;
+                                                Text {
+                                                    text: action-row.row-tooltip;
+                                                    color: Theme.text-primary;
+                                                    font-family: Theme.type-body-sm.family;
+                                                    font-weight: Theme.type-body-sm.weight;
+                                                    font-size: Theme.type-body-sm.size;
+                                                    wrap: word-wrap;
+                                                }
+                                            }
+                                        }
+                                        row-touch := TouchArea {
+                                            // Disabled rows still capture
+                                            // hover (so the tooltip
+                                            // appears) but suppress
+                                            // click delivery — the user
+                                            // gets visual feedback but
+                                            // not a no-op verb dispatch.
+                                            enabled: action-row.row-enabled;
+                                            mouse-cursor: action-row.row-enabled
+                                                ? MouseCursor.pointer
+                                                : MouseCursor.not-allowed;
+                                            clicked => {
+                                                root.action-invoked(idx);
+                                            }
+                                        }
                                     }
                                 }
                             }

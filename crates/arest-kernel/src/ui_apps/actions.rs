@@ -80,6 +80,49 @@ use crate::ui_apps::cell_renderer::CurrentCell;
 
 // ── SystemAction ───────────────────────────────────────────────────
 
+/// Whether an action is currently fireable, and (if not) why. #514
+/// extends the action surface for state-machine instances: each legal
+/// outgoing transition becomes its own button, and any guard-violating
+/// transition surfaces here as `BlockedByGuard(violation_text)` so the
+/// renderer can grey out the row and surface the explanation on hover.
+///
+/// The same pattern generalises to any action whose preconditions can
+/// be checked statically before dispatch — guards on transitions today,
+/// alethic / deontic constraints on Apply* verbs in a future commit
+/// (#288 wires the same constraint pass through this enum).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum GuardStatus {
+    /// The action's preconditions are satisfied — clicking the row
+    /// dispatches the verb. Default for every action without a
+    /// declared guard.
+    Enabled,
+    /// One or more guards block the action. The carried text is the
+    /// human-readable explanation surfaced as a tooltip on the disabled
+    /// row. Multiple violations are joined with `"; "` so the tooltip
+    /// shows everything at once.
+    BlockedByGuard(String),
+}
+
+impl GuardStatus {
+    /// Returns true when the action is currently fireable. Used by the
+    /// dispatch path to short-circuit clicks against disabled rows and
+    /// by the Slint side to set the `enabled` property on the row.
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, GuardStatus::Enabled)
+    }
+
+    /// Returns the violation text for a blocked action, or the empty
+    /// string for an enabled one. The Slint surface pushes this string
+    /// into the tooltip property regardless of state — Slint will not
+    /// render the tooltip when the row is enabled.
+    pub fn tooltip(&self) -> &str {
+        match self {
+            GuardStatus::Enabled => "",
+            GuardStatus::BlockedByGuard(text) => text.as_str(),
+        }
+    }
+}
+
 /// One legal "SYSTEM call from this screen" affordance derived from
 /// the cell graph + the current cell context. Each action IS a cell
 /// of the implicit fact type
@@ -102,6 +145,13 @@ pub struct SystemAction {
     /// doesn't need to do any string assembly. Kept stable across
     /// redraws (sorted by `compute_actions`) so click-by-index works.
     pub label: String,
+    /// Whether the action is currently fireable. Default `Enabled`.
+    /// State-machine transitions (#514) flip this to `BlockedByGuard`
+    /// when a `Guard_prevents_Transition` fact references the
+    /// transition AND the guard's predicate evaluates positively in
+    /// current state — the renderer greys the row out and surfaces the
+    /// guard's explanation as a tooltip.
+    pub guard_status: GuardStatus,
 }
 
 impl SystemAction {
@@ -110,11 +160,26 @@ impl SystemAction {
     /// canonical free-text REPL form a power user would type
     /// (e.g. `apply create File`, `transition Order::o1 submit`),
     /// so the action panel doubles as documentation for the REPL.
+    /// Returned action is `Enabled` by default; use
+    /// `with_guard_status` to surface a blocked transition.
     pub fn new(verb: SystemVerb, default_args: Vec<(String, String)>) -> Self {
         let prefix = verb.label_prefix();
         let text = verb.canonical_text(&default_args);
         let label = format!("[{prefix}] {text}");
-        Self { verb, default_args, label }
+        Self { verb, default_args, label, guard_status: GuardStatus::Enabled }
+    }
+
+    /// Construct an action with an explicit `guard_status` and an
+    /// explicit override label. Used by the SM-action enumerator
+    /// (#514) so the per-transition button shows the event name as
+    /// the principal text rather than the canonical REPL form.
+    pub fn with_label_and_guard(
+        verb: SystemVerb,
+        default_args: Vec<(String, String)>,
+        label: String,
+        guard_status: GuardStatus,
+    ) -> Self {
+        Self { verb, default_args, label, guard_status }
     }
 }
 
@@ -214,7 +279,17 @@ impl SystemVerb {
                 let sm = arg_value("sm");
                 let id = arg_value("id");
                 let next = arg_value("next");
-                format!("transition {sm}::{id} {next}")
+                let event = arg_value("event");
+                if event.is_empty() {
+                    format!("transition {sm}::{id} {next}")
+                } else {
+                    // #514: when the event name is bound (the rich SM
+                    // shape with `Transition_is_triggered_by_Event_Type`),
+                    // include it in the canonical REPL text so a power
+                    // user typing the verb manually can target the same
+                    // transition by its event-name handle.
+                    format!("transition {sm}::{id} {event} (\u{2192} {next})")
+                }
             }
             SystemVerb::Fetch => {
                 let name = arg_value("name");
@@ -268,7 +343,30 @@ pub fn compute_actions(current_cell: &CurrentCell, state: &Object) -> Vec<System
 
     // Stable, deterministic ordering. The Slint side keys clicks by
     // index; the kernel must emit the same order on every redraw.
-    out.sort_by(|a, b| a.verb.cmp(&b.verb).then_with(|| a.label.cmp(&b.label)));
+    //
+    // Sort key (#514): primary is the SystemVerb ordinal (existing).
+    // Secondary, *within* the Transition verb group, is enabled-first
+    // (so the user's natural next moves come before disabled ones)
+    // then alphabetical by event name. For non-Transition verbs the
+    // secondary key is the existing alphabetical-by-label tiebreaker.
+    out.sort_by(|a, b| {
+        a.verb
+            .cmp(&b.verb)
+            .then_with(|| {
+                if matches!(a.verb, SystemVerb::Transition)
+                    && matches!(b.verb, SystemVerb::Transition)
+                {
+                    let a_enabled = a.guard_status.is_enabled();
+                    let b_enabled = b.guard_status.is_enabled();
+                    // `true` sorts after `false` in default Ord, so
+                    // we negate to put enabled first.
+                    b_enabled.cmp(&a_enabled)
+                } else {
+                    core::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| a.label.cmp(&b.label))
+    });
     // Dedupe identical (verb, label) pairs that two different walks
     // produce.
     out.dedup_by(|a, b| a.verb == b.verb && a.label == b.label);
@@ -366,39 +464,136 @@ fn actions_for_instance(
         ],
     ));
 
-    // State machine: per next-state transition. Emits one action
-    // per next-state hop the SM has registered. #514 will specialise
-    // this further (one button per outgoing transition with the
-    // event name); #513 lays the foundation by surfacing the verb at
-    // all when an SM fact applies. The "next" arg is left empty when
-    // no Transition cell binds the next-state list — the user can
-    // still fire the verb manually with their own next-state.
+    // State machine: per legal outgoing transition (#514, EPIC #496).
+    // For any Instance with an SM (detected via
+    // `StateMachine_has_currentlyInStatus`), surface the *specific*
+    // legal next transitions as one-click actions, with their event
+    // names as labels. Each outgoing Transition becomes its own
+    // button; disabled ones (guard violations) carry the violation
+    // text on their `guard_status` so the renderer can grey them out
+    // and surface the explanation on hover.
+    //
+    // Backwards compatibility: when the richer Transition cells
+    // (`Transition_is_defined_in_State_Machine_Definition`,
+    // `Transition_is_from_Status`, `Transition_is_triggered_by_Event_Type`)
+    // are absent ENTIRELY for this SM, fall back to BBBBB's #513 shape
+    // — one generic Transition action per next-state value reachable
+    // from `Transition_is_to_Status`. The two distinct empty cases
+    // matter: (a) the rich shape is bound but the current Status is
+    // terminal (no outgoing) → emit *nothing* (correct: nowhere to
+    // go); (b) the rich shape isn't bound at all → fall back to the
+    // legacy enumeration so the Action Card still surfaces something.
     if let Some(sm_id) = state_machine_for(noun, instance, state) {
-        let next_states = next_states_for(&sm_id, state);
-        if next_states.is_empty() {
-            out.push(SystemAction::new(
-                SystemVerb::Transition,
-                vec![
-                    ("sm".to_string(), sm_id.clone()),
-                    ("id".to_string(), instance.to_string()),
-                    ("next".to_string(), String::new()),
-                ],
-            ));
+        if rich_sm_shape_present(&sm_id, state) {
+            // Rich-shape path: one action per legal outgoing
+            // transition. The label is the event name — that's the
+            // user-facing verb the action panel surfaces. When the
+            // current Status is terminal, this path emits nothing
+            // (correct: no buttons because there's nowhere to go).
+            for t in transitions_for_sm(&sm_id, state) {
+                let label = format_transition_label(&t);
+                out.push(SystemAction::with_label_and_guard(
+                    SystemVerb::Transition,
+                    vec![
+                        ("sm".to_string(), sm_id.clone()),
+                        ("id".to_string(), instance.to_string()),
+                        ("next".to_string(), t.target_status.clone()),
+                        ("event".to_string(), t.event_name.clone()),
+                        ("transition".to_string(), t.transition_id.clone()),
+                    ],
+                    label,
+                    t.guard_status,
+                ));
+            }
         } else {
-            for next in next_states {
+            // Reduced-shape fallback: walk the legacy
+            // `Transition_is_to_Status` cell. Mirrors BBBBB's #513.
+            let next_states = next_states_for(&sm_id, state);
+            if next_states.is_empty() {
                 out.push(SystemAction::new(
                     SystemVerb::Transition,
                     vec![
                         ("sm".to_string(), sm_id.clone()),
                         ("id".to_string(), instance.to_string()),
-                        ("next".to_string(), next),
+                        ("next".to_string(), String::new()),
                     ],
                 ));
+            } else {
+                for next in next_states {
+                    out.push(SystemAction::new(
+                        SystemVerb::Transition,
+                        vec![
+                            ("sm".to_string(), sm_id.clone()),
+                            ("id".to_string(), instance.to_string()),
+                            ("next".to_string(), next),
+                        ],
+                    ));
+                }
             }
         }
     }
 
     out
+}
+
+/// Returns true when the rich SM shape is populated for this SM
+/// instance — at least one Transition cell binds to the SM's
+/// Definition. Distinguishes the two empty cases for `transitions_for_sm`:
+///   * Rich shape present + terminal Status → no actions (correct).
+///   * Rich shape absent → fall back to legacy `next_states_for`.
+fn rich_sm_shape_present(sm_id: &str, state: &Object) -> bool {
+    let sm_def = state_machine_def_for(sm_id, state);
+    let cell = ast::fetch_or_phi(
+        "Transition_is_defined_in_State_Machine_Definition",
+        state,
+    );
+    let Some(facts) = cell.as_seq() else {
+        return false;
+    };
+    facts
+        .iter()
+        .any(|fact| ast::binding_matches(fact, "State Machine Definition", &sm_def))
+}
+
+/// One legal outgoing Transition for a SM instance. Carries the
+/// labelling data (event name, target Status) plus the precomputed
+/// `guard_status` so `actions_for_instance` can build the
+/// corresponding `SystemAction` without re-walking the cell graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TransitionInfo {
+    /// The Transition entity id (the principal key from the
+    /// `Transition` entity type — e.g. `'submit'`, `'review'`).
+    transition_id: String,
+    /// The Event Type name that fires this transition. This is the
+    /// principal user-facing label the Action Card surfaces (e.g.
+    /// `"submit"`, `"approved"`). Defaults to the transition id when
+    /// no `Transition_is_triggered_by_Event_Type` fact is bound.
+    event_name: String,
+    /// The Status the SM lands in after this transition fires
+    /// (`Transition_is_to_Status`). Pre-filled into the dispatch
+    /// args' `next` slot.
+    target_status: String,
+    /// Whether the transition is fireable today. `BlockedByGuard`
+    /// when one or more guards prevent it AND those guards' predicates
+    /// evaluate positively in current state.
+    guard_status: GuardStatus,
+}
+
+/// Compose the human-readable button label for a transition action.
+/// Format: `[transition] <event> (→ <target_status>)`. Disabled
+/// transitions append `" — disabled"` so screen readers / log
+/// scrapes can spot the state without consulting the tooltip arrow.
+fn format_transition_label(t: &TransitionInfo) -> String {
+    let base = format!(
+        "[{}] {} (\u{2192} {})",
+        SystemVerb::Transition.label_prefix(),
+        t.event_name,
+        t.target_status,
+    );
+    match &t.guard_status {
+        GuardStatus::Enabled => base,
+        GuardStatus::BlockedByGuard(_) => format!("{base} \u{2014} disabled"),
+    }
 }
 
 /// Fact-cell actions: `apply remove fact <id>` per fact in the cell
@@ -535,6 +730,221 @@ fn state_machine_for(noun: &str, instance: &str, state: &Object) -> Option<Strin
     })
 }
 
+/// Look up the SM's currently-in Status. Reads
+/// `StateMachine_has_currentlyInStatus` and returns the bound
+/// `currentlyInStatus` for any fact that mentions `sm_or_resource_id`
+/// in the SM, forResource, or instance role positions. Mirrors
+/// `state_machine_for`'s tolerant matching shape.
+fn current_status_for(sm_or_resource_id: &str, state: &Object) -> Option<String> {
+    let cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", state);
+    let facts = cell.as_seq()?;
+    facts.iter().find_map(|fact| {
+        let mentions = ast::binding_matches(fact, "State Machine", sm_or_resource_id)
+            || ast::binding_matches(fact, "forResource", sm_or_resource_id);
+        if !mentions {
+            return None;
+        }
+        ast::binding(fact, "currentlyInStatus").map(|s| s.to_string())
+    })
+}
+
+/// Look up the SM Definition that this SM instance is an instance of.
+/// Reads `StateMachine_is_instance_of_State_Machine_Definition` per
+/// the canonical shape in `readings/core/instances.md`. Falls back to
+/// using the SM id itself as the definition when the instance fact
+/// isn't bound (the simplified test fixtures + the legacy "SM and
+/// SMDef share id" convention used by some compile paths).
+fn state_machine_def_for(sm_id: &str, state: &Object) -> String {
+    let cell = ast::fetch_or_phi(
+        "StateMachine_is_instance_of_State_Machine_Definition",
+        state,
+    );
+    if let Some(facts) = cell.as_seq() {
+        for fact in facts {
+            if ast::binding_matches(fact, "State Machine", sm_id) {
+                if let Some(def) = ast::binding(fact, "State Machine Definition")
+                {
+                    return def.to_string();
+                }
+            }
+        }
+    }
+    sm_id.to_string()
+}
+
+/// Enumerate every legal outgoing Transition for a SM instance —
+/// one entry per Transition cell whose `from Status` matches the SM's
+/// current Status AND whose `defined in State Machine Definition`
+/// matches the SM's def. Each entry carries the event name (label),
+/// target Status (dispatch arg), and `guard_status` (Enabled or
+/// BlockedByGuard with violation text).
+///
+/// Returns an empty Vec when no rich Transition cells are populated —
+/// the caller falls back to BBBBB's #513 reduced shape.
+fn transitions_for_sm(sm_id: &str, state: &Object) -> Vec<TransitionInfo> {
+    let Some(current_status) = current_status_for(sm_id, state) else {
+        return Vec::new();
+    };
+    let sm_def = state_machine_def_for(sm_id, state);
+
+    // Walk `Transition_is_defined_in_State_Machine_Definition` to
+    // find every Transition that belongs to this SM's def. This is
+    // the rich-shape entry point; if the cell is missing we return
+    // empty (caller falls back).
+    let defined_cell = ast::fetch_or_phi(
+        "Transition_is_defined_in_State_Machine_Definition",
+        state,
+    );
+    let Some(defined_facts) = defined_cell.as_seq() else {
+        return Vec::new();
+    };
+    let mut transition_ids: BTreeSet<String> = BTreeSet::new();
+    for fact in defined_facts {
+        if ast::binding_matches(fact, "State Machine Definition", &sm_def) {
+            if let Some(tid) = ast::binding(fact, "Transition") {
+                transition_ids.insert(tid.to_string());
+            }
+        }
+    }
+    if transition_ids.is_empty() {
+        return Vec::new();
+    }
+
+    // Filter to outgoing transitions: those whose `is from Status`
+    // matches the SM's current status.
+    let from_cell = ast::fetch_or_phi("Transition_is_from_Status", state);
+    let from_facts = from_cell.as_seq();
+    let outgoing: BTreeSet<String> = transition_ids
+        .iter()
+        .filter(|tid| {
+            let Some(facts) = from_facts else {
+                // No `is_from` cell — conservatively accept every
+                // defined transition (some fixtures omit `from`
+                // entirely; the user can still see "what verbs exist").
+                return true;
+            };
+            facts.iter().any(|fact| {
+                ast::binding_matches(fact, "Transition", tid)
+                    && ast::binding_matches(fact, "Status", &current_status)
+            })
+        })
+        .cloned()
+        .collect();
+    if outgoing.is_empty() {
+        return Vec::new();
+    }
+
+    // Build the (target Status, event name) lookups in one pass each.
+    let to_cell = ast::fetch_or_phi("Transition_is_to_Status", state);
+    let to_facts = to_cell.as_seq();
+    let trigger_cell =
+        ast::fetch_or_phi("Transition_is_triggered_by_Event_Type", state);
+    let trigger_facts = trigger_cell.as_seq();
+
+    let mut out: Vec<TransitionInfo> = Vec::new();
+    for tid in &outgoing {
+        let target_status = to_facts
+            .and_then(|facts| {
+                facts.iter().find(|f| ast::binding_matches(f, "Transition", tid))
+            })
+            .and_then(|f| ast::binding(f, "Status"))
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let event_name = trigger_facts
+            .and_then(|facts| {
+                facts.iter().find(|f| ast::binding_matches(f, "Transition", tid))
+            })
+            .and_then(|f| ast::binding(f, "Event Type"))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| tid.clone());
+        let guard_status = guard_status_for_transition(tid, state);
+        out.push(TransitionInfo {
+            transition_id: tid.clone(),
+            event_name,
+            target_status,
+            guard_status,
+        });
+    }
+    out
+}
+
+/// Check whether any guard prevents the given Transition AND that
+/// guard's predicate evaluates positively in current state. Returns
+/// `Enabled` when no blocking guard applies, or `BlockedByGuard`
+/// with the joined violation text(s) when one or more guards block.
+///
+/// Cell shape (per `readings/core/state.md`):
+///   * `Guard_prevents_Transition { Guard, Transition }`
+///   * `Guard_has_violation_text { Guard, violation_text }` (optional;
+///      when absent the guard's id is used as the explanation)
+///   * `Guard_is_active { Guard }` (optional gate; when present, only
+///      guards listed here block — lets a future deontic-constraint
+///      pass mark which guards have evaluated positively without
+///      forcing this enumerator to re-run the predicate engine)
+///
+/// When `Guard_is_active` is absent, every guard that points at the
+/// transition is treated as active — conservative default that errs
+/// on the side of marking transitions disabled rather than letting
+/// the user click into a guaranteed runtime failure.
+fn guard_status_for_transition(transition_id: &str, state: &Object) -> GuardStatus {
+    let prevents_cell = ast::fetch_or_phi("Guard_prevents_Transition", state);
+    let Some(prevents_facts) = prevents_cell.as_seq() else {
+        return GuardStatus::Enabled;
+    };
+    let blocking_guards: BTreeSet<String> = prevents_facts
+        .iter()
+        .filter_map(|fact| {
+            if ast::binding_matches(fact, "Transition", transition_id) {
+                ast::binding(fact, "Guard").map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if blocking_guards.is_empty() {
+        return GuardStatus::Enabled;
+    }
+
+    // Filter to currently-active guards (when the activity gate is
+    // populated). Active gate semantics: `Guard_is_active { Guard }`
+    // facts list every guard whose predicate currently evaluates
+    // positively (i.e. the guard fires). When the cell is absent,
+    // assume every guard is active (conservative).
+    let active_cell = ast::fetch_or_phi("Guard_is_active", state);
+    let active_set: Option<BTreeSet<String>> = active_cell.as_seq().map(|facts| {
+        facts
+            .iter()
+            .filter_map(|f| ast::binding(f, "Guard").map(|s| s.to_string()))
+            .collect()
+    });
+    let firing_guards: Vec<String> = blocking_guards
+        .into_iter()
+        .filter(|g| active_set.as_ref().map_or(true, |s| s.contains(g)))
+        .collect();
+    if firing_guards.is_empty() {
+        return GuardStatus::Enabled;
+    }
+
+    // Resolve each firing guard to its violation text.
+    let viol_cell = ast::fetch_or_phi("Guard_has_violation_text", state);
+    let viol_facts = viol_cell.as_seq();
+    let mut messages: Vec<String> = firing_guards
+        .iter()
+        .map(|guard| {
+            viol_facts
+                .and_then(|facts| {
+                    facts.iter().find(|f| ast::binding_matches(f, "Guard", guard))
+                })
+                .and_then(|f| ast::binding(f, "violation_text"))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| guard.clone())
+        })
+        .collect();
+    messages.sort();
+    messages.dedup();
+    GuardStatus::BlockedByGuard(messages.join("; "))
+}
+
 /// Enumerate next-state values reachable from the SM's transition
 /// table. Reads `Transition_is_to_Status` (the canonical
 /// transition-target cell shape) and returns every `Status` value.
@@ -587,6 +997,14 @@ fn next_states_for(sm_id: &str, state: &Object) -> Vec<String> {
 /// the kernel (#515+ wiring through Platform).
 pub fn dispatch_action(action: &SystemAction) -> String {
     let summary = action.verb.canonical_text(&action.default_args);
+    // #514: short-circuit blocked actions. The Slint side already
+    // greys the row out + suppresses click delivery, but defensive
+    // depth here guards against stale clicks (Slint event delivered
+    // before the property bag refresh swaps the disabled state in)
+    // and against direct callers (REPL command, future automation).
+    if let GuardStatus::BlockedByGuard(reason) = &action.guard_status {
+        return format!("[action] {summary} \u{2192} (blocked: {reason})");
+    }
     match action.verb {
         // Read-only verbs: actually dispatch through the kernel's
         // existing fetch path so the user sees real cell contents.
@@ -1118,8 +1536,577 @@ mod tests {
             verb: SystemVerb::Fetch,
             default_args: Vec::new(),
             label: "[fetch] fetch ".to_string(),
+            guard_status: GuardStatus::Enabled,
         };
         let line = dispatch_action(&action);
         assert!(line.contains("missing name"));
+    }
+
+    // ── State-machine action surface (#514) ────────────────────────
+    //
+    // Per #514 (#496e), Theorem 5: any entity with a state machine
+    // surfaces its **specific** legal next transitions as one-click
+    // actions, with their event names as labels. Disabled transitions
+    // show their guard violations inline.
+
+    /// Three-state SM fixture: `start → middle → end`. Each transition
+    /// has an event-type label; `middle → end` carries a guard that
+    /// the test toggles on / off via `Guard_is_active`.
+    fn three_state_sm() -> Object {
+        let s = Object::phi();
+        // Resource the SM is for.
+        let s = cell_push(
+            "File_has_Name",
+            fact_from_pairs(&[("File", "f1"), ("Name", "alpha.txt")]),
+            &s,
+        );
+        // SM instance pointing at SM Definition.
+        let s = cell_push(
+            "StateMachine_is_instance_of_State_Machine_Definition",
+            fact_from_pairs(&[
+                ("State Machine", "sm1"),
+                ("State Machine Definition", "FileLifecycle"),
+            ]),
+            &s,
+        );
+        let s = cell_push(
+            "StateMachine_has_currentlyInStatus",
+            fact_from_pairs(&[
+                ("State Machine", "sm1"),
+                ("currentlyInStatus", "start"),
+                ("forResource", "f1"),
+            ]),
+            &s,
+        );
+        // Transitions defined in the SM Def.
+        let s = cell_push(
+            "Transition_is_defined_in_State_Machine_Definition",
+            fact_from_pairs(&[
+                ("Transition", "t_advance"),
+                ("State Machine Definition", "FileLifecycle"),
+            ]),
+            &s,
+        );
+        let s = cell_push(
+            "Transition_is_defined_in_State_Machine_Definition",
+            fact_from_pairs(&[
+                ("Transition", "t_finalise"),
+                ("State Machine Definition", "FileLifecycle"),
+            ]),
+            &s,
+        );
+        // From / To wiring.
+        let s = cell_push(
+            "Transition_is_from_Status",
+            fact_from_pairs(&[("Transition", "t_advance"), ("Status", "start")]),
+            &s,
+        );
+        let s = cell_push(
+            "Transition_is_to_Status",
+            fact_from_pairs(&[("Transition", "t_advance"), ("Status", "middle")]),
+            &s,
+        );
+        let s = cell_push(
+            "Transition_is_from_Status",
+            fact_from_pairs(&[("Transition", "t_finalise"), ("Status", "middle")]),
+            &s,
+        );
+        let s = cell_push(
+            "Transition_is_to_Status",
+            fact_from_pairs(&[("Transition", "t_finalise"), ("Status", "end")]),
+            &s,
+        );
+        // Event-type labels (the user-facing names).
+        let s = cell_push(
+            "Transition_is_triggered_by_Event_Type",
+            fact_from_pairs(&[("Transition", "t_advance"), ("Event Type", "advance")]),
+            &s,
+        );
+        cell_push(
+            "Transition_is_triggered_by_Event_Type",
+            fact_from_pairs(&[
+                ("Transition", "t_finalise"),
+                ("Event Type", "finalise"),
+            ]),
+            &s,
+        )
+    }
+
+    /// Mutate `state` so that the SM instance `sm1` is currently in
+    /// `status`. Used to walk the 3-state SM through start → middle →
+    /// end and observe each step's action surface.
+    fn set_current_status(state: &Object, status: &str) -> Object {
+        // Drop facts in `StateMachine_has_currentlyInStatus` that
+        // mention sm1, then push a fresh fact at the new status.
+        let cleaned = ast::cell_filter(
+            "StateMachine_has_currentlyInStatus",
+            |f| !ast::binding_matches(f, "State Machine", "sm1"),
+            state,
+        );
+        ast::cell_push(
+            "StateMachine_has_currentlyInStatus",
+            fact_from_pairs(&[
+                ("State Machine", "sm1"),
+                ("currentlyInStatus", status),
+                ("forResource", "f1"),
+            ]),
+            &cleaned,
+        )
+    }
+
+    #[test]
+    fn three_state_sm_at_start_surfaces_advance_event() {
+        let state = three_state_sm();
+        let actions = compute_actions(
+            &CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into(),
+            },
+            &state,
+        );
+        let transitions: Vec<&SystemAction> = actions
+            .iter()
+            .filter(|a| a.verb == SystemVerb::Transition)
+            .collect();
+        assert_eq!(
+            transitions.len(),
+            1,
+            "exactly one outgoing from start: {transitions:?}"
+        );
+        let advance = transitions[0];
+        // Event name is the principal user-facing label.
+        assert!(
+            advance.label.contains("advance"),
+            "label must include event name: {}",
+            advance.label
+        );
+        // Target state surfaces in the label too.
+        assert!(
+            advance.label.contains("middle"),
+            "label must include target status: {}",
+            advance.label
+        );
+        // Default args carry both event + next for the dispatcher.
+        let event_arg = advance
+            .default_args
+            .iter()
+            .find(|(k, _)| k == "event")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(event_arg, Some("advance"));
+        let next_arg = advance
+            .default_args
+            .iter()
+            .find(|(k, _)| k == "next")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(next_arg, Some("middle"));
+        // Enabled by default — no guard.
+        assert_eq!(advance.guard_status, GuardStatus::Enabled);
+    }
+
+    #[test]
+    fn three_state_sm_at_middle_surfaces_finalise_event() {
+        let state = set_current_status(&three_state_sm(), "middle");
+        let actions = compute_actions(
+            &CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into(),
+            },
+            &state,
+        );
+        let transitions: Vec<&SystemAction> = actions
+            .iter()
+            .filter(|a| a.verb == SystemVerb::Transition)
+            .collect();
+        assert_eq!(
+            transitions.len(),
+            1,
+            "exactly one outgoing from middle: {transitions:?}"
+        );
+        assert!(
+            transitions[0].label.contains("finalise"),
+            "expected finalise label, got {}",
+            transitions[0].label
+        );
+        assert!(transitions[0].label.contains("end"));
+    }
+
+    #[test]
+    fn three_state_sm_at_end_surfaces_no_outgoing_transition() {
+        let state = set_current_status(&three_state_sm(), "end");
+        let actions = compute_actions(
+            &CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into(),
+            },
+            &state,
+        );
+        let transitions: Vec<&SystemAction> = actions
+            .iter()
+            .filter(|a| a.verb == SystemVerb::Transition)
+            .collect();
+        assert!(
+            transitions.is_empty(),
+            "terminal state has no outgoing transitions: {transitions:?}"
+        );
+    }
+
+    #[test]
+    fn guard_blocking_active_marks_transition_disabled() {
+        let s = set_current_status(&three_state_sm(), "middle");
+        // Add a guard preventing finalise — and mark it active.
+        let s = cell_push(
+            "Guard_prevents_Transition",
+            fact_from_pairs(&[
+                ("Guard", "needs-approval"),
+                ("Transition", "t_finalise"),
+            ]),
+            &s,
+        );
+        let s = cell_push(
+            "Guard_has_violation_text",
+            fact_from_pairs(&[
+                ("Guard", "needs-approval"),
+                ("violation_text", "must be approved before finalising"),
+            ]),
+            &s,
+        );
+        let s = cell_push(
+            "Guard_is_active",
+            fact_from_pairs(&[("Guard", "needs-approval")]),
+            &s,
+        );
+
+        let actions = compute_actions(
+            &CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into(),
+            },
+            &s,
+        );
+        let finalise = actions
+            .iter()
+            .find(|a| {
+                a.verb == SystemVerb::Transition
+                    && a.default_args.iter().any(|(k, v)| k == "event" && v == "finalise")
+            })
+            .expect("expected the finalise transition action");
+        match &finalise.guard_status {
+            GuardStatus::BlockedByGuard(reason) => {
+                assert!(
+                    reason.contains("must be approved"),
+                    "expected violation text in tooltip, got {reason}"
+                );
+            }
+            other => panic!("expected BlockedByGuard, got {other:?}"),
+        }
+        assert!(
+            finalise.label.contains("disabled"),
+            "label must indicate disabled state: {}",
+            finalise.label
+        );
+    }
+
+    #[test]
+    fn guard_inactive_keeps_transition_enabled() {
+        let s = set_current_status(&three_state_sm(), "middle");
+        // Same guard wiring as the blocking-active test, but the
+        // `Guard_is_active` cell is empty — the guard exists in the
+        // schema but doesn't currently fire.
+        let s = cell_push(
+            "Guard_prevents_Transition",
+            fact_from_pairs(&[
+                ("Guard", "needs-approval"),
+                ("Transition", "t_finalise"),
+            ]),
+            &s,
+        );
+        // Push an unrelated guard into the active cell so the cell
+        // shape exists but doesn't list `needs-approval`.
+        let s = cell_push(
+            "Guard_is_active",
+            fact_from_pairs(&[("Guard", "some-other-guard")]),
+            &s,
+        );
+
+        let actions = compute_actions(
+            &CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into(),
+            },
+            &s,
+        );
+        let finalise = actions
+            .iter()
+            .find(|a| {
+                a.verb == SystemVerb::Transition
+                    && a.default_args.iter().any(|(k, v)| k == "event" && v == "finalise")
+            })
+            .expect("expected the finalise transition action");
+        assert_eq!(
+            finalise.guard_status,
+            GuardStatus::Enabled,
+            "guard not in Guard_is_active → action remains Enabled"
+        );
+    }
+
+    #[test]
+    fn transitions_sort_enabled_before_blocked_then_alphabetical() {
+        // Build an SM with two outgoing transitions from `start`,
+        // one of which is blocked by an active guard. Expectation:
+        // the enabled one comes first regardless of alphabetical
+        // order, then the blocked one.
+        let s = three_state_sm();
+        // Add a second outgoing from start: t_branch → branch.
+        let s = cell_push(
+            "Transition_is_defined_in_State_Machine_Definition",
+            fact_from_pairs(&[
+                ("Transition", "t_branch"),
+                ("State Machine Definition", "FileLifecycle"),
+            ]),
+            &s,
+        );
+        let s = cell_push(
+            "Transition_is_from_Status",
+            fact_from_pairs(&[("Transition", "t_branch"), ("Status", "start")]),
+            &s,
+        );
+        let s = cell_push(
+            "Transition_is_to_Status",
+            fact_from_pairs(&[("Transition", "t_branch"), ("Status", "branch")]),
+            &s,
+        );
+        let s = cell_push(
+            "Transition_is_triggered_by_Event_Type",
+            fact_from_pairs(&[("Transition", "t_branch"), ("Event Type", "branch")]),
+            &s,
+        );
+        // Block t_branch with an active guard.
+        let s = cell_push(
+            "Guard_prevents_Transition",
+            fact_from_pairs(&[
+                ("Guard", "branch-guard"),
+                ("Transition", "t_branch"),
+            ]),
+            &s,
+        );
+        let s = cell_push(
+            "Guard_is_active",
+            fact_from_pairs(&[("Guard", "branch-guard")]),
+            &s,
+        );
+
+        let actions = compute_actions(
+            &CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into(),
+            },
+            &s,
+        );
+        let transitions: Vec<&SystemAction> = actions
+            .iter()
+            .filter(|a| a.verb == SystemVerb::Transition)
+            .collect();
+        assert_eq!(transitions.len(), 2, "two outgoing: {transitions:?}");
+        // First entry must be enabled (advance), second blocked
+        // (branch) — even though `advance` > `branch` alphabetically.
+        assert!(
+            transitions[0].guard_status.is_enabled(),
+            "first transition must be Enabled (advance), got {:?}",
+            transitions[0]
+        );
+        assert!(
+            transitions[0].label.contains("advance"),
+            "first label must be advance, got {}",
+            transitions[0].label
+        );
+        assert!(
+            !transitions[1].guard_status.is_enabled(),
+            "second transition must be blocked (branch), got {:?}",
+            transitions[1]
+        );
+    }
+
+    #[test]
+    fn transitions_within_enabled_group_sort_alphabetically_by_event_name() {
+        // Two enabled outgoing transitions must come out in
+        // alphabetical order by event name.
+        let s = Object::phi();
+        let s = cell_push(
+            "File_has_Name",
+            fact_from_pairs(&[("File", "f1"), ("Name", "alpha.txt")]),
+            &s,
+        );
+        let s = cell_push(
+            "StateMachine_is_instance_of_State_Machine_Definition",
+            fact_from_pairs(&[
+                ("State Machine", "sm1"),
+                ("State Machine Definition", "Demo"),
+            ]),
+            &s,
+        );
+        let s = cell_push(
+            "StateMachine_has_currentlyInStatus",
+            fact_from_pairs(&[
+                ("State Machine", "sm1"),
+                ("currentlyInStatus", "draft"),
+                ("forResource", "f1"),
+            ]),
+            &s,
+        );
+        // Two outgoing transitions from draft, with intentionally
+        // out-of-order alphabetisation: the transition ids start with
+        // `t_zelda` / `t_alpha` so alphabetical-by-id would surface
+        // `t_alpha` first; we expect alphabetical-by-event-name (the
+        // user-facing label) to drive the sort instead.
+        let s = [("t_zelda", "zelda", "z_state"), ("t_alpha", "alpha", "a_state")]
+            .iter()
+            .fold(s, |acc, (tid, event, target)| {
+                let acc = cell_push(
+                    "Transition_is_defined_in_State_Machine_Definition",
+                    fact_from_pairs(&[
+                        ("Transition", tid),
+                        ("State Machine Definition", "Demo"),
+                    ]),
+                    &acc,
+                );
+                let acc = cell_push(
+                    "Transition_is_from_Status",
+                    fact_from_pairs(&[("Transition", tid), ("Status", "draft")]),
+                    &acc,
+                );
+                let acc = cell_push(
+                    "Transition_is_to_Status",
+                    fact_from_pairs(&[("Transition", tid), ("Status", target)]),
+                    &acc,
+                );
+                cell_push(
+                    "Transition_is_triggered_by_Event_Type",
+                    fact_from_pairs(&[("Transition", tid), ("Event Type", event)]),
+                    &acc,
+                )
+            });
+
+        let actions = compute_actions(
+            &CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into(),
+            },
+            &s,
+        );
+        let transitions: Vec<&SystemAction> = actions
+            .iter()
+            .filter(|a| a.verb == SystemVerb::Transition)
+            .collect();
+        assert_eq!(transitions.len(), 2);
+        assert!(
+            transitions[0].label.contains("alpha"),
+            "expected alpha first, got {}",
+            transitions[0].label
+        );
+        assert!(
+            transitions[1].label.contains("zelda"),
+            "expected zelda second, got {}",
+            transitions[1].label
+        );
+    }
+
+    #[test]
+    fn dispatch_blocked_action_returns_blocked_annotation() {
+        let action = SystemAction::with_label_and_guard(
+            SystemVerb::Transition,
+            vec![
+                ("sm".to_string(), "sm1".to_string()),
+                ("id".to_string(), "f1".to_string()),
+                ("next".to_string(), "end".to_string()),
+                ("event".to_string(), "finalise".to_string()),
+            ],
+            "[transition] finalise (\u{2192} end) \u{2014} disabled".to_string(),
+            GuardStatus::BlockedByGuard("must be approved first".to_string()),
+        );
+        let line = dispatch_action(&action);
+        assert!(line.contains("blocked"));
+        assert!(line.contains("must be approved first"));
+    }
+
+    #[test]
+    fn rich_sm_shape_overrides_legacy_next_states_path() {
+        // When both the rich (`Transition_is_defined_in_*` etc.) and
+        // the legacy (`Transition_is_to_Status` only) shapes are
+        // present, the rich shape wins — we get one action per legal
+        // outgoing transition (with event names), not the legacy
+        // generic Transition action per next-state value.
+        let s = three_state_sm();
+        let actions = compute_actions(
+            &CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into(),
+            },
+            &s,
+        );
+        let transitions: Vec<&SystemAction> = actions
+            .iter()
+            .filter(|a| a.verb == SystemVerb::Transition)
+            .collect();
+        // Each rich-shape transition carries an `event` arg; the
+        // legacy fallback would not.
+        assert!(
+            transitions.iter().all(|a| {
+                a.default_args.iter().any(|(k, _)| k == "event")
+            }),
+            "rich shape: every action carries an event arg"
+        );
+    }
+
+    #[test]
+    fn legacy_sm_shape_still_works_when_rich_cells_absent() {
+        // BBBBB's #513 fixture (synth_state in this test module) has
+        // only the reduced `Transition_is_to_Status` shape. With no
+        // rich Transition cells, the action surface falls back to the
+        // legacy generic Transition action per next-state value.
+        let state = synth_state();
+        let actions = compute_actions(
+            &CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into(),
+            },
+            &state,
+        );
+        let transitions: Vec<&SystemAction> = actions
+            .iter()
+            .filter(|a| a.verb == SystemVerb::Transition)
+            .collect();
+        assert!(
+            !transitions.is_empty(),
+            "legacy shape: still surfaces a Transition action: {actions:?}"
+        );
+        // None of the legacy actions carry an `event` arg.
+        assert!(
+            transitions.iter().all(|a| {
+                !a.default_args.iter().any(|(k, _)| k == "event")
+            }),
+            "legacy shape: no event arg"
+        );
+    }
+
+    #[test]
+    fn guard_status_helpers_round_trip() {
+        let enabled = GuardStatus::Enabled;
+        assert!(enabled.is_enabled());
+        assert_eq!(enabled.tooltip(), "");
+        let blocked = GuardStatus::BlockedByGuard("nope".to_string());
+        assert!(!blocked.is_enabled());
+        assert_eq!(blocked.tooltip(), "nope");
+    }
+
+    #[test]
+    fn canonical_text_for_transition_with_event_includes_event() {
+        let text = SystemVerb::Transition.canonical_text(&[
+            ("sm".to_string(), "sm1".to_string()),
+            ("id".to_string(), "f1".to_string()),
+            ("next".to_string(), "middle".to_string()),
+            ("event".to_string(), "advance".to_string()),
+        ]);
+        assert!(text.contains("advance"));
+        assert!(text.contains("middle"));
     }
 }

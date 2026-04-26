@@ -850,6 +850,14 @@ fn redraw(window: &UnifiedRepl, ui: &mut UnifiedReplState) {
     // dispatch the verb with `default_args` pre-bound from the cell
     // context. The Slint side keys clicks by index into the cached
     // `system_actions` vector — same stability story as nav targets.
+    //
+    // State-machine surface (#514): the action enumerator marks any
+    // guard-blocked transition with `GuardStatus::BlockedByGuard`. We
+    // push two index-aligned parallel arrays alongside the labels —
+    // `system-action-enabled` carries the enabled bool per row and
+    // `system-action-tooltips` carries the violation-text per row.
+    // The Slint side reads these to render the disabled state visually
+    // (greyed out + hover tooltip with the violation text).
     let action_labels_model: StringModel = ModelRc::new(VecModel::from_iter(
         snap.rendered
             .actions
@@ -857,6 +865,20 @@ fn redraw(window: &UnifiedRepl, ui: &mut UnifiedReplState) {
             .map(|a| SharedString::from(a.label.as_str())),
     ));
     window.set_system_actions(action_labels_model);
+    let action_enabled_model: ModelRc<bool> = ModelRc::new(VecModel::from_iter(
+        snap.rendered
+            .actions
+            .iter()
+            .map(|a| a.guard_status.is_enabled()),
+    ));
+    window.set_system_action_enabled(action_enabled_model);
+    let action_tooltips_model: StringModel = ModelRc::new(VecModel::from_iter(
+        snap.rendered
+            .actions
+            .iter()
+            .map(|a| SharedString::from(a.guard_status.tooltip())),
+    ));
+    window.set_system_action_tooltips(action_tooltips_model);
 
     // ---- "You are here" breadcrumb + back/forward (#516) ----
     // Tail of the navigation-history ring (last 5 entries) plus the
@@ -1869,6 +1891,54 @@ mod tests {
         let s = UnifiedReplState::new();
         assert!(s.system_actions.get(0).is_none());
         assert!(s.system_actions.get(usize::MAX).is_none());
+    }
+
+    // ---- State-machine action surface (#514) coverage --------------
+
+    #[test]
+    fn dispatch_blocked_transition_returns_blocked_annotation() {
+        // The Slint side suppresses click delivery for disabled rows
+        // (TouchArea.enabled = false), but defensive depth: when the
+        // dispatch path runs anyway (stale event after state swap, or
+        // a future REPL command that walks the same SystemAction
+        // vector), `dispatch_action` short-circuits and returns the
+        // blocked annotation rather than running the verb.
+        use crate::ui_apps::actions::{GuardStatus, SystemAction, SystemVerb};
+
+        let action = SystemAction::with_label_and_guard(
+            SystemVerb::Transition,
+            vec![
+                ("sm".to_string(), "OrderSM".to_string()),
+                ("id".to_string(), "o1".to_string()),
+                ("next".to_string(), "submitted".to_string()),
+                ("event".to_string(), "submit".to_string()),
+            ],
+            "[transition] submit (\u{2192} submitted) — disabled".to_string(),
+            GuardStatus::BlockedByGuard("must be approved".to_string()),
+        );
+        let line = crate::ui_apps::actions::dispatch_action(&action);
+        assert!(line.contains("blocked"), "{line}");
+        assert!(line.contains("must be approved"), "{line}");
+    }
+
+    #[test]
+    fn enabled_transition_dispatches_normally() {
+        // Enabled actions take the normal "would dispatch" path even
+        // when their verb is mutating (Transition is a mutating verb;
+        // the foundation slice annotation is the expected response).
+        use crate::ui_apps::actions::{SystemAction, SystemVerb};
+
+        let action = SystemAction::new(
+            SystemVerb::Transition,
+            vec![
+                ("sm".to_string(), "OrderSM".to_string()),
+                ("id".to_string(), "o1".to_string()),
+                ("next".to_string(), "submitted".to_string()),
+            ],
+        );
+        let line = crate::ui_apps::actions::dispatch_action(&action);
+        assert!(!line.contains("blocked"), "enabled action must not be blocked: {line}");
+        assert!(line.contains("transition"), "{line}");
     }
 
     // ---- Navigation history integration (#516) coverage ----------
