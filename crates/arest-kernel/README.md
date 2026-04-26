@@ -91,12 +91,96 @@ fastboot flash boot arest-kernel-boot.img # persistent flash
 UART-over-USB serial is wired (#392) — attach a serial console to see the
 boot banner before the framebuffer comes up.
 
-## Use the checker
+## Using the OS
 
-The unified REPL renders the current cell. Constraint violations against
-that cell are shown inline — same surface the CLI and the worker expose,
-but rendered as part of the screen rather than as JSON. Type `verify` at
-the REPL to run the full check against the current population.
+When boot completes you land on the launcher with three default apps:
+**Unified REPL**, **On-screen Keyboard**, and **HATEOAS Browser**. Tap or
+click an icon to open one. With a touchscreen the on-screen keyboard
+appears automatically when a text input gains focus — touch-mode detection
+(#466) flips the whole OS into spacious DensityScale.
+
+### The Unified REPL
+
+The REPL is the primary interaction surface. It renders the *current
+cell* — every screen IS a cell from the compiled state — with its
+surrounding cells linked HATEOAS-style. An action panel shows every legal
+next step: state-machine transitions per Theorem 5 plus SYSTEM verbs that
+apply to the current cell. A breadcrumb tracks where you've been.
+
+Two ways to issue a SYSTEM call:
+
+1. **Click an action button.** If the current cell is an `Order` in
+   status `In Cart`, the action panel surfaces a `place` button. Click
+   to fire the transition.
+2. **Type the verb at the prompt** — same `<key> <input>` shape as the
+   CLI:
+
+   ```
+   create:Order <<Order Id, ord-1>, <Customer, acme>>
+   transition:Order <ord-1, place>
+   get:Order ord-1
+   list:Order
+   query:Order_was_placed_by_Customer {"Customer": "acme"}
+   ```
+
+The result becomes a new screen. The breadcrumb extends; back navigates.
+
+### Navigating the cell graph
+
+Every link on a screen is a HATEOAS pointer to another cell. Click to
+follow it. There is no URL bar — the cell graph IS the address space.
+
+### Loading a new reading at runtime
+
+`load_reading` is a SYSTEM verb on any domain screen:
+
+```
+load_reading:my-app <reading body, or paste from a File cell>
+```
+
+The kernel parses it, runs the deontic gate, registers the new fact
+types and constraints, and persists the body to virtio-blk so it
+replays on next boot (#555 / #560). No reflash, no reboot.
+
+### Reading constraint violations
+
+A mutation that violates a constraint returns `Violation` cells in the
+response (Theorem 4 — violations are first-class facts, not exceptions).
+The REPL renders them alongside the result, so the bug has a coordinate
+on screen. Click a violation to navigate to the rule that fired.
+
+### Running the checker on the whole population
+
+```
+verify
+```
+
+Runs the full deontic + alethic check against every cell in P. Output
+is a list of `Violation` cells — click any one to drill in.
+
+### Browsing without typing
+
+The standalone **HATEOAS Browser** app is the same cell graph as the
+REPL but read-only — useful when you want to navigate without
+accidentally firing a SYSTEM verb. Same breadcrumb + back/forward.
+
+### Inspecting the kernel itself
+
+The kernel projects its own state through the synthetic filesystem. From
+the REPL:
+
+```
+get:File /proc/cpuinfo
+get:File /proc/meminfo
+get:File /proc/self/status
+get:File /proc/self/cmdline
+get:File /proc/self/maps
+list:File /proc        # walk every per-pid projection
+```
+
+Each `/proc/*` path is a synthesized File cell rendered from live system
+cells (#534 / #535) — not a stored byte-stream. Editing one is a no-op;
+the projection re-runs on every read.
 
 ## Optional features
 
