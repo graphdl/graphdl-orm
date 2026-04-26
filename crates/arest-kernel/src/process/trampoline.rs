@@ -144,24 +144,29 @@ pub struct IretqFrame {
 /// = 0 (DF=0, IOPL=0, AC=0 etc.).
 pub const USER_RFLAGS: u64 = 0x202;
 
-/// Placeholder userspace code-segment selector (RPL=3, TI=0, index
-/// will be assigned by the future #526 GDT module). The constant
-/// carries the RPL bits so the IretqFrame's invariant holds even
-/// before the real index is known. Format per the AMD64 manual:
+/// Userspace code-segment selector (RPL=3, TI=0, GDT index 3) —
+/// matches `arch::uefi::x86_64::gdt::USER_CS`. Format per the
+/// AMD64 manual:
 ///
 ///   bits  0..2 : RPL (3 = ring 3)
 ///   bit      2 : TI  (0 = GDT, 1 = LDT)
 ///   bits  3..15: descriptor index
 ///
-/// 0x1B = 0b0001_1011 — index 3, GDT, RPL 3. The "3" index is what
-/// the rust-osdev `bootloader` BIOS arm uses for its user-code
-/// descriptor (`arch::x86_64::gdt::USER_CODE_SELECTOR`); we pick the
-/// same value so a future migration doesn't churn the constant.
+/// 0x1B = 0b0001_1011 — index 3, GDT, RPL 3. The bottom three bits
+/// MUST be `0b011` (RPL=3 + TI=0) — the CPU's `iretq` checks the
+/// new CS RPL against the new CPL it would adopt; any other RPL
+/// triple-faults.
+///
+/// Kept named `PLACEHOLDER_*` for source-stability reasons across
+/// the #521/#552 boundary — many call sites + tests reference these
+/// constants. The value is the real one #552 provides; the
+/// "PLACEHOLDER" prefix is now slightly misleading but renaming
+/// would churn every test in this file.
 pub const PLACEHOLDER_USER_CS: u64 = 0x1B;
 
-/// Placeholder userspace stack-segment selector. Same format as
-/// `PLACEHOLDER_USER_CS` — index 4 (one slot after user code), GDT,
-/// RPL 3. 0x23 = 0b0010_0011.
+/// Userspace stack-segment selector — matches
+/// `arch::uefi::x86_64::gdt::USER_SS`. Index 4 (one slot after user
+/// code), GDT, RPL 3. 0x23 = 0b0010_0011.
 pub const PLACEHOLDER_USER_SS: u64 = 0x23;
 
 /// Build the iretq frame the x86_64 trampoline will consume to
@@ -200,33 +205,122 @@ pub fn setup_x86_64(
 /// to the entry point. Diverges (returns `!`) when the jump
 /// succeeds; returns `Err(...)` if the prerequisites aren't met.
 ///
-/// On x86_64: not yet implemented. The setup path produces the
-/// `IretqFrame`; the actual `iretq` shim needs the GDT/TSS
-/// scaffolding from #526 + the page-table install from #527 before
-/// the CPU can reach ring 3 without faulting. Returns
-/// `TrampolineError::NotYetImplemented`.
+/// On x86_64 (UEFI): builds the `IretqFrame` via `setup_x86_64`,
+/// then executes `iretq` to drop the CPU into ring 3 at the
+/// loaded program's entry point. Requires that
+/// `arch::uefi::install_userspace_gate()` has run (#552 — wires
+/// the GDT/TSS/SYSCALL MSRs). Without it, the `iretq` would fault
+/// because USER_CS / USER_SS would not exist in the firmware-
+/// inherited GDT.
+///
+/// On x86_64 (host targets — `cargo test --lib`): returns
+/// `TrampolineError::NotYetImplemented`. The host build has no GDT
+/// to drop into ring 3 against; the test surface for the trampoline
+/// covers the SETUP path only.
 ///
 /// On aarch64 / armv7: returns `TrampolineError::UnsupportedArch`.
 /// The EL0 transition needs the arch::aarch64 / arch::armv7 arms
 /// to grow EL1 → EL0 support (planned alongside the GICv3 driver).
 ///
-/// SAFETY-WISE: when implemented, this function is a one-way ticket
-/// — the kernel stack is unwound, all kernel locals are dropped,
-/// and the CPU is in userspace. The caller must NOT hold any
-/// resource that needs cleanup beyond what `Process::spawn` already
-/// arranges.
-#[cfg(target_arch = "x86_64")]
+/// SAFETY-WISE: when the iretq fires, this function is a one-way
+/// ticket — the kernel stack is unwound, all kernel locals are
+/// dropped, and the CPU is in userspace. The caller must NOT hold
+/// any resource that needs cleanup beyond what `Process::spawn`
+/// already arranges.
+#[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
 pub fn invoke(
-    _address_space: &AddressSpace,
-    _stack: &InitialStack,
+    address_space: &AddressSpace,
+    stack: &InitialStack,
 ) -> Result<core::convert::Infallible, TrampolineError> {
-    // Validate the inputs via the setup path so a future caller can
-    // call `invoke` directly and still get the same error surface
-    // `setup_x86_64` produces. The frame is computed but discarded
-    // here — the asm shim that consumes it lands in #526 alongside
-    // the GDT/TSS scaffolding.
-    let _frame = setup_x86_64(_address_space, _stack)?;
+    let frame = setup_x86_64(address_space, stack)?;
+    // SAFETY: `iretq_to_ring3` is a one-way control transfer to a
+    // userspace RIP. Preconditions:
+    //   * `arch::uefi::install_userspace_gate()` has run — the
+    //     GDT contains USER_CS / USER_SS descriptors and the
+    //     SYSCALL MSRs are wired so userspace `syscall` traps land
+    //     in our handler.
+    //   * `frame.rip` points at executable bytes loaded by the
+    //     ELF loader (`process::elf::load_segments`).
+    //   * `frame.rsp` points at a valid 16-byte-aligned stack page
+    //     (`process::stack::StackBuilder::finalize`).
+    // The `Process::spawn` orchestration upstream guarantees all
+    // three; per the type signature this function diverges, so the
+    // unreachable-after-iretq compiler hint matches reality.
+    unsafe {
+        iretq_to_ring3(frame);
+    }
+}
+
+/// Host-target x86_64 stub. The host build (cargo test on
+/// Windows / Linux / Darwin) has no GDT to drop into ring 3
+/// against; the test surface for `invoke` is structurally identical
+/// to the aarch64 stub — returns an error rather than diverging.
+#[cfg(all(target_arch = "x86_64", not(target_os = "uefi")))]
+pub fn invoke(
+    address_space: &AddressSpace,
+    stack: &InitialStack,
+) -> Result<core::convert::Infallible, TrampolineError> {
+    let _frame = setup_x86_64(address_space, stack)?;
     Err(TrampolineError::NotYetImplemented)
+}
+
+/// Asm helper — builds the IRETQ stack frame from the supplied
+/// `IretqFrame` and executes `iretq` to drop the CPU into ring 3.
+///
+/// Diverges. Never returns to the caller.
+///
+/// Why a separate `naked_asm!` function rather than inline asm in
+/// `invoke`: `naked_asm!` requires the function be `#[unsafe(naked)]`
+/// (no Rust prologue / epilogue), but `invoke` needs to receive
+/// the `frame` argument through the SysV calling convention.
+/// Solution: `invoke` passes the frame fields through the SysV ABI
+/// argument registers to a non-naked helper, which then issues the
+/// architectural `iretq`. We use plain inline asm (not naked) so
+/// the compiler can place the IRETQ frame on the stack via the
+/// usual register-allocator path — the function diverges (no
+/// epilogue runs), and we tell the compiler that via `options(noreturn)`.
+///
+/// SAFETY: the caller must have run `install_userspace_gate()` and
+/// the IRETQ frame fields must point at valid userspace state (see
+/// `invoke`'s safety contract).
+#[cfg(all(target_arch = "x86_64", target_os = "uefi"))]
+unsafe fn iretq_to_ring3(frame: IretqFrame) -> ! {
+    // Build the IRETQ frame on the kernel stack (the firmware-
+    // inherited stack we're currently running on) and execute
+    // `iretq`. The CPU pops 5 × 8 bytes from the stack:
+    //   pop RIP    ← frame.rip
+    //   pop CS     ← frame.cs
+    //   pop RFLAGS ← frame.rflags
+    //   pop RSP    ← frame.rsp     (NEW user stack pointer)
+    //   pop SS     ← frame.ss
+    // Then drops CPL to whatever CS.RPL specifies (= 3 for our
+    // USER_CS) and resumes at the new RIP.
+    //
+    // We need to push the values in REVERSE order (high-to-low
+    // address-wise — the CPU pops top-of-stack first, which is
+    // the last thing pushed).
+    //
+    // Push order:
+    //   1. SS
+    //   2. RSP
+    //   3. RFLAGS
+    //   4. CS
+    //   5. RIP
+    //   6. iretq
+    core::arch::asm!(
+        "push {ss}",
+        "push {rsp}",
+        "push {rflags}",
+        "push {cs}",
+        "push {rip}",
+        "iretq",
+        ss     = in(reg) frame.ss,
+        rsp    = in(reg) frame.rsp,
+        rflags = in(reg) frame.rflags,
+        cs     = in(reg) frame.cs,
+        rip    = in(reg) frame.rip,
+        options(noreturn),
+    )
 }
 
 /// aarch64 stub — see module docstring for the rationale. Same
