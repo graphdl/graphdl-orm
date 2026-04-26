@@ -39,19 +39,105 @@ brew install qemu
 ```bash
 # x86_64
 docker build -t arest-kernel-uefi -f crates/arest-kernel/Dockerfile.uefi .
-docker run --rm arest-kernel-uefi
+docker run --rm -p 8080:8080 arest-kernel-uefi
 
 # aarch64
 docker build -t arest-kernel-uefi-aarch64 -f crates/arest-kernel/Dockerfile.uefi-aarch64 .
-docker run --rm arest-kernel-uefi-aarch64
+docker run --rm -p 8080:8080 arest-kernel-uefi-aarch64
 
 # armv7
 docker build -t arest-kernel-uefi-armv7 -f crates/arest-kernel/Dockerfile.uefi-armv7 .
-docker run --rm arest-kernel-uefi-armv7
+docker run --rm -p 8080:8080 arest-kernel-uefi-armv7
 ```
 
-You should see the OVMF boot screen, then the AREST banner, then the
-launcher.
+The container streams the OVMF boot screen, then the AREST kernel
+banner, on stdout. The final line you should see is `ui: launcher
+running` — that confirms the kernel ran through ExitBootServices, set
+up the IDT / heap / virtio devices / smoltcp / HTTP listener, and
+yielded to the Slint event loop.
+
+**Headless by design.** The Dockerfile launches QEMU with
+`-display none`, so the Slint launcher / unified REPL / on-screen
+keyboard render to a virtio-gpu framebuffer no one is looking at.
+The Slint UI walkthrough in the next section describes what the
+kernel *supports*; to actually see it you need either a Dockerfile
+variant with `-display gtk` + X11 forwarding, or run QEMU natively.
+
+Two interaction surfaces work in headless mode out of the box:
+
+1. **Serial console** — boot output and any kernel `println!` lands
+   on container stdout (and on a future serial-input REPL, when wired).
+2. **HTTP API on `localhost:8080`** — the kernel registers
+   `arest_http_handler` on guest port 80; the Dockerfile forwards
+   container 8080 → guest 80 via QEMU SLiRP. Same verb surface as the
+   CLI and the worker, served by the in-kernel `arest_http_handler`
+   that combines `assets::lookup` (baked ui.do bundle) with
+   `system::dispatch` (engine ρ).
+
+## Persisting readings across container restarts
+
+The Dockerfile creates a 1 MiB raw image at `/disk.img` inside the
+container and exposes it as a virtio-blk device (`#335` storage,
+`#560` LoadReading persistence). Without a volume mount this image
+lives only in the container layer and `docker run --rm` wipes it on
+exit — readings load fine *during* a session but evaporate on next
+boot.
+
+Bind-mount a host file at `/disk.img` to keep the ring across runs:
+
+```bash
+# One-time: create the empty backing image
+dd if=/dev/zero of=arest-disk.img bs=1M count=1
+
+# Boot with the host file as the virtio-blk backing
+docker run --rm \
+    -p 8080:8080 \
+    -v "$(pwd)/arest-disk.img:/disk.img" \
+    arest-kernel-uefi
+```
+
+Windows PowerShell:
+
+```powershell
+fsutil file createnew arest-disk.img 1048576
+docker run --rm -p 8080:8080 -v "${PWD}/arest-disk.img:/disk.img" arest-kernel-uefi
+```
+
+LoadReading bodies written this session replay on every subsequent
+boot via `load_reading_persist::replay_on_boot` — provided the
+`arest-disk.img` host file is mounted at the same path each time.
+
+## Quickstart you can run today (Docker headless + curl)
+
+While the kernel is booted in one terminal, drive it from another via
+the HTTP surface:
+
+```bash
+# Schema introspection — every endpoint the engine generated from
+# the bundled readings (core / ui / os / templates per the kernel's
+# default feature set).
+curl http://localhost:8080/api/openapi.json | jq
+
+# List entities of a noun (empty on first boot)
+curl http://localhost:8080/arest/default/Organization
+
+# Create one
+curl -X POST http://localhost:8080/arest/default/Organization \
+    -H "Content-Type: application/json" \
+    -d '{"id":"acme","name":"Acme Corp"}'
+
+# Load a reading at runtime — persists to /disk.img if you mounted
+# the host file above; replays on next boot.
+curl -X POST http://localhost:8080/arest/default/load_reading \
+    -H "Content-Type: application/json" \
+    -d '{"name":"my-orders","body":"## Entity Types\nOrder(.Order Id) is an entity type.\nCustomer(.Name) is an entity type.\n## Fact Types\nOrder was placed by Customer.\n  Each Order was placed by exactly one Customer.\n"}'
+
+# Now exercise the freshly-loaded reading
+curl -X POST http://localhost:8080/arest/default/Order \
+    -H "Content-Type: application/json" \
+    -d '{"id":"ord-1","customer":"acme"}'
+curl http://localhost:8080/arest/default/Order/ord-1
+```
 
 ## Boot under QEMU (native)
 
