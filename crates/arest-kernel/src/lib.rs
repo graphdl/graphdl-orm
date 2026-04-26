@@ -1,0 +1,201 @@
+// crates/arest-kernel/src/lib.rs
+//
+// AREST UEFI kernel — library facade. Mirror of `main.rs`'s module
+// tree, minus the bin-specific `#[no_main]` + `_start` symbol the
+// firmware probes. The `[lib]` target gives `cargo test --lib -p
+// arest-kernel` a runnable surface for the inline `#[cfg(test)]`
+// modules scattered through `process/`, `syscall/`, `synthetic_fs/`,
+// `linuxkpi/`, `ui_apps/`, etc. — without it Cargo's bin-only crate
+// shape (declared via `[[bin]] test = false`) silently drops every
+// inline test on the floor.
+//
+// Why a separate file rather than `path = "src/main.rs"` for `[lib]`
+// ------------------------------------------------------------------
+// `main.rs` carries `#![no_main]` (no `fn main`) and includes the
+// per-arch `mod entry_uefi*;` declarations that bring in `#[entry]`-
+// macro–derived `_start` symbols. That's exactly what the kernel `.efi`
+// binary wants — but a Rust *library* has no entry point and `[lib]`
+// rejects `#![no_main]`. So the lib carries `#![no_std]` only, declares
+// every kernel module, and the bin (`main.rs`) keeps the entry stubs.
+// The two files share zero source — `main.rs` `use arest_kernel as _;`
+// pulls the lib's compiled module tree through, so the `_start` symbol
+// from `entry_uefi.rs` (which lives in the lib now) lands in the linked
+// `.efi` image without re-declaring every `mod` line in the bin.
+//
+// Host-target compatibility
+// -------------------------
+// The lib compiles on any `target_os` — UEFI for the actual kernel
+// build, Windows / Linux / Darwin for `cargo test --lib`. UEFI-specific
+// modules (`entry_uefi*`, `arch::uefi`, `arch::aarch64`, `arch::armv7`,
+// virtio transports, `block*`, `pci`, `repl`, `ui_apps`, the foreign-
+// toolkit adapters, `linuxkpi`, `doom*`) are gated on `target_os =
+// "uefi"` so the host build only sees the pure-logic modules
+// (`process`, `syscall`, `synthetic_fs`, `composer`, `component_binding`,
+// `toolkit_loop`, `assets`, `dma`, `fonts`, `icons`, `framebuffer`,
+// `http`, `system`, `net`).
+//
+// Tests inside UEFI-only modules don't run on the host (their parent
+// module isn't compiled). That's expected — the tests gated `#[cfg(all
+// (test, target_os = "linux"))]` in `composer.rs` /
+// `component_binding.rs` / `synthetic_fs/*.rs` / `toolkit_loop.rs` /
+// `gtk_adapter/event_loop.rs` / `qt_adapter/event_loop.rs` already
+// document that pattern: they want the host-target test runner.
+//
+// Why `extern crate alloc` rather than a `use` block
+// --------------------------------------------------
+// `#![no_std]` strips the `std` prelude, including `Box` / `Vec` /
+// `String`. The `alloc` crate is shipped in the sysroot but not auto-
+// linked — `extern crate alloc;` brings it in. Mirror of the same
+// pattern in `crates/arest/src/lib.rs` (line 23) and the bin's
+// `main.rs` line 27.
+
+#![no_std]
+// abi_x86_interrupt is needed on any x86_64 UEFI build that installs
+// an IDT with `extern "x86-interrupt" fn` handlers — see
+// arch::uefi::interrupts (#363). The bin and the lib both carry the
+// gate so the lib compiles cleanly under `cargo test --lib` on a host
+// stable toolchain (the cfg evaluates to false on non-x86_64 hosts) AND
+// under `cargo build --target x86_64-unknown-uefi` on nightly.
+#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
+
+extern crate alloc;
+
+// UEFI entry path (#344). Three separate entry files — the x86_64 arm
+// (`entry_uefi.rs`), the aarch64 arm (`entry_uefi_aarch64.rs`), and
+// the armv7 arm (`entry_uefi_armv7.rs`) — because the panic handlers
+// diverge (COM1 port I/O vs PL011 MMIO) and the pre-EBS init surface
+// is arch-specific. Each `#[entry]` macro defines the PE32+ `_start`
+// symbol the firmware picks up; the lib carries them so the symbol
+// lands in the linked `.efi` image once `main.rs` `use`s the lib.
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+pub mod entry_uefi;
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+pub mod entry_uefi_aarch64;
+#[cfg(all(target_os = "uefi", target_arch = "arm"))]
+pub mod entry_uefi_armv7;
+
+// Doom WASM host-shim (#270/#271). UEFI x86_64 + `feature = "doom"`-
+// gated; same shape as in `main.rs` pre-extract.
+#[cfg(all(target_os = "uefi", target_arch = "x86_64", feature = "doom"))]
+pub mod doom;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64", feature = "doom"))]
+pub mod doom_bin;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64", feature = "doom"))]
+pub mod doom_wad;
+
+// `arch` is shared across all UEFI entries. On x86_64 UEFI it supplies
+// the full 16550 / GDT / IDT / paging / PIT / PS-2 surface
+// post-ExitBootServices; on aarch64 / armv7 UEFI it supplies the PL011
+// MMIO console and the WFI idle loop. On host targets the module
+// supplies no-op stubs for `_print` etc. so the `crate::print!` /
+// `crate::println!` macros (declared inside `arch::mod`) compile
+// cleanly under `cargo test --lib`.
+pub mod arch;
+
+// Pure-logic modules — compile on every target (UEFI x86_64 / aarch64
+// / armv7 plus host x86_64-pc-windows-msvc / x86_64-unknown-linux-gnu).
+// Their inline `#[cfg(test)]` blocks are what `cargo test --lib`
+// actually runs.
+pub mod assets;
+pub mod dma;
+pub mod fonts;
+pub mod icons;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+pub mod ui_apps;
+pub mod framebuffer;
+pub mod composer;
+pub mod component_binding;
+pub mod toolkit_loop;
+pub mod http;
+// `pci` / `repl` reach `x86_64::instructions::port::Port` +
+// `x86_64::instructions::interrupts::disable` at module scope. The
+// `x86_64` crate gates those on `target_arch = "x86_64"` internally,
+// so the host build (which is x86_64-pc-windows-msvc) would still see
+// them — but the modules also pull in `crate::arch::memory` /
+// `crate::arch::*` UEFI surfaces that don't exist on host. Gate the
+// lib's view at the UEFI boundary so host builds elide them entirely.
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+pub mod pci;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+pub mod repl;
+pub mod system;
+
+// `process` (#518 Track TTTT). Pure ELF parser + AddressSpace +
+// initial-stack builder + privilege-transition trampoline. Available
+// unconditionally — the trampoline's actual `iretq` body has per-arch
+// `cfg(target_arch = "...")` arms; the host arm returns
+// `UnsupportedArch` so the crate compiles + the unit tests run cross-
+// platform.
+pub mod process;
+
+// `synthetic_fs` (#534 Track HHHHH). POSIX-path → AREST-cell renderer
+// table (`/proc/cpuinfo`, `/proc/meminfo` today). Pure byte arithmetic
+// — runs on host.
+pub mod synthetic_fs;
+
+// `syscall` (#507 Track GGGGG). Linux ABI syscall dispatch table.
+// SYS_WRITE (1), SYS_EXIT (60), SYS_EXIT_GROUP (231), SYS_OPENAT (257),
+// SYS_CLOSE (3) — all pure data marshalling, runs on host with mock
+// sinks.
+pub mod syscall;
+
+// `linuxkpi` (#460 Track AAAA). UEFI x86_64 + `feature = "linuxkpi"`-
+// gated. Same gate as in `main.rs`.
+#[cfg(all(target_os = "uefi", target_arch = "x86_64", feature = "linuxkpi"))]
+pub mod linuxkpi;
+
+// `qt_adapter` (#487 Track GGGG). UEFI x86_64 + `feature = "qt-adapter"`-
+// gated.
+#[cfg(all(target_os = "uefi", target_arch = "x86_64", feature = "qt-adapter"))]
+pub mod qt_adapter;
+
+// `gtk_adapter` (#488 Track IIII). UEFI x86_64 + `feature = "gtk-adapter"`-
+// gated.
+#[cfg(all(target_os = "uefi", target_arch = "x86_64", feature = "gtk-adapter"))]
+pub mod gtk_adapter;
+
+// `block` / `block_storage` / `virtio` / `virtio_gpu` reach
+// `x86_64::structures::paging::Translate` via
+// `arch::memory::with_page_table` plus the PCI transport — UEFI x86_64-
+// only. Same gate as in `main.rs` pre-extract.
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+pub mod block;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+pub mod block_storage;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+pub mod file_serve;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+pub mod file_upload;
+pub mod net;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+pub mod virtio;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+pub mod virtio_gpu;
+// virtio-mmio transport for aarch64 + armv7 UEFI (#368/#369 aarch64,
+// #388 armv7 widening). MMIO-based — different shape from the PCI
+// transport in `virtio.rs`.
+#[cfg(all(target_os = "uefi", any(target_arch = "aarch64", target_arch = "arm")))]
+pub mod virtio_mmio;
+// USB-over-USB serial gadget for Nexus debug (#392). Scaffold only —
+// aarch64 + armv7 UEFI.
+#[cfg(all(target_os = "uefi", any(target_arch = "aarch64", target_arch = "arm")))]
+pub mod usb_uart;
+
+/// HTTP handler — same shape as the bin's pre-extract version. Two-
+/// stage routing: `assets::lookup` first (baked ui.do bundle), then
+/// `system::dispatch` (ρ-applied defs over baked state). Pub so the
+/// per-arch entry harnesses (`entry_uefi*::kernel_run_*`) can register
+/// it via `net::register_http(80, arest_http_handler)`.
+pub fn arest_http_handler(req: &http::Request) -> http::Response {
+    if let Some(asset) = assets::lookup(&req.path) {
+        return http::Response::ok_cached(
+            asset.content_type,
+            asset.cache_control,
+            asset.body.to_vec(),
+        );
+    }
+    match system::dispatch(&req.method, &req.path, &req.body) {
+        Some(body) => http::Response::ok("text/plain; charset=utf-8", body),
+        None => http::Response::not_found(),
+    }
+}
