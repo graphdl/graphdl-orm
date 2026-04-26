@@ -54,6 +54,7 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use crate::arch::uefi::slint_backend::UnifiedRepl;
 use crate::system::SubscriberId;
+use crate::ui_apps::cell_renderer::{self, CurrentCell, RenderedScreen};
 
 /// Convenience alias — every Slint `[string]` property is bridged
 /// through a `ModelRc<SharedString>` backed by a `VecModel`. Same
@@ -119,6 +120,15 @@ struct UnifiedReplState {
     /// Snapshot of in-progress input at the moment the user first
     /// pressed Up. Restored when Down walks past the newest entry.
     pending_input: String,
+
+    // Cell-as-screen field (#511, EPIC #496). Tracks the cell the
+    // user is currently looking at. Every screen IS a cell — the
+    // typed-surface area on the right pane reads this to decide which
+    // Component to surface (via `cell_renderer::select_component_for`)
+    // and which data to project. Mirrors the breadcrumb model
+    // `nav_stack` already maintains, but typed: nav_stack is the
+    // breadcrumb trail; current_cell is the live target.
+    current_cell: CurrentCell,
 }
 
 impl UnifiedReplState {
@@ -130,6 +140,7 @@ impl UnifiedReplState {
             history: Vec::new(),
             history_idx: None,
             pending_input: String::new(),
+            current_cell: CurrentCell::Root,
         }
     }
 
@@ -142,12 +153,61 @@ impl UnifiedReplState {
 
     fn nav_push(&mut self, crumb: Breadcrumb) {
         self.nav_stack.push(crumb);
+        self.sync_current_cell();
     }
 
     /// Pop one step. Refuses to drop the `Root` entry.
     fn nav_pop(&mut self) {
         if self.nav_stack.len() > 1 {
             self.nav_stack.pop();
+            self.sync_current_cell();
+        }
+    }
+
+    /// Recompute `current_cell` from the top of `nav_stack`. Called
+    /// after every nav mutation so the cell-as-screen rendering layer
+    /// stays consistent with the breadcrumb trail. The two views are
+    /// equivalent (one breadcrumb top → one CurrentCell variant) but
+    /// stored separately so future #512 navigation actions can replace
+    /// the breadcrumb stack wholesale (e.g. jump-to-cell from the
+    /// command palette) without losing the current-cell invariant.
+    fn sync_current_cell(&mut self) {
+        self.current_cell = match self.current_nav() {
+            Breadcrumb::Root => CurrentCell::Root,
+            Breadcrumb::Noun { noun } => CurrentCell::Noun { noun: noun.clone() },
+            Breadcrumb::Instance { noun, instance } => CurrentCell::Instance {
+                noun: noun.clone(),
+                instance: instance.clone(),
+            },
+        };
+    }
+
+    /// Set the current cell directly without going through breadcrumb
+    /// navigation. Used when REPL input resolves to a specific cell
+    /// (e.g. `cell Foo_has_Bar` would jump to a FactCell). The
+    /// breadcrumb trail is also updated to keep the left-pane visual
+    /// in sync; FactCell / ComponentInstance variants don't have a
+    /// breadcrumb mapping and just leave the trail as-is.
+    fn set_current_cell(&mut self, cell: CurrentCell) {
+        self.current_cell = cell.clone();
+        match cell {
+            CurrentCell::Root => {
+                self.nav_stack.truncate(1);
+            }
+            CurrentCell::Noun { noun } => {
+                self.nav_stack.truncate(1);
+                self.nav_stack.push(Breadcrumb::Noun { noun });
+            }
+            CurrentCell::Instance { noun, instance } => {
+                self.nav_stack.truncate(1);
+                self.nav_stack.push(Breadcrumb::Noun { noun: noun.clone() });
+                self.nav_stack.push(Breadcrumb::Instance { noun, instance });
+            }
+            // FactCell + ComponentInstance: keep nav_stack as-is —
+            // the breadcrumb model can't represent them today, but
+            // current_cell carries the truth for the typed surface.
+            // #512 will extend the breadcrumb to cover these.
+            CurrentCell::FactCell { .. } | CurrentCell::ComponentInstance { .. } => {}
         }
     }
 
@@ -215,15 +275,34 @@ impl UnifiedReplState {
 
     /// Submit a line: render it into scrollback, evaluate, render the
     /// response, push to history, reset history browsing.
+    ///
+    /// Cell-as-screen extension (#511): if the line is a recognised
+    /// cell-navigation command (`cell <name>`, `noun <name>`,
+    /// `instance <noun> <id>`, `home`), the current cell is advanced
+    /// and a one-line "Now showing: …" annotation is pushed in lieu
+    /// of (or alongside) the underlying REPL response. The typed-
+    /// surface area on the right pane reads `current_cell` on the
+    /// next redraw and re-selects its Component.
+    ///
+    /// Lines that do NOT match a navigation prefix flow through to
+    /// the existing `crate::repl::evaluate_line` dispatcher unchanged
+    /// — backward-compatible with every command the prior repl
+    /// surface understood (`help`, `heap`, `quit`, …).
     fn submit(&mut self, prompt: &str, line: String) {
         self.push_line(format!("{prompt}{line}"));
 
-        let response = crate::repl::evaluate_line(&line);
-        if !response.is_empty() {
-            self.push_response(&response);
+        let trimmed = line.trim();
+        if let Some(cell) = parse_cell_nav(trimmed) {
+            let label = cell.label();
+            self.set_current_cell(cell);
+            self.push_line(format!("Now showing: {label}"));
+        } else {
+            let response = crate::repl::evaluate_line(&line);
+            if !response.is_empty() {
+                self.push_response(&response);
+            }
         }
 
-        let trimmed = line.trim();
         if !trimmed.is_empty() {
             let is_dup = self.history.last().map(|s| s == trimmed).unwrap_or(false);
             if !is_dup {
@@ -233,6 +312,67 @@ impl UnifiedReplState {
 
         self.history_idx = None;
         self.pending_input.clear();
+    }
+}
+
+/// Parse a REPL line as a cell-as-screen navigation command. Returns
+/// `Some(CurrentCell)` if the line is a recognised navigation form;
+/// `None` otherwise (the caller falls through to the legacy REPL
+/// dispatcher).
+///
+/// Recognised forms (case-insensitive on the verb, case-preserving
+/// on the args):
+///   * `home`                          — CurrentCell::Root
+///   * `noun <Noun>`                   — CurrentCell::Noun
+///   * `instance <Noun> <Id>`          — CurrentCell::Instance
+///   * `cell <CellName>`               — CurrentCell::FactCell
+///   * `component <ComponentId>`       — CurrentCell::ComponentInstance
+///
+/// #515's command palette will reuse this parser as one of its
+/// primary actions; keeping the surface here rather than inside
+/// `crate::repl::dispatch` lets navigation work on cells that REPL's
+/// dispatcher knows nothing about.
+fn parse_cell_nav(line: &str) -> Option<CurrentCell> {
+    let mut parts = line.split_whitespace();
+    let verb = parts.next()?.to_ascii_lowercase();
+    match verb.as_str() {
+        "home" => {
+            if parts.next().is_none() {
+                Some(CurrentCell::Root)
+            } else {
+                None
+            }
+        }
+        "noun" => {
+            let noun = parts.next()?.to_string();
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(CurrentCell::Noun { noun })
+        }
+        "instance" => {
+            let noun = parts.next()?.to_string();
+            let instance = parts.next()?.to_string();
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(CurrentCell::Instance { noun, instance })
+        }
+        "cell" => {
+            let name = parts.next()?.to_string();
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(CurrentCell::FactCell { cell_name: name })
+        }
+        "component" => {
+            let id = parts.next()?.to_string();
+            if parts.next().is_some() {
+                return None;
+            }
+            Some(CurrentCell::ComponentInstance { component_id: id })
+        }
+        _ => None,
     }
 }
 
@@ -381,9 +521,9 @@ fn detail_lines_for(noun: &str, instance: &str, state: &Object) -> Vec<String> {
 
 // ── Redraw: project state into all Slint properties ────────────────
 
-/// One redraw's worth of derived data (HATEOAS side). Computed inside
-/// the `with_state` closure so the read lock is released the moment
-/// `Snapshot::collect` returns.
+/// One redraw's worth of derived data (HATEOAS side + cell-as-screen).
+/// Computed inside the `with_state` closure so the read lock is
+/// released the moment `Snapshot::collect` returns.
 struct Snapshot {
     resources: Vec<String>,
     selected_resource_index: i32,
@@ -394,6 +534,10 @@ struct Snapshot {
     /// Status fragment for HATEOAS half (combined with REPL fragment
     /// in `redraw`).
     hateoas_status: String,
+    /// Cell-as-screen render (#511): the typed-surface header + the
+    /// projected field list for the current cell. The Slint side reads
+    /// every field of this for the right-pane typed surface.
+    rendered: RenderedScreen,
 }
 
 impl Snapshot {
@@ -408,6 +552,13 @@ impl Snapshot {
             ],
             breadcrumbs: vec!["Resources".to_string()],
             hateoas_status: "system::init() not yet called".to_string(),
+            rendered: RenderedScreen {
+                cell_label: "Resources".to_string(),
+                selected: None,
+                fields: vec![
+                    "(SYSTEM not initialised — call system::init() first)".to_string(),
+                ],
+            },
         }
     }
 
@@ -463,6 +614,8 @@ impl Snapshot {
             Breadcrumb::Instance { noun, instance } => format!("{noun}/{instance}"),
         };
 
+        let rendered = cell_renderer::render_current_cell(&ui.current_cell, state);
+
         Self {
             resources,
             selected_resource_index,
@@ -471,6 +624,7 @@ impl Snapshot {
             detail_lines,
             breadcrumbs,
             hateoas_status,
+            rendered,
         }
     }
 }
@@ -512,6 +666,25 @@ fn redraw(window: &UnifiedRepl, ui: &UnifiedReplState) {
         ui.scrollback.iter().map(SharedString::from),
     ));
     window.set_scrollback(scrollback_model);
+
+    // ---- Cell-as-screen typed surface (#511) ----
+    // Header: cell label + selected Component triple. The Slint side
+    // renders these in a labelled card above the field list. When no
+    // Component matched, `selected_*` properties are empty strings —
+    // the Slint side branches on emptiness to switch to the generic
+    // key-value fallback rendering.
+    window.set_current_cell_name(SharedString::from(snap.rendered.cell_label.as_str()));
+    let (sel_component, sel_toolkit, sel_symbol) = match &snap.rendered.selected {
+        Some(s) => (s.component.clone(), s.toolkit.clone(), s.symbol.clone()),
+        None => (String::new(), String::new(), String::new()),
+    };
+    window.set_current_cell_component(SharedString::from(sel_component));
+    window.set_current_cell_toolkit(SharedString::from(sel_toolkit));
+    window.set_current_cell_symbol(SharedString::from(sel_symbol));
+    let fields_model: StringModel = ModelRc::new(VecModel::from_iter(
+        snap.rendered.fields.iter().map(SharedString::from),
+    ));
+    window.set_current_cell_fields(fields_model);
 
     // ---- Combined status footer ----
     let combined_status = format!(
@@ -574,6 +747,14 @@ impl UnifiedReplApp {
     /// Read-only access to the current navigation depth (1 = Root only).
     pub fn nav_depth(&self) -> usize {
         self.state.borrow().nav_stack.len()
+    }
+
+    /// Read-only access to the current cell's display label. Useful
+    /// for tests and future host-side instrumentation that wants to
+    /// observe what screen the user is on without inspecting the
+    /// breadcrumb stack directly.
+    pub fn current_cell_label(&self) -> String {
+        self.state.borrow().current_cell.label()
     }
 }
 
@@ -1020,5 +1201,178 @@ mod tests {
         assert_eq!(app.scrollback_len(), 1);
         assert_eq!(app.history_len(), 0);
         assert_eq!(app.nav_depth(), 1);
+        // Cell-as-screen invariant (#511): on construction the
+        // current cell is Root.
+        assert_eq!(app.current_cell_label(), "Resources");
+    }
+
+    // ---- Cell-as-screen pane (#511) coverage ----------------------
+
+    #[test]
+    fn new_state_seeds_root_as_current_cell() {
+        let s = UnifiedReplState::new();
+        assert_eq!(s.current_cell, CurrentCell::Root);
+    }
+
+    #[test]
+    fn nav_push_noun_syncs_current_cell_to_noun() {
+        let mut s = UnifiedReplState::new();
+        s.nav_push(Breadcrumb::Noun { noun: "File".into() });
+        assert_eq!(s.current_cell, CurrentCell::Noun { noun: "File".into() });
+    }
+
+    #[test]
+    fn nav_push_instance_syncs_current_cell_to_instance() {
+        let mut s = UnifiedReplState::new();
+        s.nav_push(Breadcrumb::Noun { noun: "File".into() });
+        s.nav_push(Breadcrumb::Instance {
+            noun: "File".into(),
+            instance: "f1".into(),
+        });
+        assert_eq!(
+            s.current_cell,
+            CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn nav_pop_resyncs_current_cell_to_remaining_top() {
+        let mut s = UnifiedReplState::new();
+        s.nav_push(Breadcrumb::Noun { noun: "File".into() });
+        s.nav_push(Breadcrumb::Instance {
+            noun: "File".into(),
+            instance: "f1".into(),
+        });
+        s.nav_pop(); // back to Noun
+        assert_eq!(s.current_cell, CurrentCell::Noun { noun: "File".into() });
+        s.nav_pop(); // back to Root
+        assert_eq!(s.current_cell, CurrentCell::Root);
+        s.nav_pop(); // refuses past Root → no change
+        assert_eq!(s.current_cell, CurrentCell::Root);
+    }
+
+    #[test]
+    fn set_current_cell_factcell_keeps_breadcrumb_unchanged() {
+        // FactCell + ComponentInstance variants don't have a
+        // breadcrumb mapping; current_cell carries the truth and the
+        // nav stack stays where it was.
+        let mut s = UnifiedReplState::new();
+        s.nav_push(Breadcrumb::Noun { noun: "File".into() });
+        let before_depth = s.nav_stack.len();
+        s.set_current_cell(CurrentCell::FactCell {
+            cell_name: "Component_has_Property".into(),
+        });
+        assert_eq!(s.nav_stack.len(), before_depth);
+        assert_eq!(
+            s.current_cell,
+            CurrentCell::FactCell { cell_name: "Component_has_Property".into() }
+        );
+    }
+
+    #[test]
+    fn set_current_cell_instance_rebuilds_breadcrumb_trail() {
+        // Direct jump to an Instance must rebuild the breadcrumb so
+        // the left pane's trail is consistent.
+        let mut s = UnifiedReplState::new();
+        s.set_current_cell(CurrentCell::Instance {
+            noun: "File".into(),
+            instance: "f1".into(),
+        });
+        assert_eq!(s.nav_stack.len(), 3); // Root, Noun, Instance
+        assert!(matches!(s.nav_stack[1], Breadcrumb::Noun { .. }));
+        assert!(matches!(s.nav_stack[2], Breadcrumb::Instance { .. }));
+    }
+
+    // ---- parse_cell_nav ----------------------------------------
+
+    #[test]
+    fn parse_cell_nav_recognises_home() {
+        assert_eq!(parse_cell_nav("home"), Some(CurrentCell::Root));
+        assert_eq!(parse_cell_nav("HOME"), Some(CurrentCell::Root));
+        assert_eq!(parse_cell_nav("home extra"), None);
+    }
+
+    #[test]
+    fn parse_cell_nav_recognises_noun() {
+        assert_eq!(
+            parse_cell_nav("noun File"),
+            Some(CurrentCell::Noun { noun: "File".into() })
+        );
+        assert_eq!(parse_cell_nav("noun"), None);
+        assert_eq!(parse_cell_nav("noun File extra"), None);
+    }
+
+    #[test]
+    fn parse_cell_nav_recognises_instance() {
+        assert_eq!(
+            parse_cell_nav("instance File f1"),
+            Some(CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into()
+            })
+        );
+        assert_eq!(parse_cell_nav("instance File"), None);
+    }
+
+    #[test]
+    fn parse_cell_nav_recognises_cell() {
+        assert_eq!(
+            parse_cell_nav("cell Component_has_Property"),
+            Some(CurrentCell::FactCell {
+                cell_name: "Component_has_Property".into()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cell_nav_recognises_component() {
+        assert_eq!(
+            parse_cell_nav("component button.qt6"),
+            Some(CurrentCell::ComponentInstance {
+                component_id: "button.qt6".into()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cell_nav_unknown_verb_returns_none() {
+        assert_eq!(parse_cell_nav("help"), None);
+        assert_eq!(parse_cell_nav(""), None);
+        assert_eq!(parse_cell_nav("zzfrobnicate File"), None);
+    }
+
+    #[test]
+    fn submit_cell_nav_advances_current_cell_and_skips_repl() {
+        let mut s = UnifiedReplState::new();
+        s.scrollback.clear();
+        s.submit("> ", "noun File".to_string());
+        assert_eq!(s.current_cell, CurrentCell::Noun { noun: "File".into() });
+        // Annotation pushed; legacy repl::evaluate_line not invoked
+        // because the line matched a navigation form.
+        let blob = s.scrollback.join("\n");
+        assert!(blob.contains("Now showing: File"), "missing nav annotation: {blob}");
+        assert!(!blob.contains("unknown command"), "fell through to repl: {blob}");
+    }
+
+    #[test]
+    fn submit_non_nav_line_falls_through_to_repl() {
+        let mut s = UnifiedReplState::new();
+        s.scrollback.clear();
+        s.submit("> ", "help".to_string());
+        // Current cell unchanged.
+        assert_eq!(s.current_cell, CurrentCell::Root);
+        // help response present.
+        let blob = s.scrollback.join("\n");
+        assert!(blob.contains("help"), "help response missing: {blob}");
+    }
+
+    #[test]
+    fn submit_cell_nav_still_updates_history() {
+        let mut s = UnifiedReplState::new();
+        s.submit("> ", "noun File".to_string());
+        assert_eq!(s.history, vec!["noun File".to_string()]);
     }
 }
