@@ -127,6 +127,17 @@ pub mod declared_writes;
 // `command.rs`; the core sits here so it compiles into the kernel
 // image.
 pub mod select_component_core;
+// Randomness foundation (#567 + #568) — `entropy` exposes the
+// `EntropySource` trait + global slot every target installs into;
+// `csprng` is a hand-rolled ChaCha20 stream cipher seeded from that
+// slot. Both unconditional (no_std-clean per #565 audit) so the kernel
+// can pull `csprng::random_bytes` for AT_RANDOM (#575), the syscall
+// surface can wire it to `getrandom` (#577), and Workers / WASM share
+// the same primitive once their adapter (#572 / #574) installs an
+// `EntropySource`. Per-target adapters land in #569-#574; per-consumer
+// wires land in #575-#578.
+pub mod entropy;
+pub mod csprng;
 #[cfg(not(feature = "no_std"))]
 pub mod check;
 // Storage-1: pluggable StorageBackend trait + in-mem/local-fs impls.

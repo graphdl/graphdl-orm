@@ -82,6 +82,18 @@ mod ring;
 // resolves under the bin's crate root the same way it does in lib.rs.
 mod select_component_core;
 #[allow(dead_code)]
+// Randomness foundation (#567 + #568). The bin re-declares both
+// modules so the same source files compile into the std bin target.
+// `entropy` is the trait + global EntropySource slot; `csprng` is the
+// ChaCha20 generator seeded from that slot. The CLI doesn't itself
+// install an entropy source today (that's a per-target adapter job,
+// #569-#574); declaring the modules here keeps the bin's symbol
+// table in sync with the lib so future CLI consumers can call
+// `csprng::random_bytes` directly without an `arest::` import.
+mod entropy;
+#[allow(dead_code)]
+mod csprng;
+#[allow(dead_code)]
 mod freeze;
 #[allow(dead_code)]
 mod declared_writes;
