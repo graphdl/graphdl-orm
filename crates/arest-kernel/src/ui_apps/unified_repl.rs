@@ -453,6 +453,24 @@ impl UnifiedReplState {
             for line in lines {
                 self.push_line(line);
             }
+        } else if let Some(query) = parse_palette_query(trimmed) {
+            // #515: command palette. Fuzzy-search the catalogue of
+            // (cells × actions × navigation) reachable from the
+            // current cell, dump ranked hits to scrollback. Empty
+            // query (just `palette` with no args) returns the full
+            // catalogue capped at DEFAULT_LIMIT.
+            let lines = crate::system::with_state(|state| {
+                crate::ui_apps::palette::render_for_query(
+                    &query,
+                    &self.current_cell,
+                    state,
+                    crate::ui_apps::palette::DEFAULT_LIMIT,
+                )
+            })
+            .unwrap_or_else(|| vec!["State unavailable — kernel not yet initialised.".to_string()]);
+            for line in lines {
+                self.push_line(line);
+            }
         } else if let Some(cell) = parse_cell_nav(trimmed) {
             let label = cell.label();
             self.set_current_cell(cell);
@@ -535,6 +553,23 @@ fn parse_cell_nav(line: &str) -> Option<CurrentCell> {
         }
         _ => None,
     }
+}
+
+/// Parse a REPL line as a command-palette query (#515). Returns
+/// `Some(query)` when the line starts with `palette` or `pal`
+/// (case-insensitive on the verb, case-preserving on the query).
+/// The query is the remainder of the line trimmed of leading and
+/// trailing whitespace; bare `palette` with no args returns
+/// `Some("")` so the catalogue dumps in default order capped at
+/// `palette::DEFAULT_LIMIT`.
+fn parse_palette_query(line: &str) -> Option<String> {
+    let mut parts = line.splitn(2, char::is_whitespace);
+    let verb = parts.next()?.to_ascii_lowercase();
+    if verb != "palette" && verb != "pal" {
+        return None;
+    }
+    let query = parts.next().unwrap_or("").trim().to_string();
+    Some(query)
 }
 
 /// Drop the change-subscription registered by `build_app` so the
