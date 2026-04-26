@@ -8,9 +8,12 @@
 // then invokes `crate::cli::wine_bootstrap::bootstrap_prefix` to
 // apply winetricks recipes / DLL overrides / registry keys; then
 // invokes `crate::cli::wine_install::install_app` to fetch the
-// installer binary and run it under wine. Returns exit code 0 if
-// every fact-driven mutation succeeded; 3 if a winetricks recipe
-// failed; 4 if the installer install transitioned to `Failed`.
+// installer binary and run it under wine; then invokes
+// `crate::cli::wine_launch::launch_app` to spawn the installed app
+// and surface its run status. Returns exit code 0 if every
+// fact-driven mutation succeeded; 3 if a winetricks recipe failed;
+// 4 if the installer install transitioned to `Failed`; 5 if the
+// launch transitioned to `Crashed`.
 // On miss: prints a "did you mean…?" suggestion based on Levenshtein
 // distance over the slug + display-title set, returns exit code 1.
 // On missing argument: prints usage, returns exit code 2.
@@ -31,6 +34,7 @@
 use crate::ast;
 use crate::cli::wine_bootstrap;
 use crate::cli::wine_install;
+use crate::cli::wine_launch;
 use crate::command;
 
 /// Top-level entry point used by `main.rs`. Takes the residual argv
@@ -44,13 +48,15 @@ use crate::command;
 /// child process.
 ///
 /// Exit codes:
-///   * 0 — resolved + bootstrap + install succeeded (or no facts to
-///         apply / install staged for next run).
+///   * 0 — resolved + bootstrap + install + launch all succeeded
+///         (or no facts to apply / staged for next run).
 ///   * 1 — name not found in the readings.
 ///   * 2 — usage error (no app name supplied).
 ///   * 3 — bootstrap surfaced one or more recipe failures.
 ///   * 4 — install transitioned to `Failed` (fetch error or
 ///         non-zero installer exit code).
+///   * 5 — launch transitioned to `Crashed` (wine spawn failed,
+///         or the app exited non-zero within the settle window).
 pub fn dispatch<O: std::io::Write, E: std::io::Write>(
     args: &[String],
     readings: &[(&str, &str)],
@@ -140,7 +146,29 @@ pub fn dispatch_with_prefix_root<O: std::io::Write, E: std::io::Write>(
                 }
             };
             let _ = write!(out, "{}", wine_install::format_report(&install, &slug));
-            if install.status == wine_install::InstallStatus::Failed { 4 } else { 0 }
+            if install.status == wine_install::InstallStatus::Failed {
+                return 4;
+            }
+
+            // #506: launch the installed app + monitor its lifecycle.
+            // Resolves the Main Exe Path from the FORML facts, spawns
+            // wine on it under `WINEPREFIX=<prefix>` with
+            // `WINEDEBUG=-all`, samples the monitor after a 500ms
+            // settle delay, and walks the outcome through the
+            // `Wine_App_run_status` SM cell. Crashed → exit 5; any
+            // other terminal state (Running / Exited / Paused — the
+            // last unreachable from `arest run`) is treated as
+            // success because the prefix + install are intact and
+            // the launch is observably resolved.
+            let launch = match wine_launch::launch_app(&state, &slug, &prefix_path, None) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = writeln!(err, "Launch failed: {}", e);
+                    return 5;
+                }
+            };
+            let _ = write!(out, "{}", wine_launch::format_report(&launch, &slug));
+            if launch.status == wine_launch::RunStatus::Crashed { 5 } else { 0 }
         }
         None => {
             let suggestions = near_name_suggestions(&state, name, 3);
@@ -688,6 +716,32 @@ mod tests {
         let out_text = String::from_utf8(out).unwrap();
         assert!(out_text.contains("Installing Wine app 'notepad-plus-plus'"),
                 "expected install report header; got: {}", out_text);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #506 wiring: dispatch must print the launch-report block
+    /// after the install-report block. Confirms `wine_launch::format_report`
+    /// is reached for an app that has Main Exe Path declared in
+    /// the bundled wine.md.
+    #[cfg(feature = "compat-readings")]
+    #[test]
+    fn dispatch_prints_launch_report_for_notepad_plus_plus() {
+        let readings: Vec<(&str, &str)> = crate::metamodel_readings()
+            .into_iter()
+            .map(|(n, t)| (*n, *t))
+            .collect();
+        let root = test_prefix_root("dispatch-launch-report-npp");
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let _code = dispatch_with_prefix_root(
+            &["notepad-plus-plus".to_string()], &readings, &root, &mut out, &mut err,
+        );
+        let out_text = String::from_utf8(out).unwrap();
+        assert!(out_text.contains("Launching Wine app 'notepad-plus-plus'"),
+                "expected launch report header; got: {}", out_text);
+        // Main exe should be surfaced as part of the report.
+        assert!(out_text.contains("main exe:"),
+                "expected main exe line in launch report; got: {}", out_text);
         let _ = std::fs::remove_dir_all(&root);
     }
 

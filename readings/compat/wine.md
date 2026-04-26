@@ -196,6 +196,32 @@ Install Status is a value type.
        (#212) so the runtime layer can re-derive the current state
        from the fact stream rather than maintain a side index. -->
 
+Main Exe Path is a value type.
+  <!-- Prefix-relative POSIX-style path to the Wine App's main
+       executable, e.g. `drive_c/Program Files/Notepad++/notepad++.exe`.
+       Joined to the per-app prefix Directory by the launcher (#506,
+       `cli::wine_launch`) to produce the absolute path passed to
+       wine. Decoupled from Installer Filename because the installer
+       binary and the installed exe almost never share a name; the
+       launcher needs the post-install path, not the setup binary. -->
+
+Run Status is a value type.
+  The possible values of Run Status are
+    'Running', 'Paused', 'Exited', 'Crashed'.
+  <!-- State-machine state for the per-app runtime lifecycle (#506,
+       #212). Transitions: nothing → Running (wine subprocess
+       spawned and survived the ~500ms settle window) → Paused
+       (suspended via SIGSTOP / debugger break — produced by the
+       future `arest watch` flow, not by `arest run`) → Exited
+       (clean exit with status 0) | Crashed (non-zero exit, signal
+       termination, or spawn failure). Materialised as a sequence
+       of facts in the `Wine_App_run_status` cell — one fact per
+       transition, the final state being the last fact. Mirrors
+       the Install Status pattern above and the Process SM pattern
+       (#212). The runtime layer reads the latest fact for the app
+       to decide whether `arest run` should short-circuit (already
+       running) or proceed (Crashed/Exited/no-history). -->
+
 ## Fact Types
 
 ### Wine App
@@ -386,6 +412,28 @@ Wine App has Install Status.
        both facts in place, with Installed dominating because it is
        most recent. The runtime layer (#506) reads the last fact to
        decide whether to launch. -->
+
+### App launch + monitor (#506)
+
+Wine App has Main Exe Path.
+  Each Wine App has at most one Main Exe Path.
+  <!-- Prefix-relative path to the installed app's main executable.
+       The launcher (`cli::wine_launch`) joins this to the per-app
+       prefix Directory and passes the absolute path to wine.
+       Free multiplicity-of-1 so apps without a declared exe path
+       transition to a no-op `Exited` state with a clean diagnostic
+       rather than failing the whole `arest run` chain. -->
+
+Wine App has Run Status.
+  <!-- State-machine fact stream for the per-app runtime lifecycle
+       (#506 / #212). Each launch transition pushes one fact onto
+       the `Wine_App_run_status` cell; the final state is the last
+       fact in the cell. Free multiplicity so the full lifecycle
+       history is materialised: Running → (hours later) Crashed →
+       (next launch) Running again leaves three facts, the latest
+       Running dominating. `arest run` reads the latest to decide
+       whether to short-circuit (already Running) or relaunch
+       (Crashed / Exited / no-history). -->
 
 ## Constraints
 
@@ -1001,3 +1049,45 @@ Wine App 'steam-windows' has Installer Filename 'SteamSetup.exe'.
 
 Wine App '7-zip' has Installer URL 'https://www.7-zip.org/a/7z2407-x64.exe'.
 Wine App '7-zip' has Installer Filename '7z2407-x64.exe'.
+
+### Main Exe Path instance facts (#506)
+
+<!-- Prefix-relative paths to each Wine App's main executable post-
+     install. The launcher (`cli::wine_launch`) joins these to the
+     per-app prefix Directory to get the absolute path that gets
+     passed to wine. Each path is the file the app's installer
+     produces under the emulated `C:\` root — i.e. the same path
+     a Windows user would see in `Start Menu → All Programs →
+     <app>`, mapped through Wine's `drive_c/` to-Windows root
+     translation. Quoting matches the rest of this file: literal
+     spaces inside the path are preserved (`Program Files` is
+     two words, no underscore).
+
+     Verified per-app against the upstream installer's default
+     install location at the version pinned in the Installer URL
+     above. Where the installer offers an arch choice
+     (`Program Files` vs `Program Files (x86)`) the path matches
+     the app's declared `Prefix Architecture` — win32 prefixes
+     route through `Program Files`, win64 prefixes route through
+     `Program Files` for native-64 binaries and
+     `Program Files (x86)` for legacy-32 binaries. -->
+
+Wine App 'notepad-plus-plus' has Main Exe Path 'drive_c/Program Files/Notepad++/notepad++.exe'.
+
+Wine App 'office-2016-word' has Main Exe Path 'drive_c/Program Files/Microsoft Office/root/Office16/WINWORD.EXE'.
+
+Wine App 'photoshop-cs6' has Main Exe Path 'drive_c/Program Files/Adobe/Adobe Photoshop CS6 (64 Bit)/Photoshop.exe'.
+
+Wine App 'autohotkey-v1' has Main Exe Path 'drive_c/Program Files/AutoHotkey/AutoHotkey.exe'.
+
+Wine App 'notion-desktop' has Main Exe Path 'drive_c/users/wineuser/AppData/Local/Programs/Notion/Notion.exe'.
+
+Wine App 'total-commander' has Main Exe Path 'drive_c/totalcmd/TOTALCMD64.EXE'.
+
+Wine App 'vscode' has Main Exe Path 'drive_c/Program Files/Microsoft VS Code/Code.exe'.
+
+Wine App 'spotify' has Main Exe Path 'drive_c/users/wineuser/AppData/Roaming/Spotify/Spotify.exe'.
+
+Wine App 'steam-windows' has Main Exe Path 'drive_c/Program Files (x86)/Steam/steam.exe'.
+
+Wine App '7-zip' has Main Exe Path 'drive_c/Program Files/7-Zip/7zFM.exe'.

@@ -37,6 +37,21 @@
 //   * `installer_run` (#505) — subprocess wrapper for `wine
 //             <installer>`; captures stdout + stderr to
 //             `<prefix>/drive_c/_install_log` for debugging.
+//   * `wine_launch` (#506) — main app launch + monitor. Resolves the
+//             Main Exe Path from FORML facts, spawns wine on it under
+//             `WINEPREFIX=<prefix>` with `WINEDEBUG=-all`, samples
+//             the monitor after a short settle delay, and walks the
+//             outcome through the `Wine_App_run_status` SM cell
+//             (Running → Paused | Exited | Crashed). Captures
+//             stdout+stderr to `<prefix>/drive_c/_run_log`.
+//             Idempotent: refuses to relaunch when the cell's
+//             most-recent transition for the app is `Running`.
+//   * `process_monitor` (#506) — non-blocking `Child::try_wait`
+//             wrapper translating into a `MonitorOutcome` enum
+//             (`StillRunning`, `Exited(i32)`, `Crashed { exit_code }`,
+//             `Errored`). Used by `wine_launch` for the post-spawn
+//             settle poll and by the future `arest watch` flow for
+//             ongoing observation.
 //
 // Future verbs (`arest install`, `arest exec`, …) plug in here so
 // main.rs doesn't grow another giant `match` arm per subcommand.
@@ -55,3 +70,7 @@ pub mod wine_install;
 pub mod installer_fetch;
 #[cfg(not(feature = "no_std"))]
 pub mod installer_run;
+#[cfg(not(feature = "no_std"))]
+pub mod process_monitor;
+#[cfg(not(feature = "no_std"))]
+pub mod wine_launch;
