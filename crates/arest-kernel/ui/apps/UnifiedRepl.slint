@@ -94,6 +94,38 @@ export component UnifiedRepl inherits Window {
     // walk) updates this from Rust; user keystrokes update from Slint.
     in-out property <string> current-input;
 
+    // ---- Cell-as-screen typed surface (#511, EPIC #496) -------------
+    //
+    // Every screen IS a cell. The Rust glue tracks one
+    // `CurrentCell` (Root / Noun / Instance / FactCell /
+    // ComponentInstance) and runs it through the Component selection
+    // rules (#492 via the kernel-internal `cell_renderer`). What
+    // lands here on every redraw:
+    //
+    //   * `current-cell-name`      — display label for the cell
+    //     (e.g. "Resources", "File/f1", "Component_has_Property").
+    //   * `current-cell-component` — selected Component role
+    //     (e.g. "list", "card"). Empty string when no Component matched.
+    //   * `current-cell-toolkit`   — selected toolkit slug
+    //     (e.g. "slint"). Empty when no Component matched.
+    //   * `current-cell-symbol`    — toolkit-side symbol
+    //     (e.g. "List", "Card"). Empty when no Component matched.
+    //   * `current-cell-fields`    — projected cell data, one line
+    //     per field. Always populated (transparency: even when a
+    //     specialised Component is shown, the user sees the data
+    //     driving it).
+    //
+    // The Slint side renders these as a labelled card on top of the
+    // scrollback in the right pane. The card is the typed surface;
+    // future commits (#512+ navigation actions, #515 command palette)
+    // attach interactivity to its rows. This commit lands the
+    // dispatch + render path; no row-level click handling yet.
+    in property <string> current-cell-name: "Resources";
+    in property <string> current-cell-component;
+    in property <string> current-cell-toolkit;
+    in property <string> current-cell-symbol;
+    in property <[string]> current-cell-fields;
+
     // ---- Combined status text --------------------------------------
 
     // Footer status text — Rust glue renders a combined summary.
@@ -299,15 +331,78 @@ export component UnifiedRepl inherits Window {
                     }
                 }
 
-                // ===== RIGHT PANE: REPL prompt + scrollback =========
+                // ===== RIGHT PANE: typed surface + REPL =============
+                // Cell-as-screen rendering (#511, EPIC #496): the
+                // top portion is the typed surface for the current
+                // cell (rendered through the Component selected via
+                // the #492 selection rules); the middle is the REPL
+                // scrollback; the bottom is the prompt input. The
+                // typed surface IS the cell's projection through
+                // its Component — it's what makes "every screen IS
+                // a cell" visible to the user.
                 Rectangle {
                     horizontal-stretch: 1;
 
                     VerticalLayout {
                         spacing: Theme.spacing-md;
 
+                        // ---- Typed surface (cell-as-screen) -------
+                        Rectangle {
+                            min-height: 200px;
+                            vertical-stretch: 1;
+                            Card {
+                                // Header: cell label, with the
+                                // selected Component triple appended
+                                // when a Component matched. When the
+                                // selection missed (component string
+                                // empty) the header just shows the
+                                // cell label — the field list below
+                                // is the generic key-value fallback.
+                                title: root.current-cell-component == ""
+                                    ? root.current-cell-name
+                                    : root.current-cell-name + "  ·  "
+                                      + root.current-cell-component
+                                      + " (" + root.current-cell-toolkit
+                                      + " / " + root.current-cell-symbol + ")";
+
+                                // Empty-state hint when the cell
+                                // has no projected fields at all
+                                // (e.g. a phi cell). The Rust side
+                                // populates a single placeholder
+                                // line in that case so this branch
+                                // is rare.
+                                if root.current-cell-fields.length == 0 : Text {
+                                    text: "(no projected fields)";
+                                    color: Theme.text-muted;
+                                    font-family: Theme.type-body-sm.family;
+                                    font-size: Theme.type-body-sm.size;
+                                    wrap: word-wrap;
+                                }
+
+                                // Generic key-value rendering. The
+                                // "card" view of an Instance, the
+                                // "list" view of a Noun, the raw
+                                // "fact-cell" view — they all reduce
+                                // to a list of lines on the kernel
+                                // foundation slice. Future commits
+                                // can swap this for dynamically-
+                                // instantiated Slint sub-components
+                                // once a runtime component loader
+                                // exists.
+                                for line in root.current-cell-fields : Text {
+                                    text: line;
+                                    color: Theme.text-primary;
+                                    font-family: Theme.type-code.family;
+                                    font-weight: Theme.type-code.weight;
+                                    font-size: Theme.type-code.size;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+
                         // ---- Scrollback panel ----------------------
                         Rectangle {
+                            min-height: 120px;
                             vertical-stretch: 1;
                             Card {
                                 title: "REPL";

@@ -26,6 +26,13 @@
 pub mod keyboard;
 pub mod launcher;
 pub mod registry;
+// Cell-as-screen rendering helpers (#511, EPIC #496). Pure functions
+// + small ADTs that classify a "current cell", select the best
+// Component for it via #492's selection rules (kernel-internal port
+// of `arest::command::select_component`, which is host-only), and
+// project the cell's data into a list of human-readable lines for
+// the typed-surface area. Consumed by `unified_repl`.
+pub mod cell_renderer;
 // Unified REPL (#510, EPIC #496). Foundational structural merge of
 // the previous `hateoas` (Track SSS #429) + `repl` (Track TTT #430)
 // modules into a single panel — left pane drives the HATEOAS browse
