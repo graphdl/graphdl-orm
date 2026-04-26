@@ -162,6 +162,36 @@ export component UnifiedRepl inherits Window {
     // call grounded in the current cell, ready to dispatch.
     in property <[string]> system-actions;
 
+    // ---- "You are here" breadcrumb + back/forward (#516, EPIC #496) -
+    //
+    // Persistent navigation-history strip across the top of the
+    // panel. Each entry is one cell the user has visited in the
+    // current session; the rightmost entry is "you are here". The
+    // path itself IS a sequence of cells — bookmarks are facts (a
+    // future task wires them into the cell graph), history is a ring
+    // buffer (#188 primitive). Older entries fade left and roll off
+    // when the ring evicts.
+    //
+    //   * `nav-history` — labels for the last N (default 5) cells in
+    //     the path, oldest → newest. The kernel pushes these via
+    //     `BreadcrumbState::current_path_tail`.
+    //   * `nav-history-current-index` — the "you are here" index
+    //     within `nav-history`. Always the last entry today, but
+    //     carried explicitly so the cursor's display position can
+    //     differ from the tail tip in the future.
+    //   * `nav-can-go-back` / `nav-can-go-forward` — gate the
+    //     ◀ / ▶ button enabled state. Mirror the cursor's relation
+    //     to the ring's bounds.
+    //   * `bookmarks` — labels for every registered bookmark
+    //     (sorted). Rendered as a Bookmark Card on the right pane,
+    //     parallel to Navigate + Actions Cards. Click handlers fire
+    //     `bookmark-goto` with the row index.
+    in property <[string]> nav-history;
+    in property <int> nav-history-current-index: -1;
+    in property <bool> nav-can-go-back: false;
+    in property <bool> nav-can-go-forward: false;
+    in property <[string]> bookmarks;
+
     // ---- Combined status text --------------------------------------
 
     // Footer status text — Rust glue renders a combined summary.
@@ -198,6 +228,23 @@ export component UnifiedRepl inherits Window {
     // pre-bound `default_args`, and pushes the result line to
     // scrollback. See `actions::dispatch_action`.
     callback action-invoked(int);
+    // ◀ button on the navigation-history strip clicked (#516).
+    // Walks the breadcrumb cursor one entry toward the oldest. The
+    // kernel updates `current-cell` to the cell at the new cursor
+    // position without pushing a fresh history entry.
+    callback nav-back();
+    // ▶ button on the navigation-history strip clicked (#516).
+    // Walks the breadcrumb cursor one entry toward the tip. Same
+    // semantics as `nav-back` in reverse.
+    callback nav-forward();
+    // Bookmark current cell button clicked (#516). The kernel
+    // pushes a `bookmark <auto-label>` entry into its in-memory
+    // map; future task can prompt for a label.
+    callback bookmark-current();
+    // Bookmark Card row clicked (#516). Argument is the index into
+    // `bookmarks`. Kernel resolves the row → label and jumps the
+    // current cell to the bookmarked target.
+    callback bookmark-goto(int);
 
     // ---- Window chrome ----------------------------------------------
 
@@ -269,6 +316,75 @@ export component UnifiedRepl inherits Window {
                         Theme.toggle-mode();
                         root.theme-toggled();
                     }
+                }
+            }
+
+            // 1px bottom border.
+            Rectangle {
+                y: parent.height - 1px;
+                height: 1px;
+                background: Theme.border;
+            }
+        }
+
+        // ----- Navigation-history strip (#516) ----------------------
+        // Persistent breadcrumb across the top, parallel to the
+        // HATEOAS-side `breadcrumbs` model on the title bar above.
+        // The path through the cell graph IS itself a sequence of
+        // cells (#496); this strip renders the last N visited cells
+        // with separators so the user can see "you are here" at the
+        // rightmost position with older crumbs fading left. The
+        // ◀ / ▶ buttons walk the breadcrumb cursor through the
+        // history without appending new entries.
+        Rectangle {
+            background: Theme.neutral-100;
+            min-height: 36px;
+
+            HorizontalLayout {
+                padding-left: Theme.spacing-lg;
+                padding-right: Theme.spacing-lg;
+                padding-top: Theme.spacing-xs;
+                padding-bottom: Theme.spacing-xs;
+                spacing: Theme.spacing-sm;
+                alignment: start;
+
+                Button {
+                    text: "<";
+                    variant: ButtonVariant.ghost;
+                    enabled: root.nav-can-go-back;
+                    clicked => { root.nav-back(); }
+                }
+
+                Button {
+                    text: ">";
+                    variant: ButtonVariant.ghost;
+                    enabled: root.nav-can-go-forward;
+                    clicked => { root.nav-forward(); }
+                }
+
+                Text {
+                    text: "Path:";
+                    color: Theme.text-muted;
+                    font-family: Theme.type-caption.family;
+                    font-weight: Theme.type-caption.weight;
+                    font-size: Theme.type-caption.size;
+                    vertical-alignment: center;
+                }
+
+                // "You are here" path: last N visited cells. The
+                // current entry (rightmost / `nav-history-current-index`)
+                // renders bold; older crumbs fade to text-muted.
+                for crumb[idx] in root.nav-history : Text {
+                    text: idx == 0 ? crumb : " > " + crumb;
+                    color: idx == root.nav-history-current-index
+                        ? Theme.text-primary
+                        : Theme.text-muted;
+                    font-family: Theme.type-body-sm.family;
+                    font-weight: idx == root.nav-history-current-index
+                        ? Theme.type-body.weight
+                        : 400;
+                    font-size: Theme.type-body-sm.size;
+                    vertical-alignment: center;
                 }
             }
 
@@ -500,6 +616,41 @@ export component UnifiedRepl inherits Window {
                                     items: root.system-actions;
                                     item-clicked(idx, value) => {
                                         root.action-invoked(idx);
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---- Bookmarks card ------------------------
+                        // "You are here" navigation history (#516).
+                        // Parallel to the Navigate + Actions Cards
+                        // above. Each row is one named bookmark; the
+                        // header row exposes "Bookmark current" so the
+                        // user can save the current cell with one
+                        // click. Clicking a bookmark row jumps the
+                        // current cell to its target — this counts as
+                        // a navigation event (pushes a fresh history
+                        // entry), so the user can `back` out.
+                        Rectangle {
+                            min-height: 80px;
+                            Card {
+                                title: "Bookmarks";
+                                Button {
+                                    text: "+ Bookmark current cell";
+                                    variant: ButtonVariant.ghost;
+                                    clicked => { root.bookmark-current(); }
+                                }
+                                if root.bookmarks.length == 0 : Text {
+                                    text: "(no bookmarks yet — click + above to save the current cell)";
+                                    color: Theme.text-muted;
+                                    font-family: Theme.type-body-sm.family;
+                                    font-size: Theme.type-body-sm.size;
+                                    wrap: word-wrap;
+                                }
+                                if root.bookmarks.length > 0 : List {
+                                    items: root.bookmarks;
+                                    item-clicked(idx, value) => {
+                                        root.bookmark-goto(idx);
                                     }
                                 }
                             }
