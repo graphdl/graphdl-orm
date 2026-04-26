@@ -187,6 +187,20 @@ mod system;
 // portable.
 pub mod process;
 
+// `synthetic_fs` (#534 Track HHHHH, foundation for the synthetic-fs
+// epic #475). Maps well-known POSIX paths (`/proc/cpuinfo`,
+// `/proc/meminfo` today; `/sys/class`, `/dev/null`, per-pid `/proc/<n>`
+// in follow-up tracks #535-#537) to byte renderers backed by AREST
+// cells. The renderers compute their bytes on demand at read time
+// from existing kernel state (CPU topology, memory map) so the surface
+// reflects whatever the underlying cells last reported, without any
+// caching layer to invalidate. Available unconditionally — every
+// renderer is pure byte arithmetic over snapshot inputs, and the
+// per-target detection (CPUID on x86_64, ACPI MADT walk on aarch64)
+// is gated inside the renderer rather than at the module boundary,
+// so cargo check passes cleanly on every UEFI arch arm.
+pub mod synthetic_fs;
+
 // `linuxkpi` (#460 Track AAAA, foundation for the AREST-on-real-
 // hardware epic #459). FreeBSD-style Linux kernel API shim that lets
 // unmodified Linux C drivers link against AREST primitives. Off by

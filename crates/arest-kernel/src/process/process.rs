@@ -77,10 +77,11 @@ const PLACEHOLDER_AT_RANDOM: [u8; 16] = *b"AREST_TIER_1_RNG";
 /// emission. C startup reads this via `sysconf(_SC_PAGESIZE)`.
 const SYS_PAGESZ: u64 = 4096;
 
-/// Per-process state machine. Tier-1 only models the construction
-/// → spawn handoff (`Created` → `Running`). Stop / Killed / Zombied
-/// transitions land alongside the scheduler (#530) and waitpid
-/// surface (#531).
+/// Per-process state machine. Tier-1 currently models construction
+/// → spawn handoff (`Created` → `Running`) plus the userspace exit
+/// path (`Running` → `Exited`, populated by the syscall surface in
+/// #473a). Stop / Killed / Zombied transitions land alongside the
+/// scheduler (#530) and waitpid surface (#531).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
     /// Process struct constructed, address space live, stack not yet
@@ -94,6 +95,12 @@ pub enum ProcessState {
     /// Spawn errored before reaching ring 3. `Process::spawn`
     /// transitions here on `Err`.
     SpawnFailed,
+    /// Userspace called `exit(2)` or `exit_group(2)`. Set by the
+    /// `crate::syscall::exit` handler (#473a) via the
+    /// `current_process_mut` accessor below; the exit status is
+    /// stashed in `Process::exit_status` for the future
+    /// `waitpid`-like surface (#531) to consume.
+    Exited,
 }
 
 /// File-descriptor table entry. Tier-1 shape — just a tag plus an
@@ -182,6 +189,13 @@ pub struct Process {
     /// (rather than dropped on the failed path) so the test harness
     /// can inspect the layout after a structural failure.
     pub initial_stack: Option<InitialStack>,
+    /// Exit status the process passed to `exit(2)` / `exit_group(2)`.
+    /// Populated by `crate::syscall::exit::handle` once the userspace
+    /// syscall surface (#473a) is wired through to the process; `None`
+    /// until then. `wait(2)` (#531) only reads the low 8 bits, but the
+    /// kernel preserves the full i32 so a future signed-status check
+    /// has the bits.
+    pub exit_status: Option<i32>,
 }
 
 impl Process {
@@ -204,6 +218,7 @@ impl Process {
             fd_table,
             state: ProcessState::Created,
             initial_stack: None,
+            exit_status: None,
         }
     }
 
@@ -342,6 +357,7 @@ impl Process {
             ProcessState::Created => "Created",
             ProcessState::Running => "Running",
             ProcessState::SpawnFailed => "SpawnFailed",
+            ProcessState::Exited => "Exited",
         };
         s = cell_push(
             "Process_has_State",
@@ -372,6 +388,115 @@ impl Process {
         // / Process_has_Pid facts.
         self.address_space.record_into_cells(process_id, &s)
     }
+}
+
+// -- current_process accessor (#473a) -----------------------------------
+//
+// The syscall surface (`crate::syscall::dispatch::dispatch`) is a fixed
+// `(rax, rdi, rsi, rdx, r10, r8, r9) -> i64` signature — no Process
+// reference threads through. Per-syscall handlers (`syscall::write`,
+// `syscall::exit`) reach the calling Process via this kernel-wide
+// accessor: `current_process_mut(|maybe_proc| ...)` runs the closure
+// against an `Option<&mut Process>`, returning `None` when no process
+// is currently registered (the kernel boots with no process; the
+// future #552 ring-3 gate will install one before flipping to ring 3).
+//
+// Tier-1: single-threaded model
+// -----------------------------
+// The kernel runs at most one Linux process at a time today (no
+// scheduler — #530). A `spin::Mutex<Option<Process>>` static carries
+// the registered process; install / uninstall transitions are
+// explicit. Once the scheduler lands, this accessor will switch to a
+// per-CPU `current_task` lookup (matching Linux's `current` macro
+// shape) — but the call-site shape (closure receives an
+// `Option<&mut Process>`) stays the same so the syscall handlers
+// don't need re-shaping.
+//
+// Why a closure rather than a `static mut Option<&'static mut Process>`
+// ---------------------------------------------------------------------
+// The closure shape lets the static stay private — callers can't
+// stash the `&mut Process` past the `with` call's borrow lifetime.
+// This is the same shape the kernel already uses for every other
+// global mutable singleton (`arch::uefi::memory::with_page_table`,
+// `arch::uefi::memory::with_frame_allocator`). Consistency matters
+// for the same reason the other singletons use this pattern: the
+// borrow-checker enforces "you can't keep a reference past the
+// lock's release" without runtime overhead.
+//
+// Why install/uninstall rather than `set(Option<Process>)`
+// --------------------------------------------------------
+// `install(Process)` makes the "the kernel just took ownership of
+// this process" intent explicit at the call site; `uninstall()`
+// makes the "the kernel just dropped it" intent equally explicit.
+// A combined `set(Option<Process>)` would muddy both — the test
+// suite uses both to set up + tear down per-test, and named
+// transitions read better in a test diff.
+//
+// Why no `Send` bound contortion
+// ------------------------------
+// `spin::Mutex` doesn't require `Send` of its payload — the lock
+// guards access; the kernel is single-threaded so there's no actual
+// cross-thread share happening. `Process` carries `AddressSpace`
+// which holds `LoadedSegment` (raw pointers); the existing
+// `unsafe impl Send` on `LoadedSegment` (process/address_space.rs)
+// already says "the kernel will keep this single-owner per the
+// scheduler invariant" — same invariant applies here.
+
+/// Singleton holding the Linux process the kernel is currently
+/// hosting. `None` before the future #552 ring-3 gate installs one;
+/// `Some(...)` while the process is live (Created / Running). After
+/// the process exits (`crate::syscall::exit::handle` transitions to
+/// `Exited`) the static stays populated so `wait`-like callers can
+/// still read the exit status — `uninstall` is the explicit
+/// "scheduler reaped this process" transition.
+///
+/// `spin::Mutex` rather than `RefCell` so a future SMP path doesn't
+/// have to retrofit the lock; the cost is minimal (single-CPU lock
+/// = no contention) and the API matches the rest of the kernel's
+/// global mutable singletons.
+static CURRENT_PROCESS: spin::Mutex<Option<Process>> = spin::Mutex::new(None);
+
+/// Run a closure against the currently-installed Process, returning
+/// the closure's result. The closure receives `Option<&mut Process>`
+/// — `Some` if a process is installed (the post-#552 production
+/// path), `None` if not (kernel boot before any spawn, or the test
+/// suite's "uninstall fired between tests" state).
+///
+/// Returns whatever the closure returns — typed `R` so the call site
+/// can extract values out of the locked region without ferrying them
+/// through a `mem::take`-style dance.
+///
+/// Holds the singleton's `spin::Mutex` for the duration of the
+/// closure. Don't park / await inside the closure — the lock is
+/// released only when the closure returns. (No async in the kernel
+/// today; this is a "don't grow one" reminder for the future.)
+pub fn current_process_mut<F, R>(f: F) -> R
+where
+    F: FnOnce(Option<&mut Process>) -> R,
+{
+    let mut guard = CURRENT_PROCESS.lock();
+    f(guard.as_mut())
+}
+
+/// Install `proc` as the kernel's current process. Replaces any
+/// previously-installed process — caller is responsible for
+/// `uninstall`-ing first if that's not the intended semantic.
+///
+/// The future #552 ring-3 gate calls this once per spawn, just before
+/// flipping to ring 3; the trampoline returns control to the kernel
+/// only when the process exits or faults, at which point a future
+/// scheduler (#530) calls `uninstall` and picks the next runnable
+/// process.
+pub fn current_process_install(proc: Process) {
+    *CURRENT_PROCESS.lock() = Some(proc);
+}
+
+/// Drop the kernel's current process, returning it to the caller.
+/// Returns `None` if no process was installed. Used by the test
+/// harness to clean up between tests, and by the future scheduler
+/// (#530) to reap exited processes.
+pub fn current_process_uninstall() -> Option<Process> {
+    CURRENT_PROCESS.lock().take()
 }
 
 #[cfg(test)]
