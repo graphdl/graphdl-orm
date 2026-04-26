@@ -47,6 +47,7 @@ use alloc::vec::Vec;
 pub mod cpuinfo;
 pub mod meminfo;
 pub mod proc;
+pub mod proc_pid;
 
 /// Top-level resolver. Returns `Some(bytes)` for any path the
 /// synthetic-fs table recognises, `None` otherwise. The caller is

@@ -224,6 +224,16 @@ pub struct Process {
     /// kernel preserves the full i32 so a future signed-status check
     /// has the bits.
     pub exit_status: Option<i32>,
+    /// Owned copy of the argv strings the spawn was launched with.
+    /// Populated by `Process::spawn` (the borrowed `&[&[u8]]` argument
+    /// is `to_vec()`-cloned into here so the strings outlive the spawn
+    /// call's stack frame). Empty `Vec` until `spawn` runs — the
+    /// `Process::new` doorstep doesn't take argv. Used by the
+    /// `synthetic_fs::proc_pid` renderer to project `/proc/<pid>/cmdline`
+    /// (NUL-joined argv) and `/proc/<pid>/comm` (the basename of
+    /// `argv[0]`); future `prctl(PR_SET_NAME)` will mutate `argv[0]`
+    /// shape via a separate `comm_override` field.
+    pub argv: Vec<Vec<u8>>,
 }
 
 impl Process {
@@ -248,6 +258,7 @@ impl Process {
             state: ProcessState::Created,
             initial_stack: None,
             exit_status: None,
+            argv: Vec::new(),
         }
     }
 
@@ -270,6 +281,13 @@ impl Process {
     /// paths can be arbitrary bytes). Convention: `argv[0]` is the
     /// program path; the caller is responsible for picking it.
     pub fn spawn(&mut self, argv: &[&[u8]], envp: &[&[u8]]) -> Result<(), SpawnError> {
+        // Step 0: stash an owned copy of the argv strings so the
+        // /proc/<pid>/cmdline + /proc/<pid>/comm renderers
+        // (synthetic_fs::proc_pid) can project them after the spawn
+        // call returns. The borrowed `&[&[u8]]` strings would otherwise
+        // dangle once the caller's stack frame unwinds.
+        self.argv = argv.iter().map(|a| a.to_vec()).collect();
+
         // Step 1: build the auxv set. Tier-1 emits the minimum the
         // System V AMD64 PSABI requires for a static binary's
         // _start to find what it needs without making syscalls.
@@ -532,6 +550,22 @@ pub fn current_process_install(proc: Process) {
 /// (#530) to reap exited processes.
 pub fn current_process_uninstall() -> Option<Process> {
     CURRENT_PROCESS.lock().take()
+}
+
+/// Read-only accessor returning the currently-installed process's pid,
+/// or `None` if no process is installed. Sibling of
+/// `current_process_mut` — same lock discipline, but cheaper because
+/// it copies the `u32` pid out of the locked region instead of handing
+/// the closure a `&mut Process` borrow.
+///
+/// Used by the `synthetic_fs::proc` resolver to translate `/proc/self/*`
+/// path lookups into the calling process's pid (Linux convention: the
+/// `self` symlink in /proc resolves to the calling thread's pid). The
+/// resolver doesn't need to mutate the Process, just to know which pid
+/// to look up — `current_process_mut` would over-grant the lock for
+/// the read-only use case.
+pub fn current_process_id() -> Option<u32> {
+    CURRENT_PROCESS.lock().as_ref().map(|p| p.pid)
 }
 
 /// Run a closure against the currently-installed Process's open-fd
