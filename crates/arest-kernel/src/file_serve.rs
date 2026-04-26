@@ -35,6 +35,7 @@ use arest::ast::{self, Object};
 
 use crate::block_storage::{self, RegionHandle};
 use crate::block::BLOCK_SECTOR_SIZE;
+use crate::synthetic_fs;
 
 /// HTTP method that may produce a body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +119,22 @@ pub fn try_serve_with(
 
     let file_id = match parse_file_content_path(path_only) {
         Some(id) => id,
-        None => return ServeOutcome::NotApplicable,
+        None => {
+            // #534 fallback: paths that do not match the
+            // `/file/{id}/content` shape get one more shot at the
+            // synthetic-fs table (`/proc/cpuinfo`, `/proc/meminfo`,
+            // and the future `/sys/*` + `/dev/*` entries from #535-
+            // #537). The lookup runs against the URL path verbatim
+            // — POSIX absolute, no canonicalisation — so a request
+            // for `GET /proc/cpuinfo` reaches this arm with
+            // `path_only == "/proc/cpuinfo"` and the resolver yields
+            // the byte stream directly. GET / HEAD only; anything
+            // else passes through (synthetic files are read-only by
+            // construction). When the resolver returns `None` we
+            // pass through to `NotApplicable` so the assets / system
+            // dispatch chain still gets to see the URL.
+            return try_serve_synthetic(method, path_only);
+        }
     };
 
     let m = match method {
@@ -474,6 +490,66 @@ fn read_range(content: &ContentRef, start: u64, end: u64) -> Result<Vec<u8>, ()>
 fn sector_span(byte_len: u64) -> u64 {
     let sec = BLOCK_SECTOR_SIZE as u64;
     (byte_len + sec - 1) / sec
+}
+
+// ── Synthetic-fs fallback (#534) ───────────────────────────────────
+
+/// Fallback for paths that did NOT match `/file/{id}/content`. Hands
+/// the URL path to `synthetic_fs::resolve` and serves the resulting
+/// bytes when the resolver claims the path. Returns `NotApplicable`
+/// when the resolver yields `None` (typical case — most requests are
+/// not for `/proc/cpuinfo` or any other modelled synthetic path), so
+/// the caller's outer dispatch chain still sees the request.
+///
+/// HTTP semantics:
+///   * GET → full body, `Content-Type: text/plain; charset=utf-8`
+///     (every modelled synthetic file is human-readable text).
+///   * HEAD → headers only (no body).
+///   * Any other method on a recognised path → 405 with
+///     `Allow: GET, HEAD`. Synthetic files are read-only by
+///     construction; mutating verbs make no sense against them.
+///
+/// `Content-Length` is the snapshot's byte length at the moment of
+/// resolution. Synthetic files render fresh on each request — no
+/// caching layer between the cell snapshot and the wire bytes — so
+/// the length matches what the body actually carries.
+fn try_serve_synthetic(method: &str, path: &str) -> ServeOutcome {
+    let bytes = match synthetic_fs::resolve(path) {
+        Some(b) => b,
+        None => return ServeOutcome::NotApplicable,
+    };
+    let m = match method {
+        "GET" => Method::Get,
+        "HEAD" => Method::Head,
+        _ => return ServeOutcome::Response(method_not_allowed()),
+    };
+    ServeOutcome::Response(synthetic_response(m, bytes))
+}
+
+/// 200 OK wire bytes for a synthetic-fs hit. Same shape as
+/// `success_response` minus the range / disposition machinery — every
+/// synthetic file is small, read-once-whole text. `Cache-Control:
+/// no-store` because the bytes can change between consecutive reads as
+/// the underlying cells (memory map, process table, …) shift.
+///
+/// HEAD echoes the same `Content-Length` the matching GET would emit
+/// (RFC 7231 §4.3.2) but ships an empty body — captured before the
+/// method fork so the length stays right.
+fn synthetic_response(m: Method, body: Vec<u8>) -> Vec<u8> {
+    let total_len = body.len() as u64;
+    let body_bytes = match m {
+        Method::Get => body,
+        Method::Head => Vec::new(),
+    };
+    let mut out = Vec::with_capacity(192 + body_bytes.len());
+    push_status(&mut out, 200, "OK");
+    push_header(&mut out, "Content-Type", "text/plain; charset=utf-8");
+    push_header(&mut out, "Content-Length", &format!("{}", total_len));
+    push_header(&mut out, "Cache-Control", "no-store");
+    push_header(&mut out, "Connection", "close");
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(&body_bytes);
+    out
 }
 
 // ── Wire-format builders ───────────────────────────────────────────
@@ -978,6 +1054,109 @@ mod tests {
         match try_serve("GET", "/api/welcome", None, Some(&state)) {
             ServeOutcome::NotApplicable => {}
             _ => panic!("expected NotApplicable"),
+        }
+    }
+
+    #[test]
+    fn try_serve_synthetic_proc_cpuinfo() {
+        // #534: paths under `/proc/` that the synthetic-fs table
+        // recognises take priority over the regular passthrough so an
+        // HTTP client (or a future curl-from-userspace) can read
+        // `/proc/cpuinfo` without an explicit File noun in the
+        // baked SYSTEM state. Bypasses the file-id parser entirely
+        // — the URL path goes straight to `synthetic_fs::resolve`.
+        let state = build_state_with_file("a", "text/plain", "00");
+        match try_serve("GET", "/proc/cpuinfo", None, Some(&state)) {
+            ServeOutcome::Response(bytes) => {
+                let s = core::str::from_utf8(&bytes).unwrap();
+                assert!(
+                    s.starts_with("HTTP/1.1 200 OK\r\n"),
+                    "status: {}", s,
+                );
+                assert!(s.contains("Content-Type: text/plain; charset=utf-8"));
+                assert!(s.contains("Cache-Control: no-store"));
+                // Body bytes start with the cpuinfo first-line shape.
+                let body_start = s.find("\r\n\r\n").unwrap() + 4;
+                let body = &s[body_start..];
+                assert!(
+                    body.starts_with("processor\t: 0\n"),
+                    "body did not start with `processor\\t: 0\\n`:\n{}", body,
+                );
+            }
+            _ => panic!("expected Response for /proc/cpuinfo"),
+        }
+    }
+
+    #[test]
+    fn try_serve_synthetic_proc_meminfo() {
+        // Sibling check for `/proc/meminfo`: same wiring, different
+        // renderer — verifies the dispatcher hits both arms.
+        let state = build_state_with_file("a", "text/plain", "00");
+        match try_serve("GET", "/proc/meminfo", None, Some(&state)) {
+            ServeOutcome::Response(bytes) => {
+                let s = core::str::from_utf8(&bytes).unwrap();
+                assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
+                let body_start = s.find("\r\n\r\n").unwrap() + 4;
+                let body = &s[body_start..];
+                assert!(body.starts_with("MemTotal:"), "body:\n{}", body);
+            }
+            _ => panic!("expected Response for /proc/meminfo"),
+        }
+    }
+
+    #[test]
+    fn try_serve_synthetic_head_omits_body() {
+        // HEAD on a synthetic path mirrors HEAD on a File noun —
+        // headers identical to GET, body empty. Per RFC 7231 §4.3.2
+        // the `Content-Length` echoes the length GET would emit.
+        let state = build_state_with_file("a", "text/plain", "00");
+        match try_serve("HEAD", "/proc/cpuinfo", None, Some(&state)) {
+            ServeOutcome::Response(bytes) => {
+                let s = core::str::from_utf8(&bytes).unwrap();
+                assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
+                let body_start = s.find("\r\n\r\n").unwrap() + 4;
+                // No body bytes after the header terminator.
+                assert_eq!(&bytes[body_start..], &[] as &[u8]);
+                // Content-Length must still be > 0 (matches what GET
+                // would deliver).
+                assert!(
+                    !s.contains("Content-Length: 0\r\n"),
+                    "HEAD should report GET's length, got:\n{}", s,
+                );
+            }
+            _ => panic!("expected Response"),
+        }
+    }
+
+    #[test]
+    fn try_serve_synthetic_post_returns_405() {
+        // Synthetic files are read-only by construction. A POST on
+        // a recognised synthetic path returns 405 with `Allow: GET,
+        // HEAD` so a client gets a clear error rather than a silent
+        // pass-through to /api/* dispatch.
+        let state = build_state_with_file("a", "text/plain", "00");
+        match try_serve("POST", "/proc/cpuinfo", None, Some(&state)) {
+            ServeOutcome::Response(bytes) => {
+                let s = core::str::from_utf8(&bytes).unwrap();
+                assert!(
+                    s.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"),
+                    "status: {}", s,
+                );
+                assert!(s.contains("Allow: GET, HEAD"));
+            }
+            _ => panic!("expected 405 Response"),
+        }
+    }
+
+    #[test]
+    fn try_serve_unknown_proc_path_passes_through() {
+        // `/proc/uptime` is not modelled yet (waits on a future
+        // track); the dispatcher returns NotApplicable so the assets
+        // / system::dispatch chain still gets a chance to handle it.
+        let state = build_state_with_file("a", "text/plain", "00");
+        match try_serve("GET", "/proc/uptime", None, Some(&state)) {
+            ServeOutcome::NotApplicable => {}
+            _ => panic!("expected NotApplicable for unmodelled /proc path"),
         }
     }
 
