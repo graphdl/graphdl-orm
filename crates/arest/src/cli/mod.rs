@@ -74,3 +74,10 @@ pub mod installer_run;
 pub mod process_monitor;
 #[cfg(not(feature = "no_std"))]
 pub mod wine_launch;
+// `entropy_host` (#574) — host-OS `EntropySource` adapter delegating to
+// `getrandom` (Linux/FreeBSD getrandom(2), macOS arc4random_buf, Windows
+// BCryptGenRandom). Installed by callers that need RNG before any
+// `csprng::random_*` path fires; the CLI itself doesn't auto-install
+// today (per-target adapter job, see #575/#578).
+#[cfg(not(feature = "no_std"))]
+pub mod entropy_host;
