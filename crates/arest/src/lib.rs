@@ -89,6 +89,20 @@ pub mod parse_forml2_stage1;
 pub mod parse_forml2_stage2;
 #[cfg(not(feature = "no_std"))]
 pub mod load_reading;
+// `load_reading_core` (#586) — pure-FORML core extracted from
+// `load_reading` for kernel reach (mirroring JJJJJ's `select_component_core`
+// pattern in #565 part 2). The TYPES (`LoadReadingPolicy`,
+// `LoadOutcome`, `LoadError`, `LoadReport`) are unconditionally
+// available so kernel-side scaffolding can reference them in
+// cfg-gated paths; the FUNCTION itself (`load_reading`) currently
+// stays gated `cfg(not(feature = "no_std"))` because its body reaches
+// `parse_forml2` + `check`, both of which transitively pull
+// `serde` / `regex` / `std::env::var`. Once those modules port to
+// no_std, the function gate inside `load_reading_core` lifts to a
+// single-line edit and the kernel `use arest::load_reading_core::
+// load_reading` becomes a working call site (PPPPP-2's #560 closure
+// caller will adopt it in a follow-up commit).
+pub mod load_reading_core;
 #[cfg(not(feature = "no_std"))]
 // verbalize.rs deleted — zero production callers, tests were self-referential.
 #[cfg(not(feature = "no_std"))]
