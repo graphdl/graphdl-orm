@@ -194,6 +194,25 @@ pub fn install_userspace_gate() {
     x86_64::install_userspace_gate();
 }
 
+/// Install the x86_64 hardware entropy source (RDSEED-preferred, with
+/// RDRAND fallback) into `arest::entropy`'s process-wide slot (#569).
+/// After this returns, every `arest::csprng::random_bytes` call
+/// reseeds from real silicon entropy — AT_RANDOM (#575), `getrandom`
+/// (#577), and any future consumer all share the install.
+///
+/// On vintage CPUs lacking both instructions, the installed source
+/// surfaces `HardwareUnavailable` from `fill()` rather than zero
+/// bytes — keeping the door open for the UEFI EFI_RNG_PROTOCOL
+/// fallback (#571) to chain in via a separate install call.
+///
+/// Must run AFTER `init_memory()` (the install boxes a value via the
+/// global allocator) and BEFORE any csprng-touching code path. The
+/// boot path in `entry_uefi.rs` calls this immediately after
+/// `install_userspace_gate()`.
+pub fn install_entropy() {
+    x86_64::install_entropy();
+}
+
 /// Drive the kernel's idle loop. Unlike the BIOS arm's
 /// `halt_forever` (which busy-polls smoltcp because the keyboard is
 /// the only unmasked IRQ), the UEFI arm has no IRQ infrastructure
