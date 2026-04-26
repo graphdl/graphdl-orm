@@ -55,6 +55,7 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use crate::arch::uefi::slint_backend::UnifiedRepl;
 use crate::system::SubscriberId;
 use crate::ui_apps::actions::{self, SystemAction};
+use crate::ui_apps::breadcrumb::{BreadcrumbState, CrumbEntry};
 use crate::ui_apps::cell_renderer::{self, CurrentCell, RenderedScreen};
 use crate::ui_apps::navigation::NavigationTarget;
 
@@ -149,10 +150,41 @@ struct UnifiedReplState {
     // reflected in subsequent click handling — same shape as
     // `nav_targets` above.
     system_actions: Vec<SystemAction>,
+
+    // "You are here" breadcrumb + back/forward navigation history
+    // (#516, EPIC #496). The path through the cell graph IS itself a
+    // sequence of cells; this state captures it for the persistent
+    // breadcrumb strip across the top of the panel + the back /
+    // forward buttons + the Bookmark Card on the right pane.
+    //
+    // Cursor semantics: `push(cell)` moves the cursor to the new
+    // entry and clears the forward stack (browser-style); `back()`
+    // and `forward()` walk the cursor without mutating the history.
+    // `set_current_cell` and the `parse_cell_nav` REPL surface push
+    // here so every navigation surface contributes to the trail.
+    //
+    // Bookmarks are in-memory today (`RmapMap<String, CurrentCell>`)
+    // and reset across reboots. A future task can reify them as
+    // `bookmark_has_target` facts in the cell graph; the API surface
+    // is shaped to make that swap drop-in.
+    breadcrumb: BreadcrumbState,
+    /// True when the next `set_current_cell` call should NOT push to
+    /// the breadcrumb history. Set transiently by `back()` / `forward()`
+    /// / `goto_bookmark()` so the cursor walks an existing entry
+    /// rather than appending a fresh one. Always reset to `false` at
+    /// the end of `set_current_cell`.
+    suppress_breadcrumb_push: bool,
 }
 
 impl UnifiedReplState {
     fn new() -> Self {
+        // Seed the breadcrumb history with the initial Root cell so
+        // the persistent strip across the top of the panel has
+        // something to render on first paint and so the first
+        // navigation push lands on top of a real entry rather than an
+        // empty ring.
+        let mut breadcrumb = BreadcrumbState::new();
+        breadcrumb.push(CurrentCell::Root);
         Self {
             nav_stack: vec![Breadcrumb::Root],
             subscriber_id: None,
@@ -163,6 +195,8 @@ impl UnifiedReplState {
             current_cell: CurrentCell::Root,
             nav_targets: Vec::new(),
             system_actions: Vec::new(),
+            breadcrumb,
+            suppress_breadcrumb_push: false,
         }
     }
 
@@ -193,8 +227,13 @@ impl UnifiedReplState {
     /// stored separately so future #512 navigation actions can replace
     /// the breadcrumb stack wholesale (e.g. jump-to-cell from the
     /// command palette) without losing the current-cell invariant.
+    ///
+    /// Also pushes onto the navigation-history breadcrumb (#516) so
+    /// HATEOAS-side resource / instance picks contribute to the trail
+    /// alongside REPL-driven cell jumps. Suppressed during back /
+    /// forward stepping.
     fn sync_current_cell(&mut self) {
-        self.current_cell = match self.current_nav() {
+        let new_cell = match self.current_nav() {
             Breadcrumb::Root => CurrentCell::Root,
             Breadcrumb::Noun { noun } => CurrentCell::Noun { noun: noun.clone() },
             Breadcrumb::Instance { noun, instance } => CurrentCell::Instance {
@@ -202,6 +241,16 @@ impl UnifiedReplState {
                 instance: instance.clone(),
             },
         };
+        let unchanged = new_cell == self.current_cell;
+        self.current_cell = new_cell.clone();
+        if self.suppress_breadcrumb_push {
+            self.suppress_breadcrumb_push = false;
+        } else if !unchanged {
+            // Only push when the cell actually changed — avoid
+            // polluting the trail when nav_pop unwinds back to a
+            // breadcrumb position that already matches current_cell.
+            self.breadcrumb.push(new_cell);
+        }
     }
 
     /// Set the current cell directly without going through breadcrumb
@@ -210,20 +259,29 @@ impl UnifiedReplState {
     /// breadcrumb trail is also updated to keep the left-pane visual
     /// in sync; FactCell / ComponentInstance variants don't have a
     /// breadcrumb mapping and just leave the trail as-is.
+    ///
+    /// Also pushes onto the navigation-history breadcrumb (#516) so
+    /// the persistent strip + back/forward stepping reflect the new
+    /// position. Suppressed during back / forward / goto_bookmark
+    /// flows (see `suppress_breadcrumb_push`) — those advance the
+    /// cursor over existing entries rather than appending fresh ones.
     fn set_current_cell(&mut self, cell: CurrentCell) {
         self.current_cell = cell.clone();
-        match cell {
+        match &cell {
             CurrentCell::Root => {
                 self.nav_stack.truncate(1);
             }
             CurrentCell::Noun { noun } => {
                 self.nav_stack.truncate(1);
-                self.nav_stack.push(Breadcrumb::Noun { noun });
+                self.nav_stack.push(Breadcrumb::Noun { noun: noun.clone() });
             }
             CurrentCell::Instance { noun, instance } => {
                 self.nav_stack.truncate(1);
                 self.nav_stack.push(Breadcrumb::Noun { noun: noun.clone() });
-                self.nav_stack.push(Breadcrumb::Instance { noun, instance });
+                self.nav_stack.push(Breadcrumb::Instance {
+                    noun: noun.clone(),
+                    instance: instance.clone(),
+                });
             }
             // FactCell + ComponentInstance: keep nav_stack as-is —
             // the breadcrumb model can't represent them today, but
@@ -231,6 +289,59 @@ impl UnifiedReplState {
             // #512 will extend the breadcrumb to cover these.
             CurrentCell::FactCell { .. } | CurrentCell::ComponentInstance { .. } => {}
         }
+        if self.suppress_breadcrumb_push {
+            self.suppress_breadcrumb_push = false;
+        } else {
+            self.breadcrumb.push(cell);
+        }
+    }
+
+    // ---- Navigation history (#516) helpers -------------------------
+
+    /// Step the breadcrumb cursor one entry toward the oldest. When
+    /// the cursor moves, the corresponding cell becomes the current
+    /// cell (without pushing a fresh history entry). No-op when the
+    /// cursor is already at the oldest entry.
+    fn back(&mut self) -> Option<CurrentCell> {
+        let target = self.breadcrumb.back()?;
+        self.suppress_breadcrumb_push = true;
+        self.set_current_cell(target.clone());
+        Some(target)
+    }
+
+    /// Step the breadcrumb cursor one entry toward the tip. Same
+    /// shape as `back` — the destination cell becomes current
+    /// without appending a new history entry.
+    fn forward(&mut self) -> Option<CurrentCell> {
+        let target = self.breadcrumb.forward()?;
+        self.suppress_breadcrumb_push = true;
+        self.set_current_cell(target.clone());
+        Some(target)
+    }
+
+    /// Bookmark the current cell under `label`. Overwrites any prior
+    /// bookmark with the same label. Empty labels are accepted (the
+    /// caller is responsible for trimming).
+    fn bookmark(&mut self, label: String) {
+        let cell = self.current_cell.clone();
+        self.breadcrumb.bookmark(label, cell);
+    }
+
+    /// Bookmark an explicit cell under `label`. Used by the REPL
+    /// `bookmark <label>` command and the Bookmark Card's "save
+    /// current" affordance.
+    fn bookmark_cell(&mut self, label: String, cell: CurrentCell) {
+        self.breadcrumb.bookmark(label, cell);
+    }
+
+    /// Look up a bookmark by label and jump to it. Pushes a fresh
+    /// history entry — bookmarks count as navigation events so the
+    /// user can `back` from the destination back to where they were.
+    fn goto_bookmark(&mut self, label: &str) -> Option<CurrentCell> {
+        let target = self.breadcrumb.goto_bookmark(label)?;
+        // Bookmarks ARE navigation events — push, don't suppress.
+        self.set_current_cell(target.clone());
+        Some(target)
     }
 
     // ---- REPL-side helpers -----------------------------------------
@@ -747,11 +858,44 @@ fn redraw(window: &UnifiedRepl, ui: &mut UnifiedReplState) {
     ));
     window.set_system_actions(action_labels_model);
 
+    // ---- "You are here" breadcrumb + back/forward (#516) ----
+    // Tail of the navigation-history ring (last 5 entries) plus the
+    // cursor's index within that tail and the can-go-back / forward
+    // gates. The Slint side renders these as the persistent strip
+    // across the top of the panel; the ◀ / ▶ buttons walk the cursor
+    // without appending new entries.
+    const NAV_HISTORY_TAIL: usize = 5;
+    let nav_path = ui.breadcrumb.current_path_tail(NAV_HISTORY_TAIL);
+    let nav_history_model: StringModel = ModelRc::new(VecModel::from_iter(
+        nav_path.iter().map(|e: &CrumbEntry| SharedString::from(e.cell.label())),
+    ));
+    window.set_nav_history(nav_history_model);
+    let nav_current_idx = nav_path
+        .iter()
+        .position(|e| e.is_current)
+        .map(|p| p as i32)
+        .unwrap_or(-1);
+    window.set_nav_history_current_index(nav_current_idx);
+    window.set_nav_can_go_back(ui.breadcrumb.can_go_back());
+    window.set_nav_can_go_forward(ui.breadcrumb.can_go_forward());
+
+    // ---- Bookmarks (#516) ----
+    // Every registered bookmark, sorted by label. Each row is one
+    // `(label, target)` pair; the Slint surface renders just the
+    // labels and dispatches `bookmark-goto(idx)` on click — the
+    // kernel resolves index → label via the same sorted order.
+    let bookmarks_list = ui.breadcrumb.bookmark_list();
+    let bookmarks_model: StringModel = ModelRc::new(VecModel::from_iter(
+        bookmarks_list.iter().map(|(label, _)| SharedString::from(label.as_str())),
+    ));
+    window.set_bookmarks(bookmarks_model);
+
     // ---- Combined status footer ----
     let combined_status = format!(
-        "{} \u{2022} {} repl line(s) \u{2022} Up/Down history \u{2022} Ctrl+L clear \u{2022} Esc back",
+        "{} \u{2022} {} repl line(s) \u{2022} {} bookmark(s) \u{2022} Up/Down history \u{2022} Ctrl+L clear \u{2022} Esc back",
         snap.hateoas_status,
         ui.scrollback.len(),
+        ui.breadcrumb.bookmark_count(),
     );
     window.set_status_text(SharedString::from(combined_status));
 }
@@ -835,6 +979,30 @@ impl UnifiedReplApp {
     /// Slint event loop.
     pub fn system_action_count(&self) -> usize {
         self.state.borrow().system_actions.len()
+    }
+
+    /// Read-only access to the navigation-history length (#516).
+    /// Starts at 1 after construction (the initial Root entry seeded
+    /// in `UnifiedReplState::new`); grows as the user navigates.
+    pub fn breadcrumb_history_len(&self) -> usize {
+        self.state.borrow().breadcrumb.len()
+    }
+
+    /// Read-only access to the registered bookmark count (#516).
+    pub fn bookmark_count(&self) -> usize {
+        self.state.borrow().breadcrumb.bookmark_count()
+    }
+
+    /// Read-only access to the can-go-back gate (#516). Tests use
+    /// this to confirm the cursor's relation to the ring's bounds
+    /// without touching the breadcrumb directly.
+    pub fn can_go_back(&self) -> bool {
+        self.state.borrow().breadcrumb.can_go_back()
+    }
+
+    /// Read-only access to the can-go-forward gate (#516).
+    pub fn can_go_forward(&self) -> bool {
+        self.state.borrow().breadcrumb.can_go_forward()
     }
 }
 
@@ -1032,6 +1200,88 @@ pub fn build_app() -> Result<UnifiedReplApp, slint::PlatformError> {
             {
                 let mut s = state.borrow_mut();
                 s.push_line(result);
+            }
+            redraw(&window, &mut state.borrow_mut());
+        });
+    }
+
+    // ---- Navigation history: back / forward / bookmark (#516) -----
+    //
+    // ◀ button — walk the breadcrumb cursor one entry toward the
+    // oldest. The cell at the new cursor position becomes current
+    // without pushing a fresh history entry (browser-style).
+    {
+        let weak = window.as_weak();
+        let state = state.clone();
+        window.on_nav_back(move || {
+            let Some(window) = weak.upgrade() else { return };
+            let target = state.borrow_mut().back();
+            if let Some(target) = target {
+                let mut s = state.borrow_mut();
+                s.push_line(format!("\u{2190} Back to: {}", target.label()));
+            }
+            redraw(&window, &mut state.borrow_mut());
+        });
+    }
+
+    // ▶ button — walk the breadcrumb cursor one entry toward the
+    // tip. Mirrors `nav_back` in reverse.
+    {
+        let weak = window.as_weak();
+        let state = state.clone();
+        window.on_nav_forward(move || {
+            let Some(window) = weak.upgrade() else { return };
+            let target = state.borrow_mut().forward();
+            if let Some(target) = target {
+                let mut s = state.borrow_mut();
+                s.push_line(format!("\u{2192} Forward to: {}", target.label()));
+            }
+            redraw(&window, &mut state.borrow_mut());
+        });
+    }
+
+    // "+ Bookmark current cell" — auto-label the bookmark with the
+    // cell's display name. A future task can prompt for a label via
+    // a Dialog Component (PPPP's #491 binder + #515 command palette).
+    {
+        let weak = window.as_weak();
+        let state = state.clone();
+        window.on_bookmark_current(move || {
+            let Some(window) = weak.upgrade() else { return };
+            let label = {
+                let mut s = state.borrow_mut();
+                let label = s.current_cell.label();
+                s.bookmark(label.clone());
+                label
+            };
+            {
+                let mut s = state.borrow_mut();
+                s.push_line(format!("Bookmarked: {label}"));
+            }
+            redraw(&window, &mut state.borrow_mut());
+        });
+    }
+
+    // Bookmark Card row clicked — resolve the row index → label via
+    // the same sorted ordering `bookmark_list` returned, then jump.
+    // Pushes a fresh history entry (bookmarks count as navigation).
+    {
+        let weak = window.as_weak();
+        let state = state.clone();
+        window.on_bookmark_goto(move |idx| {
+            let Some(window) = weak.upgrade() else { return };
+            let label: Option<String> = {
+                let s = state.borrow();
+                s.breadcrumb
+                    .bookmark_list()
+                    .get(idx as usize)
+                    .map(|(l, _)| l.clone())
+            };
+            let Some(label) = label else { return };
+            let target = state.borrow_mut().goto_bookmark(&label);
+            if let Some(target) = target {
+                let mut s = state.borrow_mut();
+                s.push_line(format!("Bookmark: {label} \u{2192} {}", target.label()));
             }
             redraw(&window, &mut state.borrow_mut());
         });
@@ -1619,5 +1869,193 @@ mod tests {
         let s = UnifiedReplState::new();
         assert!(s.system_actions.get(0).is_none());
         assert!(s.system_actions.get(usize::MAX).is_none());
+    }
+
+    // ---- Navigation history integration (#516) coverage ----------
+
+    #[test]
+    fn new_state_seeds_breadcrumb_with_root() {
+        // The constructor pushes Root so the persistent strip across
+        // the top has something to render on first paint.
+        let s = UnifiedReplState::new();
+        assert_eq!(s.breadcrumb.len(), 1);
+        let path = s.breadcrumb.current_path();
+        assert!(path[0].is_current);
+        assert_eq!(path[0].cell, CurrentCell::Root);
+    }
+
+    #[test]
+    fn set_current_cell_pushes_to_breadcrumb_history() {
+        // Navigation events flow through `set_current_cell`; each
+        // call must contribute to the history trail so back / forward
+        // can walk over it.
+        let mut s = UnifiedReplState::new();
+        s.set_current_cell(CurrentCell::Noun { noun: "File".into() });
+        s.set_current_cell(CurrentCell::Instance {
+            noun: "File".into(),
+            instance: "f1".into(),
+        });
+        // Root (seeded) + Noun + Instance = 3 entries.
+        assert_eq!(s.breadcrumb.len(), 3);
+        assert!(s.breadcrumb.can_go_back());
+        assert!(!s.breadcrumb.can_go_forward());
+    }
+
+    #[test]
+    fn back_walks_breadcrumb_and_updates_current_cell() {
+        let mut s = UnifiedReplState::new();
+        s.set_current_cell(CurrentCell::Noun { noun: "File".into() });
+        s.set_current_cell(CurrentCell::Instance {
+            noun: "File".into(),
+            instance: "f1".into(),
+        });
+
+        // Back to Noun.
+        let prev = s.back();
+        assert_eq!(prev, Some(CurrentCell::Noun { noun: "File".into() }));
+        assert_eq!(s.current_cell, CurrentCell::Noun { noun: "File".into() });
+        // History length unchanged — back walks the cursor, doesn't push.
+        assert_eq!(s.breadcrumb.len(), 3);
+        assert!(s.breadcrumb.can_go_forward());
+
+        // Back to Root.
+        let prev = s.back();
+        assert_eq!(prev, Some(CurrentCell::Root));
+        assert_eq!(s.current_cell, CurrentCell::Root);
+        assert!(!s.breadcrumb.can_go_back());
+
+        // At oldest — back is a no-op.
+        assert_eq!(s.back(), None);
+    }
+
+    #[test]
+    fn forward_walks_breadcrumb_back_to_tip() {
+        let mut s = UnifiedReplState::new();
+        s.set_current_cell(CurrentCell::Noun { noun: "File".into() });
+        s.set_current_cell(CurrentCell::Instance {
+            noun: "File".into(),
+            instance: "f1".into(),
+        });
+        s.back();
+        s.back();
+        // Forward to Noun.
+        let next = s.forward();
+        assert_eq!(next, Some(CurrentCell::Noun { noun: "File".into() }));
+        // Forward to Instance.
+        let next = s.forward();
+        assert_eq!(
+            next,
+            Some(CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into()
+            })
+        );
+        // At tip — forward is a no-op.
+        assert_eq!(s.forward(), None);
+    }
+
+    #[test]
+    fn navigate_after_back_clears_forward_stack() {
+        // Browser-style: stepping back then navigating somewhere new
+        // drops everything past the cursor.
+        let mut s = UnifiedReplState::new();
+        s.set_current_cell(CurrentCell::Noun { noun: "File".into() });
+        s.set_current_cell(CurrentCell::Noun { noun: "Tag".into() });
+        s.back();
+        // Cursor at Noun(File). Navigate somewhere new.
+        s.set_current_cell(CurrentCell::Noun { noun: "Component".into() });
+        // History: Root, File, Component (Tag dropped).
+        assert_eq!(s.breadcrumb.len(), 3);
+        assert!(!s.breadcrumb.can_go_forward());
+        let path = s.breadcrumb.current_path();
+        assert_eq!(path[2].cell, CurrentCell::Noun { noun: "Component".into() });
+        assert!(path[2].is_current);
+    }
+
+    #[test]
+    fn bookmark_records_under_label_and_lookup_returns_cell() {
+        let mut s = UnifiedReplState::new();
+        s.set_current_cell(CurrentCell::Instance {
+            noun: "File".into(),
+            instance: "f1".into(),
+        });
+        s.bookmark("home".to_string());
+        assert!(s.breadcrumb.has_bookmark("home"));
+        assert_eq!(
+            s.breadcrumb.goto_bookmark("home"),
+            Some(CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into()
+            })
+        );
+    }
+
+    #[test]
+    fn goto_bookmark_jumps_and_pushes_to_history() {
+        let mut s = UnifiedReplState::new();
+        s.bookmark_cell(
+            "saved".to_string(),
+            CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into(),
+            },
+        );
+        let before_len = s.breadcrumb.len();
+        let target = s.goto_bookmark("saved");
+        assert_eq!(
+            target,
+            Some(CurrentCell::Instance {
+                noun: "File".into(),
+                instance: "f1".into()
+            })
+        );
+        // Bookmark navigation IS a history event — pushed.
+        assert_eq!(s.breadcrumb.len(), before_len + 1);
+        assert!(s.breadcrumb.can_go_back());
+    }
+
+    #[test]
+    fn goto_bookmark_unknown_label_is_no_op() {
+        let mut s = UnifiedReplState::new();
+        let before_len = s.breadcrumb.len();
+        assert_eq!(s.goto_bookmark("doesnotexist"), None);
+        assert_eq!(s.breadcrumb.len(), before_len);
+    }
+
+    #[test]
+    fn back_does_not_push_to_breadcrumb() {
+        // The cursor walks an existing entry; no fresh push.
+        let mut s = UnifiedReplState::new();
+        s.set_current_cell(CurrentCell::Noun { noun: "File".into() });
+        let len_before = s.breadcrumb.len();
+        s.back();
+        assert_eq!(s.breadcrumb.len(), len_before);
+    }
+
+    #[test]
+    fn nav_push_resource_selected_path_updates_breadcrumb() {
+        // The HATEOAS-side flow drives navigation through `nav_push`
+        // (not `set_current_cell`). It calls `sync_current_cell`
+        // which we wired to push to breadcrumb when the cell actually
+        // changes. Verify that path produces a history entry.
+        let mut s = UnifiedReplState::new();
+        let len_before = s.breadcrumb.len();
+        s.nav_push(Breadcrumb::Noun { noun: "File".into() });
+        assert_eq!(s.breadcrumb.len(), len_before + 1);
+        assert_eq!(
+            s.current_cell,
+            CurrentCell::Noun { noun: "File".into() }
+        );
+    }
+
+    #[test]
+    fn submit_cell_nav_pushes_to_breadcrumb() {
+        // The REPL `noun File` form routes through `set_current_cell`
+        // which must push to history.
+        let mut s = UnifiedReplState::new();
+        let len_before = s.breadcrumb.len();
+        s.submit("> ", "noun File".to_string());
+        assert_eq!(s.breadcrumb.len(), len_before + 1);
+        assert_eq!(s.current_cell, CurrentCell::Noun { noun: "File".into() });
     }
 }

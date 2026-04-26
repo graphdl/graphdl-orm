@@ -51,6 +51,14 @@ pub mod navigation;
 // hand-listed per screen. Consumed by `unified_repl`'s right-pane
 // action list.
 pub mod actions;
+// "You are here" breadcrumb + back/forward navigation history (#516,
+// EPIC #496). Adds the navigation-history chrome to the unified REPL:
+// a persistent breadcrumb across the top renders the path through the
+// cell graph, classic browser-style back/forward stepping over the
+// cell sequence, and bookmarks for quick return. The history itself
+// IS a cell sequence — bookmarks are facts (a future task wires them
+// into the cell graph), history is a ring buffer (#188 primitive).
+pub mod breadcrumb;
 // Unified REPL (#510, EPIC #496). Foundational structural merge of
 // the previous `hateoas` (Track SSS #429) + `repl` (Track TTT #430)
 // modules into a single panel — left pane drives the HATEOAS browse
