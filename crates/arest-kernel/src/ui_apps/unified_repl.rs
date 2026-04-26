@@ -436,6 +436,23 @@ impl UnifiedReplState {
             for help_line in crate::ui_apps::help::screen_help(&self.current_cell) {
                 self.push_line(help_line);
             }
+        } else if lower == "violations" || lower == "wrong" {
+            // #590: screen-aware violation rendering. Reads
+            // Violation_* cells from current state per Theorem 4 and
+            // filters to violations whose Resource references the
+            // current cell (or system-wide for Root). Falls back to
+            // an explanatory line when state is not yet installed
+            // (pre-init or test-harness path).
+            let lines = crate::system::with_state(|state| {
+                crate::ui_apps::violations::render_for_cell(
+                    &self.current_cell,
+                    state,
+                )
+            })
+            .unwrap_or_else(|| vec!["State unavailable — kernel not yet initialised.".to_string()]);
+            for line in lines {
+                self.push_line(line);
+            }
         } else if let Some(cell) = parse_cell_nav(trimmed) {
             let label = cell.label();
             self.set_current_cell(cell);

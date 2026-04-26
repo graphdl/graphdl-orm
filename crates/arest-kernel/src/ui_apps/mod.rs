@@ -67,6 +67,17 @@ pub mod breadcrumb;
 // the REPL's own cell-nav command surface. Closes the introspection
 // loop the breadcrumb (#516) opens — every screen self-describes.
 pub mod help;
+// Inline constraint violations on the current screen (#590, EPIC
+// #496). Reads the `Violation_*` cells defined in
+// `readings/core/outcomes.md` (Theorem 4 — violations are first-class
+// facts), joins them by Violation id, optionally filters to those
+// whose Resource references the current cell, and renders as
+// scrollback lines for the `violations` / `wrong` REPL command. Same
+// pattern as `help`: pure-function derivation in this module, REPL
+// surface in `unified_repl::submit`. Closes the "what's wrong here?"
+// half of the introspection loop (`help` answers "what kind of
+// screen"; `violations` answers "what's broken").
+pub mod violations;
 // Unified REPL (#510, EPIC #496). Foundational structural merge of
 // the previous `hateoas` (Track SSS #429) + `repl` (Track TTT #430)
 // modules into a single panel — left pane drives the HATEOAS browse
