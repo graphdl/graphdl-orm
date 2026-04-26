@@ -133,6 +133,15 @@ pub mod process;
 // — runs on host.
 pub mod synthetic_fs;
 
+// `load_reading_persist` (#560 Track PPPPP / DynRdg-T1). Persists
+// runtime LoadReading bodies into a virtio-blk-backed ring and
+// replays them on boot, after `system::init()` has built the baked
+// metamodel state. Pure-logic byte arithmetic on the host side, with
+// a UEFI-x86_64-only `VirtioBlkRing` impl that reaches the
+// persistence disk via `block_storage::reserve_region`. Tests live
+// inline and exercise the host-portable in-memory backend.
+pub mod load_reading_persist;
+
 // `syscall` (#507 Track GGGGG). Linux ABI syscall dispatch table.
 // SYS_WRITE (1), SYS_EXIT (60), SYS_EXIT_GROUP (231), SYS_OPENAT (257),
 // SYS_CLOSE (3) — all pure data marshalling, runs on host with mock
