@@ -773,16 +773,26 @@ export component UnifiedRepl inherits Window {
                         // the symptom is text overlapping the navigation
                         // and action panes).
                         Rectangle {
-                            // Scrollback gets the lion`s share of the
-                            // right pane`s vertical space. min-height
-                            // is the floor when other panels are tall;
-                            // vertical-stretch dominates so it claims
-                            // every leftover pixel after the smaller
-                            // Resources/Navigate/Actions/Bookmarks
-                            // cards above it lay out at their natural
-                            // sizes.
-                            min-height: 320px;
-                            vertical-stretch: 4;
+                            // Scrollback claims leftover vertical space
+                            // (vertical-stretch=2 vs the other right-
+                            // pane cards at default stretch=1, so it
+                            // gets a bit over its fair share without
+                            // dominating). Avoid stretch=4: previous
+                            // attempt pushed the input-frame off-
+                            // screen because the Card`s natural height
+                            // (driven by viewport-height = scrollback
+                            // line count × 20px) was big enough that
+                            // even VerticalLayout`s post-stretch
+                            // distribution couldn`t fit the prompt.
+                            //
+                            // FIXME(#598-style follow-up): these
+                            // numbers should come from
+                            // readings/ui/monoview.md`s Region weights
+                            // via theme.slint, not be hand-typed
+                            // magic. Leaving the literal values until
+                            // the Region-as-cell binding lands.
+                            min-height: 200px;
+                            vertical-stretch: 2;
                             clip: true;
                             Card {
                                 title: "REPL";
