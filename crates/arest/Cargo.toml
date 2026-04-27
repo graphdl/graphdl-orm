@@ -85,7 +85,29 @@ templates = []
 compat-readings = []
 default = ["wit", "debug-def", "std-deps", "parallel", "core", "ui-readings", "os-readings", "templates"]
 wit = ["dep:wit-bindgen"]
-cloudflare = ["dep:wasm-bindgen", "dep:console_error_panic_hook"]
+# cloudflare: Cloudflare Worker build profile. The worker invokes
+# `wasm-pack build --target bundler --no-default-features --features
+# cloudflare,debug-def` (see package.json `build:wasm`). Composes the
+# minimum feature set the worker needs:
+#   * wit                — wit-bindgen for the host-shim ABI
+#   * std-deps           — serde / serde_json / regex / hmac / sha2 /
+#                          subtle / flate2 / hashbrown(serde). The
+#                          parser + crypto + hashbrown serde paths all
+#                          gate on this; without it ~50 unresolved
+#                          imports surface in lib.rs / parse_forml2.
+#   * core / ui-readings / templates — bundled reading scopes the
+#                          worker exposes to clients.
+# Documented in docs/11-portability.md as the canonical worker
+# composition; keep in sync.
+cloudflare = [
+    "dep:wasm-bindgen",
+    "dep:console_error_panic_hook",
+    "wit",
+    "std-deps",
+    "core",
+    "ui-readings",
+    "templates",
+]
 local = ["dep:rusqlite"]
 parallel = ["dep:rayon"]
 # Gates the `debug` def which returns a full projection of the compiled
