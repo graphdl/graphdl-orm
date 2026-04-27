@@ -773,8 +773,16 @@ export component UnifiedRepl inherits Window {
                         // the symptom is text overlapping the navigation
                         // and action panes).
                         Rectangle {
-                            min-height: 120px;
-                            vertical-stretch: 1;
+                            // Scrollback gets the lion`s share of the
+                            // right pane`s vertical space. min-height
+                            // is the floor when other panels are tall;
+                            // vertical-stretch dominates so it claims
+                            // every leftover pixel after the smaller
+                            // Resources/Navigate/Actions/Bookmarks
+                            // cards above it lay out at their natural
+                            // sizes.
+                            min-height: 320px;
+                            vertical-stretch: 4;
                             clip: true;
                             Card {
                                 title: "REPL";
@@ -859,6 +867,17 @@ export component UnifiedRepl inherits Window {
                                     font-weight: Theme.type-code.weight;
                                     font-size: Theme.type-code.size;
                                     single-line: true;
+                                    // Anchor the caret + text to the
+                                    // left edge of the available row.
+                                    // Default alignment in
+                                    // HorizontalLayout would center the
+                                    // empty TextInput`s caret in the
+                                    // middle of the input row, which
+                                    // looked like a misplaced cursor
+                                    // even when the prompt was empty.
+                                    horizontal-alignment: left;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
 
                                     accepted => {
                                         root.submit(self.text);
