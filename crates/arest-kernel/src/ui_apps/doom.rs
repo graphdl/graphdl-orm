@@ -349,6 +349,14 @@ impl DoomHost for SlintDoomHost {
 struct DoomGuest {
     store: Store<SlintDoomHost>,
     instance: Instance,
+    /// Poison flag set by the per-frame timer when a non-OutOfFuel
+    /// trap fires (#595). Once true, subsequent tics short-circuit
+    /// before tickGame is invoked — keeps the timer cheap and stops
+    /// the launcher super-loop from being dominated by repeated
+    /// trap dispatches. Dropping the guest is deliberately avoided
+    /// because the wasmi Store destructor cascade re-trips the same
+    /// #DF that broke the boot-time smoke.
+    dead: bool,
 }
 
 /// The constructed Doom Window plus its per-frame state. Returned
@@ -621,20 +629,28 @@ fn tic(
     last_gen: &Rc<RefCell<u64>>,
 ) {
     // 1. Drive a tic. Bail early when the guest is absent (fresh-
-    //    clone build).
+    //    clone build) or when a previous tic hit a hard trap.
     //
     // #595 follow-up: a non-OutOfFuel trap (OOB / indirect-call
-    // mismatch) means the guest is wedged — tickGame will keep
-    // trapping deterministically on every subsequent call. Without a
-    // kill-switch the 35Hz timer dominates the launcher super-loop
-    // and starves keyboard / pointer dispatch (the user-visible
-    // symptom: launcher freezes once Doom is opened, mouse/keyboard
-    // ignored). Drop the guest on first hard trap so the timer
-    // becomes a no-op until the user navigates back from Doom.
-    let mut hard_trap = false;
+    // mismatch) means the guest is wedged — tickGame keeps trapping
+    // every subsequent call. Without a kill-switch the 35Hz timer
+    // dominates the super-loop and starves keyboard / pointer
+    // dispatch (launcher froze once Doom opened).
+    //
+    // Important: do NOT replace the guest with `None` on hard trap.
+    // Dropping the wasmi Store after a trap re-runs the same
+    // destructor cascade that #DF'd the boot-time smoke (see
+    // entry_uefi.rs L1177-L1196 for the cfg(any())-skipped block).
+    // Set a poison flag inside the guest instead — the next tic
+    // sees `dead=true` and short-circuits before tickGame is even
+    // looked up. Guest stays alive so its Drop runs only at process
+    // exit, not on the trap path.
     {
         let mut maybe_guest = guest_cell.borrow_mut();
         let Some(guest) = maybe_guest.as_mut() else { return };
+        if guest.dead {
+            return;
+        }
 
         // 1a. Drain any pending inbound UDP packets onto the host's
         //     in-memory ring (#385). Doom's NetGame layer expects
@@ -673,14 +689,11 @@ fn tic(
                 }
                 Err(e) => {
                     crate::println!("doom: tickGame trapped: {e} (disabling Doom guest)");
-                    hard_trap = true;
+                    guest.dead = true;
+                    return;
                 }
             }
         }
-    }
-    if hard_trap {
-        *guest_cell.borrow_mut() = None;
-        return;
     }
 
     // 2. Re-bind the captured frame as a Slint Image if it's new.
@@ -802,7 +815,7 @@ fn instantiate_guest(frame: CapturedFrame) -> Result<DoomGuest, String> {
         }
     }
 
-    Ok(DoomGuest { store, instance })
+    Ok(DoomGuest { store, instance, dead: false })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
