@@ -233,11 +233,19 @@ pub fn run(
     // Construct every app up front so navigation is just a
     // show/hide swap (no per-click constructor cost). Their
     // callbacks/state stay live for the lifetime of the kernel.
+    //
+    // Construction-order note: Slint`s `MinimalSoftwareWindow` shares
+    // a single render root across every component built against it.
+    // Each `Component::new` registers itself as the renderer`s active
+    // root, so the LAST construction wins and that`s what
+    // `draw_if_needed` paints — `.show()` only flips the per-
+    // component visibility flag, not the renderer`s root pointer.
+    // Build the side apps (launcher splash, keyboard, optional Doom)
+    // FIRST and the unified REPL LAST so the user lands on the REPL
+    // instead of the on-screen QWERTY. The keyboard and launcher
+    // splash are still reachable via the open-* navigation callbacks.
     let launcher = AppLauncher::new()
         .expect("AppLauncher::new() failed under installed Slint platform");
-    // Track #510: HateoasBrowser + Repl merged into UnifiedRepl.
-    let unified_repl_app = unified_repl::build_app()
-        .expect("UnifiedRepl construction failed");
     // Track QQQQ #465: virtual keyboard. Always constructed (no
     // feature gate); the on-screen QWERTY is the path to making
     // AREST usable on a touch-only display under QEMU. Touch / pointer
@@ -257,6 +265,11 @@ pub fn run(
         .expect("Doom construction failed");
     #[cfg(feature = "doom")]
     launcher.set_show_doom(true);
+    // Track #510: HateoasBrowser + Repl merged into UnifiedRepl.
+    // Built LAST so it wins the renderer`s root-component slot; the
+    // user lands on the REPL surface at boot per #496.
+    let unified_repl_app = unified_repl::build_app()
+        .expect("UnifiedRepl construction failed");
 
     // Track #510: the unified REPL is the default landing app. Boot
     // straight into it instead of the launcher splash so the user
