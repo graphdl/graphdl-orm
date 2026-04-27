@@ -1010,9 +1010,15 @@ fn kernel_run_uefi(
                 // actually compiled (which depends on a host C
                 // cross-compiler being available — see build.rs's
                 // Windows-host clang detection). On hosts where the C
-                // side wasn't linked, the registry is empty and the
-                // discovery banner alone proves the wire-up logic is
-                // sound up to the C boundary.
+                // side wasn't linked, the registry is empty and we
+                // fall through to the Rust-side install below.
+                //
+                // The C-side probe path historically returned -ENODEV
+                // because no transport was attached to `vdev`; #596
+                // routes around that by skipping the C-side branch
+                // when `linuxkpi_c_linked` is off (the common case)
+                // and constructing the rcore `VirtIOInput` directly
+                // against the PCI device.
                 #[cfg(linuxkpi_c_linked)]
                 {
                     let drivers = crate::linuxkpi::driver::registered_virtio_drivers();
@@ -1034,22 +1040,43 @@ fn kernel_run_uefi(
                     }
                 }
 
+                // Rust-side install (#596). Constructs a `VirtIOInput`
+                // against the PCI transport and inserts it into the
+                // INPUTS map so `poll_all_vqs` (called per launcher
+                // tick) routes events through `linuxkpi::input::
+                // input_event` into the keyboard / pointer rings. This
+                // is the path that actually delivers events to the UI;
+                // the C-side block above is a no-op on the typical
+                // build (clang absent → vendored C not linked). When
+                // both paths run on a clang-equipped host, the C-side
+                // probe still returns -ENODEV (no transport attached
+                // to its vdev) and the Rust install below is what
+                // makes the device usable.
+                let installed = crate::linuxkpi::virtio::install_input_device_from_pci(
+                    dev.bus,
+                    dev.device,
+                    dev.function,
+                );
+
                 // Banner: discriminate by enumeration order to match
                 // the QEMU CMD line ordering (keyboard first, tablet
                 // second per Dockerfile.uefi). On a 1-device boot the
                 // first device gets the keyboard label; on a 2-device
                 // boot the second gets the tablet label. Subsequent
                 // devices (rare; QEMU rarely exposes >2 input devices)
-                // fall back to a generic "device" label.
+                // fall back to a generic "device" label. Append a
+                // status tag so the operator can tell at-a-glance
+                // whether the Rust-side install succeeded.
+                let status = if installed { "live" } else { "no-driver" };
                 match idx {
                     0 => println!(
-                        "  virtio-input: keyboard online (slot {slot})"
+                        "  virtio-input: keyboard online (slot {slot}, {status})"
                     ),
                     1 => println!(
-                        "  virtio-input: tablet online (slot {slot}, abs)"
+                        "  virtio-input: tablet online (slot {slot}, abs, {status})"
                     ),
                     _ => println!(
-                        "  virtio-input: device online (slot {slot})"
+                        "  virtio-input: device online (slot {slot}, {status})"
                     ),
                 }
             }
