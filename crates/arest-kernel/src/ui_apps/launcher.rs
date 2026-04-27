@@ -413,7 +413,12 @@ pub fn run(
     // animations, draw the dirty region, idle. The loop never exits
     // — UEFI has no orderly shutdown path beyond `firmware::reboot`
     // (which we don't reach), and `kernel_run_uefi` is `-> !`.
+    //
+    // Per-frame tick counter feeds the periodic diagnostic print
+    // below. u64 so wrap-around is irrelevant (~10^11 years at 60 fps).
+    let mut tick_count: u64 = 0;
     loop {
+        tick_count = tick_count.wrapping_add(1);
         // 0. linuxkpi housekeeping. Drains the workqueue ring (any
         //    `queue_work` calls a Linux driver issued from IRQ /
         //    callback context get to run on the foreground here) and
@@ -647,6 +652,39 @@ pub fn run(
             renderer.render_by_line(&mut backend);
         });
 
+        // 4b. Cursor sprite (#596 follow-up). MinimalSoftwareWindow
+        //     doesn`t paint a host cursor — there`s no compositor
+        //     below us to render one. Paint a small white-on-black
+        //     arrow at the persistent pointer position so the user
+        //     can see where their mouse is. Drawn every frame
+        //     unconditionally (even when `draw_if_needed` was a
+        //     no-op) so the cursor follows mouse motion that didn`t
+        //     dirty any Slint surface. The sprite goes straight
+        //     to the GOP MMIO — Slint`s next dirty repaint will
+        //     overwrite the area, which is the correct behaviour
+        //     (the cursor follows the mouse on top of the latest
+        //     UI state).
+        paint_cursor_sprite(gop_ptr, gop_w, gop_h, gop_stride, gop_fmt_idx);
+
+        // 4c. Periodic diagnostic. Every ~10 seconds at 60 fps
+        //     (600 ticks) print ring depths so we can see whether
+        //     virtio-input events are arriving and being drained.
+        //     Cheap when no input is happening (one comparison per
+        //     frame; the `println!` only fires every 600th tick).
+        if tick_count % 600 == 0 {
+            let kbd_pending = crate::arch::uefi::keyboard::pending();
+            let ptr_pending = pointer::pending();
+            let (cx, cy) = pointer::current_position();
+            #[cfg(feature = "linuxkpi")]
+            let inputs = crate::linuxkpi::virtio::input_device_count();
+            #[cfg(not(feature = "linuxkpi"))]
+            let inputs = 0usize;
+            crate::println!(
+                "  diag:     tick={tick_count} kbd_pending={kbd_pending} \
+                 ptr_pending={ptr_pending} cursor=({cx},{cy}) inputs={inputs}"
+            );
+        }
+
         // 5. Idle. `pause` hints the CPU we're busy-waiting,
         //    reducing power draw and SMT-sibling contention without
         //    blocking IRQs (the PIT IRQ 0 + keyboard IRQ 1 still
@@ -834,20 +872,13 @@ fn drain_pointer_into_slint_window(window: &slint::Window) {
     use slint::LogicalPosition;
     use slint::platform::{PointerEventButton, WindowEvent};
 
-    // Cursor accumulator. Start at (0, 0) — the first AbsMove pins
-    // both axes; subsequent RelMove deltas are summed into the
-    // accumulator. This matches the cumulative semantics Slint's
-    // `WindowEvent::PointerMoved` expects (the position field is
-    // absolute, not delta).
-    //
-    // The accumulator is per-call rather than a static so a
-    // hypothetical future where the launcher restarts the loop
-    // (it doesn't today — `run` is `-> !`) would not carry stale
-    // state across reboots. The cost is one move-per-axis pair to
-    // re-build the accumulator from EV_ABS the next time the user
-    // touches the device, which is bounded by one frame of input.
-    let mut cx: i32 = 0;
-    let mut cy: i32 = 0;
+    // Cursor accumulator. Seed from the persistent `CURSOR_POS`
+    // (carried over from the previous drain) so EV_REL deltas
+    // accumulate against the user`s real on-screen position rather
+    // than resetting to (0,0) every frame. EV_ABS still snaps; the
+    // Sync flush below writes the final value back to `CURSOR_POS`
+    // for the next frame and for the cursor-sprite painter.
+    let (mut cx, mut cy) = pointer::current_position();
     let mut moved = false;
 
     pointer::drain(|event| {
@@ -891,6 +922,9 @@ fn drain_pointer_into_slint_window(window: &slint::Window) {
                             position: LogicalPosition::new(cx as f32, cy as f32),
                         },
                     );
+                    // Persist for the cursor-sprite painter and the
+                    // next drain`s seed.
+                    pointer::set_position(cx, cy);
                     moved = false;
                 }
             }
@@ -1066,5 +1100,100 @@ fn push_touch_mode_facts() {
         crate::println!(
             "  ui:       launcher: touch-mode apply failed ({msg}) — keeping prior interaction mode"
         );
+    }
+}
+
+/// Paint a small cursor arrow into the GOP framebuffer at the
+/// current `pointer::current_position()`. Slint`s `MinimalSoftwareWindow`
+/// has no compositor below it to render a host cursor, so the kernel
+/// is the only place a cursor can be drawn.
+///
+/// 12x18 pixel arrow, white on whatever was already there. Uses the
+/// raw GOP MMIO pointer + stride captured at boot — no Slint surface
+/// involvement, so the next `draw_if_needed` will overwrite the
+/// cursor area, which is the correct behaviour: the cursor follows
+/// the mouse on top of the latest UI state, redrawn every frame.
+///
+/// `gop_fmt_idx`: 0 = RGBX, 1 = BGRX (the two formats our GOP path
+/// installs after filtering Bitmask/BltOnly).
+fn paint_cursor_sprite(
+    gop_ptr: usize,
+    gop_w: usize,
+    gop_h: usize,
+    gop_stride: usize,
+    gop_fmt_idx: usize,
+) {
+    if gop_ptr == 0 || gop_w == 0 || gop_h == 0 {
+        return;
+    }
+    let (cx, cy) = pointer::current_position();
+    // Sentinel: (0, 0) is the pre-motion default. Don`t paint a
+    // visible arrow there — it`d be a useless decoration in the
+    // top-left corner on every boot when no virtio-input/PS/2 mouse
+    // delivers a position. Once a real motion event lands the value
+    // moves off (0, 0) and the sprite starts following.
+    if cx == 0 && cy == 0 {
+        return;
+    }
+    // Clamp so a wild position (e.g. EV_ABS device coordinates that
+    // haven`t been calibrated to screen pixels) doesn`t walk off the
+    // framebuffer. We saturate at (0,0) and (w-1, h-1) inclusive.
+    let cx = cx.clamp(0, gop_w as i32 - 1) as usize;
+    let cy = cy.clamp(0, gop_h as i32 - 1) as usize;
+
+    // Tiny arrow bitmap. 1 = paint, 0 = skip. 12 wide × 18 tall.
+    // Hot-spot is the top-left corner so on-screen position matches
+    // the pointer position.
+    const ARROW: [u16; 18] = [
+        0b100000000000,
+        0b110000000000,
+        0b111000000000,
+        0b111100000000,
+        0b111110000000,
+        0b111111000000,
+        0b111111100000,
+        0b111111110000,
+        0b111111111000,
+        0b111111111100,
+        0b111111110000,
+        0b111110000000,
+        0b110011000000,
+        0b100011000000,
+        0b000001100000,
+        0b000001100000,
+        0b000000110000,
+        0b000000110000,
+    ];
+
+    // White pixel: 0xFFFFFFFF works for both BGRX and RGBX (every
+    // channel max). Format index doesn`t actually matter for the
+    // pixel value but we keep it as a parameter so a future-coloured
+    // cursor (e.g. focus-tinted) can choose channel order.
+    let _ = gop_fmt_idx;
+    let pixel: u32 = 0xFFFFFFFF;
+
+    // SAFETY: `gop_ptr` is the GOP MMIO base captured at boot from
+    // the firmware`s GraphicsOutput protocol. `gop_stride` is the
+    // pixel pitch (not byte pitch). Bounds clamps above keep every
+    // write inside `[gop_ptr, gop_ptr + gop_stride*gop_h*4)`.
+    let fb = gop_ptr as *mut u32;
+    for (row, mask) in ARROW.iter().enumerate() {
+        let y = cy + row;
+        if y >= gop_h {
+            break;
+        }
+        for col in 0..12usize {
+            let bit = (mask >> (11 - col)) & 1;
+            if bit == 0 {
+                continue;
+            }
+            let x = cx + col;
+            if x >= gop_w {
+                continue;
+            }
+            unsafe {
+                fb.add(y * gop_stride + x).write_volatile(pixel);
+            }
+        }
     }
 }
