@@ -608,6 +608,94 @@ pub fn input_device_count() -> usize {
         .unwrap_or(0)
 }
 
+/// Construct a Rust `VirtIOInput` driver against a PCI virtio-input
+/// device and register it in the `INPUTS` map. Pure-Rust path that
+/// bypasses the C-driver `probe` chain in `virtio_find_vqs` —
+/// necessary because the C-side path only fires when the vendored
+/// `virtio_input.c` was compiled (gated on `linuxkpi_c_linked`,
+/// which requires clang in PATH at build.rs time and is therefore
+/// absent on Windows hosts and on the Debian-slim runtime container
+/// that ships the kernel image).
+///
+/// On success the caller can rely on `input_device_count()` /
+/// `has_tablet()` returning the new total, and `poll_all_vqs()` will
+/// drain `EV_KEY` / `EV_REL` / `EV_ABS` events off the device into
+/// the `arch::uefi::keyboard` and `arch::uefi::pointer` rings via
+/// `super::input::input_event`. The launcher super-loop already
+/// calls `poll_all_vqs()` per tick — no further wiring needed.
+///
+/// Construction is destructive: virtio handshake (begin_init / queue
+/// setup / finish_init) writes to the device. Don't double-call for
+/// the same PCI slot — the second `VirtIOInput::new` would race on
+/// device-status bits and the driver would return `AlreadyUsed`.
+///
+/// Returns `true` on success, `false` if PCI transport construction
+/// or `VirtIOInput::new` failed (banner line printed in either case
+/// so the operator sees what happened).
+pub fn install_input_device_from_pci(bus: u8, device: u8, function: u8) -> bool {
+    use virtio_drivers::transport::pci::{
+        bus::{DeviceFunction, PciRoot},
+        PciTransport,
+    };
+    use virtio_drivers::transport::{DeviceType, Transport as _};
+
+    init();
+    let device_function = DeviceFunction { bus, device, function };
+    let mut root = PciRoot::new(crate::virtio::PioCam);
+    let transport: Transport = match PciTransport::new::<crate::virtio::KernelHal, _>(
+        &mut root,
+        device_function,
+    ) {
+        Ok(t) => t.into(),
+        Err(e) => {
+            crate::println!(
+                "  linuxkpi/virtio: PciTransport::new for input failed: {:?}",
+                e
+            );
+            return false;
+        }
+    };
+    if transport.device_type() != DeviceType::Input {
+        crate::println!(
+            "  linuxkpi/virtio: device_type at {:02x}:{:02x}.{} is not Input",
+            bus,
+            device,
+            function,
+        );
+        return false;
+    }
+    let driver = match VirtIOInput::new(transport) {
+        Ok(d) => d,
+        Err(e) => {
+            crate::println!("  linuxkpi/virtio: VirtIOInput::new failed: {:?}", e);
+            return false;
+        }
+    };
+    let driver = Arc::new(Mutex::new(InputCell(driver)));
+
+    // Pure Rust path — no C-side `Virtqueue` handles to leak. The
+    // `event_vq` / `status_vq` slots stay null; `poll_all_vqs`'s
+    // snapshot loop tolerates null `event_vq` (skips the C callback
+    // dispatch tail).
+    let state = DeviceState {
+        driver,
+        event_vq: core::ptr::null_mut(),
+        status_vq: core::ptr::null_mut(),
+    };
+
+    let map = match INPUTS.get() {
+        Some(m) => m,
+        None => return false,
+    };
+    // C-path keys by `vdev as usize`; we have no vdev so synthesize a
+    // unique key from PCI BDF (bus:8 | device:5 | function:3 packs
+    // cleanly into 16 bits and never collides with a heap pointer in
+    // practice — kernel-virtual addresses are far above 64 KiB).
+    let key = ((bus as usize) << 16) | ((device as usize) << 8) | (function as usize);
+    map.lock().insert(key, state);
+    true
+}
+
 /// True when at least one of the registered virtio-input devices is
 /// likely a tablet (absolute-positioning pointer device). On the
 /// foundation slice we don't yet read VIRTIO_INPUT_CFG_EV_BITS to
