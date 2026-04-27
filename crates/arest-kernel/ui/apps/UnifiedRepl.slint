@@ -789,6 +789,18 @@ export component UnifiedRepl inherits Window {
                                     // Repl.slint's original estimate
                                     // (Theme.type-code.line-height).
                                     viewport-height: root.scrollback.length * 20px;
+                                    // Auto-scroll to the bottom so the
+                                    // newest line is always visible.
+                                    // `viewport-y` is the offset of the
+                                    // viewport relative to the visible
+                                    // window — negative pulls the
+                                    // viewport up, exposing later rows.
+                                    // Pin at min(0, -overflow) so a
+                                    // short scrollback (no overflow)
+                                    // sits at viewport-y=0 instead of a
+                                    // positive value (which would clip
+                                    // the first lines).
+                                    viewport-y: min(0px, self.height - self.viewport-height);
 
                                     VerticalLayout {
                                         spacing: 0px;
