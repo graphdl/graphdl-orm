@@ -69,3 +69,76 @@ if (existsSync(arestJsPath)) {
     console.log('sanitize-wasm-dts: guarded __wbindgen_start() call for CF Workers')
   }
 }
+
+// Build-time sanity check: confirm wasm-bindgen actually emitted its core
+// allocator intrinsics into the export section. The bundler-target glue in
+// `arest_bg.js` calls `wasm.__wbindgen_free` after every owned-string return
+// (e.g. `system(...)`), so if that export is missing the deployed Worker
+// fails on the first parse with `TypeError: wasm.__wbindgen_free is not a
+// function`. We had this regression suspected after composing `wit` into the
+// cloudflare feature — verify it's not happening again on every build.
+//
+// Read the WASM module's export section directly rather than parsing the
+// `.d.ts`, since the .d.ts is post-processed above and contains export-name
+// lines that don't map 1:1 to WASM exports for WIT-component identifiers.
+const wasmPath = resolve(__dirname, '..', 'crates', 'arest', 'pkg', 'arest_bg.wasm')
+if (existsSync(wasmPath)) {
+  const wasm = readFileSync(wasmPath)
+  const required = ['__wbindgen_free', '__wbindgen_malloc', '__wbindgen_realloc']
+  const exports = readWasmExportNames(wasm)
+  const missing = required.filter(n => !exports.includes(n))
+  if (missing.length > 0) {
+    console.error(
+      `sanitize-wasm-dts: FATAL — wasm-bindgen intrinsics missing from arest_bg.wasm: ${missing.join(', ')}\n` +
+      `  the bundler-target JS glue calls these on every system() invocation;\n` +
+      `  a Worker built without them will throw TypeError on the first parse.\n` +
+      `  Likely cause: cloudflare feature dropped 'dep:wasm-bindgen', or wit-bindgen\n` +
+      `  output is being mistakenly post-processed as a Component module.`
+    )
+    process.exit(2)
+  }
+}
+
+// Minimal LEB128 + WASM module walker — returns the names listed in the
+// export section. Inlined here so the script stays dependency-free; the
+// real wasm-tools / binaryen aren't on every contributor's PATH.
+function readWasmExportNames(buf) {
+  if (buf.length < 8 || buf.readUInt32LE(0) !== 0x6d736100) return []
+  let i = 8
+  while (i < buf.length) {
+    const sectId = buf[i++]
+    const [sectLen, after] = readULEB128(buf, i)
+    i = after
+    if (sectId === 7) {
+      const [count, afterCount] = readULEB128(buf, i)
+      let p = afterCount
+      const names = []
+      for (let e = 0; e < count; e++) {
+        const [nameLen, afterNameLen] = readULEB128(buf, p)
+        p = afterNameLen
+        names.push(buf.toString('utf8', p, p + nameLen))
+        p += nameLen
+        p += 1                         // export kind byte
+        const [, afterIdx] = readULEB128(buf, p)
+        p = afterIdx                   // export index
+      }
+      return names
+    } else {
+      i += sectLen
+    }
+  }
+  return []
+}
+
+function readULEB128(buf, offset) {
+  let result = 0
+  let shift = 0
+  let i = offset
+  while (true) {
+    const b = buf[i++]
+    result |= (b & 0x7f) << shift
+    if ((b & 0x80) === 0) break
+    shift += 7
+  }
+  return [result, i]
+}
