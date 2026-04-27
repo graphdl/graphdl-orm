@@ -766,12 +766,25 @@ export component UnifiedRepl inherits Window {
                         }
 
                         // ---- Scrollback panel ----------------------
+                        // Clip + fixed-height parent is required so the
+                        // Flickable doesn`t grow with viewport-height
+                        // (which would push every sibling card out of
+                        // bounds once scrollback exceeds ~6 lines —
+                        // the symptom is text overlapping the navigation
+                        // and action panes).
                         Rectangle {
                             min-height: 120px;
                             vertical-stretch: 1;
+                            clip: true;
                             Card {
                                 title: "REPL";
                                 scroll := Flickable {
+                                    // `clip: true` on the Rectangle
+                                    // parent above caps visual overflow.
+                                    // Avoid `width: parent.width` /
+                                    // `height: parent.height` here —
+                                    // they create a binding loop with
+                                    // Card`s auto-sized layoutinfo.
                                     // Coarse 20px per line — matches
                                     // Repl.slint's original estimate
                                     // (Theme.type-code.line-height).
