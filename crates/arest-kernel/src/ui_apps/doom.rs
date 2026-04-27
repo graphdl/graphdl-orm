@@ -622,6 +622,16 @@ fn tic(
 ) {
     // 1. Drive a tic. Bail early when the guest is absent (fresh-
     //    clone build).
+    //
+    // #595 follow-up: a non-OutOfFuel trap (OOB / indirect-call
+    // mismatch) means the guest is wedged — tickGame will keep
+    // trapping deterministically on every subsequent call. Without a
+    // kill-switch the 35Hz timer dominates the launcher super-loop
+    // and starves keyboard / pointer dispatch (the user-visible
+    // symptom: launcher freezes once Doom is opened, mouse/keyboard
+    // ignored). Drop the guest on first hard trap so the timer
+    // becomes a no-op until the user navigates back from Doom.
+    let mut hard_trap = false;
     {
         let mut maybe_guest = guest_cell.borrow_mut();
         let Some(guest) = maybe_guest.as_mut() else { return };
@@ -662,10 +672,15 @@ fn tic(
                     // captured frame is up to date.
                 }
                 Err(e) => {
-                    crate::println!("doom: tickGame trapped: {e}");
+                    crate::println!("doom: tickGame trapped: {e} (disabling Doom guest)");
+                    hard_trap = true;
                 }
             }
         }
+    }
+    if hard_trap {
+        *guest_cell.borrow_mut() = None;
+        return;
     }
 
     // 2. Re-bind the captured frame as a Slint Image if it's new.
