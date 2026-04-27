@@ -365,6 +365,23 @@ pub fn run(
     // re-apply path and downstream consumers see no spurious churn.
     apply_touch_mode_if_tablet_present();
 
+    // Slint's MinimalSoftwareWindow paints whichever component last
+    // registered itself with the shared `Rc<MinimalSoftwareWindow>`.
+    // Each `xxx_app::build_app()` constructs a `ComponentHandle` that
+    // implicitly binds to that window during `Component::new` —
+    // construction order matters. The keyboard app is the last
+    // non-Doom build_app called above, so without an explicit hide
+    // it stays as the renderer's active component and the user sees
+    // the on-screen QWERTY layout fill the SDL window even though
+    // `unified_repl_app.window.show()` runs below. Explicitly hide
+    // all the secondary apps and the launcher splash here, then show
+    // the unified REPL last so it wins the renderer's "active
+    // component" slot.
+    let _ = launcher.hide();
+    let _ = keyboard_app.window.hide();
+    #[cfg(feature = "doom")]
+    let _ = doom_app.window.hide();
+
     // Track #510: the unified REPL is the default landing app per the
     // EPIC #496 vision ("the system as the current screen"). Show it
     // first so the user lands in the merged HATEOAS-browse + REPL-
