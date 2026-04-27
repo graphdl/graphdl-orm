@@ -721,7 +721,17 @@ pub fn install_input_device_from_pci(bus: u8, device: u8, function: u8) -> bool 
 /// be called once at boot from the launcher's bootstrap (post-
 /// `system::init`, pre-super-loop) — not per-frame.
 pub fn has_tablet() -> bool {
-    input_device_count() >= 2
+    // #595/#596 follow-up: returning `true` here triggers
+    // `apply_touch_mode_if_tablet_present()` which churns SYSTEM state
+    // and appears to stress the heap enough to surface a virtio-net
+    // descriptor corruption (panic in `virtio-drivers/net_buf.rs:76`
+    // with a length field interpreted as 2_883_584). Pointer events
+    // still flow through `drain_pointer_into_slint_window` regardless
+    // of touch mode — touch mode is purely a UI density preference.
+    // The user's stated preference is keyboard + mouse + Doom, not
+    // touch-mode density, so locking this to `false` matches their ask
+    // while we continue investigating the descriptor corruption.
+    false
 }
 
 // ── Callback dispatch ──────────────────────────────────────────────
