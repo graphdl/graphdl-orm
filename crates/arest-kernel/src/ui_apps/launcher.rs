@@ -595,7 +595,19 @@ pub fn run(
         //    Without it, DHCPv4 leases would never advance and
         //    /api/* routes registered via `net::register_http` would
         //    silently sit in `Listen` forever.
-        crate::net::poll();
+        //
+        // #595 workaround: panicking inside `virtio-drivers/net_buf.rs:76`
+        // with `range end index 2_883_584 out of range for slice of
+        // length 2048` once the launcher entered its super-loop. The
+        // descriptor's `packet_len` field had been overwritten with a
+        // multi-megabyte address-shaped value, suggesting the rx-buffer
+        // descriptor ring was corrupted by an unrelated allocation
+        // (likely Doom-WASM heap churn during ui_apps::doom build_app
+        // initGame, since the panic reproduces just after the doom
+        // initGame banner lands). Skipping net::poll keeps the launcher
+        // alive and visible — HTTP/DHCP unavailable while the launcher
+        // is the active path; the launcher is the user-visible win.
+        // crate::net::poll();
 
         // 4. Repaint. `draw_if_needed` is a no-op when the active
         //    window's Slint state hasn't changed (Slint tracks dirty
