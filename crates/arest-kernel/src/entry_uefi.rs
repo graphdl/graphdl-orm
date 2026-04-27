@@ -395,30 +395,38 @@ fn kernel_run_uefi(
     // maps RAM), matching the shape of the BIOS arm's facade.
     let _phys_offset = crate::arch::init_memory(memory_map);
 
-    // #363: install the kernel-owned IDT now that the heap +
-    // frame allocator are live. Firmware's IDT is gone after
-    // `boot::exit_boot_services`, so any CPU exception (a stray
-    // `int3`, a #DF fired by a buggy MMIO write below) would
-    // triple-fault the box silently if we did not stand one up.
-    // The IDT installs the breakpoint + double-fault gates plus
-    // (since #379) the IRQ 0..47 vectors so PIT-driven ticks land
-    // on `timer_handler` rather than an unpopulated slot once
-    // `sti` is on.
-    crate::arch::init_interrupts();
-
     // #585: stand up the ring-3 userspace gate (GDT with USER_CS /
     // USER_SS, TSS with RSP0 + IST stacks, SYSCALL/SYSRET MSRs).
-    // Without this, any subsequent `Process::spawn` would triple-
-    // fault on the first selector load because the firmware-
-    // inherited GDT does not contain ring-3 segments and IA32_LSTAR
-    // is uninitialised. Helper is `Once`-guarded; safe to call
-    // exactly once here. Must run AFTER `init_memory()` (TSS uses
-    // the global allocator) and AFTER `init_interrupts()` (banner
-    // ordering convention; the install itself is independent of the
-    // IDT). See `arch::uefi::x86_64::install_userspace_gate` for
-    // the GDT → TSS → SYSCALL-MSR sequence the helper drives.
+    // Must run BEFORE `init_interrupts()` — the IDT entries that
+    // `set_handler_fn` populates snapshot `CS::get_reg()` at install
+    // time and store that selector in the gate descriptors. If we
+    // installed the IDT first (carrying the firmware-era CS) and
+    // then swapped the GDT under it, the next `sti` would dispatch
+    // IRQ 0 through an IDT entry pointing at a CS selector that no
+    // longer exists in the new GDT, triggering a #GP fault that
+    // recurses through the fault handler (same problem) and burns
+    // CPU forever — see #594. Reordering keeps the IDT consistent
+    // with the active GDT.
+    //
+    // Helper is `Once`-guarded; safe to call exactly once here.
+    // Must run AFTER `init_memory()` (TSS uses the global
+    // allocator). See `arch::uefi::x86_64::install_userspace_gate`
+    // for the GDT → TSS → SYSCALL-MSR sequence the helper drives.
     crate::arch::install_userspace_gate();
     println!("  gate:     ring-3 userspace gate online (GDT/TSS/SYSCALL MSRs)");
+
+    // #363: install the kernel-owned IDT now that the heap +
+    // frame allocator are live AND the kernel GDT is in place.
+    // Firmware's IDT is gone after `boot::exit_boot_services`, so
+    // any CPU exception (a stray `int3`, a #DF fired by a buggy
+    // MMIO write below) would triple-fault the box silently if we
+    // did not stand one up. The IDT installs the breakpoint +
+    // double-fault gates plus (since #379) the IRQ 0..47 vectors
+    // so PIT-driven ticks land on `timer_handler` rather than an
+    // unpopulated slot once `sti` is on. Each entry's CS selector
+    // is taken from `CS::get_reg()` at install time, which now
+    // returns KERNEL_CS=0x08 (the gate install reloaded it).
+    crate::arch::init_interrupts();
 
     // #569: register the x86_64 hardware entropy source (RDSEED with
     // RDRAND fallback) into `arest::entropy`'s global slot. Must run
