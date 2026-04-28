@@ -217,6 +217,18 @@ getrandom = { version = "0.2", features = ["js"] }
 opt-level = 2
 lto = "thin"
 
+# wasm-pack runs `wasm-opt -O` after cargo emits the wasm. With our
+# call graph that pass currently lowers some panic paths to literal
+# `unreachable` instructions in the worker — masking the actual
+# panic message and surfacing as `RuntimeError: unreachable` on
+# every `POST /api/parse`. Skip wasm-opt until we can identify the
+# specific transformation that loses the source-level panic so
+# `console_error_panic_hook` can do its job. Build size grows ~30%
+# (4.5 MB → ~6 MB unoptimised) but the worker has a 10 MB ceiling
+# so still fits.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
 # Test profile — optimise the crate-under-test at opt-level = 1 (was 2).
 # The suite is interpreter-heavy (every ast::apply call goes through a
 # match on ~40 Func variants). opt-level 0 leaves the match arms unin-
