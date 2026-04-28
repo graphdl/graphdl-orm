@@ -1,4 +1,5 @@
 import { deriveLinks, deriveSchema } from './hateoas'
+import { resolveSlugToNoun } from '../collections'
 
 export interface ChildRelation {
   noun: string
@@ -262,7 +263,10 @@ export async function handleArestRequest(input: ArestRequestInput): Promise<any>
       parentPath,
     })
 
-    return { ...entity, _links: links }
+    // Flatten data fields onto the top-level response. Consumers don't
+    // need to know about the EntityDB cell envelope — they want
+    // `body.name`, not `body.data.name`. Matches the fallback shape.
+    return { id: entity.id, type: entity.type, ...(entity.data || {}), _links: links }
   }
 
   if (resolved.level === 'collection' && method === 'GET') {
@@ -275,7 +279,9 @@ export async function handleArestRequest(input: ArestRequestInput): Promise<any>
         return entity
       })
     )
-    const docs = entities.filter(Boolean)
+    const docs = entities
+      .filter((e: any): e is { id: string; type: string; data: Record<string, any> } => Boolean(e))
+      .map((e) => ({ id: e.id, type: e.type, ...(e.data || {}) }))
 
     const links = deriveLinks({ noun: resolved.noun!, basePath, ir })
     const schema = deriveSchema(resolved.noun!, ir)
@@ -296,4 +302,67 @@ function buildBasePath(segments: PathSegment[]): string {
   return '/arest/' + segments
     .map(s => s.id ? `${s.slug}/${s.id}` : s.slug)
     .join('/')
+}
+
+// ── HATEOAS read fallback (engine-less) ────────────────────────────
+//
+// `handleArestRequest` requires IR to resolve slugs through the
+// constraint graph and to derive _links / _schema. When the WASM
+// engine traps on the deploy target — currently the FORML 2 stage-2
+// grammar bootstrap on wasm32 — IR can't be built, so the regular
+// path returns 500.
+//
+// This fallback covers the two read shapes the public API needs to
+// keep working under that failure: GET /arest/{slug} (collection)
+// and GET /arest/{slug}/{id} (entity). Slug → noun resolution goes
+// through the Registry's getRegisteredNouns() (no IR), and entity
+// data fields are flattened onto the response so consumers don't
+// have to know about the cell envelope.
+//
+// Trade-off: no _links, no _schema, no nested-segment navigation.
+// The full HATEOAS surface returns when the engine path works.
+
+export interface ArestReadFallbackInput {
+  path: string
+  method: string
+  registry: any
+  getStub: (id: string) => any
+  domain?: string
+}
+
+export async function handleArestReadFallback(
+  input: ArestReadFallbackInput,
+): Promise<any> {
+  if (input.method !== 'GET') return null
+
+  const trimmed = input.path.replace(/^\/arest\/?/, '').replace(/\/$/, '')
+  if (!trimmed) return null
+
+  const parts = trimmed.split('/')
+  if (parts.length < 1 || parts.length > 2) return null
+
+  const slug = parts[0]
+  const id = parts[1]
+
+  const noun = await resolveSlugToNoun(input.registry, slug)
+  if (!noun) return null
+
+  if (id !== undefined) {
+    const entity = await input.getStub(id).get().catch(() => null)
+    if (!entity) return null
+    return { id: entity.id, type: entity.type, ...(entity.data || {}) }
+  }
+
+  const ids: string[] = await input.registry
+    .getEntityIds(noun, input.domain)
+    .catch(() => [])
+
+  const entities = await Promise.all(
+    ids.map((eid: string) => input.getStub(eid).get().catch(() => null)),
+  )
+  const docs = entities
+    .filter((e: any): e is { id: string; type: string; data: Record<string, any> } => Boolean(e))
+    .map((e) => ({ id: e.id, type: e.type, ...(e.data || {}) }))
+
+  return { type: noun, docs, totalDocs: docs.length }
 }
