@@ -75,8 +75,17 @@ pub mod query;
 // induce.rs deleted — zero production callers, tests were self-referential.
 #[cfg(not(feature = "no_std"))]
 pub mod rmap;
-#[cfg(not(feature = "no_std"))]
+// `naming` (pluralize / noun_to_slug / noun_to_table / resolve_slug_to_noun)
+// is pure alloc — no serde, no regex, no std. Lifted out of the no_std
+// gate (#608) so the kernel HATEOAS read fallback (#609 / #610) can
+// reuse the same slug-projection convention the worker uses, instead
+// of re-implementing English pluralization in `crates/arest-kernel/`.
 pub mod naming;
+// `hateoas` (engine-less /arest/{slug} read fallback, #609) — pure
+// cell-graph walk + hand-rolled JSON encoder, no serde_json. Same
+// no_std gate stance as `naming` since the kernel is the primary
+// consumer; std hosts get the helper for free.
+pub mod hateoas;
 #[cfg(not(feature = "no_std"))]
 // validate.rs deleted — zero production callers, tests were self-referential.
 #[cfg(not(feature = "no_std"))]
