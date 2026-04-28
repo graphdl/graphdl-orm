@@ -402,6 +402,10 @@ describe('handleArestReadFallback', () => {
 
   const mockRegistry = {
     getRegisteredNouns: async () => ['Organization', 'Support Request', 'App'],
+    getEntityCounts: async () => [
+      { nounType: 'Organization', count: 2 },
+      { nounType: 'Support Request', count: 1 },
+    ],
     getEntityIds: async (type: string) => {
       if (type === 'Organization') return ['org-1', 'org-2']
       if (type === 'Support Request') return ['sr-1']
@@ -483,5 +487,31 @@ describe('handleArestReadFallback', () => {
       getStub: mockGetStub as any,
     })
     expect(result).toBeNull()
+  })
+
+  // The seed pipeline writes some domains' nouns to noun_index but
+  // not all (the support seed only registers materialized entity rows
+  // in entity_index). resolveSlugToNoun → getRegisteredNouns sees an
+  // empty list there, so the fallback walks getEntityCounts as a
+  // backstop — every noun with at least one materialized entity is
+  // reachable that way.
+  it('resolves noun via entity counts when noun_index is empty', async () => {
+    const sparseRegistry = {
+      getRegisteredNouns: async () => [],
+      getEntityCounts: async () => [
+        { nounType: 'Support Request', count: 3 },
+        { nounType: 'Noun', count: 34 },
+      ],
+      getEntityIds: async (type: string) => (type === 'Support Request' ? ['sr-1'] : []),
+    }
+    const result = await handleArestReadFallback({
+      path: '/arest/support-requests/sr-1',
+      method: 'GET',
+      registry: sparseRegistry as any,
+      getStub: mockGetStub as any,
+    })
+    expect(result).not.toBeNull()
+    expect(result.id).toBe('sr-1')
+    expect(result.type).toBe('Support Request')
   })
 })
