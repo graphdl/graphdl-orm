@@ -117,6 +117,33 @@ pub fn resolve_entity_id(
         .next()
 }
 
+/// Resolve a REST collection slug to its Noun name by walking the
+/// `Noun` cell in `state`. Mirror of the worker's
+/// `resolveSlugToNoun(registry, slug)` (`src/collections.ts`), with
+/// the same convention: every registered Noun's name is fed through
+/// `noun_to_slug` and matched byte-for-byte against `slug`.
+///
+/// Returns `None` if no Noun produces the given slug — callers should
+/// 404 the request rather than fall back, mirroring the worker
+/// behaviour where an unknown collection is a hard miss.
+///
+/// Used by:
+///   * arest-kernel's HATEOAS read fallback (#609 / #610) to map
+///     `/arest/organizations` → `Organization` without a hand-written
+///     slug→noun table.
+///   * The arest worker's read path indirectly (the worker has its
+///     own DurableObject-backed registry, but the convention is
+///     identical so behaviour stays bit-for-bit equivalent across
+///     deployment targets — same e2e suite passes).
+pub fn resolve_slug_to_noun(state: &crate::ast::Object, slug: &str) -> Option<String> {
+    crate::ast::fetch_or_phi("Noun", state)
+        .as_seq()?
+        .iter()
+        .filter_map(|n| crate::ast::binding(n, "name"))
+        .find(|name| noun_to_slug(name) == slug)
+        .map(|name| name.to_string())
+}
+
 /// Atom IDs — entity reference values, enum members, slugs — must be
 /// ASCII-only and case-insensitive-equivalent under ASCII fold. Free-form
 /// text fields (Description, Violation message bodies, Reading text) keep
@@ -171,6 +198,45 @@ mod tests {
         assert_eq!(noun_to_table("Fact Type"), "fact_types");
         assert_eq!(noun_to_table("SupportRequest"), "support_requests");
         assert_eq!(noun_to_table("Status"), "statuses");
+    }
+
+    #[test]
+    fn resolve_slug_round_trips_through_noun_to_slug() {
+        // Build a state with three nouns; resolve_slug_to_noun should
+        // match each one through the shared `noun_to_slug` projection.
+        use crate::ast::{cell_push, Object};
+        let nouns = ["Organization", "OrgMembership", "State Machine Definition"];
+        let state = nouns.iter().fold(Object::phi(), |acc, name| {
+            let fact = Object::seq(alloc::vec![
+                Object::seq(alloc::vec![Object::atom("name"), Object::atom(name)]),
+            ]);
+            cell_push("Noun", fact, &acc)
+        });
+
+        assert_eq!(resolve_slug_to_noun(&state, "organizations"), Some("Organization".to_string()));
+        assert_eq!(resolve_slug_to_noun(&state, "org-memberships"), Some("OrgMembership".to_string()));
+        assert_eq!(
+            resolve_slug_to_noun(&state, "state-machine-definitions"),
+            Some("State Machine Definition".to_string()),
+        );
+    }
+
+    #[test]
+    fn resolve_slug_returns_none_for_unknown() {
+        use crate::ast::{cell_push, Object};
+        let fact = Object::seq(alloc::vec![
+            Object::seq(alloc::vec![Object::atom("name"), Object::atom("Organization")]),
+        ]);
+        let state = cell_push("Noun", fact, &Object::phi());
+
+        assert_eq!(resolve_slug_to_noun(&state, "support-requests"), None);
+        assert_eq!(resolve_slug_to_noun(&state, ""), None);
+    }
+
+    #[test]
+    fn resolve_slug_returns_none_when_noun_cell_empty() {
+        // A bare state with no Noun cell at all: nothing to match.
+        assert_eq!(resolve_slug_to_noun(&crate::ast::Object::phi(), "organizations"), None);
     }
 
     #[test]
