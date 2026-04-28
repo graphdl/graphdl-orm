@@ -7,7 +7,7 @@ import { handleEvaluate, handleSynthesize } from './evaluate'
 import { handleCreateEntity, handleDeleteEntity } from './entity-routes'
 import { envelope } from './envelope'
 import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, computeRMAP, system as wasmSystem, currentDomainHandle } from './engine'
-import { handleArestRequest } from './arest-router'
+import { handleArestRequest, handleArestReadFallback } from './arest-router'
 import { handleMcpRequest } from '../mcp/remote'
 import { dispatchVerb, UNIFIED_VERBS } from './verb-dispatcher'
 
@@ -1044,11 +1044,51 @@ async function handleArestRoute(request: Request, env: Env) {
   const registryDO = getRegistryDO(env, 'global') as any
   const irDomain = url.searchParams.get('ir_domain') || 'organizations'
   const getStubLocal = (id: string) => getEntityDO(env, id) as any
-  const schemaHandle = await loadDomainSchema(registryDO, getStubLocal, irDomain).catch(() => -1)
-  if (schemaHandle < 0) return json({ error: 'No schema loaded' }, { status: 500 })
-  const ir = JSON.parse(wasmSystem(schemaHandle, 'debug', '')) as any
 
-  if (!ir) return json({ error: 'No schema loaded' }, { status: 500 })
+  // Engine path needs IR (for slug → noun via constraint graph + _links).
+  // When the WASM engine traps on the deploy target, fall through to a
+  // direct registry/EntityDB read for GET /arest/{slug}[/{id}] so the
+  // public read surface stays alive even when HATEOAS link derivation
+  // can't run. Engine-failure response loses _links and _schema.
+  const fallbackDomain = url.searchParams.get('domain') || undefined
+  const tryReadFallback = async () => {
+    const fallback = await handleArestReadFallback({
+      path: url.pathname,
+      method: request.method,
+      registry: registryDO,
+      getStub: getStubLocal,
+      domain: fallbackDomain,
+    }).catch(() => null)
+    if (fallback) return json(fallback)
+    return null
+  }
+
+  let schemaHandle: number = -1
+  try {
+    schemaHandle = await loadDomainSchema(registryDO, getStubLocal, irDomain)
+  } catch {
+    schemaHandle = -1
+  }
+  if (schemaHandle < 0) {
+    const fallbackResponse = await tryReadFallback()
+    if (fallbackResponse) return fallbackResponse
+    return json({ error: 'No schema loaded' }, { status: 500 })
+  }
+
+  let ir: any = null
+  try {
+    ir = JSON.parse(wasmSystem(schemaHandle, 'debug', '')) as any
+  } catch {
+    const fallbackResponse = await tryReadFallback()
+    if (fallbackResponse) return fallbackResponse
+    return json({ error: 'No schema loaded' }, { status: 500 })
+  }
+
+  if (!ir) {
+    const fallbackResponse = await tryReadFallback()
+    if (fallbackResponse) return fallbackResponse
+    return json({ error: 'No schema loaded' }, { status: 500 })
+  }
 
   // Debug: return IR shape if ?debug=ir
   if (url.searchParams.get('debug') === 'ir') {

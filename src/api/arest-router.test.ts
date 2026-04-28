@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { resolvePath, buildConstraintGraph, nounToSlug, handleRoot, handleArestRequest } from './arest-router'
+import { resolvePath, buildConstraintGraph, nounToSlug, handleRoot, handleArestRequest, handleArestReadFallback } from './arest-router'
 
 describe('nounToSlug', () => {
   it('converts noun name to URL slug', () => {
@@ -388,5 +388,100 @@ describe('HATEOAS walkability', () => {
     expect(apps._schema).toBeDefined()
     expect(apps._schema.fields).toBeDefined()
     expect(apps._links.self.href).toBe(appsHref)
+  })
+})
+
+describe('handleArestReadFallback', () => {
+  // Stand-in registry that resolves slugs the same way collections.ts does:
+  // each registered noun produces a slug; the fallback walks them to find a match.
+  const entities: Record<string, any> = {
+    'org-1': { id: 'org-1', type: 'Organization', data: { name: 'Test Org', orgSlug: 'test-org' } },
+    'org-2': { id: 'org-2', type: 'Organization', data: { name: 'Other', orgSlug: 'other' } },
+    'sr-1': { id: 'sr-1', type: 'Support Request', data: { subject: 'help' } },
+  }
+
+  const mockRegistry = {
+    getRegisteredNouns: async () => ['Organization', 'Support Request', 'App'],
+    getEntityIds: async (type: string) => {
+      if (type === 'Organization') return ['org-1', 'org-2']
+      if (type === 'Support Request') return ['sr-1']
+      return []
+    },
+  }
+
+  const mockGetStub = (id: string) => ({
+    get: async () => entities[id] || null,
+  })
+
+  it('returns entity with flattened data for GET /arest/organizations/{id}', async () => {
+    const result = await handleArestReadFallback({
+      path: '/arest/organizations/org-1',
+      method: 'GET',
+      registry: mockRegistry as any,
+      getStub: mockGetStub as any,
+    })
+    expect(result).not.toBeNull()
+    expect(result.id).toBe('org-1')
+    expect(result.type).toBe('Organization')
+    expect(result.name).toBe('Test Org')
+    expect(result.orgSlug).toBe('test-org')
+  })
+
+  it('returns collection with flattened docs for GET /arest/organizations', async () => {
+    const result = await handleArestReadFallback({
+      path: '/arest/organizations',
+      method: 'GET',
+      registry: mockRegistry as any,
+      getStub: mockGetStub as any,
+    })
+    expect(result).not.toBeNull()
+    expect(result.type).toBe('Organization')
+    expect(result.totalDocs).toBe(2)
+    expect(result.docs).toHaveLength(2)
+    const found = result.docs.find((d: any) => d.id === 'org-1')
+    expect(found.name).toBe('Test Org')
+    expect(found.orgSlug).toBe('test-org')
+  })
+
+  it('resolves multi-word noun slugs (Support Request → support-requests)', async () => {
+    const result = await handleArestReadFallback({
+      path: '/arest/support-requests/sr-1',
+      method: 'GET',
+      registry: mockRegistry as any,
+      getStub: mockGetStub as any,
+    })
+    expect(result).not.toBeNull()
+    expect(result.type).toBe('Support Request')
+    expect(result.subject).toBe('help')
+  })
+
+  it('returns null for unknown slugs', async () => {
+    const result = await handleArestReadFallback({
+      path: '/arest/widgets/x',
+      method: 'GET',
+      registry: mockRegistry as any,
+      getStub: mockGetStub as any,
+    })
+    expect(result).toBeNull()
+  })
+
+  it('returns null for non-GET methods', async () => {
+    const result = await handleArestReadFallback({
+      path: '/arest/organizations/org-1',
+      method: 'POST',
+      registry: mockRegistry as any,
+      getStub: mockGetStub as any,
+    })
+    expect(result).toBeNull()
+  })
+
+  it('returns null for missing entity', async () => {
+    const result = await handleArestReadFallback({
+      path: '/arest/organizations/missing',
+      method: 'GET',
+      registry: mockRegistry as any,
+      getStub: mockGetStub as any,
+    })
+    expect(result).toBeNull()
   })
 })
