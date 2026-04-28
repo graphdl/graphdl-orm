@@ -231,6 +231,49 @@ pub fn arest_http_handler(req: &http::Request) -> http::Response {
         }
     }
 
+    // POST /arest/entity — AREST command path (#614/#615), engine-less
+    // direct-write fallback. Mirror of the worker's
+    // `router.ts::handleArestRoute` POST branch when the engine traps.
+    // Body shape: `{noun, fields:{...}, domain?}`. ID generated via
+    // `arest::csprng::random_bytes` (16 random bytes hex-encoded), so
+    // entropy must be installed before this fires (it is — see
+    // `entry_uefi.rs::kernel_run_uefi` which calls `entropy::install`
+    // pre-`net::init`).
+    if req.method == "POST" && req.path == "/arest/entity" {
+        let result = system::with_state(|s| {
+            arest::hateoas::handle_arest_create(s, &req.method, &req.path, &req.body)
+        });
+        if let Some(Some((new_state, body))) = result {
+            let _ = system::apply(new_state);
+            return http::Response::ok("application/json", body);
+        }
+    }
+
+    // POST /arest/entities/{slug} — direct-write fallback (#616).
+    // Mirror of the worker's `router.ts::handleEntitiesPost`
+    // create-side fallback. Engine path (#613) waits on #588's
+    // no_std Stage-2 lift; until then this is the only POST entity
+    // surface the kernel honours, sufficient for the apis e2e
+    // suite's `POST /arest/entities/Organization with explicit id`
+    // (`apis/__e2e__/arest.test.ts:153`) and `POST /arest/entities/
+    // Support%20Request with explicit id` (line 240) cases.
+    if req.method == "POST" && req.path.starts_with("/arest/entities/") {
+        let result = system::with_state(|s| {
+            arest::hateoas::handle_arest_create_for_slug(s, &req.method, &req.path, &req.body)
+        });
+        if let Some(Some((new_state, body))) = result {
+            // Commit the new state under the write lock — release of
+            // the read lock above and acquisition of the write lock
+            // here is *not* atomic against concurrent POSTs, but the
+            // smoltcp HTTP path already serves one connection at a
+            // time so there's no concurrent writer to race against.
+            // When the kernel grows multi-connection HTTP this needs
+            // a CAS-style retry loop or a single-writer lane.
+            let _ = system::apply(new_state);
+            return http::Response::ok("application/json", body);
+        }
+    }
+
     // HATEOAS read fallback (#609). Only fires on `/arest/*` paths
     // (`assets::lookup` already excluded them above). Returns
     // `Some(json)` on a recognised slug + entity id, `None` for any
