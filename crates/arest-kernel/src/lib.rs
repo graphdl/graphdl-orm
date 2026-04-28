@@ -190,17 +190,24 @@ pub mod virtio_mmio;
 #[cfg(all(target_os = "uefi", any(target_arch = "aarch64", target_arch = "arm")))]
 pub mod usb_uart;
 
-/// HTTP handler — same shape as the bin's pre-extract version. Two-
-/// stage routing: `assets::lookup` first (baked ui.do bundle), then
-/// `system::dispatch` (ρ-applied defs over baked state). Pub so the
-/// per-arch entry harnesses (`entry_uefi*::kernel_run_*`) can register
-/// it via `net::register_http(80, arest_http_handler)`.
+/// HTTP handler — three-stage routing:
 ///
-/// `assets::lookup` already returns `None` for `/api/*` and `/arest/*`
-/// (HATEOAS namespace, owned by `system::dispatch`) — so a request like
-/// `GET /arest/parse` falls through to the dynamic dispatch and yields
-/// a real 404 instead of being rewritten to `index.html` by the SPA
-/// fallback. That carve-out is the wire-level half of #610.
+///   1. `assets::lookup` — baked ui.do bundle. Returns `None` for the
+///      `/api/*` and `/arest/*` namespaces so dynamic paths reach the
+///      dispatch tier instead of being rewritten to `index.html` by
+///      the SPA fallback (#610).
+///   2. `arest::hateoas::handle_arest_read` — engine-less HATEOAS read
+///      fallback for `GET /arest/{slug}` and `GET /arest/{slug}/{id}`
+///      (#609). Walks the live SYSTEM state via `system::with_state`
+///      and emits the `{type, docs, totalDocs}` / `{id, type, ...}`
+///      envelopes the apis e2e suite expects. Mirror of the worker's
+///      `handleArestReadFallback` so a single contract serves the
+///      kernel + the Cloudflare worker.
+///   3. `system::dispatch` — ρ-applied defs (`/api/welcome`, `/echo`,
+///      …). Final stop before a 404.
+///
+/// Pub so the per-arch entry harnesses (`entry_uefi*::kernel_run_*`)
+/// can register it via `net::register_http(80, arest_http_handler)`.
 pub fn arest_http_handler(req: &http::Request) -> http::Response {
     if let Some(asset) = assets::lookup(&req.path) {
         return http::Response::ok_cached(
@@ -209,6 +216,20 @@ pub fn arest_http_handler(req: &http::Request) -> http::Response {
             asset.body.to_vec(),
         );
     }
+
+    // HATEOAS read fallback (#609). Only fires on `/arest/*` paths
+    // (`assets::lookup` already excluded them above). Returns
+    // `Some(json)` on a recognised slug + entity id, `None` for any
+    // miss — including non-GET methods, unknown slugs, and missing
+    // entity ids. A miss falls through to `system::dispatch`; a hit
+    // short-circuits with `200 application/json`.
+    if req.path.starts_with("/arest/") || req.path == "/arest" {
+        let read = system::with_state(|s| arest::hateoas::handle_arest_read(s, &req.method, &req.path));
+        if let Some(Some(body)) = read {
+            return http::Response::ok("application/json", body);
+        }
+    }
+
     match system::dispatch(&req.method, &req.path, &req.body) {
         Some(body) => http::Response::ok("text/plain; charset=utf-8", body),
         None => http::Response::not_found(),

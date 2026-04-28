@@ -153,7 +153,29 @@ pub fn init() {
             // Func::Id is the identity ρ-application — apply(Id, x, D) = x.
             ("echo".to_string(), Func::Id),
         ];
-        let initial = ast::defs_to_state(&defs, &Object::phi());
+        let mut initial = ast::defs_to_state(&defs, &Object::phi());
+
+        // Demo Noun + entity so the HATEOAS read fallback (#608/#609/#610)
+        // returns something concrete instead of always hitting `None` on
+        // a bare boot. Mirror of how the worker seeds noun_index from
+        // readings — the kernel's metamodel-loaded path lands later
+        // (#588 lifts the Stage-2 parser to no_std), so for now we
+        // hand-stage a single Noun fact + a single Organization entity.
+        // `GET /arest/organizations` and `/arest/organizations/acme`
+        // both round-trip through `arest::hateoas::handle_arest_read`,
+        // proving the wire-up is end-to-end.
+        let noun_org = Object::seq(alloc::vec![Object::seq(alloc::vec![
+            Object::atom("name"),
+            Object::atom("Organization"),
+        ])]);
+        initial = ast::cell_push("Noun", noun_org, &initial);
+
+        let entity_acme = Object::seq(alloc::vec![
+            Object::seq(alloc::vec![Object::atom("id"), Object::atom("acme")]),
+            Object::seq(alloc::vec![Object::atom("name"), Object::atom("Acme Corp")]),
+        ]);
+        initial = ast::cell_push("Organization", entity_acme, &initial);
+
         // Box::leak gives us the `&'static Object` the slot stores.
         // The leak is intentional: the legacy `state()` shim returns
         // `&'static Object`, and `apply()`'s atomic-pointer-swap
