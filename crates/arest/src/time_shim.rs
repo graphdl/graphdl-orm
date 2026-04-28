@@ -10,7 +10,7 @@
 // Stage-2 of the FORML 2 parser uses `Instant::now()` purely for
 // optional `AREST_STAGE12_TRACE` logging — the duration is read but
 // never affects parser output. So a shim that returns zero on wasm32
-// is functionally identical to the std behaviour everywhere a trace
+// is functionally identical to the std behavior everywhere a trace
 // isn't being printed (i.e. always, in the worker).
 //
 // Native targets keep the real `std::time::Instant` so trace

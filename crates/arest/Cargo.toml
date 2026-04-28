@@ -224,7 +224,7 @@ lto = "thin"
 # every `POST /api/parse`. Skip wasm-opt until we can identify the
 # specific transformation that loses the source-level panic so
 # `console_error_panic_hook` can do its job. Build size grows ~30%
-# (4.5 MB → ~6 MB unoptimised) but the worker has a 10 MB ceiling
+# (4.5 MB → ~6 MB unoptimized) but the worker has a 10 MB ceiling
 # so still fits.
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = false

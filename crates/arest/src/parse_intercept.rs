@@ -9,7 +9,7 @@
 // JSON" on every seed file.
 //
 // The intercept wraps `parse_to_state` / `parse_to_state_with_nouns`
-// and serialises the resulting Object into the entity-array shape the
+// and serializes the resulting Object into the entity-array shape the
 // worker's `parse.ts` expects:
 //
 //   [{ id, type, domain, data }, ...]
@@ -109,10 +109,12 @@ fn parse_dispatch_inner(input: &str, with_nouns: bool) -> String {
     // markdown is touched. wasm32-unknown-unknown is panic="abort"
     // (forced by rustc — no unwind ABI on this target), so the
     // trap propagates as `RuntimeError: unreachable` with no
-    // useful diagnostic. Tracked under the #588 lift.
+    // useful diagnostic. The proper fix is the wider stage-2 no_std
+    // lift (drop std::time::Instant, std::env::var, and any other
+    // host-only deps from the parser's hot path).
     //
-    // The fallback recognises the two readings the seed pipeline
-    // actually needs to materialise for cross-domain noun
+    // The fallback recognizes the two readings the seed pipeline
+    // actually needs to materialize for cross-domain noun
     // resolution to work: noun declarations (`X is an entity type.`
     // / `X is a value type.`) and FORML 2 statements (any non-blank,
     // non-comment line terminated by `.`). It loses fact-type and
@@ -156,7 +158,7 @@ fn parse_dispatch_inner(input: &str, with_nouns: bool) -> String {
 /// would produce, so the worker's `materializeBatch` doesn't care
 /// which path produced it.
 ///
-/// Patterns recognised:
+/// Patterns recognized:
 ///   * `Foo is an entity type.`       → Noun(name=Foo, objectType=entity)
 ///   * `Foo is a value type.`         → Noun(name=Foo, objectType=value)
 ///   * `Foo is an abstract entity.`   → Noun(name=Foo, objectType=abstract)
@@ -217,7 +219,7 @@ fn regex_fallback_parse(markdown: &str, domain: &str) -> String {
 /// Recognise noun-declaration shape. Returns `(name, objectType)`
 /// where objectType is one of "entity" / "value" / "abstract".
 fn noun_from_decl(stmt: &str) -> Option<(String, &'static str)> {
-    // Lowercase suffix scan for tolerance to leading capitalisation
+    // Lowercase suffix scan for tolerance to leading capitalization
     // and incidental whitespace.
     let lower = stmt.to_lowercase();
     let (object_type, suffix) = if lower.ends_with(" is an entity type") {
@@ -294,7 +296,7 @@ fn parse_input_envelope(input: &str) -> Result<(String, String, String), String>
 }
 
 /// Build a minimal `Object` whose `Noun` cell mirrors the worker-
-/// supplied catalog. Stage-2's tokeniser only needs the noun *names*
+/// supplied catalog. Stage-2's tokenizer only needs the noun *names*
 /// (and their declared object-type) to resolve cross-domain
 /// references; everything else (fact types, constraints) is
 /// re-derived from the markdown being parsed.
@@ -330,7 +332,7 @@ fn synthetic_state_from_nouns(nouns_json: &str) -> Object {
 }
 
 /// Walk every cell named in `CELLS` and emit one entity per fact.
-/// Hand-built JSON serialisation: serde_json::to_string would need
+/// Hand-built JSON serialization: serde_json::to_string would need
 /// us to either build a serde model first (extra clones) or write a
 /// custom Serializer (overkill for a flat shape). Direct String
 /// formatting is the smallest-blast-radius option.
@@ -466,7 +468,7 @@ fn error_array(msg: &str) -> String {
 //      that `materializeBatch` writes to EntityDB.
 //   3. Nouns flow through with `data.name` set, since the worker
 //      indexes them via `registry.indexNoun(noun.data.name, slug)`.
-//   4. `parse_with_nouns` honours the supplied catalog so tier-N
+//   4. `parse_with_nouns` honors the supplied catalog so tier-N
 //      readings resolve nouns declared by tiers 1..N-1.
 //   5. Malformed envelopes return a single-element error array (not
 //      "⊥") so the seed surfaces the failure with the file's slug
@@ -540,7 +542,7 @@ mod tests {
     #[test]
     fn parse_with_nouns_carries_supplied_catalog_through_resolution() {
         // Tier-N reading references a noun declared in tier-(N-1). Without
-        // the noun catalog, stage-2 stage-1's tokeniser cannot classify
+        // the noun catalog, stage-2 stage-1's tokenizer cannot classify
         // "Order" as a known noun and the FT containing it never appears.
         let input = r#"{
             "markdown":"Customer places Order.",
@@ -657,7 +659,7 @@ mod tests {
     fn fallback_handles_terminator_with_derivation_marker() {
         // FORML 2 derivation rules end `. *` / `. **` / `. +`. The
         // fallback strips trailing markers so the line is still
-        // recognised as a statement.
+        // recognized as a statement.
         let v = fallback("Customer has Email. *", "shop");
         let readings: Vec<&str> = v.as_array().unwrap().iter()
             .filter(|e| e["type"] == "Reading")
