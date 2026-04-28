@@ -154,6 +154,23 @@ musl-libc = []
 # graceful-degrade pattern #460 / #524 established for hosts without
 # a working cross-compiler.
 busybox = []
+# server (#600 epic). Turns the kernel into a headless HATEOAS HTTP
+# server — same boot through ExitBootServices / memory init / virtio-
+# net / smoltcp / register_http(80, arest_http_handler), but the
+# Slint launcher hand-off is skipped in favour of a plain
+# `loop { net::poll(); pause }` drainer. Banner ends with
+# "server: net+http loop running" instead of "ui: launcher running",
+# and the test harness can `Invoke-WebRequest http://localhost:8080/`
+# without contending with Slint's idle-yields starving smoltcp's poll
+# (which is the diagnosed root cause of the DHCPv4 stall observed in
+# `_reports/kernel-hateoas-gap.md`).
+#
+# Slint / repl / ui-bundle still link in unconditionally on UEFI
+# x86_64 — making them truly optional is a follow-up profile-split
+# task. The runtime gate alone is enough to demonstrate the server
+# edition's behavioural contract (HATEOAS reachable from the host)
+# and unblock the apis e2e suite against the kernel target.
+server = []
 default = []
 
 [lib]

@@ -1452,12 +1452,20 @@ fn kernel_run_uefi(
     // Banner format mirrors the BIOS arm's "repl: line-buffered
     // keyboard REPL online (#183)" line so a smoke harness can
     // pattern-match the same family of phrases on either path.
-    println!("  repl:     line-buffered keyboard REPL online (#183/#365)");
-    #[cfg(feature = "doom")]
-    println!("  ui:       launcher running (Unified REPL + Doom)");
-    #[cfg(not(feature = "doom"))]
-    println!("  ui:       launcher running (Unified REPL)");
-    println!();
+    #[cfg(not(feature = "server"))]
+    {
+        println!("  repl:     line-buffered keyboard REPL online (#183/#365)");
+        #[cfg(feature = "doom")]
+        println!("  ui:       launcher running (Unified REPL + Doom)");
+        #[cfg(not(feature = "doom"))]
+        println!("  ui:       launcher running (Unified REPL)");
+        println!();
+    }
+    #[cfg(feature = "server")]
+    {
+        println!("  server:   net+http loop running (HATEOAS only, no UI/REPL)");
+        println!();
+    }
 
     // Track GGG #365 used to print "next: kernel_run handoff
     // (step 4d)" here and then enter a `loop { read_keystroke();
@@ -1480,6 +1488,7 @@ fn kernel_run_uefi(
     // for each submitted line; the BIOS-style `repl::process_key`
     // shim stays available for any future caller (e.g. a serial-
     // console fallback).
+    #[cfg(not(feature = "server"))]
     crate::repl::init();
 
     // Hand off to the Slint event loop. `launcher::run(...)` never
@@ -1491,6 +1500,28 @@ fn kernel_run_uefi(
     // its own `*mut u8` view, and `framebuffer` retains its
     // `&'static mut [u8]` for any pre-launcher draws (the paint
     // smoke + Doom blit smoke above already ran).
+    //
+    // Under feature="server" (#600), the Slint launcher hand-off is
+    // replaced by a plain `loop { net::poll(); pause }` drainer.
+    // Slint's event loop yields to the firmware idle pump in long
+    // pauses, which starves smoltcp's poll cadence and stalls
+    // DHCPv4 settle (root cause documented in
+    // `_reports/kernel-hateoas-gap.md`). The headless server profile
+    // dodges that entirely — net::poll runs every iteration, lease
+    // arrives in under a second, and host curl on the QEMU hostfwd
+    // port is reachable. HATEOAS routes registered on the
+    // arest_http_handler take it from there.
+    #[cfg(feature = "server")]
+    {
+        // Suppress the unused-binding warnings for the framebuffer
+        // descriptor — the server branch deliberately doesn't paint.
+        let _ = (gop_w, gop_h, gop_stride, gop_fmt_idx, gop_ptr);
+        loop {
+            crate::net::poll();
+            unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+        }
+    }
+    #[cfg(not(feature = "server"))]
     crate::ui_apps::launcher::run(
         gop_w, gop_h, gop_stride, gop_fmt_idx, gop_ptr,
     );
