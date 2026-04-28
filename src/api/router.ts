@@ -1113,17 +1113,32 @@ async function handleArestRoute(request: Request, env: Env) {
     } catch {}
   }
 
-  const result = await handleArestRequest({
-    path: url.pathname,
-    method: request.method,
-    ir,
-    registry: registryDO,
-    getStub: (id: string) => getEntityDO(env, id) as any,
-    userEmail,
-    population,
-  })
+  let result: any = null
+  try {
+    result = await handleArestRequest({
+      path: url.pathname,
+      method: request.method,
+      ir,
+      registry: registryDO,
+      getStub: (id: string) => getEntityDO(env, id) as any,
+      userEmail,
+      population,
+    })
+  } catch {
+    result = null
+  }
 
-  if (!result) return error(404, { errors: [{ message: 'Not Found' }] })
+  // The IR is loaded for a single domain (default: organizations). Slugs
+  // belonging to other domains (e.g. /arest/support-requests when IR is
+  // organizations) won't resolve and handleArestRequest returns null.
+  // The fallback walks the global Registry which sees nouns from every
+  // domain, so it can satisfy cross-domain reads. Caller can opt into
+  // the engine-only path by passing ?ir_domain=<domain>.
+  if (!result) {
+    const fallbackResponse = await tryReadFallback()
+    if (fallbackResponse) return fallbackResponse
+    return error(404, { errors: [{ message: 'Not Found' }] })
+  }
   return json(result)
 }
 
