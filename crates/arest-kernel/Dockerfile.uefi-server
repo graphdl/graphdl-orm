@@ -1,0 +1,88 @@
+# crates/arest-kernel/Dockerfile.uefi-server
+#
+# Server-edition variant of Dockerfile.uefi. Builds the kernel with
+# `--features server` instead of `--features linuxkpi`, then boots it
+# under QEMU + OVMF. The runtime gate inside `entry_uefi.rs::kernel_run_uefi`
+# replaces the Slint launcher hand-off with a plain
+# `loop { net::poll(); pause }` drainer — the headless HATEOAS-only
+# profile per epic #600.
+#
+# Build context layers are intentionally identical to Dockerfile.uefi
+# (Slint UI, fonts, icons, doom assets, vendored Linux source still
+# stage in). The cfg gates inside the kernel skip them at runtime so
+# the binary still boots clean, but every COPY layer remains shared
+# with the full image for cache reuse. Stripping the bake artifacts
+# entirely is a separate profile-split task (#629).
+#
+# Usage from repo root:
+#   docker build -t arest-kernel-server -f crates/arest-kernel/Dockerfile.uefi-server .
+#   docker run --rm -p 8080:8080 arest-kernel-server
+#
+# Banner replaces "ui: launcher running ..." with
+# "server: net+http loop running (HATEOAS only, no UI/REPL)" — that's
+# the visible signal the runtime gate fired. Host
+# `Invoke-WebRequest http://localhost:8080/` reaches the kernel HTTP
+# listener via the QEMU hostfwd port.
+
+FROM rust:latest AS builder
+
+RUN rustup toolchain install nightly --profile minimal \
+    && rustup component add rust-src --toolchain nightly \
+    && rustup target add x86_64-unknown-uefi --toolchain nightly \
+    && rustup target add aarch64-unknown-uefi --toolchain nightly
+
+WORKDIR /build
+
+COPY crates/arest-kernel/Cargo.toml crates/arest-kernel/Cargo.toml
+COPY crates/arest-kernel/build.rs crates/arest-kernel/build.rs
+COPY crates/arest-kernel/src/ crates/arest-kernel/src/
+COPY crates/arest-kernel/rust-toolchain.toml crates/arest-kernel/rust-toolchain.toml
+COPY crates/arest-kernel/ui/ crates/arest-kernel/ui/
+COPY crates/arest-kernel/assets/ crates/arest-kernel/assets/
+COPY apps/ui.do/dist/ apps/ui.do/dist/
+COPY crates/arest-kernel/doom_assets/ crates/arest-kernel/doom_assets/
+COPY crates/arest/Cargo.toml crates/arest/Cargo.toml
+COPY crates/arest/src/ crates/arest/src/
+COPY readings/ readings/
+COPY crates/arest-kernel/vendor/ crates/arest-kernel/vendor/
+
+# Server build: --features server (no linuxkpi). Runtime gate inside
+# entry_uefi.rs swaps the Slint launcher for a net+http drainer.
+RUN cd crates/arest-kernel \
+    && cargo +nightly build --target x86_64-unknown-uefi --release --features server
+
+FROM debian:bookworm-slim AS runner
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    qemu-system-x86 \
+    ovmf \
+    dosfstools \
+    mtools \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/crates/arest-kernel/target/x86_64-unknown-uefi/release/arest-kernel.efi /arest-kernel.efi
+
+RUN dd if=/dev/zero of=/uefi-disk.img bs=1M count=64 status=none \
+    && mkfs.fat -F 32 /uefi-disk.img >/dev/null \
+    && mmd -i /uefi-disk.img ::/EFI \
+    && mmd -i /uefi-disk.img ::/EFI/BOOT \
+    && mcopy -i /uefi-disk.img /arest-kernel.efi ::/EFI/BOOT/BOOTX64.EFI
+
+RUN dd if=/dev/zero of=/disk.img bs=1M count=1 status=none
+
+EXPOSE 8080
+
+# Server profile QEMU args: dropped virtio-gpu, virtio-keyboard, and
+# virtio-tablet — server edition has no UI surface so those devices
+# are dead weight. virtio-blk stays for the checkpoint round-trip
+# smoke (proves storage works) and virtio-net for the HTTP path.
+CMD ["qemu-system-x86_64", \
+     "-bios", "/usr/share/ovmf/OVMF.fd", \
+     "-drive", "format=raw,file=/uefi-disk.img,if=ide", \
+     "-netdev", "user,id=net0,hostfwd=tcp::8080-:80", \
+     "-device", "virtio-net-pci,netdev=net0,disable-legacy=on", \
+     "-drive", "file=/disk.img,format=raw,if=none,id=disk0", \
+     "-device", "virtio-blk-pci,drive=disk0,disable-legacy=on", \
+     "-serial", "stdio", \
+     "-display", "none", \
+     "-no-reboot", "-no-shutdown"]
