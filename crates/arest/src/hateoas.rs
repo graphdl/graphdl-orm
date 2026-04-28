@@ -155,6 +155,64 @@ fn json_string(s: &str) -> String {
     out
 }
 
+/// Aggregate parser/registry counts from `state` into the JSON shape
+/// the worker's `GET /arest/parse` returns
+/// (`src/api/parse.ts::handleParseGet`):
+///
+/// ```json
+/// {
+///   "totals": {
+///     "domains": N,
+///     "nouns": N,
+///     "readings": N,
+///     "factTypes": N,
+///     "constraints": N
+///   },
+///   "perDomain": { "<slug>": { "nouns": N, "readings": N }, ... }
+/// }
+/// ```
+///
+/// Same envelope across both deployment targets so the apis e2e suite
+/// (`apis/__e2e__/arest.test.ts`'s `GET /arest/parse returns engine
+/// stats`) passes against either.
+///
+/// On the kernel today `perDomain` is always `{}` because the kernel
+/// has no Domain registry yet (#205-style multi-tenant DO sharding
+/// is worker-only). `domains` therefore counts the `Domain` cell if
+/// it exists, otherwise `0`. The aggregate `nouns`/`readings`/etc.
+/// fields walk the live SYSTEM cells directly — same source the
+/// engine uses (#150 cell-indexed lookup), so the count is whatever
+/// is loaded right now (baked metamodel + any runtime
+/// `LoadReading` (#555) results).
+pub fn parse_stats(state: &Object) -> Vec<u8> {
+    let nouns = cell_count(state, "Noun");
+    let readings = cell_count(state, "Reading");
+    // Two casing conventions exist in the wild — `FactType` (one
+    // word, internal cell name) and `Fact Type` (two words, the
+    // canonical noun spelled in readings). Sum both so a state
+    // produced by either spelling reports the same count.
+    let fact_types = cell_count(state, "FactType") + cell_count(state, "Fact Type");
+    let constraints = cell_count(state, "Constraint");
+    let domains = cell_count(state, "Domain");
+
+    let mut out = String::new();
+    out.push_str("{\"totals\":{");
+    out.push_str(&format!("\"domains\":{}", domains));
+    out.push_str(&format!(",\"nouns\":{}", nouns));
+    out.push_str(&format!(",\"readings\":{}", readings));
+    out.push_str(&format!(",\"factTypes\":{}", fact_types));
+    out.push_str(&format!(",\"constraints\":{}", constraints));
+    out.push_str("},\"perDomain\":{}}");
+    out.into_bytes()
+}
+
+fn cell_count(state: &Object, name: &str) -> usize {
+    crate::ast::fetch_or_phi(name, state)
+        .as_seq()
+        .map(|s| s.len())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +300,46 @@ mod tests {
         let body = handle_arest_read(&s, "GET", "/arest/organizations?limit=10").expect("matched");
         let body = String::from_utf8(body).unwrap();
         assert!(body.contains("\"type\":\"Organization\""), "{body}");
+    }
+
+    #[test]
+    fn parse_stats_empty_state() {
+        let body = String::from_utf8(parse_stats(&Object::phi())).unwrap();
+        assert!(body.contains("\"domains\":0"), "{body}");
+        assert!(body.contains("\"nouns\":0"), "{body}");
+        assert!(body.contains("\"readings\":0"), "{body}");
+        assert!(body.contains("\"factTypes\":0"), "{body}");
+        assert!(body.contains("\"constraints\":0"), "{body}");
+        assert!(body.contains("\"perDomain\":{}"), "{body}");
+    }
+
+    #[test]
+    fn parse_stats_counts_each_cell() {
+        let s = Object::phi();
+        let s = cell_push("Noun", fact(&[("name", "Organization")]), &s);
+        let s = cell_push("Noun", fact(&[("name", "OrgMembership")]), &s);
+        let s = cell_push("Reading", fact(&[("text", "alpha")]), &s);
+        let s = cell_push("FactType", fact(&[("id", "ft1")]), &s);
+        let s = cell_push("Fact Type", fact(&[("id", "ft2")]), &s);
+        let s = cell_push("Constraint", fact(&[("id", "c1")]), &s);
+        let s = cell_push("Domain", fact(&[("slug", "auto.dev")]), &s);
+
+        let body = String::from_utf8(parse_stats(&s)).unwrap();
+        assert!(body.contains("\"nouns\":2"), "{body}");
+        assert!(body.contains("\"readings\":1"), "{body}");
+        // Sum across both casings — `FactType` (1) + `Fact Type` (1) = 2.
+        assert!(body.contains("\"factTypes\":2"), "{body}");
+        assert!(body.contains("\"constraints\":1"), "{body}");
+        assert!(body.contains("\"domains\":1"), "{body}");
+    }
+
+    #[test]
+    fn parse_stats_envelope_has_totals_field() {
+        // The apis e2e probe (`expect(body.totals).toBeDefined()` +
+        // `expect(typeof body.totals.domains).toBe('number')`) is the
+        // contract this test pins.
+        let body = String::from_utf8(parse_stats(&Object::phi())).unwrap();
+        assert!(body.starts_with("{\"totals\":{"), "{body}");
     }
 
     #[test]

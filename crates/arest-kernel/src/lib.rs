@@ -217,6 +217,20 @@ pub fn arest_http_handler(req: &http::Request) -> http::Response {
         );
     }
 
+    // /arest/parse — registry stats (#611/#612). Mirror of the
+    // worker's `handleParseGet` (`src/api/parse.ts`). Sits *before*
+    // the generic `/arest/{slug}` fallback because the path shape is
+    // different (it's a stats endpoint, not an entity lookup) — the
+    // generic handler would otherwise try to resolve "parse" as a
+    // slug and 404 it. POST/DELETE remain unhandled here today
+    // because the kernel can't yet compile readings at runtime
+    // (gated on #588 lifting Stage-2 to no_std).
+    if req.method == "GET" && (req.path == "/arest/parse" || req.path.starts_with("/arest/parse?")) {
+        if let Some(body) = system::with_state(|s| arest::hateoas::parse_stats(s)) {
+            return http::Response::ok("application/json", body);
+        }
+    }
+
     // HATEOAS read fallback (#609). Only fires on `/arest/*` paths
     // (`assets::lookup` already excluded them above). Returns
     // `Some(json)` on a recognised slug + entity id, `None` for any
