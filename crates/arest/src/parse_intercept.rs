@@ -95,24 +95,181 @@ pub fn parse_dispatch(input: &str, with_nouns: bool) -> String {
 }
 
 fn parse_dispatch_inner(input: &str, with_nouns: bool) -> String {
-    let (markdown, domain, nouns_json) = match parse_input_envelope(input) {
+    let (markdown, domain, _nouns_json) = match parse_input_envelope(input) {
         Ok(x) => x,
         Err(e) => return error_array(&e),
     };
+    let _ = with_nouns;
 
-    let parsed = if with_nouns {
-        let context = synthetic_state_from_nouns(&nouns_json);
-        crate::parse_forml2::parse_to_state_with_nouns(&markdown, &context)
+    // wasm32 path: skip parse_to_state and use the regex fallback.
+    // The full Stage-2 parser hits an LLVM-emitted `unreachable`
+    // somewhere in `cached_grammar_state` (the bootstrap that
+    // compiles `forml2-grammar.md` into derivation Funcs and runs
+    // them to fixpoint) — even on empty input, before any user
+    // markdown is touched. wasm32-unknown-unknown is panic="abort"
+    // (forced by rustc — no unwind ABI on this target), so the
+    // trap propagates as `RuntimeError: unreachable` with no
+    // useful diagnostic. Tracked under the #588 lift.
+    //
+    // The fallback recognises the two readings the seed pipeline
+    // actually needs to materialise for cross-domain noun
+    // resolution to work: noun declarations (`X is an entity type.`
+    // / `X is a value type.`) and FORML 2 statements (any non-blank,
+    // non-comment line terminated by `.`). It loses fact-type and
+    // constraint extraction — those need real Stage-2 — but lets
+    // the seed populate the registry's Noun + Reading cells, which
+    // is what unblocks tier-N parses on the next pass.
+    //
+    // Native targets keep the full parser (the `cfg` flips the
+    // implementation, not the public API).
+    #[cfg(target_arch = "wasm32")]
+    {
+        return regex_fallback_parse(&markdown, &domain);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let parsed = if with_nouns {
+            let nouns_json = match parse_input_envelope(input) {
+                Ok((_, _, n)) => n,
+                Err(_) => "{}".to_string(),
+            };
+            let context = synthetic_state_from_nouns(&nouns_json);
+            crate::parse_forml2::parse_to_state_with_nouns(&markdown, &context)
+        } else {
+            crate::parse_forml2::parse_to_state(&markdown)
+        };
+
+        let state = match parsed {
+            Ok(s) => s,
+            Err(e) => return error_array(&e),
+        };
+
+        serialize_entities(&state, &domain)
+    }
+}
+
+/// Regex-light noun + reading extractor — the wasm32 fallback path
+/// when the full Stage-2 parser can't run. Pure string scanning, no
+/// derivation engine, no grammar bootstrap. Returns the same
+/// `[{id, type, domain, data}, ...]` shape `serialize_entities`
+/// would produce, so the worker's `materializeBatch` doesn't care
+/// which path produced it.
+///
+/// Patterns recognised:
+///   * `Foo is an entity type.`       → Noun(name=Foo, objectType=entity)
+///   * `Foo is a value type.`         → Noun(name=Foo, objectType=value)
+///   * `Foo is an abstract entity.`   → Noun(name=Foo, objectType=abstract)
+///   * Any non-blank non-`#` line ending in `.` → Reading(text=line)
+///
+/// The noun-name extraction is intentionally permissive: anything
+/// before "is an entity type" / "is a value type" (trimmed, with
+/// markdown markers stripped) becomes the name. Quoted forms
+/// (`Foo 'Each Way Bet' is an entity type.`) are NOT handled — the
+/// fallback misses those, which is acceptable since the bundled
+/// readings that need them are baked into the metamodel and never
+/// hit this path.
+fn regex_fallback_parse(markdown: &str, domain: &str) -> String {
+    let mut out = String::from("[");
+    let mut first = true;
+    let mut reading_index = 0usize;
+
+    for raw in markdown.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        // FORML 2 statements always end with `.` (optionally
+        // followed by an ORM 2 derivation marker `*` / `**` / `+`).
+        // Skip prose lines that don't terminate this way — same
+        // filter Stage-2 applies.
+        let body = line.trim_end_matches(|c: char| matches!(c, '*' | '+' | ' '));
+        if !body.ends_with('.') { continue; }
+        let stmt = body.trim_end_matches('.').trim();
+        if stmt.is_empty() { continue; }
+
+        // Noun declaration shape — be lenient about determiner
+        // ("an" / "a") and exact suffix.
+        let noun_decl = noun_from_decl(stmt);
+        if let Some((name, object_type)) = noun_decl {
+            if !first { out.push(','); }
+            first = false;
+            push_entity(&mut out, domain, "Noun", &name, &[
+                ("name", &name),
+                ("objectType", object_type),
+            ]);
+            // Continue — also emit the line as a Reading so
+            // downstream "what readings exist?" queries see it.
+        }
+
+        // Reading: every statement-terminator line.
+        if !first { out.push(','); }
+        first = false;
+        let reading_id = format!("r{reading_index}");
+        reading_index += 1;
+        push_entity(&mut out, domain, "Reading", &reading_id, &[
+            ("text", line),
+        ]);
+    }
+
+    out.push(']');
+    out
+}
+
+/// Recognise noun-declaration shape. Returns `(name, objectType)`
+/// where objectType is one of "entity" / "value" / "abstract".
+fn noun_from_decl(stmt: &str) -> Option<(String, &'static str)> {
+    // Lowercase suffix scan for tolerance to leading capitalisation
+    // and incidental whitespace.
+    let lower = stmt.to_lowercase();
+    let (object_type, suffix) = if lower.ends_with(" is an entity type") {
+        ("entity", " is an entity type")
+    } else if lower.ends_with(" is a entity type") {
+        ("entity", " is a entity type")  // tolerant typo
+    } else if lower.ends_with(" is a value type") {
+        ("value", " is a value type")
+    } else if lower.ends_with(" is an value type") {
+        ("value", " is an value type")  // tolerant typo
+    } else if lower.ends_with(" is an abstract entity type") {
+        ("abstract", " is an abstract entity type")
+    } else if lower.ends_with(" is abstract") {
+        ("abstract", " is abstract")
     } else {
-        crate::parse_forml2::parse_to_state(&markdown)
+        return None;
     };
 
-    let state = match parsed {
-        Ok(s) => s,
-        Err(e) => return error_array(&e),
-    };
+    // Cut the suffix off the original (case-preserving) string.
+    let cut = stmt.len() - suffix.len();
+    let name = stmt[..cut].trim().to_string();
+    if name.is_empty() { return None; }
+    Some((name, object_type))
+}
 
-    serialize_entities(&state, &domain)
+/// Emit one `{id, type, domain, data}` entity as JSON. Inline so
+/// the fallback doesn't need to build an intermediate Object tree.
+fn push_entity(out: &mut String, domain: &str, type_name: &str, key: &str, fields: &[(&str, &str)]) {
+    out.push('{');
+    out.push_str("\"id\":");
+    push_json_string(out, &format!("{domain}:{type_name}:{key}"));
+    out.push_str(",\"type\":");
+    push_json_string(out, type_name);
+    out.push_str(",\"domain\":");
+    push_json_string(out, domain);
+    out.push_str(",\"data\":{");
+    let mut first = true;
+    let mut saw_domain = false;
+    for (k, v) in fields {
+        if !first { out.push(','); }
+        first = false;
+        push_json_string(out, k);
+        out.push(':');
+        push_json_string(out, v);
+        if *k == "domain" { saw_domain = true; }
+    }
+    if !saw_domain {
+        if !first { out.push(','); }
+        out.push_str("\"domain\":");
+        push_json_string(out, domain);
+    }
+    out.push_str("}}");
 }
 
 /// Pull `markdown`, `domain`, and (optionally) raw `nouns` JSON out
@@ -420,5 +577,109 @@ mod tests {
         let arr = v.as_array().expect("array");
         assert!(arr.is_empty() || arr.iter().all(|e| e["_error"].is_null()),
             "empty markdown should not error; got: {v}");
+    }
+
+    // ── Regex fallback (wasm32 path) tests ──────────────────────
+    //
+    // The fallback runs only on `target_arch = "wasm32"` in
+    // production, but the test suite runs on the host. Call it
+    // directly to verify the regex shape — the seed pipeline's
+    // tier-N invocations depend on at least Nouns and Readings
+    // flowing forward, and these tests guard that contract.
+
+    fn fallback(markdown: &str, domain: &str) -> serde_json::Value {
+        let raw = regex_fallback_parse(markdown, domain);
+        serde_json::from_str(&raw).expect("fallback emits valid JSON")
+    }
+
+    #[test]
+    fn fallback_extracts_entity_noun_from_canonical_declaration() {
+        let v = fallback("Customer is an entity type.", "shop");
+        let arr = v.as_array().expect("array");
+        let nouns: Vec<&str> = arr.iter()
+            .filter(|e| e["type"] == "Noun")
+            .filter_map(|e| e["data"]["name"].as_str())
+            .collect();
+        assert_eq!(nouns, vec!["Customer"]);
+        // Must also tag the line as a Reading so per-domain
+        // reading counts on the worker stay nonzero.
+        let readings: Vec<&str> = arr.iter()
+            .filter(|e| e["type"] == "Reading")
+            .filter_map(|e| e["data"]["text"].as_str())
+            .collect();
+        assert_eq!(readings.len(), 1);
+        assert!(readings[0].contains("Customer is an entity type"));
+    }
+
+    #[test]
+    fn fallback_distinguishes_value_from_entity_object_type() {
+        let md = "Color is a value type.\nCustomer is an entity type.";
+        let v = fallback(md, "shop");
+        let by_name: std::collections::HashMap<&str, &str> = v.as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["type"] == "Noun")
+            .filter_map(|e| Some((e["data"]["name"].as_str()?, e["data"]["objectType"].as_str()?)))
+            .collect();
+        assert_eq!(by_name.get("Color"), Some(&"value"));
+        assert_eq!(by_name.get("Customer"), Some(&"entity"));
+    }
+
+    #[test]
+    fn fallback_skips_blank_and_comment_and_prose_lines() {
+        // Markdown headings (`#`), blanks, and prose lines without
+        // a `.` terminator must NOT be picked up as Readings — the
+        // worker uses Reading count as a quality metric and we
+        // don't want incidental section text inflating it.
+        let md = "# Heading\n\nSome prose with no terminator\nCustomer is an entity type.";
+        let v = fallback(md, "shop");
+        let readings: Vec<&str> = v.as_array().unwrap().iter()
+            .filter(|e| e["type"] == "Reading")
+            .filter_map(|e| e["data"]["text"].as_str())
+            .collect();
+        assert_eq!(readings.len(), 1, "only the terminated line should be a Reading; got: {readings:?}");
+    }
+
+    #[test]
+    fn fallback_id_format_matches_full_parser_convention() {
+        // `materializeBatch` upserts on entity id; if the fallback
+        // emits `id` that doesn't match the full parser's format,
+        // tier-1 entities written by one path collide with tier-N
+        // writes by the other. Both paths use
+        // `${domain}:${Type}:${name|sequential}`.
+        let v = fallback("Customer is an entity type.", "shop");
+        let arr = v.as_array().expect("array");
+        let noun = arr.iter().find(|e| e["type"] == "Noun").expect("noun");
+        assert_eq!(noun["id"], "shop:Noun:Customer");
+    }
+
+    #[test]
+    fn fallback_handles_terminator_with_derivation_marker() {
+        // FORML 2 derivation rules end `. *` / `. **` / `. +`. The
+        // fallback strips trailing markers so the line is still
+        // recognised as a statement.
+        let v = fallback("Customer has Email. *", "shop");
+        let readings: Vec<&str> = v.as_array().unwrap().iter()
+            .filter(|e| e["type"] == "Reading")
+            .filter_map(|e| e["data"]["text"].as_str())
+            .collect();
+        assert_eq!(readings.len(), 1, "marker-terminated line should still be a Reading; got: {readings:?}");
+    }
+
+    #[test]
+    fn fallback_through_parse_dispatch_returns_nouns_on_host_too() {
+        // On wasm32 production builds `parse_dispatch_inner` calls
+        // `regex_fallback_parse`. On the host (where this test
+        // runs) it calls the full parser. This test exercises the
+        // host path end-to-end as a smoke that the public entry
+        // point still works after the fallback was wired in.
+        let input = r#"{"markdown":"Customer is an entity type.","domain":"x"}"#;
+        let v: serde_json::Value = serde_json::from_str(&parse_dispatch(input, false))
+            .expect("valid JSON");
+        let nouns: Vec<&str> = v.as_array().unwrap().iter()
+            .filter(|e| e["type"] == "Noun")
+            .filter_map(|e| e["data"]["name"].as_str())
+            .collect();
+        assert!(nouns.contains(&"Customer"), "expected Customer noun; got: {v}");
     }
 }
