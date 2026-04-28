@@ -552,10 +552,20 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
 
     // 1:1 absorption: direction bias via pure if-expression chain.
     // (Control flow has no side effects â€” returns a tuple, inputs â†’ output.)
-    let one_to_one_additions: Vec<(String, TableColumn, Option<String>)> = one_to_one_ft_ids.iter().map(|ft_id| {
+    let one_to_one_additions: Vec<(String, TableColumn, Option<String>)> = one_to_one_ft_ids.iter().filter_map(|ft_id| {
         let ft = &fact_types[ft_id];
-        let role0 = &ft.roles[0];
-        let role1 = &ft.roles[1];
+        // 1:1 absorption is a binary-only collapse: pick whichever
+        // entity role is mandatory (or has more participation) and
+        // fold the other-side role into it as a column. Ternary+ FTs
+        // can't be absorbed this way — they'd need to choose which
+        // pair to collapse, and the answer is ambiguous. The upstream
+        // `one_to_one_ft_ids` filter at line 462 (`roles.len() == 2`)
+        // already guarantees binary, but the bounds-check below makes
+        // the contract explicit at the use site so a future drift in
+        // the upstream filter degrades to an empty additions list
+        // instead of an out-of-bounds panic on `ft.roles[0]/[1]`.
+        let role0 = ft.roles.get(0)?;
+        let role1 = ft.roles.get(1)?;
         let mc0 = mc_set.contains(&format!("{}:{}", ft_id, role0.role_index));
         let mc1 = mc_set.contains(&format!("{}:{}", ft_id, role1.role_index));
 
@@ -589,7 +599,7 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
             nullable: !is_mandatory,
             references: if is_target_entity { Some(to_snake(fk_target)) } else { None },
         };
-        (absorb_into, column, None)
+        Some((absorb_into, column, None))
     }).collect();
 
     let xo_additions: Vec<(String, TableColumn, Option<String>)> = xo_columns.iter()

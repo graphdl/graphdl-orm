@@ -633,23 +633,49 @@ fn paths_for_noun_from_state(
         ]
     };
 
-    // Theorem 4b navigation from state cells
-    let participations: Vec<(String, String)> = ft_seq.iter().filter_map(|f| {
-        let ft_id = binding(f, "id")?;
+    // Theorem 4b navigation from state cells. Generalised over arity:
+    // for a binary FT we emit one nav route per other noun (one);
+    // for a ternary FT, one per other noun (two); for an n-ary FT,
+    // one per *unique* non-self role. Ring FTs (noun_name appearing
+    // ≥ 2 times in the same FT) additionally get a single self-route
+    // — the verb-slug disambiguator downstream avoids the
+    // `/{plural}/{id}/{plural}` collision. Pre-#634 the binary-only
+    // gate (`if ft_roles.len() != 2 { return None; }`) silently
+    // dropped every ternary+ FT from the OpenAPI nav surface.
+    let participations: Vec<(String, String)> = ft_seq.iter().flat_map(|f| {
+        let ft_id = match binding(f, "id") {
+            Some(id) => id,
+            None => return Vec::new(),
+        };
         let reading = binding(f, "reading").unwrap_or("").to_string();
         let ft_roles: Vec<&str> = role_seq.iter()
             .filter(|r| binding(r, "factType") == Some(ft_id))
             .filter_map(|r| binding(r, "nounName"))
             .collect();
-        if ft_roles.len() != 2 { return None; }
-        if !ft_roles.iter().any(|r| *r == noun_name) { return None; }
-        let other_name = ft_roles.iter()
-            .find(|r| **r != noun_name)
-            .map(|r| r.to_string())
-            .unwrap_or_else(|| ft_roles[0].to_string());
-        // other must be an entity
-        if noun_types.get(&other_name).map(|t| t.as_str()) != Some("entity") { return None; }
-        Some((other_name, reading))
+        if ft_roles.len() < 2 { return Vec::new(); }
+        let self_count = ft_roles.iter().filter(|r| **r == noun_name).count();
+        if self_count == 0 { return Vec::new(); }
+
+        let is_entity = |n: &str| {
+            noun_types.get(n).map(|t| t.as_str()) == Some("entity")
+        };
+
+        let mut acc: Vec<(String, String)> = Vec::new();
+        // Ring (noun appears 2+ times in this FT): emit a single self-
+        // route. Only one — additional self-roles are the same target.
+        if self_count >= 2 && is_entity(noun_name) {
+            acc.push((noun_name.to_string(), reading.clone()));
+        }
+        // Then one route per unique non-self role (entities only —
+        // value types like Status / Date aren't navigable).
+        for other in ft_roles.iter().filter(|r| **r != noun_name) {
+            if !is_entity(other) { continue; }
+            let pair = (other.to_string(), reading.clone());
+            if !acc.contains(&pair) {
+                acc.push(pair);
+            }
+        }
+        acc
     }).collect();
 
     let mut by_other: HashMap<String, Vec<String>> = HashMap::new();
@@ -1274,6 +1300,52 @@ mod tests {
         assert_eq!(list_schema["properties"]["data"]["type"], "array",
             "list envelope's data must be an array of entity rows; got: {}",
             list_schema);
+    }
+
+    #[test]
+    fn ternary_fact_type_emits_nav_routes_for_each_other_role_634() {
+        // Ternary FT — pre-#634, openapi.rs `if ft_roles.len() != 2 { return None; }`
+        // dropped these from the Theorem 4b nav surface entirely, so a
+        // ternary FT yielded *zero* `/{id}/related/...` routes. After
+        // the fix, every other entity role of the FT contributes one
+        // route per side. Three entity nouns A, B, C in one ternary FT
+        // produce six routes (A→B, A→C, B→A, B→C, C→A, C→B).
+        let state = parse("\
+            Reviewer(.Slug) is an entity type.\n\
+            Movie(.Slug) is an entity type.\n\
+            Award(.Slug) is an entity type.\n\
+            Slug is a value type.\n\
+            Reviewer has Slug.\n\
+              Each Reviewer has exactly one Slug.\n\
+            Movie has Slug.\n\
+              Each Movie has exactly one Slug.\n\
+            Award has Slug.\n\
+              Each Award has exactly one Slug.\n\
+            Reviewer recommends Movie for Award.\n\
+        ");
+        let doc = openapi_for_app(&state, "test-app");
+        let paths = doc["paths"].as_object().expect("paths must be object");
+
+        // Each entity participating in the ternary FT must reach the
+        // other two through nav routes. The slug shape under
+        // `by_other` collapses to the plural of the *other* noun when
+        // a single reading covers the pair (no disambiguation needed).
+        let expected = [
+            "/reviewers/{id}/movies",
+            "/reviewers/{id}/awards",
+            "/movies/{id}/reviewers",
+            "/movies/{id}/awards",
+            "/awards/{id}/reviewers",
+            "/awards/{id}/movies",
+        ];
+        let actual: Vec<&String> = paths.keys().collect();
+        for path in expected {
+            assert!(
+                paths.contains_key(path),
+                "ternary FT must emit nav route '{}' (Theorem 4b); paths: {:?}",
+                path, actual,
+            );
+        }
     }
 
     #[test]
