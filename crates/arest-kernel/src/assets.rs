@@ -44,6 +44,16 @@ pub fn lookup(path: &str) -> Option<Asset> {
         return None;
     }
 
+    // `/arest/*` is the HATEOAS namespace — same `system::dispatch`
+    // ownership as `/api/*`. Without this exclusion the SPA fallback
+    // below rewrites `/arest/parse`, `/arest/organizations/{id}`, etc.
+    // to `index.html`, masking real 404s and breaking the host-driven
+    // e2e suite (#608/#609/#610). Mirrors the worker's behaviour where
+    // `/arest/*` is a dynamic catch-all, never a static asset.
+    if path == "/arest" || path.starts_with("/arest/") {
+        return None;
+    }
+
     // `/` resolves to `/index.html`.
     let lookup_path = if path == "/" { "/index.html" } else { path };
 
@@ -198,6 +208,20 @@ mod tests {
         assert!(lookup("/api/welcome").is_none());
         assert!(lookup("/api/entities/Noun").is_none());
         assert!(lookup("/api").is_none());
+    }
+
+    // `/arest/*` is the HATEOAS namespace owned by `system::dispatch`.
+    // Without this exclusion the SPA fallback rewrites `/arest/parse`
+    // (and every other dynamic path) to `index.html`, masking real
+    // 404s during the kernel HATEOAS port.
+    #[test]
+    fn arest_paths_are_never_served_by_assets() {
+        assert!(lookup("/arest/parse").is_none());
+        assert!(lookup("/arest/organizations").is_none());
+        assert!(lookup("/arest/organizations/abc-123").is_none());
+        assert!(lookup("/arest/entity").is_none());
+        assert!(lookup("/arest/entities/SupportRequest").is_none());
+        assert!(lookup("/arest").is_none());
     }
 
     #[test]

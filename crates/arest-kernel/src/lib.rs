@@ -195,6 +195,12 @@ pub mod usb_uart;
 /// `system::dispatch` (ρ-applied defs over baked state). Pub so the
 /// per-arch entry harnesses (`entry_uefi*::kernel_run_*`) can register
 /// it via `net::register_http(80, arest_http_handler)`.
+///
+/// `assets::lookup` already returns `None` for `/api/*` and `/arest/*`
+/// (HATEOAS namespace, owned by `system::dispatch`) — so a request like
+/// `GET /arest/parse` falls through to the dynamic dispatch and yields
+/// a real 404 instead of being rewritten to `index.html` by the SPA
+/// fallback. That carve-out is the wire-level half of #610.
 pub fn arest_http_handler(req: &http::Request) -> http::Response {
     if let Some(asset) = assets::lookup(&req.path) {
         return http::Response::ok_cached(
