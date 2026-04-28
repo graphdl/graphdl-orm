@@ -86,6 +86,10 @@ pub mod naming;
 // no_std gate stance as `naming` since the kernel is the primary
 // consumer; std hosts get the helper for free.
 pub mod hateoas;
+// `json_min` — minimal recursive-descent JSON parser, no_std-clean
+// (#614). Powers the kernel POST entity write path, since `serde_json`
+// is std-only and the kernel can't link it. Same gate as `hateoas`.
+pub mod json_min;
 #[cfg(not(feature = "no_std"))]
 // validate.rs deleted — zero production callers, tests were self-referential.
 #[cfg(not(feature = "no_std"))]
