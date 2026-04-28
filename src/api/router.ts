@@ -517,31 +517,47 @@ router.post('/api/entity', async (request, env: Env) => {
 
   // AREST: one command, one function application, one state transfer.
   const getStub = (id: string) => getEntityDO(env, id) as any
-  let populationJson = JSON.stringify({ facts: {} })
-  populationJson = await loadDomainAndPopulation(registry, getStub, body.domain)
 
-  const arestResult = applyCommand({
-    type: 'createEntity',
-    noun: body.noun,
-    domain: body.domain,
-    id: null, // resolved below from reference scheme
-    fields: parentFields,
-  }, populationJson)
+  // Engine path — runs the WASM parser to compile the domain readings,
+  // then applies a createEntity command which validates constraints and
+  // resolves reference-scheme ids. When the WASM parser is broken on
+  // the deploy target (currently wasm32-unknown-unknown traps inside
+  // the FORML 2 grammar bootstrap), we fall through to a degraded
+  // direct-write path: skip constraint check, mint a UUID, persist.
+  let arestResult: any = null
+  let engineFailure: string | null = null
+  try {
+    const populationJson = await loadDomainAndPopulation(registry, getStub, body.domain)
+    arestResult = applyCommand({
+      type: 'createEntity',
+      noun: body.noun,
+      domain: body.domain,
+      id: null, // resolved below from reference scheme
+      fields: parentFields,
+    }, populationJson)
+  } catch (e) {
+    engineFailure = `${e}`
+  }
 
-  if (arestResult.rejected) {
+  if (arestResult?.rejected) {
     return error(422, { errors: arestResult.violations.map((v: any) => ({ message: v.detail, constraintId: v.constraintId })) })
   }
 
-  // Persist all entities from the AREST result (Resource + State Machine + Violations)
-  for (const entity of arestResult.entities) {
+  // Persist all entities from the AREST result (Resource + State Machine + Violations).
+  // In the engine-failure fallback, synthesize a single Entity record from the request
+  // body — no constraint check, no derivation, no state machine, but the row lands in
+  // EntityDB + Registry so reads see it.
+  const entitiesToPersist: Array<{ id?: string; type: string; data: Record<string, any> }> =
+    arestResult?.entities ?? [{ type: body.noun, data: parentFields }]
+  for (const entity of entitiesToPersist) {
     const eid = entity.id || crypto.randomUUID()
     const eDO = getEntityDO(env, eid) as any
     await eDO.put({ id: eid, type: entity.type, data: entity.data })
     await registry.indexEntity(entity.type, eid, body.domain)
   }
 
-  // The primary entity ID — first entity in the result
-  const primaryEntity = arestResult.entities[0]
+  // The primary entity ID — first entity in the result, or the synthesized fallback.
+  const primaryEntity = entitiesToPersist[0]
   const parentId = primaryEntity?.id || crypto.randomUUID()
 
   // Create children as separate Entity DOs
@@ -561,10 +577,11 @@ router.post('/api/entity', async (request, env: Env) => {
     id: parentId,
     noun: body.noun,
     domain: body.domain,
-    status: arestResult.status,
-    transitions: arestResult.transitions,
-    ...(arestResult.derivedCount > 0 && { derived: arestResult.derivedCount }),
-    ...(arestResult.violations.length > 0 && { deonticWarnings: arestResult.violations }),
+    status: arestResult?.status ?? null,
+    transitions: arestResult?.transitions ?? [],
+    ...(arestResult?.derivedCount > 0 && { derived: arestResult.derivedCount }),
+    ...(arestResult?.violations?.length > 0 && { deonticWarnings: arestResult.violations }),
+    ...(engineFailure && { engineFailure }),
   }, { status: 201 })
 })
 
