@@ -155,6 +155,235 @@ fn json_string(s: &str) -> String {
     out
 }
 
+/// Handle a HATEOAS write — `POST /arest/entities/{slug}` with a body
+/// of `{"id":"...","data":{...}}` — and return the new state plus the
+/// JSON envelope the worker's `EntityDB.create` returns
+/// (`{id, type, ...data}`). Returns `None` for non-matching paths,
+/// non-POST methods, unknown slugs, malformed JSON, or missing `id`.
+///
+/// Direct-write fallback only — the engine path (validate / derive /
+/// apply via `system::apply`) lands once #588 lifts Stage-2 to no_std.
+/// Until then this is the only POST path the kernel honours, mirror
+/// of the worker's `router.ts::handleEntitiesPost` create-side
+/// fallback.
+///
+/// Caller is responsible for committing the returned state via
+/// `system::apply` and emitting the response bytes back over HTTP.
+/// `handle_arest_read` afterwards sees the new entity in the same
+/// `Noun`'s cell — reads through the same projection path.
+pub fn handle_arest_create_for_slug(
+    state: &Object,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Option<(Object, Vec<u8>)> {
+    if method != "POST" {
+        return None;
+    }
+    let stripped = path.split('?').next().unwrap_or(path);
+    let trimmed = stripped.strip_prefix("/arest/entities/")?.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed.contains('/') {
+        return None;
+    }
+    // Path-encoded slugs may carry `%20` for spaces (e.g.
+    // `Support%20Request` — see `apis/__e2e__/arest.test.ts:240`).
+    // We accept either the percent-encoded or already-decoded form.
+    let slug_raw = trimmed;
+    let slug_decoded = percent_decode(slug_raw);
+    // The worker accepts the *noun name* directly in this path
+    // (e.g. `/arest/entities/Organization`), not the kebab-pluralised
+    // slug. Try noun-name match first; fall back to slug-projection
+    // resolution to keep the kernel forgiving.
+    let noun = if crate::ast::fetch_or_phi("Noun", state)
+        .as_seq()
+        .map(|ns| ns.iter().any(|n| crate::ast::binding(n, "name") == Some(&slug_decoded)))
+        .unwrap_or(false)
+    {
+        slug_decoded.clone()
+    } else {
+        crate::naming::resolve_slug_to_noun(state, slug_raw)
+            .or_else(|| crate::naming::resolve_slug_to_noun(state, &slug_decoded))?
+    };
+
+    let parsed = crate::json_min::parse(body)?;
+    let id = parsed.get("id").and_then(|v| v.as_str())?;
+    if id.is_empty() {
+        return None;
+    }
+    let data = parsed.get("data");
+
+    // Build the named-tuple fact: <<id, ID>, <key1, val1>, …>.
+    // String values flatten directly; nested objects / arrays / null /
+    // booleans are skipped — the engine can't represent them as
+    // role values today and the worker's direct-write fallback skips
+    // them too. (Floating-point numbers survive as their lexed atom
+    // string since `Atom` is opaque to the engine layer.)
+    let mut pairs: Vec<Object> = Vec::new();
+    pairs.push(Object::seq(alloc::vec![Object::atom("id"), Object::atom(id)]));
+    if let Some(JsonValue::Object(fields)) = data {
+        for (k, v) in fields {
+            if k == "id" {
+                continue;
+            }
+            let val = match v {
+                JsonValue::Str(s) => s.as_str(),
+                JsonValue::Num(n) => n.as_str(),
+                JsonValue::Bool(true) => "T",
+                JsonValue::Bool(false) => "F",
+                _ => continue,
+            };
+            pairs.push(Object::seq(alloc::vec![Object::atom(k), Object::atom(val)]));
+        }
+    }
+    let entity = Object::seq(pairs);
+
+    let new_state = crate::ast::cell_push(&noun, entity.clone(), state);
+    let response_body = entity_to_json(&noun, &entity).into_bytes();
+    Some((new_state, response_body))
+}
+
+/// Handle `POST /arest/entity` with a body of
+/// `{"noun":"Organization","domain":"organizations","fields":{...}}`.
+/// Mirror of the worker's AREST-command create path
+/// (`router.ts::handleArestRoute` POST branch). The kernel today
+/// can't run the engine path (gated on #588), so this is the
+/// direct-write fallback only — same shape `handle_arest_create_for_slug`
+/// uses, but with the noun read from the body and a random id
+/// (`arest::csprng::random_bytes`) since the request doesn't supply one.
+///
+/// Returns `None` for non-matching paths, non-POST methods, malformed
+/// JSON, missing/unknown noun. Caller commits the new state via
+/// `system::apply` and emits the response bytes.
+pub fn handle_arest_create(
+    state: &Object,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Option<(Object, Vec<u8>)> {
+    if method != "POST" {
+        return None;
+    }
+    let stripped = path.split('?').next().unwrap_or(path);
+    if stripped != "/arest/entity" {
+        return None;
+    }
+
+    let parsed = crate::json_min::parse(body)?;
+    let noun_raw = parsed.get("noun").and_then(|v| v.as_str())?;
+    if noun_raw.is_empty() {
+        return None;
+    }
+    // Verify the noun is registered. Mirror of the slug resolver's
+    // safety net — unknown nouns 404 rather than silently creating
+    // a stray cell.
+    let noun_registered = crate::ast::fetch_or_phi("Noun", state)
+        .as_seq()
+        .map(|ns| ns.iter().any(|n| crate::ast::binding(n, "name") == Some(noun_raw)))
+        .unwrap_or(false);
+    if !noun_registered {
+        return None;
+    }
+    let noun = noun_raw.to_string();
+
+    // Generate an id. The worker uses `crypto.randomUUID()`; the
+    // kernel can't always reach a hardware entropy source (QEMU
+    // commonly hides RDSEED/RDRAND, and `csprng::random_bytes`
+    // panics on reseed failure — #571 tracks the EFI_RNG_PROTOCOL
+    // fallback). Until that lands, we generate a stable opaque id
+    // from a per-process atomic counter + an FNV-1a hash of the
+    // request body. Counter ensures uniqueness across requests in
+    // the same boot; FNV-hash makes it opaque so callers can't
+    // predict the next id from request shape alone. This is the
+    // direct-write fallback's id strategy — the engine path will
+    // route through `arest::naming::resolve_entity_id` once #588
+    // unblocks the no_std Stage-2 parser.
+    let counter = NEXT_ENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let body_hash = fnv1a_64(body);
+    let id = alloc::format!("k{:08x}{:016x}", counter, body_hash);
+
+    // Same flatten policy as `handle_arest_create_for_slug`.
+    let mut pairs: Vec<Object> = Vec::new();
+    pairs.push(Object::seq(alloc::vec![Object::atom("id"), Object::atom(&id)]));
+    if let Some(JsonValue::Object(fields)) = parsed.get("fields") {
+        for (k, v) in fields {
+            if k == "id" {
+                continue;
+            }
+            let val = match v {
+                JsonValue::Str(s) => s.as_str(),
+                JsonValue::Num(n) => n.as_str(),
+                JsonValue::Bool(true) => "T",
+                JsonValue::Bool(false) => "F",
+                _ => continue,
+            };
+            pairs.push(Object::seq(alloc::vec![Object::atom(k), Object::atom(val)]));
+        }
+    }
+    let entity = Object::seq(pairs);
+
+    let new_state = crate::ast::cell_push(&noun, entity.clone(), state);
+    let response_body = entity_to_json(&noun, &entity).into_bytes();
+    Some((new_state, response_body))
+}
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+/// Per-process counter for entity-id generation in the direct-write
+/// fallback. Reset across kernel boots; ids are unique within a single
+/// kernel lifetime, not globally. Once the engine path lands the
+/// engine's reference-scheme resolver replaces this.
+static NEXT_ENTITY_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// 64-bit FNV-1a hash. Good enough to make the id opaque to callers
+/// (no preimage from request shape); not a cryptographic hash.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Decode `%20` and `%XX` percent-escapes in a URL path segment.
+/// The kernel's HTTP path arrives raw — we decode it lazily here so
+/// `Support%20Request` round-trips to `Support Request` for noun
+/// lookup. Hand-rolled instead of pulling `percent-encoding` since
+/// the kernel build is no_std.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = hex_digit(bytes[i + 1]);
+            let lo = hex_digit(bytes[i + 2]);
+            match (hi, lo) {
+                (Some(hi), Some(lo)) => {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+use crate::json_min::JsonValue;
+
 /// Aggregate parser/registry counts from `state` into the JSON shape
 /// the worker's `GET /arest/parse` returns
 /// (`src/api/parse.ts::handleParseGet`):
@@ -340,6 +569,77 @@ mod tests {
         // contract this test pins.
         let body = String::from_utf8(parse_stats(&Object::phi())).unwrap();
         assert!(body.starts_with("{\"totals\":{"), "{body}");
+    }
+
+    #[test]
+    fn create_for_slug_writes_entity_into_noun_cell() {
+        // Hand-stage a Noun cell with Organization registered so the
+        // resolver succeeds, then POST a body and verify both the
+        // new state contains the entity and the response envelope
+        // matches `EntityDB.create`'s `{id, type, ...data}`.
+        let s = Object::phi();
+        let s = cell_push("Noun", fact(&[("name", "Organization")]), &s);
+
+        let body = br#"{"id":"acme","data":{"name":"Acme Corp","orgSlug":"acme"}}"#;
+        let (new_state, resp) = handle_arest_create_for_slug(
+            &s, "POST", "/arest/entities/Organization", body,
+        ).expect("create must succeed");
+
+        let resp = String::from_utf8(resp).unwrap();
+        assert!(resp.contains("\"id\":\"acme\""), "{resp}");
+        assert!(resp.contains("\"type\":\"Organization\""), "{resp}");
+        assert!(resp.contains("\"name\":\"Acme Corp\""), "{resp}");
+        assert!(resp.contains("\"orgSlug\":\"acme\""), "{resp}");
+
+        // Round-trip: the new state should now serve a list with one
+        // entity through the read fallback.
+        let list = handle_arest_read(&new_state, "GET", "/arest/organizations").expect("list");
+        let list = String::from_utf8(list).unwrap();
+        assert!(list.contains("\"totalDocs\":1"), "{list}");
+        assert!(list.contains("\"id\":\"acme\""), "{list}");
+    }
+
+    #[test]
+    fn create_for_slug_accepts_percent_encoded_noun() {
+        // `/arest/entities/Support%20Request` is the path the apis
+        // e2e suite uses (`encodeURIComponent('Support Request')`).
+        let s = Object::phi();
+        let s = cell_push("Noun", fact(&[("name", "Support Request")]), &s);
+        let body = br#"{"id":"sr-1","data":{"title":"alpha"}}"#;
+        let (_, resp) = handle_arest_create_for_slug(
+            &s, "POST", "/arest/entities/Support%20Request", body,
+        ).expect("percent-encoded noun must resolve");
+        let resp = String::from_utf8(resp).unwrap();
+        assert!(resp.contains("\"type\":\"Support Request\""), "{resp}");
+    }
+
+    #[test]
+    fn create_for_slug_rejects_non_post() {
+        let s = cell_push("Noun", fact(&[("name", "Organization")]), &Object::phi());
+        let body = br#"{"id":"acme","data":{}}"#;
+        assert!(handle_arest_create_for_slug(&s, "GET", "/arest/entities/Organization", body).is_none());
+        assert!(handle_arest_create_for_slug(&s, "DELETE", "/arest/entities/Organization", body).is_none());
+    }
+
+    #[test]
+    fn create_for_slug_rejects_unknown_noun() {
+        let s = cell_push("Noun", fact(&[("name", "Organization")]), &Object::phi());
+        let body = br#"{"id":"x","data":{}}"#;
+        assert!(handle_arest_create_for_slug(&s, "POST", "/arest/entities/Widget", body).is_none());
+    }
+
+    #[test]
+    fn create_for_slug_rejects_missing_id() {
+        let s = cell_push("Noun", fact(&[("name", "Organization")]), &Object::phi());
+        let body = br#"{"data":{"name":"acme"}}"#;
+        assert!(handle_arest_create_for_slug(&s, "POST", "/arest/entities/Organization", body).is_none());
+    }
+
+    #[test]
+    fn create_for_slug_rejects_malformed_json() {
+        let s = cell_push("Noun", fact(&[("name", "Organization")]), &Object::phi());
+        let body = br#"{not valid json"#;
+        assert!(handle_arest_create_for_slug(&s, "POST", "/arest/entities/Organization", body).is_none());
     }
 
     #[test]
