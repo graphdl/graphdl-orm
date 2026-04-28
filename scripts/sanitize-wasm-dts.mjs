@@ -52,21 +52,62 @@ if (cleaned !== src) {
 const npmIgnorePath = resolve(__dirname, '..', 'crates', 'arest', 'pkg', '.npmignore')
 writeFileSync(npmIgnorePath, '', 'utf-8')
 
-// Cloudflare Workers' WASM runtime doesn't expose `__wbindgen_start` on
-// every instantiation path. wasm-pack's bundler target unconditionally
-// invokes it at module load, which crashes the Worker on deploy with
-// `TypeError: wasm2.__wbindgen_start is not a function`. Guard the call
-// so the module loads whether or not the runtime surfaces the start hook.
+// Cloudflare Workers + wasm-pack bundler-target mismatch.
+//
+// wasm-pack's bundler-target `arest.js` ships:
+//
+//   import * as wasm from "./arest_bg.wasm";
+//   import { __wbg_set_wasm } from "./arest_bg.js";
+//   __wbg_set_wasm(wasm);
+//   wasm.__wbindgen_start();
+//
+// It assumes the bundler auto-instantiates the WASM and exposes
+// `instance.exports` as the namespace import. Webpack with
+// `experiments.asyncWebAssembly` does this; wrangler's `CompiledWasm`
+// rule does NOT — it gives you a bare `WebAssembly.Module` instead.
+//
+// Result: `wasm.__wbindgen_malloc`, `wasm.__wbindgen_free`, `wasm.system`,
+// every export is `undefined` at runtime. The first WASM-touching request
+// throws `TypeError: wasm.<intrinsic> is not a function`, which surfaces
+// as "parse error: TypeError: wasm.__wbindgen_free is not a function" on
+// `POST /api/parse`. (The error always names `__wbindgen_free` because
+// `system()`'s `finally` clause runs after the `try` already threw on the
+// missing `__wbindgen_malloc`, and finally's throw replaces try's.)
+//
+// Rewrite `arest.js` to manually `new WebAssembly.Instance(...)` against
+// the host glue in `arest_bg.js`, then expose `.exports` as `wasm` for
+// the rest of the wrapper. The WASM module's import section names
+// `./arest_bg.js` as the source for `__wbg_*` thunks, so that's the key
+// in the import object we hand to `WebAssembly.Instance`.
 const arestJsPath = resolve(__dirname, '..', 'crates', 'arest', 'pkg', 'arest.js')
 if (existsSync(arestJsPath)) {
   const jsSrc = readFileSync(arestJsPath, 'utf-8')
-  const guarded = jsSrc.replace(
-    /^wasm\.__wbindgen_start\(\);$/m,
-    'if (typeof wasm.__wbindgen_start === "function") wasm.__wbindgen_start();',
-  )
-  if (guarded !== jsSrc) {
-    writeFileSync(arestJsPath, guarded, 'utf-8')
-    console.log('sanitize-wasm-dts: guarded __wbindgen_start() call for CF Workers')
+
+  // Idempotent: skip if already rewritten (yarn build:wasm runs the
+  // sanitizer every build — the second run would otherwise see the
+  // already-correct shim and fail to match).
+  const already = jsSrc.includes('new WebAssembly.Instance(')
+  if (!already) {
+    const rewritten = jsSrc.replace(
+      /import \* as wasm from "\.\/arest_bg\.wasm";\s*\n+import \{ __wbg_set_wasm \} from "\.\/arest_bg\.js";\s*\n+__wbg_set_wasm\(wasm\);\s*\n+(?:if \(typeof wasm\.__wbindgen_start === "function"\) )?wasm\.__wbindgen_start\(\);/,
+      [
+        'import wasm_module from "./arest_bg.wasm";',
+        'import * as __arest_bg from "./arest_bg.js";',
+        'const wasm = new WebAssembly.Instance(wasm_module, { "./arest_bg.js": __arest_bg }).exports;',
+        '__arest_bg.__wbg_set_wasm(wasm);',
+        'if (typeof wasm.__wbindgen_start === "function") wasm.__wbindgen_start();',
+      ].join('\n'),
+    )
+    if (rewritten === jsSrc) {
+      console.error(
+        'sanitize-wasm-dts: FATAL — failed to rewrite arest.js for CF Workers.\n' +
+        '  Expected the wasm-pack bundler-target preamble (import * as wasm + __wbg_set_wasm + __wbindgen_start);\n' +
+        '  found neither that nor an already-rewritten shim. wasm-pack probably changed its template.',
+      )
+      process.exit(2)
+    }
+    writeFileSync(arestJsPath, rewritten, 'utf-8')
+    console.log('sanitize-wasm-dts: rewrote arest.js to manually instantiate WASM (CF Workers compat)')
   }
 }
 
