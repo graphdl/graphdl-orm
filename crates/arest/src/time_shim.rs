@@ -1,0 +1,59 @@
+// crates/arest/src/time_shim.rs
+//
+// `std::time::Instant::now()` panics on `wasm32-unknown-unknown` —
+// the target has no monotonic clock, and the std stub for `Instant`
+// is a `panic!("time not implemented on this platform")`. With
+// `panic = "abort"` (wasm-pack release default) that panic becomes a
+// raw `unreachable` WASM trap, surfacing in the Cloudflare Worker as
+// `RuntimeError: unreachable` on every parse call.
+//
+// Stage-2 of the FORML 2 parser uses `Instant::now()` purely for
+// optional `AREST_STAGE12_TRACE` logging — the duration is read but
+// never affects parser output. So a shim that returns zero on wasm32
+// is functionally identical to the std behaviour everywhere a trace
+// isn't being printed (i.e. always, in the worker).
+//
+// Native targets keep the real `std::time::Instant` so trace
+// telemetry on the CLI / kernel host still works as designed.
+
+#![cfg(feature = "std-deps")]
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use std::time::Instant;
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy)]
+pub struct Instant;
+
+#[cfg(target_arch = "wasm32")]
+impl Instant {
+    /// Always returns the same sentinel — wasm32 has no clock to
+    /// query. Cheap (compiles to a single MOV) so call sites can
+    /// keep their unconditional `let t = Instant::now()` shape.
+    pub fn now() -> Self { Self }
+
+    /// Always zero. The only consumer is the `AREST_STAGE12_TRACE`
+    /// logging branch, which is gated on a non-wasm `env::var` and
+    /// therefore unreachable in the worker; if a future caller
+    /// asserts on elapsed time they get a clear "all zero" signal
+    /// rather than a panic.
+    pub fn elapsed(&self) -> core::time::Duration {
+        core::time::Duration::ZERO
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smoke test on the host build — proves the shim compiles and
+    /// that the native path still threads through `std::time::Instant`.
+    /// The wasm32 path is exercised by the `parse_intercept` tests
+    /// running against the deployed Worker (whose binary IS the
+    /// wasm32 build).
+    #[test]
+    fn instant_now_does_not_panic() {
+        let t = Instant::now();
+        let _ = t.elapsed();
+    }
+}

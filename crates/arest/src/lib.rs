@@ -186,6 +186,19 @@ pub mod wasm_lower;
 #[cfg(feature = "cloudflare")]
 pub mod cloudflare;
 
+// Stateless `parse` / `parse_with_nouns` intercept for the JS worker
+// (see `parse_intercept.rs` for the why). The module gates its own
+// contents on `std-deps + !no_std`, so a no-import here is harmless
+// in the kernel build.
+mod parse_intercept;
+
+// wasm-safe `Instant` shim — see time_shim.rs for the why
+// (std::time::Instant panics on wasm32-unknown-unknown). Every
+// stage-2 timing call site refers to `crate::time_shim::Instant`
+// instead of `std::time::Instant`. Module is `pub(crate)` so the
+// stage2 module can `use crate::time_shim::Instant;`.
+pub(crate) mod time_shim;
+
 // The DOMAINS / CompiledState / system_impl machinery requires serde,
 // serde_json, regex, and std — excluded from the no_std kernel build.
 // The kernel uses only `ast` and `freeze` directly.
@@ -1085,6 +1098,21 @@ fn is_read_only_op(key: &str) -> bool {
 ///     follow-up; it needs apply() to acquire cell locks just-in-time.
 #[cfg(not(feature = "no_std"))]
 fn system_impl(handle: u32, key: &str, input: &str) -> String {
+    // Stateless parse dispatch — handle 0 + key in {parse,
+    // parse_with_nouns} is the worker's "no tenant, just parse and
+    // hand me entities" path. Has to run BEFORE `tenant_lock`
+    // because slot 0 is never pre-allocated, and falling through
+    // would return "⊥" — exactly the JSON-parse failure the seed
+    // pipeline hit.
+    #[cfg(feature = "std-deps")]
+    if handle == 0 {
+        match key {
+            "parse" => return crate::parse_intercept::parse_dispatch(input, false),
+            "parse_with_nouns" => return crate::parse_intercept::parse_dispatch(input, true),
+            _ => {}
+        }
+    }
+
     let tenant = match tenant_lock(handle) {
         Some(t) => t,
         None => return "⊥".into(),

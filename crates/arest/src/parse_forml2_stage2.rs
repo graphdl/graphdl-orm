@@ -30,6 +30,7 @@ extern crate alloc;
 use alloc::{string::{String, ToString}, vec::Vec};
 use hashbrown::HashMap;
 use crate::ast::{Object, fetch_or_phi, fact_from_pairs, binding};
+use crate::time_shim::Instant;
 
 /// Classify every Statement in `statements_state` using the grammar
 /// rules in `grammar_state`. Returns a new state identical to
@@ -38,7 +39,7 @@ use crate::ast::{Object, fetch_or_phi, fact_from_pairs, binding};
 #[cfg(feature = "std-deps")]
 pub fn classify_statements(statements_state: &Object, grammar_state: &Object) -> Object {
     let trace = std::env::var("AREST_STAGE12_TRACE").is_ok();
-    let tc0 = std::time::Instant::now();
+    let tc0 = Instant::now();
     // Merge Stage-1 statement cells with grammar cells so
     // `compile_to_defs_state` sees both the nouns/fact-types/rules
     // declared by the grammar and the Statement facts they apply to.
@@ -76,7 +77,7 @@ pub fn classify_statements(statements_state: &Object, grammar_state: &Object) ->
         .zip(classifier_antecedents.iter())
         .map(|((n, f), a)| (n.as_str(), f, Some(a.as_slice())))
         .collect();
-    let t2 = std::time::Instant::now();
+    let t2 = Instant::now();
     // Grammar classification rules stratify in depth 2: round 1 emits
     // base classifications from Stage-1 `Statement_has_*` tokens;
     // round 2 fires the single
@@ -2602,7 +2603,7 @@ fn parse_to_state_via_stage12_impl(
     extra_nouns: &[String],
 ) -> Result<Object, String> {
     let trace = std::env::var("AREST_STAGE12_TRACE").is_ok();
-    let t0 = std::time::Instant::now();
+    let t0 = Instant::now();
     let grammar_state = cached_grammar_state()?;
     if trace { eprintln!("[s12] grammar cache: {:?}", t0.elapsed()); }
 
@@ -2611,7 +2612,7 @@ fn parse_to_state_via_stage12_impl(
     // collide with a grammar keyword. Quoted names (`Noun 'Each Way
     // Bet' is an entity type.`) bypass the check and land in the
     // noun cell as single tokens.
-    let t_pre = std::time::Instant::now();
+    let t_pre = Instant::now();
     reject_reserved_noun_declarations(text)?;
 
     // Direct text-scan bootstrap for noun names — avoids running the
@@ -2637,7 +2638,7 @@ fn parse_to_state_via_stage12_impl(
     // to Object::Map once at the end. Previously we did
     // `stmt_state = merge_states(&stmt_state, ...)` per line, which is
     // O(n²) on the growing cell vectors.
-    let t_tok = std::time::Instant::now();
+    let t_tok = Instant::now();
     let mut acc_cells: HashMap<String, Vec<Object>> = HashMap::new();
     for (i, raw_line) in lines.iter().enumerate() {
         let line = raw_line.trim();
@@ -2738,11 +2739,11 @@ fn parse_to_state_via_stage12_impl(
         })
         .collect();
 
-    let t_cls = std::time::Instant::now();
+    let t_cls = Instant::now();
     let classified = classify_statements(&stmt_state, grammar_state);
     if trace { eprintln!("[s12] classify: {:?}", t_cls.elapsed()); }
 
-    let t_tr = std::time::Instant::now();
+    let t_tr = Instant::now();
     // Install a thread-local statement index. `classifications_for`
     // / `head_noun_for` / `statement_text` / `trailing_marker_for` /
     // `derivation_marker_for` short-circuit cell scans by hitting
@@ -2753,7 +2754,7 @@ fn parse_to_state_via_stage12_impl(
     // leave a stale index.
     let _idx_guard = StmtIndexGuard::install(&classified);
     macro_rules! tt { ($name:expr, $e:expr) => {{
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let v = $e;
         if trace { eprintln!("    [tr] {}: {:?}", $name, t.elapsed()); }
         v
@@ -4249,7 +4250,7 @@ mod tests {
 
         // 4. Hot loop.
         const N: usize = 50;
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         let mut last_derived = 0usize;
         for _ in 0..N {
             let (_, derived) = crate::evaluate::forward_chain_defs_state_semi_naive_with_base_keys(
