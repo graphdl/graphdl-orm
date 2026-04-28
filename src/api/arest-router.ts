@@ -344,7 +344,7 @@ export async function handleArestReadFallback(
   const slug = parts[0]
   const id = parts[1]
 
-  const noun = await resolveSlugToNoun(input.registry, slug)
+  const noun = await resolveNounForSlug(input.registry, slug)
   if (!noun) return null
 
   if (id !== undefined) {
@@ -365,4 +365,54 @@ export async function handleArestReadFallback(
     .map((e) => ({ id: e.id, type: e.type, ...(e.data || {}) }))
 
   return { type: noun, docs, totalDocs: docs.length }
+}
+
+/**
+ * Slug → noun resolution for the fallback, with two backstops:
+ *
+ *   1. `getRegisteredNouns` walks the `noun_index` populated by the
+ *      seed pipeline when readings are ingested.
+ *   2. `getEntityCounts` walks the `entity_index` — every noun that
+ *      has at least one materialized entity shows up there, even if
+ *      the seed never wrote to noun_index for that domain.
+ *
+ * (2) catches cases like the support domain, whose nouns reach the
+ * registry only as entity-type rows once a Support Request is created,
+ * not as noun_index entries. Without it `/arest/support-requests`
+ * would 500 on the fallback path.
+ */
+async function resolveNounForSlug(registry: any, slug: string): Promise<string | null> {
+  const direct = await resolveSlugToNoun(registry, slug).catch(() => null)
+  if (direct) return direct
+
+  const counts: Array<{ nounType: string; count: number }> = await registry
+    .getEntityCounts()
+    .catch(() => [])
+  const seen = new Set<string>()
+  for (const { nounType } of counts) {
+    if (seen.has(nounType)) continue
+    seen.add(nounType)
+    if (collectionsSlug(nounType) === slug) return nounType
+  }
+  return null
+}
+
+// Local rename to avoid colliding with arest-router's own `nounToSlug`
+// (different convention — kebabified+pluralized only on the last word).
+function collectionsSlug(noun: string): string {
+  const words = noun.includes(' ')
+    ? noun.split(/\s+/)
+    : noun.split(/(?=[A-Z])/).filter(Boolean)
+  return words
+    .map((w, i) => (i === words.length - 1 ? pluralizeWord(w) : w).toLowerCase())
+    .join('-')
+}
+
+function pluralizeWord(word: string): string {
+  const lower = word.toLowerCase()
+  if (lower.endsWith('z')) return word + 'zes'
+  if (lower.endsWith('ss') || lower.endsWith('sh') || lower.endsWith('ch') || lower.endsWith('x')) return word + 'es'
+  if (lower.endsWith('s')) return word + 'es'
+  if (lower.endsWith('y') && !/[aeiou]y$/i.test(word)) return word.slice(0, -1) + 'ies'
+  return word + 's'
 }
