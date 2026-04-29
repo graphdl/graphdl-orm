@@ -46,6 +46,8 @@
 // same `arch::_print` / `arch::halt_forever` shape regardless of
 // which arm is active.
 
+pub mod efi_rng;
+pub mod entropy;
 pub mod memory;
 mod serial;
 
@@ -84,6 +86,44 @@ pub fn init_console() {
 /// stay live for the rest of boot).
 pub fn init_memory(memory_map: uefi::mem::memory_map::MemoryMapOwned) -> u64 {
     memory::init(memory_map)
+}
+
+/// Install the aarch64 hardware entropy source (RNDR-preferred, with
+/// RNDRRS fallback) into `arest::entropy`'s process-wide slot (#570 /
+/// Rand-T2). Sibling of `arch::uefi::install_entropy` on x86_64. After
+/// this returns, every `arest::csprng::random_bytes` call reseeds from
+/// real silicon entropy on FEAT_RNG hardware — AT_RANDOM (#575),
+/// `getrandom` (#577), and any future consumer all share the install.
+///
+/// On aarch64 silicon without FEAT_RNG (every pre-ARMv8.5-A core), the
+/// installed source surfaces `HardwareUnavailable` from `fill()` rather
+/// than zero bytes — keeping the door open for the UEFI
+/// `EFI_RNG_PROTOCOL` fallback (#571) to chain in via the `_with_seed`
+/// variant.
+///
+/// Must run AFTER `init_memory()` (the install boxes a value via the
+/// global allocator) and BEFORE any csprng-touching code path. The
+/// boot path in `entry_uefi_aarch64.rs` calls this after
+/// `init_memory()`.
+pub fn install_entropy() {
+    install_entropy_with_seed(None)
+}
+
+/// Variant that chains the firmware-captured `EFI_RNG_PROTOCOL` seed
+/// (#571) onto the silicon path. When `boot_seed` is `Some`, hardware
+/// faults fall through to a stretched keystream derived from the
+/// firmware-provided 32 bytes — preventing the
+/// `csprng::seed_from_entropy` panic that takes down POST `/arest/entity`
+/// (#614) on QEMU+AAVMF.
+///
+/// The seed must be captured pre-`boot::exit_boot_services` (see
+/// `efi_rng::capture_boot_seed`); this function is the post-EBS sink.
+pub fn install_entropy_with_seed(boot_seed: Option<[u8; entropy::SEED_LEN]>) {
+    let primary = entropy::Aarch64HwEntropy::new();
+    let fallback = boot_seed.map(entropy::BootSeedEntropy::new);
+    arest::entropy::install(alloc::boxed::Box::new(
+        entropy::ChainedEntropy::new(primary, fallback),
+    ));
 }
 
 /// Drive the kernel's idle loop. `wfi` (Wait For Interrupt) is the
