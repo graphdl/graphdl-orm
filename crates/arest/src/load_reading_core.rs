@@ -6,29 +6,29 @@
 //
 // ## Why this lives outside `load_reading.rs`
 //
-// `load_reading.rs` is gated behind `cfg(not(feature = "no_std"))`
-// because its actual `load_reading` body reaches `parse_forml2` /
-// `check::check_readings_func`, both of which transitively pull
-// `serde` + `regex` + `std::env::var` (the stage12 grammar cache hits
-// the env for trace toggles). Until those modules land in no_std,
-// the function itself stays std-only.
+// `load_reading.rs` was historically gated behind
+// `cfg(not(feature = "no_std"))` because its actual `load_reading`
+// body reached `parse_forml2` / `check::check_readings_func`, both
+// of which transitively pulled `serde` + `regex` + `std::env::var`.
+// Those gates lifted across #588 (`097577ff` — parse_forml2_stage2
+// no_std) and #589 (`56c201df` — check.rs gate lift + stale
+// parse_to_state degated). The verb body, types, and helpers are now
+// all reachable from no_std; this module is no longer cfg-fenced.
 //
-// PPPPP-2's #560 worked around the gate by accepting a closure for
-// the actual apply step — boot-time replay walks the persistence ring
-// + reports the live record count but can't actually execute the
-// LoadReading verb. The end-state for #586 is: persisted readings
-// re-execute on kernel boot once the closure caller is updated to
-// pass `arest::load_reading_core::load_reading`.
+// PPPPP-2's #560 originally worked around the legacy gate by
+// accepting a closure for the actual apply step. With the gates
+// gone, `load_reading_persist::replay_loaded_readings` calls
+// `arest::load_reading_core::load_reading` directly (#589 closure-
+// scaffold drop). Boot-time replay now actually re-executes
+// persisted readings against the live state.
 //
 // This module provides the architectural separation:
-//   * The TYPES (`LoadReadingPolicy`, `LoadOutcome`, `LoadError`,
+//   * TYPES (`LoadReadingPolicy`, `LoadOutcome`, `LoadError`,
 //     `LoadReport`) are unconditionally available so kernel-side
 //     scaffolding can reference them in cfg-gated code paths.
-//   * The FUNCTION (`load_reading`) is currently gated `cfg(not(
-//     feature = "no_std"))` because of the parse + check dep chain.
-//     Once those modules are ported, the gate lifts to a single line
-//     edit and the kernel `use arest::load_reading_core::load_reading`
-//     becomes a working call site.
+//   * The FUNCTION (`load_reading`) is now no_std-reachable and
+//     ungated — kernel callers `use arest::load_reading_core::
+//     load_reading` directly.
 //
 // ## Pipeline (unchanged from FFFFF's #555)
 //
@@ -95,12 +95,6 @@ pub struct LoadReport {
 /// per-line / per-clause errors. `EmptyBody` and `Disallowed` carry
 /// no diagnostics because they short-circuit before parse runs.
 ///
-/// The `DeonticViolation` variant is gated on `cfg(not(feature =
-/// "no_std"))` because it carries `crate::check::ReadingDiagnostic`,
-/// and `check` is currently std-only. Under no_std the variant is
-/// elided — kernel callers that only need the type surface for
-/// closure plumbing don't need to construct it.
-///
 /// `PartialEq` is intentionally NOT derived: `ReadingDiagnostic`
 /// does not implement Eq (its `Level` / `Source` fields are simple
 /// enums but the struct as a whole was authored without an Eq
@@ -125,11 +119,9 @@ pub enum LoadError {
     ParseError(String),
     /// Constraint validation flagged one or more deontic violations
     /// against the merged state. Diagnostics are structured per
-    /// `crate::check::ReadingDiagnostic`. Variant gated on std build
-    /// because `check::ReadingDiagnostic` is not yet no_std-clean
-    /// (the `check` module pulls `parse_forml2` for its grammar
-    /// cache).
-    #[cfg(not(feature = "no_std"))]
+    /// `crate::check::ReadingDiagnostic`. (#589 — variant is now
+    /// unconditionally available; `check` is no_std-reachable as
+    /// of `56c201df`.)
     DeonticViolation(Vec<crate::check::ReadingDiagnostic>),
     /// Constraint validation flagged one or more *alethic* (Layer 2,
     /// structural-impossibility) `Level::Error` diagnostics against
@@ -143,7 +135,6 @@ pub enum LoadError {
     /// remediation surface (parse/resolve → "fix the body";
     /// deontic → "the body is well-formed but the resulting state
     /// would violate a constraint"). #559 / DynRdg-5.
-    #[cfg(not(feature = "no_std"))]
     AlethicViolation(Vec<crate::check::ReadingDiagnostic>),
 }
 
@@ -175,14 +166,13 @@ impl Default for LoadReadingPolicy {
 /// DynRdg-5). Successful loads carry an empty report
 /// (`alethic_violations.is_empty() && deontic_violations.is_empty()
 /// && passes == true`) so callers can introspect what was checked
-/// without a separate accept/reject wire surface. The field is
-/// gated on std builds because the underlying diagnostic shape
-/// (`crate::check::ReadingDiagnostic`) is std-only today.
+/// without a separate accept/reject wire surface. (#589 — field is
+/// now unconditionally available; `check::ReadingDiagnostic` is
+/// no_std-reachable as of `56c201df`.)
 #[derive(Debug, Clone)]
 pub struct LoadOutcome {
     pub report: LoadReport,
     pub new_state: Object,
-    #[cfg(not(feature = "no_std"))]
     pub validation_report: LoadValidationReport,
 }
 
@@ -208,10 +198,9 @@ pub struct LoadOutcome {
 /// `check::check_readings` directly; this report is the
 /// reject-vs-accept surface.
 ///
-/// Kept gated on std builds because `ReadingDiagnostic` itself is
-/// std-only today (transitively via `parse_forml2`). When `check`
-/// lands in no_std, lift this gate alongside `load_reading`'s.
-#[cfg(not(feature = "no_std"))]
+/// (#589) The earlier `cfg(not(feature = "no_std"))` gate lifted
+/// once `check::ReadingDiagnostic` became no_std-reachable
+/// (`56c201df`). The struct is unconditionally available now.
 #[derive(Debug, Clone, Default)]
 pub struct LoadValidationReport {
     pub alethic_violations: Vec<crate::check::ReadingDiagnostic>,
@@ -355,7 +344,9 @@ pub enum ReloadError {
     InvalidName(String),
     EmptyBody,
     UnloadFailed(UnloadError),
-    #[cfg(not(feature = "no_std"))]
+    /// (#589) Variant is now unconditionally available; `LoadError`
+    /// is no longer cfg-gated since the underlying parse + check
+    /// modules became no_std-reachable.
     LoadFailed(LoadError),
     NotImplemented,
 }
@@ -604,20 +595,15 @@ pub fn remove_cell(state: &Object, name: &str) -> Object {
     }
 }
 
-// ── load_reading (gated on std until parse+check land in no_std) ──────
+// ── load_reading ──────────────────────────────────────────────────────
 //
 // The body reaches `crate::parse_forml2::parse_to_state_from` and
-// `crate::check::check_readings_func`. Both modules are currently
-// gated `cfg(not(feature = "no_std"))`; lifting that requires porting
-// stage12's `std::env::var` / `std::time::Instant` use and check.rs's
-// transitive parse_forml2 dep. Tracked as a follow-up to #586.
-//
-// Until that lands, this function stays std-only. The kernel
-// `arest::load_reading_core::load_reading` call site that PPPPP-2's
-// closure caller will adopt remains gated under
-// `cfg(not(feature = "no_std"))` at the call site too. The
-// extraction here is the architectural prerequisite — once the deps
-// land in no_std, only the gate below needs to lift.
+// `crate::check::check_readings_func`. Both modules became
+// no_std-reachable via #588 (`097577ff` — parse_forml2_stage2 no_std)
+// and #589 (`56c201df` — check.rs gate lift). The verb itself is now
+// unconditionally available; PPPPP-2's #560 closure caller calls this
+// function directly (`load_reading_persist::replay_loaded_readings`
+// in `arest-kernel`).
 
 /// Runtime peer of the bake-time `metamodel_readings()` assembler.
 ///
@@ -652,7 +638,6 @@ pub fn remove_cell(state: &Object, name: &str) -> Object {
 /// cells, the diff comes back empty, and the report is empty. The
 /// new_state still equals the old state cell-for-cell so callers may
 /// commit it without observing a diff.
-#[cfg(not(feature = "no_std"))]
 pub fn load_reading(
     state: &Object,
     name: &str,
@@ -766,7 +751,6 @@ pub fn load_reading(
 /// out as a public helper so kernel-side and host-side callers can
 /// run the same gate ahead of time (e.g. dry-run validation in a
 /// REPL or a UI preview pane). Same gate, same result.
-#[cfg(not(feature = "no_std"))]
 pub fn validate_loaded_state(state: &Object) -> LoadValidationReport {
     use crate::check::{Level, Source};
     let diag_obj = crate::ast::apply(
@@ -805,7 +789,6 @@ pub fn validate_loaded_state(state: &Object) -> LoadValidationReport {
 ///
 /// On `ManifestMissing` / `InvalidName` / `NotImplemented`, the input
 /// state is untouched.
-#[cfg(not(feature = "no_std"))]
 pub fn unload_reading(
     state: &Object,
     name: &str,
@@ -935,7 +918,6 @@ pub fn unload_reading(
 /// behavior matters: the alternative (returning a hard error) would
 /// force callers to know whether a reading is loaded before deciding
 /// between Load and Reload, which defeats the verb's purpose.
-#[cfg(not(feature = "no_std"))]
 pub fn reload_reading(
     state: &Object,
     name: &str,
@@ -1023,7 +1005,6 @@ pub fn reload_reading(
 /// re-inline the same shape here. The public API of `check_readings`
 /// returns `Vec<ReadingDiagnostic>` directly; only the lower-level
 /// Func application surface returns the encoded Object.
-#[cfg(not(feature = "no_std"))]
 fn decode_diagnostics(obj: &Object) -> Vec<crate::check::ReadingDiagnostic> {
     use crate::check::{Level, ReadingDiagnostic, Source};
     obj.as_seq()
