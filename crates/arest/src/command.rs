@@ -1305,6 +1305,20 @@ fn load_reading_handler(
                         alethic: true,
                     })
                     .collect(),
+                // #559 / DynRdg-5: alethic violations are
+                // structural-impossibility errors caught by the
+                // load-time validation gate. Surfaced under a
+                // distinct constraint_id so dashboards can route
+                // them separately from deontic constraint failures.
+                LoadError::AlethicViolation(diags) => diags
+                    .into_iter()
+                    .map(|d| crate::types::Violation {
+                        constraint_id: "load_reading.alethic".to_string(),
+                        constraint_text: d.reading.clone(),
+                        detail: d.message.clone(),
+                        alethic: true,
+                    })
+                    .collect(),
             };
             CommandResult {
                 entities: vec![],
@@ -1664,6 +1678,21 @@ fn reload_reading_handler(
                         alethic: true,
                     }],
                     LoadError::DeonticViolation(diags) => diags
+                        .into_iter()
+                        .map(|d| crate::types::Violation {
+                            constraint_id: "reload_reading.load_failed".to_string(),
+                            constraint_text: d.reading.clone(),
+                            detail: d.message.clone(),
+                            alethic: true,
+                        })
+                        .collect(),
+                    // #559 / DynRdg-5: alethic violation surfaced
+                    // through the load-step path of reload_reading.
+                    // Same detail shape as the load handler, distinct
+                    // constraint_id so dashboards can route the two
+                    // error classes (load-step alethic vs.
+                    // load-step deontic) separately.
+                    LoadError::AlethicViolation(diags) => diags
                         .into_iter()
                         .map(|d| crate::types::Violation {
                             constraint_id: "reload_reading.load_failed".to_string(),

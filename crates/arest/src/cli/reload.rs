@@ -126,6 +126,17 @@ pub fn format_failure(name: &str, err: &LoadError) -> String {
             }
             out
         }
+        // #559 / DynRdg-5: alethic violations from the load-time
+        // validation gate (parse / resolve errors against the merged
+        // state). Same render shape as DeonticViolation; different
+        // top line so the operator sees which gate fired.
+        LoadError::AlethicViolation(diags) => {
+            let mut out = format!("reload {} rejected: {} structural violation(s).", name, diags.len());
+            for d in diags.iter().take(5) {
+                out.push_str(&format!("\n  {:?}", d));
+            }
+            out
+        }
     }
 }
 

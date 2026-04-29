@@ -1835,6 +1835,29 @@ fn load_reading_error_envelope(name: &str, err: &crate::load_reading::LoadError)
                 format!("[{}]", inner.join(",")),
             )
         }
+        // #559 / DynRdg-5: alethic-class violations from the
+        // load-time validation gate. Distinct error class so wire
+        // callers can route the two reject reasons separately. Pre-#559
+        // callers that only knew `deontic_violation` continue to parse
+        // the response — the new class string is additive.
+        LoadError::AlethicViolation(diags) => {
+            let inner: Vec<String> = diags
+                .iter()
+                .map(|d| {
+                    format!(
+                        r#"{{"reading":{},"message":{},"line":{}}}"#,
+                        json_string(&d.reading),
+                        json_string(&d.message),
+                        d.line,
+                    )
+                })
+                .collect();
+            (
+                "alethic_violation",
+                format!("{} alethic violation(s)", diags.len()),
+                format!("[{}]", inner.join(",")),
+            )
+        }
     };
     format!(
         r#"{{"ok":false,"name":{},"error":{},"detail":{},"violations":{}}}"#,

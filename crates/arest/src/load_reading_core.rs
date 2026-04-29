@@ -131,6 +131,20 @@ pub enum LoadError {
     /// cache).
     #[cfg(not(feature = "no_std"))]
     DeonticViolation(Vec<crate::check::ReadingDiagnostic>),
+    /// Constraint validation flagged one or more *alethic* (Layer 2,
+    /// structural-impossibility) `Level::Error` diagnostics against
+    /// the merged state. Today this catches `Source::Parse` and
+    /// `Source::Resolve` errors emitted by `check_readings_func` —
+    /// shapes that the cell graph cannot actually represent (parse
+    /// failures recorded against a partial state, resolve failures
+    /// at error level if any future layer emits them). Kept as a
+    /// distinct variant from `DeonticViolation` so callers /
+    /// dashboards can route the two error classes to the right
+    /// remediation surface (parse/resolve → "fix the body";
+    /// deontic → "the body is well-formed but the resulting state
+    /// would violate a constraint"). #559 / DynRdg-5.
+    #[cfg(not(feature = "no_std"))]
+    AlethicViolation(Vec<crate::check::ReadingDiagnostic>),
 }
 
 /// Caller's policy for runtime reading loads.
@@ -155,10 +169,54 @@ impl Default for LoadReadingPolicy {
 /// Outcome of a successful load: the new state plus a report listing
 /// every cell that grew. The state is functional — caller swaps it in
 /// atomically.
+///
+/// `validation_report` carries the structured diagnostic envelope
+/// produced by the load-time deontic + alethic gate (#559 /
+/// DynRdg-5). Successful loads carry an empty report
+/// (`alethic_violations.is_empty() && deontic_violations.is_empty()
+/// && passes == true`) so callers can introspect what was checked
+/// without a separate accept/reject wire surface. The field is
+/// gated on std builds because the underlying diagnostic shape
+/// (`crate::check::ReadingDiagnostic`) is std-only today.
 #[derive(Debug, Clone)]
 pub struct LoadOutcome {
     pub report: LoadReport,
     pub new_state: Object,
+    #[cfg(not(feature = "no_std"))]
+    pub validation_report: LoadValidationReport,
+}
+
+/// Structured diagnostic envelope for the load-time validation gate
+/// (#559 / DynRdg-5).
+///
+/// Partitions `check::check_readings_func` output by `Source`:
+///   * `alethic_violations` — `Source::Parse` and `Source::Resolve`
+///     diagnostics at `Level::Error`. These are *structural
+///     impossibilities*: shapes the cell graph cannot represent
+///     under FORML 2 semantics. Reject the load.
+///   * `deontic_violations` — `Source::Deontic` diagnostics at
+///     `Level::Error`. The body is well-formed but the resulting
+///     state would violate a constraint (e.g. ring-validity,
+///     cardinality). Reject the load.
+///   * `passes` — `true` iff both lists are empty. Successful loads
+///     carry `passes = true` so callers can introspect the gate
+///     without a separate accept/reject channel.
+///
+/// Warnings and hints (`Level::Warning`, `Level::Hint`) are NOT
+/// surfaced here — they pass through silently, just as the pre-#559
+/// gate did. Callers that want to render them can re-run
+/// `check::check_readings` directly; this report is the
+/// reject-vs-accept surface.
+///
+/// Kept gated on std builds because `ReadingDiagnostic` itself is
+/// std-only today (transitively via `parse_forml2`). When `check`
+/// lands in no_std, lift this gate alongside `load_reading`'s.
+#[cfg(not(feature = "no_std"))]
+#[derive(Debug, Clone, Default)]
+pub struct LoadValidationReport {
+    pub alethic_violations: Vec<crate::check::ReadingDiagnostic>,
+    pub deontic_violations: Vec<crate::check::ReadingDiagnostic>,
+    pub passes: bool,
 }
 
 // ── UnloadReading types (#556 / DynRdg-2) ──────────────────────────
@@ -571,12 +629,20 @@ pub fn remove_cell(state: &Object, name: &str) -> Object {
 ///      as context so the body may reference nouns the live state
 ///      already declares).
 ///   4. Merge `state` ⊕ parsed → scratch state.
-///   5. Run `check::check_readings_func` against the scratch state.
-///      Any `Source::Deontic` `Level::Error` rejects the load.
+///   5. Run the load-time validation gate (#559 / DynRdg-5) via
+///      `validate_loaded_state(&scratch)`. The gate runs
+///      `check_readings_func` and partitions diagnostics by source:
+///      `Source::Deontic` `Level::Error` → deontic violations,
+///      `Source::Parse` / `Source::Resolve` `Level::Error` →
+///      alethic violations. Either non-empty class rejects the load
+///      (`AlethicViolation` takes precedence over `DeonticViolation`
+///      on the wire so the caller fixes structural problems first).
 ///   6. On success, diff the scratch state vs. `state` to assemble
 ///      `LoadReport` (only newly-added or changed Noun / FactType /
 ///      derivation:* cells contribute).
-///   7. Return `(report, scratch_state)` for the caller to swap in.
+///   7. Return `(report, scratch_state, validation_report)` for the
+///      caller to swap in. Successful loads carry the empty
+///      validation report so callers can introspect what was checked.
 ///
 /// On any failure step 4-5 the caller's `state` is untouched (the
 /// scratch copy is dropped). Step 1-3 never touch `state`.
@@ -625,28 +691,36 @@ pub fn load_reading(
     // Step 4: merge into scratch state.
     let scratch = ast::merge_states(state, &parsed);
 
-    // Step 5: deontic constraint validation pass (#288).
+    // Step 5: load-time deontic + alethic validation gate (#559 /
+    // DynRdg-5).
     //
-    // We re-run the full check_readings_func against the merged scratch
-    // state. Errors at deontic level reject the load. Warnings / hints
-    // pass through silently — callers that want to surface them can
-    // re-run `check::check_readings` themselves; that's a separate
-    // surface from "reject vs. accept."
-    let diag_obj = ast::apply(
-        &crate::check::check_readings_func(),
-        &scratch,
-        &scratch,
-    );
-    let diags = decode_diagnostics(&diag_obj);
-    let deontic_errors: Vec<_> = diags
-        .into_iter()
-        .filter(|d| {
-            matches!(d.source, crate::check::Source::Deontic)
-                && matches!(d.level, crate::check::Level::Error)
-        })
-        .collect();
-    if !deontic_errors.is_empty() {
-        return Err(LoadError::DeonticViolation(deontic_errors));
+    // `validate_loaded_state` runs `check_readings_func` against the
+    // merged scratch state and partitions the resulting diagnostics
+    // into two error classes:
+    //   * alethic — `Source::Parse` / `Source::Resolve` at
+    //     `Level::Error` (structural impossibilities).
+    //   * deontic — `Source::Deontic` at `Level::Error` (constraint
+    //     violations against the merged state).
+    // Either non-empty class rejects the load; the scratch state is
+    // dropped and the caller's `state` stays untouched. Warnings /
+    // hints pass through silently. Successful loads carry the empty
+    // report onward in `LoadOutcome.validation_report` so callers
+    // can introspect what was checked.
+    let validation_report = validate_loaded_state(&scratch);
+    if !validation_report.passes {
+        // Alethic errors take precedence in the wire surface — they
+        // are "the body is malformed against the existing schema,"
+        // which the caller should fix before any deontic constraint
+        // analysis is meaningful. Deontic-only failures route to the
+        // existing DeonticViolation variant for back-compat.
+        if !validation_report.alethic_violations.is_empty() {
+            return Err(LoadError::AlethicViolation(
+                validation_report.alethic_violations,
+            ));
+        }
+        return Err(LoadError::DeonticViolation(
+            validation_report.deontic_violations,
+        ));
     }
 
     // Step 6: compute the report — Noun / FactType / derivation:* cell
@@ -665,10 +739,62 @@ pub fn load_reading(
     let with_manifest = write_manifest(&scratch, trimmed_name, &report);
 
     // Step 8: return the manifest-augmented state for caller to commit.
+    // Successful loads carry the empty validation report onward so
+    // callers can introspect what was checked (#559 / DynRdg-5).
     Ok(LoadOutcome {
         report,
         new_state: with_manifest,
+        validation_report,
     })
+}
+
+/// Run the load-time deontic + alethic validation gate (#559 /
+/// DynRdg-5) against `state`.
+///
+/// Applies `check_readings_func` to the state and partitions the
+/// resulting diagnostics by `Source`:
+///   * `Source::Parse` / `Source::Resolve` at `Level::Error` →
+///     `alethic_violations` (structural impossibilities).
+///   * `Source::Deontic` at `Level::Error` → `deontic_violations`
+///     (constraint violations against the merged state).
+///
+/// `passes` is `true` iff both lists are empty. Warnings and hints
+/// pass through silently — they don't appear in either list. The
+/// helper is pure: it never mutates `state`.
+///
+/// This is the reject-vs-accept surface for `load_reading`, factored
+/// out as a public helper so kernel-side and host-side callers can
+/// run the same gate ahead of time (e.g. dry-run validation in a
+/// REPL or a UI preview pane). Same gate, same result.
+#[cfg(not(feature = "no_std"))]
+pub fn validate_loaded_state(state: &Object) -> LoadValidationReport {
+    use crate::check::{Level, Source};
+    let diag_obj = crate::ast::apply(
+        &crate::check::check_readings_func(),
+        state,
+        state,
+    );
+    let diags = decode_diagnostics(&diag_obj);
+    let mut alethic_violations: Vec<crate::check::ReadingDiagnostic> = Vec::new();
+    let mut deontic_violations: Vec<crate::check::ReadingDiagnostic> = Vec::new();
+    for d in diags.into_iter() {
+        if !matches!(d.level, Level::Error) {
+            continue;
+        }
+        match d.source {
+            Source::Deontic => deontic_violations.push(d),
+            // Parse / Resolve at error level — structural shapes the
+            // cell graph cannot represent. Routed to the alethic
+            // bucket per the #559 partition.
+            Source::Parse | Source::Resolve => alethic_violations.push(d),
+        }
+    }
+    let passes = alethic_violations.is_empty() && deontic_violations.is_empty();
+    LoadValidationReport {
+        alethic_violations,
+        deontic_violations,
+        passes,
+    }
 }
 
 /// Inverse of `load_reading` — drop a previously-loaded reading from
@@ -2042,5 +2168,275 @@ Product has SKU.
         assert_eq!(u64_to_dec(1), "1");
         assert_eq!(u64_to_dec(123456789), "123456789");
         assert_eq!(u64_to_dec(u64::MAX), "18446744073709551615");
+    }
+
+    // ── #559 / DynRdg-5: load-time deontic + alethic validation gate ──
+
+    /// (#559) Clean reading load passes both gates and the outcome
+    /// carries an empty `LoadValidationReport` with `passes = true`.
+    #[test]
+    fn valid_reading_passes_validation() {
+        let state = seed_state();
+        let body = "Product(.SKU) is an entity type.\n";
+        let outcome = load_reading(&state, "catalog", body, LoadReadingPolicy::AllowAll)
+            .expect("clean reading should load");
+
+        assert!(
+            outcome.validation_report.passes,
+            "clean load must report passes = true",
+        );
+        assert!(
+            outcome.validation_report.alethic_violations.is_empty(),
+            "clean load must have no alethic violations; got {:?}",
+            outcome.validation_report.alethic_violations,
+        );
+        assert!(
+            outcome.validation_report.deontic_violations.is_empty(),
+            "clean load must have no deontic violations; got {:?}",
+            outcome.validation_report.deontic_violations,
+        );
+    }
+
+    /// (#559) A load that triggers a known deontic constraint
+    /// (ring-validity error from layer 2) rejects with
+    /// `LoadError::DeonticViolation(...)` and the diagnostics list is
+    /// non-empty with `Source::Deontic` `Level::Error`.
+    #[test]
+    fn deontic_violation_rejects() {
+        // Seed with a ring-kind constraint spanning roles of
+        // different nouns — same fixture as
+        // `deontic_violation_rejects_and_preserves_state`. This
+        // triggers `check_ring_validity` at Level::Error.
+        let mut state = seed_state();
+        state = ast::store(
+            "FactType",
+            ast::Object::seq(vec![ast::fact_from_pairs(&[
+                ("id", "Person_likes_Animal"),
+                ("reading", "Person likes Animal"),
+            ])]),
+            &state,
+        );
+        state = ast::store(
+            "Role",
+            ast::Object::seq(vec![
+                ast::fact_from_pairs(&[
+                    ("factType", "Person_likes_Animal"),
+                    ("nounName", "Person"),
+                    ("position", "0"),
+                ]),
+                ast::fact_from_pairs(&[
+                    ("factType", "Person_likes_Animal"),
+                    ("nounName", "Animal"),
+                    ("position", "1"),
+                ]),
+            ]),
+            &state,
+        );
+        state = ast::store(
+            "Constraint",
+            ast::Object::seq(vec![ast::fact_from_pairs(&[
+                ("kind", "IR"),
+                ("span0_factTypeId", "Person_likes_Animal"),
+                ("text", "Person likes Animal is irreflexive"),
+            ])]),
+            &state,
+        );
+
+        let result = load_reading(
+            &state,
+            "noop",
+            "# noop\n",
+            LoadReadingPolicy::AllowAll,
+        );
+        match result {
+            Err(LoadError::DeonticViolation(diags)) => {
+                assert!(
+                    !diags.is_empty(),
+                    "DeonticViolation must carry at least one diagnostic",
+                );
+                // Identify by content — the ring-validity layer
+                // emits messages mentioning "ring constraint".
+                let saw_ring = diags
+                    .iter()
+                    .any(|d| d.message.contains("ring constraint"));
+                assert!(
+                    saw_ring,
+                    "expected a ring-constraint diagnostic; got {:?}",
+                    diags.iter().map(|d| &d.message).collect::<Vec<_>>(),
+                );
+                for d in &diags {
+                    assert_eq!(d.source, crate::check::Source::Deontic);
+                    assert_eq!(d.level, crate::check::Level::Error);
+                }
+            }
+            other => panic!("expected DeonticViolation, got {other:?}"),
+        }
+    }
+
+    /// (#559) Validation runs *before* commit — a load that would
+    /// otherwise add cells is rejected, leaving the state byte-
+    /// identical to its pre-load shape (atomicity contract).
+    #[test]
+    fn validation_runs_before_commit() {
+        // Same ring-violation fixture as `deontic_violation_rejects`.
+        // The body we pass adds new cells (Widget noun) — those cells
+        // would land if the gate didn't run before commit. We assert
+        // that they don't, by comparing against a snapshot.
+        let mut state = seed_state();
+        state = ast::store(
+            "FactType",
+            ast::Object::seq(vec![ast::fact_from_pairs(&[
+                ("id", "Person_likes_Animal"),
+                ("reading", "Person likes Animal"),
+            ])]),
+            &state,
+        );
+        state = ast::store(
+            "Role",
+            ast::Object::seq(vec![
+                ast::fact_from_pairs(&[
+                    ("factType", "Person_likes_Animal"),
+                    ("nounName", "Person"),
+                    ("position", "0"),
+                ]),
+                ast::fact_from_pairs(&[
+                    ("factType", "Person_likes_Animal"),
+                    ("nounName", "Animal"),
+                    ("position", "1"),
+                ]),
+            ]),
+            &state,
+        );
+        state = ast::store(
+            "Constraint",
+            ast::Object::seq(vec![ast::fact_from_pairs(&[
+                ("kind", "IR"),
+                ("span0_factTypeId", "Person_likes_Animal"),
+                ("text", "Person likes Animal is irreflexive"),
+            ])]),
+            &state,
+        );
+
+        // Snapshot for the post-rejection equality assertion.
+        let snapshot = state.clone();
+
+        // Body adds a Widget noun — this would go through merge ⊕
+        // on the scratch state, but the validation gate fires
+        // before the merge is committed.
+        let body = "Widget(.SKU) is an entity type.\n";
+        let result = load_reading(&state, "widgets", body, LoadReadingPolicy::AllowAll);
+        assert!(
+            matches!(result, Err(LoadError::DeonticViolation(_))),
+            "ring-validity error must reject the load before commit",
+        );
+
+        // Byte-identical: the rejection path must not have mutated
+        // `state`. `Object` implements `PartialEq` recursively over
+        // cells so equality here is the atomicity assertion.
+        assert_eq!(
+            state, snapshot,
+            "validation rejection must leave the input state byte-identical",
+        );
+
+        // Defensive: confirm the would-be-added Widget noun is NOT
+        // present in `state` (it never landed, because the merged
+        // scratch state was dropped). If this fired, the gate would
+        // be running after commit, not before.
+        let nouns = ast::fetch_or_phi("Noun", &state);
+        let names: Vec<&str> = nouns
+            .as_seq()
+            .map(|s| s.iter().filter_map(|f| ast::binding(f, "name")).collect())
+            .unwrap_or_default();
+        assert!(
+            !names.contains(&"Widget"),
+            "Widget must not have landed in the input state; got {names:?}",
+        );
+    }
+
+    /// (#559) Successful load surfaces a *structured* validation
+    /// report on `LoadOutcome` so callers can introspect the gate
+    /// even on the happy path. Both violation lists are empty and
+    /// `passes` is true.
+    #[test]
+    fn validation_report_is_structured() {
+        let state = seed_state();
+        let body = "\
+Product(.SKU) is an entity type.
+Category(.Name) is an entity type.
+";
+        let outcome = load_reading(&state, "catalog", body, LoadReadingPolicy::AllowAll)
+            .expect("clean reading should load");
+
+        // The structured report exists on the outcome (this is the
+        // shape contract). All three fields must be present.
+        assert_eq!(outcome.validation_report.alethic_violations.len(), 0);
+        assert_eq!(outcome.validation_report.deontic_violations.len(), 0);
+        assert!(outcome.validation_report.passes);
+
+        // Sanity: the report did NOT swallow the per-cell add report.
+        // The two reports are disjoint surfaces — `report` lists what
+        // changed; `validation_report` lists what was checked.
+        assert_eq!(
+            outcome.report.added_nouns,
+            vec!["Category".to_string(), "Product".to_string()],
+        );
+    }
+
+    /// (#559) `validate_loaded_state` is callable on its own — kernel
+    /// or REPL pre-flight callers can dry-run the gate against a
+    /// candidate state without going through the full load pipeline.
+    #[test]
+    fn validate_loaded_state_helper_partitions_diagnostics() {
+        // Clean state — no ring constraint, no parse residue.
+        let clean = seed_state();
+        let report = validate_loaded_state(&clean);
+        assert!(report.passes);
+        assert!(report.alethic_violations.is_empty());
+        assert!(report.deontic_violations.is_empty());
+
+        // Bad state — same ring-validity fixture as above.
+        let mut bad = seed_state();
+        bad = ast::store(
+            "FactType",
+            ast::Object::seq(vec![ast::fact_from_pairs(&[
+                ("id", "Person_likes_Animal"),
+                ("reading", "Person likes Animal"),
+            ])]),
+            &bad,
+        );
+        bad = ast::store(
+            "Role",
+            ast::Object::seq(vec![
+                ast::fact_from_pairs(&[
+                    ("factType", "Person_likes_Animal"),
+                    ("nounName", "Person"),
+                    ("position", "0"),
+                ]),
+                ast::fact_from_pairs(&[
+                    ("factType", "Person_likes_Animal"),
+                    ("nounName", "Animal"),
+                    ("position", "1"),
+                ]),
+            ]),
+            &bad,
+        );
+        bad = ast::store(
+            "Constraint",
+            ast::Object::seq(vec![ast::fact_from_pairs(&[
+                ("kind", "IR"),
+                ("span0_factTypeId", "Person_likes_Animal"),
+                ("text", "Person likes Animal is irreflexive"),
+            ])]),
+            &bad,
+        );
+        let bad_report = validate_loaded_state(&bad);
+        assert!(!bad_report.passes);
+        assert!(!bad_report.deontic_violations.is_empty());
+        // Every deontic diagnostic is at Error level (Warn/Hint
+        // pass through silently).
+        for d in &bad_report.deontic_violations {
+            assert_eq!(d.level, crate::check::Level::Error);
+            assert_eq!(d.source, crate::check::Source::Deontic);
+        }
     }
 }
