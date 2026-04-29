@@ -467,6 +467,374 @@ pub struct DerivationRuleDef {
     pub consequent_role_literals: Vec<ConsequentRoleLiteral>,
 }
 
+// ── Hand-rolled canonical JSON writer for `DerivationRuleDef` ────────
+//
+// Parser stage 2 (`bootstrap_grammar_state`) keys the rule cache on the
+// JSON-serialized form of each `DerivationRuleDef`. We can't depend on
+// `serde_json::to_string` from the no_std build (#588 stage2 blocker),
+// so this hand-rolled writer reproduces the exact byte sequence serde
+// emits — see `derivation_rule_def_canonical_json_matches_serde` in
+// the std-host test below for the byte-for-byte fixture.
+//
+// Encoding rules — every field below mirrors what `serde_json` would
+// produce given the `#[serde(...)]` attributes on the struct. Edits to
+// any field ordering, rename, or `skip_serializing_if` predicate must
+// be reflected here AND verified against the serde fixture.
+
+/// Append `s` JSON-escaped (with surrounding quotes) to `out`. Matches
+/// `serde_json`'s default escape policy: `"` → `\"`, `\` → `\\`, BS,
+/// FF, LF, CR, TAB → their two-char escapes, all other C0 controls →
+/// `\u00XX`. Non-ASCII UTF-8 bytes pass through unescaped (serde_json
+/// does the same unless `unicode-escapes` is requested, which we don't).
+fn json_escape(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                // Other C0 controls escape as \u00XX.
+                let n = c as u32;
+                out.push_str("\\u00");
+                let hi = (n >> 4) & 0xf;
+                let lo = n & 0xf;
+                out.push(hex_digit(hi as u8));
+                out.push(hex_digit(lo as u8));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn hex_digit(n: u8) -> char {
+    match n {
+        0..=9 => (b'0' + n) as char,
+        10..=15 => (b'a' + (n - 10)) as char,
+        _ => '0',
+    }
+}
+
+/// Append a `usize` as a JSON integer.
+fn json_write_usize(out: &mut String, n: usize) {
+    // alloc::string already provides the implementation we want.
+    out.push_str(&n.to_string());
+}
+
+/// Append an `f64` as a JSON number, matching `serde_json`'s output.
+/// `serde_json` uses `ryu`; Rust's `Debug` impl on `f64` produces the
+/// same shortest-roundtrip representation for every finite value
+/// the canonical-json fixture exercises (including integer-valued
+/// doubles like `1000000.0` — the Halpin LargeUSCity case). NaN /
+/// infinity round-trip through `serde_json` would error; we mirror by
+/// emitting `null` (serde_json does the same when `serialize_f64`
+/// hits a non-finite value via the default config).
+fn json_write_f64(out: &mut String, v: f64) {
+    if !v.is_finite() {
+        out.push_str("null");
+        return;
+    }
+    // `{:?}` emits e.g. `1.0`, `1000000.0`, `-3.14`, `0.1` — same shape
+    // as `ryu::Buffer::format_finite`.
+    let s = alloc::format!("{:?}", v);
+    out.push_str(&s);
+}
+
+impl DerivationRuleDef {
+    /// Hand-rolled canonical JSON serialization. Produces byte-identical
+    /// output to `serde_json::to_string(self)` so existing rule-cache
+    /// keys (which hash the serialized form) keep hitting after the
+    /// no_std stage2 gate flips off serde dependence.
+    ///
+    /// Field walk order, casing, and `skip_serializing_if` semantics
+    /// must stay locked to the `#[serde(...)]` attributes on the
+    /// struct definition above. The std-host test
+    /// `derivation_rule_def_canonical_json_matches_serde` covers a
+    /// representative cross-section; any new field needs a fixture row.
+    pub fn to_canonical_json(&self) -> String {
+        let mut out = String::with_capacity(128);
+        out.push('{');
+
+        // 1. id
+        out.push_str("\"id\":");
+        json_escape(&mut out, &self.id);
+
+        // 2. text
+        out.push_str(",\"text\":");
+        json_escape(&mut out, &self.text);
+
+        // 3. antecedentSources (no skip — always present).
+        out.push_str(",\"antecedentSources\":[");
+        for (i, src) in self.antecedent_sources.iter().enumerate() {
+            if i > 0 { out.push(','); }
+            antecedent_source_write(&mut out, src);
+        }
+        out.push(']');
+
+        // 4. consequentCell (no skip — always present).
+        out.push_str(",\"consequentCell\":");
+        consequent_cell_source_write(&mut out, &self.consequent_cell);
+
+        // 5. consequentInstanceRole (skip if empty).
+        if !self.consequent_instance_role.is_empty() {
+            out.push_str(",\"consequentInstanceRole\":");
+            json_escape(&mut out, &self.consequent_instance_role);
+        }
+
+        // 6. kind (always present).
+        out.push_str(",\"kind\":");
+        derivation_kind_write(&mut out, &self.kind);
+
+        // 7. joinOn (skip if empty Vec).
+        if !self.join_on.is_empty() {
+            out.push_str(",\"joinOn\":[");
+            for (i, s) in self.join_on.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                json_escape(&mut out, s);
+            }
+            out.push(']');
+        }
+
+        // 8. matchOn (skip if empty Vec). Vec<(String,String)> → array of
+        //    2-element arrays.
+        if !self.match_on.is_empty() {
+            out.push_str(",\"matchOn\":[");
+            for (i, (a, b)) in self.match_on.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                out.push('[');
+                json_escape(&mut out, a);
+                out.push(',');
+                json_escape(&mut out, b);
+                out.push(']');
+            }
+            out.push(']');
+        }
+
+        // 9. consequentBindings (skip if empty Vec).
+        if !self.consequent_bindings.is_empty() {
+            out.push_str(",\"consequentBindings\":[");
+            for (i, s) in self.consequent_bindings.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                json_escape(&mut out, s);
+            }
+            out.push(']');
+        }
+
+        // 10. antecedentFilters (skip if empty Vec).
+        if !self.antecedent_filters.is_empty() {
+            out.push_str(",\"antecedentFilters\":[");
+            for (i, f) in self.antecedent_filters.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                antecedent_filter_write(&mut out, f);
+            }
+            out.push(']');
+        }
+
+        // 11. consequentComputedBindings (skip if empty Vec).
+        if !self.consequent_computed_bindings.is_empty() {
+            out.push_str(",\"consequentComputedBindings\":[");
+            for (i, b) in self.consequent_computed_bindings.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                consequent_computed_binding_write(&mut out, b);
+            }
+            out.push(']');
+        }
+
+        // 12. consequentAggregates (skip if empty Vec).
+        if !self.consequent_aggregates.is_empty() {
+            out.push_str(",\"consequentAggregates\":[");
+            for (i, a) in self.consequent_aggregates.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                consequent_aggregate_write(&mut out, a);
+            }
+            out.push(']');
+        }
+
+        // 13. unresolvedClauses (skip if empty Vec).
+        if !self.unresolved_clauses.is_empty() {
+            out.push_str(",\"unresolvedClauses\":[");
+            for (i, s) in self.unresolved_clauses.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                json_escape(&mut out, s);
+            }
+            out.push(']');
+        }
+
+        // 14. antecedentRoleLiterals (skip if empty Vec).
+        if !self.antecedent_role_literals.is_empty() {
+            out.push_str(",\"antecedentRoleLiterals\":[");
+            for (i, l) in self.antecedent_role_literals.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                antecedent_role_literal_write(&mut out, l);
+            }
+            out.push(']');
+        }
+
+        // 15. consequentRoleLiterals (skip if empty Vec).
+        if !self.consequent_role_literals.is_empty() {
+            out.push_str(",\"consequentRoleLiterals\":[");
+            for (i, l) in self.consequent_role_literals.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                consequent_role_literal_write(&mut out, l);
+            }
+            out.push(']');
+        }
+
+        out.push('}');
+        out
+    }
+}
+
+/// Internally-tagged enum (`tag = "kind", content = "value"`) with
+/// `rename_all = "camelCase"`. Note: the camelCase rename only applies
+/// to the variant *identifiers* — struct-variant inner fields
+/// (`antecedent_index`, `role`, etc.) keep their declared snake_case,
+/// because no `rename_all` is on the inner struct portion. This matches
+/// observed `serde_json` output:
+///   `{"kind":"antecedentRole","value":{"antecedent_index":0,"role":"…"}}`
+fn consequent_cell_source_write(out: &mut String, src: &ConsequentCellSource) {
+    match src {
+        ConsequentCellSource::Literal(s) => {
+            out.push_str("{\"kind\":\"literal\",\"value\":");
+            json_escape(out, s);
+            out.push('}');
+        }
+        ConsequentCellSource::AntecedentRole { antecedent_index, role } => {
+            out.push_str("{\"kind\":\"antecedentRole\",\"value\":{\"antecedent_index\":");
+            json_write_usize(out, *antecedent_index);
+            out.push_str(",\"role\":");
+            json_escape(out, role);
+            out.push_str("}}");
+        }
+    }
+}
+
+/// Same shape as `ConsequentCellSource` — internally-tagged enum.
+/// Inner struct-variant fields stay snake_case (`fact_type`, `role`).
+fn antecedent_source_write(out: &mut String, src: &AntecedentSource) {
+    match src {
+        AntecedentSource::FactType(s) => {
+            out.push_str("{\"kind\":\"factType\",\"value\":");
+            json_escape(out, s);
+            out.push('}');
+        }
+        AntecedentSource::InstancesOfNoun(s) => {
+            out.push_str("{\"kind\":\"instancesOfNoun\",\"value\":");
+            json_escape(out, s);
+            out.push('}');
+        }
+        AntecedentSource::AbsenceOf { fact_type, role } => {
+            out.push_str("{\"kind\":\"absenceOf\",\"value\":{\"fact_type\":");
+            json_escape(out, fact_type);
+            out.push_str(",\"role\":");
+            json_escape(out, role);
+            out.push_str("}}");
+        }
+    }
+}
+
+/// Plain unit-variant enum with `rename_all = "camelCase"` →
+/// just the camelCase variant name as a JSON string.
+fn derivation_kind_write(out: &mut String, k: &DerivationKind) {
+    let s = match k {
+        DerivationKind::SubtypeInheritance => "subtypeInheritance",
+        DerivationKind::ModusPonens => "modusPonens",
+        DerivationKind::Transitivity => "transitivity",
+        DerivationKind::ClosedWorldNegation => "closedWorldNegation",
+        DerivationKind::Join => "join",
+    };
+    out.push('"');
+    out.push_str(s);
+    out.push('"');
+}
+
+fn antecedent_filter_write(out: &mut String, f: &AntecedentFilter) {
+    out.push_str("{\"antecedentIndex\":");
+    json_write_usize(out, f.antecedent_index);
+    out.push_str(",\"role\":");
+    json_escape(out, &f.role);
+    out.push_str(",\"op\":");
+    json_escape(out, &f.op);
+    out.push_str(",\"value\":");
+    json_write_f64(out, f.value);
+    out.push('}');
+}
+
+fn antecedent_role_literal_write(out: &mut String, l: &AntecedentRoleLiteral) {
+    out.push_str("{\"antecedentIndex\":");
+    json_write_usize(out, l.antecedent_index);
+    out.push_str(",\"role\":");
+    json_escape(out, &l.role);
+    out.push_str(",\"value\":");
+    json_escape(out, &l.value);
+    out.push('}');
+}
+
+fn consequent_role_literal_write(out: &mut String, l: &ConsequentRoleLiteral) {
+    out.push_str("{\"role\":");
+    json_escape(out, &l.role);
+    out.push_str(",\"value\":");
+    json_escape(out, &l.value);
+    out.push('}');
+}
+
+fn consequent_computed_binding_write(out: &mut String, b: &ConsequentComputedBinding) {
+    out.push_str("{\"role\":");
+    json_escape(out, &b.role);
+    out.push_str(",\"expr\":");
+    arith_expr_write(out, &b.expr);
+    out.push('}');
+}
+
+/// External-tagged enum (no `tag` / `content` attribute):
+///   * Newtype variant `RoleRef(String)`     → `{"roleRef":"…"}`
+///   * Newtype variant `Literal(f64)`        → `{"literal":<num>}`
+///   * Tuple variant `Op(String, Box, Box)`  →
+///     `{"op":["<sym>",<left>,<right>]}` — tuple of more than one
+///     element serializes as a JSON array.
+fn arith_expr_write(out: &mut String, e: &ArithExpr) {
+    match e {
+        ArithExpr::RoleRef(s) => {
+            out.push_str("{\"roleRef\":");
+            json_escape(out, s);
+            out.push('}');
+        }
+        ArithExpr::Literal(v) => {
+            out.push_str("{\"literal\":");
+            json_write_f64(out, *v);
+            out.push('}');
+        }
+        ArithExpr::Op(op, l, r) => {
+            out.push_str("{\"op\":[");
+            json_escape(out, op);
+            out.push(',');
+            arith_expr_write(out, l);
+            out.push(',');
+            arith_expr_write(out, r);
+            out.push_str("]}");
+        }
+    }
+}
+
+fn consequent_aggregate_write(out: &mut String, a: &ConsequentAggregate) {
+    out.push_str("{\"role\":");
+    json_escape(out, &a.role);
+    out.push_str(",\"op\":");
+    json_escape(out, &a.op);
+    out.push_str(",\"targetRole\":");
+    json_escape(out, &a.target_role);
+    out.push_str(",\"sourceFactTypeId\":");
+    json_escape(out, &a.source_fact_type_id);
+    out.push_str(",\"groupKeyRole\":");
+    json_escape(out, &a.group_key_role);
+    out.push('}');
+}
+
 /// Numeric comparison that further restricts a derivation antecedent.
 /// See `DerivationRuleDef::antecedent_filters`.
 #[derive(Debug, Clone, PartialEq)]
@@ -859,4 +1227,218 @@ pub struct RelatedNoun {
     pub via_fact_type: String,
     pub via_reading: String,
     pub world_assumption: WorldAssumption,
+}
+
+// ── Canonical-JSON tests for `DerivationRuleDef` ─────────────────────
+//
+// These tests are gated on `std-deps` because the byte-for-byte
+// fixture compares against `serde_json::to_string`. The `to_canonical_json`
+// method itself is feature-independent — only the comparison oracle
+// requires serde.
+#[cfg(all(test, feature = "std-deps"))]
+mod canonical_json_tests {
+    use super::*;
+
+    fn sample_rule_with_filter() -> DerivationRuleDef {
+        DerivationRuleDef {
+            id: "rule_largeUSCity".to_string(),
+            text: "Each LargeUSCity is a City that is in Country 'US' and has Population >= 1000000".to_string(),
+            antecedent_sources: alloc::vec![
+                AntecedentSource::FactType("city_in_country".to_string()),
+                AntecedentSource::FactType("city_population".to_string()),
+            ],
+            consequent_instance_role: String::new(),
+            consequent_cell: ConsequentCellSource::Literal("LargeUSCity_subtype".to_string()),
+            kind: DerivationKind::ModusPonens,
+            join_on: alloc::vec!["City".to_string()],
+            match_on: alloc::vec![("a".to_string(), "b".to_string())],
+            consequent_bindings: alloc::vec!["City".to_string()],
+            antecedent_filters: alloc::vec![AntecedentFilter {
+                antecedent_index: 1,
+                role: "Population".to_string(),
+                op: ">=".to_string(),
+                value: 1_000_000.0,
+            }],
+            consequent_computed_bindings: alloc::vec![ConsequentComputedBinding {
+                role: "Volume".to_string(),
+                expr: ArithExpr::Op(
+                    "*".to_string(),
+                    Box::new(ArithExpr::RoleRef("Size".to_string())),
+                    Box::new(ArithExpr::Literal(2.5)),
+                ),
+            }],
+            consequent_aggregates: alloc::vec![ConsequentAggregate {
+                role: "Arity".to_string(),
+                op: "count".to_string(),
+                target_role: "Role".to_string(),
+                source_fact_type_id: "Fact_Type_has_Role".to_string(),
+                group_key_role: "Fact Type".to_string(),
+            }],
+            unresolved_clauses: alloc::vec!["weird".to_string()],
+            antecedent_role_literals: alloc::vec![AntecedentRoleLiteral {
+                antecedent_index: 0,
+                role: "Trailing Marker".to_string(),
+                value: "is an entity type".to_string(),
+            }],
+            consequent_role_literals: alloc::vec![ConsequentRoleLiteral {
+                role: "Classification".to_string(),
+                value: "Entity Type Declaration".to_string(),
+            }],
+        }
+    }
+
+    fn sample_rule_minimal() -> DerivationRuleDef {
+        DerivationRuleDef {
+            id: "rule_minimal".to_string(),
+            text: "Foo iff Bar".to_string(),
+            antecedent_sources: alloc::vec![AntecedentSource::FactType("ft1".to_string())],
+            consequent_instance_role: String::new(),
+            consequent_cell: ConsequentCellSource::Literal("ft2".to_string()),
+            kind: DerivationKind::ModusPonens,
+            join_on: Vec::new(),
+            match_on: Vec::new(),
+            consequent_bindings: Vec::new(),
+            antecedent_filters: Vec::new(),
+            consequent_computed_bindings: Vec::new(),
+            consequent_aggregates: Vec::new(),
+            unresolved_clauses: Vec::new(),
+            antecedent_role_literals: Vec::new(),
+            consequent_role_literals: Vec::new(),
+        }
+    }
+
+    fn sample_rule_grammar_classifier() -> DerivationRuleDef {
+        // Mirrors the shape `bootstrap_grammar_state` actually constructs:
+        // single antecedent, ConsequentRoleLiterals + AntecedentRoleLiterals
+        // populated, every other Vec empty.
+        DerivationRuleDef {
+            id: "rule_abcd1234".to_string(),
+            text: "Statement has Classification 'Entity Type Declaration' iff Statement has Trailing Marker 'is an entity type'".to_string(),
+            antecedent_sources: alloc::vec![AntecedentSource::FactType(
+                "Statement_has_Trailing_Marker".to_string(),
+            )],
+            consequent_instance_role: String::new(),
+            consequent_cell: ConsequentCellSource::Literal(
+                "Statement_has_Classification".to_string(),
+            ),
+            kind: DerivationKind::ModusPonens,
+            join_on: Vec::new(),
+            match_on: Vec::new(),
+            consequent_bindings: Vec::new(),
+            antecedent_filters: Vec::new(),
+            consequent_computed_bindings: Vec::new(),
+            consequent_aggregates: Vec::new(),
+            unresolved_clauses: Vec::new(),
+            antecedent_role_literals: alloc::vec![AntecedentRoleLiteral {
+                antecedent_index: 0,
+                role: "Trailing Marker".to_string(),
+                value: "is an entity type".to_string(),
+            }],
+            consequent_role_literals: alloc::vec![ConsequentRoleLiteral {
+                role: "Classification".to_string(),
+                value: "Entity Type Declaration".to_string(),
+            }],
+        }
+    }
+
+    fn sample_rule_with_dynamic_consequent_and_absence() -> DerivationRuleDef {
+        DerivationRuleDef {
+            id: "rule_dynamic".to_string(),
+            text: "subtype inheritance".to_string(),
+            antecedent_sources: alloc::vec![
+                AntecedentSource::InstancesOfNoun("Foo".to_string()),
+                AntecedentSource::AbsenceOf {
+                    fact_type: "ft_x".to_string(),
+                    role: "R".to_string(),
+                },
+            ],
+            consequent_instance_role: "Bar".to_string(),
+            consequent_cell: ConsequentCellSource::AntecedentRole {
+                antecedent_index: 0,
+                role: "Some Role".to_string(),
+            },
+            kind: DerivationKind::SubtypeInheritance,
+            join_on: Vec::new(),
+            match_on: Vec::new(),
+            consequent_bindings: Vec::new(),
+            antecedent_filters: Vec::new(),
+            consequent_computed_bindings: Vec::new(),
+            consequent_aggregates: Vec::new(),
+            unresolved_clauses: Vec::new(),
+            antecedent_role_literals: Vec::new(),
+            consequent_role_literals: Vec::new(),
+        }
+    }
+
+    fn sample_rule_with_escapes() -> DerivationRuleDef {
+        DerivationRuleDef {
+            id: "rule_escapes".to_string(),
+            // Mix of all the JSON escape classes the writer must handle:
+            // quote, backslash, newline, tab, carriage return, control char,
+            // and a non-ASCII pass-through.
+            text: "tab\there\nnewline\rCR \"quote\" \\back \u{01}ctrl é".to_string(),
+            antecedent_sources: alloc::vec![AntecedentSource::FactType(
+                "ft\"weird\\name".to_string(),
+            )],
+            consequent_instance_role: String::new(),
+            consequent_cell: ConsequentCellSource::Literal("c".to_string()),
+            kind: DerivationKind::Transitivity,
+            join_on: Vec::new(),
+            match_on: Vec::new(),
+            consequent_bindings: Vec::new(),
+            antecedent_filters: Vec::new(),
+            consequent_computed_bindings: Vec::new(),
+            consequent_aggregates: Vec::new(),
+            unresolved_clauses: Vec::new(),
+            antecedent_role_literals: Vec::new(),
+            consequent_role_literals: Vec::new(),
+        }
+    }
+
+    /// Byte-for-byte fixture compare against serde_json. This is the
+    /// load-bearing contract: `bootstrap_grammar_state` keys the rule
+    /// cache on the JSON string, so any diff here means cache misses
+    /// for already-baked grammars.
+    #[test]
+    fn derivation_rule_def_canonical_json_matches_serde() {
+        for r in [
+            sample_rule_minimal(),
+            sample_rule_grammar_classifier(),
+            sample_rule_with_filter(),
+            sample_rule_with_dynamic_consequent_and_absence(),
+            sample_rule_with_escapes(),
+        ] {
+            let serde_out = serde_json::to_string(&r).expect("serde_json should serialize");
+            let canonical = r.to_canonical_json();
+            assert_eq!(
+                canonical, serde_out,
+                "to_canonical_json must match serde_json byte-for-byte"
+            );
+        }
+    }
+
+    /// Round-trip: hand-roll-serialize, then parse via serde_json,
+    /// verify the rule re-encodes to the same string. Catches cases
+    /// where the writer emits valid JSON but with a shape that confuses
+    /// the deserializer (e.g., wrong tag name, wrong inner-field case).
+    #[test]
+    fn derivation_rule_def_canonical_json_round_trips() {
+        for r in [
+            sample_rule_minimal(),
+            sample_rule_grammar_classifier(),
+            sample_rule_with_filter(),
+            sample_rule_with_dynamic_consequent_and_absence(),
+            sample_rule_with_escapes(),
+        ] {
+            let canonical = r.to_canonical_json();
+            let parsed: DerivationRuleDef = serde_json::from_str(&canonical)
+                .unwrap_or_else(|e| panic!("parse failed: {} for {}", e, canonical));
+            // Round-trip the parsed value back through the writer and
+            // confirm it matches the original. Comparing structs
+            // directly is awkward (DerivationRuleDef doesn't impl Eq);
+            // re-serializing gives us a deterministic equality check.
+            let re_canonical = parsed.to_canonical_json();
+            assert_eq!(canonical, re_canonical);
+        }
+    }
 }
