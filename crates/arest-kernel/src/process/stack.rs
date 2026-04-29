@@ -117,10 +117,12 @@ pub enum AuxvType {
     Entry = 9,
     /// AT_RANDOM = 25. Address of 16 bytes of CSPRNG output for libc's
     /// stack canary / pointer-mangle initialisation. The kernel
-    /// supplies the bytes — for tier-1 we use a deterministic
-    /// placeholder until #524's CSPRNG lands; libc tolerates any
-    /// 16-byte value as long as it's stable for the process's
-    /// lifetime.
+    /// supplies the bytes — `Process::spawn` (#575) fills a per-process
+    /// 16-byte buffer from `arest::crypto::random_bytes` (which
+    /// delegates to the seeded ChaCha20 csprng installed by the
+    /// entropy framework) and records the buffer's address here.
+    /// libc tolerates any 16-byte value as long as it's stable for
+    /// the process's lifetime.
     Random = 25,
 }
 

@@ -50,6 +50,7 @@
 // when the scheduler does (#530). For now any monotonically-
 // increasing u32 works.
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::vec::Vec;
 use arest::ast::{cell_push, fact_from_pairs, Object};
@@ -60,18 +61,15 @@ use super::fd_table::FdTable;
 use super::stack::{AuxvEntry, AuxvType, InitialStack, StackBuilder, StackError};
 use super::trampoline::{self, TrampolineError};
 
-/// 16 bytes of CSPRNG output the auxv `AT_RANDOM` pointer references.
-/// Tier-1 uses a deterministic placeholder — every spawn gets the same
-/// 16 bytes — until #524's CSPRNG lands. libc tolerates any 16-byte
-/// value as long as it's stable for the process's lifetime: the value
-/// seeds the stack-canary / pointer-mangle, both of which are
-/// per-process invariants. A real CSPRNG output (RDRAND on x86_64,
-/// rndr on aarch64, or a TRNG-seeded ChaCha20 on armv7) lands in
-/// `arch::random::fill` once that surface exists.
-///
-/// Placeholder bytes: ascii "AREST_TIER_1_RNG" — recognisable in a
-/// memory dump, distinct from zero, exactly 16 bytes.
-const PLACEHOLDER_AT_RANDOM: [u8; 16] = *b"AREST_TIER_1_RNG";
+/// Width (in bytes) of the AT_RANDOM auxv buffer, per the ELF System V
+/// PSABI: libc's `_dl_setup_stack_chk_guard` and the pointer-guard
+/// initialiser both consume EXACTLY 16 bytes from the address auxv's
+/// AT_RANDOM points at. Smaller buffers leak adjacent stack bytes;
+/// larger buffers waste kernel heap and confuse anyone reading the
+/// spec. Held as a named constant so the test that asserts
+/// "AT_RANDOM is 16 bytes wide" reads as enforcing the spec rather
+/// than a magic literal.
+pub(crate) const AT_RANDOM_WIDTH: usize = 16;
 
 /// 4 KiB system page size — same value `AddressSpace::PAGE_SIZE`
 /// publishes, exposed here as a `u64` for the auxv `AT_PAGESZ`
@@ -234,6 +232,30 @@ pub struct Process {
     /// `argv[0]`); future `prctl(PR_SET_NAME)` will mutate `argv[0]`
     /// shape via a separate `comm_override` field.
     pub argv: Vec<Vec<u8>>,
+    /// 16 bytes of CSPRNG output the auxv `AT_RANDOM` pointer
+    /// references — sourced from `arest::crypto::random_bytes` which
+    /// delegates to the seeded ChaCha20 csprng installed by the
+    /// entropy framework (#578 funnel; host CLI hardware seed via
+    /// `cli::entropy_host::HostEntropySource` per #574, kernel x86_64
+    /// RDSEED/RDRAND seed per #569, UEFI EFI_RNG_PROTOCOL fallback
+    /// per #571).
+    ///
+    /// Held in a `Box` so the address is stable across moves of the
+    /// `Process` struct (in particular, the move into
+    /// `CURRENT_PROCESS`'s `spin::Mutex<Option<Process>>` post-spawn).
+    /// The auxv `AT_RANDOM` value records `at_random.as_ptr() as u64`
+    /// at spawn time; if the bytes lived inline on the struct, that
+    /// pointer would dangle the moment the Process moves.
+    ///
+    /// Allocated zero in `Process::new`; filled with real CSPRNG
+    /// output in `Process::spawn` immediately before computing the
+    /// auxv pointer. libc consumes the bytes once at startup
+    /// (`__libc_setup_tls` reads them for stack-canary +
+    /// pointer-mangle initialisation), so the value need only stay
+    /// alive between `spawn` and the C startup's first read — which,
+    /// for a `Process` that survives that far, is the entire process
+    /// lifetime.
+    pub at_random: Box<[u8; AT_RANDOM_WIDTH]>,
 }
 
 impl Process {
@@ -259,6 +281,12 @@ impl Process {
             initial_stack: None,
             exit_status: None,
             argv: Vec::new(),
+            // Allocate the AT_RANDOM buffer up-front (zero-filled) so
+            // the address is stable from `new` onward; `spawn` overwrites
+            // the contents with CSPRNG bytes before recording the
+            // pointer in the auxv. The Box keeps the bytes pinned even
+            // when the Process moves into CURRENT_PROCESS post-spawn.
+            at_random: Box::new([0u8; AT_RANDOM_WIDTH]),
         }
     }
 
@@ -296,11 +324,31 @@ impl Process {
         // CSPRNG bytes in the process address space — not the bytes
         // themselves. We can't yet point at a userspace VA because
         // the page-table install (#527) hasn't landed; for tier-1
-        // we point at the placeholder bytes' kernel-space address,
-        // which (under UEFI's identity mapping) coincides with the
-        // userspace VA the future page-table install will use.
-        // Same identity-mapping rationale `AddressSpace`'s
-        // PhysAddr re-derivation uses (process/address_space.rs:42).
+        // we point at the random bytes' kernel-space address, which
+        // (under UEFI's identity mapping) coincides with the userspace
+        // VA the future page-table install will use. Same identity-
+        // mapping rationale `AddressSpace`'s PhysAddr re-derivation
+        // uses (process/address_space.rs:42).
+        //
+        // The bytes are sourced from `arest::csprng::random_bytes`
+        // — the process-wide ChaCha20 csprng. (The host-side public
+        // entry point is `arest::crypto::random_bytes` per #578, but
+        // that module is `cfg(not(feature = "no_std"))`-gated, so the
+        // kernel reaches the same delegate target directly.) The
+        // csprng is seeded once at boot from the installed
+        // `entropy::EntropySource` —
+        // `cli::entropy_host::HostEntropySource` for the host CLI
+        // (#574), `arch::uefi::x86_64::entropy::HardwareEntropySource`
+        // for the UEFI x86_64 kernel (#569 RDSEED/RDRAND, #571 UEFI
+        // EFI_RNG_PROTOCOL fallback). Tests pin the source to a
+        // `DeterministicSource` so consecutive spawns produce
+        // predictable-yet-distinct seeds.
+        //
+        // We fill INTO `*self.at_random` (the Boxed buffer the Process
+        // owns) rather than a stack array because the auxv records
+        // the address of those bytes — a stack-local would dangle the
+        // moment `spawn` returns and the trampoline reads the auxv.
+        arest::csprng::random_bytes(self.at_random.as_mut_slice());
         let phdr_count = self.address_space.segments.len() as u64;
         let phdr_addr = self
             .address_space
@@ -309,7 +357,7 @@ impl Process {
             .map(|s| s.vaddr)
             .unwrap_or(0);
         let entry = self.address_space.entry_point;
-        let random_addr = PLACEHOLDER_AT_RANDOM.as_ptr() as u64;
+        let random_addr = self.at_random.as_ptr() as u64;
         let auxv: [AuxvEntry; 7] = [
             AuxvEntry::new(AuxvType::Phdr, phdr_addr),
             AuxvEntry::new(AuxvType::Phent, ELF64_PHENT_SIZE as u64),
@@ -602,6 +650,33 @@ where
 mod tests {
     use super::*;
     use crate::process::address_space::SegmentPerm;
+    use arest::entropy::{self, DeterministicSource};
+
+    /// Test fixture: install a deterministic entropy source seeded with
+    /// `seed`, force a CSPRNG reseed so subsequent `random_bytes` calls
+    /// derive from `seed`, run the body, then uninstall + reseed so
+    /// the next test starts clean.
+    ///
+    /// Mirrors `arest::crypto::tests::with_deterministic_entropy` and
+    /// `arest::csprng::tests::with_deterministic_csprng`. Required
+    /// because `Process::spawn` now calls `arest::crypto::random_bytes`
+    /// (#575) which panics if no entropy source is installed — every
+    /// spawn-touching test needs to either install a source or skip
+    /// the spawn step.
+    ///
+    /// The cross-module `arest::entropy::TEST_LOCK` is `pub(crate)` to
+    /// `arest`, so we can't reach it from arest-kernel; we serialise
+    /// kernel-side via `cargo test`'s default per-test ordering plus
+    /// the fact that no other kernel test touches `entropy`. If a
+    /// future kernel test races against this fixture, lift the lock
+    /// to `pub` in `arest::entropy`.
+    fn with_deterministic_entropy<F: FnOnce()>(seed: [u8; 32], body: F) {
+        entropy::install(alloc::boxed::Box::new(DeterministicSource::new(seed)));
+        arest::csprng::reseed();
+        body();
+        entropy::uninstall();
+        arest::csprng::reseed();
+    }
 
     /// `Process::new` produces a `Created`-state process with the
     /// fd table seeded for stdin / stdout / stderr.
@@ -636,41 +711,45 @@ mod tests {
     /// so the caller can introspect.
     #[test]
     fn spawn_populates_stack_and_marks_failed_under_tier_1() {
-        let mut address_space = AddressSpace::new(0x40_1000);
-        address_space
-            .push_segment(0x40_1000, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
-            .expect(".text push");
-        let mut proc = Process::new(1, address_space);
-        let argv: &[&[u8]] = &[b"/bin/true"];
-        let envp: &[&[u8]] = &[b"PATH=/usr/bin"];
-        let err = proc.spawn(argv, envp).unwrap_err();
-        // Wrapped trampoline error — variant depends on target arch.
-        assert!(matches!(err, SpawnError::Trampoline(_)));
-        // State reflects the failure.
-        assert_eq!(proc.state, ProcessState::SpawnFailed);
-        // Stack is preserved.
-        assert!(proc.initial_stack.is_some());
-        let stack = proc.initial_stack.as_ref().unwrap();
-        // argc lives at sp; argv had one entry.
-        assert_eq!(stack.read_argc(), 1);
-        // SP is 16-aligned per System V ABI.
-        assert_eq!(stack.sp() % 16, 0);
+        with_deterministic_entropy([1u8; 32], || {
+            let mut address_space = AddressSpace::new(0x40_1000);
+            address_space
+                .push_segment(0x40_1000, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
+                .expect(".text push");
+            let mut proc = Process::new(1, address_space);
+            let argv: &[&[u8]] = &[b"/bin/true"];
+            let envp: &[&[u8]] = &[b"PATH=/usr/bin"];
+            let err = proc.spawn(argv, envp).unwrap_err();
+            // Wrapped trampoline error — variant depends on target arch.
+            assert!(matches!(err, SpawnError::Trampoline(_)));
+            // State reflects the failure.
+            assert_eq!(proc.state, ProcessState::SpawnFailed);
+            // Stack is preserved.
+            assert!(proc.initial_stack.is_some());
+            let stack = proc.initial_stack.as_ref().unwrap();
+            // argc lives at sp; argv had one entry.
+            assert_eq!(stack.read_argc(), 1);
+            // SP is 16-aligned per System V ABI.
+            assert_eq!(stack.sp() % 16, 0);
+        });
     }
 
     /// `Process::spawn` walks the argv list correctly — the populated
     /// stack reports the correct argc.
     #[test]
     fn spawn_argc_matches_argv_count() {
-        let mut address_space = AddressSpace::new(0x40_1000);
-        address_space
-            .push_segment(0x40_1000, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
-            .expect(".text push");
-        let mut proc = Process::new(1, address_space);
-        let argv: &[&[u8]] = &[b"/bin/sh", b"-c", b"echo hi"];
-        let envp: &[&[u8]] = &[];
-        let _ = proc.spawn(argv, envp); // expected to fail under tier-1
-        let stack = proc.initial_stack.as_ref().unwrap();
-        assert_eq!(stack.read_argc(), 3);
+        with_deterministic_entropy([2u8; 32], || {
+            let mut address_space = AddressSpace::new(0x40_1000);
+            address_space
+                .push_segment(0x40_1000, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
+                .expect(".text push");
+            let mut proc = Process::new(1, address_space);
+            let argv: &[&[u8]] = &[b"/bin/sh", b"-c", b"echo hi"];
+            let envp: &[&[u8]] = &[];
+            let _ = proc.spawn(argv, envp); // expected to fail under tier-1
+            let stack = proc.initial_stack.as_ref().unwrap();
+            assert_eq!(stack.read_argc(), 3);
+        });
     }
 
     /// `Process::spawn` emits the auxv entries in the order the spawn
@@ -679,123 +758,207 @@ mod tests {
     /// constants predict (after argv NULL, envp NULL).
     #[test]
     fn spawn_auxv_layout_matches_spec() {
-        let mut address_space = AddressSpace::new(0x40_1000);
-        address_space
-            .push_segment(0x40_1000, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
-            .expect(".text push");
-        let mut proc = Process::new(1, address_space);
-        let _ = proc.spawn(&[], &[]); // expected to fail under tier-1
-        let stack = proc.initial_stack.as_ref().unwrap();
-        let pop = stack.populated();
-        // Layout for empty argv + empty envp:
-        //   argc(8) + argv NULL(8) + envp NULL(8) = 24 bytes header,
-        //   then auxv entries starting at offset 24.
-        // First auxv entry should be AT_PHDR (a_type = 3).
-        let auxv_base = 24;
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&pop[auxv_base..auxv_base + 8]);
-        assert_eq!(u64::from_le_bytes(buf), AuxvType::Phdr as u64);
+        with_deterministic_entropy([3u8; 32], || {
+            let mut address_space = AddressSpace::new(0x40_1000);
+            address_space
+                .push_segment(0x40_1000, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
+                .expect(".text push");
+            let mut proc = Process::new(1, address_space);
+            let _ = proc.spawn(&[], &[]); // expected to fail under tier-1
+            let stack = proc.initial_stack.as_ref().unwrap();
+            let pop = stack.populated();
+            // Layout for empty argv + empty envp:
+            //   argc(8) + argv NULL(8) + envp NULL(8) = 24 bytes header,
+            //   then auxv entries starting at offset 24.
+            // First auxv entry should be AT_PHDR (a_type = 3).
+            let auxv_base = 24;
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&pop[auxv_base..auxv_base + 8]);
+            assert_eq!(u64::from_le_bytes(buf), AuxvType::Phdr as u64);
+        });
     }
 
     /// `Process::spawn` populates AT_PHNUM with the segment count.
     /// Used by libc to walk the loaded program headers.
     #[test]
     fn spawn_at_phnum_reflects_segment_count() {
-        let mut address_space = AddressSpace::new(0x40_1000);
-        address_space
-            .push_segment(0x40_1000, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
-            .expect(".text push");
-        address_space
-            .push_segment(0x40_2000, 0x20, SegmentPerm::ReadWrite, &[0x42; 16])
-            .expect(".data push");
-        let mut proc = Process::new(1, address_space);
-        let _ = proc.spawn(&[], &[]);
-        let stack = proc.initial_stack.as_ref().unwrap();
-        let pop = stack.populated();
-        // Layout: argc(8) + argv NULL(8) + envp NULL(8) = 24, then
-        // auxv. AT_PHDR (offset 24..40), AT_PHENT (offset 40..56),
-        // AT_PHNUM (offset 56..72). The AT_PHNUM value is at offset
-        // 64..72 (the val half of the third auxv pair).
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&pop[64..72]);
-        assert_eq!(u64::from_le_bytes(buf), 2);
+        with_deterministic_entropy([4u8; 32], || {
+            let mut address_space = AddressSpace::new(0x40_1000);
+            address_space
+                .push_segment(0x40_1000, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
+                .expect(".text push");
+            address_space
+                .push_segment(0x40_2000, 0x20, SegmentPerm::ReadWrite, &[0x42; 16])
+                .expect(".data push");
+            let mut proc = Process::new(1, address_space);
+            let _ = proc.spawn(&[], &[]);
+            let stack = proc.initial_stack.as_ref().unwrap();
+            let pop = stack.populated();
+            // Layout: argc(8) + argv NULL(8) + envp NULL(8) = 24, then
+            // auxv. AT_PHDR (offset 24..40), AT_PHENT (offset 40..56),
+            // AT_PHNUM (offset 56..72). The AT_PHNUM value is at offset
+            // 64..72 (the val half of the third auxv pair).
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&pop[64..72]);
+            assert_eq!(u64::from_le_bytes(buf), 2);
+        });
     }
 
     /// `Process::spawn` populates AT_PAGESZ with 4096.
     #[test]
     fn spawn_at_pagesz_is_4096() {
-        let mut address_space = AddressSpace::new(0x40_1000);
-        address_space
-            .push_segment(0x40_1000, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
-            .expect(".text push");
-        let mut proc = Process::new(1, address_space);
-        let _ = proc.spawn(&[], &[]);
-        let stack = proc.initial_stack.as_ref().unwrap();
-        let pop = stack.populated();
-        // AT_PHDR (24..40), AT_PHENT (40..56), AT_PHNUM (56..72),
-        // AT_PAGESZ (72..88). Value at offset 80..88.
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&pop[80..88]);
-        assert_eq!(u64::from_le_bytes(buf), 4096);
+        with_deterministic_entropy([5u8; 32], || {
+            let mut address_space = AddressSpace::new(0x40_1000);
+            address_space
+                .push_segment(0x40_1000, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
+                .expect(".text push");
+            let mut proc = Process::new(1, address_space);
+            let _ = proc.spawn(&[], &[]);
+            let stack = proc.initial_stack.as_ref().unwrap();
+            let pop = stack.populated();
+            // AT_PHDR (24..40), AT_PHENT (40..56), AT_PHNUM (56..72),
+            // AT_PAGESZ (72..88). Value at offset 80..88.
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&pop[80..88]);
+            assert_eq!(u64::from_le_bytes(buf), 4096);
+        });
     }
 
     /// `Process::spawn` populates AT_ENTRY with the address space's
     /// entry point. Mirrors the trampoline's iretq RIP value.
     #[test]
     fn spawn_at_entry_matches_address_space() {
-        let mut address_space = AddressSpace::new(0xCAFE_BABE);
-        address_space
-            .push_segment(0xCAFE_BABE, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
-            .expect(".text push");
-        let mut proc = Process::new(1, address_space);
-        let _ = proc.spawn(&[], &[]);
-        let stack = proc.initial_stack.as_ref().unwrap();
-        let pop = stack.populated();
-        // AT_PHDR (24..40), AT_PHENT (40..56), AT_PHNUM (56..72),
-        // AT_PAGESZ (72..88), AT_ENTRY (88..104). Value at 96..104.
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&pop[96..104]);
-        assert_eq!(u64::from_le_bytes(buf), 0xCAFE_BABE);
+        with_deterministic_entropy([6u8; 32], || {
+            let mut address_space = AddressSpace::new(0xCAFE_BABE);
+            address_space
+                .push_segment(0xCAFE_BABE, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
+                .expect(".text push");
+            let mut proc = Process::new(1, address_space);
+            let _ = proc.spawn(&[], &[]);
+            let stack = proc.initial_stack.as_ref().unwrap();
+            let pop = stack.populated();
+            // AT_PHDR (24..40), AT_PHENT (40..56), AT_PHNUM (56..72),
+            // AT_PAGESZ (72..88), AT_ENTRY (88..104). Value at 96..104.
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&pop[96..104]);
+            assert_eq!(u64::from_le_bytes(buf), 0xCAFE_BABE);
+        });
     }
 
     /// `Process::spawn` populates AT_RANDOM with a non-zero address.
-    /// The address points at the placeholder 16-byte CSPRNG seed.
+    /// The address points at the per-process 16-byte CSPRNG buffer
+    /// the spawn just filled from `arest::crypto::random_bytes`.
     #[test]
     fn spawn_at_random_is_non_zero() {
-        let mut address_space = AddressSpace::new(0x40_1000);
-        address_space
-            .push_segment(0x40_1000, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
-            .expect(".text push");
-        let mut proc = Process::new(1, address_space);
-        let _ = proc.spawn(&[], &[]);
-        let stack = proc.initial_stack.as_ref().unwrap();
-        let pop = stack.populated();
-        // AT_RANDOM at offset 104..120 (sixth auxv pair). Value at
-        // 112..120.
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&pop[112..120]);
-        assert_ne!(u64::from_le_bytes(buf), 0, "AT_RANDOM must be non-zero");
+        with_deterministic_entropy([7u8; 32], || {
+            let mut address_space = AddressSpace::new(0x40_1000);
+            address_space
+                .push_segment(0x40_1000, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
+                .expect(".text push");
+            let mut proc = Process::new(1, address_space);
+            let _ = proc.spawn(&[], &[]);
+            let stack = proc.initial_stack.as_ref().unwrap();
+            let pop = stack.populated();
+            // AT_RANDOM at offset 104..120 (sixth auxv pair). Value at
+            // 112..120.
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&pop[112..120]);
+            assert_ne!(u64::from_le_bytes(buf), 0, "AT_RANDOM must be non-zero");
+            // The recorded address must point at the per-process
+            // at_random buffer the spawn just filled.
+            assert_eq!(
+                u64::from_le_bytes(buf),
+                proc.at_random.as_ptr() as u64,
+                "AT_RANDOM auxv value must match Process.at_random buffer address"
+            );
+        });
+    }
+
+    /// #575 / Rand-C1: the AT_RANDOM bytes must come from
+    /// `arest::crypto::random_bytes` (which delegates to the seeded
+    /// ChaCha20 CSPRNG installed by the entropy framework), NOT a
+    /// hardcoded literal. Two consecutive spawns under DIFFERENT
+    /// deterministic seeds must produce DIFFERENT 16-byte buffers —
+    /// proves the bytes track the entropy source rather than coming
+    /// from rodata.
+    #[test]
+    fn at_random_is_random() {
+        let mut bytes_seed_a = [0u8; AT_RANDOM_WIDTH];
+        let mut bytes_seed_b = [0u8; AT_RANDOM_WIDTH];
+        with_deterministic_entropy([0xAAu8; 32], || {
+            let mut address_space = AddressSpace::new(0x40_1000);
+            address_space
+                .push_segment(0x40_1000, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
+                .expect(".text push");
+            let mut proc = Process::new(1, address_space);
+            let _ = proc.spawn(&[], &[]);
+            bytes_seed_a.copy_from_slice(proc.at_random.as_ref());
+        });
+        with_deterministic_entropy([0xBBu8; 32], || {
+            let mut address_space = AddressSpace::new(0x40_1000);
+            address_space
+                .push_segment(0x40_1000, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
+                .expect(".text push");
+            let mut proc = Process::new(1, address_space);
+            let _ = proc.spawn(&[], &[]);
+            bytes_seed_b.copy_from_slice(proc.at_random.as_ref());
+        });
+        assert_ne!(
+            bytes_seed_a, bytes_seed_b,
+            "AT_RANDOM bytes must differ when the entropy seed differs — \
+             proves the bytes flow from arest::crypto::random_bytes rather \
+             than a hardcoded rodata literal"
+        );
+        // Defensive: neither buffer should be the legacy
+        // b"AREST_TIER_1_RNG" placeholder.
+        assert_ne!(&bytes_seed_a, b"AREST_TIER_1_RNG");
+        assert_ne!(&bytes_seed_b, b"AREST_TIER_1_RNG");
+    }
+
+    /// #575 / Rand-C1: AT_RANDOM must be exactly 16 bytes per the
+    /// ELF AUX_RANDOM spec. libc's stack-canary / pointer-mangle
+    /// initialiser reads exactly 16 bytes from the address auxv
+    /// records — a smaller buffer would leak adjacent kernel/user
+    /// memory, a larger one wastes the heap allocation.
+    #[test]
+    fn at_random_is_16_bytes() {
+        with_deterministic_entropy([0xCCu8; 32], || {
+            let address_space = AddressSpace::new(0x40_1000);
+            let proc = Process::new(1, address_space);
+            // The Box payload's runtime length must be exactly 16.
+            assert_eq!(
+                proc.at_random.len(),
+                AT_RANDOM_WIDTH,
+                "AT_RANDOM buffer must be exactly 16 bytes (ELF AUX_RANDOM spec)"
+            );
+            // Type-level check: AT_RANDOM_WIDTH equals 16, the named
+            // constant guards against a careless copy-paste shrinking
+            // the buffer width.
+            assert_eq!(AT_RANDOM_WIDTH, 16);
+        });
     }
 
     /// `Process::spawn` appends AT_NULL terminator to the auxv.
     /// Comes after the seven explicit entries.
     #[test]
     fn spawn_auxv_terminated_with_at_null() {
-        let mut address_space = AddressSpace::new(0x40_1000);
-        address_space
-            .push_segment(0x40_1000, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
-            .expect(".text push");
-        let mut proc = Process::new(1, address_space);
-        let _ = proc.spawn(&[], &[]);
-        let stack = proc.initial_stack.as_ref().unwrap();
-        let pop = stack.populated();
-        // Six explicit auxv entries (AT_PHDR / AT_PHENT / AT_PHNUM /
-        // AT_PAGESZ / AT_ENTRY / AT_RANDOM) × 16 bytes each = 96
-        // bytes, starting at offset 24. AT_NULL terminator at
-        // offset 24 + 96 = 120, value 0.
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&pop[120..128]);
-        assert_eq!(u64::from_le_bytes(buf), AuxvType::Null as u64);
+        with_deterministic_entropy([8u8; 32], || {
+            let mut address_space = AddressSpace::new(0x40_1000);
+            address_space
+                .push_segment(0x40_1000, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
+                .expect(".text push");
+            let mut proc = Process::new(1, address_space);
+            let _ = proc.spawn(&[], &[]);
+            let stack = proc.initial_stack.as_ref().unwrap();
+            let pop = stack.populated();
+            // Six explicit auxv entries (AT_PHDR / AT_PHENT / AT_PHNUM /
+            // AT_PAGESZ / AT_ENTRY / AT_RANDOM) × 16 bytes each = 96
+            // bytes, starting at offset 24. AT_NULL terminator at
+            // offset 24 + 96 = 120, value 0.
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(&pop[120..128]);
+            assert_eq!(u64::from_le_bytes(buf), AuxvType::Null as u64);
+        });
     }
 
     /// `From<StackError>` flows through to `SpawnError::Stack`.
@@ -867,34 +1030,36 @@ mod tests {
     /// expected argc.
     #[test]
     fn spawn_elf_end_to_end() {
-        let parsed = parse(SPAWN_ELF).expect("SPAWN_ELF must parse");
-        assert_eq!(parsed.entry, 0x40_1000);
-        assert_eq!(parsed.program_headers.len(), 2);
+        with_deterministic_entropy([9u8; 32], || {
+            let parsed = parse(SPAWN_ELF).expect("SPAWN_ELF must parse");
+            assert_eq!(parsed.entry, 0x40_1000);
+            assert_eq!(parsed.program_headers.len(), 2);
 
-        let address_space =
-            load_segments(&parsed, SPAWN_ELF).expect("load must succeed");
-        assert_eq!(address_space.entry_point, 0x40_1000);
-        assert_eq!(address_space.segments.len(), 1);
-        let segment = &address_space.segments[0];
-        // Verify the loaded instruction bytes match the fixture's
-        // PT_LOAD payload — first 5 bytes are the `mov eax, 1`
-        // opcode (b8 01 00 00 00).
-        let view = segment.pages_view();
-        assert_eq!(&view[..5], &[0xb8, 0x01, 0x00, 0x00, 0x00]);
+            let address_space =
+                load_segments(&parsed, SPAWN_ELF).expect("load must succeed");
+            assert_eq!(address_space.entry_point, 0x40_1000);
+            assert_eq!(address_space.segments.len(), 1);
+            let segment = &address_space.segments[0];
+            // Verify the loaded instruction bytes match the fixture's
+            // PT_LOAD payload — first 5 bytes are the `mov eax, 1`
+            // opcode (b8 01 00 00 00).
+            let view = segment.pages_view();
+            assert_eq!(&view[..5], &[0xb8, 0x01, 0x00, 0x00, 0x00]);
 
-        let mut proc = Process::new(7, address_space);
-        let argv: &[&[u8]] = &[b"/bin/spawn"];
-        let envp: &[&[u8]] = &[b"PATH=/usr/bin"];
-        // Spawn errors at the trampoline doorstep on every arch
-        // (tier-1 limitation); the structural pipeline still runs.
-        let err = proc.spawn(argv, envp).unwrap_err();
-        assert!(matches!(err, SpawnError::Trampoline(_)));
-        assert_eq!(proc.state, ProcessState::SpawnFailed);
+            let mut proc = Process::new(7, address_space);
+            let argv: &[&[u8]] = &[b"/bin/spawn"];
+            let envp: &[&[u8]] = &[b"PATH=/usr/bin"];
+            // Spawn errors at the trampoline doorstep on every arch
+            // (tier-1 limitation); the structural pipeline still runs.
+            let err = proc.spawn(argv, envp).unwrap_err();
+            assert!(matches!(err, SpawnError::Trampoline(_)));
+            assert_eq!(proc.state, ProcessState::SpawnFailed);
 
-        // Stack populated correctly.
-        let stack = proc.initial_stack.as_ref().unwrap();
-        assert_eq!(stack.read_argc(), 1);
-        assert_eq!(stack.sp() % 16, 0);
+            // Stack populated correctly.
+            let stack = proc.initial_stack.as_ref().unwrap();
+            assert_eq!(stack.read_argc(), 1);
+            assert_eq!(stack.sp() % 16, 0);
+        });
     }
 
     /// Trampoline `setup_x86_64` produces an IretqFrame with rip =
