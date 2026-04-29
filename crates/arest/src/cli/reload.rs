@@ -347,10 +347,13 @@ Category(.Name) is an entity type.
 
     #[test]
     fn format_success_omits_zero_buckets() {
+        // Minimal explicit-field init; #558 added content_hash /
+        // version_stamp — using `..Default::default()` here keeps
+        // future field additions to `LoadReport` from forcing
+        // another edit to this CLI test.
         let report = LoadReport {
             added_nouns: vec!["A".to_string(), "B".to_string()],
-            added_fact_types: vec![],
-            added_derivations: vec![],
+            ..Default::default()
         };
         let s = format_success("test", &report);
         assert_eq!(s, "reload test: +2 nouns\n");
@@ -362,6 +365,7 @@ Category(.Name) is an entity type.
             added_nouns: vec!["A".to_string()],
             added_fact_types: vec!["B".to_string(), "C".to_string()],
             added_derivations: vec!["D".to_string(), "E".to_string(), "F".to_string()],
+            ..Default::default()
         };
         let s = format_success("test", &report);
         assert!(s.contains("+1 nouns"));

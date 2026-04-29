@@ -58,16 +58,34 @@ use crate::ast::Object;
 
 // ── Public types (unconditional so kernel scaffolding can reference) ──
 
-/// Names of cells that newly appeared (or grew) under this load.
+/// Names of cells that newly appeared (or grew) under this load,
+/// plus reading-versioning metadata (#558 / DynRdg-4).
 ///
-/// Atom = string atom value as it appears in `binding(fact, "name")` or
-/// `binding(fact, "id")`. Sorted lexicographically so the report is
-/// deterministic across hash-map iteration order.
+/// Atom lists are sorted lexicographically so the report is
+/// deterministic across hash-map iteration order. `content_hash` is
+/// a 16-character lowercase hex FNV-1a64 digest of the body bytes,
+/// so callers can tell whether the same name was loaded with a
+/// byte-different body. `version_stamp` is a process-monotonic u64
+/// allocated by `next_version()`; its semantics are "second load
+/// has a higher stamp than first load," not "globally unique
+/// identifier." Both fields are persisted into the manifest cell
+/// (`_loaded_reading:{name}`) under `contentHash` and
+/// `versionStamp` bindings — see `encode_manifest` /
+/// `decode_manifest`.
+///
+/// Pre-#558 manifest cells (no contentHash/versionStamp bindings)
+/// decode with `content_hash = ""` and `version_stamp = 0`. The
+/// unload path tolerates this so live def-states from earlier
+/// boots round-trip cleanly.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LoadReport {
     pub added_nouns: Vec<String>,
     pub added_fact_types: Vec<String>,
     pub added_derivations: Vec<String>,
+    /// 16-char lowercase hex FNV-1a64 of the loaded body.
+    pub content_hash: String,
+    /// Monotonic per-process load stamp (see `next_version()`).
+    pub version_stamp: u64,
 }
 
 /// Why a `load_reading` call rejected.
@@ -176,12 +194,22 @@ impl Default for UnloadPolicy {
     }
 }
 
-/// What `unload_reading` actually removed, mirroring `LoadReport`.
+/// What `unload_reading` actually removed, mirroring `LoadReport`,
+/// plus the manifest's recorded versioning metadata so wire callers
+/// can see which body version they just removed (#558 / DynRdg-4).
+///
+/// `content_hash` and `version_stamp` are surfaced exactly as they
+/// were stored at load time. For pre-#558 manifest cells the values
+/// are `""` and `0` respectively (see `decode_manifest`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UnloadReport {
     pub removed_nouns: Vec<String>,
     pub removed_fact_types: Vec<String>,
     pub removed_derivations: Vec<String>,
+    /// Content hash recorded by the load that wrote the manifest.
+    pub content_hash: String,
+    /// Version stamp recorded by the load that wrote the manifest.
+    pub version_stamp: u64,
 }
 
 /// Why an `unload_reading` call rejected.
@@ -304,19 +332,32 @@ pub fn manifest_cell_name(name: &str) -> String {
 /// Encode a `LoadReport` as a single fact for the manifest cell.
 /// Comma-separated atom lists fit the existing fact-binding shape
 /// without needing a nested-sequence binding type.
+///
+/// Versioning metadata (`contentHash`, `versionStamp` — #558) lands
+/// alongside the cell-id lists in the same fact. Decoding tolerates
+/// older cells written before #558 by returning `""` /  `0` for the
+/// missing bindings (see `decode_manifest`).
 pub fn encode_manifest(report: &LoadReport) -> Object {
     let nouns = report.added_nouns.join(",");
     let fts = report.added_fact_types.join(",");
     let derivs = report.added_derivations.join(",");
+    let stamp = u64_to_dec(report.version_stamp);
     Object::seq(vec![crate::ast::fact_from_pairs(&[
         ("addedNouns", &nouns),
         ("addedFactTypes", &fts),
         ("addedDerivations", &derivs),
+        ("contentHash", &report.content_hash),
+        ("versionStamp", &stamp),
     ])])
 }
 
 /// Decode a manifest cell back into a `LoadReport`. Returns `None`
 /// if the cell is absent or shape-wrong.
+///
+/// Backward-compat: pre-#558 manifest cells have no `contentHash`
+/// or `versionStamp` bindings. We accept those by defaulting the
+/// fields to `""` / `0` so old persisted state still unloads
+/// cleanly.
 pub fn decode_manifest(state: &Object, name: &str) -> Option<LoadReport> {
     let cell_name = manifest_cell_name(name);
     let cell = crate::ast::fetch(&cell_name, state);
@@ -333,11 +374,108 @@ pub fn decode_manifest(state: &Object, name: &str) -> Option<LoadReport> {
             })
             .unwrap_or_default()
     };
+    let content_hash = crate::ast::binding(fact, "contentHash")
+        .map(String::from)
+        .unwrap_or_default();
+    let version_stamp = crate::ast::binding(fact, "versionStamp")
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
     Some(LoadReport {
         added_nouns: split("addedNouns"),
         added_fact_types: split("addedFactTypes"),
         added_derivations: split("addedDerivations"),
+        content_hash,
+        version_stamp,
     })
+}
+
+// ── Reading versioning (#558 / DynRdg-4) ───────────────────────────
+
+/// Process-monotonic version counter for `load_reading`. Held behind
+/// a `spin::Mutex<u64>` so the helper is `no_std`-clean and matches
+/// the lock pattern used elsewhere in this crate (`csprng::STATE`,
+/// `entropy::GLOBAL_SOURCE`). Each successful load increments the
+/// counter and returns the new value.
+///
+/// Boot-time replay: kernel-side replay walks the persistence ring
+/// and replays each `LoadReading` verb against a fresh def-state.
+/// To keep stamps monotonic across boots, `seed_version_counter`
+/// pushes the counter forward to the highest stamp observed in the
+/// replayed manifest cells. Calling `next_version()` after seeding
+/// returns `seed + 1`, `seed + 2`, etc.
+static VERSION_COUNTER: spin::Mutex<u64> = spin::Mutex::new(0);
+
+/// Allocate the next version stamp. Increments the global counter
+/// and returns the post-increment value, so the first stamp is `1`
+/// (a stamp of `0` is reserved for "unset" / pre-#558 manifests).
+pub fn next_version() -> u64 {
+    let mut g = VERSION_COUNTER.lock();
+    *g = g.saturating_add(1);
+    *g
+}
+
+/// Seed the version counter from a known floor. Used by boot-time
+/// replay so post-replay loads continue numbering above the highest
+/// previously-seen stamp. Idempotent: calling with a value lower
+/// than the current counter is a no-op.
+pub fn seed_version_counter(floor: u64) {
+    let mut g = VERSION_COUNTER.lock();
+    if floor > *g {
+        *g = floor;
+    }
+}
+
+/// Compute a content hash of the body bytes as a 16-char lowercase
+/// hex string. Uses FNV-1a 64-bit, which is `no_std`-clean and short
+/// enough to embed in a manifest binding without bloating the cell
+/// graph. The hash is content-only — same bytes produce the same
+/// digest, byte-different bytes produce a different digest with
+/// overwhelming probability.
+///
+/// FNV-1a is not a cryptographic hash; we don't need one here. The
+/// purpose is "callers can tell two loads apart"; collision
+/// resistance against an adversary isn't part of the threat model.
+pub fn compute_content_hash(body: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h: u64 = FNV_OFFSET;
+    for b in body.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    let mut s = String::with_capacity(16);
+    let hex_digit = |n: u8| -> char {
+        match n {
+            0..=9 => (b'0' + n) as char,
+            10..=15 => (b'a' + (n - 10)) as char,
+            _ => unreachable!(),
+        }
+    };
+    // Emit nibbles MSB-first: shifts 60, 56, 52, ..., 4, 0.
+    let mut shift: i32 = 60;
+    while shift >= 0 {
+        let nibble = ((h >> shift) & 0xf) as u8;
+        s.push(hex_digit(nibble));
+        shift -= 4;
+    }
+    s
+}
+
+/// Decimal-encode a u64 into a heap-allocated `String` without
+/// reaching for `format!` (keeps the helper `no_std`-friendly).
+fn u64_to_dec(mut n: u64) -> String {
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut buf = [0u8; 20]; // u64::MAX fits in 20 decimal digits
+    let mut i = buf.len();
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    // Safety: we only wrote ASCII digits.
+    String::from_utf8(buf[i..].to_vec()).expect("ASCII digits are valid UTF-8")
 }
 
 /// Write the manifest for a successful load into `state`.
@@ -512,13 +650,18 @@ pub fn load_reading(
     }
 
     // Step 6: compute the report — Noun / FactType / derivation:* cell
-    // additions vs. the input state.
-    let report = build_report(state, &scratch);
+    // additions vs. the input state. Versioning metadata
+    // (content_hash, version_stamp) is allocated here so the report
+    // and the persisted manifest carry the same values (#558).
+    let mut report = build_report(state, &scratch);
+    report.content_hash = compute_content_hash(body);
+    report.version_stamp = next_version();
 
     // Step 7: persist the manifest so a future #556 UnloadReading can
     // recover the list of cells this load contributed. Manifest cell
     // is `_loaded_reading:{name}` carrying the three comma-separated
-    // identifier lists; see `encode_manifest` for the schema.
+    // identifier lists plus the new (#558) `contentHash` /
+    // `versionStamp` bindings; see `encode_manifest` for the schema.
     let with_manifest = write_manifest(&scratch, trimmed_name, &report);
 
     // Step 8: return the manifest-augmented state for caller to commit.
@@ -607,6 +750,13 @@ pub fn unload_reading(
         removed_nouns: manifest.added_nouns,
         removed_fact_types: manifest.added_fact_types,
         removed_derivations: manifest.added_derivations,
+        // Surface the versioning metadata recorded by the load so
+        // wire callers can see which body version was just removed.
+        // Pre-#558 manifests decode with `""` / `0` defaults, which
+        // we propagate as-is — the wire encoder treats both as
+        // absent-equivalent (#558 / DynRdg-4).
+        content_hash: manifest.content_hash,
+        version_stamp: manifest.version_stamp,
     };
 
     Ok(UnloadOutcome {
@@ -856,6 +1006,14 @@ pub fn build_report(before: &Object, after: &Object) -> LoadReport {
         added_nouns,
         added_fact_types,
         added_derivations,
+        // Versioning fields are filled in by `load_reading` after
+        // the diff is computed — the diff helper has no access to
+        // the body bytes nor a reason to allocate a stamp on its
+        // own. Default values (`""` / `0`) are the same shape that
+        // pre-#558 manifests use, so callers that only care about
+        // the cell-id diff can ignore them.
+        content_hash: String::new(),
+        version_stamp: 0,
     }
 }
 
@@ -1570,11 +1728,28 @@ Product has SKU.
             "Noun cell after reload must equal Noun cell after fresh load"
         );
 
-        // Manifest cells equal.
+        // Manifest cells equal on the cell-id lists. Since #558,
+        // the version stamp advances on every successful load — so
+        // a reload bumps `versionStamp` even when the body is
+        // byte-identical. We compare the structural fields (added_*)
+        // and the content hash (which IS deterministic on body
+        // bytes) but not version_stamp.
+        let m_fresh = decode_manifest(&fresh.new_state, "catalog").expect("fresh manifest");
+        let m_reloaded = decode_manifest(&reloaded.new_state, "catalog")
+            .expect("reloaded manifest");
+        assert_eq!(m_fresh.added_nouns, m_reloaded.added_nouns);
+        assert_eq!(m_fresh.added_fact_types, m_reloaded.added_fact_types);
+        assert_eq!(m_fresh.added_derivations, m_reloaded.added_derivations);
         assert_eq!(
-            decode_manifest(&fresh.new_state, "catalog"),
-            decode_manifest(&reloaded.new_state, "catalog"),
+            m_fresh.content_hash, m_reloaded.content_hash,
+            "byte-identical body must produce identical content hash"
         );
+        assert!(
+            m_fresh.version_stamp < m_reloaded.version_stamp,
+            "reload bumps version_stamp even on identical body: {} → {}",
+            m_fresh.version_stamp, m_reloaded.version_stamp,
+        );
+
     }
 
     /// Migrate stub: `ReloadPolicy::MigrateFacts` returns
@@ -1619,5 +1794,253 @@ Product has SKU.
             Err(ReloadError::EmptyBody) => {}
             other => panic!("expected EmptyBody, got {other:?}"),
         }
+    }
+
+    // ── #558 reading versioning tests ──────────────────────────────
+
+    /// FNV-1a64 is deterministic on identical input and differs on
+    /// byte-different input. The output is always 16 lowercase hex
+    /// chars (a pinned shape so wire callers can rely on length).
+    #[test]
+    fn content_hash_deterministic() {
+        let h1 = compute_content_hash("Product(.SKU) is an entity type.\n");
+        let h2 = compute_content_hash("Product(.SKU) is an entity type.\n");
+        let h3 = compute_content_hash("Product(.SKU) is an entity type. \n"); // extra space
+        assert_eq!(h1, h2, "same body → same hash");
+        assert_ne!(h1, h3, "byte-different body → different hash");
+        assert_eq!(h1.len(), 16, "hash must be 16 chars");
+        assert!(
+            h1.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "hash must be lowercase hex; got {h1}"
+        );
+    }
+
+    /// Empty body still has a defined hash (even though the verb
+    /// rejects empty bodies before computing it — the helper itself
+    /// stays total).
+    #[test]
+    fn content_hash_empty_string_is_well_defined() {
+        let h = compute_content_hash("");
+        // FNV-1a64 of empty input is the offset basis as hex.
+        assert_eq!(h, "cbf29ce484222325");
+    }
+
+    /// Three loads (A, B, A again) produce three strictly-increasing
+    /// version stamps. Pin the monotonic invariant — note the test
+    /// reads the stamp from the report rather than asserting absolute
+    /// values, because other tests in the same process may have
+    /// already advanced the counter.
+    #[test]
+    fn version_stamp_monotonic_across_loads() {
+        let state = seed_state();
+        let body_a = "Product(.SKU) is an entity type.\n";
+        let body_b = "Category(.Name) is an entity type.\n";
+
+        let load1 = load_reading(&state, "A", body_a, LoadReadingPolicy::AllowAll)
+            .expect("A loads");
+        let load2 = load_reading(&load1.new_state, "B", body_b, LoadReadingPolicy::AllowAll)
+            .expect("B loads");
+        let load3 = load_reading(&load2.new_state, "A", body_a, LoadReadingPolicy::AllowAll)
+            .expect("A re-loads");
+
+        assert!(
+            load1.report.version_stamp < load2.report.version_stamp,
+            "second load's stamp must be higher: {} vs {}",
+            load1.report.version_stamp, load2.report.version_stamp,
+        );
+        assert!(
+            load2.report.version_stamp < load3.report.version_stamp,
+            "third load's stamp must be higher: {} vs {}",
+            load2.report.version_stamp, load3.report.version_stamp,
+        );
+        // No stamp is ever zero — that's reserved for pre-#558
+        // manifests.
+        assert!(load1.report.version_stamp > 0);
+    }
+
+    /// `seed_version_counter` advances the floor but never rolls
+    /// back. Idempotent on a value below the current counter.
+    #[test]
+    fn seed_version_counter_advances_floor() {
+        // Bump the counter by issuing a load.
+        let state = seed_state();
+        let body = "Product(.SKU) is an entity type.\n";
+        let outcome = load_reading(&state, "x", body, LoadReadingPolicy::AllowAll)
+            .expect("load succeeds");
+        let baseline = outcome.report.version_stamp;
+
+        // Seeding with a lower value is a no-op.
+        seed_version_counter(baseline - 1);
+        let after_low = next_version();
+        assert!(
+            after_low > baseline,
+            "next_version() after low seed must still advance"
+        );
+
+        // Seeding with a higher value pushes the counter forward.
+        let target = after_low + 1000;
+        seed_version_counter(target);
+        let after_high = next_version();
+        assert_eq!(
+            after_high,
+            target + 1,
+            "next_version() after high seed = seed + 1"
+        );
+    }
+
+    /// Round-trip: load → unload → unload report carries the same
+    /// content hash and version stamp the load wrote.
+    #[test]
+    fn manifest_round_trip_preserves_versioning() {
+        let state = seed_state();
+        let body = "Product(.SKU) is an entity type.\n";
+        let loaded = load_reading(&state, "catalog", body, LoadReadingPolicy::AllowAll)
+            .expect("load succeeds");
+
+        let unloaded = unload_reading(&loaded.new_state, "catalog", UnloadPolicy::CascadeDelete)
+            .expect("unload succeeds");
+
+        assert_eq!(
+            unloaded.report.content_hash, loaded.report.content_hash,
+            "unload must surface the load's content hash"
+        );
+        assert_eq!(
+            unloaded.report.version_stamp, loaded.report.version_stamp,
+            "unload must surface the load's version stamp"
+        );
+        assert_eq!(unloaded.report.content_hash, compute_content_hash(body));
+    }
+
+    /// Reload's `removed` carries the old version's stamp; `added`
+    /// carries the new version's stamp; the new stamp is strictly
+    /// higher.
+    #[test]
+    fn reload_reflects_new_version() {
+        let state = seed_state();
+        let body_v1 = "Product(.SKU) is an entity type.\n";
+        let body_v2 = "Category(.Name) is an entity type.\n";
+
+        let loaded = load_reading(&state, "catalog", body_v1, LoadReadingPolicy::AllowAll)
+            .expect("v1 loads");
+
+        let reloaded = reload_reading(
+            &loaded.new_state,
+            "catalog",
+            body_v2,
+            ReloadPolicy::ReplaceAll,
+        )
+        .expect("reload succeeds");
+
+        // Removed report mirrors v1's metadata.
+        assert_eq!(
+            reloaded.removed.content_hash, loaded.report.content_hash,
+            "removed.content_hash must equal the original load's hash"
+        );
+        assert_eq!(
+            reloaded.removed.version_stamp, loaded.report.version_stamp,
+            "removed.version_stamp must equal the original load's stamp"
+        );
+
+        // Added report mirrors v2's body.
+        assert_eq!(
+            reloaded.added.content_hash,
+            compute_content_hash(body_v2),
+            "added.content_hash must equal hash of v2 body"
+        );
+        assert_ne!(
+            reloaded.added.content_hash, reloaded.removed.content_hash,
+            "v2 hash must differ from v1 hash"
+        );
+        assert!(
+            reloaded.removed.version_stamp < reloaded.added.version_stamp,
+            "new stamp must be strictly higher: {} → {}",
+            reloaded.removed.version_stamp, reloaded.added.version_stamp,
+        );
+    }
+
+    /// Backward-compat: a manifest cell written before #558 has no
+    /// `contentHash` / `versionStamp` bindings. Decoding must default
+    /// those fields to `""` / `0`, and `unload_reading` must still
+    /// remove the cells listed in the legacy manifest.
+    #[test]
+    fn manifest_backward_compat_pre_558() {
+        let state = seed_state();
+
+        // Synthesize a pre-#558 manifest cell shape: only the three
+        // legacy bindings, no contentHash / versionStamp. This is
+        // exactly what `encode_manifest` produced before #558.
+        let legacy_cell = Object::seq(vec![ast::fact_from_pairs(&[
+            ("addedNouns", "Widget"),
+            ("addedFactTypes", ""),
+            ("addedDerivations", ""),
+        ])]);
+        let mut state = state;
+        // Also seed the Noun cell so cascade-delete has something to
+        // remove.
+        state = ast::store(
+            "Noun",
+            Object::seq(vec![
+                ast::fact_from_pairs(&[("name", "Order"), ("objectType", "entity")]),
+                ast::fact_from_pairs(&[("name", "Widget"), ("objectType", "entity")]),
+            ]),
+            &state,
+        );
+        state = ast::store(&manifest_cell_name("legacy"), legacy_cell, &state);
+
+        // Decoder fills in defaults.
+        let decoded = decode_manifest(&state, "legacy")
+            .expect("legacy manifest must decode");
+        assert_eq!(decoded.added_nouns, vec!["Widget".to_string()]);
+        assert_eq!(decoded.content_hash, "", "missing binding → empty string");
+        assert_eq!(decoded.version_stamp, 0, "missing binding → zero");
+
+        // Unload still works against the legacy cell.
+        let unloaded = unload_reading(&state, "legacy", UnloadPolicy::CascadeDelete)
+            .expect("legacy manifest must unload");
+        assert_eq!(unloaded.report.removed_nouns, vec!["Widget".to_string()]);
+        assert_eq!(unloaded.report.content_hash, "");
+        assert_eq!(unloaded.report.version_stamp, 0);
+
+        // Widget is gone, Order survives.
+        let nouns_after = ast::fetch_or_phi("Noun", &unloaded.new_state);
+        let names: Vec<String> = nouns_after
+            .as_seq()
+            .map(|s| {
+                s.iter()
+                    .filter_map(|f| ast::binding(f, "name").map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(names.contains(&"Order".to_string()));
+        assert!(!names.contains(&"Widget".to_string()));
+    }
+
+    /// `encode_manifest` includes the new bindings in the persisted
+    /// fact, and `decode_manifest` round-trips them.
+    #[test]
+    fn manifest_encode_decode_round_trip_with_versioning() {
+        let report = LoadReport {
+            added_nouns: vec!["Foo".to_string(), "Bar".to_string()],
+            added_fact_types: vec![],
+            added_derivations: vec![],
+            content_hash: "deadbeefcafef00d".to_string(),
+            version_stamp: 42,
+        };
+        let cell = encode_manifest(&report);
+        // Plumb it through a state so decode_manifest can find it.
+        let state = ast::store(&manifest_cell_name("x"), cell, &Object::phi());
+        let decoded = decode_manifest(&state, "x").expect("decodes");
+        assert_eq!(decoded.content_hash, "deadbeefcafef00d");
+        assert_eq!(decoded.version_stamp, 42);
+        assert_eq!(decoded.added_nouns, vec!["Foo".to_string(), "Bar".to_string()]);
+    }
+
+    /// `u64_to_dec` covers the boundary cases.
+    #[test]
+    fn u64_to_dec_boundaries() {
+        assert_eq!(u64_to_dec(0), "0");
+        assert_eq!(u64_to_dec(1), "1");
+        assert_eq!(u64_to_dec(123456789), "123456789");
+        assert_eq!(u64_to_dec(u64::MAX), "18446744073709551615");
     }
 }
