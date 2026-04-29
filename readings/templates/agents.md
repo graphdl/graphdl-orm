@@ -50,6 +50,21 @@ Completion occurred at Timestamp.
 Verb invokes Agent Definition.
   Each Verb invokes at most one Agent Definition.
 
+<!--
+  Engine wiring: when a Verb invokes an Agent Definition, the verb
+  name resolves to `Func::Platform(name)` in DEFS. The handler
+  (installed per-target via `arest::externals` / `install_platform_fn`
+  or `install_async_platform_fn`) walks the Agent Definition's `uses
+  Model` + `has Prompt` facts to assemble the request, calls the
+  model, and writes the resulting `Completion` cell. No separate
+  agent-dispatch machinery — the same `Func::Platform` path serves
+  every external function (LLMs, HTTP APIs, hardware sensors).
+
+  Targets that don't install a handler (e.g. the bare kernel) see
+  `Object::Bottom` for the call — graceful skip, not a panic.
+-->
+
+
 ## Instance Facts
 
 Domain 'agents' has Access 'public'.
