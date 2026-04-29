@@ -1281,10 +1281,31 @@ pub fn build_app() -> Result<UnifiedReplApp, slint::PlatformError> {
                 s.system_actions.get(idx as usize).cloned()
             };
             let Some(action) = action else { return };
-            let result = actions::dispatch_action(&action);
+            // #564 / DynRdg-T5 — LoadReading / UnloadReading /
+            // ReloadReading consume the prompt's current input as
+            // `<name>\n<body>` (or just `<name>` for unload). Other
+            // verbs ignore the prompt and dispatch with their
+            // pre-bound `default_args`.
+            let needs_input = matches!(
+                action.verb,
+                actions::SystemVerb::LoadReading
+                    | actions::SystemVerb::UnloadReading
+                    | actions::SystemVerb::ReloadReading
+            );
+            let result = if needs_input {
+                let input = window.get_current_input().to_string();
+                actions::dispatch_action_with_input(&action, &input)
+            } else {
+                actions::dispatch_action(&action)
+            };
             {
                 let mut s = state.borrow_mut();
                 s.push_line(result);
+            }
+            // Clear the prompt after a LoadReading-class dispatch so
+            // the body doesn't linger as the next user input.
+            if needs_input {
+                window.set_current_input(SharedString::from(""));
             }
             redraw(&window, &mut state.borrow_mut());
         });
