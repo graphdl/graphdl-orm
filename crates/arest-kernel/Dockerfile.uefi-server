@@ -39,7 +39,10 @@ COPY crates/arest-kernel/src/ crates/arest-kernel/src/
 COPY crates/arest-kernel/rust-toolchain.toml crates/arest-kernel/rust-toolchain.toml
 COPY crates/arest-kernel/ui/ crates/arest-kernel/ui/
 COPY crates/arest-kernel/assets/ crates/arest-kernel/assets/
-COPY apps/ui.do/dist/ apps/ui.do/dist/
+# ui.do bundle COPY removed under server profile (#629) — build.rs
+# checks CARGO_FEATURE_SERVER and emits an empty UI_ASSETS table so
+# the SPA bytes never enter the .efi image. The dist/ COPY would
+# only be wasted build context.
 COPY crates/arest-kernel/doom_assets/ crates/arest-kernel/doom_assets/
 COPY crates/arest/Cargo.toml crates/arest/Cargo.toml
 COPY crates/arest/src/ crates/arest/src/
