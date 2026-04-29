@@ -143,6 +143,191 @@ pub struct LoadOutcome {
     pub new_state: Object,
 }
 
+// ── UnloadReading types (#556 / DynRdg-2) ──────────────────────────
+//
+// `UnloadReading` is the inverse of `LoadReading`. We persist a
+// per-reading manifest cell at load time (`_loaded_reading:{name}`)
+// recording the report's `added_nouns`, `added_fact_types`, and
+// `added_derivations`. The unload path looks up the manifest, drops
+// every listed identifier from its host cell (`Noun`, `FactType`,
+// `DerivationRule`), removes the manifest cell itself, and returns a
+// structured outcome describing what went.
+
+/// Caller's policy for what happens to facts referencing cells
+/// removed by an unload.
+///
+/// `CascadeDelete` (default) — remove every cell listed in the
+/// reading's manifest and any rows in adjacent cells (Role,
+/// derivation defs) keyed by those identifiers.
+///
+/// `Migrate` (future) — preserve referencing facts by re-homing
+/// them under a generic uncategorized fact-type bucket. #557
+/// ReloadReading depends on this for atomic unload+load with
+/// backing-fact preservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnloadPolicy {
+    CascadeDelete,
+    Migrate,
+}
+
+impl Default for UnloadPolicy {
+    fn default() -> Self {
+        UnloadPolicy::CascadeDelete
+    }
+}
+
+/// What `unload_reading` actually removed, mirroring `LoadReport`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnloadReport {
+    pub removed_nouns: Vec<String>,
+    pub removed_fact_types: Vec<String>,
+    pub removed_derivations: Vec<String>,
+}
+
+/// Why an `unload_reading` call rejected.
+///
+/// `ManifestMissing` — the reading was not previously loaded under
+/// this `name`, OR the load happened before manifest persistence
+/// (#556) and the `_loaded_reading:{name}` cell was not written.
+/// `InvalidName` — same sanitization rules as `LoadReading::name`.
+/// `Disallowed` — reserved for future host-policy gating.
+/// `NotImplemented` — the requested policy is not yet implemented
+/// (today: `UnloadPolicy::Migrate`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnloadError {
+    ManifestMissing(String),
+    InvalidName(String),
+    Disallowed,
+    NotImplemented,
+}
+
+/// Outcome of a successful unload: the new state plus a structured
+/// report listing every cell-row that was removed.
+#[derive(Debug, Clone)]
+pub struct UnloadOutcome {
+    pub report: UnloadReport,
+    pub new_state: Object,
+}
+
+/// Cell-name prefix for the per-reading manifest. The full cell
+/// name is `_loaded_reading:{name}`.
+pub const MANIFEST_CELL_PREFIX: &str = "_loaded_reading:";
+
+/// Build a manifest cell name for a given reading name.
+pub fn manifest_cell_name(name: &str) -> String {
+    let mut s = String::with_capacity(MANIFEST_CELL_PREFIX.len() + name.len());
+    s.push_str(MANIFEST_CELL_PREFIX);
+    s.push_str(name);
+    s
+}
+
+/// Encode a `LoadReport` as a single fact for the manifest cell.
+/// Comma-separated atom lists fit the existing fact-binding shape
+/// without needing a nested-sequence binding type.
+pub fn encode_manifest(report: &LoadReport) -> Object {
+    let nouns = report.added_nouns.join(",");
+    let fts = report.added_fact_types.join(",");
+    let derivs = report.added_derivations.join(",");
+    Object::seq(vec![crate::ast::fact_from_pairs(&[
+        ("addedNouns", &nouns),
+        ("addedFactTypes", &fts),
+        ("addedDerivations", &derivs),
+    ])])
+}
+
+/// Decode a manifest cell back into a `LoadReport`. Returns `None`
+/// if the cell is absent or shape-wrong.
+pub fn decode_manifest(state: &Object, name: &str) -> Option<LoadReport> {
+    let cell_name = manifest_cell_name(name);
+    let cell = crate::ast::fetch(&cell_name, state);
+    let facts = cell.as_seq()?;
+    let fact = facts.first()?;
+    let split = |key: &str| -> Vec<String> {
+        crate::ast::binding(fact, key)
+            .map(|s| {
+                if s.is_empty() {
+                    Vec::new()
+                } else {
+                    s.split(',').map(|p| p.to_string()).collect()
+                }
+            })
+            .unwrap_or_default()
+    };
+    Some(LoadReport {
+        added_nouns: split("addedNouns"),
+        added_fact_types: split("addedFactTypes"),
+        added_derivations: split("addedDerivations"),
+    })
+}
+
+/// Write the manifest for a successful load into `state`.
+pub fn write_manifest(state: &Object, name: &str, report: &LoadReport) -> Object {
+    let cell_name = manifest_cell_name(name);
+    crate::ast::store(&cell_name, encode_manifest(report), state)
+}
+
+/// Remove rows from a sequence-valued cell where `binding(row, key)`
+/// matches any value in `values`. If the cell is absent, the state
+/// is returned unchanged.
+pub fn remove_rows_by_binding(
+    state: &Object,
+    cell: &str,
+    key: &str,
+    values: &[String],
+) -> Object {
+    if values.is_empty() {
+        return state.clone();
+    }
+    let existing = crate::ast::fetch_or_phi(cell, state);
+    let rows = match existing.as_seq() {
+        Some(rows) => rows,
+        None => return state.clone(),
+    };
+    use hashbrown::HashSet;
+    let drop_set: HashSet<&str> = values.iter().map(|s| s.as_str()).collect();
+    let kept: Vec<Object> = rows
+        .iter()
+        .filter(|f| {
+            !crate::ast::binding(f, key)
+                .map(|v| drop_set.contains(v))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    if kept.len() == rows.len() {
+        return state.clone();
+    }
+    crate::ast::store(cell, Object::Seq(kept.into()), state)
+}
+
+/// Remove a cell entirely from a state.
+pub fn remove_cell(state: &Object, name: &str) -> Object {
+    use hashbrown::HashMap;
+    match state {
+        Object::Map(map) => {
+            if !map.contains_key(name) {
+                return state.clone();
+            }
+            let mut new_map: HashMap<String, Object> = map.clone();
+            new_map.remove(name);
+            Object::Map(new_map)
+        }
+        Object::Seq(_) => {
+            let cells = crate::ast::cells_iter(state);
+            if !cells.iter().any(|(n, _)| n == &name) {
+                return state.clone();
+            }
+            let kept: Vec<Object> = cells
+                .into_iter()
+                .filter(|(n, _)| n != &name)
+                .map(|(n, c)| crate::ast::cell(n, c.clone()))
+                .collect();
+            Object::Seq(kept.into())
+        }
+        _ => state.clone(),
+    }
+}
+
 // ── load_reading (gated on std until parse+check land in no_std) ──────
 //
 // The body reaches `crate::parse_forml2::parse_to_state_from` and
@@ -250,10 +435,103 @@ pub fn load_reading(
     // additions vs. the input state.
     let report = build_report(state, &scratch);
 
-    // Step 7: return scratch state for caller to commit.
+    // Step 7: persist the manifest so a future #556 UnloadReading can
+    // recover the list of cells this load contributed. Manifest cell
+    // is `_loaded_reading:{name}` carrying the three comma-separated
+    // identifier lists; see `encode_manifest` for the schema.
+    let with_manifest = write_manifest(&scratch, trimmed_name, &report);
+
+    // Step 8: return the manifest-augmented state for caller to commit.
     Ok(LoadOutcome {
         report,
-        new_state: scratch,
+        new_state: with_manifest,
+    })
+}
+
+/// Inverse of `load_reading` — drop a previously-loaded reading from
+/// the cell graph. Reads the `_loaded_reading:{name}` manifest cell,
+/// removes every listed identifier from `Noun` / `FactType` /
+/// `DerivationRule` (cascade-deleting the matching `Role` and
+/// `derivation:*` cells), and removes the manifest cell itself.
+///
+/// On `ManifestMissing` / `InvalidName` / `NotImplemented`, the input
+/// state is untouched.
+#[cfg(not(feature = "no_std"))]
+pub fn unload_reading(
+    state: &Object,
+    name: &str,
+    policy: UnloadPolicy,
+) -> Result<UnloadOutcome, UnloadError> {
+    // Step 1: sanitize.
+    let trimmed_name = name.trim();
+    if trimmed_name.is_empty() {
+        return Err(UnloadError::InvalidName(
+            "reading name must not be empty".to_string(),
+        ));
+    }
+    if trimmed_name.chars().any(|c| c.is_control()) {
+        return Err(UnloadError::InvalidName(
+            "reading name must not contain control characters".to_string(),
+        ));
+    }
+
+    // Step 2: gate Migrate.
+    if policy == UnloadPolicy::Migrate {
+        return Err(UnloadError::NotImplemented);
+    }
+
+    // Step 3: manifest lookup.
+    let manifest = match decode_manifest(state, trimmed_name) {
+        Some(m) => m,
+        None => {
+            return Err(UnloadError::ManifestMissing(trimmed_name.to_string()));
+        }
+    };
+
+    // Step 4: cascade-delete per identifier list.
+    let mut new_state = state.clone();
+    new_state = remove_rows_by_binding(
+        &new_state,
+        "Noun",
+        "name",
+        &manifest.added_nouns,
+    );
+    new_state = remove_rows_by_binding(
+        &new_state,
+        "FactType",
+        "id",
+        &manifest.added_fact_types,
+    );
+    new_state = remove_rows_by_binding(
+        &new_state,
+        "Role",
+        "factType",
+        &manifest.added_fact_types,
+    );
+    new_state = remove_rows_by_binding(
+        &new_state,
+        "DerivationRule",
+        "ruleId",
+        &manifest.added_derivations,
+    );
+    for rule_id in &manifest.added_derivations {
+        let def_name = alloc::format!("derivation:{}", rule_id);
+        new_state = remove_cell(&new_state, &def_name);
+    }
+
+    // Step 5: drop the manifest cell.
+    let manifest_cell = manifest_cell_name(trimmed_name);
+    new_state = remove_cell(&new_state, &manifest_cell);
+
+    let report = UnloadReport {
+        removed_nouns: manifest.added_nouns,
+        removed_fact_types: manifest.added_fact_types,
+        removed_derivations: manifest.added_derivations,
+    };
+
+    Ok(UnloadOutcome {
+        report,
+        new_state,
     })
 }
 
@@ -698,5 +976,209 @@ Category(.Name) is an entity type.
         assert!(names.contains(&"Order"));
         assert!(names.contains(&"Product"));
         assert!(names.contains(&"Category"));
+    }
+
+    // ── #556 unload_reading tests ───────────────────────────────────
+
+    /// Loading writes the manifest cell `_loaded_reading:{name}` so a
+    /// future UnloadReading can recover the list of added cells.
+    #[test]
+    fn load_persists_manifest_cell() {
+        let state = seed_state();
+        let body = "Product(.SKU) is an entity type.\nCategory(.Name) is an entity type.\n";
+        let outcome = load_reading(&state, "catalog", body, LoadReadingPolicy::AllowAll)
+            .expect("valid reading should load");
+        let decoded = decode_manifest(&outcome.new_state, "catalog")
+            .expect("manifest cell must be persisted");
+        assert_eq!(
+            decoded.added_nouns,
+            vec!["Category".to_string(), "Product".to_string()]
+        );
+        assert_eq!(decoded, outcome.report);
+    }
+
+    /// Successful unload of a previously-loaded reading returns the
+    /// noun list in the report and removes those rows from the Noun
+    /// cell.
+    #[test]
+    fn unload_reading_removes_added_cells() {
+        let state = seed_state();
+        let body = "Product(.SKU) is an entity type.\nCategory(.Name) is an entity type.\n";
+        let loaded = load_reading(&state, "catalog", body, LoadReadingPolicy::AllowAll)
+            .expect("load succeeds");
+
+        // Sanity: nouns are present before the unload.
+        let pre_nouns_obj = ast::fetch_or_phi("Noun", &loaded.new_state);
+        let nouns_before: Vec<&str> = pre_nouns_obj
+            .as_seq()
+            .map(|s| s.iter().filter_map(|f| ast::binding(f, "name")).collect())
+            .unwrap_or_default();
+        assert!(nouns_before.contains(&"Product"));
+        assert!(nouns_before.contains(&"Category"));
+
+        let outcome = unload_reading(&loaded.new_state, "catalog", UnloadPolicy::CascadeDelete)
+            .expect("unload succeeds");
+        assert_eq!(
+            outcome.report.removed_nouns,
+            vec!["Category".to_string(), "Product".to_string()]
+        );
+
+        // Product / Category are gone, Order (seeded) survives.
+        let post_obj = ast::fetch_or_phi("Noun", &outcome.new_state);
+        let nouns_after: Vec<String> = post_obj
+            .as_seq()
+            .map(|s| {
+                s.iter()
+                    .filter_map(|f| ast::binding(f, "name").map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(nouns_after.contains(&"Order".to_string()));
+        assert!(!nouns_after.contains(&"Product".to_string()));
+        assert!(!nouns_after.contains(&"Category".to_string()));
+
+        // The manifest cell must be gone.
+        assert!(decode_manifest(&outcome.new_state, "catalog").is_none());
+    }
+
+    /// Unload of an unknown name → ManifestMissing. Input state is
+    /// untouched.
+    #[test]
+    fn unload_unknown_name_yields_manifest_missing() {
+        let state = seed_state();
+        let snapshot = state.clone();
+        let err = unload_reading(&state, "never-loaded", UnloadPolicy::CascadeDelete)
+            .expect_err("unknown name must reject");
+        match err {
+            UnloadError::ManifestMissing(name) => {
+                assert_eq!(name, "never-loaded");
+            }
+            other => panic!("expected ManifestMissing, got {other:?}"),
+        }
+        assert_eq!(state, snapshot, "rejection must not mutate input");
+    }
+
+    /// Empty/whitespace name rejects with InvalidName.
+    #[test]
+    fn unload_empty_name_invalid() {
+        let state = seed_state();
+        match unload_reading(&state, "", UnloadPolicy::CascadeDelete) {
+            Err(UnloadError::InvalidName(_)) => {}
+            other => panic!("expected InvalidName, got {other:?}"),
+        }
+        match unload_reading(&state, "   \t", UnloadPolicy::CascadeDelete) {
+            Err(UnloadError::InvalidName(_)) => {}
+            other => panic!("expected InvalidName, got {other:?}"),
+        }
+    }
+
+    /// UnloadPolicy::Migrate is stubbed → NotImplemented.
+    #[test]
+    fn unload_migrate_policy_not_implemented() {
+        let state = seed_state();
+        let body = "Product(.SKU) is an entity type.\n";
+        let loaded = load_reading(&state, "catalog", body, LoadReadingPolicy::AllowAll)
+            .expect("load succeeds");
+        match unload_reading(&loaded.new_state, "catalog", UnloadPolicy::Migrate) {
+            Err(UnloadError::NotImplemented) => {}
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+    }
+
+    /// Round-trip: load → unload returns the Noun cell to the
+    /// pre-load state. Set semantics: every Noun row that wasn't in
+    /// the seed disappears; the seed nouns survive.
+    #[test]
+    fn unload_after_load_round_trips() {
+        let state = seed_state();
+        let body = "Product(.SKU) is an entity type.\nCategory(.Name) is an entity type.\n";
+        let loaded = load_reading(&state, "catalog", body, LoadReadingPolicy::AllowAll)
+            .expect("load succeeds");
+        let unloaded = unload_reading(&loaded.new_state, "catalog", UnloadPolicy::CascadeDelete)
+            .expect("unload succeeds");
+
+        let nouns_pre = ast::fetch_or_phi("Noun", &state);
+        let nouns_post = ast::fetch_or_phi("Noun", &unloaded.new_state);
+        assert_eq!(
+            nouns_pre, nouns_post,
+            "round-trip must restore the Noun cell"
+        );
+    }
+
+    /// Cascade behavior: load A which adds a Product noun + a fact
+    /// type "Product has SKU". After unloading A, the FT row is gone
+    /// AND its Role rows are gone too (cascade by FT id on the Role
+    /// cell's `factType` binding). We document the current cascade
+    /// scope so #557 ReloadReading can decide whether to extend it.
+    #[test]
+    fn unload_cascades_role_rows_for_removed_fact_types() {
+        let state = seed_state();
+        let body_a = "\
+Product(.SKU) is an entity type.
+Product has SKU.
+";
+        let a = load_reading(&state, "A", body_a, LoadReadingPolicy::AllowAll)
+            .expect("A loads");
+        let added_ft = a.report.added_fact_types.first().cloned();
+
+        let unloaded = unload_reading(&a.new_state, "A", UnloadPolicy::CascadeDelete)
+            .expect("unload A");
+
+        if let Some(ft) = &added_ft {
+            let ft_obj = ast::fetch_or_phi("FactType", &unloaded.new_state);
+            let ft_ids_after: Vec<String> = ft_obj
+                .as_seq()
+                .map(|s| {
+                    s.iter()
+                        .filter_map(|f| ast::binding(f, "id").map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(
+                !ft_ids_after.contains(ft),
+                "post-unload FactType must not include {}",
+                ft
+            );
+
+            let role_obj = ast::fetch_or_phi("Role", &unloaded.new_state);
+            let role_facttypes: Vec<String> = role_obj
+                .as_seq()
+                .map(|s| {
+                    s.iter()
+                        .filter_map(|f| ast::binding(f, "factType").map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            assert!(
+                !role_facttypes.contains(ft),
+                "post-unload Role must not reference {}",
+                ft
+            );
+        }
+    }
+
+    /// `remove_rows_by_binding` on an empty value list is a no-op.
+    #[test]
+    fn remove_rows_by_binding_empty_values_noop() {
+        let state = seed_state();
+        let after = remove_rows_by_binding(&state, "Noun", "name", &[]);
+        assert_eq!(state, after);
+    }
+
+    /// `remove_cell` on a missing name is a no-op.
+    #[test]
+    fn remove_cell_missing_noop() {
+        let state = seed_state();
+        let after = remove_cell(&state, "DoesNotExist");
+        assert_eq!(state, after);
+    }
+
+    /// `remove_cell` on an existing Map cell drops the entry.
+    #[test]
+    fn remove_cell_drops_map_entry() {
+        let state = seed_state();
+        let with_extra = ast::store("Extra", Object::seq(vec![]), &state);
+        let after = remove_cell(&with_extra, "Extra");
+        assert!(matches!(ast::fetch("Extra", &after), Object::Bottom));
     }
 }

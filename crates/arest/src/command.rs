@@ -114,6 +114,25 @@ pub enum Command {
         #[serde(default)]
         signature: Option<String>,
     },
+    /// is-chg inverse of `LoadReading` (#556 / DynRdg-2): drop a
+    /// previously-loaded reading from the cell graph. Looks up the
+    /// `_loaded_reading:{name}` manifest, cascade-deletes the listed
+    /// nouns / fact types / derivations, and removes the manifest
+    /// cell itself. See `crate::load_reading::unload_reading`.
+    ///
+    /// The optional `policy` field accepts "cascade-delete" (default,
+    /// also accepts "cascade_delete") and "migrate" (currently
+    /// stubbed — returns NotImplemented). Unknown values fall back
+    /// to the default.
+    UnloadReading {
+        name: String,
+        #[serde(default)]
+        policy: Option<String>,
+        #[serde(default)]
+        sender: Option<String>,
+        #[serde(default)]
+        signature: Option<String>,
+    },
 }
 
 // -- Result -----------------------------------------------------------
@@ -349,6 +368,9 @@ pub fn apply_command_defs(
         }
         Command::LoadReading { name, body, sender: _, signature: _ } => {
             load_reading_handler(d, name, body, state)
+        }
+        Command::UnloadReading { name, policy, sender: _, signature: _ } => {
+            unload_reading_handler(d, name, policy.as_deref(), state)
         }
         #[allow(unreachable_patterns)]
         _ => CommandResult {
@@ -1260,6 +1282,133 @@ fn load_reading_handler(
     }
 }
 
+/// SystemVerb::UnloadReading (#556 DynRdg-2) — runtime inverse of
+/// `LoadReading`. Drops a previously-loaded reading from the cell
+/// graph and either cascade-deletes its facts (default) or migrates
+/// them (stubbed; see `UnloadPolicy`).
+///
+/// Pure wrapper over `crate::load_reading::unload_reading`: encodes
+/// the outcome as a `CommandResult` so the existing dispatch loop
+/// can surface it through the same `__state_delta` carrier. On
+/// rejection, the result state is `phi()` so the writer-path
+/// classifier treats it as `NoCommit`. On success, the result state
+/// is the post-unload delta against the input snapshot.
+///
+/// Policy parsing: the wire-level `policy` field accepts the
+/// strings "cascade-delete" (default), "cascade_delete", and
+/// "migrate" — case-insensitive. Unknown values fall back to the
+/// default (cascade-delete) so older callers can ignore the field.
+/// The `Migrate` policy is stubbed; it returns
+/// `unload_reading.not_implemented` violation today.
+fn unload_reading_handler(
+    d: &ast::Object,
+    name: &str,
+    policy: Option<&str>,
+    state: &ast::Object,
+) -> CommandResult {
+    use crate::load_reading::{unload_reading, UnloadError, UnloadPolicy};
+
+    let parsed_policy = match policy.map(|s| s.to_ascii_lowercase()) {
+        Some(ref s) if s == "migrate" => UnloadPolicy::Migrate,
+        Some(ref s) if s == "cascade-delete" || s == "cascade_delete" => {
+            UnloadPolicy::CascadeDelete
+        }
+        _ => UnloadPolicy::default(),
+    };
+
+    match unload_reading(d, name, parsed_policy) {
+        Ok(outcome) => {
+            // Re-compile defs from the post-unload state so removed
+            // derivations / FTs propagate to the def-state. Mirrors
+            // `load_reading_handler`'s tail symmetric path.
+            let mut defs = crate::compile::compile_to_defs_state(&outcome.new_state);
+            defs.push(("compile".to_string(), ast::Func::Platform("compile".to_string())));
+            defs.push(("apply".to_string(), ast::Func::Platform("apply_command".to_string())));
+            defs.push(("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())));
+            defs.push(("audit".to_string(), ast::Func::Platform("audit".to_string())));
+            let new_d = ast::defs_to_state(&defs, &outcome.new_state);
+
+            let delta = ast::diff_cells(state, &new_d);
+
+            let mut data = hashbrown::HashMap::new();
+            data.insert("name".to_string(), name.to_string());
+            data.insert(
+                "removedNouns".to_string(),
+                outcome.report.removed_nouns.join(","),
+            );
+            data.insert(
+                "removedFactTypes".to_string(),
+                outcome.report.removed_fact_types.join(","),
+            );
+            data.insert(
+                "removedDerivations".to_string(),
+                outcome.report.removed_derivations.join(","),
+            );
+
+            let derived_count = outcome.report.removed_nouns.len()
+                + outcome.report.removed_fact_types.len()
+                + outcome.report.removed_derivations.len();
+
+            CommandResult {
+                entities: vec![EntityResult {
+                    id: format!("reading:{}", name),
+                    entity_type: "ReadingUnloaded".to_string(),
+                    data,
+                }],
+                status: None,
+                transitions: vec![],
+                navigation: vec![],
+                violations: vec![],
+                derived_count,
+                rejected: false,
+                state: delta,
+            }
+        }
+        Err(err) => {
+            let violations = match err {
+                UnloadError::Disallowed => vec![crate::types::Violation {
+                    constraint_id: "unload_reading.disallowed".to_string(),
+                    constraint_text: "runtime reading unload is disallowed by host policy".to_string(),
+                    detail: "the host did not enable runtime UnloadReading".to_string(),
+                    alethic: true,
+                }],
+                UnloadError::InvalidName(msg) => vec![crate::types::Violation {
+                    constraint_id: "unload_reading.invalid_name".to_string(),
+                    constraint_text: "reading name failed sanitization".to_string(),
+                    detail: msg,
+                    alethic: true,
+                }],
+                UnloadError::ManifestMissing(missing_name) => vec![crate::types::Violation {
+                    constraint_id: "unload_reading.manifest_missing".to_string(),
+                    constraint_text: "reading was not previously loaded under this name".to_string(),
+                    detail: format!(
+                        "no _loaded_reading:{} cell found; reload the body and unload again, \
+                         or migrate legacy state by running LoadReading first",
+                        missing_name
+                    ),
+                    alethic: true,
+                }],
+                UnloadError::NotImplemented => vec![crate::types::Violation {
+                    constraint_id: "unload_reading.not_implemented".to_string(),
+                    constraint_text: "requested UnloadPolicy is not implemented".to_string(),
+                    detail: "Migrate policy is reserved for #557 ReloadReading; use cascade-delete for now".to_string(),
+                    alethic: true,
+                }],
+            };
+            CommandResult {
+                entities: vec![],
+                status: None,
+                transitions: vec![],
+                navigation: vec![],
+                violations,
+                derived_count: 0,
+                rejected: true,
+                state: ast::Object::phi(),
+            }
+        }
+    }
+}
+
 // -- Helpers ----------------------------------------------------------
 
 /// HATEOAS as ρ-application (Theorem 4a)
@@ -2112,6 +2261,109 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         // load_reading::tests::re_load_same_body_is_idempotent test
         // which threads state forward.
         assert_eq!(second.entities[0].entity_type, "ReadingLoaded");
+    }
+
+    // ── #556 Command::UnloadReading ────────────────────────────────
+
+    /// Round trip: load a reading via the command, then unload it.
+    /// The unload reports the removed nouns and emits a
+    /// `ReadingUnloaded` entity envelope.
+    #[test]
+    fn unload_reading_round_trip_via_command() {
+        let (def_map, _state) = setup_order_defs();
+        let load_cmd = Command::LoadReading {
+            name: "catalog".to_string(),
+            body: "Product(.SKU) is an entity type.\n".to_string(),
+            sender: None,
+            signature: None,
+        };
+        let load_result = apply_command_defs(&def_map, &load_cmd, &def_map);
+        assert!(!load_result.rejected, "load must succeed");
+
+        // The load returned a delta against `def_map`; merge it back
+        // into the def-state so the manifest cell is visible to the
+        // unload.
+        let post_load_d = ast::merge_delta(&def_map, &load_result.state);
+
+        let unload_cmd = Command::UnloadReading {
+            name: "catalog".to_string(),
+            policy: None,
+            sender: None,
+            signature: None,
+        };
+        let unload_result = apply_command_defs(&post_load_d, &unload_cmd, &post_load_d);
+        assert!(!unload_result.rejected, "unload must succeed");
+        assert_eq!(unload_result.entities[0].entity_type, "ReadingUnloaded");
+        assert_eq!(unload_result.entities[0].data["name"], "catalog");
+        assert_eq!(unload_result.entities[0].data["removedNouns"], "Product");
+    }
+
+    /// Unload of an unknown name rejects with
+    /// `unload_reading.manifest_missing` and emits no state delta.
+    #[test]
+    fn unload_reading_unknown_name_rejects() {
+        let (def_map, state) = setup_order_defs();
+        let cmd = Command::UnloadReading {
+            name: "never-loaded".to_string(),
+            policy: None,
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &state);
+        assert!(result.rejected);
+        assert!(result
+            .violations
+            .iter()
+            .any(|v| v.constraint_id == "unload_reading.manifest_missing"));
+        assert_eq!(result.state, ast::Object::phi());
+    }
+
+    /// Empty name rejects with `unload_reading.invalid_name`.
+    #[test]
+    fn unload_reading_empty_name_rejects() {
+        let (def_map, state) = setup_order_defs();
+        let cmd = Command::UnloadReading {
+            name: "".to_string(),
+            policy: None,
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &state);
+        assert!(result.rejected);
+        assert!(result
+            .violations
+            .iter()
+            .any(|v| v.constraint_id == "unload_reading.invalid_name"));
+    }
+
+    /// Migrate policy is stubbed: rejects with
+    /// `unload_reading.not_implemented`.
+    #[test]
+    fn unload_reading_migrate_policy_not_implemented() {
+        let (def_map, _state) = setup_order_defs();
+        // Load first so the manifest is present (otherwise we'd hit
+        // ManifestMissing before reaching the policy gate).
+        let load_cmd = Command::LoadReading {
+            name: "catalog".to_string(),
+            body: "Product(.SKU) is an entity type.\n".to_string(),
+            sender: None,
+            signature: None,
+        };
+        let load_result = apply_command_defs(&def_map, &load_cmd, &def_map);
+        let post_load_d = ast::merge_delta(&def_map, &load_result.state);
+
+        let cmd = Command::UnloadReading {
+            name: "catalog".to_string(),
+            policy: Some("migrate".to_string()),
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&post_load_d, &cmd, &post_load_d);
+        assert!(result.rejected);
+        assert!(result
+            .violations
+            .iter()
+            .any(|v| v.constraint_id == "unload_reading.not_implemented"));
     }
 
     /// #35 regression: creating an Order with a customer field must NOT
