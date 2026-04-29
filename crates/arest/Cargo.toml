@@ -53,6 +53,15 @@ required-features = ["cluster"]
 name = "platform_zip"
 path = "tests/platform_zip.rs"
 
+# Render reading smoke (#593). Asserts `readings/ui/render.md` parses
+# standalone and composes with the other UI readings. Standalone
+# binary because `autotests = false` disables auto-discovery and
+# bundling into `tests/all.rs` would couple this slice's CI signal to
+# unrelated suites in the merged binary.
+[[test]]
+name = "render_reading"
+path = "tests/render_reading.rs"
+
 [features]
 # `core` is the always-on bundled-readings scope (Theorem 1-5
 # backbone): readings/core/{core,state,instances,outcomes,validation,
