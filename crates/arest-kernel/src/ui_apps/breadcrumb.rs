@@ -113,9 +113,12 @@ pub struct CrumbEntry {
 pub struct BreadcrumbState {
     /// Bounded ring of cells, oldest at front. Capacity is the
     /// constructor argument; pushes beyond that drop the oldest entry.
-    /// Mirrors `arest::ring::RingBuffer` semantics; we hand-roll here
-    /// because the `arest::ring` module is gated out under `no_std`
-    /// (see `arest/src/lib.rs` L107).
+    /// Logically a ring (oldest-out-on-overflow per
+    /// `arest::ring::RingBuffer`'s contract), but the browser-style
+    /// "drop the forward stack on `push` after `back`" semantic needs
+    /// random-access truncation past the cursor — `RingBuffer`'s API
+    /// is append-only, so a `VecDeque` carries the live history here
+    /// while honouring the same eviction shape on overflow.
     history: VecDeque<CurrentCell>,
     /// Maximum live entries before the oldest is evicted on push.
     capacity: usize,
