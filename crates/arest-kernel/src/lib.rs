@@ -249,6 +249,33 @@ pub fn arest_http_handler(req: &http::Request) -> http::Response {
         }
     }
 
+    // POST /arest/entities/{slug}/{id}/transition — fire a
+    // state-machine transition event (#617/#618). Sits *before* the
+    // generic `/arest/entities/{slug}` create handler because the
+    // create handler matches on the same prefix; without this guard
+    // a transition POST would be silently routed to the create path
+    // and rejected for malformed JSON. Mirror of the worker's
+    // `router.ts::POST /api/entities/:noun/:id/transition` (line 617).
+    if req.method == "POST"
+        && req.path.starts_with("/arest/entities/")
+        && (req.path.ends_with("/transition") || req.path.contains("/transition?"))
+    {
+        let result = system::with_state(|s| {
+            arest::hateoas::handle_arest_transition(s, &req.method, &req.path, &req.body)
+        });
+        if let Some(Some((new_state, body))) = result {
+            let _ = system::apply(new_state);
+            return http::Response::ok("application/json", body);
+        }
+        // No legal transition (or missing SM / unknown event) — 400
+        // with the worker's error envelope shape so the apis e2e
+        // suite's `expect(res.status).toBeGreaterThanOrEqual(400)`
+        // fallback assertion holds.
+        return http::Response::bad_request(
+            "{\"errors\":[{\"message\":\"transition rejected\"}]}",
+        );
+    }
+
     // POST /arest/entities/{slug} — direct-write fallback (#616).
     // Mirror of the worker's `router.ts::handleEntitiesPost`
     // create-side fallback. Engine path (#613) waits on #588's
