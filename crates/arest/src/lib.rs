@@ -70,7 +70,13 @@ pub mod row_shape;
 // `ast` (Object + Func + apply) and `freeze` (thaw from baked bytes).
 #[cfg(not(feature = "no_std"))]
 pub mod compile;
-#[cfg(not(feature = "no_std"))]
+// evaluate.rs is no_std-clean as of #588: hashbrown for HashSet/HashMap,
+// alloc for String/Vec/Box, `crate::time_shim::Instant` for trace timing,
+// `crate::diag!` for trace output. Both `std::env::var` call sites are
+// cfg-gated to host. Test-only references to `crate::compile` and
+// `crate::parse_forml2` live inside `#[cfg(test)] mod tests`, which
+// implies a host build with std. Lifting the per-mod gate so the kernel
+// can reach `forward_chain_*` / `synthesize` once stage-2 ports.
 pub mod evaluate;
 #[cfg(not(feature = "no_std"))]
 pub mod query;
