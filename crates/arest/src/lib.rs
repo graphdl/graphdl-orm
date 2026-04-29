@@ -107,7 +107,6 @@ pub mod conceptual_query;
 // host-only is_forbidden_url checks. stage1 + stage2 are getting
 // closer but still pull `crate::types` and `crate::evaluate` whose
 // no_std reachability hasn't been verified.
-#[cfg(not(feature = "no_std"))]
 pub mod parse_forml2;
 pub mod parse_forml2_stage1;
 #[cfg(not(feature = "no_std"))]
