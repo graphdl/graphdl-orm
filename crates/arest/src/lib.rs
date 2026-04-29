@@ -109,7 +109,6 @@ pub mod conceptual_query;
 // no_std reachability hasn't been verified.
 #[cfg(not(feature = "no_std"))]
 pub mod parse_forml2;
-#[cfg(not(feature = "no_std"))]
 pub mod parse_forml2_stage1;
 #[cfg(not(feature = "no_std"))]
 pub mod parse_forml2_stage2;
