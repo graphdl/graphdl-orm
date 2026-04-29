@@ -221,7 +221,10 @@ pub mod externals;
 // `fetch_or_phi` cell walks; the kernel can use it once an LLM
 // provider lands there.
 pub mod agent;
-#[cfg(not(feature = "no_std"))]
+// check.rs is no_std-clean — uses only `crate::ast`, `crate::parse_forml2`,
+// `crate::naming`, and `alloc::*`. All reachable from no_std as of #588.
+// Lifting the per-mod gate so `load_reading_core::load_reading` can lift
+// its function-body gate (closes the kernel-side path for #589).
 pub mod check;
 // Storage-1: pluggable StorageBackend trait + in-mem/local-fs impls.
 // std-only because backends need heap + owned types and the fs impl
