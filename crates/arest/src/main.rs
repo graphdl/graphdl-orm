@@ -425,6 +425,30 @@ fn main() {
                 std::process::exit(2);
             }
         }
+        if verb == "watch" {
+            // `arest watch <dir>` (#561 followup / DynRdg-T2) — poll
+            // a directory for `.md` changes and re-apply each via the
+            // same `LoadReading` pipeline as `reload`. Same `--db` +
+            // `local`-feature shape as `reload`; the call returns
+            // only on initial-scan failure (the polling loop runs
+            // until SIGTERM).
+            let (db_path, rest_args) = take_db_flag(&args[1..]);
+            #[cfg(feature = "local")]
+            {
+                let mut stdout = std::io::stdout();
+                let mut stderr = std::io::stderr();
+                let code = cli::watch::dispatch(
+                    &rest_args, &db_path, &mut stdout, &mut stderr);
+                std::process::exit(code);
+            }
+            #[cfg(not(feature = "local"))]
+            {
+                let _ = (rest_args, db_path);
+                eprintln!("`arest watch` requires the `local` feature.");
+                eprintln!("  cargo run --bin arest-cli --features local -- watch <dir>");
+                std::process::exit(2);
+            }
+        }
         if verb == "run" {
             // `arest run <app-name>` (#543) — resolve a Wine App name to
             // its (slug, prefix Directory) pair via wine_app_by_name.

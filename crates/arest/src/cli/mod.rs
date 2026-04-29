@@ -84,7 +84,14 @@ pub mod entropy_host;
 // `reload` (#561) — `arest reload <file.md>` runtime reading load.
 // Routes through `crate::load_reading_core::load_reading` with
 // `LoadReadingPolicy::AllowAll` and persists the merged state to the
-// configured `--db`. Companion `arest watch <dir>` lands in a follow-up
-// commit and shares the same `dispatch_with_state` core.
+// configured `--db`. Companion `arest watch <dir>` shares the same
+// `dispatch_with_state` core.
 #[cfg(not(feature = "no_std"))]
 pub mod reload;
+// `watch` (#561 followup / DynRdg-T2) — `arest watch <dir>` polls a
+// directory for `.md` changes and re-applies each modified file via
+// the same `LoadReading` pipeline as `arest reload`. Pure scan core
+// (`scan_once_with_state`) is testable without DB; the DB-backed
+// `dispatch` enters an infinite poll loop with per-reload persist.
+#[cfg(not(feature = "no_std"))]
+pub mod watch;
