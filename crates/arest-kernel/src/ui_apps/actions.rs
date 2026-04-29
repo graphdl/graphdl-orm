@@ -1299,20 +1299,13 @@ pub fn apply_remove_fact(args: &[(String, String)], state: &Object) -> Result<Ob
 //
 // `apply_load_reading` / `apply_unload_reading` / `apply_reload_reading`
 // are the kernel-side bridges to `arest::load_reading_core::*`. The
-// pure-FORML core is gated `cfg(not(feature = "no_std"))` because it
-// reaches `parse_forml2` + `check::check_readings_func`, both of which
-// pull `serde` + `regex` + `std::env::var` (#586 documents the gate).
-//
-// Under host tests (`cargo t` against this crate, where arest builds
-// with `std-deps`), the helpers route to the real `load_reading` /
-// `unload_reading` / `reload_reading` functions and return
-// `Ok((new_state, summary))`. Under the kernel build (`--target
-// x86_64-unknown-uefi --features server`) the helpers return
-// `Err("load_reading not available in no_std build")` so the action
-// surface still appears in the REPL but a click formats a clear
-// "not yet wired" line. Once #586 lifts the gate, the kernel-side
-// arms collapse to the same path the host-side test suite already
-// exercises.
+// pure-FORML core became no_std-reachable across #588 (#588 close —
+// parse_forml2_stage2 no_std) and #589 (check.rs gate lift +
+// load_reading_core function-body gate drop), so the kernel build
+// dispatches through the same code path the host-side tests do.
+// Pre-#589 these helpers had `target_os = "uefi"` stubs returning
+// "not yet wired" because the verb was std-only — those stubs are
+// gone now.
 
 /// Compute the post-state for `LoadReading <name> <body>` plus a
 /// short success summary for the REPL scrollback.
@@ -1324,7 +1317,6 @@ pub fn apply_remove_fact(args: &[(String, String)], state: &Object) -> Result<Ob
 ///
 /// Returns `Err` with a short message when args are missing or the
 /// load rejected; the variant carries the summary line on success.
-#[cfg(not(target_os = "uefi"))]
 pub fn apply_load_reading(
     args: &[(String, String)],
     state: &Object,
@@ -1353,29 +1345,8 @@ pub fn apply_load_reading(
     }
 }
 
-/// Stub for the kernel build — `arest::load_reading_core::load_reading`
-/// is gated `cfg(not(feature = "no_std"))` so we cannot call it from
-/// the UEFI target until #586 lifts the gate. Surfacing the action
-/// row + a clear error line is still useful for the REPL UI bring-up.
-#[cfg(target_os = "uefi")]
-pub fn apply_load_reading(
-    args: &[(String, String)],
-    _state: &Object,
-) -> Result<(Object, String), String> {
-    let name = arg(args, "name");
-    let body = arg(args, "body");
-    if name.is_empty() {
-        return Err("missing name".to_string());
-    }
-    if body.is_empty() {
-        return Err("missing body".to_string());
-    }
-    Err("load_reading not available in no_std build (waiting on #586)".to_string())
-}
-
 /// Compute the post-state for `UnloadReading <name>` plus a short
 /// success summary for the REPL scrollback.
-#[cfg(not(target_os = "uefi"))]
 pub fn apply_unload_reading(
     args: &[(String, String)],
     state: &Object,
@@ -1400,22 +1371,8 @@ pub fn apply_unload_reading(
     }
 }
 
-/// Stub for the kernel build — see `apply_load_reading` rationale.
-#[cfg(target_os = "uefi")]
-pub fn apply_unload_reading(
-    args: &[(String, String)],
-    _state: &Object,
-) -> Result<(Object, String), String> {
-    let name = arg(args, "name");
-    if name.is_empty() {
-        return Err("missing name".to_string());
-    }
-    Err("unload_reading not available in no_std build (waiting on #586)".to_string())
-}
-
 /// Compute the post-state for `ReloadReading <name> <body>` plus a
 /// short success summary covering both the unload + load deltas.
-#[cfg(not(target_os = "uefi"))]
 pub fn apply_reload_reading(
     args: &[(String, String)],
     state: &Object,
@@ -1447,27 +1404,7 @@ pub fn apply_reload_reading(
     }
 }
 
-/// Stub for the kernel build — see `apply_load_reading` rationale.
-#[cfg(target_os = "uefi")]
-pub fn apply_reload_reading(
-    args: &[(String, String)],
-    _state: &Object,
-) -> Result<(Object, String), String> {
-    let name = arg(args, "name");
-    let body = arg(args, "body");
-    if name.is_empty() {
-        return Err("missing name".to_string());
-    }
-    if body.is_empty() {
-        return Err("missing body".to_string());
-    }
-    Err("reload_reading not available in no_std build (waiting on #586)".to_string())
-}
-
 /// Format a `LoadError` into a short scrollback-friendly string.
-/// The `DeonticViolation` variant is gated under std (the diagnostic
-/// shape pulls non-no_std deps), so we cfg-match on that arm.
-#[cfg(not(target_os = "uefi"))]
 fn format_load_error(err: &arest::load_reading_core::LoadError) -> String {
     use arest::load_reading_core::LoadError;
     match err {
@@ -1479,10 +1416,7 @@ fn format_load_error(err: &arest::load_reading_core::LoadError) -> String {
             format!("deontic violation: {} diagnostic(s)", diags.len())
         }
         // #559 / DynRdg-5 — alethic-class violations from the
-        // load-time validation gate. Added defensively here because
-        // adding an enum variant in arest is a non-additive change
-        // for kernel consumers; without this arm the kernel crate
-        // refuses to compile.
+        // load-time validation gate.
         LoadError::AlethicViolation(diags) => {
             format!("alethic violation: {} diagnostic(s)", diags.len())
         }
@@ -1490,7 +1424,6 @@ fn format_load_error(err: &arest::load_reading_core::LoadError) -> String {
 }
 
 /// Format an `UnloadError` into a short scrollback-friendly string.
-#[cfg(not(target_os = "uefi"))]
 fn format_unload_error(err: &arest::load_reading_core::UnloadError) -> String {
     use arest::load_reading_core::UnloadError;
     match err {

@@ -78,26 +78,17 @@ use core::convert::TryFrom;
 
 use arest::ast::Object;
 
-// The runtime LoadReading verb (`arest::load_reading::load_reading`)
-// is gated behind `not(feature = "no_std")` in the arest crate
-// because its implementation reaches `parse_forml2` /
-// `check::check_readings_func`, both of which currently pull
-// `serde` + std types. The kernel uses `arest`'s `no_std` feature,
-// so the verb itself is not reachable here.
+// The runtime LoadReading verb
+// (`arest::load_reading_core::load_reading`) became no_std-reachable
+// across #588 (`097577ff` — parse_forml2_stage2 no_std) and #589
+// (`56c201df` + the engine-side gate-drop commit on the same issue
+// — check.rs gate lift + load_reading_core function-body gates
+// dropped). Replay calls the verb directly now; the closure-injection
+// scaffold is gone (#589 — kernel-side adoption).
 //
-// Persistence at the byte-stream layer doesn't need the verb —
-// `persist_record` and `decode_all` are pure byte arithmetic and
-// run anywhere. Replay, however, needs to drive the verb against
-// the live state. We solve this with a closure-based replay API
-// (`replay_with`): the caller (the eventual #564 REPL surface or a
-// std-side test) supplies a `Fn(name, body) -> Result<Object, ()>`
-// closure that knows how to apply a reading; this module sequences
-// the closure across every persisted record.
-//
-// On the kernel side today, the closure body is a no-op (the verb
-// isn't available). #564 lands the actual hook once the REPL surface
-// brings parse + check into the no_std build (or surfaces them via a
-// platform-callback shim). The persistence ring is ready and waiting.
+// Persistence at the byte-stream layer (`persist_record`,
+// `decode_all`, `coalesce_live`, `walk_to_end`) is still pure byte
+// arithmetic — those helpers run anywhere and are unchanged.
 
 // ── Disk layout constants ──────────────────────────────────────────
 
@@ -558,42 +549,52 @@ pub fn persist_loaded_reading(
     persist_record(backend, name, body, version, TOMBSTONE_LIVE)
 }
 
-/// Replay every live record from `backend` by invoking `apply` on
-/// each `(name, body, version)` triple. The closure should return
-/// the new state on success, or the unchanged state (or `None`,
-/// then handled by the caller) on validation failure. Either way,
-/// replay continues with the next record so a single bad record
+/// Replay every live record from `backend` by invoking
+/// `arest::load_reading_core::load_reading` against `state` for each
+/// `(name, body, _version)` triple. On success, `state` is updated
+/// to the post-load state; on any `LoadError`, the record is skipped
+/// and replay continues with the next one so a single bad record
 /// can't poison the boot.
 ///
-/// Why a closure instead of calling `arest::load_reading::load_reading`
-/// directly: the verb is gated behind `not(feature = "no_std")` and
-/// the kernel build uses the `no_std` feature. The closure injection
-/// lets the std-side test harness (and the eventual #564 REPL hook,
-/// once parse + check land in no_std) wire up the actual verb call,
-/// while the kernel today can pass a no-op closure to walk the ring
-/// for diagnostics without needing the parser.
+/// (#589) The earlier closure-injection signature exposed an
+/// `F: FnMut(&Object, &str, &str, u32) -> Result<Object, ()>`
+/// parameter because `load_reading` was gated behind
+/// `not(feature = "no_std")` and the kernel build couldn't reach
+/// it. With the gate dropped (parse + check both no_std-reachable
+/// across #588 + #589), the closure scaffold is no longer needed —
+/// callers stop wiring `apply` themselves and the function
+/// dispatches directly through the verb.
+///
+/// `version` from the persisted record is intentionally not threaded
+/// into `load_reading` — the verb allocates its own version stamp
+/// (`next_version()`) per the #558 monotonicity contract. Callers
+/// that need to seed the counter from the persisted floor should do
+/// that via `arest::load_reading_core::seed_version_counter` ahead
+/// of replay.
+///
+/// Policy is `LoadReadingPolicy::AllowAll` — replay is host-trusted
+/// (the records came from a previous successful load on this same
+/// kernel, so `Deny` would be incorrect).
 ///
 /// Returns the count of records that successfully merged (i.e. the
-/// closure returned `Ok`).
-pub fn replay_loaded_readings<F>(
+/// verb returned `Ok`).
+pub fn replay_loaded_readings(
     backend: &dyn RingBackend,
     state: &mut Object,
-    mut apply: F,
-) -> usize
-where
-    F: FnMut(&Object, &str, &str, u32) -> Result<Object, ()>,
-{
+) -> usize {
+    use arest::load_reading_core::{load_reading, LoadReadingPolicy};
+
     let buf = backend.read_all();
     let records = decode_all(&buf);
     let live = coalesce_live(&records);
     let mut applied = 0usize;
     for rec in live {
-        match apply(state, &rec.name, &rec.body, rec.version) {
-            Ok(new_state) => {
-                *state = new_state;
+        match load_reading(state, &rec.name, &rec.body, LoadReadingPolicy::AllowAll) {
+            Ok(outcome) => {
+                *state = outcome.new_state;
                 applied += 1;
             }
-            Err(()) => {
+            Err(_) => {
                 // Best-effort: skip this record and continue. A
                 // future revision can route the error to the
                 // kernel's diagnostic buffer; for the MVP we
@@ -618,28 +619,40 @@ pub fn live_records(backend: &dyn RingBackend) -> Vec<PersistedReading> {
 
 /// Production-side replay entry point used by the UEFI boot sequence.
 /// Opens the virtio-blk-backed ring, walks every persisted record,
-/// and reports how many were found. The actual reading-application
-/// step is deferred until the runtime LoadReading verb is reachable
-/// from the kernel build (currently gated behind
-/// `not(feature = "no_std")`; lands with #564 once parse + check are
-/// available under no_std).
+/// and replays each one through
+/// `arest::load_reading_core::load_reading` against the live
+/// `crate::system` state. (#589 — replay actually applies records
+/// now; pre-#589 behaviour was "report count only" because the verb
+/// was gated on std.)
 ///
-/// Returns `Ok(record_count)` on success, `Err(reason)` when the
-/// kernel can't even open the ring (no device, etc.). Today's
-/// behaviour is "log + continue with bake-time only," matching the
-/// failure-mode contract in the task brief: "corrupt region → log +
-/// continue with bake-time only. Replay validation fail → log +
-/// skip + continue."
+/// Returns `Ok(applied_count)` on success — the number of records
+/// the verb merged in, which may be lower than the live record
+/// count when individual bodies fail the load-time gate (#559)
+/// against the merged state. Returns `Err(reason)` when the kernel
+/// can't even open the ring (no device, etc.).
 ///
-/// The persisted records remain on disk across boots, so once the
-/// verb hook lands the same boot sequence will pick them up without
-/// any disk-format change.
+/// Failure-mode contract (unchanged from #560): "corrupt region →
+/// log + continue with bake-time only. Replay validation fail →
+/// log + skip + continue."
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 pub fn replay_from_disk() -> Result<usize, &'static str> {
     let backend = VirtioBlkRing::open()
         .ok_or("loaded-readings ring: no virtio-blk device or reservation refused")?;
-    let records = live_records(&backend);
-    Ok(records.len())
+
+    // Snapshot the live state, replay against the snapshot, commit
+    // the merged state in one `system::apply`. We can't hold the
+    // SYSTEM read lock across `replay_loaded_readings` because the
+    // verb itself walks the state (and the system module's apply
+    // path takes the write lock); cloning the snapshot via
+    // `with_state` is the clean separation.
+    let mut state = crate::system::with_state(|s| s.clone())
+        .ok_or("system::init() not called before replay_from_disk")?;
+    let applied = replay_loaded_readings(&backend, &mut state);
+    if applied > 0 {
+        crate::system::apply(state)
+            .map_err(|_| "system::apply failed during replay commit")?;
+    }
+    Ok(applied)
 }
 
 // ── CRC-32/IEEE ────────────────────────────────────────────────────
@@ -787,12 +800,13 @@ mod tests {
         assert!(recs.is_empty(), "oversize name_len terminates walk");
     }
 
-    /// Replay against the seed state with a synthetic apply closure
-    /// that simulates `load_reading` by appending one Noun per record.
-    /// This exercises the closure-injection path end-to-end without
-    /// needing the std-only verb.
+    /// Replay against the seed state via the direct call to
+    /// `arest::load_reading_core::load_reading`. (#589 — closure
+    /// scaffold dropped; verb is no_std-reachable now.) Each
+    /// persisted single-line entity declaration parses + merges
+    /// through the actual verb pipeline.
     #[test]
-    fn replay_against_seed_state_via_closure() {
+    fn replay_against_seed_state_via_load_reading() {
         let mut backend = InMemoryRing::default();
         persist_loaded_reading(
             &mut backend,
@@ -808,25 +822,7 @@ mod tests {
         );
 
         let mut state = seed_state();
-        // The closure derives the noun name from the body text — same
-        // shape `parse_forml2::parse_to_state_from` would produce
-        // for these single-line entity declarations.
-        let applied = replay_loaded_readings(&backend, &mut state, |s, _name, body, _v| {
-            let noun_name = body
-                .split_whitespace()
-                .next()
-                .and_then(|tok| tok.split('(').next())
-                .unwrap_or("");
-            if noun_name.is_empty() {
-                return Err(());
-            }
-            let new_noun = ast::fact_from_pairs(&[
-                ("name", noun_name),
-                ("objectType", "entity"),
-            ]);
-            let updated = ast::cell_push("Noun", new_noun, s);
-            Ok(updated)
-        });
+        let applied = replay_loaded_readings(&backend, &mut state);
         assert_eq!(applied, 2);
 
         // The merged state has Order (from seed) + Product + TaxRate.
@@ -840,19 +836,46 @@ mod tests {
         assert!(names.contains(&"TaxRate"), "TaxRate loaded");
     }
 
-    /// A closure that always errors should yield zero applied records,
-    /// but should NOT panic — the replay walks the entire record
-    /// stream and skips failures.
+    /// Records carrying bodies that fail the load-time gate
+    /// (`LoadError`) are skipped — replay walks the entire record
+    /// stream and surfaces only the successful loads in `applied`.
+    /// (#589) Replaces the old closure-error test; the closure is
+    /// gone, so we use a body the verb actually rejects (a
+    /// reserved-keyword noun declaration → `LoadError::ParseError`).
     #[test]
-    fn replay_with_failing_closure_skips_all() {
+    fn replay_skips_load_failures() {
         let mut backend = InMemoryRing::default();
-        persist_loaded_reading(&mut backend, "a", "Alpha(.Name) is an entity type.\n", 1);
-        persist_loaded_reading(&mut backend, "b", "Beta(.Name) is an entity type.\n", 1);
+        // First record parses fine — should land.
+        persist_loaded_reading(
+            &mut backend,
+            "good",
+            "Alpha(.Name) is an entity type.\n",
+            1,
+        );
+        // Second record uses `each` as a noun declaration — #309
+        // reserved-keyword check rejects with `LoadError::ParseError`.
+        persist_loaded_reading(
+            &mut backend,
+            "bad",
+            "each(.X) is an entity type.\n",
+            1,
+        );
 
         let mut state = seed_state();
-        let applied = replay_loaded_readings(&backend, &mut state, |_s, _n, _b, _v| Err(()));
-        assert_eq!(applied, 0, "closure-error path returns zero applied");
-        assert_eq!(state, seed_state(), "state unchanged on closure error");
+        let applied = replay_loaded_readings(&backend, &mut state);
+        assert_eq!(
+            applied, 1,
+            "only the good record applies; bad one is skipped"
+        );
+
+        // Alpha noun landed; the rejected body left no trace.
+        let nouns = ast::fetch_or_phi("Noun", &state);
+        let names: Vec<&str> = nouns
+            .as_seq()
+            .map(|s| s.iter().filter_map(|f| ast::binding(f, "name")).collect())
+            .unwrap_or_default();
+        assert!(names.contains(&"Alpha"), "Alpha loaded from good record");
+        assert!(!names.contains(&"each"), "rejected body did not land");
     }
 
     /// `live_records` returns the coalesced record set without any

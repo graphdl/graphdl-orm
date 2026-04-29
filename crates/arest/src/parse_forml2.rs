@@ -592,7 +592,12 @@ pub fn fact_types_from_state(state: &crate::ast::Object) -> HashMap<String, Fact
 /// reference nouns declared by `d` without redeclaring them. Callers
 /// typically `merge_states(d, &result)` to carry `d`'s non-noun cells
 /// forward.
-#[cfg(feature = "std-deps")]
+///
+/// No longer cfg-gated on `std-deps` — stage12's
+/// `parse_to_state_via_stage12_with_context` is no_std-clean as of
+/// #588 (commit `097577ff`), so this thin shim is reachable from the
+/// kernel target too. (#589 — engine-side adoption of
+/// `load_reading_core::load_reading` under no_std.)
 pub fn parse_to_state_from(input: &str, d: &crate::ast::Object) -> Result<crate::ast::Object, String> {
     crate::parse_forml2_stage2::parse_to_state_via_stage12_with_context(input, d)
 }
@@ -600,7 +605,8 @@ pub fn parse_to_state_from(input: &str, d: &crate::ast::Object) -> Result<crate:
 /// Alias for `parse_to_state_from` kept for API compatibility. Legacy
 /// took only nouns; stage12's context path accepts the full state and
 /// extracts what it needs.
-#[cfg(feature = "std-deps")]
+///
+/// Same gate-lift rationale as `parse_to_state_from` (#589).
 pub fn parse_to_state_with_nouns(input: &str, existing: &crate::ast::Object) -> Result<crate::ast::Object, String> {
     crate::parse_forml2_stage2::parse_to_state_via_stage12_with_context(input, existing)
 }
