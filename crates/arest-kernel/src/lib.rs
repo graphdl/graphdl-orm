@@ -192,10 +192,18 @@ pub mod usb_uart;
 
 /// HTTP handler — three-stage routing:
 ///
-///   1. `assets::lookup` — baked ui.do bundle. Returns `None` for the
-///      `/api/*` and `/arest/*` namespaces so dynamic paths reach the
-///      dispatch tier instead of being rewritten to `index.html` by
-///      the SPA fallback (#610).
+///   1. `assets::lookup_from_state` — ui.do bundle served out of the
+///      live SYSTEM File cell graph (#580). Returns `None` for the
+///      `/api/*` and `/arest/*` namespaces so dynamic paths reach
+///      the dispatch tier instead of being rewritten to `index.html`
+///      by the SPA fallback (#610). When the `ui-bundle` feature is
+///      ON, `system::init` seeds the cell graph from a build-time
+///      `include_bytes!` table so this lookup hits; when OFF (the
+///      default + the `server` profile), the cell graph is empty and
+///      every asset path falls through to the dispatch tier. The
+///      handoff for #581: replace the boot-time seed with a runtime
+///      load (HTTP fetch / freeze blob) without touching the wire
+///      handler at all.
 ///   2. `arest::hateoas::handle_arest_read` — engine-less HATEOAS read
 ///      fallback for `GET /arest/{slug}` and `GET /arest/{slug}/{id}`
 ///      (#609). Walks the live SYSTEM state via `system::with_state`
@@ -209,11 +217,20 @@ pub mod usb_uart;
 /// Pub so the per-arch entry harnesses (`entry_uefi*::kernel_run_*`)
 /// can register it via `net::register_http(80, arest_http_handler)`.
 pub fn arest_http_handler(req: &http::Request) -> http::Response {
-    if let Some(asset) = assets::lookup(&req.path) {
+    // #580: read the asset out of the live cell graph rather than the
+    // build-time `UI_ASSETS` table. The closure runs while the SYSTEM
+    // read lock is held, so we capture the materialised `Asset` and
+    // drop the guard before building the response. When `init()` has
+    // not yet been called, `with_state` returns `None` and we skip the
+    // asset tier — same external behaviour as the pre-#580 empty-table
+    // build.
+    if let Some(Some(asset)) =
+        system::with_state(|state| assets::lookup_from_state(state, &req.path))
+    {
         return http::Response::ok_cached(
             asset.content_type,
             asset.cache_control,
-            asset.body.to_vec(),
+            asset.body,
         );
     }
 
