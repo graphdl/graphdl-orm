@@ -56,8 +56,11 @@ use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 pub mod ast;
 pub mod fol;
-// types.rs uses serde Serialize/Deserialize — excluded from no_std build
-#[cfg(not(feature = "no_std"))]
+// types.rs serde derives + per-field `#[serde(...)]` attrs are gated on
+// `feature = "std-deps"` (#588), so the type definitions themselves are
+// no_std-clean. Lifting the per-mod no_std gate so the kernel can refer
+// to (e.g.) `DerivationRuleDef` via the public type name once stage-2
+// ports.
 pub mod types;
 pub mod freeze;
 pub mod row_shape;
