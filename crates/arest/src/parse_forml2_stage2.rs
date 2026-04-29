@@ -2572,10 +2572,15 @@ fn parse_to_state_via_stage12_impl(
     text: &str,
     extra_nouns: &[String],
 ) -> Result<Object, String> {
+    // Trace gate — std-host reads `AREST_STAGE12_TRACE`; no_std builds
+    // compile out the trace branches entirely.
+    #[cfg(not(feature = "no_std"))]
     let trace = std::env::var("AREST_STAGE12_TRACE").is_ok();
+    #[cfg(feature = "no_std")]
+    let trace = false;
     let t0 = Instant::now();
     let grammar_state = cached_grammar_state()?;
-    if trace { eprintln!("[s12] grammar cache: {:?}", t0.elapsed()); }
+    if trace { crate::diag!("[s12] grammar cache: {:?}", t0.elapsed()); }
 
     // #309 — enforce Theorem 1's no-reserved-substring rule. Scan
     // unquoted noun declarations in the source and reject any that
@@ -2603,7 +2608,7 @@ fn parse_to_state_via_stage12_impl(
     let noun_buckets = crate::parse_forml2_stage1::NounBuckets::from_sorted(&sorted_nouns);
 
     let lines = crate::parse_forml2::join_derivation_continuations_cow(text);
-    if trace { eprintln!("[s12] preproc (reject+nouns+join): {:?}", t_pre.elapsed()); }
+    if trace { crate::diag!("[s12] preproc (reject+nouns+join): {:?}", t_pre.elapsed()); }
     // Accumulate per-statement cells into a single HashMap, then lift
     // to Object::Map once at the end. Previously we did
     // `stmt_state = merge_states(&stmt_state, ...)` per line, which is
@@ -2688,7 +2693,7 @@ fn parse_to_state_via_stage12_impl(
             .collect();
         Object::Map(map)
     };
-    if trace { eprintln!("[s12] stage1 tokenize: {:?} ({} lines)",
+    if trace { crate::diag!("[s12] stage1 tokenize: {:?} ({} lines)",
         t_tok.elapsed(), lines.len()); }
 
     // #301 — possibility-override synthetic FactType registrations.
@@ -2711,7 +2716,7 @@ fn parse_to_state_via_stage12_impl(
 
     let t_cls = Instant::now();
     let classified = classify_statements(&stmt_state, grammar_state);
-    if trace { eprintln!("[s12] classify: {:?}", t_cls.elapsed()); }
+    if trace { crate::diag!("[s12] classify: {:?}", t_cls.elapsed()); }
 
     let t_tr = Instant::now();
     // Install a thread-local statement index. `classifications_for`
@@ -2726,7 +2731,7 @@ fn parse_to_state_via_stage12_impl(
     macro_rules! tt { ($name:expr, $e:expr) => {{
         let t = Instant::now();
         let v = $e;
-        if trace { eprintln!("    [tr] {}: {:?}", $name, t.elapsed()); }
+        if trace { crate::diag!("    [tr] {}: {:?}", $name, t.elapsed()); }
         v
     }}; }
 
@@ -2784,8 +2789,8 @@ fn parse_to_state_via_stage12_impl(
         translate_instance_facts_with_ft_ids(&classified, &declared_ft_ids));
     instance_fact_facts.extend(tt!("deriv_mode", translate_derivation_mode_facts(&classified)));
     let enum_values_facts = tt!("enum_values", translate_enum_values(&classified));
-    if trace { eprintln!("[s12] translators: {:?}", t_tr.elapsed()); }
-    if trace { eprintln!("[s12] TOTAL: {:?}", t0.elapsed()); }
+    if trace { crate::diag!("[s12] translators: {:?}", t_tr.elapsed()); }
+    if trace { crate::diag!("[s12] TOTAL: {:?}", t0.elapsed()); }
 
     // Compound reference-scheme decomposition: mirrors the legacy
     // parse_forml2.rs path. For each noun declared with `(.A, .B, ...)`
