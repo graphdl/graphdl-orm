@@ -221,7 +221,38 @@ fn main() {
     // outside the Slint pipeline) — they are unused by the embedded-
     // glyph path because `register_bitmap_font` consumes pre-
     // rasterised data, not TrueType.
+    // #627 Profile-3: `slint-build` is now an optional build-dep
+    // gated behind `feature = "slint"`. When the feature is OFF
+    // (the headless `--no-default-features --features server`
+    // profile), `slint-build`'s sources aren't resolved, so
+    // calling `slint_build::compile_with_config(...)` here would
+    // fail at the use site of the now-absent crate. Wrap the
+    // whole compile pass under `CARGO_FEATURE_SLINT` — same gate
+    // shape as CARGO_FEATURE_LINUXKPI / CARGO_FEATURE_UI_BUNDLE
+    // already use in this file. The build.rs source itself stays
+    // unconditional (we don't `extern crate slint_build` at the
+    // top — the proc-macro-style call resolves through the
+    // optional dep, which is only present when the gate emits
+    // CARGO_FEATURE_SLINT).
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SLINT");
     let ui_dir = manifest_dir.join("ui");
+    // Cargo passes feature flags to build.rs at compile-time as
+    // `--cfg feature="..."` (documented in the Cargo book ch.3.9
+    // — "Build Scripts > Inputs to the build script"). That lets
+    // us cfg-out the `slint_build::*` use sites here so the
+    // build.rs source itself compiles cleanly when the optional
+    // `slint-build` dep is absent (the headless `--no-default-
+    // features --features server` profile). The runtime
+    // `CARGO_FEATURE_SLINT` env var is also rerun-tracked above
+    // so toggling the feature re-runs the script.
+    #[cfg(not(feature = "slint"))]
+    {
+        let _ = ui_dir.is_dir(); // silence unused-binding warning
+        println!(
+            "cargo:warning=slint feature off: skipping slint_build::compile (#627 Profile-3)",
+        );
+    }
+    #[cfg(feature = "slint")]
     if ui_dir.is_dir() {
         // Compile entry: `ui/apps/UnifiedRepl.slint` (#510, EPIC #496).
         //

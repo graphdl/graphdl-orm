@@ -77,6 +77,12 @@ mod serial;
 // drive a render loop against the captured GOP framebuffer. Dead
 // code until #431 wires the entry / main-loop call sites — see
 // the module docstring for the integration shape.
+//
+// #627 Profile-3: gated on `feature = "slint"`. The body imports
+// `slint::platform::*` types so the dep needs to be in scope; the
+// headless `--no-default-features --features server` profile
+// elides this module entirely.
+#[cfg(feature = "slint")]
 pub mod slint_backend;
 // Slint input adapter (#428): drains the post-decode keyboard ring
 // (`keyboard::read_keystroke`, populated by the IRQ 1 handler) and
@@ -85,6 +91,9 @@ pub mod slint_backend;
 // pass; intended to be called once per frame from the eventual main
 // loop (#431). Dead code today — the public surface carries
 // `#[allow(dead_code)]` until the main-loop wiring lands.
+//
+// #627 Profile-3: same gate as `slint_backend` above.
+#[cfg(feature = "slint")]
 pub mod slint_input;
 pub mod time;
 
@@ -97,6 +106,7 @@ pub use serial::{_print, switch_to_post_ebs_serial};
 // re-exports have no callers — silenced until #431 lands the entry
 // wiring; mirrors the `#[allow(unused_imports)]` the aarch64 arm
 // carries on its serial re-export for the same reason.
+#[cfg(feature = "slint")]
 #[allow(unused_imports)]
 pub use slint_backend::{FramebufferBackend, FramebufferPixelOrder, UefiSlintPlatform};
 
