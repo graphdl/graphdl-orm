@@ -77,10 +77,16 @@ fn derive_one_round_with_keys(
     d: &ast::Object,
     existing_keys: &HashSet<FactKey>,
 ) -> Vec<DerivedFact> {
+    // `AREST_STAGE12_TRACE` is a host-side perf knob; under no_std there
+    // is no `std::env` to query and no stderr to print to, so the gate
+    // becomes a const-false and the optimizer drops the trace branches.
+    #[cfg(not(feature = "no_std"))]
     let trace = std::env::var("AREST_STAGE12_TRACE").is_ok();
-    let t_dk = std::time::Instant::now();
+    #[cfg(feature = "no_std")]
+    let trace = false;
+    let t_dk = crate::time_shim::Instant::now();
     let derived_keys: HashSet<FactKey> = all_derived.iter().map(fact_key).collect();
-    if trace { eprintln!("    [rnd] derived_keys: {:?}", t_dk.elapsed()); }
+    if trace { crate::diag!("    [rnd] derived_keys: {:?}", t_dk.elapsed()); }
     // `encode_state` is a ~1-2ms pure-clone pass on core.md-scale
     // inputs. Skip it when every active Func is a `Native` — the
     // specialized grammar classifiers accept `&Object` directly
@@ -89,7 +95,7 @@ fn derive_one_round_with_keys(
     // (interpreted FFP) still require the encoded pop shape.
     let all_native = derivation_defs.iter()
         .all(|(_, f)| matches!(f, ast::Func::Native(_)));
-    let t_en = std::time::Instant::now();
+    let t_en = crate::time_shim::Instant::now();
     let pop_obj;
     let apply_input: &ast::Object = if all_native {
         current_state
@@ -97,9 +103,9 @@ fn derive_one_round_with_keys(
         pop_obj = ast::encode_state(current_state);
         &pop_obj
     };
-    if trace { eprintln!("    [rnd] encode_state: {:?} (skipped={})",
+    if trace { crate::diag!("    [rnd] encode_state: {:?} (skipped={})",
         t_en.elapsed(), all_native); }
-    let t_ap = std::time::Instant::now();
+    let t_ap = crate::time_shim::Instant::now();
     let candidates: Vec<DerivedFact> = derivation_defs.iter()
         .flat_map(|(name, func)| {
             let result = ast::apply(func, apply_input, d);
@@ -110,9 +116,9 @@ fn derive_one_round_with_keys(
                 .collect::<Vec<_>>()
         })
         .collect();
-    if trace { eprintln!("    [rnd] apply {} defs: {:?} ({} candidates)",
+    if trace { crate::diag!("    [rnd] apply {} defs: {:?} ({} candidates)",
         derivation_defs.len(), t_ap.elapsed(), candidates.len()); }
-    let t_dd = std::time::Instant::now();
+    let t_dd = crate::time_shim::Instant::now();
     let mut round_keys: HashSet<FactKey> = HashSet::with_capacity(candidates.len());
     let mut out: Vec<DerivedFact> = Vec::with_capacity(candidates.len());
     for cand in candidates {
@@ -124,7 +130,7 @@ fn derive_one_round_with_keys(
             out.push(cand);
         }
     }
-    if trace { eprintln!("    [rnd] dedup: {:?} ({} novel)",
+    if trace { crate::diag!("    [rnd] dedup: {:?} ({} novel)",
         t_dd.elapsed(), out.len()); }
     out
 }
@@ -162,16 +168,20 @@ pub fn forward_chain_defs_state_semi_naive_with_base_keys(
     base_keys: Option<HashSet<FactKey>>,
 ) -> (ast::Object, Vec<DerivedFact>) {
     use hashbrown::HashMap;
+    // Same gate as `derive_one_round_with_keys`: trace knob is host-only.
+    #[cfg(not(feature = "no_std"))]
     let trace = std::env::var("AREST_STAGE12_TRACE").is_ok();
+    #[cfg(feature = "no_std")]
+    let trace = false;
     let mut current_state = d.clone();
     let mut all_derived: Vec<DerivedFact> = Vec::new();
     // Base set of fact keys in `d`. Built once here and updated
     // incrementally as rounds emit new facts — on core.md this cut
     // ~3ms per round of re-hashing the unchanged grammar portion of
     // the state.
-    let t_ek = std::time::Instant::now();
+    let t_ek = crate::time_shim::Instant::now();
     let mut existing_keys = base_keys.unwrap_or_else(|| state_keys(&current_state));
-    if trace { eprintln!("    [sn] initial state_keys: {:?} ({} keys)",
+    if trace { crate::diag!("    [sn] initial state_keys: {:?} ({} keys)",
         t_ek.elapsed(), existing_keys.len()); }
     // `dirty_cells == None` means "run everything" (initial round or
     // caller wants no filtering); `Some(set)` restricts to rules that
@@ -188,7 +198,7 @@ pub fn forward_chain_defs_state_semi_naive_with_base_keys(
             .map(|(n, f, _)| (*n, *f))
             .collect();
         if trace {
-            eprintln!("    [sn] round {}: active {}/{} defs",
+            crate::diag!("    [sn] round {}: active {}/{} defs",
                 round, active.len(), derivation_defs.len());
         }
         if active.is_empty() { break; }
