@@ -176,6 +176,17 @@ pub fn init() {
         ]);
         initial = ast::cell_push("Organization", entity_acme, &initial);
 
+        // Support Request noun (#624 — supports the apis e2e suite's
+        // `/arest/support-requests` test slice). Same hand-stage shape
+        // as Organization above; drops once #588 lifts Stage-2 to
+        // no_std and the kernel can compile readings/support/*.md
+        // at boot.
+        let noun_sr = Object::seq(alloc::vec![Object::seq(alloc::vec![
+            Object::atom("name"),
+            Object::atom("Support Request"),
+        ])]);
+        initial = ast::cell_push("Noun", noun_sr, &initial);
+
         // Box::leak gives us the `&'static Object` the slot stores.
         // The leak is intentional: the legacy `state()` shim returns
         // `&'static Object`, and `apply()`'s atomic-pointer-swap
