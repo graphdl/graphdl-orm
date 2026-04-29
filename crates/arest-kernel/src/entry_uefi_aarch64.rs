@@ -119,6 +119,18 @@ fn efi_main() -> Status {
     println!("  target: aarch64-unknown-uefi");
     println!("  pre-EBS:  PL011 MMIO active at 0x0900_0000");
 
+    // #571 (aarch64): capture an EFI_RNG_PROTOCOL bootstrap seed BEFORE
+    // EBS so the post-EBS entropy install can chain a firmware-derived
+    // fallback onto the silicon path. On QEMU's stock cortex-a72 model
+    // FEAT_RNG isn't exposed (`ID_AA64ISAR0_EL1.RNDR == 0`) and
+    // `csprng::seed_from_entropy` panics on the first reseed; without
+    // this seed the kernel crashes the moment any code path touches
+    // `random_bytes`. With it, the chain falls through cleanly to a
+    // stretched keystream derived from the firmware-mediated 32 bytes.
+    // `None` is fine — the chain degrades to bare Aarch64HwEntropy and
+    // the pre-#571 panic semantics return.
+    let boot_seed = crate::arch::aarch64::efi_rng::capture_boot_seed();
+
     // SAFETY: `boot::exit_boot_services` walks the current memory
     // map, gets the firmware's signature lock, and tears down
     // BootServices. The returned `MemoryMapOwned` is a stable copy
@@ -148,6 +160,18 @@ fn efi_main() -> Status {
     println!(
         "  mem:      {frame_count} frames usable ({usable_mib} MiB) (UEFI memory map)"
     );
+
+    // #570: register the aarch64 hardware entropy source (RNDR with
+    // RNDRRS fallback) into `arest::entropy`'s global slot. Must run
+    // BEFORE any csprng-touching code path — `random_bytes` would
+    // otherwise resolve against an uninstalled slot and panic. The
+    // ID_AA64ISAR0_EL1 probe inside the install is constant-time;
+    // no-op on pre-FEAT_RNG silicon (the source then reports
+    // HardwareUnavailable until the EFI_RNG_PROTOCOL fallback in #571
+    // chains in via `boot_seed`).
+    crate::arch::aarch64::install_entropy_with_seed(boot_seed);
+    let seed_label = if boot_seed.is_some() { " + EFI_RNG fallback" } else { "" };
+    println!("  entropy:  aarch64 hardware RNG (RNDR + RNDRRS){} installed", seed_label);
 
     // #367: DMA pool carve smoke. `arch::init_memory` on aarch64 now
     // mirrors the x86_64-UEFI arm: carves a 2 MiB contiguous region
