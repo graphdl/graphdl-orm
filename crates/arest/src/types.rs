@@ -1,4 +1,13 @@
 // crates/arest/src/types.rs
+//
+// Serde derives + per-field `#[serde(...)]` attrs are gated on the
+// `std-deps` feature (#588). Under no_std (kernel build), `serde`
+// isn't in the crate graph at all — every `derive(Deserialize,
+// Serialize)` and every `#[serde(...)]` is therefore wrapped in
+// `cfg_attr(feature = "std-deps", ...)` so the type definitions
+// themselves stay no_std-clean while round-tripping through serde
+// continues to work in the std build.
+#[cfg(feature = "std-deps")]
 use serde::{Deserialize, Serialize};
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
@@ -131,8 +140,9 @@ mod wire_tests {
 
 /// x̄ — a constant asserted into P.
 /// Subject noun 'value' predicate object 'value'.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct GeneralInstanceFact {
     pub subject_noun: String,
     pub subject_value: String,
@@ -142,8 +152,9 @@ pub struct GeneralInstanceFact {
 }
 
 /// World assumption for a noun — determines how absence of facts is interpreted
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "lowercase"))]
 pub enum WorldAssumption {
     Closed, // not stated = false (permissions, corporate authority)
     Open,   // not stated = unknown (capabilities, unenumerated abilities)
@@ -155,11 +166,12 @@ impl Default for WorldAssumption {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct NounDef {
     pub object_type: String,
-    #[serde(default)]
+    #[cfg_attr(feature = "std-deps", serde(default))]
     pub world_assumption: WorldAssumption,
 }
 
@@ -184,8 +196,9 @@ pub struct NounDef {
 /// so that plain (`Literal`) ids continue to parse and deserialize
 /// exactly as before. The `@role:<idx>:<role_name>` prefix tags the
 /// `AntecedentRole` form.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase", tag = "kind", content = "value")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase", tag = "kind", content = "value"))]
 pub enum ConsequentCellSource {
     /// Single cell keyed by a literal string.
     Literal(String),
@@ -284,8 +297,9 @@ impl Default for ConsequentCellSource {
 ///
 /// Wire format for the flat-field (no-JSON) reconstruction path uses
 /// `@noun:<name>` as a sentinel. Plain strings decode as `FactType`.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase", tag = "kind", content = "value")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase", tag = "kind", content = "value"))]
 pub enum AntecedentSource {
     /// Antecedent is the cell's fact list for this FT id.
     FactType(String),
@@ -362,8 +376,9 @@ impl Default for AntecedentSource {
 }
 
 /// A derivation rule in the IR — compiled to a DeriveFn at compile time.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct DerivationRuleDef {
     pub id: String,
     pub text: String,
@@ -377,7 +392,7 @@ pub struct DerivationRuleDef {
     /// fan out across all user fact types matching the antecedent,
     /// which the four implicit-derivation shapes (subtype inheritance,
     /// CWA negation, …) expand into readings (`#287`).
-    #[serde(default)]
+    #[cfg_attr(feature = "std-deps", serde(default))]
     pub consequent_cell: ConsequentCellSource,
     /// When the antecedent source is `InstancesOfNoun`, the per-element
     /// input to the per-fact step is a raw atom (the instance id), not
@@ -385,7 +400,7 @@ pub struct DerivationRuleDef {
     /// value becomes that atom — the result is a one-pair binding
     /// sequence `<<role, instance>>`. Empty for FactType-sourced rules
     /// (they inherit antecedent bindings via `Func::Id` as before).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "String::is_empty"))]
     pub consequent_instance_role: String,
     /// Derivation kind for compile dispatch
     pub kind: DerivationKind,
@@ -394,16 +409,16 @@ pub struct DerivationRuleDef {
     /// - Value join keys (e.g., "Squish VIN" matches Vehicle↔Candidate↔Listing)
     /// - Entity consistency (e.g., "Chrome Style Candidate" is the same entity
     ///   across candidate_squishvin and candidate_trim facts)
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub join_on: Vec<String>,
     /// For Join rules: cross-noun match predicates. Each pair (left, right)
     /// requires that the value of left contains the value of right (case-insensitive).
     /// Used for fuzzy matching like "Chrome Trim" contains "Listing Trim".
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub match_on: Vec<(String, String)>,
     /// For Join rules: noun names to include in the consequent bindings.
     /// If empty, all bindings from the joined facts are included.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub consequent_bindings: Vec<String>,
     /// Inline numeric comparisons attached to individual antecedents.
     ///
@@ -413,26 +428,26 @@ pub struct DerivationRuleDef {
     /// The `>= 1000000` is recorded as an AntecedentFilter pinned to the
     /// `has Population` antecedent. At compile time the rule becomes
     /// Filter(p) : P over the filtered antecedent facts.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub antecedent_filters: Vec<AntecedentFilter>,
     /// Consequent roles whose values are computed from arithmetic over
     /// antecedent role values. Halpin FORML attribute-style definitions:
     ///   * Box has Volume iff Box has Size and Volume is Size * Size * Size.
     /// The `Volume is Size * Size * Size` clause populates this with one
     /// ConsequentComputedBinding { role: "Volume", expr: ... }.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub consequent_computed_bindings: Vec<ConsequentComputedBinding>,
     /// Consequent roles whose values come from aggregating an image set
     /// (Codd §2.3.4 + Backus Insert). Halpin FORML:
     ///   * Fact Type has Arity iff Arity is the count of Role where Fact
     ///     Type has Role.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub consequent_aggregates: Vec<ConsequentAggregate>,
     /// Clauses the parser saw in the derivation body but could not
     /// classify into any known form (FT reference, comparison,
     /// aggregate, computed binding, anaphora, negation). The checker
     /// reports these directly — no parallel heuristic needed.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub unresolved_clauses: Vec<String>,
     /// Per-antecedent string-literal role equality filters. FORML 2 grammar
     /// readings use this for token matching, e.g.
@@ -441,21 +456,22 @@ pub struct DerivationRuleDef {
     /// where the antecedent fact type `Statement has Trailing Marker`
     /// must have its `Trailing Marker` role equal to the literal
     /// `'is an entity type'`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub antecedent_role_literals: Vec<AntecedentRoleLiteral>,
     /// Consequent roles bound to fixed string literals. Used by grammar
     /// readings whose consequent specifies a role's value, e.g.
     ///   `Statement has Classification 'Entity Type Declaration'`.
     /// The `Classification` role is bound to the literal; the remaining
     /// consequent roles inherit bindings from the antecedent fact.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub consequent_role_literals: Vec<ConsequentRoleLiteral>,
 }
 
 /// Numeric comparison that further restricts a derivation antecedent.
 /// See `DerivationRuleDef::antecedent_filters`.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct AntecedentFilter {
     /// Index into `antecedent_sources` that this filter restricts.
     pub antecedent_index: usize,
@@ -470,8 +486,9 @@ pub struct AntecedentFilter {
 
 /// String-literal equality filter pinned to an antecedent role.
 /// See `DerivationRuleDef::antecedent_role_literals`.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct AntecedentRoleLiteral {
     /// Index into `antecedent_sources` that this filter restricts.
     pub antecedent_index: usize,
@@ -483,8 +500,9 @@ pub struct AntecedentRoleLiteral {
 
 /// Fixed string literal bound to a consequent role.
 /// See `DerivationRuleDef::consequent_role_literals`.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct ConsequentRoleLiteral {
     /// Role name (noun name) in the consequent fact type.
     pub role: String,
@@ -496,8 +514,9 @@ pub struct ConsequentRoleLiteral {
 /// such as `Duration is End Time - Start Time`. Left-associative and flat
 /// (no explicit precedence between + - * /): operators evaluate in the
 /// order they appear. Parentheses aren't supported yet.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub enum ArithExpr {
     /// Reference to a role by name; resolved at compile time against the
     /// antecedent fact type's role list.
@@ -513,8 +532,9 @@ pub enum ArithExpr {
 ///   `Duration is End Time - Start Time`
 /// where `Duration` is the computed role and `End Time - Start Time` is
 /// the expression evaluated against each antecedent fact.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct ConsequentComputedBinding {
     /// Consequent role name (e.g., "Duration").
     pub role: String,
@@ -531,8 +551,9 @@ pub struct ConsequentComputedBinding {
 /// Classical relational algebra θ₁ is adequate for queries but not for
 /// counting/summing (Codd p.1); AREST closes the gap with Backus's Insert
 /// (`/`) and Length, so every aggregate lowers to θ₁ restriction + a fold.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct ConsequentAggregate {
     /// Consequent role name to receive the aggregate value (e.g. "Arity").
     pub role: String,
@@ -554,8 +575,9 @@ pub struct ConsequentAggregate {
     pub group_key_role: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub enum DerivationKind {
     SubtypeInheritance, // X is subtype of Y -> X inherits Y's constraints
     ModusPonens,        // If A then B, A holds -> B holds
@@ -564,33 +586,37 @@ pub enum DerivationKind {
     Join,               // Cross-fact-type equi-join on shared noun names
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct FactTypeDef {
-    #[serde(default)]
+    #[cfg_attr(feature = "std-deps", serde(default))]
     pub schema_id: String,
     pub reading: String,
-    #[serde(default)]
+    #[cfg_attr(feature = "std-deps", serde(default))]
     pub readings: Vec<ReadingDef>,
     pub roles: Vec<RoleDef>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct ReadingDef {
     pub text: String,
     pub role_order: Vec<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct RoleDef {
     pub noun_name: String,
     pub role_index: usize,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct ConstraintDef {
     pub id: String,
     pub kind: String,
@@ -607,8 +633,9 @@ pub struct ConstraintDef {
     pub max_occurrence: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct SpanDef {
     pub fact_type_id: String,
     pub role_index: usize,
@@ -616,8 +643,9 @@ pub struct SpanDef {
     pub subset_autofill: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct StateMachineDef {
     pub noun_name: String,
     pub statuses: Vec<String>,
@@ -627,12 +655,13 @@ pub struct StateMachineDef {
     /// graph-topology inference (source-never-target) gave a unique
     /// answer. The compiled machine fails visibly at first SM call
     /// when empty — per Thm 3, the fold needs s_0.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "String::is_empty"))]
     pub initial: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct TransitionDef {
     pub from: String,
     pub to: String,
@@ -640,8 +669,9 @@ pub struct TransitionDef {
     pub guard: Option<GuardDef>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct GuardDef {
     #[allow(dead_code)] // deserialized from JSON, read by JS callers
     pub fact_type_id: String,
@@ -658,15 +688,16 @@ pub type State = crate::ast::Object;
 // State = Object (sequence of cells). Use ast helpers: fetch_or_phi, cell_push, etc.
 
 /// A constraint violation.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct Violation {
     pub constraint_id: String,
     pub constraint_text: String,
     pub detail: String,
     /// Alethic violations are structural impossibilities (always reject).
     /// Deontic violations are reportable but may not reject.
-    #[serde(default = "default_alethic")]
+    #[cfg_attr(feature = "std-deps", serde(default = "default_alethic"))]
     pub alethic: bool,
 }
 
@@ -676,8 +707,9 @@ fn default_alethic() -> bool { true }
 // ── Forward Inference & Synthesis Types ──────────────────────────────
 
 /// A fact derived by forward inference
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct DerivedFact {
     pub fact_type_id: String,
     pub reading: String,
@@ -686,8 +718,9 @@ pub struct DerivedFact {
     pub confidence: Confidence,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std-deps", derive(Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "lowercase"))]
 pub enum Confidence {
     Definitive, // derived under CWA — fact is definitively true/false
     #[allow(dead_code)] // reserved: used when OWA derivation is implemented
@@ -697,8 +730,9 @@ pub enum Confidence {
 // ── Proof Engine Types ──────────────────────────────────────────────
 
 /// Result of attempting to prove a goal
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 #[allow(dead_code)] // used by lib.rs WASM export, not by main.rs binary
 pub enum ProofStatus {
     /// Goal is proven — a derivation chain exists from axioms to the goal
@@ -710,8 +744,9 @@ pub enum ProofStatus {
 }
 
 /// A single step in a proof tree
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 #[allow(dead_code)] // used by lib.rs WASM export, not by main.rs binary
 pub struct ProofStep {
     /// The fact being proven at this step
@@ -723,8 +758,9 @@ pub struct ProofStep {
 }
 
 /// How a fact was established in a proof
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 #[allow(dead_code)] // used by lib.rs WASM export, not by main.rs binary
 pub enum Justification {
     /// Fact exists directly in the population (axiom)
@@ -740,8 +776,9 @@ pub enum Justification {
 }
 
 /// Complete proof result
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 #[allow(dead_code)] // used by lib.rs WASM export, not by main.rs binary
 pub struct ProofResult {
     pub goal: String,
@@ -751,8 +788,9 @@ pub struct ProofResult {
 }
 
 /// Result of synthesizing knowledge about a noun
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct SynthesisResult {
     pub noun_name: String,
     pub world_assumption: WorldAssumption,
@@ -783,16 +821,18 @@ impl SynthesisResult {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct FactTypeSummary {
     pub id: String,
     pub reading: String,
     pub role_index: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct ConstraintSummary {
     pub id: String,
     pub text: String,
@@ -801,8 +841,9 @@ pub struct ConstraintSummary {
     pub deontic_operator: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct StateMachineSummary {
     pub noun_name: String,
     pub statuses: Vec<String>,
@@ -810,8 +851,9 @@ pub struct StateMachineSummary {
     pub valid_transitions: Vec<String>, // events that can fire from current state
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "std-deps", derive(Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct RelatedNoun {
     pub name: String,
     pub via_fact_type: String,
