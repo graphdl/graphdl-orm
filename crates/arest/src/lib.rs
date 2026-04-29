@@ -179,6 +179,13 @@ pub mod csprng;
 // LLM-shaped example.
 #[cfg(not(feature = "no_std"))]
 pub mod externals;
+// `agent` — pure cell-walker that resolves a verb name to its
+// (Model.code, Prompt) binding via the agents metamodel
+// (`readings/templates/agents.md`). Called by Platform-fn handlers
+// before they fire a completion. no_std-clean — `alloc::String` +
+// `fetch_or_phi` cell walks; the kernel can use it once an LLM
+// provider lands there.
+pub mod agent;
 #[cfg(not(feature = "no_std"))]
 pub mod check;
 // Storage-1: pluggable StorageBackend trait + in-mem/local-fs impls.
