@@ -614,8 +614,8 @@ pub fn translate_derivation_mode_facts(classified_state: &Object) -> Vec<Object>
 }
 
 fn derivation_marker_for(state: &Object, stmt_id: &str) -> Option<String> {
-    if let Some(v) = STMT_INDEX.with(|c|
-        c.borrow().as_ref().map(|i| i.derivation_markers.get(stmt_id).cloned()))
+    if let Some(v) = stmt_index_cell::with_borrow(|slot|
+        slot.as_ref().map(|i| i.derivation_markers.get(stmt_id).cloned()))
     {
         return v;
     }
@@ -863,9 +863,8 @@ fn possibility_synthetic_fact_type(
 /// Role head nouns for a Statement, ordered by Role Position.
 fn role_refs_for(state: &Object, stmt_id: &str) -> Vec<String> {
     // Indexed fast path — avoids three O(cell_size) scans per call.
-    if let Some(out) = STMT_INDEX.with(|c| {
-        let borrowed = c.borrow();
-        let idx = borrowed.as_ref()?;
+    if let Some(out) = stmt_index_cell::with_borrow(|slot| {
+        let idx = slot.as_ref()?;
         let role_ids = idx.role_refs_by_stmt.get(stmt_id)?;
         let mut with_pos: Vec<(usize, String)> = role_ids.iter()
             .filter_map(|rid| {
@@ -904,8 +903,8 @@ fn role_refs_for(state: &Object, stmt_id: &str) -> Vec<String> {
 }
 
 fn statement_text(state: &Object, stmt_id: &str) -> Option<String> {
-    if let Some(v) = STMT_INDEX.with(|c|
-        c.borrow().as_ref().map(|i| i.texts.get(stmt_id).cloned()))
+    if let Some(v) = stmt_index_cell::with_borrow(|slot|
+        slot.as_ref().map(|i| i.texts.get(stmt_id).cloned()))
     {
         return v;
     }
@@ -943,9 +942,66 @@ struct StmtIndex {
     statement_ids: alloc::sync::Arc<Vec<String>>,
 }
 
-std::thread_local! {
-    static STMT_INDEX: std::cell::RefCell<Option<StmtIndex>>
-        = std::cell::RefCell::new(None);
+// Translator-block cache for the parsed-statement index. Two backends
+// keyed on the `no_std` feature so this module compiles under no_std
+// without losing the per-thread isolation it depends on (#652 /
+// #588 prep):
+//
+//   * std builds: `thread_local! { RefCell<Option<StmtIndex>> }`. Tests
+//     run translator blocks on multiple threads in parallel; thread-
+//     local storage gives each parse its own slot, so concurrent
+//     `StmtIndexGuard::install`/`drop` calls do not stomp on each
+//     other.
+//   * no_std builds: `spin::Mutex<Option<StmtIndex>>`. There is no
+//     `std::thread_local!` available, and the no_std consumers
+//     (UEFI / single-task kernel contexts) do not run concurrent
+//     parses, so a process-global slot under a `Mutex` is correct.
+//     `StmtIndex`'s fields (`HashMap<String, _>`, `Arc<Vec<String>>`)
+//     are all `Send + Sync`, so the inner type is `Option<StmtIndex>`
+//     directly — the mutex supplies the interior mutability that
+//     `RefCell` did before.
+//
+// Re-entrancy audit (translator block, where the guard is installed):
+// every accessor below clones data out of the borrow/lock immediately
+// and drops it; the helpers it calls (`fetch_or_phi`, `binding`) live
+// in `ast.rs` and never touch this cell. The install/drop sites also
+// do not recurse. The guard is held for the duration of the translator
+// block in `parse_forml2_stage12`, which runs entirely on the calling
+// thread without spawning workers, so there is no opportunity for a
+// recursive `with_borrow`/`set` on the same chain.
+mod stmt_index_cell {
+    use super::StmtIndex;
+
+    #[cfg(not(feature = "no_std"))]
+    std::thread_local! {
+        static SLOT: core::cell::RefCell<Option<StmtIndex>>
+            = core::cell::RefCell::new(None);
+    }
+
+    #[cfg(feature = "no_std")]
+    static SLOT: spin::Mutex<Option<StmtIndex>> = spin::Mutex::new(None);
+
+    /// Borrow the cached `StmtIndex` (read-only) and run `f` on it.
+    #[cfg(not(feature = "no_std"))]
+    pub(super) fn with_borrow<R>(f: impl FnOnce(&Option<StmtIndex>) -> R) -> R {
+        SLOT.with(|c| f(&c.borrow()))
+    }
+
+    #[cfg(feature = "no_std")]
+    pub(super) fn with_borrow<R>(f: impl FnOnce(&Option<StmtIndex>) -> R) -> R {
+        f(&SLOT.lock())
+    }
+
+    /// Replace the cached `StmtIndex` (used by `StmtIndexGuard`).
+    #[cfg(not(feature = "no_std"))]
+    pub(super) fn set(value: Option<StmtIndex>) {
+        SLOT.with(|c| *c.borrow_mut() = value);
+    }
+
+    #[cfg(feature = "no_std")]
+    pub(super) fn set(value: Option<StmtIndex>) {
+        *SLOT.lock() = value;
+    }
 }
 
 fn build_stmt_index(state: &Object) -> StmtIndex {
@@ -1009,14 +1065,14 @@ struct StmtIndexGuard;
 impl StmtIndexGuard {
     fn install(state: &Object) -> Self {
         let idx = build_stmt_index(state);
-        STMT_INDEX.with(|c| *c.borrow_mut() = Some(idx));
+        stmt_index_cell::set(Some(idx));
         StmtIndexGuard
     }
 }
 
 impl Drop for StmtIndexGuard {
     fn drop(&mut self) {
-        STMT_INDEX.with(|c| *c.borrow_mut() = None);
+        stmt_index_cell::set(None);
     }
 }
 
@@ -1174,9 +1230,8 @@ fn strip_role_literals(text: &str, roles: &[(String, Option<String>)]) -> String
 /// Role head nouns AND literal values for a Statement, ordered by
 /// Role Position. Returns `Vec<(noun, Option<literal>)>`.
 fn role_refs_with_literals(state: &Object, stmt_id: &str) -> Vec<(String, Option<String>)> {
-    if let Some(out) = STMT_INDEX.with(|c| {
-        let borrowed = c.borrow();
-        let idx = borrowed.as_ref()?;
+    if let Some(out) = stmt_index_cell::with_borrow(|slot| {
+        let idx = slot.as_ref()?;
         let role_ids = idx.role_refs_by_stmt.get(stmt_id)?;
         let mut with_pos: Vec<(usize, String, Option<String>)> = role_ids.iter()
             .filter_map(|rid| {
@@ -1222,8 +1277,8 @@ fn role_refs_with_literals(state: &Object, stmt_id: &str) -> Vec<(String, Option
 }
 
 fn statement_verb(state: &Object, stmt_id: &str) -> Option<String> {
-    if let Some(v) = STMT_INDEX.with(|c|
-        c.borrow().as_ref().map(|i| i.verbs.get(stmt_id).cloned()))
+    if let Some(v) = stmt_index_cell::with_borrow(|slot|
+        slot.as_ref().map(|i| i.verbs.get(stmt_id).cloned()))
     {
         return v;
     }
@@ -1811,8 +1866,8 @@ fn ring_adjective_to_kind(marker: &str) -> Option<&'static str> {
 }
 
 fn trailing_marker_for(state: &Object, stmt_id: &str) -> Option<String> {
-    if let Some(v) = STMT_INDEX.with(|c|
-        c.borrow().as_ref().map(|i| i.trailing_markers.get(stmt_id).cloned()))
+    if let Some(v) = stmt_index_cell::with_borrow(|slot|
+        slot.as_ref().map(|i| i.trailing_markers.get(stmt_id).cloned()))
     {
         return v;
     }
@@ -1847,8 +1902,8 @@ fn role_noun_at_position(state: &Object, stmt_id: &str, position: usize) -> Opti
 }
 
 fn head_noun_for(state: &Object, stmt_id: &str) -> Option<String> {
-    if let Some(v) = STMT_INDEX.with(|c|
-        c.borrow().as_ref().map(|i| i.head_nouns.get(stmt_id).cloned()))
+    if let Some(v) = stmt_index_cell::with_borrow(|slot|
+        slot.as_ref().map(|i| i.head_nouns.get(stmt_id).cloned()))
     {
         return v;
     }
@@ -1862,8 +1917,8 @@ fn head_noun_for(state: &Object, stmt_id: &str) -> Option<String> {
 /// Return the list of classification names attached to a given
 /// Statement id.
 pub fn classifications_for(state: &Object, statement_id: &str) -> Vec<String> {
-    if let Some(v) = STMT_INDEX.with(|c|
-        c.borrow().as_ref().map(|i|
+    if let Some(v) = stmt_index_cell::with_borrow(|slot|
+        slot.as_ref().map(|i|
             i.classifications.get(statement_id).cloned().unwrap_or_default()))
     {
         return v;
@@ -1884,8 +1939,8 @@ pub fn classifications_for(state: &Object, statement_id: &str) -> Vec<String> {
 /// check instead of paying an allocation plus a linear scan of a
 /// cloned vector.
 pub fn classifications_contains(state: &Object, statement_id: &str, name: &str) -> bool {
-    let via_index: Option<bool> = STMT_INDEX.with(|c|
-        c.borrow().as_ref().map(|i|
+    let via_index: Option<bool> = stmt_index_cell::with_borrow(|slot|
+        slot.as_ref().map(|i|
             i.classifications.get(statement_id)
                 .is_some_and(|v| v.iter().any(|k| k == name))));
     if let Some(b) = via_index { return b; }
@@ -1903,8 +1958,8 @@ pub fn classifications_contains(state: &Object, statement_id: &str, name: &str) 
 /// "is this a fact-type-like statement" tests; preferring this over a
 /// clone-and-iterate pattern saves per-call allocation.
 pub fn classifications_contains_any(state: &Object, statement_id: &str, names: &[&str]) -> bool {
-    let via_index: Option<bool> = STMT_INDEX.with(|c|
-        c.borrow().as_ref().map(|i|
+    let via_index: Option<bool> = stmt_index_cell::with_borrow(|slot|
+        slot.as_ref().map(|i|
             i.classifications.get(statement_id)
                 .is_some_and(|v| v.iter().any(|k| names.iter().any(|n| n == k)))));
     if let Some(b) = via_index { return b; }
@@ -1922,8 +1977,8 @@ pub fn classifications_contains_any(state: &Object, statement_id: &str, names: &
 /// clone; the 15+ translators that call it per parse therefore
 /// don't collectively pay the allocation cost of ~500 strings each.
 fn collect_statement_ids(state: &Object) -> alloc::sync::Arc<Vec<String>> {
-    if let Some(v) = STMT_INDEX.with(|c|
-        c.borrow().as_ref().map(|i| i.statement_ids.clone()))
+    if let Some(v) = stmt_index_cell::with_borrow(|slot|
+        slot.as_ref().map(|i| i.statement_ids.clone()))
     {
         return v;
     }

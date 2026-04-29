@@ -113,8 +113,11 @@ pub mod parse_forml2_stage1;
 // `serde_json::to_string` to canonicalize DerivationRuleDef. Lifting
 // stage2's gate requires either porting `compile.rs` to no_std (large)
 // or refactoring `build_grammar_cache` to skip serde-json round-tripping
-// for the bootstrap grammar (medium). Also depends on `std::thread_local!`
-// for the STMT_INDEX translator-block cache. Tracked alongside #588.
+// for the bootstrap grammar (medium). The third blocker
+// (`std::thread_local!` for the STMT_INDEX translator-block cache) was
+// resolved in #652 by switching the cache to a `cfg(no_std)`-selected
+// `spin::Mutex` shim alongside the existing thread_local for std.
+// Tracked alongside #588.
 #[cfg(not(feature = "no_std"))]
 pub mod parse_forml2_stage2;
 // `load_reading` is now a thin `pub use crate::load_reading_core::*`
