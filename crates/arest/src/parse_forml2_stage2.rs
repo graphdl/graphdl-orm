@@ -2140,8 +2140,13 @@ fn bootstrap_grammar_state(text: &str) -> Result<Object, String> {
                 antecedent_role_literals,
                 consequent_role_literals,
             };
-            let json = serde_json::to_string(&rule)
-                .map_err(|e| format!("grammar bootstrap: rule json serialization failed: {}", e))?;
+            // Hand-rolled canonical serializer (#651) — byte-identical to
+            // `serde_json::to_string(&rule)`, asserted by
+            // `types::canonical_json_tests::derivation_rule_def_canonical_json_matches_serde`.
+            // Lets stage2 build under no_std without dragging serde_json
+            // through the kernel feature graph (one of the three #588 stage2
+            // blockers; the remaining two are #652 + #653).
+            let json = rule.to_canonical_json();
             derivation_rules_info.push((id, rule_text, consequent_ft_encoded, json));
             continue;
         }
