@@ -338,6 +338,22 @@ fn load_and_compile(conn: &rusqlite::Connection) -> ast::Object {
 }
 
 fn main() {
+    // Install host entropy source (#591 / #574) BEFORE any subcommand
+    // dispatch. `csprng::random_bytes` panics with a "no entropy source
+    // installed" message if a caller fires before this — `arest run`
+    // and the readings-compile path don't currently consume randomness,
+    // but the kernel-shaped `POST /arest/entity` direct-write fallback
+    // (already on disk via #614/#615 even when running under the host
+    // CLI) *does*, and any future verb that emits opaque entity ids
+    // (`csprng::random_bytes` for #614's `k{counter}{fnv}` shape, or
+    // a forthcoming UUIDv4 variant) would otherwise trip the lazy-seed
+    // panic on first use. Adapter implements `EntropySource` over
+    // `getrandom` (Linux/macOS/Windows getrandom(2) /
+    // BCryptGenRandom). Calling `install` again would REPLACE the
+    // source (entropy.rs:116) — production paths must avoid that;
+    // tests swap in `DeterministicSource` via the same hook.
+    crate::entropy::install(crate::cli::entropy_host::HostEntropySource::boxed());
+
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // ── Subcommand dispatch ────────────────────────────────────────────
