@@ -47,6 +47,59 @@ pub struct AgentBinding {
     pub agent_definition_id: String,
 }
 
+/// Append a Completion record to `state`, mirror of the agents
+/// metamodel's four facts: `Completion belongs to Agent`,
+/// `Completion has input Text`, `Completion has output Text`,
+/// `Completion occurred at Timestamp`. Returns the new state with
+/// all four cell rows pushed; caller commits via `system::apply` (or
+/// the equivalent on its target).
+///
+/// The Platform-fn handler (worker-installed for `extract` / `chat`)
+/// calls this after the LLM call returns, so the audit trail lands
+/// in the same cell graph as every other fact. From there:
+///
+///   * `GET /arest/completions` lists the audit log via the existing
+///     HATEOAS read fallback (no extra route needed).
+///   * `Citation_is_backed_by_External_System` (the existing E3
+///     #305 path) ties the Completion to the model provider for
+///     provenance.
+///
+/// The `completion_id` is caller-supplied (typically content-addressed
+/// over `(agent_id, input, timestamp)` so re-emitting the same call
+/// is idempotent at the cell level — `cell_push` itself doesn't
+/// dedupe, but the caller can use `cell_push_unique` if needed).
+pub fn record_completion(
+    state: &Object,
+    completion_id: &str,
+    agent_id: &str,
+    input_text: &str,
+    output_text: &str,
+    timestamp: &str,
+) -> Object {
+    use crate::ast::{cell_push, fact_from_pairs};
+
+    let s = cell_push(
+        "Completion_belongs_to_Agent",
+        fact_from_pairs(&[("Completion", completion_id), ("Agent", agent_id)]),
+        state,
+    );
+    let s = cell_push(
+        "Completion_has_input_Text",
+        fact_from_pairs(&[("Completion", completion_id), ("input Text", input_text)]),
+        &s,
+    );
+    let s = cell_push(
+        "Completion_has_output_Text",
+        fact_from_pairs(&[("Completion", completion_id), ("output Text", output_text)]),
+        &s,
+    );
+    cell_push(
+        "Completion_occurred_at_Timestamp",
+        fact_from_pairs(&[("Completion", completion_id), ("Timestamp", timestamp)]),
+        &s,
+    )
+}
+
 /// Walk `state` to find the Agent Definition that `verb_name`
 /// invokes, then read its `uses Model` + `has Prompt` facts.
 /// Returns `None` when:
@@ -226,6 +279,57 @@ mod tests {
             &s,
         );
         assert!(resolve_agent_verb(&s, "noprompt").is_none());
+    }
+
+    #[test]
+    fn record_completion_writes_all_four_facts() {
+        // Caller supplies (agent_id, input, output, timestamp); helper
+        // pushes the four canonical cell rows. After this lands the
+        // existing HATEOAS read fallback can serve `/arest/completions`
+        // without any extra route.
+        let s = Object::phi();
+        let s = record_completion(
+            &s,
+            "comp-001",
+            "agent-extractor",
+            "summarise this paragraph",
+            "the paragraph asserts X.",
+            "2026-04-29T12:00:00Z",
+        );
+
+        let agent = crate::ast::fetch_or_phi("Completion_belongs_to_Agent", &s);
+        let agent_seq = agent.as_seq().expect("agent cell populated");
+        assert_eq!(agent_seq.len(), 1);
+        assert_eq!(crate::ast::binding(&agent_seq[0], "Completion"), Some("comp-001"));
+        assert_eq!(crate::ast::binding(&agent_seq[0], "Agent"), Some("agent-extractor"));
+
+        let input = crate::ast::fetch_or_phi("Completion_has_input_Text", &s);
+        let input_seq = input.as_seq().expect("input cell populated");
+        assert_eq!(crate::ast::binding(&input_seq[0], "input Text"),
+            Some("summarise this paragraph"));
+
+        let output = crate::ast::fetch_or_phi("Completion_has_output_Text", &s);
+        let output_seq = output.as_seq().expect("output cell populated");
+        assert_eq!(crate::ast::binding(&output_seq[0], "output Text"),
+            Some("the paragraph asserts X."));
+
+        let ts = crate::ast::fetch_or_phi("Completion_occurred_at_Timestamp", &s);
+        let ts_seq = ts.as_seq().expect("timestamp cell populated");
+        assert_eq!(crate::ast::binding(&ts_seq[0], "Timestamp"),
+            Some("2026-04-29T12:00:00Z"));
+    }
+
+    #[test]
+    fn record_completion_is_additive_across_calls() {
+        // Two completions for the same agent — both rows land, no
+        // overwrite. Mirror of how every other entity-create cell-push
+        // accumulates across writes.
+        let s = Object::phi();
+        let s = record_completion(&s, "comp-001", "agent-a", "in1", "out1", "t1");
+        let s = record_completion(&s, "comp-002", "agent-a", "in2", "out2", "t2");
+
+        let agent = crate::ast::fetch_or_phi("Completion_belongs_to_Agent", &s);
+        assert_eq!(agent.as_seq().map(|s| s.len()), Some(2));
     }
 
     #[test]
