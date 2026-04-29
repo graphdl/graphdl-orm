@@ -94,14 +94,10 @@ pub mod json_min;
 // validate.rs deleted — zero production callers, tests were self-referential.
 #[cfg(not(feature = "no_std"))]
 pub mod conceptual_query;
-// #588 (lift Stage-2 to no_std) is in progress: the `time_shim`,
-// `OnceLock`→`spin::Once`, `env::var` trace gate, and ~50 vestigial
-// `cfg(std-deps)` per-fn gates have been lifted on parse_forml2_stage2,
-// but several remaining surfaces still pull std (eprintln! call sites
-// in stage1, `crate::types` no_std gate, `crate::evaluate` reachability
-// from the no_std build, and `regex::Regex` in parse_forml2). Until
-// those land, stage1+stage2 stay gated `not(no_std)` so the kernel
-// build doesn't see them.
+// #588 (lift Stage-2 to no_std). parse_forml2 still pulls regex +
+// host-only is_forbidden_url checks. stage1 + stage2 are getting
+// closer but still pull `crate::types` and `crate::evaluate` whose
+// no_std reachability hasn't been verified.
 #[cfg(not(feature = "no_std"))]
 pub mod parse_forml2;
 #[cfg(not(feature = "no_std"))]
