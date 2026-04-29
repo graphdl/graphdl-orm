@@ -191,6 +191,7 @@ pub enum LoaderError {
 /// rather than `Box<[u8]>` because the storage was carved with a
 /// custom `Layout` (page-aligned), and `Box`'s deallocator would use
 /// the wrong alignment hint.
+#[derive(Debug)]
 pub struct LoadedSegment {
     /// Virtual address the binary asked for. Preserved as a `u64`
     /// (not a `usize`) because ELF stores it as 64 bits and the
@@ -280,6 +281,7 @@ impl Drop for LoadedSegment {
 /// `iretq`-into once the address space is live. Not used in tier-1
 /// (no trampoline yet); preserved here so `record_into_cells`
 /// produces a complete `Process_has_EntryPoint` fact.
+#[derive(Debug)]
 pub struct AddressSpace {
     pub entry_point: u64,
     /// Loaded segments in PT_LOAD order from the ELF. The loader

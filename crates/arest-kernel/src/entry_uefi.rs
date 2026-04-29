@@ -216,6 +216,14 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 ///      the page-table singleton is live.
 ///   7. Halt. The arch-neutral kernel body drives the rest of boot
 ///      via `kernel_run_uefi` (defined below).
+///
+/// `cfg(not(test))` because `cargo test --lib` against `x86_64-
+/// unknown-uefi` links libstd, which produces its own `efi_main`
+/// symbol via the test runner. Without this gate the link step
+/// fails with `duplicate symbol: efi_main` (#582-post). The
+/// runtime kernel always builds without `cfg(test)`, so the
+/// production entry path is unchanged.
+#[cfg(not(test))]
 #[entry]
 fn efi_main() -> Status {
     // Heap init MUST be the first thing — the global allocator is an

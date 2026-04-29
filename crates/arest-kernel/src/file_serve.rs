@@ -734,6 +734,7 @@ fn find_double_crlf(buf: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use arest::ast::fact_from_pairs;
 
     fn build_state_with_file(id: &str, mime: &str, cref: &str) -> Object {
