@@ -475,6 +475,106 @@ pub fn handle_arest_transition(
     Some((new_state, out.into_bytes()))
 }
 
+/// Handle `GET /arest/entities/{slug}/{id}/transitions` — list the
+/// legal next-step events for an entity's current state. Mirror of
+/// the worker's `router.ts::GET /api/entities/:noun/:id/transitions`
+/// (line 590). Returns `{currentStatus, transitions:[{event,
+/// targetStatus},...]}`.
+///
+/// `None` when:
+///   * Method isn't GET or path doesn't end in `/transitions`.
+///   * Slug doesn't resolve to a registered noun.
+///   * No State Machine row exists for `id`.
+///
+/// Empty `transitions` array (with valid currentStatus) when the
+/// entity is in a terminal state — same shape the worker returns
+/// for engineless / no-schema fallback paths.
+pub fn handle_arest_transitions_for_entity(
+    state: &Object,
+    method: &str,
+    path: &str,
+) -> Option<Vec<u8>> {
+    if method != "GET" {
+        return None;
+    }
+    let stripped = path.split('?').next().unwrap_or(path);
+    let inner = stripped.strip_prefix("/arest/entities/")?.trim_end_matches('/');
+    let inner = inner.strip_suffix("/transitions")?.trim_end_matches('/');
+    if inner.is_empty() {
+        return None;
+    }
+    let mut parts = inner.splitn(2, '/');
+    let slug = parts.next()?;
+    let id_raw = parts.next()?;
+    if slug.is_empty() || id_raw.is_empty() || id_raw.contains('/') {
+        return None;
+    }
+    let id = percent_decode(id_raw);
+
+    // Verify the noun is registered (mirror of /transition's check —
+    // unknown nouns 404 rather than emit a stub envelope).
+    let slug_decoded = percent_decode(slug);
+    let _noun = if crate::ast::fetch_or_phi("Noun", state)
+        .as_seq()
+        .map(|ns| ns.iter().any(|n| crate::ast::binding(n, "name") == Some(&slug_decoded)))
+        .unwrap_or(false)
+    {
+        slug_decoded
+    } else {
+        crate::naming::resolve_slug_to_noun(state, slug)
+            .or_else(|| crate::naming::resolve_slug_to_noun(state, &slug_decoded))?
+    };
+
+    // Find the SM row for this resource. No SM → None (caller emits
+    // 404; the worker's "Entity has no state machine" branch returns
+    // a 200 with empty transitions, but the kernel direct-write
+    // fallback hasn't seeded `_status` so the closer behaviour is
+    // 404 / fall-through).
+    let sm_cell = crate::ast::fetch_or_phi("State Machine", state);
+    let sm_seq = sm_cell.as_seq()?;
+    let sm_row = sm_seq
+        .iter()
+        .find(|sm| crate::ast::binding(sm, "forResource") == Some(id.as_str()))?;
+    let current_status = crate::ast::binding(sm_row, "currentlyInStatus")?.to_string();
+
+    // Walk Transition cell for rows whose fromStatus matches.
+    let transitions_cell = crate::ast::fetch_or_phi("Transition", state);
+    let mut entries: Vec<(String, String)> = Vec::new();
+    if let Some(rows) = transitions_cell.as_seq() {
+        for t in rows {
+            if crate::ast::binding(t, "fromStatus") != Some(current_status.as_str()) {
+                continue;
+            }
+            let event = match crate::ast::binding(t, "event") {
+                Some(e) => e.to_string(),
+                None => continue,
+            };
+            let target = match crate::ast::binding(t, "toStatus") {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            entries.push((event, target));
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str("{\"currentStatus\":");
+    out.push_str(&json_string(&current_status));
+    out.push_str(",\"transitions\":[");
+    for (i, (event, target)) in entries.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"event\":");
+        out.push_str(&json_string(event));
+        out.push_str(",\"targetStatus\":");
+        out.push_str(&json_string(target));
+        out.push('}');
+    }
+    out.push_str("]}");
+    Some(out.into_bytes())
+}
+
 /// Replace (or append) the value at `key` in a named-tuple `entity`
 /// (`Seq([Seq([k,v]), ...])`). Used by the transition handler to
 /// rewrite an SM row's `currentlyInStatus` without disturbing other
@@ -1051,6 +1151,99 @@ mod tests {
             Some("Received"),
             "untouched SM keeps its prior status"
         );
+    }
+
+    #[test]
+    fn transitions_for_entity_lists_legal_next_steps() {
+        let s = state_with_sr_state_machine("sr-1");
+        let body = handle_arest_transitions_for_entity(
+            &s,
+            "GET",
+            "/arest/entities/support-requests/sr-1/transitions",
+        )
+        .expect("transitions endpoint must respond");
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.contains("\"currentStatus\":\"Received\""), "{body}");
+        assert!(body.contains("\"event\":\"categorize\""), "{body}");
+        assert!(body.contains("\"targetStatus\":\"Categorized\""), "{body}");
+    }
+
+    #[test]
+    fn transitions_for_entity_filters_by_current_status() {
+        // Two Transition rows: one from Received (legal), one from
+        // Categorized (NOT legal because the SM is in Received). The
+        // GET handler must only surface the legal one.
+        let s = state_with_sr_state_machine("sr-1");
+        let s = cell_push(
+            "Transition",
+            fact(&[
+                ("id", "t-resolve"),
+                ("fromStatus", "Categorized"),
+                ("toStatus", "Resolved"),
+                ("event", "resolve"),
+            ]),
+            &s,
+        );
+        let body = handle_arest_transitions_for_entity(
+            &s,
+            "GET",
+            "/arest/entities/support-requests/sr-1/transitions",
+        )
+        .expect("must respond");
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.contains("\"event\":\"categorize\""), "{body}");
+        // resolve fires only from Categorized — must be absent from the
+        // Received-state response.
+        assert!(!body.contains("\"event\":\"resolve\""), "{body}");
+    }
+
+    #[test]
+    fn transitions_for_entity_empty_when_terminal() {
+        // SM in a state with no outgoing Transition row → empty
+        // transitions array, but a valid currentStatus envelope.
+        let s = Object::phi();
+        let s = cell_push("Noun", fact(&[("name", "Support Request")]), &s);
+        let s = cell_push(
+            "State Machine",
+            fact(&[
+                ("id", "sm-done"),
+                ("forResource", "sr-done"),
+                ("currentlyInStatus", "Resolved"),
+            ]),
+            &s,
+        );
+        let body = handle_arest_transitions_for_entity(
+            &s,
+            "GET",
+            "/arest/entities/support-requests/sr-done/transitions",
+        )
+        .expect("must respond");
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.contains("\"currentStatus\":\"Resolved\""), "{body}");
+        assert!(body.contains("\"transitions\":[]"), "{body}");
+    }
+
+    #[test]
+    fn transitions_for_entity_rejects_non_get() {
+        let s = state_with_sr_state_machine("sr-1");
+        assert!(handle_arest_transitions_for_entity(
+            &s,
+            "POST",
+            "/arest/entities/support-requests/sr-1/transitions",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn transitions_for_entity_rejects_unknown_resource() {
+        let s = state_with_sr_state_machine("sr-1");
+        // sr-other has no SM row → None.
+        assert!(handle_arest_transitions_for_entity(
+            &s,
+            "GET",
+            "/arest/entities/support-requests/sr-other/transitions",
+        )
+        .is_none());
     }
 
     #[test]
