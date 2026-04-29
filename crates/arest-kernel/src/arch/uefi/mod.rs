@@ -213,6 +213,14 @@ pub fn install_entropy() {
     x86_64::install_entropy();
 }
 
+/// Variant that threads a pre-EBS firmware-captured seed (#571) into
+/// the install. Forward to the per-arch implementation that knows how
+/// to chain the seed onto the silicon path.
+#[cfg(target_arch = "x86_64")]
+pub fn install_entropy_with_seed(seed: Option<[u8; x86_64::efi_rng::SEED_LEN]>) {
+    x86_64::install_entropy_with_seed(seed);
+}
+
 /// Drive the kernel's idle loop. Unlike the BIOS arm's
 /// `halt_forever` (which busy-polls smoltcp because the keyboard is
 /// the only unmasked IRQ), the UEFI arm has no IRQ infrastructure

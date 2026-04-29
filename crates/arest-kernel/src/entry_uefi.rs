@@ -340,6 +340,19 @@ fn efi_main() -> Status {
     // subsumed by the capture block above, which calls
     // `get_handle_for_protocol` as its first step.)
 
+    // #571: capture an EFI_RNG_PROTOCOL bootstrap seed BEFORE EBS so
+    // the post-EBS entropy install can chain a firmware-derived
+    // fallback onto the silicon path. On QEMU's stock TCG CPU model
+    // RDSEED/RDRAND aren't exposed and `csprng::seed_from_entropy`
+    // panics on the first reseed; without this seed the kernel
+    // crashes the moment any code path touches `random_bytes`
+    // (`POST /arest/entity` (#614), AT_RANDOM stack canary (#575),
+    // `getrandom` syscall (#577)). With it, the chain falls through
+    // cleanly to a stretched keystream derived from the firmware-
+    // mediated 32 bytes. `None` is fine — the chain degrades to bare
+    // X86_64HwEntropy and the pre-#571 panic semantics return.
+    let boot_seed = crate::arch::uefi::x86_64::efi_rng::capture_boot_seed();
+
     // SAFETY: `boot::exit_boot_services` walks the current memory
     // map, gets the firmware's signature lock, and tears down
     // BootServices. The returned `MemoryMapOwned` is a stable copy
@@ -363,6 +376,7 @@ fn efi_main() -> Status {
     kernel_run_uefi(
         memory_map,
         gop_w, gop_h, gop_stride, gop_fmt_idx, gop_ptr, gop_size,
+        boot_seed,
     )
 }
 
@@ -378,6 +392,10 @@ fn efi_main() -> Status {
 /// Parameterised on the firmware memory map + captured GOP
 /// framebuffer descriptor — both populated in `efi_main` before
 /// `boot::exit_boot_services` invalidates the firmware tables.
+// `boot_seed` is the pre-EBS bootstrap entropy captured via
+// EFI_RNG_PROTOCOL (#571). `None` when the firmware doesn't expose
+// the protocol; the entropy install then degrades to bare
+// X86_64HwEntropy.
 fn kernel_run_uefi(
     memory_map: MemoryMapOwned,
     gop_w: usize,
@@ -386,6 +404,7 @@ fn kernel_run_uefi(
     gop_fmt_idx: usize,
     gop_ptr: usize,
     gop_size: usize,
+    boot_seed: Option<[u8; crate::arch::uefi::x86_64::efi_rng::SEED_LEN]>,
 ) -> ! {
     println!("  post-EBS: 16550 COM1 active (kernel-managed)");
 
@@ -435,8 +454,9 @@ fn kernel_run_uefi(
     // CPUID probe inside the install is constant-time; no-op on
     // vintage CPUs (the source then reports HardwareUnavailable until
     // the EFI_RNG_PROTOCOL fallback in #571 chains in).
-    crate::arch::install_entropy();
-    println!("  entropy:  x86_64 hardware RNG (RDSEED + RDRAND) installed");
+    crate::arch::uefi::install_entropy_with_seed(boot_seed);
+    let seed_label = if boot_seed.is_some() { " + EFI_RNG fallback" } else { "" };
+    println!("  entropy:  x86_64 hardware RNG (RDSEED + RDRAND){} installed", seed_label);
 
     // #379: bring the 1 kHz monotonic ms timer online. PIC remap +
     // PIT divisor + `sti`. Must run AFTER init_interrupts so the

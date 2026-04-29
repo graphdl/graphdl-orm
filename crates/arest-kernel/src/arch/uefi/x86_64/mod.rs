@@ -53,6 +53,7 @@
 // fns without conflict.
 
 pub mod entropy;
+pub mod efi_rng;
 pub mod gdt;
 pub mod syscall_entry;
 pub mod syscall_msr;
@@ -98,5 +99,21 @@ pub fn install_userspace_gate() {
 /// previously-registered source per `arest::entropy::install`'s
 /// docstring), but the boot path calls this exactly once.
 pub fn install_entropy() {
-    arest::entropy::install(alloc::boxed::Box::new(entropy::X86_64HwEntropy::new()));
+    install_entropy_with_seed(None)
+}
+
+/// Variant that chains the firmware-captured `EFI_RNG_PROTOCOL` seed
+/// (#571) onto the silicon path. When `boot_seed` is `Some`, hardware
+/// faults fall through to a stretched keystream derived from the
+/// firmware-provided 32 bytes — preventing the `csprng::seed_from_entropy`
+/// panic that takes down POST `/arest/entity` (#614) on QEMU.
+///
+/// The seed must be captured pre-`boot::exit_boot_services` (see
+/// `efi_rng::capture_boot_seed`); this function is the post-EBS sink.
+pub fn install_entropy_with_seed(boot_seed: Option<[u8; efi_rng::SEED_LEN]>) {
+    let primary = entropy::X86_64HwEntropy::new();
+    let fallback = boot_seed.map(entropy::BootSeedEntropy::new);
+    arest::entropy::install(alloc::boxed::Box::new(
+        entropy::ChainedEntropy::new(primary, fallback),
+    ));
 }
