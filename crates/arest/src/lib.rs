@@ -123,17 +123,14 @@ pub mod conceptual_query;
 // alloc imports already in place).
 pub mod parse_forml2;
 pub mod parse_forml2_stage1;
-// #588 stage2 flip blocked: `build_grammar_cache` reaches
-// `crate::compile::compile_to_defs_state` (no_std-gated) and uses
-// `serde_json::to_string` to canonicalize DerivationRuleDef. Lifting
-// stage2's gate requires either porting `compile.rs` to no_std (large)
-// or refactoring `build_grammar_cache` to skip serde-json round-tripping
-// for the bootstrap grammar (medium). The third blocker
-// (`std::thread_local!` for the STMT_INDEX translator-block cache) was
-// resolved in #652 by switching the cache to a `cfg(no_std)`-selected
-// `spin::Mutex` shim alongside the existing thread_local for std.
-// Tracked alongside #588.
-#[cfg(not(feature = "no_std"))]
+// #588: parse_forml2_stage2 is no_std-clean as of #653.
+//   * `build_grammar_cache` → `compile::compile_to_defs_state` reach
+//     unblocked by the compile.rs no_std lift (#653).
+//   * `serde_json::to_string` for DerivationRuleDef canonicalization
+//     replaced with hand-rolled JSON in #651 (commit 02745dfa).
+//   * `std::thread_local!` STMT_INDEX cache cfg-gated to `spin::Mutex`
+//     shim under no_std in #652 (commit 516bc993).
+// Closes #588.
 pub mod parse_forml2_stage2;
 // `load_reading` is now a thin `pub use crate::load_reading_core::*`
 // shim (#586). Lifting the gate is purely re-export plumbing — the

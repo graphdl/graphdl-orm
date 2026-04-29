@@ -342,7 +342,10 @@ fn push(cells: &mut Cells, name: &str, fact: Object) {
 /// Documented rule at `docs/02-writing-readings.md` §"Noun names and
 /// reserved words". Escape: quote the noun name
 /// (`Noun 'Each Way Bet' is an entity type.`).
-#[cfg(feature = "std-deps")]
+///
+/// no_std-clean (#653): pure `alloc::format!` + `str::contains`, no
+/// serde/regex/std reach. Originally cfg-gated to `std-deps` out of
+/// caution; gate dropped so stage2 can call it under no_std as well.
 pub fn reserved_keyword_in(name: &str) -> Option<&'static str> {
     // Longest first so `at most one` beats `at most` on `At Most One
     // Hop`, etc.
