@@ -1234,6 +1234,18 @@ fn load_reading_handler(
                 "addedDerivations".to_string(),
                 outcome.report.added_derivations.join(","),
             );
+            // #558 / DynRdg-4: surface reading versioning metadata on
+            // the wire so callers can detect "same name, different
+            // body" and order loads chronologically. `contentHash` is
+            // a 16-char hex FNV-1a64; `versionStamp` is a decimal u64.
+            data.insert(
+                "contentHash".to_string(),
+                outcome.report.content_hash.clone(),
+            );
+            data.insert(
+                "versionStamp".to_string(),
+                outcome.report.version_stamp.to_string(),
+            );
 
             let derived_count = outcome.report.added_nouns.len()
                 + outcome.report.added_fact_types.len()
@@ -1371,6 +1383,19 @@ fn unload_reading_handler(
             data.insert(
                 "removedDerivations".to_string(),
                 outcome.report.removed_derivations.join(","),
+            );
+            // #558 / DynRdg-4: surface the manifest's recorded
+            // versioning metadata on unload, so wire callers can see
+            // which body version was just removed. Pre-#558 manifest
+            // cells decode with `""` / `0` defaults — see
+            // `decode_manifest`; the wire output mirrors them as-is.
+            data.insert(
+                "contentHash".to_string(),
+                outcome.report.content_hash.clone(),
+            );
+            data.insert(
+                "versionStamp".to_string(),
+                outcome.report.version_stamp.to_string(),
             );
 
             let derived_count = outcome.report.removed_nouns.len()
@@ -1515,6 +1540,29 @@ fn reload_reading_handler(
             data.insert(
                 "addedDerivations".to_string(),
                 outcome.added.added_derivations.join(","),
+            );
+            // #558 / DynRdg-4: round-trip versioning metadata on
+            // reload — both the version that was removed (so callers
+            // can chronologically order body versions) and the
+            // version that was just installed. First-time-load
+            // fallthrough produces `previousContentHash = ""` and
+            // `previousVersionStamp = "0"` because the unload step
+            // had no manifest to read.
+            data.insert(
+                "previousContentHash".to_string(),
+                outcome.removed.content_hash.clone(),
+            );
+            data.insert(
+                "previousVersionStamp".to_string(),
+                outcome.removed.version_stamp.to_string(),
+            );
+            data.insert(
+                "contentHash".to_string(),
+                outcome.added.content_hash.clone(),
+            );
+            data.insert(
+                "versionStamp".to_string(),
+                outcome.added.version_stamp.to_string(),
             );
 
             let derived_count = outcome.removed.removed_nouns.len()
@@ -2745,6 +2793,132 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             .violations
             .iter()
             .any(|v| v.constraint_id == "reload_reading.not_implemented"));
+    }
+
+    // ── #558 / DynRdg-4 wire-envelope versioning ───────────────────
+
+    /// Successful LoadReading emits `contentHash` (16-char hex) and
+    /// `versionStamp` (decimal u64) on the wire envelope.
+    #[test]
+    fn load_reading_wire_carries_versioning() {
+        let (def_map, _state) = setup_order_defs();
+        let cmd = Command::LoadReading {
+            name: "catalog".to_string(),
+            body: "Product(.SKU) is an entity type.\n".to_string(),
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &def_map);
+        assert!(!result.rejected);
+        let entity = &result.entities[0];
+        assert!(entity.data.contains_key("contentHash"));
+        assert!(entity.data.contains_key("versionStamp"));
+        let hash = &entity.data["contentHash"];
+        assert_eq!(hash.len(), 16, "contentHash must be 16 hex chars");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "contentHash must be lowercase hex; got {hash}"
+        );
+        let stamp: u64 = entity.data["versionStamp"]
+            .parse()
+            .expect("versionStamp must be a u64 decimal");
+        assert!(stamp > 0, "versionStamp must be a positive monotonic value");
+    }
+
+    /// UnloadReading surfaces the manifest's recorded contentHash /
+    /// versionStamp on the wire envelope.
+    #[test]
+    fn unload_reading_wire_carries_versioning() {
+        let (def_map, _state) = setup_order_defs();
+        let load_cmd = Command::LoadReading {
+            name: "catalog".to_string(),
+            body: "Product(.SKU) is an entity type.\n".to_string(),
+            sender: None,
+            signature: None,
+        };
+        let load_result = apply_command_defs(&def_map, &load_cmd, &def_map);
+        let load_hash = load_result.entities[0].data["contentHash"].clone();
+        let load_stamp = load_result.entities[0].data["versionStamp"].clone();
+        let post_load_d = ast::merge_delta(&def_map, &load_result.state);
+
+        let unload_cmd = Command::UnloadReading {
+            name: "catalog".to_string(),
+            policy: None,
+            sender: None,
+            signature: None,
+        };
+        let unload_result = apply_command_defs(&post_load_d, &unload_cmd, &post_load_d);
+        assert!(!unload_result.rejected);
+        let entity = &unload_result.entities[0];
+        assert_eq!(entity.data["contentHash"], load_hash,
+            "unload's contentHash must equal the load's hash");
+        assert_eq!(entity.data["versionStamp"], load_stamp,
+            "unload's versionStamp must equal the load's stamp");
+    }
+
+    /// ReloadReading emits both old (`previousContentHash` /
+    /// `previousVersionStamp`) and new (`contentHash` /
+    /// `versionStamp`); the new stamp is strictly higher.
+    #[test]
+    fn reload_reading_wire_carries_old_and_new_versioning() {
+        let (def_map, _state) = setup_order_defs();
+        let load_cmd = Command::LoadReading {
+            name: "catalog".to_string(),
+            body: "Product(.SKU) is an entity type.\n".to_string(),
+            sender: None,
+            signature: None,
+        };
+        let load_result = apply_command_defs(&def_map, &load_cmd, &def_map);
+        let post_load_d = ast::merge_delta(&def_map, &load_result.state);
+        let load_hash = load_result.entities[0].data["contentHash"].clone();
+        let load_stamp: u64 = load_result.entities[0].data["versionStamp"]
+            .parse()
+            .unwrap();
+
+        let reload_cmd = Command::ReloadReading {
+            name: "catalog".to_string(),
+            body: "Category(.Name) is an entity type.\n".to_string(),
+            policy: None,
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&post_load_d, &reload_cmd, &post_load_d);
+        assert!(!result.rejected);
+        let entity = &result.entities[0];
+
+        assert_eq!(entity.data["previousContentHash"], load_hash,
+            "previousContentHash must equal the original load's hash");
+        assert_eq!(entity.data["previousVersionStamp"], load_stamp.to_string(),
+            "previousVersionStamp must equal the original load's stamp");
+
+        let new_hash = &entity.data["contentHash"];
+        let new_stamp: u64 = entity.data["versionStamp"].parse().unwrap();
+        assert_ne!(new_hash, &load_hash, "new hash must differ");
+        assert!(new_stamp > load_stamp,
+            "new stamp must be strictly higher: {load_stamp} → {new_stamp}");
+    }
+
+    /// First-time-load fallthrough on Reload: previous-version fields
+    /// are empty / zero (no manifest existed to carry them).
+    #[test]
+    fn reload_reading_first_time_wire_previous_fields_empty() {
+        let (def_map, _state) = setup_order_defs();
+        let cmd = Command::ReloadReading {
+            name: "catalog".to_string(),
+            body: "Product(.SKU) is an entity type.\n".to_string(),
+            policy: None,
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &def_map);
+        assert!(!result.rejected);
+        let entity = &result.entities[0];
+        assert_eq!(entity.data["previousContentHash"], "");
+        assert_eq!(entity.data["previousVersionStamp"], "0");
+        // New version is fully populated.
+        assert_eq!(entity.data["contentHash"].len(), 16);
+        let new_stamp: u64 = entity.data["versionStamp"].parse().unwrap();
+        assert!(new_stamp > 0);
     }
 
     /// #35 regression: creating an Order with a customer field must NOT
