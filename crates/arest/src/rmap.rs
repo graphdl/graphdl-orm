@@ -17,6 +17,13 @@
 //   4.   Independent entity -> single-column table
 //   6.   Constraint mapping (UC -> keys, MC -> NOT NULL, VC -> CHECK, SS -> FK)
 
+// Serde derives + per-field `#[serde(...)]` attrs gate on `std-deps`
+// (#653 / #588). Under no_std (kernel build), `serde` is not in the
+// crate graph at all, so every derive is wrapped in
+// `cfg_attr(feature = "std-deps", ...)` to keep the type definitions
+// no_std-clean. Round-tripping through serde continues to work in the
+// std build.
+#[cfg(feature = "std-deps")]
 use serde::{Serialize, Deserialize};
 use hashbrown::{HashMap, HashSet};
 #[allow(unused_imports)]
@@ -24,27 +31,29 @@ use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 // -- Output types -----------------------------------------------------
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "std-deps", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct TableColumn {
     pub name: String,
-    #[serde(rename = "type")]
+    #[cfg_attr(feature = "std-deps", serde(rename = "type"))]
     pub col_type: String,
     pub nullable: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "std-deps", serde(skip_serializing_if = "Option::is_none"))]
     pub references: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "std-deps", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
 pub struct TableDef {
     pub name: String,
     pub columns: Vec<TableColumn>,
     pub primary_key: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "std-deps", serde(skip_serializing_if = "Option::is_none"))]
     pub checks: Option<Vec<String>>,
     /// Additional UNIQUE constraints (each inner Vec is a set of column names)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "std-deps", serde(skip_serializing_if = "Option::is_none"))]
     pub unique_constraints: Option<Vec<Vec<String>>>,
 }
 
@@ -278,6 +287,12 @@ pub fn primary_key_of_table(cells: &crate::ast::Object, table_name: &str) -> Vec
 /// each reading / augmenting an intermediate state Object. That
 /// decomposition is tracked as a follow-up; keeping the body intact
 /// here preserves every current behaviour.
+///
+/// std-deps gate: serializes through `serde_json`. Under no_std the
+/// rmap procedure itself is reachable directly via `rmap(state)`; this
+/// Func-tree entry exists for std-host MCP dispatch / lowered compile
+/// pipelines where serde_json is already linked.
+#[cfg(feature = "std-deps")]
 pub fn rmap_func() -> crate::ast::Func {
     use alloc::sync::Arc;
     crate::ast::Func::Native(Arc::new(|state: &crate::ast::Object| {
@@ -290,6 +305,7 @@ pub fn rmap_func() -> crate::ast::Func {
 /// Decode the output of `apply(rmap_func(), state, state)` back into
 /// `Vec<TableDef>`. The Func emits a JSON atom; this helper is the
 /// inverse of that encoding.
+#[cfg(feature = "std-deps")]
 pub fn decode_rmap_result(obj: &crate::ast::Object) -> Vec<TableDef> {
     obj.as_atom()
         .and_then(|s| serde_json::from_str::<Vec<TableDef>>(s).ok())
