@@ -180,12 +180,23 @@ pub struct SelectedComponent {
 /// Component matches — the caller falls back to the generic
 /// key-value list view.
 ///
-/// Mirrors `arest::command::select_component` but with kernel-side
-/// cell names (`Component_has_ComponentRole` /
+/// Mirrors `arest::select_component_core::select_component` but with
+/// kernel-side cell names (`Component_has_ComponentRole` /
 /// `Component_is_implemented_by_Toolkit_at_ToolkitSymbol`) and the
 /// kernel-side trait cells. Constraints are intentionally empty in
 /// this slice — #511's scope is the dispatch path; #512+ wires
 /// per-screen constraint sets (touch / a11y / theme).
+///
+/// `#566` proposed collapsing this onto the engine's
+/// `select_component_core::select_component`. The cell-name
+/// projections diverge: the engine reads
+/// `Component_has_Component_Role` (parser projection of "has
+/// Component Role" — three words, three underscores) while the
+/// kernel walks the camelCase `Component_has_ComponentRole`
+/// inherited from #511. Reconciling needs the kernel-side state
+/// migrated to the parser's projection — landing alongside #589
+/// (kernel adopts the engine `load_reading` directly) once #588
+/// lifts Stage-2 to no_std.
 ///
 /// The tie-breaker rule from #492 — Slint always wins under equal
 /// scores — survives intact: every Slint binding gets a +1 floor
