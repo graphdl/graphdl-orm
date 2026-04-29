@@ -247,7 +247,7 @@ impl ProgramHeader {
 /// expected to keep the input slice alive for that follow-up call.
 /// Keeping the bytes here would force a lifetime parameter on every
 /// downstream type, which gets infectious quickly.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedElf {
     /// `e_type`. Always one of ET_EXEC / ET_DYN — we reject every
     /// other value at parse time.

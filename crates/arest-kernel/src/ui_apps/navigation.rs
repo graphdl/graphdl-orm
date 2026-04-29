@@ -97,7 +97,7 @@ pub struct NavigationTarget {
 }
 
 impl NavigationTarget {
-    fn new(target: CurrentCell, kind: NavigationKind) -> Self {
+    pub(crate) fn new(target: CurrentCell, kind: NavigationKind) -> Self {
         let prefix = kind.label_prefix();
         let label = format!("[{prefix}] {}", target.label());
         Self { target, kind, label }

@@ -173,6 +173,7 @@ pub enum StackError {
 /// Drops via the same `dealloc` + `Layout` path as
 /// `process::address_space::LoadedSegment` so the storage reclaims
 /// cleanly on `Process` tear-down.
+#[derive(Debug)]
 pub struct InitialStack {
     /// Page-aligned heap allocation backing the stack. The stack
     /// grows DOWN from `pages.add(size)` toward `pages.as_ptr()` —
