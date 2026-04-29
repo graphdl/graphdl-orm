@@ -171,6 +171,21 @@ busybox = []
 # edition's behavioural contract (HATEOAS reachable from the host)
 # and unblock the apis e2e suite against the kernel target.
 server = []
+# ui-bundle (#580). Gates the build-time bake of the ui.do React
+# bundle into the kernel binary. When ON, `build.rs` walks
+# `apps/ui.do/dist/` and emits a static `UI_ASSETS` table of
+# `(http_path, &[u8])` entries via `include_bytes!`; at boot,
+# `system::init` wraps each entry into a File cell so the runtime
+# asset handler in `arest_http_handler` can serve them out of the
+# in-memory cell graph rather than the static table directly. When
+# OFF (default + the `server` profile), the static table is empty
+# and every static-asset request 404s.
+#
+# The decoupling lets #581 lift the ui.do source out of this repo:
+# once the asset handler reads from the cell graph at runtime, the
+# boot-time bake can be replaced with an HTTP fetch / freeze-blob
+# load that populates the same cells from a separate origin.
+ui-bundle = []
 default = []
 
 [lib]

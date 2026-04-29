@@ -62,12 +62,15 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::collections::BTreeSet;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use arest::ast::{self, Func, Object};
 use spin::{Mutex, Once, RwLock};
+
+use crate::assets;
 
 /// Opaque identifier handed back to subscribers of `apply()` change
 /// notifications. Pass this value to `unsubscribe` to drop the
@@ -234,6 +237,14 @@ pub fn init() {
         ]);
         initial = ast::cell_push("Transition", t_categorize, &initial);
 
+        // #580 — seed the ui.do bundle (when the `ui-bundle` feature
+        // baked one in) into the cell graph so `arest_http_handler`
+        // can serve it via `assets::lookup_from_state`. No-op when
+        // `assets::UI_ASSETS` is empty (default + `--features server`
+        // profile). See `seed_ui_bundle_cells` for the per-asset cell
+        // shape and the handoff note for #581.
+        initial = seed_ui_bundle_cells(initial);
+
         // Box::leak gives us the `&'static Object` the slot stores.
         // The leak is intentional: the legacy `state()` shim returns
         // `&'static Object`, and `apply()`'s atomic-pointer-swap
@@ -242,6 +253,74 @@ pub fn init() {
         let leaked: &'static Object = Box::leak(Box::new(initial));
         RwLock::new(leaked)
     });
+}
+
+/// Seed the build-time ui.do bundle into the supplied state's File
+/// cell graph (#580 Layer B).
+///
+/// For each `(http_path, bytes)` entry in `assets::UI_ASSETS` (the
+/// table emitted by `build.rs` under `feature = "ui-bundle"`), pushes
+/// four facts:
+///
+///   * `File_has_Path<File, Path>`        — addressable URL
+///   * `File_has_ContentRef<File, ContentRef>` — hex-encoded inline
+///     bytes (same shape `file_upload.rs` uses post-#397d so the
+///     `file_serve.rs::decode_content_ref` reader honours it
+///     unchanged)
+///   * `File_has_MimeType<File, MimeType>` — derived via
+///     `assets::content_type_for(path)`
+///   * `File_has_Size<File, Size>`        — byte length, matching
+///     `file_upload.rs::build_file_facts_with_cref`
+///
+/// File ids are synthesised as `ui-bundle-<n>` so they don't collide
+/// with `file_upload.rs`'s `<prefix>-upload-<n>` ids.
+///
+/// Returns the unchanged state when the bundle table is empty (the
+/// default + `--features server` shape). The caller is expected to
+/// fold the returned state into whatever larger boot-time build is
+/// in flight — `init()` does this in-line before the final
+/// `Box::leak`.
+///
+/// ── Handoff for #581 ───────────────────────────────────────────────
+///
+/// Today this function reads from the build-time `UI_ASSETS` table.
+/// #581 lifts the ui.do source out of `apps/ui.do/` so the kernel
+/// can no longer `include_bytes!` the bundle at compile time. At
+/// that point this function's body becomes a runtime load — same
+/// File cell shape, but `bytes` come from a freeze blob, an HTTP
+/// fetch against a separate origin, or a disk image. The wire
+/// handler (`arest_http_handler` → `assets::lookup_from_state`)
+/// stays unchanged; only the seed source moves.
+pub fn seed_ui_bundle_cells(state: Object) -> Object {
+    let mut acc = state;
+    for (idx, (http_path, body)) in assets::UI_ASSETS.iter().enumerate() {
+        let file_id = format!("ui-bundle-{}", idx);
+        let cref = assets::encode_inline_hex(body);
+        let mime = assets::content_type_for(http_path);
+        let size = format!("{}", body.len());
+
+        acc = ast::cell_push(
+            "File_has_Path",
+            ast::fact_from_pairs(&[("File", &file_id), ("Path", http_path)]),
+            &acc,
+        );
+        acc = ast::cell_push(
+            "File_has_ContentRef",
+            ast::fact_from_pairs(&[("File", &file_id), ("ContentRef", &cref)]),
+            &acc,
+        );
+        acc = ast::cell_push(
+            "File_has_MimeType",
+            ast::fact_from_pairs(&[("File", &file_id), ("MimeType", mime)]),
+            &acc,
+        );
+        acc = ast::cell_push(
+            "File_has_Size",
+            ast::fact_from_pairs(&[("File", &file_id), ("Size", &size)]),
+            &acc,
+        );
+    }
+    acc
 }
 
 /// Dispatch a parsed HTTP request through the baked SYSTEM.
@@ -832,6 +911,47 @@ mod tests {
             "expected {probe_cell} in changed list, got {observed:?}");
 
         unsubscribe(id);
+    }
+
+    // ── #580 seed_ui_bundle_cells round-trip ───────────────────────
+
+    /// The seeder is a no-op when the `UI_ASSETS` table is empty (the
+    /// default build shape — no `--features ui-bundle`). Returning the
+    /// state untouched preserves the handler's "no bundle → 404"
+    /// behaviour without any extra cell-graph noise.
+    #[test]
+    fn seed_ui_bundle_cells_is_noop_with_empty_table() {
+        // Skip when the local build happens to have ui-bundle on; the
+        // assertion only makes sense for the empty-table path.
+        if !assets::UI_ASSETS.is_empty() {
+            return;
+        }
+        let initial = ast::cell_push(
+            "Probe",
+            fact_from_pairs(&[("k", "v")]),
+            &Object::phi(),
+        );
+        let after = seed_ui_bundle_cells(initial.clone());
+        assert_eq!(after, initial,
+            "empty UI_ASSETS must produce a state-equal seed");
+    }
+
+    /// When the table IS non-empty, every entry produces a
+    /// `File_has_Path` + `File_has_ContentRef` round-trip via the
+    /// asset-side decoder. We don't try to assert a specific path
+    /// here (the bundle's contents depend on what `apps/ui.do/dist/`
+    /// looked like at build time); we just confirm the first entry
+    /// round-trips cleanly.
+    #[test]
+    fn seed_ui_bundle_cells_round_trips_first_entry() {
+        if assets::UI_ASSETS.is_empty() {
+            return;
+        }
+        let (http_path, body) = assets::UI_ASSETS[0];
+        let after = seed_ui_bundle_cells(Object::phi());
+        let asset = assets::lookup_from_state(&after, http_path)
+            .expect("seeded entry must round-trip via lookup_from_state");
+        assert_eq!(asset.body, body.to_vec());
     }
 
     /// A subscriber that calls `unsubscribe(its_own_id)` from
