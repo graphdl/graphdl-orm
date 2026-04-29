@@ -1543,6 +1543,11 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // OpenAPI 3.1 document with the App's identity in `info`.
     //
     // See crate::generators::openapi for the schema/path derivation.
+    //
+    // The generators module is gated on `not(feature = "no_std")`
+    // because its body uses serde_json + regex; the kernel build
+    // skips this generator pass entirely. (#653 / #588)
+    #[cfg(not(feature = "no_std"))]
     apps_opted_into_generator(state, &c_instance_facts, "openapi").iter().for_each(|app| {
         let openapi_doc = crate::generators::openapi::compile_to_openapi(state, app);
         defs.push((
@@ -2477,12 +2482,21 @@ fn comparator_primitive(op: &str) -> Func {
 /// Format a parsed numeric literal back into an atom for the generated Func.
 /// Integers round-trip without the `.0` suffix so atoms stay stable against
 /// string-encoded ids (e.g. `"100"` not `"100.0"`).
+///
+/// `f64::trunc` is std-only (libm-backed). Under no_std we replicate it
+/// via an `i64` round-trip: for any finite `v` with `|v| < 1e16` (well
+/// below the i64 range and well within f64's integer-exactness window),
+/// `(v as i64) as f64` is exactly `trunc(v)` — i.e., truncation toward
+/// zero. Outside that window we fall through to default float formatting.
 fn format_numeric_atom(v: f64) -> String {
-    if v.is_finite() && v == v.trunc() && v.abs() < 1e16 {
-        format!("{}", v as i64)
-    } else {
-        format!("{}", v)
+    let v_abs = if v < 0.0 { -v } else { v };
+    if v.is_finite() && v_abs < 1e16 {
+        let truncated = (v as i64) as f64;
+        if v == truncated {
+            return format!("{}", v as i64);
+        }
     }
+    format!("{}", v)
 }
 
 /// Compile an aggregate derivation (Halpin attribute-style, Codd Â§2.3.4
