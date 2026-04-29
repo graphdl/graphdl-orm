@@ -26,8 +26,25 @@
     { "tag": "v1", "new_sqlite_classes": ["EntityDB", "RegistryDB"] },
     { "tag": "v2", "new_classes": ["BroadcastDO"] }
   ],
+  // AI_GATEWAY_URL — public URL of the Cloudflare AI Gateway worker
+  // project. Looks like
+  //   https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/<provider>
+  // where <provider> is one of `openai`, `anthropic`, `workers-ai`,
+  // etc. The `aiComplete` handler (src/api/ai/complete.ts) appends
+  // `/chat/completions` to this base, so the same URL works for any
+  // OpenAI-compatible upstream the gateway proxies.
+  //
+  // AI_GATEWAY_TOKEN — bearer token the gateway expects. NOT declared
+  // here because it's a secret. Set it with:
+  //   wrangler secret put AI_GATEWAY_TOKEN
+  // For OpenAI-routed calls this is the OpenAI API key (the gateway
+  // forwards it). For Workers AI routes, it's a Cloudflare API token.
+  // Empty/unset → `aiComplete` returns `{ error: { code: 'config' } }`
+  // and the engine's `apply(Func::Def("ai_complete"), …)` resolves to
+  // `Object::Bottom` (graceful skip per crates/arest/src/externals.rs).
   "vars": {
-    "ENVIRONMENT": "production"
+    "ENVIRONMENT": "production",
+    "AI_GATEWAY_URL": ""
   },
   "rules": [
     { "type": "CompiledWasm", "globs": ["**/*.wasm"], "fallthrough": true }

@@ -10,6 +10,7 @@ import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransiti
 import { handleArestRequest, handleArestReadFallback } from './arest-router'
 import { handleMcpRequest } from '../mcp/remote'
 import { dispatchVerb, UNIFIED_VERBS } from './verb-dispatcher'
+import { aiComplete } from './ai/complete'
 
 // ── Collection slug → noun type resolution ───────────────────────────
 // Resolved dynamically from the Registry via nounToSlug convention.
@@ -1148,6 +1149,57 @@ router.get('/arest', async (request, env: Env) => {
 
 router.get('/arest/*', async (request, env: Env) => {
   return handleArestRoute(request, env)
+})
+
+// ── AI Gateway completion (#638 / Worker-AI-1) ───────────────────────
+// Foundational primitive that #639-#642 build on (engine `Func::Def`
+// migration of /arest/extract + /arest/chat, Agent Definition seeds,
+// e2e tests). The handler lives in src/api/ai/complete.ts and is
+// install-shaped to plug into the kernel's
+// `register_async_platform_fn("ai_complete", …)` once that wire lands.
+//
+// Wire shape:
+//   POST /api/ai/complete
+//   { prompt: string, model?: string, temperature?: number,
+//     max_tokens?: number, extras?: object }
+//   →
+//   { text, _meta?, citations? }                  on success
+//   { error: { code, message, status? } }          on failure
+//
+// The handler NEVER throws — failures land as a structured envelope
+// (the engine maps those onto `Object::Bottom`).
+router.post('/api/ai/complete', async (request: Request, env: Env) => {
+  let body: { prompt?: string; model?: string; temperature?: number; max_tokens?: number; extras?: Record<string, unknown> }
+  try {
+    body = await request.json() as typeof body
+  } catch {
+    return error(400, { errors: [{ message: 'invalid JSON body' }] })
+  }
+  if (!body.prompt || typeof body.prompt !== 'string') {
+    return error(400, { errors: [{ message: 'prompt (string) required' }] })
+  }
+  const result = await aiComplete(body.prompt, {
+    env: {
+      AI_GATEWAY_URL: env.AI_GATEWAY_URL ?? '',
+      AI_GATEWAY_TOKEN: env.AI_GATEWAY_TOKEN ?? '',
+    },
+    model: body.model,
+    temperature: body.temperature,
+    max_tokens: body.max_tokens,
+    extras: body.extras,
+  })
+  // Map the structured error envelope onto an HTTP status so callers
+  // get the right network-level signal. `auth` → 401, `config` → 503
+  // (server-side misconfig, retryable after fix), upstream/network →
+  // 502, shape → 502 (gateway protocol violation).
+  if ('error' in result) {
+    const status =
+      result.error.code === 'auth' ? 401 :
+      result.error.code === 'config' ? 503 :
+      502
+    return json(result, { status })
+  }
+  return json(result)
 })
 
 // ── MCP-verb proxies for /arest/chat and /arest/extract (#201) ───────
