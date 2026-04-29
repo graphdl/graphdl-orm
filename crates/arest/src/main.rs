@@ -31,7 +31,13 @@ mod sync;
 /// like the lib's copy; kept local so we don't need to `use arest::*`
 /// (the bin re-declares each module via `mod <name>;` and can't also
 /// import the lib under the same crate name).
+///
+/// `#[macro_export]` ensures `crate::diag!` (the canonical call shape
+/// in shared modules like evaluate.rs and parse_forml2_stage2.rs)
+/// resolves under the bin target's crate root the same way it does in
+/// the lib (where lib.rs's macro is also `#[macro_export]`).
 #[allow(unused_macros)]
+#[macro_export]
 macro_rules! diag {
     ($($arg:tt)*) => { eprintln!($($arg)*) }
 }
@@ -82,6 +88,12 @@ mod command;
 mod scheduler;
 #[allow(dead_code)]
 mod ring;
+// `time_shim` (#588) — wasm-safe Instant abstraction. The bin
+// re-declares it so evaluate.rs / parse_forml2_stage2.rs
+// `crate::time_shim::Instant::now()` call sites resolve under the bin's
+// crate root the same way they do in lib.rs.
+#[allow(dead_code)]
+mod time_shim;
 #[allow(dead_code)]
 // `select_component_core` (#565) — pure FORML cell-walker that
 // `command::select_component` re-exports. The bin target re-declares
@@ -337,6 +349,29 @@ fn load_and_compile(conn: &rusqlite::Connection) -> ast::Object {
     d
 }
 
+/// Extract `--db <path>` from `tokens`, returning the chosen path
+/// (defaulting to `arest.db`) and the residual args. Mirrors the
+/// inline `--db` parser in `main()` but in a form the subcommand
+/// dispatchers can call without re-implementing the same fold.
+fn take_db_flag(tokens: &[String]) -> (String, Vec<String>) {
+    let mut db = "arest.db".to_string();
+    let mut rest: Vec<String> = Vec::new();
+    let mut expect_db = false;
+    for arg in tokens {
+        if expect_db {
+            db = arg.clone();
+            expect_db = false;
+            continue;
+        }
+        if arg == "--db" {
+            expect_db = true;
+            continue;
+        }
+        rest.push(arg.clone());
+    }
+    (db, rest)
+}
+
 fn main() {
     // Install host entropy source (#591 / #574) BEFORE any subcommand
     // dispatch. `csprng::random_bytes` panics with a "no entropy source
@@ -364,6 +399,32 @@ fn main() {
     // own exit code; unmatched first args fall through to the legacy
     // single-arg form (`arest <readings_dir>` etc.) below.
     if let Some(verb) = args.first() {
+        if verb == "reload" {
+            // `arest reload <file.md>` (#561 / DynRdg-T2) — runtime reading
+            // load via SystemVerb::LoadReading. Reads the body off disk,
+            // routes through `cli::reload::dispatch` (which opens the
+            // configured DB, threads through `dispatch_with_state`, and
+            // persists on success). Implemented under the `local` feature
+            // because the persist path needs SQLite — without `--features
+            // local`, the verb errors with the same "build with --features
+            // local" message as the readings-compile flow.
+            let (db_path, rest_args) = take_db_flag(&args[1..]);
+            #[cfg(feature = "local")]
+            {
+                let mut stdout = std::io::stdout();
+                let mut stderr = std::io::stderr();
+                let code = cli::reload::dispatch(
+                    &rest_args, &db_path, &mut stdout, &mut stderr);
+                std::process::exit(code);
+            }
+            #[cfg(not(feature = "local"))]
+            {
+                let _ = (rest_args, db_path);
+                eprintln!("`arest reload` requires the `local` feature.");
+                eprintln!("  cargo run --bin arest-cli --features local -- reload <file.md>");
+                std::process::exit(2);
+            }
+        }
         if verb == "run" {
             // `arest run <app-name>` (#543) — resolve a Wine App name to
             // its (slug, prefix Directory) pair via wine_app_by_name.
