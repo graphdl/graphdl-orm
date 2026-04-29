@@ -133,6 +133,31 @@ pub enum Command {
         #[serde(default)]
         signature: Option<String>,
     },
+    /// is-chg atomic compose of `UnloadReading` + `LoadReading`
+    /// (#557 / DynRdg-3): replace a previously-loaded reading's
+    /// body in a single commit. Either the new body fully replaces
+    /// the old (manifest, cells, the lot), or the old reading
+    /// stays exactly as it was — no partial state visible.
+    ///
+    /// The optional `policy` field accepts "replace-all" (default,
+    /// also accepts "replace_all") and "migrate-facts" (currently
+    /// stubbed — returns NotImplemented). Unknown values fall back
+    /// to the default. See `crate::load_reading::reload_reading`.
+    ///
+    /// First-time-load fallthrough: if no `_loaded_reading:{name}`
+    /// manifest is present, the unload step is treated as a no-op
+    /// and the reload degenerates to a first-time load. Documented
+    /// at the core function and the handler.
+    ReloadReading {
+        name: String,
+        body: String,
+        #[serde(default)]
+        policy: Option<String>,
+        #[serde(default)]
+        sender: Option<String>,
+        #[serde(default)]
+        signature: Option<String>,
+    },
 }
 
 // -- Result -----------------------------------------------------------
@@ -371,6 +396,9 @@ pub fn apply_command_defs(
         }
         Command::UnloadReading { name, policy, sender: _, signature: _ } => {
             unload_reading_handler(d, name, policy.as_deref(), state)
+        }
+        Command::ReloadReading { name, body, policy, sender: _, signature: _ } => {
+            reload_reading_handler(d, name, body, policy.as_deref(), state)
         }
         #[allow(unreachable_patterns)]
         _ => CommandResult {
@@ -1409,6 +1437,215 @@ fn unload_reading_handler(
     }
 }
 
+/// SystemVerb::ReloadReading (#557 / DynRdg-3) — atomic compose of
+/// `UnloadReading` + `LoadReading` against a single state snapshot.
+/// Either the new body fully replaces the old, or the old reading
+/// stays exactly as it was. No partial state is visible.
+///
+/// Pure wrapper over `crate::load_reading::reload_reading`: encodes
+/// the outcome as a `CommandResult` so the existing dispatch loop
+/// can surface it through the same `__state_delta` carrier. On
+/// rejection, the result state is `phi()` (no commit). On success,
+/// the result state is the post-reload delta against the input
+/// snapshot.
+///
+/// Policy parsing: the wire-level `policy` field accepts the
+/// strings "replace-all" (default), "replace_all", and
+/// "migrate-facts" (also "migrate_facts") — case-insensitive.
+/// Unknown values fall back to the default (replace-all). The
+/// `MigrateFacts` policy is stubbed; today it returns
+/// `reload_reading.not_implemented`.
+///
+/// First-time-load fallthrough: if no manifest is present for the
+/// name, the unload step is a no-op and the reload becomes a
+/// first-time load. The handler still returns `ReadingReloaded` so
+/// callers can treat the verb uniformly.
+fn reload_reading_handler(
+    d: &ast::Object,
+    name: &str,
+    body: &str,
+    policy: Option<&str>,
+    state: &ast::Object,
+) -> CommandResult {
+    use crate::load_reading::{reload_reading, LoadError, ReloadError, ReloadPolicy, UnloadError};
+
+    let parsed_policy = match policy.map(|s| s.to_ascii_lowercase()) {
+        Some(ref s) if s == "migrate-facts" || s == "migrate_facts" => {
+            ReloadPolicy::MigrateFacts
+        }
+        Some(ref s) if s == "replace-all" || s == "replace_all" => ReloadPolicy::ReplaceAll,
+        _ => ReloadPolicy::default(),
+    };
+
+    match reload_reading(d, name, body, parsed_policy) {
+        Ok(outcome) => {
+            // Re-compile defs from the post-reload state. Mirrors
+            // load/unload handler tails.
+            let mut defs = crate::compile::compile_to_defs_state(&outcome.new_state);
+            defs.push(("compile".to_string(), ast::Func::Platform("compile".to_string())));
+            defs.push(("apply".to_string(), ast::Func::Platform("apply_command".to_string())));
+            defs.push(("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())));
+            defs.push(("audit".to_string(), ast::Func::Platform("audit".to_string())));
+            let new_d = ast::defs_to_state(&defs, &outcome.new_state);
+
+            let delta = ast::diff_cells(state, &new_d);
+
+            let mut data = hashbrown::HashMap::new();
+            data.insert("name".to_string(), name.to_string());
+            data.insert(
+                "removedNouns".to_string(),
+                outcome.removed.removed_nouns.join(","),
+            );
+            data.insert(
+                "removedFactTypes".to_string(),
+                outcome.removed.removed_fact_types.join(","),
+            );
+            data.insert(
+                "removedDerivations".to_string(),
+                outcome.removed.removed_derivations.join(","),
+            );
+            data.insert(
+                "addedNouns".to_string(),
+                outcome.added.added_nouns.join(","),
+            );
+            data.insert(
+                "addedFactTypes".to_string(),
+                outcome.added.added_fact_types.join(","),
+            );
+            data.insert(
+                "addedDerivations".to_string(),
+                outcome.added.added_derivations.join(","),
+            );
+
+            let derived_count = outcome.removed.removed_nouns.len()
+                + outcome.removed.removed_fact_types.len()
+                + outcome.removed.removed_derivations.len()
+                + outcome.added.added_nouns.len()
+                + outcome.added.added_fact_types.len()
+                + outcome.added.added_derivations.len();
+
+            CommandResult {
+                entities: vec![EntityResult {
+                    id: format!("reading:{}", name),
+                    entity_type: "ReadingReloaded".to_string(),
+                    data,
+                }],
+                status: None,
+                transitions: vec![],
+                navigation: vec![],
+                violations: vec![],
+                derived_count,
+                rejected: false,
+                state: delta,
+            }
+        }
+        Err(err) => {
+            let violations = match err {
+                ReloadError::Disallowed => vec![crate::types::Violation {
+                    constraint_id: "reload_reading.disallowed".to_string(),
+                    constraint_text: "runtime reading reload is disallowed by host policy".to_string(),
+                    detail: "the host did not enable runtime ReloadReading".to_string(),
+                    alethic: true,
+                }],
+                ReloadError::InvalidName(msg) => vec![crate::types::Violation {
+                    constraint_id: "reload_reading.invalid_name".to_string(),
+                    constraint_text: "reading name failed sanitization".to_string(),
+                    detail: msg,
+                    alethic: true,
+                }],
+                ReloadError::EmptyBody => vec![crate::types::Violation {
+                    constraint_id: "reload_reading.empty_body".to_string(),
+                    constraint_text: "reading body is empty".to_string(),
+                    detail: "reloading an empty body would not add any cells; pass at least one statement".to_string(),
+                    alethic: true,
+                }],
+                ReloadError::UnloadFailed(unload_err) => match unload_err {
+                    UnloadError::Disallowed => vec![crate::types::Violation {
+                        constraint_id: "reload_reading.unload_failed".to_string(),
+                        constraint_text: "unload step rejected (host policy)".to_string(),
+                        detail: "the host did not enable runtime UnloadReading; reload cannot proceed".to_string(),
+                        alethic: true,
+                    }],
+                    UnloadError::InvalidName(msg) => vec![crate::types::Violation {
+                        constraint_id: "reload_reading.unload_failed".to_string(),
+                        constraint_text: "unload step rejected: invalid name".to_string(),
+                        detail: msg,
+                        alethic: true,
+                    }],
+                    UnloadError::ManifestMissing(missing_name) => vec![crate::types::Violation {
+                        // Defensive: reload_reading treats ManifestMissing
+                        // as a fall-through to first-time-load and never
+                        // surfaces it as an UnloadFailed. This branch is
+                        // unreachable today; pinned for forward-compat
+                        // if the core's policy ever changes.
+                        constraint_id: "reload_reading.unload_failed".to_string(),
+                        constraint_text: "unload step rejected: manifest missing".to_string(),
+                        detail: format!("no _loaded_reading:{} cell found", missing_name),
+                        alethic: true,
+                    }],
+                    UnloadError::NotImplemented => vec![crate::types::Violation {
+                        constraint_id: "reload_reading.unload_failed".to_string(),
+                        constraint_text: "unload step rejected: policy not implemented".to_string(),
+                        detail: "Migrate unload policy is stubbed".to_string(),
+                        alethic: true,
+                    }],
+                },
+                ReloadError::LoadFailed(load_err) => match load_err {
+                    LoadError::Disallowed => vec![crate::types::Violation {
+                        constraint_id: "reload_reading.load_failed".to_string(),
+                        constraint_text: "load step rejected (host policy)".to_string(),
+                        detail: "the host did not enable runtime LoadReading; reload rolls back".to_string(),
+                        alethic: true,
+                    }],
+                    LoadError::EmptyBody => vec![crate::types::Violation {
+                        constraint_id: "reload_reading.load_failed".to_string(),
+                        constraint_text: "load step rejected: empty body".to_string(),
+                        detail: "reload body must contain at least one statement".to_string(),
+                        alethic: true,
+                    }],
+                    LoadError::InvalidName(msg) => vec![crate::types::Violation {
+                        constraint_id: "reload_reading.load_failed".to_string(),
+                        constraint_text: "load step rejected: invalid name".to_string(),
+                        detail: msg,
+                        alethic: true,
+                    }],
+                    LoadError::ParseError(msg) => vec![crate::types::Violation {
+                        constraint_id: "reload_reading.load_failed".to_string(),
+                        constraint_text: "load step rejected: FORML 2 parse error".to_string(),
+                        detail: msg,
+                        alethic: true,
+                    }],
+                    LoadError::DeonticViolation(diags) => diags
+                        .into_iter()
+                        .map(|d| crate::types::Violation {
+                            constraint_id: "reload_reading.load_failed".to_string(),
+                            constraint_text: d.reading.clone(),
+                            detail: d.message.clone(),
+                            alethic: true,
+                        })
+                        .collect(),
+                },
+                ReloadError::NotImplemented => vec![crate::types::Violation {
+                    constraint_id: "reload_reading.not_implemented".to_string(),
+                    constraint_text: "requested ReloadPolicy is not implemented".to_string(),
+                    detail: "MigrateFacts policy is reserved; use replace-all for now".to_string(),
+                    alethic: true,
+                }],
+            };
+            CommandResult {
+                entities: vec![],
+                status: None,
+                transitions: vec![],
+                navigation: vec![],
+                violations,
+                derived_count: 0,
+                rejected: true,
+                state: ast::Object::phi(),
+            }
+        }
+    }
+}
+
 // -- Helpers ----------------------------------------------------------
 
 /// HATEOAS as ρ-application (Theorem 4a)
@@ -2364,6 +2601,150 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             .violations
             .iter()
             .any(|v| v.constraint_id == "unload_reading.not_implemented"));
+    }
+
+    // ── #557 Command::ReloadReading ────────────────────────────────
+
+    /// Round trip: load A, then reload A with a different body. The
+    /// reload reports both the removed and added cells and emits a
+    /// `ReadingReloaded` envelope.
+    #[test]
+    fn reload_reading_round_trip_via_command() {
+        let (def_map, _state) = setup_order_defs();
+        let load_cmd = Command::LoadReading {
+            name: "catalog".to_string(),
+            body: "Product(.SKU) is an entity type.\n".to_string(),
+            sender: None,
+            signature: None,
+        };
+        let load_result = apply_command_defs(&def_map, &load_cmd, &def_map);
+        assert!(!load_result.rejected, "load must succeed");
+        let post_load_d = ast::merge_delta(&def_map, &load_result.state);
+
+        let reload_cmd = Command::ReloadReading {
+            name: "catalog".to_string(),
+            body: "Category(.Name) is an entity type.\n".to_string(),
+            policy: None,
+            sender: None,
+            signature: None,
+        };
+        let reload_result = apply_command_defs(&post_load_d, &reload_cmd, &post_load_d);
+        assert!(!reload_result.rejected, "reload must succeed");
+        assert_eq!(reload_result.entities[0].entity_type, "ReadingReloaded");
+        assert_eq!(reload_result.entities[0].data["name"], "catalog");
+        assert_eq!(reload_result.entities[0].data["removedNouns"], "Product");
+        assert_eq!(reload_result.entities[0].data["addedNouns"], "Category");
+    }
+
+    /// First-time reload (no manifest) falls through to load and
+    /// emits `ReadingReloaded` with empty `removedNouns`. Pins the
+    /// fall-through behavior at the command boundary.
+    #[test]
+    fn reload_reading_first_time_load_via_command() {
+        let (def_map, _state) = setup_order_defs();
+        let cmd = Command::ReloadReading {
+            name: "catalog".to_string(),
+            body: "Product(.SKU) is an entity type.\n".to_string(),
+            policy: None,
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &def_map);
+        assert!(!result.rejected, "first-time-reload must succeed");
+        assert_eq!(result.entities[0].entity_type, "ReadingReloaded");
+        assert_eq!(result.entities[0].data["removedNouns"], "");
+        assert_eq!(result.entities[0].data["addedNouns"], "Product");
+    }
+
+    /// Empty body rejects with `reload_reading.empty_body`.
+    #[test]
+    fn reload_reading_empty_body_rejects() {
+        let (def_map, state) = setup_order_defs();
+        let cmd = Command::ReloadReading {
+            name: "catalog".to_string(),
+            body: "".to_string(),
+            policy: None,
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &state);
+        assert!(result.rejected);
+        assert!(result
+            .violations
+            .iter()
+            .any(|v| v.constraint_id == "reload_reading.empty_body"));
+        assert_eq!(result.state, ast::Object::phi());
+    }
+
+    /// Empty name rejects with `reload_reading.invalid_name`.
+    #[test]
+    fn reload_reading_empty_name_rejects() {
+        let (def_map, state) = setup_order_defs();
+        let cmd = Command::ReloadReading {
+            name: "".to_string(),
+            body: "Product(.SKU) is an entity type.\n".to_string(),
+            policy: None,
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &state);
+        assert!(result.rejected);
+        assert!(result
+            .violations
+            .iter()
+            .any(|v| v.constraint_id == "reload_reading.invalid_name"));
+    }
+
+    /// Parse error in the new body rejects with
+    /// `reload_reading.load_failed` and emits no state delta —
+    /// atomicity contract at the command boundary.
+    #[test]
+    fn reload_reading_parse_error_rolls_back() {
+        let (def_map, _state) = setup_order_defs();
+        // Pre-load the reading.
+        let load_cmd = Command::LoadReading {
+            name: "catalog".to_string(),
+            body: "Product(.SKU) is an entity type.\n".to_string(),
+            sender: None,
+            signature: None,
+        };
+        let load_result = apply_command_defs(&def_map, &load_cmd, &def_map);
+        let post_load_d = ast::merge_delta(&def_map, &load_result.state);
+
+        let reload_cmd = Command::ReloadReading {
+            name: "catalog".to_string(),
+            body: "each(.X) is an entity type.\n".to_string(),
+            policy: None,
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&post_load_d, &reload_cmd, &post_load_d);
+        assert!(result.rejected);
+        assert!(result
+            .violations
+            .iter()
+            .any(|v| v.constraint_id == "reload_reading.load_failed"));
+        assert_eq!(result.state, ast::Object::phi(), "rejection emits no state delta");
+    }
+
+    /// MigrateFacts policy is stubbed: rejects with
+    /// `reload_reading.not_implemented`.
+    #[test]
+    fn reload_reading_migrate_facts_not_implemented() {
+        let (def_map, state) = setup_order_defs();
+        let cmd = Command::ReloadReading {
+            name: "catalog".to_string(),
+            body: "Product(.SKU) is an entity type.\n".to_string(),
+            policy: Some("migrate-facts".to_string()),
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &state);
+        assert!(result.rejected);
+        assert!(result
+            .violations
+            .iter()
+            .any(|v| v.constraint_id == "reload_reading.not_implemented"));
     }
 
     /// #35 regression: creating an Order with a customer field must NOT

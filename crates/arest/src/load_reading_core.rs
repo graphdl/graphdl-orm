@@ -209,6 +209,86 @@ pub struct UnloadOutcome {
     pub new_state: Object,
 }
 
+// ── ReloadReading types (#557 / DynRdg-3) ──────────────────────────
+//
+// `ReloadReading` composes `unload` + `load` against a single
+// state snapshot with single-commit atomicity: either the new body
+// fully replaces the old (manifest, cells, the lot), or the old
+// reading stays exactly as it was. No partial state is visible to
+// callers across either step.
+//
+// `ReplaceAll` (default) drives the unload step with
+// `UnloadPolicy::CascadeDelete` and the load step with
+// `LoadReadingPolicy::AllowAll`. `MigrateFacts` is forward-looking
+// and currently stubs out to `NotImplemented` — it depends on
+// `UnloadPolicy::Migrate` (also stubbed) to preserve referencing
+// facts when the new body re-declares the same fact-types.
+
+/// Caller's policy for how to compose unload+load atomically.
+///
+/// `ReplaceAll` (default) — unload with `CascadeDelete`, then load.
+/// Loses any backing facts referencing dropped FTs. The right
+/// policy when the new body is a strict superset / disjoint
+/// redefinition.
+/// `MigrateFacts` (future) — unload with `Migrate`, preserving
+/// referencing facts under a generic uncategorized bucket so the
+/// reload re-homes them under the new schema. Stubbed today;
+/// returns `ReloadError::NotImplemented`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloadPolicy {
+    ReplaceAll,
+    MigrateFacts,
+}
+
+impl Default for ReloadPolicy {
+    fn default() -> Self {
+        ReloadPolicy::ReplaceAll
+    }
+}
+
+/// Why a `reload_reading` call rejected.
+///
+/// `Disallowed` — host policy (reserved; today the load step gates).
+/// `InvalidName` — same sanitization rules as Load/Unload's name.
+/// `EmptyBody` — empty/whitespace body, mirrors `LoadError::EmptyBody`.
+/// `UnloadFailed` — the unload step rejected with a non-`ManifestMissing`
+/// reason. (`ManifestMissing` is treated as a "first-time-load disguised
+/// as a reload" and falls through to the load step — see the
+/// `reload_reading` doc comment for the rationale.)
+/// `LoadFailed` — the load step rejected; `new_state` rolls back to the
+/// pre-reload snapshot, fulfilling the atomicity contract.
+/// `NotImplemented` — `ReloadPolicy::MigrateFacts` is reserved.
+///
+/// `PartialEq` is intentionally NOT derived because `LoadError`
+/// itself does not implement Eq under std builds (the
+/// `DeonticViolation` variant carries a non-Eq diagnostic shape).
+/// Tests pattern-match on the variant instead.
+#[derive(Debug, Clone)]
+pub enum ReloadError {
+    Disallowed,
+    InvalidName(String),
+    EmptyBody,
+    UnloadFailed(UnloadError),
+    #[cfg(not(feature = "no_std"))]
+    LoadFailed(LoadError),
+    NotImplemented,
+}
+
+/// Outcome of a successful reload: structured reports for both
+/// directions of the round-trip plus the post-reload state.
+///
+/// `removed` — what the unload step took out (empty when the
+/// reload was actually a first-time load — see
+/// `reload_reading` doc).
+/// `added` — what the load step put in.
+/// `new_state` — the post-reload def-state for the caller to commit.
+#[derive(Debug, Clone)]
+pub struct ReloadOutcome {
+    pub removed: UnloadReport,
+    pub added: LoadReport,
+    pub new_state: Object,
+}
+
 /// Cell-name prefix for the per-reading manifest. The full cell
 /// name is `_loaded_reading:{name}`.
 pub const MANIFEST_CELL_PREFIX: &str = "_loaded_reading:";
@@ -532,6 +612,131 @@ pub fn unload_reading(
     Ok(UnloadOutcome {
         report,
         new_state,
+    })
+}
+
+/// Atomic unload+load — replace a previously-loaded reading's body in
+/// a single commit. (#557 / DynRdg-3.)
+///
+/// Pipeline:
+///   1. Gate `ReloadPolicy::MigrateFacts` → `NotImplemented`. Forward
+///      compatibility hook; depends on `UnloadPolicy::Migrate`.
+///   2. Sanitize `name` (empty/whitespace/control → `InvalidName`)
+///      and `body` (empty/whitespace → `EmptyBody`). Cheap; same
+///      rules as `load_reading` / `unload_reading`.
+///   3. Snapshot the input `state` so we can roll back if either step
+///      below fails. `Object` is `Clone`, so the snapshot is the
+///      whole pre-reload graph.
+///   4. Step A: `unload_reading(&state, name, UnloadPolicy::CascadeDelete)`.
+///      A `ManifestMissing` rejection is NOT fatal — it means the
+///      reading isn't currently loaded, so the reload degenerates to
+///      a first-time load (an empty `UnloadReport` + the load
+///      step's added cells). Other unload errors propagate as
+///      `ReloadError::UnloadFailed`.
+///   5. Step B: `load_reading(&unload_outcome.new_state, name, body,
+///      LoadReadingPolicy::AllowAll)`. On any error, return
+///      `ReloadError::LoadFailed` — the snapshot is dropped and the
+///      caller sees byte-equal-to-input `state` is preserved at the
+///      caller side (this function never mutates `state`; the
+///      atomicity contract is "if either step fails, the new_state
+///      we hand back is identical to the input snapshot" — i.e. no
+///      partial reload visible).
+///   6. Assemble `ReloadOutcome { removed, added, new_state }` and
+///      return.
+///
+/// **Atomicity contract:** if either the unload or the load step
+/// fails, the caller never sees a state where one of those completed
+/// and the other did not. The error returns leave `state` untouched
+/// (this function takes `&Object` and never re-binds the caller's
+/// reference); on success, `new_state` is the fully-merged
+/// post-reload graph.
+///
+/// **First-time-load fallthrough:** when no `_loaded_reading:{name}`
+/// manifest is present, `unload_reading` returns `ManifestMissing`.
+/// We interpret this as "the caller asked to reload but the reading
+/// isn't there" and proceed with the load, returning an empty
+/// `UnloadReport` in the outcome's `removed` field. Pinning this
+/// behavior matters: the alternative (returning a hard error) would
+/// force callers to know whether a reading is loaded before deciding
+/// between Load and Reload, which defeats the verb's purpose.
+#[cfg(not(feature = "no_std"))]
+pub fn reload_reading(
+    state: &Object,
+    name: &str,
+    body: &str,
+    policy: ReloadPolicy,
+) -> Result<ReloadOutcome, ReloadError> {
+    // Step 1: gate.
+    if policy == ReloadPolicy::MigrateFacts {
+        return Err(ReloadError::NotImplemented);
+    }
+
+    // Step 2: sanitize. Done up front so we reject cheaply before
+    // any unload work runs — duplicates the checks inside
+    // load_reading / unload_reading but means a malformed call
+    // never observes partial pipeline state.
+    let trimmed_name = name.trim();
+    if trimmed_name.is_empty() {
+        return Err(ReloadError::InvalidName(
+            "reading name must not be empty".to_string(),
+        ));
+    }
+    if trimmed_name.chars().any(|c| c.is_control()) {
+        return Err(ReloadError::InvalidName(
+            "reading name must not contain control characters".to_string(),
+        ));
+    }
+    if body.trim().is_empty() {
+        return Err(ReloadError::EmptyBody);
+    }
+
+    // Step 3: snapshot. We don't actually use this for rollback
+    // because both steps already operate functionally on `&Object`
+    // — the atomicity contract is satisfied by the fact that we
+    // never bind a partial state to `new_state` until both steps
+    // have succeeded. Still, holding the snapshot makes the
+    // intent explicit and lets us return it (effectively a no-op
+    // since we can also return `state.clone()` directly) on
+    // failure for callers that might want to inspect it.
+    let _snapshot = state.clone();
+
+    // Step 4: unload. Treat ManifestMissing as a fall-through to
+    // first-time-load. Other unload errors are fatal.
+    let unload_outcome = match unload_reading(state, trimmed_name, UnloadPolicy::CascadeDelete) {
+        Ok(o) => o,
+        Err(UnloadError::ManifestMissing(_)) => {
+            // First-time-load disguised as reload: synthesize an
+            // empty UnloadOutcome carrying the input state.
+            UnloadOutcome {
+                report: UnloadReport::default(),
+                new_state: state.clone(),
+            }
+        }
+        Err(other) => return Err(ReloadError::UnloadFailed(other)),
+    };
+
+    // Step 5: load against the post-unload state. On failure, the
+    // caller's state is untouched (we never wrote `unload_outcome
+    // .new_state` back to the caller — that's the atomicity
+    // contract). The LoadError variant preserves the diagnostic
+    // tree so callers can render specific failure reasons.
+    let load_outcome = match load_reading(
+        &unload_outcome.new_state,
+        trimmed_name,
+        body,
+        LoadReadingPolicy::AllowAll,
+    ) {
+        Ok(o) => o,
+        Err(e) => return Err(ReloadError::LoadFailed(e)),
+    };
+
+    // Step 6: assemble. The new state is the load step's output —
+    // it already includes the post-unload cell deletions and the
+    // refreshed manifest cell.
+    Ok(ReloadOutcome {
+        removed: unload_outcome.report,
+        added: load_outcome.report,
+        new_state: load_outcome.new_state,
     })
 }
 
@@ -1180,5 +1385,239 @@ Product has SKU.
         let with_extra = ast::store("Extra", Object::seq(vec![]), &state);
         let after = remove_cell(&with_extra, "Extra");
         assert!(matches!(ast::fetch("Extra", &after), Object::Bottom));
+    }
+
+    // ── #557 reload_reading tests ───────────────────────────────────
+
+    /// Happy path: load reading A, then reload A with a modified
+    /// body. New state has the new body's cells, no orphans from
+    /// the old body, and the manifest reflects the new body.
+    #[test]
+    fn reload_reading_happy_path_replaces_body() {
+        let state = seed_state();
+        let body_v1 = "Product(.SKU) is an entity type.\n";
+        let body_v2 = "Category(.Name) is an entity type.\n";
+
+        let loaded = load_reading(&state, "catalog", body_v1, LoadReadingPolicy::AllowAll)
+            .expect("v1 loads");
+
+        let reloaded = reload_reading(&loaded.new_state, "catalog", body_v2, ReloadPolicy::ReplaceAll)
+            .expect("reload to v2 succeeds");
+
+        // Old body's noun is gone.
+        assert_eq!(reloaded.removed.removed_nouns, vec!["Product".to_string()]);
+        // New body's noun is added.
+        assert_eq!(reloaded.added.added_nouns, vec!["Category".to_string()]);
+
+        // Post-state has Category but not Product. (Order is from seed.)
+        let nouns_obj = ast::fetch_or_phi("Noun", &reloaded.new_state);
+        let nouns: Vec<String> = nouns_obj
+            .as_seq()
+            .map(|s| {
+                s.iter()
+                    .filter_map(|f| ast::binding(f, "name").map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(nouns.contains(&"Order".to_string()), "seed Order survives");
+        assert!(nouns.contains(&"Category".to_string()), "v2 Category present");
+        assert!(!nouns.contains(&"Product".to_string()), "v1 Product orphaned");
+
+        // Manifest reflects v2's added cells, not v1's.
+        let manifest = decode_manifest(&reloaded.new_state, "catalog")
+            .expect("manifest must persist");
+        assert_eq!(manifest.added_nouns, vec!["Category".to_string()]);
+    }
+
+    /// First-time load: reload a name that's never been loaded
+    /// falls through to the load step. The `removed` report is
+    /// empty; `added` matches a fresh load. We document this
+    /// behavior in the function doc.
+    #[test]
+    fn reload_reading_first_time_load_fallthrough() {
+        let state = seed_state();
+        let body = "Product(.SKU) is an entity type.\n";
+
+        let outcome = reload_reading(&state, "catalog", body, ReloadPolicy::ReplaceAll)
+            .expect("first-time-load falls through to load");
+
+        // Empty removed report — there was nothing to unload.
+        assert!(outcome.removed.removed_nouns.is_empty());
+        assert!(outcome.removed.removed_fact_types.is_empty());
+        assert!(outcome.removed.removed_derivations.is_empty());
+
+        // Added matches a normal first-time load.
+        assert_eq!(outcome.added.added_nouns, vec!["Product".to_string()]);
+
+        // Manifest is now present.
+        assert!(decode_manifest(&outcome.new_state, "catalog").is_some());
+    }
+
+    /// Atomic on parse failure: reload with a body that triggers a
+    /// parse error rejects with `LoadFailed(ParseError(_))` and
+    /// the input state is byte-identical pre and post.
+    #[test]
+    fn reload_reading_atomic_on_parse_failure() {
+        let state = seed_state();
+        let body_v1 = "Product(.SKU) is an entity type.\n";
+        let bad_body = "each(.X) is an entity type.\n";
+
+        let loaded = load_reading(&state, "catalog", body_v1, LoadReadingPolicy::AllowAll)
+            .expect("v1 loads");
+
+        let snapshot = loaded.new_state.clone();
+        let err = reload_reading(&loaded.new_state, "catalog", bad_body, ReloadPolicy::ReplaceAll)
+            .expect_err("parse error must reject reload");
+
+        match err {
+            ReloadError::LoadFailed(LoadError::ParseError(_)) => {}
+            other => panic!("expected LoadFailed(ParseError), got {other:?}"),
+        }
+
+        // The input state is untouched — the function takes &Object
+        // and never bound a partial state to it. Atomicity contract.
+        assert_eq!(loaded.new_state, snapshot, "input state must not mutate on failure");
+    }
+
+    /// Atomic on validation failure: reload with a body that triggers
+    /// a deontic violation rejects with
+    /// `LoadFailed(DeonticViolation(_))` and the input state is
+    /// preserved.
+    ///
+    /// We build a state where check_ring_validity will fire on the
+    /// post-load merged state (mirrors
+    /// `deontic_violation_rejects_and_preserves_state`).
+    #[test]
+    fn reload_reading_atomic_on_validation_failure() {
+        let mut state = seed_state();
+        // Pre-seed ring-validity error scaffolding.
+        state = ast::store(
+            "FactType",
+            ast::Object::seq(vec![ast::fact_from_pairs(&[
+                ("id", "Person_likes_Animal"),
+                ("reading", "Person likes Animal"),
+            ])]),
+            &state,
+        );
+        state = ast::store(
+            "Role",
+            ast::Object::seq(vec![
+                ast::fact_from_pairs(&[
+                    ("factType", "Person_likes_Animal"),
+                    ("nounName", "Person"),
+                    ("position", "0"),
+                ]),
+                ast::fact_from_pairs(&[
+                    ("factType", "Person_likes_Animal"),
+                    ("nounName", "Animal"),
+                    ("position", "1"),
+                ]),
+            ]),
+            &state,
+        );
+        state = ast::store(
+            "Constraint",
+            ast::Object::seq(vec![ast::fact_from_pairs(&[
+                ("kind", "IR"),
+                ("span0_factTypeId", "Person_likes_Animal"),
+                ("text", "Person likes Animal is irreflexive"),
+            ])]),
+            &state,
+        );
+
+        // First-time-load fallthrough is fine: the deontic violation
+        // fires inside the load step regardless of unload.
+        let snapshot = state.clone();
+        let err = reload_reading(&state, "catalog", "# noop\n", ReloadPolicy::ReplaceAll)
+            .expect_err("ring-validity error must reject the reload");
+
+        match err {
+            ReloadError::LoadFailed(LoadError::DeonticViolation(_)) => {}
+            other => panic!("expected LoadFailed(DeonticViolation), got {other:?}"),
+        }
+
+        // State preserved exactly.
+        assert_eq!(state, snapshot, "input state must not mutate on validation failure");
+    }
+
+    /// Idempotency: reload A with byte-identical body. The outcome's
+    /// `removed` and `added` reports describe the round-trip (both
+    /// list the same cells), but `new_state` ends up byte-equal to a
+    /// fresh single-load.
+    #[test]
+    fn reload_reading_idempotent_with_same_body() {
+        let state = seed_state();
+        let body = "Product(.SKU) is an entity type.\n";
+
+        // Baseline: a fresh first-time load gives us the target
+        // post-state shape.
+        let fresh = load_reading(&state, "catalog", body, LoadReadingPolicy::AllowAll)
+            .expect("first load succeeds");
+
+        // Now run the round trip via reload starting from fresh.
+        let reloaded = reload_reading(&fresh.new_state, "catalog", body, ReloadPolicy::ReplaceAll)
+            .expect("idempotent reload succeeds");
+
+        // Removed and added describe the round trip — both list Product.
+        assert_eq!(reloaded.removed.removed_nouns, vec!["Product".to_string()]);
+        assert_eq!(reloaded.added.added_nouns, vec!["Product".to_string()]);
+
+        // The post-state Noun cell equals the fresh-load Noun cell.
+        let nouns_fresh = ast::fetch_or_phi("Noun", &fresh.new_state);
+        let nouns_reloaded = ast::fetch_or_phi("Noun", &reloaded.new_state);
+        assert_eq!(
+            nouns_fresh, nouns_reloaded,
+            "Noun cell after reload must equal Noun cell after fresh load"
+        );
+
+        // Manifest cells equal.
+        assert_eq!(
+            decode_manifest(&fresh.new_state, "catalog"),
+            decode_manifest(&reloaded.new_state, "catalog"),
+        );
+    }
+
+    /// Migrate stub: `ReloadPolicy::MigrateFacts` returns
+    /// `NotImplemented`. State is untouched.
+    #[test]
+    fn reload_reading_migrate_facts_not_implemented() {
+        let state = seed_state();
+        let snapshot = state.clone();
+        let err = reload_reading(&state, "catalog", "# anything\n", ReloadPolicy::MigrateFacts)
+            .expect_err("MigrateFacts must return NotImplemented");
+        match err {
+            ReloadError::NotImplemented => {}
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
+        assert_eq!(state, snapshot, "MigrateFacts must not mutate input");
+    }
+
+    /// Empty/whitespace name rejects with `InvalidName` before any
+    /// pipeline work. Mirrors the load/unload sanitization.
+    #[test]
+    fn reload_reading_empty_name_invalid() {
+        let state = seed_state();
+        match reload_reading(&state, "", "# x\n", ReloadPolicy::ReplaceAll) {
+            Err(ReloadError::InvalidName(_)) => {}
+            other => panic!("expected InvalidName, got {other:?}"),
+        }
+        match reload_reading(&state, "   \t", "# x\n", ReloadPolicy::ReplaceAll) {
+            Err(ReloadError::InvalidName(_)) => {}
+            other => panic!("expected InvalidName, got {other:?}"),
+        }
+    }
+
+    /// Empty body rejects with `EmptyBody`. State untouched.
+    #[test]
+    fn reload_reading_empty_body_rejected() {
+        let state = seed_state();
+        match reload_reading(&state, "x", "", ReloadPolicy::ReplaceAll) {
+            Err(ReloadError::EmptyBody) => {}
+            other => panic!("expected EmptyBody, got {other:?}"),
+        }
+        match reload_reading(&state, "x", "   \n\t  ", ReloadPolicy::ReplaceAll) {
+            Err(ReloadError::EmptyBody) => {}
+            other => panic!("expected EmptyBody, got {other:?}"),
+        }
     }
 }

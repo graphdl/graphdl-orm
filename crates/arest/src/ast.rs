@@ -2842,6 +2842,14 @@ fn command_field_overflow(command: &crate::command::Command) -> Option<&'static 
             match signature.as_deref().map(over).unwrap_or(false) { true => return Some("signature"), false => {} }
             None
         }
+        Command::ReloadReading { name, body, policy, sender, signature } => {
+            match over(name) { true => return Some("name"), false => {} }
+            match over(body) { true => return Some("body"), false => {} }
+            match policy.as_deref().map(over).unwrap_or(false) { true => return Some("policy"), false => {} }
+            match sender.as_deref().map(over).unwrap_or(false) { true => return Some("sender"), false => {} }
+            match signature.as_deref().map(over).unwrap_or(false) { true => return Some("signature"), false => {} }
+            None
+        }
     }
 }
 
