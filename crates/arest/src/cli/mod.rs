@@ -81,3 +81,10 @@ pub mod wine_launch;
 // today (per-target adapter job, see #575/#578).
 #[cfg(not(feature = "no_std"))]
 pub mod entropy_host;
+// `reload` (#561) — `arest reload <file.md>` runtime reading load.
+// Routes through `crate::load_reading_core::load_reading` with
+// `LoadReadingPolicy::AllowAll` and persists the merged state to the
+// configured `--db`. Companion `arest watch <dir>` lands in a follow-up
+// commit and shares the same `dispatch_with_state` core.
+#[cfg(not(feature = "no_std"))]
+pub mod reload;
