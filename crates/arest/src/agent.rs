@@ -281,6 +281,64 @@ mod tests {
         assert!(resolve_agent_verb(&s, "noprompt").is_none());
     }
 
+    /// Worked end-to-end test: parse the actual `readings/templates/
+    /// agents.md` via `parse_forml2`, hand-stage one Verb /
+    /// Verb_invokes_Agent_Definition / Agent_Definition_uses_Model /
+    /// Agent_Definition_has_Prompt instance row, and verify the
+    /// walker's cell-name guesses match the parser's real output.
+    /// Acts as a tripwire — if the parser ever changes the canonical
+    /// cell-naming convention (`Reading_text_with_underscores`),
+    /// this test catches it before production handlers silently
+    /// fail to resolve verbs.
+    #[test]
+    fn resolve_against_real_agents_metamodel_cells() {
+        let agents_md = include_str!("../../../readings/templates/agents.md");
+        let parsed = crate::parse_forml2::parse_to_state(agents_md)
+            .expect("agents.md must parse");
+
+        // Hand-stage one instance row in each of the four cells the
+        // walker reads. The cell *names* come from the parser's
+        // canonical projection of the reading text — if the parser
+        // emits a different name, this test fails noisily.
+        let s = crate::ast::cell_push(
+            "Verb",
+            crate::ast::fact_from_pairs(&[
+                ("id", "verb-extract"),
+                ("name", "extract"),
+            ]),
+            &parsed,
+        );
+        let s = crate::ast::cell_push(
+            "Verb_invokes_Agent_Definition",
+            crate::ast::fact_from_pairs(&[
+                ("Verb", "verb-extract"),
+                ("Agent Definition", "agent-extractor"),
+            ]),
+            &s,
+        );
+        let s = crate::ast::cell_push(
+            "Agent_Definition_uses_Model",
+            crate::ast::fact_from_pairs(&[
+                ("Agent Definition", "agent-extractor"),
+                ("Model", "claude-sonnet-4.6"),
+            ]),
+            &s,
+        );
+        let s = crate::ast::cell_push(
+            "Agent_Definition_has_Prompt",
+            crate::ast::fact_from_pairs(&[
+                ("Agent Definition", "agent-extractor"),
+                ("Prompt", "Extract one fact per claim. Be terse."),
+            ]),
+            &s,
+        );
+
+        let binding = resolve_agent_verb(&s, "extract")
+            .expect("walker resolves against real parsed agents.md");
+        assert_eq!(binding.model_code, "claude-sonnet-4.6");
+        assert_eq!(binding.prompt, "Extract one fact per claim. Be terse.");
+    }
+
     #[test]
     fn record_completion_writes_all_four_facts() {
         // Caller supplies (agent_id, input, output, timestamp); helper
