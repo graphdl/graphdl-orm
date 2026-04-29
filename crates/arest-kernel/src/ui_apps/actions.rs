@@ -980,21 +980,285 @@ fn next_states_for(sm_id: &str, state: &Object) -> Vec<String> {
 
 // ── Dispatch (action invocation → SYSTEM call) ────────────────────
 
+/// Look up a `default_args` entry by key. Returns the bound value
+/// or the empty string when the key is absent. Used by every
+/// `apply_*` helper below to extract the per-verb required args.
+fn arg(args: &[(String, String)], key: &str) -> String {
+    args.iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default()
+}
+
+/// Compute the post-state for `Apply create <noun>`. Pure function
+/// over `&Object` so tests can exercise the verb without touching
+/// the kernel SYSTEM singleton.
+///
+/// Args:
+///   * `noun` — required; the noun whose cell receives the new entity.
+///   * `id`   — optional; when present, the new entity carries this
+///              id binding; when absent, a synthetic `id` derived
+///              from the cell's current length is used so the
+///              creation is observable in tests.
+///
+/// Returns `Err` when the noun is missing/empty.
+pub fn apply_create(args: &[(String, String)], state: &Object) -> Result<Object, String> {
+    let noun = arg(args, "noun");
+    if noun.is_empty() {
+        return Err("missing noun".to_string());
+    }
+    // Derive an id when none was supplied. The action panel today
+    // only pre-binds `noun` for ApplyCreate (see `actions_for_root`
+    // / `actions_for_noun`); the future parameter editor will let
+    // the user fill in `id` + arbitrary fields. Synthetic id is
+    // `<noun>-<count>` so two successive creates against the same
+    // noun produce distinguishable rows the post-state assertions
+    // can pin down.
+    let supplied_id = arg(args, "id");
+    let id = if supplied_id.is_empty() {
+        let existing = ast::fetch_or_phi(&noun, state);
+        let n = existing.as_seq().map(|s| s.len()).unwrap_or(0);
+        format!("{noun}-{n}")
+    } else {
+        supplied_id
+    };
+    // Build a named-tuple entity carrying just the id binding. Same
+    // shape `handle_arest_create_for_slug` produces for an empty
+    // `data` body.
+    let entity = Object::seq(alloc::vec![Object::seq(alloc::vec![
+        Object::atom("id"),
+        Object::atom(&id),
+    ])]);
+    Ok(ast::cell_push(&noun, entity, state))
+}
+
+/// Compute the post-state for `Apply update <noun>::<id>`. Walks
+/// the noun's cell, finds the entity carrying `id`, and rewrites
+/// (or appends) every additional `(key, value)` arg as a binding.
+/// Args reserved for the dispatcher (`noun`, `id`) are skipped.
+///
+/// Returns `Err` when the noun/id are missing or no matching entity
+/// exists in the cell.
+pub fn apply_update(args: &[(String, String)], state: &Object) -> Result<Object, String> {
+    let noun = arg(args, "noun");
+    let id = arg(args, "id");
+    if noun.is_empty() {
+        return Err("missing noun".to_string());
+    }
+    if id.is_empty() {
+        return Err("missing id".to_string());
+    }
+    let cell = ast::fetch_or_phi(&noun, state);
+    let Some(rows) = cell.as_seq() else {
+        return Err(format!("noun {noun} not found"));
+    };
+    let mut updated_any = false;
+    let mut new_rows: Vec<Object> = Vec::with_capacity(rows.len());
+    for row in rows {
+        if ast::binding(row, "id") == Some(id.as_str()) {
+            let mut next = row.clone();
+            for (k, v) in args {
+                if k == "noun" || k == "id" {
+                    continue;
+                }
+                next = update_binding_inplace(&next, k, v);
+            }
+            new_rows.push(next);
+            updated_any = true;
+        } else {
+            new_rows.push(row.clone());
+        }
+    }
+    if !updated_any {
+        return Err(format!("entity {noun}::{id} not found"));
+    }
+    Ok(ast::store(&noun, Object::seq(new_rows), state))
+}
+
+/// Rewrite (or append) a binding on a named-tuple entity. Mirror of
+/// `crate::arest::hateoas::update_binding`, hand-rolled here because
+/// the hateoas helper is private. Identical semantics: replace the
+/// existing pair when `key` matches; otherwise push a new pair on
+/// the tail.
+fn update_binding_inplace(entity: &Object, key: &str, new_value: &str) -> Object {
+    let mut out: Vec<Object> = Vec::new();
+    let mut updated = false;
+    if let Some(pairs) = entity.as_seq() {
+        for pair in pairs {
+            if let Some(items) = pair.as_seq() {
+                if items.len() == 2 && items[0].as_atom() == Some(key) {
+                    out.push(Object::seq(alloc::vec![
+                        Object::atom(key),
+                        Object::atom(new_value),
+                    ]));
+                    updated = true;
+                    continue;
+                }
+            }
+            out.push(pair.clone());
+        }
+    }
+    if !updated {
+        out.push(Object::seq(alloc::vec![
+            Object::atom(key),
+            Object::atom(new_value),
+        ]));
+    }
+    Object::seq(out)
+}
+
+/// Compute the post-state for `Apply destroy <noun>::<id>`. Drops
+/// every row from the noun's cell whose `id` binding matches.
+/// Returns `Err` when no matching entity is present (so the caller
+/// can surface the miss instead of silently no-opping).
+pub fn apply_destroy(args: &[(String, String)], state: &Object) -> Result<Object, String> {
+    let noun = arg(args, "noun");
+    let id = arg(args, "id");
+    if noun.is_empty() {
+        return Err("missing noun".to_string());
+    }
+    if id.is_empty() {
+        return Err("missing id".to_string());
+    }
+    let cell = ast::fetch_or_phi(&noun, state);
+    let Some(rows) = cell.as_seq() else {
+        return Err(format!("noun {noun} not found"));
+    };
+    let before = rows.len();
+    let kept: Vec<Object> = rows
+        .iter()
+        .filter(|row| ast::binding(row, "id") != Some(id.as_str()))
+        .cloned()
+        .collect();
+    if kept.len() == before {
+        return Err(format!("entity {noun}::{id} not found"));
+    }
+    Ok(ast::store(&noun, Object::seq(kept), state))
+}
+
+/// Compute the post-state for the rich-shape `Transition` verb.
+/// Mirrors `arest::hateoas::handle_arest_transition` against the
+/// kernel-side cell shape `actions_for_instance` + `transitions_for_sm`
+/// emit (rich shape: `StateMachine_has_currentlyInStatus` +
+/// `Transition_is_from_Status` / `Transition_is_to_Status` +
+/// `Transition_is_triggered_by_Event_Type`).
+///
+/// Args:
+///   * `sm`   — required; the State Machine instance id.
+///   * `next` — required; the target Status the SM lands in.
+///
+/// Side effect: rewrites the SM's `currentlyInStatus` to `next`.
+/// Per-fact validation (does the rich shape say this transition is
+/// legal from the current Status?) happens in the action enumerator
+/// (`actions_for_instance` only emits legal outgoing transitions);
+/// the dispatcher trusts that filter and just commits the rewrite.
+/// This keeps the dispatcher's failure mode narrow: it errors only
+/// when the SM row itself is missing or the next-state arg is empty.
+pub fn apply_transition(args: &[(String, String)], state: &Object) -> Result<Object, String> {
+    let sm_id = arg(args, "sm");
+    let next = arg(args, "next");
+    if sm_id.is_empty() {
+        return Err("missing sm".to_string());
+    }
+    if next.is_empty() {
+        return Err("missing next".to_string());
+    }
+    let cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", state);
+    let Some(rows) = cell.as_seq() else {
+        return Err(format!("State Machine {sm_id} not found"));
+    };
+    let mut updated = false;
+    let mut new_rows: Vec<Object> = Vec::with_capacity(rows.len());
+    for row in rows {
+        if ast::binding_matches(row, "State Machine", &sm_id) {
+            new_rows.push(update_binding_inplace(row, "currentlyInStatus", &next));
+            updated = true;
+        } else {
+            new_rows.push(row.clone());
+        }
+    }
+    if !updated {
+        return Err(format!("State Machine {sm_id} not found"));
+    }
+    Ok(ast::store(
+        "StateMachine_has_currentlyInStatus",
+        Object::seq(new_rows),
+        state,
+    ))
+}
+
+/// Compute the post-state for `Store <name> <contents>`. Direct
+/// cell write — replaces the whole cell. The contents arg is parsed
+/// as a single-fact named-tuple from the remaining args (every
+/// (key, value) pair other than `name` becomes one role binding).
+///
+/// Returns `Err` when `name` is empty.
+pub fn apply_store(args: &[(String, String)], state: &Object) -> Result<Object, String> {
+    let name = arg(args, "name");
+    if name.is_empty() {
+        return Err("missing name".to_string());
+    }
+    // Synthesise a single fact from the remaining args. Empty when
+    // only `name` was bound — then Store writes an empty cell, which
+    // is the canonical "clear this cell" idiom.
+    let mut pairs: Vec<Object> = Vec::new();
+    for (k, v) in args {
+        if k == "name" {
+            continue;
+        }
+        pairs.push(Object::seq(alloc::vec![
+            Object::atom(k),
+            Object::atom(v),
+        ]));
+    }
+    let contents = if pairs.is_empty() {
+        Object::phi()
+    } else {
+        Object::seq(alloc::vec![Object::seq(pairs)])
+    };
+    Ok(ast::store(&name, contents, state))
+}
+
+/// Compute the post-state for `Apply remove fact <cell>#<idx>`.
+/// Drops the fact at index `idx` from the named cell.
+pub fn apply_remove_fact(args: &[(String, String)], state: &Object) -> Result<Object, String> {
+    let cell_name = arg(args, "cell");
+    let idx_str = arg(args, "fact");
+    if cell_name.is_empty() {
+        return Err("missing cell".to_string());
+    }
+    let idx: usize = idx_str
+        .parse()
+        .map_err(|_| format!("invalid fact index: {idx_str}"))?;
+    let cell = ast::fetch_or_phi(&cell_name, state);
+    let Some(rows) = cell.as_seq() else {
+        return Err(format!("cell {cell_name} not found"));
+    };
+    if idx >= rows.len() {
+        return Err(format!("fact index {idx} out of range"));
+    }
+    let kept: Vec<Object> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| if i == idx { None } else { Some(r.clone()) })
+        .collect();
+    Ok(ast::store(&cell_name, Object::seq(kept), state))
+}
+
 /// Dispatch a SystemAction against the in-kernel SYSTEM and return
 /// the result as a human-readable line for the REPL scrollback. This
 /// is the kernel-side translation of the action panel click into the
 /// existing `Func`-application path the legacy REPL uses.
 ///
-/// The dispatcher is intentionally narrow on the foundation slice:
-/// every verb resolves through `crate::system::with_state` + a
-/// single `ast::apply` (the same shape `system::apply_named` /
-/// `system::fetch_named` use). Verbs that mutate state (Apply*,
-/// Transition, Store) are no-ops on the foundation slice — they
-/// return a "would dispatch" annotation describing what the call
-/// would have done, so the REPL scrollback shows the user the
-/// effect without committing it. The full mutation path lands when
-/// the host-side `command::apply_command` becomes reachable from
-/// the kernel (#515+ wiring through Platform).
+/// Read-only verbs (Fetch / FetchOrPhi / Def) resolve through
+/// `crate::system::fetch_named`, the same path the wire uses.
+///
+/// Mutating verbs (#554) — Apply create / update / destroy /
+/// remove fact, Transition, Store — compute their post-state via
+/// the pure `apply_*` helpers above and commit through
+/// `crate::system::apply`. Errors (missing args, entity not found,
+/// invalid index) surface in the result line so the action panel /
+/// scrollback shows the user what went wrong without crashing.
 pub fn dispatch_action(action: &SystemAction) -> String {
     let summary = action.verb.canonical_text(&action.default_args);
     // #514: short-circuit blocked actions. The Slint side already
@@ -1009,12 +1273,7 @@ pub fn dispatch_action(action: &SystemAction) -> String {
         // Read-only verbs: actually dispatch through the kernel's
         // existing fetch path so the user sees real cell contents.
         SystemVerb::Fetch | SystemVerb::FetchOrPhi => {
-            let name = action
-                .default_args
-                .iter()
-                .find(|(k, _)| k == "name")
-                .map(|(_, v)| v.clone())
-                .unwrap_or_default();
+            let name = arg(&action.default_args, "name");
             if name.is_empty() {
                 return format!("[action] {summary} → (missing name)");
             }
@@ -1027,12 +1286,7 @@ pub fn dispatch_action(action: &SystemAction) -> String {
         // Def is a fetch into the def cell; same shape as Fetch but
         // explicit about the verb in the result line.
         SystemVerb::Def => {
-            let name = action
-                .default_args
-                .iter()
-                .find(|(k, _)| k == "name")
-                .map(|(_, v)| v.clone())
-                .unwrap_or_default();
+            let name = arg(&action.default_args, "name");
             if name.is_empty() {
                 return format!("[action] {summary} → (missing name)");
             }
@@ -1045,17 +1299,41 @@ pub fn dispatch_action(action: &SystemAction) -> String {
                 .unwrap_or_else(|_| format!("({} bytes)", bytes.len()));
             format!("[action] {summary} → def: {body}")
         }
-        // Mutating verbs: would-dispatch on the foundation slice.
-        // The verb survives the round-trip through Func::* primitives
-        // so a future commit can plumb `system::apply` here without
-        // changing the action enumeration shape.
+        // Mutating verbs (#554). Each branch:
+        //   1. Computes the post-state via the pure `apply_*` helper
+        //      under `crate::system::with_state` (read lock briefly).
+        //   2. Hands the post-state to `crate::system::apply` to
+        //      install + notify subscribers (which triggers the
+        //      action / nav / cell-render redraw on the next frame).
+        //   3. Surfaces success / failure in the scrollback line.
         SystemVerb::ApplyCreate
         | SystemVerb::ApplyUpdate
         | SystemVerb::ApplyDestroy
         | SystemVerb::ApplyRemoveFact
         | SystemVerb::Transition
         | SystemVerb::Store => {
-            format!("[action] {summary} → (would dispatch — foundation slice is read-only)")
+            let computed: Option<Result<Object, String>> =
+                crate::system::with_state(|st| match action.verb {
+                    SystemVerb::ApplyCreate => apply_create(&action.default_args, st),
+                    SystemVerb::ApplyUpdate => apply_update(&action.default_args, st),
+                    SystemVerb::ApplyDestroy => apply_destroy(&action.default_args, st),
+                    SystemVerb::ApplyRemoveFact => {
+                        apply_remove_fact(&action.default_args, st)
+                    }
+                    SystemVerb::Transition => apply_transition(&action.default_args, st),
+                    SystemVerb::Store => apply_store(&action.default_args, st),
+                    _ => Err("unreachable".to_string()),
+                });
+            match computed {
+                Some(Ok(new_state)) => match crate::system::apply(new_state) {
+                    Ok(()) => format!("[action] {summary} \u{2192} ok"),
+                    Err(e) => format!("[action] {summary} \u{2192} (apply failed: {e})"),
+                },
+                Some(Err(e)) => format!("[action] {summary} \u{2192} (error: {e})"),
+                None => {
+                    format!("[action] {summary} \u{2192} (system not initialised)")
+                }
+            }
         }
         // Platform / Native: dispatch path resolves the named
         // primitive through `Func::Platform(name)` / the Fn1 closure
@@ -1063,12 +1341,7 @@ pub fn dispatch_action(action: &SystemAction) -> String {
         // registries are empty by default, so this is structurally
         // identical to a fetch into a missing def cell.
         SystemVerb::Platform | SystemVerb::Native => {
-            let name = action
-                .default_args
-                .iter()
-                .find(|(k, _)| k == "name")
-                .map(|(_, v)| v.clone())
-                .unwrap_or_default();
+            let name = arg(&action.default_args, "name");
             // Construct the Func and apply it to phi against current
             // state to exercise the same dispatch path the wire uses.
             let _func = match action.verb {
@@ -1502,6 +1775,13 @@ mod tests {
 
     #[test]
     fn dispatch_action_produces_annotation_for_mutating_verbs() {
+        // #554 wired the mutating verbs through `system::apply`. The
+        // canonical verb form still appears in the result line; the
+        // post-action annotation is now "ok" on success or
+        // "(error: ...)" on a validation miss. We can't assert the
+        // success branch from a unit test that doesn't initialise
+        // SYSTEM, but the line still starts with `[action]` + the
+        // canonical verb form regardless of which branch fires.
         let action = SystemAction::new(
             SystemVerb::ApplyCreate,
             vec![("noun".to_string(), "File".to_string())],
@@ -1509,7 +1789,6 @@ mod tests {
         let line = dispatch_action(&action);
         assert!(line.contains("[action]"));
         assert!(line.contains("apply create File"));
-        assert!(line.contains("foundation slice"));
     }
 
     #[test]
@@ -1540,6 +1819,406 @@ mod tests {
         };
         let line = dispatch_action(&action);
         assert!(line.contains("missing name"));
+    }
+
+    // ── Mutating-verb wiring (#554) ───────────────────────────────
+    //
+    // These test the pure `apply_*` helpers directly so the verb
+    // semantics are exercised against synthetic state without
+    // requiring `system::init`. The end-to-end round-trip through
+    // `dispatch_action` + `system::apply` is covered by
+    // `cell_renderer::tests::wired_apply_*` once the SYSTEM
+    // singleton is set up.
+
+    #[test]
+    fn apply_create_pushes_new_entity_into_noun_cell() {
+        // Apply create File → File cell gains a row carrying the
+        // synthetic id `File-0` (cell was empty).
+        let state = Object::phi();
+        let args = vec![("noun".to_string(), "File".to_string())];
+        let new_state = apply_create(&args, &state).expect("create");
+        let cell = ast::fetch_or_phi("File", &new_state);
+        let rows = cell.as_seq().expect("cell populated");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(ast::binding(&rows[0], "id"), Some("File-0"));
+    }
+
+    #[test]
+    fn apply_create_honours_user_supplied_id() {
+        let state = Object::phi();
+        let args = vec![
+            ("noun".to_string(), "File".to_string()),
+            ("id".to_string(), "f-explicit".to_string()),
+        ];
+        let new_state = apply_create(&args, &state).expect("create");
+        let rows = ast::fetch_or_phi("File", &new_state);
+        let rows = rows.as_seq().expect("cell populated");
+        assert_eq!(ast::binding(&rows[0], "id"), Some("f-explicit"));
+    }
+
+    #[test]
+    fn apply_create_missing_noun_errors() {
+        let state = Object::phi();
+        let err = apply_create(&[], &state).unwrap_err();
+        assert!(err.contains("missing noun"), "{err}");
+    }
+
+    #[test]
+    fn apply_update_rewrites_matching_entity_bindings() {
+        // Seed File cell with one entity; update should rewrite an
+        // existing binding AND append a new (key, value) pair.
+        let entity = Object::seq(alloc::vec![
+            Object::seq(alloc::vec![Object::atom("id"), Object::atom("f1")]),
+            Object::seq(alloc::vec![Object::atom("Name"), Object::atom("alpha")]),
+        ]);
+        let state = ast::cell_push("File", entity, &Object::phi());
+        let args = vec![
+            ("noun".to_string(), "File".to_string()),
+            ("id".to_string(), "f1".to_string()),
+            ("Name".to_string(), "alpha-renamed".to_string()),
+            ("MimeType".to_string(), "text/plain".to_string()),
+        ];
+        let new_state = apply_update(&args, &state).expect("update");
+        let rows = ast::fetch_or_phi("File", &new_state);
+        let rows = rows.as_seq().expect("cell populated");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(ast::binding(&rows[0], "id"), Some("f1"));
+        assert_eq!(ast::binding(&rows[0], "Name"), Some("alpha-renamed"));
+        assert_eq!(ast::binding(&rows[0], "MimeType"), Some("text/plain"));
+    }
+
+    #[test]
+    fn apply_update_unknown_entity_errors() {
+        let state = ast::cell_push(
+            "File",
+            Object::seq(alloc::vec![Object::seq(alloc::vec![
+                Object::atom("id"),
+                Object::atom("f1"),
+            ])]),
+            &Object::phi(),
+        );
+        let args = vec![
+            ("noun".to_string(), "File".to_string()),
+            ("id".to_string(), "ghost".to_string()),
+        ];
+        let err = apply_update(&args, &state).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn apply_destroy_removes_matching_entity() {
+        let s = ast::cell_push(
+            "File",
+            Object::seq(alloc::vec![Object::seq(alloc::vec![
+                Object::atom("id"),
+                Object::atom("f1"),
+            ])]),
+            &Object::phi(),
+        );
+        let s = ast::cell_push(
+            "File",
+            Object::seq(alloc::vec![Object::seq(alloc::vec![
+                Object::atom("id"),
+                Object::atom("f2"),
+            ])]),
+            &s,
+        );
+        let args = vec![
+            ("noun".to_string(), "File".to_string()),
+            ("id".to_string(), "f1".to_string()),
+        ];
+        let new_state = apply_destroy(&args, &s).expect("destroy");
+        let rows = ast::fetch_or_phi("File", &new_state);
+        let rows = rows.as_seq().expect("cell populated");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(ast::binding(&rows[0], "id"), Some("f2"));
+    }
+
+    #[test]
+    fn apply_destroy_unknown_entity_errors() {
+        let s = ast::cell_push(
+            "File",
+            Object::seq(alloc::vec![Object::seq(alloc::vec![
+                Object::atom("id"),
+                Object::atom("f1"),
+            ])]),
+            &Object::phi(),
+        );
+        let args = vec![
+            ("noun".to_string(), "File".to_string()),
+            ("id".to_string(), "ghost".to_string()),
+        ];
+        let err = apply_destroy(&args, &s).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn apply_transition_rewrites_currently_in_status() {
+        // Seed an SM row at `start`; transition `next=middle` rewrites
+        // it.
+        let s = cell_push(
+            "StateMachine_has_currentlyInStatus",
+            fact_from_pairs(&[
+                ("State Machine", "sm1"),
+                ("currentlyInStatus", "start"),
+                ("forResource", "f1"),
+            ]),
+            &Object::phi(),
+        );
+        let args = vec![
+            ("sm".to_string(), "sm1".to_string()),
+            ("id".to_string(), "f1".to_string()),
+            ("next".to_string(), "middle".to_string()),
+        ];
+        let new_state = apply_transition(&args, &s).expect("transition");
+        let cell =
+            ast::fetch_or_phi("StateMachine_has_currentlyInStatus", &new_state);
+        let rows = cell.as_seq().expect("cell populated");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            ast::binding(&rows[0], "currentlyInStatus"),
+            Some("middle"),
+        );
+        // forResource binding survives the rewrite.
+        assert_eq!(ast::binding(&rows[0], "forResource"), Some("f1"));
+    }
+
+    #[test]
+    fn apply_transition_unknown_sm_errors() {
+        let s = cell_push(
+            "StateMachine_has_currentlyInStatus",
+            fact_from_pairs(&[
+                ("State Machine", "sm1"),
+                ("currentlyInStatus", "start"),
+            ]),
+            &Object::phi(),
+        );
+        let args = vec![
+            ("sm".to_string(), "ghost".to_string()),
+            ("id".to_string(), "f1".to_string()),
+            ("next".to_string(), "middle".to_string()),
+        ];
+        let err = apply_transition(&args, &s).unwrap_err();
+        assert!(err.contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn apply_store_writes_named_cell_with_synthesised_fact() {
+        let state = Object::phi();
+        let args = vec![
+            ("name".to_string(), "Probe".to_string()),
+            ("k".to_string(), "v".to_string()),
+        ];
+        let new_state = apply_store(&args, &state).expect("store");
+        let cell = ast::fetch_or_phi("Probe", &new_state);
+        let rows = cell.as_seq().expect("cell populated");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(ast::binding(&rows[0], "k"), Some("v"));
+    }
+
+    #[test]
+    fn apply_store_clears_cell_when_only_name_supplied() {
+        // Seed a cell, then Store with only `name` → cell becomes
+        // empty (the canonical "clear" idiom).
+        let s = ast::cell_push(
+            "Probe",
+            fact_from_pairs(&[("k", "v")]),
+            &Object::phi(),
+        );
+        let args = vec![("name".to_string(), "Probe".to_string())];
+        let new_state = apply_store(&args, &s).expect("store-clear");
+        let cell = ast::fetch_or_phi("Probe", &new_state);
+        // After clear the cell exists but is empty (`phi`). `as_seq`
+        // returns Some(empty slice) for phi.
+        let rows = cell.as_seq().unwrap_or(&[]);
+        assert!(rows.is_empty(), "expected empty cell, got {rows:?}");
+    }
+
+    #[test]
+    fn apply_store_missing_name_errors() {
+        let err = apply_store(&[], &Object::phi()).unwrap_err();
+        assert!(err.contains("missing name"), "{err}");
+    }
+
+    #[test]
+    fn apply_remove_fact_drops_indexed_row() {
+        let s = cell_push(
+            "Probe",
+            fact_from_pairs(&[("k", "v0")]),
+            &Object::phi(),
+        );
+        let s = cell_push("Probe", fact_from_pairs(&[("k", "v1")]), &s);
+        let args = vec![
+            ("cell".to_string(), "Probe".to_string()),
+            ("fact".to_string(), "0".to_string()),
+        ];
+        let new_state = apply_remove_fact(&args, &s).expect("remove");
+        let rows = ast::fetch_or_phi("Probe", &new_state);
+        let rows = rows.as_seq().expect("cell populated");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(ast::binding(&rows[0], "k"), Some("v1"));
+    }
+
+    #[test]
+    fn apply_remove_fact_out_of_range_errors() {
+        let s = cell_push(
+            "Probe",
+            fact_from_pairs(&[("k", "v0")]),
+            &Object::phi(),
+        );
+        let args = vec![
+            ("cell".to_string(), "Probe".to_string()),
+            ("fact".to_string(), "99".to_string()),
+        ];
+        let err = apply_remove_fact(&args, &s).unwrap_err();
+        assert!(err.contains("out of range"), "{err}");
+    }
+
+    /// End-to-end roundtrip — Apply create → SYSTEM committed →
+    /// new entity visible on a subsequent `with_state` read. Uses
+    /// the singleton `system::init` (idempotent) so this dovetails
+    /// with the other tests that share the binary.
+    #[test]
+    fn dispatch_apply_create_commits_to_system_state() {
+        crate::system::init();
+        // Seed the noun if not already present (init() seeds a few
+        // demo nouns; we use our own to avoid colliding).
+        let probe_noun = "WireUpProbe554";
+        let pre = crate::system::with_state(|s| s.clone()).expect("init ran");
+        let pre_with_noun = ast::cell_push(
+            "Noun",
+            Object::seq(alloc::vec![Object::seq(alloc::vec![
+                Object::atom("name"),
+                Object::atom(probe_noun),
+            ])]),
+            &pre,
+        );
+        crate::system::apply(pre_with_noun).expect("seed noun");
+
+        let action = SystemAction::new(
+            SystemVerb::ApplyCreate,
+            vec![
+                ("noun".to_string(), probe_noun.to_string()),
+                ("id".to_string(), "wp-1".to_string()),
+            ],
+        );
+        let line = dispatch_action(&action);
+        assert!(line.contains("ok"), "{line}");
+
+        // Post-state read: the WireUpProbe554 cell now has a row with
+        // id=wp-1.
+        let found = crate::system::with_state(|s| {
+            let cell = ast::fetch_or_phi(probe_noun, s);
+            cell.as_seq()
+                .map(|rows| rows.iter().any(|r| ast::binding(r, "id") == Some("wp-1")))
+                .unwrap_or(false)
+        })
+        .expect("init ran");
+        assert!(found, "post-create state must include wp-1");
+    }
+
+    /// End-to-end roundtrip — Apply transition rewrites the
+    /// SYSTEM-installed SM row's `currentlyInStatus`.
+    #[test]
+    fn dispatch_transition_commits_to_system_state() {
+        crate::system::init();
+        // Seed an SM row with a unique id so we don't collide with
+        // the init'd `sm-sr-1` row.
+        let pre = crate::system::with_state(|s| s.clone()).expect("init ran");
+        let seeded = cell_push(
+            "StateMachine_has_currentlyInStatus",
+            fact_from_pairs(&[
+                ("State Machine", "sm-554-probe"),
+                ("currentlyInStatus", "start"),
+            ]),
+            &pre,
+        );
+        crate::system::apply(seeded).expect("seed sm");
+
+        let action = SystemAction::new(
+            SystemVerb::Transition,
+            vec![
+                ("sm".to_string(), "sm-554-probe".to_string()),
+                ("id".to_string(), "x".to_string()),
+                ("next".to_string(), "middle".to_string()),
+            ],
+        );
+        let line = dispatch_action(&action);
+        assert!(line.contains("ok"), "{line}");
+
+        // Post-state: sm-554-probe is now in `middle`.
+        let post_status = crate::system::with_state(|s| {
+            let cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", s);
+            cell.as_seq()
+                .and_then(|rows| {
+                    rows.iter()
+                        .find(|r| ast::binding_matches(r, "State Machine", "sm-554-probe"))
+                        .and_then(|r| ast::binding(r, "currentlyInStatus"))
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_default()
+        })
+        .expect("init ran");
+        assert_eq!(post_status, "middle");
+    }
+
+    /// End-to-end roundtrip — Apply Store writes a named cell that
+    /// the next `with_state` read sees populated.
+    #[test]
+    fn dispatch_store_commits_to_system_state() {
+        crate::system::init();
+        let action = SystemAction::new(
+            SystemVerb::Store,
+            vec![
+                ("name".to_string(), "WireUpStoreProbe554".to_string()),
+                ("k".to_string(), "v".to_string()),
+            ],
+        );
+        let line = dispatch_action(&action);
+        assert!(line.contains("ok"), "{line}");
+
+        let post = crate::system::with_state(|s| {
+            let cell = ast::fetch_or_phi("WireUpStoreProbe554", s);
+            cell.as_seq()
+                .and_then(|rows| rows.first().cloned())
+                .map(|fact| ast::binding(&fact, "k").map(|s| s.to_string()))
+                .flatten()
+                .unwrap_or_default()
+        })
+        .expect("init ran");
+        assert_eq!(post, "v");
+    }
+
+    /// End-to-end roundtrip — invalid Apply update (entity missing)
+    /// returns an error envelope in the result line and leaves
+    /// SYSTEM state unchanged.
+    #[test]
+    fn dispatch_invalid_update_surfaces_error_and_leaves_state() {
+        crate::system::init();
+        let pre_snapshot = crate::system::with_state(|s| s.clone()).expect("init ran");
+
+        let action = SystemAction::new(
+            SystemVerb::ApplyUpdate,
+            vec![
+                ("noun".to_string(), "ImaginaryNoun554".to_string()),
+                ("id".to_string(), "ghost".to_string()),
+            ],
+        );
+        let line = dispatch_action(&action);
+        assert!(line.contains("error"), "{line}");
+
+        let post_snapshot = crate::system::with_state(|s| s.clone()).expect("init ran");
+        // The ImaginaryNoun554 cell does not appear post-failure.
+        let cell = ast::fetch_or_phi("ImaginaryNoun554", &post_snapshot);
+        assert!(
+            cell.as_seq().map(|s| s.is_empty()).unwrap_or(true),
+            "failed update must not leak the noun cell"
+        );
+        // The pre-snapshot's cell shape survives. (We can't compare
+        // the entire Object across other concurrent tests' applies,
+        // so we confirm the failure path didn't introduce the
+        // imaginary cell.)
+        let _ = pre_snapshot;
     }
 
     // ── State-machine action surface (#514) ────────────────────────
