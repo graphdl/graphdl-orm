@@ -143,6 +143,110 @@ impl EntropySource for X86_64HwEntropy {
     }
 }
 
+// ── EFI_RNG_PROTOCOL fallback (#571) ───────────────────────────────
+//
+// On hosts where RDSEED + RDRAND are both masked (common in QEMU,
+// some hypervisors, and pre-Ivy-Bridge silicon), the X86_64HwEntropy
+// source above returns `HardwareUnavailable` for every `fill()` call.
+// `arest::csprng::seed_from_entropy` then panics — and every kernel
+// path that touches `random_bytes` (POST /arest/entity (#614),
+// AT_RANDOM stack canary (#575), the `getrandom` syscall (#577))
+// goes down with it.
+//
+// EFI_RNG_PROTOCOL gives us one shot at firmware-provided entropy
+// before `boot::exit_boot_services`. We capture 32 bytes of seed
+// pre-EBS and stretch them through a counter-mode FNV-1a-64 keystream
+// post-EBS. Not crypto-grade in isolation — FNV is non-cryptographic
+// and the seed is finite — but the seed itself was firmware-random,
+// the csprng above stretches it via ChaCha20, and #584 (mixing
+// entropy source) replaces this once it lands. Until then this is
+// how the kernel survives on QEMU.
+//
+// `BootSeedEntropy` always succeeds — it never returns `HardwareUnavailable` —
+// so the chain below uses it as the unconditional fallback when the
+// hardware source faults.
+
+/// Bootstrap entropy source backed by a 32-byte seed captured from
+/// `EFI_RNG_PROTOCOL` before ExitBootServices. Each `fill()` call
+/// derives output by repeatedly hashing `(seed || counter || index)`
+/// with FNV-1a-64 and writing 8 bytes per round, advancing the counter
+/// monotonically so the same seed never produces the same output twice.
+pub struct BootSeedEntropy {
+    seed: [u8; 32],
+    counter: core::sync::atomic::AtomicU64,
+}
+
+impl BootSeedEntropy {
+    pub fn new(seed: [u8; 32]) -> Self {
+        Self { seed, counter: core::sync::atomic::AtomicU64::new(0) }
+    }
+}
+
+impl EntropySource for BootSeedEntropy {
+    fn fill(&mut self, buf: &mut [u8]) -> Result<usize, EntropyError> {
+        let mut written = 0;
+        while written < buf.len() {
+            // Pull the next counter so two concurrent fills (post-SMP)
+            // would still see distinct streams. `Relaxed` is fine —
+            // we only need uniqueness, not happens-before with the
+            // entropy-source mutex.
+            let ctr = self.counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            // Hash (counter || seed) with FNV-1a-64. Cheap, no_std-clean,
+            // good enough opacity to derive bootstrap bytes from a
+            // firmware-random seed. `core::hash` is not in core's
+            // public surface, so we inline the constant.
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in ctr.to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            for b in self.seed.iter() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            let block = h.to_le_bytes();
+            let take = core::cmp::min(8, buf.len() - written);
+            buf[written..written + take].copy_from_slice(&block[..take]);
+            written += take;
+        }
+        Ok(written)
+    }
+}
+
+/// Composite source: try RDSEED/RDRAND first, fall back to the
+/// firmware-seeded keystream when the hardware path faults. Mirror
+/// of FreeBSD's `random(4)` rolling-back-to-Yarrow design — primary
+/// path is silicon entropy, secondary is a stretched bootstrap seed.
+///
+/// When `fallback` is `None` (no EFI RNG seed captured pre-EBS),
+/// this degrades to bare X86_64HwEntropy and a hardware fault still
+/// surfaces as `HardwareUnavailable`. That's the pre-#571 behaviour.
+pub struct ChainedEntropy {
+    primary: X86_64HwEntropy,
+    fallback: Option<BootSeedEntropy>,
+}
+
+impl ChainedEntropy {
+    pub fn new(primary: X86_64HwEntropy, fallback: Option<BootSeedEntropy>) -> Self {
+        Self { primary, fallback }
+    }
+}
+
+impl EntropySource for ChainedEntropy {
+    fn fill(&mut self, buf: &mut [u8]) -> Result<usize, EntropyError> {
+        match self.primary.fill(buf) {
+            Ok(n) => Ok(n),
+            Err(EntropyError::HardwareUnavailable) => {
+                match &mut self.fallback {
+                    Some(fb) => fb.fill(buf),
+                    None => Err(EntropyError::HardwareUnavailable),
+                }
+            }
+            Err(other) => Err(other),
+        }
+    }
+}
+
 // ── CPUID probe ─────────────────────────────────────────────────────
 
 /// Returns `(rdseed_present, rdrand_present)`. Pure CPUID — no side
