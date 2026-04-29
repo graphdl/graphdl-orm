@@ -1478,6 +1478,14 @@ fn format_load_error(err: &arest::load_reading_core::LoadError) -> String {
         LoadError::DeonticViolation(diags) => {
             format!("deontic violation: {} diagnostic(s)", diags.len())
         }
+        // #559 / DynRdg-5 — alethic-class violations from the
+        // load-time validation gate. Added defensively here because
+        // adding an enum variant in arest is a non-additive change
+        // for kernel consumers; without this arm the kernel crate
+        // refuses to compile.
+        LoadError::AlethicViolation(diags) => {
+            format!("alethic violation: {} diagnostic(s)", diags.len())
+        }
     }
 }
 
