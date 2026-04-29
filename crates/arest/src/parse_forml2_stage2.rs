@@ -36,15 +36,22 @@ use crate::time_shim::Instant;
 /// rules in `grammar_state`. Returns a new state identical to
 /// `statements_state` plus a populated `Statement_has_Classification`
 /// cell.
-#[cfg(feature = "std-deps")]
 pub fn classify_statements(statements_state: &Object, grammar_state: &Object) -> Object {
+    // Trace gate — under std the AREST_STAGE12_TRACE env var enables
+    // detailed timing telemetry; under no_std (kernel) it's a const
+    // false so the eprintln branches compile out entirely. The kernel
+    // gets equivalent observability via the `check` system verb that
+    // pipes diag! through its serial sink.
+    #[cfg(not(feature = "no_std"))]
     let trace = std::env::var("AREST_STAGE12_TRACE").is_ok();
+    #[cfg(feature = "no_std")]
+    let trace = false;
     let tc0 = Instant::now();
     // Merge Stage-1 statement cells with grammar cells so
     // `compile_to_defs_state` sees both the nouns/fact-types/rules
     // declared by the grammar and the Statement facts they apply to.
     let merged = crate::ast::merge_states(statements_state, grammar_state);
-    if trace { eprintln!("  [cls] merge: {:?}", tc0.elapsed()); }
+    if trace { crate::diag!("  [cls] merge: {:?}", tc0.elapsed()); }
     // Grammar defs are pure functions of forml2-grammar.md — cached
     // in `GRAMMAR_CACHE` at first access. Stage-1 never populates the
     // DerivationRule cell (user rules stay in Statement form until
@@ -60,11 +67,13 @@ pub fn classify_statements(statements_state: &Object, grammar_state: &Object) ->
         Err(_) => {
             // Fallback: if grammar cache failed, run nothing (classify
             // is a no-op and translators will see an un-classified
-            // state — the caller's error path handles this).
-            static EMPTY_DEFS: std::sync::OnceLock<
+            // state — the caller's error path handles this). `spin::Once`
+            // (alloc-compatible) instead of `std::sync::OnceLock` so the
+            // no_std build resolves the same path.
+            static EMPTY_DEFS: spin::Once<
                 (Vec<(String, crate::ast::Func)>, Vec<Vec<String>>)
-            > = std::sync::OnceLock::new();
-            let (d, a) = EMPTY_DEFS.get_or_init(|| (Vec::new(), Vec::new()));
+            > = spin::Once::new();
+            let (d, a) = EMPTY_DEFS.call_once(|| (Vec::new(), Vec::new()));
             (d, a, None)
         }
     };
@@ -100,7 +109,7 @@ pub fn classify_statements(statements_state: &Object, grammar_state: &Object) ->
     });
     let (final_state, _) = crate::evaluate::forward_chain_defs_state_semi_naive_with_base_keys(
         &deriv, &merged, 2, initial_keys);
-    if trace { eprintln!("  [cls] forward_chain ({} defs): {:?}",
+    if trace { crate::diag!("  [cls] forward_chain ({} defs): {:?}",
         deriv.len(), t2.elapsed()); }
     final_state
 }
@@ -119,7 +128,6 @@ pub fn classify_statements(statements_state: &Object, grammar_state: &Object) ->
 ///
 /// Grouped by Head Noun: one Noun fact per distinct name, with the
 /// most specific objectType across its classifications applied.
-#[cfg(feature = "std-deps")]
 pub fn translate_nouns(classified_state: &Object) -> Vec<Object> {
     use alloc::collections::BTreeMap;
     let statement_ids = collect_statement_ids(classified_state);
@@ -219,7 +227,6 @@ pub fn translate_nouns(classified_state: &Object) -> Vec<Object> {
 /// `,` (matching legacy's binding format rmap reads via
 /// `referenceScheme.split(',')`). Returns `None` if the text doesn't
 /// contain a `(.…)` suffix for this noun.
-#[cfg(feature = "std-deps")]
 fn extract_reference_scheme(text: &str, head_noun: &str) -> Option<String> {
     let after_noun = text.find(head_noun).map(|i| i + head_noun.len())?;
     let rest = &text[after_noun..];
@@ -263,7 +270,6 @@ fn extract_reference_scheme(text: &str, head_noun: &str) -> Option<String> {
 ///   2. Entity-based fallback for single-noun constraints (ring kinds,
 ///      value constraints, etc.) where the stripped text surfaces
 ///      one noun and step 1 yields no match.
-#[cfg(feature = "std-deps")]
 fn enrich_constraints_with_spans(
     constraints: &[Object],
     role_facts: &[Object],
@@ -338,7 +344,6 @@ fn enrich_constraints_with_spans(
 /// noun — `role_index` points at its position in the FT, so downstream
 /// code (`check.rs`'s `constraint_applies_to_role`) attaches the
 /// constraint to the correct role.
-#[cfg(feature = "std-deps")]
 fn resolve_constraint_span_ft(
     text: &str,
     roles_by_ft: &hashbrown::HashMap<String, Vec<(usize, String)>>,
@@ -434,7 +439,6 @@ fn resolve_constraint_span_ft(
 /// absent, whitespace, or a non-alphanumeric separator). Returns the
 /// ordered sequence of noun names — duplicates preserved (e.g. ring
 /// constraints' `Person ... Person` becomes `[Person, Person]`).
-#[cfg(feature = "std-deps")]
 fn find_noun_sequence(text: &str, sorted_nouns_longest_first: &[String]) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     let bytes = text.as_bytes();
@@ -472,7 +476,6 @@ fn find_noun_sequence(text: &str, sorted_nouns_longest_first: &[String]) -> Vec<
 /// Strip `<alpha><digits>` patterns to `<alpha>` so ring conditional
 /// shapes surface the base noun. `Noun1` → `Noun`; `API3` → `API`.
 /// Digits not preceded by a letter (numeric literals) are preserved.
-#[cfg(feature = "std-deps")]
 fn strip_digit_subscripts(s: &str) -> alloc::string::String {
     let mut out = alloc::string::String::with_capacity(s.len());
     let mut last_was_alpha = false;
@@ -494,7 +497,6 @@ fn strip_digit_subscripts(s: &str) -> alloc::string::String {
 /// `If some X R some Y then Y R X. (symmetric)`). Returns the body
 /// with the annotation removed (still ending in `.`), or `None` if
 /// the parens don't contain a recognized ring adjective.
-#[cfg(feature = "std-deps")]
 fn strip_ring_annotation(line: &str) -> Option<&str> {
     let trimmed = line.trim_end();
     let inner = trimmed.strip_suffix(')')?;
@@ -513,7 +515,6 @@ fn strip_ring_annotation(line: &str) -> Option<&str> {
 
 /// Extract the quoted values from a `The possible values of <Noun>
 /// are 'v1', 'v2', …` declaration. Returns them joined by `,`.
-#[cfg(feature = "std-deps")]
 fn extract_enum_values(text: &str) -> Option<String> {
     let lower = text.to_ascii_lowercase();
     let are_idx = lower.find(" are ")?;
@@ -533,7 +534,6 @@ fn extract_enum_values(text: &str) -> Option<String> {
 /// facts: `(subtype, supertype)` pairs. The subtype is the Statement's
 /// Head Noun; the supertype is the noun at Role Position 1 (the only
 /// other role reference in `A is a subtype of B`).
-#[cfg(feature = "std-deps")]
 pub fn translate_subtypes(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     statement_ids.iter().filter_map(|stmt_id| {
@@ -565,7 +565,6 @@ pub fn translate_subtypes(classified_state: &Object) -> Vec<Object> {
 /// the derivation-marker on derivation-rule statements (where the
 /// `*` prefix is a readability marker, not a mode signal on a Fact
 /// Type) doesn't spawn spurious InstanceFacts.
-#[cfg(feature = "std-deps")]
 pub fn translate_derivation_mode_facts(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
@@ -614,7 +613,6 @@ pub fn translate_derivation_mode_facts(classified_state: &Object) -> Vec<Object>
     out
 }
 
-#[cfg(feature = "std-deps")]
 fn derivation_marker_for(state: &Object, stmt_id: &str) -> Option<String> {
     if let Some(v) = STMT_INDEX.with(|c|
         c.borrow().as_ref().map(|i| i.derivation_markers.get(stmt_id).cloned()))
@@ -634,7 +632,6 @@ fn derivation_marker_for(state: &Object, stmt_id: &str) -> Option<String> {
 /// (B, A), (C, A), (D, A). The supertype's abstractness flows
 /// through `translate_nouns` which treats Partition Declaration as
 /// an abstract-marking classification.
-#[cfg(feature = "std-deps")]
 pub fn translate_partitions(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
@@ -664,7 +661,6 @@ pub fn translate_partitions(classified_state: &Object) -> Vec<Object> {
 /// current FORML 2 corpus relies on this separation — the noun-
 /// declaration shape `Customer is an entity type` also matches Fact
 /// Type Reading because it has a Role Reference.
-#[cfg(feature = "std-deps")]
 pub fn translate_fact_types(classified_state: &Object) -> (Vec<Object>, Vec<Object>) {
     let statement_ids = collect_statement_ids(classified_state);
     let mut ft_facts: Vec<Object> = Vec::new();
@@ -786,7 +782,6 @@ fn fact_type_id_from_reading(reading: &str, roles: &[String]) -> String {
 ///
 /// `nouns` is the full declared-noun list. Longest-first matching
 /// drives role extraction, same as Stage-1 tokenisation.
-#[cfg(feature = "std-deps")]
 fn possibility_synthetic_fact_type(
     body: &str,
     nouns: &[String],
@@ -927,7 +922,6 @@ fn statement_text(state: &Object, stmt_id: &str) -> Option<String> {
 /// per call to O(1) HashMap lookups. Core.md has ~150 statements and
 /// ~500 Statement_has_Classification facts; without this cache each
 /// of the 15 translators was scanning the full cell 150 times.
-#[cfg(feature = "std-deps")]
 #[derive(Default)]
 struct StmtIndex {
     classifications: hashbrown::HashMap<String, Vec<String>>,
@@ -949,13 +943,11 @@ struct StmtIndex {
     statement_ids: alloc::sync::Arc<Vec<String>>,
 }
 
-#[cfg(feature = "std-deps")]
 std::thread_local! {
     static STMT_INDEX: std::cell::RefCell<Option<StmtIndex>>
         = std::cell::RefCell::new(None);
 }
 
-#[cfg(feature = "std-deps")]
 fn build_stmt_index(state: &Object) -> StmtIndex {
     let mut idx = StmtIndex::default();
     let index_single = |cell: &str, key_field: &str, value_field: &str,
@@ -1012,10 +1004,8 @@ fn build_stmt_index(state: &Object) -> StmtIndex {
 
 /// RAII guard so the thread-local index is always cleared at the end
 /// of the translator block, even on early return or panic.
-#[cfg(feature = "std-deps")]
 struct StmtIndexGuard;
 
-#[cfg(feature = "std-deps")]
 impl StmtIndexGuard {
     fn install(state: &Object) -> Self {
         let idx = build_stmt_index(state);
@@ -1024,7 +1014,6 @@ impl StmtIndexGuard {
     }
 }
 
-#[cfg(feature = "std-deps")]
 impl Drop for StmtIndexGuard {
     fn drop(&mut self) {
         STMT_INDEX.with(|c| *c.borrow_mut() = None);
@@ -1049,7 +1038,6 @@ impl Drop for StmtIndexGuard {
 ///
 /// Unary instance-facts (value assertions like `Customer 'alice' is
 /// active`) currently emit with empty objectNoun/objectValue.
-#[cfg(feature = "std-deps")]
 pub fn translate_instance_facts(classified_state: &Object) -> Vec<Object> {
     translate_instance_facts_with_ft_ids(classified_state, &[])
 }
@@ -1069,7 +1057,6 @@ pub fn translate_instance_facts(classified_state: &Object) -> Vec<Object> {
 /// per-role literals), so it picks up the inter-role verb chunks
 /// (`with`, `at`, `and …`) that the per-statement Verb cell only
 /// records for the role-0 ↔ role-1 gap.
-#[cfg(feature = "std-deps")]
 pub fn translate_instance_facts_with_ft_ids(
     classified_state: &Object,
     declared_ft_ids: &[String],
@@ -1153,7 +1140,6 @@ pub fn translate_instance_facts_with_ft_ids(
 /// shapes) match distinct positions; each successive scan starts at
 /// the previous strip's end. Roles without literals are passed
 /// through unchanged.
-#[cfg(feature = "std-deps")]
 fn strip_role_literals(text: &str, roles: &[(String, Option<String>)]) -> String {
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0usize;
@@ -1264,7 +1250,6 @@ fn statement_verb(state: &Object, stmt_id: &str) -> Option<String> {
 /// `text` (Statement text), and `entity` (Head Noun). Spans
 /// (fact_type_id resolution) are left empty — a follow-up
 /// commit will populate them once the FactType cell exists.
-#[cfg(feature = "std-deps")]
 pub fn translate_ring_constraints(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let declared_nouns = declared_noun_names(classified_state);
@@ -1318,7 +1303,6 @@ pub fn translate_ring_constraints(classified_state: &Object) -> Vec<Object> {
 ///
 /// Returns the ring kind (`TR` / `AS` / `SY` / `AT` / `IT` / `RF`)
 /// or `None` when the statement doesn't match a ring shape.
-#[cfg(feature = "std-deps")]
 fn conditional_ring_kind(text: &str, declared_nouns: &[String])
     -> Option<&'static str>
 {
@@ -1402,7 +1386,6 @@ fn conditional_ring_kind(text: &str, declared_nouns: &[String])
 /// will migrate in a follow-up commit once the
 /// FactType + Role cells have been populated by Stage-2 earlier in
 /// the pipeline.
-#[cfg(feature = "std-deps")]
 pub fn translate_derivation_rules(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let declared_nouns = declared_noun_names(classified_state);
@@ -1451,7 +1434,6 @@ pub fn translate_derivation_rules(classified_state: &Object) -> Vec<Object> {
 /// subscripts). For the common shape
 /// `<rule-consequent> if|when <ante> and <ante> and …`, each
 /// `and`-separated chunk is a clause candidate.
-#[cfg(feature = "std-deps")]
 pub fn translate_unresolved_clauses(
     classified_state: &Object,
     _ft_facts: &[Object],
@@ -1520,7 +1502,6 @@ pub fn translate_unresolved_clauses(
 /// (the grammar has 28 rules all producing `Statement has
 /// Classification`), so keying on consequent alone collapses them;
 /// text hashing gives each rule a unique id.
-#[cfg(feature = "std-deps")]
 fn derivation_rule_id(text: &str) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in text.as_bytes() {
@@ -1539,7 +1520,6 @@ fn derivation_rule_id(text: &str) -> String {
 /// The Value Type `Noun` fact is still emitted by `translate_nouns`
 /// from the preceding `Priority is a value type.` statement — this
 /// translator only contributes the value list.
-#[cfg(feature = "std-deps")]
 pub fn translate_enum_values(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
@@ -1580,7 +1560,6 @@ pub fn translate_enum_values(classified_state: &Object) -> Vec<Object> {
 /// `translate_cardinality_constraints` because the grammar keys the
 /// two families on different tokens (Quantifier vs Constraint
 /// Keyword vs Trailing Marker).
-#[cfg(feature = "std-deps")]
 pub fn translate_set_constraints(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let declared_nouns = declared_noun_names(classified_state);
@@ -1632,7 +1611,6 @@ pub fn translate_set_constraints(classified_state: &Object) -> Vec<Object> {
 
 /// All declared noun names in a classified state, sorted longest-first
 /// so substring-style matching prefers `Fact Type` over `Fact` etc.
-#[cfg(feature = "std-deps")]
 fn declared_noun_names(state: &Object) -> Vec<String> {
     let cell = fetch_or_phi("Noun", state);
     let mut names: Vec<String> = cell.as_seq()
@@ -1652,7 +1630,6 @@ fn declared_noun_names(state: &Object) -> Vec<String> {
 ///
 /// Longest-first pass with masking — `Fact Type` wins over `Fact`
 /// when both are declared, preventing substring double-counts.
-#[cfg(feature = "std-deps")]
 fn antecedent_distinct_nouns(text: &str, declared: &[String]) -> usize {
     let Some((ante, _)) = text.split_once(" then ") else { return 0 };
     let bytes = ante.as_bytes();
@@ -1693,7 +1670,6 @@ fn antecedent_distinct_nouns(text: &str, declared: &[String]) -> usize {
 /// `translate_fact_types`, and span binding is a follow-up pass that
 /// reads both cells. This matches the deferred-span shape used by
 /// `translate_ring_constraints`.
-#[cfg(feature = "std-deps")]
 pub fn translate_cardinality_constraints(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
@@ -1755,7 +1731,6 @@ pub fn translate_cardinality_constraints(classified_state: &Object) -> Vec<Objec
 /// from the EnumValues cell directly (see
 /// `parse_forml2::enum_values_for_noun`) and attaches the constraint
 /// to every role where the noun appears.
-#[cfg(feature = "std-deps")]
 pub fn translate_value_constraints(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
@@ -1791,7 +1766,6 @@ fn enum_values_for(state: &Object, stmt_id: &str) -> Vec<String> {
 /// cell facts with modality="deontic" and the stripped deontic
 /// operator. Entity defaults to the Head Noun of the body (after
 /// the `It is X that` prefix was stripped by Stage-1).
-#[cfg(feature = "std-deps")]
 pub fn translate_deontic_constraints(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
@@ -1887,7 +1861,6 @@ fn head_noun_for(state: &Object, stmt_id: &str) -> Option<String> {
 
 /// Return the list of classification names attached to a given
 /// Statement id.
-#[cfg(feature = "std-deps")]
 pub fn classifications_for(state: &Object, statement_id: &str) -> Vec<String> {
     if let Some(v) = STMT_INDEX.with(|c|
         c.borrow().as_ref().map(|i|
@@ -1910,7 +1883,6 @@ pub fn classifications_for(state: &Object, statement_id: &str) -> Vec<String> {
 /// only need boolean membership can loop over statements at ~O(1) per
 /// check instead of paying an allocation plus a linear scan of a
 /// cloned vector.
-#[cfg(feature = "std-deps")]
 pub fn classifications_contains(state: &Object, statement_id: &str, name: &str) -> bool {
     let via_index: Option<bool> = STMT_INDEX.with(|c|
         c.borrow().as_ref().map(|i|
@@ -1930,7 +1902,6 @@ pub fn classifications_contains(state: &Object, statement_id: &str, name: &str) 
 /// use this for "does this statement carry ANY excluded kind" and
 /// "is this a fact-type-like statement" tests; preferring this over a
 /// clone-and-iterate pattern saves per-call allocation.
-#[cfg(feature = "std-deps")]
 pub fn classifications_contains_any(state: &Object, statement_id: &str, names: &[&str]) -> bool {
     let via_index: Option<bool> = STMT_INDEX.with(|c|
         c.borrow().as_ref().map(|i|
@@ -1993,7 +1964,6 @@ fn collect_statement_ids(state: &Object) -> alloc::sync::Arc<Vec<String>> {
 /// Killed two perf cliffs: the legacy parse of the grammar MD (~140
 /// lines) and the compile-to-defs pass (~20ms/call for 69
 /// classification rules).
-#[cfg(feature = "std-deps")]
 type GrammarCacheEntry = (
     Object,                                             // expanded grammar state
     alloc::vec::Vec<(String, crate::ast::Func)>,        // classifier defs only
@@ -2001,9 +1971,17 @@ type GrammarCacheEntry = (
     hashbrown::HashSet<u64>,                            // cached state_keys of expanded grammar
 );
 
-#[cfg(feature = "std-deps")]
-static GRAMMAR_CACHE: std::sync::OnceLock<GrammarCacheEntry>
-    = std::sync::OnceLock::new();
+// `spin::Once` (alloc-compatible) instead of `std::sync::OnceLock` so
+// the cache resolves under no_std (kernel build). Stores
+// `Result<GrammarCacheEntry, String>` because `spin::Once::call_once`
+// takes a non-fallible closure — the failable bootstrap runs inside
+// the closure, captures any error in the cached value, and subsequent
+// callers re-read the same Result. First failure is permanent for the
+// process lifetime (matches the legacy `OnceLock::set` semantics
+// where a failed init left the cache empty and any later attempt would
+// re-fail identically anyway, since the input is `include_str!`-baked).
+static GRAMMAR_CACHE: spin::Once<Result<GrammarCacheEntry, String>>
+    = spin::Once::new();
 
 /// Stage-0 grammar bootstrap (#285 follow-up). Parses the narrow subset
 /// of FORML 2 shapes used by `readings/forml2-grammar.md` directly into
@@ -2029,7 +2007,6 @@ static GRAMMAR_CACHE: std::sync::OnceLock<GrammarCacheEntry>
 /// `DerivationRule` facts include a lossless `json` binding so
 /// `compile_to_defs_state` takes the no-resolve fast path (grammar
 /// rules never feed through `re_resolve_rules`).
-#[cfg(feature = "std-deps")]
 fn bootstrap_grammar_state(text: &str) -> Result<Object, String> {
     use crate::types::{
         DerivationRuleDef, DerivationKind, AntecedentSource,
@@ -2273,9 +2250,12 @@ fn bootstrap_grammar_state(text: &str) -> Result<Object, String> {
     Ok(Object::Map(map))
 }
 
-#[cfg(feature = "std-deps")]
 fn cached_grammar() -> Result<&'static GrammarCacheEntry, String> {
-    if let Some(g) = GRAMMAR_CACHE.get() { return Ok(g); }
+    let cached = GRAMMAR_CACHE.call_once(|| build_grammar_cache());
+    cached.as_ref().map_err(|e| e.clone())
+}
+
+fn build_grammar_cache() -> Result<GrammarCacheEntry, String> {
     let grammar = include_str!("../../../readings/forml2-grammar.md");
     // Stage-0 bootstrap: the grammar file uses a narrow subset of FORML 2
     // shapes (entity / value / enum / binary FT / iff rule). Parsing it
@@ -2359,22 +2339,18 @@ fn cached_grammar() -> Result<&'static GrammarCacheEntry, String> {
     // avoiding a ~3-4ms per-call re-hash of ~4000 grammar facts
     // inside every `classify_statements` invocation.
     let expanded_keys = crate::evaluate::state_keys(&expanded_grammar);
-    // OnceLock::set is safe under races — first writer wins, others
-    // drop their work. We then read via `get` which succeeds.
-    let _ = GRAMMAR_CACHE.set((
+    Ok((
         expanded_grammar,
         classifier_defs,
         classifier_antecedents,
         expanded_keys,
-    ));
-    Ok(GRAMMAR_CACHE.get().expect("just set"))
+    ))
 }
 
 /// Parse a classification rule's reading text into
 /// `(classification, [(cell_name, literal), ...])`. Returns `None`
 /// if the text doesn't match the expected shape. Single- and
 /// two-clause-with-`and` antecedents are both supported.
-#[cfg(feature = "std-deps")]
 fn parse_classification_rule_spec(text: &str)
     -> Option<(String, Vec<(String, Option<String>)>)>
 {
@@ -2430,7 +2406,6 @@ fn parse_classification_rule_spec(text: &str)
 /// Input shape: `encode_state` produces
 /// `Seq[Seq[Atom(ft_id), Seq[fact, ...]], ...]` — scan once for each
 /// clause's cell by name.
-#[cfg(feature = "std-deps")]
 fn build_native_classifier(
     classification: String,
     clauses: Vec<(String, Option<String>)>,
@@ -2537,7 +2512,6 @@ fn build_native_classifier(
 /// antecedent cells — `Some(cells)` for specialized rules, `None` for
 /// unspecialized ones (meaning the semi-naive chainer should run them
 /// every round conservatively).
-#[cfg(feature = "std-deps")]
 fn specialize_grammar_classifiers(
     grammar_state: &Object,
     defs: &mut alloc::vec::Vec<(String, crate::ast::Func)>,
@@ -2567,13 +2541,11 @@ fn specialize_grammar_classifiers(
     antecedents
 }
 
-#[cfg(feature = "std-deps")]
 fn cached_grammar_state() -> Result<&'static Object, String> {
     cached_grammar().map(|(s, _, _, _)| s)
 }
 
 /// Public entry point: parse FORML 2 source with no external context.
-#[cfg(feature = "std-deps")]
 pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
     parse_to_state_via_stage12_impl(text, &[])
 }
@@ -2584,7 +2556,6 @@ pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
 /// noun *names* are propagated — fact types are re-derived from
 /// `text` by `translate_fact_types`, and `merge_states(ctx, result)`
 /// on the caller's side carries the rest of `ctx`'s cells forward.
-#[cfg(feature = "std-deps")]
 pub fn parse_to_state_via_stage12_with_context(
     text: &str,
     ctx: &Object,
@@ -2597,7 +2568,6 @@ pub fn parse_to_state_via_stage12_with_context(
     parse_to_state_via_stage12_impl(text, &extra)
 }
 
-#[cfg(feature = "std-deps")]
 fn parse_to_state_via_stage12_impl(
     text: &str,
     extra_nouns: &[String],
@@ -2870,7 +2840,6 @@ fn parse_to_state_via_stage12_impl(
 ///
 /// Ids are rsplit on `-` so multi-hyphen first components
 /// (`alpha-team-7` into (`alpha-team`, `7`)) survive.
-#[cfg(feature = "std-deps")]
 fn compound_ref_component_cells(
     noun_facts: &[Object],
     instance_facts: &[Object],
@@ -2936,7 +2905,6 @@ fn compound_ref_component_cells(
 ///
 /// Returns `(cell_name, facts)` pairs the caller merges into the
 /// final cell map.
-#[cfg(feature = "std-deps")]
 fn instance_fact_field_cells(instance_facts: &[Object]) -> Vec<(String, Vec<Object>)> {
     let mut out: hashbrown::HashMap<String, Vec<Object>> = hashbrown::HashMap::new();
     for f in instance_facts {
@@ -2992,7 +2960,6 @@ fn instance_fact_field_cells(instance_facts: &[Object]) -> Vec<(String, Vec<Obje
 /// Names beginning with a single quote are treated as quoted
 /// identifiers and bypass the check (Theorem 1 escape documented at
 /// `docs/02-writing-readings.md`).
-#[cfg(feature = "std-deps")]
 fn reject_reserved_noun_declarations(text: &str) -> Result<(), String> {
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -3032,7 +2999,6 @@ fn reject_reserved_noun_declarations(text: &str) -> Result<(), String> {
 /// Quoted names have their surrounding quotes stripped. Partition
 /// subtype lists are expanded so each member becomes a noun name.
 /// Handles `(.refScheme)` suffixes by trimming at the open paren.
-#[cfg(feature = "std-deps")]
 fn extract_declared_noun_names(text: &str) -> Vec<String> {
     let mut names: alloc::collections::BTreeSet<String> =
         alloc::collections::BTreeSet::new();
@@ -3104,7 +3070,6 @@ fn extract_declared_noun_names(text: &str) -> Vec<String> {
     names.into_iter().collect()
 }
 
-#[cfg(feature = "std-deps")]
 #[cfg(all(test, feature = "std-deps"))]
 mod tests {
     use super::*;
