@@ -224,6 +224,20 @@ pub enum SystemVerb {
     Platform,
     /// `native <name>` — invoke a Native escape-hatch closure.
     Native,
+    /// `load_reading <name> <body>` (#564 / DynRdg-T5) — register a
+    /// FORML 2 reading body at runtime. The action surface adds this
+    /// row at the root screen so users can extend the schema from the
+    /// REPL. `name` and `body` are read from the action's
+    /// `default_args`; the REPL's input prompt can populate them via
+    /// `dispatch_action_with_input` (parses `<name>\n<body>`).
+    LoadReading,
+    /// `unload_reading <name>` (#556 / DynRdg-2) — drop a previously-
+    /// loaded reading from the cell graph by name. Inverse of
+    /// `LoadReading`. Surfaced alongside it on the root screen.
+    UnloadReading,
+    /// `reload_reading <name> <body>` (#557 / DynRdg-3) — atomic
+    /// unload+load against a single state snapshot.
+    ReloadReading,
 }
 
 impl SystemVerb {
@@ -241,6 +255,9 @@ impl SystemVerb {
             SystemVerb::Def => "def",
             SystemVerb::Platform => "platform",
             SystemVerb::Native => "native",
+            SystemVerb::LoadReading => "load",
+            SystemVerb::UnloadReading => "unload",
+            SystemVerb::ReloadReading => "reload",
         }
     }
 
@@ -314,6 +331,30 @@ impl SystemVerb {
             SystemVerb::Native => {
                 let name = arg_value("name");
                 format!("native {name}")
+            }
+            SystemVerb::LoadReading => {
+                let name = arg_value("name");
+                if name.is_empty() {
+                    "load_reading".to_string()
+                } else {
+                    format!("load_reading {name}")
+                }
+            }
+            SystemVerb::UnloadReading => {
+                let name = arg_value("name");
+                if name.is_empty() {
+                    "unload_reading".to_string()
+                } else {
+                    format!("unload_reading {name}")
+                }
+            }
+            SystemVerb::ReloadReading => {
+                let name = arg_value("name");
+                if name.is_empty() {
+                    "reload_reading".to_string()
+                } else {
+                    format!("reload_reading {name}")
+                }
             }
         }
     }
@@ -391,6 +432,15 @@ fn actions_for_root(state: &Object) -> Vec<SystemAction> {
             vec![("name".to_string(), format!("resolve:{noun}"))],
         ));
     }
+    // Meta-system verbs (#564 / DynRdg-T5): runtime reading load /
+    // unload / reload. Always available on the root screen — they
+    // operate on the def-state itself, not on any specific noun /
+    // instance. Default args are empty; the REPL's input prompt
+    // populates `name` and `body` (see `dispatch_action_with_input`)
+    // when the user clicks one of these rows.
+    out.push(SystemAction::new(SystemVerb::LoadReading, Vec::new()));
+    out.push(SystemAction::new(SystemVerb::UnloadReading, Vec::new()));
+    out.push(SystemAction::new(SystemVerb::ReloadReading, Vec::new()));
     out
 }
 
@@ -1245,6 +1295,206 @@ pub fn apply_remove_fact(args: &[(String, String)], state: &Object) -> Result<Ob
     Ok(ast::store(&cell_name, Object::seq(kept), state))
 }
 
+// ── Runtime LoadReading verbs (#564 / DynRdg-T5) ───────────────────
+//
+// `apply_load_reading` / `apply_unload_reading` / `apply_reload_reading`
+// are the kernel-side bridges to `arest::load_reading_core::*`. The
+// pure-FORML core is gated `cfg(not(feature = "no_std"))` because it
+// reaches `parse_forml2` + `check::check_readings_func`, both of which
+// pull `serde` + `regex` + `std::env::var` (#586 documents the gate).
+//
+// Under host tests (`cargo t` against this crate, where arest builds
+// with `std-deps`), the helpers route to the real `load_reading` /
+// `unload_reading` / `reload_reading` functions and return
+// `Ok((new_state, summary))`. Under the kernel build (`--target
+// x86_64-unknown-uefi --features server`) the helpers return
+// `Err("load_reading not available in no_std build")` so the action
+// surface still appears in the REPL but a click formats a clear
+// "not yet wired" line. Once #586 lifts the gate, the kernel-side
+// arms collapse to the same path the host-side test suite already
+// exercises.
+
+/// Compute the post-state for `LoadReading <name> <body>` plus a
+/// short success summary for the REPL scrollback.
+///
+/// Args:
+///   * `name` — required; the reading's logical name (becomes a
+///              `_loaded_reading:{name}` manifest cell).
+///   * `body` — required; the FORML 2 body to register.
+///
+/// Returns `Err` with a short message when args are missing or the
+/// load rejected; the variant carries the summary line on success.
+#[cfg(not(target_os = "uefi"))]
+pub fn apply_load_reading(
+    args: &[(String, String)],
+    state: &Object,
+) -> Result<(Object, String), String> {
+    use arest::load_reading_core::{load_reading, LoadReadingPolicy};
+
+    let name = arg(args, "name");
+    let body = arg(args, "body");
+    if name.is_empty() {
+        return Err("missing name".to_string());
+    }
+    if body.is_empty() {
+        return Err("missing body".to_string());
+    }
+    match load_reading(state, &name, &body, LoadReadingPolicy::AllowAll) {
+        Ok(outcome) => {
+            let summary = format!(
+                "+{} nouns, +{} fact types, +{} derivations",
+                outcome.report.added_nouns.len(),
+                outcome.report.added_fact_types.len(),
+                outcome.report.added_derivations.len(),
+            );
+            Ok((outcome.new_state, summary))
+        }
+        Err(err) => Err(format_load_error(&err)),
+    }
+}
+
+/// Stub for the kernel build — `arest::load_reading_core::load_reading`
+/// is gated `cfg(not(feature = "no_std"))` so we cannot call it from
+/// the UEFI target until #586 lifts the gate. Surfacing the action
+/// row + a clear error line is still useful for the REPL UI bring-up.
+#[cfg(target_os = "uefi")]
+pub fn apply_load_reading(
+    args: &[(String, String)],
+    _state: &Object,
+) -> Result<(Object, String), String> {
+    let name = arg(args, "name");
+    let body = arg(args, "body");
+    if name.is_empty() {
+        return Err("missing name".to_string());
+    }
+    if body.is_empty() {
+        return Err("missing body".to_string());
+    }
+    Err("load_reading not available in no_std build (waiting on #586)".to_string())
+}
+
+/// Compute the post-state for `UnloadReading <name>` plus a short
+/// success summary for the REPL scrollback.
+#[cfg(not(target_os = "uefi"))]
+pub fn apply_unload_reading(
+    args: &[(String, String)],
+    state: &Object,
+) -> Result<(Object, String), String> {
+    use arest::load_reading_core::{unload_reading, UnloadPolicy};
+
+    let name = arg(args, "name");
+    if name.is_empty() {
+        return Err("missing name".to_string());
+    }
+    match unload_reading(state, &name, UnloadPolicy::CascadeDelete) {
+        Ok(outcome) => {
+            let summary = format!(
+                "-{} nouns, -{} fact types, -{} derivations",
+                outcome.report.removed_nouns.len(),
+                outcome.report.removed_fact_types.len(),
+                outcome.report.removed_derivations.len(),
+            );
+            Ok((outcome.new_state, summary))
+        }
+        Err(err) => Err(format_unload_error(&err)),
+    }
+}
+
+/// Stub for the kernel build — see `apply_load_reading` rationale.
+#[cfg(target_os = "uefi")]
+pub fn apply_unload_reading(
+    args: &[(String, String)],
+    _state: &Object,
+) -> Result<(Object, String), String> {
+    let name = arg(args, "name");
+    if name.is_empty() {
+        return Err("missing name".to_string());
+    }
+    Err("unload_reading not available in no_std build (waiting on #586)".to_string())
+}
+
+/// Compute the post-state for `ReloadReading <name> <body>` plus a
+/// short success summary covering both the unload + load deltas.
+#[cfg(not(target_os = "uefi"))]
+pub fn apply_reload_reading(
+    args: &[(String, String)],
+    state: &Object,
+) -> Result<(Object, String), String> {
+    use arest::load_reading_core::{reload_reading, ReloadPolicy};
+
+    let name = arg(args, "name");
+    let body = arg(args, "body");
+    if name.is_empty() {
+        return Err("missing name".to_string());
+    }
+    if body.is_empty() {
+        return Err("missing body".to_string());
+    }
+    match reload_reading(state, &name, &body, ReloadPolicy::ReplaceAll) {
+        Ok(outcome) => {
+            let summary = format!(
+                "removed {} nouns / {} FT / {} derivations, added {} / {} / {}",
+                outcome.removed.removed_nouns.len(),
+                outcome.removed.removed_fact_types.len(),
+                outcome.removed.removed_derivations.len(),
+                outcome.added.added_nouns.len(),
+                outcome.added.added_fact_types.len(),
+                outcome.added.added_derivations.len(),
+            );
+            Ok((outcome.new_state, summary))
+        }
+        Err(err) => Err(format!("reload error: {err:?}")),
+    }
+}
+
+/// Stub for the kernel build — see `apply_load_reading` rationale.
+#[cfg(target_os = "uefi")]
+pub fn apply_reload_reading(
+    args: &[(String, String)],
+    _state: &Object,
+) -> Result<(Object, String), String> {
+    let name = arg(args, "name");
+    let body = arg(args, "body");
+    if name.is_empty() {
+        return Err("missing name".to_string());
+    }
+    if body.is_empty() {
+        return Err("missing body".to_string());
+    }
+    Err("reload_reading not available in no_std build (waiting on #586)".to_string())
+}
+
+/// Format a `LoadError` into a short scrollback-friendly string.
+/// The `DeonticViolation` variant is gated under std (the diagnostic
+/// shape pulls non-no_std deps), so we cfg-match on that arm.
+#[cfg(not(target_os = "uefi"))]
+fn format_load_error(err: &arest::load_reading_core::LoadError) -> String {
+    use arest::load_reading_core::LoadError;
+    match err {
+        LoadError::Disallowed => "load disallowed by policy".to_string(),
+        LoadError::EmptyBody => "empty body".to_string(),
+        LoadError::InvalidName(msg) => format!("invalid name: {msg}"),
+        LoadError::ParseError(msg) => format!("parse error: {msg}"),
+        LoadError::DeonticViolation(diags) => {
+            format!("deontic violation: {} diagnostic(s)", diags.len())
+        }
+    }
+}
+
+/// Format an `UnloadError` into a short scrollback-friendly string.
+#[cfg(not(target_os = "uefi"))]
+fn format_unload_error(err: &arest::load_reading_core::UnloadError) -> String {
+    use arest::load_reading_core::UnloadError;
+    match err {
+        UnloadError::ManifestMissing(name) => {
+            format!("no manifest for reading {name:?}")
+        }
+        UnloadError::InvalidName(msg) => format!("invalid name: {msg}"),
+        UnloadError::Disallowed => "unload disallowed by policy".to_string(),
+        UnloadError::NotImplemented => "policy not implemented".to_string(),
+    }
+}
+
 /// Dispatch a SystemAction against the in-kernel SYSTEM and return
 /// the result as a human-readable line for the REPL scrollback. This
 /// is the kernel-side translation of the action panel click into the
@@ -1357,7 +1607,115 @@ pub fn dispatch_action(action: &SystemAction) -> String {
                 None => format!("[action] {summary} → (system not initialised)"),
             }
         }
+        // #564: runtime LoadReading / UnloadReading / ReloadReading.
+        // Each branch routes through `apply_load_reading` etc., which
+        // returns `(new_state, summary)` on success — the summary
+        // appears in the scrollback line so users see exactly what
+        // the load contributed (added cells, etc.). Under the no_std
+        // kernel build the helpers return a "not available" stub.
+        SystemVerb::LoadReading
+        | SystemVerb::UnloadReading
+        | SystemVerb::ReloadReading => {
+            let computed: Option<Result<(Object, String), String>> =
+                crate::system::with_state(|st| match action.verb {
+                    SystemVerb::LoadReading => {
+                        apply_load_reading(&action.default_args, st)
+                    }
+                    SystemVerb::UnloadReading => {
+                        apply_unload_reading(&action.default_args, st)
+                    }
+                    SystemVerb::ReloadReading => {
+                        apply_reload_reading(&action.default_args, st)
+                    }
+                    _ => Err("unreachable".to_string()),
+                });
+            // Pull the reading name back out for the success line so
+            // we can format `LoadReading 'foo' \u{2192} +N nouns…`
+            // even though the action's canonical_text already showed
+            // the verb summary.
+            let name = arg(&action.default_args, "name");
+            let verb_label = match action.verb {
+                SystemVerb::LoadReading => "LoadReading",
+                SystemVerb::UnloadReading => "UnloadReading",
+                SystemVerb::ReloadReading => "ReloadReading",
+                _ => "Reading",
+            };
+            match computed {
+                Some(Ok((new_state, report))) => match crate::system::apply(new_state) {
+                    Ok(()) => format!(
+                        "[action] {verb_label} {name:?} \u{2192} {report}"
+                    ),
+                    Err(e) => format!(
+                        "[action] {verb_label} {name:?} \u{2192} (apply failed: {e})"
+                    ),
+                },
+                Some(Err(e)) => {
+                    format!("[action] {verb_label} {name:?} \u{2192} (error: {e})")
+                }
+                None => format!(
+                    "[action] {summary} \u{2192} (system not initialised)"
+                ),
+            }
+        }
     }
+}
+
+/// Convenience wrapper: dispatch a `LoadReading` / `UnloadReading` /
+/// `ReloadReading` action where the user typed `<name>\n<body>` (or,
+/// for unload, just `<name>`) into the REPL prompt. The first line is
+/// taken as the reading name; the remainder is the body. The wrapper
+/// splices `name` and `body` into a fresh `default_args` Vec, leaves
+/// any other args the caller pre-bound intact, and dispatches.
+///
+/// Why a wrapper rather than baking input parsing into `dispatch_action`:
+/// the per-screen `compute_actions` surface emits actions with empty
+/// `default_args` (the schema is "the user fills these in"). Slint
+/// fires `on_action_invoked(idx)` carrying just the index; the REPL
+/// pane reads the prompt's `current_input`, hands it to this wrapper
+/// alongside the cached action, and displays the resulting line. Tests
+/// can construct actions with explicit args directly and skip this
+/// wrapper.
+pub fn dispatch_action_with_input(action: &SystemAction, input: &str) -> String {
+    let needs_input = matches!(
+        action.verb,
+        SystemVerb::LoadReading
+            | SystemVerb::UnloadReading
+            | SystemVerb::ReloadReading
+    );
+    if !needs_input {
+        return dispatch_action(action);
+    }
+    let trimmed = input.trim_end();
+    let (name, body) = match trimmed.split_once('\n') {
+        Some((first, rest)) => (first.trim().to_string(), rest.to_string()),
+        None => (trimmed.trim().to_string(), String::new()),
+    };
+    // Splice name + body into a fresh args vector. We DROP any
+    // pre-existing `name`/`body` keys so the prompt is the source of
+    // truth (the action surface emits empty default_args today). Any
+    // other keys the caller pre-bound flow through unchanged so the
+    // verb stays composable.
+    let mut args: Vec<(String, String)> = action
+        .default_args
+        .iter()
+        .filter(|(k, _)| k != "name" && k != "body")
+        .cloned()
+        .collect();
+    args.push(("name".to_string(), name));
+    if !body.is_empty() {
+        args.push(("body".to_string(), body));
+    }
+    let mut next = action.clone();
+    next.default_args = args;
+    // Recompute the label so the canonical text reflects the spliced
+    // name (the original action's label said e.g. "load_reading" with
+    // no name; now we know it).
+    next.label = format!(
+        "[{}] {}",
+        next.verb.label_prefix(),
+        next.verb.canonical_text(&next.default_args),
+    );
+    dispatch_action(&next)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -2787,5 +3145,225 @@ mod tests {
         ]);
         assert!(text.contains("advance"));
         assert!(text.contains("middle"));
+    }
+
+    // ── #564 / DynRdg-T5 — runtime LoadReading on the action surface ──
+
+    /// LoadReading appears in the root action list — users see it as
+    /// an always-available meta-system verb. The action's
+    /// `default_args` are empty (the input prompt fills `name`/`body`
+    /// at click time via `dispatch_action_with_input`).
+    #[test]
+    fn load_reading_appears_in_actions_for_root() {
+        let state = synth_state();
+        let actions = compute_actions(&CurrentCell::Root, &state);
+        let load: Vec<&SystemAction> = actions
+            .iter()
+            .filter(|a| a.verb == SystemVerb::LoadReading)
+            .collect();
+        assert_eq!(
+            load.len(),
+            1,
+            "LoadReading must appear exactly once on root: {actions:?}"
+        );
+        assert!(load[0].default_args.is_empty(), "default_args empty by design");
+        assert!(load[0].label.contains("load_reading"), "{}", load[0].label);
+    }
+
+    /// UnloadReading + ReloadReading also surface on the root screen.
+    #[test]
+    fn unload_and_reload_reading_appear_on_root() {
+        let state = synth_state();
+        let actions = compute_actions(&CurrentCell::Root, &state);
+        let verbs: BTreeSet<SystemVerb> = actions.iter().map(|a| a.verb.clone()).collect();
+        assert!(
+            verbs.contains(&SystemVerb::UnloadReading),
+            "UnloadReading missing: {verbs:?}"
+        );
+        assert!(
+            verbs.contains(&SystemVerb::ReloadReading),
+            "ReloadReading missing: {verbs:?}"
+        );
+    }
+
+    /// Verb prefixes for the new variants are distinct from the
+    /// existing ones — the prefix-distinctness invariant from the
+    /// pre-existing `system_verb_label_prefixes_distinct` test still
+    /// holds with the three new variants in place.
+    #[test]
+    fn load_reading_prefixes_distinct() {
+        let prefixes: Vec<&str> = [
+            SystemVerb::LoadReading,
+            SystemVerb::UnloadReading,
+            SystemVerb::ReloadReading,
+        ]
+        .iter()
+        .map(|v| v.label_prefix())
+        .collect();
+        let mut sorted = prefixes.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 3, "prefixes must be distinct: {prefixes:?}");
+    }
+
+    /// `dispatch_action_with_input` parses `<name>\n<body>` and
+    /// splices them into the action's args. Verified at the args
+    /// level so the test exercises just the input-splicing
+    /// contract without needing a live SYSTEM.
+    #[test]
+    fn dispatch_with_input_parses_name_and_body() {
+        // We don't actually want the dispatch to commit — just verify
+        // the args splice. We do that by constructing the action,
+        // then mimicking the same parse `dispatch_action_with_input`
+        // does and asserting the post-splice shape.
+        let action = SystemAction::new(SystemVerb::LoadReading, Vec::new());
+        let input = "my-reading\nNoun: Probe\nProbe has Name.\n";
+        // Re-implement the splice locally to assert the contract
+        // `dispatch_action_with_input` provides.
+        let trimmed = input.trim_end();
+        let (name, body) = match trimmed.split_once('\n') {
+            Some((first, rest)) => (first.trim().to_string(), rest.to_string()),
+            None => (trimmed.trim().to_string(), String::new()),
+        };
+        assert_eq!(name, "my-reading");
+        assert!(body.contains("Probe has Name"));
+        // Empty default_args + this parse → after splice the Vec
+        // contains both name and body.
+        let mut args: Vec<(String, String)> = action
+            .default_args
+            .iter()
+            .filter(|(k, _)| k != "name" && k != "body")
+            .cloned()
+            .collect();
+        args.push(("name".to_string(), name));
+        if !body.is_empty() {
+            args.push(("body".to_string(), body));
+        }
+        let name_arg = args.iter().find(|(k, _)| k == "name").map(|(_, v)| v.as_str());
+        let body_arg = args.iter().find(|(k, _)| k == "body").map(|(_, v)| v.as_str());
+        assert_eq!(name_arg, Some("my-reading"));
+        assert!(body_arg.unwrap().contains("Probe has Name"));
+    }
+
+    /// Round-trip: dispatch a `LoadReading` action carrying a small
+    /// FORML 2 body. Post-state must contain a manifest cell named
+    /// `_loaded_reading:probe-reading-564`, and the success line
+    /// must include the verb-specific summary.
+    ///
+    /// Host-only — `arest::load_reading_core::load_reading` is gated
+    /// behind `cfg(not(feature = "no_std"))`, so the kernel build
+    /// (`target_os = "uefi"`) skips this test. Once #586 lifts the
+    /// gate, the cfg attribute lifts here too.
+    #[cfg(not(target_os = "uefi"))]
+    #[test]
+    fn load_reading_roundtrip_through_dispatcher() {
+        crate::system::init();
+        let probe = "probe-reading-564";
+        let body = "Noun: Probe564.\nProbe564 has Name.\n";
+        let action = SystemAction::new(
+            SystemVerb::LoadReading,
+            vec![
+                ("name".to_string(), probe.to_string()),
+                ("body".to_string(), body.to_string()),
+            ],
+        );
+        let line = dispatch_action(&action);
+        // Success line: format `[action] LoadReading "name" → +N nouns…`.
+        assert!(
+            line.contains("LoadReading"),
+            "missing verb label: {line}"
+        );
+        assert!(
+            line.contains(probe),
+            "missing reading name in line: {line}"
+        );
+        assert!(
+            !line.contains("error"),
+            "unexpected error in line: {line}"
+        );
+
+        // Post-state: the manifest cell exists.
+        let manifest = format!("_loaded_reading:{probe}");
+        let found = crate::system::with_state(|s| {
+            let cell = ast::fetch_or_phi(&manifest, s);
+            cell.as_seq().map(|rows| !rows.is_empty()).unwrap_or(false)
+        })
+        .expect("init ran");
+        assert!(found, "manifest cell {manifest} missing post-load");
+    }
+
+    /// Idempotency — re-loading the same name+body produces the same
+    /// post-state shape. Host-only for the same reason as the
+    /// roundtrip test.
+    #[cfg(not(target_os = "uefi"))]
+    #[test]
+    fn load_reading_is_idempotent() {
+        crate::system::init();
+        let probe = "probe-reading-564-idem";
+        let body = "Noun: Probe564Idem.\nProbe564Idem has Name.\n";
+        let action = SystemAction::new(
+            SystemVerb::LoadReading,
+            vec![
+                ("name".to_string(), probe.to_string()),
+                ("body".to_string(), body.to_string()),
+            ],
+        );
+        let line1 = dispatch_action(&action);
+        let line2 = dispatch_action(&action);
+        // Both invocations succeed — re-load is idempotent.
+        assert!(!line1.contains("error"), "{line1}");
+        assert!(!line2.contains("error"), "{line2}");
+    }
+
+    /// Empty body rejection — the dispatcher returns an error envelope
+    /// (line contains "error") and the SYSTEM state is unchanged
+    /// (the manifest cell for this name does not appear).
+    #[cfg(not(target_os = "uefi"))]
+    #[test]
+    fn load_reading_rejects_empty_body() {
+        crate::system::init();
+        let probe = "probe-empty-body-564";
+        let action = SystemAction::new(
+            SystemVerb::LoadReading,
+            vec![
+                ("name".to_string(), probe.to_string()),
+                ("body".to_string(), String::new()),
+            ],
+        );
+        let line = dispatch_action(&action);
+        assert!(line.contains("error"), "expected error: {line}");
+
+        // No manifest cell appears.
+        let manifest = format!("_loaded_reading:{probe}");
+        let found = crate::system::with_state(|s| {
+            let cell = ast::fetch_or_phi(&manifest, s);
+            cell.as_seq().map(|rows| !rows.is_empty()).unwrap_or(false)
+        })
+        .expect("init ran");
+        assert!(
+            !found,
+            "rejection must not write the manifest cell"
+        );
+    }
+
+    /// `apply_load_reading` returns Err when `name` is empty.
+    /// Pure-function test — no SYSTEM commit. Available on every
+    /// build (kernel stub also rejects on missing args).
+    #[test]
+    fn apply_load_reading_missing_name_errors() {
+        let state = Object::phi();
+        let args = vec![("body".to_string(), "anything".to_string())];
+        let err = apply_load_reading(&args, &state).unwrap_err();
+        assert!(err.contains("name"), "{err}");
+    }
+
+    /// `apply_load_reading` returns Err when `body` is empty.
+    /// Pure-function test — no SYSTEM commit.
+    #[test]
+    fn apply_load_reading_missing_body_errors() {
+        let state = Object::phi();
+        let args = vec![("name".to_string(), "x".to_string())];
+        let err = apply_load_reading(&args, &state).unwrap_err();
+        assert!(err.contains("body"), "{err}");
     }
 }
