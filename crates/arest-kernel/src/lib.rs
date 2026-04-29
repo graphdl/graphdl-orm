@@ -249,6 +249,25 @@ pub fn arest_http_handler(req: &http::Request) -> http::Response {
         }
     }
 
+    // GET /arest/entities/{slug}/{id}/transitions — list legal
+    // next-step events for an entity's current state (#617/#618
+    // companion). Mirror of the worker's GET /api/entities/:noun/:id/
+    // transitions (router.ts:590). Sits before the generic GET /arest
+    // read fallback so the `/transitions` suffix isn't silently
+    // treated as a sub-id.
+    if req.method == "GET"
+        && req.path.starts_with("/arest/entities/")
+        && (req.path.ends_with("/transitions") || req.path.contains("/transitions?"))
+    {
+        let body = system::with_state(|s| {
+            arest::hateoas::handle_arest_transitions_for_entity(s, &req.method, &req.path)
+        });
+        if let Some(Some(body)) = body {
+            return http::Response::ok("application/json", body);
+        }
+        return http::Response::not_found();
+    }
+
     // POST /arest/entities/{slug}/{id}/transition — fire a
     // state-machine transition event (#617/#618). Sits *before* the
     // generic `/arest/entities/{slug}` create handler because the
