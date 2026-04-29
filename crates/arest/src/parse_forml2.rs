@@ -111,10 +111,15 @@ fn strip_existential_quantifiers(clause: &str) -> String {
 /// textually (e.g. Status is SM-managed).
 fn is_noun_has_noun_literal(clause: &str, noun_names: &[String]) -> bool {
     let trimmed = clause.trim().trim_end_matches('.');
-    let re = regex::Regex::new(r"^(.+?) has (.+?) '[^']*'$").expect("static");
-    let Some(caps) = re.captures(trimmed) else { return false; };
-    let subj = caps.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
-    let attr = caps.get(2).map(|m| m.as_str().trim()).unwrap_or_default();
+    // Hand-rolled equivalent of `^(.+?) has (.+?) '[^']*'$`.
+    // Strip the trailing space-prefixed quoted literal, then split on
+    // the first ` has ` to recover (subj, attr).
+    let Some((without_literal, _)) = strip_trailing_quoted_literal(trimmed) else {
+        return false;
+    };
+    let Some(idx) = without_literal.find(" has ") else { return false; };
+    let subj = without_literal[..idx].trim();
+    let attr = without_literal[idx + " has ".len()..].trim();
     let is_noun = |s: &str| noun_names.iter().any(|n| n == s);
     is_noun(subj) && is_noun(attr)
 }
@@ -253,9 +258,17 @@ fn is_entity_ref_scheme_literal(clause: &str, noun_names: &[String]) -> bool {
     let stripped = ["other ", "that ", "some ", "each ", "any ", "the ", "a ", "an "]
         .iter()
         .fold(trimmed, |s, q| s.strip_prefix(q).unwrap_or(s));
-    let re = regex::Regex::new(r"^(.+?) (?:is not|is) '[^']*'$").expect("static");
-    let Some(caps) = re.captures(stripped) else { return false; };
-    let raw_subj = caps.get(1).map(|m| m.as_str().trim()).unwrap_or_default();
+    // Hand-rolled `^(.+?) (?:is not|is) '[^']*'$`. Strip the trailing
+    // quoted literal, then peel off either ` is not` or ` is` from the
+    // right end. Existing code only consumes the captured subject.
+    let Some((without_literal, _)) = strip_trailing_quoted_literal(stripped) else {
+        return false;
+    };
+    let raw_subj = without_literal
+        .strip_suffix(" is not")
+        .or_else(|| without_literal.strip_suffix(" is"));
+    let Some(raw_subj) = raw_subj else { return false; };
+    let raw_subj = raw_subj.trim();
     let (base, _) = parse_role_token(raw_subj);
     noun_names.iter().any(|n| n == base)
 }
@@ -687,14 +700,31 @@ fn try_parse_aggregate_clause(text: &str, noun_names: &[String]) -> Option<(Stri
     // covers count/sum/avg/min/max plus their prose equivalents
     // (`earliest` / `latest` / `first` / `last`) which appear in
     // time-series readings like `Date is the earliest Timestamp`.
-    let re = regex::Regex::new(
-        r"^(.+?) is the (count|sum|avg|min|max|earliest|latest|first|last) of (.+?)(?: where (.+))?$"
-    ).expect("static regex compiles");
-    let caps = re.captures(t)?;
-    let role = caps.get(1)?.as_str().trim().to_string();
-    let op = caps.get(2)?.as_str().to_string();
-    let target = caps.get(3)?.as_str().trim().to_string();
-    let where_clause = caps.get(4).map(|m| m.as_str().trim().to_string()).unwrap_or_default();
+    // Hand-rolled equivalent of
+    //   ^(.+?) is the (count|sum|avg|min|max|earliest|latest|first|last)
+    //         of (.+?)(?: where (.+))?$
+    // Find leftmost ` is the `, then require the next token to be a
+    // recognised op followed by ` of `; everything after splits on
+    // an optional ` where ` clause.
+    const AGG_OPS: &[&str] = &[
+        "count", "sum", "avg", "min", "max",
+        "earliest", "latest", "first", "last",
+    ];
+    let is_the_idx = t.find(" is the ")?;
+    let role = t[..is_the_idx].trim().to_string();
+    let after_is_the = &t[is_the_idx + " is the ".len()..];
+    let (op, after_of) = AGG_OPS.iter().find_map(|op| {
+        let after_op = after_is_the.strip_prefix(op)?;
+        let after_of = after_op.strip_prefix(" of ")?;
+        Some(((*op).to_string(), after_of))
+    })?;
+    let (target, where_clause) = match after_of.find(" where ") {
+        Some(widx) => (
+            after_of[..widx].trim().to_string(),
+            after_of[widx + " where ".len()..].trim().to_string(),
+        ),
+        None => (after_of.trim().to_string(), String::new()),
+    };
     // Target must resolve against the noun catalog — either the full
     // string is a declared noun, or its first space-separated token
     // is (for compound role paths like `LineItem Amount` meaning the
@@ -738,17 +768,10 @@ fn try_parse_computed_binding(text: &str, noun_names: &[String]) -> Option<(Stri
 /// Returns `None` if any token fails to parse as an operand or operator.
 fn parse_arithmetic_expr(text: &str, noun_names: &[String]) -> Option<crate::types::ArithExpr> {
     use crate::types::ArithExpr;
-    let re = regex::Regex::new(r"\s*([+\-*/])\s*").expect("static regex compiles");
-    let mut tokens: Vec<String> = Vec::new();
-    let mut cursor = 0usize;
-    for m in re.find_iter(text) {
-        let head = text[cursor..m.start()].trim();
-        if !head.is_empty() { tokens.push(head.to_string()); }
-        tokens.push(m.as_str().trim().to_string());
-        cursor = m.end();
-    }
-    let tail = text[cursor..].trim();
-    if !tail.is_empty() { tokens.push(tail.to_string()); }
+    // Hand-rolled tokenizer equivalent to splitting on the regex
+    // `\s*([+\-*/])\s*` with `find_iter`: emit each `+ - * /` as its
+    // own token and treat the surrounding whitespace as a separator.
+    let tokens = tokenize_arith(text);
     if tokens.is_empty() { return None; }
 
     let parse_atom = |token: &str| -> Option<ArithExpr> {
@@ -810,16 +833,13 @@ fn split_top_level_and(text: &str) -> Vec<&str> {
 }
 
 fn split_antecedent_comparator(text: &str) -> (String, Option<(String, f64)>) {
-    let re = regex::Regex::new(
-        r"\s*(>=|<=|!=|<>|>|<|=)\s*(-?\d+(?:\.\d+)?)\s*$"
-    ).expect("static regex compiles");
-    match re.captures(text) {
-        Some(caps) => {
-            let whole = caps.get(0).unwrap();
-            let stripped = text[..whole.start()].trim_end().to_string();
-            let raw_op = caps.get(1).unwrap().as_str();
+    // Hand-rolled equivalent of
+    //   `\s*(>=|<=|!=|<>|>|<|=)\s*(-?\d+(?:\.\d+)?)\s*$`
+    // applied at end-of-string. See `peel_trailing_comparator` for
+    // the right-to-left scan that mirrors the regex match shape.
+    match peel_trailing_comparator(text) {
+        Some((stripped, raw_op, value)) => {
             let op = if raw_op == "<>" { "!=".to_string() } else { raw_op.to_string() };
-            let value: f64 = caps.get(2).unwrap().as_str().parse().unwrap_or(0.0);
             (stripped, Some((op, value)))
         }
         None => (text.to_string(), None),
@@ -1062,10 +1082,10 @@ fn resolve_derivation_rule(
     // re_resolve_rules re-runs this function and would otherwise
     // accumulate duplicates from prior passes.
     rule.consequent_role_literals.clear();
-    let trailing_literal_re = regex::Regex::new(r" '([^']*)'\s*$").expect("static");
-    let consequent_trailing_literal = trailing_literal_re
-        .captures(consequent_text)
-        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+    // Hand-rolled equivalent of regex ` '([^']*)'\s*$`: capture the
+    // single-quoted literal at end of string, after a leading space.
+    let consequent_trailing_literal =
+        strip_trailing_quoted_literal(consequent_text).map(|(_, lit)| lit);
     let resolved_consequent = resolve_fact_type(consequent_text).unwrap_or_default();
     rule.consequent_cell = crate::types::ConsequentCellSource::Literal(resolved_consequent);
     if let Some(lit) = consequent_trailing_literal {
@@ -1140,10 +1160,14 @@ fn resolve_derivation_rule(
         // AntecedentRoleLiteral after the FT resolves, so downstream
         // compilation can filter antecedent facts by that literal
         // (#286).
-        let literal_re = regex::Regex::new(r" '([^']*)'\s*$").expect("static");
-        let trailing_literal = literal_re.captures(&stripped)
-            .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
-        let destripped_literal = literal_re.replace(&stripped, "").to_string();
+        // Hand-rolled equivalent of regex ` '([^']*)'\s*$`: capture
+        // the trailing single-quoted literal (after a space) and the
+        // text with that segment removed.
+        let (destripped_literal, trailing_literal) =
+            match strip_trailing_quoted_literal(&stripped) {
+                Some((without, lit)) => (without, Some(lit)),
+                None => (stripped.clone(), None),
+            };
         let ft_resolved = resolve_fact_type(&stripped)
             .or_else(|| (dehyphenated != stripped).then(|| resolve_fact_type(&dehyphenated)).flatten())
             .or_else(|| (destripped_literal != stripped)
@@ -1607,8 +1631,452 @@ pub(crate) fn find_nouns(text: &str, noun_names: &[String]) -> Vec<(usize, usize
 }
 
 // =========================================================================
+// Hand-rolled string-matching helpers (replacing `regex::Regex` sites,
+// part of the `no_std` lift in #588). Each helper documents the regex
+// it stands in for and the call site that drove it.
+// =========================================================================
+
+/// Hand-rolled equivalent of regex ` '([^']*)'\s*$`.
+///
+/// Returns `Some((without_literal, captured))` when `s` ends in a
+/// space-prefixed single-quoted literal (optionally followed by
+/// trailing ASCII whitespace). The `without_literal` string mirrors
+/// what `regex::Regex::replace(s, "")` produces — i.e. `s` with the
+/// matched span removed. `captured` is the literal's interior.
+///
+/// Returns `None` when no such trailing literal is present.
+///
+/// Sites: 1065 (consequent text), 1143 (antecedent stripped form).
+fn strip_trailing_quoted_literal(s: &str) -> Option<(String, String)> {
+    // 1. Trim only ASCII whitespace from the right end (regex `\s` is
+    //    Unicode in default regex crate config but inputs here are
+    //    ASCII-only — no FORML reading uses non-ASCII whitespace).
+    let body = s.trim_end();
+    // 2. Body must end with a single quote.
+    let body = body.strip_suffix('\'')?;
+    // 3. The literal interior is everything after the *last*
+    //    space-prefixed quote that contains no inner quote.
+    //    `[^']*` between the two quotes means the literal cannot
+    //    itself contain a single quote, so we search backwards for
+    //    the opening ` '`.
+    let open = body.rfind(" '")?;
+    let interior = &body[open + 2..];
+    if interior.contains('\'') {
+        return None;
+    }
+    let captured = interior.to_string();
+    // 4. `without_literal` = everything before the leading space of
+    //    the literal segment. The regex match includes the trailing
+    //    `\s*`, so `replace` consumes it; we mirror that by dropping
+    //    everything from `open` onward.
+    let without_literal = s[..open].to_string();
+    Some((without_literal, captured))
+}
+
+/// Hand-rolled tokenizer equivalent to splitting on regex
+/// `\s*([+\-*/])\s*` via `find_iter`.
+///
+/// Walks the input, emits each `+ - * /` as its own token, and emits
+/// the maximal whitespace-trimmed run between operators as the
+/// surrounding operand tokens. Empty operands are dropped (matches
+/// the `if !head.is_empty()` guard the regex code used).
+///
+/// Site: 741 (parse_arithmetic_expr).
+fn tokenize_arith(text: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if matches!(c, b'+' | b'-' | b'*' | b'/') {
+            let head = text[start..i].trim();
+            if !head.is_empty() {
+                tokens.push(head.to_string());
+            }
+            tokens.push((c as char).to_string());
+            i += 1;
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    let tail = text[start..].trim();
+    if !tail.is_empty() {
+        tokens.push(tail.to_string());
+    }
+    tokens
+}
+
+/// Hand-rolled equivalent of trailing-comparator regex
+///   `\s*(>=|<=|!=|<>|>|<|=)\s*(-?\d+(?:\.\d+)?)\s*$`
+///
+/// Returns `Some((stripped, raw_op, value))` where:
+/// - `stripped` is the input with the trailing operator + numeric
+///   suffix removed and trailing whitespace trimmed (mirrors
+///   `text[..whole.start()].trim_end().to_string()`),
+/// - `raw_op` is the literal operator token (`>=`, `<=`, `!=`, `<>`,
+///   `>`, `<`, `=`) — caller normalises `<>` → `!=`,
+/// - `value` is the parsed `f64`.
+///
+/// Returns `None` if the input does not end in the comparator+number
+/// shape.
+///
+/// Site: 813 (split_antecedent_comparator).
+fn peel_trailing_comparator(text: &str) -> Option<(String, &'static str, f64)> {
+    // 1. Right-trim whitespace (matches the regex tail `\s*$`).
+    let s = text.trim_end();
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let end = bytes.len();
+    // 2. Walk backwards over the integer tail `\d+`.
+    let mut p = end;
+    while p > 0 && bytes[p - 1].is_ascii_digit() {
+        p -= 1;
+    }
+    if p == end {
+        return None; // no trailing digits at all
+    }
+    // 3. Optional `\.\d+` fractional suffix immediately before the
+    //    digit-tail we already consumed.
+    if p > 0 && bytes[p - 1] == b'.' {
+        let dot = p - 1;
+        let mut q = dot;
+        while q > 0 && bytes[q - 1].is_ascii_digit() {
+            q -= 1;
+        }
+        // Require at least one digit to the left of the dot, else
+        // `.5` would parse as part of the number but the regex
+        // `\d+\.\d+` requires `\d+` on the left.
+        if q < dot {
+            p = q;
+        }
+    }
+    // 4. Optional leading `-` directly attached to the number.
+    let num_start_with_sign = if p > 0 && bytes[p - 1] == b'-' {
+        p - 1
+    } else {
+        p
+    };
+    // 5. Try both with- and without-sign so the operator-detection
+    //    step can pick the variant that exposes a valid operator.
+    //    For input `... > -10`, with-sign reading "-10" leaves "..."
+    //    + ` > ` for the operator; without-sign reading "10" leaves
+    //    "... > -" which fails the operator match.
+    for &num_start in &[num_start_with_sign, p] {
+        let value: f64 = match s[num_start..end].parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        // 6. Skip whitespace between op and number (`\s*` after op).
+        let mut op_end = num_start;
+        while op_end > 0 && bytes[op_end - 1].is_ascii_whitespace() {
+            op_end -= 1;
+        }
+        // 7. Operator alternation, longest first (so `>=` beats `>`).
+        const OPS: &[&str] = &[">=", "<=", "!=", "<>", ">", "<", "="];
+        let Some(op) = OPS.iter().find(|op| {
+            op.len() <= op_end && &s[op_end - op.len()..op_end] == **op
+        }) else {
+            continue;
+        };
+        let op_start = op_end - op.len();
+        // 8. `stripped` mirrors `text[..whole.start()].trim_end()`.
+        //    `whole.start()` is the start of the leading `\s*` run
+        //    before the operator; trim_end on the slice up to the
+        //    operator gives the same result.
+        let stripped = text[..op_start].trim_end().to_string();
+        return Some((stripped, op, value));
+    }
+    None
+}
+
+// =========================================================================
 // Instance fact parsing (state machines)
 // =========================================================================
+
+#[cfg(test)]
+mod regex_replacement_tests {
+    use super::*;
+    use alloc::string::ToString;
+
+    // ── strip_trailing_quoted_literal ──────────────────────────────
+
+    #[test]
+    fn strip_trailing_literal_basic() {
+        let (without, lit) = strip_trailing_quoted_literal(
+            "Statement has Classification 'Entity Type Declaration'"
+        ).unwrap();
+        assert_eq!(without, "Statement has Classification");
+        assert_eq!(lit, "Entity Type Declaration");
+    }
+
+    #[test]
+    fn strip_trailing_literal_empty_interior() {
+        let (without, lit) = strip_trailing_quoted_literal("Foo has Bar ''").unwrap();
+        assert_eq!(without, "Foo has Bar");
+        assert_eq!(lit, "");
+    }
+
+    #[test]
+    fn strip_trailing_literal_with_trailing_ws() {
+        let (without, lit) = strip_trailing_quoted_literal(
+            "Task has Status 'Done'   "
+        ).unwrap();
+        assert_eq!(without, "Task has Status");
+        assert_eq!(lit, "Done");
+    }
+
+    #[test]
+    fn strip_trailing_literal_no_quote_returns_none() {
+        assert!(strip_trailing_quoted_literal("Task has Status Done").is_none());
+    }
+
+    #[test]
+    fn strip_trailing_literal_no_leading_space_returns_none() {
+        // The pattern requires a space before the opening quote.
+        assert!(strip_trailing_quoted_literal("'Done'").is_none());
+    }
+
+    #[test]
+    fn strip_trailing_literal_quote_not_at_end_returns_none() {
+        assert!(strip_trailing_quoted_literal("Foo 'mid' bar").is_none());
+    }
+
+    // ── tokenize_arith ─────────────────────────────────────────────
+
+    #[test]
+    fn tokenize_arith_simple() {
+        assert_eq!(tokenize_arith("Size * Size * Size"),
+                   alloc::vec!["Size", "*", "Size", "*", "Size"]);
+    }
+
+    #[test]
+    fn tokenize_arith_mixed_ops() {
+        assert_eq!(tokenize_arith("A + B - C * D / E"),
+                   alloc::vec!["A", "+", "B", "-", "C", "*", "D", "/", "E"]);
+    }
+
+    #[test]
+    fn tokenize_arith_no_spaces() {
+        assert_eq!(tokenize_arith("A+B"), alloc::vec!["A", "+", "B"]);
+    }
+
+    #[test]
+    fn tokenize_arith_lone_atom() {
+        assert_eq!(tokenize_arith("Size"), alloc::vec!["Size"]);
+    }
+
+    #[test]
+    fn tokenize_arith_empty() {
+        assert!(tokenize_arith("").is_empty());
+        assert!(tokenize_arith("   ").is_empty());
+    }
+
+    #[test]
+    fn tokenize_arith_drops_empty_operands_between_ops() {
+        // Two adjacent operators leave an empty middle operand,
+        // matching the regex code's `if !head.is_empty()` guard.
+        assert_eq!(tokenize_arith("A++B"),
+                   alloc::vec!["A", "+", "+", "B"]);
+    }
+
+    // ── peel_trailing_comparator ───────────────────────────────────
+
+    #[test]
+    fn peel_comparator_ge() {
+        let (stripped, op, v) = peel_trailing_comparator(
+            "has Population >= 1000000"
+        ).unwrap();
+        assert_eq!(stripped, "has Population");
+        assert_eq!(op, ">=");
+        assert!((v - 1_000_000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn peel_comparator_le() {
+        let (stripped, op, v) = peel_trailing_comparator("X <= 5").unwrap();
+        assert_eq!(stripped, "X");
+        assert_eq!(op, "<=");
+        assert!((v - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn peel_comparator_neq_long() {
+        let (stripped, op, v) = peel_trailing_comparator("X <> 0").unwrap();
+        assert_eq!(stripped, "X");
+        assert_eq!(op, "<>");
+        assert!((v - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn peel_comparator_neq_bang() {
+        let (stripped, op, _) = peel_trailing_comparator("X != 0").unwrap();
+        assert_eq!(stripped, "X");
+        assert_eq!(op, "!=");
+    }
+
+    #[test]
+    fn peel_comparator_short_ops_not_eaten_by_long() {
+        // `>` should not be re-promoted to `>=`.
+        let (stripped, op, _) = peel_trailing_comparator("X > 1").unwrap();
+        assert_eq!(stripped, "X");
+        assert_eq!(op, ">");
+    }
+
+    #[test]
+    fn peel_comparator_decimal() {
+        let (stripped, op, v) = peel_trailing_comparator("Score >= 99.5").unwrap();
+        assert_eq!(stripped, "Score");
+        assert_eq!(op, ">=");
+        assert!((v - 99.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn peel_comparator_negative() {
+        let (stripped, op, v) = peel_trailing_comparator("Delta > -10").unwrap();
+        assert_eq!(stripped, "Delta");
+        assert_eq!(op, ">");
+        assert!((v + 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn peel_comparator_no_op_returns_none() {
+        assert!(peel_trailing_comparator("Score 100").is_none());
+    }
+
+    #[test]
+    fn peel_comparator_no_number_returns_none() {
+        assert!(peel_trailing_comparator("Score >=").is_none());
+        assert!(peel_trailing_comparator("Score").is_none());
+    }
+
+    #[test]
+    fn peel_comparator_eq_alone() {
+        let (stripped, op, v) = peel_trailing_comparator("X = 7").unwrap();
+        assert_eq!(stripped, "X");
+        assert_eq!(op, "=");
+        assert!((v - 7.0).abs() < 1e-9);
+    }
+
+    // ── is_noun_has_noun_literal (site 114) ────────────────────────
+
+    #[test]
+    fn noun_has_noun_literal_matches() {
+        let nouns: alloc::vec::Vec<String> = ["Country", "Population"]
+            .iter().map(|s| s.to_string()).collect();
+        assert!(is_noun_has_noun_literal("Country has Population '1000000'", &nouns));
+    }
+
+    #[test]
+    fn noun_has_noun_literal_rejects_unknown_subject() {
+        let nouns: alloc::vec::Vec<String> = ["Population"].iter().map(|s| s.to_string()).collect();
+        assert!(!is_noun_has_noun_literal("Country has Population '1000000'", &nouns));
+    }
+
+    #[test]
+    fn noun_has_noun_literal_rejects_no_literal() {
+        let nouns: alloc::vec::Vec<String> = ["Country", "Population"]
+            .iter().map(|s| s.to_string()).collect();
+        assert!(!is_noun_has_noun_literal("Country has Population", &nouns));
+    }
+
+    // ── is_entity_ref_scheme_literal (site 256) ────────────────────
+
+    #[test]
+    fn ref_scheme_literal_matches_is() {
+        let nouns: alloc::vec::Vec<String> = ["Country"].iter().map(|s| s.to_string()).collect();
+        assert!(is_entity_ref_scheme_literal("Country is 'France'", &nouns));
+    }
+
+    #[test]
+    fn ref_scheme_literal_matches_is_not() {
+        let nouns: alloc::vec::Vec<String> = ["Country"].iter().map(|s| s.to_string()).collect();
+        assert!(is_entity_ref_scheme_literal("Country is not 'France'", &nouns));
+    }
+
+    #[test]
+    fn ref_scheme_literal_with_leading_quantifier() {
+        let nouns: alloc::vec::Vec<String> = ["Country"].iter().map(|s| s.to_string()).collect();
+        assert!(is_entity_ref_scheme_literal("the Country is 'France'", &nouns));
+    }
+
+    #[test]
+    fn ref_scheme_literal_rejects_unknown_noun() {
+        let nouns: alloc::vec::Vec<String> = ["Country"].iter().map(|s| s.to_string()).collect();
+        assert!(!is_entity_ref_scheme_literal("Region is 'EU'", &nouns));
+    }
+
+    #[test]
+    fn ref_scheme_literal_strips_subscript() {
+        let nouns: alloc::vec::Vec<String> = ["Person"].iter().map(|s| s.to_string()).collect();
+        assert!(is_entity_ref_scheme_literal("Person1 is 'Alice'", &nouns));
+    }
+
+    // ── try_parse_aggregate_clause (site 690) ──────────────────────
+
+    #[test]
+    fn aggregate_count_no_where() {
+        let nouns: alloc::vec::Vec<String> = ["Task"].iter().map(|s| s.to_string()).collect();
+        let (role, op, target, w) = try_parse_aggregate_clause(
+            "done Task Count is the count of Task", &nouns
+        ).unwrap();
+        assert_eq!(role, "done Task Count");
+        assert_eq!(op, "count");
+        assert_eq!(target, "Task");
+        assert_eq!(w, "");
+    }
+
+    #[test]
+    fn aggregate_with_where() {
+        let nouns: alloc::vec::Vec<String> = ["Task", "Status"].iter().map(|s| s.to_string()).collect();
+        let (role, op, target, w) = try_parse_aggregate_clause(
+            "done Task Count is the count of Task where Task has Status 'Done'", &nouns
+        ).unwrap();
+        assert_eq!(role, "done Task Count");
+        assert_eq!(op, "count");
+        assert_eq!(target, "Task");
+        assert_eq!(w, "Task has Status 'Done'");
+    }
+
+    #[test]
+    fn aggregate_earliest_op_with_of() {
+        let nouns: alloc::vec::Vec<String> = ["Timestamp", "Date"].iter().map(|s| s.to_string()).collect();
+        let (role, op, target, _) = try_parse_aggregate_clause(
+            "Date is the earliest of Timestamp", &nouns
+        ).unwrap();
+        assert_eq!(role, "Date");
+        assert_eq!(op, "earliest");
+        assert_eq!(target, "Timestamp");
+    }
+
+    #[test]
+    fn aggregate_strips_leading_that() {
+        let nouns: alloc::vec::Vec<String> = ["Task"].iter().map(|s| s.to_string()).collect();
+        let res = try_parse_aggregate_clause(
+            "that done Task Count is the count of Task", &nouns
+        );
+        assert!(res.is_some());
+    }
+
+    #[test]
+    fn aggregate_rejects_unknown_target() {
+        let nouns: alloc::vec::Vec<String> = ["Task"].iter().map(|s| s.to_string()).collect();
+        assert!(try_parse_aggregate_clause(
+            "X is the count of UnknownThing", &nouns
+        ).is_none());
+    }
+
+    #[test]
+    fn aggregate_rejects_non_aggregate() {
+        let nouns: alloc::vec::Vec<String> = ["Task"].iter().map(|s| s.to_string()).collect();
+        assert!(try_parse_aggregate_clause(
+            "Task is the boss of Task", &nouns
+        ).is_none());
+    }
+}
 
 
 
