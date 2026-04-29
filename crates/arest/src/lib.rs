@@ -103,15 +103,24 @@ pub mod json_min;
 // validate.rs deleted — zero production callers, tests were self-referential.
 #[cfg(not(feature = "no_std"))]
 pub mod conceptual_query;
-// #588 (lift Stage-2 to no_std). parse_forml2 still pulls regex +
-// host-only is_forbidden_url checks. stage1 + stage2 are getting
-// closer but still pull `crate::types` and `crate::evaluate` whose
-// no_std reachability hasn't been verified.
+// #588: parse_forml2 + parse_forml2_stage1 are no_std-clean (regex
+// hand-rolled in 49a26abd, types serde derives gated in 2751f1cf,
+// alloc imports already in place).
 pub mod parse_forml2;
 pub mod parse_forml2_stage1;
+// #588 stage2 flip blocked: `build_grammar_cache` reaches
+// `crate::compile::compile_to_defs_state` (no_std-gated) and uses
+// `serde_json::to_string` to canonicalize DerivationRuleDef. Lifting
+// stage2's gate requires either porting `compile.rs` to no_std (large)
+// or refactoring `build_grammar_cache` to skip serde-json round-tripping
+// for the bootstrap grammar (medium). Also depends on `std::thread_local!`
+// for the STMT_INDEX translator-block cache. Tracked alongside #588.
 #[cfg(not(feature = "no_std"))]
 pub mod parse_forml2_stage2;
-#[cfg(not(feature = "no_std"))]
+// `load_reading` is now a thin `pub use crate::load_reading_core::*`
+// shim (#586). Lifting the gate is purely re-export plumbing — the
+// pure-FORML core has always been no_std-aware; the function itself
+// is still cfg-gated inside `load_reading_core` (see comment below).
 pub mod load_reading;
 // `load_reading_core` (#586) — pure-FORML core extracted from
 // `load_reading` for kernel reach (mirroring JJJJJ's `select_component_core`
