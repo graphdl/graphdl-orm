@@ -165,15 +165,20 @@ pub mod select_component_core;
 // wires land in #575-#578.
 pub mod entropy;
 pub mod csprng;
-// `ai` (#agents-1) — install-once / call-anywhere LLM provider slot,
-// keyed off the `Model.code` carried by the agents metamodel
-// (`readings/templates/agents.md`). Pure transport surface (Provider
-// trait + global slot); the engine's verb→agent→model dispatch
-// (#agents-2) lands above this. no_std-clean — `spin::RwLock` is the
-// only sync primitive, and the kernel can install nothing (yielding
-// `AiError::NotInstalled` on every `/arest/extract` invocation today
-// without panicking).
-pub mod ai;
+// `externals` (#agents-1 reform) — doc + worked example for the
+// canonical "external function in DEFS" pattern. *No new machinery*:
+// the registration / dispatch / async / citation surface is entirely
+// in `ast.rs` (`register_runtime_fn`, `install_platform_fn`,
+// `install_async_platform_fn`, `apply_platform`, `apply_platform_async`,
+// `emit_citation_fact`). LLMs, HTTP-API integrations, hardware
+// sensors, and any future "external thing the engine calls out to"
+// all flow through this same single shape.
+//
+// The earlier `arest::ai` module duplicated this pattern with its own
+// trait + slot; deleted in this commit. See `externals` docs for the
+// LLM-shaped example.
+#[cfg(not(feature = "no_std"))]
+pub mod externals;
 #[cfg(not(feature = "no_std"))]
 pub mod check;
 // Storage-1: pluggable StorageBackend trait + in-mem/local-fs impls.
