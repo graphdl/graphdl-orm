@@ -165,6 +165,15 @@ pub mod select_component_core;
 // wires land in #575-#578.
 pub mod entropy;
 pub mod csprng;
+// `ai` (#agents-1) — install-once / call-anywhere LLM provider slot,
+// keyed off the `Model.code` carried by the agents metamodel
+// (`readings/templates/agents.md`). Pure transport surface (Provider
+// trait + global slot); the engine's verb→agent→model dispatch
+// (#agents-2) lands above this. no_std-clean — `spin::RwLock` is the
+// only sync primitive, and the kernel can install nothing (yielding
+// `AiError::NotInstalled` on every `/arest/extract` invocation today
+// without panicking).
+pub mod ai;
 #[cfg(not(feature = "no_std"))]
 pub mod check;
 // Storage-1: pluggable StorageBackend trait + in-mem/local-fs impls.

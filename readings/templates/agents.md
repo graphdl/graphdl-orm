@@ -23,6 +23,9 @@ Agent Definition has Name.
 Agent Definition uses Model.
   Each Agent Definition uses exactly one Model.
 
+Agent Definition has Prompt.
+  Each Agent Definition has exactly one Prompt.
+
 ### Agent
 Agent is instance of Agent Definition.
   Each Agent is instance of exactly one Agent Definition.
