@@ -59,6 +59,7 @@ pub mod close;
 pub mod dispatch;
 pub mod exit;
 pub mod futex;
+pub mod getrandom;
 pub mod openat;
 pub mod write;
 

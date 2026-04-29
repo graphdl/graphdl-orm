@@ -55,6 +55,7 @@
 use crate::syscall::close;
 use crate::syscall::exit;
 use crate::syscall::futex;
+use crate::syscall::getrandom;
 use crate::syscall::openat;
 use crate::syscall::write;
 
@@ -140,6 +141,17 @@ pub const SYS_OPENAT: u64 = 257;
 /// pending #545, all others -ENOSYS). Per #544 (Track YYYYY).
 pub const SYS_FUTEX: u64 = 202;
 
+/// Linux x86_64 syscall number for `getrandom(buf, buflen, flags)`.
+/// Source: `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_getrandom`
+/// (= 318). The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_getrandom`. Routes
+/// to `getrandom::handle`, which fills the userspace buffer from the
+/// kernel-wide ChaCha20 CSPRNG (seeded at boot from `arest::entropy`
+/// — RDSEED/RDRAND on UEFI x86_64 per #569, host CLI per #574). Caps
+/// at 1 MiB per call (POSIX-conformant short read). Flags are ignored
+/// — AREST has a single entropy stream. Per #576 (Track Rand-C2).
+pub const SYS_GETRANDOM: u64 = 318;
+
 /// The dispatch entry point. Match on `rax` and forward the argument
 /// registers (rdi / rsi / rdx / r10 / r8 / r9) to the per-syscall
 /// handler. Handlers that take fewer than six args simply ignore the
@@ -178,6 +190,14 @@ pub fn dispatch(
             // a FUTEX_WAKE stub; #544 (Track YYYYY) ships this slice,
             // #545 ships the real WAKE, #546+ ship REQUEUE / PI futex.
             futex::handle(rdi, rsi as u32, rdx as u32, r10, r8, r9 as u32)
+        }
+        SYS_GETRANDOM => {
+            // getrandom(buf, buflen, flags) per Linux's
+            // `linux/include/uapi/linux/random.h`. Three-arg syscall:
+            // rdi = buf, rsi = buflen, rdx = flags. Caps at 1 MiB
+            // per call (POSIX-conformant short read); flags are
+            // accepted but ignored — AREST has one CSPRNG stream.
+            getrandom::handle(rdi, rsi, rdx as u32)
         }
         SYS_EXIT | SYS_EXIT_GROUP => {
             // exit / exit_group both transition the Process state
@@ -261,6 +281,13 @@ mod tests {
     #[test]
     fn sys_futex_number_matches_linux_uapi() {
         assert_eq!(SYS_FUTEX, 202);
+    }
+
+    /// `SYS_GETRANDOM` is 318 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_getrandom`.
+    #[test]
+    fn sys_getrandom_number_matches_linux_uapi() {
+        assert_eq!(SYS_GETRANDOM, 318);
     }
 
     /// `futex(NULL, FUTEX_WAIT, 0, ...)` returns -EFAULT — null
