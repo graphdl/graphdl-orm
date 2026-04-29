@@ -27,6 +27,7 @@
 // Drop-oldest under back-pressure.
 
 use alloc::collections::VecDeque;
+use core::sync::atomic::{AtomicI32, Ordering};
 use spin::Mutex;
 
 /// One pointer event. Mirrors the subset of Linux input events that
@@ -135,6 +136,58 @@ pub fn push_pointer_event(event: PointerEvent) {
     push(event);
 }
 
+/// Persistent on-screen cursor position. Read by the per-frame
+/// cursor-sprite painter (`paint_cursor_sprite`) and seeded into the
+/// EV_REL accumulator at the top of every Slint pointer drain so
+/// relative motion deltas accumulate against the user's real screen
+/// position rather than resetting to (0, 0) every frame. Updated at
+/// the end of each `Sync` flush via `set_position`.
+///
+/// Two `AtomicI32` cells (rather than a `Mutex<(i32, i32)>`) so the
+/// cursor-sprite painter — which runs on the kernel super-loop's
+/// hot path between `draw_if_needed` and the `pause` idle — never
+/// contends with the drain side that's writing the next position.
+/// Reads/writes use `Relaxed` ordering: both axes are independent
+/// scalars, the painter's "torn" read of one axis from frame N and
+/// the other from frame N+1 is visually indistinguishable from a
+/// one-frame-late position (sub-millisecond display artefact, no
+/// correctness consequence). Same shape `keyboard.rs` doesn't need
+/// because keystrokes don't have a "current value" — only a queue.
+///
+/// Initial value (0, 0) is the pre-motion sentinel that
+/// `paint_cursor_sprite` checks for to skip painting the corner
+/// arrow on every boot before any pointer device has delivered an
+/// event.
+static CURSOR_X: AtomicI32 = AtomicI32::new(0);
+static CURSOR_Y: AtomicI32 = AtomicI32::new(0);
+
+/// Read the persistent cursor position. Returns `(x, y)` in screen
+/// pixels — same coordinate space the cursor-sprite painter and the
+/// Slint `WindowEvent::PointerMoved` LogicalPosition use.
+///
+/// Transitional shim for the launcher's super-loop (#647). The
+/// `pointer::drain` consumer in `drain_pointer_into_slint_window`
+/// seeds its EV_REL accumulator from this value so deltas survive
+/// across frames; the `paint_cursor_sprite` helper reads the same
+/// value to know where to draw the arrow. Both call sites want a
+/// plain `(i32, i32)` rather than the richer per-window state the
+/// future windowing surface (#459d) will track.
+pub fn current_position() -> (i32, i32) {
+    (CURSOR_X.load(Ordering::Relaxed), CURSOR_Y.load(Ordering::Relaxed))
+}
+
+/// Write the persistent cursor position. Called from the Slint
+/// pointer drain at each `PointerEvent::Sync` flush, after the
+/// EV_REL/EV_ABS accumulator has been dispatched as a single
+/// `WindowEvent::PointerMoved`.
+///
+/// Transitional shim for the launcher's super-loop (#647). See
+/// `current_position` for the two-`AtomicI32` rationale.
+pub fn set_position(x: i32, y: i32) {
+    CURSOR_X.store(x, Ordering::Relaxed);
+    CURSOR_Y.store(y, Ordering::Relaxed);
+}
+
 // ── Tests ──────────────────────────────────────────────────────────
 //
 // Kernel `[[bin]]` runs with `test = false` (Cargo.toml L98), so
@@ -166,5 +219,19 @@ mod tests {
             other => panic!("expected AbsMove(42, 17), got {:?}", other),
         }
         assert!(read_event().is_none());
+    }
+
+    /// `set_position` followed by `current_position` round-trips
+    /// the cursor coordinate. The launcher-side
+    /// `drain_pointer_into_slint_window` (Track XXXXX #466) and
+    /// `paint_cursor_sprite` (#596 follow-up) rely on this shim
+    /// to seed the EV_REL accumulator and to find the sprite's
+    /// draw location respectively (#647).
+    #[test]
+    fn current_position_round_trips_through_set_position() {
+        set_position(123, -45);
+        assert_eq!(current_position(), (123, -45));
+        set_position(0, 0);
+        assert_eq!(current_position(), (0, 0));
     }
 }
