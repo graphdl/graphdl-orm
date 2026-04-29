@@ -80,9 +80,16 @@ pub mod compile;
 pub mod evaluate;
 #[cfg(not(feature = "no_std"))]
 pub mod query;
-#[cfg(not(feature = "no_std"))]
 // induce.rs deleted — zero production callers, tests were self-referential.
-#[cfg(not(feature = "no_std"))]
+// rmap.rs is no_std-clean as of #653: hashbrown for HashMap/HashSet,
+// alloc for String/Vec, serde derives + the two `serde_json` Func-tree
+// entry points (`rmap_func` / `decode_rmap_result`) cfg-gated on
+// `std-deps`. The rmap procedure body itself (`rmap()` / `to_snake` /
+// `table_names` / `columns_for_table` / `primary_key_of_table` /
+// `unique_constraints_of_table` / `rmap_cell_map_from_state` /
+// `rmap_cells_from_state`) is no_std-clean and reachable from the
+// kernel. Lifted so `compile.rs` (which reaches all of those helpers)
+// can lift its own no_std gate (#653 / #588).
 pub mod rmap;
 // `naming` (pluralize / noun_to_slug / noun_to_table / resolve_slug_to_noun)
 // is pure alloc — no serde, no regex, no std. Lifted out of the no_std
