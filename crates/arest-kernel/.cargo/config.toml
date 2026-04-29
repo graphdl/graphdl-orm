@@ -13,3 +13,11 @@
 
 [build]
 target = "x86_64-unknown-uefi"
+
+# `cargo t` runs the lib tests on the host target instead of UEFI
+# (where std isn't linkable and the panic_handler in entry_uefi.rs
+# would collide with std's). Mirror of the arest crate's `t` alias
+# pattern. #582.
+[alias]
+t = "test --lib --target x86_64-pc-windows-msvc"
+c = "check --lib --target x86_64-pc-windows-msvc"
