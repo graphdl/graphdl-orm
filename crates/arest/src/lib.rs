@@ -65,10 +65,18 @@ pub mod types;
 pub mod freeze;
 pub mod row_shape;
 
-// Modules that depend on serde / serde_json / regex / hmac / std are
-// excluded from the no_std (kernel) build. The kernel only needs
-// `ast` (Object + Func + apply) and `freeze` (thaw from baked bytes).
-#[cfg(not(feature = "no_std"))]
+// compile.rs is no_std-clean as of #653: `profile_timer` already
+// cfg-selects between `std::time::Instant` (native std) and a
+// zero-duration stub (wasm + no_std). Every `serde_json::*` call site
+// is gated on either `std-deps` (the lossless JSON paths in
+// `cell_index_from_state` for ConstraintDef / DerivationRuleDef /
+// StateMachineDef) or `debug-def` (the `debug` def projection), both
+// of which are off in the kernel build. `std::collections::HashSet`
+// uses live in `#[cfg(test)] mod schema_tests`, which only compiles
+// in the host build. All `crate::rmap::*` reaches target the
+// no_std-clean helpers (#653 prep). Lifting so the kernel and stage-2
+// `bootstrap_grammar_state` can reach `compile_to_defs_state` once
+// stage-2 ports.
 pub mod compile;
 // evaluate.rs is no_std-clean as of #588: hashbrown for HashSet/HashMap,
 // alloc for String/Vec/Box, `crate::time_shim::Instant` for trace timing,
