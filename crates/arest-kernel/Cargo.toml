@@ -258,13 +258,13 @@ virtio-drivers = "0.11"
 # (design tokens / render tree) for the Slint surface, and the
 # stock templates (Organization / Agent) for the demo boot. The
 # `core` slice is always compiled in; the other three are explicit.
-arest = { path = "../arest", default-features = false, features = [
-    "no_std",
-    "core",
-    "ui-readings",
-    "os-readings",
-    "templates",
-] }
+# `arest` dep declared per-target below. `target_os = "uefi"` gets
+# the no_std build (kernel); everything else (Windows / Linux /
+# Darwin host) gets the std-deps build so `cargo t` (#582) can link
+# panic_handler / global_allocator out of std instead of colliding
+# with the kernel's own definitions in `entry_uefi*::panic`. The
+# `target_os = "uefi"` section moves the dep next to the other
+# UEFI-only deps further down.
 
 # Rust-osdev helpers for x86_64-specific structures — GDT, IDT, TSS,
 # page-table flags, privilege rings. Small, no-alloc, no-std. Only
@@ -313,6 +313,28 @@ pic8259 = "0.11"
 # PL011 MMIO (aarch64 arm) so it prints both pre- and post-EBS
 # without depending on BootServices.
 uefi = { version = "0.34", features = ["alloc", "logger"] }
+# arest engine — no_std build for the kernel target. Mirror is in
+# the `not(target_os = "uefi")` section below for `cargo t`.
+arest = { path = "../arest", default-features = false, features = [
+    "no_std",
+    "core",
+    "ui-readings",
+    "os-readings",
+    "templates",
+] }
+
+[target.'cfg(not(target_os = "uefi"))'.dependencies]
+# arest engine — std-deps build for host tests (`cargo t`, #582).
+# Lets the kernel `[lib]` test target resolve panic_handler /
+# global_allocator out of std rather than collide with the kernel's
+# own definitions in `entry_uefi*::panic`.
+arest = { path = "../arest", features = [
+    "std-deps",
+    "core",
+    "ui-readings",
+    "os-readings",
+    "templates",
+] }
 
 # x86_64-unknown-uefi specific deps (#344 cross-arch). wasmi powers
 # the Doom WASM host-shim (#270/#271/#376). `hash-collections` feature
