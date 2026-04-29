@@ -187,6 +187,53 @@ pub fn init() {
         ])]);
         initial = ast::cell_push("Noun", noun_sr, &initial);
 
+        // State-machine prerequisites for #617/#618 — `POST /arest/
+        // entities/support-requests/{id}/transition` walks
+        // `State Machine` (forResource → currentlyInStatus) and
+        // `Transition` (fromStatus + event → toStatus). Hand-stage:
+        //   * a State Machine row mirroring an SR's initial status,
+        //   * a Transition row that fires `categorize` from
+        //     `Received` → `Categorized` (apis e2e fixture at
+        //     `apis/__e2e__/arest.test.ts:286`).
+        // The SR entity itself isn't seeded — the e2e suite POSTs
+        // its own SR earlier in the test run (line 240). Operators
+        // wanting to exercise the seeded SM can manually `POST
+        // /arest/entities/support-requests` with `id=sr-1` first.
+        let noun_sm = Object::seq(alloc::vec![Object::seq(alloc::vec![
+            Object::atom("name"),
+            Object::atom("State Machine"),
+        ])]);
+        initial = ast::cell_push("Noun", noun_sm, &initial);
+        let noun_t = Object::seq(alloc::vec![Object::seq(alloc::vec![
+            Object::atom("name"),
+            Object::atom("Transition"),
+        ])]);
+        initial = ast::cell_push("Noun", noun_t, &initial);
+
+        let sm_demo = Object::seq(alloc::vec![
+            Object::seq(alloc::vec![Object::atom("id"), Object::atom("sm-sr-1")]),
+            Object::seq(alloc::vec![Object::atom("forResource"), Object::atom("sr-1")]),
+            Object::seq(alloc::vec![
+                Object::atom("currentlyInStatus"),
+                Object::atom("Received"),
+            ]),
+        ]);
+        initial = ast::cell_push("State Machine", sm_demo, &initial);
+
+        let t_categorize = Object::seq(alloc::vec![
+            Object::seq(alloc::vec![Object::atom("id"), Object::atom("t-categorize")]),
+            Object::seq(alloc::vec![
+                Object::atom("fromStatus"),
+                Object::atom("Received"),
+            ]),
+            Object::seq(alloc::vec![
+                Object::atom("toStatus"),
+                Object::atom("Categorized"),
+            ]),
+            Object::seq(alloc::vec![Object::atom("event"), Object::atom("categorize")]),
+        ]);
+        initial = ast::cell_push("Transition", t_categorize, &initial);
+
         // Box::leak gives us the `&'static Object` the slot stores.
         // The leak is intentional: the legacy `state()` shim returns
         // `&'static Object`, and `apply()`'s atomic-pointer-swap

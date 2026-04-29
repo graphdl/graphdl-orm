@@ -326,6 +326,187 @@ pub fn handle_arest_create(
     Some((new_state, response_body))
 }
 
+/// Handle a `POST /arest/entities/{slug}/{id}/transition` — fire a
+/// state-machine transition event. Mirror of the worker's
+/// `router.ts::POST /api/entities/:noun/:id/transition` (line 617),
+/// minus the engine path: the kernel direct-write fallback walks the
+/// `State Machine` cell (entity rows with `forResource` +
+/// `currentlyInStatus` bindings, mirror of the worker's DurableObject
+/// shape) to read current status, walks the `Transition` cell to find
+/// a matching `(fromStatus, event)` row, then rewrites the SM row's
+/// `currentlyInStatus` and pushes a new `Event` entity.
+///
+/// Returns `(new_state, response_bytes)` on success — caller commits
+/// via `system::apply` and emits the body. The response envelope
+/// mirrors the worker's:
+///
+///   `{"id":"...","noun":"...","previousStatus":"...","status":"...","event":"..."}`
+///
+/// `None` when:
+///   * Method isn't POST or the path doesn't end in `/transition`.
+///   * The slug doesn't resolve to a registered noun.
+///   * The body isn't valid JSON or `event` is missing/empty.
+///   * No State Machine row has `forResource == id`.
+///   * No Transition row matches `(currentStatus, event)`.
+///
+/// The kernel HTTP handler maps `None` to `404`/`400` per the worker's
+/// error envelope (`router.ts:646-671`); the engine path lands once
+/// #588 lifts Stage-2 to no_std and the kernel can compile readings
+/// at runtime.
+pub fn handle_arest_transition(
+    state: &Object,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> Option<(Object, Vec<u8>)> {
+    if method != "POST" {
+        return None;
+    }
+    let stripped = path.split('?').next().unwrap_or(path);
+    let inner = stripped.strip_prefix("/arest/entities/")?.trim_end_matches('/');
+    let inner = inner.strip_suffix("/transition")?.trim_end_matches('/');
+    if inner.is_empty() {
+        return None;
+    }
+
+    // Split into `{slug}/{id}` — id may itself contain percent-encoded
+    // characters (UUIDs don't, but the apis e2e suite encodes them
+    // anyway via `encodeURIComponent`). Reject paths with extra
+    // segments so e.g. `/arest/entities/X/Y/Z/transition` doesn't
+    // silently treat `Y/Z` as the id.
+    let mut parts = inner.splitn(2, '/');
+    let slug = parts.next()?;
+    let id_raw = parts.next()?;
+    if slug.is_empty() || id_raw.is_empty() || id_raw.contains('/') {
+        return None;
+    }
+    let id = percent_decode(id_raw);
+
+    // Resolve slug → noun. Same dual-lookup as
+    // `handle_arest_create_for_slug` (noun-name match first, then
+    // kebab-pluralised slug projection).
+    let slug_decoded = percent_decode(slug);
+    let noun = if crate::ast::fetch_or_phi("Noun", state)
+        .as_seq()
+        .map(|ns| ns.iter().any(|n| crate::ast::binding(n, "name") == Some(&slug_decoded)))
+        .unwrap_or(false)
+    {
+        slug_decoded.clone()
+    } else {
+        crate::naming::resolve_slug_to_noun(state, slug)
+            .or_else(|| crate::naming::resolve_slug_to_noun(state, &slug_decoded))?
+    };
+
+    // Body shape mirror of router.ts:620 — `{event, domain?}`.
+    let parsed = crate::json_min::parse(body)?;
+    let event = parsed.get("event").and_then(|v| v.as_str())?;
+    if event.is_empty() {
+        return None;
+    }
+
+    // Walk State Machine cell to find the row whose `forResource`
+    // matches `id`. We need both the row (to update) and its index
+    // (to swap in the rewritten copy).
+    let sm_cell = crate::ast::fetch_or_phi("State Machine", state);
+    let sm_seq = sm_cell.as_seq()?;
+    let (sm_idx, sm_row) = sm_seq
+        .iter()
+        .enumerate()
+        .find(|(_, sm)| crate::ast::binding(sm, "forResource") == Some(id.as_str()))?;
+    let current_status = crate::ast::binding(sm_row, "currentlyInStatus")?.to_string();
+
+    // Walk Transition cell for a row matching `(fromStatus, event)`.
+    // The worker's engine path additionally scopes by
+    // `forStateMachineDefinition`; the kernel direct-write fallback
+    // assumes one SM definition per noun (the apis e2e fixture
+    // `Support Request → Categorize` is the only flow exercised
+    // today), so the scoping reduces to (status, event).
+    let transitions_cell = crate::ast::fetch_or_phi("Transition", state);
+    let new_status = transitions_cell
+        .as_seq()?
+        .iter()
+        .find(|t| {
+            crate::ast::binding(t, "fromStatus") == Some(current_status.as_str())
+                && crate::ast::binding(t, "event") == Some(event)
+        })
+        .and_then(|t| crate::ast::binding(t, "toStatus"))?
+        .to_string();
+
+    // Rebuild State Machine cell with the matched row's
+    // `currentlyInStatus` updated. `cell_push` only appends, so we
+    // hand-build the new seq and `store` it whole.
+    let new_sm_row = update_binding(sm_row, "currentlyInStatus", &new_status);
+    let mut new_sm_vec: Vec<Object> = sm_seq.to_vec();
+    new_sm_vec[sm_idx] = new_sm_row;
+    let new_state = crate::ast::store("State Machine", Object::seq(new_sm_vec), state);
+
+    // Push a new `Event` entity recording the transition. Mirror of
+    // the worker's `arestResult.entities` Event persistence
+    // (router.ts:680-684). `forResource`/`type` are the cross-cutting
+    // role bindings the OpenAPI introspection (#148) surfaces.
+    let event_counter = NEXT_ENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let event_id = alloc::format!("evt-{:08x}", event_counter);
+    let event_entity = Object::seq(alloc::vec![
+        Object::seq(alloc::vec![Object::atom("id"), Object::atom(&event_id)]),
+        Object::seq(alloc::vec![Object::atom("forResource"), Object::atom(&id)]),
+        Object::seq(alloc::vec![Object::atom("type"), Object::atom(event)]),
+    ]);
+    let new_state = crate::ast::cell_push("Event", event_entity, &new_state);
+
+    // Build the response envelope — order keys to match the worker's
+    // `json({ id, noun, previousStatus, status, event, transitions })`
+    // (router.ts:686). `transitions` is omitted today because the
+    // direct-write fallback doesn't compute the legal next-step set
+    // (the engine path's job once #588 lands).
+    let mut out = String::new();
+    out.push('{');
+    out.push_str("\"id\":");
+    out.push_str(&json_string(&id));
+    out.push_str(",\"noun\":");
+    out.push_str(&json_string(&noun));
+    out.push_str(",\"previousStatus\":");
+    out.push_str(&json_string(&current_status));
+    out.push_str(",\"status\":");
+    out.push_str(&json_string(&new_status));
+    out.push_str(",\"event\":");
+    out.push_str(&json_string(event));
+    out.push('}');
+
+    Some((new_state, out.into_bytes()))
+}
+
+/// Replace (or append) the value at `key` in a named-tuple `entity`
+/// (`Seq([Seq([k,v]), ...])`). Used by the transition handler to
+/// rewrite an SM row's `currentlyInStatus` without disturbing other
+/// fields. Lives here rather than in `ast` because the named-tuple
+/// shape is a hateoas convention, not an engine primitive.
+fn update_binding(entity: &Object, key: &str, new_value: &str) -> Object {
+    let mut out: Vec<Object> = Vec::new();
+    let mut updated = false;
+    if let Some(pairs) = entity.as_seq() {
+        for pair in pairs {
+            if let Some(items) = pair.as_seq() {
+                if items.len() == 2 && items[0].as_atom() == Some(key) {
+                    out.push(Object::seq(alloc::vec![
+                        Object::atom(key),
+                        Object::atom(new_value),
+                    ]));
+                    updated = true;
+                    continue;
+                }
+            }
+            out.push(pair.clone());
+        }
+    }
+    if !updated {
+        out.push(Object::seq(alloc::vec![
+            Object::atom(key),
+            Object::atom(new_value),
+        ]));
+    }
+    Object::seq(out)
+}
+
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Per-process counter for entity-id generation in the direct-write
@@ -649,5 +830,243 @@ mod tests {
         assert_eq!(json_string("a\\b"), "\"a\\\\b\"");
         assert_eq!(json_string("a\nb"), "\"a\\nb\"");
         assert_eq!(json_string("a\tb"), "\"a\\tb\"");
+    }
+
+    /// Fixture: a state seeded with a Support Request entity, a State
+    /// Machine row pointing at it (currentlyInStatus = "Received"),
+    /// and a Transition row that turns "Received" + "categorize" into
+    /// "Categorized". Mirror of the apis e2e fixture
+    /// (`apis/__e2e__/arest.test.ts:286`) the kernel direct-write
+    /// fallback is the kernel-side counterpart for.
+    fn state_with_sr_state_machine(sr_id: &str) -> Object {
+        let s = Object::phi();
+        let s = cell_push("Noun", fact(&[("name", "Support Request")]), &s);
+        let s = cell_push("Noun", fact(&[("name", "State Machine")]), &s);
+        let s = cell_push("Noun", fact(&[("name", "Transition")]), &s);
+        let s = cell_push(
+            "Support Request",
+            fact(&[("id", sr_id), ("title", "alpha")]),
+            &s,
+        );
+        let s = cell_push(
+            "State Machine",
+            fact(&[
+                ("id", "sm-1"),
+                ("forResource", sr_id),
+                ("currentlyInStatus", "Received"),
+            ]),
+            &s,
+        );
+        cell_push(
+            "Transition",
+            fact(&[
+                ("id", "t-1"),
+                ("fromStatus", "Received"),
+                ("toStatus", "Categorized"),
+                ("event", "categorize"),
+            ]),
+            &s,
+        )
+    }
+
+    #[test]
+    fn transition_fires_categorize_event() {
+        let s = state_with_sr_state_machine("sr-1");
+        let body = br#"{"event":"categorize","domain":"support"}"#;
+        let (new_state, resp) = handle_arest_transition(
+            &s,
+            "POST",
+            "/arest/entities/support-requests/sr-1/transition",
+            body,
+        )
+        .expect("transition must succeed");
+
+        let resp = String::from_utf8(resp).unwrap();
+        assert!(resp.contains("\"id\":\"sr-1\""), "{resp}");
+        assert!(resp.contains("\"previousStatus\":\"Received\""), "{resp}");
+        assert!(resp.contains("\"status\":\"Categorized\""), "{resp}");
+        assert!(resp.contains("\"event\":\"categorize\""), "{resp}");
+
+        // SM row's currentlyInStatus is now Categorized — and the row
+        // is the *same* row (no append-by-mistake).
+        let sm = crate::ast::fetch_or_phi("State Machine", &new_state);
+        let sm_seq = sm.as_seq().expect("sm cell present");
+        assert_eq!(sm_seq.len(), 1, "SM cell must not gain a duplicate row");
+        assert_eq!(
+            crate::ast::binding(&sm_seq[0], "currentlyInStatus"),
+            Some("Categorized")
+        );
+
+        // Event row landed on the Event cell.
+        let events = crate::ast::fetch_or_phi("Event", &new_state);
+        let events_seq = events.as_seq().expect("event cell present");
+        assert_eq!(events_seq.len(), 1);
+        assert_eq!(crate::ast::binding(&events_seq[0], "type"), Some("categorize"));
+        assert_eq!(crate::ast::binding(&events_seq[0], "forResource"), Some("sr-1"));
+    }
+
+    #[test]
+    fn transition_accepts_kebab_pluralised_slug() {
+        // The worker's openapi/UI paths emit kebab-pluralised slugs
+        // (`/arest/entities/support-requests/...`). The kernel
+        // resolver must accept both forms (matching
+        // `handle_arest_create_for_slug`'s dual lookup).
+        let s = state_with_sr_state_machine("sr-2");
+        let body = br#"{"event":"categorize"}"#;
+        let result = handle_arest_transition(
+            &s,
+            "POST",
+            "/arest/entities/support-requests/sr-2/transition",
+            body,
+        );
+        assert!(result.is_some(), "kebab-pluralised slug must resolve");
+    }
+
+    #[test]
+    fn transition_rejects_non_post() {
+        let s = state_with_sr_state_machine("sr-1");
+        let body = br#"{"event":"categorize"}"#;
+        assert!(handle_arest_transition(
+            &s, "GET", "/arest/entities/SupportRequest/sr-1/transition", body
+        )
+        .is_none());
+        assert!(handle_arest_transition(
+            &s, "DELETE", "/arest/entities/SupportRequest/sr-1/transition", body
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn transition_rejects_path_without_transition_suffix() {
+        let s = state_with_sr_state_machine("sr-1");
+        let body = br#"{"event":"categorize"}"#;
+        // Missing /transition — this is the create path, not transition.
+        assert!(handle_arest_transition(
+            &s, "POST", "/arest/entities/SupportRequest/sr-1", body
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn transition_rejects_unknown_event() {
+        // SM exists, but no Transition row matches `(Received, escalate)`.
+        let s = state_with_sr_state_machine("sr-1");
+        let body = br#"{"event":"escalate"}"#;
+        let result = handle_arest_transition(
+            &s,
+            "POST",
+            "/arest/entities/SupportRequest/sr-1/transition",
+            body,
+        );
+        assert!(result.is_none(), "no transition for escalate from Received");
+    }
+
+    #[test]
+    fn transition_rejects_missing_state_machine() {
+        // Resource exists but no SM row points at it. The handler
+        // fails closed (None) so the kernel HTTP layer maps to 400 —
+        // mirror of the worker's 'Entity has no state machine' branch
+        // (router.ts:646-648).
+        let s = Object::phi();
+        let s = cell_push("Noun", fact(&[("name", "Support Request")]), &s);
+        let s = cell_push("Support Request", fact(&[("id", "sr-orphan")]), &s);
+        let body = br#"{"event":"categorize"}"#;
+        let result = handle_arest_transition(
+            &s,
+            "POST",
+            "/arest/entities/SupportRequest/sr-orphan/transition",
+            body,
+        );
+        assert!(result.is_none(), "no SM → None");
+    }
+
+    #[test]
+    fn transition_rejects_missing_event_field() {
+        let s = state_with_sr_state_machine("sr-1");
+        // Body has no `event` field.
+        let body = br#"{"domain":"support"}"#;
+        let result = handle_arest_transition(
+            &s,
+            "POST",
+            "/arest/entities/SupportRequest/sr-1/transition",
+            body,
+        );
+        assert!(result.is_none(), "missing event → None");
+    }
+
+    #[test]
+    fn transition_rejects_unknown_noun() {
+        let s = state_with_sr_state_machine("sr-1");
+        let body = br#"{"event":"categorize"}"#;
+        let result = handle_arest_transition(
+            &s,
+            "POST",
+            "/arest/entities/Widget/sr-1/transition",
+            body,
+        );
+        assert!(result.is_none(), "unknown noun → None");
+    }
+
+    #[test]
+    fn transition_preserves_unrelated_sm_rows() {
+        // Two SMs in the cell, one matching forResource, one not. The
+        // transition must update only the matching row and leave the
+        // other untouched.
+        let s = state_with_sr_state_machine("sr-1");
+        let s = cell_push(
+            "State Machine",
+            fact(&[
+                ("id", "sm-other"),
+                ("forResource", "sr-other"),
+                ("currentlyInStatus", "Received"),
+            ]),
+            &s,
+        );
+        let body = br#"{"event":"categorize"}"#;
+        let (new_state, _) = handle_arest_transition(
+            &s,
+            "POST",
+            "/arest/entities/support-requests/sr-1/transition",
+            body,
+        )
+        .expect("transition succeeds");
+        let sm = crate::ast::fetch_or_phi("State Machine", &new_state);
+        let sm_seq = sm.as_seq().expect("sm cell");
+        assert_eq!(sm_seq.len(), 2, "both rows preserved");
+        // Find each by id and check status — order isn't part of the contract.
+        let target_row = sm_seq
+            .iter()
+            .find(|r| crate::ast::binding(r, "id") == Some("sm-1"))
+            .expect("sm-1 still present");
+        assert_eq!(
+            crate::ast::binding(target_row, "currentlyInStatus"),
+            Some("Categorized")
+        );
+        let other_row = sm_seq
+            .iter()
+            .find(|r| crate::ast::binding(r, "id") == Some("sm-other"))
+            .expect("sm-other still present");
+        assert_eq!(
+            crate::ast::binding(other_row, "currentlyInStatus"),
+            Some("Received"),
+            "untouched SM keeps its prior status"
+        );
+    }
+
+    #[test]
+    fn update_binding_replaces_existing_value() {
+        let entity = fact(&[("id", "x"), ("currentlyInStatus", "A")]);
+        let updated = update_binding(&entity, "currentlyInStatus", "B");
+        assert_eq!(crate::ast::binding(&updated, "currentlyInStatus"), Some("B"));
+        // Other field preserved.
+        assert_eq!(crate::ast::binding(&updated, "id"), Some("x"));
+    }
+
+    #[test]
+    fn update_binding_appends_when_key_missing() {
+        let entity = fact(&[("id", "x")]);
+        let updated = update_binding(&entity, "currentlyInStatus", "A");
+        assert_eq!(crate::ast::binding(&updated, "currentlyInStatus"), Some("A"));
+        assert_eq!(crate::ast::binding(&updated, "id"), Some("x"));
     }
 }
