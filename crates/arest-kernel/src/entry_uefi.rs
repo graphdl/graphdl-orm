@@ -146,6 +146,12 @@ fn raw_com1_str(s: &str) {
 /// consoles don't drop characters. `writeln!` via core::fmt
 /// handles formatting without alloc — panic inside alloc would
 /// otherwise deadlock on the Talck mutex.
+// `cfg(not(test))` because `cargo test --lib` against the
+// `x86_64-unknown-uefi` target links `libstd`, which provides its own
+// `panic_impl` lang item. Without this gate the test build conflicts
+// with std's panic handler (#582). The runtime kernel always builds
+// without `cfg(test)`, so this gate is a pure test-only hatch.
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     use core::fmt::Write;
