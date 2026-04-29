@@ -15,28 +15,37 @@
 //
 // Native targets keep the real `std::time::Instant` so trace
 // telemetry on the CLI / kernel host still works as designed.
+//
+// Under `feature = "no_std"` (the kernel build) we route every
+// target to the zero-sentinel shim — there is no `std::time` to
+// reach for and the only consumer is the gated trace path, which
+// is compiled out anyway. This unblocks #588 (lifting Stage-2 to
+// no_std): once the shim is no_std-clean the parser cascade no
+// longer needs `std::time::Instant` in its closure of imports.
 
-#![cfg(feature = "std-deps")]
-
-#[cfg(not(target_arch = "wasm32"))]
+// Real `std::time::Instant` on std-host non-wasm targets.
+#[cfg(all(feature = "std-deps", not(target_arch = "wasm32")))]
 pub use std::time::Instant;
 
-#[cfg(target_arch = "wasm32")]
+// Zero-sentinel shim on wasm32 (`std::time::Instant::now()` panics
+// there) and on no_std builds (no `std::time` available).
+#[cfg(any(feature = "no_std", target_arch = "wasm32"))]
 #[derive(Clone, Copy)]
 pub struct Instant;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(feature = "no_std", target_arch = "wasm32"))]
 impl Instant {
     /// Always returns the same sentinel — wasm32 has no clock to
-    /// query. Cheap (compiles to a single MOV) so call sites can
+    /// query and the kernel's monotonic clock isn't piped through
+    /// here yet. Cheap (compiles to a single MOV) so call sites can
     /// keep their unconditional `let t = Instant::now()` shape.
     pub fn now() -> Self { Self }
 
     /// Always zero. The only consumer is the `AREST_STAGE12_TRACE`
     /// logging branch, which is gated on a non-wasm `env::var` and
-    /// therefore unreachable in the worker; if a future caller
-    /// asserts on elapsed time they get a clear "all zero" signal
-    /// rather than a panic.
+    /// therefore unreachable in the worker / kernel; if a future
+    /// caller asserts on elapsed time they get a clear "all zero"
+    /// signal rather than a panic.
     pub fn elapsed(&self) -> core::time::Duration {
         core::time::Duration::ZERO
     }
