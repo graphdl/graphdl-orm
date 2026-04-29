@@ -100,7 +100,16 @@ pub mod assets;
 pub mod dma;
 pub mod fonts;
 pub mod icons;
-#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+// `ui_apps` is the Slint-driven boot UI surface (Unified REPL,
+// launcher, keyboard, doom). Every submodule that touches the
+// runtime imports `slint::*`, and the launcher's `run(...)`
+// builder needs `arch::uefi::slint_backend::*` (also gated on
+// `feature = "slint"` below). #627 Profile-3: the whole tree
+// elides under the headless `--no-default-features --features
+// server` profile so the .efi link line drops the launcher
+// surface — the only call site is `entry_uefi.rs::kernel_run_uefi
+// → ui_apps::launcher::run(...)`, which is itself feature-gated.
+#[cfg(all(target_os = "uefi", target_arch = "x86_64", feature = "slint"))]
 pub mod ui_apps;
 pub mod framebuffer;
 pub mod composer;

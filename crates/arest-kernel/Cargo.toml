@@ -38,7 +38,20 @@ license = "AGPL-3.0-or-later"
 # unconditionally available on the UEFI x86_64 build); the gate is
 # pure source-level so the .efi footprint matches the licensing
 # story. See `crates/arest-kernel/doom_assets/README.md`.
-doom = []
+# `doom = ["slint"]` (#627 Profile-3 follow-up): the Doom app
+# (`ui_apps/doom.rs`) is a Slint `ComponentHandle` driver — the
+# launcher places it as the third icon in the Slint launcher
+# splash, and the per-frame timer rasterises into a
+# `slint::Image` via `SharedPixelBuffer::clone_from_slice`. So
+# pulling `--features doom` without `--features slint` would
+# fail to compile (the `use slint::{ComponentHandle, Image,
+# Rgba8Pixel, ...}` imports at the top of `ui_apps/doom.rs`
+# would be dangling). Composing `slint` into `doom` keeps the
+# old single-flag invocation (`--features doom` on a default
+# build, or `--features doom,server` for a server+doom build —
+# additive, so default brings slint anyway) working while
+# making the dep explicit.
+doom = ["slint"]
 # linuxkpi (#460 Track AAAA, foundation for the AREST-on-real-hardware
 # epic #459). FreeBSD-style Linux kernel API shim that lets unmodified
 # Linux C drivers link against AREST primitives. Off by default
@@ -170,7 +183,43 @@ busybox = []
 # task. The runtime gate alone is enough to demonstrate the server
 # edition's behavioural contract (HATEOAS reachable from the host)
 # and unblock the apis e2e suite against the kernel target.
+#
+# #627 Profile-3 follow-up: the `slint` feature below is the
+# first half of the profile split. With `--no-default-features
+# --features server`, neither the `slint` runtime crate nor its
+# `slint-build` host compiler dep are pulled in — the kernel
+# binary's link line drops the entire Slint surface (~hundreds of
+# KB of glyph atlases + `.slint` codegen + the software renderer)
+# and build.rs short-circuits past `slint_build::compile_*`. With
+# `--no-default-features --features mini`, both are pulled (mini
+# pulls in slint by composition; see the `mini` feature below).
 server = []
+# slint (#627 Profile-3). Gates the Slint UI toolkit dep + its
+# host-side `slint-build` compiler. When OFF: build.rs skips the
+# `.slint` compile pass; `arch::uefi::slint_backend`,
+# `arch::uefi::slint_input`, and the entire `ui_apps/*` tree are
+# elided from the crate graph; `entry_uefi::kernel_run_uefi`'s
+# launcher hand-off branch is unreachable. When ON (the default,
+# and pulled by the `mini` profile): the existing UEFI x86_64
+# Slint event-loop hand-off is back in scope. Server-only builds
+# (`--no-default-features --features server`) drop slint and
+# slint-build entirely from the build graph — that's the binary-
+# size + cold-build win the profile split unlocks.
+#
+# `dep:slint` / `dep:slint-build` syntax (Cargo 1.60+): pulls only
+# the explicit dep without auto-creating a `feature = "slint"`
+# alias on the runtime side. The `[target.cfg(...).dependencies]`
+# block for `slint` and the `[build-dependencies]` block for
+# `slint-build` both carry `optional = true` below to make the
+# `dep:` references resolve.
+slint = ["dep:slint", "dep:slint-build"]
+# mini (#631 / Profile-3 smoke harness). Composes the headless
+# `server` profile with the `slint` runtime so the boot path can
+# spin up a UI window for the smoke harness while the HATEOAS net
+# loop runs alongside. `ui-bundle` is pulled in too so the in-RAM
+# ui.do React bundle is served from the cell graph (matches the
+# behavioural contract the `mini` smoke asserts).
+mini = ["server", "slint", "ui-bundle"]
 # ui-bundle (#580). Gates the build-time bake of the ui.do React
 # bundle into the kernel binary. When ON, `build.rs` walks
 # `apps/ui.do/dist/` and emits a static `UI_ASSETS` table of
@@ -186,7 +235,28 @@ server = []
 # boot-time bake can be replaced with an HTTP fetch / freeze-blob
 # load that populates the same cells from a separate origin.
 ui-bundle = []
-default = []
+# Default feature set — `slint` so plain `cargo build --target
+# x86_64-unknown-uefi -p arest-kernel` (the developer build the
+# README documents) keeps booting into the Unified REPL launcher
+# that pre-#627 builds shipped. The headless `server` profile
+# opts out via `--no-default-features --features server`; the
+# `mini` smoke profile opts in via `--no-default-features
+# --features mini` (which composes `slint` back in alongside
+# server). Concrete table:
+#
+#   plain build               → slint runtime + launcher hand-off
+#   --features server         → slint runtime + server net-loop
+#                               (additive flags; both branches
+#                                compile, server wins at runtime)
+#   --no-default-features
+#     --features server       → no slint, no slint-build, server
+#                               net-loop (the headless build —
+#                                what the Dockerfile.uefi-server
+#                                container ships, smallest .efi)
+#   --no-default-features
+#     --features mini         → slint runtime + server net-loop
+#                               (smoke-harness build for #631)
+default = ["slint"]
 
 [lib]
 # #579 Track QQQQQ — extracted lib facade so `cargo test --lib -p
@@ -380,7 +450,14 @@ wasmi = { version = "0.50", default-features = false, features = ["hash-collecti
 # The framebuffer backend (#427) and the input/event-pump adapter
 # (#428) wire this dependency into the kernel; this commit only
 # adds it to the build graph.
-slint = { version = "1.16", default-features = false, features = [
+# `optional = true` — pulled only when the `slint` Cargo feature
+# is selected (#627 Profile-3). The `dep:slint` reference in the
+# `[features].slint = [...]` block above wires the resolution.
+# Default builds carry the dep (default = ["slint"]); the headless
+# server profile (`--no-default-features --features server`) drops
+# it from the build graph so the .efi link line + cold compile
+# graph both shrink.
+slint = { version = "1.16", default-features = false, optional = true, features = [
     "compat-1-2",
     "unsafe-single-threaded",
     "libm",
@@ -412,7 +489,16 @@ slint = { version = "1.16", default-features = false, features = [
 # (which is already resolved unconditionally for the runtime
 # `slint` crate's transitive deps anyway).
 [build-dependencies]
-slint-build = "1.16"
+# `optional = true` — only pulled when the `slint` Cargo feature
+# is on (#627 Profile-3). build.rs gates its
+# `slint_build::compile_with_config(...)` call on
+# `CARGO_FEATURE_SLINT` so the host doesn't even need slint-build's
+# sources resolved when the headless `server` profile is built
+# (`--no-default-features --features server`). Mirrors the
+# CARGO_FEATURE_LINUXKPI / CARGO_FEATURE_MUSL_LIBC /
+# CARGO_FEATURE_BUSYBOX / CARGO_FEATURE_UI_BUNDLE patterns
+# already in build.rs.
+slint-build = { version = "1.16", optional = true }
 # `cc` for the linuxkpi C-side compile (#460 Track AAAA). build.rs
 # only invokes `cc::Build` when CARGO_FEATURE_LINUXKPI is set, so this
 # dep is harmless on default builds (the `cc` crate itself is small

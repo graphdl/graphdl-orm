@@ -1485,7 +1485,15 @@ fn kernel_run_uefi(
     // Banner format mirrors the BIOS arm's "repl: line-buffered
     // keyboard REPL online (#183)" line so a smoke harness can
     // pattern-match the same family of phrases on either path.
-    #[cfg(not(feature = "server"))]
+    // #627 Profile-3: the "ui: launcher running" banner is now
+    // gated on `feature = "slint"` (was `not(feature = "server")`).
+    // The two features are orthogonal post-split — both can be ON
+    // (the `mini` smoke profile) so we don't want the slint banner
+    // suppressed just because `server` is also enabled. The server
+    // banner sits behind its own gate; when both fire, both
+    // banners print (and the runtime hand-off below picks one
+    // branch).
+    #[cfg(feature = "slint")]
     {
         println!("  repl:     line-buffered keyboard REPL online (#183/#365)");
         #[cfg(feature = "doom")]
@@ -1497,6 +1505,11 @@ fn kernel_run_uefi(
     #[cfg(feature = "server")]
     {
         println!("  server:   net+http loop running (HATEOAS only, no UI/REPL)");
+        println!();
+    }
+    #[cfg(not(any(feature = "slint", feature = "server")))]
+    {
+        println!("  warn:     neither `slint` nor `server` feature enabled — falling back to halt loop");
         println!();
     }
 
@@ -1521,7 +1534,13 @@ fn kernel_run_uefi(
     // for each submitted line; the BIOS-style `repl::process_key`
     // shim stays available for any future caller (e.g. a serial-
     // console fallback).
-    #[cfg(not(feature = "server"))]
+    // #627 Profile-3: `repl::init()` is the static line-buffer
+    // setup the Slint REPL app drives via `repl::evaluate_line`.
+    // It's only meaningful when slint is on — without slint the
+    // unified-repl panel never instantiates and nothing calls
+    // `evaluate_line`. Gated on `feature = "slint"` (was
+    // `not(feature = "server")`).
+    #[cfg(feature = "slint")]
     crate::repl::init();
 
     // Hand off to the Slint event loop. `launcher::run(...)` never
@@ -1544,6 +1563,15 @@ fn kernel_run_uefi(
     // arrives in under a second, and host curl on the QEMU hostfwd
     // port is reachable. HATEOAS routes registered on the
     // arest_http_handler take it from there.
+    //
+    // #627 Profile-3 ordering: the `feature = "server"` branch
+    // sits FIRST so that when both `server` and `slint` are
+    // enabled (the `mini` smoke profile, `--features mini`), the
+    // server net-loop wins — that's the same precedence today's
+    // `feature = "server"` build has, since slint never gets a
+    // chance to monopolise the CPU. The `feature = "slint"`
+    // branch (no server) is the launcher hand-off, identical to
+    // the pre-#627 default build.
     #[cfg(feature = "server")]
     {
         // Suppress the unused-binding warnings for the framebuffer
@@ -1554,8 +1582,21 @@ fn kernel_run_uefi(
             unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
         }
     }
-    #[cfg(not(feature = "server"))]
+    #[cfg(all(feature = "slint", not(feature = "server")))]
     crate::ui_apps::launcher::run(
         gop_w, gop_h, gop_stride, gop_fmt_idx, gop_ptr,
     );
+    // Fallback: neither `slint` nor `server` feature is enabled.
+    // This shouldn't happen with any documented profile (default
+    // includes `slint`; `server` and `mini` both opt in
+    // explicitly), but a misconfigured `--no-default-features`
+    // invocation lands here. Halt cleanly so the smoke harness
+    // sees a defined termination rather than a link-time error.
+    #[cfg(not(any(feature = "slint", feature = "server")))]
+    {
+        let _ = (gop_w, gop_h, gop_stride, gop_fmt_idx, gop_ptr);
+        loop {
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+        }
+    }
 }
