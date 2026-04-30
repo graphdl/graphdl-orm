@@ -24,7 +24,15 @@
 // longer needs `std::time::Instant` in its closure of imports.
 
 // Real `std::time::Instant` on std-host non-wasm targets.
-#[cfg(all(feature = "std-deps", not(target_arch = "wasm32")))]
+//
+// `not(feature = "no_std")` is critical when `std-deps + no_std` are
+// composed together (#592 feature-conflict cleanup): `pub use
+// std::time::Instant` would otherwise resolve `std::*` against a
+// crate that has `#![no_std]` set at the root, blowing up with
+// E0433. The no_std shim below already covers any feature combo
+// where `no_std` is on; gating the std re-export to
+// `not(feature = "no_std")` makes the two arms truly disjoint.
+#[cfg(all(feature = "std-deps", not(target_arch = "wasm32"), not(feature = "no_std")))]
 pub use std::time::Instant;
 
 // Zero-sentinel shim on wasm32 (`std::time::Instant::now()` panics

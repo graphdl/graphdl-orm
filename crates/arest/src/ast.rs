@@ -151,7 +151,12 @@ use hashbrown::HashMap;
 use crate::sync::Arc;
 use core::fmt;
 
-#[cfg(feature = "parallel")]
+// `parallel` requires std (rayon thread pools); the top-level
+// `compile_error!` in lib.rs (#592) rejects `no_std + parallel`, so
+// gating this import on `not(feature = "no_std")` is belt-and-braces
+// — keeps the unresolved-import diagnostic from drowning out the
+// clearer compile_error message if the user composes both anyway.
+#[cfg(all(feature = "parallel", not(feature = "no_std")))]
 use rayon::prelude::*;
 
 // ── Objects (data domain) ────────────────────────────────────────────
@@ -1924,7 +1929,7 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
         Func::Construction(funcs) => {
             // Serial under a fuel cap (thread-local, Rayon workers
             // would start at u64::MAX and escape the caller's bound).
-            #[cfg(feature = "parallel")]
+            #[cfg(all(feature = "parallel", not(feature = "no_std")))]
             if funcs.len() >= 16 && !fuel_is_bounded() {
                 let results: Vec<Object> = funcs.par_iter()
                     .map(|f| apply(f, x, d))
@@ -1953,7 +1958,7 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                     // Threshold 64: below this, Rayon spawn overhead exceeds gain.
                     // Stays serial under a fuel cap so the per-element
                     // debit is observed on this thread (fuel is thread-local).
-                    #[cfg(feature = "parallel")]
+                    #[cfg(all(feature = "parallel", not(feature = "no_std")))]
                     if items.len() >= 64 && !fuel_is_bounded() {
                         return Object::seq(
                             items.par_iter().map(|xi| apply(f, xi, d)).collect()
@@ -1983,7 +1988,7 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                 Some(items) => {
                     // Parallel filter falls back to serial when a fuel
                     // cap is in effect — same reasoning as ApplyToAll.
-                    #[cfg(feature = "parallel")]
+                    #[cfg(all(feature = "parallel", not(feature = "no_std")))]
                     if items.len() >= 64 && !fuel_is_bounded() {
                         let kept: Vec<Object> = items.par_iter()
                             .filter(|xi| apply(p, xi, d) == Object::t())

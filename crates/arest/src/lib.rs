@@ -8,6 +8,41 @@
 
 #![cfg_attr(feature = "no_std", no_std)]
 
+// ── Feature-conflict guards (#592) ─────────────────────────────────
+//
+// Some feature combinations cannot work and previously failed with
+// confusing E0432 / "no global allocator" / "missing impl" cascades.
+// Surface a clear message at the top of compilation so the caller
+// learns the actual constraint without chasing 40+ inner errors.
+//
+// `parallel` pulls `rayon`, which is built around `std::thread` /
+// `std::sync` thread pools. There is no `no_std` rayon path; even on
+// targets where the dep happens to compile (e.g. UEFI today, via
+// transitive resolver luck), the runtime would not have an OS thread
+// to schedule on. Reject the combination.
+#[cfg(all(feature = "no_std", feature = "parallel"))]
+compile_error!(
+    "feature combination not supported: `no_std` + `parallel` — rayon \
+     thread pools require std::thread; build the kernel without `parallel` \
+     (e.g. `--no-default-features --features no_std,core,...`)"
+);
+
+// `wit` brings in `wit-bindgen::generate!` which expands to an
+// `exports::arest::engine::engine::Guest` impl. The impl body in
+// `lib.rs` reaches `parse_and_compile_impl` / `release_impl` /
+// `system_impl`, all gated `#[cfg(not(feature = "no_std"))]` because
+// they pump through the std-only parser + command surface. Composing
+// `wit` with `no_std` therefore breaks at the Guest impl with three
+// E0425 "function not found" errors. The Cloudflare worker build is
+// the only `wit` consumer today and it always carries std-deps; the
+// kernel build does not need wit. Reject the combination.
+#[cfg(all(feature = "no_std", feature = "wit"))]
+compile_error!(
+    "feature combination not supported: `no_std` + `wit` — wit-bindgen \
+     Guest impls reach the std-only parser surface; the kernel build \
+     must omit `wit` (e.g. `--no-default-features --features no_std,core,...`)"
+);
+
 // `alloc` is brought in unconditionally so `alloc::sync::Arc` /
 // `alloc::boxed::Box` / `alloc::vec::Vec` resolve in both default
 // (std) and `no_std` builds. Under std, `alloc` is part of the
@@ -1902,17 +1937,25 @@ fn json_string_array(items: &[String]) -> String {
 }
 
 // ── WIT Component exports ───────────────────────────────────────────
+//
+// Doubly gated on `feature = "wit"` AND `not(feature = "no_std")`:
+// the Guest impl reaches `parse_and_compile_impl` / `release_impl` /
+// `system_impl`, all of which are themselves `#[cfg(not(feature =
+// "no_std"))]` (they pump through the std-only parser + command
+// surface). The top-of-file `compile_error!` covers the `no_std + wit`
+// combo with a clear message; this `not(no_std)` gate prevents the
+// downstream "cannot find function" cascade from drowning that out.
 
-#[cfg(feature = "wit")]
+#[cfg(all(feature = "wit", not(feature = "no_std")))]
 wit_bindgen::generate!({ world: "arest", path: "wit" });
 
-#[cfg(feature = "wit")]
+#[cfg(all(feature = "wit", not(feature = "no_std")))]
 struct E;
 
-#[cfg(feature = "wit")]
+#[cfg(all(feature = "wit", not(feature = "no_std")))]
 export!(E);
 
-#[cfg(feature = "wit")]
+#[cfg(all(feature = "wit", not(feature = "no_std")))]
 impl exports::arest::engine::engine::Guest for E {
     fn parse_and_compile(readings: Vec<(String, String)>) -> Result<u32, String> {
         parse_and_compile_impl(readings)
