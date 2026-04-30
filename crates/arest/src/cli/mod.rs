@@ -81,6 +81,16 @@ pub mod wine_launch;
 // today (per-target adapter job, see #575/#578).
 #[cfg(not(feature = "no_std"))]
 pub mod entropy_host;
+// `tenant_master_host` (#663) — host-CLI tenant master installer.
+// Generates 32 random bytes on first run, persists to
+// `~/.arest/tenant_master.bin` (mode 0600 on Unix, restricted ACL on
+// Windows), reads on subsequent runs. Wires into the cell_aead global
+// slot via `arest::cell_aead::install_tenant_master`. Boot order:
+// `entropy_host::install` first (csprng needs it for the seed), then
+// `tenant_master_host::install` (uses csprng to generate the master
+// on first run).
+#[cfg(not(feature = "no_std"))]
+pub mod tenant_master_host;
 // `reload` (#561) — `arest reload <file.md>` runtime reading load.
 // Routes through `crate::load_reading_core::load_reading` with
 // `LoadReadingPolicy::AllowAll` and persists the merged state to the

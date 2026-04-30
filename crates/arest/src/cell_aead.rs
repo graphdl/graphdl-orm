@@ -139,6 +139,86 @@ impl fmt::Debug for TenantMasterKey {
     }
 }
 
+// ── Process-global tenant master slot (#663) ───────────────────────
+//
+// Every target installs exactly one tenant master at boot:
+//
+//   * host CLI:  `~/.arest/tenant_master.bin` (32 random bytes,
+//                generated on first run, persisted with mode 0600).
+//                See `crate::cli::tenant_master_host`.
+//   * kernel:    bootstrap entropy + freeze-blob salt (HKDF-derive).
+//   * worker:    Cloudflare Secret + tenant_id (HKDF-derive).
+//
+// The slot is `spin::Once` (not `RwLock`) because the master is
+// install-once-and-read-thereafter — we never need to swap it after
+// boot, and `Once::call_once` gives us a one-shot install with no
+// runtime locking on the hot read path.
+//
+// Mirrors the shape of `crate::entropy::GLOBAL_SOURCE` but with
+// stricter "install exactly once" semantics: the entropy source can
+// be replaced (so tests can swap a `DeterministicSource`); the tenant
+// master cannot. Tests that need a different master construct one
+// inline via `TenantMasterKey::from_bytes` rather than touching the
+// global.
+
+/// Process-wide tenant master, installed once at boot. `None` until
+/// `install_tenant_master` runs; returning `None` from
+/// `current_tenant_master` after that lets call sites distinguish
+/// "the boot path forgot to install" from "decryption failed".
+static GLOBAL_TENANT_MASTER: spin::Once<TenantMasterKey> = spin::Once::new();
+
+/// Install the process-wide tenant master. Called exactly once during
+/// early boot — any subsequent calls are silently ignored by the
+/// `Once` semantics (the first install wins). Targets that need a
+/// different master across runs MUST be in different processes;
+/// tests instantiating `TenantMasterKey` ad-hoc don't go through this
+/// slot at all.
+///
+/// The boot order is: `entropy::install` first (so `csprng` can lazy-
+/// seed), THEN this — the host CLI's `install_or_generate_master` may
+/// call `csprng::random_bytes` to produce the 32 bytes when the master
+/// file is absent, and that path requires an installed entropy source.
+pub fn install_tenant_master(master: TenantMasterKey) {
+    GLOBAL_TENANT_MASTER.call_once(|| master);
+}
+
+/// Borrow the installed tenant master. Returns `None` until
+/// `install_tenant_master` has run (boot bug — surface as a clear
+/// error at the call site rather than panicking). Cheap; no locking
+/// on the read path.
+pub fn current_tenant_master() -> Option<&'static TenantMasterKey> {
+    GLOBAL_TENANT_MASTER.get()
+}
+
+/// Test-only: clear the installed master. The `Once` slot has no
+/// public reset — this resorts to `unsafe` to mutate the static so
+/// host-side tests that install/uninstall across cases work.
+/// Production code MUST NOT call this.
+///
+/// Held under the same cross-module test lock as the entropy slot
+/// (`entropy::TEST_LOCK`) so concurrent cases can't observe a torn
+/// state.
+///
+/// Safety: the `Once` API doesn't expose reset; the only reader is
+/// `current_tenant_master`, which is read-only. Tests that call
+/// this must hold `entropy::TEST_LOCK` to serialize with all other
+/// global-slot mutators in the crate.
+#[cfg(test)]
+#[allow(dead_code)]
+#[allow(invalid_reference_casting)]
+pub(crate) fn reset_tenant_master_for_test() {
+    // The const-to-mut pointer cast trips `invalid_reference_casting`
+    // (a deny-by-default lint as of recent rustc). The only reader is
+    // `current_tenant_master`, and tests serialize via
+    // `entropy::TEST_LOCK`, so concurrent observation isn't possible.
+    unsafe {
+        let p = &GLOBAL_TENANT_MASTER as *const spin::Once<TenantMasterKey>
+            as *mut spin::Once<TenantMasterKey>;
+        core::ptr::write(p, spin::Once::new());
+    }
+}
+
+
 // ── Cell address ───────────────────────────────────────────────────
 
 /// Canonical four-tuple identifying a cell across the engine. Acts as
@@ -543,5 +623,52 @@ mod tests {
         let s = format!("{:?}", m);
         assert!(s.contains("redacted"), "Debug must redact: got {s}");
         assert!(!s.contains("85"), "Debug must not surface byte 0x55 (= 85)");
+    }
+
+    // ── Process-global tenant master slot (#663) ────────────────────
+
+    /// `current_tenant_master` must return `None` when nothing has
+    /// been installed. The boot path uses this to fail loudly rather
+    /// than panicking on a missing master.
+    #[test]
+    fn current_tenant_master_is_none_until_installed() {
+        let _guard = entropy::TEST_LOCK.lock();
+        reset_tenant_master_for_test();
+        assert!(current_tenant_master().is_none(),
+            "uninstalled slot must read as None");
+    }
+
+    /// `install_tenant_master` followed by `current_tenant_master`
+    /// must hand back the exact bytes — same `as_bytes()` value as
+    /// went in. This is the core read-after-write contract the host
+    /// CLI boot path relies on.
+    #[test]
+    fn install_then_current_returns_same_bytes() {
+        let _guard = entropy::TEST_LOCK.lock();
+        reset_tenant_master_for_test();
+        let bytes = [0x42u8; CELL_KEY_LEN];
+        install_tenant_master(TenantMasterKey::from_bytes(bytes));
+        let got = current_tenant_master().expect("after install, slot must be Some");
+        assert_eq!(got.as_bytes(), &bytes);
+        reset_tenant_master_for_test();
+    }
+
+    /// `Once` semantics: a second install is a no-op (first install
+    /// wins). Production paths install exactly once at boot, so this
+    /// pins behaviour for the "boot script accidentally calls install
+    /// twice" scenario — the second call must NOT silently swap the
+    /// master out from under in-flight cell_seal callers.
+    #[test]
+    fn second_install_is_a_no_op() {
+        let _guard = entropy::TEST_LOCK.lock();
+        reset_tenant_master_for_test();
+        let first = [0x11u8; CELL_KEY_LEN];
+        let second = [0x99u8; CELL_KEY_LEN];
+        install_tenant_master(TenantMasterKey::from_bytes(first));
+        install_tenant_master(TenantMasterKey::from_bytes(second));
+        let got = current_tenant_master().unwrap();
+        assert_eq!(got.as_bytes(), &first,
+            "Once::call_once: first install must win, second is silently dropped");
+        reset_tenant_master_for_test();
     }
 }
