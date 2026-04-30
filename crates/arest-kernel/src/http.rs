@@ -49,6 +49,7 @@ impl Status {
             409 => "Conflict",
             500 => "Internal Server Error",
             501 => "Not Implemented",
+            503 => "Service Unavailable",
             _ => "Unknown",
         }
     }
@@ -70,17 +71,32 @@ pub struct Request {
 /// `Cache-Control` is optional so API responses (no sensible cache
 /// policy at this layer) stay header-light while static assets
 /// (#266) emit the right directive per path.
+///
+/// `retry_after` (#620 / HATEOAS-6b) carries an opaque pointer string
+/// for the `Retry-After` header. Per RFC 7231 §7.1.3 this is normally
+/// a delay-seconds or HTTP-date, but the kernel's 503-on-no-LLM-body
+/// envelope re-purposes it as a worker URL the caller can re-issue
+/// the request against — same intent ("come back here when this
+/// request can succeed"), wider target. Optional so legacy responses
+/// stay header-light.
 #[derive(Debug)]
 pub struct Response {
     pub status: Status,
     pub content_type: &'static str,
     pub cache_control: Option<&'static str>,
+    pub retry_after: Option<String>,
     pub body: Vec<u8>,
 }
 
 impl Response {
     pub fn ok(content_type: &'static str, body: Vec<u8>) -> Self {
-        Self { status: Status(200), content_type, cache_control: None, body }
+        Self {
+            status: Status(200),
+            content_type,
+            cache_control: None,
+            retry_after: None,
+            body,
+        }
     }
 
     /// `ok` with an explicit Cache-Control directive — used by the
@@ -95,6 +111,7 @@ impl Response {
             status: Status(200),
             content_type,
             cache_control: Some(cache_control),
+            retry_after: None,
             body,
         }
     }
@@ -104,6 +121,7 @@ impl Response {
             status: Status(404),
             content_type: "text/plain",
             cache_control: None,
+            retry_after: None,
             body: b"Not Found\n".to_vec(),
         }
     }
@@ -113,6 +131,7 @@ impl Response {
             status: Status(400),
             content_type: "text/plain",
             cache_control: None,
+            retry_after: None,
             body: msg.as_bytes().to_vec(),
         }
     }
@@ -122,7 +141,29 @@ impl Response {
             status: Status(500),
             content_type: "text/plain",
             cache_control: None,
+            retry_after: None,
             body: msg.as_bytes().to_vec(),
+        }
+    }
+
+    /// 503 Service Unavailable with a `Retry-After` header carrying an
+    /// opaque pointer (#620 / HATEOAS-6b). Used by the
+    /// `POST /arest/extract` handler to surface "the verb is
+    /// registered but no LLM body is installed in this profile;
+    /// re-issue against `<retry_after>`". Body is JSON envelope bytes
+    /// the caller renders out of the introspectable Agent Definition
+    /// metadata.
+    pub fn service_unavailable_with_retry_after(
+        content_type: &'static str,
+        retry_after: String,
+        body: Vec<u8>,
+    ) -> Self {
+        Self {
+            status: Status(503),
+            content_type,
+            cache_control: None,
+            retry_after: Some(retry_after),
+            body,
         }
     }
 
@@ -143,6 +184,9 @@ impl Response {
         ));
         if let Some(cache) = self.cache_control {
             write_fmt(&mut out, format_args!("Cache-Control: {}\r\n", cache));
+        }
+        if let Some(retry_after) = &self.retry_after {
+            write_fmt(&mut out, format_args!("Retry-After: {}\r\n", retry_after));
         }
         out.extend_from_slice(b"Connection: close\r\n\r\n");
         out.extend_from_slice(&self.body);

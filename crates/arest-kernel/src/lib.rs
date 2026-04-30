@@ -257,6 +257,36 @@ pub fn arest_http_handler(req: &http::Request) -> http::Response {
         }
     }
 
+    // POST /arest/extract — agent verb dispatch (#620 / HATEOAS-6b).
+    // The verb is registered as `Func::Platform("extract")` at boot
+    // (`system::init`), but the kernel profile installs no body —
+    // so `apply` returns `Object::Bottom` and `dispatch_extract`
+    // lifts that into the structured 503 envelope with the
+    // `Retry-After: <worker-url>` header. Sits *before* the generic
+    // HATEOAS read fallback so the path isn't silently treated as a
+    // slug ("extract" would resolve to a nonexistent Noun and 404,
+    // hiding the introspectable envelope). When a body is installed
+    // (e.g. via `externals::install_async_platform_fn` in a future
+    // worker-shaped profile), this same branch returns 200 with the
+    // serialised result. Branch-free dispatch — same code path runs
+    // regardless of body presence; the outcome's status is what
+    // varies. See `system::dispatch_extract` for the full envelope
+    // shape.
+    if req.method == "POST" && req.path == "/arest/extract" {
+        let outcome = system::dispatch_extract(&req.body);
+        if outcome.status == 200 {
+            return http::Response::ok("application/json", outcome.body);
+        }
+        let retry_after = outcome
+            .retry_after
+            .unwrap_or_else(|| alloc::string::String::from(system::EXTRACT_WORKER_URL));
+        return http::Response::service_unavailable_with_retry_after(
+            "application/json",
+            retry_after,
+            outcome.body,
+        );
+    }
+
     // POST /arest/entity — AREST command path (#614/#615), engine-less
     // direct-write fallback. Mirror of the worker's
     // `router.ts::handleArestRoute` POST branch when the engine traps.
