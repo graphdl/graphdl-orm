@@ -111,47 +111,101 @@ function Test-KnownFailure {
 }
 
 # Run a native command, capture stdout+stderr to a temp file, return
-# (exitCode, capturedOutput, elapsedSeconds). Defeats PowerShell 5.1's
-# stderr-as-ErrorRecord behaviour by relying on the file capture.
+# (exitCode, capturedOutput, elapsedSeconds).
+#
+# We delegate redirection to cmd.exe rather than using PowerShell's
+# Start-Process -RedirectStandardOutput / -RedirectStandardError. PS 5.1's
+# implementation deadlocks here on long-running cargo runs (observed:
+# stage 1 hung after writing the header line, no cargo child surviving,
+# 0% CPU on the parent for hours). cmd.exe's `>file 2>&1` is bulletproof
+# on Windows and avoids the NativeCommandError wrapping that bites us in
+# PS 5.1 when redirecting native stderr through pipelines.
 function Invoke-Capture {
     param(
         [string]$Cmd,
         [string[]]$CmdArgs,
-        [string]$WorkingDir
+        [string]$WorkingDir,
+        # Hard wall-clock cap. If the child hasn't exited within this many
+        # seconds, kill the process tree and return Exit=-1 with a marker
+        # in the captured output. 0 disables the cap. Set per-stage to keep
+        # one runaway test (e.g. a vitest worker that holds workerd alive)
+        # from blocking the orchestration script for hours.
+        [int]$TimeoutSec = 0
     )
     $tmpOut = New-TemporaryFile
-    $tmpErr = New-TemporaryFile
     $start = Get-Date
-    $prevEAP = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
     $exit = 0
+    # Use System.Diagnostics.Process directly with async stdout/stderr
+    # capture. Start-Process -Wait deadlocks on long-running cargo runs even
+    # when redirecting to files (observed: stage 1 hangs with cmd.exe wrapper
+    # alive but no cargo/rustc child surviving, no progress for tens of
+    # minutes). The PSI + BeginOutputReadLine pattern is the canonical Windows
+    # solution: drain both pipes asynchronously while waiting for exit.
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Cmd
+    # PS 5.1's PSI takes a single Arguments string (no ArgumentList collection).
+    # Quote args containing whitespace; pass others as-is.
+    $argString = ($CmdArgs | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ($_ -replace '"','\"') + '"' } else { $_ }
+    }) -join ' '
+    $psi.Arguments = $argString
+    $psi.WorkingDirectory = $WorkingDir
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    $stdoutSb = New-Object System.Text.StringBuilder
+    $stderrSb = New-Object System.Text.StringBuilder
+    $stdoutEvent = Register-ObjectEvent -InputObject $proc `
+        -EventName "OutputDataReceived" `
+        -MessageData $stdoutSb `
+        -Action { if ($null -ne $EventArgs.Data) { [void]$Event.MessageData.AppendLine($EventArgs.Data) } }
+    $stderrEvent = Register-ObjectEvent -InputObject $proc `
+        -EventName "ErrorDataReceived" `
+        -MessageData $stderrSb `
+        -Action { if ($null -ne $EventArgs.Data) { [void]$Event.MessageData.AppendLine($EventArgs.Data) } }
     try {
-        $proc = Start-Process -FilePath $Cmd `
-            -ArgumentList $CmdArgs `
-            -RedirectStandardOutput $tmpOut.FullName `
-            -RedirectStandardError $tmpErr.FullName `
-            -WorkingDirectory $WorkingDir `
-            -NoNewWindow `
-            -Wait `
-            -PassThru
-        $exit = $proc.ExitCode
+        [void]$proc.Start()
+        $proc.BeginOutputReadLine()
+        $proc.BeginErrorReadLine()
+        if ($TimeoutSec -gt 0) {
+            $exited = $proc.WaitForExit($TimeoutSec * 1000)
+            if (-not $exited) {
+                # Kill process tree (Process.Kill($true) is .NET 5+; PS 5.1 .NET
+                # Framework only has parameterless Kill, which doesn't terminate
+                # children. Walk the tree with WMI as a fallback.)
+                try {
+                    Get-CimInstance Win32_Process -Filter "ParentProcessId=$($proc.Id)" -ErrorAction SilentlyContinue |
+                        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                    $proc.Kill()
+                } catch {}
+                [void]$stderrSb.AppendLine("Invoke-Capture: TIMEOUT after $TimeoutSec sec - killed process tree.")
+                $exit = -1
+            } else {
+                # WaitForExit() with no arg drains the async event handlers
+                # once the streams close.
+                $proc.WaitForExit()
+                $exit = $proc.ExitCode
+            }
+        } else {
+            $proc.WaitForExit()
+            $exit = $proc.ExitCode
+        }
     } catch {
         $exit = -1
-        Add-Content -Path $tmpErr.FullName -Value ("Start-Process threw: " + $_.Exception.Message)
+        [void]$stderrSb.AppendLine("Process.Start threw: " + $_.Exception.Message)
     } finally {
-        $ErrorActionPreference = $prevEAP
+        Unregister-Event -SourceIdentifier $stdoutEvent.Name -ErrorAction SilentlyContinue
+        Unregister-Event -SourceIdentifier $stderrEvent.Name -ErrorAction SilentlyContinue
+        $proc.Dispose()
     }
     $elapsed = ((Get-Date) - $start).TotalSeconds
-    $outText = ""
-    if (Test-Path $tmpOut.FullName) {
-        $outText += (Get-Content $tmpOut.FullName -Raw -ErrorAction SilentlyContinue)
-    }
-    if (Test-Path $tmpErr.FullName) {
-        $errText = (Get-Content $tmpErr.FullName -Raw -ErrorAction SilentlyContinue)
-        if ($errText) { $outText += "`n--- stderr ---`n" + $errText }
-    }
+    $outText = $stdoutSb.ToString()
+    $errText = $stderrSb.ToString()
+    if ($errText) { $outText += "`n--- stderr ---`n" + $errText }
     Remove-Item $tmpOut.FullName -Force -ErrorAction SilentlyContinue
-    Remove-Item $tmpErr.FullName -Force -ErrorAction SilentlyContinue
     if ($null -eq $outText) { $outText = "" }
     return @{ Exit = $exit; Output = $outText; Elapsed = $elapsed }
 }
@@ -324,7 +378,10 @@ if (-not $yarnCmd) {
     Add-StageResult "vitest" "vitest TS tests" "SKIP" "yarn not installed" 0 ""
 } else {
     $yarnPath = $yarnCmd.Source
-    $r = Invoke-Capture -Cmd $yarnPath -CmdArgs @("test") -WorkingDir $repoRoot
+    # 15-min cap: vitest occasionally pins workerd in a wasm-stuck state and
+    # never returns. Treat that as a stage failure rather than blocking the
+    # whole orchestration. Adjust upward if the suite legitimately grows.
+    $r = Invoke-Capture -Cmd $yarnPath -CmdArgs @("test") -WorkingDir $repoRoot -TimeoutSec 900
     $vitestCounts = Parse-VitestCounts -Output $r.Output
     $detail = "{0} passed, {1} failed, {2:N0}s" -f $vitestCounts.Passed, $vitestCounts.Failed, $r.Elapsed
     if ($r.Exit -eq 0 -and $vitestCounts.Failed -eq 0) {
@@ -367,9 +424,11 @@ if (-not $dockerOk) {
     # Drive the smoke script via powershell.exe so we don't inherit ambient
     # $ErrorActionPreference state mid-run. The smoke script writes its
     # PASS/FAIL banner to stdout and exits 0 on success.
+    # 15-min cap covers Docker pull + image build + boot + curl handshake.
     $r = Invoke-Capture -Cmd "powershell.exe" `
         -CmdArgs @("-NoProfile","-NonInteractive","-File",$smokeScript,"-Smoke") `
-        -WorkingDir $repoRoot
+        -WorkingDir $repoRoot `
+        -TimeoutSec 900
     $detail = "{0:N1}s" -f $r.Elapsed
     if ($r.Exit -eq 0 -and $r.Output -match "PASS:.*reachable") {
         # Pull the curl-elapsed milliseconds out of the smoke script's PASS line.
@@ -397,9 +456,11 @@ if (-not $wranglerCmd) {
     Add-StageResult "worker-e2e" "worker e2e (wrangler dev)" "SKIP" "wrangler not installed" 0 ""
 } else {
     $workerScript = Join-Path $repoRoot "scripts\run-e2e-against-worker.ps1"
+    # 15-min cap covers wrangler dev boot + apis e2e suite.
     $r = Invoke-Capture -Cmd "powershell.exe" `
         -CmdArgs @("-NoProfile","-NonInteractive","-File",$workerScript) `
-        -WorkingDir $repoRoot
+        -WorkingDir $repoRoot `
+        -TimeoutSec 900
     $vitestCounts = Parse-VitestCounts -Output $r.Output
     $detail = "{0}/{1} tests, {2:N0}s" -f $vitestCounts.Passed, ($vitestCounts.Passed + $vitestCounts.Failed), $r.Elapsed
     # The worker script also exits 1 if wrangler can't bind the port -
