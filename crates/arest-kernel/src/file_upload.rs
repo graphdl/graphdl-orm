@@ -1879,6 +1879,23 @@ fn region_alloc_error_response(e: block_storage::Error) -> Vec<u8> {
             out.extend_from_slice(body);
             out
         }
+        // Aead is unreachable on the alloc_region path (which never
+        // touches the AEAD primitive), but the match must stay
+        // exhaustive after #659 added the variant. Surface it as a
+        // 500 with a distinct hint so the operator notices if it
+        // ever fires.
+        Aead(_) => {
+            let body = b"unexpected AEAD error from region allocator; \
+                this should be unreachable - please file an issue\n";
+            let mut out = Vec::with_capacity(192 + body.len());
+            push_status(&mut out, 500, "Internal Server Error");
+            push_header(&mut out, "Content-Type", "text/plain; charset=utf-8");
+            push_header(&mut out, "Content-Length", &format!("{}", body.len()));
+            push_header(&mut out, "Connection", "close");
+            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(body);
+            out
+        }
     }
 }
 
