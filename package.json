@@ -31,6 +31,7 @@
     "test": "vitest run",
     "test:all": "yarn build:wasm:test && vitest run",
     "test:watch": "vitest",
+    "test:e2e": "vitest run src/tests/e2e-hateoas.test.ts",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "yarn build"
   },
