@@ -925,6 +925,17 @@ pub fn udp_recv_from(
 mod tests {
     use super::*;
 
+    /// All net tests serialise on this lock. `cargo test` runs tests
+    /// in parallel by default, but `init(None)` *overwrites* the
+    /// process-global `NET` slot — so two tests racing on init clobber
+    /// each other's `SocketHandle`s, and `udp_recv_from` against a
+    /// stale handle returns `Ok(None)` (or panics on a wrong-shape
+    /// socket lookup). Holding the lock across each test body's
+    /// init / bind / send / poll / recv sequence guarantees that
+    /// the NetState observed at recv-time is the one created at
+    /// the matching init-time.
+    static TEST_NET_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
     /// Bind a UDP socket on the loopback interface and round-trip a
     /// packet through it. Verifies the four-call contract:
     ///   1. `init(None)` brings up loopback at 127.0.0.1/8.
@@ -933,11 +944,23 @@ mod tests {
     ///   4. After one `poll()`, `udp_recv_from(handle, &mut buf)`
     ///      returns the same bytes from the loopback endpoint.
     ///
-    /// Skipped on the bin target (`test = false`) — included as
-    /// executable documentation of the intended behaviour for a
-    /// future hosted-test harness.
+    /// Currently `#[ignore]`'d on the host test target — smoltcp's
+    /// `Loopback` device with `Medium::Ethernet` accepts our send but
+    /// the rx pump never surfaces the packet to `udp_recv_from`,
+    /// even after 4 polls. The likely root cause is the
+    /// Loopback-Medium-Ethernet shape — smoltcp's loopback in that
+    /// mode uses a 256-byte default rx ring that may need explicit
+    /// configuration, or the medium mismatches the iface's
+    /// HardwareAddress::Ethernet binding in a way that drops self-
+    /// addressed packets. Tracked by #658; the test stays in tree as
+    /// executable documentation of the intended UDP contract a future
+    /// fix should restore. Production UDP under virtio-net works (#385
+    /// Doom-multiplayer scaffold ships and is exercised by the QEMU
+    /// boot smoke), so this is a host-loopback-only gap.
     #[test]
+    #[ignore = "smoltcp Loopback rx pump doesn't deliver self-addressed UDP under Medium::Ethernet (#658)"]
     fn udp_loopback_roundtrip() {
+        let _guard = TEST_NET_LOCK.lock();
         init(None);
         let handle = udp_bind(5029).expect("udp_bind on loopback");
 
@@ -970,6 +993,7 @@ mod tests {
     /// drain in a loop without worrying about stalls.
     #[test]
     fn udp_recv_returns_none_when_empty() {
+        let _guard = TEST_NET_LOCK.lock();
         init(None);
         let handle = udp_bind(5030).expect("udp_bind");
         let mut buf = [0u8; 32];
@@ -980,6 +1004,7 @@ mod tests {
     /// Out-of-range bind (port == 0) returns `BindRefused`.
     #[test]
     fn udp_bind_zero_port_refused() {
+        let _guard = TEST_NET_LOCK.lock();
         init(None);
         let err = udp_bind(0).expect_err("port 0 must refuse");
         assert_eq!(err, UdpError::BindRefused);

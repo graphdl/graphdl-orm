@@ -670,7 +670,28 @@ mod tests {
     /// the fact that no other kernel test touches `entropy`. If a
     /// future kernel test races against this fixture, lift the lock
     /// to `pub` in `arest::entropy`.
+    ///
+    /// `cargo test` runs tests in parallel by default. The
+    /// `entropy::install` / `entropy::uninstall` pair touches a
+    /// process-global slot (`arest::entropy::GLOBAL_SOURCE`), and the
+    /// csprng reseed/random_bytes path reads it. Without
+    /// serialization, two `with_deterministic_entropy` calls running
+    /// concurrently can race: thread A installs source A and reseeds,
+    /// then thread B installs source B (overwriting A) and reseeds,
+    /// then thread A's body calls random_bytes against B's source
+    /// (or worse — between A's uninstall and A's body's next
+    /// random_bytes, the global is `None` and seed_from_entropy
+    /// panics).
+    ///
+    /// `TEST_ENTROPY_LOCK` serializes the entire install / body /
+    /// uninstall sequence so each test sees a clean entropy world for
+    /// the duration of its body. Cost is parallelism within the
+    /// entropy-touching subset of tests; everything else still runs
+    /// in parallel.
+    static TEST_ENTROPY_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
     fn with_deterministic_entropy<F: FnOnce()>(seed: [u8; 32], body: F) {
+        let _guard = TEST_ENTROPY_LOCK.lock();
         entropy::install(alloc::boxed::Box::new(DeterministicSource::new(seed)));
         arest::csprng::reseed();
         body();
@@ -1004,9 +1025,14 @@ mod tests {
         proc.fd_table[1] = FdEntry::Closed;
         let recorded = proc.record_into_cells("test_proc", &Object::phi());
         let serialised = format!("{:?}", recorded);
-        // Two Process_has_FdTable facts (fd 0 + fd 2), not three.
-        let count = serialised.matches("Process_has_FdTable").count();
-        assert_eq!(count, 2, "Closed fd 1 must elide");
+        // Count fact-shape `Backend` pair occurrences — that pair is
+        // unique to Process_has_FdTable facts (Pid/State/EntryPoint
+        // facts don't carry it). The cell-name `Process_has_FdTable`
+        // itself appears once regardless of fact count, so we can't
+        // count by that string. Two open fds (0 = Serial, 2 = Serial)
+        // → two `Backend` pairs in the recorded Object.
+        let count = serialised.matches("Backend").count();
+        assert_eq!(count, 2, "Closed fd 1 must elide; expected one Backend pair per remaining fd (0 + 2)");
     }
 
     // -- Integration: SPAWN_ELF end-to-end ---------------------------

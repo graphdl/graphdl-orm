@@ -727,7 +727,7 @@ mod tests {
     /// 32-bit ELF (ELFCLASS32) is `WrongClass`.
     #[test]
     fn elfclass32_rejected() {
-        let mut buf: [u8; 256] = [0; 256];
+        let mut buf: [u8; 272] = [0; 272];
         buf[..TINY_ELF.len()].copy_from_slice(TINY_ELF);
         buf[4] = 1; // ELFCLASS32
         assert_eq!(parse(&buf), Err(ElfError::WrongClass));
@@ -736,7 +736,7 @@ mod tests {
     /// Big-endian ELF (ELFDATA2MSB) is `WrongEndian`.
     #[test]
     fn elfdata2msb_rejected() {
-        let mut buf: [u8; 256] = [0; 256];
+        let mut buf: [u8; 272] = [0; 272];
         buf[..TINY_ELF.len()].copy_from_slice(TINY_ELF);
         buf[5] = 2; // ELFDATA2MSB
         assert_eq!(parse(&buf), Err(ElfError::WrongEndian));
@@ -745,7 +745,7 @@ mod tests {
     /// FreeBSD ABI (9) is `WrongAbi`.
     #[test]
     fn freebsd_abi_rejected() {
-        let mut buf: [u8; 256] = [0; 256];
+        let mut buf: [u8; 272] = [0; 272];
         buf[..TINY_ELF.len()].copy_from_slice(TINY_ELF);
         buf[7] = 9;
         assert_eq!(parse(&buf), Err(ElfError::WrongAbi));
@@ -755,7 +755,7 @@ mod tests {
     /// extension toolchains emit this, and we host them just fine.
     #[test]
     fn elfosabi_linux_accepted() {
-        let mut buf: [u8; 256] = [0; 256];
+        let mut buf: [u8; 272] = [0; 272];
         buf[..TINY_ELF.len()].copy_from_slice(TINY_ELF);
         buf[7] = ELFOSABI_LINUX;
         let elf = parse(&buf).expect("ELFOSABI_LINUX must parse");
@@ -766,7 +766,7 @@ mod tests {
     /// we only host executables (ET_EXEC) and PIE (ET_DYN).
     #[test]
     fn et_rel_rejected() {
-        let mut buf: [u8; 256] = [0; 256];
+        let mut buf: [u8; 272] = [0; 272];
         buf[..TINY_ELF.len()].copy_from_slice(TINY_ELF);
         buf[16] = 1; // ET_REL
         buf[17] = 0;
@@ -777,7 +777,7 @@ mod tests {
     /// loader applies relocations.
     #[test]
     fn et_dyn_accepted() {
-        let mut buf: [u8; 256] = [0; 256];
+        let mut buf: [u8; 272] = [0; 272];
         buf[..TINY_ELF.len()].copy_from_slice(TINY_ELF);
         buf[16] = ET_DYN as u8;
         buf[17] = 0;
@@ -789,7 +789,7 @@ mod tests {
     /// is a separate epic.
     #[test]
     fn em_aarch64_rejected() {
-        let mut buf: [u8; 256] = [0; 256];
+        let mut buf: [u8; 272] = [0; 272];
         buf[..TINY_ELF.len()].copy_from_slice(TINY_ELF);
         buf[18] = 183; // EM_AARCH64
         buf[19] = 0;
@@ -803,15 +803,17 @@ mod tests {
         // Take the 64-byte header + 56-byte single phdr = 120 bytes
         // BUT keep e_phnum = 2. Parser should refuse to read past
         // the end.
-        let mut buf = TINY_ELF[..64 + ELF64_PHENT_SIZE].to_vec();
+        let buf_short = TINY_ELF[..64 + ELF64_PHENT_SIZE].to_vec();
         // e_phnum lives at offset 56 (after e_shentsize at 54).
         // It already says 2 in TINY_ELF — leave it. The shortened
         // buffer can't hold the 2nd entry → expect overflow.
-        assert_eq!(parse(&buf), Err(ElfError::PhdrTableOverflow));
-        // Sanity: bumping it to 1 makes the same buffer parse.
-        buf[56] = 1;
-        buf[57] = 0;
-        let elf = parse(&buf).expect("1-phdr fixture must parse");
+        assert_eq!(parse(&buf_short), Err(ElfError::PhdrTableOverflow));
+        // Sanity: bumping it to 1 in a FULL fixture (so PT_LOAD's
+        // p_offset=0x100 is still in-range) makes parse succeed.
+        let mut buf_full = TINY_ELF.to_vec();
+        buf_full[56] = 1;
+        buf_full[57] = 0;
+        let elf = parse(&buf_full).expect("1-phdr fixture must parse");
         assert_eq!(elf.program_headers.len(), 1);
     }
 
@@ -830,7 +832,7 @@ mod tests {
     /// `e_ehsize` other than 64 is `BadHeaderSize`.
     #[test]
     fn bad_e_ehsize_rejected() {
-        let mut buf: [u8; 256] = [0; 256];
+        let mut buf: [u8; 272] = [0; 272];
         buf[..TINY_ELF.len()].copy_from_slice(TINY_ELF);
         buf[52] = 0x80; // e_ehsize = 128
         assert_eq!(parse(&buf), Err(ElfError::BadHeaderSize));
@@ -839,7 +841,7 @@ mod tests {
     /// `e_phentsize` other than 56 is `BadPhentSize`.
     #[test]
     fn bad_e_phentsize_rejected() {
-        let mut buf: [u8; 256] = [0; 256];
+        let mut buf: [u8; 272] = [0; 272];
         buf[..TINY_ELF.len()].copy_from_slice(TINY_ELF);
         buf[54] = 0x40; // e_phentsize = 64
         assert_eq!(parse(&buf), Err(ElfError::BadPhentSize));
