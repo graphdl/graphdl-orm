@@ -110,6 +110,32 @@ cargo run --release --bin arest-cli --features local -- readings/ --db app.db
 cargo run --release --bin arest-cli --features local -- --db app.db "list:Order" ""
 ```
 
+## Tenant master key (#663)
+
+On first run, `arest-cli` generates a 32-byte tenant master key and writes
+it to `~/.arest/tenant_master.bin` (Unix) or `%USERPROFILE%\.arest\tenant_master.bin`
+(Windows). On subsequent runs the same file is read; the bytes seed the
+HKDF-SHA256 derivation of every per-cell ChaCha20-Poly1305 key (#659).
+
+Two operator invariants:
+
+- **Loss = unrecoverable cells.** Without these 32 bytes, every sealed cell
+  on disk (freeze blobs, kernel checkpoints, DO contents) becomes unreadable
+  ciphertext. **Back up `~/.arest/tenant_master.bin` immediately after the
+  first `arest-cli` run.**
+- **Migration = copy the file.** Moving to a new machine? Copy
+  `~/.arest/tenant_master.bin` (preserve `chmod 0600` on Unix). Same key on
+  both sides means cells exchanged between them open identically.
+
+The file is created with mode `0600` on Unix; on Windows it inherits the
+default `%USERPROFILE%` ACL (owner-only). If `arest-cli` finds a master
+file with a looser Unix mode (e.g. `0644` after a sloppy `cp`), it refuses
+to load and prints a `chmod 0600` hint — fix the mode and re-run.
+
+OS-keystore integration (macOS Keychain, Windows Credential Manager, Linux
+libsecret) is out of scope for v1; file an issue if your environment needs
+it.
+
 ## Tests
 
 ```bash

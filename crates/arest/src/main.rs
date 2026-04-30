@@ -113,6 +113,12 @@ mod entropy;
 #[allow(dead_code)]
 mod csprng;
 #[allow(dead_code)]
+// `cell_aead` (#659) — per-cell AEAD primitive + tenant master slot
+// (#663). The bin re-declares it so the boot path can call
+// `crate::cell_aead::install_tenant_master(...)` after generating /
+// reading the master file via `cli::tenant_master_host`.
+mod cell_aead;
+#[allow(dead_code)]
 mod freeze;
 #[allow(dead_code)]
 mod declared_writes;
@@ -388,6 +394,25 @@ fn main() {
     // source (entropy.rs:116) — production paths must avoid that;
     // tests swap in `DeterministicSource` via the same hook.
     crate::entropy::install(crate::cli::entropy_host::HostEntropySource::boxed());
+
+    // Install the per-tenant master key (#663) BEFORE any subcommand
+    // dispatch. On first run, generates 32 fresh CSPRNG bytes (which
+    // is why this MUST follow the entropy::install above — csprng's
+    // lazy-seed otherwise panics with "no entropy source installed")
+    // and persists to `~/.arest/tenant_master.bin` with mode 0600.
+    // On subsequent runs, reads the same file and installs the bytes
+    // into the `arest::cell_aead` global slot. Once installed, every
+    // cell_seal / cell_open path through the engine has the master
+    // available via `cell_aead::current_tenant_master()`.
+    //
+    // `expect` is the right call here: a failure to read or write
+    // `~/.arest/tenant_master.bin` means an unwriteable home directory
+    // (read-only filesystem, missing $HOME, broken ACL) — none of
+    // which we can recover from at runtime, and all of which the user
+    // will recognise from the panic message.
+    crate::cli::tenant_master_host::install()
+        .expect("tenant master install (#663): \
+                 could not read or generate ~/.arest/tenant_master.bin");
 
     let args: Vec<String> = std::env::args().skip(1).collect();
 
