@@ -125,7 +125,16 @@ pub mod http;
 // lib's view at the UEFI boundary so host builds elide them entirely.
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 pub mod pci;
-#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+// `repl` (#628 Profile-4): additionally gated on `feature = "repl"`.
+// The only callers are `entry_uefi::kernel_run_uefi` (the static
+// line-buffer init, itself feature-gated on `slint`) and
+// `ui_apps::unified_repl::submit` (the launcher's REPL panel,
+// transitively gated on `slint`). With `slint` composing `repl`
+// (Cargo.toml), every default / mini / dev build still pulls the
+// module; the headless `--no-default-features --features server`
+// build drops it entirely. Mirror of the slint module-decl gates
+// the #627 commit added to this file (lines 112 + 126-129).
+#[cfg(all(target_os = "uefi", target_arch = "x86_64", feature = "repl"))]
 pub mod repl;
 pub mod system;
 

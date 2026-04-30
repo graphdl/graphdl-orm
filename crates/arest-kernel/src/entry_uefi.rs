@@ -513,31 +513,48 @@ fn kernel_run_uefi(
     // that the unmask ran without faulting. Drainer (the UEFI REPL
     // pump) lands in #365; this commit only proves the IRQ pipeline
     // came up.
-    println!("  kbd:      PS/2 driver online (IRQ 1 unmasked)");
+    //
+    // #628 Profile-4: gated on `feature = "repl"`. `arch::uefi::
+    // keyboard` is the post-decode `DecodedKey` ring + `pc-keyboard`
+    // decoder bootstrap, which is itself feature-gated under `repl`.
+    // The matching IRQ 1 vector install + the PIC unmask of IRQ 1
+    // are also gated in `arch::uefi::interrupts`. With `repl` OFF
+    // (the headless `--no-default-features --features server`
+    // build), the keyboard subsystem is fully elided and the poll
+    // smoke would have nothing to call into. Skip the banner pair
+    // entirely; the headless boot log gains a `kbd: skipped (no
+    // repl feature)` line so a smoke harness can still pattern-
+    // match a kbd: token if it greps for one.
+    #[cfg(feature = "repl")]
+    {
+        println!("  kbd:      PS/2 driver online (IRQ 1 unmasked)");
 
-    // Scancode-poll smoke. The QEMU smoke harness runs headless
-    // (no `-display`, no virtual keyboard input), so the expected
-    // outcome is "idle" — no scancode arrives within the 50 ms
-    // budget. The line's purpose is to prove the driver
-    // initialised without a fault: a triple-fault inside
-    // `keyboard_handler` would have killed the boot before this
-    // line ran. Spinning against `now_ms()` (which the PIT IRQ 0
-    // advances every ~1 ms) lets us cap the wait without depending
-    // on the exact CPU speed of the smoke container.
-    let kbd_deadline = crate::arch::time::now_ms().wrapping_add(50);
-    let mut kbd_observed = false;
-    while crate::arch::time::now_ms() < kbd_deadline {
-        if crate::arch::keyboard::read_keystroke().is_some() {
-            kbd_observed = true;
-            break;
+        // Scancode-poll smoke. The QEMU smoke harness runs headless
+        // (no `-display`, no virtual keyboard input), so the expected
+        // outcome is "idle" — no scancode arrives within the 50 ms
+        // budget. The line's purpose is to prove the driver
+        // initialised without a fault: a triple-fault inside
+        // `keyboard_handler` would have killed the boot before this
+        // line ran. Spinning against `now_ms()` (which the PIT IRQ 0
+        // advances every ~1 ms) lets us cap the wait without depending
+        // on the exact CPU speed of the smoke container.
+        let kbd_deadline = crate::arch::time::now_ms().wrapping_add(50);
+        let mut kbd_observed = false;
+        while crate::arch::time::now_ms() < kbd_deadline {
+            if crate::arch::keyboard::read_keystroke().is_some() {
+                kbd_observed = true;
+                break;
+            }
+            unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
         }
-        unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+        println!(
+            "  kbd:      poll {} (50 ms budget, ring depth={})",
+            if kbd_observed { "scancode received" } else { "idle" },
+            crate::arch::keyboard::pending(),
+        );
     }
-    println!(
-        "  kbd:      poll {} (50 ms budget, ring depth={})",
-        if kbd_observed { "scancode received" } else { "idle" },
-        crate::arch::keyboard::pending(),
-    );
+    #[cfg(not(feature = "repl"))]
+    println!("  kbd:      skipped (no repl feature; PS/2 driver elided, IRQ 1 masked)");
 
     // Proves the page-table singleton is live post-EBS: going
     // through `memory::usable_frame_count()` forces a `FRAME_ALLOCATOR.lock()`
