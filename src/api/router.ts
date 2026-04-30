@@ -14,6 +14,15 @@ import { aiComplete } from './ai/complete'
 import { handleExtract } from './ai/extract'
 import { handleChat } from './ai/chat'
 import { AGENT_DEFINITIONS_STATE } from './ai/agent-seed'
+import {
+  loadReading,
+  resolveTenant,
+  loadReadingEnvelope,
+  loadReadingViolationEnvelope,
+  type CellStub,
+  type IndexStub,
+  type LoadReadingDeps,
+} from './load-reading'
 
 // ── Collection slug → noun type resolution ───────────────────────────
 // Resolved dynamically from the Registry via nounToSlug convention.
@@ -285,6 +294,68 @@ router.get('/api/openapi.json', async (request, env: Env) => {
     })
   }
   return json(doc)
+})
+
+// ── DynRdg-T3 (#562): SystemVerb::LoadReading on the worker target ───
+//
+// POST /api/load_reading
+//   Body: { name, body }
+//   Header (optional): X-Tenant: <tenant-id> (default 'global')
+//   Response: { data: LoadReadingResponse, _links } on success
+//            { data: { validation }, violations: [...] } on rejection
+//
+// Drives the engine-level dispatch (`load_reading_core::load_reading`
+// shape — check + compile pipeline) on a per-tenant in-memory engine
+// handle, persists the resulting `_loaded_reading:{tenant}:{name}`
+// manifest cell to its own DO (per #217 / #221 cell-per-DO), and
+// registers it with the registry index for cold-start replay.
+//
+// Cold-start replay runs lazily on the first request per (isolate,
+// tenant) — see `getTenantHandle` inside `load-reading.ts`.
+router.post('/api/load_reading', async (request: Request, env: Env) => {
+  let body: { name?: string; body?: string }
+  try {
+    body = (await request.json()) as typeof body
+  } catch {
+    return error(400, { errors: [{ message: 'invalid JSON body' }] })
+  }
+  if (!body.name || typeof body.name !== 'string') {
+    return error(400, { errors: [{ message: 'name (string) required' }] })
+  }
+  if (typeof body.body !== 'string') {
+    return error(400, { errors: [{ message: 'body (string) required' }] })
+  }
+
+  const tenant = resolveTenant(request)
+  const deps: LoadReadingDeps = {
+    tenant,
+    getCellStub: (key: string): CellStub => {
+      const id = env.ENTITY_DB.idFromName(key)
+      // EntityDB exposes `get` and `put` shaped exactly like CellStub —
+      // see src/entity-do.ts. The cast strips the DurableObjectStub
+      // typing without a runtime indirection.
+      return env.ENTITY_DB.get(id) as unknown as CellStub
+    },
+    getIndexStub: (t: string): IndexStub => {
+      // Per-tenant registry shard. Mirrors the per-domain shard pattern
+      // in #205's `registryIdForDomain` — use the tenant id as the
+      // domain-level shard key so two tenants' indexes never share a DO.
+      const id = registryIdForDomain(env.REGISTRY_DB, 'global', t)
+      return env.REGISTRY_DB.get(id) as unknown as IndexStub
+    },
+  }
+
+  const result = await loadReading(body.name, body.body, deps)
+  if (!result.ok) {
+    if (result.status === 422) {
+      const r = result.response as { error: string; validation: any }
+      return json(loadReadingViolationEnvelope(r.validation), { status: 422 })
+    }
+    const r = result.response as { error: string }
+    return error(result.status, { errors: [{ message: r.error }] })
+  }
+  const r = result.response as Awaited<ReturnType<typeof loadReading>>['response'] & { name: string }
+  return json(loadReadingEnvelope(r as any))
 })
 
 // ── Unified MCP verb → HTTP route mapping (#200) ─────────────────────
