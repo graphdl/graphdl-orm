@@ -438,6 +438,7 @@ fn boot_time_snapshot_secret() -> [u8; 32] {
     use sha2::{Digest, Sha256};
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
+    #[cfg(not(target_arch = "wasm32"))]
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let mut h = Sha256::new();
@@ -454,12 +455,21 @@ fn boot_time_snapshot_secret() -> [u8; 32] {
     // SystemTime nanos: defense in depth against platforms where
     // RandomState might be weak — the absolute boot instant is not
     // predictable to an outside attacker.
-    let now_nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u128)
-        .unwrap_or(0);
-    h.update(now_nanos.to_le_bytes());
-    h.update((std::process::id() as u64).to_le_bytes());
+    //
+    // wasm32-unknown-unknown's std implementation has no real clock and
+    // panics on SystemTime::now(); skip that mix-in there. The four
+    // RandomState draws above already cover >>128 bits of OS entropy
+    // (getrandom / BCryptGenRandom / Web Crypto via getrandom-shims),
+    // and the monotonic counter differentiates same-instant tenants.
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u128)
+            .unwrap_or(0);
+        h.update(now_nanos.to_le_bytes());
+        h.update((std::process::id() as u64).to_le_bytes());
+    }
     // Monotonic counter differentiates tenants created in the same
     // nanosecond within the same process.
     static COUNTER: AtomicU64 = AtomicU64::new(0);
