@@ -24,7 +24,6 @@ Domain Change proposes Constraint.
 Domain Change proposes Fact Type.
 Domain Change proposes Status.
 Domain Change proposes Transition.
-Domain Change proposes Event Type.
 
 Domain Change has Rationale.
   Each Domain Change has exactly one Rationale.
@@ -42,6 +41,22 @@ Signal leads to Domain Change.
 Signal has Signal Source.
   Each Signal has exactly one Signal Source.
 
+### Domain Change actions
+
+User submits Domain Change for review.
+  Each User, Domain Change combination occurs at most once in the population of User submits Domain Change for review.
+
+User approves Domain Change.
+  Each User, Domain Change combination occurs at most once in the population of User approves Domain Change.
+
+User rejects Domain Change.
+  Each User, Domain Change combination occurs at most once in the population of User rejects Domain Change.
+
+User requests revision of Domain Change.
+  Each User, Domain Change combination occurs at most once in the population of User requests revision of Domain Change.
+
+Domain Change is applied.
+
 ## Subtypes
 
 Model Element is a supertype of Reading.
@@ -50,7 +65,6 @@ Model Element is a supertype of Constraint.
 Model Element is a supertype of Fact Type.
 Model Element is a supertype of Status.
 Model Element is a supertype of Transition.
-Model Element is a supertype of Event Type.
 
 ## Constraints
 
@@ -78,27 +92,27 @@ Status 'Proposed' is initial in State Machine Definition 'Domain Change'.
 Transition 'review' is defined in State Machine Definition 'Domain Change'.
 Transition 'review' is from Status 'Proposed'.
 Transition 'review' is to Status 'Under Review'.
-Transition 'review' is triggered by Event Type 'review-requested'.
+Transition 'review' is triggered by Fact Type 'User submits Domain Change for review'.
 
 Transition 'approve-change' is defined in State Machine Definition 'Domain Change'.
 Transition 'approve-change' is from Status 'Under Review'.
 Transition 'approve-change' is to Status 'Approved'.
-Transition 'approve-change' is triggered by Event Type 'approved'.
+Transition 'approve-change' is triggered by Fact Type 'User approves Domain Change'.
 
 Transition 'reject' is defined in State Machine Definition 'Domain Change'.
 Transition 'reject' is from Status 'Under Review'.
 Transition 'reject' is to Status 'Rejected'.
-Transition 'reject' is triggered by Event Type 'rejected'.
+Transition 'reject' is triggered by Fact Type 'User rejects Domain Change'.
 
 Transition 'revise' is defined in State Machine Definition 'Domain Change'.
 Transition 'revise' is from Status 'Under Review'.
 Transition 'revise' is to Status 'Proposed'.
-Transition 'revise' is triggered by Event Type 'revision-requested'.
+Transition 'revise' is triggered by Fact Type 'User requests revision of Domain Change'.
 
 Transition 'apply' is defined in State Machine Definition 'Domain Change'.
 Transition 'apply' is from Status 'Approved'.
 Transition 'apply' is to Status 'Applied'.
-Transition 'apply' is triggered by Event Type 'applied'.
+Transition 'apply' is triggered by Fact Type 'Domain Change is applied'.
 
 Domain 'evolution' has Access 'public'.
 Domain 'evolution' has Description 'Self-modification as a Domain Change state machine. Proposing a new fact type is proposing a theorem (Curry-Howard). CSDP validation is the proof check, successful ingestion is the proof.'.
