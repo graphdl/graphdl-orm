@@ -285,6 +285,7 @@ mod tests {
     use super::*;
     use crate::process::address_space::AddressSpace;
     use crate::process::futex_table::with_futex_table;
+    use crate::process::process::CURRENT_PROCESS_TEST_LOCK;
     use crate::process::{
         current_process_install, current_process_mut, current_process_uninstall, Process,
         ProcessState,
@@ -416,6 +417,7 @@ mod tests {
     /// branches on to retry CAS.
     #[test]
     fn wait_value_mismatch_returns_eagain() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         // Allocate a 4-byte-aligned u32 cell with a known value; ask
         // the handler to wait for a different value. Should return
         // -EAGAIN immediately, NOT enqueue.
@@ -445,6 +447,7 @@ mod tests {
     /// the Process state to `BlockedFutex(uaddr)` + returns 0.
     #[test]
     fn wait_value_match_enqueues_and_blocks() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         let cell: u32 = 42;
         let cell_addr = &cell as *const u32 as u64;
         assert_eq!(cell_addr & 0b11, 0, "cell must be 4-byte aligned");
@@ -478,6 +481,7 @@ mod tests {
     /// fires.
     #[test]
     fn wait_value_match_with_no_process_uses_placeholder_pid() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         let cell: u32 = 99;
         let cell_addr = &cell as *const u32 as u64;
         assert_eq!(cell_addr & 0b11, 0, "cell must be 4-byte aligned");
@@ -502,6 +506,7 @@ mod tests {
     /// stub call.
     #[test]
     fn wake_returns_zero_under_stub() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         drain_global_futex_table();
         // Pre-populate a waiter via the table directly so we can
         // confirm the stub leaves it alone.
@@ -540,6 +545,7 @@ mod tests {
     /// (single-process kernel; PRIVATE / SHARED collapse).
     #[test]
     fn private_flag_stripped_for_op_dispatch() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         let cell: u32 = 7;
         let cell_addr = &cell as *const u32 as u64;
         assert_eq!(cell_addr & 0b11, 0);
@@ -571,6 +577,7 @@ mod tests {
     /// timeout instead.
     #[test]
     fn wait_blocked_futex_carries_correct_uaddr() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         let cell: u32 = 5;
         let cell_addr = &cell as *const u32 as u64;
         assert_eq!(cell_addr & 0b11, 0);

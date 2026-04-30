@@ -112,6 +112,7 @@ mod tests {
     use crate::process::address_space::AddressSpace;
     use crate::process::current_process_install;
     use crate::process::current_process_uninstall;
+    use crate::process::process::CURRENT_PROCESS_TEST_LOCK;
     use crate::process::Process;
 
     /// `mark_exited(0)` transitions the registered current process to
@@ -120,6 +121,7 @@ mod tests {
     /// same accessor.
     #[test]
     fn mark_exited_transitions_state_to_exited() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         // Fresh address space + Process.
         let address_space = AddressSpace::new(0x40_1000);
         let proc = Process::new(7, address_space);
@@ -141,6 +143,7 @@ mod tests {
     /// `init_time` ran — the function tolerates pre-init calls.
     #[test]
     fn mark_exited_no_op_when_no_current_process() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         // Make sure no process is installed (defensive, in case a
         // prior test forgot to uninstall).
         current_process_uninstall();
@@ -156,6 +159,7 @@ mod tests {
     /// the docstring promises.
     #[test]
     fn mark_exited_repeated_calls_clobber_status() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         let address_space = AddressSpace::new(0x40_1000);
         let proc = Process::new(11, address_space);
         current_process_install(proc);
@@ -175,6 +179,7 @@ mod tests {
     /// byte).
     #[test]
     fn mark_exited_preserves_signed_status() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         let address_space = AddressSpace::new(0x40_1000);
         let proc = Process::new(13, address_space);
         current_process_install(proc);

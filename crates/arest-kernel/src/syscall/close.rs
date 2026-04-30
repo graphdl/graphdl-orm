@@ -69,6 +69,7 @@ mod tests {
     use super::*;
     use crate::process::address_space::AddressSpace;
     use crate::process::fd_table::synthetic;
+    use crate::process::process::CURRENT_PROCESS_TEST_LOCK;
     use crate::process::{current_process_install, current_process_uninstall, Process};
 
     /// Helper: install a fresh Process so the handler has somewhere
@@ -83,6 +84,7 @@ mod tests {
     /// slot.
     #[test]
     fn close_valid_fd_returns_zero() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         install_test_process();
         // Allocate an fd directly through the fd table.
         let fd = current_process_fd_table(|t| {
@@ -104,6 +106,7 @@ mod tests {
     /// `close(fd)` on an unknown fd returns `-EBADF`.
     #[test]
     fn close_unknown_fd_returns_minus_ebadf() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         install_test_process();
         let result = handle(99);
         assert_eq!(result, -EBADF);
@@ -113,6 +116,7 @@ mod tests {
     /// Closing the same fd twice returns `-EBADF` on the second call.
     #[test]
     fn double_close_returns_minus_ebadf() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         install_test_process();
         let fd = current_process_fd_table(|t| {
             t.expect("process installed")
@@ -129,6 +133,7 @@ mod tests {
     /// tier-1 limitation.
     #[test]
     fn close_standard_streams_returns_minus_ebadf_under_tier_1() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         install_test_process();
         assert_eq!(handle(0), -EBADF);
         assert_eq!(handle(1), -EBADF);
@@ -139,6 +144,7 @@ mod tests {
     /// `close` with no current process installed returns `-EBADF`.
     #[test]
     fn close_with_no_process_returns_minus_ebadf() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         // Defensive: make sure no leftover from a prior test.
         current_process_uninstall();
         assert_eq!(handle(3), -EBADF);
@@ -148,6 +154,7 @@ mod tests {
     /// only stores non-negative keys, so any negative lookup misses.
     #[test]
     fn close_negative_fd_returns_minus_ebadf() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         install_test_process();
         assert_eq!(handle(-1), -EBADF);
         assert_eq!(handle(-100), -EBADF);
