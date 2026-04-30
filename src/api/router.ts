@@ -12,6 +12,7 @@ import { handleMcpRequest } from '../mcp/remote'
 import { dispatchVerb, UNIFIED_VERBS } from './verb-dispatcher'
 import { aiComplete } from './ai/complete'
 import { handleExtract } from './ai/extract'
+import { AGENT_DEFINITIONS_STATE } from './ai/agent-seed'
 
 // ── Collection slug → noun type resolution ───────────────────────────
 // Resolved dynamically from the Registry via nounToSlug convention.
@@ -1218,7 +1219,7 @@ router.post('/arest/chat', async (request: Request) => {
   }
 })
 
-// ── /arest/extract (#639 / Worker-AI-2) ──────────────────────────────
+// ── /arest/extract (#639 / Worker-AI-2 + #641 / Worker-AI-4) ─────────
 // Migrated from the dispatchVerb('compile', body) placeholder (#619
 // spike) to the real LLM extract pipeline:
 //
@@ -1231,12 +1232,21 @@ router.post('/arest/chat', async (request: Request) => {
 //
 // 503 envelope shape mirrors the kernel-side #620 path so HATEOAS-aware
 // clients can branch on a single envelope schema across both targets.
-// Until #641 seeds the Agent Definition into worker boot state, every
-// real request returns 503 — that's expected; the contract is correct.
+//
+// #641 (this commit) wires the boot-time Agent Definition seed
+// (`AGENT_DEFINITIONS_STATE` from `./ai/agent-seed`) so the four-cell
+// walker resolves to the Extractor Agent Definition. With AI_GATEWAY_*
+// env vars set, requests now return 200 with the parsed JSON payload;
+// without them, the 503 envelope's `agentDefinition` block carries
+// the resolved model code + agent id (introspection works without a
+// live LLM call). Mirror of the kernel's `system::init` Agent
+// Definition seed pattern at `crates/arest-kernel/src/system.rs:262`.
 router.post('/arest/extract', async (request: Request, env: Env) => {
   return handleExtract(request, {
     AI_GATEWAY_URL: env.AI_GATEWAY_URL ?? '',
     AI_GATEWAY_TOKEN: env.AI_GATEWAY_TOKEN ?? '',
+  }, {
+    state: AGENT_DEFINITIONS_STATE,
   })
 })
 
