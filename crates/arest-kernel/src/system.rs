@@ -899,6 +899,34 @@ mod tests {
     use super::*;
     use arest::ast::fact_from_pairs;
 
+    /// Test-only serialisation lock for the module-global `SYSTEM`
+    /// state slot. `cargo test` runs tests in parallel by default;
+    /// every test that calls `apply()` against the singleton (or that
+    /// reads `with_state()` after staging cells via `apply()`) races
+    /// with every other such test, because `apply()` swaps the slot's
+    /// inner `&'static Object` pointer atomically — so a sibling test
+    /// that calls `apply()` between this test's stage and assert wipes
+    /// the staged cells.
+    ///
+    /// Concretely the failure mode that motivated this lock (#664):
+    /// `extract_envelope_includes_agent_definition_when_resolved` stages
+    /// four `Verb` / `Agent_Definition_*` cells via `apply()`, calls
+    /// `dispatch_extract`, asserts that the response envelope carries
+    /// the resolved agent definition, then rolls back via a second
+    /// `apply()`. If a sibling test (`apply_delivers_changed_cells_to_
+    /// subscribers`, `module_round_trip_init_apply_read`, etc.) runs
+    /// `apply()` between the stage and the dispatch, the staged cells
+    /// vanish and the assert sees the unstaged-state envelope.
+    /// Conversely, the `_omits_agent_definition_when_unresolved` test
+    /// observes a leaked staged-state if the rollback hasn't yet run.
+    ///
+    /// All system tests that touch `SYSTEM` via `init()` / `apply()` /
+    /// `with_state()` acquire this lock. Same shape as the
+    /// `TEST_ENTROPY_LOCK` (#658) and `TEST_NET_LOCK` (#658) patterns
+    /// — per-resource, not per-module, so tests that don't touch the
+    /// global state still parallelise.
+    pub(crate) static SYSTEM_STATE_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
     /// Helper mirroring `init()`'s leak-and-wrap shape. Returns a
     /// detached `RwLock<&'static Object>` so the lock semantics can
     /// be exercised without contending on the module-level
@@ -1023,6 +1051,7 @@ mod tests {
     /// against any other test that happens to call `init()`.
     #[test]
     fn module_round_trip_init_apply_read() {
+        let _guard = SYSTEM_STATE_TEST_LOCK.lock();
         init();
 
         // Read the as-init'd state — must contain the `welcome`
@@ -1056,6 +1085,7 @@ mod tests {
     /// same backing slot so they can't diverge.
     #[test]
     fn legacy_state_shim_matches_with_state() {
+        let _guard = SYSTEM_STATE_TEST_LOCK.lock();
         init();
         let via_shim = state().expect("init ran");
         let via_with = with_state(|s| s as *const Object).expect("init ran");
@@ -1139,6 +1169,7 @@ mod tests {
     /// HateoasBrowser to react to `POST /file` mutations.
     #[test]
     fn apply_delivers_changed_cells_to_subscribers() {
+        let _guard = SYSTEM_STATE_TEST_LOCK.lock();
         use core::sync::atomic::AtomicUsize;
         init();
 
@@ -1230,6 +1261,7 @@ mod tests {
     /// for the rest of the call.
     #[test]
     fn handler_can_unsubscribe_itself_without_deadlock() {
+        let _guard = SYSTEM_STATE_TEST_LOCK.lock();
         use core::cell::Cell;
         init();
         // Cell of the id, populated after we know the id.
@@ -1310,6 +1342,7 @@ mod tests {
 
     #[test]
     fn extract_returns_503_when_no_body() {
+        let _guard = SYSTEM_STATE_TEST_LOCK.lock();
         init();
         // Empty body — the Platform-fn slot is registered at init but
         // no body is installed in the kernel profile, so apply
@@ -1330,6 +1363,7 @@ mod tests {
 
     #[test]
     fn extract_envelope_includes_agent_definition_when_resolved() {
+        let _guard = SYSTEM_STATE_TEST_LOCK.lock();
         init();
         // Stage the four cells `agent::resolve_agent_verb` walks:
         // Verb, Verb_invokes_Agent_Definition,
@@ -1391,6 +1425,7 @@ mod tests {
 
     #[test]
     fn extract_envelope_omits_agent_definition_when_unresolved() {
+        let _guard = SYSTEM_STATE_TEST_LOCK.lock();
         init();
         // Snapshot the singleton; if a sibling test (above) staged
         // Agent Definition cells and the rollback ran, we should see
@@ -1426,6 +1461,7 @@ mod tests {
 
     #[test]
     fn extract_dispatch_does_not_panic_on_malformed_json() {
+        let _guard = SYSTEM_STATE_TEST_LOCK.lock();
         init();
         // Garbage input — the parser returns None, and the dispatcher
         // surfaces an `extract.parse` envelope rather than panicking.
@@ -1463,6 +1499,7 @@ mod tests {
     #[cfg(not(target_os = "uefi"))]
     #[test]
     fn extract_with_installed_body_returns_200() {
+        let _guard = SYSTEM_STATE_TEST_LOCK.lock();
         use arest::ast::{install_platform_fn, uninstall_platform_fn};
         init();
 

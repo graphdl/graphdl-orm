@@ -312,6 +312,7 @@ pub fn lookup_file_cell_id_in(path: &str, state: &Object) -> Option<String> {
 mod tests {
     use super::*;
     use crate::process::address_space::AddressSpace;
+    use crate::process::process::CURRENT_PROCESS_TEST_LOCK;
     use crate::process::{current_process_install, current_process_uninstall, Process};
     use arest::ast::{cell_push, fact_from_pairs, Object};
 
@@ -362,6 +363,7 @@ mod tests {
     /// "/proc/cpuinfo" }`.
     #[test]
     fn open_proc_cpuinfo_returns_valid_fd() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         install_test_process();
         let path = cstring("/proc/cpuinfo");
         let fd = handle(AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0);
@@ -384,6 +386,7 @@ mod tests {
     /// resolves through synthetic-fs.
     #[test]
     fn open_proc_meminfo_returns_valid_fd() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         install_test_process();
         let path = cstring("/proc/meminfo");
         let fd = handle(AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0);
@@ -397,6 +400,7 @@ mod tests {
     /// (no SYSTEM init in tests).
     #[test]
     fn open_missing_path_returns_minus_enoent() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         install_test_process();
         let path = cstring("/tmp/missing");
         let result = handle(AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0);
@@ -409,6 +413,7 @@ mod tests {
     /// for writing is forbidden.
     #[test]
     fn open_synthetic_with_wronly_returns_minus_eacces() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         install_test_process();
         let path = cstring("/proc/cpuinfo");
         let result = handle(AT_FDCWD, path.as_ptr() as u64, O_WRONLY, 0);
@@ -420,6 +425,7 @@ mod tests {
     /// `-EACCES` for the same reason.
     #[test]
     fn open_synthetic_with_rdwr_returns_minus_eacces() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         install_test_process();
         let path = cstring("/proc/cpuinfo");
         let result = handle(AT_FDCWD, path.as_ptr() as u64, O_RDWR, 0);
@@ -431,6 +437,7 @@ mod tests {
     /// is not a valid pathname address.
     #[test]
     fn open_null_pathname_returns_minus_efault() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         install_test_process();
         let result = handle(AT_FDCWD, 0, O_RDONLY, 0);
         assert_eq!(result, -EFAULT);
@@ -444,6 +451,7 @@ mod tests {
     /// range. Test the `(flags & O_ACCMODE) == 3` reserved value.
     #[test]
     fn open_invalid_access_mode_returns_minus_einval() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         install_test_process();
         let path = cstring("/proc/cpuinfo");
         // 3 is the reserved O_PATH discriminant — tier-1 rejects.
@@ -457,6 +465,7 @@ mod tests {
     /// relative-to-fd surface tier-1 doesn't model.
     #[test]
     fn open_relative_to_fd_returns_minus_enosys() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         install_test_process();
         let path = cstring("relative/path");
         let result = handle(99, path.as_ptr() as u64, O_RDONLY, 0);
@@ -469,6 +478,7 @@ mod tests {
     /// don't match) rather than -ENOSYS.
     #[test]
     fn open_absolute_with_arbitrary_dirfd_ignores_dirfd() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         install_test_process();
         let path = cstring("/absolute/missing");
         let result = handle(99, path.as_ptr() as u64, O_RDONLY, 0);
@@ -482,6 +492,7 @@ mod tests {
     /// POSIX's "lowest free fd" rule.
     #[test]
     fn sequential_opens_allocate_increasing_fds() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         install_test_process();
         let path_a = cstring("/proc/cpuinfo");
         let path_b = cstring("/proc/meminfo");

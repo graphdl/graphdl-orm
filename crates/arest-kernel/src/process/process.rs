@@ -600,6 +600,27 @@ pub fn current_process_uninstall() -> Option<Process> {
     CURRENT_PROCESS.lock().take()
 }
 
+/// Test-only serialisation lock for the process-global
+/// `CURRENT_PROCESS` singleton. `cargo test` runs tests in parallel by
+/// default; every test that calls `current_process_install` /
+/// `current_process_uninstall` (the syscall handler test suites in
+/// `syscall::openat`, `syscall::close`, `syscall::exit`, `syscall::futex`)
+/// touches the same `spin::Mutex<Option<Process>>` slot above.
+/// Without serialisation, two tests racing on install/uninstall clobber
+/// each other's process — e.g. `syscall::openat::tests::
+/// sequential_opens_allocate_increasing_fds` expects fds to land at 3
+/// then 4, but if a sibling test installs a fresh process between the
+/// two `handle()` calls the fd-table state resets and the second
+/// handle returns 3 instead of 4.
+///
+/// All syscall test modules that touch `CURRENT_PROCESS` acquire this
+/// lock at the top of their bodies. Same shape as the
+/// `TEST_ENTROPY_LOCK` and `TEST_NET_LOCK` patterns (#658) — the lock
+/// is per-resource, not per-module, so concurrent tests that don't
+/// touch the process global still parallelise.
+#[cfg(test)]
+pub(crate) static CURRENT_PROCESS_TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
 /// Read-only accessor returning the currently-installed process's pid,
 /// or `None` if no process is installed. Sibling of
 /// `current_process_mut` — same lock discipline, but cheaper because
