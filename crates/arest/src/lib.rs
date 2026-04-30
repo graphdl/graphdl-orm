@@ -293,6 +293,18 @@ pub mod wasm_lower;
 #[cfg(feature = "cloudflare")]
 pub mod cloudflare;
 
+// Cloudflare Worker entropy adapter (#572 / Rand-T4) — `EntropySource`
+// over Web Crypto's `crypto.getRandomValues` via the `getrandom` crate's
+// `js` backend (Cargo.toml [target.'cfg(target_arch = "wasm32")'] gate).
+// Mirror of `cli/entropy_host.rs` (#574); installed once from
+// `cloudflare::__wasm_init` so `csprng::random_*` paths reached by
+// route handlers find a seeded source. Gated on the same `cloudflare`
+// feature because the install site lives in `cloudflare.rs` — but the
+// adapter itself only depends on `getrandom`, which is a non-optional
+// dep on every platform that compiles a worker build.
+#[cfg(feature = "cloudflare")]
+pub mod cloudflare_entropy;
+
 // Stateless `parse` / `parse_with_nouns` intercept for the JS worker
 // (see `parse_intercept.rs` for the why). The module gates its own
 // contents on `std-deps + !no_std`, so a no-import here is harmless
