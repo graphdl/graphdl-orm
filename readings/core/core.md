@@ -658,14 +658,7 @@ HTTP Method 'OPTIONS' has Name 'OPTIONS'.
 
 ### External Systems
 
-External System 'auth.vin' has URL 'https://auth.vin'.
-External System 'auth.vin' has Header 'Authorization'.
-External System 'auth.vin' has Prefix 'users API-Key'.
-External System 'auto.dev' has URL 'https://api.auto.dev'.
-External System 'auto.dev' has Header 'X-API-Key'.
-External System 'stripe' has URL 'https://api.stripe.com/v1'.
-External System 'stripe' has Header 'Authorization'.
-External System 'stripe' has Prefix 'Bearer'.
+<!-- External System auth shape instance facts (URL/Header/Prefix/Country Code/Kind) for auth.vin, auto.dev, stripe, github, resend live in arest/readings/templates/connectors.md. Per-app Domain Connection facts carrying Secret References live in each consuming app's gitignored .env file. -->
 
 Domain 'core' has Access 'public'.
 Domain 'core' has Description 'Extracted from NORMA ORM2 model (design/html/). The canonical FORML 2 metamodel against which every user domain is a subtype binding.'.
