@@ -12,6 +12,7 @@ import { handleMcpRequest } from '../mcp/remote'
 import { dispatchVerb, UNIFIED_VERBS } from './verb-dispatcher'
 import { aiComplete } from './ai/complete'
 import { handleExtract } from './ai/extract'
+import { handleChat } from './ai/chat'
 import { AGENT_DEFINITIONS_STATE } from './ai/agent-seed'
 
 // ── Collection slug → noun type resolution ───────────────────────────
@@ -1204,19 +1205,36 @@ router.post('/api/ai/complete', async (request: Request, env: Env) => {
   return json(result)
 })
 
-// ── MCP-verb proxies for /arest/chat and /arest/extract (#201) ───────
-// Thin POST proxies that delegate through dispatchVerb so CLI, local
-// MCP (stdio), and HTTP clients share the same input/output contract.
-//   /arest/chat    → dispatchVerb('query', body)  — natural-language query
-router.post('/arest/chat', async (request: Request) => {
-  let body: Record<string, unknown>
-  try { body = (await request.json()) as Record<string, unknown> } catch { body = {} }
-  try {
-    const result = await dispatchVerb('query', body)
-    return json(result)
-  } catch (e) {
-    return error(400, e instanceof Error ? e.message : String(e))
-  }
+// ── /arest/chat (#640 / Worker-AI-3 + #641 / Worker-AI-4) ────────────
+// Migrated from the dispatchVerb('query', body) placeholder (#201
+// MCP-verb proxy) to the real LLM chat pipeline — direct mirror of
+// the /arest/extract migration in #639:
+//
+//   1. Resolve the Agent Definition for verb "chat" via the four-cell
+//      walker `resolveAgentVerb` (TS port of
+//      `arest::agent::resolve_agent_verb`).
+//   2. Render the prompt template with body as input.
+//   3. Call `aiComplete(rendered_prompt, { env, model: binding.modelCode })`.
+//   4. Surface the LLM text verbatim in `{ text, _meta?, citations? }`
+//      — chat is natural prose, no JSON parse step (unlike extract).
+//
+// 503 envelope shape mirrors the kernel-side #620 path so HATEOAS-aware
+// clients can branch on a single envelope schema across both targets
+// and across the chat/extract verbs.
+//
+// #641 wires the boot-time Agent Definition seed
+// (`AGENT_DEFINITIONS_STATE` from `./ai/agent-seed`) so the four-cell
+// walker resolves to the Chatter Agent Definition. With AI_GATEWAY_*
+// env vars set, requests return 200 with the LLM reply; without them,
+// the 503 envelope's `agentDefinition` block carries the resolved
+// model code + agent id (introspection works without a live LLM call).
+router.post('/arest/chat', async (request: Request, env: Env) => {
+  return handleChat(request, {
+    AI_GATEWAY_URL: env.AI_GATEWAY_URL ?? '',
+    AI_GATEWAY_TOKEN: env.AI_GATEWAY_TOKEN ?? '',
+  }, {
+    state: AGENT_DEFINITIONS_STATE,
+  })
 })
 
 // ── /arest/extract (#639 / Worker-AI-2 + #641 / Worker-AI-4) ─────────
