@@ -216,18 +216,13 @@ struct NetState {
     device: KernelDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
-    /// DHCPv4 client socket (#263). Registered at boot when DHCP is
-    /// active; `poll` picks up `Event::Configured` once the lease
-    /// arrives and installs the IP, netmask, and default gateway on
-    /// the interface. `None` under the `static-ip` feature (#657)
-    /// where the address is hardcoded at init and the DHCP socket
-    /// would otherwise actively negotiate with SLiRP — that
-    /// negotiation, even with events undrained, leaves SLiRP's
-    /// hostfwd→guest forwarder in a state where TCP segments to
-    /// guest:80 are dropped, so the smoke harness's host curl gets
-    /// `Empty reply from server`. `None` here = no DHCP socket in
-    /// the SocketSet, so no DISCOVER/REQUEST goes on the wire.
-    dhcp_handle: Option<SocketHandle>,
+    /// DHCPv4 client socket (#263). Registered at boot; `poll` picks
+    /// up `Event::Configured` once the lease arrives and calls
+    /// `apply_dhcp_config` to install the IP, netmask, and default
+    /// gateway on the interface. Inactive over Loopback (no DHCP
+    /// server), so `dhcp_lease()` returns None until virtio-net is
+    /// live and a real DHCP server responds.
+    dhcp_handle: SocketHandle,
     /// Cached lease info so the banner / status calls can report
     /// the assigned address without re-polling the socket.
     lease: Option<DhcpLease>,
@@ -340,25 +335,25 @@ pub fn init(virtio: Option<VirtioPhy>) {
     // — no extra wiring at the call site. Over Loopback the socket
     // simply times out and retries; harmless.
     //
-    // When `static-ip` is on (#655 / #657), we skip the DHCP socket
-    // entirely — both the SocketSet add and the field. The
-    // interface already has 10.0.2.15/24 + default gateway from the
-    // branch above. A DHCP socket would otherwise be driven by
-    // `iface.poll()` through DISCOVER → OFFER → REQUEST → ACK on
-    // every smoke run, and that exchange — observed via #657's
-    // diagnostic prints — interacts with QEMU SLiRP's hostfwd state
-    // such that subsequent TCP segments destined for guest:80 are
-    // dropped before reaching the virtio-net rx ring. Skipping the
-    // socket short-circuits the DHCP pump and leaves SLiRP's
-    // hostfwd routing on its default static path
-    // (host:8080 → 10.0.2.15:80), which is what the smoke needs.
+    // When `static-ip` is on (#655), we skip the DHCP socket entirely.
+    // The interface already has 10.0.2.15/24 + default gateway from the
+    // branch above; a DHCP socket would otherwise emit a `Deconfigured`
+    // event on first poll (initial Halted state) which `poll`'s
+    // dhcp-event handler would interpret as "lease lost" and wipe the
+    // static config we just installed. Skipping the socket short-
+    // circuits the entire DHCP pump.
     #[cfg(not(feature = "static-ip"))]
     let dhcp_handle = {
         let dhcp_socket = dhcpv4::Socket::new();
-        Some(sockets.add(dhcp_socket))
+        sockets.add(dhcp_socket)
     };
+    // Static-IP build still needs `dhcp_handle` to populate `NetState`
+    // — we add a placeholder DHCP socket but never poll its events.
+    // Using a real socket (rather than `Option<SocketHandle>`) keeps
+    // `NetState` shape unchanged and side-steps the borrow / mutex
+    // implications of conditional fields elsewhere in the module.
     #[cfg(feature = "static-ip")]
-    let dhcp_handle: Option<SocketHandle> = None;
+    let dhcp_handle = sockets.add(dhcpv4::Socket::new());
 
     *NET.lock() = Some(NetState {
         device,
@@ -425,43 +420,41 @@ pub fn poll() -> bool {
     // Drain DHCP events every poll, regardless of whether socket
     // state "changed" — smoltcp reports on a different axis.
     //
-    // `dhcp_handle` is `None` under the `static-ip` feature (#657):
-    // no socket is in the SocketSet, so there's nothing to drain
-    // and `iface.poll()` doesn't synthesise DHCP traffic on the
-    // wire. Letting a `Deconfigured` event through would clear the
+    // When `static-ip` is on (#655) we skip this entirely: the
+    // interface is statically configured at `init` time and the
+    // DHCP socket is a placeholder we never read events from.
+    // Letting a `Deconfigured` event through would clear the
     // static IP; letting a `Configured` event through would
     // overwrite it with whatever the server hands out (which on
     // QEMU SLiRP is the same address — but the round-trip wastes
     // boot-time and breaks the determinism the static-ip feature
-    // exists to provide). Skipping the socket entirely also avoids
-    // the SLiRP-hostfwd-vs-DHCP interaction documented in the
-    // `init` comment above.
-    if let Some(handle) = state.dhcp_handle {
-        let dhcp = state.sockets.get_mut::<dhcpv4::Socket>(handle);
-        if let Some(event) = dhcp.poll() {
-            match event {
-                dhcpv4::Event::Configured(config) => {
-                    state.lease = Some(DhcpLease {
-                        address: config.address,
-                        router: config.router,
-                        dns_servers: config.dns_servers.iter().copied().collect(),
-                    });
-                    state.iface.update_ip_addrs(|addrs| {
-                        addrs.clear();
-                        let _ = addrs.push(IpCidr::Ipv4(config.address));
-                    });
-                    if let Some(router) = config.router {
-                        let _ = state.iface.routes_mut()
-                            .add_default_ipv4_route(router);
-                    } else {
-                        state.iface.routes_mut().remove_default_ipv4_route();
-                    }
-                }
-                dhcpv4::Event::Deconfigured => {
-                    state.lease = None;
-                    state.iface.update_ip_addrs(|addrs| addrs.clear());
+    // exists to provide).
+    #[cfg(not(feature = "static-ip"))]
+    let dhcp = state.sockets.get_mut::<dhcpv4::Socket>(state.dhcp_handle);
+    #[cfg(not(feature = "static-ip"))]
+    if let Some(event) = dhcp.poll() {
+        match event {
+            dhcpv4::Event::Configured(config) => {
+                state.lease = Some(DhcpLease {
+                    address: config.address,
+                    router: config.router,
+                    dns_servers: config.dns_servers.iter().copied().collect(),
+                });
+                state.iface.update_ip_addrs(|addrs| {
+                    addrs.clear();
+                    let _ = addrs.push(IpCidr::Ipv4(config.address));
+                });
+                if let Some(router) = config.router {
+                    let _ = state.iface.routes_mut()
+                        .add_default_ipv4_route(router);
+                } else {
                     state.iface.routes_mut().remove_default_ipv4_route();
                 }
+            }
+            dhcpv4::Event::Deconfigured => {
+                state.lease = None;
+                state.iface.update_ip_addrs(|addrs| addrs.clear());
+                state.iface.routes_mut().remove_default_ipv4_route();
             }
         }
     }
