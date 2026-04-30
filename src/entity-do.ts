@@ -32,6 +32,13 @@
 
 import { DurableObject } from 'cloudflare:workers'
 import type { SqlLike } from './sql-like'
+import {
+  type CellAddress,
+  type TenantMasterKey,
+  cellSeal,
+  cellOpen,
+  deriveTenantMasterKey,
+} from './cell-encryption'
 export type { SqlLike } from './sql-like'
 
 // ── Types ───────────────────────────────────────────────────────────
@@ -112,13 +119,125 @@ export function removeCell(sql: SqlLike): { id: string } | null {
   return { id: cell.id }
 }
 
+// ── Cell-level encryption (#659) ───────────────────────────────────
+//
+// `storeCellSealed` / `fetchCellSealed` are the cell_seal / cell_open
+// pair the EntityDB reaches for whenever a tenant master is bound at
+// the DO scope. The wire shape stored in the SQLite TEXT column is a
+// magic prefix + base64 of the sealed envelope:
+//
+//     "ARESTAEAD1:" + base64(NONCE | ciphertext | tag)
+//
+// The prefix is what lets `fetchCell` /
+// `fetchCellSealed` distinguish encrypted from plaintext rows during
+// a migration window — if the prefix is absent we treat the row as
+// legacy plaintext JSON. Production deployments enable encryption
+// uniformly so the legacy path is a no-op once the migration window
+// closes; until then it keeps mixed-shape DBs readable.
+//
+// Address shape: scope = "worker", domain = the EntityDB's noun type
+// (e.g. "Order"), cellName = the entity id (e.g. "ord-42"), version
+// = 0 today (a future commit can wire this to the per-row monotonic
+// version per #558 for replay-defence on hot-swapped masters).
+
+/** Sealed-row magic prefix on the SQLite TEXT column. */
+export const SEALED_CELL_PREFIX = 'ARESTAEAD1:'
+
+/** Build a CellAddress from the EntityDB's notion of (type, id). */
+export function cellAddressFor(type: string, id: string): CellAddress {
+  return {
+    scope: 'worker',
+    domain: type,
+    cellName: id,
+    version: 0,
+  }
+}
+
+/** ↑n — fetch the cell, decrypting if the row carries the sealed
+ *  prefix. Returns the same shape as `fetchCell` so callers can
+ *  swap the helper without touching their consumers. */
+export async function fetchCellSealed(
+  sql: SqlLike,
+  master: TenantMasterKey,
+): Promise<CellContents | null> {
+  const rows = sql.exec(`SELECT id, type, data FROM cell`).toArray()
+  if (rows.length === 0) return null
+  const row = rows[0] as Record<string, any>
+  const dataField: unknown = row.data
+  let data: Record<string, unknown>
+  if (typeof dataField === 'string' && dataField.startsWith(SEALED_CELL_PREFIX)) {
+    const sealed = base64ToBytes(dataField.slice(SEALED_CELL_PREFIX.length))
+    const address = cellAddressFor(row.type as string, row.id as string)
+    const opened = await cellOpen(master, address, sealed)
+    const json = new TextDecoder().decode(opened)
+    data = JSON.parse(json)
+  } else if (typeof dataField === 'string') {
+    // Legacy plaintext row — read as-is during migration window.
+    data = JSON.parse(dataField || '{}')
+  } else {
+    data = (dataField as Record<string, unknown>) ?? {}
+  }
+  return {
+    id: row.id,
+    type: row.type,
+    data,
+  }
+}
+
+/** ↓n — store new contents into the cell, sealing the JSON-encoded
+ *  data column with the per-tenant master before the SQL write.
+ *  The encrypted bytes go into the same `data` TEXT column, prefixed
+ *  with `SEALED_CELL_PREFIX` so `fetchCellSealed` / `fetchCell` can
+ *  tell encrypted rows from legacy plaintext. */
+export async function storeCellSealed(
+  sql: SqlLike,
+  master: TenantMasterKey,
+  id: string,
+  type: string,
+  data: Record<string, unknown>,
+): Promise<CellContents> {
+  const json = JSON.stringify(data)
+  const address = cellAddressFor(type, id)
+  const sealed = await cellSeal(master, address, json)
+  const blob = SEALED_CELL_PREFIX + bytesToBase64(sealed)
+  sql.exec(
+    `INSERT OR REPLACE INTO cell (id, type, data) VALUES (?, ?, ?)`,
+    id,
+    type,
+    blob,
+  )
+  return { id, type, data }
+}
+
+// Inline base64 helpers — `cell-encryption.ts` keeps them private; we
+// duplicate the few lines here rather than re-exporting because the
+// SQL column round-trip is the only place outside the encryption
+// module that needs the raw conversion.
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = ''
+  const CHUNK = 0x8000
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(
+      ...bytes.subarray(i, Math.min(i + CHUNK, bytes.length)),
+    )
+  }
+  return btoa(binary)
+}
+function base64ToBytes(b64: string): Uint8Array {
+  const binary = atob(b64)
+  const out = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i)
+  return out
+}
+
 // ── Fact Projection ─────────────────────────────────────────────────
 // Facts are NOT stored. They are projections of the cell's data.
 // α(project_column) applied to the data record.
 
-/** Project the cell into facts. Each field becomes a fact type instance. */
-export function getFacts(sql: SqlLike): Fact[] {
-  const cell = fetchCell(sql)
+/** Project a cell value (already fetched + decrypted) into facts.
+ *  Pure function — split out so the encrypted DO methods can call it
+ *  after `fetchCellSealed` without re-deriving the master. */
+export function factsFromCell(cell: CellContents | null): Fact[] {
   if (!cell) return []
   return Object.entries(cell.data)
     .filter(([_, v]) => v !== null && v !== undefined && v !== '')
@@ -126,6 +245,11 @@ export function getFacts(sql: SqlLike): Fact[] {
       graphSchemaId: `${cell.type} has ${field}`,
       bindings: [[cell.type, cell.id], [field, String(value)]],
     }))
+}
+
+/** Project the cell into facts. Each field becomes a fact type instance. */
+export function getFacts(sql: SqlLike): Fact[] {
+  return factsFromCell(fetchCell(sql))
 }
 
 /** Project facts for a specific fact type (field). */
@@ -180,6 +304,12 @@ export function listConnectedSystems(sql: SqlLike): string[] {
 
 export class EntityDB extends DurableObject {
   private initialized = false
+  /** Lazily-derived per-tenant master. `null` until the first call
+   *  that actually needs to seal/open — derivation reaches Web
+   *  Crypto's `crypto.subtle` and is async, so we can't do it in
+   *  `ensureInit` (which is sync) and shouldn't pay the cost on
+   *  every request. */
+  private master: TenantMasterKey | null = null
 
   private ensureInit(): void {
     if (this.initialized) return
@@ -188,19 +318,53 @@ export class EntityDB extends DurableObject {
     this.initialized = true
   }
 
+  /** Resolve the per-tenant master from the
+   *  `TENANT_MASTER_SEED` Worker secret + this DO's id (which is
+   *  the tenant-scoped routing key the dispatcher derived). Memoised
+   *  per DO instance.
+   *
+   *  Returns `null` if the secret is not bound — callers fall back
+   *  to the legacy plaintext path so a stripped-down dev build (no
+   *  `wrangler secret put TENANT_MASTER_SEED` step) keeps working
+   *  without source surgery. Production deployments must set the
+   *  secret; absence of the secret in prod is a deploy-time bug. */
+  private async getMaster(): Promise<TenantMasterKey | null> {
+    if (this.master) return this.master
+    const env = this.env as { TENANT_MASTER_SEED?: string } | undefined
+    const seed = env?.TENANT_MASTER_SEED
+    if (!seed) return null
+    // The DO's id name is the tenant routing key (per-cell DO mapping
+    // #217). Use it as the salt so each tenant derives a distinct
+    // master from the same shared seed.
+    const tenantSalt = this.ctx.id.toString()
+    const m = await deriveTenantMasterKey(seed, tenantSalt)
+    this.master = m
+    return m
+  }
+
   /** ↑n — fetch the cell. Returns { id, type, data } or null. */
   async get(): Promise<CellContents | null> {
     this.ensureInit()
+    const master = await this.getMaster()
+    if (master) {
+      return fetchCellSealed(this.ctx.storage.sql, master)
+    }
     return fetchCell(this.ctx.storage.sql)
   }
 
   /** ↓n — store the cell. Merges with existing data (idempotent across domains). */
   async put(input: { id: string; type: string; data: Record<string, unknown> }): Promise<CellContents> {
     this.ensureInit()
-    const existing = fetchCell(this.ctx.storage.sql)
+    const master = await this.getMaster()
+    const existing = master
+      ? await fetchCellSealed(this.ctx.storage.sql, master)
+      : fetchCell(this.ctx.storage.sql)
     const merged: Record<string, unknown> = existing ? { ...existing.data } : {}
     for (const [k, v] of Object.entries(input.data)) {
       if (v !== null && v !== undefined) merged[k] = v
+    }
+    if (master) {
+      return storeCellSealed(this.ctx.storage.sql, master, input.id, input.type, merged)
     }
     return storeCell(this.ctx.storage.sql, input.id, input.type, merged)
   }
@@ -213,16 +377,37 @@ export class EntityDB extends DurableObject {
 
   async getFacts(): Promise<Fact[]> {
     this.ensureInit()
+    const master = await this.getMaster()
+    if (master) {
+      const cell = await fetchCellSealed(this.ctx.storage.sql, master)
+      return factsFromCell(cell)
+    }
     return getFacts(this.ctx.storage.sql)
   }
 
   async getFactsBySchema(graphSchemaId: string): Promise<Fact[]> {
     this.ensureInit()
+    const master = await this.getMaster()
+    if (master) {
+      const cell = await fetchCellSealed(this.ctx.storage.sql, master)
+      return factsFromCell(cell).filter(f => f.graphSchemaId === graphSchemaId)
+    }
     return getFactsBySchema(this.ctx.storage.sql, graphSchemaId)
   }
 
   async toPopulation(): Promise<Record<string, Array<{ factTypeId: string; bindings: Array<[string, string]> }>>> {
     this.ensureInit()
+    const master = await this.getMaster()
+    if (master) {
+      const cell = await fetchCellSealed(this.ctx.storage.sql, master)
+      const facts = factsFromCell(cell)
+      const population: Record<string, Array<{ factTypeId: string; bindings: Array<[string, string]> }>> = {}
+      for (const fact of facts) {
+        if (!population[fact.graphSchemaId]) population[fact.graphSchemaId] = []
+        population[fact.graphSchemaId].push({ factTypeId: fact.graphSchemaId, bindings: fact.bindings })
+      }
+      return population
+    }
     return toPopulation(this.ctx.storage.sql)
   }
 
