@@ -67,7 +67,9 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
+use arest::agent;
 use arest::ast::{self, Func, Object};
+use arest::json_min;
 use spin::{Mutex, Once, RwLock};
 
 use crate::assets;
@@ -236,6 +238,26 @@ pub fn init() {
             Object::seq(alloc::vec![Object::atom("event"), Object::atom("categorize")]),
         ]);
         initial = ast::cell_push("Transition", t_categorize, &initial);
+
+        // #620 / HATEOAS-6b — register the `extract` agent verb as a
+        // Func::Platform slot at boot. The kernel profile installs no
+        // body (cf. `Func::Platform(_) → Bottom` in the `no_std` arm
+        // of `apply_nonbottom`), so `apply(Func::Def("extract"), …)`
+        // returns `Object::Bottom` and `handle_extract` lifts that
+        // into a 503 envelope pointing at the worker URL. Branch-free
+        // dispatch — the verb resolves through the same FetchOrPhi /
+        // metacompose path every other ρ-applied def does. The
+        // worker target swaps in a real LLM body via
+        // `externals::install_async_platform_fn` (or its sync twin)
+        // without touching the dispatch path.
+        //
+        // See `crates/arest/src/externals.rs:54-86` for the worked
+        // example this implementation follows verbatim.
+        initial = ast::register_runtime_fn(
+            "extract",
+            Func::Platform("extract".to_string()),
+            &initial,
+        );
 
         // #580 — seed the ui.do bundle (when the `ui-bundle` feature
         // baked one in) into the cell graph so `arest_http_handler`
@@ -411,6 +433,251 @@ fn apply_named(name: &str, body: &[u8]) -> Vec<u8> {
     })
     .expect("system::init() not called");
     serialise(&out)
+}
+
+/// Worker URL the `Retry-After` header points the caller at when
+/// `POST /arest/extract` falls into the no-body path (#620 / HATEOAS-6b).
+/// Single source of truth so the header value, the envelope's
+/// `_links.worker.href`, and the envelope's top-level `retryAfter`
+/// can't drift.
+pub const EXTRACT_WORKER_URL: &str = "https://arest.do/arest/extract";
+
+/// Outcome of `dispatch_extract` — gives the HTTP layer enough shape
+/// to build either a 200 (body installed; `result_body` is the JSON-
+/// shaped output of the LLM call) or a 503 (no body installed;
+/// `result_body` is the introspectable envelope below). The status
+/// is owned by this module rather than the caller so the
+/// envelope-vs-body decision lives in one place.
+#[derive(Debug)]
+pub struct ExtractOutcome {
+    /// HTTP status — 200 when the Platform-fn body produced a non-Bottom
+    /// Object, 503 when it returned Bottom (no body installed in this
+    /// profile, the `Func::Platform(_) → Bottom` arm in `no_std` apply).
+    pub status: u16,
+    /// Response body bytes. JSON for both branches:
+    ///   * 200 — the engine output, currently the same shape
+    ///     `serialise()` emits (atoms pass through, everything else
+    ///     renders via Debug; future commits replace with FFP-to-JSON).
+    ///   * 503 — the structured envelope documented on
+    ///     `build_no_body_envelope` below.
+    pub body: Vec<u8>,
+    /// Worker URL when this is a 503 envelope, `None` for 200. Lifted
+    /// to the HTTP layer as a `Retry-After` header.
+    pub retry_after: Option<String>,
+}
+
+/// `POST /arest/extract` dispatch entry (#620 / HATEOAS-6b).
+///
+/// Three branches:
+///   1. Body parses as JSON → drive `apply(Func::Def("extract"),
+///      input, D)`. On `Object::Bottom` (no LLM body installed in this
+///      profile), emit the introspectable 503 envelope with the
+///      resolved Agent Definition metadata when available.
+///   2. Body parses but apply produces a non-Bottom Object → 200 with
+///      the result serialised (`serialise()`).
+///   3. Body fails to parse → 503 with `extract.parse` envelope so a
+///      malformed POST never panics; mirrors the `extract.no_body`
+///      shape so callers can rely on a single envelope schema across
+///      both failure modes.
+///
+/// The function is `pub` so the dispatcher in `lib.rs` can reach it
+/// without going through the lower-level `apply_named` (which serialises
+/// blindly and has no envelope shape — extract needs the structured
+/// surface for #624 e2e).
+pub fn dispatch_extract(body: &[u8]) -> ExtractOutcome {
+    // Parse JSON input first. An empty body is treated as `phi()` —
+    // the verb may still be invoked with no operand (some agent
+    // prompts don't need one). Garbage body falls into the parse
+    // envelope below.
+    let parsed_input: Option<Object> = if body.is_empty() {
+        Some(Object::phi())
+    } else {
+        match json_min::parse(body) {
+            Some(v) => Some(json_to_object(&v)),
+            None => None,
+        }
+    };
+
+    let parsed_input = match parsed_input {
+        Some(obj) => obj,
+        None => {
+            // #620 — malformed JSON returns 503 with `extract.parse`.
+            // Reusing the no-body envelope's `_links.worker` shape so
+            // the caller can still re-issue against the worker
+            // (which may have looser parsing or surface a richer
+            // 4xx). 503 (not 400) keeps the dispatch contract uniform:
+            // every failure mode here is "this profile can't fulfil
+            // the call; here's where it might succeed".
+            let envelope = build_envelope(
+                "extract.parse",
+                "Request body did not parse as JSON; nothing to dispatch to the 'extract' verb.",
+                None,
+            );
+            return ExtractOutcome {
+                status: 503,
+                body: envelope.into_bytes(),
+                retry_after: Some(EXTRACT_WORKER_URL.to_string()),
+            };
+        }
+    };
+
+    // Drive the verb through the standard ρ-application path. If
+    // SYSTEM hasn't been initialised the kernel is in a programmer-
+    // error state — surface a 500-shaped envelope rather than
+    // panicking, so the wire keeps responding.
+    let result = with_state(|state| {
+        ast::apply(
+            &Func::Def("extract".to_string()),
+            &parsed_input,
+            state,
+        )
+    });
+
+    let (result, agent_binding) = match result {
+        Some(r) => {
+            let binding = with_state(|state| agent::resolve_agent_verb(state, "extract"))
+                .flatten();
+            (r, binding)
+        }
+        None => {
+            // init() not called — degrade to 503 so the wire stays up.
+            let envelope = build_envelope(
+                "extract.no_body",
+                "SYSTEM not initialised; the 'extract' verb cannot be dispatched.",
+                None,
+            );
+            return ExtractOutcome {
+                status: 503,
+                body: envelope.into_bytes(),
+                retry_after: Some(EXTRACT_WORKER_URL.to_string()),
+            };
+        }
+    };
+
+    if result.is_bottom() {
+        let envelope = build_envelope(
+            "extract.no_body",
+            "The 'extract' verb is registered on this kernel but no LLM body is installed. \
+             Configure a body via arest::externals::install_async_platform_fn, or route to a \
+             profile that has one.",
+            agent_binding.as_ref(),
+        );
+        return ExtractOutcome {
+            status: 503,
+            body: envelope.into_bytes(),
+            retry_after: Some(EXTRACT_WORKER_URL.to_string()),
+        };
+    }
+
+    // Body installed — return 200 with the serialised result. For now
+    // this reuses `serialise()`; once a richer FFP-to-JSON projector
+    // lands the 200 branch can swap encoders without touching the
+    // 503 path.
+    ExtractOutcome {
+        status: 200,
+        body: serialise(&result),
+        retry_after: None,
+    }
+}
+
+/// Convert a parsed `JsonValue` into an `Object` for the engine. The
+/// engine's role-fact shape is `Seq(<key, value>)`, so JSON objects
+/// become a Seq of 2-tuples; arrays pass through as Seqs; primitives
+/// become atoms with a stable string rendering. Mirror of the shape
+/// `hateoas::handle_arest_create_for_slug` builds for entity creates,
+/// but lifted into a stand-alone helper because extract input isn't
+/// limited to a flat field bag.
+fn json_to_object(v: &json_min::JsonValue) -> Object {
+    use json_min::JsonValue;
+    match v {
+        JsonValue::Null => Object::phi(),
+        JsonValue::Bool(true) => Object::atom("T"),
+        JsonValue::Bool(false) => Object::atom("F"),
+        JsonValue::Str(s) => Object::atom(s),
+        JsonValue::Num(n) => Object::atom(n),
+        JsonValue::Array(items) => {
+            Object::seq(items.iter().map(json_to_object).collect())
+        }
+        JsonValue::Object(pairs) => {
+            let mut entries: Vec<Object> = Vec::with_capacity(pairs.len());
+            for (k, v) in pairs {
+                entries.push(Object::seq(alloc::vec![
+                    Object::atom(k),
+                    json_to_object(v),
+                ]));
+            }
+            Object::seq(entries)
+        }
+    }
+}
+
+/// Build the 503 envelope per #620's spec. Includes the resolved
+/// Agent Definition metadata (model + prompt) when `binding` is
+/// `Some`; gracefully omits the field when no Agent Definition cell
+/// is reachable for the verb. Worker fallback always present in
+/// `_links.worker.href` so the envelope is structurally stable —
+/// callers branch only on `agentDefinition`'s presence.
+///
+/// The introspection leak is bounded: Agent Definition metadata is
+/// already publicly readable via `/explain` (#148); this just makes
+/// it visible at the call site so a HATEOAS-aware client can pick a
+/// profile to retry against without a second round-trip.
+fn build_envelope(
+    code: &str,
+    message: &str,
+    binding: Option<&agent::AgentBinding>,
+) -> String {
+    let mut out = String::with_capacity(384);
+    out.push_str("{\"errors\":[{");
+    out.push_str("\"code\":");
+    out.push_str(&json_string_escape(code));
+    out.push_str(",\"message\":");
+    out.push_str(&json_string_escape(message));
+    out.push_str(",\"verb\":\"extract\"");
+    if let Some(b) = binding {
+        out.push_str(",\"agentDefinition\":{");
+        out.push_str("\"model\":");
+        out.push_str(&json_string_escape(&b.model_code));
+        out.push_str(",\"prompt\":");
+        out.push_str(&json_string_escape(&b.prompt));
+        out.push('}');
+    }
+    out.push_str(",\"_links\":{\"worker\":{\"href\":");
+    out.push_str(&json_string_escape(EXTRACT_WORKER_URL));
+    out.push_str("}}");
+    out.push_str("}],\"status\":503,\"retryAfter\":");
+    out.push_str(&json_string_escape(EXTRACT_WORKER_URL));
+    out.push('}');
+    out
+}
+
+/// Quote and escape a string per RFC 8259 §7. Hand-rolled twin of
+/// `hateoas::json_string` — repeated rather than re-exported because
+/// that helper is module-private in `arest::hateoas` (not part of the
+/// crate's public surface; making it `pub` would lock the kernel into
+/// an internal API). The two stay in sync structurally; if the engine
+/// ever lifts its escaper into `arest::json_min` proper, this one can
+/// collapse to a re-export.
+fn json_string_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Read the baked SYSTEM state through a closure. `f` runs while
@@ -1012,5 +1279,220 @@ mod tests {
         apply(next2).expect("apply succeeds post-init");
         assert!(!ran.load(Ordering::Relaxed),
             "handler must not re-run after self-unsubscribe");
+    }
+
+    // ── #620 / HATEOAS-6b — POST /arest/extract dispatch ──────────────
+    //
+    // These tests exercise `dispatch_extract` against locally-built
+    // states rather than the module-level `SYSTEM` singleton, so they
+    // can stage Agent Definition cells per case without contending on
+    // the global init path. The 503-with-installed-body case uses the
+    // sec-2 platform fallback registry (host-only via the std-deps
+    // arest dep — see `crates/arest-kernel/Cargo.toml`'s
+    // `[target.'cfg(not(target_os = "uefi"))'.dependencies]` block)
+    // so the dispatch can resolve a real body without a worker
+    // present. UEFI-target builds elide the platform fallback shim
+    // (kernel profile is `feature = "no_std"`); those tests don't run
+    // there and that's intentional — UEFI verification is a
+    // `cargo check` not a `cargo test`.
+    //
+    // The `dispatch_extract` function itself reads from `with_state`,
+    // which means each test must `init()` the singleton (or at minimum
+    // mutate it via `apply`) before driving the dispatcher. The
+    // singleton is process-lifetime, so subsequent tests share the
+    // base state — the assertions below all key on cell-name probes
+    // unique to the test case so cross-test contamination doesn't
+    // matter. The Agent-Definition tests further isolate themselves by
+    // staging into the live SYSTEM via `apply`, asserting against the
+    // result, then restoring the singleton via a follow-up apply that
+    // clears the staged cells (so a later test seeing the singleton
+    // doesn't observe stale Verb / Agent_Definition_* facts).
+
+    #[test]
+    fn extract_returns_503_when_no_body() {
+        init();
+        // Empty body — the Platform-fn slot is registered at init but
+        // no body is installed in the kernel profile, so apply
+        // produces Bottom and the envelope lifts to 503.
+        let outcome = dispatch_extract(b"");
+        assert_eq!(outcome.status, 503, "no body installed must surface as 503");
+        let body_str = core::str::from_utf8(&outcome.body).expect("envelope is utf-8 json");
+        assert!(
+            body_str.contains("\"code\":\"extract.no_body\""),
+            "envelope must carry extract.no_body code, got: {body_str}",
+        );
+        assert_eq!(
+            outcome.retry_after.as_deref(),
+            Some(EXTRACT_WORKER_URL),
+            "Retry-After header must point at the worker URL",
+        );
+    }
+
+    #[test]
+    fn extract_envelope_includes_agent_definition_when_resolved() {
+        init();
+        // Stage the four cells `agent::resolve_agent_verb` walks:
+        // Verb, Verb_invokes_Agent_Definition,
+        // Agent_Definition_uses_Model, Agent_Definition_has_Prompt.
+        // We capture the pre-state so we can roll back at the end and
+        // not contaminate sibling tests sharing the singleton.
+        let pre = with_state(|s| s.clone()).expect("init ran");
+        let s = ast::cell_push(
+            "Verb",
+            fact_from_pairs(&[("id", "verb-extract"), ("name", "extract")]),
+            &pre,
+        );
+        let s = ast::cell_push(
+            "Verb_invokes_Agent_Definition",
+            fact_from_pairs(&[
+                ("Verb", "verb-extract"),
+                ("Agent Definition", "agent-extractor"),
+            ]),
+            &s,
+        );
+        let s = ast::cell_push(
+            "Agent_Definition_uses_Model",
+            fact_from_pairs(&[
+                ("Agent Definition", "agent-extractor"),
+                ("Model", "claude-sonnet-4.6"),
+            ]),
+            &s,
+        );
+        let s = ast::cell_push(
+            "Agent_Definition_has_Prompt",
+            fact_from_pairs(&[
+                ("Agent Definition", "agent-extractor"),
+                ("Prompt", "Extract one fact per claim. Be terse."),
+            ]),
+            &s,
+        );
+        apply(s).expect("apply succeeds post-init");
+
+        let outcome = dispatch_extract(b"");
+        assert_eq!(outcome.status, 503);
+        let body_str = core::str::from_utf8(&outcome.body).expect("envelope is utf-8 json");
+        assert!(
+            body_str.contains("\"agentDefinition\""),
+            "envelope must carry agentDefinition when resolved, got: {body_str}",
+        );
+        assert!(
+            body_str.contains("\"model\":\"claude-sonnet-4.6\""),
+            "envelope must surface the resolved model code, got: {body_str}",
+        );
+        assert!(
+            body_str.contains("\"prompt\":\"Extract one fact per claim. Be terse.\""),
+            "envelope must surface the resolved prompt, got: {body_str}",
+        );
+
+        // Roll the singleton back to its pre-test state so siblings
+        // don't observe the staged Verb / Agent_Definition_* cells.
+        apply(pre).expect("rollback apply succeeds");
+    }
+
+    #[test]
+    fn extract_envelope_omits_agent_definition_when_unresolved() {
+        init();
+        // Snapshot the singleton; if a sibling test (above) staged
+        // Agent Definition cells and the rollback ran, we should see
+        // an unresolved verb here. Belt-and-braces: explicitly assert
+        // that no Verb cell carries `name = extract` in the snapshot
+        // we're about to dispatch against. If one is present the test
+        // is an honest false negative — flag it via skip rather than
+        // a brittle pass.
+        let snap = with_state(|s| s.clone()).expect("init ran");
+        let has_verb = ast::fetch_or_phi("Verb", &snap)
+            .as_seq()
+            .map(|seq| seq.iter().any(|v| ast::binding(v, "name") == Some("extract")))
+            .unwrap_or(false);
+        if has_verb {
+            // Sibling test ran and didn't roll back — skip, this case
+            // can only assert the absent path against an unstaged
+            // snapshot.
+            return;
+        }
+        let outcome = dispatch_extract(b"");
+        assert_eq!(outcome.status, 503);
+        let body_str = core::str::from_utf8(&outcome.body).expect("envelope is utf-8 json");
+        assert!(
+            !body_str.contains("\"agentDefinition\""),
+            "envelope must omit agentDefinition when verb is unresolved, got: {body_str}",
+        );
+        // The other fields stay present — code, message, verb,
+        // _links.worker, status, retryAfter.
+        assert!(body_str.contains("\"code\":\"extract.no_body\""));
+        assert!(body_str.contains("\"verb\":\"extract\""));
+        assert!(body_str.contains("\"_links\":{\"worker\""));
+    }
+
+    #[test]
+    fn extract_dispatch_does_not_panic_on_malformed_json() {
+        init();
+        // Garbage input — the parser returns None, and the dispatcher
+        // surfaces an `extract.parse` envelope rather than panicking.
+        // 503 (not 400) keeps the dispatch contract uniform: every
+        // failure mode here resolves as "this profile can't fulfil
+        // the call, here's where it might succeed".
+        let outcome = dispatch_extract(b"{not-json");
+        assert_eq!(outcome.status, 503);
+        let body_str = core::str::from_utf8(&outcome.body).expect("envelope is utf-8 json");
+        assert!(
+            body_str.contains("\"code\":\"extract.parse\""),
+            "malformed JSON must produce extract.parse code, got: {body_str}",
+        );
+        assert_eq!(
+            outcome.retry_after.as_deref(),
+            Some(EXTRACT_WORKER_URL),
+        );
+    }
+
+    /// Confirms the slot mechanism works end-to-end once a body is
+    /// installed: the verb is registered as `Func::Platform("extract")`
+    /// at boot, the host-target arest build's PLATFORM_FALLBACK
+    /// registry accepts an installed body, and `dispatch_extract`
+    /// surfaces 200 instead of 503. UEFI builds elide
+    /// `install_platform_fn` (it's `cfg(not(feature = "no_std"))` in
+    /// `arest::ast`), so this test is `cfg(not(target_os = "uefi"))`-
+    /// only — the per-target dep block in
+    /// `crates/arest-kernel/Cargo.toml` resolves the host-deps
+    /// arest crate variant for `cargo test --lib -p arest-kernel`,
+    /// where the registry is reachable. The UEFI cross-compile
+    /// (`cargo check --target x86_64-unknown-uefi --features
+    /// server --tests`) elides this case entirely, which is what
+    /// the bar in #620 documents (UEFI verification is a
+    /// `cargo check`, not a `cargo test`).
+    #[cfg(not(target_os = "uefi"))]
+    #[test]
+    fn extract_with_installed_body_returns_200() {
+        use arest::ast::{install_platform_fn, uninstall_platform_fn};
+        init();
+
+        // Install an echo-shaped body that turns the input Object into
+        // a known atom so we can assert against it. The body just
+        // returns an atom marker — the assertion is structural (status
+        // 200, body contains the marker), not a deep round-trip of
+        // the input shape.
+        install_platform_fn(
+            "extract",
+            arest::sync::Arc::new(|_input: &Object, _d: &Object| {
+                Object::atom("LLM(echo): kernel-extract-installed")
+            }),
+        );
+
+        let outcome = dispatch_extract(b"{\"foo\":\"bar\"}");
+        // Restore the kernel default (no body installed) before the
+        // assertions so a panic doesn't leave the registry hot for
+        // the no-body tests above (#620 — those tests assume Bottom).
+        uninstall_platform_fn("extract");
+
+        assert_eq!(outcome.status, 200, "installed body must surface as 200");
+        let body_str = core::str::from_utf8(&outcome.body).expect("response is utf-8");
+        assert!(
+            body_str.contains("LLM(echo): kernel-extract-installed"),
+            "installed body's output must round-trip, got: {body_str}",
+        );
+        assert!(
+            outcome.retry_after.is_none(),
+            "200 response must not carry a Retry-After hint",
+        );
     }
 }
