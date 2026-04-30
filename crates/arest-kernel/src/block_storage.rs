@@ -474,6 +474,95 @@ pub fn last_state_sealed_open(master: &TenantMasterKey) -> Result<Option<Vec<u8>
         .map_err(Error::Aead)
 }
 
+// ── Tenant master rotation (#662 — kernel side) ────────────────────
+//
+// First-version rotation takes the kernel checkpoint slot read-only
+// for the duration of the call. The kernel's mount slot is guarded
+// by `MOUNT: Mutex<Option<Mounted>>` (single-writer by construction)
+// and `checkpoint_sealed` / `last_state_sealed_open` already
+// serialise on the same lock, so the rotation walk inherits the
+// serialisation without an extra primitive — we just hold the
+// outer rotate call long enough to do read-old → write-new without
+// an interleaving checkpoint.
+//
+// Operator workflow (kernel):
+//
+//   1. Persist the new 32-byte master in the freeze-blob "pending"
+//      slot alongside the existing "active" slot. (Targets that
+//      derive the master from boot entropy + salt store the new
+//      salt in "pending" instead of the bytes themselves.)
+//   2. Call `rotate_checkpoint_master(old, new)`:
+//        - reads the on-disk sealed envelope under `old`;
+//        - re-seals the recovered plaintext under `new`;
+//        - writes the new envelope back atomically (single
+//          `checkpoint()` call — same path the rest of the kernel
+//          uses, so the durability contract is unchanged).
+//   3. Promote "pending" → "active" in the freeze-blob.
+//   4. Wipe the old master from the boot path.
+//
+// Only ONE sealed cell on disk: the kernel persists a single
+// outer-envelope checkpoint at `("kernel", "persistence",
+// "checkpoint", boot_count)`. A multi-checkpoint follow-up (#666 et
+// al.) would extend this to the per-slot checkpoint set.
+
+/// Rotate the on-disk checkpoint envelope from `old` to `new`. Reads
+/// the sealed bytes off the mount, opens with the old master,
+/// re-seals with the new master, writes the new envelope back.
+///
+/// Returns `Ok(())` on a clean rotation; `Err(Error::NotMounted)` if
+/// no checkpoint has ever been written; `Err(Error::Aead(_))` if the
+/// old master cannot open the on-disk envelope (in which case the
+/// disk is left untouched — operator must intervene).
+///
+/// The rotation holds the mount lock (`MOUNT`) for the read-side
+/// only. The write-back hands off through `checkpoint()` which
+/// re-acquires it; in between, a concurrent `checkpoint_sealed`
+/// call from the kernel's own tick would be locked out by the
+/// Mutex, so the read-old / write-new sequence is atomic against
+/// other writers. First-version assumption, documented above.
+pub fn rotate_checkpoint_master(
+    old: &TenantMasterKey,
+    new: &TenantMasterKey,
+) -> Result<(), Error> {
+    // Read side: pull the sealed bytes + the boot_count they were
+    // sealed at.
+    let (sealed, prev_boot) = {
+        let guard = MOUNT.lock();
+        match guard.as_ref() {
+            Some(m) => match &m.state {
+                Some(bytes) => (bytes.clone(), m.header.boot_count),
+                None => return Err(Error::NotMounted),
+            },
+            None => return Err(Error::NotMounted),
+        }
+    };
+    let address = CellAddress::new(
+        CHECKPOINT_SCOPE,
+        CHECKPOINT_DOMAIN,
+        CHECKPOINT_CELL,
+        prev_boot,
+    );
+    // Re-seal under `new` using the rotation primitive — single-cell
+    // atomic, fresh nonce, same address (so AAD bindings stay
+    // consistent). A `Truncated` envelope on disk is impossible at
+    // this point (CRC + magic already passed at mount time), but
+    // surface it cleanly anyway via `Error::Aead`.
+    let new_sealed = cell_aead::rotate_cell(old, new, &address, &sealed)
+        .map_err(Error::Aead)?;
+    // Write back through the existing checkpoint path — re-uses the
+    // CRC + header machinery so the on-disk format is identical.
+    checkpoint(&new_sealed)?;
+    // Refresh the in-memory mount cache so a subsequent
+    // `last_state_sealed_open(new)` reads the just-written envelope.
+    {
+        let mut guard = MOUNT.lock();
+        if let Some(m) = guard.as_mut() {
+            m.state = Some(new_sealed);
+        }
+    }
+    Ok(())
+}
+
 // ── Reserved sub-regions ───────────────────────────────────────────
 //
 // `reserve_region` carves a contiguous sector range out of the

@@ -1335,6 +1335,68 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         return name.to_string();
     }
 
+    // ── #662 SystemVerb::RotateTenantMaster ─────────────────────────
+    //
+    //   system(h, "rotate_tenant_master:<tenant_id>", <JSON body>) → <JSON envelope>
+    //
+    // Rotate a tenant's master key A → B over a caller-supplied set of
+    // sealed cells. Pure transform: input is `{old, new, cells:[…]}`,
+    // output is `{ok, rotated:[…], failures:[…]}`. The walk does NOT
+    // touch the storage backend — the caller (kernel block_storage,
+    // worker EntityDB orchestrator, host CLI) is responsible for
+    // atomic-swapping each `rotated` entry into storage and for
+    // holding the per-tenant write lock for the rotation window.
+    //
+    // The `<tenant_id>` suffix is informational (audit trail / future
+    // routing) — at the engine layer a SYSTEM call is already scoped
+    // to a tenant via its `handle`. Two tenants on the same handle
+    // cannot share a master, so the suffix is a label for operator
+    // logs, not a routing key.
+    //
+    // Gate: same `RegisterMode::Privileged` boundary as `register:`
+    // and `load_reading:`. An accidentally-exposed `system_impl` over
+    // HTTP/MCP MUST NOT let a remote actor trigger a master rotation.
+    //
+    // Read-only window: the rotation walk assumes the tenant is held
+    // read-only by the caller (per-tenant write lock). The engine
+    // does not enforce that here — the lock lives at the kernel /
+    // worker layer where the cell store is actually mutated. See
+    // `cell_aead::rotate_tenant`'s module documentation.
+    //
+    // Input shape (all fields required):
+    //   {
+    //     "old":   "<64-hex-char master>",
+    //     "new":   "<64-hex-char master>",
+    //     "cells": [
+    //       {"scope":"…","domain":"…","cell_name":"…","version":N,
+    //        "sealed_hex":"<lowercase hex of the old sealed envelope>"},
+    //       …
+    //     ]
+    //   }
+    //
+    // Success envelope:
+    //   {"ok":true,"tenant_id":"<id>","rotated":[
+    //     {"scope":…,"domain":…,"cell_name":…,"version":…,
+    //      "sealed_hex":"<hex of the new sealed envelope>"}, …
+    //    ],"failures":[
+    //     {"scope":…,"cell_name":…,"version":…,"kind":"auth"|"truncated"}, …
+    //    ]}
+    //
+    // Hex (not base64) for the sealed payload because the engine has
+    // no base64 dep today and the existing `register:<name>` hex-body
+    // path already established the convention. A future base64
+    // upgrade can land alongside whatever follow-up adds the dep.
+    //
+    // Failure envelopes (parser-level errors):
+    //   {"ok":false,"tenant_id":"<id>","error":"disallowed",…}      // gate
+    //   {"ok":false,"tenant_id":"<id>","error":"bad_input","detail":"…"}
+    if let Some(tenant_id) = key.strip_prefix("rotate_tenant_master:") {
+        if tenant.read().register_mode != RegisterMode::Privileged {
+            return rotate_tenant_master_disallowed_envelope(tenant_id);
+        }
+        return rotate_tenant_master_dispatch(tenant_id, input);
+    }
+
     // ── Federated ingest FFI (#305) ──────────────────────────────────
     //
     //   system(h, "federated_ingest:<noun>", <JSON>) → <cite-id> | ⊥
@@ -1954,6 +2016,272 @@ fn json_string(s: &str) -> String {
 fn json_string_array(items: &[String]) -> String {
     let inner: Vec<String> = items.iter().map(|s| json_string(s)).collect();
     format!("[{}]", inner.join(","))
+}
+
+// ── #662 SystemVerb::RotateTenantMaster envelope helpers ───────────
+//
+// Hand-rolled JSON shaping (matches the load_reading envelope style
+// above) so the wire contract is visible at a glance and the dispatch
+// stays no-extra-deps. The dispatch parses input via `serde_json::
+// Value` (already in the engine's deps), runs `cell_aead::
+// rotate_tenant`, and renders the report back through the helpers
+// here.
+//
+// Hex encode/decode are inlined: the engine has no `hex` dep, but the
+// existing `register:<name>` arm already hand-rolls the same nibble
+// loop — keeping the rotation dispatch consistent rather than pulling
+// in a one-off crate.
+
+#[cfg(not(feature = "no_std"))]
+fn rotate_tenant_master_disallowed_envelope(tenant_id: &str) -> String {
+    format!(
+        r#"{{"ok":false,"tenant_id":{},"error":"disallowed","detail":"runtime RotateTenantMaster is gated by register_mode; flip to Privileged via set_register_mode"}}"#,
+        json_string(tenant_id),
+    )
+}
+
+#[cfg(not(feature = "no_std"))]
+fn rotate_tenant_master_bad_input_envelope(tenant_id: &str, detail: &str) -> String {
+    format!(
+        r#"{{"ok":false,"tenant_id":{},"error":"bad_input","detail":{}}}"#,
+        json_string(tenant_id),
+        json_string(detail),
+    )
+}
+
+/// Decode a 64-hex-char string into a 32-byte master key. Returns
+/// `Err(detail)` on any width/charset failure so the caller can
+/// surface the reason in the envelope.
+#[cfg(not(feature = "no_std"))]
+fn rotate_master_from_hex(field: &str, hex: &str) -> Result<[u8; 32], String> {
+    if hex.len() != 64 {
+        return Err(format!(
+            "field '{field}' must be 64 hex chars (32 bytes), got {} chars",
+            hex.len()
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        let hi = match chunk[0] {
+            b'0'..=b'9' => chunk[0] - b'0',
+            b'a'..=b'f' => chunk[0] - b'a' + 10,
+            b'A'..=b'F' => chunk[0] - b'A' + 10,
+            _ => return Err(format!("field '{field}' contains non-hex char at byte {i}")),
+        };
+        let lo = match chunk[1] {
+            b'0'..=b'9' => chunk[1] - b'0',
+            b'a'..=b'f' => chunk[1] - b'a' + 10,
+            b'A'..=b'F' => chunk[1] - b'A' + 10,
+            _ => return Err(format!("field '{field}' contains non-hex char at byte {i}")),
+        };
+        out[i] = (hi << 4) | lo;
+    }
+    Ok(out)
+}
+
+/// Decode a lowercase-or-mixed hex string into raw bytes. Whitespace
+/// and odd-length input fail with a structured error.
+#[cfg(not(feature = "no_std"))]
+fn rotate_bytes_from_hex(hex: &str) -> Result<Vec<u8>, String> {
+    if hex.len() % 2 != 0 {
+        return Err(format!("sealed_hex must be even-length, got {}", hex.len()));
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    let bs = hex.as_bytes();
+    for i in (0..bs.len()).step_by(2) {
+        let hi = match bs[i] {
+            b'0'..=b'9' => bs[i] - b'0',
+            b'a'..=b'f' => bs[i] - b'a' + 10,
+            b'A'..=b'F' => bs[i] - b'A' + 10,
+            _ => return Err(format!("sealed_hex non-hex at byte {i}")),
+        };
+        let lo = match bs[i + 1] {
+            b'0'..=b'9' => bs[i + 1] - b'0',
+            b'a'..=b'f' => bs[i + 1] - b'a' + 10,
+            b'A'..=b'F' => bs[i + 1] - b'A' + 10,
+            _ => return Err(format!("sealed_hex non-hex at byte {}", i + 1)),
+        };
+        out.push((hi << 4) | lo);
+    }
+    Ok(out)
+}
+
+/// Encode raw bytes as lowercase hex.
+#[cfg(not(feature = "no_std"))]
+fn rotate_hex_from_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
+
+/// Parse the input envelope, run `cell_aead::rotate_tenant`, render
+/// the result. Returns the JSON envelope string.
+#[cfg(not(feature = "no_std"))]
+fn rotate_tenant_master_dispatch(tenant_id: &str, input: &str) -> String {
+    use crate::cell_aead::{self, AeadError, CellAddress, TenantMasterKey};
+
+    // Parse JSON.
+    let parsed: serde_json::Value = match serde_json::from_str(input) {
+        Ok(v) => v,
+        Err(e) => {
+            return rotate_tenant_master_bad_input_envelope(
+                tenant_id,
+                &format!("input is not valid JSON: {e}"),
+            );
+        }
+    };
+
+    let old_hex = match parsed.get("old").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => {
+            return rotate_tenant_master_bad_input_envelope(
+                tenant_id,
+                "missing or non-string 'old' field",
+            );
+        }
+    };
+    let new_hex = match parsed.get("new").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => {
+            return rotate_tenant_master_bad_input_envelope(
+                tenant_id,
+                "missing or non-string 'new' field",
+            );
+        }
+    };
+    let old_bytes = match rotate_master_from_hex("old", old_hex) {
+        Ok(b) => b,
+        Err(e) => return rotate_tenant_master_bad_input_envelope(tenant_id, &e),
+    };
+    let new_bytes = match rotate_master_from_hex("new", new_hex) {
+        Ok(b) => b,
+        Err(e) => return rotate_tenant_master_bad_input_envelope(tenant_id, &e),
+    };
+    let old_master = TenantMasterKey::from_bytes(old_bytes);
+    let new_master = TenantMasterKey::from_bytes(new_bytes);
+
+    let cells_arr = match parsed.get("cells").and_then(|v| v.as_array()) {
+        Some(a) => a,
+        None => {
+            return rotate_tenant_master_bad_input_envelope(
+                tenant_id,
+                "missing or non-array 'cells' field",
+            );
+        }
+    };
+
+    // Decode each cell descriptor.
+    let mut input_cells: Vec<(CellAddress, Vec<u8>)> = Vec::with_capacity(cells_arr.len());
+    for (i, cell) in cells_arr.iter().enumerate() {
+        let scope = match cell.get("scope").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => {
+                return rotate_tenant_master_bad_input_envelope(
+                    tenant_id,
+                    &format!("cells[{i}]: missing 'scope'"),
+                );
+            }
+        };
+        let domain = match cell.get("domain").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => {
+                return rotate_tenant_master_bad_input_envelope(
+                    tenant_id,
+                    &format!("cells[{i}]: missing 'domain'"),
+                );
+            }
+        };
+        let cell_name = match cell.get("cell_name").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => {
+                return rotate_tenant_master_bad_input_envelope(
+                    tenant_id,
+                    &format!("cells[{i}]: missing 'cell_name'"),
+                );
+            }
+        };
+        let version = match cell.get("version").and_then(|v| v.as_u64()) {
+            Some(n) => n,
+            None => {
+                return rotate_tenant_master_bad_input_envelope(
+                    tenant_id,
+                    &format!("cells[{i}]: missing or non-u64 'version'"),
+                );
+            }
+        };
+        let sealed_hex = match cell.get("sealed_hex").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => {
+                return rotate_tenant_master_bad_input_envelope(
+                    tenant_id,
+                    &format!("cells[{i}]: missing 'sealed_hex'"),
+                );
+            }
+        };
+        let sealed = match rotate_bytes_from_hex(sealed_hex) {
+            Ok(b) => b,
+            Err(e) => {
+                return rotate_tenant_master_bad_input_envelope(
+                    tenant_id,
+                    &format!("cells[{i}]: {e}"),
+                );
+            }
+        };
+        input_cells.push((CellAddress::new(scope, domain, cell_name, version), sealed));
+    }
+
+    // Run the rotation walk. The engine layer does NOT enforce a
+    // per-tenant write lock here — the caller (kernel block_storage,
+    // worker EntityDB orchestrator) holds that lock for the duration
+    // of the rotation window. See `cell_aead::rotate_tenant`'s
+    // module documentation.
+    let report = cell_aead::rotate_tenant(&old_master, &new_master, input_cells.into_iter());
+
+    // Render the success envelope.
+    let rotated_inner: Vec<String> = report
+        .rotated
+        .iter()
+        .map(|(addr, sealed)| {
+            format!(
+                r#"{{"scope":{},"domain":{},"cell_name":{},"version":{},"sealed_hex":{}}}"#,
+                json_string(&addr.scope),
+                json_string(&addr.domain),
+                json_string(&addr.cell_name),
+                addr.version,
+                json_string(&rotate_hex_from_bytes(sealed)),
+            )
+        })
+        .collect();
+    let failures_inner: Vec<String> = report
+        .failures
+        .iter()
+        .map(|(addr, kind)| {
+            let kind_str = match kind {
+                AeadError::Auth => "auth",
+                AeadError::Truncated => "truncated",
+            };
+            format!(
+                r#"{{"scope":{},"domain":{},"cell_name":{},"version":{},"kind":{}}}"#,
+                json_string(&addr.scope),
+                json_string(&addr.domain),
+                json_string(&addr.cell_name),
+                addr.version,
+                json_string(kind_str),
+            )
+        })
+        .collect();
+    format!(
+        r#"{{"ok":true,"tenant_id":{},"rotated_count":{},"failure_count":{},"rotated":[{}],"failures":[{}]}}"#,
+        json_string(tenant_id),
+        report.rotated.len(),
+        report.failures.len(),
+        rotated_inner.join(","),
+        failures_inner.join(","),
+    )
 }
 
 // ── WIT Component exports ───────────────────────────────────────────
@@ -3380,6 +3708,217 @@ Order has total.
         for _ in 0..16 {
             assert_ne!(system_impl(h, "audit", ""), "⊥");
         }
+        release_impl(h);
+    }
+
+    // ── #662 SystemVerb::RotateTenantMaster ─────────────────────────
+
+    /// Build a `cells:[…]` JSON fragment from sealed-bytes pairs.
+    fn rotation_cells_json(items: &[(&str, &str, &str, u64, &[u8])]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut entries: Vec<String> = Vec::with_capacity(items.len());
+        for (scope, domain, name, version, sealed) in items {
+            let mut hex = String::with_capacity(sealed.len() * 2);
+            for &b in *sealed {
+                hex.push(HEX[(b >> 4) as usize] as char);
+                hex.push(HEX[(b & 0x0f) as usize] as char);
+            }
+            entries.push(format!(
+                r#"{{"scope":"{scope}","domain":"{domain}","cell_name":"{name}","version":{version},"sealed_hex":"{hex}"}}"#,
+            ));
+        }
+        format!("[{}]", entries.join(","))
+    }
+
+    fn hex_bytes(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for &b in bytes {
+            s.push(HEX[(b >> 4) as usize] as char);
+            s.push(HEX[(b & 0x0f) as usize] as char);
+        }
+        s
+    }
+
+    /// SystemVerb gate: an Untrusted tenant must NOT be able to
+    /// trigger a rotation. Same boundary as `register:` — the gate
+    /// fires before any input parsing.
+    #[test]
+    fn system_rotate_tenant_master_is_gated_untrusted_by_default() {
+        let h = create_bare_impl();
+        let body = r#"{"old":"00","new":"00","cells":[]}"#;
+        let out = system_impl(h, "rotate_tenant_master:tenant-A", body);
+        assert!(out.contains(r#""ok":false"#), "Untrusted gate must reject: {out}");
+        assert!(out.contains(r#""error":"disallowed""#),
+            "envelope must surface 'disallowed' error class; got {out}");
+        release_impl(h);
+    }
+
+    /// Privileged-mode end-to-end: seal cells under master A,
+    /// dispatch the SystemVerb, parse the envelope, decode each
+    /// rotated cell, verify it opens under master B.
+    #[test]
+    fn system_rotate_tenant_master_round_trips_under_privileged() {
+        use crate::cell_aead::{cell_open, cell_seal, CellAddress, TenantMasterKey};
+        use crate::entropy::{self, DeterministicSource};
+
+        let _guard = entropy::TEST_LOCK.lock();
+        entropy::install(Box::new(DeterministicSource::new([47u8; 32])));
+        crate::csprng::reseed();
+
+        let h = create_bare_impl();
+        super::set_register_mode(h, super::RegisterMode::Privileged);
+
+        // Build N=5 cells under master A.
+        let master_a_bytes = [0xA1u8; 32];
+        let master_b_bytes = [0xB2u8; 32];
+        let master_a = TenantMasterKey::from_bytes(master_a_bytes);
+        let master_b = TenantMasterKey::from_bytes(master_b_bytes);
+        let mut sealed_pairs: Vec<(CellAddress, Vec<u8>)> = Vec::new();
+        for i in 0u64..5 {
+            let addr = CellAddress::new(
+                "acme",
+                "orders",
+                format!("Order#{i}"),
+                i + 1,
+            );
+            let pt = format!("payload-{i}");
+            let sealed = cell_seal(&master_a, &addr, pt.as_bytes());
+            sealed_pairs.push((addr, sealed));
+        }
+
+        // Compose the SystemVerb input JSON.
+        let cells_json = rotation_cells_json(
+            &sealed_pairs.iter()
+                .map(|(a, s)| (
+                    a.scope.as_str(),
+                    a.domain.as_str(),
+                    a.cell_name.as_str(),
+                    a.version,
+                    s.as_slice(),
+                ))
+                .collect::<Vec<_>>(),
+        );
+        let body = format!(
+            r#"{{"old":"{}","new":"{}","cells":{}}}"#,
+            hex_bytes(&master_a_bytes),
+            hex_bytes(&master_b_bytes),
+            cells_json,
+        );
+
+        let out = system_impl(h, "rotate_tenant_master:tenant-A", &body);
+
+        // Surface-level shape: ok=true, no failures, all 5 rotated.
+        assert!(out.contains(r#""ok":true"#), "envelope must report ok; got {out}");
+        assert!(out.contains(r#""tenant_id":"tenant-A""#),
+            "envelope must echo tenant_id; got {out}");
+        assert!(out.contains(r#""rotated_count":5"#),
+            "expected 5 rotated cells; got {out}");
+        assert!(out.contains(r#""failure_count":0"#),
+            "expected zero failures; got {out}");
+
+        // Parse the envelope, decode each rotated cell, open under B.
+        let parsed: serde_json::Value = serde_json::from_str(&out)
+            .expect("envelope must be valid JSON");
+        let rotated = parsed.get("rotated").and_then(|v| v.as_array())
+            .expect("rotated array");
+        assert_eq!(rotated.len(), 5);
+        for (i, cell) in rotated.iter().enumerate() {
+            let scope = cell.get("scope").and_then(|v| v.as_str()).unwrap();
+            let domain = cell.get("domain").and_then(|v| v.as_str()).unwrap();
+            let name = cell.get("cell_name").and_then(|v| v.as_str()).unwrap();
+            let version = cell.get("version").and_then(|v| v.as_u64()).unwrap();
+            let hex = cell.get("sealed_hex").and_then(|v| v.as_str()).unwrap();
+            // Decode hex.
+            let mut bytes = Vec::with_capacity(hex.len() / 2);
+            let bs = hex.as_bytes();
+            let mut k = 0;
+            while k + 1 < bs.len() {
+                let hi = (bs[k] as char).to_digit(16).unwrap() as u8;
+                let lo = (bs[k+1] as char).to_digit(16).unwrap() as u8;
+                bytes.push((hi << 4) | lo);
+                k += 2;
+            }
+            let addr = CellAddress::new(scope, domain, name, version);
+            let recovered = cell_open(&master_b, &addr, &bytes)
+                .expect("rotated cell must open under master B");
+            let expected = format!("payload-{i}");
+            assert_eq!(recovered.as_slice(), expected.as_bytes(),
+                "rotated cell {i} payload must match original");
+
+            // Master A must NOT open the rotated bytes.
+            assert!(cell_open(&master_a, &addr, &bytes).is_err(),
+                "rotated bytes must be opaque to old master A");
+        }
+
+        release_impl(h);
+        entropy::uninstall();
+        crate::csprng::reseed();
+    }
+
+    /// Bad input (invalid JSON, wrong-width key, missing field):
+    /// must surface as ok=false with error="bad_input" and a detail
+    /// string. No state is mutated.
+    #[test]
+    fn system_rotate_tenant_master_rejects_malformed_input() {
+        let h = create_bare_impl();
+        super::set_register_mode(h, super::RegisterMode::Privileged);
+
+        // Not JSON.
+        let out = system_impl(h, "rotate_tenant_master:t1", "not json");
+        assert!(out.contains(r#""ok":false"#));
+        assert!(out.contains(r#""error":"bad_input""#));
+
+        // Missing 'old' field.
+        let out = system_impl(
+            h,
+            "rotate_tenant_master:t1",
+            r#"{"new":"00","cells":[]}"#,
+        );
+        assert!(out.contains(r#""ok":false"#));
+        assert!(out.contains(r#""error":"bad_input""#));
+        assert!(out.contains("'old'"));
+
+        // Wrong-width old.
+        let out = system_impl(
+            h,
+            "rotate_tenant_master:t1",
+            r#"{"old":"deadbeef","new":"00","cells":[]}"#,
+        );
+        assert!(out.contains(r#""ok":false"#));
+        assert!(out.contains(r#""error":"bad_input""#));
+
+        // 64-char old but non-hex char in new.
+        let zero64: String = "0".repeat(64);
+        let bad64: String = "X".repeat(64);
+        let body = format!(
+            r#"{{"old":"{zero64}","new":"{bad64}","cells":[]}}"#,
+        );
+        let out = system_impl(h, "rotate_tenant_master:t1", &body);
+        assert!(out.contains(r#""ok":false"#));
+        assert!(out.contains(r#""error":"bad_input""#));
+
+        release_impl(h);
+    }
+
+    /// Empty cells array under valid masters: ok=true with empty
+    /// rotated/failures. Edge case for an operator dry-run.
+    #[test]
+    fn system_rotate_tenant_master_empty_cells_yields_empty_report() {
+        let h = create_bare_impl();
+        super::set_register_mode(h, super::RegisterMode::Privileged);
+        let zero64: String = "0".repeat(64);
+        let one64: String = "1".repeat(64);
+        let body = format!(
+            r#"{{"old":"{zero64}","new":"{one64}","cells":[]}}"#,
+        );
+        let out = system_impl(h, "rotate_tenant_master:tenant-empty", &body);
+        assert!(out.contains(r#""ok":true"#));
+        assert!(out.contains(r#""tenant_id":"tenant-empty""#));
+        assert!(out.contains(r#""rotated_count":0"#));
+        assert!(out.contains(r#""failure_count":0"#));
+        assert!(out.contains(r#""rotated":[]"#));
+        assert!(out.contains(r#""failures":[]"#));
         release_impl(h);
     }
 }
