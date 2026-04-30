@@ -99,11 +99,14 @@ wit = ["dep:wit-bindgen"]
 # cloudflare,debug-def` (see package.json `build:wasm`). Composes the
 # minimum feature set the worker needs:
 #   * wit                — wit-bindgen for the host-shim ABI
-#   * std-deps           — serde / serde_json / regex / hmac / sha2 /
+#   * std-deps           — serde / serde_json / regex / hmac /
 #                          subtle / flate2 / hashbrown(serde). The
 #                          parser + crypto + hashbrown serde paths all
 #                          gate on this; without it ~50 unresolved
 #                          imports surface in lib.rs / parse_forml2.
+#                          (sha2 lives outside std-deps now — it is
+#                          required unconditionally by the cell-AEAD
+#                          path in `crypto::cell_aead`, see #659.)
 #   * core / ui-readings / templates — bundled reading scopes the
 #                          worker exposes to clients.
 # Documented in docs/11-portability.md as the canonical worker
@@ -135,10 +138,13 @@ profile = []
 # native-code dependency tree. Run the PoC with:
 #   cargo test --features wasm-lower --lib wasm_lower
 wasm-lower = ["dep:wasm-encoder", "dep:wasmi"]
-# std-deps bundles serde, serde_json, regex, hmac, sha2, subtle — all
+# std-deps bundles serde, serde_json, regex, hmac, subtle — all
 # require std and are excluded from the no_std / kernel build. Included
 # in `default` so all normal (std) builds keep working without changes.
-std-deps = ["dep:serde", "dep:serde_json", "dep:regex", "dep:hmac", "dep:sha2", "dep:subtle", "dep:flate2", "hashbrown/serde"]
+# (sha2 was previously gated here but is now an unconditional dep
+# under default-features = false because the cell-AEAD path #659
+# needs HKDF-SHA256 in the no_std kernel + worker builds too.)
+std-deps = ["dep:serde", "dep:serde_json", "dep:regex", "dep:hmac", "dep:subtle", "dep:flate2", "hashbrown/serde"]
 # no_std build target — gates every `use std::*` behind a
 # `std`/`no_std` split so the crate can be embedded in bare-metal
 # contexts (FPGA soft-cores, x86_64 kernel via #175+). Enable via:
@@ -166,11 +172,28 @@ wasm-bindgen = { version = "0.2", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 rayon = { version = "1", optional = true }
-# hmac / sha2 / subtle are used only by crypto.rs which is gated on
+# hmac / subtle are used only by crypto.rs which is gated on
 # `not(no_std)` — make them optional so the no_std build skips them.
 hmac = { version = "0.12", optional = true }
-sha2 = { version = "0.10", optional = true }
 subtle = { version = "2", optional = true }
+# sha2: used by both std crypto.rs (HMAC-SHA256 path) AND the
+# always-on no_std cell-AEAD path (#659 — HKDF-SHA256 over the
+# tenant master). default-features = false makes the crate
+# no_std-clean (drops `std` impls of `Read`/`Write`); the std-deps
+# feature still works because nothing in crypto.rs depends on the
+# std features (only the type + traits).
+sha2 = { version = "0.10", default-features = false }
+# chacha20poly1305 (#659) — cell-level AEAD for at-rest + in-transit
+# ciphertext. Pure-Rust RustCrypto implementation. `default-features
+# = false, features = ["alloc"]` is the documented no_std recipe;
+# composes with our existing csprng / entropy stack and with
+# kernel + worker + WASM targets without an AES dep.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+# hkdf (#659) — HKDF-SHA256 expansion of the per-tenant master into
+# a per-cell 32-byte key. `default-features = false` is no_std-clean
+# (the `std` feature only adds a `std::error::Error` impl on its
+# error type that we don't reach for).
+hkdf = { version = "0.12", default-features = false }
 # flate2: gzip decompression for the vendored schema.org JSON-LD
 # (#343). Used only by src/external/schema_org.rs which decompresses
 # the embedded `schema_org.jsonld.gz` at ingest time.
