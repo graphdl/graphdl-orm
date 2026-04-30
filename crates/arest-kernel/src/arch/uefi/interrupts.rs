@@ -145,7 +145,24 @@ pub fn init_interrupts() {
         // decoded keystroke onto the kernel-side ring. The ring is
         // drained by the boot smoke today; the UEFI REPL pump (#365)
         // becomes the production drainer.
+        //
+        // #628 Profile-4: gated on `feature = "repl"`. When OFF
+        // (the headless `--no-default-features --features server`
+        // profile), the `keyboard_handler` function and the
+        // `arch::uefi::keyboard` module are both elided, so the
+        // line wouldn't compile. The matching IRQ 1 mask bit is
+        // also kept set in `pic_init` below (the PIC mask byte
+        // becomes 0xFD instead of 0xFC) so no firmware-pending
+        // PS/2 IRQ can fire into the unpopulated vector 33 slot.
+        // To remove the residual triple-fault risk if a stray
+        // PS/2 IRQ somehow bypassed the mask, we route vector 33
+        // through `default_irq_handler` (the EOI-only stub) when
+        // `repl` is off — the `cfg_attr` selector on the function
+        // call below picks the right handler.
+        #[cfg(feature = "repl")]
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_handler);
+        #[cfg(not(feature = "repl"))]
+        idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(default_irq_handler);
 
         // Defensive: IRQ 2..15 (vectors 34..47) get a stub handler.
         // Without this, a firmware-leftover pending IRQ that fires
@@ -192,6 +209,14 @@ pub fn init_interrupts() {
 pub fn pic_init() {
     // Stand up the `pc-keyboard` decoder singleton before the IRQ
     // mask is cleared — see docstring for the ordering rationale.
+    // #628 Profile-4: gated on `feature = "repl"`. The decoder
+    // singleton lives in `arch::uefi::keyboard`, which is itself
+    // feature-gated (the module decl in `arch/uefi/mod.rs` is
+    // `#[cfg(feature = "repl")]`); skip the call when the module
+    // is absent. The matching IRQ 1 mask bit also stays set
+    // below so no PS/2 scancode can fire into the missing
+    // decoder.
+    #[cfg(feature = "repl")]
     super::keyboard::init();
 
     // SAFETY: ICW programming sequence — driven entirely through the
@@ -200,13 +225,29 @@ pub fn pic_init() {
     unsafe {
         let mut pics = PICS.lock();
         pics.initialize();
-        // 0xFC = 1111_1100 on PIC1 — unmask IRQ 0 (timer) AND
-        // IRQ 1 (keyboard). Bit 0 = 0 → IRQ 0 enabled; bit 1 = 0 →
-        // IRQ 1 enabled. Same mask byte the BIOS arm writes (see
-        // `arch::x86_64::interrupts::init_pic`) so the keyboard
-        // wakes the same way on both boot paths.
+        // PIC1 mask byte:
+        //   `feature = "repl"` ON  → 0xFC = 1111_1100 — unmask IRQ 0
+        //                            (timer) AND IRQ 1 (keyboard).
+        //                            Bit 0 = 0 → IRQ 0 enabled; bit 1
+        //                            = 0 → IRQ 1 enabled. Same mask
+        //                            byte the BIOS arm writes (see
+        //                            `arch::x86_64::interrupts::init_pic`)
+        //                            so the keyboard wakes the same
+        //                            way on both boot paths.
+        //   `feature = "repl"` OFF → 0xFD = 1111_1101 — IRQ 0 only.
+        //                            Keyboard line stays masked since
+        //                            no consumer would drain the ring;
+        //                            also keeps vector 33 from firing
+        //                            into an unpopulated IDT slot
+        //                            (`init_interrupts` only installs
+        //                            `keyboard_handler` under the same
+        //                            gate, see #628).
         // 0xFF on PIC2 — keep RTC/mouse/etc all masked.
-        pics.write_masks(0xFC, 0xFF);
+        #[cfg(feature = "repl")]
+        let pic1_mask: u8 = 0xFC;
+        #[cfg(not(feature = "repl"))]
+        let pic1_mask: u8 = 0xFD;
+        pics.write_masks(pic1_mask, 0xFF);
     }
 }
 
@@ -306,6 +347,14 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
 /// the ring is bounded and the ISR drops oldest under back-pressure;
 /// late EOI here would surface as a spurious double-pop on the
 /// drainer side rather than a silent drop.
+///
+/// #628 Profile-4: gated on `feature = "repl"`. `super::keyboard`
+/// is also feature-gated, so this function would otherwise fail
+/// to compile with `repl` off. With `repl` off, IRQ 1 stays masked
+/// at the PIC (`pic_init` writes 0xFD instead of 0xFC) AND the IDT
+/// vector 33 install is skipped (`init_interrupts`) — there's no
+/// path to reach this function in that profile.
+#[cfg(feature = "repl")]
 extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     // SAFETY: 0x60 is the PS/2 keyboard data port — a documented
     // PC-architecture port that returns the most recent scancode

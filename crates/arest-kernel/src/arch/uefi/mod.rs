@@ -54,6 +54,18 @@
 //     hardware interrupts come online.
 
 pub mod interrupts;
+// PS/2 keyboard driver + post-decode `DecodedKey` ring (#364).
+// #628 Profile-4: gated on `feature = "repl"`. The IRQ 1 handler
+// in `interrupts.rs` and the `pic_init` decoder bootstrap are
+// also gated on the same feature; with `repl` OFF, the keyboard
+// line stays masked at the PIC and the IDT vector 33 slot stays
+// at the defensive default-IRQ stub. Slint pulls `repl` via
+// composition (Cargo.toml) so any slint-on profile keeps this
+// module live (slint_input.rs / ui_apps/keyboard.rs / launcher.rs
+// all reach `super::keyboard`). The headless
+// `--no-default-features --features server` build drops the
+// module + the IRQ wiring + the smoke-poll banner.
+#[cfg(feature = "repl")]
 pub mod keyboard;
 pub mod memory;
 // x86_64-specific modules — GDT / TSS / SYSCALL MSR / SYSCALL entry

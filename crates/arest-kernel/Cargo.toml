@@ -212,13 +212,54 @@ server = []
 # block for `slint` and the `[build-dependencies]` block for
 # `slint-build` both carry `optional = true` below to make the
 # `dep:` references resolve.
-slint = ["dep:slint", "dep:slint-build"]
+#
+# `slint = [..., "repl"]` (#628 Profile-4 follow-up): the Slint
+# launcher's Unified REPL panel calls `crate::repl::evaluate_line`
+# from `ui_apps/unified_repl.rs:479`, and the launcher / keyboard /
+# slint_input modules all reach `crate::arch::uefi::keyboard` for
+# the post-decode `DecodedKey` ring (`read_keystroke` /
+# `push_keystroke` / `pending`). Both surfaces are gated under the
+# `repl` feature now, so any `slint`-on profile must also pull
+# `repl` to keep the imports resolvable. Composing here means the
+# pre-#628 single-flag invocations (`--features slint`, the
+# `default` profile, the `mini` profile) keep working without the
+# caller having to remember the new dependency.
+slint = ["dep:slint", "dep:slint-build", "repl"]
+# repl (#628 Profile-4). Gates the kernel REPL line editor + dispatch
+# table (`crate::repl`) plus the PS/2 keyboard subsystem
+# (`crate::arch::uefi::keyboard` ring, the IRQ 1 handler that feeds
+# it, and the `pc-keyboard` decoder init in `pic_init`). When OFF:
+# the REPL module is elided from the crate graph; the keyboard ring
+# module is elided; the IDT's IRQ 1 vector slot stays unpopulated
+# (the keyboard line is left masked at the PIC by `pic_init`); the
+# kbd-poll smoke in the boot banner is skipped. When ON (the
+# default — composed via `slint`, plus the `mini` profile and the
+# explicit `--features repl` invocation): the existing PS/2 IRQ
+# pipeline + REPL evaluator are back in scope.
+#
+# No external runtime deps — `pc-keyboard` is a tiny pure-Rust
+# decoder (~few KB) and stays unconditionally in the dep graph
+# (it's referenced by `doom.rs` types via `feature = "doom"` and
+# by `slint_input.rs` via `feature = "slint"`). The binary-size
+# win for `--no-default-features --features server` is the
+# elision of the `crate::repl` text-dispatch table + the
+# keyboard ring module + the IRQ 1 handler body.
+#
+# Why `slint` composes `repl` rather than the inverse: `repl` is
+# usable on its own (the BIOS-style `repl::process_key` shim is
+# target-agnostic), but `slint`'s launcher unconditionally drives
+# the unified REPL panel — there's no slint-on / repl-off
+# combination that would compile without source surgery on
+# `ui_apps/launcher.rs`. Same shape as `doom = ["slint"]` (#627).
+repl = []
 # mini (#631 / Profile-3 smoke harness). Composes the headless
 # `server` profile with the `slint` runtime so the boot path can
 # spin up a UI window for the smoke harness while the HATEOAS net
 # loop runs alongside. `ui-bundle` is pulled in too so the in-RAM
 # ui.do React bundle is served from the cell graph (matches the
-# behavioural contract the `mini` smoke asserts).
+# behavioural contract the `mini` smoke asserts). `repl` is
+# composed via `slint` (slint pulls repl per #628), so the mini
+# smoke also exercises the REPL evaluator + PS/2 keyboard pipeline.
 mini = ["server", "slint", "ui-bundle"]
 # ui-bundle (#580). Gates the build-time bake of the ui.do React
 # bundle into the kernel binary. When ON, `build.rs` walks
@@ -238,24 +279,37 @@ ui-bundle = []
 # Default feature set — `slint` so plain `cargo build --target
 # x86_64-unknown-uefi -p arest-kernel` (the developer build the
 # README documents) keeps booting into the Unified REPL launcher
-# that pre-#627 builds shipped. The headless `server` profile
+# that pre-#627 builds shipped. `slint` composes `repl` (#628 —
+# the launcher's REPL panel + the keyboard pipeline ride along),
+# so the default build still gets the full REPL + PS/2 surface
+# the pre-#628 dev loop assumed. The headless `server` profile
 # opts out via `--no-default-features --features server`; the
 # `mini` smoke profile opts in via `--no-default-features
-# --features mini` (which composes `slint` back in alongside
-# server). Concrete table:
+# --features mini` (which composes `slint`, and via slint pulls
+# `repl`, alongside server). Concrete table:
 #
-#   plain build               → slint runtime + launcher hand-off
-#   --features server         → slint runtime + server net-loop
-#                               (additive flags; both branches
-#                                compile, server wins at runtime)
+#   plain build               → slint + repl runtime + launcher
+#                               hand-off
+#   --features server         → slint + repl runtime + server
+#                               net-loop (additive flags; both
+#                               branches compile, server wins at
+#                               runtime)
 #   --no-default-features
-#     --features server       → no slint, no slint-build, server
-#                               net-loop (the headless build —
-#                                what the Dockerfile.uefi-server
-#                                container ships, smallest .efi)
+#     --features server       → no slint, no slint-build, no repl,
+#                               no PS/2 keyboard, server net-loop
+#                               (the headless build — what the
+#                               Dockerfile.uefi-server container
+#                               ships, smallest .efi)
 #   --no-default-features
-#     --features mini         → slint runtime + server net-loop
-#                               (smoke-harness build for #631)
+#     --features mini         → slint + repl runtime + server
+#                               net-loop (smoke-harness build
+#                               for #631)
+#   --no-default-features
+#     --features repl         → repl + PS/2 keyboard, no slint,
+#                               no server (halt-loop fallback —
+#                               REPL imports compile but no
+#                               drainer wires them; rarely
+#                               useful, present for orthogonality)
 default = ["slint"]
 
 [lib]
