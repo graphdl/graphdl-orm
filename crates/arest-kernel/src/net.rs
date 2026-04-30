@@ -455,6 +455,24 @@ fn drive_http(listener: &mut HttpListener, sockets: &mut SocketSet<'static>) {
     use smoltcp::socket::tcp::State;
     let socket = sockets.get_mut::<tcp::Socket>(listener.handle);
 
+    // #657 diagnostic: log every TCP state transition the listener
+    // sees. The `LAST_STATE`/`LAST_RX_LEN`/`LAST_TX_LEN` statics are
+    // throttled to fire only on change so the COM1 serial doesn't
+    // drown in per-tick noise across the millions-of-polls that
+    // `loop { net::poll(); pause }` produces.
+    let cur_state = socket.state();
+    {
+        let mut last = HTTP_LAST_STATE.lock();
+        if *last != Some(cur_state) {
+            crate::println!(
+                "http-diag: state {:?} -> {:?} (rx={} tx={}/{})",
+                *last, cur_state, listener.rx_buf.len(),
+                listener.tx_sent, listener.tx_buf.len(),
+            );
+            *last = Some(cur_state);
+        }
+    }
+
     // (1) Closed → re-arm listen.
     if socket.state() == State::Closed {
         let _ = socket.listen(listener.port);
@@ -480,10 +498,20 @@ fn drive_http(listener: &mut HttpListener, sockets: &mut SocketSet<'static>) {
 
     // (3) Accumulate request bytes.
     if socket.can_recv() {
+        let prev_len = listener.rx_buf.len();
         let _ = socket.recv(|chunk| {
             listener.rx_buf.extend_from_slice(chunk);
             (chunk.len(), ())
         });
+        let added = listener.rx_buf.len() - prev_len;
+        if added > 0 {
+            let preview_end = core::cmp::min(listener.rx_buf.len(), 60);
+            crate::println!(
+                "http-diag: recv +{} (total {}) preview={:?}",
+                added, listener.rx_buf.len(),
+                core::str::from_utf8(&listener.rx_buf[..preview_end]).unwrap_or("<non-utf8>"),
+            );
+        }
     }
 
     if listener.rx_buf.is_empty() {
@@ -491,6 +519,10 @@ fn drive_http(listener: &mut HttpListener, sockets: &mut SocketSet<'static>) {
     }
 
     // (4) Try to parse; on success dispatch handler and queue response.
+    //
+    // #657 diagnostic: emit one line per parse outcome so the smoke
+    // log can distinguish "request never arrived" / "still waiting on
+    // headers" / "parsed but handler exploded" / "wire bytes queued".
     //
     // Five dispatch arms, checked in order:
     //   a. `/file/{id}/content` (#403) — handled by `file_serve::try_serve`,
@@ -520,14 +552,35 @@ fn drive_http(listener: &mut HttpListener, sockets: &mut SocketSet<'static>) {
     //   e. Anything else — falls through to the registered `Handler` fn,
     //      which serialises via `Response::to_wire()`.
     let parsed = match http::parse_request(&listener.rx_buf) {
-        Ok(Some(req)) => Ok(req),
-        Ok(None) => return, // need more bytes
-        Err(msg) => Err(msg),
+        Ok(Some(req)) => {
+            crate::println!(
+                "http-diag: parsed {} {} (body={}B)",
+                req.method, req.path, req.body.len(),
+            );
+            Ok(req)
+        }
+        Ok(None) => {
+            crate::println!(
+                "http-diag: parse incomplete, rx_buf={}B",
+                listener.rx_buf.len(),
+            );
+            return; // need more bytes
+        }
+        Err(msg) => {
+            crate::println!("http-diag: parse error: {}", msg);
+            Err(msg)
+        }
     };
     let wire = match parsed {
         Ok(req) => dispatch_request(&req, &listener.rx_buf, listener.handler),
         Err(msg) => http::Response::bad_request(msg).to_wire(),
     };
+    crate::println!(
+        "http-diag: wire ready, {}B; head: {:?}",
+        wire.len(),
+        core::str::from_utf8(&wire[..core::cmp::min(wire.len(), 60)])
+            .unwrap_or("<non-utf8>"),
+    );
     listener.tx_buf = wire;
     listener.tx_sent = 0;
     listener.rx_buf.clear();
@@ -536,12 +589,24 @@ fn drive_http(listener: &mut HttpListener, sockets: &mut SocketSet<'static>) {
     if socket.can_send() {
         if let Ok(n) = socket.send_slice(&listener.tx_buf) {
             listener.tx_sent = n;
+            crate::println!(
+                "http-diag: opportunistic send n={} (of {})",
+                n, listener.tx_buf.len(),
+            );
         }
+    } else {
+        crate::println!("http-diag: opportunistic send blocked (can_send=false)");
     }
     if listener.tx_sent >= listener.tx_buf.len() {
         socket.close();
+        crate::println!("http-diag: socket.close() after full send");
     }
 }
+
+/// #657 diagnostic — track the listener's last-observed TCP state so
+/// we can log every transition exactly once. `Option` because the
+/// initial value is "haven't seen one yet".
+static HTTP_LAST_STATE: Mutex<Option<smoltcp::socket::tcp::State>> = Mutex::new(None);
 
 /// Route one parsed request through the file-* intercept arms (when
 /// available) before falling back to the registered `Handler` chain.
