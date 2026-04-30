@@ -436,7 +436,7 @@ impl Driver {
             // attached scanout (spec sec 5.7.6.7) — without it the
             // DMA buffer changes invisibly to the display.
             if let FrontBackend::VirtioGpu = self.backend {
-                #[cfg(target_arch = "x86_64")]
+                #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
                 let _ = crate::virtio_gpu::flush_active_surface();
             }
         }
