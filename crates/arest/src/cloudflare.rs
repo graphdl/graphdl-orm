@@ -6,10 +6,29 @@ use wasm_bindgen::prelude::*;
 
 /// Install console_error_panic_hook so Rust panics across the WASM
 /// boundary surface as console.error messages instead of opaque
-/// `unreachable` traps. Runs once at module load via #[wasm_bindgen(start)].
+/// `unreachable` traps. Also installs the Cloudflare Worker
+/// `EntropySource` adapter (#572 / Rand-T4) into the engine's global
+/// slot — every Worker isolate exposes Web Crypto via
+/// `crypto.getRandomValues`, and the adapter wraps `getrandom`'s `js`
+/// backend (Cargo.toml gates `getrandom = { features = ["js"] }` for
+/// wasm32) behind the engine's `EntropySource` trait.
+///
+/// Order matters: the entropy install MUST run before any route
+/// handler can call `csprng::random_bytes` (its lazy-seed path panics
+/// with "no entropy source installed" otherwise). The
+/// `#[wasm_bindgen(start)]` attribute guarantees this body runs once
+/// per WASM module instantiation, before any exported function (`fetch`
+/// / `system` / `parse_and_compile` / etc.) is reachable from JS.
+///
+/// `entropy::install` REPLACES the previously installed source
+/// (`entropy.rs:116`); production code must avoid double-installation
+/// — running here is the exception that proves the rule (we are in
+/// fact "boot"), and this body fires exactly once per instance so the
+/// concern is moot.
 #[wasm_bindgen(start)]
 pub fn __wasm_init() {
     console_error_panic_hook::set_once();
+    crate::cloudflare_entropy::install_worker_entropy();
 }
 
 /// Allocate D with the bundled metamodel and platform primitives loaded.
