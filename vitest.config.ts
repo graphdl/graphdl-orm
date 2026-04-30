@@ -55,11 +55,25 @@ export default defineConfig({
   test: {
     globals: true,
     include: ['src/**/*.test.ts', 'tests/**/*.test.ts', 'scripts/**/*.test.ts'],
-    // Parallel fork workers are flaky on Windows when each worker loads
-    // the arest WASM module (intermittent "RuntimeError: unreachable" +
-    // "Worker exited unexpectedly" under load). Single-fork serializes
-    // file execution; total wall time is ~10s which is acceptable.
+    // Run each test file in a fresh Node fork, sequentially. We cannot use
+    // singleFork (all-files-in-one-process) because some test files leave
+    // behind unsettled timers / open Streams / dangling fetches that
+    // accumulate across the run and eventually deadlock vitest somewhere
+    // around the 15th file (observed: bisecting 37 files individually all
+    // pass in <60s each, but a combined run hangs after verb-dispatcher).
+    // We also can't use parallel forks because concurrent loads of
+    // arest_bg.wasm intermittently trip "RuntimeError: unreachable" on
+    // Windows under load. Sequential isolated forks gives us both: leak
+    // containment per file + serialized WASM init.
     fileParallelism: false,
+    pool: 'forks',
+  },
+  // Vitest 4 hoisted poolOptions out of `test.*` to the top level.
+  poolOptions: {
+    forks: {
+      isolate: true,
+      singleFork: false,
+    },
   },
   resolve: {
     alias: {

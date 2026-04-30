@@ -378,10 +378,11 @@ if (-not $yarnCmd) {
     Add-StageResult "vitest" "vitest TS tests" "SKIP" "yarn not installed" 0 ""
 } else {
     $yarnPath = $yarnCmd.Source
-    # 15-min cap: vitest occasionally pins workerd in a wasm-stuck state and
-    # never returns. Treat that as a stage failure rather than blocking the
-    # whole orchestration. Adjust upward if the suite legitimately grows.
-    $r = Invoke-Capture -Cmd $yarnPath -CmdArgs @("test") -WorkingDir $repoRoot -TimeoutSec 900
+    # 30-min cap: per-file fork isolation (vitest.config.ts) means each of
+    # the ~37 test files spawns its own short-lived Node fork, so cold-cache
+    # runs aggregate fork startup overhead. 30 min is a comfortable margin
+    # over the observed worst case while still bounding any actual hang.
+    $r = Invoke-Capture -Cmd $yarnPath -CmdArgs @("test") -WorkingDir $repoRoot -TimeoutSec 1800
     $vitestCounts = Parse-VitestCounts -Output $r.Output
     $detail = "{0} passed, {1} failed, {2:N0}s" -f $vitestCounts.Passed, $vitestCounts.Failed, $r.Elapsed
     if ($r.Exit -eq 0 -and $vitestCounts.Failed -eq 0) {
