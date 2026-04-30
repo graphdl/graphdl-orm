@@ -43,6 +43,32 @@
 // through (#578). Targets MUST install an entropy source before any
 // `cell_seal` call (the panic-on-uninstalled-source contract is
 // inherited from csprng).
+//
+// ## Wire format (cross-tier contract — #660)
+//
+// Exposed across the wasm-bindgen boundary as `cell_seal_wasm` /
+// `cell_open_wasm` (`crates/arest/src/cloudflare.rs`). The Worker's
+// TS path (`src/cell-encryption.ts`) and the kernel's sealed
+// checkpoint path (`crates/arest-kernel/src/block_storage.rs`) speak
+// this format byte-for-byte. Future tiers (FPGA, mobile, host CLI)
+// inherit the contract from this comment, not by reverse-engineering
+// either implementation.
+//
+//     sealed envelope = [12-byte nonce][ciphertext = plaintext.len() bytes][16-byte Poly1305 tag]
+//     AAD             = CellAddress::canonical_bytes()
+//                       (= [u32 LE scope_len | scope]
+//                          [u32 LE domain_len | domain]
+//                          [u32 LE cell_name_len | cell_name]
+//                          [u64 LE version])
+//     cell key        = HKDF-SHA256(ikm = master, salt = canonical_bytes,
+//                                    info = "arest-cell-key/v1")[..32]
+//     AEAD            = ChaCha20-Poly1305 (chacha20poly1305 crate, RFC 8439)
+//
+// Sealed-envelope overhead is `NONCE_LEN + TAG_LEN` = 28 bytes.
+// Tampering with any envelope byte (nonce, ciphertext, or tag), or
+// opening under a different address / master, surfaces as
+// `AeadError::Auth`; envelopes shorter than 28 bytes surface as
+// `AeadError::Truncated`.
 
 #[allow(unused_imports)]
 use alloc::{vec, vec::Vec, string::{String, ToString}, format};
@@ -207,17 +233,18 @@ pub fn current_tenant_master() -> Option<&'static TenantMasterKey> {
 #[allow(dead_code)]
 #[allow(invalid_reference_casting)]
 pub(crate) fn reset_tenant_master_for_test() {
-    // The const-to-mut pointer cast trips `invalid_reference_casting`
-    // (a deny-by-default lint as of recent rustc). The only reader is
-    // `current_tenant_master`, and tests serialize via
-    // `entropy::TEST_LOCK`, so concurrent observation isn't possible.
+    // TODO(#663 agent, 2026-04-30, sam@driv.ly via #662): the
+    // const-to-mut pointer cast below trips
+    // `invalid_reference_casting` (a deny-by-default lint as of
+    // recent rustc). Until #663 lands a proper UnsafeCell wrapper,
+    // suppressing the lint here lets the rest of the crate's test
+    // suite compile. Functional behaviour is unchanged.
     unsafe {
         let p = &GLOBAL_TENANT_MASTER as *const spin::Once<TenantMasterKey>
             as *mut spin::Once<TenantMasterKey>;
         core::ptr::write(p, spin::Once::new());
     }
 }
-
 
 // ── Cell address ───────────────────────────────────────────────────
 
@@ -396,6 +423,173 @@ pub fn cell_open(
         aad: &aad,
     };
     cipher.decrypt(nonce, payload).map_err(|_| AeadError::Auth)
+}
+
+// ── Tenant master rotation (#662) ──────────────────────────────────
+//
+// Operator workflow: a deployment switches from master A → master B
+// without losing access to existing cells. The rotation re-seals each
+// cell under the new master, leaving the cell address untouched —
+// per-cell HKDF still derives a distinct key, but from the new root.
+//
+// Rotation is single-cell atomic: open the sealed envelope under the
+// old master, re-seal the recovered plaintext under the new master at
+// the SAME `CellAddress`. A fresh nonce is drawn (per-seal nonce
+// uniqueness is unchanged from `cell_seal`); the AAD bytes are
+// identical pre/post-rotation, so a future opener that knows only the
+// new master must still present the correct address to authenticate.
+//
+// ## Tenant-locked walk
+//
+// `rotate_tenant` is the multi-cell driver. It iterates the caller-
+// supplied `(CellAddress, sealed_bytes)` stream and produces a
+// `RotationReport` collecting:
+//   * `rotated`: every cell that opened cleanly under the old master
+//     and re-sealed under the new master. Caller atomic-swaps these
+//     into storage.
+//   * `failures`: every cell the old master could NOT open. These are
+//     retained under the old master untouched — operator decides
+//     whether to retry, zeroize, or accept the loss. The walk does
+//     NOT abort on the first failure: a single corrupt cell would
+//     otherwise hold the entire tenant hostage to the old master.
+//
+// ## Read-only window assumption
+//
+// First-version rotation is non-zero-downtime. The caller MUST hold a
+// per-tenant write lock for the duration of the walk (kernel: the
+// per-slot RwLock from #155; worker: the per-tenant write semaphore
+// at the EntityDB orchestrator level — each individual EntityDB DO is
+// already single-writer by Cloudflare's design, so the per-tenant
+// guard is what serialises the cross-DO walk). Concurrent writes
+// during rotation would observe a half-rotated cell set: some cells
+// readable only by `old`, some only by `new`. Either drains the
+// rotation or holds writes until it completes. This module documents
+// the assumption; the kernel and worker call sites enforce it via
+// their respective lock primitives.
+//
+// ## Operator workflow (kernel side)
+//
+//   1. Persist the new 32-byte master in the freeze-blob "pending"
+//      slot alongside the existing "active" slot.
+//   2. Acquire the per-tenant write lock (kernel #155 path).
+//   3. Enumerate sealed cells via `block_storage` reserved-region
+//      iteration; pass them through `rotate_tenant`.
+//   4. Atomic-swap each `RotationReport.rotated` entry into storage.
+//   5. Promote "pending" → "active" in the freeze-blob; drop the old.
+//   6. Release the per-tenant write lock.
+//
+// ## Operator workflow (worker side)
+//
+//   1. `wrangler secret put TENANT_MASTER_SEED_v2 <new>` (the v1
+//      slot stays bound during the rotation window).
+//   2. Acquire the per-tenant write lock at the orchestrator (the
+//      RegistryDB / dispatcher seam, so concurrent writes against
+//      the tenant's EntityDBs cannot interleave).
+//   3. Enumerate the tenant's EntityDB cells via the per-tenant
+//      scoping from #205; for each cell read the sealed row, run
+//      `rotate_cell`, write the new sealed row back atomically.
+//   4. Once the report is empty of failures (or operator accepts the
+//      reported losses), `wrangler secret put TENANT_MASTER_SEED <new>`
+//      and `wrangler secret delete TENANT_MASTER_SEED_v2`.
+//   5. Release the per-tenant write lock.
+//
+// ## Out of scope (deferred to follow-ups)
+//
+//   * Zero-downtime rotation. First version takes the tenant
+//     read-only for the rotation window (caller-enforced lock above).
+//   * Per-cell metadata indicating which master a cell is sealed
+//     under. Without it the operator MUST keep both masters loaded
+//     simultaneously through the rotation; once promotion lands the
+//     old master can be zeroized.
+//   * Automated rotation triggers. Operator-initiated only via the
+//     `SystemVerb::RotateTenantMaster` privileged dispatch in
+//     `arest::lib::system_impl` — gated behind `RegisterMode::Privileged`
+//     so an HTTP/MCP frontend cannot trigger a rotation remotely.
+
+/// Outcome of a multi-cell rotation walk. Plaintext-only fields — the
+/// `rotated` payloads are sealed bytes (still ciphertext) so logging
+/// or returning a `RotationReport` does not leak cell contents. Cell
+/// addresses are also plaintext at the storage layer (they double as
+/// routing keys), so surfacing them here is safe.
+#[derive(Debug, Clone)]
+pub struct RotationReport {
+    /// Cells that re-sealed cleanly under the new master. Each entry
+    /// is the new sealed envelope for the matching `CellAddress`; the
+    /// caller atomic-swaps these into storage to complete the
+    /// rotation. Order matches the input iterator's order.
+    pub rotated: Vec<(CellAddress, Vec<u8>)>,
+    /// Cells the old master could not open. These were left untouched
+    /// — the storage row is still valid under the old master, the new
+    /// master cannot read it. Operator decides whether to retry,
+    /// zeroize, or accept the loss. Order matches the input
+    /// iterator's order.
+    pub failures: Vec<(CellAddress, AeadError)>,
+}
+
+impl RotationReport {
+    /// Returns `true` when every supplied cell rotated successfully.
+    /// Convenience for callers that gate the master-promotion step on
+    /// "no losses".
+    pub fn is_complete(&self) -> bool {
+        self.failures.is_empty()
+    }
+}
+
+/// Single-cell rotation primitive. Opens `sealed` with `old`, re-seals
+/// the recovered plaintext under `new` at the SAME `addr` (fresh
+/// nonce). Atomic at the cell level: either both halves succeed and
+/// the caller has a new sealed envelope to swap in, or the call
+/// returns the open-side `AeadError` and the on-disk row is
+/// untouched.
+///
+/// Returns `Err(AeadError::Truncated)` if `sealed` is structurally
+/// malformed under the AEAD envelope (shorter than `NONCE_LEN +
+/// TAG_LEN`); returns `Err(AeadError::Auth)` if the old master cannot
+/// open the envelope at this address (wrong master / wrong AAD /
+/// tampered ciphertext / cell sealed under a third key entirely).
+///
+/// Panics propagate from `cell_seal` — same contract as elsewhere in
+/// this module: an uninstalled entropy source on the target is a
+/// bring-up bug, not a runtime outage.
+pub fn rotate_cell(
+    old: &TenantMasterKey,
+    new: &TenantMasterKey,
+    addr: &CellAddress,
+    sealed: &[u8],
+) -> Result<Vec<u8>, AeadError> {
+    let plaintext = cell_open(old, addr, sealed)?;
+    Ok(cell_seal(new, addr, &plaintext))
+}
+
+/// Walk a tenant's sealed cells, rotating each from `old` → `new`.
+///
+/// The caller is responsible for:
+///   * Holding the per-tenant write lock for the duration of the walk
+///     (read-only window — see module-level documentation above).
+///   * Atomic-swapping each `RotationReport.rotated` entry into
+///     storage. The walk itself is pure: it reads the input iterator
+///     and produces sealed bytes; nothing here touches a backend.
+///   * Deciding what to do with `RotationReport.failures` (retry the
+///     individual cells, zeroize them, or accept the loss).
+///
+/// One failed cell does NOT abort the walk. A single corrupt envelope
+/// would otherwise force the operator to keep the old master active
+/// for the entire tenant. Per-cell failures are collected; the rest
+/// of the cells continue to rotate.
+pub fn rotate_tenant(
+    old: &TenantMasterKey,
+    new: &TenantMasterKey,
+    cells: impl Iterator<Item = (CellAddress, Vec<u8>)>,
+) -> RotationReport {
+    let mut rotated: Vec<(CellAddress, Vec<u8>)> = Vec::new();
+    let mut failures: Vec<(CellAddress, AeadError)> = Vec::new();
+    for (addr, sealed) in cells {
+        match rotate_cell(old, new, &addr, &sealed) {
+            Ok(new_sealed) => rotated.push((addr, new_sealed)),
+            Err(e) => failures.push((addr, e)),
+        }
+    }
+    RotationReport { rotated, failures }
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -625,6 +819,193 @@ mod tests {
         assert!(!s.contains("85"), "Debug must not surface byte 0x55 (= 85)");
     }
 
+    // ── Tenant master rotation (#662) ───────────────────────────────
+
+    /// Test 1.1 — `rotate_cell` round-trip. Seal under master A,
+    /// rotate to B, open with B → original plaintext recovered.
+    #[test]
+    fn rotate_cell_round_trips_to_new_master() {
+        let master_a = fixture_master(0xA1);
+        let master_b = fixture_master(0xB2);
+        let addr = fixture_address();
+        let plaintext = b"rotation round-trip payload";
+        with_deterministic_entropy([29u8; 32], || {
+            let sealed_a = cell_seal(&master_a, &addr, plaintext);
+            let sealed_b = rotate_cell(&master_a, &master_b, &addr, &sealed_a)
+                .expect("rotate_cell must succeed when old master can open");
+            // The new envelope is structurally a fresh AEAD output —
+            // distinct nonce + tag from the old (no shared nonce by
+            // construction; rotation does NOT reuse the inbound nonce).
+            assert_ne!(sealed_a, sealed_b,
+                "rotate_cell must produce a fresh envelope, not echo the input");
+            // New master opens cleanly; recovered plaintext matches.
+            let recovered = cell_open(&master_b, &addr, &sealed_b)
+                .expect("post-rotation open under new master must succeed");
+            assert_eq!(recovered.as_slice(), plaintext);
+        });
+    }
+
+    /// Test 1.2 — opening original sealed bytes with B (without
+    /// rotation) MUST fail. Sanity check that proves the rotation
+    /// step is doing real work — without `rotate_cell`, master B
+    /// has no path into A's ciphertext.
+    #[test]
+    fn untouched_envelope_fails_under_new_master() {
+        let master_a = fixture_master(0xA1);
+        let master_b = fixture_master(0xB2);
+        let addr = fixture_address();
+        let plaintext = b"isolation invariant";
+        with_deterministic_entropy([31u8; 32], || {
+            let sealed_a = cell_seal(&master_a, &addr, plaintext);
+            // Without rotation, master B cannot read master A's bytes.
+            assert_eq!(
+                cell_open(&master_b, &addr, &sealed_a),
+                Err(AeadError::Auth),
+                "master B must not open master A's untouched envelope",
+            );
+        });
+    }
+
+    /// Test 1.3 — multi-cell `rotate_tenant` walk. Seal N cells under
+    /// A; rotate; iterate the report; every `rotated` entry opens
+    /// cleanly under B. Belt-and-braces: also verify each rotated
+    /// entry now FAILS under master A (the rotation step is one-way
+    /// at the per-cell envelope level — master A still works on the
+    /// untouched original bytes, but the freshly-sealed-under-B bytes
+    /// are A-opaque).
+    #[test]
+    fn rotate_tenant_walk_re_seals_every_cell() {
+        let master_a = fixture_master(0xA1);
+        let master_b = fixture_master(0xB2);
+        let addresses: alloc::vec::Vec<CellAddress> = (0u64..5)
+            .map(|i| CellAddress::new("acme", "orders", format!("Order#{i}"), i + 1))
+            .collect();
+        let plaintexts: alloc::vec::Vec<alloc::vec::Vec<u8>> = (0u8..5)
+            .map(|i| {
+                let mut v = alloc::vec::Vec::new();
+                v.extend_from_slice(b"payload-");
+                v.push(b'A' + i);
+                v
+            })
+            .collect();
+        with_deterministic_entropy([37u8; 32], || {
+            // Seal every cell under master A.
+            let sealed_a: alloc::vec::Vec<(CellAddress, alloc::vec::Vec<u8>)> = addresses
+                .iter()
+                .zip(plaintexts.iter())
+                .map(|(addr, pt)| (addr.clone(), cell_seal(&master_a, addr, pt)))
+                .collect();
+
+            // Drive the rotation walk.
+            let report = rotate_tenant(
+                &master_a,
+                &master_b,
+                sealed_a.iter().map(|(a, s)| (a.clone(), s.clone())),
+            );
+            assert!(report.is_complete(),
+                "no failures expected on an all-clean input; got {} failures",
+                report.failures.len());
+            assert_eq!(report.rotated.len(), addresses.len(),
+                "every cell must appear in `rotated`");
+
+            // Every rotated entry opens under B with the original plaintext.
+            for ((addr, new_sealed), expected) in report.rotated.iter().zip(plaintexts.iter()) {
+                let recovered = cell_open(&master_b, addr, new_sealed)
+                    .expect("rotated cell must open under new master");
+                assert_eq!(recovered.as_slice(), expected.as_slice());
+                // And master A canNOT open the freshly-sealed-under-B bytes.
+                assert_eq!(
+                    cell_open(&master_a, addr, new_sealed),
+                    Err(AeadError::Auth),
+                    "rotated bytes must be opaque to the OLD master",
+                );
+            }
+        });
+    }
+
+    /// Test 1.4 — failure path: corrupt one entry; the walk reports
+    /// it in `failures` without aborting the rest. A single bad cell
+    /// must not hold the whole tenant hostage to the old master.
+    #[test]
+    fn rotate_tenant_isolates_per_cell_failures() {
+        let master_a = fixture_master(0xA1);
+        let master_b = fixture_master(0xB2);
+        let addresses: alloc::vec::Vec<CellAddress> = (0u64..3)
+            .map(|i| CellAddress::new("acme", "orders", format!("Order#{i}"), i + 1))
+            .collect();
+        with_deterministic_entropy([41u8; 32], || {
+            // Seal every cell under master A.
+            let mut sealed_a: alloc::vec::Vec<(CellAddress, alloc::vec::Vec<u8>)> = addresses
+                .iter()
+                .map(|addr| {
+                    let pt = format!("payload-for-{}", addr.cell_name);
+                    (addr.clone(), cell_seal(&master_a, addr, pt.as_bytes()))
+                })
+                .collect();
+
+            // Corrupt the middle cell's tag so its open() fails Auth.
+            let mid = 1;
+            let last = sealed_a[mid].1.len() - 1;
+            sealed_a[mid].1[last] ^= 0xFF;
+
+            // Also include a structurally-truncated cell to exercise
+            // the `Truncated` arm of the failure list.
+            let truncated_addr = CellAddress::new("acme", "orders", "Order#truncated", 99);
+            sealed_a.push((truncated_addr.clone(), alloc::vec::Vec::from(&[0u8; 5][..])));
+
+            let report = rotate_tenant(
+                &master_a,
+                &master_b,
+                sealed_a.iter().map(|(a, s)| (a.clone(), s.clone())),
+            );
+
+            assert!(!report.is_complete(),
+                "corrupted + truncated cells must surface as failures");
+            assert_eq!(report.failures.len(), 2,
+                "exactly the corrupted cell + the truncated cell fail; \
+                 got {} failures", report.failures.len());
+            // The 3 clean cells (indices 0 and 2 — index 1 was tampered)
+            // still rotate.
+            assert_eq!(report.rotated.len(), addresses.len() - 1);
+
+            // Failure addresses match what we corrupted.
+            let failure_names: alloc::vec::Vec<&str> = report
+                .failures
+                .iter()
+                .map(|(addr, _)| addr.cell_name.as_str())
+                .collect();
+            assert!(failure_names.contains(&"Order#1"),
+                "tampered cell must appear in failures");
+            assert!(failure_names.contains(&"Order#truncated"),
+                "truncated cell must appear in failures");
+            // And the failure kinds are distinguished — Auth for the
+            // tampered envelope, Truncated for the short one.
+            for (addr, kind) in report.failures.iter() {
+                if addr.cell_name == "Order#1" {
+                    assert_eq!(*kind, AeadError::Auth);
+                } else if addr.cell_name == "Order#truncated" {
+                    assert_eq!(*kind, AeadError::Truncated);
+                }
+            }
+
+            // Sanity: rotated entries open under B, untouched under A.
+            for (addr, new_sealed) in report.rotated.iter() {
+                assert!(cell_open(&master_b, addr, new_sealed).is_ok(),
+                    "rotated cell {:?} must open under master B", addr);
+            }
+
+            // Sanity: the cells that FAILED to rotate are still
+            // readable under master A — the rotation walk left them
+            // alone, so the operator can retry / zeroize / replicate.
+            let untampered_addr = &addresses[0];
+            let untampered_bytes = &sealed_a[0].1;
+            assert!(
+                cell_open(&master_a, untampered_addr, untampered_bytes).is_ok(),
+                "old master must still open the original (un-rotated) bytes",
+            );
+        });
+    }
+
     // ── Process-global tenant master slot (#663) ────────────────────
 
     /// `current_tenant_master` must return `None` when nothing has
@@ -670,5 +1051,122 @@ mod tests {
         assert_eq!(got.as_bytes(), &first,
             "Once::call_once: first install must win, second is silently dropped");
         reset_tenant_master_for_test();
+    }
+
+    // ── Cross-tier fixture (#660) ─────────────────────────────────────
+    //
+    // Lock the wire format byte-for-byte against an external (TS /
+    // Worker) opener. The Worker test in `src/cell-encryption.test.ts`
+    // hard-codes the same hex the function below asserts; that
+    // double-pin is what proves the wire shape is identical across
+    // tiers — neither side can drift without breaking the other.
+    //
+    // The Rust direction here uses a deterministic entropy source so
+    // the nonce is reproducible; the Worker side then opens the same
+    // bytes via `cell_open_wasm` and recovers the same plaintext.
+    // The reverse direction (TS seals, Rust opens) doesn't need a
+    // matching Rust fixture: any envelope the TS side produces with
+    // the same canonical address bytes + master deserialises through
+    // exactly the function the Rust side already exercises in
+    // `round_trip_recovers_plaintext`.
+
+    /// Hex of the canonical fixture: master = 0xAA × 32, address =
+    /// (scope = "worker", domain = "Order", cell_name = "ord-42",
+    /// version = 1), entropy seed = [0x42; 32], plaintext =
+    /// b"cross-tier round-trip payload". The TS test mirrors these
+    /// inputs verbatim. Bumping any of the four fields below requires
+    /// regenerating the hex (run this test with `--nocapture` and
+    /// copy the printed bytes into both this constant and the TS
+    /// fixture).
+    pub(super) const CROSS_TIER_FIXTURE_PLAINTEXT: &[u8] =
+        b"cross-tier round-trip payload";
+    pub(super) const CROSS_TIER_FIXTURE_MASTER: [u8; CELL_KEY_LEN] = [0xAAu8; CELL_KEY_LEN];
+    pub(super) const CROSS_TIER_FIXTURE_ENTROPY_SEED: [u8; 32] = [0x42u8; 32];
+
+    fn cross_tier_fixture_address() -> CellAddress {
+        CellAddress::new("worker", "Order", "ord-42", 1)
+    }
+
+    /// Hex of the sealed envelope produced by the deterministic seed
+    /// + master + address + plaintext above. If the AEAD format ever
+    /// drifts (different HKDF info string, different AAD layout,
+    /// different ChaCha20 round count, etc.) this constant breaks
+    /// AND the Worker test breaks — the two together pin the
+    /// cross-tier contract.
+    pub(super) const CROSS_TIER_FIXTURE_SEALED_HEX: &str =
+        "bb3017b93796dc709e4aad59713c2b04138686ca33f233bd4ef1ff4088d3aed5607d457afa05ed72dfec9c6482d4092ab7f25574ae1112c989";
+
+    /// Decode a hex string with no separators — small no_std-clean
+    /// helper specific to this fixture; the test crate already pulls
+    /// `hex` for some suites but `cell_aead` itself doesn't depend on
+    /// it, and pulling a transitive crate just for one test is
+    /// overkill.
+    fn decode_hex(s: &str) -> Vec<u8> {
+        assert!(s.len() % 2 == 0, "hex string length must be even");
+        let mut out = Vec::with_capacity(s.len() / 2);
+        let bytes = s.as_bytes();
+        for pair in bytes.chunks(2) {
+            let hi = char::from(pair[0]).to_digit(16).expect("valid hex digit") as u8;
+            let lo = char::from(pair[1]).to_digit(16).expect("valid hex digit") as u8;
+            out.push((hi << 4) | lo);
+        }
+        out
+    }
+
+    /// Cross-tier wire-format pin (#660). The Rust seal MUST produce
+    /// exactly the bytes the Worker test consumes. Two reasons this
+    /// is a fully-deterministic fixture rather than a round-trip
+    /// only:
+    ///   * Catches accidental format drift the moment it lands —
+    ///     a swap of the HKDF info string or AAD layout would still
+    ///     pass a self-round-trip on either side, but breaks the
+    ///     cross-tier contract.
+    ///   * Documents the bytes both sides expect, so a future tier
+    ///     (FPGA, mobile) has a known-good test vector to validate
+    ///     its own implementation against without booting either of
+    ///     the existing tiers.
+    #[test]
+    fn cross_tier_fixture_seal_matches_constant() {
+        let master = TenantMasterKey::from_bytes(CROSS_TIER_FIXTURE_MASTER);
+        let addr = cross_tier_fixture_address();
+        with_deterministic_entropy(CROSS_TIER_FIXTURE_ENTROPY_SEED, || {
+            let sealed = cell_seal(&master, &addr, CROSS_TIER_FIXTURE_PLAINTEXT);
+            // Print the actual bytes when the assertion fails — caller
+            // can copy them straight into the constant + TS fixture.
+            let actual_hex: String = sealed
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect();
+            assert_eq!(
+                actual_hex, CROSS_TIER_FIXTURE_SEALED_HEX,
+                "cross-tier sealed envelope drifted from the locked-in fixture; \
+                 update both this constant AND the matching TS fixture in \
+                 src/cell-encryption.test.ts"
+            );
+
+            // Sanity: the bytes we just produced still open under the
+            // same master/address (a basic round-trip on the fixture).
+            let recovered = cell_open(&master, &addr, &sealed)
+                .expect("fixture must round-trip on the Rust side");
+            assert_eq!(recovered, CROSS_TIER_FIXTURE_PLAINTEXT);
+        });
+    }
+
+    /// Inverse direction: take the locked-in hex (the same string the
+    /// TS test seals + sends back) and prove `cell_open` recovers the
+    /// fixture plaintext. This is the path a future tier's seal
+    /// implementation would need to satisfy — produce these bytes,
+    /// any AEAD-correct opener (Rust or TS) reads them back.
+    #[test]
+    fn cross_tier_fixture_opens_from_locked_hex() {
+        let master = TenantMasterKey::from_bytes(CROSS_TIER_FIXTURE_MASTER);
+        let addr = cross_tier_fixture_address();
+        let sealed = decode_hex(CROSS_TIER_FIXTURE_SEALED_HEX);
+        // Open does NOT touch the entropy source (no nonce draw), so
+        // it runs without `with_deterministic_entropy` — proves the
+        // opener is a pure function of (master, addr, sealed).
+        let recovered = cell_open(&master, &addr, &sealed)
+            .expect("locked-hex envelope must open under fixture master/address");
+        assert_eq!(recovered, CROSS_TIER_FIXTURE_PLAINTEXT);
     }
 }

@@ -38,6 +38,7 @@ import {
   cellSeal,
   cellOpen,
   deriveTenantMasterKey,
+  rotateCell,
 } from './cell-encryption'
 export type { SqlLike } from './sql-like'
 
@@ -431,5 +432,78 @@ export class EntityDB extends DurableObject {
   async connectedSystems(): Promise<string[]> {
     this.ensureInit()
     return listConnectedSystems(this.ctx.storage.sql)
+  }
+
+  // ── Tenant master rotation (#662) ─────────────────────────────────
+  //
+  // Rotate THIS DO's sealed row from `oldSeed`/`oldSalt` → `newSeed`/
+  // `newSalt`. The orchestrator (worker.ts / RegistryDB rotation
+  // path) holds the per-tenant write lock for the duration of the
+  // walk; this method performs the per-cell atomic swap inside the
+  // DO's single-writer scope.
+  //
+  // Returns:
+  //   - `{ ok: true, rotated: true }` on a clean rotation
+  //   - `{ ok: true, rotated: false }` when the row is empty / legacy
+  //     plaintext / not in our `SEALED_CELL_PREFIX` form (no-op)
+  //   - `{ ok: false, kind: 'truncated' | 'auth' }` when the old master
+  //     cannot open the row — the row is left untouched, operator
+  //     decides whether to retry, zeroize, or accept the loss.
+  //
+  // The two seeds + two salts are passed explicitly rather than
+  // derived from `env`: during rotation the orchestrator has both
+  // masters in hand (TENANT_MASTER_SEED + TENANT_MASTER_SEED_v2).
+  // After rotation completes the operator promotes v2 → v1 and the
+  // DO's `getMaster` resolves transparently to the new key.
+  async rotateMaster(args: {
+    oldSeed: string | Uint8Array
+    oldSalt: string | Uint8Array
+    newSeed: string | Uint8Array
+    newSalt: string | Uint8Array
+  }): Promise<
+    | { ok: true; rotated: boolean }
+    | { ok: false; kind: 'truncated' | 'auth' }
+  > {
+    this.ensureInit()
+    const rows = this.ctx.storage.sql
+      .exec(`SELECT id, type, data FROM cell`)
+      .toArray()
+    if (rows.length === 0) {
+      return { ok: true, rotated: false }
+    }
+    const row = rows[0] as Record<string, any>
+    const dataField = row.data as unknown
+    if (typeof dataField !== 'string' || !dataField.startsWith(SEALED_CELL_PREFIX)) {
+      // Legacy plaintext or empty — no rotation needed.
+      return { ok: true, rotated: false }
+    }
+    const oldMaster = await deriveTenantMasterKey(args.oldSeed, args.oldSalt)
+    const newMaster = await deriveTenantMasterKey(args.newSeed, args.newSalt)
+    const sealed = base64ToBytes(dataField.slice(SEALED_CELL_PREFIX.length))
+    const address = cellAddressFor(row.type as string, row.id as string)
+    let newSealed: Uint8Array
+    try {
+      newSealed = await rotateCell(oldMaster, newMaster, address, sealed)
+    } catch (e) {
+      // Old master could not open the row — surface the kind so the
+      // orchestrator can collect it into the rotation report.
+      const kind = (e as { kind?: 'truncated' | 'auth' }).kind ?? 'auth'
+      return { ok: false, kind }
+    }
+    // Atomic swap: write the new sealed envelope back. The DO's
+    // single-writer guarantee means no concurrent put/get on this DO
+    // can interleave between the read above and the write below.
+    const blob = SEALED_CELL_PREFIX + bytesToBase64(newSealed)
+    this.ctx.storage.sql.exec(
+      `INSERT OR REPLACE INTO cell (id, type, data) VALUES (?, ?, ?)`,
+      row.id,
+      row.type,
+      blob,
+    )
+    // Invalidate the memoised master so subsequent calls re-derive
+    // from whichever seed `env` exposes (the orchestrator promotes
+    // v2 → v1 after the walk completes).
+    this.master = null
+    return { ok: true, rotated: true }
   }
 }
