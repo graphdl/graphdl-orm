@@ -44,21 +44,30 @@ if (-not $KeepContainer.IsPresent -and $env:E2E_KEEP_CONTAINER -eq '1') {
 
 $containerName = "arest-kernel-e2e-$([guid]::NewGuid().ToString('N').Substring(0,8))"
 
-Write-Host "[#656 e2e] Building UEFI kernel image..." -ForegroundColor Cyan
+Write-Host "[#656 e2e] Building UEFI kernel image (server profile)..." -ForegroundColor Cyan
+# Use the lean server profile (no Slint runtime, no UI bundle, no
+# REPL/PS-2 keyboard) — that's the profile #657's smoke verifies
+# host-curl-reachable, and dropping the launcher hand-off lets
+# `loop { net::poll(); pause }` drive smoltcp without competing
+# with the Slint event loop's idle pump.
 $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 try {
-    docker build -t arest-kernel-uefi -f "$repoRoot\crates\arest-kernel\Dockerfile.uefi" $repoRoot
+    docker build -t arest-kernel-server -f "$repoRoot\crates\arest-kernel\Dockerfile.uefi-server" $repoRoot
 } finally {
     $ErrorActionPreference = $prevEAP
 }
 if ($LASTEXITCODE -ne 0) { throw "Docker build failed (exit $LASTEXITCODE)" }
 
-Write-Host "[#656 e2e] Booting kernel container '$containerName' on :8080..." -ForegroundColor Cyan
+Write-Host "[#656 e2e] Booting kernel container '$containerName' on 127.0.0.1:8080..." -ForegroundColor Cyan
+# Bind explicitly to 127.0.0.1 (not 0.0.0.0) so PowerShell host-side
+# probes hit IPv4 loopback directly rather than going through the
+# WSL2 VM's bridge. See #657 — same Windows/Docker-Desktop quirk
+# that caused "Empty reply from server" on the smoke harness path.
 $prevEAP = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 try {
-    & docker run --rm --name $containerName -d -p 8080:8080 arest-kernel-uefi | Out-Null
+    & docker run --rm --name $containerName -d -p 127.0.0.1:8080:8080 arest-kernel-server | Out-Null
 } finally {
     $ErrorActionPreference = $prevEAP
 }
@@ -87,41 +96,37 @@ function Stop-KernelContainer {
 }
 
 try {
-    # Wait for :8080 to accept connections. Any HTTP response (incl.
-    # 404 at `/`) means the kernel is listening — that's the
+    # Wait for 127.0.0.1:8080 to accept connections. Any HTTP response
+    # (incl. 404 at `/`) means the kernel is listening — that's the
     # readiness condition. Connection refused or timeout means the
-    # net stack hasn't settled yet (#655).
-    Write-Host "[#656 e2e] Waiting up to ${BootTimeoutSec}s for :8080 to accept connections..." -ForegroundColor Cyan
+    # net stack hasn't settled yet.
+    #
+    # Use curl.exe rather than Invoke-WebRequest. IWR depends on IE/Edge
+    # COM interfaces that PowerShell 5.1 in `-NonInteractive` mode can't
+    # initialise — silent failure looks like an Empty-reply timeout.
+    # See #657 commit b61652dd for the same fix on the smoke harness.
+    Write-Host "[#656 e2e] Waiting up to ${BootTimeoutSec}s for 127.0.0.1:8080 to accept connections..." -ForegroundColor Cyan
     $deadline = (Get-Date).AddSeconds($BootTimeoutSec)
     $ready = $false
     while ((Get-Date) -lt $deadline) {
-        $prevEAP = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        try {
-            $resp = Invoke-WebRequest -Uri "http://localhost:8080/" -TimeoutSec 2 -UseBasicParsing -ErrorAction SilentlyContinue
-            if ($null -ne $resp) { $ready = $true }
-        } catch {
-            # Connection refused / timeout — keep polling.
-        } finally {
-            $ErrorActionPreference = $prevEAP
+        $code = & curl.exe -s -m 2 -o NUL -w "%{http_code}" "http://127.0.0.1:8080/" 2>$null
+        if ($LASTEXITCODE -eq 0 -and $code -match '^[0-9]+$' -and [int]$code -gt 0) {
+            $ready = $true
+            break
         }
-        if ($ready) { break }
         Start-Sleep -Milliseconds 500
     }
 
     if (-not $ready) {
-        Write-Warning ("[#656 e2e] :8080 did not open within ${BootTimeoutSec}s. " +
-            "This is the #655 net-settling regime; the e2e suite will skip cleanly. " +
-            "Re-run with -BootTimeoutSec 120 or land #655's net fix and retry.")
-        # Soft-warn, not throw: the test suite itself handles
-        # connection-refused as a clean skip, so we still exit 0 to
-        # let the operator see the skip rather than a script failure.
+        Write-Warning ("[#656 e2e] 127.0.0.1:8080 did not open within ${BootTimeoutSec}s. " +
+            "Kernel may not have reached `server: net+http loop running` yet; " +
+            "raise -BootTimeoutSec or check `docker logs $containerName`.")
         Stop-KernelContainer
         exit 1
     }
 
-    Write-Host "[#656 e2e] :8080 is up. Running vitest suite..." -ForegroundColor Green
-    $env:BASE = "http://localhost:8080"
+    Write-Host "[#656 e2e] 127.0.0.1:8080 is up. Running vitest suite..." -ForegroundColor Green
+    $env:BASE = "http://127.0.0.1:8080"
     Push-Location $repoRoot
     try {
         # `yarn test` resolves to `vitest run` per package.json.

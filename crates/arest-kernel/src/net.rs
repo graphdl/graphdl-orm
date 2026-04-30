@@ -471,18 +471,26 @@ pub fn poll() -> bool {
 
 /// One tick of the HTTP listener state machine.
 ///
-/// Four states, checked in order:
+/// Five states, checked in order:
 ///
 ///   1. Socket is Closed — re-`listen` on the listener's port so the
 ///      next client can connect. Clear any leftover buffers from the
 ///      previous connection.
 ///   2. A response is in flight (`tx_sent < tx_buf.len()`) — push as
-///      many remaining bytes as the send ring accepts; when the whole
-///      response has been written, `close()` the socket so the client
-///      sees EOF and the listener re-arms on the next poll.
-///   3. Request bytes are arriving — `recv` whatever smoltcp has for
+///      many remaining bytes as the send ring accepts.
+///   3. Peer has half-closed (`state() == CloseWait`) AND we've sent
+///      our full response — call `close()` to complete the passive
+///      close sequence. We rely on the peer to FIN first (per the
+///      `Connection: close` header we ship in every response) rather
+///      than closing eagerly, because clients like undici interpret
+///      a same-segment data+FIN as "abruptly closed" and surface the
+///      response as a "fetch failed: other side closed" error
+///      (#624 diagnosis 2026-04-30). curl tolerates the same-segment
+///      data+FIN; undici doesn't, so the passive-close path is the
+///      contract that lets both work.
+///   4. Request bytes are arriving — `recv` whatever smoltcp has for
 ///      us and append to `rx_buf`.
-///   4. A full request has been accumulated — parse it, call the
+///   5. A full request has been accumulated — parse it, call the
 ///      handler, serialise the response into `tx_buf`, and try an
 ///      immediate send to minimise round-trip latency.
 fn drive_http(listener: &mut HttpListener, sockets: &mut SocketSet<'static>) {
@@ -517,6 +525,7 @@ fn drive_http(listener: &mut HttpListener, sockets: &mut SocketSet<'static>) {
     }
 
     // (2) Drain any in-flight response before accepting new input.
+    //     No close() here — see (3) below.
     if listener.tx_sent < listener.tx_buf.len() {
         if socket.can_send() {
             let remaining = &listener.tx_buf[listener.tx_sent..];
@@ -524,9 +533,24 @@ fn drive_http(listener: &mut HttpListener, sockets: &mut SocketSet<'static>) {
                 listener.tx_sent += n;
             }
         }
-        if listener.tx_sent >= listener.tx_buf.len() {
-            socket.close();
-        }
+        return;
+    }
+
+    // (3) Passive close: the response is fully written into smoltcp's
+    //     send buffer (tx_sent == tx_buf.len()) but we don't FIN until
+    //     the peer FINs first. This gives clients reading the
+    //     `Connection: close` response a chance to consume the body
+    //     bytes off the wire before any FIN segment arrives, which
+    //     undici (Node's fetch dispatcher) is sensitive to.
+    //
+    //     `tx_buf` non-empty + `state == CloseWait` means: the peer
+    //     ACK'd our data and FIN'd from their side; we now FIN to
+    //     complete LAST_ACK -> CLOSED, then re-listen on the next
+    //     tick when state hits Closed (step 1).
+    if !listener.tx_buf.is_empty() && socket.state() == State::CloseWait {
+        socket.close();
+        listener.tx_buf.clear();
+        listener.tx_sent = 0;
         return;
     }
 
@@ -620,20 +644,18 @@ fn drive_http(listener: &mut HttpListener, sockets: &mut SocketSet<'static>) {
     listener.rx_buf.clear();
 
     // Opportunistic first send so the fast path finishes in one tick.
+    // No close() here — passive close handled at step (3) on the next
+    // poll once the peer FINs.
     if socket.can_send() {
         if let Ok(n) = socket.send_slice(&listener.tx_buf) {
             listener.tx_sent = n;
             crate::println!(
-                "http-diag: opportunistic send n={} (of {})",
+                "http-diag: opportunistic send n={} (of {}); awaiting peer FIN",
                 n, listener.tx_buf.len(),
             );
         }
     } else {
         crate::println!("http-diag: opportunistic send blocked (can_send=false)");
-    }
-    if listener.tx_sent >= listener.tx_buf.len() {
-        socket.close();
-        crate::println!("http-diag: socket.close() after full send");
     }
 }
 
