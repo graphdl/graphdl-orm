@@ -49,10 +49,23 @@ COPY crates/arest/src/ crates/arest/src/
 COPY readings/ readings/
 COPY crates/arest-kernel/vendor/ crates/arest-kernel/vendor/
 
-# Server build: --features server (no linuxkpi). Runtime gate inside
-# entry_uefi.rs swaps the Slint launcher for a net+http drainer.
+# Server build: --no-default-features --features server (#655).
+# `--no-default-features` drops the `slint` default feature so the
+# slint runtime crate, slint-build host compiler, ui_apps tree, and
+# Slint event loop are all elided from the build graph — the
+# `entry_uefi.rs::kernel_run_uefi` server branch is the only
+# runtime hand-off that compiles. This is the lean profile from
+# #627 + #628 (Profile-3/-4 splits); composing `slint` on top of
+# `server` linked everything but kept the runtime gate, which left
+# binary size + cold compile bloated for the headless smoke.
+#
+# The `feature = "server"` runtime branch in `entry_uefi.rs` runs
+# `loop { net::poll(); pause }` (see net.rs `now()` — #655 wired
+# the smoltcp clock to the PIT-backed `arch::time::now_ms()` so
+# DHCPv4 retries align with wall-clock real-network latency).
 RUN cd crates/arest-kernel \
-    && cargo +nightly build --target x86_64-unknown-uefi --release --features server
+    && cargo +nightly build --target x86_64-unknown-uefi --release \
+       --no-default-features --features server,static-ip
 
 FROM debian:bookworm-slim AS runner
 

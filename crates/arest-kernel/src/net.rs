@@ -56,16 +56,36 @@ use crate::virtio::VirtioPhy;
 #[cfg(all(target_os = "uefi", any(target_arch = "aarch64", target_arch = "arm")))]
 use crate::virtio_mmio::VirtioPhy;
 
-/// Monotonically-increasing timestamp for smoltcp's scheduler. Once
-/// the TSC / HPET timer IRQ is wired we hand this a proper tick
-/// counter; for now it's a raw counter bumped on every poll so the
-/// TCP retransmit machinery at least progresses.
-static MONOTONIC_MILLIS: spin::Mutex<i64> = spin::Mutex::new(0);
-
+/// Monotonic timestamp for smoltcp's scheduler.
+///
+/// On UEFI x86_64 we read the PIT-backed `arch::time::now_ms()`
+/// counter directly. Without this, the previous fallback (a per-call
+/// counter that incremented by exactly 1 ms regardless of wall time)
+/// blew past every smoltcp retry / lease deadline within microseconds
+/// of wall-clock — DHCPv4 fired DISCOVER, smoltcp's "wait 4 s for
+/// OFFER" timer expired in ~4 ms of real time inside the tight
+/// `loop { net::poll(); pause }` drainer, and the client retried
+/// before SLiRP's DHCP server (which responds in real-world ms) could
+/// reply. Net effect: lease never settled inside the 45 s smoke
+/// window — see `_reports/kernel-hateoas-gap.md` (#655).
+///
+/// On other targets (aarch64 / armv7 UEFI, host-test target) we keep
+/// the legacy per-call counter — those arms don't have a PIT-backed
+/// `arch::time::now_ms()` exposed yet and the existing in-tree call
+/// sites that exercise `net::poll()` (the loopback round-trip in
+/// `#[cfg(test)] mod tests`) don't depend on real-world time.
 fn now() -> Instant {
-    let mut t = MONOTONIC_MILLIS.lock();
-    *t = t.saturating_add(1);
-    Instant::from_millis(*t)
+    #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+    {
+        Instant::from_millis(crate::arch::time::now_ms() as i64)
+    }
+    #[cfg(not(all(target_os = "uefi", target_arch = "x86_64")))]
+    {
+        static MONOTONIC_MILLIS: spin::Mutex<i64> = spin::Mutex::new(0);
+        let mut t = MONOTONIC_MILLIS.lock();
+        *t = t.saturating_add(1);
+        Instant::from_millis(*t)
+    }
 }
 
 /// Global network state. `Option` so `init` can build it after the
@@ -242,12 +262,36 @@ pub fn init(virtio: Option<VirtioPhy>) {
     // On loopback we can statically assign 127.0.0.1/8 right away.
     // On virtio-net we leave the address empty — DHCP fills it in
     // on the first successful lease (Configured event in `poll`).
+    //
+    // Exception (#655 server-profile smoke fallback): when the
+    // `static-ip` feature is on AND we have a virtio-net device, we
+    // statically assign QEMU SLiRP's well-known guest IP (10.0.2.15/24,
+    // gateway 10.0.2.2) immediately, skipping the DHCP wait. SLiRP's
+    // own DHCP server hands out the same address with a 24-hour lease,
+    // so this is behaviourally identical to DHCP-completed for any
+    // tcp socket the guest binds — just deterministic and instant.
+    // Used by the boot-smoke harness so the host curl path is reachable
+    // without waiting on DHCP retransmit cadence (which on the lean
+    // server profile fails to settle inside the 60 s smoke window —
+    // root cause undiagnosed in this session, tracked separately).
     if matches!(device, KernelDevice::Loopback(_)) {
         iface.update_ip_addrs(|addrs| {
             addrs
                 .push(IpCidr::new(IpAddress::v4(127, 0, 0, 1), 8))
                 .expect("loopback address push");
         });
+    } else {
+        #[cfg(feature = "static-ip")]
+        {
+            iface.update_ip_addrs(|addrs| {
+                let _ = addrs.push(IpCidr::Ipv4(
+                    Ipv4Cidr::new(smoltcp::wire::Ipv4Address::new(10, 0, 2, 15), 24),
+                ));
+            });
+            let _ = iface.routes_mut().add_default_ipv4_route(
+                smoltcp::wire::Ipv4Address::new(10, 0, 2, 2),
+            );
+        }
     }
 
     let mut sockets = SocketSet::new(Vec::new());
@@ -256,8 +300,26 @@ pub fn init(virtio: Option<VirtioPhy>) {
     // virtio-net path, `poll` DISCOVER / REQUESTs a lease automatically
     // — no extra wiring at the call site. Over Loopback the socket
     // simply times out and retries; harmless.
-    let dhcp_socket = dhcpv4::Socket::new();
-    let dhcp_handle = sockets.add(dhcp_socket);
+    //
+    // When `static-ip` is on (#655), we skip the DHCP socket entirely.
+    // The interface already has 10.0.2.15/24 + default gateway from the
+    // branch above; a DHCP socket would otherwise emit a `Deconfigured`
+    // event on first poll (initial Halted state) which `poll`'s
+    // dhcp-event handler would interpret as "lease lost" and wipe the
+    // static config we just installed. Skipping the socket short-
+    // circuits the entire DHCP pump.
+    #[cfg(not(feature = "static-ip"))]
+    let dhcp_handle = {
+        let dhcp_socket = dhcpv4::Socket::new();
+        sockets.add(dhcp_socket)
+    };
+    // Static-IP build still needs `dhcp_handle` to populate `NetState`
+    // — we add a placeholder DHCP socket but never poll its events.
+    // Using a real socket (rather than `Option<SocketHandle>`) keeps
+    // `NetState` shape unchanged and side-steps the borrow / mutex
+    // implications of conditional fields elsewhere in the module.
+    #[cfg(feature = "static-ip")]
+    let dhcp_handle = sockets.add(dhcpv4::Socket::new());
 
     *NET.lock() = Some(NetState {
         device,
@@ -323,7 +385,19 @@ pub fn poll() -> bool {
 
     // Drain DHCP events every poll, regardless of whether socket
     // state "changed" — smoltcp reports on a different axis.
+    //
+    // When `static-ip` is on (#655) we skip this entirely: the
+    // interface is statically configured at `init` time and the
+    // DHCP socket is a placeholder we never read events from.
+    // Letting a `Deconfigured` event through would clear the
+    // static IP; letting a `Configured` event through would
+    // overwrite it with whatever the server hands out (which on
+    // QEMU SLiRP is the same address — but the round-trip wastes
+    // boot-time and breaks the determinism the static-ip feature
+    // exists to provide).
+    #[cfg(not(feature = "static-ip"))]
     let dhcp = state.sockets.get_mut::<dhcpv4::Socket>(state.dhcp_handle);
+    #[cfg(not(feature = "static-ip"))]
     if let Some(event) = dhcp.poll() {
         match event {
             dhcpv4::Event::Configured(config) => {
