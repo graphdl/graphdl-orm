@@ -71,10 +71,18 @@ if ($Smoke) {
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        # -p 8080:8080: bridge container's exposed 8080 to the host so
-        # the post-banner curl step can reach the kernel's HTTP listener
-        # via QEMU's hostfwd=tcp::8080-:80.
-        & docker run --rm --name $containerName -d -p 8080:8080 arest-kernel-server | Out-Null
+        # -p 127.0.0.1:8080:8080: bind the host side of the port mapping
+        # to IPv4 loopback explicitly. The default `-p 8080:8080` form
+        # binds to `0.0.0.0`, which Docker Desktop on Windows reaches
+        # only via the WSL2 VM's IPv4 address — `Invoke-WebRequest
+        # http://127.0.0.1:8080/` then probes a port that isn't
+        # forwarded back, and times out with "Empty reply from server".
+        # The explicit `127.0.0.1:` host binding (or use of `-4`-flagged
+        # curl against the same address) routes the host-side connection
+        # straight into the container's QEMU SLiRP hostfwd, which the
+        # 2026-04-30 diagnostic confirmed delivers all the way through
+        # to the guest's smoltcp listener.
+        & docker run --rm --name $containerName -d -p 127.0.0.1:8080:8080 arest-kernel-server | Out-Null
     } finally {
         $ErrorActionPreference = $prevEAP
     }
@@ -151,61 +159,62 @@ if ($Smoke) {
         }
 
         # Host -> docker:8080 -> QEMU hostfwd -> guest:80 reachability.
-        # SOFT check (mirrors boot-kernel-uefi.ps1's #361 WARN): the
-        # banner-level smoke PASSES on the in-kernel observation alone
-        # (every prereq subsystem booted, the HTTP handler is registered,
-        # net::poll is running unblocked by Slint). The host-curl path
-        # additionally proves the QEMU SLiRP hostfwd reaches the guest's
-        # smoltcp listener — when it works it's the full demonstration
-        # the apis e2e suite (#624) needs.
+        # HARD check (#657 closed): proves the QEMU SLiRP hostfwd
+        # reaches the guest's smoltcp listener and the kernel's
+        # arest_http_handler returns a real response. Required for
+        # the apis e2e suite (#624).
         #
-        # Status as of #655:
-        #   * Slint-idle blocker resolved (lean profile drops slint
-        #     entirely, `loop { net::poll(); pause }` runs unblocked).
-        #   * PIT IRQ 0 unmask bug fixed (interrupts.rs PIC mask was
-        #     0xFD which masked IRQ 0; corrected to 0xFE).
-        #   * smoltcp clock wired to PIT-backed `arch::time::now_ms()`
-        #     so DHCPv4 / TCP retry timers are wall-clock-aligned.
-        #   * `static-ip` feature added that hardcodes QEMU SLiRP's
-        #     guest IP (10.0.2.15/24, gateway 10.0.2.2) so DHCP isn't
-        #     on the smoke window's critical path.
-        # Despite all four fixes, the host curl still gets "Empty
-        # reply from server" — TCP handshake to SLiRP succeeds but
-        # the inner SLiRP -> guest:80 pipe never delivers bytes.
-        # Likely a virtio-net rx-pump cadence issue or a smoltcp
-        # listen-socket interaction not yet diagnosed; tracked as a
-        # follow-up sub-task. For now keep the assertion soft so the
-        # banner-level smoke unblocks #624's banner asserts; promote
-        # to hard-fail once the residual host-curl gap is closed.
+        # Use `127.0.0.1` explicitly rather than `localhost` — on
+        # Windows, `localhost` resolves to `::1` first (IPv6), but
+        # Docker Desktop's port-mapping only forwards IPv4 by
+        # default, so the IPv6 attempt times out with "Empty reply
+        # from server". The IPv4 path is the one the smoke is
+        # actually testing; pinning the URL to 127.0.0.1 routes
+        # around the resolver order. (Diagnosed 2026-04-30 — the
+        # original Empty-reply mystery was DNS, not the kernel net
+        # stack which had been instrumented with rx/tx counters and
+        # observed delivering the full handshake + response wire
+        # bytes via the IPv4 path.)
+        # Use curl.exe rather than Invoke-WebRequest. IWR's `-Uri`
+        # implementation depends on Internet Explorer / Edge COM
+        # interfaces that PowerShell 5.1 in `-NonInteractive` mode
+        # cannot drive (`PromptForChoice`-class init failures show
+        # up as silent "Empty reply from server" timeouts in the
+        # smoke runner's captured stderr stream). curl.exe ships
+        # with Windows 10+ and 11 by default and has no such
+        # dependency; it also gives us a clean exit code + body
+        # capture without the elaborate Invoke-WebRequest object
+        # surface.
         $curlOk = $false
         $curlBody = $null
         $curlStatus = $null
+        $curlBodyFile = New-TemporaryFile
         $curlDeadline = (Get-Date).AddSeconds(60)
         $curlStart = Get-Date
         while ((Get-Date) -lt $curlDeadline) {
-            try {
-                $resp = Invoke-WebRequest -Uri "http://localhost:8080/" -TimeoutSec 3 -ErrorAction Stop
-                if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 500) {
-                    $curlOk = $true
-                    $curlStatus = $resp.StatusCode
-                    $curlBody = $resp.Content
-                    break
-                }
-            } catch {
-                Start-Sleep -Milliseconds 500
+            $code = & curl.exe -s -m 3 -o $curlBodyFile.FullName -w "%{http_code}" "http://127.0.0.1:8080/" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $code -match '^[0-9]+$' -and [int]$code -ge 200 -and [int]$code -lt 500) {
+                $curlOk = $true
+                $curlStatus = [int]$code
+                $curlBody = Get-Content $curlBodyFile.FullName -Raw -ErrorAction SilentlyContinue
+                if ($null -eq $curlBody) { $curlBody = "" }
+                break
             }
+            Start-Sleep -Milliseconds 500
         }
         $curlElapsed = ((Get-Date) - $curlStart).TotalSeconds
+        Remove-Item $curlBodyFile.FullName -Force -ErrorAction SilentlyContinue
 
         if (-not $curlOk) {
-            Write-Host "WARN: http://localhost:8080/ unreachable from host within 60 s (#655 deferred)." -ForegroundColor Yellow
-            Write-Host "      Banner-level smoke PASSES; in-kernel net+http subsystems are verified." -ForegroundColor Yellow
-            Write-Host "      Residual host-curl gap is tracked as a sub-task — see net.rs / boot-kernel-uefi-server.ps1 comments." -ForegroundColor Yellow
-        } else {
-            $bodyPreview = if ($curlBody.Length -gt 120) { $curlBody.Substring(0, 120) + "..." } else { $curlBody }
-            Write-Host ("PASS: http://localhost:8080/ reachable in {0:N1} s (HTTP {1}, {2} bytes)." -f $curlElapsed, $curlStatus, $curlBody.Length) -ForegroundColor Green
-            Write-Host "      Body preview: $bodyPreview" -ForegroundColor DarkGray
+            Write-Host "FAIL: http://127.0.0.1:8080/ unreachable from host within 60 s." -ForegroundColor Red
+            Write-Host "      Banner observed but the host-curl path is broken." -ForegroundColor Red
+            Write-Host "`n--- captured serial log ($logPath) ---"
+            Write-Host $log
+            exit 1
         }
+        $bodyPreview = if ($curlBody.Length -gt 120) { $curlBody.Substring(0, 120) + "..." } else { $curlBody }
+        Write-Host ("PASS: http://127.0.0.1:8080/ reachable in {0:N1} s (HTTP {1}, {2} bytes)." -f $curlElapsed, $curlStatus, $curlBody.Length) -ForegroundColor Green
+        Write-Host "      Body preview: $bodyPreview" -ForegroundColor DarkGray
 
         Write-Host "PASS: server-profile UEFI banner observed end-to-end." -ForegroundColor Green
         Write-Host "Serial log: $logPath"
