@@ -235,6 +235,14 @@ pub mod select_component_core;
 // wires land in #575-#578.
 pub mod entropy;
 pub mod csprng;
+// Cell-level AEAD (#659) — per-cell ChaCha20-Poly1305 with HKDF-SHA256
+// derivation from a per-tenant master. Pure no_std; sits next to
+// `csprng` because it draws nonces from the same process-wide CSPRNG
+// (#578). Every serialization boundary outside the engine's
+// in-memory operating set (DO write, kernel block_storage flush,
+// freeze/thaw bytes, network frame) seals through this module so a
+// leaked DO doesn't decrypt sibling cells without the tenant master.
+pub mod cell_aead;
 // `externals` (#agents-1 reform) — doc + worked example for the
 // canonical "external function in DEFS" pattern. *No new machinery*:
 // the registration / dispatch / async / citation surface is entirely
