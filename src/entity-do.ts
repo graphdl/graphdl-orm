@@ -60,11 +60,32 @@ export interface Fact {
 // ── Schema ──────────────────────────────────────────────────────────
 
 export function initCellSchema(sql: SqlLike): void {
+  // The `version` column is the per-cell monotonic counter used as
+  // part of the AEAD AAD (#661 / #558). Each successful sealed write
+  // bumps it; a captured-then-replayed older sealed envelope at the
+  // same `(scope, domain, cell_name)` fails to decrypt because the
+  // current row's version no longer matches the captured ciphertext's
+  // AAD. Default 0 — the first sealed write bumps to 1.
   sql.exec(`CREATE TABLE IF NOT EXISTS cell (
     id TEXT PRIMARY KEY,
     type TEXT NOT NULL,
-    data TEXT NOT NULL DEFAULT '{}'
+    data TEXT NOT NULL DEFAULT '{}',
+    version INTEGER NOT NULL DEFAULT 0
   )`)
+
+  // Schema migration: existing DOs created before #661 don't have the
+  // `version` column. ALTER TABLE ADD COLUMN is idempotent-by-trial:
+  // SQLite throws "duplicate column name" if it already exists, which
+  // we swallow. Pre-existing rows pick up the DEFAULT 0 — matching
+  // the "all existing cells are at version 0" baseline the task brief
+  // calls out.
+  try {
+    sql.exec(`ALTER TABLE cell ADD COLUMN version INTEGER NOT NULL DEFAULT 0`)
+  } catch {
+    // Column already exists — expected when the table was created
+    // fresh by the CREATE TABLE above (with the column already in
+    // its declaration).
+  }
 
   // Migration from old entity table: if entity table exists, migrate data
   try {
@@ -73,8 +94,8 @@ export function initCellSchema(sql: SqlLike): void {
       const row = rows[0] as Record<string, any>
       const data = typeof row.fields === 'string' ? row.fields : JSON.stringify(row.fields || {})
       sql.exec(
-        `INSERT OR REPLACE INTO cell (id, type, data) VALUES (?, ?, ?)`,
-        row.id, row.noun, data,
+        `INSERT OR REPLACE INTO cell (id, type, data, version) VALUES (?, ?, ?, ?)`,
+        row.id, row.noun, data, 0,
       )
       sql.exec(`DROP TABLE entity`)
     }
@@ -120,7 +141,7 @@ export function removeCell(sql: SqlLike): { id: string } | null {
   return { id: cell.id }
 }
 
-// ── Cell-level encryption (#659) ───────────────────────────────────
+// ── Cell-level encryption (#659 / #661) ────────────────────────────
 //
 // `storeCellSealed` / `fetchCellSealed` are the cell_seal / cell_open
 // pair the EntityDB reaches for whenever a tenant master is bound at
@@ -138,37 +159,56 @@ export function removeCell(sql: SqlLike): { id: string } | null {
 //
 // Address shape: scope = "worker", domain = the EntityDB's noun type
 // (e.g. "Order"), cellName = the entity id (e.g. "ord-42"), version
-// = 0 today (a future commit can wire this to the per-row monotonic
-// version per #558 for replay-defence on hot-swapped masters).
+// = the per-cell monotonic counter from the row's `version` column
+// (#661 / #558). Each successful sealed write bumps the counter; a
+// captured-then-replayed older sealed envelope at the same address
+// fails decrypt because the persisted version (now N+1) no longer
+// matches the captured ciphertext's AAD (which carries N).
 
 /** Sealed-row magic prefix on the SQLite TEXT column. */
 export const SEALED_CELL_PREFIX = 'ARESTAEAD1:'
 
-/** Build a CellAddress from the EntityDB's notion of (type, id). */
-export function cellAddressFor(type: string, id: string): CellAddress {
+/** Build a CellAddress from the EntityDB's notion of (type, id) plus
+ *  the per-row monotonic version (#661). Pre-existing cells default
+ *  to version 0 (matching the schema column DEFAULT); the first
+ *  successful sealed write through `storeCellSealed` bumps to 1. */
+export function cellAddressFor(type: string, id: string, version: number = 0): CellAddress {
   return {
     scope: 'worker',
     domain: type,
     cellName: id,
-    version: 0,
+    version,
   }
 }
 
 /** ↑n — fetch the cell, decrypting if the row carries the sealed
  *  prefix. Returns the same shape as `fetchCell` so callers can
- *  swap the helper without touching their consumers. */
+ *  swap the helper without touching their consumers.
+ *
+ *  The persisted `version` column is read alongside the sealed bytes
+ *  and folded into the CellAddress before `cellOpen` — without it the
+ *  AEAD opener would derive a different per-cell HKDF key (since the
+ *  AAD includes the version) and every read after the first write
+ *  would surface as `CellAeadError(auth)`. */
 export async function fetchCellSealed(
   sql: SqlLike,
   master: TenantMasterKey,
 ): Promise<CellContents | null> {
-  const rows = sql.exec(`SELECT id, type, data FROM cell`).toArray()
+  const rows = sql.exec(`SELECT id, type, data, version FROM cell`).toArray()
   if (rows.length === 0) return null
   const row = rows[0] as Record<string, any>
   const dataField: unknown = row.data
+  // Coerce the persisted version. Older DOs that pre-date the
+  // schema change return undefined for the column; treat those as
+  // version 0 (legacy baseline). SQLite returns INTEGER as `number`
+  // through the workerd binding.
+  const persistedVersion = typeof row.version === 'number' && Number.isFinite(row.version)
+    ? row.version
+    : 0
   let data: Record<string, unknown>
   if (typeof dataField === 'string' && dataField.startsWith(SEALED_CELL_PREFIX)) {
     const sealed = base64ToBytes(dataField.slice(SEALED_CELL_PREFIX.length))
-    const address = cellAddressFor(row.type as string, row.id as string)
+    const address = cellAddressFor(row.type as string, row.id as string, persistedVersion)
     const opened = await cellOpen(master, address, sealed)
     const json = new TextDecoder().decode(opened)
     data = JSON.parse(json)
@@ -189,7 +229,19 @@ export async function fetchCellSealed(
  *  data column with the per-tenant master before the SQL write.
  *  The encrypted bytes go into the same `data` TEXT column, prefixed
  *  with `SEALED_CELL_PREFIX` so `fetchCellSealed` / `fetchCell` can
- *  tell encrypted rows from legacy plaintext. */
+ *  tell encrypted rows from legacy plaintext.
+ *
+ *  ## Atomic version + sealed write (#661)
+ *
+ *  Read the current `version` column for this row, bump by 1, build
+ *  the CellAddress with the NEW version, seal under that address,
+ *  and persist `(version, sealed)` in a single
+ *  `INSERT OR REPLACE INTO cell` call. The DO is single-writer by
+ *  Cloudflare's design, so the read-modify-write window cannot
+ *  observe a concurrent put on the same row; the single SQL UPSERT
+ *  commits both halves together (the sealed bytes and the new
+ *  version), preserving the invariant that the persisted version
+ *  always matches the AAD the sealed bytes were produced under. */
 export async function storeCellSealed(
   sql: SqlLike,
   master: TenantMasterKey,
@@ -197,15 +249,30 @@ export async function storeCellSealed(
   type: string,
   data: Record<string, unknown>,
 ): Promise<CellContents> {
+  // Read the current version for this row (if any). A fresh cell
+  // returns 0 rows; a re-write returns the existing row's stamp.
+  // The DO is single-writer, so this read-then-write window is
+  // atomic with respect to any other operation on the same DO.
+  const existing = sql.exec(`SELECT version FROM cell WHERE id = ?`, id).toArray()
+  const prevVersion = existing.length > 0 && typeof (existing[0] as any).version === 'number'
+    ? (existing[0] as any).version as number
+    : 0
+  const nextVersion = prevVersion + 1
+
   const json = JSON.stringify(data)
-  const address = cellAddressFor(type, id)
+  const address = cellAddressFor(type, id, nextVersion)
   const sealed = await cellSeal(master, address, json)
   const blob = SEALED_CELL_PREFIX + bytesToBase64(sealed)
+  // Persist sealed bytes + new version atomically. INSERT OR REPLACE
+  // is one statement; SQLite commits it as a single row write, so
+  // we cannot end up in a state where the new sealed bytes were
+  // committed but the version bump was not (or vice versa).
   sql.exec(
-    `INSERT OR REPLACE INTO cell (id, type, data) VALUES (?, ?, ?)`,
+    `INSERT OR REPLACE INTO cell (id, type, data, version) VALUES (?, ?, ?, ?)`,
     id,
     type,
     blob,
+    nextVersion,
   )
   return { id, type, data }
 }
@@ -466,7 +533,7 @@ export class EntityDB extends DurableObject {
   > {
     this.ensureInit()
     const rows = this.ctx.storage.sql
-      .exec(`SELECT id, type, data FROM cell`)
+      .exec(`SELECT id, type, data, version FROM cell`)
       .toArray()
     if (rows.length === 0) {
       return { ok: true, rotated: false }
@@ -480,7 +547,14 @@ export class EntityDB extends DurableObject {
     const oldMaster = await deriveTenantMasterKey(args.oldSeed, args.oldSalt)
     const newMaster = await deriveTenantMasterKey(args.newSeed, args.newSalt)
     const sealed = base64ToBytes(dataField.slice(SEALED_CELL_PREFIX.length))
-    const address = cellAddressFor(row.type as string, row.id as string)
+    // The persisted version IS the AAD the sealed bytes were produced
+    // under (#661). Rotation re-seals the recovered plaintext at the
+    // SAME address (same version) but under the new master — the
+    // version field stays put, only the master derivation changes.
+    const persistedVersion = typeof row.version === 'number' && Number.isFinite(row.version)
+      ? row.version
+      : 0
+    const address = cellAddressFor(row.type as string, row.id as string, persistedVersion)
     let newSealed: Uint8Array
     try {
       newSealed = await rotateCell(oldMaster, newMaster, address, sealed)
@@ -493,12 +567,17 @@ export class EntityDB extends DurableObject {
     // Atomic swap: write the new sealed envelope back. The DO's
     // single-writer guarantee means no concurrent put/get on this DO
     // can interleave between the read above and the write below.
+    // The version is preserved — rotation is master-only, not
+    // content-mutating, so bumping the version stamp here would
+    // wrongly invalidate the just-produced sealed bytes against
+    // their own AAD.
     const blob = SEALED_CELL_PREFIX + bytesToBase64(newSealed)
     this.ctx.storage.sql.exec(
-      `INSERT OR REPLACE INTO cell (id, type, data) VALUES (?, ?, ?)`,
+      `INSERT OR REPLACE INTO cell (id, type, data, version) VALUES (?, ?, ?, ?)`,
       row.id,
       row.type,
       blob,
+      persistedVersion,
     )
     // Invalidate the memoised master so subsequent calls re-derive
     // from whichever seed `env` exposes (the orchestrator promotes
