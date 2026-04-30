@@ -4,8 +4,14 @@ import { resolve } from 'path'
 import type { Plugin } from 'vite'
 
 // Handle .wasm imports for Vitest:
-// - For arest_bg.wasm: export the actual file bytes as a Uint8Array so initSync works.
-// - For all other .wasm files: stub with {} (Cloudflare CompiledWasm convention).
+// - For arest_bg.wasm: export a compiled `WebAssembly.Module` so the
+//   sanitizer-rewritten `arest.js` (which does
+//   `new WebAssembly.Instance(wasm_module, ...)`) can load cleanly
+//   under Node. Cloudflare's `CompiledWasm` rule supplies a Module at
+//   runtime; vitest needs to mimic that. The previous Uint8Array
+//   default broke the moment any .test.ts transitively imported
+//   `crates/arest/pkg/arest.js` (#660 wired cell-encryption.ts to it).
+// - For all other .wasm files: stub with {} (CompiledWasm convention).
 function wasmStubPlugin(): Plugin {
   return {
     name: 'wasm-stub',
@@ -14,7 +20,9 @@ function wasmStubPlugin(): Plugin {
       if (id.endsWith('arest_bg.wasm')) {
         const bytes = readFileSync(resolve(id.replace(/\?.*$/, '')))
         const b64 = bytes.toString('base64')
-        return `const bytes = Uint8Array.from(atob(${JSON.stringify(b64)}), c => c.charCodeAt(0)); export default bytes;`
+        return `const bytes = Uint8Array.from(atob(${JSON.stringify(b64)}), c => c.charCodeAt(0));
+const wasmModule = new WebAssembly.Module(bytes);
+export default wasmModule;`
       }
       if (id.endsWith('.wasm')) {
         return 'export default {}'
