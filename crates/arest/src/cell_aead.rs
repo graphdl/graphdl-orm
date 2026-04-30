@@ -191,59 +191,56 @@ impl fmt::Debug for TenantMasterKey {
 /// `install_tenant_master` runs; returning `None` from
 /// `current_tenant_master` after that lets call sites distinguish
 /// "the boot path forgot to install" from "decryption failed".
-static GLOBAL_TENANT_MASTER: spin::Once<TenantMasterKey> = spin::Once::new();
+///
+/// `Mutex<Option<_>>` rather than `Once<_>` so `reset_tenant_master_for_test`
+/// can clear the slot without `unsafe` reference-casting. The read
+/// path takes a brief lock and clones the 32-byte key; that's cheaper
+/// than the AEAD work the caller will then do, so the lock isn't a
+/// hot-path concern. (#665 — replaces the prior `Once`+ptr-write impl
+/// that tripped `invalid_reference_casting`.)
+static GLOBAL_TENANT_MASTER: spin::Mutex<Option<TenantMasterKey>> =
+    spin::Mutex::new(None);
 
-/// Install the process-wide tenant master. Called exactly once during
-/// early boot — any subsequent calls are silently ignored by the
-/// `Once` semantics (the first install wins). Targets that need a
-/// different master across runs MUST be in different processes;
-/// tests instantiating `TenantMasterKey` ad-hoc don't go through this
-/// slot at all.
+/// Install the process-wide tenant master. The first install wins;
+/// subsequent calls are silently ignored to preserve the boot-time-
+/// install-once contract that the prior `spin::Once`-backed impl
+/// established. Targets that need a different master across runs MUST
+/// be in different processes; tests instantiating `TenantMasterKey`
+/// ad-hoc don't go through this slot at all.
 ///
 /// The boot order is: `entropy::install` first (so `csprng` can lazy-
 /// seed), THEN this — the host CLI's `install_or_generate_master` may
 /// call `csprng::random_bytes` to produce the 32 bytes when the master
 /// file is absent, and that path requires an installed entropy source.
 pub fn install_tenant_master(master: TenantMasterKey) {
-    GLOBAL_TENANT_MASTER.call_once(|| master);
+    let mut slot = GLOBAL_TENANT_MASTER.lock();
+    if slot.is_none() {
+        *slot = Some(master);
+    }
 }
 
-/// Borrow the installed tenant master. Returns `None` until
+/// Read the installed tenant master. Returns `None` until
 /// `install_tenant_master` has run (boot bug — surface as a clear
-/// error at the call site rather than panicking). Cheap; no locking
-/// on the read path.
-pub fn current_tenant_master() -> Option<&'static TenantMasterKey> {
-    GLOBAL_TENANT_MASTER.get()
+/// error at the call site rather than panicking). Returns an owned
+/// clone so callers don't hold the slot lock; the 32-byte clone is
+/// negligible against the AEAD work each call site goes on to perform.
+pub fn current_tenant_master() -> Option<TenantMasterKey> {
+    GLOBAL_TENANT_MASTER.lock().clone()
 }
 
-/// Test-only: clear the installed master. The `Once` slot has no
-/// public reset — this resorts to `unsafe` to mutate the static so
-/// host-side tests that install/uninstall across cases work.
-/// Production code MUST NOT call this.
+/// Test-only: clear the installed master so the next test's
+/// `install_tenant_master` call wins the slot.
 ///
 /// Held under the same cross-module test lock as the entropy slot
 /// (`entropy::TEST_LOCK`) so concurrent cases can't observe a torn
-/// state.
+/// state. No `unsafe`, no lint suppression — straightforward Mutex
+/// mutation now that the slot type is `Mutex<Option<_>>`.
 ///
-/// Safety: the `Once` API doesn't expose reset; the only reader is
-/// `current_tenant_master`, which is read-only. Tests that call
-/// this must hold `entropy::TEST_LOCK` to serialize with all other
-/// global-slot mutators in the crate.
+/// Production code MUST NOT call this.
 #[cfg(test)]
 #[allow(dead_code)]
-#[allow(invalid_reference_casting)]
 pub(crate) fn reset_tenant_master_for_test() {
-    // TODO(#663 agent, 2026-04-30, sam@driv.ly via #662): the
-    // const-to-mut pointer cast below trips
-    // `invalid_reference_casting` (a deny-by-default lint as of
-    // recent rustc). Until #663 lands a proper UnsafeCell wrapper,
-    // suppressing the lint here lets the rest of the crate's test
-    // suite compile. Functional behaviour is unchanged.
-    unsafe {
-        let p = &GLOBAL_TENANT_MASTER as *const spin::Once<TenantMasterKey>
-            as *mut spin::Once<TenantMasterKey>;
-        core::ptr::write(p, spin::Once::new());
-    }
+    *GLOBAL_TENANT_MASTER.lock() = None;
 }
 
 // ── Cell address ───────────────────────────────────────────────────
