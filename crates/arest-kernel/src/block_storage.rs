@@ -47,6 +47,7 @@
 use alloc::vec::Vec;
 
 use crate::block::{self, BLOCK_SECTOR_SIZE};
+use arest::cell_aead::{self, CellAddress, TenantMasterKey};
 
 /// Eight-byte magic prefix. Keyed to AREST + kernel (K) + schema
 /// version 1. Distinct from the freeze-byte `AREST\x01` marker so a
@@ -104,6 +105,13 @@ pub enum Error {
     /// whole multiple of `BLOCK_SECTOR_SIZE`. Callers that want
     /// variable-length payloads layer framing on top of the region.
     OutOfRange,
+    /// AEAD seal / open of the on-disk state blob failed (#659).
+    /// `Truncated` here means the sealed envelope on disk was
+    /// shorter than the AEAD overhead; `Auth` means the tag /
+    /// AAD didn't match — most often a stale tenant master key
+    /// after a salt rotation. Callers should refuse to rehydrate
+    /// rather than silently boot from the baked metamodel.
+    Aead(cell_aead::AeadError),
 }
 
 // ── Mount state ────────────────────────────────────────────────────
@@ -351,6 +359,119 @@ pub fn mark_clean_shutdown() -> Result<(), Error> {
     block::write_sector(0, &sector0).map_err(|_| Error::Io)?;
     block::flush().map_err(|_| Error::Io)?;
     Ok(())
+}
+
+// ── Sealed checkpoint (#659) ───────────────────────────────────────
+//
+// `checkpoint(bytes)` above writes plaintext sector by sector. Every
+// serialization boundary outside the engine's in-memory operating
+// set must seal each cell before it leaves, so the kernel
+// persistence path also wraps the whole state blob in an AEAD
+// envelope keyed against a per-tenant master.
+//
+// The freeze layer already seals each cell individually
+// (`arest::freeze::freeze_sealed`), so this layer's outer-envelope
+// AEAD looks like double-encryption — and it is, deliberately:
+//
+//   * Inner (freeze_sealed): each cell sealed against
+//     CellAddress(scope, domain, cell_name, cell_version). Defends
+//     a leaked sector or a torn-write region against per-cell
+//     surface area.
+//   * Outer (checkpoint_sealed): the entire freeze blob sealed as a
+//     single anonymous cell at CellAddress("kernel",
+//     "persistence", "checkpoint", boot_count). Defends the layout
+//     metadata (number of cells, cell-name strings, sealed-cell
+//     lengths) — all of which freeze_sealed leaves in plaintext as
+//     routing keys.
+//
+// Cost is one extra HKDF derivation + one ChaCha20-Poly1305 pass
+// over the whole blob per checkpoint (~tens of KB/s on a software
+// implementation), and 28 bytes of envelope overhead. The on-disk
+// CRC + magic stay over the *sealed* bytes — wire-level corruption
+// detection happens before AEAD open, the AEAD path defends only
+// against a bit-perfect read of unauthorised data.
+//
+// Callers that want plaintext checkpoints (boot-image bake, FPGA
+// ROM image, in-process snapshot debugging) keep using `checkpoint`
+// / `last_state`; encryption-required paths (the production boot
+// loop, every host that mounts persistent storage) should reach for
+// `checkpoint_sealed` / `last_state_sealed_open`.
+
+/// AAD/salt domain string for the kernel persistence checkpoint —
+/// scopes the outer AEAD envelope to this exact use site so a
+/// future "cluster replication" or "cold-start migration" wrapper
+/// over the same master can't open a checkpoint envelope by accident.
+pub const CHECKPOINT_SCOPE: &str = "kernel";
+
+/// Sub-domain for the persistence layer specifically. Pairs with
+/// `CHECKPOINT_SCOPE` to form the outer-envelope cell address.
+pub const CHECKPOINT_DOMAIN: &str = "persistence";
+
+/// Cell name for the single anonymous checkpoint cell. Constant
+/// because there's only ever one of these on disk per slot — multi-
+/// slot checkpoint follow-ups (#666 and friends) would extend this
+/// with a slot id.
+pub const CHECKPOINT_CELL: &str = "checkpoint";
+
+/// Persist `state` as the current checkpoint, sealing the whole
+/// blob against `master` first. The version field of the address
+/// is the previous boot count (so each checkpoint binds to the boot
+/// it was minted under) — a kernel that rolls back through a
+/// reboot will read the right version off the header before
+/// re-deriving the per-cell key.
+///
+/// Same `Error::StateTooLarge` budget as `checkpoint` minus the
+/// AEAD overhead. `Error::Aead` is reserved for the sister
+/// `last_state_sealed_open` path; the seal direction never fails
+/// for finite inputs (the underlying RustCrypto encrypt is
+/// infallible).
+pub fn checkpoint_sealed(state: &[u8], master: &TenantMasterKey) -> Result<(), Error> {
+    let prev_boot = last_boot_count();
+    let address = CellAddress::new(
+        CHECKPOINT_SCOPE,
+        CHECKPOINT_DOMAIN,
+        CHECKPOINT_CELL,
+        prev_boot,
+    );
+    let sealed = cell_aead::cell_seal(master, &address, state);
+    checkpoint(&sealed)
+}
+
+/// Recover and AEAD-open the last sealed checkpoint. Returns `Ok(None)`
+/// when there's nothing to rehydrate (fresh disk, no device,
+/// corrupted header — same shape as `last_state`); returns
+/// `Err(Error::Aead(_))` when the on-disk envelope is structurally
+/// fine but the AEAD tag / AAD doesn't match the master.
+///
+/// The address `version` is the boot counter recorded in the
+/// header, NOT the live `last_boot_count` (which is one greater
+/// after a successful boot). Without this, a kernel that rebooted
+/// between the seal and the open would derive a different per-cell
+/// key and fail Auth on its own checkpoint.
+pub fn last_state_sealed_open(master: &TenantMasterKey) -> Result<Option<Vec<u8>>, Error> {
+    let sealed = match last_state() {
+        Some(bytes) => bytes,
+        None => return Ok(None),
+    };
+    // The sealed-envelope's address binds to the *previous* boot
+    // count — not the current one. The mount step already loaded
+    // the on-disk header (which carries the `boot_count` value
+    // committed by the previous session); reuse that here so the
+    // rehydration AAD matches what the seal step wrote.
+    let prev_boot = MOUNT
+        .lock()
+        .as_ref()
+        .map(|m| m.header.boot_count)
+        .unwrap_or(0);
+    let address = CellAddress::new(
+        CHECKPOINT_SCOPE,
+        CHECKPOINT_DOMAIN,
+        CHECKPOINT_CELL,
+        prev_boot,
+    );
+    cell_aead::cell_open(master, &address, &sealed)
+        .map(Some)
+        .map_err(Error::Aead)
 }
 
 // ── Reserved sub-regions ───────────────────────────────────────────
