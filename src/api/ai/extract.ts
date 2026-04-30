@@ -80,6 +80,15 @@ export interface AgentVerbState {
   Verb_invokes_Agent_Definition?: ReadonlyArray<Record<string, string>>
   Agent_Definition_uses_Model?: ReadonlyArray<Record<string, string>>
   Agent_Definition_has_Prompt?: ReadonlyArray<Record<string, string>>
+  /**
+   * Introspection-only cells (#641 / Worker-AI-4). Not consulted by
+   * `resolveAgentVerb` — present so dashboards / `/explain` endpoints
+   * can surface human-readable Agent Definition metadata, and so the
+   * seed shape mirrors the full `readings/templates/agents.md`
+   * footprint the kernel populates via `system::init`.
+   */
+  Agent_Definition_has_Name?: ReadonlyArray<Record<string, string>>
+  Agent_Definition_belongs_to_Domain?: ReadonlyArray<Record<string, string>>
 }
 
 export interface AgentBinding {
