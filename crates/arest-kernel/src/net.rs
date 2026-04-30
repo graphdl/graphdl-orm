@@ -34,27 +34,46 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpo
 use spin::Mutex;
 
 // `file_serve` / `file_upload` reach into `crate::block_storage`, which
-// is `cfg(target_arch = "x86_64")`-gated (see main.rs L186-L197). The
-// aarch64 + armv7 UEFI arms can compile `net` end-to-end without those
-// helpers — `drive_http` simply skips the file_* intercept arms and
-// falls straight through to the registered `Handler` chain. The cfg
-// guards on the `try_serve` call sites in `drive_http` mirror this.
-#[cfg(target_arch = "x86_64")]
+// is `cfg(all(target_os = "uefi", target_arch = "x86_64"))`-gated (see
+// lib.rs / main.rs L186-L197). The aarch64 + armv7 UEFI arms can
+// compile `net` end-to-end without those helpers — `drive_http`
+// simply skips the file_* intercept arms and falls straight through
+// to the registered `Handler` chain. The cfg guards on the `try_serve`
+// call sites in `drive_http` mirror this. Host targets
+// (x86_64-pc-windows-msvc / x86_64-unknown-linux-gnu, used by
+// `cargo test --lib`) also miss the modules — the `target_os = "uefi"`
+// half of the gate guards them.
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 use crate::file_serve::{self, ServeOutcome};
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 use crate::file_upload::{self, ServeOutcome as UploadOutcome};
 use crate::http;
 
-// `VirtioPhy` source is arch-specific. On x86_64 we wrap the PCI-
-// transport `crate::virtio::VirtioPhy` (BIOS + UEFI). On aarch64 +
-// armv7 UEFI we wrap the MMIO-transport `crate::virtio_mmio::VirtioPhy`
-// (#449's parallel adapter). The `KernelDevice::Virtio` arm threads
-// through whichever flavour the cfg picks, so the rest of `net` is
+// `VirtioPhy` source is arch-specific. On UEFI x86_64 we wrap the PCI-
+// transport `crate::virtio::VirtioPhy`. On UEFI aarch64 + armv7 we
+// wrap the MMIO-transport `crate::virtio_mmio::VirtioPhy` (#449's
+// parallel adapter). The `KernelDevice::Virtio` arm threads through
+// whichever flavour the cfg picks, so the rest of `net` is
 // transport-agnostic.
-#[cfg(target_arch = "x86_64")]
+//
+// Host targets (cargo test --lib on Windows / Linux) get a host stub
+// at the bottom of this module so `Option<VirtioPhy>` keeps a valid
+// type for the loopback-only `init` path the inline UDP tests
+// exercise. The stub is uninhabited; no instances ever exist, so the
+// `KernelDevice::Virtio` variant (cfg-gated to UEFI only) is
+// unreachable through the host code path.
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 use crate::virtio::VirtioPhy;
 #[cfg(all(target_os = "uefi", any(target_arch = "aarch64", target_arch = "arm")))]
 use crate::virtio_mmio::VirtioPhy;
+
+/// Host-target stub. `Option<VirtioPhy>` is the parameter type for
+/// `init`, which the inline UDP / loopback tests call as `init(None)`
+/// — the loopback path doesn't need a real NIC. Keeping the type
+/// uninhabited (`enum {}`) means `Some(_)` is unreachable, so the
+/// `KernelDevice::Virtio` arm being elided on host builds is sound.
+#[cfg(not(target_os = "uefi"))]
+pub enum VirtioPhy {}
 
 /// Monotonic timestamp for smoltcp's scheduler.
 ///
@@ -105,6 +124,11 @@ pub enum KernelDevice {
     Loopback(Loopback),
     /// Real NIC — packets cross PCI into QEMU's user-mode NAT and
     /// on to the host via `-hostfwd=tcp::8080-:80` (#267).
+    /// UEFI-only: host targets (`cargo test --lib`) reach
+    /// `KernelDevice` only through the loopback path, so the variant
+    /// is elided to keep the host build free of phy-related types
+    /// that have no analogue under the host operating system.
+    #[cfg(target_os = "uefi")]
     Virtio(VirtioPhy),
 }
 
@@ -113,7 +137,7 @@ pub enum KernelDevice {
 /// inner smoltcp-native token.
 pub enum KernelRxToken<'a> {
     Loopback(<Loopback as Device>::RxToken<'a>),
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
     Virtio(crate::virtio::VirtioRxToken<'a>),
     #[cfg(all(target_os = "uefi", any(target_arch = "aarch64", target_arch = "arm")))]
     Virtio(crate::virtio_mmio::VirtioRxToken<'a>),
@@ -121,7 +145,7 @@ pub enum KernelRxToken<'a> {
 
 pub enum KernelTxToken<'a> {
     Loopback(<Loopback as Device>::TxToken<'a>),
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
     Virtio(crate::virtio::VirtioTxToken<'a>),
     #[cfg(all(target_os = "uefi", any(target_arch = "aarch64", target_arch = "arm")))]
     Virtio(crate::virtio_mmio::VirtioTxToken<'a>),
@@ -134,6 +158,7 @@ impl<'a> phy::RxToken for KernelRxToken<'a> {
     {
         match self {
             KernelRxToken::Loopback(t) => t.consume(f),
+            #[cfg(target_os = "uefi")]
             KernelRxToken::Virtio(t) => t.consume(f),
         }
     }
@@ -146,6 +171,7 @@ impl<'a> phy::TxToken for KernelTxToken<'a> {
     {
         match self {
             KernelTxToken::Loopback(t) => t.consume(len, f),
+            #[cfg(target_os = "uefi")]
             KernelTxToken::Virtio(t) => t.consume(len, f),
         }
     }
@@ -160,6 +186,7 @@ impl Device for KernelDevice {
             KernelDevice::Loopback(d) => d
                 .receive(ts)
                 .map(|(r, t)| (KernelRxToken::Loopback(r), KernelTxToken::Loopback(t))),
+            #[cfg(target_os = "uefi")]
             KernelDevice::Virtio(d) => d
                 .receive(ts)
                 .map(|(r, t)| (KernelRxToken::Virtio(r), KernelTxToken::Virtio(t))),
@@ -169,6 +196,7 @@ impl Device for KernelDevice {
     fn transmit(&mut self, ts: Instant) -> Option<Self::TxToken<'_>> {
         match self {
             KernelDevice::Loopback(d) => d.transmit(ts).map(KernelTxToken::Loopback),
+            #[cfg(target_os = "uefi")]
             KernelDevice::Virtio(d) => d.transmit(ts).map(KernelTxToken::Virtio),
         }
     }
@@ -176,6 +204,7 @@ impl Device for KernelDevice {
     fn capabilities(&self) -> DeviceCapabilities {
         match self {
             KernelDevice::Loopback(d) => d.capabilities(),
+            #[cfg(target_os = "uefi")]
             KernelDevice::Virtio(d) => d.capabilities(),
         }
     }
@@ -244,10 +273,15 @@ pub struct DhcpLease {
 /// has probed PCI.
 pub fn init(virtio: Option<VirtioPhy>) {
     let (mut device, mac) = match virtio {
+        #[cfg(target_os = "uefi")]
         Some(phy) => {
             let mac = phy.mac_address();
             (KernelDevice::Virtio(phy), mac)
         }
+        // Host build (cargo test --lib): `VirtioPhy` is uninhabited so
+        // `Some(_)` is unreachable and Rust accepts the empty match.
+        #[cfg(not(target_os = "uefi"))]
+        Some(phy) => match phy {},
         None => {
             // Loopback needs a fake MAC — smoltcp only uses it to frame
             // Ethernet headers internally, and nothing on the wire cares.
@@ -620,7 +654,7 @@ static HTTP_LAST_STATE: Mutex<Option<smoltcp::socket::tcp::State>> = Mutex::new(
 /// shrinks to a direct handler call. Generic routes (`/api/*`, the
 /// HATEOAS site, the SPA fallback) reach the `Handler` chain on every
 /// arch.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn dispatch_request(
     req: &http::Request,
     rx_buf: &[u8],
@@ -684,7 +718,7 @@ fn dispatch_request(
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(all(target_os = "uefi", target_arch = "x86_64")))]
 fn dispatch_request(
     req: &http::Request,
     _rx_buf: &[u8],

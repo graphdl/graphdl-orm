@@ -79,6 +79,23 @@ pub fn _print(_args: core::fmt::Arguments<'_>) {
     // (e.g. `syscall::write`'s production sink) compiles cleanly.
 }
 
+/// Host-target `halt_forever` stub. Mirrors the per-arch UEFI arms'
+/// divergent functions but with no firmware-specific instruction
+/// (`hlt` / `wfi` / port writes are all bare-metal-only). Reached
+/// only from `syscall::exit::handle` on the host build, where it
+/// satisfies the `-> !` return type required by Linux ABI's
+/// SYS_EXIT / SYS_EXIT_GROUP. Tests that exercise the exit path
+/// observe the side-effect (`mark_exited`) ahead of the dive into
+/// this loop and never enter it; the loop is only here so production
+/// code (a hypothetical host-runner that actually invokes a process
+/// to completion) terminates cleanly without UB.
+#[cfg(not(target_os = "uefi"))]
+pub fn halt_forever() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 /// Crate-wide `print!`. Routes to `$crate::arch::_print`, which is
 /// supplied by the active arch arm above.
 #[macro_export]
