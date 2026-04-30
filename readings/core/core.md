@@ -222,15 +222,6 @@ Frequency Constraint has Max Occurrence.
 ### Constraint Span (objectification of "Constraint spans Role")
 Constraint Span autofills from superset.
 
-### Event Type
-Event Type has Name.
-  Each Event Type has exactly one Name.
-  It is possible that more than one Event Type has the same Name.
-Event Type publishes to Stream.
-  For each Stream, exactly one Event Type publishes to that Stream.
-  It is possible that some Event Type publishes to more than one Stream.
-Event Type can be created by Verb.
-
 ### Stream
 Stream has Name.
   Each Stream has exactly one Name.

@@ -6,7 +6,6 @@ Resource(.Reference) is an entity type.
 Fact is an entity type.
   Fact is a subtype of Resource.
 State Machine(.id) is an entity type.
-Event(.id) is an entity type.
 Guard Run(.Name) is an entity type.
 Citation(.id) is an entity type.
 
@@ -82,26 +81,15 @@ State Machine is for Resource. *
 Resource is currently in Status.
   Each Resource is currently in at most one Status.
 
-### Event
-Event(.id) is an entity type.
-Event is for Resource.
-  Each Event is for exactly one Resource.
-Event is of Event Type.
-  Each Event is of exactly one Event Type.
-Event occurred at Timestamp.
-  Each Event occurred at exactly one Timestamp.
-Event has Data.
-  Each Event has at most one Data.
-
-### Event Triggered Transition (objectification of "Event triggered Transition for Resource")
-Event triggered Transition for Resource.
-  In each population of Event triggered Transition for Resource, each Event, Transition, Resource combination occurs at most once.
-  This association with Event, Transition, Resource provides the preferred identification scheme for Event Triggered Transition.
+### Fact Triggered Transition (objectification of "Fact triggered Transition for Resource")
+Fact triggered Transition for Resource.
+  In each population of Fact triggered Transition for Resource, each Fact, Transition, Resource combination occurs at most once.
+  This association with Fact, Transition, Resource provides the preferred identification scheme for Fact Triggered Transition.
 
 ## Subset Constraints
 
-If some Event triggered some Transition for some Resource then that Event is of some Event Type
-  where that Transition is triggered by that Event Type.
+If some Fact triggered some Transition for some Resource then that Fact is of some Fact Type
+  where that Transition is triggered by that Fact Type.
 
 ### Guard Run
 Guard Run is for Guard.

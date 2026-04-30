@@ -7,7 +7,6 @@ State Machine Definition is a subtype of Status.
 Transition(.id) is an entity type.
 Guard(.Name) is an entity type.
 
-Event Type(.id) is an entity type.
 Stream(.id) is an entity type.
 
 ## Readings
@@ -29,14 +28,10 @@ Transition is from Status.
   Each Transition is from exactly one Status.
 Transition is to Status.
   Each Transition is to exactly one Status.
-Transition is triggered by Event Type.
-  Each Transition is triggered by exactly one Event Type.
+Transition is triggered by Fact Type.
+  Each Transition is triggered by exactly one Fact Type.
 Verb is performed during Transition.
   Each Verb is performed during at most one Transition.
-
-### Event Type
-Event Type has Pattern.
-  Each Event Type has at most one Pattern.
 
 ### Status
 Status is initial in State Machine Definition.
