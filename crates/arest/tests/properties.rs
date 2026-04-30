@@ -2326,15 +2326,15 @@ Order has Reason.
 #[test]
 fn bundled_metamodel_passes_validate_model() {
     let readings: Vec<(&str, &str)> = vec![
-        ("core", include_str!("../../../readings/core.md")),
-        ("state", include_str!("../../../readings/state.md")),
-        ("instances", include_str!("../../../readings/instances.md")),
-        ("outcomes", include_str!("../../../readings/outcomes.md")),
-        ("validation", include_str!("../../../readings/validation.md")),
-        ("evolution", include_str!("../../../readings/evolution.md")),
-        ("organizations", include_str!("../../../readings/organizations.md")),
-        ("agents", include_str!("../../../readings/agents.md")),
-        ("ui", include_str!("../../../readings/ui.md")),
+        ("core", include_str!("../../../readings/core/core.md")),
+        ("state", include_str!("../../../readings/core/state.md")),
+        ("instances", include_str!("../../../readings/core/instances.md")),
+        ("outcomes", include_str!("../../../readings/core/outcomes.md")),
+        ("validation", include_str!("../../../readings/core/validation.md")),
+        ("evolution", include_str!("../../../readings/core/evolution.md")),
+        ("organizations", include_str!("../../../readings/templates/organizations.md")),
+        ("agents", include_str!("../../../readings/templates/agents.md")),
+        ("ui", include_str!("../../../readings/ui/ui.md")),
     ];
     // Use parse_markdown per file, then merge the resulting states
     // (ast::merge_states) so validate_model sees a single combined
@@ -2361,7 +2361,7 @@ fn bundled_metamodel_passes_validate_model() {
 /// away from what #288 will wire up in check.rs.
 #[test]
 fn antecedent_clause_has_shape_constraint_declared_in_core_md() {
-    let core_src = include_str!("../../../readings/core.md");
+    let core_src = include_str!("../../../readings/core/core.md");
     let state = arest::parse_forml2::parse_to_state(core_src)
         .expect("core.md parses");
 
@@ -2408,7 +2408,7 @@ fn antecedent_clause_has_shape_constraint_declared_in_core_md() {
 /// failure instead of quietly rotting.
 #[test]
 fn implicit_derivations_landed_as_rules_in_core_md() {
-    let core_src = include_str!("../../../readings/core.md");
+    let core_src = include_str!("../../../readings/core/core.md");
     let state = arest::parse_forml2::parse_to_state(core_src)
         .expect("core.md parses");
 
@@ -2442,7 +2442,7 @@ fn implicit_derivations_landed_as_rules_in_core_md() {
 /// drive them at runtime through Theorem 4's violation path.
 #[test]
 fn ring_validity_and_completeness_obligations_declared_in_core_md() {
-    let core_src = include_str!("../../../readings/core.md");
+    let core_src = include_str!("../../../readings/core/core.md");
     let state = arest::parse_forml2::parse_to_state(core_src)
         .expect("core.md parses");
 
@@ -2476,7 +2476,7 @@ fn ring_validity_and_completeness_obligations_declared_in_core_md() {
 /// #349 / #350 / #351 which depend on these declarations.
 #[test]
 fn migration_entity_type_and_obligation_declared_in_core_md() {
-    let core_src = include_str!("../../../readings/core.md");
+    let core_src = include_str!("../../../readings/core/core.md");
     let state = arest::parse_forml2::parse_to_state(core_src)
         .expect("core.md parses");
 
@@ -2520,7 +2520,7 @@ fn migration_entity_type_and_obligation_declared_in_core_md() {
 /// stable to fire into.
 #[test]
 fn migration_application_entity_declared_in_core_md() {
-    let core_src = include_str!("../../../readings/core.md");
+    let core_src = include_str!("../../../readings/core/core.md");
     let state = arest::parse_forml2::parse_to_state(core_src)
         .expect("core.md parses");
 
@@ -2560,7 +2560,7 @@ fn migration_application_entity_declared_in_core_md() {
 /// visible_population projection in #350 reads to filter.
 #[test]
 fn migration_firing_emits_migration_application_per_source_fact() {
-    let core_src = include_str!("../../../readings/core.md");
+    let core_src = include_str!("../../../readings/core/core.md");
     let mut state = arest::parse_forml2::parse_to_state(core_src).expect("core.md parses");
 
     // User schema: Widget with two same-shape FTs (legacy + modern).
@@ -2687,7 +2687,7 @@ fn visible_population_hides_facts_referenced_by_migration_application() {
 /// rewrite.
 #[test]
 fn list_noun_reads_through_visible_population() {
-    let core_src = include_str!("../../../readings/core.md");
+    let core_src = include_str!("../../../readings/core/core.md");
     let mut state = arest::parse_forml2::parse_to_state(core_src).unwrap();
     let user = r#"Widget(.id) is an entity type.
 Legacy Name is a value type.
@@ -2763,7 +2763,7 @@ Widget has Modern Name."#;
 ///     order is a total order.
 #[test]
 fn migration_application_ordering_obligations_declared_in_core_md() {
-    let core_src = include_str!("../../../readings/core.md");
+    let core_src = include_str!("../../../readings/core/core.md");
     let state = arest::parse_forml2::parse_to_state(core_src).expect("core.md parses");
 
     let constraints = ast::fetch_or_phi("Constraint", &state);
@@ -3255,9 +3255,9 @@ Noun 'Stripe Customer' has URI '/customers'.
 ///   under OWA as the origin (e.g. Stripe, auto.dev).
 #[test]
 fn authority_type_enum_carries_runtime_function_and_federated_fetch() {
-    let instances = include_str!("../../../readings/instances.md");
+    let instances = include_str!("../../../readings/core/instances.md");
     let enum_line = instances.lines()
-        .find(|l| l.contains("possible values of Authority Type"))
+        .find(|l: &&str| l.contains("possible values of Authority Type"))
         .expect("Authority Type enum declaration should exist in instances.md");
     assert!(enum_line.contains("'Runtime-Function'"),
         "Authority Type enum should declare 'Runtime-Function'; line: {enum_line}");

@@ -56,9 +56,9 @@ Noun 'User' has URI '/users'.
 /// pipeline that is noisier to set up for a two-string assertion.
 #[test]
 fn authority_type_enum_includes_runtime_function_and_federated_fetch() {
-    let instances = include_str!("../../../readings/instances.md");
+    let instances = include_str!("../../../readings/core/instances.md");
     let enum_line = instances.lines()
-        .find(|l| l.contains("possible values of Authority Type"))
+        .find(|l: &&str| l.contains("possible values of Authority Type"))
         .expect("Authority Type enum declaration should exist in instances.md");
     assert!(enum_line.contains("'Runtime-Function'"),
         "Authority Type enum should declare 'Runtime-Function'; line: {enum_line}");
