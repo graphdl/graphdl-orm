@@ -11,6 +11,7 @@ import { handleArestRequest, handleArestReadFallback } from './arest-router'
 import { handleMcpRequest } from '../mcp/remote'
 import { dispatchVerb, UNIFIED_VERBS } from './verb-dispatcher'
 import { aiComplete } from './ai/complete'
+import { handleExtract } from './ai/extract'
 
 // ── Collection slug → noun type resolution ───────────────────────────
 // Resolved dynamically from the Registry via nounToSlug convention.
@@ -1206,7 +1207,6 @@ router.post('/api/ai/complete', async (request: Request, env: Env) => {
 // Thin POST proxies that delegate through dispatchVerb so CLI, local
 // MCP (stdio), and HTTP clients share the same input/output contract.
 //   /arest/chat    → dispatchVerb('query', body)  — natural-language query
-//   /arest/extract → dispatchVerb('compile', body) — readings → compiled state
 router.post('/arest/chat', async (request: Request) => {
   let body: Record<string, unknown>
   try { body = (await request.json()) as Record<string, unknown> } catch { body = {} }
@@ -1218,15 +1218,26 @@ router.post('/arest/chat', async (request: Request) => {
   }
 })
 
-router.post('/arest/extract', async (request: Request) => {
-  let body: Record<string, unknown>
-  try { body = (await request.json()) as Record<string, unknown> } catch { body = {} }
-  try {
-    const result = await dispatchVerb('compile', body)
-    return json(result)
-  } catch (e) {
-    return error(400, e instanceof Error ? e.message : String(e))
-  }
+// ── /arest/extract (#639 / Worker-AI-2) ──────────────────────────────
+// Migrated from the dispatchVerb('compile', body) placeholder (#619
+// spike) to the real LLM extract pipeline:
+//
+//   1. Resolve the Agent Definition for verb "extract" via the four-
+//      cell walker `resolveAgentVerb` (TS port of
+//      `arest::agent::resolve_agent_verb`).
+//   2. Render the prompt template with body as input.
+//   3. Call `aiComplete(rendered_prompt, { env, model: binding.modelCode })`.
+//   4. Parse the LLM output as JSON; on parse failure surface `_raw`.
+//
+// 503 envelope shape mirrors the kernel-side #620 path so HATEOAS-aware
+// clients can branch on a single envelope schema across both targets.
+// Until #641 seeds the Agent Definition into worker boot state, every
+// real request returns 503 — that's expected; the contract is correct.
+router.post('/arest/extract', async (request: Request, env: Env) => {
+  return handleExtract(request, {
+    AI_GATEWAY_URL: env.AI_GATEWAY_URL ?? '',
+    AI_GATEWAY_TOKEN: env.AI_GATEWAY_TOKEN ?? '',
+  })
 })
 
 // ── #205: List all known domains from the global registry ────────────
