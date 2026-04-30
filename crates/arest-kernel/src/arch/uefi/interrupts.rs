@@ -225,7 +225,7 @@ pub fn pic_init() {
     unsafe {
         let mut pics = PICS.lock();
         pics.initialize();
-        // PIC1 mask byte:
+        // PIC1 mask byte (bit set = MASKED, bit clear = unmasked):
         //   `feature = "repl"` ON  → 0xFC = 1111_1100 — unmask IRQ 0
         //                            (timer) AND IRQ 1 (keyboard).
         //                            Bit 0 = 0 → IRQ 0 enabled; bit 1
@@ -234,19 +234,29 @@ pub fn pic_init() {
         //                            `arch::x86_64::interrupts::init_pic`)
         //                            so the keyboard wakes the same
         //                            way on both boot paths.
-        //   `feature = "repl"` OFF → 0xFD = 1111_1101 — IRQ 0 only.
+        //   `feature = "repl"` OFF → 0xFE = 1111_1110 — IRQ 0 only.
+        //                            Bit 0 = 0 → IRQ 0 (timer) enabled;
+        //                            bit 1 = 1 → IRQ 1 (keyboard) MASKED.
         //                            Keyboard line stays masked since
         //                            no consumer would drain the ring;
         //                            also keeps vector 33 from firing
         //                            into an unpopulated IDT slot
         //                            (`init_interrupts` only installs
         //                            `keyboard_handler` under the same
-        //                            gate, see #628).
+        //                            gate, see #628). #655 fixed the
+        //                            byte (was 0xFD = mask IRQ 0,
+        //                            unmask IRQ 1 — the inverse): on
+        //                            `--no-default-features --features
+        //                            server` builds the PIT timer line
+        //                            stayed masked, `arch::time::now_ms`
+        //                            never advanced, and smoltcp's
+        //                            DHCPv4 retry / TCP retransmit
+        //                            timers were frozen at t=0 forever.
         // 0xFF on PIC2 — keep RTC/mouse/etc all masked.
         #[cfg(feature = "repl")]
         let pic1_mask: u8 = 0xFC;
         #[cfg(not(feature = "repl"))]
-        let pic1_mask: u8 = 0xFD;
+        let pic1_mask: u8 = 0xFE;
         pics.write_masks(pic1_mask, 0xFF);
     }
 }

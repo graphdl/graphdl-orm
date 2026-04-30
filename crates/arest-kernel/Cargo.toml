@@ -194,6 +194,30 @@ busybox = []
 # `--no-default-features --features mini`, both are pulled (mini
 # pulls in slint by composition; see the `mini` feature below).
 server = []
+# static-ip (#655). Hardcodes QEMU SLiRP's well-known guest IP
+# (10.0.2.15/24, gateway 10.0.2.2) on the smoltcp interface at
+# `net::init` time, skipping the DHCPv4 negotiation entirely. SLiRP
+# would hand out the same address with a 24-hour lease anyway, so
+# behaviourally this is identical to DHCP-completed for any TCP /
+# UDP socket the guest binds — just deterministic and instant.
+#
+# Why ship this as an opt-in alongside the dynamic DHCP path:
+# DHCPv4 settle on the lean server profile (`--no-default-features
+# --features server`) intermittently misses the smoke window's
+# host-curl probe — root cause not fully diagnosed in #655 (PIT-
+# backed clock + PIC unmask of IRQ 0 both fixed; the residual
+# ~minute settle time is likely a virtio-net rx-pump cadence
+# issue or a smoltcp DHCPv4 retry interaction with frozen-then-
+# unfrozen monotonic time). Until the dynamic path is solid the
+# smoke profile composes `static-ip` + `server` so the host can
+# reach :8080 deterministically.
+#
+# OFF on every other profile so the dynamic DHCP path is exercised
+# in production-like configurations (real laptop / Pi 4 / etc.).
+# Composes additively with `server` (the smoke harness picks both)
+# and is a no-op on the loopback fallback (which already gets
+# 127.0.0.1/8 statically).
+static-ip = []
 # slint (#627 Profile-3). Gates the Slint UI toolkit dep + its
 # host-side `slint-build` compiler. When OFF: build.rs skips the
 # `.slint` compile pass; `arch::uefi::slint_backend`,
