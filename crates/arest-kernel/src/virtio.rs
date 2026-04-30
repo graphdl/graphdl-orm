@@ -418,6 +418,11 @@ impl<'a> phy::RxToken for VirtioRxToken<'a> {
     }
 }
 
+/// #657 diagnostic — running tally of tx packets actually framed by
+/// `VirtioTxToken::consume` (which only runs when smoltcp had bytes
+/// to send). Logged on the same `RX_LOG_AT` thresholds.
+static VIRTIO_TX_COUNT: spin::Mutex<u64> = spin::Mutex::new(0);
+
 impl<'a> phy::TxToken for VirtioTxToken<'a> {
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
@@ -428,13 +433,32 @@ impl<'a> phy::TxToken for VirtioTxToken<'a> {
         let nic = unsafe { &mut *self.nic };
         let mut tx_buf: TxBuffer = nic.new_tx_buffer(len);
         let result = f(tx_buf.packet_mut());
+        let send_outcome = nic.send(tx_buf);
+        {
+            let mut n = VIRTIO_TX_COUNT.lock();
+            *n += 1;
+            if VIRTIO_RX_LOG_AT.contains(&*n) {
+                crate::println!(
+                    "virtio-net: tx #{} ({} bytes, send_ok={})",
+                    *n, len, send_outcome.is_ok(),
+                );
+            }
+        }
         // If send fails the packet just gets dropped — smoltcp
         // retransmits via its TCP stack; there's no in-band way
         // to report a NIC error back through TxToken.
-        let _ = nic.send(tx_buf);
+        let _ = send_outcome;
         result
     }
 }
+
+/// #657 diagnostic — running tally of rx packets handed to smoltcp by
+/// `VirtioPhy::receive`. Logged every time it crosses one of the
+/// thresholds in `RX_LOG_AT` so the smoke log shows packet activity
+/// without flooding the COM1 serial across the millions-of-polls of
+/// the `loop { net::poll(); pause }` drainer.
+static VIRTIO_RX_COUNT: spin::Mutex<u64> = spin::Mutex::new(0);
+const VIRTIO_RX_LOG_AT: &[u64] = &[1, 2, 3, 5, 10, 25, 50, 100, 250, 500, 1000];
 
 impl phy::Device for VirtioPhy {
     type RxToken<'a> = VirtioRxToken<'a>;
@@ -445,6 +469,17 @@ impl phy::Device for VirtioPhy {
             return None;
         }
         let buf = self.nic.receive().ok()?;
+        {
+            let mut n = VIRTIO_RX_COUNT.lock();
+            *n += 1;
+            if VIRTIO_RX_LOG_AT.contains(&*n) {
+                crate::println!(
+                    "virtio-net: rx #{} ({} bytes)",
+                    *n,
+                    buf.packet().len(),
+                );
+            }
+        }
         let nic_ptr: *mut VirtIONetDevice = &mut self.nic;
         let rx = VirtioRxToken {
             nic: nic_ptr,
