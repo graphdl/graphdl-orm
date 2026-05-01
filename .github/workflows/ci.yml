@@ -72,6 +72,13 @@ jobs:
         shell: pwsh
         run: ./scripts/test-all.ps1
 
-      # scripts/check-all-targets.ps1 not yet committed (tracked by #668).
-      # When it lands, add a step here that runs it under pwsh and gates
-      # on its exit code.
+      # Cross-target compile sweep. Catches the silent-aarch64-break
+      # failure mode that bit #441/#452/#654 — surfaces target-specific
+      # type/feature regressions that test-all.ps1's host-only run
+      # misses. continue-on-error: true while the aarch64 lang-item
+      # break (filed as #677) is being chased; flip back to gating once
+      # that lands.
+      - name: Run check-all-targets.ps1
+        shell: pwsh
+        run: ./scripts/check-all-targets.ps1
+        continue-on-error: true
