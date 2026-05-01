@@ -240,11 +240,28 @@ export function evaluate(handle: number, text: string, population: string): any 
 }
 
 /** Get available transitions for a noun in a given status.
- *  Returns array of { from, to, event } parsed from display notation.
- *  Terminal status returns empty array (φ). */
+ *  Returns array of { from, to, event }. The WASM def emits a JSON
+ *  array of `[from, to, event]` triples (was display notation in
+ *  earlier builds — the legacy `<f,t,e>` parser is kept as a fallback
+ *  in case a stale wasm is loaded). Terminal status returns []. */
 export function transitions(handle: number, noun: string, status: string): Array<{ from: string; to: string; event: string }> {
   const raw = system(handle, `transitions:${noun}`, status)
-  if (raw === 'φ' || raw === '⊥') return []
+  if (raw === 'φ' || raw === '⊥' || raw === 'null') return []
+  // JSON-first: `[[from, to, event], ...]`.
+  const trimmed = raw.trim()
+  if (trimmed.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(trimmed)
+      if (Array.isArray(parsed)) {
+        return parsed
+          .filter((t: unknown): t is unknown[] => Array.isArray(t) && t.length >= 3)
+          .map((t: unknown[]) => ({ from: String(t[0]), to: String(t[1]), event: String(t[2]) }))
+      }
+    } catch {
+      // fall through to legacy parser
+    }
+  }
+  // Legacy display notation `<from, to, event>`.
   const matches = [...raw.matchAll(/<([^<>,]+),\s*([^<>,]+),\s*([^<>,]+)>/g)]
   return matches.map(m => ({ from: m[1].trim(), to: m[2].trim(), event: m[3].trim() }))
 }
