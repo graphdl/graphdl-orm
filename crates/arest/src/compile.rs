@@ -4668,6 +4668,30 @@ fn compile_forbidden_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     // response_text = Selector(1) : ctx
     let response = Func::Selector(1);
 
+    // Population path (#681). Spans set, no enum values, no response-text
+    // gating: this is the multi-clause / single-clause "It is forbidden
+    // that some <fact pattern> ..." family that bites on the population
+    // rather than on a free-text response. Emit one violation per fact
+    // present in any of the spanned trigger fact types.
+    //
+    // The CWA-enum and OWA-keyword paths below stay for response-text
+    // checking (where Selector(1) is a non-empty string). They never
+    // fire on population validation because the eval context's text is
+    // empty, which is exactly the bug the population path closes.
+    if forbidden_values.is_empty() && !is_response_constraint && !def.spans.is_empty() {
+        let ft_ids: Vec<String> = def.spans.iter()
+            .map(|s| s.fact_type_id.clone())
+            .collect();
+        let facts = extract_facts_multi(&ft_ids);
+        let primary_ft = ft_ids.first().map(String::as_str).unwrap_or("");
+        let detail = Func::construction(vec![
+            Func::constant(Object::atom("Forbidden fact present in")),
+            Func::constant(Object::atom(primary_ft)),
+        ]);
+        let viol = make_violation_func(&def.id, &def.text, detail);
+        return Func::compose(Func::apply_to_all(viol), facts);
+    }
+
     // Entity scoping: if not a response constraint and entity is specified,
     // only evaluate when response text contains the entity name.
     let entity_gate = match (&def.entity, is_response_constraint) {
