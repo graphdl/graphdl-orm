@@ -403,15 +403,41 @@ fn hex_nibble(v: u8) -> char {
 /// `bytes` in its ContentRef. Returns the new file id and the
 /// updated D.
 ///
-/// Funnels through `command::apply_command_defs(CreateEntity)` —
-/// the same path the HTTP `create:File` handler uses — so any
-/// derivations (Size = byte-length of ContentRef per
-/// `readings/filesystem.md`) and validations fire as they would
-/// from a normal create. We do NOT bypass that pipeline.
+/// When the `readings/filesystem.md` defs (`resolve:File`,
+/// `validate:File`, derivations) are loaded into `d`, we funnel
+/// through `command::apply_command_defs(CreateEntity)` — the same
+/// path the HTTP `create:File` handler uses — so any derivations
+/// (Size = byte-length of ContentRef) and validations fire as they
+/// would from a normal create. The result of that path is a CELL
+/// DELTA per #209, so we merge it back onto the input state to
+/// return the full new D.
+///
+/// When the readings are NOT loaded (the platform module's tests
+/// and any host that wants to drive the zip codec without first
+/// compiling filesystem.md), `resolve:File` is Bottom and the
+/// generic `create_via_defs` resolver would emit facts under
+/// `File_has_<field>` cell names (e.g. the "in Directory" field
+/// would land under the cell `File_has_in Directory`, with a
+/// space). The actual cell that the rest of the codec — and the
+/// readings, when they later load — uses is `File_is_in_Directory`.
+/// To keep the round-trip intact in that case we skip the def
+/// pipeline and do the direct cell push under the parser-canonical
+/// fact-type ids. (#672 — round-trip tests previously failed
+/// because the success path returned a delta with the wrong cell
+/// names and dropped the rest of the state.)
 fn create_file(name: &str, mime: &str, bytes: &[u8], parent_dir_id: &str, d: &Object)
     -> Result<(String, Object), String>
 {
     let id = synth_id("file");
+
+    // Fast path when readings aren't loaded: no resolve:File def, so
+    // the def pipeline can only produce mis-named cells. Push facts
+    // directly under the canonical names instead.
+    if ast::fetch("resolve:File", d).is_bottom() {
+        let new_d = direct_push_file(&id, name, mime, bytes, parent_dir_id, d);
+        return Ok((id, new_d));
+    }
+
     let mut fields: HashMap<String, String> = HashMap::new();
     fields.insert("Name".to_string(), name.to_string());
     fields.insert("MimeType".to_string(), mime.to_string());
@@ -428,24 +454,29 @@ fn create_file(name: &str, mime: &str, bytes: &[u8], parent_dir_id: &str, d: &Ob
     };
     let result = command::apply_command_defs(d, &cmd, d);
     if result.rejected {
-        // The `create:File` command was rejected by validation. Most
-        // common cause today is the readings being absent from the
-        // tenant's compiled state — fall back to a direct cell push
-        // so callers (and our tests) can drive the codec without
-        // first compiling readings/filesystem.md. The fallback uses
-        // exactly the same fact-type ids the parser would generate.
+        // The `create:File` command was rejected by validation.
+        // Fall back to a direct cell push so callers can recover.
         let new_d = direct_push_file(&id, name, mime, bytes, parent_dir_id, d);
         return Ok((id, new_d));
     }
-    // `state` on the result IS the new D after the create.
-    Ok((id, result.state))
+    // `result.state` is a cell delta (#209). Merge it back onto the
+    // input state to recover the full D.
+    Ok((id, ast::merge_delta(d, &result.state)))
 }
 
-/// Same shape as `create_file` for Directory entities.
+/// Same shape as `create_file` for Directory entities. See
+/// `create_file` for the rationale behind the readings-absent fast
+/// path and the delta merge.
 fn create_directory(name: &str, parent_dir_id: Option<&str>, d: &Object)
     -> Result<(String, Object), String>
 {
     let id = synth_id("dir");
+
+    if ast::fetch("resolve:Directory", d).is_bottom() {
+        let new_d = direct_push_directory(&id, name, parent_dir_id, d);
+        return Ok((id, new_d));
+    }
+
     let mut fields: HashMap<String, String> = HashMap::new();
     fields.insert("Name".to_string(), name.to_string());
     if let Some(p) = parent_dir_id {
@@ -464,7 +495,7 @@ fn create_directory(name: &str, parent_dir_id: Option<&str>, d: &Object)
         let new_d = direct_push_directory(&id, name, parent_dir_id, d);
         return Ok((id, new_d));
     }
-    Ok((id, result.state))
+    Ok((id, ast::merge_delta(d, &result.state)))
 }
 
 /// Direct cell-push fallback for File creation. Reproduces the

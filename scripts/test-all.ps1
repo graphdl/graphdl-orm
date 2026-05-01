@@ -58,11 +58,6 @@ $KnownFailures = @{
         "cell_aead.rs",
         "test result: FAILED. 0 passed; 1 failed"
     )
-    # #672: platform_zip round-trip tests fail - File cells not materialising
-    # after unzip. Tracked separately, doesn't block the orchestration script.
-    "arest-integration" = @(
-        "platform_zip"
-    )
     # vitest under wasm32 build occasionally surfaces SystemTime panics on
     # nondeterministic clock paths. The worker-e2e agent (#642) noted these
     # as pre-existing wasm32 SystemTime failures. Don't gate on them.
