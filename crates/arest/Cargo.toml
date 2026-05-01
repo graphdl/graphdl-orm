@@ -25,15 +25,24 @@ path = "src/main.rs"
 # Merged integration test binary — bundles tests/integration.rs,
 # tests/properties.rs, tests/e3_integration.rs as submodules. Avoids
 # linking arest + deps three times for the same suite.
+#
+# `required-features = ["test-bins"]` (#684/#650a): each integration
+# test binary forces a full link of the arest rlib + deps, ~73s of
+# cold compile across the five gated suites. `cargo test --lib` never
+# runs them anyway — only CI / scripts/test-all.ps1 do — so gating
+# them on a feature lets day-to-day `cargo t` skip the compile
+# entirely. CI passes `--features test-bins` to enable them.
 [[test]]
 name = "all"
 path = "tests/all.rs"
+required-features = ["test-bins"]
 
 # Stays standalone — must observe process-global PLATFORM_FALLBACK
 # registry untainted by other suites' install_platform_fn calls.
 [[test]]
 name = "sec_2_platform_fallback_audit"
 path = "tests/sec_2_platform_fallback_audit.rs"
+required-features = ["test-bins"]
 
 # Cluster gossip tests — gated on the `cluster` feature so default
 # `cargo test` runs don't pay for spinning up real UDP sockets.
@@ -52,6 +61,7 @@ required-features = ["cluster"]
 [[test]]
 name = "platform_zip"
 path = "tests/platform_zip.rs"
+required-features = ["test-bins"]
 
 # Render reading smoke (#593). Asserts `readings/ui/render.md` parses
 # standalone and composes with the other UI readings. Standalone
@@ -61,6 +71,7 @@ path = "tests/platform_zip.rs"
 [[test]]
 name = "render_reading"
 path = "tests/render_reading.rs"
+required-features = ["test-bins"]
 
 # Cell-AEAD fuzz harness (#669). Property-based round-trip,
 # cross-tenant rejection, tamper detection, and AAD-binding tests
@@ -71,8 +82,15 @@ path = "tests/render_reading.rs"
 [[test]]
 name = "cell_aead_fuzz"
 path = "tests/cell_aead_fuzz.rs"
+required-features = ["test-bins"]
 
 [features]
+# `test-bins` (#684/#650a) — opt-in flag that lets each integration
+# `[[test]]` entry compile. Off by default so `cargo test --lib`
+# (and the `cargo t` alias) skip the ~73s of cold integration-test
+# binary compile that --lib never runs anyway. CI / scripts/test-all.ps1
+# pass `--features test-bins` to opt back in.
+test-bins = []
 # `core` is the always-on bundled-readings scope (Theorem 1-5
 # backbone): readings/core/{core,state,instances,outcomes,validation}.md.
 # Reserved as a no-op feature so callers can write `--features core`

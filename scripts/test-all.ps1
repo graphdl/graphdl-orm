@@ -280,9 +280,12 @@ if ($VerboseOutput) { Write-Host $r.Output }
 # ---------------------------------------------------------------------------
 # Stage 2: arest integration tests
 # ---------------------------------------------------------------------------
+# `--features test-bins` (#684) opts in the heavy [[test]] entries that
+# day-to-day `cargo test --lib` skips. CI is the only consumer that
+# needs them, and Stage 2 is exactly that consumer.
 Write-StageHeader 2 8 "arest integration tests"
 $r = Invoke-Capture -Cmd "cargo" `
-    -CmdArgs @("test","--target","x86_64-pc-windows-msvc","--tests") `
+    -CmdArgs @("test","--target","x86_64-pc-windows-msvc","--tests","--features","test-bins") `
     -WorkingDir $arestDir
 $counts = Parse-CargoCounts -Output $r.Output
 $detail = "{0} passed, {1} failed, {2} ignored, {3:N0}s" -f $counts.Passed, $counts.Failed, $counts.Ignored, $r.Elapsed
