@@ -2541,7 +2541,31 @@ fn platform_apply_command(x: &Object, d: &Object) -> Object {
         Some(_) => return Object::atom("⊥ input exceeds platform buffer"),
         None => return Object::Bottom,
     };
-    let command: crate::command::Command = match serde_json::from_str(input) {
+    // Two accepted input shapes:
+    //   (a) raw Command JSON — `{"type":"createEntity",...}`
+    //   (b) JS-envelope wrapper — `{"command":{...},"population":"<json>"}`
+    //
+    // The host SDK (src/api/engine.ts:applyCommand) wraps because
+    // callers want to pass a per-call population alongside the command
+    // without mutating the tenant's compiled state. Detect the wrapper
+    // shape, peel the command out, and ingest the population into a
+    // forked state before dispatch. The raw-Command branch is the
+    // backward-compatible fast path used by the kernel REPL and the
+    // CLI's single-tenant calls.
+    let parsed: serde_json::Value = match serde_json::from_str(input) {
+        Ok(v) => v,
+        Err(e) => return Object::atom(&format!("⊥ {}", e)),
+    };
+    let (command_json, population_str): (serde_json::Value, Option<String>) = if parsed.get("command").is_some() {
+        // (b) — extract the inner command + population fields.
+        let cmd = parsed.get("command").cloned().unwrap_or(serde_json::Value::Null);
+        let pop = parsed.get("population")
+            .and_then(|v| if v.is_string() { v.as_str().map(String::from) } else { Some(v.to_string()) });
+        (cmd, pop)
+    } else {
+        (parsed, None)
+    };
+    let command: crate::command::Command = match serde_json::from_value(command_json) {
         Ok(c) => c,
         Err(e) => return Object::atom(&format!("⊥ {}", e)),
     };
@@ -2550,13 +2574,68 @@ fn platform_apply_command(x: &Object, d: &Object) -> Object {
         Some(field) => return Object::atom(&format!("⊥ field '{}' exceeds platform buffer", field)),
         None => {}
     }
-    // D contains both population cells and def cells.
-    // apply_command_defs uses d for ρ-dispatch and state for population.
-    let result = crate::command::apply_command_defs(d, &command, d);
+    // If the caller supplied a population envelope, ingest it into a
+    // forked state so apply_command_defs sees those facts in D. The
+    // shape mirrors `forwardChain`'s input (`{"facts":[{factType,
+    // subject?, roles?}, …]}`) so a single host can build one
+    // population JSON string and pass it to either pipeline.
+    let dispatch_state = match population_str {
+        Some(pop_str) if !pop_str.is_empty() && pop_str != "null" => {
+            ingest_population_into(d, &pop_str)
+        }
+        _ => d.clone(),
+    };
+    let result = crate::command::apply_command_defs(&dispatch_state, &command, &dispatch_state);
     match serde_json::to_string(&result) {
         Ok(s) => Object::atom(&s),
         Err(e) => Object::atom(&format!("⊥ {}", e)),
     }
+}
+
+/// Merge a JS-side population JSON (`{"facts":[{factType, subject?,
+/// roles?}, …]}`) into a fork of D so apply sees the caller's
+/// per-call facts alongside D's existing cells. Used by
+/// `platform_apply_command` when invoked through the engine.ts
+/// `{command, population}` envelope. Unknown shapes are tolerated —
+/// malformed entries are skipped, not fatal — same forgiving
+/// contract as `forward_chain_to_json`.
+fn ingest_population_into(d: &Object, population_json: &str) -> Object {
+    let parsed: serde_json::Value = match serde_json::from_str(population_json) {
+        Ok(v) => v,
+        Err(_) => return d.clone(),
+    };
+    let facts = match parsed.get("facts").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return d.clone(),
+    };
+    let mut state = d.clone();
+    for entry in facts {
+        let Some(obj) = entry.as_object() else { continue };
+        let Some(fact_type) = obj.get("factType").and_then(|v| v.as_str())
+            .or_else(|| obj.get("factTypeId").and_then(|v| v.as_str()))
+        else { continue };
+        // Build a fact pairs list. Subject acts as the head-noun
+        // binding when role bindings aren't supplied (mirrors the
+        // forward_chain ingest convention).
+        let mut pairs: Vec<(&str, &str)> = Vec::new();
+        if let Some(subj) = obj.get("subject").and_then(|v| v.as_str()) {
+            // Best-effort: bind the subject under the fact-type name
+            // itself (Noun-like) plus a generic "id" key. Downstream
+            // consumers tolerate missing exact role names because the
+            // population can be re-projected at apply time.
+            pairs.push((fact_type, subj));
+        }
+        if let Some(role_obj) = obj.get("roles").and_then(|v| v.as_object()) {
+            for (k, v) in role_obj {
+                if let Some(s) = v.as_str() {
+                    pairs.push((k.as_str(), s));
+                }
+            }
+        }
+        if pairs.is_empty() { continue; }
+        state = cell_push(fact_type, fact_from_pairs(&pairs), &state);
+    }
+    state
 }
 
 /// Platform primitive: create entity from fact pairs (AREST Eq. 6).
