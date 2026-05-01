@@ -481,6 +481,9 @@ uefi = { version = "0.34", features = ["alloc", "logger"] }
 arest = { path = "../arest", default-features = false, features = [
     "no_std",
     "core",
+    "evolution-readings",
+    "imports-readings",
+    "ingest-readings",
     "ui-readings",
     "os-readings",
     "templates",
@@ -494,6 +497,9 @@ arest = { path = "../arest", default-features = false, features = [
 arest = { path = "../arest", features = [
     "std-deps",
     "core",
+    "evolution-readings",
+    "imports-readings",
+    "ingest-readings",
     "ui-readings",
     "os-readings",
     "templates",

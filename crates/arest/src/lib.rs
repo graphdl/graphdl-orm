@@ -928,7 +928,34 @@ pub const CORE_READINGS: &[(&str, &str)] = &[
     ("instances",     include_str!("../../../readings/core/instances.md")),
     ("outcomes",      include_str!("../../../readings/core/outcomes.md")),
     ("validation",    include_str!("../../../readings/core/validation.md")),
+];
+
+/// Self-modification machinery — Domain Change SM, Signal entities, and
+/// the deontic gate that requires Human-sourced approvals for changes
+/// to root-tier domains. An app that doesn't model proposing schema
+/// edits doesn't need this slice. Kernel + arest-cli enable by default.
+#[cfg(feature = "evolution-readings")]
+pub const EVOLUTION_READINGS: &[(&str, &str)] = &[
     ("evolution",     include_str!("../../../readings/core/evolution.md")),
+];
+
+/// JS library imports as a federation primitive (analogous to
+/// `External System` for HTTP). Declares JS Package, Module Path,
+/// Symbol Name, and the `Verb is exported from JS Package` binding;
+/// the runtime walks `populate:{verb}` to install each import into
+/// DEFS. Off for pure-CRM workers; on for the kernel + support.do.
+#[cfg(feature = "imports-readings")]
+pub const IMPORTS_READINGS: &[(&str, &str)] = &[
+    ("imports",       include_str!("../../../readings/core/imports.md")),
+];
+
+/// Webhook ingest — Webhook Event Type yields Fact Type + JSON Path
+/// extraction rules. Required by any tenant accepting webhook payloads
+/// (Stripe events, GitHub events, etc.). Off for kernels that don't
+/// expose an inbound HTTP endpoint, on for the worker + support.do.
+#[cfg(feature = "ingest-readings")]
+pub const INGEST_READINGS: &[(&str, &str)] = &[
+    ("ingest",        include_str!("../../../readings/core/ingest.md")),
 ];
 
 /// UI surface readings (design tokens, render tree, themes). Included
@@ -983,6 +1010,12 @@ pub const COMPAT_READINGS: &[(&str, &str)] = &[
 pub fn metamodel_readings() -> Vec<&'static (&'static str, &'static str)> {
     let mut out: Vec<&'static (&'static str, &'static str)> = Vec::new();
     out.extend(CORE_READINGS.iter());
+    #[cfg(feature = "evolution-readings")]
+    { out.extend(EVOLUTION_READINGS.iter()); }
+    #[cfg(feature = "imports-readings")]
+    { out.extend(IMPORTS_READINGS.iter()); }
+    #[cfg(feature = "ingest-readings")]
+    { out.extend(INGEST_READINGS.iter()); }
     #[cfg(feature = "templates")]
     { out.extend(TEMPLATE_READINGS.iter()); }
     #[cfg(feature = "ui-readings")]

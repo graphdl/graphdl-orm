@@ -74,12 +74,27 @@ path = "tests/cell_aead_fuzz.rs"
 
 [features]
 # `core` is the always-on bundled-readings scope (Theorem 1-5
-# backbone): readings/core/{core,state,instances,outcomes,validation,
-# evolution}.md. Reserved as a no-op feature so callers can write
-# `--features core` symmetrically with the optional `ui-readings`,
-# `os-readings`, `templates` slices below; the actual `CORE_READINGS`
-# constant in src/lib.rs is unconditional and always compiled in.
+# backbone): readings/core/{core,state,instances,outcomes,validation}.md.
+# Reserved as a no-op feature so callers can write `--features core`
+# symmetrically with the optional slices below; the actual
+# `CORE_READINGS` constant in src/lib.rs is unconditional.
 core = []
+# `evolution-readings` — Domain Change SM, Signal entities, deontic
+# gates over root-tier domain edits. Required for self-modifying
+# tenants (the auto.dev evolution flow); a pure-CRM worker that never
+# proposes schema changes can leave this off.
+evolution-readings = []
+# `imports-readings` — JS Package + Verb-export bindings. Federation
+# primitive analogous to External System for HTTP; declares Module
+# Path / Symbol Name so the runtime can install JS-imported functions
+# into DEFS via `populate:{verb}`. On for support.do + kernel;
+# off for workers that bind only HTTP-backed Verbs.
+imports-readings = []
+# `ingest-readings` — Webhook Event Type yields Fact Type + JSON Path
+# rules. Required by tenants accepting inbound webhook payloads
+# (Stripe events, GitHub events, support inbox); off for kernels
+# without an inbound HTTP endpoint.
+ingest-readings = []
 # `ui-readings` (#437) — pulls in readings/ui/ui.md. Enabled when any
 # UI projection runs (the in-kernel Slint surface, ui.do worker). Off
 # by default so a Cloudflare Worker doing pure CRM doesn't bake in
@@ -102,7 +117,7 @@ templates = []
 # folds external reports into the same graph. Off by default —
 # workers that aren't running Wine apps shouldn't pay the bake cost.
 compat-readings = []
-default = ["wit", "debug-def", "std-deps", "parallel", "core", "ui-readings", "os-readings", "templates"]
+default = ["wit", "debug-def", "std-deps", "parallel", "core", "evolution-readings", "imports-readings", "ingest-readings", "ui-readings", "os-readings", "templates"]
 wit = ["dep:wit-bindgen"]
 # cloudflare: Cloudflare Worker build profile. The worker invokes
 # `wasm-pack build --target bundler --no-default-features --features
@@ -127,6 +142,9 @@ cloudflare = [
     "wit",
     "std-deps",
     "core",
+    "evolution-readings",
+    "imports-readings",
+    "ingest-readings",
     "ui-readings",
     "templates",
 ]
