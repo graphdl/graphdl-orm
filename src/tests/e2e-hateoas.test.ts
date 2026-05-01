@@ -33,16 +33,16 @@
 
 import { describe, it, expect, beforeAll } from 'vitest'
 
-// Default BASE points at the worker production URL inferred from the
-// project's vite/UI configs (`https://ui.auto.dev/arest`). The worker
-// itself accepts the same routes at host root; we strip `/arest` from
-// the default so the test body can append `/arest/...` consistently.
+// E2E suite is opt-in via `BASE`. Without it, the suite skips cleanly
+// rather than hitting api.auto.dev (which gates these routes behind
+// auth and would surface 401s as test failures in dev).
 //
 // Override with `BASE=http://localhost:8080` to point at the kernel
-// under QEMU. `BASE` may be either `http(s)://host` or
+// under QEMU, or `BASE=https://api.auto.dev` to point at the deployed
+// worker. `BASE` may be either `http(s)://host` or
 // `http(s)://host/prefix`; trailing slashes and `/arest` suffixes are
 // normalized away so test paths can be written as `/arest/...`.
-const RAW_BASE = process.env.BASE ?? 'https://api.auto.dev'
+const RAW_BASE = process.env.BASE ?? ''
 const BASE = RAW_BASE.replace(/\/$/, '').replace(/\/arest$/, '')
 
 const FETCH_TIMEOUT_MS = 5_000
@@ -69,6 +69,13 @@ async function fetchWithTimeout(
 }
 
 beforeAll(async () => {
+  if (!BASE) {
+    reach.reachable = false
+    reach.reason = 'BASE env not set'
+    // Quiet skip — the absence of BASE is the explicit opt-out. Don't
+    // print a warning that would noise up every yarn-test invocation.
+    return
+  }
   // Probe BASE for reachability. A connection refused / DNS failure /
   // timeout flips the suite into skip mode; any HTTP response (even a
   // 404 at `/`) means BASE is up and we can run the contract tests.
