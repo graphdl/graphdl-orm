@@ -67,33 +67,35 @@ describe('Eq 6 — SYSTEM dispatches multiple operations on same compiled state'
 // The reachable set is accumulated by folding transitions over the status sequence.
 
 describe('Eq 12 — State Machine as foldl (status-gated transitions)', () => {
+  // Events come back as the trigger Fact Type reading under the new
+  // metamodel ('Customer ships Order'), not the transition name ('ship').
+  // The target Status ('Shipped' / 'Delivered') carries the verb form, so
+  // the keyword search covers event + to to stay stable across the rename.
+  const eventsAndTargets = (result: any[]) =>
+    result.flatMap((t: any) => [t.event, t.to, t.targetStatus].filter(Boolean))
+
   it("'In Cart' includes 'place' transition", () => {
-    const result = transitions(handle, 'Order', 'In Cart')
-    const events = result.map((t: any) => t.event ?? t.targetStatus ?? t.to ?? JSON.stringify(t))
+    const events = eventsAndTargets(transitions(handle, 'Order', 'In Cart'))
     expect(events.some((e: string) => e.toLowerCase().includes('place'))).toBe(true)
   })
 
   it("'In Cart' does not include 'ship' transition", () => {
-    const result = transitions(handle, 'Order', 'In Cart')
-    const events = result.map((t: any) => t.event ?? t.targetStatus ?? t.to ?? JSON.stringify(t))
+    const events = eventsAndTargets(transitions(handle, 'Order', 'In Cart'))
     expect(events.some((e: string) => e.toLowerCase().includes('ship'))).toBe(false)
   })
 
   it("'Placed' includes 'ship' transition", () => {
-    const result = transitions(handle, 'Order', 'Placed')
-    const events = result.map((t: any) => t.event ?? t.targetStatus ?? t.to ?? JSON.stringify(t))
+    const events = eventsAndTargets(transitions(handle, 'Order', 'Placed'))
     expect(events.some((e: string) => e.toLowerCase().includes('ship'))).toBe(true)
   })
 
   it("'Placed' does not include 'place' transition", () => {
-    const result = transitions(handle, 'Order', 'Placed')
-    const events = result.map((t: any) => t.event ?? t.targetStatus ?? t.to ?? JSON.stringify(t))
+    const events = eventsAndTargets(transitions(handle, 'Order', 'Placed'))
     expect(events.some((e: string) => e.toLowerCase().includes('place'))).toBe(false)
   })
 
   it("'Shipped' includes 'deliver' transition", () => {
-    const result = transitions(handle, 'Order', 'Shipped')
-    const events = result.map((t: any) => t.event ?? t.targetStatus ?? t.to ?? JSON.stringify(t))
+    const events = eventsAndTargets(transitions(handle, 'Order', 'Shipped'))
     expect(events.some((e: string) => e.toLowerCase().includes('deliver'))).toBe(true)
   })
 
