@@ -1134,6 +1134,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             m.entry(ft_id).or_default().push(func);
             m
         });
+    let validated_ft_ids: HashSet<String> = ft_to_app_constraints.keys().cloned().collect();
     defs.extend(ft_to_app_constraints.into_iter().map(|(ft_id, funcs)| {
         (format!("validate:{}", ft_id), Func::compose(Func::Concat, Func::construction(funcs)))
     }));
@@ -1142,6 +1143,11 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // fact types the noun participates in. Lets create/update/transition
     // handlers pay O(FTs-touching-noun) instead of O(all constraints).
     // For the metamodel that's ~5â€“10 FTs per noun vs 345 bulk constraints.
+    //
+    // Filter to FTs that actually have a `validate:{ft}` def emitted —
+    // referencing a missing def returns Bottom from Func::Def and Concat
+    // propagates that, so a single FT-without-constraints would null the
+    // whole aggregate. Drop unreferenced FTs early.
     //
     // Key is `validate:{noun}`. Collision with `validate:{ft_id}` is
     // avoided because FT ids are reading-derived snake_case strings
@@ -1153,6 +1159,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         .flat_map(|(ft_id, ft)| ft.roles.iter()
             .map(|r| (r.noun_name.clone(), ft_id.clone()))
             .collect::<Vec<_>>())
+        .filter(|(_, ft_id)| validated_ft_ids.contains(ft_id))
         .fold(HashMap::new(), |mut m, (n, ft)| {
             m.entry(n).or_default().insert(ft);
             m
@@ -6158,6 +6165,177 @@ mod deontic_conjunction_test {
         let key = "validate:Outbound Email";
         assert!(defs.iter().any(|(n, _)| n == key),
             "compile must emit {key}; got validate keys {:?}",
+            defs.iter().map(|(n, _)| n.as_str())
+                .filter(|n| n.starts_with("validate"))
+                .collect::<Vec<_>>());
+    }
+
+    /// Parser-path acceptance test mirroring the support fixture
+    /// (src/tests/permission-guards.test.ts). Uses `parse_to_state`
+    /// end-to-end so any stage-2 emission gap (missing spans, wrong
+    /// entity, dropped constraint) shows up here as a 0-violation
+    /// failure instead of going undetected to the WASM round-trip.
+    #[test]
+    fn parser_path_forbidden_constraint_violates_when_trigger_fact_present() {
+        let readings = "# Outbound Email Guard
+
+## Entity Types
+Outbound Email(.id) is an entity type.
+
+## Fact Types
+### Outbound Email actions
+Outbound Email is sent.
+
+## Deontic Constraints
+It is forbidden that some Outbound Email is sent.
+";
+        let state = crate::parse_forml2::parse_to_state(readings)
+            .expect("parse should succeed");
+
+        // Sanity: a Constraint cell row must exist with deontic+forbidden.
+        let constraints = ast::fetch_or_phi("Constraint", &state);
+        let count = constraints.as_seq().map(|s| s.len()).unwrap_or(0);
+        assert!(count >= 1, "parser must emit ≥1 Constraint cell row; got {count}; cell={:?}", constraints);
+
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        // Build a population with one is-sent fact.
+        let mut pop_cells: HashMap<String, Vec<Object>> = HashMap::new();
+        pop_cells.entry("Outbound_Email_is_sent".into())
+            .or_default()
+            .push(Object::seq(vec![
+                Object::seq(vec![
+                    Object::atom("Outbound Email"),
+                    Object::atom("eml-1"),
+                ]),
+            ]));
+        let pop_state = Object::Map(pop_cells.into_iter()
+            .map(|(k, v)| (k, Object::Seq(v.into())))
+            .collect());
+
+        let ctx = ast::encode_eval_context_state("", None, &pop_state);
+        let violations_obj = ast::apply(
+            &Func::Def("validate:Outbound Email".to_string()),
+            &ctx,
+            &d,
+        );
+        let violations = ast::decode_violations(&violations_obj);
+        assert!(!violations.is_empty(),
+            "parser-path forbidden constraint must produce ≥1 violation; \
+             got {:?}; raw obj {:?}; \n\
+             validate keys: {:?};\n\
+             constraint defs: {:?}",
+            violations, violations_obj,
+            defs.iter().map(|(n, _)| n.as_str()).filter(|n| n.starts_with("validate")).collect::<Vec<_>>(),
+            defs.iter().map(|(n, _)| n.as_str()).filter(|n| n.starts_with("constraint:")).collect::<Vec<_>>());
+    }
+
+    /// Multi-clause forbidden constraint exactly as the support
+    /// permission-guard test uses it. The conjunction body joins three
+    /// clauses across `Outbound Email is sent`, `User approves Outbound
+    /// Email`, and the subtype-membership predicate `that User is Agent`.
+    ///
+    /// For #681 v1 we don't try to evaluate the join semantically yet
+    /// — the contract is just that the parser-path emits the constraint
+    /// with non-empty spans pointing at the conjunction's trigger FTs,
+    /// and that validate:{noun} fires when the trigger FT carries any
+    /// fact. The over-strict v1 lands the support test at
+    /// "Agent approval rejects send" → the test that's been failing.
+    /// A future v2 hardening (full join + subtype check) will tighten
+    /// the rejection set so non-Agent approvals don't trip the same
+    /// guard.
+    #[test]
+    fn parser_path_multi_clause_forbidden_emits_constraint_with_spans() {
+        let readings = "# User + Agent\n\
+\n\
+## Entity Types\n\
+User(.id) is an entity type.\n\
+Agent(.id) is an entity type.\n\
+  Agent is a subtype of User.\n\
+\n\
+## Value Types\n\
+Email is a value type.\n\
+\n\
+## Fact Types\n\
+### User\n\
+User has Email.\n\
+  Each User has at most one Email.\n\
+\n\
+# Outbound Email Guard\n\
+\n\
+## Entity Types\n\
+Outbound Email(.id) is an entity type.\n\
+\n\
+## Fact Types\n\
+### Outbound Email actions\n\
+User approves Outbound Email.\n\
+Outbound Email is sent.\n\
+\n\
+## Deontic Constraints\n\
+It is forbidden that some Outbound Email is sent and some User approves that Outbound Email and that User is Agent.\n";
+        let state = crate::parse_forml2::parse_to_state(readings)
+            .expect("parse should succeed");
+
+        let constraints = ast::fetch_or_phi("Constraint", &state);
+        let constraint_facts = constraints.as_seq()
+            .map(|s| s.to_vec()).unwrap_or_default();
+
+        let deontic = constraint_facts.iter()
+            .find(|c| ast::binding(c, "modality") == Some("deontic"))
+            .unwrap_or_else(|| panic!(
+                "multi-clause forbidden must reach Constraint cell as deontic; \
+                 parser-side dropping is the gap. Cell rows: {constraint_facts:?}"
+            ));
+
+        let entity = ast::binding(deontic, "entity").unwrap_or("");
+        let span0_ft = ast::binding(deontic, "span0_factTypeId").unwrap_or("");
+        let op = ast::binding(deontic, "deonticOperator").unwrap_or("");
+
+        assert_eq!(op, "forbidden",
+            "deonticOperator must be 'forbidden' for our text; got {op:?}");
+        assert!(!entity.is_empty(),
+            "entity must be set on the parsed constraint; got empty");
+        assert!(!span0_ft.is_empty(),
+            "span0_factTypeId must be set so compile_forbidden_ast \
+             can route the violation Func to validate:{{ft}}; got empty; \
+             constraint = {deontic:?}");
+
+        // Now exercise the apply path: validate:{entity} fed the
+        // population must surface ≥1 violation. This is the gap the
+        // WASM test trips on — the Rust unit test going through full
+        // parse + compile + apply must agree with the WASM round-trip.
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        // Populate the trigger FT cell. ft id is derived from the
+        // span — robust to whatever id the parser assigned.
+        let mut pop_cells: HashMap<String, Vec<Object>> = HashMap::new();
+        pop_cells.entry(span0_ft.to_string())
+            .or_default()
+            .push(Object::seq(vec![
+                Object::seq(vec![
+                    Object::atom("Outbound Email"),
+                    Object::atom("eml-2"),
+                ]),
+            ]));
+        let pop_state = Object::Map(pop_cells.into_iter()
+            .map(|(k, v)| (k, Object::Seq(v.into())))
+            .collect());
+
+        let validate_key = alloc::format!("validate:{}", entity);
+        let ctx = ast::encode_eval_context_state("", None, &pop_state);
+        let violations_obj = ast::apply(
+            &Func::Def(validate_key.clone()),
+            &ctx,
+            &d,
+        );
+        let violations = ast::decode_violations(&violations_obj);
+        assert!(!violations.is_empty(),
+            "validate:{entity} must produce ≥1 violation when trigger FT \
+             {span0_ft} carries a fact; got {:?}; raw {:?}; \n\
+             validate keys: {:?}",
+            violations, violations_obj,
             defs.iter().map(|(n, _)| n.as_str())
                 .filter(|n| n.starts_with("validate"))
                 .collect::<Vec<_>>());
