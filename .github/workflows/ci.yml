@@ -1,0 +1,77 @@
+# CI for AREST. Tracks #671.
+#
+# Mirrors the local developer flow: invokes scripts/test-all.ps1, which
+# runs every test surface (cargo unit/integration/doctest, kernel host
+# tests, vitest, kernel UEFI smoke, worker e2e) and exits 0 only when
+# there are no novel failures. KnownFailures inside the script don't gate.
+#
+# windows-latest (not ubuntu) because the orchestration scripts are
+# PowerShell-first and use Windows-only paths/process semantics. cargo
+# tests target x86_64-pc-windows-msvc, the host triple on this runner.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight runs for the same ref when a new commit arrives.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+
+      # Cache cargo registry + git index + per-crate target dirs. Keeps
+      # cold runs from rebuilding every dependency from scratch.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/arest/target
+            crates/arest-kernel/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Setup Node + yarn
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: yarn
+
+      - name: Install wasm-pack
+        # Required by yarn build:wasm; not bundled with the runner.
+        run: cargo install wasm-pack --locked
+
+      - run: yarn install --frozen-lockfile
+
+      # WASM artifacts are a prerequisite for the vitest stage in test-all.ps1.
+      - run: yarn build:wasm
+
+      # pwsh (not bash) because the script is PowerShell-first and uses
+      # System.Diagnostics.Process and CIM cmdlets directly. Exit code is
+      # 0 iff no novel failures; KnownFailures stay non-blocking.
+      - name: Run test-all.ps1
+        shell: pwsh
+        run: ./scripts/test-all.ps1
+
+      # scripts/check-all-targets.ps1 not yet committed (tracked by #668).
+      # When it lands, add a step here that runs it under pwsh and gates
+      # on its exit code.
