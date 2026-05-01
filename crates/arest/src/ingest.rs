@@ -90,8 +90,14 @@ pub fn forward_chain_to_json(state: &Object, input_json: &str) -> String {
     inst_facts.extend(harvest_inst_facts_from_readings(state));
     let nouns = read_noun_ref_schemes(state);
 
+    // Reading aliases: a binary FT declared `Forward / Reverse` shows
+    // up in the FactType cell as a single entry whose `reading` is the
+    // full slash-joined text. The SM trigger reference and the input
+    // fact may use either side, and they must resolve to the same FT.
+    let aliases = build_reading_aliases(state);
+
     // 3. Build the SM trigger index.
-    let trigger_idx = build_trigger_index(&inst_facts);
+    let trigger_idx = build_trigger_index(&inst_facts, &aliases);
     let webhook_idx = build_webhook_index(&inst_facts);
 
     // 4. Apply webhook ingest first — this synthesises new Facts that
@@ -112,7 +118,7 @@ pub fn forward_chain_to_json(state: &Object, input_json: &str) -> String {
     let pool: Vec<InputFact> = input_facts.iter().cloned()
         .chain(synthetic_facts.iter().cloned())
         .collect();
-    let triggered = run_trigger_derivation(&pool, &trigger_idx);
+    let triggered = run_trigger_derivation(&pool, &trigger_idx, &aliases);
 
     // 6. Resource is currently in Status fold.
     let statuses = compute_resource_statuses(&triggered, &trigger_idx);
@@ -399,6 +405,55 @@ fn parse_four_quoted<'a>(
     Some((a, b, c, d))
 }
 
+// ── Reading aliases (slash alternate readings) ──────────────────────
+//
+// A binary fact type may carry multiple readings of the same role pair,
+// declared `Forward / Reverse` on a single line per ORM 2. The parser
+// preserves the full slash text in the `FactType.reading` binding. Any
+// downstream lookup keyed on a single reading (SM trigger reference,
+// input population fact) must be tolerant of either side. We build a
+// many-to-many alias index here: `read → {read, plus every sibling}`.
+// Lookup is `aliases.get(reading).cloned().unwrap_or_else(|| {reading})`.
+type ReadingAliases = HashMap<String, Vec<String>>;
+
+fn build_reading_aliases(state: &Object) -> ReadingAliases {
+    let mut out: ReadingAliases = HashMap::new();
+    let ft_cell = fetch_or_phi("FactType", state);
+    let Some(items) = ft_cell.as_seq() else { return out };
+    for f in items {
+        let Some(reading) = binding(f, "reading") else { continue };
+        // Filter only true alternate-reading FT entries — SM directives
+        // and other instance-fact-shaped readings sometimes leak into
+        // the FactType cell when the metamodel isn't loaded; those have
+        // a different shape and shouldn't be split on slash.
+        if !reading.contains(" / ") { continue; }
+        let parts: Vec<String> = reading
+            .split(" / ")
+            .map(|s| s.trim().trim_end_matches('.').trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.len() < 2 { continue; }
+        for p in &parts {
+            let entry = out.entry(p.clone()).or_default();
+            for sib in &parts {
+                if !entry.contains(sib) { entry.push(sib.clone()); }
+            }
+        }
+    }
+    out
+}
+
+/// Resolve a fact-type reading to the set of readings that name the
+/// same FT (the input itself plus every sibling alternate reading).
+/// Always includes the input — non-alias keys round-trip unchanged.
+fn resolve_aliases(reading: &str, aliases: &ReadingAliases) -> Vec<String> {
+    if let Some(group) = aliases.get(reading) {
+        group.clone()
+    } else {
+        alloc::vec![reading.to_string()]
+    }
+}
+
 /// Per-noun reference scheme value-type names (e.g. Order → ["OrderId"]).
 /// Read from the `Noun` cell's `referenceScheme` binding, falling back to
 /// the InstanceFact `Noun 'X' has Reference Scheme '…'` shape if the
@@ -447,7 +502,7 @@ struct TriggerEntry {
     from: String,
 }
 
-fn build_trigger_index(facts: &[InstFact]) -> TriggerIndex {
+fn build_trigger_index(facts: &[InstFact], aliases: &ReadingAliases) -> TriggerIndex {
     let mut idx = TriggerIndex::default();
 
     // Pass 1: SM ↔ Noun.
@@ -525,12 +580,18 @@ fn build_trigger_index(facts: &[InstFact]) -> TriggerIndex {
             .or_else(|| idx.sm_to_noun.keys().next().cloned())
             .unwrap_or_default();
         if sm.is_empty() { continue; }
-        idx.by_fact_type.entry(fact_type.clone()).or_default().push(TriggerEntry {
+        let entry = TriggerEntry {
             transition: transition.clone(),
             sm,
             to,
             from,
-        });
+        };
+        // Register the entry under every alias of the trigger fact type
+        // so the lookup hits regardless of which reading the input fact
+        // uses. `resolve_aliases` always returns at least the input.
+        for alias in resolve_aliases(fact_type, aliases) {
+            idx.by_fact_type.entry(alias).or_default().push(entry.clone());
+        }
     }
 
     idx
@@ -559,13 +620,28 @@ struct TriggeredTuple {
 fn run_trigger_derivation(
     pool: &[InputFact],
     idx: &TriggerIndex,
+    aliases: &ReadingAliases,
 ) -> Vec<TriggeredTuple> {
     let mut out: Vec<TriggeredTuple> = Vec::new();
 
     for (seq, fact) in pool.iter().enumerate() {
+        // Try the literal fact_type first, then walk every sibling
+        // reading. The trigger index is already populated under all
+        // aliases (see `build_trigger_index`), so the first hit wins —
+        // walking aliases is a defensive fallback for the case where
+        // the trigger directive used a reading that the FactType cell
+        // doesn't list (e.g. metamodel-loaded path that splits the
+        // slash form into separate entries).
         let entries = match idx.by_fact_type.get(&fact.fact_type) {
             Some(e) => e,
-            None => continue,
+            None => {
+                let mut found: Option<&Vec<TriggerEntry>> = None;
+                for alias in resolve_aliases(&fact.fact_type, aliases) {
+                    if alias == fact.fact_type { continue; }
+                    if let Some(e) = idx.by_fact_type.get(&alias) { found = Some(e); break; }
+                }
+                match found { Some(e) => e, None => continue }
+            }
         };
         for entry in entries {
             let noun = match idx.sm_to_noun.get(&entry.sm) {
@@ -870,7 +946,8 @@ pub fn inspect_to_json(state: &Object) -> String {
     let harvested = harvest_inst_facts_from_readings(state);
     let harvested_count = harvested.len();
     inst_facts.extend(harvested);
-    let trigger_idx = build_trigger_index(&inst_facts);
+    let aliases = build_reading_aliases(state);
+    let trigger_idx = build_trigger_index(&inst_facts, &aliases);
     let webhook_idx = build_webhook_index(&inst_facts);
     let nouns = read_noun_ref_schemes(state);
 
@@ -963,7 +1040,7 @@ mod tests {
             mk("Transition", "place", "is to", "Status", "Placed"),
             mk("Transition", "place", "is triggered by", "Fact Type", "Customer places Order"),
         ];
-        let idx = build_trigger_index(&facts);
+        let idx = build_trigger_index(&facts, &HashMap::new());
         assert_eq!(idx.sm_to_noun.get("Order"), Some(&"Order".to_string()));
         assert_eq!(idx.sm_initial.get("Order"), Some(&"In Cart".to_string()));
         let entries = idx.by_fact_type.get("Customer places Order").expect("entry");
@@ -979,7 +1056,7 @@ mod tests {
             mk("Transition", "place", "is to", "Status", "Placed"),
             mk("Transition", "place", "is triggered by", "Fact Type", "Customer places Order"),
         ];
-        let idx = build_trigger_index(&facts);
+        let idx = build_trigger_index(&facts, &HashMap::new());
 
         let mut roles = BTreeMap::new();
         roles.insert("Customer".to_string(), "alice".to_string());
@@ -989,7 +1066,7 @@ mod tests {
             subject: None,
             roles,
         }];
-        let triggered = run_trigger_derivation(&pool, &idx);
+        let triggered = run_trigger_derivation(&pool, &idx, &HashMap::new());
         assert_eq!(triggered.len(), 1);
         assert_eq!(triggered[0].transition, "place");
         assert_eq!(triggered[0].resource, "42");
@@ -1068,7 +1145,7 @@ mod tests {
         }
         // 7 directives → 7 InstFact records.
         assert_eq!(all.len(), 7);
-        let idx = build_trigger_index(&all);
+        let idx = build_trigger_index(&all, &HashMap::new());
         assert_eq!(idx.sm_to_noun.get("Order"), Some(&"Order".to_string()));
         assert_eq!(idx.sm_initial.get("Order"), Some(&"In Cart".to_string()));
         let entries = idx.by_fact_type.get("Customer places Order").expect("entry");
