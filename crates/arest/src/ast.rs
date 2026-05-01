@@ -2608,12 +2608,46 @@ fn ingest_population_into(d: &Object, population_json: &str) -> Object {
         Some(arr) => arr,
         None => return d.clone(),
     };
+    // Build a reading→canonical-id map from the FactType cell so a
+    // caller passing the human-readable form (`"Outbound Email is sent"`)
+    // lands in the same cell that compile_to_defs_state's per-FT
+    // validate looks up (`Outbound_Email_is_sent`). Without this
+    // canonicalization the cell name diverges between ingest path and
+    // validate path, and constraints silently never fire.
+    let ft_cell = fetch_or_phi("FactType", d);
+    let mut reading_to_id: HashMap<String, String> = HashMap::new();
+    if let Some(items) = ft_cell.as_seq() {
+        for f in items {
+            let Some(id) = binding(f, "id") else { continue };
+            // Canonical id always maps to itself — round-trips when caller
+            // already passes the underscore form.
+            reading_to_id.insert(id.to_string(), id.to_string());
+            if let Some(reading) = binding(f, "reading") {
+                reading_to_id.insert(reading.to_string(), id.to_string());
+                // Slash-separated alternate readings: register each side.
+                if reading.contains(" / ") {
+                    for part in reading.split(" / ") {
+                        let p = part.trim().trim_end_matches('.').trim();
+                        if !p.is_empty() {
+                            reading_to_id.insert(p.to_string(), id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut state = d.clone();
     for entry in facts {
         let Some(obj) = entry.as_object() else { continue };
         let Some(fact_type) = obj.get("factType").and_then(|v| v.as_str())
             .or_else(|| obj.get("factTypeId").and_then(|v| v.as_str()))
         else { continue };
+        // Resolve the caller's factType to the canonical FT id when the
+        // model declares it. Fall back to the raw string for unknown
+        // FTs (forward-compat: older code may push to free-form cells).
+        let canonical_ft: String = reading_to_id.get(fact_type)
+            .cloned()
+            .unwrap_or_else(|| fact_type.to_string());
         // Build a fact pairs list. Subject acts as the head-noun
         // binding when role bindings aren't supplied (mirrors the
         // forward_chain ingest convention).
@@ -2633,7 +2667,7 @@ fn ingest_population_into(d: &Object, population_json: &str) -> Object {
             }
         }
         if pairs.is_empty() { continue; }
-        state = cell_push(fact_type, fact_from_pairs(&pairs), &state);
+        state = cell_push(&canonical_ft, fact_from_pairs(&pairs), &state);
     }
     state
 }
