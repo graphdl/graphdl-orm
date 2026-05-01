@@ -269,6 +269,16 @@ pub mod agent;
 // Lifting the per-mod gate so `load_reading_core::load_reading` can lift
 // its function-body gate (closes the kernel-side path for #589).
 pub mod check;
+// `ingest` (#fact-driven-sm) — JSON entry point for the two declarative
+// derivations the metamodel pivot landed: `Fact triggered Transition for
+// Resource` (state.md / instances.md) and `Webhook Event Type yields
+// Fact Type with Role from JSON Path` (ingest.md). Reached only via
+// `system(h, "forward_chain", input)`; the kernel build (no_std) doesn't
+// hit that path so the module sits behind the std-deps gate. Pure
+// helper — no tenant-state mutation, no FFP machinery, just a fold over
+// the InstanceFact cell + the input population.
+#[cfg(all(feature = "std-deps", not(feature = "no_std")))]
+pub mod ingest;
 // Storage-1: pluggable StorageBackend trait + in-mem/local-fs impls.
 // std-only because backends need heap + owned types and the fs impl
 // needs std::fs. The kernel / no_std target uses `freeze::thaw`
@@ -1736,6 +1746,72 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     if key == "select_component" {
         let snapshot = tenant.read().snapshot_d();
         return command::select_component_json(&snapshot, input);
+    }
+
+    // ── #fact-driven-sm: forward_chain JSON entry point ─────────────
+    //
+    //   system(h, "forward_chain", input_json) → result_json
+    //
+    // Runs two declarative-model derivations end-to-end:
+    //
+    //   1. `Fact triggered Transition for Resource`
+    //      (readings/core/instances.md):
+    //
+    //        If some Fact F is of Fact Type FT, and some Transition T
+    //        is triggered by FT (per state.md), and F uses some Resource
+    //        R for some Role whose player Noun is the noun of T's State
+    //        Machine Definition, then F triggered T for R.
+    //
+    //   2. `Webhook Event Type yields Fact Type with Role from JSON Path`
+    //      (readings/core/ingest.md):
+    //
+    //        When a Webhook Event arrives carrying a Webhook Event Type,
+    //        construct one Fact per Fact Type the Type yields. For each
+    //        Role, extract the value at the declared JSON Path; if the
+    //        Role's player is an entity, find-or-upsert via the Noun's
+    //        reference scheme.
+    //
+    // Plus the SM fold `Resource is currently in Status` over the
+    // (1) tuples (latest-wins). The result envelope is consumed by
+    // `src/api/engine.ts::forwardChain` which JSON.parse's it into
+    // `{ derived: { ...factName: [...] } }`.
+    //
+    // Read-only: no tenant mutation. The synthesised facts and derived
+    // tuples live in the result envelope only — persistence is the
+    // create/apply pipeline's job, not the forward-chain query's.
+    if key == "forward_chain" {
+        let snapshot = tenant.read().snapshot_d();
+        return crate::ingest::forward_chain_to_json(&snapshot, input);
+    }
+    if key == "inspect_ingest" {
+        let snapshot = tenant.read().snapshot_d();
+        return crate::ingest::inspect_to_json(&snapshot);
+    }
+
+    // ── #fact-driven-sm: capture source on compile ─────────────────
+    //
+    // Push the raw readings text into a private `_arest_source_text`
+    // cell BEFORE the writer dispatch fires `platform_compile` on it.
+    // The ingest module reads this cell to recover SM trigger directives
+    // and webhook yields rules that the FORML 2 parser silently drops
+    // when the bare engine is loaded without the `STATE_READINGS` /
+    // `INGEST_READINGS` metamodel prereqs. Without this fallback the
+    // declarative-model derivations only fire when the consumer pre-
+    // loads the metamodel — but the TDD spec at
+    // `src/tests/fact-driven-sm.test.ts` exercises bare-mode compile
+    // without that prereq.
+    //
+    // The cell is namespaced with a leading underscore so it doesn't
+    // collide with any FORML-declared cell name and is visibly engine-
+    // internal in debug dumps.
+    if key == "compile" {
+        let mut st = tenant.write();
+        let snapshot = st.snapshot_d();
+        let fact = ast::fact_from_pairs(&[("text", input)]);
+        let new_d = ast::cell_push("_arest_source_text", fact, &snapshot);
+        st.replace_d(new_d);
+        // Fall through to the standard writer dispatch below for the
+        // actual compile.
     }
 
     // ── Read-only dispatch path ─────────────────────────────────────
