@@ -428,3 +428,109 @@ Webhook Event Type 'payment.succeeded' yields Fact Type 'Customer pays for Order
     expect(orderStatus.Status ?? orderStatus.status).toBe('Paid')
   })
 })
+
+// ── Alternate readings: trigger lookup by either reading ────────────
+//
+// FORML 2 / ORM: a binary fact type may carry multiple readings of the
+// same role pair, declared `Forward / Reverse` on a single line. They
+// are aliases for one fact type, not two. The §1 paper example uses
+// `Order is placed by Customer / Customer places Order` and references
+// the trigger as `Customer places Order`. The engine must resolve that
+// trigger reference to the FT regardless of which reading was chosen
+// as the canonical id, and a fact added under either reading must drive
+// the same transition.
+
+describe('Transition trigger lookup resolves through alternate readings', () => {
+  const ALT_READING_SM = `# Orders
+
+## Entity Types
+Order(.OrderId) is an entity type.
+Customer(.Name) is an entity type.
+
+## Fact Types
+
+### Order
+Order is placed by Customer / Customer places Order.
+
+## Instance Facts
+State Machine Definition 'Order' is for Noun 'Order'.
+Status 'In Cart' is initial in State Machine Definition 'Order'.
+Status 'Placed' is defined in State Machine Definition 'Order'.
+Transition 'place' is defined in State Machine Definition 'Order'.
+Transition 'place' is from Status 'In Cart'.
+Transition 'place' is to Status 'Placed'.
+Transition 'place' is triggered by Fact Type 'Customer places Order'.
+`
+
+  it('compileDomain accepts the slash alternate reading', () => {
+    const c = track(compileDomain(ALT_READING_SM, 'orders'))
+    expect(c.handle).toBeGreaterThanOrEqual(0)
+  })
+
+  it('a fact added by the forward reading triggers the place transition', () => {
+    const c = track(compileDomain(ALT_READING_SM, 'orders'))
+    const populationFacts = JSON.stringify({
+      facts: [
+        { factType: 'Customer', subject: 'alice' },
+        { factType: 'Order', subject: '42' },
+        // Forward reading — same role pair as the alternate.
+        { factType: 'Order is placed by Customer', roles: { Customer: 'alice', Order: '42' } },
+      ],
+    })
+    const result = forwardChain(populationFacts, c.handle)
+    const status = result?.derived?.['Resource is currently in Status']
+      ?? result?.['Resource is currently in Status']
+      ?? []
+    const orderStatus = (status as any[]).find((s) =>
+      (s.Resource === '42' || s.resource === '42'))
+    expect(orderStatus).toBeDefined()
+    expect(orderStatus.Status ?? orderStatus.status).toBe('Placed')
+  })
+
+  it('a fact added by the alternate reading triggers the same transition', () => {
+    const c = track(compileDomain(ALT_READING_SM, 'orders'))
+    const populationFacts = JSON.stringify({
+      facts: [
+        { factType: 'Customer', subject: 'alice' },
+        { factType: 'Order', subject: '42' },
+        // Alternate reading — must resolve to the same FT.
+        { factType: 'Customer places Order', roles: { Customer: 'alice', Order: '42' } },
+      ],
+    })
+    const result = forwardChain(populationFacts, c.handle)
+    const status = result?.derived?.['Resource is currently in Status']
+      ?? result?.['Resource is currently in Status']
+      ?? []
+    const orderStatus = (status as any[]).find((s) =>
+      (s.Resource === '42' || s.resource === '42'))
+    expect(orderStatus).toBeDefined()
+    expect(orderStatus.Status ?? orderStatus.status).toBe('Placed')
+  })
+
+  it('the trigger reference resolves regardless of which reading is canonical', () => {
+    // Mirror domain — same FT, but the trigger references the FORWARD
+    // reading instead of the alternate. Both should resolve.
+    const MIRROR_SM = ALT_READING_SM.replace(
+      "Transition 'place' is triggered by Fact Type 'Customer places Order'.",
+      "Transition 'place' is triggered by Fact Type 'Order is placed by Customer'.",
+    )
+    const c = track(compileDomain(MIRROR_SM, 'orders'))
+    const populationFacts = JSON.stringify({
+      facts: [
+        { factType: 'Customer', subject: 'alice' },
+        { factType: 'Order', subject: '42' },
+        // Use the alternate reading to commit the fact — different from
+        // the trigger reference, but same FT.
+        { factType: 'Customer places Order', roles: { Customer: 'alice', Order: '42' } },
+      ],
+    })
+    const result = forwardChain(populationFacts, c.handle)
+    const status = result?.derived?.['Resource is currently in Status']
+      ?? result?.['Resource is currently in Status']
+      ?? []
+    const orderStatus = (status as any[]).find((s) =>
+      (s.Resource === '42' || s.resource === '42'))
+    expect(orderStatus).toBeDefined()
+    expect(orderStatus.Status ?? orderStatus.status).toBe('Placed')
+  })
+})
