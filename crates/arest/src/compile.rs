@@ -6044,3 +6044,141 @@ mod populate_imports_test {
         }
     }
 }
+
+#[cfg(test)]
+mod deontic_conjunction_test {
+    //! TDD spec for #681: a forbidden multi-clause conjunction must
+    //! compile to a Func that, when evaluated against a population
+    //! satisfying every clause, returns a non-empty violation Seq.
+    //!
+    //! Today's `compile_forbidden_ast` has two paths:
+    //!   1. CWA path: forbidden enum values from the spans
+    //!   2. OWA path: keyword co-occurrence in `Selector(1)` (response text)
+    //!
+    //! Neither matches the population-conjunction shape used by
+    //! support.auto.dev's permission guard:
+    //!
+    //!   It is forbidden that some Outbound Email is sent
+    //!   and some User approves that Outbound Email
+    //!   and that User is Agent.
+    //!
+    //! These tests pin the contract that the missing path must satisfy
+    //! before the support app can ship.
+    use super::*;
+    use crate::ast::{self, Object, fact_from_pairs};
+    use hashbrown::HashMap;
+    use alloc::string::ToString;
+
+    /// A minimal state with one forbidden constraint that bites every
+    /// time `Outbound Email is sent` has a fact present. Two-clause to
+    /// start: the third (subtype) clause gets layered on once the join
+    /// path is wired.
+    fn state_with_forbidden_send() -> Object {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Outbound Email"), ("objectType", "entity"),
+        ]));
+        cells.entry("FactType".into()).or_default().push(fact_from_pairs(&[
+            ("id", "Outbound_Email_is_sent"),
+            ("reading", "Outbound Email is sent"),
+        ]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "Outbound_Email_is_sent"),
+            ("nounName", "Outbound Email"),
+            ("position", "0"),
+        ]));
+        cells.entry("Constraint".into()).or_default().push(fact_from_pairs(&[
+            ("id", "deontic_send"),
+            ("kind", "deontic"),
+            ("modality", "deontic"),
+            ("deonticOperator", "forbidden"),
+            ("text", "It is forbidden that some Outbound Email is sent."),
+            ("span0_factTypeId", "Outbound_Email_is_sent"),
+            ("span0_roleIndex", "0"),
+            ("entity", "Outbound Email"),
+        ]));
+        Object::Map(cells.into_iter()
+            .map(|(k, v)| (k, Object::Seq(v.into())))
+            .collect())
+    }
+
+    /// A constraint:{id} def must exist in the compiled output for
+    /// every Constraint cell row, regardless of modality. This is the
+    /// floor: if it's not even emitted, nothing downstream can fire.
+    #[test]
+    fn forbidden_constraint_emits_constraint_def() {
+        let state = state_with_forbidden_send();
+        let defs = compile_to_defs_state(&state);
+        let key = "constraint:deontic_send";
+        assert!(defs.iter().any(|(n, _)| n == key),
+            "compile must emit {key}; got constraint keys {:?}",
+            defs.iter().map(|(n, _)| n.as_str())
+                .filter(|n| n.starts_with("constraint:"))
+                .collect::<Vec<_>>());
+    }
+
+    /// The per-noun aggregate `validate:{noun}` must reach every
+    /// constraint that bites at the noun. For our forbidden-send
+    /// constraint the span is on `Outbound_Email_is_sent` whose role
+    /// is on `Outbound Email`, so `validate:Outbound Email` should
+    /// route through `validate:Outbound_Email_is_sent` and ultimately
+    /// reach the constraint Func.
+    ///
+    /// This test is structural: it verifies the `validate:{noun}` def
+    /// exists with non-trivial body. The full apply-time semantics is
+    /// covered by the next test.
+    #[test]
+    fn validate_noun_aggregate_exists_for_forbidden_constraint() {
+        let state = state_with_forbidden_send();
+        let defs = compile_to_defs_state(&state);
+        let key = "validate:Outbound Email";
+        assert!(defs.iter().any(|(n, _)| n == key),
+            "compile must emit {key}; got validate keys {:?}",
+            defs.iter().map(|(n, _)| n.as_str())
+                .filter(|n| n.starts_with("validate"))
+                .collect::<Vec<_>>());
+    }
+
+    /// THE failing acceptance test for #681: applying validate:{noun}
+    /// to an eval context whose population contains a fact in the
+    /// forbidden constraint's trigger FT must produce ≥1 violation.
+    ///
+    /// Today this returns `Object::phi()` because compile_forbidden_ast
+    /// falls into the OWA keyword path (text="It is forbidden that
+    /// some Outbound Email is sent."), which only fires when
+    /// Selector(1)/response text mentions enough keywords. Population
+    /// validation never sets a response text. The fix is a third
+    /// path in compile_forbidden_ast that emits a Func keyed on
+    /// "is some fact present in the trigger FT cell?".
+    #[test]
+    fn forbidden_constraint_violates_when_trigger_fact_present() {
+        let state = state_with_forbidden_send();
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        // Population: one Outbound Email is-sent fact.
+        let mut pop_cells: HashMap<String, Vec<Object>> = HashMap::new();
+        pop_cells.entry("Outbound_Email_is_sent".into())
+            .or_default()
+            .push(Object::seq(vec![
+                Object::seq(vec![
+                    Object::atom("Outbound Email"),
+                    Object::atom("eml-1"),
+                ]),
+            ]));
+        let pop_state = Object::Map(pop_cells.into_iter()
+            .map(|(k, v)| (k, Object::Seq(v.into())))
+            .collect());
+
+        let ctx = ast::encode_eval_context_state("", None, &pop_state);
+        let violations_obj = ast::apply(
+            &Func::Def("validate:Outbound Email".to_string()),
+            &ctx,
+            &d,
+        );
+        let violations = ast::decode_violations(&violations_obj);
+        assert!(!violations.is_empty(),
+            "forbidden constraint with trigger fact present must produce \
+             ≥1 violation; got {:?}; raw obj {:?}", violations, violations_obj);
+    }
+}
