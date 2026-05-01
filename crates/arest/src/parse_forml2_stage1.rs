@@ -619,8 +619,22 @@ fn inner_quantifiers(body: &str) -> Vec<&'static str> {
     // Pre-materialized so the filter below doesn't `format!` per call.
     const SHORT: &[&str] = &["at most", "at least"];
     const SHORT_ONE: &[&str] = &["at most one", "at least one"];
+    // Multi-clause superset suppression: when the body uses
+    // `<quant> of the following holds` (a Constraint Keyword that the
+    // grammar rule classifies as XC/XO/OR), the bare LONG quantifier
+    // hit is a false positive — the same words are part of the
+    // multi-clause keyword, not an inner UC signal. Without this
+    // suppression both classifiers fire and the cardinality
+    // translator (UC family) wins over the set translator (XO/XC/OR
+    // family), so `For each Task, exactly one of the following holds:
+    // …` lands as kind=UC instead of kind=XO.
     let long_hits: Vec<&'static str> = LONG.iter()
         .filter(|q| body.contains(**q))
+        .filter(|q| {
+            // Suppress when the keyword superset is present.
+            let superset = alloc::format!("{} of the following holds", q);
+            !body.contains(&superset)
+        })
         .copied()
         .collect();
     // A bare 'at most' / 'at least' is emitted only when its
