@@ -96,6 +96,14 @@ pub fn forward_chain_to_json(state: &Object, input_json: &str) -> String {
     // fact may use either side, and they must resolve to the same FT.
     let aliases = build_reading_aliases(state);
 
+    // Subtype chain: `Agent is a subtype of User` declares that every
+    // Agent fact is also a User fact (per core.md's `Resource is
+    // inherited instance of Noun`). We materialise the inherited
+    // instances here so downstream constraints / triggers / role
+    // bindings can resolve `Agent → User` membership without each
+    // consumer re-walking the subtype graph.
+    let supertypes = build_supertype_chains(state);
+
     // 3. Build the SM trigger index.
     let trigger_idx = build_trigger_index(&inst_facts, &aliases);
     let webhook_idx = build_webhook_index(&inst_facts);
@@ -114,6 +122,16 @@ pub fn forward_chain_to_json(state: &Object, input_json: &str) -> String {
         }
     }
 
+    // 4b. Subtype-inheritance synthesis. For every input fact whose
+    // factType is a declared subtype noun, emit a sibling fact under
+    // each supertype in its chain (transitive). This is the runtime
+    // half of core.md's implicit `Resource is inherited instance of
+    // Noun` derivation, materialised here so the SM trigger derivation
+    // and any downstream join (deontic constraints, role bindings)
+    // sees the resource as an instance of every type it inherits from.
+    let inherited_facts = run_subtype_inheritance(&input_facts, &synthetic_facts, &supertypes);
+    synthetic_facts.extend(inherited_facts);
+
     // 5. SM trigger derivation. The input pool is union(input, synthetic).
     let pool: Vec<InputFact> = input_facts.iter().cloned()
         .chain(synthetic_facts.iter().cloned())
@@ -124,7 +142,7 @@ pub fn forward_chain_to_json(state: &Object, input_json: &str) -> String {
     let statuses = compute_resource_statuses(&triggered, &trigger_idx);
 
     // 7. Encode the result envelope.
-    encode_result(&triggered, &statuses, &yielded_by_ft, &synthetic_facts)
+    encode_result(&triggered, &statuses, &yielded_by_ft, &synthetic_facts, &supertypes)
 }
 
 // ── Input parsing ────────────────────────────────────────────────────
@@ -452,6 +470,92 @@ fn resolve_aliases(reading: &str, aliases: &ReadingAliases) -> Vec<String> {
     } else {
         alloc::vec![reading.to_string()]
     }
+}
+
+// ── Subtype chains ──────────────────────────────────────────────────
+//
+// `Agent is a subtype of User` declares an `is-a` relation. Stage-2's
+// `translate_subtypes` writes one Subtype-cell entry per declaration
+// with `subtype` + `supertype` bindings. We walk that cell once and
+// pre-compute, for each subtype noun, the transitive list of all its
+// supertypes. Lookup is then `supertypes.get(noun).unwrap_or(&Vec::new())`.
+
+fn build_supertype_chains(state: &Object) -> HashMap<String, Vec<String>> {
+    use alloc::collections::BTreeSet;
+    let mut direct: HashMap<String, Vec<String>> = HashMap::new();
+    let cell = fetch_or_phi("Subtype", state);
+    if let Some(items) = cell.as_seq() {
+        for f in items {
+            let Some(sub) = binding(f, "subtype") else { continue };
+            let Some(sup) = binding(f, "supertype") else { continue };
+            let entry = direct.entry(sub.to_string()).or_default();
+            if !entry.iter().any(|s| s == sup) { entry.push(sup.to_string()); }
+        }
+    }
+    // Also harvest from the InstanceFact cell shape produced by the
+    // implicit `Noun is subtype of Noun` reading in core.md, which
+    // lands as `subjectNoun=Noun, fieldName=is subtype of, objectNoun=Noun`.
+    let inst_cell = fetch_or_phi("InstanceFact", state);
+    if let Some(items) = inst_cell.as_seq() {
+        for f in items {
+            let Some(snoun) = binding(f, "subjectNoun") else { continue };
+            if snoun != "Noun" { continue; }
+            let Some(field) = binding(f, "fieldName") else { continue };
+            if !field.to_lowercase().contains("subtype") { continue; }
+            let Some(sub) = binding(f, "subjectValue") else { continue };
+            let Some(sup) = binding(f, "objectValue") else { continue };
+            let entry = direct.entry(sub.to_string()).or_default();
+            if !entry.iter().any(|s| s == sup) { entry.push(sup.to_string()); }
+        }
+    }
+    if direct.is_empty() { return direct; }
+    // Transitive closure: for each subtype, walk supertype chain.
+    let mut closed: HashMap<String, Vec<String>> = HashMap::new();
+    for sub in direct.keys() {
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        let mut frontier: Vec<String> = direct.get(sub).cloned().unwrap_or_default();
+        while let Some(n) = frontier.pop() {
+            if !visited.insert(n.clone()) { continue; }
+            if let Some(parents) = direct.get(&n) {
+                for p in parents { frontier.push(p.clone()); }
+            }
+        }
+        closed.insert(sub.clone(), visited.into_iter().collect());
+    }
+    closed
+}
+
+/// For every fact whose `fact_type` matches a known subtype noun,
+/// emit a sibling fact under each supertype in its closure. The
+/// derived fact preserves the subject and roles unchanged so a
+/// downstream consumer that asked about Users sees the Agent's
+/// resource id without distinguishing which subtype originally bound
+/// it. Resources that aren't subtype nouns round-trip nothing.
+fn run_subtype_inheritance(
+    input: &[InputFact],
+    synth: &[InputFact],
+    supertypes: &HashMap<String, Vec<String>>,
+) -> Vec<InputFact> {
+    if supertypes.is_empty() { return Vec::new(); }
+    let mut out: Vec<InputFact> = Vec::new();
+    for fact in input.iter().chain(synth.iter()) {
+        let Some(parents) = supertypes.get(&fact.fact_type) else { continue };
+        for parent in parents {
+            // Don't re-emit if an explicit fact for the supertype
+            // already exists in the input (subject + parent type).
+            let already = input.iter().any(|f| {
+                f.fact_type == *parent && f.subject == fact.subject
+                    && f.roles == fact.roles
+            });
+            if already { continue; }
+            out.push(InputFact {
+                fact_type: parent.clone(),
+                subject: fact.subject.clone(),
+                roles: fact.roles.clone(),
+            });
+        }
+    }
+    out
 }
 
 /// Per-noun reference scheme value-type names (e.g. Order → ["OrderId"]).
@@ -874,6 +978,7 @@ fn encode_result(
     statuses: &[(String, String)],
     yielded: &HashMap<String, Vec<HashMap<String, String>>>,
     synthesized: &[InputFact],
+    supertypes: &HashMap<String, Vec<String>>,
 ) -> String {
     let mut derived = serde_json::Map::new();
 
@@ -917,12 +1022,30 @@ fn encode_result(
         derived.insert(ft.clone(), serde_json::Value::Array(arr));
     }
 
-    // Materialised entity resources from synthesised facts (so the
-    // ingest test's "Invoice resource exists" assertion has something
-    // to find via the yielded fact's role values). The TDD spec is
-    // satisfied by the role-binding entries in the yielded fact array,
-    // so we don't allocate separate per-noun resource lists here.
-    let _ = synthesized;
+    // Resource is inherited instance of Noun (per core.md). For every
+    // synthesised fact whose factType matches a declared supertype, we
+    // emit a tuple {Resource, Noun} so the join in deontic constraints
+    // ("…where that User is Agent") and downstream membership checks
+    // can read the subtype-inheritance derivation directly.
+    let mut inherited_arr: Vec<serde_json::Value> = Vec::new();
+    for fact in synthesized {
+        // The synthesised fact carries factType = supertype. Only emit
+        // if at least one subtype maps into this supertype name (i.e.
+        // it really is a supertype, not just any synthesised fact).
+        let is_supertype = supertypes.values().any(|chain| chain.iter().any(|s| s == &fact.fact_type));
+        if !is_supertype { continue; }
+        let Some(subj) = &fact.subject else { continue };
+        let mut m = serde_json::Map::new();
+        m.insert("Resource".into(), serde_json::Value::String(subj.clone()));
+        m.insert("Noun".into(), serde_json::Value::String(fact.fact_type.clone()));
+        inherited_arr.push(serde_json::Value::Object(m));
+    }
+    if !inherited_arr.is_empty() {
+        derived.insert(
+            "Resource is inherited instance of Noun".into(),
+            serde_json::Value::Array(inherited_arr),
+        );
+    }
 
     let total: usize = triggered.len() + statuses.len()
         + yielded.values().map(|v| v.len()).sum::<usize>();
