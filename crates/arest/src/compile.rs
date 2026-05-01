@@ -431,7 +431,10 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
                         }
                     }
                     "State Machine Definition" => { sm.insert(f.subject_value.clone(), f.object_value.clone()); }
-                    "Event Type" => { event.insert(f.subject_value.clone(), f.object_value.clone()); }
+                    // Per metamodel commit 64f0494f: transitions are now triggered
+                    // by Fact Type (was Event Type, dropped). Accept both during
+                    // the migration grace window so older fixtures still work.
+                    "Fact Type" | "Event Type" => { event.insert(f.subject_value.clone(), f.object_value.clone()); }
                     _ => {}
                 };
                 (from, to, sm, event)

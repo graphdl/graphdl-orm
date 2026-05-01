@@ -34,6 +34,7 @@ export const STATE_READINGS = `# State
 Status(.Name) is an entity type.
 State Machine Definition(.Name) is an entity type.
 Transition(.id) is an entity type.
+Fact Type(.id) is an entity type.
 Noun(.Name) is an entity type.
 
 ## Fact Types
@@ -48,6 +49,7 @@ Status is initial in State Machine Definition.
 Transition is defined in State Machine Definition.
 Transition is from Status.
 Transition is to Status.
+Transition is triggered by Fact Type.
 `.trim()
 
 // ── Domain reading strings ──────────────────────────────────────────────────
@@ -73,6 +75,11 @@ Order was placed by Customer.
 Order has Priority.
 Order has Amount.
 
+### Order actions
+Customer places Order.
+Customer ships Order.
+Customer receives Order.
+
 ## Constraints
 Each Order was placed by exactly one Customer.
 Each Order has at most one Priority.
@@ -84,12 +91,15 @@ Status 'In Cart' is initial in State Machine Definition 'Order'.
 Transition 'place' is defined in State Machine Definition 'Order'.
 Transition 'place' is from Status 'In Cart'.
 Transition 'place' is to Status 'Placed'.
+Transition 'place' is triggered by Fact Type 'Customer places Order'.
 Transition 'ship' is defined in State Machine Definition 'Order'.
 Transition 'ship' is from Status 'Placed'.
 Transition 'ship' is to Status 'Shipped'.
+Transition 'ship' is triggered by Fact Type 'Customer ships Order'.
 Transition 'deliver' is defined in State Machine Definition 'Order'.
 Transition 'deliver' is from Status 'Shipped'.
 Transition 'deliver' is to Status 'Delivered'.
+Transition 'deliver' is triggered by Fact Type 'Customer receives Order'.
 `
 
 export const SUPPORT_READINGS = `# Support

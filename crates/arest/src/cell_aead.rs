@@ -281,10 +281,12 @@ impl CellAddress {
     /// HKDF salt and the AEAD AAD so a single canonical form ties the
     /// two together. Format:
     ///
-    ///     [u32 LE scope_len  | scope_bytes]
-    ///     [u32 LE domain_len | domain_bytes]
-    ///     [u32 LE name_len   | name_bytes]
-    ///     [u64 LE version]
+    /// ```text
+    /// [u32 LE scope_len  | scope_bytes]
+    /// [u32 LE domain_len | domain_bytes]
+    /// [u32 LE name_len   | name_bytes]
+    /// [u64 LE version]
+    /// ```
     ///
     /// Length prefixes prevent boundary-collision attacks where
     /// e.g. (scope = "ab", domain = "cde") would collide with
