@@ -1734,6 +1734,16 @@ pub fn translate_cardinality_constraints(classified_state: &Object) -> Vec<Objec
         // sentence a rule, even when it incidentally contains a `some`
         // quantifier inside an antecedent clause.
         if classifications_contains(classified_state, stmt_id, "Derivation Rule") { continue; }
+        // Same exclusion applies for deontic constraints: a sentence
+        // carrying `It is forbidden/obligatory/permitted that …` is a
+        // deontic over the body's fact pattern, NOT an alethic UC/MC
+        // over its inner quantifier. Without this guard a shape like
+        // `It is forbidden that some User approves X` would surface
+        // both an MC alethic constraint (from the inner `some`
+        // quantifier) and a deontic constraint — and consumers
+        // reading the Constraint cell would treat the alethic MC as
+        // an obligation, the opposite of the author's intent.
+        if deontic_operator_for(classified_state, stmt_id).is_some() { continue; }
         let text = statement_text(classified_state, stmt_id).unwrap_or_default();
         let entity = head_noun_for(classified_state, stmt_id).unwrap_or_default();
         let is_fc = classifications_contains(classified_state, stmt_id, "Frequency Constraint");
@@ -1825,17 +1835,32 @@ pub fn translate_deontic_constraints(classified_state: &Object) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
-        if !classifications_contains(classified_state, stmt_id, "Deontic Constraint") {
-            continue;
-        }
+        // Per forml2-grammar.md:141-143, a Statement is classified as
+        // 'Deontic Constraint' iff it carries one of the Deontic
+        // Operator literals ('obligatory' / 'forbidden' / 'permitted').
+        // The classifier rule's fixpoint is supposed to add the
+        // 'Deontic Constraint' tag, but the meta-circular grammar
+        // pipeline doesn't always materialise it for statements that
+        // ALSO carry a Quantifier (the cardinality classifier wins
+        // the dispatch). The translator's source-of-truth signal is
+        // the deontic operator itself, recorded by stage1 in
+        // `Statement_has_Deontic_Operator`. Check that directly so
+        // shapes like `It is forbidden that some X is Y'd ...` (where
+        // a 'some' inner quantifier sits next to the forbidden prefix)
+        // still emit a deontic-modality constraint.
+        let op = deontic_operator_for(classified_state, stmt_id);
+        let classified_deontic = classifications_contains(
+            classified_state, stmt_id, "Deontic Constraint",
+        );
+        if op.is_none() && !classified_deontic { continue; }
         let text = statement_text(classified_state, stmt_id).unwrap_or_default();
-        let op = deontic_operator_for(classified_state, stmt_id).unwrap_or_default();
+        let op_str = op.unwrap_or_default();
         let entity = head_noun_for(classified_state, stmt_id).unwrap_or_default();
         out.push(fact_from_pairs(&[
             ("id",               text.as_str()),
             ("kind",             "UC"),
             ("modality",         "deontic"),
-            ("deonticOperator",  op.as_str()),
+            ("deonticOperator",  op_str.as_str()),
             ("text",             text.as_str()),
             ("entity",           entity.as_str()),
         ]));
