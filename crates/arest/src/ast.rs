@@ -2599,6 +2599,12 @@ fn platform_apply_command(x: &Object, d: &Object) -> Object {
 /// `{command, population}` envelope. Unknown shapes are tolerated —
 /// malformed entries are skipped, not fatal — same forgiving
 /// contract as `forward_chain_to_json`.
+///
+/// `cfg(not(no_std))` because the body uses serde_json — the no_std
+/// kernel target excludes serde_json (HATEOAS extract path takes a
+/// different deserialiser), so the function itself is too. This
+/// matches the gate on the only caller, `platform_apply_command`.
+#[cfg(not(feature = "no_std"))]
 fn ingest_population_into(d: &Object, population_json: &str) -> Object {
     let parsed: serde_json::Value = match serde_json::from_str(population_json) {
         Ok(v) => v,
