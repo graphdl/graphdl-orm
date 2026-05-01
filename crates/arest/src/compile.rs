@@ -1639,6 +1639,76 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         diag!("  [profile] {} federation defs", backed_nouns.len());
     }
 
+    // ── Data Federation: populate:{verb} from "Verb is exported from JS Package" ──
+    // JS-library analog of the populate:{noun} block above (see
+    // readings/core/imports.md). Each Verb that is exported from a JS
+    // Package gets a populate:{verb} def carrying the Module Path +
+    // Symbol Name + package metadata. The runtime (host CLI, Cloudflare
+    // Worker, kernel) reads this def and binds the local JS function
+    // into DEFS via `register_runtime_fn`. Parallel populate_import:{verb}
+    // Platform-fn name follows the same dispatch pattern as
+    // populate_fetch:{noun}: hosts install a sync callback via
+    // `ast::install_platform_fn("populate_import:<verb>", ...)`.
+    {
+        // Build JS Package metadata table from instance facts.
+        let mut js_packages: HashMap<String, HashMap<String, String>> = HashMap::new();
+        c_instance_facts.iter()
+            .filter(|f| f.subject_noun == "JS Package")
+            .for_each(|f| {
+                js_packages.entry(f.subject_value.clone())
+                    .or_default()
+                    .insert(f.field_name.clone(), f.object_value.clone());
+            });
+
+        // Build verb → JS Package mappings from "Verb is exported from JS Package".
+        let exported_verbs: Vec<(String, String)> = c_instance_facts.iter()
+            .filter(|f| f.field_name.contains("exported") && f.object_noun == "JS Package")
+            .map(|f| (f.subject_value.clone(), f.object_value.clone()))
+            .collect();
+
+        // Per-verb Module Path / Symbol Name lookups (from "Verb has X").
+        let verb_module_paths: HashMap<String, String> = c_instance_facts.iter()
+            .filter(|f| f.subject_noun == "Verb" && f.field_name.contains("Module_Path"))
+            .map(|f| (f.subject_value.clone(), f.object_value.clone()))
+            .collect();
+        let verb_symbol_names: HashMap<String, String> = c_instance_facts.iter()
+            .filter(|f| f.subject_noun == "Verb" && f.field_name.contains("Symbol_Name"))
+            .map(|f| (f.subject_value.clone(), f.object_value.clone()))
+            .collect();
+
+        defs.extend(exported_verbs.iter().map(|(verb_name, package_name)| {
+            let pkg = js_packages.get(package_name);
+            let version = pkg.and_then(|p| p.iter().find(|(k, _)| k.contains("Version")).map(|(_, v)| v.as_str())).unwrap_or("");
+            let pkg_mgr = pkg.and_then(|p| p.iter().find(|(k, _)| k.contains("Package_Manager")).map(|(_, v)| v.as_str())).unwrap_or("");
+            let module_path = verb_module_paths.get(verb_name).map(|s| s.as_str()).unwrap_or("");
+            let symbol_name = verb_symbol_names.get(verb_name).map(|s| s.as_str()).unwrap_or("");
+
+            let config = Object::seq(vec![
+                Object::seq(vec![Object::atom("kind"), Object::atom("js-import")]),
+                Object::seq(vec![Object::atom("package"), Object::atom(package_name)]),
+                Object::seq(vec![Object::atom("module_path"), Object::atom(module_path)]),
+                Object::seq(vec![Object::atom("symbol_name"), Object::atom(symbol_name)]),
+                Object::seq(vec![Object::atom("version"), Object::atom(version)]),
+                Object::seq(vec![Object::atom("package_manager"), Object::atom(pkg_mgr)]),
+                Object::seq(vec![Object::atom("verb"), Object::atom(verb_name)]),
+            ]);
+
+            (format!("populate:{}", verb_name), Func::constant(config))
+        }));
+        // Parallel emission of populate_import:{verb} as a dispatchable
+        // Platform name. Hosts install a sync callback via
+        // `ast::install_platform_fn("populate_import:<verb>", ...)`
+        // that reads the compile-emitted populate:{verb} config,
+        // performs the dynamic import (e.g. `import { symbol } from
+        // 'module'`), and registers the function. Without an installed
+        // callback, apply_platform returns Bottom — safe default.
+        defs.extend(exported_verbs.iter().map(|(verb_name, _)| {
+            let key = format!("populate_import:{}", verb_name);
+            (key.clone(), Func::Platform(key))
+        }));
+        diag!("  [profile] {} JS-import federation defs", exported_verbs.len());
+    }
+
     // Query defs â€” Î±(schema â†’ Platform dispatch). query:{ft_id} reads
     // the fact-type cell from live D and returns matching facts as a
     // JSON array, optionally filtered by role bindings in the operand.
@@ -5839,5 +5909,138 @@ mod schema_tests {
             "compiled {} under its allowed_writes must refuse metamodel store",
             user_def_name
         );
+    }
+}
+
+// ── Federation: populate:{verb} from "Verb is exported from JS Package" ──
+
+#[cfg(test)]
+mod populate_imports_test {
+    use super::*;
+    use crate::ast::{self, Object, fact_from_pairs};
+
+    /// Build Object state with one JS Package noun, one Verb noun,
+    /// and instance facts declaring that Verb is exported from the
+    /// package, plus Module Path / Symbol Name / Version / Package
+    /// Manager facts. Mirrors the cell shape the parser emits for
+    /// readings/core/imports.md + a templates/vercel-ai.md domain.
+    fn state_with_one_js_import() -> Object {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "JS Package"), ("objectType", "entity"),
+        ]));
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Verb"), ("objectType", "entity"),
+        ]));
+
+        // Instance facts. fieldName uses canonical FT id form (with
+        // underscores) — this is what stage-2 emits when the FT is
+        // declared (see parse_forml2_stage2::translate_instance_facts_with_ft_ids).
+        // The compile-side filter uses .contains() so the substring match
+        // is robust to either canonical or raw-verb fallback shapes.
+        cells.entry("InstanceFact".into()).or_default().push(fact_from_pairs(&[
+            ("subjectNoun",  "Verb"),
+            ("subjectValue", "streamText"),
+            ("fieldName",    "Verb_is_exported_from_JS_Package"),
+            ("objectNoun",   "JS Package"),
+            ("objectValue",  "ai"),
+        ]));
+        cells.entry("InstanceFact".into()).or_default().push(fact_from_pairs(&[
+            ("subjectNoun",  "Verb"),
+            ("subjectValue", "streamText"),
+            ("fieldName",    "Verb_has_Module_Path"),
+            ("objectNoun",   ""),
+            ("objectValue",  "ai"),
+        ]));
+        cells.entry("InstanceFact".into()).or_default().push(fact_from_pairs(&[
+            ("subjectNoun",  "Verb"),
+            ("subjectValue", "streamText"),
+            ("fieldName",    "Verb_has_Symbol_Name"),
+            ("objectNoun",   ""),
+            ("objectValue",  "streamText"),
+        ]));
+        cells.entry("InstanceFact".into()).or_default().push(fact_from_pairs(&[
+            ("subjectNoun",  "JS Package"),
+            ("subjectValue", "ai"),
+            ("fieldName",    "JS_Package_has_Version"),
+            ("objectNoun",   ""),
+            ("objectValue",  "5.0.0"),
+        ]));
+        cells.entry("InstanceFact".into()).or_default().push(fact_from_pairs(&[
+            ("subjectNoun",  "JS Package"),
+            ("subjectValue", "ai"),
+            ("fieldName",    "JS_Package_has_Package_Manager"),
+            ("objectNoun",   ""),
+            ("objectValue",  "npm"),
+        ]));
+        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect())
+    }
+
+    /// Helper: extract a key/value pair from a Constant-Func-encoded
+    /// populate config. The def is `Func::Constant(config)`; defs_to_state
+    /// stores it as `func_to_object(Func::Constant(c)) = <', c>`. We
+    /// unwrap that envelope, then walk the inner Seq for `(key, atom)`
+    /// pairs.
+    fn config_binding(populate: &Object, key: &str) -> Option<String> {
+        let inner = populate.as_seq()
+            .filter(|items| items.len() == 2 && items[0].as_atom() == Some("'"))
+            .map(|items| &items[1])
+            .unwrap_or(populate);
+        inner.as_seq()?.iter().find_map(|pair| {
+            let items = pair.as_seq()?;
+            (items.len() == 2 && items[0].as_atom() == Some(key))
+                .then(|| items[1].as_atom().unwrap_or("").to_string())
+        })
+    }
+
+    /// Each Verb that is exported from a JS Package gets a
+    /// `populate:{verb}` def encoding the import metadata. Without
+    /// this cell, support.do can't bind Vercel AI / Vercel Chat
+    /// functions declaratively at boot.
+    #[test]
+    fn populate_import_def_emitted_for_js_exported_verb() {
+        let state = state_with_one_js_import();
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        let pop = ast::fetch("populate:streamText", &d);
+        assert_ne!(pop, Object::Bottom,
+            "populate:streamText should exist (Verb 'streamText' exported from JS Package 'ai'); \
+             defs keys: {:?}",
+            defs.iter().map(|(n, _)| n.as_str()).filter(|n| n.starts_with("populate")).collect::<Vec<_>>());
+
+        assert_eq!(config_binding(&pop, "kind").as_deref(), Some("js-import"));
+        assert_eq!(config_binding(&pop, "package").as_deref(), Some("ai"));
+        assert_eq!(config_binding(&pop, "module_path").as_deref(), Some("ai"));
+        assert_eq!(config_binding(&pop, "symbol_name").as_deref(), Some("streamText"));
+        assert_eq!(config_binding(&pop, "version").as_deref(), Some("5.0.0"));
+        assert_eq!(config_binding(&pop, "package_manager").as_deref(), Some("npm"));
+        assert_eq!(config_binding(&pop, "verb").as_deref(), Some("streamText"));
+    }
+
+    /// Parallel populate_import:{verb} Platform-fn def. This is the
+    /// dispatch handle that hosts wire to a runtime callback that
+    /// performs the actual `import { symbol } from 'module'`. Without
+    /// the def, `Func::Def("populate_import:streamText")` returns
+    /// Bottom and the host has no entry point to install against.
+    #[test]
+    fn populate_import_platform_fn_def_emitted_for_js_exported_verb() {
+        let state = state_with_one_js_import();
+        let defs = compile_to_defs_state(&state);
+
+        let (_, func) = defs.iter()
+            .find(|(n, _)| n == "populate_import:streamText")
+            .unwrap_or_else(|| panic!(
+                "compile must emit populate_import:streamText Platform fn; got keys {:?}",
+                defs.iter().map(|(n, _)| n.as_str())
+                    .filter(|n| n.contains("streamText") || n.contains("populate_import"))
+                    .collect::<Vec<_>>()
+            ));
+        match func {
+            Func::Platform(name) => assert_eq!(name, "populate_import:streamText",
+                "populate_import:{{verb}} must dispatch to the same-named Platform fn"),
+            other => panic!("populate_import:streamText must be Func::Platform, got {:?}",
+                std::mem::discriminant(other)),
+        }
     }
 }
