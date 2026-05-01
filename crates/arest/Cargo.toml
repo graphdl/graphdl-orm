@@ -62,6 +62,16 @@ path = "tests/platform_zip.rs"
 name = "render_reading"
 path = "tests/render_reading.rs"
 
+# Cell-AEAD fuzz harness (#669). Property-based round-trip,
+# cross-tenant rejection, tamper detection, and AAD-binding tests
+# over `cell_seal` / `cell_open`. Standalone binary so a failure
+# here surfaces independently of the main integration suite, and so
+# proptest's per-runner state doesn't have to interleave with other
+# `tests/all.rs` submodules.
+[[test]]
+name = "cell_aead_fuzz"
+path = "tests/cell_aead_fuzz.rs"
+
 [features]
 # `core` is the always-on bundled-readings scope (Theorem 1-5
 # backbone): readings/core/{core,state,instances,outcomes,validation,
@@ -230,6 +240,11 @@ spin = { version = "0.9", default-features = false, features = ["mutex", "spin_m
 # lib's no_std feature path. Pinned at 0.2 (same major as everything
 # else in the ecosystem currently depends on).
 [dev-dependencies]
+# proptest (#669): property-based fuzz harness for the cell-AEAD
+# primitive (`tests/cell_aead_fuzz.rs`). Pinned at 1.x — same major
+# the rest of the Rust ecosystem currently tracks. Dev-only, so the
+# kernel / worker / WASM builds never see it.
+proptest = "1"
 
 # getrandom: gated on non-UEFI; emits compile_error! on *-unknown-uefi.
 # Native (Linux/macOS/Windows) host CLI uses the OS-syscall backend.
