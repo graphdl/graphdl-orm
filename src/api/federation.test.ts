@@ -85,7 +85,7 @@ describe('Federation end-to-end', () => {
 
   it('organizations.md declares User backed by auth.vin', () => {
     const orgReadings = readFileSync(
-      resolve(__dirname, '../../readings/organizations.md'), 'utf-8'
+      resolve(__dirname, '../../readings/templates/organizations.md'), 'utf-8'
     )
     expect(orgReadings).toContain("Noun 'User' is backed by External System 'auth.vin'")
     expect(orgReadings).toContain("Noun 'User' has URI '/users'")
@@ -93,27 +93,30 @@ describe('Federation end-to-end', () => {
 
   it('organizations.md declares API Product backed by auto.dev', () => {
     const orgReadings = readFileSync(
-      resolve(__dirname, '../../readings/organizations.md'), 'utf-8'
+      resolve(__dirname, '../../readings/templates/organizations.md'), 'utf-8'
     )
     expect(orgReadings).toContain("Noun 'API Product' is backed by External System 'auto.dev'")
   })
 
   it('organizations.md declares Stripe nouns backed by stripe', () => {
     const orgReadings = readFileSync(
-      resolve(__dirname, '../../readings/organizations.md'), 'utf-8'
+      resolve(__dirname, '../../readings/templates/organizations.md'), 'utf-8'
     )
     expect(orgReadings).toContain("Noun 'Stripe Customer' is backed by External System 'stripe'")
     expect(orgReadings).toContain("Noun 'Stripe Customer' has URI '/customers'")
     expect(orgReadings).toContain("Noun 'Stripe Subscription' is backed by External System 'stripe'")
   })
 
-  it('core.md declares stripe External System', () => {
-    const coreReadings = readFileSync(
-      resolve(__dirname, '../../readings/core.md'), 'utf-8'
+  it('connectors.md declares stripe External System', () => {
+    // Post-#437 reorg: the stripe External System declaration moved from
+    // readings/core.md (singular, pre-reorg) into readings/templates/
+    // connectors.md alongside other tenant-facing connector definitions.
+    const connectorReadings = readFileSync(
+      resolve(__dirname, '../../readings/templates/connectors.md'), 'utf-8'
     )
-    expect(coreReadings).toContain("External System 'stripe' has URL 'https://api.stripe.com/v1'")
-    expect(coreReadings).toContain("External System 'stripe' has Header 'Authorization'")
-    expect(coreReadings).toContain("External System 'stripe' has Prefix 'Bearer'")
+    expect(connectorReadings).toContain("External System 'stripe' has URL 'https://api.stripe.com/v1'")
+    expect(connectorReadings).toContain("External System 'stripe' has Header 'Authorization'")
+    expect(connectorReadings).toContain("External System 'stripe' has Prefix 'Bearer'")
   })
 
   it('DEFS registers auth.vin, auto.dev, and stripe external systems', () => {

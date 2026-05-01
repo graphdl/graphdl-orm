@@ -4,9 +4,11 @@
  * Parses FORML2 readings via the WASM engine and returns the compiled IR + entity list.
  * Every paper verification test file imports from here.
  *
- * Note on the WASM debug format: system(handle, 'debug', '') returns a display string
- * of the form <<nouns, <N1, N2>>, <factTypes, <<id, reading>>>, <constraints, <...>>, <totalFacts, N>>.
- * parseDebugIR() converts this into the { nouns, factTypes, constraints } shape used throughout.
+ * The WASM `system(handle, 'debug', '')` emits a JSON envelope:
+ *   { nouns: [...], factTypes: [{id, reading}], constraints: [{kind, modality, text}],
+ *     stateMachines: [...], totalFacts: N }
+ * (Older builds emitted an S-expression display; parseDebugIR keeps a
+ * fallback for that shape in case a stale WASM is loaded.)
  */
 
 import {
@@ -135,47 +137,61 @@ export interface CompiledDomain {
 // ── Debug format parser ─────────────────────────────────────────────────────
 
 /**
- * Parse the WASM debug display format into a structured IR object.
+ * Parse the WASM debug envelope into a structured IR object.
  *
- * The format is: <<nouns, <N1, N2>>, <factTypes, <<id, reading>>>, <constraints, <...>>, <totalFacts, N>>
+ * Current shape (JSON):
+ *   { nouns: string[],
+ *     factTypes: [{id, reading}],
+ *     constraints: [{kind, modality, text}],
+ *     stateMachines: [...],
+ *     totalFacts: N }
  *
- * This is NOT JSON — it is AREST's internal display notation.
- * We extract the sections by finding the named top-level fields.
+ * Legacy fallback: the older display notation
+ *   <<nouns, <N1, N2>>, <factTypes, ...>, <constraints, ...>, <totalFacts, N>>
+ * is still recognized so a stale wasm doesn't silently produce empty IR.
  */
 function parseDebugIR(raw: string): CompiledDomain['ir'] {
-  // Extract nouns section: <<nouns, <N1, N2, ...>>
+  // Try JSON first.
+  const trimmed = raw.trim()
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed) as {
+        nouns?: string[]
+        factTypes?: Array<{ id: string; reading: string }>
+        constraints?: Array<{ kind: string; text: string }>
+        totalFacts?: number
+      }
+      return {
+        nouns: parsed.nouns ?? [],
+        factTypes: parsed.factTypes ?? [],
+        constraints: parsed.constraints ?? [],
+        totalFacts: parsed.totalFacts ?? 0,
+        raw,
+      }
+    } catch {
+      // fall through to legacy parser
+    }
+  }
+
+  // Legacy display-notation parser (kept for safety).
   const nounsMatch = raw.match(/<nouns,\s*<([^>]*)>/)
   const nouns: string[] = nounsMatch
     ? nounsMatch[1].split(',').map(s => s.trim()).filter(Boolean)
     : []
-
-  // Extract factTypes section: <factTypes, <<id, reading>, <id, reading>>>
   const factTypes: Array<{ id: string; reading: string }> = []
   const ftSection = raw.match(/<factTypes,\s*(<<.*?>>|φ)/)
   if (ftSection && ftSection[1] !== 'φ') {
-    const ftContent = ftSection[1]
-    // Each entry is <id, reading text>
-    const ftEntries = ftContent.matchAll(/<([^,<>]+),\s*([^<>]+)>/g)
-    for (const m of ftEntries) {
-      factTypes.push({ id: m[1].trim(), reading: m[2].trim() })
-    }
+    const ftEntries = ftSection[1].matchAll(/<([^,<>]+),\s*([^<>]+)>/g)
+    for (const m of ftEntries) factTypes.push({ id: m[1].trim(), reading: m[2].trim() })
   }
-
-  // Extract constraints section
   const constraints: Array<{ kind: string; text: string }> = []
   const cSection = raw.match(/<constraints,\s*(<<.*?>>|φ)/)
   if (cSection && cSection[1] !== 'φ') {
-    const cContent = cSection[1]
-    const cEntries = cContent.matchAll(/<([^,<>]+),\s*([^<>]+)>/g)
-    for (const m of cEntries) {
-      constraints.push({ kind: m[1].trim(), text: m[2].trim() })
-    }
+    const cEntries = cSection[1].matchAll(/<([^,<>]+),\s*([^<>]+)>/g)
+    for (const m of cEntries) constraints.push({ kind: m[1].trim(), text: m[2].trim() })
   }
-
-  // Extract totalFacts
   const tfMatch = raw.match(/<totalFacts,\s*(\d+)>/)
   const totalFacts = tfMatch ? parseInt(tfMatch[1], 10) : 0
-
   return { nouns, factTypes, constraints, totalFacts, raw }
 }
 
