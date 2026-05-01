@@ -74,22 +74,28 @@ An order domain is declared in FORML\,2:
 \begin{lstlisting}
 Order(.OrderId) is an entity type.
 Customer(.Name) is an entity type.
-Order was placed by Customer.
-  Each Order was placed by exactly one
+Order is placed by Customer
+  / Customer places Order.
+  Each Order is placed by exactly one
   Customer.
+Customer ships Order.
 Status 'In Cart' is initial in
   State Machine Definition 'Order'.
 Transition 'place' is from
   Status 'In Cart'.
 Transition 'place' is to
   Status 'Placed'.
+Transition 'place' is triggered by
+  Fact Type 'Customer places Order'.
 Transition 'ship' is from
   Status 'Placed'.
 Transition 'ship' is to
   Status 'Shipped'.
+Transition 'ship' is triggered by
+  Fact Type 'Customer ships Order'.
 \end{lstlisting}
 
-\noindent These nine readings compile to a database table, a foreign key, a uniqueness constraint, and a three-state machine, which is everything needed to run an order pipeline. Consider the constraint ``Each Order was placed by exactly one Customer.'' The compiler recognizes this as a uniqueness restriction on the $\mathit{placedBy}$ role and emits:
+\noindent These twelve readings compile to a database table, a foreign key, a uniqueness constraint, and a three-state machine driven by two trigger fact types, which is everything needed to run an order pipeline. Consider the constraint ``Each Order is placed by exactly one Customer.'' The compiler recognizes this as a uniqueness restriction on the $\mathit{placedBy}$ role and emits:
 \begin{align*}
 (\rho\,\mathit{reading})\!:\!P_{\mathit{placedBy}} = \mathit{Filter}(\mathit{count}(s_1) > 1) : P_{\mathit{placedBy}}
 \end{align*}
@@ -151,7 +157,7 @@ A state machine processes events chronologically:
 \end{align}
 The transition function is a chain of conditions~\cite[Sec.\,11.2.4]{backus78}: $p$ tests whether $\langle s, e\rangle$ matches a declared transition, $f$ returns the target state, $g$ tries the next or returns $\bar{s}$ as fallback. The fold is pure replay. Applying the event stream produces the current state without side effects.
 
-\smallskip\noindent\textbf{Facts as events.} Creating a fact fires an event. The event type is the fact type; the event arguments are the role bindings. A transition that declares its trigger as a fact type fires automatically when that fact enters $P$. During $\mathit{create}$~(\ref{eq:create}), $\mathit{resolve}$ and $\mathit{derive}$ push facts into $P$; each produces an event that the machine fold~(\ref{eq:sm}) consumes. An entity whose facts satisfy all outgoing transition guards advances from its initial status to its terminal status in a single $\mathit{SYSTEM}$ call. External events from a message queue, a webhook, or a peer enter the same stream without requiring a local fact. The machine does not distinguish between fact-fired and externally fired events; both are elements of $E$ in the fold~(\ref{eq:sm}).
+\smallskip\noindent\textbf{Facts as events.} Creating a fact fires an event. The event type is the fact type; the event arguments are the role bindings. A transition that declares its trigger as a fact type fires automatically when that fact enters $P$. The metamodel reifies this in two derivations: \emph{Fact triggered Transition for Resource} joins each fact in $P$ to the transitions whose trigger fact type matches, and \emph{Resource is currently in Status} folds those tuples latest-wins per resource. The machine fold~(\ref{eq:sm}) is the same operation; the derivations expose its inputs and output as ordinary facts subject to constraints, derivation rules, and HATEOAS projection. During $\mathit{create}$~(\ref{eq:create}), $\mathit{resolve}$ and $\mathit{derive}$ push facts into $P$; each produces an event that the machine fold~(\ref{eq:sm}) consumes. An entity whose facts satisfy all outgoing transition guards advances from its initial status to its terminal status in a single $\mathit{SYSTEM}$ call. External events from a message queue, a webhook, or a peer enter the same stream without requiring a local fact: an inbound webhook is itself a fact (\emph{Webhook Event Type yields Fact Type with Role from JSON Path}), and the runtime materializes the yielded facts into $P$ before the fold runs. The machine does not distinguish between fact-fired and externally fired events; both are elements of $E$ in the fold~(\ref{eq:sm}).
 
 Deletion is a transition to a terminal state. The entity reaches a state with no outgoing transitions and is excluded from query results by restriction.
 
