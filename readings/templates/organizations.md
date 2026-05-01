@@ -5,7 +5,7 @@
 Organization(.Slug) is an entity type.
 App(.Slug) is an entity type.
 Domain(.Slug) is an entity type.
-User(.Email) is an entity type.
+User(.id) is an entity type.
 External System(.Name) is an entity type.
 Generator(.Name) is an entity type.
 
@@ -32,6 +32,12 @@ User owns Organization.
 User administers Organization.
 
 User belongs to Organization.
+
+### User
+
+User has Email.
+  Each User has at most one Email.
+  For each Email, exactly one User has that Email.
 
 ### App
 
@@ -96,7 +102,7 @@ No Domain may cycle back to itself via one or more traversals through depends on
 
 ## Derivation Rules
 
-If some User authenticates and that User does not own any Organization then that User owns some Organization and that Organization has Name that is that User's Email.
+If some User authenticates and that User has some Email and that User does not own any Organization then that User owns some Organization and that Organization has Name that is that Email.
 
 + User accesses Domain if User owns Organization and App belongs to that Organization and Domain belongs to that App.
 + User accesses Domain if User administers Organization and App belongs to that Organization and Domain belongs to that App.
