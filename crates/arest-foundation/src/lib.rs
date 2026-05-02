@@ -34,6 +34,14 @@ pub mod ring;
 pub mod entropy;
 pub mod entropy_mix;
 pub mod entropy_net;
+pub mod csprng;
+// `crypto` and `cell_aead` carry `#[cfg(not(feature = "no_std"))]` and
+// no_std-clean module bodies respectively. Both depend on csprng +
+// entropy which now live as siblings; their `crate::csprng` /
+// `crate::entropy` imports resolve to the foundation's own modules.
+#[cfg(not(feature = "no_std"))]
+pub mod crypto;
+pub mod cell_aead;
 // `naming` stays in arest for now — its slug_for_noun /
 // resolve_slug_to_noun helpers reach `crate::ast::{fetch_or_phi,
 // binding}` to walk the Noun cell. Splitting it would mean either

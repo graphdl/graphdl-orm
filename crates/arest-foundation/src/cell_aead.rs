@@ -237,9 +237,16 @@ pub fn current_tenant_master() -> Option<TenantMasterKey> {
 /// mutation now that the slot type is `Mutex<Option<_>>`.
 ///
 /// Production code MUST NOT call this.
-#[cfg(test)]
+///
+/// Exposed across the arest-foundation→arest crate boundary under
+/// `test-helpers` (#686) so arest's tests (cell_aead doc-tests live
+/// in foundation now, but tenant-master-rotation flows in arest's
+/// cli/tenant_master_host + freeze + cloudflare tests still reach in
+/// to clear the slot between cases). Production builds never see the
+/// symbol because arest only enables `test-helpers` in dev-deps.
+#[cfg(any(test, feature = "test-helpers"))]
 #[allow(dead_code)]
-pub(crate) fn reset_tenant_master_for_test() {
+pub fn reset_tenant_master_for_test() {
     *GLOBAL_TENANT_MASTER.lock() = None;
 }
 

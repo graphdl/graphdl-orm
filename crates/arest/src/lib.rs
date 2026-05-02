@@ -200,7 +200,7 @@ pub mod command;
 #[cfg(not(feature = "no_std"))]
 pub mod cli;
 #[cfg(not(feature = "no_std"))]
-pub mod crypto;
+pub use arest_foundation::crypto;  // #686 stage 5 — moved out of arest
 #[cfg(not(feature = "no_std"))]
 pub mod generators;
 #[cfg(not(feature = "no_std"))]
@@ -252,7 +252,7 @@ pub use arest_foundation::entropy_mix;  // #686 stage 4 — moved out of arest
 // Compose with MixingEntropySource so network outage degrades to OS RNG
 // rather than panicking the engine.
 pub use arest_foundation::entropy_net;  // #686 stage 4 — moved out of arest
-pub mod csprng;
+pub use arest_foundation::csprng;  // #686 stage 5 — moved out of arest
 // Cell-level AEAD (#659) — per-cell ChaCha20-Poly1305 with HKDF-SHA256
 // derivation from a per-tenant master. Pure no_std; sits next to
 // `csprng` because it draws nonces from the same process-wide CSPRNG
@@ -260,7 +260,7 @@ pub mod csprng;
 // in-memory operating set (DO write, kernel block_storage flush,
 // freeze/thaw bytes, network frame) seals through this module so a
 // leaked DO doesn't decrypt sibling cells without the tenant master.
-pub mod cell_aead;
+pub use arest_foundation::cell_aead;  // #686 stage 5 — moved out of arest
 // `externals` (#agents-1 reform) — doc + worked example for the
 // canonical "external function in DEFS" pattern. *No new machinery*:
 // the registration / dispatch / async / citation surface is entirely
