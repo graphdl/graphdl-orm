@@ -200,7 +200,7 @@ wasm-lower = ["dep:wasm-encoder", "dep:wasmi"]
 # (sha2 was previously gated here but is now an unconditional dep
 # under default-features = false because the cell-AEAD path #659
 # needs HKDF-SHA256 in the no_std kernel + worker builds too.)
-std-deps = ["dep:serde", "dep:serde_json", "dep:regex", "dep:hmac", "dep:subtle", "dep:flate2", "hashbrown/serde"]
+std-deps = ["dep:serde", "dep:serde_json", "dep:regex", "dep:hmac", "dep:subtle", "dep:flate2", "hashbrown/serde", "arest-foundation/std-deps"]
 # no_std build target — gates every `use std::*` behind a
 # `std`/`no_std` split so the crate can be embedded in bare-metal
 # contexts (FPGA soft-cores, x86_64 kernel via #175+). Enable via:
@@ -208,7 +208,9 @@ std-deps = ["dep:serde", "dep:serde_json", "dep:regex", "dep:hmac", "dep:subtle"
 # Pulls `hashbrown` (HashMap) and `spin` (RwLock/Mutex/OnceLock),
 # both of which are unconditional deps — the feature flag only
 # toggles std / core / alloc selection in the crate itself.
-no_std = []
+# Forwards to arest-foundation/no_std so the leaf-pure modules
+# (sync, entropy, csprng, …) compile under core+alloc too.
+no_std = ["arest-foundation/no_std"]
 # SWIM-style gossip membership (Cluster-1). Pulls in std::net +
 # std::thread — incompatible with no_std. Off by default so embedded
 # and FPGA builds don't pay for a network stack they won't use.
@@ -217,6 +219,13 @@ no_std = []
 cluster = []
 
 [dependencies]
+# arest-foundation (#686): leaf-pure no_std-clean primitives — sync
+# (this stage), then progressively naming/json_min/time_shim/ring,
+# then the entropy + crypto + cell-AEAD stack. Re-exported under the
+# same module names (`arest::sync` etc.) so call sites stay unchanged.
+# Feature flags forward: when arest is built with `no_std`, the same
+# flag is propagated so the foundation stays kernel-clean.
+arest-foundation = { path = "../arest-foundation", default-features = false }
 # serde / serde_json / regex require std — made optional so the no_std
 # build (kernel, FPGA) can exclude them. The `std-deps` feature bundles
 # them; it is on by default and disabled under `no_std`.

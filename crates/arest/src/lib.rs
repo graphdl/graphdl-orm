@@ -72,13 +72,17 @@ macro_rules! diag {
     ($($arg:tt)*) => { }
 }
 
-pub mod sync;
+// `sync` is re-exported from `arest-foundation` (#686). The module
+// moved out of this crate so cargo can codegen it once and skip
+// rebuilding it when only engine modules change. Call sites continue
+// to write `crate::sync::Mutex` / `arest::sync::Arc` — the re-export
+// makes both paths resolve unchanged.
+pub use arest_foundation::sync;
 // `sync` exports `Arc` (via `alloc::sync::Arc`) and spin-based
-// `Mutex`/`RwLock`/`OnceLock` that work on both std and no_std builds
-// — the cfg gate these imports used to carry was stale. Ungate so the
-// type appears in scope for the `ast` module's Arc<[Object]> Seq and
-// `Func::Native`'s Arc<dyn Fn>, even when the big std-only engine
-// block below is elided.
+// `Mutex`/`RwLock`/`OnceLock` that work on both std and no_std builds.
+// Ungate so the type appears in scope for the `ast` module's
+// Arc<[Object]> Seq and `Func::Native`'s Arc<dyn Fn>, even when the
+// big std-only engine block below is elided.
 use crate::sync::Arc;
 #[cfg(not(feature = "no_std"))]
 use crate::sync::Mutex;

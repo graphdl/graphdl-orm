@@ -55,6 +55,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 name = "arest"
 version = "0.9.0"
 dependencies = [
+ "arest-foundation",
  "chacha20poly1305",
  "console_error_panic_hook",
  "flate2",
@@ -75,6 +76,19 @@ dependencies = [
  "wasm-encoder 0.230.0",
  "wasmi",
  "wit-bindgen 0.41.0",
+]
+
+[[package]]
+name = "arest-foundation"
+version = "0.9.0"
+dependencies = [
+ "chacha20poly1305",
+ "hashbrown 0.14.5",
+ "hkdf",
+ "hmac",
+ "sha2",
+ "spin",
+ "subtle",
 ]
 
 [[package]]

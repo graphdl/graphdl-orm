@@ -1,0 +1,52 @@
+# crates/arest-foundation/Cargo.toml
+#
+# Foundation primitives sub-crate (#686).
+#
+# Carries the leaf-pure modules from arest that have zero reach into
+# ast / compile / parse_forml2 / evaluate: synchronisation primitives,
+# entropy + CSPRNG stack, crypto + cell-AEAD, naming/json_min/time_shim
+# helpers. The split exists so:
+#
+#   1. Faster incremental compiles — touching ast.rs no longer rebuilds
+#      the entropy stack or the AEAD code path.
+#   2. Tighter no_std contract — every module here MUST stay no_std-
+#      reachable; cross-target sweeps fail fast if a leaf module starts
+#      importing std accidentally.
+#   3. Reuse from sibling crates (arest-kernel, future arest-mini) without
+#      pulling in the full engine.
+#
+# Feature surface mirrors arest's: `no_std` toggles std/core selection,
+# `std-deps` bundles the optional serde/hmac/subtle stack, `cloudflare`
+# is the worker bundle (wasm-bindgen + minimum no_std-compatible deps).
+# Dependency versions are pinned identical to crates/arest/Cargo.toml so
+# the workspace cargo cache deduplicates builds.
+
+[package]
+name = "arest-foundation"
+version = "0.9.0"
+edition = "2021"
+description = "AREST foundation primitives: sync, naming, time, ring, entropy, csprng, crypto, cell-AEAD — leaf-pure no_std-clean modules underneath the engine"
+repository = "https://github.com/graphdl/arest"
+license = "AGPL-3.0-or-later"
+
+[features]
+# `no_std` matches arest's: when set, the crate compiles against
+# core+alloc and skips std-only modules. Default-off so host CLI builds
+# get the full surface; the kernel passes `--no-default-features`.
+no_std = []
+# `std-deps` bundles the optional crypto deps that need std (hmac /
+# subtle for crypto.rs's HMAC-SHA256 path). Mirrors arest's flag of
+# the same name.
+std-deps = ["dep:hmac", "dep:subtle"]
+default = ["std-deps"]
+
+[dependencies]
+# Versions pinned identical to crates/arest/Cargo.toml so cargo
+# deduplicates the build across both crates.
+spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex", "rwlock", "once"] }
+hashbrown = { version = "0.14" }
+sha2 = { version = "0.10", default-features = false }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+hkdf = { version = "0.12", default-features = false }
+hmac = { version = "0.12", optional = true }
+subtle = { version = "2", optional = true }
