@@ -38,6 +38,12 @@ no_std = []
 # subtle for crypto.rs's HMAC-SHA256 path). Mirrors arest's flag of
 # the same name.
 std-deps = ["dep:hmac", "dep:subtle"]
+# `test-helpers` exposes `entropy::TEST_LOCK` as `pub` so consuming
+# crates' test suites (arest's cell_aead/csprng/crypto/freeze/…) can
+# serialize against the same global-entropy-slot lock arest-foundation's
+# own tests use. Enabled in arest's [dev-dependencies] only — production
+# builds never link the symbol.
+test-helpers = []
 default = ["std-deps"]
 
 [dependencies]

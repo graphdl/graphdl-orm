@@ -300,6 +300,12 @@ spin = { version = "0.9", default-features = false, features = ["mutex", "spin_m
 # the rest of the Rust ecosystem currently tracks. Dev-only, so the
 # kernel / worker / WASM builds never see it.
 proptest = "1"
+# arest-foundation `test-helpers` (#686): exposes `entropy::TEST_LOCK`
+# so arest's own tests (cell_aead, csprng, crypto, cloudflare_entropy,
+# freeze, …) can serialize global-entropy-slot install/uninstall against
+# the same mutex arest-foundation's entropy tests use. Dev-only — the
+# foundation's `pub static TEST_LOCK` symbol stays out of production.
+arest-foundation = { path = "../arest-foundation", default-features = false, features = ["test-helpers"] }
 
 # getrandom: gated on non-UEFI; emits compile_error! on *-unknown-uefi.
 # Native (Linux/macOS/Windows) host CLI uses the OS-syscall backend.

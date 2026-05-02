@@ -219,8 +219,16 @@ impl EntropySource for DeterministicSource {
 // is mid-fill. Serialising via one process-wide lock keeps the
 // fixture installation atomic with the test body. Cross-module via
 // `pub(crate)`.
-#[cfg(test)]
-pub(crate) static TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+//
+// Exposed across the arest-foundation→arest crate boundary under the
+// `test-helpers` feature: arest's own tests (cell_aead, csprng,
+// crypto, cloudflare_entropy, freeze, …) install/uninstall the
+// global slot too, so they need to serialize against the same lock
+// arest-foundation's tests use. The feature is enabled in arest's
+// `[dev-dependencies] arest-foundation = { features = ["test-helpers"] }`
+// so production builds never link the symbol — only test binaries.
+#[cfg(any(test, feature = "test-helpers"))]
+pub static TEST_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 // ── Tests ────────────────────────────────────────────────────────────
 

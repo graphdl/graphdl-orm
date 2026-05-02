@@ -237,7 +237,7 @@ pub mod select_component_core;
 // the same primitive once their adapter (#572 / #574) installs an
 // `EntropySource`. Per-target adapters land in #569-#574; per-consumer
 // wires land in #575-#578.
-pub mod entropy;
+pub use arest_foundation::entropy;  // #686 stage 3 — moved out of arest
 // `entropy_mix` (#584 / Rand-X1): MixingEntropySource combines N
 // EntropySource children via XOR. The "anytrust" property — output is
 // uniform if even ONE child is uniform — gives defense-in-depth for
