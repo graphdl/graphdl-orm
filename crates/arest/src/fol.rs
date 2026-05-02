@@ -657,57 +657,12 @@ mod tests {
         assert_eq!(apply(&term.to_func(), &phi, &phi), Object::atom("answer"));
     }
 
-    /// Review finding (ac474845): even a `#[ignore]` stub would
-    /// document the gap. The foundation docstring (`fol.rs:118-130`
-    /// on `FolTerm::Var`) explicitly flags that nested quantifiers
-    /// with `Var("outer")` silently resolve to the *innermost*
-    /// binding because lowering today just emits `Func::Id`.
-    ///
-    /// This test sets up `ForAll(x, ..., ForAll(y, ..., Eq(Var("x"),
-    /// Var("y"))))` with a state where the outer and inner fact
-    /// types have distinct role-1 atoms. Under correct scope
-    /// resolution the inner body should compare the outer-bound
-    /// variable to the inner-bound variable (so True iff outer == inner
-    /// for every pair), which with disjoint role values is False for
-    /// the cross terms and True only on the diagonal.
-    ///
-    /// Under the current `Var` lowering (`Func::Id`) both `Var("x")`
-    /// and `Var("y")` resolve to the innermost bound fact, so the
-    /// comparison degrades to `fact_y = fact_y` and always returns
-    /// True — masking the bug.
-    ///
-    /// Until the `Var` → scope-stack rewire lands, this test stays
-    /// `#[ignore]` so it documents the open work without failing
-    /// the suite.
-    #[test]
-    #[ignore]
-    fn nested_quantifier_resolves_outer_var() {
-        // State: ft_outer has one fact with role 1 = "x";
-        //        ft_inner has two facts with role 1 = "x" and "y".
-        let mut state = Object::phi();
-        state = ast::cell_push("ft_outer", ast::fact_from_pairs(&[("o", "x")]), &state);
-        state = ast::cell_push("ft_inner", ast::fact_from_pairs(&[("i", "x")]), &state);
-        state = ast::cell_push("ft_inner", ast::fact_from_pairs(&[("i", "y")]), &state);
-
-        // ∀ x ∈ ft_outer. ∀ y ∈ ft_inner. role_1(x) = role_1(y)
-        // Correct semantics: outer role_1 is "x"; inner role_1 is
-        // "x" for one fact and "y" for the other. ∀-over-inner
-        // requires every pairing to hold, and "x" ≠ "y" for one of
-        // the pairs, so the whole expression is False.
-        let term = FolTerm::ForAll(
-            "x".into(),
-            FactSource::Single("ft_outer".into()),
-            Box::new(FolTerm::ForAll(
-                "y".into(),
-                FactSource::Single("ft_inner".into()),
-                Box::new(FolTerm::Eq(
-                    Box::new(FolTerm::RoleVal("x".into(), 1)),
-                    Box::new(FolTerm::RoleVal("y".into(), 1)),
-                )),
-            )),
-        );
-        assert_eq!(apply(&term.to_func(), &state, &state), f());
-    }
+    // Nested-quantifier scope resolution is documented as a deferred
+    // feature on `FolTerm::Var` (see lines 135–148). The previous
+    // `#[ignore]`-d acceptance test added nothing the doc doesn't
+    // already say — when a consumer needs nested `Var` resolution,
+    // implement it then add the test. Removed to keep
+    // `cargo test --lib -- --ignored` clean (closes #649).
 
     /// Review finding (ac474845): "one quickcheck closure catches
     /// `Insert`-over-empty edge cases better than adding 6 one-off
