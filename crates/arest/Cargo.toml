@@ -84,6 +84,16 @@ name = "cell_aead_fuzz"
 path = "tests/cell_aead_fuzz.rs"
 required-features = ["test-bins"]
 
+# FORML 2 parser fuzz harness (#670). Property-based "no panic on any
+# input" assertion for stage-1 + stage-2 + downstream compile. The
+# floor for accepting tenant-supplied readings via `system::load_reading`
+# without DoS / panic-leaks. Standalone binary so a counterexample
+# shrinks cleanly; proptest output stays on its own runner.
+[[test]]
+name = "parser_fuzz"
+path = "tests/parser_fuzz.rs"
+required-features = ["test-bins"]
+
 [features]
 # `test-bins` (#684/#650a) — opt-in flag that lets each integration
 # `[[test]]` entry compile. Off by default so `cargo test --lib`
