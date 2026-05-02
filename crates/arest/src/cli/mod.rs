@@ -105,3 +105,14 @@ pub mod reload;
 // `dispatch` enters an infinite poll loop with per-reload persist.
 #[cfg(not(feature = "no_std"))]
 pub mod watch;
+// `entry` (#684/#650b) — main CLI dispatcher extracted from src/main.rs.
+// Pre-extract, src/main.rs declared `mod ast; mod compile; ...` for
+// every lib module independently of lib.rs, forcing cargo to recompile
+// the entire crate twice (once for the lib's rlib, once for the bin's
+// compilation unit). Profile (cargo-timing 2026-05-01) showed ~120s of
+// duplicate cumulative compile across `arest-cli "bin"` and
+// `arest-cli "bin" (test)`. Now `cli::entry::main_entry` carries the
+// dispatcher inside the lib's compilation, src/main.rs is a 6-line
+// shim, and each source file compiles exactly once.
+#[cfg(not(feature = "no_std"))]
+pub mod entry;
