@@ -152,7 +152,7 @@ pub mod hateoas;
 // `json_min` — minimal recursive-descent JSON parser, no_std-clean
 // (#614). Powers the kernel POST entity write path, since `serde_json`
 // is std-only and the kernel can't link it. Same gate as `hateoas`.
-pub mod json_min;
+pub use arest_foundation::json_min;  // #686 stage 2 — moved out of arest
 #[cfg(not(feature = "no_std"))]
 // validate.rs deleted — zero production callers, tests were self-referential.
 #[cfg(not(feature = "no_std"))]
@@ -212,7 +212,7 @@ pub mod scheduler;
 // gate (#565) so kernel code (e.g. arest-kernel breadcrumb history,
 // FPGA audit-log generator) can reuse the engine primitive instead
 // of hand-rolling a parallel VecDeque<T>.
-pub mod ring;
+pub use arest_foundation::ring;  // #686 stage 2 — moved out of arest
 // `declared_writes` is cfg-aware end-to-end: the std build provides a
 // thread_local capability stack (`std::thread_local!`); the no_std
 // build exposes no-op shims (`push_caps`/`is_store_allowed` always
@@ -352,7 +352,10 @@ mod parse_intercept;
 // stage-2 timing call site refers to `crate::time_shim::Instant`
 // instead of `std::time::Instant`. Module is `pub(crate)` so the
 // stage2 module can `use crate::time_shim::Instant;`.
-pub(crate) mod time_shim;
+// #686 stage 2: time_shim moved to arest-foundation. Re-exported as
+// pub(crate) because the upstream callers reach `crate::time_shim::Instant`
+// — keeping the pub(crate) scope preserves the original visibility surface.
+pub(crate) use arest_foundation::time_shim;
 
 // The DOMAINS / CompiledState / system_impl machinery requires serde,
 // serde_json, regex, and std — excluded from the no_std kernel build.

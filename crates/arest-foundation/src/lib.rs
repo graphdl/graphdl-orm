@@ -28,3 +28,13 @@
 extern crate alloc;
 
 pub mod sync;
+pub mod json_min;
+pub mod time_shim;
+pub mod ring;
+// `naming` stays in arest for now — its slug_for_noun /
+// resolve_slug_to_noun helpers reach `crate::ast::{fetch_or_phi,
+// binding}` to walk the Noun cell. Splitting it would mean either
+// pulling ast across the boundary (impossible — that's the engine
+// itself) or fragmenting naming into pure-string vs cell-walking
+// halves. Worth doing later if naming becomes a hot path; not blocking
+// the current cycle's faster-incremental-compile goal.
