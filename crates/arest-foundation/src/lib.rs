@@ -32,6 +32,8 @@ pub mod json_min;
 pub mod time_shim;
 pub mod ring;
 pub mod entropy;
+pub mod entropy_mix;
+pub mod entropy_net;
 // `naming` stays in arest for now — its slug_for_noun /
 // resolve_slug_to_noun helpers reach `crate::ast::{fetch_or_phi,
 // binding}` to walk the Noun cell. Splitting it would mean either

@@ -243,7 +243,7 @@ pub use arest_foundation::entropy;  // #686 stage 3 — moved out of arest
 // uniform if even ONE child is uniform — gives defense-in-depth for
 // the host CLI (OS getrandom + #583 network adapter), the kernel
 // (virtio-rng + RDSEED/RNDR + EFI_RNG), and any future composition.
-pub mod entropy_mix;
+pub use arest_foundation::entropy_mix;  // #686 stage 4 — moved out of arest
 // `entropy_net` (#583 / Rand-T7): NetworkEntropySource pulls true-random
 // bytes from a remote endpoint (random.org atmospheric noise, ANU QRNG
 // quantum vacuum, NIST Beacon) via a generic fetcher closure. The HTTP
@@ -251,7 +251,7 @@ pub mod entropy_mix;
 // Cache + refill amortises round-trip latency across many CSPRNG seeds.
 // Compose with MixingEntropySource so network outage degrades to OS RNG
 // rather than panicking the engine.
-pub mod entropy_net;
+pub use arest_foundation::entropy_net;  // #686 stage 4 — moved out of arest
 pub mod csprng;
 // Cell-level AEAD (#659) — per-cell ChaCha20-Poly1305 with HKDF-SHA256
 // derivation from a per-tenant master. Pure no_std; sits next to
