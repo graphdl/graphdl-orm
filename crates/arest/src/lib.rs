@@ -234,6 +234,20 @@ pub mod select_component_core;
 // `EntropySource`. Per-target adapters land in #569-#574; per-consumer
 // wires land in #575-#578.
 pub mod entropy;
+// `entropy_mix` (#584 / Rand-X1): MixingEntropySource combines N
+// EntropySource children via XOR. The "anytrust" property — output is
+// uniform if even ONE child is uniform — gives defense-in-depth for
+// the host CLI (OS getrandom + #583 network adapter), the kernel
+// (virtio-rng + RDSEED/RNDR + EFI_RNG), and any future composition.
+pub mod entropy_mix;
+// `entropy_net` (#583 / Rand-T7): NetworkEntropySource pulls true-random
+// bytes from a remote endpoint (random.org atmospheric noise, ANU QRNG
+// quantum vacuum, NIST Beacon) via a generic fetcher closure. The HTTP
+// transport stays at the consumer site so this module adds zero deps.
+// Cache + refill amortises round-trip latency across many CSPRNG seeds.
+// Compose with MixingEntropySource so network outage degrades to OS RNG
+// rather than panicking the engine.
+pub mod entropy_net;
 pub mod csprng;
 // Cell-level AEAD (#659) — per-cell ChaCha20-Poly1305 with HKDF-SHA256
 // derivation from a per-tenant master. Pure no_std; sits next to
