@@ -58,3 +58,6 @@ comment.cut
 *.db
 *.db-journal
 arest-kernel.bios.img
+
+# Tutor sandbox SQLite (per-developer, ephemeral)
+tutor/.sandbox/
