@@ -25,7 +25,7 @@ const __dirname = dirname(__filename)
 
 let _sandboxHandle = -1
 let _engine: typeof import('../api/engine.js') | null = null
-let _cliBootstrapped = false
+let _bootstrapPromise: Promise<void> | null = null
 
 export function tutorDomainsDir(): string {
   return resolve(__dirname, '..', '..', 'tutor', 'domains')
@@ -37,7 +37,7 @@ export function tutorSandboxDbPath(): string {
 }
 
 function shouldUseCliDb(): boolean {
-  return Boolean(process.env.AREST_CLI) && Boolean(tutorSandboxDbPath())
+  return Boolean(process.env.AREST_CLI)
 }
 
 function runArestCli(args: string[]): Promise<string> {
@@ -60,13 +60,18 @@ function runArestCli(args: string[]): Promise<string> {
 }
 
 async function ensureCliBootstrapped(): Promise<void> {
-  if (_cliBootstrapped) return
-  const dbPath = tutorSandboxDbPath()
-  mkdirSync(resolve(dbPath, '..'), { recursive: true })
-  if (!existsSync(dbPath)) {
-    await runArestCli([tutorDomainsDir(), '--db', dbPath])
-  }
-  _cliBootstrapped = true
+  if (_bootstrapPromise) return _bootstrapPromise
+  _bootstrapPromise = (async () => {
+    const dbPath = tutorSandboxDbPath()
+    mkdirSync(resolve(dbPath, '..'), { recursive: true })
+    if (!existsSync(dbPath)) {
+      await runArestCli([tutorDomainsDir(), '--db', dbPath])
+    }
+  })().catch((err) => {
+    _bootstrapPromise = null  // allow retry on next call after failure
+    throw err
+  })
+  return _bootstrapPromise
 }
 
 async function getEngine() {
@@ -107,7 +112,7 @@ export async function resetSandbox(): Promise<void> {
     try { _engine.release_domain?.(_sandboxHandle) } catch {}
   }
   _sandboxHandle = -1
-  _cliBootstrapped = false
+  _bootstrapPromise = null
   const dbPath = tutorSandboxDbPath()
   try { if (existsSync(dbPath)) rmSync(dbPath) } catch {}
 }
@@ -122,5 +127,5 @@ export function _testOnly_dropSandboxHandle(): void {
     try { _engine.release_domain?.(_sandboxHandle) } catch {}
   }
   _sandboxHandle = -1
-  _cliBootstrapped = false
+  _bootstrapPromise = null
 }
