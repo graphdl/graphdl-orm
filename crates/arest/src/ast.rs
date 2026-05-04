@@ -142,6 +142,17 @@ fn fuel_is_bounded() -> bool {
 fn fuel_is_bounded() -> bool {
     APPLY_FUEL_ATOMIC.load(core::sync::atomic::Ordering::Relaxed) != u64::MAX
 }
+
+/// Snapshot the current fuel counter without modifying it. Used by
+/// `apply_with_fuel` to compute the remaining budget after a bounded
+/// evaluation returns. `u64::MAX` is the unlimited sentinel.
+#[cfg(not(feature = "no_std"))]
+fn current_fuel() -> u64 { APPLY_FUEL.with(|c| c.get()) }
+
+#[cfg(feature = "no_std")]
+fn current_fuel() -> u64 {
+    APPLY_FUEL_ATOMIC.load(core::sync::atomic::Ordering::Relaxed)
+}
 //
 // All framework objects compile to these types:
 //   Role        → Selector
@@ -1526,6 +1537,30 @@ pub fn apply(func: &Func, x: &Object, d: &Object) -> Object {
         true => Object::Bottom,
         false => apply_nonbottom(func, x, d),
     }
+}
+
+/// H2 (#690): Pure-API fuel surface. Evaluates `apply(func, x, d)`
+/// under an explicit reduction budget and returns both the result and
+/// the unconsumed remainder. `u64::MAX` is the unlimited sentinel —
+/// `apply_with_fuel(f, x, d, u64::MAX)` matches `apply(f, x, d)`
+/// semantics with a `(_, u64::MAX)` second slot.
+///
+/// Backus's algebra has no fuel — Bottom is a function of `(f, x)`.
+/// The recursive evaluator still uses an internal counter for the
+/// per-`apply` debit (`consume_fuel`), but external callers see fuel
+/// as data flowing through the call: `(f, x, fuel) ↦ (object, fuel')`.
+/// Sec-3 enforcement at the `system::apply` boundary stays unchanged
+/// — that layer is unaware of how the budget is plumbed underneath.
+///
+/// Compatible with `with_fuel`: an outer `with_fuel(N, …)` scope sets
+/// the ambient counter to N before this call sees `fuel`. The inner
+/// `with_fuel(fuel, …)` here saves that prior value and restores it
+/// on return, so well-scoped nesting still composes.
+pub fn apply_with_fuel(func: &Func, x: &Object, d: &Object, fuel: u64) -> (Object, u64) {
+    with_fuel(fuel, || {
+        let result = apply(func, x, d);
+        (result, current_fuel())
+    })
 }
 
 fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
@@ -7327,5 +7362,61 @@ mod tests {
             f = Func::Compose(Box::new(f), Box::new(Func::Id));
         }
         assert_eq!(apply(&f, &Object::atom("x"), &defs()), Object::atom("x"));
+    }
+
+    // ── #690 / Audit H2: apply_with_fuel pure-API surface ─────────
+
+    #[test]
+    fn apply_with_fuel_unlimited_matches_apply() {
+        // Calling with u64::MAX must match plain `apply` and report
+        // u64::MAX remaining (the unlimited sentinel is preserved —
+        // `consume_fuel` short-circuits without touching the counter).
+        let f = Func::Compose(Box::new(Func::Id), Box::new(Func::Id));
+        let (result, remaining) = apply_with_fuel(&f, &Object::atom("x"), &defs(), u64::MAX);
+        assert_eq!(result, Object::atom("x"));
+        assert_eq!(remaining, u64::MAX);
+    }
+
+    #[test]
+    fn apply_with_fuel_returns_remaining_budget() {
+        // Two-step Compose(Id, Id) under budget 10 ⇒ each apply()
+        // recursion debits one. The exact remaining value depends on
+        // how many internal apply() calls the Compose primitive
+        // makes; what's invariant is `remaining < budget`.
+        let f = Func::Compose(Box::new(Func::Id), Box::new(Func::Id));
+        let (result, remaining) = apply_with_fuel(&f, &Object::atom("x"), &defs(), 10);
+        assert_eq!(result, Object::atom("x"));
+        assert!(remaining < 10, "some fuel must be debited; got {remaining}");
+    }
+
+    #[test]
+    fn apply_with_fuel_exhaustion_returns_bottom_and_zero() {
+        // 10 000 deep Compose chain with budget 100 ⇒ Bottom + 0
+        // remaining. Mirrors `fuel_exhaustion_collapses_deep_compose_to_bottom`
+        // but on the new explicit-fuel surface.
+        let mut f = Func::Id;
+        for _ in 0..10_000 {
+            f = Func::Compose(Box::new(f), Box::new(Func::Id));
+        }
+        let (result, remaining) = apply_with_fuel(&f, &Object::atom("x"), &defs(), 100);
+        assert_eq!(result, Object::Bottom);
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn apply_with_fuel_restores_outer_budget() {
+        // apply_with_fuel must save+restore the ambient counter so
+        // sibling calls in an outer with_fuel scope still see their
+        // original budget.
+        with_fuel(5, || {
+            // Burn the inner scope's budget entirely.
+            let (_, _) = apply_with_fuel(&Func::Id, &Object::atom("x"), &defs(), 100);
+            // Outer: still has 5; a 50-deep chain still collapses.
+            let mut f = Func::Id;
+            for _ in 0..50 {
+                f = Func::Compose(Box::new(f), Box::new(Func::Id));
+            }
+            assert_eq!(apply(&f, &Object::atom("x"), &defs()), Object::Bottom);
+        });
     }
 }
