@@ -41,17 +41,24 @@ use hashbrown::HashMap;
 /// `Ack` is follower → primary: "I applied it."
 /// `Nack` is follower → primary: "I already have ≥ `have`; send me
 /// deltas from `have+1` onwards (Cluster-4 range-request lives here)."
+/// `Reject` is follower → primary: "thaw succeeded but the state
+/// failed alethic validation against its own def graph (D4 / #706);
+/// don't replay this generation — fix the upstream commit." `reason`
+/// carries the joined alethic violation messages so the primary can
+/// surface them in logs / dashboards without a side-channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReplMsg {
-    State { tenant: u32, generation: u64, bytes: Vec<u8> },
-    Ack   { tenant: u32, generation: u64 },
-    Nack  { tenant: u32, generation: u64, have: u64 },
+    State  { tenant: u32, generation: u64, bytes: Vec<u8> },
+    Ack    { tenant: u32, generation: u64 },
+    Nack   { tenant: u32, generation: u64, have: u64 },
+    Reject { tenant: u32, generation: u64, have: u64, reason: String },
 }
 
 // Wire tags. u8 so decoder doesn't need to branch on alignment.
 const TAG_STATE: u8 = 0x01;
 const TAG_ACK: u8 = 0x02;
 const TAG_NACK: u8 = 0x03;
+const TAG_REJECT: u8 = 0x04;
 
 /// Magic for the replication frame. Distinct from the Object freeze
 /// magic so a decoder that receives the wrong message type fails fast
@@ -83,6 +90,15 @@ impl ReplMsg {
                 buf.extend_from_slice(&tenant.to_le_bytes());
                 buf.extend_from_slice(&generation.to_le_bytes());
                 buf.extend_from_slice(&have.to_le_bytes());
+            }
+            ReplMsg::Reject { tenant, generation, have, reason } => {
+                // TAG_REJECT | u32 tenant | u64 generation | u64 have | u32 len | reason
+                buf.push(TAG_REJECT);
+                buf.extend_from_slice(&tenant.to_le_bytes());
+                buf.extend_from_slice(&generation.to_le_bytes());
+                buf.extend_from_slice(&have.to_le_bytes());
+                buf.extend_from_slice(&(reason.len() as u32).to_le_bytes());
+                buf.extend_from_slice(reason.as_bytes());
             }
         }
         buf
@@ -134,6 +150,26 @@ impl ReplMsg {
                 let have = u64::from_le_bytes(frame[i..i+8].try_into().unwrap());
                 let _ = i;
                 Ok(ReplMsg::Nack { tenant, generation, have })
+            }
+            TAG_REJECT => {
+                if frame.len() < i + 4 + 8 + 8 + 4 {
+                    return Err("truncated Reject header".to_string());
+                }
+                let tenant = u32::from_le_bytes(frame[i..i+4].try_into().unwrap()); i += 4;
+                let generation = u64::from_le_bytes(frame[i..i+8].try_into().unwrap()); i += 8;
+                let have = u64::from_le_bytes(frame[i..i+8].try_into().unwrap()); i += 8;
+                let len = u32::from_le_bytes(frame[i..i+4].try_into().unwrap()) as usize; i += 4;
+                if frame.len() < i + len {
+                    return Err("truncated Reject reason".to_string());
+                }
+                let reason = core::str::from_utf8(&frame[i..i+len])
+                    .map_err(|_| "Reject reason not UTF-8".to_string())?
+                    .to_string();
+                i += len;
+                if i != frame.len() {
+                    return Err("trailing bytes after Reject".to_string());
+                }
+                Ok(ReplMsg::Reject { tenant, generation, have, reason })
             }
             t => Err(alloc::format!("unknown repl tag {t:#x}")),
         }
@@ -243,6 +279,33 @@ impl Follower {
                     // water mark so the primary retries / resnapshots.
                     Err(_) => return ReplMsg::Nack { tenant, generation, have: cur },
                 };
+
+                // D4 (#706): validate the thawed def state against
+                // its own validate Func before applying. The wire is
+                // mTLS-checked (Cluster-5), but a primary that itself
+                // accepted bad facts (D1/D2/D3/T1 boundaries) would
+                // happily replicate the bad state to every follower.
+                // Run the same `validate` dispatch the local write
+                // path uses; if any alethic violation surfaces, Reject
+                // with the joined messages so the primary can pinpoint
+                // the upstream commit. Validate Def absent = no-op:
+                // boot snapshots and pre-validate states still apply.
+                let ctx = crate::ast::encode_eval_context_state("", None, &obj);
+                let violation_obj = crate::ast::apply(
+                    &crate::ast::Func::Def("validate".to_string()),
+                    &ctx,
+                    &obj,
+                );
+                let violations = crate::ast::decode_violations(&violation_obj);
+                let alethic: Vec<_> = violations.iter().filter(|v| v.alethic).collect();
+                if !alethic.is_empty() {
+                    let reason = alethic.iter()
+                        .map(|v| v.constraint_text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return ReplMsg::Reject { tenant, generation, have: cur, reason };
+                }
+
                 apply_state(tenant, obj);
                 self.applied.insert(tenant, generation);
                 ReplMsg::Ack { tenant, generation }
@@ -285,6 +348,22 @@ mod tests {
 
         let n = ReplMsg::Nack { tenant: 2, generation: 9, have: 7 };
         assert_eq!(ReplMsg::decode(&n.encode()).unwrap(), n);
+    }
+
+    #[test]
+    fn wire_roundtrip_reject() {
+        // Empty reason and non-empty reason both round-trip; non-ASCII
+        // payload exercises the UTF-8 length-prefix path.
+        let empty = ReplMsg::Reject {
+            tenant: 4, generation: 11, have: 10, reason: String::new(),
+        };
+        assert_eq!(ReplMsg::decode(&empty.encode()).unwrap(), empty);
+
+        let with_reason = ReplMsg::Reject {
+            tenant: 4, generation: 11, have: 10,
+            reason: "alethic: each Order has exactly one customer ✗".to_string(),
+        };
+        assert_eq!(ReplMsg::decode(&with_reason.encode()).unwrap(), with_reason);
     }
 
     #[test]
@@ -408,6 +487,41 @@ mod tests {
         }
         assert!(log.borrow().is_empty());
         assert_eq!(f.applied(1), 0, "broken bytes must not advance the HWM");
+    }
+
+    #[test]
+    fn follower_rejects_alethic_violation_without_advancing() {
+        // D4 (#706): build a def state whose `validate` Func returns
+        // a single alethic violation. The follower should refuse to
+        // apply, return ReplMsg::Reject with the joined reason, and
+        // leave its high water mark untouched.
+        use crate::ast::{Func, Object as Obj, defs_to_state};
+
+        let violation = Obj::seq(vec![Obj::seq(vec![
+            Obj::atom("test_constraint"),
+            Obj::atom("Customer must exist for every Order"),
+            Obj::atom("Order o-1 has no Customer"),
+        ])]);
+        let validate_func = Func::constant(violation);
+        let defs = vec![("validate".to_string(), validate_func)];
+        let bad_state = defs_to_state(&defs, &Obj::phi());
+
+        let mut f = Follower::new();
+        let (log, apply) = capturing_apply();
+
+        let msg = ReplMsg::State { tenant: 7, generation: 1, bytes: freeze(&bad_state) };
+        let r = f.receive(msg, &apply);
+        match r {
+            ReplMsg::Reject { tenant: 7, generation: 1, have: 0, reason } => {
+                assert!(
+                    reason.contains("Customer must exist for every Order"),
+                    "Reject reason should carry the violation text, got: {reason}",
+                );
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+        assert!(log.borrow().is_empty(), "rejected state must not be applied");
+        assert_eq!(f.applied(7), 0, "rejected state must not advance the HWM");
     }
 
     #[test]
