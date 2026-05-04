@@ -93,3 +93,18 @@ describe('tutor lesson predicate grading', () => {
     expect(result.ok).toBe(true)
   }, 60_000)
 })
+
+describe('tutor.reset', () => {
+  it('drops in-handle state and re-bootstraps from tutor/domains', async () => {
+    // Force a fresh handle.
+    await resetSandbox()
+    // Verify the noun catalog is back (Order is from orders.md).
+    const before = JSON.parse(await tutorSystemCall('list:Noun', '')) ?? []
+    expect(before.map((n: any) => n.id ?? n.Name).includes('Order')).toBe(true)
+
+    // Reset again and prove the catalog is still present (re-bootstrap).
+    await resetSandbox()
+    const after = JSON.parse(await tutorSystemCall('list:Noun', '')) ?? []
+    expect(after.map((n: any) => n.id ?? n.Name).includes('Order')).toBe(true)
+  }, 60_000)
+})

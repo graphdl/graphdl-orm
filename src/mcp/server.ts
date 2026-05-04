@@ -64,7 +64,7 @@ import {
   type MutationContextDetail,
   type MutationContextTool,
 } from './mutation-context.js'
-import { tutorSystemCall } from './tutor-sandbox.js'
+import { tutorSystemCall, resetSandbox } from './tutor-sandbox.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(__dirname, '..', '..')
@@ -1651,6 +1651,18 @@ server.registerTool(
       check,
       next,
     })
+  },
+)
+
+server.registerTool(
+  'tutor.reset',
+  {
+    description: 'Wipe the tutor sandbox engine and SQLite file. The next tutor.* call rebootstraps it from tutor/domains/. Use when you want to redo a track from a clean slate or when you have edited tutor/domains/ readings.',
+    inputSchema: {},
+  },
+  async () => {
+    await resetSandbox()
+    return textResult({ ok: true, message: 'Tutor sandbox reset.' })
   },
 )
 
