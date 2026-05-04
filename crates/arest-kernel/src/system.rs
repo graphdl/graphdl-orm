@@ -718,10 +718,51 @@ pub fn with_state<R>(f: impl FnOnce(&Object) -> R) -> Option<R> {
 /// `unsubscribe` from inside the closure can't deadlock on the
 /// `SUBSCRIBERS` `Mutex`.
 ///
-/// Returns `Err` only when `init()` hasn't run yet (a programmer
-/// error — the call site should ensure boot ordering puts
-/// `system::init` before any route that mutates).
-pub fn apply(new_state: Object) -> Result<(), &'static str> {
+/// D2 (#704): every write on this surface is validated before it
+/// commits. The thawed `new_state` is run through `Func::Def("validate")`
+/// (the same dispatch the local write path and the cluster follower
+/// boundary use); any **alethic** violations reject — the pointer
+/// swap and subscriber delivery are both skipped, the joined
+/// violation messages come back in `Err`. Validate Def absent on
+/// the new state is a no-op (boot snapshots that pre-date the
+/// metamodel still apply); deontic-only states still flow through.
+///
+/// Trusted boot paths that legitimately commit pre-validated state
+/// (e.g. `load_reading_persist::replay_from_disk` rebuilding the
+/// def graph from a checkpoint that was already validated when
+/// originally written) call `apply_unchecked` to bypass the gate.
+///
+/// Returns `Err` when `init()` hasn't run yet (a programmer error)
+/// or when the alethic-violation gate rejects.
+pub fn apply(new_state: Object) -> Result<(), String> {
+    // Validate first — if the state is structurally impossible
+    // against its own def graph, refuse the swap. The same
+    // `Func::Def("validate")` the local write path and the cluster
+    // follower (#706) use; absent validate Def = no-op.
+    let ctx = ast::encode_eval_context_state("", None, &new_state);
+    let violation_obj = ast::apply(
+        &Func::Def("validate".to_string()),
+        &ctx,
+        &new_state,
+    );
+    let violations = ast::decode_violations(&violation_obj);
+    let alethic: Vec<_> = violations.iter().filter(|v| v.alethic).collect();
+    if !alethic.is_empty() {
+        let reason = alethic.iter()
+            .map(|v| v.constraint_text.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("constraint violation: {}", reason));
+    }
+    apply_unchecked(new_state).map_err(|e| e.to_string())
+}
+
+/// Commit `new_state` without running the validate gate. Reserved
+/// for trusted boot paths (checkpoint replay, internal compositor
+/// registrations) that construct state which is either already
+/// validated upstream or genuinely pre-metamodel. Production HTTP
+/// write surfaces and SystemVerb dispatch use [`apply`] instead.
+pub fn apply_unchecked(new_state: Object) -> Result<(), &'static str> {
     let lock = SYSTEM.get().ok_or("system::init() not called")?;
     let leaked: &'static Object = Box::leak(Box::new(new_state));
     // Diff inside the write critical section so we have stable

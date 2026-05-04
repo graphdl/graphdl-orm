@@ -452,9 +452,11 @@ pub fn register_gtk_components() -> Result<usize, &'static str> {
         count += 1;
     }
 
-    // 3. Commit the new state. Subscribers (HateoasBrowser, future
-    //    selection-rule cache) get notified of every changed cell.
-    system::apply(state).map_err(|e| e)?;
+    // 3. Commit the new state. Boot-time toolkit registration —
+    //    validate-bypass via apply_unchecked because Component facts
+    //    are kernel-side derived (no user input) and the metamodel
+    //    may not yet carry validate Defs at this stage of init.
+    system::apply_unchecked(state)?;
     let _ = log_resolved_pointers();
     Ok(count)
 }

@@ -378,9 +378,9 @@ impl fmt::Display for Object {
 
 // `types::Violation` is a serde-derived struct — gated out of no_std
 // along with the `types` module itself. The three helpers below
-// (encode/decode_violation, decode_violations) are only called by
-// check / compile pipelines that are themselves std-only.
-#[cfg(not(feature = "no_std"))]
+// (encode/decode_violation, decode_violations) are reachable from
+// the kernel system::apply validate gate (#704), so the import is
+// unconditional — the helpers themselves are alloc-clean.
 use crate::types::Violation;
 
 /// Encode an evaluation context as a single Object.
@@ -454,7 +454,10 @@ pub fn encode_state(state: &Object) -> Object {
 /// Decode a violation Object back to a Violation struct.
 /// Expected: <constraint_id, constraint_text, detail>
 /// Detail can be an atom (string) or a sequence of atoms (joined with spaces).
-#[cfg(not(feature = "no_std"))]
+///
+/// no_std-clean (#704 / Audit D2): the kernel system::apply gate
+/// reaches this from no_std builds. Implementation is purely
+/// alloc-backed (Vec, String, Object), so dropping the gate is safe.
 pub fn decode_violation(obj: &Object) -> Option<Violation> {
     let items = obj.as_seq().filter(|i| i.len() == 3)?;
     let detail: String = match &items[2] {
@@ -473,8 +476,8 @@ pub fn decode_violation(obj: &Object) -> Option<Violation> {
     })
 }
 
-/// Decode a sequence of violation Objects.
-#[cfg(not(feature = "no_std"))]
+/// Decode a sequence of violation Objects. no_std-clean (see
+/// `decode_violation` rationale).
 pub fn decode_violations(obj: &Object) -> Vec<Violation> {
     match obj.as_seq() {
         Some(items) => items.iter().flat_map(|item|
@@ -484,8 +487,8 @@ pub fn decode_violations(obj: &Object) -> Vec<Violation> {
     }
 }
 
-/// Encode a Violation as an Object.
-#[cfg(not(feature = "no_std"))]
+/// Encode a Violation as an Object. no_std-clean (see
+/// `decode_violation` rationale).
 pub fn encode_violation(v: &Violation) -> Object {
     Object::seq(vec![
         Object::atom(&v.constraint_id),

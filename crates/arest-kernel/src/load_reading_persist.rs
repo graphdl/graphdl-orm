@@ -661,7 +661,10 @@ pub fn replay_from_disk() -> Result<usize, &'static str> {
         .ok_or("system::init() not called before replay_from_disk")?;
     let applied = replay_loaded_readings(&backend, &mut state);
     if applied > 0 {
-        crate::system::apply(state)
+        // Boot-time replay of already-validated persisted readings
+        // — validate ran when each was originally loaded (#559), so
+        // the gate is redundant here. apply_unchecked.
+        crate::system::apply_unchecked(state)
             .map_err(|_| "system::apply failed during replay commit")?;
     }
     Ok(applied)

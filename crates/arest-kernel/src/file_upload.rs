@@ -354,7 +354,7 @@ pub fn try_serve_idempotent(
         // The only failure mode is "init() not called", which is a
         // boot-ordering regression. Surface it as 500 so the client
         // gets a clear signal rather than a silent vanish-on-write.
-        return ServeOutcome::Response(internal_error(msg));
+        return ServeOutcome::Response(internal_error(&msg));
     }
 
     let response = created_response(&file_id);
@@ -425,7 +425,7 @@ fn begin_chunked_upload(
         directory_id,
     );
     if let Err(msg) = crate::system::apply(new_state) {
-        return internal_error(msg);
+        return internal_error(&msg);
     }
 
     UPLOADS.lock().insert(
@@ -581,7 +581,7 @@ pub fn try_serve_chunk_idempotent(
 
     if !body.is_empty() {
         if let Err(msg) = write_chunk_to_region(st, offset, body) {
-            return ServeOutcome::Response(internal_error(msg));
+            return ServeOutcome::Response(internal_error(&msg));
         }
         // Capture the first 512 bytes for the closing MIME sniff.
         if st.sniff_window.len() < 512 {
@@ -607,7 +607,7 @@ pub fn try_serve_chunk_idempotent(
             let pre_state = crate::system::state().cloned().unwrap_or_else(Object::phi);
             let new_state = update_mime_fact(&pre_state, file_id, sniffed);
             if let Err(msg) = crate::system::apply(new_state) {
-                return ServeOutcome::Response(internal_error(msg));
+                return ServeOutcome::Response(internal_error(&msg));
             }
             st.mime_hint = sniffed.to_string();
         }
@@ -645,7 +645,7 @@ pub fn try_serve_chunk_idempotent(
             &directory_id,
         );
         if let Err(msg) = crate::system::apply(new_state) {
-            return ServeOutcome::Response(internal_error(msg));
+            return ServeOutcome::Response(internal_error(&msg));
         }
         st.complete = true;
         // Drop the in-memory session — anyone re-querying upload-state

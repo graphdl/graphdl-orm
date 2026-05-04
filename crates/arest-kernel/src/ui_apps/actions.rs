@@ -2392,7 +2392,7 @@ mod tests {
             ])]),
             &pre,
         );
-        crate::system::apply(pre_with_noun).expect("seed noun");
+        crate::system::apply_unchecked(pre_with_noun).expect("seed noun");
 
         let action = SystemAction::new(
             SystemVerb::ApplyCreate,
@@ -2432,7 +2432,7 @@ mod tests {
             ]),
             &pre,
         );
-        crate::system::apply(seeded).expect("seed sm");
+        crate::system::apply_unchecked(seeded).expect("seed sm");
 
         let action = SystemAction::new(
             SystemVerb::Transition,

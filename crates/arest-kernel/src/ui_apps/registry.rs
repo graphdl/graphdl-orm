@@ -664,7 +664,9 @@ fn component_binding_id(component_name: &str) -> String {
 pub fn register_slint_components() -> Result<(), &'static str> {
     let new_state = crate::system::with_state(|s| build_slint_component_state(s))
         .ok_or("system::init() not called before register_slint_components()")?;
-    crate::system::apply(new_state)
+    // Boot-time Slint Component registration — validate-bypass via
+    // apply_unchecked. Same rationale as qt/gtk adapter binding.
+    crate::system::apply_unchecked(new_state)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
