@@ -64,6 +64,7 @@ import {
   type MutationContextDetail,
   type MutationContextTool,
 } from './mutation-context.js'
+import { tutorSystemCall, getSandboxHandle, resetSandbox } from './tutor-sandbox.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(__dirname, '..', '..')
@@ -1516,7 +1517,10 @@ function cmpNum(actual: number, op: string, expected: number): boolean {
   }
 }
 
-async function evalExpectPredicate(predicate: string): Promise<{ ok: boolean; detail: string }> {
+export async function evalExpectPredicate(
+  predicate: string,
+  call: (key: string, input: string) => Promise<string> = systemCall,
+): Promise<{ ok: boolean; detail: string }> {
   const p = predicate.replace(/\\\s/g, ' ').trim()
   if (!p) return { ok: false, detail: 'empty predicate' }
   const parseJson = (s: string): any => JSON.parse(s.trim())
@@ -1528,7 +1532,7 @@ async function evalExpectPredicate(predicate: string): Promise<{ ok: boolean; de
   let m = p.match(/^list\s+([^\s{][^{]*?)\s+contains\s+(\{[\s\S]*\})$/)
   if (m) {
     const [, noun, jsonStr] = m
-    const raw = await systemCall(`list:${noun.trim()}`, '')
+    const raw = await call(`list:${noun.trim()}`, '')
     const list = safeJson(raw, [])
     if (!Array.isArray(list)) return { ok: false, detail: `list:${noun.trim()} -> not an array` }
     const expected = parseJson(jsonStr)
@@ -1540,7 +1544,7 @@ async function evalExpectPredicate(predicate: string): Promise<{ ok: boolean; de
   m = p.match(/^list\s+(\S+(?:\s\S+)*?)\s+count\s+(==|>=|<=|>|<)\s+(\d+)$/)
   if (m) {
     const [, noun, op, nStr] = m
-    const raw = await systemCall(`list:${noun.trim()}`, '')
+    const raw = await call(`list:${noun.trim()}`, '')
     const list = safeJson(raw, [])
     const len = Array.isArray(list) ? list.length : 0
     const ok = cmpNum(len, op, parseInt(nStr, 10))
@@ -1551,7 +1555,7 @@ async function evalExpectPredicate(predicate: string): Promise<{ ok: boolean; de
   m = p.match(/^query\s+(\S+)\s+contains\s+(\{[\s\S]*\})$/)
   if (m) {
     const [, ft, jsonStr] = m
-    const raw = await systemCall(`query:${ft}`, '')
+    const raw = await call(`query:${ft}`, '')
     const rows = safeJson(raw, [])
     const expected = parseJson(jsonStr)
     const ok = Array.isArray(rows) && rows.some((r: any) => matchesSubset(r, expected))
@@ -1562,7 +1566,7 @@ async function evalExpectPredicate(predicate: string): Promise<{ ok: boolean; de
   m = p.match(/^query\s+(\S+)\s+count\s+(==|>=|<=|>|<)\s+(\d+)$/)
   if (m) {
     const [, ft, op, nStr] = m
-    const raw = await systemCall(`query:${ft}`, '')
+    const raw = await call(`query:${ft}`, '')
     const rows = safeJson(raw, [])
     const len = Array.isArray(rows) ? rows.length : 0
     const ok = cmpNum(len, op, parseInt(nStr, 10))
@@ -1573,7 +1577,7 @@ async function evalExpectPredicate(predicate: string): Promise<{ ok: boolean; de
   m = p.match(/^get\s+(\S+(?:\s\S+)*?)\s+(\S+)\s+equals\s+(\{[\s\S]*\})$/)
   if (m) {
     const [, noun, id, jsonStr] = m
-    const raw = await systemCall(`get:${noun.trim()}`, id)
+    const raw = await call(`get:${noun.trim()}`, id)
     const entity = safeJson(raw, null)
     const expected = parseJson(jsonStr)
     const ok = entity !== null && matchesSubset(entity, expected)
@@ -1584,7 +1588,7 @@ async function evalExpectPredicate(predicate: string): Promise<{ ok: boolean; de
   m = p.match(/^status\s+(\S+(?:\s\S+)*?)\s+(\S+)\s+is\s+(\S+)$/)
   if (m) {
     const [, , id, expectedStatus] = m
-    const raw = await systemCall(`get:State Machine`, id)
+    const raw = await call(`get:State Machine`, id)
     const sm: any = safeJson(raw, null)
     const actual = sm?.currentlyInStatus ?? null
     const ok = actual === expectedStatus
@@ -1625,7 +1629,7 @@ server.registerTool(
     const content = readFileSync(lesson.path, 'utf-8')
     const parsed = parseTutorLesson(content)
     const check = parsed.expect
-      ? await evalExpectPredicate(parsed.expect)
+      ? await evalExpectPredicate(parsed.expect, tutorSystemCall)
       : { ok: null as any, detail: 'no expect predicate in this lesson' }
     const nextNum = lessons.find(l => l.num > n)?.num
     const nextInTrack = nextNum ? { track: t, num: nextNum } : null

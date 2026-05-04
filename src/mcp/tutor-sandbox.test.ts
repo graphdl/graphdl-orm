@@ -15,6 +15,7 @@ import { getSandboxHandle, tutorSystemCall, resetSandbox, tutorDomainsDir } from
 import { compileDomainReadings, system } from '../api/engine.js'
 import { existsSync } from 'fs'
 import { resolve } from 'path'
+import { evalExpectPredicate } from './server.js'
 
 const TIMEOUT = 60_000
 
@@ -81,4 +82,14 @@ describe('tutor sandbox — WASM mode', () => {
     expect(names).toContain('Order')
     void before
   }, TIMEOUT)
+})
+
+describe('tutor lesson predicate grading', () => {
+  it('grades list-contains predicate against the sandbox', async () => {
+    const result = await evalExpectPredicate(
+      'list Noun contains {"id":"Order"}',
+      tutorSystemCall,
+    )
+    expect(result.ok).toBe(true)
+  }, 60_000)
 })
