@@ -158,22 +158,32 @@ impl PersistedReading {
         4 + 2 + self.name.len() + 4 + self.body.len() + 4 + 1 + 4
     }
 
-    /// Append the canonical byte encoding to `out`. Returns the number
-    /// of bytes appended (== `encoded_len`).
-    pub fn encode_to(&self, out: &mut Vec<u8>) -> usize {
+    /// Append the canonical byte encoding to `out`. Returns
+    /// `Some(bytes_appended)` (== `encoded_len`) on success, `None`
+    /// when `name.len() > MAX_NAME_LEN` or `body.len() > MAX_BODY_BYTES`
+    /// — the bounds the wire format can address. Single source of
+    /// truth: `persist_record` short-circuits before calling, but
+    /// direct callers (boot replay, future verb handlers, fuzz
+    /// fixtures) get the same guard without panicking (#708).
+    pub fn encode_to(&self, out: &mut Vec<u8>) -> Option<usize> {
+        if self.name.len() > MAX_NAME_LEN || self.body.len() > MAX_BODY_BYTES {
+            return None;
+        }
         let start = out.len();
         out.extend_from_slice(&RECORD_MAGIC.to_le_bytes());
-        let nl = u16::try_from(self.name.len()).expect("name_len fits u16");
+        // Bounds above guarantee the casts fit — name_len ≤ 256 ≤ u16::MAX,
+        // body_len ≤ 64 KiB ≤ u32::MAX. `as` is safe inside this gate.
+        let nl = self.name.len() as u16;
         out.extend_from_slice(&nl.to_le_bytes());
         out.extend_from_slice(self.name.as_bytes());
-        let bl = u32::try_from(self.body.len()).expect("body_len fits u32");
+        let bl = self.body.len() as u32;
         out.extend_from_slice(&bl.to_le_bytes());
         out.extend_from_slice(self.body.as_bytes());
         out.extend_from_slice(&self.version.to_le_bytes());
         out.push(self.tombstone);
         let crc = crc32(&out[start..]);
         out.extend_from_slice(&crc.to_le_bytes());
-        out.len() - start
+        Some(out.len() - start)
     }
 }
 
@@ -533,7 +543,9 @@ pub fn persist_record(
         tombstone,
     };
     let mut bytes = Vec::with_capacity(rec.encoded_len());
-    rec.encode_to(&mut bytes);
+    if rec.encode_to(&mut bytes).is_none() {
+        return false;
+    }
     backend.append(&bytes).is_some()
 }
 
@@ -689,6 +701,38 @@ mod tests {
         ast::store("Noun", nouns, &Object::phi())
     }
 
+    /// #708 / Audit P2: `encode_to` must return None instead of
+    /// panicking when name or body exceed the on-disk bounds. Direct
+    /// callers (boot replay, future verb handlers, fuzz fixtures)
+    /// hit this path without going through `persist_record`'s gate.
+    #[test]
+    fn encode_to_returns_none_on_oversized_name() {
+        let huge_name = "x".repeat(MAX_NAME_LEN + 1);
+        let rec = PersistedReading {
+            name: huge_name,
+            body: "Order(.id) is an entity type.\n".to_string(),
+            version: 1,
+            tombstone: TOMBSTONE_LIVE,
+        };
+        let mut bytes = Vec::new();
+        assert_eq!(rec.encode_to(&mut bytes), None);
+        assert!(bytes.is_empty(), "rejected encode must not partially write");
+    }
+
+    #[test]
+    fn encode_to_returns_none_on_oversized_body() {
+        let huge_body = "x".repeat(MAX_BODY_BYTES + 1);
+        let rec = PersistedReading {
+            name: "ok".to_string(),
+            body: huge_body,
+            version: 1,
+            tombstone: TOMBSTONE_LIVE,
+        };
+        let mut bytes = Vec::new();
+        assert_eq!(rec.encode_to(&mut bytes), None);
+        assert!(bytes.is_empty(), "rejected encode must not partially write");
+    }
+
     /// Encode + decode round-trip on a single record. Bytes go in,
     /// the same record comes out.
     #[test]
@@ -700,7 +744,7 @@ mod tests {
             tombstone: TOMBSTONE_LIVE,
         };
         let mut bytes = Vec::new();
-        let n = rec.encode_to(&mut bytes);
+        let n = rec.encode_to(&mut bytes).expect("fixture within bounds");
         assert_eq!(n, rec.encoded_len(), "encoded len matches reported");
 
         let recs = decode_all(&bytes);
@@ -894,7 +938,7 @@ mod tests {
             tombstone: TOMBSTONE_DEAD,
         };
         let mut bytes = Vec::new();
-        dead_a.encode_to(&mut bytes);
+        dead_a.encode_to(&mut bytes).expect("fixture within bounds");
         backend.append(&bytes);
 
         let live = live_records(&backend);
@@ -925,7 +969,7 @@ mod tests {
             tombstone: TOMBSTONE_DEAD,
         };
         let mut bytes = Vec::new();
-        dead.encode_to(&mut bytes);
+        dead.encode_to(&mut bytes).expect("fixture within bounds");
         backend.append(&bytes);
 
         let recs = decode_all(&backend.read_all());
