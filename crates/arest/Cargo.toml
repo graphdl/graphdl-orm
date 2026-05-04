@@ -94,6 +94,16 @@ name = "parser_fuzz"
 path = "tests/parser_fuzz.rs"
 required-features = ["test-bins"]
 
+# `load_reading` fuzz harness (#707 / Audit P1-A1). Property-based
+# "no panic on any (name, body) pair" assertion for the headline
+# tenant-mutation surface. Covers the composed pipeline that
+# `parser_fuzz` skips: parse + merge + recompile + validate_loaded_state
+# + manifest write. Standalone binary so failures shrink cleanly.
+[[test]]
+name = "load_reading_fuzz"
+path = "tests/load_reading_fuzz.rs"
+required-features = ["test-bins"]
+
 [features]
 # `test-bins` (#684/#650a) — opt-in flag that lets each integration
 # `[[test]]` entry compile. Off by default so `cargo test --lib`
