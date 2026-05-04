@@ -114,6 +114,27 @@ name = "freeze_thaw_fuzz"
 path = "tests/freeze_thaw_fuzz.rs"
 required-features = ["test-bins"]
 
+# `ingest::forward_chain_to_json` fuzz harness (#707 / Audit P1-A2).
+# By-design adversarial: webhook payloads come from external HTTP
+# callers (Stripe events, GitHub events, support inbox). A panic
+# here would be a DoS against the kernel/worker HTTP path that
+# wraps it. Standalone so a counterexample shrinks cleanly.
+[[test]]
+name = "ingest_fuzz"
+path = "tests/ingest_fuzz.rs"
+required-features = ["test-bins"]
+
+# `command::apply_command_defs` fuzz harness (#707 / Audit P1-A5).
+# Reached by every SYSTEM verb invocation: HTTP create / update /
+# transition / query, MCP `apply`, CLI verb dispatch, cluster
+# follower replication. Inputs cross a serde JSON boundary then
+# hit dispatch with attacker-controllable noun / domain / id /
+# field-map content. Standalone so failures shrink cleanly.
+[[test]]
+name = "apply_command_fuzz"
+path = "tests/apply_command_fuzz.rs"
+required-features = ["test-bins"]
+
 [features]
 # `test-bins` (#684/#650a) — opt-in flag that lets each integration
 # `[[test]]` entry compile. Off by default so `cargo test --lib`
