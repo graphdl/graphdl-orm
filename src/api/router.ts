@@ -4,7 +4,7 @@ import { registryIdForDomain, listDomains } from '../registry-do'
 import { nounToSlug, nounToTable, resolveSlugToNoun } from '../collections'
 import { handleParse } from './parse'
 import { handleEvaluate, handleSynthesize } from './evaluate'
-import { handleCreateEntity, handleDeleteEntity } from './entity-routes'
+import { handleCreateEntity, handleDeleteEntity, applyEntityCommand } from './entity-routes'
 import { envelope } from './envelope'
 import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, computeRMAP, system as wasmSystem, currentDomainHandle } from './engine'
 import { handleArestRequest, handleArestReadFallback } from './arest-router'
@@ -591,39 +591,29 @@ router.post('/api/entity', async (request, env: Env) => {
   }
 
   // AREST: one command, one function application, one state transfer.
+  // Audit T1 (#699) — the prior engine-failure fallback was the largest
+  // hallucination surface in the codebase: a WASM trap silently turned
+  // every write into a no-validate / no-derive / no-state-machine direct
+  // EntityDB write that downstream UI displayed as if it had been engine-
+  // validated. Removed. If the engine traps now, the request fails loudly.
   const getStub = (id: string) => getEntityDO(env, id) as any
 
-  // Engine path — runs the WASM parser to compile the domain readings,
-  // then applies a createEntity command which validates constraints and
-  // resolves reference-scheme ids. When the WASM parser is broken on
-  // the deploy target (currently wasm32-unknown-unknown traps inside
-  // the FORML 2 grammar bootstrap), we fall through to a degraded
-  // direct-write path: skip constraint check, mint a UUID, persist.
-  let arestResult: any = null
-  let engineFailure: string | null = null
-  try {
-    const populationJson = await loadDomainAndPopulation(registry, getStub, body.domain)
-    arestResult = applyCommand({
-      type: 'createEntity',
-      noun: body.noun,
-      domain: body.domain,
-      id: null, // resolved below from reference scheme
-      fields: parentFields,
-    }, populationJson)
-  } catch (e) {
-    engineFailure = `${e}`
-  }
+  const populationJson = await loadDomainAndPopulation(registry, getStub, body.domain)
+  const arestResult = applyCommand({
+    type: 'createEntity',
+    noun: body.noun,
+    domain: body.domain,
+    id: null, // resolved below from reference scheme
+    fields: parentFields,
+  }, populationJson)
 
   if (arestResult?.rejected) {
     return error(422, { errors: arestResult.violations.map((v: any) => ({ message: v.detail, constraintId: v.constraintId })) })
   }
 
   // Persist all entities from the AREST result (Resource + State Machine + Violations).
-  // In the engine-failure fallback, synthesize a single Entity record from the request
-  // body — no constraint check, no derivation, no state machine, but the row lands in
-  // EntityDB + Registry so reads see it.
   const entitiesToPersist: Array<{ id?: string; type: string; data: Record<string, any> }> =
-    arestResult?.entities ?? [{ type: body.noun, data: parentFields }]
+    arestResult?.entities ?? []
   for (const entity of entitiesToPersist) {
     const eid = entity.id || crypto.randomUUID()
     const eDO = getEntityDO(env, eid) as any
@@ -631,7 +621,7 @@ router.post('/api/entity', async (request, env: Env) => {
     await registry.indexEntity(entity.type, eid, body.domain)
   }
 
-  // The primary entity ID — first entity in the result, or the synthesized fallback.
+  // The primary entity ID — first entity in the result.
   const primaryEntity = entitiesToPersist[0]
   const parentId = primaryEntity?.id || crypto.randomUUID()
 
@@ -656,7 +646,6 @@ router.post('/api/entity', async (request, env: Env) => {
     transitions: arestResult?.transitions ?? [],
     ...(arestResult?.derivedCount > 0 && { derived: arestResult.derivedCount }),
     ...(arestResult?.violations?.length > 0 && { deonticWarnings: arestResult.violations }),
-    ...(engineFailure && { engineFailure }),
   }, { status: 201 })
 })
 
@@ -769,42 +758,104 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
 })
 
 // ── Entity queries (fan-out via pure handlers) ───────────────────────
-// POST /api/entities/:noun — create entity via direct DO write
+// POST /api/entities/:noun — create entity through engine (#699 / Audit T1).
+// Routed through applyEntityCommand so validate runs (deontic + alethic
+// constraint gates emit 422 with violations), derive runs (state-machine
+// transitions, derived facts), and persisted entities reflect the engine's
+// __state delta — not raw user-supplied fields.
 router.post('/api/entities/:noun', async (request, env: Env) => {
   const noun = decodeURIComponent(request.params.noun)
   const body = await request.json() as { domain?: string; data?: Record<string, unknown>; id?: string }
   const domain = body.domain || new URL(request.url).searchParams.get('domain') || ''
   if (!domain) return error(400, { errors: [{ message: 'domain required in body or query param' }] })
 
-  const entityId = body.id || crypto.randomUUID()
-  const entityDO = getEntityDO(env, entityId) as any
-  await entityDO.put({ id: entityId, type: noun, data: body.data || {} })
-
   const registry = getRegistryDO(env, 'global') as any
-  await registry.indexEntity(noun, entityId, domain)
+  const getStub = (id: string) => getEntityDO(env, id) as any
 
-  const cell = await entityDO.get()
+  const result = await applyEntityCommand(
+    { operation: 'create', noun, domain, id: body.id, fields: body.data ?? {} },
+    registry,
+    getStub,
+    { loadDomainAndPopulation, applyCommand },
+  )
+  if (result.rejected) {
+    return error(422, {
+      errors: result.violations.map((v) => ({ message: v.detail, constraintId: v.constraintId })),
+    })
+  }
+  const primary = result.entities[0]
   return json(envelope({
-    id: cell.id,
-    type: cell.type,
-    ...cell.data,
+    id: result.id,
+    type: primary?.type ?? noun,
+    ...(primary?.data ?? {}),
+  }, {
+    derived: result.derivedCount > 0 ? { count: result.derivedCount } : {},
+    violations: result.violations.map((v) => ({
+      reading: v.reading ?? '',
+      constraintId: v.constraintId ?? '',
+      modality: v.modality ?? 'deontic',
+      detail: v.detail,
+    })),
   }), { status: 201 })
 })
 
 
 
-// PATCH on entities: ↓n with merged data (cell store replaces contents)
+// PATCH on entities: read existing, merge fields, route through engine
+// (#699 / Audit T1) — the merged-data shape is what validate sees, so a
+// constraint that depends on prior cell state still gates the write.
 router.patch('/api/entities/:noun/:id', async (request, env: Env) => {
-  const { id } = request.params
+  const noun = decodeURIComponent(request.params.noun)
+  const id = decodeId(request.params)
   const body = await request.json() as Record<string, any>
+  const domain = body.domain || new URL(request.url).searchParams.get('domain')
+    || ''
 
   const entityDO = getEntityDO(env, id) as any
   const existing = await entityDO.get()
   if (!existing) return error(404, { errors: [{ message: 'Not Found' }] })
 
-  const merged = { ...existing.data, ...body }
-  const result = await entityDO.put({ id: existing.id, type: existing.type, data: merged })
-  return json(envelope({ id: result.id, type: result.type, ...result.data }))
+  // Resolve domain from existing cell when not supplied — preserves the
+  // pre-refactor caller contract that PATCH didn't require ?domain=.
+  const resolvedDomain = domain
+    || (existing.data?._domain as string | undefined)
+    || (existing.data?.domain as string | undefined)
+    || ''
+  if (!resolvedDomain) {
+    return error(400, { errors: [{ message: 'domain required (body, query, or entity._domain)' }] })
+  }
+
+  const registry = getRegistryDO(env, 'global') as any
+  const getStub = (eid: string) => getEntityDO(env, eid) as any
+
+  // Engine's UpdateEntity owns the merge — pass the patch fields, not the
+  // pre-merged blob — so a derive that depends on the prior state can
+  // observe both populations.
+  const result = await applyEntityCommand(
+    { operation: 'update', noun: existing.type ?? noun, domain: resolvedDomain, id, fields: body },
+    registry,
+    getStub,
+    { loadDomainAndPopulation, applyCommand },
+  )
+  if (result.rejected) {
+    return error(422, {
+      errors: result.violations.map((v) => ({ message: v.detail, constraintId: v.constraintId })),
+    })
+  }
+  const updated = result.entities.find((e) => e.id === id) ?? result.entities[0]
+  return json(envelope({
+    id: updated?.id ?? id,
+    type: updated?.type ?? existing.type,
+    ...(updated?.data ?? {}),
+  }, {
+    derived: result.derivedCount > 0 ? { count: result.derivedCount } : {},
+    violations: result.violations.map((v) => ({
+      reading: v.reading ?? '',
+      constraintId: v.constraintId ?? '',
+      modality: v.modality ?? 'deontic',
+      detail: v.detail,
+    })),
+  }))
 })
 
 router.delete('/api/entities/:noun/:id', async (request, env: Env) => {
@@ -970,7 +1021,7 @@ router.all('/api/parse', handleParse)
 
 
 
-/** POST /api/:collection — create */
+/** POST /api/:collection — create through engine (#699 / Audit T1). */
 router.post('/api/:collection', async (request, env: Env) => {
   const collection = decodeURIComponent(request.params.collection)
   const body = await request.json() as Record<string, any>
@@ -981,21 +1032,32 @@ router.post('/api/:collection', async (request, env: Env) => {
     return error(404, { errors: [{ message: `Collection "${collection}" not found` }] })
   }
 
-  const domain = body.domain || ''
+  const domain = (body.domain as string | undefined) || ''
+  if (!domain) return error(400, { errors: [{ message: 'domain required in body' }] })
+
   const broadcast = env.BROADCAST.get(env.BROADCAST.idFromName('global')) as any
-  const result = await handleCreateEntity(
-    entityType,
-    domain,
-    body,
-    (id) => getEntityDO(env, id) as any,
+  const getStub = (id: string) => getEntityDO(env, id) as any
+
+  const result = await applyEntityCommand(
+    { operation: 'create', noun: entityType, domain, fields: body },
     registry,
-    undefined,
+    getStub,
+    { loadDomainAndPopulation, applyCommand },
     broadcast,
   )
-  return json({ doc: { id: result.id, ...body }, message: 'Created successfully' }, { status: 201 })
+  if (result.rejected) {
+    return error(422, {
+      errors: result.violations.map((v) => ({ message: v.detail, constraintId: v.constraintId })),
+    })
+  }
+  const primary = result.entities[0]
+  return json({
+    doc: { id: result.id, ...(primary?.data ?? body) },
+    message: 'Created successfully',
+  }, { status: 201 })
 })
 
-/** PATCH /api/:collection/:id — update */
+/** PATCH /api/:collection/:id — update through engine (#699 / Audit T1). */
 router.patch('/api/:collection/:id', async (request, env: Env) => {
   const collection = decodeURIComponent(request.params.collection); const id = decodeURIComponent(request.params.id)
   const body = await request.json() as Record<string, any>
@@ -1009,9 +1071,36 @@ router.patch('/api/:collection/:id', async (request, env: Env) => {
   const entityDO = getEntityDO(env, id) as any
   const existing = await entityDO.get()
   if (!existing) return error(404, { errors: [{ message: 'Not Found' }] })
-  const merged = { ...existing.data, ...body }
-  const result = await entityDO.put({ id: existing.id, type: existing.type, data: merged })
-  return json({ doc: { id: result.id, type: result.type, ...result.data }, message: 'Updated successfully' })
+
+  const domain = (body.domain as string | undefined)
+    || (existing.data?._domain as string | undefined)
+    || (existing.data?.domain as string | undefined)
+    || ''
+  if (!domain) {
+    return error(400, { errors: [{ message: 'domain required (body or entity._domain)' }] })
+  }
+
+  const getStub = (eid: string) => getEntityDO(env, eid) as any
+  const result = await applyEntityCommand(
+    { operation: 'update', noun: existing.type ?? entityType, domain, id, fields: body },
+    registry,
+    getStub,
+    { loadDomainAndPopulation, applyCommand },
+  )
+  if (result.rejected) {
+    return error(422, {
+      errors: result.violations.map((v) => ({ message: v.detail, constraintId: v.constraintId })),
+    })
+  }
+  const updated = result.entities.find((e) => e.id === id) ?? result.entities[0]
+  return json({
+    doc: {
+      id: updated?.id ?? id,
+      type: updated?.type ?? existing.type,
+      ...(updated?.data ?? {}),
+    },
+    message: 'Updated successfully',
+  })
 })
 
 /** DELETE /api/:collection/:id — delete */

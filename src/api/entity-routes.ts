@@ -266,3 +266,153 @@ export async function handleDeleteEntity(
   }
   return { id: result.id, deleted: true }
 }
+
+// ---------------------------------------------------------------------------
+// applyEntityCommand — engine-path entity write (#699 / Audit T1)
+// ---------------------------------------------------------------------------
+
+// Audit T1 (#699). The bypass routes used to call EntityDO.put() directly,
+// skipping validate + derive + Theorem 5 envelope. This helper threads
+// every entity write through the engine: build population from EntityDB,
+// call applyCommand (which runs validate then derive), persist returned
+// __state entities, broadcast the mutation.
+//
+// Wire-shape parity with `dispatchVerb('apply', ...)` — the audit text's
+// "reroute every entity write through dispatchVerb('apply', ...)" maps
+// 1:1 to this `{ operation, noun, id, fields }` input. dispatchVerb
+// itself takes the engine-state path (no DO-backed population), which
+// the worker target can't satisfy without round-tripping every cell on
+// every request — hence this DO-aware sibling.
+
+/** Engine surface this helper depends on — narrow types so a test
+ * can pass a mock without touching the wasm-pack module. */
+export interface EngineDeps {
+  /** Build a population JSON from registry + DOs for `domain`. */
+  loadDomainAndPopulation(
+    registry: any,
+    getStub: (id: string) => any,
+    domain: string,
+  ): Promise<string>
+  /** Apply a Command against a population, returning the engine result. */
+  applyCommand(command: any, populationJson: string): any
+}
+
+export type EntityCommandOperation = 'create' | 'update'
+
+export interface ApplyEntityCommandInput {
+  operation: EntityCommandOperation
+  noun: string
+  domain: string
+  /** Required for 'update'; optional for 'create' (engine resolves via
+   *  reference scheme when absent). */
+  id?: string
+  fields: Record<string, unknown>
+}
+
+export interface EngineEntity {
+  id?: string
+  type: string
+  data: Record<string, unknown>
+}
+
+export interface EngineViolation {
+  reading?: string
+  constraintId?: string
+  detail?: string
+  modality?: 'alethic' | 'deontic'
+}
+
+export interface ApplyEntityCommandResult {
+  /** True when validate rejected the command. Caller maps to 422. */
+  rejected: boolean
+  /** Primary entity id — first persisted entity, or the input id. */
+  id: string
+  status: string | null
+  transitions: unknown[]
+  derivedCount: number
+  violations: EngineViolation[]
+  /** Entities the engine asked to persist (after validate + derive).
+   *  Already written to DOs + indexed before this returns. */
+  entities: EngineEntity[]
+}
+
+export async function applyEntityCommand(
+  input: ApplyEntityCommandInput,
+  registry: RegistryWriteStub & RegistryReadStub & { [k: string]: any },
+  getStub: (id: string) => EntityWriteStub & EntityReadStub,
+  engine: EngineDeps,
+  broadcast?: BroadcastWriteStub,
+): Promise<ApplyEntityCommandResult> {
+  if (input.operation === 'update' && !input.id) {
+    throw new Error('applyEntityCommand: update requires `id`')
+  }
+
+  const populationJson = await engine.loadDomainAndPopulation(
+    registry,
+    getStub,
+    input.domain,
+  )
+
+  const cmd = input.operation === 'create'
+    ? {
+        type: 'createEntity',
+        noun: input.noun,
+        domain: input.domain,
+        id: input.id ?? null,
+        fields: input.fields,
+      }
+    : {
+        type: 'updateEntity',
+        noun: input.noun,
+        domain: input.domain,
+        entityId: input.id,
+        fields: input.fields,
+      }
+
+  const arestResult = engine.applyCommand(cmd, populationJson)
+
+  if (arestResult?.rejected) {
+    return {
+      rejected: true,
+      id: input.id ?? '',
+      status: null,
+      transitions: [],
+      derivedCount: 0,
+      violations: arestResult.violations ?? [],
+      entities: [],
+    }
+  }
+
+  const entities: EngineEntity[] = arestResult?.entities ?? []
+  for (const entity of entities) {
+    const eid = entity.id || crypto.randomUUID()
+    entity.id = eid
+    await getStub(eid).put({ id: eid, type: entity.type, data: entity.data })
+    await registry.indexEntity(entity.type, eid, input.domain)
+  }
+
+  const primaryId = entities[0]?.id ?? input.id ?? crypto.randomUUID()
+
+  if (broadcast) {
+    try {
+      await broadcast.publish({
+        domain: input.domain,
+        noun: input.noun,
+        entityId: primaryId,
+        operation: input.operation,
+        facts: input.fields,
+        timestamp: Date.now(),
+      })
+    } catch { /* signal-delivery is best-effort */ }
+  }
+
+  return {
+    rejected: false,
+    id: primaryId,
+    status: arestResult?.status ?? null,
+    transitions: arestResult?.transitions ?? [],
+    derivedCount: arestResult?.derivedCount ?? 0,
+    violations: arestResult?.violations ?? [],
+    entities,
+  }
+}

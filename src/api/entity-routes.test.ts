@@ -5,6 +5,7 @@ import {
   handleCreateEntity,
   handleDeleteEntity,
   populateDepthForEntity,
+  applyEntityCommand,
 } from './entity-routes'
 
 describe('entity-routes', () => {
@@ -285,6 +286,166 @@ describe('entity-routes', () => {
     const result = await handleGetEntity(nounStub, { depth: 1, getStub: (id) => stubs.get(id)! })
 
     expect(result!.data.factType).toEqual({ id: 'gs1', name: 'Tickets' })
+  })
+
+  // ── applyEntityCommand (#699 / Audit T1) ────────────────────────────
+
+  it('applyEntityCommand creates: validate runs, returned entities persist', async () => {
+    const stub = {
+      put: vi.fn().mockResolvedValue({ id: 'ord-1', type: 'Order', data: { total: 10 } }),
+      delete: vi.fn(),
+      get: vi.fn(),
+    }
+    const registry = {
+      getEntityIds: vi.fn(),
+      indexEntity: vi.fn().mockResolvedValue(undefined),
+      deindexEntity: vi.fn().mockResolvedValue(undefined),
+    }
+    const engine = {
+      loadDomainAndPopulation: vi.fn().mockResolvedValue('{"facts":{}}'),
+      applyCommand: vi.fn().mockReturnValue({
+        rejected: false,
+        entities: [{ id: 'ord-1', type: 'Order', data: { total: 10 } }],
+        status: 'placed',
+        transitions: [],
+        violations: [],
+        derivedCount: 0,
+      }),
+    }
+    const result = await applyEntityCommand(
+      { operation: 'create', noun: 'Order', domain: 'orders', fields: { total: 10 } },
+      registry,
+      () => stub,
+      engine,
+    )
+    expect(engine.loadDomainAndPopulation).toHaveBeenCalledWith(registry, expect.any(Function), 'orders')
+    expect(engine.applyCommand).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'createEntity', noun: 'Order', domain: 'orders', fields: { total: 10 } }),
+      '{"facts":{}}',
+    )
+    expect(stub.put).toHaveBeenCalledWith({ id: 'ord-1', type: 'Order', data: { total: 10 } })
+    expect(registry.indexEntity).toHaveBeenCalledWith('Order', 'ord-1', 'orders')
+    expect(result.rejected).toBe(false)
+    expect(result.id).toBe('ord-1')
+    expect(result.status).toBe('placed')
+  })
+
+  it('applyEntityCommand surfaces engine rejection without persisting', async () => {
+    const stub = {
+      put: vi.fn(), delete: vi.fn(), get: vi.fn(),
+    }
+    const registry = {
+      getEntityIds: vi.fn(),
+      indexEntity: vi.fn(),
+      deindexEntity: vi.fn(),
+    }
+    const engine = {
+      loadDomainAndPopulation: vi.fn().mockResolvedValue('{"facts":{}}'),
+      applyCommand: vi.fn().mockReturnValue({
+        rejected: true,
+        violations: [{ reading: 'r1', constraintId: 'c1', detail: 'mandatory role missing', modality: 'alethic' }],
+        entities: [],
+      }),
+    }
+    const result = await applyEntityCommand(
+      { operation: 'create', noun: 'Order', domain: 'orders', fields: {} },
+      registry,
+      () => stub,
+      engine,
+    )
+    expect(result.rejected).toBe(true)
+    expect(result.violations).toHaveLength(1)
+    expect(stub.put).not.toHaveBeenCalled()
+    expect(registry.indexEntity).not.toHaveBeenCalled()
+  })
+
+  it('applyEntityCommand update: routes through updateEntity command', async () => {
+    const stub = {
+      put: vi.fn().mockResolvedValue({ id: 'ord-1', type: 'Order', data: { total: 99 } }),
+      delete: vi.fn(),
+      get: vi.fn(),
+    }
+    const registry = {
+      getEntityIds: vi.fn(),
+      indexEntity: vi.fn().mockResolvedValue(undefined),
+      deindexEntity: vi.fn(),
+    }
+    const engine = {
+      loadDomainAndPopulation: vi.fn().mockResolvedValue('{"facts":{}}'),
+      applyCommand: vi.fn().mockReturnValue({
+        rejected: false,
+        entities: [{ id: 'ord-1', type: 'Order', data: { total: 99 } }],
+        status: 'placed',
+        transitions: [],
+        violations: [],
+      }),
+    }
+    await applyEntityCommand(
+      { operation: 'update', noun: 'Order', domain: 'orders', id: 'ord-1', fields: { total: 99 } },
+      registry,
+      () => stub,
+      engine,
+    )
+    expect(engine.applyCommand).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'updateEntity',
+        noun: 'Order',
+        domain: 'orders',
+        entityId: 'ord-1',
+        fields: { total: 99 },
+      }),
+      '{"facts":{}}',
+    )
+  })
+
+  it('applyEntityCommand throws when update is missing id', async () => {
+    const engine = {
+      loadDomainAndPopulation: vi.fn(),
+      applyCommand: vi.fn(),
+    }
+    await expect(
+      applyEntityCommand(
+        { operation: 'update', noun: 'Order', domain: 'orders', fields: {} } as any,
+        {} as any,
+        () => ({}) as any,
+        engine,
+      ),
+    ).rejects.toThrow(/update requires `id`/)
+    expect(engine.loadDomainAndPopulation).not.toHaveBeenCalled()
+  })
+
+  it('applyEntityCommand publishes a broadcast event when broadcast stub provided', async () => {
+    const stub = {
+      put: vi.fn().mockResolvedValue({ id: 'ord-1', type: 'Order', data: {} }),
+      delete: vi.fn(), get: vi.fn(),
+    }
+    const registry = {
+      getEntityIds: vi.fn(),
+      indexEntity: vi.fn().mockResolvedValue(undefined),
+      deindexEntity: vi.fn(),
+    }
+    const broadcast = { publish: vi.fn().mockResolvedValue(undefined) }
+    const engine = {
+      loadDomainAndPopulation: vi.fn().mockResolvedValue('{"facts":{}}'),
+      applyCommand: vi.fn().mockReturnValue({
+        rejected: false,
+        entities: [{ id: 'ord-1', type: 'Order', data: {} }],
+      }),
+    }
+    await applyEntityCommand(
+      { operation: 'create', noun: 'Order', domain: 'orders', fields: { total: 1 } },
+      registry,
+      () => stub,
+      engine,
+      broadcast,
+    )
+    expect(broadcast.publish).toHaveBeenCalledWith(expect.objectContaining({
+      domain: 'orders',
+      noun: 'Order',
+      entityId: 'ord-1',
+      operation: 'create',
+      facts: { total: 1 },
+    }))
   })
 
 })
