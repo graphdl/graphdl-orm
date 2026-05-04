@@ -14,6 +14,8 @@ import { describe, it, expect } from 'vitest'
 import { getSandboxHandle, tutorSystemCall, resetSandbox, tutorDomainsDir } from './tutor-sandbox.js'
 import { compileDomainReadings, system } from '../api/engine.js'
 import { existsSync } from 'fs'
+import { mkdtempSync } from 'fs'
+import { tmpdir } from 'os'
 import { resolve } from 'path'
 import { evalExpectPredicate, listRegisteredTools } from './server.js'
 
@@ -134,4 +136,38 @@ describe('tutor.* mirror tools', () => {
     expect(parsed).toBeDefined()
     expect(parsed?.rejected).not.toBe(true)
   }, 60_000)
+})
+
+const haveCli = Boolean(process.env.AREST_CLI && existsSync(process.env.AREST_CLI))
+
+describe.skipIf(!haveCli)('tutor sandbox — CLI persistence', () => {
+  it('a tutor.apply create persists across an in-process handle drop', async () => {
+    const tempDir = mkdtempSync(`${tmpdir()}/arest-tutor-`)
+    const dbPath = `${tempDir}/tutor.db`
+    process.env.AREST_TUTOR_DB = dbPath
+
+    await resetSandbox()
+    await tutorSystemCall(
+      'create:Customer',
+      '<<id, persisted-1>, <Name, persisted>>',
+    )
+    expect(existsSync(dbPath)).toBe(true)
+
+    // Drop the in-process handle but keep the DB file. Equivalent to
+    // an MCP server restart against the same AREST_TUTOR_DB.
+    const mod = await import('./tutor-sandbox.js') as any
+    if (typeof mod._testOnly_dropSandboxHandle === 'function') {
+      mod._testOnly_dropSandboxHandle()
+    }
+
+    // After "restart", a fresh tutorSystemCall against the same DB must
+    // see the previously written entity.
+    const listed = JSON.parse(await tutorSystemCall('list:Customer', '')) ?? []
+    expect(Array.isArray(listed)).toBe(true)
+    expect(
+      listed.find((c: any) => (c.id ?? c.Name) === 'persisted-1' || c.Name === 'persisted'),
+    ).toBeDefined()
+
+    delete process.env.AREST_TUTOR_DB
+  }, 120_000)
 })
