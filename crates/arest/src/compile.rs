@@ -5356,6 +5356,14 @@ pub fn generate_derivation_triggers(
 }
 
 // -- Schema Compilation Tests -----------------------------------------
+//
+// M4 (#697): all `std::collections::HashSet` usage in this module is
+// test-only — set-equality assertions on def-name lists where order
+// is incidental (compile_func_round_trip and family-decomposition
+// shape pins). Production compile paths use `hashbrown::HashSet`
+// where set membership matters. The audit's M4 scan flagged these
+// lines; this comment is the explicit tag so a future grep can
+// distinguish them from production usage at a glance.
 
 #[cfg(test)]
 mod schema_tests {
