@@ -711,7 +711,14 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
     return error(400, { errors: [{ message: 'Entity has no state machine' }] })
   }
 
-  // AREST: apply transition command
+  // AREST: apply transition command. Audit T4 (#702) — applyCommand routes
+  // through the engine's transition_via_defs, which runs the deontic +
+  // alethic validate gate (D1 / #703) before producing the new SM cell as
+  // part of __state (#209). The handler trusts the engine result: every
+  // returned entity is persisted, including the State Machine cell whose
+  // currentlyInStatus has flipped. No manual SM cell write — that bypass
+  // was the worker-side equivalent of the entity-write hallucination T1
+  // closed.
   const populationJson = await loadDomainAndPopulation(registry, getStub, domainSlug)
   const cmd = {
     type: 'transition' as const,
@@ -720,9 +727,7 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
     currentStatus,
     domain: domainSlug,
   }
-  console.log('AREST transition cmd:', JSON.stringify(cmd))
   const arestResult = applyCommand(cmd, populationJson)
-  console.log('AREST transition result:', JSON.stringify({ status: arestResult.status, entities: arestResult.entities?.length, error: (arestResult as any).error }))
 
   if (arestResult.rejected) {
     return error(422, { errors: arestResult.violations.map((v: any) => ({ message: v.detail })) })
@@ -731,16 +736,12 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
   if (!arestResult.status) {
     return error(400, { errors: [{
       message: `Invalid transition: event '${body.event}' not available from status '${currentStatus}'`,
-    }], debug: { arestResult, cmd } })
+    }] })
   }
 
-  // Update the State Machine entity's current status via cell store (↓n)
-  const smCell = await getStub(smEntityId).get()
-  if (smCell) {
-    await getStub(smEntityId).put({ id: smCell.id, type: smCell.type, data: { ...smCell.data, currentlyInStatus: arestResult.status } })
-  }
-
-  // Persist any Event entities from the AREST result
+  // Persist every entity from the engine's __state — the new SM cell
+  // (currentlyInStatus updated) and any Event entities the transition
+  // emitted, indexed under the same domain.
   for (const e of arestResult.entities) {
     const eid = e.id || crypto.randomUUID()
     await getStub(eid).put({ id: eid, type: e.type, data: e.data })
