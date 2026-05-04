@@ -130,8 +130,8 @@ ProductVariant has Stock Count.
 Each Category has at most one parent Category.
 
 ### Ring constraints on "Category has parent Category" are declared as tagged
-### shorthands on the binary fact type, not as long prose. Each shorthand maps
-### to one elementary assertion about the role pair.
+### constraints on the binary fact type, not as long prose. Each tagged
+### constraint maps to one elementary assertion about the role pair.
 Category has parent Category is irreflexive.
 Category has parent Category is acyclic.
 

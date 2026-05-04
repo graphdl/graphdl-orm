@@ -135,32 +135,39 @@ Status 'Shipped' is defined in State Machine Definition 'Order'.
 Status 'Delivered' is defined in State Machine Definition 'Order'.
 Status 'Cancelled' is defined in State Machine Definition 'Order'.
 Status 'Refunded' is defined in State Machine Definition 'Order'.
-Status 'Draft' is initial.
+Status 'Draft' is initial in State Machine Definition 'Order'.
 
+Transition 'place' is defined in State Machine Definition 'Order'.
 Transition 'place' is from Status 'Draft'.
 Transition 'place' is to Status 'Placed'.
 Transition 'place' is triggered by Event Type 'place'.
 
+Transition 'pay' is defined in State Machine Definition 'Order'.
 Transition 'pay' is from Status 'Placed'.
 Transition 'pay' is to Status 'Paid'.
 Transition 'pay' is triggered by Event Type 'pay'.
 
+Transition 'ship' is defined in State Machine Definition 'Order'.
 Transition 'ship' is from Status 'Paid'.
 Transition 'ship' is to Status 'Shipped'.
 Transition 'ship' is triggered by Event Type 'ship'.
 
+Transition 'deliver' is defined in State Machine Definition 'Order'.
 Transition 'deliver' is from Status 'Shipped'.
 Transition 'deliver' is to Status 'Delivered'.
 Transition 'deliver' is triggered by Event Type 'deliver'.
 
+Transition 'cancel-draft' is defined in State Machine Definition 'Order'.
 Transition 'cancel-draft' is from Status 'Draft'.
 Transition 'cancel-draft' is to Status 'Cancelled'.
 Transition 'cancel-draft' is triggered by Event Type 'cancel'.
 
+Transition 'cancel-placed' is defined in State Machine Definition 'Order'.
 Transition 'cancel-placed' is from Status 'Placed'.
 Transition 'cancel-placed' is to Status 'Cancelled'.
 Transition 'cancel-placed' is triggered by Event Type 'cancel'.
 
+Transition 'refund' is defined in State Machine Definition 'Order'.
 Transition 'refund' is from Status 'Delivered'.
 Transition 'refund' is to Status 'Refunded'.
 Transition 'refund' is triggered by Event Type 'refund'.
@@ -172,16 +179,19 @@ Status 'Pending' is defined in State Machine Definition 'Payment'.
 Status 'Authorized' is defined in State Machine Definition 'Payment'.
 Status 'Captured' is defined in State Machine Definition 'Payment'.
 Status 'Failed' is defined in State Machine Definition 'Payment'.
-Status 'Pending' is initial.
+Status 'Pending' is initial in State Machine Definition 'Payment'.
 
+Transition 'authorize' is defined in State Machine Definition 'Payment'.
 Transition 'authorize' is from Status 'Pending'.
 Transition 'authorize' is to Status 'Authorized'.
 Transition 'authorize' is triggered by Event Type 'authorize'.
 
+Transition 'capture' is defined in State Machine Definition 'Payment'.
 Transition 'capture' is from Status 'Authorized'.
 Transition 'capture' is to Status 'Captured'.
 Transition 'capture' is triggered by Event Type 'capture'.
 
+Transition 'fail' is defined in State Machine Definition 'Payment'.
 Transition 'fail' is from Status 'Pending'.
 Transition 'fail' is to Status 'Failed'.
 Transition 'fail' is triggered by Event Type 'fail'.

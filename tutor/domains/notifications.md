@@ -95,28 +95,34 @@ Status 'Sent' is defined in State Machine Definition 'Notification'.
 Status 'Delivered' is defined in State Machine Definition 'Notification'.
 Status 'Read' is defined in State Machine Definition 'Notification'.
 Status 'Failed' is defined in State Machine Definition 'Notification'.
-Status 'Queued' is initial.
+Status 'Queued' is initial in State Machine Definition 'Notification'.
 
+Transition 'send' is defined in State Machine Definition 'Notification'.
 Transition 'send' is from Status 'Queued'.
 Transition 'send' is to Status 'Sending'.
 Transition 'send' is triggered by Event Type 'send'.
 
+Transition 'confirm-sent' is defined in State Machine Definition 'Notification'.
 Transition 'confirm-sent' is from Status 'Sending'.
 Transition 'confirm-sent' is to Status 'Sent'.
 Transition 'confirm-sent' is triggered by Event Type 'confirm-sent'.
 
+Transition 'confirm-delivery' is defined in State Machine Definition 'Notification'.
 Transition 'confirm-delivery' is from Status 'Sent'.
 Transition 'confirm-delivery' is to Status 'Delivered'.
 Transition 'confirm-delivery' is triggered by Event Type 'confirm-delivery'.
 
+Transition 'mark-read' is defined in State Machine Definition 'Notification'.
 Transition 'mark-read' is from Status 'Delivered'.
 Transition 'mark-read' is to Status 'Read'.
 Transition 'mark-read' is triggered by Event Type 'mark-read'.
 
+Transition 'fail-sending' is defined in State Machine Definition 'Notification'.
 Transition 'fail-sending' is from Status 'Sending'.
 Transition 'fail-sending' is to Status 'Failed'.
 Transition 'fail-sending' is triggered by Event Type 'fail'.
 
+Transition 'retry' is defined in State Machine Definition 'Notification'.
 Transition 'retry' is from Status 'Failed'.
 Transition 'retry' is to Status 'Queued'.
 Transition 'retry' is triggered by Event Type 'retry'.

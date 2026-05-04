@@ -5,7 +5,7 @@
 
 A ternary binds three nouns. The arity decomposition rule requires that a ternary have a UC spanning at least two of its three roles. If the ternary lacks such a UC, the fact is compound and should be split into binaries.
 
-The FORML2 form uses `For each ... and ...`. For example, "For each Plan and Interval that Plan has that Interval at most one Price" means "(Plan, Interval) → Price is many-to-one." You cannot use the `Each X` shorthand for ternaries, because that would be a single-role UC on a ternary, which violates the rule.
+The FORML2 form uses `For each ... and ...`. For example, "For each Plan and Interval that Plan has that Interval at most one Price" means "(Plan, Interval) -> Price is many-to-one." You cannot use a single-role `Each X` UC on a ternary, because that violates the spanning UC rule.
 
 ## Do it
 

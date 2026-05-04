@@ -4,16 +4,18 @@ A state machine describes how an entity transitions between statuses. In arest, 
 
 ## Declaring a machine
 
-An SM declaration has four parts: which noun it tracks, the initial status, the statuses that exist, and the transitions between them.
+An SM declaration names the noun it tracks, its initial status, and each transition's state-machine membership, source status, and target status. Statuses reached by transitions are recognized from those transition facts, so you only need separate `Status is defined in State Machine Definition` facts for statuses that are not reached by a transition.
 
 ```forml2
 State Machine Definition 'Order' is for Noun 'Order'.
 Status 'In Cart' is initial in State Machine Definition 'Order'.
-Transition 'place' is from Status 'In Cart' to Status 'Placed'.
-Transition 'ship' is from Status 'Placed' to Status 'Shipped'.
+Transition 'place' is defined in State Machine Definition 'Order'.
+Transition 'place' is from Status 'In Cart'.
+Transition 'place' is to Status 'Placed'.
+Transition 'ship' is defined in State Machine Definition 'Order'.
+Transition 'ship' is from Status 'Placed'.
+Transition 'ship' is to Status 'Shipped'.
 ```
-
-The statuses themselves (`Placed`, `Shipped`) are implied by the transitions, so you do not need to list them separately unless you want one that no transition reaches.
 
 ### Mealy and Moore semantics
 
@@ -65,7 +67,9 @@ A status with no outgoing transitions is terminal. Corollary: Deletion says that
 
 ```forml2
 Status 'Archived' is terminal in State Machine Definition 'Order'.
-Transition 'archive' is from Status 'Shipped' to Status 'Archived'.
+Transition 'archive' is defined in State Machine Definition 'Order'.
+Transition 'archive' is from Status 'Shipped'.
+Transition 'archive' is to Status 'Archived'.
 ```
 
 Tenants who prefer soft-delete declare an Archived status; those who want hard-delete can `retract` the facts directly.

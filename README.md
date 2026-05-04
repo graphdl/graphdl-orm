@@ -25,8 +25,12 @@ Order was placed by Customer.
 
 State Machine Definition 'Order' is for Noun 'Order'.
 Status 'In Cart' is initial in State Machine Definition 'Order'.
-Transition 'place' is from Status 'In Cart' to Status 'Placed'.
-Transition 'ship' is from Status 'Placed' to Status 'Shipped'.
+Transition 'place' is defined in State Machine Definition 'Order'.
+Transition 'place' is from Status 'In Cart'.
+Transition 'place' is to Status 'Placed'.
+Transition 'ship' is defined in State Machine Definition 'Order'.
+Transition 'ship' is from Status 'Placed'.
+Transition 'ship' is to Status 'Shipped'.
 ```
 
 Compile it:
@@ -47,7 +51,7 @@ arest-cli "transition:Order" "<ord-1, place>" --db app.db
 #   "_links": { "ship": { ... } } }
 ```
 
-That is the full setup. The schema, the uniqueness constraint, the three-state machine, and the REST surface all come from the nine readings above. There is no translation step, no ORM boilerplate, and no handler registration.
+That is the full setup. The schema, the uniqueness constraint, the three-state machine, and the REST surface all come from the readings above. There is no translation step, no ORM boilerplate, and no handler registration.
 
 ## What readings compile into
 

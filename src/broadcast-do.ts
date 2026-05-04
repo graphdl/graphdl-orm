@@ -15,6 +15,7 @@
 
 import { DurableObject } from 'cloudflare:workers'
 import { cellKey as rmapCellKey } from './api/cell-key'
+import type { Env } from './types'
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -252,7 +253,7 @@ export async function openSseStream(reg: Registry, request: Request): Promise<Re
 export class BroadcastDO extends DurableObject {
   private registry: Registry
 
-  constructor(ctx: DurableObjectState, env: unknown) {
+  constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env)
     this.registry = createRegistry()
   }

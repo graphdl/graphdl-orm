@@ -74,11 +74,18 @@ writeFileSync(npmIgnorePath, '', 'utf-8')
 // `system()`'s `finally` clause runs after the `try` already threw on the
 // missing `__wbindgen_malloc`, and finally's throw replaces try's.)
 //
-// Rewrite `arest.js` to manually `new WebAssembly.Instance(...)` against
-// the host glue in `arest_bg.js`, then expose `.exports` as `wasm` for
-// the rest of the wrapper. The WASM module's import section names
-// `./arest_bg.js` as the source for `__wbg_*` thunks, so that's the key
-// in the import object we hand to `WebAssembly.Instance`.
+// Rewrite `arest.js` to work in both Cloudflare/Vitest and plain Node:
+//
+// - Cloudflare's `CompiledWasm` and the Vitest plugin expose a default
+//   `WebAssembly.Module`, so we manually instantiate it against the host
+//   glue in `arest_bg.js`.
+// - Node's WASM ESM integration exposes the instance exports as the module
+//   namespace, with no default export. In that case the namespace is already
+//   the object wasm-bindgen's JS glue wants.
+//
+// The WASM module's import section names `./arest_bg.js` as the source for
+// `__wbg_*` thunks, so that's the key in the import object we hand to
+// `WebAssembly.Instance` on the manual path.
 const arestJsPath = resolve(__dirname, '..', 'crates', 'arest', 'pkg', 'arest.js')
 if (existsSync(arestJsPath)) {
   const jsSrc = readFileSync(arestJsPath, 'utf-8')
@@ -86,14 +93,16 @@ if (existsSync(arestJsPath)) {
   // Idempotent: skip if already rewritten (yarn build:wasm runs the
   // sanitizer every build — the second run would otherwise see the
   // already-correct shim and fail to match).
-  const already = jsSrc.includes('new WebAssembly.Instance(')
+  const already = jsSrc.includes('const wasm = wasm_import.default instanceof WebAssembly.Module')
   if (!already) {
     const rewritten = jsSrc.replace(
-      /import \* as wasm from "\.\/arest_bg\.wasm";\s*\n+import \{ __wbg_set_wasm \} from "\.\/arest_bg\.js";\s*\n+__wbg_set_wasm\(wasm\);\s*\n+(?:if \(typeof wasm\.__wbindgen_start === "function"\) )?wasm\.__wbindgen_start\(\);/,
+      /(?:import \* as wasm from "\.\/arest_bg\.wasm";\s*\n+import \{ __wbg_set_wasm \} from "\.\/arest_bg\.js";\s*\n+__wbg_set_wasm\(wasm\);\s*\n+(?:if \(typeof wasm\.__wbindgen_start === "function"\) )?wasm\.__wbindgen_start\(\);|import wasm_module from "\.\/arest_bg\.wasm";\s*\n+import \* as __arest_bg from "\.\/arest_bg\.js";\s*\n+const wasm = new WebAssembly\.Instance\(wasm_module, \{ "\.\/arest_bg\.js": __arest_bg \}\)\.exports;\s*\n+__arest_bg\.__wbg_set_wasm\(wasm\);\s*\n+if \(typeof wasm\.__wbindgen_start === "function"\) wasm\.__wbindgen_start\(\);)/,
       [
-        'import wasm_module from "./arest_bg.wasm";',
+        'import * as wasm_import from "./arest_bg.wasm";',
         'import * as __arest_bg from "./arest_bg.js";',
-        'const wasm = new WebAssembly.Instance(wasm_module, { "./arest_bg.js": __arest_bg }).exports;',
+        'const wasm = wasm_import.default instanceof WebAssembly.Module',
+        '    ? new WebAssembly.Instance(wasm_import.default, { "./arest_bg.js": __arest_bg }).exports',
+        '    : wasm_import;',
         '__arest_bg.__wbg_set_wasm(wasm);',
         'if (typeof wasm.__wbindgen_start === "function") wasm.__wbindgen_start();',
       ].join('\n'),
@@ -107,7 +116,7 @@ if (existsSync(arestJsPath)) {
       process.exit(2)
     }
     writeFileSync(arestJsPath, rewritten, 'utf-8')
-    console.log('sanitize-wasm-dts: rewrote arest.js to manually instantiate WASM (CF Workers compat)')
+    console.log('sanitize-wasm-dts: rewrote arest.js with hybrid WASM loader (CF Workers/Vitest/Node)')
   }
 }
 

@@ -107,24 +107,29 @@ Status 'Draft' is defined in State Machine Definition 'Article'.
 Status 'In Review' is defined in State Machine Definition 'Article'.
 Status 'Published' is defined in State Machine Definition 'Article'.
 Status 'Archived' is defined in State Machine Definition 'Article'.
-Status 'Draft' is initial.
+Status 'Draft' is initial in State Machine Definition 'Article'.
 
+Transition 'submit' is defined in State Machine Definition 'Article'.
 Transition 'submit' is from Status 'Draft'.
 Transition 'submit' is to Status 'In Review'.
 Transition 'submit' is triggered by Event Type 'submit'.
 
+Transition 'publish' is defined in State Machine Definition 'Article'.
 Transition 'publish' is from Status 'In Review'.
 Transition 'publish' is to Status 'Published'.
 Transition 'publish' is triggered by Event Type 'publish'.
 
+Transition 'revise' is defined in State Machine Definition 'Article'.
 Transition 'revise' is from Status 'In Review'.
 Transition 'revise' is to Status 'Draft'.
 Transition 'revise' is triggered by Event Type 'revise'.
 
+Transition 'archive' is defined in State Machine Definition 'Article'.
 Transition 'archive' is from Status 'Published'.
 Transition 'archive' is to Status 'Archived'.
 Transition 'archive' is triggered by Event Type 'archive'.
 
+Transition 'unarchive' is defined in State Machine Definition 'Article'.
 Transition 'unarchive' is from Status 'Archived'.
 Transition 'unarchive' is to Status 'Draft'.
 Transition 'unarchive' is triggered by Event Type 'unarchive'.

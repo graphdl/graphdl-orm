@@ -79,7 +79,11 @@ Order is placed by Customer
   Each Order is placed by exactly one
   Customer.
 Customer ships Order.
+State Machine Definition 'Order' is for
+  Noun 'Order'.
 Status 'In Cart' is initial in
+  State Machine Definition 'Order'.
+Transition 'place' is defined in
   State Machine Definition 'Order'.
 Transition 'place' is from
   Status 'In Cart'.
@@ -87,6 +91,8 @@ Transition 'place' is to
   Status 'Placed'.
 Transition 'place' is triggered by
   Fact Type 'Customer places Order'.
+Transition 'ship' is defined in
+  State Machine Definition 'Order'.
 Transition 'ship' is from
   Status 'Placed'.
 Transition 'ship' is to
@@ -95,7 +101,7 @@ Transition 'ship' is triggered by
   Fact Type 'Customer ships Order'.
 \end{lstlisting}
 
-\noindent These twelve readings compile to a database table, a foreign key, a uniqueness constraint, and a three-state machine driven by two trigger fact types, which is everything needed to run an order pipeline. Consider the constraint ``Each Order is placed by exactly one Customer.'' The compiler recognizes this as a uniqueness restriction on the $\mathit{placedBy}$ role and emits:
+\noindent These readings compile to a database table, a foreign key, a uniqueness constraint, and a three-state machine driven by two trigger fact types, which is everything needed to run an order pipeline. Consider the constraint ``Each Order is placed by exactly one Customer.'' The compiler recognizes this as a uniqueness restriction on the $\mathit{placedBy}$ role and emits:
 \begin{align*}
 (\rho\,\mathit{reading})\!:\!P_{\mathit{placedBy}} = \mathit{Filter}(\mathit{count}(s_1) > 1) : P_{\mathit{placedBy}}
 \end{align*}

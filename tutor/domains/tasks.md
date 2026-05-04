@@ -110,8 +110,8 @@ Task targets Milestone.
 
 ## Constraints
 
-### Prefer the tagged ring-constraint shorthand to prose reasoning. The
-### shorthand is a single elementary assertion about the fact type.
+### Prefer the tagged ring-constraint sentence to prose reasoning. The
+### tagged constraint is a single elementary assertion about the fact type.
 Task blocks Task is acyclic.
 
 ### Subset constraint between two binary fact types, stated elementally.
@@ -144,28 +144,34 @@ Status 'Todo' is defined in State Machine Definition 'Task'.
 Status 'In Progress' is defined in State Machine Definition 'Task'.
 Status 'In Review' is defined in State Machine Definition 'Task'.
 Status 'Done' is defined in State Machine Definition 'Task'.
-Status 'Backlog' is initial.
+Status 'Backlog' is initial in State Machine Definition 'Task'.
 
+Transition 'prioritize' is defined in State Machine Definition 'Task'.
 Transition 'prioritize' is from Status 'Backlog'.
 Transition 'prioritize' is to Status 'Todo'.
 Transition 'prioritize' is triggered by Event Type 'prioritize'.
 
+Transition 'start' is defined in State Machine Definition 'Task'.
 Transition 'start' is from Status 'Todo'.
 Transition 'start' is to Status 'In Progress'.
 Transition 'start' is triggered by Event Type 'start'.
 
+Transition 'review' is defined in State Machine Definition 'Task'.
 Transition 'review' is from Status 'In Progress'.
 Transition 'review' is to Status 'In Review'.
 Transition 'review' is triggered by Event Type 'submit-for-review'.
 
+Transition 'approve' is defined in State Machine Definition 'Task'.
 Transition 'approve' is from Status 'In Review'.
 Transition 'approve' is to Status 'Done'.
 Transition 'approve' is triggered by Event Type 'approve'.
 
+Transition 'reject' is defined in State Machine Definition 'Task'.
 Transition 'reject' is from Status 'In Review'.
 Transition 'reject' is to Status 'In Progress'.
 Transition 'reject' is triggered by Event Type 'request-changes'.
 
+Transition 'reopen' is defined in State Machine Definition 'Task'.
 Transition 'reopen' is from Status 'Done'.
 Transition 'reopen' is to Status 'Todo'.
 Transition 'reopen' is triggered by Event Type 'reopen'.

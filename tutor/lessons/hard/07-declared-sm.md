@@ -3,7 +3,7 @@
 **Goal:** Write a state machine as a set of facts (with no code and no DSL) and fire a transition.
 **Prereqs:** Lesson H6
 
-A state machine in FORML2 is declared exactly like anything else: facts about SM Definitions, Statuses, Transitions, and Event Types. The metamodel spec (`readings/state.md`) says each Transition belongs to exactly one SM, each SM is for exactly one Noun, and the initial status is derivable from graph topology (sources never targeted).
+A state machine in FORML2 is declared exactly like anything else: facts about SM Definitions, Statuses, Transitions, and Event Types. The metamodel spec (`readings/state.md`) says each Transition belongs to exactly one SM, each SM is for exactly one Noun, and the initial status is stated as a fact on the SM.
 
 Always include `Transition 'X' is defined in State Machine Definition 'Y'`. Without that fact, the compiler falls back to a heuristic that can pick the wrong SM when two SMs share a status name.
 
@@ -15,7 +15,7 @@ Status 'Open' is defined in State Machine Definition 'Case'.
 Status 'Investigating' is defined in State Machine Definition 'Case'.
 Status 'Solved' is defined in State Machine Definition 'Case'.
 Status 'Closed' is defined in State Machine Definition 'Case'.
-Status 'Open' is initial.
+Status 'Open' is initial in State Machine Definition 'Case'.
 
 Transition 'investigate' is defined in State Machine Definition 'Case'.
 Transition 'investigate' is from Status 'Open'.

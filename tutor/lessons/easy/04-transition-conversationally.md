@@ -3,7 +3,7 @@
 **Goal:** Advance an entity through its state machine using plain language.
 **Prereqs:** Lesson E3
 
-State machines in AREST are declared via readings (for example, "Transition 'place' is from Status 'Draft'..."), and they are already compiled. You do not have to remember the event name: ask the engine which actions are legal right now and pick one.
+State machines in AREST are declared via readings (for example, "Transition 'place' is defined in State Machine Definition 'Order'."), and they are already compiled. You do not have to remember the event name: ask the engine which actions are legal right now and pick one.
 
 In Easy mode the agent picks for you. You say "place it" and the agent translates to the right `apply transition` call.
 
@@ -20,7 +20,7 @@ Propose a small SM for Order if one isn't declared yet:
     "Status 'Draft' is defined in State Machine Definition 'Order'.",
     "Status 'Placed' is defined in State Machine Definition 'Order'.",
     "Status 'Shipped' is defined in State Machine Definition 'Order'.",
-    "Status 'Draft' is initial.",
+    "Status 'Draft' is initial in State Machine Definition 'Order'.",
     "Transition 'place' is defined in State Machine Definition 'Order'. Transition 'place' is from Status 'Draft'. Transition 'place' is to Status 'Placed'. Transition 'place' is triggered by Event Type 'place'.",
     "Transition 'ship' is defined in State Machine Definition 'Order'. Transition 'ship' is from Status 'Placed'. Transition 'ship' is to Status 'Shipped'. Transition 'ship' is triggered by Event Type 'ship'."
   ]
