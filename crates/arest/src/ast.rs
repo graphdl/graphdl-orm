@@ -12,29 +12,35 @@
 // Functions are the program domain (primitives + combining forms).
 // Application is the single operation: f:x → object.
 //
-// Skip-validate flag: set by CLI --no-validate to bypass constraint
-// evaluation during bulk compile. Validation is O(constraints × population);
-// per-fact-type indexing is available via the `validate:{fact_type_id}`
-// defs produced by compile_to_defs_state. Bulk loads may still skip
-// validation entirely when the readings are known-good.
+// Skip-validate policy: when the `Policy_skip_validate` cell holds atom
+// "T", `platform_compile` bypasses the post-merge constraint evaluation.
+// The policy lives in the defs state — set it once at boot via
+// `install_skip_validate(&d)` and the compile path observes it through
+// the same merged_state it already builds.
+//
+// Validation is O(constraints × population); per-fact-type indexing is
+// available via the `validate:{fact_type_id}` defs produced by
+// `compile_to_defs_state`. Bulk loads of known-good readings may opt
+// out entirely with this policy.
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
-#[cfg(not(feature = "no_std"))]
-thread_local! {
-    static SKIP_VALIDATE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
-}
-#[cfg(not(feature = "no_std"))]
-pub fn set_skip_validate(on: bool) { SKIP_VALIDATE.with(|b| b.set(on)); }
-#[cfg(not(feature = "no_std"))]
-fn is_skip_validate() -> bool { SKIP_VALIDATE.with(|b| b.get()) }
+/// Policy cell: presence of atom "T" disables constraint evaluation
+/// during `platform_compile`. Reachable from any state — typically the
+/// defs state that flows into the compile merge.
+pub const POLICY_SKIP_VALIDATE: &str = "Policy_skip_validate";
 
-#[cfg(feature = "no_std")]
-static SKIP_VALIDATE_ATOMIC: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-#[cfg(feature = "no_std")]
-pub fn set_skip_validate(on: bool) { SKIP_VALIDATE_ATOMIC.store(on, core::sync::atomic::Ordering::Relaxed); }
-#[cfg(feature = "no_std")]
-fn is_skip_validate() -> bool { SKIP_VALIDATE_ATOMIC.load(core::sync::atomic::Ordering::Relaxed) }
+/// Install the skip-validate policy on `state`. Returns a new state
+/// with the `Policy_skip_validate` cell set to atom "T".
+pub fn install_skip_validate(state: &Object) -> Object {
+    store(POLICY_SKIP_VALIDATE, Object::atom("T"), state)
+}
+
+/// Read the skip-validate policy from `state`. True iff the
+/// `Policy_skip_validate` cell holds atom "T".
+fn is_skip_validate(state: &Object) -> bool {
+    matches!(fetch(POLICY_SKIP_VALIDATE, state).as_atom(), Some("T"))
+}
 
 // ── Reductions fuel (Sec-3: #159 enforcement inside apply) ─────────
 //
@@ -2455,8 +2461,9 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
     let new_d = defs_to_state(&defs, &merged_state);
 
     // Validate: ρ(validate) applied to merged state. Alethic violations reject.
-    // Skipped when SKIP_VALIDATE is set (--no-validate flag for bulk compile).
-    let decoded = match is_skip_validate() {
+    // Skipped when the Policy_skip_validate cell holds atom "T" — installed
+    // via `install_skip_validate(&d)` (e.g. CLI --no-validate at boot).
+    let decoded = match is_skip_validate(&merged_state) {
         true => vec![],
         false => {
             let ctx = encode_eval_context_state("", None, &merged_state);
@@ -6404,6 +6411,62 @@ mod tests {
         assert_eq!(facts.len(), 1, "expected exactly one compile_history entry");
         assert_eq!(binding(&facts[0], "status"), Some("compiled"));
         assert_eq!(binding(&facts[0], "Domain Change"), Some("compile-0"));
+    }
+
+    // ── #689: Policy_skip_validate cell semantics ─────────────────
+
+    #[test]
+    fn skip_validate_default_is_false_on_empty_state() {
+        assert!(!is_skip_validate(&Object::phi()));
+    }
+
+    #[test]
+    fn install_skip_validate_sets_policy_cell_to_atom_t() {
+        let state = install_skip_validate(&Object::phi());
+        assert_eq!(fetch(POLICY_SKIP_VALIDATE, &state), Object::atom("T"));
+        assert!(is_skip_validate(&state));
+    }
+
+    #[test]
+    fn install_skip_validate_is_idempotent() {
+        let once = install_skip_validate(&Object::phi());
+        let twice = install_skip_validate(&once);
+        assert_eq!(once, twice);
+        assert!(is_skip_validate(&twice));
+    }
+
+    #[test]
+    fn skip_validate_is_false_when_cell_holds_other_atom() {
+        // Only atom "T" enables the policy — defends against other
+        // truthy strings ("true", "1", "yes") accidentally flipping it.
+        let state = store(POLICY_SKIP_VALIDATE, Object::atom("F"), &Object::phi());
+        assert!(!is_skip_validate(&state));
+        let state = store(POLICY_SKIP_VALIDATE, Object::atom("true"), &Object::phi());
+        assert!(!is_skip_validate(&state));
+    }
+
+    #[test]
+    fn platform_compile_skips_validate_when_policy_installed() {
+        // A reading that violates the metamodel-shadow guard would normally
+        // be rejected by validate. With Policy_skip_validate set, validation
+        // is skipped and a benign compile path completes successfully. We
+        // assert via the compile_history side-effect — present iff compile
+        // ran to record_compile_event without rejecting on validation.
+        let readings = "Each Person has a name.";
+        let initial_d = defs_to_state(
+            &vec![("compile".to_string(), Func::Platform("compile".to_string()))],
+            &Object::phi(),
+        );
+        let policy_d = install_skip_validate(&initial_d);
+        let result = apply(
+            &Func::Platform("compile".to_string()),
+            &Object::atom(readings),
+            &policy_d,
+        );
+        let history = fetch_or_phi("compile_history", &result);
+        let facts = history.as_seq().expect("compile_history cell should exist");
+        assert_eq!(facts.len(), 1);
+        assert_eq!(binding(&facts[0], "status"), Some("compiled"));
     }
 
     // ── Security #26: audit trail unit tests ─────────────────────

@@ -415,13 +415,14 @@ pub fn main_entry() {
         },
     );
 
-    // Wire parsed flags to their engine-level thread_local toggles.
-    if no_validate { ast::set_skip_validate(true); }
+    // Wire parsed flags to their engine surface. `--no-validate` is now
+    // a state cell installed on the def store below (see #689); `--strict`
+    // is still a parser-side mode toggle.
     if strict { parse_forml2::set_strict_mode(true); }
 
     #[cfg(not(feature = "local"))]
     {
-        let _ = &db_path; let _ = &rest; // flags-only invocation
+        let _ = &db_path; let _ = &rest; let _ = no_validate; // flags-only invocation
         eprintln!("Build with --features local for SQLite support.");
         eprintln!("  cargo run --bin arest-cli --features local -- <readings_dir>");
         std::process::exit(1);
@@ -525,8 +526,12 @@ pub fn main_entry() {
                         .collect())
                     .unwrap_or_default();
                 eprintln!("[load] App/sqlite instance facts: {:?}", app_ifs);
-                no_validate.then(|| ast::set_skip_validate(true));
                 let mut state = state;
+                // `--no-validate` only matters for runtime `compile` SYSTEM
+                // calls (#689). The dirs path parses + persists directly
+                // without going through `platform_compile`, so the policy
+                // cell would be dead code here — the install lives in the
+                // single-SYSTEM and REPL branches below.
                 // Store (App, Generator) opt-ins as a cell so compile can
                 // emit per-App artifacts (openapi, eventually sqlite/etc.).
                 opt_in_pairs.iter().for_each(|(app, g)| {
@@ -567,6 +572,7 @@ pub fn main_entry() {
             // arest <key> <input> — single SYSTEM call
             (true, n) if n >= 2 => {
                 let d = load_and_compile(&conn);
+                let d = if no_validate { ast::install_skip_validate(&d) } else { d };
                 let key = &non_dirs[0];
                 let input = &non_dirs[1];
                 let t = std::time::Instant::now();
@@ -579,6 +585,7 @@ pub fn main_entry() {
             // arest --db <path> — REPL mode
             _ => {
                 let mut d = load_and_compile(&conn);
+                if no_validate { d = ast::install_skip_validate(&d); }
 
                 eprintln!("AREST REPL — SYSTEM is the only function.");
                 eprintln!("  <key> <input>    call system(key, input)");
