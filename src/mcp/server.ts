@@ -6,9 +6,10 @@
  * inspect audit trails, and verify identity signatures.
  *
  * Two modes (selected by env):
- *   AREST_MODE=local     — load readings from $AREST_READINGS_DIR via
- *                            the bundled WASM engine. No network. Default
- *                            when AREST_URL is unset or empty.
+ *   AREST_MODE=local     — load the selected app from $AREST_APPS_DIR /
+ *                            $AREST_APP, or explicit $AREST_READINGS_DIR /
+ *                            $AREST_DB paths. No network. Default when
+ *                            AREST_URL is unset or empty.
  *   AREST_MODE=remote    — call a deployed Cloudflare Worker at
  *                            $AREST_URL using $AREST_API_KEY.
  *
@@ -20,14 +21,15 @@
  *         "args": ["-y", "arest", "mcp"],
  *         "env": {
  *           "AREST_MODE": "local",
- *           "AREST_READINGS_DIR": "/absolute/path/to/readings"
+ *           "AREST_APPS_DIR": "/absolute/path/to/apps",
+ *           "AREST_APP": "support"
  *         }
  *       }
  *     }
  *   }
  *
  * Or call directly:
- *   AREST_MODE=local AREST_READINGS_DIR=./readings npx tsx src/mcp/server.ts
+ *   AREST_MODE=local AREST_APPS_DIR=../apps AREST_APP=support npx tsx src/mcp/server.ts
  */
 
 /// <reference types="node" />
@@ -37,22 +39,140 @@ import { z } from 'zod'
 import { readFileSync, readdirSync, existsSync } from 'fs'
 import { resolve, dirname, join } from 'path'
 import { fileURLToPath } from 'url'
+import { spawn } from 'child_process'
+import {
+  appendManagedInstanceFacts,
+  buildApplyInstanceFacts,
+  checkArestApps,
+  createArestApp,
+  inferInitialAppName,
+  inspectArestApp,
+  listArestReadingFiles,
+  listArestApps,
+  resolveArestApp,
+  type ArestApp,
+  type ArestAppHealth,
+  type ManagedInstanceFactTypeReading,
+} from './apps.js'
+import {
+  buildMutationContext,
+  enforceMutationContext,
+  DEFAULT_MUTATION_PROMPTS,
+  CONTEXT_RECEIPT_FIELD_DESCRIPTION,
+  MUTATION_CONTEXT_DESCRIPTION,
+  MUTATION_TOOL_DESCRIPTION,
+  type MutationContextDetail,
+  type MutationContextTool,
+} from './mutation-context.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
+const REPO_ROOT = resolve(__dirname, '..', '..')
 
 // ── Mode selection ──────────────────────────────────────────────────
 
 const AREST_URL = process.env.AREST_URL || ''
 const AREST_API_KEY = process.env.AREST_API_KEY || ''
+const AREST_APPS_DIR = process.env.AREST_APPS_DIR || ''
 const AREST_READINGS_DIR = process.env.AREST_READINGS_DIR || ''
+const AREST_DB = process.env.AREST_DB || ''
+const AREST_CLI = process.env.AREST_CLI || resolve(REPO_ROOT, 'crates', 'arest', 'target', 'release', process.platform === 'win32' ? 'arest-cli.exe' : 'arest-cli')
 const AREST_MODE = (process.env.AREST_MODE || (AREST_URL ? 'remote' : 'local')).toLowerCase()
 const AREST_DEBUG = process.env.AREST_DEBUG === '1'
+const INITIAL_APP_NAME = inferInitialAppName(process.env)
+const APP_MODE_ENABLED = Boolean(AREST_DB || process.env.AREST_APP || AREST_APPS_DIR)
+
+function appRegistryOptions() {
+  return {
+    appsDir: AREST_APPS_DIR || undefined,
+    cwd: REPO_ROOT,
+    explicitAppName: INITIAL_APP_NAME,
+    explicitReadingsDir: AREST_READINGS_DIR || undefined,
+    explicitDbPath: AREST_DB || undefined,
+  }
+}
+
+let activeApp = resolveArestApp(INITIAL_APP_NAME, appRegistryOptions())
 
 // ── Local mode: bundled WASM engine via engine.ts ───────────────────
 // Lazily imported so remote-mode users don't pay the WASM cost.
 
 let _localHandle: number = -1
 let _localEngine: typeof import('../api/engine.js') | null = null
+let _localReadingsSignature = ''
+
+function resetLocalHandle() {
+  _localHandle = -1
+  _localReadingsSignature = ''
+}
+
+function activateApp(name: string): ArestApp {
+  activeApp = resolveArestApp(name, appRegistryOptions())
+  resetLocalHandle()
+  return activeApp
+}
+
+function currentReadingsDir(): string {
+  return activeApp.readingsDir || AREST_READINGS_DIR
+}
+
+function currentDbPath(): string {
+  return activeApp.dbPath || AREST_DB
+}
+
+function shouldUseCliDb(): boolean {
+  return AREST_MODE === 'local' && APP_MODE_ENABLED && Boolean(currentDbPath())
+}
+
+type AppDetail = 'summary' | 'full'
+
+function compactHealth(health: ArestAppHealth) {
+  return {
+    status: health.status,
+    ok: health.ok,
+    issues: health.issues,
+    next_actions: health.next_actions,
+    readings: {
+      count: health.readings.count,
+      newestModified: health.readings.newestModified,
+    },
+    db: {
+      exists: health.db.exists,
+      stale: health.db.stale,
+      modified: health.db.modified,
+      bytes: health.db.bytes,
+    },
+    dependencies: {
+      direct: health.dependencies.direct.map((dependency) => dependency.name),
+      closure: health.dependencies.closure.map((dependency) => dependency.name),
+      newestModified: health.dependencies.newestModified,
+      stale: health.dependencies.stale,
+    },
+  }
+}
+
+function appSummary(app: ArestApp = activeApp, detail: AppDetail = 'summary') {
+  const inspected = inspectArestApp(app, appRegistryOptions())
+  const active = app.name === activeApp.name
+  const health = detail === 'full' ? inspected.health : compactHealth(inspected.health)
+  const nextActions = [...health.next_actions]
+  if (!active && health.status !== 'library' && health.status !== 'not_found') {
+    nextActions.push({
+      tool: 'apps.use',
+      args: { name: app.name },
+      reason: 'make this app the active UoD for subsequent local operations',
+    })
+  }
+  return {
+    ...app,
+    active,
+    mode: AREST_MODE,
+    app_mode_enabled: APP_MODE_ENABLED,
+    health: {
+      ...health,
+      next_actions: nextActions,
+    },
+  }
+}
 
 async function getLocalEngine() {
   if (_localEngine) return _localEngine
@@ -61,19 +181,26 @@ async function getLocalEngine() {
 }
 
 async function getLocalHandle(): Promise<number> {
-  if (_localHandle >= 0) return _localHandle
+  const readingsDir = currentReadingsDir()
+  const signature = readingsSignature(readingsDir)
+  if (_localHandle >= 0 && _localReadingsSignature === signature) return _localHandle
   const engine = await getLocalEngine()
-  const readings = loadReadingsFromDir(AREST_READINGS_DIR)
+  const readings = loadReadingsFromDir(readingsDir)
   _localHandle = engine.compileDomainReadings(...readings)
+  _localReadingsSignature = signature
   return _localHandle
 }
 
 function loadReadingsFromDir(dir: string): string[] {
   if (!dir || !existsSync(dir)) return []
-  return readdirSync(dir)
-    .filter(name => name.endsWith('.md'))
-    .sort()
-    .map(name => readFileSync(join(dir, name), 'utf-8'))
+  return listArestReadingFiles(dir).map(file => readFileSync(file.path, 'utf-8'))
+}
+
+function readingsSignature(dir: string): string {
+  if (!dir || !existsSync(dir)) return ''
+  return listArestReadingFiles(dir)
+    .map(file => `${file.path}:${file.modifiedMs}:${file.bytes}`)
+    .join('|')
 }
 
 // ── Remote mode: HTTP fetch ─────────────────────────────────────────
@@ -99,9 +226,29 @@ function textResult(data: any) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] }
 }
 
+function parseTransitionTriples(raw: string, noun: string, id: string): Array<Record<string, string>> {
+  const out: Array<Record<string, string>> = []
+  const re = /<([^,<>]+),\s*([^,<>]+),\s*([^<>]+)>/g
+  let match: RegExpExecArray | null
+  while ((match = re.exec(raw)) !== null) {
+    const [, fromStatus, targetStatus, event] = match
+    out.push({
+      event: event.trim(),
+      targetStatus: targetStatus.trim(),
+      fromStatus: fromStatus.trim(),
+      method: 'POST',
+      href: `/api/entities/${encodeURIComponent(noun)}/${encodeURIComponent(id)}/transition`,
+    })
+  }
+  return out
+}
+
 // ── Command dispatch (dual mode) ────────────────────────────────────
 
 async function dispatchCommand(command: any): Promise<any> {
+  if (shouldUseCliDb()) {
+    return cliApplyCommand(command)
+  }
   if (AREST_MODE === 'local') {
     const engine = await getLocalEngine()
     const handle = await getLocalHandle()
@@ -117,9 +264,7 @@ async function dispatchCommand(command: any): Promise<any> {
 
 async function dispatchRead(path: string): Promise<any> {
   if (AREST_MODE === 'local') {
-    const engine = await getLocalEngine()
-    const handle = await getLocalHandle()
-    const raw = engine.system(handle, 'debug', '')
+    const raw = await systemCall('debug', '')
     try { return JSON.parse(raw) } catch { return { raw } }
   }
   return httpRequest(path)
@@ -128,9 +273,133 @@ async function dispatchRead(path: string): Promise<any> {
 // ── Local system call helper ──────────────────────────────────────
 
 async function systemCall(key: string, input: string): Promise<string> {
+  if (shouldUseCliDb()) return cliSystemCall(key, input)
   const engine = await getLocalEngine()
   const handle = await getLocalHandle()
   return engine.system(handle, key, input)
+}
+
+function runArestCli(args: string[]): Promise<string> {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(AREST_CLI, args, {
+      cwd: REPO_ROOT,
+      env: process.env,
+      windowsHide: true,
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+    child.stdout.on('data', chunk => { stdout += chunk })
+    child.stderr.on('data', chunk => { stderr += chunk })
+    child.on('error', reject)
+    child.on('close', code => {
+      if (AREST_DEBUG && stderr.trim()) console.error(stderr.trim())
+      if (code === 0) {
+        resolvePromise(stdout.trim())
+      } else {
+        reject(new Error(stderr.trim() || `arest-cli exited with code ${code}`))
+      }
+    })
+  })
+}
+
+function cliSystemCall(key: string, input: string): Promise<string> {
+  return runArestCli(['--db', currentDbPath(), key, input])
+}
+
+function compileAppReadings(app: ArestApp): Promise<string> {
+  return runArestCli([app.readingsDir, '--db', app.dbPath])
+}
+
+function compileResult(raw: string) {
+  let parsed: unknown
+  try { parsed = JSON.parse(raw) } catch {}
+  const rejected = raw.trim().startsWith('⊥')
+  return {
+    ok: !rejected,
+    rejected,
+    bytes: raw.length,
+    raw,
+    ...(parsed !== undefined ? { parsed } : {}),
+  }
+}
+
+function parseJsonResult(raw: string): any {
+  try { return JSON.parse(raw) } catch { return { raw } }
+}
+
+async function persistManagedApplyFacts(
+  input: {
+    operation: 'create' | 'update' | 'transition'
+    noun: string
+    id?: string
+    fields?: Record<string, string>
+  },
+  result: unknown,
+) {
+  if (!shouldUseCliDb()) return undefined
+  if (result && typeof result === 'object' && (result as { rejected?: unknown }).rejected === true) return undefined
+
+  const built = buildApplyInstanceFacts(input, result)
+  if (built.lines.length === 0 && built.warnings.length === 0) return undefined
+
+  const appended = built.lines.length > 0
+    ? appendManagedInstanceFacts(currentReadingsDir(), built.lines)
+    : undefined
+
+  return {
+    ...(appended ?? { path: undefined, appended: 0, skipped: 0, lines: [] }),
+    durable: Boolean(appended && appended.appended > 0),
+    db_updated_by_apply: true,
+    warnings: built.warnings,
+  }
+}
+
+async function localApplyResult(
+  raw: string,
+  input: {
+    operation: 'create' | 'update' | 'transition'
+    noun: string
+    id?: string
+    fields?: Record<string, string>
+  },
+) {
+  const result = parseJsonResult(raw)
+  const instance_reading = await persistManagedApplyFacts(input, result)
+  if (instance_reading && result && typeof result === 'object' && !Array.isArray(result)) {
+    return textResult({ ...result, instance_reading })
+  }
+  return textResult(result)
+}
+
+async function cliApplyCommand(command: any): Promise<any> {
+  let key = ''
+  let input = ''
+  switch (command?.type) {
+    case 'createEntity': {
+      key = `create:${command.noun}`
+      const pairs = Object.entries(command.fields || {}).map(([k, v]) => `<${k}, ${v}>`).join(', ')
+      const idPair = command.id ? `<id, ${command.id}>${pairs ? ', ' : ''}` : ''
+      input = `<${idPair}${pairs}>`
+      break
+    }
+    case 'updateEntity': {
+      key = `update:${command.noun}`
+      const pairs = Object.entries(command.fields || {}).map(([k, v]) => `<${k}, ${v}>`).join(', ')
+      input = `<<id, ${command.entityId}>${pairs ? `, ${pairs}` : ''}>`
+      break
+    }
+    case 'transition': {
+      key = `transition:${command.noun || ''}`
+      input = `<${command.entityId || ''}, ${command.event || ''}>`
+      break
+    }
+    default:
+      return { rejected: true, error: `unsupported command type: ${command?.type || 'unknown'}` }
+  }
+  const raw = await cliSystemCall(key, input)
+  try { return JSON.parse(raw) } catch { return { raw } }
 }
 
 // ── Data Federation: fetch from external systems via populate:{noun} ──
@@ -200,6 +469,43 @@ const server = new McpServer({
   version: '0.2.0',
 })
 
+function loadPrompt(name: string): string {
+  try {
+    return readFileSync(resolve(__dirname, 'prompts', `${name}.md`), 'utf-8')
+  } catch {
+    return `# ${name}\n\nPrompt file not found.`
+  }
+}
+
+function currentMutationContext(detail: MutationContextDetail = 'summary') {
+  return buildMutationContext({
+    detail,
+    scope: {
+      app: activeApp.name,
+      db: APP_MODE_ENABLED ? currentDbPath() : undefined,
+      readingsDir: currentReadingsDir(),
+    },
+    prompts: DEFAULT_MUTATION_PROMPTS.map((prompt) => ({
+      ...prompt,
+      text: loadPrompt(prompt.name),
+    })),
+  })
+}
+
+function mutationGateResult(
+  tool: MutationContextTool,
+  contextReceipt: string | undefined,
+  payload: Record<string, unknown>,
+) {
+  const gate = enforceMutationContext({
+    tool,
+    receivedReceipt: contextReceipt,
+    context: currentMutationContext(),
+    payload,
+  })
+  return gate.ok ? null : textResult(gate.error)
+}
+
 // =====================================================================
 // TOOLS — MCP verb set (v1.0)
 // =====================================================================
@@ -229,6 +535,226 @@ const server = new McpServer({
 // (Platform/Native) are registered server-side and are intentionally not
 // LLM-exposed.
 // =====================================================================
+
+// ── 0. context: prompt-backed mutation gate ──────────────────────────
+
+server.registerTool(
+  'context',
+  {
+    description: MUTATION_CONTEXT_DESCRIPTION,
+    inputSchema: {
+      detail: z.enum(['summary', 'full']).optional().describe('summary returns rules and prompt digests. full also includes prompt text.'),
+    },
+  },
+  async ({ detail }) => textResult(currentMutationContext((detail ?? 'summary') as MutationContextDetail)),
+)
+
+// ── 0a. apps: select the active app / UoD ────────────────────────────
+
+server.registerTool(
+  'apps.current',
+  {
+    description: 'Show the active AREST app. The active app determines the local readings directory, SQLite DB path, and mutation context scope.',
+    inputSchema: {
+      detail: z.enum(['summary', 'full']).optional().describe('summary returns compact health. full includes reading file details.'),
+    },
+  },
+  async ({ detail }) => textResult({ active_app: appSummary(activeApp, (detail ?? 'summary') as AppDetail) }),
+)
+
+server.registerTool(
+  'apps.list',
+  {
+    description: 'List AREST apps under the configured apps directory. Each app is an independent UoD with its own readings and SQLite DB.',
+    inputSchema: {
+      detail: z.enum(['summary', 'full']).optional().describe('summary returns compact health. full includes reading file details.'),
+      include_ready: z.boolean().optional().describe('Include ready apps. Default true. Set false to see only apps needing action.'),
+    },
+  },
+  async ({ detail, include_ready }) => {
+    const apps = listArestApps(appRegistryOptions())
+      .map((app) => appSummary(app, (detail ?? 'summary') as AppDetail))
+      .filter((app) => include_ready !== false || app.health.status !== 'ready')
+    return textResult({
+      active_app: activeApp.name,
+      apps_dir: AREST_APPS_DIR || undefined,
+      apps,
+    })
+  },
+)
+
+server.registerTool(
+  'apps.status',
+  {
+    description: 'Inspect one AREST app and return health, reading/DB freshness, and next actions. Defaults to the active app.',
+    inputSchema: {
+      name: z.string().optional().describe('AREST app name. Defaults to the active app.'),
+      detail: z.enum(['summary', 'full']).optional().describe('summary returns compact health. full includes reading file details. Default full.'),
+    },
+  },
+  async ({ name, detail }) => {
+    const app = name ? resolveArestApp(name, appRegistryOptions()) : activeApp
+    const isActive = app.name === activeApp.name
+    return textResult({
+      app: appSummary(app, (detail ?? 'full') as AppDetail),
+      context: isActive ? currentMutationContext() : undefined,
+    })
+  },
+)
+
+server.registerTool(
+  'apps.check',
+  {
+    description: 'Check every discovered AREST app and summarize health across the registry. Use this as the first orientation call before choosing an app.',
+    inputSchema: {
+      detail: z.enum(['summary', 'full']).optional().describe('summary returns compact health. full includes reading file details.'),
+      include_ready: z.boolean().optional().describe('Include ready apps. Default true. Set false to return only apps needing action.'),
+    },
+  },
+  async ({ detail, include_ready }) => {
+    const check = checkArestApps(appRegistryOptions())
+    const apps = check.apps
+      .filter((app) => include_ready !== false || app.health.status !== 'ready')
+      .map((app) => appSummary(app, (detail ?? 'summary') as AppDetail))
+    return textResult({
+      active_app: activeApp.name,
+      apps_dir: AREST_APPS_DIR || undefined,
+      summary: check.summary,
+      apps,
+    })
+  },
+)
+
+server.registerTool(
+  'apps.register',
+  {
+    description: 'Register AREST apps by scanning the apps directory. Registration is directory-derived: no catalog facts are written by this tool.',
+    inputSchema: {
+      name: z.string().optional().describe('Optional app name to register/inspect. Defaults to every discovered app.'),
+      detail: z.enum(['summary', 'full']).optional().describe('summary returns compact health. full includes reading file details.'),
+    },
+  },
+  async ({ name, detail }) => {
+    const apps = name
+      ? [appSummary(resolveArestApp(name, appRegistryOptions()), (detail ?? 'summary') as AppDetail)]
+      : checkArestApps(appRegistryOptions()).apps.map((app) => appSummary(app, (detail ?? 'summary') as AppDetail))
+    return textResult({
+      registration: 'directory-derived',
+      writes_catalog_facts: false,
+      active_app: activeApp.name,
+      apps_dir: AREST_APPS_DIR || undefined,
+      registered_apps: apps,
+    })
+  },
+)
+
+server.registerTool(
+  'apps.use',
+  {
+    description: 'Switch the active local AREST app. Subsequent local reads/writes and context receipts use that app scope.',
+    inputSchema: {
+      name: z.string().describe('AREST app name under the apps directory.'),
+    },
+  },
+  async ({ name }) => {
+    const candidate = resolveArestApp(name, appRegistryOptions())
+    const health = inspectArestApp(candidate, appRegistryOptions()).health
+    if (health.status === 'library') {
+      return textResult({
+        error: 'app_is_library',
+        message: 'This registry entry is a library, not an app UoD. It cannot be activated.',
+        app: appSummary(candidate, 'full'),
+      })
+    }
+    if (health.status === 'not_found') {
+      return textResult({
+        error: 'app_not_found',
+        message: 'No app or library root exists for this name under the apps directory.',
+        app: appSummary(candidate, 'full'),
+      })
+    }
+    const app = activateApp(name)
+    return textResult({ active_app: appSummary(app, 'full'), context: currentMutationContext() })
+  },
+)
+
+server.registerTool(
+  'apps.create',
+  {
+    description: 'Create a local AREST app directory with readings storage. Optionally write an initial reading, compile it to the app DB, and activate the app.',
+    inputSchema: {
+      name: z.string().describe('New AREST app name under the apps directory.'),
+      reading: z.string().optional().describe('Optional initial FORML2 reading text to write to readings/app.md.'),
+      compile: z.boolean().optional().describe('Compile the app readings into its SQLite DB after creation. Default false.'),
+      activate: z.boolean().optional().describe('Make this app active after creation. Default true.'),
+    },
+  },
+  async ({ name, reading, compile, activate }) => {
+    if (AREST_MODE !== 'local') return textResult({ error: 'apps.create requires local mode' })
+
+    let app = createArestApp(name, appRegistryOptions(), reading)
+    let result: Record<string, unknown> | null = null
+    if (compile) {
+      const before = inspectArestApp(app, appRegistryOptions())
+      if (before.health.readings.count === 0) {
+        result = { ok: false, skipped: true, error: 'app has no .md readings to compile' }
+      } else {
+        const raw = await compileAppReadings(app)
+        result = compileResult(raw)
+        app = resolveArestApp(app.name, appRegistryOptions())
+      }
+    }
+    if (activate !== false) app = activateApp(app.name)
+
+    return textResult({
+      app: appSummary(app, 'full'),
+      compile_result: result,
+      context: app.name === activeApp.name ? currentMutationContext() : undefined,
+    })
+  },
+)
+
+server.registerTool(
+  'apps.compile',
+  {
+    description: 'Compile an app readings directory into that app SQLite DB. This refreshes the app DB from readings as the source of truth.',
+    inputSchema: {
+      name: z.string().optional().describe('AREST app name. Defaults to the active app.'),
+      activate: z.boolean().optional().describe('Make the compiled app active. Default true when name is provided, otherwise leaves current active app.'),
+    },
+  },
+  async ({ name, activate }) => {
+    if (AREST_MODE !== 'local') return textResult({ error: 'apps.compile requires local mode' })
+
+    const target = name ? resolveArestApp(name, appRegistryOptions()) : activeApp
+    const before = inspectArestApp(target, appRegistryOptions())
+    if (before.health.status === 'library') {
+      return textResult({
+        error: 'app_is_library',
+        message: 'This registry entry is a library, not an app UoD. It is not compiled to its own SQLite DB.',
+        app: appSummary(target, 'full'),
+      })
+    }
+    if (before.health.readings.count === 0) {
+      return textResult({
+        error: 'app_readings_missing',
+        message: 'apps.compile requires at least one .md file in the app readings directory.',
+        app: appSummary(target, 'full'),
+      })
+    }
+    const raw = await compileAppReadings(target)
+    const refreshed = resolveArestApp(target.name, appRegistryOptions())
+    const shouldActivate = name ? activate !== false : activate === true
+    if (shouldActivate) activateApp(refreshed.name)
+
+    return textResult({
+      app: appSummary(refreshed, 'full'),
+      compile_result: compileResult(raw),
+      active_app: appSummary(activeApp, 'summary'),
+      context: refreshed.name === activeApp.name ? currentMutationContext() : undefined,
+    })
+  },
+)
 
 // ── 1. get: retrieve an entity or list entities ──────────────────────
 
@@ -312,8 +838,9 @@ server.registerTool(
 server.registerTool(
   'apply',
   {
-    description: 'Apply an operation to an entity. The operation determines behavior: create (new entity), update (modify fields), transition (fire SM event). Executes the AREST pipeline: resolve → derive → validate → emit.',
+    description: `Apply an operation to an entity. The operation determines behavior: create (new entity), update (modify fields), transition (fire SM event). Executes the AREST pipeline: resolve -> derive -> validate -> emit. ${MUTATION_TOOL_DESCRIPTION}`,
     inputSchema: {
+      context_receipt: z.string().optional().describe(CONTEXT_RECEIPT_FIELD_DESCRIPTION),
       operation: z.enum(['create', 'update', 'transition']).describe('Operation type'),
       noun: z.string().describe('Entity noun type (e.g. "Order", "Case")'),
       id: z.string().optional().describe('Entity ID. Required for update/transition. Optional for create (auto-generated).'),
@@ -323,24 +850,26 @@ server.registerTool(
       signature: z.string().optional().describe('HMAC-SHA256 signature'),
     },
   },
-  async ({ operation, noun, id, fields, event, sender, signature }) => {
+  async ({ context_receipt, operation, noun, id, fields, event, sender, signature }) => {
+    const blocked = mutationGateResult('apply', context_receipt, { operation, noun, id, fields, event })
+    if (blocked) return blocked
+
     if (AREST_MODE === 'local') {
       switch (operation) {
         case 'create': {
           const pairs = Object.entries(fields || {}).map(([k, v]) => `<${k}, ${v}>`).join(', ')
           const idPair = id ? `<id, ${id}>, ` : ''
           const raw = await systemCall(`create:${noun}`, `<${idPair}${pairs}>`)
-          try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
+          return localApplyResult(raw, { operation, noun, id, fields })
         }
         case 'update': {
-          const command = { type: 'updateEntity', noun, domain: '', entityId: id, fields: fields || {}, sender, signature }
-          const data = await dispatchCommand(command)
-          return textResult(data)
+          const pairs = Object.entries(fields || {}).map(([k, v]) => `<${k}, ${v}>`).join(', ')
+          const raw = await systemCall(`update:${noun}`, `<<id, ${id || ''}>${pairs ? `, ${pairs}` : ''}>`)
+          return localApplyResult(raw, { operation, noun, id, fields })
         }
         case 'transition': {
-          const command = { type: 'transition', entityId: id, event, domain: '', sender, signature }
-          const data = await dispatchCommand(command)
-          return textResult(data)
+          const raw = await systemCall(`transition:${noun}`, `<${id || ''}, ${event || ''}>`)
+          return localApplyResult(raw, { operation, noun, id })
         }
       }
     }
@@ -385,11 +914,14 @@ server.registerTool(
       }
       const rawTransitions = await systemCall(`transitions:${noun}`, resolvedStatus)
       const rawEntity = await systemCall(`get:${noun}`, id)
+      const parsedTransitions = parseOr(rawTransitions, null)
       return textResult({
         entity: id,
         noun,
         status: resolvedStatus || null,
-        transitions: parseOr(rawTransitions, []),
+        transitions: Array.isArray(parsedTransitions)
+          ? parsedTransitions
+          : parseTransitionTriples(rawTransitions, noun, id),
         entity_data: parseOr(rawEntity, null),
       })
     }
@@ -446,12 +978,16 @@ server.registerTool(
 server.registerTool(
   'compile',
   {
-    description: 'Compile FORML2 readings into the engine (self-modification, Corollary 5). The engine extends its own program. New nouns, fact types, constraints, derivation rules, and state machines become active immediately. Alethic violations reject.',
+    description: `Compile FORML2 readings into the engine (self-modification, Corollary 5). The engine extends its own program. New nouns, fact types, constraints, derivation rules, and state machines become active immediately. Alethic violations reject. ${MUTATION_TOOL_DESCRIPTION}`,
     inputSchema: {
+      context_receipt: z.string().optional().describe(CONTEXT_RECEIPT_FIELD_DESCRIPTION),
       readings: z.string().describe('FORML2 readings as markdown text'),
     },
   },
-  async ({ readings }) => {
+  async ({ context_receipt, readings }) => {
+    const blocked = mutationGateResult('compile', context_receipt, { readings })
+    if (blocked) return blocked
+
     if (AREST_MODE === 'local') {
       const raw = await systemCall('compile', readings)
       const ok = !raw.startsWith('⊥')
@@ -581,8 +1117,9 @@ server.registerTool(
 server.registerTool(
   'propose',
   {
-    description: 'Propose a change to the schema or population. Creates a Domain Change entity with the proposed elements (readings, nouns, fact types, constraints, verbs, state machines). Enters the review workflow at status "Proposed". Use transition to advance through Under Review → Approved → Applied. For immediate changes bypassing review, use compile directly.',
+    description: `Propose a change to the schema or population. Creates a Domain Change entity with the proposed elements (readings, nouns, fact types, constraints, verbs, state machines). Enters the review workflow at status "Proposed". Use transition to advance through Under Review -> Approved -> Applied. For immediate changes bypassing review, use compile directly. ${MUTATION_TOOL_DESCRIPTION}`,
     inputSchema: {
+      context_receipt: z.string().optional().describe(CONTEXT_RECEIPT_FIELD_DESCRIPTION),
       rationale: z.string().describe('Why this change is needed'),
       target_domain: z.string().describe('Domain slug to change (e.g. "orders", "core")'),
       readings: z.array(z.string()).optional().describe('FORML2 reading text to add'),
@@ -591,7 +1128,10 @@ server.registerTool(
       verbs: z.array(z.string()).optional().describe('Verb names to declare'),
     },
   },
-  async ({ rationale, target_domain, readings, nouns, constraints, verbs }) => {
+  async ({ context_receipt, rationale, target_domain, readings, nouns, constraints, verbs }) => {
+    const blocked = mutationGateResult('propose', context_receipt, { rationale, target_domain, readings, nouns, constraints, verbs })
+    if (blocked) return blocked
+
     if (AREST_MODE !== 'local') return textResult({ error: 'propose requires local mode' })
 
     // Generate a stable change ID from the rationale + time.
@@ -1129,14 +1669,6 @@ if (AREST_DEBUG) {
 
 // ── Prompts — domain knowledge served on demand ─────────────────────
 
-function loadPrompt(name: string): string {
-  try {
-    return readFileSync(resolve(__dirname, 'prompts', `${name}.md`), 'utf-8')
-  } catch {
-    return `# ${name}\n\nPrompt file not found.`
-  }
-}
-
 server.registerPrompt(
   'arest_overview',
   { description: 'AREST system overview, constraint types, and FORML2 document structure' },
@@ -1185,7 +1717,7 @@ async function main() {
   const transport = new StdioServerTransport()
   await server.connect(transport)
   // eslint-disable-next-line no-console
-  console.error(`AREST MCP server started — mode=${AREST_MODE}${AREST_MODE === 'remote' ? ` url=${AREST_URL}` : ''}${AREST_DEBUG ? ' [DEBUG]' : ''}`)
+  console.error(`AREST MCP server started — mode=${AREST_MODE}${AREST_MODE === 'remote' ? ` url=${AREST_URL}` : ` app=${activeApp.name}`}${AREST_DEBUG ? ' [DEBUG]' : ''}`)
 }
 
 main().catch((err) => {

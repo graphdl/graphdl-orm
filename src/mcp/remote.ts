@@ -23,7 +23,16 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
 import { z } from 'zod'
 
-import { getEngine, getHandle, systemCall, safeJson } from './engine-bridge.js'
+import { getHandle, systemCall, safeJson } from './engine-bridge.js'
+import {
+  buildMutationContext,
+  enforceMutationContext,
+  CONTEXT_RECEIPT_FIELD_DESCRIPTION,
+  MUTATION_CONTEXT_DESCRIPTION,
+  MUTATION_TOOL_DESCRIPTION,
+  type MutationContextDetail,
+  type MutationContextTool,
+} from './mutation-context.js'
 
 function textResult(data: any) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] }
@@ -32,6 +41,31 @@ function textResult(data: any) {
 /** Build a fresh McpServer bound to the shared Worker engine handle. */
 export function createRemoteServer(): McpServer {
   const server = new McpServer({ name: 'arest-remote', version: '0.2.0' })
+  const currentMutationContext = (detail: MutationContextDetail = 'summary') => buildMutationContext({ detail })
+  const mutationGateResult = (
+    tool: MutationContextTool,
+    contextReceipt: string | undefined,
+    payload: Record<string, unknown>,
+  ) => {
+    const gate = enforceMutationContext({
+      tool,
+      receivedReceipt: contextReceipt,
+      context: currentMutationContext(),
+      payload,
+    })
+    return gate.ok ? null : textResult(gate.error)
+  }
+
+  server.registerTool(
+    'context',
+    {
+      description: MUTATION_CONTEXT_DESCRIPTION,
+      inputSchema: {
+        detail: z.enum(['summary', 'full']).optional().describe('summary returns rules and prompt digests. full also includes prompt text when available.'),
+      },
+    },
+    async ({ detail }) => textResult(currentMutationContext((detail ?? 'summary') as MutationContextDetail)),
+  )
 
   server.registerTool(
     'schema',
@@ -56,18 +90,9 @@ export function createRemoteServer(): McpServer {
     return { content: [{ type: 'text' as const, text: JSON.stringify(payload) }] }
   }
 
-  function knownNouns(): string[] {
-    const dump = safeJson(systemCallSync('debug', ''), {})
+  async function knownNouns(): Promise<string[]> {
+    const dump = safeJson(await systemCall('debug', ''), {})
     return Object.keys((dump as any).nouns ?? {})
-  }
-
-  // systemCall is async, but for search we want to fan out lookups in
-  // parallel without churning through `await` in a loop. Engine calls are
-  // in-process (WASM in the same isolate), so a sync wrapper is fine.
-  function systemCallSync(key: string, input: string): string {
-    if (!_engine) throw new Error('engine not initialized')
-    if (_handle === null) throw new Error('handle not allocated')
-    return _engine.system(_handle, key, input)
   }
 
   server.registerTool(
@@ -81,13 +106,13 @@ export function createRemoteServer(): McpServer {
       const needle = (query ?? '').trim().toLowerCase()
       if (!needle) return chatgptResult({ results: [] })
 
-      const nouns = knownNouns()
+      const nouns = await knownNouns()
       const results: Array<{ id: string; title: string; url: string }> = []
       const cap = 50
 
       for (const noun of nouns) {
         if (results.length >= cap) break
-        const list = safeJson(systemCallSync(`list:${noun}`, ''), [])
+        const list = safeJson(await systemCall(`list:${noun}`, ''), [])
         if (!Array.isArray(list)) continue
         for (const entity of list) {
           if (results.length >= cap) break
@@ -121,8 +146,8 @@ export function createRemoteServer(): McpServer {
       }
       const noun = id.slice(0, sep)
       const entityId = id.slice(sep + 1)
-      const entity = safeJson(systemCallSync(`get:${noun}`, entityId), null)
-      const sm = safeJson(systemCallSync('get:State Machine', entityId), null) as any
+      const entity = safeJson(await systemCall(`get:${noun}`, entityId), null)
+      const sm = safeJson(await systemCall('get:State Machine', entityId), null) as any
       const status = sm && typeof sm.currentlyInStatus === 'string' ? sm.currentlyInStatus : null
       return chatgptResult({
         id,
@@ -171,8 +196,9 @@ export function createRemoteServer(): McpServer {
   server.registerTool(
     'apply',
     {
-      description: 'Apply an operation to an entity (create / update / transition). Runs the full pipeline: resolve -> derive -> validate -> emit.',
+      description: `Apply an operation to an entity (create / update / transition). Runs the full pipeline: resolve -> derive -> validate -> emit. ${MUTATION_TOOL_DESCRIPTION}`,
       inputSchema: {
+        context_receipt: z.string().optional().describe(CONTEXT_RECEIPT_FIELD_DESCRIPTION),
         operation: z.enum(['create', 'update', 'transition']),
         noun: z.string(),
         id: z.string().optional(),
@@ -180,7 +206,10 @@ export function createRemoteServer(): McpServer {
         fields: z.record(z.string(), z.string()).optional(),
       },
     },
-    async ({ operation, noun, id, event, fields }) => {
+    async ({ context_receipt, operation, noun, id, event, fields }) => {
+      const blocked = mutationGateResult('apply', context_receipt, { operation, noun, id, event, fields })
+      if (blocked) return blocked
+
       if (operation === 'transition') {
         if (!id || !event) return textResult({ error: 'transition requires id and event' })
         const raw = await systemCall(`transition:${noun}`, `<${id}, ${event}>`)
@@ -203,7 +232,7 @@ export function createRemoteServer(): McpServer {
     async ({ noun, id, status }) => {
       let resolvedStatus = status || ''
       if (!resolvedStatus) {
-        const sm = safeJson(await systemCall('get:State Machine', id), null)
+        const sm = safeJson(await systemCall('get:State Machine', id), null) as any
         if (sm && typeof sm.currentlyInStatus === 'string') resolvedStatus = sm.currentlyInStatus
       }
       const transitions = safeJson(await systemCall(`transitions:${noun}`, resolvedStatus), [])
@@ -215,10 +244,16 @@ export function createRemoteServer(): McpServer {
   server.registerTool(
     'compile',
     {
-      description: 'Compile FORML2 readings into the running engine (self-modification).',
-      inputSchema: { readings: z.string() },
+      description: `Compile FORML2 readings into the running engine (self-modification). ${MUTATION_TOOL_DESCRIPTION}`,
+      inputSchema: {
+        context_receipt: z.string().optional().describe(CONTEXT_RECEIPT_FIELD_DESCRIPTION),
+        readings: z.string(),
+      },
     },
-    async ({ readings }) => {
+    async ({ context_receipt, readings }) => {
+      const blocked = mutationGateResult('compile', context_receipt, { readings })
+      if (blocked) return blocked
+
       const raw = await systemCall('compile', readings)
       const ok = !raw.startsWith('⊥')
       return textResult({ ok, result: safeJson(raw, raw) })

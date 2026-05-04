@@ -77,7 +77,7 @@ Domain belongs to Organization.
   Each Domain belongs to at most one Organization.
 ```
 
-**Ternary+ constraints**: You cannot use n:n shorthand for ternaries. Express which role combination has the UC using "For each ... and ...":
+**Ternary+ constraints**: Do not use compact n:n notation for ternaries. Express which role combination has the UC using "For each ... and ...":
 ```
 Plan has Price per Interval.
   For each Plan and Interval that Plan has that Interval at most one Price.
@@ -86,7 +86,7 @@ This means UC(Plan, Interval) â€” each plan-interval pair determines one pr
 
 ### Multiplicity (Uniqueness Constraints on Binary Facts)
 
-Express multiplicity as natural language FORML2 constraints beneath each reading. Never use shorthand notation like `*:1` or `1:*` â€” always use full sentences.
+Express multiplicity as natural language FORML2 constraints beneath each reading. Never use compact notation like `*:1` or `1:*` â€” always use full sentences.
 
 | Pattern | FORML2 Constraint | Meaning |
 |---------|------------------|---------|

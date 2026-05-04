@@ -85,7 +85,7 @@ export interface IngestPayload {
  * link graph can now reach the provenance record without knowing the
  * citationId→URL mapping by convention.
  */
-export function enrichResponseWithCitation<T extends { _links?: Record<string, unknown> }>(
+export function enrichResponseWithCitation<T extends object>(
   data: T,
   citationId: string,
   basePath: string,
@@ -94,7 +94,7 @@ export function enrichResponseWithCitation<T extends { _links?: Record<string, u
   absorbed: true
   _links: Record<string, unknown> & { citations: { href: string } }
 } {
-  const existingLinks = (data._links ?? {}) as Record<string, unknown>
+  const existingLinks = ((data as T & { _links?: Record<string, unknown> })._links ?? {}) as Record<string, unknown>
   return {
     ...data,
     citationId,

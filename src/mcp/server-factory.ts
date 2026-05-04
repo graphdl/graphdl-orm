@@ -22,6 +22,15 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import * as engine from '../api/engine.js'
 import { dispatchVerb } from '../api/verb-dispatcher.js'
+import {
+  buildMutationContext,
+  enforceMutationContext,
+  CONTEXT_RECEIPT_FIELD_DESCRIPTION,
+  MUTATION_CONTEXT_DESCRIPTION,
+  MUTATION_TOOL_DESCRIPTION,
+  type MutationContextDetail,
+  type MutationContextTool,
+} from './mutation-context.js'
 
 export interface CreateArestServerOptions {
   handle?: number
@@ -53,12 +62,39 @@ export function createArestServer(options: CreateArestServerOptions = {}): McpSe
     return textResult(envelope.data)
   }
 
+  const currentMutationContext = (detail: MutationContextDetail = 'summary') => buildMutationContext({ detail })
+
+  const mutationGateResult = (
+    tool: MutationContextTool,
+    contextReceipt: string | undefined,
+    payload: Record<string, unknown>,
+  ) => {
+    const gate = enforceMutationContext({
+      tool,
+      receivedReceipt: contextReceipt,
+      context: currentMutationContext(),
+      payload,
+    })
+    return gate.ok ? null : textResult(gate.error)
+  }
+
   const server = new McpServer({
     name: options.name ?? 'arest',
     version: options.version ?? '0.7.0',
   })
 
   // ── Introspection ─────────────────────────────────────────────────
+
+  server.registerTool(
+    'context',
+    {
+      description: MUTATION_CONTEXT_DESCRIPTION,
+      inputSchema: {
+        detail: z.enum(['summary', 'full']).optional().describe('summary returns rules and prompt digests. full also includes prompt text when available.'),
+      },
+    },
+    async ({ detail }) => textResult(currentMutationContext((detail ?? 'summary') as MutationContextDetail)),
+  )
 
   server.registerTool(
     'schema',
@@ -116,8 +152,9 @@ export function createArestServer(options: CreateArestServerOptions = {}): McpSe
   server.registerTool(
     'apply',
     {
-      description: 'Apply an operation to an entity (create / update / transition). Runs the full pipeline: resolve -> derive -> validate -> emit.',
+      description: `Apply an operation to an entity (create / update / transition). Runs the full pipeline: resolve -> derive -> validate -> emit. ${MUTATION_TOOL_DESCRIPTION}`,
       inputSchema: {
+        context_receipt: z.string().optional().describe(CONTEXT_RECEIPT_FIELD_DESCRIPTION),
         operation: z.enum(['create', 'update', 'transition']),
         noun: z.string(),
         id: z.string().optional(),
@@ -125,7 +162,12 @@ export function createArestServer(options: CreateArestServerOptions = {}): McpSe
         fields: z.record(z.string(), z.string()).optional(),
       },
     },
-    async (input) => dispatch('apply', input),
+    async (input) => {
+      const { context_receipt, ...body } = input as Record<string, unknown> & { context_receipt?: string }
+      const blocked = mutationGateResult('apply', context_receipt, body)
+      if (blocked) return blocked
+      return dispatch('apply', body)
+    },
   )
 
   // ── Self-modification ─────────────────────────────────────────────
@@ -133,10 +175,18 @@ export function createArestServer(options: CreateArestServerOptions = {}): McpSe
   server.registerTool(
     'compile',
     {
-      description: 'Compile FORML2 readings into the running engine (self-modification).',
-      inputSchema: { readings: z.string() },
+      description: `Compile FORML2 readings into the running engine (self-modification). ${MUTATION_TOOL_DESCRIPTION}`,
+      inputSchema: {
+        context_receipt: z.string().optional().describe(CONTEXT_RECEIPT_FIELD_DESCRIPTION),
+        readings: z.string(),
+      },
     },
-    async (input) => dispatch('compile', input),
+    async (input) => {
+      const { context_receipt, ...body } = input as Record<string, unknown> & { context_receipt?: string }
+      const blocked = mutationGateResult('compile', context_receipt, body)
+      if (blocked) return blocked
+      return dispatch('compile', body)
+    },
   )
 
   server.registerTool(

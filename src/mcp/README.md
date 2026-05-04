@@ -9,7 +9,7 @@ Two modes:
 
 | Mode    | When                                           | Engine               |
 |---------|------------------------------------------------|----------------------|
-| `local` | personal / private — your readings, your data | bundled WASM, no net |
+| `local` | personal / private — your readings, your data | bundled WASM or local SQLite CLI, no net |
 | `remote`| against a deployed worker                      | HTTP to `AREST_URL`  |
 
 ## Prerequisites
@@ -35,7 +35,9 @@ Order was placed by Customer.
 ## State Machines
 State Machine Definition 'Order' is for Noun 'Order'.
 Status 'In Cart' is initial in State Machine Definition 'Order'.
-Transition 'place' is from Status 'In Cart' to Status 'Placed'.
+Transition 'place' is defined in State Machine Definition 'Order'.
+Transition 'place' is from Status 'In Cart'.
+Transition 'place' is to Status 'Placed'.
 EOF
 
 AREST_MODE=local AREST_READINGS_DIR=$PWD/readings npx -y arest mcp
@@ -65,6 +67,84 @@ your platform):
 ```
 
 Restart the client. The agent now has access to the AREST verb set.
+
+## Local app scope
+
+An AREST app is a local scope: one app root, one readings directory, and one
+SQLite DB. The selected app is the active UoD for local fact operations.
+The registry also discovers sibling AREST packages whose `package.json`
+declares `kind: "app"` or `kind: "library"`; this is how reusable packages
+such as law libraries appear without needing to live under `AREST_APPS_DIR`.
+App and library discovery scans the filesystem on each tool call, so new or
+changed readings do not require an MCP restart. Restart is only needed after
+changing the MCP server code or tool definitions.
+
+Use app mode by setting `AREST_APPS_DIR` and `AREST_APP`, or by setting
+explicit `AREST_READINGS_DIR` / `AREST_DB` paths. Existing DB names are
+preserved: if an app directory contains exactly one `.db` file, the MCP
+server uses it instead of inventing a new name.
+
+```json
+{
+  "mcpServers": {
+    "arest": {
+      "command": "npx",
+      "args": ["-y", "arest", "mcp"],
+      "env": {
+        "AREST_MODE": "local",
+        "AREST_APPS_DIR": "/absolute/path/to/apps",
+        "AREST_APP": "support"
+      }
+    }
+  }
+}
+```
+
+The app tools are:
+
+- `apps.current` — show the active app, readings directory, DB path, health, and next actions.
+- `apps.list` — list apps under `AREST_APPS_DIR`.
+- `apps.status` — inspect one app, defaulting to the active app, with reading/DB freshness.
+- `apps.check` — summarize health across every discovered app.
+- `apps.register` — scan the apps directory and return the directory-derived catalog; it writes no catalog facts.
+- `apps.use` — switch the active app; subsequent local operations use that DB.
+- `apps.create` — create an app readings directory and optionally compile it.
+- `apps.compile` — compile an app's readings into its SQLite DB.
+
+Most MCP clients display dotted tool names with underscores. For example,
+`apps.current` may appear as `apps_current`, and `apps.check` may appear as
+`apps_check`.
+
+App health statuses are:
+
+- `ready` — readings and DB are present, and the DB is at least as new as the app readings and dependency readings.
+- `library` — the directory contains reusable readings or source material but no app marker or DB; this is not an issue and is not an active UoD target.
+- `needs_compile` — readings exist but the DB file is missing.
+- `stale_db` — one or more app readings or package dependency readings are newer than the DB.
+- `missing_readings` — the readings directory is missing or has no `.md` files.
+- `not_found` — an explicitly requested app/library name has no root directory.
+
+When an app package declares AREST package dependencies with `file:`
+specifiers, app health also includes the direct dependency list, transitive
+dependency closure, newest dependency reading timestamp, and whether that
+dependency set makes the app DB stale. This keeps compile impact derived from
+the filesystem and package graph instead of storing duplicate app-health facts.
+
+## Mutation context gate
+
+Fact-mutating tools are gated by the AREST modeling context. Before calling
+`apply`, `compile`, or `propose`, call `context` and pass the returned
+`receipt` as `context_receipt` on the mutating call. This forces agents to
+load the rules, prompt manifest, app scope, and anti-patterns for typed
+FORML facts instead of writing ad hoc prose memory.
+
+The selected app and active fact storage medium are the implicit Universe of
+Discourse; the gate does not add a `universe_of_discourse` field or require
+UoD meta-facts.
+
+Read-only tools such as `schema`, `get`, `query`, `actions`, `tutor`, `ask`,
+`synthesize`, and `validate` remain open so an agent can inspect the model
+before taking a write.
 
 ## Plug into a remote worker
 
@@ -98,6 +178,8 @@ AREST_MODE=local AREST_READINGS_DIR=$PWD/readings yarn mcp
 
 | Group          | Verbs                                                      |
 |----------------|------------------------------------------------------------|
+| Context        | `context`                                                  |
+| Apps           | `apps.current`, `apps.list`, `apps.status`, `apps.check`, `apps.register`, `apps.use`, `apps.create`, `apps.compile` |
 | Algebra        | `assert`, `retract`, `project`, `compile`                  |
 | Entity sugar   | `get`, `query`, `apply`, `create`, `read`, `update`, `transition`, `delete` |
 | Introspection  | `explain`, `actions`, `schema`, `verify`                   |
