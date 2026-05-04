@@ -110,12 +110,32 @@ fn read_object(bytes: &[u8], cursor: &mut usize) -> Result<Object, String> {
         }
         TAG_SEQ => {
             let n = read_u32(bytes, cursor)? as usize;
+            // #707 / Audit P1-A3: cap pre-allocation against remaining
+            // bytes. Each element encoding requires ≥ 1 byte
+            // (TAG_BOTTOM), so a count exceeding remaining bytes is
+            // structurally impossible and lets a tampered freeze image
+            // request a multi-GB allocation up front.
+            let remaining = bytes.len().saturating_sub(*cursor);
+            if n > remaining {
+                return Err(format!(
+                    "seq length {n} exceeds remaining bytes {remaining}"
+                ));
+            }
             let mut items = Vec::with_capacity(n);
             for _ in 0..n { items.push(read_object(bytes, cursor)?); }
             Ok(Object::Seq(items.into()))
         }
         TAG_MAP => {
             let n = read_u32(bytes, cursor)? as usize;
+            // Same bound as TAG_SEQ — each entry needs ≥ 1 byte (klen
+            // takes 4, payload ≥ 1, so 5 minimum), but the loose
+            // `> remaining` is the simplest correct cap.
+            let remaining = bytes.len().saturating_sub(*cursor);
+            if n > remaining {
+                return Err(format!(
+                    "map length {n} exceeds remaining bytes {remaining}"
+                ));
+            }
             let mut m = hashbrown::HashMap::with_capacity(n);
             for _ in 0..n {
                 let klen = read_u32(bytes, cursor)? as usize;

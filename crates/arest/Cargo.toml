@@ -104,6 +104,16 @@ name = "load_reading_fuzz"
 path = "tests/load_reading_fuzz.rs"
 required-features = ["test-bins"]
 
+# `freeze::thaw` + `thaw_sealed` fuzz harness (#707 / Audit P1-A3).
+# Production storage-path panic floor: kernel checkpoint replay,
+# cluster follower receive (#706), and DurableObject thaw on the
+# worker all funnel through here with bytes the engine didn't write.
+# Standalone so a counterexample shrinks cleanly.
+[[test]]
+name = "freeze_thaw_fuzz"
+path = "tests/freeze_thaw_fuzz.rs"
+required-features = ["test-bins"]
+
 [features]
 # `test-bins` (#684/#650a) — opt-in flag that lets each integration
 # `[[test]]` entry compile. Off by default so `cargo test --lib`
