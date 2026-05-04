@@ -787,21 +787,53 @@ fn transition_via_defs(
         })
         .unwrap_or(new_state);
 
+    let transition_fired = new_status.is_some();
     let status = new_status.or_else(|| current_status.map(|s| s.to_string()));
+
+    // Audit D1 (#703): deontic gate on the post-rewrite state. A
+    // transition is a mutation like any other — every deontic
+    // constraint over the touched cells must fire, otherwise an
+    // approval/permit/forbid clause that the readings declare for the
+    // SM status field is silently bypassed (e.g. "It is forbidden that
+    // some Outbound Email is sent without an Approver"). Mirrors the
+    // update_via_defs pattern at L942-948 that the create/update paths
+    // already follow. Skip when the transition didn't actually fire
+    // (no machine matched / event ignored) — there's no new state to
+    // validate and no noun to key the per-noun aggregate on.
+    let (violations, rejected) = if transition_fired && !noun.is_empty() {
+        let ctx_obj = ast::encode_eval_context_state("", None, &new_state);
+        let validate_key = format!("validate:{}", noun);
+        let validate_func = def_func(&validate_key, d)
+            .or_else(|| def_func("validate", d))
+            .unwrap_or(ast::Func::constant(ast::Object::phi()));
+        let violation_obj = ast::apply(&validate_func, &ctx_obj, d);
+        let vs = ast::decode_violations(&violation_obj);
+        let r = vs.iter().any(|v| v.alethic);
+        (vs, r)
+    } else {
+        (vec![], false)
+    };
 
     let transitions = hateoas_via_rho(d, &noun, entity_id, status.as_deref());
     let navigation = nav_links_via_rho(d, &noun, entity_id);
 
-    // #209: return only the status-cell delta, not the full D.
-    let delta = ast::diff_cells(state, &new_state);
+    // #209: return only the status-cell delta, not the full D. When a
+    // deontic alethic violation rejects the transition, emit an empty
+    // delta — the rewrite happened in `new_state` but must NOT ship to
+    // the caller (mirroring update_via_defs:958).
+    let delta = if rejected {
+        ast::Object::phi()
+    } else {
+        ast::diff_cells(state, &new_state)
+    };
     CommandResult {
         entities: vec![],
         status,
         transitions,
         navigation,
-        violations: vec![],
+        violations,
         derived_count: 0,
-        rejected: false,
+        rejected,
         state: delta,
     }
 }
