@@ -13,30 +13,50 @@ yarn install
 yarn compile   # round-trips every domain through the Rust compiler
 ```
 
-To use the tutor from Claude Code or Claude Desktop, add this to your MCP config (the AREST repo already contains a `.mcp.json` with a matching `arest-tutor` entry):
-
-```json
-{
-  "mcpServers": {
-    "arest-tutor": {
-      "command": "yarn",
-      "args": ["--cwd", "/absolute/path/to/arest/tutor", "mcp"],
-      "env": {
-        "AREST_MODE": "local",
-        "AREST_READINGS_DIR": "/absolute/path/to/arest/tutor/domains"
-      }
-    }
-  }
-}
-```
-
-Then ask the agent things like:
+With the `arest` MCP connected in Claude Code, ask the agent things like:
 
 > "Create an order for customer alice@example.com, then place it and ship it."
 > "Why was this order marked delivered?"
 > "Show me every category that is a descendant of Electronics."
 
 Every response is a ρ-application over the facts. No handler code was written; the readings produced the behavior.
+
+## Using the tutor from Claude Code or Claude Desktop
+
+The tutor is built into the main `arest` MCP server — you do **not** need
+a separate `arest-tutor` registration. Any current `arest` registration
+exposes the lesson tool plus a fully isolated tutor sandbox:
+
+| Tool                                    | Purpose                                                                  |
+|-----------------------------------------|--------------------------------------------------------------------------|
+| `tutor`                                 | List lessons or load one (with auto-graded `~~~ expect` predicate).      |
+| `tutor.list` / `tutor.get` / `tutor.query` | Read against the sandbox.                                              |
+| `tutor.apply` / `tutor.compile` / `tutor.propose` / `tutor.actions` | Mutate the sandbox.                       |
+| `tutor.reset`                           | Wipe the sandbox and re-bootstrap from `tutor/domains/`.                 |
+
+The sandbox is a separate `D` (state) loaded from `tutor/domains/`; your
+active app is **never touched** by `tutor.*` calls.
+
+### Sandbox persistence
+
+In CLI-DB mode (when `AREST_CLI` is set, the production setup), the
+sandbox is backed by its own SQLite file:
+
+- Default path: `tutor/.sandbox/tutor.db` (gitignored, per-developer).
+- Override: set `$AREST_TUTOR_DB` to any path, e.g. a sync-friendly
+  location if you want lesson progress to follow you across machines.
+- `tutor.reset` deletes this file and re-bootstraps from
+  `tutor/domains/` on the next call.
+
+In WASM mode (no `AREST_CLI`), the sandbox lives only in process memory
+and is lost on MCP restart — fine for quick experimentation; CLI mode is
+the right choice for working through lessons in order.
+
+### Migrating from `arest-tutor`
+
+The previous `arest-tutor` named entry in `.mcp.json` has been removed.
+If your personal config still has it, the entry continues to work but is
+redundant — point Claude at `arest` instead.
 
 ## Domains
 
