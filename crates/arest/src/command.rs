@@ -1172,6 +1172,41 @@ fn apply_load_readings(
     // Merge: foldl(concat_cell, D, cells(parsed))
     let merged_state = ast::merge_states(d, &parsed);
 
+    // D3 (#705): mirror the singular `load_reading_handler` validation
+    // gate. Either alethic (Source::Parse / ::Resolve) or deontic
+    // (Source::Deontic) errors against the merged state reject the
+    // batch load — the recompile + persist below is skipped, the
+    // returned state is phi() so the writer-path classifier treats it
+    // as no-commit. Mirrors `load_reading_core::load_reading` step 5.
+    let validation = crate::load_reading::validate_loaded_state(&merged_state);
+    if !validation.passes {
+        let violations: Vec<crate::types::Violation> = validation.alethic_violations
+            .into_iter()
+            .map(|diag| crate::types::Violation {
+                constraint_id: "load_readings.alethic".to_string(),
+                constraint_text: diag.reading,
+                detail: diag.message,
+                alethic: true,
+            })
+            .chain(validation.deontic_violations.into_iter().map(|diag| crate::types::Violation {
+                constraint_id: "load_readings.deontic".to_string(),
+                constraint_text: diag.reading,
+                detail: diag.message,
+                alethic: true,
+            }))
+            .collect();
+        return CommandResult {
+            entities: vec![],
+            status: None,
+            transitions: vec![],
+            navigation: vec![],
+            violations,
+            derived_count: 0,
+            rejected: true,
+            state: ast::Object::phi(),
+        };
+    }
+
     // Compile defs from merged state + re-register platform primitives
     let mut defs = crate::compile::compile_to_defs_state(&merged_state);
     defs.push(("compile".to_string(), ast::Func::Platform("compile".to_string())));
