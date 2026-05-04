@@ -2060,6 +2060,22 @@ type GrammarCacheEntry = (
 // process lifetime (matches the legacy `OnceLock::set` semantics
 // where a failed init left the cache empty and any later attempt would
 // re-fail identically anyway, since the input is `include_str!`-baked).
+//
+// M5 (#698): SANCTIONED MEMOIZATION EXEMPTION.
+//
+// The audit's purity sweep flagged this static as ambient state. It
+// is — and it stays. The exemption is on the same footing as the
+// `Func` AOT cache (#318) and the per-process compile-defs cache:
+// the input is `include_str!`-baked at build time (the
+// `forml2-grammar.md` byte buffer is part of the binary), the
+// computation is observably referentially transparent, and the
+// cached value is the parse result of that same buffer every time.
+// `cached_grammar()` is morally `parse(GRAMMAR)` — pure — and the
+// `Once` is an implementation detail behind that pure interface.
+// Removing it would re-parse the grammar (~50 ms cold) on every
+// stage-12 entry, including from the kernel super-loop. Same
+// rationale Backus's interpreter would invoke: a fixed program
+// over a fixed input, computed once.
 static GRAMMAR_CACHE: spin::Once<Result<GrammarCacheEntry, String>>
     = spin::Once::new();
 
