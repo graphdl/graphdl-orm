@@ -513,21 +513,48 @@ fn derive_state_machines_from_facts(facts: &[GeneralInstanceFact]) -> HashMap<St
 // Compile an Object state into named FFP definitions.
 // All generators always produce all defs. Selection is at apply time:
 // SYSTEM:sql:sqlite:Order returns DDL, SYSTEM:xsd:Order returns XSD.
-#[cfg(not(feature = "no_std"))]
-thread_local! {
-    static ACTIVE_GENERATORS: core::cell::RefCell<HashSet<String>> = core::cell::RefCell::new(HashSet::new());
-}
-#[cfg(not(feature = "no_std"))]
-pub fn set_active_generators(gens: HashSet<String>) { ACTIVE_GENERATORS.with(|g| *g.borrow_mut() = gens); }
-#[cfg(not(feature = "no_std"))]
-fn active_generators() -> HashSet<String> { ACTIVE_GENERATORS.with(|g| g.borrow().clone()) }
+//
+// H3 (#691): the active-generator set is a function of `state`. The
+// authoritative encoding is `App 'X' uses Generator 'Y'.` instance
+// facts (read from c_instance_facts in the compile fold). Optional
+// per-compile override comes through `Policy_active_generators` —
+// install it before compile via `install_active_generators(state, …)`.
+// No process-global thread-local — `compile(state)` is a pure
+// function of `state`.
 
-#[cfg(feature = "no_std")]
-static ACTIVE_GENERATORS_GLOBAL: crate::sync::Mutex<Option<HashSet<String>>> = crate::sync::Mutex::new(None);
-#[cfg(feature = "no_std")]
-pub fn set_active_generators(gens: HashSet<String>) { *ACTIVE_GENERATORS_GLOBAL.lock() = Some(gens); }
-#[cfg(feature = "no_std")]
-fn active_generators() -> HashSet<String> { ACTIVE_GENERATORS_GLOBAL.lock().clone().unwrap_or_default() }
+/// Policy cell carrying a runtime override for the active-generator
+/// set. Contents: a Seq of atom generator names (lowercased). Absent
+/// or empty cell means "no override — fall back to the
+/// `App_uses_Generator` opt-in pattern in instance facts."
+pub const POLICY_ACTIVE_GENERATORS: &str = "Policy_active_generators";
+
+/// Install the active-generators policy on `state`. Replaces any
+/// prior override. `gens` is treated case-insensitively when the
+/// compile path matches against generator names.
+pub fn install_active_generators<I, S>(state: &crate::ast::Object, gens: I) -> crate::ast::Object
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let atoms: Vec<crate::ast::Object> = gens
+        .into_iter()
+        .map(|s| crate::ast::Object::atom(s.as_ref()))
+        .collect();
+    crate::ast::store(POLICY_ACTIVE_GENERATORS, crate::ast::Object::Seq(atoms.into()), state)
+}
+
+/// Read the active-generators policy from `state`. Returns the
+/// override set when the `Policy_active_generators` cell is present
+/// and non-empty; otherwise returns an empty set so the caller falls
+/// through to the instance-fact opt-in scan.
+fn active_generators_from_state(state: &crate::ast::Object) -> HashSet<String> {
+    crate::ast::fetch(POLICY_ACTIVE_GENERATORS, state)
+        .as_seq()
+        .map(|items| items.iter()
+            .filter_map(|o| o.as_atom().map(|s| s.to_string()))
+            .collect())
+        .unwrap_or_default()
+}
 
 /// Return every App that opted into `generator` ("openapi", "sqlite", â€¦).
 ///
@@ -1087,8 +1114,10 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         .unwrap_or_default();
 
     // Generator opt-in (needed early for validate partitioning).
+    // H3 (#691): pure function of `state` — no thread-local.
+    // Policy cell takes precedence; otherwise scan instance facts.
     let generators = {
-        let active = active_generators();
+        let active = active_generators_from_state(state);
         if !active.is_empty() { active } else {
             c_instance_facts.iter()
                 .filter(|f| f.object_noun == "Generator" || f.field_name == "Generator")

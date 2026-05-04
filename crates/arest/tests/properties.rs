@@ -426,11 +426,18 @@ fn compile_orders() -> (ast::Object, ast::Object) {
 }
 
 fn compile_orders_with_generators(gens: &[&str]) -> (ast::Object, ast::Object) {
-    let gen_set: hashbrown::HashSet<String> = gens.iter().map(|s| s.to_string()).collect();
-    compile::set_active_generators(gen_set);
-    let result = compile_orders();
-    compile::set_active_generators(hashbrown::HashSet::new());
-    result
+    // H3 (#691): generator override is now a state cell, not a
+    // process-global thread-local. Install on `state` before
+    // compile_to_defs_state — no restore needed because the policy
+    // is local to the state we own here.
+    let meta_ir = compat::parse_markdown(STATE_METAMODEL).unwrap();
+    let meta_state = compat::domain_to_state(&meta_ir);
+    let orders_state = parse_forml2::parse_to_state_with_nouns(ORDERS_DOMAIN, &meta_state).unwrap();
+    let state = merge_state_into(&meta_state, &orders_state);
+    let state = compile::install_active_generators(&state, gens);
+    let defs = compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+    (state, d)
 }
 
 // ── Theorem 1: Grammar Unambiguity ───────────────────────────────────
