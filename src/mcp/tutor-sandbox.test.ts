@@ -15,7 +15,7 @@ import { getSandboxHandle, tutorSystemCall, resetSandbox, tutorDomainsDir } from
 import { compileDomainReadings, system } from '../api/engine.js'
 import { existsSync } from 'fs'
 import { resolve } from 'path'
-import { evalExpectPredicate } from './server.js'
+import { evalExpectPredicate, listRegisteredTools } from './server.js'
 
 const TIMEOUT = 60_000
 
@@ -106,5 +106,32 @@ describe('tutor.reset', () => {
     await resetSandbox()
     const after = JSON.parse(await tutorSystemCall('list:Noun', '')) ?? []
     expect(after.map((n: any) => n.id ?? n.Name).includes('Order')).toBe(true)
+  }, 60_000)
+})
+
+describe('tutor.* mirror tools', () => {
+  it('registers all eight tutor.* tools', () => {
+    const names = listRegisteredTools()
+    expect(names).toEqual(expect.arrayContaining([
+      'tutor', 'tutor.reset',
+      'tutor.propose', 'tutor.apply', 'tutor.compile',
+      'tutor.query', 'tutor.list', 'tutor.get', 'tutor.actions',
+    ]))
+  })
+
+  it('a tutor.apply create call returns a non-error JSON response', async () => {
+    await resetSandbox()
+    // Construct the same wire shape the bare apply tool uses for WASM/local
+    // mode: create:NOUN with a <<id, ID>, <field, value>> tuple.
+    const raw = await tutorSystemCall(
+      'create:Customer',
+      '<<id, alice-1>, <Name, alice>>',
+    )
+    // The call must produce parseable JSON. We do NOT assert that a
+    // subsequent list:Customer surfaces alice-1; that round-trip is
+    // covered by the CLI-persistence test in Task 6.
+    const parsed = JSON.parse(raw)
+    expect(parsed).toBeDefined()
+    expect(parsed?.rejected).not.toBe(true)
   }, 60_000)
 })

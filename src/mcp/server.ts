@@ -470,6 +470,16 @@ const server = new McpServer({
   version: '0.2.0',
 })
 
+const _registeredTools = new Set<string>()
+const _registerTool = server.registerTool.bind(server)
+server.registerTool = ((name: string, ...rest: any[]) => {
+  _registeredTools.add(name)
+  return _registerTool(name, ...rest)
+}) as typeof server.registerTool
+export function listRegisteredTools(): string[] {
+  return [..._registeredTools].sort()
+}
+
 function loadPrompt(name: string): string {
   try {
     return readFileSync(resolve(__dirname, 'prompts', `${name}.md`), 'utf-8')
@@ -1663,6 +1673,116 @@ server.registerTool(
   async () => {
     await resetSandbox()
     return textResult({ ok: true, message: 'Tutor sandbox reset.' })
+  },
+)
+
+// ── tutor.* mirror tools — sandbox-routed ──────────────────────────
+
+server.registerTool(
+  'tutor.list',
+  {
+    description: 'list:NOUN against the tutor sandbox (tutor/domains/). Use this instead of `list` when working through lessons.',
+    inputSchema: { noun: z.string().describe('Entity noun, e.g. "Order".') },
+  },
+  async ({ noun }) => {
+    const raw = await tutorSystemCall(`list:${noun}`, '')
+    const parsed = JSON.parse(raw) ?? []
+    return textResult(parsed)
+  },
+)
+
+server.registerTool(
+  'tutor.get',
+  {
+    description: 'get:NOUN/ID against the tutor sandbox.',
+    inputSchema: { noun: z.string(), id: z.string() },
+  },
+  async ({ noun, id }) => {
+    const raw = await tutorSystemCall(`get:${noun}`, id)
+    const parsed = JSON.parse(raw) ?? null
+    return textResult(parsed)
+  },
+)
+
+server.registerTool(
+  'tutor.query',
+  {
+    description: 'query:FACT_TYPE against the tutor sandbox. Filters are passed as a JSON object.',
+    inputSchema: {
+      fact_type: z.string(),
+      filter: z.record(z.string(), z.string()).optional(),
+    },
+  },
+  async ({ fact_type, filter }) => {
+    const raw = await tutorSystemCall(`query:${fact_type}`, JSON.stringify(filter ?? {}))
+    const parsed = JSON.parse(raw) ?? []
+    return textResult(parsed)
+  },
+)
+
+server.registerTool(
+  'tutor.actions',
+  {
+    description: 'List the legal SM transitions for a noun in the tutor sandbox.',
+    inputSchema: { noun: z.string(), id: z.string().optional() },
+  },
+  async ({ noun, id }) => {
+    const raw = await tutorSystemCall(`transitions:${noun}`, id ?? '')
+    return textResult({ raw, parsed: parseTransitionTriples(raw, noun, id ?? '') })
+  },
+)
+
+server.registerTool(
+  'tutor.apply',
+  {
+    description: 'Apply create/update/transition against the tutor sandbox. Same shape as `apply`. Mutations are scoped to the sandbox; the active app is untouched.',
+    inputSchema: {
+      operation: z.enum(['create', 'update', 'transition']),
+      noun: z.string(),
+      id: z.string().optional(),
+      event: z.string().optional(),
+      fields: z.record(z.string(), z.string()).optional(),
+    },
+  },
+  async ({ operation, noun, id, event, fields }) => {
+    const pairs = Object.entries(fields ?? {}).map(([k, v]) => `<${k}, ${v}>`).join(', ')
+    if (operation === 'create') {
+      const idPair = id ? `<id, ${id}>${pairs ? ', ' : ''}` : ''
+      const raw = await tutorSystemCall(`create:${noun}`, `<${idPair}${pairs}>`)
+      try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
+    }
+    if (operation === 'update') {
+      const raw = await tutorSystemCall(`update:${noun}`, `<<id, ${id || ''}>${pairs ? `, ${pairs}` : ''}>`)
+      try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
+    }
+    const raw = await tutorSystemCall(`transition:${noun}`, `<${id || ''}, ${event || ''}>`)
+    try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
+  },
+)
+
+server.registerTool(
+  'tutor.compile',
+  {
+    description: 'Compile FORML2 readings into the tutor sandbox (Corollary 5 — self-modification, lesson-scoped).',
+    inputSchema: { readings: z.string().describe('FORML2 readings markdown.') },
+  },
+  async ({ readings }) => textResult({ raw: await tutorSystemCall('compile', readings) }),
+)
+
+server.registerTool(
+  'tutor.propose',
+  {
+    description: 'Stage a Domain Change against the tutor sandbox. Same shape as `propose`.',
+    inputSchema: {
+      rationale: z.string(),
+      target_domain: z.string().optional(),
+      nouns: z.array(z.string()).optional(),
+      readings: z.array(z.string()).optional(),
+    },
+  },
+  async (args) => {
+    const raw = await tutorSystemCall(`create:Domain Change`, JSON.stringify(args))
+    try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
   },
 )
 
