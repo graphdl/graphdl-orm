@@ -64,7 +64,7 @@ import {
   type MutationContextDetail,
   type MutationContextTool,
 } from './mutation-context.js'
-import { tutorSystemCall, getSandboxHandle, resetSandbox } from './tutor-sandbox.js'
+import { tutorSystemCall } from './tutor-sandbox.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(__dirname, '..', '..')
