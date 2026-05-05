@@ -25,10 +25,13 @@ Text is a value type.
 Head Noun is a value type.
 Verb is a value type.
 Trailing Marker is a value type.
+  The possible values of Trailing Marker are 'is an entity type', 'is a value type', 'is abstract', 'is acyclic', 'is asymmetric', 'is antisymmetric', 'is intransitive', 'is irreflexive', 'is reflexive', 'is symmetric', 'is transitive', 'are mutually exclusive', 'is partitioned into', 'is a subtype of'.
 Quantifier is a value type.
   The possible values of Quantifier are 'each', 'at most one', 'at least one', 'exactly one', 'some', 'no', 'at most', 'at least'.
 Derivation Marker is a value type.
   The possible values of Derivation Marker are 'fully-derived', 'derived-and-stored', 'semi-derived'.
+Derivation Marker Symbol is a value type.
+  The possible values of Derivation Marker Symbol are '**', '*', '+'.
 Role Position is a value type.
 Literal Value is a value type.
 Keyword is a value type.
