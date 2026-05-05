@@ -591,6 +591,36 @@ function isArestPackage(metadata: PackageMetadata | null): metadata is PackageMe
   return false
 }
 
+/**
+ * Build the positional arg list for `arest-cli` to compile an app whose
+ * readings reference declarations from packages it depends on.
+ *
+ * Order is leaf-first: each dependency's `readingsDir` is prepended
+ * with the deepest leaf appearing first, then its parent, then the
+ * app's own readings directory, then `--db <path>`. This matches the
+ * existing single-app shape (`[readingsDir, '--db', dbPath]`) when there
+ * are no dependencies, and reverses the pre-order closure so parent
+ * declarations are seen before any reading that references them.
+ *
+ * Dependencies that don't exist on disk or carry no readings are
+ * skipped — the caller should not be forced to deal with broken
+ * package specs.
+ */
+export function buildAppCompileArgs(
+  app: ArestApp,
+  options: AppRegistryOptions = {},
+): string[] {
+  const { closure } = dependencyClosure(app, options)
+  const depDirs: string[] = []
+  // Reverse pre-order → leaf-first compile order.
+  for (let i = closure.length - 1; i >= 0; i--) {
+    const dep = closure[i]
+    if (!dep.exists || !dep.hasReadings) continue
+    depDirs.push(dep.readingsDir)
+  }
+  return [...depDirs, app.readingsDir, '--db', app.dbPath]
+}
+
 function dependencyClosure(app: ArestApp, options: AppRegistryOptions): {
   direct: ArestAppDependency[]
   closure: ArestAppDependency[]

@@ -42,6 +42,7 @@ import { fileURLToPath } from 'url'
 import { spawn } from 'child_process'
 import {
   appendManagedInstanceFacts,
+  buildAppCompileArgs,
   buildApplyInstanceFacts,
   checkArestApps,
   createArestApp,
@@ -310,7 +311,7 @@ function cliSystemCall(key: string, input: string): Promise<string> {
 }
 
 function compileAppReadings(app: ArestApp): Promise<string> {
-  return runArestCli([app.readingsDir, '--db', app.dbPath])
+  return runArestCli(buildAppCompileArgs(app, appRegistryOptions()))
 }
 
 function compileResult(raw: string) {

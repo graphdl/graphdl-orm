@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   appendManagedInstanceFacts,
   buildApplyInstanceFacts,
+  buildAppCompileArgs,
   checkArestApps,
   createArestApp,
   inferInitialAppName,
@@ -289,6 +290,77 @@ describe('MCP app registry helpers', () => {
     expect(check.summary.total).toBe(1)
     expect(check.summary.library).toBe(1)
     expect(check.summary.issue_count).toBe(0)
+  })
+
+  describe('buildAppCompileArgs', () => {
+    it('returns just own readings + --db when there are no dependencies', () => {
+      const appsDir = tempAppsDir()
+      createArestApp('solo', { appsDir }, 'Order(.Order Id) is an entity type.')
+      const app = resolveArestApp('solo', { appsDir })
+      const args = buildAppCompileArgs(app, { appsDir })
+      expect(args).toEqual([app.readingsDir, '--db', app.dbPath])
+    })
+
+    it('prepends every dependency readings dir, deepest leaf first, before the app dir', () => {
+      // Topology:
+      //   support  ──depends on──>  auto.dev  ──depends on──>  law-core
+      // Closure walk is pre-order: [auto.dev, law-core]. For arest-cli the
+      // safest order is leaf-first: [law-core, auto.dev], then the app.
+      const root = tempAppsDir()
+      const appsDir = join(root, 'apps')
+      const supportRoot = join(appsDir, 'support')
+      const autoDevRoot = join(appsDir, 'auto.dev')
+      const lawCoreRoot = join(root, 'law-core')
+      mkdirSync(join(supportRoot, 'readings'), { recursive: true })
+      mkdirSync(join(autoDevRoot, 'readings'), { recursive: true })
+      mkdirSync(join(lawCoreRoot, 'readings'), { recursive: true })
+      writeFileSync(join(supportRoot, 'package.json'), JSON.stringify({
+        name: 'arest-support',
+        kind: 'app',
+        dependencies: { 'arest-auto-dev': 'file:../auto.dev' },
+      }), 'utf8')
+      writeFileSync(join(autoDevRoot, 'package.json'), JSON.stringify({
+        name: 'arest-auto-dev',
+        kind: 'library',
+        dependencies: { 'arest-law-core': 'file:../../law-core' },
+      }), 'utf8')
+      writeFileSync(join(lawCoreRoot, 'package.json'), JSON.stringify({
+        name: 'arest-law-core',
+        kind: 'library',
+      }), 'utf8')
+      writeFileSync(join(supportRoot, 'readings', 'app.md'), 'Ticket(.Ticket Id) is an entity type.', 'utf8')
+      writeFileSync(join(autoDevRoot, 'readings', 'auto.md'), 'Plan(.Plan Id) is an entity type.', 'utf8')
+      writeFileSync(join(lawCoreRoot, 'readings', 'core.md'), 'Jurisdiction(.Name) is an entity type.', 'utf8')
+
+      const support = resolveArestApp('support', { appsDir, libraryDirs: [root] })
+      const args = buildAppCompileArgs(support, { appsDir, libraryDirs: [root] })
+
+      expect(args).toEqual([
+        resolve(lawCoreRoot, 'readings'),
+        resolve(autoDevRoot, 'readings'),
+        support.readingsDir,
+        '--db',
+        support.dbPath,
+      ])
+    })
+
+    it('skips dependencies that have no readings or do not exist on disk', () => {
+      const root = tempAppsDir()
+      const appsDir = join(root, 'apps')
+      const supportRoot = join(appsDir, 'support')
+      mkdirSync(join(supportRoot, 'readings'), { recursive: true })
+      writeFileSync(join(supportRoot, 'package.json'), JSON.stringify({
+        name: 'arest-support',
+        kind: 'app',
+        dependencies: { 'arest-missing-lib': 'file:../missing-lib' },
+      }), 'utf8')
+      writeFileSync(join(supportRoot, 'readings', 'app.md'), 'Ticket(.Ticket Id) is an entity type.', 'utf8')
+
+      const app = resolveArestApp('support', { appsDir, libraryDirs: [root] })
+      const args = buildAppCompileArgs(app, { appsDir, libraryDirs: [root] })
+
+      expect(args).toEqual([app.readingsDir, '--db', app.dbPath])
+    })
   })
 
   it('discovers AREST package roots outside the apps directory', () => {
