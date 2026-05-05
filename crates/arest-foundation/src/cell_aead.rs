@@ -260,6 +260,15 @@ pub fn reset_tenant_master_for_test() {
 ///     per #558, so an older ciphertext at the same scope/domain/name
 ///     fails decrypt against a newer key by construction)
 ///
+/// S1i (#725) contract: the `version` field IS the post-S1b chain's
+/// `version_id` (see ast.rs `cell_pin` / `version_entry_id`). Callers
+/// in the worker EntityDB, kernel block_storage, and host CLI MUST
+/// thread the chain's monotonic id here — not their own counter — so
+/// the AAD reflects the true storage version at seal time. The
+/// `aad_mismatch_fails_open` test (Test 1.3 below) covers the
+/// version-replay invariant explicitly: sealing under v=N and
+/// opening under v=N+1 returns AeadError::Auth.
+///
 /// `Clone + Eq + Hash` so callers can stash addresses in maps; the
 /// `canonical_bytes` representation is a deterministic
 /// length-prefixed concatenation suitable for both HKDF and AAD.
