@@ -900,11 +900,44 @@ pub fn emit_citation_fact(
     external_system: Option<&str>,
     state: &Object,
 ) -> (String, Object) {
+    emit_citation_fact_pinned(
+        uri, authority_type, retrieval_date, external_system, None, state,
+    )
+}
+
+/// S1f (#722) variant of `emit_citation_fact` that also pins the
+/// citation to a specific `(cell_name, version_id)` provenance pair.
+/// When `cell_pin` is `Some((name, id))` the helper emits two
+/// additional Citation facts — `Citation_pins_Cell_Name` and
+/// `Citation_pins_Cell_Version_Id` — and folds the pair into the
+/// content-addressed Citation id so two cites of the same URI under
+/// different versions get distinct ids (the audit trail can
+/// distinguish "fetched at v=3" from "fetched at v=4" even when the
+/// upstream URL is identical).
+///
+/// Use this when a Platform function or federated fetch operates on a
+/// specific version of a cell — query `system(h, "cell_pin", name)`
+/// (S1e) for the chain version_id, then thread it here. Callers that
+/// don't have or need cell provenance keep using `emit_citation_fact`
+/// — `cell_pin = None` produces the pre-S1f shape unchanged.
+#[cfg(not(feature = "no_std"))]
+pub fn emit_citation_fact_pinned(
+    uri: &str,
+    authority_type: &str,
+    retrieval_date: &str,
+    external_system: Option<&str>,
+    cell_pin: Option<(&str, u64)>,
+    state: &Object,
+) -> (String, Object) {
     use core::hash::{BuildHasher, Hash, Hasher};
     let mut h = hashbrown::hash_map::DefaultHashBuilder::default().build_hasher();
     uri.hash(&mut h);
     authority_type.hash(&mut h);
     retrieval_date.hash(&mut h);
+    if let Some((name, id)) = cell_pin {
+        name.hash(&mut h);
+        id.hash(&mut h);
+    }
     let cite_id = alloc::format!("cite:{:016x}", h.finish());
 
     // Auto-generated Text satisfies the alethic in readings/instances.md:
@@ -944,7 +977,7 @@ pub fn emit_citation_fact(
         fact_from_pairs(&[("Citation", &cite_id), ("Authority Type", authority_type)]),
         &with_rd,
     );
-    let final_state = external_system
+    let with_ext = external_system
         .map(|ext| {
             cell_push_unique(
                 "Citation_is_backed_by_External_System",
@@ -953,6 +986,25 @@ pub fn emit_citation_fact(
             )
         })
         .unwrap_or(with_at);
+    // S1f (#722): when the cite is for a specific cell version, push
+    // the two `Citation pins …` facts so the audit chain records
+    // exact storage provenance, not just the URI.
+    let final_state = match cell_pin {
+        Some((name, id)) => {
+            let id_str = alloc::format!("{}", id);
+            let with_name = cell_push_unique(
+                "Citation_pins_Cell_Name",
+                fact_from_pairs(&[("Citation", &cite_id), ("Cell Name", name)]),
+                &with_ext,
+            );
+            cell_push_unique(
+                "Citation_pins_Cell_Version_Id",
+                fact_from_pairs(&[("Citation", &cite_id), ("Cell Version Id", &id_str)]),
+                &with_name,
+            )
+        }
+        None => with_ext,
+    };
     (cite_id, final_state)
 }
 
@@ -5327,6 +5379,80 @@ mod tests {
             "auto-text should include external system: {matched_str}");
         assert!(matched_str.contains("2026-04-20T12:00:00Z"),
             "auto-text should include retrieval date: {matched_str}");
+    }
+
+    // ── S1f (#722): Citation pins cell_name@version_id ──────────────
+
+    #[test]
+    fn emit_citation_fact_pinned_pushes_cell_name_and_version_id_facts() {
+        // A federated fetch that read cell "Customer" at version 7
+        // emits a Citation pinned to that exact provenance pair.
+        let (cite_id, d) = emit_citation_fact_pinned(
+            "https://api.stripe.com/v1/customers/cus_42",
+            "Federated-Fetch",
+            "2026-05-05T09:00:00Z",
+            Some("stripe"),
+            Some(("Customer", 7)),
+            &Object::phi(),
+        );
+        let name_cell = fetch("Citation_pins_Cell_Name", &d).as_seq()
+            .map(|s| s.to_vec()).unwrap_or_default();
+        assert_eq!(name_cell.len(), 1, "one Cell Name pin; got {}", name_cell.len());
+        assert_eq!(binding(&name_cell[0], "Citation"), Some(cite_id.as_str()));
+        assert_eq!(binding(&name_cell[0], "Cell Name"), Some("Customer"));
+
+        let ver_cell = fetch("Citation_pins_Cell_Version_Id", &d).as_seq()
+            .map(|s| s.to_vec()).unwrap_or_default();
+        assert_eq!(ver_cell.len(), 1, "one Cell Version Id pin; got {}", ver_cell.len());
+        assert_eq!(binding(&ver_cell[0], "Citation"), Some(cite_id.as_str()));
+        assert_eq!(binding(&ver_cell[0], "Cell Version Id"), Some("7"));
+    }
+
+    #[test]
+    fn emit_citation_fact_pinned_at_different_versions_get_distinct_ids() {
+        // Same URI / authority / date, different cell version → distinct
+        // Citation ids so the audit trail can tell "fetched at v=3"
+        // apart from "fetched at v=4."
+        let (id3, _) = emit_citation_fact_pinned(
+            "platform:read_inventory", "Runtime-Function",
+            "2026-05-05T10:00:00Z", None, Some(("Inventory", 3)), &Object::phi());
+        let (id4, _) = emit_citation_fact_pinned(
+            "platform:read_inventory", "Runtime-Function",
+            "2026-05-05T10:00:00Z", None, Some(("Inventory", 4)), &Object::phi());
+        assert_ne!(id3, id4,
+            "different cell versions of the same URI must yield distinct Citation ids");
+    }
+
+    #[test]
+    fn emit_citation_fact_pinned_is_idempotent_per_pin() {
+        // Same (uri, auth, date, pin) twice → same id, same cell sizes.
+        let d0 = Object::phi();
+        let (id1, d1) = emit_citation_fact_pinned(
+            "platform:read_inventory", "Runtime-Function",
+            "2026-05-05T10:00:00Z", None, Some(("Inventory", 9)), &d0);
+        let (id2, d2) = emit_citation_fact_pinned(
+            "platform:read_inventory", "Runtime-Function",
+            "2026-05-05T10:00:00Z", None, Some(("Inventory", 9)), &d1);
+        assert_eq!(id1, id2, "same pin must yield same Citation id");
+        let name_cell = fetch("Citation_pins_Cell_Name", &d2).as_seq()
+            .map(|s| s.to_vec()).unwrap_or_default();
+        assert_eq!(name_cell.len(), 1,
+            "second emit must dedupe Cell Name pin; got {}", name_cell.len());
+    }
+
+    #[test]
+    fn emit_citation_fact_unpinned_does_not_push_pin_facts() {
+        // Backwards-compat: callers that don't pass a pin see the
+        // pre-S1f cell shape — no Citation_pins_… facts emitted.
+        let (_, d) = emit_citation_fact(
+            "platform:send_email", "Runtime-Function",
+            "2026-05-05T10:00:00Z", None, &Object::phi());
+        let name_cell = fetch("Citation_pins_Cell_Name", &d);
+        assert!(name_cell.is_bottom() || name_cell.as_seq().map(|s| s.is_empty()).unwrap_or(true),
+            "unpinned Citation must NOT push Cell Name pin");
+        let ver_cell = fetch("Citation_pins_Cell_Version_Id", &d);
+        assert!(ver_cell.is_bottom() || ver_cell.as_seq().map(|s| s.is_empty()).unwrap_or(true),
+            "unpinned Citation must NOT push Cell Version Id pin");
     }
 
     /// Emission uses cell_push_unique, so repeated emission for the same

@@ -15,8 +15,11 @@ Reference is a value type.
 Value is a value type.
 Retrieval Date is a value type.
 
+Cell Name is a value type.
+Cell Version Id is a value type.
+
 Authority Type is a value type.
-  The possible values of Authority Type are 'Constitutional', 'Statute', 'Regulation', 'Case', 'Rule-of-Court', 'Executive-Order', 'Treaty', 'Agency-Guidance', 'Industry-Standard', 'Administrative-Ruling', 'Runtime-Function', 'Federated-Fetch'.
+  The possible values of Authority Type are 'Constitutional', 'Statute', 'Regulation', 'Case', 'Rule-of-Court', 'Executive-Order', 'Treaty', 'Agency-Guidance', 'Industry-Standard', 'Administrative-Ruling', 'Runtime-Function', 'Federated-Fetch', 'Storage-Pin'.
 
 ## Readings
 
@@ -33,6 +36,12 @@ Citation has Authority Type.
 Citation is backed by External System.
   Each Citation is backed by at most one External System.
   It is possible that more than one Citation is backed by the same External System.
+Citation pins Cell Name.
+  Each Citation pins at most one Cell Name.
+  It is possible that more than one Citation pins the same Cell Name.
+Citation pins Cell Version Id.
+  Each Citation pins at most one Cell Version Id.
+  It is possible that more than one Citation pins the same Cell Version Id.
 
 ### Fact
 Fact belongs to Domain.
