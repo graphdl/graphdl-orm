@@ -3503,6 +3503,45 @@ pub fn chain_truncate_at(chain: &Object, cutoff: u64) -> Object {
     Object::seq(kept)
 }
 
+/// S1h (#724): "Cell as_of Version" — the contents of cell `name` at
+/// version_id `at`, or None if the cell isn't a chain or no entry
+/// matches. Bitemporal point-in-time read over the chain produced by
+/// merge_delta. Pure function: traverses the chain in stored order
+/// without mutating state.
+///
+/// Pairs with `chain_truncate_at` (which gives the prefix); this gives
+/// just the contents at one moment.
+pub fn as_of(state: &Object, name: &str, at: u64) -> Option<Object> {
+    let raw = fetch_raw(name, state);
+    chain_at_version(&raw, at)
+        .and_then(version_entry_contents)
+        .cloned()
+}
+
+/// S1h (#724): "Cell between Version1 and Version2" — chain entries
+/// for cell `name` whose version_id falls in `[lo, hi]` inclusive,
+/// in chronological order. Returns an empty Vec if the cell isn't
+/// a chain or no entries fall in range. Caller swaps `lo` and `hi`
+/// if reversed isn't intended; the helper is total and just gives
+/// back nothing when `lo > hi`.
+pub fn between(state: &Object, name: &str, lo: u64, hi: u64) -> Vec<Object> {
+    if lo > hi {
+        return Vec::new();
+    }
+    let raw = fetch_raw(name, state);
+    if !is_version_chain(&raw) {
+        return Vec::new();
+    }
+    raw.as_seq()
+        .map(|seq| seq.iter()
+            .filter(|entry| {
+                version_entry_id(entry).is_some_and(|id| id >= lo && id <= hi)
+            })
+            .cloned()
+            .collect())
+        .unwrap_or_default()
+}
+
 /// Latest version_id of the cell named `name`, or None if the cell is
 /// absent or the stored value isn't a chain. S1d snapshot: capture the
 /// pin point per cell at snapshot time.
@@ -6912,6 +6951,82 @@ mod tests {
         assert_eq!(version_entry_prev(&hist[0]), None);
         assert_eq!(version_entry_prev(&hist[1]), Some(1));
         assert_eq!(version_entry_prev(&hist[2]), Some(2));
+    }
+
+    // ─── S1h: as_of / between derivations (#724) ──────────────────────
+
+    #[test]
+    fn as_of_returns_contents_at_specific_version() {
+        // Three sequential merges → chain [v1=a, v2=b, v3=c].
+        let mut state = Object::Map(HashMap::new());
+        for tag in &["a", "b", "c"] {
+            let mut d = HashMap::new();
+            d.insert("X".to_string(), Object::atom(tag));
+            state = merge_delta(&state, &Object::Map(d));
+        }
+        assert_eq!(as_of(&state, "X", 1), Some(Object::atom("a")));
+        assert_eq!(as_of(&state, "X", 2), Some(Object::atom("b")));
+        assert_eq!(as_of(&state, "X", 3), Some(Object::atom("c")));
+        // Unknown version → None
+        assert_eq!(as_of(&state, "X", 99), None);
+        // Unknown cell → None
+        assert_eq!(as_of(&state, "Y", 1), None);
+    }
+
+    #[test]
+    fn as_of_returns_none_for_unversioned_cell() {
+        // Legacy raw value — no chain, no version_id to match.
+        let state = Object::seq(vec![cell("X", Object::atom("raw"))]);
+        assert_eq!(as_of(&state, "X", 0), None);
+        assert_eq!(as_of(&state, "X", 1), None);
+    }
+
+    #[test]
+    fn between_returns_chain_slice_in_chronological_order() {
+        let mut state = Object::Map(HashMap::new());
+        for tag in &["a", "b", "c", "d", "e"] {
+            let mut d = HashMap::new();
+            d.insert("X".to_string(), Object::atom(tag));
+            state = merge_delta(&state, &Object::Map(d));
+        }
+        // Inclusive range [2, 4] → entries v2, v3, v4 in order.
+        let slice = between(&state, "X", 2, 4);
+        assert_eq!(slice.len(), 3);
+        assert_eq!(version_entry_id(&slice[0]), Some(2));
+        assert_eq!(version_entry_id(&slice[1]), Some(3));
+        assert_eq!(version_entry_id(&slice[2]), Some(4));
+        assert_eq!(version_entry_contents(&slice[0]), Some(&Object::atom("b")));
+        assert_eq!(version_entry_contents(&slice[2]), Some(&Object::atom("d")));
+    }
+
+    #[test]
+    fn between_handles_singleton_range_and_full_range() {
+        let mut state = Object::Map(HashMap::new());
+        for tag in &["a", "b", "c"] {
+            let mut d = HashMap::new();
+            d.insert("Y".to_string(), Object::atom(tag));
+            state = merge_delta(&state, &Object::Map(d));
+        }
+        // [2, 2] → just v2
+        let one = between(&state, "Y", 2, 2);
+        assert_eq!(one.len(), 1);
+        assert_eq!(version_entry_id(&one[0]), Some(2));
+        // [1, 100] → all 3
+        let all = between(&state, "Y", 1, 100);
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn between_returns_empty_for_inverted_range_or_unversioned() {
+        let mut state = Object::Map(HashMap::new());
+        let mut d = HashMap::new();
+        d.insert("Z".to_string(), Object::atom("v"));
+        state = merge_delta(&state, &Object::Map(d));
+        // Inverted range — total function, just empty.
+        assert!(between(&state, "Z", 5, 1).is_empty());
+        // Legacy raw cell — no chain to slice.
+        let raw = Object::seq(vec![cell("Z", Object::atom("raw"))]);
+        assert!(between(&raw, "Z", 1, 100).is_empty());
     }
 
     #[cfg(not(feature = "no_std"))]
