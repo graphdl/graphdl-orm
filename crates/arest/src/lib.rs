@@ -849,15 +849,18 @@ impl CompiledState {
     /// Return all cell names related to `noun`. Scans `self.cells`
     /// for names that equal the noun, start with `"<noun>_"`, or
     /// contain `"_<noun>_"` / `"_<noun>"` (handles RMAP-derived FT
-    /// cells like `Order_has_total`, `Order_has_Amount`). `audit_log`
-    /// is always included.
+    /// cells like `Order_has_total`, `Order_has_Amount`).
+    ///
+    /// S1c (#719) dropped the unconditional `audit_log` push — the
+    /// chain (S1b) replaces that cell. Pre-S1c freezes whose state
+    /// still carries an `audit_log` cell will be picked up via the
+    /// noun-name match the same as any other cell.
     #[allow(dead_code)]
     fn cells_for_noun(&self, noun: &str) -> Vec<String> {
         let prefix = format!("{}_", noun);
         let infix  = format!("_{}_", noun);
         let suffix = format!("_{}", noun);
-        let mut targets: Vec<String> = self
-            .cells
+        self.cells
             .keys()
             .filter(|k| {
                 *k == noun
@@ -866,12 +869,7 @@ impl CompiledState {
                     || k.ends_with(&suffix)
             })
             .cloned()
-            .collect();
-        // audit_log is always a write target for system verbs.
-        if !targets.iter().any(|t| t == "audit_log") {
-            targets.push("audit_log".to_string());
-        }
-        targets
+            .collect()
     }
 }
 
@@ -2860,36 +2858,14 @@ mod handle_isolation_tests {
         release_impl(h_b);
     }
 
-    /// `audit_log` must be reachable as a system def — return the
-    /// audit trail as a JSON array, and each entry for an entity-scoped
-    /// apply must carry the entity id so `explain` can filter by it.
-    #[test]
-    fn audit_log_reachable_via_system_and_carries_entity_id() {
-        let h = create_impl();
-
-        let _ = system_impl(h, "compile", "\
-Order(.id) is an entity type.
-Order has total.
-");
-        let create_out = system_impl(h, "create:Order", "<<id, audit-ord-1>, <total, 7>>");
-        assert!(!create_out.starts_with('⊥'), "create:Order must succeed, got: {create_out}");
-
-        // Pass "0" as the (unused) input because apply() short-circuits on
-        // Object::Bottom — an empty string parses to ⊥. The def is named
-        // `audit` (not `audit_log`) to avoid shadowing the `audit_log` data
-        // cell that cell_push overwrites on every create.
-        let audit_out = system_impl(h, "audit", "0");
-        assert!(!audit_out.starts_with('⊥'),
-            "system('audit', '0') must not return ⊥; got: {audit_out}");
-        assert!(audit_out.starts_with('['),
-            "audit must return a JSON array; got: {audit_out}");
-        assert!(audit_out.contains("apply:create"),
-            "audit must record the apply:create operation; got: {audit_out}");
-        assert!(audit_out.contains("audit-ord-1"),
-            "audit entries for entity-scoped applies must carry the entity id; got: {audit_out}");
-
-        release_impl(h);
-    }
+    // S1c (#719): the audit_log cell is gone; the chain (S1b) carries
+    // the audit surface. The pre-S1c
+    // `audit_log_reachable_via_system_and_carries_entity_id` test
+    // covered the legacy cell path and is no longer applicable. The
+    // chain-side equivalent (apply threading the Command into
+    // VersionEntry's `event` field, projected via `cells_iter_history`)
+    // is the #719-followup; tests for that path land with the wiring
+    // commit.
 
     /// After `create:Order` adds an entity to D via apply, both
     /// `list:Order` and `get:Order` must see it. Currently those defs
@@ -3635,13 +3611,14 @@ Order has total.
         // and commits successfully without escalating to the Tier-2
         // exclusive-lock path.
         //
-        // Strategy: pre-seed a tenant with Order, Order_has_total, and
-        // audit_log cells (simulating a compiled domain with an RMAP-
-        // derived FT cell), then call write_targets_for_key and
-        // try_commit_declared directly to assert:
+        // Strategy: pre-seed a tenant with Order and FT cells, then
+        // call write_targets_for_key and try_commit_declared directly:
         //   1. cells_for_noun("Order") returns all Order-related cells.
         //   2. try_commit_declared commits successfully (Committed).
         //   3. No StructuralChange fallback occurs.
+        // S1c (#719): audit_log cell removed from this fixture — the
+        // chain is the audit surface; cells_for_noun no longer carries
+        // an unconditional audit_log target.
         let h = alloc_with_noun("Order");
         {
             // Extend the state with FT cells that RMAP would produce.
@@ -3650,8 +3627,7 @@ Order has total.
             let state = {
                 let s = ast::store("Order",           ast::Object::atom("o0"),    &ast::Object::phi());
                 let s = ast::store("Order_has_total", ast::Object::atom("0"),     &s);
-                let s = ast::store("Order_has_Amount",ast::Object::atom("100"),   &s);
-                ast::store("audit_log",               ast::Object::atom("[]"),    &s)
+                ast::store("Order_has_Amount",ast::Object::atom("100"),   &s)
             };
             st.replace_d(state);
         }
@@ -3660,18 +3636,16 @@ Order has total.
         let st = tenant.read();
         let snapshot = st.snapshot_d();
 
-        // cells_for_noun must include all Order-related cells + audit_log.
+        // cells_for_noun must include all Order-related cells.
         let targets = st.cells_for_noun("Order");
         assert!(targets.contains(&"Order".to_string()),           "Order cell included");
         assert!(targets.contains(&"Order_has_total".to_string()), "FT cell Order_has_total included");
         assert!(targets.contains(&"Order_has_Amount".to_string()),"FT cell Order_has_Amount included");
-        assert!(targets.contains(&"audit_log".to_string()),       "audit_log always included");
 
         // Build a new_d that updates Order and one FT cell.
         let new_d = {
             let s = ast::store("Order",           ast::Object::atom("o1"),  &snapshot);
-            let s = ast::store("Order_has_total", ast::Object::atom("50"),  &s);
-            ast::store("audit_log",               ast::Object::atom("[e1]"),&s)
+            ast::store("Order_has_total", ast::Object::atom("50"),  &s)
         };
 
         // Commit via the declared path — must succeed without StructuralChange.
@@ -3687,7 +3661,6 @@ Order has total.
         let d = peek(h).unwrap();
         assert_eq!(ast::fetch("Order",           &d), ast::Object::atom("o1"));
         assert_eq!(ast::fetch("Order_has_total", &d), ast::Object::atom("50"));
-        assert_eq!(ast::fetch("audit_log",       &d), ast::Object::atom("[e1]"));
         // Untouched FT cell must be preserved.
         assert_eq!(ast::fetch("Order_has_Amount",&d), ast::Object::atom("100"));
 

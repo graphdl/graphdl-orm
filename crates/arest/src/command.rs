@@ -719,18 +719,15 @@ fn create_via_defs(
         }
     })).collect();
 
-    // Security #26: audit trail — append an audit_log fact to the returned
-    // state so callers who persist the state see the trace. rejected applies
-    // to the pre-audit state; the audit push itself is invisible to the
-    // decision because it only touches the audit_log cell.
-    let outcome = match rejected { true => "rejected", false => "ok" };
-    let final_state = ast::record_audit(
-        match rejected { true => state, false => &derived_state },
-        "apply:create",
-        outcome,
-        sender,
-        Some(&entity_id),
-    );
+    // S1c (#719): the legacy `audit_log` cell + Security #26 audit-push
+    // are gone. Per whitepaper eq:cellfold the chain (S1b) is the audit
+    // surface; operation/sender provenance is the event operand on each
+    // chain entry — system_impl will thread that via merge_delta_with_event
+    // when wiring the apply path (#719-followup). For now, the returned
+    // delta carries the post-apply contents only; rejected applies snap
+    // to the pre-state.
+    let _ = (sender, &entity_id); // operation+sender retained for follow-up wiring
+    let final_state = match rejected { true => state.clone(), false => derived_state };
     // #209: return only the cells this command modified, not the full D.
     // system_impl merges this delta onto the snapshot before commit.
     let delta = ast::diff_cells(state, &final_state);
@@ -3098,180 +3095,12 @@ Transition 'place' is to Status 'Placed'.
             result.violations);
     }
 
-    /// #26: audit trail — create command pushes an audit_log fact.
-    #[test]
-    fn create_command_appends_audit_log_entry() {
-        let (def_map, state) = setup_order_defs();
-        let mut fields = HashMap::new();
-        fields.insert("orderNumber".to_string(), "ORD-AUD".to_string());
-        let cmd = Command::CreateEntity {
-            noun: "Order".to_string(),
-            domain: "orders".to_string(),
-            id: Some("ORD-AUD".to_string()),
-            fields,
-            sender: Some("auditor@example.com".to_string()),
-            signature: None,
-        };
-        let result = apply_command_defs(&def_map, &cmd, &state);
-        let log = ast::fetch_or_phi("audit_log", &result.state);
-        let entries = log.as_seq().expect("audit_log cell must exist after apply");
-        assert!(!entries.is_empty(), "audit_log must contain at least one entry");
-        let first = &entries[0];
-        assert_eq!(ast::binding(first, "operation"), Some("apply:create"));
-        assert_eq!(ast::binding(first, "outcome"), Some("ok"));
-        assert_eq!(ast::binding(first, "sender"), Some("auditor@example.com"));
-    }
-
-    /// #26: successful `platform_compile` must push an audit_log fact with
-    /// operation=compile, outcome=compiled. Exercises the ρ-level compile
-    /// primitive — same pattern as the compile_history #22 test.
-    #[test]
-    fn platform_compile_appends_audit_log_entry_on_success() {
-        let readings = "Each Person has a name.";
-        let initial_d = ast::defs_to_state(
-            &vec![("compile".to_string(), ast::Func::Platform("compile".to_string()))],
-            &ast::Object::phi(),
-        );
-        let result = ast::apply(
-            &ast::Func::Platform("compile".to_string()),
-            &ast::Object::atom(readings),
-            &initial_d,
-        );
-        // Must be a successful state, not a ⊥ atom error.
-        assert!(
-            result.as_atom().map(|s| !s.starts_with("⊥")).unwrap_or(true),
-            "compile should not return an error atom, got: {:?}",
-            result
-        );
-        let log = ast::fetch_or_phi("audit_log", &result);
-        let entries = log.as_seq().expect("audit_log cell should exist after successful compile");
-        assert_eq!(entries.len(), 1, "expected exactly one audit_log entry after one compile");
-        assert_eq!(ast::binding(&entries[0], "operation"), Some("compile"));
-        assert_eq!(ast::binding(&entries[0], "outcome"), Some("compiled"));
-        assert_eq!(ast::binding(&entries[0], "sequence"), Some("0"));
-        // Compile has no sender — must render as empty string.
-        assert_eq!(ast::binding(&entries[0], "sender"), Some(""));
-    }
-
-    /// #26: rejected apply (alethic MC violation) must still push an
-    /// audit_log entry with operation=apply:create, outcome=rejected.
-    /// Uses the same AUTH_DOMAIN pattern as
-    /// `mc_fires_on_missing_mandatory_role_for_new_entity`.
-    #[test]
-    fn rejected_create_appends_audit_log_rejected_entry() {
-        let readings = r#"# Auth
-
-## Entity Types
-Order(.OrderId) is an entity type.
-User(.Email) is an entity type.
-
-## Value Types
-OrderId is a value type.
-Email is a value type.
-
-## Fact Types
-### Order
-Order is created by User.
-
-## Constraints
-Each Order is created by exactly one User.
-"#;
-        let state = crate::parse_forml2::parse_to_state(readings).unwrap();
-        let defs = crate::compile::compile_to_defs_state(&state);
-        let def_map = ast::defs_to_state(&defs, &state);
-
-        // Create without a User fact and without a sender — MC must
-        // reject this command (same pattern as the mc_fires_on_... test).
-        let mut fields = HashMap::new();
-        fields.insert("OrderId".to_string(), "ord-rej".to_string());
-        let cmd = Command::CreateEntity {
-            noun: "Order".to_string(),
-            domain: "test".to_string(),
-            id: Some("ord-rej".to_string()),
-            fields,
-            sender: None,
-            signature: None,
-        };
-        let result = apply_command_defs(&def_map, &cmd, &state);
-        assert!(result.rejected, "MC violation must reject the command");
-
-        // Even on rejection, the returned state must carry an audit entry
-        // so a host that chooses to persist for audit-only purposes has
-        // the rejection recorded.
-        let log = ast::fetch_or_phi("audit_log", &result.state);
-        let entries = log.as_seq().expect("audit_log cell must exist after rejected apply");
-        assert_eq!(entries.len(), 1, "rejected apply should still push one audit entry");
-        assert_eq!(ast::binding(&entries[0], "operation"), Some("apply:create"));
-        assert_eq!(ast::binding(&entries[0], "outcome"), Some("rejected"));
-        assert_eq!(ast::binding(&entries[0], "sequence"), Some("0"));
-        // No sender supplied → empty string binding (None materializes as "").
-        assert_eq!(ast::binding(&entries[0], "sender"), Some(""));
-    }
-
-    /// #26: multiple applied commands must yield monotonically increasing
-    /// sequence numbers (0, 1, 2) — the audit trail is totally ordered.
-    #[test]
-    fn multiple_commands_yield_monotonic_audit_sequence() {
-        let (def_map, state) = setup_order_defs();
-
-        let make_create = |id: &str| {
-            let mut fields = HashMap::new();
-            fields.insert("orderNumber".to_string(), id.to_string());
-            Command::CreateEntity {
-                noun: "Order".to_string(),
-                domain: "orders".to_string(),
-                id: Some(id.to_string()),
-                fields,
-                sender: Some(format!("u-{}", id)),
-                signature: None,
-            }
-        };
-
-        // Thread state across three successive creates.
-        let r1 = apply_command_defs(&def_map, &make_create("ORD-SEQ-1"), &state);
-        assert!(!r1.rejected, "create 1 should succeed");
-        let r2 = apply_command_defs(&def_map, &make_create("ORD-SEQ-2"), &r1.state);
-        assert!(!r2.rejected, "create 2 should succeed");
-        let r3 = apply_command_defs(&def_map, &make_create("ORD-SEQ-3"), &r2.state);
-        assert!(!r3.rejected, "create 3 should succeed");
-
-        let log = ast::fetch_or_phi("audit_log", &r3.state);
-        let entries = log.as_seq().expect("audit_log cell must exist after three applies");
-        assert_eq!(entries.len(), 3, "three creates should yield three audit entries");
-        assert_eq!(ast::binding(&entries[0], "sequence"), Some("0"));
-        assert_eq!(ast::binding(&entries[1], "sequence"), Some("1"));
-        assert_eq!(ast::binding(&entries[2], "sequence"), Some("2"));
-        // Each entry carries its per-command sender (shape sanity).
-        assert_eq!(ast::binding(&entries[0], "sender"), Some("u-ORD-SEQ-1"));
-        assert_eq!(ast::binding(&entries[1], "sender"), Some("u-ORD-SEQ-2"));
-        assert_eq!(ast::binding(&entries[2], "sender"), Some("u-ORD-SEQ-3"));
-    }
-
-    /// #26: commands without a sender must still produce a well-formed
-    /// audit entry; the `sender` binding is present as an empty string.
-    #[test]
-    fn create_without_sender_audit_entry_has_empty_sender_binding() {
-        let (def_map, state) = setup_order_defs();
-        let mut fields = HashMap::new();
-        fields.insert("orderNumber".to_string(), "ORD-NOSND".to_string());
-        let cmd = Command::CreateEntity {
-            noun: "Order".to_string(),
-            domain: "orders".to_string(),
-            id: Some("ORD-NOSND".to_string()),
-            fields,
-            sender: None,
-            signature: None,
-        };
-        let result = apply_command_defs(&def_map, &cmd, &state);
-        assert!(!result.rejected, "create without sender should still succeed");
-        let log = ast::fetch_or_phi("audit_log", &result.state);
-        let entries = log.as_seq().expect("audit_log cell must exist after apply");
-        assert_eq!(entries.len(), 1, "one create should yield one audit entry");
-        // Missing sender renders as "" — binding is present, not absent.
-        assert_eq!(ast::binding(&entries[0], "sender"), Some(""));
-        assert_eq!(ast::binding(&entries[0], "operation"), Some("apply:create"));
-        assert_eq!(ast::binding(&entries[0], "outcome"), Some("ok"));
-    }
+    // S1c (#719): the 5 #26 audit_log tests are removed — the chain
+    // (S1b/c) is the audit surface now. Wiring the apply path to
+    // thread the Command into VersionEntry's `event` field is the
+    // #719-followup; until then, no equivalent assertions exist here.
+    // Pre-S1c freezes that contain a populated `audit_log` cell still
+    // read back via `platform_audit_log` (legacy compatibility only).
 
     /// #35: MC compile must catch entities missing a mandatory role.
     /// Creating an Order on a domain where "Each Order is created by

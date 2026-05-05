@@ -2765,41 +2765,12 @@ fn record_compile_event(state: &Object, status: &str) -> Object {
         ("Domain Change", id.as_str()),
         ("status", status),
     ]);
-    let with_history = cell_push("compile_history", fact, state);
-    record_audit(&with_history, "compile", status, None, None)
-}
-
-/// Security #26 — Audit trail for compile and apply operations.
-///
-/// Every `platform_compile` and `platform_apply_command` invocation appends
-/// a fact to an `audit_log` cell: <operation, outcome, sequence, sender?>.
-/// Sequence number is the current length of the cell, so the trace is
-/// totally ordered and WASM-safe (no wall clock). Rejected operations
-/// whose state is discarded by the host harness cannot persist their
-/// audit entries; this is a known limitation tracked alongside the
-/// reject-persistence semantics of platform_compile / platform_apply.
-pub(crate) fn record_audit(
-    state: &Object,
-    operation: &str,
-    outcome: &str,
-    sender: Option<&str>,
-    entity: Option<&str>,
-) -> Object {
-    let seq = fetch_or_phi("audit_log", state)
-        .as_seq()
-        .map(|items| items.len())
-        .unwrap_or(0);
-    let seq_str = seq.to_string();
-    let sender_val = sender.unwrap_or("");
-    let entity_val = entity.unwrap_or("");
-    let fact = fact_from_pairs(&[
-        ("operation", operation),
-        ("outcome", outcome),
-        ("sequence", seq_str.as_str()),
-        ("sender", sender_val),
-        ("entity", entity_val),
-    ]);
-    cell_push("audit_log", fact, state)
+    // S1c (#719): the compile_history cell carries the structural trace
+    // (Domain Change facts per §4.2 evolution machinery). The legacy
+    // `audit_log` push is gone — the chain (S1b) is now the audit
+    // surface, and operation/sender provenance lives in VersionEntry's
+    // `event` field for entries minted by the apply path.
+    cell_push("compile_history", fact, state)
 }
 
 /// apply command: create = emit ∘ validate ∘ derive ∘ resolve (Eq. 10).
@@ -3350,32 +3321,62 @@ pub fn cell(name: &str, contents: Object) -> Object {
 //   contents     : the cell payload (any Object)
 //   prev         : Option<u64> (atom-encoded decimal; empty = None)
 //   recorded_at  : wall-clock atom from `platform_now`, or any Object
+//   event        : (S1c, optional) the apply-time operand `x` that
+//                  produced this entry — eq:cellfold's `μ_n` input.
+//                  Carries operation kind + sender + payload, so the
+//                  chain doubles as the audit-of-record. Omitted (4-
+//                  field shape) for entries from non-apply paths
+//                  (compile-time bootstrap, internal forward-chain),
+//                  preserving back-compat with pre-S1c freezes.
 
 pub const VERSION_ID_KEY: &str = "version_id";
 pub const VERSION_CONTENTS_KEY: &str = "contents";
 pub const VERSION_PREV_KEY: &str = "prev";
 pub const VERSION_RECORDED_AT_KEY: &str = "recorded_at";
+pub const VERSION_EVENT_KEY: &str = "event";
 
-/// Construct a VersionEntry. Pure shape — no clock side-effect; pass the
-/// `recorded_at` value the caller wants written (typically the result of
-/// `apply_platform("now", …, …)` at write time).
+/// Construct a VersionEntry without an event field — the pre-S1c
+/// 4-field shape. Used by non-apply commit paths (compile bootstrap,
+/// internal forward-chain merges, legacy raw-promote).
 pub fn version_entry(
     version_id: u64,
     contents: Object,
     prev: Option<u64>,
     recorded_at: Object,
 ) -> Object {
+    version_entry_with_event(version_id, contents, prev, recorded_at, None)
+}
+
+/// S1c (#719): construct a VersionEntry with an optional `event` field.
+/// When `event = Some(x)`, the entry records the apply-time operand
+/// that produced this version — operation kind, sender, payload — so
+/// the chain replaces the legacy `audit_log` cell.
+///
+/// Pure shape; no clock side-effect. Pass the `recorded_at` value the
+/// caller wants written (typically the result of `apply_platform("now",
+/// …, …)` at write time).
+pub fn version_entry_with_event(
+    version_id: u64,
+    contents: Object,
+    prev: Option<u64>,
+    recorded_at: Object,
+    event: Option<Object>,
+) -> Object {
     let id_str = alloc::format!("{}", version_id);
     let prev_str = match prev {
         Some(p) => alloc::format!("{}", p),
         None => alloc::string::String::new(),
     };
-    Object::seq(alloc::vec![
+    let mut pairs = alloc::vec![
         Object::seq(alloc::vec![Object::atom(VERSION_ID_KEY), Object::atom(&id_str)]),
         Object::seq(alloc::vec![Object::atom(VERSION_CONTENTS_KEY), contents]),
         Object::seq(alloc::vec![Object::atom(VERSION_PREV_KEY), Object::atom(&prev_str)]),
         Object::seq(alloc::vec![Object::atom(VERSION_RECORDED_AT_KEY), recorded_at]),
-    ])
+    ];
+    if let Some(e) = event {
+        pairs.push(Object::seq(alloc::vec![Object::atom(VERSION_EVENT_KEY), e]));
+    }
+    Object::seq(pairs)
 }
 
 /// Helper: get the value side of a (key, value) pair from a fact-shaped
@@ -3408,6 +3409,15 @@ pub fn version_entry_prev(entry: &Object) -> Option<u64> {
 
 pub fn version_entry_recorded_at(entry: &Object) -> Option<&Object> {
     pair_value(entry, VERSION_RECORDED_AT_KEY)
+}
+
+/// S1c (#719): the apply-time operand `x` that produced this entry —
+/// FFP `μ_n`'s input, eq:cellfold's audit-of-record. `None` for
+/// pre-S1c entries, internal commits, and the synthetic v=0 raw-
+/// promote shim. `Some(event)` for entries minted by `apply_command`
+/// where the caller threaded the event through `merge_delta_with_event`.
+pub fn version_entry_event(entry: &Object) -> Option<&Object> {
+    pair_value(entry, VERSION_EVENT_KEY)
 }
 
 /// Detect whether an Object carries the VersionEntry shape. Used by
@@ -3462,15 +3472,43 @@ pub fn cell_contents_view(obj: &Object) -> &Object {
 
 /// Wrap raw contents in a fresh single-version chain (version_id = 1,
 /// prev = None). Used by `merge_delta` when the base has no prior entry
-/// for a cell name.
+/// for a cell name. No event field — internal commits.
 pub fn wrap_as_chain(contents: Object, recorded_at: Object) -> Object {
-    Object::seq(alloc::vec![version_entry(1, contents, None, recorded_at)])
+    wrap_as_chain_with_event(contents, recorded_at, None)
+}
+
+/// S1c (#719): wrap raw contents in a fresh chain, optionally
+/// recording the apply-time event that produced it. Use this from
+/// the apply path; non-apply commits should keep using
+/// `wrap_as_chain` (no event = legacy 4-field shape).
+pub fn wrap_as_chain_with_event(
+    contents: Object,
+    recorded_at: Object,
+    event: Option<Object>,
+) -> Object {
+    Object::seq(alloc::vec![version_entry_with_event(
+        1, contents, None, recorded_at, event,
+    )])
 }
 
 /// Append a new version entry to a chain. If `current` is not a chain,
 /// promote it to a synthetic version-0 entry first so the new entry's
 /// `prev` pointer chains backward into the legacy raw value.
 pub fn chain_append(current: &Object, new_contents: Object, recorded_at: Object) -> Object {
+    chain_append_with_event(current, new_contents, recorded_at, None)
+}
+
+/// S1c (#719): append with an optional event (eq:cellfold's `μ_n`
+/// input). The event is attached only to the newly appended entry —
+/// the synthetic v=0 promote shim for legacy raw values stays
+/// event-less because it represents pre-history, not an applied
+/// operation.
+pub fn chain_append_with_event(
+    current: &Object,
+    new_contents: Object,
+    recorded_at: Object,
+    event: Option<Object>,
+) -> Object {
     if is_version_chain(current) {
         let mut items: alloc::vec::Vec<Object> = current.as_seq()
             .map(|s| s.iter().cloned().collect())
@@ -3479,15 +3517,19 @@ pub fn chain_append(current: &Object, new_contents: Object, recorded_at: Object)
             .and_then(version_entry_id)
             .unwrap_or(0);
         let new_id = prev_id + 1;
-        items.push(version_entry(new_id, new_contents, Some(prev_id), recorded_at));
+        items.push(version_entry_with_event(
+            new_id, new_contents, Some(prev_id), recorded_at, event,
+        ));
         Object::seq(items)
     } else {
         // Promote legacy raw value to a synthetic v0 with prev=None.
-        // The new contents land as v1 with prev=Some(0).
+        // The new contents land as v1 with prev=Some(0). The v0 has
+        // no event (it never went through an apply); the v1 carries
+        // the event the caller threaded.
         let v0_recorded = Object::atom("0");
         Object::seq(alloc::vec![
             version_entry(0, current.clone(), None, v0_recorded),
-            version_entry(1, new_contents, Some(0), recorded_at),
+            version_entry_with_event(1, new_contents, Some(0), recorded_at, event),
         ])
     }
 }
@@ -3932,6 +3974,25 @@ pub fn diff_cells(old: &Object, new: &Object) -> Object {
 /// `cells_iter(merge_delta(old, diff_cells(old, new)))` produces the
 /// same (name, contents) pairs as `cells_iter(new)`.
 pub fn merge_delta(base: &Object, delta: &Object) -> Object {
+    merge_delta_with_event(base, delta, None)
+}
+
+/// S1c (#719): merge with the apply-time event threaded into every
+/// cell's new VersionEntry. Use this from the apply path where the
+/// event is the `Command` that triggered the write — operation kind,
+/// sender, and payload are then queryable via `cells_iter_history`
+/// without a separate `audit_log` cell.
+///
+/// Internal commits (compile-bootstrap, intermediate forward-chain)
+/// keep using `merge_delta` (event = None). The event is shared
+/// across every cell in this batch — eq:cellfold says one `μ_n`
+/// invocation is one `x` operand; cells in a single delta were all
+/// produced by the same apply.
+pub fn merge_delta_with_event(
+    base: &Object,
+    delta: &Object,
+    event: Option<Object>,
+) -> Object {
     // Read base WITHOUT unwrapping — chains are preserved.
     let mut base_map: HashMap<String, Object> = match base {
         Object::Map(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -3967,8 +4028,10 @@ pub fn merge_delta(base: &Object, delta: &Object) -> Object {
 
     for (k, v) in delta_pairs {
         let new_chain = match base_map.get(&k) {
-            Some(existing) => chain_append(existing, v, recorded_at.clone()),
-            None => wrap_as_chain(v, recorded_at.clone()),
+            Some(existing) => chain_append_with_event(
+                existing, v, recorded_at.clone(), event.clone(),
+            ),
+            None => wrap_as_chain_with_event(v, recorded_at.clone(), event.clone()),
         };
         base_map.insert(k, new_chain);
     }
@@ -7593,57 +7656,65 @@ mod tests {
         assert_eq!(binding(&facts[0], "status"), Some("compiled"));
     }
 
-    // ── Security #26: audit trail unit tests ─────────────────────
+    // ── S1c (#719): VersionEntry event field ──────────────────────────
     //
-    // Direct coverage of the `record_audit` helper that backs every
-    // compile/apply audit push. Test the three shape invariants:
-    //   1. on empty state, first entry gets sequence 0;
-    //   2. on an N-entry state, the next entry gets sequence N;
-    //   3. all four bindings (operation, outcome, sequence, sender)
-    //      are present, with an omitted sender rendering as "".
+    // The chain (S1b) replaces the legacy `audit_log` cell. VersionEntry
+    // optionally carries the apply-time event (eq:cellfold's `μ_n`
+    // input) so operation kind + sender + payload are queryable from
+    // `cells_iter_history` without a parallel audit_log scaffold.
 
     #[test]
-    fn record_audit_appends_entry_with_sequence_zero_on_empty_state() {
-        let state = Object::phi();
-        let result = record_audit(&state, "compile", "compiled", Some("root@example"), None);
-        let log = fetch_or_phi("audit_log", &result);
-        let facts = log.as_seq().expect("audit_log should be a sequence");
-        assert_eq!(facts.len(), 1, "empty state should yield exactly one audit entry");
-        assert_eq!(binding(&facts[0], "operation"), Some("compile"));
-        assert_eq!(binding(&facts[0], "outcome"), Some("compiled"));
-        assert_eq!(binding(&facts[0], "sequence"), Some("0"));
-        assert_eq!(binding(&facts[0], "sender"), Some("root@example"));
-        assert_eq!(binding(&facts[0], "entity"), Some(""));
+    fn version_entry_event_extracts_optional_field_when_present() {
+        let event = fact_from_pairs(&[("operation", "apply:create"), ("sender", "u1")]);
+        let entry = version_entry_with_event(
+            1,
+            Object::atom("payload"),
+            None,
+            Object::atom("now"),
+            Some(event.clone()),
+        );
+        assert_eq!(version_entry_event(&entry), Some(&event));
+        assert_eq!(version_entry_id(&entry), Some(1));
+        assert_eq!(version_entry_contents(&entry), Some(&Object::atom("payload")));
     }
 
     #[test]
-    fn record_audit_next_entry_uses_cell_length_as_sequence() {
-        // Pre-populate the audit_log with two arbitrary prior entries.
-        let state = record_audit(&Object::phi(), "compile", "compiled", None, None);
-        let state = record_audit(&state, "apply:create", "ok", Some("u1"), Some("ord-1"));
-        // The third push must observe sequence = 2 (current cell length).
-        let state = record_audit(&state, "apply:create", "rejected", Some("u2"), Some("ord-2"));
-        let log = fetch_or_phi("audit_log", &state);
-        let facts = log.as_seq().expect("audit_log should be a sequence");
-        assert_eq!(facts.len(), 3, "three pushes should yield three entries");
-        assert_eq!(binding(&facts[2], "operation"), Some("apply:create"));
-        assert_eq!(binding(&facts[2], "outcome"), Some("rejected"));
-        assert_eq!(binding(&facts[2], "sequence"), Some("2"));
-        assert_eq!(binding(&facts[2], "sender"), Some("u2"));
-        assert_eq!(binding(&facts[2], "entity"), Some("ord-2"));
+    fn version_entry_event_returns_none_for_eventless_entries() {
+        let entry = version_entry(1, Object::atom("p"), None, Object::atom("now"));
+        assert!(version_entry_event(&entry).is_none(),
+            "pre-S1c 4-field entries must not surface an event");
+        // Round-tripping the no-event constructor through the variant
+        // helper with explicit None must produce the same shape.
+        let same = version_entry_with_event(1, Object::atom("p"), None, Object::atom("now"), None);
+        assert_eq!(entry, same);
     }
 
     #[test]
-    fn record_audit_omitted_sender_renders_as_empty_string() {
-        let result = record_audit(&Object::phi(), "compile", "compiled", None, None);
-        let log = fetch_or_phi("audit_log", &result);
-        let facts = log.as_seq().expect("audit_log should be a sequence");
-        assert_eq!(facts.len(), 1);
-        // `None` sender must materialize as "" so downstream binding
-        // lookups never hit a missing key (totality of the fact type).
-        assert_eq!(binding(&facts[0], "sender"), Some(""));
-        assert_eq!(binding(&facts[0], "sequence"), Some("0"));
-        assert_eq!(binding(&facts[0], "entity"), Some(""));
+    fn merge_delta_with_event_attaches_event_to_new_chain_entry() {
+        let event = fact_from_pairs(&[("operation", "apply:create"), ("sender", "u1")]);
+        let s0 = Object::Map(HashMap::new());
+        let mut d = HashMap::new();
+        d.insert("Order".to_string(), Object::atom("ord-1"));
+        let s1 = merge_delta_with_event(&s0, &Object::Map(d), Some(event.clone()));
+
+        let hist = cells_iter_history(&s1, "Order");
+        assert_eq!(hist.len(), 1);
+        assert_eq!(version_entry_id(&hist[0]), Some(1));
+        assert_eq!(version_entry_event(&hist[0]), Some(&event),
+            "event must round-trip through merge_delta_with_event");
+    }
+
+    #[test]
+    fn merge_delta_eventless_path_omits_event_field() {
+        // The plain merge_delta delegates to the event variant with
+        // None — entries must remain in the pre-S1c 4-field shape so
+        // pre-existing freezes keep round-tripping.
+        let s0 = Object::Map(HashMap::new());
+        let mut d = HashMap::new();
+        d.insert("Order".to_string(), Object::atom("ord-1"));
+        let s1 = merge_delta(&s0, &Object::Map(d));
+        let hist = cells_iter_history(&s1, "Order");
+        assert!(version_entry_event(&hist[0]).is_none());
     }
 
     // ── Security #19: per-field input bound (PLATFORM_MAX_FIELD) ─────
