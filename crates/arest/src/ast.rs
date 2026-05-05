@@ -2277,6 +2277,9 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
         s if s.starts_with("get_noun:") => platform_get_noun(&s[9..], x, d),
         s if s.starts_with("query_ft:") => platform_query_ft(&s[9..], x, d),
         "audit" => platform_audit_log(d),
+        // S1a (#717): wall-clock primitive — populates VersionEntry's
+        // recorded_at field at write time. See platform_now below.
+        "now" => platform_now(),
         // Fall through to the runtime-installed callback registry for
         // names outside the compile-derived range. See
         // `install_platform_fn` — hosts (ML scorer, local projector,
@@ -2284,6 +2287,28 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
         // is installed, preserving total-function semantics.
         _ => dispatch_platform_fallback(name, x, d),
     }
+}
+
+/// Platform primitive: return current wall-clock time as Unix epoch
+/// milliseconds, atom-encoded decimal. Key: "now". Input: ignored.
+///
+/// S1a (#717): introduces the host-clock primitive for the immutable-cell
+/// chain (S1, #716). The returned timestamp populates a VersionEntry's
+/// `recorded_at` field at write time.
+///
+/// std builds: `std::time::SystemTime::now()`. wasm32 (worker) gets it
+/// the same way — the Cloudflare Worker runtime stubs SystemTime to
+/// `Date.now()`. no_std (kernel): host injection is the long-tail
+/// follow-up; until then this primitive returns Bottom (the apply-Func
+/// no_std branch) and S1b can fall back to the chain's monotonic
+/// version_id as logical time when wall-clock is unavailable.
+#[cfg(not(feature = "no_std"))]
+fn platform_now() -> Object {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    Object::atom(&ms.to_string())
 }
 
 /// Platform primitive: return the audit_log cell as a JSON array.
@@ -3252,6 +3277,92 @@ pub const CELL_TAG: &str = "CELL";
 /// Create a cell object: <CELL, name, contents>
 pub fn cell(name: &str, contents: Object) -> Object {
     Object::seq(vec![Object::atom(CELL_TAG), Object::atom(name), contents])
+}
+
+// ─── VersionEntry: cell-version wrapper (S1a, #717) ─────────────────────
+//
+// Realigns the cell store with whitepaper §3.3 + eq:cellfold (#716).
+// Backus's store operator `↓ n: ⟨x, D⟩ → D'` is purely functional: each
+// write produces a new D, and `D_n' = foldl μ_n D_n E_n` makes the
+// per-cell sequence of intermediate states explicit. Today the Rust
+// impl collapses that sequence into a single overwrite (`merge_delta` →
+// `map.insert`); S1 (#716) realigns it as an append-version chain.
+//
+// S1a is the shape definition + Platform `now` primitive only — no
+// behavior change. S1b (#718) flips `merge_delta` to append-using-this-
+// shape and `cells_iter` to return the latest version's contents.
+//
+// Encoding: a VersionEntry is itself an Object — a Seq of (key, value)
+// pairs, like `fact_from_pairs`. Carries:
+//   version_id   : monotonic u64 (atom-encoded decimal)
+//   contents     : the cell payload (any Object)
+//   prev         : Option<u64> (atom-encoded decimal; empty = None)
+//   recorded_at  : wall-clock atom from `platform_now`, or any Object
+
+pub const VERSION_ID_KEY: &str = "version_id";
+pub const VERSION_CONTENTS_KEY: &str = "contents";
+pub const VERSION_PREV_KEY: &str = "prev";
+pub const VERSION_RECORDED_AT_KEY: &str = "recorded_at";
+
+/// Construct a VersionEntry. Pure shape — no clock side-effect; pass the
+/// `recorded_at` value the caller wants written (typically the result of
+/// `apply_platform("now", …, …)` at write time).
+pub fn version_entry(
+    version_id: u64,
+    contents: Object,
+    prev: Option<u64>,
+    recorded_at: Object,
+) -> Object {
+    let id_str = alloc::format!("{}", version_id);
+    let prev_str = match prev {
+        Some(p) => alloc::format!("{}", p),
+        None => alloc::string::String::new(),
+    };
+    Object::seq(alloc::vec![
+        Object::seq(alloc::vec![Object::atom(VERSION_ID_KEY), Object::atom(&id_str)]),
+        Object::seq(alloc::vec![Object::atom(VERSION_CONTENTS_KEY), contents]),
+        Object::seq(alloc::vec![Object::atom(VERSION_PREV_KEY), Object::atom(&prev_str)]),
+        Object::seq(alloc::vec![Object::atom(VERSION_RECORDED_AT_KEY), recorded_at]),
+    ])
+}
+
+/// Helper: get the value side of a (key, value) pair from a fact-shaped
+/// Object. Differs from `binding` by accepting a non-atom value — needed
+/// for VersionEntry's `contents` and `recorded_at` fields, which can hold
+/// arbitrary sub-Objects.
+fn pair_value<'a>(fact: &'a Object, key: &str) -> Option<&'a Object> {
+    fact.as_seq()?.iter().find_map(|pair| {
+        let items = pair.as_seq()?;
+        (items.len() == 2 && items[0].as_atom() == Some(key))
+            .then_some(&items[1])
+    })
+}
+
+/// Extract a VersionEntry's `version_id` field. Returns None if the
+/// Object is not a VersionEntry or the field is malformed.
+pub fn version_entry_id(entry: &Object) -> Option<u64> {
+    binding(entry, VERSION_ID_KEY)?.parse().ok()
+}
+
+pub fn version_entry_contents(entry: &Object) -> Option<&Object> {
+    pair_value(entry, VERSION_CONTENTS_KEY)
+}
+
+/// Extract the `prev` field. Empty string encodes None (the chain root).
+pub fn version_entry_prev(entry: &Object) -> Option<u64> {
+    let s = binding(entry, VERSION_PREV_KEY)?;
+    if s.is_empty() { None } else { s.parse().ok() }
+}
+
+pub fn version_entry_recorded_at(entry: &Object) -> Option<&Object> {
+    pair_value(entry, VERSION_RECORDED_AT_KEY)
+}
+
+/// Detect whether an Object carries the VersionEntry shape. Used by
+/// S1b's `cells_iter` to decide between unwrap-latest-version (new
+/// shape) vs. raw-contents (legacy shape) at read time.
+pub fn is_version_entry(obj: &Object) -> bool {
+    version_entry_id(obj).is_some() && version_entry_contents(obj).is_some()
 }
 
 /// Fetch (↑n): retrieve contents of the first cell named n from a store.
@@ -6389,6 +6500,61 @@ mod tests {
         let state = cell_push("Noun", f1.clone(), &Object::phi());
         let state2 = cell_push("Noun", f2.clone(), &state);
         assert_eq!(fetch_or_phi("Noun", &state2), Object::seq(vec![f1, f2]));
+    }
+
+    // ─── VersionEntry shape (S1a, #717) ────────────────────────────────
+
+    #[test]
+    fn version_entry_round_trips_all_fields() {
+        let contents = Object::atom("hello");
+        let recorded = Object::atom("1700000000000");
+        let entry = version_entry(42, contents.clone(), Some(41), recorded.clone());
+        assert_eq!(version_entry_id(&entry), Some(42));
+        assert_eq!(version_entry_contents(&entry), Some(&contents));
+        assert_eq!(version_entry_prev(&entry), Some(41));
+        assert_eq!(version_entry_recorded_at(&entry), Some(&recorded));
+        assert!(is_version_entry(&entry));
+    }
+
+    #[test]
+    fn version_entry_with_no_prev_returns_none() {
+        let entry = version_entry(1, Object::atom("first"), None, Object::atom("t0"));
+        assert_eq!(version_entry_id(&entry), Some(1));
+        assert_eq!(version_entry_prev(&entry), None);
+    }
+
+    #[test]
+    fn version_entry_can_carry_complex_contents() {
+        // contents is an arbitrary Object — this is how a cell whose
+        // payload is a Seq-of-facts will be stored once S1b lands.
+        let contents = Object::seq(vec![
+            fact_from_pairs(&[("name", "Alice"), ("age", "30")]),
+            fact_from_pairs(&[("name", "Bob"),   ("age", "25")]),
+        ]);
+        let entry = version_entry(7, contents.clone(), None, Object::phi());
+        assert_eq!(version_entry_contents(&entry), Some(&contents));
+    }
+
+    #[test]
+    fn is_version_entry_rejects_plain_objects() {
+        assert!(!is_version_entry(&Object::phi()));
+        assert!(!is_version_entry(&Object::atom("notanentry")));
+        assert!(!is_version_entry(&Object::seq(vec![Object::atom("a")])));
+        // A normal cell tuple must not pollute the predicate.
+        assert!(!is_version_entry(&cell("Noun", Object::atom("Alice"))));
+    }
+
+    #[cfg(not(feature = "no_std"))]
+    #[test]
+    fn platform_now_returns_monotonically_nondecreasing_decimal_atom() {
+        let t1 = apply_platform("now", &Object::phi(), &Object::phi());
+        let t2 = apply_platform("now", &Object::phi(), &Object::phi());
+        let s1 = t1.as_atom().expect("now returns an atom");
+        let s2 = t2.as_atom().expect("now returns an atom");
+        let ms1: u128 = s1.parse().expect("decimal millis");
+        let ms2: u128 = s2.parse().expect("decimal millis");
+        assert!(ms1 > 0, "host clock should be after epoch");
+        assert!(ms2 >= ms1, "wall clock must be monotonic across consecutive calls");
     }
 
     #[test]
