@@ -22,6 +22,8 @@ Constraint(.id) is an entity type.
 
 Constraint Type(.code) is an entity type.
 
+Constraint Kind(.code) is an entity type.
+
 Derivation Rule(.id) is an entity type.
 
 Modality Type is a value type.
@@ -83,6 +85,11 @@ Scope is a value type.
 
 Derivation Mode is a value type.
   The possible values of Derivation Mode are 'fully-derived', 'derived-and-stored', 'semi-derived'.
+
+Constraint Kind Label is a value type.
+
+Constraint Kind Family is a value type.
+  The possible values of Constraint Kind Family are 'ring', 'uniqueness', 'mandatory', 'frequency', 'value', 'set-comparison', 'subset', 'equality'.
 
 ## Fact Types
 
@@ -209,6 +216,12 @@ Constraint is semantic.
 ### Constraint Type
 Constraint Type has Name.
   Each Constraint Type has exactly one Name.
+
+### Constraint Kind
+Constraint Kind has Constraint Kind Label.
+  Each Constraint Kind has exactly one Constraint Kind Label.
+Constraint Kind has Constraint Kind Family.
+  Each Constraint Kind has exactly one Constraint Kind Family.
 
 ### Set Comparison Constraint (subtype of Constraint)
 Set Comparison Constraint has Argument Length.
@@ -630,6 +643,51 @@ Constraint Type 'IT' has Name 'Intransitive'.
 Constraint Type 'TR' has Name 'Transitive'.
 Constraint Type 'AC' has Name 'Acyclic'.
 Constraint Type 'VC' has Name 'ValueComparison'.
+
+### Constraint Kinds (#747)
+
+Each Constraint Kind code below names one alethic constraint dispatch
+arm in `compile.rs`. The Family groups codes that share an evaluation
+shape (ring, set-comparison, subset/equality, value, frequency,
+uniqueness, mandatory) so tooling — OpenAPI, docs, MCP introspection —
+can enumerate the inventory from declared facts instead of reading the
+Rust match. AT and ANS share the antisymmetric ring kernel; ANS is
+preserved as a separate kind so the alias surfaces as a fact.
+
+Constraint Kind 'IR' has Constraint Kind Label 'Irreflexive Ring'.
+Constraint Kind 'IR' has Constraint Kind Family 'ring'.
+Constraint Kind 'AS' has Constraint Kind Label 'Asymmetric Ring'.
+Constraint Kind 'AS' has Constraint Kind Family 'ring'.
+Constraint Kind 'SY' has Constraint Kind Label 'Symmetric Ring'.
+Constraint Kind 'SY' has Constraint Kind Family 'ring'.
+Constraint Kind 'AT' has Constraint Kind Label 'Antisymmetric Ring'.
+Constraint Kind 'AT' has Constraint Kind Family 'ring'.
+Constraint Kind 'IT' has Constraint Kind Label 'Intransitive Ring'.
+Constraint Kind 'IT' has Constraint Kind Family 'ring'.
+Constraint Kind 'TR' has Constraint Kind Label 'Transitive Ring'.
+Constraint Kind 'TR' has Constraint Kind Family 'ring'.
+Constraint Kind 'AC' has Constraint Kind Label 'Acyclic Ring'.
+Constraint Kind 'AC' has Constraint Kind Family 'ring'.
+Constraint Kind 'RF' has Constraint Kind Label 'Reflexive Ring'.
+Constraint Kind 'RF' has Constraint Kind Family 'ring'.
+Constraint Kind 'UC' has Constraint Kind Label 'Uniqueness'.
+Constraint Kind 'UC' has Constraint Kind Family 'uniqueness'.
+Constraint Kind 'MC' has Constraint Kind Label 'Mandatory'.
+Constraint Kind 'MC' has Constraint Kind Family 'mandatory'.
+Constraint Kind 'FC' has Constraint Kind Label 'Frequency'.
+Constraint Kind 'FC' has Constraint Kind Family 'frequency'.
+Constraint Kind 'VC' has Constraint Kind Label 'Value'.
+Constraint Kind 'VC' has Constraint Kind Family 'value'.
+Constraint Kind 'XO' has Constraint Kind Label 'Exclusive Or'.
+Constraint Kind 'XO' has Constraint Kind Family 'set-comparison'.
+Constraint Kind 'XC' has Constraint Kind Label 'Exclusion'.
+Constraint Kind 'XC' has Constraint Kind Family 'set-comparison'.
+Constraint Kind 'OR' has Constraint Kind Label 'Inclusive Or'.
+Constraint Kind 'OR' has Constraint Kind Family 'set-comparison'.
+Constraint Kind 'SS' has Constraint Kind Label 'Subset'.
+Constraint Kind 'SS' has Constraint Kind Family 'subset'.
+Constraint Kind 'EQ' has Constraint Kind Label 'Equality'.
+Constraint Kind 'EQ' has Constraint Kind Family 'equality'.
 
 ### Join Types (NORMA #279)
 

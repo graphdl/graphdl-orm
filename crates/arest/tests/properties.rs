@@ -2444,6 +2444,136 @@ fn implicit_derivations_landed_as_rules_in_core_md() {
     }
 }
 
+/// #747 (MC3a narrowest reading): the 17 alethic Constraint Kinds that
+/// `compile.rs`'s match-on-`def.kind.as_str()` dispatches over land as
+/// declared facts in core.md. The audit value is that tooling — OpenAPI,
+/// MCP introspection, docs — can enumerate the constraint-kind inventory
+/// from data instead of re-reading the Rust source. The compile.rs match
+/// stays untouched in this task; a follow-up will read these facts.
+///
+/// Each kind contributes two InstanceFacts: one carrying its
+/// `Constraint Kind Label` (human-readable name), one carrying its
+/// `Constraint Kind Family` (coarse evaluation grouping — `ring`,
+/// `set-comparison`, `subset`, `equality`, `value`, `frequency`,
+/// `uniqueness`, `mandatory`). The dual-fact decomposition is what
+/// the existing FORML 2 grammar accepts cleanly; the InstanceFact
+/// translator does not currently support a single `(.code, Label,
+/// Family)` ternary surface form (verified against
+/// `parse_forml2_stage2::translate_instance_facts`).
+#[test]
+fn constraint_kind_inventory_landed_in_core_md() {
+    let core_src = include_str!("../../../readings/core/core.md");
+    let state = arest::parse_forml2::parse_to_state(core_src)
+        .expect("core.md parses");
+
+    // Constraint Kind landed as an entity type in the Noun cell.
+    let nouns = ast::fetch_or_phi("Noun", &state);
+    let noun_seq = nouns.as_seq().expect("Noun cell Seq");
+    let constraint_kind_noun = noun_seq.iter()
+        .find(|f| ast::binding(f, "name") == Some("Constraint Kind"))
+        .expect("Constraint Kind declared as a Noun in core.md");
+    assert_eq!(ast::binding(constraint_kind_noun, "objectType"), Some("entity"),
+        "Constraint Kind should be an entity type");
+
+    // Constraint Kind Label + Family landed as value types.
+    for vt in ["Constraint Kind Label", "Constraint Kind Family"] {
+        let found = noun_seq.iter()
+            .find(|f| ast::binding(f, "name") == Some(vt))
+            .unwrap_or_else(|| panic!("{vt} declared as a Noun in core.md"));
+        assert_eq!(ast::binding(found, "objectType"), Some("value"),
+            "{vt} should be a value type");
+    }
+
+    // The 17 codes the alethic dispatch in compile.rs covers. AT and
+    // ANS share the antisymmetric kernel (`"AT" | "ANS"` arm); ANS is
+    // an alias and is not given its own Constraint Kind here — the 17
+    // entries match the 17 distinct kinds the family taxonomy
+    // partitions, mirroring the existing Constraint Type inventory
+    // plus RF (which the original Constraint Type list omits).
+    let expected_codes: [&str; 17] = [
+        "IR", "AS", "SY", "AT",
+        "UC", "MC",
+        "FC", "VC",
+        "IT", "TR", "AC", "RF",
+        "XO", "XC", "OR",
+        "SS", "EQ",
+    ];
+
+    let inst_facts = ast::fetch_or_phi("InstanceFact", &state);
+    let inst_seq = inst_facts.as_seq().expect("InstanceFact cell Seq");
+
+    // Collect Label and Family facts indexed by code.
+    let mut label_by_code: std::collections::BTreeMap<String, String>
+        = std::collections::BTreeMap::new();
+    let mut family_by_code: std::collections::BTreeMap<String, String>
+        = std::collections::BTreeMap::new();
+    for f in inst_seq.iter() {
+        if ast::binding(f, "subjectNoun") != Some("Constraint Kind") {
+            continue;
+        }
+        let code = match ast::binding(f, "subjectValue") {
+            Some(c) => c.to_string(),
+            None => continue,
+        };
+        let value = match ast::binding(f, "objectValue") {
+            Some(v) => v.to_string(),
+            None => continue,
+        };
+        match ast::binding(f, "objectNoun") {
+            Some("Constraint Kind Label") => {
+                label_by_code.insert(code, value);
+            }
+            Some("Constraint Kind Family") => {
+                family_by_code.insert(code, value);
+            }
+            _ => {}
+        }
+    }
+
+    // 17 Label facts, 17 Family facts, one per expected code.
+    assert_eq!(label_by_code.len(), 17,
+        "expected 17 Constraint Kind Label facts, got {}: {:?}",
+        label_by_code.len(), label_by_code);
+    assert_eq!(family_by_code.len(), 17,
+        "expected 17 Constraint Kind Family facts, got {}: {:?}",
+        family_by_code.len(), family_by_code);
+
+    // Every expected code has both a Label and a Family.
+    for code in &expected_codes {
+        assert!(label_by_code.contains_key(*code),
+            "missing Constraint Kind Label fact for code {code}; \
+             present: {:?}", label_by_code.keys().collect::<Vec<_>>());
+        assert!(family_by_code.contains_key(*code),
+            "missing Constraint Kind Family fact for code {code}; \
+             present: {:?}", family_by_code.keys().collect::<Vec<_>>());
+    }
+
+    // Family values are drawn from the declared enumeration. The 8
+    // family names mirror the dispatch shapes in compile.rs.
+    let valid_families: std::collections::BTreeSet<&str> = [
+        "ring", "uniqueness", "mandatory", "frequency",
+        "value", "set-comparison", "subset", "equality",
+    ].into_iter().collect();
+    for (code, fam) in &family_by_code {
+        assert!(valid_families.contains(fam.as_str()),
+            "Constraint Kind {code} has unrecognised Family {fam:?}; \
+             must be one of {valid_families:?}");
+    }
+
+    // Spot-check a few canonical (code, family) pairs so a regression
+    // that scrambles the assignment surfaces here, not just in totals.
+    assert_eq!(family_by_code.get("IR").map(String::as_str), Some("ring"),
+        "IR is a ring constraint kind");
+    assert_eq!(family_by_code.get("UC").map(String::as_str), Some("uniqueness"),
+        "UC is the uniqueness kind");
+    assert_eq!(family_by_code.get("XO").map(String::as_str), Some("set-comparison"),
+        "XO is a set-comparison kind");
+    assert_eq!(family_by_code.get("SS").map(String::as_str), Some("subset"),
+        "SS is the subset kind");
+    assert_eq!(family_by_code.get("EQ").map(String::as_str), Some("equality"),
+        "EQ is the equality kind");
+}
+
 /// #288: check.rs Layers 2+3 expressed as deontic obligations in
 /// core.md. Pins the readings so #317's metamodel-FT push can later
 /// drive them at runtime through Theorem 4's violation path.
