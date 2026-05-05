@@ -1071,6 +1071,23 @@ pub async fn apply_platform_async(name: &str, x: &Object, d: &Object) -> Object 
 // because apply is synchronous — hosts bridge async work at the FFI
 // level (federated_ingest) instead. This registry is only for
 // genuinely synchronous callbacks.
+//
+// C1 (#687): the *discovery* surface lives in the cell substrate.
+// `Policy_platform` carries a Seq of fact rows
+//   `<<name, "X">, <identifier, "Y">>`
+// from which `platform_from_state` resolves a name → identifier. The
+// process-global Rust side-table below (`PLATFORM_FALLBACK`) is keyed
+// by that identifier and holds the actual `Arc<dyn Fn>` — the
+// non-introspectable, non-replayable bit. `install_platform_fn` writes
+// to *both* the side-table and a process-wide mirror state via
+// `install_platform`, so introspection (`installed_platform_fn_names`,
+// the sec-2 audit test) reads the cell instead of the raw registry.
+
+/// Policy cell carrying the runtime-installed Platform names. Contents:
+/// a Seq of `<<name, X>, <identifier, Y>>` named-tuple rows. Reading a
+/// `name` resolves to the identifier the side-table dispatches on.
+/// Absent or empty cell means "no runtime body installed at this name".
+pub const POLICY_PLATFORM: &str = "Policy_platform";
 
 #[cfg(not(feature = "no_std"))]
 pub type PlatformFn = crate::sync::Arc<
@@ -1082,24 +1099,126 @@ static PLATFORM_FALLBACK: crate::sync::OnceLock<
     crate::sync::RwLock<HashMap<String, PlatformFn>>
 > = crate::sync::OnceLock::new();
 
+// Process-wide mirror of the runtime registry, encoded in the cell
+// substrate. `install_platform_fn` updates both this mirror and the
+// side-table; `installed_platform_fn_names` and the dispatcher read
+// from this mirror so the cell is the authority for "is X registered".
+#[cfg(not(feature = "no_std"))]
+static PLATFORM_REGISTRY_STATE: crate::sync::OnceLock<
+    crate::sync::Mutex<Object>
+> = crate::sync::OnceLock::new();
+
+#[cfg(not(feature = "no_std"))]
+fn platform_registry_state() -> &'static crate::sync::Mutex<Object> {
+    PLATFORM_REGISTRY_STATE.get_or_init(|| crate::sync::Mutex::new(Object::phi()))
+}
+
+/// Install a Platform identifier into `state`'s `Policy_platform` cell.
+/// Returns a new state with a `<<name, X>, <identifier, Y>>` row whose
+/// `name` binding is `name` and `identifier` binding is `identifier`.
+/// Re-installing a `name` replaces its existing row in place; other
+/// rows are untouched. Pure function — no side effects on the side-
+/// table; the discovery surface and the function-pointer surface are
+/// updated independently by `install_platform_fn`.
+pub fn install_platform(state: &Object, name: &str, identifier: &str) -> Object {
+    let row = fact_from_pairs(&[("name", name), ("identifier", identifier)]);
+    let existing = fetch_or_phi(POLICY_PLATFORM, state);
+    let new_rows: Vec<Object> = match existing.as_seq() {
+        Some(items) => {
+            let mut out: Vec<Object> = items.iter()
+                .filter(|r| binding(r, "name") != Some(name))
+                .cloned()
+                .collect();
+            out.push(row);
+            out
+        }
+        None => alloc::vec![row],
+    };
+    store(POLICY_PLATFORM, Object::Seq(new_rows.into()), state)
+}
+
+/// Read the Platform identifier for `name` from `state`'s
+/// `Policy_platform` cell. Returns `Some(identifier)` when a row with
+/// matching `name` is present, `None` otherwise. The identifier is the
+/// side-table key the dispatcher uses to find the actual closure; for
+/// names installed via `install_platform_fn`, the identifier and the
+/// name are the same string.
+pub fn platform_from_state(state: &Object, name: &str) -> Option<alloc::string::String> {
+    let cell = fetch(POLICY_PLATFORM, state);
+    let rows = cell.as_seq()?;
+    rows.iter().find_map(|r| {
+        if binding(r, "name") == Some(name) {
+            binding(r, "identifier").map(|s| s.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// Sorted names currently registered in `state`'s `Policy_platform`
+/// cell. Empty when the cell is absent. Pure function — host-side
+/// introspection that does not consult the process-global side-table.
+pub fn platform_names_from_state(state: &Object) -> alloc::vec::Vec<alloc::string::String> {
+    let cell = fetch(POLICY_PLATFORM, state);
+    let mut out: alloc::vec::Vec<alloc::string::String> = cell.as_seq()
+        .map(|rows| rows.iter()
+            .filter_map(|r| binding(r, "name").map(|s| s.to_string()))
+            .collect())
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+/// Remove a Platform name from `state`'s `Policy_platform` cell.
+/// Returns a new state with the matching row dropped; if no row
+/// matches, returns a state where the cell is materialised but
+/// unchanged in content. Counterpart to `install_platform` for
+/// `uninstall_platform_fn`.
+#[cfg(not(feature = "no_std"))]
+fn uninstall_platform(state: &Object, name: &str) -> Object {
+    let existing = fetch_or_phi(POLICY_PLATFORM, state);
+    let new_rows: Vec<Object> = match existing.as_seq() {
+        Some(items) => items.iter()
+            .filter(|r| binding(r, "name") != Some(name))
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    };
+    store(POLICY_PLATFORM, Object::Seq(new_rows.into()), state)
+}
+
 /// Install a synchronous Platform body. apply_platform falls through
 /// here for names not covered by the hardcoded match. The body is an
 /// `Arc<dyn Fn(&Object, &Object) -> Object>` — takes the operand and
 /// the current `D`, returns an Object. Thread-safe; callers may
 /// re-install to replace the body.
+///
+/// C1 (#687): the name is also recorded in the process-wide
+/// `Policy_platform` cell mirror so introspection paths read the cell
+/// substrate instead of the raw side-table. The identifier stored in
+/// the cell is the same string as `name`; the side-table is keyed by
+/// that identifier.
 #[cfg(not(feature = "no_std"))]
 pub fn install_platform_fn(name: &str, f: PlatformFn) {
     let reg = PLATFORM_FALLBACK.get_or_init(|| crate::sync::RwLock::new(HashMap::new()));
     reg.write().insert(name.to_string(), f);
+    let mirror = platform_registry_state();
+    let mut guard = mirror.lock();
+    *guard = install_platform(&guard, name, name);
 }
 
 /// Remove a previously-installed Platform body. Used by tests to
-/// avoid leakage between test cases sharing process state.
+/// avoid leakage between test cases sharing process state. Mirrors the
+/// removal into the process-wide `Policy_platform` cell so the audit
+/// surface stays in sync with the side-table.
 #[cfg(not(feature = "no_std"))]
 pub fn uninstall_platform_fn(name: &str) {
     if let Some(reg) = PLATFORM_FALLBACK.get() {
         reg.write().remove(name);
     }
+    let mirror = platform_registry_state();
+    let mut guard = mirror.lock();
+    *guard = uninstall_platform(&guard, name);
 }
 
 /// Names the crate's production paths are permitted to install into
@@ -1111,29 +1230,35 @@ pub fn uninstall_platform_fn(name: &str) {
 #[cfg(not(feature = "no_std"))]
 pub const APPROVED_PLATFORM_FN_NAMES: &[&str] = &[];
 
-/// Sorted names currently installed in `PLATFORM_FALLBACK`. Empty
-/// when the `OnceLock` has never been initialized. Used by the sec-2
-/// guard test; also exposable for host-side introspection.
+/// Sorted names currently installed in `PLATFORM_FALLBACK`. Reads from
+/// the `Policy_platform` cell mirror — the cell is the authority for
+/// "is X registered". Used by the sec-2 guard test; also exposable for
+/// host-side introspection.
 #[cfg(not(feature = "no_std"))]
 pub fn installed_platform_fn_names() -> alloc::vec::Vec<alloc::string::String> {
-    match PLATFORM_FALLBACK.get() {
-        Some(reg) => {
-            let mut v: alloc::vec::Vec<alloc::string::String> =
-                reg.read().keys().cloned().collect();
-            v.sort();
-            v
-        }
-        None => alloc::vec::Vec::new(),
-    }
+    let mirror = platform_registry_state();
+    let guard = mirror.lock();
+    platform_names_from_state(&guard)
 }
 
 #[cfg(not(feature = "no_std"))]
 fn dispatch_platform_fallback(name: &str, x: &Object, d: &Object) -> Object {
+    // The cell mirror is the authority on whether `name` is installed.
+    // Reading it here keeps the side-table accessible only by an
+    // identifier the cell handed back, never by raw name lookup.
+    let mirror = platform_registry_state();
+    let identifier = {
+        let guard = mirror.lock();
+        match platform_from_state(&guard, name) {
+            Some(id) => id,
+            None => return Object::Bottom,
+        }
+    };
     let reg = match PLATFORM_FALLBACK.get() {
         Some(r) => r,
         None => return Object::Bottom,
     };
-    let maybe_f = reg.read().get(name).cloned();
+    let maybe_f = reg.read().get(&identifier).cloned();
     match maybe_f {
         Some(f) => f(x, d),
         None => Object::Bottom,
@@ -5094,6 +5219,119 @@ mod tests {
         uninstall_platform_fn("e3_test_readx");
         assert_eq!(result, Object::atom("the-value"),
             "installed closure must have access to D so it can fetch cells");
+    }
+
+    // ── C1 (#687): Policy_platform cell semantics ────────────────────
+
+    #[test]
+    fn platform_from_state_returns_none_on_empty_state() {
+        assert_eq!(platform_from_state(&Object::phi(), "anything"), None);
+    }
+
+    #[test]
+    fn install_platform_round_trips_through_cell() {
+        let s = install_platform(&Object::phi(), "ai_complete", "platform.ai.complete");
+        assert_eq!(
+            platform_from_state(&s, "ai_complete"),
+            Some("platform.ai.complete".to_string()),
+            "install_platform → platform_from_state must round-trip the identifier"
+        );
+    }
+
+    #[test]
+    fn install_platform_does_not_leak_into_fresh_state() {
+        let s = install_platform(&Object::phi(), "ai_complete", "platform.ai.complete");
+        // The installed name is invisible to a state that did not see
+        // the install — Policy_platform is per-state, not process-global.
+        assert_eq!(platform_from_state(&Object::phi(), "ai_complete"), None);
+        // And the original installed-into state still carries it.
+        assert!(platform_from_state(&s, "ai_complete").is_some());
+    }
+
+    #[test]
+    fn install_platform_replaces_prior_identifier_for_same_name() {
+        let s1 = install_platform(&Object::phi(), "ai_complete", "old.id");
+        let s2 = install_platform(&s1, "ai_complete", "new.id");
+        // Only the latest identifier is visible — re-install replaces.
+        assert_eq!(
+            platform_from_state(&s2, "ai_complete"),
+            Some("new.id".to_string())
+        );
+        // Exactly one row remains in the cell.
+        let rows = fetch(POLICY_PLATFORM, &s2).as_seq()
+            .map(|s| s.to_vec()).unwrap_or_default();
+        assert_eq!(rows.len(), 1, "duplicate names must collapse to one row");
+    }
+
+    #[test]
+    fn install_platform_preserves_other_names() {
+        let s = install_platform(&Object::phi(), "alpha", "id.alpha");
+        let s = install_platform(&s, "beta", "id.beta");
+        assert_eq!(platform_from_state(&s, "alpha"), Some("id.alpha".to_string()));
+        assert_eq!(platform_from_state(&s, "beta"), Some("id.beta".to_string()));
+        assert_eq!(platform_names_from_state(&s), vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn platform_from_state_distinguishes_unrelated_names() {
+        let s = install_platform(&Object::phi(), "alpha", "id.alpha");
+        assert_eq!(platform_from_state(&s, "alpha"), Some("id.alpha".to_string()));
+        assert_eq!(platform_from_state(&s, "beta"), None);
+    }
+
+    #[test]
+    fn install_platform_fn_makes_name_visible_through_cell_mirror() {
+        // install_platform_fn updates both the side-table AND the
+        // process-wide Policy_platform mirror. installed_platform_fn_names
+        // reads from the cell, so the install must show up there.
+        install_platform_fn(
+            "c1_cell_mirror_probe",
+            crate::sync::Arc::new(|x: &Object, _d: &Object| x.clone()),
+        );
+        let names = installed_platform_fn_names();
+        assert!(
+            names.contains(&"c1_cell_mirror_probe".to_string()),
+            "install_platform_fn must surface the name through the cell mirror; got {:?}",
+            names
+        );
+        // Cleanup so the sec-2 audit test (which checks the mirror) does
+        // not see this probe name as an unapproved installed entry.
+        uninstall_platform_fn("c1_cell_mirror_probe");
+        let after = installed_platform_fn_names();
+        assert!(
+            !after.contains(&"c1_cell_mirror_probe".to_string()),
+            "uninstall_platform_fn must remove the name from the cell mirror; got {:?}",
+            after
+        );
+    }
+
+    #[test]
+    fn dispatch_platform_fallback_uses_cell_as_authority() {
+        // Identical end-to-end behaviour to the pre-C1 dispatcher: an
+        // installed body is reached, an uninstalled name returns ⊥. The
+        // distinguishing C1 invariant is that the dispatcher consults
+        // the cell mirror, not the side-table directly — verified by
+        // the install_platform_fn test above which proves the mirror is
+        // populated. This test pins the end-to-end contract.
+        install_platform_fn(
+            "c1_dispatch_probe",
+            crate::sync::Arc::new(|x: &Object, _d: &Object| x.clone()),
+        );
+        let out = dispatch_platform_fallback(
+            "c1_dispatch_probe",
+            &Object::atom("hello"),
+            &Object::phi(),
+        );
+        assert_eq!(out, Object::atom("hello"));
+        uninstall_platform_fn("c1_dispatch_probe");
+        let out = dispatch_platform_fallback(
+            "c1_dispatch_probe",
+            &Object::atom("hello"),
+            &Object::phi(),
+        );
+        assert_eq!(out, Object::Bottom,
+            "after uninstall, the cell mirror is empty so the dispatcher \
+             must short-circuit to Bottom without consulting the side-table");
     }
 
     // ── End-to-end: register → invoke → cite (#305 integration) ─
