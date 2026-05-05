@@ -354,9 +354,9 @@ pub fn classify_statements(statements_state: &Object, grammar_state: &Object) ->
 ///
 /// Grouped by Head Noun: one Noun fact per distinct name, with the
 /// most specific objectType across its classifications applied.
-pub fn translate_nouns(classified_state: &Object) -> Vec<Object> {
+pub fn translate_nouns(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     use alloc::collections::BTreeMap;
-    let statement_ids = collect_statement_ids(classified_state);
+    let statement_ids = collect_statement_ids(idx);
     let mut by_noun: BTreeMap<String, &'static str> = BTreeMap::new();
     // Side-tables, keyed by noun name: reference scheme columns, enum
     // values, supertype. Legacy emits all three as bindings on the
@@ -366,19 +366,19 @@ pub fn translate_nouns(classified_state: &Object) -> Vec<Object> {
     let mut enum_values: BTreeMap<String, String> = BTreeMap::new();
     let mut super_types: BTreeMap<String, String> = BTreeMap::new();
     for stmt_id in statement_ids.iter() {
-        let Some(head) = head_noun_for(classified_state, stmt_id) else { continue };
-        let ot = if classifications_contains_any(classified_state, stmt_id,
+        let Some(head) = head_noun_for(idx,stmt_id) else { continue };
+        let ot = if classifications_contains_any(idx,stmt_id,
             &["Abstract Declaration", "Partition Declaration"])
         {
             // Partition Declaration marks the supertype abstract
             // (ORM 2: a partitioned type has no direct instances;
             // every instance is in exactly one subtype).
             Some("abstract")
-        } else if classifications_contains(classified_state, stmt_id, "Entity Type Declaration") {
+        } else if classifications_contains(idx,stmt_id, "Entity Type Declaration") {
             Some("entity")
-        } else if classifications_contains(classified_state, stmt_id, "Value Type Declaration") {
+        } else if classifications_contains(idx,stmt_id, "Value Type Declaration") {
             Some("value")
-        } else if classifications_contains(classified_state, stmt_id, "Subtype Declaration") {
+        } else if classifications_contains(idx,stmt_id, "Subtype Declaration") {
             // `Fact Type is a subtype of Noun` declares `Fact Type`
             // as a Noun alongside the Subtype relation — legacy
             // treats it as entity-typed unless later abstracted.
@@ -402,10 +402,10 @@ pub fn translate_nouns(classified_state: &Object) -> Vec<Object> {
         // them. Re-scan here rather than plumb a separate
         // `Statement_has_Reference_Scheme` cell through the grammar
         // just for this one shape.
-        if classifications_contains_any(classified_state, stmt_id,
+        if classifications_contains_any(idx,stmt_id,
             &["Entity Type Declaration", "Value Type Declaration"])
         {
-            if let Some(text) = statement_text(classified_state, stmt_id) {
+            if let Some(text) = statement_text(idx,stmt_id) {
                 if let Some(rs) = extract_reference_scheme(&text, &head) {
                     ref_schemes.insert(head.clone(), rs);
                 }
@@ -413,15 +413,15 @@ pub fn translate_nouns(classified_state: &Object) -> Vec<Object> {
         }
 
         // Supertype binding: `Subtype is a subtype of Supertype.`
-        if classifications_contains(classified_state, stmt_id, "Subtype Declaration") {
+        if classifications_contains(idx,stmt_id, "Subtype Declaration") {
             if let Some(sup) = role_noun_at_position(classified_state, stmt_id, 1) {
                 super_types.insert(head.clone(), sup);
             }
         }
 
         // Enum values: `The possible values of Priority are 'low', 'medium', 'high'.`
-        if classifications_contains(classified_state, stmt_id, "Enum Values Declaration") {
-            if let Some(text) = statement_text(classified_state, stmt_id) {
+        if classifications_contains(idx,stmt_id, "Enum Values Declaration") {
+            if let Some(text) = statement_text(idx,stmt_id) {
                 if let Some(vals) = extract_enum_values(&text) {
                     enum_values.insert(head.clone(), vals);
                 }
@@ -760,13 +760,13 @@ fn extract_enum_values(text: &str) -> Option<String> {
 /// facts: `(subtype, supertype)` pairs. The subtype is the Statement's
 /// Head Noun; the supertype is the noun at Role Position 1 (the only
 /// other role reference in `A is a subtype of B`).
-pub fn translate_subtypes(classified_state: &Object) -> Vec<Object> {
-    let statement_ids = collect_statement_ids(classified_state);
+pub fn translate_subtypes(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(idx);
     statement_ids.iter().filter_map(|stmt_id| {
-        if !classifications_contains(classified_state, stmt_id, "Subtype Declaration") {
+        if !classifications_contains(idx,stmt_id, "Subtype Declaration") {
             return None;
         }
-        let sub = head_noun_for(classified_state, stmt_id)?;
+        let sub = head_noun_for(idx,stmt_id)?;
         let sup = role_noun_at_position(classified_state, stmt_id, 1)?;
         Some(fact_from_pairs(&[
             ("subtype", sub.as_str()),
@@ -791,8 +791,8 @@ pub fn translate_subtypes(classified_state: &Object) -> Vec<Object> {
 /// the derivation-marker on derivation-rule statements (where the
 /// `*` prefix is a readability marker, not a mode signal on a Fact
 /// Type) doesn't spawn spurious InstanceFacts.
-pub fn translate_derivation_mode_facts(classified_state: &Object) -> Vec<Object> {
-    let statement_ids = collect_statement_ids(classified_state);
+pub fn translate_derivation_mode_facts(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(idx);
     let mut out: Vec<Object> = Vec::new();
     // Same exclude list as translate_fact_types — don't emit on
     // noun declarations or instance facts that incidentally
@@ -814,14 +814,14 @@ pub fn translate_derivation_mode_facts(classified_state: &Object) -> Vec<Object>
         // derivation rule also has a marker but lands as Derivation
         // Rule, not Fact Type Reading, because Stage-1 strips the
         // leading `* ` prefix before tokenization (see #294).
-        if !classifications_contains(classified_state, stmt_id, "Fact Type Reading") {
+        if !classifications_contains(idx,stmt_id, "Fact Type Reading") {
             continue;
         }
-        if classifications_contains_any(classified_state, stmt_id, EXCLUDE) {
+        if classifications_contains_any(idx,stmt_id, EXCLUDE) {
             continue;
         }
-        let Some(mode) = derivation_marker_for(classified_state, stmt_id) else { continue };
-        let Some(text) = statement_text(classified_state, stmt_id) else { continue };
+        let Some(mode) = derivation_marker_for(idx,stmt_id) else { continue };
+        let Some(text) = statement_text(idx,stmt_id) else { continue };
         // Legacy passes `field_name = "Derivation Mode"` — the
         // attribute noun itself — rather than constructing a
         // canonical FT id. This is the attribute-style
@@ -839,17 +839,8 @@ pub fn translate_derivation_mode_facts(classified_state: &Object) -> Vec<Object>
     out
 }
 
-fn derivation_marker_for(state: &Object, stmt_id: &str) -> Option<String> {
-    if let Some(v) = stmt_index_cell::with_borrow(|slot|
-        slot.as_ref().map(|i| i.derivation_markers.get(stmt_id).cloned()))
-    {
-        return v;
-    }
-    fetch_or_phi("Statement_has_Derivation_Marker", state)
-        .as_seq()?
-        .iter()
-        .find(|f| binding(f, "Statement") == Some(stmt_id))
-        .and_then(|f| binding(f, "Derivation_Marker").map(String::from))
+fn derivation_marker_for(idx: &StmtIndex, stmt_id: &str) -> Option<String> {
+    idx.derivation_markers.get(stmt_id).cloned()
 }
 
 /// Translate `Partition Declaration` classifications into `Subtype`
@@ -858,15 +849,15 @@ fn derivation_marker_for(state: &Object, stmt_id: &str) -> Option<String> {
 /// (B, A), (C, A), (D, A). The supertype's abstractness flows
 /// through `translate_nouns` which treats Partition Declaration as
 /// an abstract-marking classification.
-pub fn translate_partitions(classified_state: &Object) -> Vec<Object> {
-    let statement_ids = collect_statement_ids(classified_state);
+pub fn translate_partitions(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(idx);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
-        if !classifications_contains(classified_state, stmt_id, "Partition Declaration") {
+        if !classifications_contains(idx,stmt_id, "Partition Declaration") {
             continue;
         }
-        let Some(sup) = head_noun_for(classified_state, stmt_id) else { continue };
-        let roles = role_refs_for(classified_state, stmt_id);
+        let Some(sup) = head_noun_for(idx,stmt_id) else { continue };
+        let roles = role_refs_for(idx,stmt_id);
         for sub in roles.iter().skip(1) {
             out.push(fact_from_pairs(&[
                 ("subtype", sub.as_str()),
@@ -887,8 +878,8 @@ pub fn translate_partitions(classified_state: &Object) -> Vec<Object> {
 /// current FORML 2 corpus relies on this separation — the noun-
 /// declaration shape `Customer is an entity type` also matches Fact
 /// Type Reading because it has a Role Reference.
-pub fn translate_fact_types(classified_state: &Object) -> (Vec<Object>, Vec<Object>) {
-    let statement_ids = collect_statement_ids(classified_state);
+pub fn translate_fact_types(classified_state: &Object, idx: &StmtIndex) -> (Vec<Object>, Vec<Object>) {
+    let statement_ids = collect_statement_ids(idx);
     let mut ft_facts: Vec<Object> = Vec::new();
     let mut role_facts: Vec<Object> = Vec::new();
     // Exclude every non-fact-type classification. Fact Type Reading
@@ -918,14 +909,14 @@ pub fn translate_fact_types(classified_state: &Object) -> (Vec<Object>, Vec<Obje
         "Deontic Constraint",
     ];
     for stmt_id in statement_ids.iter() {
-        if !classifications_contains(classified_state, stmt_id, "Fact Type Reading") {
+        if !classifications_contains(idx,stmt_id, "Fact Type Reading") {
             continue;
         }
-        if classifications_contains_any(classified_state, stmt_id, EXCLUDE) {
+        if classifications_contains_any(idx,stmt_id, EXCLUDE) {
             continue;
         }
-        let roles = role_refs_for(classified_state, stmt_id);
-        let Some(text) = statement_text(classified_state, stmt_id) else { continue };
+        let roles = role_refs_for(idx,stmt_id);
+        let Some(text) = statement_text(idx,stmt_id) else { continue };
         let reading = text;
         // Mirror legacy's `fact_type_id(role_nouns, verb)` shape:
         // noun parts preserve their declared casing, the verb between
@@ -1087,58 +1078,23 @@ fn possibility_synthetic_fact_type(
 }
 
 /// Role head nouns for a Statement, ordered by Role Position.
-fn role_refs_for(state: &Object, stmt_id: &str) -> Vec<String> {
-    // Indexed fast path — avoids three O(cell_size) scans per call.
-    if let Some(out) = stmt_index_cell::with_borrow(|slot| {
-        let idx = slot.as_ref()?;
-        let role_ids = idx.role_refs_by_stmt.get(stmt_id)?;
-        let mut with_pos: Vec<(usize, String)> = role_ids.iter()
-            .filter_map(|rid| {
-                let pos: usize = idx.role_pos_by_ref.get(rid)?.parse().ok()?;
-                let noun = idx.role_head_noun_by_ref.get(rid)?.clone();
-                Some((pos, noun))
-            })
-            .collect();
-        with_pos.sort_by_key(|(p, _)| *p);
-        Some(with_pos.into_iter().map(|(_, n)| n).collect())
-    }) {
-        return out;
-    }
-    let refs = fetch_or_phi("Statement_has_Role_Reference", state);
-    let Some(refs_seq) = refs.as_seq() else { return Vec::new() };
-    let role_ids: Vec<String> = refs_seq.iter()
-        .filter(|f| binding(f, "Statement") == Some(stmt_id))
-        .filter_map(|f| binding(f, "Role_Reference").map(String::from))
+fn role_refs_for(idx: &StmtIndex, stmt_id: &str) -> Vec<String> {
+    let Some(role_ids) = idx.role_refs_by_stmt.get(stmt_id) else {
+        return Vec::new();
+    };
+    let mut with_pos: Vec<(usize, String)> = role_ids.iter()
+        .filter_map(|rid| {
+            let pos: usize = idx.role_pos_by_ref.get(rid)?.parse().ok()?;
+            let noun = idx.role_head_noun_by_ref.get(rid)?.clone();
+            Some((pos, noun))
+        })
         .collect();
-    let positions = fetch_or_phi("Role_Reference_has_Role_Position", state);
-    let pos_seq = positions.as_seq();
-    let head_nouns = fetch_or_phi("Role_Reference_has_Head_Noun", state);
-    let hn_seq = head_nouns.as_seq();
-    let mut with_pos: Vec<(usize, String)> = role_ids.iter().filter_map(|id| {
-        let pos_s = pos_seq.as_ref()?.iter()
-            .find(|f| binding(f, "Role_Reference") == Some(id.as_str()))
-            .and_then(|f| binding(f, "Role_Position").map(String::from))?;
-        let pos: usize = pos_s.parse().ok()?;
-        let noun = hn_seq.as_ref()?.iter()
-            .find(|f| binding(f, "Role_Reference") == Some(id.as_str()))
-            .and_then(|f| binding(f, "Head_Noun").map(String::from))?;
-        Some((pos, noun))
-    }).collect();
     with_pos.sort_by_key(|(p, _)| *p);
     with_pos.into_iter().map(|(_, n)| n).collect()
 }
 
-fn statement_text(state: &Object, stmt_id: &str) -> Option<String> {
-    if let Some(v) = stmt_index_cell::with_borrow(|slot|
-        slot.as_ref().map(|i| i.texts.get(stmt_id).cloned()))
-    {
-        return v;
-    }
-    fetch_or_phi("Statement_has_Text", state)
-        .as_seq()?
-        .iter()
-        .find(|f| binding(f, "Statement") == Some(stmt_id))
-        .and_then(|f| binding(f, "Text").map(String::from))
+fn statement_text(idx: &StmtIndex, stmt_id: &str) -> Option<String> {
+    idx.texts.get(stmt_id).cloned()
 }
 
 /// Thread-local index cache populated once per parse call (during
@@ -1166,68 +1122,6 @@ struct StmtIndex {
     /// bump rather than cloning 506 heap-allocated `String`s on
     /// every translator call.
     statement_ids: alloc::sync::Arc<Vec<String>>,
-}
-
-// Translator-block cache for the parsed-statement index. Two backends
-// keyed on the `no_std` feature so this module compiles under no_std
-// without losing the per-thread isolation it depends on (#652 /
-// #588 prep):
-//
-//   * std builds: `thread_local! { RefCell<Option<StmtIndex>> }`. Tests
-//     run translator blocks on multiple threads in parallel; thread-
-//     local storage gives each parse its own slot, so concurrent
-//     `StmtIndexGuard::install`/`drop` calls do not stomp on each
-//     other.
-//   * no_std builds: `spin::Mutex<Option<StmtIndex>>`. There is no
-//     `std::thread_local!` available, and the no_std consumers
-//     (UEFI / single-task kernel contexts) do not run concurrent
-//     parses, so a process-global slot under a `Mutex` is correct.
-//     `StmtIndex`'s fields (`HashMap<String, _>`, `Arc<Vec<String>>`)
-//     are all `Send + Sync`, so the inner type is `Option<StmtIndex>`
-//     directly — the mutex supplies the interior mutability that
-//     `RefCell` did before.
-//
-// Re-entrancy audit (translator block, where the guard is installed):
-// every accessor below clones data out of the borrow/lock immediately
-// and drops it; the helpers it calls (`fetch_or_phi`, `binding`) live
-// in `ast.rs` and never touch this cell. The install/drop sites also
-// do not recurse. The guard is held for the duration of the translator
-// block in `parse_forml2_stage12`, which runs entirely on the calling
-// thread without spawning workers, so there is no opportunity for a
-// recursive `with_borrow`/`set` on the same chain.
-mod stmt_index_cell {
-    use super::StmtIndex;
-
-    #[cfg(not(feature = "no_std"))]
-    std::thread_local! {
-        static SLOT: core::cell::RefCell<Option<StmtIndex>>
-            = core::cell::RefCell::new(None);
-    }
-
-    #[cfg(feature = "no_std")]
-    static SLOT: spin::Mutex<Option<StmtIndex>> = spin::Mutex::new(None);
-
-    /// Borrow the cached `StmtIndex` (read-only) and run `f` on it.
-    #[cfg(not(feature = "no_std"))]
-    pub(super) fn with_borrow<R>(f: impl FnOnce(&Option<StmtIndex>) -> R) -> R {
-        SLOT.with(|c| f(&c.borrow()))
-    }
-
-    #[cfg(feature = "no_std")]
-    pub(super) fn with_borrow<R>(f: impl FnOnce(&Option<StmtIndex>) -> R) -> R {
-        f(&SLOT.lock())
-    }
-
-    /// Replace the cached `StmtIndex` (used by `StmtIndexGuard`).
-    #[cfg(not(feature = "no_std"))]
-    pub(super) fn set(value: Option<StmtIndex>) {
-        SLOT.with(|c| *c.borrow_mut() = value);
-    }
-
-    #[cfg(feature = "no_std")]
-    pub(super) fn set(value: Option<StmtIndex>) {
-        *SLOT.lock() = value;
-    }
 }
 
 fn build_stmt_index(state: &Object) -> StmtIndex {
@@ -1284,24 +1178,6 @@ fn build_stmt_index(state: &Object) -> StmtIndex {
     idx
 }
 
-/// RAII guard so the thread-local index is always cleared at the end
-/// of the translator block, even on early return or panic.
-struct StmtIndexGuard;
-
-impl StmtIndexGuard {
-    fn install(state: &Object) -> Self {
-        let idx = build_stmt_index(state);
-        stmt_index_cell::set(Some(idx));
-        StmtIndexGuard
-    }
-}
-
-impl Drop for StmtIndexGuard {
-    fn drop(&mut self) {
-        stmt_index_cell::set(None);
-    }
-}
-
 /// Translate `Instance Fact` classifications into `InstanceFact` cell
 /// facts. Binary instance-fact shape (subject + field + object):
 ///
@@ -1320,8 +1196,8 @@ impl Drop for StmtIndexGuard {
 ///
 /// Unary instance-facts (value assertions like `Customer 'alice' is
 /// active`) currently emit with empty objectNoun/objectValue.
-pub fn translate_instance_facts(classified_state: &Object) -> Vec<Object> {
-    translate_instance_facts_with_ft_ids(classified_state, &[])
+pub fn translate_instance_facts(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+    translate_instance_facts_with_ft_ids(classified_state, idx, &[])
 }
 
 /// Variant that can resolve `fieldName` to a canonical FT id when the
@@ -1341,17 +1217,18 @@ pub fn translate_instance_facts(classified_state: &Object) -> Vec<Object> {
 /// records for the role-0 ↔ role-1 gap.
 pub fn translate_instance_facts_with_ft_ids(
     classified_state: &Object,
+    idx: &StmtIndex,
     declared_ft_ids: &[String],
 ) -> Vec<Object> {
-    let statement_ids = collect_statement_ids(classified_state);
+    let statement_ids = collect_statement_ids(idx);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
-        if !classifications_contains(classified_state, stmt_id, "Instance Fact") {
+        if !classifications_contains(idx,stmt_id, "Instance Fact") {
             continue;
         }
-        let roles = role_refs_with_literals(classified_state, stmt_id);
+        let roles = role_refs_with_literals(idx,stmt_id);
         if roles.is_empty() { continue; }
-        let verb = statement_verb(classified_state, stmt_id).unwrap_or_default();
+        let verb = statement_verb(idx,stmt_id).unwrap_or_default();
         let subject_noun = &roles[0].0;
         let subject_value = roles[0].1.as_deref().unwrap_or("");
         let (object_noun, object_value) = roles.get(1)
@@ -1379,7 +1256,7 @@ pub fn translate_instance_facts_with_ft_ids(
         } else {
             // Strip role literals from the statement text to recover
             // the canonical FT reading shape, then build the id.
-            let text = statement_text(classified_state, stmt_id)
+            let text = statement_text(idx,stmt_id)
                 .unwrap_or_default();
             let role_nouns: Vec<String> = roles.iter()
                 .map(|(n, _)| n.clone()).collect();
@@ -1455,64 +1332,24 @@ fn strip_role_literals(text: &str, roles: &[(String, Option<String>)]) -> String
 
 /// Role head nouns AND literal values for a Statement, ordered by
 /// Role Position. Returns `Vec<(noun, Option<literal>)>`.
-fn role_refs_with_literals(state: &Object, stmt_id: &str) -> Vec<(String, Option<String>)> {
-    if let Some(out) = stmt_index_cell::with_borrow(|slot| {
-        let idx = slot.as_ref()?;
-        let role_ids = idx.role_refs_by_stmt.get(stmt_id)?;
-        let mut with_pos: Vec<(usize, String, Option<String>)> = role_ids.iter()
-            .filter_map(|rid| {
-                let pos: usize = idx.role_pos_by_ref.get(rid)?.parse().ok()?;
-                let noun = idx.role_head_noun_by_ref.get(rid)?.clone();
-                let lit = idx.role_literal_by_ref.get(rid).cloned();
-                Some((pos, noun, lit))
-            })
-            .collect();
-        with_pos.sort_by_key(|(p, _, _)| *p);
-        Some(with_pos.into_iter().map(|(_, n, l)| (n, l)).collect())
-    }) {
-        return out;
-    }
-    let refs = fetch_or_phi("Statement_has_Role_Reference", state);
-    let Some(refs_seq) = refs.as_seq() else { return Vec::new() };
-    let role_ids: Vec<String> = refs_seq.iter()
-        .filter(|f| binding(f, "Statement") == Some(stmt_id))
-        .filter_map(|f| binding(f, "Role_Reference").map(String::from))
+fn role_refs_with_literals(idx: &StmtIndex, stmt_id: &str) -> Vec<(String, Option<String>)> {
+    let Some(role_ids) = idx.role_refs_by_stmt.get(stmt_id) else {
+        return Vec::new();
+    };
+    let mut with_pos: Vec<(usize, String, Option<String>)> = role_ids.iter()
+        .filter_map(|rid| {
+            let pos: usize = idx.role_pos_by_ref.get(rid)?.parse().ok()?;
+            let noun = idx.role_head_noun_by_ref.get(rid)?.clone();
+            let lit = idx.role_literal_by_ref.get(rid).cloned();
+            Some((pos, noun, lit))
+        })
         .collect();
-    let positions = fetch_or_phi("Role_Reference_has_Role_Position", state);
-    let pos_seq = positions.as_seq();
-    let head_nouns = fetch_or_phi("Role_Reference_has_Head_Noun", state);
-    let hn_seq = head_nouns.as_seq();
-    let literals = fetch_or_phi("Role_Reference_has_Literal_Value", state);
-    let lit_seq = literals.as_seq();
-    let mut with_pos: Vec<(usize, String, Option<String>)> = role_ids.iter().filter_map(|id| {
-        let pos_s = pos_seq.as_ref()?.iter()
-            .find(|f| binding(f, "Role_Reference") == Some(id.as_str()))
-            .and_then(|f| binding(f, "Role_Position").map(String::from))?;
-        let pos: usize = pos_s.parse().ok()?;
-        let noun = hn_seq.as_ref()?.iter()
-            .find(|f| binding(f, "Role_Reference") == Some(id.as_str()))
-            .and_then(|f| binding(f, "Head_Noun").map(String::from))?;
-        let literal = lit_seq.as_ref()
-            .and_then(|s| s.iter()
-                .find(|f| binding(f, "Role_Reference") == Some(id.as_str()))
-                .and_then(|f| binding(f, "Literal_Value").map(String::from)));
-        Some((pos, noun, literal))
-    }).collect();
     with_pos.sort_by_key(|(p, _, _)| *p);
     with_pos.into_iter().map(|(_, n, l)| (n, l)).collect()
 }
 
-fn statement_verb(state: &Object, stmt_id: &str) -> Option<String> {
-    if let Some(v) = stmt_index_cell::with_borrow(|slot|
-        slot.as_ref().map(|i| i.verbs.get(stmt_id).cloned()))
-    {
-        return v;
-    }
-    fetch_or_phi("Statement_has_Verb", state)
-        .as_seq()?
-        .iter()
-        .find(|f| binding(f, "Statement") == Some(stmt_id))
-        .and_then(|f| binding(f, "Verb").map(String::from))
+fn statement_verb(idx: &StmtIndex, stmt_id: &str) -> Option<String> {
+    idx.verbs.get(stmt_id).cloned()
 }
 
 /// Translate `Ring Constraint` classifications into `Constraint` cell
@@ -1531,9 +1368,10 @@ fn statement_verb(state: &Object, stmt_id: &str) -> Option<String> {
 /// `text` (Statement text), and `entity` (Head Noun). Spans
 /// (fact_type_id resolution) are left empty — a follow-up
 /// commit will populate them once the FactType cell exists.
-pub fn translate_ring_constraints(classified_state: &Object) -> Vec<Object> {
+pub fn translate_ring_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     translate_ring_constraints_with_tables(
         classified_state,
+        idx,
         &RingKindTable::boot(),
         &ConditionalRingMatrix::boot(),
     )
@@ -1546,10 +1384,11 @@ pub fn translate_ring_constraints(classified_state: &Object) -> Vec<Object> {
 /// `translate_ring_constraints`.
 pub fn translate_ring_constraints_with_tables(
     classified_state: &Object,
+    idx: &StmtIndex,
     ring_kinds: &RingKindTable,
     conditional_matrix: &ConditionalRingMatrix,
 ) -> Vec<Object> {
-    let statement_ids = collect_statement_ids(classified_state);
+    let statement_ids = collect_statement_ids(idx);
     let declared_nouns = declared_noun_names(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
@@ -1561,10 +1400,10 @@ pub fn translate_ring_constraints_with_tables(
         //       marker rule — matches legacy `try_ring`'s pass-2b
         //       conditional-pattern dispatcher.
         let is_classified_ring = classifications_contains(
-            classified_state, stmt_id, "Ring Constraint");
-        let text = statement_text(classified_state, stmt_id).unwrap_or_default();
+            idx, stmt_id, "Ring Constraint");
+        let text = statement_text(idx,stmt_id).unwrap_or_default();
         let (kind, kind_source) = if is_classified_ring {
-            let marker = match trailing_marker_for(classified_state, stmt_id) {
+            let marker = match trailing_marker_for(idx,stmt_id) {
                 Some(m) => m,
                 None => continue,
             };
@@ -1580,7 +1419,7 @@ pub fn translate_ring_constraints_with_tables(
             continue;
         };
         let _ = kind_source;
-        let entity = head_noun_for(classified_state, stmt_id).unwrap_or_default();
+        let entity = head_noun_for(idx,stmt_id).unwrap_or_default();
         out.push(fact_from_pairs(&[
             ("id",       text.as_str()),
             ("kind",     kind.as_str()),
@@ -1707,9 +1546,9 @@ fn encode_conditional_ring_pattern(
 /// will migrate in a follow-up commit once the
 /// FactType + Role cells have been populated by Stage-2 earlier in
 /// the pipeline.
-pub fn translate_derivation_rules(classified_state: &Object) -> Vec<Object> {
+pub fn translate_derivation_rules(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     translate_derivation_rules_with_matrix(
-        classified_state, &ConditionalRingMatrix::boot())
+        classified_state, idx, &ConditionalRingMatrix::boot())
 }
 
 /// MC2 (#713) cell-driven variant. Stage-2's
@@ -1718,23 +1557,24 @@ pub fn translate_derivation_rules(classified_state: &Object) -> Vec<Object> {
 /// arbitration check. Bare callers get the `boot()` fallback.
 pub fn translate_derivation_rules_with_matrix(
     classified_state: &Object,
+    idx: &StmtIndex,
     conditional_matrix: &ConditionalRingMatrix,
 ) -> Vec<Object> {
-    let statement_ids = collect_statement_ids(classified_state);
+    let statement_ids = collect_statement_ids(idx);
     let declared_nouns = declared_noun_names(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
-        if !classifications_contains(classified_state, stmt_id, "Derivation Rule") {
+        if !classifications_contains(idx,stmt_id, "Derivation Rule") {
             continue;
         }
-        let text = statement_text(classified_state, stmt_id).unwrap_or_default();
+        let text = statement_text(idx,stmt_id).unwrap_or_default();
         // Arbitrate with `translate_set_constraints`: when the
         // Statement also classifies as Subset Constraint AND the
         // antecedent has ≥2 distinct declared nouns, the SS
         // translator claims this statement — skip DR emission.
         // Legacy's pass-2b priority gives try_subset first dibs;
         // only on semantic failure does try_derivation take over.
-        let is_subset = classifications_contains(classified_state, stmt_id, "Subset Constraint");
+        let is_subset = classifications_contains(idx,stmt_id, "Subset Constraint");
         if is_subset && antecedent_distinct_nouns(&text, &declared_nouns) >= 2 {
             continue;
         }
@@ -1771,9 +1611,10 @@ pub fn translate_derivation_rules_with_matrix(
 /// `and`-separated chunk is a clause candidate.
 pub fn translate_unresolved_clauses(
     classified_state: &Object,
+    idx: &StmtIndex,
     _ft_facts: &[Object],
 ) -> Vec<Object> {
-    let statement_ids = collect_statement_ids(classified_state);
+    let statement_ids = collect_statement_ids(idx);
     // Build the set of WORDS that appear anywhere in a declared noun
     // name — `HTTP Status` declared contributes both `HTTP` and
     // `Status`. A clause is resolved if every Title-case word it
@@ -1787,8 +1628,8 @@ pub fn translate_unresolved_clauses(
     let _ = &declared;
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
-        if !classifications_contains(classified_state, stmt_id, "Derivation Rule") { continue; }
-        let text = match statement_text(classified_state, stmt_id) {
+        if !classifications_contains(idx,stmt_id, "Derivation Rule") { continue; }
+        let text = match statement_text(idx,stmt_id) {
             Some(t) => t, None => continue,
         };
         let split_keywords: &[&str] = &[" iff ", " if ", " when "];
@@ -1855,14 +1696,14 @@ fn derivation_rule_id(text: &str) -> String {
 /// The Value Type `Noun` fact is still emitted by `translate_nouns`
 /// from the preceding `Priority is a value type.` statement — this
 /// translator only contributes the value list.
-pub fn translate_enum_values(classified_state: &Object) -> Vec<Object> {
-    let statement_ids = collect_statement_ids(classified_state);
+pub fn translate_enum_values(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(idx);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
-        if !classifications_contains(classified_state, stmt_id, "Enum Values Declaration") {
+        if !classifications_contains(idx,stmt_id, "Enum Values Declaration") {
             continue;
         }
-        let Some(noun) = head_noun_for(classified_state, stmt_id) else { continue };
+        let Some(noun) = head_noun_for(idx,stmt_id) else { continue };
         let values = enum_values_for(classified_state, stmt_id);
         if values.is_empty() { continue; }
         let mut pairs: Vec<(String, String)> = Vec::new();
@@ -1895,20 +1736,20 @@ pub fn translate_enum_values(classified_state: &Object) -> Vec<Object> {
 /// `translate_cardinality_constraints` because the grammar keys the
 /// two families on different tokens (Quantifier vs Constraint
 /// Keyword vs Trailing Marker).
-pub fn translate_set_constraints(classified_state: &Object) -> Vec<Object> {
-    let statement_ids = collect_statement_ids(classified_state);
+pub fn translate_set_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(idx);
     let declared_nouns = declared_noun_names(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
-        let text = statement_text(classified_state, stmt_id).unwrap_or_default();
-        let is_dr = classifications_contains(classified_state, stmt_id, "Derivation Rule");
-        let kind = if classifications_contains(classified_state, stmt_id, "Equality Constraint") {
+        let text = statement_text(idx,stmt_id).unwrap_or_default();
+        let is_dr = classifications_contains(idx,stmt_id, "Derivation Rule");
+        let kind = if classifications_contains(idx,stmt_id, "Equality Constraint") {
             // `iff` keyword also classifies as Derivation Rule; prefer
             // DR when no `if and only if` multi-clause keyword fires
             // (that's the grammar's EQ signal, not mere `iff`).
             if is_dr { continue; }
             "EQ"
-        } else if classifications_contains(classified_state, stmt_id, "Subset Constraint") {
+        } else if classifications_contains(idx,stmt_id, "Subset Constraint") {
             // SS classification fires on the synthetic `if some then
             // that` constraint keyword. Legacy's `try_subset` also
             // requires the antecedent to contain 2+ DISTINCT declared
@@ -1920,19 +1761,19 @@ pub fn translate_set_constraints(classified_state: &Object) -> Vec<Object> {
                 continue;
             }
             "SS"
-        } else if classifications_contains(classified_state, stmt_id, "Exclusive-Or Constraint") {
+        } else if classifications_contains(idx,stmt_id, "Exclusive-Or Constraint") {
             if is_dr { continue; }
             "XO"
-        } else if classifications_contains(classified_state, stmt_id, "Or Constraint") {
+        } else if classifications_contains(idx,stmt_id, "Or Constraint") {
             if is_dr { continue; }
             "OR"
-        } else if classifications_contains(classified_state, stmt_id, "Exclusion Constraint") {
+        } else if classifications_contains(idx,stmt_id, "Exclusion Constraint") {
             if is_dr { continue; }
             "XC"
         } else {
             continue;
         };
-        let entity = head_noun_for(classified_state, stmt_id).unwrap_or_default();
+        let entity = head_noun_for(idx,stmt_id).unwrap_or_default();
         out.push(fact_from_pairs(&[
             ("id",       text.as_str()),
             ("kind",     kind),
@@ -2005,15 +1846,15 @@ fn antecedent_distinct_nouns(text: &str, declared: &[String]) -> usize {
 /// `translate_fact_types`, and span binding is a follow-up pass that
 /// reads both cells. This matches the deferred-span shape used by
 /// `translate_ring_constraints`.
-pub fn translate_cardinality_constraints(classified_state: &Object) -> Vec<Object> {
-    let statement_ids = collect_statement_ids(classified_state);
+pub fn translate_cardinality_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(idx);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
         // A Statement classified as Derivation Rule never contributes
         // a cardinality Constraint — the `iff` keyword makes the whole
         // sentence a rule, even when it incidentally contains a `some`
         // quantifier inside an antecedent clause.
-        if classifications_contains(classified_state, stmt_id, "Derivation Rule") { continue; }
+        if classifications_contains(idx,stmt_id, "Derivation Rule") { continue; }
         // Same exclusion applies for deontic constraints: a sentence
         // carrying `It is forbidden/obligatory/permitted that …` is a
         // deontic over the body's fact pattern, NOT an alethic UC/MC
@@ -2024,11 +1865,11 @@ pub fn translate_cardinality_constraints(classified_state: &Object) -> Vec<Objec
         // reading the Constraint cell would treat the alethic MC as
         // an obligation, the opposite of the author's intent.
         if deontic_operator_for(classified_state, stmt_id).is_some() { continue; }
-        let text = statement_text(classified_state, stmt_id).unwrap_or_default();
-        let entity = head_noun_for(classified_state, stmt_id).unwrap_or_default();
-        let is_fc = classifications_contains(classified_state, stmt_id, "Frequency Constraint");
-        let is_uc = classifications_contains(classified_state, stmt_id, "Uniqueness Constraint");
-        let is_mc = classifications_contains(classified_state, stmt_id, "Mandatory Role Constraint");
+        let text = statement_text(idx,stmt_id).unwrap_or_default();
+        let entity = head_noun_for(idx,stmt_id).unwrap_or_default();
+        let is_fc = classifications_contains(idx,stmt_id, "Frequency Constraint");
+        let is_uc = classifications_contains(idx,stmt_id, "Uniqueness Constraint");
+        let is_mc = classifications_contains(idx,stmt_id, "Mandatory Role Constraint");
         if !(is_fc || is_uc || is_mc) { continue; }
 
         // `exactly one` splits into UC + MC per legacy behavior
@@ -2076,14 +1917,14 @@ pub fn translate_cardinality_constraints(classified_state: &Object) -> Vec<Objec
 /// from the EnumValues cell directly (see
 /// `parse_forml2::enum_values_for_noun`) and attaches the constraint
 /// to every role where the noun appears.
-pub fn translate_value_constraints(classified_state: &Object) -> Vec<Object> {
-    let statement_ids = collect_statement_ids(classified_state);
+pub fn translate_value_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+    let statement_ids = collect_statement_ids(idx);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
-        if !classifications_contains(classified_state, stmt_id, "Value Constraint") {
+        if !classifications_contains(idx,stmt_id, "Value Constraint") {
             continue;
         }
-        let Some(noun) = head_noun_for(classified_state, stmt_id) else { continue };
+        let Some(noun) = head_noun_for(idx,stmt_id) else { continue };
         let id = alloc::format!("VC:{}", noun);
         let text = alloc::format!("{} has a value constraint", noun);
         out.push(fact_from_pairs(&[
@@ -2111,9 +1952,9 @@ fn enum_values_for(state: &Object, stmt_id: &str) -> Vec<String> {
 /// cell facts with modality="deontic" and the stripped deontic
 /// operator. Entity defaults to the Head Noun of the body (after
 /// the `It is X that` prefix was stripped by Stage-1).
-pub fn translate_deontic_constraints(classified_state: &Object) -> Vec<Object> {
+pub fn translate_deontic_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     translate_deontic_constraints_with_table(
-        classified_state, &DeonticShapeTable::boot())
+        classified_state, idx, &DeonticShapeTable::boot())
 }
 
 /// MC2 (#713) cell-driven variant. The (kind, modality) pair emitted
@@ -2127,9 +1968,10 @@ pub fn translate_deontic_constraints(classified_state: &Object) -> Vec<Object> {
 /// `kind="UC", modality="deontic"` defaults.
 pub fn translate_deontic_constraints_with_table(
     classified_state: &Object,
+    idx: &StmtIndex,
     deontic_shapes: &DeonticShapeTable,
 ) -> Vec<Object> {
-    let statement_ids = collect_statement_ids(classified_state);
+    let statement_ids = collect_statement_ids(idx);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
         // Per forml2-grammar.md:141-143, a Statement is classified as
@@ -2147,12 +1989,12 @@ pub fn translate_deontic_constraints_with_table(
         // still emit a deontic-modality constraint.
         let op = deontic_operator_for(classified_state, stmt_id);
         let classified_deontic = classifications_contains(
-            classified_state, stmt_id, "Deontic Constraint",
+            idx, stmt_id, "Deontic Constraint",
         );
         if op.is_none() && !classified_deontic { continue; }
-        let text = statement_text(classified_state, stmt_id).unwrap_or_default();
+        let text = statement_text(idx,stmt_id).unwrap_or_default();
         let op_str = op.unwrap_or_default();
-        let entity = head_noun_for(classified_state, stmt_id).unwrap_or_default();
+        let entity = head_noun_for(idx,stmt_id).unwrap_or_default();
         // Resolve emission shape via the cell-driven table. Fall back
         // to the first table row when the operator isn't enumerated
         // (defensive — the parallel-enum invariant guarantees a row
@@ -2193,17 +2035,8 @@ fn ring_adjective_to_kind(marker: &str, table: &RingKindTable)
     table.kind_for(marker).map(String::from)
 }
 
-fn trailing_marker_for(state: &Object, stmt_id: &str) -> Option<String> {
-    if let Some(v) = stmt_index_cell::with_borrow(|slot|
-        slot.as_ref().map(|i| i.trailing_markers.get(stmt_id).cloned()))
-    {
-        return v;
-    }
-    fetch_or_phi("Statement_has_Trailing_Marker", state)
-        .as_seq()?
-        .iter()
-        .find(|f| binding(f, "Statement") == Some(stmt_id))
-        .and_then(|f| binding(f, "Trailing_Marker").map(String::from))
+fn trailing_marker_for(idx: &StmtIndex, stmt_id: &str) -> Option<String> {
+    idx.trailing_markers.get(stmt_id).cloned()
 }
 
 fn role_noun_at_position(state: &Object, stmt_id: &str, position: usize) -> Option<String> {
@@ -2229,94 +2062,34 @@ fn role_noun_at_position(state: &Object, stmt_id: &str, position: usize) -> Opti
         .and_then(|f| binding(f, "Head_Noun").map(String::from))
 }
 
-fn head_noun_for(state: &Object, stmt_id: &str) -> Option<String> {
-    if let Some(v) = stmt_index_cell::with_borrow(|slot|
-        slot.as_ref().map(|i| i.head_nouns.get(stmt_id).cloned()))
-    {
-        return v;
-    }
-    fetch_or_phi("Statement_has_Head_Noun", state)
-        .as_seq()?
-        .iter()
-        .find(|f| binding(f, "Statement") == Some(stmt_id))
-        .and_then(|f| binding(f, "Head_Noun").map(String::from))
+fn head_noun_for(idx: &StmtIndex, stmt_id: &str) -> Option<String> {
+    idx.head_nouns.get(stmt_id).cloned()
 }
 
 /// Return the list of classification names attached to a given
 /// Statement id.
-pub fn classifications_for(state: &Object, statement_id: &str) -> Vec<String> {
-    if let Some(v) = stmt_index_cell::with_borrow(|slot|
-        slot.as_ref().map(|i|
-            i.classifications.get(statement_id).cloned().unwrap_or_default()))
-    {
-        return v;
-    }
-    fetch_or_phi("Statement_has_Classification", state)
-        .as_seq()
-        .map(|facts| facts.iter()
-            .filter(|f| binding(f, "Statement") == Some(statement_id))
-            .filter_map(|f| binding(f, "Classification").map(String::from))
-            .collect())
-        .unwrap_or_default()
+pub fn classifications_for(idx: &StmtIndex, statement_id: &str) -> Vec<String> {
+    idx.classifications.get(statement_id).cloned().unwrap_or_default()
 }
 
 /// Fast membership check — returns `true` when `statement_id` carries
 /// a classification equal to `name`. Avoids the `Vec<String>` clone
-/// that `classifications_for` pays on every call; translators that
-/// only need boolean membership can loop over statements at ~O(1) per
-/// check instead of paying an allocation plus a linear scan of a
-/// cloned vector.
-pub fn classifications_contains(state: &Object, statement_id: &str, name: &str) -> bool {
-    let via_index: Option<bool> = stmt_index_cell::with_borrow(|slot|
-        slot.as_ref().map(|i|
-            i.classifications.get(statement_id)
-                .is_some_and(|v| v.iter().any(|k| k == name))));
-    if let Some(b) = via_index { return b; }
-    fetch_or_phi("Statement_has_Classification", state)
-        .as_seq()
-        .map(|facts| facts.iter().any(|f|
-            binding(f, "Statement") == Some(statement_id)
-            && binding(f, "Classification") == Some(name)))
-        .unwrap_or(false)
+/// that `classifications_for` pays on every call.
+pub fn classifications_contains(idx: &StmtIndex, statement_id: &str, name: &str) -> bool {
+    idx.classifications.get(statement_id)
+        .is_some_and(|v| v.iter().any(|k| k == name))
 }
 
 /// Fast disjoint-membership check — returns `true` when any of the
-/// given names matches a classification on `statement_id`. Translators
-/// use this for "does this statement carry ANY excluded kind" and
-/// "is this a fact-type-like statement" tests; preferring this over a
-/// clone-and-iterate pattern saves per-call allocation.
-pub fn classifications_contains_any(state: &Object, statement_id: &str, names: &[&str]) -> bool {
-    let via_index: Option<bool> = stmt_index_cell::with_borrow(|slot|
-        slot.as_ref().map(|i|
-            i.classifications.get(statement_id)
-                .is_some_and(|v| v.iter().any(|k| names.iter().any(|n| n == k)))));
-    if let Some(b) = via_index { return b; }
-    fetch_or_phi("Statement_has_Classification", state)
-        .as_seq()
-        .map(|facts| facts.iter().any(|f|
-            binding(f, "Statement") == Some(statement_id)
-            && binding(f, "Classification").is_some_and(|k| names.iter().any(|n| *n == k))))
-        .unwrap_or(false)
+/// given names matches a classification on `statement_id`.
+pub fn classifications_contains_any(idx: &StmtIndex, statement_id: &str, names: &[&str]) -> bool {
+    idx.classifications.get(statement_id)
+        .is_some_and(|v| v.iter().any(|k| names.iter().any(|n| *n == k.as_str())))
 }
 
-/// Collect all Statement ids from the `Statement` cell. When the
-/// thread-local `StmtIndex` is installed this is a refcount bump on
-/// the cached `Arc<Vec<String>>` rather than a full `Vec<String>`
-/// clone; the 15+ translators that call it per parse therefore
-/// don't collectively pay the allocation cost of ~500 strings each.
-fn collect_statement_ids(state: &Object) -> alloc::sync::Arc<Vec<String>> {
-    if let Some(v) = stmt_index_cell::with_borrow(|slot|
-        slot.as_ref().map(|i| i.statement_ids.clone()))
-    {
-        return v;
-    }
-    alloc::sync::Arc::new(
-        fetch_or_phi("Statement", state)
-            .as_seq()
-            .map(|facts| facts.iter()
-                .filter_map(|f| binding(f, "id").map(String::from))
-                .collect())
-            .unwrap_or_default())
+/// Collect all Statement ids — refcount bump on the cached `Arc<Vec<String>>`.
+fn collect_statement_ids(idx: &StmtIndex) -> alloc::sync::Arc<Vec<String>> {
+    idx.statement_ids.clone()
 }
 
 /// End-to-end Stage-1 + Stage-2 pipeline: FORML 2 source text → final
@@ -3137,15 +2910,14 @@ fn parse_to_state_via_stage12_impl(
     if trace { crate::diag!("[s12] classify: {:?}", t_cls.elapsed()); }
 
     let t_tr = Instant::now();
-    // Install a thread-local statement index. `classifications_for`
-    // / `head_noun_for` / `statement_text` / `trailing_marker_for` /
-    // `derivation_marker_for` short-circuit cell scans by hitting
-    // this index — the 15 translators each called those helpers
-    // per statement, so without the cache core.md paid ~1M fact
-    // scans (~12ms) that now collapse to O(1) HashMap lookups.
-    // RAII guard resets on Drop so early returns / panics can't
-    // leave a stale index.
-    let _idx_guard = StmtIndexGuard::install(&classified);
+    // Build the statement index once, thread it explicitly through
+    // every translator. C2 (#688): the prior thread-local SLOT made
+    // translator results depend on which ancestor frame populated it,
+    // a CRITICAL purity violation in the meta-circular parser. Helpers
+    // (`classifications_for` / `head_noun_for` / `statement_text` /
+    // `trailing_marker_for` / `derivation_marker_for`) take `&StmtIndex`
+    // directly; no implicit ambient state.
+    let idx = build_stmt_index(&classified);
     macro_rules! tt { ($name:expr, $e:expr) => {{
         let t = Instant::now();
         let v = $e;
@@ -3161,7 +2933,7 @@ fn parse_to_state_via_stage12_impl(
     // antecedent-noun-count arbitration and
     // `translate_ring_constraints`' `conditional_ring_kind` helper
     // both need the domain-level catalog.
-    let noun_facts = tt!("nouns", translate_nouns(&classified));
+    let noun_facts = tt!("nouns", translate_nouns(&classified, &idx));
     let classified = {
         let mut map: HashMap<String, Object> = match &classified {
             Object::Map(m) => m.clone(),
@@ -3171,9 +2943,9 @@ fn parse_to_state_via_stage12_impl(
         Object::Map(map)
     };
 
-    let mut subtype_facts: Vec<Object> = tt!("subtypes", translate_subtypes(&classified));
-    subtype_facts.extend(tt!("partitions", translate_partitions(&classified)));
-    let (mut ft_facts, mut role_facts) = tt!("fact_types", translate_fact_types(&classified));
+    let mut subtype_facts: Vec<Object> = tt!("subtypes", translate_subtypes(&classified, &idx));
+    subtype_facts.extend(tt!("partitions", translate_partitions(&classified, &idx)));
+    let (mut ft_facts, mut role_facts) = tt!("fact_types", translate_fact_types(&classified, &idx));
     // Append possibility-synthetic FactType + Role facts.
     for (ft_fact, role_fs) in &synthetic_fts_and_roles {
         // De-dup: skip if translate_fact_types already emitted this id.
@@ -3186,12 +2958,12 @@ fn parse_to_state_via_stage12_impl(
     }
     let mut constraint_facts: Vec<Object> = tt!("ring",
         translate_ring_constraints_with_tables(
-            &classified, &ring_kinds, &conditional_matrix));
-    constraint_facts.extend(tt!("cardinality", translate_cardinality_constraints(&classified)));
-    constraint_facts.extend(tt!("set", translate_set_constraints(&classified)));
-    constraint_facts.extend(tt!("value_c", translate_value_constraints(&classified)));
+            &classified, &idx, &ring_kinds, &conditional_matrix));
+    constraint_facts.extend(tt!("cardinality", translate_cardinality_constraints(&classified, &idx)));
+    constraint_facts.extend(tt!("set", translate_set_constraints(&classified, &idx)));
+    constraint_facts.extend(tt!("value_c", translate_value_constraints(&classified, &idx)));
     constraint_facts.extend(tt!("deontic",
-        translate_deontic_constraints_with_table(&classified, &deontic_shapes)));
+        translate_deontic_constraints_with_table(&classified, &idx, &deontic_shapes)));
     // Enrich each constraint with span0_factTypeId / span0_roleIndex
     // (and span1_*) bindings derived from the Role cell. Legacy emits
     // these at constraint-translation time; check.rs, command.rs and
@@ -3201,16 +2973,16 @@ fn parse_to_state_via_stage12_impl(
     constraint_facts = tt!("enrich_spans",
         enrich_constraints_with_spans(&constraint_facts, &role_facts));
     let derivation_facts = tt!("derivation",
-        translate_derivation_rules_with_matrix(&classified, &conditional_matrix));
+        translate_derivation_rules_with_matrix(&classified, &idx, &conditional_matrix));
     let unresolved_clause_facts = tt!("unresolved",
-        translate_unresolved_clauses(&classified, &ft_facts));
+        translate_unresolved_clauses(&classified, &idx, &ft_facts));
     let declared_ft_ids: Vec<String> = ft_facts.iter()
         .filter_map(|f| binding(f, "id").map(String::from))
         .collect();
     let mut instance_fact_facts = tt!("instance_facts",
-        translate_instance_facts_with_ft_ids(&classified, &declared_ft_ids));
-    instance_fact_facts.extend(tt!("deriv_mode", translate_derivation_mode_facts(&classified)));
-    let enum_values_facts = tt!("enum_values", translate_enum_values(&classified));
+        translate_instance_facts_with_ft_ids(&classified, &idx, &declared_ft_ids));
+    instance_fact_facts.extend(tt!("deriv_mode", translate_derivation_mode_facts(&classified, &idx)));
+    let enum_values_facts = tt!("enum_values", translate_enum_values(&classified, &idx));
     if trace { crate::diag!("[s12] translators: {:?}", t_tr.elapsed()); }
     if trace { crate::diag!("[s12] TOTAL: {:?}", t0.elapsed()); }
 
@@ -3511,6 +3283,11 @@ mod tests {
         parse_to_state(grammar).expect("grammar must parse")
     }
 
+    /// Test helper: build a fresh StmtIndex from a classified state.
+    /// C2 (#688): translators now take `&StmtIndex` explicitly. Tests
+    /// that call helpers / translators directly build their own index.
+    fn idx(state: &Object) -> StmtIndex { build_stmt_index(state) }
+
     /// Stage-0 bootstrap must produce every cell `compile_to_defs_state`
     /// and `specialize_grammar_classifiers` read from. Specific counts
     /// are pinned to the committed `readings/forml2-grammar.md` (23
@@ -3588,7 +3365,7 @@ mod tests {
         let stmt = stage1_state(
             "s1", "Customer is an entity type.", &["Customer"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Entity Type Declaration"),
             "expected Entity Type Declaration classification; got {:?}", kinds);
     }
@@ -3598,7 +3375,7 @@ mod tests {
         let stmt = stage1_state(
             "s1", "Priority is a value type.", &["Priority"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Value Type Declaration"),
             "expected Value Type Declaration classification; got {:?}", kinds);
     }
@@ -3607,7 +3384,7 @@ mod tests {
     fn abstract_declaration_is_classified() {
         let stmt = stage1_state("s1", "Request is abstract.", &["Request"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Abstract Declaration"),
             "expected Abstract Declaration; got {:?}", kinds);
     }
@@ -3622,7 +3399,7 @@ mod tests {
         for (text, nouns) in cases {
             let stmt = stage1_state("s1", text, nouns);
             let classified = classify_statements(&stmt, &grammar_state());
-            let kinds = classifications_for(&classified, "s1");
+            let kinds = classifications_for(&idx(&classified),"s1");
             assert!(kinds.iter().any(|k| k == "Ring Constraint"),
                 "expected Ring Constraint for {:?}; got {:?}", text, kinds);
         }
@@ -3634,7 +3411,7 @@ mod tests {
             "s1", "Support Request is a subtype of Request.",
             &["Support Request", "Request"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Subtype Declaration"),
             "expected Subtype Declaration; got {:?}", kinds);
     }
@@ -3644,7 +3421,7 @@ mod tests {
         let stmt = stage1_state(
             "s1", "Customer places Order.", &["Customer", "Order"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Fact Type Reading"),
             "expected Fact Type Reading; got {:?}", kinds);
     }
@@ -3654,7 +3431,7 @@ mod tests {
         let stmt = stage1_state(
             "s1", "Customer is an entity type.", &["Customer"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let noun_facts = super::translate_nouns(&classified);
+        let noun_facts = super::translate_nouns(&classified, &idx(&classified));
         assert_eq!(noun_facts.len(), 1);
         assert_eq!(binding(&noun_facts[0], "name"), Some("Customer"));
         assert_eq!(binding(&noun_facts[0], "objectType"), Some("entity"));
@@ -3665,7 +3442,7 @@ mod tests {
         let stmt = stage1_state(
             "s1", "Priority is a value type.", &["Priority"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let noun_facts = super::translate_nouns(&classified);
+        let noun_facts = super::translate_nouns(&classified, &idx(&classified));
         assert_eq!(noun_facts.len(), 1);
         assert_eq!(binding(&noun_facts[0], "name"), Some("Priority"));
         assert_eq!(binding(&noun_facts[0], "objectType"), Some("value"));
@@ -3677,7 +3454,7 @@ mod tests {
         let stmt = stage1_state(
             "s1", "Customer places Order.", &["Customer", "Order"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let noun_facts = super::translate_nouns(&classified);
+        let noun_facts = super::translate_nouns(&classified, &idx(&classified));
         assert!(noun_facts.is_empty(),
             "fact-type readings must not produce Noun facts; got {:?}", noun_facts);
     }
@@ -3706,7 +3483,7 @@ mod tests {
         }
         let stmt = Object::Map(merged_cells);
         let classified = classify_statements(&stmt, &grammar_state());
-        let noun_facts = super::translate_nouns(&classified);
+        let noun_facts = super::translate_nouns(&classified, &idx(&classified));
         assert_eq!(noun_facts.len(), 2);
         let by_name: HashMap<String, String> = noun_facts.iter()
             .filter_map(|f| {
@@ -3744,7 +3521,7 @@ mod tests {
         }
         let stmt = Object::Map(merged);
         let classified = classify_statements(&stmt, &grammar_state());
-        let noun_facts = super::translate_nouns(&classified);
+        let noun_facts = super::translate_nouns(&classified, &idx(&classified));
         assert_eq!(noun_facts.len(), 1);
         assert_eq!(binding(&noun_facts[0], "name"), Some("Request"));
         assert_eq!(binding(&noun_facts[0], "objectType"), Some("abstract"));
@@ -3756,7 +3533,7 @@ mod tests {
             "s1", "Support Request is a subtype of Request.",
             &["Support Request", "Request"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let subtype_facts = super::translate_subtypes(&classified);
+        let subtype_facts = super::translate_subtypes(&classified, &idx(&classified));
         assert_eq!(subtype_facts.len(), 1);
         assert_eq!(binding(&subtype_facts[0], "subtype"), Some("Support Request"));
         assert_eq!(binding(&subtype_facts[0], "supertype"), Some("Request"));
@@ -3767,7 +3544,7 @@ mod tests {
         let stmt = stage1_state(
             "s1", "Customer is an entity type.", &["Customer"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let subtype_facts = super::translate_subtypes(&classified);
+        let subtype_facts = super::translate_subtypes(&classified, &idx(&classified));
         assert!(subtype_facts.is_empty());
     }
 
@@ -3776,7 +3553,7 @@ mod tests {
         let stmt = stage1_state(
             "s1", "Customer places Order.", &["Customer", "Order"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let (ft, roles) = super::translate_fact_types(&classified);
+        let (ft, roles) = super::translate_fact_types(&classified, &idx(&classified));
         assert_eq!(ft.len(), 1);
         assert_eq!(binding(&ft[0], "id"), Some("Customer_places_Order"));
         assert_eq!(binding(&ft[0], "reading"), Some("Customer places Order"));
@@ -3798,7 +3575,7 @@ mod tests {
         let stmt = stage1_state(
             "s1", "Customer is an entity type.", &["Customer"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let (ft, roles) = super::translate_fact_types(&classified);
+        let (ft, roles) = super::translate_fact_types(&classified, &idx(&classified));
         assert!(ft.is_empty(), "got FT facts: {:?}", ft);
         assert!(roles.is_empty());
     }
@@ -3809,7 +3586,7 @@ mod tests {
             "s1", "Support Request is a subtype of Request.",
             &["Support Request", "Request"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let (ft, _) = super::translate_fact_types(&classified);
+        let (ft, _) = super::translate_fact_types(&classified, &idx(&classified));
         assert!(ft.is_empty());
     }
 
@@ -3819,7 +3596,7 @@ mod tests {
             "s1", "Customer 'alice' places Order 'o-7'.",
             &["Customer", "Order"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Instance Fact"),
             "expected Instance Fact; got {:?}", kinds);
     }
@@ -3830,7 +3607,7 @@ mod tests {
             "s1", "Customer 'alice' places Order 'o-7'.",
             &["Customer", "Order"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let facts = super::translate_instance_facts(&classified);
+        let facts = super::translate_instance_facts(&classified, &idx(&classified));
         assert_eq!(facts.len(), 1);
         let f = &facts[0];
         assert_eq!(binding(f, "subjectNoun"),  Some("Customer"));
@@ -3852,7 +3629,7 @@ mod tests {
             &["Customer", "Order"]);
         let classified = classify_statements(&stmt, &grammar_state());
         let facts = super::translate_instance_facts_with_ft_ids(
-            &classified, &["Customer_places_Order".to_string()]);
+            &classified, &idx(&classified), &["Customer_places_Order".to_string()]);
         assert_eq!(facts.len(), 1);
         assert_eq!(binding(&facts[0], "fieldName"),
             Some("Customer_places_Order"));
@@ -3863,7 +3640,7 @@ mod tests {
         let stmt = stage1_state(
             "s1", "Customer places Order.", &["Customer", "Order"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let facts = super::translate_instance_facts(&classified);
+        let facts = super::translate_instance_facts(&classified, &idx(&classified));
         assert!(facts.is_empty(), "got {:?}", facts);
     }
 
@@ -3880,7 +3657,7 @@ mod tests {
              DLL Name 'riched20.dll' with DLL Behavior 'native'.",
             &["Wine App", "DLL Name", "DLL Behavior"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let facts = super::translate_instance_facts(&classified);
+        let facts = super::translate_instance_facts(&classified, &idx(&classified));
         assert_eq!(facts.len(), 1, "expected 1 instance fact; got {:?}", facts);
         let f = &facts[0];
         assert_eq!(binding(f, "subjectNoun"),  Some("Wine App"));
@@ -3907,7 +3684,7 @@ mod tests {
         let canonical_id =
             "Wine_App_requires_dll_override_of_DLL_Name_with_DLL_Behavior".to_string();
         let facts = super::translate_instance_facts_with_ft_ids(
-            &classified, &[canonical_id.clone()]);
+            &classified, &idx(&classified), &[canonical_id.clone()]);
         assert_eq!(facts.len(), 1);
         assert_eq!(binding(&facts[0], "fieldName"), Some(canonical_id.as_str()));
     }
@@ -4010,7 +3787,7 @@ mod tests {
         ] {
             let stmt = stage1_state("s1", text, &nouns);
             let classified = classify_statements(&stmt, &grammar_state());
-            let constraints = super::translate_ring_constraints(&classified);
+            let constraints = super::translate_ring_constraints(&classified, &idx(&classified));
             assert_eq!(constraints.len(), 1, "text={:?}", text);
             assert_eq!(binding(&constraints[0], "kind"), Some(expected_kind),
                 "text={:?}", text);
@@ -4094,7 +3871,7 @@ mod tests {
         let stmt = stage1_state(
             "s1", "Customer is an entity type.", &["Customer"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let constraints = super::translate_ring_constraints(&classified);
+        let constraints = super::translate_ring_constraints(&classified, &idx(&classified));
         assert!(constraints.is_empty());
     }
 
@@ -4105,7 +3882,7 @@ mod tests {
             "Customer has Full Name iff Customer has First Name.",
             &["Customer", "Full Name", "First Name"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let rules = super::translate_derivation_rules(&classified);
+        let rules = super::translate_derivation_rules(&classified, &idx(&classified));
         assert_eq!(rules.len(), 1);
         assert!(binding(&rules[0], "text").unwrap()
                 .contains("Customer has Full Name iff"));
@@ -4115,7 +3892,7 @@ mod tests {
     fn translate_derivation_rules_skips_non_derivations() {
         let stmt = stage1_state("s1", "Customer is an entity type.", &["Customer"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let rules = super::translate_derivation_rules(&classified);
+        let rules = super::translate_derivation_rules(&classified, &idx(&classified));
         assert!(rules.is_empty());
     }
 
@@ -4125,7 +3902,7 @@ mod tests {
             "s1", "It is obligatory that Customer has Email.",
             &["Customer", "Email"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Deontic Constraint"),
             "expected Deontic Constraint; got {:?}", kinds);
     }
@@ -4136,7 +3913,7 @@ mod tests {
             "s1", "It is forbidden that Support Response uses Dash.",
             &["Support Response", "Dash"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let constraints = super::translate_deontic_constraints(&classified);
+        let constraints = super::translate_deontic_constraints(&classified, &idx(&classified));
         assert_eq!(constraints.len(), 1);
         assert_eq!(binding(&constraints[0], "modality"), Some("deontic"));
         assert_eq!(binding(&constraints[0], "deonticOperator"), Some("forbidden"));
@@ -4150,7 +3927,7 @@ mod tests {
             "The possible values of Priority are 'low', 'medium', 'high'.",
             &["Priority"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Enum Values Declaration"),
             "expected Enum Values Declaration; got {:?}", kinds);
     }
@@ -4162,7 +3939,7 @@ mod tests {
             "The possible values of Priority are 'low', 'medium', 'high'.",
             &["Priority"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let facts = super::translate_enum_values(&classified);
+        let facts = super::translate_enum_values(&classified, &idx(&classified));
         assert_eq!(facts.len(), 1);
         let f = &facts[0];
         assert_eq!(binding(f, "noun"), Some("Priority"));
@@ -4177,7 +3954,7 @@ mod tests {
             "s1", "Animal is partitioned into Cat, Dog, Bird.",
             &["Animal", "Cat", "Dog", "Bird"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Partition Declaration"),
             "expected Partition Declaration; got {:?}", kinds);
     }
@@ -4188,7 +3965,7 @@ mod tests {
             "s1", "Animal is partitioned into Cat, Dog, Bird.",
             &["Animal", "Cat", "Dog", "Bird"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let subtypes = super::translate_partitions(&classified);
+        let subtypes = super::translate_partitions(&classified, &idx(&classified));
         let subs: Vec<_> = subtypes.iter()
             .filter_map(|f| binding(f, "subtype").map(String::from))
             .collect();
@@ -4198,7 +3975,7 @@ mod tests {
         }
         // translate_nouns must see Partition Declaration as a signal
         // to mark Animal as abstract.
-        let nouns = super::translate_nouns(&classified);
+        let nouns = super::translate_nouns(&classified, &idx(&classified));
         let animal = nouns.iter()
             .find(|f| binding(f, "name") == Some("Animal"))
             .expect("Animal noun fact");
@@ -4217,7 +3994,7 @@ mod tests {
             "The possible values of Priority are 'low', 'medium', 'high'.",
             &["Priority"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Value Constraint"),
             "expected Value Constraint; got {:?}", kinds);
     }
@@ -4229,7 +4006,7 @@ mod tests {
             "Each Order was placed by exactly one Customer.",
             &["Order", "Customer"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Uniqueness Constraint"),
             "expected Uniqueness Constraint; got {:?}", kinds);
     }
@@ -4241,7 +4018,7 @@ mod tests {
             "Each Customer has at least one Email.",
             &["Customer", "Email"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Mandatory Role Constraint"),
             "expected Mandatory Role Constraint; got {:?}", kinds);
     }
@@ -4253,7 +4030,7 @@ mod tests {
             "Each Order has at most 5 and at least 2 Line Items.",
             &["Order", "Line Item"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Frequency Constraint"),
             "expected Frequency Constraint; got {:?}", kinds);
     }
@@ -4265,7 +4042,7 @@ mod tests {
             "Each Employee is paid if and only if Employee has Salary.",
             &["Employee", "Salary"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Equality Constraint"),
             "expected Equality Constraint; got {:?}", kinds);
     }
@@ -4277,7 +4054,7 @@ mod tests {
             "For each Account at most one of the following holds: Account is open; Account is closed.",
             &["Account"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Exclusion Constraint"),
             "expected Exclusion Constraint (multi-clause form); got {:?}", kinds);
     }
@@ -4289,7 +4066,7 @@ mod tests {
             "For each Order exactly one of the following holds: Order is draft; Order is placed.",
             &["Order"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Exclusive-Or Constraint"),
             "expected Exclusive-Or Constraint; got {:?}", kinds);
     }
@@ -4301,7 +4078,7 @@ mod tests {
             "For each User at least one of the following holds: User has Email; User has Phone.",
             &["User", "Email", "Phone"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Or Constraint"),
             "expected Or Constraint; got {:?}", kinds);
     }
@@ -4313,7 +4090,7 @@ mod tests {
             "If some User owns some Organization then that User has some Email.",
             &["User", "Organization", "Email"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Subset Constraint"),
             "expected Subset Constraint; got {:?}", kinds);
     }
@@ -4332,19 +4109,19 @@ mod tests {
             "If some User owns some Organization then that User has some Email.",
             &["User", "Organization", "Email"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Subset Constraint"),
             "expected Subset Constraint; got {:?}", kinds);
         assert!(kinds.iter().any(|k| k == "Derivation Rule"),
             "expected Derivation Rule classification (arbitrated below); \
              got {:?}", kinds);
-        let constraints = super::translate_set_constraints(&classified);
+        let constraints = super::translate_set_constraints(&classified, &idx(&classified));
         let ss: Vec<_> = constraints.iter()
             .filter(|f| binding(f, "kind") == Some("SS"))
             .collect();
         assert_eq!(ss.len(), 1, "expected 1 SS, got {:?}", constraints);
         assert_eq!(binding(ss[0], "modality"), Some("alethic"));
-        let rules = super::translate_derivation_rules(&classified);
+        let rules = super::translate_derivation_rules(&classified, &idx(&classified));
         assert!(rules.is_empty(),
             "expected no Derivation Rule emission (SS wins); got {:?}",
             rules);
@@ -4376,9 +4153,9 @@ mod tests {
             Object::Map(map)
         };
         let classified = classify_statements(&stmt_only_thing, &grammar_state());
-        let ss = super::translate_set_constraints(&classified);
+        let ss = super::translate_set_constraints(&classified, &idx(&classified));
         assert!(ss.is_empty(), "SS defers when antecedent nouns < 2; got {:?}", ss);
-        let rules = super::translate_derivation_rules(&classified);
+        let rules = super::translate_derivation_rules(&classified, &idx(&classified));
         assert_eq!(rules.len(), 1,
             "DR picks up the statement when SS defers; got {:?}", rules);
     }
@@ -4399,7 +4176,7 @@ mod tests {
         let merged = crate::ast::merge_states(&merged, &or_stmt);
         let classified = classify_statements(&merged, &grammar_state());
 
-        let constraints = super::translate_set_constraints(&classified);
+        let constraints = super::translate_set_constraints(&classified, &idx(&classified));
         let by_kind = |k: &str| -> Vec<&Object> {
             constraints.iter().filter(|f| binding(f, "kind") == Some(k)).collect()
         };
@@ -4428,7 +4205,7 @@ mod tests {
         let merged = crate::ast::merge_states(&merged, &fc);
         let classified = classify_statements(&merged, &grammar_state());
 
-        let constraints = super::translate_cardinality_constraints(&classified);
+        let constraints = super::translate_cardinality_constraints(&classified, &idx(&classified));
         let by_kind = |k: &str| -> Vec<&Object> {
             constraints.iter().filter(|f| binding(f, "kind") == Some(k)).collect()
         };
@@ -4448,7 +4225,7 @@ mod tests {
         let stmt = stage1_state(
             "s1", "Each Noun plays some Role.", &["Noun", "Role"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let kinds = classifications_for(&classified, "s1");
+        let kinds = classifications_for(&idx(&classified),"s1");
         assert!(kinds.iter().any(|k| k == "Mandatory Role Constraint"),
             "expected MC classification for 'some' quantifier; got {:?}", kinds);
     }
@@ -4460,7 +4237,7 @@ mod tests {
             "The possible values of Priority are 'low', 'medium', 'high'.",
             &["Priority"]);
         let classified = classify_statements(&stmt, &grammar_state());
-        let vcs = super::translate_value_constraints(&classified);
+        let vcs = super::translate_value_constraints(&classified, &idx(&classified));
         assert_eq!(vcs.len(), 1);
         let f = &vcs[0];
         assert_eq!(binding(f, "kind"), Some("VC"));
@@ -4762,7 +4539,7 @@ mod tests {
             let stmt = stage1_state("s1", text, &nouns);
             let classified = classify_statements(&stmt, &grammar_state());
             let constraints = super::translate_ring_constraints_with_tables(
-                &classified, &ring_kinds, &conditional_matrix);
+                &classified, &idx(&classified), &ring_kinds, &conditional_matrix);
             assert_eq!(constraints.len(), 1, "text={:?}", text);
             assert_eq!(binding(&constraints[0], "kind"), Some(expected_kind),
                 "text={:?}", text);
@@ -4858,7 +4635,7 @@ mod tests {
             &["Customer", "Order"]);
         let classified = classify_statements(&stmt, &grammar_state());
         let constraints = super::translate_deontic_constraints_with_table(
-            &classified, &table);
+            &classified, &idx(&classified), &table);
         assert_eq!(constraints.len(), 1);
         let f = &constraints[0];
         assert_eq!(binding(f, "kind"), Some("UC"));
