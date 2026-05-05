@@ -6,10 +6,10 @@ import { handleParse } from './parse'
 import { handleEvaluate, handleSynthesize } from './evaluate'
 import { handleCreateEntity, handleDeleteEntity, applyEntityCommand } from './entity-routes'
 import { envelope } from './envelope'
-import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, computeRMAP, system as wasmSystem, currentDomainHandle } from './engine'
+import { loadDomainSchema, loadDomainAndPopulation, buildPopulation, getTransitions, applyCommand, querySchema, forwardChain, getNounSchemas, system as wasmSystem, currentDomainHandle } from './engine'
 import { handleArestRequest, handleArestReadFallback } from './arest-router'
 import { handleMcpRequest } from '../mcp/remote'
-import { dispatchVerb, UNIFIED_VERBS } from './verb-dispatcher'
+import { dispatchVerb, UNIFIED_VERBS, openApiCellSuffix } from './verb-dispatcher'
 import { aiComplete } from './ai/complete'
 import { handleExtract } from './ai/extract'
 import { handleChat } from './ai/chat'
@@ -116,15 +116,27 @@ router.get('/api/connect/:domain', async (request, env: Env) => {
 // ── Derivation trace for a domain ────────────────────────────────────
 // Per the paper: derivation chains are recorded and available on demand.
 // Returns the full forward-chained derivation trace for a domain's population.
+//
+// T2 (#700): the engine call goes through `dispatchVerb('forward_chain',
+// { population })` so the same verb arm services the worker URL, the
+// auto-wired `/api/forward_chain` endpoint, and any future MCP/CLI
+// caller. The DO-driven population assembly (loadDomainSchema +
+// buildPopulation) stays in the worker — that orchestration is genuinely
+// platform-specific and can't move into the dispatcher (which has no env).
 router.get('/api/trace/:domain', async (request, env: Env) => {
   const domain = decodeURIComponent(request.params.domain)
   const registry = getRegistryDO(env, 'global') as any
   const getStub = (id: string) => getEntityDO(env, id) as any
 
-  await loadDomainSchema(registry, getStub, domain).catch(() => {})
+  const handle = await loadDomainSchema(registry, getStub, domain).catch(() => -1)
   const popJson = await buildPopulation(registry, getStub, domain)
   let derived: Array<{ factTypeId: string; reading: string; bindings: Array<[string, string]>; derivedBy: string }> = []
-  try { derived = forwardChain(popJson) } catch {}
+  try {
+    const env5 = await dispatchVerb('forward_chain', { population: popJson }, handle)
+    if (Array.isArray(env5.data)) {
+      derived = env5.data as typeof derived
+    }
+  } catch { /* engine error → empty trace, same as the legacy try/catch */ }
 
   return json({
     domain,
@@ -167,18 +179,24 @@ router.post('/api/debug/arest/:domain', async (request, env: Env) => {
   return json(result)
 })
 
+// T2 (#700): the engine projection goes through `dispatchVerb('debug', {})`
+// so the worker URL, the auto-wired `/api/debug` endpoint, and any
+// future MCP/CLI caller share one switch arm. The DO-driven schema load
+// stays in the worker.
 router.get('/api/debug/compiled/:domain', async (request, env: Env) => {
   const { domain } = request.params
   const registry = getRegistryDO(env, 'global') as any
   const handle = await loadDomainSchema(registry, (id: string) => getEntityDO(env, id) as any, domain)
-  return json(JSON.parse(wasmSystem(handle, 'debug', '')))
+  const env5 = await dispatchVerb('debug', {}, handle)
+  return json(env5.data)
 })
 
 router.get('/api/debug/schema/:domain', async (request, env: Env) => {
   const domain = decodeURIComponent(request.params.domain)
   const registry = getRegistryDO(env, 'global') as any
   const handle = await loadDomainSchema(registry, (id: string) => getEntityDO(env, id) as any, domain)
-  const schema = JSON.parse(wasmSystem(handle, 'debug', ''))
+  const env5 = await dispatchVerb('debug', {}, handle)
+  const schema = env5.data as { nouns: Record<string, unknown>; factTypes: Record<string, unknown>; constraints: unknown[]; stateMachines: Record<string, any> }
   return json({
     domain,
     nounCount: Object.keys(schema.nouns).length,
@@ -191,13 +209,14 @@ router.get('/api/debug/schema/:domain', async (request, env: Env) => {
 })
 
 // RMAP: show cell partitioning derived from UC structure (Halpin, Ch. 17).
+// T2 (#700): the engine call goes through `dispatchVerb('rmap', {})`.
 router.get('/api/debug/rmap/:domain', async (request, env: Env) => {
   const domain = decodeURIComponent(request.params.domain)
   const registry = getRegistryDO(env, 'global') as any
   const getStub = (id: string) => getEntityDO(env, id) as any
-  await loadDomainSchema(registry, getStub, domain).catch(() => {})
-  const tables = computeRMAP()
-  return json({ domain, tables })
+  const handle = await loadDomainSchema(registry, getStub, domain).catch(() => -1)
+  const env5 = await dispatchVerb('rmap', {}, handle)
+  return json({ domain, tables: env5.data })
 })
 
 router.get('/debug/table/:table', async (request, env: Env) => {
@@ -233,22 +252,11 @@ router.get('/debug/table/:table', async (request, env: Env) => {
 // 'organizations') selects which compiled domain to query — the cell
 // is looked up on that domain's state. A single compile may contain
 // several Apps across many domains.
-
-/// Mirrors rmap::to_snake in the Rust crate: insert `_` before an
-/// uppercase letter that follows a lowercase one, replace space and
-/// hyphen with `_`, lowercase everything. Used to form the cell key
-/// from an App slug so the TS route lands on the same key the
-/// compile gate emitted.
-function appCellSuffix(app: string): string {
-  let out = ''
-  for (let i = 0; i < app.length; i++) {
-    const ch = app[i]
-    const prev = i > 0 ? app[i - 1] : ''
-    if (/[A-Z]/.test(ch) && /[a-z]/.test(prev)) out += '_'
-    out += ch === ' ' || ch === '-' ? '_' : ch.toLowerCase()
-  }
-  return out
-}
+//
+// T2 (#700): the cell read goes through `dispatchVerb('openapi', { app })`.
+// The snake-case suffix helper that used to live here moved to
+// verb-dispatcher.ts (`openApiCellSuffix`) so the same source of truth
+// drives both the legacy URL and the auto-wired `/api/openapi` verb.
 
 // ── Live event stream (SSE) ────────────────────────────────────────
 //
@@ -276,16 +284,18 @@ router.get('/api/openapi.json', async (request, env: Env) => {
     })
   }
   const domain = url.searchParams.get('domain') || 'organizations'
-  const cellKey = `openapi:${appCellSuffix(app)}`
 
   const registry = getRegistryDO(env, 'global') as any
   const handle = await loadDomainSchema(registry, (id: string) => getEntityDO(env, id) as any, domain)
-  const raw = wasmSystem(handle, cellKey, '')
 
-  let doc: any = null
-  try { doc = JSON.parse(raw) } catch { /* empty/bottom → doc stays null */ }
-
-  if (!doc || typeof doc !== 'object' || !doc.openapi) {
+  // Delegate to the unified `openapi` verb arm. The dispatcher returns
+  // either the OpenAPI document or `{ error: 'no openapi for app', … }`
+  // when the cell is absent — translate the latter to a 404 with the
+  // same wording the legacy route used so consumers don't see a wire
+  // shape change.
+  const env5 = await dispatchVerb('openapi', { app }, handle)
+  const data = env5.data as { openapi?: unknown; error?: string }
+  if (!data || data.error || !data.openapi) {
     return error(404, {
       errors: [{
         message: `No OpenAPI document for App '${app}'. ` +
@@ -293,7 +303,7 @@ router.get('/api/openapi.json', async (request, env: Env) => {
       }],
     })
   }
-  return json(doc)
+  return json(data)
 })
 
 // ── DynRdg-T3 (#562): SystemVerb::LoadReading on the worker target ───
@@ -452,6 +462,14 @@ router.post('/api/evaluate', handleEvaluate)
 router.post('/api/synthesize', (request, env) => handleSynthesize(request, env))
 
 // ── Induction (discover constraints from population) — uses WASM engine
+//
+// TODO(T2 / #700 / 2026-05-04): collapse into a `dispatchVerb('induce', …)`
+// arm once the Rust side gains a real `induce` system intercept. The
+// `induce` module was deleted in #211 (zero production callers, tests
+// were self-referential), so this route currently dispatches a key the
+// engine no longer recognises and returns ⊥. Left hand-coded to mark
+// the gap; do NOT add the engine verb from this agent (that's a Rust
+// task and out of scope per the audit instructions).
 router.post('/api/induce', async (request, env: Env) => {
   const body = await request.json() as { domain?: string }
   const registry = getRegistryDO(env, 'global') as any

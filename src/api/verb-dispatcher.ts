@@ -186,9 +186,92 @@ export async function dispatchVerb(
       return envelope(safeJson(raw) ?? { raw })
     }
 
+    case 'debug': {
+      // T2 (#700): full compiled-state projection. Pure read on the
+      // currently-loaded handle. The legacy worker routes
+      // `/api/debug/compiled/:domain` and `/api/debug/schema/:domain`
+      // delegate here after `loadDomainSchema` populates the handle.
+      // Note: the `schema` arm above predates this verb and is the same
+      // engine call; both are kept so consumers can pick the spelling
+      // they prefer (MCP tool name vs. URL noun).
+      const raw = engine.system(h, 'debug', '')
+      return envelope(safeJson(raw) ?? { raw })
+    }
+
+    case 'rmap': {
+      // T2 (#700): RMAP table projection (Halpin Ch. 17). Pure read on
+      // the currently-loaded handle. Replaces the body of the legacy
+      // `/api/debug/rmap/:domain` route, which still does the per-domain
+      // schema load before delegating here.
+      const raw = engine.system(h, 'rmap', '')
+      return envelope(safeJson(raw) ?? { raw })
+    }
+
+    case 'forward_chain': {
+      // T2 (#700): run the engine's derivation runner over a caller-
+      // supplied population (JSON encoded as `{ facts: { ftId: [...] } }`).
+      // The worker's `/api/trace/:domain` route assembles the population
+      // from EntityDB + Registry then delegates here for the lfp pass.
+      // Engine intercept lives at `system_impl` `forward_chain`.
+      const { population } = body as { population?: string }
+      if (typeof population !== 'string') {
+        throw new Error('forward_chain requires `population` (JSON string)')
+      }
+      const raw = engine.system(h, 'forward_chain', population)
+      return envelope(safeJson(raw) ?? { raw })
+    }
+
+    case 'openapi': {
+      // T2 (#700): read the OpenAPI 3.1 doc cell for the named App.
+      // The compiler emits one cell per opted-in App, keyed
+      // `openapi:{snake(app)}` (see `crate::rmap::to_snake` and the
+      // generator gate in `crates/arest/src/compile.rs`). Cell missing
+      // → `{ error: 'no openapi for app' }` so callers see a clear
+      // remediation instead of an empty envelope. Mirrors the legacy
+      // `/api/openapi.json?app=…` route, which still does the
+      // per-domain schema load before delegating here.
+      const { app } = body as { app?: string }
+      if (!app || typeof app !== 'string') {
+        throw new Error('openapi requires `app` (string)')
+      }
+      const cellKey = `openapi:${openApiCellSuffix(app)}`
+      const raw = engine.system(h, cellKey, '')
+      const doc = safeJson(raw)
+      if (!doc || typeof doc !== 'object' || !(doc as { openapi?: unknown }).openapi) {
+        return envelope({
+          error: 'no openapi for app',
+          app,
+          hint: `Add "App '${app}' uses Generator 'openapi'." to the App's readings to enable this cell.`,
+        })
+      }
+      return envelope(doc)
+    }
+
     default:
       throw new Error(`unknown verb: ${verb}`)
   }
+}
+
+/**
+ * Mirror of `crate::rmap::to_snake` in the Rust crate: insert `_`
+ * before an uppercase letter that follows a lowercase one, replace
+ * space and hyphen with `_`, lowercase everything. Used by the
+ * `openapi` verb to form the cell key from an App slug so the TS
+ * dispatcher lands on the same key the Rust compile gate emitted.
+ *
+ * Exported so the legacy `/api/openapi.json` worker route — which
+ * still does its own schema load before delegating to dispatchVerb —
+ * can share this single source of truth with the verb arm.
+ */
+export function openApiCellSuffix(app: string): string {
+  let out = ''
+  for (let i = 0; i < app.length; i++) {
+    const ch = app[i]
+    const prev = i > 0 ? app[i - 1] : ''
+    if (/[A-Z]/.test(ch) && /[a-z]/.test(prev)) out += '_'
+    out += ch === ' ' || ch === '-' ? '_' : ch.toLowerCase()
+  }
+  return out
 }
 
 /** Wrap a value in the Theorem 5 four-key shape with empty defaults. */
@@ -232,6 +315,11 @@ export const UNIFIED_VERBS = [
   'rollback',
   'snapshots',
   'external_browse',
+  // T2 (#700): hand-coded routes consolidated.
+  'debug',
+  'rmap',
+  'forward_chain',
+  'openapi',
 ] as const
 
 export type UnifiedVerb = typeof UNIFIED_VERBS[number]
