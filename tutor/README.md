@@ -52,6 +52,17 @@ In WASM mode (no `AREST_CLI`), the sandbox lives only in process memory
 and is lost on MCP restart — fine for quick experimentation; CLI mode is
 the right choice for working through lessons in order.
 
+### Schema drift
+
+The first time the sandbox is bootstrapped (CLI mode) or the handle is
+compiled (WASM mode), the SHA-256 of the joined `tutor/domains/*.md`
+readings is recorded — to a sidecar file `<db>.hash` in CLI mode, or in
+process memory in WASM mode. Every subsequent `tutor.*` call re-checks
+the hash and throws a `TutorSchemaMismatchError` ("schema mismatch — run
+`tutor.reset`") if the readings on disk have changed since the recorded
+hash. Run `tutor.reset` to wipe the sandbox state plus the recorded
+hash and rebootstrap from the current readings.
+
 ### Migrating from `arest-tutor`
 
 The previous `arest-tutor` named entry in `.mcp.json` has been removed.

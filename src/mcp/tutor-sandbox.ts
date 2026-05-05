@@ -20,6 +20,7 @@ import { resolve, dirname, join } from 'path'
 import { tmpdir } from 'os'
 import { fileURLToPath } from 'url'
 import { spawn } from 'child_process'
+import { createHash } from 'crypto'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
@@ -27,6 +28,18 @@ const __dirname = dirname(__filename)
 let _sandboxHandle = -1
 let _engine: typeof import('../api/engine.js') | null = null
 let _bootstrapPromise: Promise<void> | null = null
+let _wasmHashAtCompile: string | null = null
+
+export class TutorSchemaMismatchError extends Error {
+  constructor() {
+    super(
+      'Tutor sandbox schema mismatch — readings under tutor/domains/ have ' +
+      'changed since the sandbox was bootstrapped. Run `tutor.reset` to ' +
+      'rebootstrap from the current readings.',
+    )
+    this.name = 'TutorSchemaMismatchError'
+  }
+}
 
 export function tutorDomainsDir(): string {
   return resolve(__dirname, '..', '..', 'tutor', 'domains')
@@ -67,6 +80,11 @@ async function ensureCliBootstrapped(): Promise<void> {
     mkdirSync(resolve(dbPath, '..'), { recursive: true })
     if (!existsSync(dbPath)) {
       await runArestCli([tutorDomainsDir(), '--db', dbPath])
+      recordSchemaHash()
+    } else {
+      // Existing DB — verify the readings on disk still match the hash
+      // captured when the DB was bootstrapped. Throws if drift detected.
+      assertSchemaConsistencyCli()
     }
   })().catch((err) => {
     _bootstrapPromise = null  // allow retry on next call after failure
@@ -90,17 +108,56 @@ function loadTutorDomainReadings(): string[] {
     .map(f => readFileSync(join(dir, f), 'utf-8'))
 }
 
+function readingsHash(): string {
+  const joined = loadTutorDomainReadings().join('\n---\n')
+  return createHash('sha256').update(joined).digest('hex')
+}
+
+function hashSidecarPath(): string {
+  return tutorSandboxDbPath() + '.hash'
+}
+
+function recordSchemaHash(): void {
+  const sidecar = hashSidecarPath()
+  mkdirSync(resolve(sidecar, '..'), { recursive: true })
+  writeFileSync(sidecar, readingsHash())
+}
+
+function assertSchemaConsistencyCli(): void {
+  const sidecar = hashSidecarPath()
+  if (!existsSync(sidecar)) return
+  const stored = readFileSync(sidecar, 'utf-8').trim()
+  if (stored && stored !== readingsHash()) {
+    throw new TutorSchemaMismatchError()
+  }
+}
+
+function assertSchemaConsistencyWasm(): void {
+  if (_wasmHashAtCompile === null) return
+  if (_wasmHashAtCompile !== readingsHash()) {
+    throw new TutorSchemaMismatchError()
+  }
+}
+
 export async function getSandboxHandle(): Promise<number> {
-  if (_sandboxHandle >= 0) return _sandboxHandle
+  if (_sandboxHandle >= 0) {
+    assertSchemaConsistencyWasm()
+    return _sandboxHandle
+  }
   const engine = await getEngine()
   const readings = loadTutorDomainReadings()
   _sandboxHandle = engine.compileDomainReadings(...readings)
+  _wasmHashAtCompile = readingsHash()
   return _sandboxHandle
 }
 
 export async function tutorSystemCall(key: string, input: string): Promise<string> {
   if (shouldUseCliDb()) {
     await ensureCliBootstrapped()
+    // Re-check on every call: the bootstrap promise is cached at module
+    // level, so without this an in-process readings edit wouldn't surface
+    // until the next MCP server start.
+    assertSchemaConsistencyCli()
     if (key === 'compile') {
       // arest-cli's `compile` SYSTEM key against persisted state does not
       // append schema. The binary's positional readings-dir form is the
@@ -127,8 +184,11 @@ export async function resetSandbox(): Promise<void> {
   }
   _sandboxHandle = -1
   _bootstrapPromise = null
+  _wasmHashAtCompile = null
   const dbPath = tutorSandboxDbPath()
   try { if (existsSync(dbPath)) rmSync(dbPath) } catch {}
+  const sidecar = hashSidecarPath()
+  try { if (existsSync(sidecar)) rmSync(sidecar) } catch {}
 }
 
 /**
@@ -142,4 +202,5 @@ export function _testOnly_dropSandboxHandle(): void {
   }
   _sandboxHandle = -1
   _bootstrapPromise = null
+  _wasmHashAtCompile = null
 }

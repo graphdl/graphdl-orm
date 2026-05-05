@@ -11,12 +11,11 @@
  * trigger the first compile.
  */
 import { describe, it, expect } from 'vitest'
-import { getSandboxHandle, tutorSystemCall, resetSandbox, tutorDomainsDir } from './tutor-sandbox.js'
+import { getSandboxHandle, tutorSystemCall, resetSandbox, tutorDomainsDir, TutorSchemaMismatchError } from './tutor-sandbox.js'
 import { compileDomainReadings, system } from '../api/engine.js'
-import { existsSync } from 'fs'
-import { mkdtempSync } from 'fs'
+import { existsSync, mkdtempSync, writeFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
-import { resolve } from 'path'
+import { resolve, join } from 'path'
 import { evalExpectPredicate, listRegisteredTools } from './server.js'
 
 const TIMEOUT = 60_000
@@ -170,6 +169,52 @@ describe.skipIf(!haveCli)('tutor sandbox — CLI persistence', () => {
 
     delete process.env.AREST_TUTOR_DB
   }, 120_000)
+})
+
+describe('tutor sandbox — schema drift detection', () => {
+  it('throws TutorSchemaMismatchError when readings change after bootstrap (WASM)', async () => {
+    await resetSandbox()
+    // Bootstrap: compile + record the readings hash.
+    await tutorSystemCall('list:Noun', '')
+
+    // Add a probe file under tutor/domains/. This mutates the readings
+    // set the next hash will see. Use try/finally so a thrown assertion
+    // never leaves the shared dir polluted for other tests.
+    const probe = `_drift_probe_${Date.now()}_${Math.random().toString(36).slice(2)}.md`
+    const probePath = join(tutorDomainsDir(), probe)
+    writeFileSync(probePath, 'DriftProbe(.X) is an entity type.\nX is a value type.\n')
+    try {
+      await expect(tutorSystemCall('list:Noun', '')).rejects.toBeInstanceOf(TutorSchemaMismatchError)
+    } finally {
+      try { rmSync(probePath) } catch {}
+    }
+
+    // After cleanup, calls succeed again (hash matches the original).
+    const list = JSON.parse(await tutorSystemCall('list:Noun', '')) ?? []
+    expect(Array.isArray(list)).toBe(true)
+    expect(list.length).toBeGreaterThan(0)
+  }, 60_000)
+
+  it('tutor.reset clears the cached hash so a new readings set is acceptable', async () => {
+    await resetSandbox()
+    // Bootstrap with a probe in place so the recorded hash includes it.
+    const probe = `_drift_probe_${Date.now()}_${Math.random().toString(36).slice(2)}.md`
+    const probePath = join(tutorDomainsDir(), probe)
+    writeFileSync(probePath, 'DriftProbeB(.Y) is an entity type.\nY is a value type.\n')
+    try {
+      await tutorSystemCall('list:Noun', '')
+      // Remove the probe — now readings differ from the recorded hash.
+      rmSync(probePath)
+      await expect(tutorSystemCall('list:Noun', '')).rejects.toBeInstanceOf(TutorSchemaMismatchError)
+      // tutor.reset wipes the hash; bootstrap rerecords against the
+      // current readings on the next call.
+      await resetSandbox()
+      const list = JSON.parse(await tutorSystemCall('list:Noun', '')) ?? []
+      expect(list.length).toBeGreaterThan(0)
+    } finally {
+      try { if (existsSync(probePath)) rmSync(probePath) } catch {}
+    }
+  }, 60_000)
 })
 
 describe.skipIf(!haveCli)('tutor.compile — CLI mode dispatch', () => {
