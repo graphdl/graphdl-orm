@@ -64,7 +64,7 @@ import {
   type MutationContextDetail,
   type MutationContextTool,
 } from './mutation-context.js'
-import { tutorSystemCall, resetSandbox } from './tutor-sandbox.js'
+import { tutorSystemCall, resetSandbox, parseEngineRaw } from './tutor-sandbox.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(__dirname, '..', '..')
@@ -1686,8 +1686,7 @@ server.registerTool(
   },
   async ({ noun }) => {
     const raw = await tutorSystemCall(`list:${noun}`, '')
-    const parsed = JSON.parse(raw) ?? []
-    return textResult(parsed)
+    return textResult(parseEngineRaw(raw, []))
   },
 )
 
@@ -1699,8 +1698,7 @@ server.registerTool(
   },
   async ({ noun, id }) => {
     const raw = await tutorSystemCall(`get:${noun}`, id)
-    const parsed = JSON.parse(raw) ?? null
-    return textResult(parsed)
+    return textResult(parseEngineRaw(raw, null))
   },
 )
 
@@ -1715,8 +1713,7 @@ server.registerTool(
   },
   async ({ fact_type, filter }) => {
     const raw = await tutorSystemCall(`query:${fact_type}`, JSON.stringify(filter ?? {}))
-    const parsed = JSON.parse(raw) ?? []
-    return textResult(parsed)
+    return textResult(parseEngineRaw(raw, []))
   },
 )
 

@@ -11,7 +11,7 @@
  * trigger the first compile.
  */
 import { describe, it, expect } from 'vitest'
-import { getSandboxHandle, tutorSystemCall, resetSandbox, tutorDomainsDir, TutorSchemaMismatchError } from './tutor-sandbox.js'
+import { getSandboxHandle, tutorSystemCall, resetSandbox, tutorDomainsDir, TutorSchemaMismatchError, parseEngineRaw } from './tutor-sandbox.js'
 import { compileDomainReadings, system } from '../api/engine.js'
 import { existsSync, mkdtempSync, writeFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
@@ -92,6 +92,62 @@ describe('tutor lesson predicate grading', () => {
       tutorSystemCall,
     )
     expect(result.ok).toBe(true)
+  }, 60_000)
+})
+
+describe('parseEngineRaw — engine response laundering', () => {
+  it('parses successful JSON arrays and objects', () => {
+    expect(parseEngineRaw('[1,2,3]', [])).toEqual([1, 2, 3])
+    expect(parseEngineRaw('{"id":"Order"}', null)).toEqual({ id: 'Order' })
+  })
+
+  it('returns fallback when the engine emits null', () => {
+    expect(parseEngineRaw('null', [])).toEqual([])
+    expect(parseEngineRaw('null', null)).toBe(null)
+  })
+
+  it('returns a rejection envelope for ⊥ responses (no throw)', () => {
+    expect(parseEngineRaw('⊥', [])).toEqual({ rejected: true, raw: '⊥' })
+    const detailed = parseEngineRaw('⊥ unknown noun: NoSuchThing', [])
+    expect(detailed).toEqual({
+      rejected: true,
+      raw: '⊥ unknown noun: NoSuchThing',
+    })
+  })
+
+  it('returns a parse_error envelope for non-JSON, non-⊥ output', () => {
+    const result = parseEngineRaw('not json', []) as any
+    expect(result.raw).toBe('not json')
+    expect(typeof result.parse_error).toBe('string')
+    expect(result.parse_error.length).toBeGreaterThan(0)
+  })
+
+  it('strips outer whitespace before parsing', () => {
+    expect(parseEngineRaw('  [1]\n', [])).toEqual([1])
+    expect(parseEngineRaw('\t⊥ rejected\n', [])).toEqual({
+      rejected: true,
+      raw: '⊥ rejected',
+    })
+  })
+})
+
+describe('tutor.* read mirrors no longer throw on engine rejection', () => {
+  it('a list call against an unknown noun returns a rejection envelope, not a thrown error', async () => {
+    // Bootstrap the sandbox.
+    await tutorSystemCall('list:Noun', '')
+    // Ask for a noun that does not exist — the engine returns ⊥.
+    const raw = await tutorSystemCall('list:NoSuchNoun_DoesNotExist', '')
+    const cooked = parseEngineRaw(raw, []) as any
+    // Either the engine genuinely rejected (most cases), or it returned an
+    // empty array (some engines treat unknown nouns as zero hits). Either
+    // way, no throw, and the shape is a useful object/array — not a raw
+    // string the caller has to JSON.parse themselves.
+    if ('rejected' in cooked) {
+      expect(cooked.rejected).toBe(true)
+      expect(typeof cooked.raw).toBe('string')
+    } else {
+      expect(Array.isArray(cooked)).toBe(true)
+    }
   }, 60_000)
 })
 

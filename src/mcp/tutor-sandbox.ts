@@ -41,6 +41,39 @@ export class TutorSchemaMismatchError extends Error {
   }
 }
 
+/**
+ * Coerce a raw engine response (from arest-cli or engine.system) into a
+ * shape callers can act on without a try/catch.
+ *
+ *   • Successful JSON                         → parsed value (or `fallback` when null).
+ *   • Engine rejection (response starts `⊥`)  → `{ rejected: true, raw }`.
+ *   • Anything else that JSON.parse can't eat → `{ raw, parse_error }`.
+ *
+ * Mirrors the laundering pattern the bare `apply` tool already uses, so
+ * tutor.* read tools surface engine errors as data instead of throwing.
+ */
+export function parseEngineRaw<T>(
+  raw: string,
+  fallback: T,
+):
+  | T
+  | { rejected: true; raw: string }
+  | { raw: string; parse_error: string } {
+  const trimmed = raw.trim()
+  if (trimmed.startsWith('⊥')) {
+    return { rejected: true, raw: trimmed }
+  }
+  try {
+    const parsed = JSON.parse(trimmed)
+    return parsed ?? fallback
+  } catch (err) {
+    return {
+      raw: trimmed,
+      parse_error: err instanceof Error ? err.message : String(err),
+    }
+  }
+}
+
 export function tutorDomainsDir(): string {
   return resolve(__dirname, '..', '..', 'tutor', 'domains')
 }
