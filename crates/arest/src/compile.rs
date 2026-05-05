@@ -1217,8 +1217,15 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // Transitions + meta â€” Î±(sm â†’ <transitions_def, meta_def>)
     defs.extend(model.state_machines.iter().flat_map(|sm| {
         let machine_def_name = format!("machine:{}", sm.noun_name);
-        let events: Vec<String> = sm.transition_table.iter().map(|(_, _, e)| e.clone())
-            .collect::<hashbrown::HashSet<_>>().into_iter().collect();
+        // M1e (#733): sort-then-dedup is the right primitive for "list
+        // of distinct events." HashSet was used purely for de-dup; the
+        // outer Vec ordering wasn't load-bearing (per-event checks
+        // are order-independent under Filter(¬null)) but stable order
+        // makes generator output deterministic across runs.
+        let mut events: Vec<String> = sm.transition_table.iter()
+            .map(|(_, _, e)| e.clone()).collect();
+        events.sort();
+        events.dedup();
         // Î±(event â†’ check_func): for each event, build condition that tests transition
         let checks: Vec<Func> = events.iter().map(|event| {
             let apply_machine = Func::compose(
@@ -1449,9 +1456,17 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         .flat_map(|(ft, c)| ft.roles.iter().map(move |r| (r.noun_name.clone(), c)))
         .fold(HashMap::new(), |mut m, (noun, c)| { m.entry(noun).or_default().push(c); m });
 
+    // M1e (#733): same shape as the in-loop dedup above — sort+dedup
+    // gives a deterministic distinct-events list without spinning up a
+    // HashSet for each SM.
     let noun_transitions: HashMap<String, Vec<String>> = model.state_machines.iter()
-        .map(|sm| (sm.noun_name.clone(), sm.transition_table.iter()
-            .map(|(_, _, e)| e.clone()).collect::<HashSet<_>>().into_iter().collect()))
+        .map(|sm| {
+            let mut events: Vec<String> = sm.transition_table.iter()
+                .map(|(_, _, e)| e.clone()).collect();
+            events.sort();
+            events.dedup();
+            (sm.noun_name.clone(), events)
+        })
         .collect();
 
     // Î±(noun â†’ agent_def) â€” filter nouns with readings, map to prompt Object
@@ -1552,8 +1567,13 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     if !active_dialects.is_empty() {
         // #325: triggers read RMAP via cells too, matching generator 3.
         let rmap_cells = crate::rmap::rmap_cells_from_state(state);
-        let table_names: hashbrown::HashSet<String> = crate::rmap::table_names(&rmap_cells)
-            .into_iter().collect();
+        // M1f (#734): `table_names()` already returns a Vec; only
+        // `.contains()` is needed downstream (two call sites in
+        // `generate_derivation_triggers`). HashSet was a needless
+        // realloc; Vec membership over <~100 tables per domain is
+        // O(n) on a tiny list, fine for trigger codegen which runs
+        // rarely.
+        let table_names = crate::rmap::table_names(&rmap_cells);
         let triggers = generate_derivation_triggers(
             &c_derivation_rules, &c_fact_types, &rmap_cells, &table_names);
         defs.extend(triggers.into_iter().map(|(name, ddl)| {
@@ -2052,14 +2072,21 @@ pub(crate) fn validate_model_data(ir: &CellIndex) -> Vec<String> {
         });
 
     // 5. Ring constraint on non-self-referential binary
+    // M1d (#732): "are both role nouns the same?" doesn't need a
+    // HashSet — for a binary FT it's just `r0 != r1`. Direct compare
+    // also gives a deterministic diagnostic (HashSet iteration order
+    // wasn't).
     ir.constraints.iter()
         .filter(|c| ["IR", "AS", "SY", "TR", "IT", "AC", "RF", "AT"].contains(&c.kind.as_str()))
         .for_each(|c| {
             c.spans.first().and_then(|span| ir.fact_types.get(&span.fact_type_id)).map(|ft| {
-                let role_nouns: HashSet<&str> = ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
-                (ft.roles.len() == 2 && role_nouns.len() != 1).then(|| errors.push(format!(
-                    "Ring constraint '{}' on '{}' requires both roles to be the same type, but found {:?}",
-                    c.kind, ft.reading, role_nouns)));
+                if let (2, Some(r0), Some(r1)) = (ft.roles.len(), ft.roles.get(0), ft.roles.get(1)) {
+                    if r0.noun_name != r1.noun_name {
+                        errors.push(format!(
+                            "Ring constraint '{}' on '{}' requires both roles to be the same type, but found {{\"{}\", \"{}\"}}",
+                            c.kind, ft.reading, r0.noun_name, r1.noun_name));
+                    }
+                }
             });
         });
 
@@ -3115,10 +3142,10 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     )
                 }
             } else {
-                let literal_by_role: hashbrown::HashMap<&str, &str> =
-                    rule.consequent_role_literals.iter()
-                        .map(|crl| (crl.role.as_str(), crl.value.as_str()))
-                        .collect();
+                // M1b (#730): direct iter-find over the literals list
+                // — typical rules have ≤5 entries, so the HashMap was
+                // overkill. Linear scan is O(R × L) with tiny
+                // constants and avoids the per-call hash table build.
                 let cons_roles = data.fact_types.get(&consequent_id)
                     .map(|ft| ft.roles.clone())
                     .unwrap_or_default();
@@ -3126,10 +3153,10 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 // names to match Stage-1 / cell-push conventions.
                 let pairs: Vec<Func> = cons_roles.iter().map(|r| {
                     let key = r.noun_name.replace(' ', "_");
-                    let value_func = match literal_by_role.get(r.noun_name.as_str()) {
-                        Some(lit) => Func::constant(Object::atom(lit)),
-                        None => role_value_by_name(&r.noun_name),
-                    };
+                    let value_func = rule.consequent_role_literals.iter()
+                        .find(|crl| crl.role == r.noun_name)
+                        .map(|crl| Func::constant(Object::atom(&crl.value)))
+                        .unwrap_or_else(|| role_value_by_name(&r.noun_name));
                     Func::construction(vec![
                         Func::constant(Object::atom(&key)),
                         value_func,
@@ -3180,21 +3207,18 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             let bindings = if rule.consequent_role_literals.is_empty() {
                 first_fact
             } else {
-                let literal_by_role: hashbrown::HashMap<&str, &str> =
-                    rule.consequent_role_literals.iter()
-                        .map(|crl| (crl.role.as_str(), crl.value.as_str()))
-                        .collect();
+                // M1c (#731): same pattern as M1b — direct iter-find.
                 let cons_roles = data.fact_types.get(&consequent_id)
                     .map(|ft| ft.roles.clone())
                     .unwrap_or_default();
                 let pairs: Vec<Func> = cons_roles.iter().map(|r| {
                     let key = r.noun_name.replace(' ', "_");
-                    let value_func = match literal_by_role.get(r.noun_name.as_str()) {
-                        Some(lit) => Func::constant(Object::atom(lit)),
-                        None => Func::compose(
+                    let value_func = rule.consequent_role_literals.iter()
+                        .find(|crl| crl.role == r.noun_name)
+                        .map(|crl| Func::constant(Object::atom(&crl.value)))
+                        .unwrap_or_else(|| Func::compose(
                             role_value_by_name(&r.noun_name),
-                            first_fact.clone()),
-                    };
+                            first_fact.clone()));
                     Func::construction(vec![
                         Func::constant(Object::atom(&key)),
                         value_func,
@@ -5234,7 +5258,7 @@ pub fn generate_derivation_triggers(
     derivation_rules: &[DerivationRuleDef],
     fact_types: &HashMap<String, FactTypeDef>,
     rmap_cells: &crate::ast::Object,
-    table_names: &HashSet<String>,
+    table_names: &[String],
 ) -> Vec<(String, String)> {
     let mut result = Vec::new();
 
