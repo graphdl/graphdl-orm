@@ -3365,11 +3365,112 @@ pub fn is_version_entry(obj: &Object) -> bool {
     version_entry_id(obj).is_some() && version_entry_contents(obj).is_some()
 }
 
-/// Fetch (↑n): retrieve contents of the first cell named n from a store.
-/// ↑n:D → c where D contains <CELL, n, c>
-/// Returns bottom if no cell named n exists.
-/// O(1) for Map stores, O(n) fallback for Seq stores.
-pub fn fetch(name: &str, state: &Object) -> Object {
+// ─── Cell version chain (S1b, #718) ─────────────────────────────────────
+//
+// A "version chain" is an Object::Seq whose elements are all VersionEntry
+// objects in chronological order (oldest at index 0, latest at len-1).
+// `merge_delta` (the commit boundary) appends a new entry per cell update
+// — this realizes whitepaper eq:cellfold's `D_n' = foldl μ_n D_n E_n`.
+//
+// Reads stay transparent: `fetch`, `fetch_or_phi`, and `cells_iter` all
+// auto-unwrap chains to return the latest version's contents. Legacy raw
+// values pass through unchanged. `cells_iter_history` (additive) returns
+// the full chain for callers who want the trace.
+//
+// `store` (the intermediate-computation primitive) is unchanged — only
+// `merge_delta` versions, so internal forward-chaining work doesn't grow
+// a chain entry per fact.
+
+/// Predicate: is this Object a non-empty Seq of VersionEntry items?
+pub fn is_version_chain(obj: &Object) -> bool {
+    obj.as_seq()
+        .map(|items| !items.is_empty() && items.iter().all(is_version_entry))
+        .unwrap_or(false)
+}
+
+/// Latest entry of a chain, or None if the input isn't a chain.
+pub fn chain_latest(obj: &Object) -> Option<&Object> {
+    if !is_version_chain(obj) {
+        return None;
+    }
+    obj.as_seq()?.last()
+}
+
+/// "Logical contents" of a cell value: latest version's contents if the
+/// value is a chain, otherwise the raw object itself. The lifetime of
+/// the returned reference matches the input — reads are zero-copy.
+pub fn cell_contents_view(obj: &Object) -> &Object {
+    if let Some(latest) = chain_latest(obj) {
+        if let Some(c) = version_entry_contents(latest) {
+            return c;
+        }
+    }
+    obj
+}
+
+/// Wrap raw contents in a fresh single-version chain (version_id = 1,
+/// prev = None). Used by `merge_delta` when the base has no prior entry
+/// for a cell name.
+pub fn wrap_as_chain(contents: Object, recorded_at: Object) -> Object {
+    Object::seq(alloc::vec![version_entry(1, contents, None, recorded_at)])
+}
+
+/// Append a new version entry to a chain. If `current` is not a chain,
+/// promote it to a synthetic version-0 entry first so the new entry's
+/// `prev` pointer chains backward into the legacy raw value.
+pub fn chain_append(current: &Object, new_contents: Object, recorded_at: Object) -> Object {
+    if is_version_chain(current) {
+        let mut items: alloc::vec::Vec<Object> = current.as_seq()
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        let prev_id = items.last()
+            .and_then(version_entry_id)
+            .unwrap_or(0);
+        let new_id = prev_id + 1;
+        items.push(version_entry(new_id, new_contents, Some(prev_id), recorded_at));
+        Object::seq(items)
+    } else {
+        // Promote legacy raw value to a synthetic v0 with prev=None.
+        // The new contents land as v1 with prev=Some(0).
+        let v0_recorded = Object::atom("0");
+        Object::seq(alloc::vec![
+            version_entry(0, current.clone(), None, v0_recorded),
+            version_entry(1, new_contents, Some(0), recorded_at),
+        ])
+    }
+}
+
+/// Walk the version chain of cell `name` in stored order (oldest first
+/// → newest last). Empty Vec if the cell doesn't exist. For non-chain
+/// (legacy) values, returns a single-element Vec wrapping the raw value
+/// as a synthetic v0 entry — kept allocation-free by returning a Vec of
+/// owned VersionEntry Objects in that one branch only.
+pub fn cells_iter_history(state: &Object, name: &str) -> Vec<Object> {
+    let raw = match state {
+        Object::Map(map) => match map.get(name) {
+            Some(v) => v.clone(),
+            None => return Vec::new(),
+        },
+        Object::Seq(_) | _ => {
+            let v = fetch_raw(name, state);
+            if matches!(v, Object::Bottom) { return Vec::new(); }
+            v
+        }
+    };
+    if is_version_chain(&raw) {
+        raw.as_seq()
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    } else {
+        // Legacy: synthesize a v0 entry so callers get a uniform shape.
+        alloc::vec![version_entry(0, raw, None, Object::atom("0"))]
+    }
+}
+
+/// Internal: fetch the raw stored value (chain-or-raw) without unwrapping.
+/// `fetch` exists as the public unwrap-aware reader. `fetch_raw` is for
+/// `merge_delta` and `cells_iter_history` which need to see the chain.
+fn fetch_raw(name: &str, state: &Object) -> Object {
     match state {
         Object::Map(map) => map.get(name).cloned().unwrap_or(Object::Bottom),
         Object::Seq(cells) => cells.iter()
@@ -3386,6 +3487,24 @@ pub fn fetch(name: &str, state: &Object) -> Object {
             })
             .unwrap_or(Object::Bottom),
         _ => Object::Bottom,
+    }
+}
+
+/// Fetch (↑n): retrieve contents of the first cell named n from a store.
+/// ↑n:D → c where D contains <CELL, n, c>
+/// Returns bottom if no cell named n exists.
+/// O(1) for Map stores, O(n) fallback for Seq stores.
+pub fn fetch(name: &str, state: &Object) -> Object {
+    let raw = fetch_raw(name, state);
+    // S1b (#718): unwrap to latest version's contents if the stored
+    // value is a version chain. Legacy raw values pass through.
+    if is_version_chain(&raw) {
+        chain_latest(&raw)
+            .and_then(version_entry_contents)
+            .cloned()
+            .unwrap_or(Object::Bottom)
+    } else {
+        raw
     }
 }
 
@@ -3527,14 +3646,18 @@ fn same_identity(a: &Object, b: &Object) -> bool {
 /// Iterate all cells in state as (name, contents) pairs.
 /// Replaces: population.facts.iter()
 pub fn cells_iter(state: &Object) -> Vec<(&str, &Object)> {
+    // S1b (#718): when a stored value is a version chain, the &Object
+    // returned points at the latest version's `contents` sub-Object.
+    // Lifetime stays the same as the input — chain unwrapping is
+    // pointer chase, not allocation. Legacy raw values pass through.
     match state {
         Object::Map(map) => map.iter()
-            .map(|(k, v)| (k.as_str(), v))
+            .map(|(k, v)| (k.as_str(), cell_contents_view(v)))
             .collect(),
         Object::Seq(cells) => cells.iter().filter_map(|c| {
             let items = c.as_seq()?;
             if items.len() == 3 && items[0].as_atom() == Some(CELL_TAG) {
-                Some((items[1].as_atom()?, &items[2]))
+                Some((items[1].as_atom()?, cell_contents_view(&items[2])))
             } else {
                 None
             }
@@ -3566,21 +3689,64 @@ pub fn diff_cells(old: &Object, new: &Object) -> Object {
     Object::Map(delta)
 }
 
-/// Merge a cell delta onto a base store. For each cell in `delta`,
-/// overwrite the corresponding cell in `base`; other cells pass
-/// through unchanged. Complement of `diff_cells`: for any (old, new),
-/// `merge_delta(old, diff_cells(old, new)) == new` for the cells
-/// present in new.
+/// Merge a cell delta onto a base store. S1b (#718): for each cell in
+/// `delta`, append the new contents as a fresh VersionEntry on top of
+/// the base's per-cell chain (or wrap it in a new chain if the cell is
+/// absent from base). Cells not in `delta` keep their existing chain.
+///
+/// Realizes whitepaper eq:cellfold (`D_n' = foldl μ_n D_n E_n`): each
+/// merge is one fold step, the per-cell sequence of intermediate states
+/// is retained instead of collapsed.
+///
+/// Read invariant: `cells_iter`/`fetch_or_phi` on the result returns
+/// the latest version's contents — same logical view as the legacy
+/// "last-write-wins" semantics, so existing readers are unaffected.
+///
+/// Complement of `diff_cells`: for any (old, new),
+/// `cells_iter(merge_delta(old, diff_cells(old, new)))` produces the
+/// same (name, contents) pairs as `cells_iter(new)`.
 pub fn merge_delta(base: &Object, delta: &Object) -> Object {
-    let base_map: HashMap<String, Object> = cells_iter(base).into_iter()
-        .map(|(k, v)| (k.to_string(), v.clone()))
-        .collect();
-    let delta_map: HashMap<String, Object> = cells_iter(delta).into_iter()
-        .map(|(k, v)| (k.to_string(), v.clone()))
-        .collect();
-    let mut merged = base_map;
-    for (k, v) in delta_map { merged.insert(k, v); }
-    Object::Map(merged)
+    // Read base WITHOUT unwrapping — chains are preserved.
+    let mut base_map: HashMap<String, Object> = match base {
+        Object::Map(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        Object::Seq(cells) => cells.iter().filter_map(|c| {
+            let items = c.as_seq()?;
+            if items.len() == 3 && items[0].as_atom() == Some(CELL_TAG) {
+                Some((items[1].as_atom()?.to_string(), items[2].clone()))
+            } else {
+                None
+            }
+        }).collect(),
+        _ => HashMap::new(),
+    };
+
+    // Delta values are raw contents (logical, not chain-wrapped) per
+    // the diff_cells contract.
+    let delta_pairs: Vec<(String, Object)> = match delta {
+        Object::Map(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        Object::Seq(cells) => cells.iter().filter_map(|c| {
+            let items = c.as_seq()?;
+            if items.len() == 3 && items[0].as_atom() == Some(CELL_TAG) {
+                Some((items[1].as_atom()?.to_string(), items[2].clone()))
+            } else {
+                None
+            }
+        }).collect(),
+        _ => Vec::new(),
+    };
+
+    // One wall-clock read per merge — every cell in this delta gets the
+    // same recorded_at (commit-batch atomicity).
+    let recorded_at = apply_platform("now", &Object::phi(), &Object::phi());
+
+    for (k, v) in delta_pairs {
+        let new_chain = match base_map.get(&k) {
+            Some(existing) => chain_append(existing, v, recorded_at.clone()),
+            None => wrap_as_chain(v, recorded_at.clone()),
+        };
+        base_map.insert(k, new_chain);
+    }
+    Object::Map(base_map)
 }
 
 /// Demultiplex events by cell assignment (paper Eq. demux).
@@ -6542,6 +6708,162 @@ mod tests {
         assert!(!is_version_entry(&Object::seq(vec![Object::atom("a")])));
         // A normal cell tuple must not pollute the predicate.
         assert!(!is_version_entry(&cell("Noun", Object::atom("Alice"))));
+    }
+
+    // ─── S1b: chain semantics + merge_delta append (#718) ──────────────
+
+    #[test]
+    fn is_version_chain_detects_wrapped_seq_only() {
+        let chain = wrap_as_chain(Object::atom("payload"), Object::atom("0"));
+        assert!(is_version_chain(&chain));
+        // Raw cells aren't chains.
+        assert!(!is_version_chain(&Object::atom("plain")));
+        assert!(!is_version_chain(&Object::phi()));
+        assert!(!is_version_chain(&Object::seq(vec![Object::atom("a"), Object::atom("b")])));
+        // Single non-entry items in a Seq don't qualify.
+        assert!(!is_version_chain(&Object::seq(vec![fact_from_pairs(&[("k", "v")])])));
+    }
+
+    #[test]
+    fn cell_contents_view_unwraps_chain_or_passes_raw() {
+        let raw = Object::atom("raw");
+        assert_eq!(cell_contents_view(&raw), &raw, "raw passes through");
+
+        let payload = Object::atom("payload");
+        let chain = wrap_as_chain(payload.clone(), Object::atom("0"));
+        assert_eq!(cell_contents_view(&chain), &payload, "chain unwraps to latest");
+    }
+
+    #[test]
+    fn merge_delta_appends_a_new_version_per_call() {
+        // Start with an empty Map base.
+        let s0 = Object::Map(HashMap::new());
+
+        let mut d1 = HashMap::new();
+        d1.insert("X".to_string(), Object::atom("v1"));
+        let s1 = merge_delta(&s0, &Object::Map(d1));
+
+        let mut d2 = HashMap::new();
+        d2.insert("X".to_string(), Object::atom("v2"));
+        let s2 = merge_delta(&s1, &Object::Map(d2));
+
+        // Logical view shows latest.
+        assert_eq!(fetch_or_phi("X", &s2), Object::atom("v2"));
+
+        // History shows both versions in chronological order.
+        let hist = cells_iter_history(&s2, "X");
+        assert_eq!(hist.len(), 2, "two merges → two entries");
+        assert_eq!(version_entry_id(&hist[0]), Some(1));
+        assert_eq!(version_entry_contents(&hist[0]), Some(&Object::atom("v1")));
+        assert_eq!(version_entry_prev(&hist[0]), None);
+        assert_eq!(version_entry_id(&hist[1]), Some(2));
+        assert_eq!(version_entry_contents(&hist[1]), Some(&Object::atom("v2")));
+        assert_eq!(version_entry_prev(&hist[1]), Some(1));
+    }
+
+    #[test]
+    fn merge_delta_creates_chain_for_absent_cell() {
+        let s0 = Object::Map(HashMap::new());
+        let mut d = HashMap::new();
+        d.insert("Brand_new".to_string(), Object::atom("hello"));
+        let s1 = merge_delta(&s0, &Object::Map(d));
+
+        let hist = cells_iter_history(&s1, "Brand_new");
+        assert_eq!(hist.len(), 1);
+        assert_eq!(version_entry_id(&hist[0]), Some(1));
+        assert_eq!(version_entry_prev(&hist[0]), None);
+    }
+
+    #[test]
+    fn merge_delta_promotes_legacy_raw_to_v0_then_appends() {
+        // Base is built from legacy Seq form (no chain wrapping).
+        let s0 = Object::seq(vec![cell("X", Object::atom("legacy"))]);
+
+        let mut d = HashMap::new();
+        d.insert("X".to_string(), Object::atom("new"));
+        let s1 = merge_delta(&s0, &Object::Map(d));
+
+        // History: synthetic v0 = "legacy", then v1 = "new".
+        let hist = cells_iter_history(&s1, "X");
+        assert_eq!(hist.len(), 2);
+        assert_eq!(version_entry_id(&hist[0]), Some(0), "legacy promoted to v0");
+        assert_eq!(version_entry_contents(&hist[0]), Some(&Object::atom("legacy")));
+        assert_eq!(version_entry_id(&hist[1]), Some(1));
+        assert_eq!(version_entry_contents(&hist[1]), Some(&Object::atom("new")));
+
+        // Logical view of the cell is the latest write.
+        assert_eq!(fetch_or_phi("X", &s1), Object::atom("new"));
+    }
+
+    #[test]
+    fn cells_iter_history_returns_synthetic_v0_for_legacy_raw() {
+        // Pure-Seq state with no chain wrapping anywhere.
+        let s = Object::seq(vec![cell("X", Object::atom("only"))]);
+        let hist = cells_iter_history(&s, "X");
+        assert_eq!(hist.len(), 1);
+        assert_eq!(version_entry_id(&hist[0]), Some(0));
+        assert_eq!(version_entry_contents(&hist[0]), Some(&Object::atom("only")));
+    }
+
+    #[test]
+    fn cells_iter_history_empty_for_unknown_cell() {
+        let s = Object::Map(HashMap::new());
+        assert!(cells_iter_history(&s, "no_such_cell").is_empty());
+    }
+
+    #[test]
+    fn diff_then_merge_preserves_logical_view_after_chain_lands() {
+        // The eq:cellfold realignment must not break the legacy
+        // diff_cells → merge_delta round-trip invariant: cells_iter on
+        // the reconstructed state must produce the same (name, contents)
+        // pairs as cells_iter on the new state.
+        let old = Object::seq(vec![
+            cell("A", Object::atom("1")),
+            cell("B", Object::atom("2")),
+            cell("C", Object::atom("3")),
+        ]);
+        let new = Object::seq(vec![
+            cell("A", Object::atom("1")),       // unchanged
+            cell("B", Object::atom("CHANGED")), // changed
+            cell("C", Object::atom("3")),       // unchanged
+            cell("D", Object::atom("4")),       // added
+        ]);
+        let delta = diff_cells(&old, &new);
+        let reconstructed = merge_delta(&old, &delta);
+
+        // Logical view of reconstructed matches new for every cell.
+        for name in ["A", "B", "C", "D"] {
+            assert_eq!(
+                fetch_or_phi(name, &reconstructed),
+                fetch_or_phi(name, &new),
+                "cell {} round-trips through diff+merge", name
+            );
+        }
+    }
+
+    #[test]
+    fn merge_delta_on_chain_does_not_lose_prior_versions() {
+        // Three sequential merges to the same cell — chain should grow
+        // to three entries.
+        let mut state = Object::Map(HashMap::new());
+        for tag in &["a", "b", "c"] {
+            let mut d = HashMap::new();
+            d.insert("Item".to_string(), Object::atom(tag));
+            state = merge_delta(&state, &Object::Map(d));
+        }
+        let hist = cells_iter_history(&state, "Item");
+        assert_eq!(hist.len(), 3);
+        assert_eq!(version_entry_contents(&hist[0]), Some(&Object::atom("a")));
+        assert_eq!(version_entry_contents(&hist[1]), Some(&Object::atom("b")));
+        assert_eq!(version_entry_contents(&hist[2]), Some(&Object::atom("c")));
+        // version_ids are sequential starting at 1.
+        assert_eq!(version_entry_id(&hist[0]), Some(1));
+        assert_eq!(version_entry_id(&hist[1]), Some(2));
+        assert_eq!(version_entry_id(&hist[2]), Some(3));
+        // Each prev points at the previous id.
+        assert_eq!(version_entry_prev(&hist[0]), None);
+        assert_eq!(version_entry_prev(&hist[1]), Some(1));
+        assert_eq!(version_entry_prev(&hist[2]), Some(2));
     }
 
     #[cfg(not(feature = "no_std"))]
