@@ -1008,4 +1008,59 @@ Customer wrote Review.
         // compound-noun heuristic.
         assert!(!super::text_contains_capitalized_prefixed("GDPR Data processes Data", "Data"));
     }
+
+    /// #750 — parser-level fix for the compound-noun problem. When a
+    /// fact-type reading contains a compound noun in role position
+    /// (`Personal Data Breach is breach of security leading to loss of
+    /// Personal Data`), the parser must produce Role facts whose
+    /// `nounName` is the compound noun, not the bare-word suffix.
+    ///
+    /// Driving readings used here: only `Data(.id)` is explicitly
+    /// declared as an entity type. `Personal Data` and
+    /// `Personal Data Breach` appear inline with `(.…)` annotations
+    /// in role positions; the parser auto-declares them so Stage-1's
+    /// longest-first noun matcher can recognize the compound nouns
+    /// when tokenizing the FT reading.
+    ///
+    /// This test asserts the parser-level invariant directly
+    /// (Role cell contents and the stored FT reading) so it stays
+    /// meaningful even after the `check_ring_completeness` suppression
+    /// heuristic at check.rs:373-407 is removed.
+    #[test]
+    fn compound_noun_inline_id_preserved_in_role_noun_name() {
+        let input = "\
+Data(.id) is an entity type.
+Personal Data Breach(.id) is breach of security leading to loss of Personal Data(.id).
+";
+        let state = parse_to_state(input).expect("parse");
+
+        // The fact type's two roles must both bind to compound nouns,
+        // not the bare-word `Data` suffix.
+        let ft_id_for_target: Option<String> = fetch_or_phi("FactType", &state).as_seq()
+            .and_then(|fts| fts.iter().find_map(|ft| {
+                let reading = binding(ft, "reading").unwrap_or("");
+                if reading.contains("breach of security") {
+                    binding(ft, "id").map(|s| s.to_string())
+                } else { None }
+            }));
+        let target_id = ft_id_for_target.expect("the breach-of-security FT must register");
+        let target_role_nouns: Vec<String> = fetch_or_phi("Role", &state).as_seq()
+            .map(|rs| rs.iter()
+                .filter(|r| binding(r, "factType").map(|s| s.to_string()) == Some(target_id.clone()))
+                .filter_map(|r| binding(r, "nounName").map(|s| s.to_string()))
+                .collect())
+            .unwrap_or_default();
+        assert_eq!(target_role_nouns.len(), 2,
+            "binary FT must produce two Role facts; got {:?}",
+            target_role_nouns);
+        assert!(target_role_nouns.iter().all(|n| n != "Data"),
+            "no role of the breach FT may bind to the bare suffix `Data` (compound noun was lost in tokenization); got {:?}",
+            target_role_nouns);
+        assert!(target_role_nouns.iter().any(|n| n == "Personal Data Breach"),
+            "first role must bind to compound noun `Personal Data Breach`; got {:?}",
+            target_role_nouns);
+        assert!(target_role_nouns.iter().any(|n| n == "Personal Data"),
+            "second role must bind to compound noun `Personal Data`; got {:?}",
+            target_role_nouns);
+    }
 }

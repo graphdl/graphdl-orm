@@ -3195,6 +3195,16 @@ fn reject_reserved_noun_declarations(
 /// Quoted names have their surrounding quotes stripped. Partition
 /// subtype lists are expanded so each member becomes a noun name.
 /// Handles `(.refScheme)` suffixes by trimming at the open paren.
+///
+/// #750 — also auto-declares compound nouns referenced inline with
+/// `(.<refScheme>)` in role positions (e.g. `Personal Data Breach is
+/// breach of security leading to loss of Personal Data(.id).`). The
+/// trailing `(.id)` marks the preceding capitalized-word run as a
+/// noun head. Without this scan, the longest-match Stage-1 tokenizer
+/// has no entry for `Personal Data` in its noun set and falls
+/// through to the bare-word `Data`, producing a false ring shape on
+/// the FT's two roles. Auto-declaring the compound from inline use
+/// preserves the declared role nouns end-to-end.
 fn extract_declared_noun_names(text: &str) -> Vec<String> {
     let mut names: alloc::collections::BTreeSet<String> =
         alloc::collections::BTreeSet::new();
@@ -3262,8 +3272,107 @@ fn extract_declared_noun_names(text: &str) -> Vec<String> {
         if let Some(before) = before {
             push(&mut names, before);
         }
+        // #750 — auto-declare compound nouns from inline `(.…)` use.
+        // Apply to every line so a fact-type reading like
+        // `Foo(.id) is breach of Personal Data(.id).` contributes
+        // both `Foo` and `Personal Data`. The entity-declaration form
+        // above already captured the head, but inline references in
+        // role positions need this scan.
+        for noun in extract_inline_paren_nouns(line) {
+            names.insert(noun);
+        }
     }
     names.into_iter().collect()
+}
+
+/// #750 — given a single line, find each `(.<chars>)` occurrence and
+/// recover the noun head that immediately precedes it. The head is
+/// the longest run of consecutive capitalized words (each starting
+/// with an ASCII uppercase letter) walking backward from the open
+/// paren, separated by single spaces. Stops on:
+///   - sentence start (offset 0),
+///   - a non-capitalized word (lowercase verb like `is`, `has`),
+///   - a punctuation boundary (`.`, `,`, `:`, etc.),
+///   - any non-letter, non-digit, non-underscore, non-space byte.
+///
+/// Returns the heads as owned `String`s.
+fn extract_inline_paren_nouns(line: &str) -> Vec<String> {
+    let bytes = line.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut search_from = 0;
+    while let Some(rel) = line[search_from..].find("(.") {
+        let paren = search_from + rel;
+        // Advance past this `(.` for the next iteration regardless of
+        // outcome. Use paren + 2 so we never re-enter the same site.
+        search_from = paren + 2;
+
+        // Walk back past the `(`. If the immediate preceding char is
+        // not an alphanumeric / underscore (i.e. the `(.` isn't right
+        // up against a word), skip — that's a citation, footnote, or
+        // unrelated punctuation.
+        if paren == 0 { continue; }
+        let end = paren;
+        // Must immediately follow a word character.
+        if !(bytes[end - 1].is_ascii_alphanumeric() || bytes[end - 1] == b'_') {
+            continue;
+        }
+        // Walk backward over capitalized space-separated words.
+        let head_start = walk_back_capitalized_words(bytes, end);
+        if head_start >= end { continue; }
+        let head = &line[head_start..end];
+        // Filter: must contain at least one ASCII uppercase letter
+        // (otherwise we've picked up a lowercase fragment like
+        // `subject`). And must not include a `(` itself.
+        if !head.bytes().any(|b| b.is_ascii_uppercase()) { continue; }
+        if head.contains('(') { continue; }
+        // Multi-word heads are the interesting case here; single
+        // words also enter the list (cheap, and may catch
+        // implicit declarations). The cost is bounded — Stage-1's
+        // longest-match prefers the longest matching noun, so
+        // an extra single-word entry is harmless.
+        out.push(head.to_string());
+    }
+    out
+}
+
+/// Walk backward from `end` over capitalized word characters,
+/// returning the start byte offset of the first character of the
+/// run. Words are separated by exactly one space; each word starts
+/// with an ASCII uppercase letter and contains only ASCII alpha
+/// (uppercase or lowercase) — digits and underscores are excluded
+/// from noun heads to keep the scan conservative.
+fn walk_back_capitalized_words(bytes: &[u8], end: usize) -> usize {
+    if end == 0 { return 0; }
+    // `accepted` tracks the start of the last word we committed to.
+    // We only return positions we've accepted; an aborted scan of a
+    // tentative previous word does not move `accepted` backward.
+    let mut accepted = end;
+    let mut cursor = end;
+    loop {
+        // Find start of current word: walk back while ascii alpha.
+        let mut word_start = cursor;
+        while word_start > 0 && bytes[word_start - 1].is_ascii_alphabetic() {
+            word_start -= 1;
+        }
+        // Empty run (cursor sits on non-alpha) → done.
+        if word_start == cursor { break; }
+        // Reject lowercase-leading word — that's a verb / preposition,
+        // not part of the noun head.
+        if !bytes[word_start].is_ascii_uppercase() { break; }
+        // Accept this word.
+        accepted = word_start;
+        // Need exactly one ASCII space separating words to keep
+        // walking. Sentence start, period, or other punctuation
+        // ends the noun head.
+        if word_start == 0 || bytes[word_start - 1] != b' ' { break; }
+        // The char before the space must be ASCII alpha so the
+        // previous token is a real word. Otherwise stop.
+        if word_start < 2 || !bytes[word_start - 2].is_ascii_alphabetic() { break; }
+        // Step the cursor onto the space; next iter will walk past
+        // it into the previous word.
+        cursor = word_start - 1;
+    }
+    accepted
 }
 
 #[cfg(all(test, feature = "std-deps"))]
