@@ -1,14 +1,5 @@
 # Vercel AI SDK
 
-Reading for the `ai` npm package (Vercel AI SDK core) and its provider
-modules. Verbs declared here become callable through DEFS once the JS
-import mechanism described in `core/imports.md` resolves them.
-
-The core package exports the LLM call surface (`generateText`,
-`streamText`, `generateObject`, `streamObject`, `embed`, `embedMany`,
-`tool`) plus stream-to-Response helpers used on the server side. Provider
-modules export Model factories that the core functions consume.
-
 ## Instance Facts
 
 ### Packages
@@ -105,4 +96,4 @@ Verb 'streamToResponse' has Symbol Name 'streamToResponse'.
 Verb 'streamToResponse' has Description 'Convert a StreamTextResult into a Response that the client useChat hook can consume. Wires the SSE protocol the hook expects.'.
 
 Domain 'vercel-ai' has Access 'public'.
-Domain 'vercel-ai' has Description 'Vercel AI SDK (npm: ai). Core primitives for building LLM applications: generateText, streamText, generateObject, streamObject, embed, embedMany, tool. Provider modules (@ai-sdk/openai, @ai-sdk/anthropic, @ai-sdk/google, @ai-sdk/xai) export model factories. Verbs declared here become callable to AREST domains via DEFS once core/imports.md is wired into the runtime; pair with templates/vercel-chat.md for the React UI surface.'.
+Domain 'vercel-ai' has Description 'Vercel AI SDK (npm: ai) core surface plus @ai-sdk/* provider model factories.'.

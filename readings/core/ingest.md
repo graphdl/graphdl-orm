@@ -1,10 +1,5 @@
 # Event Ingest
 
-How webhook events from external systems are mapped to facts in the AREST
-population. The fetch path (`docs/08-federation.md`) covers GET-pull from
-external systems; this file covers PUSH ingest of events that carry a bag
-of facts each.
-
 ## Entity Types
 
 Webhook Event(.id) is an entity type.
@@ -51,18 +46,6 @@ It is obligatory that for each Webhook Event Type that yields some Fact Type, ev
 
 ## Derivation Rules
 
-### Yielded Fact (#ingest)
-
-When a Webhook Event arrives carrying a Webhook Event Type, the runtime
-constructs one Fact per Fact Type that the Webhook Event Type yields.
-For each Role of that Fact Type, the runtime extracts a value from the
-Webhook Event's Payload at the declared JSON Path. If the Role's player
-is an entity, the engine finds-or-upserts the entity using the Noun's
-reference scheme matching the extracted value; if the Role's player is
-a value type, the value is used directly. The constructed Fact enters
-P; the state machine fold consumes it via Transition is triggered by
-Fact Type.
-
 * Webhook Event yields Fact iff Webhook Event has Webhook Event Type
   and Webhook Event Type yields Fact Type
   and Fact is of that Fact Type
@@ -73,4 +56,4 @@ Fact Type.
 ## Instance Facts
 
 Domain 'ingest' has Access 'public'.
-Domain 'ingest' has Description 'Webhook event ingest. An external system pushes a Webhook Event carrying a Payload. The Webhook Event Type declares which Fact Types it yields and the JSON Path that fills each Role. The runtime materialises the Facts into P; the state machine fold consumes them via Transition is triggered by Fact Type. Reference scheme matching handles entity find-or-upsert from extracted ids. The fetch path (federation) is for GET-pull; this domain is for PUSH ingest.'.
+Domain 'ingest' has Description 'Webhook event ingest. External system pushes a Webhook Event carrying a Payload; the Webhook Event Type declares which Fact Types it yields and the JSON Paths that fill each Role.'.

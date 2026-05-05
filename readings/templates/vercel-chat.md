@@ -1,15 +1,4 @@
-# Vercel AI SDK — Chat / UI Surface
-
-Reading for the React UI bindings of the Vercel AI SDK (`@ai-sdk/react`)
-plus AI Elements (chat UI components). These hooks and components turn
-`generateText` / `streamText` / `streamObject` responses produced by the
-server-side surface (`templates/vercel-ai.md`) into managed-state React
-UIs.
-
-The hooks consume the AI SDK Data Stream protocol that
-`streamText().toDataStreamResponse()` (and equivalents) emit. AI Elements
-provides ready-made primitives — `Conversation`, `Message`,
-`PromptInput`, `Response` — composable on top of the hook state.
+# Vercel AI SDK Chat UI
 
 ## Instance Facts
 
@@ -93,4 +82,4 @@ Verb 'toAIStreamResponse' has Symbol Name 'toAIStreamResponse'.
 Verb 'toAIStreamResponse' has Description 'Legacy converter for older streaming clients. Prefer toDataStreamResponse for new code.'.
 
 Domain 'vercel-chat' has Access 'public'.
-Domain 'vercel-chat' has Description 'Vercel AI SDK React UI surface (@ai-sdk/react) plus AI Elements (ai-elements). useChat, useCompletion, useObject, useAssistant hooks for managed chat state on the client; Conversation / Message / PromptInput / Response / Reasoning components for ready-made UI; toDataStreamResponse on the server-side bridges generateText / streamText results to the SSE protocol the hooks consume. Pairs with templates/vercel-ai.md for the server-side core, templates/agent-chat.md for the abstract conversation primitive, and core/imports.md for the JS import federation surface.'.
+Domain 'vercel-chat' has Description 'Vercel AI SDK React UI surface (@ai-sdk/react) plus AI Elements components.'.
