@@ -468,23 +468,44 @@ pub struct ExtractOutcome {
 
 /// `POST /arest/extract` dispatch entry (#620 / HATEOAS-6b).
 ///
-/// Three branches:
-///   1. Body parses as JSON → drive `apply(Func::Def("extract"),
-///      input, D)`. On `Object::Bottom` (no LLM body installed in this
-///      profile), emit the introspectable 503 envelope with the
-///      resolved Agent Definition metadata when available.
+/// Back-compat shim around the verb-agnostic `dispatch_verb` (#701 /
+/// T3). Existing callers (`arest_http_handler`, the entry-uefi smoke
+/// path, the inline tests below) keep their function-name affordance;
+/// the underlying dispatch path is the same `dispatch_verb("extract",
+/// body)` switch arm, mirroring T2's "legacy URLs delegate via the
+/// dispatcher" pattern in `src/api/router.ts:368-405`.
+pub fn dispatch_extract(body: &[u8]) -> ExtractOutcome {
+    dispatch_verb("extract", body)
+}
+
+/// Unified verb dispatcher (#701 / T3). Mirror of T2's worker-side
+/// `dispatchVerb(verb, body)` (`src/api/verb-dispatcher.ts`): one
+/// switch arm per verb name, delegating to `ast::apply(Func::Def(verb),
+/// input, D)` for the canonical ρ-application path. Adding a new verb
+/// means baking a `Func::Def` cell into `system::init`'s state — no
+/// change to this dispatcher or to `arest_http_handler` is required;
+/// the route auto-binds via `route_to_def`'s generic `/api/<verb>`
+/// match.
+///
+/// Three branches (verb-agnostic):
+///   1. Body parses as JSON → drive `apply(Func::Def(verb), input, D)`.
+///      On `Object::Bottom` (no body installed in this profile, the
+///      `Func::Platform(_) → Bottom` arm in `no_std` apply, or an
+///      unregistered verb), emit the introspectable 503 envelope with
+///      the resolved Agent Definition metadata when available.
 ///   2. Body parses but apply produces a non-Bottom Object → 200 with
 ///      the result serialised (`serialise()`).
-///   3. Body fails to parse → 503 with `extract.parse` envelope so a
-///      malformed POST never panics; mirrors the `extract.no_body`
+///   3. Body fails to parse → 503 with `<verb>.parse` envelope so a
+///      malformed POST never panics; mirrors the `<verb>.no_body`
 ///      shape so callers can rely on a single envelope schema across
 ///      both failure modes.
 ///
-/// The function is `pub` so the dispatcher in `lib.rs` can reach it
-/// without going through the lower-level `apply_named` (which serialises
-/// blindly and has no envelope shape — extract needs the structured
-/// surface for #624 e2e).
-pub fn dispatch_extract(body: &[u8]) -> ExtractOutcome {
+/// The envelope's `verb`, `code`, and message strings are interpolated
+/// from `verb` so a HATEOAS-aware client can disambiguate which verb
+/// failed without re-parsing the URL. The Theorem 5 envelope contract
+/// (status / code / retryAfter / _links.worker) is identical regardless
+/// of the verb name — only the textual surface changes.
+pub fn dispatch_verb(verb: &str, body: &[u8]) -> ExtractOutcome {
     // Parse JSON input first. An empty body is treated as `phi()` —
     // the verb may still be invoked with no operand (some agent
     // prompts don't need one). Garbage body falls into the parse
@@ -501,7 +522,7 @@ pub fn dispatch_extract(body: &[u8]) -> ExtractOutcome {
     let parsed_input = match parsed_input {
         Some(obj) => obj,
         None => {
-            // #620 — malformed JSON returns 503 with `extract.parse`.
+            // #620 — malformed JSON returns 503 with `<verb>.parse`.
             // Reusing the no-body envelope's `_links.worker` shape so
             // the caller can still re-issue against the worker
             // (which may have looser parsing or surface a richer
@@ -509,8 +530,11 @@ pub fn dispatch_extract(body: &[u8]) -> ExtractOutcome {
             // every failure mode here is "this profile can't fulfil
             // the call; here's where it might succeed".
             let envelope = build_envelope(
-                "extract.parse",
-                "Request body did not parse as JSON; nothing to dispatch to the 'extract' verb.",
+                verb,
+                &format!("{verb}.parse"),
+                &format!(
+                    "Request body did not parse as JSON; nothing to dispatch to the '{verb}' verb.",
+                ),
                 None,
             );
             return ExtractOutcome {
@@ -527,7 +551,7 @@ pub fn dispatch_extract(body: &[u8]) -> ExtractOutcome {
     // panicking, so the wire keeps responding.
     let result = with_state(|state| {
         ast::apply(
-            &Func::Def("extract".to_string()),
+            &Func::Def(verb.to_string()),
             &parsed_input,
             state,
         )
@@ -535,15 +559,16 @@ pub fn dispatch_extract(body: &[u8]) -> ExtractOutcome {
 
     let (result, agent_binding) = match result {
         Some(r) => {
-            let binding = with_state(|state| agent::resolve_agent_verb(state, "extract"))
+            let binding = with_state(|state| agent::resolve_agent_verb(state, verb))
                 .flatten();
             (r, binding)
         }
         None => {
             // init() not called — degrade to 503 so the wire stays up.
             let envelope = build_envelope(
-                "extract.no_body",
-                "SYSTEM not initialised; the 'extract' verb cannot be dispatched.",
+                verb,
+                &format!("{verb}.no_body"),
+                &format!("SYSTEM not initialised; the '{verb}' verb cannot be dispatched."),
                 None,
             );
             return ExtractOutcome {
@@ -556,10 +581,13 @@ pub fn dispatch_extract(body: &[u8]) -> ExtractOutcome {
 
     if result.is_bottom() {
         let envelope = build_envelope(
-            "extract.no_body",
-            "The 'extract' verb is registered on this kernel but no LLM body is installed. \
-             Configure a body via arest::externals::install_async_platform_fn, or route to a \
-             profile that has one.",
+            verb,
+            &format!("{verb}.no_body"),
+            &format!(
+                "The '{verb}' verb is registered on this kernel but no LLM body is installed. \
+                 Configure a body via arest::externals::install_async_platform_fn, or route to a \
+                 profile that has one.",
+            ),
             agent_binding.as_ref(),
         );
         return ExtractOutcome {
@@ -623,6 +651,7 @@ fn json_to_object(v: &json_min::JsonValue) -> Object {
 /// it visible at the call site so a HATEOAS-aware client can pick a
 /// profile to retry against without a second round-trip.
 fn build_envelope(
+    verb: &str,
     code: &str,
     message: &str,
     binding: Option<&agent::AgentBinding>,
@@ -633,7 +662,8 @@ fn build_envelope(
     out.push_str(&json_string_escape(code));
     out.push_str(",\"message\":");
     out.push_str(&json_string_escape(message));
-    out.push_str(",\"verb\":\"extract\"");
+    out.push_str(",\"verb\":");
+    out.push_str(&json_string_escape(verb));
     if let Some(b) = binding {
         out.push_str(",\"agentDefinition\":{");
         out.push_str("\"model\":");
@@ -936,7 +966,7 @@ fn serialise(obj: &Object) -> Vec<u8> {
 // the round-trip test, which uses a `call_once`-guarded global.
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use arest::ast::fact_from_pairs;
 

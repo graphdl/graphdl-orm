@@ -266,34 +266,65 @@ pub fn arest_http_handler(req: &http::Request) -> http::Response {
         }
     }
 
-    // POST /arest/extract — agent verb dispatch (#620 / HATEOAS-6b).
-    // The verb is registered as `Func::Platform("extract")` at boot
-    // (`system::init`), but the kernel profile installs no body —
-    // so `apply` returns `Object::Bottom` and `dispatch_extract`
-    // lifts that into the structured 503 envelope with the
-    // `Retry-After: <worker-url>` header. Sits *before* the generic
-    // HATEOAS read fallback so the path isn't silently treated as a
-    // slug ("extract" would resolve to a nonexistent Noun and 404,
-    // hiding the introspectable envelope). When a body is installed
-    // (e.g. via `externals::install_async_platform_fn` in a future
-    // worker-shaped profile), this same branch returns 200 with the
-    // serialised result. Branch-free dispatch — same code path runs
-    // regardless of body presence; the outcome's status is what
-    // varies. See `system::dispatch_extract` for the full envelope
-    // shape.
-    if req.method == "POST" && req.path == "/arest/extract" {
-        let outcome = system::dispatch_extract(&req.body);
-        if outcome.status == 200 {
-            return http::Response::ok("application/json", outcome.body);
+    // POST /api/<verb> + POST /arest/extract — unified verb-cell
+    // dispatch (#701 / T3). Mirror of T2's worker-side
+    // `for (const verb of UNIFIED_VERBS) router.post('/api/' + verb,
+    // ...)` (`src/api/router.ts:368-405`). Every verb baked into the
+    // SYSTEM cell graph as a `Func::Def` is reachable here without
+    // touching the routing table; new verbs auto-bind via
+    // `system::dispatch_verb`'s name parameter.
+    //
+    // Today the kernel profile only ships `extract` as a registered
+    // verb (`Func::Platform("extract")` from `system::init`), and the
+    // `no_std` engine elides the body — so `apply` returns
+    // `Object::Bottom` and `dispatch_verb` lifts that into the
+    // structured 503 envelope with the `Retry-After: <worker-url>`
+    // header (#620 / HATEOAS-6b). When a body is installed
+    // (`externals::install_async_platform_fn` in a future worker-
+    // shaped profile, or per-verb at app-start), the same branch
+    // returns 200 with the serialised result.
+    //
+    // The legacy URL `POST /arest/extract` keeps working — it
+    // resolves to the same `dispatch_verb("extract", ...)` switch
+    // arm so the wire contract for existing clients is preserved.
+    // Sits *before* the generic HATEOAS read fallback so the path
+    // isn't silently treated as a slug ("extract" would resolve to
+    // a nonexistent Noun and 404, hiding the introspectable
+    // envelope).
+    if req.method == "POST" {
+        // Canonical surface: /api/<verb>. Single source of truth for
+        // the verb name lives in the URL — no hand-coded switch.
+        let canonical_verb = req.path
+            .strip_prefix("/api/")
+            .map(|tail| tail.split('?').next().unwrap_or(tail));
+        // Legacy alias: /arest/extract. Mirrors the worker's pattern
+        // of keeping legacy URLs alive against the new dispatcher.
+        let legacy_verb = if req.path == "/arest/extract"
+            || req.path.starts_with("/arest/extract?")
+        {
+            Some("extract")
+        } else {
+            None
+        };
+        if let Some(verb) = canonical_verb.or(legacy_verb) {
+            // Reject empty / suspicious verb names — those would
+            // collide with the engine-less fallback paths below if
+            // the prefix-strip yielded an empty tail.
+            if !verb.is_empty() && verb.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                let outcome = system::dispatch_verb(verb, &req.body);
+                if outcome.status == 200 {
+                    return http::Response::ok("application/json", outcome.body);
+                }
+                let retry_after = outcome
+                    .retry_after
+                    .unwrap_or_else(|| alloc::string::String::from(system::EXTRACT_WORKER_URL));
+                return http::Response::service_unavailable_with_retry_after(
+                    "application/json",
+                    retry_after,
+                    outcome.body,
+                );
+            }
         }
-        let retry_after = outcome
-            .retry_after
-            .unwrap_or_else(|| alloc::string::String::from(system::EXTRACT_WORKER_URL));
-        return http::Response::service_unavailable_with_retry_after(
-            "application/json",
-            retry_after,
-            outcome.body,
-        );
     }
 
     // POST /arest/entity — AREST command path (#614/#615), engine-less
@@ -401,5 +432,192 @@ pub fn arest_http_handler(req: &http::Request) -> http::Response {
     match system::dispatch(&req.method, &req.path, &req.body) {
         Some(body) => http::Response::ok("text/plain; charset=utf-8", body),
         None => http::Response::not_found(),
+    }
+}
+
+// ── Tests — `arest_http_handler` route audit (T3 / #701) ───────────
+//
+// T3's audit scope: every hand-coded route in `arest_http_handler`
+// that wraps an engine-side verb call should run through the unified
+// verb-cell dispatch surface (`system::dispatch_verb`), so the verb
+// is discoverable via the metamodel and uniform across worker /
+// kernel / CLI / MCP. Mirror of T2's worker-side refactor (#700) in
+// `src/api/router.ts`, which added a `for (const verb of UNIFIED_VERBS)`
+// auto-bind for `POST /api/{verb}` and reduced the hand-coded
+// `engine.system(...)` call sites to platform-specific orchestration.
+//
+// On the kernel side the verb surface is narrower: the `no_std` arest
+// build only exposes `Func::Def` / `Func::Platform` / `Func::FetchOrPhi`
+// (compile / parse / check / command live behind the std-only feature
+// gate, see `system.rs:7-12`), so the only verb shipped on the kernel
+// today is `extract` (registered as `Func::Platform("extract")` at
+// `system::init`). Hand-coded `/arest/{slug}` HATEOAS fallbacks stay
+// hand-coded — they're engine-less direct-write paths because the
+// kernel can't yet runtime-compile readings (#588).
+//
+// Each test below asserts that the refactored handler routes the
+// `POST /api/{verb}` shape through the same dispatcher as the
+// `POST /arest/extract` legacy URL, keeping the Theorem 5 envelope
+// contract (status, code, retryAfter, _links.worker) identical
+// regardless of which URL the client used.
+#[cfg(test)]
+mod handler_tests {
+    use super::*;
+    use crate::system::tests::SYSTEM_STATE_TEST_LOCK;
+
+    /// Build an `http::Request` for a given method / path / body. Mirrors
+    /// the shape `http::parse_request` would emit on the wire — direct
+    /// in-memory construction skips the parser since the dispatcher is
+    /// what we're exercising, not the HTTP/1.1 wire format (which has
+    /// its own `http::self_test` coverage).
+    fn req(method: &str, path: &str, body: &[u8]) -> http::Request {
+        http::Request {
+            method: method.into(),
+            path: path.into(),
+            body: body.to_vec(),
+            accept: None,
+        }
+    }
+
+    /// `POST /api/extract` against the unified verb surface. Mirror of
+    /// the worker's `POST /api/extract` (T2 / `dispatchVerb('extract',
+    /// ...)`). Asserts the handler produces the same 503 envelope as
+    /// `POST /arest/extract` when no LLM body is installed — both
+    /// flow through `system::dispatch_verb("extract", body)`.
+    #[test]
+    fn post_api_extract_dispatches_through_verb_cell() {
+        let _guard = SYSTEM_STATE_TEST_LOCK.lock();
+        system::init();
+        let resp = arest_http_handler(&req("POST", "/api/extract", b""));
+        assert_eq!(
+            resp.status.0, 503,
+            "no body installed must surface as 503 via /api/extract too",
+        );
+        let body_str = core::str::from_utf8(&resp.body).expect("envelope is utf-8 json");
+        assert!(
+            body_str.contains("\"code\":\"extract.no_body\""),
+            "envelope must carry extract.no_body code, got: {body_str}",
+        );
+        assert_eq!(
+            resp.retry_after.as_deref(),
+            Some(system::EXTRACT_WORKER_URL),
+            "Retry-After header must point at the worker URL",
+        );
+    }
+
+    /// Legacy URL `POST /arest/extract` must keep returning the same
+    /// envelope as the canonical `/api/extract` route. T2's pattern:
+    /// "legacy URLs delegate via the dispatcher" — both URLs land in
+    /// the same `system::dispatch_verb` switch arm so the wire contract
+    /// for existing clients is preserved.
+    #[test]
+    fn post_arest_extract_legacy_url_routes_via_same_dispatcher() {
+        let _guard = SYSTEM_STATE_TEST_LOCK.lock();
+        system::init();
+        let canonical = arest_http_handler(&req("POST", "/api/extract", b""));
+        let legacy = arest_http_handler(&req("POST", "/arest/extract", b""));
+        assert_eq!(canonical.status.0, legacy.status.0,
+            "/api/extract and /arest/extract must produce the same status");
+        assert_eq!(canonical.body, legacy.body,
+            "/api/extract and /arest/extract must produce the same envelope body");
+        assert_eq!(canonical.retry_after, legacy.retry_after,
+            "/api/extract and /arest/extract must produce the same Retry-After");
+    }
+
+    /// `system::dispatch_verb("extract", body)` is the kernel's single
+    /// switch arm for the `extract` verb. `system::dispatch_extract`
+    /// stays alive as a back-compat shim for existing call sites
+    /// (entry_uefi / direct callers) but routes through the same
+    /// underlying dispatcher. This test pins the equivalence so a
+    /// future refactor that drifts the two paths apart fails loudly.
+    #[test]
+    fn dispatch_verb_extract_matches_dispatch_extract() {
+        let _guard = SYSTEM_STATE_TEST_LOCK.lock();
+        system::init();
+        let via_verb = system::dispatch_verb("extract", b"");
+        let via_legacy = system::dispatch_extract(b"");
+        assert_eq!(via_verb.status, via_legacy.status,
+            "dispatch_verb and dispatch_extract must agree on status");
+        assert_eq!(via_verb.body, via_legacy.body,
+            "dispatch_verb and dispatch_extract must agree on body");
+        assert_eq!(via_verb.retry_after, via_legacy.retry_after,
+            "dispatch_verb and dispatch_extract must agree on Retry-After");
+    }
+
+    /// `system::dispatch_verb` against an unknown verb still produces
+    /// a structured 503 envelope rather than panicking — the dispatch
+    /// contract is uniform regardless of whether the verb is
+    /// registered. The envelope's `verb` field carries the requested
+    /// name so a HATEOAS-aware client can disambiguate the failure.
+    #[test]
+    fn dispatch_verb_unknown_verb_returns_503_envelope() {
+        let _guard = SYSTEM_STATE_TEST_LOCK.lock();
+        system::init();
+        let outcome = system::dispatch_verb("some_unregistered_verb", b"");
+        assert_eq!(
+            outcome.status, 503,
+            "unknown verb must surface as 503 (no body installed for it either)",
+        );
+        let body_str = core::str::from_utf8(&outcome.body).expect("envelope is utf-8 json");
+        assert!(
+            body_str.contains("\"verb\":\"some_unregistered_verb\""),
+            "envelope's verb field must echo the requested verb name, got: {body_str}",
+        );
+    }
+
+    /// `POST /api/<verb>` auto-binds against any baked verb cell —
+    /// the kernel's mirror of T2's `for (const verb of UNIFIED_VERBS)`
+    /// auto-bind in `src/api/router.ts`. Pre-T3 the only POST verb
+    /// reachable via the wire was `/arest/extract`; post-T3 every verb
+    /// baked into the SYSTEM cell graph is reachable as `POST
+    /// /api/<verb>` with no change to the routing table. Adding a
+    /// verb is a single `system::init` cell push.
+    ///
+    /// `echo` is baked as `Func::Id` (apply(Id, x, _) = x), so
+    /// `dispatch_verb("echo", body)` round-trips the JSON-parsed input
+    /// straight back as the `200 application/json` body. Demonstrates
+    /// the auto-bind on a verb other than `extract`.
+    ///
+    /// `welcome` keeps its legacy `GET /api/welcome` text/plain
+    /// affordance — handled by the existing `system::dispatch` arm
+    /// at the bottom of `arest_http_handler`. The new POST arm
+    /// doesn't intercept GETs, so the read path is unchanged.
+    #[test]
+    fn api_path_auto_resolves_baked_def_names() {
+        let _guard = SYSTEM_STATE_TEST_LOCK.lock();
+        system::init();
+        // GET /api/welcome — legacy text/plain via system::dispatch.
+        let welcome = arest_http_handler(&req("GET", "/api/welcome", b""));
+        assert_eq!(welcome.status.0, 200, "/api/welcome (GET) must resolve via system::dispatch");
+        // POST /api/echo with a JSON body — flows through the new
+        // unified verb dispatcher, which parses the body, runs
+        // apply(Func::Def("echo"), input, D) = input, and serialises
+        // the result as application/json.
+        let echo = arest_http_handler(&req("POST", "/api/echo", b"\"hello\""));
+        assert_eq!(echo.status.0, 200, "/api/echo (POST) must resolve via dispatch_verb");
+        assert_eq!(echo.content_type, "application/json",
+            "/api/echo response must be JSON-shaped (envelope path)");
+    }
+
+    /// Engine-less HATEOAS fallback routes (the `/arest/entities/*`
+    /// POST/GET surface, `/arest/entity` POST, `/arest/parse` GET, and
+    /// the `/arest/{slug}` read fallback) stay hand-coded by design:
+    /// the engine traps in the kernel because Stage-2 compile is
+    /// std-only (#588). Once #588 lifts these can flow through
+    /// `dispatch_verb` like `extract` does today, but T3 does not
+    /// gate on that work.
+    ///
+    /// This test asserts the fallback is still wired by sending
+    /// `GET /arest/parse` (the simplest one — a stats projection over
+    /// the live state) and confirming a 200 with a JSON body. If the
+    /// refactor accidentally ate the fallback the test surfaces it as
+    /// a 404.
+    #[test]
+    fn arest_parse_stats_fallback_still_wired() {
+        let _guard = SYSTEM_STATE_TEST_LOCK.lock();
+        system::init();
+        let resp = arest_http_handler(&req("GET", "/arest/parse", b""));
+        assert_eq!(resp.status.0, 200, "/arest/parse stats fallback must still respond 200");
+        assert_eq!(resp.content_type, "application/json");
     }
 }
