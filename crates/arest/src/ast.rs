@@ -3305,27 +3305,17 @@ pub const VERSION_PREV_KEY: &str = "prev";
 pub const VERSION_RECORDED_AT_KEY: &str = "recorded_at";
 pub const VERSION_EVENT_KEY: &str = "event";
 
-/// Construct a VersionEntry without an event field — the pre-S1c
-/// 4-field shape. Used by non-apply commit paths (compile bootstrap,
-/// internal forward-chain merges, legacy raw-promote).
-pub fn version_entry(
-    version_id: u64,
-    contents: Object,
-    prev: Option<u64>,
-    recorded_at: Object,
-) -> Object {
-    version_entry_with_event(version_id, contents, prev, recorded_at, None)
-}
-
-/// S1c (#719): construct a VersionEntry with an optional `event` field.
-/// When `event = Some(x)`, the entry records the apply-time operand
-/// that produced this version — operation kind, sender, payload — so
-/// the chain replaces the legacy `audit_log` cell.
+/// Construct a VersionEntry. Pure shape; no clock side-effect — pass
+/// the `recorded_at` value the caller wants written (typically the
+/// result of `apply_platform("now", …, …)` at write time).
 ///
-/// Pure shape; no clock side-effect. Pass the `recorded_at` value the
-/// caller wants written (typically the result of `apply_platform("now",
-/// …, …)` at write time).
-pub fn version_entry_with_event(
+/// `event` is the apply-time operand `x` that produced this entry —
+/// FFP `μ_n`'s input, eq:cellfold's audit-of-record. `None` for
+/// non-apply paths (compile bootstrap, internal forward-chain merges,
+/// the synthetic v=0 raw-promote shim) — produces the pre-S1c 4-field
+/// shape, byte-identical to existing freezes. `Some(event)` from the
+/// apply path (S1c #719); the chain doubles as audit.
+pub fn version_entry(
     version_id: u64,
     contents: Object,
     prev: Option<u64>,
@@ -3441,39 +3431,20 @@ pub fn cell_contents_view(obj: &Object) -> &Object {
 }
 
 /// Wrap raw contents in a fresh single-version chain (version_id = 1,
-/// prev = None). Used by `merge_delta` when the base has no prior entry
-/// for a cell name. No event field — internal commits.
-pub fn wrap_as_chain(contents: Object, recorded_at: Object) -> Object {
-    wrap_as_chain_with_event(contents, recorded_at, None)
-}
-
-/// S1c (#719): wrap raw contents in a fresh chain, optionally
-/// recording the apply-time event that produced it. Use this from
-/// the apply path; non-apply commits should keep using
-/// `wrap_as_chain` (no event = legacy 4-field shape).
-pub fn wrap_as_chain_with_event(
-    contents: Object,
-    recorded_at: Object,
-    event: Option<Object>,
-) -> Object {
-    Object::seq(alloc::vec![version_entry_with_event(
-        1, contents, None, recorded_at, event,
-    )])
+/// prev = None). `event` is the apply-time operand for entries minted
+/// by the apply path; `None` for non-apply commits.
+pub fn wrap_as_chain(contents: Object, recorded_at: Object, event: Option<Object>) -> Object {
+    Object::seq(alloc::vec![version_entry(1, contents, None, recorded_at, event)])
 }
 
 /// Append a new version entry to a chain. If `current` is not a chain,
 /// promote it to a synthetic version-0 entry first so the new entry's
 /// `prev` pointer chains backward into the legacy raw value.
-pub fn chain_append(current: &Object, new_contents: Object, recorded_at: Object) -> Object {
-    chain_append_with_event(current, new_contents, recorded_at, None)
-}
-
-/// S1c (#719): append with an optional event (eq:cellfold's `μ_n`
-/// input). The event is attached only to the newly appended entry —
-/// the synthetic v=0 promote shim for legacy raw values stays
-/// event-less because it represents pre-history, not an applied
-/// operation.
-pub fn chain_append_with_event(
+///
+/// `event` is attached only to the newly appended entry — the synthetic
+/// v=0 promote shim stays event-less because it represents pre-history,
+/// not an applied operation.
+pub fn chain_append(
     current: &Object,
     new_contents: Object,
     recorded_at: Object,
@@ -3487,9 +3458,7 @@ pub fn chain_append_with_event(
             .and_then(version_entry_id)
             .unwrap_or(0);
         let new_id = prev_id + 1;
-        items.push(version_entry_with_event(
-            new_id, new_contents, Some(prev_id), recorded_at, event,
-        ));
+        items.push(version_entry(new_id, new_contents, Some(prev_id), recorded_at, event));
         Object::seq(items)
     } else {
         // Promote legacy raw value to a synthetic v0 with prev=None.
@@ -3498,8 +3467,8 @@ pub fn chain_append_with_event(
         // the event the caller threaded.
         let v0_recorded = Object::atom("0");
         Object::seq(alloc::vec![
-            version_entry(0, current.clone(), None, v0_recorded),
-            version_entry_with_event(1, new_contents, Some(0), recorded_at, event),
+            version_entry(0, current.clone(), None, v0_recorded, None),
+            version_entry(1, new_contents, Some(0), recorded_at, event),
         ])
     }
 }
@@ -3527,7 +3496,7 @@ pub fn cells_iter_history(state: &Object, name: &str) -> Vec<Object> {
             .unwrap_or_default()
     } else {
         // Legacy: synthesize a v0 entry so callers get a uniform shape.
-        alloc::vec![version_entry(0, raw, None, Object::atom("0"))]
+        alloc::vec![version_entry(0, raw, None, Object::atom("0"), None)]
     }
 }
 
@@ -3943,22 +3912,14 @@ pub fn diff_cells(old: &Object, new: &Object) -> Object {
 /// Complement of `diff_cells`: for any (old, new),
 /// `cells_iter(merge_delta(old, diff_cells(old, new)))` produces the
 /// same (name, contents) pairs as `cells_iter(new)`.
-pub fn merge_delta(base: &Object, delta: &Object) -> Object {
-    merge_delta_with_event(base, delta, None)
-}
-
-/// S1c (#719): merge with the apply-time event threaded into every
-/// cell's new VersionEntry. Use this from the apply path where the
-/// event is the `Command` that triggered the write — operation kind,
-/// sender, and payload are then queryable via `cells_iter_history`
-/// without a separate `audit_log` cell.
-///
-/// Internal commits (compile-bootstrap, intermediate forward-chain)
-/// keep using `merge_delta` (event = None). The event is shared
-/// across every cell in this batch — eq:cellfold says one `μ_n`
-/// invocation is one `x` operand; cells in a single delta were all
-/// produced by the same apply.
-pub fn merge_delta_with_event(
+/// `event` (S1c #719) is the apply-time operand `x` threaded into
+/// every cell's new VersionEntry — operation kind, sender, and
+/// payload become queryable via `cells_iter_history`. `None` for
+/// non-apply commits (compile-bootstrap, intermediate forward-chain).
+/// The event is shared across every cell in this batch — eq:cellfold
+/// says one `μ_n` invocation is one `x` operand; cells in a single
+/// delta were all produced by the same apply.
+pub fn merge_delta(
     base: &Object,
     delta: &Object,
     event: Option<Object>,
@@ -3998,10 +3959,8 @@ pub fn merge_delta_with_event(
 
     for (k, v) in delta_pairs {
         let new_chain = match base_map.get(&k) {
-            Some(existing) => chain_append_with_event(
-                existing, v, recorded_at.clone(), event.clone(),
-            ),
-            None => wrap_as_chain_with_event(v, recorded_at.clone(), event.clone()),
+            Some(existing) => chain_append(existing, v, recorded_at.clone(), event.clone()),
+            None => wrap_as_chain(v, recorded_at.clone(), event.clone()),
         };
         base_map.insert(k, new_chain);
     }
@@ -7007,7 +6966,7 @@ mod tests {
     fn version_entry_round_trips_all_fields() {
         let contents = Object::atom("hello");
         let recorded = Object::atom("1700000000000");
-        let entry = version_entry(42, contents.clone(), Some(41), recorded.clone());
+        let entry = version_entry(42, contents.clone(), Some(41), recorded.clone(), None);
         assert_eq!(version_entry_id(&entry), Some(42));
         assert_eq!(version_entry_contents(&entry), Some(&contents));
         assert_eq!(version_entry_prev(&entry), Some(41));
@@ -7017,7 +6976,7 @@ mod tests {
 
     #[test]
     fn version_entry_with_no_prev_returns_none() {
-        let entry = version_entry(1, Object::atom("first"), None, Object::atom("t0"));
+        let entry = version_entry(1, Object::atom("first"), None, Object::atom("t0"), None);
         assert_eq!(version_entry_id(&entry), Some(1));
         assert_eq!(version_entry_prev(&entry), None);
     }
@@ -7030,7 +6989,7 @@ mod tests {
             fact_from_pairs(&[("name", "Alice"), ("age", "30")]),
             fact_from_pairs(&[("name", "Bob"),   ("age", "25")]),
         ]);
-        let entry = version_entry(7, contents.clone(), None, Object::phi());
+        let entry = version_entry(7, contents.clone(), None, Object::phi(), None);
         assert_eq!(version_entry_contents(&entry), Some(&contents));
     }
 
@@ -7047,7 +7006,7 @@ mod tests {
 
     #[test]
     fn is_version_chain_detects_wrapped_seq_only() {
-        let chain = wrap_as_chain(Object::atom("payload"), Object::atom("0"));
+        let chain = wrap_as_chain(Object::atom("payload"), Object::atom("0"), None);
         assert!(is_version_chain(&chain));
         // Raw cells aren't chains.
         assert!(!is_version_chain(&Object::atom("plain")));
@@ -7063,7 +7022,7 @@ mod tests {
         assert_eq!(cell_contents_view(&raw), &raw, "raw passes through");
 
         let payload = Object::atom("payload");
-        let chain = wrap_as_chain(payload.clone(), Object::atom("0"));
+        let chain = wrap_as_chain(payload.clone(), Object::atom("0"), None);
         assert_eq!(cell_contents_view(&chain), &payload, "chain unwraps to latest");
     }
 
@@ -7074,11 +7033,11 @@ mod tests {
 
         let mut d1 = HashMap::new();
         d1.insert("X".to_string(), Object::atom("v1"));
-        let s1 = merge_delta(&s0, &Object::Map(d1));
+        let s1 = merge_delta(&s0, &Object::Map(d1), None);
 
         let mut d2 = HashMap::new();
         d2.insert("X".to_string(), Object::atom("v2"));
-        let s2 = merge_delta(&s1, &Object::Map(d2));
+        let s2 = merge_delta(&s1, &Object::Map(d2), None);
 
         // Logical view shows latest.
         assert_eq!(fetch_or_phi("X", &s2), Object::atom("v2"));
@@ -7099,7 +7058,7 @@ mod tests {
         let s0 = Object::Map(HashMap::new());
         let mut d = HashMap::new();
         d.insert("Brand_new".to_string(), Object::atom("hello"));
-        let s1 = merge_delta(&s0, &Object::Map(d));
+        let s1 = merge_delta(&s0, &Object::Map(d), None);
 
         let hist = cells_iter_history(&s1, "Brand_new");
         assert_eq!(hist.len(), 1);
@@ -7114,7 +7073,7 @@ mod tests {
 
         let mut d = HashMap::new();
         d.insert("X".to_string(), Object::atom("new"));
-        let s1 = merge_delta(&s0, &Object::Map(d));
+        let s1 = merge_delta(&s0, &Object::Map(d), None);
 
         // History: synthetic v0 = "legacy", then v1 = "new".
         let hist = cells_iter_history(&s1, "X");
@@ -7162,7 +7121,7 @@ mod tests {
             cell("D", Object::atom("4")),       // added
         ]);
         let delta = diff_cells(&old, &new);
-        let reconstructed = merge_delta(&old, &delta);
+        let reconstructed = merge_delta(&old, &delta, None);
 
         // Logical view of reconstructed matches new for every cell.
         for name in ["A", "B", "C", "D"] {
@@ -7181,7 +7140,7 @@ mod tests {
         for tag in &["a", "b", "c"] {
             let mut d = HashMap::new();
             d.insert("Item".to_string(), Object::atom(tag));
-            state = merge_delta(&state, &Object::Map(d));
+            state = merge_delta(&state, &Object::Map(d), None);
         }
         state
     }
@@ -7270,7 +7229,7 @@ mod tests {
         for tag in &["a", "b", "c"] {
             let mut d = HashMap::new();
             d.insert("Item".to_string(), Object::atom(tag));
-            state = merge_delta(&state, &Object::Map(d));
+            state = merge_delta(&state, &Object::Map(d), None);
         }
         let hist = cells_iter_history(&state, "Item");
         assert_eq!(hist.len(), 3);
@@ -7296,7 +7255,7 @@ mod tests {
         for tag in &["a", "b", "c"] {
             let mut d = HashMap::new();
             d.insert("X".to_string(), Object::atom(tag));
-            state = merge_delta(&state, &Object::Map(d));
+            state = merge_delta(&state, &Object::Map(d), None);
         }
         assert_eq!(as_of(&state, "X", 1), Some(Object::atom("a")));
         assert_eq!(as_of(&state, "X", 2), Some(Object::atom("b")));
@@ -7321,7 +7280,7 @@ mod tests {
         for tag in &["a", "b", "c", "d", "e"] {
             let mut d = HashMap::new();
             d.insert("X".to_string(), Object::atom(tag));
-            state = merge_delta(&state, &Object::Map(d));
+            state = merge_delta(&state, &Object::Map(d), None);
         }
         // Inclusive range [2, 4] → entries v2, v3, v4 in order.
         let slice = between(&state, "X", 2, 4);
@@ -7339,7 +7298,7 @@ mod tests {
         for tag in &["a", "b", "c"] {
             let mut d = HashMap::new();
             d.insert("Y".to_string(), Object::atom(tag));
-            state = merge_delta(&state, &Object::Map(d));
+            state = merge_delta(&state, &Object::Map(d), None);
         }
         // [2, 2] → just v2
         let one = between(&state, "Y", 2, 2);
@@ -7355,7 +7314,7 @@ mod tests {
         let mut state = Object::Map(HashMap::new());
         let mut d = HashMap::new();
         d.insert("Z".to_string(), Object::atom("v"));
-        state = merge_delta(&state, &Object::Map(d));
+        state = merge_delta(&state, &Object::Map(d), None);
         // Inverted range — total function, just empty.
         assert!(between(&state, "Z", 5, 1).is_empty());
         // Legacy raw cell — no chain to slice.
@@ -7450,7 +7409,7 @@ mod tests {
             cell("D", Object::atom("4")),
         ]);
         let delta = diff_cells(&old, &new);
-        let reconstructed = merge_delta(&old, &delta);
+        let reconstructed = merge_delta(&old, &delta, None);
         for name in ["A", "B", "C", "D"] {
             assert_eq!(fetch_or_phi(name, &reconstructed), fetch_or_phi(name, &new),
                 "cell {} must match after merge_delta(old, diff(old,new))", name);
@@ -7464,7 +7423,7 @@ mod tests {
             cell("B", Object::atom("2")),
         ]);
         let empty_delta = Object::Map(HashMap::new());
-        let merged = merge_delta(&base, &empty_delta);
+        let merged = merge_delta(&base, &empty_delta, None);
         assert_eq!(fetch_or_phi("A", &merged), Object::atom("1"));
         assert_eq!(fetch_or_phi("B", &merged), Object::atom("2"));
     }
@@ -7636,7 +7595,7 @@ mod tests {
     #[test]
     fn version_entry_event_extracts_optional_field_when_present() {
         let event = fact_from_pairs(&[("operation", "apply:create"), ("sender", "u1")]);
-        let entry = version_entry_with_event(
+        let entry = version_entry(
             1,
             Object::atom("payload"),
             None,
@@ -7650,13 +7609,9 @@ mod tests {
 
     #[test]
     fn version_entry_event_returns_none_for_eventless_entries() {
-        let entry = version_entry(1, Object::atom("p"), None, Object::atom("now"));
+        let entry = version_entry(1, Object::atom("p"), None, Object::atom("now"), None);
         assert!(version_entry_event(&entry).is_none(),
-            "pre-S1c 4-field entries must not surface an event");
-        // Round-tripping the no-event constructor through the variant
-        // helper with explicit None must produce the same shape.
-        let same = version_entry_with_event(1, Object::atom("p"), None, Object::atom("now"), None);
-        assert_eq!(entry, same);
+            "entries constructed with event=None must not surface an event field");
     }
 
     #[test]
@@ -7665,13 +7620,13 @@ mod tests {
         let s0 = Object::Map(HashMap::new());
         let mut d = HashMap::new();
         d.insert("Order".to_string(), Object::atom("ord-1"));
-        let s1 = merge_delta_with_event(&s0, &Object::Map(d), Some(event.clone()));
+        let s1 = merge_delta(&s0, &Object::Map(d), Some(event.clone()));
 
         let hist = cells_iter_history(&s1, "Order");
         assert_eq!(hist.len(), 1);
         assert_eq!(version_entry_id(&hist[0]), Some(1));
         assert_eq!(version_entry_event(&hist[0]), Some(&event),
-            "event must round-trip through merge_delta_with_event");
+            "event must round-trip through merge_delta");
     }
 
     #[test]
@@ -7682,7 +7637,7 @@ mod tests {
         let s0 = Object::Map(HashMap::new());
         let mut d = HashMap::new();
         d.insert("Order".to_string(), Object::atom("ord-1"));
-        let s1 = merge_delta(&s0, &Object::Map(d));
+        let s1 = merge_delta(&s0, &Object::Map(d), None);
         let hist = cells_iter_history(&s1, "Order");
         assert!(version_entry_event(&hist[0]).is_none());
     }

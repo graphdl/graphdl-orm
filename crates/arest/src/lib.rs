@@ -2068,7 +2068,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
                 // try_commit_diff against the same snapshot so the CAS
                 // only touches the delta cells. If the snapshot is
                 // stale, escalate to Tier 2 with a fresh re-apply.
-                let new_d = ast::merge_delta(&snapshot, &delta);
+                let new_d = ast::merge_delta(&snapshot, &delta, None);
                 let outcome = st.try_commit_diff(&snapshot, &new_d);
                 match outcome {
                     CommitOutcome::Committed => return response,
@@ -2091,7 +2091,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
             response
         }
         WriterResult::CommitDelta { delta, response } => {
-            let new_d = ast::merge_delta(&snapshot, &delta);
+            let new_d = ast::merge_delta(&snapshot, &delta, None);
             st.replace_d(new_d);
             response
         }
@@ -3084,7 +3084,7 @@ Order has total.
         for p in payloads {
             let mut d = hashbrown::HashMap::new();
             d.insert(name.to_string(), ast::Object::atom(p));
-            state = ast::merge_delta(&state, &ast::Object::Map(d));
+            state = ast::merge_delta(&state, &ast::Object::Map(d), None);
         }
         let h = allocate(ast::Object::Map(hashbrown::HashMap::new()), vec![]);
         let tenant = tenant_lock(h).unwrap();
@@ -3152,10 +3152,10 @@ Order has total.
             let cur = st.snapshot_d();
             let mut d = hashbrown::HashMap::new();
             d.insert("Noun".to_string(), ast::Object::atom("c"));
-            let s3 = ast::merge_delta(&cur, &ast::Object::Map(d));
+            let s3 = ast::merge_delta(&cur, &ast::Object::Map(d), None);
             let mut d = hashbrown::HashMap::new();
             d.insert("Noun".to_string(), ast::Object::atom("d"));
-            let s4 = ast::merge_delta(&s3, &ast::Object::Map(d));
+            let s4 = ast::merge_delta(&s3, &ast::Object::Map(d), None);
             st.replace_d(s4);
         }
         assert_eq!(system_impl(h, "compact", "Noun"), "2",

@@ -2661,7 +2661,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         // The load returned a delta against `def_map`; merge it back
         // into the def-state so the manifest cell is visible to the
         // unload.
-        let post_load_d = ast::merge_delta(&def_map, &load_result.state);
+        let post_load_d = ast::merge_delta(&def_map, &load_result.state, None);
 
         let unload_cmd = Command::UnloadReading {
             name: "catalog".to_string(),
@@ -2728,7 +2728,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             signature: None,
         };
         let load_result = apply_command_defs(&def_map, &load_cmd, &def_map);
-        let post_load_d = ast::merge_delta(&def_map, &load_result.state);
+        let post_load_d = ast::merge_delta(&def_map, &load_result.state, None);
 
         let cmd = Command::UnloadReading {
             name: "catalog".to_string(),
@@ -2760,7 +2760,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         };
         let load_result = apply_command_defs(&def_map, &load_cmd, &def_map);
         assert!(!load_result.rejected, "load must succeed");
-        let post_load_d = ast::merge_delta(&def_map, &load_result.state);
+        let post_load_d = ast::merge_delta(&def_map, &load_result.state, None);
 
         let reload_cmd = Command::ReloadReading {
             name: "catalog".to_string(),
@@ -2850,7 +2850,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             signature: None,
         };
         let load_result = apply_command_defs(&def_map, &load_cmd, &def_map);
-        let post_load_d = ast::merge_delta(&def_map, &load_result.state);
+        let post_load_d = ast::merge_delta(&def_map, &load_result.state, None);
 
         let reload_cmd = Command::ReloadReading {
             name: "catalog".to_string(),
@@ -2932,7 +2932,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         let load_result = apply_command_defs(&def_map, &load_cmd, &def_map);
         let load_hash = load_result.entities[0].data["contentHash"].clone();
         let load_stamp = load_result.entities[0].data["versionStamp"].clone();
-        let post_load_d = ast::merge_delta(&def_map, &load_result.state);
+        let post_load_d = ast::merge_delta(&def_map, &load_result.state, None);
 
         let unload_cmd = Command::UnloadReading {
             name: "catalog".to_string(),
@@ -2962,7 +2962,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             signature: None,
         };
         let load_result = apply_command_defs(&def_map, &load_cmd, &def_map);
-        let post_load_d = ast::merge_delta(&def_map, &load_result.state);
+        let post_load_d = ast::merge_delta(&def_map, &load_result.state, None);
         let load_hash = load_result.entities[0].data["contentHash"].clone();
         let load_stamp: u64 = load_result.entities[0].data["versionStamp"]
             .parse()

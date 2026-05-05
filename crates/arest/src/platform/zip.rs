@@ -461,7 +461,7 @@ fn create_file(name: &str, mime: &str, bytes: &[u8], parent_dir_id: &str, d: &Ob
     }
     // `result.state` is a cell delta (#209). Merge it back onto the
     // input state to recover the full D.
-    Ok((id, ast::merge_delta(d, &result.state)))
+    Ok((id, ast::merge_delta(d, &result.state, None)))
 }
 
 /// Same shape as `create_file` for Directory entities. See
@@ -495,7 +495,7 @@ fn create_directory(name: &str, parent_dir_id: Option<&str>, d: &Object)
         let new_d = direct_push_directory(&id, name, parent_dir_id, d);
         return Ok((id, new_d));
     }
-    Ok((id, ast::merge_delta(d, &result.state)))
+    Ok((id, ast::merge_delta(d, &result.state, None)))
 }
 
 /// Direct cell-push fallback for File creation. Reproduces the
