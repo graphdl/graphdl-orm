@@ -2873,13 +2873,19 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
     //       (FORML 2 grammar: `Statement has Trailing Marker
     //       'is an entity type'`, #286).
     // Multiple predicates on the same antecedent are combined via And.
-    let mut preds_by_idx: hashbrown::HashMap<usize, Vec<Func>> =
-        hashbrown::HashMap::new();
+    //
+    // M1a (#729): the keys are antecedent indices (0..n where
+    // n = antecedent_ids.len()), so `Vec<Vec<Func>>` is the natural
+    // shape — direct index access, no hashing, no per-insert bucket
+    // allocation. The previous `HashMap<usize, Vec<Func>>` was an
+    // accumulator for an index-keyed projection; the right primitive
+    // for an index-keyed projection is a Vec slot.
+    let mut preds_by_idx: Vec<Vec<Func>> = vec![Vec::new(); antecedent_ids.len()];
     for af in rule.antecedent_filters.iter() {
         if let Some(ft_id) = antecedent_ids.get(af.antecedent_index) {
             if let Some(ft) = data.fact_types.get(ft_id) {
                 if let Some(p) = build_antecedent_filter_pred(af, ft) {
-                    preds_by_idx.entry(af.antecedent_index).or_default().push(p);
+                    preds_by_idx[af.antecedent_index].push(p);
                 }
             }
         }
@@ -2898,7 +2904,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                             Func::constant(Object::atom(&arl.value)),
                         ]),
                     );
-                    preds_by_idx.entry(arl.antecedent_index).or_default().push(pred);
+                    preds_by_idx[arl.antecedent_index].push(pred);
                 }
             }
         }
@@ -2908,7 +2914,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
     // predicates; otherwise return the bare extractor. Multiple
     // predicates combine with And.
     let extract = |idx: usize, ft_id: &str| -> Func {
-        match preds_by_idx.get(&idx) {
+        match preds_by_idx.get(idx) {
             Some(preds) if !preds.is_empty() => {
                 let combined = preds.iter().cloned().reduce(|a, b|
                     Func::compose(Func::And, Func::construction(vec![a, b])))
