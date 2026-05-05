@@ -2683,13 +2683,19 @@ fn parse_to_state_via_stage12_impl(
     let grammar_state = cached_grammar_state()?;
     if trace { crate::diag!("[s12] grammar cache: {:?}", t0.elapsed()); }
 
+    // MC1 (#712): build the Stage-1 vocab from the cached grammar
+    // state's EnumValues cell. Stage-1 falls back to `Vocab::boot()`
+    // when called outside the cell-driven path (legacy callers, unit
+    // tests). Pass-by-borrow so we don't clone the vocab per line.
+    let vocab = crate::parse_forml2_stage1::Vocab::from_grammar_state(grammar_state);
+
     // #309 — enforce Theorem 1's no-reserved-substring rule. Scan
     // unquoted noun declarations in the source and reject any that
     // collide with a grammar keyword. Quoted names (`Noun 'Each Way
     // Bet' is an entity type.`) bypass the check and land in the
     // noun cell as single tokens.
     let t_pre = Instant::now();
-    reject_reserved_noun_declarations(text)?;
+    reject_reserved_noun_declarations(text, &vocab)?;
 
     // Direct text-scan bootstrap for noun names — avoids running the
     // full legacy cascade a second time just to recover the Noun cell.
@@ -2782,8 +2788,8 @@ fn parse_to_state_via_stage12_impl(
             continue;
         }
         let statement_id = alloc::format!("s{}", i);
-        let cells = crate::parse_forml2_stage1::tokenize_statement_with_buckets(
-            &statement_id, line, &noun_buckets);
+        let cells = crate::parse_forml2_stage1::tokenize_statement_with_buckets_vocab(
+            &statement_id, line, &noun_buckets, &vocab);
         for (cell_name, facts) in cells.into_iter() {
             acc_cells.entry(cell_name).or_default().extend(facts);
         }
@@ -3066,7 +3072,10 @@ fn instance_fact_field_cells(instance_facts: &[Object]) -> Vec<(String, Vec<Obje
 /// Names beginning with a single quote are treated as quoted
 /// identifiers and bypass the check (Theorem 1 escape documented at
 /// `docs/02-writing-readings.md`).
-fn reject_reserved_noun_declarations(text: &str) -> Result<(), String> {
+fn reject_reserved_noun_declarations(
+    text: &str,
+    vocab: &crate::parse_forml2_stage1::Vocab,
+) -> Result<(), String> {
     for raw_line in text.lines() {
         let line = raw_line.trim();
         let before = line
@@ -3085,7 +3094,7 @@ fn reject_reserved_noun_declarations(text: &str) -> Result<(), String> {
         if name.is_empty() { continue; }
         // Quoted names bypass the check.
         if name.starts_with('\'') { continue; }
-        if let Some(kw) = crate::parse_forml2_stage1::reserved_keyword_in(name) {
+        if let Some(kw) = crate::parse_forml2_stage1::reserved_keyword_in_with_vocab(name, vocab) {
             return Err(alloc::format!(
                 "noun declaration `{}` collides with reserved keyword `{}`; \
                  quote the name to escape: `Noun '{}' is an entity type.`",
@@ -3189,10 +3198,16 @@ mod tests {
 
     /// Stage-0 bootstrap must produce every cell `compile_to_defs_state`
     /// and `specialize_grammar_classifiers` read from. Specific counts
-    /// are pinned to the committed `readings/forml2-grammar.md` (16
-    /// nouns, 16 binary FTs, 5 enum-valued value types, 30+ classifier
+    /// are pinned to the committed `readings/forml2-grammar.md` (17
+    /// nouns, 16 binary FTs, 7 enum-valued value types, 30+ classifier
     /// rules) to guard against a shape recognizer silently dropping a
     /// line when the grammar file is edited.
+    ///
+    /// MC1 (#712) bumped the noun count to 17 by adding the
+    /// `Derivation Marker Symbol` value type, and the enum-valued noun
+    /// count to 7 by adding `Trailing Marker` and `Derivation Marker
+    /// Symbol` enum-value declarations so Stage-1's vocab can be lifted
+    /// from cells.
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
@@ -3200,7 +3215,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 16, "noun count");
+        assert_eq!(noun_count, 17, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -3212,7 +3227,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 5, "enum-valued noun count");
+        assert_eq!(enum_count, 7, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);

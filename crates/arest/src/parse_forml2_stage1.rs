@@ -31,12 +31,168 @@ use crate::ast::{Object, fact_from_pairs};
 
 type Cells = HashMap<String, Vec<Object>>;
 
+// ── MC1 Vocab (#712) ────────────────────────────────────────────────
+//
+// The token vocabulary Stage-1 uses to tokenize statements lives in
+// `readings/forml2-grammar.md` as `The possible values of <Type> are
+// '...'.` enum-value declarations. Stage-2 caches the parsed grammar
+// state (`cached_grammar_state`); Stage-1 receives a `Vocab` distilled
+// from the EnumValues cell of that state.
+//
+// `Vocab::boot()` is the chicken-and-egg fallback used by the Stage-1
+// unit tests (which don't run Stage-2's cache build) and by the bare
+// `tokenize_statement` / `tokenize_statement_presorted` /
+// `tokenize_statement_with_buckets` entry points kept for legacy
+// callers. The boot set MUST stay byte-identical to the EnumValues
+// declarations in the grammar reading so the two paths produce the
+// same Statement cells.
+//
+// `Vocab::from_grammar_state(state)` reads the EnumValues cell of a
+// parsed grammar state and returns a Vocab driven by the readings.
+// Stage-2's `parse_to_state_via_stage12_impl` builds one of these
+// from `cached_grammar_state()` and threads it through
+// `tokenize_statement_with_vocab` so user-corpus parsing follows the
+// readings vocabulary.
+
+/// Tokenization vocabulary lifted from `readings/forml2-grammar.md`.
+///
+/// All fields use owned `Vec<String>` so a `Vocab` built from cells
+/// outlives the borrowed grammar state. Stage-1 hot-path rebuilds
+/// "needle" derivations (e.g. `" iff "` from `iff`) at call time;
+/// the per-parse cost is dominated by tokenization itself, not these
+/// short prefix scans, and keeping the struct simple lets it be
+/// rebuilt cheaply per parse if the grammar ever becomes mutable.
+#[derive(Debug, Clone)]
+pub struct Vocab {
+    /// Quantifier atoms (e.g. `each`, `at most one`, `exactly one`,
+    /// `some`, `no`, `at most`, `at least`). Used for both leading
+    /// quantifier stripping and inner quantifier detection.
+    pub quantifiers: Vec<String>,
+    /// Conditional/derivation keywords (e.g. `iff`, `if`, `when`).
+    pub keywords: Vec<String>,
+    /// Multi-clause constraint keyword phrases (e.g. `if and only if`,
+    /// `at most one of the following holds`).
+    pub constraint_keywords: Vec<String>,
+    /// Deontic operator atoms (e.g. `obligatory`, `forbidden`,
+    /// `permitted`). Stage-1 builds the `It is <op> that ` prefix per
+    /// operator at strip time.
+    pub deontic_operators: Vec<String>,
+    /// Trailing marker phrases (e.g. `is an entity type`, `is acyclic`,
+    /// `are mutually exclusive`).
+    pub trailing_markers: Vec<String>,
+    /// ORM 2 derivation marker symbols paired with their canonical
+    /// names: `("**", "derived-and-stored")`, `("*", "fully-derived")`,
+    /// `("+", "semi-derived")`. Order matters — longer first so `**`
+    /// wins over `*`.
+    pub derivation_markers: Vec<(String, String)>,
+}
+
+impl Vocab {
+    /// Boot vocabulary — the chicken-and-egg fallback used when no
+    /// parsed grammar state is available (Stage-1 unit tests, the
+    /// `tokenize_statement_*` entry points kept for legacy callers).
+    /// Must stay in sync with the EnumValues declarations in
+    /// `readings/forml2-grammar.md`.
+    pub fn boot() -> Self {
+        Vocab {
+            quantifiers: ["each", "at most one", "at least one", "exactly one",
+                          "some", "no", "at most", "at least"]
+                .iter().map(|s| s.to_string()).collect(),
+            keywords: ["iff", "if", "when"]
+                .iter().map(|s| s.to_string()).collect(),
+            constraint_keywords: [
+                "if and only if",
+                "at most one of the following holds",
+                "exactly one of the following holds",
+                "at least one of the following holds",
+            ].iter().map(|s| s.to_string()).collect(),
+            deontic_operators: ["obligatory", "forbidden", "permitted"]
+                .iter().map(|s| s.to_string()).collect(),
+            trailing_markers: [
+                "is an entity type",
+                "is a value type",
+                "is abstract",
+                "is acyclic",
+                "is asymmetric",
+                "is antisymmetric",
+                "is intransitive",
+                "is irreflexive",
+                "is reflexive",
+                "is symmetric",
+                "is transitive",
+                "are mutually exclusive",
+                "is partitioned into",
+                "is a subtype of",
+            ].iter().map(|s| s.to_string()).collect(),
+            derivation_markers: alloc::vec![
+                ("**".to_string(), "derived-and-stored".to_string()),
+                ("*".to_string(),  "fully-derived".to_string()),
+                ("+".to_string(),  "semi-derived".to_string()),
+            ],
+        }
+    }
+
+    /// Build a vocab by reading the EnumValues cell of a parsed
+    /// grammar state. Each enum-value-typed value type in the grammar
+    /// reading lands as a fact `{ noun: "<Type>", value0: "...",
+    /// value1: "...", ... }`; this function pulls the values for the
+    /// known vocab types and falls back to boot for any type that is
+    /// missing or empty.
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let boot = Self::boot();
+        let cell = crate::ast::fetch_or_phi("EnumValues", state);
+        let facts = match cell.as_seq() {
+            Some(s) => s,
+            None => return boot,
+        };
+        let read = |type_name: &str, fallback: &[String]| -> Vec<String> {
+            for f in facts.iter() {
+                if crate::ast::binding(f, "noun") != Some(type_name) { continue; }
+                let vals: Vec<String> = (0..)
+                    .map_while(|i| {
+                        let key = format!("value{i}");
+                        crate::ast::binding(f, &key).map(String::from)
+                    })
+                    .collect();
+                if !vals.is_empty() { return vals; }
+            }
+            fallback.to_vec()
+        };
+        let quantifiers = read("Quantifier", &boot.quantifiers);
+        let keywords = read("Keyword", &boot.keywords);
+        let constraint_keywords = read("Constraint Keyword", &boot.constraint_keywords);
+        let deontic_operators = read("Deontic Operator", &boot.deontic_operators);
+        let trailing_markers = read("Trailing Marker", &boot.trailing_markers);
+        // Derivation markers are read as a parallel pair of enum
+        // value types: `Derivation Marker Symbol` and
+        // `Derivation Marker` (kept in the existing grammar).
+        let symbols = read("Derivation Marker Symbol", &[]);
+        let names = read("Derivation Marker", &[]);
+        let derivation_markers = if symbols.len() == names.len() && !symbols.is_empty() {
+            symbols.into_iter().zip(names).collect()
+        } else {
+            boot.derivation_markers.clone()
+        };
+        Vocab {
+            quantifiers,
+            keywords,
+            constraint_keywords,
+            deontic_operators,
+            trailing_markers,
+            derivation_markers,
+        }
+    }
+}
+
 /// Tokenize a single FORML 2 statement into the Stage-1 cell shape.
 ///
 /// - `statement_id`: unique id for this Statement (caller-assigned).
 /// - `text`: the raw statement text (trailing period allowed; this
 ///   function trims it).
 /// - `nouns`: declared noun names. Matching uses longest-first.
+///
+/// Uses `Vocab::boot()`. For the cell-driven path (Stage-2 caller),
+/// use `tokenize_statement_with_vocab` instead.
 ///
 /// Returns a `Cells` map the caller can merge into a larger state.
 pub fn tokenize_statement(statement_id: &str, text: &str, nouns: &[String]) -> Cells {
@@ -85,9 +241,23 @@ pub fn tokenize_statement_presorted(statement_id: &str, text: &str, sorted_nouns
     tokenize_statement_with_buckets(statement_id, text, &buckets)
 }
 
-/// Fastest entry point for bulk tokenization: caller has pre-built
-/// the `NounBuckets` index. Stage-2 uses this for the per-line loop.
+/// Fastest entry point for bulk tokenization with the boot vocab.
+/// Caller has pre-built the `NounBuckets` index. Kept for legacy
+/// callers; Stage-2 uses `tokenize_statement_with_buckets_vocab` so
+/// the vocabulary follows `readings/forml2-grammar.md`.
 pub fn tokenize_statement_with_buckets(statement_id: &str, text: &str, buckets: &NounBuckets<'_>) -> Cells {
+    tokenize_statement_with_buckets_vocab(statement_id, text, buckets, &Vocab::boot())
+}
+
+/// Vocab-aware tokenizer (#712 / MC1). Stage-2's per-line loop calls
+/// this with a `Vocab` distilled from the cached grammar state's
+/// EnumValues cell, so token recognition follows the readings.
+pub fn tokenize_statement_with_buckets_vocab(
+    statement_id: &str,
+    text: &str,
+    buckets: &NounBuckets<'_>,
+    vocab: &Vocab,
+) -> Cells {
     let mut cells: Cells = HashMap::new();
     // Canonical text: drop the trailing period AND the leading ORM 2
     // derivation marker (`* ` / `** ` / `+ `). Legacy's `try_derivation`
@@ -104,7 +274,7 @@ pub fn tokenize_statement_with_buckets(statement_id: &str, text: &str, buckets: 
     // 1. Strip trailing ORM 2 derivation marker. Apply to the
     //    canonical text too so downstream consumers (Text cell,
     //    FactType id construction) don't carry the ` *` suffix.
-    let (body, derivation_marker) = strip_derivation_marker(no_prefix);
+    let (body, derivation_marker) = strip_derivation_marker(no_prefix, vocab);
     let canonical: &str = body.trim_end_matches('.').trim();
     let body: &str = canonical;
 
@@ -117,10 +287,10 @@ pub fn tokenize_statement_with_buckets(statement_id: &str, text: &str, buckets: 
     let body: &str = body_stripped.as_ref();
 
     // 2. Strip leading deontic operator (`It is obligatory/forbidden/permitted that`).
-    let (body, deontic_operator) = strip_leading_deontic_operator(body);
+    let (body, deontic_operator) = strip_leading_deontic_operator(body, vocab);
 
     // 3. Strip leading quantifier.
-    let (body, quantifier) = strip_leading_quantifier(body);
+    let (body, quantifier) = strip_leading_quantifier(body, vocab);
 
     // 3. Longest-first noun matching over the body. Caller supplies
     //    a pre-built `NounBuckets` so we skip per-call partitioning.
@@ -131,7 +301,7 @@ pub fn tokenize_statement_with_buckets(statement_id: &str, text: &str, buckets: 
     let mut verb = extract_verb(body, &role_refs);
 
     // 5. Trailing Marker.
-    let mut trailing_marker = extract_trailing_marker(body, &role_refs);
+    let mut trailing_marker = extract_trailing_marker(body, &role_refs, vocab);
     // Synthetic ring marker: `No <Noun> <verb> itself` is ORM 2's
     // irreflexive-constraint shorthand. Legacy's `try_ring` matches
     // it directly; Stage-2 relies on the `is irreflexive` trailing
@@ -191,9 +361,9 @@ pub fn tokenize_statement_with_buckets(statement_id: &str, text: &str, buckets: 
     // distinct inner quantifier so the grammar's recognizer rules
     // can fire. Longest-first: when 'at most one' is present, drop
     // the bare 'at most' so FC doesn't mis-fire on a UC sentence.
-    for q in inner_quantifiers(body) {
+    for q in inner_quantifiers(body, vocab) {
         push(&mut cells, "Statement_has_Quantifier", fact_from_pairs(&[
-            ("Statement", statement_id), ("Quantifier", q),
+            ("Statement", statement_id), ("Quantifier", q.as_str()),
         ]));
     }
     if let Some(dm) = derivation_marker.as_ref() {
@@ -222,15 +392,17 @@ pub fn tokenize_statement_with_buckets(statement_id: &str, text: &str, buckets: 
     // keywords below — `if and only if` would otherwise also emit the
     // shorter `if` keyword and spuriously classify the statement as a
     // Derivation Rule.
-    let is_constraint_body = CONSTRAINT_KEYWORDS.iter().any(|k| body.contains(*k));
+    let is_constraint_body = vocab.constraint_keywords.iter()
+        .any(|k| body.contains(k.as_str()));
     if !is_constraint_body {
-        // Pre-materialized `" <kw> "` needles — parallel to KEYWORDS.
-        // Avoids allocating a fresh String per (line × keyword) pair.
-        const KEYWORD_NEEDLES: &[&str] = &[" iff ", " if ", " when "];
-        for (kw_idx, kw) in KEYWORDS.iter().enumerate() {
-            if body.contains(KEYWORD_NEEDLES[kw_idx]) {
+        // Build " <kw> " needles per call from the vocab. The keyword
+        // list is tiny (3 entries in boot vocab) so the per-line
+        // allocation cost is negligible compared to noun matching.
+        for kw in vocab.keywords.iter() {
+            let needle = format!(" {} ", kw);
+            if body.contains(needle.as_str()) {
                 push(&mut cells, "Statement_has_Keyword", fact_from_pairs(&[
-                    ("Statement", statement_id), ("Keyword", kw),
+                    ("Statement", statement_id), ("Keyword", kw.as_str()),
                 ]));
             }
         }
@@ -269,10 +441,10 @@ pub fn tokenize_statement_with_buckets(statement_id: &str, text: &str, buckets: 
     //   'at most one of the following holds'     → Exclusion Constraint
     //   'exactly one of the following holds'     → Exclusive-Or Constraint
     //   'at least one of the following holds'    → Or Constraint
-    for kw in CONSTRAINT_KEYWORDS {
-        if body.contains(*kw) {
+    for kw in vocab.constraint_keywords.iter() {
+        if body.contains(kw.as_str()) {
             push(&mut cells, "Statement_has_Constraint_Keyword", fact_from_pairs(&[
-                ("Statement", statement_id), ("Constraint_Keyword", kw),
+                ("Statement", statement_id), ("Constraint_Keyword", kw.as_str()),
             ]));
         }
     }
@@ -346,96 +518,116 @@ fn push(cells: &mut Cells, name: &str, fact: Object) {
 /// no_std-clean (#653): pure `alloc::format!` + `str::contains`, no
 /// serde/regex/std reach. Originally cfg-gated to `std-deps` out of
 /// caution; gate dropped so stage2 can call it under no_std as well.
-pub fn reserved_keyword_in(name: &str) -> Option<&'static str> {
-    // Longest first so `at most one` beats `at most` on `At Most One
-    // Hop`, etc.
-    const RESERVED: &[&str] = &[
-        "at most one of the following holds",
-        "at least one of the following holds",
-        "exactly one of the following holds",
+pub fn reserved_keyword_in(name: &str) -> Option<alloc::string::String> {
+    reserved_keyword_in_with_vocab(name, &Vocab::boot())
+}
+
+/// Vocab-aware variant of `reserved_keyword_in` (#712 / MC1). The
+/// reserved set is the union of `vocab.constraint_keywords`,
+/// `vocab.quantifiers`, `vocab.keywords`, `vocab.deontic_operators`,
+/// plus a tiny tail of atoms (`then`, `exactly`, `if some then that`,
+/// `possible`, `impossible`) that are part of the grammar but don't
+/// have a dedicated value-type enum yet. Stage-2 may call the bare
+/// `reserved_keyword_in` (which delegates to `Vocab::boot()`) before
+/// the cached grammar state is built; once built, it can pass a
+/// cell-driven vocab here for full meta-circularity.
+pub fn reserved_keyword_in_with_vocab(name: &str, vocab: &Vocab)
+    -> Option<alloc::string::String>
+{
+    // Build the reserved set from the vocab + the small fixed tail.
+    let mut reserved: Vec<alloc::string::String> = Vec::new();
+    reserved.extend(vocab.constraint_keywords.iter().cloned());
+    reserved.extend(vocab.quantifiers.iter().cloned());
+    reserved.extend(vocab.keywords.iter().cloned());
+    reserved.extend(vocab.deontic_operators.iter().cloned());
+    // Boot-only atoms — these aren't yet expressed as enum-value
+    // declarations in `readings/forml2-grammar.md`. They include the
+    // synthetic `if some then that` token Stage-1 emits for ORM 2
+    // subset constraints, the `then` connective from `If ... then ...`
+    // derivation rules, the bare `exactly` (legacy), and the
+    // possibility-marker pair from ORM 2 (`possible` / `impossible`).
+    for extra in [
         "if some then that",
-        "if and only if",
-        "at most one",
-        "at least one",
-        "exactly one",
-        "at most",
-        "at least",
-        "each", "no", "some", "exactly",
-        "iff", "if", "then", "when",
-        "obligatory", "forbidden", "permitted",
-        "possible", "impossible",
-    ];
+        "then",
+        "exactly",
+        "possible",
+        "impossible",
+    ] {
+        if !reserved.iter().any(|r| r == extra) {
+            reserved.push(extra.to_string());
+        }
+    }
+    // Longest-first so `at most one` beats `at most`.
+    reserved.sort_by(|a, b| b.len().cmp(&a.len()));
     let padded: alloc::string::String =
         alloc::format!(" {} ", name.to_lowercase());
-    RESERVED.iter()
+    reserved.into_iter()
         .find(|kw| {
             let needle = alloc::format!(" {} ", kw);
             padded.contains(needle.as_str())
         })
-        .copied()
 }
 
-fn strip_derivation_marker(text: &str) -> (&str, Option<String>) {
-    if let Some(before) = text.strip_suffix(" **") {
-        return (before, Some("derived-and-stored".to_string()));
-    }
-    if let Some(before) = text.strip_suffix(" *") {
-        return (before, Some("fully-derived".to_string()));
-    }
-    if let Some(before) = text.strip_suffix(" +") {
-        return (before, Some("semi-derived".to_string()));
-    }
-    (text, None)
-}
-
-const KEYWORDS: &[&str] = &["iff", "if", "when"];
-
-/// Multi-clause constraint keywords (Halpin FORML / ORM 2). Each
-/// phrase uniquely signals one constraint kind per the grammar's
-/// recognizer rules.
-const CONSTRAINT_KEYWORDS: &[&str] = &[
-    "if and only if",
-    "at most one of the following holds",
-    "exactly one of the following holds",
-    "at least one of the following holds",
-];
-
-const QUANTIFIERS: &[&str] = &[
-    "at most one ",
-    "at least one ",
-    "exactly one ",
-    "at most ",
-    "at least ",
-    "Each ",
-    "each ",
-    "Some ",
-    "some ",
-    "No ",
-    "no ",
-];
-
-fn strip_leading_quantifier(text: &str) -> (&str, Option<String>) {
-    for q in QUANTIFIERS {
-        if let Some(rest) = text.strip_prefix(q) {
-            return (rest, Some(q.trim().to_lowercase()));
+fn strip_derivation_marker<'a>(text: &'a str, vocab: &Vocab) -> (&'a str, Option<String>) {
+    // Markers are stored longest-first in `vocab.derivation_markers`,
+    // so `**` wins over `*`. Each marker is matched as `" {symbol}"`
+    // so we don't accidentally peel a literal `*` out of e.g. a
+    // multi-line continuation that ends in punctuation.
+    for (sym, name) in vocab.derivation_markers.iter() {
+        let needle = format!(" {}", sym);
+        if let Some(before) = text.strip_suffix(needle.as_str()) {
+            return (before, Some(name.clone()));
         }
     }
     (text, None)
 }
 
-const DEONTIC_PREFIXES: &[(&str, &str)] = &[
-    ("It is obligatory that ", "obligatory"),
-    ("It is forbidden that ",  "forbidden"),
-    ("It is permitted that ",  "permitted"),
-    ("it is obligatory that ", "obligatory"),
-    ("it is forbidden that ",  "forbidden"),
-    ("it is permitted that ",  "permitted"),
-];
+fn strip_leading_quantifier<'a>(text: &'a str, vocab: &Vocab)
+    -> (&'a str, Option<String>)
+{
+    // Try longest first so `at most one` beats `at most`.
+    let mut sorted: Vec<&str> = vocab.quantifiers.iter()
+        .map(|s| s.as_str()).collect();
+    sorted.sort_by(|a, b| b.len().cmp(&a.len()));
+    for q in sorted {
+        // Each quantifier matches both lowercase and Capitalized
+        // sentence-leading forms. We append a trailing space so the
+        // strip excludes the noun/verb body.
+        let lower = format!("{} ", q);
+        if let Some(rest) = text.strip_prefix(lower.as_str()) {
+            return (rest, Some(q.to_lowercase()));
+        }
+        if let Some(first) = q.chars().next() {
+            if first.is_lowercase() {
+                let mut cap = String::with_capacity(q.len() + 1);
+                cap.push(first.to_ascii_uppercase());
+                cap.push_str(&q[first.len_utf8()..]);
+                cap.push(' ');
+                if let Some(rest) = text.strip_prefix(cap.as_str()) {
+                    return (rest, Some(q.to_lowercase()));
+                }
+            }
+        }
+    }
+    (text, None)
+}
 
-fn strip_leading_deontic_operator(text: &str) -> (&str, Option<String>) {
-    for (prefix, op) in DEONTIC_PREFIXES {
-        if let Some(rest) = text.strip_prefix(prefix) {
-            return (rest, Some(op.to_string()));
+fn strip_leading_deontic_operator<'a>(text: &'a str, vocab: &Vocab)
+    -> (&'a str, Option<String>)
+{
+    // Each deontic operator is stripped as both `It is <op> that ` and
+    // its lowercase variant `it is <op> that `. The grammar reading
+    // declares the bare operator atom (e.g. `'obligatory'`); the
+    // wrapping prefix is the canonical English shape from Halpin's
+    // FORML 2 spec.
+    for op in vocab.deontic_operators.iter() {
+        let cap = format!("It is {} that ", op);
+        if let Some(rest) = text.strip_prefix(cap.as_str()) {
+            return (rest, Some(op.clone()));
+        }
+        let low = format!("it is {} that ", op);
+        if let Some(rest) = text.strip_prefix(low.as_str()) {
+            return (rest, Some(op.clone()));
         }
     }
     (text, None)
@@ -589,62 +781,52 @@ fn extract_verb(text: &str, refs: &[RoleRef]) -> Option<String> {
     }
 }
 
-/// Trailing markers are suffixes that signal statement kind. The list
-/// comes from the Rust classifier's fixed set. Stage-2 derivation
-/// rules match against these marker atoms, not against raw prose.
-const TRAILING_MARKERS: &[&str] = &[
-    "is an entity type",
-    "is a value type",
-    "is abstract",
-    "is acyclic",
-    "is asymmetric",
-    "is antisymmetric",
-    "is intransitive",
-    "is irreflexive",
-    "is reflexive",
-    "is symmetric",
-    "is transitive",
-    "are mutually exclusive",
-    "is partitioned into",
-    "is a subtype of",
-];
+/// Scan the body for inner quantifier phrases drawn from `vocab` and
+/// return those present, in longest-first order. Longest-match
+/// semantics prevent UC-on-'at most one' sentences from also firing
+/// FC (which requires both 'at most' and 'at least' without the 'one'
+/// suffix).
+fn inner_quantifiers(body: &str, vocab: &Vocab) -> Vec<String> {
+    // Partition the vocab quantifier atoms into the two operational
+    // classes the inner-quantifier scan needs:
+    //   * "long" forms ending in ` one` (`at most one`, `at least
+    //     one`, `exactly one`) — these participate in the multi-clause
+    //     superset suppression below.
+    //   * "short" forms (`at most`, `at least`) — emitted only when
+    //     their long-form extension isn't already present.
+    // The other atoms (`each`, `no`, `some`) are leading-quantifier
+    // shapes; only `some` is also an inner signal (Halpin's MC
+    // shorthand) and we keep that special-case below.
+    let long: Vec<&str> = vocab.quantifiers.iter()
+        .filter(|q| q.ends_with(" one"))
+        .map(|s| s.as_str())
+        .collect();
+    let short: Vec<&str> = vocab.quantifiers.iter()
+        .filter(|q| {
+            let s = q.as_str();
+            // `at most` / `at least` — multiword shorts whose long
+            // extension exists in `long`.
+            s.contains(' ')
+                && !s.ends_with(" one")
+                && long.iter().any(|l| *l == format!("{} one", s).as_str())
+        })
+        .map(|s| s.as_str())
+        .collect();
 
-/// Scan the body for inner quantifier phrases and return those
-/// present, in longest-first order. Longest-match semantics prevent
-/// UC-on-'at most one' sentences from also firing FC (which requires
-/// both 'at most' and 'at least' without the 'one' suffix).
-fn inner_quantifiers(body: &str) -> Vec<&'static str> {
-    const LONG: &[&str] = &["at most one", "at least one", "exactly one"];
-    // Parallel arrays — SHORT[i]'s "one" extension is SHORT_ONE[i].
-    // Pre-materialized so the filter below doesn't `format!` per call.
-    const SHORT: &[&str] = &["at most", "at least"];
-    const SHORT_ONE: &[&str] = &["at most one", "at least one"];
-    // Multi-clause superset suppression: when the body uses
-    // `<quant> of the following holds` (a Constraint Keyword that the
-    // grammar rule classifies as XC/XO/OR), the bare LONG quantifier
-    // hit is a false positive — the same words are part of the
-    // multi-clause keyword, not an inner UC signal. Without this
-    // suppression both classifiers fire and the cardinality
-    // translator (UC family) wins over the set translator (XO/XC/OR
-    // family), so `For each Task, exactly one of the following holds:
-    // …` lands as kind=UC instead of kind=XO.
-    let long_hits: Vec<&'static str> = LONG.iter()
+    let long_hits: Vec<String> = long.iter()
         .filter(|q| body.contains(**q))
         .filter(|q| {
-            // Suppress when the keyword superset is present.
             let superset = alloc::format!("{} of the following holds", q);
             !body.contains(&superset)
         })
-        .copied()
+        .map(|s| (*s).to_string())
         .collect();
-    // A bare 'at most' / 'at least' is emitted only when its
-    // "<phrase> one" extension isn't already present in the body —
-    // that way `at most 5 and at least 2` yields both shorts but
-    // `at most one Customer` yields only the long form.
-    let short_hits: Vec<&'static str> = SHORT.iter()
-        .enumerate()
-        .filter(|(i, q)| body.contains(**q) && !body.contains(SHORT_ONE[*i]))
-        .map(|(_, q)| *q)
+    let short_hits: Vec<String> = short.iter()
+        .filter(|q| {
+            let extension = alloc::format!("{} one", q);
+            body.contains(**q) && !body.contains(extension.as_str())
+        })
+        .map(|s| (*s).to_string())
         .collect();
     // ORM 2 plural `some` is the MC signal — `Each X has some Y` is
     // the "at least one" shorthand. Emit as its own quantifier atom
@@ -652,7 +834,9 @@ fn inner_quantifiers(body: &str) -> Vec<&'static str> {
     // space on each side to avoid matching inside words like `someone`
     // or at the start when `some` is the leading quantifier (stripped
     // upstream by `strip_leading_quantifier`).
-    let some_hit: Option<&'static str> = body.contains(" some ").then_some("some");
+    let some_hit: Option<String> =
+        (vocab.quantifiers.iter().any(|q| q == "some") && body.contains(" some "))
+            .then(|| "some".to_string());
     long_hits.into_iter().chain(short_hits).chain(some_hit).collect()
 }
 
@@ -676,13 +860,19 @@ fn extract_enum_values(body: &str) -> Option<Vec<String>> {
     (!values.is_empty()).then_some(values)
 }
 
-fn extract_trailing_marker(text: &str, refs: &[RoleRef]) -> Option<String> {
+fn extract_trailing_marker(text: &str, refs: &[RoleRef], vocab: &Vocab) -> Option<String> {
     // Look only past the last noun match (including any trailing
     // literal). That keeps "is a value type" from matching inside
     // "X is a value type" where X is a noun.
     let start = refs.last().map(|r| r.span_end).unwrap_or(0);
     let tail = text[start..].trim();
-    TRAILING_MARKERS.iter()
+    // Longest first so `is a subtype of Person` (Verb) doesn't shadow
+    // `is acyclic` etc., and so a marker that is a prefix of another
+    // (`is a` vs `is a value type`) wins on the longer form.
+    let mut sorted: Vec<&str> = vocab.trailing_markers.iter()
+        .map(|s| s.as_str()).collect();
+    sorted.sort_by(|a, b| b.len().cmp(&a.len()));
+    sorted.iter()
         .find(|m| tail == **m || tail.starts_with(*m))
         .map(|m| (*m).to_string())
 }
@@ -740,48 +930,48 @@ mod tests {
 
     #[test]
     fn reserved_keyword_in_catches_each_way_bet() {
-        assert_eq!(super::reserved_keyword_in("Each Way Bet"), Some("each"));
+        assert_eq!(super::reserved_keyword_in("Each Way Bet").as_deref(), Some("each"));
     }
 
     #[test]
     fn reserved_keyword_in_catches_no_show_fee() {
-        assert_eq!(super::reserved_keyword_in("No Show Fee"), Some("no"));
+        assert_eq!(super::reserved_keyword_in("No Show Fee").as_deref(), Some("no"));
     }
 
     #[test]
     fn reserved_keyword_in_catches_at_most_one_hop_longest_first() {
         // `at most one` wins over `at most` per longest-first ordering.
-        assert_eq!(super::reserved_keyword_in("At Most One Hop"),
+        assert_eq!(super::reserved_keyword_in("At Most One Hop").as_deref(),
                    Some("at most one"));
     }
 
     #[test]
     fn reserved_keyword_in_catches_multi_clause_phrase() {
-        assert_eq!(super::reserved_keyword_in("If And Only If Then Noun"),
+        assert_eq!(super::reserved_keyword_in("If And Only If Then Noun").as_deref(),
                    Some("if and only if"));
     }
 
     #[test]
     fn reserved_keyword_in_accepts_normal_names() {
-        assert_eq!(super::reserved_keyword_in("Order"), None);
-        assert_eq!(super::reserved_keyword_in("Customer"), None);
-        assert_eq!(super::reserved_keyword_in("Line Item"), None);
-        assert_eq!(super::reserved_keyword_in("Fact Type"), None);
+        assert!(super::reserved_keyword_in("Order").is_none());
+        assert!(super::reserved_keyword_in("Customer").is_none());
+        assert!(super::reserved_keyword_in("Line Item").is_none());
+        assert!(super::reserved_keyword_in("Fact Type").is_none());
     }
 
     #[test]
     fn reserved_keyword_in_does_not_match_substring_inside_word() {
         // Word-bounded: `each` must be a whole word, not a letter
         // sequence inside one.
-        assert_eq!(super::reserved_keyword_in("Teacher"), None);
-        assert_eq!(super::reserved_keyword_in("Beach"), None);
-        assert_eq!(super::reserved_keyword_in("Reacher"), None);
+        assert!(super::reserved_keyword_in("Teacher").is_none());
+        assert!(super::reserved_keyword_in("Beach").is_none());
+        assert!(super::reserved_keyword_in("Reacher").is_none());
     }
 
     #[test]
     fn reserved_keyword_in_is_case_insensitive() {
-        assert_eq!(super::reserved_keyword_in("EACH way bet"), Some("each"));
-        assert_eq!(super::reserved_keyword_in("no Show Fee"), Some("no"));
+        assert_eq!(super::reserved_keyword_in("EACH way bet").as_deref(), Some("each"));
+        assert_eq!(super::reserved_keyword_in("no Show Fee").as_deref(), Some("no"));
     }
 
     #[test]
@@ -1052,5 +1242,185 @@ mod tests {
                 .collect())
             .unwrap_or_default();
         assert_eq!(vals, vec!["low", "medium", "high"]);
+    }
+
+    // ─── #712 / MC1: cell-driven vocab tests ──────────────────────────
+    //
+    // These tests assert Stage-1 reads quantifier / keyword / deontic /
+    // trailing-marker / constraint-keyword vocab from a `Vocab` derived
+    // from cells, not from the (now-internal) boot constants. They use
+    // a synthetic state object built directly in the test, so they
+    // verify the cell-reading path independent of `cached_grammar_state`.
+
+    fn synthetic_vocab_state(enums: &[(&str, &[&str])]) -> Object {
+        use alloc::sync::Arc;
+        let facts: Vec<Object> = enums.iter().map(|(noun, vals)| {
+            let mut pairs: Vec<(String, String)> = alloc::vec![
+                ("noun".to_string(), (*noun).to_string()),
+            ];
+            for (i, v) in vals.iter().enumerate() {
+                pairs.push((format!("value{i}"), (*v).to_string()));
+            }
+            let refs: Vec<(&str, &str)> = pairs.iter()
+                .map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            fact_from_pairs(&refs)
+        }).collect();
+        let mut map = HashMap::new();
+        map.insert("EnumValues".to_string(), Object::Seq(Arc::from(facts)));
+        Object::Map(map)
+    }
+
+    #[test]
+    fn vocab_from_grammar_state_reads_quantifier_enum() {
+        // Grammar reading declares: The possible values of Quantifier
+        // are 'each', 'some', 'every', ...
+        // A `Vocab` derived from that state must include those atoms.
+        let state = synthetic_vocab_state(&[
+            ("Quantifier", &["each", "some", "no"]),
+            ("Keyword", &["iff", "if", "when"]),
+            ("Deontic Operator", &["obligatory"]),
+            ("Constraint Keyword", &["if and only if"]),
+        ]);
+        let vocab = Vocab::from_grammar_state(&state);
+        assert!(vocab.quantifiers.iter().any(|q| q == "each"));
+        assert!(vocab.quantifiers.iter().any(|q| q == "some"));
+        assert!(vocab.quantifiers.iter().any(|q| q == "no"));
+        assert!(vocab.keywords.iter().any(|k| k == "iff"));
+        assert!(vocab.deontic_operators.iter().any(|o| o == "obligatory"));
+        assert!(vocab.constraint_keywords.iter().any(|k| k == "if and only if"));
+    }
+
+    #[test]
+    fn vocab_from_grammar_state_falls_back_to_boot_for_missing_types() {
+        // EnumValues missing the Quantifier type → boot fallback.
+        let state = synthetic_vocab_state(&[
+            ("Keyword", &["iff", "if", "when"]),
+        ]);
+        let vocab = Vocab::from_grammar_state(&state);
+        // Boot values present.
+        assert!(vocab.quantifiers.iter().any(|q| q == "each"));
+        assert!(vocab.quantifiers.iter().any(|q| q == "at most one"));
+        // Trailing markers — entirely missing from the EnumValues —
+        // also fall back to boot.
+        assert!(vocab.trailing_markers.iter().any(|t| t == "is an entity type"));
+    }
+
+    #[test]
+    fn tokenize_with_vocab_recognizes_quantifier_via_cell_path() {
+        // The test that the audit doc calls out: the parser recognizes
+        // 'each' as a quantifier via the cell-driven path. Build a
+        // vocab whose Quantifier set comes from a synthetic EnumValues
+        // cell, not from `Vocab::boot()`, and verify Stage-1 emits the
+        // Statement_has_Quantifier fact.
+        let state = synthetic_vocab_state(&[
+            ("Quantifier", &["each", "exactly one", "at most", "at least", "some", "no", "at most one", "at least one"]),
+            ("Keyword", &["iff", "if", "when"]),
+            ("Deontic Operator", &["obligatory", "forbidden", "permitted"]),
+            ("Constraint Keyword", &["if and only if"]),
+        ]);
+        let vocab = Vocab::from_grammar_state(&state);
+        let sorted: Vec<&str> = ["Customer", "Order"].to_vec();
+        let buckets = NounBuckets::from_sorted(&sorted);
+        let cells = tokenize_statement_with_buckets_vocab(
+            "s1", "Each Customer places exactly one Order.", &buckets, &vocab);
+        let qs: Vec<String> = cells.get("Statement_has_Quantifier")
+            .map(|facts| facts.iter()
+                .filter_map(|f| binding(f, "Quantifier").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert!(qs.iter().any(|q| q == "each"),
+            "expected 'each' from cell-driven vocab; got {:?}", qs);
+        assert!(qs.iter().any(|q| q == "exactly one"),
+            "expected 'exactly one' inner quantifier from cell-driven vocab; got {:?}", qs);
+    }
+
+    #[test]
+    fn tokenize_with_vocab_skips_quantifier_absent_from_cells() {
+        // Inverse of the test above: if the cell-driven vocab does
+        // NOT list 'each' as a Quantifier, Stage-1 must not emit it.
+        // This is the invariant that proves the path is truly
+        // cell-driven (no fallback to a hardcoded `each`).
+        let state = synthetic_vocab_state(&[
+            ("Quantifier", &["some", "no"]),  // no `each`
+            ("Keyword", &["iff", "if", "when"]),
+            ("Deontic Operator", &["obligatory"]),
+            ("Constraint Keyword", &["if and only if"]),
+        ]);
+        let vocab = Vocab::from_grammar_state(&state);
+        let sorted: Vec<&str> = ["Customer", "Order"].to_vec();
+        let buckets = NounBuckets::from_sorted(&sorted);
+        let cells = tokenize_statement_with_buckets_vocab(
+            "s1", "Each Customer places Order.", &buckets, &vocab);
+        let qs: Vec<String> = cells.get("Statement_has_Quantifier")
+            .map(|facts| facts.iter()
+                .filter_map(|f| binding(f, "Quantifier").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert!(!qs.iter().any(|q| q == "each"),
+            "vocab without `each` must not emit Quantifier 'each'; got {:?}", qs);
+    }
+
+    #[test]
+    fn tokenize_with_vocab_recognizes_keyword_via_cell_path() {
+        let state = synthetic_vocab_state(&[
+            ("Quantifier", &["each"]),
+            ("Keyword", &["iff", "if", "when"]),
+            ("Deontic Operator", &["obligatory"]),
+            ("Constraint Keyword", &["if and only if"]),
+        ]);
+        let vocab = Vocab::from_grammar_state(&state);
+        let sorted: Vec<&str> = ["Order", "Customer"].to_vec();
+        let buckets = NounBuckets::from_sorted(&sorted);
+        let cells = tokenize_statement_with_buckets_vocab(
+            "s1", "Order is placed iff Customer exists.", &buckets, &vocab);
+        let ks: Vec<String> = cells.get("Statement_has_Keyword")
+            .map(|facts| facts.iter()
+                .filter_map(|f| binding(f, "Keyword").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert!(ks.iter().any(|k| k == "iff"),
+            "expected 'iff' Keyword from cell-driven vocab; got {:?}", ks);
+    }
+
+    #[test]
+    fn tokenize_with_vocab_recognizes_deontic_via_cell_path() {
+        let state = synthetic_vocab_state(&[
+            ("Quantifier", &["each"]),
+            ("Keyword", &["iff", "if", "when"]),
+            ("Deontic Operator", &["obligatory", "forbidden", "permitted"]),
+            ("Constraint Keyword", &["if and only if"]),
+        ]);
+        let vocab = Vocab::from_grammar_state(&state);
+        let sorted: Vec<&str> = ["Customer", "Order"].to_vec();
+        let buckets = NounBuckets::from_sorted(&sorted);
+        let cells = tokenize_statement_with_buckets_vocab(
+            "s1",
+            "It is obligatory that Customer places Order.",
+            &buckets, &vocab);
+        let op = cells.get("Statement_has_Deontic_Operator")
+            .and_then(|f| f.first())
+            .and_then(|f| binding(f, "Deontic_Operator").map(String::from));
+        assert_eq!(op.as_deref(), Some("obligatory"),
+            "expected 'obligatory' Deontic Operator from cell-driven vocab");
+    }
+
+    #[test]
+    fn reserved_keyword_in_with_vocab_uses_cell_set() {
+        // `reserved_keyword_in_with_vocab` must pick up reserved atoms
+        // from the supplied vocab — not from `Vocab::boot()`. Pass a
+        // Vocab that reserves only `each`; `customer` is allowed.
+        let state = synthetic_vocab_state(&[
+            ("Quantifier", &["each"]),
+            ("Keyword", &[]),
+            ("Deontic Operator", &[]),
+            ("Constraint Keyword", &[]),
+        ]);
+        let vocab = Vocab::from_grammar_state(&state);
+        // `Customer` doesn't collide with `each` as a whole word.
+        assert!(super::reserved_keyword_in_with_vocab("Customer", &vocab).is_none());
+        // `Each Way Bet` collides on `each`.
+        assert_eq!(
+            super::reserved_keyword_in_with_vocab("Each Way Bet", &vocab).as_deref(),
+            Some("each"));
     }
 }
