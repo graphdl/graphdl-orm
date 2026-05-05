@@ -91,6 +91,8 @@ Constraint Kind Label is a value type.
 Constraint Kind Family is a value type.
   The possible values of Constraint Kind Family are 'ring', 'uniqueness', 'mandatory', 'frequency', 'value', 'set-comparison', 'subset', 'equality'.
 
+Constraint Match Keyword is a value type.
+
 ## Fact Types
 
 ### Noun
@@ -212,6 +214,8 @@ Constraint has modality of Modality Type.
 Constraint has Text.
   Each Constraint has at most one Text.
 Constraint is semantic.
+Constraint has Constraint Match Keyword.
+  It is possible that some Constraint has more than one Constraint Match Keyword.
 
 ### Constraint Type
 Constraint Type has Name.

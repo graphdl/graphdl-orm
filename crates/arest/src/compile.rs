@@ -4751,7 +4751,17 @@ fn compile_equality_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
 /// from the eval context <response_text, sender_identity, population>.
 fn compile_forbidden_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     let forbidden_values = collect_enum_values(data, &def.spans);
-    let text_keywords = extract_constraint_keywords(&def.text);
+    // MC3c (#749): prefer authored `Constraint has Constraint Match Keyword`
+    // facts over the in-Rust extraction heuristic. Fall back to the legacy
+    // text-walking extractor when no facts are declared so existing
+    // fixtures keep working through the migration window.
+    let declared_keywords = constraint_match_keywords_from_cell(data, &def.id);
+    #[allow(deprecated)]
+    let text_keywords = if !declared_keywords.is_empty() {
+        declared_keywords
+    } else {
+        extract_constraint_keywords(&def.text)
+    };
     let is_response_constraint = def.entity.as_ref()
         .map_or(false, |e| e.to_lowercase().contains("response"));
 
@@ -5033,9 +5043,47 @@ fn compile_obligatory_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     }
 }
 
+/// MC3c (#749): collect declared `Constraint has Constraint Match
+/// Keyword` instance facts whose subject value matches `constraint_id`.
+/// Returns lowercased values (matching the OWA-path Contains semantics
+/// the keyword set feeds into).
+///
+/// The constraint id is whatever Stage-2 assigned to the deontic
+/// constraint cell; today that is the full constraint text. A reading
+/// like `Constraint '<full text>' has Constraint Match Keyword
+/// 'overnight'` therefore lands as an InstanceFact with
+/// `subjectNoun = "Constraint"`, `subjectValue = <full text>`,
+/// `objectNoun = "Constraint Match Keyword"`, `objectValue =
+/// "overnight"`. Empty result means "no facts declared" — the caller
+/// falls back to the legacy text-walking extractor.
+fn constraint_match_keywords_from_cell(data: &CellIndex, constraint_id: &str)
+    -> Vec<String>
+{
+    data.general_instance_facts.iter()
+        .filter(|f|
+            f.subject_noun == "Constraint"
+                && f.subject_value == constraint_id
+                && f.object_noun == "Constraint Match Keyword"
+        )
+        .map(|f| f.object_value.to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// Extract lowercase keywords from a deontic constraint text.
 /// Strips the "It is forbidden/obligatory/permitted that" prefix,
 /// then extracts PascalCase and multi-word noun phrases.
+///
+/// Deprecated (MC3c, #749): authors should declare keywords with
+/// `Constraint '<id>' has Constraint Match Keyword '<value>'` in
+/// readings instead of relying on this Rust-side text heuristic.
+/// Kept as the fallback path so legacy fixtures that don't declare
+/// keywords still produce an OWA keyword set during the migration
+/// window. Slated for removal in a follow-up once corpora migrate.
+#[deprecated(since = "0.1.0",
+    note = "MC3c (#749): declare `Constraint has Constraint Match Keyword` \
+            facts in readings instead. This in-Rust extractor is the \
+            migration-window fallback only.")]
 fn extract_constraint_keywords(text: &str) -> Vec<String> {
     let stripped = text
         .replace("It is forbidden that ", "")
@@ -6584,6 +6632,122 @@ It is forbidden that each Noun has a name that ends with 'ies'.\n";
             "Personal Data must NOT trigger the singular-naming \
              deontic constraint (its name does not end with 'ies'); \
              got violations: {:?}", violations);
+    }
+
+    /// MC3c (#749): the OWA-keyword path must source its keyword set
+    /// from declared `Constraint has Constraint Match Keyword` facts
+    /// rather than the in-Rust `extract_constraint_keywords` text
+    /// heuristic. The test pins the contract:
+    ///
+    ///   1. With NO declared keywords, a response containing the word
+    ///      'overnight' does NOT trigger the constraint, because the
+    ///      legacy extractor pulls keywords from the constraint text
+    ///      ('response', 'uses', 'markdown') and 'overnight' isn't in
+    ///      that set.
+    ///
+    ///   2. With ONE declared keyword 'overnight', the same response
+    ///      DOES trigger a violation — the declared-keyword set
+    ///      replaces the extracted set, and 'overnight' matches the
+    ///      response, exceeding the threshold.
+    ///
+    /// Both runs use identical (state, response) inputs apart from the
+    /// declared-keyword InstanceFact, so any behaviour delta proves
+    /// the declared facts feed the OWA path.
+    fn state_with_owa_response_constraint(
+        declared_keywords: &[&str],
+    ) -> Object {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Response"), ("objectType", "entity"),
+        ]));
+        // The constraint id used by compile_forbidden_ast lookup.
+        // Stage-2 sets id = full constraint text (period stripped); we
+        // mirror that here so the InstanceFact's subjectValue can
+        // reach the same key.
+        let constraint_text = "It is forbidden that a Response uses Markdown";
+        cells.entry("Constraint".into()).or_default().push(fact_from_pairs(&[
+            ("id", constraint_text),
+            ("kind", "deontic"),
+            ("modality", "deontic"),
+            ("deonticOperator", "forbidden"),
+            ("text", constraint_text),
+            ("entity", "Response"), // is_response_constraint = true
+        ]));
+        // Declared `Constraint has Constraint Match Keyword` facts
+        // routed through the InstanceFact cell — same shape Stage-2
+        // emits when a reading like
+        //   `Constraint '<text>' has Constraint Match Keyword 'overnight'`
+        // is parsed.
+        let inst_facts: Vec<Object> = declared_keywords.iter().map(|kw| {
+            fact_from_pairs(&[
+                ("subjectNoun",  "Constraint"),
+                ("subjectValue", constraint_text),
+                ("fieldName",    "has"),
+                ("objectNoun",   "Constraint Match Keyword"),
+                ("objectValue",  *kw),
+            ])
+        }).collect();
+        if !inst_facts.is_empty() {
+            cells.insert("InstanceFact".into(), inst_facts);
+        }
+        Object::Map(cells.into_iter()
+            .map(|(k, v)| (k, Object::Seq(v.into())))
+            .collect())
+    }
+
+    /// MC3c (#749): legacy extractor path (no declared facts) — text
+    /// keywords ('response', 'uses', 'markdown') don't match a
+    /// response containing 'overnight rendering', so no violation.
+    #[test]
+    fn declared_keywords_unset_falls_back_to_text_extraction() {
+        let state = state_with_owa_response_constraint(&[]);
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        let ctx = ast::encode_eval_context_state(
+            "this contains overnight rendering",
+            None,
+            &Object::phi(),
+        );
+        let constraint_text = "It is forbidden that a Response uses Markdown";
+        // The constraint def name carries the same id Stage-2 uses.
+        let viol = ast::apply(
+            &Func::Def(alloc::format!("constraint:{}", constraint_text)),
+            &ctx,
+            &d,
+        );
+        let violations = ast::decode_violations(&viol);
+        assert!(violations.is_empty(),
+            "without declared keywords, response 'overnight rendering' \
+             should NOT match the text-extracted keyword set \
+             (response/uses/markdown); got {:?}", violations);
+    }
+
+    /// MC3c (#749): declared-keyword path — declaring 'overnight' as a
+    /// match keyword makes a response containing 'overnight' trip the
+    /// OWA threshold (1 keyword, threshold=0, 1>0).
+    #[test]
+    fn declared_keywords_drive_owa_match() {
+        let state = state_with_owa_response_constraint(&["overnight"]);
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        let ctx = ast::encode_eval_context_state(
+            "this contains overnight rendering",
+            None,
+            &Object::phi(),
+        );
+        let constraint_text = "It is forbidden that a Response uses Markdown";
+        let viol = ast::apply(
+            &Func::Def(alloc::format!("constraint:{}", constraint_text)),
+            &ctx,
+            &d,
+        );
+        let violations = ast::decode_violations(&viol);
+        assert!(!violations.is_empty(),
+            "declared keyword 'overnight' must match response \
+             containing 'overnight'; got 0 violations from raw obj {:?}",
+            viol);
     }
 
     #[test]
