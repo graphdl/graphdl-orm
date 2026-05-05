@@ -999,6 +999,57 @@ pub struct ConstraintDef {
     pub entity: Option<String>,
     pub min_occurrence: Option<usize>,
     pub max_occurrence: Option<usize>,
+    /// MC4b (#751): per-fact text predicate for deontic constraints
+    /// over a single noun's value-typed binding. When `Some`, the
+    /// compiler's population path filters facts through this predicate
+    /// before emitting violations — `It is forbidden that each Noun
+    /// has a name that ends with 'ies'` only flags Nouns whose `name`
+    /// binding satisfies the predicate, not every Noun.
+    pub predicate: Option<DeonticPredicate>,
+}
+
+/// Per-fact text predicate that gates deontic violations in the
+/// population path. Tightly scoped to the shapes the singular-naming
+/// constraint motivates — `EndsWith` and `StartsWith` over a single
+/// role binding. Future tasks can extend (Contains, regex, etc.) as
+/// new constraints land that need them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(tag = "kind", rename_all = "camelCase"))]
+pub enum DeonticPredicate {
+    EndsWith   { role: String, literal: String, negated: bool },
+    StartsWith { role: String, literal: String, negated: bool },
+}
+
+impl DeonticPredicate {
+    /// Encode as a flat `<kind>:<negated>:<role>:<literal>` string for
+    /// embedding in the Constraint cell's `predicate` field. The
+    /// fields use no `:` themselves — `kind` is one of the known
+    /// variants, `negated` is `0`/`1`, `role` is a noun-name token
+    /// without `:`, `literal` is the user's quoted text. Round-trip
+    /// is exact for the cases this DSL needs.
+    pub fn encode(&self) -> String {
+        match self {
+            DeonticPredicate::EndsWith { role, literal, negated } =>
+                alloc::format!("ends_with:{}:{}:{}", *negated as u8, role, literal),
+            DeonticPredicate::StartsWith { role, literal, negated } =>
+                alloc::format!("starts_with:{}:{}:{}", *negated as u8, role, literal),
+        }
+    }
+
+    pub fn decode(s: &str) -> Option<Self> {
+        let mut parts = s.splitn(4, ':');
+        let kind = parts.next()?;
+        let neg_str = parts.next()?;
+        let role = parts.next()?.to_string();
+        let literal = parts.next()?.to_string();
+        let negated = neg_str == "1";
+        match kind {
+            "ends_with"   => Some(DeonticPredicate::EndsWith   { role, literal, negated }),
+            "starts_with" => Some(DeonticPredicate::StartsWith { role, literal, negated }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

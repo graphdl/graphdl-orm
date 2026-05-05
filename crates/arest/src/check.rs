@@ -117,12 +117,17 @@ where F: Fn(&Object) -> Vec<ReadingDiagnostic> + Send + Sync + 'static {
 /// check_readings as a Func tree. Reads cells from the state (passed
 /// as apply's operand) and returns a Seq of diagnostic Maps.
 ///
-///   check_readings_func = Concat ∘ [ layer₁, layer₂, layer₃, layer₄, layer₅ ]
+///   check_readings_func = Concat ∘ [ layer₁, layer₂, layer₃, layer₄ ]
 ///
 /// The composition is explicit FFP; layer bodies stay Native for now
 /// because several read multiple cells and format messages. Future
 /// work (#214 cont.) can lower each layer body into `ApplyToAll`,
 /// `Filter`, `Construction`, and binding-extract primitives.
+///
+/// MC4b (#751): the singular-naming layer moved out — it is now a
+/// deontic constraint in `readings/core/core.md` that flows through
+/// the validate dispatch and surfaces as a `Violation` rather than a
+/// `ReadingDiagnostic`. The Rust heuristic that lived here is gone.
 pub fn check_readings_func() -> Func {
     Func::compose(
         Func::Concat,
@@ -130,7 +135,6 @@ pub fn check_readings_func() -> Func {
             layer_native(check_unresolved_clauses),
             layer_native(check_ring_validity),
             layer_native(check_ring_completeness),
-            layer_native(check_singular_naming),
             layer_native(check_atom_ids),
         ]),
     )
@@ -406,29 +410,13 @@ fn text_contains_capitalized_prefixed(text: &str, target: &str) -> bool {
     false
 }
 
-/// Noun names that look like plurals of `<base>y` (via the `ies → y`
-/// round-trip) — ORM 2 convention is singular entity names.
-fn check_singular_naming(state: &Object) -> Vec<ReadingDiagnostic> {
-    fetch_or_phi("Noun", state).as_seq()
-        .map(|ns| ns.iter().filter_map(|n| {
-            let name = binding(n, "name")?;
-            let base = name.strip_suffix("ies").filter(|b| !b.is_empty())?;
-            let singular = format!("{}y", base);
-            (crate::naming::pluralize(&singular) == name).then(|| ReadingDiagnostic {
-                line: 0,
-                reading: name.to_string(),
-                level: Level::Warning,
-                source: Source::Deontic,
-                message: format!(
-                    "noun `{}` looks like a plural of `{}` — ORM 2 convention is singular entity names",
-                    name, singular,
-                ),
-                suggestion: Some(format!("rename to `{}` and declare `Noun '{}' has Plural '{}'.`",
-                    singular, singular, name)),
-            })
-        }).collect())
-        .unwrap_or_default()
-}
+/// MC4b (#751): the singular-naming heuristic ("noun looks like a
+/// plural of `<base>y`") moved out of check.rs. It is now expressed
+/// as `It is forbidden that each Noun has a name that ends with
+/// 'ies'.` in `readings/core/core.md`, compiled by the deontic
+/// translator with a per-fact text predicate, and surfaced as a
+/// `Violation` through the validate dispatch. The Rust check
+/// disappeared with that move.
 
 /// Atom IDs on instance facts that aren't printable ASCII — Func::Lower
 /// and fixed-width name wires (FPGA ingress) misbehave on those.
@@ -967,16 +955,19 @@ Customer wrote Review.
     #[test]
     fn check_readings_func_top_level_is_concat_of_construction() {
         // Structural assertion — the top-level Func must remain
-        // Concat ∘ Construction([…]) with exactly 5 layers. This is
+        // Concat ∘ Construction([…]) with exactly 4 layers. This is
         // the paper-aligned shape (Backus Concat + Construction).
+        // MC4b (#751) dropped the singular-naming layer; the
+        // equivalent diagnostic now flows from the deontic constraint
+        // path into the violations stream.
         let func = check_readings_func();
         match &func {
             Func::Compose(outer, inner) => {
                 assert!(matches!(**outer, Func::Concat),
                     "top-level must compose Concat onto the construction");
                 match &**inner {
-                    Func::Construction(layers) => assert_eq!(layers.len(), 5,
-                        "check_readings_func must expose exactly 5 layer Funcs"),
+                    Func::Construction(layers) => assert_eq!(layers.len(), 4,
+                        "check_readings_func must expose exactly 4 layer Funcs"),
                     other => panic!("inner must be Construction, got {:?}", other),
                 }
             }

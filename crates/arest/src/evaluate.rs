@@ -1,4 +1,4 @@
-﻿// crates/arest/src/evaluate.rs
+// crates/arest/src/evaluate.rs
 //
 // Evaluation is beta reduction. That's it.
 //
@@ -1461,6 +1461,7 @@ mod tests {
             min_occurrence: None,
             max_occurrence: None,
             deontic_operator: None,
+            predicate: None,
         });
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
@@ -1522,6 +1523,7 @@ mod tests {
             entity: None,
             min_occurrence: None,
             max_occurrence: None,
+            predicate: None,
         });
 
         let state = state_with_facts("ft1", &[&[("Customer", "c1"), ("Name", "Alice")], &[("Customer", "c1"), ("Name", "Bob")]]);
@@ -1556,6 +1558,7 @@ mod tests {
             entity: None,
             min_occurrence: None,
             max_occurrence: None,
+            predicate: None,
         });
 
         let mut pop_state = ast::Object::phi();
@@ -1598,6 +1601,7 @@ mod tests {
             entity: Some("Order".to_string()),
             min_occurrence: None,
             max_occurrence: None,
+            predicate: None,
         });
 
         let mut pop_state = ast::Object::phi();
@@ -1641,6 +1645,7 @@ mod tests {
             entity: None,
             min_occurrence: None,
             max_occurrence: None,
+            predicate: None,
         });
 
         let mut pop_state = ast::Object::phi();
@@ -1668,6 +1673,7 @@ mod tests {
             entity: None,
             min_occurrence: None,
             max_occurrence: None,
+            predicate: None,
         });
 
         let (_meta_state, defs, def_map) = compile_cells(cells);
@@ -1705,6 +1711,7 @@ mod tests {
             entity: Some("Order".to_string()),
             min_occurrence: None,
             max_occurrence: None,
+            predicate: None,
         });
 
         let mut pop_state = ast::Object::phi();
@@ -1752,6 +1759,7 @@ mod tests {
             entity: None,
             min_occurrence: None,
             max_occurrence: None,
+            predicate: None,
         });
 
         let mut pop_state = ast::Object::phi();
@@ -1795,6 +1803,7 @@ mod tests {
             entity: Some("Customer".to_string()),
             min_occurrence: None,
             max_occurrence: None,
+            predicate: None,
         });
 
         cells = with_ft(cells, "ft3", &FactTypeDef {
@@ -1841,6 +1850,7 @@ mod tests {
             entity: None,
             min_occurrence: None,
             max_occurrence: None,
+            predicate: None,
         });
 
         let (_meta_state, defs, def_map) = compile_cells(cells);
@@ -1865,6 +1875,7 @@ mod tests {
             entity: None,
             min_occurrence: None,
             max_occurrence: None,
+            predicate: None,
         });
 
         let (_meta_state, defs, def_map) = compile_cells(cells);
@@ -1911,6 +1922,7 @@ mod tests {
             entity: None,
             min_occurrence: None,
             max_occurrence: None,
+            predicate: None,
         });
 
         let (_meta_state, defs, def_map) = compile_cells(cells);
@@ -1955,6 +1967,7 @@ mod tests {
             entity: None,
             min_occurrence: None,
             max_occurrence: None,
+            predicate: None,
         });
 
         let mut pop_state = ast::Object::phi();
@@ -2051,6 +2064,7 @@ mod tests {
             entity: None,
             min_occurrence: None,
             max_occurrence: None,
+            predicate: None,
         });
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
@@ -2257,6 +2271,7 @@ mod tests {
             entity: None,
             min_occurrence: None,
             max_occurrence: None,
+            predicate: None,
         });
 
         let (meta_pop, _defs, _def_map) = compile_cells(cells);
@@ -3226,6 +3241,7 @@ mod tests {
             entity: None,
             min_occurrence: None,
             max_occurrence: None,
+            predicate: None,
         });
         cells
     }

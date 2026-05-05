@@ -1471,6 +1471,7 @@ pub(crate) fn constraint_to_fact_test(c: &ConstraintDef) -> crate::ast::Object {
     ];
     c.deontic_operator.as_ref().map(|op| pairs.push(("deonticOperator".into(), op.clone())));
     c.entity.as_ref().map(|e| pairs.push(("entity".into(), e.clone())));
+    c.predicate.as_ref().map(|p| pairs.push(("predicate".into(), p.encode())));
     pairs.extend(c.spans.iter().enumerate().flat_map(|(i, span)| [
         (alloc::format!("span{}_factTypeId", i), span.fact_type_id.clone()),
         (alloc::format!("span{}_roleIndex", i), span.role_index.to_string()),

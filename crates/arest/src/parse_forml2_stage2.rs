@@ -1999,16 +1999,102 @@ pub fn translate_deontic_constraints_with_table(
             .or_else(|| deontic_shapes.rows.first()
                 .map(|(_, k, m)| (k.as_str(), m.as_str())))
             .unwrap_or(("UC", "deontic"));
-        out.push(fact_from_pairs(&[
+        // MC4b (#751): recognise per-fact text predicates of shape
+        // `<role> [does not] (ends|starts) with '<lit>'`. Only the
+        // `ends with` family motivates this task (singular naming);
+        // `starts with` is a near-zero-cost peer. Empty `predicate`
+        // cell field means no per-fact filter — the population path
+        // emits one violation per fact unconditionally as before.
+        let predicate = parse_deontic_text_predicate(&text);
+        let mut pairs: alloc::vec::Vec<(&str, &str)> = alloc::vec![
             ("id",               text.as_str()),
             ("kind",             kind),
             ("modality",         modality),
             ("deonticOperator",  op_str.as_str()),
             ("text",             text.as_str()),
             ("entity",           entity.as_str()),
-        ]));
+        ];
+        let predicate_encoded;
+        if let Some(p) = &predicate {
+            predicate_encoded = p.encode();
+            pairs.push(("predicate", predicate_encoded.as_str()));
+        }
+        out.push(fact_from_pairs(&pairs));
     }
     out
+}
+
+/// MC4b (#751): tight-grammar parser for per-fact text predicates
+/// inside a deontic constraint body. Matches three lowercase shapes
+/// only — `<role> ends with '<lit>'`, `<role> does not end with '<lit>'`,
+/// `<role> starts with '<lit>'`, `<role> does not start with '<lit>'`.
+/// `<role>` is whatever lowercase identifier (no spaces) follows the
+/// last `has a` / `has` segment in the body, e.g.
+/// `It is forbidden that each Noun has a name that ends with 'ies'`
+/// extracts role=`name`, literal=`ies`, negated=`false`. Anything
+/// else returns `None` and falls through to the existing population
+/// path unchanged.
+fn parse_deontic_text_predicate(text: &str) -> Option<crate::types::DeonticPredicate> {
+    use crate::types::DeonticPredicate;
+    // Strip the `It is X that ` deontic prefix.
+    let body = text
+        .strip_prefix("It is forbidden that ")
+        .or_else(|| text.strip_prefix("It is obligatory that "))
+        .or_else(|| text.strip_prefix("It is permitted that "))
+        .unwrap_or(text);
+
+    // The shape we accept anchors on `that <ends|starts> with '...'` or
+    // `that does not <ends|starts> with '...'`. Walking right-to-left
+    // off the closing apostrophe is robust to the prose preceding it
+    // (`each Noun has a name that …`, `each Activity has a code that
+    // …`, etc.) without committing to a full English grammar.
+    let trimmed = body.trim_end_matches('.').trim();
+    let bytes = trimmed.as_bytes();
+    let last_quote = bytes.iter().rposition(|&b| b == b'\'')?;
+    if last_quote == 0 { return None; }
+    let prev_quote = bytes[..last_quote].iter().rposition(|&b| b == b'\'')?;
+    let literal = &trimmed[prev_quote + 1..last_quote];
+    if literal.is_empty() { return None; }
+
+    let prefix = trimmed[..prev_quote].trim_end();
+    // Match one of the four shapes by suffix on the prefix.
+    let (op_kind, negated, head_end) = if let Some(h) = prefix.strip_suffix(" ends with") {
+        ("ends_with", false, h.trim_end())
+    } else if let Some(h) = prefix.strip_suffix(" does not end with") {
+        ("ends_with", true, h.trim_end())
+    } else if let Some(h) = prefix.strip_suffix(" starts with") {
+        ("starts_with", false, h.trim_end())
+    } else if let Some(h) = prefix.strip_suffix(" does not start with") {
+        ("starts_with", true, h.trim_end())
+    } else {
+        return None;
+    };
+
+    // Role = the lowercase token sitting in `has a <role> that` /
+    // `has <role> that` immediately before the predicate. The shapes
+    // we accept always read `… has [a] <role> that <pred> '<lit>'`,
+    // so peel `that` first, then peel `has [a]`. Anything that
+    // doesn't match returns None.
+    let head_end = head_end.strip_suffix(" that").unwrap_or(head_end).trim_end();
+    // Pop the role token off the right.
+    let role_owned: String = match head_end.rfind(' ') {
+        Some(i) => head_end[i + 1..].to_string(),
+        None    => return None,
+    };
+    let pre_role = head_end[..head_end.len() - role_owned.len()].trim_end();
+    let _has_match = pre_role.ends_with(" has a") || pre_role.ends_with(" has");
+    if !_has_match { return None; }
+    // Single-token, lowercase identifier only.
+    if role_owned.is_empty()
+        || role_owned.contains(' ')
+        || role_owned.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+    { return None; }
+    let literal_owned = literal.to_string();
+    Some(match op_kind {
+        "ends_with"   => DeonticPredicate::EndsWith   { role: role_owned, literal: literal_owned, negated },
+        "starts_with" => DeonticPredicate::StartsWith { role: role_owned, literal: literal_owned, negated },
+        _ => return None,
+    })
 }
 
 fn deontic_operator_for(state: &Object, stmt_id: &str) -> Option<String> {
@@ -4067,6 +4153,35 @@ mod tests {
         assert_eq!(binding(&constraints[0], "modality"), Some("deontic"));
         assert_eq!(binding(&constraints[0], "deonticOperator"), Some("forbidden"));
         assert_eq!(binding(&constraints[0], "entity"), Some("Support Response"));
+    }
+
+    /// MC4b (#751): the deontic translator recognises the tight
+    /// `<role> ends with '<lit>'` clause-shape inside a forbidden
+    /// constraint body and emits an encoded `predicate` field on the
+    /// Constraint cell. The compiler reads it back via
+    /// `DeonticPredicate::decode` and uses `Func::filter` to gate
+    /// per-fact violations on the population path.
+    #[test]
+    fn translate_deontic_constraints_captures_ends_with_predicate() {
+        let stmt = stage1_state(
+            "s1",
+            "It is forbidden that each Noun has a name that ends with 'ies'.",
+            &["Noun"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let constraints = super::translate_deontic_constraints(&classified, &idx(&classified));
+        assert_eq!(constraints.len(), 1, "one deontic constraint");
+        let predicate = binding(&constraints[0], "predicate")
+            .expect("predicate field must be present on the Constraint cell");
+        let decoded = crate::types::DeonticPredicate::decode(predicate)
+            .expect("predicate field must round-trip through DeonticPredicate::decode");
+        match decoded {
+            crate::types::DeonticPredicate::EndsWith { role, literal, negated } => {
+                assert_eq!(role, "name");
+                assert_eq!(literal, "ies");
+                assert!(!negated);
+            }
+            other => panic!("expected EndsWith, got {:?}", other),
+        }
     }
 
     #[test]

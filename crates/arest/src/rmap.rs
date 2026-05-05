@@ -368,6 +368,7 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
                 text: get("text").unwrap_or_default(), spans,
                 set_comparison_argument_length: None, clauses: None, entity: get("entity"),
                 min_occurrence: None, max_occurrence: None,
+                predicate: None,
             }
         }).collect())
         .unwrap_or_default();
@@ -833,6 +834,7 @@ pub fn rmap_cell_map(state: &crate::ast::Object) -> HashMap<String, String> {
                 text: get("text").unwrap_or_default(), spans,
                 set_comparison_argument_length: None, clauses: None, entity: get("entity"),
                 min_occurrence: None, max_occurrence: None,
+                predicate: None,
             }
         }).collect())
         .unwrap_or_default();

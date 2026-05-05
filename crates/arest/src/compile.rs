@@ -290,6 +290,28 @@ fn make_violation_func(id: &str, text: &str, detail: Func) -> Func {
     ])
 }
 
+/// MC4b (#751): build a Func that takes a fact (a `<<key, val>, ...>`
+/// binding seq) and returns T iff the fact's `role` value matches the
+/// predicate. Used by `Func::filter` in the deontic-population path to
+/// gate per-fact violations on a text predicate (e.g. only flag Noun
+/// facts whose `name` binding ends with 'ies').
+fn deontic_predicate_func(p: &DeonticPredicate) -> Func {
+    let (op, role, literal, negated) = match p {
+        DeonticPredicate::EndsWith   { role, literal, negated } =>
+            (Func::EndsWith,   role.as_str(), literal.as_str(), *negated),
+        DeonticPredicate::StartsWith { role, literal, negated } =>
+            (Func::StartsWith, role.as_str(), literal.as_str(), *negated),
+    };
+    // role_value_by_name resolves the binding by key (handles both
+    // space- and underscore-normalised forms). Pair it with the
+    // literal as the right operand of the text-pattern op.
+    let pred = Func::compose(op, Func::construction(vec![
+        role_value_by_name(role),
+        Func::constant(Object::atom(literal)),
+    ]));
+    if negated { Func::compose(Func::Not, pred) } else { pred }
+}
+
 /// Extract the value of a role from an encoded fact by position.
 /// Fact encoding: <<noun1, val1>, <noun2, val2>, ...>
 /// Role value at index i: sel(2)  .  sel(i+1)
@@ -1086,6 +1108,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                 text: get("text").unwrap_or_default(), spans,
                 set_comparison_argument_length: None, clauses: None, entity: get("entity"),
                 min_occurrence: None, max_occurrence: None,
+                predicate: get("predicate").as_deref().and_then(DeonticPredicate::decode),
             }
         }).collect())
         .unwrap_or_default();
@@ -2196,6 +2219,7 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
                 text: get("text").unwrap_or_default(), spans,
                 set_comparison_argument_length: None, clauses: None, entity: get("entity"),
                 min_occurrence: None, max_occurrence: None,
+                predicate: get("predicate").as_deref().and_then(DeonticPredicate::decode),
             }
         }).collect()).unwrap_or_default();
     let derivation_rules: Vec<DerivationRuleDef> = fetch_or_phi("DerivationRule", state).as_seq()
@@ -4744,15 +4768,44 @@ fn compile_forbidden_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     // checking (where Selector(1) is a non-empty string). They never
     // fire on population validation because the eval context's text is
     // empty, which is exactly the bug the population path closes.
-    if forbidden_values.is_empty() && !is_response_constraint && !def.spans.is_empty() {
-        let ft_ids: Vec<String> = def.spans.iter()
-            .map(|s| s.fact_type_id.clone())
-            .collect();
-        let facts = extract_facts_multi(&ft_ids);
-        let primary_ft = ft_ids.first().map(String::as_str).unwrap_or("");
+    if forbidden_values.is_empty() && !is_response_constraint
+        && (!def.spans.is_empty() || def.predicate.is_some())
+    {
+        // MC4b (#751): when a per-fact predicate is set, the constraint
+        // wants to read the entity's own cell directly — `It is
+        // forbidden that each Noun has a name that ends with 'ies'`
+        // targets the `Noun` metamodel cell, not whichever
+        // `enrich_constraints_with_spans` happened to bind. Prefer
+        // `def.entity` as the cell-name source whenever a predicate
+        // is present; fall back to spans only when no entity was
+        // recovered. Constraints without a predicate keep the legacy
+        // span-driven path.
+        let entity_cell = def.predicate.as_ref()
+            .and_then(|_| def.entity.as_ref().filter(|s| !s.is_empty()).cloned());
+        let primary_ft = entity_cell.clone()
+            .or_else(|| def.spans.first().map(|s| s.fact_type_id.clone()))
+            .or_else(|| def.entity.clone())
+            .unwrap_or_default();
+        let facts = match (&entity_cell, def.spans.is_empty()) {
+            (Some(cell), _) => extract_facts_func(cell),
+            (None, false)   => {
+                let ft_ids: Vec<String> = def.spans.iter()
+                    .map(|s| s.fact_type_id.clone())
+                    .collect();
+                extract_facts_multi(&ft_ids)
+            }
+            (None, true)    => extract_facts_func(&primary_ft),
+        };
+        // MC4b (#751): per-fact text predicate. Filter the stream so
+        // only facts whose role binding satisfies the predicate
+        // produce a violation.
+        let facts = match &def.predicate {
+            Some(p) => Func::compose(Func::filter(deontic_predicate_func(p)), facts),
+            None    => facts,
+        };
         let detail = Func::construction(vec![
             Func::constant(Object::atom("Forbidden fact present in")),
-            Func::constant(Object::atom(primary_ft)),
+            Func::constant(Object::atom(&primary_ft)),
         ]);
         let viol = make_violation_func(&def.id, &def.text, detail);
         return Func::compose(Func::apply_to_all(viol), facts);
@@ -4857,6 +4910,44 @@ fn compile_obligatory_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     let checks_sender = def.text.to_lowercase().contains("senderidentity");
     let is_response_constraint = def.entity.as_ref()
         .map_or(false, |e| e.to_lowercase().contains("response"));
+
+    // MC4b (#751): obligatory-with-predicate inverse of forbidden.
+    // `It is obligatory that each Noun has a name that starts with
+    // '<X>'` flags every Noun whose `name` does NOT start with `<X>`.
+    // Reuse the population path: filter on the negation of the
+    // predicate, emit one violation per surviving fact. Mirror the
+    // forbidden path's preference for `def.entity` as the cell-name
+    // source whenever a predicate is set.
+    if obligatory_values.is_empty() && !checks_sender && !is_response_constraint
+        && def.predicate.is_some()
+        && (!def.spans.is_empty() || def.entity.is_some())
+    {
+        let entity_cell = def.entity.as_ref().filter(|s| !s.is_empty()).cloned();
+        let primary_ft = entity_cell.clone()
+            .or_else(|| def.spans.first().map(|s| s.fact_type_id.clone()))
+            .unwrap_or_default();
+        let facts = match (&entity_cell, def.spans.is_empty()) {
+            (Some(cell), _) => extract_facts_func(cell),
+            (None, false)   => {
+                let ft_ids: Vec<String> = def.spans.iter()
+                    .map(|s| s.fact_type_id.clone())
+                    .collect();
+                extract_facts_multi(&ft_ids)
+            }
+            (None, true)    => extract_facts_func(&primary_ft),
+        };
+        // Obligation violated = predicate does NOT hold. Wrap the
+        // predicate Func in Not before filtering.
+        let pred = def.predicate.as_ref().map(deontic_predicate_func).unwrap();
+        let neg_pred = Func::compose(Func::Not, pred);
+        let detail = Func::construction(vec![
+            Func::constant(Object::atom("Obligation violated in")),
+            Func::constant(Object::atom(&primary_ft)),
+        ]);
+        let viol = make_violation_func(&def.id, &def.text, detail);
+        return Func::compose(Func::apply_to_all(viol),
+            Func::compose(Func::filter(neg_pred), facts));
+    }
 
     let response = Func::Selector(1);
 
@@ -6419,6 +6510,82 @@ It is forbidden that some Outbound Email is sent and some User approves that Out
     /// validation never sets a response text. The fix is a third
     /// path in compile_forbidden_ast that emits a Func keyed on
     /// "is some fact present in the trigger FT cell?".
+    /// MC4b (#751): the singular-naming deontic constraint flags
+    /// Noun facts whose `name` ends with 'ies'. The compiler routes
+    /// the predicate through `Func::filter` over the Noun cell, so
+    /// `Activities` and `Series` (both end with 'ies') produce
+    /// violations while `Personal Data` does not. `Series` documents
+    /// the behavior the audit explicitly accepted: the new path is
+    /// strictly suffix-based (no plural-round-trip narrowing) and so
+    /// is more aggressive than the legacy `check_singular_naming`
+    /// heuristic.
+    #[test]
+    fn singular_naming_deontic_flags_ies_suffix_nouns() {
+        let readings = "\
+Noun(.name) is an entity type.\n\
+Activities is an entity type.\n\
+Personal Data is an entity type.\n\
+Series is an entity type.\n\
+\n\
+It is forbidden that each Noun has a name that ends with 'ies'.\n";
+        let state = crate::parse_forml2::parse_to_state(readings)
+            .expect("parse should succeed");
+
+        // The Constraint cell must carry the parsed predicate so the
+        // compiler's population path can apply Func::filter on it.
+        let constraints = ast::fetch_or_phi("Constraint", &state);
+        let deontic = constraints.as_seq()
+            .and_then(|s| s.iter().find(|c|
+                ast::binding(c, "modality") == Some("deontic")
+                && ast::binding(c, "deonticOperator") == Some("forbidden")
+            ).cloned())
+            .expect("forbidden deontic constraint must reach the Constraint cell");
+        assert_eq!(
+            ast::binding(&deontic, "predicate").unwrap_or(""),
+            "ends_with:0:name:ies",
+            "predicate field must encode EndsWith(role=name, lit=ies, neg=false); \
+             got {:?}", ast::binding(&deontic, "predicate"));
+
+        // Compile + apply validate. The Noun cell is sourced from
+        // the indexed population at Selector(4); encode_eval_context_state
+        // walks the state's cells and includes Noun.
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+        let ctx = ast::encode_eval_context_state("", None, &state);
+        let violations_obj = ast::apply(
+            &Func::Def("validate".to_string()),
+            &ctx,
+            &d,
+        );
+        let violations = ast::decode_violations(&violations_obj);
+        let texts: Vec<String> = violations.iter()
+            .filter(|v| v.constraint_text.contains("ends with 'ies'"))
+            .map(|v| v.detail.clone())
+            .collect();
+        // Must flag Activities + Series (and any other ies-ending noun
+        // declared by the user/metamodel — Series here covers the
+        // pre-existing-suffix case the audit called out).
+        assert!(!violations.is_empty(),
+            "validate must produce ≥1 violation; got {:?}", violations);
+        let singular_naming_violations = violations.iter()
+            .filter(|v| v.constraint_text.contains("ends with 'ies'"))
+            .count();
+        assert!(singular_naming_violations >= 2,
+            "expected ≥2 singular-naming violations (Activities + Series); \
+             got {} (details: {:?})",
+            singular_naming_violations, texts);
+
+        // Personal Data does NOT end with 'ies' — must not appear in
+        // the violation stream as a singular-naming violation.
+        let personal_data_flagged = violations.iter().any(|v|
+            v.constraint_text.contains("ends with 'ies'")
+            && v.detail.contains("Personal Data"));
+        assert!(!personal_data_flagged,
+            "Personal Data must NOT trigger the singular-naming \
+             deontic constraint (its name does not end with 'ies'); \
+             got violations: {:?}", violations);
+    }
+
     #[test]
     fn forbidden_constraint_violates_when_trigger_fact_present() {
         let state = state_with_forbidden_send();

@@ -466,6 +466,8 @@ Antecedent Clause has Clause Shape.
 
 It is obligatory that each Antecedent Clause has Clause Shape.
 
+It is forbidden that each Noun has a name that ends with 'ies'.
+
 ## Migration (#348)
 
 ### Rationale
