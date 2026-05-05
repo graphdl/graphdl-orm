@@ -93,6 +93,13 @@ fn derive_one_round_with_keys(
     // (raw state or encoded pop) and resolve cells via
     // `fetch_or_phi` on `Object::Map`. Non-Native variants
     // (interpreted FFP) still require the encoded pop shape.
+    //
+    // H4 (#692): production paths no longer emit Native — the last
+    // Native leaf (rmap_func) is now Func::Platform. This gate stays
+    // for historical specialized-classifier deployments and tests
+    // that hand-build Native nodes; the empty-defs branch (all() over
+    // an empty iterator returns true → skip the encode) is the only
+    // common-case hit today.
     let all_native = derivation_defs.iter()
         .all(|(_, f)| matches!(f, ast::Func::Native(_)));
     let t_en = crate::time_shim::Instant::now();

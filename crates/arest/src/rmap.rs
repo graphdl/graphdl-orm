@@ -272,34 +272,39 @@ pub fn primary_key_of_table(cells: &crate::ast::Object, table_name: &str) -> Vec
 
 /// #214: RMAP as a Func tree entry point.
 ///
-/// Returns a `Func::Native` leaf that, when applied via `ast::apply`
-/// against the state Object, produces an `Object::atom` containing
-/// the JSON-serialized `Vec<TableDef>`. This is the ρ-dispatchable
-/// form of RMAP — any caller that operates on Func trees (including
-/// future lowered compile pipelines or the MCP dispatch layer) can
-/// treat RMAP as a first-class ρ-application instead of reaching in
-/// to the Rust procedure directly.
+/// Returns a `Func::Platform("rmap")` leaf that, when applied via
+/// `ast::apply` against the state Object, produces an `Object::atom`
+/// containing the JSON-serialized `Vec<TableDef>`. This is the
+/// ρ-dispatchable form of RMAP — any caller that operates on Func
+/// trees (including future lowered compile pipelines or the MCP
+/// dispatch layer) can treat RMAP as a first-class ρ-application
+/// instead of reaching in to the Rust procedure directly.
 ///
-/// The leaf still wraps Halpin's procedural Ch. 10 algorithm as its
-/// body. A deeper FFP rewrite would decompose the six RMAP passes
-/// (binarize → absorb → classify-UC → one-to-one-absorb → compound-
-/// ref-scheme → constraint-map) into a `FoldL` over per-pass Funcs,
-/// each reading / augmenting an intermediate state Object. That
-/// decomposition is tracked as a follow-up; keeping the body intact
-/// here preserves every current behaviour.
+/// The platform body still wraps Halpin's procedural Ch. 10
+/// algorithm. A deeper FFP rewrite would decompose the six RMAP
+/// passes (binarize → absorb → classify-UC → one-to-one-absorb →
+/// compound-ref-scheme → constraint-map) into a `FoldL` over per-pass
+/// Funcs, each reading / augmenting an intermediate state Object.
+/// That decomposition is tracked as a follow-up; routing through
+/// Platform preserves every current behaviour while making the leaf
+/// introspectable and per-runtime-routable.
 ///
 /// std-deps gate: serializes through `serde_json`. Under no_std the
 /// rmap procedure itself is reachable directly via `rmap(state)`; this
 /// Func-tree entry exists for std-host MCP dispatch / lowered compile
 /// pipelines where serde_json is already linked.
+///
+/// H4 (#692): this used to wrap an `Arc<dyn Fn>` in `Func::Native` —
+/// the largest typed-IR-residue hazard remaining after H1-H3. RMAP
+/// is now a named `Func::Platform("rmap")` op dispatched through
+/// `apply_platform`; the closure body lives in `ast::platform_rmap`.
+/// The leaf is now introspectable (kind = Platform, name = "rmap"),
+/// freezable / replayable, and routable per runtime: each target
+/// (server / FPGA / Solidity) can install its own table-mapping
+/// strategy under the same name.
 #[cfg(feature = "std-deps")]
 pub fn rmap_func() -> crate::ast::Func {
-    use alloc::sync::Arc;
-    crate::ast::Func::Native(Arc::new(|state: &crate::ast::Object| {
-        let tables = rmap(state);
-        let json = serde_json::to_string(&tables).unwrap_or_else(|_| "[]".to_string());
-        crate::ast::Object::atom(&json)
-    }))
+    crate::ast::Func::Platform("rmap".to_string())
 }
 
 /// Decode the output of `apply(rmap_func(), state, state)` back into
@@ -1520,5 +1525,31 @@ mod tests {
                 a.columns.iter().map(|c| &c.name).collect::<Vec<_>>(),
                 b.columns.iter().map(|c| &c.name).collect::<Vec<_>>());
         }
+    }
+
+    /// H4 (#692): rmap_func MUST return a Platform variant — not a
+    /// Native closure. Migrating the escape hatch into Platform makes
+    /// the leaf introspectable (the audit / freeze / replay surfaces
+    /// can see "this is rmap" instead of "<native>") and routable per
+    /// runtime (server / FPGA / Solidity each pick their own body for
+    /// the same name).
+    #[test]
+    fn rmap_func_is_platform_not_native() {
+        match rmap_func() {
+            crate::ast::Func::Platform(name) => assert_eq!(name, "rmap",
+                "rmap_func must dispatch via the named platform op `rmap`"),
+            other => panic!(
+                "rmap_func must be Func::Platform(\"rmap\"), got {:?}", other),
+        }
+    }
+
+    /// H4 (#692): the Func tree returned by rmap_func() must be
+    /// fully introspectable — no Native escape hatches anywhere
+    /// in the tree. has_native is the canonical purity probe.
+    #[test]
+    fn rmap_func_has_no_native_leaves() {
+        assert!(!rmap_func().has_native(),
+            "rmap_func must be free of Native leaves; the migration to \
+             Platform is the whole point of H4");
     }
 }

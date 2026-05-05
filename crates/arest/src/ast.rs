@@ -2263,6 +2263,13 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
         "compose_rel" => platform_compose_rel(x),
         "tc" => platform_tc(x),
         "tc_cycles" => platform_tc_cycles(x),
+        // H4 (#692): RMAP (Halpin Ch. 10 relational mapping) was the
+        // last production Func::Native leaf. Routing through Platform
+        // makes it introspectable and lets each runtime (server, FPGA,
+        // Solidity) supply its own table-mapping strategy. The body
+        // (and its serde_json encode) live in `platform_rmap` below.
+        #[cfg(feature = "std-deps")]
+        "rmap" => platform_rmap(x, d),
         s if s.starts_with("create:") => platform_create(&s[7..], x, d),
         s if s.starts_with("update:") => platform_update(&s[7..], x, d),
         s if s.starts_with("transition:") => platform_transition(&s[11..], x, d),
@@ -2496,6 +2503,23 @@ fn platform_tc(x: &Object) -> Object {
         closure.extend(new_edges);
     }
     Object::Seq(closure.into())
+}
+
+/// H4 (#692): RMAP platform body. Calls Halpin's relational-mapping
+/// procedure on the live state and serialises the resulting
+/// `Vec<TableDef>` to a JSON atom — the inverse of
+/// `crate::rmap::decode_rmap_result`. The serde_json hop is what
+/// keeps this op host-only (`std-deps`); embedded / FPGA targets
+/// supply their own `"rmap"` body via `install_platform_fn`.
+///
+/// Input: ignored (RMAP reads schema from cells in `d`).
+/// Returns Object::Bottom only on a serialisation failure that the
+/// host should never reach — the procedure itself is total.
+#[cfg(all(not(feature = "no_std"), feature = "std-deps"))]
+fn platform_rmap(_x: &Object, d: &Object) -> Object {
+    let tables = crate::rmap::rmap(d);
+    let json = serde_json::to_string(&tables).unwrap_or_else(|_| "[]".to_string());
+    Object::atom(&json)
 }
 
 /// Platform primitive: signature verification (AREST §5.5).
@@ -3852,145 +3876,17 @@ fn register_theta1_into(defs: &mut Vec<(String, Func)>) {
     defs.push(("compose_rel".to_string(), Func::Platform("compose_rel".to_string())));
 }
 
-#[allow(dead_code)] // reference implementations kept for docs; dispatch goes via Platform
-fn _register_theta1_native_legacy(defs: &mut Vec<(String, Func)>) {
-    // project: pi_L(R) = alpha([s_i1,...,s_ik]) : R
-    // Takes <indices, R> and projects R onto those columns.
-    // NATIVE because: indices are data that determine which Selectors to build.
-    // A pure Func would require alpha(Construction(selectors)) but Construction
-    // is a compile-time combinator -- the selector list is determined by the
-    // index sequence at runtime.
-    defs.push(("project".to_string(), Func::Native(Arc::new(|x: &Object| {
-        // Monadic bind via ? on Option — Backus cond lifted into Option.
-        // Any shape mismatch folds to None, then unwraps to Object::Bottom.
-        x.as_seq()
-            .filter(|items| items.len() == 2)
-            .and_then(|items| {
-                let indices = items[0].as_seq()?;
-                let relation = items[1].as_seq()?;
-                let selectors: Vec<usize> = indices.iter()
-                    .filter_map(|i| i.as_atom().and_then(|s| s.parse().ok()))
-                    .collect();
-                (!selectors.is_empty()).then_some(())?;
-                let rows: Vec<Object> = relation.iter()
-                    .filter_map(|tuple| {
-                        let cols = tuple.as_seq()?;
-                        let projected: Vec<Object> = selectors.iter()
-                            .filter_map(|&s| (s >= 1 && s <= cols.len()).then(|| cols[s-1].clone()))
-                            .collect();
-                        Some(Object::Seq(projected.into()))
-                    })
-                    .fold(Vec::new(), |mut acc, row| {
-                        (!acc.contains(&row)).then(|| acc.push(row));
-                        acc
-                    });
-                Some(Object::Seq(rows.into()))
-            })
-            .unwrap_or(Object::Bottom)
-    }))));
-
-    // join: join:<shared_col, R, S> = natural join on shared column index.
-    // NATIVE because: shared_col is a runtime value that determines which
-    // Selector to use for comparison and which columns to include in the
-    // merged tuple. Pure Func cannot parameterize Selector indices from data.
-    defs.push(("join".to_string(), Func::Native(Arc::new(|x: &Object| {
-        x.as_seq()
-            .filter(|items| items.len() == 3)
-            .and_then(|items| {
-                let shared_col: usize = items[0].as_atom().and_then(|s| s.parse().ok())?;
-                let r = items[1].as_seq()?;
-                let s = items[2].as_seq()?;
-
-                let result: Vec<Object> = r.iter()
-                    .filter_map(|r_tuple| {
-                        r_tuple.as_seq()
-                            .filter(|cols| shared_col >= 1 && shared_col <= cols.len())
-                    })
-                    .flat_map(|r_cols| {
-                        let r_val = r_cols[shared_col - 1].clone();
-                        s.iter().filter_map(move |s_tuple| {
-                            let s_cols = s_tuple.as_seq()
-                                .filter(|cols| shared_col >= 1 && shared_col <= cols.len())?;
-                            (r_val == s_cols[shared_col - 1]).then(|| {
-                                let mut merged: Vec<Object> = r_cols.to_vec();
-                                merged.extend(s_cols.iter().enumerate()
-                                    .filter(|(i, _)| i + 1 != shared_col)
-                                    .map(|(_, col)| col.clone()));
-                                Object::Seq(merged.into())
-                            })
-                        })
-                    })
-                    .collect();
-                Some(Object::Seq(result.into()))
-            })
-            .unwrap_or(Object::Bottom)
-    }))));
-
-    // tie: gamma(R) = Filter(eq . [sel(1), sel(n)]) : R
-    // Selects tuples where first column = last column, then removes the last column.
-    // NATIVE because: "last column" requires knowing the tuple arity n at runtime.
-    // Backus's Selector(n) requires a fixed n at compile time. There is no
-    // "select last element" primitive in FP. The Reverse+Selector(1) trick
-    // works for comparison but the "remove last column" step still needs
-    // dynamic-arity Construction to rebuild the tuple without its last element.
-    defs.push(("tie".to_string(), Func::Native(Arc::new(|x: &Object| {
-        x.as_seq()
-            .map(|relation| {
-                Object::Seq(relation.iter()
-                    .filter_map(|tuple| {
-                        let cols = tuple.as_seq()?;
-                        (cols.len() >= 2 && cols[0] == cols[cols.len() - 1])
-                            .then(|| Object::Seq(cols[..cols.len()-1].into()))
-                    })
-                    .collect())
-            })
-            .unwrap_or(Object::Bottom)
-    }))));
-
-    // compose_rel: R . S = pi_1s(R*S) -- relational composition.
-    // Join R and S on shared column, then project out the shared column.
-    // NATIVE because: inherits both join's dynamic column selection and
-    // project's dynamic Construction building. The shared_col parameter
-    // determines runtime behavior that cannot be fixed at compile time.
-    defs.push(("compose_rel".to_string(), Func::Native(Arc::new(|x: &Object| {
-        x.as_seq()
-            .filter(|items| items.len() == 3)
-            .and_then(|items| {
-                let shared_col: usize = items[0].as_atom().and_then(|s| s.parse().ok())?;
-                let r = items[1].as_seq()?;
-                let s = items[2].as_seq()?;
-
-                let result: Vec<Object> = r.iter()
-                    .filter_map(|r_tuple| {
-                        r_tuple.as_seq()
-                            .filter(|cols| shared_col >= 1 && shared_col <= cols.len())
-                    })
-                    .flat_map(|r_cols| {
-                        let r_val = r_cols[shared_col - 1].clone();
-                        s.iter().filter_map(move |s_tuple| {
-                            let s_cols = s_tuple.as_seq()
-                                .filter(|cols| shared_col >= 1 && shared_col <= cols.len())?;
-                            (r_val == s_cols[shared_col - 1]).then(|| {
-                                let projected: Vec<Object> = r_cols.iter().enumerate()
-                                    .filter(|(i, _)| i + 1 != shared_col)
-                                    .map(|(_, col)| col.clone())
-                                    .chain(s_cols.iter().enumerate()
-                                        .filter(|(i, _)| i + 1 != shared_col)
-                                        .map(|(_, col)| col.clone()))
-                                    .collect();
-                                Object::Seq(projected.into())
-                            })
-                        })
-                    })
-                    .fold(Vec::new(), |mut acc, row| {
-                        (!acc.contains(&row)).then(|| acc.push(row));
-                        acc
-                    });
-                Some(Object::Seq(result.into()))
-            })
-            .unwrap_or(Object::Bottom)
-    }))));
-}
+// H4 (#692): the `_register_theta1_native_legacy` reference body —
+// 130 lines of Func::Native(Arc::new(closure)) reproductions of the
+// Codd θ₁ ops that previously documented the pre-Platform escape
+// hatch — was removed when the last production Native leaf (rmap_func)
+// migrated to Platform. Each op's live implementation lives in
+// `apply_platform` (`platform_project` / `platform_join` /
+// `platform_tie` / `platform_compose_rel`); the `register_theta1_into`
+// registry above wires each name as a `Func::Platform`. See git
+// history (`git log -- crates/arest/src/ast.rs | grep H4`) for the
+// removed body if the closure form is needed for FPGA / Solidity
+// dispatch reference.
 
 // ── Convenience constructors ─────────────────────────────────────────
 
