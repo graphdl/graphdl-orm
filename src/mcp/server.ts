@@ -64,6 +64,7 @@ import {
   type MutationContextDetail,
   type MutationContextTool,
 } from './mutation-context.js'
+import { tutorSystemCall, resetSandbox } from './tutor-sandbox.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(__dirname, '..', '..')
@@ -468,6 +469,16 @@ const server = new McpServer({
   name: 'arest',
   version: '0.2.0',
 })
+
+const _registeredTools = new Set<string>()
+const _registerTool = server.registerTool.bind(server)
+server.registerTool = ((name: string, ...rest: any[]) => {
+  _registeredTools.add(name)
+  return _registerTool(name, ...rest)
+}) as typeof server.registerTool
+export function listRegisteredTools(): string[] {
+  return [..._registeredTools].sort()
+}
 
 function loadPrompt(name: string): string {
   try {
@@ -1516,7 +1527,10 @@ function cmpNum(actual: number, op: string, expected: number): boolean {
   }
 }
 
-async function evalExpectPredicate(predicate: string): Promise<{ ok: boolean; detail: string }> {
+export async function evalExpectPredicate(
+  predicate: string,
+  call: (key: string, input: string) => Promise<string> = systemCall,
+): Promise<{ ok: boolean; detail: string }> {
   const p = predicate.replace(/\\\s/g, ' ').trim()
   if (!p) return { ok: false, detail: 'empty predicate' }
   const parseJson = (s: string): any => JSON.parse(s.trim())
@@ -1528,7 +1542,7 @@ async function evalExpectPredicate(predicate: string): Promise<{ ok: boolean; de
   let m = p.match(/^list\s+([^\s{][^{]*?)\s+contains\s+(\{[\s\S]*\})$/)
   if (m) {
     const [, noun, jsonStr] = m
-    const raw = await systemCall(`list:${noun.trim()}`, '')
+    const raw = await call(`list:${noun.trim()}`, '')
     const list = safeJson(raw, [])
     if (!Array.isArray(list)) return { ok: false, detail: `list:${noun.trim()} -> not an array` }
     const expected = parseJson(jsonStr)
@@ -1540,7 +1554,7 @@ async function evalExpectPredicate(predicate: string): Promise<{ ok: boolean; de
   m = p.match(/^list\s+(\S+(?:\s\S+)*?)\s+count\s+(==|>=|<=|>|<)\s+(\d+)$/)
   if (m) {
     const [, noun, op, nStr] = m
-    const raw = await systemCall(`list:${noun.trim()}`, '')
+    const raw = await call(`list:${noun.trim()}`, '')
     const list = safeJson(raw, [])
     const len = Array.isArray(list) ? list.length : 0
     const ok = cmpNum(len, op, parseInt(nStr, 10))
@@ -1551,7 +1565,7 @@ async function evalExpectPredicate(predicate: string): Promise<{ ok: boolean; de
   m = p.match(/^query\s+(\S+)\s+contains\s+(\{[\s\S]*\})$/)
   if (m) {
     const [, ft, jsonStr] = m
-    const raw = await systemCall(`query:${ft}`, '')
+    const raw = await call(`query:${ft}`, '')
     const rows = safeJson(raw, [])
     const expected = parseJson(jsonStr)
     const ok = Array.isArray(rows) && rows.some((r: any) => matchesSubset(r, expected))
@@ -1562,7 +1576,7 @@ async function evalExpectPredicate(predicate: string): Promise<{ ok: boolean; de
   m = p.match(/^query\s+(\S+)\s+count\s+(==|>=|<=|>|<)\s+(\d+)$/)
   if (m) {
     const [, ft, op, nStr] = m
-    const raw = await systemCall(`query:${ft}`, '')
+    const raw = await call(`query:${ft}`, '')
     const rows = safeJson(raw, [])
     const len = Array.isArray(rows) ? rows.length : 0
     const ok = cmpNum(len, op, parseInt(nStr, 10))
@@ -1573,7 +1587,7 @@ async function evalExpectPredicate(predicate: string): Promise<{ ok: boolean; de
   m = p.match(/^get\s+(\S+(?:\s\S+)*?)\s+(\S+)\s+equals\s+(\{[\s\S]*\})$/)
   if (m) {
     const [, noun, id, jsonStr] = m
-    const raw = await systemCall(`get:${noun.trim()}`, id)
+    const raw = await call(`get:${noun.trim()}`, id)
     const entity = safeJson(raw, null)
     const expected = parseJson(jsonStr)
     const ok = entity !== null && matchesSubset(entity, expected)
@@ -1584,7 +1598,7 @@ async function evalExpectPredicate(predicate: string): Promise<{ ok: boolean; de
   m = p.match(/^status\s+(\S+(?:\s\S+)*?)\s+(\S+)\s+is\s+(\S+)$/)
   if (m) {
     const [, , id, expectedStatus] = m
-    const raw = await systemCall(`get:State Machine`, id)
+    const raw = await call(`get:State Machine`, id)
     const sm: any = safeJson(raw, null)
     const actual = sm?.currentlyInStatus ?? null
     const ok = actual === expectedStatus
@@ -1625,7 +1639,7 @@ server.registerTool(
     const content = readFileSync(lesson.path, 'utf-8')
     const parsed = parseTutorLesson(content)
     const check = parsed.expect
-      ? await evalExpectPredicate(parsed.expect)
+      ? await evalExpectPredicate(parsed.expect, tutorSystemCall)
       : { ok: null as any, detail: 'no expect predicate in this lesson' }
     const nextNum = lessons.find(l => l.num > n)?.num
     const nextInTrack = nextNum ? { track: t, num: nextNum } : null
@@ -1647,6 +1661,128 @@ server.registerTool(
       check,
       next,
     })
+  },
+)
+
+server.registerTool(
+  'tutor.reset',
+  {
+    description: 'Wipe the tutor sandbox engine and SQLite file. The next tutor.* call rebootstraps it from tutor/domains/. Use when you want to redo a track from a clean slate or when you have edited tutor/domains/ readings.',
+    inputSchema: {},
+  },
+  async () => {
+    await resetSandbox()
+    return textResult({ ok: true, message: 'Tutor sandbox reset.' })
+  },
+)
+
+// ── tutor.* mirror tools — sandbox-routed ──────────────────────────
+
+server.registerTool(
+  'tutor.list',
+  {
+    description: 'list:NOUN against the tutor sandbox (tutor/domains/). Use this instead of `list` when working through lessons.',
+    inputSchema: { noun: z.string().describe('Entity noun, e.g. "Order".') },
+  },
+  async ({ noun }) => {
+    const raw = await tutorSystemCall(`list:${noun}`, '')
+    const parsed = JSON.parse(raw) ?? []
+    return textResult(parsed)
+  },
+)
+
+server.registerTool(
+  'tutor.get',
+  {
+    description: 'get:NOUN/ID against the tutor sandbox.',
+    inputSchema: { noun: z.string(), id: z.string() },
+  },
+  async ({ noun, id }) => {
+    const raw = await tutorSystemCall(`get:${noun}`, id)
+    const parsed = JSON.parse(raw) ?? null
+    return textResult(parsed)
+  },
+)
+
+server.registerTool(
+  'tutor.query',
+  {
+    description: 'query:FACT_TYPE against the tutor sandbox. Filters are passed as a JSON object.',
+    inputSchema: {
+      fact_type: z.string(),
+      filter: z.record(z.string(), z.string()).optional(),
+    },
+  },
+  async ({ fact_type, filter }) => {
+    const raw = await tutorSystemCall(`query:${fact_type}`, JSON.stringify(filter ?? {}))
+    const parsed = JSON.parse(raw) ?? []
+    return textResult(parsed)
+  },
+)
+
+server.registerTool(
+  'tutor.actions',
+  {
+    description: 'List the legal SM transitions for a noun in the tutor sandbox.',
+    inputSchema: { noun: z.string(), id: z.string().optional() },
+  },
+  async ({ noun, id }) => {
+    const raw = await tutorSystemCall(`transitions:${noun}`, id ?? '')
+    return textResult({ raw, parsed: parseTransitionTriples(raw, noun, id ?? '') })
+  },
+)
+
+server.registerTool(
+  'tutor.apply',
+  {
+    description: 'Apply create/update/transition against the tutor sandbox. Same shape as `apply`. Mutations are scoped to the sandbox; the active app is untouched.',
+    inputSchema: {
+      operation: z.enum(['create', 'update', 'transition']),
+      noun: z.string(),
+      id: z.string().optional(),
+      event: z.string().optional(),
+      fields: z.record(z.string(), z.string()).optional(),
+    },
+  },
+  async ({ operation, noun, id, event, fields }) => {
+    const pairs = Object.entries(fields ?? {}).map(([k, v]) => `<${k}, ${v}>`).join(', ')
+    if (operation === 'create') {
+      const idPair = id ? `<id, ${id}>${pairs ? ', ' : ''}` : ''
+      const raw = await tutorSystemCall(`create:${noun}`, `<${idPair}${pairs}>`)
+      try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
+    }
+    if (operation === 'update') {
+      const raw = await tutorSystemCall(`update:${noun}`, `<<id, ${id || ''}>${pairs ? `, ${pairs}` : ''}>`)
+      try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
+    }
+    const raw = await tutorSystemCall(`transition:${noun}`, `<${id || ''}, ${event || ''}>`)
+    try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
+  },
+)
+
+server.registerTool(
+  'tutor.compile',
+  {
+    description: 'Compile FORML2 readings into the tutor sandbox (Corollary 5 — self-modification, lesson-scoped).',
+    inputSchema: { readings: z.string().describe('FORML2 readings markdown.') },
+  },
+  async ({ readings }) => textResult({ raw: await tutorSystemCall('compile', readings) }),
+)
+
+server.registerTool(
+  'tutor.propose',
+  {
+    description: 'Stage a Domain Change against the tutor sandbox. Same shape as `propose`.',
+    inputSchema: {
+      rationale: z.string(),
+      target_domain: z.string().optional(),
+      nouns: z.array(z.string()).optional(),
+      readings: z.array(z.string()).optional(),
+    },
+  },
+  async (args) => {
+    const raw = await tutorSystemCall(`create:Domain Change`, JSON.stringify(args))
+    try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
   },
 )
 

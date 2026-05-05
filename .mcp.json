@@ -2,21 +2,12 @@
   "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/sdk/main/schemas/mcp.json",
   "mcpServers": {
     "arest": {
-      "description": "AREST engine — FORML2 readings → REST API. Exposes create/apply/compile/audit tools for domain modeling, constraint validation, and self-modification.",
+      "description": "AREST engine — FORML2 readings → REST API. Tools: apply / compile / propose / query / audit / verify, plus a built-in sandboxed tutor (tutor + tutor.* tools) that runs orthogonal to your active app.",
       "command": "npx",
       "args": ["-y", "tsx", "src/mcp/server.ts"],
       "env": {
         "AREST_MODE": "local",
         "AREST_READINGS_DIR": "./readings"
-      }
-    },
-    "arest-tutor": {
-      "description": "AREST with the full arest-tutor domain bundle loaded (catalog, orders, tasks, content, scheduling, notifications). Use this to exercise every framework feature from Claude.",
-      "command": "npx",
-      "args": ["-y", "tsx", "src/mcp/server.ts"],
-      "env": {
-        "AREST_MODE": "local",
-        "AREST_READINGS_DIR": "./tutor/domains"
       }
     },
     "arest-remote": {
