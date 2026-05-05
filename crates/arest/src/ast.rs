@@ -3555,6 +3555,93 @@ pub fn chain_truncate_at(chain: &Object, cutoff: u64) -> Object {
     Object::seq(kept)
 }
 
+/// S1g (#723): drop chain entries whose version_id is not in
+/// `keep_ids` AND is not the chain's latest entry. Latest is always
+/// kept so the cell's logical view (`fetch` / `cells_iter`) is
+/// unaffected — compaction trims audit history, never the active
+/// value. Non-chain inputs pass through unchanged.
+///
+/// `keep_ids` is the union of:
+/// - snapshot pins (S1d): every `SnapshotEntry::Pinned(id)` recorded
+///   for this cell across the live snapshot map;
+/// - citation pins (S1f): every Cell Version Id named by a
+///   `Citation_pins_Cell_Name` / `Citation_pins_Cell_Version_Id`
+///   pair whose Cell Name is this cell.
+///
+/// Returns the compacted chain. The returned Object is byte-identical
+/// to the input when no entries were eligible for drop, so callers
+/// can compare lengths to know whether anything was actually freed.
+pub fn compact_chain(chain: &Object, keep_ids: &alloc::collections::BTreeSet<u64>) -> Object {
+    if !is_version_chain(chain) {
+        return chain.clone();
+    }
+    let entries = match chain.as_seq() {
+        Some(s) => s,
+        None => return chain.clone(),
+    };
+    let latest_id = entries.last().and_then(version_entry_id);
+    let kept: alloc::vec::Vec<Object> = entries.iter()
+        .filter(|entry| {
+            let id = match version_entry_id(entry) {
+                Some(id) => id,
+                None => return true, // malformed entry — keep defensively
+            };
+            keep_ids.contains(&id) || latest_id == Some(id)
+        })
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        return Object::phi();
+    }
+    Object::seq(kept)
+}
+
+/// S1g (#723): collect the set of cell version_ids cited by Citation
+/// facts for the named cell. Walks the post-S1f
+/// `Citation_pins_Cell_Name` and `Citation_pins_Cell_Version_Id`
+/// cells and returns the inner-join over the Citation column.
+///
+/// Empty set if either cell is absent or the join finds no row for
+/// `cell_name`. Callers union this with snapshot pins before passing
+/// to `compact_chain`.
+pub fn cell_versions_pinned_by_citations(
+    state: &Object,
+    cell_name: &str,
+) -> alloc::collections::BTreeSet<u64> {
+    use alloc::collections::BTreeMap;
+    let mut out = alloc::collections::BTreeSet::new();
+    let name_cell = fetch_or_phi("Citation_pins_Cell_Name", state);
+    let ver_cell = fetch_or_phi("Citation_pins_Cell_Version_Id", state);
+    let name_facts = match name_cell.as_seq() {
+        Some(s) => s,
+        None => return out,
+    };
+    let ver_facts = match ver_cell.as_seq() {
+        Some(s) => s,
+        None => return out,
+    };
+    // Build Citation -> Version lookup once, then filter the name cell
+    // to citations that pin `cell_name`. O(N+M) over the two cells.
+    let mut cite_to_ver: BTreeMap<&str, u64> = BTreeMap::new();
+    for fact in ver_facts.iter() {
+        let cite = match binding(fact, "Citation") { Some(s) => s, None => continue };
+        let ver_str = match binding(fact, "Cell Version Id") { Some(s) => s, None => continue };
+        if let Ok(id) = ver_str.parse::<u64>() {
+            cite_to_ver.insert(cite, id);
+        }
+    }
+    for fact in name_facts.iter() {
+        let cite = match binding(fact, "Citation") { Some(s) => s, None => continue };
+        let bound_name = match binding(fact, "Cell Name") { Some(s) => s, None => continue };
+        if bound_name == cell_name {
+            if let Some(&id) = cite_to_ver.get(cite) {
+                out.insert(id);
+            }
+        }
+    }
+    out
+}
+
 /// S1h (#724): "Cell as_of Version" — the contents of cell `name` at
 /// version_id `at`, or None if the cell isn't a chain or no entry
 /// matches. Bitemporal point-in-time read over the chain produced by
@@ -7052,6 +7139,94 @@ mod tests {
                 "cell {} round-trips through diff+merge", name
             );
         }
+    }
+
+    // ── S1g (#723): chain compaction ────────────────────────────────
+
+    fn build_three_chain_state() -> Object {
+        let mut state = Object::Map(HashMap::new());
+        for tag in &["a", "b", "c"] {
+            let mut d = HashMap::new();
+            d.insert("Item".to_string(), Object::atom(tag));
+            state = merge_delta(&state, &Object::Map(d));
+        }
+        state
+    }
+
+    #[test]
+    fn compact_chain_keeps_only_pinned_and_latest() {
+        let state = build_three_chain_state();
+        let chain = fetch_raw("Item", &state);
+        // Pin v=1 only; v=3 (latest) is always kept; v=2 should drop.
+        let mut keep = alloc::collections::BTreeSet::new();
+        keep.insert(1u64);
+        let compacted = compact_chain(&chain, &keep);
+
+        let entries = compacted.as_seq().expect("compacted is a chain seq");
+        assert_eq!(entries.len(), 2,
+            "v=2 must drop; kept = {{v=1, latest=v=3}}; got {} entries", entries.len());
+        let ids: Vec<u64> = entries.iter().filter_map(version_entry_id).collect();
+        assert_eq!(ids, vec![1, 3], "expected ids [1,3]; got {:?}", ids);
+    }
+
+    #[test]
+    fn compact_chain_keeps_latest_when_no_pins() {
+        let state = build_three_chain_state();
+        let chain = fetch_raw("Item", &state);
+        let keep = alloc::collections::BTreeSet::new();
+        let compacted = compact_chain(&chain, &keep);
+        let entries = compacted.as_seq().unwrap();
+        assert_eq!(entries.len(), 1, "no pins → only latest kept");
+        assert_eq!(version_entry_id(&entries[0]), Some(3));
+    }
+
+    #[test]
+    fn compact_chain_passes_through_non_chain() {
+        let raw = Object::atom("legacy");
+        let mut keep = alloc::collections::BTreeSet::new();
+        keep.insert(99u64);
+        let result = compact_chain(&raw, &keep);
+        assert_eq!(result, raw, "non-chain inputs pass through unchanged");
+    }
+
+    #[test]
+    fn compact_chain_no_op_when_all_versions_pinned() {
+        let state = build_three_chain_state();
+        let chain = fetch_raw("Item", &state);
+        let mut keep = alloc::collections::BTreeSet::new();
+        keep.extend([1u64, 2, 3]);
+        let compacted = compact_chain(&chain, &keep);
+        assert_eq!(compacted, chain, "all-pinned compaction is a no-op");
+    }
+
+    #[test]
+    fn cell_versions_pinned_by_citations_returns_versions_for_cell() {
+        // Two citations: one pins (Item, v=2), one pins (Other, v=5).
+        let (_, s) = emit_citation_fact_pinned(
+            "platform:pin1", "Storage-Pin", "2026-05-05T00:00:00Z",
+            None, Some(("Item", 2)), &Object::phi());
+        let (_, s) = emit_citation_fact_pinned(
+            "platform:pin2", "Storage-Pin", "2026-05-05T00:00:00Z",
+            None, Some(("Other", 5)), &s);
+
+        let item_pins = cell_versions_pinned_by_citations(&s, "Item");
+        assert!(item_pins.contains(&2),
+            "Item pins must include v=2; got {:?}", item_pins);
+        assert!(!item_pins.contains(&5),
+            "Item pins must NOT include Other's v=5; got {:?}", item_pins);
+
+        let other_pins = cell_versions_pinned_by_citations(&s, "Other");
+        assert_eq!(other_pins.iter().copied().collect::<Vec<_>>(), vec![5]);
+    }
+
+    #[test]
+    fn cell_versions_pinned_by_citations_empty_for_uncited_cell() {
+        let (_, s) = emit_citation_fact_pinned(
+            "platform:pin1", "Storage-Pin", "2026-05-05T00:00:00Z",
+            None, Some(("Item", 2)), &Object::phi());
+        let pins = cell_versions_pinned_by_citations(&s, "NoSuchCell");
+        assert!(pins.is_empty(),
+            "cell with no Citation pins must yield empty set; got {:?}", pins);
     }
 
     #[test]

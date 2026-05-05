@@ -615,6 +615,42 @@ impl CompiledState {
         ast::Object::Map(map)
     }
 
+    /// S1g (#723): drop chain entries for cell `name` that aren't
+    /// pinned by any live snapshot (#720) AND aren't pinned by any
+    /// Citation (#722). Latest entry is always kept so the cell's
+    /// logical view (`fetch` / `cells_iter`) is unchanged.
+    ///
+    /// Returns `Some(dropped_count)` for chain cells (zero when
+    /// nothing was eligible to drop), `None` for absent cells or
+    /// pre-S1b raw cells (un-versioned). Holds the per-cell write
+    /// lock for the read-modify-write; concurrent reads on other
+    /// cells aren't blocked.
+    fn compact_cell(&self, name: &str) -> Option<usize> {
+        // Gather pin sources BEFORE acquiring the cell's write lock so
+        // we never hold the write guard while taking read locks on the
+        // Citation cells (which would risk a deadlock if a concurrent
+        // writer ordered locks the other way).
+        let mut keep_ids = alloc::collections::BTreeSet::new();
+        for snap in self.snapshots.values() {
+            if let Some(SnapshotEntry::Pinned(id)) = snap.get(name) {
+                keep_ids.insert(*id);
+            }
+        }
+        let cite_pins = ast::cell_versions_pinned_by_citations(&self.snapshot_d(), name);
+        keep_ids.extend(cite_pins);
+
+        let lock = self.cells.get(name)?;
+        let mut guard = lock.write();
+        if !ast::is_version_chain(&*guard) {
+            return None;
+        }
+        let before_len = guard.as_seq().map(|s| s.len()).unwrap_or(0);
+        let compacted = ast::compact_chain(&*guard, &keep_ids);
+        let after_len = compacted.as_seq().map(|s| s.len()).unwrap_or(0);
+        *guard = compacted;
+        Some(before_len.saturating_sub(after_len))
+    }
+
     /// Assemble an `Object::Map` view of the full state. Each cell's
     /// read lock is held briefly for the clone; readers don't block
     /// each other, but a writer on that cell will block the snapshot
@@ -1723,6 +1759,18 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         let snapshot = tenant.read().snapshot_d();
         return match ast::cell_pin(&snapshot, input) {
             Some(id) => id.to_string(),
+            None => "⊥".into(),
+        };
+    }
+
+    // S1g (#723): per-cell GC compaction. Drops chain entries that
+    // aren't pinned by any live snapshot or Citation; latest is always
+    // kept (the cell's logical view is unchanged). Decimal dropped-
+    // count for chain cells, `⊥` for absent / un-versioned cells.
+    if key == "compact" {
+        let st = tenant.read();
+        return match st.compact_cell(input) {
+            Some(dropped) => dropped.to_string(),
             None => "⊥".into(),
         };
     }
@@ -3097,6 +3145,66 @@ Order has total.
     #[test]
     fn cell_pin_handler_on_invalid_handle_returns_bottom() {
         assert_eq!(system_impl(u32::MAX, "cell_pin", "Noun"), "⊥");
+    }
+
+    // ── S1g (#723): compact handler ─────────────────────────────────
+
+    #[test]
+    fn compact_handler_drops_unpinned_versions_keeps_latest() {
+        // Three appends → chain v=1, v=2, v=3. No snapshots, no
+        // Citations: only the latest is kept; two entries dropped.
+        let h = alloc_with_chain("Noun", &["a", "b", "c"]);
+        assert_eq!(system_impl(h, "compact", "Noun"), "2");
+        // After compaction the chain has just v=3; cell_pin still
+        // reports v=3 (logical view unchanged).
+        assert_eq!(system_impl(h, "cell_pin", "Noun"), "3");
+        release_impl(h);
+    }
+
+    #[test]
+    fn compact_handler_preserves_snapshot_pinned_versions() {
+        // Build chain to v=2, snapshot it (pinning v=2), append v=3 +
+        // v=4. Compaction must keep v=2 (pinned) and v=4 (latest);
+        // v=3 should drop.
+        let h = alloc_with_chain("Noun", &["a", "b"]);
+        let _ = system_impl(h, "snapshot", "v2");
+        // Append two more versions through replace_d using merge_delta
+        // so the chain extends.
+        {
+            let tenant = tenant_lock(h).unwrap();
+            let mut st = tenant.write();
+            let cur = st.snapshot_d();
+            let mut d = hashbrown::HashMap::new();
+            d.insert("Noun".to_string(), ast::Object::atom("c"));
+            let s3 = ast::merge_delta(&cur, &ast::Object::Map(d));
+            let mut d = hashbrown::HashMap::new();
+            d.insert("Noun".to_string(), ast::Object::atom("d"));
+            let s4 = ast::merge_delta(&s3, &ast::Object::Map(d));
+            st.replace_d(s4);
+        }
+        assert_eq!(system_impl(h, "compact", "Noun"), "2",
+            "v=1 and v=3 unpinned → drop 2; v=2 (snapshot) and v=4 (latest) kept");
+        release_impl(h);
+    }
+
+    #[test]
+    fn compact_handler_returns_bottom_for_unversioned_cell() {
+        let h = alloc_with_noun("raw");
+        assert_eq!(system_impl(h, "compact", "Noun"), "⊥",
+            "non-chain cells can't be compacted; expect ⊥");
+        release_impl(h);
+    }
+
+    #[test]
+    fn compact_handler_returns_bottom_for_unknown_cell() {
+        let h = alloc_with_chain("Noun", &["a"]);
+        assert_eq!(system_impl(h, "compact", "Missing"), "⊥");
+        release_impl(h);
+    }
+
+    #[test]
+    fn compact_handler_on_invalid_handle_returns_bottom() {
+        assert_eq!(system_impl(u32::MAX, "compact", "Noun"), "⊥");
     }
 
     // ── Sec-4: HMAC-signed snapshot ids ──────────────────────────────
