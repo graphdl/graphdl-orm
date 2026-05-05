@@ -15,8 +15,9 @@
  *                            $AREST_TUTOR_DB; survives restarts.
  */
 /// <reference types="node" />
-import { readFileSync, readdirSync, existsSync, rmSync, mkdirSync } from 'fs'
+import { readFileSync, readdirSync, existsSync, rmSync, mkdirSync, mkdtempSync, writeFileSync } from 'fs'
 import { resolve, dirname, join } from 'path'
+import { tmpdir } from 'os'
 import { fileURLToPath } from 'url'
 import { spawn } from 'child_process'
 
@@ -100,6 +101,19 @@ export async function getSandboxHandle(): Promise<number> {
 export async function tutorSystemCall(key: string, input: string): Promise<string> {
   if (shouldUseCliDb()) {
     await ensureCliBootstrapped()
+    if (key === 'compile') {
+      // arest-cli's `compile` SYSTEM key against persisted state does not
+      // append schema. The binary's positional readings-dir form is the
+      // one that registers nouns/facts into --db. Drop the input into a
+      // tempdir and re-invoke that form.
+      const tempDir = mkdtempSync(join(tmpdir(), 'arest-tutor-compile-'))
+      try {
+        writeFileSync(join(tempDir, '_extra.md'), input)
+        return await runArestCli([tempDir, '--db', tutorSandboxDbPath()])
+      } finally {
+        try { rmSync(tempDir, { recursive: true, force: true }) } catch {}
+      }
+    }
     return runArestCli(['--db', tutorSandboxDbPath(), key, input])
   }
   const engine = await getEngine()

@@ -171,3 +171,34 @@ describe.skipIf(!haveCli)('tutor sandbox — CLI persistence', () => {
     delete process.env.AREST_TUTOR_DB
   }, 120_000)
 })
+
+describe.skipIf(!haveCli)('tutor.compile — CLI mode dispatch', () => {
+  it('compiling a small readings text returns a non-rejection result', async () => {
+    const tempDir = mkdtempSync(`${tmpdir()}/arest-tutor-compile-`)
+    const dbPath = `${tempDir}/tutor.db`
+    process.env.AREST_TUTOR_DB = dbPath
+    await resetSandbox()
+
+    // Bootstrap the sandbox so the SYSTEM call dispatch is exercised
+    // against a real persisted DB.
+    await tutorSystemCall('list:Noun', '')
+
+    // Compile a tiny readings text that declares a noun not present in
+    // tutor/domains/. The CLI binary's `compile <readings>` SYSTEM key
+    // does not append schema (it returns "0 nouns added"); tutorSystemCall
+    // therefore special-cases compile in CLI mode to use the positional
+    // readings-dir form. We assert the call succeeds without a rejection
+    // marker — surfacing the new noun in `list:Noun` is a separate engine
+    // visibility concern (only federated / cell-indexed nouns appear
+    // there) tracked outside this test.
+    const readings = [
+      'Widget(.Sku) is an entity type.',
+      'Sku is a value type.',
+    ].join('\n')
+    const compiled = await tutorSystemCall('compile', readings)
+    expect(compiled).toBeDefined()
+    expect(compiled.startsWith('⊥')).toBe(false)
+
+    delete process.env.AREST_TUTOR_DB
+  }, 120_000)
+})
