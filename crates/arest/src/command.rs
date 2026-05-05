@@ -719,14 +719,15 @@ fn create_via_defs(
         }
     })).collect();
 
-    // S1c (#719): the legacy `audit_log` cell + Security #26 audit-push
-    // are gone. Per whitepaper eq:cellfold the chain (S1b) is the audit
-    // surface; operation/sender provenance is the event operand on each
-    // chain entry — system_impl will thread that via merge_delta_with_event
-    // when wiring the apply path (#719-followup). For now, the returned
-    // delta carries the post-apply contents only; rejected applies snap
-    // to the pre-state.
-    let _ = (sender, &entity_id); // operation+sender retained for follow-up wiring
+    // S1c (#719 + #757): the legacy `audit_log` cell + Security #26
+    // audit-push are gone. Per whitepaper eq:cellfold the chain (S1b) is
+    // the audit surface; operation/sender provenance rides on each
+    // chain entry's `event` field — `system_impl` threads (verb,
+    // operand) via `apply_event` into `merge_delta` at the commit
+    // boundary (lib.rs Tier-1 + Tier-2 CommitDelta arms). The returned
+    // delta still carries the post-apply contents only; rejected
+    // applies snap to the pre-state.
+    let _ = (sender, &entity_id); // operation+sender now ride on the event operand at the commit boundary
     let final_state = match rejected { true => state.clone(), false => derived_state };
     // #209: return only the cells this command modified, not the full D.
     // system_impl merges this delta onto the snapshot before commit.

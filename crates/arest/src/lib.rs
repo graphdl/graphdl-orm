@@ -2068,7 +2068,13 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
                 // try_commit_diff against the same snapshot so the CAS
                 // only touches the delta cells. If the snapshot is
                 // stale, escalate to Tier 2 with a fresh re-apply.
-                let new_d = ast::merge_delta(&snapshot, &delta, None);
+                //
+                // S1c #757: thread the verb + operand through merge_delta
+                // so each VersionEntry minted here carries the apply-time
+                // `x` per FFP applicative-state-transfer. The chain
+                // doubles as audit-of-record; no audit_log sidecar.
+                let event = ast::apply_event(key, obj.clone());
+                let new_d = ast::merge_delta(&snapshot, &delta, Some(event));
                 let outcome = st.try_commit_diff(&snapshot, &new_d);
                 match outcome {
                     CommitOutcome::Committed => return response,
@@ -2091,7 +2097,9 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
             response
         }
         WriterResult::CommitDelta { delta, response } => {
-            let new_d = ast::merge_delta(&snapshot, &delta, None);
+            // S1c #757: same event threading as Tier 1.
+            let event = ast::apply_event(key, obj.clone());
+            let new_d = ast::merge_delta(&snapshot, &delta, Some(event));
             st.replace_d(new_d);
             response
         }
@@ -2861,11 +2869,88 @@ mod handle_isolation_tests {
     // S1c (#719): the audit_log cell is gone; the chain (S1b) carries
     // the audit surface. The pre-S1c
     // `audit_log_reachable_via_system_and_carries_entity_id` test
-    // covered the legacy cell path and is no longer applicable. The
-    // chain-side equivalent (apply threading the Command into
-    // VersionEntry's `event` field, projected via `cells_iter_history`)
-    // is the #719-followup; tests for that path land with the wiring
-    // commit.
+    // covered the legacy cell path. The chain-side equivalent landed
+    // in #757 — apply threads (verb, operand) into VersionEntry.event
+    // at the merge_delta boundary, projected via `cells_iter_history`.
+    // The two tests below cover that path on both Tier 1 and Tier 2.
+
+    /// S1c #757: every apply-driven CommitDelta merge must stamp the
+    /// resulting VersionEntry.event with `apply_event(verb, operand)`,
+    /// so the chain doubles as audit-of-record per FFP applicative-
+    /// state-transfer (`f:x → y` where `x` carries op + sender).
+    ///
+    /// The exact cell name a `create:Order` fact lands in depends on
+    /// resolver decisions; instead of pinning a specific name, we walk
+    /// every chain in the snapshot and assert at least one carries a
+    /// `create:Order` event whose operand mentions the entity id.
+    #[test]
+    fn apply_threads_command_into_version_entry_event() {
+        let h = create_impl();
+        let readings = "\
+Order(.id) is an entity type.
+Order has total.
+  Each Order has at most one total.
+";
+        let _ = system_impl(h, "compile", readings);
+        let _ = system_impl(h, "create:Order", "<<id, ord-1>, <total, 100>>");
+
+        let d = peek(h).expect("handle live");
+
+        let mut found_apply_event = false;
+        for (name, _contents) in ast::cells_iter(&d) {
+            // cells_iter unwraps to latest; re-fetch raw to walk history.
+            let raw = ast::fetch_raw(&name, &d);
+            if !ast::is_version_chain(&raw) { continue; }
+            for entry in raw.as_seq().into_iter().flatten() {
+                let Some(event) = ast::version_entry_event(entry) else { continue; };
+                let Some(verb) = ast::apply_event_verb(event) else { continue; };
+                if verb != "create:Order" { continue; }
+                let operand = ast::apply_event_operand(event)
+                    .expect("event with verb must also expose operand");
+                let serialized = operand.to_json_string();
+                assert!(serialized.contains("ord-1"),
+                    "operand must preserve Command payload; got: {serialized}");
+                found_apply_event = true;
+                break;
+            }
+            if found_apply_event { break; }
+        }
+        assert!(found_apply_event,
+            "no chain entry carried a create:Order apply_event after a create:Order call (S1c #757 wiring)");
+
+        release_impl(h);
+    }
+
+    /// Compile and other non-apply paths (Commit / replace_d) must keep
+    /// the 4-field VersionEntry shape — only the apply-driven path
+    /// carries an event. This guards the pre-S1c freeze byte-identity
+    /// invariant called out in version_entry's docstring.
+    #[test]
+    fn compile_path_does_not_attach_event_to_version_entries() {
+        let h = create_impl();
+        // compile is a Commit (full-state) path, not CommitDelta —
+        // any chain entries it produces must stay event-less.
+        let readings = "\
+Order(.id) is an entity type.
+Order has total.
+  Each Order has at most one total.
+";
+        let out = system_impl(h, "compile", readings);
+        assert!(!out.starts_with('⊥'), "compile must succeed, got: {out}");
+
+        let d = peek(h).expect("handle live");
+        // Walk every chain in the snapshot; none of the entries should
+        // carry an event field, because no apply ran.
+        for (_name, contents) in ast::cells_iter(&d) {
+            if !ast::is_version_chain(&contents) { continue; }
+            for entry in contents.as_seq().into_iter().flatten() {
+                assert!(ast::version_entry_event(entry).is_none(),
+                    "compile-path VersionEntry must be event-less; saw event on entry: {entry:?}");
+            }
+        }
+
+        release_impl(h);
+    }
 
     /// After `create:Order` adds an entity to D via apply, both
     /// `list:Order` and `get:Order` must see it. Currently those defs

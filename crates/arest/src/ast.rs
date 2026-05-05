@@ -3387,6 +3387,37 @@ pub fn is_version_entry(obj: &Object) -> bool {
     version_entry_id(obj).is_some() && version_entry_contents(obj).is_some()
 }
 
+// ─── Apply event (S1c #757) ─────────────────────────────────────────
+//
+// The operand `x` that drove a `system_impl` apply call: a (verb,
+// operand) pair stamped onto each VersionEntry the apply produces.
+// Per FFP applicative-state-transfer, every commit is `f:x → y`; this
+// surfaces `x` so the chain doubles as the audit-of-record without a
+// sidecar audit_log cell.
+
+pub const APPLY_EVENT_VERB_KEY: &str = "verb";
+pub const APPLY_EVENT_OPERAND_KEY: &str = "operand";
+
+/// Build the apply-time event Object that gets attached to every
+/// VersionEntry minted by a `system_impl` apply call. Two-pair shape:
+///   <<verb, "create:Order">, <operand, <<id, ord-1>, <total, 100>>>>
+/// Pre-S1c entries (compile bootstrap, internal forward-chain merges)
+/// continue to pass `None` to `merge_delta`.
+pub fn apply_event(verb: &str, operand: Object) -> Object {
+    Object::seq(alloc::vec![
+        Object::seq(alloc::vec![Object::atom(APPLY_EVENT_VERB_KEY), Object::atom(verb)]),
+        Object::seq(alloc::vec![Object::atom(APPLY_EVENT_OPERAND_KEY), operand]),
+    ])
+}
+
+pub fn apply_event_verb(event: &Object) -> Option<&str> {
+    binding(event, APPLY_EVENT_VERB_KEY)
+}
+
+pub fn apply_event_operand(event: &Object) -> Option<&Object> {
+    pair_value(event, APPLY_EVENT_OPERAND_KEY)
+}
+
 // ─── Cell version chain (S1b, #718) ─────────────────────────────────────
 //
 // A "version chain" is an Object::Seq whose elements are all VersionEntry
@@ -7612,6 +7643,28 @@ mod tests {
         let entry = version_entry(1, Object::atom("p"), None, Object::atom("now"), None);
         assert!(version_entry_event(&entry).is_none(),
             "entries constructed with event=None must not surface an event field");
+    }
+
+    #[test]
+    fn apply_event_round_trips_verb_and_operand() {
+        let operand = fact_from_pairs(&[("id", "ord-1"), ("total", "100")]);
+        let event = apply_event("create:Order", operand.clone());
+        assert_eq!(apply_event_verb(&event), Some("create:Order"));
+        assert_eq!(apply_event_operand(&event), Some(&operand));
+    }
+
+    #[test]
+    fn apply_event_preserves_non_atom_operand_structure() {
+        // Operand can be any Object — a Seq of pairs in this case.
+        // apply_event must not flatten or stringify it.
+        let operand = Object::seq(alloc::vec![
+            Object::seq(alloc::vec![Object::atom("a"), Object::atom("1")]),
+            Object::seq(alloc::vec![Object::atom("b"), Object::atom("2")]),
+        ]);
+        let event = apply_event("transition:Order", operand.clone());
+        let extracted = apply_event_operand(&event)
+            .expect("operand must round-trip");
+        assert_eq!(extracted, &operand);
     }
 
     #[test]
