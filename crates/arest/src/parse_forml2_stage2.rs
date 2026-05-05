@@ -1242,22 +1242,16 @@ pub fn translate_instance_facts_with_ft_ids(
         // `fact_type_id_from_reading` so the inter-role verb tokens
         // (e.g. ` with `, ` at `, ` and `) survive. Lower-arity facts
         // keep the cheap path — no statement-text walk needed.
-        let canonical = if roles.len() <= 2 {
-            if object_noun.is_empty() {
-                alloc::format!("{}_{}",
-                    subject_noun.replace(' ', "_"),
-                    verb.to_lowercase().replace(' ', "_"))
-            } else {
-                alloc::format!("{}_{}_{}",
-                    subject_noun.replace(' ', "_"),
-                    verb.to_lowercase().replace(' ', "_"),
-                    object_noun.replace(' ', "_"))
-            }
-        } else {
-            // Strip role literals from the statement text to recover
-            // the canonical FT reading shape, then build the id.
-            let text = statement_text(idx,stmt_id)
-                .unwrap_or_default();
+        // Use the same text-walking canonicalizer the schema-side uses
+        // (see translate_fact_types). The previous binary-only path
+        // built `{subject}_{verb}_{object}` from a format string, which
+        // diverged from `fact_type_id_from_reading` whenever the reading
+        // self-referenced a role noun (e.g. `Fact Type has Layer
+        // Affinity to Layer` — the intra-verb `Layer` gets lowercased
+        // by the schema walker but stayed capitalized in the format
+        // string), silently breaking the declared-FT lookup.
+        let canonical = {
+            let text = statement_text(idx,stmt_id).unwrap_or_default();
             let role_nouns: Vec<String> = roles.iter()
                 .map(|(n, _)| n.clone()).collect();
             let reading = strip_role_literals(&text, &roles);
@@ -3633,6 +3627,52 @@ mod tests {
         assert_eq!(facts.len(), 1);
         assert_eq!(binding(&facts[0], "fieldName"),
             Some("Customer_places_Order"));
+    }
+
+    /// Regression: instance-fact-side FT id construction must match the
+    /// schema-side `fact_type_id_from_reading` even when the fact-type
+    /// reading self-references one of its role nouns. For the reading
+    /// `Fact Type has Layer Affinity to Layer`, the role noun `Layer`
+    /// also appears inside the verb phrase (`Layer Affinity`); the
+    /// schema-side walks the reading and lowercases that intra-verb
+    /// occurrence, yielding `Fact_Type_has_layer_affinity_to_layer`.
+    /// The previous binary-case code path used a format string that
+    /// preserved the object noun's casing, producing
+    /// `Fact_Type_has_layer_affinity_to_Layer` and breaking the
+    /// declared-FT lookup so metamodel-targeting instance facts
+    /// silently dropped on the floor.
+    #[test]
+    fn translate_instance_facts_resolves_canonical_for_self_referential_reading() {
+        // Drive both schema-side and instance-side through the SAME stage1
+        // input so the role-detection and walking are symmetric. The FT
+        // declaration `Fact Type has Layer Affinity to Layer.` is parsed
+        // first; its id from fact_type_id_from_reading IS the declared
+        // FT id we expect translate_instance_facts to resolve to.
+        let decl_stmt = stage1_state(
+            "s_decl",
+            "Fact Type has Layer Affinity to Layer.",
+            &["Fact Type", "Layer"]);
+        let decl_classified = classify_statements(&decl_stmt, &grammar_state());
+        let (ft_facts, _role_facts) = super::translate_fact_types(
+            &decl_classified, &idx(&decl_classified));
+        assert_eq!(ft_facts.len(), 1, "expected one FactType from declaration");
+        let canonical_id = binding(&ft_facts[0], "id")
+            .expect("FactType must have id binding").to_string();
+
+        let stmt = stage1_state(
+            "s_inst",
+            "Fact Type 'Decision_was_made_by_Agent' has Layer Affinity to Layer 'SPD1-6'.",
+            &["Fact Type", "Layer"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let facts = super::translate_instance_facts_with_ft_ids(
+            &classified, &idx(&classified), &[canonical_id.clone()]);
+        assert_eq!(facts.len(), 1);
+        assert_eq!(
+            binding(&facts[0], "fieldName"),
+            Some(canonical_id.as_str()),
+            "instance-fact FT id must match the schema-side canonical id even \
+             when the reading self-references a role noun (canonical was {})",
+            canonical_id);
     }
 
     #[test]
