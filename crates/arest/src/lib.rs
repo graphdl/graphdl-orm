@@ -1712,6 +1712,21 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         );
     }
 
+    // S1e (#721): expose the chain's monotonic version_id for a named
+    // cell so AEAD callers (worker EntityDB, kernel block_storage, host
+    // CLI freeze paths) can source the AAD `version` field from the
+    // engine's true storage version rather than maintaining their own
+    // counter. Decimal for chain cells, `⊥` for absent / un-versioned
+    // cells (callers should treat ⊥ as "version 0" for pre-S1b raw
+    // cells). See cell_aead.rs CellAddress's S1i contract comment.
+    if key == "cell_pin" {
+        let snapshot = tenant.read().snapshot_d();
+        return match ast::cell_pin(&snapshot, input) {
+            Some(id) => id.to_string(),
+            None => "⊥".into(),
+        };
+    }
+
     // `check` (#199) — run the readings diagnostic pass without
     // committing. Input is the readings text; output is a pretty-
     // printed diagnostic list (one line per diagnostic, newline-
@@ -3024,6 +3039,64 @@ Order has total.
         assert_eq!(system_impl(u32::MAX, "snapshot", ""), "⊥");
         assert_eq!(system_impl(u32::MAX, "rollback", "whatever"), "⊥");
         assert_eq!(system_impl(u32::MAX, "snapshots", ""), "⊥");
+    }
+
+    // ── S1e (#721): cell_pin handler ──────────────────────────────────
+    //
+    // Exposes the chain's monotonic version_id for a named cell so AEAD
+    // callers can source the AAD `version` field from the engine's true
+    // storage version — the unification S1e calls for. Returns decimal
+    // for chain cells, `⊥` for absent / un-versioned cells. The worker
+    // EntityDB migration (drop the per-row counter from #661 in favour
+    // of this) is the follow-on work; this handler is the engine-side
+    // capability.
+
+    /// Build a chain-bearing state via two merge_delta appends, then
+    /// install it via `replace_d` (which preserves chain wrapping —
+    /// unlike `allocate`, whose `defs_to_state` calls `cells_iter` and
+    /// unwraps chains to latest contents).
+    fn alloc_with_chain(name: &str, payloads: &[&str]) -> u32 {
+        let mut state = ast::Object::Map(hashbrown::HashMap::new());
+        for p in payloads {
+            let mut d = hashbrown::HashMap::new();
+            d.insert(name.to_string(), ast::Object::atom(p));
+            state = ast::merge_delta(&state, &ast::Object::Map(d));
+        }
+        let h = allocate(ast::Object::Map(hashbrown::HashMap::new()), vec![]);
+        let tenant = tenant_lock(h).unwrap();
+        tenant.write().replace_d(state);
+        h
+    }
+
+    #[test]
+    fn cell_pin_handler_returns_chain_version_id() {
+        // Two appends → chain whose latest entry carries version_id 2.
+        let h = alloc_with_chain("Noun", &["v1", "v2"]);
+        assert_eq!(system_impl(h, "cell_pin", "Noun"), "2");
+        release_impl(h);
+    }
+
+    #[test]
+    fn cell_pin_handler_returns_bottom_for_unknown_cell() {
+        let h = alloc_with_chain("Noun", &["v1"]);
+        assert_eq!(system_impl(h, "cell_pin", "Missing"), "⊥");
+        release_impl(h);
+    }
+
+    #[test]
+    fn cell_pin_handler_returns_bottom_for_unversioned_cell() {
+        // alloc_with_noun stores the cell via `ast::store` directly,
+        // bypassing merge_delta's chain wrapping — the cell is raw,
+        // not a chain, so cell_pin yields ⊥ (callers should treat ⊥
+        // as version-0 for pre-S1b backwards-compat).
+        let h = alloc_with_noun("raw");
+        assert_eq!(system_impl(h, "cell_pin", "Noun"), "⊥");
+        release_impl(h);
+    }
+
+    #[test]
+    fn cell_pin_handler_on_invalid_handle_returns_bottom() {
+        assert_eq!(system_impl(u32::MAX, "cell_pin", "Noun"), "⊥");
     }
 
     // ── Sec-4: HMAC-signed snapshot ids ──────────────────────────────
