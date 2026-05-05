@@ -2,23 +2,9 @@
   "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/sdk/main/schemas/mcp.json",
   "mcpServers": {
     "arest": {
-      "description": "AREST engine — FORML2 readings → REST API. Tools: apply / compile / propose / query / audit / verify, plus a built-in sandboxed tutor (tutor + tutor.* tools) that runs orthogonal to your active app.",
+      "description": "AREST engine — FORML2 readings → REST API. Tools: apply / compile / propose / query / audit / verify, plus a built-in sandboxed tutor (tutor + tutor.* tools) that runs orthogonal to your active app. Configure your personal scope via shell env: AREST_CLI (path to arest-cli for CLI/SQLite persistence), AREST_DB, and AREST_READINGS_DIR (or AREST_APPS_DIR + AREST_APP for the app registry). For remote-worker mode, set AREST_MODE=remote plus AREST_URL and AREST_API_KEY. Without any of these, the server runs in WASM mode against the bundled metamodel.",
       "command": "npx",
-      "args": ["-y", "tsx", "src/mcp/server.ts"],
-      "env": {
-        "AREST_MODE": "local",
-        "AREST_READINGS_DIR": "./readings"
-      }
-    },
-    "arest-remote": {
-      "description": "AREST engine (remote worker mode). Requires AREST_URL and AREST_API_KEY set in your shell.",
-      "command": "npx",
-      "args": ["-y", "tsx", "src/mcp/server.ts"],
-      "env": {
-        "AREST_MODE": "remote",
-        "AREST_URL": "${AREST_URL}",
-        "AREST_API_KEY": "${AREST_API_KEY}"
-      }
+      "args": ["-y", "tsx", "src/mcp/server.ts"]
     }
   }
 }
