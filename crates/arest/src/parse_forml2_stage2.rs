@@ -32,6 +32,232 @@ use hashbrown::HashMap;
 use crate::ast::{Object, fetch_or_phi, fact_from_pairs, binding};
 use crate::time_shim::Instant;
 
+// ── MC2 Stage-2 dispatch tables (#713) ──────────────────────────────
+//
+// Stage-2's translators used to keep three hardcoded dispatch matrices:
+//
+//   1. `ring_adjective_to_kind` mapped trailing-marker phrases
+//      ("is acyclic" / "is symmetric" / ...) to the ORM 2 ring
+//      constraint kind code ("AC" / "SY" / ...).
+//   2. `conditional_ring_kind` mapped a 5-tuple of antecedent /
+//      consequent boolean shape signals to a ring kind code, used
+//      for the conditional ring shape `If X R Y then ...`.
+//   3. `translate_deontic_constraints` emitted constraint cell facts
+//      with kind="UC" / modality="deontic" for every deontic operator
+//      in `("obligatory", "forbidden", "permitted")`.
+//
+// MC2 lifts each of those three tables to enum-value declarations in
+// `readings/forml2-grammar.md` and reads them back via the same cell
+// path as MC1's `Vocab`. The boot fallback stays in Rust for the
+// chicken-and-egg case where the tables drive the parser that loads
+// the readings that define the tables.
+//
+// Each table struct exposes:
+//   - `Self::boot()` — Rust-side fallback constants kept byte-for-byte
+//     identical to the readings declarations.
+//   - `Self::from_grammar_state(state)` — parallel-enum reader. Reads
+//     two enum value lists keyed by `noun:` from the EnumValues cell
+//     and zips them by index.
+
+/// Stage-2 ring kind dispatch — `<trailing-marker>` → ORM 2 kind code.
+/// Owned `Vec<(String, String)>` so the table outlives any borrowed
+/// grammar state (mirrors `Vocab::derivation_markers`).
+#[derive(Debug, Clone)]
+pub struct RingKindTable {
+    /// Pairs of `(trailing-marker, kind-code)` such as
+    /// `("is acyclic", "AC")`. Order matches the readings'
+    /// parallel-enum declaration order.
+    pub markers: Vec<(String, String)>,
+}
+
+impl RingKindTable {
+    /// Boot table — must stay in sync with the parallel
+    /// `Ring Constraint Trailing Marker` and `Ring Constraint Kind
+    /// Code` enum-value declarations in `readings/forml2-grammar.md`.
+    pub fn boot() -> Self {
+        RingKindTable {
+            markers: alloc::vec![
+                ("is irreflexive".to_string(),   "IR".to_string()),
+                ("is asymmetric".to_string(),    "AS".to_string()),
+                ("is antisymmetric".to_string(), "AT".to_string()),
+                ("is symmetric".to_string(),     "SY".to_string()),
+                ("is intransitive".to_string(),  "IT".to_string()),
+                ("is transitive".to_string(),    "TR".to_string()),
+                ("is acyclic".to_string(),       "AC".to_string()),
+                ("is reflexive".to_string(),     "RF".to_string()),
+            ],
+        }
+    }
+
+    /// Build the table by reading the parallel `Ring Constraint
+    /// Trailing Marker` / `Ring Constraint Kind Code` enum-value
+    /// declarations from a parsed grammar state's EnumValues cell.
+    /// Falls back to `boot()` if the lists are missing or have
+    /// mismatched lengths.
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let markers = read_parallel_enum_pair(
+            state,
+            "Ring Constraint Trailing Marker",
+            "Ring Constraint Kind Code",
+        );
+        match markers {
+            Some(m) => RingKindTable { markers: m },
+            None => Self::boot(),
+        }
+    }
+
+    /// Look up the kind code for a trailing marker phrase.
+    pub fn kind_for(&self, marker: &str) -> Option<&str> {
+        self.markers.iter()
+            .find(|(m, _)| m == marker)
+            .map(|(_, k)| k.as_str())
+    }
+}
+
+/// Stage-2 conditional ring matrix — encoded boolean tuple → ORM 2
+/// kind code. The encoded pattern names mirror `conditional_ring_kind`'s
+/// match arms (see `encode_conditional_ring_pattern`).
+#[derive(Debug, Clone)]
+pub struct ConditionalRingMatrix {
+    /// `(pattern-name, kind-code)` rows in declaration order. Lookup
+    /// is by exact pattern-name match.
+    pub rows: Vec<(String, String)>,
+}
+
+impl ConditionalRingMatrix {
+    /// Boot matrix — must stay in sync with the parallel
+    /// `Conditional Ring Pattern` / `Conditional Ring Kind Code`
+    /// enum-value declarations in `readings/forml2-grammar.md`.
+    pub fn boot() -> Self {
+        ConditionalRingMatrix {
+            rows: alloc::vec![
+                ("and+impossible+isnot-ante".to_string(), "AT".to_string()),
+                ("and+impossible".to_string(),            "IT".to_string()),
+                ("and".to_string(),                       "TR".to_string()),
+                ("impossible".to_string(),                "AS".to_string()),
+                ("isnot-conse".to_string(),               "AS".to_string()),
+                ("itself-conse".to_string(),              "RF".to_string()),
+                ("plain".to_string(),                     "SY".to_string()),
+            ],
+        }
+    }
+
+    /// Build the matrix from parallel `Conditional Ring Pattern` /
+    /// `Conditional Ring Kind Code` enum-value declarations.
+    /// Falls back to `boot()` on any mismatch.
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_parallel_enum_pair(
+            state,
+            "Conditional Ring Pattern",
+            "Conditional Ring Kind Code",
+        );
+        match rows {
+            Some(r) => ConditionalRingMatrix { rows: r },
+            None => Self::boot(),
+        }
+    }
+
+    /// Look up the kind code for an encoded pattern name.
+    pub fn kind_for(&self, pattern: &str) -> Option<&str> {
+        self.rows.iter()
+            .find(|(p, _)| p == pattern)
+            .map(|(_, k)| k.as_str())
+    }
+}
+
+/// Stage-2 deontic shape table — `<deontic-operator>` → emission
+/// `(kind, modality)` pair. Currently every operator emits the same
+/// shape (`UC` / `deontic`); the table is lifted so future operators
+/// can emit distinct shapes without re-touching the translator.
+#[derive(Debug, Clone)]
+pub struct DeonticShapeTable {
+    /// `(operator, kind-code, modality)` rows in declaration order.
+    pub rows: Vec<(String, String, String)>,
+}
+
+impl DeonticShapeTable {
+    /// Boot table — must stay in sync with the parallel
+    /// `Deontic Operator` / `Deontic Constraint Kind Code` /
+    /// `Deontic Constraint Modality` enum-value declarations.
+    pub fn boot() -> Self {
+        DeonticShapeTable {
+            rows: alloc::vec![
+                ("obligatory".to_string(), "UC".to_string(), "deontic".to_string()),
+                ("forbidden".to_string(),  "UC".to_string(), "deontic".to_string()),
+                ("permitted".to_string(),  "UC".to_string(), "deontic".to_string()),
+            ],
+        }
+    }
+
+    /// Build the table from parallel `Deontic Operator` /
+    /// `Deontic Constraint Kind Code` / `Deontic Constraint Modality`
+    /// enum-value declarations.  Falls back to `boot()` on any mismatch.
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let ops = read_enum_values(state, "Deontic Operator");
+        let kinds = read_enum_values(state, "Deontic Constraint Kind Code");
+        let modalities = read_enum_values(state, "Deontic Constraint Modality");
+        if ops.len() == kinds.len()
+            && ops.len() == modalities.len()
+            && !ops.is_empty()
+        {
+            let rows = ops.into_iter()
+                .zip(kinds)
+                .zip(modalities)
+                .map(|((o, k), m)| (o, k, m))
+                .collect();
+            DeonticShapeTable { rows }
+        } else {
+            Self::boot()
+        }
+    }
+
+    /// Look up the `(kind, modality)` pair for a deontic operator.
+    pub fn shape_for(&self, op: &str) -> Option<(&str, &str)> {
+        self.rows.iter()
+            .find(|(o, _, _)| o == op)
+            .map(|(_, k, m)| (k.as_str(), m.as_str()))
+    }
+}
+
+/// Read a single enum-value list from the EnumValues cell of a parsed
+/// grammar state, keyed by `noun: <type_name>`. Returns an empty
+/// `Vec` if no row matches.
+fn read_enum_values(state: &Object, type_name: &str) -> Vec<String> {
+    let cell = fetch_or_phi("EnumValues", state);
+    let facts = match cell.as_seq() {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    for f in facts.iter() {
+        if binding(f, "noun") != Some(type_name) { continue; }
+        return (0..)
+            .map_while(|i| {
+                let key = alloc::format!("value{i}");
+                binding(f, &key).map(String::from)
+            })
+            .collect();
+    }
+    Vec::new()
+}
+
+/// Read two parallel enum-value lists and zip them index-wise.
+/// Returns `None` if either list is empty or the lengths don't match;
+/// callers fall back to `boot()` so a missing or malformed declaration
+/// can't silently truncate the table.
+fn read_parallel_enum_pair(
+    state: &Object,
+    left_type: &str,
+    right_type: &str,
+) -> Option<Vec<(String, String)>> {
+    let left = read_enum_values(state, left_type);
+    let right = read_enum_values(state, right_type);
+    if left.len() == right.len() && !left.is_empty() {
+        Some(left.into_iter().zip(right).collect())
+    } else {
+        None
+    }
+}
+
 /// Classify every Statement in `statements_state` using the grammar
 /// rules in `grammar_state`. Returns a new state identical to
 /// `statements_state` plus a populated `Statement_has_Classification`
@@ -1306,6 +1532,23 @@ fn statement_verb(state: &Object, stmt_id: &str) -> Option<String> {
 /// (fact_type_id resolution) are left empty — a follow-up
 /// commit will populate them once the FactType cell exists.
 pub fn translate_ring_constraints(classified_state: &Object) -> Vec<Object> {
+    translate_ring_constraints_with_tables(
+        classified_state,
+        &RingKindTable::boot(),
+        &ConditionalRingMatrix::boot(),
+    )
+}
+
+/// MC2 (#713) cell-driven variant. Stage-2's
+/// `parse_to_state_via_stage12_impl` builds the two tables once from
+/// the cached grammar state's EnumValues cell and threads them through.
+/// Bare callers (legacy unit tests) get the `boot()` fallback via
+/// `translate_ring_constraints`.
+pub fn translate_ring_constraints_with_tables(
+    classified_state: &Object,
+    ring_kinds: &RingKindTable,
+    conditional_matrix: &ConditionalRingMatrix,
+) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let declared_nouns = declared_noun_names(classified_state);
     let mut out: Vec<Object> = Vec::new();
@@ -1325,11 +1568,13 @@ pub fn translate_ring_constraints(classified_state: &Object) -> Vec<Object> {
                 Some(m) => m,
                 None => continue,
             };
-            match ring_adjective_to_kind(&marker) {
+            match ring_adjective_to_kind(&marker, ring_kinds) {
                 Some(k) => (k, "marker"),
                 None => continue,
             }
-        } else if let Some(k) = conditional_ring_kind(&text, &declared_nouns) {
+        } else if let Some(k) = conditional_ring_kind(
+            &text, &declared_nouns, conditional_matrix)
+        {
             (k, "conditional")
         } else {
             continue;
@@ -1338,7 +1583,7 @@ pub fn translate_ring_constraints(classified_state: &Object) -> Vec<Object> {
         let entity = head_noun_for(classified_state, stmt_id).unwrap_or_default();
         out.push(fact_from_pairs(&[
             ("id",       text.as_str()),
-            ("kind",     kind),
+            ("kind",     kind.as_str()),
             ("modality", "alethic"),
             ("text",     text.as_str()),
             ("entity",   entity.as_str()),
@@ -1358,9 +1603,16 @@ pub fn translate_ring_constraints(classified_state: &Object) -> Vec<Object> {
 ///
 /// Returns the ring kind (`TR` / `AS` / `SY` / `AT` / `IT` / `RF`)
 /// or `None` when the statement doesn't match a ring shape.
-fn conditional_ring_kind(text: &str, declared_nouns: &[String])
-    -> Option<&'static str>
-{
+///
+/// MC2 (#713): the boolean-tuple → kind dispatch matrix lives in
+/// `ConditionalRingMatrix`; this function only recognises the shape
+/// signals. The translator threads `ConditionalRingMatrix::boot()` for
+/// bare callers and the cell-driven instance for the Stage-2 path.
+fn conditional_ring_kind(
+    text: &str,
+    declared_nouns: &[String],
+    matrix: &ConditionalRingMatrix,
+) -> Option<String> {
     if !text.starts_with("If ") { return None; }
     let then_idx = text.find(" then ")?;
     let antecedent = &text[3..then_idx];
@@ -1400,36 +1652,50 @@ fn conditional_ring_kind(text: &str, declared_nouns: &[String])
         .any(|w| strip_subscript(w) == *first);
     if !consequent_has_same_noun { return None; }
 
+    let pattern = encode_conditional_ring_pattern(antecedent, consequent)?;
+    matrix.kind_for(&pattern).map(String::from)
+}
+
+/// Encode the (has_and, impossible, itself_in_consequent,
+/// is_not_in_antecedent, is_not_in_consequent) boolean tuple into the
+/// pattern name used to key into `ConditionalRingMatrix`. Returns
+/// `None` for tuples that don't correspond to any recognised ring
+/// shape (e.g. `impossible + itself_in_consequent`).
+fn encode_conditional_ring_pattern(
+    antecedent: &str,
+    consequent: &str,
+) -> Option<String> {
     let has_and = antecedent.contains(" and ");
     let impossible = consequent.starts_with("it is impossible that ");
     let itself_in_consequent = consequent.contains(" itself");
     let is_not_in_antecedent = antecedent.contains(" is not ");
     let is_not_in_consequent = consequent.contains(" is not ");
 
-    match (has_and, impossible, itself_in_consequent,
-           is_not_in_antecedent, is_not_in_consequent) {
+    let name = match (has_and, impossible, itself_in_consequent,
+                      is_not_in_antecedent, is_not_in_consequent) {
         // AT: `If A1 R A2 and A1 is not A2 then impossible A2 R A1`.
-        (true, true, _, true, _)        => Some("AT"),
+        (true, true, _, true, _)        => "and+impossible+isnot-ante",
         // IT: `If A1 R A2 and A2 R A3 then impossible A1 R A3`.
-        (true, true, _, false, _)       => Some("IT"),
+        (true, true, _, false, _)       => "and+impossible",
         // TR: `If A1 R A2 and A2 R A3 then A1 R A3`.
-        (true, false, _, _, _)          => Some("TR"),
+        (true, false, _, _, _)          => "and",
         // AS via "impossible": `If A1 R A2 then it is impossible that
         // A2 R A1`.
-        (false, true, false, _, _)      => Some("AS"),
+        (false, true, false, _, _)      => "impossible",
         // AS via "is not" in consequent: `If Noun1 R Noun2, then
         // Noun2 is not R Noun1`. Legacy's matrix maps this to `SY`
         // but the semantic is asymmetry — stage12 matches the
         // semantic rather than reproduce the legacy matrix bug.
-        (false, false, false, _, true)  => Some("AS"),
+        (false, false, false, _, true)  => "isnot-conse",
         // RF: `If A1 R some A2 then A1 R itself`.
-        (false, false, true, _, _)      => Some("RF"),
+        (false, false, true, _, _)      => "itself-conse",
         // SY: `If A1 R A2 then A2 R A1`.
-        (false, false, false, _, false) => Some("SY"),
+        (false, false, false, _, false) => "plain",
         // Anything else (e.g. `impossible + itself_in_consequent`) is
         // not a recognised ring shape.
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(name.to_string())
 }
 
 /// Translate `Derivation Rule` classifications into `DerivationRule`
@@ -1442,6 +1708,18 @@ fn conditional_ring_kind(text: &str, declared_nouns: &[String])
 /// FactType + Role cells have been populated by Stage-2 earlier in
 /// the pipeline.
 pub fn translate_derivation_rules(classified_state: &Object) -> Vec<Object> {
+    translate_derivation_rules_with_matrix(
+        classified_state, &ConditionalRingMatrix::boot())
+}
+
+/// MC2 (#713) cell-driven variant. Stage-2's
+/// `parse_to_state_via_stage12_impl` builds the matrix once from the
+/// cached grammar state and threads it through the conditional-ring
+/// arbitration check. Bare callers get the `boot()` fallback.
+pub fn translate_derivation_rules_with_matrix(
+    classified_state: &Object,
+    conditional_matrix: &ConditionalRingMatrix,
+) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let declared_nouns = declared_noun_names(classified_state);
     let mut out: Vec<Object> = Vec::new();
@@ -1464,7 +1742,9 @@ pub fn translate_derivation_rules(classified_state: &Object) -> Vec<Object> {
         // statement matches a conditional ring shape (all antecedent
         // role tokens share a base noun, consequent matches), the
         // ring translator claims it — skip DR emission.
-        if conditional_ring_kind(&text, &declared_nouns).is_some() {
+        if conditional_ring_kind(
+            &text, &declared_nouns, conditional_matrix).is_some()
+        {
             continue;
         }
         let id = derivation_rule_id(&text);
@@ -1832,6 +2112,23 @@ fn enum_values_for(state: &Object, stmt_id: &str) -> Vec<String> {
 /// operator. Entity defaults to the Head Noun of the body (after
 /// the `It is X that` prefix was stripped by Stage-1).
 pub fn translate_deontic_constraints(classified_state: &Object) -> Vec<Object> {
+    translate_deontic_constraints_with_table(
+        classified_state, &DeonticShapeTable::boot())
+}
+
+/// MC2 (#713) cell-driven variant. The (kind, modality) pair emitted
+/// per deontic operator is read from `DeonticShapeTable`, which
+/// `parse_to_state_via_stage12_impl` builds from the cached grammar
+/// state's parallel `Deontic Operator` / `Deontic Constraint Kind
+/// Code` / `Deontic Constraint Modality` enum-value declarations.
+/// When a statement is classified deontic but carries no operator
+/// (e.g. a `Quantifier` shadowed the operator atom), we fall back to
+/// the first table row's shape — matching the legacy hardcoded
+/// `kind="UC", modality="deontic"` defaults.
+pub fn translate_deontic_constraints_with_table(
+    classified_state: &Object,
+    deontic_shapes: &DeonticShapeTable,
+) -> Vec<Object> {
     let statement_ids = collect_statement_ids(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
@@ -1856,10 +2153,20 @@ pub fn translate_deontic_constraints(classified_state: &Object) -> Vec<Object> {
         let text = statement_text(classified_state, stmt_id).unwrap_or_default();
         let op_str = op.unwrap_or_default();
         let entity = head_noun_for(classified_state, stmt_id).unwrap_or_default();
+        // Resolve emission shape via the cell-driven table. Fall back
+        // to the first table row when the operator isn't enumerated
+        // (defensive — the parallel-enum invariant guarantees a row
+        // per operator, but a malformed reading could leave the
+        // operator unmapped; the boot fallback row always carries
+        // ("UC", "deontic") so behaviour matches the pre-MC2 hardcode).
+        let (kind, modality) = deontic_shapes.shape_for(&op_str)
+            .or_else(|| deontic_shapes.rows.first()
+                .map(|(_, k, m)| (k.as_str(), m.as_str())))
+            .unwrap_or(("UC", "deontic"));
         out.push(fact_from_pairs(&[
             ("id",               text.as_str()),
-            ("kind",             "UC"),
-            ("modality",         "deontic"),
+            ("kind",             kind),
+            ("modality",         modality),
             ("deonticOperator",  op_str.as_str()),
             ("text",             text.as_str()),
             ("entity",           entity.as_str()),
@@ -1876,18 +2183,14 @@ fn deontic_operator_for(state: &Object, stmt_id: &str) -> Option<String> {
         .and_then(|f| binding(f, "Deontic_Operator").map(String::from))
 }
 
-fn ring_adjective_to_kind(marker: &str) -> Option<&'static str> {
-    match marker {
-        "is irreflexive"   => Some("IR"),
-        "is asymmetric"    => Some("AS"),
-        "is antisymmetric" => Some("AT"),
-        "is symmetric"     => Some("SY"),
-        "is intransitive"  => Some("IT"),
-        "is transitive"    => Some("TR"),
-        "is acyclic"       => Some("AC"),
-        "is reflexive"     => Some("RF"),
-        _                  => None,
-    }
+/// Resolve a trailing-marker phrase to its ring constraint kind code
+/// via the (cell-driven) `RingKindTable`. The hardcoded match arms
+/// that lived here previously have moved to `RingKindTable::boot()` —
+/// MC2 (#713) wants this dispatch surface to live in the readings.
+fn ring_adjective_to_kind(marker: &str, table: &RingKindTable)
+    -> Option<String>
+{
+    table.kind_for(marker).map(String::from)
 }
 
 fn trailing_marker_for(state: &Object, stmt_id: &str) -> Option<String> {
@@ -2688,6 +2991,14 @@ fn parse_to_state_via_stage12_impl(
     // when called outside the cell-driven path (legacy callers, unit
     // tests). Pass-by-borrow so we don't clone the vocab per line.
     let vocab = crate::parse_forml2_stage1::Vocab::from_grammar_state(grammar_state);
+    // MC2 (#713): build Stage-2's three dispatch tables (ring kinds,
+    // conditional ring matrix, deontic shape) from the same cached
+    // grammar state. The translators each fall back to their `boot()`
+    // table when called outside this cell-driven path. Threaded
+    // by-borrow so the per-parse build cost is the only allocation.
+    let ring_kinds = RingKindTable::from_grammar_state(grammar_state);
+    let conditional_matrix = ConditionalRingMatrix::from_grammar_state(grammar_state);
+    let deontic_shapes = DeonticShapeTable::from_grammar_state(grammar_state);
 
     // #309 — enforce Theorem 1's no-reserved-substring rule. Scan
     // unquoted noun declarations in the source and reject any that
@@ -2873,11 +3184,14 @@ fn parse_to_state_via_stage12_impl(
         ft_facts.push(ft_fact.clone());
         role_facts.extend(role_fs.clone());
     }
-    let mut constraint_facts: Vec<Object> = tt!("ring", translate_ring_constraints(&classified));
+    let mut constraint_facts: Vec<Object> = tt!("ring",
+        translate_ring_constraints_with_tables(
+            &classified, &ring_kinds, &conditional_matrix));
     constraint_facts.extend(tt!("cardinality", translate_cardinality_constraints(&classified)));
     constraint_facts.extend(tt!("set", translate_set_constraints(&classified)));
     constraint_facts.extend(tt!("value_c", translate_value_constraints(&classified)));
-    constraint_facts.extend(tt!("deontic", translate_deontic_constraints(&classified)));
+    constraint_facts.extend(tt!("deontic",
+        translate_deontic_constraints_with_table(&classified, &deontic_shapes)));
     // Enrich each constraint with span0_factTypeId / span0_roleIndex
     // (and span1_*) bindings derived from the Role cell. Legacy emits
     // these at constraint-translation time; check.rs, command.rs and
@@ -2886,7 +3200,8 @@ fn parse_to_state_via_stage12_impl(
     // role (legacy quirk preserved for byte-level parity).
     constraint_facts = tt!("enrich_spans",
         enrich_constraints_with_spans(&constraint_facts, &role_facts));
-    let derivation_facts = tt!("derivation", translate_derivation_rules(&classified));
+    let derivation_facts = tt!("derivation",
+        translate_derivation_rules_with_matrix(&classified, &conditional_matrix));
     let unresolved_clause_facts = tt!("unresolved",
         translate_unresolved_clauses(&classified, &ft_facts));
     let declared_ft_ids: Vec<String> = ft_facts.iter()
@@ -3198,8 +3513,8 @@ mod tests {
 
     /// Stage-0 bootstrap must produce every cell `compile_to_defs_state`
     /// and `specialize_grammar_classifiers` read from. Specific counts
-    /// are pinned to the committed `readings/forml2-grammar.md` (17
-    /// nouns, 16 binary FTs, 7 enum-valued value types, 30+ classifier
+    /// are pinned to the committed `readings/forml2-grammar.md` (23
+    /// nouns, 16 binary FTs, 13 enum-valued value types, 30+ classifier
     /// rules) to guard against a shape recognizer silently dropping a
     /// line when the grammar file is edited.
     ///
@@ -3207,7 +3522,12 @@ mod tests {
     /// `Derivation Marker Symbol` value type, and the enum-valued noun
     /// count to 7 by adding `Trailing Marker` and `Derivation Marker
     /// Symbol` enum-value declarations so Stage-1's vocab can be lifted
-    /// from cells.
+    /// from cells. MC2 (#713) added 6 more parallel-enum value types
+    /// (`Ring Constraint Trailing Marker` / `Ring Constraint Kind
+    /// Code`, `Conditional Ring Pattern` / `Conditional Ring Kind
+    /// Code`, `Deontic Constraint Kind Code` / `Deontic Constraint
+    /// Modality`) so Stage-2's three dispatch matrices can be lifted
+    /// from cells too — bumping noun count to 23, enum count to 13.
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
@@ -3215,7 +3535,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 17, "noun count");
+        assert_eq!(noun_count, 23, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -3227,7 +3547,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 7, "enum-valued noun count");
+        assert_eq!(enum_count, 13, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -4359,4 +4679,201 @@ mod tests {
             deriv.len(), round2_active);
     }
 
+    // ─── #713 / MC2: cell-driven dispatch table tests ─────────────────
+    //
+    // These tests assert Stage-2 reads its three dispatch matrices
+    // (ring kinds, conditional ring, deontic shape) from a
+    // `RingKindTable` / `ConditionalRingMatrix` / `DeonticShapeTable`
+    // built off the EnumValues cell. They use a synthetic state object
+    // built directly in the test, so they verify the cell-reading path
+    // independent of `cached_grammar_state`.
+
+    fn synthetic_enum_state(enums: &[(&str, &[&str])]) -> Object {
+        use alloc::sync::Arc;
+        let facts: Vec<Object> = enums.iter().map(|(noun, vals)| {
+            let mut pairs: Vec<(String, String)> = alloc::vec![
+                ("noun".to_string(), (*noun).to_string()),
+            ];
+            for (i, v) in vals.iter().enumerate() {
+                pairs.push((alloc::format!("value{i}"), (*v).to_string()));
+            }
+            let refs: Vec<(&str, &str)> = pairs.iter()
+                .map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            fact_from_pairs(&refs)
+        }).collect();
+        let mut map: HashMap<String, Object> = HashMap::new();
+        map.insert("EnumValues".to_string(), Object::Seq(Arc::from(facts)));
+        Object::Map(map)
+    }
+
+    #[test]
+    fn ring_kind_table_from_grammar_state_reads_parallel_enums() {
+        // The test the audit calls out: Stage-2 recognizes 'is acyclic'
+        // as a ring kind via the cell path. Build a table whose markers
+        // come from a synthetic EnumValues cell, not from `boot()`,
+        // and verify `kind_for("is acyclic")` returns "AC".
+        let state = synthetic_enum_state(&[
+            ("Ring Constraint Trailing Marker", &["is acyclic", "is symmetric"]),
+            ("Ring Constraint Kind Code", &["AC", "SY"]),
+        ]);
+        let table = super::RingKindTable::from_grammar_state(&state);
+        assert_eq!(table.kind_for("is acyclic"), Some("AC"));
+        assert_eq!(table.kind_for("is symmetric"), Some("SY"));
+        assert_eq!(table.kind_for("is irreflexive"), None,
+            "missing-from-cells marker must not resolve");
+    }
+
+    #[test]
+    fn ring_kind_table_falls_back_to_boot_on_length_mismatch() {
+        // If the parallel enums have different lengths, the reader
+        // refuses to zip them and falls back to `boot()`.
+        let state = synthetic_enum_state(&[
+            ("Ring Constraint Trailing Marker", &["is acyclic"]),
+            ("Ring Constraint Kind Code", &["AC", "SY"]),
+        ]);
+        let table = super::RingKindTable::from_grammar_state(&state);
+        // boot() includes all 8 markers — assert the irreflexive entry
+        // we did NOT add appears (proving fallback fired).
+        assert_eq!(table.kind_for("is irreflexive"), Some("IR"));
+    }
+
+    #[test]
+    fn translate_ring_constraints_with_cell_table_emits_expected_kinds() {
+        // End-to-end: synthesize the parallel enum cell, build the
+        // table, and run `translate_ring_constraints_with_tables` —
+        // every kind must come from the cell-driven table.
+        let state = synthetic_enum_state(&[
+            ("Ring Constraint Trailing Marker", &[
+                "is irreflexive", "is asymmetric", "is antisymmetric",
+                "is symmetric", "is intransitive", "is transitive",
+                "is acyclic", "is reflexive",
+            ]),
+            ("Ring Constraint Kind Code", &[
+                "IR", "AS", "AT", "SY", "IT", "TR", "AC", "RF",
+            ]),
+        ]);
+        let ring_kinds = super::RingKindTable::from_grammar_state(&state);
+        let conditional_matrix = super::ConditionalRingMatrix::boot();
+        for (text, nouns, expected_kind) in [
+            ("Category has parent Category is acyclic.",    vec!["Category"], "AC"),
+            ("Person is parent of Person is irreflexive.",  vec!["Person"],   "IR"),
+            ("Person loves Person is symmetric.",           vec!["Person"],   "SY"),
+        ] {
+            let stmt = stage1_state("s1", text, &nouns);
+            let classified = classify_statements(&stmt, &grammar_state());
+            let constraints = super::translate_ring_constraints_with_tables(
+                &classified, &ring_kinds, &conditional_matrix);
+            assert_eq!(constraints.len(), 1, "text={:?}", text);
+            assert_eq!(binding(&constraints[0], "kind"), Some(expected_kind),
+                "text={:?}", text);
+        }
+    }
+
+    #[test]
+    fn ring_kind_table_from_real_grammar_loads_eight_markers() {
+        // The committed grammar must declare both parallel enums so
+        // the cell path returns the same 8-row table as `boot()`.
+        let state = grammar_state();
+        let table = super::RingKindTable::from_grammar_state(&state);
+        assert_eq!(table.markers.len(), 8,
+            "expected 8 ring-kind rows from real grammar; got {:?}",
+            table.markers);
+        assert_eq!(table.kind_for("is acyclic"), Some("AC"));
+        assert_eq!(table.kind_for("is asymmetric"), Some("AS"));
+        assert_eq!(table.kind_for("is antisymmetric"), Some("AT"));
+        assert_eq!(table.kind_for("is intransitive"), Some("IT"));
+        assert_eq!(table.kind_for("is irreflexive"), Some("IR"));
+        assert_eq!(table.kind_for("is reflexive"), Some("RF"));
+        assert_eq!(table.kind_for("is symmetric"), Some("SY"));
+        assert_eq!(table.kind_for("is transitive"), Some("TR"));
+    }
+
+    #[test]
+    fn conditional_ring_matrix_from_grammar_state_reads_parallel_enums() {
+        let state = synthetic_enum_state(&[
+            ("Conditional Ring Pattern", &["plain", "and"]),
+            ("Conditional Ring Kind Code", &["SY", "TR"]),
+        ]);
+        let matrix = super::ConditionalRingMatrix::from_grammar_state(&state);
+        assert_eq!(matrix.kind_for("plain"), Some("SY"));
+        assert_eq!(matrix.kind_for("and"), Some("TR"));
+        assert_eq!(matrix.kind_for("impossible"), None,
+            "pattern not in cells must not resolve");
+    }
+
+    #[test]
+    fn conditional_ring_matrix_from_real_grammar_loads_seven_rows() {
+        let state = grammar_state();
+        let matrix = super::ConditionalRingMatrix::from_grammar_state(&state);
+        assert_eq!(matrix.rows.len(), 7,
+            "expected 7 conditional-ring rows; got {:?}", matrix.rows);
+        assert_eq!(matrix.kind_for("plain"),                     Some("SY"));
+        assert_eq!(matrix.kind_for("and"),                       Some("TR"));
+        assert_eq!(matrix.kind_for("and+impossible"),            Some("IT"));
+        assert_eq!(matrix.kind_for("and+impossible+isnot-ante"), Some("AT"));
+        assert_eq!(matrix.kind_for("impossible"),                Some("AS"));
+        assert_eq!(matrix.kind_for("isnot-conse"),               Some("AS"));
+        assert_eq!(matrix.kind_for("itself-conse"),              Some("RF"));
+    }
+
+    #[test]
+    fn deontic_shape_table_from_grammar_state_reads_three_parallel_enums() {
+        let state = synthetic_enum_state(&[
+            ("Deontic Operator", &["obligatory", "forbidden", "permitted"]),
+            ("Deontic Constraint Kind Code", &["UC", "UC", "UC"]),
+            ("Deontic Constraint Modality", &["deontic", "deontic", "deontic"]),
+        ]);
+        let table = super::DeonticShapeTable::from_grammar_state(&state);
+        assert_eq!(table.shape_for("obligatory"), Some(("UC", "deontic")));
+        assert_eq!(table.shape_for("forbidden"),  Some(("UC", "deontic")));
+        assert_eq!(table.shape_for("permitted"),  Some(("UC", "deontic")));
+        assert_eq!(table.shape_for("encouraged"), None);
+    }
+
+    #[test]
+    fn deontic_shape_table_falls_back_to_boot_on_length_mismatch() {
+        // Parallel enum lengths differ → boot fallback. Boot has all
+        // three operators mapped to (UC, deontic).
+        let state = synthetic_enum_state(&[
+            ("Deontic Operator", &["obligatory"]),
+            ("Deontic Constraint Kind Code", &["UC", "UC", "UC"]),
+            ("Deontic Constraint Modality", &["deontic"]),
+        ]);
+        let table = super::DeonticShapeTable::from_grammar_state(&state);
+        assert_eq!(table.shape_for("forbidden"), Some(("UC", "deontic")),
+            "boot fallback must include all three operators");
+    }
+
+    #[test]
+    fn translate_deontic_constraints_with_cell_table_emits_expected_shape() {
+        let state = synthetic_enum_state(&[
+            ("Deontic Operator", &["obligatory", "forbidden", "permitted"]),
+            ("Deontic Constraint Kind Code", &["UC", "UC", "UC"]),
+            ("Deontic Constraint Modality", &["deontic", "deontic", "deontic"]),
+        ]);
+        let table = super::DeonticShapeTable::from_grammar_state(&state);
+        let stmt = stage1_state(
+            "s1",
+            "It is obligatory that Customer places Order.",
+            &["Customer", "Order"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let constraints = super::translate_deontic_constraints_with_table(
+            &classified, &table);
+        assert_eq!(constraints.len(), 1);
+        let f = &constraints[0];
+        assert_eq!(binding(f, "kind"), Some("UC"));
+        assert_eq!(binding(f, "modality"), Some("deontic"));
+        assert_eq!(binding(f, "deonticOperator"), Some("obligatory"));
+    }
+
+    #[test]
+    fn deontic_shape_table_from_real_grammar_loads_three_operators() {
+        let state = grammar_state();
+        let table = super::DeonticShapeTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 3,
+            "expected 3 deontic operator rows; got {:?}", table.rows);
+        assert_eq!(table.shape_for("obligatory"), Some(("UC", "deontic")));
+        assert_eq!(table.shape_for("forbidden"),  Some(("UC", "deontic")));
+        assert_eq!(table.shape_for("permitted"),  Some(("UC", "deontic")));
+    }
 }
