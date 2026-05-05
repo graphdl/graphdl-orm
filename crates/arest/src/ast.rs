@@ -3467,10 +3467,58 @@ pub fn cells_iter_history(state: &Object, name: &str) -> Vec<Object> {
     }
 }
 
-/// Internal: fetch the raw stored value (chain-or-raw) without unwrapping.
-/// `fetch` exists as the public unwrap-aware reader. `fetch_raw` is for
-/// `merge_delta` and `cells_iter_history` which need to see the chain.
-fn fetch_raw(name: &str, state: &Object) -> Object {
+/// Get a specific entry from a version chain by its version_id, or
+/// None if the input isn't a chain or no entry matches. S1d (#720)
+/// uses this to materialize a cell's value at a snapshot's pinned id.
+pub fn chain_at_version(chain: &Object, version_id: u64) -> Option<&Object> {
+    if !is_version_chain(chain) {
+        return None;
+    }
+    chain.as_seq()?
+        .iter()
+        .find(|entry| version_entry_id(entry) == Some(version_id))
+}
+
+/// Truncate a chain to entries with version_id <= cutoff, preserving
+/// chronological order. S1d rollback: reconstruct a cell's state at
+/// the snapshot's pinned version by chopping off any entries that
+/// landed after the snapshot was taken. Returns the input unchanged
+/// when it isn't a chain.
+pub fn chain_truncate_at(chain: &Object, cutoff: u64) -> Object {
+    if !is_version_chain(chain) {
+        return chain.clone();
+    }
+    let kept: alloc::vec::Vec<Object> = chain.as_seq()
+        .map(|s| s.iter()
+            .filter(|entry| version_entry_id(entry).is_some_and(|id| id <= cutoff))
+            .cloned()
+            .collect())
+        .unwrap_or_default();
+    if kept.is_empty() {
+        // Cutoff predates every entry — this should not happen if the
+        // snapshot pin was taken from this chain. Defensive: return phi
+        // so the cell behaves as absent.
+        return Object::phi();
+    }
+    Object::seq(kept)
+}
+
+/// Latest version_id of the cell named `name`, or None if the cell is
+/// absent or the stored value isn't a chain. S1d snapshot: capture the
+/// pin point per cell at snapshot time.
+pub fn cell_pin(state: &Object, name: &str) -> Option<u64> {
+    let raw = fetch_raw(name, state);
+    if !is_version_chain(&raw) {
+        return None;
+    }
+    chain_latest(&raw).and_then(version_entry_id)
+}
+
+/// Fetch the raw stored value (chain-or-raw) without unwrapping.
+/// `fetch` exists as the public unwrap-aware reader; this is the
+/// chain-preserving counterpart used by `merge_delta`,
+/// `cells_iter_history`, and S1d snapshot/rollback.
+pub fn fetch_raw(name: &str, state: &Object) -> Object {
     match state {
         Object::Map(map) => map.get(name).cloned().unwrap_or(Object::Bottom),
         Object::Seq(cells) => cells.iter()

@@ -389,13 +389,18 @@ pub(crate) use arest_foundation::time_shim;
 ///             Needs only the outer `read()` guard, so two disjoint-
 ///             cell writers run in parallel.
 ///
-/// `snapshots` holds named captures of `d` taken via `system(h,
-/// "snapshot", "")` and restorable via `system(h, "rollback", id)`.
-/// Cheap in memory because cells share `Arc` storage — a snapshot
-/// is one map insert plus an Arc ref bump per cell.
+/// `snapshots` holds named per-cell capture maps taken via
+/// `system(h, "snapshot", "")` and restorable via
+/// `system(h, "rollback", id)`. S1d (#720): each cell captured by a
+/// snapshot stores either a `Pinned(version_id)` into its post-S1b
+/// version chain, or `Raw(Object)` for cells whose value isn't yet
+/// versioned (raw store / replace_d paths that bypass merge_delta).
+/// Pins feed S1g (#723) compaction so chains can be pruned without
+/// orphaning a snapshot's reach; raw captures keep rollback semantics
+/// correct for tests and bootstrap states that pre-date the chain.
 struct CompiledState {
     cells: hashbrown::HashMap<String, Arc<RwLock<ast::Object>>>,
-    snapshots: hashbrown::HashMap<String, ast::Object>,
+    snapshots: hashbrown::HashMap<String, alloc::collections::BTreeMap<String, SnapshotEntry>>,
     /// Sec-4: per-tenant secret that HMAC-signs snapshot ids so
     /// `system(h, "rollback", …)` cannot be driven by brute-forcing
     /// raw labels. Filled from a boot-time nonce in `new()`; never
@@ -432,6 +437,19 @@ struct CompiledState {
 pub enum RegisterMode {
     Untrusted,
     Privileged,
+}
+
+/// S1d (#720): per-cell capture in a snapshot's BTreeMap.
+/// `Pinned(version_id)` is the post-S1b chain pointer (cheap, O(1));
+/// `Raw(Object)` is a verbatim fallback for cells whose value is
+/// un-versioned (legacy raw store, replace_d paths that don't go
+/// through merge_delta). One discriminant per cell — the snapshot is
+/// O(cells) entries either way.
+#[cfg(not(feature = "no_std"))]
+#[derive(Clone, Debug)]
+enum SnapshotEntry {
+    Pinned(u64),
+    Raw(ast::Object),
 }
 
 /// Outcome of a targeted-write attempt via `try_commit_diff`.
@@ -543,6 +561,58 @@ impl CompiledState {
                 Err(curr) => fuel = curr,
             }
         }
+    }
+
+    /// S1d (#720): capture per-cell version pins from the live state.
+    /// For each cell, records the latest version_id of its chain, or
+    /// 0 if the cell value is raw (un-versioned). A pinned id lets
+    /// `rollback` reconstruct that cell's state at the time of capture
+    /// even after further `merge_delta` calls have appended new
+    /// versions. Read locks are held only long enough to inspect the
+    /// chain head, so concurrent writers aren't serialized.
+    fn compute_snapshot_pins(
+        &self,
+    ) -> alloc::collections::BTreeMap<String, SnapshotEntry> {
+        let mut pins = alloc::collections::BTreeMap::new();
+        for (name, lock) in &self.cells {
+            let raw = lock.read();
+            let entry = match ast::chain_latest(&raw).and_then(ast::version_entry_id) {
+                Some(id) => SnapshotEntry::Pinned(id),
+                None => SnapshotEntry::Raw(raw.clone()),
+            };
+            pins.insert(name.clone(), entry);
+        }
+        pins
+    }
+
+    /// S1d (#720): rebuild an `Object::Map` from a snapshot's per-cell
+    /// captures. `Pinned` entries truncate the cell's current chain to
+    /// the pinned `version_id`; `Raw` entries restore a verbatim copy
+    /// of what was stored at snapshot time. Cells absent from the
+    /// snapshot are omitted (they didn't exist at capture).
+    fn reconstruct_from_pins(
+        &self,
+        pins: &alloc::collections::BTreeMap<String, SnapshotEntry>,
+    ) -> ast::Object {
+        let mut map: hashbrown::HashMap<String, ast::Object> =
+            hashbrown::HashMap::with_capacity(pins.len());
+        for (name, entry) in pins {
+            match entry {
+                SnapshotEntry::Pinned(pinned_id) => {
+                    let lock = match self.cells.get(name) {
+                        Some(l) => l,
+                        None => continue,
+                    };
+                    let raw = lock.read();
+                    let restored = ast::chain_truncate_at(&raw, *pinned_id);
+                    map.insert(name.clone(), restored);
+                }
+                SnapshotEntry::Raw(value) => {
+                    map.insert(name.clone(), value.clone());
+                }
+            }
+        }
+        ast::Object::Map(map)
     }
 
     /// Assemble an `Object::Map` view of the full state. Each cell's
@@ -1586,8 +1656,9 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         } else {
             input.to_string()
         };
-        let snap = st.snapshot_d();
-        st.snapshots.insert(label.clone(), snap);
+        // S1d (#720): pin per-cell version_ids instead of cloning d.
+        let pins = st.compute_snapshot_pins();
+        st.snapshots.insert(label.clone(), pins);
         // Sec-4: append an HMAC tag over the raw label under the
         // tenant's secret. Caller keeps the signed form and must
         // hand it back unmodified to `rollback`. 16 hex chars = first
@@ -1621,8 +1692,11 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
             return "⊥".into();
         }
         return match st.snapshots.get(raw).cloned() {
-            Some(snap) => {
-                st.replace_d(snap);
+            Some(pins) => {
+                // S1d (#720): rebuild d by truncating each pinned
+                // cell's chain to its captured version_id.
+                let restored = st.reconstruct_from_pins(&pins);
+                st.replace_d(restored);
                 input.to_string()
             }
             None => "⊥".into(),
