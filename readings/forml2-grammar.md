@@ -42,6 +42,18 @@ Literal Role is a value type.
 Enum Value is a value type.
 Constraint Keyword is a value type.
   The possible values of Constraint Keyword are 'if and only if', 'at most one of the following holds', 'exactly one of the following holds', 'at least one of the following holds', 'if some then that'.
+Ring Constraint Trailing Marker is a value type.
+  The possible values of Ring Constraint Trailing Marker are 'is irreflexive', 'is asymmetric', 'is antisymmetric', 'is symmetric', 'is intransitive', 'is transitive', 'is acyclic', 'is reflexive'.
+Ring Constraint Kind Code is a value type.
+  The possible values of Ring Constraint Kind Code are 'IR', 'AS', 'AT', 'SY', 'IT', 'TR', 'AC', 'RF'.
+Conditional Ring Pattern is a value type.
+  The possible values of Conditional Ring Pattern are 'and+impossible+isnot-ante', 'and+impossible', 'and', 'impossible', 'isnot-conse', 'itself-conse', 'plain'.
+Conditional Ring Kind Code is a value type.
+  The possible values of Conditional Ring Kind Code are 'AT', 'IT', 'TR', 'AS', 'AS', 'RF', 'SY'.
+Deontic Constraint Kind Code is a value type.
+  The possible values of Deontic Constraint Kind Code are 'UC', 'UC', 'UC'.
+Deontic Constraint Modality is a value type.
+  The possible values of Deontic Constraint Modality are 'deontic', 'deontic', 'deontic'.
 
 ## Fact Types
 
