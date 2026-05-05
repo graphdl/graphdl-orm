@@ -2328,7 +2328,6 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
         s if s.starts_with("list_noun:") => platform_list_noun(&s[10..], d),
         s if s.starts_with("get_noun:") => platform_get_noun(&s[9..], x, d),
         s if s.starts_with("query_ft:") => platform_query_ft(&s[9..], x, d),
-        "audit" => platform_audit_log(d),
         // S1a (#717): wall-clock primitive — populates VersionEntry's
         // recorded_at field at write time. See platform_now below.
         "now" => platform_now(),
@@ -2361,35 +2360,6 @@ fn platform_now() -> Object {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     Object::atom(&ms.to_string())
-}
-
-/// Platform primitive: return the audit_log cell as a JSON array.
-/// Key: "audit_log". Input: ignored. Each entry renders as
-/// `{operation, outcome, sequence, sender, entity}`. Empty cell or
-/// missing cell yields `[]` — never Bottom.
-#[cfg(not(feature = "no_std"))]
-fn platform_audit_log(d: &Object) -> Object {
-    let log = fetch_or_phi("audit_log", d);
-    let items: Vec<serde_json::Value> = log.as_seq()
-        .map(|facts| facts.iter().filter_map(|fact| {
-            let pairs = fact.as_seq()?;
-            let mut map = serde_json::Map::new();
-            pairs.iter().for_each(|pair| {
-                if let Some(kv) = pair.as_seq() {
-                    if let (Some(role), Some(val)) = (
-                        kv.first().and_then(|k| k.as_atom()),
-                        kv.get(1).and_then(|v| v.as_atom()),
-                    ) {
-                        map.insert(role.to_string(), serde_json::Value::String(val.to_string()));
-                    }
-                }
-            });
-            Some(serde_json::Value::Object(map))
-        }).collect())
-        .unwrap_or_default();
-    let json = serde_json::to_string(&serde_json::Value::Array(items))
-        .unwrap_or_else(|_| "[]".to_string());
-    Object::atom(&json)
 }
 
 /// Codd π: project:<indices, R> → rows of R restricted to the given column indices.

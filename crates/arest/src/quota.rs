@@ -6,19 +6,14 @@
 // derivation chain shouldn't be able to starve other Apps; the
 // kernel enforces ceilings.
 //
-// Three accountable resources:
-//   - audit-log entries  (count of audit_log cell entries)
+// Two accountable resources (S1c #719 dropped AuditLogEntries —
+// the audit_log cell is gone; the chain is the audit surface and
+// per-cell GC compaction (#723) is the right primitive for chain-
+// growth bounding):
 //   - CPU time           (cumulative nanoseconds of μ evaluation)
 //   - memory             (population size — approximated as cell count)
 //
-// This initial cut implements the enforcement primitive for all
-// three dimensions. CPU + memory accounting instrumentation (when
-// to record, where to read) follow in a separate commit; this
-// module lands the shape and the audit-log counter that's always
-// available.
-//
 // Quota declarations live as instance facts on the App:
-//   App 'X' has Audit Log Limit '1000'.
 //   App 'X' has Cpu Ms Quota '5000'.
 //   App 'X' has Memory Cells Limit '10000'.
 //
@@ -34,10 +29,6 @@ use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 /// A resource dimension under quota.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resource {
-    /// Number of entries in the audit_log cell. Each mutation
-    /// appends one entry, so this counts total committed
-    /// operations across all tenants sharing this App's namespace.
-    AuditLogEntries,
     /// Cumulative nanoseconds of μ-evaluation time. Instrumentation
     /// to record this is wired in a follow-up — today the counter
     /// cell is read as-is and returns zero if absent.
@@ -56,16 +47,6 @@ pub struct QuotaStatus {
     pub usage: u64,
     pub limit: u64,
     pub exceeded: bool,
-}
-
-/// Count the audit-log entries in state. Used as the usage value
-/// for Resource::AuditLogEntries. The audit_log cell is a Seq of
-/// audit records appended by record_audit.
-pub fn audit_log_count(state: &Object) -> u64 {
-    match fetch("audit_log", state) {
-        Object::Seq(items) => items.len() as u64,
-        _ => 0,
-    }
 }
 
 /// Count non-def cells in state. Used as the usage value for
@@ -105,12 +86,10 @@ pub fn cpu_nanos_used(state: &Object) -> u64 {
 /// ceiling, fail open, etc.).
 ///
 /// Fact-shape:
-///   App '<slug>' has Audit Log Limit '<n>'.
 ///   App '<slug>' has Cpu Ms Quota '<ms>'.
 ///   App '<slug>' has Memory Cells Limit '<n>'.
 pub fn app_quota_limit(state: &Object, app: &str, resource: Resource) -> Option<u64> {
     let field = match resource {
-        Resource::AuditLogEntries => "Audit Log Limit",
         Resource::CpuNanos        => "Cpu Ms Quota",
         Resource::MemoryCells     => "Memory Cells Limit",
     };
@@ -138,7 +117,6 @@ pub fn check_quota(
     resource: Resource,
 ) -> QuotaStatus {
     let usage = match resource {
-        Resource::AuditLogEntries => audit_log_count(state),
         Resource::CpuNanos        => cpu_nanos_used(state),
         Resource::MemoryCells     => cell_count(state),
     };
@@ -161,30 +139,6 @@ mod tests {
     }
 
     #[test]
-    fn audit_log_count_on_empty_state_is_zero() {
-        assert_eq!(audit_log_count(&Object::phi()), 0);
-    }
-
-    #[test]
-    fn audit_log_count_scales_with_appended_entries() {
-        let s0 = Object::phi();
-        let s1 = cell_push("audit_log",
-            fact_from_pairs(&[("op", "create"), ("outcome", "ok")]), &s0);
-        let s2 = cell_push("audit_log",
-            fact_from_pairs(&[("op", "update"), ("outcome", "ok")]), &s1);
-        assert_eq!(audit_log_count(&s0), 0);
-        assert_eq!(audit_log_count(&s1), 1);
-        assert_eq!(audit_log_count(&s2), 2);
-    }
-
-    #[test]
-    fn app_quota_limit_reads_audit_log_limit_fact() {
-        let s = state_with_app_quota("sherlock", "Audit Log Limit", "1000");
-        assert_eq!(app_quota_limit(&s, "sherlock", Resource::AuditLogEntries), Some(1000));
-        assert_eq!(app_quota_limit(&s, "other", Resource::AuditLogEntries), None);
-    }
-
-    #[test]
     fn app_quota_limit_converts_cpu_ms_to_ns() {
         let s = state_with_app_quota("sherlock", "Cpu Ms Quota", "5");
         // 5ms = 5_000_000 ns
@@ -192,29 +146,10 @@ mod tests {
     }
 
     #[test]
-    fn check_quota_reports_under_at_over() {
-        let base = state_with_app_quota("sherlock", "Audit Log Limit", "2");
-
-        // Under: 0 entries < 2
-        let status = check_quota(&base, "sherlock", Resource::AuditLogEntries);
-        assert_eq!(status.usage, 0);
-        assert_eq!(status.limit, 2);
-        assert!(!status.exceeded);
-
-        // At limit: 2 entries >= 2 — exceeded
-        let state = cell_push("audit_log",
-            fact_from_pairs(&[("op", "a")]),
-            &cell_push("audit_log", fact_from_pairs(&[("op", "b")]), &base));
-        let status = check_quota(&state, "sherlock", Resource::AuditLogEntries);
-        assert_eq!(status.usage, 2);
-        assert!(status.exceeded);
-    }
-
-    #[test]
     fn check_quota_no_declared_limit_never_exceeds() {
-        let state = cell_push("audit_log", fact_from_pairs(&[("op", "a")]), &Object::phi());
-        let status = check_quota(&state, "sherlock", Resource::AuditLogEntries);
-        assert_eq!(status.usage, 1);
+        let state = Object::phi();
+        let status = check_quota(&state, "sherlock", Resource::CpuNanos);
+        assert_eq!(status.usage, 0);
         assert_eq!(status.limit, u64::MAX);
         assert!(!status.exceeded);
     }
