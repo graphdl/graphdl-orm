@@ -2798,10 +2798,17 @@ fn platform_apply_command(x: &Object, d: &Object) -> Object {
         _ => d.clone(),
     };
     let result = crate::command::apply_command_defs(&dispatch_state, &command, &dispatch_state);
-    match serde_json::to_string(&result) {
-        Ok(s) => Object::atom(&s),
-        Err(e) => Object::atom(&format!("⊥ {}", e)),
-    }
+    // #766: return the `{__state_delta, __result}` Map carrier the
+    // writer-dispatcher (`lib.rs::classify_writer_result`) recognises as
+    // CommitDelta. Before this change we stringified the CommandResult
+    // into an Object::atom, which fell into `NoCommit` — the apply
+    // looked successful but no chain entry was ever appended. The Map
+    // carrier slots straight into `merge_delta`, extending each touched
+    // cell's chain so `cell_pin` reflects the new version. The encoded
+    // `__result` body uses the same compact JSON `decode_command_result`
+    // already round-trips, so worker callers that read `__result` get
+    // the exact same envelope shape they would have seen pre-#766.
+    crate::command::encode_command_result(&result)
 }
 
 /// Merge a JS-side population JSON (`{"facts":[{factType, subject?,

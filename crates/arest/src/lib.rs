@@ -1381,6 +1381,9 @@ fn is_read_only_op(key: &str) -> bool {
     matches!(
         key,
         "debug" | "audit" | "verify_signature" | "snapshots" | "select_component"
+        // #765: fetch_cell is a pure projection over snapshot_d (peer of
+        // cell_pin) — host adapters route their cell reads through it.
+        | "fetch_cell"
     )
     || key.starts_with("list:")
     || key.starts_with("get:")
@@ -1758,6 +1761,24 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         return match ast::cell_pin(&snapshot, input) {
             Some(id) => id.to_string(),
             None => "⊥".into(),
+        };
+    }
+
+    // #765: read-side peer of `cell_pin`. Worker EntityDB and other
+    // host adapters use `system(h, "fetch_cell", name)` to read a cell's
+    // current contents straight from the engine snapshot — keeping the
+    // host's per-cell sidecar (SQL row, KV blob) from drifting from the
+    // engine's authoritative chain. Returns the contents as JSON via
+    // `to_json_string` (atom payloads become JSON strings, Maps become
+    // objects, Seqs become arrays); absent cells surface as `"⊥"` so
+    // worker fallback paths can detect them. Read-only — runs under the
+    // shared lock per `is_read_only_op("fetch_cell")`.
+    if key == "fetch_cell" {
+        let snapshot = tenant.read().snapshot_d();
+        let result = ast::fetch(input, &snapshot);
+        return match result {
+            ast::Object::Bottom => "⊥".into(),
+            obj => obj.to_json_string(),
         };
     }
 
@@ -2991,6 +3012,59 @@ Order has total.
         release_impl(h);
     }
 
+    /// #766 — `system(h, "apply", <CreateEntity JSON>)` must extend the
+    /// per-cell version chain. Before this fix `platform_apply_command`
+    /// returned an `Object::atom(JSON.stringify(result))`, which
+    /// `classify_writer_result` slotted into NoCommit — the call
+    /// returned the JSON envelope but never appended a VersionEntry, so
+    /// every touched cell stayed at `cell_pin = ⊥`. After the fix the
+    /// platform handler returns the `{__state_delta, __result}` Map
+    /// carrier the classifier recognises as CommitDelta, which goes
+    /// through `merge_delta` and appends a per-cell entry. Observable:
+    /// at least one cell touched by the apply carries `cell_pin ≥ 1`.
+    #[test]
+    fn apply_extends_chain_on_at_least_one_touched_cell() {
+        let h = create_impl();
+
+        let readings = "\
+Order(.id) is an entity type.
+Order has total.
+  Each Order has at most one total.
+";
+        let compile_out = system_impl(h, "compile", readings);
+        assert!(!compile_out.starts_with('⊥'),
+            "compile must not reject simple Order schema, got: {compile_out}");
+
+        // Use the `apply` verb with a raw CreateEntity JSON Command —
+        // the path that goes through `platform_apply_command`. Empty
+        // domain because the test schema has no Domain fact.
+        let cmd_json = r#"{"type":"createEntity","noun":"Order","domain":"","id":"ord-1","fields":{"total":"100"}}"#;
+        let apply_out = system_impl(h, "apply", cmd_json);
+        assert!(!apply_out.starts_with('⊥'),
+            "apply must not return ⊥ on a well-formed CreateEntity command, got: {apply_out}");
+
+        // Scan every cell in the post-apply snapshot. After CommitDelta
+        // through `merge_delta`, at least one touched cell carries a
+        // version chain — the contract this commit re-establishes.
+        // Pre-#766 the platform handler returned an Object::atom and the
+        // classifier dropped it into NoCommit, so merge_delta never ran
+        // and no cell carried a version_id.
+        let snapshot = peek(h).expect("handle must be live after apply");
+        let chain_cells: Vec<&str> = ast::cells_iter(&snapshot).into_iter()
+            .filter_map(|(name, _)| ast::cell_pin(&snapshot, name).map(|_| name))
+            .collect();
+        assert!(
+            !chain_cells.is_empty(),
+            "apply must extend the chain on at least one cell; \
+             after `system(h, \"apply\", <CreateEntity JSON>)` no cell carried a version_id. \
+             This is the #766 regression: platform_apply_command returned \
+             an Object::atom, classify_writer_result slotted it into \
+             NoCommit, and merge_delta never ran."
+        );
+
+        release_impl(h);
+    }
+
     /// Profiling invocation — runs the same create/list/get workload as
     /// `list_and_get_see_runtime_created_entities` with the apply-
     /// variant profiler enabled, then dumps the histogram to stderr.
@@ -3206,6 +3280,58 @@ Order has total.
     #[test]
     fn cell_pin_handler_on_invalid_handle_returns_bottom() {
         assert_eq!(system_impl(u32::MAX, "cell_pin", "Noun"), "⊥");
+    }
+
+    // ── #765: fetch_cell handler ──────────────────────────────────────
+    //
+    // Worker EntityDB and other host adapters need a read-side peer to
+    // `cell_pin`: given a cell name, return its current contents as JSON
+    // (or "⊥" if absent). With this verb in place, host code routes its
+    // cell reads through the engine's snapshot just like the chain-bump
+    // path routes writes through `apply` — keeping the worker's per-cell
+    // SQL sidecar from drifting from the engine's authoritative chain.
+
+    #[test]
+    fn fetch_cell_handler_round_trips_atom_payload() {
+        let h = alloc_with_noun("ord-1");
+        let out = system_impl(h, "fetch_cell", "Noun");
+        // Atom payload is rendered as a JSON string by `to_json_string`.
+        assert_eq!(out, "\"ord-1\"",
+            "fetch_cell must return the cell contents as JSON; got: {out}");
+        release_impl(h);
+    }
+
+    #[test]
+    fn fetch_cell_handler_returns_bottom_for_missing_cell() {
+        let h = alloc_with_noun("present");
+        assert_eq!(system_impl(h, "fetch_cell", "AbsentCell"), "⊥",
+            "absent cells must surface as ⊥ so worker fallback paths fire");
+        release_impl(h);
+    }
+
+    #[test]
+    fn fetch_cell_handler_unwraps_chain_to_latest_version() {
+        // alloc_with_chain installs a real chain; fetch_cell must return
+        // the latest contents — not the raw chain wrapper.
+        let h = alloc_with_chain("Noun", &["v1", "v2", "v3"]);
+        let out = system_impl(h, "fetch_cell", "Noun");
+        assert_eq!(out, "\"v3\"",
+            "fetch_cell must unwrap the chain and return the latest version's contents");
+        release_impl(h);
+    }
+
+    #[test]
+    fn fetch_cell_handler_on_invalid_handle_returns_bottom() {
+        assert_eq!(system_impl(u32::MAX, "fetch_cell", "Noun"), "⊥");
+    }
+
+    #[test]
+    fn fetch_cell_is_recognised_as_read_only_op() {
+        // Concurrency invariant: fetch_cell must take the shared (read)
+        // lock so two readers don't serialise behind each other. If this
+        // ever flips to the write path, parallel reads degrade.
+        assert!(is_read_only_op("fetch_cell"),
+            "fetch_cell is a pure projection over snapshot_d; must run under read()");
     }
 
     // ── S1g (#723): compact handler ─────────────────────────────────
