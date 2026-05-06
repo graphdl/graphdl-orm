@@ -3145,8 +3145,8 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
 /// consequent fact with the combined bindings.
 ///
 /// This implements the relational equi-join needed for rules like:
-///   Vehicle is resolved to Chrome Style Candidate
-///     := Vehicle has Squish VIN
+///   Vehicle is resolved to Chrome Style Candidate iff
+///     Vehicle has Squish VIN
 ///     and Chrome Style Candidate has that Squish VIN
 ///     and some Listing has that VIN
 ///     and that Listing has Listing Trim

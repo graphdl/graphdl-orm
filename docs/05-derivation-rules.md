@@ -46,7 +46,7 @@ The conditional form `If ... then ...` is also recognized for rules whose conseq
 If some User authenticates and that User does not own any Organization then that User owns some Organization.
 ```
 
-`:=` is retired. It came from pre-ORM 1 BNF-style grammar derivations and is no longer accepted as canonical syntax for new readings. The parser still tolerates it for backward compatibility during migration, but new rules should use the marker + iff/if form.
+`:=` is removed. It came from pre-ORM 1 BNF-style grammar derivations and is no longer recognized by the parser. Use the marker + iff/if form.
 
 ## Anaphora
 

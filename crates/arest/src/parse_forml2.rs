@@ -666,8 +666,7 @@ pub(crate) fn join_derivation_continuations_cow(input: &str) -> Vec<alloc::borro
             || stripped.starts_with("** ")
             || stripped.starts_with("+ ")
             || stripped.contains(" iff ")
-            || (stripped.contains(" if ") && !stripped.starts_with("If "))
-            || stripped.contains(" := ");
+            || (stripped.contains(" if ") && !stripped.starts_with("If "));
         if !is_derivation_head || line.trim_end().ends_with('.') {
             out.push(Cow::Borrowed(line));
             i += 1;
@@ -971,11 +970,10 @@ fn resolve_derivation_rule(
     // rule as a Join derivation.  Only the antecedent portion is rewritten;
     // the consequent is left unchanged.
     if rule.text.contains("'s ") {
-        // Split off everything up to and including the iff/if/`:=` keyword,
+        // Split off everything up to and including the iff/if keyword,
         // expand only the antecedent portion, then reassemble.
-        let sep_offset = rule.text.find(" := ")
-            .map(|i| (i, i + 4))
-            .or_else(|| rule.text.find(" iff ").map(|i| (i, i + 5)))
+        let sep_offset = rule.text.find(" iff ")
+            .map(|i| (i, i + 5))
             .or_else(|| rule.text.find(" if ").map(|i| (i, i + 4)));
         if let Some((sep_start, sep_end)) = sep_offset {
             let consequent_part = &rule.text[..sep_start];
@@ -987,12 +985,10 @@ fn resolve_derivation_rule(
         }
     }
 
-    // Split on " := ", " iff ", or " if " to get (consequent, antecedent_text)
+    // Split on " iff " or " if " to get (consequent, antecedent_text)
     let (consequent_text, antecedent_raw) = rule.text
-        .find(" := ")
-        .map(|i| (&rule.text[..i], &rule.text[i + 4..]))
-        .or_else(|| rule.text.find(" iff ")
-            .map(|i| (&rule.text[..i], &rule.text[i + 5..])))
+        .find(" iff ")
+        .map(|i| (&rule.text[..i], &rule.text[i + 5..]))
         .or_else(|| rule.text.find(" if ")
             .map(|i| (&rule.text[..i], &rule.text[i + 4..])))
         .unwrap_or((&rule.text, ""));
