@@ -108,9 +108,9 @@ pub mod row_shape;
 // cfg-selects between `std::time::Instant` (native std) and a
 // zero-duration stub (wasm + no_std). Every `serde_json::*` call site
 // is gated on either `std-deps` (the lossless JSON paths in
-// `cell_index_from_state` for ConstraintDef / DerivationRuleDef /
-// StateMachineDef) or `debug-def` (the `debug` def projection), both
-// of which are off in the kernel build. `std::collections::HashSet`
+// `cell_index_from_state` for ConstraintDef / DerivationRuleDef) or
+// `debug-def` (the `debug` def projection), both of which are off in
+// the kernel build. `std::collections::HashSet`
 // uses live in `#[cfg(test)] mod schema_tests`, which only compiles
 // in the host build. All `crate::rmap::*` reaches target the
 // no_std-clean helpers (#653 prep). Lifting so the kernel and stage-2

@@ -666,8 +666,9 @@ Thing has Arity.
 
 // ─── State machine derivation (#759 / Audit MC3b-a) ────────────────
 //
-// readings/core/state.md adds a derivation rule that mirrors Pass 2 of
-// `derive_state_machines_from_facts` (compile.rs:385-401):
+// readings/core/state.md adds a derivation rule that captures Pass 2 of
+// the SM assembly (the same logic the now-retired
+// `derive_state_machines_from_facts` carried in compile.rs):
 //   • A `Status is initial in SM` instance fact also derives the
 //     corresponding `Status is defined in SM` fact.
 //   • A direct `Status is defined in SM` instance fact lands in the
@@ -789,9 +790,9 @@ Status 'Placed' is defined in State Machine Definition 'OrderSM'.
 
 // ─── Pass 4: graph-derived initial Status (#760 / Audit MC3b-b) ─────
 //
-// readings/core/state.md adds a Pass-4 derivation rule that mirrors
-// the topology fold in `derive_state_machines_from_facts` at
-// compile.rs:479-505:
+// readings/core/state.md adds a Pass-4 derivation rule that captures
+// the topology fold the now-retired `derive_state_machines_from_facts`
+// used to perform in compile.rs:
 //
 //   A Status is "rooted" in a State Machine Definition iff some
 //   Transition in that SM has it as source AND no Transition in that

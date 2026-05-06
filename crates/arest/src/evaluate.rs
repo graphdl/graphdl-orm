@@ -615,8 +615,22 @@ mod tests {
     use hashbrown::HashMap;
     use crate::types::{
         ConstraintDef, DerivationRuleDef, FactTypeDef, GeneralInstanceFact, NounDef,
-        RoleDef, SpanDef, StateMachineDef, WorldAssumption,
+        RoleDef, SpanDef, TransitionDef, WorldAssumption,
     };
+
+    // Test-only SM fixture. The production SM compile path is fully
+    // cell-driven (#763) — there's no public typed `StateMachineDef`
+    // in flight any more. This struct exists solely so the existing
+    // test corpora that build SMs by literal can stay readable; the
+    // `with_state_machine` helper below fans these fields out to the
+    // normalized SM cells the compile path actually consumes.
+    #[derive(Debug, Clone, Default)]
+    struct StateMachineDef {
+        noun_name: String,
+        statuses: Vec<String>,
+        transitions: Vec<TransitionDef>,
+        initial: String,
+    }
 
     fn empty_state() -> ast::Object {
         ast::Object::phi()
@@ -696,15 +710,8 @@ mod tests {
         cells
     }
 
-    /// Push SM cells.
-    ///
-    /// MC3b-d (#762): in addition to the legacy JSON-blob `StateMachine`
-    /// cell (kept as fallback per #748 — only deleted in #763), populate
-    /// the normalized SM cells that `compile_state_machine_from_cells`
-    /// (#761) reads. Each test corpus then exercises BOTH compile paths
-    /// in one shot via `compile_data_with_state` (which tries the cell-
-    /// driven path first and falls back to the JSON-blob/typed-struct
-    /// path when the normalized cells are empty).
+    /// Push SM cells (cell-driven path only — #763 retired the JSON-blob
+    /// `StateMachine` cell and the typed-struct fallback).
     ///
     /// Cell shapes match what the parser's instance-fact fanout would
     /// emit for the equivalent FORML 2 statements declared in
@@ -727,15 +734,8 @@ mod tests {
     /// forward-chaining over the Transition cells. The consumer-side
     /// uniqueness gate in `compile_state_machine_from_cells` enforces
     /// |rooted| == 1 ⇒ promote-to-initial; ambiguity leaves initial
-    /// empty (matches the typed path's behaviour at compile.rs:5169).
+    /// empty so the runtime fails visibly at first SM call.
     fn with_state_machine(mut cells: S, name: &str, sm: &StateMachineDef) -> S {
-        // -- Legacy JSON-blob path (fallback). ----------------------------
-        let json = serde_json::to_string(sm).unwrap_or_default();
-        cells.entry("StateMachine".into()).or_default().push(ast::fact_from_pairs(&[
-            ("name", name), ("json", json.as_str()),
-        ]));
-
-        // -- Cell-driven path (#761 consumer). ----------------------------
         // SM-for-Noun: binds the SM definition to the noun it governs.
         cells.entry("State_Machine_Definition_is_for_Noun".into()).or_default().push(
             ast::fact_from_pairs(&[
@@ -794,11 +794,10 @@ mod tests {
         }
 
         // Pass 4 rooted-cell computation. Mirrors the source-never-
-        // target topology fold in `derive_state_machines_from_facts`
-        // (compile.rs:479-505) and the parser-side derivation rule in
-        // readings/core/state.md. Only emits when no explicit initial
-        // exists — when an explicit initial is present it always wins
-        // and the rooted cell is unused.
+        // target topology fold the parser-side derivation rule in
+        // readings/core/state.md produces. Only emits when no explicit
+        // initial exists — when an explicit initial is present it
+        // always wins and the rooted cell is unused.
         if sm.initial.is_empty() {
             // Source set: from-Statuses across all transitions.
             // Target set: to-Statuses across all transitions.
@@ -3512,204 +3511,15 @@ mod tests {
             "expected no classification facts, got {:?}", hits);
     }
 
-    // ── MC3b-d (#762) parity: cell-driven SM ⇋ JSON-blob SM ──────────
-    //
-    // Sibling task #761 (compile.rs) already proved cell-driven and
-    // typed-struct compile parity at the *compiler* level. This test
-    // pins the same parity at the *eval* site: the same SM corpus,
-    // first compiled via the legacy JSON-blob path only and then via
-    // the normalized-cell path only, must produce identical
-    // run-to-completion outputs through `run_machine_defs`.
-    //
-    // Coverage strategy: split helpers that emit ONE side or the OTHER,
-    // never both — the default `with_state_machine` helper above pushes
-    // both shapes (so every other test exercises the cell-driven-first
-    // path with the JSON-blob fallback already wired in
-    // `compile_data_with_state` per #761). These two single-path helpers
-    // exist solely to expose each branch in isolation for parity assertion.
-
-    /// Push only the legacy JSON-blob `StateMachine` cell — exercises
-    /// `compile_state_machine` via `derive_state_machines_from_facts`.
-    /// `compile_state_machine_from_cells` returns None (no
-    /// `State_Machine_Definition_is_for_Noun` fact) and the typed path
-    /// runs.
-    fn with_state_machine_legacy_only(mut cells: S, name: &str, sm: &StateMachineDef) -> S {
-        let json = serde_json::to_string(sm).unwrap_or_default();
-        cells.entry("StateMachine".into()).or_default().push(ast::fact_from_pairs(&[
-            ("name", name), ("json", json.as_str()),
-        ]));
-        cells
-    }
-
-    /// Push only the normalized SM cells — exercises
-    /// `compile_state_machine_from_cells` (#761). The legacy
-    /// JSON-blob cell stays absent so the cell-driven path is the only
-    /// way `compile_data_with_state` finds the SM. Mirrors the cell
-    /// fanout the parser would emit for the equivalent FORML 2 facts
-    /// (and matches the cell shapes used by the compile.rs parity tests
-    /// at compile.rs:7027-7056).
-    fn with_state_machine_cells_only(mut cells: S, name: &str, sm: &StateMachineDef) -> S {
-        cells.entry("State_Machine_Definition_is_for_Noun".into()).or_default().push(
-            ast::fact_from_pairs(&[
-                ("State Machine Definition", name),
-                ("Noun", sm.noun_name.as_str()),
-            ]));
-        if !sm.initial.is_empty() {
-            cells.entry("Status_is_initial_in_State_Machine_Definition".into()).or_default()
-                .push(ast::fact_from_pairs(&[
-                    ("Status", sm.initial.as_str()),
-                    ("State Machine Definition", name),
-                ]));
-        }
-        for s in &sm.statuses {
-            cells.entry("Status_is_defined_in_State_Machine_Definition".into()).or_default()
-                .push(ast::fact_from_pairs(&[
-                    ("Status", s.as_str()),
-                    ("State Machine Definition", name),
-                ]));
-        }
-        for t in &sm.transitions {
-            let t_name = t.event.as_str();
-            cells.entry("Transition_is_defined_in_State_Machine_Definition".into()).or_default()
-                .push(ast::fact_from_pairs(&[
-                    ("Transition", t_name),
-                    ("State Machine Definition", name),
-                ]));
-            cells.entry("Transition_is_from_Status".into()).or_default()
-                .push(ast::fact_from_pairs(&[
-                    ("Transition", t_name),
-                    ("Status", t.from.as_str()),
-                ]));
-            cells.entry("Transition_is_to_Status".into()).or_default()
-                .push(ast::fact_from_pairs(&[
-                    ("Transition", t_name),
-                    ("Status", t.to.as_str()),
-                ]));
-            cells.entry("Transition_is_triggered_by_Fact_Type".into()).or_default()
-                .push(ast::fact_from_pairs(&[
-                    ("Transition", t_name),
-                    ("Fact Type", t.event.as_str()),
-                ]));
-        }
-        // Pass-4 rooted derivation (#760) — only emit when no explicit
-        // initial, mirroring the consumer-side uniqueness gate in
-        // `compile_state_machine_from_cells`.
-        if sm.initial.is_empty() {
-            let sources: Vec<&str> = sm.transitions.iter()
-                .map(|t| t.from.as_str()).collect();
-            let targets: Vec<&str> = sm.transitions.iter()
-                .map(|t| t.to.as_str()).collect();
-            let mut seen: Vec<&str> = Vec::new();
-            for s in &sources {
-                if !targets.contains(s) && !seen.contains(s) {
-                    seen.push(*s);
-                    cells.entry("Status_is_rooted_in_State_Machine_Definition".into())
-                        .or_default()
-                        .push(ast::fact_from_pairs(&[
-                            ("Status", s),
-                            ("State Machine Definition", name),
-                        ]));
-                }
-            }
-        }
-        cells
-    }
-
-    #[test]
-    fn parity_eval_cell_driven_vs_json_blob_state_machine() {
-        // Tiny corpus: one SM with explicit initial, three statuses,
-        // three transitions covering happy path + branch + dead end.
-        let sm = StateMachineDef {
-            noun_name: "Order".to_string(),
-            statuses: vec![
-                "Draft".to_string(),
-                "Placed".to_string(),
-                "Shipped".to_string(),
-                "Cancelled".to_string(),
-            ],
-            transitions: vec![
-                TransitionDef { from: "Draft".to_string(),  to: "Placed".to_string(),    event: "place".to_string(),  guard: None },
-                TransitionDef { from: "Placed".to_string(), to: "Shipped".to_string(),   event: "ship".to_string(),   guard: None },
-                TransitionDef { from: "Draft".to_string(),  to: "Cancelled".to_string(), event: "cancel".to_string(), guard: None },
-            ],
-            initial: "Draft".to_string(),
-        };
-
-        // Build via the JSON-blob path only.
-        let legacy_cells = with_state_machine_legacy_only(empty_cells(), "OrderSM", &sm);
-        let (_legacy_state, legacy_defs, legacy_def_map) = compile_cells(legacy_cells);
-
-        // Build via the normalized-cell path only.
-        let cell_cells = with_state_machine_cells_only(empty_cells(), "OrderSM", &sm);
-        let (_cell_state, cell_defs, cell_def_map) = compile_cells(cell_cells);
-
-        // Representative event sequences — happy path, branch path,
-        // invalid event (Func falls through to Selector(1) returning
-        // current state), and unknown-event-from-terminal cases.
-        let cases: &[&[&str]] = &[
-            &["place", "ship"],              // Draft → Placed → Shipped
-            &["cancel"],                     // Draft → Cancelled
-            &["place", "cancel"],            // Draft → Placed → (no-op) Placed
-            &["ship"],                       // (no-op from Draft) Draft
-            &["place", "ship", "cancel"],    // Draft → Placed → Shipped → (no-op) Shipped
-            &[],                             // initial-only
-        ];
-        for events in cases {
-            let legacy_out = run_machine_defs(&legacy_defs, &legacy_def_map, "Order", events);
-            let cell_out   = run_machine_defs(&cell_defs,   &cell_def_map,   "Order", events);
-            assert_eq!(legacy_out, cell_out,
-                "parity break for events {:?}: legacy JSON-blob -> {:?}, \
-                 cell-driven -> {:?}", events, legacy_out, cell_out);
-        }
-    }
-
-    #[test]
-    fn parity_eval_cell_driven_vs_json_blob_graph_derived_initial() {
-        // No explicit initial — both paths must derive the same initial
-        // from graph topology (Pass 4 / source-never-target).
-        // Draft is the unique source-never-target.
-        let sm = StateMachineDef {
-            noun_name: "Order".to_string(),
-            statuses: vec![
-                "Draft".to_string(),
-                "Placed".to_string(),
-                "Shipped".to_string(),
-            ],
-            transitions: vec![
-                TransitionDef { from: "Draft".to_string(),  to: "Placed".to_string(),  event: "place".to_string(), guard: None },
-                TransitionDef { from: "Placed".to_string(), to: "Shipped".to_string(), event: "ship".to_string(),  guard: None },
-            ],
-            initial: String::new(),
-        };
-
-        let legacy_cells = with_state_machine_legacy_only(empty_cells(), "OrderSM", &sm);
-        let (_l_state, legacy_defs, legacy_def_map) = compile_cells(legacy_cells);
-
-        let cell_cells = with_state_machine_cells_only(empty_cells(), "OrderSM", &sm);
-        let (_c_state, cell_defs, cell_def_map) = compile_cells(cell_cells);
-
-        // Initial must agree: both paths derive "Draft".
-        let legacy_initial = run_machine_defs(&legacy_defs, &legacy_def_map, "Order", &[]);
-        let cell_initial   = run_machine_defs(&cell_defs,   &cell_def_map,   "Order", &[]);
-        assert_eq!(legacy_initial, "Draft",
-            "JSON-blob path must derive Draft as graph-initial; got {:?}", legacy_initial);
-        assert_eq!(cell_initial, legacy_initial,
-            "cell-driven path must agree on graph-derived initial; got {:?} vs legacy {:?}",
-            cell_initial, legacy_initial);
-
-        // Run-to-completion parity for the chain.
-        let cases: &[&[&str]] = &[
-            &["place"],
-            &["place", "ship"],
-            &["ship"],          // no-op from Draft
-        ];
-        for events in cases {
-            let legacy_out = run_machine_defs(&legacy_defs, &legacy_def_map, "Order", events);
-            let cell_out   = run_machine_defs(&cell_defs,   &cell_def_map,   "Order", events);
-            assert_eq!(legacy_out, cell_out,
-                "parity break for events {:?}: legacy {:?} vs cell {:?}",
-                events, legacy_out, cell_out);
-        }
-    }
+    // MC3b-e (#763) retired the JSON-blob path. The MC3b-d parity tests
+    // (cell-driven ⇋ JSON-blob, legacy_only / cells_only helpers) were
+    // load-bearing only as long as both paths existed; they're gone with
+    // the JSON-blob path. The remaining SM eval coverage above
+    // (`test_run_machine_via_ast`, `test_initial_status_*`,
+    // `test_run_machine_support_request_lifecycle`,
+    // `test_guarded_transition_blocks_on_violation`, etc.) all build SMs
+    // via `with_state_machine`, which now writes only the normalized
+    // cells — so each of those tests already exercises the cell-driven
+    // compile path end-to-end through `run_machine_defs`.
 }
 
