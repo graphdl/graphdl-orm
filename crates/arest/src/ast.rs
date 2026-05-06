@@ -2572,8 +2572,9 @@ fn platform_rmap(_x: &Object, d: &Object) -> Object {
 /// Platform primitive: signature verification (AREST §5.5).
 /// Input: seq<atom, atom, atom> — (sender, payload, signature).
 /// Output: atom("true"|"false"), or Object::Bottom on malformed input.
-/// Wired through crate::crypto::verify_signature — currently a
-/// DefaultHasher MAC placeholder; swap to HMAC-SHA256 when upgrading.
+/// Wired through crate::crypto::verify_signature — HMAC-SHA256 over
+/// (sender || "::" || payload), constant-time hex compare via `subtle`.
+/// Key from AREST_HMAC_KEY env (production) or DEV_KEY fallback.
 #[cfg(not(feature = "no_std"))]
 fn platform_verify_signature(x: &Object) -> Object {
     let parts = match x.as_seq() {
