@@ -2322,12 +2322,42 @@ fn compile_data_with_state(
     // the JSON-blob / facts-derived path still runs for unmigrated
     // corpora and freeze fixtures. Per #748, the JSON-blob path is
     // only deleted in #763.
-    let state_machines: Vec<CompiledStateMachine> = sm_source.values()
-        .map(|sm_def| {
-            state
-                .and_then(|s| compile_state_machine_from_cells(
-                    &sm_def.noun_name, s, &constraints))
-                .unwrap_or_else(|| compile_state_machine(sm_def, &constraints))
+    //
+    // MC3b-d (#762): the noun *enumeration* must also union the
+    // cell-driven discovery (`discover_sm_nouns_from_cells`) with the
+    // legacy `sm_source` keys. Without that, a corpus whose only SM
+    // signal is the normalized cells (no JSON-blob StateMachine cell,
+    // no `derive_state_machines_from_facts`-shaped general_instance_facts)
+    // would compile zero state machines despite having SM cells. The
+    // per-noun compile call below still tries cell-driven first and
+    // falls back to the typed path when an `sm_def` is available.
+    // `sm_source` is keyed by SM definition name; the noun is on
+    // `sm_def.noun_name`. The cell-driven enumerator returns nouns
+    // directly. Build a noun-keyed work list, taking nouns from the
+    // legacy source first (so order matches existing baselines) then
+    // appending any cell-only nouns we haven't seen yet. For each noun,
+    // try the cell-driven compile path first; on None, fall back to
+    // the typed-struct path via the legacy `StateMachineDef`.
+    let cell_sm_nouns: Vec<String> = state
+        .map(discover_sm_nouns_from_cells)
+        .unwrap_or_default();
+    let mut all_sm_nouns: Vec<String> = sm_source.values()
+        .map(|d| d.noun_name.clone())
+        .collect();
+    for n in &cell_sm_nouns {
+        if !all_sm_nouns.contains(n) { all_sm_nouns.push(n.clone()); }
+    }
+    let state_machines: Vec<CompiledStateMachine> = all_sm_nouns.iter()
+        .filter_map(|noun| {
+            let cell_compiled = state.and_then(|s|
+                compile_state_machine_from_cells(noun, s, &constraints));
+            if let Some(c) = cell_compiled { return Some(c); }
+            // No cell-driven SM for this noun — fall back to the typed
+            // path if `sm_source` has a def whose noun matches. Skip
+            // otherwise.
+            sm_source.values()
+                .find(|d| d.noun_name == *noun)
+                .map(|d| compile_state_machine(d, &constraints))
         })
         .collect();
     diag!("  [profile] {} state machines: {:?}", state_machines.len(), t1.elapsed());
@@ -5341,6 +5371,33 @@ fn compile_state_machine(
 /// empty/degenerate `CompiledStateMachine` whose transition Func is
 /// `Selector(1)` (return current state) — same shape the typed-struct
 /// path emits for empty `def.transitions`.
+///
+/// MC3b-d (#762) sibling: `discover_sm_nouns_from_cells` (below) lists
+/// every Noun bound to an SM via the normalized cells, so callers
+/// (`compile_data_with_state` in particular) can iterate the
+/// cell-driven SM set independently of the JSON-blob /
+/// `derive_state_machines_from_facts` discovery sources. Without it,
+/// the cell-driven compile path only fires for nouns that *also* have
+/// a JSON-blob StateMachine cell or a derivable `general_instance_facts`
+/// shape — ignoring corpora whose only SM signal is the normalized
+/// cells. The parity tests in evaluate.rs (#762) caught this gap.
+fn discover_sm_nouns_from_cells(cells: &crate::ast::Object) -> Vec<String> {
+    use crate::ast::{fetch_or_phi, binding};
+    fetch_or_phi("State_Machine_Definition_is_for_Noun", cells)
+        .as_seq()
+        .map(|facts| {
+            let mut seen: Vec<String> = Vec::new();
+            for f in facts {
+                if let Some(n) = binding(f, "Noun") {
+                    let s = n.to_string();
+                    if !seen.contains(&s) { seen.push(s); }
+                }
+            }
+            seen
+        })
+        .unwrap_or_default()
+}
+
 fn compile_state_machine_from_cells(
     noun_name: &str,
     cells: &crate::ast::Object,
