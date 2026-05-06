@@ -73,9 +73,9 @@ It is possible that the same Domain Change proposes more than one Model Element.
 
 It is obligatory that each Domain Change has exactly one Rationale.
 
-It is forbidden that a Domain Change targeting Domain 'evolution' is applied without Signal Source 'Human'.
-It is forbidden that a Domain Change targeting Domain 'organizations' is applied without Signal Source 'Human'.
 It is forbidden that a Domain Change targeting Domain 'core' is applied without Signal Source 'Human'.
+It is forbidden that a Domain Change targeting Domain 'evolution' is applied without Signal Source 'Human'.
+It is forbidden that a Domain Change targeting Domain 'ethics' is applied without Signal Source 'Human'.
 
 ## Derivation Rules
 
