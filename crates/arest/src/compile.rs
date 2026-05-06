@@ -3214,7 +3214,17 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
             .map(|(_, ri)| *ri)
     };
 
-    // Extract facts per antecedent
+    // Extract facts per antecedent.
+    //
+    // #814 audit: this branch does NOT apply `rule.antecedent_role_literals`
+    // — the literal-value filters that compile_explicit_derivation
+    // wraps in Filter at line ~2841. A user-authored Join rule of the
+    // form `X has Lift Priority 'P' iff some X has Mode 'M' and that X
+    // has Kind 'K'` will see both literal filters silently dropped, and
+    // the engine joins the unfiltered Mode and Kind populations. The
+    // fix is to reuse the `extract` closure from compile_explicit_derivation
+    // (which Filter-wraps the extractor when preds_by_idx[idx] is
+    // non-empty). Tracked as #814b.
     let fact_extractors: Vec<Func> = antecedent_ids.iter()
         .map(|ft_id| extract_facts_from_pop(ft_id))
         .collect();
