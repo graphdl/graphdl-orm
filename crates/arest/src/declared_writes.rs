@@ -106,6 +106,22 @@ fn is_protected_metamodel(cell: &str) -> bool {
 /// consult this — they're shared by trusted engine paths that should
 /// bypass caps (write to `runtime_registered_names`, audit trails,
 /// Citation provenance, etc.).
+///
+/// #810 audit: rule 1 is the documented bypass. It's safe **only** for
+/// callers that fall into one of these categories:
+///   - Compile machinery (compile.rs, parser, generators) — body is
+///     compiler-authored, not user-authored.
+///   - Kernel paths (no_std build) — `is_store_allowed` is hard-wired
+///     to `true` and there is no user-code threat surface.
+///   - Engine paths driven by Func::Def lookup — `defs_writes_scope`
+///     pushes caps from `allowed_writes:{name}` if present, otherwise
+///     the body runs under the empty stack. This is safe **only when**
+///     the def's body is compiler-authored.
+/// The hole #810a tracks: a user-authored derivation whose consequent
+/// is `AntecedentRole`, Join, or Aggregate gets no cap emission today
+/// (compile.rs:1152 filters out non-Literal consequents), so its body
+/// runs under the empty stack. Strict mode should compute the
+/// consequent FT name at compile time for every consequent kind.
 #[cfg(not(feature = "no_std"))]
 pub fn is_store_allowed(cell: &str) -> bool {
     CAP_STACK.with(|s| {

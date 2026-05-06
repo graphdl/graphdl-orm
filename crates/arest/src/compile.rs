@@ -1149,6 +1149,16 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // unrestricted, which preserves legacy behavior for all rules the
     // compiler itself owns. User readings never emit "*"; only kernel
     // paths would, and this loop never writes the wildcard.
+    //
+    // #810 audit: this filter ALSO skips user rules whose consequent is
+    // `AntecedentRole` (dynamic cell-id from antecedent binding), Join,
+    // or Aggregate — `literal.is_empty()` returns true for those, so
+    // the early-return on line below means they run unrestricted under
+    // an empty cap stack. The threat is bounded because the compiler
+    // (not the user) authors the body's Func::Store targets, but a
+    // future strict-mode pass should compute the consequent FT name at
+    // compile time for every consequent kind and emit caps uniformly.
+    // Tracked as #810a.
     defs.extend(model.derivations.iter()
         .filter_map(|compiled| {
             // Match by `text` rather than `id`: parse_forml2::re_resolve_rules
