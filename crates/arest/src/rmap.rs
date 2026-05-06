@@ -934,6 +934,106 @@ pub struct EntityCellRouting {
     pub field_value: String,
 }
 
+/// Snapshot-level cache of state-derived data needed for entity-cell
+/// routing. Build once per snapshot, route many facts cheaply.
+///
+/// `entity_cell_for_fact` and `entity_id_field_name` previously
+/// recomputed `rmap_cell_map(state)` and walked the Noun cell on
+/// every call — fine when called once per apply, regression when
+/// called per fact across a multi-fact delta (see #771). The router
+/// pulls those state-keyed reads up to one pass and caches the three
+/// projections every per-fact call needs:
+///
+///   - shard_map      : `ft_id    -> snake_case absorbing target`
+///   - noun_by_snake  : `to_snake(noun_name) -> noun_name` (PascalCase)
+///   - id_field_by_noun : `noun_name -> referenceScheme field name`
+///
+/// Cache invalidation matches snapshot lifetime: when `merge_delta`
+/// produces a new snapshot, build a new router. The snapshot is the
+/// state, the router is its read view.
+#[derive(Debug, Clone)]
+pub struct EntityCellRouter {
+    shard_map: HashMap<String, String>,
+    noun_by_snake: HashMap<String, String>,
+    id_field_by_noun: HashMap<String, String>,
+}
+
+impl EntityCellRouter {
+    /// Build the router from a snapshot. Pre-computes the rmap shard
+    /// map plus snake-case and reference-scheme indices over the Noun
+    /// cell. One state pass; per-fact routing thereafter is HashMap
+    /// lookups.
+    pub fn new(state: &crate::ast::Object) -> Self {
+        use crate::ast::{fetch_or_phi, binding};
+
+        let shard_map = rmap_cell_map(state);
+
+        let mut noun_by_snake: HashMap<String, String> = HashMap::new();
+        let mut id_field_by_noun: HashMap<String, String> = HashMap::new();
+        if let Some(ns) = fetch_or_phi("Noun", state).as_seq() {
+            for n in ns.iter() {
+                let Some(name) = binding(n, "name") else { continue };
+                noun_by_snake.insert(to_snake(name), name.to_string());
+                let scheme = binding(n, "referenceScheme")
+                    .unwrap_or("id").to_string();
+                id_field_by_noun.insert(name.to_string(), scheme);
+            }
+        }
+
+        EntityCellRouter { shard_map, noun_by_snake, id_field_by_noun }
+    }
+
+    /// Route a single fact (under `ft_id`) to its absorbing entity
+    /// cell, or `None` for self-cells / non-projectable shapes.
+    ///
+    /// Mirrors the per-call `entity_cell_for_fact` semantics exactly,
+    /// but reads pre-computed state projections instead of walking
+    /// the Noun cell and recomputing `rmap_cell_map` per call.
+    pub fn route_fact(
+        &self,
+        ft_id: &str,
+        fact: &crate::ast::Object,
+    ) -> Option<EntityCellRouting> {
+        use crate::ast::binding;
+
+        let target = self.shard_map.get(ft_id)?;
+        let ft_snake = to_snake(ft_id);
+        if *target == ft_snake { return None; }
+
+        let noun_name = self.noun_by_snake.get(target)?.clone();
+        let entity_id = binding(fact, &noun_name)?.to_string();
+
+        let pair = fact.as_seq()?.iter().find_map(|p| {
+            let items = p.as_seq()?;
+            if items.len() != 2 { return None; }
+            let key = items[0].as_atom()?;
+            if key == noun_name { return None; }
+            let val = items[1].as_atom()?;
+            Some((key.to_string(), val.to_string()))
+        })?;
+
+        Some(EntityCellRouting {
+            cell_name: format!("{}:{}", noun_name, entity_id),
+            noun_name,
+            entity_id,
+            field_key: pair.0,
+            field_value: pair.1,
+        })
+    }
+
+    /// Reference-scheme field name for a noun. Defaults to `"id"`.
+    pub fn id_field_for(&self, noun_name: &str) -> &str {
+        self.id_field_by_noun.get(noun_name).map(|s| s.as_str()).unwrap_or("id")
+    }
+
+    /// Borrowed view of the rmap shard map (FT id -> snake target).
+    /// Exposed so callers that already hold a router can drive the
+    /// row-projection loop without rebuilding the map.
+    pub fn shard_map(&self) -> &HashMap<String, String> {
+        &self.shard_map
+    }
+}
+
 /// Compute per-entity cell routing for a fact under FT `ft_id`.
 ///
 /// Consults `rmap_cell_map` to determine whether the FT absorbs into
@@ -947,62 +1047,17 @@ pub struct EntityCellRouting {
 /// junction) or when the fact bindings don't carry the expected
 /// shape (defensive — the apply-path always emits the canonical
 /// `<<noun, entity_id>, <field, value>>` shape).
+///
+/// One-shot helper for callers that route a single fact. For
+/// multi-fact callers (e.g. `augment_delta_with_entity_cells`),
+/// build an `EntityCellRouter` once and use `route_fact` per fact —
+/// this function is implemented in those terms.
 pub fn entity_cell_for_fact(
     state: &crate::ast::Object,
     ft_id: &str,
     fact: &crate::ast::Object,
 ) -> Option<EntityCellRouting> {
-    use crate::ast::{fetch_or_phi, binding};
-
-    // Step 1: rmap routing. Returns the snake_case target — either an
-    // entity table (e.g. "order") or the FT's own junction id
-    // (e.g. "person_teaches_course"). When the target equals the FT
-    // id's snake_case (i.e. the FT's own junction cell), there's no
-    // entity to absorb into; bail out.
-    let shard_map = rmap_cell_map(state);
-    let target = shard_map.get(ft_id)?.clone();
-    let ft_snake = to_snake(ft_id);
-    if target == ft_snake {
-        return None;
-    }
-
-    // Step 2: recover the absorber's PascalCase noun name from the
-    // Noun cell — rmap emits snake_case, but the fact's bindings key
-    // by the schema-declared noun name (PascalCase). Match by snake
-    // equivalence so subtype-resolved roots and compound spellings
-    // both reconcile correctly.
-    let noun_cell = fetch_or_phi("Noun", state);
-    let noun_seq = noun_cell.as_seq().map(|s| s.to_vec()).unwrap_or_default();
-    let noun_name = noun_seq.iter()
-        .filter_map(|n| binding(n, "name"))
-        .find(|name| to_snake(name) == target)?
-        .to_string();
-
-    // Step 3: pull entity_id from the fact's binding for the absorber
-    // noun. The apply-path facts bind the noun key to its entity-id
-    // value (e.g. `<Order, ord-1>`). Use the binding directly.
-    let entity_id = binding(fact, &noun_name)?.to_string();
-
-    // Step 4: extract (field_key, field_value) — every binding in the
-    // fact except the absorber's own (noun, entity_id) pair. For
-    // canonical binary facts there's exactly one such pair; pick the
-    // first to keep the routing deterministic.
-    let pair = fact.as_seq()?.iter().find_map(|p| {
-        let items = p.as_seq()?;
-        if items.len() != 2 { return None; }
-        let key = items[0].as_atom()?;
-        if key == noun_name { return None; }
-        let val = items[1].as_atom()?;
-        Some((key.to_string(), val.to_string()))
-    })?;
-
-    Some(EntityCellRouting {
-        cell_name: format!("{}:{}", noun_name, entity_id),
-        noun_name,
-        entity_id,
-        field_key: pair.0,
-        field_value: pair.1,
-    })
+    EntityCellRouter::new(state).route_fact(ft_id, fact)
 }
 
 /// Reference-scheme field name for a noun (e.g. `"id"` for `Order`).
@@ -1010,14 +1065,11 @@ pub fn entity_cell_for_fact(
 /// from `Order(.id) is an entity type.`); defaults to `"id"`. Used by
 /// the apply path to seed the 3NF row's primary-key column when
 /// materializing per-entity cells.
+///
+/// One-shot helper. Multi-noun callers should build an
+/// `EntityCellRouter` and use `id_field_for` instead.
 pub fn entity_id_field_name(state: &crate::ast::Object, noun_name: &str) -> String {
-    use crate::ast::{fetch_or_phi, binding};
-    let noun_cell = fetch_or_phi("Noun", state);
-    noun_cell.as_seq()
-        .and_then(|ns| ns.iter().find(|n| binding(n, "name") == Some(noun_name)))
-        .and_then(|n| binding(n, "referenceScheme"))
-        .unwrap_or("id")
-        .to_string()
+    EntityCellRouter::new(state).id_field_for(noun_name).to_string()
 }
 
 #[cfg(test)]
@@ -1670,5 +1722,99 @@ mod tests {
         assert!(!rmap_func().has_native(),
             "rmap_func must be free of Native leaves; the migration to \
              Platform is the whole point of H4");
+    }
+
+    /// #771: EntityCellRouter::route_fact must produce the same
+    /// routing as the per-call `entity_cell_for_fact` for every
+    /// (ft_id, fact) pair we throw at both. Pins parity so the perf
+    /// fix is invisible to behaviour. The actual absorption direction
+    /// (which role becomes the absorber under a single-role UC) is
+    /// rmap_cell_map's choice; the parity test only requires that
+    /// direct and router agree.
+    #[test]
+    fn router_route_fact_matches_per_call_entity_cell_for_fact() {
+        let state = make_state(
+            vec![
+                ("Order", "entity"),
+                ("Customer", "entity"),
+                ("Course", "entity"),
+                ("Person", "entity"),
+                ("Total", "value"),
+            ],
+            vec![
+                ("ft_total", "Order has Total", vec![("Order", 0), ("Total", 1)]),
+                ("ft_cust", "Order belongs to Customer",
+                    vec![("Order", 0), ("Customer", 1)]),
+                // Compound UC -> own junction cell (route_fact returns None)
+                ("ft_teach", "Person teaches Course",
+                    vec![("Person", 0), ("Course", 1)]),
+            ],
+            vec![
+                ("UC", vec![("ft_total", 0)]),
+                ("UC", vec![("ft_cust", 0)]),
+                ("UC", vec![("ft_teach", 0), ("ft_teach", 1)]),
+            ],
+        );
+
+        let router = EntityCellRouter::new(&state);
+
+        let cases: Vec<(&str, ast::Object)> = vec![
+            ("ft_total",
+                ast::fact_from_pairs(&[("Order", "ord-1"), ("Total", "100")])),
+            ("ft_cust",
+                ast::fact_from_pairs(&[("Order", "ord-2"), ("Customer", "cust-1")])),
+            ("ft_teach",
+                ast::fact_from_pairs(&[("Person", "alice"), ("Course", "cs101")])),
+            // Unknown FT id — both must miss the shard map identically.
+            ("ft_unknown",
+                ast::fact_from_pairs(&[("Order", "ord-3"), ("Total", "200")])),
+        ];
+
+        for (ft_id, fact) in &cases {
+            let direct = entity_cell_for_fact(&state, ft_id, fact);
+            let routed = router.route_fact(ft_id, fact);
+
+            assert_eq!(direct.is_some(), routed.is_some(),
+                "direct vs router must agree on Some/None for ft = {}", ft_id);
+            if let (Some(d), Some(r)) = (direct, routed) {
+                assert_eq!(d.cell_name,    r.cell_name,    "cell_name parity, ft = {}", ft_id);
+                assert_eq!(d.noun_name,    r.noun_name,    "noun_name parity, ft = {}", ft_id);
+                assert_eq!(d.entity_id,    r.entity_id,    "entity_id parity, ft = {}", ft_id);
+                assert_eq!(d.field_key,    r.field_key,    "field_key parity, ft = {}", ft_id);
+                assert_eq!(d.field_value,  r.field_value,  "field_value parity, ft = {}", ft_id);
+            }
+        }
+
+        // At least one case must route (Some) and at least one must
+        // miss (None) — otherwise we're not exercising both branches.
+        let some_count = cases.iter()
+            .filter(|(ft, f)| router.route_fact(ft, f).is_some()).count();
+        let none_count = cases.iter()
+            .filter(|(ft, f)| router.route_fact(ft, f).is_none()).count();
+        assert!(some_count >= 1, "test fixture must include at least one routable fact");
+        assert!(none_count >= 1, "test fixture must include at least one non-routable fact");
+    }
+
+    /// #771: EntityCellRouter::id_field_for must match the per-call
+    /// entity_id_field_name across nouns with explicit reference
+    /// schemes, default-id fallback, and unknown nouns.
+    #[test]
+    fn router_id_field_for_matches_per_call_entity_id_field_name() {
+        // make_state's entity nouns get referenceScheme="id" by default.
+        let state = make_state(
+            vec![("Order", "entity"), ("Customer", "entity"), ("Total", "value")],
+            vec![
+                ("ft1", "Order has Total", vec![("Order", 0), ("Total", 1)]),
+            ],
+            vec![("UC", vec![("ft1", 0)])],
+        );
+        let router = EntityCellRouter::new(&state);
+
+        for noun in ["Order", "Customer", "Total", "DoesNotExist"] {
+            let direct = entity_id_field_name(&state, noun);
+            let routed = router.id_field_for(noun);
+            assert_eq!(direct, routed,
+                "id_field_for parity must hold for noun = {}", noun);
+        }
     }
 }

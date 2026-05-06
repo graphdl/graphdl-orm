@@ -2154,15 +2154,22 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
 /// cell is absent from the snapshot). Unchanged entity cells are
 /// omitted so unnecessary chain entries are not appended.
 ///
-/// All routing decisions delegate to `rmap::entity_cell_for_fact` —
-/// no RMAP logic is duplicated here. The function is a thin storage-
-/// layer projection over rmap's absorption oracle.
+/// All routing decisions delegate to `rmap::EntityCellRouter` — no
+/// RMAP logic is duplicated here. The function is a thin storage-
+/// layer projection over rmap's absorption oracle. The router is
+/// constructed once per call so the snapshot's Noun cell + RMAP
+/// classification are walked once, not once per fact in the delta
+/// (#771 — multi-fact deltas previously hit `rmap_cell_map` per fact).
 #[cfg(not(feature = "no_std"))]
 fn augment_delta_with_entity_cells(
     snapshot: &ast::Object,
     delta: &ast::Object,
 ) -> ast::Object {
     use hashbrown::{HashMap, HashSet};
+
+    // Build the router once. Per-fact routing below is HashMap
+    // lookups against this snapshot view.
+    let router = crate::rmap::EntityCellRouter::new(snapshot);
 
     // Step 1: identify (noun, entity_id) pairs touched by the delta.
     // Each fact in each FT cell of the delta routes (or doesn't) into
@@ -2171,7 +2178,7 @@ fn augment_delta_with_entity_cells(
     for (ft_id, contents) in ast::cells_iter(delta) {
         let Some(facts) = contents.as_seq() else { continue };
         for fact in facts.iter() {
-            if let Some(routing) = crate::rmap::entity_cell_for_fact(snapshot, ft_id, fact) {
+            if let Some(routing) = router.route_fact(ft_id, fact) {
                 touched.insert((routing.noun_name, routing.entity_id));
             }
         }
@@ -2187,9 +2194,9 @@ fn augment_delta_with_entity_cells(
     // Eventless merge: this is a read-only projection helper.
     let merged = ast::merge_delta(snapshot, delta, None);
 
-    // Step 3: rmap shard map keyed by FT id. Used to find every FT
-    // that absorbs into a given entity table (snake_case).
-    let shard_map = crate::rmap::rmap_cell_map_from_state(snapshot);
+    // Step 3: rmap shard map (borrowed from router). Used to find
+    // every FT that absorbs into a given entity table (snake_case).
+    let shard_map = router.shard_map();
 
     // Step 4: project the 3NF row per touched entity. The id column
     // (per the noun's reference scheme) is seeded from the entity_id
@@ -2198,7 +2205,7 @@ fn augment_delta_with_entity_cells(
     let mut entity_rows: HashMap<String, ast::Object> = HashMap::new();
     for (noun_name, entity_id) in touched {
         let target_snake = crate::rmap::to_snake(&noun_name);
-        let id_field = crate::rmap::entity_id_field_name(snapshot, &noun_name);
+        let id_field = router.id_field_for(&noun_name).to_string();
 
         let mut row: HashMap<String, ast::Object> = HashMap::new();
         row.insert(id_field, ast::Object::atom(&entity_id));
