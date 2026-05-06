@@ -94,6 +94,58 @@ export function callCellPin(handle: number, cellName: string): number | null {
   return Number.isFinite(n) ? n : null
 }
 
+/**
+ * Read the contents of `cellName` from the engine pinned at `handle`
+ * via the `fetch_cell` system verb (#765 / S1e read-side peer of
+ * `cell_pin`). Returns the parsed cell payload as the JS shape the
+ * engine encoded:
+ *   - atom payloads → JS string (e.g. `"ord-42"`)
+ *   - Map payloads → JS object (e.g. `{ id, type, data }`)
+ *   - Seq payloads → JS array
+ * Returns `null` for cells the engine does not yet know about — the
+ * engine surfaces these as the bottom marker `"⊥"` (see
+ * `crates/arest/src/lib.rs::system_impl` for the dispatch and §S1c
+ * eq:cellfold for why "the chain IS the version stamp").
+ *
+ * Mirrors `callCellPin` in shape: thin shim around `system(h,
+ * "fetch_cell", name)` that maps the engine's bottom marker to `null`
+ * and parses the JSON envelope into a JS value.
+ *
+ * Worker EntityDB read paths (#765) use this helper to source the
+ * cell's contents from the engine's authoritative chain instead of
+ * the per-DO SQLite sidecar — keeping the host's per-cell storage
+ * from drifting from the engine's true storage version. When the
+ * engine returns `null` (legacy cell that pre-dates the engine
+ * apply path, or rotated bytes that engine-silent rotation
+ * preserved), callers MUST fall back to the legacy SQL SELECT so
+ * existing-cell envelopes still open during the migration window
+ * before #768 drops the `cell.version` SQL column.
+ *
+ * Returns `null` (NOT throw) when:
+ *   - `handle` is out of range / not allocated (engine returns "⊥")
+ *   - the named cell has no chain entry (engine returns "⊥")
+ *   - the engine reply is not parseable JSON (defensive — the engine
+ *     contract is `to_json_string`, but we keep the helper total so a
+ *     malformed envelope fans out to the SQL fallback path rather
+ *     than throwing into the DO method that called us)
+ */
+export function callFetchCell(handle: number, cellName: string): unknown | null {
+  ensureWasm()
+  const raw = system(handle, 'fetch_cell', cellName)
+  if (raw === '⊥' || raw === '') return null
+  try {
+    return JSON.parse(raw)
+  } catch {
+    // Defensive: the engine's `fetch_cell` always returns JSON via
+    // `to_json_string` (atoms wrap as JSON strings, Maps as objects,
+    // Seqs as arrays), but a malformed reply must not crash the
+    // calling DO method. Returning `null` routes the caller to its
+    // SQL fallback path — same recovery shape the legacy / un-chained
+    // cells already exercise.
+    return null
+  }
+}
+
 // wasm-pack --target bundler auto-initializes the WASM when arest.js is
 // imported (via wasm.__wbindgen_start() inside the wrapper). No explicit
 // initSync call is needed here — ensureWasm is kept as a no-op so the

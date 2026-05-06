@@ -40,7 +40,7 @@ import {
   deriveTenantMasterKey,
   rotateCell,
 } from './cell-encryption'
-import { compileDomainReadings, freezeHandle, thawHandle, release_domain, system, callCellPin } from './api/engine'
+import { compileDomainReadings, freezeHandle, thawHandle, release_domain, system, callCellPin, callFetchCell } from './api/engine'
 export type { SqlLike } from './sql-like'
 
 // ── Types ───────────────────────────────────────────────────────────
@@ -131,6 +131,80 @@ export function fetchCell(sql: SqlLike): CellContents | null {
     id: row.id,
     type: row.type,
     data: typeof row.data === 'string' ? JSON.parse(row.data) : (row.data || {}),
+  }
+}
+
+/** ↑n via engine — try the per-DO engine `fetch_cell` system verb
+ *  (#765, S1c eq:cellfold) for the cell named `cellName`, with SQL
+ *  fallback through `fetchCell` for cells the engine does not yet
+ *  know about (legacy cells written before #766 wired engine apply,
+ *  or cells whose direct-SQL writes — e.g. `rotateMaster` — are
+ *  intentionally engine-silent so the chain version stays consistent
+ *  with the preserved AAD version on rotated bytes).
+ *
+ *  Engine-first means a chain-resident cell's contents come straight
+ *  from the engine snapshot instead of the worker's SQLite sidecar —
+ *  this is the read-side closure of the chain-as-version-of-record
+ *  contract that #766 (write path) and #767 (AEAD AAD source) were
+ *  building toward.
+ *
+ *  Engine return shape adaptation: `system(h, "fetch_cell", name)`
+ *  hands back the cell's contents JSON via the engine's
+ *  `to_json_string` (atom payloads → JSON string, Maps → object,
+ *  Seqs → array). Worker EntityDB cells are conventionally written
+ *  through `EntityDB.put` → `writeCellThroughEngine` → `createEntity`
+ *  — that path stores facts under fact-type cells (e.g.
+ *  `Order_has_total`) and does NOT today populate a per-entity-id
+ *  cell shaped `{id, type, data}`. So for `cellName = entity-id`
+ *  the engine returns `⊥` for those cells and the SQL fallback
+ *  fires — exactly the "class (b)/(c) legacy cells" path the brief
+ *  calls out.
+ *
+ *  When a future engine surface DOES register an entity-id cell with
+ *  the `{id, type, data}` shape, the JSON we parse here matches
+ *  `CellContents` directly. Defensive: anything that isn't shaped
+ *  like `CellContents` (or that fails the JSON envelope check) routes
+ *  through the SQL fallback so the DO never surfaces a malformed
+ *  payload to its caller.
+ *
+ *  Both args default to the no-engine-bound case so legacy callers
+ *  (the un-encrypted `EntityDB.get` path with no master, or unit
+ *  tests driving `fetchCell` directly) keep working without surgery. */
+export function fetchCellViaEngine(
+  sql: SqlLike,
+  engineHandle: number = -1,
+  cellName: string = '',
+): CellContents | null {
+  if (engineHandle >= 0 && cellName.length > 0) {
+    const fromEngine = callFetchCell(engineHandle, cellName)
+    const adapted = adaptEngineCellPayload(fromEngine)
+    if (adapted !== null) return adapted
+  }
+  return fetchCell(sql)
+}
+
+/** Best-effort coercion of a `callFetchCell` return value into the
+ *  `CellContents` shape. Returns `null` for any payload that isn't
+ *  recognisably a `{id, type, data}` envelope — caller falls back
+ *  to SQL.
+ *
+ *  The coercion is intentionally narrow: a future engine surface that
+ *  stores entity cells will produce this exact shape. Until then,
+ *  every entity-id-keyed `fetch_cell` returns the engine's `⊥` (which
+ *  `callFetchCell` already maps to `null`) and the body of this helper
+ *  is dead code. Keeping the shape check explicit means the moment
+ *  the engine grows entity-cell semantics, reads route through the
+ *  engine path with zero call-site changes. */
+function adaptEngineCellPayload(payload: unknown): CellContents | null {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null
+  const m = payload as Record<string, unknown>
+  if (typeof m.id !== 'string' || typeof m.type !== 'string') return null
+  const data = m.data
+  if (data !== null && data !== undefined && typeof data !== 'object') return null
+  return {
+    id: m.id,
+    type: m.type,
+    data: (data as Record<string, unknown>) ?? {},
   }
 }
 
@@ -281,6 +355,60 @@ export async function fetchCellSealed(
     type: row.type,
     data,
   }
+}
+
+/** ↑n via engine — try the per-DO engine `fetch_cell` system verb
+ *  (#765, S1c eq:cellfold) for the sealed-cell path, with the existing
+ *  `fetchCellSealed` (decrypt-from-SQL) as the fallback for cells the
+ *  engine does not yet know about.
+ *
+ *  ## Why route encrypted reads through the engine
+ *
+ *  Per the chain-as-version-of-record contract (#766/#767), a cell
+ *  written through `EntityDB.put` lands in the engine's chain via
+ *  `apply` (currently as facts under fact-type cells, not as a
+ *  per-entity envelope — see `fetchCellViaEngine` for the shape
+ *  details). When/if the engine surface grows entity-keyed cells,
+ *  reads of those cells should source from the engine snapshot
+ *  rather than the worker's encrypted SQL row. The wiring lands
+ *  here so the moment that surface ships, encrypted reads inherit
+ *  it for free.
+ *
+ *  ## Today's behaviour: SQL fallback dominant
+ *
+ *  Today's engine stores by fact-type, not by entity-id, so
+ *  `callFetchCell(handle, entityId)` returns null for all current
+ *  worker cells. The fallback always fires and the encrypted SQL
+ *  decrypt path runs as before — no behaviour change for the live
+ *  EntityDB. The engine call is cheap (a snapshot read under a
+ *  shared lock per `is_read_only_op("fetch_cell")`) so the wiring
+ *  cost is negligible.
+ *
+ *  ## Backward-compat for class (b)/(c) cells
+ *
+ *  - (a) Cells written via #766 engine apply path: chain-resident.
+ *    `fetch_cell` returns contents when the surface supports it
+ *    (today: still ⊥ for entity ids).
+ *  - (b) Legacy cells written by direct SQL pre-#766: engine has no
+ *    chain entry. `fetch_cell` returns ⊥ → fallback opens the SQL
+ *    sealed bytes.
+ *  - (c) `rotateMaster` re-sealed bytes (engine-silent by design):
+ *    same fallback path as (b).
+ *
+ *  All three classes remain readable across the migration window
+ *  before #768 drops the `cell.version` SQL column. */
+export async function fetchCellSealedViaEngine(
+  sql: SqlLike,
+  master: TenantMasterKey,
+  engineHandle: number = -1,
+  cellName: string = '',
+): Promise<CellContents | null> {
+  if (engineHandle >= 0 && cellName.length > 0) {
+    const fromEngine = callFetchCell(engineHandle, cellName)
+    const adapted = adaptEngineCellPayload(fromEngine)
+    if (adapted !== null) return adapted
+  }
+  return fetchCellSealed(sql, master, engineHandle)
 }
 
 /** ↓n — store new contents into the cell, sealing the JSON-encoded
@@ -706,30 +834,56 @@ export class EntityDB extends DurableObject {
 
   /** ↑n — fetch the cell. Returns { id, type, data } or null.
    *
-   *  Hydrates the per-DO engine so the sealed-row path can source the
-   *  AEAD AAD `version` field from `cell_pin` (#767/S1e) instead of
-   *  the worker-minted SQL counter. */
+   *  Hydrates the per-DO engine so:
+   *    - the sealed-row path can source the AEAD AAD `version` field
+   *      from `cell_pin` (#767/S1e) instead of the worker SQL counter,
+   *    - the read can route through `system(h, "fetch_cell", name)`
+   *      (#765) for chain-resident cells, with the SQL `SELECT id,
+   *      type, data` as the fallback for cells the engine does not
+   *      yet know about (legacy class (b) + rotated class (c) — see
+   *      `fetchCellViaEngine`/`fetchCellSealedViaEngine`).
+   *
+   *  The `cellName` we hand the engine is `this.ctx.id.toString()` —
+   *  the DO's routing identifier (the cellKey-formatted name from
+   *  `src/api/cell-key.ts`). Today's engine surface stores facts
+   *  under fact-type cells (`Order_has_total` etc.), not under
+   *  entity-id, so `callFetchCell` returns `⊥` for these names and
+   *  the SQL fallback fires. The wiring lands so that the moment
+   *  the engine grows entity-keyed cells, reads inherit the
+   *  chain-as-version-of-record path with zero call-site changes. */
   async get(): Promise<CellContents | null> {
     this.ensureInit()
     const master = await this.getMaster()
+    await this.hydrateEngine()
+    const cellName = this.ctx.id.toString()
     if (master) {
-      await this.hydrateEngine()
-      return fetchCellSealed(this.ctx.storage.sql, master, this.engineHandle)
+      return fetchCellSealedViaEngine(
+        this.ctx.storage.sql, master, this.engineHandle, cellName,
+      )
     }
-    return fetchCell(this.ctx.storage.sql)
+    return fetchCellViaEngine(
+      this.ctx.storage.sql, this.engineHandle, cellName,
+    )
   }
 
   /** ↓n — store the cell. Merges with existing data (idempotent across domains).
    *
    *  Hydrates the per-DO engine so the sealed-row path can source the
-   *  AEAD AAD `version` field from `cell_pin` (#767/S1e). */
+   *  AEAD AAD `version` field from `cell_pin` (#767/S1e), and so the
+   *  read of existing contents (for the merge) routes through
+   *  `system(h, "fetch_cell", name)` (#765) with SQL fallback. */
   async put(input: { id: string; type: string; data: Record<string, unknown> }): Promise<CellContents> {
     this.ensureInit()
     const master = await this.getMaster()
-    if (master) await this.hydrateEngine()
+    await this.hydrateEngine()
+    const cellName = this.ctx.id.toString()
     const existing = master
-      ? await fetchCellSealed(this.ctx.storage.sql, master, this.engineHandle)
-      : fetchCell(this.ctx.storage.sql)
+      ? await fetchCellSealedViaEngine(
+          this.ctx.storage.sql, master, this.engineHandle, cellName,
+        )
+      : fetchCellViaEngine(
+          this.ctx.storage.sql, this.engineHandle, cellName,
+        )
     const merged: Record<string, unknown> = existing ? { ...existing.data } : {}
     for (const [k, v] of Object.entries(input.data)) {
       if (v !== null && v !== undefined) merged[k] = v
@@ -876,6 +1030,40 @@ export class EntityDB extends DurableObject {
     | { ok: false; kind: 'truncated' | 'auth' }
   > {
     this.ensureInit()
+    // Hydrate the per-DO engine FIRST so:
+    //   - the AAD `version` field can be sourced from `cell_pin`
+    //     (#767/S1e) — matching whatever the sealing path used to
+    //     mint the AAD,
+    //   - the cell-contents read can route through
+    //     `system(h, "fetch_cell", name)` (#765) for engine-resident
+    //     cells, with the SQL row as the fallback (which rotation
+    //     ALWAYS still requires for the sealed bytes column —
+    //     engine returns plaintext contents, but rotation needs the
+    //     raw AEAD envelope to decrypt+re-encrypt under the new
+    //     master). The engine probe is the read-pattern bookend per
+    //     #765's contract; in practice rotation cells are always in
+    //     the (c) class (engine-silent rewrites) so the probe
+    //     surfaces `⊥` and the SQL row is authoritative anyway.
+    await this.hydrateEngine()
+    const cellName = this.ctx.id.toString()
+    // Engine-first probe per #765 read-pattern contract. Even when
+    // the probe returns non-null (e.g. a future surface registers an
+    // entity-id cell), rotation MUST still read the SQL row — the
+    // engine returns plaintext cell contents but rotation needs the
+    // SEALED bytes (data column) and the persisted version stamp
+    // (version column) to decrypt+re-encrypt under the new master.
+    // In practice rotation cells are always class (c) (engine-silent
+    // rewrites preserved per the task brief), so the probe surfaces
+    // `⊥` and the SQL row is authoritative. The probe stays wired
+    // so the moment a sibling task adds an engine surface for the
+    // sealed envelope (or the rotated bytes start landing in the
+    // chain through a key-rotation-safe apply), we can collapse the
+    // SQL fallback.
+    if (this.engineHandle >= 0) {
+      // Result intentionally discarded — informational probe only.
+      // Keeps the call-site shape uniform with `EntityDB.get`/`put`.
+      callFetchCell(this.engineHandle, cellName)
+    }
     const rows = this.ctx.storage.sql
       .exec(`SELECT id, type, data, version FROM cell`)
       .toArray()
@@ -888,12 +1076,6 @@ export class EntityDB extends DurableObject {
       // Legacy plaintext or empty — no rotation needed.
       return { ok: true, rotated: false }
     }
-    // Hydrate the per-DO engine so the AAD `version` field can be
-    // sourced from `cell_pin` (#767/S1e) — matching whatever the
-    // sealing path used to mint the AAD. The SQL `cell.version`
-    // column is the legacy fallback for cells that have no chain
-    // entry yet.
-    await this.hydrateEngine()
     const oldMaster = await deriveTenantMasterKey(args.oldSeed, args.oldSalt)
     const newMaster = await deriveTenantMasterKey(args.newSeed, args.newSalt)
     const sealed = base64ToBytes(dataField.slice(SEALED_CELL_PREFIX.length))
