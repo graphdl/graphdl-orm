@@ -53,6 +53,47 @@ export function thawHandle(handle: number, hexBytes: string): boolean {
   return system(handle, 'thaw', hexBytes) === 'ok'
 }
 
+/**
+ * Look up the chain head's `version_id` for `cellName` in the engine
+ * pinned at `handle` (#721 / S1e). Returns the decimal version_id as
+ * a JS number for chain cells, or `null` for cells that the engine
+ * does not yet know about (the engine returns `"⊥"` in that case —
+ * see `crates/arest/src/lib.rs::system_impl` for the `cell_pin`
+ * dispatch and §S1c eq:cellfold for why "the chain IS the version
+ * stamp").
+ *
+ * AEAD callers (#767 / S1i) source the `CellAddress.version` field
+ * from this helper instead of the worker-minted SQL counter:
+ * binding the AAD to the engine's true storage version is what eq:
+ * cellfold guarantees, so a captured-then-replayed older sealed
+ * envelope at the same `(scope, domain, cell_name)` fails to decrypt
+ * because the current chain head's version no longer matches the
+ * captured ciphertext's AAD.
+ *
+ * Returns `null` (NOT throw) when:
+ *   - `handle` is out of range / not allocated
+ *   - the named cell has no chain entry (pre-S1b raw cell, or never
+ *     written through the engine)
+ *
+ * The caller is expected to fall back to its legacy version source
+ * (the worker `cell.version` SQL column) when this returns `null`,
+ * so existing-cell encryption/decryption still works during the
+ * migration window before #768 drops the column.
+ */
+export function callCellPin(handle: number, cellName: string): number | null {
+  ensureWasm()
+  const raw = system(handle, 'cell_pin', cellName)
+  if (raw === '⊥' || raw === '') return null
+  // Decimal-encoded u64. Parse via Number — version_ids in practice
+  // stay well under 2^53 (one bump per write, per cell, per DO; even
+  // a 1-Hz writer for a century is ~3e9 ≪ 9e15). If we ever need to
+  // handle larger values we'd return BigInt here, but the AAD
+  // canonical encoder downstream takes `bigint | number` already
+  // (see `cell-encryption.ts::canonicalAddressBytes`).
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : null
+}
+
 // wasm-pack --target bundler auto-initializes the WASM when arest.js is
 // imported (via wasm.__wbindgen_start() inside the wrapper). No explicit
 // initSync call is needed here — ensureWasm is kept as a no-op so the

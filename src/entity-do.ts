@@ -40,7 +40,7 @@ import {
   deriveTenantMasterKey,
   rotateCell,
 } from './cell-encryption'
-import { compileDomainReadings, freezeHandle, thawHandle, release_domain, system } from './api/engine'
+import { compileDomainReadings, freezeHandle, thawHandle, release_domain, system, callCellPin } from './api/engine'
 export type { SqlLike } from './sql-like'
 
 // ── Types ───────────────────────────────────────────────────────────
@@ -182,9 +182,14 @@ export function removeCell(sql: SqlLike): { id: string } | null {
 export const SEALED_CELL_PREFIX = 'ARESTAEAD1:'
 
 /** Build a CellAddress from the EntityDB's notion of (type, id) plus
- *  the per-row monotonic version (#661). Pre-existing cells default
- *  to version 0 (matching the schema column DEFAULT); the first
- *  successful sealed write through `storeCellSealed` bumps to 1. */
+ *  the per-row monotonic version (#661 — sourced from the engine's
+ *  `cell_pin` chain head as of #767/S1e, with the worker SQL
+ *  `cell.version` column as a backwards-compat fallback for legacy
+ *  cells that pre-date the per-DO engine path).
+ *
+ *  Pre-existing cells default to version 0 (matching the schema
+ *  column DEFAULT); the first successful sealed write through
+ *  `storeCellSealed` bumps to 1. */
 export function cellAddressFor(type: string, id: string, version: number = 0): CellAddress {
   return {
     scope: 'worker',
@@ -192,6 +197,33 @@ export function cellAddressFor(type: string, id: string, version: number = 0): C
     cellName: id,
     version,
   }
+}
+
+/** Resolve the AAD `version` field for a sealed cell. Per #767/S1e,
+ *  the canonical source is the per-DO engine's `cell_pin` for
+ *  `cellName` against the supplied `engineHandle`. If the engine has
+ *  no chain entry for that cell (legacy cell that never went through
+ *  the engine path, or fresh chain that hasn't received its first
+ *  apply), the helper falls back to the worker-minted `fallbackVersion`
+ *  (typically the `cell.version` SQL column) so that envelopes sealed
+ *  before the engine path was wired still open during the migration
+ *  window. The fallback path goes away with #768 when the SQL column
+ *  is dropped.
+ *
+ *  When `engineHandle < 0` (no engine bound, e.g. a unit test exercising
+ *  the legacy-only path) the helper short-circuits to the fallback.
+ *
+ *  Note: the AAD AAD already binds version_id by construction (S1i
+ *  #725) — this helper just sources the field from the engine's true
+ *  storage version instead of the worker-minted counter. */
+export function aadVersionFor(
+  engineHandle: number,
+  cellName: string,
+  fallbackVersion: number,
+): number {
+  if (engineHandle < 0) return fallbackVersion
+  const pinned = callCellPin(engineHandle, cellName)
+  return pinned ?? fallbackVersion
 }
 
 /** ↑n — fetch the cell, decrypting if the row carries the sealed
@@ -202,10 +234,22 @@ export function cellAddressFor(type: string, id: string, version: number = 0): C
  *  and folded into the CellAddress before `cellOpen` — without it the
  *  AEAD opener would derive a different per-cell HKDF key (since the
  *  AAD includes the version) and every read after the first write
- *  would surface as `CellAeadError(auth)`. */
+ *  would surface as `CellAeadError(auth)`.
+ *
+ *  ## AAD version source (#767 / S1e)
+ *
+ *  When `engineHandle >= 0` the AAD `version` field is sourced from
+ *  the engine's `cell_pin` for this cell (the chain head version_id —
+ *  per §S1c eq:cellfold the chain IS the version stamp). For legacy
+ *  cells whose chain entry has not yet been written through the
+ *  engine, `cell_pin` returns `⊥` and the helper falls back to the
+ *  worker-minted `cell.version` column, so existing-cell envelopes
+ *  still open during the migration window before #768 drops the SQL
+ *  column. Pass `-1` (the default) for the no-engine path. */
 export async function fetchCellSealed(
   sql: SqlLike,
   master: TenantMasterKey,
+  engineHandle: number = -1,
 ): Promise<CellContents | null> {
   const rows = sql.exec(`SELECT id, type, data, version FROM cell`).toArray()
   if (rows.length === 0) return null
@@ -221,7 +265,8 @@ export async function fetchCellSealed(
   let data: Record<string, unknown>
   if (typeof dataField === 'string' && dataField.startsWith(SEALED_CELL_PREFIX)) {
     const sealed = base64ToBytes(dataField.slice(SEALED_CELL_PREFIX.length))
-    const address = cellAddressFor(row.type as string, row.id as string, persistedVersion)
+    const aadVersion = aadVersionFor(engineHandle, row.id as string, persistedVersion)
+    const address = cellAddressFor(row.type as string, row.id as string, aadVersion)
     const opened = await cellOpen(master, address, sealed)
     const json = new TextDecoder().decode(opened)
     data = JSON.parse(json)
@@ -254,13 +299,24 @@ export async function fetchCellSealed(
  *  observe a concurrent put on the same row; the single SQL UPSERT
  *  commits both halves together (the sealed bytes and the new
  *  version), preserving the invariant that the persisted version
- *  always matches the AAD the sealed bytes were produced under. */
+ *  always matches the AAD the sealed bytes were produced under.
+ *
+ *  ## AAD version source (#767 / S1e)
+ *
+ *  The version baked into the CellAddress AAD is sourced from the
+ *  engine's `cell_pin` for this cell when `engineHandle >= 0` —
+ *  per §S1c eq:cellfold the chain IS the version stamp. The fallback
+ *  path (no engine, or pre-engine cell) keeps using `nextVersion`
+ *  (the bumped worker counter) so the legacy seal/open contract
+ *  still holds during the migration window before #768 drops the
+ *  SQL column. */
 export async function storeCellSealed(
   sql: SqlLike,
   master: TenantMasterKey,
   id: string,
   type: string,
   data: Record<string, unknown>,
+  engineHandle: number = -1,
 ): Promise<CellContents> {
   // Read the current version for this row (if any). A fresh cell
   // returns 0 rows; a re-write returns the existing row's stamp.
@@ -273,7 +329,12 @@ export async function storeCellSealed(
   const nextVersion = prevVersion + 1
 
   const json = JSON.stringify(data)
-  const address = cellAddressFor(type, id, nextVersion)
+  // AAD version: prefer engine's chain head over the worker counter.
+  // For a brand-new cell the engine returns ⊥; the bumped counter
+  // (`nextVersion`) acts as the legacy fallback so AEAD seal/open
+  // round-trips work uniformly across the migration window.
+  const aadVersion = aadVersionFor(engineHandle, id, nextVersion)
+  const address = cellAddressFor(type, id, aadVersion)
   const sealed = await cellSeal(master, address, json)
   const blob = SEALED_CELL_PREFIX + bytesToBase64(sealed)
   // Persist sealed bytes + new version atomically. INSERT OR REPLACE
@@ -643,22 +704,31 @@ export class EntityDB extends DurableObject {
     return m
   }
 
-  /** ↑n — fetch the cell. Returns { id, type, data } or null. */
+  /** ↑n — fetch the cell. Returns { id, type, data } or null.
+   *
+   *  Hydrates the per-DO engine so the sealed-row path can source the
+   *  AEAD AAD `version` field from `cell_pin` (#767/S1e) instead of
+   *  the worker-minted SQL counter. */
   async get(): Promise<CellContents | null> {
     this.ensureInit()
     const master = await this.getMaster()
     if (master) {
-      return fetchCellSealed(this.ctx.storage.sql, master)
+      await this.hydrateEngine()
+      return fetchCellSealed(this.ctx.storage.sql, master, this.engineHandle)
     }
     return fetchCell(this.ctx.storage.sql)
   }
 
-  /** ↓n — store the cell. Merges with existing data (idempotent across domains). */
+  /** ↓n — store the cell. Merges with existing data (idempotent across domains).
+   *
+   *  Hydrates the per-DO engine so the sealed-row path can source the
+   *  AEAD AAD `version` field from `cell_pin` (#767/S1e). */
   async put(input: { id: string; type: string; data: Record<string, unknown> }): Promise<CellContents> {
     this.ensureInit()
     const master = await this.getMaster()
+    if (master) await this.hydrateEngine()
     const existing = master
-      ? await fetchCellSealed(this.ctx.storage.sql, master)
+      ? await fetchCellSealed(this.ctx.storage.sql, master, this.engineHandle)
       : fetchCell(this.ctx.storage.sql)
     const merged: Record<string, unknown> = existing ? { ...existing.data } : {}
     for (const [k, v] of Object.entries(input.data)) {
@@ -703,7 +773,7 @@ export class EntityDB extends DurableObject {
       console.warn('EntityDB.put: engine apply failed, falling back to SQL-only write:', e)
     }
     if (master) {
-      return storeCellSealed(this.ctx.storage.sql, master, input.id, input.type, merged)
+      return storeCellSealed(this.ctx.storage.sql, master, input.id, input.type, merged, this.engineHandle)
     }
     return storeCell(this.ctx.storage.sql, input.id, input.type, merged)
   }
@@ -718,7 +788,8 @@ export class EntityDB extends DurableObject {
     this.ensureInit()
     const master = await this.getMaster()
     if (master) {
-      const cell = await fetchCellSealed(this.ctx.storage.sql, master)
+      await this.hydrateEngine()
+      const cell = await fetchCellSealed(this.ctx.storage.sql, master, this.engineHandle)
       return factsFromCell(cell)
     }
     return getFacts(this.ctx.storage.sql)
@@ -728,7 +799,8 @@ export class EntityDB extends DurableObject {
     this.ensureInit()
     const master = await this.getMaster()
     if (master) {
-      const cell = await fetchCellSealed(this.ctx.storage.sql, master)
+      await this.hydrateEngine()
+      const cell = await fetchCellSealed(this.ctx.storage.sql, master, this.engineHandle)
       return factsFromCell(cell).filter(f => f.graphSchemaId === graphSchemaId)
     }
     return getFactsBySchema(this.ctx.storage.sql, graphSchemaId)
@@ -738,7 +810,8 @@ export class EntityDB extends DurableObject {
     this.ensureInit()
     const master = await this.getMaster()
     if (master) {
-      const cell = await fetchCellSealed(this.ctx.storage.sql, master)
+      await this.hydrateEngine()
+      const cell = await fetchCellSealed(this.ctx.storage.sql, master, this.engineHandle)
       const facts = factsFromCell(cell)
       const population: Record<string, Array<{ factTypeId: string; bindings: Array<[string, string]> }>> = {}
       for (const fact of facts) {
@@ -815,17 +888,26 @@ export class EntityDB extends DurableObject {
       // Legacy plaintext or empty — no rotation needed.
       return { ok: true, rotated: false }
     }
+    // Hydrate the per-DO engine so the AAD `version` field can be
+    // sourced from `cell_pin` (#767/S1e) — matching whatever the
+    // sealing path used to mint the AAD. The SQL `cell.version`
+    // column is the legacy fallback for cells that have no chain
+    // entry yet.
+    await this.hydrateEngine()
     const oldMaster = await deriveTenantMasterKey(args.oldSeed, args.oldSalt)
     const newMaster = await deriveTenantMasterKey(args.newSeed, args.newSalt)
     const sealed = base64ToBytes(dataField.slice(SEALED_CELL_PREFIX.length))
-    // The persisted version IS the AAD the sealed bytes were produced
-    // under (#661). Rotation re-seals the recovered plaintext at the
-    // SAME address (same version) but under the new master — the
-    // version field stays put, only the master derivation changes.
+    // The AAD the sealed bytes were produced under: prefer engine's
+    // chain head (matches the engine-sealed path), fall back to the
+    // SQL counter (matches the pre-engine legacy path). Rotation
+    // re-seals the recovered plaintext at the SAME address (same
+    // version) but under the new master — the version field stays
+    // put, only the master derivation changes.
     const persistedVersion = typeof row.version === 'number' && Number.isFinite(row.version)
       ? row.version
       : 0
-    const address = cellAddressFor(row.type as string, row.id as string, persistedVersion)
+    const aadVersion = aadVersionFor(this.engineHandle, row.id as string, persistedVersion)
+    const address = cellAddressFor(row.type as string, row.id as string, aadVersion)
     let newSealed: Uint8Array
     try {
       newSealed = await rotateCell(oldMaster, newMaster, address, sealed)
