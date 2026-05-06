@@ -663,3 +663,126 @@ Thing has Arity.
 // `compile_join_derivation`, outside this harness' target. Left as a
 // TODO so a future shape that exercises the AntecedentRole branch can
 // be added next to its sibling shapes.
+
+// ─── State machine derivation (#759 / Audit MC3b-a) ────────────────
+//
+// readings/core/state.md adds a derivation rule that mirrors Pass 2 of
+// `derive_state_machines_from_facts` (compile.rs:385-401):
+//   • A `Status is initial in SM` instance fact also derives the
+//     corresponding `Status is defined in SM` fact.
+//   • A direct `Status is defined in SM` instance fact lands in the
+//     same cell (Pass 2b — already done by the parser; no derivation
+//     needed because the FT is also assertable directly).
+//   • Pass 1 (`State Machine Definition is for Noun`) is the FT itself
+//     — its instance fact already registers the SM record.
+//
+// Two assertions:
+//   1. The new rule text is present in readings/core/state.md (file
+//      edit landed).
+//   2. A tiny self-contained reading that re-declares the same FTs +
+//      includes the same rule text actually populates the cells via
+//      the engine's forward-chain, with `Draft` (initial) appearing
+//      alongside `Placed` (directly-asserted defined) in the
+//      `Status_is_defined_in_State_Machine_Definition` cell.
+
+#[test]
+fn sm_derivation_rules_populate_normalized_cells_from_initial_and_defined_facts() {
+    use crate::ast::{cells_iter, fetch_or_phi};
+
+    // (1) The Pass-2 derivation rule must be present in
+    // readings/core/state.md — this is the file change #759 ships.
+    let state_md = include_str!("../../../readings/core/state.md");
+    let pass2_rule_text = "Status is defined in State Machine Definition iff that Status is initial in that State Machine Definition";
+    assert!(
+        state_md.contains(pass2_rule_text),
+        "readings/core/state.md must contain the Pass-2 derivation rule (#759)\n\
+         expected substring: `{}`\n\
+         (this rule mirrors compile.rs:385-401 — initial Status implies defined Status)",
+        pass2_rule_text,
+    );
+
+    // (2) Self-contained smoke: re-declare just the FTs we exercise so
+    // the test doesn't drag in the full core+state metamodel, then
+    // check the engine populates the cells correctly via forward-chain.
+    let src = r#"# SM Derivation TDD
+Order(.Name) is an entity type.
+State Machine Definition(.Name) is an entity type.
+Status(.Name) is an entity type.
+Noun is an entity type.
+
+## Fact Types
+State Machine Definition is for Noun.
+Status is initial in State Machine Definition.
+Status is defined in State Machine Definition. *
+
+## Derivation Rules
+* Status is defined in State Machine Definition iff that Status is initial in that State Machine Definition.
+
+## Instance Facts
+State Machine Definition 'OrderSM' is for Noun 'Order'.
+Status 'Draft' is initial in State Machine Definition 'OrderSM'.
+Status 'Placed' is defined in State Machine Definition 'OrderSM'.
+"#;
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    let model = crate::compile::compile(&state);
+    let derivation_refs: Vec<(&str, &crate::ast::Func)> =
+        model.derivations.iter().map(|d| (d.id.as_str(), &d.func)).collect();
+    let (final_state, _derived) =
+        crate::evaluate::forward_chain_defs_state(&derivation_refs, &state);
+
+    // Collect the Status-name set in Status_is_defined_in_SM to verify
+    // both the directly-asserted Placed AND the initial-derived Draft
+    // landed in the cell (Pass 2 + Pass 2b parity with compile.rs).
+    let defined_cell = fetch_or_phi("Status_is_defined_in_State_Machine_Definition", &final_state);
+    let defined_pairs: Vec<(String, String)> = defined_cell.as_seq().map(|facts| {
+        facts.iter().filter_map(|f| {
+            let pairs = f.as_seq()?;
+            let mut status: Option<String> = None;
+            let mut sm: Option<String> = None;
+            for p in pairs.iter() {
+                let kv = p.as_seq()?;
+                if kv.len() != 2 { continue; }
+                let k = kv[0].as_atom()?;
+                let v = kv[1].as_atom()?;
+                if k == "Status" { status = Some(v.to_string()); }
+                if k == "State Machine Definition" { sm = Some(v.to_string()); }
+            }
+            Some((status?, sm?))
+        }).collect()
+    }).unwrap_or_default();
+    assert!(
+        defined_pairs.iter().any(|(s, m)| s == "Placed" && m == "OrderSM"),
+        "Pass 2b: directly-asserted (Placed, OrderSM) must remain in Status_is_defined_in_SM, got {:?}",
+        defined_pairs,
+    );
+    assert!(
+        defined_pairs.iter().any(|(s, m)| s == "Draft" && m == "OrderSM"),
+        "Pass 2: initial Status (Draft, OrderSM) must be derived into Status_is_defined_in_SM, got {:?}\nfinal cells: {:?}",
+        defined_pairs,
+        cells_iter(&final_state).iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+    );
+
+    // The initial-marking cell entry must still exist for the initial Status.
+    let initial_cell = fetch_or_phi("Status_is_initial_in_State_Machine_Definition", &final_state);
+    let initial_pairs: Vec<(String, String)> = initial_cell.as_seq().map(|facts| {
+        facts.iter().filter_map(|f| {
+            let pairs = f.as_seq()?;
+            let mut status: Option<String> = None;
+            let mut sm: Option<String> = None;
+            for p in pairs.iter() {
+                let kv = p.as_seq()?;
+                if kv.len() != 2 { continue; }
+                let k = kv[0].as_atom()?;
+                let v = kv[1].as_atom()?;
+                if k == "Status" { status = Some(v.to_string()); }
+                if k == "State Machine Definition" { sm = Some(v.to_string()); }
+            }
+            Some((status?, sm?))
+        }).collect()
+    }).unwrap_or_default();
+    assert!(
+        initial_pairs.iter().any(|(s, m)| s == "Draft" && m == "OrderSM"),
+        "initial-marking cell must contain (Draft, OrderSM), got {:?}",
+        initial_pairs,
+    );
+}
