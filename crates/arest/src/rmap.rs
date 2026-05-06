@@ -903,6 +903,123 @@ pub fn rmap_cell_map(state: &crate::ast::Object) -> HashMap<String, String> {
     map
 }
 
+// ── #770 — per-entity cell routing (paper §196 + §462 eq:cellfold) ──
+//
+// Given a fact stored in an FT cell, decide which per-entity cell
+// `<Noun>:<entity-id>` should absorb its contribution and pull the
+// (field, value) pair to merge into the entity's 3NF row.
+//
+// Routing decision is rmap-driven: `rmap_cell_map` already classifies
+// every FT into either a per-entity table (snake_case) or its own
+// junction cell (the original FT id). When the routing target is an
+// entity table, the fact's first pair `(noun, entity_id)` identifies
+// the entity instance and the remaining pair(s) become the row's
+// (field, value) columns.
+//
+// Returns None when the FT routes into its own junction cell (compound
+// UC / M:N / no UC) or when the fact's binding shape can't be projected.
+
+/// Per-entity cell routing for a single fact contribution.
+///
+/// `cell_name` is `<Noun>:<entity-id>` — the per-entity cell that
+/// absorbs this fact's contribution. `field_key` and `field_value`
+/// are the (column, value) pair to merge into the entity's 3NF row
+/// (e.g. `total = "100"` from `Order_has_total` for `Order:ord-1`).
+#[derive(Debug, Clone)]
+pub struct EntityCellRouting {
+    pub cell_name: String,
+    pub noun_name: String,
+    pub entity_id: String,
+    pub field_key: String,
+    pub field_value: String,
+}
+
+/// Compute per-entity cell routing for a fact under FT `ft_id`.
+///
+/// Consults `rmap_cell_map` to determine whether the FT absorbs into
+/// an entity table. When it does, the absorbing entity's PascalCase
+/// noun name is recovered from the Noun cell (matching by snake_case
+/// equivalence to the rmap-emitted target), the entity_id is pulled
+/// from the fact's binding for that noun, and the remaining pair(s)
+/// supply the (field, value) contribution to the 3NF row.
+///
+/// Returns None when the FT routes to its own cell (compound /
+/// junction) or when the fact bindings don't carry the expected
+/// shape (defensive — the apply-path always emits the canonical
+/// `<<noun, entity_id>, <field, value>>` shape).
+pub fn entity_cell_for_fact(
+    state: &crate::ast::Object,
+    ft_id: &str,
+    fact: &crate::ast::Object,
+) -> Option<EntityCellRouting> {
+    use crate::ast::{fetch_or_phi, binding};
+
+    // Step 1: rmap routing. Returns the snake_case target — either an
+    // entity table (e.g. "order") or the FT's own junction id
+    // (e.g. "person_teaches_course"). When the target equals the FT
+    // id's snake_case (i.e. the FT's own junction cell), there's no
+    // entity to absorb into; bail out.
+    let shard_map = rmap_cell_map(state);
+    let target = shard_map.get(ft_id)?.clone();
+    let ft_snake = to_snake(ft_id);
+    if target == ft_snake {
+        return None;
+    }
+
+    // Step 2: recover the absorber's PascalCase noun name from the
+    // Noun cell — rmap emits snake_case, but the fact's bindings key
+    // by the schema-declared noun name (PascalCase). Match by snake
+    // equivalence so subtype-resolved roots and compound spellings
+    // both reconcile correctly.
+    let noun_cell = fetch_or_phi("Noun", state);
+    let noun_seq = noun_cell.as_seq().map(|s| s.to_vec()).unwrap_or_default();
+    let noun_name = noun_seq.iter()
+        .filter_map(|n| binding(n, "name"))
+        .find(|name| to_snake(name) == target)?
+        .to_string();
+
+    // Step 3: pull entity_id from the fact's binding for the absorber
+    // noun. The apply-path facts bind the noun key to its entity-id
+    // value (e.g. `<Order, ord-1>`). Use the binding directly.
+    let entity_id = binding(fact, &noun_name)?.to_string();
+
+    // Step 4: extract (field_key, field_value) — every binding in the
+    // fact except the absorber's own (noun, entity_id) pair. For
+    // canonical binary facts there's exactly one such pair; pick the
+    // first to keep the routing deterministic.
+    let pair = fact.as_seq()?.iter().find_map(|p| {
+        let items = p.as_seq()?;
+        if items.len() != 2 { return None; }
+        let key = items[0].as_atom()?;
+        if key == noun_name { return None; }
+        let val = items[1].as_atom()?;
+        Some((key.to_string(), val.to_string()))
+    })?;
+
+    Some(EntityCellRouting {
+        cell_name: format!("{}:{}", noun_name, entity_id),
+        noun_name,
+        entity_id,
+        field_key: pair.0,
+        field_value: pair.1,
+    })
+}
+
+/// Reference-scheme field name for a noun (e.g. `"id"` for `Order`).
+/// Reads the Noun cell's `referenceScheme` binding (set by the parser
+/// from `Order(.id) is an entity type.`); defaults to `"id"`. Used by
+/// the apply path to seed the 3NF row's primary-key column when
+/// materializing per-entity cells.
+pub fn entity_id_field_name(state: &crate::ast::Object, noun_name: &str) -> String {
+    use crate::ast::{fetch_or_phi, binding};
+    let noun_cell = fetch_or_phi("Noun", state);
+    noun_cell.as_seq()
+        .and_then(|ns| ns.iter().find(|n| binding(n, "name") == Some(noun_name)))
+        .and_then(|n| binding(n, "referenceScheme"))
+        .unwrap_or("id")
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

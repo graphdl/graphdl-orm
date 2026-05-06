@@ -2094,8 +2094,17 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
                 // so each VersionEntry minted here carries the apply-time
                 // `x` per FFP applicative-state-transfer. The chain
                 // doubles as audit-of-record; no audit_log sidecar.
+                //
+                // S2 #770: alongside the FT-cell writes (eq:demux
+                // intermediate per §458), materialize per-entity cells
+                // (paper §196 — "each entity is a cell" — with 3NF row
+                // contents from Halpin Ch. 10 RMAP). Each affected
+                // entity cell extends its own chain on every apply
+                // touching it (eq:cellfold, §462). FT cells stay live
+                // so projection queries keep working.
                 let event = ast::apply_event(key, obj.clone());
-                let new_d = ast::merge_delta(&snapshot, &delta, Some(event));
+                let augmented = augment_delta_with_entity_cells(&snapshot, &delta);
+                let new_d = ast::merge_delta(&snapshot, &augmented, Some(event));
                 let outcome = st.try_commit_diff(&snapshot, &new_d);
                 match outcome {
                     CommitOutcome::Committed => return response,
@@ -2119,12 +2128,125 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         }
         WriterResult::CommitDelta { delta, response } => {
             // S1c #757: same event threading as Tier 1.
+            // S2 #770: same entity-cell augmentation as Tier 1.
             let event = ast::apply_event(key, obj.clone());
-            let new_d = ast::merge_delta(&snapshot, &delta, Some(event));
+            let augmented = augment_delta_with_entity_cells(&snapshot, &delta);
+            let new_d = ast::merge_delta(&snapshot, &augmented, Some(event));
             st.replace_d(new_d);
             response
         }
     }
+}
+
+/// S2 #770: materialise per-entity cells alongside the FT-cell delta.
+///
+/// Paper §196 ("each entity is a cell") + §462 eq:cellfold (each cell
+/// folds its own event stream, chain-versioned). For every entity
+/// touched by `delta`, computes the entity's 3NF row at the post-apply
+/// view (snapshot ∪ delta) by walking all FT cells whose RMAP
+/// absorption targets this entity, projecting each fact's bindings
+/// into (field, value) columns. The id column is seeded from the
+/// noun's reference scheme.
+///
+/// Returned Object is a Map carrying every cell in `delta` PLUS a
+/// `<Noun>:<entity-id>` cell per touched entity whose row contents
+/// differ from the snapshot's existing entity cell (or whose entity
+/// cell is absent from the snapshot). Unchanged entity cells are
+/// omitted so unnecessary chain entries are not appended.
+///
+/// All routing decisions delegate to `rmap::entity_cell_for_fact` —
+/// no RMAP logic is duplicated here. The function is a thin storage-
+/// layer projection over rmap's absorption oracle.
+#[cfg(not(feature = "no_std"))]
+fn augment_delta_with_entity_cells(
+    snapshot: &ast::Object,
+    delta: &ast::Object,
+) -> ast::Object {
+    use hashbrown::{HashMap, HashSet};
+
+    // Step 1: identify (noun, entity_id) pairs touched by the delta.
+    // Each fact in each FT cell of the delta routes (or doesn't) into
+    // an entity cell — collect the unique routings.
+    let mut touched: HashSet<(String, String)> = HashSet::new();
+    for (ft_id, contents) in ast::cells_iter(delta) {
+        let Some(facts) = contents.as_seq() else { continue };
+        for fact in facts.iter() {
+            if let Some(routing) = crate::rmap::entity_cell_for_fact(snapshot, ft_id, fact) {
+                touched.insert((routing.noun_name, routing.entity_id));
+            }
+        }
+    }
+
+    // Early out — nothing to absorb.
+    if touched.is_empty() {
+        return delta.clone();
+    }
+
+    // Step 2: post-apply view (snapshot overlaid with delta) — used
+    // to source unchanged FT cells when projecting the entity row.
+    // Eventless merge: this is a read-only projection helper.
+    let merged = ast::merge_delta(snapshot, delta, None);
+
+    // Step 3: rmap shard map keyed by FT id. Used to find every FT
+    // that absorbs into a given entity table (snake_case).
+    let shard_map = crate::rmap::rmap_cell_map_from_state(snapshot);
+
+    // Step 4: project the 3NF row per touched entity. The id column
+    // (per the noun's reference scheme) is seeded from the entity_id
+    // itself. All other columns come from FTs whose shard target
+    // matches the entity's snake-cased noun name.
+    let mut entity_rows: HashMap<String, ast::Object> = HashMap::new();
+    for (noun_name, entity_id) in touched {
+        let target_snake = crate::rmap::to_snake(&noun_name);
+        let id_field = crate::rmap::entity_id_field_name(snapshot, &noun_name);
+
+        let mut row: HashMap<String, ast::Object> = HashMap::new();
+        row.insert(id_field, ast::Object::atom(&entity_id));
+
+        for (ft_id, target) in shard_map.iter() {
+            if *target != target_snake { continue; }
+            let cell = ast::fetch_or_phi(ft_id, &merged);
+            let Some(facts) = cell.as_seq() else { continue };
+            for fact in facts.iter() {
+                if ast::binding(fact, &noun_name) != Some(&entity_id) { continue; }
+                // Pull every (field, value) pair except the absorber's
+                // (noun, entity_id) self-pair. Multiple FTs may
+                // contribute different fields to the same row; this
+                // fold accumulates them.
+                let Some(pairs) = fact.as_seq() else { continue };
+                for pair in pairs.iter() {
+                    let Some(items) = pair.as_seq() else { continue };
+                    if items.len() != 2 { continue; }
+                    let Some(k) = items[0].as_atom() else { continue };
+                    if k == noun_name { continue; }
+                    let Some(v) = items[1].as_atom() else { continue };
+                    row.insert(k.to_string(), ast::Object::atom(v));
+                }
+            }
+        }
+
+        let cell_name = format!("{}:{}", noun_name, entity_id);
+        let row_obj = ast::Object::Map(row);
+
+        // Skip emission if the entity cell already exists with the
+        // same row contents — chain-extension is wasted work.
+        let snapshot_row = ast::fetch(&cell_name, snapshot);
+        if snapshot_row != row_obj {
+            entity_rows.insert(cell_name, row_obj);
+        }
+    }
+
+    // Step 5: combine the original delta's FT cells with the new
+    // entity cells. Both ride into the same merge_delta call so the
+    // apply event is stamped on every chain entry uniformly.
+    let mut combined: HashMap<String, ast::Object> = match delta {
+        ast::Object::Map(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        ast::Object::Seq(_) | _ => ast::cells_iter(delta).into_iter()
+            .map(|(name, contents)| (name.to_string(), contents.clone()))
+            .collect(),
+    };
+    combined.extend(entity_rows);
+    ast::Object::Map(combined)
 }
 
 /// Extract declared write targets for known system verbs. Returns
@@ -3061,6 +3183,132 @@ Order has total.
              an Object::atom, classify_writer_result slotted it into \
              NoCommit, and merge_delta never ran."
         );
+
+        release_impl(h);
+    }
+
+    // ── #770 — per-entity cells (paper §196 + §462 eq:cellfold) ─────────
+    //
+    // Each entity is a cell whose contents is the 3NF row that Halpin's
+    // RMAP absorbs from all FTs whose UC chains anchor to that entity's
+    // key. Materialised at the apply commit boundary alongside the
+    // existing FT-cell writes (the eq:demux intermediate per §458 stays
+    // live so projection queries keep working). Cell name convention:
+    // `<Noun>:<entity-id>` (e.g. `Order:ord-1`).
+
+    /// Per-entity cell exists and carries a chain after `create:Order`.
+    /// Both `cell_pin("Order:ord-1") = 1` (one apply, one chain entry)
+    /// and `fetch_cell("Order:ord-1")` returns a JSON object with all
+    /// declared fields (id + total + customer).
+    ///
+    /// Uses `create_bare_impl` so the user's `Order` noun isn't
+    /// shadowed by the metamodel's pre-loaded `Order` (an internal
+    /// fact-type role positions noun); the feature contract — per-
+    /// entity cells materialize at apply time — is independent of
+    /// whether the metamodel is loaded.
+    #[test]
+    fn create_order_materializes_per_entity_cell_with_3nf_row() {
+        let h = create_bare_impl();
+        let readings = "\
+Order(.id) is an entity type.
+Order has total.
+  Each Order has at most one total.
+Order has customer.
+  Each Order has at most one customer.
+";
+        let compile_out = system_impl(h, "compile", readings);
+        assert!(!compile_out.starts_with('⊥'),
+            "compile must not reject Order schema, got: {compile_out}");
+
+        let create_out = system_impl(h, "create:Order",
+            "<<id, ord-1>, <total, 100>, <customer, acme>>");
+        assert!(!create_out.starts_with('⊥'),
+            "create:Order must not return ⊥, got: {create_out}");
+
+        // (a) cell_pin returns 1 — one apply, one chain entry.
+        let pin = system_impl(h, "cell_pin", "Order:ord-1");
+        assert_eq!(pin, "1",
+            "cell_pin(\"Order:ord-1\") must be 1 after one create; got: {pin}");
+
+        // (b) fetch_cell returns the 3NF row JSON containing all fields.
+        let row = system_impl(h, "fetch_cell", "Order:ord-1");
+        assert!(row.contains("\"total\""),
+            "fetch_cell must return a row containing total field; got: {row}");
+        assert!(row.contains("\"100\"") || row.contains("100"),
+            "fetch_cell row must include total value 100; got: {row}");
+        assert!(row.contains("\"customer\""),
+            "fetch_cell must return a row containing customer field; got: {row}");
+        assert!(row.contains("acme"),
+            "fetch_cell row must include customer value acme; got: {row}");
+        assert!(row.contains("ord-1"),
+            "fetch_cell row must include id ord-1; got: {row}");
+
+        // (c) FT cells stay live (eq:demux intermediate per §458).
+        let ft_total = system_impl(h, "fetch_cell", "Order_has_total");
+        assert!(!ft_total.starts_with('⊥'),
+            "FT cell Order_has_total must remain populated; got: {ft_total}");
+        assert!(ft_total.contains("ord-1") && ft_total.contains("100"),
+            "Order_has_total must contain the fact for ord-1; got: {ft_total}");
+        let ft_cust = system_impl(h, "fetch_cell", "Order_has_customer");
+        assert!(!ft_cust.starts_with('⊥'),
+            "FT cell Order_has_customer must remain populated; got: {ft_cust}");
+        assert!(ft_cust.contains("ord-1") && ft_cust.contains("acme"),
+            "Order_has_customer must contain the fact for ord-1; got: {ft_cust}");
+
+        release_impl(h);
+    }
+
+    /// `update:Order` extends the per-entity cell's chain. After two
+    /// applies on the same entity the chain head is at version 2; the
+    /// row reflects the latest values; history shows both VersionEntry
+    /// items, each carrying an apply_event payload (per §757).
+    #[test]
+    fn update_order_extends_per_entity_chain_with_event_payload() {
+        let h = create_bare_impl();
+        let readings = "\
+Order(.id) is an entity type.
+Order has total.
+  Each Order has at most one total.
+Order has customer.
+  Each Order has at most one customer.
+";
+        assert!(!system_impl(h, "compile", readings).starts_with('⊥'));
+
+        let _ = system_impl(h, "create:Order",
+            "<<id, ord-1>, <total, 100>, <customer, acme>>");
+        let upd_out = system_impl(h, "update:Order",
+            "<<id, ord-1>, <total, 250>>");
+        assert!(!upd_out.starts_with('⊥'),
+            "update:Order must succeed; got: {upd_out}");
+
+        // (a) chain head bumped to 2 (one create + one update).
+        let pin = system_impl(h, "cell_pin", "Order:ord-1");
+        assert_eq!(pin, "2",
+            "cell_pin(\"Order:ord-1\") must be 2 after create+update; got: {pin}");
+
+        // (b) fetch_cell shows the updated row (total = 250) and
+        // preserves the unchanged customer field.
+        let row = system_impl(h, "fetch_cell", "Order:ord-1");
+        assert!(row.contains("250"),
+            "fetch_cell row must reflect updated total=250; got: {row}");
+        assert!(row.contains("acme"),
+            "fetch_cell row must preserve unchanged customer=acme; got: {row}");
+
+        // (c) chain history shows two VersionEntry items, each with
+        // apply_event payloads (verb + operand) per S1c #757.
+        let snapshot = peek(h).expect("handle live");
+        let history = ast::cells_iter_history(&snapshot, "Order:ord-1");
+        assert_eq!(history.len(), 2,
+            "history must show two VersionEntry items after create+update; got {} entries",
+            history.len());
+        let events: Vec<&str> = history.iter()
+            .filter_map(|entry| ast::version_entry_event(entry))
+            .filter_map(|ev| ast::apply_event_verb(ev))
+            .collect();
+        assert!(events.iter().any(|v| *v == "create:Order"),
+            "first chain entry must carry create:Order event; got events: {events:?}");
+        assert!(events.iter().any(|v| *v == "update:Order"),
+            "second chain entry must carry update:Order event; got events: {events:?}");
 
         release_impl(h);
     }
