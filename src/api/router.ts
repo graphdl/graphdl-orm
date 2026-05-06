@@ -461,6 +461,24 @@ router.post('/api/import', async (request: Request, env: Env) => {
 router.post('/api/evaluate', handleEvaluate)
 router.post('/api/synthesize', (request, env) => handleSynthesize(request, env))
 
+// ── Induction (discover constraints from population) — uses WASM engine
+//
+// TODO(T2 / #700 / 2026-05-04): collapse into a `dispatchVerb('induce', …)`
+// arm once the Rust side gains a real `induce` system intercept. The
+// `induce` module was deleted in #211 (zero production callers, tests
+// were self-referential), so this route currently dispatches a key the
+// engine no longer recognises and returns ⊥. Left hand-coded to mark
+// the gap; do NOT add the engine verb from this agent (that's a Rust
+// task and out of scope per the audit instructions).
+router.post('/api/induce', async (request, env: Env) => {
+  const body = await request.json() as { domain?: string }
+  const registry = getRegistryDO(env, 'global') as any
+  const getStub = (id: string) => getEntityDO(env, id) as any
+  const handle = await loadDomainSchema(registry, getStub, body.domain || 'default')
+  if (handle < 0) return error(400, { errors: [{ message: 'no domain loaded' }] })
+  return json(JSON.parse(wasmSystem(handle, 'induce', '')))
+})
+
 // Entity creation goes through POST /api/entities/:noun (the AREST command path).
 
 router.post('/api/_placeholder', async (request: Request, env: Env) => {
