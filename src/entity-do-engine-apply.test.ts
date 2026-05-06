@@ -176,10 +176,12 @@ describe('EntityDB engine-apply write path (#766)', () => {
   }, COMPILE_TIMEOUT_MS)
 
   it('round-trip: SQL cell row stays updated after engine apply (back-compat for #765)', async () => {
-    // #765 hasn't routed reads through the engine yet, so the legacy
-    // `fetchCell(sql)` path must still surface the latest payload.
-    // After #768 (`cell.version` column drop) we revisit this; until
-    // then the SQL row is the read-side store of record.
+    // #765 routes reads through the engine where chain-resident cells
+    // exist, but for the still-fact-keyed payload the engine returns ⊥
+    // and `fetchCell(sql)` is the back-compat surface. The SQL row
+    // remains the read-side store of record for the {id,type,data}
+    // contents column even after #768 dropped the legacy cell.version
+    // column — only the version sidecar is gone.
     await db.put({
       id: 'ord-1',
       type: 'Order',

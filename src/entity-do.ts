@@ -61,31 +61,32 @@ export interface Fact {
 // ── Schema ──────────────────────────────────────────────────────────
 
 export function initCellSchema(sql: SqlLike): void {
-  // The `version` column is the per-cell monotonic counter used as
-  // part of the AEAD AAD (#661 / #558). Each successful sealed write
-  // bumps it; a captured-then-replayed older sealed envelope at the
-  // same `(scope, domain, cell_name)` fails to decrypt because the
-  // current row's version no longer matches the captured ciphertext's
-  // AAD. Default 0 — the first sealed write bumps to 1.
+  // ⟨id, type, data⟩ — the cell's contents per AREST.tex §202. The
+  // chain (per-DO engine) IS the version-of-record per §462 eq:cellfold
+  // and §472 ("hash chain provides ordering"); cell.version was the
+  // divergent SQL sidecar §3.3 warns against. As of #768 the column is
+  // gone — `aadVersionFor` sources the AEAD AAD `version` field from
+  // `system(h, "cell_pin", cellName)` exclusively (#767 / S1e + #770).
   sql.exec(`CREATE TABLE IF NOT EXISTS cell (
     id TEXT PRIMARY KEY,
     type TEXT NOT NULL,
-    data TEXT NOT NULL DEFAULT '{}',
-    version INTEGER NOT NULL DEFAULT 0
+    data TEXT NOT NULL DEFAULT '{}'
   )`)
 
-  // Schema migration: existing DOs created before #661 don't have the
-  // `version` column. ALTER TABLE ADD COLUMN is idempotent-by-trial:
-  // SQLite throws "duplicate column name" if it already exists, which
-  // we swallow. Pre-existing rows pick up the DEFAULT 0 — matching
-  // the "all existing cells are at version 0" baseline the task brief
-  // calls out.
+  // ── Migration: drop the legacy `version` column (#768, #721-followup-e) ──
+  //
+  // Pre-#768 DOs persisted a per-cell monotonic counter in `cell.version`
+  // and folded it into the AEAD AAD. With the engine chain shipped
+  // (#764–#770), that counter is the divergent sidecar AREST.tex §202
+  // / eq:cellfold rules out — chain head from `cell_pin` is now the
+  // canonical source. Drop the column on existing DOs; idempotent-by-trial
+  // (SQLite raises "no such column" once the column has already been
+  // dropped, or when CREATE TABLE above ran fresh without it).
   try {
-    sql.exec(`ALTER TABLE cell ADD COLUMN version INTEGER NOT NULL DEFAULT 0`)
+    sql.exec(`ALTER TABLE cell DROP COLUMN version`)
   } catch {
-    // Column already exists — expected when the table was created
-    // fresh by the CREATE TABLE above (with the column already in
-    // its declaration).
+    // Column already absent — expected on fresh DOs (CREATE TABLE above
+    // omits `version`) and on second-call idempotency for migrated DOs.
   }
 
   // Migration from old entity table: if entity table exists, migrate data.
@@ -107,8 +108,8 @@ export function initCellSchema(sql: SqlLike): void {
       const row = rows[0] as Record<string, any>
       const data = typeof row.fields === 'string' ? row.fields : JSON.stringify(row.fields || {})
       sql.exec(
-        `INSERT OR REPLACE INTO cell (id, type, data, version) VALUES (?, ?, ?, ?)`,
-        row.id, row.noun, data, 0,
+        `INSERT OR REPLACE INTO cell (id, type, data) VALUES (?, ?, ?)`,
+        row.id, row.noun, data,
       )
       sql.exec(`DROP TABLE entity`)
     }
@@ -256,14 +257,17 @@ export function removeCell(sql: SqlLike): { id: string } | null {
 export const SEALED_CELL_PREFIX = 'ARESTAEAD1:'
 
 /** Build a CellAddress from the EntityDB's notion of (type, id) plus
- *  the per-row monotonic version (#661 — sourced from the engine's
- *  `cell_pin` chain head as of #767/S1e, with the worker SQL
- *  `cell.version` column as a backwards-compat fallback for legacy
- *  cells that pre-date the per-DO engine path).
+ *  the chain head version_id sourced from `system(h, "cell_pin", id)`
+ *  (#767 / S1e + #770). With the per-DO engine chain shipped, the
+ *  chain IS the version stamp per AREST.tex §462 eq:cellfold and §472
+ *  ("hash chain provides ordering") — so the worker no longer mints a
+ *  parallel SQL counter (the divergent sidecar §3.3 / §202 warns against).
  *
- *  Pre-existing cells default to version 0 (matching the schema
- *  column DEFAULT); the first successful sealed write through
- *  `storeCellSealed` bumps to 1. */
+ *  Pre-#770 cells (chain has no entry for `id` yet) default to version 0
+ *  via `aadVersionFor`'s fallback; the first successful sealed write
+ *  through `storeCellSealed` materialises a chain entry through the
+ *  engine apply path (#766) and the AAD `version` jumps to whatever
+ *  chain head `cell_pin` reports next. */
 export function cellAddressFor(type: string, id: string, version: number = 0): CellAddress {
   return {
     scope: 'worker',
@@ -273,73 +277,56 @@ export function cellAddressFor(type: string, id: string, version: number = 0): C
   }
 }
 
-/** Resolve the AAD `version` field for a sealed cell. Per #767/S1e,
- *  the canonical source is the per-DO engine's `cell_pin` for
- *  `cellName` against the supplied `engineHandle`. If the engine has
- *  no chain entry for that cell (legacy cell that never went through
- *  the engine path, or fresh chain that hasn't received its first
- *  apply), the helper falls back to the worker-minted `fallbackVersion`
- *  (typically the `cell.version` SQL column) so that envelopes sealed
- *  before the engine path was wired still open during the migration
- *  window. The fallback path goes away with #768 when the SQL column
- *  is dropped.
+/** Resolve the AAD `version` field for a sealed cell from the per-DO
+ *  engine's `cell_pin` chain head for `cellName` (#767 / S1e + #770).
  *
- *  When `engineHandle < 0` (no engine bound, e.g. a unit test exercising
- *  the legacy-only path) the helper short-circuits to the fallback.
+ *  As of #768 there is no SQL fallback — the worker `cell.version`
+ *  column is gone. When `engineHandle < 0` (no engine bound, e.g. a
+ *  unit test exercising the legacy-only path before hydrate) or when
+ *  the engine has no chain entry yet for this cell, the helper returns
+ *  `0` (the eq:cellfold "empty fold" baseline). Once the cell's first
+ *  sealed write lands on the chain via #766's `writeCellThroughEngine`,
+ *  `cell_pin` reports the chain head and subsequent reads pick it up.
  *
- *  Note: the AAD AAD already binds version_id by construction (S1i
- *  #725) — this helper just sources the field from the engine's true
- *  storage version instead of the worker-minted counter. */
+ *  Note: the AEAD AAD binds version_id by construction (S1i #725) —
+ *  this helper sources the field from the chain so the worker matches
+ *  the engine's storage version_id exactly. */
 export function aadVersionFor(
   engineHandle: number,
   cellName: string,
-  fallbackVersion: number,
 ): number {
-  if (engineHandle < 0) return fallbackVersion
+  if (engineHandle < 0) return 0
   const pinned = callCellPin(engineHandle, cellName)
-  return pinned ?? fallbackVersion
+  return pinned ?? 0
 }
 
 /** ↑n — fetch the cell, decrypting if the row carries the sealed
  *  prefix. Returns the same shape as `fetchCell` so callers can
  *  swap the helper without touching their consumers.
  *
- *  The persisted `version` column is read alongside the sealed bytes
- *  and folded into the CellAddress before `cellOpen` — without it the
- *  AEAD opener would derive a different per-cell HKDF key (since the
- *  AAD includes the version) and every read after the first write
- *  would surface as `CellAeadError(auth)`.
+ *  ## AAD version source (#767 / S1e + #768)
  *
- *  ## AAD version source (#767 / S1e)
- *
- *  When `engineHandle >= 0` the AAD `version` field is sourced from
- *  the engine's `cell_pin` for this cell (the chain head version_id —
- *  per §S1c eq:cellfold the chain IS the version stamp). For legacy
- *  cells whose chain entry has not yet been written through the
- *  engine, `cell_pin` returns `⊥` and the helper falls back to the
- *  worker-minted `cell.version` column, so existing-cell envelopes
- *  still open during the migration window before #768 drops the SQL
- *  column. Pass `-1` (the default) for the no-engine path. */
+ *  The AAD `version` field is sourced from the engine's `cell_pin`
+ *  chain head for this cell — per AREST.tex §462 eq:cellfold and §472
+ *  the chain IS the version stamp. As of #768 there is no SQL fallback
+ *  (the `cell.version` column has been dropped); when the engine has
+ *  no chain entry yet, `aadVersionFor` returns `0` (the empty-fold
+ *  baseline). Pass `-1` for `engineHandle` in the no-engine path
+ *  (legacy unit tests) — the AAD then resolves to `0`, matching what
+ *  `storeCellSealed` would have sealed under at the same call. */
 export async function fetchCellSealed(
   sql: SqlLike,
   master: TenantMasterKey,
   engineHandle: number = -1,
 ): Promise<CellContents | null> {
-  const rows = sql.exec(`SELECT id, type, data, version FROM cell`).toArray()
+  const rows = sql.exec(`SELECT id, type, data FROM cell`).toArray()
   if (rows.length === 0) return null
   const row = rows[0] as Record<string, any>
   const dataField: unknown = row.data
-  // Coerce the persisted version. Older DOs that pre-date the
-  // schema change return undefined for the column; treat those as
-  // version 0 (legacy baseline). SQLite returns INTEGER as `number`
-  // through the workerd binding.
-  const persistedVersion = typeof row.version === 'number' && Number.isFinite(row.version)
-    ? row.version
-    : 0
   let data: Record<string, unknown>
   if (typeof dataField === 'string' && dataField.startsWith(SEALED_CELL_PREFIX)) {
     const sealed = base64ToBytes(dataField.slice(SEALED_CELL_PREFIX.length))
-    const aadVersion = aadVersionFor(engineHandle, row.id as string, persistedVersion)
+    const aadVersion = aadVersionFor(engineHandle, row.id as string)
     const address = cellAddressFor(row.type as string, row.id as string, aadVersion)
     const opened = await cellOpen(master, address, sealed)
     const json = new TextDecoder().decode(opened)
@@ -417,27 +404,23 @@ export async function fetchCellSealedViaEngine(
  *  with `SEALED_CELL_PREFIX` so `fetchCellSealed` / `fetchCell` can
  *  tell encrypted rows from legacy plaintext.
  *
- *  ## Atomic version + sealed write (#661)
+ *  ## AAD version source (#767 / S1e + #768 + #770)
  *
- *  Read the current `version` column for this row, bump by 1, build
- *  the CellAddress with the NEW version, seal under that address,
- *  and persist `(version, sealed)` in a single
- *  `INSERT OR REPLACE INTO cell` call. The DO is single-writer by
- *  Cloudflare's design, so the read-modify-write window cannot
- *  observe a concurrent put on the same row; the single SQL UPSERT
- *  commits both halves together (the sealed bytes and the new
- *  version), preserving the invariant that the persisted version
- *  always matches the AAD the sealed bytes were produced under.
+ *  The CellAddress AAD `version` is sourced from the engine's
+ *  `cell_pin` chain head for this cell — per AREST.tex §462 eq:cellfold
+ *  and §472 the chain IS the version stamp. Caller (`EntityDB.put`)
+ *  routes the write through `writeCellThroughEngine` BEFORE invoking
+ *  this helper, so the chain has already extended and `cell_pin`
+ *  reports the new head; this seal then binds that head into the AAD
+ *  and the matching `fetchCellSealed` path (which sources the same
+ *  head) recovers the plaintext.
  *
- *  ## AAD version source (#767 / S1e)
- *
- *  The version baked into the CellAddress AAD is sourced from the
- *  engine's `cell_pin` for this cell when `engineHandle >= 0` —
- *  per §S1c eq:cellfold the chain IS the version stamp. The fallback
- *  path (no engine, or pre-engine cell) keeps using `nextVersion`
- *  (the bumped worker counter) so the legacy seal/open contract
- *  still holds during the migration window before #768 drops the
- *  SQL column. */
+ *  Pre-#770 ordering note: when the engine has no chain entry for the
+ *  cell yet (e.g. apply path didn't materialise an entity cell — the
+ *  pre-#770 fact-keyed-only world), `aadVersionFor` returns `0` and
+ *  read/write both bind `0` so the round-trip still works; once #770's
+ *  per-entity chain materialisation lands the live behaviour the AAD
+ *  threads non-zero version_ids. */
 export async function storeCellSealed(
   sql: SqlLike,
   master: TenantMasterKey,
@@ -446,35 +429,20 @@ export async function storeCellSealed(
   data: Record<string, unknown>,
   engineHandle: number = -1,
 ): Promise<CellContents> {
-  // Read the current version for this row (if any). A fresh cell
-  // returns 0 rows; a re-write returns the existing row's stamp.
-  // The DO is single-writer, so this read-then-write window is
-  // atomic with respect to any other operation on the same DO.
-  const existing = sql.exec(`SELECT version FROM cell WHERE id = ?`, id).toArray()
-  const prevVersion = existing.length > 0 && typeof (existing[0] as any).version === 'number'
-    ? (existing[0] as any).version as number
-    : 0
-  const nextVersion = prevVersion + 1
-
   const json = JSON.stringify(data)
-  // AAD version: prefer engine's chain head over the worker counter.
-  // For a brand-new cell the engine returns ⊥; the bumped counter
-  // (`nextVersion`) acts as the legacy fallback so AEAD seal/open
-  // round-trips work uniformly across the migration window.
-  const aadVersion = aadVersionFor(engineHandle, id, nextVersion)
+  // AAD version comes straight from the chain head. The engine apply
+  // call (in `EntityDB.put`) runs BEFORE us so the chain has already
+  // extended; `fetchCellSealed`'s mirror call to `aadVersionFor` will
+  // surface the same head and the AEAD round-trip closes.
+  const aadVersion = aadVersionFor(engineHandle, id)
   const address = cellAddressFor(type, id, aadVersion)
   const sealed = await cellSeal(master, address, json)
   const blob = SEALED_CELL_PREFIX + bytesToBase64(sealed)
-  // Persist sealed bytes + new version atomically. INSERT OR REPLACE
-  // is one statement; SQLite commits it as a single row write, so
-  // we cannot end up in a state where the new sealed bytes were
-  // committed but the version bump was not (or vice versa).
   sql.exec(
-    `INSERT OR REPLACE INTO cell (id, type, data, version) VALUES (?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO cell (id, type, data) VALUES (?, ?, ?)`,
     id,
     type,
     blob,
-    nextVersion,
   )
   return { id, type, data }
 }
@@ -1065,7 +1033,7 @@ export class EntityDB extends DurableObject {
       callFetchCell(this.engineHandle, cellName)
     }
     const rows = this.ctx.storage.sql
-      .exec(`SELECT id, type, data, version FROM cell`)
+      .exec(`SELECT id, type, data FROM cell`)
       .toArray()
     if (rows.length === 0) {
       return { ok: true, rotated: false }
@@ -1079,16 +1047,17 @@ export class EntityDB extends DurableObject {
     const oldMaster = await deriveTenantMasterKey(args.oldSeed, args.oldSalt)
     const newMaster = await deriveTenantMasterKey(args.newSeed, args.newSalt)
     const sealed = base64ToBytes(dataField.slice(SEALED_CELL_PREFIX.length))
-    // The AAD the sealed bytes were produced under: prefer engine's
-    // chain head (matches the engine-sealed path), fall back to the
-    // SQL counter (matches the pre-engine legacy path). Rotation
-    // re-seals the recovered plaintext at the SAME address (same
-    // version) but under the new master — the version field stays
-    // put, only the master derivation changes.
-    const persistedVersion = typeof row.version === 'number' && Number.isFinite(row.version)
-      ? row.version
-      : 0
-    const aadVersion = aadVersionFor(this.engineHandle, row.id as string, persistedVersion)
+    // AAD source for rotation is the engine's chain head per #768 +
+    // #770. With the worker `cell.version` column gone, the chain IS
+    // the canonical version stamp (AREST.tex §462 eq:cellfold / §472).
+    // Rotation does NOT extend the chain — it's a key swap on the
+    // persistence layer, not a logical mutation of the cell's contents
+    // — so the chain head observed here is the SAME version_id the
+    // sealed bytes were originally produced under, which is exactly
+    // what AEAD AAD reconstruction needs. The next `EntityDB.get` call
+    // sources the same `cell_pin` value when computing the AAD for the
+    // re-encrypted bytes; round-trip closes.
+    const aadVersion = aadVersionFor(this.engineHandle, row.id as string)
     const address = cellAddressFor(row.type as string, row.id as string, aadVersion)
     let newSealed: Uint8Array
     try {
@@ -1102,28 +1071,20 @@ export class EntityDB extends DurableObject {
     // Atomic swap: write the new sealed envelope back. The DO's
     // single-writer guarantee means no concurrent put/get on this DO
     // can interleave between the read above and the write below.
-    // The version is preserved — rotation is master-only, not
-    // content-mutating, so bumping the version stamp here would
-    // wrongly invalidate the just-produced sealed bytes against
-    // their own AAD.
     //
-    // #766 (#721-followup-c) note: this SQL write does NOT route
-    // through `writeCellThroughEngine`. Engine apply would mint a new
-    // VersionEntry via `merge_delta` (S1b #718) and bump the chain's
-    // version_id from N to N+1. The rotated sealed bytes here carry
-    // AAD=N (preserved per the contract above); after #767 lands and
-    // sources `CellAddress.version` from `system(h, "cell_pin", …)`,
-    // a chain at N+1 against AAD=N would fail every subsequent
-    // `cellOpen` for this cell. Rotation must therefore stay
-    // engine-silent — it's a key swap on the persistence layer, not
-    // a logical mutation of the cell's contents.
+    // Engine-silent by design — `writeCellThroughEngine` would mint a
+    // new VersionEntry via `merge_delta` (S1b #718) and bump the
+    // chain's version_id from N to N+1, while the rotated sealed
+    // bytes still carry AAD=N. With AAD now sourced exclusively from
+    // `cell_pin` (#768), a chain at N+1 against AAD=N would fail
+    // every subsequent `cellOpen` for this cell. Rotation MUST stay
+    // engine-silent so the chain head + AAD version stay in lockstep.
     const blob = SEALED_CELL_PREFIX + bytesToBase64(newSealed)
     this.ctx.storage.sql.exec(
-      `INSERT OR REPLACE INTO cell (id, type, data, version) VALUES (?, ?, ?, ?)`,
+      `INSERT OR REPLACE INTO cell (id, type, data) VALUES (?, ?, ?)`,
       row.id,
       row.type,
       blob,
-      persistedVersion,
     )
     // Invalidate the memoised master so subsequent calls re-derive
     // from whichever seed `env` exposes (the orchestrator promotes

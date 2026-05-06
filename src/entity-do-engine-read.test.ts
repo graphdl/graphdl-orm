@@ -206,8 +206,11 @@ describe('EntityDB engine-routed cell reads (#765)', () => {
   // The brief calls out three cell classes: (a) engine-apply-written,
   // (b) pre-#766 legacy direct-SQL, (c) rotateMaster-rewritten
   // direct-SQL. Classes (b) + (c) MUST stay readable through the SQL
-  // fallback for the migration window before #768 drops the
-  // `cell.version` column and a future task migrates the chain.
+  // fallback for the migration window — even now that #768 has
+  // dropped the worker-minted `cell.version` SQL column, the SQL
+  // PAYLOAD column ({id, type, data}) keeps the legacy contents
+  // readable via `fetchCell` until a future task migrates them onto
+  // the engine chain.
 
   it('SQL fallback returns the legacy value when callFetchCell returns null', async () => {
     // Simulate a class (b) legacy cell: the SQL row exists (written

@@ -75,10 +75,11 @@ export function thawHandle(handle: number, hexBytes: string): boolean {
  *   - the named cell has no chain entry (pre-S1b raw cell, or never
  *     written through the engine)
  *
- * The caller is expected to fall back to its legacy version source
- * (the worker `cell.version` SQL column) when this returns `null`,
- * so existing-cell encryption/decryption still works during the
- * migration window before #768 drops the column.
+ * As of #768 the worker `cell.version` SQL column is gone — the AAD
+ * `version` field falls back to `0` (the eq:cellfold "empty fold"
+ * baseline) when this returns `null`. Once the cell's first write
+ * lands on the chain through `writeCellThroughEngine` (#766) the
+ * pin reports a real version_id and subsequent reads pick it up.
  */
 export function callCellPin(handle: number, cellName: string): number | null {
   ensureWasm()
