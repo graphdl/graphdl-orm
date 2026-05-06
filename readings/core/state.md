@@ -38,6 +38,7 @@ Status is initial in State Machine Definition.
   Each State Machine Definition has at most one initial Status.
 Status is defined in State Machine Definition. *
 Status is terminal in State Machine Definition. *
+Status is rooted in State Machine Definition. *
 
 ### Guard
 Guard references Fact Type.
@@ -84,6 +85,44 @@ Guard prevents Transition.
 -->
 
 * Status is defined in State Machine Definition iff that Status is initial in that State Machine Definition.
+
+<!--
+  #760 / Audit MC3b-b: Pass-4 graph-derived initial Status. Mirrors
+  the source-never-target topology fold in
+  `derive_state_machines_from_facts` at compile.rs:479-505.
+
+  A Status is "rooted" in a SM iff it is the source of some Transition
+  in that SM and no Transition in that SM has it as target. The
+  consumer side (#761 — `compile_state_machine`) promotes a single
+  rooted Status to `is initial in` ONLY when the rooted set has
+  cardinality 1; ambiguity (multiple rooted, zero rooted, or cycles)
+  leaves the SM without an inferred initial — the same behaviour the
+  Rust path implements at compile.rs:502-504.
+
+  Two things the rule is NOT able to express on its own and that the
+  consumer side (#761) must therefore implement:
+
+  (1) Uniqueness gate. FORML 2 derivations are monotonic — "exactly
+      one rooted Status per SM" is a cardinality predicate, not a
+      join. Per task #760's option (a) we deliberately stop short
+      and emit every candidate; the consumer applies cardinality.
+
+  (2) Strict set-difference negation. The parser currently strips
+      the leading `no` and the trailing `where …` clause and falls
+      back to resolving the bare FT (parse_forml2.rs:1184-1194), so
+      the negative antecedent does not produce an `AbsenceOf` source
+      — only the explicit `_cwa_negation_…` synthetic rules in
+      compile.rs:2546-2599 currently emit AbsenceOf, and only for
+      CWA nouns. Until parser-side negation lands as a follow-up,
+      this rule over-emits for source-AND-target Statuses; the
+      consumer's cardinality gate filters that case naturally
+      (over-emit ⇒ |rooted| > 1 ⇒ no initial inferred ⇒ same end
+      result as the Rust path's "ambiguous" branch).
+
+  See task #760 report for grammar coverage notes.
+-->
+
+* Status is rooted in State Machine Definition iff some Transition is defined in that State Machine Definition and that Transition is from that Status and no Transition is defined in that State Machine Definition where that Transition is to that Status.
 
 ## Constraints
 

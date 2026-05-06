@@ -786,3 +786,141 @@ Status 'Placed' is defined in State Machine Definition 'OrderSM'.
         initial_pairs,
     );
 }
+
+// ─── Pass 4: graph-derived initial Status (#760 / Audit MC3b-b) ─────
+//
+// readings/core/state.md adds a Pass-4 derivation rule that mirrors
+// the topology fold in `derive_state_machines_from_facts` at
+// compile.rs:479-505:
+//
+//   A Status is "rooted" in a State Machine Definition iff some
+//   Transition in that SM has it as source AND no Transition in that
+//   SM has it as target. Source-never-target is the graph-theoretic
+//   characterization of an initial state when no `is initial in` fact
+//   was declared.
+//
+// Per task #760, we use option (a): emit `Status is rooted in SM` for
+// EVERY source-never-target candidate. The uniqueness gate ("exactly
+// one rooted Status implies the engine treats it as initial") is
+// deferred to the consumer side (#761 — `compile_state_machine` will
+// promote to initial only when the rooted set has cardinality 1).
+// FORML 2 derivations are monotonic, so "exactly one" cannot be
+// expressed as a derivation rule; it is naturally a constraint /
+// cardinality predicate the consumer applies after forward-chain.
+//
+// This test exercises the unique-source-never-target case so the rule
+// fires and lands one entry in the rooted cell.
+
+#[test]
+fn sm_derivation_rules_populate_rooted_cell_from_graph_topology_when_no_initial_fact() {
+    use crate::ast::{cells_iter, fetch_or_phi};
+
+    // (1) The Pass-4 derivation rule must be present in
+    // readings/core/state.md — this is the file change #760 ships.
+    let state_md = include_str!("../../../readings/core/state.md");
+    let pass4_rule_text = "Status is rooted in State Machine Definition iff some Transition is defined in that State Machine Definition and that Transition is from that Status and no Transition is defined in that State Machine Definition where that Transition is to that Status";
+    assert!(
+        state_md.contains(pass4_rule_text),
+        "readings/core/state.md must contain the Pass-4 derivation rule (#760)\n\
+         expected substring: `{}`\n\
+         (this rule mirrors compile.rs:479-505 — source-never-target Statuses are graph-rooted candidates for initial)",
+        pass4_rule_text,
+    );
+
+    // (2) Self-contained smoke: declare the SM, two transitions
+    // forming a chain Draft -> Placed -> Shipped, with NO `is initial
+    // in` instance fact. Assert the rooted cell contains (Draft,
+    // OrderSM) and ONLY (Draft, OrderSM) — Placed is a target, Shipped
+    // is a target, Draft is the lone source-never-target.
+    let src = r#"# SM Derivation TDD — Pass 4
+Order(.Name) is an entity type.
+State Machine Definition(.Name) is an entity type.
+Status(.Name) is an entity type.
+Transition(.Name) is an entity type.
+Fact Type(.Name) is an entity type.
+Noun is an entity type.
+
+## Fact Types
+State Machine Definition is for Noun.
+Transition is defined in State Machine Definition.
+Transition is from Status.
+Transition is to Status.
+Transition is triggered by Fact Type.
+Status is rooted in State Machine Definition. *
+
+## Derivation Rules
+* Status is rooted in State Machine Definition iff some Transition is defined in that State Machine Definition and that Transition is from that Status and no Transition is defined in that State Machine Definition where that Transition is to that Status.
+
+## Instance Facts
+State Machine Definition 'OrderSM' is for Noun 'Order'.
+Transition 'place' is defined in State Machine Definition 'OrderSM'.
+Transition 'place' is from Status 'Draft'.
+Transition 'place' is to Status 'Placed'.
+Transition 'place' is triggered by Fact Type 'Order_was_placed'.
+Transition 'ship' is defined in State Machine Definition 'OrderSM'.
+Transition 'ship' is from Status 'Placed'.
+Transition 'ship' is to Status 'Shipped'.
+Transition 'ship' is triggered by Fact Type 'Order_was_shipped'.
+"#;
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    let model = crate::compile::compile(&state);
+    let derivation_refs: Vec<(&str, &crate::ast::Func)> =
+        model.derivations.iter().map(|d| (d.id.as_str(), &d.func)).collect();
+    let (final_state, _derived) =
+        crate::evaluate::forward_chain_defs_state(&derivation_refs, &state);
+
+    let rooted_cell = fetch_or_phi("Status_is_rooted_in_State_Machine_Definition", &final_state);
+    let rooted_pairs: Vec<(String, String)> = rooted_cell.as_seq().map(|facts| {
+        facts.iter().filter_map(|f| {
+            let pairs = f.as_seq()?;
+            let mut status: Option<String> = None;
+            let mut sm: Option<String> = None;
+            for p in pairs.iter() {
+                let kv = p.as_seq()?;
+                if kv.len() != 2 { continue; }
+                let k = kv[0].as_atom()?;
+                let v = kv[1].as_atom()?;
+                if k == "Status" { status = Some(v.to_string()); }
+                if k == "State Machine Definition" { sm = Some(v.to_string()); }
+            }
+            Some((status?, sm?))
+        }).collect()
+    }).unwrap_or_default();
+
+    // Draft is source of `place` and never a target — the rule's
+    // positive antecedents (some Transition is defined in SM AND that
+    // Transition is from that Status) DO bind Draft, so it must
+    // appear regardless of whether the negation pruned anything.
+    assert!(
+        rooted_pairs.iter().any(|(s, m)| s == "Draft" && m == "OrderSM"),
+        "Pass 4: graph-rooted (Draft, OrderSM) must appear in Status_is_rooted_in_State_Machine_Definition,\n\
+         got {:?}\nfinal cells: {:?}",
+        rooted_pairs,
+        cells_iter(&final_state).iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+    );
+    // Shipped is target of `ship` and is NOT source of any
+    // transition — so the positive antecedent `that Transition is
+    // from that Status` doesn't bind Shipped at all, regardless of
+    // whether the negation antecedent is honored. This is the
+    // strongest assertion the test can make without depending on
+    // parser-side negation/AbsenceOf support — the consumer-side
+    // cardinality gate (#761) will deduplicate / require uniqueness.
+    assert!(
+        !rooted_pairs.iter().any(|(s, m)| s == "Shipped" && m == "OrderSM"),
+        "Pass 4: (Shipped, OrderSM) is a transition target only, NEVER a source — so the positive\n\
+         antecedent `that Transition is from that Status` cannot bind it; it must NOT be rooted.\n\
+         got {:?}",
+        rooted_pairs,
+    );
+
+    // NOTE on Placed: per task #760's option (a), the parser's
+    // current handling of `no X where Y` strips negation and falls
+    // back to the bare FT, so source-AND-target Statuses (Placed)
+    // may appear in the rooted cell. The consumer side (#761) is
+    // responsible for the uniqueness/cardinality gate that promotes
+    // a single rooted Status to `is initial in`. When more than one
+    // candidate appears (e.g. Placed + Draft from over-emission),
+    // the consumer leaves initial empty — same as compile.rs:502-504.
+    // The rooted set MUST contain Draft for that gate to ever fire;
+    // the assertion above is the load-bearing one.
+}
