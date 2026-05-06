@@ -4,6 +4,8 @@ import {
   initCellSchema, fetchCell, storeCell, removeCell,
   getFacts, getFactsBySchema, toPopulation,
   initSecretSchema, storeSecret, resolveSecret, deleteSecret, listConnectedSystems,
+  SEALED_CELL_PREFIX,
+  EntityDB,
 } from './entity-do'
 
 function createMockSql(): SqlLike & { tables: Record<string, any[]> } {
@@ -286,4 +288,144 @@ describe('entity-do (cell model)', () => {
   // is now the canonical version source per AREST.tex §462 eq:cellfold
   // and §472. Sibling task #769 (#721-followup-f) lands fresh
   // engine-round-trip coverage that pins the new contract end-to-end.
+
+  // ── getMaster: hard-fail on missing TENANT_MASTER_SEED (Sweep-8a / #809) ──
+  //
+  // Silently degrading the "encrypted" cell store to plaintext on a
+  // missing master seed was a security foot-gun: an operator who
+  // forgot the `wrangler secret put TENANT_MASTER_SEED` step would
+  // ship a Worker that persists tenant data in the clear without
+  // any visible signal. The DO now refuses to fall back unless BOTH
+  // `ENVIRONMENT !== 'production'` AND `AREST_ALLOW_PLAINTEXT === '1'`
+  // are set — production cannot run plaintext, even with a stray
+  // opt-in flag.
+  describe('getMaster missing-seed policy (#809)', () => {
+    function makeEntityDB(env: Record<string, string | undefined>): EntityDB {
+      // hydrateEngine + persistEngineState use ctx.storage.get/put for the
+      // engine freeze blob. Stub them to mimic empty-storage behaviour.
+      const kv: Record<string, unknown> = {}
+      const ctx = {
+        id: { toString: () => 'tenant-test' },
+        storage: {
+          sql: createMockSql(),
+          get: async <T>(key: string): Promise<T | undefined> => kv[key] as T | undefined,
+          put: async (key: string, value: unknown): Promise<void> => { kv[key] = value },
+          delete: async (key: string): Promise<boolean> => {
+            const had = key in kv
+            delete kv[key]
+            return had
+          },
+        },
+      }
+      // The vitest cloudflare stub makes `DurableObject` an empty class,
+      // so it never wires `ctx`/`env` for us — assign them directly.
+      const db = Object.create(EntityDB.prototype) as EntityDB
+      ;(db as any).ctx = ctx
+      ;(db as any).env = env
+      ;(db as any).initialized = false
+      ;(db as any).master = null
+      // Pretend the engine is already hydrated so put() / get() don't
+      // trigger compileDomainReadings() — these tests exercise the
+      // master-key gate, not the engine round-trip (which is covered
+      // by entity-do-engine-roundtrip.test.ts).
+      ;(db as any).engineHandle = 0
+      return db
+    }
+
+    it('throws with an actionable message when TENANT_MASTER_SEED is unset', async () => {
+      const db = makeEntityDB({})
+      let threw: unknown = null
+      try {
+        await db.get()
+      } catch (e) {
+        threw = e
+      }
+      expect(threw).toBeInstanceOf(Error)
+      const msg = (threw as Error).message
+      // Names the missing env var so the operator knows what to bind.
+      expect(msg).toContain('TENANT_MASTER_SEED')
+      // Names the dev opt-in so the dev path is discoverable.
+      expect(msg).toContain('AREST_ALLOW_PLAINTEXT')
+      // Tells the operator what to do (the wrangler command).
+      expect(msg).toContain('wrangler secret put TENANT_MASTER_SEED')
+    })
+
+    it('still throws when AREST_ALLOW_PLAINTEXT is set to a non-"1" value', async () => {
+      // Belt-and-braces: only the literal string "1" opts in. Stray
+      // truthy values (`"true"`, `"yes"`, `"0"`, etc.) still trip the
+      // fail-closed branch so a typo in dev config can't accidentally
+      // leak into production.
+      for (const v of ['true', 'yes', '0', '', 'on']) {
+        const db = makeEntityDB({ AREST_ALLOW_PLAINTEXT: v })
+        let threw: unknown = null
+        try {
+          await db.put({ id: 'c1', type: 'Customer', data: { name: 'A' } })
+        } catch (e) {
+          threw = e
+        }
+        expect(threw, `value=${JSON.stringify(v)}`).toBeInstanceOf(Error)
+        expect((threw as Error).message).toContain('TENANT_MASTER_SEED')
+      }
+    })
+
+    it('still throws in production even when AREST_ALLOW_PLAINTEXT="1"', async () => {
+      // The dual-gate's whole point: even with the dev opt-in
+      // mistakenly set in production, the missing seed still fails
+      // closed. A stray AREST_ALLOW_PLAINTEXT=1 in a prod Worker
+      // env must not silently downgrade to plaintext storage.
+      const db = makeEntityDB({
+        AREST_ALLOW_PLAINTEXT: '1',
+        ENVIRONMENT: 'production',
+      })
+      let threw: unknown = null
+      try {
+        await db.put({ id: 'c1', type: 'Customer', data: { name: 'A' } })
+      } catch (e) {
+        threw = e
+      }
+      expect(threw).toBeInstanceOf(Error)
+      expect((threw as Error).message).toContain('TENANT_MASTER_SEED')
+    })
+
+    it('allows the legacy plaintext path when AREST_ALLOW_PLAINTEXT="1" and not production', async () => {
+      // The dev-only escape hatch. With both gates open (no
+      // ENVIRONMENT=production, AREST_ALLOW_PLAINTEXT='1'),
+      // getMaster() returns null and callers use the plaintext SQL
+      // helpers. This must keep working so a stripped-down local
+      // Worker without secret plumbing remains runnable.
+      const db = makeEntityDB({ AREST_ALLOW_PLAINTEXT: '1' })
+      const stored = await db.put({
+        id: 'cust-1',
+        type: 'Customer',
+        data: { name: 'Alice' },
+      })
+      expect(stored.id).toBe('cust-1')
+      const fetched = await db.get()
+      expect(fetched?.data.name).toBe('Alice')
+    })
+
+    it('uses the sealed path when TENANT_MASTER_SEED is bound', async () => {
+      // The production happy path. With the seed bound, the DO
+      // derives a per-tenant master and writes seal-prefixed bytes
+      // — the legacy plaintext escape hatch is irrelevant.
+      const db = makeEntityDB({
+        TENANT_MASTER_SEED: 'this-is-a-test-seed-not-a-real-secret-32b!',
+      })
+      const stored = await db.put({
+        id: 'cust-2',
+        type: 'Customer',
+        data: { name: 'Bob' },
+      })
+      expect(stored.data.name).toBe('Bob')
+      // The persisted row's `data` column must be the sealed envelope,
+      // not raw JSON — proves we took the encrypted branch.
+      const sql = (db as any).ctx.storage.sql as ReturnType<typeof createMockSql>
+      const row = (sql.tables['cell'] || [])[0]
+      expect(typeof row.data).toBe('string')
+      expect((row.data as string).startsWith(SEALED_CELL_PREFIX)).toBe(true)
+      // And reading back round-trips through the sealed path cleanly.
+      const fetched = await db.get()
+      expect(fetched?.data.name).toBe('Bob')
+    })
+  })
 })
