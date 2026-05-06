@@ -2804,30 +2804,44 @@ fn cached_grammar_state() -> Result<&'static Object, String> {
 
 /// Public entry point: parse FORML 2 source with no external context.
 pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
-    parse_to_state_via_stage12_impl(text, &[])
+    parse_to_state_via_stage12_impl(text, &[], &[])
 }
 
 /// Context-aware parse (#285). Used by `parse_to_state_from` and
 /// `parse_to_state_with_nouns` so a statement mentioning a noun
-/// declared in a previously-parsed domain tokenises correctly. Only
-/// noun *names* are propagated — fact types are re-derived from
-/// `text` by `translate_fact_types`, and `merge_states(ctx, result)`
+/// declared in a previously-parsed domain tokenises correctly.
+/// Both noun *names* AND fact-type *ids* are propagated: nouns let
+/// the per-line tokenizer match (e.g. `State Machine Definition`
+/// stays a single token); FT ids let `translate_instance_facts`
+/// resolve a body like `State Machine Definition 'Order' is for
+/// Noun 'Order'.` to the canonical underscored cell name
+/// (`State_Machine_Definition_is_for_Noun`) instead of the verb-only
+/// fallback. Without the FT propagation the per-field cell fanout
+/// in `instance_fact_field_cells` writes to a non-canonical cell
+/// (e.g. `is_for`) and downstream cell-driven code (#761/#762's SM
+/// readers, etc.) sees an empty FT cell. `merge_states(ctx, result)`
 /// on the caller's side carries the rest of `ctx`'s cells forward.
 pub fn parse_to_state_via_stage12_with_context(
     text: &str,
     ctx: &Object,
 ) -> Result<Object, String> {
-    let extra: Vec<String> = fetch_or_phi("Noun", ctx).as_seq()
+    let extra_nouns: Vec<String> = fetch_or_phi("Noun", ctx).as_seq()
         .map(|facts| facts.iter()
             .filter_map(|f| binding(f, "name").map(String::from))
             .collect())
         .unwrap_or_default();
-    parse_to_state_via_stage12_impl(text, &extra)
+    let extra_ft_ids: Vec<String> = fetch_or_phi("FactType", ctx).as_seq()
+        .map(|facts| facts.iter()
+            .filter_map(|f| binding(f, "id").map(String::from))
+            .collect())
+        .unwrap_or_default();
+    parse_to_state_via_stage12_impl(text, &extra_nouns, &extra_ft_ids)
 }
 
 fn parse_to_state_via_stage12_impl(
     text: &str,
     extra_nouns: &[String],
+    extra_ft_ids: &[String],
 ) -> Result<Object, String> {
     // Trace gate — std-host reads `AREST_STAGE12_TRACE`; no_std builds
     // compile out the trace branches entirely.
@@ -3056,9 +3070,24 @@ fn parse_to_state_via_stage12_impl(
         translate_derivation_rules_with_matrix(&classified, &idx, &conditional_matrix));
     let unresolved_clause_facts = tt!("unresolved",
         translate_unresolved_clauses(&classified, &idx, &ft_facts));
-    let declared_ft_ids: Vec<String> = ft_facts.iter()
+    let mut declared_ft_ids: Vec<String> = ft_facts.iter()
         .filter_map(|f| binding(f, "id").map(String::from))
         .collect();
+    // Merge in FT ids from caller-supplied context (#763 prereq):
+    // when this parse runs against a metamodel-bearing context, the
+    // FTs declared in that context aren't in `ft_facts` (which only
+    // covers FTs declared in *this* `text`), so instance facts that
+    // reference context-declared FTs would fall back to verb-only
+    // fieldName and `instance_fact_field_cells` would write them to
+    // a non-canonical cell. Threading context FT ids here keeps the
+    // canonical resolution working across context boundaries — the
+    // downstream cell-driven SM compiler (#761 et al.) reads
+    // `State_Machine_Definition_is_for_Noun` and finds populated facts.
+    for id in extra_ft_ids {
+        if !declared_ft_ids.iter().any(|existing| existing == id) {
+            declared_ft_ids.push(id.clone());
+        }
+    }
     let mut instance_fact_facts = tt!("instance_facts",
         translate_instance_facts_with_ft_ids(&classified, &idx, &declared_ft_ids));
     instance_fact_facts.extend(tt!("deriv_mode", translate_derivation_mode_facts(&classified, &idx)));
