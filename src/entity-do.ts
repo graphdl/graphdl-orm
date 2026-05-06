@@ -781,16 +781,44 @@ export class EntityDB extends DurableObject {
    *  the tenant-scoped routing key the dispatcher derived). Memoised
    *  per DO instance.
    *
-   *  Returns `null` if the secret is not bound — callers fall back
-   *  to the legacy plaintext path so a stripped-down dev build (no
-   *  `wrangler secret put TENANT_MASTER_SEED` step) keeps working
-   *  without source surgery. Production deployments must set the
-   *  secret; absence of the secret in prod is a deploy-time bug. */
+   *  Hard-fails (throws) if the secret is missing in production
+   *  (`Sweep-8a` / task #809). The legacy "silently fall back to
+   *  plaintext" behaviour was a 1.0 security foot-gun: an
+   *  "encrypted" DO that quietly stored cell payloads in cleartext
+   *  whenever the deploy step forgot `wrangler secret put
+   *  TENANT_MASTER_SEED`. Production cannot run plaintext.
+   *
+   *  Plaintext is only permitted under an explicit dev opt-in:
+   *  `AREST_ALLOW_PLAINTEXT === '1'` AND `ENVIRONMENT !==
+   *  'production'`. Tests that exercise the EntityDB encrypted
+   *  path MUST set `TENANT_MASTER_SEED` in the mocked env. */
   private async getMaster(): Promise<TenantMasterKey | null> {
     if (this.master) return this.master
-    const env = this.env as { TENANT_MASTER_SEED?: string } | undefined
+    const env = this.env as
+      | {
+          TENANT_MASTER_SEED?: string
+          ENVIRONMENT?: string
+          AREST_ALLOW_PLAINTEXT?: string
+        }
+      | undefined
     const seed = env?.TENANT_MASTER_SEED
-    if (!seed) return null
+    if (!seed) {
+      const isProd = env?.ENVIRONMENT === 'production'
+      const plaintextOptIn = env?.AREST_ALLOW_PLAINTEXT === '1'
+      if (isProd || !plaintextOptIn) {
+        throw new Error(
+          'EntityDB.getMaster: TENANT_MASTER_SEED is not bound. ' +
+            'Cell storage cannot fall back to plaintext in production. ' +
+            'Fix: run `wrangler secret put TENANT_MASTER_SEED` (and re-deploy) ' +
+            'so per-tenant masters can be derived. ' +
+            'For local dev only, you may opt in to the legacy plaintext ' +
+            'path by setting both `ENVIRONMENT != "production"` and ' +
+            '`AREST_ALLOW_PLAINTEXT=1` in your env (never do this in prod).',
+        )
+      }
+      // Dev-only legacy plaintext path: explicit opt-in + non-prod.
+      return null
+    }
     // The DO's id name is the tenant routing key (per-cell DO mapping
     // #217). Use it as the salt so each tenant derives a distinct
     // master from the same shared seed.
