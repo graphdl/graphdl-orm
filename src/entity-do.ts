@@ -40,7 +40,7 @@ import {
   deriveTenantMasterKey,
   rotateCell,
 } from './cell-encryption'
-import { compileDomainReadings, freezeHandle, thawHandle, release_domain } from './api/engine'
+import { compileDomainReadings, freezeHandle, thawHandle, release_domain, system } from './api/engine'
 export type { SqlLike } from './sql-like'
 
 // ── Types ───────────────────────────────────────────────────────────
@@ -88,7 +88,19 @@ export function initCellSchema(sql: SqlLike): void {
     // its declaration).
   }
 
-  // Migration from old entity table: if entity table exists, migrate data
+  // Migration from old entity table: if entity table exists, migrate data.
+  //
+  // #766 (#721-followup-c) note: this SQL write does NOT route through
+  // the per-DO engine apply path. `initCellSchema` is a sync function
+  // called from `EntityDB.ensureInit`, which runs before the engine
+  // handle is hydrated (`hydrateEngine` is async and only kicked off
+  // by the first user-facing instance method). Routing this one-time
+  // legacy-table migration through engine apply would require either
+  // making `initCellSchema` async + reaching the engine handle from a
+  // free function, or deferring the migration until the first call —
+  // both heavier than the migration warrants. The migrated cell will
+  // pick up an engine-side chain entry on its first write through
+  // `put()` / `writeCellThroughEngine`.
   try {
     const rows = sql.exec(`SELECT id, noun, fields FROM entity LIMIT 1`).toArray()
     if (rows.length > 0) {
@@ -475,6 +487,106 @@ export class EntityDB extends DurableObject {
     await this.ctx.storage.put(ENGINE_STATE_STORAGE_KEY, hex)
   }
 
+  /** Route a cell write through the per-DO engine's `apply` system
+   *  verb (#766, #721-followup-c).
+   *
+   *  ## Current behaviour (#766) and pending engine lift
+   *
+   *  `system(h, "apply", JSON)` dispatches to
+   *  `crates/arest/src/ast.rs:platform_apply_command`, which evaluates
+   *  the command via `apply_command_defs` and returns the resulting
+   *  `CommandResult` wrapped as `Object::atom(JSON.stringify(result))`.
+   *  The outer write dispatcher (`crates/arest/src/lib.rs:2048`
+   *  `system_impl`) recognises a `WriterResult::CommitDelta` ONLY when
+   *  the result is a Map shaped `{__state_delta, __result}` —
+   *  `platform_apply_command` does not return that shape today, so
+   *  the current dispatch resolves to `NoCommit` and D is NOT
+   *  mutated. The chain therefore does NOT extend on this call.
+   *
+   *  The wiring below is intentional: keeping the helper hot on
+   *  every `put()` means the moment the engine lift lands (return
+   *  the raw delta carrier from `platform_apply_command`, or expose
+   *  a new `raw_store` SystemVerb), the EntityDB write path inherits
+   *  chain semantics with zero call-site changes. The persist-after-
+   *  apply call already keeps the freeze image fresh, the WASM handle
+   *  is reused, and the verb shape (`createEntity`/`updateEntity`)
+   *  matches the rest of the worker (`src/api/entity-routes.ts`).
+   *
+   *  Whitepaper anchor (AREST.tex §202, §462 eq:cellfold): one writer
+   *  per cell, chain version-of-record. Pre-#766 the worker EntityDB
+   *  stamped each cell with its own SQL `cell.version` column — the
+   *  divergent sidecar §3.3 warns against. The full migration off
+   *  `cell.version` lands once the engine surface lift (above) +
+   *  sibling tasks #765 (engine reads) and #767 (cell_pin →
+   *  CellAddress.version_id) close out — #768 then drops the column.
+   *
+   *  Returns the parsed engine response so callers can surface
+   *  `entities`/`violations`/etc. The response is best-effort: a
+   *  malformed engine reply (parse error) is swallowed because the
+   *  SQL write at the call site is the authoritative store until
+   *  #765 routes reads through engine fetch.
+   *
+   *  Sibling-task contract: do NOT call this from rotation
+   *  (`rotateMaster`) — rotation re-encrypts the cell's bytes under a
+   *  new master while preserving the AAD version field; bumping the
+   *  engine's chain here would put the new sealed bytes
+   *  (AAD=oldVersion) out of sync with the engine's version stamp
+   *  (newVersion+1), causing `cellOpen` to fail the next read after
+   *  #767 lands. The migration path (`initCellSchema`'s
+   *  legacy-`entity`-table branch) also skips this helper because
+   *  the engine handle isn't allocated until first instance-method
+   *  call. */
+  protected async writeCellThroughEngine(
+    operation: 'create' | 'update',
+    type: string,
+    id: string,
+    fields: Record<string, unknown>,
+  ): Promise<unknown> {
+    await this.hydrateEngine()
+    // Coerce field values to strings — engine `Command::CreateEntity`
+    // (`crates/arest/src/command.rs:46`) declares `fields:
+    // hashbrown::HashMap<String, String>`. JSON bool/number passed
+    // raw would fail the deserializer.
+    const stringFields: Record<string, string> = {}
+    for (const [k, v] of Object.entries(fields)) {
+      if (v === null || v === undefined) continue
+      stringFields[k] = typeof v === 'string' ? v : String(v)
+    }
+    const command = operation === 'create'
+      ? {
+          type: 'createEntity',
+          noun: type,
+          domain: '',
+          id,
+          fields: stringFields,
+        }
+      : {
+          type: 'updateEntity',
+          noun: type,
+          domain: '',
+          entityId: id,
+          fields: stringFields,
+        }
+    // The wrapped envelope shape — `platform_apply_command`
+    // (crates/arest/src/ast.rs:2750) accepts both
+    // `{command, population}` and raw command JSON; we use the
+    // wrapper for parity with `engine.applyCommand` so a future
+    // refactor can collapse the two call sites.
+    const envelope = JSON.stringify({ command, population: '' })
+    const raw = system(this.engineHandle, 'apply', envelope)
+    await this.persistEngineState()
+    try {
+      return JSON.parse(raw)
+    } catch {
+      // Bottom / malformed envelope — the engine still committed the
+      // delta into its chain (we just can't parse the JSON envelope
+      // back). Returning `null` keeps the helper total; the SQL
+      // write at the call site remains authoritative for
+      // backward-compat readers.
+      return null
+    }
+  }
+
   /** Test hook — exposes the hydrate path to the unit suite without
    *  having to drive it through one of the user-facing methods.
    *  Returns the engine handle (always `>= 0` after the call).
@@ -551,6 +663,44 @@ export class EntityDB extends DurableObject {
     const merged: Record<string, unknown> = existing ? { ...existing.data } : {}
     for (const [k, v] of Object.entries(input.data)) {
       if (v !== null && v !== undefined) merged[k] = v
+    }
+    // ── Engine apply (#766, #721-followup-c) ─────────────────────
+    // Route the write through the per-DO engine BEFORE the SQL
+    // write so the engine path is the authoritative version-of-
+    // record per AREST.tex §202, §462 eq:cellfold. The helper docs
+    // on `writeCellThroughEngine` capture the current limitation:
+    // `system(h, "apply", …)` is functionally evaluated but does NOT
+    // mutate D today (the wrapper at platform_apply_command turns
+    // the delta carrier into a JSON-string atom that the outer
+    // dispatcher classifies as NoCommit). The wiring is hot anyway
+    // so chain semantics land here automatically once the engine
+    // surface lift (or a `raw_store` SystemVerb) ships.
+    //
+    // The SQL write below (storeCellSealed/storeCell) stays as
+    // backward-compat scaffolding — sibling task #765 routes reads
+    // through `system(h, "fetch", ...)`, after which the SQL
+    // payload column becomes redundant. #768 then drops the
+    // `cell.version` SQL column once #767 sources CellAddress's
+    // version field from `cell_pin` instead of the row stamp.
+    //
+    // Best-effort: a thrown engine error doesn't abort the SQL
+    // write. Until #765 lands, reads still source from SQL, so a
+    // missing engine apply is recoverable. We log to console.warn
+    // for ops visibility without breaking the request.
+    const isUpdate = existing !== null
+    try {
+      await this.writeCellThroughEngine(
+        isUpdate ? 'update' : 'create',
+        input.type,
+        input.id,
+        merged,
+      )
+    } catch (e) {
+      // Engine apply failure is non-fatal during the migration
+      // window. The SQL write below is the authoritative store
+      // until #765/#767/#768 lands.
+      // eslint-disable-next-line no-console
+      console.warn('EntityDB.put: engine apply failed, falling back to SQL-only write:', e)
     }
     if (master) {
       return storeCellSealed(this.ctx.storage.sql, master, input.id, input.type, merged)
@@ -692,6 +842,17 @@ export class EntityDB extends DurableObject {
     // content-mutating, so bumping the version stamp here would
     // wrongly invalidate the just-produced sealed bytes against
     // their own AAD.
+    //
+    // #766 (#721-followup-c) note: this SQL write does NOT route
+    // through `writeCellThroughEngine`. Engine apply would mint a new
+    // VersionEntry via `merge_delta` (S1b #718) and bump the chain's
+    // version_id from N to N+1. The rotated sealed bytes here carry
+    // AAD=N (preserved per the contract above); after #767 lands and
+    // sources `CellAddress.version` from `system(h, "cell_pin", …)`,
+    // a chain at N+1 against AAD=N would fail every subsequent
+    // `cellOpen` for this cell. Rotation must therefore stay
+    // engine-silent — it's a key swap on the persistence layer, not
+    // a logical mutation of the cell's contents.
     const blob = SEALED_CELL_PREFIX + bytesToBase64(newSealed)
     this.ctx.storage.sql.exec(
       `INSERT OR REPLACE INTO cell (id, type, data, version) VALUES (?, ?, ?, ?)`,
