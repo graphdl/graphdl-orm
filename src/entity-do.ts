@@ -40,6 +40,7 @@ import {
   deriveTenantMasterKey,
   rotateCell,
 } from './cell-encryption'
+import { compileDomainReadings, freezeHandle, thawHandle, release_domain } from './api/engine'
 export type { SqlLike } from './sql-like'
 
 // ── Types ───────────────────────────────────────────────────────────
@@ -370,6 +371,11 @@ export function listConnectedSystems(sql: SqlLike): string[] {
 
 // ── Durable Object ──────────────────────────────────────────────────
 
+/** DO storage key under which each EntityDB persists its engine
+ *  freeze image (#764). Constant — every EntityDB DO uses the same
+ *  key inside its own private storage namespace. */
+export const ENGINE_STATE_STORAGE_KEY = 'engine_state_bytes'
+
 export class EntityDB extends DurableObject {
   private initialized = false
   /** Lazily-derived per-tenant master. `null` until the first call
@@ -379,11 +385,126 @@ export class EntityDB extends DurableObject {
    *  every request. */
   private master: TenantMasterKey | null = null
 
+  /** Per-DO engine handle (#764, #721-followup-a). `-1` until the
+   *  first call hydrates it. Each EntityDB instance IS a cell per
+   *  the whitepaper (§3.3, §202): its engine state is the per-cell
+   *  fold `D_n' = foldl μ_n D_n E_n`. Sibling tasks #765/#766/#767
+   *  route cell reads/writes through this handle; this task only
+   *  delivers the lifecycle layer.
+   *
+   *  The handle is RESERVED across the DO's lifetime — Cloudflare
+   *  evicts the isolate after some idle period and a fresh isolate
+   *  re-hydrates from `state.storage` via `hydrateEngine`. The
+   *  legacy direct-SQL paths (`fetchCell` / `storeCell` / etc.) are
+   *  unaffected by this field; they continue to operate on
+   *  `ctx.storage.sql` directly until #765/#766 swap them out. */
+  private engineHandle = -1
+
+  /** In-flight hydrate promise. Concurrent invocations on a fresh
+   *  isolate must NOT race on `compileDomainReadings` /
+   *  `thawHandle` — only one `compileDomainReadings` should run per
+   *  DO instance. We memoise the promise so any concurrent caller
+   *  awaits the same hydrate work. Cloudflare's
+   *  `state.blockConcurrencyWhile` would be the canonical primitive
+   *  here, but that has to live in the constructor; doing it
+   *  lazily is equally correct because the DO is single-threaded
+   *  inside one isolate (concurrent fetches enter the JS event
+   *  loop one at a time, so the second caller observes the first's
+   *  in-flight promise before it ever calls `hydrateEngine` itself). */
+  private hydrateInFlight: Promise<void> | null = null
+
   private ensureInit(): void {
     if (this.initialized) return
     initCellSchema(this.ctx.storage.sql)
     initSecretSchema(this.ctx.storage.sql)
     this.initialized = true
+  }
+
+  /** Idempotent hydrate: ensure `engineHandle` is allocated and
+   *  loaded with the persisted freeze image (if any). Safe to call
+   *  on every public method; cheap after the first call (just an
+   *  early-return on the cached handle).
+   *
+   *  Concurrency: two concurrent `await this.hydrateEngine()` calls
+   *  on a cold isolate share one in-flight promise — the second
+   *  caller sees `hydrateInFlight` non-null and awaits it instead
+   *  of double-allocating. Cloudflare's
+   *  `state.blockConcurrencyWhile` is the canonical equivalent
+   *  primitive but is only callable from the constructor; deferring
+   *  to lazy hydrate is the same shape because the DO is
+   *  single-isolate-single-threaded and the JS event loop
+   *  serialises the field reads. */
+  protected async hydrateEngine(): Promise<void> {
+    if (this.engineHandle >= 0) return
+    if (this.hydrateInFlight) return this.hydrateInFlight
+    this.hydrateInFlight = (async () => {
+      // Re-check inside the critical section in case a concurrent
+      // caller raced us through the early return above (defensive
+      // — under Cloudflare's single-thread model this can't happen,
+      // but it costs nothing and keeps the invariant local).
+      if (this.engineHandle >= 0) return
+      const handle = compileDomainReadings()
+      const persisted = await this.ctx.storage.get<string>(
+        ENGINE_STATE_STORAGE_KEY,
+      )
+      if (typeof persisted === 'string' && persisted.length > 0) {
+        // Best-effort hydrate: a malformed / cross-version freeze
+        // image returns `false` and we keep the freshly-allocated
+        // empty engine. Sibling task #769 adds explicit migration;
+        // this task's contract is "lifecycle wired", not "every
+        // possible freeze image is recoverable".
+        thawHandle(handle, persisted)
+      }
+      this.engineHandle = handle
+    })()
+    try {
+      await this.hydrateInFlight
+    } finally {
+      this.hydrateInFlight = null
+    }
+  }
+
+  /** Snapshot the per-DO engine state and write it back to DO
+   *  storage. Called by sibling tasks #766/#767 after every
+   *  state-mutating engine call (apply / transition). Public for
+   *  those siblings; the lifecycle test below also drives it
+   *  directly to verify the persistence path. */
+  protected async persistEngineState(): Promise<void> {
+    if (this.engineHandle < 0) return
+    const hex = freezeHandle(this.engineHandle)
+    await this.ctx.storage.put(ENGINE_STATE_STORAGE_KEY, hex)
+  }
+
+  /** Test hook — exposes the hydrate path to the unit suite without
+   *  having to drive it through one of the user-facing methods.
+   *  Returns the engine handle (always `>= 0` after the call).
+   *  Marked with the `__test_` prefix so production callers don't
+   *  reach for it by accident. */
+  async __test_hydrate(): Promise<number> {
+    await this.hydrateEngine()
+    return this.engineHandle
+  }
+
+  /** Test hook — exposes the freeze + persist path so the lifecycle
+   *  test can drive a write-back without waiting for sibling tasks
+   *  to land. Returns the hex blob that was written. */
+  async __test_persist(): Promise<string> {
+    await this.hydrateEngine()
+    await this.persistEngineState()
+    const stored = await this.ctx.storage.get<string>(
+      ENGINE_STATE_STORAGE_KEY,
+    )
+    return stored ?? ''
+  }
+
+  /** Test hook — releases the engine handle (mimics isolate
+   *  eviction). The next `hydrateEngine` re-allocates and re-thaws
+   *  from DO storage. */
+  async __test_evict(): Promise<void> {
+    if (this.engineHandle >= 0) {
+      release_domain(this.engineHandle)
+      this.engineHandle = -1
+    }
   }
 
   /** Resolve the per-tenant master from the

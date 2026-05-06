@@ -8,6 +8,51 @@
 
 import { create, create_bare, release, system } from '../../crates/arest/pkg/arest.js'
 
+// ── Per-DO engine lifecycle (#764) ──────────────────────────────────
+//
+// `_h` below is a per-PROCESS engine handle — fine for the legacy
+// shared-domain code paths (apply/query/etc. that all read the same
+// in-process metamodel), but wrong for EntityDB DOs. Each DO instance
+// IS a cell per the whitepaper (§3.3, §202): its engine state is the
+// per-cell fold `D_n' = foldl μ_n D_n E_n` and must persist across
+// the DO's lifetime independently of any other DO. The two helpers
+// below — `freezeHandle` and `thawHandle` — are the wasm-bindgen
+// surface the DO uses to round-trip a handle's whole D through DO
+// storage between invocations.
+//
+// Both are thin shims over the engine's `system(handle, "freeze"|
+// "thaw", …)` keys, which encode the freeze image as lowercase hex
+// (string-only transport — wasm-bindgen + MCP both hand strings).
+// See `crates/arest/src/lib.rs` line 1814 for the engine side.
+
+/**
+ * Snapshot the engine state for `handle` as a hex-encoded freeze image.
+ * Returns the bytes ready to be written to durable storage.
+ *
+ * The hex form is stable + byte-deterministic — two freezes of the
+ * same state produce identical strings, which keeps the persisted
+ * `engine_state_bytes` blob diffable.
+ */
+export function freezeHandle(handle: number): string {
+  ensureWasm()
+  return system(handle, 'freeze', '')
+}
+
+/**
+ * Replace the engine state for `handle` with the contents of
+ * `hexBytes` (a hex-encoded freeze image previously produced by
+ * `freezeHandle`). Returns `true` on success, `false` if the engine
+ * rejected the bytes (malformed hex, bad magic, truncated payload).
+ *
+ * The DO uses this on cold start to hydrate its per-cell engine
+ * state from `state.storage.get('engine_state_bytes')` before any
+ * call observes the handle.
+ */
+export function thawHandle(handle: number, hexBytes: string): boolean {
+  ensureWasm()
+  return system(handle, 'thaw', hexBytes) === 'ok'
+}
+
 // wasm-pack --target bundler auto-initializes the WASM when arest.js is
 // imported (via wasm.__wbindgen_start() inside the wrapper). No explicit
 // initSync call is needed here — ensureWasm is kept as a no-op so the
