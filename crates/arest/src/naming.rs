@@ -85,36 +85,28 @@ fn split_noun(name: &str) -> Vec<String> {
 
 /// Resolve an entity ID from its data using the noun's reference scheme.
 ///
-/// Given a noun name and entity data fields, looks up the noun's reference
-/// scheme in the compiled state and extracts the matching field value as the ID.
+/// Looks up the noun's `referenceScheme` directly from the `Noun` cell
+/// (set by the parser from `Order(.id) is an entity type.`) and returns
+/// the matching field value from `fields`. Defaults the field name to
+/// `"id"` when the noun declares no scheme. Returns `None` when the noun
+/// is unknown or the chosen field is absent / empty in `fields`.
 ///
-/// Returns None if no reference scheme, ref scheme is "id", or no matching field.
+/// Mirrors the read pattern in `rmap::EntityCellRouter::id_field_for` —
+/// both treat `referenceScheme` as the single source of truth, no
+/// lowercase-field-name heuristics.
 pub fn resolve_entity_id(
     state: &crate::ast::Object,
     noun_name: &str,
     fields: &hashbrown::HashMap<String, String>,
 ) -> Option<String> {
-    // Guard: noun must exist in the Noun cell.
     let noun_cell = crate::ast::fetch_or_phi("Noun", state);
-    let _noun_def = noun_cell.as_seq()?.iter()
+    let noun_def = noun_cell.as_seq()?
+        .iter()
         .find(|n| crate::ast::binding(n, "name") == Some(noun_name))?;
-    // Reference scheme is not stored in the IR nouns directly -- it's in the
-    // fact types where this noun plays a role with a value-type noun.
-    // For now, check if any fact type has this noun as subject with a value-type object.
-    // The first value-type role's field value becomes the ID.
-    //
-    // A more precise approach: parse the (.RefScheme) from the noun declaration.
-    // But the IR doesn't carry refScheme yet. When it does, use it directly.
-
-    // Heuristic: find a field that looks like a reference scheme
-    // Common patterns: "slug", "email", "code", "name" for value-type refs
-    fields.iter()
-        .filter(|(field, value)| !value.is_empty() && {
-            let lower = field.to_lowercase();
-            lower == "slug" || lower.ends_with("slug") || lower == "email" || lower == "code" || lower == "id"
-        })
-        .map(|(_, value)| value.clone())
-        .next()
+    let scheme = crate::ast::binding(noun_def, "referenceScheme").unwrap_or("id");
+    fields.get(scheme)
+        .filter(|v| !v.is_empty())
+        .cloned()
 }
 
 /// Resolve a REST collection slug to its Noun name by walking the
