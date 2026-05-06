@@ -34,7 +34,8 @@
  *      write — the lifecycle path is wired so chain bumping lands
  *      automatically the moment the engine surface grows it.
  *   2. The legacy SQL store remains updated — read-side back-compat
- *      until #765 routes reads through engine fetch.
+ *      retained as defense-in-depth until Sweep-6e/6f collapse the
+ *      SQL fall-back (#801, #802).
  *   3. The engine handle is hydrated once and reused — no per-write
  *      WASM re-compile.
  *

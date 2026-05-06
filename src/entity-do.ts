@@ -564,9 +564,10 @@ export class EntityDB extends DurableObject {
    *  The handle is RESERVED across the DO's lifetime — Cloudflare
    *  evicts the isolate after some idle period and a fresh isolate
    *  re-hydrates from `state.storage` via `hydrateEngine`. The
-   *  legacy direct-SQL paths (`fetchCell` / `storeCell` / etc.) are
-   *  unaffected by this field; they continue to operate on
-   *  `ctx.storage.sql` directly until #765/#766 swap them out. */
+   *  legacy direct-SQL paths (`fetchCell` / `storeCell` / etc.)
+   *  remain alongside the engine path; #765/#766 routed reads/writes
+   *  through engine, but removing the SQL fall-back is gated on
+   *  Sweep-6e/6f (#801, #802). */
   private engineHandle = -1
 
   /** In-flight hydrate promise. Concurrent invocations on a fresh
@@ -916,9 +917,10 @@ export class EntityDB extends DurableObject {
         merged,
       )
     } catch (e) {
-      // Engine apply failure is non-fatal during the migration
-      // window. The SQL write below is the authoritative store
-      // until #765/#767/#768 lands.
+      // Engine apply failure is non-fatal: the SQL write below
+      // remains the authoritative store. Removing this fall-back is
+      // tracked under Sweep-6e/6f (#801, #802) — gated on engine-only
+      // path stabilization.
       // eslint-disable-next-line no-console
       console.warn('EntityDB.put: engine apply failed, falling back to SQL-only write:', e)
     }
