@@ -2292,11 +2292,21 @@ pub(crate) fn compile(state: &crate::ast::Object) -> CompiledModel {
     let td = profile_timer::now();
     let data = cell_index_from_state(state);
     diag!("[profile] cell_index_from_state: {:?} ({} nouns, {} fts, {} constraints)", td.elapsed(), data.nouns.len(), data.fact_types.len(), data.constraints.len());
-    compile_data(&data)
+    compile_data_with_state(&data, Some(state))
 }
 
-/// Core compilation: CellIndex -> CompiledModel.
+/// Core compilation: CellIndex -> CompiledModel. The `state` parameter
+/// is optional so synthetic-call paths that build a CellIndex without
+/// an Object (vanishingly rare) still work; when present it unlocks
+/// the cell-driven SM path (#761).
 fn compile_data(data: &CellIndex) -> CompiledModel {
+    compile_data_with_state(data, None)
+}
+
+fn compile_data_with_state(
+    data: &CellIndex,
+    state: Option<&crate::ast::Object>,
+) -> CompiledModel {
     let t0 = profile_timer::now();
     let constraints: Vec<CompiledConstraint> = data.constraints.iter()
         .map(|def| compile_constraint(data, def))
@@ -2306,8 +2316,19 @@ fn compile_data(data: &CellIndex) -> CompiledModel {
     let t1 = profile_timer::now();
     let sm_defs = derive_state_machines_from_facts(&data.general_instance_facts);
     let sm_source = if sm_defs.is_empty() { &data.state_machines } else { &sm_defs };
+    // MC3b-c (#761): try the cell-driven path first when we have the
+    // state Object; fall back to the typed-struct path for any noun
+    // whose normalized cells are empty (no SM-for-Noun binding) so
+    // the JSON-blob / facts-derived path still runs for unmigrated
+    // corpora and freeze fixtures. Per #748, the JSON-blob path is
+    // only deleted in #763.
     let state_machines: Vec<CompiledStateMachine> = sm_source.values()
-        .map(|sm_def| compile_state_machine(sm_def, &constraints))
+        .map(|sm_def| {
+            state
+                .and_then(|s| compile_state_machine_from_cells(
+                    &sm_def.noun_name, s, &constraints))
+                .unwrap_or_else(|| compile_state_machine(sm_def, &constraints))
+        })
         .collect();
     diag!("  [profile] {} state machines: {:?}", state_machines.len(), t1.elapsed());
 
@@ -5281,6 +5302,191 @@ fn compile_state_machine(
     }
 }
 
+/// Cell-driven SM compiler — MC3b-c (#761).
+///
+/// Reads SM behavior from the normalized FT cells populated by the
+/// derivation rules in `readings/core/state.md` (#759 Pass 1/2/2b,
+/// #760 Pass 4) and assembles the same `CompiledStateMachine` shape
+/// `compile_state_machine` produces from a typed `StateMachineDef`.
+///
+/// Cells consumed (each is a sequence of named-tuple facts produced by
+/// the parser's per-FT cell fanout — see `instance_fact_field_cells`
+/// in `parse_forml2_stage2.rs`):
+///
+///   * `State_Machine_Definition_is_for_Noun` — SM ↔ Noun binding
+///   * `Status_is_initial_in_State_Machine_Definition` — explicit initial
+///   * `Status_is_rooted_in_State_Machine_Definition` — Pass-4
+///     graph-derived candidates (forward-chain output of #760's rule)
+///   * `Status_is_defined_in_State_Machine_Definition` — full status
+///     set (Pass 1/2/2b output of #759's rule)
+///   * `Transition_is_defined_in_State_Machine_Definition` — owning SM
+///   * `Transition_is_from_Status` / `Transition_is_to_Status` —
+///     transition endpoints
+///   * `Transition_is_triggered_by_Fact_Type` — event name
+///
+/// `noun_name` is the Noun whose SM to compile. Returns `Some` when
+/// at least one `State_Machine_Definition_is_for_Noun` fact binds an
+/// SM to that noun; returns `None` otherwise so the caller can fall
+/// back to the JSON-blob / typed-struct path.
+///
+/// Pass-4 uniqueness gate: when no explicit `Status is initial in SM`
+/// fact was asserted, the rooted-set (Pass 4 candidates) is consulted.
+/// If exactly one rooted Status exists for the SM, it is promoted to
+/// initial — matching the `derive_state_machines_from_facts` Pass 4
+/// logic at compile.rs:502-504. Per the brief (#760), this cardinality
+/// gate has to live consumer-side because FORML 2 derivations are
+/// monotonic and cannot express "exactly one" themselves.
+///
+/// Robust to missing cells: an SM with zero transitions yields an
+/// empty/degenerate `CompiledStateMachine` whose transition Func is
+/// `Selector(1)` (return current state) — same shape the typed-struct
+/// path emits for empty `def.transitions`.
+fn compile_state_machine_from_cells(
+    noun_name: &str,
+    cells: &crate::ast::Object,
+    constraints: &[CompiledConstraint],
+) -> Option<CompiledStateMachine> {
+    use crate::ast::{fetch_or_phi, binding};
+
+    // -- Step 1: bind the SM definition name(s) for this noun. --------
+    // Cell shape produced by the parser's instance-fact fanout for
+    // `State Machine Definition 'X' is for Noun 'Y'`:
+    //   <<State Machine Definition, X>, <Noun, Y>>
+    let sm_for_noun = fetch_or_phi(
+        "State_Machine_Definition_is_for_Noun", cells);
+    let sm_names: Vec<String> = sm_for_noun.as_seq().map(|facts| {
+        facts.iter().filter_map(|f| {
+            let n = binding(f, "Noun")?;
+            (n == noun_name).then(|| binding(f, "State Machine Definition")
+                .map(|s| s.to_string()))?
+        }).collect::<Vec<_>>()
+    }).unwrap_or_default();
+
+    // No SM for this noun — caller falls back to the JSON-blob path.
+    let sm_name = sm_names.into_iter().next()?;
+
+    // Helper: extract (Status, SM) pairs from a normalized SM cell that
+    // matches our `sm_name`. The cell facts are 2-tuples of named pairs
+    // shaped <<Status, S>, <State Machine Definition, X>>.
+    let statuses_for_sm = |cell_name: &str| -> Vec<String> {
+        fetch_or_phi(cell_name, cells).as_seq().map(|facts| {
+            facts.iter().filter_map(|f| {
+                let s = binding(f, "Status")?;
+                let m = binding(f, "State Machine Definition")?;
+                (m == sm_name.as_str()).then(|| s.to_string())
+            }).collect::<Vec<_>>()
+        }).unwrap_or_default()
+    };
+
+    // -- Step 2: explicit initial status. -----------------------------
+    let initial_decls = statuses_for_sm(
+        "Status_is_initial_in_State_Machine_Definition");
+    let explicit_initial: Option<String> = initial_decls.into_iter().next();
+
+    // -- Step 3: full status set (Pass 1/2/2b). -----------------------
+    let mut statuses: Vec<String> = statuses_for_sm(
+        "Status_is_defined_in_State_Machine_Definition");
+
+    // -- Step 4: transitions. -----------------------------------------
+    // First gather (transition_name -> sm_name) ownership so we know
+    // which transitions belong to this SM. Cell shape:
+    //   <<Transition, T>, <State Machine Definition, X>>
+    let t_in_sm: Vec<String> = fetch_or_phi(
+        "Transition_is_defined_in_State_Machine_Definition", cells)
+        .as_seq().map(|facts| {
+            facts.iter().filter_map(|f| {
+                let t = binding(f, "Transition")?;
+                let m = binding(f, "State Machine Definition")?;
+                (m == sm_name.as_str()).then(|| t.to_string())
+            }).collect::<Vec<_>>()
+        }).unwrap_or_default();
+
+    // Per-transition source/target/event lookups. Use Vec to keep the
+    // hashbrown ban (M1, #694).
+    let t_from_pairs: Vec<(String, String)> = fetch_or_phi(
+        "Transition_is_from_Status", cells).as_seq().map(|facts| {
+            facts.iter().filter_map(|f| {
+                let t = binding(f, "Transition")?;
+                let s = binding(f, "Status")?;
+                Some((t.to_string(), s.to_string()))
+            }).collect()
+        }).unwrap_or_default();
+    let t_to_pairs: Vec<(String, String)> = fetch_or_phi(
+        "Transition_is_to_Status", cells).as_seq().map(|facts| {
+            facts.iter().filter_map(|f| {
+                let t = binding(f, "Transition")?;
+                let s = binding(f, "Status")?;
+                Some((t.to_string(), s.to_string()))
+            }).collect()
+        }).unwrap_or_default();
+    let t_event_pairs: Vec<(String, String)> = fetch_or_phi(
+        "Transition_is_triggered_by_Fact_Type", cells).as_seq().map(|facts| {
+            facts.iter().filter_map(|f| {
+                let t = binding(f, "Transition")?;
+                let e = binding(f, "Fact Type")?;
+                Some((t.to_string(), e.to_string()))
+            }).collect()
+        }).unwrap_or_default();
+
+    let lookup = |pairs: &[(String, String)], key: &str| -> Option<String> {
+        pairs.iter().find_map(|(k, v)| (k == key).then(|| v.clone()))
+    };
+
+    let mut transitions: Vec<TransitionDef> = t_in_sm.iter().filter_map(|t_name| {
+        let from = lookup(&t_from_pairs, t_name)?;
+        let to   = lookup(&t_to_pairs, t_name)?;
+        let event = lookup(&t_event_pairs, t_name).unwrap_or_else(|| t_name.clone());
+        // Backfill statuses encountered in transitions (parity with
+        // the typed-struct Pass 3 fold at compile.rs:471-477).
+        if !statuses.contains(&from) { statuses.push(from.clone()); }
+        if !statuses.contains(&to)   { statuses.push(to.clone()); }
+        Some(TransitionDef { from, to, event, guard: None })
+    }).collect();
+
+    // Stable order: the typed path uses a HashSet-driven iteration so
+    // its order is non-deterministic. We sort transitions and statuses
+    // so the cell-driven function emits a canonical Func that's
+    // independent of cell-fact ordering.
+    transitions.sort_by(|a, b| (&a.from, &a.event, &a.to).cmp(&(&b.from, &b.event, &b.to)));
+
+    // -- Step 5: Pass-4 uniqueness gate. ------------------------------
+    // When no explicit `Status is initial in SM` exists, fall back to
+    // the rooted-set (Pass 4 candidates). Single rooted Status ⇒
+    // initial; otherwise leave initial empty (matches Rust path's
+    // "ambiguous" branch at compile.rs:502-504).
+    let initial = match explicit_initial {
+        Some(s) => s,
+        None => {
+            let rooted = statuses_for_sm(
+                "Status_is_rooted_in_State_Machine_Definition");
+            // De-dup defensively: the parser-shaped cell may carry the
+            // same fact more than once if the upstream rule fired
+            // multiple times.
+            let mut unique: Vec<String> = Vec::new();
+            for s in rooted {
+                if !unique.contains(&s) { unique.push(s); }
+            }
+            if unique.len() == 1 { unique.into_iter().next().unwrap() }
+            else { String::new() }
+        }
+    };
+
+    // -- Step 6: assemble a StateMachineDef and reuse the typed-path
+    // hierarchical-expansion + AST-construction logic in
+    // `compile_state_machine`. This guarantees byte-equivalent Func
+    // output for any SM whose cell-driven inputs match what
+    // `derive_state_machines_from_facts` would have produced from the
+    // same instance facts — the only divergence is which side did the
+    // assembly. -------------------------------------------------------
+    let def = StateMachineDef {
+        noun_name: noun_name.to_string(),
+        statuses,
+        transitions,
+        initial,
+    };
+    Some(compile_state_machine(&def, constraints))
+}
+
 // -- SQL Dialect DDL Generation ---------------------------------------
 
 #[derive(Clone, Copy)]
@@ -6780,5 +6986,299 @@ It is forbidden that each Noun has a name that ends with 'ies'.\n";
         assert!(!violations.is_empty(),
             "forbidden constraint with trigger fact present must produce \
              ≥1 violation; got {:?}; raw obj {:?}", violations, violations_obj);
+    }
+}
+
+// ── #761 (MC3b-c): cell-driven SM compiler parity tests ──────────────
+//
+// `compile_state_machine_from_cells` reads SM behavior from the
+// normalized FT cells populated by the derivation rules in
+// readings/core/state.md (#759 Pass 1/2/2b, #760 Pass 4) and produces
+// the same `CompiledStateMachine` shape `compile_state_machine`
+// produces from a typed `StateMachineDef`.
+//
+// Two tests:
+//   1. `parity_with_typed_struct_path_for_explicit_initial`
+//      — corpus with an explicit `Status is initial in SM` fact;
+//      both paths must compile to a transition Func that classifies
+//      events identically (apply-equivalence, since `Func` doesn't
+//      derive PartialEq and the AST shape is the same anyway).
+//   2. `graph_derived_initial_when_unique_source_never_target`
+//      — corpus with NO `is initial in` fact; the cell-driven path
+//      must promote the unique source-never-target Status to initial
+//      via the Pass-4 rooted cell + uniqueness gate.
+#[cfg(test)]
+mod cell_driven_sm_tests {
+    use super::*;
+    use crate::ast::{self, Object, fact_from_pairs};
+    use crate::types::{StateMachineDef, TransitionDef};
+
+    /// Build a minimal cell store that mimics what the parser would
+    /// emit for the corpus described above. We bypass the parser to
+    /// keep the test hermetic and avoid coupling to parser-side
+    /// derivation/forward-chain timing — the function under test only
+    /// reads the named cells, so populating them directly is sufficient.
+    fn order_sm_cells_with_explicit_initial() -> Object {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        cells.entry("State_Machine_Definition_is_for_Noun".into()).or_default()
+            .push(fact_from_pairs(&[
+                ("State Machine Definition", "OrderSM"),
+                ("Noun", "Order"),
+            ]));
+        cells.entry("Status_is_initial_in_State_Machine_Definition".into()).or_default()
+            .push(fact_from_pairs(&[
+                ("Status", "Draft"),
+                ("State Machine Definition", "OrderSM"),
+            ]));
+        for s in &["Draft", "Placed", "Shipped"] {
+            cells.entry("Status_is_defined_in_State_Machine_Definition".into()).or_default()
+                .push(fact_from_pairs(&[
+                    ("Status", s),
+                    ("State Machine Definition", "OrderSM"),
+                ]));
+        }
+        for (t, from, to, ev) in &[
+            ("place", "Draft",  "Placed",  "Order_was_placed"),
+            ("ship",  "Placed", "Shipped", "Order_was_shipped"),
+        ] {
+            cells.entry("Transition_is_defined_in_State_Machine_Definition".into()).or_default()
+                .push(fact_from_pairs(&[
+                    ("Transition", t),
+                    ("State Machine Definition", "OrderSM"),
+                ]));
+            cells.entry("Transition_is_from_Status".into()).or_default()
+                .push(fact_from_pairs(&[("Transition", t), ("Status", from)]));
+            cells.entry("Transition_is_to_Status".into()).or_default()
+                .push(fact_from_pairs(&[("Transition", t), ("Status", to)]));
+            cells.entry("Transition_is_triggered_by_Fact_Type".into()).or_default()
+                .push(fact_from_pairs(&[("Transition", t), ("Fact Type", ev)]));
+        }
+        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect())
+    }
+
+    /// The same SM as a typed `StateMachineDef`, mirroring what
+    /// `derive_state_machines_from_facts` would produce from the
+    /// matching instance facts.
+    fn order_sm_def_with_explicit_initial() -> StateMachineDef {
+        StateMachineDef {
+            noun_name: "Order".to_string(),
+            statuses: vec!["Draft".into(), "Placed".into(), "Shipped".into()],
+            initial: "Draft".into(),
+            transitions: vec![
+                TransitionDef {
+                    from: "Draft".into(), to: "Placed".into(),
+                    event: "Order_was_placed".into(), guard: None,
+                },
+                TransitionDef {
+                    from: "Placed".into(), to: "Shipped".into(),
+                    event: "Order_was_shipped".into(), guard: None,
+                },
+            ],
+        }
+    }
+
+    /// Apply the SM transition Func to <current_state, event> and
+    /// return the next state. Mirrors the runtime call shape in
+    /// evaluate.rs.
+    fn step(func: &ast::Func, state: &str, event: &str, defs: &Object) -> String {
+        let input = Object::seq(vec![Object::atom(state), Object::atom(event)]);
+        match ast::apply(func, &input, defs) {
+            Object::Atom(s) => s,
+            other => panic!("transition Func must return Atom; got {:?}", other),
+        }
+    }
+
+    /// Parity: cell-driven and typed-struct paths must produce
+    /// transition Funcs that classify events identically. We exercise
+    /// every (state, event) pair the SM understands plus a couple of
+    /// no-op cases (unknown event, unknown state) to pin the fallback
+    /// branch (`Selector(1)` returns the current state).
+    #[test]
+    fn parity_with_typed_struct_path_for_explicit_initial() {
+        let cells = order_sm_cells_with_explicit_initial();
+        let def = order_sm_def_with_explicit_initial();
+        let constraints: Vec<CompiledConstraint> = vec![];
+
+        let typed = compile_state_machine(&def, &constraints);
+        let cell_driven = compile_state_machine_from_cells(
+            "Order", &cells, &constraints,
+        ).expect("cell-driven path must return Some when SM-for-Noun exists");
+
+        assert_eq!(cell_driven.noun_name, typed.noun_name);
+        assert_eq!(cell_driven.initial, typed.initial,
+            "both paths must agree on initial state");
+        // Status sets must be set-equal (order may differ between paths).
+        let typed_set: std::collections::BTreeSet<&str> =
+            typed.statuses.iter().map(String::as_str).collect();
+        let cell_set: std::collections::BTreeSet<&str> =
+            cell_driven.statuses.iter().map(String::as_str).collect();
+        assert_eq!(cell_set, typed_set,
+            "both paths must agree on the status set");
+
+        // Apply-parity: both Funcs must produce identical next-states
+        // for every (current, event) pair we care about.
+        let defs = Object::phi();
+        let cases = &[
+            // Live transitions
+            ("Draft",   "Order_was_placed"),
+            ("Placed",  "Order_was_shipped"),
+            // Wrong-event no-ops — Func falls through to Selector(1).
+            ("Draft",   "Order_was_shipped"),
+            ("Placed",  "Order_was_placed"),
+            ("Shipped", "Order_was_placed"),
+            // Unknown event / state
+            ("Shipped", "Order_was_received"),
+            ("Cancelled", "Order_was_placed"),
+        ];
+        for (state, event) in cases {
+            let typed_next = step(&typed.func, state, event, &defs);
+            let cell_next  = step(&cell_driven.func, state, event, &defs);
+            assert_eq!(typed_next, cell_next,
+                "parity break at ({}, {}): typed path -> {:?}, \
+                 cell-driven path -> {:?}",
+                state, event, typed_next, cell_next);
+        }
+    }
+
+    /// Pass-4 uniqueness gate: when no `Status is initial in SM` fact
+    /// exists, the cell-driven path consults the rooted cell. If
+    /// exactly one rooted Status appears for the SM, it is promoted
+    /// to initial — matching `derive_state_machines_from_facts`
+    /// Pass-4 behavior at compile.rs:502-504.
+    fn order_sm_cells_with_graph_derived_initial() -> Object {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        cells.entry("State_Machine_Definition_is_for_Noun".into()).or_default()
+            .push(fact_from_pairs(&[
+                ("State Machine Definition", "OrderSM"),
+                ("Noun", "Order"),
+            ]));
+        // No `Status is initial in SM` fact — the rooted cell is the
+        // only signal.
+        for s in &["Draft", "Placed", "Shipped"] {
+            cells.entry("Status_is_defined_in_State_Machine_Definition".into()).or_default()
+                .push(fact_from_pairs(&[
+                    ("Status", s),
+                    ("State Machine Definition", "OrderSM"),
+                ]));
+        }
+        // Pass-4 forward-chain output for a Draft -> Placed -> Shipped
+        // chain: Draft is the unique source-never-target.
+        cells.entry("Status_is_rooted_in_State_Machine_Definition".into()).or_default()
+            .push(fact_from_pairs(&[
+                ("Status", "Draft"),
+                ("State Machine Definition", "OrderSM"),
+            ]));
+        for (t, from, to, ev) in &[
+            ("place", "Draft",  "Placed",  "Order_was_placed"),
+            ("ship",  "Placed", "Shipped", "Order_was_shipped"),
+        ] {
+            cells.entry("Transition_is_defined_in_State_Machine_Definition".into()).or_default()
+                .push(fact_from_pairs(&[
+                    ("Transition", t),
+                    ("State Machine Definition", "OrderSM"),
+                ]));
+            cells.entry("Transition_is_from_Status".into()).or_default()
+                .push(fact_from_pairs(&[("Transition", t), ("Status", from)]));
+            cells.entry("Transition_is_to_Status".into()).or_default()
+                .push(fact_from_pairs(&[("Transition", t), ("Status", to)]));
+            cells.entry("Transition_is_triggered_by_Fact_Type".into()).or_default()
+                .push(fact_from_pairs(&[("Transition", t), ("Fact Type", ev)]));
+        }
+        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect())
+    }
+
+    #[test]
+    fn graph_derived_initial_when_unique_source_never_target() {
+        let cells = order_sm_cells_with_graph_derived_initial();
+        let constraints: Vec<CompiledConstraint> = vec![];
+        let cell_driven = compile_state_machine_from_cells(
+            "Order", &cells, &constraints,
+        ).expect("cell-driven path must return Some when SM-for-Noun exists");
+
+        // Pass-4 uniqueness: rooted cardinality == 1 ⇒ promote to initial.
+        assert_eq!(cell_driven.initial, "Draft",
+            "Pass-4 uniqueness gate must promote the lone rooted Status \
+             to initial when no explicit `is initial in` fact exists; \
+             got initial={:?}, statuses={:?}",
+            cell_driven.initial, cell_driven.statuses);
+
+        // The transition Func must still classify the chain correctly.
+        let defs = Object::phi();
+        assert_eq!(step(&cell_driven.func, "Draft",  "Order_was_placed",  &defs), "Placed");
+        assert_eq!(step(&cell_driven.func, "Placed", "Order_was_shipped", &defs), "Shipped");
+    }
+
+    /// Multiple rooted Statuses ⇒ ambiguous; the cell-driven path
+    /// must leave `initial` empty (matches the typed path's behavior
+    /// at compile.rs:5169).
+    #[test]
+    fn graph_derived_initial_left_empty_when_rooted_set_is_ambiguous() {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        cells.entry("State_Machine_Definition_is_for_Noun".into()).or_default()
+            .push(fact_from_pairs(&[
+                ("State Machine Definition", "OrderSM"),
+                ("Noun", "Order"),
+            ]));
+        // Two rooted Statuses → ambiguous → initial stays empty.
+        for s in &["Draft", "Pending"] {
+            cells.entry("Status_is_rooted_in_State_Machine_Definition".into()).or_default()
+                .push(fact_from_pairs(&[
+                    ("Status", s),
+                    ("State Machine Definition", "OrderSM"),
+                ]));
+        }
+        let cells = Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect());
+
+        let constraints: Vec<CompiledConstraint> = vec![];
+        let cell_driven = compile_state_machine_from_cells(
+            "Order", &cells, &constraints,
+        ).expect("cell-driven path must return Some when SM-for-Noun exists");
+
+        assert!(cell_driven.initial.is_empty(),
+            "ambiguous rooted set must leave initial empty; got {:?}",
+            cell_driven.initial);
+    }
+
+    /// No SM-for-Noun fact ⇒ the cell-driven path returns None so the
+    /// caller can fall back to the JSON-blob path.
+    #[test]
+    fn returns_none_when_no_sm_for_noun_fact() {
+        let cells = Object::Map(HashMap::new());
+        let constraints: Vec<CompiledConstraint> = vec![];
+        let result = compile_state_machine_from_cells(
+            "NonexistentNoun", &cells, &constraints,
+        );
+        assert!(result.is_none(),
+            "cell-driven path must return None when no SM-for-Noun \
+             fact binds the requested noun; got {:?}", result.map(|c| c.noun_name));
+    }
+
+    /// SM-for-Noun fact exists but no transitions ⇒ degenerate
+    /// CompiledStateMachine whose transition Func is `Selector(1)`
+    /// (returns current state). No panics on missing cells.
+    #[test]
+    fn empty_transitions_yields_degenerate_compiled_sm() {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        cells.entry("State_Machine_Definition_is_for_Noun".into()).or_default()
+            .push(fact_from_pairs(&[
+                ("State Machine Definition", "OrderSM"),
+                ("Noun", "Order"),
+            ]));
+        let cells = Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect());
+        let constraints: Vec<CompiledConstraint> = vec![];
+        let cell_driven = compile_state_machine_from_cells(
+            "Order", &cells, &constraints,
+        ).expect("cell-driven path must return Some when SM-for-Noun exists");
+
+        // No transitions / no statuses / no initial — everything degenerate.
+        assert!(cell_driven.transition_table.is_empty());
+        assert!(cell_driven.statuses.is_empty());
+        assert!(cell_driven.initial.is_empty());
+
+        // Selector(1) returns the current state for any input.
+        let defs = Object::phi();
+        let result = step(&cell_driven.func, "Anything", "any_event", &defs);
+        assert_eq!(result, "Anything",
+            "fallback Func must echo current state; got {:?}", result);
     }
 }
