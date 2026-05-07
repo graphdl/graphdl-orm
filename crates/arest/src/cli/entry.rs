@@ -482,6 +482,32 @@ pub fn main_entry() {
                 // Fold all readings (metamodel + user) into Object state.
                 // Each reading parses to its own state; consecutive states
                 // merge via cell concatenation. No Domain struct.
+                //
+                // Closure Under Self-Modification (AREST.tex Corollary 6 +
+                // Migration Remark, #831 / cor:closure): compile is a
+                // SYSTEM application that PRESERVES P. Seed the fold
+                // from existing DB state (population FT cells stripped
+                // of `:` def cells, since defs get regenerated below by
+                // `compile_to_defs_state`). Apply-written facts that
+                // aren't in readings survive across recompile via
+                // `merge_states`'s identity-aware concat_dedup. Mirrors
+                // `platform_compile`'s `merge_states(d, &parsed)` at
+                // ast.rs:2683.
+                let prior_population: ast::Object = {
+                    let loaded = db::load_state(&conn);
+                    let map: hashbrown::HashMap<String, ast::Object> =
+                        ast::cells_iter(&loaded).into_iter()
+                            .filter(|(name, _)| !name.contains(':'))
+                            .map(|(name, contents)| (name.to_string(), contents.clone()))
+                            .collect();
+                    ast::Object::Map(map)
+                };
+                let prior_cell_count = ast::cells_iter(&prior_population).len();
+                if prior_cell_count > 0 {
+                    eprintln!("[load] preserving {} cells from existing DB \
+                              (Closure Under Self-Modification, cor:closure)",
+                              prior_cell_count);
+                }
                 parse_forml2::set_bootstrap_mode(true);
                 parse_forml2::set_strict_mode(strict);
                 let all_readings: Vec<(&str, &str)> = crate::metamodel_readings().into_iter()
@@ -489,7 +515,7 @@ pub fn main_entry() {
                     .chain(readings.iter().map(|(n, t)| (n.as_str(), t.as_str())))
                     .collect();
                 let state = all_readings.iter().fold(
-                    ast::Object::phi(),
+                    prior_population,
                     |merged, (name, text)| {
                         let this = parse_forml2::parse_to_state_from(text, &merged)
                             .unwrap_or_else(|e| { eprintln!("{}: {}", name, e); std::process::exit(1); });

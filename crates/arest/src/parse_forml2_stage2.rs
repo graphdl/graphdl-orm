@@ -4899,6 +4899,48 @@ mod tests {
             consequent_ft, binding(&rule_seq[0], "text"));
     }
 
+    /// #831 / cor:closure — Closure Under Self-Modification (AREST.tex
+    /// Corollary 6 + Migration Remark): the compile op is a SYSTEM
+    /// application that PRESERVES P. New readings extend D; they don't
+    /// reset it. `platform_compile` (ast.rs:2683) already does
+    /// `merge_states(d, &parsed)` for this reason. The canonical CLI
+    /// entry path (cli/entry.rs:491) folds from `Object::phi()` and
+    /// silently throws away apply-written FT cells on every recompile,
+    /// which is what apps/tasks #831 is asking to fix.
+    ///
+    /// This test pins the engine-level invariant the fix relies on:
+    /// parsing schema-only readings against a prior state with
+    /// apply-written FT cells must, after merge, still contain those
+    /// cells verbatim.
+    #[test]
+    fn parse_then_merge_preserves_prior_population_when_readings_have_no_instance_facts() {
+        let mut prior = crate::ast::Object::phi();
+        prior = crate::ast::cell_push(
+            "Task_has_Task_Status",
+            crate::ast::fact_from_pairs(&[("Task", "1"), ("Task Status", "completed")]),
+            &prior,
+        );
+        let schema_only = "\
+            Task is an entity type.\n\
+            Task Status is a value type.\n\
+            Task has Task Status.\n\
+        ";
+        let parsed = super::parse_to_state_via_stage12_with_context(schema_only, &prior)
+            .expect("schema-only readings must parse against a prior state");
+        let merged = crate::ast::merge_states(&prior, &parsed);
+
+        let cell = crate::ast::fetch_or_phi("Task_has_Task_Status", &merged);
+        let entries: Vec<&crate::ast::Object> = cell.as_seq()
+            .map(|s| s.iter().collect()).unwrap_or_default();
+        assert_eq!(entries.len(), 1,
+            "prior apply-written fact must survive parse+merge \
+             (Closure Under Self-Modification, AREST.tex Cor.\u{00a0}6); \
+             got {} entries", entries.len());
+        assert!(crate::ast::binding(entries[0], "Task Status") == Some("completed"),
+            "the surviving fact must carry the prior apply-written value `completed`, \
+             not be replaced by a default; got {:?}", entries[0]);
+    }
+
     // ── Perf Benchmarks (opt-in) ───────────────────────────────────────
     //
     // Kept out of the default suite by `#[ignore]`. Run with:
