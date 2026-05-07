@@ -4691,6 +4691,48 @@ mod tests {
     // calling `parse_to_state_legacy`; retired with the legacy cascade
     // in #285 (stage12 is the parser now).
 
+    /// Stage-1/2 must preserve all instance facts even when their
+    /// quoted values contain shell/tokenizer-significant characters
+    /// like `<`. apps/tasks bug (#821): a single `<` inside one
+    /// Subject value silently truncated every subsequent Task Subject
+    /// from the parsed cell — observed boundary at Task 622/623 because
+    /// 623's subject was the first to contain `<`. Apps/tasks
+    /// instance-fact migrations carry user-typed prose; characters
+    /// like `<` in `< 30 s` must round-trip cleanly.
+    #[test]
+    fn instance_fact_value_containing_lessthan_does_not_truncate_subsequent_facts() {
+        let src = "\
+            Task(.id) is an entity type.\n\
+            Task Subject is a value type.\n\
+            Task has Task Subject.\n\
+            Task '622' has Task Subject 'HATEOAS-prereq-b: Apply chosen network fix (poll-from-wakeup or static IP)'.\n\
+            Task '623' has Task Subject 'HATEOAS-prereq-c: Verify host curl localhost:8080 reachable in < 30 s'.\n\
+            Task '624' has Task Subject 'HATEOAS-verify: Run apis e2e against kernel (BASE=localhost:8080)'.\n\
+            Task '625' has Task Subject 'Profile-1: Hierarchical Cargo features (server / mini / full + leaf flags)'.\n\
+        ";
+        let state = super::parse_to_state_via_stage12(src)
+            .expect("parse_to_state_via_stage12");
+        let cell = fetch_or_phi("Task_has_Task_Subject", &state);
+        let entries: Vec<&Object> = cell.as_seq()
+            .map(|s| s.iter().collect())
+            .unwrap_or_default();
+        let task_ids: Vec<&str> = entries.iter()
+            .filter_map(|f| f.as_seq())
+            .filter_map(|pairs| pairs.iter().find_map(|p| {
+                let kv = p.as_seq()?;
+                let role = kv.first()?.as_atom()?;
+                if role == "Task" { kv.get(1)?.as_atom() } else { None }
+            }))
+            .collect();
+        assert!(task_ids.contains(&"622"), "Task 622 (pre-<) must parse; got {:?}", task_ids);
+        assert!(task_ids.contains(&"623"), "Task 623 (with <) must parse; got {:?}", task_ids);
+        assert!(task_ids.contains(&"624"), "Task 624 (after <) must parse; got {:?}", task_ids);
+        assert!(task_ids.contains(&"625"), "Task 625 (further on) must parse; got {:?}", task_ids);
+        assert_eq!(entries.len(), 4,
+            "all four instance facts must land in the cell; got {} entries with task_ids {:?}",
+            entries.len(), task_ids);
+    }
+
     /// Stage-2 must populate `consequentFactTypeId` on emitted
     /// DerivationRule cell facts when the rule's consequent matches a
     /// declared FactType reading. Without this, downstream
