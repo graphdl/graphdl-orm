@@ -421,10 +421,17 @@ fn parse_with_depth(input: &str, depth: usize) -> Object {
 impl fmt::Display for Object {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Object::Atom(s) => write!(f, "{}", escape_atom_for_display(s)),
+            // Top-level atoms are emitted verbatim. A standalone Atom
+            // carrying e.g. a JSON document (the shape
+            // `platform_query_ft` returns) MUST NOT have its `<`,
+            // `>`, `,` escaped — it isn't embedded in a Seq, so
+            // there's no FFP-syntactic ambiguity to defend against.
+            // Atoms appearing INSIDE a Seq are escaped via
+            // `atom_inside_seq` below.
+            Object::Atom(s) => write!(f, "{}", s),
             Object::Seq(items) if items.is_empty() => write!(f, "φ"),
             Object::Seq(items) => {
-                write!(f, "<{}>", items.iter().map(|item| item.to_string())
+                write!(f, "<{}>", items.iter().map(|item| item_inside_seq(item))
                     .collect::<Vec<_>>().join(", "))
             }
             Object::Map(map) => {
@@ -434,6 +441,27 @@ impl fmt::Display for Object {
             }
             Object::Bottom => write!(f, "⊥"),
         }
+    }
+}
+
+/// Render an Object as it appears INSIDE a Seq. Atoms here MUST
+/// have FFP-syntactic chars escaped so they don't fool
+/// `split_top_level` on the way back. Nested Seqs recurse — every
+/// atom leaf, however deep, gets escape treatment.
+fn item_inside_seq(item: &Object) -> alloc::string::String {
+    match item {
+        Object::Atom(s) => escape_atom_for_display(s),
+        Object::Seq(items) if items.is_empty() => "φ".into(),
+        Object::Seq(items) => {
+            alloc::format!("<{}>", items.iter().map(item_inside_seq)
+                .collect::<Vec<_>>().join(", "))
+        }
+        Object::Map(map) => {
+            alloc::format!("{{{}}}",
+                map.iter().map(|(k, v)| alloc::format!("{}={}", k, item_inside_seq(v)))
+                    .collect::<Vec<_>>().join(", "))
+        }
+        Object::Bottom => "⊥".into(),
     }
 }
 
