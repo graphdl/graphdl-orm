@@ -1654,24 +1654,25 @@ pub fn translate_derivation_rules_with_matrix(
 /// that prefixes the consequent (or equals it), or empty string if no
 /// match. Empty when `ft_facts` is empty so legacy callers that don't
 /// thread FT facts get the same `""` they used to.
+///
+/// Subscript-aware (#828 follow-up): when the rule consequent uses a
+/// subscripted role-noun token (`Task1 has Task Readiness 'blocked'`
+/// in a ring-FT derivation), the verbatim text doesn't prefix-match
+/// the bare reading `Task has Task Readiness`. We try matching twice:
+/// once verbatim, once with trailing-digit subscripts stripped from
+/// every Title-cased token. Mirrors `parse_role_token`'s policy of
+/// treating trailing ASCII digits on a Title-case token as a Halpin
+/// numeric subscript rather than part of the noun name.
 fn resolve_consequent_fact_type_id(rule_text: &str, ft_facts: &[Object]) -> String {
     if ft_facts.is_empty() { return String::new(); }
     let consequent = derivation_rule_consequent(rule_text);
+    let consequent_no_subs = strip_role_subscripts(consequent);
     let mut best: (usize, &str) = (0, "");
     for ft in ft_facts {
         let Some(reading) = binding(ft, "reading") else { continue };
         if reading.is_empty() { continue }
-        // The reading must either equal the consequent or be followed
-        // by a space (next role) or `'` (literal value) — preventing
-        // `Task has Task Readiness` from spuriously matching a longer
-        // consequent like `Task has Task Readiness Score 5`.
-        let matched = if consequent == reading {
-            true
-        } else if let Some(rest) = consequent.strip_prefix(reading) {
-            rest.starts_with(' ') || rest.starts_with('\'')
-        } else {
-            false
-        };
+        let matched = consequent_matches_reading(consequent, reading)
+            || consequent_matches_reading(&consequent_no_subs, reading);
         if matched && reading.len() > best.0 {
             if let Some(id) = binding(ft, "id") {
                 best = (reading.len(), id);
@@ -1679,6 +1680,37 @@ fn resolve_consequent_fact_type_id(rule_text: &str, ft_facts: &[Object]) -> Stri
         }
     }
     best.1.to_string()
+}
+
+/// Reading must either equal the consequent or be followed by a space
+/// (next role) or `'` (literal value) — preventing `Task has Task
+/// Readiness` from spuriously matching a longer consequent like
+/// `Task has Task Readiness Score 5`.
+fn consequent_matches_reading(consequent: &str, reading: &str) -> bool {
+    if consequent == reading { return true; }
+    if let Some(rest) = consequent.strip_prefix(reading) {
+        return rest.starts_with(' ') || rest.starts_with('\'');
+    }
+    false
+}
+
+/// Strip trailing ASCII-digit subscripts from each whitespace-separated
+/// token whose first byte is an ASCII uppercase letter. `Task1` →
+/// `Task`, `IPv4` → `IPv` (matching `parse_role_token`'s policy).
+/// Tokens like `'blocked'` (literals) and `has` (lowercase verbs)
+/// pass through unchanged.
+fn strip_role_subscripts(text: &str) -> String {
+    text.split_whitespace().map(|word| {
+        let bytes = word.as_bytes();
+        if bytes.first().map_or(false, |b| b.is_ascii_uppercase()) {
+            let boundary = word.char_indices().rev()
+                .take_while(|(_, c)| c.is_ascii_digit())
+                .last().map(|(i, _)| i).unwrap_or(word.len());
+            word[..boundary].to_string()
+        } else {
+            word.to_string()
+        }
+    }).collect::<Vec<_>>().join(" ")
 }
 
 /// Extract the consequent text from a derivation rule. Strips bullet
@@ -4823,6 +4855,46 @@ mod tests {
             .unwrap_or("");
         assert_eq!(consequent_ft, "Task_has_Task_Readiness",
             "consequentFactTypeId must resolve to the canonical FT id of the consequent reading; \
+             got '{}'. Rule text: {:?}",
+            consequent_ft, binding(&rule_seq[0], "text"));
+    }
+
+    /// Stage-2 must populate `consequentFactTypeId` for derivation rules
+    /// whose consequent uses a SUBSCRIPTED role-noun token (`Task1`,
+    /// `Task2`, …). Without subscript stripping in
+    /// `resolve_consequent_fact_type_id`, the consequent text
+    /// `Task1 has Task Readiness 'blocked'` fails to prefix-match the
+    /// FT reading `Task has Task Readiness` because `Task1` doesn't
+    /// equal `Task`. Result: empty consequentFactTypeId, so
+    /// `derivation_index:{noun}` skips the rule (no FT to harvest
+    /// nouns from), the apply-path noun-gating filter excludes it,
+    /// and ring-FT join derivations silently never fire on per-call
+    /// apply. apps/tasks's `Task1 has Task Readiness 'blocked' iff
+    /// Task2 blocks Task1 and Task2 has Task Status 'pending'` is
+    /// the canonical case.
+    #[test]
+    fn stage12_pipeline_resolves_consequent_fact_type_id_for_subscripted_role_token() {
+        let src = "\
+            Task is an entity type.\n\
+            Task Status is a value type.\n\
+            Task Readiness is a value type.\n\
+            Task has Task Status.\n\
+            Task has Task Readiness.\n\
+            Task blocks Task.\n\
+            Task1 has Task Readiness 'blocked' iff Task2 blocks Task1 and Task2 has Task Status 'pending'.\n\
+        ";
+        let state = super::parse_to_state_via_stage12(src)
+            .expect("parse_to_state_via_stage12");
+        let rules = fetch_or_phi("DerivationRule", &state);
+        let rule_seq = rules.as_seq()
+            .expect("DerivationRule cell must be a Seq");
+        assert_eq!(rule_seq.len(), 1,
+            "exactly one derivation rule expected; got {}", rule_seq.len());
+        let consequent_ft = binding(&rule_seq[0], "consequentFactTypeId")
+            .unwrap_or("");
+        assert_eq!(consequent_ft, "Task_has_Task_Readiness",
+            "consequentFactTypeId must resolve to `Task_has_Task_Readiness` even when the \
+             consequent's role-noun token (`Task1`) carries a numeric subscript; \
              got '{}'. Rule text: {:?}",
             consequent_ft, binding(&rule_seq[0], "text"));
     }

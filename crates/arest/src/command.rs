@@ -2563,6 +2563,83 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         );
     }
 
+    /// #828 — full stratification through apply update: stratum 1 must
+    /// reach fixpoint before stratum 2 evaluates its negation guard.
+    /// With T1 blocks T2 and both pending, an UpdateEntity touching T1
+    /// must produce mutually-exclusive readiness:
+    ///   * T2 → blocked  (stratum 1: T1 pending blocker)
+    ///   * T1 → ready    (stratum 2: T1 pending, no blocked entry for T1)
+    ///   * T2 NOT ready  (stratum 2's AbsenceOf must see T2's blocked
+    ///                    fact materialized by stratum 1)
+    /// Without stratum ordering the ready rule fires in round 1 before
+    /// blocked is populated, so T2 ends up tagged both 'blocked' and
+    /// 'ready'.
+    #[test]
+    fn apply_path_update_runs_strata_in_order_so_ready_respects_blocked() {
+        let src = "\
+            Task(.id) is an entity type.\n\
+            Task Status is a value type.\n\
+            Task Readiness is a value type.\n\
+            Task has Task Status.\n\
+            Task has Task Readiness.\n\
+            Task blocks Task.\n\
+            Task '1' has Task Status 'pending'.\n\
+            Task '2' has Task Status 'pending'.\n\
+            Task '1' blocks Task '2'.\n\
+            Task1 has Task Readiness 'blocked' iff Task2 blocks Task1 and Task2 has Task Status 'pending'.\n\
+            Task has Task Readiness 'ready' iff Task has Task Status 'pending' and Task has no Task Readiness 'blocked'.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_map = ast::defs_to_state(&defs, &state);
+
+        // Update T1: re-set its status. Triggers the apply forward chain.
+        let mut fields = HashMap::new();
+        fields.insert("Task Status".to_string(), "pending".to_string());
+        let cmd = Command::UpdateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            entity_id: "1".to_string(),
+            fields,
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &state);
+        assert!(!result.rejected,
+            "update must not be rejected; violations={:?}", result.violations);
+
+        let readiness_cell = ast::fetch_or_phi("Task_has_Task_Readiness", &result.state);
+        let entries: Vec<&ast::Object> = readiness_cell.as_seq()
+            .map(|s| s.iter().collect()).unwrap_or_default();
+        let by_status = |status: &str| -> Vec<String> {
+            entries.iter()
+                .filter(|f| f.as_seq().map(|pairs| pairs.iter().any(|p| {
+                    let kv = match p.as_seq() { Some(kv) => kv, None => return false };
+                    kv.first().and_then(|k| k.as_atom()) == Some("Task Readiness")
+                        && kv.get(1).and_then(|v| v.as_atom()) == Some(status)
+                })).unwrap_or(false))
+                .filter_map(|f| f.as_seq().and_then(|pairs| pairs.iter().find_map(|p| {
+                    let kv = p.as_seq()?;
+                    let role = kv.first()?.as_atom()?;
+                    if role == "Task" { kv.get(1)?.as_atom().map(String::from) } else { None }
+                })))
+                .collect()
+        };
+        let ready = by_status("ready");
+        let blocked = by_status("blocked");
+        assert!(blocked.contains(&"2".to_string()),
+            "T2 must be blocked (T1 pending blocks it); ready={:?}, blocked={:?}", ready, blocked);
+        assert!(ready.contains(&"1".to_string()),
+            "T1 must be ready (pending, nothing blocks it); ready={:?}, blocked={:?}", ready, blocked);
+        assert!(!ready.contains(&"2".to_string()),
+            "T2 must NOT be ready — its blocked fact materialized in stratum 1 \
+             must filter it out of stratum 2's ready rule; \
+             ready={:?}, blocked={:?}", ready, blocked);
+        assert!(!blocked.contains(&"1".to_string()),
+            "T1 must NOT be blocked (nothing blocks it); ready={:?}, blocked={:?}", ready, blocked);
+    }
+
     #[test]
     fn transition_updates_state_status() {
         let (def_map, state) = setup_order_defs();
