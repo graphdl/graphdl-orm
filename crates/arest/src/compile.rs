@@ -3212,6 +3212,108 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             Func::compose(Func::apply_to_all(derive_one), extract(0, ft_id))
         }
         _ => {
+            // Subscript-driven join (#826): when a rule's antecedents
+            // share a subscript token (`Task1` in both `Task1 blocks
+            // Task2` and `Task1 has Task Status 'pending'`), the
+            // semantics are a per-tuple equi-join — fire one
+            // consequent per (a0, a1) where a0[role_idx0] ==
+            // a1[role_idx1]. The existing existence-check branch
+            // below fires once globally and projects bindings from
+            // the first fact, which is wrong for ring-FT joins (the
+            // consequent's `Task` always becomes the first role of
+            // the first ring fact, never the per-tuple match).
+            //
+            // 2-antecedent specialisation. Larger arities still flow
+            // through the existence check or compile_join_derivation
+            // until subscript joining generalises.
+            let ant_subs = antecedent_role_subscripts(rule, data);
+            let cons_subs = consequent_role_subscripts(rule, &consequent_id, data);
+            let join_pair: Option<(usize, usize)> = if antecedent_ids.len() == 2 {
+                ant_subs.first().and_then(|a0| ant_subs.get(1).and_then(|a1| {
+                    a0.iter().find_map(|(idx0, sub0)| {
+                        if sub0.is_empty() { return None; }
+                        a1.iter().find(|(_, sub1)| sub1 == sub0).map(|(idx1, _)| (*idx0, *idx1))
+                    })
+                }))
+            } else { None };
+
+            if let Some((j0, j1)) = join_pair {
+                // Per-tuple equi-join. Build the joined-pair stream:
+                //   DistR : <ant0_facts, ant1_facts>
+                //     → seq of <a0, ant1_facts>
+                //   apply_to_all(distl + filter(match_join_key)) per a0
+                //     → seq of seq of <a0, a1> where a0.role[j0] == a1.role[j1]
+                //   Concat → flat seq of <a0, a1>
+                //   apply_to_all(emit_consequent)
+                let ant0 = extract(0, &antecedent_ids[0]);
+                let ant1 = extract(1, &antecedent_ids[1]);
+                let match_key = Func::compose(Func::Eq, Func::construction(vec![
+                    Func::compose(role_value(j0), Func::Selector(1)),
+                    Func::compose(role_value(j1), Func::Selector(2)),
+                ]));
+                let pair_stream_per_a0 = Func::compose(
+                    Func::filter(match_key),
+                    Func::DistL,
+                );
+                let pair_stream = Func::compose(
+                    Func::Concat,
+                    Func::compose(
+                        Func::apply_to_all(pair_stream_per_a0),
+                        Func::compose(Func::DistR, Func::construction(vec![ant0, ant1])),
+                    ),
+                );
+
+                // Build consequent bindings: for each consequent role,
+                // (a) literal pin, (b) subscript-positional projection
+                // from the matched (a0, a1) pair, (c) name fallback
+                // against a0.
+                let cons_roles = data.fact_types.get(&consequent_id)
+                    .map(|ft| ft.roles.clone())
+                    .unwrap_or_default();
+                let pairs: Vec<Func> = cons_roles.iter().enumerate().map(|(cons_role_idx, r)| {
+                    let key = r.noun_name.clone();
+                    if let Some(crl) = rule.consequent_role_literals.iter()
+                        .find(|crl| crl.role == r.noun_name)
+                    {
+                        return Func::construction(vec![
+                            Func::constant(Object::atom(&key)),
+                            Func::constant(Object::atom(&crl.value)),
+                        ]);
+                    }
+                    let cons_sub = cons_subs.iter()
+                        .find(|(idx, _)| *idx == cons_role_idx)
+                        .map(|(_, s)| s.as_str())
+                        .filter(|s| !s.is_empty());
+                    if let Some(sub) = cons_sub {
+                        for (ant_idx, ant_role_subs) in ant_subs.iter().enumerate() {
+                            if let Some((ant_role_idx, _)) = ant_role_subs.iter()
+                                .find(|(_, s)| s == sub)
+                            {
+                                let pick = if ant_idx == 0 { Func::Selector(1) } else { Func::Selector(2) };
+                                return Func::construction(vec![
+                                    Func::constant(Object::atom(&key)),
+                                    Func::compose(role_value(*ant_role_idx), pick),
+                                ]);
+                            }
+                        }
+                    }
+                    Func::construction(vec![
+                        Func::constant(Object::atom(&key)),
+                        Func::compose(role_value_by_name(&r.noun_name), Func::Selector(1)),
+                    ])
+                }).collect();
+                let bindings_func = Func::construction(pairs);
+                let derive_one = Func::construction(vec![
+                    consequent_id_func.clone(),
+                    consequent_reading_func.clone(),
+                    bindings_func,
+                ]);
+                return CompiledDerivation {
+                    id, text, kind,
+                    func: Func::compose(Func::apply_to_all(derive_one), pair_stream),
+                };
+            }
+
             // Multi-antecedent existence check. Fires when every
             // antecedent has at least one surviving fact.
             //
@@ -6479,7 +6581,6 @@ mod schema_tests {
     /// blocks Task2 and Task1 has Task Status 'pending'.` over
     /// `Task '1' blocks Task '2'` must emit the consequent on Task 2
     /// (the blocked one), NOT Task 1 (the blocker).
-    #[ignore = "engine gap: 2-antecedent ring-FT subscript join not yet supported"]
     #[test]
     fn ring_ft_join_derivation_binds_subscript_variables_by_role_position() {
         let src = "\
