@@ -312,6 +312,17 @@ impl StatementTranslatorTable {
             .collect()
     }
 
+    /// Inverse lookup: all classification kinds that `translator` is
+    /// registered to handle, in declaration order. Empty `Vec` means
+    /// no kinds dispatch to this translator (likely a bug — either an
+    /// unregistered translator or a typo'd name).
+    pub fn kinds_for(&self, translator: &str) -> Vec<&str> {
+        self.rows.iter()
+            .filter(|(_, t)| t == translator)
+            .map(|(k, _)| k.as_str())
+            .collect()
+    }
+
     /// All distinct kinds in the table, in first-occurrence order.
     pub fn kinds(&self) -> Vec<&str> {
         let mut out: Vec<&str> = Vec::new();
@@ -866,9 +877,11 @@ fn extract_enum_values(text: &str) -> Option<String> {
 /// Head Noun; the supertype is the noun at Role Position 1 (the only
 /// other role reference in `A is a subtype of B`).
 pub fn translate_subtypes(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+    let table = StatementTranslatorTable::boot();
+    let kinds: Vec<&str> = table.kinds_for("translate_subtypes");
     let statement_ids = collect_statement_ids(idx);
     statement_ids.iter().filter_map(|stmt_id| {
-        if !classifications_contains(idx,stmt_id, "Subtype Declaration") {
+        if !kinds.iter().any(|k| classifications_contains(idx, stmt_id, k)) {
             return None;
         }
         let sub = head_noun_for(idx,stmt_id)?;
@@ -948,17 +961,25 @@ fn derivation_marker_for(idx: &StmtIndex, stmt_id: &str) -> Option<String> {
     idx.derivation_markers.get(stmt_id).cloned()
 }
 
-/// Translate `Partition Declaration` classifications into `Subtype`
-/// cell facts — one `(subtype, supertype)` pair per subtype in the
+/// Translate Partition Declaration statements into `Subtype` cell
+/// facts — one `(subtype, supertype)` pair per subtype in the
 /// comma-separated list. Shape: `A is partitioned into B, C, D` →
 /// (B, A), (C, A), (D, A). The supertype's abstractness flows
 /// through `translate_nouns` which treats Partition Declaration as
 /// an abstract-marking classification.
+///
+/// The Classification kind(s) this translator handles are read from
+/// `StatementTranslatorTable::boot()` rather than hardcoded — the
+/// Rust function name is the registry key. Per AREST.tex §3 (eq:sys)
+/// new operations are registered without modifying any entity.
 pub fn translate_partitions(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+    let _ = classified_state; // statement classification flows via idx
+    let table = StatementTranslatorTable::boot();
+    let kinds: Vec<&str> = table.kinds_for("translate_partitions");
     let statement_ids = collect_statement_ids(idx);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
-        if !classifications_contains(idx,stmt_id, "Partition Declaration") {
+        if !kinds.iter().any(|k| classifications_contains(idx, stmt_id, k)) {
             continue;
         }
         let Some(sup) = head_noun_for(idx,stmt_id) else { continue };
@@ -1325,10 +1346,12 @@ pub fn translate_instance_facts_with_ft_ids(
     idx: &StmtIndex,
     declared_ft_ids: &[String],
 ) -> Vec<Object> {
+    let table = StatementTranslatorTable::boot();
+    let kinds: Vec<&str> = table.kinds_for("translate_instance_facts");
     let statement_ids = collect_statement_ids(idx);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
-        if !classifications_contains(idx,stmt_id, "Instance Fact") {
+        if !kinds.iter().any(|k| classifications_contains(idx, stmt_id, k)) {
             continue;
         }
         let roles = role_refs_with_literals(idx,stmt_id);
@@ -1487,6 +1510,8 @@ pub fn translate_ring_constraints_with_tables(
     ring_kinds: &RingKindTable,
     conditional_matrix: &ConditionalRingMatrix,
 ) -> Vec<Object> {
+    let table = StatementTranslatorTable::boot();
+    let kinds: Vec<&str> = table.kinds_for("translate_ring_constraints");
     let statement_ids = collect_statement_ids(idx);
     let declared_nouns = declared_noun_names(classified_state);
     let mut out: Vec<Object> = Vec::new();
@@ -1498,8 +1523,8 @@ pub fn translate_ring_constraints_with_tables(
         //       X R Z` etc.) not caught by the grammar's trailing-
         //       marker rule — matches legacy `try_ring`'s pass-2b
         //       conditional-pattern dispatcher.
-        let is_classified_ring = classifications_contains(
-            idx, stmt_id, "Ring Constraint");
+        let is_classified_ring = kinds.iter()
+            .any(|k| classifications_contains(idx, stmt_id, k));
         let text = statement_text(idx,stmt_id).unwrap_or_default();
         let (kind, kind_source) = if is_classified_ring {
             let marker = match trailing_marker_for(idx,stmt_id) {
@@ -1716,11 +1741,13 @@ pub fn translate_derivation_rules_with_matrix(
     conditional_matrix: &ConditionalRingMatrix,
     ft_facts: &[Object],
 ) -> Vec<Object> {
+    let table = StatementTranslatorTable::boot();
+    let kinds: Vec<&str> = table.kinds_for("translate_derivation_rules");
     let statement_ids = collect_statement_ids(idx);
     let declared_nouns = declared_noun_names(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
-        if !classifications_contains(idx,stmt_id, "Derivation Rule") {
+        if !kinds.iter().any(|k| classifications_contains(idx, stmt_id, k)) {
             continue;
         }
         let text = statement_text(idx,stmt_id).unwrap_or_default();
@@ -1940,10 +1967,12 @@ fn derivation_rule_id(text: &str) -> String {
 /// from the preceding `Priority is a value type.` statement — this
 /// translator only contributes the value list.
 pub fn translate_enum_values(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+    let table = StatementTranslatorTable::boot();
+    let kinds: Vec<&str> = table.kinds_for("translate_enum_values");
     let statement_ids = collect_statement_ids(idx);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
-        if !classifications_contains(idx,stmt_id, "Enum Values Declaration") {
+        if !kinds.iter().any(|k| classifications_contains(idx, stmt_id, k)) {
             continue;
         }
         let Some(noun) = head_noun_for(idx,stmt_id) else { continue };
@@ -2161,10 +2190,12 @@ pub fn translate_cardinality_constraints(classified_state: &Object, idx: &StmtIn
 /// `parse_forml2::enum_values_for_noun`) and attaches the constraint
 /// to every role where the noun appears.
 pub fn translate_value_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+    let table = StatementTranslatorTable::boot();
+    let kinds: Vec<&str> = table.kinds_for("translate_value_constraints");
     let statement_ids = collect_statement_ids(idx);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
-        if !classifications_contains(idx,stmt_id, "Value Constraint") {
+        if !kinds.iter().any(|k| classifications_contains(idx, stmt_id, k)) {
             continue;
         }
         let Some(noun) = head_noun_for(idx,stmt_id) else { continue };
@@ -2214,6 +2245,8 @@ pub fn translate_deontic_constraints_with_table(
     idx: &StmtIndex,
     deontic_shapes: &DeonticShapeTable,
 ) -> Vec<Object> {
+    let table = StatementTranslatorTable::boot();
+    let kinds: Vec<&str> = table.kinds_for("translate_deontic_constraints");
     let statement_ids = collect_statement_ids(idx);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
@@ -2231,9 +2264,8 @@ pub fn translate_deontic_constraints_with_table(
         // a 'some' inner quantifier sits next to the forbidden prefix)
         // still emit a deontic-modality constraint.
         let op = deontic_operator_for(classified_state, stmt_id);
-        let classified_deontic = classifications_contains(
-            idx, stmt_id, "Deontic Constraint",
-        );
+        let classified_deontic = kinds.iter()
+            .any(|k| classifications_contains(idx, stmt_id, k));
         if op.is_none() && !classified_deontic { continue; }
         let text = statement_text(idx,stmt_id).unwrap_or_default();
         let op_str = op.unwrap_or_default();
