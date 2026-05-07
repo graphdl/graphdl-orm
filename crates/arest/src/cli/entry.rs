@@ -153,17 +153,48 @@ fn system(key: &str, input: &str, d: &ast::Object) -> (String, ast::Object) {
     let obj = ast::Object::parse(input);
     let result = ast::apply(&ast::Func::Def(key.to_string()), &obj, d);
 
-    // State transition: if result contains cells (Noun, FactType, etc.)
-    // it's a new D. Otherwise it's a display-only output.
-    let is_new_d = result.as_seq().is_some()
-        && ast::fetch("Noun", &result) != ast::Object::Bottom;
-
-    let new_d = match is_new_d {
-        true => result.clone(),
-        false => d.clone(),
+    // Three result shapes the dispatcher must distinguish:
+    //
+    //   (a) Compile-style: `Object::Seq` of cells with a Noun entry.
+    //       The apply'd function returned the entire new D directly;
+    //       we replace D wholesale.
+    //
+    //   (b) Apply-style (#766): `Object::Map` carrier with a
+    //       `__state_delta` cell and a `__result` JSON atom — what
+    //       `platform_create` / `platform_update` /
+    //       `platform_transition` emit via `encode_command_result`.
+    //       The delta covers only the cells the command modified;
+    //       merge it onto D so the chain entries land and persist.
+    //       (#831(a) follow-up: this branch was missing, so apply
+    //       results from the CLI shell-out were stringified and
+    //       discarded — the in-process WASM-side `system_impl` never
+    //       had the bug because it routes via
+    //       `classify_writer_result` → `CommitDelta` →
+    //       `merge_delta`. The CLI now mirrors that.)
+    //
+    //   (c) Display-only: every other shape is a query/explain/audit
+    //       response that doesn't change D.
+    //
+    // For (b) we also surface the JSON envelope under `__result` as
+    // the printed output so callers (MCP server, scripts) see the
+    // same response shape `system_impl` produces.
+    let (display, new_d) = match &result {
+        ast::Object::Map(m) if m.contains_key("__state_delta") => {
+            let delta = m.get("__state_delta").cloned().unwrap_or(ast::Object::phi());
+            let merged = ast::merge_delta(d, &delta, None);
+            let result_atom = m.get("__result").cloned();
+            let output = result_atom
+                .and_then(|o| o.as_atom().map(|s| s.to_string()))
+                .unwrap_or_else(|| result.to_string());
+            (output, merged)
+        }
+        ast::Object::Seq(_) if ast::fetch("Noun", &result) != ast::Object::Bottom => {
+            (result.to_string(), result.clone())
+        }
+        _ => (result.to_string(), d.clone()),
     };
 
-    (result.to_string(), new_d)
+    (display, new_d)
 }
 
 /// Read .md files from directories, sorted alphabetically, app.md first.
