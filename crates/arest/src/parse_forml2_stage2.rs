@@ -1542,17 +1542,27 @@ fn encode_conditional_ring_pattern(
 /// the pipeline.
 pub fn translate_derivation_rules(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     translate_derivation_rules_with_matrix(
-        classified_state, idx, &ConditionalRingMatrix::boot())
+        classified_state, idx, &ConditionalRingMatrix::boot(), &[])
 }
 
 /// MC2 (#713) cell-driven variant. Stage-2's
 /// `parse_to_state_via_stage12_impl` builds the matrix once from the
 /// cached grammar state and threads it through the conditional-ring
 /// arbitration check. Bare callers get the `boot()` fallback.
+///
+/// `ft_facts` is the FactType cell already emitted by
+/// `translate_fact_types` for this same parse. When non-empty it
+/// drives the `consequentFactTypeId` resolution that lets
+/// `compile.rs::cell_index_from_state` route the rule to its target
+/// cell and forward-chain firing pick it up. Callers that don't have
+/// FT facts in scope (the older unit tests) pass `&[]` and accept the
+/// empty consequent id — `re_resolve_rules` (compile-time fallback)
+/// will retry from the rule text alone.
 pub fn translate_derivation_rules_with_matrix(
     classified_state: &Object,
     idx: &StmtIndex,
     conditional_matrix: &ConditionalRingMatrix,
+    ft_facts: &[Object],
 ) -> Vec<Object> {
     let statement_ids = collect_statement_ids(idx);
     let declared_nouns = declared_noun_names(classified_state);
@@ -1582,13 +1592,68 @@ pub fn translate_derivation_rules_with_matrix(
             continue;
         }
         let id = derivation_rule_id(&text);
+        let consequent_ft = resolve_consequent_fact_type_id(&text, ft_facts);
         out.push(fact_from_pairs(&[
             ("id",                   id.as_str()),
             ("text",                 text.as_str()),
-            ("consequentFactTypeId", ""),
+            ("consequentFactTypeId", consequent_ft.as_str()),
         ]));
     }
     out
+}
+
+/// Match a derivation rule's consequent text against the readings of
+/// the declared FactTypes. Returns the FT id of the longest reading
+/// that prefixes the consequent (or equals it), or empty string if no
+/// match. Empty when `ft_facts` is empty so legacy callers that don't
+/// thread FT facts get the same `""` they used to.
+fn resolve_consequent_fact_type_id(rule_text: &str, ft_facts: &[Object]) -> String {
+    if ft_facts.is_empty() { return String::new(); }
+    let consequent = derivation_rule_consequent(rule_text);
+    let mut best: (usize, &str) = (0, "");
+    for ft in ft_facts {
+        let Some(reading) = binding(ft, "reading") else { continue };
+        if reading.is_empty() { continue }
+        // The reading must either equal the consequent or be followed
+        // by a space (next role) or `'` (literal value) — preventing
+        // `Task has Task Readiness` from spuriously matching a longer
+        // consequent like `Task has Task Readiness Score 5`.
+        let matched = if consequent == reading {
+            true
+        } else if let Some(rest) = consequent.strip_prefix(reading) {
+            rest.starts_with(' ') || rest.starts_with('\'')
+        } else {
+            false
+        };
+        if matched && reading.len() > best.0 {
+            if let Some(id) = binding(ft, "id") {
+                best = (reading.len(), id);
+            }
+        }
+    }
+    best.1.to_string()
+}
+
+/// Extract the consequent text from a derivation rule. Strips bullet
+/// markers and trailing terminator, then returns everything before the
+/// leftmost ` iff ` / ` if ` / ` when ` keyword. Falls back to the
+/// stripped rule text when no antecedent keyword is present (well-
+/// formed rules always have one, but the parser's non-rule paths may
+/// still feed in stray classifications).
+fn derivation_rule_consequent(rule_text: &str) -> &str {
+    let mut t = rule_text.trim();
+    for prefix in ["* ", "** ", "+ "] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            t = rest.trim_start();
+            break;
+        }
+    }
+    t = t.trim_end_matches('.').trim_end();
+    let split_keywords: &[&str] = &[" iff ", " if ", " when "];
+    match split_keywords.iter().filter_map(|kw| t.find(kw)).min() {
+        Some(idx) => t[..idx].trim_end(),
+        None => t,
+    }
 }
 
 /// Scan derivation rule antecedents for clauses that don't match any
@@ -3067,7 +3132,7 @@ fn parse_to_state_via_stage12_impl(
     constraint_facts = tt!("enrich_spans",
         enrich_constraints_with_spans(&constraint_facts, &role_facts));
     let derivation_facts = tt!("derivation",
-        translate_derivation_rules_with_matrix(&classified, &idx, &conditional_matrix));
+        translate_derivation_rules_with_matrix(&classified, &idx, &conditional_matrix, &ft_facts));
     let unresolved_clause_facts = tt!("unresolved",
         translate_unresolved_clauses(&classified, &idx, &ft_facts));
     let mut declared_ft_ids: Vec<String> = ft_facts.iter()
@@ -4625,6 +4690,40 @@ mod tests {
     // `diff_organization_fixture` was a legacy-vs-stage12 parity check
     // calling `parse_to_state_legacy`; retired with the legacy cascade
     // in #285 (stage12 is the parser now).
+
+    /// Stage-2 must populate `consequentFactTypeId` on emitted
+    /// DerivationRule cell facts when the rule's consequent matches a
+    /// declared FactType reading. Without this, downstream
+    /// `re_resolve_rules` has nothing to resolve, the compiler can't
+    /// route the rule to its target cell, and forward-chain firing
+    /// drops the rule on the floor — which is why apps/tasks's
+    /// `Task has Task Readiness 'ready' iff Task has Task Status 'pending'.`
+    /// never materialises a Task_has_Task_Readiness cell entry.
+    /// See task #822 in apps/tasks for the full engine-gap diagnosis.
+    #[test]
+    fn stage12_pipeline_populates_consequent_fact_type_id_for_literal_iff_rule() {
+        let src = "\
+            Task is an entity type.\n\
+            Task Status is a value type.\n\
+            Task Readiness is a value type.\n\
+            Task has Task Status.\n\
+            Task has Task Readiness.\n\
+            Task has Task Readiness 'ready' iff Task has Task Status 'pending'.\n\
+        ";
+        let state = super::parse_to_state_via_stage12(src)
+            .expect("parse_to_state_via_stage12");
+        let rules = fetch_or_phi("DerivationRule", &state);
+        let rule_seq = rules.as_seq()
+            .expect("DerivationRule cell must be a Seq");
+        assert_eq!(rule_seq.len(), 1,
+            "exactly one derivation rule expected; got {}", rule_seq.len());
+        let consequent_ft = binding(&rule_seq[0], "consequentFactTypeId")
+            .unwrap_or("");
+        assert_eq!(consequent_ft, "Task_has_Task_Readiness",
+            "consequentFactTypeId must resolve to the canonical FT id of the consequent reading; \
+             got '{}'. Rule text: {:?}",
+            consequent_ft, binding(&rule_seq[0], "text"));
+    }
 
     // ── Perf Benchmarks (opt-in) ───────────────────────────────────────
     //
