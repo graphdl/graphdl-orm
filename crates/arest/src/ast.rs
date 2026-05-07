@@ -322,17 +322,70 @@ impl Object {
     }
 }
 
-/// Split a string on commas, respecting nested <> brackets.
-/// foldl over chars, accumulating (depth, start, splits).
+/// Split a string on commas, respecting nested <> brackets and
+/// backslash-escaped specials inside atom tokens. A `\` always
+/// escapes the next char, so an atom value `reachable in \< 30 s`
+/// (the `Display`-emitted form of the in-memory atom
+/// `reachable in < 30 s`) doesn't open a fake nesting level.
 fn split_top_level(s: &str) -> Vec<&str> {
-    let (_, start, mut splits) = s.char_indices().fold((0i32, 0usize, vec![]), |(depth, start, mut acc), (i, c)| match c {
-        '<' => (depth + 1, start, acc),
-        '>' => (depth - 1, start, acc),
-        ',' if depth == 0 => { acc.push(&s[start..i]); (depth, i + 1, acc) }
-        _ => (depth, start, acc),
-    });
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut splits: Vec<&str> = Vec::new();
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => { chars.next(); }
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => {
+                splits.push(&s[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
     splits.push(&s[start..]);
     splits
+}
+
+/// Backslash-escape the FFP-syntactic characters (`<`, `>`, `,`) and
+/// the escape character itself when emitting an atom to the FFP
+/// wire format. Without this, an instance fact value like
+/// `reachable in < 30 s` (a perfectly legitimate atom) round-trips
+/// through `db::persist_state` → `db::load_state` as a malformed
+/// nested `Seq`, silently corrupting the cell. Escaping is a pure
+/// `Display`-side concern; the in-memory `Object::Atom("reachable
+/// in < 30 s")` is unchanged.
+fn escape_atom_for_display(s: &str) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' | '<' | '>' | ',' => { out.push('\\'); out.push(c); }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Reverse of `escape_atom_for_display`. `\X` for any `X` becomes
+/// `X` (we don't reserve specific escape sequences — the only
+/// purpose is to neutralize the FFP-syntactic characters when they
+/// appear inside an atom). A trailing `\` with no following char is
+/// preserved verbatim (defensive: never panic on malformed input).
+fn unescape_atom_from_display(s: &str) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(next) => out.push(next),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Maximum nesting depth for `Object::parse` to prevent stack overflow on
@@ -361,14 +414,14 @@ fn parse_with_depth(input: &str, depth: usize) -> Object {
                 ),
             }
         }
-        atom => Object::Atom(atom.to_string()),
+        atom => Object::Atom(unescape_atom_from_display(atom)),
     }
 }
 
 impl fmt::Display for Object {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Object::Atom(s) => write!(f, "{}", s),
+            Object::Atom(s) => write!(f, "{}", escape_atom_for_display(s)),
             Object::Seq(items) if items.is_empty() => write!(f, "φ"),
             Object::Seq(items) => {
                 write!(f, "<{}>", items.iter().map(|item| item.to_string())
@@ -4592,6 +4645,83 @@ mod tests {
     fn bottom_propagates_through_sequence() {
         let seq = Object::seq(vec![Object::atom("a"), Object::Bottom, Object::atom("c")]);
         assert_eq!(seq, Object::Bottom);
+    }
+
+    /// `Object::parse(obj.to_string())` must be the identity for any
+    /// Object that came out of the parser. Values containing literal
+    /// `<` or `>` (e.g. an instance fact subject like `reachable in
+    /// < 30 s`) round-trip cleanly through the in-memory algebra
+    /// because the parser stops splitting once depth returns to 0,
+    /// and atoms are treated as opaque tokens. They DO NOT round-trip
+    /// cleanly through `db::persist_state` → `db::load_state` because
+    /// SQLite stores the cell's atom-formed `Display` output and the
+    /// load path re-runs `Object::parse` on it without the
+    /// surrounding cell-level `<...>` wrapper that defines depth 0.
+    /// The DB value `<<Task, 623>, <Task Subject, …< 30 s>>` parses
+    /// fine; the value `<Task Subject, …< 30 s>` (a single fact's
+    /// pair, stored with no outer wrapper) does too. The bug we
+    /// observe in apps/tasks (subjects ≥#623 missing from query
+    /// results) lives elsewhere — likely in how `db::persist_state`
+    /// stringifies a cell whose contents include unbalanced `<`
+    /// characters embedded inside an Atom value, or in how some
+    /// upstream serializer writes these atoms.
+    ///
+    /// This test pins the algebra-level invariant the rest of the
+    /// engine assumes. If this ever fails, every cell write/read
+    /// round-trip in the local CLI is silently corrupting data.
+    #[test]
+    fn parse_after_to_string_is_identity_for_atoms_containing_lessthan() {
+        let cases = [
+            "reachable in < 30 s",
+            "a < b > c",
+            "no brackets here",
+            "value with , comma",
+            "< leading angle",
+            "trailing angle >",
+        ];
+        for raw in cases.iter() {
+            let original = Object::atom(raw);
+            let display = original.to_string();
+            let reparsed = Object::parse(&display);
+            assert_eq!(
+                reparsed, original,
+                "Object::parse(Object::atom({:?}).to_string()) must equal the original; \
+                 to_string produced {:?}, reparse produced {:?}",
+                raw, display, reparsed,
+            );
+        }
+    }
+
+    /// Cell-level round-trip: a Seq of pairs where one pair's atom
+    /// value contains literal `<` must survive `to_string` →
+    /// `Object::parse`. This is the shape `db::persist_state` writes
+    /// for a fact-type cell containing an instance fact whose value
+    /// has an angle bracket — exactly the apps/tasks #623 case
+    /// (`HATEOAS-prereq-c: …reachable in < 30 s`).
+    #[test]
+    fn cell_round_trip_preserves_atom_values_containing_lessthan() {
+        let cell = Object::seq(vec![
+            // fact 1: (Task=623, Subject="reachable in < 30 s")
+            Object::seq(vec![
+                Object::seq(vec![Object::atom("Task"), Object::atom("623")]),
+                Object::seq(vec![Object::atom("Task Subject"),
+                    Object::atom("reachable in < 30 s")]),
+            ]),
+            // fact 2: (Task=624, Subject="simple") — must remain visible
+            Object::seq(vec![
+                Object::seq(vec![Object::atom("Task"), Object::atom("624")]),
+                Object::seq(vec![Object::atom("Task Subject"),
+                    Object::atom("simple")]),
+            ]),
+        ]);
+        let display = cell.to_string();
+        let reparsed = Object::parse(&display);
+        assert_eq!(
+            reparsed, cell,
+            "cell with fact value containing `<` must round-trip; \
+             to_string produced {:?}, reparse produced {:?}",
+            display, reparsed,
+        );
     }
 
     #[test]
