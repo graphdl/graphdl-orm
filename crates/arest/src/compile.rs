@@ -273,8 +273,19 @@ fn instances_of_noun_func(noun_name: &str) -> Func {
 /// Returns the concatenation of all facts from all matching fact types.
 /// Concat . [extract_ft1, extract_ft2, ...] : ctx -> <all facts>
 fn extract_facts_multi(ft_ids: &[String]) -> Func {
-    let extractors: Vec<Func> = ft_ids.iter().map(|id| extract_facts_func(id)).collect();
+    // Dedupe by FT id. Ring constraints carry duplicate span entries
+    // (`enrich_constraints_with_spans` always pushes span0 and span1
+    // pointing at the same FT for binary-ring constraints), and
+    // concatenating the same extractor twice doubles the population
+    // — which makes the AS / SY / AT predicates fire 2× per real
+    // edge. Distinct FT ids must still flow through Concat.
+    let mut seen: hashbrown::HashSet<&String> = hashbrown::HashSet::new();
+    let extractors: Vec<Func> = ft_ids.iter()
+        .filter(|id| seen.insert(*id))
+        .map(|id| extract_facts_func(id))
+        .collect();
     match extractors.len() {
+        0 => Func::constant(Object::phi()),
         1 => extractors.into_iter().next().unwrap(),
         _ => Func::compose(Func::Concat, Func::construction(extractors)),
     }

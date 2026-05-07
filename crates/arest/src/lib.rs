@@ -4755,6 +4755,181 @@ Order has total.
         assert!(out.contains(r#""failures":[]"#));
         release_impl(h);
     }
+
+    /// Minimal repro: compile a schema with the apps/tasks-style
+    /// asymmetry constraint plus ONE directed block edge. The
+    /// constraint must NOT fire — there's no reverse pair. apps/tasks
+    /// today fires this constraint 2× per directed edge even when no
+    /// reverse exists, rejecting the entire reading. Spec: zero
+    /// violations for a single directed (A,B) block fact.
+    #[test]
+    fn ring_asymmetric_constraint_does_not_fire_on_single_directed_edge() {
+        let src = "\
+Task(.id) is an entity type.
+Task has Task Status.
+  Each Task has exactly one Task Status.
+Task Status is a value type.
+Task blocks Task.
+No Task blocks itself.
+If Task1 blocks Task2 then Task2 does not block Task1.
+Task '1' has Task Status 'pending'.
+Task '2' has Task Status 'pending'.
+Task '1' blocks Task '2'.
+";
+        let h = create_bare_impl();
+        let r = system_impl(h, "compile", src);
+        eprintln!("[ring-debug] result-len={}, prefix={:?}",
+            r.len(), &r[..r.len().min(800)]);
+        release_impl(h);
+        assert!(!r.starts_with('⊥') && !r.contains("constraint violation"),
+            "single directed block edge must not violate the asymmetry constraint; \
+             got rejection: {}", &r[..r.len().min(2000)]);
+    }
+
+    /// Variant: schema-only (no instance facts). The asymmetry
+    /// constraint must compile cleanly and fire ZERO violations.
+    #[test]
+    fn ring_asymmetric_constraint_compiles_clean_with_no_instance_facts() {
+        let src = "\
+Task(.id) is an entity type.
+Task blocks Task.
+No Task blocks itself.
+If Task1 blocks Task2 then Task2 does not block Task1.
+";
+        let h = create_bare_impl();
+        let r = system_impl(h, "compile", src);
+        eprintln!("[ring-debug-empty] result={:?}", &r[..r.len().min(500)]);
+        release_impl(h);
+        assert!(!r.starts_with('⊥') && !r.contains("constraint violation"),
+            "schema-only compile must not raise constraint violations; got: {}",
+            &r[..r.len().min(500)]);
+    }
+
+    /// Variant: same instance fact, but no asymmetry constraint.
+    /// Confirms the violation IS specific to the asymmetry rule
+    /// (not coming from `No Task blocks itself`).
+    #[test]
+    fn ring_only_irreflexive_passes_for_directed_edge_between_distinct_tasks() {
+        let src = "\
+Task(.id) is an entity type.
+Task blocks Task.
+No Task blocks itself.
+Task '1' blocks Task '2'.
+";
+        let h = create_bare_impl();
+        let r = system_impl(h, "compile", src);
+        eprintln!("[ring-only-irreflexive] result={:?}", &r[..r.len().min(500)]);
+        release_impl(h);
+        assert!(!r.starts_with('⊥') && !r.contains("constraint violation"),
+            "irreflexive-only with distinct (1,2) edge must compile clean; got: {}",
+            &r[..r.len().min(500)]);
+    }
+
+    /// Variant: same instance fact, only the asymmetry constraint
+    /// (no irreflexive). Isolates the asymmetry firing.
+    #[test]
+    fn ring_only_asymmetric_does_not_fire_on_single_directed_edge() {
+        let src = "\
+Task(.id) is an entity type.
+Task blocks Task.
+If Task1 blocks Task2 then Task2 does not block Task1.
+Task '1' blocks Task '2'.
+";
+        let h = create_bare_impl();
+        let r = system_impl(h, "compile", src);
+        eprintln!("[ring-only-asym] result={:?}", &r[..r.len().min(500)]);
+        release_impl(h);
+        assert!(!r.starts_with('⊥') && !r.contains("constraint violation"),
+            "asymmetric-only with directed (1,2) edge must compile clean; got: {}",
+            &r[..r.len().min(500)]);
+    }
+
+    /// Replicate `compileDomainReadings(...readings)`'s per-reading
+    /// `system(h, "compile", text)` sequence on the actual apps/tasks
+    /// readings. Verifies the asymmetry-classifier fix end-to-end:
+    /// `If Task1 blocks Task2 then Task2 does not block Task1` no
+    /// longer mis-classifies as SY (require reverse) and rejects
+    /// imported.md.
+    ///
+    /// Filesystem-dependent (reads C:/Users/lippe/Repos/apps/tasks/
+    /// readings/...), so `#[ignore]`d in the default suite. Run with
+    /// `cargo test --lib wasm_compile_sequence_preserves -- --ignored`.
+    #[ignore = "filesystem-dependent integration test against apps/tasks readings"]
+    #[test]
+    fn wasm_compile_sequence_preserves_all_instance_facts_through_handle() {
+        let app_md = std::fs::read_to_string(
+            "C:/Users/lippe/Repos/apps/tasks/readings/app.md")
+            .expect("read app.md");
+        let imported_md = std::fs::read_to_string(
+            "C:/Users/lippe/Repos/apps/tasks/readings/instances/imported.md")
+            .expect("read imported.md");
+        let mcp_md = std::fs::read_to_string(
+            "C:/Users/lippe/Repos/apps/tasks/readings/instances/mcp.md")
+            .expect("read mcp.md");
+        let priority_md = std::fs::read_to_string(
+            "C:/Users/lippe/Repos/apps/tasks/readings/instances/priority.md")
+            .expect("read priority.md");
+
+        let count_subject_lines = |s: &str| {
+            s.lines()
+                .filter(|l| l.starts_with("Task '") && l.contains(" has Task Subject "))
+                .count()
+        };
+        let expected_subjects = count_subject_lines(&imported_md)
+            + count_subject_lines(&mcp_md)
+            // Same-Task-id duplicates: only one survives the UC.
+            // Compute the unique-id set for the upper bound.
+            ;
+        eprintln!("[wasm-debug] expected_subject_lines={}", expected_subjects);
+
+        let h = create_impl();
+
+        for (name, text) in [
+            ("app.md", app_md.as_str()),
+            ("imported.md", imported_md.as_str()),
+            ("mcp.md", mcp_md.as_str()),
+            ("priority.md", priority_md.as_str()),
+        ] {
+            let r = system_impl(h, "compile", text);
+            let snap = peek(h).expect("handle live");
+            let cell = ast::fetch_or_phi("Task_has_Task_Subject", &snap);
+            let count = cell.as_seq().map(|s| s.len()).unwrap_or(0);
+            eprintln!("[wasm-debug] after {}: cell={}, result-len={}",
+                name, count, r.len());
+            if r.starts_with('⊥') || r.contains("constraint violation") {
+                // Count how many distinct constraint texts appear and
+                // dump up to 4000 chars so we see the violation list.
+                let semi_count = r.matches(';').count();
+                eprintln!("[wasm-debug]   REJECTED ({} semicolons / probable violations): {}",
+                    semi_count, &r[..r.len().min(4000)]);
+            }
+        }
+
+        let final_snap = peek(h).expect("handle live");
+        let final_cell = ast::fetch_or_phi("Task_has_Task_Subject", &final_snap);
+        let final_count = final_cell.as_seq().map(|s| s.len()).unwrap_or(0);
+
+        // Highest task id present
+        let max_id: Option<u32> = final_cell.as_seq()
+            .map(|s| s.iter().filter_map(|f| {
+                f.as_seq()?.iter().find_map(|p| {
+                    let kv = p.as_seq()?;
+                    let role = kv.first()?.as_atom()?;
+                    if role == "Task" {
+                        kv.get(1)?.as_atom()?.parse::<u32>().ok()
+                    } else { None }
+                })
+            }).max())
+            .flatten();
+        eprintln!("[wasm-debug] FINAL: cell={}, max_task_id={:?}", final_count, max_id);
+
+        release_impl(h);
+
+        assert!(matches!(max_id, Some(id) if id >= 800),
+            "Task_has_Task_Subject must include Task ids ≥800 \
+             (apps/tasks has tasks up through 824); max id observed={:?} \
+             in {} entries", max_id, final_count);
+    }
 }
 
 // ── Storage-1: backend routing integration tests ─────────────────────

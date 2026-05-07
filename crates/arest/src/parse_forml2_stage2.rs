@@ -1501,8 +1501,22 @@ fn encode_conditional_ring_pattern(
     let has_and = antecedent.contains(" and ");
     let impossible = consequent.starts_with("it is impossible that ");
     let itself_in_consequent = consequent.contains(" itself");
-    let is_not_in_antecedent = antecedent.contains(" is not ");
-    let is_not_in_consequent = consequent.contains(" is not ");
+    // A negated antecedent / consequent can be spelled with `is not`,
+    // `does not`, or `do not` — semantically equivalent in FORML2 ring
+    // shapes. `If Task1 blocks Task2 then Task2 does not block Task1`
+    // is the asymmetric pattern (`isnot-conse` → AS); without
+    // recognising `does not` it mis-classifies as `plain` → SY and
+    // every directed edge fires a "missing reverse" violation.
+    let is_negated_antecedent = antecedent.contains(" is not ")
+        || antecedent.contains(" does not ")
+        || antecedent.contains(" do not ");
+    let is_negated_consequent = consequent.contains(" is not ")
+        || consequent.contains(" does not ")
+        || consequent.contains(" do not ");
+    // Keep the legacy variable names for the matcher tuple so the
+    // pattern table below stays unchanged.
+    let is_not_in_antecedent = is_negated_antecedent;
+    let is_not_in_consequent = is_negated_consequent;
 
     let name = match (has_and, impossible, itself_in_consequent,
                       is_not_in_antecedent, is_not_in_consequent) {
