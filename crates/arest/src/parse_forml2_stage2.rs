@@ -219,6 +219,58 @@ impl DeonticShapeTable {
     }
 }
 
+/// Stage-2 set constraint kind dispatch — `<classification-kind>` →
+/// ORM 2 set-constraint kind code. Mirrors `CardinalityConstraintKindTable`.
+/// Five rows in declaration order: Equality / Subset / Exclusive-Or /
+/// Or / Exclusion Constraint → `EQ` / `SS` / `XO` / `OR` / `XC`.
+/// Order matters — translate_set_constraints picks the first matching
+/// row, mirroring the legacy if-else cascade.
+#[derive(Debug, Clone)]
+pub struct SetConstraintKindTable {
+    /// Pairs of `(classification-kind, kind-code)` such as
+    /// `("Equality Constraint", "EQ")`. Order matches the readings'
+    /// parallel-enum declaration order.
+    pub rows: Vec<(String, String)>,
+}
+
+impl SetConstraintKindTable {
+    /// Boot table — must stay in sync with the parallel
+    /// `Set Constraint Kind` and `Set Constraint Kind Code`
+    /// enum-value declarations in `readings/forml2-grammar.md`.
+    pub fn boot() -> Self {
+        SetConstraintKindTable {
+            rows: alloc::vec![
+                ("Equality Constraint".to_string(),     "EQ".to_string()),
+                ("Subset Constraint".to_string(),       "SS".to_string()),
+                ("Exclusive-Or Constraint".to_string(), "XO".to_string()),
+                ("Or Constraint".to_string(),           "OR".to_string()),
+                ("Exclusion Constraint".to_string(),    "XC".to_string()),
+            ],
+        }
+    }
+
+    /// Build the table from parallel `Set Constraint Kind` /
+    /// `Set Constraint Kind Code` enum-value declarations.
+    /// Falls back to `boot()` on any mismatch.
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_parallel_enum_pair(
+            state,
+            "Set Constraint Kind",
+            "Set Constraint Kind Code",
+        );
+        match rows {
+            Some(r) => SetConstraintKindTable { rows: r },
+            None => Self::boot(),
+        }
+    }
+
+    /// Iterate `(kind, code)` pairs in declaration order so the
+    /// caller can apply per-kind arbitration in cascade order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.rows.iter().map(|(k, c)| (k.as_str(), c.as_str()))
+    }
+}
+
 /// Stage-2 cardinality constraint kind dispatch — `<classification-kind>`
 /// → ORM 2 cardinality kind code. Mirrors `RingKindTable` (#713) but
 /// keyed on the Statement Classification name rather than a trailing
@@ -2041,46 +2093,39 @@ pub fn translate_enum_values(classified_state: &Object, idx: &StmtIndex) -> Vec<
 /// two families on different tokens (Quantifier vs Constraint
 /// Keyword vs Trailing Marker).
 pub fn translate_set_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+    let kind_table = SetConstraintKindTable::boot();
     let statement_ids = collect_statement_ids(idx);
     let declared_nouns = declared_noun_names(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
         let text = statement_text(idx,stmt_id).unwrap_or_default();
-        let is_dr = classifications_contains(idx,stmt_id, "Derivation Rule");
-        let kind = if classifications_contains(idx,stmt_id, "Equality Constraint") {
-            // `iff` keyword also classifies as Derivation Rule; prefer
-            // DR when no `if and only if` multi-clause keyword fires
-            // (that's the grammar's EQ signal, not mere `iff`).
-            if is_dr { continue; }
-            "EQ"
-        } else if classifications_contains(idx,stmt_id, "Subset Constraint") {
-            // SS classification fires on the synthetic `if some then
-            // that` constraint keyword. Legacy's `try_subset` also
-            // requires the antecedent to contain 2+ DISTINCT declared
-            // noun types; below that threshold, `try_derivation`
-            // wins. Mirror that arbitration here — when the
-            // antecedent doesn't have enough declared-noun diversity,
-            // defer to the Derivation Rule translator.
-            if antecedent_distinct_nouns(&text, &declared_nouns) < 2 {
-                continue;
-            }
-            "SS"
-        } else if classifications_contains(idx,stmt_id, "Exclusive-Or Constraint") {
-            if is_dr { continue; }
-            "XO"
-        } else if classifications_contains(idx,stmt_id, "Or Constraint") {
-            if is_dr { continue; }
-            "OR"
-        } else if classifications_contains(idx,stmt_id, "Exclusion Constraint") {
-            if is_dr { continue; }
-            "XC"
-        } else {
-            continue;
-        };
+        let is_dr = classifications_contains(idx, stmt_id, "Derivation Rule");
+        // Cascade through the registered set-constraint kinds in
+        // declaration order. Per-kind arbitration:
+        //   - SS (Subset Constraint): fires on `if some then that`,
+        //     which also matches Derivation Rule. Legacy's try_subset
+        //     requires 2+ DISTINCT declared nouns in the antecedent;
+        //     below that threshold, defer to translate_derivation_rules.
+        //   - All other kinds: a Statement also classified as
+        //     Derivation Rule (`iff` / `if`) is owned by the DR
+        //     translator; skip emission here.
+        let mut emit: Option<&str> = None;
+        for (kind, code) in kind_table.iter() {
+            if !classifications_contains(idx, stmt_id, kind) { continue; }
+            let skip = if code == "SS" {
+                antecedent_distinct_nouns(&text, &declared_nouns) < 2
+            } else {
+                is_dr
+            };
+            if skip { continue; }
+            emit = Some(code);
+            break;
+        }
+        let Some(kind_code) = emit else { continue };
         let entity = head_noun_for(idx,stmt_id).unwrap_or_default();
         out.push(fact_from_pairs(&[
             ("id",       text.as_str()),
-            ("kind",     kind),
+            ("kind",     kind_code),
             ("modality", "alethic"),
             ("text",     text.as_str()),
             ("entity",   entity.as_str()),
@@ -3843,7 +3888,9 @@ mod tests {
     /// #833 layer 4 added the parallel-enum
     /// `Cardinality Constraint Kind` ↔ `Cardinality Constraint Kind
     /// Code` so translate_cardinality_constraints reads its kind
-    /// codes from a registry — bumping noun=26, enum=15.
+    /// codes from a registry — bumping noun=26, enum=15. Layer 5
+    /// did the same for set constraints (`Set Constraint Kind` ↔
+    /// `Set Constraint Kind Code`) — bumping noun=28, enum=17.
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
@@ -3851,7 +3898,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 26, "noun count");
+        assert_eq!(noun_count, 28, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -3863,7 +3910,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 15, "enum-valued noun count");
+        assert_eq!(enum_count, 17, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -5437,6 +5484,54 @@ mod tests {
         assert_eq!(table.shape_for("obligatory"), Some(("UC", "deontic")));
         assert_eq!(table.shape_for("forbidden"),  Some(("UC", "deontic")));
         assert_eq!(table.shape_for("permitted"),  Some(("UC", "deontic")));
+    }
+
+    // ─── #833 layer 5: set constraint kind table ──────────────────────
+
+    #[test]
+    fn set_constraint_kind_table_boot_has_five_kinds_in_cascade_order() {
+        let table = super::SetConstraintKindTable::boot();
+        assert_eq!(table.rows.len(), 5);
+        let pairs: Vec<(&str, &str)> = table.iter().collect();
+        assert_eq!(pairs, vec![
+            ("Equality Constraint", "EQ"),
+            ("Subset Constraint", "SS"),
+            ("Exclusive-Or Constraint", "XO"),
+            ("Or Constraint", "OR"),
+            ("Exclusion Constraint", "XC"),
+        ]);
+    }
+
+    #[test]
+    fn set_constraint_kind_table_from_grammar_state_reads_parallel_enums() {
+        let state = synthetic_enum_state(&[
+            ("Set Constraint Kind", &[
+                "Equality Constraint", "Subset Constraint",
+                "Exclusive-Or Constraint", "Or Constraint",
+                "Exclusion Constraint"]),
+            ("Set Constraint Kind Code", &["EQ", "SS", "XO", "OR", "XC"]),
+        ]);
+        let table = super::SetConstraintKindTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 5);
+    }
+
+    #[test]
+    fn set_constraint_kind_table_falls_back_to_boot_on_length_mismatch() {
+        let state = synthetic_enum_state(&[
+            ("Set Constraint Kind", &["Equality Constraint"]),
+            ("Set Constraint Kind Code", &["EQ", "SS"]),
+        ]);
+        let table = super::SetConstraintKindTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 5);
+    }
+
+    #[test]
+    fn set_constraint_kind_table_from_real_grammar_loads_five_rows() {
+        let state = grammar_state();
+        let table = super::SetConstraintKindTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 5,
+            "expected 5 set-constraint kind rows from real grammar; got {:?}",
+            table.rows);
     }
 
     // ─── #833 layer 4: cardinality constraint kind table ──────────────

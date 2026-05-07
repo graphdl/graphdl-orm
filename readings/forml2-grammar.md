@@ -60,6 +60,10 @@ Cardinality Constraint Kind is a value type.
   The possible values of Cardinality Constraint Kind are 'Frequency Constraint', 'Uniqueness Constraint', 'Mandatory Role Constraint'.
 Cardinality Constraint Kind Code is a value type.
   The possible values of Cardinality Constraint Kind Code are 'FC', 'UC', 'MC'.
+Set Constraint Kind is a value type.
+  The possible values of Set Constraint Kind are 'Equality Constraint', 'Subset Constraint', 'Exclusive-Or Constraint', 'Or Constraint', 'Exclusion Constraint'.
+Set Constraint Kind Code is a value type.
+  The possible values of Set Constraint Kind Code are 'EQ', 'SS', 'XO', 'OR', 'XC'.
 
 ## Fact Types
 
