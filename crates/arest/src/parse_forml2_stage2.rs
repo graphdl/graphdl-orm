@@ -4701,16 +4701,28 @@ mod tests {
     /// like `<` in `< 30 s` must round-trip cleanly.
     #[test]
     fn instance_fact_value_containing_lessthan_does_not_truncate_subsequent_facts() {
-        let src = "\
-            Task(.id) is an entity type.\n\
-            Task Subject is a value type.\n\
-            Task has Task Subject.\n\
-            Task '622' has Task Subject 'HATEOAS-prereq-b: Apply chosen network fix (poll-from-wakeup or static IP)'.\n\
-            Task '623' has Task Subject 'HATEOAS-prereq-c: Verify host curl localhost:8080 reachable in < 30 s'.\n\
-            Task '624' has Task Subject 'HATEOAS-verify: Run apis e2e against kernel (BASE=localhost:8080)'.\n\
-            Task '625' has Task Subject 'Profile-1: Hierarchical Cargo features (server / mini / full + leaf flags)'.\n\
-        ";
-        let state = super::parse_to_state_via_stage12(src)
+        // Stage-2 itself preserves all facts even at file scale (540
+        // facts × one with `<` in its value: all land). The empirical
+        // apps/tasks symptom — boundary at Task 622 in the WASM-side
+        // cell — must therefore live downstream of Stage-2 (validate,
+        // merge_states, or handle-cache invalidation in
+        // src/mcp/server.ts). This test pins the parser-side
+        // robustness; the downstream investigation is tracked
+        // separately.
+        let mut src = String::new();
+        src.push_str("Task(.id) is an entity type.\n");
+        src.push_str("Task Subject is a value type.\n");
+        src.push_str("Task has Task Subject.\n");
+        for n in 100..640 {
+            if n == 510 {
+                src.push_str(&alloc::format!(
+                    "Task '{}' has Task Subject 'reachable in < 30 s'.\n", n));
+            } else {
+                src.push_str(&alloc::format!(
+                    "Task '{}' has Task Subject 'subject {}'.\n", n, n));
+            }
+        }
+        let state = super::parse_to_state_via_stage12(&src)
             .expect("parse_to_state_via_stage12");
         let cell = fetch_or_phi("Task_has_Task_Subject", &state);
         let entries: Vec<&Object> = cell.as_seq()
@@ -4724,13 +4736,14 @@ mod tests {
                 if role == "Task" { kv.get(1)?.as_atom() } else { None }
             }))
             .collect();
-        assert!(task_ids.contains(&"622"), "Task 622 (pre-<) must parse; got {:?}", task_ids);
-        assert!(task_ids.contains(&"623"), "Task 623 (with <) must parse; got {:?}", task_ids);
-        assert!(task_ids.contains(&"624"), "Task 624 (after <) must parse; got {:?}", task_ids);
-        assert!(task_ids.contains(&"625"), "Task 625 (further on) must parse; got {:?}", task_ids);
-        assert_eq!(entries.len(), 4,
-            "all four instance facts must land in the cell; got {} entries with task_ids {:?}",
-            entries.len(), task_ids);
+        let expected = 540;  // 100..640 inclusive of start, exclusive of end
+        assert!(task_ids.contains(&"509"), "Task 509 (pre-<) must parse; got {} entries", task_ids.len());
+        assert!(task_ids.contains(&"510"), "Task 510 (with <) must parse; got {} entries", task_ids.len());
+        assert!(task_ids.contains(&"511"), "Task 511 (after <) must parse; got {} entries", task_ids.len());
+        assert!(task_ids.contains(&"639"), "Task 639 (last) must parse; got {} entries", task_ids.len());
+        assert_eq!(entries.len(), expected,
+            "all {} instance facts must land in the cell; got {} entries — likely truncated past the `<`",
+            expected, entries.len());
     }
 
     /// Stage-2 must populate `consequentFactTypeId` on emitted
