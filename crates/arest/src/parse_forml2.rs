@@ -1550,7 +1550,7 @@ impl SchemaCatalog {
 
 /// Parse a role token into (base_noun_name, full_token_with_subscript).
 /// "Person1" -> ("Person", "Person1"). "User" -> ("User", "User").
-fn parse_role_token(token: &str) -> (&str, &str) {
+pub(crate) fn parse_role_token(token: &str) -> (&str, &str) {
     let boundary = token
         .char_indices()
         .rev()

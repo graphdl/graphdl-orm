@@ -2773,6 +2773,89 @@ fn build_antecedent_filter_pred(af: &crate::types::AntecedentFilter, ft: &crate:
 ///     Constant(phi)
 ///   )
 /// Blocked on: no Filter/Find primitive to locate a fact type by ID in the
+/// Build a per-rule "subscript -> (antecedent_index, role_index)" map
+/// by re-parsing the rule's text against the declared FactType
+/// readings. Used by ring-FT derivations where two roles share a noun
+/// name (`Task blocks Task`) — the subscripted token (`Task1`) in the
+/// rule text disambiguates which role position the rule references,
+/// but `role_value_by_name` projects by binding key and always picks
+/// the first matching role. The map lets compile-time projection
+/// fall back to `role_value(position)` when a subscript appears.
+///
+/// Returns a vector with the same arity as `rule.antecedent_sources`,
+/// where `out[i]` is a `Vec<(role_index, subscript_token)>` pairing
+/// each role position in antecedent `i` with its subscripted token
+/// from the rule text. Roles that have no subscript get an empty
+/// string.
+///
+/// Threads through the existing `parse_forml2::find_nouns` /
+/// `parse_role_token` helpers — the same logic the resolver uses
+/// for noun matching, just kept long enough to expose subscripts.
+fn antecedent_role_subscripts(
+    rule: &DerivationRuleDef,
+    data: &CellIndex,
+) -> Vec<Vec<(usize, String)>> {
+    use crate::parse_forml2::{find_nouns, parse_role_token};
+    let noun_names: Vec<String> = data.nouns.keys().cloned().collect();
+    let antecedent_text = rule.text.find(" iff ").map(|i| &rule.text[i + 5..])
+        .or_else(|| rule.text.find(" if ").map(|i| &rule.text[i + 4..]))
+        .unwrap_or("");
+    let antecedent_clauses: Vec<&str> = antecedent_text
+        .split(" and ")
+        .map(|s| s.trim().trim_end_matches('.').trim())
+        .collect();
+    rule.antecedent_sources.iter().enumerate().map(|(i, src)| {
+        let ft_id = src.fact_type_id();
+        let ft = match data.fact_types.get(ft_id) {
+            Some(ft) => ft, None => return Vec::new(),
+        };
+        let clause = match antecedent_clauses.get(i) { Some(c) => *c, None => return Vec::new() };
+        let nouns = find_nouns(clause, &noun_names);
+        let mut out: Vec<(usize, String)> = Vec::new();
+        let mut role_cursor = 0;
+        for (_, _, token) in nouns {
+            let (base, full) = parse_role_token(&token);
+            if role_cursor < ft.roles.len() && ft.roles[role_cursor].noun_name == base {
+                let subscript = if full == base { String::new() } else { full.to_string() };
+                out.push((role_cursor, subscript));
+                role_cursor += 1;
+            }
+        }
+        out
+    }).collect()
+}
+
+/// Parallel map for the consequent. Returns `Vec<(role_index,
+/// subscript)>` for the consequent FT's roles. Empty for non-Literal
+/// consequents (no subscript projection makes sense there).
+fn consequent_role_subscripts(
+    rule: &DerivationRuleDef,
+    consequent_id: &str,
+    data: &CellIndex,
+) -> Vec<(usize, String)> {
+    use crate::parse_forml2::{find_nouns, parse_role_token};
+    let noun_names: Vec<String> = data.nouns.keys().cloned().collect();
+    let consequent_text = rule.text.find(" iff ").map(|i| &rule.text[..i])
+        .or_else(|| rule.text.find(" if ").map(|i| &rule.text[..i]))
+        .unwrap_or(rule.text.as_str())
+        .trim();
+    let ft = match data.fact_types.get(consequent_id) {
+        Some(ft) => ft, None => return Vec::new(),
+    };
+    let nouns = find_nouns(consequent_text, &noun_names);
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut role_cursor = 0;
+    for (_, _, token) in nouns {
+        let (base, full) = parse_role_token(&token);
+        if role_cursor < ft.roles.len() && ft.roles[role_cursor].noun_name == base {
+            let subscript = if full == base { String::new() } else { full.to_string() };
+            out.push((role_cursor, subscript));
+            role_cursor += 1;
+        }
+    }
+    out
+}
+
 /// population Seq. Requires a fold-based search (Insert + Condition) that
 /// would be more complex than the direct Object traversal below.
 fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> CompiledDerivation {
@@ -3068,19 +3151,55 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 let cons_roles = data.fact_types.get(&consequent_id)
                     .map(|ft| ft.roles.clone())
                     .unwrap_or_default();
+                // Subscript map (#826): when the antecedent is a ring
+                // FT (two roles same noun) and the rule disambiguates
+                // via subscripts (`Task1`/`Task2`), the consequent's
+                // role subscript pins which antecedent role position
+                // its value comes from. Without this, the
+                // `role_value_by_name` fallback projects by binding
+                // key and always picks role-0 of the ring.
+                let ant_subs = antecedent_role_subscripts(rule, data);
+                let cons_subs = consequent_role_subscripts(rule, &consequent_id, data);
                 // Binding pair keys preserve noun-name spaces to match
                 // the parser convention — see role_value_by_name. The
                 // cell name uses FT-id underscores; the inner role
                 // names track the noun's natural form.
-                let pairs: Vec<Func> = cons_roles.iter().map(|r| {
+                let pairs: Vec<Func> = cons_roles.iter().enumerate().map(|(cons_role_idx, r)| {
                     let key = r.noun_name.clone();
-                    let value_func = rule.consequent_role_literals.iter()
+                    // 1. Literal pin wins.
+                    if let Some(crl) = rule.consequent_role_literals.iter()
                         .find(|crl| crl.role == r.noun_name)
-                        .map(|crl| Func::constant(Object::atom(&crl.value)))
-                        .unwrap_or_else(|| role_value_by_name(&r.noun_name));
+                    {
+                        return Func::construction(vec![
+                            Func::constant(Object::atom(&key)),
+                            Func::constant(Object::atom(&crl.value)),
+                        ]);
+                    }
+                    // 2. Subscript-positional projection: this
+                    //    consequent role has a subscript that matches
+                    //    a subscript on antecedent[0]'s role at some
+                    //    position → project that position positionally.
+                    let cons_sub = cons_subs.iter()
+                        .find(|(idx, _)| *idx == cons_role_idx)
+                        .map(|(_, s)| s.as_str())
+                        .filter(|s| !s.is_empty());
+                    if let Some(sub) = cons_sub {
+                        if let Some(ant0_subs) = ant_subs.first() {
+                            if let Some((ant_role_idx, _)) = ant0_subs.iter()
+                                .find(|(_, s)| s == sub)
+                            {
+                                return Func::construction(vec![
+                                    Func::constant(Object::atom(&key)),
+                                    role_value(*ant_role_idx),
+                                ]);
+                            }
+                        }
+                    }
+                    // 3. Fallback: name-based binding lookup (the
+                    //    pre-#826 behaviour for non-ring FTs).
                     Func::construction(vec![
                         Func::constant(Object::atom(&key)),
-                        value_func,
+                        role_value_by_name(&r.noun_name),
                     ])
                 }).collect();
                 Func::construction(pairs)
@@ -6295,25 +6414,72 @@ mod schema_tests {
                 .collect::<Vec<_>>());
     }
 
-    /// Ring (self-referential) FT join: a derivation that joins on a FT
-    /// where both roles share the same noun must bind subscript variables
-    /// to the right positional roles. apps/tasks #821-blocked symptom:
-    /// `Task2 has Task Readiness 'blocked' iff Task1 blocks Task2 and
-    /// Task1 has Task Status 'pending'.` over `Task '1' blocks Task '2'`
-    /// must emit the consequent on Task 2 (the blocked one), NOT Task 1
-    /// (the blocker). Empirically the engine fires the consequent on
-    /// Task 1 today — the role binding is inverted.
+    /// Single-antecedent ring FT consequent binding: when an
+    /// antecedent FT has two roles that share a noun (`Task blocks
+    /// Task`), the rule's role subscript (`Task2` vs `Task1`) must
+    /// disambiguate which role's value flows to the consequent.
     ///
-    /// Engine gap: `resolve_derivation_rule` discards subscripts (Task1,
-    /// Task2) via `parse_role_token`, leaving the consequent binding
-    /// keyed only on the noun name "Task". `compile_join_derivation`'s
-    /// `find_role(ft, "Task")` then returns the first matching role
-    /// (position 0, the blocker), so the consequent always emits on the
-    /// wrong side of the ring. Fix needs subscript-aware role lookup
-    /// across the resolver and join compiler — multi-day refactor.
-    /// Tracked as a known limitation; this test pins the desired
-    /// behaviour for when the engine catches up.
-    #[ignore = "engine gap: ring-FT subscript binding not yet supported (see apps/tasks #826)"]
+    /// Spec: with `Task '1' blocks Task '2'.` and rule
+    /// `Task2 has Task Readiness 'blocked' iff Task1 blocks Task2.`,
+    /// the derived fact must be `Task=2 has Readiness=blocked` (Task 2
+    /// is the blocked one, role-1 of the ring). Today AREST emits
+    /// `Task=1` because `role_value_by_name("Task")` returns the
+    /// first binding, ignoring the subscript.
+    #[test]
+    fn ring_ft_one_antecedent_subscript_picks_correct_role_for_consequent() {
+        let src = "\
+            Task(.id) is an entity type.\n\
+            Task Readiness is a value type.\n\
+            Task has Task Readiness.\n\
+            Task blocks Task.\n\
+            Task '1' blocks Task '2'.\n\
+            Task2 has Task Readiness 'blocked' iff Task1 blocks Task2.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        let derivation_refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d)
+            .into_iter()
+            .filter(|(n, _)| n.starts_with("derivation:rule_"))
+            .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &d)))
+            .collect();
+        let derivation_refs: Vec<(&str, &ast::Func)> = derivation_refs_owned.iter()
+            .map(|(n, f)| (n.as_str(), f)).collect();
+        let (new_d, _) = crate::evaluate::forward_chain_defs_state(&derivation_refs, &d);
+
+        let cell = ast::fetch_or_phi("Task_has_Task_Readiness", &new_d);
+        let entries: Vec<&ast::Object> = cell.as_seq()
+            .map(|s| s.iter().collect()).unwrap_or_default();
+        let blocked: Vec<String> = entries.iter()
+            .filter(|f| f.as_seq().map(|pairs| pairs.iter().any(|p| {
+                let kv = match p.as_seq() { Some(kv) => kv, None => return false };
+                kv.first().and_then(|k| k.as_atom()) == Some("Task Readiness")
+                    && kv.get(1).and_then(|v| v.as_atom()) == Some("blocked")
+            })).unwrap_or(false))
+            .filter_map(|f| f.as_seq().and_then(|pairs| pairs.iter().find_map(|p| {
+                let kv = p.as_seq()?;
+                let role = kv.first()?.as_atom()?;
+                if role == "Task" { kv.get(1)?.as_atom().map(String::from) } else { None }
+            })))
+            .collect();
+        assert!(blocked.contains(&"2".to_string()),
+            "Task 2 (blocked, role-1 of ring) must be tagged 'blocked'; \
+             got blocked={:?}", blocked);
+        assert!(!blocked.contains(&"1".to_string()),
+            "Task 1 (blocker, role-0) must NOT be tagged 'blocked'; \
+             got blocked={:?}", blocked);
+    }
+
+    /// Two-antecedent ring FT join with subscripts: a derivation that
+    /// joins on a FT where both roles share the same noun must bind
+    /// subscript variables to the right positional roles. apps/tasks
+    /// #826 symptom: `Task2 has Task Readiness 'blocked' iff Task1
+    /// blocks Task2 and Task1 has Task Status 'pending'.` over
+    /// `Task '1' blocks Task '2'` must emit the consequent on Task 2
+    /// (the blocked one), NOT Task 1 (the blocker).
+    #[ignore = "engine gap: 2-antecedent ring-FT subscript join not yet supported"]
     #[test]
     fn ring_ft_join_derivation_binds_subscript_variables_by_role_position() {
         let src = "\
