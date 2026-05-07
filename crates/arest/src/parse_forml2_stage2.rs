@@ -910,23 +910,19 @@ pub fn translate_subtypes(classified_state: &Object, idx: &StmtIndex) -> Vec<Obj
 /// `*` prefix is a readability marker, not a mode signal on a Fact
 /// Type) doesn't spawn spurious InstanceFacts.
 pub fn translate_derivation_mode_facts(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+    let _ = classified_state;
     let statement_ids = collect_statement_ids(idx);
     let mut out: Vec<Object> = Vec::new();
     // Same exclude list as translate_fact_types — don't emit on
-    // noun declarations or instance facts that incidentally
-    // carry role references.
-    const EXCLUDE: &[&str] = &[
-        "Entity Type Declaration", "Value Type Declaration",
-        "Subtype Declaration", "Abstract Declaration",
-        "Enum Values Declaration", "Instance Fact",
-        "Partition Declaration", "Derivation Rule",
-        "Uniqueness Constraint", "Mandatory Role Constraint",
-        "Frequency Constraint", "Ring Constraint",
-        "Value Constraint", "Equality Constraint",
-        "Subset Constraint", "Exclusion Constraint",
-        "Exclusive-Or Constraint", "Or Constraint",
-        "Deontic Constraint",
-    ];
+    // noun declarations or instance facts that incidentally carry
+    // role references. Derived from StatementTranslatorTable as
+    // "every registered classification kind except Fact Type
+    // Reading", so adding a new kind to the grammar automatically
+    // extends the exclusion (without re-touching this list).
+    let table = StatementTranslatorTable::boot();
+    let exclude: Vec<&str> = table.kinds().into_iter()
+        .filter(|k| *k != "Fact Type Reading")
+        .collect();
     for stmt_id in statement_ids.iter() {
         // Fact Type Reading classification is the anchor — an `iff`
         // derivation rule also has a marker but lands as Derivation
@@ -935,7 +931,7 @@ pub fn translate_derivation_mode_facts(classified_state: &Object, idx: &StmtInde
         if !classifications_contains(idx,stmt_id, "Fact Type Reading") {
             continue;
         }
-        if classifications_contains_any(idx,stmt_id, EXCLUDE) {
+        if classifications_contains_any(idx, stmt_id, &exclude) {
             continue;
         }
         let Some(mode) = derivation_marker_for(idx,stmt_id) else { continue };
@@ -1012,33 +1008,18 @@ pub fn translate_fact_types(classified_state: &Object, idx: &StmtIndex) -> (Vec<
     // fires whenever a Role Reference is present, which is true of
     // declarations, instance facts, and constraint statements alike.
     // The translator only emits when Fact Type Reading is the ONLY
-    // structural classification.
-    const EXCLUDE: &[&str] = &[
-        "Entity Type Declaration",
-        "Value Type Declaration",
-        "Subtype Declaration",
-        "Abstract Declaration",
-        "Enum Values Declaration",
-        "Instance Fact",
-        "Partition Declaration",
-        "Derivation Rule",
-        "Uniqueness Constraint",
-        "Mandatory Role Constraint",
-        "Frequency Constraint",
-        "Ring Constraint",
-        "Value Constraint",
-        "Equality Constraint",
-        "Subset Constraint",
-        "Exclusion Constraint",
-        "Exclusive-Or Constraint",
-        "Or Constraint",
-        "Deontic Constraint",
-    ];
+    // structural classification. Derived from StatementTranslatorTable
+    // as "every registered kind except Fact Type Reading" — adding a
+    // new kind to the grammar automatically extends the exclusion.
+    let table = StatementTranslatorTable::boot();
+    let exclude: Vec<&str> = table.kinds().into_iter()
+        .filter(|k| *k != "Fact Type Reading")
+        .collect();
     for stmt_id in statement_ids.iter() {
         if !classifications_contains(idx,stmt_id, "Fact Type Reading") {
             continue;
         }
-        if classifications_contains_any(idx,stmt_id, EXCLUDE) {
+        if classifications_contains_any(idx, stmt_id, &exclude) {
             continue;
         }
         let roles = role_refs_for(idx,stmt_id);
