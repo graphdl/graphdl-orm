@@ -562,6 +562,39 @@ pub fn main_entry() {
                 let d = ast::defs_to_state(&defs, &state);
                 let compiled = readings.len();
 
+                // Materialize compile defs (schemas, derivations,
+                // sql:sqlite:* DDL, sql:trigger:* triggers, …) into the
+                // state cells so apply_ddl + persist_state see them and
+                // so user `derivation:rule_*` defs can be forward-chained
+                // over the population. Without this step the compile
+                // emits cells for instance facts but never fires literal-
+                // iff rules, leaving consequent FT cells empty (#822 in
+                // apps/tasks).
+                let compile_defs = crate::compile::compile_to_defs_state(&state);
+                let d = ast::defs_to_state(&compile_defs, &d);
+
+                // Forward-chain over user `derivation:rule_*` defs to
+                // materialize derived FT cells (e.g.
+                // `Task has Task Readiness 'ready' iff Task has Task
+                // Status 'pending'.` populates Task_has_Task_Readiness
+                // alongside the parsed Task_has_Task_Status cell).
+                let derivation_refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d)
+                    .into_iter()
+                    .filter(|(n, _)| n.starts_with("derivation:rule_"))
+                    .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &d)))
+                    .collect();
+                let d = if derivation_refs_owned.is_empty() {
+                    d
+                } else {
+                    let derivation_refs: Vec<(&str, &ast::Func)> = derivation_refs_owned.iter()
+                        .map(|(n, f)| (n.as_str(), f)).collect();
+                    let (new_d, derived) = crate::evaluate::forward_chain_defs_state(
+                        &derivation_refs, &d);
+                    eprintln!("[load] {} user derivation rules fired, {} facts derived",
+                        derivation_refs_owned.len(), derived.len());
+                    new_d
+                };
+
                 // Persist state to SQLite (tables + triggers).
                 db::apply_ddl(&conn, &d);
                 db::persist_state(&conn, &d);

@@ -6230,6 +6230,59 @@ mod schema_tests {
             user_def_name
         );
     }
+
+    /// End-to-end: a user-authored literal-iff derivation rule fires at
+    /// compile time over the readings-loaded population, materialising
+    /// the consequent FT cell with derived facts. This is the second
+    /// layer of the apps/tasks engine gap (#822 in apps/tasks): even
+    /// after Stage-2 populates `consequentFactTypeId`, the CLI compile
+    /// path persists the parsed state without running forward-chain
+    /// over user `derivation:*` defs, so the consequent cell stays
+    /// empty.
+    #[test]
+    fn user_literal_iff_rule_fires_forward_chain_over_population_at_compile_time() {
+        let src = "\
+            Order is an entity type.\n\
+            Order Status is a value type.\n\
+            Order Readiness is a value type.\n\
+            Order has Order Status.\n\
+            Order has Order Readiness.\n\
+            Order 'o1' has Order Status 'pending'.\n\
+            Order has Order Readiness 'ready' iff Order has Order Status 'pending'.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        let derivation_refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d)
+            .into_iter()
+            .filter(|(n, _)| n.starts_with("derivation:rule_"))
+            .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &d)))
+            .collect();
+        assert!(!derivation_refs_owned.is_empty(),
+            "compile must emit derivation:rule_<hash> for user rule; got def names: {:?}",
+            ast::cells_iter(&d).into_iter()
+                .map(|(n, _)| n.to_string())
+                .filter(|n| n.starts_with("derivation:"))
+                .collect::<Vec<_>>());
+        let derivation_refs: Vec<(&str, &ast::Func)> = derivation_refs_owned.iter()
+            .map(|(n, f)| (n.as_str(), f)).collect();
+        let (new_d, _derived) = crate::evaluate::forward_chain_defs_state(&derivation_refs, &d);
+
+        let readiness_cell = ast::fetch_or_phi("Order_has_Order_Readiness", &new_d);
+        let readiness_facts = readiness_cell.as_seq()
+            .map(|s| s.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert!(!readiness_facts.is_empty(),
+            "Order_has_Order_Readiness cell must be populated by forward-chain firing of \
+             the literal-iff rule over the 'pending' Order Status fact; cell was empty. \
+             defs containing 'derivation:': {:?}",
+            ast::cells_iter(&d).into_iter()
+                .map(|(n, _)| n.to_string())
+                .filter(|n| n.starts_with("derivation:"))
+                .collect::<Vec<_>>());
+    }
 }
 
 // ── Federation: populate:{verb} from "Verb is exported from JS Package" ──
