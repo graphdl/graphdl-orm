@@ -4756,79 +4756,96 @@ Order has total.
         release_impl(h);
     }
 
-    /// Minimal repro: compile a schema with the apps/tasks-style
-    /// asymmetry constraint plus ONE directed block edge. The
-    /// constraint must NOT fire — there's no reverse pair. apps/tasks
-    /// today fires this constraint 2× per directed edge even when no
-    /// reverse exists, rejecting the entire reading. Spec: zero
-    /// violations for a single directed (A,B) block fact.
+    /// Spec — canonical FORML2 trailing-marker form for asymmetry:
+    /// `<FT> is asymmetric.` per `forml2-grammar.md` Ring Constraint
+    /// Trailing Marker (mirrors NORMA's
+    /// `RingConstraintType.Asymmetric`). A single directed (1,2) edge
+    /// must compile clean — no reverse pair, no violation.
     #[test]
-    fn ring_asymmetric_constraint_does_not_fire_on_single_directed_edge() {
+    fn ring_AS_trailing_marker_compiles_clean_for_directed_edge() {
         let src = "\
 Task(.id) is an entity type.
-Task has Task Status.
-  Each Task has exactly one Task Status.
-Task Status is a value type.
 Task blocks Task.
-No Task blocks itself.
-If Task1 blocks Task2 then Task2 does not block Task1.
-Task '1' has Task Status 'pending'.
-Task '2' has Task Status 'pending'.
+  Task blocks Task is asymmetric.
 Task '1' blocks Task '2'.
 ";
         let h = create_bare_impl();
         let r = system_impl(h, "compile", src);
-        eprintln!("[ring-debug] result-len={}, prefix={:?}",
-            r.len(), &r[..r.len().min(800)]);
         release_impl(h);
         assert!(!r.starts_with('⊥') && !r.contains("constraint violation"),
-            "single directed block edge must not violate the asymmetry constraint; \
-             got rejection: {}", &r[..r.len().min(2000)]);
+            "trailing-marker `Task blocks Task is asymmetric.` with a directed \
+             (1,2) edge must compile clean; got: {}", &r[..r.len().min(500)]);
     }
 
-    /// Variant: schema-only (no instance facts). The asymmetry
-    /// constraint must compile cleanly and fire ZERO violations.
+    /// Spec — canonical NORMA conditional verbalization for asymmetry:
+    /// `If <ant> then it is impossible that <reverse>.` per
+    /// `VerbalizationCoreSnippets.xml` line 91/97
+    /// (`ModalPossibilityOperator alethic sign=negative`).
     #[test]
-    fn ring_asymmetric_constraint_compiles_clean_with_no_instance_facts() {
+    fn ring_AS_modal_impossible_compiles_clean_for_directed_edge() {
         let src = "\
 Task(.id) is an entity type.
 Task blocks Task.
-No Task blocks itself.
-If Task1 blocks Task2 then Task2 does not block Task1.
-";
-        let h = create_bare_impl();
-        let r = system_impl(h, "compile", src);
-        eprintln!("[ring-debug-empty] result={:?}", &r[..r.len().min(500)]);
-        release_impl(h);
-        assert!(!r.starts_with('⊥') && !r.contains("constraint violation"),
-            "schema-only compile must not raise constraint violations; got: {}",
-            &r[..r.len().min(500)]);
-    }
-
-    /// Variant: same instance fact, but no asymmetry constraint.
-    /// Confirms the violation IS specific to the asymmetry rule
-    /// (not coming from `No Task blocks itself`).
-    #[test]
-    fn ring_only_irreflexive_passes_for_directed_edge_between_distinct_tasks() {
-        let src = "\
-Task(.id) is an entity type.
-Task blocks Task.
-No Task blocks itself.
+If Task1 blocks Task2 then it is impossible that Task2 blocks Task1.
 Task '1' blocks Task '2'.
 ";
         let h = create_bare_impl();
         let r = system_impl(h, "compile", src);
-        eprintln!("[ring-only-irreflexive] result={:?}", &r[..r.len().min(500)]);
+        release_impl(h);
+        assert!(!r.starts_with('⊥') && !r.contains("constraint violation"),
+            "NORMA conditional `it is impossible that` form must compile clean for \
+             a directed (1,2) edge; got: {}", &r[..r.len().min(500)]);
+    }
+
+    /// Spec — Halpin prose form for asymmetry per
+    /// `Information Modeling and Relational Databases` §6.3:
+    /// `If <ant> then <reversed-ant> is not.` Mirrors AREST's
+    /// pre-existing `isnot-conse` matcher path.
+    #[test]
+    fn ring_AS_isnot_consequent_compiles_clean_for_directed_edge() {
+        let src = "\
+Task(.id) is an entity type.
+Task blocks Task.
+If Task1 blocks Task2 then Task2 is not blocks Task1.
+Task '1' blocks Task '2'.
+";
+        let h = create_bare_impl();
+        let r = system_impl(h, "compile", src);
+        release_impl(h);
+        assert!(!r.starts_with('⊥') && !r.contains("constraint violation"),
+            "Halpin `is not` prose form must compile clean for a directed (1,2) \
+             edge; got: {}", &r[..r.len().min(500)]);
+    }
+
+    /// Spec — control: irreflexive-only constraint with a directed
+    /// (1,2) edge between distinct tasks must compile clean.
+    #[test]
+    fn ring_irreflexive_passes_for_directed_edge_between_distinct_tasks() {
+        let src = "\
+Task(.id) is an entity type.
+Task blocks Task.
+  Task blocks Task is irreflexive.
+Task '1' blocks Task '2'.
+";
+        let h = create_bare_impl();
+        let r = system_impl(h, "compile", src);
         release_impl(h);
         assert!(!r.starts_with('⊥') && !r.contains("constraint violation"),
             "irreflexive-only with distinct (1,2) edge must compile clean; got: {}",
             &r[..r.len().min(500)]);
     }
 
-    /// Variant: same instance fact, only the asymmetry constraint
-    /// (no irreflexive). Isolates the asymmetry firing.
+    /// Spec — fail-closed: a non-canonical conditional phrasing
+    /// (`does not`, `cannot`, `never`, …) is NOT a recognised ring
+    /// shape per FORML2 / NORMA / Halpin references. The matcher
+    /// must NOT silently classify it as SY (which would then fire a
+    /// "missing reverse" violation against every directed edge).
+    /// Today the parser returns it as an unclassified statement —
+    /// the compile succeeds because no ring constraint emerges from
+    /// the prose. Authors should use the canonical trailing-marker
+    /// or `it is impossible that` form.
     #[test]
-    fn ring_only_asymmetric_does_not_fire_on_single_directed_edge() {
+    fn ring_AS_unrecognised_prose_does_not_silently_misclassify_as_symmetric() {
         let src = "\
 Task(.id) is an entity type.
 Task blocks Task.
@@ -4837,10 +4854,10 @@ Task '1' blocks Task '2'.
 ";
         let h = create_bare_impl();
         let r = system_impl(h, "compile", src);
-        eprintln!("[ring-only-asym] result={:?}", &r[..r.len().min(500)]);
         release_impl(h);
-        assert!(!r.starts_with('⊥') && !r.contains("constraint violation"),
-            "asymmetric-only with directed (1,2) edge must compile clean; got: {}",
+        assert!(!r.contains("constraint violation"),
+            "unrecognised prose form must not be silently classified as a \
+             symmetric (require-reverse) ring constraint; got: {}",
             &r[..r.len().min(500)]);
     }
 

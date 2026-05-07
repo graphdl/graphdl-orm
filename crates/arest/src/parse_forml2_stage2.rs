@@ -1489,6 +1489,31 @@ fn conditional_ring_kind(
     matrix.kind_for(&pattern).map(String::from)
 }
 
+/// FORML2 / NORMA canonical negation marker for the conditional
+/// ring shape. NORMA's `VerbalizationCoreSnippets.xml` defines a
+/// single alethic-negative `ModalPossibilityOperator` —
+/// `it is impossible that` (line 91 / 97). That pattern is matched
+/// elsewhere in this file via `consequent.starts_with("it is
+/// impossible that ")` → `impossible` marker.
+///
+/// The `is not` substring is a Halpin-textbook prose form (cf.
+/// `Information Modeling and Relational Databases`, Halpin & Morgan
+/// §6.3) used in informal conditional renderings of asymmetry: `If
+/// A1 R A2 then A2 is not R A1.` The matcher recognises it as the
+/// `isnot-conse` / `isnot-ante` pattern when no other canonical
+/// marker fires.
+///
+/// Anything else (`does not`, `cannot`, `never`, …) is NOT in the
+/// FORML2 / NORMA / Halpin reference set. The matcher will fail to
+/// classify those clauses, and the statement falls through as
+/// unrecognised — preferable to silent mis-classification. Authors
+/// should use the canonical trailing-marker form
+/// (`A R A is asymmetric.`) or NORMA's `it is impossible that`
+/// conditional form.
+fn clause_is_negated(text: &str) -> bool {
+    text.contains(" is not ")
+}
+
 /// Encode the (has_and, impossible, itself_in_consequent,
 /// is_not_in_antecedent, is_not_in_consequent) boolean tuple into the
 /// pattern name used to key into `ConditionalRingMatrix`. Returns
@@ -1501,22 +1526,30 @@ fn encode_conditional_ring_pattern(
     let has_and = antecedent.contains(" and ");
     let impossible = consequent.starts_with("it is impossible that ");
     let itself_in_consequent = consequent.contains(" itself");
-    // A negated antecedent / consequent can be spelled with `is not`,
-    // `does not`, or `do not` — semantically equivalent in FORML2 ring
-    // shapes. `If Task1 blocks Task2 then Task2 does not block Task1`
-    // is the asymmetric pattern (`isnot-conse` → AS); without
-    // recognising `does not` it mis-classifies as `plain` → SY and
-    // every directed edge fires a "missing reverse" violation.
-    let is_negated_antecedent = antecedent.contains(" is not ")
-        || antecedent.contains(" does not ")
-        || antecedent.contains(" do not ");
-    let is_negated_consequent = consequent.contains(" is not ")
-        || consequent.contains(" does not ")
-        || consequent.contains(" do not ");
-    // Keep the legacy variable names for the matcher tuple so the
-    // pattern table below stays unchanged.
-    let is_not_in_antecedent = is_negated_antecedent;
-    let is_not_in_consequent = is_negated_consequent;
+    let is_not_in_antecedent = clause_is_negated(antecedent);
+    let is_not_in_consequent = clause_is_negated(consequent);
+
+    // Fail closed on non-canonical English negation. If the consequent
+    // contains any common negation word that is NOT one of the
+    // canonical FORML2 / NORMA / Halpin markers (`it is impossible
+    // that`, ` is not `, ` itself`), the matcher must NOT fall
+    // through to the positive `plain` shape — that would silently
+    // classify a denial as a symmetric (require-reverse) constraint
+    // and reject every directed edge as a "missing reverse"
+    // violation. Authors using prose like `does not block` or `cannot
+    // block` should switch to the canonical trailing-marker form
+    // (`<FT> is asymmetric.`) or NORMA's `it is impossible that`.
+    const NON_CANONICAL_NEGATION_HINTS: &[&str] = &[
+        " does not ", " do not ", " did not ",
+        " cannot ", " can not ", " must not ", " will not ", " would not ",
+        " never ", " no longer ",
+    ];
+    let consequent_has_non_canonical_negation = NON_CANONICAL_NEGATION_HINTS
+        .iter().any(|n| consequent.contains(n));
+    if consequent_has_non_canonical_negation
+        && !impossible && !is_not_in_consequent {
+        return None;
+    }
 
     let name = match (has_and, impossible, itself_in_consequent,
                       is_not_in_antecedent, is_not_in_consequent) {
