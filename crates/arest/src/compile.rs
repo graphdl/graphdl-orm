@@ -338,10 +338,17 @@ fn role_value(role_index: usize) -> Func {
 /// ("Trailing_Marker"); normalising at lookup time lets the filter
 /// predicate stay spelled in the grammar's noun name.
 fn role_value_by_name(name: &str) -> Func {
-    let key = name.replace(' ', "_");
+    // Match the binding key exactly as the parser stores it: noun names
+    // with spaces preserved. The parser's instance-fact emitter produces
+    // `Seq([Atom("Implementation Mode"), Atom(...)])` for a multi-word
+    // value type. Dropping the space → underscore translation here lets
+    // the Func find the binding when the rule's antecedent literal filter
+    // runs over a parser-populated cell. (Cell names — the outer Cells
+    // ρ keys — are still FT-ids with underscores; only the inner role
+    // names track the noun's natural-language form.)
     let match_key = Func::compose(Func::Eq, Func::construction(vec![
         Func::Selector(1),
-        Func::constant(Object::atom(&key)),
+        Func::constant(Object::atom(name)),
     ]));
     Func::compose(
         Func::compose(Func::Selector(2), Func::Selector(1)),
@@ -2893,10 +2900,13 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
     if let Some(crate::types::AntecedentSource::InstancesOfNoun(noun)) =
         rule.antecedent_sources.first()
     {
-        let role_key = rule.consequent_instance_role.replace(' ', "_");
+        // Binding-pair keys preserve noun-name spaces to match the
+        // parser convention — see role_value_by_name. The cell name
+        // (the outer Cells ρ key) is FT-id-style with underscores; the
+        // inner role names are noun-name-style with spaces.
         let bindings = Func::construction(vec![
             Func::construction(vec![
-                Func::constant(Object::atom(&role_key)),
+                Func::constant(Object::atom(&rule.consequent_instance_role)),
                 Func::Id,
             ]),
         ]);
@@ -3047,10 +3057,12 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 let cons_roles = data.fact_types.get(&consequent_id)
                     .map(|ft| ft.roles.clone())
                     .unwrap_or_default();
-                // Binding pair keys use underscore-normalised role
-                // names to match Stage-1 / cell-push conventions.
+                // Binding pair keys preserve noun-name spaces to match
+                // the parser convention — see role_value_by_name. The
+                // cell name uses FT-id underscores; the inner role
+                // names track the noun's natural form.
                 let pairs: Vec<Func> = cons_roles.iter().map(|r| {
-                    let key = r.noun_name.replace(' ', "_");
+                    let key = r.noun_name.clone();
                     let value_func = rule.consequent_role_literals.iter()
                         .find(|crl| crl.role == r.noun_name)
                         .map(|crl| Func::constant(Object::atom(&crl.value)))
@@ -3106,11 +3118,12 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 first_fact
             } else {
                 // M1c (#731): same pattern as M1b — direct iter-find.
+                // Binding keys preserve noun-name spaces (parser convention).
                 let cons_roles = data.fact_types.get(&consequent_id)
                     .map(|ft| ft.roles.clone())
                     .unwrap_or_default();
                 let pairs: Vec<Func> = cons_roles.iter().map(|r| {
-                    let key = r.noun_name.replace(' ', "_");
+                    let key = r.noun_name.clone();
                     let value_func = rule.consequent_role_literals.iter()
                         .find(|crl| crl.role == r.noun_name)
                         .map(|crl| Func::constant(Object::atom(&crl.value)))

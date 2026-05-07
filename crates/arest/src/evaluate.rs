@@ -3453,10 +3453,11 @@ mod tests {
     fn literal_in_consequent_fires_when_antecedent_literal_matches() {
         // Stage-2 must see the derived classification fact when a
         // Statement carries the exact trailing-marker literal the
-        // grammar rule names. Binding keys use underscore-normalised
-        // noun names (Stage-1 convention: `Trailing_Marker`), matched
-        // against the FT role noun_name `Trailing Marker` by
-        // compile::role_value_by_name.
+        // grammar rule names. Binding keys preserve noun-name spaces
+        // to match the parser convention (`Trailing Marker`), looked
+        // up by compile::role_value_by_name verbatim — see the sibling
+        // suppressed_when_mismatches test which already used the
+        // space-keyed form.
         let cells = stmt_classification_cells(
             "is an entity type", "Entity Type Declaration");
         let (_meta, defs, _def_map) = compile_cells(cells);
@@ -3465,7 +3466,7 @@ mod tests {
         pop = ast::cell_push("stmt_has_trailing_marker",
             ast::fact_from_pairs(&[
                 ("Statement", "s1"),
-                ("Trailing_Marker", "is an entity type"),
+                ("Trailing Marker", "is an entity type"),
             ]), &pop);
 
         let dd = derivation_defs_from(&defs);

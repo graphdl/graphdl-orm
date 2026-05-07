@@ -190,11 +190,13 @@ Vehicle has Transit Category.
 
     // Antecedent predicate must filter on the role literal: two facts
     // with different Weight Class values, only the matching one derives.
-    // Binding keys are underscore-normalised to match role_value_by_name's
-    // lookup key (compile.rs::role_value_by_name replaces ' ' with '_').
+    // Binding keys preserve noun spaces, matching the parser convention
+    // (compile.rs::role_value_by_name looks up by the noun name verbatim
+    // — cell names are FT-id-style with underscores, but inner bindings
+    // are noun-name-style with spaces).
     let out = apply_to_facts(&func, &[
-        ("Vehicle_has_Weight_Class", &[("Vehicle", "v-heavy"), ("Weight_Class", "extra heavy")]),
-        ("Vehicle_has_Weight_Class", &[("Vehicle", "v-light"), ("Weight_Class", "light")]),
+        ("Vehicle_has_Weight_Class", &[("Vehicle", "v-heavy"), ("Weight Class", "extra heavy")]),
+        ("Vehicle_has_Weight_Class", &[("Vehicle", "v-light"), ("Weight Class", "light")]),
     ]);
     let derived = decode_derived(&out);
     assert_eq!(derived.len(), 1, "only the matching Vehicle should derive, got {:#?}", derived);
@@ -204,8 +206,8 @@ Vehicle has Transit Category.
         "expected Vehicle='v-heavy', got {:#?}", bindings,
     );
     assert!(
-        bindings.iter().any(|(k, v)| k == "Transit_Category" && v == "heavy"),
-        "expected Transit_Category='heavy', got {:#?}", bindings,
+        bindings.iter().any(|(k, v)| k == "Transit Category" && v == "heavy"),
+        "expected Transit Category='heavy', got {:#?}", bindings,
     );
 }
 
@@ -741,17 +743,17 @@ Paper Element has Lift Priority.
     //   pe-3: Mode='Aspirational'    → no derive (literal mismatch)
     let out = apply_to_facts(&func, &[
         ("Paper_Element_has_Implementation_Mode",
-            &[("Paper_Element", "pe-1"), ("Implementation_Mode", "In Code Only")]),
+            &[("Paper Element", "pe-1"), ("Implementation Mode", "In Code Only")]),
         ("Paper_Element_has_Implementation_Mode",
-            &[("Paper_Element", "pe-2"), ("Implementation_Mode", "In Readings")]),
+            &[("Paper Element", "pe-2"), ("Implementation Mode", "In Readings")]),
         ("Paper_Element_has_Implementation_Mode",
-            &[("Paper_Element", "pe-3"), ("Implementation_Mode", "Aspirational")]),
+            &[("Paper Element", "pe-3"), ("Implementation Mode", "Aspirational")]),
     ]);
     let derived = decode_derived(&out);
 
     let liftable_pes: Vec<String> = derived.iter()
         .flat_map(|(_, _, b)| b.iter())
-        .filter(|(k, _)| k == "Paper_Element")
+        .filter(|(k, _)| k == "Paper Element")
         .map(|(_, v)| v.clone())
         .collect();
 
@@ -764,6 +766,106 @@ Paper Element has Lift Priority.
     assert!(!liftable_pes.iter().any(|p| p == "pe-3"),
         "pe-3 (Mode=Aspirational) must NOT derive Liftable; got {:?}\nfull derived: {:#?}",
         liftable_pes, derived);
+}
+
+// ─── Category 13: Forward-chain over populated state (#817 MCP path) ─
+//
+// The earlier #817 test at `shape_some_quantifier_with_multi_word_literal_filters_antecedent`
+// exercises the compiled Func directly via apply_to_facts — that proves
+// the parser+compile pipeline emits a correct Func. But the MCP/worker
+// path doesn't apply the Func directly; it routes through
+// `forward_chain_defs_state` over a state populated with instance
+// facts. If forward_chain has a bug — wrong cell name resolution,
+// fact normalization mismatch, derivation persistence skipped — the
+// previous test wouldn't catch it.
+//
+// This test pre-populates Paper Element instance facts inside the
+// reading itself (the same way apps/paper's instance file does), runs
+// the engine compile + forward_chain pipeline, and asserts the
+// derived Lift Priority cell contains Liftable for the In-Code-Only
+// elements. If this fails, the gap is in forward_chain (engine), not
+// in the compiled Func itself.
+
+#[test]
+fn paper_lift_priority_derivation_fires_through_forward_chain() {
+    use crate::ast::{cells_iter, fetch_or_phi};
+
+    let src = r#"# Paper Forward-Chain Test
+Paper Element(.ID) is an entity type.
+ID is a value type.
+Implementation Mode is a value type.
+Lift Priority is a value type.
+
+## Fact Types
+Paper Element has ID.
+Paper Element has Implementation Mode.
+Paper Element has Lift Priority.
+
+## Derivation Rules
+* Paper Element has Lift Priority 'Liftable' iff some Paper Element has Implementation Mode 'In Code Only'.
+
+## Instance Facts
+Paper Element 'pe-code' has Implementation Mode 'In Code Only'.
+Paper Element 'pe-readings' has Implementation Mode 'In Readings'.
+Paper Element 'pe-aspirational' has Implementation Mode 'Aspirational'.
+"#;
+
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    let model = crate::compile::compile(&state);
+
+    // Sanity: the rule is in the compiled derivation set.
+    let lift_rule = model.derivations.iter()
+        .find(|d| d.text.contains("Lift Priority") && d.text.contains("Liftable"));
+    assert!(
+        lift_rule.is_some(),
+        "Lift Priority derivation must be in compiled model.derivations.\n\
+         Got {} derivations: {:#?}",
+        model.derivations.len(),
+        model.derivations.iter().map(|d| d.text.as_str()).collect::<Vec<_>>(),
+    );
+
+    // Run forward_chain_defs_state over the populated state — this is
+    // the path the MCP/worker takes during apply.
+    let derivation_refs: Vec<(&str, &crate::ast::Func)> =
+        model.derivations.iter().map(|d| (d.id.as_str(), &d.func)).collect();
+    let (final_state, _derived) =
+        crate::evaluate::forward_chain_defs_state(&derivation_refs, &state);
+
+    // Read the derived cell.
+    let lift_cell = fetch_or_phi("Paper_Element_has_Lift_Priority", &final_state);
+    let lift_pairs: Vec<(String, String)> = lift_cell.as_seq().map(|facts| {
+        facts.iter().filter_map(|f| {
+            let pairs = f.as_seq()?;
+            let mut pe: Option<String> = None;
+            let mut lp: Option<String> = None;
+            for p in pairs.iter() {
+                let kv = p.as_seq()?;
+                if kv.len() != 2 { continue; }
+                let k = kv[0].as_atom()?;
+                let v = kv[1].as_atom()?;
+                if k == "Paper Element" || k == "Paper_Element" { pe = Some(v.to_string()); }
+                if k == "Lift Priority" || k == "Lift_Priority" { lp = Some(v.to_string()); }
+            }
+            Some((pe?, lp?))
+        }).collect()
+    }).unwrap_or_default();
+
+    // The In-Code-Only Paper Element must have Liftable in its Lift Priority cell.
+    assert!(
+        lift_pairs.iter().any(|(pe, lp)| pe == "pe-code" && lp == "Liftable"),
+        "expected (pe-code, Liftable) in Paper_Element_has_Lift_Priority after forward-chain.\n\
+         Got: {:?}\n\
+         All cells: {:?}",
+        lift_pairs,
+        cells_iter(&final_state).iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+    );
+    // Negative cases: pe-readings and pe-aspirational must NOT derive Liftable.
+    assert!(
+        !lift_pairs.iter().any(|(pe, _)| pe == "pe-readings"),
+        "pe-readings (Mode=In Readings) must NOT derive Liftable, got {:?}", lift_pairs);
+    assert!(
+        !lift_pairs.iter().any(|(pe, _)| pe == "pe-aspirational"),
+        "pe-aspirational (Mode=Aspirational) must NOT derive Liftable, got {:?}", lift_pairs);
 }
 
 // ─── Category 6: Aggregate ─────────────────────────────────────────
