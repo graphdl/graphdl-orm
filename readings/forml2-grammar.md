@@ -56,6 +56,10 @@ Deontic Constraint Kind Code is a value type.
   The possible values of Deontic Constraint Kind Code are 'UC', 'UC', 'UC'.
 Deontic Constraint Modality is a value type.
   The possible values of Deontic Constraint Modality are 'deontic', 'deontic', 'deontic'.
+Cardinality Constraint Kind is a value type.
+  The possible values of Cardinality Constraint Kind are 'Frequency Constraint', 'Uniqueness Constraint', 'Mandatory Role Constraint'.
+Cardinality Constraint Kind Code is a value type.
+  The possible values of Cardinality Constraint Kind Code are 'FC', 'UC', 'MC'.
 
 ## Fact Types
 

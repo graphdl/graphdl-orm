@@ -219,6 +219,57 @@ impl DeonticShapeTable {
     }
 }
 
+/// Stage-2 cardinality constraint kind dispatch — `<classification-kind>`
+/// → ORM 2 cardinality kind code. Mirrors `RingKindTable` (#713) but
+/// keyed on the Statement Classification name rather than a trailing
+/// marker. Three rows: Frequency / Uniqueness / Mandatory Role
+/// Constraint → `FC` / `UC` / `MC`.
+#[derive(Debug, Clone)]
+pub struct CardinalityConstraintKindTable {
+    /// Pairs of `(classification-kind, kind-code)` such as
+    /// `("Frequency Constraint", "FC")`. Order matches the readings'
+    /// parallel-enum declaration order.
+    pub rows: Vec<(String, String)>,
+}
+
+impl CardinalityConstraintKindTable {
+    /// Boot table — must stay in sync with the parallel
+    /// `Cardinality Constraint Kind` and `Cardinality Constraint Kind
+    /// Code` enum-value declarations in `readings/forml2-grammar.md`.
+    pub fn boot() -> Self {
+        CardinalityConstraintKindTable {
+            rows: alloc::vec![
+                ("Frequency Constraint".to_string(),      "FC".to_string()),
+                ("Uniqueness Constraint".to_string(),     "UC".to_string()),
+                ("Mandatory Role Constraint".to_string(), "MC".to_string()),
+            ],
+        }
+    }
+
+    /// Build the table from parallel `Cardinality Constraint Kind` /
+    /// `Cardinality Constraint Kind Code` enum-value declarations.
+    /// Falls back to `boot()` on any mismatch.
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_parallel_enum_pair(
+            state,
+            "Cardinality Constraint Kind",
+            "Cardinality Constraint Kind Code",
+        );
+        match rows {
+            Some(r) => CardinalityConstraintKindTable { rows: r },
+            None => Self::boot(),
+        }
+    }
+
+    /// Return the kind code for the first registered classification
+    /// the statement is classified as, or `None` if none match.
+    pub fn code_for_statement(&self, idx: &StmtIndex, stmt_id: &str) -> Option<&str> {
+        self.rows.iter()
+            .find(|(kind, _)| classifications_contains(idx, stmt_id, kind))
+            .map(|(_, code)| code.as_str())
+    }
+}
+
 /// Stage-2 translator dispatch — `<classification-kind>` → translator
 /// name(s). Mirrors `RingKindTable` / `ConditionalRingMatrix` /
 /// `DeonticShapeTable` (#713) but the relation is many-to-many: e.g.,
@@ -2100,6 +2151,7 @@ fn antecedent_distinct_nouns(text: &str, declared: &[String]) -> usize {
 /// reads both cells. This matches the deferred-span shape used by
 /// `translate_ring_constraints`.
 pub fn translate_cardinality_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+    let kind_table = CardinalityConstraintKindTable::boot();
     let statement_ids = collect_statement_ids(idx);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
@@ -2118,12 +2170,13 @@ pub fn translate_cardinality_constraints(classified_state: &Object, idx: &StmtIn
         // reading the Constraint cell would treat the alethic MC as
         // an obligation, the opposite of the author's intent.
         if deontic_operator_for(classified_state, stmt_id).is_some() { continue; }
+        // Resolve the kind code from the registry. Order in
+        // CardinalityConstraintKindTable::boot() puts FC before UC
+        // before MC so FC precedence is preserved when a Statement
+        // happens to carry multiple cardinality classifications.
+        let Some(kind) = kind_table.code_for_statement(idx, stmt_id) else { continue };
         let text = statement_text(idx,stmt_id).unwrap_or_default();
         let entity = head_noun_for(idx,stmt_id).unwrap_or_default();
-        let is_fc = classifications_contains(idx,stmt_id, "Frequency Constraint");
-        let is_uc = classifications_contains(idx,stmt_id, "Uniqueness Constraint");
-        let is_mc = classifications_contains(idx,stmt_id, "Mandatory Role Constraint");
-        if !(is_fc || is_uc || is_mc) { continue; }
 
         // `exactly one` splits into UC + MC per legacy behavior
         // (ORM 2: cardinality of 1 is the conjunction of "at most
@@ -2133,7 +2186,7 @@ pub fn translate_cardinality_constraints(classified_state: &Object, idx: &StmtIn
         // Restricted to `Each X ... exactly one Y` — the "For each
         // X, exactly one Y has that X" external-UC form is preserved
         // as a single UC per legacy behavior.
-        if is_uc && text.contains("exactly one") && text.starts_with("Each ") {
+        if kind == "UC" && text.contains("exactly one") && text.starts_with("Each ") {
             let uc_text = text.replace("exactly one", "at most one");
             let mc_text = text.replace("exactly one", "some");
             out.push(fact_from_pairs(&[
@@ -2149,8 +2202,6 @@ pub fn translate_cardinality_constraints(classified_state: &Object, idx: &StmtIn
             continue;
         }
 
-        // FC takes precedence over UC/MC on the same Statement.
-        let kind = if is_fc { "FC" } else if is_uc { "UC" } else { "MC" };
         out.push(fact_from_pairs(&[
             ("id",       text.as_str()),
             ("kind",     kind),
@@ -3789,6 +3840,10 @@ mod tests {
     /// `Classification is translated by Translator` binary fact type
     /// so the per-classification translator dispatch is fact-based
     /// (per AREST.tex §3 eq:sys) — bumping noun=24, FT=17, role=34.
+    /// #833 layer 4 added the parallel-enum
+    /// `Cardinality Constraint Kind` ↔ `Cardinality Constraint Kind
+    /// Code` so translate_cardinality_constraints reads its kind
+    /// codes from a registry — bumping noun=26, enum=15.
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
@@ -3796,7 +3851,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 24, "noun count");
+        assert_eq!(noun_count, 26, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -3808,7 +3863,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 13, "enum-valued noun count");
+        assert_eq!(enum_count, 15, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -5382,6 +5437,51 @@ mod tests {
         assert_eq!(table.shape_for("obligatory"), Some(("UC", "deontic")));
         assert_eq!(table.shape_for("forbidden"),  Some(("UC", "deontic")));
         assert_eq!(table.shape_for("permitted"),  Some(("UC", "deontic")));
+    }
+
+    // ─── #833 layer 4: cardinality constraint kind table ──────────────
+
+    #[test]
+    fn cardinality_kind_table_boot_has_three_kinds_in_fc_uc_mc_order() {
+        let table = super::CardinalityConstraintKindTable::boot();
+        assert_eq!(table.rows.len(), 3);
+        assert_eq!(table.rows[0].0, "Frequency Constraint");
+        assert_eq!(table.rows[0].1, "FC");
+        assert_eq!(table.rows[1].0, "Uniqueness Constraint");
+        assert_eq!(table.rows[1].1, "UC");
+        assert_eq!(table.rows[2].0, "Mandatory Role Constraint");
+        assert_eq!(table.rows[2].1, "MC");
+    }
+
+    #[test]
+    fn cardinality_kind_table_from_grammar_state_reads_parallel_enums() {
+        let state = synthetic_enum_state(&[
+            ("Cardinality Constraint Kind", &[
+                "Frequency Constraint", "Uniqueness Constraint",
+                "Mandatory Role Constraint"]),
+            ("Cardinality Constraint Kind Code", &["FC", "UC", "MC"]),
+        ]);
+        let table = super::CardinalityConstraintKindTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 3);
+    }
+
+    #[test]
+    fn cardinality_kind_table_falls_back_to_boot_on_length_mismatch() {
+        let state = synthetic_enum_state(&[
+            ("Cardinality Constraint Kind", &["Frequency Constraint"]),
+            ("Cardinality Constraint Kind Code", &["FC", "UC"]),
+        ]);
+        let table = super::CardinalityConstraintKindTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 3, "boot fallback expected on mismatch");
+    }
+
+    #[test]
+    fn cardinality_kind_table_from_real_grammar_loads_three_rows() {
+        let state = grammar_state();
+        let table = super::CardinalityConstraintKindTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 3,
+            "expected 3 cardinality kind rows from real grammar; got {:?}",
+            table.rows);
     }
 
     // ─── #833: Statement translator dispatch table ────────────────────
