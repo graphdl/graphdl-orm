@@ -3214,19 +3214,52 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
             .map(|(_, ri)| *ri)
     };
 
-    // Extract facts per antecedent.
-    //
-    // #814 audit: this branch does NOT apply `rule.antecedent_role_literals`
-    // — the literal-value filters that compile_explicit_derivation
-    // wraps in Filter at line ~2841. A user-authored Join rule of the
-    // form `X has Lift Priority 'P' iff some X has Mode 'M' and that X
-    // has Kind 'K'` will see both literal filters silently dropped, and
-    // the engine joins the unfiltered Mode and Kind populations. The
-    // fix is to reuse the `extract` closure from compile_explicit_derivation
-    // (which Filter-wraps the extractor when preds_by_idx[idx] is
-    // non-empty). Tracked as #814b.
-    let fact_extractors: Vec<Func> = antecedent_ids.iter()
-        .map(|ft_id| extract_facts_from_pop(ft_id))
+    // Per-antecedent predicates — same two sources as
+    // compile_explicit_derivation (numeric `antecedent_filters` and
+    // string-literal `antecedent_role_literals`). #814b: previously this
+    // path dropped both, so a Join rule like `X has R 'r' iff some X has
+    // A 'a' and that X has B 'b'` joined the unfiltered A and B
+    // populations and emitted spurious facts. Now we mirror the
+    // explicit path's preds_by_idx + Filter-wrapped extractor.
+    let mut preds_by_idx: Vec<Vec<Func>> = vec![Vec::new(); antecedent_ids.len()];
+    for af in rule.antecedent_filters.iter() {
+        if let Some(ft_id) = antecedent_ids.get(af.antecedent_index) {
+            if let Some(ft) = data.fact_types.get(ft_id) {
+                if let Some(p) = build_antecedent_filter_pred(af, ft) {
+                    preds_by_idx[af.antecedent_index].push(p);
+                }
+            }
+        }
+    }
+    for arl in rule.antecedent_role_literals.iter() {
+        if let Some(ft_id) = antecedent_ids.get(arl.antecedent_index) {
+            if let Some(ft) = data.fact_types.get(ft_id) {
+                if ft.roles.iter().any(|r| r.noun_name == arl.role) {
+                    let pred = Func::compose(
+                        Func::Eq,
+                        Func::construction(vec![
+                            role_value_by_name(&arl.role),
+                            Func::constant(Object::atom(&arl.value)),
+                        ]),
+                    );
+                    preds_by_idx[arl.antecedent_index].push(pred);
+                }
+            }
+        }
+    }
+    let fact_extractors: Vec<Func> = antecedent_ids.iter().enumerate()
+        .map(|(idx, ft_id)| {
+            let raw = extract_facts_from_pop(ft_id);
+            match preds_by_idx.get(idx) {
+                Some(preds) if !preds.is_empty() => {
+                    let combined = preds.iter().cloned().reduce(|a, b|
+                        Func::compose(Func::And, Func::construction(vec![a, b])))
+                        .unwrap();
+                    Func::compose(Func::filter(combined), raw)
+                }
+                _ => raw,
+            }
+        })
         .collect();
 
     // Dispatch on antecedent count: 0 â†’ phi, 1 â†’ Î±(derive), â‰¥2 â†’ iterative join

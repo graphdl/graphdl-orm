@@ -23,7 +23,7 @@
 use crate::ast::{self, Func, Object};
 use crate::compile;
 use crate::parse_forml2::parse_to_state;
-use crate::types::{ConsequentCellSource, DerivationRuleDef};
+use crate::types::{ConsequentCellSource, DerivationKind, DerivationRuleDef};
 
 /// Parse a self-contained reading, return the sole derivation rule and
 /// its compiled Func. Panics with a legible message if the reading
@@ -589,6 +589,181 @@ Order has Email.
         "Order binding should be ord-1, got {:#?}", bindings);
     assert!(bindings.iter().any(|(k, v)| k == "Email" && v == "alice@example.com"),
         "Email binding should be alice@example.com, got {:#?}", bindings);
+}
+
+// ─── Category 11: Join-path with antecedent literal filters (#818) ──
+//
+// Shape: `* X has R 'r' iff some X has A 'a' and that X has B 'b'` — a
+// Join-routed rule (≥2 antecedents joined on a shared noun) where each
+// antecedent additionally pins a role to a literal value. The bug
+// `compile_join_derivation` documents at compile.rs:3219 is that the
+// Join path drops `rule.antecedent_role_literals` on the floor — the
+// literal filters that `compile_explicit_derivation` applies via
+// `Filter(p)` at compile.rs:2818-2847 are silently absent on the Join
+// branch. Result: the rule fires for every join-key match regardless
+// of the literal predicates, producing spurious derived facts.
+//
+// This test asserts (a) parse populates antecedent_role_literals on
+// both antecedents, and (b) the engine respects them — only the
+// (Doc has Priority='high', Doc has Kind='critical') tuple should
+// derive. Currently expected to fail on the eval assertions; the parse
+// shape may pass.
+
+#[test]
+fn shape_join_with_antecedent_literal_filters_applies_filters() {
+    let src = r#"# Test
+Doc(.ID) is an entity type.
+ID is a value type.
+Priority is a value type.
+Kind is a value type.
+Status is a value type.
+
+## Fact Types
+Doc has ID.
+Doc has Priority.
+Doc has Kind.
+Doc has Status.
+
+## Derivation Rules
+* Doc has Status 'urgent' iff some Doc has Priority 'high' and that Doc has Kind 'critical'.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    // Routing: 2 antecedents joined on Doc → DerivationKind::Join.
+    assert_eq!(rule.kind, DerivationKind::Join,
+        "expected Join routing, got {:?} (rule text: {})", rule.kind, rule.text);
+    assert_eq!(rule.antecedent_sources.len(), 2,
+        "two antecedents expected, got {:#?}", rule.antecedent_sources);
+
+    // Both literal filters must survive parsing.
+    assert!(
+        rule.antecedent_role_literals.iter().any(|l|
+            l.role == "Priority" && l.value == "high" && l.antecedent_index == 0),
+        "expected Priority='high' filter on antecedent 0, got {:#?}",
+        rule.antecedent_role_literals,
+    );
+    assert!(
+        rule.antecedent_role_literals.iter().any(|l|
+            l.role == "Kind" && l.value == "critical" && l.antecedent_index == 1),
+        "expected Kind='critical' filter on antecedent 1, got {:#?}",
+        rule.antecedent_role_literals,
+    );
+
+    // Population:
+    //   d-yes:    Priority='high'  Kind='critical'  → DERIVE
+    //   d-no-pri: Priority='low'   Kind='critical'  → no derive (Priority filter)
+    //   d-no-knd: Priority='high'  Kind='advisory'  → no derive (Kind filter)
+    let out = apply_to_facts(&func, &[
+        ("Doc_has_Priority", &[("Doc", "d-yes"),    ("Priority", "high")]),
+        ("Doc_has_Kind",     &[("Doc", "d-yes"),    ("Kind", "critical")]),
+        ("Doc_has_Priority", &[("Doc", "d-no-pri"), ("Priority", "low")]),
+        ("Doc_has_Kind",     &[("Doc", "d-no-pri"), ("Kind", "critical")]),
+        ("Doc_has_Priority", &[("Doc", "d-no-knd"), ("Priority", "high")]),
+        ("Doc_has_Kind",     &[("Doc", "d-no-knd"), ("Kind", "advisory")]),
+    ]);
+    let derived = decode_derived(&out);
+
+    let urgent_docs: Vec<String> = derived.iter()
+        .flat_map(|(_, _, b)| b.iter())
+        .filter(|(k, _)| k == "Doc")
+        .map(|(_, v)| v.clone())
+        .collect();
+
+    assert!(urgent_docs.iter().any(|d| d == "d-yes"),
+        "d-yes (Priority=high, Kind=critical) MUST derive; got Doc-bindings {:?}\nfull derived: {:#?}",
+        urgent_docs, derived);
+    assert!(!urgent_docs.iter().any(|d| d == "d-no-pri"),
+        "d-no-pri (Priority=low) must NOT derive — Priority literal filter ignored?\n\
+         Doc-bindings {:?}\nfull derived: {:#?}",
+        urgent_docs, derived);
+    assert!(!urgent_docs.iter().any(|d| d == "d-no-knd"),
+        "d-no-knd (Kind=advisory) must NOT derive — Kind literal filter ignored?\n\
+         Doc-bindings {:?}\nfull derived: {:#?}",
+        urgent_docs, derived);
+}
+
+// ─── Category 12: Single-antecedent + `some` + multi-word literal ───
+//
+// Shape: `* X has Y 'liftable' iff some X has Z 'in code only'` —
+// mirrors apps/paper's Lift Priority derivation. Single antecedent, so
+// it routes through `compile_explicit_derivation` (not the Join path).
+// The literal value `in code only` spans three tokens; the literal
+// quantifier word `some` precedes the antecedent. Tracked as #817 —
+// the prior session report observed the apps/paper substrate's
+// Liftable derivation never firing on `Implementation Mode 'In Code
+// Only'` populations. This test isolates whether the gap is in the
+// parser's literal capture, the explicit-derivation compile path, or
+// something else entirely (e.g. case-sensitivity on values).
+
+#[test]
+fn shape_some_quantifier_with_multi_word_literal_filters_antecedent() {
+    let src = r#"# Test
+Paper Element(.ID) is an entity type.
+ID is a value type.
+Implementation Mode is a value type.
+Lift Priority is a value type.
+
+## Fact Types
+Paper Element has ID.
+Paper Element has Implementation Mode.
+Paper Element has Lift Priority.
+
+## Derivation Rules
+* Paper Element has Lift Priority 'Liftable' iff some Paper Element has Implementation Mode 'In Code Only'.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    // Single antecedent → compile_explicit_derivation.
+    assert_eq!(rule.antecedent_sources.len(), 1,
+        "single-antecedent rule expected, got {:#?}", rule.antecedent_sources);
+    assert_ne!(rule.kind, DerivationKind::Join,
+        "single-antecedent rule must NOT route through Join path, got {:?}", rule.kind);
+
+    // Multi-word literal must survive parse intact on the antecedent.
+    assert!(
+        rule.antecedent_role_literals.iter().any(|l|
+            l.role == "Implementation Mode" && l.value == "In Code Only" && l.antecedent_index == 0),
+        "expected antecedent literal Implementation Mode='In Code Only' on idx 0, got {:#?}\n\
+         (likely failure: parser dropped the `some` quantifier or split the multi-word literal)",
+        rule.antecedent_role_literals,
+    );
+    // And the consequent literal too.
+    assert!(
+        rule.consequent_role_literals.iter().any(|l|
+            l.role == "Lift Priority" && l.value == "Liftable"),
+        "expected consequent literal Lift Priority='Liftable', got {:#?}",
+        rule.consequent_role_literals,
+    );
+
+    // Behavior:
+    //   pe-1: Mode='In Code Only'    → DERIVE Lift Priority='Liftable'
+    //   pe-2: Mode='In Readings'     → no derive (literal mismatch)
+    //   pe-3: Mode='Aspirational'    → no derive (literal mismatch)
+    let out = apply_to_facts(&func, &[
+        ("Paper_Element_has_Implementation_Mode",
+            &[("Paper_Element", "pe-1"), ("Implementation_Mode", "In Code Only")]),
+        ("Paper_Element_has_Implementation_Mode",
+            &[("Paper_Element", "pe-2"), ("Implementation_Mode", "In Readings")]),
+        ("Paper_Element_has_Implementation_Mode",
+            &[("Paper_Element", "pe-3"), ("Implementation_Mode", "Aspirational")]),
+    ]);
+    let derived = decode_derived(&out);
+
+    let liftable_pes: Vec<String> = derived.iter()
+        .flat_map(|(_, _, b)| b.iter())
+        .filter(|(k, _)| k == "Paper_Element")
+        .map(|(_, v)| v.clone())
+        .collect();
+
+    assert!(liftable_pes.iter().any(|p| p == "pe-1"),
+        "pe-1 (Mode=In Code Only) MUST derive Liftable; got {:?}\nfull derived: {:#?}",
+        liftable_pes, derived);
+    assert!(!liftable_pes.iter().any(|p| p == "pe-2"),
+        "pe-2 (Mode=In Readings) must NOT derive Liftable; got {:?}\nfull derived: {:#?}",
+        liftable_pes, derived);
+    assert!(!liftable_pes.iter().any(|p| p == "pe-3"),
+        "pe-3 (Mode=Aspirational) must NOT derive Liftable; got {:?}\nfull derived: {:#?}",
+        liftable_pes, derived);
 }
 
 // ─── Category 6: Aggregate ─────────────────────────────────────────
