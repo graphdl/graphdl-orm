@@ -6283,6 +6283,78 @@ mod schema_tests {
                 .filter(|n| n.starts_with("derivation:"))
                 .collect::<Vec<_>>());
     }
+
+    /// Ring (self-referential) FT join: a derivation that joins on a FT
+    /// where both roles share the same noun must bind subscript variables
+    /// to the right positional roles. apps/tasks #821-blocked symptom:
+    /// `Task2 has Task Readiness 'blocked' iff Task1 blocks Task2 and
+    /// Task1 has Task Status 'pending'.` over `Task '1' blocks Task '2'`
+    /// must emit the consequent on Task 2 (the blocked one), NOT Task 1
+    /// (the blocker). Empirically the engine fires the consequent on
+    /// Task 1 today — the role binding is inverted.
+    ///
+    /// Engine gap: `resolve_derivation_rule` discards subscripts (Task1,
+    /// Task2) via `parse_role_token`, leaving the consequent binding
+    /// keyed only on the noun name "Task". `compile_join_derivation`'s
+    /// `find_role(ft, "Task")` then returns the first matching role
+    /// (position 0, the blocker), so the consequent always emits on the
+    /// wrong side of the ring. Fix needs subscript-aware role lookup
+    /// across the resolver and join compiler — multi-day refactor.
+    /// Tracked as a known limitation; this test pins the desired
+    /// behaviour for when the engine catches up.
+    #[ignore = "engine gap: ring-FT subscript binding not yet supported (see apps/tasks #826)"]
+    #[test]
+    fn ring_ft_join_derivation_binds_subscript_variables_by_role_position() {
+        let src = "\
+            Task(.id) is an entity type.\n\
+            Task Status is a value type.\n\
+            Task Readiness is a value type.\n\
+            Task has Task Status.\n\
+            Task has Task Readiness.\n\
+            Task blocks Task.\n\
+            Task '1' has Task Status 'pending'.\n\
+            Task '2' has Task Status 'pending'.\n\
+            Task '1' blocks Task '2'.\n\
+            Task2 has Task Readiness 'blocked' iff Task1 blocks Task2 and Task1 has Task Status 'pending'.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        let derivation_refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d)
+            .into_iter()
+            .filter(|(n, _)| n.starts_with("derivation:rule_"))
+            .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &d)))
+            .collect();
+        let derivation_refs: Vec<(&str, &ast::Func)> = derivation_refs_owned.iter()
+            .map(|(n, f)| (n.as_str(), f)).collect();
+        let (new_d, _derived) = crate::evaluate::forward_chain_defs_state(&derivation_refs, &d);
+
+        let readiness_cell = ast::fetch_or_phi("Task_has_Task_Readiness", &new_d);
+        let entries: Vec<&ast::Object> = readiness_cell.as_seq()
+            .map(|s| s.iter().collect()).unwrap_or_default();
+        let blocked_tasks: Vec<String> = entries.iter()
+            .filter(|f| {
+                f.as_seq().map(|pairs| pairs.iter().any(|p| {
+                    let kv = match p.as_seq() { Some(kv) => kv, None => return false };
+                    kv.first().and_then(|k| k.as_atom()) == Some("Task Readiness")
+                        && kv.get(1).and_then(|v| v.as_atom()) == Some("blocked")
+                })).unwrap_or(false)
+            })
+            .filter_map(|f| f.as_seq().and_then(|pairs| pairs.iter().find_map(|p| {
+                let kv = p.as_seq()?;
+                let role = kv.first()?.as_atom()?;
+                if role == "Task" { kv.get(1)?.as_atom().map(String::from) } else { None }
+            })))
+            .collect();
+        assert!(blocked_tasks.contains(&"2".to_string()),
+            "Task 2 must be tagged 'blocked' (Task 1 blocks it and is pending); \
+             got blocked tasks {:?}", blocked_tasks);
+        assert!(!blocked_tasks.contains(&"1".to_string()),
+            "Task 1 must NOT be tagged 'blocked' (nothing blocks it); \
+             got blocked tasks {:?}", blocked_tasks);
+    }
 }
 
 // ── Federation: populate:{verb} from "Verb is exported from JS Package" ──
