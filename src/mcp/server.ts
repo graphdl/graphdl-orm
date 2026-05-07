@@ -41,9 +41,7 @@ import { resolve, dirname, join } from 'path'
 import { fileURLToPath } from 'url'
 import { spawn } from 'child_process'
 import {
-  appendManagedInstanceFacts,
   buildAppCompileArgs,
-  buildApplyInstanceFacts,
   checkArestApps,
   createArestApp,
   inferInitialAppName,
@@ -331,36 +329,21 @@ function parseJsonResult(raw: string): any {
   try { return JSON.parse(raw) } catch { return { raw } }
 }
 
-async function persistManagedApplyFacts(
-  input: {
-    operation: 'create' | 'update' | 'transition'
-    noun: string
-    id?: string
-    fields?: Record<string, string>
-  },
-  result: unknown,
-) {
-  if (!shouldUseCliDb()) return undefined
-  if (result && typeof result === 'object' && (result as { rejected?: unknown }).rejected === true) return undefined
-
-  const built = buildApplyInstanceFacts(input, result)
-  if (built.lines.length === 0 && built.warnings.length === 0) return undefined
-
-  const appended = built.lines.length > 0
-    ? appendManagedInstanceFacts(currentReadingsDir(), built.lines)
-    : undefined
-
-  return {
-    ...(appended ?? { path: undefined, appended: 0, skipped: 0, lines: [] }),
-    durable: Boolean(appended && appended.appended > 0),
-    db_updated_by_apply: true,
-    warnings: built.warnings,
-  }
-}
-
+// #831(a) — apply no longer round-trips through mcp.md. cor:closure
+// (AREST.tex Cor. 6 / commit 9630f882 in cli/entry.rs:491) makes the
+// CLI compile preserve population FT cells across recompile, so the
+// DB persists apply-written facts on its own. The previous
+// `persistManagedApplyFacts` appended every apply to
+// readings/instances/mcp.md as a durability hedge against compile
+// rebuilding from φ; that's exactly the rebuild that no longer
+// happens. The mcp.md file remains parseable as a normal reading
+// for any facts that were written there before this change, but
+// the server stops adding to it. Migration / cleanup of legacy
+// content in mcp.md is a separate concern (the readings author can
+// leave it, edit it, or delete it without the server caring).
 async function localApplyResult(
   raw: string,
-  input: {
+  _input: {
     operation: 'create' | 'update' | 'transition'
     noun: string
     id?: string
@@ -368,10 +351,6 @@ async function localApplyResult(
   },
 ) {
   const result = parseJsonResult(raw)
-  const instance_reading = await persistManagedApplyFacts(input, result)
-  if (instance_reading && result && typeof result === 'object' && !Array.isArray(result)) {
-    return textResult({ ...result, instance_reading })
-  }
   return textResult(result)
 }
 
