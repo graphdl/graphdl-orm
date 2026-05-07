@@ -843,12 +843,18 @@ fn query_via_defs(
     bindings: &hashbrown::HashMap<String, String>,
     state: &ast::Object,
 ) -> CommandResult {
-    // Look up schema role names from state metadata
+    // Look up schema role names from state metadata. The Role cell's
+    // bindings use `factType` for the FT-id key (parser convention,
+    // see parse_forml2::fact_types_from_state); `graphSchema` was the
+    // earlier name and a stray reference here meant no role ever
+    // matched, role_names came back empty, and target_role degenerated
+    // to 0 — query_via_defs silently returned empty matches against
+    // any parse-populated state. (#819)
     let role_cell = ast::fetch_or_phi("Role", state);
     let role_names: Vec<String> = role_cell.as_seq()
         .map(|roles| {
             let mut matched: Vec<(usize, String)> = roles.iter()
-                .filter(|r| ast::binding_matches(r, "graphSchema", schema_id))
+                .filter(|r| ast::binding_matches(r, "factType", schema_id))
                 .filter_map(|r| {
                     let name = ast::binding(r, "nounName")?.to_string();
                     let pos: usize = ast::binding(r, "position").and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -2505,6 +2511,70 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         let result = apply_command_defs(&def_map, &cmd, &state);
         assert!(!result.rejected);
         assert_eq!(result.entities[0].entity_type, "QueryResult");
+    }
+
+    /// #819: query_via_defs must read role-name bindings from the
+    /// Role cell using the parser's actual binding key (`factType`),
+    /// not the stale `graphSchema` key. Without this rename the Role
+    /// lookup never matches, role_names ends up empty, target_role
+    /// degenerates to 0, and the filter never narrows the matches.
+    ///
+    /// Exercises a metamodel FT — Status_is_initial_in_State_Machine_Definition —
+    /// because the parser populates the Role cell with both roles for
+    /// metamodel FTs (each entry has factType + nounName + position).
+    /// User-domain FTs declared inside a reading currently get only
+    /// their first role registered; that's a separate parser gap and
+    /// not what this test is locking in.
+    #[test]
+    fn query_via_defs_resolves_role_names_from_parser_populated_role_cell() {
+        let (def_map, base_state) = setup_order_defs();
+
+        let ft_id = "Status_is_initial_in_State_Machine_Definition";
+        let mut state = base_state;
+        state = ast::cell_push(ft_id,
+            ast::fact_from_pairs(&[
+                ("Status", "Draft"),
+                ("State Machine Definition", "OrderSM"),
+            ]), &state);
+        state = ast::cell_push(ft_id,
+            ast::fact_from_pairs(&[
+                ("Status", "Open"),
+                ("State Machine Definition", "TicketSM"),
+            ]), &state);
+        state = ast::cell_push(ft_id,
+            ast::fact_from_pairs(&[
+                ("Status", "New"),
+                ("State Machine Definition", "OrderSM"),
+            ]), &state);
+
+        let mut bindings = HashMap::new();
+        bindings.insert("State Machine Definition".to_string(), "OrderSM".to_string());
+
+        let cmd = Command::Query {
+            schema_id: ft_id.to_string(),
+            domain: "orders".to_string(),
+            target: "Status".to_string(),
+            bindings,
+            sender: None,
+            signature: None,
+        };
+
+        let result = apply_command_defs(&def_map, &cmd, &state);
+        assert!(!result.rejected, "query against populated FT must not reject");
+        assert_eq!(result.entities[0].entity_type, "QueryResult");
+        let count = &result.entities[0].data["count"];
+        // Two facts have State Machine Definition='OrderSM' (Draft,
+        // New). The filter narrows from three to two via the Role
+        // cell lookup — which only works when the binding key
+        // query_via_defs filters on (`factType`) matches what the
+        // parser writes.
+        assert_eq!(count, "2",
+            "OrderSM filter must yield exactly 2 Status matches; got count={}, matches={:?}",
+            count, result.entities[0].data.get("matches"));
+        let matches = &result.entities[0].data["matches"];
+        assert!(matches.contains("Draft"), "expected Draft in matches='{}'", matches);
+        assert!(matches.contains("New"), "expected New in matches='{}'", matches);
+        assert!(!matches.contains("Open"), "Open (TicketSM) must NOT match: '{}'", matches);
     }
 
     #[test]
