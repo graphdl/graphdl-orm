@@ -529,35 +529,60 @@ fn create_via_defs(
             .map(|s| s.split(',').map(|id| id.to_string()).collect())
             .unwrap_or_default()
     };
-    let derivation_defs_owned: Vec<(String, ast::Func)> = ast::cells_iter(d).into_iter()
-        .filter(|(n, _)| n.starts_with("derivation:"))
-        .filter(|(n, _)| {
-            let def_id = n.strip_prefix("derivation:").unwrap_or(n);
-            if has_sql_triggers {
-                // SM infrastructure derivations
-                n.contains("StateMachine") || n.contains("machine:") || n.contains("_transitive_Status")
-                    || n.contains("_transitive_Transition") || n.contains("sm_init")
-                // Derivations whose consequent is needed by the SM
-                    || sm_event_types.iter().any(|evt| n.contains(evt))
-            } else if !relevant_ids.is_empty() {
-                // Noun-gated: only run derivations relevant to the created noun
-                relevant_ids.contains(def_id)
-                    // Always include SM infrastructure
-                    || n.contains("StateMachine") || n.contains("machine:")
-                    || n.contains("sm_init")
-            } else {
-                true // no index available, run all
-            }
-        })
-        .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, d)))
-        .collect();
-    diag!("[profile] derivation gating: {}/{} rules for noun '{}'",
-        derivation_defs_owned.len(),
+    // 2-stratum forward chain (#828): stratum 1 = `derivation:rule_*`
+    // (positive rules), stratum 2 = `derivation_strat2:rule_*`
+    // (negation-guarded rules). Mirrors `cli/entry.rs::run_load`.
+    // Without this split a stratum-2 AbsenceOf guard fires in round 1
+    // before the positive rule its negative dependency reads has
+    // populated, so the consequent fires for entries that should be
+    // filtered out.
+    let collect_stratum = |prefix: &str| -> Vec<(String, ast::Func)> {
+        let cell_prefix = alloc::format!("{}:", prefix);
+        ast::cells_iter(d).into_iter()
+            .filter(|(n, _)| n.starts_with(cell_prefix.as_str()))
+            .filter(|(n, _)| {
+                let def_id = n.strip_prefix(cell_prefix.as_str()).unwrap_or(n);
+                if has_sql_triggers {
+                    // SM infrastructure derivations
+                    n.contains("StateMachine") || n.contains("machine:") || n.contains("_transitive_Status")
+                        || n.contains("_transitive_Transition") || n.contains("sm_init")
+                    // Derivations whose consequent is needed by the SM
+                        || sm_event_types.iter().any(|evt| n.contains(evt))
+                } else if !relevant_ids.is_empty() {
+                    // Noun-gated: only run derivations relevant to the created noun
+                    relevant_ids.contains(def_id)
+                        // Always include SM infrastructure
+                        || n.contains("StateMachine") || n.contains("machine:")
+                        || n.contains("sm_init")
+                } else {
+                    true // no index available, run all
+                }
+            })
+            .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, d)))
+            .collect()
+    };
+    let stratum1 = collect_stratum("derivation");
+    let stratum2 = collect_stratum("derivation_strat2");
+    diag!("[profile] derivation gating: {}/{} stratum-1, {}/{} stratum-2 rules for noun '{}'",
+        stratum1.len(),
         ast::cells_iter(d).into_iter().filter(|(n, _)| n.starts_with("derivation:")).count(),
+        stratum2.len(),
+        ast::cells_iter(d).into_iter().filter(|(n, _)| n.starts_with("derivation_strat2:")).count(),
         noun);
-    let derivation_refs: Vec<(&str, &ast::Func)> = derivation_defs_owned.iter()
-        .map(|(n, f)| (n.as_str(), f)).collect();
-    let (derived_state, derived) = crate::evaluate::forward_chain_defs_state(&derivation_refs, &resolved);
+    let (post_s1, mut derived) = if stratum1.is_empty() {
+        (resolved.clone(), Vec::new())
+    } else {
+        let refs: Vec<(&str, &ast::Func)> = stratum1.iter().map(|(n, f)| (n.as_str(), f)).collect();
+        crate::evaluate::forward_chain_defs_state(&refs, &resolved)
+    };
+    let derived_state = if stratum2.is_empty() {
+        post_s1
+    } else {
+        let refs: Vec<(&str, &ast::Func)> = stratum2.iter().map(|(n, f)| (n.as_str(), f)).collect();
+        let (post_s2, more) = crate::evaluate::forward_chain_defs_state(&refs, &post_s1);
+        derived.extend(more);
+        post_s2
+    };
 
     // Collect fact type IDs from derived facts as additional events.
     derived.iter().for_each(|d| fact_events.push(d.fact_type_id.clone()));
@@ -954,23 +979,40 @@ fn update_via_defs(
             .map(|s| s.split(',').map(|id| id.to_string()).collect())
             .unwrap_or_default()
     };
-    let derivation_defs_owned: Vec<(String, ast::Func)> = ast::cells_iter(d).into_iter()
-        .filter(|(n, _)| n.starts_with("derivation:"))
-        .filter(|(n, _)| {
-            let def_id = n.strip_prefix("derivation:").unwrap_or(n);
-            if !relevant_ids.is_empty() {
-                relevant_ids.contains(def_id)
-                    || n.contains("StateMachine") || n.contains("machine:")
-                    || n.contains("sm_init")
-            } else {
-                true
-            }
-        })
-        .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, d)))
-        .collect();
-    let derivation_defs: Vec<(&str, &ast::Func)> = derivation_defs_owned.iter()
-        .map(|(n, f)| (n.as_str(), f)).collect();
-    let (new_state, derived) = crate::evaluate::forward_chain_defs_state(&derivation_defs, &new_state);
+    // 2-stratum forward chain (#828): see create path for rationale.
+    let collect_stratum = |prefix: &str| -> Vec<(String, ast::Func)> {
+        let cell_prefix = alloc::format!("{}:", prefix);
+        ast::cells_iter(d).into_iter()
+            .filter(|(n, _)| n.starts_with(cell_prefix.as_str()))
+            .filter(|(n, _)| {
+                let def_id = n.strip_prefix(cell_prefix.as_str()).unwrap_or(n);
+                if !relevant_ids.is_empty() {
+                    relevant_ids.contains(def_id)
+                        || n.contains("StateMachine") || n.contains("machine:")
+                        || n.contains("sm_init")
+                } else {
+                    true
+                }
+            })
+            .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, d)))
+            .collect()
+    };
+    let stratum1 = collect_stratum("derivation");
+    let stratum2 = collect_stratum("derivation_strat2");
+    let (new_state, mut derived) = if stratum1.is_empty() {
+        (new_state, Vec::new())
+    } else {
+        let refs: Vec<(&str, &ast::Func)> = stratum1.iter().map(|(n, f)| (n.as_str(), f)).collect();
+        crate::evaluate::forward_chain_defs_state(&refs, &new_state)
+    };
+    let new_state = if stratum2.is_empty() {
+        new_state
+    } else {
+        let refs: Vec<(&str, &ast::Func)> = stratum2.iter().map(|(n, f)| (n.as_str(), f)).collect();
+        let (post_s2, more) = crate::evaluate::forward_chain_defs_state(&refs, &new_state);
+        derived.extend(more);
+        post_s2
+    };
 
     // Prefer per-noun validate aggregate (O(FTs-touching-noun)) over the
     // bulk validate (O(all constraints)). Falls back to bulk when the
@@ -2446,6 +2488,79 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         let sm_cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", &result.state);
         let sm_facts = sm_cell.as_seq().unwrap();
         assert!(ast::binding(&sm_facts[0], "currentlyInStatus") == Some("Draft"));
+    }
+
+    /// #828 — apply path must run the 2-stratum forward chain that
+    /// `cli/entry.rs` runs after compile. Otherwise negation rules
+    /// emitted under `derivation_strat2:rule_*` are filtered out by
+    /// the `n.starts_with("derivation:")` guard at command.rs:560 and
+    /// command.rs:973, so per-call create / update never materializes
+    /// the negation-derived facts.
+    ///
+    /// Substrate mirrors apps/tasks readiness: stratum 1 emits
+    /// `Task has Task Readiness 'blocked'` from `blocks` + `pending`,
+    /// stratum 2 emits `Task has Task Readiness 'ready'` from
+    /// `pending` + `has no Task Readiness 'blocked'`. After creating
+    /// a single pending Task with no blocker, the ready rule must
+    /// fire — proving the apply path includes both strata.
+    #[test]
+    fn apply_path_create_fires_stratum2_negation_rules_for_user_domain_readiness() {
+        let src = "\
+            Task(.id) is an entity type.\n\
+            Task Status is a value type.\n\
+            Task Readiness is a value type.\n\
+            Task has Task Status.\n\
+            Task has Task Readiness.\n\
+            Task blocks Task.\n\
+            Task1 has Task Readiness 'blocked' iff Task2 blocks Task1 and Task2 has Task Status 'pending'.\n\
+            Task has Task Readiness 'ready' iff Task has Task Status 'pending' and Task has no Task Readiness 'blocked'.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_map = ast::defs_to_state(&defs, &state);
+
+        // Use the canonical role name "Task Status" so the pushed fact's
+        // role binding matches the parser-emitted form that the
+        // stratum-1 / stratum-2 rules read (resolve_field lowercases for
+        // the resolve:{noun} lookup, but the cell_push role is verbatim).
+        let mut fields = HashMap::new();
+        fields.insert("Task Status".to_string(), "pending".to_string());
+        let cmd = Command::CreateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            id: Some("1".to_string()),
+            fields,
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &state);
+        assert!(!result.rejected,
+            "create must not be rejected; violations={:?}", result.violations);
+
+        let readiness_cell = ast::fetch_or_phi("Task_has_Task_Readiness", &result.state);
+        let entries: Vec<&ast::Object> = readiness_cell.as_seq()
+            .map(|s| s.iter().collect()).unwrap_or_default();
+        let ready_tasks: Vec<String> = entries.iter()
+            .filter(|f| f.as_seq().map(|pairs| pairs.iter().any(|p| {
+                let kv = match p.as_seq() { Some(kv) => kv, None => return false };
+                kv.first().and_then(|k| k.as_atom()) == Some("Task Readiness")
+                    && kv.get(1).and_then(|v| v.as_atom()) == Some("ready")
+            })).unwrap_or(false))
+            .filter_map(|f| f.as_seq().and_then(|pairs| pairs.iter().find_map(|p| {
+                let kv = p.as_seq()?;
+                let role = kv.first()?.as_atom()?;
+                if role == "Task" { kv.get(1)?.as_atom().map(String::from) } else { None }
+            })))
+            .collect();
+        assert!(
+            ready_tasks.contains(&"1".to_string()),
+            "Apply path must fire stratum-2 negation rules: Task '1' (pending, no blocker) \
+             must be tagged Task Readiness 'ready' after CreateEntity. \
+             Got ready tasks {:?}; readiness cell entries {}.",
+            ready_tasks,
+            entries.len(),
+        );
     }
 
     #[test]
