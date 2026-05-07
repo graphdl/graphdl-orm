@@ -219,6 +219,111 @@ impl DeonticShapeTable {
     }
 }
 
+/// Stage-2 translator dispatch — `<classification-kind>` → translator
+/// name(s). Mirrors `RingKindTable` / `ConditionalRingMatrix` /
+/// `DeonticShapeTable` (#713) but the relation is many-to-many: e.g.,
+/// Subtype Declaration is handled by both `translate_nouns` and
+/// `translate_subtypes`, and `translate_set_constraints` handles five
+/// kinds.
+///
+/// Per AREST.tex §3 (eq:sys) — "the entity handles the dispatch, not
+/// the system function. New operations are registered in DEFS without
+/// modifying any entity." Stage-2's main dispatch loop should consult
+/// this table to discover which translators apply to a given Statement
+/// Classification, rather than hardcoding 19 per-kind branches. See
+/// task #833 for context.
+#[derive(Debug, Clone)]
+pub struct StatementTranslatorTable {
+    /// `(classification-kind, translator-name)` rows in declaration
+    /// order. Multiple rows per kind are allowed (M:N relation).
+    pub rows: Vec<(String, String)>,
+}
+
+impl StatementTranslatorTable {
+    /// Boot table — must stay in sync with the
+    /// `Classification_has_Translator` cell built from
+    /// `Classification 'X' is translated by Translator 'Y'.` instance
+    /// facts in `readings/forml2-grammar.md`.
+    pub fn boot() -> Self {
+        StatementTranslatorTable {
+            rows: alloc::vec![
+                ("Entity Type Declaration".to_string(),    "translate_nouns".to_string()),
+                ("Value Type Declaration".to_string(),     "translate_nouns".to_string()),
+                ("Subtype Declaration".to_string(),        "translate_nouns".to_string()),
+                ("Subtype Declaration".to_string(),        "translate_subtypes".to_string()),
+                ("Abstract Declaration".to_string(),       "translate_nouns".to_string()),
+                ("Partition Declaration".to_string(),      "translate_nouns".to_string()),
+                ("Partition Declaration".to_string(),      "translate_partitions".to_string()),
+                ("Enum Values Declaration".to_string(),    "translate_enum_values".to_string()),
+                ("Instance Fact".to_string(),              "translate_instance_facts".to_string()),
+                ("Fact Type Reading".to_string(),          "translate_fact_types".to_string()),
+                ("Fact Type Reading".to_string(),          "translate_derivation_mode_facts".to_string()),
+                ("Derivation Rule".to_string(),            "translate_derivation_rules".to_string()),
+                ("Uniqueness Constraint".to_string(),      "translate_cardinality_constraints".to_string()),
+                ("Mandatory Role Constraint".to_string(),  "translate_cardinality_constraints".to_string()),
+                ("Frequency Constraint".to_string(),       "translate_cardinality_constraints".to_string()),
+                ("Ring Constraint".to_string(),            "translate_ring_constraints".to_string()),
+                ("Subset Constraint".to_string(),          "translate_set_constraints".to_string()),
+                ("Equality Constraint".to_string(),        "translate_set_constraints".to_string()),
+                ("Exclusion Constraint".to_string(),       "translate_set_constraints".to_string()),
+                ("Exclusive-Or Constraint".to_string(),    "translate_set_constraints".to_string()),
+                ("Or Constraint".to_string(),              "translate_set_constraints".to_string()),
+                ("Value Constraint".to_string(),           "translate_value_constraints".to_string()),
+                ("Deontic Constraint".to_string(),         "translate_deontic_constraints".to_string()),
+            ],
+        }
+    }
+
+    /// Build the table from the
+    /// `Classification_has_Translator` cell of a parsed
+    /// grammar state. Falls back to `boot()` when the cell is empty
+    /// or missing — same defensive pattern as `RingKindTable`.
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let cell = fetch_or_phi("Classification_has_Translator", state);
+        let facts = match cell.as_seq() {
+            Some(s) => s,
+            None => return Self::boot(),
+        };
+        let mut rows: Vec<(String, String)> = Vec::new();
+        for f in facts.iter() {
+            let kind = match binding(f, "Classification") {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => continue,
+            };
+            let translator = match binding(f, "Translator") {
+                Some(s) if !s.is_empty() => s.to_string(),
+                _ => continue,
+            };
+            rows.push((kind, translator));
+        }
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            StatementTranslatorTable { rows }
+        }
+    }
+
+    /// All translator names registered for `kind`, in declaration
+    /// order. Empty `Vec` if the kind has no translators registered.
+    pub fn translators_for(&self, kind: &str) -> Vec<&str> {
+        self.rows.iter()
+            .filter(|(k, _)| k == kind)
+            .map(|(_, t)| t.as_str())
+            .collect()
+    }
+
+    /// All distinct kinds in the table, in first-occurrence order.
+    pub fn kinds(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for (k, _) in &self.rows {
+            if !out.iter().any(|&x| x == k.as_str()) {
+                out.push(k.as_str());
+            }
+        }
+        out
+    }
+}
+
 /// Read a single enum-value list from the EnumValues cell of a parsed
 /// grammar state, keyed by `noun: <type_name>`. Returns an empty
 /// `Vec` if no row matches.
@@ -3667,6 +3772,10 @@ mod tests {
     /// Code`, `Deontic Constraint Kind Code` / `Deontic Constraint
     /// Modality`) so Stage-2's three dispatch matrices can be lifted
     /// from cells too — bumping noun count to 23, enum count to 13.
+    /// #833 added the `Translator` entity type and the
+    /// `Classification is translated by Translator` binary fact type
+    /// so the per-classification translator dispatch is fact-based
+    /// (per AREST.tex §3 eq:sys) — bumping noun=24, FT=17, role=34.
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
@@ -3674,15 +3783,15 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 23, "noun count");
+        assert_eq!(noun_count, 24, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(ft_count, 16, "fact type count");
+        assert_eq!(ft_count, 17, "fact type count");
 
         let role_count = fetch_or_phi("Role", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(role_count, 32, "role count (2 per FT)");
+        assert_eq!(role_count, 34, "role count (2 per FT)");
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -5260,5 +5369,142 @@ mod tests {
         assert_eq!(table.shape_for("obligatory"), Some(("UC", "deontic")));
         assert_eq!(table.shape_for("forbidden"),  Some(("UC", "deontic")));
         assert_eq!(table.shape_for("permitted"),  Some(("UC", "deontic")));
+    }
+
+    // ─── #833: Statement translator dispatch table ────────────────────
+
+    fn synthetic_translator_state(rows: &[(&str, &str)]) -> Object {
+        use alloc::sync::Arc;
+        let facts: Vec<Object> = rows.iter().map(|(kind, translator)| {
+            fact_from_pairs(&[
+                ("Classification", *kind),
+                ("Translator",     *translator),
+            ])
+        }).collect();
+        let mut map: HashMap<String, Object> = HashMap::new();
+        map.insert(
+            "Classification_has_Translator".to_string(),
+            Object::Seq(Arc::from(facts)));
+        Object::Map(map)
+    }
+
+    #[test]
+    fn statement_translator_table_boot_has_every_classification_kind() {
+        // Per AREST.tex §3: registered translators span every kind
+        // declared by the grammar's classification vocabulary. The
+        // boot table is the Rust-side fallback, so it must enumerate
+        // the same 20 classifications the grammar declares (19
+        // structural + Fact Type Reading).
+        let table = super::StatementTranslatorTable::boot();
+        let kinds = table.kinds();
+        let expected = [
+            "Entity Type Declaration", "Value Type Declaration",
+            "Subtype Declaration", "Abstract Declaration",
+            "Partition Declaration", "Enum Values Declaration",
+            "Instance Fact", "Fact Type Reading", "Derivation Rule",
+            "Uniqueness Constraint", "Mandatory Role Constraint",
+            "Frequency Constraint", "Ring Constraint", "Subset Constraint",
+            "Equality Constraint", "Exclusion Constraint",
+            "Exclusive-Or Constraint", "Or Constraint", "Value Constraint",
+            "Deontic Constraint",
+        ];
+        for k in expected.iter() {
+            assert!(kinds.iter().any(|x| x == k),
+                "boot table missing kind {:?}; have {:?}", k, kinds);
+        }
+        assert_eq!(kinds.len(), expected.len(),
+            "boot table has {} kinds, expected {}: {:?}",
+            kinds.len(), expected.len(), kinds);
+    }
+
+    #[test]
+    fn statement_translator_table_translators_for_handles_many_to_many() {
+        // Subtype Declaration is handled by both translate_nouns AND
+        // translate_subtypes (the Rust pipeline runs both for that
+        // kind). Translation order matches declaration order.
+        let table = super::StatementTranslatorTable::boot();
+        let subtype = table.translators_for("Subtype Declaration");
+        assert_eq!(subtype, vec!["translate_nouns", "translate_subtypes"],
+            "Subtype Declaration must dispatch to both nouns + subtypes");
+        // translate_set_constraints handles five kinds; query each.
+        for kind in ["Subset Constraint", "Equality Constraint",
+                     "Exclusion Constraint", "Exclusive-Or Constraint",
+                     "Or Constraint"] {
+            let t = table.translators_for(kind);
+            assert!(t.contains(&"translate_set_constraints"),
+                "{kind} should be handled by translate_set_constraints; got {t:?}");
+        }
+    }
+
+    #[test]
+    fn statement_translator_table_translators_for_unknown_kind_returns_empty() {
+        let table = super::StatementTranslatorTable::boot();
+        assert!(table.translators_for("Made Up Kind").is_empty());
+        assert!(table.translators_for("").is_empty());
+    }
+
+    #[test]
+    fn statement_translator_table_from_grammar_state_reads_binary_facts() {
+        // Fact-based dispatch table: the cell
+        // `Classification_has_Translator` carries one
+        // fact per (kind, translator) pair. The reader builds the
+        // table from those facts, in declaration order.
+        let state = synthetic_translator_state(&[
+            ("Entity Type Declaration", "translate_nouns"),
+            ("Subtype Declaration",     "translate_nouns"),
+            ("Subtype Declaration",     "translate_subtypes"),
+        ]);
+        let table = super::StatementTranslatorTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 3);
+        assert_eq!(table.translators_for("Entity Type Declaration"),
+                   vec!["translate_nouns"]);
+        assert_eq!(table.translators_for("Subtype Declaration"),
+                   vec!["translate_nouns", "translate_subtypes"]);
+        assert!(table.translators_for("Derivation Rule").is_empty(),
+            "kinds not in cell must not resolve");
+    }
+
+    #[test]
+    fn statement_translator_table_falls_back_to_boot_on_empty_cell() {
+        // Empty cell → boot fallback. Same defensive pattern as the
+        // other #713 tables: a missing or empty grammar declaration
+        // can't silently produce a translator-less stage-2.
+        let state: Object = {
+            let mut m: HashMap<String, Object> = HashMap::new();
+            m.insert("Classification_has_Translator".to_string(),
+                     Object::Seq(alloc::sync::Arc::from(Vec::<Object>::new())));
+            Object::Map(m)
+        };
+        let table = super::StatementTranslatorTable::from_grammar_state(&state);
+        // boot has all 20 kinds; empty cell would have 0.
+        assert_eq!(table.kinds().len(), 20);
+    }
+
+    #[test]
+    fn statement_translator_table_from_real_grammar_loads_full_dispatch() {
+        // Per AREST.tex §3 (eq:sys) the dispatch table is fact-based:
+        // the grammar's `Classification is translated by Translator`
+        // declarations are the source of truth, with boot() as a
+        // chicken-and-egg fallback for parsing the grammar that
+        // declares the table. This test verifies (a) the grammar
+        // *does* declare the cell — boot fallback is not enough, and
+        // (b) every kind in boot is covered by the grammar.
+        let state = grammar_state();
+        let cell = fetch_or_phi("Classification_has_Translator", &state);
+        let facts = cell.as_seq().expect(
+            "grammar must declare the Classification_has_Translator \
+             cell — fact-based dispatch (per #833 / AREST.tex §3 eq:sys) cannot \
+             rely on the boot fallback");
+        assert!(!facts.is_empty(),
+            "Classification_has_Translator cell exists but is empty; \
+             grammar must populate it with one row per (kind, translator) pair");
+        let table = super::StatementTranslatorTable::from_grammar_state(&state);
+        let boot = super::StatementTranslatorTable::boot();
+        for kind in boot.kinds() {
+            let from_grammar = table.translators_for(kind);
+            let from_boot = boot.translators_for(kind);
+            assert_eq!(from_grammar, from_boot,
+                "kind {kind:?} translators differ: grammar {from_grammar:?} vs boot {from_boot:?}");
+        }
     }
 }

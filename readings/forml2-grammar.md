@@ -19,6 +19,8 @@ Role Reference(.id) is an entity type.
 
 Classification(.name) is an entity type.
 
+Translator(.name) is an entity type.
+
 ## Value Types
 
 Text is a value type.
@@ -70,10 +72,53 @@ Statement has Enum Value.
 Statement has Constraint Keyword.
 Statement has Classification.
 
+Classification has Translator.
+
 Statement has Role Reference.
 Role Reference has Head Noun.
 Role Reference has Literal Value.
 Role Reference has Role Position.
+
+## Statement Translator Dispatch (#833)
+
+Per AREST.tex §3 (eq:sys) — *the entity handles the dispatch, not the
+system function.* New translators are registered into DEFS without
+modifying any entity. The Rust pipeline consults this table to
+discover which translators apply to a given Statement Classification.
+The relation is many-to-many: e.g., Subtype Declaration is handled by
+both `translate_nouns` and `translate_subtypes`, and
+`translate_set_constraints` handles five constraint kinds.
+
+The Entity Type and Fact Type for this dispatch are declared in the
+top-level `## Entity Types` and `## Fact Types` sections so the
+bootstrap grammar parser picks them up. The Instance Facts populating
+the table follow.
+
+### Instance Facts
+
+Classification 'Entity Type Declaration' has Translator 'translate_nouns'.
+Classification 'Value Type Declaration' has Translator 'translate_nouns'.
+Classification 'Subtype Declaration' has Translator 'translate_nouns'.
+Classification 'Subtype Declaration' has Translator 'translate_subtypes'.
+Classification 'Abstract Declaration' has Translator 'translate_nouns'.
+Classification 'Partition Declaration' has Translator 'translate_nouns'.
+Classification 'Partition Declaration' has Translator 'translate_partitions'.
+Classification 'Enum Values Declaration' has Translator 'translate_enum_values'.
+Classification 'Instance Fact' has Translator 'translate_instance_facts'.
+Classification 'Fact Type Reading' has Translator 'translate_fact_types'.
+Classification 'Fact Type Reading' has Translator 'translate_derivation_mode_facts'.
+Classification 'Derivation Rule' has Translator 'translate_derivation_rules'.
+Classification 'Uniqueness Constraint' has Translator 'translate_cardinality_constraints'.
+Classification 'Mandatory Role Constraint' has Translator 'translate_cardinality_constraints'.
+Classification 'Frequency Constraint' has Translator 'translate_cardinality_constraints'.
+Classification 'Ring Constraint' has Translator 'translate_ring_constraints'.
+Classification 'Subset Constraint' has Translator 'translate_set_constraints'.
+Classification 'Equality Constraint' has Translator 'translate_set_constraints'.
+Classification 'Exclusion Constraint' has Translator 'translate_set_constraints'.
+Classification 'Exclusive-Or Constraint' has Translator 'translate_set_constraints'.
+Classification 'Or Constraint' has Translator 'translate_set_constraints'.
+Classification 'Value Constraint' has Translator 'translate_value_constraints'.
+Classification 'Deontic Constraint' has Translator 'translate_deontic_constraints'.
 
 ## Instance Facts — the classification vocabulary
 
