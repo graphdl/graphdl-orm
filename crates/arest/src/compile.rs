@@ -92,6 +92,16 @@ pub(crate) struct CompiledDerivation {
     pub(crate) text: String,
     pub(crate) kind: DerivationKind,
     pub(crate) func: crate::ast::Func,
+    /// Stratification (#826b): a rule that reads another rule's
+    /// consequent cell negatively (`<noun> has no <FT clause>`)
+    /// must run AFTER positive-only rules reach fixpoint, otherwise
+    /// the AbsenceOf guard fires in round 1 before the positive
+    /// derivations have populated their consequent cells. Set in
+    /// the AbsenceOf branch of `compile_explicit_derivation`; the
+    /// def-emission path uses it to bucket the rule under
+    /// `derivation_strat2:<id>` so callers (CLI compile, apply
+    /// path, MCP query) can drive a 2-stratum forward chain.
+    pub(crate) uses_negation: bool,
 }
 
 /// A compiled state machine. func is the transition function: <state, event> -> state'.
@@ -1147,8 +1157,19 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     }));
 
     // Derivation rules â€” Î±(derivation â†’ def)
+    //
+    // Stratification (#826b): rules whose antecedent reads another
+    // rule's consequent cell negatively (`<noun> has no <FT clause>`)
+    // emit under `derivation_strat2:<id>` so callers run a 2-stratum
+    // forward chain — positive rules to fixpoint, then negation
+    // rules. Without that, the AbsenceOf guard fires in round 1
+    // before its negative-dependency cell has been populated, and
+    // the consequent fires for entries that should be filtered out.
     defs.extend(model.derivations.iter()
-        .map(|d| (format!("derivation:{}", d.id), d.func.clone())));
+        .map(|d| {
+            let prefix = if d.uses_negation { "derivation_strat2" } else { "derivation" };
+            (format!("{}:{}", prefix, d.id), d.func.clone())
+        }));
 
     // Migration rules (#349). One derivation-shaped def per Migration
     // instance in the population. Fires inside forward_chain alongside
@@ -2707,7 +2728,7 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
         ),
     );
 
-    CompiledDerivation { id, text, kind, func }
+    CompiledDerivation { id, text, kind, func, uses_negation: false }
 }
 
 /// Compile a Halpin arithmetic expression (Box::Volume = Size * Size * Size)
@@ -3078,7 +3099,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 ),
             ),
         };
-        return CompiledDerivation { id, text, kind, func };
+        return CompiledDerivation { id, text, kind, func, uses_negation: false };
     }
 
     let func = match antecedent_ids.len() {
@@ -3212,6 +3233,98 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             Func::compose(Func::apply_to_all(derive_one), extract(0, ft_id))
         }
         _ => {
+            // Negation guard (#826b): a 2-antecedent rule whose second
+            // antecedent is `AbsenceOf` is `<positive ant> AND no
+            // matching fact in <negated FT>`. Fire per a0 in the
+            // positive antecedent only when the negated FT has no
+            // matching fact for that a0's join-role value (and any
+            // pinned role literals).
+            if antecedent_ids.len() == 2 {
+                if let crate::types::AntecedentSource::AbsenceOf { fact_type, role } =
+                    &rule.antecedent_sources[1]
+                {
+                    let ant0 = extract(0, &antecedent_ids[0]);
+                    let neg_ft = extract_facts_from_pop(fact_type);
+                    // Build the per-fact filter on the negated FT:
+                    //   key match — `role_value_by_name(<role>)`(neg_fact) == `role_value_by_name(<ant0_role>)`(a0)
+                    // We pick `a0`'s match role from antecedent[0]'s
+                    // role with the same noun_name (the natural join,
+                    // since user rules name the entity once).
+                    let a0_match_role: String = data.fact_types.get(&antecedent_ids[0])
+                        .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == *role))
+                        .map(|r| r.noun_name.clone())
+                        .unwrap_or_else(|| role.clone());
+                    let key_match = Func::compose(Func::Eq, Func::construction(vec![
+                        Func::compose(role_value_by_name(role), Func::Selector(2)),
+                        Func::compose(role_value_by_name(&a0_match_role), Func::Selector(1)),
+                    ]));
+                    // Apply any role-literal filters pinned to the
+                    // AbsenceOf antecedent (e.g. `'blocked'` on a
+                    // Task Readiness role).
+                    let mut neg_pred = key_match;
+                    for arl in rule.antecedent_role_literals.iter()
+                        .filter(|arl| arl.antecedent_index == 1)
+                    {
+                        let lit_check = Func::compose(Func::Eq, Func::construction(vec![
+                            Func::compose(role_value_by_name(&arl.role), Func::Selector(2)),
+                            Func::constant(Object::atom(&arl.value)),
+                        ]));
+                        neg_pred = Func::compose(Func::And, Func::construction(vec![
+                            neg_pred, lit_check,
+                        ]));
+                    }
+                    let any_match = Func::compose(Func::compose(Func::Not, Func::NullTest),
+                        Func::compose(Func::filter(neg_pred), Func::DistL));
+                    let absent_guard = Func::compose(Func::Not, any_match);
+
+                    // Build consequent bindings from a0 only
+                    // (literals + name-based projection). derive_one
+                    // is wrapped in `compose(derive_one, Selector(1))`
+                    // below so it sees a0 directly — value_func
+                    // therefore doesn't add its own Selector.
+                    let cons_roles = data.fact_types.get(&consequent_id)
+                        .map(|ft| ft.roles.clone())
+                        .unwrap_or_default();
+                    let pairs: Vec<Func> = cons_roles.iter().map(|r| {
+                        let key = r.noun_name.clone();
+                        let value_func = rule.consequent_role_literals.iter()
+                            .find(|crl| crl.role == r.noun_name)
+                            .map(|crl| Func::constant(Object::atom(&crl.value)))
+                            .unwrap_or_else(|| role_value_by_name(&r.noun_name));
+                        Func::construction(vec![
+                            Func::constant(Object::atom(&key)),
+                            value_func,
+                        ])
+                    }).collect();
+                    let bindings_func = Func::construction(pairs);
+                    let derive_one = Func::construction(vec![
+                        consequent_id_func.clone(),
+                        consequent_reading_func.clone(),
+                        bindings_func,
+                    ]);
+                    // For each a0, pair with the full negated-FT
+                    // population, then keep only when the absent
+                    // guard holds.
+                    let per_a0 = Func::condition(
+                        absent_guard,
+                        Func::construction(vec![
+                            Func::compose(derive_one, Func::Selector(1)),
+                        ]),
+                        Func::constant(Object::phi()),
+                    );
+                    return CompiledDerivation {
+                        id, text, kind,
+                        func: Func::compose(
+                            Func::Concat,
+                            Func::compose(
+                                Func::apply_to_all(per_a0),
+                                Func::compose(Func::DistR, Func::construction(vec![ant0, neg_ft])),
+                            ),
+                        ),
+                        uses_negation: true,
+                    };
+                }
+            }
             // Subscript-driven join (#826): when a rule's antecedents
             // share a subscript token (`Task1` in both `Task1 blocks
             // Task2` and `Task1 has Task Status 'pending'`), the
@@ -3311,6 +3424,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 return CompiledDerivation {
                     id, text, kind,
                     func: Func::compose(Func::apply_to_all(derive_one), pair_stream),
+                    uses_negation: false,
                 };
             }
 
@@ -3389,7 +3503,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             )
         }
     };
-    CompiledDerivation { id, text, kind, func }
+    CompiledDerivation { id, text, kind, func, uses_negation: false }
 }
 
 
@@ -3512,6 +3626,7 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
         0 => return CompiledDerivation {
             id, text, kind,
             func: Func::constant(Object::phi()),
+            uses_negation: false,
         },
         1 => {
             // Single antecedent: no join, just derive from each fact.
@@ -3526,6 +3641,7 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
             return CompiledDerivation {
                 id, text, kind,
                 func: Func::compose(Func::apply_to_all(derived), fact_extractors.into_iter().next().unwrap()),
+                uses_negation: false,
             };
         },
         _ => {},
@@ -3627,7 +3743,7 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
 
     let func = Func::compose(Func::apply_to_all(derived_fact), current);
 
-    CompiledDerivation { id, text, kind, func }
+    CompiledDerivation { id, text, kind, func, uses_negation: false }
 }
 
 // (join_recursive, check_join_keys, check_match_predicates removed --
@@ -3738,7 +3854,7 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
 
         let func = Func::compose(Func::Concat, Func::compose(derive_facts, new_instances));
 
-        CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func }
+        CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func, uses_negation: false }
 }
 
 fn compile_constraint(data: &CellIndex, def: &ConstraintDef) -> CompiledConstraint {
@@ -6572,6 +6688,83 @@ mod schema_tests {
         assert!(!blocked.contains(&"1".to_string()),
             "Task 1 (blocker, role-0) must NOT be tagged 'blocked'; \
              got blocked={:?}", blocked);
+    }
+
+    /// Negation in a user-rule antecedent: `Task has no Task
+    /// Readiness 'blocked'` should emit `AntecedentSource::AbsenceOf`
+    /// and the engine should fire the consequent only when no
+    /// matching fact exists in the negated FT for the bound entity.
+    /// apps/tasks #826b: without this, the natural rule
+    ///   `Task has Task Readiness 'ready' iff
+    ///    Task has Task Status 'pending' and
+    ///    Task has no Task Readiness 'blocked'.`
+    /// can't be expressed — so we either drop the universal `ready`
+    /// rule (consumer composes query-side) or accept overlap with
+    /// `blocked`. Spec: with two pending Tasks where only Task 1 is
+    /// blocked (Task 2 blocks Task 1, Task 2 is pending), only Task 2
+    /// gets `ready`; Task 1 gets `blocked`.
+    #[test]
+    fn user_rule_with_has_no_clause_emits_absence_guarded_derivation() {
+        let src = "\
+            Task(.id) is an entity type.\n\
+            Task Status is a value type.\n\
+            Task Readiness is a value type.\n\
+            Task has Task Status.\n\
+            Task has Task Readiness.\n\
+            Task blocks Task.\n\
+            Task '1' has Task Status 'pending'.\n\
+            Task '2' has Task Status 'pending'.\n\
+            Task '2' blocks Task '1'.\n\
+            Task1 has Task Readiness 'blocked' iff Task2 blocks Task1 and Task2 has Task Status 'pending'.\n\
+            Task has Task Readiness 'ready' iff Task has Task Status 'pending' and Task has no Task Readiness 'blocked'.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        // Stratified forward chain (#826b): positive rules first,
+        // then negation rules. Mirrors `cli::entry`'s compile path.
+        let collect = |prefix: &str, state: &ast::Object| -> Vec<(String, ast::Func)> {
+            ast::cells_iter(state).into_iter()
+                .filter(|(n, _)| n.starts_with(prefix))
+                .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, state)))
+                .collect()
+        };
+        let s1 = collect("derivation:rule_", &d);
+        let refs1: Vec<(&str, &ast::Func)> = s1.iter().map(|(n, f)| (n.as_str(), f)).collect();
+        let (d, _) = crate::evaluate::forward_chain_defs_state(&refs1, &d);
+        let s2 = collect("derivation_strat2:rule_", &d);
+        let refs2: Vec<(&str, &ast::Func)> = s2.iter().map(|(n, f)| (n.as_str(), f)).collect();
+        let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs2, &d);
+
+        let cell = ast::fetch_or_phi("Task_has_Task_Readiness", &new_d);
+        let entries: Vec<&ast::Object> = cell.as_seq()
+            .map(|s| s.iter().collect()).unwrap_or_default();
+        let by_status = |status: &str| -> Vec<String> {
+            entries.iter()
+                .filter(|f| f.as_seq().map(|pairs| pairs.iter().any(|p| {
+                    let kv = match p.as_seq() { Some(kv) => kv, None => return false };
+                    kv.first().and_then(|k| k.as_atom()) == Some("Task Readiness")
+                        && kv.get(1).and_then(|v| v.as_atom()) == Some(status)
+                })).unwrap_or(false))
+                .filter_map(|f| f.as_seq().and_then(|pairs| pairs.iter().find_map(|p| {
+                    let kv = p.as_seq()?;
+                    let role = kv.first()?.as_atom()?;
+                    if role == "Task" { kv.get(1)?.as_atom().map(String::from) } else { None }
+                })))
+                .collect()
+        };
+        let blocked = by_status("blocked");
+        let ready = by_status("ready");
+        assert!(blocked.contains(&"1".to_string()),
+            "Task 1 must be blocked (blocked by Task 2 which is pending); got blocked={:?}", blocked);
+        assert!(!blocked.contains(&"2".to_string()),
+            "Task 2 must NOT be blocked (nothing blocks it); got blocked={:?}", blocked);
+        assert!(ready.contains(&"2".to_string()),
+            "Task 2 must be ready (pending and not blocked); got ready={:?}", ready);
+        assert!(!ready.contains(&"1".to_string()),
+            "Task 1 must NOT be ready (it has Readiness 'blocked'); got ready={:?}", ready);
     }
 
     /// Two-antecedent ring FT join with subscripts: a derivation that

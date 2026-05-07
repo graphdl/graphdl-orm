@@ -578,20 +578,36 @@ pub fn main_entry() {
                 // `Task has Task Readiness 'ready' iff Task has Task
                 // Status 'pending'.` populates Task_has_Task_Readiness
                 // alongside the parsed Task_has_Task_Status cell).
-                let derivation_refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d)
-                    .into_iter()
-                    .filter(|(n, _)| n.starts_with("derivation:rule_"))
-                    .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &d)))
-                    .collect();
-                let d = if derivation_refs_owned.is_empty() {
-                    d
-                } else {
-                    let derivation_refs: Vec<(&str, &ast::Func)> = derivation_refs_owned.iter()
+                //
+                // Stratification (#826b): rules whose antecedent reads
+                // another rule's consequent cell negatively are emitted
+                // under `derivation_strat2:<id>`. Run positive rules
+                // (`derivation:rule_*`) to fixpoint first, then the
+                // negation rules — otherwise an AbsenceOf guard
+                // evaluates against an empty consequent cell in round 1
+                // and fires for entries that should be filtered out.
+                let collect_derivs = |prefix: &str, state: &ast::Object| -> Vec<(String, ast::Func)> {
+                    ast::cells_iter(state).into_iter()
+                        .filter(|(n, _)| n.starts_with(prefix))
+                        .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, state)))
+                        .collect()
+                };
+                let stratum1 = collect_derivs("derivation:rule_", &d);
+                let d = if stratum1.is_empty() { d } else {
+                    let refs: Vec<(&str, &ast::Func)> = stratum1.iter()
                         .map(|(n, f)| (n.as_str(), f)).collect();
-                    let (new_d, derived) = crate::evaluate::forward_chain_defs_state(
-                        &derivation_refs, &d);
-                    eprintln!("[load] {} user derivation rules fired, {} facts derived",
-                        derivation_refs_owned.len(), derived.len());
+                    let (new_d, derived) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+                    eprintln!("[load] stratum 1: {} positive derivation rules fired, {} facts derived",
+                        stratum1.len(), derived.len());
+                    new_d
+                };
+                let stratum2 = collect_derivs("derivation_strat2:rule_", &d);
+                let d = if stratum2.is_empty() { d } else {
+                    let refs: Vec<(&str, &ast::Func)> = stratum2.iter()
+                        .map(|(n, f)| (n.as_str(), f)).collect();
+                    let (new_d, derived) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+                    eprintln!("[load] stratum 2: {} negation derivation rules fired, {} facts derived",
+                        stratum2.len(), derived.len());
                     new_d
                 };
 

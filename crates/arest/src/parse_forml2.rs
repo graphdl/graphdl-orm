@@ -1173,24 +1173,84 @@ fn resolve_derivation_rule(
                 Some((without, lit)) => (without, Some(lit)),
                 None => (stripped.clone(), None),
             };
-        let ft_resolved = resolve_fact_type(&stripped)
+        // Detect FORML2 negation patterns BEFORE resolving so that a
+        // matching FT lands as `AntecedentSource::AbsenceOf` (a
+        // closed-world existential negation guard) rather than a
+        // positive `FactType` antecedent. Patterns:
+        //   `<Noun> has no <Noun> '<value>'` — negation of a binary FT
+        //   `<Noun> is not <derived FT>` — negation of a unary FT
+        //   `no <Noun> <verb> <Noun>` — sentence-level negation
+        //   `<Noun> does not <verb> <Noun>` — same, prose form
+        // The negated form's FT id is recovered by the same fallback
+        // as before, but the emission kind switches to AbsenceOf.
+        // Skip negation detection for clauses with a `where`
+        // subquery (`no Transition is defined in <SM> where that
+        // Transition is to <Status>`) — those are kernel-grammar
+        // shapes the existing strip-to-positive fallback handles
+        // structurally; emitting AbsenceOf would change the
+        // antecedent count and break the per-rule compile path.
+        let is_negated_clause = (part.contains(" has no ")
+            || part.contains(" is not ")
+            || part.contains(" does not ")
+            || part.starts_with("no ")
+            || part.starts_with("not "))
+            && !part.contains(" where ");
+
+        let ft_resolved_positive = resolve_fact_type(&stripped)
             .or_else(|| (dehyphenated != stripped).then(|| resolve_fact_type(&dehyphenated)).flatten())
             .or_else(|| (destripped_literal != stripped)
-                .then(|| resolve_fact_type(&destripped_literal)).flatten())
-            .or_else(|| {
-                let pos = strip_anaphora(part)
-                    .replace(" is not ", " is ")
-                    .replace(" has no ", " has ")
-                    .replace(" does not ", " ");
-                let pos = pos.trim_start_matches("no ").trim_start_matches("not ");
-                // Strip " where ..." suffix â€” negated clauses with
-                // where-filters ("no X is defined in Y where Z")
-                // need the base FT without the filter tail.
-                let pos = pos.split(" where ").next().unwrap_or(pos);
-                resolve_fact_type(pos)
-            });
+                .then(|| resolve_fact_type(&destripped_literal)).flatten());
+        let ft_resolved_via_negation_strip = || {
+            let pos = strip_anaphora(part)
+                .replace(" is not ", " is ")
+                .replace(" has no ", " has ")
+                .replace(" does not ", " ");
+            let pos = pos.trim_start_matches("no ").trim_start_matches("not ");
+            let (pos_no_lit, _) = match strip_trailing_quoted_literal(pos) {
+                Some((without, lit)) => (without, Some(lit)),
+                None => (pos.to_string(), None),
+            };
+            let pos = pos_no_lit.split(" where ").next().unwrap_or(&pos_no_lit).to_string();
+            resolve_fact_type(&pos)
+        };
+        let ft_resolved = ft_resolved_positive.clone()
+            .or_else(ft_resolved_via_negation_strip);
 
         if let Some(ft_id) = ft_resolved {
+            // Treat as AbsenceOf whenever the clause carries a
+            // syntactic negation marker. The positive resolver's
+            // verb-None catalog fallback will happily match the
+            // underlying FT even when the verb is `has no` /
+            // `does not <verb>`, so positive resolution succeeding
+            // is NOT proof that the clause is positive — the
+            // negation marker is.
+            if is_negated_clause {
+                let role = ir.fact_types.get(&ft_id)
+                    .and_then(|ft| ft.roles.first())
+                    .map(|r| r.noun_name.clone())
+                    .unwrap_or_default();
+                let absence_index = resolved_ids.len();
+                if let Some(lit) = trailing_literal.clone() {
+                    let lit_role = ir.fact_types.get(&ft_id)
+                        .and_then(|ft| ft.roles.last())
+                        .map(|r| r.noun_name.clone())
+                        .unwrap_or_default();
+                    if !lit_role.is_empty() {
+                        role_literals.push(crate::types::AntecedentRoleLiteral {
+                            antecedent_index: absence_index,
+                            role: lit_role,
+                            value: lit,
+                        });
+                    }
+                }
+                // Place a sentinel marker in resolved_ids so antecedent
+                // indices stay aligned with filters/literals; the final
+                // post-loop pass below replaces sentinels with the
+                // actual `AbsenceOf` source.
+                resolved_ids.push(alloc::format!("@absence:{}:{}",
+                    ft_id, role));
+                continue;
+            }
             if let Some((op, value)) = comparator.clone() {
                 let role = ir.fact_types.get(&ft_id)
                     .and_then(|ft| ft.roles.last())
@@ -1320,7 +1380,20 @@ fn resolve_derivation_rule(
         rule.unresolved_clauses.push(part.to_string());
     }
     rule.antecedent_sources = resolved_ids.into_iter()
-        .map(crate::types::AntecedentSource::FactType).collect();
+        .map(|s| {
+            // Sentinel `@absence:<ft_id>:<role>` from the negated-clause
+            // branch above. Decode into `AntecedentSource::AbsenceOf`.
+            if let Some(rest) = s.strip_prefix("@absence:") {
+                if let Some((ft_id, role)) = rest.split_once(':') {
+                    return crate::types::AntecedentSource::AbsenceOf {
+                        fact_type: ft_id.to_string(),
+                        role: role.to_string(),
+                    };
+                }
+            }
+            crate::types::AntecedentSource::FactType(s)
+        })
+        .collect();
     rule.antecedent_filters = filters;
     rule.antecedent_role_literals = role_literals;
     rule.consequent_computed_bindings = computed;
