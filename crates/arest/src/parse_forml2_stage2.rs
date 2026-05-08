@@ -219,6 +219,43 @@ impl DeonticShapeTable {
     }
 }
 
+/// Type signature for stage-2 statement translators with the uniform
+/// shape `(classified_state, idx) -> Vec<Object>`. The non-conforming
+/// translators are excluded from the registry — `translate_fact_types`
+/// returns a `(Vec<Object>, Vec<Object>)` tuple and the
+/// `_with_*` variants take extra dispatch tables. Per AREST.tex §3.2
+/// Platform Binding, registered functions occupy the platform-layer
+/// complement of compiled readings; together they span DEFS.
+pub type TranslatorFn = fn(&Object, &StmtIndex) -> Vec<Object>;
+
+/// Registry of translator-name → fn pointer. The string keys must
+/// match the second column of the
+/// `Classification_has_Translator` cell built from instance facts
+/// in `readings/forml2-grammar.md` so the
+/// `statement_translator_table_translator_names_resolve_to_functions`
+/// regression catches typos and renames.
+///
+/// Scope is the uniform `(state, idx) -> Vec<Object>` translators.
+/// Multi-output translators (translate_fact_types) and arg-bearing
+/// variants (translate_*_with_table[s]/_matrix/_ft_ids) live outside
+/// the registry — the stage-2 pipeline still calls them by name.
+pub fn translator_function_registry() -> hashbrown::HashMap<&'static str, TranslatorFn> {
+    let mut m: hashbrown::HashMap<&'static str, TranslatorFn> = hashbrown::HashMap::new();
+    m.insert("translate_nouns",                  translate_nouns                 as TranslatorFn);
+    m.insert("translate_subtypes",               translate_subtypes              as TranslatorFn);
+    m.insert("translate_partitions",             translate_partitions            as TranslatorFn);
+    m.insert("translate_derivation_mode_facts",  translate_derivation_mode_facts as TranslatorFn);
+    m.insert("translate_instance_facts",         translate_instance_facts        as TranslatorFn);
+    m.insert("translate_ring_constraints",       translate_ring_constraints      as TranslatorFn);
+    m.insert("translate_cardinality_constraints",translate_cardinality_constraints as TranslatorFn);
+    m.insert("translate_set_constraints",        translate_set_constraints       as TranslatorFn);
+    m.insert("translate_value_constraints",      translate_value_constraints     as TranslatorFn);
+    m.insert("translate_deontic_constraints",    translate_deontic_constraints   as TranslatorFn);
+    m.insert("translate_derivation_rules",       translate_derivation_rules      as TranslatorFn);
+    m.insert("translate_enum_values",            translate_enum_values           as TranslatorFn);
+    m
+}
+
 /// Stage-2 noun object-type dispatch — `<classification-kind>` →
 /// declared Object Type. Mirrors `CardinalityConstraintKindTable`
 /// (#833 layer 4) but maps Statement Classifications to noun object
@@ -5534,6 +5571,54 @@ mod tests {
         assert_eq!(table.shape_for("obligatory"), Some(("UC", "deontic")));
         assert_eq!(table.shape_for("forbidden"),  Some(("UC", "deontic")));
         assert_eq!(table.shape_for("permitted"),  Some(("UC", "deontic")));
+    }
+
+    // ─── #833 layer 7: translator-name → fn pointer registry ─────────
+
+    #[test]
+    fn statement_translator_table_translator_names_resolve_to_functions() {
+        // Per AREST.tex §3.2: registered functions span the platform
+        // layer. Every translator name registered in
+        // StatementTranslatorTable must resolve to a Rust function
+        // pointer (or be a known-exception, e.g. translate_fact_types
+        // which returns a tuple and lives outside the uniform registry).
+        // This catches typos / renames between the grammar readings
+        // and the Rust pipeline.
+        let table = super::StatementTranslatorTable::boot();
+        let registry = super::translator_function_registry();
+        let known_exceptions: &[&str] = &[
+            // translate_fact_types: (Vec<Object>, Vec<Object>) signature.
+            "translate_fact_types",
+        ];
+        let mut translator_names: Vec<&str> = table.rows.iter()
+            .map(|(_, t)| t.as_str())
+            .collect();
+        translator_names.sort();
+        translator_names.dedup();
+        for name in translator_names {
+            if known_exceptions.contains(&name) { continue; }
+            assert!(registry.contains_key(name),
+                "translator {name:?} registered in StatementTranslatorTable \
+                 but missing from translator_function_registry; \
+                 either add the fn pointer to the registry or rename \
+                 the readings instance fact to match the Rust fn");
+        }
+    }
+
+    #[test]
+    fn translator_function_registry_keys_are_valid_translators() {
+        // Reverse direction: every fn pointer in the registry must
+        // resolve to at least one Classification kind in the table.
+        // An orphan fn pointer means the readings forgot to declare
+        // any kind that dispatches to it.
+        let table = super::StatementTranslatorTable::boot();
+        let registry = super::translator_function_registry();
+        for name in registry.keys() {
+            let kinds = table.kinds_for(name);
+            assert!(!kinds.is_empty(),
+                "fn pointer {name:?} is registered but no Classification \
+                 kind in StatementTranslatorTable dispatches to it");
+        }
     }
 
     // ─── #833 layer 6: object-type kind table (translate_nouns) ───────
