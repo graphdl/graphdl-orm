@@ -250,6 +250,11 @@ fn harvest_inst_facts_from_readings(state: &Object) -> Vec<InstFact> {
     let mut seen: hashbrown::HashSet<(String, String, String, String, String, Vec<(String, String)>)> =
         hashbrown::HashSet::new();
 
+    // #838: derive directive patterns from state's FactType + Role
+    // cells once; pass them down. Falls back to the const compat list
+    // for the bare-engine path where the metamodel isn't loaded.
+    let patterns = directive_patterns_for_state(state);
+
     // FactType cell readings — the parser preserves the source text in
     // the `reading` binding even when it can't fully classify the
     // statement (e.g. SM directives without the metamodel loaded land
@@ -258,7 +263,7 @@ fn harvest_inst_facts_from_readings(state: &Object) -> Vec<InstFact> {
     if let Some(items) = ft_cell.as_seq() {
         for f in items {
             if let Some(reading) = binding(f, "reading") {
-                for ifact in parse_reading_for_directives(reading) {
+                for ifact in parse_reading_for_directives_with_patterns(reading, &patterns) {
                     let key = inst_key(&ifact);
                     if seen.insert(key) { out.push(ifact); }
                 }
@@ -279,7 +284,7 @@ fn harvest_inst_facts_from_readings(state: &Object) -> Vec<InstFact> {
                 for raw_line in text.lines() {
                     let line = raw_line.trim().trim_end_matches('.').trim();
                     if line.is_empty() { continue; }
-                    for ifact in parse_reading_for_directives(line) {
+                    for ifact in parse_reading_for_directives_with_patterns(line, &patterns) {
                         let key = inst_key(&ifact);
                         if seen.insert(key) { out.push(ifact); }
                     }
@@ -297,51 +302,138 @@ fn inst_key(f: &InstFact) -> (String, String, String, String, String, Vec<(Strin
 
 /// A binary metamodel directive pattern: `<subject_noun> 'sval' <verb>
 /// <object_noun> 'oval'`. The reading parser scans an input string
-/// against each pattern in `directive_pattern_table` and emits an
-/// `InstFact { subject_noun, sval, verb, object_noun, oval }` for the
-/// first match. Per AREST.tex §3 the dispatch is fact-shaped: each
-/// pattern is a row of data, not an if-arm. See task #834.
+/// against each pattern emitted by `directive_patterns_for_state` and
+/// emits an `InstFact { subject_noun, sval, verb, object_noun, oval }`
+/// for the first match. Per AREST.tex §3 the dispatch is fact-shaped:
+/// each pattern is a row of data, not an if-arm. See task #834/#838.
 struct DirectivePattern {
-    subject_noun: &'static str,
-    verb: &'static str,
-    object_noun: &'static str,
+    subject_noun: String,
+    verb: String,
+    object_noun: String,
 }
 
-/// Boot-time directive pattern list — must stay in sync with the
-/// binary fact types declared in `readings/core/state.md`. Order is
-/// declaration-order; the parser returns the first match. The
-/// `Transition is triggered by Event Type` row is a compatibility
-/// alias — same verb as the Fact Type row but a different object
-/// noun, kept so old fixtures still parse.
-fn directive_pattern_table() -> &'static [DirectivePattern] {
-    &[
-        DirectivePattern { subject_noun: "State Machine Definition", verb: "is for",            object_noun: "Noun" },
-        DirectivePattern { subject_noun: "Status",                   verb: "is initial in",     object_noun: "State Machine Definition" },
-        DirectivePattern { subject_noun: "Status",                   verb: "is defined in",     object_noun: "State Machine Definition" },
-        DirectivePattern { subject_noun: "Transition",               verb: "is defined in",     object_noun: "State Machine Definition" },
-        DirectivePattern { subject_noun: "Transition",               verb: "is from",           object_noun: "Status" },
-        DirectivePattern { subject_noun: "Transition",               verb: "is to",             object_noun: "Status" },
-        DirectivePattern { subject_noun: "Transition",               verb: "is triggered by",   object_noun: "Fact Type" },
-        DirectivePattern { subject_noun: "Transition",               verb: "is triggered by",   object_noun: "Event Type" },
-    ]
+/// Boot-time directive pattern list — used as a fallback when the
+/// state's FactType cell has no binary FTs (the bare-engine path where
+/// `readings/core/state.md` hasn't been loaded). Once the metamodel is
+/// in `state`, `directive_patterns_for_state(state)` derives the same
+/// patterns from the FactType cell and supersedes this list. The
+/// `Transition is triggered by Event Type` row is a compat alias —
+/// same verb as the Fact Type row but a different object noun, kept
+/// so old fixtures still parse without redeclaring the metamodel.
+fn directive_pattern_table_compat() -> Vec<DirectivePattern> {
+    [
+        ("State Machine Definition", "is for",          "Noun"),
+        ("Status",                   "is initial in",   "State Machine Definition"),
+        ("Status",                   "is defined in",   "State Machine Definition"),
+        ("Transition",               "is defined in",   "State Machine Definition"),
+        ("Transition",               "is from",         "Status"),
+        ("Transition",               "is to",           "Status"),
+        ("Transition",               "is triggered by", "Fact Type"),
+        ("Transition",               "is triggered by", "Event Type"),
+    ].into_iter().map(|(s, v, o)| DirectivePattern {
+        subject_noun: s.to_string(),
+        verb: v.to_string(),
+        object_noun: o.to_string(),
+    }).collect()
+}
+
+/// Derive directive patterns from the FactType + Role cells at
+/// runtime (#838). Each binary FT in state IS a directive pattern:
+/// the verb is what's left after stripping the leading subject noun
+/// and trailing object noun from the FT reading. Falls back to the
+/// compat list when state's FactType cell has no binary FTs (bare
+/// engine, no metamodel loaded). De-dupes by (subject, verb, object).
+fn directive_patterns_for_state(state: &Object) -> Vec<DirectivePattern> {
+    let ft_cell = fetch_or_phi("FactType", state);
+    let role_cell = fetch_or_phi("Role", state);
+    let role_facts: Vec<&Object> = role_cell.as_seq()
+        .map(|s| s.iter().collect()).unwrap_or_default();
+
+    let mut out: Vec<DirectivePattern> = Vec::new();
+    let mut seen: hashbrown::HashSet<(String, String, String)> = hashbrown::HashSet::new();
+
+    if let Some(ft_items) = ft_cell.as_seq() {
+        for ft in ft_items {
+            let Some(arity_str) = binding(ft, "arity") else { continue };
+            if arity_str != "2" { continue; }
+            let Some(ft_id) = binding(ft, "id") else { continue };
+            let Some(reading) = binding(ft, "reading") else { continue };
+            // Pick role at position 0 and 1 by joining on factType.
+            let mut role_at_pos: [Option<String>; 2] = [None, None];
+            for r in role_facts.iter() {
+                if binding(r, "factType") != Some(ft_id) { continue; }
+                let Some(pos) = binding(r, "position").and_then(|s| s.parse::<usize>().ok())
+                    else { continue };
+                if pos < 2 {
+                    role_at_pos[pos] = binding(r, "nounName").map(String::from);
+                }
+            }
+            let (Some(snoun), Some(onoun)) = (role_at_pos[0].clone(), role_at_pos[1].clone())
+                else { continue };
+            // Slash-alternate readings have multiple reading sentences
+            // separated by ' / '. Each reading is itself `Subject ...
+            // Object`-shaped; emit one pattern per reading-segment.
+            for segment in reading.split(" / ") {
+                let seg = segment.trim().trim_end_matches('.').trim();
+                let Some(verb) = extract_verb_from_reading(seg, &snoun, &onoun)
+                    else { continue };
+                let key = (snoun.clone(), verb.clone(), onoun.clone());
+                if seen.insert(key) {
+                    out.push(DirectivePattern {
+                        subject_noun: snoun.clone(),
+                        verb,
+                        object_noun: onoun.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Fallback / compat: if the runtime list is empty (bare engine,
+    // no metamodel loaded), use the const list. When runtime has any
+    // binary FTs, also append the compat aliases for fact-type readings
+    // that aren't declared in state but old fixtures still emit.
+    if out.is_empty() {
+        return directive_pattern_table_compat();
+    }
+    for compat in directive_pattern_table_compat() {
+        let key = (compat.subject_noun.clone(), compat.verb.clone(), compat.object_noun.clone());
+        if seen.insert(key) { out.push(compat); }
+    }
+    out
+}
+
+/// Extract the verb between `subject_noun ` (prefix) and ` object_noun`
+/// (suffix) from a binary FT reading. Returns None when the reading
+/// doesn't match `<subject> <verb> <object>` shape.
+fn extract_verb_from_reading(reading: &str, snoun: &str, onoun: &str) -> Option<String> {
+    let prefix = alloc::format!("{} ", snoun);
+    let suffix = alloc::format!(" {}", onoun);
+    let after_prefix = reading.strip_prefix(&prefix)?;
+    let verb = after_prefix.strip_suffix(&suffix)?;
+    let trimmed = verb.trim();
+    if trimmed.is_empty() { return None; }
+    Some(trimmed.to_string())
 }
 
 fn match_directive_pattern(reading: &str, p: &DirectivePattern) -> Option<InstFact> {
     let prefix = alloc::format!("{} '", p.subject_noun);
     let mid = alloc::format!("' {} {} '", p.verb, p.object_noun);
     let (sval, oval) = parse_two_quoted(reading, &prefix, &mid, "'")?;
-    Some(mk_inst(p.subject_noun, sval, p.verb, p.object_noun, oval))
+    Some(mk_inst(&p.subject_noun, sval, &p.verb, &p.object_noun, oval))
 }
 
 /// Parse a single reading/statement string for known metamodel
-/// directives. Returns synthesised InstFact records. Iterates the
-/// `directive_pattern_table` in declaration order and returns the
-/// first match; falls through to the 4-quoted webhook pattern.
-fn parse_reading_for_directives(reading: &str) -> Vec<InstFact> {
+/// directives. Iterates `patterns` in order and returns the first
+/// match; falls through to the 4-quoted webhook pattern.
+fn parse_reading_for_directives_with_patterns(
+    reading: &str,
+    patterns: &[DirectivePattern],
+) -> Vec<InstFact> {
     let r = reading.trim().trim_end_matches('.').trim();
     let mut out: Vec<InstFact> = Vec::new();
 
-    for pattern in directive_pattern_table() {
+    for pattern in patterns {
         if let Some(fact) = match_directive_pattern(r, pattern) {
             out.push(fact);
             return out;
@@ -1260,9 +1352,10 @@ mod tests {
             "Transition 'place' is to Status 'Placed'",
             "Transition 'place' is triggered by Fact Type 'Customer places Order'",
         ];
+        let patterns = directive_pattern_table_compat();
         let mut all: Vec<InstFact> = Vec::new();
         for r in readings {
-            all.extend(parse_reading_for_directives(r));
+            all.extend(parse_reading_for_directives_with_patterns(r, &patterns));
         }
         // 7 directives → 7 InstFact records.
         assert_eq!(all.len(), 7);
@@ -1278,7 +1371,8 @@ mod tests {
     #[test]
     fn harvest_recovers_webhook_yields_directive() {
         let r = "Webhook Event Type 'invoice.paid' yields Fact Type 'Invoice was paid by Customer' with Role 'Invoice' from JSON Path '$.data.invoice.id'";
-        let facts = parse_reading_for_directives(r);
+        let patterns = directive_pattern_table_compat();
+        let facts = parse_reading_for_directives_with_patterns(r, &patterns);
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].subject_noun, "Webhook Event Type");
         assert_eq!(facts[0].subject_value, "invoice.paid");
@@ -1330,6 +1424,71 @@ mod tests {
         let (synth, _yielded) = run_webhook_ingest(&pool, &idx, &nouns);
         // Customer role missing → no fact materialised.
         assert!(synth.is_empty(), "incomplete payload must not yield partial fact");
+    }
+
+    /// #838 — directive patterns must be derived from the FactType cell
+    /// at runtime, not from the hardcoded const table. Each binary FT
+    /// declared in readings IS a directive pattern; agents shouldn't
+    /// have to ship a Rust patch to register a new SM-shaped reading.
+    ///
+    /// Spec: build a state with a custom binary FT (`Foo bars Baz`)
+    /// that is NOT in `directive_pattern_table()`. Feed a reading
+    /// like `Foo 'f1' bars Baz 'b1'` through harvest and assert the
+    /// resulting InstFact carries the right (subject_noun, verb,
+    /// object_noun, values). Today the const-only path can't see
+    /// `Foo bars Baz` and returns empty.
+    #[test]
+    fn harvest_recognises_runtime_binary_ft_as_directive_pattern() {
+        use crate::ast::{cell_push, fact_from_pairs, Object};
+
+        // Empty starting state, then push a FactType row + Role rows
+        // describing `Foo bars Baz` as a binary FT.
+        let s0 = Object::phi();
+        let s1 = cell_push("FactType",
+            fact_from_pairs(&[
+                ("id", "Foo_bars_Baz"),
+                ("reading", "Foo bars Baz"),
+                ("arity", "2"),
+            ]),
+            &s0);
+        let s2 = cell_push("Role",
+            fact_from_pairs(&[
+                ("factType", "Foo_bars_Baz"),
+                ("nounName", "Foo"),
+                ("position", "0"),
+            ]),
+            &s1);
+        let s3 = cell_push("Role",
+            fact_from_pairs(&[
+                ("factType", "Foo_bars_Baz"),
+                ("nounName", "Baz"),
+                ("position", "1"),
+            ]),
+            &s2);
+        // _arest_source_text carries the reading the harvester scans.
+        let s4 = cell_push("_arest_source_text",
+            fact_from_pairs(&[("text", "Foo 'f1' bars Baz 'b1'.")]),
+            &s3);
+
+        let facts = harvest_inst_facts_from_readings(&s4);
+        let foo_bars: Vec<&InstFact> = facts.iter()
+            .filter(|f| f.subject_noun == "Foo"
+                && f.field_name == "bars"
+                && f.object_noun == "Baz")
+            .collect();
+        assert!(!foo_bars.is_empty(),
+            "harvest must derive `Foo bars Baz` as a directive pattern from the \
+             runtime FactType cell — not from the hardcoded const table. \
+             Got {} facts overall: {:?}",
+            facts.len(),
+            facts.iter().map(|f| (
+                f.subject_noun.as_str(), f.field_name.as_str(), f.object_noun.as_str()
+            )).collect::<Vec<_>>());
+        let f0 = foo_bars[0];
+        assert_eq!(f0.subject_value, "f1",
+            "subject value extracted from quoted literal");
+        assert_eq!(f0.object_value, "b1",
+            "object value extracted from quoted literal");
     }
 }
 

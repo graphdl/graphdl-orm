@@ -84,6 +84,38 @@ issues list first to see if that file is actively being refactored.
 - `Cargo.lock` unless you are explicitly upgrading a dependency.
 - `target/`, `node_modules/`, `dist/`, `pkg/` — all generated.
 
+## Test-runner discipline (avoid 3-5min cold rebuilds)
+
+The arest crate is ~80k LOC. Cold builds take 3-5 min; warm
+incremental builds take 10-20 s.
+
+Cargo caches are bucketed by (profile, features). Each new
+combination triggers a **full cold compile** the first time:
+
+| Invocation                 | Profile     | Features                   | Output dir              |
+|----------------------------|-------------|----------------------------|-------------------------|
+| `cargo test --lib`         | `test`      | default (=incl. std-deps)  | `target/debug/`         |
+| `cargo tall` (alias)       | `test`      | explicit `std-deps`        | `target/debug/`         |
+| `cargo t` (alias)          | `dev-fast`  | explicit `std-deps`        | `target/dev-fast/`      |
+
+`cargo t` (dev-fast, opt-level 0) **stack-overflows** on
+`ast::tests::fuel_unset_leaves_apply_unrestricted` because Rust's
+ast::apply recursion blows the default 1 MB Windows stack without
+const-folding. Don't use it.
+
+**Do**:
+- Pick ONE invocation per session and stick to it. Default to
+  `cargo test --lib <test_name>` for targeted inner-loop tests
+  (15-20 s incremental), and `cargo test --lib` for the full suite
+  once at end-of-task verification.
+- For quick syntax checks without link, use `cargo c` (alias for
+  `check --lib --features std-deps`).
+
+**Don't**:
+- Switch between `cargo test --lib`, `cargo t`, and `cargo tall`
+  in the same session — every switch is a cold rebuild.
+- Use `cargo t` (dev-fast) until the stack-overflow is fixed.
+
 ## Things to remember beyond this file
 
 Per user's global CLAUDE.md: no memory system; use AREST MCP in local
