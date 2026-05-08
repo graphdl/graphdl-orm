@@ -605,6 +605,37 @@ fn create_via_defs(
         stratum2.len(),
         ast::cells_iter(d).into_iter().filter(|(n, _)| n.starts_with("derivation_strat2:")).count(),
         noun);
+    // #836 — drop derived consequent cells from `resolved` before
+    // forward-chain so the LFP recomputes against the current
+    // primary state. Mirrors the cli/entry.rs compile-path fix per
+    // AREST.tex §4.3 (LFP per request). Without this, an apply that
+    // flips a primary fact (e.g. a Task's Status) leaves stale
+    // derived facts (e.g. another Task's blocked-readiness) in the
+    // population because forward_chain only adds, never retracts.
+    let resolved = {
+        let drule_cell = ast::fetch_or_phi("DerivationRule", d);
+        let derived_cells: hashbrown::HashSet<String> = drule_cell.as_seq()
+            .map(|facts| facts.iter()
+                .filter_map(|f| ast::binding(f, "consequentFactTypeId"))
+                .map(|encoded| crate::types::ConsequentCellSource::decode(encoded)
+                    .literal_id().to_string())
+                .filter(|s| !s.is_empty())
+                .collect())
+            .unwrap_or_default();
+        if derived_cells.is_empty() {
+            resolved
+        } else {
+            let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+            for (name, contents) in ast::cells_iter(&resolved).into_iter() {
+                if derived_cells.contains(name) {
+                    new_map.insert(name.to_string(), ast::Object::phi());
+                } else {
+                    new_map.insert(name.to_string(), contents.clone());
+                }
+            }
+            ast::Object::Map(new_map)
+        }
+    };
     let (post_s1, mut derived) = if stratum1.is_empty() {
         (resolved.clone(), Vec::new())
     } else {
@@ -1039,6 +1070,32 @@ fn update_via_defs(
     };
     let stratum1 = collect_stratum("derivation");
     let stratum2 = collect_stratum("derivation_strat2");
+    // #836 — clear derived consequent cells before forward-chain
+    // (LFP per request, AREST.tex §4.3). Same fix as create_via_defs.
+    let new_state = {
+        let drule_cell = ast::fetch_or_phi("DerivationRule", d);
+        let derived_cells: hashbrown::HashSet<String> = drule_cell.as_seq()
+            .map(|facts| facts.iter()
+                .filter_map(|f| ast::binding(f, "consequentFactTypeId"))
+                .map(|encoded| crate::types::ConsequentCellSource::decode(encoded)
+                    .literal_id().to_string())
+                .filter(|s| !s.is_empty())
+                .collect())
+            .unwrap_or_default();
+        if derived_cells.is_empty() {
+            new_state
+        } else {
+            let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+            for (name, contents) in ast::cells_iter(&new_state).into_iter() {
+                if derived_cells.contains(name) {
+                    new_map.insert(name.to_string(), ast::Object::phi());
+                } else {
+                    new_map.insert(name.to_string(), contents.clone());
+                }
+            }
+            ast::Object::Map(new_map)
+        }
+    };
     let (new_state, mut derived) = if stratum1.is_empty() {
         (new_state, Vec::new())
     } else {
