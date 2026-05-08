@@ -7462,6 +7462,284 @@ It is forbidden that each Noun has a name that ends with 'ies'.\n";
     }
 }
 
+// ── #816: alethic mandatory-role rejection at compile time ──────────
+//
+// ORM 2 mandatory-role constraints (`MC` kind, FORML2 syntax:
+// `Each X has at least one Y`) are alethic by default — they MUST hold
+// or the model is invalid. The runtime `validate` def already evaluates
+// the compiled MC Func against the cell population and emits violations;
+// `decode_violation` flags every emitted violation as `alethic: true`,
+// and `platform_compile` rejects on any alethic violation. This test
+// pins the contract end-to-end: a Foo instance that fails to participate
+// in a `Foo has Bar` fact (where MC requires it) must surface a
+// "Mandatory violation" entry through the `validate` def, alethic enough
+// for `platform_compile`'s rejection branch to fire.
+#[cfg(test)]
+mod mandatory_role_alethic_rejection_tests {
+    use super::*;
+    use crate::ast::{self, Object, fact_from_pairs};
+
+    /// Build cells: Foo + Bar + Label nouns, two FTs (`Foo has Bar`,
+    /// `Foo has Label`), an MC alethic constraint over `Foo has Bar`
+    /// role 0, and one Foo instance reachable only via `Foo has Label`.
+    /// No `Foo has Bar` fact is present, so foo1 has zero Bars — the
+    /// MC must violate.
+    fn state_missing_mandatory_bar() -> Object {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+
+        // Nouns
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Foo"), ("objectType", "entity"),
+        ]));
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Bar"), ("objectType", "entity"),
+        ]));
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Label"), ("objectType", "value"),
+        ]));
+
+        // FactType: Foo has Bar (id "ft_has_bar")
+        cells.entry("FactType".into()).or_default().push(fact_from_pairs(&[
+            ("id", "ft_has_bar"), ("reading", "Foo has Bar"), ("arity", "2"),
+        ]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_has_bar"), ("nounName", "Foo"), ("position", "0"),
+        ]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_has_bar"), ("nounName", "Bar"), ("position", "1"),
+        ]));
+
+        // FactType: Foo has Label (id "ft_has_label") — used to seed a
+        // Foo instance without binding it to a Bar.
+        cells.entry("FactType".into()).or_default().push(fact_from_pairs(&[
+            ("id", "ft_has_label"), ("reading", "Foo has Label"), ("arity", "2"),
+        ]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_has_label"), ("nounName", "Foo"), ("position", "0"),
+        ]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_has_label"), ("nounName", "Label"), ("position", "1"),
+        ]));
+
+        // MC alethic over ft_has_bar at role 0 (Foo). FORML2:
+        //   Each Foo has at least one Bar.
+        let mc = ConstraintDef {
+            id: "mc_foo_bar".into(),
+            kind: "MC".into(),
+            modality: "alethic".into(),
+            text: "Each Foo has at least one Bar".into(),
+            spans: vec![SpanDef {
+                fact_type_id: "ft_has_bar".into(),
+                role_index: 0,
+                subset_autofill: None,
+            }],
+            ..Default::default()
+        };
+        cells.entry("Constraint".into()).or_default()
+            .push(crate::parse_forml2::constraint_to_fact_test(&mc));
+
+        // Population: one Foo instance, reachable via ft_has_label.
+        // No ft_has_bar fact => the MC must fire on foo1.
+        cells.entry("ft_has_label".into()).or_default()
+            .push(Object::seq(vec![
+                Object::seq(vec![Object::atom("Foo"), Object::atom("foo1")]),
+                Object::seq(vec![Object::atom("Label"), Object::atom("greeting")]),
+            ]));
+
+        Object::Map(cells.into_iter()
+            .map(|(k, v)| (k, Object::Seq(v.into())))
+            .collect())
+    }
+
+    /// End-to-end: compile the model, run `validate`, decode violations.
+    /// At least one alethic MC violation must surface — the same shape
+    /// `platform_compile` consumes to reject the compile.
+    #[test]
+    fn mc_violation_alethic_rejects_at_compile_time() {
+        let state = state_missing_mandatory_bar();
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        let ctx = ast::encode_eval_context_state("", None, &state);
+        let violations_obj = ast::apply(
+            &ast::Func::Def("validate".to_string()),
+            &ctx,
+            &d,
+        );
+        let violations = ast::decode_violations(&violations_obj);
+
+        // Pre: at least one violation must surface.
+        assert!(!violations.is_empty(),
+            "MC alethic constraint over a Foo with no Bar must produce \
+             ≥1 violation through `validate`; got {:?}; raw obj {:?}",
+            violations, violations_obj);
+
+        // The violation must reference the MC constraint id and Foo
+        // instance, surfacing the "Mandatory violation" label that
+        // `compile_mandatory_ast` emits.
+        let mc_violations: Vec<&crate::types::Violation> = violations.iter()
+            .filter(|v| v.constraint_id == "mc_foo_bar")
+            .collect();
+        assert!(!mc_violations.is_empty(),
+            "expected ≥1 violation tagged with constraint_id 'mc_foo_bar'; \
+             got constraint_ids {:?}",
+            violations.iter().map(|v| v.constraint_id.as_str()).collect::<Vec<_>>());
+
+        let v = mc_violations[0];
+        assert!(v.alethic,
+            "MC violation must be alethic (rejects compile, not just warns); \
+             got alethic={} for {:?}", v.alethic, v);
+        assert!(v.detail.contains("Mandatory violation"),
+            "violation detail should carry the 'Mandatory violation' label \
+             so the user can identify the failing constraint kind; got {:?}",
+            v.detail);
+        assert!(v.detail.contains("foo1"),
+            "violation detail should name the failing Foo instance 'foo1'; \
+             got {:?}", v.detail);
+        assert!(v.detail.contains("Foo has Bar"),
+            "violation detail should reference the FT reading the instance \
+             fails to participate in; got {:?}", v.detail);
+    }
+
+    /// Silent-MC gap: if an MC arrives with no resolvable spans (e.g.
+    /// the FT id cannot be matched by `enrich_constraints_with_spans`),
+    /// `compile_mandatory_ast` falls through to `Func::constant(phi())`
+    /// — the constraint silently does nothing at runtime. Pin this so
+    /// the structural validator can be expanded later (#816 follow-up):
+    /// the user's intent ("Each Foo has at least one Bar") is dropped
+    /// without diagnostic. This test documents the current behavior
+    /// and would flip to a structural error once promoted.
+    #[test]
+    fn mc_with_unresolved_spans_emits_no_runtime_violation() {
+        let mut state = state_missing_mandatory_bar();
+
+        // Replace the MC with one whose spans point at a nonexistent FT.
+        // The runtime check then collapses to phi() — no violation, no
+        // diagnostic.
+        let bad_mc = ConstraintDef {
+            id: "mc_bad".into(),
+            kind: "MC".into(),
+            modality: "alethic".into(),
+            text: "Each Foo has at least one Quux".into(),
+            spans: vec![SpanDef {
+                fact_type_id: "ft_does_not_exist".into(),
+                role_index: 0,
+                subset_autofill: None,
+            }],
+            ..Default::default()
+        };
+        if let Object::Map(ref mut m) = state {
+            // Replace Constraint cell with just the bad MC.
+            m.insert("Constraint".into(), Object::Seq(vec![
+                crate::parse_forml2::constraint_to_fact_test(&bad_mc),
+            ].into()));
+        }
+
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+        let ctx = ast::encode_eval_context_state("", None, &state);
+        let violations_obj = ast::apply(
+            &ast::Func::Def("validate".to_string()),
+            &ctx,
+            &d,
+        );
+        let violations = ast::decode_violations(&violations_obj);
+        let mc_bad: Vec<&crate::types::Violation> = violations.iter()
+            .filter(|v| v.constraint_id == "mc_bad")
+            .collect();
+        assert!(mc_bad.is_empty(),
+            "current behavior: an MC with unresolved spans is silent at \
+             runtime (no violation emitted). Documents the structural \
+             gap a follow-up to #816 would close. Got: {:?}", mc_bad);
+
+        // The structural validator surfaces the gap as a "references
+        // undeclared fact type" message. Verify that path is the entry
+        // point a future promotion would attach to.
+        let model_errors = validate_model_from_state(&state);
+        let undeclared_ft_err = model_errors.iter()
+            .find(|e| e.contains("undeclared fact type") && e.contains("ft_does_not_exist"));
+        assert!(undeclared_ft_err.is_some(),
+            "validate_model_from_state must surface the undeclared-FT \
+             gap so a follow-up can promote it to alethic rejection; \
+             got errors: {:?}", model_errors);
+    }
+
+    /// End-to-end through `Func::Platform("compile")`: pre-load `d`
+    /// with the same model + Foo-without-Bar population, submit an
+    /// empty reading, and assert the platform returns the
+    /// `⊥ constraint violation: ...` atom carrying the MC text. This
+    /// pins the user-visible compile-time rejection — the surface
+    /// callers (CLI, MCP, kernel REPL) read.
+    #[test]
+    fn platform_compile_rejects_with_mc_violation_atom() {
+        // Pre-load the model into `d` and register the `compile`
+        // platform fn so apply can dispatch through `platform_compile`.
+        let model_state = state_missing_mandatory_bar();
+        let initial_d = ast::defs_to_state(
+            &alloc::vec![(
+                "compile".to_string(),
+                ast::Func::Platform("compile".to_string()),
+            )],
+            &model_state,
+        );
+
+        // Empty reading — no new schema, just a re-validate. The MC
+        // already fails on the pre-loaded population.
+        let result = ast::apply(
+            &ast::Func::Platform("compile".to_string()),
+            &Object::atom(""),
+            &initial_d,
+        );
+
+        let atom = result.as_atom().unwrap_or_else(|| panic!(
+            "platform_compile must reject with an atom when MC alethic \
+             constraint is violated; got non-atom result: {:?}", result));
+        assert!(atom.starts_with("⊥ constraint violation"),
+            "rejection atom must begin with '⊥ constraint violation'; \
+             got {:?}", atom);
+        assert!(atom.contains("Each Foo has at least one Bar"),
+            "rejection atom must surface the failing constraint text \
+             so the user sees which MC blocked compile; got {:?}", atom);
+    }
+
+    /// Counterpoint: when the Foo instance DOES have a Bar, the MC must
+    /// NOT fire. Pins that the test above isn't trivially-passing on
+    /// compile errors unrelated to MC.
+    #[test]
+    fn mc_no_violation_when_mandatory_bar_present() {
+        let mut state = state_missing_mandatory_bar();
+        // Add the missing fact: foo1 has bar1.
+        if let Object::Map(ref mut m) = state {
+            let cell = m.entry("ft_has_bar".into())
+                .or_insert_with(|| Object::Seq(vec![].into()));
+            let mut facts: Vec<Object> = cell.as_seq()
+                .map(|s| s.to_vec())
+                .unwrap_or_default();
+            facts.push(Object::seq(vec![
+                Object::seq(vec![Object::atom("Foo"), Object::atom("foo1")]),
+                Object::seq(vec![Object::atom("Bar"), Object::atom("bar1")]),
+            ]));
+            *cell = Object::Seq(facts.into());
+        }
+
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+        let ctx = ast::encode_eval_context_state("", None, &state);
+        let violations_obj = ast::apply(
+            &ast::Func::Def("validate".to_string()),
+            &ctx,
+            &d,
+        );
+        let violations = ast::decode_violations(&violations_obj);
+        let mc_violations: Vec<&crate::types::Violation> = violations.iter()
+            .filter(|v| v.constraint_id == "mc_foo_bar")
+            .collect();
+        assert!(mc_violations.is_empty(),
+            "MC must NOT fire when foo1 participates in `Foo has Bar`; \
+             got mc violations {:?}", mc_violations);
+    }
+}
+
 // ── #761 (MC3b-c): cell-driven SM compiler parity tests ──────────────
 //
 // `compile_state_machine_from_cells` reads SM behavior from the
