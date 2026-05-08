@@ -310,6 +310,65 @@ impl ObjectTypeKindTable {
     }
 }
 
+/// #789 — `unresolved_subclauses` filters title-case tokens that are
+/// known prose words rather than nouns (articles, demonstratives,
+/// quantifiers, control-flow keywords). The list lifts from an inline
+/// const into a typed table that mirrors the `Prose Stopword` enum
+/// declared in `readings/forml2-grammar.md`. `boot()` carries the
+/// 12-word fallback so the bare-engine compile path stays working;
+/// `from_grammar_state(state)` reads the runtime enum once the
+/// metamodel is loaded. Same shape as `ObjectTypeKindTable` per #833.
+#[derive(Debug, Clone)]
+pub struct ProseStopwordTable {
+    /// Title-case prose tokens that are NOT noun references. Order
+    /// matches the `'If', 'When', 'Then', ...` declaration in
+    /// readings/forml2-grammar.md so future agents can read either
+    /// the const or the grammar and see the same sequence.
+    pub rows: Vec<String>,
+}
+
+impl ProseStopwordTable {
+    /// Boot table — must stay in sync with `Prose Stopword` enum-value
+    /// declaration in `readings/forml2-grammar.md`. Twelve title-case
+    /// tokens broken into four cohorts: control-flow (If/When/Then),
+    /// demonstratives (That/This), articles (An/A/The), quantifiers
+    /// (Each/Some/No/Every).
+    pub fn boot() -> Self {
+        ProseStopwordTable {
+            rows: alloc::vec![
+                "If".to_string(),    "When".to_string(),  "Then".to_string(),
+                "That".to_string(),  "This".to_string(),
+                "An".to_string(),    "A".to_string(),     "The".to_string(),
+                "Each".to_string(),  "Some".to_string(),  "No".to_string(),
+                "Every".to_string(),
+            ],
+        }
+    }
+
+    /// Build the table from the runtime `Prose Stopword` enum-value
+    /// declaration. Falls back to `boot()` when the cell is empty
+    /// (bare engine, no metamodel loaded).
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_enum_values(state, "Prose Stopword");
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            ProseStopwordTable { rows }
+        }
+    }
+
+    /// Iterate the stopwords in declaration order.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.rows.iter().map(|s| s.as_str())
+    }
+
+    /// Whole-word case-sensitive membership test. Mirrors the legacy
+    /// `PROSE_STOPWORDS.iter().any(|s| *s == *w)` semantics.
+    pub fn contains(&self, word: &str) -> bool {
+        self.rows.iter().any(|s| s == word)
+    }
+}
+
 /// Stage-2 set constraint kind dispatch — `<classification-kind>` →
 /// ORM 2 set-constraint kind code + arbitration-rule name. Mirrors
 /// `CardinalityConstraintKindTable` plus a third column for the
@@ -2157,18 +2216,18 @@ pub fn translate_unresolved_clauses(
         // / "Phantom" tokens legacy's resolver flags. Clauses that
         // only reference declared nouns are assumed to resolve; the
         // full join-path resolver that would say otherwise is out of
-        // scope here.
-        const PROSE_STOPWORDS: &[&str] = &[
-            "If", "When", "Then", "That", "This", "An", "A", "The",
-            "Each", "Some", "No", "Every",
-        ];
+        // scope here. #789 — stopword list lifts to ProseStopwordTable
+        // so the data lives in `readings/forml2-grammar.md` rather
+        // than as a const here. boot() falls back to the historic
+        // 12-word list when the bare engine has no metamodel loaded.
+        let stopwords = ProseStopwordTable::boot();
         for clause in antecedent.split(" and ") {
             let clause = clause.trim();
             if clause.is_empty() { continue; }
             let has_unknown_titlecase = clause.split(|c: char| !c.is_alphanumeric())
                 .filter(|w| !w.is_empty())
                 .filter(|w| w.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false))
-                .filter(|w| !PROSE_STOPWORDS.iter().any(|s| *s == *w))
+                .filter(|w| !stopwords.contains(w))
                 .any(|w| {
                     // Strip trailing digits (subscripted `Order1`).
                     let base: String = w.trim_end_matches(|c: char| c.is_ascii_digit()).into();
@@ -5752,6 +5811,64 @@ mod tests {
         let state = grammar_state();
         let table = super::ObjectTypeKindTable::from_grammar_state(&state);
         assert_eq!(table.rows.len(), 5);
+    }
+
+    // ─── #789: prose stopword table ──────────────────────────────────
+
+    /// #789 — the 12 title-case prose tokens that `unresolved_subclauses`
+    /// silently filters when scanning for unknown nouns must come from
+    /// a typed table (and ultimately the grammar) instead of an inline
+    /// const. Asserts the boot table carries every word the previous
+    /// const enumerated, in the same declaration order so existing
+    /// behavior round-trips without surprise.
+    #[test]
+    fn prose_stopword_table_boot_has_twelve_words_in_declared_order() {
+        let table = super::ProseStopwordTable::boot();
+        let words: Vec<&str> = table.iter().collect();
+        assert_eq!(words, vec![
+            "If", "When", "Then", "That", "This", "An", "A", "The",
+            "Each", "Some", "No", "Every",
+        ],
+        "boot table must mirror the historic PROSE_STOPWORDS const, \
+         in declaration order, so unresolved_subclauses behaves \
+         identically before and after the lift.");
+    }
+
+    /// #789 — `contains` is case-sensitive and matches whole words,
+    /// matching the original `PROSE_STOPWORDS.iter().any(|s| *s == *w)`
+    /// semantics. "Each" matches; "each" doesn't (lowercase reaches a
+    /// different code path); "Eachling" doesn't (would need substring).
+    #[test]
+    fn prose_stopword_table_contains_is_case_sensitive_whole_word() {
+        let table = super::ProseStopwordTable::boot();
+        assert!(table.contains("Each"),
+            "title-case Each is in the table");
+        assert!(!table.contains("each"),
+            "lowercase each is NOT a prose stopword (would shadow Quantifier 'each')");
+        assert!(!table.contains("Eachling"),
+            "substring matches are not allowed");
+        assert!(!table.contains(""),
+            "empty string is not a stopword");
+    }
+
+    /// #789 — when state's EnumValues cell carries Prose Stopword
+    /// values, from_grammar_state lifts them at runtime. Empty cell
+    /// falls back to boot() so the bare-engine path keeps working.
+    #[test]
+    fn prose_stopword_table_from_grammar_state_reads_enum_values() {
+        let state = synthetic_enum_state(&[
+            ("Prose Stopword", &["Foo", "Bar", "Baz"]),
+        ]);
+        let table = super::ProseStopwordTable::from_grammar_state(&state);
+        assert_eq!(table.rows, vec!["Foo", "Bar", "Baz"]);
+    }
+
+    #[test]
+    fn prose_stopword_table_falls_back_to_boot_on_empty_state() {
+        let state = synthetic_enum_state(&[]);
+        let table = super::ProseStopwordTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 12,
+            "empty grammar state falls back to the 12-word boot table");
     }
 
     // ─── #833 layer 5: set constraint kind table ──────────────────────
