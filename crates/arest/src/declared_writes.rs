@@ -47,6 +47,24 @@ use hashbrown::HashSet;
 std::thread_local! {
     static CAP_STACK: core::cell::RefCell<Vec<HashSet<String>>> =
         const { core::cell::RefCell::new(Vec::new()) };
+
+    // #815 — Func::Store strict mode flag (per-thread).
+    //
+    // OFF (default): empty cap stack = system mode = unrestricted store.
+    //                Preserves every legacy engine path that writes via
+    //                plain `apply()`.
+    // ON:            empty cap stack = "no declaration" = ⊥. Every
+    //                Func::Store must be reached through an explicit
+    //                cap frame (`apply_with_caps`, or `Func::Def(name)`
+    //                with a matching `allowed_writes:{name}` companion).
+    //
+    // Strict mode is an audit gate: under it, any consequent kind whose
+    // compile path forgot to emit `allowed_writes:{name}` surfaces as
+    // ⊥ at apply time rather than silently writing under "trusted
+    // system" privilege. Use `strict_store_guard(true)` for an RAII
+    // scope that restores the previous flag on drop.
+    static STRICT_STORE_MODE: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
 }
 
 /// Push `allowed` onto the capability stack. Returned guard pops on drop.
@@ -94,7 +112,8 @@ fn is_protected_metamodel(cell: &str) -> bool {
 
 /// True when a store to `cell` is permitted by the current capability
 /// frame. Decision lattice (top to bottom, first match wins):
-///   1. Empty stack   → system mode, unrestricted.
+///   1. Empty stack + strict OFF → system mode, unrestricted (legacy).
+///   1'. Empty stack + strict ON → ⊥ (no declaration ⇒ refused). #815
 ///   2. "*" in frame  → trusted compile-machinery scope, unrestricted.
 ///   3. Protected     → refused (user scope cannot touch metamodel,
 ///                      even if the declaration names it).
@@ -120,18 +139,86 @@ fn is_protected_metamodel(cell: &str) -> bool {
 /// The hole #810a tracks: a user-authored derivation whose consequent
 /// is `AntecedentRole`, Join, or Aggregate gets no cap emission today
 /// (compile.rs:1152 filters out non-Literal consequents), so its body
-/// runs under the empty stack. Strict mode should compute the
-/// consequent FT name at compile time for every consequent kind.
+/// runs under the empty stack. Strict mode (#815) flips rule 1 so the
+/// gap surfaces as ⊥ at apply time; #816 closes the gap by emitting
+/// `allowed_writes:{name}` for every consequent kind in compile.rs.
 #[cfg(not(feature = "no_std"))]
 pub fn is_store_allowed(cell: &str) -> bool {
     CAP_STACK.with(|s| {
         match s.borrow().last() {
-            None => true,
+            // #815: strict mode reinterprets the empty stack as "no
+            // declaration" rather than "trusted system mode." With it
+            // OFF (default) the legacy unrestricted path is preserved
+            // so every existing caller that doesn't push a frame
+            // continues to work untouched.
+            None => !is_strict_store_mode(),
             Some(frame) if frame.contains("*") => true,
             Some(_) if is_protected_metamodel(cell) => false,
             Some(frame) => frame.contains(cell),
         }
     })
+}
+
+// ── #815: Func::Store strict mode (per-thread) ───────────────────────
+
+/// Set the strict-store mode flag for the current thread. Returns the
+/// previous value so the caller can restore it (preferred via the
+/// `strict_store_guard` RAII helper).
+///
+/// Public so test harnesses, the CLI (`--strict-store`), and #816's
+/// compile-pipeline integration can flip the flag without reaching
+/// into the thread-local directly.
+#[cfg(not(feature = "no_std"))]
+pub fn set_strict_store_mode(on: bool) -> bool {
+    STRICT_STORE_MODE.with(|c| {
+        let prev = c.get();
+        c.set(on);
+        prev
+    })
+}
+
+/// Read the current strict-store mode flag for this thread.
+#[cfg(not(feature = "no_std"))]
+pub fn is_strict_store_mode() -> bool {
+    STRICT_STORE_MODE.with(|c| c.get())
+}
+
+/// RAII guard that sets `STRICT_STORE_MODE` to `on` and restores the
+/// previous value on drop. Use this for any scope that needs strict
+/// enforcement (test bodies, audit-mode compile passes) — exception-
+/// safe and nestable.
+#[cfg(not(feature = "no_std"))]
+pub fn strict_store_guard(on: bool) -> StrictStoreGuard {
+    let prev = set_strict_store_mode(on);
+    StrictStoreGuard { prev }
+}
+
+/// Drop guard for `strict_store_guard`. Restores the saved flag value
+/// on scope exit even if the protected body panics.
+#[cfg(not(feature = "no_std"))]
+pub struct StrictStoreGuard { prev: bool }
+
+#[cfg(not(feature = "no_std"))]
+impl Drop for StrictStoreGuard {
+    fn drop(&mut self) {
+        STRICT_STORE_MODE.with(|c| c.set(self.prev));
+    }
+}
+
+// no_std build: strict mode is a no-op. The kernel image runs only
+// compile-authored code, so there's no user-code threat surface there
+// and `is_store_allowed` is already hard-wired to true.
+#[cfg(feature = "no_std")]
+pub fn set_strict_store_mode(_on: bool) -> bool { false }
+#[cfg(feature = "no_std")]
+pub fn is_strict_store_mode() -> bool { false }
+#[cfg(feature = "no_std")]
+pub fn strict_store_guard(_on: bool) -> StrictStoreGuard { StrictStoreGuard { prev: false } }
+#[cfg(feature = "no_std")]
+pub struct StrictStoreGuard { prev: bool }
+#[cfg(feature = "no_std")]
+impl Drop for StrictStoreGuard {
+    fn drop(&mut self) { let _ = self.prev; }
 }
 
 // no_std build: capabilities are a no-op. The kernel image runs only

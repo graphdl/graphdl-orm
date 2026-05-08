@@ -8837,4 +8837,171 @@ mod tests {
         assert_eq!(arr2.len(), 2,
             "{{Task2:113}} must match both rows where blocked (pos 1) = 113; got {sub2:?}");
     }
+
+    // ── #815: Func::Store strict mode ────────────────────────────────
+    //
+    // Strict mode is the audit gate for `Func::Store`. When OFF (default,
+    // legacy behaviour), an empty capability stack is "system mode" — the
+    // caller is implicitly trusted and stores succeed unrestricted. When
+    // ON, the empty stack is reinterpreted as "no declaration" — every
+    // `Func::Store` must be reached through an explicit cap frame, so
+    // any consequent kind whose compile path forgot to emit
+    // `allowed_writes:{name}` shows up immediately as ⊥.
+    //
+    // The gate is the substrate-aligned check: `allowed_writes` is the
+    // registry of which functions may write where, and strict mode treats
+    // an absent registry entry as a violation rather than a permission.
+    // #816 (in `compile.rs`) is the parallel work that emits the missing
+    // entries for `AntecedentRole`, Join, and Aggregate consequents; this
+    // module is the apply-time enforcement that makes `#816` checkable.
+
+    /// Baseline: with strict mode OFF (legacy behaviour) and no caps
+    /// frame on the stack, `apply(Func::Store, …)` succeeds — preserves
+    /// every existing engine path that writes via plain `apply()`.
+    #[test]
+    fn strict_off_empty_caps_permits_store() {
+        let state = Object::Map(hashbrown::HashMap::new());
+        let input = Object::seq(vec![
+            Object::atom("any_cell"),
+            Object::atom("v"),
+            state.clone(),
+        ]);
+        let _g = crate::declared_writes::strict_store_guard(false);
+        let result = apply(&Func::Store, &input, &state);
+        assert_eq!(
+            fetch("any_cell", &result),
+            Object::atom("v"),
+            "strict OFF + empty caps must keep legacy unrestricted store",
+        );
+    }
+
+    /// Gate: with strict mode ON and no caps frame on the stack, a
+    /// `Func::Store` is refused — the empty stack is no longer "trusted
+    /// system mode" but "no declaration." This is what surfaces a
+    /// missing `allowed_writes:{name}` companion at apply time.
+    #[test]
+    fn strict_on_empty_caps_refuses_store() {
+        let state = Object::Map(hashbrown::HashMap::new());
+        let input = Object::seq(vec![
+            Object::atom("any_cell"),
+            Object::atom("v"),
+            state.clone(),
+        ]);
+        let _g = crate::declared_writes::strict_store_guard(true);
+        let result = apply(&Func::Store, &input, &state);
+        assert_eq!(
+            result, Object::Bottom,
+            "strict ON + empty caps must refuse Func::Store (no declaration ⇒ ⊥)",
+        );
+    }
+
+    /// A user-authored `Func::Def(name)` whose body emits `Func::Store`
+    /// but has NO `allowed_writes:{name}` companion in DEFS is exactly
+    /// the gap #810a tracks: under strict mode, the body runs with an
+    /// empty cap stack and the store collapses to ⊥. This is the
+    /// surface that catches every consequent kind whose compile path
+    /// forgot to emit caps — Literal, AntecedentRole, Join, Aggregate
+    /// alike — without ast.rs needing to know which kind it was.
+    #[test]
+    fn strict_on_def_without_allowed_writes_refuses_body_store() {
+        // Body: store("good", "v", state)
+        let body = Func::Compose(
+            Box::new(Func::Store),
+            Box::new(Func::construction(vec![
+                Func::constant(Object::atom("good")),
+                Func::constant(Object::atom("v")),
+                Func::Id,
+            ])),
+        );
+        let d0 = Object::Map(hashbrown::HashMap::new());
+        // No `allowed_writes:undeclared_def` cell → no caps frame is
+        // pushed by `defs_writes_scope`, so strict mode bottoms the
+        // store inside the body.
+        let d1 = store("undeclared_def", func_to_object(&body), &d0);
+
+        let _g = crate::declared_writes::strict_store_guard(true);
+        let result = apply(&Func::Def("undeclared_def".to_string()), &d1, &d1);
+        assert_eq!(
+            fetch("good", &result),
+            Object::Bottom,
+            "strict ON: a Def without allowed_writes:{{name}} must refuse the body store; got result = {:?}",
+            result,
+        );
+    }
+
+    /// Complement: under strict mode, a `Func::Def(name)` WITH
+    /// `allowed_writes:{name}` declaring its target succeeds normally.
+    /// Once #816 emits the companion for every consequent kind, all
+    /// derivation defs will pass strict mode through this path.
+    #[test]
+    fn strict_on_def_with_allowed_writes_permits_body_store() {
+        let body = Func::Compose(
+            Box::new(Func::Store),
+            Box::new(Func::construction(vec![
+                Func::constant(Object::atom("good")),
+                Func::constant(Object::atom("yes")),
+                Func::Id,
+            ])),
+        );
+        let d0 = Object::Map(hashbrown::HashMap::new());
+        let d1 = store("declared_def", func_to_object(&body), &d0);
+        let d2 = store(
+            "allowed_writes:declared_def",
+            Object::seq(vec![Object::atom("good")]),
+            &d1,
+        );
+
+        let _g = crate::declared_writes::strict_store_guard(true);
+        let result = apply(&Func::Def("declared_def".to_string()), &d2, &d2);
+        assert_eq!(
+            fetch("good", &result),
+            Object::atom("yes"),
+            "strict ON: a Def with matching allowed_writes must permit the body store; got result = {:?}",
+            result,
+        );
+    }
+
+    /// `apply_with_caps` already pushes an explicit frame. Under strict
+    /// mode that frame is the source of truth — a store INSIDE the
+    /// allow-list still succeeds, because strict mode only escalates
+    /// the empty-stack case, not the populated-stack rules.
+    #[test]
+    fn strict_on_apply_with_caps_inside_allowed_set_permits_store() {
+        let state = Object::Map(hashbrown::HashMap::new());
+        let input = Object::seq(vec![
+            Object::atom("my_cell"),
+            Object::atom("ok"),
+            state.clone(),
+        ]);
+        let allowed: hashbrown::HashSet<String> =
+            ["my_cell".to_string()].into_iter().collect();
+
+        let _g = crate::declared_writes::strict_store_guard(true);
+        let result = crate::declared_writes::apply_with_caps(
+            &Func::Store, &input, &state, &allowed,
+        );
+        assert_eq!(
+            fetch("my_cell", &result),
+            Object::atom("ok"),
+            "strict ON + apply_with_caps: store inside allow-list must succeed; got result = {:?}",
+            result,
+        );
+    }
+
+    /// The strict-store guard restores the previous flag on drop —
+    /// otherwise nested test runs (or nested compile pipelines) would
+    /// leak the flag across thread-local scope boundaries.
+    #[test]
+    fn strict_store_guard_restores_previous_flag_on_drop() {
+        // Confirm starting state, set it, drop guard, observe restoration.
+        assert!(!crate::declared_writes::is_strict_store_mode(),
+            "strict mode default must be OFF for this test to be meaningful");
+        {
+            let _g = crate::declared_writes::strict_store_guard(true);
+            assert!(crate::declared_writes::is_strict_store_mode(),
+                "strict mode must be ON inside the guard scope");
+        }
+        assert!(!crate::declared_writes::is_strict_store_mode(),
+            "strict mode must restore to OFF after guard drop");
+    }
 }
