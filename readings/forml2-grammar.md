@@ -64,6 +64,10 @@ Set Constraint Kind is a value type.
   The possible values of Set Constraint Kind are 'Equality Constraint', 'Subset Constraint', 'Exclusive-Or Constraint', 'Or Constraint', 'Exclusion Constraint'.
 Set Constraint Kind Code is a value type.
   The possible values of Set Constraint Kind Code are 'EQ', 'SS', 'XO', 'OR', 'XC'.
+Object Type Source Kind is a value type.
+  The possible values of Object Type Source Kind are 'Abstract Declaration', 'Partition Declaration', 'Entity Type Declaration', 'Value Type Declaration', 'Subtype Declaration'.
+Object Type is a value type.
+  The possible values of Object Type are 'abstract', 'abstract', 'entity', 'value', 'entity'.
 
 ## Fact Types
 

@@ -219,6 +219,60 @@ impl DeonticShapeTable {
     }
 }
 
+/// Stage-2 noun object-type dispatch — `<classification-kind>` →
+/// declared Object Type. Mirrors `CardinalityConstraintKindTable`
+/// (#833 layer 4) but maps Statement Classifications to noun object
+/// types. Five rows in cascade order: Abstract / Partition Declaration
+/// → `abstract`, Entity Type Declaration → `entity`, Value Type
+/// Declaration → `value`, Subtype Declaration → `entity`. Abstract
+/// rows come first so a noun classified as both abstract and entity
+/// is recorded as abstract (legacy "abstract wins" semantics).
+#[derive(Debug, Clone)]
+pub struct ObjectTypeKindTable {
+    /// Pairs of `(classification-kind, object-type)` such as
+    /// `("Entity Type Declaration", "entity")`. Order matches the
+    /// readings' parallel-enum declaration order.
+    pub rows: Vec<(String, String)>,
+}
+
+impl ObjectTypeKindTable {
+    /// Boot table — must stay in sync with the parallel
+    /// `Object Type Source Kind` and `Object Type` enum-value
+    /// declarations in `readings/forml2-grammar.md`.
+    pub fn boot() -> Self {
+        ObjectTypeKindTable {
+            rows: alloc::vec![
+                ("Abstract Declaration".to_string(),    "abstract".to_string()),
+                ("Partition Declaration".to_string(),   "abstract".to_string()),
+                ("Entity Type Declaration".to_string(), "entity".to_string()),
+                ("Value Type Declaration".to_string(),  "value".to_string()),
+                ("Subtype Declaration".to_string(),     "entity".to_string()),
+            ],
+        }
+    }
+
+    /// Build the table from parallel `Object Type Source Kind` /
+    /// `Object Type` enum-value declarations. Falls back to `boot()`
+    /// on any mismatch.
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_parallel_enum_pair(
+            state,
+            "Object Type Source Kind",
+            "Object Type",
+        );
+        match rows {
+            Some(r) => ObjectTypeKindTable { rows: r },
+            None => Self::boot(),
+        }
+    }
+
+    /// Iterate `(kind, object-type)` pairs in cascade order so the
+    /// caller can apply abstract-wins merge semantics.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.rows.iter().map(|(k, t)| (k.as_str(), t.as_str()))
+    }
+}
+
 /// Stage-2 set constraint kind dispatch — `<classification-kind>` →
 /// ORM 2 set-constraint kind code. Mirrors `CardinalityConstraintKindTable`.
 /// Five rows in declaration order: Equality / Subset / Exclusive-Or /
@@ -576,7 +630,7 @@ pub fn classify_statements(statements_state: &Object, grammar_state: &Object) ->
 pub fn translate_nouns(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     use alloc::collections::BTreeMap;
     let statement_ids = collect_statement_ids(idx);
-    let mut by_noun: BTreeMap<String, &'static str> = BTreeMap::new();
+    let mut by_noun: BTreeMap<String, String> = BTreeMap::new();
     // Side-tables, keyed by noun name: reference scheme columns, enum
     // values, supertype. Legacy emits all three as bindings on the
     // Noun fact itself; rmap / openapi / the ref-scheme-driven OpenAPI
@@ -584,32 +638,25 @@ pub fn translate_nouns(classified_state: &Object, idx: &StmtIndex) -> Vec<Object
     let mut ref_schemes: BTreeMap<String, String> = BTreeMap::new();
     let mut enum_values: BTreeMap<String, String> = BTreeMap::new();
     let mut super_types: BTreeMap<String, String> = BTreeMap::new();
+    let object_type_table = ObjectTypeKindTable::boot();
     for stmt_id in statement_ids.iter() {
         let Some(head) = head_noun_for(idx,stmt_id) else { continue };
-        let ot = if classifications_contains_any(idx,stmt_id,
-            &["Abstract Declaration", "Partition Declaration"])
-        {
-            // Partition Declaration marks the supertype abstract
-            // (ORM 2: a partitioned type has no direct instances;
-            // every instance is in exactly one subtype).
-            Some("abstract")
-        } else if classifications_contains(idx,stmt_id, "Entity Type Declaration") {
-            Some("entity")
-        } else if classifications_contains(idx,stmt_id, "Value Type Declaration") {
-            Some("value")
-        } else if classifications_contains(idx,stmt_id, "Subtype Declaration") {
-            // `Fact Type is a subtype of Noun` declares `Fact Type`
-            // as a Noun alongside the Subtype relation — legacy
-            // treats it as entity-typed unless later abstracted.
-            Some("entity")
-        } else {
-            None
-        };
+        // Cascade through the registered object-type kinds in
+        // declaration order. The boot() ordering puts Abstract +
+        // Partition Declaration first so the abstract rows match
+        // before entity/value rows for a noun that's classified as
+        // both. The explicit abstract-wins merge below also covers
+        // the case where multiple Statements address the same noun
+        // (e.g. a Partition Declaration plus a separate Entity Type
+        // Declaration on the same noun name).
+        let ot: Option<String> = object_type_table.iter()
+            .find(|(kind, _)| classifications_contains(idx, stmt_id, kind))
+            .map(|(_, t)| t.to_string());
         if let Some(new_ot) = ot {
-            let slot = by_noun.entry(head.clone()).or_insert(new_ot);
+            let slot = by_noun.entry(head.clone()).or_insert_with(|| new_ot.clone());
             // Abstract wins over entity/value; otherwise keep existing.
             if new_ot == "abstract" {
-                *slot = "abstract";
+                *slot = "abstract".to_string();
             }
         }
 
@@ -650,7 +697,7 @@ pub fn translate_nouns(classified_state: &Object, idx: &StmtIndex) -> Vec<Object
     by_noun.into_iter().map(|(name, ot)| {
         let mut pairs: Vec<(&str, &str)> = vec![
             ("name", name.as_str()),
-            ("objectType", ot),
+            ("objectType", ot.as_str()),
             ("worldAssumption", "closed"),
         ];
         if let Some(rs) = ref_schemes.get(&name) {
@@ -3891,6 +3938,9 @@ mod tests {
     /// codes from a registry — bumping noun=26, enum=15. Layer 5
     /// did the same for set constraints (`Set Constraint Kind` ↔
     /// `Set Constraint Kind Code`) — bumping noun=28, enum=17.
+    /// Layer 6 added `Object Type Source Kind` ↔ `Object Type` so
+    /// translate_nouns reads its kind→object_type mapping from the
+    /// registry — bumping noun=30, enum=19.
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
@@ -3898,7 +3948,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 28, "noun count");
+        assert_eq!(noun_count, 30, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -3910,7 +3960,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 17, "enum-valued noun count");
+        assert_eq!(enum_count, 19, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -5484,6 +5534,51 @@ mod tests {
         assert_eq!(table.shape_for("obligatory"), Some(("UC", "deontic")));
         assert_eq!(table.shape_for("forbidden"),  Some(("UC", "deontic")));
         assert_eq!(table.shape_for("permitted"),  Some(("UC", "deontic")));
+    }
+
+    // ─── #833 layer 6: object-type kind table (translate_nouns) ───────
+
+    #[test]
+    fn object_type_kind_table_boot_has_five_kinds_in_abstract_first_order() {
+        let table = super::ObjectTypeKindTable::boot();
+        let pairs: Vec<(&str, &str)> = table.iter().collect();
+        assert_eq!(pairs, vec![
+            ("Abstract Declaration", "abstract"),
+            ("Partition Declaration", "abstract"),
+            ("Entity Type Declaration", "entity"),
+            ("Value Type Declaration", "value"),
+            ("Subtype Declaration", "entity"),
+        ]);
+    }
+
+    #[test]
+    fn object_type_kind_table_from_grammar_state_reads_parallel_enums() {
+        let state = synthetic_enum_state(&[
+            ("Object Type Source Kind", &[
+                "Abstract Declaration", "Partition Declaration",
+                "Entity Type Declaration", "Value Type Declaration",
+                "Subtype Declaration"]),
+            ("Object Type", &["abstract", "abstract", "entity", "value", "entity"]),
+        ]);
+        let table = super::ObjectTypeKindTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 5);
+    }
+
+    #[test]
+    fn object_type_kind_table_falls_back_to_boot_on_length_mismatch() {
+        let state = synthetic_enum_state(&[
+            ("Object Type Source Kind", &["Entity Type Declaration"]),
+            ("Object Type", &["entity", "value"]),
+        ]);
+        let table = super::ObjectTypeKindTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 5);
+    }
+
+    #[test]
+    fn object_type_kind_table_from_real_grammar_loads_five_rows() {
+        let state = grammar_state();
+        let table = super::ObjectTypeKindTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 5);
     }
 
     // ─── #833 layer 5: set constraint kind table ──────────────────────
