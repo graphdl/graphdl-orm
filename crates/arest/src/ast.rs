@@ -3026,11 +3026,11 @@ fn platform_transition(_noun: &str, x: &Object, d: &Object) -> Object {
     let entity_id = items.first().and_then(|o| o.as_atom()).unwrap_or("").to_string();
     let event = items.get(1).and_then(|o| o.as_atom()).unwrap_or("").to_string();
     // Extract current status from state for the entity
-    let status_key = "StateMachine_has_currentlyInStatus";
-    let current_status = fetch_or_phi(status_key, d).as_seq()
+    let sm = crate::command::StateMachineCellShape::boot();
+    let current_status = fetch_or_phi(sm.cell_name, d).as_seq()
         .and_then(|facts| facts.iter()
-            .find(|f| binding_matches(f, "State Machine", &entity_id))
-            .and_then(|f| binding(f, "currentlyInStatus").map(|s| s.to_string())));
+            .find(|f| binding_matches(f, sm.state_machine_role, &entity_id))
+            .and_then(|f| binding(f, sm.current_status_role).map(|s| s.to_string())));
     let command = crate::command::Command::Transition {
         entity_id,
         event,

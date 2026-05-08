@@ -14,6 +14,42 @@ use crate::ast;
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
+/// State Machine cell shape — the synthesized role-token names the
+/// apply / transition / status-extraction paths read and write to
+/// the `StateMachine_has_currentlyInStatus` cell. These are Rust-side
+/// internal identifiers (not metamodel-declared FactType readings),
+/// so they're centralized as a struct of constants rather than
+/// derived from grammar; mirroring the "single source of truth" goal
+/// of #833's parallel-enum tables for the synthesized side. See task
+/// #835.
+pub struct StateMachineCellShape {
+    /// Cell name carrying the synthesized "<state machine> currently
+    /// in <status>" facts.
+    pub cell_name: &'static str,
+    /// Subject role binding: the State Machine entity id.
+    pub state_machine_role: &'static str,
+    /// Object role binding: the current status value.
+    pub current_status_role: &'static str,
+    /// Result entity binding: the target resource id (alias of the
+    /// State Machine entity id at the API surface).
+    pub for_resource_role: &'static str,
+    /// HATEOAS / API entity_type label for the synthesized SM
+    /// representation entity.
+    pub entity_type_label: &'static str,
+}
+
+impl StateMachineCellShape {
+    pub const fn boot() -> Self {
+        StateMachineCellShape {
+            cell_name:           "StateMachine_has_currentlyInStatus",
+            state_machine_role:  "State Machine",
+            current_status_role: "currentlyInStatus",
+            for_resource_role:   "forResource",
+            entity_type_label:   "State Machine",
+        }
+    }
+}
+
 /// Resolve a def from D: Fetch + metacompose (Backus 13.3.2: ρ).
 /// Returns the Func if the def exists, or None.
 fn def_func(name: &str, d: &ast::Object) -> Option<ast::Func> {
@@ -690,13 +726,13 @@ fn create_via_defs(
             // Write final status to state.
             let init_status = extract_sm_status(&derived_state, &entity_id).unwrap_or_default();
             if current != init_status {
-                let status_key = "StateMachine_has_currentlyInStatus";
-                let filtered = ast::cell_filter(status_key, |f| {
-                    !ast::binding_matches(f, "State Machine", &entity_id)
+                let sm = StateMachineCellShape::boot();
+                let filtered = ast::cell_filter(sm.cell_name, |f| {
+                    !ast::binding_matches(f, sm.state_machine_role, &entity_id)
                 }, &st);
-                st = ast::cell_push(status_key, ast::fact_from_pairs(&[
-                    ("State Machine", &entity_id),
-                    ("currentlyInStatus", &current),
+                st = ast::cell_push(sm.cell_name, ast::fact_from_pairs(&[
+                    (sm.state_machine_role,  &entity_id),
+                    (sm.current_status_role, &current),
                 ]), &filtered);
             }
             st
@@ -726,7 +762,8 @@ fn create_via_defs(
         .map(|d| format!("{}:{:?}", d.fact_type_id, d.bindings))
         .collect();
     diag!("[debug] SM derived facts: {:?}", sm_derived);
-    let sm_cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", &derived_state);
+    let sm_shape = StateMachineCellShape::boot();
+    let sm_cell = ast::fetch_or_phi(sm_shape.cell_name, &derived_state);
     diag!("[debug] SM cell: {:?}", sm_cell);
     let status = extract_sm_status(&derived_state, &entity_id);
     let transitions = hateoas_via_rho(d, noun, &entity_id, status.as_deref());
@@ -738,9 +775,12 @@ fn create_via_defs(
         id: entity_id.clone(), entity_type: noun.to_string(), data: entity_data,
     }).chain(status.as_ref().map(|st| {
         EntityResult {
-            id: entity_id.clone(), entity_type: "State Machine".to_string(),
-            data: [("forResource", entity_id.as_str()), ("currentlyInStatus", st.as_str()), ("domain", domain)]
-                .iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            id: entity_id.clone(), entity_type: sm_shape.entity_type_label.to_string(),
+            data: [
+                (sm_shape.for_resource_role,   entity_id.as_str()),
+                (sm_shape.current_status_role, st.as_str()),
+                ("domain", domain),
+            ].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         }
     })).collect();
 
@@ -797,15 +837,15 @@ fn transition_via_defs(
     };
 
     // Update SM status fact in state: remove old, add new (identity when no new_status)
-    let status_key = "StateMachine_has_currentlyInStatus";
+    let sm = StateMachineCellShape::boot();
     new_state = new_status.as_ref()
         .map(|status| {
-            let filtered = ast::cell_filter(status_key, |f| {
-                !ast::binding_matches(f, "State Machine", entity_id)
+            let filtered = ast::cell_filter(sm.cell_name, |f| {
+                !ast::binding_matches(f, sm.state_machine_role, entity_id)
             }, &new_state);
-            ast::cell_push(status_key, ast::fact_from_pairs(&[
-                ("State Machine", entity_id),
-                ("currentlyInStatus", status.as_str()),
+            ast::cell_push(sm.cell_name, ast::fact_from_pairs(&[
+                (sm.state_machine_role,  entity_id),
+                (sm.current_status_role, status.as_str()),
             ]), &filtered)
         })
         .unwrap_or(new_state);
@@ -1913,15 +1953,16 @@ fn nav_links_via_rho(d: &ast::Object, noun: &str, entity_id: &str) -> Vec<Naviga
 }
 
 fn extract_sm_status(state: &ast::Object, sm_id: &str) -> Option<String> {
-    let cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", state);
+    let sm = StateMachineCellShape::boot();
+    let cell = ast::fetch_or_phi(sm.cell_name, state);
     cell.as_seq()?.iter()
         .find(|fact| {
-            ast::binding_matches(fact, "State Machine", sm_id)
+            ast::binding_matches(fact, sm.state_machine_role, sm_id)
                 || fact.as_seq().map_or(false, |pairs| {
                     pairs.iter().any(|pair| pair.as_seq().and_then(|p| p.get(1)?.as_atom()) == Some(sm_id))
                 })
         })
-        .and_then(|fact| ast::binding(fact, "currentlyInStatus").map(|s| s.to_string()))
+        .and_then(|fact| ast::binding(fact, sm.current_status_role).map(|s| s.to_string()))
 }
 
 // =====================================================================
