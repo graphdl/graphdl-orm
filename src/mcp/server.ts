@@ -64,6 +64,7 @@ import {
   type MutationContextTool,
 } from './mutation-context.js'
 import { tutorSystemCall, resetSandbox, parseEngineRaw } from './tutor-sandbox.js'
+import { resolveArestCli } from './cli-resolver.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(__dirname, '..', '..')
@@ -75,7 +76,10 @@ const AREST_API_KEY = process.env.AREST_API_KEY || ''
 const AREST_APPS_DIR = process.env.AREST_APPS_DIR || ''
 const AREST_READINGS_DIR = process.env.AREST_READINGS_DIR || ''
 const AREST_DB = process.env.AREST_DB || ''
-const AREST_CLI = process.env.AREST_CLI || resolve(REPO_ROOT, 'crates', 'arest', 'target', 'release', process.platform === 'win32' ? 'arest-cli.exe' : 'arest-cli')
+// #841: prefer whichever of target/debug or target/release was built
+// most recently. Existing AREST_CLI env var still wins when set
+// explicitly, so workspace overrides aren't disturbed.
+const AREST_CLI = process.env.AREST_CLI || resolveArestCli(REPO_ROOT)
 const AREST_MODE = (process.env.AREST_MODE || (AREST_URL ? 'remote' : 'local')).toLowerCase()
 const AREST_DEBUG = process.env.AREST_DEBUG === '1'
 const INITIAL_APP_NAME = inferInitialAppName(process.env)
