@@ -311,55 +311,100 @@ impl ObjectTypeKindTable {
 }
 
 /// Stage-2 set constraint kind dispatch — `<classification-kind>` →
-/// ORM 2 set-constraint kind code. Mirrors `CardinalityConstraintKindTable`.
-/// Five rows in declaration order: Equality / Subset / Exclusive-Or /
-/// Or / Exclusion Constraint → `EQ` / `SS` / `XO` / `OR` / `XC`.
-/// Order matters — translate_set_constraints picks the first matching
-/// row, mirroring the legacy if-else cascade.
+/// ORM 2 set-constraint kind code + arbitration-rule name. Mirrors
+/// `CardinalityConstraintKindTable` plus a third column for the
+/// per-kind arbitration predicate. Five rows in declaration order:
+/// Equality / Subset / Exclusive-Or / Or / Exclusion Constraint →
+/// `EQ` / `SS` / `XO` / `OR` / `XC`. Subset uses
+/// `antecedent_diversity_min_2`; everyone else uses
+/// `derivation_rule_wins`. Order matters — translate_set_constraints
+/// picks the first matching row, mirroring the legacy if-else cascade.
 #[derive(Debug, Clone)]
 pub struct SetConstraintKindTable {
-    /// Pairs of `(classification-kind, kind-code)` such as
-    /// `("Equality Constraint", "EQ")`. Order matches the readings'
-    /// parallel-enum declaration order.
-    pub rows: Vec<(String, String)>,
+    /// Triples of `(classification-kind, kind-code, arbitration-rule)`
+    /// such as `("Equality Constraint", "EQ", "derivation_rule_wins")`.
+    /// Order matches the readings' parallel-enum declaration order.
+    pub rows: Vec<(String, String, String)>,
 }
 
 impl SetConstraintKindTable {
     /// Boot table — must stay in sync with the parallel
-    /// `Set Constraint Kind` and `Set Constraint Kind Code`
-    /// enum-value declarations in `readings/forml2-grammar.md`.
+    /// `Set Constraint Kind` / `Set Constraint Kind Code` /
+    /// `Set Constraint Arbitration Rule` enum-value declarations in
+    /// `readings/forml2-grammar.md`.
     pub fn boot() -> Self {
         SetConstraintKindTable {
             rows: alloc::vec![
-                ("Equality Constraint".to_string(),     "EQ".to_string()),
-                ("Subset Constraint".to_string(),       "SS".to_string()),
-                ("Exclusive-Or Constraint".to_string(), "XO".to_string()),
-                ("Or Constraint".to_string(),           "OR".to_string()),
-                ("Exclusion Constraint".to_string(),    "XC".to_string()),
+                ("Equality Constraint".to_string(),     "EQ".to_string(), "derivation_rule_wins".to_string()),
+                ("Subset Constraint".to_string(),       "SS".to_string(), "antecedent_diversity_min_2".to_string()),
+                ("Exclusive-Or Constraint".to_string(), "XO".to_string(), "derivation_rule_wins".to_string()),
+                ("Or Constraint".to_string(),           "OR".to_string(), "derivation_rule_wins".to_string()),
+                ("Exclusion Constraint".to_string(),    "XC".to_string(), "derivation_rule_wins".to_string()),
             ],
         }
     }
 
     /// Build the table from parallel `Set Constraint Kind` /
-    /// `Set Constraint Kind Code` enum-value declarations.
-    /// Falls back to `boot()` on any mismatch.
+    /// `Set Constraint Kind Code` / `Set Constraint Arbitration Rule`
+    /// enum-value declarations. Falls back to `boot()` on any mismatch.
     pub fn from_grammar_state(state: &Object) -> Self {
-        let rows = read_parallel_enum_pair(
-            state,
-            "Set Constraint Kind",
-            "Set Constraint Kind Code",
-        );
-        match rows {
-            Some(r) => SetConstraintKindTable { rows: r },
-            None => Self::boot(),
+        let kinds = read_enum_values(state, "Set Constraint Kind");
+        let codes = read_enum_values(state, "Set Constraint Kind Code");
+        let rules = read_enum_values(state, "Set Constraint Arbitration Rule");
+        if kinds.len() == codes.len()
+            && kinds.len() == rules.len()
+            && !kinds.is_empty()
+        {
+            let rows = kinds.into_iter()
+                .zip(codes)
+                .zip(rules)
+                .map(|((k, c), r)| (k, c, r))
+                .collect();
+            SetConstraintKindTable { rows }
+        } else {
+            Self::boot()
         }
     }
 
-    /// Iterate `(kind, code)` pairs in declaration order so the
-    /// caller can apply per-kind arbitration in cascade order.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.rows.iter().map(|(k, c)| (k.as_str(), c.as_str()))
+    /// Iterate `(kind, code, arbitration-rule)` triples in
+    /// declaration order so the caller can apply per-kind
+    /// arbitration in cascade order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        self.rows.iter().map(|(k, c, r)| (k.as_str(), c.as_str(), r.as_str()))
     }
+}
+
+/// Per-kind arbitration predicate: returns `true` when the Statement
+/// should be skipped (a different translator owns it). Each predicate
+/// is registered in `set_constraint_arbitration_registry` keyed by the
+/// rule name declared in the readings parallel-enum.
+pub type SetConstraintArbitrationFn = fn(text: &str, declared_nouns: &[String], idx: &StmtIndex, stmt_id: &str) -> bool;
+
+/// Skip when the Statement is also classified as Derivation Rule.
+/// Used for EQ / XO / OR / XC where the `iff` keyword that produces
+/// these classifications also produces a Derivation Rule
+/// classification, and translate_derivation_rules wins.
+fn skip_on_derivation_rule(_text: &str, _nouns: &[String], idx: &StmtIndex, stmt_id: &str) -> bool {
+    classifications_contains(idx, stmt_id, "Derivation Rule")
+}
+
+/// Skip when the antecedent has fewer than 2 distinct declared nouns.
+/// Used for SS where the synthetic `if some then that` constraint
+/// keyword also fires for single-antecedent-noun cases that legacy
+/// hands to translate_derivation_rules.
+fn skip_on_low_antecedent_diversity(text: &str, declared_nouns: &[String], _idx: &StmtIndex, _stmt_id: &str) -> bool {
+    antecedent_distinct_nouns(text, declared_nouns) < 2
+}
+
+/// Registry of arbitration-rule name → predicate. The string keys must
+/// match the third column of `SetConstraintKindTable` so the
+/// `set_constraint_arbitration_registry_covers_kind_table` regression
+/// catches typos and renames.
+pub fn set_constraint_arbitration_registry() -> hashbrown::HashMap<&'static str, SetConstraintArbitrationFn> {
+    let mut m: hashbrown::HashMap<&'static str, SetConstraintArbitrationFn> = hashbrown::HashMap::new();
+    m.insert("derivation_rule_wins",        skip_on_derivation_rule        as SetConstraintArbitrationFn);
+    m.insert("antecedent_diversity_min_2",  skip_on_low_antecedent_diversity as SetConstraintArbitrationFn);
+    m
 }
 
 /// Stage-2 cardinality constraint kind dispatch — `<classification-kind>`
@@ -2178,30 +2223,28 @@ pub fn translate_enum_values(classified_state: &Object, idx: &StmtIndex) -> Vec<
 /// Keyword vs Trailing Marker).
 pub fn translate_set_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     let kind_table = SetConstraintKindTable::boot();
+    let arbitration_registry = set_constraint_arbitration_registry();
     let statement_ids = collect_statement_ids(idx);
     let declared_nouns = declared_noun_names(classified_state);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
         let text = statement_text(idx,stmt_id).unwrap_or_default();
-        let is_dr = classifications_contains(idx, stmt_id, "Derivation Rule");
         // Cascade through the registered set-constraint kinds in
-        // declaration order. Per-kind arbitration:
-        //   - SS (Subset Constraint): fires on `if some then that`,
-        //     which also matches Derivation Rule. Legacy's try_subset
-        //     requires 2+ DISTINCT declared nouns in the antecedent;
-        //     below that threshold, defer to translate_derivation_rules.
-        //   - All other kinds: a Statement also classified as
-        //     Derivation Rule (`iff` / `if`) is owned by the DR
-        //     translator; skip emission here.
+        // declaration order. Each row carries a kind name, a kind
+        // code, and an arbitration-rule name; the rule is resolved
+        // through `set_constraint_arbitration_registry` and applied
+        // to decide whether this kind defers to a different
+        // translator (e.g. translate_derivation_rules) on this
+        // particular Statement.
         let mut emit: Option<&str> = None;
-        for (kind, code) in kind_table.iter() {
+        for (kind, code, rule_name) in kind_table.iter() {
             if !classifications_contains(idx, stmt_id, kind) { continue; }
-            let skip = if code == "SS" {
-                antecedent_distinct_nouns(&text, &declared_nouns) < 2
-            } else {
-                is_dr
-            };
-            if skip { continue; }
+            let arbitration = arbitration_registry.get(rule_name)
+                .copied()
+                .unwrap_or(skip_on_derivation_rule);
+            if arbitration(&text, &declared_nouns, idx, stmt_id) {
+                continue;
+            }
             emit = Some(code);
             break;
         }
@@ -3977,7 +4020,11 @@ mod tests {
     /// `Set Constraint Kind Code`) — bumping noun=28, enum=17.
     /// Layer 6 added `Object Type Source Kind` ↔ `Object Type` so
     /// translate_nouns reads its kind→object_type mapping from the
-    /// registry — bumping noun=30, enum=19.
+    /// registry — bumping noun=30, enum=19. Layer 8 added a third
+    /// parallel-enum `Set Constraint Arbitration Rule` so each set
+    /// constraint kind names the predicate that decides whether
+    /// translate_set_constraints emits or defers — bumping noun=31,
+    /// enum=20.
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
@@ -3985,7 +4032,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 30, "noun count");
+        assert_eq!(noun_count, 31, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -3997,7 +4044,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 19, "enum-valued noun count");
+        assert_eq!(enum_count, 20, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -5672,13 +5719,13 @@ mod tests {
     fn set_constraint_kind_table_boot_has_five_kinds_in_cascade_order() {
         let table = super::SetConstraintKindTable::boot();
         assert_eq!(table.rows.len(), 5);
-        let pairs: Vec<(&str, &str)> = table.iter().collect();
-        assert_eq!(pairs, vec![
-            ("Equality Constraint", "EQ"),
-            ("Subset Constraint", "SS"),
-            ("Exclusive-Or Constraint", "XO"),
-            ("Or Constraint", "OR"),
-            ("Exclusion Constraint", "XC"),
+        let triples: Vec<(&str, &str, &str)> = table.iter().collect();
+        assert_eq!(triples, vec![
+            ("Equality Constraint",     "EQ", "derivation_rule_wins"),
+            ("Subset Constraint",       "SS", "antecedent_diversity_min_2"),
+            ("Exclusive-Or Constraint", "XO", "derivation_rule_wins"),
+            ("Or Constraint",           "OR", "derivation_rule_wins"),
+            ("Exclusion Constraint",    "XC", "derivation_rule_wins"),
         ]);
     }
 
@@ -5690,6 +5737,10 @@ mod tests {
                 "Exclusive-Or Constraint", "Or Constraint",
                 "Exclusion Constraint"]),
             ("Set Constraint Kind Code", &["EQ", "SS", "XO", "OR", "XC"]),
+            ("Set Constraint Arbitration Rule", &[
+                "derivation_rule_wins", "antecedent_diversity_min_2",
+                "derivation_rule_wins", "derivation_rule_wins",
+                "derivation_rule_wins"]),
         ]);
         let table = super::SetConstraintKindTable::from_grammar_state(&state);
         assert_eq!(table.rows.len(), 5);
@@ -5700,6 +5751,7 @@ mod tests {
         let state = synthetic_enum_state(&[
             ("Set Constraint Kind", &["Equality Constraint"]),
             ("Set Constraint Kind Code", &["EQ", "SS"]),
+            ("Set Constraint Arbitration Rule", &["derivation_rule_wins"]),
         ]);
         let table = super::SetConstraintKindTable::from_grammar_state(&state);
         assert_eq!(table.rows.len(), 5);
@@ -5712,6 +5764,20 @@ mod tests {
         assert_eq!(table.rows.len(), 5,
             "expected 5 set-constraint kind rows from real grammar; got {:?}",
             table.rows);
+    }
+
+    #[test]
+    fn set_constraint_arbitration_registry_covers_kind_table() {
+        // Every arbitration-rule name in SetConstraintKindTable must
+        // resolve to a Rust function in the arbitration registry.
+        // Catches typos / renames between readings and Rust code.
+        let table = super::SetConstraintKindTable::boot();
+        let registry = super::set_constraint_arbitration_registry();
+        for (_kind, _code, rule) in table.iter() {
+            assert!(registry.contains_key(rule),
+                "arbitration rule {rule:?} declared in SetConstraintKindTable \
+                 but missing from set_constraint_arbitration_registry");
+        }
     }
 
     // ─── #833 layer 4: cardinality constraint kind table ──────────────
