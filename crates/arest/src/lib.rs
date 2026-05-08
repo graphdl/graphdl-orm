@@ -3340,6 +3340,79 @@ Order has customer.
         release_impl(h);
     }
 
+    /// #837 / #836 update-path — when `update:Task` flips a primary
+    /// fact that participates in a derivation rule's antecedent, stale
+    /// derived consequents from a prior forward-chain must be cleared
+    /// before the LFP recomputes. Without `update_via_defs`'s
+    /// derived-cell drop (command.rs:1075), forward_chain's monotonic
+    /// add-only behavior leaves the old derived facts in place — the
+    /// engine no longer reflects the current primary state.
+    ///
+    /// Scenario: Task 2 blocks Task 1; both pending. After re_derive
+    /// the blocked rule fires, so Task_has_Task_Readiness contains
+    /// Task=1 with Readiness='blocked'. Updating Task 2 to 'completed'
+    /// invalidates the rule's antecedent (Task 2 is no longer pending),
+    /// so the post-update cell must be empty. Without the LFP-clear
+    /// the stale 'blocked' fact persists.
+    #[test]
+    fn update_clears_stale_derived_consequents_before_forward_chain() {
+        let h = create_bare_impl();
+        let readings = "\
+Task(.id) is an entity type.
+Task Status is a value type.
+Task Readiness is a value type.
+Task has Task Status.
+Task has Task Readiness.
+Task blocks Task.
+Task '1' has Task Status 'pending'.
+Task '2' has Task Status 'pending'.
+Task '2' blocks Task '1'.
+Task1 has Task Readiness 'blocked' iff Task2 blocks Task1 and Task2 has Task Status 'pending'.
+";
+        let compile_out = system_impl(h, "compile", readings);
+        assert!(!compile_out.starts_with('⊥'),
+            "compile must not reject Tasks/blocked-rule schema; got: {compile_out}");
+
+        // Pre-condition: forward-chain populates the derived consequent.
+        let _ = system_impl(h, "re_derive", "");
+        let pre = peek(h).expect("handle live after compile + re_derive");
+        let pre_readiness = ast::fetch_or_phi("Task_has_Task_Readiness", &pre);
+        let pre_blocked: Vec<String> = pre_readiness.as_seq()
+            .map(|s| s.iter().filter_map(|f| {
+                let task = ast::binding(f, "Task")?.to_string();
+                let r = ast::binding(f, "Task Readiness")?;
+                (r == "blocked").then_some(task)
+            }).collect()).unwrap_or_default();
+        assert!(pre_blocked.contains(&"1".to_string()),
+            "re_derive must derive Task=1 Readiness='blocked' from the pending+blocks state; \
+             got blocked={pre_blocked:?}");
+
+        // Update flips Task 2's antecedent fact.
+        let upd_out = system_impl(h, "update:Task",
+            "<<id, 2>, <Task Status, completed>>");
+        assert!(!upd_out.starts_with('⊥'),
+            "update:Task must succeed when flipping Status pending→completed; got: {upd_out}");
+
+        // Post-condition: the blocked-rule no longer fires (Task 2's
+        // status is no longer 'pending'), so Task_has_Task_Readiness
+        // must not retain Task=1 with Readiness='blocked'.
+        let post = peek(h).expect("handle live after update");
+        let post_readiness = ast::fetch_or_phi("Task_has_Task_Readiness", &post);
+        let post_blocked: Vec<String> = post_readiness.as_seq()
+            .map(|s| s.iter().filter_map(|f| {
+                let task = ast::binding(f, "Task")?.to_string();
+                let r = ast::binding(f, "Task Readiness")?;
+                (r == "blocked").then_some(task)
+            }).collect()).unwrap_or_default();
+        assert!(!post_blocked.contains(&"1".to_string()),
+            "after update:Task '2'→completed the blocked rule's antecedent is false; \
+             Task_has_Task_Readiness must not retain Task=1 Readiness='blocked'. \
+             Without the #836 LFP-clear in update_via_defs the stale fact persists. \
+             Got blocked={post_blocked:?}");
+
+        release_impl(h);
+    }
+
     /// Profiling invocation — runs the same create/list/get workload as
     /// `list_and_get_see_runtime_created_entities` with the apply-
     /// variant profiler enabled, then dumps the histogram to stderr.
