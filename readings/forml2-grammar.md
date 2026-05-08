@@ -32,6 +32,8 @@ Quantifier is a value type.
   The possible values of Quantifier are 'each', 'at most one', 'at least one', 'exactly one', 'some', 'no', 'at most', 'at least'.
 Prose Stopword is a value type.
   The possible values of Prose Stopword are 'If', 'When', 'Then', 'That', 'This', 'An', 'A', 'The', 'Each', 'Some', 'No', 'Every'.
+Constraint Span Prefix is a value type.
+  The possible values of Constraint Span Prefix are 'It is obligatory that ', 'It is forbidden that ', 'It is permitted that ', 'Each ', 'each ', 'at most one ', 'exactly one ', 'at least one ', 'some ', 'No ', 'no '.
 Derivation Marker is a value type.
   The possible values of Derivation Marker are 'fully-derived', 'derived-and-stored', 'semi-derived'.
 Derivation Marker Symbol is a value type.

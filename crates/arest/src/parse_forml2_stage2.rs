@@ -369,6 +369,71 @@ impl ProseStopwordTable {
     }
 }
 
+/// #790 — `resolve_constraint_span_ft` strips a closed vocabulary of
+/// deontic / quantifier prefixes from a constraint-span text fragment
+/// before doing FT lookup. The vocabulary lifts from an inline
+/// `.replace().replace()...` cascade into a typed
+/// `ConstraintSpanPrefixTable` reading the `Constraint Span Prefix`
+/// grammar enum declared in `readings/forml2-grammar.md`. Same shape
+/// as `ProseStopwordTable` per #789 and `RingAdjectiveTable` per #791.
+/// The `.replace` semantics (substring replace anywhere, not just
+/// at start) are preserved by `strip_all_inline` — every entry is
+/// removed wherever it occurs in declaration order.
+#[derive(Debug, Clone)]
+pub struct ConstraintSpanPrefixTable {
+    /// The 11 deontic / quantifier prefixes, three cohorts:
+    /// deontic operators ('It is obligatory that ' etc.),
+    /// distributive quantifier ('Each ' / 'each '),
+    /// cardinal/existential/negative ('at most one ' through 'no ').
+    /// Order matches the legacy cascade order in
+    /// `resolve_constraint_schema` so behavior round-trips.
+    pub rows: Vec<String>,
+}
+
+impl ConstraintSpanPrefixTable {
+    /// Boot table — must stay in sync with `Constraint Span Prefix`
+    /// enum-value declaration in `readings/forml2-grammar.md`.
+    pub fn boot() -> Self {
+        ConstraintSpanPrefixTable {
+            rows: alloc::vec![
+                "It is obligatory that ".to_string(),
+                "It is forbidden that ".to_string(),
+                "It is permitted that ".to_string(),
+                "Each ".to_string(),       "each ".to_string(),
+                "at most one ".to_string(), "exactly one ".to_string(),
+                "at least one ".to_string(), "some ".to_string(),
+                "No ".to_string(),          "no ".to_string(),
+            ],
+        }
+    }
+
+    /// Build the table from the runtime `Constraint Span Prefix`
+    /// enum-value declaration. Falls back to `boot()` when the cell
+    /// is empty (bare engine, no metamodel loaded).
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_enum_values(state, "Constraint Span Prefix");
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            ConstraintSpanPrefixTable { rows }
+        }
+    }
+
+    /// Iterate the prefixes in declaration order.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.rows.iter().map(|s| s.as_str())
+    }
+
+    /// Apply every prefix as a substring `replace_all` in declaration
+    /// order. Mirrors the legacy `.replace(...).replace(...)` cascade
+    /// — substring replace anywhere, not just at start. Returns the
+    /// fully-stripped text.
+    pub fn strip_all(&self, text: &str) -> String {
+        self.rows.iter().fold(text.to_string(),
+            |acc, prefix| acc.replace(prefix.as_str(), ""))
+    }
+}
+
 /// #791 — `strip_ring_annotation` recognizes a closed 8-token
 /// vocabulary of bare ring adjectives — `irreflexive`, `asymmetric`,
 /// `antisymmetric`, `symmetric`, `intransitive`, `transitive`,
@@ -1091,14 +1156,11 @@ fn resolve_constraint_span_ft(
     };
     // Strip deontic / quantifier prefixes that precede the noun-verb-noun
     // backbone. Order matches legacy's `resolve_constraint_schema`.
-    let stripped = stripped
-        .replace("It is obligatory that ", "")
-        .replace("It is forbidden that ", "")
-        .replace("It is permitted that ", "")
-        .replace("Each ", "").replace("each ", "")
-        .replace("at most one ", "").replace("exactly one ", "")
-        .replace("at least one ", "").replace("some ", "")
-        .replace("No ", "").replace("no ", "");
+    // #790 — vocabulary lifts to ConstraintSpanPrefixTable so the data
+    // lives in `readings/forml2-grammar.md` rather than as a cascade
+    // here. boot() falls back to the historic 11-prefix list when the
+    // bare engine has no metamodel loaded.
+    let stripped = ConstraintSpanPrefixTable::boot().strip_all(&stripped);
 
     // #326: strip digit subscripts (`Noun1`, `Noun2` → `Noun`) so
     // conditional ring shapes like "If Noun1 is subtype of Noun2 …
@@ -4185,7 +4247,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 33, "noun count");
+        assert_eq!(noun_count, 34, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -4197,7 +4259,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 22, "enum-valued noun count");
+        assert_eq!(enum_count, 23, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -5996,6 +6058,70 @@ mod tests {
         let table = super::RingAdjectiveTable::from_grammar_state(&state);
         assert_eq!(table.rows.len(), 8,
             "empty grammar state falls back to the 8-adjective boot table");
+    }
+
+    // ─── #790: constraint span prefix table ──────────────────────────
+
+    /// #790 — `resolve_constraint_span_ft` strips deontic / quantifier
+    /// prefixes via a `.replace(...).replace(...)` cascade. Eleven
+    /// prefixes in three cohorts (deontic, distributive, cardinal/
+    /// existential/negative). Lift mirrors `ProseStopwordTable` /
+    /// `RingAdjectiveTable`. Boot order matches the legacy cascade.
+    #[test]
+    fn constraint_span_prefix_table_boot_has_eleven_prefixes_in_cascade_order() {
+        let table = super::ConstraintSpanPrefixTable::boot();
+        let prefixes: Vec<&str> = table.iter().collect();
+        assert_eq!(prefixes, vec![
+            "It is obligatory that ",
+            "It is forbidden that ",
+            "It is permitted that ",
+            "Each ", "each ",
+            "at most one ", "exactly one ",
+            "at least one ", "some ",
+            "No ", "no ",
+        ],
+        "boot table must mirror legacy resolve_constraint_schema cascade \
+         order so constraint-span FT resolution behaves identically before \
+         and after the lift.");
+    }
+
+    /// #790 — `strip_all` preserves `.replace` semantics (substring
+    /// replace anywhere, not just at start). Each prefix is removed
+    /// wherever it occurs in the input.
+    #[test]
+    fn constraint_span_prefix_table_strip_all_replaces_substrings_in_order() {
+        let table = super::ConstraintSpanPrefixTable::boot();
+        assert_eq!(
+            table.strip_all("Each Foo has at most one Bar"),
+            "Foo has Bar",
+            "leading Each + interior 'at most one ' both stripped");
+        assert_eq!(
+            table.strip_all("It is obligatory that some Foo bars Baz"),
+            "Foo bars Baz",
+            "deontic + existential prefixes both stripped");
+        assert_eq!(
+            table.strip_all("Foo bars Baz"),
+            "Foo bars Baz",
+            "no-prefix input round-trips unchanged");
+    }
+
+    /// #790 — when state's EnumValues cell carries Constraint Span
+    /// Prefix values, from_grammar_state lifts them at runtime.
+    #[test]
+    fn constraint_span_prefix_table_from_grammar_state_reads_enum_values() {
+        let state = synthetic_enum_state(&[
+            ("Constraint Span Prefix", &["foo ", "bar "]),
+        ]);
+        let table = super::ConstraintSpanPrefixTable::from_grammar_state(&state);
+        assert_eq!(table.rows, vec!["foo ", "bar "]);
+    }
+
+    #[test]
+    fn constraint_span_prefix_table_falls_back_to_boot_on_empty_state() {
+        let state = synthetic_enum_state(&[]);
+        let table = super::ConstraintSpanPrefixTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 11,
+            "empty grammar state falls back to the 11-prefix boot table");
     }
 
     // ─── #833 layer 5: set constraint kind table ──────────────────────
