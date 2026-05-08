@@ -380,6 +380,36 @@ impl SetConstraintKindTable {
 /// rule name declared in the readings parallel-enum.
 pub type SetConstraintArbitrationFn = fn(text: &str, declared_nouns: &[String], idx: &StmtIndex, stmt_id: &str) -> bool;
 
+/// Translator pre-gate predicate: returns `true` when the Statement
+/// should be skipped before the translator's per-kind dispatch. Used
+/// uniformly across all of a translator's kinds (e.g. cardinality's
+/// "skip if Derivation Rule" applies to FC + UC + MC alike).
+pub type CardinalityArbitrationFn = fn(state: &Object, idx: &StmtIndex, stmt_id: &str) -> bool;
+
+/// Skip when the Statement is also classified as Derivation Rule —
+/// `iff` makes the whole sentence a rule even when it incidentally
+/// contains a quantifier.
+fn skip_card_on_derivation_rule(_state: &Object, idx: &StmtIndex, stmt_id: &str) -> bool {
+    classifications_contains(idx, stmt_id, "Derivation Rule")
+}
+
+/// Skip when the Statement carries a Deontic Operator (`It is
+/// forbidden/obligatory/permitted that …`) — the inner quantifier
+/// is part of a deontic over the body, not an alethic UC/MC.
+fn skip_card_on_deontic_operator(state: &Object, _idx: &StmtIndex, stmt_id: &str) -> bool {
+    deontic_operator_for(state, stmt_id).is_some()
+}
+
+/// Registry of cardinality pre-gate name → predicate. Both predicates
+/// are uniform skip rules applied before the per-kind FC/UC/MC
+/// dispatch in translate_cardinality_constraints.
+pub fn cardinality_arbitration_registry() -> hashbrown::HashMap<&'static str, CardinalityArbitrationFn> {
+    let mut m: hashbrown::HashMap<&'static str, CardinalityArbitrationFn> = hashbrown::HashMap::new();
+    m.insert("derivation_rule_wins", skip_card_on_derivation_rule as CardinalityArbitrationFn);
+    m.insert("deontic_operator_wins", skip_card_on_deontic_operator as CardinalityArbitrationFn);
+    m
+}
+
 /// Skip when the Statement is also classified as Derivation Rule.
 /// Used for EQ / XO / OR / XC where the `iff` keyword that produces
 /// these classifications also produces a Derivation Rule
@@ -2324,24 +2354,21 @@ fn antecedent_distinct_nouns(text: &str, declared: &[String]) -> usize {
 /// `translate_ring_constraints`.
 pub fn translate_cardinality_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     let kind_table = CardinalityConstraintKindTable::boot();
+    let arbitration_registry = cardinality_arbitration_registry();
     let statement_ids = collect_statement_ids(idx);
     let mut out: Vec<Object> = Vec::new();
     for stmt_id in statement_ids.iter() {
-        // A Statement classified as Derivation Rule never contributes
-        // a cardinality Constraint — the `iff` keyword makes the whole
-        // sentence a rule, even when it incidentally contains a `some`
-        // quantifier inside an antecedent clause.
-        if classifications_contains(idx,stmt_id, "Derivation Rule") { continue; }
-        // Same exclusion applies for deontic constraints: a sentence
-        // carrying `It is forbidden/obligatory/permitted that …` is a
-        // deontic over the body's fact pattern, NOT an alethic UC/MC
-        // over its inner quantifier. Without this guard a shape like
-        // `It is forbidden that some User approves X` would surface
-        // both an MC alethic constraint (from the inner `some`
-        // quantifier) and a deontic constraint — and consumers
-        // reading the Constraint cell would treat the alethic MC as
-        // an obligation, the opposite of the author's intent.
-        if deontic_operator_for(classified_state, stmt_id).is_some() { continue; }
+        // Apply every registered cardinality pre-gate predicate
+        // uniformly: if any rule says skip, defer to whichever
+        // translator owns the Statement. The two registered rules
+        // are 'derivation_rule_wins' (DR's iff makes the whole
+        // sentence a rule, even with a 'some' quantifier inside an
+        // antecedent) and 'deontic_operator_wins' (a sentence
+        // carrying It is forbidden/obligatory/permitted... is a
+        // deontic over the body, not an alethic UC/MC).
+        let skip = arbitration_registry.values()
+            .any(|rule| rule(classified_state, idx, stmt_id));
+        if skip { continue; }
         // Resolve the kind code from the registry. Order in
         // CardinalityConstraintKindTable::boot() puts FC before UC
         // before MC so FC precedence is preserved when a Statement
@@ -5618,6 +5645,20 @@ mod tests {
         assert_eq!(table.shape_for("obligatory"), Some(("UC", "deontic")));
         assert_eq!(table.shape_for("forbidden"),  Some(("UC", "deontic")));
         assert_eq!(table.shape_for("permitted"),  Some(("UC", "deontic")));
+    }
+
+    // ─── #833 layer 9: cardinality arbitration registry ───────────────
+
+    #[test]
+    fn cardinality_arbitration_registry_has_two_predicates() {
+        let r = super::cardinality_arbitration_registry();
+        assert!(r.contains_key("derivation_rule_wins"),
+            "missing derivation_rule_wins arbitration predicate");
+        assert!(r.contains_key("deontic_operator_wins"),
+            "missing deontic_operator_wins arbitration predicate");
+        assert_eq!(r.len(), 2,
+            "expected exactly 2 cardinality arbitration predicates; got {}",
+            r.len());
     }
 
     // ─── #833 layer 7: translator-name → fn pointer registry ─────────
