@@ -116,6 +116,52 @@ const-folding. Don't use it.
   in the same session — every switch is a cold rebuild.
 - Use `cargo t` (dev-fast) until the stack-overflow is fixed.
 
+## Dispatch-to-data lift recipe (Sweep-1 pattern)
+
+Inline string-literal vocabularies in `parse_forml2_stage2.rs` /
+`compile.rs` are a smell. They lift to typed tables that read from
+the grammar at runtime — same shape, repeated. Six lifts landed
+2026-05 (#789 PROSE_STOPWORDS / #790 ConstraintSpanPrefix / #791
+RingAdjective / #788 DeonticPredicateOperator / #786
+NonCanonicalNegationHint+ConditionalRingPattern / #781 helper).
+
+The shape:
+
+1. **Struct** with `rows: Vec<...>` (or `rows: Vec<(...)>` for
+   multi-column tables).
+2. **`boot()`** — hardcoded fallback in declaration order. The
+   ordering MATTERS when the original was a cascade (`if-let-else`
+   on suffixes, `match` arms with wildcards) — boot must mirror
+   it so behavior round-trips.
+3. **`from_grammar_state(state)`** — read enum values from the
+   `EnumValues` cell of the parsed grammar, fall back to `boot()`
+   when the cell is empty or lengths disagree. Use
+   `read_enum_values` for single-column, `read_parallel_enum_pair`
+   for 2-tuples, `read_parallel_enum_triple` for 3-tuples (#781).
+4. **Domain accessor** — one method that mirrors the legacy
+   inline cascade's API. `contains(word)` for membership,
+   `match_suffix(prefix)` for suffix-strip, `match_signals(...)`
+   for tuple dispatch, etc. Replace the inline call with a
+   one-liner over the accessor.
+5. **Grammar declaration** in `readings/forml2-grammar.md`. Every
+   table needs a corresponding `<Type Name> is a value type. The
+   possible values of <Type Name> are 'a', 'b', ...`. For multi-
+   column tables, multiple parallel value types with matching
+   row counts.
+6. **TDD coverage** — at minimum: boot-has-N-rows-in-declared-
+   order; accessor-returns-correct-result; from_grammar_state-
+   reads-parallel-enums; falls-back-to-boot-on-empty-state.
+7. **Bump `bootstrap_grammar_covers_expected_shapes`** — every
+   new value type bumps the noun count + enum-valued-noun count.
+   Test failure is the canary that you forgot the grammar
+   declaration.
+
+Wildcards in source matches lift cleanly via `Option<bool>`
+(see ConditionalRingPatternTable in #786 — Some(b) = required,
+None = wildcard). Skip `from_grammar_state` for wildcard tables
+unless multiple callers need it (parallel-enum representation
+of wildcards is awkward).
+
 ## Things to remember beyond this file
 
 Per user's global CLAUDE.md: no memory system; use AREST MCP in local
