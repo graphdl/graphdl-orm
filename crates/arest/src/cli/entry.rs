@@ -630,6 +630,43 @@ pub fn main_entry() {
                 let compile_defs = crate::compile::compile_to_defs_state(&state);
                 let d = ast::defs_to_state(&compile_defs, &d);
 
+                // #836 — drop derived consequent cells before forward-
+                // chain so the LFP recomputes from primary facts. Per
+                // AREST.tex §4.3: "Derivation: forward chaining,
+                // monotonic, evaluated to the least fixed point per
+                // request. Derivation only adds facts over finite P;
+                // the fixed point exists by Knaster-Tarski and is
+                // reached in ≤ |P_max|-|P| steps." Without this step,
+                // cor:closure preserves derived facts whose primary
+                // support has changed, leaving stale conclusions in
+                // the population (the #772 stuck-blocked symptom).
+                let derived_cells: hashbrown::HashSet<String> = {
+                    let mut out: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+                    let drule_cell = ast::fetch_or_phi("DerivationRule", &d);
+                    if let Some(facts) = drule_cell.as_seq() {
+                        for fact in facts.iter() {
+                            let Some(encoded) = ast::binding(fact, "consequentFactTypeId") else { continue };
+                            let cell_name = crate::types::ConsequentCellSource::decode(encoded)
+                                .literal_id().to_string();
+                            if !cell_name.is_empty() { out.insert(cell_name); }
+                        }
+                    }
+                    out
+                };
+                let d = if derived_cells.is_empty() { d } else {
+                    eprintln!("[load] dropping {} derived cells before forward-chain (LFP per request, #836): {:?}",
+                        derived_cells.len(), derived_cells);
+                    let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+                    for (name, contents) in ast::cells_iter(&d).into_iter() {
+                        if derived_cells.contains(name) {
+                            new_map.insert(name.to_string(), ast::Object::phi());
+                        } else {
+                            new_map.insert(name.to_string(), contents.clone());
+                        }
+                    }
+                    ast::Object::Map(new_map)
+                };
+
                 // Forward-chain over user `derivation:rule_*` defs to
                 // materialize derived FT cells (e.g.
                 // `Task has Task Readiness 'ready' iff Task has Task
