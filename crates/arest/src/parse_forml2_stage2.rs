@@ -4175,7 +4175,9 @@ mod tests {
     /// parallel-enum `Set Constraint Arbitration Rule` so each set
     /// constraint kind names the predicate that decides whether
     /// translate_set_constraints emits or defers — bumping noun=31,
-    /// enum=20.
+    /// enum=20. #789 added `Prose Stopword` enum (12 values) — bumping
+    /// noun=32, enum=21. #791 added `Ring Adjective` enum (8 values)
+    /// — bumping noun=33, enum=22.
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
@@ -4183,7 +4185,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 31, "noun count");
+        assert_eq!(noun_count, 33, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -4195,7 +4197,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 20, "enum-valued noun count");
+        assert_eq!(enum_count, 22, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
