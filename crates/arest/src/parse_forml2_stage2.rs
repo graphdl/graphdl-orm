@@ -536,21 +536,17 @@ impl SetConstraintKindTable {
     /// `Set Constraint Kind Code` / `Set Constraint Arbitration Rule`
     /// enum-value declarations. Falls back to `boot()` on any mismatch.
     pub fn from_grammar_state(state: &Object) -> Self {
-        let kinds = read_enum_values(state, "Set Constraint Kind");
-        let codes = read_enum_values(state, "Set Constraint Kind Code");
-        let rules = read_enum_values(state, "Set Constraint Arbitration Rule");
-        if kinds.len() == codes.len()
-            && kinds.len() == rules.len()
-            && !kinds.is_empty()
-        {
-            let rows = kinds.into_iter()
-                .zip(codes)
-                .zip(rules)
-                .map(|((k, c), r)| (k, c, r))
-                .collect();
-            SetConstraintKindTable { rows }
-        } else {
-            Self::boot()
+        // #781: 3-tuple parallel-enum read via the shared helper so
+        // future 3-tuple tables can reuse the same length-check +
+        // zip + fallback semantics.
+        match read_parallel_enum_triple(
+            state,
+            "Set Constraint Kind",
+            "Set Constraint Kind Code",
+            "Set Constraint Arbitration Rule",
+        ) {
+            Some(rows) => SetConstraintKindTable { rows },
+            None => Self::boot(),
         }
     }
 
@@ -826,6 +822,35 @@ fn read_parallel_enum_pair(
     let right = read_enum_values(state, right_type);
     if left.len() == right.len() && !left.is_empty() {
         Some(left.into_iter().zip(right).collect())
+    } else {
+        None
+    }
+}
+
+/// Read three parallel enum-value lists and zip them index-wise.
+/// Returns `None` if any list is empty or the lengths don't match;
+/// callers fall back to `boot()` so a missing or malformed declaration
+/// can't silently truncate the table. #781 — same shape as
+/// `read_parallel_enum_pair` for the 3-tuple case (kind / code /
+/// arbitration-rule). Used by `SetConstraintKindTable::from_grammar_state`.
+fn read_parallel_enum_triple(
+    state: &Object,
+    first_type: &str,
+    second_type: &str,
+    third_type: &str,
+) -> Option<Vec<(String, String, String)>> {
+    let first = read_enum_values(state, first_type);
+    let second = read_enum_values(state, second_type);
+    let third = read_enum_values(state, third_type);
+    if first.len() == second.len()
+        && first.len() == third.len()
+        && !first.is_empty()
+    {
+        Some(first.into_iter()
+            .zip(second)
+            .zip(third)
+            .map(|((a, b), c)| (a, b, c))
+            .collect())
     } else {
         None
     }
@@ -6155,6 +6180,53 @@ mod tests {
         ]);
         let table = super::SetConstraintKindTable::from_grammar_state(&state);
         assert_eq!(table.rows.len(), 5);
+    }
+
+    // ─── #781: read_parallel_enum_triple ─────────────────────────────
+
+    /// #781 — `read_parallel_enum_triple` mirrors the existing
+    /// `read_parallel_enum_pair` for the 3-tuple case used by
+    /// `SetConstraintKindTable::from_grammar_state`. Returns Some
+    /// when all three lists exist, are equal-length, and non-empty;
+    /// returns None otherwise so callers can fall back to boot().
+    #[test]
+    fn read_parallel_enum_triple_returns_zipped_when_lengths_match() {
+        let state = synthetic_enum_state(&[
+            ("First",  &["a", "b", "c"]),
+            ("Second", &["A", "B", "C"]),
+            ("Third",  &["1", "2", "3"]),
+        ]);
+        let triples = super::read_parallel_enum_triple(&state, "First", "Second", "Third");
+        assert_eq!(triples, Some(vec![
+            ("a".to_string(), "A".to_string(), "1".to_string()),
+            ("b".to_string(), "B".to_string(), "2".to_string()),
+            ("c".to_string(), "C".to_string(), "3".to_string()),
+        ]));
+    }
+
+    #[test]
+    fn read_parallel_enum_triple_returns_none_on_length_mismatch() {
+        let state = synthetic_enum_state(&[
+            ("First",  &["a", "b"]),
+            ("Second", &["A", "B", "C"]),
+            ("Third",  &["1", "2"]),
+        ]);
+        let triples = super::read_parallel_enum_triple(&state, "First", "Second", "Third");
+        assert_eq!(triples, None,
+            "mismatched lengths must return None so callers fall back to boot()");
+    }
+
+    #[test]
+    fn read_parallel_enum_triple_returns_none_when_any_list_empty() {
+        let state = synthetic_enum_state(&[
+            ("First",  &["a"]),
+            ("Second", &[]),
+            ("Third",  &["1"]),
+        ]);
+        let triples = super::read_parallel_enum_triple(&state, "First", "Second", "Third");
+        assert_eq!(triples, None,
+            "any empty list means the parallel-enum declaration is incomplete; \
+             return None so callers fall back to boot()");
     }
 
     #[test]
