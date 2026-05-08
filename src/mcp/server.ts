@@ -65,6 +65,7 @@ import {
 } from './mutation-context.js'
 import { tutorSystemCall, resetSandbox, parseEngineRaw } from './tutor-sandbox.js'
 import { resolveArestCli } from './cli-resolver.js'
+import { checkCliStaleness } from './cli-staleness.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(__dirname, '..', '..')
@@ -1835,6 +1836,14 @@ async function main() {
   await server.connect(transport)
   // eslint-disable-next-line no-console
   console.error(`AREST MCP server started — mode=${AREST_MODE}${AREST_MODE === 'remote' ? ` url=${AREST_URL}` : ` app=${activeApp.name}`}${AREST_DEBUG ? ' [DEBUG]' : ''}`)
+  // #842: warn if AREST_CLI is older than crates/arest/src — agent
+  // edited engine source but rebuilt the wrong artifact (or didn't
+  // rebuild at all). Local mode only; remote/cloudflare uses HTTP/WASM.
+  if (AREST_MODE === 'local') {
+    const srcDir = resolve(REPO_ROOT, 'crates', 'arest', 'src')
+    const stale = checkCliStaleness(AREST_CLI, srcDir)
+    if (stale) console.error(`[arest-mcp warning] ${stale}`)
+  }
 }
 
 main().catch((err) => {
