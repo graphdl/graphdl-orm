@@ -34,6 +34,12 @@ Prose Stopword is a value type.
   The possible values of Prose Stopword are 'If', 'When', 'Then', 'That', 'This', 'An', 'A', 'The', 'Each', 'Some', 'No', 'Every'.
 Constraint Span Prefix is a value type.
   The possible values of Constraint Span Prefix are 'It is obligatory that ', 'It is forbidden that ', 'It is permitted that ', 'Each ', 'each ', 'at most one ', 'exactly one ', 'at least one ', 'some ', 'No ', 'no '.
+Deontic Predicate Operator is a value type.
+  The possible values of Deontic Predicate Operator are ' ends with', ' does not end with', ' starts with', ' does not start with'.
+Deontic Predicate Operator Kind is a value type.
+  The possible values of Deontic Predicate Operator Kind are 'ends_with', 'ends_with', 'starts_with', 'starts_with'.
+Deontic Predicate Operator Negated is a value type.
+  The possible values of Deontic Predicate Operator Negated are 'false', 'true', 'false', 'true'.
 Derivation Marker is a value type.
   The possible values of Derivation Marker are 'fully-derived', 'derived-and-stored', 'semi-derived'.
 Derivation Marker Symbol is a value type.

@@ -498,6 +498,76 @@ impl RingAdjectiveTable {
     }
 }
 
+/// #788 — `parse_deontic_text_predicate` matches one of four suffixes
+/// on a deontic-constraint prefix (` ends with`, ` does not end with`,
+/// ` starts with`, ` does not start with`) and decodes (kind, negated).
+/// The 4-suffix cascade lifts to a 3-tuple typed table mirroring
+/// `SetConstraintKindTable` per #781 — same parallel-enum shape, same
+/// boot/from_grammar_state/iter pattern, plus a `match_suffix` accessor
+/// for the per-call use site.
+#[derive(Debug, Clone)]
+pub struct DeonticPredicateOperatorTable {
+    /// Triples of `(suffix, kind, negated)`. Suffix carries its leading
+    /// space so `match_suffix` matches the same `prefix.strip_suffix(...)`
+    /// shape the legacy cascade used. Kind values are the canonical
+    /// `DeonticPredicate` discriminant tags ('ends_with' / 'starts_with').
+    /// Negated parses from string 'true' / 'false'.
+    pub rows: Vec<(String, String, bool)>,
+}
+
+impl DeonticPredicateOperatorTable {
+    /// Boot table — must stay in sync with the parallel
+    /// `Deontic Predicate Operator` / `Deontic Predicate Operator Kind`
+    /// / `Deontic Predicate Operator Negated` enum-value declarations
+    /// in `readings/forml2-grammar.md`.
+    pub fn boot() -> Self {
+        DeonticPredicateOperatorTable {
+            rows: alloc::vec![
+                (" ends with".to_string(),           "ends_with".to_string(),   false),
+                (" does not end with".to_string(),   "ends_with".to_string(),   true),
+                (" starts with".to_string(),         "starts_with".to_string(), false),
+                (" does not start with".to_string(), "starts_with".to_string(), true),
+            ],
+        }
+    }
+
+    /// Build the table from the runtime parallel-enum declarations.
+    /// Falls back to `boot()` when any list is empty or lengths
+    /// disagree — matches the contract from `read_parallel_enum_triple`.
+    pub fn from_grammar_state(state: &Object) -> Self {
+        match read_parallel_enum_triple(
+            state,
+            "Deontic Predicate Operator",
+            "Deontic Predicate Operator Kind",
+            "Deontic Predicate Operator Negated",
+        ) {
+            Some(triples) => DeonticPredicateOperatorTable {
+                rows: triples.into_iter().map(|(suffix, kind, negated)| {
+                    (suffix, kind, negated == "true")
+                }).collect(),
+            },
+            None => Self::boot(),
+        }
+    }
+
+    /// Iterate `(suffix, kind, negated)` triples in declaration order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str, bool)> {
+        self.rows.iter().map(|(s, k, n)| (s.as_str(), k.as_str(), *n))
+    }
+
+    /// Try each suffix in declaration order; on first match return
+    /// `(prefix-without-suffix, kind, negated)`. Mirrors the legacy
+    /// `prefix.strip_suffix(...)` cascade in `parse_deontic_text_predicate`.
+    pub fn match_suffix<'a>(&self, prefix: &'a str) -> Option<(&'a str, &str, bool)> {
+        for (suffix, kind, negated) in self.rows.iter() {
+            if let Some(rest) = prefix.strip_suffix(suffix.as_str()) {
+                return Some((rest.trim_end(), kind.as_str(), *negated));
+            }
+        }
+        None
+    }
+}
+
 /// Stage-2 set constraint kind dispatch — `<classification-kind>` →
 /// ORM 2 set-constraint kind code + arbitration-rule name. Mirrors
 /// `CardinalityConstraintKindTable` plus a third column for the
@@ -2780,18 +2850,11 @@ fn parse_deontic_text_predicate(text: &str) -> Option<crate::types::DeonticPredi
     if literal.is_empty() { return None; }
 
     let prefix = trimmed[..prev_quote].trim_end();
-    // Match one of the four shapes by suffix on the prefix.
-    let (op_kind, negated, head_end) = if let Some(h) = prefix.strip_suffix(" ends with") {
-        ("ends_with", false, h.trim_end())
-    } else if let Some(h) = prefix.strip_suffix(" does not end with") {
-        ("ends_with", true, h.trim_end())
-    } else if let Some(h) = prefix.strip_suffix(" starts with") {
-        ("starts_with", false, h.trim_end())
-    } else if let Some(h) = prefix.strip_suffix(" does not start with") {
-        ("starts_with", true, h.trim_end())
-    } else {
-        return None;
-    };
+    // #788 — match one of the four shapes via DeonticPredicateOperatorTable.
+    // boot() carries the historic suffix cascade; future additions
+    // (matches/contains/gt/lt) land as enum-value rows in readings.
+    let table = DeonticPredicateOperatorTable::boot();
+    let (head_end, op_kind, negated) = table.match_suffix(prefix)?;
 
     // Role = the lowercase token sitting in `has a <role> that` /
     // `has <role> that` immediately before the predicate. The shapes
@@ -4272,7 +4335,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 34, "noun count");
+        assert_eq!(noun_count, 37, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -4284,7 +4347,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 23, "enum-valued noun count");
+        assert_eq!(enum_count, 26, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -6227,6 +6290,94 @@ mod tests {
         assert_eq!(triples, None,
             "any empty list means the parallel-enum declaration is incomplete; \
              return None so callers fall back to boot()");
+    }
+
+    // ─── #788: deontic predicate operator table ──────────────────────
+
+    /// #788 — `parse_deontic_text_predicate` matches one of four
+    /// suffixes on a deontic-constraint prefix (` ends with`,
+    /// ` does not end with`, ` starts with`, ` does not start with`)
+    /// and decodes (kind, negated). The 4-suffix cascade lifts to
+    /// `DeonticPredicateOperatorTable` mirroring `SetConstraintKindTable`'s
+    /// 3-tuple shape per #781.
+    #[test]
+    fn deontic_predicate_operator_table_boot_has_four_rows_in_match_order() {
+        let table = super::DeonticPredicateOperatorTable::boot();
+        let rows: Vec<(&str, &str, bool)> = table.iter().collect();
+        assert_eq!(rows, vec![
+            (" ends with",          "ends_with",   false),
+            (" does not end with",  "ends_with",   true),
+            (" starts with",        "starts_with", false),
+            (" does not start with","starts_with", true),
+        ],
+        "boot table must mirror the historic strip_suffix cascade in \
+         parse_deontic_text_predicate so behavior round-trips.");
+    }
+
+    /// #788 — `match_suffix` returns the (kind, negated) for the first
+    /// matching suffix, mirroring strip_suffix cascade semantics.
+    #[test]
+    fn deontic_predicate_operator_table_match_suffix_finds_kind_and_negation() {
+        let table = super::DeonticPredicateOperatorTable::boot();
+        // Positive ends_with case.
+        let (rest, kind, neg) = table.match_suffix("each Foo has a name that ends with")
+            .expect("match");
+        assert_eq!((rest, kind, neg),
+            ("each Foo has a name that", "ends_with", false));
+        // Negated ends_with case — must not match the shorter ` ends with` first.
+        let (rest, kind, neg) = table.match_suffix("each Foo has a name that does not end with")
+            .expect("match");
+        assert_eq!((rest, kind, neg),
+            ("each Foo has a name that", "ends_with", true));
+        // starts_with cases.
+        let (rest, kind, neg) = table.match_suffix("Foo has code that starts with")
+            .expect("match");
+        assert_eq!((rest, kind, neg),
+            ("Foo has code that", "starts_with", false));
+        let (rest, kind, neg) = table.match_suffix("Foo has code that does not start with")
+            .expect("match");
+        assert_eq!((rest, kind, neg),
+            ("Foo has code that", "starts_with", true));
+        // Non-match returns None.
+        assert!(table.match_suffix("Foo has code that contains").is_none(),
+            "unrecognised suffix yields None");
+    }
+
+    #[test]
+    fn deontic_predicate_operator_table_from_grammar_state_reads_parallel_enums() {
+        let state = synthetic_enum_state(&[
+            ("Deontic Predicate Operator", &[
+                " ends with", " does not end with",
+                " starts with", " does not start with"]),
+            ("Deontic Predicate Operator Kind", &[
+                "ends_with", "ends_with",
+                "starts_with", "starts_with"]),
+            ("Deontic Predicate Operator Negated", &[
+                "false", "true", "false", "true"]),
+        ]);
+        let table = super::DeonticPredicateOperatorTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 4);
+    }
+
+    #[test]
+    fn deontic_predicate_operator_table_falls_back_to_boot_on_empty_state() {
+        let state = synthetic_enum_state(&[]);
+        let table = super::DeonticPredicateOperatorTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 4,
+            "empty grammar state falls back to the 4-row boot table");
+    }
+
+    #[test]
+    fn deontic_predicate_operator_table_from_real_grammar_loads_four_rows() {
+        let state = grammar_state();
+        let table = super::DeonticPredicateOperatorTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 4,
+            "real forml2-grammar.md must declare all four operator/kind/negated rows");
+        // Round-trip: real grammar declarations should produce the
+        // same rows as boot() so behavior matches the legacy cascade.
+        let boot_rows = super::DeonticPredicateOperatorTable::boot().rows;
+        assert_eq!(table.rows, boot_rows,
+            "grammar-loaded rows must match boot fallback exactly");
     }
 
     #[test]
