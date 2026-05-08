@@ -568,6 +568,129 @@ impl DeonticPredicateOperatorTable {
     }
 }
 
+/// #786 — `encode_conditional_ring_pattern` fails closed when the
+/// consequent contains common English negation prose that ISN'T one
+/// of the canonical FORML2 / NORMA / Halpin markers. The 10-hint list
+/// lifts to a typed table mirroring `ProseStopwordTable` per #789.
+#[derive(Debug, Clone)]
+pub struct NonCanonicalNegationHintTable {
+    /// Whitespace-padded hint substrings checked anywhere in the
+    /// consequent. Order matches the historic const.
+    pub rows: Vec<String>,
+}
+
+impl NonCanonicalNegationHintTable {
+    /// Boot table — must stay in sync with the
+    /// `Non Canonical Negation Hint` enum-value declaration in
+    /// `readings/forml2-grammar.md`.
+    pub fn boot() -> Self {
+        NonCanonicalNegationHintTable {
+            rows: alloc::vec![
+                " does not ".to_string(),  " do not ".to_string(),  " did not ".to_string(),
+                " cannot ".to_string(),    " can not ".to_string(),
+                " must not ".to_string(),  " will not ".to_string(), " would not ".to_string(),
+                " never ".to_string(),     " no longer ".to_string(),
+            ],
+        }
+    }
+
+    /// Build from runtime `Non Canonical Negation Hint` enum-value
+    /// declaration. Falls back to `boot()` when the cell is empty.
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_enum_values(state, "Non Canonical Negation Hint");
+        if rows.is_empty() { Self::boot() } else { NonCanonicalNegationHintTable { rows } }
+    }
+
+    /// Iterate hints in declaration order.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.rows.iter().map(|s| s.as_str())
+    }
+
+    /// True if any hint occurs as a substring of `text`. Mirrors the
+    /// legacy `NON_CANONICAL_NEGATION_HINTS.iter().any(|n| consequent.contains(n))`
+    /// semantics.
+    pub fn any_match(&self, text: &str) -> bool {
+        self.rows.iter().any(|hint| text.contains(hint.as_str()))
+    }
+}
+
+/// #786 — `encode_conditional_ring_pattern` dispatches a 5-tuple of
+/// boolean signals (has_and, impossible, itself_in_consequent,
+/// is_not_in_antecedent, is_not_in_consequent) to one of seven
+/// `Conditional Ring Pattern` names. The legacy match arms include
+/// wildcards (`_`); this table preserves them as `Option<bool>`:
+/// `Some(b)` = required match, `None` = wildcard. The matcher picks
+/// the first row whose every `Some(b)` matches the input — same
+/// first-match-wins semantics as the legacy match.
+#[derive(Debug, Clone)]
+pub struct ConditionalRingPatternTable {
+    /// 7 rows of (5-signal mask, pattern-name). Mask order matches
+    /// the function signature: (has_and, impossible,
+    /// itself_in_consequent, is_not_in_antecedent, is_not_in_consequent).
+    pub rows: Vec<([Option<bool>; 5], String)>,
+}
+
+impl ConditionalRingPatternTable {
+    /// Boot table — must stay in sync with the legacy match arms in
+    /// `encode_conditional_ring_pattern`. `from_grammar_state` is
+    /// deferred: representing 5-column wildcard masks as parallel
+    /// enums is awkward and 7 callers don't justify the extra
+    /// scaffolding yet.
+    pub fn boot() -> Self {
+        ConditionalRingPatternTable {
+            rows: alloc::vec![
+                // (true, true, _, true, _) → AT
+                ([Some(true),  Some(true),  None,        Some(true),  None],
+                    "and+impossible+isnot-ante".to_string()),
+                // (true, true, _, false, _) → IT
+                ([Some(true),  Some(true),  None,        Some(false), None],
+                    "and+impossible".to_string()),
+                // (true, false, _, _, _) → TR
+                ([Some(true),  Some(false), None,        None,        None],
+                    "and".to_string()),
+                // (false, true, false, _, _) → AS via "impossible"
+                ([Some(false), Some(true),  Some(false), None,        None],
+                    "impossible".to_string()),
+                // (false, false, false, _, true) → AS via "is not"
+                ([Some(false), Some(false), Some(false), None,        Some(true)],
+                    "isnot-conse".to_string()),
+                // (false, false, true, _, _) → RF
+                ([Some(false), Some(false), Some(true),  None,        None],
+                    "itself-conse".to_string()),
+                // (false, false, false, _, false) → SY
+                ([Some(false), Some(false), Some(false), None,        Some(false)],
+                    "plain".to_string()),
+            ],
+        }
+    }
+
+    /// First-row-match dispatch over the five signals. Returns the
+    /// pattern name if a row matches, None otherwise (e.g. impossible
+    /// combined with itself_in_consequent has no recognised shape).
+    pub fn match_signals(
+        &self,
+        has_and: bool,
+        impossible: bool,
+        itself_in_consequent: bool,
+        is_not_in_antecedent: bool,
+        is_not_in_consequent: bool,
+    ) -> Option<&str> {
+        let input = [
+            has_and, impossible, itself_in_consequent,
+            is_not_in_antecedent, is_not_in_consequent,
+        ];
+        for (mask, name) in self.rows.iter() {
+            if mask.iter().zip(input.iter()).all(|(m, &i)| match m {
+                Some(b) => *b == i,
+                None    => true,
+            }) {
+                return Some(name.as_str());
+            }
+        }
+        None
+    }
+}
+
 /// Stage-2 set constraint kind dispatch — `<classification-kind>` →
 /// ORM 2 set-constraint kind code + arbitration-rule name. Mirrors
 /// `CardinalityConstraintKindTable` plus a third column for the
@@ -2193,42 +2316,27 @@ fn encode_conditional_ring_pattern(
     // violation. Authors using prose like `does not block` or `cannot
     // block` should switch to the canonical trailing-marker form
     // (`<FT> is asymmetric.`) or NORMA's `it is impossible that`.
-    const NON_CANONICAL_NEGATION_HINTS: &[&str] = &[
-        " does not ", " do not ", " did not ",
-        " cannot ", " can not ", " must not ", " will not ", " would not ",
-        " never ", " no longer ",
-    ];
-    let consequent_has_non_canonical_negation = NON_CANONICAL_NEGATION_HINTS
-        .iter().any(|n| consequent.contains(n));
-    if consequent_has_non_canonical_negation
-        && !impossible && !is_not_in_consequent {
+    // #786 — hints lift to NonCanonicalNegationHintTable.
+    let hints = NonCanonicalNegationHintTable::boot();
+    if hints.any_match(consequent) && !impossible && !is_not_in_consequent {
         return None;
     }
 
-    let name = match (has_and, impossible, itself_in_consequent,
-                      is_not_in_antecedent, is_not_in_consequent) {
-        // AT: `If A1 R A2 and A1 is not A2 then impossible A2 R A1`.
-        (true, true, _, true, _)        => "and+impossible+isnot-ante",
-        // IT: `If A1 R A2 and A2 R A3 then impossible A1 R A3`.
-        (true, true, _, false, _)       => "and+impossible",
-        // TR: `If A1 R A2 and A2 R A3 then A1 R A3`.
-        (true, false, _, _, _)          => "and",
-        // AS via "impossible": `If A1 R A2 then it is impossible that
-        // A2 R A1`.
-        (false, true, false, _, _)      => "impossible",
-        // AS via "is not" in consequent: `If Noun1 R Noun2, then
-        // Noun2 is not R Noun1`. Legacy's matrix maps this to `SY`
-        // but the semantic is asymmetry — stage12 matches the
-        // semantic rather than reproduce the legacy matrix bug.
-        (false, false, false, _, true)  => "isnot-conse",
-        // RF: `If A1 R some A2 then A1 R itself`.
-        (false, false, true, _, _)      => "itself-conse",
-        // SY: `If A1 R A2 then A2 R A1`.
-        (false, false, false, _, false) => "plain",
-        // Anything else (e.g. `impossible + itself_in_consequent`) is
-        // not a recognised ring shape.
-        _ => return None,
-    };
+    // #786 — pattern dispatch lifts to ConditionalRingPatternTable
+    // with Option<bool> wildcards preserving the legacy match-arm
+    // semantics (first-row-match wins). Pattern shapes:
+    //   AT: (true, true, _, true, _) → and+impossible+isnot-ante
+    //   IT: (true, true, _, false, _) → and+impossible
+    //   TR: (true, false, _, _, _) → and
+    //   AS via "impossible": (false, true, false, _, _) → impossible
+    //   AS via "is not": (false, false, false, _, true) → isnot-conse
+    //   RF: (false, false, true, _, _) → itself-conse
+    //   SY: (false, false, false, _, false) → plain
+    let table = ConditionalRingPatternTable::boot();
+    let name = table.match_signals(
+        has_and, impossible, itself_in_consequent,
+        is_not_in_antecedent, is_not_in_consequent,
+    )?;
     Some(name.to_string())
 }
 
@@ -4335,7 +4443,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 37, "noun count");
+        assert_eq!(noun_count, 38, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -4347,7 +4455,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 26, "enum-valued noun count");
+        assert_eq!(enum_count, 27, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -6378,6 +6486,90 @@ mod tests {
         let boot_rows = super::DeonticPredicateOperatorTable::boot().rows;
         assert_eq!(table.rows, boot_rows,
             "grammar-loaded rows must match boot fallback exactly");
+    }
+
+    // ─── #786: conditional ring pattern table + non-canonical negation ───
+
+    /// #786 — `encode_conditional_ring_pattern` has two inline
+    /// vocabularies: a 10-hint NON_CANONICAL_NEGATION_HINTS const
+    /// (negation prose that should fail closed instead of falling
+    /// through to `plain`) and a 7-row 5-tuple match that dispatches
+    /// pattern names. Both lift to typed tables.
+    #[test]
+    fn non_canonical_negation_hint_table_boot_has_ten_hints() {
+        let table = super::NonCanonicalNegationHintTable::boot();
+        let hints: Vec<&str> = table.iter().collect();
+        assert_eq!(hints, vec![
+            " does not ", " do not ", " did not ",
+            " cannot ", " can not ", " must not ", " will not ", " would not ",
+            " never ", " no longer ",
+        ],
+        "boot table must mirror the historic NON_CANONICAL_NEGATION_HINTS \
+         const so encode_conditional_ring_pattern fails closed identically.");
+    }
+
+    #[test]
+    fn non_canonical_negation_hint_table_any_match_returns_true_on_substring() {
+        let table = super::NonCanonicalNegationHintTable::boot();
+        assert!(table.any_match("Foo does not bar"),
+            " does not  matches anywhere in the text");
+        assert!(table.any_match("Foo never bar"),
+            " never  matches anywhere in the text (with leading space)");
+        assert!(!table.any_match("Foo bars"),
+            "no negation hint present");
+    }
+
+    /// #786 — pattern dispatch is a 7-row table over 5 boolean
+    /// predicates with wildcards. Each row's signal mask uses
+    /// Option<bool>: Some(b) = required match, None = wildcard. The
+    /// matcher iterates rows in declaration order; first row whose
+    /// every Some(b) matches the input wins, mirroring the legacy
+    /// match arm semantics.
+    #[test]
+    fn conditional_ring_pattern_table_boot_has_seven_rows_in_match_order() {
+        let table = super::ConditionalRingPatternTable::boot();
+        let names: Vec<&str> = table.rows.iter().map(|(_, n)| n.as_str()).collect();
+        assert_eq!(names, vec![
+            "and+impossible+isnot-ante",
+            "and+impossible",
+            "and",
+            "impossible",
+            "isnot-conse",
+            "itself-conse",
+            "plain",
+        ],
+        "boot table row order must mirror the legacy match arm order so \
+         the wildcard cascade behaves identically.");
+    }
+
+    #[test]
+    fn conditional_ring_pattern_table_match_signals_returns_first_matching_row() {
+        let table = super::ConditionalRingPatternTable::boot();
+        // Row 1: (true, true, _, true, _) → "and+impossible+isnot-ante"
+        assert_eq!(table.match_signals(true, true, false, true, false),
+            Some("and+impossible+isnot-ante"));
+        assert_eq!(table.match_signals(true, true, true, true, true),
+            Some("and+impossible+isnot-ante"));
+        // Row 3: (true, false, _, _, _) → "and"
+        assert_eq!(table.match_signals(true, false, false, false, false),
+            Some("and"));
+        // Row 7: (false, false, false, _, false) → "plain"
+        assert_eq!(table.match_signals(false, false, false, false, false),
+            Some("plain"));
+        assert_eq!(table.match_signals(false, false, false, true, false),
+            Some("plain"),
+            "row 7 wildcards on col 3 (is_not_in_antecedent)");
+        // Row 5: (false, false, false, _, true) → "isnot-conse"
+        // Note: row 5 comes BEFORE row 7 so true on col 4 wins
+        assert_eq!(table.match_signals(false, false, false, false, true),
+            Some("isnot-conse"));
+        // Row 6: (false, false, true, _, _) → "itself-conse"
+        assert_eq!(table.match_signals(false, false, true, false, false),
+            Some("itself-conse"));
+        // No row matches: e.g. (false, true, true, _, _) — impossible + itself
+        // is not a recognised ring shape; original returns None via the wildcard.
+        assert_eq!(table.match_signals(false, true, true, false, false), None,
+            "impossible + itself_in_consequent is not a recognised ring shape");
     }
 
     #[test]
