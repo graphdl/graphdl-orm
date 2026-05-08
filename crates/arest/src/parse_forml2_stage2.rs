@@ -369,6 +369,70 @@ impl ProseStopwordTable {
     }
 }
 
+/// #791 — `strip_ring_annotation` recognizes a closed 8-token
+/// vocabulary of bare ring adjectives — `irreflexive`, `asymmetric`,
+/// `antisymmetric`, `symmetric`, `intransitive`, `transitive`,
+/// `acyclic`, `reflexive` — that may appear in a trailing
+/// `(<adjective>)` annotation on a multi-clause conditional ring
+/// shape (e.g., `If some X R some Y then Y R X. (symmetric)`). The
+/// vocabulary lifts from an inline `KINDS` const into a typed table
+/// reading the `Ring Adjective` grammar enum declared in
+/// `readings/forml2-grammar.md`. Mirrors `RingKindTable` (same eight
+/// kinds, but the bare adjective form rather than the `is X` trailing
+/// marker), and the table-shape conventions of `ProseStopwordTable`
+/// per #789.
+#[derive(Debug, Clone)]
+pub struct RingAdjectiveTable {
+    /// The eight bare ring adjectives. Order matches the
+    /// `'irreflexive', 'asymmetric', ...` declaration in
+    /// readings/forml2-grammar.md so future agents can read either
+    /// the const or the grammar and see the same sequence. Note: this
+    /// is NOT the `is X` form (`is irreflexive`) — that lives in
+    /// `Ring Constraint Trailing Marker` and `RingKindTable`.
+    pub rows: Vec<String>,
+}
+
+impl RingAdjectiveTable {
+    /// Boot table — must stay in sync with `Ring Adjective` enum-value
+    /// declaration in `readings/forml2-grammar.md`. Eight bare-form
+    /// adjectives in the same declaration order as the legacy `KINDS`
+    /// const in `strip_ring_annotation`.
+    pub fn boot() -> Self {
+        RingAdjectiveTable {
+            rows: alloc::vec![
+                "irreflexive".to_string(),   "asymmetric".to_string(),
+                "antisymmetric".to_string(), "symmetric".to_string(),
+                "intransitive".to_string(),  "transitive".to_string(),
+                "acyclic".to_string(),       "reflexive".to_string(),
+            ],
+        }
+    }
+
+    /// Build the table from the runtime `Ring Adjective` enum-value
+    /// declaration. Falls back to `boot()` when the cell is empty
+    /// (bare engine, no metamodel loaded).
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_enum_values(state, "Ring Adjective");
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            RingAdjectiveTable { rows }
+        }
+    }
+
+    /// Iterate the adjectives in declaration order.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.rows.iter().map(|s| s.as_str())
+    }
+
+    /// Whole-word case-sensitive membership test. Mirrors the legacy
+    /// `KINDS.iter().any(|k| *k == kind)` semantics in
+    /// `strip_ring_annotation`.
+    pub fn contains(&self, word: &str) -> bool {
+        self.rows.iter().any(|s| s == word)
+    }
+}
+
 /// Stage-2 set constraint kind dispatch — `<classification-kind>` →
 /// ORM 2 set-constraint kind code + arbitration-rule name. Mirrors
 /// `CardinalityConstraintKindTable` plus a third column for the
@@ -1165,11 +1229,12 @@ fn strip_ring_annotation(line: &str) -> Option<&str> {
     let inner = trimmed.strip_suffix(')')?;
     let open_idx = inner.rfind('(')?;
     let kind = inner[open_idx + 1..].trim();
-    const KINDS: &[&str] = &[
-        "irreflexive", "asymmetric", "antisymmetric", "symmetric",
-        "intransitive", "transitive", "acyclic", "reflexive",
-    ];
-    if !KINDS.iter().any(|k| *k == kind) { return None; }
+    // #791 — bare-adjective vocabulary lifts to RingAdjectiveTable
+    // so the data lives in `readings/forml2-grammar.md` rather than
+    // an inline const here. boot() falls back to the historic 8-word
+    // list when the bare engine has no metamodel loaded.
+    let adjectives = RingAdjectiveTable::boot();
+    if !adjectives.contains(kind) { return None; }
     // Caller expects the body to end with `.` — strip the annotation
     // and any whitespace between body-period and open-paren.
     let body = inner[..open_idx].trim_end();
@@ -5869,6 +5934,66 @@ mod tests {
         let table = super::ProseStopwordTable::from_grammar_state(&state);
         assert_eq!(table.rows.len(), 12,
             "empty grammar state falls back to the 12-word boot table");
+    }
+
+    // ─── #791: ring adjective table ──────────────────────────────────
+
+    /// #791 — `strip_ring_annotation` filters trailing `(<adjective>)`
+    /// annotations on ring-constraint conditional shapes. The 8-token
+    /// closed vocabulary (irreflexive, asymmetric, antisymmetric,
+    /// symmetric, intransitive, transitive, acyclic, reflexive) lived
+    /// in an inline const; this lift moves it to a typed
+    /// `RingAdjectiveTable` reading from the `Ring Adjective` grammar
+    /// enum. Boot table preserves declaration order so behavior round-
+    /// trips. Mirrors `RingKindTable` (same eight kinds, but the bare
+    /// adjective form rather than the `is X` trailing marker).
+    #[test]
+    fn ring_adjective_table_boot_has_eight_adjectives_in_declared_order() {
+        let table = super::RingAdjectiveTable::boot();
+        let words: Vec<&str> = table.iter().collect();
+        assert_eq!(words, vec![
+            "irreflexive", "asymmetric", "antisymmetric", "symmetric",
+            "intransitive", "transitive", "acyclic", "reflexive",
+        ],
+        "boot table must mirror the historic `KINDS` const in \
+         strip_ring_annotation, in declaration order, so that \
+         conditional ring-shape annotation parsing behaves identically \
+         before and after the lift.");
+    }
+
+    /// #791 — `contains` is case-sensitive whole-word, matching the
+    /// original `KINDS.iter().any(|k| *k == kind)` semantics.
+    #[test]
+    fn ring_adjective_table_contains_is_case_sensitive_whole_word() {
+        let table = super::RingAdjectiveTable::boot();
+        assert!(table.contains("symmetric"),
+            "lowercase symmetric is the canonical declaration form");
+        assert!(!table.contains("Symmetric"),
+            "title-case is NOT a ring adjective annotation");
+        assert!(!table.contains("symmetrical"),
+            "substring matches are not allowed");
+        assert!(!table.contains(""),
+            "empty string is not a ring adjective");
+    }
+
+    /// #791 — when state's EnumValues cell carries Ring Adjective
+    /// values, from_grammar_state lifts them at runtime. Empty cell
+    /// falls back to boot() so the bare-engine path keeps working.
+    #[test]
+    fn ring_adjective_table_from_grammar_state_reads_enum_values() {
+        let state = synthetic_enum_state(&[
+            ("Ring Adjective", &["foo", "bar", "baz"]),
+        ]);
+        let table = super::RingAdjectiveTable::from_grammar_state(&state);
+        assert_eq!(table.rows, vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn ring_adjective_table_falls_back_to_boot_on_empty_state() {
+        let state = synthetic_enum_state(&[]);
+        let table = super::RingAdjectiveTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 8,
+            "empty grammar state falls back to the 8-adjective boot table");
     }
 
     // ─── #833 layer 5: set constraint kind table ──────────────────────
