@@ -88,37 +88,6 @@ export function initCellSchema(sql: SqlLike): void {
     // Column already absent — expected on fresh DOs (CREATE TABLE above
     // omits `version`) and on second-call idempotency for migrated DOs.
   }
-
-  // Migration from old entity table: if entity table exists, migrate data.
-  //
-  // #766 (#721-followup-c) note: this SQL write does NOT route through
-  // the per-DO engine apply path. `initCellSchema` is a sync function
-  // called from `EntityDB.ensureInit`, which runs before the engine
-  // handle is hydrated (`hydrateEngine` is async and only kicked off
-  // by the first user-facing instance method). Routing this one-time
-  // legacy-table migration through engine apply would require either
-  // making `initCellSchema` async + reaching the engine handle from a
-  // free function, or deferring the migration until the first call —
-  // both heavier than the migration warrants. The migrated cell will
-  // pick up an engine-side chain entry on its first write through
-  // `put()` / `writeCellThroughEngine`.
-  try {
-    const rows = sql.exec(`SELECT id, noun, fields FROM entity LIMIT 1`).toArray()
-    if (rows.length > 0) {
-      const row = rows[0] as Record<string, any>
-      const data = typeof row.fields === 'string' ? row.fields : JSON.stringify(row.fields || {})
-      sql.exec(
-        `INSERT OR REPLACE INTO cell (id, type, data) VALUES (?, ?, ?)`,
-        row.id, row.noun, data,
-      )
-      sql.exec(`DROP TABLE entity`)
-    }
-  } catch {
-    // No old entity table — expected for new DOs
-  }
-
-  // Drop legacy events table — traceability is modeled as Event entities in the population
-  try { sql.exec(`DROP TABLE events`) } catch { /* doesn't exist */ }
 }
 
 // ── Cell Operations (↑n / ↓n) ──────────────────────────────────────
@@ -690,10 +659,7 @@ export class EntityDB extends DurableObject {
    *  engine's chain here would put the new sealed bytes
    *  (AAD=oldVersion) out of sync with the engine's version stamp
    *  (newVersion+1), causing `cellOpen` to fail the next read after
-   *  #767 lands. The migration path (`initCellSchema`'s
-   *  legacy-`entity`-table branch) also skips this helper because
-   *  the engine handle isn't allocated until first instance-method
-   *  call. */
+   *  #767 lands. */
   protected async writeCellThroughEngine(
     operation: 'create' | 'update',
     type: string,
