@@ -3148,8 +3148,24 @@ fn platform_query_ft(ft_id: &str, x: &Object, d: &Object) -> Object {
         ).collect())
         .unwrap_or_default();
 
+    // #840: ring fact types (both roles share the same noun, e.g.
+    // `Task blocks Task`) carry pairs <<Task, blocker>, <Task, blocked>>
+    // which collapse to a single key under naive `map.insert`. First
+    // pass counts how many times each role name appears; second pass
+    // emits subscript-suffixed keys (Task1, Task2, ...) when count > 1
+    // — matching the FORML2 derivation-rule subscript convention. Roles
+    // that appear exactly once keep their bare names.
     let fact_to_json = |fact: &Object| -> Option<serde_json::Value> {
         let pairs = fact.as_seq()?;
+        let mut role_count: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
+        for pair in pairs.iter() {
+            if let Some(kv) = pair.as_seq() {
+                if let Some(role) = kv.first().and_then(|k| k.as_atom()) {
+                    *role_count.entry(role.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut next_index: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
         let mut map = serde_json::Map::new();
         pairs.iter().for_each(|pair| {
             if let Some(kv) = pair.as_seq() {
@@ -3157,20 +3173,40 @@ fn platform_query_ft(ft_id: &str, x: &Object, d: &Object) -> Object {
                     kv.first().and_then(|k| k.as_atom()),
                     kv.get(1).and_then(|v| v.as_atom()),
                 ) {
-                    map.insert(role.to_string(), serde_json::Value::String(val.to_string()));
+                    let key = if role_count.get(role).copied().unwrap_or(0) > 1 {
+                        let idx = next_index.entry(role.to_string()).or_insert(0);
+                        *idx += 1;
+                        alloc::format!("{}{}", role, idx)
+                    } else {
+                        role.to_string()
+                    };
+                    map.insert(key, serde_json::Value::String(val.to_string()));
                 }
             }
         });
         Some(serde_json::Value::Object(map))
     };
 
+    // #840: filter accepts either exact subscripted keys (Task1, Task2)
+    // for precise role-targeting on ring FTs, or bare role names (Task)
+    // which match any numbered variant. Non-ring queries are unaffected
+    // because role names appear once and no subscripting happens.
     let matched: Vec<serde_json::Value> = facts_seq.iter()
         .filter_map(fact_to_json)
         .filter(|obj| {
             let m = match obj.as_object() { Some(m) => m, None => return false };
-            filter.iter().all(|(k, v)|
-                m.get(k).and_then(|val| val.as_str()) == Some(v.as_str())
-            )
+            filter.iter().all(|(k, v)| {
+                if let Some(actual) = m.get(k).and_then(|x| x.as_str()) {
+                    return actual == v.as_str();
+                }
+                // Fallback: filter key is a bare role name on a ring
+                // FT — match if any subscripted variant equals v.
+                m.iter().any(|(mk, mv)| {
+                    mk.starts_with(k.as_str())
+                        && mk[k.len()..].chars().all(|c| c.is_ascii_digit())
+                        && mv.as_str() == Some(v.as_str())
+                })
+            })
         })
         .collect();
 
@@ -8719,5 +8755,86 @@ mod tests {
             }
             assert_eq!(apply(&f, &Object::atom("x"), &defs()), Object::Bottom);
         });
+    }
+
+    /// #840 — `query_ft` on a ring fact type (both roles share the same
+    /// noun, e.g. `Task blocks Task`) must return both role values, not
+    /// silently collapse them into a single key. Today fact_to_json's
+    /// `map.insert(role, val)` overwrites the first occurrence with the
+    /// second when role names collide, so the agent reading its own
+    /// dependency graph through MCP gets back `{"Task": <only blocked>}`
+    /// instead of `{"Task1": <blocker>, "Task2": <blocked>}` (or any
+    /// scheme that distinguishes them).
+    ///
+    /// Spec: a fact `<<Task, 112>, <Task, 113>>` in cell
+    /// `Task_blocks_Task` must project to a JSON object that carries
+    /// both bindings. We assert *both* values are present somewhere in
+    /// the result — the exact key naming (Task1/Task2 vs subscript) is
+    /// the implementation choice the fix lands.
+    #[test]
+    fn query_ft_returns_both_roles_on_ring_fact_type() {
+        let s0 = Object::phi();
+        let fact = fact_from_pairs(&[("Task", "112"), ("Task", "113")]);
+        let s1 = cell_push("Task_blocks_Task", fact, &s0);
+
+        let result = platform_query_ft("Task_blocks_Task", &Object::atom(""), &s1);
+        let json_str = result.as_atom().expect("result must be a JSON atom");
+        let parsed: serde_json::Value = serde_json::from_str(json_str)
+            .unwrap_or_else(|e| panic!("query_ft must return valid JSON; got {json_str:?} err={e}"));
+        let arr = parsed.as_array()
+            .unwrap_or_else(|| panic!("query_ft must return a JSON array; got {parsed:?}"));
+        assert_eq!(arr.len(), 1, "exactly one matching ring fact");
+        let row = arr[0].as_object()
+            .unwrap_or_else(|| panic!("each fact projects to an object; got {:?}", arr[0]));
+        let values: Vec<&str> = row.values()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(values.contains(&"112"),
+            "blocker Task=112 must appear in the projection; got row={row:?}. \
+             #840: ring FT projection collapses both roles into a single \
+             `Task` key, dropping the blocker silently.");
+        assert!(values.contains(&"113"),
+            "blocked Task=113 must appear in the projection; got row={row:?}. \
+             #840: see comment above.");
+    }
+
+    /// #840 follow-up — filter on a ring FT must accept both bare role
+    /// (matches any numbered variant) and exact subscripted keys
+    /// (Task1, Task2). Non-ring filters keep working unchanged.
+    #[test]
+    fn query_ft_filter_supports_bare_and_subscripted_keys_on_ring_fact_type() {
+        let s0 = Object::phi();
+        let s1 = cell_push("Task_blocks_Task",
+            fact_from_pairs(&[("Task", "112"), ("Task", "113")]), &s0);
+        let s2 = cell_push("Task_blocks_Task",
+            fact_from_pairs(&[("Task", "112"), ("Task", "114")]), &s1);
+        let s3 = cell_push("Task_blocks_Task",
+            fact_from_pairs(&[("Task", "200"), ("Task", "113")]), &s2);
+
+        let parse = |obj: &Object| -> Vec<serde_json::Value> {
+            let json_str = obj.as_atom().expect("JSON atom");
+            serde_json::from_str::<serde_json::Value>(json_str)
+                .ok().and_then(|v| v.as_array().cloned()).unwrap_or_default()
+        };
+
+        // Bare role: filter {Task: 112} matches any ring fact where any
+        // Task variant = 112 — the two facts blocked by 112.
+        let bare = platform_query_ft("Task_blocks_Task",
+            &Object::atom(r#"{"Task":"112"}"#), &s3);
+        assert_eq!(parse(&bare).len(), 2,
+            "bare {{Task:112}} must match both ring facts where blocker=112; got {bare:?}");
+
+        // Subscript Task1: precise blocker match — only 112-as-blocker rows.
+        let sub1 = platform_query_ft("Task_blocks_Task",
+            &Object::atom(r#"{"Task1":"112"}"#), &s3);
+        assert_eq!(parse(&sub1).len(), 2,
+            "{{Task1:112}} must match both rows where blocker (pos 0) = 112; got {sub1:?}");
+
+        // Subscript Task2: blocked-side match — fact <200,113> only.
+        let sub2 = platform_query_ft("Task_blocks_Task",
+            &Object::atom(r#"{"Task2":"113"}"#), &s3);
+        let arr2 = parse(&sub2);
+        assert_eq!(arr2.len(), 2,
+            "{{Task2:113}} must match both rows where blocked (pos 1) = 113; got {sub2:?}");
     }
 }
