@@ -295,59 +295,57 @@ fn inst_key(f: &InstFact) -> (String, String, String, String, String, Vec<(Strin
      f.object_noun.clone(), f.object_value.clone(), f.extra.clone())
 }
 
+/// A binary metamodel directive pattern: `<subject_noun> 'sval' <verb>
+/// <object_noun> 'oval'`. The reading parser scans an input string
+/// against each pattern in `directive_pattern_table` and emits an
+/// `InstFact { subject_noun, sval, verb, object_noun, oval }` for the
+/// first match. Per AREST.tex §3 the dispatch is fact-shaped: each
+/// pattern is a row of data, not an if-arm. See task #834.
+struct DirectivePattern {
+    subject_noun: &'static str,
+    verb: &'static str,
+    object_noun: &'static str,
+}
+
+/// Boot-time directive pattern list — must stay in sync with the
+/// binary fact types declared in `readings/core/state.md`. Order is
+/// declaration-order; the parser returns the first match. The
+/// `Transition is triggered by Event Type` row is a compatibility
+/// alias — same verb as the Fact Type row but a different object
+/// noun, kept so old fixtures still parse.
+fn directive_pattern_table() -> &'static [DirectivePattern] {
+    &[
+        DirectivePattern { subject_noun: "State Machine Definition", verb: "is for",            object_noun: "Noun" },
+        DirectivePattern { subject_noun: "Status",                   verb: "is initial in",     object_noun: "State Machine Definition" },
+        DirectivePattern { subject_noun: "Status",                   verb: "is defined in",     object_noun: "State Machine Definition" },
+        DirectivePattern { subject_noun: "Transition",               verb: "is defined in",     object_noun: "State Machine Definition" },
+        DirectivePattern { subject_noun: "Transition",               verb: "is from",           object_noun: "Status" },
+        DirectivePattern { subject_noun: "Transition",               verb: "is to",             object_noun: "Status" },
+        DirectivePattern { subject_noun: "Transition",               verb: "is triggered by",   object_noun: "Fact Type" },
+        DirectivePattern { subject_noun: "Transition",               verb: "is triggered by",   object_noun: "Event Type" },
+    ]
+}
+
+fn match_directive_pattern(reading: &str, p: &DirectivePattern) -> Option<InstFact> {
+    let prefix = alloc::format!("{} '", p.subject_noun);
+    let mid = alloc::format!("' {} {} '", p.verb, p.object_noun);
+    let (sval, oval) = parse_two_quoted(reading, &prefix, &mid, "'")?;
+    Some(mk_inst(p.subject_noun, sval, p.verb, p.object_noun, oval))
+}
+
 /// Parse a single reading/statement string for known metamodel
-/// directives. Returns synthesised InstFact records.
+/// directives. Returns synthesised InstFact records. Iterates the
+/// `directive_pattern_table` in declaration order and returns the
+/// first match; falls through to the 4-quoted webhook pattern.
 fn parse_reading_for_directives(reading: &str) -> Vec<InstFact> {
     let r = reading.trim().trim_end_matches('.').trim();
     let mut out: Vec<InstFact> = Vec::new();
 
-    // Pattern: `State Machine Definition 'X' is for Noun 'N'`
-    if let Some((sm, noun)) = parse_two_quoted(r,
-        "State Machine Definition '", "' is for Noun '", "'") {
-        out.push(mk_inst("State Machine Definition", sm, "is for", "Noun", noun));
-        return out;
-    }
-    // `Status 'S' is initial in State Machine Definition 'X'`
-    if let Some((s, sm)) = parse_two_quoted(r,
-        "Status '", "' is initial in State Machine Definition '", "'") {
-        out.push(mk_inst("Status", s, "is initial in", "State Machine Definition", sm));
-        return out;
-    }
-    // `Status 'S' is defined in State Machine Definition 'X'`
-    if let Some((s, sm)) = parse_two_quoted(r,
-        "Status '", "' is defined in State Machine Definition '", "'") {
-        out.push(mk_inst("Status", s, "is defined in", "State Machine Definition", sm));
-        return out;
-    }
-    // `Transition 'T' is defined in State Machine Definition 'X'`
-    if let Some((t, sm)) = parse_two_quoted(r,
-        "Transition '", "' is defined in State Machine Definition '", "'") {
-        out.push(mk_inst("Transition", t, "is defined in", "State Machine Definition", sm));
-        return out;
-    }
-    // `Transition 'T' is from Status 'S'`
-    if let Some((t, s)) = parse_two_quoted(r,
-        "Transition '", "' is from Status '", "'") {
-        out.push(mk_inst("Transition", t, "is from", "Status", s));
-        return out;
-    }
-    // `Transition 'T' is to Status 'S'`
-    if let Some((t, s)) = parse_two_quoted(r,
-        "Transition '", "' is to Status '", "'") {
-        out.push(mk_inst("Transition", t, "is to", "Status", s));
-        return out;
-    }
-    // `Transition 'T' is triggered by Fact Type 'FT'`
-    if let Some((t, ft)) = parse_two_quoted(r,
-        "Transition '", "' is triggered by Fact Type '", "'") {
-        out.push(mk_inst("Transition", t, "is triggered by", "Fact Type", ft));
-        return out;
-    }
-    // Compat: `Transition 'T' is triggered by Event Type 'E'`
-    if let Some((t, e)) = parse_two_quoted(r,
-        "Transition '", "' is triggered by Event Type '", "'") {
-        out.push(mk_inst("Transition", t, "is triggered by", "Event Type", e));
-        return out;
+    for pattern in directive_pattern_table() {
+        if let Some(fact) = match_directive_pattern(r, pattern) {
+            out.push(fact);
+            return out;
+        }
     }
 
     // `Webhook Event Type 'WET' yields Fact Type 'FT' with Role 'R'
