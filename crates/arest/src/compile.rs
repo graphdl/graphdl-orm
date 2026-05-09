@@ -1348,14 +1348,28 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // For each binary fact type with a UC, the UC role is the child (dependent),
     // the other role is the parent. Navigation is a constant function returning
     // the related noun names.
-    // HATEOAS nav links â€” fold UC constraints into (children_map, parent_map), then Î± â†’ defs
+    //
+    // VALUE TYPES are skipped on either side. Whitepaper §3: "Each
+    // entity is a cell. RMAP determines which facts belong to which
+    // cell from the schema's uniqueness constraints: the result is a
+    // 3NF row." A value type has no cell of its own — it lives INSIDE
+    // the entity's 3NF row as a scalar attribute, already inline in the
+    // representation's data block. Emitting `nav:Task:parent → [Task
+    // Description]` is a category error: there is no Task Description
+    // entity to navigate to. Theorem 4b's projection only ranges over
+    // entity-typed nouns.
+    let is_entity = |n: &str| c_nouns.get(n)
+        .map(|nd| nd.object_type != "value")
+        .unwrap_or(true);
     let (children_map, parent_map) = c_constraints.iter()
         .filter(|c| c.kind == "UC" && !c.spans.is_empty())
         .filter_map(|c| {
             let ft = c_fact_types.get(&c.spans[0].fact_type_id)?;
             (ft.roles.len() == 2).then(|| ())?;
             let idx = c.spans[0].role_index;
-            Some((ft.roles[1 - idx].noun_name.clone(), ft.roles[idx].noun_name.clone()))
+            let parent = ft.roles[1 - idx].noun_name.clone();
+            let child = ft.roles[idx].noun_name.clone();
+            (is_entity(&parent) && is_entity(&child)).then(|| (parent, child))
         })
         .fold(
             (HashMap::<String, Vec<String>>::new(), HashMap::<String, Vec<String>>::new()),
@@ -8004,5 +8018,128 @@ mod cell_driven_sm_tests {
         let result = step(&cell_driven.func, "Anything", "any_event", &defs);
         assert_eq!(result, "Anything",
             "fallback Func must echo current state; got {:?}", result);
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// HATEOAS nav-link projection — value-typed sides excluded
+// ──────────────────────────────────────────────────────────────────────
+//
+// Whitepaper Theorem 4b (HATEOAS as Projection) says navigation links
+// are projections of the population over fact types' role nouns. The
+// proof depends on §3 ("Each entity is a cell") — RMAP determines which
+// facts belong to which cell from UCs, producing a 3NF row per entity.
+//
+// Value types are NOT cells. They live INSIDE the entity's 3NF row as
+// scalar attributes. Treating a value-typed role as a navigable
+// parent/child is a category error — the response data block already
+// carries the value inline; emitting a nav link to "/api/entities/Task
+// %20Description" points at nothing because Task Description has no
+// cell to fetch.
+//
+// This module pins that nav links over a binary FT skip the FT entirely
+// when EITHER role is value-typed. Children/parent/peer/related are
+// over entity-typed nouns only.
+#[cfg(test)]
+mod nav_links_skip_value_types {
+    use super::*;
+    use crate::ast::{self, Object, fact_from_pairs};
+
+    /// Minimal cells: Task entity + Task Description value type, joined
+    /// by `Task has Task Description` with a UC on the Task role.
+    /// Mirrors apps/tasks/readings/app.md.
+    fn task_with_description_cells() -> Object {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Task"), ("objectType", "entity"),
+            ("referenceScheme", "id"),
+        ]));
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Task Description"), ("objectType", "value"),
+        ]));
+        cells.entry("FactType".into()).or_default().push(fact_from_pairs(&[
+            ("id", "Task_has_Task_Description"),
+            ("reading", "Task has Task Description"),
+            ("arity", "2"),
+        ]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "Task_has_Task_Description"),
+            ("nounName", "Task"), ("position", "0"),
+        ]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "Task_has_Task_Description"),
+            ("nounName", "Task Description"), ("position", "1"),
+        ]));
+        let uc = ConstraintDef {
+            id: "uc_task_desc".into(),
+            kind: "UC".into(),
+            modality: "alethic".into(),
+            text: "Each Task has at most one Task Description".into(),
+            spans: vec![SpanDef {
+                fact_type_id: "Task_has_Task_Description".into(),
+                role_index: 0,
+                subset_autofill: None,
+            }],
+            ..Default::default()
+        };
+        cells.entry("Constraint".into()).or_default()
+            .push(crate::parse_forml2::constraint_to_fact_test(&uc));
+        Object::Map(cells.into_iter()
+            .map(|(k, v)| (k, Object::Seq(v.into())))
+            .collect())
+    }
+
+    fn def_value(defs: &[(String, ast::Func)], name: &str) -> Option<Object> {
+        defs.iter().find(|(n, _)| n == name)
+            .map(|(_, f)| ast::apply(f, &Object::phi(), &Object::phi()))
+    }
+
+    /// `Task has Task Description` UC sits on Task. The legacy
+    /// nav-link generator would emit `nav:Task:parent → [Task
+    /// Description]`. After the fix, the value-typed side is dropped
+    /// — there is no parent to navigate to because Task Description
+    /// has no cell of its own.
+    #[test]
+    fn nav_parent_skips_value_type_side() {
+        let state = task_with_description_cells();
+        let defs = compile_to_defs_state(&state);
+
+        // The bug: nav:Task:parent contained Task Description.
+        let parents = def_value(&defs, "nav:Task:parent");
+        match parents {
+            None => { /* no nav def emitted at all — also acceptable */ }
+            Some(seq) => {
+                let names: Vec<String> = seq.as_seq()
+                    .map(|items| items.iter()
+                        .filter_map(|i| i.as_atom().map(String::from))
+                        .collect())
+                    .unwrap_or_default();
+                assert!(!names.iter().any(|n| n == "Task Description"),
+                    "Task Description is a value type — it has no cell, so it \
+                     must not appear as a navigation parent of Task. The 3NF \
+                     row already carries it inline in the entity data block. \
+                     Got nav:Task:parent = {:?}", names);
+            }
+        }
+    }
+
+    /// Same shape from the other direction — Task Description should
+    /// not have a `nav:children` def either.
+    #[test]
+    fn nav_children_skips_value_type_target() {
+        let state = task_with_description_cells();
+        let defs = compile_to_defs_state(&state);
+
+        let children = def_value(&defs, "nav:Task:children");
+        let names: Vec<String> = children
+            .as_ref()
+            .and_then(|s| s.as_seq())
+            .map(|items| items.iter()
+                .filter_map(|i| i.as_atom().map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert!(!names.iter().any(|n| n == "Task Description"),
+            "Task Description (value type) must not appear as a child noun \
+             in Task's nav projection. Got {:?}", names);
     }
 }
