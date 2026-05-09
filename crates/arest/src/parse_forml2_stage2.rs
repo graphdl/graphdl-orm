@@ -4371,16 +4371,41 @@ fn reject_reserved_noun_declarations(
     text: &str,
     vocab: &crate::parse_forml2_stage1::Vocab,
 ) -> Result<(), String> {
+    // #845 — same literal-aware scan as extract_declared_noun_names:
+    // a Task Description like 'X is a subtype of Y' must NOT be
+    // treated as a subtype declaration here either. Char-boundary
+    // safe (real readings use em-dash and other multibyte chars).
+    let escapes = QuoteEscapeTable::boot();
+    let find_outside_literals = |hay: &str, needle: &str| -> Option<usize> {
+        let mut cursor = 0;
+        while cursor < hay.len() {
+            match hay[cursor..].find('\'') {
+                Some(rel_quote) => {
+                    let abs_quote = cursor + rel_quote;
+                    if let Some(rel) = hay[cursor..abs_quote].find(needle) {
+                        return Some(cursor + rel);
+                    }
+                    let body = &hay[abs_quote + 1..];
+                    match escapes.find_close(body) {
+                        Some(end) => { cursor = abs_quote + 1 + end + 1; }
+                        None => return None,
+                    }
+                }
+                None => return hay[cursor..].find(needle).map(|r| cursor + r),
+            }
+        }
+        None
+    };
     for raw_line in text.lines() {
         let line = raw_line.trim();
         let before = line
             .strip_suffix(" is an entity type.")
             .or_else(|| line.strip_suffix(" is a value type."))
             .or_else(|| line.strip_suffix(" is abstract."))
-            .or_else(|| line.split(" is a subtype of ").next()
-                .filter(|pre| *pre != line))
-            .or_else(|| line.split(" is partitioned into ").next()
-                .filter(|pre| *pre != line));
+            .or_else(|| find_outside_literals(line, " is a subtype of ")
+                .map(|i| &line[..i]))
+            .or_else(|| find_outside_literals(line, " is partitioned into ")
+                .map(|i| &line[..i]));
         let Some(before) = before else { continue };
         let name = match before.find('(') {
             Some(p) => before[..p].trim(),
@@ -4438,11 +4463,46 @@ fn extract_declared_noun_names(text: &str) -> Vec<String> {
         }
     };
 
+    // #845 — keyword scans must skip single-quoted literal spans.
+    // Without this, a Task Description like 'X is a subtype of Y'
+    // matches the subtype-declaration shape inside the literal,
+    // pushing the entire prefix as a noun name. Dispatch through
+    // QuoteEscapeTable for consistent literal-skipping per the
+    // Sweep-1 dispatch-to-data pattern. Walk by char_indices so
+    // we never slice mid-codepoint (em-dash, smart quotes, etc.
+    // appear in real readings — see metamodel comment text).
+    let escapes = QuoteEscapeTable::boot();
+    let find_outside_literals = |hay: &str, needle: &str| -> Option<usize> {
+        let mut cursor = 0;
+        while cursor < hay.len() {
+            // Find the next `'` starting at cursor (char-boundary safe).
+            match hay[cursor..].find('\'') {
+                Some(rel_quote) => {
+                    let abs_quote = cursor + rel_quote;
+                    // Match needle in the segment BEFORE the literal.
+                    if let Some(rel) = hay[cursor..abs_quote].find(needle) {
+                        return Some(cursor + rel);
+                    }
+                    // Skip past the literal.
+                    let body = &hay[abs_quote + 1..];
+                    match escapes.find_close(body) {
+                        Some(end) => { cursor = abs_quote + 1 + end + 1; }
+                        None => return None, // unterminated — bail
+                    }
+                }
+                None => {
+                    // No more literals; needle anywhere from cursor on counts.
+                    return hay[cursor..].find(needle).map(|r| cursor + r);
+                }
+            }
+        }
+        None
+    };
     for raw_line in text.lines() {
         let line = raw_line.trim();
         // Partition declaration — both the super and each subtype get
         // added. `Animal is partitioned into Cat, Dog, Bird.`
-        if let Some(idx) = line.find(" is partitioned into ") {
+        if let Some(idx) = find_outside_literals(line, " is partitioned into ") {
             push(&mut names, &line[..idx]);
             let tail = line[idx + " is partitioned into ".len()..]
                 .trim_end_matches('.')
@@ -4460,7 +4520,7 @@ fn extract_declared_noun_names(text: &str) -> Vec<String> {
                 for sub in inner.split(',') {
                     push(&mut names, sub);
                 }
-                if let Some(st_idx) = line.find(" subtypes of ") {
+                if let Some(st_idx) = find_outside_literals(line, " subtypes of ") {
                     let tail = line[st_idx + " subtypes of ".len()..]
                         .trim_end_matches('.')
                         .trim();
@@ -4470,7 +4530,7 @@ fn extract_declared_noun_names(text: &str) -> Vec<String> {
             }
         }
         // Subtype. `Dog is a subtype of Animal.`
-        if let Some(idx) = line.find(" is a subtype of ") {
+        if let Some(idx) = find_outside_literals(line, " is a subtype of ") {
             push(&mut names, &line[..idx]);
             let tail = line[idx + " is a subtype of ".len()..]
                 .trim_end_matches('.')
@@ -6671,6 +6731,51 @@ mod tests {
     fn quote_escape_table_unterminated_returns_none() {
         let table = super::QuoteEscapeTable::boot();
         assert_eq!(table.find_close("no close quote here"), None);
+    }
+
+    /// #845 — `extract_declared_noun_names` walks every reading line
+    /// looking for declaration-shaped phrases (`is a subtype of`,
+    /// `is partitioned into`). The naive `line.find(...)` matches
+    /// inside single-quoted literals too, so a Task Description like
+    /// `'X is a subtype of Y'` would push the entire prefix
+    /// `Task '287' has Task Description 'X` as a noun name and the
+    /// suffix `Y'` as a supertype — corrupting the noun catalog and
+    /// emitting a bogus Subtype Declaration in the cell.
+    ///
+    /// Fix dispatches the keyword scan through QuoteEscapeTable so
+    /// matches inside literal spans are skipped.
+    #[test]
+    fn extract_declared_noun_names_skips_subtype_inside_literal() {
+        let text = "Task '287' has Task Description 'X is a subtype of Y'.";
+        let names = super::extract_declared_noun_names(text);
+        assert!(!names.iter().any(|n| n.contains("X is a subtype")
+            || n.contains("Task Description") || n == "Y'"
+            || n == "Y" || n == "X"),
+            "literal content inside a quoted Task Description must NOT \
+             be treated as a subtype declaration. Got noun names: {:?}",
+            names);
+    }
+
+    #[test]
+    fn extract_declared_noun_names_still_catches_real_subtype_declarations() {
+        let text = "Dog is a subtype of Animal.";
+        let names = super::extract_declared_noun_names(text);
+        assert!(names.iter().any(|n| n == "Dog"),
+            "real subtype-of-noun lines must still register both nouns. Got: {:?}", names);
+        assert!(names.iter().any(|n| n == "Animal"),
+            "real subtype-of-noun lines must still register both nouns. Got: {:?}", names);
+    }
+
+    #[test]
+    fn extract_declared_noun_names_skips_partitioned_inside_literal() {
+        let text = "Task '500' has Task Description 'X is partitioned into Y, Z'.";
+        let names = super::extract_declared_noun_names(text);
+        assert!(!names.iter().any(|n| n.contains("Task Description")
+            || n == "Y, Z'" || n == "Y" || n == "Z"
+            || n.contains("X is partitioned")),
+            "literal content inside a quoted Task Description must NOT \
+             be treated as a partition declaration. Got noun names: {:?}",
+            names);
     }
 
     /// Coupled regression: `strip_role_literals` (line 2272) ALSO scans
