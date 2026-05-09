@@ -607,6 +607,98 @@ impl RangeOperatorTable {
     }
 }
 
+/// Sweep-1 lift of the FORML2 single-quoted literal escape convention
+/// (#844 enabling work). Stage-1's `extract_following_literal_span` in
+/// `parse_forml2_stage1.rs` historically used `body.find('\'')` to
+/// locate the close-quote — naive scan with no escape handling. That
+/// truncated `'doesn''t work'` to literal=`doesn`, silently dropping
+/// every instance fact whose value carried an apostrophe.
+///
+/// The lift moves the escape vocabulary to a typed `QuoteEscapeTable`
+/// reading the `Quote Escape` value type from
+/// `readings/forml2-grammar.md`. Boot enables the SQL-style
+/// `'doubled-quote'` convention (`''` decodes to `'`). Same shape as
+/// `WordComparatorTable` per #783's first slice — bare phrases in
+/// `rows`, semantic methods (`find_close`, `decode`) consult the
+/// table at every call so swapping the boot for a richer grammar
+/// declaration adjusts parser behavior with no Rust change.
+#[derive(Debug, Clone)]
+pub struct QuoteEscapeTable {
+    /// Names of the escape conventions enabled in this table. Order
+    /// matches the `'doubled-quote', ...` declaration in
+    /// readings/forml2-grammar.md. Currently the only convention the
+    /// parser honors is `'doubled-quote'`; future conventions
+    /// (e.g. `'backslash-quote'`) extend `find_close` / `decode`.
+    pub rows: Vec<String>,
+}
+
+impl QuoteEscapeTable {
+    /// Boot table — must stay in sync with `Quote Escape` enum-value
+    /// declaration in `readings/forml2-grammar.md`. One convention:
+    /// SQL-style doubled quote (`''` → `'`).
+    pub fn boot() -> Self {
+        QuoteEscapeTable {
+            rows: alloc::vec!["doubled-quote".to_string()],
+        }
+    }
+
+    /// Build the table from the runtime `Quote Escape` enum-value
+    /// declaration. Falls back to `boot()` when the cell is empty.
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_enum_values(state, "Quote Escape");
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            QuoteEscapeTable { rows }
+        }
+    }
+
+    /// Iterate the conventions in declaration order.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.rows.iter().map(|s| s.as_str())
+    }
+
+    /// Whether the doubled-quote escape (`''` → `'`) is enabled.
+    pub fn allows_doubled_quote(&self) -> bool {
+        self.rows.iter().any(|r| r == "doubled-quote")
+    }
+
+    /// Find the close-quote position in the body of a single-quoted
+    /// literal. `body` is the slice immediately AFTER the opening
+    /// `'`. Returns the byte offset of the close `'` within `body`,
+    /// or `None` if the literal is unterminated. With doubled-quote
+    /// enabled, runs of `''` are treated as escaped apostrophe and
+    /// scanned past — only a lone `'` counts as the close.
+    pub fn find_close(&self, body: &str) -> Option<usize> {
+        let bytes = body.as_bytes();
+        let allow_dq = self.allows_doubled_quote();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\'' {
+                if allow_dq && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Decode escapes in a literal body (the substring strictly between
+    /// the opening and closing quotes). With doubled-quote enabled,
+    /// every `''` collapses to a single `'`. Future conventions extend
+    /// this with their own decoders.
+    pub fn decode(&self, body: &str) -> alloc::string::String {
+        if self.allows_doubled_quote() {
+            body.replace("''", "'")
+        } else {
+            body.to_string()
+        }
+    }
+}
+
 /// #788 — `parse_deontic_text_predicate` matches one of four suffixes
 /// on a deontic-constraint prefix (` ends with`, ` does not end with`,
 /// ` starts with`, ` does not start with`) and decodes (kind, negated).
@@ -4552,7 +4644,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 40, "noun count");
+        assert_eq!(noun_count, 41, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -4564,7 +4656,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 29, "enum-valued noun count");
+        assert_eq!(enum_count, 30, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -6503,6 +6595,78 @@ mod tests {
         let table = super::RangeOperatorTable::from_grammar_state(&state);
         assert_eq!(table.rows.len(), 3,
             "empty grammar state falls back to the 3-operator boot table");
+    }
+
+    // ─── #844 / readings-as-source-code: quote escape table ──────────
+
+    /// Stage-1's `extract_following_literal_span` historically used
+    /// `body.find('\'')` to locate the close-quote of a single-quoted
+    /// literal — naive scan with no escape handling. That meant a
+    /// description like `'doesn''t work'` was truncated to `doesn`.
+    /// Lift the literal-escape convention to a typed `QuoteEscapeTable`
+    /// declared as the `Quote Escape` value type in
+    /// `readings/forml2-grammar.md`. Boot enables `'doubled-quote'`
+    /// (the `''` → `'` SQL convention). Mirrors the Sweep-1 dispatch-
+    /// to-data pattern: the parser dispatches to the data, the data
+    /// lives in the grammar reading.
+    #[test]
+    fn quote_escape_table_boot_has_doubled_quote_convention() {
+        let table = super::QuoteEscapeTable::boot();
+        let conventions: Vec<&str> = table.iter().collect();
+        assert_eq!(conventions, vec!["doubled-quote"],
+            "boot table enables the SQL-style `''` → `'` escape; \
+             without this, instance facts can't carry apostrophes \
+             in their literals.");
+    }
+
+    #[test]
+    fn quote_escape_table_from_grammar_state_reads_enum_values() {
+        let state = synthetic_enum_state(&[
+            ("Quote Escape", &["doubled-quote", "backslash-quote"]),
+        ]);
+        let table = super::QuoteEscapeTable::from_grammar_state(&state);
+        assert_eq!(table.rows, vec!["doubled-quote", "backslash-quote"]);
+    }
+
+    #[test]
+    fn quote_escape_table_falls_back_to_boot_on_empty_state() {
+        let state = synthetic_enum_state(&[]);
+        let table = super::QuoteEscapeTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 1,
+            "empty grammar state falls back to the single-convention boot table");
+    }
+
+    #[test]
+    fn quote_escape_table_find_close_with_no_inner_quote() {
+        let table = super::QuoteEscapeTable::boot();
+        // body is the slice AFTER the opening `'` and includes the close `'`
+        // followed by anything else. find_close returns the byte offset of
+        // the close `'`.
+        assert_eq!(table.find_close("simple'.").unwrap(), 6);
+    }
+
+    #[test]
+    fn quote_escape_table_find_close_skips_doubled_quote() {
+        let table = super::QuoteEscapeTable::boot();
+        // `it''s late'.` — the `''` at offset 2 is a doubled-quote escape;
+        // the real close is at offset 10.
+        assert_eq!(table.find_close("it''s late'.").unwrap(), 10,
+            "doubled-quote in body must NOT be treated as the close");
+    }
+
+    #[test]
+    fn quote_escape_table_decode_collapses_doubled_quote() {
+        let table = super::QuoteEscapeTable::boot();
+        assert_eq!(table.decode("it''s late"), "it's late");
+        assert_eq!(table.decode("no escapes"), "no escapes");
+        assert_eq!(table.decode("''start"), "'start");
+        assert_eq!(table.decode("end''"), "end'");
+    }
+
+    #[test]
+    fn quote_escape_table_unterminated_returns_none() {
+        let table = super::QuoteEscapeTable::boot();
+        assert_eq!(table.find_close("no close quote here"), None);
     }
 
     // ─── #833 layer 5: set constraint kind table ──────────────────────

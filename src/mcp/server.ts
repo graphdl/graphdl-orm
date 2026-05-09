@@ -851,20 +851,27 @@ server.registerTool(
     if (blocked) return blocked
 
     if (AREST_MODE === 'local') {
+      // Mirrors `escape_atom_for_display` in crates/arest/src/ast.rs.
+      // Engine's Object::parse uses split_top_level which treats `,`,
+      // `<`, `>` as syntactic separators at depth 0; backslash escapes
+      // the next char. Without this, a field value containing any of
+      // those (e.g. a Task Description with a comma) gets silently
+      // truncated at the first unescaped comma.
+      const escapeAtom = (s: string) => s.replace(/[\\<>,]/g, ch => '\\' + ch)
       switch (operation) {
         case 'create': {
-          const pairs = Object.entries(fields || {}).map(([k, v]) => `<${k}, ${v}>`).join(', ')
-          const idPair = id ? `<id, ${id}>, ` : ''
+          const pairs = Object.entries(fields || {}).map(([k, v]) => `<${escapeAtom(k)}, ${escapeAtom(v)}>`).join(', ')
+          const idPair = id ? `<id, ${escapeAtom(id)}>, ` : ''
           const raw = await systemCall(`create:${noun}`, `<${idPair}${pairs}>`)
           return localApplyResult(raw, { operation, noun, id, fields })
         }
         case 'update': {
-          const pairs = Object.entries(fields || {}).map(([k, v]) => `<${k}, ${v}>`).join(', ')
-          const raw = await systemCall(`update:${noun}`, `<<id, ${id || ''}>${pairs ? `, ${pairs}` : ''}>`)
+          const pairs = Object.entries(fields || {}).map(([k, v]) => `<${escapeAtom(k)}, ${escapeAtom(v)}>`).join(', ')
+          const raw = await systemCall(`update:${noun}`, `<<id, ${escapeAtom(id || '')}>${pairs ? `, ${pairs}` : ''}>`)
           return localApplyResult(raw, { operation, noun, id, fields })
         }
         case 'transition': {
-          const raw = await systemCall(`transition:${noun}`, `<${id || ''}, ${event || ''}>`)
+          const raw = await systemCall(`transition:${noun}`, `<${escapeAtom(id || '')}, ${escapeAtom(event || '')}>`)
           return localApplyResult(raw, { operation, noun, id })
         }
       }

@@ -737,6 +737,13 @@ fn match_role_references(text: &str, buckets: &NounBuckets<'_>) -> Vec<RoleRef> 
 /// Halpin's `<Noun> '<value>'` instance-fact / ref-scheme-literal form.
 /// Returns `(literal, span_end)` where `span_end` is the byte offset
 /// immediately after the closing `'` (or `from` if no literal).
+///
+/// The literal-escape convention is dispatched through
+/// `QuoteEscapeTable::boot()` (Sweep-1 lift, #844 enabling work). With
+/// the boot convention `'doubled-quote'` enabled, `''` inside the body
+/// is treated as an escaped apostrophe rather than the close-quote, and
+/// the returned literal has those `''` collapsed back to `'`. Without
+/// this dispatch, `'doesn''t work'` truncated to literal=`doesn`.
 fn extract_following_literal_span(text: &str, from: usize) -> (Option<String>, usize) {
     let rest = &text[from..];
     let after_ws = rest.trim_start();
@@ -745,9 +752,10 @@ fn extract_following_literal_span(text: &str, from: usize) -> (Option<String>, u
         return (None, from);
     }
     let body = &after_ws[1..];
-    match body.find('\'') {
+    let escapes = crate::parse_forml2_stage2::QuoteEscapeTable::boot();
+    match escapes.find_close(body) {
         Some(end) => {
-            let literal = body[..end].to_string();
+            let literal = escapes.decode(&body[..end]);
             // from + ws_len + 1 (opening quote) + end + 1 (closing quote)
             let span_end = from + ws_len + 1 + end + 1;
             (Some(literal), span_end)
@@ -1000,6 +1008,28 @@ mod tests {
             .collect();
         assert!(literals.contains(&"alice"), "got literals: {:?}", literals);
         assert!(literals.contains(&"o-7"), "got literals: {:?}", literals);
+    }
+
+    /// Sweep-1 lift of the literal-escape convention into the Quote
+    /// Escape grammar table (#844 enabling work). Without the table,
+    /// stage-1 used `body.find('\'')` and truncated `'doesn''t work'`
+    /// to literal=`doesn`. With QuoteEscapeTable::boot() supplying the
+    /// `doubled-quote` convention, the close-quote scan skips `''` and
+    /// the decoded literal is `doesn't work`.
+    #[test]
+    fn instance_fact_literal_decodes_doubled_quote_escape() {
+        let c = tokenize_statement("s1",
+            "Task '844' has Task Description 'doesn''t work without escape support'.",
+            &nouns(&["Task", "Task Description"]));
+        let rr_lit = c.get("Role_Reference_has_Literal_Value")
+            .expect("literals cell must exist");
+        let literals: Vec<_> = rr_lit.iter()
+            .filter_map(|f| binding(f, "Literal_Value"))
+            .collect();
+        assert!(literals.contains(&"844"), "got literals: {:?}", literals);
+        assert!(literals.contains(&"doesn't work without escape support"),
+            "doubled-quote should decode to single quote inside the literal; \
+             got literals: {:?}", literals);
     }
 
     #[test]
