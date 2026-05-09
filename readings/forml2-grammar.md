@@ -60,6 +60,8 @@ Ring Adjective is a value type.
   The possible values of Ring Adjective are 'irreflexive', 'asymmetric', 'antisymmetric', 'symmetric', 'intransitive', 'transitive', 'acyclic', 'reflexive'.
 Word Comparator is a value type.
   The possible values of Word Comparator are 'exceeds', 'is greater than', 'is less than', 'is at least', 'is at most', 'is more than', 'equals', 'is equal to'.
+Range Operator is a value type.
+  The possible values of Range Operator are 'within', 'before', 'after'.
 Ring Constraint Trailing Marker is a value type.
   The possible values of Ring Constraint Trailing Marker are 'is irreflexive', 'is asymmetric', 'is antisymmetric', 'is symmetric', 'is intransitive', 'is transitive', 'is acyclic', 'is reflexive'.
 Ring Constraint Kind Code is a value type.

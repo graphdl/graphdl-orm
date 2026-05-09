@@ -556,6 +556,57 @@ impl WordComparatorTable {
     }
 }
 
+/// #783 second slice — `is_range_filter_clause` in `parse_forml2.rs`
+/// scans for an inline 3-entry `RANGE_OPS` const (` within `,
+/// ` before `, ` after `). Each entry was stored already wrapped in
+/// spaces so substring search matched on word boundaries. The lift
+/// moves the operator vocabulary to a typed `RangeOperatorTable`
+/// reading the `Range Operator` grammar enum. Same shape as
+/// `WordComparatorTable` per the first slice — bare phrases in `rows`,
+/// the caller adds spaces at use site.
+#[derive(Debug, Clone)]
+pub struct RangeOperatorTable {
+    /// The three range-filter operator phrases. Order matches the
+    /// `'within', 'before', 'after'` declaration in
+    /// readings/forml2-grammar.md and the legacy `RANGE_OPS` const
+    /// in `is_range_filter_clause` so first-match-wins iteration
+    /// behavior round-trips.
+    pub rows: Vec<String>,
+}
+
+impl RangeOperatorTable {
+    /// Boot table — must stay in sync with `Range Operator` enum-value
+    /// declaration in `readings/forml2-grammar.md`. Three phrases in
+    /// the same declaration order as the legacy `RANGE_OPS` const.
+    pub fn boot() -> Self {
+        RangeOperatorTable {
+            rows: alloc::vec![
+                "within".to_string(),
+                "before".to_string(),
+                "after".to_string(),
+            ],
+        }
+    }
+
+    /// Build the table from the runtime `Range Operator` enum-value
+    /// declaration. Falls back to `boot()` when the cell is empty
+    /// (bare engine, no metamodel loaded).
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_enum_values(state, "Range Operator");
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            RangeOperatorTable { rows }
+        }
+    }
+
+    /// Iterate the operators in declaration order. Phrases lack
+    /// surrounding spaces; the caller adds them for substring search.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.rows.iter().map(|s| s.as_str())
+    }
+}
+
 /// #788 — `parse_deontic_text_predicate` matches one of four suffixes
 /// on a deontic-constraint prefix (` ends with`, ` does not end with`,
 /// ` starts with`, ` does not start with`) and decodes (kind, negated).
@@ -4501,7 +4552,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 39, "noun count");
+        assert_eq!(noun_count, 40, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -4513,7 +4564,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 28, "enum-valued noun count");
+        assert_eq!(enum_count, 29, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -6417,6 +6468,41 @@ mod tests {
         let table = super::WordComparatorTable::from_grammar_state(&state);
         assert_eq!(table.rows.len(), 8,
             "empty grammar state falls back to the 8-comparator boot table");
+    }
+
+    // ─── #783 second slice: range operator table ─────────────────────
+
+    /// #783 — `is_range_filter_clause` in parse_forml2.rs has a 3-entry
+    /// inline `RANGE_OPS` const (` within `, ` before `, ` after `).
+    /// Second slice of the Sweep-1c migration: lift the const to a
+    /// typed `RangeOperatorTable` reading from the `Range Operator`
+    /// grammar enum. Boot stays in declaration order so the first-
+    /// match-wins iteration semantics round-trip.
+    #[test]
+    fn range_operator_table_boot_has_three_operators_in_declared_order() {
+        let table = super::RangeOperatorTable::boot();
+        let words: Vec<&str> = table.iter().collect();
+        assert_eq!(words, vec!["within", "before", "after"],
+            "boot table must mirror the historic RANGE_OPS const, in \
+             declaration order, so is_range_filter_clause returns the \
+             same result for every input.");
+    }
+
+    #[test]
+    fn range_operator_table_from_grammar_state_reads_enum_values() {
+        let state = synthetic_enum_state(&[
+            ("Range Operator", &["foo", "bar"]),
+        ]);
+        let table = super::RangeOperatorTable::from_grammar_state(&state);
+        assert_eq!(table.rows, vec!["foo", "bar"]);
+    }
+
+    #[test]
+    fn range_operator_table_falls_back_to_boot_on_empty_state() {
+        let state = synthetic_enum_state(&[]);
+        let table = super::RangeOperatorTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 3,
+            "empty grammar state falls back to the 3-operator boot table");
     }
 
     // ─── #833 layer 5: set constraint kind table ──────────────────────

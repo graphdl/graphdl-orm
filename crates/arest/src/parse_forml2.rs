@@ -306,9 +306,12 @@ fn is_range_filter_clause(
     noun_names: &[String],
     catalog: &SchemaCatalog,
 ) -> bool {
-    const RANGE_OPS: &[&str] = &[" within ", " before ", " after "];
-    RANGE_OPS.iter().any(|op| {
-        let Some(idx) = clause.find(op) else { return false; };
+    // #783 second slice — vocabulary lifts to RangeOperatorTable so the
+    // 3 operators live in `readings/forml2-grammar.md` as a `Range
+    // Operator` enum value type. Boot stays in sync with the grammar.
+    crate::parse_forml2_stage2::RangeOperatorTable::boot().iter().any(|op| {
+        let needle = alloc::format!(" {} ", op);
+        let Some(idx) = clause.find(&needle) else { return false; };
         let head = clause[..idx].trim();
         head_resolves(head, noun_names, catalog)
     })
