@@ -800,6 +800,32 @@ server.registerTool(
 
 // ── 2. query: query facts across the population ──────────────────────
 
+/**
+ * Translate the engine's raw response to the user-facing tuple list.
+ *
+ * #821: When `query:<ft>` isn't in DEFS (FT name unknown to the
+ * schema), `apply` returns `Object::Bottom` which serializes to "⊥".
+ * The user-facing answer to "give me facts of type X" is always a
+ * list of tuples; an unknown FT yields the same empty list as a
+ * known FT with no matching population. Whitepaper §3 ("DEFS holds
+ * compiled readings + functions registered by the runtime") casts
+ * this as a platform-layer translation: the engine faithfully
+ * signals "no def by that name" via Bottom; the MCP runtime maps
+ * that to the user-friendly empty tuples list.
+ *
+ * Other JSON.parse failures still surface as { raw } so genuinely
+ * malformed engine responses aren't swallowed silently.
+ */
+export function parseQueryResponse(raw: string): unknown {
+  if (raw === '⊥') return []
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed ?? []
+  } catch {
+    return { raw }
+  }
+}
+
 server.registerTool(
   'query',
   {
@@ -813,13 +839,7 @@ server.registerTool(
     if (AREST_MODE === 'local') {
       const filterStr = filter ? JSON.stringify(filter) : ''
       const raw = await systemCall(`query:${fact_type}`, filterStr)
-      try {
-        const parsed = JSON.parse(raw)
-        // Query returns a list of matching facts; null/undefined means nothing matched.
-        return textResult(parsed ?? [])
-      } catch {
-        return textResult({ raw })
-      }
+      return textResult(parseQueryResponse(raw))
     }
     const data = await httpRequest(`/arest/default/query/${encodeURIComponent(fact_type)}`, {
       method: 'POST',

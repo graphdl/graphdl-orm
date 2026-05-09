@@ -8,6 +8,7 @@
 import { describe, it, expect } from 'vitest'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
+import { parseQueryResponse } from './server.js'
 
 describe('AREST MCP Server', () => {
   it('registers expected tool names', () => {
@@ -106,5 +107,28 @@ describe('AREST MCP Server', () => {
       command: { type: 'createEntity', noun: 'Order', domain: 'test', fields: { customer: 'acme' } },
     })
     expect(result.command.type).toBe('createEntity')
+  })
+})
+
+describe('#821 query verb returns tuples for empty / unknown FT', () => {
+  it('translates engine ⊥ (FT unknown to schema) to empty tuple list', () => {
+    // When `query:<ft>` def isn't in DEFS, apply returns Object::Bottom
+    // which serializes to "⊥". The user-facing semantic is "there are no
+    // facts of that type" — same as the empty-population case.
+    expect(parseQueryResponse('⊥')).toEqual([])
+  })
+
+  it('passes through valid JSON tuple list unchanged', () => {
+    const tuples = JSON.stringify([{ Task: '262', 'Task Status': 'completed' }])
+    expect(parseQueryResponse(tuples)).toEqual([{ Task: '262', 'Task Status': 'completed' }])
+  })
+
+  it('translates explicit JSON null to empty tuple list', () => {
+    expect(parseQueryResponse('null')).toEqual([])
+  })
+
+  it('returns { raw } for non-⊥ malformed responses (preserves diagnostics)', () => {
+    const result = parseQueryResponse('this is not json and not bottom')
+    expect(result).toEqual({ raw: 'this is not json and not bottom' })
   })
 })
