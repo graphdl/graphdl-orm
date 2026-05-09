@@ -8035,6 +8035,121 @@ mod cell_driven_sm_tests {
         assert_eq!(result, "Anything",
             "fallback Func must echo current state; got {:?}", result);
     }
+
+    /// #813 — When two SMs share a status name (here, 'Proposed'), the
+    /// compile must scope each SM by its bound noun. Symptom from the
+    /// original bug report: a Merge entity with Status 'Proposed' got
+    /// the Domain Change SM attached because both declared 'Proposed'.
+    /// The cell-driven path's contract: `compile_state_machine_from_cells
+    /// (noun, cells, ...)` returns the SM for THAT noun, regardless of
+    /// other SMs sharing status names.
+    fn two_sms_sharing_proposed_status() -> Object {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        // Two SM-Noun bindings.
+        for (sm, noun) in &[
+            ("DomainChangeSM", "Domain Change"),
+            ("MergeSM", "Merge"),
+        ] {
+            cells.entry("State_Machine_Definition_is_for_Noun".into()).or_default()
+                .push(fact_from_pairs(&[
+                    ("State Machine Definition", sm),
+                    ("Noun", noun),
+                ]));
+            cells.entry("Status_is_initial_in_State_Machine_Definition".into()).or_default()
+                .push(fact_from_pairs(&[
+                    ("Status", "Proposed"),
+                    ("State Machine Definition", sm),
+                ]));
+        }
+        // DomainChange statuses: Proposed → Approved.
+        for s in &["Proposed", "Approved"] {
+            cells.entry("Status_is_defined_in_State_Machine_Definition".into()).or_default()
+                .push(fact_from_pairs(&[
+                    ("Status", s),
+                    ("State Machine Definition", "DomainChangeSM"),
+                ]));
+        }
+        cells.entry("Transition_is_defined_in_State_Machine_Definition".into()).or_default()
+            .push(fact_from_pairs(&[
+                ("Transition", "approve_dc"),
+                ("State Machine Definition", "DomainChangeSM"),
+            ]));
+        cells.entry("Transition_is_from_Status".into()).or_default()
+            .push(fact_from_pairs(&[("Transition", "approve_dc"), ("Status", "Proposed")]));
+        cells.entry("Transition_is_to_Status".into()).or_default()
+            .push(fact_from_pairs(&[("Transition", "approve_dc"), ("Status", "Approved")]));
+        cells.entry("Transition_is_triggered_by_Fact_Type".into()).or_default()
+            .push(fact_from_pairs(&[("Transition", "approve_dc"), ("Fact Type", "User_approves_DC")]));
+        // Merge statuses: Proposed → Facts Populated → Merged.
+        for s in &["Proposed", "Facts Populated", "Merged"] {
+            cells.entry("Status_is_defined_in_State_Machine_Definition".into()).or_default()
+                .push(fact_from_pairs(&[
+                    ("Status", s),
+                    ("State Machine Definition", "MergeSM"),
+                ]));
+        }
+        cells.entry("Transition_is_defined_in_State_Machine_Definition".into()).or_default()
+            .push(fact_from_pairs(&[
+                ("Transition", "populate_facts"),
+                ("State Machine Definition", "MergeSM"),
+            ]));
+        cells.entry("Transition_is_from_Status".into()).or_default()
+            .push(fact_from_pairs(&[("Transition", "populate_facts"), ("Status", "Proposed")]));
+        cells.entry("Transition_is_to_Status".into()).or_default()
+            .push(fact_from_pairs(&[("Transition", "populate_facts"), ("Status", "Facts Populated")]));
+        cells.entry("Transition_is_triggered_by_Fact_Type".into()).or_default()
+            .push(fact_from_pairs(&[("Transition", "populate_facts"), ("Fact Type", "Merge_facts_populated")]));
+        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect())
+    }
+
+    /// `compile_state_machine_from_cells("Domain Change", ...)` must
+    /// return the DomainChangeSM compiled state machine — its initial
+    /// status, defined statuses, and transition Func. Even though
+    /// 'Proposed' also appears as MergeSM's initial, the noun argument
+    /// disambiguates.
+    #[test]
+    fn compile_picks_dc_sm_for_domain_change_noun_despite_shared_status() {
+        let cells = two_sms_sharing_proposed_status();
+        let constraints: Vec<CompiledConstraint> = vec![];
+        let dc = compile_state_machine_from_cells("Domain Change", &cells, &constraints)
+            .expect("Domain Change must have an SM");
+        assert_eq!(dc.noun_name, "Domain Change");
+        assert_eq!(dc.initial, "Proposed");
+        let dc_statuses: std::collections::BTreeSet<&str> =
+            dc.statuses.iter().map(String::as_str).collect();
+        assert_eq!(dc_statuses,
+            ["Approved", "Proposed"].into_iter().collect::<std::collections::BTreeSet<&str>>(),
+            "Domain Change SM must contain only its own statuses, not Merge's");
+        // The transition Func should fire on Domain Change's event, not Merge's.
+        let defs = Object::phi();
+        assert_eq!(step(&dc.func, "Proposed", "User_approves_DC", &defs), "Approved");
+        // Merge's event should be a no-op for DC's SM.
+        assert_eq!(step(&dc.func, "Proposed", "Merge_facts_populated", &defs), "Proposed",
+            "DC's SM must NOT fire Merge's transition trigger");
+    }
+
+    /// Symmetric: `compile_state_machine_from_cells("Merge", ...)`
+    /// must return the MergeSM, not DomainChangeSM, even though both
+    /// share 'Proposed'.
+    #[test]
+    fn compile_picks_merge_sm_for_merge_noun_despite_shared_status() {
+        let cells = two_sms_sharing_proposed_status();
+        let constraints: Vec<CompiledConstraint> = vec![];
+        let merge = compile_state_machine_from_cells("Merge", &cells, &constraints)
+            .expect("Merge must have an SM");
+        assert_eq!(merge.noun_name, "Merge");
+        assert_eq!(merge.initial, "Proposed");
+        let merge_statuses: std::collections::BTreeSet<&str> =
+            merge.statuses.iter().map(String::as_str).collect();
+        assert_eq!(merge_statuses,
+            ["Facts Populated", "Merged", "Proposed"].into_iter().collect::<std::collections::BTreeSet<&str>>(),
+            "Merge SM must contain only its own statuses, not Domain Change's");
+        let defs = Object::phi();
+        assert_eq!(step(&merge.func, "Proposed", "Merge_facts_populated", &defs), "Facts Populated");
+        // DC's event should be a no-op for Merge's SM.
+        assert_eq!(step(&merge.func, "Proposed", "User_approves_DC", &defs), "Proposed",
+            "Merge's SM must NOT fire DC's transition trigger");
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
