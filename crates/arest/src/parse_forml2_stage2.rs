@@ -2272,6 +2272,7 @@ pub fn translate_instance_facts_with_ft_ids(
 fn strip_role_literals(text: &str, roles: &[(String, Option<String>)]) -> String {
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0usize;
+    let escapes = QuoteEscapeTable::boot();
     for (noun, lit) in roles {
         let Some(rel) = text[cursor..].find(noun.as_str()) else {
             // Reading doesn't align with roles — return original text
@@ -2284,13 +2285,16 @@ fn strip_role_literals(text: &str, roles: &[(String, Option<String>)]) -> String
         // Copy text up to and including the noun.
         out.push_str(&text[cursor..after_noun]);
         cursor = after_noun;
-        // If a literal follows (whitespace + `'…'`), skip it.
+        // If a literal follows (whitespace + `'…'`), skip it. Dispatch
+        // close-quote scan through QuoteEscapeTable so doubled-quote
+        // escapes inside the literal don't terminate the literal early
+        // — same fix as extract_following_literal_span in stage1.
         if let Some(_lit_str) = lit {
             let tail = &text[cursor..];
             let after_ws = tail.trim_start();
             let ws_len = tail.len() - after_ws.len();
             if after_ws.starts_with('\'') {
-                if let Some(end) = after_ws[1..].find('\'') {
+                if let Some(end) = escapes.find_close(&after_ws[1..]) {
                     cursor += ws_len + 1 + end + 1;
                 }
             }
@@ -6667,6 +6671,30 @@ mod tests {
     fn quote_escape_table_unterminated_returns_none() {
         let table = super::QuoteEscapeTable::boot();
         assert_eq!(table.find_close("no close quote here"), None);
+    }
+
+    /// Coupled regression: `strip_role_literals` (line 2272) ALSO scans
+    /// for the close-quote of role literals — this time to STRIP them
+    /// before reconstructing the canonical FT id. Without dispatching
+    /// through QuoteEscapeTable, an instance fact like `Task '262' has
+    /// Task Description 'Driver for QEMU''s ...'.` survives stage-1 parse
+    /// (post-fix), lands in InstanceFact with the decoded value, but the
+    /// canonical id rebuild in fan-out picks up garbage past the early
+    /// false-close — so fieldName falls back to `has` and the fact never
+    /// reaches the per-FT `Task_has_Task_Description` cell. With the
+    /// dispatch in place, the reading round-trips end-to-end.
+    #[test]
+    fn strip_role_literals_skips_doubled_quote_inside_value() {
+        let text = "Task '262' has Task Description 'Driver for QEMU''s NIC.'";
+        let roles = alloc::vec![
+            ("Task".to_string(), Some("262".to_string())),
+            ("Task Description".to_string(), Some("Driver for QEMU's NIC.".to_string())),
+        ];
+        let stripped = super::strip_role_literals(text, &roles);
+        assert_eq!(stripped, "Task has Task Description",
+            "stripped text must be the canonical reading; if the close-\
+             quote scanner trips on `''`, the literal isn't fully stripped \
+             and the canonical FT id resolution fails.");
     }
 
     // ─── #833 layer 5: set constraint kind table ──────────────────────
