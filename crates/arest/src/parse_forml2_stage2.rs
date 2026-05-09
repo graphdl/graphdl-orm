@@ -498,6 +498,64 @@ impl RingAdjectiveTable {
     }
 }
 
+/// #783 first slice — `is_word_comparator_clause` in `parse_forml2.rs`
+/// scans for an inline 8-entry `COMPARATORS` const (` exceeds `,
+/// ` is greater than `, ` is less than `, ` is at least `,
+/// ` is at most `, ` is more than `, ` equals `, ` is equal to `).
+/// Each entry was stored already wrapped in spaces so substring search
+/// matched on word boundaries. The lift moves the comparator vocabulary
+/// to a typed `WordComparatorTable` reading the `Word Comparator`
+/// grammar enum. Boot-table rows store the bare phrase (no surrounding
+/// spaces) — same convention as `RingAdjectiveTable` per #791. The
+/// caller adds spaces at use site to preserve word-boundary semantics.
+#[derive(Debug, Clone)]
+pub struct WordComparatorTable {
+    /// The eight word-form comparator phrases. Order matches the
+    /// `'exceeds', 'is greater than', ...` declaration in
+    /// readings/forml2-grammar.md and the legacy `COMPARATORS` const
+    /// in `is_word_comparator_clause` so first-match-wins iteration
+    /// behavior round-trips.
+    pub rows: Vec<String>,
+}
+
+impl WordComparatorTable {
+    /// Boot table — must stay in sync with `Word Comparator` enum-value
+    /// declaration in `readings/forml2-grammar.md`. Eight phrases in
+    /// the same declaration order as the legacy `COMPARATORS` const.
+    pub fn boot() -> Self {
+        WordComparatorTable {
+            rows: alloc::vec![
+                "exceeds".to_string(),
+                "is greater than".to_string(),
+                "is less than".to_string(),
+                "is at least".to_string(),
+                "is at most".to_string(),
+                "is more than".to_string(),
+                "equals".to_string(),
+                "is equal to".to_string(),
+            ],
+        }
+    }
+
+    /// Build the table from the runtime `Word Comparator` enum-value
+    /// declaration. Falls back to `boot()` when the cell is empty
+    /// (bare engine, no metamodel loaded).
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_enum_values(state, "Word Comparator");
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            WordComparatorTable { rows }
+        }
+    }
+
+    /// Iterate the comparators in declaration order. Phrases lack
+    /// surrounding spaces; use `spaced()` for the substring-search form.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.rows.iter().map(|s| s.as_str())
+    }
+}
+
 /// #788 — `parse_deontic_text_predicate` matches one of four suffixes
 /// on a deontic-constraint prefix (` ends with`, ` does not end with`,
 /// ` starts with`, ` does not start with`) and decodes (kind, negated).
@@ -4443,7 +4501,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 38, "noun count");
+        assert_eq!(noun_count, 39, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -4455,7 +4513,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 27, "enum-valued noun count");
+        assert_eq!(enum_count, 28, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -6318,6 +6376,47 @@ mod tests {
         let table = super::ConstraintSpanPrefixTable::from_grammar_state(&state);
         assert_eq!(table.rows.len(), 11,
             "empty grammar state falls back to the 11-prefix boot table");
+    }
+
+    // ─── #783 first slice: word comparator table ─────────────────────
+
+    /// #783 — `is_word_comparator_clause` in parse_forml2.rs has an
+    /// 8-entry inline `COMPARATORS` const (` exceeds `, ` is greater
+    /// than `, ...). First slice of the Sweep-1c migration: lift the
+    /// const to a typed `WordComparatorTable` reading from the
+    /// `Word Comparator` grammar enum. Boot table preserves the
+    /// declaration order so the iteration semantics — first matching
+    /// keyword wins, both sides must reference declared nouns — round-
+    /// trip without surprise.
+    #[test]
+    fn word_comparator_table_boot_has_eight_comparators_in_declared_order() {
+        let table = super::WordComparatorTable::boot();
+        let words: Vec<&str> = table.iter().collect();
+        assert_eq!(words, vec![
+            "exceeds", "is greater than", "is less than",
+            "is at least", "is at most", "is more than",
+            "equals", "is equal to",
+        ],
+        "boot table must mirror the historic COMPARATORS const, in \
+         declaration order, so is_word_comparator_clause returns the \
+         same result for every input.");
+    }
+
+    #[test]
+    fn word_comparator_table_from_grammar_state_reads_enum_values() {
+        let state = synthetic_enum_state(&[
+            ("Word Comparator", &["foo", "bar baz"]),
+        ]);
+        let table = super::WordComparatorTable::from_grammar_state(&state);
+        assert_eq!(table.rows, vec!["foo", "bar baz"]);
+    }
+
+    #[test]
+    fn word_comparator_table_falls_back_to_boot_on_empty_state() {
+        let state = synthetic_enum_state(&[]);
+        let table = super::WordComparatorTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 8,
+            "empty grammar state falls back to the 8-comparator boot table");
     }
 
     // ─── #833 layer 5: set constraint kind table ──────────────────────

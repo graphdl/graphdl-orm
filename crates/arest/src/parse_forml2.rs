@@ -346,21 +346,21 @@ fn is_bare_value_comparison(clause: &str, noun_names: &[String]) -> bool {
 }
 
 fn is_word_comparator_clause(clause: &str, noun_names: &[String]) -> bool {
-    const COMPARATORS: &[&str] = &[
-        " exceeds ", " is greater than ", " is less than ",
-        " is at least ", " is at most ", " is more than ",
-        " equals ", " is equal to ",
-    ];
-    COMPARATORS.iter().any(|kw| {
-        let Some(idx) = clause.find(kw) else { return false; };
+    // #783 first slice — vocabulary lifts to WordComparatorTable so the
+    // 8 phrases live in `readings/forml2-grammar.md` as a `Word Comparator`
+    // enum value type. Boot stays in sync with the grammar; same first-
+    // match-wins iteration as the legacy COMPARATORS const.
+    crate::parse_forml2_stage2::WordComparatorTable::boot().iter().any(|kw| {
+        let needle = alloc::format!(" {} ", kw);
+        let Some(idx) = clause.find(&needle) else { return false; };
         let lhs = clause[..idx].trim();
-        let rhs = clause[idx + kw.len()..].trim();
+        let rhs = clause[idx + needle.len()..].trim();
         let side_has_noun = |side: &str| noun_names.iter().any(|n| {
             // Whole-side match or noun as a whole-word substring.
             side == n
-                || side.starts_with(&format!("{} ", n))
-                || side.ends_with(&format!(" {}", n))
-                || side.contains(&format!(" {} ", n))
+                || side.starts_with(&alloc::format!("{} ", n))
+                || side.ends_with(&alloc::format!(" {}", n))
+                || side.contains(&alloc::format!(" {} ", n))
         });
         side_has_noun(lhs) && side_has_noun(rhs)
     })
