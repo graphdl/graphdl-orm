@@ -83,6 +83,12 @@ Each noun has at most one SM definition. If you need several concurrent workflow
 
 The alethic constraint `For each Noun, at most one State Machine Definition is for that Noun.` is in the metamodel and will reject multiple SMs on one noun.
 
+## Shared status names across SMs
+
+Two SMs on different nouns may declare the same status name (e.g. both `Domain Change` and `Merge` have a `Proposed`). The engine disambiguates by the explicit `State Machine Definition is for Noun` binding — `Status 'Proposed'` lives in `DomainChangeSM` for Domain Change entities and in `MergeSM` for Merge entities. They do not collide.
+
+The disambiguation only works when each SM declares the binding explicitly. A reading like `Initial Merge Status is 'Proposed'` (without a `State Machine Definition is for Noun 'Merge'` line) leaves the noun unbound — `compile_sm_init_for` is per-noun, so no SM init derivation fires for unbound entities. Pinned by `compile_picks_dc_sm_for_domain_change_noun_despite_shared_status` and `compile_picks_merge_sm_for_merge_noun_despite_shared_status` in `crates/arest/src/compile.rs`.
+
 ## Deontic liveness
 
 Transition graphs may contain cycles. The metamodel asserts:
