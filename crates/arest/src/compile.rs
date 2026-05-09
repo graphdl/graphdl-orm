@@ -1379,12 +1379,28 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                 (cm, pm)
             },
         );
-    defs.extend(children_map.iter().map(|(noun, children)|
-        (format!("nav:{}:children", noun), Func::constant(Object::Seq(children.iter().map(|c| Object::atom(c)).collect())))
-    ));
-    defs.extend(parent_map.iter().map(|(noun, parents)|
-        (format!("nav:{}:parent", noun), Func::constant(Object::Seq(parents.iter().map(|p| Object::atom(p)).collect())))
-    ));
+    // Emit nav:{n}:children and nav:{n}:parent for EVERY entity noun,
+    // even when the projection is empty. Without this, a recompile that
+    // drops a noun (or filters out its prior nav contributions, e.g.
+    // value-typed sides per the entity-only filter above) leaves the
+    // OLD def in the persisted state. defs_to_state's overlay then
+    // shows the stale list. Emitting an empty Seq for missing nouns
+    // forces the overlay to REPLACE rather than ADD, so each compile
+    // cycle produces a complete and self-consistent nav-def snapshot.
+    let entity_nouns: Vec<&str> = c_nouns.iter()
+        .filter(|(_, nd)| nd.object_type != "value")
+        .map(|(name, _)| name.as_str())
+        .collect();
+    defs.extend(entity_nouns.iter().map(|noun| {
+        let children = children_map.get(*noun).cloned().unwrap_or_default();
+        (format!("nav:{}:children", noun),
+         Func::constant(Object::Seq(children.iter().map(|c| Object::atom(c)).collect())))
+    }));
+    defs.extend(entity_nouns.iter().map(|noun| {
+        let parents = parent_map.get(*noun).cloned().unwrap_or_default();
+        (format!("nav:{}:parent", noun),
+         Func::constant(Object::Seq(parents.iter().map(|p| Object::atom(p)).collect())))
+    }));
 
     // â”€â”€ Generator opt-in (resolved above for validate partitioning) â”€â”€
 
