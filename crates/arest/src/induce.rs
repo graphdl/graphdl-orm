@@ -401,6 +401,109 @@ pub fn candidate_derives(
     to_explain.iter().all(|target| target_in_post_state(target, &post_state))
 }
 
+/// #851 — Search loop. Enumerate every candidate of shape `ft_id`,
+/// gate by alethic constraints (#850), then by forward-chain coverage
+/// of `to_explain` (#849), and emit one Hypothesis Candidate fact per
+/// surviving candidate per the schema in `readings/core/induction.md`.
+///
+/// Empty `to_explain` skips the chain check (open-ended search — emit
+/// every constraint-satisfying candidate). Non-empty requires every
+/// fact in `to_explain` to materialise after forward-chain LFP on the
+/// state augmented with the candidate.
+///
+/// Each emitted Hypothesis Candidate fact carries:
+///   - `id`: deterministic, hyp-{ft_id}-{idx} so callers can de-dup
+///     across re-runs.
+///   - cell `Hypothesis_Candidate_has_hidden__Fact`: the candidate's
+///     projected per-FT shape (the atomic fact whose addition to P
+///     would explain the targets).
+///   - cell `Hypothesis_Candidate_explains_Fact`: per-target pointers
+///     in the same projected per-FT shape (empty when to_explain is
+///     empty).
+/// No scoring (Confidence Score) is attached — that's #852.
+///
+/// `state` (used for enumeration + projection) and `defs` (compiled
+/// def overlays for `validate` + `derivation:*`) are the same shape
+/// the caller already builds for #849/#850. Callers that fetch
+/// observations + compiled defs as a single Map (typical: post-
+/// `defs_to_state` overlay) can pass it as both arguments.
+///
+/// Returns an empty Vec when no candidate survives (cartesian product
+/// is empty, every candidate violates a constraint, or every candidate
+/// fails the chain check). Callers wrap in `Object::seq` for FFP-shape
+/// emission.
+pub fn run_search(
+    state: &Object,
+    defs: &Object,
+    ft_id: &str,
+    to_explain: &[Object],
+) -> Vec<Object> {
+    let candidates = enumerate_candidates_for_fact_type(state, ft_id);
+    let mut hyps: Vec<Object> = Vec::with_capacity(candidates.len());
+    for (idx, candidate) in candidates.iter().enumerate() {
+        if !candidate_passes_constraints(state, defs, candidate) { continue; }
+        if !to_explain.is_empty()
+            && !candidate_derives(state, defs, candidate, to_explain) {
+            continue;
+        }
+        hyps.push(build_hypothesis_candidate(ft_id, idx, candidate, to_explain));
+    }
+    hyps
+}
+
+/// Encode a single Hypothesis Candidate per `readings/core/induction.md`.
+/// Cell-shaped: a Map carrying `id` + the two link-cells the schema
+/// declares (`Hypothesis Candidate has hidden- Fact`,
+/// `Hypothesis Candidate explains Fact`). Cell names use the
+/// `parse_forml2_stage2` convention `<Subject>_<verb>_<Object>` with
+/// hyphenated qualifiers underscore-doubled (matches the FT id
+/// `Hypothesis_Candidate_has_hidden__Fact` the FORML2 stage-2 emits
+/// from the schema's `has hidden- Fact` reading).
+///
+/// The `id` binding is deterministic on (`ft_id`, `idx`) so re-running
+/// the same search produces stable ids — useful for de-dup across
+/// successive #852 scoring passes.
+///
+/// hidden-Fact carries the candidate's per-FT projected shape (one
+/// fact). explains-Fact carries one per-FT projected fact per
+/// `to_explain` entry (zero when to_explain is empty).
+fn build_hypothesis_candidate(
+    ft_id: &str,
+    idx: usize,
+    candidate: &Object,
+    to_explain: &[Object],
+) -> Object {
+    let id = alloc::format!("hyp-{}-{}", ft_id, idx);
+    let hidden = Object::Seq(
+        Vec::from([project_instance_fact_to_per_ft(candidate)]).into());
+    let explains = Object::Seq(
+        to_explain.iter()
+            .map(project_instance_fact_to_per_ft)
+            .collect::<Vec<Object>>()
+            .into());
+    let mut state = Object::phi();
+    state = crate::ast::store(
+        "Hypothesis_Candidate_has_hidden__Fact", hidden, &state);
+    state = crate::ast::store(
+        "Hypothesis_Candidate_explains_Fact", explains, &state);
+    // Stamp the id as a top-level binding alongside the link cells so
+    // callers can read it via `binding(hyp, "id")` without descending
+    // into a cell. Mirrors how FactType cells carry `id` directly.
+    let id_pair = Object::seq(vec![
+        Object::atom("id"),
+        Object::atom(&id),
+    ]);
+    // The result is a Seq carrying the id binding pair followed by the
+    // two cell triples. `binding` reads the id pair; `fetch_or_phi`
+    // reads the cells. Both shapes coexist because `binding` skips any
+    // non-2-Seq element, and `fetch_or_phi` only matches CELL triples.
+    let cells = state.as_seq().map(|s| s.to_vec()).unwrap_or_default();
+    let mut items: Vec<Object> = Vec::with_capacity(1 + cells.len());
+    items.push(id_pair);
+    items.extend(cells);
+    Object::Seq(items.into())
+}
+
 /// Project an InstanceFact-shaped fact into the per-FT cell shape
 /// `parse_forml2_stage2::instance_fact_field_cells` produces:
 ///   - role 0:  `<subjectNoun, subjectValue>`
@@ -842,5 +945,145 @@ Thing has Other.
              antecedent `Thing has Bar 'present'`; <t1 has Foo \
              'fired'> must NOT derive"
         );
+    }
+
+    // ─── #851 run_search — search loop integration ───────────────────
+
+    /// Acceptance test for the platform_induce search loop (#851).
+    ///
+    /// Schema:
+    ///   Coin(.id) is an entity type. Side is a value type.
+    ///   Side enum: 'heads', 'tails'. Coin has Side.
+    ///   Each Coin has at most one Side.
+    ///
+    /// Observations: one Coin instance c1, no Side asserted.
+    /// to_explain: empty (open-ended search — emit every constraint-
+    /// satisfying candidate).
+    ///
+    /// The search loop must:
+    ///   1. Enumerate `Coin_has_Side` candidates over the c1 × {heads,
+    ///      tails} domain → 2 candidates.
+    ///   2. Each candidate satisfies the UC (count=1 ≤ 1) — both pass
+    ///      `candidate_passes_constraints`.
+    ///   3. With empty `to_explain`, the chain-check is skipped — both
+    ///      candidates emit Hypothesis Candidates.
+    ///   4. Result is a Seq of length 2; each Hypothesis Candidate has
+    ///      a hidden-Fact link to its candidate's projected per-FT
+    ///      atom; explains-Fact is empty (no to_explain).
+    #[test]
+    fn coin_side_no_to_explain_yields_one_hypothesis_per_enum_value() {
+        use crate::ast::{Func, apply, defs_to_state, fetch_or_phi};
+        use crate::types::{ConstraintDef, SpanDef};
+        let mut state = make_state(
+            &[("Coin", "entity"), ("Side", "value")],
+            &[("Coin_has_Side", "Coin has Side", 2)],
+            &[
+                ("Coin_has_Side", "Coin", 0),
+                ("Coin_has_Side", "Side", 1),
+            ],
+            &[("Side", &["heads", "tails"])],
+            // One Coin instance c1, no Side asserted yet.
+            &[vec![
+                ("subjectNoun",  "Coin"),
+                ("subjectValue", "c1"),
+                ("fieldName",    "Coin_exists"),
+                ("objectNoun",   ""),
+                ("objectValue",  ""),
+            ]],
+        );
+        // Layer the UC alethic constraint via the production
+        // constraint encoder so the gate exercises the same path as
+        // #850's tests.
+        let uc = ConstraintDef {
+            id: "uc_each_coin_at_most_one_side".into(),
+            kind: "UC".into(),
+            modality: "Alethic".into(),
+            text: "Each Coin has at most one Side".into(),
+            spans: vec![SpanDef {
+                fact_type_id: "Coin_has_Side".into(),
+                role_index: 0,
+                subset_autofill: None,
+            }],
+            ..Default::default()
+        };
+        let constraint_fact = crate::parse_forml2::constraint_to_fact_test(&uc);
+        state = crate::ast::cell_push("Constraint", constraint_fact, &state);
+
+        // Compile defs from state so the search loop has access to the
+        // `validate` def + `derivation:*` overlays, then register the
+        // induce platform itself so apply() routes through.
+        let mut defs_vec = crate::compile::compile_to_defs_state(&state);
+        defs_vec.push((
+            "induce".to_string(),
+            Func::Platform("induce".to_string()),
+        ));
+        let d = defs_to_state(&defs_vec, &state);
+
+        // Build args: <<ft_id, "Coin_has_Side">, <to_explain, <>>>.
+        // Empty to_explain triggers the open-ended branch (no chain-
+        // check; emit every constraint-satisfying candidate).
+        let args = Object::seq(vec![
+            Object::seq(vec![
+                Object::atom("ft_id"),
+                Object::atom("Coin_has_Side"),
+            ]),
+            Object::seq(vec![
+                Object::atom("to_explain"),
+                Object::phi(),
+            ]),
+        ]);
+
+        let result = apply(&Func::Def("induce".to_string()), &args, &d);
+
+        // Result must be a Seq of 2 Hypothesis Candidate facts.
+        let hyps = result.as_seq().expect(
+            "platform_induce must return a Seq of Hypothesis Candidate facts");
+        assert_eq!(hyps.len(), 2,
+            "expected 2 Hypothesis Candidates (one per Side enum value); \
+             got {} → {:?}", hyps.len(), hyps);
+
+        // Each Hypothesis Candidate must have an id and a hidden-Fact
+        // pointer; with empty to_explain, no explains-Fact pointers.
+        // hidden-Facts collectively span the projected per-FT shape of
+        // both candidates (`<<Coin, c1>, <Side, heads>>` and
+        // `<<Coin, c1>, <Side, tails>>`).
+        let mut sides_seen: Vec<String> = Vec::new();
+        for hyp in hyps.iter() {
+            let hyp_id = binding(hyp, "id").expect(
+                "every Hypothesis Candidate must carry an id binding");
+            assert!(!hyp_id.is_empty(),
+                "Hypothesis Candidate id must not be empty: {:?}", hyp);
+            // The candidate's projected per-FT shape lives on the
+            // `Coin_has_Side` cell of the post-state attached to the
+            // hyp via hidden-Fact. Grab the cell's binding for `Side`
+            // and confirm it's one of {heads, tails}.
+            let hidden = fetch_or_phi("Hypothesis_Candidate_has_hidden__Fact", hyp);
+            let hidden_facts = hidden.as_seq().expect(
+                "hidden-Fact link must be present as a Seq of pointers");
+            assert_eq!(hidden_facts.len(), 1,
+                "single-candidate Hypothesis Candidate must have one \
+                 hidden-Fact pointer; got {:?}", hidden_facts);
+            let pointer = &hidden_facts[0];
+            // Pointer is a fact carrying the candidate's per-FT shape:
+            // `<<Coin, c1>, <Side, X>>`.
+            assert_eq!(binding(pointer, "Coin"), Some("c1"),
+                "hidden-Fact pointer must reference Coin c1; got {:?}",
+                pointer);
+            let side_value = binding(pointer, "Side").expect(
+                "hidden-Fact pointer must carry a Side binding");
+            sides_seen.push(side_value.to_string());
+            // explains-Fact is empty when to_explain is empty.
+            let explains = fetch_or_phi("Hypothesis_Candidate_explains_Fact", hyp);
+            let explains_seq = explains.as_seq().expect(
+                "explains-Fact link must be present (possibly empty Seq) \
+                 even when no to_explain facts are supplied");
+            assert!(explains_seq.is_empty(),
+                "explains-Fact must be empty when to_explain is empty; \
+                 got {:?}", explains_seq);
+        }
+        sides_seen.sort();
+        assert_eq!(sides_seen, vec!["heads".to_string(), "tails".to_string()],
+            "expected one Hypothesis Candidate per Side enum value \
+             (heads, tails); got {:?}", sides_seen);
     }
 }

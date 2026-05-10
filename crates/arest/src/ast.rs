@@ -2670,14 +2670,45 @@ fn platform_verify_signature(x: &Object) -> Object {
     Object::atom(match ok { true => "true", false => "false" })
 }
 
-/// #846 stub for the `induce` def (Func::Platform name "induce").
-/// Future tasks #848-#852 add the search loop; until then this returns
-/// phi so callers can distinguish "induce ran but found nothing" from
-/// "induce was never wired" (the latter would yield Object::Bottom from
-/// apply_platform's fallback path).
+/// #851 — `induce` Func::Platform dispatch. Thin parser that lifts
+/// the search-loop's args off the FFP-shaped `x` operand, then hands
+/// off to `induce::run_search` (the search loop lives in `induce.rs`
+/// alongside the #848-#850 primitives it composes).
+///
+/// Input shape — a Seq of pair-bindings:
+///
+///   <<ft_id, "<FT id>">, <to_explain, <fact₁, fact₂, …>>>
+///
+/// `ft_id` is read via `binding(x, "ft_id")` (atom-valued pair).
+/// `to_explain` is a sub-Seq of InstanceFact-shaped facts; we walk
+/// `x.as_seq()` to find the `<to_explain, …>` pair directly because
+/// `binding` only handles atom-valued pairs.
+///
+/// Empty `x` (Object::phi or no `ft_id` binding) is a no-op — returns
+/// phi. This preserves the #846 stub contract: callers can still
+/// distinguish "induce ran but emitted nothing" from "induce was never
+/// wired" (the latter yields Object::Bottom from `apply_platform`'s
+/// fallback).
+///
+/// `d` carries both the compiled defs (validate, derivation:*) AND the
+/// observation cells (post-`defs_to_state` overlay). The search loop
+/// reuses `d` as both `state` and `defs` per the integration the
+/// induce::tests::coin_side_no_to_explain_yields_one_hypothesis_per_enum_value
+/// acceptance test exercises.
 #[cfg(not(feature = "no_std"))]
-fn platform_induce(_x: &Object, _d: &Object) -> Object {
-    Object::phi()
+fn platform_induce(x: &Object, d: &Object) -> Object {
+    let Some(ft_id) = binding(x, "ft_id") else { return Object::phi(); };
+    if ft_id.is_empty() { return Object::phi(); }
+    let to_explain: Vec<Object> = x.as_seq()
+        .and_then(|items| items.iter().find_map(|p| {
+            let pair = p.as_seq()?;
+            if pair.len() != 2 { return None; }
+            if pair[0].as_atom() != Some("to_explain") { return None; }
+            pair[1].as_seq().map(|s| s.to_vec())
+        }))
+        .unwrap_or_default();
+    let hyps = crate::induce::run_search(d, d, ft_id, &to_explain);
+    Object::Seq(hyps.into())
 }
 
 /// compile ∘ parse: readings text → new defs merged into D.
