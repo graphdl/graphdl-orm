@@ -272,6 +272,61 @@ fn build_candidate_fact(
     fact_from_pairs(&pair_refs)
 }
 
+/// #850 — Per-candidate constraint-violation gate. Build state' =
+/// observations + candidate, run the existing `validate` def, return
+/// true iff no violations surface.
+///
+/// Reuses `ast::apply(Func::Def("validate"), ctx, d)` and
+/// `ast::decode_violations` — same shape as the compile-rejection
+/// path for alethic constraints (see
+/// `mc_violation_alethic_rejects_at_compile_time` in
+/// `crates/arest/src/compile.rs`).
+///
+/// `candidate` is shaped as an InstanceFact (canonical layout from
+/// `enumerate_candidates_for_fact_type` / stage-2): bindings carry
+/// `subjectNoun` / `subjectValue` / `fieldName` / `objectNoun` /
+/// `objectValue` (+ `roleNNoun` / `roleNValue` for ternary+). The
+/// `fieldName` binding names the FactType id whose cell receives the
+/// candidate when projected into per-cell shape — same projection
+/// `parse_forml2_stage2::instance_fact_field_cells` performs at
+/// stage-2 build time.
+///
+/// `defs` is the already-compiled defs Object (built by the caller
+/// once via `compile::compile_to_defs_state` + `ast::defs_to_state`)
+/// so the search loop in #851 can reuse one compile across many
+/// candidate checks.
+///
+/// Returns `true` when no `validate` violation surfaces (candidate is
+/// admissible) and `false` otherwise. A candidate with no `fieldName`
+/// (or an empty one) is treated as inert — there's no cell to push it
+/// into, so it cannot violate anything; returns `true`.
+pub fn candidate_passes_constraints(
+    state: &Object,
+    defs: &Object,
+    candidate: &Object,
+) -> bool {
+    let Some(ft_id) = binding(candidate, "fieldName") else { return true; };
+    if ft_id.is_empty() { return true; }
+    // Project the InstanceFact-shaped candidate to the per-FT cell
+    // shape `validate` reads. Reuses #849's projection helper so the
+    // gate and the chain-check stay shape-aligned (one source of
+    // truth for cell-fact translation).
+    let projected = project_instance_fact_to_per_ft(candidate);
+    let state_prime = crate::ast::cell_push(ft_id, projected, state);
+    // Encode eval context off the candidate-augmented state so
+    // `validate`'s constraint funcs (which read the population via
+    // Selector(4) / `extract_facts_func`) see the candidate alongside
+    // the existing observations. `defs` carries the compiled Func
+    // table — including `validate` itself — built once by the caller.
+    let ctx = crate::ast::encode_eval_context_state("", None, &state_prime);
+    let violations_obj = crate::ast::apply(
+        &crate::ast::Func::Def("validate".to_string()),
+        &ctx,
+        defs,
+    );
+    crate::ast::decode_violations(&violations_obj).is_empty()
+}
+
 /// #849 — Per-candidate forward-chain check. Build state' = observations
 /// + candidate, run forward_chain_defs_state, return whether every fact
 /// in `to_explain` is present in the LFP closure.
@@ -595,6 +650,110 @@ mod tests {
         assert!(candidates.is_empty(),
             "expected empty result when role domain is empty; got {:?}",
             candidates);
+    }
+
+    // ─── #850 candidate_passes_constraints ────────────────────────
+
+    /// Build a state with a UC alethic constraint on the role-0 of an
+    /// `X has Foo` binary FT (`Each X has at most one Foo`). Reuses
+    /// `make_state` for the schema cells, then layers the Constraint
+    /// cell on top via `parse_forml2::constraint_to_fact_test` so the
+    /// constraint encoding stays in sync with the production parser.
+    fn state_with_uc_each_x_has_at_most_one_foo() -> Object {
+        use crate::types::{ConstraintDef, SpanDef};
+        let mut state = make_state(
+            &[("X", "entity"), ("Foo", "value")],
+            &[("X_has_Foo", "X has Foo", 2)],
+            &[
+                ("X_has_Foo", "X", 0),
+                ("X_has_Foo", "Foo", 1),
+            ],
+            &[("Foo", &["a", "b"])],
+            // Seed one X instance via an InstanceFact so the entity-side
+            // domain is non-empty for downstream candidate emission.
+            &[vec![
+                ("subjectNoun",  "X"),
+                ("subjectValue", "x1"),
+                ("fieldName",    "X_exists"),
+                ("objectNoun",   ""),
+                ("objectValue",  ""),
+            ]],
+        );
+        let uc = ConstraintDef {
+            id: "uc_each_x_at_most_one_foo".into(),
+            kind: "UC".into(),
+            modality: "Alethic".into(),
+            text: "Each X has at most one Foo".into(),
+            spans: vec![SpanDef {
+                fact_type_id: "X_has_Foo".into(),
+                role_index: 0,
+                subset_autofill: None,
+            }],
+            ..Default::default()
+        };
+        let constraint_fact = crate::parse_forml2::constraint_to_fact_test(&uc);
+        // make_state emits a Seq store; cell_push correctly appends a
+        // Constraint cell on top, leaving the schema cells intact.
+        state = crate::ast::cell_push("Constraint", constraint_fact, &state);
+        state
+    }
+
+    /// Build an InstanceFact-shaped candidate for `X has Foo` matching
+    /// the canonical layout `enumerate_candidates_for_fact_type` emits.
+    fn x_has_foo_candidate(x_value: &str, foo_value: &str) -> Object {
+        fact_from_pairs(&[
+            ("subjectNoun",  "X"),
+            ("subjectValue", x_value),
+            ("fieldName",    "X_has_Foo"),
+            ("objectNoun",   "Foo"),
+            ("objectValue",  foo_value),
+        ])
+    }
+
+    /// One candidate, no observations: a single `<X has Foo>` fact
+    /// satisfies `Each X has at most one Foo` (one is ≤ one). The gate
+    /// must accept this candidate. Drives the no-violation branch
+    /// straight through `validate` — the same path #851's search loop
+    /// will exercise on every viable hypothesis.
+    #[test]
+    fn candidate_satisfying_all_constraints_returns_true() {
+        let state = state_with_uc_each_x_has_at_most_one_foo();
+        let defs_vec = crate::compile::compile_to_defs_state(&state);
+        let d = crate::ast::defs_to_state(&defs_vec, &state);
+        let candidate = x_has_foo_candidate("x1", "a");
+        assert!(
+            candidate_passes_constraints(&state, &d, &candidate),
+            "single <x1, Foo a> candidate satisfies UC `Each X has at most one Foo` \
+             (count = 1); gate must return true"
+        );
+    }
+
+    /// Same schema, but observations already contain `<x1 has Foo a>`.
+    /// The candidate `<x1 has Foo b>` adds a second Foo for x1 — UC
+    /// fires (count = 2 > 1). Gate must reject. Drives the violation
+    /// branch through `validate`'s alethic path, mirroring how the
+    /// compile-rejection harness in
+    /// `mc_violation_alethic_rejects_at_compile_time` (compile.rs)
+    /// surfaces alethic violations to the platform.
+    #[test]
+    fn candidate_violating_alethic_uc_returns_false() {
+        let mut state = state_with_uc_each_x_has_at_most_one_foo();
+        // Pre-load the FT cell with the existing `<x1, a>` observation
+        // in per-cell shape so `validate` reads it identically to a
+        // stage-2-emitted fact (matches `instance_fact_field_cells`).
+        state = crate::ast::cell_push(
+            "X_has_Foo",
+            fact_from_pairs(&[("X", "x1"), ("Foo", "a")]),
+            &state,
+        );
+        let defs_vec = crate::compile::compile_to_defs_state(&state);
+        let d = crate::ast::defs_to_state(&defs_vec, &state);
+        let candidate = x_has_foo_candidate("x1", "b");
+        assert!(
+            !candidate_passes_constraints(&state, &d, &candidate),
+            "candidate <x1, Foo b> on top of observation <x1, Foo a> violates \
+             UC `Each X has at most one Foo` (count = 2); gate must return false"
+        );
     }
 
     // ─── #849 candidate_derives ───────────────────────────────────────
