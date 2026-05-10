@@ -127,7 +127,14 @@ pub mod compile;
 pub mod evaluate;
 #[cfg(not(feature = "no_std"))]
 pub mod query;
-// induce.rs deleted — zero production callers, tests were self-referential.
+// induce.rs (#848-#852) — induction engine search primitives.
+// First helper `enumerate_candidates_for_fact_type` (#848) lands the
+// single-fact-type candidate enumeration that #851's search loop will
+// drive. The historical induce.rs (deleted in 77edd7b3 per #211) was
+// constraint-induction logic with zero production callers; this is a
+// new file with a different purpose — search primitives only,
+// consumed by the platform `induce` Func registered in #846.
+pub mod induce;
 // rmap.rs is no_std-clean as of #653: hashbrown for HashMap/HashSet,
 // alloc for String/Vec, serde derives + the two `serde_json` Func-tree
 // entry points (`rmap_func` / `decode_rmap_result`) cfg-gated on
