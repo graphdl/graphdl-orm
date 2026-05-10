@@ -265,6 +265,7 @@ fn load_and_compile(conn: &rusqlite::Connection) -> ast::Object {
     defs.push(("apply".to_string(), ast::Func::Platform("apply_command".to_string())));
     defs.push(("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())));
     defs.push(("audit".to_string(), ast::Func::Platform("audit".to_string())));
+    defs.push(("induce".to_string(), ast::Func::Platform("induce".to_string())));
     let d = ast::defs_to_state(&defs, &loaded);
     eprintln!("[profile] compile: {:?} ({} defs)", t.elapsed(), defs.len());
     d

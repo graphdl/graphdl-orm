@@ -2386,6 +2386,7 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
         "compile" => platform_compile(x, d),
         "apply_command" => platform_apply_command(x, d),
         "verify_signature" => platform_verify_signature(x),
+        "induce" => platform_induce(x, d),
         // Codd θ₁ relational operators: take runtime data that cannot be
         // parameterized in compile-time FFP combining forms. Routing via
         // Platform lets each runtime (server, FPGA, Solidity) provide its
@@ -2667,6 +2668,16 @@ fn platform_verify_signature(x: &Object) -> Object {
     let signature = match parts[2].as_atom() { Some(s) => s, None => return Object::Bottom };
     let ok = crate::crypto::verify_signature(sender, payload, signature);
     Object::atom(match ok { true => "true", false => "false" })
+}
+
+/// #846 stub for the `induce` def (Func::Platform name "induce").
+/// Future tasks #848-#852 add the search loop; until then this returns
+/// phi so callers can distinguish "induce ran but found nothing" from
+/// "induce was never wired" (the latter would yield Object::Bottom from
+/// apply_platform's fallback path).
+#[cfg(not(feature = "no_std"))]
+fn platform_induce(_x: &Object, _d: &Object) -> Object {
+    Object::phi()
 }
 
 /// compile ∘ parse: readings text → new defs merged into D.
@@ -8459,6 +8470,26 @@ mod tests {
             result.as_atom(),
             Some("⊥ field 'fields' exceeds platform buffer"),
         );
+    }
+
+    // ── induce stub (#846) ───────────────────────────────────────────
+
+    #[test]
+    fn induce_def_apply_returns_phi() {
+        // Wire 'induce' as a Func::Platform name → platform_induce stub.
+        // Future tasks (#848-#852) replace the stub body with the search
+        // loop; until then it must return phi so callers can distinguish
+        // "induce ran but found nothing" from "induce was never wired"
+        // (the latter would yield Object::Bottom from apply_platform's
+        // fallback path).
+        let defs = [(
+            "induce".to_string(),
+            Func::Platform("induce".to_string()),
+        )];
+        let d = defs_to_state(&defs, &Object::phi());
+        let result = apply(&Func::Def("induce".to_string()), &Object::phi(), &d);
+        assert_eq!(result, Object::phi(),
+            "Func::Def(\"induce\") must dispatch to platform_induce stub which returns phi");
     }
 
     // ── normalize() — Backus §12 algebraic rewrite pass ─────────────
