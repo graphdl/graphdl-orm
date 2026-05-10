@@ -272,6 +272,140 @@ fn build_candidate_fact(
     fact_from_pairs(&pair_refs)
 }
 
+/// #849 — Per-candidate forward-chain check. Build state' = observations
+/// + candidate, run forward_chain_defs_state, return whether every fact
+/// in `to_explain` is present in the LFP closure.
+///
+/// Reuses `ast::forward_chain_defs_state` and `ast::cells_iter` — no
+/// new combining-form wiring. The candidate is shaped as InstanceFact
+/// (canonical 5-pair-prefix layout from #848); the function projects it
+/// into the appropriate per-FT cell (per `fieldName` binding) before
+/// chain. Mirrors the projection
+/// `parse_forml2_stage2::instance_fact_field_cells` performs at stage-2
+/// build time so the derivation rule sees the same shape it would in a
+/// regular load path. `to_explain` facts use the same InstanceFact
+/// shape and are projected the same way for membership lookup.
+///
+/// `state` carries the observation cells (per-FT cells the candidate
+/// pushes into and to_explain reads from). `defs` is the already-
+/// compiled defs Object (built by the caller once via
+/// `compile::compile_to_defs_state` + `ast::defs_to_state`) so the
+/// search loop in #851 can reuse one compile across many candidate
+/// checks. We merge state' onto defs so the chained input carries
+/// both the rule cells and the post-candidate observation cells.
+///
+/// Returns `false` early when:
+///   - the candidate has no `fieldName` binding (or it's empty) — no
+///     cell to push to means no derivation can fire from it;
+///   - any fact in `to_explain` lacks a `fieldName` (we cannot locate
+///     the cell to look it up in).
+/// Returns `true` only when EVERY `to_explain` fact materializes in
+/// post-state cells after forward-chain LFP.
+pub fn candidate_derives(
+    state: &Object,
+    defs: &Object,
+    candidate: &Object,
+    to_explain: &[Object],
+) -> bool {
+    let Some(ft_id) = binding(candidate, "fieldName") else { return false; };
+    if ft_id.is_empty() { return false; }
+
+    // Project the InstanceFact-shaped candidate to the per-FT cell
+    // shape, then push into state. Same projection
+    // `parse_forml2_stage2::instance_fact_field_cells` performs.
+    let projected = project_instance_fact_to_per_ft(candidate);
+    let state_with_candidate = crate::ast::cell_push(ft_id, projected, state);
+
+    // Merge state' onto defs so the chained input carries both the
+    // metadata + rule cells (from defs) AND the post-candidate
+    // observation cells. `merge_states` concat-dedups overlapping
+    // cells, so existing observation cells in defs (e.g. seeded
+    // domain instances) survive alongside the freshly pushed
+    // candidate cell.
+    let chained_input = crate::ast::merge_states(defs, &state_with_candidate);
+
+    // Collect derivation refs from defs. Cover both stratum-1
+    // (positive) and stratum-2 (negation-guarded) prefixes — same
+    // dispatch shape `command::create_via_defs` uses, so the
+    // candidate-check sees the same rule surface a regular create
+    // would.
+    let refs_owned: Vec<(String, crate::ast::Func)> = crate::ast::cells_iter(defs).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:") || n.starts_with("derivation_strat2:"))
+        .map(|(n, contents)| (n.to_string(), crate::ast::metacompose(contents, defs)))
+        .collect();
+    let refs: Vec<(&str, &crate::ast::Func)> = refs_owned.iter()
+        .map(|(n, f)| (n.as_str(), f)).collect();
+
+    // Forward-chain to LFP. The returned post_state has all derived
+    // facts integrated into their respective per-FT cells.
+    let (post_state, _derived) =
+        crate::evaluate::forward_chain_defs_state(&refs, &chained_input);
+
+    // Verify each to_explain fact materialized in post_state. All-must-
+    // hold semantics: a single missing fact ⇒ candidate insufficient.
+    to_explain.iter().all(|target| target_in_post_state(target, &post_state))
+}
+
+/// Project an InstanceFact-shaped fact into the per-FT cell shape
+/// `parse_forml2_stage2::instance_fact_field_cells` produces:
+///   - role 0:  `<subjectNoun, subjectValue>`
+///   - role 1:  `<objectNoun (or fieldName when objectNoun is empty),
+///               objectValue>`
+///   - role N≥2: `<roleNNoun, roleNValue>`
+/// Empty trailing roles end the chain.
+fn project_instance_fact_to_per_ft(candidate: &Object) -> Object {
+    let subject_noun = binding(candidate, "subjectNoun").unwrap_or("");
+    let subject_value = binding(candidate, "subjectValue").unwrap_or("");
+    let object_noun = binding(candidate, "objectNoun").unwrap_or("");
+    let object_value = binding(candidate, "objectValue").unwrap_or("");
+    let field_name = binding(candidate, "fieldName").unwrap_or("");
+    // Mirrors `instance_fact_field_cells`: when the FT is unary
+    // (objectNoun empty), the second pair keys on the field_name
+    // itself so the per-cell shape stays self-describing.
+    let object_key = if object_noun.is_empty() { field_name } else { object_noun };
+    let mut pairs: Vec<(String, String)> = Vec::with_capacity(2);
+    pairs.push((subject_noun.to_string(), subject_value.to_string()));
+    pairs.push((object_key.to_string(),    object_value.to_string()));
+    let mut n: usize = 2;
+    loop {
+        let noun_key = alloc::format!("role{}Noun", n);
+        let value_key = alloc::format!("role{}Value", n);
+        let Some(noun) = binding(candidate, &noun_key) else { break };
+        if noun.is_empty() { break; }
+        let value = binding(candidate, &value_key).unwrap_or("");
+        pairs.push((noun.to_string(), value.to_string()));
+        n += 1;
+    }
+    let pair_refs: Vec<(&str, &str)> = pairs.iter()
+        .map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    fact_from_pairs(&pair_refs)
+}
+
+/// Membership test for a `to_explain` fact (InstanceFact-shape) in a
+/// post-LFP state. Project the target to per-FT shape, fetch the
+/// matching per-FT cell, and test for any fact whose bindings
+/// superset-cover the target's. Order-independent (per-FT cells write
+/// pairs in declared role order, but the check tolerates re-ordering
+/// for robustness against future cell-shape evolution).
+fn target_in_post_state(target: &Object, post_state: &Object) -> bool {
+    let Some(ft_id) = binding(target, "fieldName") else { return false; };
+    if ft_id.is_empty() { return false; }
+    let projected = project_instance_fact_to_per_ft(target);
+    let target_pairs: Vec<(&str, &str)> = match projected.as_seq() {
+        Some(items) => items.iter().filter_map(|p| {
+            let kv = p.as_seq()?;
+            if kv.len() != 2 { return None; }
+            Some((kv[0].as_atom()?, kv[1].as_atom()?))
+        }).collect(),
+        None => return false,
+    };
+    let cell = fetch_or_phi(ft_id, post_state);
+    let Some(facts) = cell.as_seq() else { return false; };
+    facts.iter().any(|fact| {
+        target_pairs.iter().all(|(k, v)| binding(fact, k) == Some(*v))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,5 +595,93 @@ mod tests {
         assert!(candidates.is_empty(),
             "expected empty result when role domain is empty; got {:?}",
             candidates);
+    }
+
+    // ─── #849 candidate_derives ───────────────────────────────────────
+
+    /// Compile a tiny FORML2 schema carrying a literal-pinned iff
+    /// derivation rule (`* Thing has Foo 'fired' iff Thing has Bar
+    /// 'present'`). Returns the parsed state plus the unified defs
+    /// map (state's cells + `derivation:*` overlays) so each test
+    /// can push a candidate cell and call `candidate_derives`
+    /// without re-paying compile cost. The literal pinning makes the
+    /// consequent unambiguous (Foo 'fired' from any Thing whose Bar
+    /// is 'present') so the membership check on `to_explain` lines
+    /// up exactly with the derived fact.
+    fn schema_thing_foo_iff_thing_bar() -> (Object, Object) {
+        let src = r#"# Test
+Thing(.Id) is an entity type.
+Id is a value type.
+Foo is a value type.
+Bar is a value type.
+Other is a value type.
+
+## Fact Types
+Thing has Id.
+Thing has Foo.
+Thing has Bar.
+Thing has Other.
+
+## Derivation Rules
+* Thing has Foo 'fired' iff Thing has Bar 'present'.
+"#;
+        let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+        let defs_vec = crate::compile::compile_to_defs_state(&state);
+        let d = crate::ast::defs_to_state(&defs_vec, &state);
+        (state, d)
+    }
+
+    /// Build an InstanceFact-shaped fact for `Thing has <Field>
+    /// '<value>'` matching the canonical 5-pair layout
+    /// `enumerate_candidates_for_fact_type` emits.
+    fn thing_has_field_fact(thing_id: &str, field: &str, value: &str) -> Object {
+        let ft_id = alloc::format!("Thing_has_{field}");
+        fact_from_pairs(&[
+            ("subjectNoun",  "Thing"),
+            ("subjectValue", thing_id),
+            ("fieldName",    ft_id.as_str()),
+            ("objectNoun",   field),
+            ("objectValue",  value),
+        ])
+    }
+
+    /// Candidate `<t1 has Bar 'present'>` is exactly the antecedent
+    /// of the iff rule. Forward-chain on observations + candidate
+    /// must materialise `<t1 has Foo 'fired'>` into the
+    /// `Thing_has_Foo` cell. The check then holds — return `true`.
+    /// Drives the positive branch through the derivation projection +
+    /// LFP closure path #851's search loop will use to confirm a
+    /// candidate explains its target.
+    #[test]
+    fn candidate_triggering_derivation_rule_passes_check() {
+        let (state, d) = schema_thing_foo_iff_thing_bar();
+        let candidate = thing_has_field_fact("t1", "Bar", "present");
+        let to_explain = vec![thing_has_field_fact("t1", "Foo", "fired")];
+        assert!(
+            candidate_derives(&state, &d, &candidate, &to_explain),
+            "candidate <t1 has Bar 'present'> must trigger derivation \
+             `Thing has Foo 'fired' iff Thing has Bar 'present'` and \
+             materialise <t1 has Foo 'fired'>"
+        );
+    }
+
+    /// Same schema, different candidate: `<t1 has Other 'whatever'>`
+    /// touches a different FT cell (Thing_has_Other), so the
+    /// antecedent of the rule (Thing_has_Bar with Bar='present')
+    /// remains empty after push. No derivation fires; `<t1 has Foo
+    /// 'fired'>` does not materialise; the check returns `false`.
+    /// Drives the negative branch — the gate that lets #851's search
+    /// loop discard candidates whose closure misses the target set.
+    #[test]
+    fn candidate_insufficient_to_trigger_rule_returns_false() {
+        let (state, d) = schema_thing_foo_iff_thing_bar();
+        let candidate = thing_has_field_fact("t1", "Other", "whatever");
+        let to_explain = vec![thing_has_field_fact("t1", "Foo", "fired")];
+        assert!(
+            !candidate_derives(&state, &d, &candidate, &to_explain),
+            "candidate <t1 has Other 'whatever'> does not match the \
+             antecedent `Thing has Bar 'present'`; <t1 has Foo \
+             'fired'> must NOT derive"
+        );
     }
 }
