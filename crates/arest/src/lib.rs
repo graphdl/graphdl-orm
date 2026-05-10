@@ -3463,6 +3463,272 @@ Task1 has Task Readiness 'blocked' iff Task2 blocks Task1 and Task2 has Task Sta
         release_impl(h);
     }
 
+    /// #867 — `apply create` on a noun whose reference scheme requires an
+    /// `id` MUST resolve identity (Whitepaper §6.3 — "Identity follows
+    /// from the reference scheme; resolve applies it"), not silently
+    /// emit an empty-id orphan.
+    ///
+    /// Pre-fix behavior: `platform_apply_command` → `create_via_defs` with
+    /// `explicit_id = None` set `entity_id = ""` (command.rs:471), and
+    /// every `cell_push` emitted a fact with `(noun, "")` as the head
+    /// pair. The "entity" was not query-addressable via `get:Noun id=<x>`
+    /// because no x matched, leaving an orphan cell entry. Per the
+    /// engineering decision documented in #867's commit message this
+    /// patch chooses **auto-generate** (timestamp + noun-prefix) over
+    /// reject-with-violation: tasks/orders frequently arrive without an
+    /// explicit id from the MCP surface, and silent rejection creates
+    /// more confusion than a generated id.
+    ///
+    /// Test: apply create with NO id → assert the response carries a
+    /// non-empty id, the entity is query-addressable via that id, and
+    /// no cell entry has an empty-id head pair.
+    #[test]
+    fn apply_create_without_id_auto_generates_id_no_empty_orphan() {
+        let h = create_bare_impl();
+        let readings = "\
+Task(.id) is an entity type.
+Task has Task Subject.
+  Each Task has at most one Task Subject.
+Task has Task Status.
+  Each Task has at most one Task Status.
+";
+        let compile_out = system_impl(h, "compile", readings);
+        assert!(!compile_out.starts_with('⊥'),
+            "compile must not reject Task schema, got: {compile_out}");
+
+        // apply create — no id field. Pre-fix this produced empty-id
+        // orphan facts in the cells; post-fix the engine resolves an id
+        // (timestamp+noun-prefix) so the entity is addressable.
+        let cmd_json = r#"{"type":"createEntity","noun":"Task","domain":"","fields":{"Task Subject":"write report","Task Status":"pending"}}"#;
+        let apply_out = system_impl(h, "apply", cmd_json);
+        assert!(!apply_out.starts_with('⊥'),
+            "apply must not return ⊥ on a well-formed CreateEntity; got: {apply_out}");
+
+        // The result envelope MUST carry a non-empty id for the new entity.
+        // platform_apply_command wraps the CommandResult; the entity id is
+        // the first entity's id field. We probe via fetch_cell after.
+        // Snapshot scan: every fact in Task-related cells must have a
+        // non-empty entity id in the head ("Task" role). The orphan bug
+        // emitted facts where the Task value was "".
+        let snapshot = peek(h).expect("handle live after apply");
+        // Task FT cells follow the convention `Task_has_<Role>` where
+        // the role name preserves spaces verbatim (e.g.
+        // `Task_has_Task Subject`). Filter to those plus the per-entity
+        // cell `Task` (or `Task:<id>` if materialised).
+        let task_cells: Vec<(String, ast::Object)> = ast::cells_iter(&snapshot).into_iter()
+            .filter(|(name, _)| name.starts_with("Task_has_"))
+            .map(|(name, contents)| (name.to_string(), contents.clone()))
+            .collect();
+        assert!(!task_cells.is_empty(),
+            "apply must populate at least one Task FT cell; got cells: {:?}",
+            ast::cells_iter(&snapshot).into_iter().map(|(n, _)| n.to_string())
+                .collect::<Vec<_>>());
+
+        // No fact in any Task cell may have an empty Task id.
+        for (name, contents) in &task_cells {
+            let facts: Vec<&ast::Object> = contents.as_seq()
+                .map(|s| s.iter().collect()).unwrap_or_default();
+            for f in &facts {
+                let task_id = ast::binding(f, "Task");
+                assert!(
+                    task_id.map_or(true, |s| !s.is_empty()),
+                    "cell {name} must not contain an empty-id Task fact; \
+                     fact={f:?}. The #867 orphan bug emitted facts where \
+                     the Task atom was '' because explicit_id was None and \
+                     create_via_defs defaulted to entity_id = \"\".",
+                );
+            }
+        }
+
+        // The created entity must be query-addressable via the generated
+        // id. Find any non-empty Task id from the FT cells, then probe
+        // get:Task with it. If auto-generate worked, get must succeed.
+        let generated_id: Option<String> = task_cells.iter().find_map(|(_, contents)| {
+            contents.as_seq()?.iter().find_map(|f| {
+                ast::binding(f, "Task").filter(|s| !s.is_empty()).map(|s| s.to_string())
+            })
+        });
+        let id = generated_id.expect(
+            "at least one Task fact must carry a generated id (#867 fix). \
+             Pre-fix every fact had Task=\"\" so this find_map returned None.");
+        let get_out = system_impl(h, "get:Task", &id);
+        assert!(!get_out.starts_with('⊥'),
+            "get:Task must succeed on the auto-generated id '{id}'; \
+             got: {get_out}");
+        assert!(get_out.contains(&id),
+            "get:Task response must mention the generated id '{id}'; \
+             got: {get_out}");
+
+        release_impl(h);
+    }
+
+    /// #868 — `apply update` with a partial-fields payload MUST retract-
+    /// and-replace ONLY the named fields. Untouched single-valued facts
+    /// must persist, and the update path must NOT manufacture spurious
+    /// cells (e.g. `Task_has_currentlyInStatus`,  `Task_has_forResource`,
+    /// `Task_has_instanceOf`, `Task_has_domain`) by reading SM-derived /
+    /// system facts back as if they were user fields.
+    ///
+    /// Pre-fix behavior: `update_via_defs`'s merge logic
+    /// (command.rs:1009-1021) collected existing facts from `state` and
+    /// chained the new fields in. The collection scanned ALL cells via
+    /// `cells_iter(state).flat_map(...)` to gather facts where pairs[0]
+    /// has the entity_id at position 1. This naive scan also picks up
+    /// SM-derived facts whose `State Machine` role value happens to
+    /// equal the Task id (e.g. `StateMachine_has_currentlyInStatus`),
+    /// then re-pushes them under wrong cell names like
+    /// `Task_has_currentlyInStatus` — manufacturing whole-row noise.
+    /// In domains where the user's role name collides with an SM-emitted
+    /// role (e.g. a `Task Status` field where the SM also names its
+    /// initial status `pending`), the merge overwrites the user's
+    /// `Task Status` with the SM's initial value — the precise loss
+    /// the bug report describes ("Status flips to 'pending'"). The
+    /// whitepaper §5.1 spec for create (`emit ∘ validate ∘ derive ∘
+    /// resolve`) is the per-field write pipeline; update is the same
+    /// shape but scoped to the field set in the payload. Reading
+    /// derived facts back as user input violates that scope:
+    /// derived consequents are downstream of resolve, not inputs to it.
+    ///
+    /// Test: create a Task with Subject + Status='completed' +
+    /// Priority='p0' + Description='old'. Apply update with ONLY
+    /// {Task Description: 'new'}. Assert (a) the four user fields land
+    /// at the expected post-update values (Description='new', Status,
+    /// Priority, Subject preserved); (b) NO spurious
+    /// `Task_has_<sm-role>` cells exist for the SM-emitted roles
+    /// (currentlyInStatus, forResource, instanceOf, domain).
+    #[test]
+    fn apply_update_partial_fields_preserves_untouched_single_valued_facts() {
+        let h = create_bare_impl();
+        // Task domain + SM whose initial status fact derivation pushes
+        // a Task Status fact (pre-fix this leaks into update's merged
+        // map and overwrites the user-set 'completed' value).
+        let readings = "\
+Status(.Name) is an entity type.
+State Machine Definition(.Name) is an entity type.
+Transition(.id) is an entity type.
+Noun(.Name) is an entity type.
+State Machine Definition is for Noun.
+Status is initial in State Machine Definition.
+Transition is defined in State Machine Definition.
+Transition is from Status.
+Transition is to Status.
+Transition is triggered by Event Type.
+Task(.id) is an entity type.
+Task has Task Subject.
+  Each Task has at most one Task Subject.
+Task has Task Status.
+  Each Task has at most one Task Status.
+Task has Task Priority.
+  Each Task has at most one Task Priority.
+Task has Task Description.
+  Each Task has at most one Task Description.
+State Machine Definition 'Task' is for Noun 'Task'.
+Status 'pending' is initial in State Machine Definition 'Task'.
+Transition 'complete' is defined in State Machine Definition 'Task'.
+  Transition 'complete' is from Status 'pending'.
+  Transition 'complete' is to Status 'completed'.
+  Transition 'complete' is triggered by Event Type 'complete'.
+";
+        let compile_out = system_impl(h, "compile", readings);
+        assert!(!compile_out.starts_with('⊥'),
+            "compile must not reject Task schema, got: {compile_out}");
+
+        // Create with explicit id so we can target the update. Use the
+        // local-MCP convenience verb (`create:Task` with fact-pairs) —
+        // same path the MCP server's `apply` tool dispatches through in
+        // local mode (src/mcp/server.ts:931-934).
+        let create_out = system_impl(h, "create:Task",
+            "<<id, t1>, <Task Subject, write report>, <Task Status, completed>, <Task Priority, p0>, <Task Description, old>>");
+        assert!(!create_out.starts_with('⊥'),
+            "create:Task must not return ⊥; got: {create_out}");
+
+        // Sanity: the four fields landed in their cells. Cell name
+        // convention (verified empirically): `Task_has_<Role Name>` —
+        // the role name preserves spaces verbatim, only the head noun
+        // and `_has_` suffix are joined with underscores.
+        let pre = peek(h).expect("handle live after create");
+        let pre_status_cell = ast::fetch_or_phi("Task_has_Task Status", &pre);
+        let pre_status: Option<String> = pre_status_cell.as_seq().and_then(|facts|
+            facts.iter().find_map(|f| {
+                if ast::binding_matches(f, "Task", "t1") {
+                    ast::binding(f, "Task Status").map(|s| s.to_string())
+                } else { None }
+            })
+        );
+        assert_eq!(pre_status.as_deref(), Some("completed"),
+            "pre-update sanity: Task t1 Status must be 'completed'; \
+             got: {pre_status:?}");
+
+        // Apply update with ONLY Task Description — partial fields.
+        // Use the local-MCP path (`update:Task` def with fact-pairs)
+        // exactly as the MCP server's `apply` tool does in local mode
+        // (src/mcp/server.ts:937-940). The local path goes through
+        // `platform_update` → `update_via_defs`; the JSON wrapper goes
+        // through `platform_apply_command` → same `update_via_defs`.
+        let update_out = system_impl(h, "update:Task",
+            "<<id, t1>, <Task Description, new>>");
+        assert!(!update_out.starts_with('⊥'),
+            "update:Task must not return ⊥; got: {update_out}");
+
+        // Post-update: Description='new', Status='completed' (preserved!),
+        // Priority='p0' (preserved!), Subject='write report' (preserved!).
+        let post = peek(h).expect("handle live after update");
+
+        let read_field = |cell: &str, role: &str| -> Option<String> {
+            ast::fetch_or_phi(cell, &post).as_seq()?.iter().find_map(|f| {
+                if ast::binding_matches(f, "Task", "t1") {
+                    ast::binding(f, role).map(|s| s.to_string())
+                } else { None }
+            })
+        };
+
+        let post_desc = read_field("Task_has_Task Description", "Task Description");
+        assert_eq!(post_desc.as_deref(), Some("new"),
+            "post-update Description must be 'new'; got: {post_desc:?}");
+
+        let post_status = read_field("Task_has_Task Status", "Task Status");
+        assert_eq!(post_status.as_deref(), Some("completed"),
+            "#868: post-update Status must be PRESERVED at 'completed' \
+             when the update payload omits Status. Pre-fix the engine \
+             reverted Status to its initial value ('pending'), losing \
+             the prior fact. Got: {post_status:?}");
+
+        let post_prio = read_field("Task_has_Task Priority", "Task Priority");
+        assert_eq!(post_prio.as_deref(), Some("p0"),
+            "#868: post-update Priority must be PRESERVED at 'p0' when \
+             the update payload omits Priority; got: {post_prio:?}");
+
+        let post_subj = read_field("Task_has_Task Subject", "Task Subject");
+        assert_eq!(post_subj.as_deref(), Some("write report"),
+            "#868: post-update Subject must be PRESERVED at 'write report' \
+             when the update payload omits Subject; got: {post_subj:?}");
+
+        // (b) No spurious `Task_has_<sm-role>` cells from the SM
+        // derivations. The pre-fix update merge picked up SM-derived
+        // facts (StateMachine_has_currentlyInStatus / forResource /
+        // instanceOf) — where pairs[0].get(1) happens to equal
+        // entity_id because the SM uses the entity id as both the
+        // State Machine id AND the forResource value — and re-pushed
+        // them under wrong cell names like `Task_has_currentlyInStatus`.
+        // The fix scopes the update to payload fields only, leaving
+        // SM derivations untouched. (Note: `Task_has_domain` is a
+        // create-path artifact from `create_via_defs`'s
+        // `chain(("domain", domain))` and is unrelated to #868.)
+        for sm_role in &["currentlyInStatus", "forResource", "instanceOf"] {
+            let cell = format!("Task_has_{sm_role}");
+            let bottom = matches!(ast::fetch(&cell, &post), ast::Object::Bottom);
+            let empty = ast::fetch_or_phi(&cell, &post)
+                .as_seq().map_or(true, |s| s.is_empty());
+            assert!(bottom || empty,
+                "#868: spurious cell '{cell}' must NOT be created by update; \
+                 the pre-fix merge re-pushed SM-derived facts as if they \
+                 were Task user fields. cell content: {:?}",
+                ast::fetch(&cell, &post));
+        }
+
+        release_impl(h);
+    }
+
     /// Profiling invocation — runs the same create/list/get workload as
     /// `list_and_get_see_runtime_created_entities` with the apply-
     /// variant profiler enabled, then dumps the histogram to stderr.

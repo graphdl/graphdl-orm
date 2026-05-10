@@ -450,6 +450,50 @@ pub fn apply_command_defs(
     }
 }
 
+/// #867 — auto-generate an entity id when the create command's
+/// `explicit_id` is None. Returns `<noun-lowercased>-<n>` where n is
+/// (count of distinct values playing the noun-role in `state`) + 1.
+/// Spaces in the noun become hyphens so the id stays a single
+/// space-free atom (`State Machine` → `state-machine-1`).
+///
+/// Deterministic per (noun, state); platform-independent (no
+/// `SystemTime` so the function compiles on wasm32 / no_std without
+/// the runtime panic that `std::time::SystemTime::now()` triggers
+/// on `wasm32-unknown-unknown`). Counting existing entities means
+/// the second auto-create against the same snapshot generates the
+/// same id as the first — but in practice the platform commits the
+/// first delta back into `D` at the merge_delta boundary before the
+/// second call snapshots, so the count moves forward across
+/// successive calls.
+fn auto_generate_entity_id(noun: &str, state: &ast::Object) -> String {
+    // Distinct entity-role values for this noun across all FT cells.
+    // A fact's "entity-id" for noun N is the value of any role binding
+    // whose role name matches N. This mirrors `platform_list_noun`'s
+    // entity discovery — same identity discovery, same count surface.
+    let mut seen: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+    for (_, contents) in ast::cells_iter(state) {
+        let facts = match contents.as_seq() { Some(s) => s, None => continue };
+        for fact in facts.iter() {
+            let pairs = match fact.as_seq() { Some(p) => p, None => continue };
+            for pair in pairs.iter() {
+                let kv = match pair.as_seq() { Some(s) => s, None => continue };
+                let role = match kv.first().and_then(|k| k.as_atom()) {
+                    Some(r) => r, None => continue
+                };
+                if role != noun { continue; }
+                let val = match kv.get(1).and_then(|v| v.as_atom()) {
+                    Some(v) => v, None => continue
+                };
+                if val.is_empty() { continue; }
+                seen.insert(val.to_string());
+            }
+        }
+    }
+    let n = seen.len() + 1;
+    let prefix = noun.to_lowercase().replace(' ', "-");
+    format!("{prefix}-{n}")
+}
+
 /// create = emit ∘ validate ∘ derive ∘ resolve (Eq. 5)
 /// Each stage is a ρ-application. The result is an Object, decoded to CommandResult at the boundary.
 ///
@@ -468,7 +512,30 @@ fn create_via_defs(
     sender: Option<&str>,
     state: &ast::Object,
 ) -> CommandResult {
+    // #867 — when no explicit id is provided, resolve identity per
+    // whitepaper §6.3 ("Identity follows from the reference scheme;
+    // resolve applies it"). Pre-fix the engine defaulted to the empty
+    // string, every cell_push pushed a fact with `(noun, "")` as its
+    // head pair, and the resulting "entity" was unaddressable. The
+    // safer default for tasks/orders coming from the MCP surface is
+    // **auto-generate** (over reject-with-violation): a generated id
+    // makes the entity addressable and round-trips through `get:Noun`
+    // immediately, with no human interpretation required.
+    //
+    // Generation scheme: `<noun-lowercased-hyphenated>-<n>` where n is
+    // (count of distinct entity-role values for `noun` in `state`) + 1.
+    // Deterministic per (noun, snapshot), platform-independent (no
+    // wallclock — works on wasm32 / no_std), and visibly counts up so
+    // the surface area is debuggable. Two creates against the same
+    // snapshot generate distinct ids only because the second runs
+    // against a state augmented by the first via merge_delta at the
+    // commit boundary; within a single call the count is stable.
     let entity_id = explicit_id.unwrap_or("").to_string();
+    let entity_id = if entity_id.is_empty() {
+        auto_generate_entity_id(noun, state)
+    } else {
+        entity_id
+    };
 
     // ── resolve: populate facts via ρ(resolve:{noun}) ──────────────
     let fields_with_domain: Vec<(&str, &str)> = fields.iter()
@@ -1005,9 +1072,45 @@ fn update_via_defs(
     new_fields: &hashbrown::HashMap<String, String>,
     state: &ast::Object,
 ) -> CommandResult {
-    // Read current facts for this entity, merge with new fields
-    let merged: hashbrown::HashMap<String, String> = ast::cells_iter(state)
+    // #868 — per-field retract-then-insert scoped to the payload.
+    //
+    // Pre-fix the merge logic scanned ALL cells for facts where any
+    // pair had `entity_id` at position 1, then re-pushed every collected
+    // (field, value) under `format!("{noun}_has_{field}")`. Two failure
+    // modes:
+    //   1. SM-derived facts whose `State Machine` role value equals the
+    //      target entity id leak into the merge and get re-pushed under
+    //      bogus cell names (`Task_has_currentlyInStatus`,
+    //      `Task_has_forResource`, `Task_has_instanceOf`,
+    //      `Task_has_domain`).
+    //   2. When a user-named role collides with an SM-emitted role
+    //      (cookbook scenario: a Task Status field where the SM names
+    //      its initial 'pending'), the SM-derived value overwrites the
+    //      user-supplied one — exactly the "Status flips to 'pending'"
+    //      regression #868 reports.
+    //
+    // The whitepaper §5.1 spec is per-field retract-then-insert scoped
+    // to the field set IN the payload. Untouched single-valued facts
+    // must persist unchanged. The fix: fold over `new_fields` only.
+    // Cells the payload doesn't name stay byte-identical — `diff_cells`
+    // at the end will see them unchanged and ship an empty entry for
+    // each, leaving the existing chain intact.
+    //
+    // The `merged` map (existing facts + payload override) is still
+    // needed for the EntityResult.data the API surface returns, so the
+    // caller sees the post-update row including untouched fields.
+    let existing_fields: hashbrown::HashMap<String, String> = ast::cells_iter(state)
         .into_iter()
+        .filter(|(name, _)| {
+            // Restrict the existing-row scan to FT cells whose name
+            // begins with `<noun>_has_` (the parser-emitted convention
+            // for binary fact types head-noun'd by `noun`). This
+            // excludes SM-derived cells (`StateMachine_has_*`,
+            // `_cwa_negation:*`, `_transitive_*`, `derivation:*`, etc.)
+            // whose entity-role value happens to equal `entity_id`
+            // — the exact noise the pre-fix merge swept up.
+            name.starts_with(&alloc::format!("{}_has_", noun))
+        })
         .flat_map(|(_, contents)| contents.as_seq().into_iter().flat_map(|facts| facts.to_vec()))
         .filter_map(|fact| {
             let pairs = fact.as_seq().filter(|p| p.len() >= 2)?;
@@ -1017,12 +1120,19 @@ fn update_via_defs(
             let v = pairs[1].as_seq().and_then(|p| p.get(1)?.as_atom().map(|s| s.to_string()))?;
             Some((k, v))
         })
+        .collect();
+    // `merged` for the EntityResult: existing fields ∪ payload (payload wins).
+    let merged: hashbrown::HashMap<String, String> = existing_fields.iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
         .chain(new_fields.iter().map(|(k, v)| (k.clone(), v.clone())))
         .collect();
 
-    // Remove old facts for this entity, insert merged (fold over fields)
+    // Per-field retract-then-insert SCOPED TO PAYLOAD: only fold over
+    // `new_fields`. Untouched single-valued facts (Status, Priority,
+    // etc.) stay in place — their cells are unchanged so `diff_cells`
+    // will not ship an entry for them, preserving the prior chain entry.
     let resolve_key = format!("resolve:{}", noun);
-    let new_state = merged.iter().fold(state.clone(), |acc, (field_name, value)| {
+    let new_state = new_fields.iter().fold(state.clone(), |acc, (field_name, value)| {
         let ft_id = def_func(&resolve_key, d)
             .map(|f| ast::apply(&f, &ast::Object::atom(&field_name.to_lowercase()), d))
             .and_then(|o| o.as_atom().map(|s| s.to_string()))
