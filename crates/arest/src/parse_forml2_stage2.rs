@@ -2202,6 +2202,23 @@ pub fn translate_instance_facts_with_ft_ids(
         if !kinds.iter().any(|k| classifications_contains(idx, stmt_id, k)) {
             continue;
         }
+        // #866 — arbitrate with translate_derivation_rules. The grammar
+        // emits Statement_has_Literal_Role for any rule body that
+        // carries a single-quoted literal value
+        // (`* Task is parallelizable iff Task has Task Readiness 'ready'`),
+        // which makes the Instance Fact recognizer fire alongside the
+        // Derivation Rule recognizer keyed on the `iff` keyword. Without
+        // this skip, the rule statement lands in the InstanceFact cell
+        // with subjectValue empty, fieldName = the verb-portion of the
+        // rule body (`is parallelizable iff`), and a malformed
+        // verb-only per-field cell name on the downstream fan-out —
+        // shadowing the legitimate per-FT consequent the rule is
+        // supposed to populate. Same arbitration shape as
+        // skip_on_derivation_rule used by translate_set_constraints
+        // and translate_cardinality_constraints (#291 / #295).
+        if classifications_contains(idx, stmt_id, "Derivation Rule") {
+            continue;
+        }
         let roles = role_refs_with_literals(idx,stmt_id);
         if roles.is_empty() { continue; }
         let verb = statement_verb(idx,stmt_id).unwrap_or_default();

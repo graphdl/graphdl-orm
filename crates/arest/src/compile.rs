@@ -6856,6 +6856,141 @@ mod schema_tests {
             "Task 1 must NOT be tagged 'blocked' (nothing blocks it); \
              got blocked tasks {:?}", blocked_tasks);
     }
+
+    /// #866 — unary derivation rule consequent: `Task is parallelizable
+    /// iff Task has Task Status 'pending'` declares a unary FT
+    /// (`Task is parallelizable`) and a derivation rule whose consequent
+    /// is that unary FT. The compiler must:
+    ///   1. resolve `consequentFactTypeId` to `Task_is_parallelizable`
+    ///      (NOT to the verb-only `is_parallelizable_iff` slop, NOT to
+    ///      empty);
+    ///   2. fan out the rule on forward-chain to populate the
+    ///      `Task_is_parallelizable` cell with one `<Task, taskId>` row
+    ///      per matching antecedent fact.
+    ///
+    /// Whitepaper §6.1 (tab:ffp): a unary fact type IS a CONS with one
+    /// role; the per-FT cell stores `<<Task, value>>` rows. Before the
+    /// fix the consequent resolver (or an upstream pass) emitted a cell
+    /// named after the verb-only portion of the rule body
+    /// (`is parallelizable iff`), short-circuiting the FT lookup and
+    /// silently dropping the per-Task projection.
+    #[test]
+    fn user_unary_iff_rule_fires_forward_chain_over_population_at_compile_time() {
+        let src = "\
+            Task(.id) is an entity type.\n\
+            Task Readiness is a value type.\n\
+            Task is parallelizable.\n\
+            Task has Task Readiness.\n\
+            Task '1' has Task Readiness 'ready'.\n\
+            * Task is parallelizable iff Task has Task Readiness 'ready'.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        // Sanity: the parsed FactType cell must contain Task_is_parallelizable.
+        let ft_cell = ast::fetch_or_phi("FactType", &state);
+        let ft_ids: Vec<String> = ft_cell.as_seq()
+            .map(|s| s.iter()
+                .filter_map(|f| ast::binding(f, "id").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert!(ft_ids.iter().any(|id| id == "Task_is_parallelizable"),
+            "parsed FactType cell must include the unary FT \
+             `Task_is_parallelizable`; got {:?}", ft_ids);
+
+        // Sanity: the parsed DerivationRule must point at that FT id.
+        let dr_cell = ast::fetch_or_phi("DerivationRule", &state);
+        let consequent_ids: Vec<String> = dr_cell.as_seq()
+            .map(|s| s.iter()
+                .filter_map(|f| ast::binding(f, "consequentFactTypeId").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert!(consequent_ids.iter().any(|id| id == "Task_is_parallelizable"),
+            "DerivationRule.consequentFactTypeId must resolve to the \
+             unary FT `Task_is_parallelizable`; got {:?}", consequent_ids);
+
+        // No malformed verb-only cell may exist anywhere in the
+        // parsed state. The bug surfaced as a cell named after the
+        // verb-portion plus the iff keyword
+        // (`is parallelizable iff`) — assert that NO such cell name
+        // leaks through any pass.
+        let cell_names: Vec<String> = ast::cells_iter(&state).into_iter()
+            .map(|(n, _)| n.to_string()).collect();
+        for n in &cell_names {
+            assert!(!n.contains(" iff "),
+                "no parsed cell may carry an unstripped ` iff ` suffix; \
+                 found malformed cell `{}` in {:?}", n, cell_names);
+        }
+
+        // The InstanceFact cell must not mis-classify the rule statement
+        // as an instance fact (#866 root cause). When the rule's
+        // `'ready'` literal triggers Statement_has_Literal_Role, the
+        // grammar's instance-fact recognizer fires alongside the
+        // derivation-rule classification — and translate_instance_facts
+        // must arbitrate (skip) on Derivation Rule. Without arbitration,
+        // a malformed instance fact lands with a verb-only fieldName
+        // like `is parallelizable iff` projecting onto a malformed
+        // per-field cell.
+        let inst_cell = ast::fetch_or_phi("InstanceFact", &state);
+        let bad_inst: Vec<String> = inst_cell.as_seq()
+            .map(|s| s.iter()
+                .filter_map(|f| ast::binding(f, "fieldName").map(String::from))
+                .filter(|fn_| fn_.contains(" iff ") || fn_.contains("iff"))
+                .collect())
+            .unwrap_or_default();
+        assert!(bad_inst.is_empty(),
+            "InstanceFact cell must NOT contain rows whose fieldName \
+             carries the rule keyword `iff` (rule statement was \
+             mis-classified as an instance fact and its verb-fallback \
+             fieldName captured the rule body verb); got fieldNames = \
+             {:?}; full cell = {:?}",
+            bad_inst,
+            inst_cell.as_seq().map(|s| s.iter().cloned().collect::<Vec<_>>())
+                .unwrap_or_default());
+
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        let derivation_refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d)
+            .into_iter()
+            .filter(|(n, _)| n.starts_with("derivation:rule_"))
+            .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &d)))
+            .collect();
+        assert!(!derivation_refs_owned.is_empty(),
+            "compile must emit derivation:rule_<hash> for the unary user rule; \
+             got def names: {:?}",
+            ast::cells_iter(&d).into_iter()
+                .map(|(n, _)| n.to_string())
+                .filter(|n| n.starts_with("derivation:"))
+                .collect::<Vec<_>>());
+        let derivation_refs: Vec<(&str, &ast::Func)> = derivation_refs_owned.iter()
+            .map(|(n, f)| (n.as_str(), f)).collect();
+        let (new_d, _derived) = crate::evaluate::forward_chain_defs_state(
+            &derivation_refs, &d);
+
+        // Spec assertion: the unary consequent FT cell must exist and
+        // carry one row per matching antecedent (Task '1' is pending).
+        let parallel_cell = ast::fetch_or_phi("Task_is_parallelizable", &new_d);
+        let parallel_facts = parallel_cell.as_seq()
+            .map(|s| s.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert!(!parallel_facts.is_empty(),
+            "Task_is_parallelizable cell must be populated by forward-chain \
+             firing of the unary literal-iff rule over the 'pending' Task \
+             Status fact; cell was empty. All cells in d: {:?}",
+            ast::cells_iter(&new_d).into_iter()
+                .map(|(n, _)| n.to_string())
+                .collect::<Vec<_>>());
+        let task_ids: Vec<String> = parallel_facts.iter()
+            .filter_map(|f| f.as_seq().and_then(|pairs| pairs.iter().find_map(|p| {
+                let kv = p.as_seq()?;
+                let role = kv.first()?.as_atom()?;
+                if role == "Task" { kv.get(1)?.as_atom().map(String::from) } else { None }
+            })))
+            .collect();
+        assert!(task_ids.contains(&"1".to_string()),
+            "Task_is_parallelizable must include the matching Task '1' \
+             (the only pending Task); got {:?}", task_ids);
+    }
 }
 
 // ── Federation: populate:{verb} from "Verb is exported from JS Package" ──
