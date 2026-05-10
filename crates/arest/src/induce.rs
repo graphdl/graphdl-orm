@@ -439,16 +439,175 @@ pub fn run_search(
     to_explain: &[Object],
 ) -> Vec<Object> {
     let candidates = enumerate_candidates_for_fact_type(state, ft_id);
-    let mut hyps: Vec<Object> = Vec::with_capacity(candidates.len());
+    let mut scored: Vec<(i64, Object)> = Vec::with_capacity(candidates.len());
     for (idx, candidate) in candidates.iter().enumerate() {
         if !candidate_passes_constraints(state, defs, candidate) { continue; }
         if !to_explain.is_empty()
             && !candidate_derives(state, defs, candidate, to_explain) {
             continue;
         }
-        hyps.push(build_hypothesis_candidate(ft_id, idx, candidate, to_explain));
+        // #852 — Score the surviving candidate by forward-chaining the
+        // user-authored Scoring Rules over the candidate-augmented state
+        // and reading the Confidence Score consequents the rules emit.
+        // The id stamped on the Hypothesis Candidate matches the id used
+        // for materialising the Hypothesis_Candidate entity row, so the
+        // rule-emitted `Hypothesis Candidate has Confidence Score` rows
+        // can be filtered down to the candidate at hand.
+        let id = alloc::format!("hyp-{}-{}", ft_id, idx);
+        let score = score_candidate(state, defs, candidate, &id);
+        let hyp = build_hypothesis_candidate(ft_id, idx, candidate, to_explain, &score);
+        scored.push((parse_score(&score), hyp));
     }
-    hyps
+    // #852 — Stable sort by Confidence Score descending. Stable so ties
+    // preserve enumeration order (deterministic across re-runs given the
+    // deterministic id stamping in build_hypothesis_candidate).
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.into_iter().map(|(_, h)| h).collect()
+}
+
+/// #852 — Per-candidate scoring pass. Materialise the Hypothesis Candidate
+/// as a `Hypothesis_Candidate` entity-cell row keyed by `id`, push the
+/// candidate fact into its FT cell, forward-chain over the resulting
+/// state, and read the `Hypothesis_Candidate_has_Confidence_Score` cell
+/// rows the user-authored Scoring Rules emit. Return the SUM of all
+/// scores keyed to `id` (numeric strings parsed as i64; non-numeric
+/// scores fall back to 1 per row, so categorical rules like "trustworthy"
+/// still rank higher than no-rule-fired). Empty result means no Scoring
+/// Rule fired — score zero.
+///
+/// Rules that emit a Confidence Score for a different Hypothesis
+/// Candidate id than the one being scored (which can happen when a rule
+/// universally quantifies over Hypothesis Candidate, picking up older
+/// hyps still resident in the cell) are filtered out by the id check.
+/// In single-pass scoring (each candidate scored in isolation against a
+/// freshly-materialised single-row Hypothesis_Candidate cell) this is
+/// belt-and-suspenders.
+///
+/// Returns the score as a String so build_hypothesis_candidate can stamp
+/// it as a `confidenceScore` binding on the hyp without a parse round-
+/// trip. Numeric ranking happens in run_search via `parse_score`.
+fn score_candidate(
+    state: &Object,
+    defs: &Object,
+    candidate: &Object,
+    hyp_id: &str,
+) -> String {
+    let Some(ft_id) = binding(candidate, "fieldName") else { return String::new(); };
+    if ft_id.is_empty() { return String::new(); }
+
+    // Project + push the candidate fact into its FT cell so any Scoring
+    // Rule whose antecedent reads that cell (e.g. `Coin has Side
+    // 'heads'`) sees the candidate alongside the prior observations.
+    let projected = project_instance_fact_to_per_ft(candidate);
+    let mut state_prime = crate::ast::cell_push(&ft_id, projected, state);
+
+    // Materialise a single Hypothesis_Candidate entity-cell row keyed by
+    // the hyp id so any Scoring Rule whose consequent is `Hypothesis
+    // Candidate has Confidence Score …` can bind a Hypothesis Candidate
+    // to attach the score to. We isolate the scoring pass to ONE hyp at
+    // a time so the resulting Confidence Score rows unambiguously
+    // belong to this candidate (no cross-candidate contamination).
+    let hyp_row = fact_from_pairs(&[("Hypothesis Candidate", hyp_id)]);
+    state_prime = crate::ast::cell_push("Hypothesis_Candidate", hyp_row, &state_prime);
+
+    // Project the candidate's NON-SUBJECT bindings onto a synthetic
+    // `Hypothesis_Candidate_has_hidden_<ObjectNoun>` cell row keyed by
+    // the hyp id. This is what lets a Scoring Rule like `Hypothesis
+    // Candidate has Confidence Score '10' iff Hypothesis Candidate has
+    // hidden Side 'heads'.` bind the Hypothesis Candidate AND filter
+    // on the candidate's role values in a single antecedent — without
+    // a cross-cell join the engine doesn't currently express. The
+    // host-side projection materialises one such cell per candidate;
+    // the rules in readings consume it.
+    //
+    // For binary FT `<Subject> has <Object>`: row is `<<Hypothesis
+    // Candidate, hyp_id>, <<ObjectNoun>, <ObjectValue>>>` in cell
+    // `Hypothesis_Candidate_has_hidden_<ObjectNounUnderscored>`. For
+    // unary or higher arities the projection mirrors the candidate's
+    // per-FT shape with the subject role replaced by Hypothesis
+    // Candidate. Empty objectNoun → unary FT, no synthetic cell.
+    if let Some(object_noun) = binding(candidate, "objectNoun") {
+        if !object_noun.is_empty() {
+            let object_value = binding(candidate, "objectValue").unwrap_or("");
+            let cell_name = alloc::format!(
+                "Hypothesis_Candidate_has_hidden_{}",
+                object_noun.replace(' ', "_"));
+            let mut pairs: Vec<(String, String)> = Vec::with_capacity(3);
+            pairs.push(("Hypothesis Candidate".to_string(), hyp_id.to_string()));
+            pairs.push((object_noun.to_string(), object_value.to_string()));
+            // Carry through ternary+ role bindings unchanged so multi-
+            // role candidates (e.g. `X gives Y to Z`) surface every
+            // role on the synthetic cell.
+            for n in 2.. {
+                let noun_key = alloc::format!("role{}Noun", n);
+                let Some(noun) = binding(candidate, &noun_key) else { break };
+                if noun.is_empty() { break; }
+                let value_key = alloc::format!("role{}Value", n);
+                let value = binding(candidate, &value_key).unwrap_or("");
+                pairs.push((noun.to_string(), value.to_string()));
+            }
+            let pair_refs: Vec<(&str, &str)> = pairs.iter()
+                .map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let synth_row = fact_from_pairs(&pair_refs);
+            state_prime = crate::ast::cell_push(&cell_name, synth_row, &state_prime);
+        }
+    }
+
+    // Merge state' onto defs so the chained input carries both rule
+    // metadata (defs) AND the augmented observation cells. Same shape
+    // candidate_derives uses for its forward-chain pass.
+    let chained_input = crate::ast::merge_states(defs, &state_prime);
+
+    // Collect derivation refs from defs — both stratum-1 and stratum-2.
+    // User-authored Scoring Rules compile to `derivation:rule_<hash>`
+    // defs (per the standard derivation pipeline); they're read off the
+    // same prefix candidate_derives uses.
+    let refs_owned: Vec<(String, crate::ast::Func)> = crate::ast::cells_iter(defs).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:") || n.starts_with("derivation_strat2:"))
+        .map(|(n, contents)| (n.to_string(), crate::ast::metacompose(contents, defs)))
+        .collect();
+    let refs: Vec<(&str, &crate::ast::Func)> = refs_owned.iter()
+        .map(|(n, f)| (n.as_str(), f)).collect();
+
+    // Forward-chain to LFP. The `Hypothesis_Candidate_has_Confidence_Score`
+    // cell of the post_state will carry one row per Scoring Rule that
+    // fired for this candidate.
+    let (post_state, _derived) =
+        crate::evaluate::forward_chain_defs_state(&refs, &chained_input);
+
+    let cs_cell = crate::ast::fetch_or_phi(
+        "Hypothesis_Candidate_has_Confidence_Score", &post_state);
+    let Some(rows) = cs_cell.as_seq() else { return String::new(); };
+
+    // Sum scores keyed to hyp_id. Numeric strings parse as i64 (sum
+    // accumulates additive contributions); non-numeric rows count as
+    // one point each so a rule emitting a categorical label still
+    // contributes to ranking.
+    let mut total: i64 = 0;
+    let mut any_row_for_hyp = false;
+    for row in rows.iter() {
+        let row_hyp = binding(row, "Hypothesis Candidate").unwrap_or("");
+        // When the row carries no Hypothesis Candidate binding (rule
+        // emits a free-floating Confidence Score), treat it as belonging
+        // to this candidate — single-row Hypothesis_Candidate cell means
+        // there's no other hyp it could attach to.
+        if !row_hyp.is_empty() && row_hyp != hyp_id { continue; }
+        any_row_for_hyp = true;
+        let cs = binding(row, "Confidence Score").unwrap_or("");
+        match cs.parse::<i64>() {
+            Ok(n) => { total += n; }
+            Err(_) => { total += 1; }
+        }
+    }
+    if !any_row_for_hyp { return String::new(); }
+    alloc::format!("{}", total)
+}
+
+/// Parse a Confidence Score string to an i64 for ranking. Empty or
+/// non-numeric strings sort as 0 (no scoring rule fired or rule emitted
+/// a categorical label that didn't carry a numeric weight).
+fn parse_score(s: &str) -> i64 {
+    s.parse::<i64>().unwrap_or(0)
 }
 
 /// Encode a single Hypothesis Candidate per `readings/core/induction.md`.
@@ -472,6 +631,7 @@ fn build_hypothesis_candidate(
     idx: usize,
     candidate: &Object,
     to_explain: &[Object],
+    confidence_score: &str,
 ) -> Object {
     let id = alloc::format!("hyp-{}-{}", ft_id, idx);
     let hidden = Object::Seq(
@@ -493,13 +653,25 @@ fn build_hypothesis_candidate(
         Object::atom("id"),
         Object::atom(&id),
     ]);
-    // The result is a Seq carrying the id binding pair followed by the
-    // two cell triples. `binding` reads the id pair; `fetch_or_phi`
-    // reads the cells. Both shapes coexist because `binding` skips any
-    // non-2-Seq element, and `fetch_or_phi` only matches CELL triples.
+    // #852 — Stamp the rule-emitted Confidence Score (if any) as a
+    // `confidenceScore` binding. Empty when no Scoring Rule fired
+    // for this candidate (search ran without scoring vocabulary, or
+    // every rule's antecedent missed). Callers that want the numeric
+    // value parse it back from the binding; ranking happens upstream
+    // in run_search via parse_score.
+    let cs_pair = Object::seq(vec![
+        Object::atom("confidenceScore"),
+        Object::atom(confidence_score),
+    ]);
+    // The result is a Seq carrying the id + score binding pairs
+    // followed by the two cell triples. `binding` reads the pairs;
+    // `fetch_or_phi` reads the cells. Both shapes coexist because
+    // `binding` skips any non-2-Seq element, and `fetch_or_phi` only
+    // matches CELL triples.
     let cells = state.as_seq().map(|s| s.to_vec()).unwrap_or_default();
-    let mut items: Vec<Object> = Vec::with_capacity(1 + cells.len());
+    let mut items: Vec<Object> = Vec::with_capacity(2 + cells.len());
     items.push(id_pair);
+    items.push(cs_pair);
     items.extend(cells);
     Object::Seq(items.into())
 }
@@ -1085,5 +1257,159 @@ Thing has Other.
         assert_eq!(sides_seen, vec!["heads".to_string(), "tails".to_string()],
             "expected one Hypothesis Candidate per Side enum value \
              (heads, tails); got {:?}", sides_seen);
+    }
+
+    // ─── #852 Scoring Rules — rank Hypothesis Candidates by Confidence Score ──
+
+    /// Acceptance test for the platform_induce scoring + ranking layer (#852).
+    ///
+    /// "Scoring Rules as readings, not Rust" — the test schema declares two
+    /// derivation rules that emit `Hypothesis Candidate has Confidence Score`
+    /// facts. The induce loop materialises each surviving Hypothesis
+    /// Candidate into the `Hypothesis_Candidate` entity cell, forward-chains
+    /// the user-authored rules over the candidate-augmented state, reads the
+    /// score off the resulting `Hypothesis_Candidate_has_Confidence_Score`
+    /// cell, and sorts hyps by score descending. There is NO hardcoded
+    /// scoring function in Rust — the readings ARE the source code.
+    ///
+    /// Schema:
+    ///   Coin(.id) is an entity type. Side is a value type with values
+    ///   {'heads','tails'}. Coin has Side. Each Coin has at most one Side.
+    ///   Hypothesis Candidate(.id) is an entity type. Confidence Score is
+    ///   a value type. Hypothesis Candidate has Confidence Score.
+    ///   Hypothesis Candidate has hidden Side.
+    ///   * Hypothesis Candidate has Confidence Score '10'
+    ///       iff Hypothesis Candidate has hidden Side 'heads'.
+    ///   * Hypothesis Candidate has Confidence Score '1'
+    ///       iff Hypothesis Candidate has hidden Side 'tails'.
+    ///
+    /// The `Hypothesis Candidate has hidden Side` FT is the surface the
+    /// induce engine projects per-candidate role bindings onto so each
+    /// rule's antecedent can BIND a Hypothesis Candidate (from the
+    /// projected row) AND filter on the candidate's Side value (literal
+    /// pin) in a single antecedent — the consequent reuses the
+    /// antecedent's Hypothesis Candidate binding to attach the score.
+    ///
+    /// Observations: one Coin instance c1, no Side asserted.
+    /// to_explain: empty.
+    ///
+    /// Search loop must:
+    ///   1. Enumerate `Coin_has_Side` candidates → 2 candidates (c1×heads, c1×tails).
+    ///   2. Both pass the at-most-one-Side UC.
+    ///   3. Per-candidate scoring pass:
+    ///      - Materialise Hypothesis Candidate entity row for the hyp id.
+    ///      - Project the candidate fact onto a per-hyp
+    ///        `Hypothesis_Candidate_has_hidden_Side` row.
+    ///      - Forward-chain → Rule A fires for heads-candidate (score '10');
+    ///        Rule B fires for tails-candidate (score '1').
+    ///   4. Result is a Seq ordered by Confidence Score DESCENDING:
+    ///      first = heads-hyp (score 10), second = tails-hyp (score 1).
+    #[test]
+    fn run_search_ranks_hypothesis_candidates_by_confidence_score_descending() {
+        use crate::ast::{Func, apply, defs_to_state, fetch_or_phi};
+        // Schema — Coin/Side enumeration fixture + scoring vocabulary.
+        // Two Scoring Rules expressed as FORML2 derivation rules. The
+        // induce engine materialises a per-candidate
+        // `Hypothesis_Candidate_has_hidden_Side` row keyed by hyp id
+        // alongside the `Hypothesis_Candidate` entity row, then forward-
+        // chains the rules over that augmented state. Each rule's
+        // antecedent binds Hypothesis Candidate (from
+        // `Hypothesis Candidate has hidden Side`) AND filters Side
+        // (literal pin); the consequent reuses the antecedent's
+        // Hypothesis Candidate binding to attach a Confidence Score
+        // pinned to the rule's literal.
+        let src = "# Coin/Side scoring fixture\n\
+            Coin(.id) is an entity type.\n\
+            Side is a value type.\n\
+            The possible values of Side are 'heads', 'tails'.\n\
+            Coin has Side.\n\
+            Each Coin has at most one Side.\n\
+            \n\
+            Hypothesis Candidate(.id) is an entity type.\n\
+            Confidence Score is a value type.\n\
+            Hypothesis Candidate has Confidence Score.\n\
+            Hypothesis Candidate has hidden Side.\n\
+            \n\
+            ## Derivation Rules\n\
+            * Hypothesis Candidate has Confidence Score '10' iff Hypothesis Candidate has hidden Side 'heads'.\n\
+            * Hypothesis Candidate has Confidence Score '1' iff Hypothesis Candidate has hidden Side 'tails'.\n\
+        ";
+        let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+        // Seed one Coin instance c1 via an InstanceFact so the entity-side
+        // domain for `Coin_has_Side` enumeration is non-empty. The
+        // schema declares Coin as an entity type; the `entity_population_for_noun`
+        // helper walks cells for Coin bindings, picking this up.
+        let state = crate::ast::cell_push(
+            "InstanceFact",
+            fact_from_pairs(&[
+                ("subjectNoun",  "Coin"),
+                ("subjectValue", "c1"),
+                ("fieldName",    "Coin_exists"),
+                ("objectNoun",   ""),
+                ("objectValue",  ""),
+            ]),
+            &state,
+        );
+        let mut defs_vec = crate::compile::compile_to_defs_state(&state);
+        defs_vec.push((
+            "induce".to_string(),
+            Func::Platform("induce".to_string()),
+        ));
+        let d = defs_to_state(&defs_vec, &state);
+
+        let args = Object::seq(vec![
+            Object::seq(vec![
+                Object::atom("ft_id"),
+                Object::atom("Coin_has_Side"),
+            ]),
+            Object::seq(vec![
+                Object::atom("to_explain"),
+                Object::phi(),
+            ]),
+        ]);
+
+        let result = apply(&Func::Def("induce".to_string()), &args, &d);
+        let hyps = result.as_seq().expect(
+            "platform_induce must return a Seq of Hypothesis Candidate facts");
+        assert_eq!(hyps.len(), 2,
+            "expected 2 Hypothesis Candidates (one per Side enum value); \
+             got {} → {:?}", hyps.len(), hyps);
+
+        // Read each hyp's Confidence Score (top-level binding stamped by
+        // build_hypothesis_candidate after #852 wires scoring) and the
+        // associated Side from its hidden-Fact pointer.
+        let hyp_summaries: Vec<(String, String)> = hyps.iter().map(|hyp| {
+            let score = binding(hyp, "confidenceScore")
+                .map(String::from)
+                .unwrap_or_default();
+            let hidden = fetch_or_phi("Hypothesis_Candidate_has_hidden__Fact", hyp);
+            let side = hidden.as_seq()
+                .and_then(|facts| facts.first().cloned())
+                .and_then(|f| binding(&f, "Side").map(String::from))
+                .unwrap_or_default();
+            (score, side)
+        }).collect();
+
+        // Both candidates must carry a non-empty score binding (proves the
+        // scoring layer ran, not just enumeration).
+        for (score, side) in &hyp_summaries {
+            assert!(!score.is_empty(),
+                "Hypothesis Candidate (Side={}) must carry a confidenceScore \
+                 binding; summaries={:?}", side, hyp_summaries);
+        }
+
+        // Ordering: heads (score=10) must precede tails (score=1).
+        assert_eq!(hyp_summaries[0].1, "heads",
+            "expected first hyp to be Side=heads (score 10); got {:?}",
+            hyp_summaries);
+        assert_eq!(hyp_summaries[0].0, "10",
+            "expected first hyp's confidenceScore to be '10'; got {:?}",
+            hyp_summaries);
+        assert_eq!(hyp_summaries[1].1, "tails",
+            "expected second hyp to be Side=tails (score 1); got {:?}",
+            hyp_summaries);
+        assert_eq!(hyp_summaries[1].0, "1",
+            "expected second hyp's confidenceScore to be '1'; got {:?}",
+            hyp_summaries);
     }
 }
