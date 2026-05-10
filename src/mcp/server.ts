@@ -849,6 +849,55 @@ server.registerTool(
   },
 )
 
+// ── 2b. sql: read-only SELECT over the relational substrate (#864) ──
+//
+// Cells ARE relations (RMAP / whitepaper §3). Each FactType cell maps
+// to a SQL table named `ft_<sanitize(ft_id)>` whose columns are the
+// role names (spaces → underscores). For example, the cell
+// `Task_has_Task_Priority` becomes the table `ft_Task_has_Task_Priority`
+// with columns `Task` and `Task_Priority`.
+//
+// `query fact_type=X filter={k:v}` is a degenerate single-table SELECT
+// with one WHERE clause; `sql` lifts that to the full SQLite SELECT
+// surface (JOINs, subqueries, NOT EXISTS, GROUP BY) — the natural
+// language for cross-FT projection. Mutating SQL is refused; INSERT /
+// UPDATE / DELETE go through `apply` so derivation, validation, and
+// emit run as usual.
+//
+// Returns `{rows: [{col: val, …}, …]}` on success or `{error: "…"}`
+// on parse / exec failure. Errors are always JSON envelopes — no
+// thrown exceptions on bad SQL.
+export function parseSqlResponse(raw: string): unknown {
+  if (raw === '⊥') return { error: 'engine returned ⊥ (handle missing or local feature unavailable)' }
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed ?? { error: 'engine returned null envelope' }
+  } catch {
+    return { error: 'malformed sql envelope', raw }
+  }
+}
+
+server.registerTool(
+  'sql',
+  {
+    description: 'Read-only SQL SELECT over the relational substrate (#864). Each FactType cell becomes a SQL table named ft_<FactType_id> with columns matching the role names (spaces → underscores). Example: SELECT "Task" FROM ft_Task_has_Task_Priority WHERE "Task_Priority" = \'p0\'. Returns {rows: [{col: val, ...}, ...]} on success or {error: "..."} on parse / exec failure. Use for cross-fact-type joins, NOT EXISTS, and any projection beyond a single fact type with one WHERE clause — for those, prefer `query`. Mutating SQL (INSERT / UPDATE / DELETE) is refused; use `apply` instead.',
+    inputSchema: {
+      query: z.string().describe('A SQL SELECT statement. Tables are ft_<FactType_id> (e.g. ft_Task_has_Task_Priority); columns are role names with spaces replaced by underscores. Quote both identifiers and string values per SQL standard.'),
+    },
+  },
+  async ({ query }) => {
+    if (AREST_MODE === 'local') {
+      const raw = await systemCall('sql', query)
+      return textResult(parseSqlResponse(raw))
+    }
+    const data = await httpRequest('/arest/default/sql', {
+      method: 'POST',
+      body: JSON.stringify({ query }),
+    })
+    return textResult(data)
+  },
+)
+
 // ── 3. apply: create, update, or transition an entity ────────────────
 
 server.registerTool(

@@ -8,7 +8,7 @@
 import { describe, it, expect } from 'vitest'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
-import { parseQueryResponse } from './server.js'
+import { parseQueryResponse, parseSqlResponse } from './server.js'
 
 describe('AREST MCP Server', () => {
   it('registers expected tool names', () => {
@@ -130,5 +130,31 @@ describe('#821 query verb returns tuples for empty / unknown FT', () => {
   it('returns { raw } for non-⊥ malformed responses (preserves diagnostics)', () => {
     const result = parseQueryResponse('this is not json and not bottom')
     expect(result).toEqual({ raw: 'this is not json and not bottom' })
+  })
+})
+
+describe('#864 sql verb envelope parsing', () => {
+  it('passes through a successful rows envelope', () => {
+    const raw = JSON.stringify({ rows: [{ Task: '1', Task_Priority: 'p0' }] })
+    expect(parseSqlResponse(raw)).toEqual({ rows: [{ Task: '1', Task_Priority: 'p0' }] })
+  })
+
+  it('passes through an engine-emitted error envelope', () => {
+    const raw = JSON.stringify({ error: 'no such table: ft_nope' })
+    expect(parseSqlResponse(raw)).toEqual({ error: 'no such table: ft_nope' })
+  })
+
+  it('translates engine ⊥ into a structured error envelope', () => {
+    // ⊥ here means the system handle didn't dispatch — most often
+    // because the build lacks the local feature. Surface that to the
+    // caller as a structured error rather than a malformed-JSON crash.
+    const result = parseSqlResponse('⊥') as { error: string }
+    expect(result.error).toMatch(/⊥|local/)
+  })
+
+  it('wraps malformed engine output in a structured error envelope', () => {
+    const result = parseSqlResponse('not json at all') as { error: string; raw: string }
+    expect(result.error).toMatch(/malformed/)
+    expect(result.raw).toBe('not json at all')
   })
 })

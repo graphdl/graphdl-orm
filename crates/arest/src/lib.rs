@@ -127,6 +127,12 @@ pub mod compile;
 pub mod evaluate;
 #[cfg(not(feature = "no_std"))]
 pub mod query;
+// #864: read-only SQL SELECT over the cell graph. Materializes per-FT
+// SQLite tables on each call (cells ARE relations per RMAP / whitepaper
+// §3) and runs the user query in an in-memory SQLite. Local feature
+// gates the rusqlite dep — same gate the CLI persistence path uses.
+#[cfg(feature = "local")]
+pub mod sql;
 // induce.rs (#848-#852) — induction engine search primitives.
 // First helper `enumerate_candidates_for_fact_type` (#848) lands the
 // single-fact-type candidate enumeration that #851's search loop will
@@ -1392,6 +1398,13 @@ fn is_read_only_op(key: &str) -> bool {
         // #765: fetch_cell is a pure projection over snapshot_d (peer of
         // cell_pin) — host adapters route their cell reads through it.
         | "fetch_cell"
+        // #864: sql is a pure projection — materializes per-FT SQLite
+        // tables on the snapshot and runs a SELECT-only query. No
+        // tenant-state mutation. SELECT-only is enforced inside the
+        // verb (`sql::sql_query`); the read lock here means parallel
+        // sql calls don't contend with each other or with `query:` /
+        // `get:` traffic on the same handle.
+        | "sql"
     )
     || key.starts_with("list:")
     || key.starts_with("get:")
@@ -1808,6 +1821,35 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
             ast::Object::Bottom => "⊥".into(),
             obj => obj.to_json_string(),
         };
+    }
+
+    // #864 — read-only SQL SELECT over the relational substrate.
+    //
+    //   system(h, "sql", "<SELECT ...>") → JSON envelope
+    //
+    // Each FactType cell is materialized as a per-call in-memory
+    // SQLite table named `ft_<sanitize(ft_id)>`; the user query runs
+    // against that view. Cells ARE relations per RMAP / whitepaper §3
+    // — SQL is the natural language for cross-FT projection. INSERT /
+    // UPDATE / DELETE are refused via `crate::sql::sql_query`'s
+    // SELECT-only gate; mutating SQL goes through the apply pipeline
+    // (separate task). Read-only → runs under the shared lock per
+    // `is_read_only_op("sql")` below.
+    //
+    // Local feature gate: rusqlite is the `local` dep. The fallback
+    // arm returns an error envelope so callers on non-local builds
+    // (Cloudflare worker, kernel) get a structured "not available"
+    // response instead of an opaque ⊥.
+    if key == "sql" {
+        #[cfg(feature = "local")]
+        {
+            let snapshot = tenant.read().snapshot_d();
+            return crate::sql::sql_query(&snapshot, input);
+        }
+        #[cfg(not(feature = "local"))]
+        {
+            return r#"{"error":"sql verb requires the `local` feature (rusqlite); rebuild with --features local"}"#.to_string();
+        }
     }
 
     // S1g (#723): per-cell GC compaction. Drops chain entries that

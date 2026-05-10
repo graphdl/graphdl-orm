@@ -150,6 +150,19 @@ mod db {
 /// owned state instead of a global handle registry.
 #[cfg(feature = "local")]
 fn system(key: &str, input: &str, d: &ast::Object) -> (String, ast::Object) {
+    // #864 — read-only SQL SELECT intercept. Mirrors the engine-side
+    // intercept in `lib.rs::system_impl` so the CLI shell-out path
+    // (`arest-cli --db <path> sql "<SELECT ...>"`) the MCP shim uses
+    // produces the same JSON envelope as the in-process engine call.
+    // Bypassing the standard `apply(Func::Def(key), …)` path is
+    // necessary because `sql` is not a Def — it's a host-only verb
+    // that materializes per-FT SQLite tables from the cell graph and
+    // queries them. State is unchanged on this branch (read-only).
+    if key == "sql" {
+        let raw = input.to_string();
+        return (crate::sql::sql_query(d, &raw), d.clone());
+    }
+
     let obj = ast::Object::parse(input);
     let result = ast::apply(&ast::Func::Def(key.to_string()), &obj, d);
 

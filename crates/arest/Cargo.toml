@@ -124,6 +124,17 @@ name = "ingest_fuzz"
 path = "tests/ingest_fuzz.rs"
 required-features = ["test-bins"]
 
+# `sql` verb acceptance against the apps/tasks DB (#864). End-to-end
+# pin: load the real SQLite cell store, run the parallel-paths query,
+# assert it returns ≥ 1 ready+p0 task disjoint from the in_progress
+# set. Skips gracefully when the DB isn't on disk so CI runners
+# without the apps repo cloned don't fail. Local feature gates the
+# rusqlite dep; test-bins gate matches every other integration suite.
+[[test]]
+name = "sql_against_tasks_db"
+path = "tests/sql_against_tasks_db.rs"
+required-features = ["test-bins", "local"]
+
 # `command::apply_command_defs` fuzz harness (#707 / Audit P1-A5).
 # Reached by every SYSTEM verb invocation: HTTP create / update /
 # transition / query, MCP `apply`, CLI verb dispatch, cluster
