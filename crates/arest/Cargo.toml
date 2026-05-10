@@ -158,6 +158,17 @@ name = "sherlock_induce"
 path = "tests/sherlock_induce.rs"
 required-features = ["test-bins"]
 
+# Subtype metamodel rule end-to-end pin (#890). Acceptance for
+# replacing the per-(sub, sup, ft) Rust synthesizer loop in
+# `compile.rs` with a single FORML 2 metamodel derivation rule
+# expressed in `readings/core/core.md`. Asserts the inherited fact
+# `<<Vehicle, '1'>, <Color, 'red'>>` lands in `Vehicle_has_Color` after
+# compile + forward-chain over a `Car is a subtype of Vehicle` fixture.
+[[test]]
+name = "subtype_metamodel_rule_e2e"
+path = "tests/subtype_metamodel_rule_e2e.rs"
+required-features = ["test-bins"]
+
 # Unary-consequent derivation rule end-to-end pin (#866 follow-up).
 # The simplified unit test in compile.rs schema_tests was insufficient
 # — it didn't catch the apps/tasks failure mode where the unary FT
