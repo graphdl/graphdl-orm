@@ -8,7 +8,7 @@
 import { describe, it, expect } from 'vitest'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
-import { parseQueryResponse, parseSqlResponse } from './server.js'
+import { parseQueryResponse, parseSqlResponse, parseCellsResponse, parseInduceResponse } from './server.js'
 
 describe('AREST MCP Server', () => {
   it('registers expected tool names', () => {
@@ -156,5 +156,127 @@ describe('#864 sql verb envelope parsing', () => {
     const result = parseSqlResponse('not json at all') as { error: string; raw: string }
     expect(result.error).toMatch(/malformed/)
     expect(result.raw).toBe('not json at all')
+  })
+})
+
+describe('#870 cells verb envelope parsing', () => {
+  it('passes through a successful list envelope', () => {
+    const raw = JSON.stringify({
+      cells: [
+        { name: 'Task_has_Task_Priority', size_bytes: 128 },
+        { name: 'Task_has_Task_Status',   size_bytes: 96 },
+      ],
+    })
+    expect(parseCellsResponse(raw)).toEqual({
+      cells: [
+        { name: 'Task_has_Task_Priority', size_bytes: 128 },
+        { name: 'Task_has_Task_Status',   size_bytes: 96 },
+      ],
+    })
+  })
+
+  it('passes through a successful get envelope with parsed contents', () => {
+    const raw = JSON.stringify({
+      name: 'Task_has_Task_Priority',
+      contents: [{ Task: '1', 'Task Priority': 'p0' }],
+      size_bytes: 64,
+    })
+    const parsed = parseCellsResponse(raw) as { name: string; contents: unknown[] }
+    expect(parsed.name).toBe('Task_has_Task_Priority')
+    expect(parsed.contents).toEqual([{ Task: '1', 'Task Priority': 'p0' }])
+  })
+
+  it('passes through an engine-emitted error envelope (no such cell)', () => {
+    const raw = JSON.stringify({ error: 'no such cell: Bogus' })
+    expect(parseCellsResponse(raw)).toEqual({ error: 'no such cell: Bogus' })
+  })
+
+  it('translates engine ⊥ into a structured error envelope', () => {
+    // ⊥ here means the system handle didn't dispatch — most often
+    // because the build lacks the std-deps feature. Surface that to
+    // the caller as a structured error rather than a malformed-JSON
+    // crash.
+    const result = parseCellsResponse('⊥') as { error: string }
+    expect(result.error).toMatch(/⊥|std-deps|handle/)
+  })
+})
+
+describe('#854 induce verb envelope parsing', () => {
+  it('passes through a successful Hypothesis Candidate array', () => {
+    // Basic call: engine returns the run_search Vec serialized as a
+    // JSON array. Each element is the FFP-shaped Hypothesis Candidate
+    // Object::Seq (here represented as nested objects per to_json_value).
+    const raw = JSON.stringify([
+      { hypothesisCandidateId: 'hyp-Order_was_placed_by_Customer-0', confidenceScore: '5' },
+      { hypothesisCandidateId: 'hyp-Order_was_placed_by_Customer-1', confidenceScore: '2' },
+    ])
+    const parsed = parseInduceResponse(raw) as Array<{ confidenceScore: string }>
+    expect(Array.isArray(parsed)).toBe(true)
+    expect(parsed).toHaveLength(2)
+    expect(parsed[0].confidenceScore).toBe('5')
+  })
+
+  it('translates engine ⊥ into a structured error envelope', () => {
+    // ⊥ here means the system handle didn't dispatch — handle was
+    // never registered, or the build lacks the induce verb. Surface
+    // that to the caller as a structured error rather than a
+    // malformed-JSON crash.
+    const result = parseInduceResponse('⊥') as { error: string }
+    expect(result.error).toMatch(/⊥|induce|handle/)
+  })
+
+  it('passes through with bound=phi (empty bound) producing an empty array', () => {
+    // bound=phi (no role pre-bound) is the default open-ended search;
+    // when no candidate survives the constraint gate the engine
+    // returns Object::Seq([]) which serializes to JSON `[]`. The
+    // parser MUST surface that as an empty array, not an error or
+    // a {raw} fallback.
+    expect(parseInduceResponse('[]')).toEqual([])
+    // null also collapses to the empty list (consistent with the
+    // query verb's null → [] translation in #821).
+    expect(parseInduceResponse('null')).toEqual([])
+  })
+
+  it('preserves engine ranking — top Hypothesis Candidate carries the highest Confidence Score (Sherlock fixture shape)', () => {
+    // Mirrors the apps/sherlock/readings/cases/test-locked-room.md
+    // fixture from #853: `induce` over `Hypothesis_has_Plausibility`
+    // returns at least one Hypothesis Candidate, the top-ranked one
+    // pairs `h1-evidence-supported` with the `'plausible'`
+    // Plausibility, and the engine has stamped a non-empty
+    // `confidenceScore` binding (so the Scoring Rule layer fired,
+    // not just enumeration). The Rust integration test
+    // `tests/sherlock_induce.rs` exercises the full engine flow;
+    // this TS shim test asserts the parser preserves the ordering
+    // the engine emitted (Confidence-Score-descending stable sort
+    // in `induce::run_search`) so callers see the evidence-supported
+    // candidate first.
+    const raw = JSON.stringify([
+      {
+        hypothesisCandidateId: 'hyp-Hypothesis_has_Plausibility-0',
+        confidenceScore: '10',
+        Hypothesis_Candidate_has_hidden__Fact: [
+          { Hypothesis: 'h1-evidence-supported', Plausibility: 'plausible' },
+        ],
+      },
+      {
+        hypothesisCandidateId: 'hyp-Hypothesis_has_Plausibility-1',
+        confidenceScore: '0',
+        Hypothesis_Candidate_has_hidden__Fact: [
+          { Hypothesis: 'h2-no-evidence', Plausibility: 'implausible' },
+        ],
+      },
+    ])
+    const parsed = parseInduceResponse(raw) as Array<{
+      confidenceScore: string
+      Hypothesis_Candidate_has_hidden__Fact: Array<{ Hypothesis: string; Plausibility: string }>
+    }>
+    expect(parsed[0].Hypothesis_Candidate_has_hidden__Fact[0].Hypothesis)
+      .toBe('h1-evidence-supported')
+    expect(parsed[0].Hypothesis_Candidate_has_hidden__Fact[0].Plausibility)
+      .toBe('plausible')
+    // Top candidate's score must be strictly higher than the
+    // bottom candidate's score — the parser preserves order.
+    expect(Number(parsed[0].confidenceScore))
+      .toBeGreaterThan(Number(parsed[1].confidenceScore))
   })
 })

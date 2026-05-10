@@ -898,6 +898,184 @@ server.registerTool(
   },
 )
 
+// ── 2c. cells: list / get / trace over the cell graph (#870) ──────────
+//
+// Sister to `sql` (#864): where `sql` materializes per-FT relational
+// tables for cross-FT JOINs, `cells` exposes the flat cell-graph
+// view — what cells exist, how big they are, what's in them, and
+// which derivation rules drive them. Closes the introspection gap
+// that previously sent agents to `sqlite3 cells …` for every diagnostic
+// question (find malformed cells, check derivation rule outputs,
+// verify what compile wrote).
+//
+// Three modes (chosen via the `mode` parameter):
+//
+//   list  — `{cells: [{name, size_bytes}, ...]}`
+//           Filtered by an optional glob pattern (`*` and `?`
+//           wildcards anchored at both ends). `pattern: 'Task_*'`
+//           returns only the Task fact-type cells; `pattern: '*'`
+//           (the default) returns every cell.
+//
+//   get   — `{name, contents: <parsed-tuple-list>, size_bytes}`
+//           Parses the FFP-encoded cell contents into a JSON array
+//           of role-keyed objects (so `Task_has_Task_Priority` rows
+//           come back as `[{Task: "1", "Task Priority": "p0"}, ...]`).
+//           Returns `{error}` when the cell is absent.
+//
+//   trace — `{rule_text, consequent_cell, materialized_count}`
+//           Looks up a derivation rule by `rule_id` (exact match on
+//           the DerivationRule cell's `id` field) or `rule_pattern`
+//           (substring match on rule text — first hit wins).
+//           `materialized_count` reports the row count of the
+//           consequent cell so callers can verify the rule actually
+//           fired during the last forward-chain pass.
+//
+// Returns `{error}` envelopes uniformly on parse / lookup failure;
+// no thrown exceptions for malformed input.
+export function parseCellsResponse(raw: string): unknown {
+  if (raw === '⊥') return { error: 'engine returned ⊥ (handle missing or std-deps feature unavailable)' }
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed ?? { error: 'engine returned null envelope' }
+  } catch {
+    return { error: 'malformed cells envelope', raw }
+  }
+}
+
+server.registerTool(
+  'cells',
+  {
+    description: 'Read-only cell-graph introspection (#870). Three modes: `list` returns {cells:[{name,size_bytes},...]} optionally filtered by a glob pattern (e.g. "Task_*"); `get` returns {name,contents,size_bytes} for a single cell with FFP-parsed contents; `trace` returns {rule_text,consequent_cell,materialized_count} for a derivation rule (look up by rule_id exact match or rule_pattern substring match). Use this instead of dropping to `sqlite3 cells …` when you need to know what cells exist, inspect a cell\'s contents, or verify a derivation rule populated its consequent cell. For cross-FT JOINs use `sql` instead.',
+    inputSchema: {
+      mode: z.enum(['list', 'get', 'trace']).describe('Introspection mode: list, get, or trace.'),
+      pattern: z.string().optional().describe('Glob pattern for `list` (e.g. "Task_*", "*derivation*"). Defaults to "*" — all cells.'),
+      name: z.string().optional().describe('Exact cell name for `get` (e.g. "FactType", "Task_has_Task_Priority"). Required for get mode.'),
+      rule_id: z.string().optional().describe('Exact match on a DerivationRule.id for `trace` mode. Provide either rule_id or rule_pattern.'),
+      rule_pattern: z.string().optional().describe('Substring match on a DerivationRule.text for `trace` mode. First match wins.'),
+    },
+  },
+  async ({ mode, pattern, name, rule_id, rule_pattern }) => {
+    const envelope: Record<string, string> = { mode }
+    if (pattern !== undefined) envelope.pattern = pattern
+    if (name !== undefined) envelope.name = name
+    if (rule_id !== undefined) envelope.rule_id = rule_id
+    if (rule_pattern !== undefined) envelope.rule_pattern = rule_pattern
+    if (AREST_MODE === 'local') {
+      const raw = await systemCall('cells', JSON.stringify(envelope))
+      return textResult(parseCellsResponse(raw))
+    }
+    const data = await httpRequest('/arest/default/cells', {
+      method: 'POST',
+      body: JSON.stringify(envelope),
+    })
+    return textResult(data)
+  },
+)
+
+// ── 2d. induce: search for Hypothesis Candidates (#854) ──────────────
+//
+// Wraps the engine's `induce` Func::Platform (registered #846, search
+// loop landed in #851 commit 14ebcfdc, ranking landed in #852 commit
+// b6235cc6). Until this verb landed, induce was only callable via
+// direct `Func::Platform("induce")` in tests; the MCP shim makes it
+// routine for agents.
+//
+// Input envelope (mirrors what `platform_induce` parses off `x`):
+//
+//   {
+//     "ft_id":      "<FT id to search over, required>",
+//     "to_explain": [<InstanceFact ...>],   // optional Seq of facts
+//     "bound":      {"…": "…"}              // optional binding map
+//   }
+//
+// `to_explain` and `bound` are optional. Empty `to_explain` means
+// open-ended search (every constraint-satisfying candidate ranked by
+// the user's Scoring Rules); empty `bound` is the default case where
+// no role is fixed up front.
+//
+// Output: a `Seq<Hypothesis Candidate>` (whatever `run_search`
+// returns; see `induce::build_hypothesis_candidate`). The MCP shim
+// is a pass-through over the JSON envelope — sort order is preserved
+// (Confidence-Score-descending, see `induce::run_search`'s stable
+// sort) because the parser doesn't re-sort.
+//
+// On engine error (handle missing, ft_id absent from FactType cell)
+// `platform_induce` returns `Object::phi`, which serializes to the
+// JSON `[]` — visible to callers as "induce ran but found nothing".
+// True engine ⊥ (handle never registered, build missing the verb)
+// translates to a structured `{error}` envelope.
+export function parseInduceResponse(raw: string): unknown {
+  if (raw === '⊥') return { error: 'engine returned ⊥ (handle missing or induce verb not wired)' }
+  try {
+    const parsed = JSON.parse(raw)
+    // `run_search` returns an empty Vec → `Object::Seq` of length zero
+    // → JSON `[]`. `null` likewise translates to the empty list so
+    // callers see "no candidates" rather than a nullable surprise.
+    if (parsed === null || parsed === undefined) return []
+    return parsed
+  } catch {
+    return { error: 'malformed induce envelope', raw }
+  }
+}
+
+server.registerTool(
+  'induce',
+  {
+    description: 'Search for Hypothesis Candidates over a fact type using the induce engine (#854). Wraps `Func::Platform("induce")` — enumerates candidates from the cartesian product of the FT\'s role types, gates them through the alethic-violation check, runs the user\'s Scoring Rules, and returns a Seq of Hypothesis Candidates ranked Confidence-Score-descending. `to_explain` (optional) is the seq of InstanceFacts you want the candidate to forward-chain-derive; empty means open-ended search. `bound` (optional) pins specific role values up front. See readings/core/induction.md for the Hypothesis Candidate / Confidence Score / Scoring Rule vocabulary.',
+    inputSchema: {
+      ft_id: z.string().describe('Fact type id to search over (e.g. "Hypothesis_has_Plausibility").'),
+      to_explain: z.array(z.unknown()).optional().describe('Optional seq of InstanceFact-shaped facts the candidate should forward-chain-derive. Empty (default) means open-ended search.'),
+      bound: z.record(z.string(), z.string()).optional().describe('Optional pre-bound role values keyed by role name. Constrains the cartesian enumeration to candidates that match these bindings.'),
+    },
+  },
+  async ({ ft_id, to_explain, bound }) => {
+    if (AREST_MODE === 'local') {
+      // Build the FFP-shaped argument the engine's `platform_induce`
+      // parser expects: a Seq of pair-bindings keyed by `ft_id`,
+      // `to_explain`, and `bound`. atom-shaped values become
+      // `<key, value>` pairs; the seq-shaped `to_explain` becomes
+      // `<to_explain, <fact1, fact2, …>>` (the parser walks the
+      // pair list to find the seq-valued `to_explain` directly per
+      // `platform_induce` doc-comment).
+      //
+      // Mirrors `escape_atom_for_display` semantics (split_top_level
+      // treats `<`, `>`, `,` as separators at depth 0; backslash
+      // escapes the next char).
+      const escapeAtom = (s: string) => s.replace(/[\\<>,]/g, ch => '\\' + ch)
+      const renderValue = (v: unknown): string => {
+        if (v === null || v === undefined) return 'φ'
+        if (typeof v === 'string') return escapeAtom(v)
+        if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+        if (Array.isArray(v)) {
+          if (v.length === 0) return 'φ'
+          return `<${v.map(renderValue).join(', ')}>`
+        }
+        if (typeof v === 'object') {
+          const pairs = Object.entries(v as Record<string, unknown>)
+            .map(([k, val]) => `<${escapeAtom(k)}, ${renderValue(val)}>`)
+          return `<${pairs.join(', ')}>`
+        }
+        return escapeAtom(String(v))
+      }
+      const pairs: string[] = [`<ft_id, ${escapeAtom(ft_id)}>`]
+      if (to_explain !== undefined) {
+        pairs.push(`<to_explain, ${renderValue(to_explain)}>`)
+      }
+      if (bound !== undefined) {
+        pairs.push(`<bound, ${renderValue(bound)}>`)
+      }
+      const arg = `<${pairs.join(', ')}>`
+      const raw = await systemCall('induce', arg)
+      return textResult(parseInduceResponse(raw))
+    }
+    const data = await httpRequest('/arest/default/induce', {
+      method: 'POST',
+      body: JSON.stringify({ ft_id, to_explain, bound }),
+    })
+    return textResult(data)
+  },
+)
+
 // ── 3. apply: create, update, or transition an entity ────────────────
 
 server.registerTool(

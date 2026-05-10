@@ -461,22 +461,73 @@ router.post('/api/import', async (request: Request, env: Env) => {
 router.post('/api/evaluate', handleEvaluate)
 router.post('/api/synthesize', (request, env) => handleSynthesize(request, env))
 
-// ── Induction (discover constraints from population) — uses WASM engine
+// ── Induction — Hypothesis Candidate search via the WASM engine (#854)
 //
-// TODO(T2 / #700 / 2026-05-04): collapse into a `dispatchVerb('induce', …)`
-// arm once the Rust side gains a real `induce` system intercept. The
-// `induce` module was deleted in #211 (zero production callers, tests
-// were self-referential), so this route currently dispatches a key the
-// engine no longer recognises and returns ⊥. Left hand-coded to mark
-// the gap; do NOT add the engine verb from this agent (that's a Rust
-// task and out of scope per the audit instructions).
+// Wraps the engine's `Func::Platform("induce")` (registered #846,
+// search loop landed in #851 commit 14ebcfdc, ranking landed in #852
+// commit b6235cc6). The stub from #211 returned ⊥; this route now
+// builds the FFP-shaped argument from the request body and forwards
+// to `system(handle, "induce", arg)`, returning the parsed Hypothesis
+// Candidate sequence (already ranked Confidence-Score-descending by
+// `induce::run_search`'s stable sort).
+//
+// Body shape mirrors the MCP `induce` tool input:
+//   { domain?: string,         // which loaded domain (default "default")
+//     ft_id: string,           // FT to search over (required)
+//     to_explain?: unknown[],  // optional Seq of InstanceFacts
+//     bound?: Record<string,string> }   // optional pre-bound roles
 router.post('/api/induce', async (request, env: Env) => {
-  const body = await request.json() as { domain?: string }
+  const body = await request.json() as {
+    domain?: string
+    ft_id?: string
+    to_explain?: unknown[]
+    bound?: Record<string, string>
+  }
+  if (!body.ft_id || typeof body.ft_id !== 'string') {
+    return error(400, { errors: [{ message: 'ft_id required' }] })
+  }
   const registry = getRegistryDO(env, 'global') as any
   const getStub = (id: string) => getEntityDO(env, id) as any
   const handle = await loadDomainSchema(registry, getStub, body.domain || 'default')
   if (handle < 0) return error(400, { errors: [{ message: 'no domain loaded' }] })
-  return json(JSON.parse(wasmSystem(handle, 'induce', '')))
+
+  // Build the FFP envelope `platform_induce` expects. Mirrors the
+  // local-MCP shim's serializer — atoms get FFP-escape on `<`, `>`,
+  // `,`, `\`; nested seqs become `<a, b, …>`; objects become
+  // `<<key, value>, …>`.
+  const escapeAtom = (s: string) => s.replace(/[\\<>,]/g, ch => '\\' + ch)
+  const renderValue = (v: unknown): string => {
+    if (v === null || v === undefined) return 'φ'
+    if (typeof v === 'string') return escapeAtom(v)
+    if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+    if (Array.isArray(v)) {
+      if (v.length === 0) return 'φ'
+      return `<${v.map(renderValue).join(', ')}>`
+    }
+    if (typeof v === 'object') {
+      const pairs = Object.entries(v as Record<string, unknown>)
+        .map(([k, val]) => `<${escapeAtom(k)}, ${renderValue(val)}>`)
+      return `<${pairs.join(', ')}>`
+    }
+    return escapeAtom(String(v))
+  }
+  const pairs: string[] = [`<ft_id, ${escapeAtom(body.ft_id)}>`]
+  if (body.to_explain !== undefined) {
+    pairs.push(`<to_explain, ${renderValue(body.to_explain)}>`)
+  }
+  if (body.bound !== undefined) {
+    pairs.push(`<bound, ${renderValue(body.bound)}>`)
+  }
+  const arg = `<${pairs.join(', ')}>`
+  const raw = wasmSystem(handle, 'induce', arg)
+  if (raw === '⊥') {
+    return error(500, { errors: [{ message: 'induce engine returned ⊥' }] })
+  }
+  try {
+    return json(JSON.parse(raw))
+  } catch {
+    return error(500, { errors: [{ message: `induce returned malformed envelope: ${raw}` }] })
+  }
 })
 
 // Entity creation goes through POST /api/entities/:noun (the AREST command path).

@@ -133,6 +133,13 @@ pub mod query;
 // gates the rusqlite dep — same gate the CLI persistence path uses.
 #[cfg(feature = "local")]
 pub mod sql;
+// #870: read-only cells introspection — list / get / trace verbs that
+// surface what the cell graph actually contains so agents stop dropping
+// to `sqlite3 cells …`. Mirrors the `sql` wiring shape (engine
+// intercept under shared lock, JSON envelope) but exposes the flat
+// cell view rather than the per-FT relational view.
+#[cfg(feature = "std-deps")]
+pub mod cells_introspect;
 // induce.rs (#848-#852) — induction engine search primitives.
 // First helper `enumerate_candidates_for_fact_type` (#848) lands the
 // single-fact-type candidate enumeration that #851's search loop will
@@ -1265,6 +1272,12 @@ fn create_bare_impl() -> u32 {
         ("apply".to_string(), ast::Func::Platform("apply_command".to_string())),
         ("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())),
         ("audit".to_string(), ast::Func::Platform("audit".to_string())),
+        // #854: induction engine surfaced as a Func::Platform so
+        // `system(h, "induce", "<args>")` resolves through the
+        // standard Func::Def → Func::Platform dispatch (search loop
+        // in `induce::run_search`, plumbing in `ast::platform_induce`).
+        // Mirrors how the CLI's `load_and_compile` registers it.
+        ("induce".to_string(), ast::Func::Platform("induce".to_string())),
     ];
     allocate(state, defs)
 }
@@ -1340,6 +1353,10 @@ fn metamodel_state() -> &'static ast::Object {
             ("apply".to_string(), ast::Func::Platform("apply_command".to_string())),
             ("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())),
             ("audit".to_string(), ast::Func::Platform("audit".to_string())),
+            // #854: induction engine — same registration as
+            // create_bare_impl above so cached metamodel handles
+            // dispatch `induce` through to `platform_induce`.
+            ("induce".to_string(), ast::Func::Platform("induce".to_string())),
         ]);
         ast::defs_to_state(&defs, &merged)
     })
@@ -1405,6 +1422,10 @@ fn is_read_only_op(key: &str) -> bool {
         // sql calls don't contend with each other or with `query:` /
         // `get:` traffic on the same handle.
         | "sql"
+        // #870: cells is a pure projection — list / get / trace over
+        // the snapshot's cell graph. No state mutation. Read lock so
+        // parallel introspection calls don't serialize.
+        | "cells"
     )
     || key.starts_with("list:")
     || key.starts_with("get:")
@@ -1852,6 +1873,33 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         }
     }
 
+    // #870 — read-only cells introspection over the cell graph.
+    //
+    //   system(h, "cells", "<JSON envelope>") → JSON envelope
+    //
+    // Three modes (chosen by `mode` field):
+    //   {"mode":"list","pattern":"Task_*"}        → {cells:[{name,size_bytes},...]}
+    //   {"mode":"get","name":"FactType"}          → {name,contents,size_bytes}
+    //   {"mode":"trace","rule_id":"…"}            → {rule_text,consequent_cell,materialized_count}
+    //   {"mode":"trace","rule_pattern":"…"}       → same shape, first matching rule
+    //
+    // Pure projection — no state mutation. The verb body lives in
+    // `crate::cells_introspect` so the wiring stays a thin dispatch.
+    // std-deps gates the serde_json envelope shaping; no_std builds
+    // get a structured "feature unavailable" diagnostic instead of
+    // an opaque ⊥.
+    if key == "cells" {
+        #[cfg(feature = "std-deps")]
+        {
+            let snapshot = tenant.read().snapshot_d();
+            return crate::cells_introspect::cells_query(&snapshot, input);
+        }
+        #[cfg(not(feature = "std-deps"))]
+        {
+            return r#"{"error":"cells verb requires the `std-deps` feature; rebuild with --features std-deps"}"#.to_string();
+        }
+    }
+
     // S1g (#723): per-cell GC compaction. Drops chain entries that
     // aren't pinned by any live snapshot or Citation; latest is always
     // kept (the cell's logical view is unchanged). Decimal dropped-
@@ -2007,6 +2055,9 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         defs.push(("apply".to_string(), ast::Func::Platform("apply_command".to_string())));
         defs.push(("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())));
         defs.push(("audit".to_string(), ast::Func::Platform("audit".to_string())));
+        // #854: induction engine — same registration as create_*
+        // above so post-load_reading handles still dispatch `induce`.
+        defs.push(("induce".to_string(), ast::Func::Platform("induce".to_string())));
         let new_d = ast::defs_to_state(&defs, &outcome.new_state);
         let mut st = tenant.write();
         st.replace_d(new_d);
