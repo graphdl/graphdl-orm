@@ -3355,96 +3355,263 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     };
                 }
             }
-            // Subscript-driven join (#826): when a rule's antecedents
-            // share a subscript token (`Task1` in both `Task1 blocks
-            // Task2` and `Task1 has Task Status 'pending'`), the
-            // semantics are a per-tuple equi-join — fire one
-            // consequent per (a0, a1) where a0[role_idx0] ==
-            // a1[role_idx1]. The existing existence-check branch
-            // below fires once globally and projects bindings from
-            // the first fact, which is wrong for ring-FT joins (the
-            // consequent's `Task` always becomes the first role of
-            // the first ring fact, never the per-tuple match).
+            // Subscript-driven join (#826, generalised in #866-c):
+            // when a rule's antecedents share a subscript token
+            // (`Task1` in both `Task1 blocks Task2` and `Task1 has
+            // Task Status 'pending'`), the semantics are a per-tuple
+            // equi-join — fire one consequent per matching cross-
+            // product where every shared-subscript role pair agrees.
+            // The existing existence-check branch below fires once
+            // globally and projects bindings from the first fact,
+            // which is wrong for ring-FT joins (the consequent's
+            // `Task` always becomes the first role of the first
+            // ring fact, never the per-tuple match).
             //
-            // 2-antecedent specialisation. Larger arities still flow
-            // through the existence check or compile_join_derivation
-            // until subscript joining generalises.
+            // Generalised to N antecedents: build a left-folded
+            // join chain a0 ⨝ a1 ⨝ a2 ⨝ … where each step
+            // joins the accumulated tuple with the next antecedent
+            // on every subscript pair the two share.
             let ant_subs = antecedent_role_subscripts(rule, data);
             let cons_subs = consequent_role_subscripts(rule, &consequent_id, data);
-            let join_pair: Option<(usize, usize)> = if antecedent_ids.len() == 2 {
-                ant_subs.first().and_then(|a0| ant_subs.get(1).and_then(|a1| {
-                    a0.iter().find_map(|(idx0, sub0)| {
-                        if sub0.is_empty() { return None; }
-                        a1.iter().find(|(_, sub1)| sub1 == sub0).map(|(idx1, _)| (*idx0, *idx1))
-                    })
-                }))
-            } else { None };
+            // Detect that at least one subscript bridges some pair
+            // of antecedents. If yes, take the subscript-join path.
+            let any_subscript_bridge = (0..antecedent_ids.len()).any(|i| {
+                let Some(ai) = ant_subs.get(i) else { return false };
+                ai.iter().any(|(_, sub_i)| {
+                    !sub_i.is_empty() && (0..antecedent_ids.len())
+                        .filter(|j| *j != i)
+                        .any(|j| ant_subs.get(j)
+                            .map_or(false, |aj| aj.iter()
+                                .any(|(_, sub_j)| sub_j == sub_i)))
+                })
+            });
 
-            if let Some((j0, j1)) = join_pair {
-                // Per-tuple equi-join. Build the joined-pair stream:
-                //   DistR : <ant0_facts, ant1_facts>
-                //     → seq of <a0, ant1_facts>
-                //   apply_to_all(distl + filter(match_join_key)) per a0
-                //     → seq of seq of <a0, a1> where a0.role[j0] == a1.role[j1]
-                //   Concat → flat seq of <a0, a1>
-                //   apply_to_all(emit_consequent)
-                let ant0 = extract(0, &antecedent_ids[0]);
-                let ant1 = extract(1, &antecedent_ids[1]);
-                let match_key = Func::compose(Func::Eq, Func::construction(vec![
-                    Func::compose(role_value(j0), Func::Selector(1)),
-                    Func::compose(role_value(j1), Func::Selector(2)),
-                ]));
-                let pair_stream_per_a0 = Func::compose(
-                    Func::filter(match_key),
-                    Func::DistL,
-                );
-                let pair_stream = Func::compose(
-                    Func::Concat,
-                    Func::compose(
-                        Func::apply_to_all(pair_stream_per_a0),
-                        Func::compose(Func::DistR, Func::construction(vec![ant0, ant1])),
-                    ),
-                );
-
-                // Build consequent bindings: for each consequent role,
-                // (a) literal pin, (b) subscript-positional projection
-                // from the matched (a0, a1) pair, (c) name fallback
-                // against a0.
+            if any_subscript_bridge {
+                // Build the join chain.
+                //
+                // Tuple shape after step k (0-indexed):
+                //   k_total = 0  → just a0 (no nesting; Id picks it)
+                //   k_total = 1  → <a0, a1>
+                //   k_total = 2  → <<a0, a1>, a2>
+                //   k_total = N  → <<…<a0, a1>, a2>, … aN>
+                // Helper `pick_in_tuple(k_total, ant_idx)` returns a
+                // Func that pulls antecedent `ant_idx` out of the
+                // step-k_total tuple shape:
+                //   ant_idx == k_total       → Selector(2)
+                //                              (or Id when k_total==0)
+                //   ant_idx == k_total - 1   → Selector(2).Selector(1)
+                //   ant_idx <  k_total - 1   → Selector(2).Selector(1)
+                //                              .Selector(1).….Selector(1)
+                //                              (one Selector(2) plus
+                //                              k_total-ant_idx-1 extra
+                //                              Selector(1)s on top)
+                //   ant_idx == 0, k_total>0  → Selector(1).….Selector(1)
+                //                              (k_total Selector(1)s)
+                let pick_in_tuple = |k_total: usize, ant_idx: usize| -> Func {
+                    debug_assert!(ant_idx <= k_total);
+                    if k_total == 0 {
+                        // No nesting yet — the "tuple" is just a0.
+                        return Func::Id;
+                    }
+                    if ant_idx == k_total {
+                        // Most-recent antecedent sits at Selector(2).
+                        return Func::Selector(2);
+                    }
+                    // Older antecedent: peel into Selector(1) until
+                    // we reach the layer at which `ant_idx` is the
+                    // most-recent, then take Selector(2) (or Id when
+                    // ant_idx == 0).
+                    let mut f = if ant_idx == 0 {
+                        Func::Selector(1)
+                    } else {
+                        Func::compose(Func::Selector(2), Func::Selector(1))
+                    };
+                    let strip_levels = k_total - ant_idx - 1;
+                    for _ in 0..strip_levels {
+                        f = Func::compose(f, Func::Selector(1));
+                    }
+                    f
+                };
+                // Subscripts the rule's antecedent[i] role[ri]
+                // carries. Empty string means no subscript. Lookup
+                // helper avoids re-walking ant_subs in the loops.
+                let sub_of = |i: usize, ri: usize| -> String {
+                    ant_subs.get(i)
+                        .and_then(|a| a.iter().find(|(idx, _)| *idx == ri))
+                        .map(|(_, s)| s.clone())
+                        .unwrap_or_default()
+                };
+                // Step 0: a0_facts.
+                let mut tuple_stream = extract(0, &antecedent_ids[0]);
+                // For each subsequent antecedent, build join key
+                // pairs against PRIOR antecedents that share a
+                // subscript on some role.
+                for k in 1..antecedent_ids.len() {
+                    let ant_k_facts = extract(k, &antecedent_ids[k]);
+                    let Some(ft_k) = data.fact_types.get(&antecedent_ids[k]) else {
+                        // Schema lookup failed — degenerate, fall
+                        // back to existence check.
+                        return CompiledDerivation {
+                            id: id.clone(), text: text.clone(), kind: kind.clone(),
+                            func: Func::constant(Object::phi()),
+                            uses_negation: false,
+                        };
+                    };
+                    let ft_k_role_count = ft_k.roles.len();
+                    // Collect equality predicates: for each role rk
+                    // of antecedent[k], if its subscript matches a
+                    // subscript on some prior antecedent's role,
+                    // require equality. (We pick the FIRST matching
+                    // prior; multiple prior matches are redundant
+                    // since equality is transitive.)
+                    let mut eqs: Vec<Func> = Vec::new();
+                    for rk in 0..ft_k_role_count {
+                        let sub = sub_of(k, rk);
+                        if sub.is_empty() { continue }
+                        // Find first prior antecedent + role with
+                        // the same subscript.
+                        let mut found_prior: Option<(usize, usize)> = None;
+                        'outer: for prior in 0..k {
+                            let Some(ft_prior) = data.fact_types.get(&antecedent_ids[prior])
+                            else { continue };
+                            for r_prior in 0..ft_prior.roles.len() {
+                                if sub_of(prior, r_prior) == sub {
+                                    found_prior = Some((prior, r_prior));
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        if let Some((prior_ant, prior_role)) = found_prior {
+                            let lhs = Func::compose(role_value(prior_role),
+                                Func::compose(pick_in_tuple(k - 1, prior_ant),
+                                    Func::Selector(1)));
+                            let rhs = Func::compose(role_value(rk),
+                                Func::Selector(2));
+                            eqs.push(Func::compose(Func::Eq,
+                                Func::construction(vec![lhs, rhs])));
+                        }
+                    }
+                    // Also fold in non-subscripted noun-equality
+                    // joins (e.g. `Source File` shared as a value
+                    // across two antecedents, no subscript token).
+                    // For each role rk of ant[k], if its noun_name
+                    // also appears as the noun_name of some prior
+                    // antecedent's role AND neither carries a
+                    // disambiguating subscript on this position,
+                    // require equality. Skips when rk has a
+                    // subscript (handled above).
+                    for rk in 0..ft_k_role_count {
+                        if !sub_of(k, rk).is_empty() { continue }
+                        let noun_k = &ft_k.roles[rk].noun_name;
+                        let mut found_prior: Option<(usize, usize)> = None;
+                        'outer2: for prior in 0..k {
+                            let Some(ft_prior) = data.fact_types.get(&antecedent_ids[prior])
+                            else { continue };
+                            for r_prior in 0..ft_prior.roles.len() {
+                                if &ft_prior.roles[r_prior].noun_name != noun_k { continue }
+                                if !sub_of(prior, r_prior).is_empty() { continue }
+                                found_prior = Some((prior, r_prior));
+                                break 'outer2;
+                            }
+                        }
+                        if let Some((prior_ant, prior_role)) = found_prior {
+                            let lhs = Func::compose(role_value(prior_role),
+                                Func::compose(pick_in_tuple(k - 1, prior_ant),
+                                    Func::Selector(1)));
+                            let rhs = Func::compose(role_value(rk),
+                                Func::Selector(2));
+                            eqs.push(Func::compose(Func::Eq,
+                                Func::construction(vec![lhs, rhs])));
+                        }
+                    }
+                    let combined: Func = if eqs.is_empty() {
+                        // No join key — Cartesian product. Cheap
+                        // existence check upstream filters mostly
+                        // to small candidate sets, so this stays
+                        // bounded for typical fixtures.
+                        Func::constant(Object::atom("true"))
+                    } else {
+                        eqs.into_iter()
+                            .reduce(|a, b| Func::compose(Func::And,
+                                Func::construction(vec![a, b])))
+                            .unwrap()
+                    };
+                    let pair_stream_per_acc = Func::compose(
+                        Func::filter(combined),
+                        Func::DistL,
+                    );
+                    tuple_stream = Func::compose(
+                        Func::Concat,
+                        Func::compose(
+                            Func::apply_to_all(pair_stream_per_acc),
+                            Func::compose(Func::DistR,
+                                Func::construction(vec![tuple_stream, ant_k_facts])),
+                        ),
+                    );
+                }
+                // Now `tuple_stream` is a flat seq of nested
+                // tuples `<<<a0, a1>, a2>, …>` where every join
+                // constraint holds. Build per-tuple consequent.
                 let cons_roles = data.fact_types.get(&consequent_id)
                     .map(|ft| ft.roles.clone())
                     .unwrap_or_default();
-                let pairs: Vec<Func> = cons_roles.iter().enumerate().map(|(cons_role_idx, r)| {
-                    let key = r.noun_name.clone();
-                    if let Some(crl) = rule.consequent_role_literals.iter()
-                        .find(|crl| crl.role == r.noun_name)
-                    {
-                        return Func::construction(vec![
-                            Func::constant(Object::atom(&key)),
-                            Func::constant(Object::atom(&crl.value)),
-                        ]);
-                    }
-                    let cons_sub = cons_subs.iter()
-                        .find(|(idx, _)| *idx == cons_role_idx)
-                        .map(|(_, s)| s.as_str())
-                        .filter(|s| !s.is_empty());
-                    if let Some(sub) = cons_sub {
-                        for (ant_idx, ant_role_subs) in ant_subs.iter().enumerate() {
-                            if let Some((ant_role_idx, _)) = ant_role_subs.iter()
-                                .find(|(_, s)| s == sub)
+                let last_k = antecedent_ids.len() - 1;
+                let pairs: Vec<Func> = cons_roles.iter().enumerate()
+                    .map(|(cons_role_idx, r)| {
+                        let key = r.noun_name.clone();
+                        // (1) Literal pin wins.
+                        if let Some(crl) = rule.consequent_role_literals.iter()
+                            .find(|crl| crl.role == r.noun_name)
+                        {
+                            return Func::construction(vec![
+                                Func::constant(Object::atom(&key)),
+                                Func::constant(Object::atom(&crl.value)),
+                            ]);
+                        }
+                        // (2) Subscript-positional projection.
+                        let cons_sub = cons_subs.iter()
+                            .find(|(idx, _)| *idx == cons_role_idx)
+                            .map(|(_, s)| s.as_str())
+                            .filter(|s| !s.is_empty());
+                        if let Some(sub) = cons_sub {
+                            for (ant_idx, ant_role_subs) in ant_subs.iter().enumerate() {
+                                if let Some((ant_role_idx, _)) = ant_role_subs.iter()
+                                    .find(|(_, s)| s == sub)
+                                {
+                                    return Func::construction(vec![
+                                        Func::constant(Object::atom(&key)),
+                                        Func::compose(role_value(*ant_role_idx),
+                                            pick_in_tuple(last_k, ant_idx)),
+                                    ]);
+                                }
+                            }
+                        }
+                        // (3) Name-based fallback against any
+                        // antecedent that carries a role with the
+                        // matching noun_name. Picks the first
+                        // antecedent with that role to mirror the
+                        // 1-antecedent case's role_value_by_name
+                        // semantics.
+                        for (ant_idx, ft_id) in antecedent_ids.iter().enumerate() {
+                            let Some(ft) = data.fact_types.get(ft_id) else { continue };
+                            if let Some((role_idx, _)) = ft.roles.iter()
+                                .enumerate()
+                                .find(|(_, rr)| rr.noun_name == r.noun_name)
                             {
-                                let pick = if ant_idx == 0 { Func::Selector(1) } else { Func::Selector(2) };
                                 return Func::construction(vec![
                                     Func::constant(Object::atom(&key)),
-                                    Func::compose(role_value(*ant_role_idx), pick),
+                                    Func::compose(role_value(role_idx),
+                                        pick_in_tuple(last_k, ant_idx)),
                                 ]);
                             }
                         }
-                    }
-                    Func::construction(vec![
-                        Func::constant(Object::atom(&key)),
-                        Func::compose(role_value_by_name(&r.noun_name), Func::Selector(1)),
-                    ])
-                }).collect();
+                        // No source — emit phi for that role's
+                        // value.
+                        Func::construction(vec![
+                            Func::constant(Object::atom(&key)),
+                            Func::constant(Object::phi()),
+                        ])
+                    }).collect();
                 let bindings_func = Func::construction(pairs);
                 let derive_one = Func::construction(vec![
                     consequent_id_func.clone(),
@@ -3453,13 +3620,35 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 ]);
                 return CompiledDerivation {
                     id, text, kind,
-                    func: Func::compose(Func::apply_to_all(derive_one), pair_stream),
+                    func: Func::compose(Func::apply_to_all(derive_one), tuple_stream),
                     uses_negation: false,
                 };
             }
 
-            // Multi-antecedent existence check. Fires when every
-            // antecedent has at least one surviving fact.
+            // Multi-antecedent path. Two semantics:
+            //
+            // (a) Implicit equi-join on a shared role (#866 follow-
+            //     up): when every consequent role has the same name
+            //     as a role on antecedent 0 AND every other
+            //     antecedent ALSO has that role, fire per matching
+            //     a0 fact whose subject value also has matching
+            //     facts in antecedents 1..n. This is the natural
+            //     Halpin reading of `Task is recommended iff Task
+            //     has Task Readiness 'ready' and Task has Task
+            //     Priority 'p0' and Task is parallelizable.` —
+            //     "for each Task that satisfies all three
+            //     conditions, mark it recommended". Without this,
+            //     the existence-check fallback below fires once and
+            //     emits ONE derived fact (using a0's first-fact
+            //     bindings), missing every other matching subject.
+            //
+            // (b) Existence check (legacy fallback): when no shared-
+            //     role join is detected, fall back to the global
+            //     existence check that emits a single fact per
+            //     successful guard. Preserved for grammar rules and
+            //     literal-consequent rules that pin every role
+            //     fresh from `consequent_role_literals` and don't
+            //     depend on a per-subject fanout.
             //
             // Defensive: the multi-antecedent branch isn't wired up for
             // `AntecedentRole` consequents — the per-step input is a
@@ -3474,6 +3663,189 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                       this path emits phi (no facts). Route through compile_join_derivation or restructure.",
                       rule.id);
             }
+
+            // (a) Implicit equi-join detection. Pick the natural
+            // join roles: every role of the consequent FT that
+            // also appears on antecedent 0 AND on every other
+            // antecedent (as a role's noun_name). When the set is
+            // non-empty AND the rule has no `consequent_role_literals`
+            // pinning every role, build a per-a0 fanout that checks
+            // each other antecedent for a fact matching a0 on every
+            // join role.
+            //
+            // Subscript safety: a rule like `Task2 is file-conflicting
+            // iff Task1 has Task Status 'in_progress' and Task1
+            // touches Source File and Task2 touches Source File`
+            // shares the noun `Task` across antecedents but the
+            // subscripts identify DIFFERENT variables — Task1 and
+            // Task2 are not the same. The implicit-join detector
+            // would incorrectly fold them onto the same value. Skip
+            // join-role candidacy for any noun that appears with
+            // distinct non-empty subscripts across the antecedents
+            // (or distinct subscripts between the consequent and an
+            // antecedent). Such rules need full subscript-aware
+            // multi-way joining (#866-c, follow-up); for now they
+            // fall through to the existence-check fallback, which
+            // is no worse than today's behavior for them.
+            let cons_roles_for_join = data.fact_types.get(&consequent_id)
+                .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let ant0_role_set: HashSet<String> = data.fact_types.get(&antecedent_ids[0])
+                .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+                .unwrap_or_default();
+            let ant_subs = antecedent_role_subscripts(rule, data);
+            let cons_subs = consequent_role_subscripts(rule, &consequent_id, data);
+            // For a candidate noun, collect the set of distinct
+            // non-empty subscripts seen for that noun's role across
+            // antecedents AND consequent. Empty subscripts are
+            // compatible with anything (the same variable).
+            let subscripts_for_role = |role: &str| -> hashbrown::HashSet<String> {
+                let mut subs: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+                for (i, ft_id) in antecedent_ids.iter().enumerate() {
+                    let Some(ft) = data.fact_types.get(ft_id) else { continue };
+                    for (ri, r) in ft.roles.iter().enumerate() {
+                        if r.noun_name != role { continue }
+                        if let Some(per_ant) = ant_subs.get(i) {
+                            if let Some((_, sub)) = per_ant.iter().find(|(idx, _)| *idx == ri) {
+                                if !sub.is_empty() { subs.insert(sub.clone()); }
+                            }
+                        }
+                    }
+                }
+                if let Some(cons_ft) = data.fact_types.get(&consequent_id) {
+                    for (ri, r) in cons_ft.roles.iter().enumerate() {
+                        if r.noun_name != role { continue }
+                        if let Some((_, sub)) = cons_subs.iter().find(|(idx, _)| *idx == ri) {
+                            if !sub.is_empty() { subs.insert(sub.clone()); }
+                        }
+                    }
+                }
+                subs
+            };
+            let join_roles: Vec<String> = cons_roles_for_join.iter()
+                .filter(|r| ant0_role_set.contains(*r))
+                .filter(|r| antecedent_ids[1..].iter().all(|ft_id|
+                    data.fact_types.get(ft_id).map_or(false, |ft|
+                        ft.roles.iter().any(|rr| rr.noun_name == **r))))
+                .filter(|r| subscripts_for_role(r).len() <= 1)
+                .cloned()
+                .collect();
+            if !join_roles.is_empty() {
+                // Per-a0 fanout. For each fact a0 in the filtered
+                // antecedent-0 stream, check that for every other
+                // antecedent i in 1..n, ≥1 fact in antecedent[i]
+                // (already filter-wrapped by `extract`) matches a0
+                // on every join role. When all match, emit one
+                // consequent fact whose bindings come from a0
+                // (literal pin wins per role) for every consequent
+                // role.
+                //
+                // Threading the encoded population: `extract(i, …)`
+                // is a Func that expects the encoded pop as input,
+                // not a single a0 fact. So we precompute the
+                // per-antecedent fact lists at the OUTER level,
+                // then `DistR`-pair each a0 with the (n-1)-tuple
+                // of other-antecedent fact lists. Inside the per-a0
+                // step Selector(1) gives a0, Selector(2) gives the
+                // tuple of other-antecedent fact lists, indexed by
+                // their position-in-tuple.
+                //
+                // Match predicate: a candidate fact `c` from
+                // antecedent[i] matches a0 on join role R iff
+                //   role_value_by_name(R)(c) == role_value_by_name(R)(a0)
+                // The DistL+filter+null-test pattern is the same one
+                // the AbsenceOf branch uses; here we negate the
+                // null-test to mean "≥1 match exists".
+                let n_other = antecedent_ids.len() - 1;
+                let other_extracts: Vec<Func> = antecedent_ids.iter().enumerate()
+                    .skip(1)
+                    .map(|(i, ft_id)| extract(i, ft_id))
+                    .collect();
+                // Inside per-a0: input is <a0, <ant1_facts, ant2_facts, …>>.
+                // For each other-antecedent slot j (1-based within the tuple),
+                // pair a0 with ant_facts[j], filter by per-role equality
+                // on join roles, check non-empty.
+                let other_checks: Vec<Func> = (0..n_other).map(|j| {
+                    let per_role_match: Vec<Func> = join_roles.iter().map(|jr| {
+                        Func::compose(Func::Eq, Func::construction(vec![
+                            Func::compose(role_value_by_name(jr), Func::Selector(2)),
+                            Func::compose(role_value_by_name(jr), Func::Selector(1)),
+                        ]))
+                    }).collect();
+                    let combined = per_role_match.into_iter()
+                        .reduce(|a, b| Func::compose(Func::And,
+                            Func::construction(vec![a, b])))
+                        .unwrap();
+                    let any_match = Func::compose(
+                        Func::compose(Func::Not, Func::NullTest),
+                        Func::compose(Func::filter(combined), Func::DistL));
+                    // Build <a0, ant_j_facts>: Selector(1) is a0,
+                    // Selector(j+1) of Selector(2) is ant_j_facts
+                    // (1-based selector over a 1-based tuple slot).
+                    let a0 = Func::Selector(1);
+                    let ant_j = Func::compose(Func::Selector(j + 1), Func::Selector(2));
+                    Func::compose(any_match,
+                        Func::construction(vec![a0, ant_j]))
+                }).collect();
+                let all_others_hold = if other_checks.is_empty() {
+                    Func::constant(Object::atom("true"))
+                } else {
+                    other_checks.into_iter()
+                        .reduce(|a, b| Func::compose(Func::And,
+                            Func::construction(vec![a, b])))
+                        .unwrap()
+                };
+                // Build consequent bindings from a0 (literal pin
+                // wins). Construction is in declared role order so
+                // downstream cell-table consumers see a canonical
+                // shape regardless of antecedent role order.
+                let cons_roles = data.fact_types.get(&consequent_id)
+                    .map(|ft| ft.roles.clone())
+                    .unwrap_or_default();
+                let pairs: Vec<Func> = cons_roles.iter().map(|r| {
+                    let key = r.noun_name.clone();
+                    let value_func = rule.consequent_role_literals.iter()
+                        .find(|crl| crl.role == r.noun_name)
+                        .map(|crl| Func::constant(Object::atom(&crl.value)))
+                        .unwrap_or_else(|| Func::compose(
+                            role_value_by_name(&r.noun_name),
+                            Func::Selector(1)));   // a0
+                    Func::construction(vec![
+                        Func::constant(Object::atom(&key)),
+                        value_func,
+                    ])
+                }).collect();
+                let bindings_func = Func::construction(pairs);
+                let derive_one = Func::construction(vec![
+                    consequent_id_func.clone(),
+                    consequent_reading_func.clone(),
+                    bindings_func,
+                ]);
+                let per_a0 = Func::condition(
+                    all_others_hold,
+                    Func::construction(vec![derive_one]),
+                    Func::constant(Object::phi()),
+                );
+                let other_facts_tuple = Func::construction(other_extracts);
+                return CompiledDerivation {
+                    id, text, kind,
+                    func: Func::compose(
+                        Func::Concat,
+                        Func::compose(
+                            Func::apply_to_all(per_a0),
+                            Func::compose(Func::DistR,
+                                Func::construction(vec![
+                                    extract(0, &antecedent_ids[0]),
+                                    other_facts_tuple,
+                                ])),
+                        ),
+                    ),
+                    uses_negation: false,
+                };
+            }
+
+            // (b) Existence-check fallback. Fires when every
+            // antecedent has at least one surviving fact.
             let ant_checks: Vec<Func> = antecedent_ids.iter().enumerate()
                 .map(|(i, ft_id)| Func::compose(
                     Func::compose(Func::Not, Func::NullTest),

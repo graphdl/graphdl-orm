@@ -619,6 +619,18 @@ pub fn parse_to_state_with_nouns(input: &str, existing: &crate::ast::Object) -> 
 
 /// Re-resolve a rules vec given just the typed lookups it needs.
 /// No ParseCtx struct required â€” callers pass their HashMaps directly.
+/// Public wrapper around `re_resolve_rules` for integration tests
+/// that need to inspect the resolved antecedent_sources of a parsed
+/// rule. Production callers stay on the internal name.
+#[doc(hidden)]
+pub fn re_resolve_rules_pub(
+    rules: &mut Vec<DerivationRuleDef>,
+    nouns: &HashMap<String, NounDef>,
+    fact_types: &HashMap<String, FactTypeDef>,
+) {
+    re_resolve_rules(rules, nouns, fact_types);
+}
+
 pub(crate) fn re_resolve_rules(
     rules: &mut Vec<DerivationRuleDef>,
     nouns: &HashMap<String, NounDef>,
@@ -1681,15 +1693,28 @@ pub(crate) fn find_nouns(text: &str, noun_names: &[String]) -> Vec<(usize, usize
             while let Some(found) = text_lower[pos..].find(name_lower.as_str()) {
                 let start = pos + found;
                 let mut end = start + name_lower.len();
-                let before_ok = start == 0 || !text.as_bytes()[start - 1].is_ascii_alphanumeric();
+                // Token-boundary check: the byte before and after the
+                // match must not extend the identifier. Reject when the
+                // surrounding char is alphanumeric OR an ASCII hyphen
+                // (so hyphenated words like `file-conflicting` are
+                // atomic — without the hyphen check the unary FT verb
+                // `is file-conflicting` would mis-split into "file" +
+                // "-conflicting", with `find_nouns` capturing the
+                // metamodel noun `File` from inside an unrelated
+                // identifier and breaking
+                // `resolve_consequent_fact_type_id` for the rule
+                // `Task2 is file-conflicting iff …`. #866-c.
+                let is_word_byte = |b: u8| -> bool {
+                    b.is_ascii_alphanumeric() || b == b'-'
+                };
+                let before_ok = start == 0 || !is_word_byte(text.as_bytes()[start - 1]);
                 // Extend end past any trailing ASCII digit subscript.
                 while end < text.len() && text.as_bytes()[end].is_ascii_digit() {
                     end += 1;
                 }
                 // After the (possibly-extended) end, the next byte must
-                // not be alphanumeric â€” otherwise the match was part of
-                // a longer identifier.
-                let after_ok = end >= text.len() || !text.as_bytes()[end].is_ascii_alphanumeric();
+                // not extend the identifier (alphanumeric or hyphen).
+                let after_ok = end >= text.len() || !is_word_byte(text.as_bytes()[end]);
                 let no_overlap = !used.iter().any(|&(s, e)| start < e && end > s);
 
                 if before_ok && after_ok && no_overlap {

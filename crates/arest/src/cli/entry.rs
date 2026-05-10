@@ -163,6 +163,16 @@ fn system(key: &str, input: &str, d: &ast::Object) -> (String, ast::Object) {
         return (crate::sql::sql_query(d, &raw), d.clone());
     }
 
+    // #870 — read-only cells introspection intercept. Same shape as
+    // the `sql` arm: mirror the engine-side intercept so
+    // `arest-cli --db <path> cells "<JSON>"` produces the same envelope
+    // the MCP shim sees from the in-process engine call. Read-only;
+    // state is unchanged on this branch.
+    if key == "cells" {
+        let raw = input.to_string();
+        return (crate::cells_introspect::cells_query(d, &raw), d.clone());
+    }
+
     let obj = ast::Object::parse(input);
     let result = ast::apply(&ast::Func::Def(key.to_string()), &obj, d);
 
@@ -700,22 +710,28 @@ pub fn main_entry() {
                         .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, state)))
                         .collect()
                 };
+                // #866 — joint fixpoint over stratum 1 + stratum 2.
+                // The prior pattern ran each stratum to fixpoint
+                // independently. That misses the case where a stratum-2
+                // negation guard's denial enables a new stratum-1
+                // positive rule that should re-fire (e.g. unary
+                // derivation chains: `Task is parallelizable` depends
+                // on `Task is not file-conflicting`, which is
+                // stratum-2 over `Task is file-conflicting`, which is
+                // stratum-1 over status). forward_chain_stratified
+                // iterates the two strata together until no new facts
+                // appear in an outer round.
                 let stratum1 = collect_derivs("derivation:rule_", &d);
-                let d = if stratum1.is_empty() { d } else {
-                    let refs: Vec<(&str, &ast::Func)> = stratum1.iter()
-                        .map(|(n, f)| (n.as_str(), f)).collect();
-                    let (new_d, derived) = crate::evaluate::forward_chain_defs_state(&refs, &d);
-                    eprintln!("[load] stratum 1: {} positive derivation rules fired, {} facts derived",
-                        stratum1.len(), derived.len());
-                    new_d
-                };
                 let stratum2 = collect_derivs("derivation_strat2:rule_", &d);
-                let d = if stratum2.is_empty() { d } else {
-                    let refs: Vec<(&str, &ast::Func)> = stratum2.iter()
+                let d = if stratum1.is_empty() && stratum2.is_empty() { d } else {
+                    let s1_refs: Vec<(&str, &ast::Func)> = stratum1.iter()
                         .map(|(n, f)| (n.as_str(), f)).collect();
-                    let (new_d, derived) = crate::evaluate::forward_chain_defs_state(&refs, &d);
-                    eprintln!("[load] stratum 2: {} negation derivation rules fired, {} facts derived",
-                        stratum2.len(), derived.len());
+                    let s2_refs: Vec<(&str, &ast::Func)> = stratum2.iter()
+                        .map(|(n, f)| (n.as_str(), f)).collect();
+                    let (new_d, derived) = crate::evaluate::forward_chain_stratified(
+                        &s1_refs, &s2_refs, &d, 100);
+                    eprintln!("[load] stratified joint fixpoint: {} stratum-1 + {} stratum-2 rules, {} facts derived",
+                        stratum1.len(), stratum2.len(), derived.len());
                     new_d
                 };
 

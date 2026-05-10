@@ -158,6 +158,22 @@ name = "sherlock_induce"
 path = "tests/sherlock_induce.rs"
 required-features = ["test-bins"]
 
+# Unary-consequent derivation rule end-to-end pin (#866 follow-up).
+# The simplified unit test in compile.rs schema_tests was insufficient
+# — it didn't catch the apps/tasks failure mode where the unary FT
+# also appears in the rule BODY (positively as a join, or negatively
+# as an absence guard). This test mirrors apps/tasks/readings/app.md
+# verbatim through compile_to_defs_state + forward_chain and asserts
+# every per-FT cell (`Task_is_parallelizable`, `Task_is_recommended`,
+# `Task_is_file-conflicting`) materializes with the expected rows.
+# Standalone so the engine-side regression signal stays disjoint from
+# the merged `tests/all.rs` suite. The `local` feature gates the
+# live-DB acceptance test; the inline-fixture tests run without it.
+[[test]]
+name = "unary_derivation_e2e"
+path = "tests/unary_derivation_e2e.rs"
+required-features = ["test-bins", "local"]
+
 [features]
 # `test-bins` (#684/#650a) — opt-in flag that lets each integration
 # `[[test]]` entry compile. Off by default so `cargo test --lib`

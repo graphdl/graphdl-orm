@@ -244,6 +244,58 @@ pub fn forward_chain_defs_state_semi_naive_with_base_keys(
     (current_state, all_derived)
 }
 
+/// Run a 2-stratum forward chain to a JOINT fixpoint: alternate
+/// between stratum 1 (positive `derivation:rule_*`) and stratum 2
+/// (negation-guarded `derivation_strat2:rule_*`) until BOTH passes
+/// produce zero new facts in a row.
+///
+/// Naïve sequential `chain(s1) -> chain(s2)` is incomplete when a
+/// positive (stratum-1) rule reads a cell that a stratum-2 rule
+/// produces — `Task is recommended iff … and Task is parallelizable`
+/// where `parallelizable` is itself stratum-2 because its body has
+/// `Task is not file-conflicting`. Stratum 1 fires `recommended`
+/// against an empty `Task_is_parallelizable` cell, then stratum 2
+/// populates `parallelizable` — and never re-fires `recommended`.
+/// The bug surfaces as the consequent cell staying empty even though
+/// every antecedent is satisfied at the fixpoint.
+///
+/// This helper alternates rounds: positive rules → negation rules →
+/// positive rules … until a round produces zero novel facts. Both
+/// strata are monotonic (each only adds facts), the population is
+/// finite, so the alternation terminates by Knaster-Tarski (the
+/// composed monotone operator on the powerset lattice has a unique
+/// least fixed point and we reach it in ≤ |P_max|−|P| iterations).
+///
+/// `max_outer_rounds` bounds the outer alternation to surface
+/// pathological rule sets (the inner rounds keep the existing 100
+/// cap from [`forward_chain_defs_state`]).
+pub fn forward_chain_stratified(
+    stratum1: &[(&str, &ast::Func)],
+    stratum2: &[(&str, &ast::Func)],
+    d: &ast::Object,
+    max_outer_rounds: usize,
+) -> (ast::Object, Vec<DerivedFact>) {
+    let mut state = d.clone();
+    let mut all_derived: Vec<DerivedFact> = Vec::new();
+    for _ in 0..max_outer_rounds {
+        let before = all_derived.len();
+        if !stratum1.is_empty() {
+            let (s1, d1) = forward_chain_defs_state(stratum1, &state);
+            state = s1;
+            all_derived.extend(d1);
+        }
+        if !stratum2.is_empty() {
+            let (s2, d2) = forward_chain_defs_state(stratum2, &state);
+            state = s2;
+            all_derived.extend(d2);
+        }
+        if all_derived.len() == before {
+            break;
+        }
+    }
+    (state, all_derived)
+}
+
 /// Like [`forward_chain_defs_state`] but capped at `max_rounds` rule
 /// applications. Callers that know their rule set is stratified (no
 /// rule's antecedent reads another rule's consequent cell) can pass
