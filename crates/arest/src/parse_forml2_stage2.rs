@@ -498,6 +498,75 @@ impl RingAdjectiveTable {
     }
 }
 
+/// #875 — `is_universal_quantifier_clause` in `parse_forml2.rs` scans
+/// for an inline `strip_prefix("for each ")` cascade. The single-keyword
+/// vocabulary (today `for each `, with the trailing space included so
+/// the prefix-strip is a whole-word match) is the same dispatch-to-
+/// data smell as `WordComparatorTable` per #783, `RingAdjectiveTable`
+/// per #791, etc. The lift moves the keyword vocabulary to a typed
+/// `UniversalQuantifierTable` reading the `Universal Quantifier Keyword`
+/// grammar enum. Boot-table rows store the keyword with its trailing
+/// space so the strip semantics round-trip without surprise. Future
+/// keywords (e.g., `For each `, `Each `, `every `, `all `) extend the
+/// grammar declaration and are picked up automatically; no Rust change
+/// is required to recognise more universal-quantifier prefixes.
+#[derive(Debug, Clone)]
+pub struct UniversalQuantifierTable {
+    /// The universal-quantifier keyword prefixes. Order matches the
+    /// `'for each ', ...` declaration in `readings/forml2-grammar.md`
+    /// and the legacy `strip_prefix("for each ")` call in
+    /// `is_universal_quantifier_clause` so first-match-wins iteration
+    /// behavior round-trips.
+    pub rows: Vec<String>,
+}
+
+impl UniversalQuantifierTable {
+    /// Boot table — must stay in sync with `Universal Quantifier
+    /// Keyword` enum-value declaration in
+    /// `readings/forml2-grammar.md`. One keyword (`for each `) in the
+    /// same declaration order as the legacy hardcoded prefix strip.
+    pub fn boot() -> Self {
+        UniversalQuantifierTable {
+            rows: alloc::vec![
+                "for each ".to_string(),
+            ],
+        }
+    }
+
+    /// Build the table from the runtime `Universal Quantifier Keyword`
+    /// enum-value declaration. Falls back to `boot()` when the cell is
+    /// empty (bare engine, no metamodel loaded).
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_enum_values(state, "Universal Quantifier Keyword");
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            UniversalQuantifierTable { rows }
+        }
+    }
+
+    /// Iterate the keywords in declaration order. Each keyword carries
+    /// its trailing space; the caller uses `match_prefix` for the
+    /// substring-strip form.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.rows.iter().map(|s| s.as_str())
+    }
+
+    /// Try each keyword in declaration order; on first match return
+    /// the post-keyword tail of `clause`. Mirrors the legacy
+    /// `clause.strip_prefix("for each ")` call exactly: case-sensitive,
+    /// whole-prefix match (the trailing space in the keyword enforces
+    /// the word boundary).
+    pub fn match_prefix<'a>(&self, clause: &'a str) -> Option<&'a str> {
+        for kw in self.rows.iter() {
+            if let Some(rest) = clause.strip_prefix(kw.as_str()) {
+                return Some(rest);
+            }
+        }
+        None
+    }
+}
+
 /// #783 first slice — `is_word_comparator_clause` in `parse_forml2.rs`
 /// scans for an inline 8-entry `COMPARATORS` const (` exceeds `,
 /// ` is greater than `, ` is less than `, ` is at least `,
@@ -4717,7 +4786,8 @@ mod tests {
     /// translate_set_constraints emits or defers — bumping noun=31,
     /// enum=20. #789 added `Prose Stopword` enum (12 values) — bumping
     /// noun=32, enum=21. #791 added `Ring Adjective` enum (8 values)
-    /// — bumping noun=33, enum=22.
+    /// — bumping noun=33, enum=22. #875 added `Universal Quantifier
+    /// Keyword` enum (1 value) — bumping noun=42, enum=31.
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
@@ -4725,7 +4795,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 41, "noun count");
+        assert_eq!(noun_count, 42, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -4737,7 +4807,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 30, "enum-valued noun count");
+        assert_eq!(enum_count, 31, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -6536,6 +6606,63 @@ mod tests {
         let table = super::RingAdjectiveTable::from_grammar_state(&state);
         assert_eq!(table.rows.len(), 8,
             "empty grammar state falls back to the 8-adjective boot table");
+    }
+
+    // ─── #875: universal quantifier table ────────────────────────────
+
+    /// #875 — `is_universal_quantifier_clause` in parse_forml2.rs has a
+    /// hardcoded `strip_prefix("for each ")` cascade (one keyword today,
+    /// historically the smell same as #786/#788/#789/#790/#791 — the
+    /// keyword set lives in code, not in the grammar). This lift moves
+    /// the prefix vocabulary to a typed `UniversalQuantifierTable`
+    /// reading the `Universal Quantifier Keyword` grammar enum. Boot
+    /// table preserves the historic cascade order so the recognizer
+    /// behaves identically before and after the lift.
+    #[test]
+    fn universal_quantifier_table_boot_has_one_keyword_in_declared_order() {
+        let table = super::UniversalQuantifierTable::boot();
+        let words: Vec<&str> = table.iter().collect();
+        assert_eq!(words, vec!["for each "],
+            "boot table must mirror the historic `for each ` strip_prefix \
+             call in is_universal_quantifier_clause, with the trailing \
+             space included so the prefix-strip semantics round-trip.");
+    }
+
+    /// #875 — `match_prefix` returns the post-keyword tail when the
+    /// clause starts with one of the declared keywords; otherwise None.
+    /// Mirrors the historic `clause.strip_prefix("for each ")`
+    /// behavior exactly.
+    #[test]
+    fn universal_quantifier_table_match_prefix_returns_tail_or_none() {
+        let table = super::UniversalQuantifierTable::boot();
+        assert_eq!(table.match_prefix("for each Authority that …"),
+            Some("Authority that …"));
+        assert_eq!(table.match_prefix("if X then Y"), None,
+            "non-quantifier clause must not match");
+        assert_eq!(table.match_prefix("For each Authority"), None,
+            "case-sensitive: capitalised `For` must not match the \
+             lowercase boot keyword");
+        assert_eq!(table.match_prefix(""), None,
+            "empty clause cannot start with any keyword");
+    }
+
+    /// #875 — when state's EnumValues cell carries Universal Quantifier
+    /// Keyword values, from_grammar_state lifts them at runtime.
+    #[test]
+    fn universal_quantifier_table_from_grammar_state_reads_enum_values() {
+        let state = synthetic_enum_state(&[
+            ("Universal Quantifier Keyword", &["foo ", "bar "]),
+        ]);
+        let table = super::UniversalQuantifierTable::from_grammar_state(&state);
+        assert_eq!(table.rows, vec!["foo ", "bar "]);
+    }
+
+    #[test]
+    fn universal_quantifier_table_falls_back_to_boot_on_empty_state() {
+        let state = synthetic_enum_state(&[]);
+        let table = super::UniversalQuantifierTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 1,
+            "empty grammar state falls back to the 1-keyword boot table");
     }
 
     // ─── #790: constraint span prefix table ──────────────────────────

@@ -55,17 +55,26 @@ pub(crate) fn set_strict_mode(_on: bool) {}
 
 
 
-/// True when `clause` starts with `for each <Noun>` and is followed
-/// by at least one more declared noun reference (the predicate over
-/// the universally-quantified variable). Accepts universal-quantifier
-/// antecedents like
+/// True when `clause` starts with a universal-quantifier keyword
+/// (`for each ` per the boot table; future keywords come from the
+/// `Universal Quantifier Keyword` grammar enum) followed by `<Noun>`
+/// and is followed by at least one more declared noun reference (the
+/// predicate over the universally-quantified variable). Accepts
+/// universal-quantifier antecedents like
 ///     for each Authority that applies to that Support Response,
 ///       that Support Response satisfies that Authority
 /// so the overall derivation rule is not flagged as unresolved.
+///
+/// #875 Sweep-1 lift — vocabulary lifts to `UniversalQuantifierTable`
+/// so the keyword set lives in `readings/forml2-grammar.md` as a
+/// `Universal Quantifier Keyword` enum value type. Boot stays in sync
+/// with the grammar; same first-match-wins iteration as the legacy
+/// inline `strip_prefix("for each ")` cascade.
 fn is_universal_quantifier_clause(clause: &str, noun_names: &[String]) -> bool {
     let trimmed = clause.trim();
-    let Some(after) = trimmed.strip_prefix("for each ") else { return false; };
-    // Must mention a declared noun after `for each`.
+    let Some(after) = crate::parse_forml2_stage2::UniversalQuantifierTable::boot()
+        .match_prefix(trimmed) else { return false; };
+    // Must mention a declared noun after the quantifier keyword.
     noun_names.iter().any(|n| after.starts_with(n.as_str()))
         // ...and at least one more noun reference in the tail.
         && noun_names.iter().any(|n| {
