@@ -146,6 +146,18 @@ name = "apply_command_fuzz"
 path = "tests/apply_command_fuzz.rs"
 required-features = ["test-bins"]
 
+# Sherlock app induce acceptance (#853). End-to-end pin: load the
+# Sherlock readings + a tiny test fixture, invoke
+# `Func::Platform("induce")` over `Hypothesis_explains_Fact`, assert
+# the top-ranked Hypothesis Candidate matches the intended explanation.
+# Standalone so the readings-as-source-code surface for induction stays
+# its own CI signal independent of the engine-internal induce::tests
+# fixtures in src/induce.rs.
+[[test]]
+name = "sherlock_induce"
+path = "tests/sherlock_induce.rs"
+required-features = ["test-bins"]
+
 [features]
 # `test-bins` (#684/#650a) — opt-in flag that lets each integration
 # `[[test]]` entry compile. Off by default so `cargo test --lib`
