@@ -567,6 +567,81 @@ impl UniversalQuantifierTable {
     }
 }
 
+/// #876 — `is_extraction_clause` in `parse_forml2.rs` scans for an
+/// inline 2-entry array literal `[" is extracted from ",
+/// " is derived from "]` to recognise ML-style computed bindings of the
+/// shape `<Noun> is extracted from <Noun>` / `<Noun> is derived from
+/// <Noun>`. Each entry was stored already wrapped in spaces so the
+/// `find` substring search matched on word boundaries. The lift moves
+/// the infix-marker vocabulary to a typed `ExtractionClauseTable`
+/// reading the `Extraction Clause Keyword` grammar enum. Boot-table
+/// rows store the keyword with its surrounding spaces so the
+/// `find`-and-slice semantics round-trip without surprise. Future
+/// extraction markers (e.g., ` is inferred from `, ` is classified
+/// from `, ` is summarised from `) extend the grammar declaration and
+/// are picked up automatically; no Rust change is required.
+#[derive(Debug, Clone)]
+pub struct ExtractionClauseTable {
+    /// The extraction-clause infix markers. Order matches the
+    /// `' is extracted from ', ' is derived from '` declaration in
+    /// `readings/forml2-grammar.md` and the legacy 2-entry array
+    /// literal in `is_extraction_clause` so first-match-wins iteration
+    /// behavior round-trips.
+    pub rows: Vec<String>,
+}
+
+impl ExtractionClauseTable {
+    /// Boot table — must stay in sync with `Extraction Clause Keyword`
+    /// enum-value declaration in `readings/forml2-grammar.md`. Two
+    /// markers in the same declaration order as the legacy hardcoded
+    /// array literal in `is_extraction_clause`.
+    pub fn boot() -> Self {
+        ExtractionClauseTable {
+            rows: alloc::vec![
+                " is extracted from ".to_string(),
+                " is derived from ".to_string(),
+            ],
+        }
+    }
+
+    /// Build the table from the runtime `Extraction Clause Keyword`
+    /// enum-value declaration. Falls back to `boot()` when the cell is
+    /// empty (bare engine, no metamodel loaded).
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_enum_values(state, "Extraction Clause Keyword");
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            ExtractionClauseTable { rows }
+        }
+    }
+
+    /// Iterate the keywords in declaration order. Each keyword carries
+    /// its surrounding spaces; the caller uses `split_at_keyword` for
+    /// the find-and-slice form.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.rows.iter().map(|s| s.as_str())
+    }
+
+    /// Try each keyword in declaration order; on first match return
+    /// `(lhs, rhs)` where `lhs` is the trimmed text before the keyword
+    /// and `rhs` is the trimmed text after it. Mirrors the legacy
+    /// `let Some(idx) = trimmed.find(kw); let lhs = trimmed[..idx]
+    /// .trim(); let rhs = trimmed[idx + kw.len()..].trim();` shape in
+    /// `is_extraction_clause` exactly: case-sensitive substring search,
+    /// surrounding spaces in the keyword enforce the word boundary.
+    pub fn split_at_keyword<'a>(&self, clause: &'a str) -> Option<(&'a str, &'a str)> {
+        for kw in self.rows.iter() {
+            if let Some(idx) = clause.find(kw.as_str()) {
+                let lhs = clause[..idx].trim();
+                let rhs = clause[idx + kw.len()..].trim();
+                return Some((lhs, rhs));
+            }
+        }
+        None
+    }
+}
+
 /// #783 first slice — `is_word_comparator_clause` in `parse_forml2.rs`
 /// scans for an inline 8-entry `COMPARATORS` const (` exceeds `,
 /// ` is greater than `, ` is less than `, ` is at least `,
@@ -4787,7 +4862,9 @@ mod tests {
     /// enum=20. #789 added `Prose Stopword` enum (12 values) — bumping
     /// noun=32, enum=21. #791 added `Ring Adjective` enum (8 values)
     /// — bumping noun=33, enum=22. #875 added `Universal Quantifier
-    /// Keyword` enum (1 value) — bumping noun=42, enum=31.
+    /// Keyword` enum (1 value) — bumping noun=42, enum=31. #876 added
+    /// `Extraction Clause Keyword` enum (2 values) — bumping noun=43,
+    /// enum=32.
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
@@ -4795,7 +4872,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 42, "noun count");
+        assert_eq!(noun_count, 43, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -4807,7 +4884,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 31, "enum-valued noun count");
+        assert_eq!(enum_count, 32, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -6663,6 +6740,70 @@ mod tests {
         let table = super::UniversalQuantifierTable::from_grammar_state(&state);
         assert_eq!(table.rows.len(), 1,
             "empty grammar state falls back to the 1-keyword boot table");
+    }
+
+    // ─── #876: extraction clause table ───────────────────────────────
+
+    /// #876 — `is_extraction_clause` in parse_forml2.rs has a hardcoded
+    /// 2-entry array literal `[" is extracted from ", " is derived from "]`
+    /// the same dispatch-to-data smell as #783/#786/#788/#789/#790/#791/#875.
+    /// The keyword set lives in code, not in the grammar. This lift moves
+    /// the infix-marker vocabulary to a typed `ExtractionClauseTable`
+    /// reading the `Extraction Clause Keyword` grammar enum. Boot table
+    /// preserves the historic two-marker order so the recognizer behaves
+    /// identically before and after the lift.
+    #[test]
+    fn extraction_clause_table_boot_has_two_keywords_in_declared_order() {
+        let table = super::ExtractionClauseTable::boot();
+        let words: Vec<&str> = table.iter().collect();
+        assert_eq!(words, vec![" is extracted from ", " is derived from "],
+            "boot table must mirror the historic 2-entry array literal in \
+             is_extraction_clause, with surrounding spaces included so the \
+             interior-substring search semantics round-trip.");
+    }
+
+    /// #876 — `split_at_keyword` returns (lhs, rhs) when the clause
+    /// contains one of the declared keywords as a substring; otherwise
+    /// None. Mirrors the historic `[..idx]` / `[idx + kw.len()..]`
+    /// slicing in `is_extraction_clause` exactly.
+    #[test]
+    fn extraction_clause_table_split_at_keyword_returns_lhs_rhs_or_none() {
+        let table = super::ExtractionClauseTable::boot();
+        assert_eq!(
+            table.split_at_keyword("Topic is extracted from Article"),
+            Some(("Topic", "Article")),
+            "first-match-wins on `is extracted from`");
+        assert_eq!(
+            table.split_at_keyword("Sentiment is derived from Review"),
+            Some(("Sentiment", "Review")),
+            "second cascade entry `is derived from` must also match");
+        assert_eq!(
+            table.split_at_keyword("Foo has Bar"),
+            None,
+            "non-extraction clause must not match");
+        assert_eq!(
+            table.split_at_keyword(""),
+            None,
+            "empty clause cannot contain any keyword");
+    }
+
+    /// #876 — when state's EnumValues cell carries Extraction Clause
+    /// Keyword values, from_grammar_state lifts them at runtime.
+    #[test]
+    fn extraction_clause_table_from_grammar_state_reads_enum_values() {
+        let state = synthetic_enum_state(&[
+            ("Extraction Clause Keyword", &[" foo ", " bar "]),
+        ]);
+        let table = super::ExtractionClauseTable::from_grammar_state(&state);
+        assert_eq!(table.rows, vec![" foo ", " bar "]);
+    }
+
+    #[test]
+    fn extraction_clause_table_falls_back_to_boot_on_empty_state() {
+        let state = synthetic_enum_state(&[]);
+        let table = super::ExtractionClauseTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 2,
+            "empty grammar state falls back to the 2-keyword boot table");
     }
 
     // ─── #790: constraint span prefix table ──────────────────────────

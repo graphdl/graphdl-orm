@@ -84,20 +84,25 @@ fn is_universal_quantifier_clause(clause: &str, noun_names: &[String]) -> bool {
 }
 
 /// True when `clause` has the shape `<Noun> is extracted from <Noun>`
-/// or `<Noun> is derived from <Noun>`. Both operands must be declared.
-/// Used for ML-style computed bindings (free-text extraction,
-/// classifier outputs) where the underlying extractor is registered
-/// at runtime. Classification here suppresses the false-unresolved
-/// noise; the actual extraction function lives in DEFS.
+/// or `<Noun> is derived from <Noun>` (per the boot table; future
+/// markers come from the `Extraction Clause Keyword` grammar enum).
+/// Both operands must be declared. Used for ML-style computed bindings
+/// (free-text extraction, classifier outputs) where the underlying
+/// extractor is registered at runtime. Classification here suppresses
+/// the false-unresolved noise; the actual extraction function lives
+/// in DEFS.
+///
+/// #876 Sweep-1 lift — vocabulary lifts to `ExtractionClauseTable`
+/// so the keyword set lives in `readings/forml2-grammar.md` as an
+/// `Extraction Clause Keyword` enum value type. Boot stays in sync
+/// with the grammar; same first-match-wins iteration as the legacy
+/// inline `[" is extracted from ", " is derived from "]` array.
 fn is_extraction_clause(clause: &str, noun_names: &[String]) -> bool {
     let trimmed = clause.trim().trim_end_matches('.');
-    [" is extracted from ", " is derived from "].iter().any(|kw| {
-        let Some(idx) = trimmed.find(kw) else { return false; };
-        let lhs = trimmed[..idx].trim();
-        let rhs = trimmed[idx + kw.len()..].trim();
-        let is_noun = |s: &str| noun_names.iter().any(|n| n == s);
-        is_noun(lhs) && is_noun(rhs)
-    })
+    let Some((lhs, rhs)) = crate::parse_forml2_stage2::ExtractionClauseTable::boot()
+        .split_at_keyword(trimmed) else { return false; };
+    let is_noun = |s: &str| noun_names.iter().any(|n| n == s);
+    is_noun(lhs) && is_noun(rhs)
 }
 
 /// Strip existential / anaphoric quantifiers from FT references so
