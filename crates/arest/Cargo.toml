@@ -185,21 +185,6 @@ name = "unary_derivation_e2e"
 path = "tests/unary_derivation_e2e.rs"
 required-features = ["test-bins", "local"]
 
-# Cross-antecedent role comparison end-to-end pin (#907). The
-# parser-side companion to the IR field added in a0cfb318 and the
-# compile-side wiring added in e639bd43. Asserts a FORML 2 rule
-# `Task2 is preceded iff Task1 has lower Task ID than Task2 and …`
-# parses to a DerivationRuleDef with a non-empty
-# `antecedent_role_comparisons` vec AND forward-chains a filtered
-# population whose `Task_is_preceded` cell carries only the (Task2
-# whose Task ID exceeds at least one Task1 in the same file)
-# half of the unfiltered join product. Once this lands, the
-# apps/tasks parallelization fix (#906) reduces to a readings edit.
-[[test]]
-name = "cross_antecedent_comparison_e2e"
-path = "tests/cross_antecedent_comparison_e2e.rs"
-required-features = ["test-bins"]
-
 [features]
 # `test-bins` (#684/#650a) — opt-in flag that lets each integration
 # `[[test]]` entry compile. Off by default so `cargo test --lib`

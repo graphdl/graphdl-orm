@@ -60,10 +60,6 @@ Ring Adjective is a value type.
   The possible values of Ring Adjective are 'irreflexive', 'asymmetric', 'antisymmetric', 'symmetric', 'intransitive', 'transitive', 'acyclic', 'reflexive'.
 Word Comparator is a value type.
   The possible values of Word Comparator are 'exceeds', 'is greater than', 'is less than', 'is at least', 'is at most', 'is more than', 'equals', 'is equal to'.
-Cross Antecedent Comparator Keyword is a value type.
-  The possible values of Cross Antecedent Comparator Keyword are 'has equal or lower', 'has equal or higher', 'has lower', 'has higher'.
-Cross Antecedent Comparator Op is a value type.
-  The possible values of Cross Antecedent Comparator Op are '<=', '>=', '<', '>'.
 Range Operator is a value type.
   The possible values of Range Operator are 'within', 'before', 'after'.
 Quote Escape is a value type.
