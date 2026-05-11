@@ -1008,7 +1008,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             DerivationRuleDef {
                 id: get("id"), text: get("text"), antecedent_sources: vec![], consequent_instance_role: String::new(),
                 consequent_cell: crate::types::ConsequentCellSource::decode(&get("consequentFactTypeId")),
-                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
+                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
             }
         }).collect())
         .unwrap_or_default();
@@ -2228,7 +2228,7 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
                 kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![],
                 consequent_bindings: vec![], antecedent_filters: vec![],
                 consequent_computed_bindings: vec![], consequent_aggregates: vec![],
-                unresolved_clauses: vec![], antecedent_role_literals: vec![], consequent_role_literals: vec![],
+                unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
             }
         }).collect()).unwrap_or_default();
     let general_instance_facts: Vec<GeneralInstanceFact> = fetch_or_phi("InstanceFact", state).as_seq()
@@ -2457,7 +2457,7 @@ fn compile_derivations(data: &CellIndex, state_machines: &[CompiledStateMachine]
                 join_on: vec![], match_on: vec![], consequent_bindings: vec![],
                 antecedent_filters: vec![], consequent_computed_bindings: vec![],
                 consequent_aggregates: vec![], unresolved_clauses: vec![],
-                antecedent_role_literals: vec![], consequent_role_literals: vec![],
+                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
             };
             compile_explicit_derivation(data, &rule)
         }));
@@ -2503,7 +2503,7 @@ fn compile_derivations(data: &CellIndex, state_machines: &[CompiledStateMachine]
                     consequent_bindings: vec![src_noun, dst_noun],
                     antecedent_filters: vec![], consequent_computed_bindings: vec![],
                     consequent_aggregates: vec![], unresolved_clauses: vec![],
-                    antecedent_role_literals: vec![], consequent_role_literals: vec![],
+                    antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
                 };
                 Some(compile_join_derivation(data, &rule))
             }))
@@ -2560,7 +2560,7 @@ fn compile_derivations(data: &CellIndex, state_machines: &[CompiledStateMachine]
                 join_on: vec![], match_on: vec![], consequent_bindings: vec![],
                 antecedent_filters: vec![], consequent_computed_bindings: vec![],
                 consequent_aggregates: vec![], unresolved_clauses: vec![],
-                antecedent_role_literals: vec![], consequent_role_literals: vec![],
+                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
             };
             compile_explicit_derivation(data, &rule)
         }));
@@ -4251,7 +4251,7 @@ pub(crate) fn compile_subtype_inheritance_metamodel(
                 join_on: vec![], match_on: vec![], consequent_bindings: vec![],
                 antecedent_filters: vec![], consequent_computed_bindings: vec![],
                 consequent_aggregates: vec![], unresolved_clauses: vec![],
-                antecedent_role_literals: vec![], consequent_role_literals: vec![],
+                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
             };
             compile_explicit_derivation(data, &rule).func
         })

@@ -458,6 +458,12 @@ pub struct DerivationRuleDef {
     /// `'is an entity type'`.
     #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub antecedent_role_literals: Vec<AntecedentRoleLiteral>,
+    /// Cross-antecedent numeric comparisons between two role values (#907).
+    ///   * Task2 is preceded iff Task1 has lower Task ID than Task2 and ...
+    /// At compile time becomes a join + filter over the two antecedents.
+    /// Atoms are numerically coerced (matching `AntecedentFilter`).
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
+    pub antecedent_role_comparisons: Vec<AntecedentRoleComparison>,
     /// Consequent roles bound to fixed string literals. Used by grammar
     /// readings whose consequent specifies a role's value, e.g.
     ///   `Statement has Classification 'Entity Type Declaration'`.
@@ -685,6 +691,16 @@ impl DerivationRuleDef {
             out.push(']');
         }
 
+        // 16. antecedentRoleComparisons (#907 — skip if empty Vec).
+        if !self.antecedent_role_comparisons.is_empty() {
+            out.push_str(",\"antecedentRoleComparisons\":[");
+            for (i, c) in self.antecedent_role_comparisons.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                antecedent_role_comparison_write(&mut out, c);
+            }
+            out.push(']');
+        }
+
         out.push('}');
         out
     }
@@ -772,6 +788,20 @@ fn antecedent_role_literal_write(out: &mut String, l: &AntecedentRoleLiteral) {
     json_escape(out, &l.role);
     out.push_str(",\"value\":");
     json_escape(out, &l.value);
+    out.push('}');
+}
+
+fn antecedent_role_comparison_write(out: &mut String, c: &AntecedentRoleComparison) {
+    out.push_str("{\"lhsAntecedentIndex\":");
+    json_write_usize(out, c.lhs_antecedent_index);
+    out.push_str(",\"lhsRole\":");
+    json_escape(out, &c.lhs_role);
+    out.push_str(",\"op\":");
+    json_escape(out, &c.op);
+    out.push_str(",\"rhsAntecedentIndex\":");
+    json_write_usize(out, c.rhs_antecedent_index);
+    out.push_str(",\"rhsRole\":");
+    json_escape(out, &c.rhs_role);
     out.push('}');
 }
 
@@ -864,6 +894,37 @@ pub struct AntecedentRoleLiteral {
     pub role: String,
     /// Required literal value (string equality).
     pub value: String,
+}
+
+/// Cross-antecedent numeric comparison between two role values.
+/// See `DerivationRuleDef::antecedent_role_comparisons` (#907).
+///
+/// Where `AntecedentFilter` compares a role value to a literal
+/// (`has Population >= 1000000`), this struct compares two role
+/// values from potentially-different antecedents:
+///
+///   * Task2 is preceded iff Task1 has lower Task ID than Task2
+///     and Task1 touches Source File and Task2 touches Source File.
+///
+/// At compile time the rule becomes a join over the two antecedents
+/// filtered by `op(value_lhs(role_lhs), value_rhs(role_rhs))`. Atoms
+/// are coerced to f64 via the same `apply_compare` semantics
+/// `AntecedentFilter` uses — strictly numeric. Lexicographic atom
+/// comparison would need a separate primitive.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
+pub struct AntecedentRoleComparison {
+    /// Index into `antecedent_sources` of the LHS antecedent.
+    pub lhs_antecedent_index: usize,
+    /// Role name on the LHS antecedent's fact type.
+    pub lhs_role: String,
+    /// Comparison op: one of `">="`, `"<="`, `">"`, `"<"`, `"="`, `"!="`.
+    pub op: String,
+    /// Index into `antecedent_sources` of the RHS antecedent.
+    pub rhs_antecedent_index: usize,
+    /// Role name on the RHS antecedent's fact type.
+    pub rhs_role: String,
 }
 
 /// Fixed string literal bound to a consequent role.
@@ -1315,6 +1376,7 @@ mod canonical_json_tests {
                 role: "Trailing Marker".to_string(),
                 value: "is an entity type".to_string(),
             }],
+            antecedent_role_comparisons: alloc::vec![],
             consequent_role_literals: alloc::vec![ConsequentRoleLiteral {
                 role: "Classification".to_string(),
                 value: "Entity Type Declaration".to_string(),
@@ -1338,6 +1400,7 @@ mod canonical_json_tests {
             consequent_aggregates: Vec::new(),
             unresolved_clauses: Vec::new(),
             antecedent_role_literals: Vec::new(),
+            antecedent_role_comparisons: Vec::new(),
             consequent_role_literals: Vec::new(),
         }
     }
@@ -1369,6 +1432,7 @@ mod canonical_json_tests {
                 role: "Trailing Marker".to_string(),
                 value: "is an entity type".to_string(),
             }],
+            antecedent_role_comparisons: alloc::vec![],
             consequent_role_literals: alloc::vec![ConsequentRoleLiteral {
                 role: "Classification".to_string(),
                 value: "Entity Type Declaration".to_string(),
@@ -1401,6 +1465,7 @@ mod canonical_json_tests {
             consequent_aggregates: Vec::new(),
             unresolved_clauses: Vec::new(),
             antecedent_role_literals: Vec::new(),
+            antecedent_role_comparisons: Vec::new(),
             consequent_role_literals: Vec::new(),
         }
     }
@@ -1426,6 +1491,7 @@ mod canonical_json_tests {
             consequent_aggregates: Vec::new(),
             unresolved_clauses: Vec::new(),
             antecedent_role_literals: Vec::new(),
+            antecedent_role_comparisons: Vec::new(),
             consequent_role_literals: Vec::new(),
         }
     }

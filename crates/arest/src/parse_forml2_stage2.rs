@@ -3650,6 +3650,7 @@ fn bootstrap_grammar_state(text: &str) -> Result<Object, String> {
                 consequent_aggregates: Vec::new(),
                 unresolved_clauses: Vec::new(),
                 antecedent_role_literals,
+                antecedent_role_comparisons: Vec::new(),
                 consequent_role_literals,
             };
             // Hand-rolled canonical serializer (#651) — byte-identical to
