@@ -4138,6 +4138,35 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
                 Func::compose(Func::DistR, Func::construction(vec![current, ft_j])))))
     });
 
+    // #907 — cross-antecedent role comparisons. Each entry compares two
+    // role values from potentially-different antecedents in the joined
+    // depth-n product (e.g. `Task1 has lower Task ID than Task2`). The
+    // predicate is wrapped as a final Filter over `current` — runs after
+    // the join keys + match predicates have already culled the product.
+    let role_comp_preds: Vec<Func> = rule.antecedent_role_comparisons.iter().filter_map(|c| {
+        // Both antecedent indices must fall within range; both roles
+        // must resolve on their respective FTs. Drop silently otherwise
+        // (mirrors antecedent_filters' silent-drop behavior).
+        if c.lhs_antecedent_index >= n || c.rhs_antecedent_index >= n {
+            return None;
+        }
+        let lhs_ri = find_role(c.lhs_antecedent_index, &c.lhs_role)?;
+        let rhs_ri = find_role(c.rhs_antecedent_index, &c.rhs_role)?;
+        let lhs_val = Func::compose(role_value(lhs_ri), access_fact(c.lhs_antecedent_index, n));
+        let rhs_val = Func::compose(role_value(rhs_ri), access_fact(c.rhs_antecedent_index, n));
+        Some(Func::compose(
+            comparator_primitive(&c.op),
+            Func::construction(vec![lhs_val, rhs_val]),
+        ))
+    }).collect();
+    let current = if role_comp_preds.is_empty() {
+        current
+    } else {
+        let combined = role_comp_preds.into_iter().reduce(|a, b|
+            Func::compose(Func::And, Func::construction(vec![a, b]))).unwrap();
+        Func::compose(Func::filter(combined), current)
+    };
+
     // Build the consequent fact from the final joined structure (depth n).
     // For each consequent binding noun, find which FT has it and extract the value.
     let binding_nouns: Vec<String> = if consequent_binding_names.is_empty() {
