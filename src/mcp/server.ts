@@ -248,6 +248,35 @@ function parseTransitionTriples(raw: string, noun: string, id: string): Array<Re
   return out
 }
 
+function normalizeTransitionRows(raw: string, noun: string, id: string): Array<Record<string, string>> {
+  const parsed = parseEngineRaw(raw, [])
+  if (Array.isArray(parsed)) {
+    return parsed.flatMap((item: any) => {
+      if (Array.isArray(item)) {
+        const [fromStatus, targetStatus, event] = item.map((v) => String(v))
+        return [{
+          event,
+          targetStatus,
+          fromStatus,
+          method: 'POST',
+          href: `/api/entities/${encodeURIComponent(noun)}/${encodeURIComponent(id)}/transition`,
+        }]
+      }
+      if (item && typeof item === 'object') {
+        return [{
+          event: String(item.event ?? item.Event ?? ''),
+          targetStatus: String(item.targetStatus ?? item.TargetStatus ?? item.to ?? ''),
+          fromStatus: String(item.fromStatus ?? item.FromStatus ?? item.from ?? ''),
+          method: String(item.method ?? 'POST'),
+          href: String(item.href ?? `/api/entities/${encodeURIComponent(noun)}/${encodeURIComponent(id)}/transition`),
+        }]
+      }
+      return []
+    }).filter((t) => t.event || t.targetStatus || t.fromStatus)
+  }
+  return parseTransitionTriples(raw, noun, id)
+}
+
 // ── Command dispatch (dual mode) ────────────────────────────────────
 
 async function dispatchCommand(command: any): Promise<any> {
@@ -456,10 +485,10 @@ const server = new McpServer({
 })
 
 const _registeredTools = new Set<string>()
-const _registerTool = server.registerTool.bind(server)
-server.registerTool = ((name: string, ...rest: any[]) => {
+const _registerTool = server.registerTool.bind(server) as typeof server.registerTool
+server.registerTool = ((name: string, config: any, callback: any) => {
   _registeredTools.add(name)
-  return _registerTool(name, ...rest)
+  return (_registerTool as any)(name, config, callback)
 }) as typeof server.registerTool
 export function listRegisteredTools(): string[] {
   return [..._registeredTools].sort()
@@ -1171,7 +1200,7 @@ server.registerTool(
         status: resolvedStatus || null,
         transitions: Array.isArray(parsedTransitions)
           ? parsedTransitions
-          : parseTransitionTriples(rawTransitions, noun, id),
+          : normalizeTransitionRows(rawTransitions, noun, id),
         entity_data: parseOr(rawEntity, null),
       })
     }
@@ -1714,6 +1743,114 @@ Only include facts clearly stated or strongly implied by the text. Do not invent
 // response carries a `next` hint pointing at lesson num+1. The
 // grammar of expect predicates is documented in tutor/lessons/_format.md.
 
+type TutorCall = (key: string, input: string) => Promise<string>
+
+function factValue(row: any, role: string): string | undefined {
+  if (!row || typeof row !== 'object') return undefined
+  const underscore = role.replace(/\s+/g, '_')
+  const compact = role.replace(/\s+/g, '')
+  const value = row[role] ?? row[underscore] ?? row[compact]
+  return value === undefined || value === null ? undefined : String(value)
+}
+
+async function tutorQueryRows(call: TutorCall, factType: string): Promise<any[]> {
+  const raw = await call(`query:${factType}`, '')
+  const parsed = parseEngineRaw(raw, [])
+  return Array.isArray(parsed) ? parsed : []
+}
+
+export async function readTutorAuthoringWorkflow(
+  call: TutorCall = tutorSystemCall,
+  status?: string,
+) {
+  const [
+    orderRows,
+    situationRows,
+    guidanceRows,
+    toolRows,
+    statusRows,
+  ] = await Promise.all([
+    tutorQueryRows(call, 'Authoring_Step_has_Authoring_Step_Order'),
+    tutorQueryRows(call, 'Authoring_Step_applies_in_Authoring_Situation'),
+    tutorQueryRows(call, 'Authoring_Step_has_Authoring_Guidance'),
+    tutorQueryRows(call, 'Authoring_Step_recommends_Authoring_Tool'),
+    tutorQueryRows(call, 'Authoring_Step_uses_Status'),
+  ])
+
+  const steps = new Map<string, {
+    step: string
+    order?: number
+    status?: string
+    situation?: string
+    guidance?: string
+    tools: string[]
+  }>()
+  const ensureStep = (step: string) => {
+    const existing = steps.get(step)
+    if (existing) return existing
+    const created: {
+      step: string
+      order?: number
+      status?: string
+      situation?: string
+      guidance?: string
+      tools: string[]
+    } = { step, tools: [] }
+    steps.set(step, created)
+    return created
+  }
+
+  for (const row of orderRows) {
+    const step = factValue(row, 'Authoring Step')
+    if (!step) continue
+    const record = ensureStep(step)
+    const order = Number(factValue(row, 'Authoring Step Order'))
+    if (Number.isFinite(order)) record.order = order
+  }
+  for (const row of situationRows) {
+    const step = factValue(row, 'Authoring Step')
+    const situation = factValue(row, 'Authoring Situation')
+    if (step && situation) ensureStep(step).situation = situation
+  }
+  for (const row of guidanceRows) {
+    const step = factValue(row, 'Authoring Step')
+    const guidance = factValue(row, 'Authoring Guidance')
+    if (step && guidance) ensureStep(step).guidance = guidance
+  }
+  for (const row of toolRows) {
+    const step = factValue(row, 'Authoring Step')
+    const tool = factValue(row, 'Authoring Tool')
+    if (!step || !tool) continue
+    const tools = ensureStep(step).tools
+    if (!tools.includes(tool)) tools.push(tool)
+  }
+  for (const row of statusRows) {
+    const step = factValue(row, 'Authoring Step')
+    const stepStatus = factValue(row, 'Status')
+    if (step && stepStatus) ensureStep(step).status = stepStatus
+  }
+
+  const sortedSteps = [...steps.values()]
+    .sort((a, b) => (a.order ?? Number.MAX_SAFE_INTEGER) - (b.order ?? Number.MAX_SAFE_INTEGER))
+    .map((step) => ({ ...step, tools: step.tools.sort() }))
+  const currentStatus = status ?? sortedSteps[0]?.status ?? ''
+  const rawActions = currentStatus
+    ? await call('transitions:Authoring Session', currentStatus)
+    : '[]'
+
+  return {
+    source: {
+      kind: 'readings',
+      path: 'tutor/domains/authoring.md',
+    },
+    noun: 'Authoring Session',
+    current_status: currentStatus || null,
+    current_step: sortedSteps.find((step) => step.status === currentStatus) ?? null,
+    steps: sortedSteps,
+    actions: normalizeTransitionRows(rawActions, 'Authoring Session', currentStatus),
+  }
+}
+
 const TUTOR_TRACKS = ['easy', 'medium', 'hard'] as const
 type TutorTrack = typeof TUTOR_TRACKS[number]
 
@@ -1957,14 +2094,30 @@ server.registerTool(
 )
 
 server.registerTool(
+  'tutor.authoring',
+  {
+    description: 'Project the CSDP schema-authorship workflow from tutor/domains/authoring.md. Returns readings-backed steps and current HATEOAS actions for an Authoring Session status.',
+    inputSchema: {
+      status: z.string().optional().describe('Current Authoring Session status. Defaults to the initial CSDP authoring status from the readings.'),
+    },
+  },
+  async ({ status }) => textResult(await readTutorAuthoringWorkflow(tutorSystemCall, status)),
+)
+
+server.registerTool(
   'tutor.actions',
   {
-    description: 'List the legal SM transitions for a noun in the tutor sandbox.',
-    inputSchema: { noun: z.string(), id: z.string().optional() },
+    description: 'List legal SM transitions for a noun in the tutor sandbox. Pass status for pure workflow projection, or id for legacy entity-oriented calls.',
+    inputSchema: {
+      noun: z.string(),
+      id: z.string().optional(),
+      status: z.string().optional(),
+    },
   },
-  async ({ noun, id }) => {
-    const raw = await tutorSystemCall(`transitions:${noun}`, id ?? '')
-    return textResult({ raw, parsed: parseTransitionTriples(raw, noun, id ?? '') })
+  async ({ noun, id, status }) => {
+    const current = status ?? id ?? ''
+    const raw = await tutorSystemCall(`transitions:${noun}`, current)
+    return textResult({ raw, parsed: normalizeTransitionRows(raw, noun, id ?? current) })
   },
 )
 

@@ -16,7 +16,7 @@ import { compileDomainReadings, system } from '../api/engine.js'
 import { existsSync, mkdtempSync, writeFileSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { resolve, join } from 'path'
-import { evalExpectPredicate, listRegisteredTools } from './server.js'
+import { evalExpectPredicate, listRegisteredTools, readTutorAuthoringWorkflow } from './server.js'
 
 const TIMEOUT = 60_000
 
@@ -167,14 +167,33 @@ describe('tutor.reset', () => {
 })
 
 describe('tutor.* mirror tools', () => {
-  it('registers all eight tutor.* tools', () => {
+  it('registers tutor.* tools', () => {
     const names = listRegisteredTools()
     expect(names).toEqual(expect.arrayContaining([
       'tutor', 'tutor.reset',
       'tutor.propose', 'tutor.apply', 'tutor.compile',
       'tutor.query', 'tutor.list', 'tutor.get', 'tutor.actions',
+      'tutor.authoring',
     ]))
   })
+
+  it('projects CSDP authoring workflow from tutor readings', async () => {
+    await resetSandbox()
+
+    const orderRows = parseEngineRaw(
+      await tutorSystemCall('query:Authoring_Step_has_Authoring_Step_Order', ''),
+      [],
+    ) as any[]
+    expect(Array.isArray(orderRows)).toBe(true)
+    expect(orderRows.some((row) => row['Authoring Step'] === 'inspect-existing-model')).toBe(true)
+
+    const workflow = await readTutorAuthoringWorkflow(tutorSystemCall, 'Inspect Existing Model')
+    expect(workflow.source.path).toBe('tutor/domains/authoring.md')
+    expect(workflow.steps.map((step) => step.step)).toContain('inspect-existing-model')
+    expect(workflow.steps.every((step) => typeof step.guidance === 'string' && step.guidance.length > 0)).toBe(true)
+    expect(workflow.current_step?.step).toBe('inspect-existing-model')
+    expect(workflow.actions.some((action) => action.event === 'elicit-example-facts')).toBe(true)
+  }, 180_000)
 
   it('a tutor.apply create call returns a non-error JSON response', async () => {
     await resetSandbox()

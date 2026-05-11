@@ -37,6 +37,7 @@ describe('MCP mutation context gate', () => {
     expect(JSON.stringify(context)).not.toContain('app-design')
     expect(JSON.stringify(context)).not.toContain('operation_protocol')
     expect(JSON.stringify(context)).not.toContain('universe_of_discourse')
+    expect(JSON.stringify(context)).not.toContain('authoring_actions')
   })
 
   it('binds receipts to app scope when scope is supplied', () => {
@@ -110,5 +111,21 @@ describe('MCP mutation context gate', () => {
       noun: 'Codex Memory',
       fields: { 'User Text': 'remember this paragraph' },
     })).toContain('fields contain catch-all prose-memory names: User Text')
+  })
+
+  it('keeps modeling violations tied to the prompt bundle, not a separate action model', () => {
+    const context = testContext()
+
+    const result = enforceMutationContext({
+      tool: 'compile',
+      receivedReceipt: context.receipt,
+      context,
+      payload: { readings: 'Fact Note(.Note Id) is an entity type.' },
+    })
+
+    expect(result.ok).toBe(false)
+    expect(result.ok ? '' : result.error.error).toBe('modeling_context_violation')
+    expect(JSON.stringify(result)).not.toContain('authoring_actions')
+    expect(result.ok ? '' : result.error.next_step).toContain('Inspect schema/tutor/context')
   })
 })

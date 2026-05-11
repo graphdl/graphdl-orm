@@ -75,7 +75,7 @@ export const MUTATION_CONTEXT_ANTI_PATTERNS: readonly string[] = [
 ]
 
 export const MUTATION_CONTEXT_HOW_TO: readonly string[] = [
-  'Call schema, tutor, or query to inspect the existing model.',
+  'Call schema, tutor, tutor.authoring, actions, or query to inspect the existing model and readings-backed workflow.',
   'Call context and read the returned rules and prompt manifest.',
   'For population changes, call apply with operation=create/update/transition and the context_receipt.',
   'For schema changes, write FORML2 readings and call compile or propose with the context_receipt.',
