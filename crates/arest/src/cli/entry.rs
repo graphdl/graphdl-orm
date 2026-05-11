@@ -173,6 +173,15 @@ fn system(key: &str, input: &str, d: &ast::Object) -> (String, ast::Object) {
         return (crate::cells_introspect::cells_query(d, &raw), d.clone());
     }
 
+    // #871 — read-only session re-orientation intercept. Same shape:
+    // `arest-cli --db <path> orient "<JSON>"` produces the same
+    // envelope the MCP shim sees from the in-process engine call.
+    // Read-only; state is unchanged on this branch.
+    if key == "orient" {
+        let raw = input.to_string();
+        return (crate::orient::orient(d, &raw), d.clone());
+    }
+
     let obj = ast::Object::parse(input);
     let result = ast::apply(&ast::Func::Def(key.to_string()), &obj, d);
 

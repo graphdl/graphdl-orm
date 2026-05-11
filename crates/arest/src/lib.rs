@@ -148,6 +148,8 @@ pub mod cells_introspect;
 // new file with a different purpose — search primitives only,
 // consumed by the platform `induce` Func registered in #846.
 pub mod induce;
+#[cfg(feature = "std-deps")]
+pub mod orient;
 // rmap.rs is no_std-clean as of #653: hashbrown for HashMap/HashSet,
 // alloc for String/Vec, serde derives + the two `serde_json` Func-tree
 // entry points (`rmap_func` / `decode_rmap_result`) cfg-gated on
@@ -1074,6 +1076,7 @@ pub const CORE_READINGS: &[(&str, &str)] = &[
     ("outcomes",      include_str!("../../../readings/core/outcomes.md")),
     ("validation",    include_str!("../../../readings/core/validation.md")),
     ("induction",     include_str!("../../../readings/core/induction.md")),
+    ("naming",        include_str!("../../../readings/core/naming.md")),
 ];
 
 /// Self-modification machinery — Domain Change SM, Signal entities, and

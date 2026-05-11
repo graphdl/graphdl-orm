@@ -8,7 +8,7 @@
 import { describe, it, expect } from 'vitest'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
-import { parseQueryResponse, parseSqlResponse, parseCellsResponse, parseInduceResponse } from './server.js'
+import { parseQueryResponse, parseSqlResponse, parseCellsResponse, parseInduceResponse, parseOrientResponse } from './server.js'
 
 describe('AREST MCP Server', () => {
   it('registers expected tool names', () => {
@@ -278,5 +278,68 @@ describe('#854 induce verb envelope parsing', () => {
     // bottom candidate's score — the parser preserves order.
     expect(Number(parsed[0].confidenceScore))
       .toBeGreaterThan(Number(parsed[1].confidenceScore))
+  })
+})
+
+describe('#871 orient verb envelope parsing', () => {
+  it('passes through a successful orient envelope', () => {
+    // Standard four-key envelope the engine emits when handed
+    // `{"active_app":"tasks"}` against a populated snapshot.
+    const raw = JSON.stringify({
+      apps: [
+        {
+          name: 'tasks',
+          root: '/path/to/apps/tasks',
+          last_compile: null,
+          ready_count: 33,
+          in_progress_count: 7,
+          completed_count: 612,
+        },
+      ],
+      active_app: 'tasks',
+      recent_changes: [
+        { kind: 'apply', noun: 'Task_has_Task_Status', count: 652 },
+      ],
+      suggested_next: "Try: mcp__arest__query Task_is_recommended in app 'tasks' for the launch-candidate set.",
+    })
+    const parsed = parseOrientResponse(raw) as {
+      apps: Array<{ name: string; ready_count: number }>
+      active_app: string
+      recent_changes: Array<{ noun: string }>
+      suggested_next: string
+    }
+    expect(parsed.active_app).toBe('tasks')
+    expect(parsed.apps).toHaveLength(1)
+    expect(parsed.apps[0].ready_count).toBe(33)
+    expect(parsed.recent_changes[0].noun).toBe('Task_has_Task_Status')
+    expect(parsed.suggested_next).toContain('recommended')
+  })
+
+  it('passes through an engine-emitted error envelope', () => {
+    // Malformed input from the caller — the engine returns a
+    // structured `{error}` envelope which the parser should preserve.
+    const raw = JSON.stringify({ error: 'input must be JSON: expected value at line 1 column 1' })
+    expect(parseOrientResponse(raw)).toEqual({
+      error: 'input must be JSON: expected value at line 1 column 1',
+    })
+  })
+
+  it('translates engine ⊥ into a structured error envelope', () => {
+    // ⊥ here means the system handle didn't dispatch — most often
+    // because the build lacks the std-deps feature, or the handle
+    // wasn't allocated for this session. Surface that to the caller
+    // as a structured error rather than a malformed-JSON crash.
+    const result = parseOrientResponse('⊥') as { error: string }
+    expect(result.error).toMatch(/⊥|std-deps|handle/)
+  })
+
+  it('wraps malformed engine output in a structured error envelope', () => {
+    // Any non-JSON, non-⊥ output is preserved under `raw` so the
+    // caller can inspect what the engine actually said. Used as a
+    // diagnostic when the engine's envelope format drifts from the
+    // parser's expectations.
+    const result = parseOrientResponse('not json at all') as { error: string; raw: string }
+    expect(result.error).toMatch(/malformed/)
+    expect(result.raw).toBe('not json at all')
   })
 })

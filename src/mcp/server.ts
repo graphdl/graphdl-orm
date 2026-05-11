@@ -1105,6 +1105,68 @@ server.registerTool(
   },
 )
 
+// ── 2e. orient: one-screen session re-orientation (#871) ─────────────
+//
+// Per #869 (MCP UX north-star: agents get value without reading the
+// whitepaper), every fresh session today re-discovers the landscape
+// via 5-6 separate calls — `apps_list`, `apps_current`, `query` for
+// task counts, `cells trace` for the latest derivation activity. One
+// envelope returning that entire picture makes re-entry instant.
+//
+// Returns:
+//
+//   {
+//     "apps":           [{name, root, last_compile, ready_count,
+//                         in_progress_count, completed_count}, ...],
+//     "active_app":     "tasks" | null,
+//     "recent_changes": [{kind, noun, count}, ...],
+//     "suggested_next": "Try: ..."
+//   }
+//
+// Counts come from the active app's loaded snapshot (the engine has
+// one DB at a time). Sibling apps in `apps_dir` surface as bare
+// entries with `last_compile` from the .db file mtime — the engine
+// doesn't open every sibling DB to count its rows. Agents that need
+// per-app counts call `apps_use` then `orient` again.
+//
+// Returns `{error}` envelope on malformed input — never throws so the
+// verb stays usable as the agent's recovery path when other things
+// have already gone wrong in the session.
+export function parseOrientResponse(raw: string): unknown {
+  if (raw === '⊥') return { error: 'engine returned ⊥ (handle missing or std-deps feature unavailable)' }
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed ?? { error: 'engine returned null envelope' }
+  } catch {
+    return { error: 'malformed orient envelope', raw }
+  }
+}
+
+server.registerTool(
+  'orient',
+  {
+    description: 'Read-only session re-orientation envelope (#871). Returns one screen of "where are we": the apps inventory (active app first with ready/in_progress/completed task counts; sibling apps with last_compile timestamps), the currently active app name, a list of recent cell-graph activity (instance fact cells with their row counts), and a one-line suggested-next pointer. Use as the FIRST call in a new session to skip the usual 5-6 probing verbs (apps_list + apps_current + query Task_has_Task_Status + cells trace ...). Optional inputs: `apps_dir` to enumerate sibling apps from disk; `active_app` so the suggestion template names the current app. No state mutation.',
+    inputSchema: {
+      apps_dir: z.string().optional().describe('Optional absolute path to the apps directory. When set, sibling apps are enumerated from filesystem (each must carry a `readings/` directory and a `*.db` file). When omitted, only the active app is reported.'),
+      active_app: z.string().optional().describe('Optional active app name. The verb uses this to name the active entry in the apps list and to render the suggested_next template. When omitted, suggested_next falls back to a "pick an app" pointer.'),
+    },
+  },
+  async ({ apps_dir, active_app }) => {
+    const envelope: Record<string, string> = {}
+    if (apps_dir !== undefined) envelope.apps_dir = apps_dir
+    if (active_app !== undefined) envelope.active_app = active_app
+    if (AREST_MODE === 'local') {
+      const raw = await systemCall('orient', JSON.stringify(envelope))
+      return textResult(parseOrientResponse(raw))
+    }
+    const data = await httpRequest('/arest/default/orient', {
+      method: 'POST',
+      body: JSON.stringify(envelope),
+    })
+    return textResult(data)
+  },
+)
+
 // ── 3. apply: create, update, or transition an entity ────────────────
 
 server.registerTool(
