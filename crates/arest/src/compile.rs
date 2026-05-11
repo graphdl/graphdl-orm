@@ -1783,6 +1783,14 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         (format!("query:{}", id), Func::Platform(format!("query_ft:{}", id)))
     }));
 
+    // Retraction defs — exact tuple removal from a FactType cell.
+    // Semiderived (+) cells are still just cells once materialized; if
+    // their supporting facts remain, the next forward-chain compile may
+    // re-materialize the tuple.
+    defs.extend(model.schemas.keys().map(|id| {
+        (format!("retract:{}", id), Func::Platform(format!("retract:{}", id)))
+    }));
+
     // Helpers as fns (not closures) to avoid borrow conflicts
     fn binary_fts_for<'a>(fact_types: &'a HashMap<String, FactTypeDef>, noun: &str) -> Vec<&'a FactTypeDef> {
         fact_types.values()
@@ -3524,9 +3532,22 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     // disambiguating subscript on this position,
                     // require equality. Skips when rk has a
                     // subscript (handled above).
+                    //
+                    // #907 — roles appearing as the LHS / RHS role of
+                    // an `antecedent_role_comparison` are EXCLUDED
+                    // from auto-join: the user is asking for the two
+                    // role values to be compared (lower / higher /
+                    // equal or lower / equal or higher), not unified.
+                    // The post-join Filter built below applies the
+                    // comparison predicate instead.
+                    let role_is_compared = |role_name: &str| -> bool {
+                        rule.antecedent_role_comparisons.iter()
+                            .any(|c| c.lhs_role == role_name || c.rhs_role == role_name)
+                    };
                     for rk in 0..ft_k_role_count {
                         if !sub_of(k, rk).is_empty() { continue }
                         let noun_k = &ft_k.roles[rk].noun_name;
+                        if role_is_compared(noun_k) { continue }
                         let mut found_prior: Option<(usize, usize)> = None;
                         'outer2: for prior in 0..k {
                             let Some(ft_prior) = data.fact_types.get(&antecedent_ids[prior])
@@ -3548,22 +3569,27 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                                 Func::construction(vec![lhs, rhs])));
                         }
                     }
-                    let combined: Func = if eqs.is_empty() {
+                    let pair_stream_per_acc: Func = if eqs.is_empty() {
                         // No join key — Cartesian product. Cheap
                         // existence check upstream filters mostly
                         // to small candidate sets, so this stays
                         // bounded for typical fixtures.
-                        Func::constant(Object::atom("true"))
+                        // Skip the Filter wrap entirely; the legacy
+                        // `Func::constant(Object::atom("true"))`
+                        // never produced `Object::t()` so Filter
+                        // would have dropped every tuple. The
+                        // explicit Cartesian product is just `DistL`.
+                        Func::DistL
                     } else {
-                        eqs.into_iter()
+                        let combined = eqs.into_iter()
                             .reduce(|a, b| Func::compose(Func::And,
                                 Func::construction(vec![a, b])))
-                            .unwrap()
+                            .unwrap();
+                        Func::compose(
+                            Func::filter(combined),
+                            Func::DistL,
+                        )
                     };
-                    let pair_stream_per_acc = Func::compose(
-                        Func::filter(combined),
-                        Func::DistL,
-                    );
                     tuple_stream = Func::compose(
                         Func::Concat,
                         Func::compose(
@@ -3580,6 +3606,51 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     .map(|ft| ft.roles.clone())
                     .unwrap_or_default();
                 let last_k = antecedent_ids.len() - 1;
+
+                // #907 — apply cross-antecedent role comparison filters
+                // over the final tuple stream. Each entry produces one
+                // post-join predicate combining `role_value(ri) .
+                // pick_in_tuple(last_k, ai) . Selector(1)` for both
+                // sides through `comparator_primitive(op)`. The
+                // resulting Filter wraps `tuple_stream` so only tuples
+                // satisfying every comparison survive to the
+                // consequent-derivation step. Invalid antecedent
+                // indices or unknown roles silently drop the comparison
+                // (mirrors antecedent_filters' silent-drop semantics).
+                let comp_role_idx_in_ft = |ant_idx: usize, role: &str| -> Option<usize> {
+                    data.fact_types.get(antecedent_ids.get(ant_idx)?)
+                        .and_then(|ft| ft.roles.iter()
+                            .find(|r| r.noun_name == role)
+                            .map(|r| r.role_index))
+                };
+                let n_ant = antecedent_ids.len();
+                let comp_preds: Vec<Func> = rule.antecedent_role_comparisons.iter()
+                    .filter_map(|c| {
+                        if c.lhs_antecedent_index >= n_ant
+                            || c.rhs_antecedent_index >= n_ant
+                        {
+                            return None;
+                        }
+                        let lhs_ri = comp_role_idx_in_ft(c.lhs_antecedent_index, &c.lhs_role)?;
+                        let rhs_ri = comp_role_idx_in_ft(c.rhs_antecedent_index, &c.rhs_role)?;
+                        let lhs_val = Func::compose(role_value(lhs_ri),
+                            pick_in_tuple(last_k, c.lhs_antecedent_index));
+                        let rhs_val = Func::compose(role_value(rhs_ri),
+                            pick_in_tuple(last_k, c.rhs_antecedent_index));
+                        Some(Func::compose(
+                            comparator_primitive(&c.op),
+                            Func::construction(vec![lhs_val, rhs_val]),
+                        ))
+                    })
+                    .collect();
+                let tuple_stream = if comp_preds.is_empty() {
+                    tuple_stream
+                } else {
+                    let combined = comp_preds.into_iter()
+                        .reduce(|a, b| Func::compose(Func::And,
+                            Func::construction(vec![a, b]))).unwrap();
+                    Func::compose(Func::filter(combined), tuple_stream)
+                };
                 let pairs: Vec<Func> = cons_roles.iter().enumerate()
                     .map(|(cons_role_idx, r)| {
                         let key = r.noun_name.clone();
@@ -6991,6 +7062,23 @@ mod schema_tests {
                 _ => panic!("both sides must be Construction Funcs for {}", name),
             }
         }
+    }
+
+    #[test]
+    fn compile_emits_retract_defs_for_fact_types() {
+        let state = make_state_with_fact_type(
+            "Ticket_has_Ticket_Status",
+            "Ticket has Ticket Status",
+            vec![("Ticket", 0), ("Ticket Status", 1)],
+        );
+        let defs = compile_to_defs_state(&state);
+        let retract = defs.iter()
+            .find(|(name, _)| name == "retract:Ticket_has_Ticket_Status")
+            .map(|(_, func)| func);
+        assert!(matches!(
+            retract,
+            Some(crate::ast::Func::Platform(name)) if name == "retract:Ticket_has_Ticket_Status"
+        ));
     }
 
     /// Sanity: every family predicate is disjoint except for the

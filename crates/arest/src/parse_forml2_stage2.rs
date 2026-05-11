@@ -700,6 +700,126 @@ impl WordComparatorTable {
     }
 }
 
+/// #907 — cross-antecedent role comparison vocabulary.
+/// `resolve_derivation_rule` in `parse_forml2.rs` recognises clauses of
+/// the form `<Noun1> <keyword> <Role-as-Noun> than <Noun2>` where each
+/// `<keyword>` maps to a numeric comparison operator. The lift moves
+/// the keyword vocabulary to a typed `CrossAntecedentComparatorTable`
+/// reading parallel `Cross Antecedent Comparator Keyword` /
+/// `Cross Antecedent Comparator Op` enum-value declarations from
+/// `readings/forml2-grammar.md`. Same parallel-pair shape as
+/// `ObjectTypeKindTable` per #780 — bare keyword phrases in `rows`,
+/// boot mirrors the legacy hardcoded vocabulary so first-match-wins
+/// iteration round-trips. Longer keywords ("has equal or lower") MUST
+/// precede shorter prefixes ("has lower") in boot so `match_clause`
+/// recognises the full phrase rather than the truncated head.
+#[derive(Debug, Clone)]
+pub struct CrossAntecedentComparatorTable {
+    /// Pairs of `(keyword, op)` such as `("has lower", "<")`. Order
+    /// matches the readings' parallel-enum declaration order. Order
+    /// matters — longer keywords first so `match_clause`'s first-
+    /// match-wins iteration doesn't truncate a four-word phrase to
+    /// its two-word prefix.
+    pub rows: Vec<(String, String)>,
+}
+
+impl CrossAntecedentComparatorTable {
+    /// Boot table — must stay in sync with the parallel
+    /// `Cross Antecedent Comparator Keyword` /
+    /// `Cross Antecedent Comparator Op` enum-value declarations in
+    /// `readings/forml2-grammar.md`. Four keywords in cascade order
+    /// (longer phrases first so prefix-matching doesn't truncate).
+    pub fn boot() -> Self {
+        CrossAntecedentComparatorTable {
+            rows: alloc::vec![
+                ("has equal or lower".to_string(),  "<=".to_string()),
+                ("has equal or higher".to_string(), ">=".to_string()),
+                ("has lower".to_string(),           "<".to_string()),
+                ("has higher".to_string(),          ">".to_string()),
+            ],
+        }
+    }
+
+    /// Build the table from parallel `Cross Antecedent Comparator
+    /// Keyword` / `Cross Antecedent Comparator Op` enum-value
+    /// declarations. Falls back to `boot()` on any mismatch.
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_parallel_enum_pair(
+            state,
+            "Cross Antecedent Comparator Keyword",
+            "Cross Antecedent Comparator Op",
+        );
+        match rows {
+            Some(r) => CrossAntecedentComparatorTable { rows: r },
+            None => Self::boot(),
+        }
+    }
+
+    /// Iterate `(keyword, op)` pairs in declaration order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.rows.iter().map(|(k, o)| (k.as_str(), o.as_str()))
+    }
+
+    /// Match a clause against the pattern
+    ///   `<Noun1> <keyword> <Role-as-Noun> than <Noun2>`
+    /// where Noun1, Role, Noun2 are all in `noun_names`. Returns
+    /// `Some((lhs_noun, lhs_role, op, rhs_noun, rhs_role))` on first-
+    /// keyword match, `None` otherwise.
+    ///
+    /// The Role-as-Noun is the value-type role being compared (e.g.
+    /// "Task ID"). The same role name is used on both sides — the
+    /// LHS antecedent's FT carries it as the comparison value and
+    /// the RHS antecedent's FT must also carry it. The five-tuple
+    /// shape mirrors `AntecedentRoleComparison`'s field layout so
+    /// the caller can resolve `(lhs_noun, rhs_noun)` to antecedent
+    /// indices and emit the IR entry directly.
+    ///
+    /// Subscript-aware (`Task1`, `Task2`): we strip trailing ASCII
+    /// digits from the captured noun tokens before comparing against
+    /// `noun_names`, so a rule body with `Task1 has lower Task ID
+    /// than Task2` matches when only `Task` is declared.
+    pub fn match_clause<'a>(
+        &self,
+        clause: &'a str,
+        noun_names: &[String],
+    ) -> Option<(&'a str, String, &str, &'a str, String)> {
+        let trimmed = clause.trim();
+        for (keyword, op) in self.rows.iter() {
+            // Build the substring `" <keyword> "` so word boundaries
+            // are respected at both ends (same convention as
+            // `is_word_comparator_clause`).
+            let needle = alloc::format!(" {} ", keyword);
+            let Some(idx) = trimmed.find(needle.as_str()) else { continue; };
+            let lhs = trimmed[..idx].trim();
+            let after = trimmed[idx + needle.len()..].trim();
+            // Need a ` than ` delimiter splitting (role-as-noun, rhs-noun).
+            let Some(than_idx) = after.find(" than ") else { continue; };
+            let role_text = after[..than_idx].trim();
+            let rhs = after[than_idx + " than ".len()..].trim();
+            // Strip trailing-digit subscripts before checking noun_names.
+            let strip = |t: &str| -> String {
+                let bytes = t.as_bytes();
+                if bytes.first().map_or(false, |b| b.is_ascii_uppercase()) {
+                    let boundary = t.char_indices().rev()
+                        .take_while(|(_, c)| c.is_ascii_digit())
+                        .last().map(|(i, _)| i).unwrap_or(t.len());
+                    t[..boundary].to_string()
+                } else {
+                    t.to_string()
+                }
+            };
+            let lhs_base = strip(lhs);
+            let rhs_base = strip(rhs);
+            let role_base = strip(role_text);
+            let is_declared = |n: &str| noun_names.iter().any(|d| d == n);
+            if is_declared(&lhs_base) && is_declared(&rhs_base) && is_declared(&role_base) {
+                return Some((lhs, lhs_base, op.as_str(), rhs, rhs_base));
+            }
+        }
+        None
+    }
+}
+
 /// #783 second slice — `is_range_filter_clause` in `parse_forml2.rs`
 /// scans for an inline 3-entry `RANGE_OPS` const (` within `,
 /// ` before `, ` after `). Each entry was stored already wrapped in
@@ -4865,7 +4985,9 @@ mod tests {
     /// — bumping noun=33, enum=22. #875 added `Universal Quantifier
     /// Keyword` enum (1 value) — bumping noun=42, enum=31. #876 added
     /// `Extraction Clause Keyword` enum (2 values) — bumping noun=43,
-    /// enum=32.
+    /// enum=32. #907 added parallel `Cross Antecedent Comparator
+    /// Keyword` / `Cross Antecedent Comparator Op` (4 values each)
+    /// — bumping noun=45, enum=34.
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
@@ -4873,7 +4995,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 43, "noun count");
+        assert_eq!(noun_count, 45, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -4885,7 +5007,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 32, "enum-valued noun count");
+        assert_eq!(enum_count, 34, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -6910,6 +7032,86 @@ mod tests {
         let table = super::WordComparatorTable::from_grammar_state(&state);
         assert_eq!(table.rows.len(), 8,
             "empty grammar state falls back to the 8-comparator boot table");
+    }
+
+    // ─── #907: cross-antecedent comparator table ─────────────────────
+
+    /// #907 — `resolve_derivation_rule` in parse_forml2.rs recognises a
+    /// new clause shape `<Noun1> <keyword> <Role-as-Noun> than <Noun2>`
+    /// where `<keyword>` is one of `has lower`, `has higher`, `has equal
+    /// or lower`, `has equal or higher`. The vocabulary lives in
+    /// `readings/forml2-grammar.md` as parallel `Cross Antecedent
+    /// Comparator Keyword` / `Cross Antecedent Comparator Op` enum-value
+    /// types. Boot order is longest-first so `match_clause`'s first-
+    /// match-wins iteration picks `has equal or lower` before its
+    /// `has lower` prefix on input like `Task1 has equal or lower
+    /// Priority than Task2`.
+    #[test]
+    fn cross_antecedent_comparator_table_boot_has_four_keywords_longest_first() {
+        let table = super::CrossAntecedentComparatorTable::boot();
+        let rows: Vec<(&str, &str)> = table.iter().collect();
+        assert_eq!(rows, vec![
+            ("has equal or lower",  "<="),
+            ("has equal or higher", ">="),
+            ("has lower",           "<"),
+            ("has higher",          ">"),
+        ],
+        "boot table must list keywords longest-first so prefix matches \
+         don't shadow longer phrases; ops mirror their lexical comparator");
+    }
+
+    #[test]
+    fn cross_antecedent_comparator_table_match_clause_returns_five_tuple() {
+        let table = super::CrossAntecedentComparatorTable::boot();
+        let nouns = vec!["Task".to_string(), "Task ID".to_string()];
+        let m = table.match_clause("Task1 has lower Task ID than Task2", &nouns);
+        let (lhs_token, lhs_base, op, rhs_token, rhs_base) = m.expect("match");
+        assert_eq!(lhs_token, "Task1");
+        assert_eq!(lhs_base, "Task");
+        assert_eq!(op, "<");
+        assert_eq!(rhs_token, "Task2");
+        assert_eq!(rhs_base, "Task");
+    }
+
+    #[test]
+    fn cross_antecedent_comparator_table_match_clause_picks_longest_keyword() {
+        let table = super::CrossAntecedentComparatorTable::boot();
+        let nouns = vec!["Task".to_string(), "Priority".to_string()];
+        let m = table.match_clause("Task1 has equal or lower Priority than Task2", &nouns);
+        let (_, _, op, _, _) = m.expect("match");
+        assert_eq!(op, "<=",
+            "longer keyword 'has equal or lower' must match before \
+             its 'has lower' prefix");
+    }
+
+    #[test]
+    fn cross_antecedent_comparator_table_match_clause_requires_declared_nouns() {
+        let table = super::CrossAntecedentComparatorTable::boot();
+        // Role 'Task ID' not declared — match must fail.
+        let nouns = vec!["Task".to_string()];
+        assert!(table.match_clause("Task1 has lower Task ID than Task2", &nouns).is_none(),
+            "match must require LHS, RHS, and Role to be declared nouns");
+    }
+
+    #[test]
+    fn cross_antecedent_comparator_table_from_grammar_state_reads_parallel_enums() {
+        let state = synthetic_enum_state(&[
+            ("Cross Antecedent Comparator Keyword", &["foo", "bar"]),
+            ("Cross Antecedent Comparator Op",      &["X", "Y"]),
+        ]);
+        let table = super::CrossAntecedentComparatorTable::from_grammar_state(&state);
+        assert_eq!(table.rows, vec![
+            ("foo".to_string(), "X".to_string()),
+            ("bar".to_string(), "Y".to_string()),
+        ]);
+    }
+
+    #[test]
+    fn cross_antecedent_comparator_table_falls_back_to_boot_on_empty_state() {
+        let state = synthetic_enum_state(&[]);
+        let table = super::CrossAntecedentComparatorTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 4,
+            "empty grammar state falls back to the 4-keyword boot table");
     }
 
     // ─── #783 second slice: range operator table ─────────────────────
