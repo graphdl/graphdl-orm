@@ -38,6 +38,10 @@ function textResult(data: any) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] }
 }
 
+function escapeAtom(s: string): string {
+  return s.replace(/[\\<>,]/g, ch => '\\' + ch)
+}
+
 /** Build a fresh McpServer bound to the shared Worker engine handle. */
 export function createRemoteServer(): McpServer {
   const server = new McpServer({ name: 'arest-remote', version: '0.2.0' })
@@ -219,6 +223,30 @@ export function createRemoteServer(): McpServer {
       const idPair = id ? `<id, ${id}>, ` : ''
       const key = operation === 'create' ? `create:${noun}` : `update:${noun}`
       const raw = await systemCall(key, `<${idPair}${pairs}>`)
+      return textResult(safeJson(raw, { raw }))
+    },
+  )
+
+  server.registerTool(
+    'retract',
+    {
+      description: `Retract an exact fact tuple from a FactType cell. ${MUTATION_TOOL_DESCRIPTION}`,
+      inputSchema: {
+        context_receipt: z.string().optional().describe(CONTEXT_RECEIPT_FIELD_DESCRIPTION),
+        fact_type: z.string(),
+        roles: z.record(z.string(), z.string()).optional(),
+        pairs: z.array(z.object({ role: z.string(), value: z.string() })).optional(),
+      },
+    },
+    async ({ context_receipt, fact_type, roles, pairs }) => {
+      const blocked = mutationGateResult('retract', context_receipt, { fact_type, roles, pairs })
+      if (blocked) return blocked
+
+      const entries = Array.isArray(pairs) && pairs.length
+        ? pairs.map(({ role, value }) => [role, value] as const)
+        : Object.entries(roles || {})
+      const input = `<${entries.map(([role, value]) => `<${escapeAtom(role)}, ${escapeAtom(value)}>`).join(', ')}>`
+      const raw = await systemCall(`retract:${fact_type}`, input)
       return textResult(safeJson(raw, { raw }))
     },
   )

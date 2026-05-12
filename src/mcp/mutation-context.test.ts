@@ -23,6 +23,7 @@ describe('MCP mutation context gate', () => {
     expect(context.version).toBe('arest-context:v1')
     expect(context.receipt).toMatch(/^arest-context:v1:fnv1a64:[0-9a-f]{16}$/)
     expect(context.receipt_applies_to).toContain('apply')
+    expect(context.receipt_applies_to).toContain('retract')
     expect(context.prompt_bundle.map((p) => p.name)).toEqual([
       'overview',
       'design-principles',
@@ -99,6 +100,21 @@ describe('MCP mutation context gate', () => {
     })
 
     expect(result.ok).toBe(true)
+  })
+
+  it('requires an exact fact tuple for retraction', () => {
+    expect(mutationModelingViolations('retract', {
+      fact_type: 'Order_was_placed_by_Customer',
+    })).toContain('retract requires roles or pairs')
+
+    expect(mutationModelingViolations('retract', {
+      roles: { Order: 'ord-1', Customer: 'acme' },
+    })).toContain('retract requires fact_type')
+
+    expect(mutationModelingViolations('retract', {
+      fact_type: 'Order_was_placed_by_Customer',
+      roles: { Order: 'ord-1', Customer: 'acme' },
+    })).toEqual([])
   })
 
   it('rejects known prose-memory anti-patterns', () => {

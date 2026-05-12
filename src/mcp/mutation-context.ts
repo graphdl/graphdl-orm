@@ -1,6 +1,6 @@
 export const MUTATION_CONTEXT_VERSION = 'arest-context:v1'
 
-export const MUTATING_CONTEXT_TOOLS = ['apply', 'compile', 'propose'] as const
+export const MUTATING_CONTEXT_TOOLS = ['apply', 'retract', 'compile', 'propose'] as const
 
 export type MutationContextTool = typeof MUTATING_CONTEXT_TOOLS[number] | string
 export type MutationContextDetail = 'summary' | 'full'
@@ -77,7 +77,7 @@ export const MUTATION_CONTEXT_ANTI_PATTERNS: readonly string[] = [
 export const MUTATION_CONTEXT_HOW_TO: readonly string[] = [
   'Call schema, tutor, tutor.authoring, actions, or query to inspect the existing model and readings-backed workflow.',
   'Call context and read the returned rules and prompt manifest.',
-  'For population changes, call apply with operation=create/update/transition and the context_receipt.',
+  'For population changes, call apply with operation=create/update/transition or retract exact fact tuples with the context_receipt.',
   'For schema changes, write FORML2 readings and call compile or propose with the context_receipt.',
   'If a mutation is rejected, repair the model or use propose to record the schema change workflow.',
 ]
@@ -214,6 +214,18 @@ export function mutationModelingViolations(tool: MutationContextTool, payload: R
     }
     if (operation === 'transition' && (!payload.id || !payload.event)) {
       violations.push('transition requires id and event')
+    }
+  }
+  if (tool === 'retract') {
+    if (typeof payload.fact_type !== 'string' || !payload.fact_type.trim()) {
+      violations.push('retract requires fact_type')
+    }
+    const roles = payload.roles
+    const pairs = payload.pairs
+    const hasRoles = Boolean(roles && typeof roles === 'object' && !Array.isArray(roles) && Object.keys(roles as Record<string, unknown>).length)
+    const hasPairs = Array.isArray(pairs) && pairs.length > 0
+    if (!hasRoles && !hasPairs) {
+      violations.push('retract requires roles or pairs')
     }
   }
   return violations

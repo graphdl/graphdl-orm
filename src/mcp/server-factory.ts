@@ -170,6 +170,25 @@ export function createArestServer(options: CreateArestServerOptions = {}): McpSe
     },
   )
 
+  server.registerTool(
+    'retract',
+    {
+      description: `Retract an exact fact tuple from a FactType cell. ${MUTATION_TOOL_DESCRIPTION}`,
+      inputSchema: {
+        context_receipt: z.string().optional().describe(CONTEXT_RECEIPT_FIELD_DESCRIPTION),
+        fact_type: z.string(),
+        roles: z.record(z.string(), z.string()).optional(),
+        pairs: z.array(z.object({ role: z.string(), value: z.string() })).optional(),
+      },
+    },
+    async (input) => {
+      const { context_receipt, ...body } = input as Record<string, unknown> & { context_receipt?: string }
+      const blocked = mutationGateResult('retract', context_receipt, body)
+      if (blocked) return blocked
+      return dispatch('retract', body)
+    },
+  )
+
   // ── Self-modification ─────────────────────────────────────────────
 
   server.registerTool(

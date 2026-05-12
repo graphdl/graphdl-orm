@@ -75,6 +75,16 @@ mod db {
         let tx = conn.unchecked_transaction()
             .unwrap_or_else(|e| { eprintln!("Transaction failed: {}", e); std::process::exit(1); });
 
+        // Replace the persisted snapshot atomically. INSERT OR REPLACE
+        // updates cells that still exist, but it cannot remove cells
+        // whose facts were retracted or whose derivation rule stopped
+        // producing them. Deleting inside the transaction keeps the DB
+        // equal to the current cell graph while preserving crash safety.
+        tx.execute("DELETE FROM cells", [])
+            .unwrap_or_else(|e| { eprintln!("Failed to clear cells: {}", e); std::process::exit(1); });
+        tx.execute("DELETE FROM defs", [])
+            .unwrap_or_else(|e| { eprintln!("Failed to clear defs: {}", e); std::process::exit(1); });
+
         // Store population cells only — compiled defs are recomputed
         // on each session start (452ms). Persisting Func trees as display
         // strings is slow to reload (Object::parse on thousands of nested
@@ -139,6 +149,52 @@ mod db {
 
         state.to_store()
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn persist_state_removes_rows_absent_from_next_snapshot() {
+            let conn = Connection::open_in_memory().expect("in-memory sqlite");
+            ensure_meta_tables(&conn);
+
+            let first = ast::store(
+                "query:Ticket",
+                ast::Object::atom("old def"),
+                &ast::store("Ticket", ast::Object::atom("old cell"), &ast::Object::phi()),
+            );
+            persist_state(&conn, &first);
+
+            let cell_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM cells WHERE name = 'Ticket'",
+                [],
+                |row| row.get(0),
+            ).expect("cell count");
+            let def_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM defs WHERE name = 'query:Ticket'",
+                [],
+                |row| row.get(0),
+            ).expect("def count");
+            assert_eq!(cell_count, 1);
+            assert_eq!(def_count, 1);
+
+            persist_state(&conn, &ast::Object::phi());
+
+            let cell_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM cells WHERE name = 'Ticket'",
+                [],
+                |row| row.get(0),
+            ).expect("cell count after replacement");
+            let def_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM defs WHERE name = 'query:Ticket'",
+                [],
+                |row| row.get(0),
+            ).expect("def count after replacement");
+            assert_eq!(cell_count, 0);
+            assert_eq!(def_count, 0);
+        }
+    }
 }
 
 // =========================================================================
@@ -180,6 +236,71 @@ fn system(key: &str, input: &str, d: &ast::Object) -> (String, ast::Object) {
     if key == "orient" {
         let raw = input.to_string();
         return (crate::orient::orient(d, &raw), d.clone());
+    }
+
+    // task-738 — `retract:<ft_name>` removes one exact fact tuple from
+    // the named FactType cell. Mirrors the engine-side intercept in
+    // `lib.rs::system_impl` so the CLI shell-out path the MCP shim
+    // uses produces the same updated state envelope. Write path:
+    // returns ("ok", new_d) so the caller persists. ⊥ returns leave
+    // D unchanged.
+    if let Some(ft_name) = key.strip_prefix("retract:") {
+        let input_obj = ast::Object::parse(input);
+        let pairs: Vec<(String, String)> = match input_obj.as_seq() {
+            Some(items) if !items.is_empty() => items.iter()
+                .filter_map(|item| {
+                    let kv = item.as_seq()?;
+                    if kv.len() != 2 { return None; }
+                    let role = kv[0].as_atom()?.to_string();
+                    let value = kv[1].as_atom()?.to_string();
+                    Some((role, value))
+                })
+                .collect(),
+            _ => return ("⊥".into(), d.clone()),
+        };
+        if pairs.is_empty() {
+            return ("⊥".into(), d.clone());
+        }
+        let cell = ast::fetch_or_phi(ft_name, d);
+        let items: Vec<ast::Object> = match cell.as_seq() {
+            Some(it) => it.to_vec(),
+            None => return ("⊥".into(), d.clone()),
+        };
+        let mut found_idx: Option<usize> = None;
+        for (i, fact) in items.iter().enumerate() {
+            let fact_pairs: Vec<(String, String)> = match fact.as_seq() {
+                Some(ps) => ps.iter()
+                    .filter_map(|p| {
+                        let kv = p.as_seq()?;
+                        if kv.len() != 2 { return None; }
+                        let r = kv[0].as_atom()?.to_string();
+                        let v = kv[1].as_atom()?.to_string();
+                        Some((r, v))
+                    })
+                    .collect(),
+                None => continue,
+            };
+            if fact_pairs.len() != pairs.len() { continue; }
+            let all_match = pairs.iter().all(|(role, value)| {
+                fact_pairs.iter().any(|(fr, fv)| fr == role && fv == value)
+            });
+            if all_match {
+                found_idx = Some(i);
+                break;
+            }
+        }
+        let idx = match found_idx {
+            Some(i) => i,
+            None => return ("⊥".into(), d.clone()),
+        };
+        let mut new_items = items;
+        new_items.remove(idx);
+        let new_cell = ast::Object::Seq(new_items.into());
+        let mut delta_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+        delta_map.insert(ft_name.to_string(), new_cell);
+        let delta = ast::Object::Map(delta_map);
+        let new_d = ast::merge_delta(d, &delta, None);
+        return ("ok".into(), new_d);
     }
 
     let obj = ast::Object::parse(input);

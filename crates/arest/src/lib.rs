@@ -1701,6 +1701,84 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         return cite_id;
     }
 
+    // ── Retract FFI (task-738) ───────────────────────────────────────
+    //
+    //   system(h, "retract:<ft_name>", "<<role1, val1>, <role2, val2>, ...>>") → "ok" | "⊥"
+    //
+    // Remove an exact fact tuple from the named FactType cell. The MCP
+    // retract verb (src/mcp/server.ts) wraps role/value pairs into the
+    // FFP S-expr shape above and routes them here. Matches by exact
+    // role-name × value across all pairs in the input. For repeated-
+    // role FTs the wrapper preserves declared order; this matcher
+    // currently uses role-name keyed membership which is correct for
+    // distinct-role FTs (the apps/tasks duplicate-renumber use case).
+    //
+    // New cell value is appended via merge_delta, so the prior version
+    // stays in the chain for audit. No constraint re-firing here —
+    // call `re_derive` after a sequence of retracts to rebuild derived
+    // cells.
+    if let Some(ft_name) = key.strip_prefix("retract:") {
+        let input_obj = ast::Object::parse(input);
+        let pairs: Vec<(String, String)> = match input_obj.as_seq() {
+            Some(items) if !items.is_empty() => items.iter()
+                .filter_map(|item| {
+                    let kv = item.as_seq()?;
+                    if kv.len() != 2 { return None; }
+                    let role = kv[0].as_atom()?.to_string();
+                    let value = kv[1].as_atom()?.to_string();
+                    Some((role, value))
+                })
+                .collect(),
+            _ => return "⊥".into(),
+        };
+        if pairs.is_empty() {
+            return "⊥".into();
+        }
+        let mut st = tenant.write();
+        let snapshot = st.snapshot_d();
+        let cell = ast::fetch_or_phi(ft_name, &snapshot);
+        let items: Vec<ast::Object> = match cell.as_seq() {
+            Some(it) => it.to_vec(),
+            None => return "⊥".into(),
+        };
+        let mut found_idx: Option<usize> = None;
+        for (i, fact) in items.iter().enumerate() {
+            let fact_pairs: Vec<(String, String)> = match fact.as_seq() {
+                Some(ps) => ps.iter()
+                    .filter_map(|p| {
+                        let kv = p.as_seq()?;
+                        if kv.len() != 2 { return None; }
+                        let r = kv[0].as_atom()?.to_string();
+                        let v = kv[1].as_atom()?.to_string();
+                        Some((r, v))
+                    })
+                    .collect(),
+                None => continue,
+            };
+            if fact_pairs.len() != pairs.len() { continue; }
+            let all_match = pairs.iter().all(|(role, value)| {
+                fact_pairs.iter().any(|(fr, fv)| fr == role && fv == value)
+            });
+            if all_match {
+                found_idx = Some(i);
+                break;
+            }
+        }
+        let idx = match found_idx {
+            Some(i) => i,
+            None => return "⊥".into(),
+        };
+        let mut new_items = items;
+        new_items.remove(idx);
+        let new_cell = ast::Object::Seq(new_items.into());
+        let mut delta_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+        delta_map.insert(ft_name.to_string(), new_cell);
+        let delta = ast::Object::Map(delta_map);
+        let new_d = ast::merge_delta(&snapshot, &delta, None);
+        st.replace_d(new_d);
+        return "ok".into();
+    }
+
     // ── Re-derive FFI (#305 follow-up to #14/#15) ────────────────────
     //
     //   system(h, "re_derive", "") → "<count>"
