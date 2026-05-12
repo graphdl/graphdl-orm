@@ -301,9 +301,23 @@ fn is_entity_ref_scheme_literal(clause: &str, noun_names: &[String]) -> bool {
 /// True when `clause` has the shape `<Noun> is (a|an) <Noun>` with
 /// both sides resolving to declared nouns. Treated as a typing
 /// predicate rather than a fact-type reference.
+///
+/// #879 Sweep-1 lift — infix subtype-check vocabulary lifts to
+/// `SubtypeInstanceCheckTable` so the keyword set lives in
+/// `readings/forml2-grammar.md` as a `Subtype Instance Check
+/// Keyword` enum value type. Boot stays in sync with the grammar;
+/// same iter-and-any semantics as the legacy inline
+/// `[" is a ", " is an "].iter().any(...)` chain, so a clause
+/// containing both keywords retries the second when the first
+/// fails to resolve both sides. Caution per #845: the clause shape
+/// "X is a subtype of Y" still naively substring-matches " is a "
+/// but the LHS/RHS pair fails the `noun_names` lookup so the
+/// classifier returns false — preserving the literal-aware-scanner
+/// invariant.
 fn is_subtype_instance_check(clause: &str, noun_names: &[String]) -> bool {
     let trimmed = clause.trim();
-    [" is a ", " is an "].iter().any(|kw| {
+    let table = crate::parse_forml2_stage2::SubtypeInstanceCheckTable::boot();
+    table.iter().any(|kw| {
         let Some(idx) = trimmed.find(kw) else { return false; };
         let lhs = trimmed[..idx].trim();
         let rhs = trimmed[idx + kw.len()..].trim();

@@ -795,6 +795,101 @@ impl EntityRefSchemeLiteralTable {
         None
     }
 }
+/// #879 — `is_subtype_instance_check` in `parse_forml2.rs` scans for
+/// an infix subtype-instance keyword (` is a ` or ` is an `) used to
+/// classify clauses of the shape `<Noun> is a <Noun>` /
+/// `<Noun> is an <Noun>` where both sides resolve to declared nouns.
+/// The legacy keyword set lives inline as `[" is a ", " is an "]`
+/// scanned via `trimmed.find(kw)` which splits the clause into an
+/// LHS and RHS that are each looked up against `noun_names`. Each
+/// keyword carries surrounding spaces so the `find` semantics match
+/// on word boundaries — without them tokens like `phrase`, `dais`,
+/// `oasis` would mis-match.
+///
+/// The lift moves the infix-marker vocabulary to a typed
+/// `SubtypeInstanceCheckTable` reading the `Subtype Instance Check
+/// Keyword` grammar enum. Boot-table rows store the keyword with its
+/// surrounding spaces so the `find`-and-slice semantics round-trip
+/// without surprise. Future keywords (e.g., ` is the `, ` is one `)
+/// extend the grammar declaration and are picked up automatically;
+/// no Rust change is required.
+///
+/// Caution per task description: the clause shape "X is a subtype of
+/// Y" was the literal that triggered #845's literal-aware-scanner
+/// fix. This lift is at the call-site level (the inline derivation
+/// rule body part scanner at parse_forml2.rs:1653) and does NOT
+/// re-introduce a top-level reading scanner — so the #845 literal-
+/// awareness guarantee is preserved. The accessor preserves the
+/// legacy semantics exactly: " is a subtype of " still naively
+/// substring-matches " is a ", but the LHS is empty and the RHS
+/// starts with "subtype of …" — neither resolves through
+/// `noun_names`, so the classifier returns false and the clause
+/// falls through to the unresolved-clause diagnostic as before.
+#[derive(Debug, Clone)]
+pub struct SubtypeInstanceCheckTable {
+    /// The subtype-instance-check infix markers. Order matches the
+    /// `' is a ', ' is an '` declaration in
+    /// `readings/forml2-grammar.md` and the legacy two-entry
+    /// `[" is a ", " is an "]` array in `is_subtype_instance_check`
+    /// so first-match-wins iteration behavior round-trips.
+    pub rows: Vec<String>,
+}
+
+impl SubtypeInstanceCheckTable {
+    /// Boot table — must stay in sync with `Subtype Instance Check
+    /// Keyword` enum-value declaration in
+    /// `readings/forml2-grammar.md`. Two markers (` is a `, ` is an `)
+    /// in the same declaration order as the legacy hardcoded array
+    /// in `is_subtype_instance_check`.
+    pub fn boot() -> Self {
+        SubtypeInstanceCheckTable {
+            rows: alloc::vec![
+                " is a ".to_string(),
+                " is an ".to_string(),
+            ],
+        }
+    }
+
+    /// Build the table from the runtime `Subtype Instance Check
+    /// Keyword` enum-value declaration. Falls back to `boot()` when
+    /// the cell is empty (bare engine, no metamodel loaded).
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_enum_values(state, "Subtype Instance Check Keyword");
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            SubtypeInstanceCheckTable { rows }
+        }
+    }
+
+    /// Iterate the keywords in declaration order. Each keyword
+    /// carries its surrounding spaces; the caller uses
+    /// `split_at_keyword` for the find-and-slice form.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.rows.iter().map(|s| s.as_str())
+    }
+
+    /// Try each keyword in declaration order; on first match return
+    /// `(lhs, rhs)` where `lhs` is the trimmed text before the keyword
+    /// and `rhs` is the trimmed text after it. Mirrors the legacy
+    /// `let Some(idx) = trimmed.find(kw); let lhs = trimmed[..idx]
+    /// .trim(); let rhs = trimmed[idx + kw.len()..].trim();` shape in
+    /// `is_subtype_instance_check` exactly: case-sensitive substring
+    /// search, surrounding spaces in the keyword enforce the word
+    /// boundary, declaration order ensures ` is a ` is tried before
+    /// ` is an ` (matching the legacy `.iter().any` chain).
+    pub fn split_at_keyword<'a>(&self, clause: &'a str) -> Option<(&'a str, &'a str)> {
+        for kw in self.rows.iter() {
+            if let Some(idx) = clause.find(kw.as_str()) {
+                let lhs = clause[..idx].trim();
+                let rhs = clause[idx + kw.len()..].trim();
+                return Some((lhs, rhs));
+            }
+        }
+        None
+    }
+}
+
 
 /// #783 first slice — `is_word_comparator_clause` in `parse_forml2.rs`
 /// scans for an inline 8-entry `COMPARATORS` const (` exceeds `,
@@ -5022,6 +5117,8 @@ mod tests {
     /// enum=32. #877 added `Noun Has Noun Literal Keyword` enum (1
     /// value) — bumping noun=44, enum=33. #878 added `Entity Ref Scheme
     /// Literal Keyword` enum (2 values) — bumping noun=45, enum=34.
+    /// #879 added `Subtype Instance Check Keyword` enum (2 values) —
+    /// bumping noun=46, enum=35.
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
@@ -5029,7 +5126,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 45, "noun count");
+        assert_eq!(noun_count, 46, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -5041,7 +5138,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 34, "enum-valued noun count");
+        assert_eq!(enum_count, 35, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -7092,6 +7189,100 @@ mod tests {
     fn entity_ref_scheme_literal_table_falls_back_to_boot_on_empty_state() {
         let state = synthetic_enum_state(&[]);
         let table = super::EntityRefSchemeLiteralTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 2,
+            "empty grammar state falls back to the 2-keyword boot table");
+    }
+
+
+    // ─── #879: subtype instance check table ──────────────────────────
+
+    /// #879 — `is_subtype_instance_check` in parse_forml2.rs has a
+    /// hardcoded pair of infix subtype-instance keywords (` is a `,
+    /// ` is an `) scanned via `[" is a ", " is an "].iter().any(|kw|
+    /// trimmed.find(kw)...)`. The keyword set lives in code, not in
+    /// the grammar. Each keyword has surrounding spaces so the `find`
+    /// semantics match on word boundaries — without them tokens like
+    /// `phrase`, `dais`, `oasis` would mis-match. This lift moves the
+    /// infix-marker vocabulary to a typed `SubtypeInstanceCheckTable`
+    /// reading the `Subtype Instance Check Keyword` grammar enum.
+    /// Boot table preserves the historic two-keyword order so the
+    /// recognizer behaves identically before and after the lift.
+    #[test]
+    fn subtype_instance_check_table_boot_has_two_keywords_in_declared_order() {
+        let table = super::SubtypeInstanceCheckTable::boot();
+        let words: Vec<&str> = table.iter().collect();
+        assert_eq!(words, vec![" is a ", " is an "],
+            "boot table must mirror the historic ` is a ` / ` is an ` \
+             infix order in is_subtype_instance_check, with the \
+             surrounding spaces included so the find-and-slice \
+             semantics round-trip on word boundaries.");
+    }
+
+    /// #879 — `split_at_keyword` returns the LHS/RHS subject pair
+    /// when the clause contains a declared keyword; otherwise None.
+    /// Surrounding spaces in the keyword enforce the word boundary —
+    /// case-sensitive substring search mirrors the legacy
+    /// `trimmed.find(kw); lhs = trimmed[..idx].trim();
+    /// rhs = trimmed[idx + kw.len()..].trim();` shape in
+    /// `is_subtype_instance_check` exactly.
+    ///
+    /// Caution per task: the clause shape "X is a subtype of Y" was
+    /// the literal that triggered #845's literal-aware-scanner fix.
+    /// Here the accessor still finds " is a " in
+    /// "Robocall is a subtype of Telemarketing Call" and returns
+    /// `("Robocall", "subtype of Telemarketing Call")` — exactly the
+    /// legacy behavior. The caller's downstream `noun_names` check
+    /// then rejects "subtype of Telemarketing Call" so the classifier
+    /// returns false and the clause falls through, preserving the
+    /// post-#845 invariant that literal-scoped phrases don't
+    /// accidentally classify.
+    #[test]
+    fn subtype_instance_check_table_split_at_keyword_returns_lhs_rhs_or_none() {
+        let table = super::SubtypeInstanceCheckTable::boot();
+        assert_eq!(
+            table.split_at_keyword("Robocall is a Autodialed Call"),
+            Some(("Robocall", "Autodialed Call")),
+            "` is a ` infix splits to LHS / RHS subject pair");
+        assert_eq!(
+            table.split_at_keyword("Robocall is an Autodialed Call"),
+            Some(("Robocall", "Autodialed Call")),
+            "` is an ` infix splits to LHS / RHS subject pair");
+        assert_eq!(
+            table.split_at_keyword("Robocall is a subtype of Telemarketing Call"),
+            Some(("Robocall", "subtype of Telemarketing Call")),
+            "the #845 trigger phrase still naively substring-matches \
+             ` is a `; the LHS/RHS pair returned here is rejected by \
+             the caller's noun_names check so the classifier returns \
+             false (preserving legacy behavior).");
+        assert_eq!(
+            table.split_at_keyword("Robocall has Autodialed Call"),
+            None,
+            "non-subtype infix must not match");
+        assert_eq!(
+            table.split_at_keyword(""),
+            None,
+            "empty clause cannot contain any keyword");
+    }
+
+    /// #879 — when state's EnumValues cell carries Subtype Instance
+    /// Check Keyword values, from_grammar_state lifts them at runtime.
+    #[test]
+    fn subtype_instance_check_table_from_grammar_state_reads_enum_values() {
+        let state = synthetic_enum_state(&[
+            ("Subtype Instance Check Keyword", &[" is the ", " is one "]),
+        ]);
+        let table = super::SubtypeInstanceCheckTable::from_grammar_state(&state);
+        assert_eq!(table.rows, vec![" is the ", " is one "]);
+        assert_eq!(
+            table.split_at_keyword("Robocall is the Autodialed Call"),
+            Some(("Robocall", "Autodialed Call")),
+            "runtime-loaded keyword must be honoured by the accessor");
+    }
+
+    #[test]
+    fn subtype_instance_check_table_falls_back_to_boot_on_empty_state() {
+        let state = synthetic_enum_state(&[]);
+        let table = super::SubtypeInstanceCheckTable::from_grammar_state(&state);
         assert_eq!(table.rows.len(), 2,
             "empty grammar state falls back to the 2-keyword boot table");
     }

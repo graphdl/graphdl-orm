@@ -72,6 +72,8 @@ Noun Has Noun Literal Keyword is a value type.
   The possible values of Noun Has Noun Literal Keyword are ' has '.
 Entity Ref Scheme Literal Keyword is a value type.
   The possible values of Entity Ref Scheme Literal Keyword are ' is not', ' is'.
+Subtype Instance Check Keyword is a value type.
+  The possible values of Subtype Instance Check Keyword are ' is a ', ' is an '.
 Ring Constraint Trailing Marker is a value type.
   The possible values of Ring Constraint Trailing Marker are 'is irreflexive', 'is asymmetric', 'is antisymmetric', 'is symmetric', 'is intransitive', 'is transitive', 'is acyclic', 'is reflexive'.
 Ring Constraint Kind Code is a value type.
