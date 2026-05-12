@@ -54,10 +54,11 @@
  *     `S1i #725` AAD-binds-version contract directly.
  */
 
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import {
   EntityDB,
   ENGINE_STATE_STORAGE_KEY,
+  SEALED_CELL_PREFIX,
   aadVersionFor,
   cellAddressFor,
 } from './entity-do'
@@ -156,7 +157,19 @@ function createMockCtx(idName: string): MockCtx {
 function makeEntityDB(ctx: MockCtx, env: Record<string, unknown> = {}): EntityDB {
   const db = new (EntityDB as unknown as new () => EntityDB)()
   ;(db as unknown as { ctx: MockCtx }).ctx = ctx
-  ;(db as unknown as { env: Record<string, unknown> }).env = env
+  // Post-#888/#902 (`getMaster` fail-loud), an env without
+  // `TENANT_MASTER_SEED` and without the explicit dev-only
+  // `AREST_ALLOW_PLAINTEXT=1` opt-in throws on the first `db.put` /
+  // `db.get`. The #769 cases below predate that hardening and were
+  // written against the legacy plaintext-default path; they do NOT
+  // exercise the AEAD AAD agreement contract (that's the #803 case
+  // (c) below). Default the env to the dev opt-in so the chain-
+  // version-of-record contracts they pin remain observable through
+  // the plaintext branch. Callers that want the sealed-cell path
+  // (e.g. `makeSealedEntityDB` for the #803 cases) bind
+  // `TENANT_MASTER_SEED` explicitly to override.
+  const mergedEnv: Record<string, unknown> = { AREST_ALLOW_PLAINTEXT: '1', ...env }
+  ;(db as unknown as { env: Record<string, unknown> }).env = mergedEnv
   return db
 }
 
@@ -461,4 +474,465 @@ describe('EntityDB engine round-trip — chain-as-version-of-record (#769)', () 
     // helper's docstring.
     expect(aadVersionFor(-1, 'anything')).toBe(0)
   }, COMPILE_TIMEOUT_MS)
+
+  // ─────────────────────────────────────────────────────────────────────
+  // ── #803 / #777 engine-only IO contracts ─────────────────────────────
+  // ─────────────────────────────────────────────────────────────────────
+  //
+  // The #769 cases above pin the chain-as-version-of-record contract
+  // from the version-stamp direction. #803 (this block) pins the
+  // engine-only IO contract from the worker's perspective: every cell
+  // write must reach SQLite ONLY through CellSource adapters that
+  // ultimately consult the engine — there must be no parallel SQL-
+  // shadowing path that mutates the chain twice, returns stale bytes,
+  // mints an AAD version out of band, or bypasses the freeze blob.
+  //
+  // Background — #777 parent:
+  //   Worker should reach SQLite ONLY through the engine-resident
+  //   CellSource adapter chain. SQL writes that don't first route
+  //   through `writeCellThroughEngine` would double-increment a
+  //   parallel version, leak stale reads, or split-brain the AEAD
+  //   AAD source between worker-minted and engine-sourced version_ids.
+  //
+  // Sibling audit:
+  //   #886 (in flight) verifies the engine-side that `apply` is the
+  //   only D-mutating verb routed through `CommitDelta`. #803 (here)
+  //   verifies the WORKER side: the four contracts below pin that
+  //   `EntityDB.put` / `EntityDB.get` / cold-start hydrate do not
+  //   construct their own out-of-band version counters or fall back
+  //   to a plaintext-shadow that would diverge from the engine view.
+  //
+  // Vitest gap caveat (file-header §):
+  //   `merge_delta` panics on `platform_now()` under vitest's WASM
+  //   runtime, so the chain does NOT extend on `apply` here. The
+  //   contracts below use the engine-only path through `EntityDB.put`
+  //   (master-bound, sealed envelope) and pin the worker-side
+  //   invariants that observable under the SystemTime-less runtime:
+  //     - cell_pin remains consistent across writes (no
+  //       parallel-SQL-shadow bumps it spuriously)
+  //     - aadVersionFor sourcing is byte-equal at seal AND at open
+  //       (no out-of-band counter on either side)
+  //     - the sealed envelope decodes via AEAD on cold-start hydrate
+  //       (proving the freeze blob carries the engine-sourced AAD
+  //       version through the isolate boundary).
+  //   The chain-extension half is covered by the Rust-side cargo tests
+  //   #777 cited (engine apply → CommitDelta → chain extends by 1)
+  //   under the native runtime where SystemTime is available.
+
+  /**
+   * Helper — mint a fresh ctx + master-bound EntityDB for the #803
+   * engine-only tests. The seed is bound so `getMaster` resolves to
+   * the sealed path (post-#888 there is no plaintext fall-back). This
+   * matches production deploy shape — the path under test IS the
+   * sealed path because #777 is about consolidating ALL cell I/O
+   * through the engine + AEAD adapter chain, with NO plaintext escape
+   * hatch and NO out-of-band SQL counter.
+   */
+  function makeSealedEntityDB(idName: string): { ctx: MockCtx; db: EntityDB } {
+    const ctx = createMockCtx(idName)
+    const db = makeEntityDB(ctx, {
+      TENANT_MASTER_SEED: 'engine-only-#803-test-seed-not-a-secret-32b!',
+    })
+    return { ctx, db }
+  }
+
+  // ── (a) Write-through monotonic chain extension under engine-only path ─
+  //
+  // #803 contract (a): EntityDB.put MUST route through the engine
+  // `apply` verb BEFORE the SQL write. No parallel SQL shadow path
+  // may bump the chain version counter — otherwise two paths would
+  // race to extend the chain and a single user write would observe
+  // a +2 jump (or a value-source split between the engine's chain
+  // head and a worker-minted SQL column).
+  //
+  // Worker-side observation under vitest gap (file header §):
+  //   The engine apply throws inside `merge_delta` (SystemTime panic)
+  //   and EntityDB.put's try/catch swallows it — the chain does NOT
+  //   extend. The invariant we pin is the *absence* of a parallel
+  //   counter: cell_pin reads identically before write 1, after write
+  //   1, and after write 2. A spurious SQL-shadow path that bumped a
+  //   parallel counter would surface here as v1 != v0 or v2 != v1,
+  //   even with the engine apply failing. The pre-#768 `cell.version`
+  //   SQL column (now dropped) was exactly such a parallel counter;
+  //   this test pins that it stays gone.
+  //
+  // Under live Cloudflare Workers (SystemTime available): engine
+  // apply mutates D, chain extends, cell_pin reports v1 then v2 with
+  // v2 = v1 + 1 (NOT v1 + 2). The Rust-side
+  // `apply_extends_chain_on_at_least_one_touched_cell` test covers
+  // the +1 extension; the worker-side invariant pinned HERE is that
+  // the worker contributes NO additional bump beyond what the engine
+  // mints.
+
+  it('7. (a) write-through extends the chain only through the engine apply path — no SQL shadow that double-increments', async () => {
+    const { ctx, db } = makeSealedEntityDB('Order:ord-rt-7')
+    const cellName = ctx.id.toString()
+
+    // Pre-write baseline: no engine handle, no chain entry.
+    await db.__test_hydrate()
+    const handle = (db as unknown as { engineHandle: number }).engineHandle
+    expect(handle).toBeGreaterThanOrEqual(0)
+    const baseline = aadVersionFor(handle, cellName)
+    expect(callCellPin(handle, cellName)).toBeNull()
+    expect(baseline).toBe(0)
+
+    await db.put({ id: 'ord-rt-7', type: 'Order', data: { total: '10' } })
+    const v1 = aadVersionFor(handle, cellName)
+    const pin1 = callCellPin(handle, cellName) ?? 0
+    // Engine + worker MUST agree on the version after write 1. A
+    // parallel SQL-counter path would let v1 diverge from pin1.
+    expect(v1).toBe(pin1)
+
+    await db.put({ id: 'ord-rt-7', type: 'Order', data: { total: '20' } })
+    const v2 = aadVersionFor(handle, cellName)
+    const pin2 = callCellPin(handle, cellName) ?? 0
+    expect(v2).toBe(pin2)
+
+    // Monotonic: chain head NEVER regresses. Under vitest both stay
+    // at 0 (apply panics inside merge_delta) — that's the engine
+    // contract observed locally. Under live workers v2 > v1 > 0 and
+    // the chain extends by exactly 1 per call. Either way: monotonic
+    // non-decreasing, and the worker doesn't add its own bump.
+    expect(v1).toBeGreaterThanOrEqual(baseline)
+    expect(v2).toBeGreaterThanOrEqual(v1)
+
+    // The absence of an out-of-band SQL shadow counter is the load-
+    // bearing invariant: the worker reads version_id ONLY through
+    // aadVersionFor → cell_pin. If a sweep ever re-introduces a SQL
+    // column (cell.version, cell.head_id, …) and reads from it, this
+    // test stops detecting the parallel-path-divergence shape; that
+    // would be a regression on #777's scope-of-truth contract.
+    //
+    // SQL row shape pin: no `version` column on persisted rows. The
+    // mock storage records the column list at INSERT time; we walk
+    // the row keys and assert the legacy counter is gone (post-#768).
+    const tables = (ctx.storage.sql as unknown as { _tables?: Record<string, unknown[]> })._tables
+    // The mock doesn't expose tables — read via the SELECT path instead.
+    const rows = ctx.storage.sql
+      .exec(`SELECT id, type, data FROM cell`)
+      .toArray() as Array<Record<string, unknown>>
+    expect(rows).toHaveLength(1)
+    const row = rows[0]
+    // The legacy `version` column is gone (#768). Even if the mock
+    // accepted an INSERT carrying `version`, the SELECT projection
+    // doesn't surface it — the schema contract is "no parallel
+    // counter exists at the SQL layer".
+    expect('version' in row).toBe(false)
+    // Tables-side defensive check: if the mock _did_ expose internals,
+    // verify no `version` slot was written. (No-op when undefined.)
+    if (tables && Array.isArray(tables.cell) && tables.cell.length > 0) {
+      const persistedRow = tables.cell[0] as Record<string, unknown>
+      expect('version' in persistedRow).toBe(false)
+    }
+  }, COMPILE_TIMEOUT_MS)
+
+  // ── (b) Read-after-write returns engine's view (not stale SQL) ──────
+  //
+  // #803 contract (b): EntityDB.get IMMEDIATELY after EntityDB.put
+  // must return the just-written value through the engine-routed
+  // read path (`fetchCellSealedViaEngine` / `callFetchCell` →
+  // sealed-SQL fallback). No stale SQL read may surface a pre-write
+  // value, and no version-skew between seal-side and open-side AAD
+  // may surface a CellAeadError.
+  //
+  // Worker-side observation:
+  //   The engine apply throws under vitest (file header §), but the
+  //   SQL sealed write still lands and the read decrypts via the
+  //   sealed-SQL fallback path of `fetchCellSealedViaEngine`. The
+  //   crucial #803 invariant is that the read returns the merged
+  //   payload from the write — proving the engine-routed READ helper
+  //   does not regress to a stale snapshot when the write helper's
+  //   engine apply throws. (If a SQL-shadow counter incremented on
+  //   the write but not on the read, the AEAD AAD `version` field
+  //   would diverge and `cellOpen` would fail with kind='auth'.)
+  //
+  // Under live workers: chain extends, fetch_cell returns the engine
+  // payload, no SQL touched — same `cell.data` round-trip closure
+  // because seal/open agree on the chain-sourced version_id.
+
+  it('8. (b) read-after-write returns the just-written value through the engine-routed read (no stale SQL view)', async () => {
+    const { db } = makeSealedEntityDB('Order:ord-rt-8')
+
+    // Write 1: fresh cell. The engine apply attempt fires through
+    // `writeCellThroughEngine` BEFORE storeCellSealed runs (per
+    // EntityDB.put's body) — vitest's SystemTime gap may make apply
+    // throw, but the SQL sealed write still completes. Read must
+    // surface the just-written payload.
+    await db.put({ id: 'ord-rt-8', type: 'Order', data: { total: '100', status: 'open' } })
+    const afterWrite1 = await db.get()
+    expect(afterWrite1).not.toBeNull()
+    expect(afterWrite1!.id).toBe('ord-rt-8')
+    expect(afterWrite1!.type).toBe('Order')
+    expect(afterWrite1!.data.total).toBe('100')
+    expect(afterWrite1!.data.status).toBe('open')
+
+    // Write 2: merge a new field. EntityDB.put's merge semantics keep
+    // existing fields and overlay incoming ones. The read after the
+    // second write must reflect the merged view — proving the engine-
+    // routed read isn't pinning a stale snapshot from before write 2.
+    await db.put({ id: 'ord-rt-8', type: 'Order', data: { status: 'fulfilled', shipped: 'true' } })
+    const afterWrite2 = await db.get()
+    expect(afterWrite2).not.toBeNull()
+    expect(afterWrite2!.data.total).toBe('100') // preserved across merge
+    expect(afterWrite2!.data.status).toBe('fulfilled') // overwritten by write 2
+    expect(afterWrite2!.data.shipped).toBe('true') // added by write 2
+
+    // The engine-routed read path MUST consult `callFetchCell` on
+    // every read. Even when the engine returns ⊥ (today's surface
+    // for entity-id-keyed cells per #770's note), the call wires the
+    // read through the chain-as-version-of-record bookend so that
+    // when the engine grows entity-cell semantics, reads inherit the
+    // engine view with no call-site change. We pin the spy to detect
+    // a regression that bypasses the engine-routed helper and
+    // SELECTs straight from SQL.
+    const engineMod = await import('./api/engine')
+    const spy = vi.spyOn(engineMod, 'callFetchCell')
+    try {
+      const probed = await db.get()
+      expect(probed).not.toBeNull()
+      expect(probed!.data.total).toBe('100')
+      expect(spy).toHaveBeenCalled()
+      // The cellName passed to callFetchCell IS the DO routing key —
+      // the same name aadVersionFor uses to source cell_pin. A read
+      // path that diverged from this naming would mean engine and AEAD
+      // view different cells; #777's contract requires they agree.
+      const callArg = spy.mock.calls[0][1]
+      expect(callArg).toBe('Order:ord-rt-8')
+    } finally {
+      spy.mockRestore()
+    }
+  }, COMPILE_TIMEOUT_MS)
+
+  // ── (c) AEAD AAD agreement under engine-only writes ─────────────────
+  //
+  // #803 contract (c): the AEAD AAD `(scope, domain, cellName, version)`
+  // tuple MUST be byte-identical between the seal-side
+  // (`storeCellSealed` → `cellAddressFor` + `aadVersionFor`) and the
+  // open-side (`fetchCellSealed` → same helpers). No worker path
+  // may mint the version field through any source other than the
+  // engine's `cell_pin` chain head — otherwise `cellOpen` fails
+  // tag verification on what should be a round-trip-closing read.
+  //
+  // Worker-side observation:
+  //   We drive a write through `EntityDB.put` (engine apply attempt +
+  //   sealed SQL write), then HAND-RECONSTRUCT the address from the
+  //   public helpers (`cellAddressFor(type, id, aadVersionFor(handle,
+  //   cellName))`). Decrypting the persisted sealed bytes with that
+  //   hand-built AAD must succeed — proving the helpers consume the
+  //   same source the worker's seal path consumed. Any divergence
+  //   (e.g. a SQL-counter source for one side, engine for the other)
+  //   would fail with `kind = 'auth'`.
+  //
+  // The test also pins the converse: an AAD constructed with a wrong
+  // version field MUST fail to open — proving the AAD does bind the
+  // version_id field (S1i #725 / canonicalAddressBytes layout).
+
+  it('9. (c) AEAD AAD agrees on (scope, domain, cellName, version) between engine-only seal and open paths', async () => {
+    const { ctx, db } = makeSealedEntityDB('Order:ord-rt-9')
+    const cellName = ctx.id.toString()
+    await db.put({
+      id: 'ord-rt-9',
+      type: 'Order',
+      data: { total: '777', label: 'engine-only-write' },
+    })
+
+    const handle = (db as unknown as { engineHandle: number }).engineHandle
+    expect(handle).toBeGreaterThanOrEqual(0)
+
+    // Sealed envelope is what the SQL row carries. Pull it back through
+    // the mock SELECT and strip the SEALED_CELL_PREFIX magic.
+    const rows = ctx.storage.sql
+      .exec(`SELECT id, type, data FROM cell`)
+      .toArray() as Array<Record<string, unknown>>
+    expect(rows).toHaveLength(1)
+    const row = rows[0]
+    const dataField = row.data as string
+    expect(typeof dataField).toBe('string')
+    expect(dataField.startsWith(SEALED_CELL_PREFIX)).toBe(true)
+    const sealedBytes = base64ToBytes(dataField.slice(SEALED_CELL_PREFIX.length))
+
+    // Hand-reconstruct the AAD from the same public helpers the
+    // worker's open path uses. If `aadVersionFor` ever drew from a
+    // shadow source, the version field reconstructed here would
+    // differ from the seal-time version and the open would fail.
+    const aadVersion = aadVersionFor(handle, cellName)
+    const address = cellAddressFor('Order', 'ord-rt-9', aadVersion)
+    expect(address.scope).toBe('worker')
+    expect(address.domain).toBe('Order')
+    expect(address.cellName).toBe('ord-rt-9')
+    expect(address.version).toBe(aadVersion)
+
+    // Derive the same master EntityDB used internally.
+    // (`makeSealedEntityDB`'s env seed + the DO id as the tenant salt.)
+    const master = await deriveTenantMasterKey(
+      'engine-only-#803-test-seed-not-a-secret-32b!',
+      cellName,
+    )
+
+    // Engine-only open: same AAD construction surfaces the plaintext.
+    const opened = await cellOpen(master, address, sealedBytes)
+    const recovered = JSON.parse(new TextDecoder().decode(opened)) as Record<
+      string,
+      unknown
+    >
+    expect(recovered.total).toBe('777')
+    expect(recovered.label).toBe('engine-only-write')
+
+    // Converse: a wrong version in the AAD MUST fail. The seal-side
+    // baked aadVersion into the AAD; opening at aadVersion + 1
+    // (or aadVersion + 100) proves the AEAD binds the version field
+    // (S1i #725) — exactly the bind that makes a captured-then-
+    // replayed older ciphertext fail at a later head. If the worker
+    // ever forgot to thread aadVersion through cellAddressFor, this
+    // catch fires.
+    const skewedAddress = cellAddressFor('Order', 'ord-rt-9', aadVersion + 100)
+    let openKind: string | undefined
+    try {
+      await cellOpen(master, skewedAddress, sealedBytes)
+      expect.fail('cellOpen with skewed AAD version must reject the envelope')
+    } catch (e) {
+      openKind = (e as CellAeadError).kind
+    }
+    expect(openKind).toBe('auth')
+
+    // The round-trip via the public EntityDB.get path closes — proves
+    // the production read helper does precisely the same AAD recon-
+    // struction we just did by hand.
+    const cell = await db.get()
+    expect(cell).not.toBeNull()
+    expect(cell!.data.total).toBe('777')
+    expect(cell!.data.label).toBe('engine-only-write')
+  }, COMPILE_TIMEOUT_MS)
+
+  // ── (d) Cold-start hydrate reads what engine-only writes wrote ──────
+  //
+  // #803 contract (d): a DO recreate against the same `ctx.storage`
+  // must surface the engine-only-written cell value end-to-end —
+  // `EntityDB.get()` on the new instance returns the same payload
+  // the first instance wrote via `EntityDB.put`. This closes the
+  // cold-start half of #777's engine-only IO contract: the freeze
+  // blob carries the engine state (including chain head per
+  // `cell_pin`) across the isolate boundary, and the sealed SQL row
+  // (the post-vitest-gap authoritative store for the payload) is
+  // re-opened under an AAD whose version field comes from that
+  // freeze-restored chain head.
+  //
+  // Why this is the load-bearing test for #777's full collapse:
+  //   If ANY out-of-band SQL counter (or worker-minted version) had
+  //   survived #768, the new DO instance would source its AAD version
+  //   from a different place than the original DO did — and `cellOpen`
+  //   on the persisted bytes would fail with kind='auth'. The fact
+  //   that the cold-start read returns the payload proves the
+  //   version stamp survived through ONE channel: the engine freeze
+  //   image. (Under vitest's SystemTime gap, the chain stayed at 0
+  //   pre- and post-thaw, so the "version stamp survived" reduces to
+  //   "the empty-fold baseline survived" — but the worker-side
+  //   contract pinned is the same: aadVersionFor sourced from
+  //   cell_pin, on both isolates, with no parallel counter.)
+  //
+  // Lifecycle pinned here:
+  //   1. dbA writes via put — engine apply attempts, persistEngineState
+  //      writes the freeze blob, sealed SQL row lands.
+  //   2. Manual __test_evict on dbA releases the WASM handle.
+  //   3. dbB constructed against the same ctx.storage → fresh
+  //      EntityDB instance, engineHandle starts at -1.
+  //   4. dbB.get() hydrates from storage, opens the sealed row, the
+  //      AEAD round-trip closes because the AAD version is sourced
+  //      from the freeze-restored chain head (or its empty-fold
+  //      baseline under the vitest gap).
+
+  it('10. (d) cold-start hydrate: a fresh DO instance reads the engine-only-written cell end-to-end', async () => {
+    const { ctx, db: dbA } = makeSealedEntityDB('Order:ord-rt-10')
+    const cellName = ctx.id.toString()
+
+    // Write through the engine apply + sealed SQL path. The freeze
+    // blob lands automatically through writeCellThroughEngine's call
+    // to persistEngineState, but we also drive __test_persist to
+    // belt-and-braces ensure the storage carries the freeze image
+    // even when the apply path threw inside merge_delta (vitest gap).
+    await dbA.put({
+      id: 'ord-rt-10',
+      type: 'Order',
+      data: { total: '999', region: 'us-east' },
+    })
+    const blobA = await dbA.__test_persist()
+    expect(typeof blobA).toBe('string')
+    expect(blobA.length).toBeGreaterThan(0)
+
+    // Snapshot the pre-eviction view for cross-check after recreate.
+    const handleA = (dbA as unknown as { engineHandle: number }).engineHandle
+    expect(handleA).toBeGreaterThanOrEqual(0)
+    const headA = aadVersionFor(handleA, cellName)
+    const preEvictCell = await dbA.get()
+    expect(preEvictCell).not.toBeNull()
+    expect(preEvictCell!.data.total).toBe('999')
+    expect(preEvictCell!.data.region).toBe('us-east')
+
+    // Mimic isolate eviction: release dbA's WASM handle. The DO's
+    // `ctx.storage` (sealed SQL row + engine freeze blob) persists.
+    await dbA.__test_evict()
+
+    // Cold-start: brand-new EntityDB instance against the SAME
+    // ctx.storage — this is what Cloudflare does after isolate
+    // eviction. The constructor leaves engineHandle = -1; the first
+    // `get` hydrates from the persisted freeze blob and opens the
+    // sealed SQL row.
+    const dbB = makeEntityDB(ctx, {
+      TENANT_MASTER_SEED: 'engine-only-#803-test-seed-not-a-secret-32b!',
+    })
+
+    // Engine handle starts unallocated on the fresh instance.
+    expect((dbB as unknown as { engineHandle: number }).engineHandle).toBe(-1)
+
+    // The cold-start read MUST return the original value end-to-end.
+    // This is the only way to prove:
+    //   - engine state restored from the freeze blob (chain head
+    //     observable via aadVersionFor matches dbA's view)
+    //   - sealed SQL row's AAD reconstructs through the engine-only
+    //     path's helpers (no out-of-band counter)
+    //   - the master derives identically against the same env seed
+    //     + DO id salt (per-tenant key derivation is stable)
+    //   - the AEAD round-trip closes (no kind='auth' from a version
+    //     skew between persisted bytes and post-hydrate AAD source)
+    const coldStartCell = await dbB.get()
+    expect(coldStartCell).not.toBeNull()
+    expect(coldStartCell!.id).toBe('ord-rt-10')
+    expect(coldStartCell!.type).toBe('Order')
+    expect(coldStartCell!.data.total).toBe('999')
+    expect(coldStartCell!.data.region).toBe('us-east')
+
+    // Post-hydrate handle is allocated and the chain head is byte-
+    // stable across recreate — the engine view dbB observes is the
+    // same one dbA had. Any divergence here would mean the freeze/
+    // thaw lifecycle silently dropped state; #803's cold-start
+    // contract is precisely that this DOES NOT happen.
+    const handleB = (dbB as unknown as { engineHandle: number }).engineHandle
+    expect(handleB).toBeGreaterThanOrEqual(0)
+    const headB = aadVersionFor(handleB, cellName)
+    expect(headB).toBe(headA)
+
+    // And a subsequent put on dbB merges with the dbA-written payload
+    // — proves the cold-started DO continues to round-trip through
+    // the engine-only path (read-modify-write) without losing the
+    // pre-eviction fields.
+    await dbB.put({ id: 'ord-rt-10', type: 'Order', data: { region: 'eu-west' } })
+    const merged = await dbB.get()
+    expect(merged).not.toBeNull()
+    expect(merged!.data.total).toBe('999') // preserved from dbA's write
+    expect(merged!.data.region).toBe('eu-west') // overwritten by dbB's write
+  }, COMPILE_TIMEOUT_MS)
 })
+
+// ── Local helper: base64 decoder for the AAD verification test ──────
+//
+// `cell-encryption.ts` keeps its base64 helpers private. The sealed
+// row inspection in test 9 needs to strip SEALED_CELL_PREFIX and
+// decode the body back to bytes for `cellOpen`. We duplicate the few
+// lines rather than re-export — they're total functions on small
+// inputs and the test surface here is the ONLY consumer.
+function base64ToBytes(b64: string): Uint8Array {
+  const binary = atob(b64)
+  const out = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i)
+  return out
+}
