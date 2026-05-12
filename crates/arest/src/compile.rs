@@ -4928,7 +4928,14 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
     let inner_funcs: Vec<Func> = sm.transition_table.iter().map(|(_from, to, event_ft)| {
         let to_obj = Object::atom(to);
         let sm_noun_obj = Object::atom(&sm_noun);
-        let event_facts = extract_facts_from_pop(event_ft);
+        // transition_table stores the Fact Type's human-readable form
+        // (e.g. "Task is started") because that's the binding value in
+        // `Transition_is_triggered_by_Fact_Type`. Cell ids are the
+        // canonical underscore-separated form (e.g. "Task_is_started")
+        // — normalize spaces → underscores so the extractor reads the
+        // right cell.
+        let event_ft_canonical = event_ft.replace(' ', "_");
+        let event_facts = extract_facts_from_pop(&event_ft_canonical);
 
         // Per-fact extractor: filter the fact's binding pairs for
         // role_name == sm_noun, project to the value side. Mirrors
