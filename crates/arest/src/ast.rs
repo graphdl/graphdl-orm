@@ -2165,11 +2165,34 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
             // Sec-5: consult the capability stack. Under a user-scoped
             // frame (apply_with_caps or Func::Def with allowed_writes),
             // writes to cells outside the allow-list or to the
-            // protected metamodel set collapse to ⊥. Empty stack =
-            // system mode = unrestricted (preserves legacy apply()).
+            // protected metamodel set collapse to ⊥.
+            //
+            // #903 (A-17): the empty-stack case is cfg-gated. Under
+            // `feature = "no_std"` the kernel image keeps the legacy
+            // unrestricted behavior because init / boot / metamodel-
+            // load paths legitimately need to populate engine state
+            // before the capability system is in place (and there is
+            // no user-code threat surface in the kernel). Under
+            // `not(feature = "no_std")` (worker / host builds, which
+            // always link `std-deps`), an empty cap stack is refused —
+            // the bypass branch is replaced by the same Sec-5
+            // violation shape (`Object::Bottom`) the populated-frame
+            // out-of-allow-list path uses. Callers that legitimately
+            // need the legacy unrestricted behavior under std (test
+            // fixtures from before #903, gradual-migration islands)
+            // wrap themselves in `permissive_empty_caps_guard()` for
+            // the duration of the legacy block.
             match x.as_seq() {
                 Some(items) if items.len() == 3 => {
                     match items[0].as_atom() {
+                        // #903 — empty stack under std refuses by default.
+                        // no_std builds skip this branch entirely (the cfg
+                        // gates it out) so kernel boot paths keep the
+                        // unrestricted system-mode semantics.
+                        #[cfg(not(feature = "no_std"))]
+                        Some(_) if crate::declared_writes::cap_stack_is_empty()
+                            && !crate::declared_writes::is_permissive_empty_caps_mode() =>
+                            Object::Bottom,
                         // declared_writes is now no_std-reachable (#565);
                         // its no_std shim returns true unconditionally
                         // (kernel runs only compile-authored code, no
@@ -6833,6 +6856,11 @@ mod tests {
     #[test]
     fn store_via_func_apply() {
         // store:<"FILE", new_contents, D> via Func::Store
+        //
+        // #903: under std the empty-stack `Func::Store` is refused by
+        // default. This test documents the legacy unrestricted shape
+        // and runs under `permissive_empty_caps_guard()` to opt in.
+        let _g = crate::declared_writes::permissive_empty_caps_guard();
         let state = Object::seq(vec![
             cell("FILE", Object::atom("old")),
         ]);
@@ -8920,8 +8948,15 @@ mod tests {
     /// Baseline: with strict mode OFF (legacy behaviour) and no caps
     /// frame on the stack, `apply(Func::Store, …)` succeeds — preserves
     /// every existing engine path that writes via plain `apply()`.
+    ///
+    /// #903: under std the empty-stack `Func::Store` is refused by
+    /// default. This test documents the strict-OFF + permissive
+    /// composition: when both gates allow the empty-stack case,
+    /// the store succeeds. The `permissive_empty_caps_guard()`
+    /// opts in to the legacy unrestricted behavior.
     #[test]
     fn strict_off_empty_caps_permits_store() {
+        let _pg = crate::declared_writes::permissive_empty_caps_guard();
         let state = Object::Map(hashbrown::HashMap::new());
         let input = Object::seq(vec![
             Object::atom("any_cell"),
@@ -8933,7 +8968,7 @@ mod tests {
         assert_eq!(
             fetch("any_cell", &result),
             Object::atom("v"),
-            "strict OFF + empty caps must keep legacy unrestricted store",
+            "strict OFF + empty caps + permissive must keep legacy unrestricted store",
         );
     }
 
@@ -9065,5 +9100,98 @@ mod tests {
         }
         assert!(!crate::declared_writes::is_strict_store_mode(),
             "strict mode must restore to OFF after guard drop");
+    }
+
+    // ── #903: cfg-gate Func::Store empty-stack bypass on no_std ──────
+    //
+    // Security finding A-17 from #779. `Func::Store` with an empty
+    // capability stack writes unrestricted. That bypass is legitimate
+    // for kernel boot / init / metamodel-load (which run before the
+    // capability system exists) but it is the hole that defeats Sec-5's
+    // (#332) declared-writes enforcement when worker/host code paths
+    // forget to push a frame.
+    //
+    // The fix is structural: cfg-gate the empty-stack pass-through on
+    // `feature = "no_std"`. Kernel-only builds keep the unrestricted
+    // legacy behavior. Worker / host builds (which always link
+    // `std-deps`) reject empty-stack writes by default, the same way
+    // strict-mode (#815) does opt-in.
+
+    /// Kernel-cfg: under `feature = "no_std"`, `Func::Store` with an
+    /// empty capability stack writes the target cell. The kernel image
+    /// runs only compile-authored code; there is no user-code threat
+    /// surface there, so the empty-stack "system mode" remains in force.
+    #[cfg(feature = "no_std")]
+    #[test]
+    fn no_std_empty_caps_permits_func_store() {
+        let state = Object::Map(hashbrown::HashMap::new());
+        let input = Object::seq(vec![
+            Object::atom("init_cell"),
+            Object::atom("kernel-boot"),
+            state.clone(),
+        ]);
+        let result = apply(&Func::Store, &input, &state);
+        assert_eq!(
+            fetch("init_cell", &result),
+            Object::atom("kernel-boot"),
+            "no_std build: empty cap stack must remain unrestricted for kernel boot/init paths",
+        );
+    }
+
+    /// Worker-cfg: under default features (`std-deps`, i.e. worker /
+    /// host build), `Func::Store` with an empty capability stack is
+    /// REFUSED — collapses to ⊥, target cell is NOT written. This is
+    /// the production gate for A-17: any worker/host caller that
+    /// reaches `Func::Store` without an `apply_with_caps` frame or a
+    /// matching `allowed_writes:{name}` on a Func::Def is bypassing
+    /// Sec-5 and the apply pipeline must refuse them rather than write.
+    #[cfg(not(feature = "no_std"))]
+    #[test]
+    fn worker_empty_caps_refuses_func_store_and_leaves_cell_unwritten() {
+        let state = Object::Map(hashbrown::HashMap::new());
+        let input = Object::seq(vec![
+            Object::atom("some_cell"),
+            Object::atom("unauthorized"),
+            state.clone(),
+        ]);
+        let result = apply(&Func::Store, &input, &state);
+        assert_eq!(
+            result, Object::Bottom,
+            "worker/host build: empty cap stack must refuse Func::Store (Sec-5 #322); got {:?}",
+            result,
+        );
+        assert_eq!(
+            fetch("some_cell", &result),
+            Object::Bottom,
+            "worker/host build: rejected store must leave target cell unwritten",
+        );
+    }
+
+    /// Worker-cfg regression pin: under default features, `Func::Store`
+    /// with a non-empty capability stack (via `apply_with_caps`) passes
+    /// through normally. The cfg-gate at #903 only escalates the
+    /// EMPTY-stack case; populated frames still follow the established
+    /// Sec-5 rules (in-frame: succeeds; out-of-frame: ⊥). Protects
+    /// against an over-broad refactor that collapses every cap path.
+    #[cfg(not(feature = "no_std"))]
+    #[test]
+    fn worker_populated_caps_permits_func_store_inside_allow_list() {
+        let state = Object::Map(hashbrown::HashMap::new());
+        let input = Object::seq(vec![
+            Object::atom("my_cell"),
+            Object::atom("v"),
+            state.clone(),
+        ]);
+        let allowed: hashbrown::HashSet<String> =
+            ["my_cell".to_string()].into_iter().collect();
+        let result = crate::declared_writes::apply_with_caps(
+            &Func::Store, &input, &state, &allowed,
+        );
+        assert_eq!(
+            fetch("my_cell", &result),
+            Object::atom("v"),
+            "worker/host build: populated cap frame inside allow-list must still succeed; got {:?}",
+            result,
+        );
     }
 }

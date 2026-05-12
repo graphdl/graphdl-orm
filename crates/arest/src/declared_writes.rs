@@ -65,6 +65,27 @@ std::thread_local! {
     // scope that restores the previous flag on drop.
     static STRICT_STORE_MODE: core::cell::Cell<bool> =
         const { core::cell::Cell::new(false) };
+
+    // #903 — permissive-empty-caps flag (per-thread).
+    //
+    // Under std builds the empty-stack `Func::Store` is refused by
+    // default (security finding A-17 from #779). The kernel-side
+    // legitimate-bypass cases run under `cfg(feature = "no_std")` and
+    // there `is_store_allowed` is a hard-wired `true`. For std-side
+    // callers that still need the legacy unrestricted behavior — test
+    // fixtures from before #903, migration islands inside the compile
+    // pipeline that haven't yet been wired to push a `*` wildcard
+    // frame — this flag re-enables the bypass for the duration of a
+    // RAII guard. Use `permissive_empty_caps_guard()` for the scope;
+    // restoration on drop keeps the flag clean across thread-local
+    // boundaries.
+    //
+    // Default is `false`: the safe-by-default position is to refuse
+    // empty-stack writes. Any worker / host caller that hits the
+    // refusal in production needs to push a real cap frame, not
+    // toggle this flag.
+    static PERMISSIVE_EMPTY_CAPS_MODE: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
 }
 
 /// Push `allowed` onto the capability stack. Returned guard pops on drop.
@@ -142,6 +163,7 @@ fn is_protected_metamodel(cell: &str) -> bool {
 /// runs under the empty stack. Strict mode (#815) flips rule 1 so the
 /// gap surfaces as ⊥ at apply time; #816 closes the gap by emitting
 /// `allowed_writes:{name}` for every consequent kind in compile.rs.
+///
 #[cfg(not(feature = "no_std"))]
 pub fn is_store_allowed(cell: &str) -> bool {
     CAP_STACK.with(|s| {
@@ -157,6 +179,30 @@ pub fn is_store_allowed(cell: &str) -> bool {
             Some(frame) => frame.contains(cell),
         }
     })
+}
+
+/// True when the current capability stack is empty (no frame pushed).
+/// Used by the cfg-gated #903 refusal at the `Func::Store` dispatch
+/// site in `ast.rs` to distinguish "empty stack" (the A-17 bypass
+/// case from #779 — a hole that lets worker / host callers reach
+/// `Func::Store` without going through the Sec-5 capability check)
+/// from "populated stack" (which keeps going through
+/// `is_store_allowed`'s full decision lattice). Public so the
+/// dispatch site can layer the cfg gate over the strict-mode check.
+#[cfg(not(feature = "no_std"))]
+pub fn cap_stack_is_empty() -> bool {
+    CAP_STACK.with(|s| s.borrow().is_empty())
+}
+/// no_std build: kernel image has no cap stack — every store path is
+/// unrestricted by construction (no user-code threat surface). The
+/// dispatch site's cfg-gate is itself cfg'd out under no_std, so this
+/// shim only exists to keep the function name resolvable in shared
+/// header inclusions; it always reports "non-empty" so any caller that
+/// reaches it through error paths still flows down the permissive
+/// branch.
+#[cfg(feature = "no_std")]
+pub fn cap_stack_is_empty() -> bool {
+    false
 }
 
 // ── #815: Func::Store strict mode (per-thread) ───────────────────────
@@ -205,6 +251,54 @@ impl Drop for StrictStoreGuard {
     }
 }
 
+// ── #903: permissive-empty-caps escape hatch (per-thread) ────────────
+
+/// Set the permissive-empty-caps flag for the current thread.
+/// Returns the previous value so the caller can restore it (preferred
+/// via the `permissive_empty_caps_guard` RAII helper).
+///
+/// Worker / host (`not(feature = "no_std")`) builds refuse empty-stack
+/// `Func::Store` writes by default (#903). This flag re-enables the
+/// legacy unrestricted behavior for the narrow callers that still
+/// need it — test fixtures predating #903, gradual-migration islands
+/// in compile machinery — without flipping the global default.
+#[cfg(not(feature = "no_std"))]
+pub fn set_permissive_empty_caps_mode(on: bool) -> bool {
+    PERMISSIVE_EMPTY_CAPS_MODE.with(|c| {
+        let prev = c.get();
+        c.set(on);
+        prev
+    })
+}
+
+/// Read the current permissive-empty-caps flag for this thread.
+#[cfg(not(feature = "no_std"))]
+pub fn is_permissive_empty_caps_mode() -> bool {
+    PERMISSIVE_EMPTY_CAPS_MODE.with(|c| c.get())
+}
+
+/// RAII guard that sets `PERMISSIVE_EMPTY_CAPS_MODE` to `true` and
+/// restores the previous value on drop. Use this for any scope that
+/// needs the legacy unrestricted empty-stack behavior under std
+/// builds — exception-safe and nestable.
+#[cfg(not(feature = "no_std"))]
+pub fn permissive_empty_caps_guard() -> PermissiveEmptyCapsGuard {
+    let prev = set_permissive_empty_caps_mode(true);
+    PermissiveEmptyCapsGuard { prev }
+}
+
+/// Drop guard for `permissive_empty_caps_guard`. Restores the saved
+/// flag value on scope exit even if the protected body panics.
+#[cfg(not(feature = "no_std"))]
+pub struct PermissiveEmptyCapsGuard { prev: bool }
+
+#[cfg(not(feature = "no_std"))]
+impl Drop for PermissiveEmptyCapsGuard {
+    fn drop(&mut self) {
+        PERMISSIVE_EMPTY_CAPS_MODE.with(|c| c.set(self.prev));
+    }
+}
+
 // no_std build: strict mode is a no-op. The kernel image runs only
 // compile-authored code, so there's no user-code threat surface there
 // and `is_store_allowed` is already hard-wired to true.
@@ -218,6 +312,24 @@ pub fn strict_store_guard(_on: bool) -> StrictStoreGuard { StrictStoreGuard { pr
 pub struct StrictStoreGuard { prev: bool }
 #[cfg(feature = "no_std")]
 impl Drop for StrictStoreGuard {
+    fn drop(&mut self) { let _ = self.prev; }
+}
+
+// no_std build: permissive-empty-caps is a no-op for the same reason —
+// the kernel image has no user-code threat surface, so `is_store_allowed`
+// is hard-wired to true regardless of the flag.
+#[cfg(feature = "no_std")]
+pub fn set_permissive_empty_caps_mode(_on: bool) -> bool { false }
+#[cfg(feature = "no_std")]
+pub fn is_permissive_empty_caps_mode() -> bool { true }
+#[cfg(feature = "no_std")]
+pub fn permissive_empty_caps_guard() -> PermissiveEmptyCapsGuard {
+    PermissiveEmptyCapsGuard { prev: true }
+}
+#[cfg(feature = "no_std")]
+pub struct PermissiveEmptyCapsGuard { prev: bool }
+#[cfg(feature = "no_std")]
+impl Drop for PermissiveEmptyCapsGuard {
     fn drop(&mut self) { let _ = self.prev; }
 }
 
@@ -446,8 +558,14 @@ mod tests {
     /// Legacy apply (no caps pushed) must remain permissive — otherwise
     /// every existing caller that doesn't know about caps would regress.
     /// Empty capability stack = system mode = unrestricted.
+    ///
+    /// #903: under std builds the empty-stack `Func::Store` is refused
+    /// by default. Tests that documented the pre-#903 legacy semantics
+    /// run inside `permissive_empty_caps_guard()` so the legacy
+    /// behavior remains observable for callers that opt in.
     #[test]
     fn apply_without_caps_permits_all_stores() {
+        let _g = permissive_empty_caps_guard();
         let state = Object::Map(hashbrown::HashMap::new());
         let input = Object::seq(vec![
             Object::atom("Noun"),
@@ -458,15 +576,21 @@ mod tests {
         assert_eq!(
             ast::fetch("Noun", &result),
             Object::atom("anything"),
-            "apply() without caps must be unrestricted (system mode)",
+            "apply() without caps must be unrestricted (system mode) under permissive-empty-caps",
         );
     }
 
     /// Capability stack must pop on drop even when the body returns
     /// Bottom — otherwise an escape via early-return would leak caps
     /// to subsequent unrelated apply() calls on the same thread.
+    ///
+    /// #903: this test verifies the cap-stack pop semantics, not the
+    /// empty-stack write policy, so the legacy unrestricted behavior
+    /// is re-enabled via `permissive_empty_caps_guard()` for the
+    /// post-pop plain apply.
     #[test]
     fn caps_pop_after_apply_with_caps_returns() {
+        let _g = permissive_empty_caps_guard();
         let state = Object::Map(hashbrown::HashMap::new());
         let denied_input = Object::seq(vec![
             Object::atom("x"),
@@ -552,8 +676,14 @@ mod tests {
     /// that preserves legacy behavior for existing compiled defs, so
     /// the established test baseline doesn't regress. Caps only apply
     /// when the def record explicitly declares them.
+    ///
+    /// #903: under std the empty-stack body store is refused by
+    /// default; this test re-enables the legacy unrestricted behavior
+    /// via `permissive_empty_caps_guard()` so the pre-#903 baseline
+    /// is still observable for callers that opt in.
     #[test]
     fn def_without_allowed_writes_is_unrestricted() {
+        let _g = permissive_empty_caps_guard();
         let body = Func::Compose(
             Box::new(Func::Store),
             Box::new(Func::construction(vec![
@@ -568,7 +698,7 @@ mod tests {
         assert_eq!(
             ast::fetch("Noun", &result),
             Object::atom("x"),
-            "legacy defs (no allowed_writes cell) must be unrestricted"
+            "legacy defs (no allowed_writes cell) must be unrestricted under permissive-empty-caps"
         );
     }
 
