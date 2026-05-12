@@ -2181,6 +2181,40 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         ]))));
     }
 
+    // #905/task-740 follow-up: emit `SyntheticDerivedCells` meta cell
+    // listing the cells synthetic derivations (`_sm_init_*`,
+    // `_sm_event_fold_*`) write into. The LFP-per-request drop logic
+    // (cli/entry.rs:810) reads this alongside the DerivationRule cell's
+    // `consequentFactTypeId` field — user rules contribute via the
+    // latter; synthetic rules via this cell. No hand-curated cell list
+    // in dispatch logic. Future synthetic rule kinds extend this cell
+    // by appending their consequents at the same point.
+    //
+    // SM init and event-fold both emit to the same three cells:
+    // StateMachine_has_instanceOf / _currentlyInStatus / _forResource.
+    // Emit the constants only when at least one SM exists in the
+    // compiled model — apps without SMs get an empty registry (no
+    // cells to drop, no work for the dispatcher).
+    if !model.state_machines.is_empty() {
+        let sm_cell_names = [
+            "StateMachine_has_instanceOf",
+            "StateMachine_has_currentlyInStatus",
+            "StateMachine_has_forResource",
+        ];
+        let entries: Vec<crate::ast::Object> = sm_cell_names.iter()
+            .map(|name| crate::ast::Object::seq(vec![
+                crate::ast::Object::seq(vec![
+                    crate::ast::Object::atom("name"),
+                    crate::ast::Object::atom(name),
+                ]),
+            ]))
+            .collect();
+        defs.push((
+            "SyntheticDerivedCells".to_string(),
+            Func::constant(crate::ast::Object::Seq(entries.into())),
+        ));
+    }
+
     // Algebraic rewrite pass (Backus Â§12). Normalize every emitted Func
     // to its smallest equivalent form before it enters D. Rewrites are
     // observational equivalences, so runtime semantics are unchanged;

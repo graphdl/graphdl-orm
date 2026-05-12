@@ -818,6 +818,31 @@ pub fn main_entry() {
                             if !cell_name.is_empty() { out.insert(cell_name); }
                         }
                     }
+                    // #905/task-740: synthetic-rule consequents (SM init,
+                    // SM event-fold, etc.) declared in
+                    // SyntheticDerivedCells meta cell from compile.rs.
+                    // User rules contribute via DerivationRule above;
+                    // synthetic rules via this cell. No hand-curated
+                    // list in the dispatcher.
+                    //
+                    // The cell is emitted via `defs.push(..., Func::constant(seq))`
+                    // which `func_to_object` stores as a 2-elem Seq
+                    // `<atom("'"), seq_of_entries>` — the FFP const-fn
+                    // wrapper. Unwrap the wrapper before iterating.
+                    let synth_cell = ast::fetch_or_phi("SyntheticDerivedCells", &d);
+                    let synth_entries = synth_cell.as_seq()
+                        .and_then(|items| {
+                            if items.len() == 2 && items[0].as_atom() == Some("'") {
+                                items[1].as_seq().map(|s| s.to_vec())
+                            } else {
+                                Some(items.to_vec())
+                            }
+                        })
+                        .unwrap_or_default();
+                    for fact in synth_entries.iter() {
+                        let Some(name) = ast::binding(fact, "name") else { continue };
+                        if !name.is_empty() { out.insert(name.to_string()); }
+                    }
                     out
                 };
                 let d = if derived_cells.is_empty() { d } else {
