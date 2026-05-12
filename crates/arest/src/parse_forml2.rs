@@ -316,14 +316,19 @@ fn is_entity_ref_scheme_literal(clause: &str, noun_names: &[String]) -> bool {
 /// invariant.
 fn is_subtype_instance_check(clause: &str, noun_names: &[String]) -> bool {
     let trimmed = clause.trim();
-    let table = crate::parse_forml2_stage2::SubtypeInstanceCheckTable::boot();
-    table.iter().any(|kw| {
-        let Some(idx) = trimmed.find(kw) else { return false; };
-        let lhs = trimmed[..idx].trim();
-        let rhs = trimmed[idx + kw.len()..].trim();
-        let is_noun = |s: &str| noun_names.iter().any(|n| n == s);
-        is_noun(lhs) && is_noun(rhs)
-    })
+    // Chained-temporary form: the `Table::boot()` temporary lives
+    // to end-of-statement so the iterator's borrow of `rows` is
+    // valid across the `.any(...)` closure. Mirrors the sibling
+    // lifts in is_range_filter_clause / is_word_comparator_clause —
+    // a named local would trip the drop-order check (E0597).
+    crate::parse_forml2_stage2::SubtypeInstanceCheckTable::boot()
+        .iter().any(|kw| {
+            let Some(idx) = trimmed.find(kw) else { return false; };
+            let lhs = trimmed[..idx].trim();
+            let rhs = trimmed[idx + kw.len()..].trim();
+            let is_noun = |s: &str| noun_names.iter().any(|n| n == s);
+            is_noun(lhs) && is_noun(rhs)
+        })
 }
 
 /// True when `clause` uses a word-based comparator
