@@ -14,6 +14,8 @@ It is forbidden that a Constraint of Constraint Type 'UC' spans fewer Roles than
 
 It is obligatory that when a Fact Type has exactly two Roles that both reference the same Noun, some Constraint of Constraint Type 'IR', 'AS', 'AT', 'SY', 'IT', 'TR', or 'AC' spans those Roles.
 
+It is permitted that a Fact Type has no Constraint of Constraint Type 'IR', 'AS', 'AT', 'SY', 'IT', 'TR', or 'AC' spanning its Roles when the Reading of that Fact Type contains a capitalized-word-prefixed form of its Ring Noun, or when some Noun ending in that Ring Noun is declared elsewhere in the corpus. The two conditions reflect compound-noun parse-time artifacts (eu-law `Personal Data Breach … Personal Data` and Biometric/Genetic/Personal Data sharing the `Data` suffix) and are read by `check_ring_completeness` to suppress ring-completeness hints; without them, the corpus surfaces 9 false-positive ring hints. The permission text is the source of truth for the suppression patterns — `check.rs` reads the Permission cell and applies the named pattern matchers; deleting either condition here re-enables the corresponding suppression layer to drop out of the check.
+
 ### Ring Constraint Validity
 
 It is forbidden that a Constraint of Constraint Type 'IR', 'AS', 'AT', 'SY', 'IT', 'TR', or 'AC' spans Roles of a Fact Type where those Roles reference different Nouns.

@@ -289,12 +289,16 @@ fn check_ring_validity(state: &Object) -> Vec<ReadingDiagnostic> {
 /// quotes `found[1].2` verbatim and `Data` at the end has no
 /// surviving prefix text after the match), and the check fires.
 ///
-/// Suppression heuristic: if the stored reading contains the pattern
-/// `<CapitalizedWord> <ring_noun>` anywhere, at least one role
-/// originally resolved to a compound noun ending in ring_noun —
-/// treat the ring detection as a parse-time artifact and stay quiet.
-/// Reproduces the 9 false positives from the FORML sibling agent's
-/// run against the eu-law corpus.
+/// Suppression patterns are now read from the `Constraint` cell as a
+/// `permitted` deontic permission (see `readings/core/validation.md`
+/// ` It is permitted that a Fact Type has no Constraint … when the
+/// Reading … contains a capitalized-word-prefixed form of its Ring
+/// Noun, or when some Noun ending in that Ring Noun is declared
+/// elsewhere in the corpus.`). `RingCompletenessSuppression::from_state`
+/// reads the permission and enables the two pattern matchers
+/// accordingly; if no permission is registered (e.g. a bare
+/// `check_readings(user_text)` call with no metamodel context) it
+/// falls back to `boot()` which preserves the legacy behaviour.
 fn check_ring_completeness(state: &Object) -> Vec<ReadingDiagnostic> {
     let ft_cell = fetch_or_phi("FactType", state);
     let role_cell = fetch_or_phi("Role", state);
@@ -304,6 +308,7 @@ fn check_ring_completeness(state: &Object) -> Vec<ReadingDiagnostic> {
             .filter_map(|n| binding(n, "name").map(|s| s.to_string()))
             .collect())
         .unwrap_or_default();
+    let suppression = RingCompletenessSuppression::from_state(state);
 
     ft_cell.as_seq()
         .map(|fts| fts.iter().filter_map(|ft| {
@@ -318,31 +323,14 @@ fn check_ring_completeness(state: &Object) -> Vec<ReadingDiagnostic> {
             (roles.len() == 2 && roles[0] == roles[1]).then_some(())?;
             let ring_noun = roles[0];
 
-            // Suppression layer 1: the stored reading still contains a
-            // `<Capitalized> <ring_noun>` pair (e.g. "Personal Data"
-            // surviving at the end of a reading whose first role
-            // prefix was stripped). Evidence of a compound noun that
-            // the parse-time noun list was missing.
+            // Suppression read from the validation.md permission. Each
+            // enabled pattern matcher gets a chance to suppress; ring
+            // hints are advisory and false positives from tokenization
+            // are strictly worse than a missed hint.
             let reading = binding(ft, "reading").unwrap_or("");
-            let has_compound_prefix = text_contains_capitalized_prefixed(reading, ring_noun);
-            // Suppression layer 2: a compound noun ending in ring_noun
-            // is declared elsewhere in the corpus (e.g. "Biometric
-            // Data" in eu-law). Even if this FT's stored reading has
-            // lost every prefix to parse_fact's role-capture rebuild,
-            // the presence of such a compound makes the ring reading
-            // ambiguous enough to suppress — ring hints are advisory
-            // and false positives from tokenization are strictly
-            // worse than a missed hint.
-            let compound_noun_declared = noun_names.iter().any(|n| {
-                let suffix = match ring_noun.is_empty() {
-                    true => false,
-                    false => n.ends_with(ring_noun)
-                        && n.len() > ring_noun.len()
-                        && n.as_bytes()[n.len() - ring_noun.len() - 1] == b' ',
-                };
-                suffix
-            });
-            (!has_compound_prefix && !compound_noun_declared).then_some(())?;
+            if suppression.suppresses(reading, ring_noun, &noun_names) {
+                return None;
+            }
 
             let has_ring = constraint_cell.as_seq()
                 .map(|cs| cs.iter().any(|c|
@@ -368,13 +356,110 @@ fn check_ring_completeness(state: &Object) -> Vec<ReadingDiagnostic> {
         .unwrap_or_default()
 }
 
+/// #865: ring-completeness suppression as a typed table, read from the
+/// `Constraint` cell as a `permitted` deontic permission declared in
+/// `readings/core/validation.md`. Replaces the hand-rolled byte-walker
+/// and inline suppression layers in `check_ring_completeness`.
+///
+/// Two pattern matchers compose into the suppression. The cell text
+/// names each matcher via a sentinel substring; `from_state` enables
+/// the matcher iff the corresponding permission constraint is present
+/// in the cell. The `boot()` variant enables both — preserving the
+/// legacy behaviour for callers that parse raw user text without the
+/// metamodel context (so the historic compound-noun suppression keeps
+/// working in `check_readings(user_text)`).
+///
+/// Future patterns: extend `RingCompletenessSuppression`, add another
+/// sentinel substring + matcher, and add another `It is permitted that
+/// … <new-sentinel> …` reading. No Rust change to `check_ring_completeness`.
+#[derive(Debug, Clone)]
+struct RingCompletenessSuppression {
+    /// Pattern: the stored FT reading contains a `<Capitalized>
+    /// <ring_noun>` pair — evidence that at least one role was a
+    /// compound noun the parser's longest-first noun matcher missed.
+    match_capitalized_prefix: bool,
+    /// Pattern: a noun ending in `<ring_noun>` is declared elsewhere —
+    /// e.g. `Biometric Data` next to `Data(.id)`. The corpus-wide
+    /// ambiguity is enough to suppress the ring hint.
+    match_compound_suffix_declared: bool,
+}
+
+/// Sentinel substrings the permission text MUST contain for each
+/// pattern matcher to be enabled. Kept in sync with the prose in
+/// `readings/core/validation.md` § "Ring Constraint Completeness".
+const SENTINEL_CAPITALIZED_PREFIX: &str = "capitalized-word-prefixed";
+const SENTINEL_COMPOUND_SUFFIX:    &str = "ending in";
+
+impl RingCompletenessSuppression {
+    /// Legacy fallback — both pattern matchers enabled. Matches the
+    /// hand-coded behaviour before #865 and keeps `check_readings`
+    /// working when the input does not carry the validation.md
+    /// permission constraint.
+    fn boot() -> Self {
+        RingCompletenessSuppression {
+            match_capitalized_prefix: true,
+            match_compound_suffix_declared: true,
+        }
+    }
+
+    /// Read suppression patterns from the `Constraint` cell. A `permitted`
+    /// deontic constraint whose text carries the sentinel substring for a
+    /// pattern enables that matcher. When no permitted-modality ring
+    /// suppression constraints are present in the cell at all, fall back
+    /// to `boot()` so legacy callers without the metamodel context
+    /// continue to behave as before.
+    fn from_state(state: &Object) -> Self {
+        let constraint_cell = fetch_or_phi("Constraint", state);
+        let perm_texts: Vec<&str> = constraint_cell.as_seq()
+            .map(|cs| cs.iter()
+                .filter(|c| binding(c, "deonticOperator") == Some("permitted"))
+                .filter_map(|c| binding(c, "text"))
+                // Restrict to the ring-completeness family: every
+                // permission in this family mentions ring constraints
+                // in its body.
+                .filter(|t| t.contains("Constraint Type 'IR'"))
+                .collect())
+            .unwrap_or_default();
+        if perm_texts.is_empty() {
+            return Self::boot();
+        }
+        RingCompletenessSuppression {
+            match_capitalized_prefix:
+                perm_texts.iter().any(|t| t.contains(SENTINEL_CAPITALIZED_PREFIX)),
+            match_compound_suffix_declared:
+                perm_texts.iter().any(|t| t.contains(SENTINEL_COMPOUND_SUFFIX)),
+        }
+    }
+
+    /// True iff some enabled pattern matcher fires on the
+    /// `(reading, ring_noun, declared_nouns)` triple. The two matchers
+    /// implement the prose in `readings/core/validation.md`:
+    ///   1. `match_capitalized_prefix` — reading contains
+    ///      `<Capitalized word> <ring_noun>`.
+    ///   2. `match_compound_suffix_declared` — some declared noun ends
+    ///      in ` <ring_noun>`.
+    fn suppresses(&self, reading: &str, ring_noun: &str, nouns: &[String]) -> bool {
+        if ring_noun.is_empty() { return false; }
+        if self.match_capitalized_prefix
+            && reading_contains_capitalized_prefix(reading, ring_noun)
+        {
+            return true;
+        }
+        if self.match_compound_suffix_declared
+            && nouns.iter().any(|n| noun_ends_with_space_target(n, ring_noun))
+        {
+            return true;
+        }
+        false
+    }
+}
+
 /// True iff `text` contains an occurrence of `target` that is
 /// immediately preceded by a Capitalized word (ASCII uppercase
 /// followed by at least one lowercase letter) and a single space.
-/// Used by `check_ring_completeness` to detect compound-noun
-/// false positives without needing the parser to have accumulated
-/// the compound declaration.
-fn text_contains_capitalized_prefixed(text: &str, target: &str) -> bool {
+/// Implements the `match_capitalized_prefix` pattern declared in
+/// `readings/core/validation.md`.
+fn reading_contains_capitalized_prefix(text: &str, target: &str) -> bool {
     if target.is_empty() { return false; }
     let bytes = text.as_bytes();
     let target_bytes = target.as_bytes();
@@ -388,16 +473,11 @@ fn text_contains_capitalized_prefixed(text: &str, target: &str) -> bool {
         // and followed by ASCII lowercase — a Capitalized word token.
         let prefixed = start >= 2 && bytes[start - 1] == b' '
             && {
-                // Walk back to the preceding space (or start of text) to
-                // isolate the word immediately before the target.
                 let word_end = start - 1;
                 let mut word_start = word_end;
                 while word_start > 0 && bytes[word_start - 1] != b' ' {
                     word_start -= 1;
                 }
-                // The preceding word is bytes[word_start..word_end].
-                // It must start with an uppercase ASCII letter and
-                // contain at least one lowercase ASCII letter.
                 let word = &bytes[word_start..word_end];
                 !word.is_empty()
                     && word[0].is_ascii_uppercase()
@@ -408,6 +488,17 @@ fn text_contains_capitalized_prefixed(text: &str, target: &str) -> bool {
         if pos >= text.len() { break; }
     }
     false
+}
+
+/// True iff `n` ends with ` <target>` — i.e. `<target>` is the bare
+/// last word of a compound noun. Implements the
+/// `match_compound_suffix_declared` pattern declared in
+/// `readings/core/validation.md`.
+fn noun_ends_with_space_target(n: &str, target: &str) -> bool {
+    !target.is_empty()
+        && n.ends_with(target)
+        && n.len() > target.len()
+        && n.as_bytes()[n.len() - target.len() - 1] == b' '
 }
 
 /// MC4b (#751): the singular-naming heuristic ("noun looks like a
@@ -976,28 +1067,84 @@ Customer wrote Review.
     }
 
     #[test]
-    fn text_contains_capitalized_prefixed_only_fires_on_compound_nouns() {
+    fn reading_contains_capitalized_prefix_only_fires_on_compound_nouns() {
         // Positive: "Personal Data" has "Personal" as capitalized prefix.
-        assert!(super::text_contains_capitalized_prefixed(
+        assert!(super::reading_contains_capitalized_prefix(
             "Data is processed in manner that ensures appropriate security of Personal Data",
             "Data",
         ));
         // Negative: "Data or Data" — "or" is lowercase, no compound.
-        assert!(!super::text_contains_capitalized_prefixed("Data or Data", "Data"));
+        assert!(!super::reading_contains_capitalized_prefix("Data or Data", "Data"));
         // Negative: "Monitoring Body takes Monitoring Body" — `takes` is lowercase.
-        assert!(!super::text_contains_capitalized_prefixed(
+        assert!(!super::reading_contains_capitalized_prefix(
             "Monitoring Body takes Monitoring Body",
             "Monitoring Body",
         ));
         // Negative: "Data Subject where Data Subject" — `where` is lowercase.
-        assert!(!super::text_contains_capitalized_prefixed(
+        assert!(!super::reading_contains_capitalized_prefix(
             "Data Subject where Data Subject",
             "Data Subject",
         ));
         // Negative: an acronym like "GDPR Data" — "GDPR" has no lowercase
         // letters, so it doesn't count as a "Capitalized word" for our
         // compound-noun heuristic.
-        assert!(!super::text_contains_capitalized_prefixed("GDPR Data processes Data", "Data"));
+        assert!(!super::reading_contains_capitalized_prefix("GDPR Data processes Data", "Data"));
+    }
+
+    /// #865: the ring-completeness suppression now reads its pattern
+    /// matchers from the `Constraint` cell as a `permitted` deontic
+    /// permission declared in `readings/core/validation.md`. This pin
+    /// asserts the read-from-cell mechanism is wired in three ways:
+    ///
+    ///   1. With no permission in the cell, `from_state` falls back to
+    ///      `boot()` (both matchers enabled) so legacy `check_readings`
+    ///      callers without metamodel context keep working.
+    ///   2. A synthesised state with ONLY the capitalized-prefix
+    ///      sentinel enables JUST that matcher (compound-suffix matcher
+    ///      stays disabled) — proves the cell-text drives selection.
+    ///   3. The validation.md-loaded metamodel state has the permission
+    ///      registered: `from_state` enables both matchers from the cell
+    ///      rather than via the boot fallback.
+    #[test]
+    fn ring_completeness_suppression_reads_pattern_set_from_permission_cell() {
+        use crate::ast::{Object, fact_from_pairs, cell_push};
+
+        // (1) Empty state → boot fallback: both matchers enabled.
+        let empty = Object::phi();
+        let s0 = super::RingCompletenessSuppression::from_state(&empty);
+        assert!(s0.match_capitalized_prefix && s0.match_compound_suffix_declared,
+            "empty state must fall back to boot() with both matchers enabled");
+
+        // (2) Synthesized Constraint cell with ONLY a capitalized-prefix
+        // permission. The compound-suffix sentinel ("ending in") is
+        // absent from the text, so that matcher must stay off — proving
+        // the suppression flags really come from the cell, not from a
+        // hardcoded Rust default.
+        let perm = fact_from_pairs(&[
+            ("id",               "test-perm-cap-only"),
+            ("kind",             "UC"),
+            ("modality",         "deontic"),
+            ("deonticOperator",  "permitted"),
+            ("text",             "It is permitted that a Fact Type has no Constraint of Constraint Type 'IR', 'AS', 'AT', 'SY', 'IT', 'TR', or 'AC' spanning its Roles when the Reading contains a capitalized-word-prefixed form of its Ring Noun."),
+        ]);
+        let synth = cell_push("Constraint", perm, &Object::phi());
+        let s1 = super::RingCompletenessSuppression::from_state(&synth);
+        assert!( s1.match_capitalized_prefix,
+            "capitalized-prefix sentinel in cell text must enable that matcher");
+        assert!(!s1.match_compound_suffix_declared,
+            "missing 'ending in' sentinel must leave compound-suffix matcher off; got {:?}", s1);
+
+        // (3) End-to-end: parse the bundled metamodel corpus (which
+        // includes readings/core/validation.md) and confirm the
+        // Constraint cell carries a permission that enables BOTH
+        // matchers via `from_state`. This proves the round-trip:
+        // validation.md → translate_deontic_constraints → Constraint
+        // cell → RingCompletenessSuppression::from_state.
+        let metamodel_state = parse_to_state(&crate::metamodel_corpus())
+            .expect("metamodel must parse");
+        let s2 = super::RingCompletenessSuppression::from_state(&metamodel_state);
+        assert!(s2.match_capitalized_prefix && s2.match_compound_suffix_declared,
+            "validation.md permission must populate the Constraint cell so both matchers enable; got {:?}", s2);
     }
 
     /// #750 — parser-level fix for the compound-noun problem. When a
