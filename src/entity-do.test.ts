@@ -387,12 +387,13 @@ describe('entity-do (cell model)', () => {
       expect((threw as Error).message).toContain('TENANT_MASTER_SEED')
     })
 
-    it('allows the legacy plaintext path when AREST_ALLOW_PLAINTEXT="1" and not production', async () => {
+    it('allows the legacy plaintext branch when AREST_ALLOW_PLAINTEXT="1" and not production', async () => {
       // The dev-only escape hatch. With both gates open (no
       // ENVIRONMENT=production, AREST_ALLOW_PLAINTEXT='1'),
-      // getMaster() returns null and callers use the plaintext SQL
-      // helpers. This must keep working so a stripped-down local
-      // Worker without secret plumbing remains runnable.
+      // getMaster() returns null and EntityDB.put runs without
+      // throwing. Read-back round-trips through the engine-only
+      // path (in-memory cell graph cache under vitest's apply-panic
+      // gap, engine `fetch_cell` on live workers).
       const db = makeEntityDB({ AREST_ALLOW_PLAINTEXT: '1' })
       const stored = await db.put({
         id: 'cust-1',
@@ -404,10 +405,16 @@ describe('entity-do (cell model)', () => {
       expect(fetched?.data.name).toBe('Alice')
     })
 
-    it('uses the sealed path when TENANT_MASTER_SEED is bound', async () => {
+    it('proceeds through the master-bound branch when TENANT_MASTER_SEED is bound (engine-only IO, #885)', async () => {
       // The production happy path. With the seed bound, the DO
-      // derives a per-tenant master and writes seal-prefixed bytes
-      // — the legacy plaintext escape hatch is irrelevant.
+      // derives a per-tenant master and routes the put through
+      // `writeCellThroughEngine`. Post-#885 the worker no longer
+      // writes the sealed envelope to the SQL `cell` table — the
+      // engine's chain is the version-of-record and the worker's
+      // in-memory cell graph mirrors the engine view. The seal
+      // prefix verification this test used to perform against the
+      // SQL row is now covered by `entity-do-engine-roundtrip.test.ts`
+      // test 9 against the address-level AAD helpers (engine-only).
       const db = makeEntityDB({
         TENANT_MASTER_SEED: 'this-is-a-test-seed-not-a-real-secret-32b!',
       })
@@ -417,13 +424,10 @@ describe('entity-do (cell model)', () => {
         data: { name: 'Bob' },
       })
       expect(stored.data.name).toBe('Bob')
-      // The persisted row's `data` column must be the sealed envelope,
-      // not raw JSON — proves we took the encrypted branch.
+      // SQL cell table stays empty — the engine-only IO contract.
       const sql = (db as any).ctx.storage.sql as ReturnType<typeof createMockSql>
-      const row = (sql.tables['cell'] || [])[0]
-      expect(typeof row.data).toBe('string')
-      expect((row.data as string).startsWith(SEALED_CELL_PREFIX)).toBe(true)
-      // And reading back round-trips through the sealed path cleanly.
+      expect(sql.tables['cell'] ?? []).toHaveLength(0)
+      // Read-back round-trips through the engine-only path.
       const fetched = await db.get()
       expect(fetched?.data.name).toBe('Bob')
     })
@@ -494,12 +498,15 @@ describe('entity-do (cell model)', () => {
       expect(sql.tables['cell'] ?? []).toHaveLength(0)
     })
 
-    it('dev with AREST_ALLOW_PLAINTEXT=1 permits plaintext mode', async () => {
+    it('dev with AREST_ALLOW_PLAINTEXT=1 permits the plaintext branch (engine-only IO, #885)', async () => {
       // The dev escape hatch is intentionally preserved so a local
       // worker without secret plumbing remains runnable. With the
       // dual gate open (non-prod ENVIRONMENT + AREST_ALLOW_PLAINTEXT
-      // == '1'), getMaster() returns null and the write succeeds via
-      // the plaintext SQL helpers. Read-back round-trips cleanly.
+      // == '1'), getMaster() returns null and the write proceeds
+      // through the engine-only path. Post-#885 there is no SQL
+      // `cell` row written — the engine's chain is the version-of-
+      // record and the worker's in-memory cell graph carries the
+      // payload within the isolate.
       const db = makeEntityDB({ AREST_ALLOW_PLAINTEXT: '1' })
       const stored = await db.put({
         id: 'c-902-dev',
@@ -509,22 +516,19 @@ describe('entity-do (cell model)', () => {
       expect(stored.id).toBe('c-902-dev')
       const fetched = await db.get()
       expect(fetched?.data.name).toBe('Mallory')
-      // Belt-and-braces: nothing in the persisted row should look
-      // like the sealed envelope — we genuinely took the plaintext
-      // branch, not a silent seal under a default key.
+      // No SQL `cell` row — the engine-only IO contract (#885).
       const sql = (db as any).ctx.storage.sql as ReturnType<typeof createMockSql>
-      const row = (sql.tables['cell'] || [])[0]
-      expect(typeof row.data === 'string'
-        ? (row.data as string).startsWith(SEALED_CELL_PREFIX)
-        : false).toBe(false)
+      expect(sql.tables['cell'] ?? []).toHaveLength(0)
     })
 
-    it('getMaster with TENANT_MASTER_SEED set returns the master normally', async () => {
+    it('getMaster with TENANT_MASTER_SEED set proceeds normally (engine-only IO, #885)', async () => {
       // Happy-path regression: a bound seed must continue to derive
-      // a per-tenant master and route writes through the sealed
-      // envelope. If a future refactor of the dual-gate accidentally
-      // shorts this branch (e.g. an over-eager throw), this test
-      // catches it.
+      // a per-tenant master and the put must proceed through the
+      // engine-only path without throwing. Post-#885 the SQL `cell`
+      // row no longer carries a sealed envelope (engine chain is the
+      // version-of-record), so the seal-prefix verification this
+      // test used to perform against the SQL row has moved to the
+      // address-level AAD helpers in entity-do-engine-roundtrip.test.ts.
       const db = makeEntityDB({
         TENANT_MASTER_SEED: 'a-9-closure-seed-#902-not-a-real-secret-32b!',
         ENVIRONMENT: 'production',
@@ -535,12 +539,9 @@ describe('entity-do (cell model)', () => {
         data: { name: 'Carol' },
       })
       expect(stored.data.name).toBe('Carol')
-      // The persisted row is the sealed envelope — proves we took
-      // the encrypted branch, not the plaintext fallback.
+      // No SQL `cell` row — the engine-only IO contract (#885).
       const sql = (db as any).ctx.storage.sql as ReturnType<typeof createMockSql>
-      const row = (sql.tables['cell'] || [])[0]
-      expect(typeof row.data).toBe('string')
-      expect((row.data as string).startsWith(SEALED_CELL_PREFIX)).toBe(true)
+      expect(sql.tables['cell'] ?? []).toHaveLength(0)
       const fetched = await db.get()
       expect(fetched?.data.name).toBe('Carol')
     })
@@ -582,48 +583,48 @@ describe('entity-do (cell model)', () => {
       return db
     }
 
-    it('round-trips a sealed cell through the master-bound get path', async () => {
-      // Pin the happy path: write a sealed cell, read it back, confirm
-      // the AEAD round-trip closes. Mirrors the lifecycle test above
-      // but lives in the #888 describe block so the regression check
-      // is co-located with the fail-loud assertions.
+    it('round-trips a cell through the master-bound put/get path (engine-only IO, #885)', async () => {
+      // Pin the happy path: write a cell with master bound, read it
+      // back, confirm the round-trip closes. Post-#885 the SQL `cell`
+      // table stays empty — the engine's chain is the version-of-
+      // record and the worker's in-memory cell graph mirrors the
+      // engine view for read-after-write.
       const db = makeEntityDB({
         TENANT_MASTER_SEED: 'sealed-cell-round-trip-seed-#888',
       })
       await db.put({ id: 'ord-888', type: 'Order', data: { status: 'open', total: '42' } })
       const sql = (db as any).ctx.storage.sql as ReturnType<typeof createMockSql>
-      const row = (sql.tables['cell'] || [])[0]
-      expect((row.data as string).startsWith(SEALED_CELL_PREFIX)).toBe(true)
+      expect(sql.tables['cell'] ?? []).toHaveLength(0)
       const fetched = await db.get()
       expect(fetched).not.toBeNull()
       expect(fetched!.data.status).toBe('open')
       expect(fetched!.data.total).toBe('42')
     })
 
-    it('throws when the master is bound but the row has no SEALED_CELL_PREFIX', async () => {
-      // Simulate a corrupt/legacy row that bypassed `storeCellSealed`
-      // (e.g. a pre-#660 plaintext write, an operator manually mucking
-      // with the SQL, or a future codec change that forgot to migrate).
-      // Pre-#888 the worker silently parsed `data` as JSON and returned
-      // a CellContents — leaking plaintext from a supposedly-encrypted
-      // store. After #888 the read must throw, naming the broken cell
-      // so the operator can investigate.
-      const db = makeEntityDB({
-        TENANT_MASTER_SEED: 'sealed-cell-fail-loud-seed-#888',
-      })
-      const sql = (db as any).ctx.storage.sql as ReturnType<typeof createMockSql>
+    it('fetchCellSealed throws when a hand-seeded SQL row lacks SEALED_CELL_PREFIX (legacy helper contract preserved, #888)', async () => {
+      // The fail-loud contract on `fetchCellSealed` is preserved for
+      // direct callers (rotation, AEAD-aware tooling) even though the
+      // productive EntityDB.put/get path no longer writes/reads SQL
+      // (#885). We drive the helper directly here so the regression
+      // pin survives the engine-only collapse — a future caller that
+      // reaches `fetchCellSealed` on a non-sealed row must still
+      // throw naming the cell, not silently surface plaintext.
+      const sql = createMockSql()
       // Hand-seed a plaintext row: bypasses storeCellSealed entirely.
       sql.exec(
         `INSERT OR REPLACE INTO cell (id, type, data) VALUES (?, ?, ?)`,
         'corrupt-1', 'Customer', JSON.stringify({ name: 'PlainAlice' }),
       )
+      const { fetchCellSealed } = await import('./entity-do')
+      const { deriveTenantMasterKey } = await import('./cell-encryption')
+      const master = await deriveTenantMasterKey('sealed-cell-fail-loud-seed-#888', 'tenant-888')
       let threw: unknown = null
       try {
-        await db.get()
+        await fetchCellSealed(sql, master, -1)
       } catch (e) {
         threw = e
       }
-      expect(threw, 'master-bound read of a plaintext row must throw').toBeInstanceOf(Error)
+      expect(threw, 'fetchCellSealed of a plaintext row must throw').toBeInstanceOf(Error)
       const msg = (threw as Error).message
       // Must name the affected cell so the operator can locate it.
       expect(msg).toContain('corrupt-1')

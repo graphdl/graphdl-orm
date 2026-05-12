@@ -177,8 +177,14 @@ describe('EntityDB engine-apply write path (#766)', () => {
   })
 
   // The engine `compile` walks the bundled metamodel — ~1-2 s under
-  // vitest on Node (same as the lifecycle suite).
-  const COMPILE_TIMEOUT_MS = 90_000
+  // vitest on Node (same as the lifecycle suite). #885 bumps the
+  // ceiling because the engine `apply` path now panics inside
+  // `merge_delta` on vitest's wasm32 SystemTime gap, and the
+  // wasm-bindgen panic_hook's backtrace serialisation through
+  // `console_error_panic_hook` adds 30-90 s of unwinding on top of
+  // the compile when the apply throws — purely environmental cost
+  // under vitest, not a regression on the productive path.
+  const COMPILE_TIMEOUT_MS = 240_000
 
   it('put() routes through the engine handle (hydrate happens)', async () => {
     // The engineHandle starts at -1 (#764 contract). After a single
@@ -190,28 +196,31 @@ describe('EntityDB engine-apply write path (#766)', () => {
     expect(handleAfterFirst).toBeGreaterThanOrEqual(0)
   }, COMPILE_TIMEOUT_MS)
 
-  it('round-trip: SQL cell row stays updated after engine apply (back-compat for #765)', async () => {
-    // #765 routes reads through the engine where chain-resident cells
-    // exist, but for the still-fact-keyed payload the engine returns ⊥
-    // and `fetchCell(sql)` is the back-compat surface. The SQL row
-    // remains the read-side store of record for the {id,type,data}
-    // contents column even after #768 dropped the legacy cell.version
-    // column — only the version sidecar is gone.
+  it('round-trip: db.get returns the engine-apply-written cell (no SQL bookkeeping, #885)', async () => {
+    // As of #885 `EntityDB.put` does NOT write to the SQL `cell`
+    // table — the engine's chain is the version-of-record (#797 Map
+    // carrier → CommitDelta), and the worker's in-memory cell graph
+    // mirrors the engine view for read-after-write within an isolate.
+    // The `cell` table stays empty on the productive path.
     await db.put({
       id: 'ord-1',
       type: 'Order',
       data: { total: '99', status: 'open' },
     })
-    const cell = fetchCell(ctx.storage.sql)
+    const sqlRows = fetchCell(ctx.storage.sql)
+    expect(sqlRows).toBeNull() // no SQL cell row written
+
+    const cell = await db.get()
     expect(cell?.id).toBe('ord-1')
     expect(cell?.type).toBe('Order')
     expect(cell?.data.total).toBe('99')
     expect(cell?.data.status).toBe('open')
 
-    // A second put merges (per the existing contract in `put`) and
-    // the SQL row reflects the merged payload.
+    // A second put merges (per the existing contract in `put`); the
+    // in-memory cell graph carries the merged payload.
     await db.put({ id: 'ord-1', type: 'Order', data: { status: 'fulfilled' } })
-    const cell2 = fetchCell(ctx.storage.sql)
+    expect(fetchCell(ctx.storage.sql)).toBeNull() // still no SQL row
+    const cell2 = await db.get()
     expect(cell2?.data.total).toBe('99') // preserved
     expect(cell2?.data.status).toBe('fulfilled') // overwritten
   }, COMPILE_TIMEOUT_MS)

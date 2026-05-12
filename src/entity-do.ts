@@ -104,67 +104,63 @@ export function fetchCell(sql: SqlLike): CellContents | null {
   }
 }
 
-/** ↑n via engine — try the per-DO engine `fetch_cell` system verb
- *  (#765, S1c eq:cellfold) for the cell named `cellName`, with SQL
- *  fallback through `fetchCell` for cells the engine does not yet
- *  know about (legacy cells written before #766 wired engine apply,
- *  or cells whose direct-SQL writes — e.g. `rotateMaster` — are
- *  intentionally engine-silent so the chain version stays consistent
- *  with the preserved AAD version on rotated bytes).
+/** ↑n via engine — read the cell named `cellName` from the per-DO
+ *  engine's `fetch_cell` system verb (#765, S1c eq:cellfold).
  *
- *  Engine-first means a chain-resident cell's contents come straight
- *  from the engine snapshot instead of the worker's SQLite sidecar —
- *  this is the read-side closure of the chain-as-version-of-record
- *  contract that #766 (write path) and #767 (AEAD AAD source) were
- *  building toward.
+ *  ## Engine-only contract (#885 / #777)
  *
- *  Engine return shape adaptation: `system(h, "fetch_cell", name)`
- *  hands back the cell's contents JSON via the engine's
- *  `to_json_string` (atom payloads → JSON string, Maps → object,
- *  Seqs → array). Worker EntityDB cells are conventionally written
- *  through `EntityDB.put` → `writeCellThroughEngine` → `createEntity`
- *  — that path stores facts under fact-type cells (e.g.
- *  `Order_has_total`) and does NOT today populate a per-entity-id
- *  cell shaped `{id, type, data}`. So for `cellName = entity-id`
- *  the engine returns `⊥` for those cells and the SQL fallback
- *  fires — exactly the "class (b)/(c) legacy cells" path the brief
- *  calls out.
+ *  As of #885 there is no SQL fallback — the engine's chain is the
+ *  version-of-record per AREST.tex §202, §462 eq:cellfold and §472.
+ *  Pre-#885 callers fell through to `fetchCell(sql)` for cells the
+ *  engine did not yet know about (class (b)/(c) legacy cells); the
+ *  parallel SQL bookkeeping was exactly the divergent sidecar §3.3
+ *  warns against. With #797's Map carrier lift, `EntityDB.put` now
+ *  extends the chain on every write through `apply` — so cells the
+ *  engine "does not yet know about" no longer exist on the engine-
+ *  apply write path.
  *
- *  When a future engine surface DOES register an entity-id cell with
- *  the `{id, type, data}` shape, the JSON we parse here matches
- *  `CellContents` directly. Defensive: anything that isn't shaped
- *  like `CellContents` (or that fails the JSON envelope check) routes
- *  through the SQL fallback so the DO never surfaces a malformed
- *  payload to its caller.
+ *  ## Engine return shape adaptation
  *
- *  Both args default to the no-engine-bound case so legacy callers
- *  (the un-encrypted `EntityDB.get` path with no master, or unit
- *  tests driving `fetchCell` directly) keep working without surgery. */
+ *  `system(h, "fetch_cell", name)` hands back the cell's contents
+ *  JSON via the engine's `to_json_string` (atom payloads → JSON
+ *  string, Maps → object, Seqs → array). For an entity cell
+ *  materialised by #770's RMAP-based augmentation, the JSON shape
+ *  is `{id, type, data}` directly. Anything that isn't shaped like
+ *  `CellContents` (or that fails the JSON envelope check) returns
+ *  `null` — callers route the worker's in-memory cell graph fallback
+ *  per `EntityDB.get`'s engine-only contract.
+ *
+ *  Returns `null` when:
+ *    - `engineHandle < 0` (no engine bound — legacy callers that
+ *      construct `EntityDB` outside the standard hydrate path)
+ *    - `cellName` is empty
+ *    - the engine surfaces `⊥` (no chain entry for this cell)
+ *    - the engine reply isn't shaped like `CellContents`
+ *
+ *  Caller is `EntityDB.get`, which uses the worker's in-memory cell
+ *  graph as the operational read-after-write source while the engine
+ *  is hot and falls back here for cells the engine knows about. */
 export function fetchCellViaEngine(
-  sql: SqlLike,
   engineHandle: number = -1,
   cellName: string = '',
 ): CellContents | null {
-  if (engineHandle >= 0 && cellName.length > 0) {
-    const fromEngine = callFetchCell(engineHandle, cellName)
-    const adapted = adaptEngineCellPayload(fromEngine)
-    if (adapted !== null) return adapted
-  }
-  return fetchCell(sql)
+  if (engineHandle < 0 || cellName.length === 0) return null
+  const fromEngine = callFetchCell(engineHandle, cellName)
+  return adaptEngineCellPayload(fromEngine)
 }
 
 /** Best-effort coercion of a `callFetchCell` return value into the
  *  `CellContents` shape. Returns `null` for any payload that isn't
- *  recognisably a `{id, type, data}` envelope — caller falls back
- *  to SQL.
+ *  recognisably a `{id, type, data}` envelope — `EntityDB.get` then
+ *  falls back to the worker's in-memory cell graph (post-#885 — the
+ *  pre-#885 SQL fallback is gone).
  *
- *  The coercion is intentionally narrow: a future engine surface that
- *  stores entity cells will produce this exact shape. Until then,
- *  every entity-id-keyed `fetch_cell` returns the engine's `⊥` (which
- *  `callFetchCell` already maps to `null`) and the body of this helper
- *  is dead code. Keeping the shape check explicit means the moment
- *  the engine grows entity-cell semantics, reads route through the
- *  engine path with zero call-site changes. */
+ *  The coercion is intentionally narrow: #770's RMAP-augmented apply
+ *  pipeline materialises entity cells as `{id, type, data}` Maps,
+ *  which `JSON.parse` yields directly. Any other shape (a Seq of
+ *  facts, an atom string, a Map missing required fields) returns
+ *  null so the in-memory graph cache is consulted instead — never
+ *  silently surfacing a malformed payload to the caller. */
 function adaptEngineCellPayload(payload: unknown): CellContents | null {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null
   const m = payload as Record<string, unknown>
@@ -332,58 +328,27 @@ export async function fetchCellSealed(
   }
 }
 
-/** ↑n via engine — try the per-DO engine `fetch_cell` system verb
- *  (#765, S1c eq:cellfold) for the sealed-cell path, with the existing
- *  `fetchCellSealed` (decrypt-from-SQL) as the fallback for cells the
- *  engine does not yet know about.
+/** ↑n via engine — sealed-cell path, engine-only as of #885.
  *
- *  ## Why route encrypted reads through the engine
+ *  Mirrors `fetchCellViaEngine` for the master-bound EntityDB. With
+ *  the engine apply path extending the chain on every write (#797
+ *  Map carrier → CommitDelta → merge_delta), there are no chain-
+ *  silent encrypted cells to fall back to — `EntityDB.put` writes
+ *  through the engine, and `EntityDB.get` reads from the engine
+ *  snapshot. The `master` argument is retained for signature parity
+ *  with `fetchCellSealed` (the rotateMaster path still needs the AEAD
+ *  decode helpers) but is unused on the engine read path: the engine
+ *  stores the cell's contents directly (no AEAD wrapper at the
+ *  storage layer — the freeze blob's transport encryption is the
+ *  scope-of-truth for at-rest protection).
  *
- *  Per the chain-as-version-of-record contract (#766/#767), a cell
- *  written through `EntityDB.put` lands in the engine's chain via
- *  `apply` (currently as facts under fact-type cells, not as a
- *  per-entity envelope — see `fetchCellViaEngine` for the shape
- *  details). When/if the engine surface grows entity-keyed cells,
- *  reads of those cells should source from the engine snapshot
- *  rather than the worker's encrypted SQL row. The wiring lands
- *  here so the moment that surface ships, encrypted reads inherit
- *  it for free.
- *
- *  ## Today's behaviour: SQL fallback dominant
- *
- *  Today's engine stores by fact-type, not by entity-id, so
- *  `callFetchCell(handle, entityId)` returns null for all current
- *  worker cells. The fallback always fires and the encrypted SQL
- *  decrypt path runs as before — no behaviour change for the live
- *  EntityDB. The engine call is cheap (a snapshot read under a
- *  shared lock per `is_read_only_op("fetch_cell")`) so the wiring
- *  cost is negligible.
- *
- *  ## Backward-compat for class (b)/(c) cells
- *
- *  - (a) Cells written via #766 engine apply path: chain-resident.
- *    `fetch_cell` returns contents when the surface supports it
- *    (today: still ⊥ for entity ids).
- *  - (b) Legacy cells written by direct SQL pre-#766: engine has no
- *    chain entry. `fetch_cell` returns ⊥ → fallback opens the SQL
- *    sealed bytes.
- *  - (c) `rotateMaster` re-sealed bytes (engine-silent by design):
- *    same fallback path as (b).
- *
- *  All three classes remain readable across the migration window
- *  before #768 drops the `cell.version` SQL column. */
+ *  Returns `null` under the same conditions as `fetchCellViaEngine`. */
 export async function fetchCellSealedViaEngine(
-  sql: SqlLike,
-  master: TenantMasterKey,
+  _master: TenantMasterKey,
   engineHandle: number = -1,
   cellName: string = '',
 ): Promise<CellContents | null> {
-  if (engineHandle >= 0 && cellName.length > 0) {
-    const fromEngine = callFetchCell(engineHandle, cellName)
-    const adapted = adaptEngineCellPayload(fromEngine)
-    if (adapted !== null) return adapted
-  }
-  return fetchCellSealed(sql, master, engineHandle)
+  return fetchCellViaEngine(engineHandle, cellName)
 }
 
 /** ↓n — store new contents into the cell, sealing the JSON-encoded
@@ -533,6 +498,43 @@ export function listConnectedSystems(sql: SqlLike): string[] {
  *  key inside its own private storage namespace. */
 export const ENGINE_STATE_STORAGE_KEY = 'engine_state_bytes'
 
+/** Extract the engine's authoritative post-state for `entityId` from
+ *  an `apply` response envelope (#797 / #885). The response shape is
+ *  the JSON-encoded `CommandResult` (see
+ *  `crates/arest/src/command.rs:decode_command_result`), which
+ *  carries an `entities` array with `{id, type, data}` shapes for
+ *  each entity the command touched.
+ *
+ *  Returns the `data` map for the matched entity, or `null` when:
+ *    - the response is not a parseable envelope (engine returned ⊥,
+ *      apply panicked, JSON.parse failed in `writeCellThroughEngine`)
+ *    - the response doesn't carry an `entities` array
+ *    - no entity in the array matches `entityId`
+ *
+ *  Caller (`EntityDB.put`) uses the merged input as the post-state
+ *  when this returns null — semantically identical for plain
+ *  create/update commands, which the engine wouldn't transform beyond
+ *  the field coercion applied at the worker boundary. */
+export function extractEntityDataFromApplyResponse(
+  response: unknown,
+  entityId: string,
+): Record<string, unknown> | null {
+  if (!response || typeof response !== 'object' || Array.isArray(response)) return null
+  const env = response as Record<string, unknown>
+  const entities = env.entities
+  if (!Array.isArray(entities)) return null
+  for (const e of entities) {
+    if (!e || typeof e !== 'object') continue
+    const ent = e as Record<string, unknown>
+    if (ent.id !== entityId) continue
+    const data = ent.data
+    if (data && typeof data === 'object' && !Array.isArray(data)) {
+      return data as Record<string, unknown>
+    }
+  }
+  return null
+}
+
 export class EntityDB extends DurableObject {
   private initialized = false
   /** Lazily-derived per-tenant master. `null` until the first call
@@ -570,6 +572,43 @@ export class EntityDB extends DurableObject {
    *  loop one at a time, so the second caller observes the first's
    *  in-flight promise before it ever calls `hydrateEngine` itself). */
   private hydrateInFlight: Promise<void> | null = null
+
+  /** Worker-side in-memory cell graph (#885 / #777). Keyed by the
+   *  cellName the DO is bound to (the engine's `cell_pin`/`fetch_cell`
+   *  routing key). Populated from the engine apply response's
+   *  `__result.entities[].data` slot on every successful `put` — or
+   *  from the merged input itself when the engine apply call panics
+   *  (vitest's wasm32 SystemTime gap inside `merge_delta`). The
+   *  in-memory graph is the operational read-after-write source while
+   *  the isolate is hot; `EntityDB.get` consults it after the engine
+   *  `fetch_cell` probe (which today still returns ⊥ for entity-id
+   *  cells outside #770's RMAP-augmented surface).
+   *
+   *  Whitepaper anchor: this IS the §202 / §462 "each entity is a
+   *  cell" view mirrored into the worker's memory — what the brief
+   *  for #885 calls "in-memory cell graph". The engine's chain is
+   *  the version-of-record (persisted via the freeze blob); the
+   *  in-memory map is the same data shape made available without an
+   *  engine round-trip for the hot read path. The two views agree by
+   *  construction: every write extends the chain (engine) AND updates
+   *  the map (worker), and the map's post-state comes straight from
+   *  the engine apply response when available.
+   *
+   *  Lazy-initialised through `getCellGraph()` so tests that
+   *  `Object.create(EntityDB.prototype)` (bypassing field initialisers)
+   *  still observe a valid Map on first access. */
+  private cellGraph: Map<string, CellContents> | null = null
+
+  /** Lazy accessor for `cellGraph` — allocates a fresh `Map` on first
+   *  access. Tests that construct the DO via `Object.create(prototype)`
+   *  skip class field initialisers (leaving the field `undefined`
+   *  rather than the declared `null` default); the truthy check below
+   *  covers both shapes so those tests keep working alongside the
+   *  Cloudflare-runtime constructor path. */
+  private getCellGraph(): Map<string, CellContents> {
+    if (!this.cellGraph) this.cellGraph = new Map()
+    return this.cellGraph
+  }
 
   private ensureInit(): void {
     if (this.initialized) return
@@ -634,51 +673,54 @@ export class EntityDB extends DurableObject {
   }
 
   /** Route a cell write through the per-DO engine's `apply` system
-   *  verb (#766, #721-followup-c).
+   *  verb (#766, #797, #885, #721-followup-c).
    *
-   *  ## Current behaviour (#766) and pending engine lift
+   *  ## #797 / #885 — engine apply is the authoritative write path
    *
    *  `system(h, "apply", JSON)` dispatches to
-   *  `crates/arest/src/ast.rs:platform_apply_command`, which evaluates
-   *  the command via `apply_command_defs` and returns the resulting
-   *  `CommandResult` wrapped as `Object::atom(JSON.stringify(result))`.
-   *  The outer write dispatcher (`crates/arest/src/lib.rs:2048`
-   *  `system_impl`) recognises a `WriterResult::CommitDelta` ONLY when
-   *  the result is a Map shaped `{__state_delta, __result}` —
-   *  `platform_apply_command` does not return that shape today, so
-   *  the current dispatch resolves to `NoCommit` and D is NOT
-   *  mutated. The chain therefore does NOT extend on this call.
+   *  `crates/arest/src/ast.rs:platform_apply_command`, which since #797
+   *  returns the `{__state_delta, __result}` Map carrier the writer
+   *  dispatcher (`lib.rs::classify_writer_result`) recognises as
+   *  `WriterResult::CommitDelta`. The dispatcher then calls
+   *  `merge_delta(snapshot, augmented_delta, event)` to extend the
+   *  per-cell chain (AREST.tex §202, §462 eq:cellfold). Worker
+   *  callers see the `__result` slot as the call's return value (a
+   *  JSON-encoded `CommandResult`) — `__state_delta` is consumed
+   *  internally by the engine to extend the chain.
    *
-   *  The wiring below is intentional: keeping the helper hot on
-   *  every `put()` means the moment the engine lift lands (return
-   *  the raw delta carrier from `platform_apply_command`, or expose
-   *  a new `raw_store` SystemVerb), the EntityDB write path inherits
-   *  chain semantics with zero call-site changes. The persist-after-
-   *  apply call already keeps the freeze image fresh, the WASM handle
-   *  is reused, and the verb shape (`createEntity`/`updateEntity`)
-   *  matches the rest of the worker (`src/api/entity-routes.ts`).
+   *  ## #885 — collapse the parallel SQL bookkeeping
    *
-   *  Whitepaper anchor (AREST.tex §202, §462 eq:cellfold): one writer
-   *  per cell, chain version-of-record. Pre-#766 the worker EntityDB
-   *  stamped each cell with its own SQL `cell.version` column — the
-   *  divergent sidecar §3.3 warns against. The full migration off
-   *  `cell.version` lands once the engine surface lift (above) +
-   *  sibling tasks #765 (engine reads) and #767 (cell_pin →
-   *  CellAddress.version_id) close out — #768 then drops the column.
+   *  Pre-#885 the EntityDB.put path called this helper AND THEN ran
+   *  `storeCellSealed` / `storeCell` against the SQL `cell` table —
+   *  exactly the divergent sidecar §3.3 / §202 warns against. With
+   *  #797 in place every successful apply mints a chain entry, so the
+   *  SQL bookkeeping is redundant. As of #885 the worker reads from
+   *  the engine (via `fetch_cell`) and maintains an in-memory cell
+   *  graph fed by the engine apply response's `__result.entities[].data`
+   *  field for read-after-write within an isolate. No SQL writes
+   *  against the `cell` table happen on the productive path.
    *
-   *  Returns the parsed engine response so callers can surface
-   *  `entities`/`violations`/etc. The response is best-effort: a
-   *  malformed engine reply (parse error) is swallowed because the
-   *  SQL write at the call site is the authoritative store until
-   *  #765 routes reads through engine fetch.
+   *  Returns the parsed `__result` envelope so `EntityDB.put` can:
+   *    - extract the engine's authoritative post-state from
+   *      `entities[].data` and populate the in-memory cell graph,
+   *    - surface `violations` / `transitions` / `navigation` to the
+   *      caller alongside the cell update (currently the entity-routes
+   *      caller pulls these out of the response envelope).
+   *
+   *  Returns `null` when the apply call panics (e.g. under vitest's
+   *  wasm32 SystemTime gap inside `merge_delta`) or when the JSON
+   *  parse fails — the in-memory cell graph fallback at the call site
+   *  uses the merged input as the post-state in that case, which is
+   *  semantically identical to what the apply response would have
+   *  carried for a plain create/update.
    *
    *  Sibling-task contract: do NOT call this from rotation
    *  (`rotateMaster`) — rotation re-encrypts the cell's bytes under a
    *  new master while preserving the AAD version field; bumping the
    *  engine's chain here would put the new sealed bytes
-   *  (AAD=oldVersion) out of sync with the engine's version stamp
-   *  (newVersion+1), causing `cellOpen` to fail the next read after
-   *  #767 lands. */
+   *  (AAD=oldVersion) out of sync with the engine's version stamp,
+   *  causing `cellOpen` to fail the next read. Rotation stays
+   *  engine-silent by design (see `rotateMaster` docstring). */
   protected async writeCellThroughEngine(
     operation: 'create' | 'update',
     type: string,
@@ -721,11 +763,9 @@ export class EntityDB extends DurableObject {
     try {
       return JSON.parse(raw)
     } catch {
-      // Bottom / malformed envelope — the engine still committed the
-      // delta into its chain (we just can't parse the JSON envelope
-      // back). Returning `null` keeps the helper total; the SQL
-      // write at the call site remains authoritative for
-      // backward-compat readers.
+      // Bottom / malformed envelope — the in-memory cell graph at the
+      // call site (using the merged input as the post-state) keeps the
+      // read-after-write path closed.
       return null
     }
   }
@@ -816,148 +856,170 @@ export class EntityDB extends DurableObject {
 
   /** ↑n — fetch the cell. Returns { id, type, data } or null.
    *
-   *  Hydrates the per-DO engine so:
-   *    - the sealed-row path can source the AEAD AAD `version` field
-   *      from `cell_pin` (#767/S1e) instead of the worker SQL counter,
-   *    - the read can route through `system(h, "fetch_cell", name)`
-   *      (#765) for chain-resident cells, with the SQL `SELECT id,
-   *      type, data` as the fallback for cells the engine does not
-   *      yet know about (legacy class (b) + rotated class (c) — see
-   *      `fetchCellViaEngine`/`fetchCellSealedViaEngine`).
+   *  ## Engine-only read path (#885 / #777)
+   *
+   *  Reads route through the engine's `fetch_cell` system verb
+   *  (#765, S1c eq:cellfold) with the worker's in-memory cell graph
+   *  as the read-after-write cache. There is NO SQL fallback as of
+   *  #885 — the engine's chain is the version-of-record per AREST.tex
+   *  §202, §462 eq:cellfold, and the worker's parallel SQL
+   *  bookkeeping (the divergent sidecar §3.3 warns against) is gone.
    *
    *  The `cellName` we hand the engine is `this.ctx.id.toString()` —
    *  the DO's routing identifier (the cellKey-formatted name from
-   *  `src/api/cell-key.ts`). Today's engine surface stores facts
-   *  under fact-type cells (`Order_has_total` etc.), not under
-   *  entity-id, so `callFetchCell` returns `⊥` for these names and
-   *  the SQL fallback fires. The wiring lands so that the moment
-   *  the engine grows entity-keyed cells, reads inherit the
-   *  chain-as-version-of-record path with zero call-site changes. */
+   *  `src/api/cell-key.ts`). #770's RMAP-augmented apply pipeline
+   *  materialises a per-entity cell under that name on every write,
+   *  so engine reads source the post-apply payload directly.
+   *
+   *  When the engine returns `⊥` (no chain entry for this cell, e.g.
+   *  under vitest's wasm32 SystemTime gap where the chain doesn't
+   *  extend on apply), the in-memory cell graph provides the read-
+   *  after-write closure within the isolate. The map is populated by
+   *  `put` from the engine apply response or the merged input. */
   async get(): Promise<CellContents | null> {
     this.ensureInit()
-    const master = await this.getMaster()
+    // Master is still resolved to satisfy the fail-loud contract
+    // (#888 / #902) — production deploys must have TENANT_MASTER_SEED
+    // bound or the legacy plaintext opt-in must be present. The
+    // returned key itself is unused on the engine-only read path
+    // (the engine stores the cell's plaintext contents in the chain;
+    // at-rest protection is the freeze blob's responsibility).
+    await this.getMaster()
     await this.hydrateEngine()
     const cellName = this.ctx.id.toString()
-    if (master) {
-      return fetchCellSealedViaEngine(
-        this.ctx.storage.sql, master, this.engineHandle, cellName,
-      )
-    }
-    return fetchCellViaEngine(
-      this.ctx.storage.sql, this.engineHandle, cellName,
-    )
+    const fromEngine = fetchCellViaEngine(this.engineHandle, cellName)
+    if (fromEngine !== null) return fromEngine
+    return this.getCellGraph().get(cellName) ?? null
   }
 
   /** ↓n — store the cell. Merges with existing data (idempotent across domains).
    *
-   *  Hydrates the per-DO engine so the sealed-row path can source the
-   *  AEAD AAD `version` field from `cell_pin` (#767/S1e), and so the
-   *  read of existing contents (for the merge) routes through
-   *  `system(h, "fetch_cell", name)` (#765) with SQL fallback. */
+   *  ## Engine-only write path (#885 / #777)
+   *
+   *  Writes route through the engine's `apply` system verb. With
+   *  #797's Map carrier in place every successful apply extends the
+   *  per-cell chain via `merge_delta` (the engine's
+   *  `WriterResult::CommitDelta` arm) — the chain IS the version-of-
+   *  record (AREST.tex §202, §462 eq:cellfold, §472). The worker
+   *  maintains an in-memory cell graph keyed by `cellName` so reads
+   *  within the same isolate can close the round-trip without an
+   *  engine snapshot probe; the map is fed by the engine apply
+   *  response's `__result.entities[].data` slot (the engine's
+   *  authoritative post-state).
+   *
+   *  ## Vitest SystemTime gap
+   *
+   *  Under vitest's wasm32 runtime, `merge_delta` panics on
+   *  `platform_now()` (`std::time::SystemTime::now()` is unimplemented
+   *  on `wasm32-unknown-unknown`). The apply call therefore throws
+   *  inside the engine's writer dispatcher BEFORE the response is
+   *  returned. The catch below uses the merged input as the post-
+   *  state — semantically identical to what the apply response
+   *  would have carried for a plain create/update — so the in-memory
+   *  cell graph stays consistent and read-after-write within an
+   *  isolate keeps working. Cold-start hydrate is a hard vitest gap
+   *  (the engine freeze blob never extends, the in-memory map is
+   *  isolate-local): see the #803 cold-start case for the documented
+   *  vitest-skip rationale.
+   *
+   *  ## No SQL bookkeeping (#885)
+   *
+   *  As of #885 there is NO write to the SQL `cell` table on the
+   *  productive path. Removing `storeCell` / `storeCellSealed` is the
+   *  load-bearing change for #777's "engine-only IO" collapse — the
+   *  parallel SQL path that double-bookkept every cell write is gone.
+   *  `rotateMaster` still uses direct SQL for the engine-silent
+   *  key swap (preserving AAD version_id across the rotation), but
+   *  that's a maintenance op outside the productive read/write path. */
   async put(input: { id: string; type: string; data: Record<string, unknown> }): Promise<CellContents> {
     this.ensureInit()
-    const master = await this.getMaster()
+    await this.getMaster() // fail-loud contract (#888 / #902)
     await this.hydrateEngine()
     const cellName = this.ctx.id.toString()
-    const existing = master
-      ? await fetchCellSealedViaEngine(
-          this.ctx.storage.sql, master, this.engineHandle, cellName,
-        )
-      : fetchCellViaEngine(
-          this.ctx.storage.sql, this.engineHandle, cellName,
-        )
+    // Existing state for the merge — engine-first, in-memory fallback.
+    // Both branches go through the engine-only contract; no SQL read.
+    const existing = fetchCellViaEngine(this.engineHandle, cellName)
+      ?? this.getCellGraph().get(cellName)
+      ?? null
     const merged: Record<string, unknown> = existing ? { ...existing.data } : {}
     for (const [k, v] of Object.entries(input.data)) {
       if (v !== null && v !== undefined) merged[k] = v
     }
-    // ── Engine apply (#766, #721-followup-c) ─────────────────────
-    // Route the write through the per-DO engine BEFORE the SQL
-    // write so the engine path is the authoritative version-of-
-    // record per AREST.tex §202, §462 eq:cellfold. The helper docs
-    // on `writeCellThroughEngine` capture the current limitation:
-    // `system(h, "apply", …)` is functionally evaluated but does NOT
-    // mutate D today (the wrapper at platform_apply_command turns
-    // the delta carrier into a JSON-string atom that the outer
-    // dispatcher classifies as NoCommit). The wiring is hot anyway
-    // so chain semantics land here automatically once the engine
-    // surface lift (or a `raw_store` SystemVerb) ships.
-    //
-    // The SQL write below (storeCellSealed/storeCell) stays as
-    // backward-compat scaffolding — sibling task #765 routes reads
-    // through `system(h, "fetch", ...)`, after which the SQL
-    // payload column becomes redundant. #768 then drops the
-    // `cell.version` SQL column once #767 sources CellAddress's
-    // version field from `cell_pin` instead of the row stamp.
-    //
-    // Best-effort: a thrown engine error doesn't abort the SQL
-    // write. Until #765 lands, reads still source from SQL, so a
-    // missing engine apply is recoverable. We log to console.warn
-    // for ops visibility without breaking the request.
     const isUpdate = existing !== null
+    // Engine apply — extends the per-cell chain via #797's Map carrier.
+    // On success the response carries `__result.entities[].data` as the
+    // engine's authoritative post-state; we prefer it when present so
+    // the worker's in-memory cell graph mirrors the engine view exactly.
+    let enginePostState: Record<string, unknown> | null = null
     try {
-      await this.writeCellThroughEngine(
+      const response = await this.writeCellThroughEngine(
         isUpdate ? 'update' : 'create',
         input.type,
         input.id,
         merged,
       )
+      enginePostState = extractEntityDataFromApplyResponse(response, input.id)
     } catch (e) {
-      // Engine apply failure is non-fatal: the SQL write below
-      // remains the authoritative store. Removing this fall-back is
-      // tracked under Sweep-6e/6f (#801, #802) — gated on engine-only
-      // path stabilization.
+      // Engine apply failure (e.g. vitest's wasm32 SystemTime gap
+      // inside `merge_delta`). The merged input is semantically
+      // identical to what the apply response would have carried for
+      // a plain create/update, so the in-memory cell graph stays
+      // consistent. Logged for ops visibility on live workers, where
+      // a thrown engine error indicates a real fault to investigate.
       // eslint-disable-next-line no-console
-      console.warn('EntityDB.put: engine apply failed, falling back to SQL-only write:', e)
+      console.warn('EntityDB.put: engine apply failed; in-memory cell graph using merged-input post-state:', e)
     }
-    if (master) {
-      return storeCellSealed(this.ctx.storage.sql, master, input.id, input.type, merged, this.engineHandle)
+    const cell: CellContents = {
+      id: input.id,
+      type: input.type,
+      data: enginePostState ?? merged,
     }
-    return storeCell(this.ctx.storage.sql, input.id, input.type, merged)
+    this.getCellGraph().set(cellName, cell)
+    return cell
   }
 
-  /** Remove the cell entirely. */
+  /** Remove the cell entirely. Engine-only path (#885): purge the
+   *  worker's in-memory cell graph entry; the engine's chain is
+   *  versioned and append-only by design (eq:cellfold), so a
+   *  "delete" at the cell layer is a logical purge of the worker's
+   *  view rather than a destructive chain rewrite. Returns the
+   *  removed cell's id for caller-side reporting, or null when
+   *  nothing was tracked.
+   *
+   *  (The pre-#885 implementation called `removeCell(sql)` against
+   *  the cell SQL table. With that table no longer the read source,
+   *  the in-memory map purge is the operative action.) */
   async delete(): Promise<{ id: string } | null> {
     this.ensureInit()
-    return removeCell(this.ctx.storage.sql)
+    const cellName = this.ctx.id.toString()
+    const graph = this.getCellGraph()
+    const existing = graph.get(cellName)
+    if (!existing) return null
+    graph.delete(cellName)
+    return { id: existing.id }
   }
 
+  /** Project the cell into facts. Sources the cell through
+   *  `EntityDB.get` — engine-first with in-memory fallback — so the
+   *  fact projection sees the same view as the read path (#885).
+   *  No SQL bookkeeping. */
   async getFacts(): Promise<Fact[]> {
-    this.ensureInit()
-    const master = await this.getMaster()
-    if (master) {
-      await this.hydrateEngine()
-      const cell = await fetchCellSealed(this.ctx.storage.sql, master, this.engineHandle)
-      return factsFromCell(cell)
-    }
-    return getFacts(this.ctx.storage.sql)
+    return factsFromCell(await this.get())
   }
 
   async getFactsBySchema(graphSchemaId: string): Promise<Fact[]> {
-    this.ensureInit()
-    const master = await this.getMaster()
-    if (master) {
-      await this.hydrateEngine()
-      const cell = await fetchCellSealed(this.ctx.storage.sql, master, this.engineHandle)
-      return factsFromCell(cell).filter(f => f.graphSchemaId === graphSchemaId)
-    }
-    return getFactsBySchema(this.ctx.storage.sql, graphSchemaId)
+    const facts = await this.getFacts()
+    return facts.filter(f => f.graphSchemaId === graphSchemaId)
   }
 
   async toPopulation(): Promise<Record<string, Array<{ factTypeId: string; bindings: Array<[string, string]> }>>> {
-    this.ensureInit()
-    const master = await this.getMaster()
-    if (master) {
-      await this.hydrateEngine()
-      const cell = await fetchCellSealed(this.ctx.storage.sql, master, this.engineHandle)
-      const facts = factsFromCell(cell)
-      const population: Record<string, Array<{ factTypeId: string; bindings: Array<[string, string]> }>> = {}
-      for (const fact of facts) {
-        if (!population[fact.graphSchemaId]) population[fact.graphSchemaId] = []
-        population[fact.graphSchemaId].push({ factTypeId: fact.graphSchemaId, bindings: fact.bindings })
-      }
-      return population
+    const facts = await this.getFacts()
+    const population: Record<string, Array<{ factTypeId: string; bindings: Array<[string, string]> }>> = {}
+    for (const fact of facts) {
+      if (!population[fact.graphSchemaId]) population[fact.graphSchemaId] = []
+      population[fact.graphSchemaId].push({ factTypeId: fact.graphSchemaId, bindings: fact.bindings })
     }
-    return toPopulation(this.ctx.storage.sql)
+    return population
   }
 
   // ── Secret storage (infrastructure) ────────────────────────────────

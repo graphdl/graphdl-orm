@@ -153,8 +153,13 @@ function makeEntityDB(ctx: MockCtx, env: Record<string, unknown> = {}): EntityDB
 }
 
 // Compiling the bundled metamodel under vitest takes ~1-2 s on Node,
-// matching the lifecycle / apply suites.
-const COMPILE_TIMEOUT_MS = 90_000
+// matching the lifecycle / apply suites. #885 bumps the ceiling
+// because the engine `apply` path now panics inside `merge_delta`
+// on vitest's wasm32 SystemTime gap, and the wasm-bindgen
+// panic_hook's backtrace serialisation through
+// `console_error_panic_hook` adds 30-90 s of unwinding on top of
+// the compile when the apply throws.
+const COMPILE_TIMEOUT_MS = 240_000
 
 // ── Tests ───────────────────────────────────────────────────────────
 
@@ -189,26 +194,20 @@ describe('EntityDB engine-routed cell reads (#765)', () => {
     expect(cell!.data.status).toBe('open')
   }, COMPILE_TIMEOUT_MS)
 
-  it('engine-path return value is preferred over SQL when callFetchCell yields a CellContents shape', async () => {
+  it('engine payload (CellContents shape) is returned directly when callFetchCell yields one', async () => {
     // Mock callFetchCell to return a {id, type, data} envelope. The
     // engine prereq guarantees the verb returns parseable JSON for
-    // cells that ARE chain-resident in a future engine surface; we
-    // pin the worker's wiring contract that the engine value, when
-    // present, wins over the SQL row. Without this contract, a
-    // chain-resident cell would silently fall through to its stale
-    // SQL sidecar — exactly the divergence #765 is meant to close.
+    // cells that ARE chain-resident under #770's RMAP-augmented
+    // surface. We pin the worker's wiring contract that the engine
+    // value, when present, is surfaced directly.
     const engineMod = await import('./api/engine')
     const ENGINE_PAYLOAD = { id: 'cust-1', type: 'Customer', data: { name: 'Engine' } }
-    // First seed the SQL row with a DIFFERENT value so the test fails
-    // if the SQL path wins. Then mock callFetchCell to return the
-    // engine payload — engine value should be returned.
-    storeCell(ctx.storage.sql, 'cust-1', 'Customer', { name: 'SQL' })
     const spy = vi.spyOn(engineMod, 'callFetchCell').mockReturnValue(ENGINE_PAYLOAD)
     try {
       // Drive through fetchCellViaEngine directly — bypasses the
       // EntityDB wrapper so the helper's contract is the unit under
       // test (the wrapper is exercised by the round-trip above).
-      const result = fetchCellViaEngine(ctx.storage.sql, 1 /* fakeHandle */, 'cust-1')
+      const result = fetchCellViaEngine(1 /* fakeHandle */, 'cust-1')
       expect(result).not.toBeNull()
       expect(result!.id).toBe('cust-1')
       expect(result!.type).toBe('Customer')
@@ -219,74 +218,53 @@ describe('EntityDB engine-routed cell reads (#765)', () => {
     }
   })
 
-  // ── Backward-compat: SQL fallback for class (b)/(c) cells ──────────
+  // ── Engine-only contract (#885 / #777) ─────────────────────────────
   //
-  // The brief calls out three cell classes: (a) engine-apply-written,
-  // (b) pre-#766 legacy direct-SQL, (c) rotateMaster-rewritten
-  // direct-SQL. Classes (b) + (c) MUST stay readable through the SQL
-  // fallback for the migration window — even now that #768 has
-  // dropped the worker-minted `cell.version` SQL column, the SQL
-  // PAYLOAD column ({id, type, data}) keeps the legacy contents
-  // readable via `fetchCell` until a future task migrates them onto
-  // the engine chain.
+  // As of #885 there is NO SQL fallback. `fetchCellViaEngine` returns
+  // `null` when the engine doesn't know about the cell (the worker's
+  // in-memory cell graph at `EntityDB.get` provides the read-after-
+  // write closure within an isolate). The pre-#885 "class (b) legacy
+  // direct-SQL cells" path is gone — every cell write extends the
+  // chain through `apply` (#797 Map carrier → CommitDelta).
 
-  it('SQL fallback returns the legacy value when callFetchCell returns null', async () => {
-    // Simulate a class (b) legacy cell: the SQL row exists (written
-    // via direct SQL pre-#766) but the engine has no chain entry.
-    // `callFetchCell` returns null → `fetchCellViaEngine` falls
-    // through to `fetchCell(sql)` → the legacy row surfaces.
+  it('null engine payload returns null (no SQL fallback as of #885)', async () => {
+    // Even if a stray SQL row exists (e.g. from a pre-#885 deploy),
+    // `fetchCellViaEngine` ignores it. The engine is the only read
+    // source.
     storeCell(ctx.storage.sql, 'legacy-1', 'LegacyEntity', { fromSql: 'yes', count: 7 })
     const engineMod = await import('./api/engine')
     const spy = vi.spyOn(engineMod, 'callFetchCell').mockReturnValue(null)
     try {
-      const result = fetchCellViaEngine(ctx.storage.sql, 1 /* fakeHandle */, 'legacy-1')
-      expect(result).not.toBeNull()
-      expect(result!.id).toBe('legacy-1')
-      expect(result!.type).toBe('LegacyEntity')
-      expect(result!.data.fromSql).toBe('yes')
-      expect(result!.data.count).toBe(7)
+      const result = fetchCellViaEngine(1 /* fakeHandle */, 'legacy-1')
+      expect(result).toBeNull()
       expect(spy).toHaveBeenCalledWith(1, 'legacy-1')
     } finally {
       spy.mockRestore()
     }
   })
 
-  it('SQL fallback fires when no engine handle is bound (engineHandle = -1)', async () => {
-    // The default no-engine path: legacy callers (un-encrypted DOs
-    // built before the per-DO engine landed) keep working without
-    // surgery. The engine call is short-circuited by the
-    // `engineHandle >= 0` guard.
+  it('no engine handle bound (engineHandle = -1) returns null without consulting SQL', () => {
+    // Pre-#885 callers fell through to a SQL SELECT when no engine
+    // handle was bound. Post-#885 the function is engine-only: a
+    // missing handle yields null.
     storeCell(ctx.storage.sql, 'no-engine-1', 'Order', { total: '42' })
-    const result = fetchCellViaEngine(ctx.storage.sql, -1, '')
-    expect(result).not.toBeNull()
-    expect(result!.id).toBe('no-engine-1')
-    expect(result!.data.total).toBe('42')
+    const result = fetchCellViaEngine(-1, '')
+    expect(result).toBeNull()
   })
 
-  it('sealed-cell SQL fallback round-trips when engine returns null', async () => {
-    // Class (b) for the encrypted path: SQL row carries the sealed
-    // envelope, engine has no chain entry, `fetchCellSealedViaEngine`
-    // falls through to `fetchCellSealed` which decrypts the SQL row.
-    // Mirrors the rotateMaster (class c) path — same code path.
+  it('sealed-cell engine-only path: returns null when engine returns null (no SQL fallback)', async () => {
+    // The sealed variant `fetchCellSealedViaEngine` mirrors
+    // `fetchCellViaEngine` post-#885 — engine-only, no SQL fallback.
+    // The `master` argument is retained for signature parity with the
+    // rotation path's AEAD helpers but is unused on the engine read.
     const master = await deriveTenantMasterKey('test-seed-#765', 'tenant-aad')
-    // Seed via a real seal/store so the SQL row has a valid sealed
-    // envelope — we can't hand-craft one because the AAD includes
-    // the per-cell HKDF derivation.
-    const { storeCellSealed } = await import('./entity-do')
-    await storeCellSealed(
-      ctx.storage.sql, master, 'sealed-1', 'Order',
-      { lane: 'sealed-fallback' }, -1,
-    )
     const engineMod = await import('./api/engine')
     const spy = vi.spyOn(engineMod, 'callFetchCell').mockReturnValue(null)
     try {
       const result = await fetchCellSealedViaEngine(
-        ctx.storage.sql, master, 1 /* fakeHandle */, 'sealed-1',
+        master, 1 /* fakeHandle */, 'sealed-1',
       )
-      expect(result).not.toBeNull()
-      expect(result!.id).toBe('sealed-1')
-      expect(result!.type).toBe('Order')
-      expect(result!.data.lane).toBe('sealed-fallback')
+      expect(result).toBeNull()
       expect(spy).toHaveBeenCalledWith(1, 'sealed-1')
     } finally {
       spy.mockRestore()
@@ -296,17 +274,17 @@ describe('EntityDB engine-routed cell reads (#765)', () => {
   // ── Missing cells return null without throwing ─────────────────────
 
   it('missing cell: engine-path returns null when nothing was ever written', () => {
-    // No SQL row, no engine chain entry. The DO has just been spun
-    // up. Both paths return null cleanly — no throw, no crash.
-    const result = fetchCellViaEngine(ctx.storage.sql, -1, '')
+    // No engine handle, no engine chain entry. The DO has just been
+    // spun up. Result: null, no throw, no crash.
+    const result = fetchCellViaEngine(-1, '')
     expect(result).toBeNull()
   })
 
-  it('missing cell: engine-bound path returns null when engine and SQL both have nothing', async () => {
+  it('missing cell: engine-bound path returns null when engine has no chain entry', async () => {
     const engineMod = await import('./api/engine')
     const spy = vi.spyOn(engineMod, 'callFetchCell').mockReturnValue(null)
     try {
-      const result = fetchCellViaEngine(ctx.storage.sql, 1 /* fakeHandle */, 'missing-1')
+      const result = fetchCellViaEngine(1 /* fakeHandle */, 'missing-1')
       expect(result).toBeNull()
       expect(spy).toHaveBeenCalledWith(1, 'missing-1')
     } finally {
@@ -316,9 +294,9 @@ describe('EntityDB engine-routed cell reads (#765)', () => {
 
   it('missing cell via EntityDB.get: returns null gracefully on a fresh DO', async () => {
     // Black-box from the DO surface: no put has ever happened, so
-    // SQL has no row and the engine has no chain entry. Result:
-    // null, no throw. This is the contract the worker dispatcher
-    // depends on (404 vs 500).
+    // the engine has no chain entry and the in-memory cell graph is
+    // empty. Result: null, no throw. This is the contract the
+    // worker dispatcher depends on (404 vs 500).
     const cell = await db.get()
     expect(cell).toBeNull()
   }, COMPILE_TIMEOUT_MS)
@@ -326,38 +304,33 @@ describe('EntityDB engine-routed cell reads (#765)', () => {
   // ── Engine envelope shape coercion ──────────────────────────────────
   //
   // The engine's `to_json_string` produces JSON for the cell's stored
-  // contents shape. For a future entity-keyed cell registered as a
-  // Map `{id, type, data}`, JSON.parse yields exactly the
+  // contents shape. For an entity cell materialised under #770's
+  // RMAP-augmented surface, JSON.parse yields exactly the
   // `CellContents` envelope. For ANYTHING else (a Seq of facts, an
-  // atom string, a Map missing required fields), the worker MUST NOT
-  // surface a malformed payload — it must fall through to SQL.
+  // atom string, a Map missing required fields), the worker returns
+  // null — `EntityDB.get` then falls through to the in-memory cell
+  // graph cache.
 
   it('coercion rejects non-envelope engine payloads (atom string)', async () => {
-    storeCell(ctx.storage.sql, 'fallback-1', 'Order', { fromSql: true })
     const engineMod = await import('./api/engine')
     const spy = vi.spyOn(engineMod, 'callFetchCell').mockReturnValue('plain-atom-string')
     try {
       // The engine payload is a string, not an envelope —
-      // `adaptEngineCellPayload` returns null → SQL fallback fires.
-      const result = fetchCellViaEngine(ctx.storage.sql, 1, 'fallback-1')
-      expect(result).not.toBeNull()
-      expect(result!.id).toBe('fallback-1')
-      expect(result!.data.fromSql).toBe(true)
+      // `adaptEngineCellPayload` returns null.
+      const result = fetchCellViaEngine(1, 'fallback-1')
+      expect(result).toBeNull()
     } finally {
       spy.mockRestore()
     }
   })
 
   it('coercion rejects engine payloads missing the id field', async () => {
-    storeCell(ctx.storage.sql, 'fallback-2', 'Order', { fromSql: true })
     const engineMod = await import('./api/engine')
     // Map shape but missing the `id` field — coercion rejects.
     const spy = vi.spyOn(engineMod, 'callFetchCell').mockReturnValue({ type: 'Order', data: { x: 1 } })
     try {
-      const result = fetchCellViaEngine(ctx.storage.sql, 1, 'fallback-2')
-      expect(result).not.toBeNull()
-      expect(result!.id).toBe('fallback-2')
-      expect(result!.data.fromSql).toBe(true)
+      const result = fetchCellViaEngine(1, 'fallback-2')
+      expect(result).toBeNull()
     } finally {
       spy.mockRestore()
     }
