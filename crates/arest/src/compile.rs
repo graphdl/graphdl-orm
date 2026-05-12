@@ -5584,17 +5584,13 @@ fn compile_equality_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
 /// from the eval context <response_text, sender_identity, population>.
 fn compile_forbidden_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     let forbidden_values = collect_enum_values(data, &def.spans);
-    // MC3c (#749): prefer authored `Constraint has Constraint Match Keyword`
-    // facts over the in-Rust extraction heuristic. Fall back to the legacy
-    // text-walking extractor when no facts are declared so existing
-    // fixtures keep working through the migration window.
-    let declared_keywords = constraint_match_keywords_from_cell(data, &def.id);
-    #[allow(deprecated)]
-    let text_keywords = if !declared_keywords.is_empty() {
-        declared_keywords
-    } else {
-        extract_constraint_keywords(&def.text)
-    };
+    // MC3c (#749, #897): keywords come exclusively from authored
+    // `Constraint has Constraint Match Keyword` facts. The legacy
+    // in-Rust text-walking fallback (`extract_constraint_keywords`)
+    // was removed once corpora migrated; constraints that omit the
+    // facts simply emit no OWA-keyword check (empty `text_keywords`
+    // falls through the `else if !text_keywords.is_empty()` branch).
+    let text_keywords = constraint_match_keywords_from_cell(data, &def.id);
     let is_response_constraint = def.entity.as_ref()
         .map_or(false, |e| e.to_lowercase().contains("response"));
 
@@ -5901,53 +5897,6 @@ fn constraint_match_keywords_from_cell(data: &CellIndex, constraint_id: &str)
         .map(|f| f.object_value.to_lowercase())
         .filter(|s| !s.is_empty())
         .collect()
-}
-
-/// Extract lowercase keywords from a deontic constraint text.
-/// Strips the "It is forbidden/obligatory/permitted that" prefix,
-/// then extracts PascalCase and multi-word noun phrases.
-///
-/// Deprecated (MC3c, #749): authors should declare keywords with
-/// `Constraint '<id>' has Constraint Match Keyword '<value>'` in
-/// readings instead of relying on this Rust-side text heuristic.
-/// Kept as the fallback path so legacy fixtures that don't declare
-/// keywords still produce an OWA keyword set during the migration
-/// window. Slated for removal in a follow-up once corpora migrate.
-#[deprecated(since = "0.1.0",
-    note = "MC3c (#749): declare `Constraint has Constraint Match Keyword` \
-            facts in readings instead. This in-Rust extractor is the \
-            migration-window fallback only.")]
-fn extract_constraint_keywords(text: &str) -> Vec<String> {
-    let stripped = text
-        .replace("It is forbidden that ", "")
-        .replace("It is obligatory that ", "")
-        .replace("It is permitted that ", "");
-
-    // Î±(word â†’ pascal_split â†’ filter(len>2)) : words
-    let mut keywords: Vec<String> = stripped.split_whitespace()
-        .map(|word| word.trim_matches(|c: char| !c.is_alphanumeric()))
-        .filter(|clean| !clean.is_empty())
-        .flat_map(|clean| {
-            // PascalCase split via fold: accumulate chars, emit on uppercase boundary
-            let (parts, last) = clean.chars().fold((Vec::new(), String::new()), |(mut parts, mut cur), ch| {
-                // At uppercase boundary (with non-empty accumulator), flush cur into parts
-                (ch.is_uppercase() && !cur.is_empty())
-                    .then(|| parts.push(core::mem::take(&mut cur)));
-                cur.push(ch);
-                (parts, cur)
-            });
-            parts.into_iter().chain(core::iter::once(last))
-                .map(|s| s.to_lowercase())
-                .filter(|s| s.len() > 2)
-        })
-        .collect();
-
-    // Deduplicate
-    keywords.sort();
-    keywords.dedup();
-    // Filter out common stop words
-    keywords.retain(|w| !matches!(w.as_str(), "the" | "that" | "for" | "and" | "with" | "without" | "using" | "has" | "have" | "into" | "from"));
-    keywords
 }
 
 // -- State Machine Compilation --------------------------------------
@@ -7999,20 +7948,19 @@ It is forbidden that each Noun has a name that ends with 'ies'.\n";
              got violations: {:?}", violations);
     }
 
-    /// MC3c (#749): the OWA-keyword path must source its keyword set
-    /// from declared `Constraint has Constraint Match Keyword` facts
-    /// rather than the in-Rust `extract_constraint_keywords` text
-    /// heuristic. The test pins the contract:
+    /// MC3c (#749, #897): the OWA-keyword path sources its keyword set
+    /// exclusively from declared `Constraint has Constraint Match
+    /// Keyword` facts. The legacy in-Rust text-extraction fallback was
+    /// removed in #897. The test pins the contract:
     ///
     ///   1. With NO declared keywords, a response containing the word
     ///      'overnight' does NOT trigger the constraint, because the
-    ///      legacy extractor pulls keywords from the constraint text
-    ///      ('response', 'uses', 'markdown') and 'overnight' isn't in
-    ///      that set.
+    ///      OWA-keyword branch only fires when `text_keywords` is
+    ///      non-empty — with no declared facts it stays empty.
     ///
     ///   2. With ONE declared keyword 'overnight', the same response
     ///      DOES trigger a violation — the declared-keyword set
-    ///      replaces the extracted set, and 'overnight' matches the
+    ///      drives the OWA branch, and 'overnight' matches the
     ///      response, exceeding the threshold.
     ///
     /// Both runs use identical (state, response) inputs apart from the
@@ -8060,11 +8008,11 @@ It is forbidden that each Noun has a name that ends with 'ies'.\n";
             .collect())
     }
 
-    /// MC3c (#749): legacy extractor path (no declared facts) — text
-    /// keywords ('response', 'uses', 'markdown') don't match a
-    /// response containing 'overnight rendering', so no violation.
+    /// MC3c (#749, #897): no declared keywords ⇒ empty `text_keywords`
+    /// ⇒ the OWA-keyword branch is skipped entirely, so a response
+    /// containing 'overnight rendering' produces no violation.
     #[test]
-    fn declared_keywords_unset_falls_back_to_text_extraction() {
+    fn declared_keywords_unset_yields_no_owa_match() {
         let state = state_with_owa_response_constraint(&[]);
         let defs = compile_to_defs_state(&state);
         let d = ast::defs_to_state(&defs, &state);
@@ -8083,9 +8031,9 @@ It is forbidden that each Noun has a name that ends with 'ies'.\n";
         );
         let violations = ast::decode_violations(&viol);
         assert!(violations.is_empty(),
-            "without declared keywords, response 'overnight rendering' \
-             should NOT match the text-extracted keyword set \
-             (response/uses/markdown); got {:?}", violations);
+            "without declared keywords, the OWA-keyword branch is \
+             skipped entirely, so response 'overnight rendering' \
+             must produce no violation; got {:?}", violations);
     }
 
     /// MC3c (#749): declared-keyword path — declaring 'overnight' as a
