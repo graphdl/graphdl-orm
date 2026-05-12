@@ -195,6 +195,20 @@ name = "transitivity_metamodel_rule_e2e"
 path = "tests/transitivity_metamodel_rule_e2e.rs"
 required-features = ["test-bins"]
 
+# CWA negation metamodel rule end-to-end pin (#893). Acceptance for
+# replacing the per-(CWA-noun, FT, role) Rust synthesizer loop in
+# `compile.rs::compile_derivations` (was lines ~2585-2639) with a
+# single FORML 2 metamodel derivation rule expressed in
+# `readings/core/derivation.md`. Asserts the CWA-inferred complement
+# fact `<<_neg_Person, 'bob'>>` lands in the synthetic cell
+# `_cwa_negation:Person_has_Skill` after compile + forward-chain
+# over a `Person has Skill` fixture with one participating Person
+# ('alice') and one non-participating Person ('bob').
+[[test]]
+name = "cwa_negation_metamodel_rule_e2e"
+path = "tests/cwa_negation_metamodel_rule_e2e.rs"
+required-features = ["test-bins"]
+
 # Unary-consequent derivation rule end-to-end pin (#866 follow-up).
 # The simplified unit test in compile.rs schema_tests was insufficient
 # — it didn't catch the apps/tasks failure mode where the unary FT

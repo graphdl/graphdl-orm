@@ -117,15 +117,56 @@ consequent cell name `_transitive_<Ft1>_<Ft2>` is preserved so
 SM-infrastructure gates in `command.rs` (which key off
 `_transitive_Status` / `_transitive_Transition`) keep working.
 
+## CWA negation (#893 — replaces the per-(CWA-noun, FT, role) Rust loop)
+
+Whitepaper §5.2 universal CWA-negation schema: every instance of a
+closed-world Noun that does NOT participate in a Fact Type at a
+role played by that Noun is in the complement of that Fact Type at
+that role. Open-world Nouns are skipped — absence of evidence is
+not evidence of absence under OWA.
+
+* Fact Type has CWA-complement Resource
+    iff some Noun has World Assumption 'CWA'
+    and some Fact Type has Role at position P played by that Noun
+    and that Resource is instance of that Noun
+    and no Fact of that Fact Type binds Resource at that Role
+    and that Fact is `<<_neg_<Noun>, Resource>>`
+    and that Fact lives in the synthetic cell `_cwa_negation:<Fact Type id>`.
+
+The rule's antecedent quantifies over `Noun × FactType × Role ×
+<Noun-instances>` cells gated by `Noun.world_assumption = Closed`
+and the role-membership condition `Role.noun_name = Noun.name`; its
+consequent is the synthesized `<<_neg_<Noun>, Resource>>` binding
+pushed into every fresh `_cwa_negation:<FT id>` cell when no Fact
+of `FT id` binds Resource at the Noun's role.
+`compile_cwa_negation_metamodel` in `crates/arest/src/compile.rs`
+performs the lift to a Func:
+
+  Concat . [
+    per-(CWA-Noun, FT, Role) inner Func,
+    ...
+  ]
+
+where each inner Func is the byte-for-byte same shape
+`compile_explicit_derivation` produces for an `InstancesOfNoun` +
+`AbsenceOf` 2-antecedent rule with
+`Literal("_cwa_negation:<FT id>")` consequent and
+`consequent_instance_role = "_neg_<Noun>"`. Behavioural equivalence
+with the pre-#893 per-triple fanout is pinned by
+`crates/arest/tests/cwa_negation_metamodel_rule_e2e.rs`. The
+consequent cell name `_cwa_negation:<FT id>` is preserved so
+SM-infrastructure gates in `command.rs` and the
+`evaluate::derivation_defs_from` consumer (which keys off the
+`_cwa_negation:` cell prefix) keep working.
+
 ## Other structural rules (deferred — still synthesised in compile.rs)
 
-The following rules currently remain as per-binding loops in
-`compile.rs::compile_derivations`. Lifting them to declarative
-metamodel rules here is tracked under #287/#311 follow-ups:
-
-* CWA negation — Resource is in complement of FT iff Resource is
-  instance of some Noun, Noun plays some Role of FT, no Fact uses
-  Resource for that Role.
+All four of #287/#311's structural-rule lifts (subtype inheritance,
+SS auto-fill, transitivity, CWA negation) are now expressed as
+declarative metamodel rules in this file. Future structural-rule
+lifts that need a similar treatment should follow the same shape:
+the rule body above + a `compile_<name>_metamodel(data)` lift in
+`compile.rs` + a `<name>_metamodel_rule_e2e.rs` acceptance pin.
 
 The original "implicit derivation" framing of subtype inheritance
 in `readings/core/core.md` §332 (`Resource is inherited instance of

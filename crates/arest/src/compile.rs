@@ -1333,6 +1333,38 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             }
             pairs
         };
+        // #893: collect every (CWA-noun, ft_id) pair the CWA-negation
+        // metamodel rule fans out over — every FT where some CWA
+        // noun (the default `WorldAssumption::Closed`) plays a role.
+        // The single `_cwa_negation` metamodel rule carries no
+        // individual noun name in its id (the merged Func emits the
+        // union of every per-(noun, ft, role) inner Func), so the
+        // substring fallback misses it — same gap #890 patched for
+        // `_subtype_inheritance`, #891 patched for `_ss_autofill`,
+        // and #892 patched for `_transitivity`. We key the rule
+        // under every noun that plays a role in any FT-with-a-CWA-
+        // role, so noun-gated dispatch
+        // (`command::create_via_defs`) finds it for any role of any
+        // FT involved in a CWA-negation derivation.
+        let cwa_negation_ft_pairs: Vec<(String, String)> = {
+            let mut pairs: Vec<(String, String)> = Vec::new();
+            // Walk `c_nouns` (the indexed Noun definitions) keeping
+            // only CWA nouns, mirroring
+            // `compile_cwa_negation_metamodel`'s noun filter exactly,
+            // then walk `c_fact_types` for any role-membership match.
+            // Same source so the index lines up with the compiled
+            // rule's actual fanout.
+            for (noun_name, ndef) in c_nouns.iter() {
+                if ndef.world_assumption != WorldAssumption::Closed { continue; }
+                for (ft_id, ft) in c_fact_types.iter() {
+                    if ft.roles.iter().any(|r| r.noun_name == *noun_name) {
+                        let entry = (noun_name.clone(), ft_id.clone());
+                        if !pairs.contains(&entry) { pairs.push(entry); }
+                    }
+                }
+            }
+            pairs
+        };
         let mut noun_to_derivations: HashMap<String, Vec<String>> = HashMap::new();
         // For each compiled derivation, determine which nouns are involved.
         // Strategy: check the derivation ID and all fact types in the domain
@@ -1432,6 +1464,22 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                         if let Some(ft) = c_fact_types.get(ft_id.as_str()) {
                             for role in &ft.roles { nouns.insert(role.noun_name.clone()); }
                         }
+                    }
+                }
+            }
+            // #893: same patch for the single `_cwa_negation`
+            // metamodel rule — the merged Func emits the union of
+            // every per-(CWA-noun, ft, role) inner Func, so no
+            // single noun appears in the def id. Key under the CWA
+            // noun itself AND every noun that plays a role in the
+            // gated FT (so a peer-role noun's create dispatch also
+            // triggers re-evaluation of the CWA-negation rule that
+            // partly fires on its FT).
+            if did == CWA_NEGATION_ID {
+                for (noun_name, ft_id) in cwa_negation_ft_pairs.iter() {
+                    nouns.insert(noun_name.clone());
+                    if let Some(ft) = c_fact_types.get(ft_id.as_str()) {
+                        for role in &ft.roles { nouns.insert(role.noun_name.clone()); }
                     }
                 }
             }
@@ -2582,61 +2630,20 @@ fn compile_derivations(data: &CellIndex, state_machines: &[CompiledStateMachine]
         derivations.push(d);
     }
 
-    // CWA negation (#287 gap #2): for each (CWA noun, FT, role) triple
-    // where the noun plays a role in the FT, synthesize a standard
-    // `DerivationRuleDef` with:
-    //   - primary antecedent: `InstancesOfNoun(noun)` — the noun's
-    //     instances aggregated across every cell.
-    //   - secondary antecedent: `AbsenceOf { fact_type: ft_id,
-    //     role: noun_name }` — the "no fact of ft_id has this
-    //     instance at the noun's role" guard.
-    //   - consequent_cell: `Literal("_cwa_negation:<ft_id>")` — a
-    //     dedicated per-FT negation cell keeping negatives out of
-    //     presence-constraint enumerations.
-    //   - consequent_instance_role: `_neg_<noun>` — the binding key
-    //     downstream code knows to look for.
-    // The rule routes through `compile_explicit_derivation`'s
-    // InstancesOfNoun+guard path, same Func shape every user rule
-    // (and subtype inheritance) uses. The named `compile_cwa_negation`
-    // function is gone; the inlined per-FT Func-builder that replaced
-    // it in an earlier pass is also gone.
-    derivations.extend(data.nouns.iter()
-        .filter(|(_, def)| def.world_assumption == WorldAssumption::Closed)
-        .flat_map(|(noun_name, _)| {
-            let noun = noun_name.clone();
-            data.fact_types.iter()
-                .flat_map(move |(ft_id, ft)| {
-                    let noun = noun.clone();
-                    let ft_id = ft_id.clone();
-                    let reading = ft.reading.clone();
-                    let noun_filter = noun.clone();
-                    ft.roles.iter()
-                        .filter(move |r| r.noun_name == noun_filter)
-                        .map(move |_r| (noun.clone(), ft_id.clone(), reading.clone()))
-                })
-        })
-        .map(|(noun, ft_id, reading)| {
-            let rule = DerivationRuleDef {
-                id: format!("_cwa_negation_{}_{}", noun, ft_id),
-                text: format!("NOT: {} (CWA negation for {})", reading, noun),
-                antecedent_sources: vec![
-                    crate::types::AntecedentSource::InstancesOfNoun(noun.clone()),
-                    crate::types::AntecedentSource::AbsenceOf {
-                        fact_type: ft_id.clone(),
-                        role: noun.clone(),
-                    },
-                ],
-                consequent_cell: crate::types::ConsequentCellSource::Literal(
-                    format!("_cwa_negation:{}", ft_id)),
-                consequent_instance_role: format!("_neg_{}", noun),
-                kind: DerivationKind::ClosedWorldNegation,
-                join_on: vec![], match_on: vec![], consequent_bindings: vec![],
-                antecedent_filters: vec![], consequent_computed_bindings: vec![],
-                consequent_aggregates: vec![], unresolved_clauses: vec![],
-                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
-            };
-            compile_explicit_derivation(data, &rule)
-        }));
+    // CWA negation (#893): the per-(CWA-noun, FT, role) synthesis
+    // loop is replaced by ONE metamodel derivation rule declared in
+    // `readings/core/derivation.md` and lifted to ONE
+    // CompiledDerivation by `compile_cwa_negation_metamodel`.
+    // Whitepaper §5.2: this is the universal CWA-negation schema —
+    // antecedent quantifies over `Noun × FactType × Role × <Noun-
+    // instances>` cells gated by `world_assumption = Closed` and the
+    // role-membership condition; consequent is the synthesized
+    // `<<_neg_<noun>, instance>>` fact pushed into the synthetic
+    // `_cwa_negation:<ft_id>` cell when no fact of `ft_id` binds
+    // that instance at that role.
+    if let Some(d) = compile_cwa_negation_metamodel(data) {
+        derivations.push(d);
+    }
 
     // Implicit: state machine initialization from cell-driven SM defs.
     // MC3b-e (#763): SMs come from `compile_state_machine_from_cells`,
@@ -4577,6 +4584,116 @@ pub(crate) fn compile_transitivity_metamodel(
 /// merged Func emits the union of every per-pair inner Func, so no
 /// single noun appears in the def name).
 pub(crate) const TRANSITIVITY_ID: &str = "_transitivity";
+
+/// Compile CWA (Closed-World-Assumption) negation as ONE
+/// CompiledDerivation whose Func concatenates per-(CWA-noun, FT,
+/// role) inner Funcs (#893).
+///
+/// Whitepaper §5.2 (universal CWA-negation schema) frames closed-
+/// world negation as a single metamodel derivation rule whose
+/// antecedent quantifies over `Noun × FactType × Role × <Noun-
+/// instances>` cells gated by `Noun.world_assumption = Closed` and
+/// the role-membership condition `Role.noun_name = Noun.name`. Its
+/// consequent is the synthesized `<<_neg_<noun>, instance>>` fact
+/// pushed into the synthetic `_cwa_negation:<ft_id>` cell when no
+/// fact of `ft_id` binds that instance at that role (the `AbsenceOf`
+/// guard antecedent enforces the participation check). The
+/// declarative form lives in `readings/core/derivation.md`; this
+/// function is the compile-time lift of that rule into a Func the
+/// FFP forward chainer fires at evaluation time.
+///
+/// Each per-(noun, ft, role) inner Func is byte-for-byte the same
+/// shape `compile_explicit_derivation` produces for an
+/// `InstancesOfNoun` + `AbsenceOf` 2-antecedent rule with
+/// `Literal("_cwa_negation:<ft_id>")` consequent and
+/// `consequent_instance_role = "_neg_<noun>"` — so behaviour is
+/// preserved across the loop → metamodel-rule transition (#893
+/// acceptance: `cwa_negation_metamodel_rule_e2e.rs`).
+///
+/// Returns `None` when no (CWA-noun, FT) participation triple
+/// exists — the chainer shouldn't see a no-op `Concat . []` def in
+/// that case (matches the pre-#893 loop's "no rules emitted when no
+/// CWA noun plays a role in any FT" behaviour).
+pub(crate) fn compile_cwa_negation_metamodel(
+    data: &CellIndex,
+) -> Option<CompiledDerivation> {
+    // Mirror the pre-#893 loop's triple enumeration exactly: walk
+    // every CWA noun, then every FT, then every role of that FT
+    // whose `noun_name` matches the current noun. Same iteration
+    // order, so emission is byte-for-byte identical at the cell
+    // level.
+    let inner_funcs: Vec<Func> = data.nouns.iter()
+        .filter(|(_, def)| def.world_assumption == WorldAssumption::Closed)
+        .flat_map(|(noun_name, _)| {
+            let noun = noun_name.clone();
+            data.fact_types.iter()
+                .flat_map(move |(ft_id, ft)| {
+                    let noun = noun.clone();
+                    let ft_id = ft_id.clone();
+                    let reading = ft.reading.clone();
+                    let noun_filter = noun.clone();
+                    ft.roles.iter()
+                        .filter(move |r| r.noun_name == noun_filter)
+                        .map(move |_r| (noun.clone(), ft_id.clone(), reading.clone()))
+                })
+        })
+        .map(|(noun, ft_id, reading)| {
+            // Lift each (noun, ft, role) triple to the same
+            // DerivationRuleDef the pre-#893 loop synthesized, then
+            // route through compile_explicit_derivation so the
+            // InstancesOfNoun + AbsenceOf 2-antecedent +
+            // Literal-consequent path produces the per-triple Func.
+            // Discard the wrapper CompiledDerivation — we want only
+            // its `func` to fold into the outer Concat.
+            let rule = DerivationRuleDef {
+                id: format!("_cwa_negation_{}_{}", noun, ft_id),
+                text: format!("NOT: {} (CWA negation for {})", reading, noun),
+                antecedent_sources: vec![
+                    crate::types::AntecedentSource::InstancesOfNoun(noun.clone()),
+                    crate::types::AntecedentSource::AbsenceOf {
+                        fact_type: ft_id.clone(),
+                        role: noun.clone(),
+                    },
+                ],
+                consequent_cell: crate::types::ConsequentCellSource::Literal(
+                    format!("_cwa_negation:{}", ft_id)),
+                consequent_instance_role: format!("_neg_{}", noun),
+                kind: DerivationKind::ClosedWorldNegation,
+                join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+                antecedent_filters: vec![], consequent_computed_bindings: vec![],
+                consequent_aggregates: vec![], unresolved_clauses: vec![],
+                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+            };
+            compile_explicit_derivation(data, &rule).func
+        })
+        .collect();
+    if inner_funcs.is_empty() { return None; }
+    // Concat the per-triple Funcs into one Func that emits the
+    // union of every per-triple inner Func's tuple sequence.
+    // forward_chain_defs_state routes each emitted
+    // `<consequent_ft_id, reading, bindings>` tuple to its own
+    // `_cwa_negation:<ft_id>` cell (slot 0), so the merged emission
+    // is indistinguishable from the pre-#893 N-Funcs-N-defs shape
+    // at the cell level.
+    let func = Func::compose(Func::Concat, Func::construction(inner_funcs));
+    Some(CompiledDerivation {
+        id: CWA_NEGATION_ID.to_string(),
+        text: "CWA negation metamodel rule (readings/core/derivation.md)".to_string(),
+        kind: DerivationKind::ClosedWorldNegation,
+        func,
+        uses_negation: true,
+    })
+}
+
+/// Synthetic id for the single CWA-negation metamodel rule (#893).
+/// Recognised by the `derivation_index` synthetic-id fallback in
+/// `compile_to_defs_state` so the index keys this id into every
+/// CWA noun that plays a role in some FT — without that, noun-gated
+/// `command::create_via_defs` paths would skip CWA negation for
+/// lack of a noun-name match in the id (the merged Func emits the
+/// union of every per-(noun, ft, role) inner Func, so no single
+/// noun appears in the def name).
+pub(crate) const CWA_NEGATION_ID: &str = "_cwa_negation";
 
 /// State machine initialization as a derivation rule.
 ///
