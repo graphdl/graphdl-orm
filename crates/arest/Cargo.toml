@@ -185,6 +185,30 @@ name = "unary_derivation_e2e"
 path = "tests/unary_derivation_e2e.rs"
 required-features = ["test-bins", "local"]
 
+# DerivationRule replace-on-recompile pin (#913). cor:closure preserves
+# the `DerivationRule` meta cell across recompiles. Each parse emits a
+# rule fact with `id = fnv(text)`, so editing a rule body produces a
+# new id and the prior rule survives concat_dedup — both rules' def
+# cells fire on the next forward chain. Spec: readings are the source
+# of truth for the rule set, so the consequent cell must reflect ONLY
+# the current rule. Mirrors the #836 fix's "drop derived cells before
+# forward chain" but targets the rule REGISTRY itself.
+[[test]]
+name = "derivation_rule_replace_on_recompile_e2e"
+path = "tests/derivation_rule_replace_on_recompile_e2e.rs"
+required-features = ["test-bins"]
+
+# Cross-antecedent role-vs-role value comparison (#914). Parser-side
+# recognition of `<Noun1>'s <Role> <word-comparator> <Noun2>'s <Role>`
+# clauses in derivation rule bodies, reusing the existing
+# `WordComparatorTable` vocabulary (no parallel keyword table).
+# Asserts the parsed rule's `antecedent_role_comparisons` is non-empty
+# AND forward-chain emits only the directional pairs (lhs < rhs).
+[[test]]
+name = "cross_antecedent_value_comparison_e2e"
+path = "tests/cross_antecedent_value_comparison_e2e.rs"
+required-features = ["test-bins"]
+
 [features]
 # `test-bins` (#684/#650a) — opt-in flag that lets each integration
 # `[[test]]` entry compile. Off by default so `cargo test --lib`
