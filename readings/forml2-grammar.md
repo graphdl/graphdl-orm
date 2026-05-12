@@ -72,6 +72,8 @@ Noun Has Noun Literal Keyword is a value type.
   The possible values of Noun Has Noun Literal Keyword are ' has '.
 Entity Ref Scheme Literal Keyword is a value type.
   The possible values of Entity Ref Scheme Literal Keyword are ' is not', ' is'.
+Bare Value Comparison Keyword is a value type.
+  The possible values of Bare Value Comparison Keyword are ' or more', ' or less', ' or greater', ' or fewer'.
 Possessive Marker is a value type.
   The possible values of Possessive Marker are 'apostrophe-s'.
 Subtype Instance Check Keyword is a value type.

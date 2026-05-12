@@ -796,6 +796,91 @@ impl EntityRefSchemeLiteralTable {
     }
 }
 
+/// #880 — `is_bare_value_comparison` in `parse_forml2.rs` scans for a
+/// trailing bare-value comparison keyword (` or more`, ` or less`,
+/// ` or greater`, ` or fewer`) on the right end of the clause via an
+/// inline 4-entry `TAILS` const checked with
+/// `trimmed.ends_with(t)`. Each entry carries a leading space so the
+/// `ends_with` match enforces a word boundary (otherwise tokens
+/// whose final word ends with one of the marker words would
+/// mis-match).
+///
+/// The lift moves the suffix-marker vocabulary to a typed
+/// `BareValueComparisonTable` reading the `Bare Value Comparison
+/// Keyword` grammar enum. Boot-table rows store the keyword with its
+/// leading space so the `ends_with` semantics round-trip without
+/// surprise. Reuses the same boot/from_grammar_state/iter shape as
+/// the sibling `EntityRefSchemeLiteralTable` / `NounHasNounLiteralTable`
+/// lifts. Future keywords (e.g., ` or above`, ` or below`) extend the
+/// grammar declaration and are picked up automatically; no Rust
+/// change is required.
+///
+/// NOTE: this table is adjacent to but distinct from
+/// `WordComparatorTable`. WordComparator covers the bridge-form
+/// comparators (` exceeds `, ` equals `, ` is greater than `, ...)
+/// that appear between two operands. The bare-value comparison shape
+/// is a trailing range-bound suffix on the value side of an `of`-
+/// possessive clause and has no overlap with the WordComparator
+/// vocabulary, so a parallel table is the right call here (cf. the
+/// #914 note where the reverted `CrossAntecedentComparatorTable`
+/// invented an unnecessary parallel vocabulary).
+#[derive(Debug, Clone)]
+pub struct BareValueComparisonTable {
+    /// The four bare-value-comparison trailing-suffix keywords. Order
+    /// matches the `' or more', ' or less', ' or greater', ' or fewer'`
+    /// declaration in `readings/forml2-grammar.md` and the legacy
+    /// `TAILS` const in `is_bare_value_comparison` so any-match-wins
+    /// iteration behavior round-trips.
+    pub rows: Vec<String>,
+}
+
+impl BareValueComparisonTable {
+    /// Boot table — must stay in sync with `Bare Value Comparison
+    /// Keyword` enum-value declaration in
+    /// `readings/forml2-grammar.md`. Four markers (` or more`,
+    /// ` or less`, ` or greater`, ` or fewer`) in the same declaration
+    /// order as the legacy hardcoded `TAILS` const in
+    /// `is_bare_value_comparison`.
+    pub fn boot() -> Self {
+        BareValueComparisonTable {
+            rows: alloc::vec![
+                " or more".to_string(),
+                " or less".to_string(),
+                " or greater".to_string(),
+                " or fewer".to_string(),
+            ],
+        }
+    }
+
+    /// Build the table from the runtime `Bare Value Comparison
+    /// Keyword` enum-value declaration. Falls back to `boot()` when
+    /// the cell is empty (bare engine, no metamodel loaded).
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_enum_values(state, "Bare Value Comparison Keyword");
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            BareValueComparisonTable { rows }
+        }
+    }
+
+    /// Iterate the keywords in declaration order. Each keyword
+    /// carries its leading space; the caller uses `ends_with_keyword`
+    /// for the `ends_with` form.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.rows.iter().map(|s| s.as_str())
+    }
+
+    /// Return true iff `clause` ends with any declared keyword.
+    /// Mirrors the legacy `TAILS.iter().any(|t| trimmed.ends_with(t))`
+    /// shape in `is_bare_value_comparison` exactly: case-sensitive
+    /// suffix match, leading space in the keyword enforces the word
+    /// boundary.
+    pub fn ends_with_keyword(&self, clause: &str) -> bool {
+        self.rows.iter().any(|kw| clause.ends_with(kw.as_str()))
+    }
+}
+
 /// #884 - `try_expand_possessive` in `parse_forml2.rs` rewrites
 /// possessive antecedent clauses of the shape `<Noun1>'s <Noun2> ...`
 /// into the explicit join form `<Noun1> has <Noun2> and that
@@ -5271,6 +5356,8 @@ mod tests {
     /// bumping noun=47, enum=36.
     /// #879 added `Subtype Instance Check Keyword` enum (2 values) —
     /// bumping noun=46, enum=35.
+    /// #880 added `Bare Value Comparison Keyword` enum (4 values) —
+    /// bumping noun=48, enum=37.
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
@@ -5278,7 +5365,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 47, "noun count");
+        assert_eq!(noun_count, 48, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -5290,7 +5377,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 36, "enum-valued noun count");
+        assert_eq!(enum_count, 37, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -7343,6 +7430,81 @@ mod tests {
         let table = super::EntityRefSchemeLiteralTable::from_grammar_state(&state);
         assert_eq!(table.rows.len(), 2,
             "empty grammar state falls back to the 2-keyword boot table");
+    }
+
+    // ─── #880: bare value comparison table ───────────────────────────
+
+    /// #880 — `is_bare_value_comparison` in parse_forml2.rs has a
+    /// hardcoded 4-entry `TAILS` const (` or more`, ` or less`,
+    /// ` or greater`, ` or fewer`) checked via
+    /// `TAILS.iter().any(|t| trimmed.ends_with(t))`. The keyword set
+    /// lives in code, not in the grammar. Each entry carries a leading
+    /// space so the `ends_with` match enforces a word boundary
+    /// (otherwise tokens whose final word ends with one of the marker
+    /// words could mis-match). This lift moves the suffix-marker
+    /// vocabulary to a typed `BareValueComparisonTable` reading the
+    /// `Bare Value Comparison Keyword` grammar enum. Boot table
+    /// preserves the historic four-keyword order so the recognizer
+    /// behaves identically before and after the lift.
+    #[test]
+    fn bare_value_comparison_table_boot_has_four_keywords_in_declared_order() {
+        let table = super::BareValueComparisonTable::boot();
+        let words: Vec<&str> = table.iter().collect();
+        assert_eq!(words, vec![" or more", " or less", " or greater", " or fewer"],
+            "boot table must mirror the historic ` or more` / ` or less` \
+             / ` or greater` / ` or fewer` suffix order in \
+             is_bare_value_comparison, with the leading space included \
+             so the ends_with semantics round-trip on word boundaries.");
+    }
+
+    /// #880 — `ends_with_keyword` returns true when the clause ends
+    /// with any declared keyword. Mirrors the legacy
+    /// `TAILS.iter().any(|t| trimmed.ends_with(t))` shape in
+    /// `is_bare_value_comparison` exactly: case-sensitive suffix match,
+    /// leading space in the keyword enforces the word boundary.
+    #[test]
+    fn bare_value_comparison_table_ends_with_keyword_returns_bool() {
+        let table = super::BareValueComparisonTable::boot();
+        assert!(
+            table.ends_with_keyword("HTTP Status of 500 or more"),
+            "` or more` suffix matches at clause tail");
+        assert!(
+            table.ends_with_keyword("HTTP Status of 500 or less"),
+            "` or less` suffix matches at clause tail");
+        assert!(
+            table.ends_with_keyword("HTTP Status of 500 or greater"),
+            "` or greater` suffix matches at clause tail");
+        assert!(
+            table.ends_with_keyword("HTTP Status of 500 or fewer"),
+            "` or fewer` suffix matches at clause tail");
+        assert!(
+            !table.ends_with_keyword("HTTP Status of 500"),
+            "clause without trailing keyword must not match");
+        assert!(
+            !table.ends_with_keyword(""),
+            "empty clause cannot end with any keyword");
+    }
+
+    /// #880 — when state's EnumValues cell carries Bare Value
+    /// Comparison Keyword values, from_grammar_state lifts them at
+    /// runtime.
+    #[test]
+    fn bare_value_comparison_table_from_grammar_state_reads_enum_values() {
+        let state = synthetic_enum_state(&[
+            ("Bare Value Comparison Keyword", &[" or above", " or below"]),
+        ]);
+        let table = super::BareValueComparisonTable::from_grammar_state(&state);
+        assert_eq!(table.rows, vec![" or above", " or below"]);
+        assert!(table.ends_with_keyword("Score of 80 or above"),
+            "runtime-loaded keyword must be honoured by the accessor");
+    }
+
+    #[test]
+    fn bare_value_comparison_table_falls_back_to_boot_on_empty_state() {
+        let state = synthetic_enum_state(&[]);
+        let table = super::BareValueComparisonTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 4,
+            "empty grammar state falls back to the 4-keyword boot table");
     }
 
     // --- #884: possessive marker table -----------------------------

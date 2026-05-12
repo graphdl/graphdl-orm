@@ -366,12 +366,17 @@ fn is_range_filter_clause(
 /// `HTTP Status of at least 500`, `HTTP Status of at most 500`.
 /// The FT reference is the subject noun; the `of <N> <comparator>`
 /// tail is an implicit comparator filter on the value side.
+///
+/// #880 Sweep-1 lift — trailing comparison-keyword vocabulary lifts
+/// to `BareValueComparisonTable` so the keyword set lives in
+/// `readings/forml2-grammar.md` as a `Bare Value Comparison Keyword`
+/// enum value type. Boot stays in sync with the grammar; same
+/// any-match-wins iteration as the legacy inline `TAILS.iter().any(
+/// |t| trimmed.ends_with(t))`.
 fn is_bare_value_comparison(clause: &str, noun_names: &[String]) -> bool {
-    const TAILS: &[&str] = &[
-        " or more", " or less", " or greater", " or fewer",
-    ];
     let trimmed = clause.trim().trim_end_matches('.');
-    let ends_with_tail = TAILS.iter().any(|t| trimmed.ends_with(t));
+    let ends_with_tail = crate::parse_forml2_stage2::BareValueComparisonTable::boot()
+        .ends_with_keyword(trimmed);
     if !ends_with_tail { return false; }
     // The clause must contain " of " followed by a numeric literal
     // and reference at least one declared noun on the left side.
