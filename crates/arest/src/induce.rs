@@ -736,6 +736,215 @@ fn target_in_post_state(target: &Object, post_state: &Object) -> bool {
     })
 }
 
+// ─── #856 Rule induction primitive ────────────────────────────────────────
+//
+// Distinct from the #846–#852 abductive induction primitives (which
+// enumerate hidden FACT populations to explain `to_explain`):
+//
+// Rule induction enumerates DERIVATION RULE candidates whose forward-
+// chain semantics reproduce ALL positive examples AND reject ALL
+// negative examples. The candidate SPACE is rules, not facts.
+//
+// ARC-AGI-3 use case: observe ~3 input/output transitions of a novel
+// game ("doubling": 1→2, 2→4, 3→6), induce the candidate rule
+// (`Y is doubling of X iff Y is 2 × X`), then deduce the rest of the
+// game by forward-chaining that rule.
+//
+// Candidate space (this primitive): literal-multiplier arithmetic
+// rules `Y = N × X` for N ∈ 1..=DEFAULT_RULE_SEARCH_MAX_MULTIPLIER. The
+// rule-template space is code-defined here because the rules are about
+// rules — a meta-language. Each candidate compiles to a
+// `DerivationRuleDef` carrying a single `ConsequentComputedBinding`
+// over an `ArithExpr` so the existing forward-chain machinery
+// (compile.rs ArithExpr lowering, evaluate.rs LFP) interprets it
+// identically to a user-authored `Y is doubling of X iff Y is 2 × X`
+// derivation rule.
+//
+// Scoring: `(positives matched) − NEGATIVE_PENALTY × (negatives
+// matched)`. Negatives weighted heavily so a rule that fits all
+// positives by accident but also fires for a negative ranks below a
+// rule that fits all positives and rejects every negative.
+
+/// Default upper bound for literal-multiplier search. Covers the
+/// canonical ARC-AGI-3 "doubling" / "tripling" / etc. patterns without
+/// blowing up the candidate space when the call site doesn't override.
+const DEFAULT_RULE_SEARCH_MAX_MULTIPLIER: i64 = 10;
+
+/// Per-negative penalty in the rule-fit score. A candidate that fits
+/// all positives but also matches one negative is strictly worse than
+/// a candidate that fits all positives and rejects every negative —
+/// the high weight collapses ties so the generalising rule ranks first.
+const NEGATIVE_PENALTY: i64 = 10;
+
+/// #856 — Rule induction search.
+///
+/// Enumerate candidate `DerivationRuleDef`s of the literal-multiplier
+/// form `Y = N × X` (N ∈ 1..=DEFAULT_RULE_SEARCH_MAX_MULTIPLIER), score
+/// each by `(positives matched) − NEGATIVE_PENALTY × (negatives
+/// matched)`, and return them ranked by score descending.
+///
+/// Inputs:
+///   - `state`: schema cells (Noun, FactType, Role) used to identify
+///     the consequent FT id + role nouns. Both positives and negatives
+///     share a common `fieldName` binding — that's the FT under
+///     induction.
+///   - `defs`: compiled defs Object (parity with the abductive `run_search`
+///     signature). Currently unused by the literal-multiplier template
+///     but kept on the API so future templates (e.g. join + arithmetic
+///     fitness checks against alethic constraints) plug in without a
+///     breaking signature change.
+///   - `positive_examples`: InstanceFact-shaped facts the rule must
+///     derive. For arithmetic templates, each fact must carry
+///     `subjectValue` + `objectValue` parseable as integers.
+///   - `negative_examples`: InstanceFact-shaped facts the rule must
+///     NOT derive.
+///
+/// Output: `Vec<DerivationRuleDef>` ranked by score descending. Empty
+/// when no positive examples are supplied (nothing to fit), or every
+/// candidate scored ≤ 0 (no rule in the space generalised). Stable
+/// sort preserves enumeration order on ties so re-runs are
+/// deterministic.
+///
+/// The chosen rule's `consequent_computed_bindings` carries the
+/// arithmetic expression `N × <role-1-noun>`; forward-chaining over
+/// the schema's role-1 (X) observations derives `<role-0-noun, N × X>`
+/// into the FT cell — the platform's existing forward-chain machinery
+/// interprets the resulting `DerivationRuleDef` without any new
+/// engine wiring.
+pub fn run_rule_search(
+    state: &Object,
+    _defs: &Object,
+    positive_examples: &[Object],
+    negative_examples: &[Object],
+) -> Vec<crate::types::DerivationRuleDef> {
+    if positive_examples.is_empty() {
+        return Vec::new();
+    }
+    // Every example must share a common FT id (the rule being induced
+    // derives into ONE consequent cell). When ids disagree, return
+    // empty — the call site has the wrong input shape.
+    let Some(ft_id) = common_field_name(positive_examples, negative_examples) else {
+        return Vec::new();
+    };
+    let role_nouns = role_nouns_for_ft(state, &ft_id);
+    if role_nouns.len() != 2 {
+        // Literal-multiplier template only fits binary FTs. Higher
+        // arities (ternary +) need a different template space.
+        return Vec::new();
+    }
+    let consequent_role = &role_nouns[0]; // role 0 — the "Y" in Y is doubling of X
+    let antecedent_role = &role_nouns[1]; // role 1 — the "X"
+
+    // Parse positives + negatives into (Y, X) integer pairs up front so
+    // the scoring loop doesn't re-parse per multiplier candidate.
+    let positives_int = parse_examples_as_int_pairs(positive_examples);
+    let negatives_int = parse_examples_as_int_pairs(negative_examples);
+
+    let mut scored: Vec<(i64, crate::types::DerivationRuleDef)> = Vec::new();
+    for n in 1..=DEFAULT_RULE_SEARCH_MAX_MULTIPLIER {
+        let rule = build_multiplier_rule(&ft_id, consequent_role, antecedent_role, n);
+        let pos_hits: i64 = positives_int.iter()
+            .filter(|(y, x)| n * x == *y)
+            .count() as i64;
+        let neg_hits: i64 = negatives_int.iter()
+            .filter(|(y, x)| n * x == *y)
+            .count() as i64;
+        let score = pos_hits - NEGATIVE_PENALTY * neg_hits;
+        // Keep only candidates that actually fit at least one positive.
+        // A zero-positive rule contributes no information and would
+        // clutter the output.
+        if pos_hits > 0 {
+            scored.push((score, rule));
+        }
+    }
+    // Stable sort by score descending. Stable so ties preserve
+    // enumeration order (small multipliers first) — deterministic
+    // across re-runs.
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.into_iter().map(|(_, r)| r).collect()
+}
+
+/// Extract the `fieldName` shared by every example. Returns `None` if
+/// the slices are empty or if any example carries a different id.
+fn common_field_name(
+    positives: &[Object],
+    negatives: &[Object],
+) -> Option<String> {
+    let first = binding(positives.first()?, "fieldName")?.to_string();
+    if first.is_empty() { return None; }
+    for ex in positives.iter().chain(negatives.iter()) {
+        match binding(ex, "fieldName") {
+            Some(id) if id == first => {}
+            _ => return None,
+        }
+    }
+    Some(first)
+}
+
+/// Parse a slice of InstanceFact-shaped examples into `(Y, X)` integer
+/// pairs. Examples whose subjectValue/objectValue fail to parse as i64
+/// are skipped silently — non-numeric examples don't participate in
+/// arithmetic-template scoring.
+fn parse_examples_as_int_pairs(examples: &[Object]) -> Vec<(i64, i64)> {
+    examples.iter()
+        .filter_map(|ex| {
+            let y = binding(ex, "subjectValue")?.parse::<i64>().ok()?;
+            let x = binding(ex, "objectValue")?.parse::<i64>().ok()?;
+            Some((y, x))
+        })
+        .collect()
+}
+
+/// Build a `DerivationRuleDef` representing the literal-multiplier rule
+/// `Y = N × X` for the given consequent FT and role nouns. The text is
+/// shaped after the user-facing reading `Y is doubling of X iff Y is N
+/// × X` so a downstream renderer (or a human reading the candidate
+/// list) can immediately see the multiplier.
+fn build_multiplier_rule(
+    ft_id: &str,
+    consequent_role: &str,
+    antecedent_role: &str,
+    n: i64,
+) -> crate::types::DerivationRuleDef {
+    use crate::types::{
+        DerivationRuleDef, DerivationKind, ConsequentCellSource,
+        AntecedentSource, ConsequentComputedBinding, ArithExpr,
+    };
+    let text = alloc::format!(
+        "* {consequent_role} is doubling of {antecedent_role} iff \
+         {consequent_role} is {n} × {antecedent_role}",
+        consequent_role = consequent_role,
+        antecedent_role = antecedent_role,
+        n = n,
+    );
+    let id = alloc::format!("rule_induced_n{}", n);
+    DerivationRuleDef {
+        id,
+        text,
+        antecedent_sources: alloc::vec![AntecedentSource::FactType(ft_id.to_string())],
+        consequent_instance_role: String::new(),
+        consequent_cell: ConsequentCellSource::Literal(ft_id.to_string()),
+        kind: DerivationKind::ModusPonens,
+        join_on: Vec::new(),
+        match_on: Vec::new(),
+        consequent_bindings: Vec::new(),
+        antecedent_filters: Vec::new(),
+        consequent_computed_bindings: alloc::vec![ConsequentComputedBinding {
+            role: consequent_role.to_string(),
+            expr: ArithExpr::Op(
+                "*".to_string(),
+                alloc::boxed::Box::new(ArithExpr::Literal(n as f64)),
+                alloc::boxed::Box::new(ArithExpr::RoleRef(antecedent_role.to_string())),
+            ),
+        }],
+        consequent_aggregates: Vec::new(),
+        unresolved_clauses: Vec::new(),
+        antecedent_role_literals: Vec::new(),
+        antecedent_role_comparisons: Vec::new(),
+        consequent_role_literals: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1411,5 +1620,178 @@ Thing has Other.
         assert_eq!(hyp_summaries[1].0, "1",
             "expected second hyp's confidenceScore to be '1'; got {:?}",
             hyp_summaries);
+    }
+
+    // ─── #856 run_rule_search — induce DERIVATION RULES from positives + negatives ──
+
+    /// Acceptance test for #856 rule induction primitive.
+    ///
+    /// Distinct from the #846–#852 abductive induction primitives
+    /// (which enumerate hidden FACT populations to explain `to_explain`):
+    /// this primitive enumerates DERIVATION RULE candidates whose
+    /// forward-chain semantics reproduce ALL positive examples AND
+    /// reject ALL negative examples.
+    ///
+    /// ARC-AGI-3 use case: given ~3 observed input/output transitions of
+    /// a novel game (here the "doubling" pattern: 1→2, 2→4, 3→6), induce
+    /// the underlying rule (`Y = 2 × X`) so the rest of the game's
+    /// transitions deduce.
+    ///
+    /// Schema:
+    ///   Number(.value) is an entity type.
+    ///   Number is doubling of Number.   (binary ring FT)
+    ///
+    /// Positives (3): <2, 1>, <4, 2>, <6, 3>.
+    /// Negatives (2): <5, 1>, <7, 4>  — fail Y = 2 × X.
+    ///
+    /// Search space: literal-multiplier rules `Y = N × X` for N ∈ 1..=10.
+    /// Score = (positives matched) − 10 × (negatives matched), so the
+    /// generalising rule wins by a wide margin over any spurious-fit one.
+    ///
+    /// The top-ranked candidate's text MUST encode the doubling pattern
+    /// (multiplier 2 over role X) AND its consequent_computed_bindings
+    /// must hold an `ArithExpr` whose evaluation against each positive's
+    /// X yields the positive's Y, and against each negative's X yields a
+    /// value DIFFERENT from the negative's Y. That arithmetic property
+    /// IS the forward-chain semantics for the rule's consequent role:
+    /// the consequent fact carries `<Y, value_from_expr>`, so the rule
+    /// derives the positive's Y exactly when `expr(X) == Y`.
+    #[test]
+    fn rule_search_finds_doubling_rule_from_positive_and_negative_examples() {
+        // Schema cells — Number entity type, ring binary FT Number_is_doubling_of_Number.
+        // No EnumValues for Number (entity-side population only); the
+        // role-0/role-1 nouns are both "Number" (ring shape).
+        let state = make_state(
+            &[("Number", "entity")],
+            &[("Number_is_doubling_of_Number",
+               "Number is doubling of Number", 2)],
+            &[
+                ("Number_is_doubling_of_Number", "Number", 0),
+                ("Number_is_doubling_of_Number", "Number", 1),
+            ],
+            &[],
+            // Seed Number instances so the entity-side domain is non-empty
+            // for downstream callers (rule induction itself reads the
+            // examples directly, but a realistic schema carries the
+            // population alongside).
+            &[
+                vec![("subjectNoun", "Number"), ("subjectValue", "1"),
+                     ("fieldName", "Number_exists"),
+                     ("objectNoun", ""), ("objectValue", "")],
+                vec![("subjectNoun", "Number"), ("subjectValue", "2"),
+                     ("fieldName", "Number_exists"),
+                     ("objectNoun", ""), ("objectValue", "")],
+                vec![("subjectNoun", "Number"), ("subjectValue", "3"),
+                     ("fieldName", "Number_exists"),
+                     ("objectNoun", ""), ("objectValue", "")],
+                vec![("subjectNoun", "Number"), ("subjectValue", "4"),
+                     ("fieldName", "Number_exists"),
+                     ("objectNoun", ""), ("objectValue", "")],
+            ],
+        );
+        let defs_vec = crate::compile::compile_to_defs_state(&state);
+        let d = crate::ast::defs_to_state(&defs_vec, &state);
+
+        // Build positive / negative InstanceFact-shaped facts. Subject =
+        // Y (role 0), object = X (role 1) per the reading `Y is doubling
+        // of X`. Stage-2 emits ring FTs in role-declaration order, so
+        // subjectValue=Y, objectValue=X aligns with the role list above.
+        let positives: Vec<Object> = [(2, 1), (4, 2), (6, 3)].iter()
+            .map(|(y, x)| number_doubling_fact(y, x))
+            .collect();
+        let negatives: Vec<Object> = [(5, 1), (7, 4)].iter()
+            .map(|(y, x)| number_doubling_fact(y, x))
+            .collect();
+
+        let candidates = crate::induce::run_rule_search(
+            &state, &d, &positives, &negatives);
+        assert!(!candidates.is_empty(),
+            "run_rule_search must return at least one candidate rule for \
+             the doubling pattern; got empty");
+
+        // Top-ranked candidate must encode multiplier 2 over a Number
+        // role. The text mentions "2" (the multiplier literal) and the
+        // ConsequentComputedBinding holds an ArithExpr whose evaluation
+        // reproduces every positive and rejects every negative.
+        let top = &candidates[0];
+        assert!(top.text.contains('2'),
+            "top-ranked candidate's text must mention the doubling \
+             multiplier '2'; got text = {:?}", top.text);
+        assert_eq!(top.consequent_cell.literal_id(),
+            "Number_is_doubling_of_Number",
+            "top-ranked candidate must derive into the doubling FT cell; \
+             got {:?}", top.consequent_cell);
+
+        // The consequent_computed_bindings must hold an ArithExpr that
+        // evaluates as Y = 2 × X for each positive and NOT for any negative.
+        // This IS the forward-chain semantics: the rule's consequent role
+        // value is computed by this expression against antecedent role
+        // values, so the post-chain fact carries `<Y, expr(X)>` and is
+        // discoverable in the cell exactly when `expr(X) == Y`.
+        assert_eq!(top.consequent_computed_bindings.len(), 1,
+            "top-ranked candidate must hold exactly one \
+             ConsequentComputedBinding for the Y role; got {:?}",
+            top.consequent_computed_bindings);
+        let cb = &top.consequent_computed_bindings[0];
+
+        // Apply the expression to each positive; result must equal Y.
+        for fact in positives.iter() {
+            let y = binding(fact, "subjectValue").and_then(|v| v.parse::<i64>().ok())
+                .expect("positive subjectValue must parse as integer");
+            let x = binding(fact, "objectValue").and_then(|v| v.parse::<i64>().ok())
+                .expect("positive objectValue must parse as integer");
+            let computed = eval_arith_with_x(&cb.expr, x);
+            assert_eq!(computed, Some(y),
+                "top rule's expression must reproduce positive <{},{}>; \
+                 expr({}) = {:?}, expected {}",
+                y, x, x, computed, y);
+        }
+        for fact in negatives.iter() {
+            let y = binding(fact, "subjectValue").and_then(|v| v.parse::<i64>().ok())
+                .expect("negative subjectValue must parse as integer");
+            let x = binding(fact, "objectValue").and_then(|v| v.parse::<i64>().ok())
+                .expect("negative objectValue must parse as integer");
+            let computed = eval_arith_with_x(&cb.expr, x);
+            assert_ne!(computed, Some(y),
+                "top rule's expression must REJECT negative <{},{}>; \
+                 expr({}) = {:?} but should NOT equal {}",
+                y, x, x, computed, y);
+        }
+    }
+
+    /// Build an InstanceFact-shaped fact for `Number 'y' is doubling of
+    /// Number 'x'`. Ring FT: subjectNoun and objectNoun are both
+    /// "Number"; subjectValue is the Y (consequent), objectValue is the
+    /// X (antecedent input), per the role declaration order in the test
+    /// schema.
+    fn number_doubling_fact(y: &i64, x: &i64) -> Object {
+        let y_s = alloc::format!("{}", y);
+        let x_s = alloc::format!("{}", x);
+        fact_from_pairs(&[
+            ("subjectNoun",  "Number"),
+            ("subjectValue", y_s.as_str()),
+            ("fieldName",    "Number_is_doubling_of_Number"),
+            ("objectNoun",   "Number"),
+            ("objectValue",  x_s.as_str()),
+        ])
+    }
+
+    /// Evaluate a literal-multiplier ArithExpr against a single X value.
+    /// The candidate space is `Y = N × X` for integer N, so the only
+    /// shape we expect is `Op("*", Literal(N), RoleRef(_))` or its
+    /// symmetric form `Op("*", RoleRef(_), Literal(N))`. Any other shape
+    /// returns None so the assertion can flag a wrong template.
+    fn eval_arith_with_x(expr: &crate::types::ArithExpr, x: i64) -> Option<i64> {
+        use crate::types::ArithExpr;
+        match expr {
+            ArithExpr::Op(op, left, right) if op == "*" => {
+                let l = eval_arith_with_x(left, x)?;
+                let r = eval_arith_with_x(right, x)?;
+                Some(l * r)
+            }
+            ArithExpr::Literal(n) => Some(*n as i64),
+            ArithExpr::RoleRef(_) => Some(x),
+            _ => None,
+        }
     }
 }
