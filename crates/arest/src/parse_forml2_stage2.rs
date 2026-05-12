@@ -795,6 +795,156 @@ impl EntityRefSchemeLiteralTable {
         None
     }
 }
+
+/// #884 - `try_expand_possessive` in `parse_forml2.rs` rewrites
+/// possessive antecedent clauses of the shape `<Noun1>'s <Noun2> ...`
+/// into the explicit join form `<Noun1> has <Noun2> and that
+/// <Noun2> ...` so the downstream anaphora detector classifies the
+/// rule as a Join derivation. The trigger marker is the literal
+/// 3-byte token `'s ` (apostrophe + s + space): the function gates
+/// on `text.contains("'s ")`, scans for `text.find("'s ")`, and
+/// hops past it with `result[apos_pos + 3..]`. The marker carries
+/// its trailing space so the find semantics enforce a word
+/// boundary - a clause like `Order'something` (apostrophe-other-
+/// char) doesn't trigger.
+///
+/// The lift moves the trigger-marker vocabulary to a typed
+/// `PossessiveMarkerTable` reading the `Possessive Marker` grammar
+/// enum. Boot-table rows store the literal `'s ` token verbatim -
+/// as the inline `text.contains("'s ")` / `find("'s ")` / skip-3
+/// hops expect. The grammar declaration spells the marker
+/// descriptively as `'apostrophe-s'` to side-step the inner-quote
+/// escape gap in `bootstrap_grammar_state` (the same convention
+/// `Quote Escape` uses for the doubled-quote escape: descriptive
+/// name in grammar, real semantics resolved by the mediator). The
+/// `expand` accessor encapsulates the full substitution body -
+/// longest-noun-match around the apostrophe, chained-possessive
+/// iteration, fail-closed when either side is unknown - so the
+/// caller in `parse_forml2.rs` becomes a one-liner.
+#[derive(Debug, Clone)]
+pub struct PossessiveMarkerTable {
+    /// The possessive trigger marker(s). Order matches the
+    /// `'apostrophe-s'` declaration in `readings/forml2-grammar.md`
+    /// and the legacy inline `"'s "` literal in
+    /// `try_expand_possessive`. Boot rows are stored as the literal
+    /// 3-byte token (apostrophe + s + space) so the
+    /// `contains`/`find`/skip-3 semantics round-trip exactly.
+    pub rows: Vec<String>,
+}
+
+impl PossessiveMarkerTable {
+    /// Boot table - must stay in sync with `Possessive Marker`
+    /// enum-value declaration in `readings/forml2-grammar.md`. One
+    /// marker (`'s `) - the literal 3-byte trigger that the legacy
+    /// `try_expand_possessive` hard-coded.
+    pub fn boot() -> Self {
+        PossessiveMarkerTable {
+            rows: alloc::vec![
+                "'s ".to_string(),
+            ],
+        }
+    }
+
+    /// Build the table from the runtime `Possessive Marker` enum-
+    /// value declaration. Falls back to `boot()` when the cell is
+    /// empty (bare engine, no metamodel loaded). The grammar uses
+    /// the descriptive placeholder `apostrophe-s` because the
+    /// bootstrap parser strips outer quotes and so cannot round-
+    /// trip a value containing an inner apostrophe; the mediator
+    /// reinterprets `apostrophe-s` as the literal `'s ` token to
+    /// preserve `contains`/`find` semantics. Any other declared
+    /// value is passed through verbatim, leaving room for future
+    /// possessive markers expressible without the escape gap.
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let raw = read_enum_values(state, "Possessive Marker");
+        if raw.is_empty() {
+            return Self::boot();
+        }
+        let rows: Vec<String> = raw.into_iter()
+            .map(|v| if v == "apostrophe-s" { "'s ".to_string() } else { v })
+            .collect();
+        PossessiveMarkerTable { rows }
+    }
+
+    /// Iterate the markers in declaration order. Each marker is the
+    /// literal trigger token (e.g. `'s `); the caller uses `expand`
+    /// for the full substitution form.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.rows.iter().map(|s| s.as_str())
+    }
+
+    /// Expand possessive syntax in a derivation body clause.
+    ///
+    /// Walks `text` left-to-right looking for `<Noun1>'s <Noun2>`
+    /// sequences (any of the declared markers in the table), and
+    /// rewrites each into the explicit two-clause join form
+    /// `<Noun1> has <Noun2> and that <Noun2><suffix>`. Iterates
+    /// until no more markers remain (handles chained possessives).
+    /// Bails out as soon as a marker site fails to resolve either
+    /// noun side - leaves the rest of the text untouched so the
+    /// downstream resolver can emit its own unresolved-clause
+    /// diagnostic. Returns `Some(expanded)` when at least one
+    /// substitution fired; `None` when no marker appeared at all
+    /// (mirroring the historic `if !text.contains("'s ") { return
+    /// None; }` early exit in `try_expand_possessive`).
+    pub fn expand(&self, text: &str, noun_names: &[String]) -> Option<String> {
+        // Quick exit - no declared marker means nothing to expand.
+        let has_any = self.rows.iter().any(|m| text.contains(m.as_str()));
+        if !has_any { return None; }
+
+        let mut result = text.to_string();
+        let mut changed = false;
+
+        // First-match-wins per iteration: pick the earliest occurrence
+        // of any declared marker in the current `result`. Each iter
+        // makes one substitution and re-scans (handles chained
+        // possessives via the join shape).
+        loop {
+            let earliest: Option<(usize, &str)> = self.rows.iter()
+                .filter_map(|m| result.find(m.as_str()).map(|i| (i, m.as_str())))
+                .min_by_key(|(i, _)| *i);
+            let Some((apos_pos, marker)) = earliest else { break };
+
+            // Longest known noun ending at apos_pos.
+            let prefix = &result[..apos_pos];
+            let noun1 = noun_names.iter()
+                .filter(|n| prefix.ends_with(n.as_str()))
+                .max_by_key(|n| n.len())
+                .cloned();
+
+            // Longest known noun starting just past the marker.
+            let after_pos = apos_pos + marker.len();
+            let after = &result[after_pos..];
+            let noun2 = noun_names.iter()
+                .filter(|n| after.starts_with(n.as_str()))
+                .max_by_key(|n| n.len())
+                .cloned();
+
+            match (noun1, noun2) {
+                (Some(n1), Some(n2)) => {
+                    let n1_start = apos_pos - n1.len();
+                    let n2_end = after_pos + n2.len();
+                    let before_n1 = &result[..n1_start];
+                    let after_n2 = &result[n2_end..];
+                    result = alloc::format!(
+                        "{}{} has {} and that {}{}",
+                        before_n1, n1, n2, n2, after_n2
+                    );
+                    changed = true;
+                }
+                _ => {
+                    // Unknown noun around the marker - bail out to
+                    // avoid corrupting input the parser can't
+                    // understand. Matches legacy `break` behavior.
+                    break;
+                }
+            }
+        }
+
+        changed.then_some(result)
+    }
+}
+
 /// #879 — `is_subtype_instance_check` in `parse_forml2.rs` scans for
 /// an infix subtype-instance keyword (` is a ` or ` is an `) used to
 /// classify clauses of the shape `<Noun> is a <Noun>` /
@@ -5117,6 +5267,8 @@ mod tests {
     /// enum=32. #877 added `Noun Has Noun Literal Keyword` enum (1
     /// value) — bumping noun=44, enum=33. #878 added `Entity Ref Scheme
     /// Literal Keyword` enum (2 values) — bumping noun=45, enum=34.
+    /// #884 added `Possessive Marker` enum (1 value) —
+    /// bumping noun=47, enum=36.
     /// #879 added `Subtype Instance Check Keyword` enum (2 values) —
     /// bumping noun=46, enum=35.
     #[test]
@@ -5126,7 +5278,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 46, "noun count");
+        assert_eq!(noun_count, 47, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -5138,7 +5290,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 35, "enum-valued noun count");
+        assert_eq!(enum_count, 36, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -7192,6 +7344,84 @@ mod tests {
         assert_eq!(table.rows.len(), 2,
             "empty grammar state falls back to the 2-keyword boot table");
     }
+
+    // --- #884: possessive marker table -----------------------------
+
+    /// #884 - `try_expand_possessive` in parse_forml2.rs has a
+    /// hardcoded 3-byte trigger marker `'s ` (apostrophe + s + space)
+    /// that gates the function via `text.contains("'s ")` /
+    /// `text.find("'s ")` / `&result[apos_pos + 3..]` (skip past the
+    /// marker). The keyword lives in code, not in the grammar. This
+    /// lift moves the trigger-marker vocabulary to a typed
+    /// `PossessiveMarkerTable` reading the `Possessive Marker` grammar
+    /// enum. Boot table preserves the historic one-marker shape so
+    /// the recognizer behaves identically before and after the lift.
+    #[test]
+    fn possessive_marker_table_boot_has_one_marker() {
+        let table = super::PossessiveMarkerTable::boot();
+        let markers: Vec<&str> = table.iter().collect();
+        assert_eq!(markers, vec!["'s "],
+            "boot table must mirror the historic `'s ` literal in \
+             try_expand_possessive, with the trailing space included \
+             so the find/skip-3 semantics round-trip on word \
+             boundaries.");
+    }
+
+    /// #884 - `expand` returns the canonical join form when the
+    /// possessive marker is found between two known nouns; returns
+    /// `None` when the marker is absent. Mirrors the historic
+    /// `try_expand_possessive` semantics exactly: matching nouns
+    /// produce `<n1> has <n2> and that <n2><tail>`; unknown nouns
+    /// around the marker bail out cleanly.
+    #[test]
+    fn possessive_marker_table_expand_rewrites_canonical_shape() {
+        let table = super::PossessiveMarkerTable::boot();
+        let nouns: Vec<String> = ["Order", "Customer"].iter()
+            .map(|s| s.to_string()).collect();
+        assert_eq!(
+            table.expand("Order's Customer has Age", &nouns),
+            Some("Order has Customer and that Customer has Age".to_string()),
+            "Order's Customer has Age expands to the canonical join \
+             form Order has Customer and that Customer has Age");
+        assert_eq!(
+            table.expand("Order has Customer", &nouns),
+            None,
+            "no possessive marker leaves the text untouched (None)");
+        assert_eq!(
+            table.expand("Unknown's Other has Foo", &nouns),
+            None,
+            "unknown nouns around the marker bail out, leaving the \
+             changed flag false so the function returns None");
+    }
+
+    /// #884 - when state's EnumValues cell carries a Possessive
+    /// Marker declaration with the descriptive `apostrophe-s`
+    /// placeholder, from_grammar_state translates it back to the
+    /// literal `'s ` token. Any other declared value passes through
+    /// verbatim, leaving room for future markers.
+    #[test]
+    fn possessive_marker_table_from_grammar_state_decodes_apostrophe_placeholder() {
+        let state = synthetic_enum_state(&[
+            ("Possessive Marker", &["apostrophe-s"]),
+        ]);
+        let table = super::PossessiveMarkerTable::from_grammar_state(&state);
+        assert_eq!(table.rows, vec!["'s "],
+            "descriptive `apostrophe-s` placeholder decodes back to \
+             the literal `'s ` trigger");
+    }
+
+    /// #884 - empty grammar state falls back to the 1-marker boot
+    /// table so a bare engine (no metamodel loaded) still recognises
+    /// the canonical possessive trigger.
+    #[test]
+    fn possessive_marker_table_falls_back_to_boot_on_empty_state() {
+        let state = synthetic_enum_state(&[]);
+        let table = super::PossessiveMarkerTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 1,
+            "empty grammar state falls back to the 1-marker boot \
+             table");
+    }
+
 
 
     // ─── #879: subtype instance check table ──────────────────────────

@@ -1171,59 +1171,13 @@ fn split_antecedent_comparator(text: &str) -> (String, Option<(String, f64)>) {
 /// "Order has Customer and that Customer has Age"
 /// ```
 pub(crate) fn try_expand_possessive(text: &str, noun_names: &[String]) -> Option<String> {
-    // Quick exit â€” no apostrophe means nothing to expand.
-    if !text.contains("'s ") {
-        return None;
-    }
-
-    // Walk the text looking for `<Noun>'s <Noun2>` sequences.
-    // We use a simple left-to-right scan: find the first `'s `, identify the
-    // noun that ends just before the apostrophe, identify the noun that begins
-    // just after the space, then emit the expanded two-clause form.
-    let mut result = text.to_string();
-    let mut changed = false;
-
-    // Iterate until no more `'s ` tokens remain (handles chained possessives).
-    loop {
-        let Some(apos_pos) = result.find("'s ") else { break };
-
-        // Find noun1: the longest known noun ending at apos_pos.
-        let prefix = &result[..apos_pos];
-        let noun1 = noun_names.iter()
-            .filter(|n| prefix.ends_with(n.as_str()))
-            .max_by_key(|n| n.len())
-            .cloned();
-
-        // Find noun2: the longest known noun starting at apos_pos + 3.
-        let after = &result[apos_pos + 3..]; // skip `'s `
-        let noun2 = noun_names.iter()
-            .filter(|n| after.starts_with(n.as_str()))
-            .max_by_key(|n| n.len())
-            .cloned();
-
-        match (noun1, noun2) {
-            (Some(n1), Some(n2)) => {
-                // Build the expanded form:
-                //   "<prefix-without-n1><n1> has <n2> and that <n2><suffix-without-n2>"
-                let n1_start = apos_pos - n1.len();
-                let n2_end = apos_pos + 3 + n2.len();
-                let before_n1 = &result[..n1_start];
-                let after_n2 = &result[n2_end..];
-                result = format!(
-                    "{}{} has {} and that {}{}",
-                    before_n1, n1, n2, n2, after_n2
-                );
-                changed = true;
-            }
-            _ => {
-                // Unknown noun around the apostrophe â€” leave as-is to avoid
-                // corrupting input the parser can't understand.
-                break;
-            }
-        }
-    }
-
-    changed.then_some(result)
+    // #884 Sweep-1 lift - possessive-trigger vocabulary lifts to
+    // `PossessiveMarkerTable` so the marker set lives in
+    // `readings/forml2-grammar.md` as a `Possessive Marker` enum value
+    // type. Boot stays in sync with the grammar; the table's `expand`
+    // accessor owns the longest-noun-match + chained-iteration body so
+    // the caller here is a one-liner.
+    crate::parse_forml2_stage2::PossessiveMarkerTable::boot().expand(text, noun_names)
 }
 
 /// Resolve a derivation rule's text into structured fact type references.
