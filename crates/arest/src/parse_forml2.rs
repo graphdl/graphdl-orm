@@ -383,6 +383,120 @@ fn is_word_comparator_clause(clause: &str, noun_names: &[String]) -> bool {
     })
 }
 
+/// #914 — Normalize a `WordComparatorTable` phrase to the ASCII
+/// comparator op consumed by `comparator_primitive` in `compile.rs`.
+/// The mapping matches the literal-RHS path
+/// (`split_antecedent_comparator` → `peel_trailing_comparator`)
+/// so the post-join Filter primitive treats both shapes the same.
+/// `exceeds`, `is greater than`, `is more than` → `">"`,
+/// `is less than` → `"<"`,
+/// `is at least` → `">="`,
+/// `is at most` → `"<="`,
+/// `equals`, `is equal to` → `"="`.
+/// Any unknown phrase yields `"="` — same fall-through
+/// `comparator_primitive` uses for unrecognised ops.
+fn word_comparator_to_op(phrase: &str) -> &'static str {
+    match phrase {
+        "exceeds" | "is greater than" | "is more than" => ">",
+        "is less than" => "<",
+        "is at least" => ">=",
+        "is at most" => "<=",
+        "equals" | "is equal to" => "=",
+        _ => "=",
+    }
+}
+
+/// #914 — Recognise a cross-antecedent role-vs-role value comparison
+/// clause. Two operand shapes are accepted:
+///
+///   * Possessive: `<NounToken>'s <Role>` (mirrors `try_expand_possessive`)
+///   * Anaphoric:  `<NounToken> has <Role>` (the post-expansion form
+///                 the rest of the parser sees)
+///
+/// joined by a `WordComparatorTable` phrase. Subscripted noun tokens
+/// (`Task1`, `Task2`) are accepted so ring-style rules naming the same
+/// base noun on both sides stay distinguishable.
+///
+/// Returns `Some((lhs_noun_token, lhs_role, op, rhs_noun_token, rhs_role))`
+/// when both sides match. `op` is the normalised ASCII comparator
+/// (see `word_comparator_to_op`). `noun_token` preserves the
+/// subscripted form so downstream antecedent-index lookup can locate
+/// the specific FT clause that introduced this noun token.
+///
+/// Reuses the existing `WordComparatorTable` vocabulary; no parallel
+/// keyword table is introduced (the reverted 313f5546 approach
+/// invented `CrossAntecedentComparatorTable` — flagged as a modeling
+/// error because `.id` is just one role on the entity and
+/// `WordComparator` already covers role-value comparison).
+fn try_extract_cross_antecedent_role_comparison(
+    clause: &str,
+    noun_names: &[String],
+) -> Option<(String, String, &'static str, String, String)> {
+    let trimmed = clause.trim().trim_end_matches('.').trim();
+    // Iterate the existing comparator phrases in declaration order so
+    // longer phrases (e.g. `is greater than`) match before shorter
+    // overlapping ones (`is`). `WordComparatorTable::boot` already
+    // returns them in that order.
+    let table = crate::parse_forml2_stage2::WordComparatorTable::boot();
+    for phrase in table.iter() {
+        let needle = alloc::format!(" {} ", phrase);
+        let Some(idx) = trimmed.find(needle.as_str()) else { continue; };
+        let lhs = trimmed[..idx].trim();
+        let rhs = trimmed[idx + needle.len()..].trim();
+        let Some((lhs_tok, lhs_role)) = parse_noun_role_operand(lhs, noun_names)
+        else { continue; };
+        let Some((rhs_tok, rhs_role)) = parse_noun_role_operand(rhs, noun_names)
+        else { continue; };
+        return Some((
+            lhs_tok,
+            lhs_role,
+            word_comparator_to_op(phrase),
+            rhs_tok,
+            rhs_role,
+        ));
+    }
+    None
+}
+
+/// #914 helper — parse a single operand of a cross-antecedent
+/// comparator clause into `(noun_token, role)`. Accepts both the
+/// possessive form `<NounToken>'s <Role>` (the FORML2 surface
+/// expression) and the anaphoric form `<NounToken> has <Role>` (the
+/// post-possessive-expansion shape).
+///
+/// `NounToken` may carry a numeric subscript (`Task1`, `Customer2`);
+/// `parse_role_token` is used to derive the base noun for the
+/// "declared noun" check. `Role` must itself be a declared noun.
+fn parse_noun_role_operand(
+    operand: &str,
+    noun_names: &[String],
+) -> Option<(String, String)> {
+    let t = operand.trim();
+    // Possessive form: `<NounToken>'s <Role>`.
+    if let Some(apos_idx) = t.find("'s ") {
+        let token = t[..apos_idx].trim();
+        let role = t[apos_idx + 3..].trim();
+        let (base, _) = parse_role_token(token);
+        if noun_names.iter().any(|n| n == base)
+            && noun_names.iter().any(|n| n == role)
+        {
+            return Some((token.to_string(), role.to_string()));
+        }
+    }
+    // Anaphoric form: `<NounToken> has <Role>`.
+    if let Some(has_idx) = t.find(" has ") {
+        let token = t[..has_idx].trim();
+        let role = t[has_idx + " has ".len()..].trim();
+        let (base, _) = parse_role_token(token);
+        if noun_names.iter().any(|n| n == base)
+            && noun_names.iter().any(|n| n == role)
+        {
+            return Some((token.to_string(), role.to_string()));
+        }
+    }
+    None
+}
+
 
 
 
@@ -994,6 +1108,53 @@ fn resolve_derivation_rule(
     let mut noun_names: Vec<String> = ir.nouns.keys().cloned().collect();
     noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
 
+    // #914 — Pre-pass: extract cross-antecedent role-vs-role value
+    // comparison clauses (`<NounToken>'s <Role> <word-comparator>
+    // <NounToken>'s <Role>`) from the antecedent text BEFORE the
+    // generic possessive expansion fires. Each match is recorded for
+    // later mapping into `AntecedentRoleComparison`; the clause itself
+    // is dropped from `rule.text` so the downstream FT-resolution loop
+    // never sees it (and never emits a spurious `AntecedentFilter` or
+    // an unresolved-clause diagnostic). Reuses the existing
+    // `WordComparatorTable` vocabulary — no parallel keyword table.
+    let mut pending_role_comparisons: Vec<
+        (String, String, &'static str, String, String)
+    > = Vec::new();
+    {
+        let sep_offset = rule.text.find(" iff ")
+            .map(|i| (i, i + 5))
+            .or_else(|| rule.text.find(" if ").map(|i| (i, i + 4)));
+        if let Some((sep_start, sep_end)) = sep_offset {
+            let consequent_part = rule.text[..sep_start].to_string();
+            let sep_word = rule.text[sep_start..sep_end].to_string();
+            let antecedent_part = rule.text[sep_end..].to_string();
+            // Walk top-level ` and ` clauses; keep the unrecognised
+            // ones, record the recognised ones as comparison specs.
+            let mut kept_clauses: Vec<String> = Vec::new();
+            let mut found_any = false;
+            for raw in split_top_level_and(&antecedent_part) {
+                let part = raw.trim_end_matches('.').trim();
+                if let Some((lhs_tok, lhs_role, op, rhs_tok, rhs_role)) =
+                    try_extract_cross_antecedent_role_comparison(part, &noun_names)
+                {
+                    pending_role_comparisons.push(
+                        (lhs_tok, lhs_role, op, rhs_tok, rhs_role));
+                    found_any = true;
+                } else {
+                    // Preserve original (with whatever trailing period
+                    // the input carried) so re-assembly stays byte-
+                    // stable when no comparison clauses are present.
+                    kept_clauses.push(raw.to_string());
+                }
+            }
+            if found_any {
+                let new_antecedent = kept_clauses.join(" and ");
+                rule.text = format!("{}{}{}",
+                    consequent_part, sep_word, new_antecedent);
+            }
+        }
+    }
+
     // Pre-process: expand possessive syntax (`X's Y`) into explicit join form
     // (`X has Y and that Y`) so the anaphora detector below can classify the
     // rule as a Join derivation.  Only the antecedent portion is rewritten;
@@ -1096,8 +1257,10 @@ fn resolve_derivation_rule(
     };
 
     // Detect "that X" anaphoric references -- nouns preceded by "that " in
-    // antecedent parts become join keys.
-    let join_keys: Vec<String> = antecedent_parts.iter()
+    // antecedent parts become join keys. Mutable because the #914
+    // cross-antecedent-comparison branch below can append synthesised
+    // shared-noun keys when promoting a rule to Join classification.
+    let mut join_keys: Vec<String> = antecedent_parts.iter()
         .flat_map(|part| {
             noun_names.iter().filter_map(|noun| {
                 let pattern = format!("that {}", noun);
@@ -1142,6 +1305,12 @@ fn resolve_derivation_rule(
     // clauses like `has Population >= 1000000` resolve to the base FT
     // with an AntecedentFilter pinned to that antecedent's position.
     let mut resolved_ids: Vec<String> = Vec::new();
+    // #914 — parallel vec recording the antecedent-clause text that
+    // produced each entry in `resolved_ids`. Used after the main loop
+    // to map cross-antecedent comparison specs (noun_token + role)
+    // back to their antecedent indices. Length stays equal to
+    // `resolved_ids.len()`.
+    let mut resolved_part_text: Vec<String> = Vec::new();
     let mut filters: Vec<crate::types::AntecedentFilter> = Vec::new();
     let mut role_literals: Vec<crate::types::AntecedentRoleLiteral> = Vec::new();
     let mut computed: Vec<crate::types::ConsequentComputedBinding> = Vec::new();
@@ -1278,6 +1447,7 @@ fn resolve_derivation_rule(
                 // actual `AbsenceOf` source.
                 resolved_ids.push(alloc::format!("@absence:{}:{}",
                     ft_id, role));
+                resolved_part_text.push(part.to_string());
                 continue;
             }
             if let Some((op, value)) = comparator.clone() {
@@ -1304,6 +1474,7 @@ fn resolve_derivation_rule(
                 }
             }
             resolved_ids.push(ft_id);
+            resolved_part_text.push(part.to_string());
             continue;
         }
 
@@ -1427,6 +1598,195 @@ fn resolve_derivation_rule(
     rule.antecedent_role_literals = role_literals;
     rule.consequent_computed_bindings = computed;
     rule.consequent_aggregates = aggregates;
+
+    // #914 — map each pre-pass-recorded cross-antecedent comparison
+    // spec to an `AntecedentRoleComparison` by locating the antecedent
+    // whose clause carries the LHS / RHS noun token AND whose FT
+    // carries the comparison role.  `resolved_part_text` is the
+    // parallel vec recording each resolved clause's text; we scan it
+    // for a clause containing the noun token (via `find_nouns` for
+    // subscript-aware matching) and check the FT's role list.
+    //
+    // Reordering for the engine's existing post-join Filter machinery
+    // (`compile_join_derivation`): that path picks consequent bindings
+    // from the FIRST antecedent that carries each binding noun (no
+    // subscript awareness), so for the rule to land the right Task
+    // value in the consequent we reorder `antecedent_sources` so
+    // antecedents whose clause carries the CONSEQUENT-side subscripted
+    // noun token (the "subject" of the consequent fact type) come
+    // first. Indices on every co-vec (filters, role literals,
+    // resolved_part_text) and the comparison-spec endpoints are
+    // remapped in lockstep.
+    //
+    // Unresolvable specs are silently dropped — same convention
+    // `antecedent_filters` uses when a filter clause's base FT fails
+    // to resolve.
+    rule.antecedent_role_comparisons = Vec::new();
+    if !pending_role_comparisons.is_empty() {
+        // Step 1: identify the consequent subscript token (if any).
+        // The consequent text is the rule's text up to ` iff `/` if `;
+        // a subscripted token like `Task2` is the role on the
+        // consequent FT that the rule is "asserting about".
+        let consequent_token: Option<String> = {
+            let cons_text = rule.text.find(" iff ").map(|i| &rule.text[..i])
+                .or_else(|| rule.text.find(" if ").map(|i| &rule.text[..i]))
+                .unwrap_or(rule.text.as_str());
+            let mut tok: Option<String> = None;
+            for (_, _, n) in find_nouns(cons_text, &noun_names) {
+                let (base, full) = parse_role_token(&n);
+                if full != base {
+                    tok = Some(n.clone());
+                    break;
+                }
+            }
+            tok
+        };
+
+        // Step 2: derive a stable permutation that puts antecedents
+        // matching the consequent-subscripted token first, then the
+        // rest in original order. Antecedents whose clause carries
+        // the consequent token rank 0; others rank 1.
+        let n_ants = rule.antecedent_sources.len();
+        let rank = |i: usize| -> usize {
+            let Some(ref tok) = consequent_token else { return 1; };
+            let Some(clause) = resolved_part_text.get(i) else { return 1; };
+            if find_nouns(clause, &noun_names)
+                .iter().any(|(_, _, n)| n == tok) { 0 } else { 1 }
+        };
+        let mut permutation: Vec<usize> = (0..n_ants).collect();
+        permutation.sort_by_key(|&i| (rank(i), i));
+        // Identity-permutation short-circuit so unchanged antecedent
+        // ordering stays byte-for-byte the same.
+        let needs_reorder = permutation.iter().enumerate()
+            .any(|(new_i, &old_i)| new_i != old_i);
+        // Inverse map: old_index → new_index.
+        let mut inverse = alloc::vec![0usize; n_ants];
+        for (new_i, &old_i) in permutation.iter().enumerate() {
+            inverse[old_i] = new_i;
+        }
+        if needs_reorder {
+            // Reorder antecedent_sources + resolved_part_text in
+            // lockstep.
+            let new_sources: Vec<crate::types::AntecedentSource> = permutation.iter()
+                .map(|&i| rule.antecedent_sources[i].clone())
+                .collect();
+            let new_part_text: Vec<String> = permutation.iter()
+                .map(|&i| resolved_part_text[i].clone())
+                .collect();
+            rule.antecedent_sources = new_sources;
+            resolved_part_text = new_part_text;
+            // Remap antecedent_index on every per-antecedent
+            // structure that carries one.
+            for af in rule.antecedent_filters.iter_mut() {
+                if let Some(new_i) = inverse.get(af.antecedent_index) {
+                    af.antecedent_index = *new_i;
+                }
+            }
+            for arl in rule.antecedent_role_literals.iter_mut() {
+                if let Some(new_i) = inverse.get(arl.antecedent_index) {
+                    arl.antecedent_index = *new_i;
+                }
+            }
+        }
+
+        // Step 3: map each spec's LHS/RHS noun-token + role pair to
+        // the (now possibly reordered) antecedent index.
+        let find_ant_idx = |token: &str, role: &str| -> Option<usize> {
+            for (i, clause) in resolved_part_text.iter().enumerate() {
+                let nouns = find_nouns(clause, &noun_names);
+                let token_present = nouns.iter().any(|(_, _, n)| n == token);
+                if !token_present { continue; }
+                let src = rule.antecedent_sources.get(i)?;
+                let ft_id = src.fact_type_id();
+                if ft_id.is_empty() { continue; }
+                let ft = ir.fact_types.get(ft_id)?;
+                if ft.roles.iter().any(|r| r.noun_name == role) {
+                    return Some(i);
+                }
+            }
+            None
+        };
+        for (lhs_tok, lhs_role, op, rhs_tok, rhs_role)
+            in pending_role_comparisons.iter()
+        {
+            let Some(li) = find_ant_idx(lhs_tok, lhs_role) else { continue; };
+            let Some(ri) = find_ant_idx(rhs_tok, rhs_role) else { continue; };
+            rule.antecedent_role_comparisons.push(
+                crate::types::AntecedentRoleComparison {
+                    lhs_antecedent_index: li,
+                    lhs_role: lhs_role.clone(),
+                    op: op.to_string(),
+                    rhs_antecedent_index: ri,
+                    rhs_role: rhs_role.clone(),
+                });
+        }
+
+        // Step 4: promote the rule to `Join` kind and synthesise
+        // `join_on` keys so it routes through `compile_join_derivation`
+        // (the only compile path that picks up
+        // `antecedent_role_comparisons`). Join keys are the natural
+        // shared nouns across antecedents that are NOT the comparison
+        // roles themselves — typically Source File-style shared values
+        // that the user expects to equi-join.
+        //
+        // Subscript-aware filtering: only nouns whose token appears
+        // IDENTICALLY across every antecedent clause that mentions
+        // them are eligible. Ring-FT subscripts (`Task1` vs `Task2`)
+        // identify DIFFERENT variables of the same base noun; equi-
+        // joining them would collapse the two subscripts onto the
+        // same value (which is exactly what the comparison clause is
+        // contradicting). The compile_explicit_derivation subscript
+        // path applies the same guard; here we duplicate it at the
+        // parse layer because compile_join_derivation doesn't carry
+        // its own subscript discipline.
+        //
+        // The classifier below (`is_join` check) re-validates the
+        // rule against the standard "shared by ≥2 antecedent FTs"
+        // predicate before flipping `kind`, so synthesised keys that
+        // don't actually appear on multiple antecedent FTs degrade
+        // back to no-op.
+        let comparison_roles: hashbrown::HashSet<String> = rule.antecedent_role_comparisons
+            .iter()
+            .flat_map(|c| [c.lhs_role.clone(), c.rhs_role.clone()])
+            .collect();
+        let tokens_for_noun = |noun: &str| -> hashbrown::HashSet<String> {
+            let mut toks: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+            for clause in resolved_part_text.iter() {
+                for (_, _, t) in find_nouns(clause, &noun_names) {
+                    let (base, _) = parse_role_token(&t);
+                    if base == noun { toks.insert(t.clone()); }
+                }
+            }
+            toks
+        };
+        let mut shared: Vec<String> = Vec::new();
+        for src in rule.antecedent_sources.iter() {
+            let ft_id = src.fact_type_id();
+            if ft_id.is_empty() { continue; }
+            let Some(ft) = ir.fact_types.get(ft_id) else { continue; };
+            for r in ft.roles.iter() {
+                if comparison_roles.contains(&r.noun_name) { continue; }
+                let appears = rule.antecedent_sources.iter()
+                    .filter_map(|s| ir.fact_types.get(s.fact_type_id()))
+                    .filter(|ft| ft.roles.iter().any(|rr| rr.noun_name == r.noun_name))
+                    .count();
+                if appears < 2 { continue; }
+                // Skip nouns appearing with multiple distinct
+                // subscript tokens across antecedent clauses —
+                // those are independent variables, not a shared
+                // join key.
+                if tokens_for_noun(&r.noun_name).len() > 1 { continue; }
+                if !shared.contains(&r.noun_name) {
+                    shared.push(r.noun_name.clone());
+                }
+            }
+        }
+        for key in shared.into_iter() {
+            if !join_keys.contains(&key) {
+                join_keys.push(key);
+            }
+        }
+    }
 
     // Deduplicate join keys
     let mut seen = hashbrown::HashSet::new();
