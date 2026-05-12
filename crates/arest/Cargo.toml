@@ -181,6 +181,20 @@ name = "ss_autofill_metamodel_rule_e2e"
 path = "tests/ss_autofill_metamodel_rule_e2e.rs"
 required-features = ["test-bins"]
 
+# Transitivity metamodel rule end-to-end pin (#892). Acceptance for
+# replacing the per-(ft1, ft2) Rust synthesizer loop in
+# `compile.rs::compile_derivations` (was lines ~2514-2559) with a
+# single FORML 2 metamodel derivation rule expressed in
+# `readings/core/derivation.md`. Asserts the transitively inferred
+# fact `<<Person, 'p1'>, <Country, 'us'>>` lands in the synthetic
+# cell `_transitive_Person_has_City_City_is_in_Country` after
+# compile + forward-chain over a `Person has City` + `City is in
+# Country` fixture sharing the `City` join noun.
+[[test]]
+name = "transitivity_metamodel_rule_e2e"
+path = "tests/transitivity_metamodel_rule_e2e.rs"
+required-features = ["test-bins"]
+
 # Unary-consequent derivation rule end-to-end pin (#866 follow-up).
 # The simplified unit test in compile.rs schema_tests was insufficient
 # — it didn't catch the apps/tasks failure mode where the unary FT

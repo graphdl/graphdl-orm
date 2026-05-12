@@ -75,16 +75,53 @@ consequent. Behavioural equivalence with the pre-#891 per-SS-
 Constraint fanout is pinned by
 `crates/arest/tests/ss_autofill_metamodel_rule_e2e.rs`.
 
+## Transitivity of binary Fact Types (#892 — replaces the per-(ft1, ft2) Rust loop)
+
+Whitepaper §5.2 universal modus-ponens schema for transitive
+composition: any two binary Fact Types whose join nouns chain
+(ft1's second role and ft2's first role share a noun) compose into
+a fresh transitive Fact Type whose facts pair ft1's source-role
+binding with ft2's destination-role binding.
+
+* Fact Type has inferred transitive Fact
+    iff some Fact Type Ft1 has Role at position 1 played by Noun J
+    and some Fact Type Ft2 has Role at position 0 played by Noun J
+    and that Ft1 has Source Noun S at position 0
+    and that Ft2 has Destination Noun D at position 1
+    and some Fact F1 in Ft1 binds Resource X at Source S and Resource Y at Join J
+    and some Fact F2 in Ft2 binds Resource Y at Join J and Resource Z at Destination D
+    and that Fact Type is `_transitive_<Ft1>_<Ft2>`
+    and that Fact has Source S at Resource X and Destination D at Resource Z.
+
+The rule's antecedent quantifies over `(FactType × FactType) ×
+<Ft1-Fact × Ft2-Fact>` cells gated by the shared-join-noun
+condition; its consequent is the synthesized `<<S, X>, <D, Z>>`
+binding pushed into every fresh `_transitive_<Ft1>_<Ft2>` cell.
+`compile_transitivity_metamodel` in `crates/arest/src/compile.rs`
+performs the lift to a Func:
+
+  Concat . [
+    per-(Ft1, Ft2) inner Func,
+    ...
+  ]
+
+where each inner Func is the byte-for-byte same shape
+`compile_join_derivation` produces for a 2-antecedent
+`[FactType(Ft1), FactType(Ft2)]` rule with
+`Literal("_transitive_<Ft1>_<Ft2>")` consequent,
+`join_on = [shared_noun]`, and
+`consequent_bindings = [src_noun, dst_noun]`. Behavioural
+equivalence with the pre-#892 per-pair fanout is pinned by
+`crates/arest/tests/transitivity_metamodel_rule_e2e.rs`. The
+consequent cell name `_transitive_<Ft1>_<Ft2>` is preserved so
+SM-infrastructure gates in `command.rs` (which key off
+`_transitive_Status` / `_transitive_Transition`) keep working.
+
 ## Other structural rules (deferred — still synthesised in compile.rs)
 
 The following rules currently remain as per-binding loops in
 `compile.rs::compile_derivations`. Lifting them to declarative
 metamodel rules here is tracked under #287/#311 follow-ups:
-
-* Transitivity of binary FTs — Fact Type has inferred Fact iff some
-  Fact uses Resource for the first Role and some other Fact uses
-  other Resource for the second Role of a Fact Type sharing the join
-  Noun.
 
 * CWA negation — Resource is in complement of FT iff Resource is
   instance of some Noun, Noun plays some Role of FT, no Fact uses

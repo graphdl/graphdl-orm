@@ -1301,6 +1301,38 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             }
             pairs
         };
+        // #892: collect every (ft1_id, ft2_id) pair the transitivity
+        // metamodel rule fans out over — binary FTs (arity == 2)
+        // where `ft1.roles[1].noun_name == ft2.roles[0].noun_name`
+        // (ft1 ends at the noun ft2 begins at). The single
+        // `_transitivity` metamodel rule carries no individual noun
+        // name in its id (the merged Func emits the union of every
+        // per-pair inner Func), so the substring fallback misses it
+        // — same gap #890 patched for `_subtype_inheritance` and
+        // #891 patched for `_ss_autofill`. We key the rule under
+        // every noun that plays a role in either FT of every
+        // chaining pair, so noun-gated dispatch
+        // (`command::create_via_defs`) finds it for any role of any
+        // FT involved in transitive composition.
+        let transitivity_ft_pairs: Vec<(String, String)> = {
+            let mut pairs: Vec<(String, String)> = Vec::new();
+            // Walk `c_fact_types` (the indexed FactType definitions)
+            // mirroring `compile_transitivity_metamodel`'s pair
+            // enumeration exactly. Same source so the index lines up
+            // with the compiled rule's actual fanout.
+            let binary: Vec<(&String, &FactTypeDef)> = c_fact_types.iter()
+                .filter(|(_, ft)| ft.roles.len() == 2)
+                .collect();
+            for (i, (ft1_id, ft1)) in binary.iter().enumerate() {
+                for (j, (ft2_id, ft2)) in binary.iter().enumerate() {
+                    if j == i { continue; }
+                    if ft1.roles[1].noun_name != ft2.roles[0].noun_name { continue; }
+                    let entry = ((*ft1_id).clone(), (*ft2_id).clone());
+                    if !pairs.contains(&entry) { pairs.push(entry); }
+                }
+            }
+            pairs
+        };
         let mut noun_to_derivations: HashMap<String, Vec<String>> = HashMap::new();
         // For each compiled derivation, determine which nouns are involved.
         // Strategy: check the derivation ID and all fact types in the domain
@@ -1379,6 +1411,23 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             // or consequent FT of any SS-autofill span.
             if did == SS_AUTOFILL_ID {
                 for (a_ft, b_ft) in ss_autofill_ft_pairs.iter() {
+                    for ft_id in [a_ft, b_ft] {
+                        if let Some(ft) = c_fact_types.get(ft_id.as_str()) {
+                            for role in &ft.roles { nouns.insert(role.noun_name.clone()); }
+                        }
+                    }
+                }
+            }
+            // #892: same patch for the single `_transitivity`
+            // metamodel rule — the merged Func emits the union of
+            // every per-(ft1, ft2) inner Func, so no single noun
+            // appears in the def id. Key under every noun that
+            // plays a role in either FT of every chaining pair, so
+            // noun-gated dispatch (command::create_via_defs) finds
+            // it for any role of any FT involved in transitive
+            // composition.
+            if did == TRANSITIVITY_ID {
+                for (a_ft, b_ft) in transitivity_ft_pairs.iter() {
                     for ft_id in [a_ft, b_ft] {
                         if let Some(ft) = c_fact_types.get(ft_id.as_str()) {
                             for role in &ft.roles { nouns.insert(role.noun_name.clone()); }
@@ -2511,52 +2560,27 @@ fn compile_derivations(data: &CellIndex, state_machines: &[CompiledStateMachine]
         derivations.push(d);
     }
 
-    // Transitivity (#287): for each pair of binary FTs where ft1's
-    // second role shares its noun with ft2's first role (A→B and B→C),
-    // emit a standard Join `DerivationRuleDef` and route through
-    // compile_join_derivation. The compile-time loop enumerating FT
-    // pairs stays (a single FORML 2 rule would need a metamodel
-    // antecedent over `Fact Type has Role` populations — deferred), but
-    // the per-pair work now uses the same two-antecedent Join Func
-    // shape every user rule takes. The consequent cell id
-    // `_transitive_<ft1>_<ft2>` matches the pre-287 name so SM
-    // infrastructure gates in `command.rs` keep working.
-    let binary_fts: Vec<(String, FactTypeDef)> = data.fact_types.iter()
-        .filter(|(_, ft)| ft.roles.len() == 2)
-        .map(|(id, ft)| (id.clone(), ft.clone()))
-        .collect();
-    derivations.extend(binary_fts.iter().enumerate()
-        .flat_map(|(i, (ft1_id, ft1))| binary_fts.iter().enumerate()
-            .filter(move |(j, _)| *j != i)
-            .filter_map(move |(_, (ft2_id, ft2))| {
-                (ft1.roles[1].noun_name == ft2.roles[0].noun_name).then_some(())?;
-                let shared_noun = ft1.roles[1].noun_name.clone();
-                let src_noun = ft1.roles[0].noun_name.clone();
-                let dst_noun = ft2.roles[1].noun_name.clone();
-                let reading = format!(
-                    "{} transitively relates to {} via {}",
-                    src_noun, dst_noun, shared_noun);
-                let rule = DerivationRuleDef {
-                    id: format!("_transitivity_{}_{}", ft1_id, ft2_id),
-                    text: reading,
-                    antecedent_sources: vec![
-                        crate::types::AntecedentSource::FactType(ft1_id.clone()),
-                        crate::types::AntecedentSource::FactType(ft2_id.clone()),
-                    ],
-                    consequent_cell: crate::types::ConsequentCellSource::Literal(
-                        format!("_transitive_{}_{}", ft1_id, ft2_id)),
-                    consequent_instance_role: String::new(),
-                    kind: DerivationKind::Transitivity,
-                    join_on: vec![shared_noun],
-                    match_on: vec![],
-                    consequent_bindings: vec![src_noun, dst_noun],
-                    antecedent_filters: vec![], consequent_computed_bindings: vec![],
-                    consequent_aggregates: vec![], unresolved_clauses: vec![],
-                    antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
-                };
-                Some(compile_join_derivation(data, &rule))
-            }))
-    );
+    // Transitivity (#892): the per-(ft1, ft2) binary-FT pair
+    // synthesis loop is replaced by ONE metamodel derivation rule
+    // declared in `readings/core/derivation.md` and lifted to ONE
+    // CompiledDerivation by `compile_transitivity_metamodel`.
+    // Whitepaper §5.2: this is the universal modus-ponens schema
+    // for transitive composition — antecedent quantifies over
+    // `(FactType × FactType)` pairs where ft1's second role and
+    // ft2's first role share a noun, consequent is the inferred
+    // `<<src_noun, src_id>, <dst_noun, dst_id>>` fact pushed into
+    // the synthetic `_transitive_<ft1_id>_<ft2_id>` cell.
+    // Behaviour is byte-for-byte identical to the pre-#892 fanout
+    // (acceptance: `crates/arest/tests/transitivity_metamodel_rule_e2e.rs`);
+    // pre-#892 the chainer saw N defs `derivation:_transitivity_<a>_<b>`,
+    // post-#892 it sees ONE def `derivation:_transitivity` whose Func
+    // emits the same union of `<consequent_ft_id, reading, bindings>`
+    // tuples in one Concat step. The consequent cell id
+    // `_transitive_<ft1>_<ft2>` is preserved so SM infrastructure
+    // gates in `command.rs` keep working.
+    if let Some(d) = compile_transitivity_metamodel(data) {
+        derivations.push(d);
+    }
 
     // CWA negation (#287 gap #2): for each (CWA noun, FT, role) triple
     // where the noun plays a role in the FT, synthesize a standard
@@ -4446,6 +4470,113 @@ pub(crate) fn compile_ss_autofill_metamodel(
 /// Func emits the union of every per-SS-Constraint inner Func, so
 /// no single antecedent noun appears in the def name).
 pub(crate) const SS_AUTOFILL_ID: &str = "_ss_autofill";
+
+/// Compile transitive composition of binary Fact Types as ONE
+/// CompiledDerivation whose Func concatenates per-(ft1, ft2) inner
+/// Funcs (#892).
+///
+/// Whitepaper §5.2 (universal modus-ponens schema) frames
+/// transitivity as a single metamodel derivation rule whose
+/// antecedent quantifies over `(FactType × FactType)` pairs where
+/// ft1's second role and ft2's first role share a noun (the
+/// "join noun"), and whose consequent is the synthesized
+/// `<<src_noun, src_id>, <dst_noun, dst_id>>` fact pushed into a
+/// fresh `_transitive_<ft1_id>_<ft2_id>` cell. The declarative form
+/// lives in `readings/core/derivation.md`; this function is the
+/// compile-time lift of that rule into a Func the FFP forward
+/// chainer fires at evaluation time.
+///
+/// Each per-(ft1, ft2) inner Func is byte-for-byte the same shape
+/// `compile_join_derivation` produces for a 2-antecedent
+/// `[FactType(ft1), FactType(ft2)]` rule with
+/// `Literal("_transitive_<ft1>_<ft2>")` consequent and
+/// `join_on = [shared_noun]` + `consequent_bindings = [src_noun,
+/// dst_noun]` — so behaviour is preserved across the loop →
+/// metamodel-rule transition (#892 acceptance:
+/// `transitivity_metamodel_rule_e2e.rs`).
+///
+/// Returns `None` when fewer than two distinct binary Fact Types
+/// exist whose role-1/role-0 nouns chain — the chainer shouldn't see
+/// a no-op `Concat . []` def in that case (matches the pre-#892
+/// loop's "no rules emitted when no FT pair chains" behaviour).
+pub(crate) fn compile_transitivity_metamodel(
+    data: &CellIndex,
+) -> Option<CompiledDerivation> {
+    // Mirror the pre-#892 loop's pair enumeration exactly: filter
+    // binary Fact Types (arity 2), then walk every ordered pair
+    // (i ≠ j) where `ft1.roles[1].noun_name == ft2.roles[0].noun_name`.
+    // Same iteration order, so emission is byte-for-byte identical
+    // at the cell level.
+    let binary_fts: Vec<(String, FactTypeDef)> = data.fact_types.iter()
+        .filter(|(_, ft)| ft.roles.len() == 2)
+        .map(|(id, ft)| (id.clone(), ft.clone()))
+        .collect();
+    let inner_funcs: Vec<Func> = binary_fts.iter().enumerate()
+        .flat_map(|(i, (ft1_id, ft1))| binary_fts.iter().enumerate()
+            .filter(move |(j, _)| *j != i)
+            .filter_map(move |(_, (ft2_id, ft2))| {
+                (ft1.roles[1].noun_name == ft2.roles[0].noun_name).then_some(())?;
+                let shared_noun = ft1.roles[1].noun_name.clone();
+                let src_noun = ft1.roles[0].noun_name.clone();
+                let dst_noun = ft2.roles[1].noun_name.clone();
+                let reading = format!(
+                    "{} transitively relates to {} via {}",
+                    src_noun, dst_noun, shared_noun);
+                // Lift each (ft1, ft2) pair to the same
+                // DerivationRuleDef the pre-#892 loop synthesized,
+                // then route through compile_join_derivation so the
+                // 2-antecedent `FactType` + `Literal`-consequent
+                // path produces the per-pair Func. Discard the
+                // wrapper CompiledDerivation — we want only its
+                // `func` to fold into the outer Concat.
+                let rule = DerivationRuleDef {
+                    id: format!("_transitivity_{}_{}", ft1_id, ft2_id),
+                    text: reading,
+                    antecedent_sources: vec![
+                        crate::types::AntecedentSource::FactType(ft1_id.clone()),
+                        crate::types::AntecedentSource::FactType(ft2_id.clone()),
+                    ],
+                    consequent_cell: crate::types::ConsequentCellSource::Literal(
+                        format!("_transitive_{}_{}", ft1_id, ft2_id)),
+                    consequent_instance_role: String::new(),
+                    kind: DerivationKind::Transitivity,
+                    join_on: vec![shared_noun],
+                    match_on: vec![],
+                    consequent_bindings: vec![src_noun, dst_noun],
+                    antecedent_filters: vec![], consequent_computed_bindings: vec![],
+                    consequent_aggregates: vec![], unresolved_clauses: vec![],
+                    antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+                };
+                Some(compile_join_derivation(data, &rule).func)
+            }))
+        .collect();
+    if inner_funcs.is_empty() { return None; }
+    // Concat the per-pair Funcs into one Func that emits the union
+    // of every per-pair inner Func's tuple sequence.
+    // forward_chain_defs_state routes each emitted
+    // `<consequent_ft_id, reading, bindings>` tuple to its own
+    // `_transitive_<ft1>_<ft2>` cell (slot 0), so the merged
+    // emission is indistinguishable from the pre-#892 N-Funcs-N-defs
+    // shape at the cell level.
+    let func = Func::compose(Func::Concat, Func::construction(inner_funcs));
+    Some(CompiledDerivation {
+        id: TRANSITIVITY_ID.to_string(),
+        text: "Transitivity metamodel rule (readings/core/derivation.md)".to_string(),
+        kind: DerivationKind::Transitivity,
+        func,
+        uses_negation: false,
+    })
+}
+
+/// Synthetic id for the single transitivity metamodel rule (#892).
+/// Recognised by the `derivation_index` synthetic-id fallback in
+/// `compile_to_defs_state` so the index keys this id into every
+/// noun that plays a role in some pair of chaining binary FTs —
+/// without that, noun-gated `command::create_via_defs` paths would
+/// skip transitivity for lack of a noun-name match in the id (the
+/// merged Func emits the union of every per-pair inner Func, so no
+/// single noun appears in the def name).
+pub(crate) const TRANSITIVITY_ID: &str = "_transitivity";
 
 /// State machine initialization as a derivation rule.
 ///
