@@ -2996,16 +2996,20 @@ fn platform_apply_command(x: &Object, d: &Object) -> Object {
         _ => d.clone(),
     };
     let result = crate::command::apply_command_defs(&dispatch_state, &command, &dispatch_state);
-    // #766: return the `{__state_delta, __result}` Map carrier the
-    // writer-dispatcher (`lib.rs::classify_writer_result`) recognises as
-    // CommitDelta. Before this change we stringified the CommandResult
-    // into an Object::atom, which fell into `NoCommit` — the apply
-    // looked successful but no chain entry was ever appended. The Map
-    // carrier slots straight into `merge_delta`, extending each touched
-    // cell's chain so `cell_pin` reflects the new version. The encoded
-    // `__result` body uses the same compact JSON `decode_command_result`
-    // already round-trips, so worker callers that read `__result` get
-    // the exact same envelope shape they would have seen pre-#766.
+    // #766 / #797: return the `{__state_delta, __result}` Map carrier
+    // the writer-dispatcher (`lib.rs::classify_writer_result`)
+    // recognises as CommitDelta. Before this lift we stringified the
+    // CommandResult into an Object::atom, which fell into `NoCommit` —
+    // the apply looked successful but no chain entry was ever appended.
+    // The Map carrier slots straight into `merge_delta`, extending each
+    // touched cell's chain so `cell_pin` reflects the new version. The
+    // encoded `__result` body uses the same compact JSON
+    // `decode_command_result` already round-trips, so worker callers
+    // that read `__result` get the exact same envelope shape they would
+    // have seen pre-#766. The carrier shape is locked down by the
+    // `platform_apply_command_*_returns_map_carrier_shape` /
+    // `_state_delta_is_map_of_touched_cells` / `_classifies_as_commit_delta`
+    // acceptance tests below — #797's #777 linchpin.
     crate::command::encode_command_result(&result)
 }
 
@@ -8688,6 +8692,201 @@ mod tests {
         assert_eq!(
             result.as_atom(),
             Some("⊥ field 'fields' exceeds platform buffer"),
+        );
+    }
+
+    // ── #797 / #766 — Map carrier return shape ───────────────────────
+    //
+    // The successful (non-rejecting) path of `platform_apply_command`
+    // must return the `{__state_delta, __result}` Map carrier introduced
+    // by S1c #757 / #766. The carrier is the linchpin for #777 (worker
+    // collapse to engine-only IO): without it `classify_writer_result`
+    // (lib.rs) would route the result to `NoCommit`, the per-cell chain
+    // would never extend, and the worker's `writeCellThroughEngine`
+    // (src/entity-do.ts) would not be able to extract `__state_delta`
+    // to apply to its in-memory cell graph — forcing the parallel SQL
+    // write path that S1 / #777 set out to retire.
+    //
+    // Pre-lift behaviour returned an `Object::atom(<json-summary>)` and
+    // these tests would fail at `result.as_map()` being None — the
+    // shape distinguisher this commit locks down.
+
+    /// Build a phi state object — enough for `apply_command_defs` to
+    /// fall through `resolve:<noun>` to the default
+    /// `<noun>_has_<field>` cell-name convention. Zero schema, zero
+    /// derivations, zero validate functions — the create still emits
+    /// per-field cells under that fallback name so `__state_delta` is
+    /// observably non-empty.
+    fn apply_command_phi_state() -> Object {
+        Object::phi()
+    }
+
+    #[test]
+    fn platform_apply_command_create_returns_map_carrier_shape() {
+        // A well-formed CreateEntity command against an empty state.
+        // create_via_defs (#867) auto-generates the entity id when none
+        // is supplied; the FT-cell fallback (command.rs:550) ensures at
+        // least one cell is pushed into the delta.
+        let json = r#"{"type":"createEntity","noun":"Person","domain":"d","fields":{"name":"Alice"}}"#;
+        let input = Object::atom(json);
+        let d = apply_command_phi_state();
+        let result = platform_apply_command(&input, &d);
+
+        // The return must be a Map, not an atom — pre-lift this was an
+        // `Object::atom(json_summary)` and `result.as_map()` would be
+        // None. The Map shape is the contract `classify_writer_result`
+        // matches on for CommitDelta.
+        let map = result.as_map().expect(
+            "platform_apply_command must return a Map carrier on success; \
+             pre-#766 it returned an Object::atom and writes never committed",
+        );
+        assert!(
+            map.contains_key("__state_delta"),
+            "Map carrier must contain a __state_delta key; \
+             keys present = {:?}",
+            map.keys().collect::<Vec<_>>(),
+        );
+        assert!(
+            map.contains_key("__result"),
+            "Map carrier must contain a __result key; \
+             keys present = {:?}",
+            map.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn platform_apply_command_create_result_field_is_json_atom() {
+        // The __result slot must carry the compact JSON envelope as an
+        // atom — exactly the bytes pre-#766 callers received as the
+        // bare return value. Worker callers that pull `__result` back
+        // out (writer-dispatcher response field, command.rs::decode_command_result)
+        // must see the same parseable JSON shape.
+        let json = r#"{"type":"createEntity","noun":"Person","domain":"d","fields":{"name":"Alice"}}"#;
+        let input = Object::atom(json);
+        let d = apply_command_phi_state();
+        let result = platform_apply_command(&input, &d);
+
+        let map = result.as_map().expect("Map carrier expected");
+        let result_obj = map.get("__result")
+            .expect("__result key must be present in the Map carrier");
+        let result_atom = result_obj.as_atom()
+            .expect("__result must be an Object::atom holding the compact JSON envelope");
+        // The atom must parse as JSON — the envelope shape
+        // `decode_command_result` already round-trips. Any non-JSON
+        // payload here breaks that round-trip and the worker's
+        // response-string contract.
+        let parsed: serde_json::Value = serde_json::from_str(result_atom)
+            .expect("__result atom must be valid JSON");
+        assert!(
+            parsed.is_object(),
+            "__result JSON must be an object; got {}",
+            result_atom,
+        );
+    }
+
+    #[test]
+    fn platform_apply_command_create_state_delta_is_map_of_touched_cells() {
+        // The __state_delta slot must be a Map whose keys are the cell
+        // names the command modified — exactly the per-command delta
+        // `merge_delta` (lib.rs CommitDelta arm) consumes. For a
+        // `createEntity` with one field, at least one FT cell appears
+        // (the `<noun>_has_<field>` cell pushed by create_via_defs
+        // command.rs:550).
+        let json = r#"{"type":"createEntity","noun":"Person","domain":"d","fields":{"name":"Alice"}}"#;
+        let input = Object::atom(json);
+        let d = apply_command_phi_state();
+        let result = platform_apply_command(&input, &d);
+
+        let map = result.as_map().expect("Map carrier expected");
+        let delta = map.get("__state_delta")
+            .expect("__state_delta key must be present");
+        let delta_map = delta.as_map().expect(
+            "__state_delta must itself be a Map of per-cell post-state; \
+             classify_writer_result inspects delta.as_map() before \
+             promoting to CommitDelta",
+        );
+        // At least one cell was touched: with no `resolve:Person` def
+        // installed, create_via_defs falls back to `Person_has_name`.
+        // The exact cell name is documented in command.rs but the
+        // contract here is just that the delta isn't empty.
+        assert!(
+            !delta_map.is_empty(),
+            "create with a non-empty fields map must yield a non-empty \
+             per-cell delta; got delta keys = {:?}",
+            delta_map.keys().collect::<Vec<_>>(),
+        );
+        // Stronger: verify the noun_has_field FT cell appears. This
+        // pins the shape worker callers depend on when applying the
+        // delta to their in-memory cell graph.
+        assert!(
+            delta_map.contains_key("Person_has_name"),
+            "create:Person with field=name must touch the Person_has_name FT cell; \
+             got delta keys = {:?}",
+            delta_map.keys().collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn platform_apply_command_update_returns_map_carrier_shape() {
+        // The update variant must also surface the Map carrier so
+        // worker callers can lift the delta on update through the same
+        // code path they use for create. Pre-lift the worker fell back
+        // to a parallel SQL write because the engine couldn't return
+        // the post-update delta — only a stringified envelope.
+        let json = r#"{"type":"updateEntity","noun":"Person","domain":"d","entityId":"p-1","fields":{"name":"Bob"}}"#;
+        let input = Object::atom(json);
+        let d = apply_command_phi_state();
+        let result = platform_apply_command(&input, &d);
+
+        let map = result.as_map().expect(
+            "platform_apply_command(updateEntity) must return a Map carrier; \
+             worker collapse to engine-only IO (#777) depends on this",
+        );
+        assert!(
+            map.contains_key("__state_delta") && map.contains_key("__result"),
+            "Map carrier must contain both __state_delta and __result keys; \
+             keys present = {:?}",
+            map.keys().collect::<Vec<_>>(),
+        );
+        // __state_delta is a Map even when the update is a no-op
+        // (empty cells); shape stability matters for the classifier.
+        let delta = map.get("__state_delta").unwrap();
+        assert!(
+            delta.as_map().is_some(),
+            "__state_delta on update must be a Map, even if empty (no \
+             existing entity); got {:?}",
+            delta,
+        );
+    }
+
+    #[test]
+    fn platform_apply_command_map_carrier_classifies_as_commit_delta() {
+        // Mirror the writer dispatcher's `classify_writer_result`
+        // recognition test inline here so the shape contract is
+        // testable from ast.rs without taking a lib.rs dependency.
+        // The carrier must (a) be a Map, (b) carry both keys, (c) have
+        // `__state_delta` itself be a Map — exactly the predicates
+        // classify_writer_result inspects (lib.rs::classify_writer_result).
+        // If any predicate fails, the dispatcher routes to NoCommit and
+        // merge_delta never runs — the #766 / #777 regression.
+        let json = r#"{"type":"createEntity","noun":"Person","domain":"d","fields":{"name":"Alice"}}"#;
+        let input = Object::atom(json);
+        let result = platform_apply_command(&input, &apply_command_phi_state());
+
+        // Predicate 1: top-level Map.
+        let map = result.as_map().expect("classifier predicate 1: top-level Map");
+        // Predicate 2: both keys present.
+        assert!(map.contains_key("__state_delta"),
+            "classifier predicate 2a: __state_delta key");
+        assert!(map.contains_key("__result"),
+            "classifier predicate 2b: __result key");
+        // Predicate 3: __state_delta is itself a Map (so the dispatcher
+        // can clone-extract the delta and pass it to merge_delta).
+        assert!(
+            map.get("__state_delta").unwrap().as_map().is_some(),
+            "classifier predicate 3: __state_delta as Map — without \
+             this the dispatcher falls back to NoCommit and the \
+             worker's #777 engine-only IO collapse is impossible"
         );
     }
 
