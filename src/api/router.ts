@@ -1467,28 +1467,6 @@ router.post('/arest/chat', async (request: Request, env: Env) => {
   })
 })
 
-// ── /arest/extract (#639 / Worker-AI-2 + #641 / Worker-AI-4) ─────────
-// Migrated from the dispatchVerb('compile', body) placeholder (#619
-// spike) to the real LLM extract pipeline:
-//
-//   1. Resolve the Agent Definition for verb "extract" via the four-
-//      cell walker `resolveAgentVerb` (TS port of
-//      `arest::agent::resolve_agent_verb`).
-//   2. Render the prompt template with body as input.
-//   3. Call `aiComplete(rendered_prompt, { env, model: binding.modelCode })`.
-//   4. Parse the LLM output as JSON; on parse failure surface `_raw`.
-//
-// 503 envelope shape mirrors the kernel-side #620 path so HATEOAS-aware
-// clients can branch on a single envelope schema across both targets.
-//
-// #641 (this commit) wires the boot-time Agent Definition seed
-// (`AGENT_DEFINITIONS_STATE` from `./ai/agent-seed`) so the four-cell
-// walker resolves to the Extractor Agent Definition. With AI_GATEWAY_*
-// env vars set, requests now return 200 with the parsed JSON payload;
-// without them, the 503 envelope's `agentDefinition` block carries
-// the resolved model code + agent id (introspection works without a
-// live LLM call). Mirror of the kernel's `system::init` Agent
-// Definition seed pattern at `crates/arest-kernel/src/system.rs:262`.
 router.post('/arest/extract', async (request: Request, env: Env) => {
   return handleExtract(request, {
     AI_GATEWAY_URL: env.AI_GATEWAY_URL ?? '',
