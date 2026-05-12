@@ -264,6 +264,56 @@ pub fn boxed_in_memory() -> Box<dyn StorageBackend> {
     Box::new(InMemoryBackend::new())
 }
 
+// ── Cell-adapter audit (#886, parent #777 / #336 freeze-thaw) ───────
+//
+// #777 demands the engine reach SQLite (and any other persistent
+// substrate) only through a CellSource adapter — concretely, the
+// `CellStorageBackend` trait below. A parallel-IO path that bypasses
+// the adapter would let two writers drift: the adapter's freeze/thaw
+// view (#336) and a raw rusqlite path would land different bytes for
+// the same `(tenant, cell)` pair, and tenant isolation (Def 2) would
+// no longer hold by construction.
+//
+// #886 audited every `rusqlite` / `Connection::` call site in
+// `crates/arest/src/` (`grep -rn "rusqlite\|Connection::\|::open("`
+// 2026-05-09). Five files mention rusqlite. None of them is engine
+// production code — all five fall into one of two documented
+// exceptions:
+//
+//   1. **CLI process-boundary persistence (legitimate exception).**
+//      `crates/arest/src/cli/entry.rs`, `cli/reload.rs`, `cli/watch.rs`
+//      open `~/arest.db` to load/persist tenant state at process
+//      boundaries — the engine reads from this DB into an
+//      `ast::Object` ONCE on startup (via `db::load_state`), then
+//      every subsequent engine read/write happens against the
+//      in-memory cell graph. The DB is the on-disk freeze format the
+//      CLI happens to use; it is not an IO surface the engine
+//      consults during a request. A CLI-only direct rusqlite path is
+//      equivalent to `LocalFilesystemBackend::write_object` writing
+//      raw freeze bytes — different encoding (SQL rows vs freeze
+//      blob), same role (process-boundary persistence). When the
+//      `LocalFilesystemBackend` path is wired into the CLI
+//      (Storage-1 follow-up), the rusqlite blocks here will retire.
+//
+//   2. **In-memory query implementation (legitimate exception).**
+//      `crates/arest/src/sql.rs` materialises an in-memory
+//      `Connection::open_in_memory()` per `system(h, "sql", …)` call,
+//      copies the live cell graph into per-FT tables, runs the
+//      user's SELECT, and drops the connection. Nothing is persisted
+//      and nothing crosses a process boundary; the SQLite engine is
+//      an implementation detail of the SELECT runtime, not a
+//      durable store. The state input is always sourced from
+//      `tenant.read().snapshot_d()` (see lib.rs `key == "sql"` arm)
+//      so the cell-adapter contract still gates every byte the
+//      query observes.
+//
+// **Engine production code never imports rusqlite.** A future bypass
+// would surface as a new file under `crates/arest/src/` (not in
+// `cli/`, not `sql.rs`) calling `Connection::open(path)` for a
+// non-`:memory:` URI. The expected fix is to route through
+// `CellStorageBackend::cell_read` / `cell_commit` so the freeze/thaw
+// invariants (#336) and tenant isolation (Def 2) hold.
+
 // ── CellStorageBackend + DurableObjectBackend (Storage-3, #336) ─────
 //
 // The paper (§5.4, Definition 2 — Cell Isolation) is explicit: each
