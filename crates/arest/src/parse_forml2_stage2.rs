@@ -6884,6 +6884,68 @@ mod tests {
             "empty grammar state falls back to the 2-keyword boot table");
     }
 
+    // ─── #877: noun-has-noun literal table ───────────────────────────
+
+    /// #877 — `is_noun_has_noun_literal` in parse_forml2.rs has a
+    /// hardcoded ` has ` infix keyword (one keyword today, the same
+    /// dispatch-to-data smell as #875). The keyword set lives in
+    /// code, not in the grammar. This lift moves the infix-marker
+    /// vocabulary to a typed `NounHasNounLiteralTable` reading the
+    /// `Noun Has Noun Literal Keyword` grammar enum. Boot table
+    /// preserves the historic single-keyword order so the recognizer
+    /// behaves identically before and after the lift.
+    #[test]
+    fn noun_has_noun_literal_table_boot_has_one_keyword_in_declared_order() {
+        let table = super::NounHasNounLiteralTable::boot();
+        let words: Vec<&str> = table.iter().collect();
+        assert_eq!(words, vec![" has "],
+            "boot table must mirror the historic ` has ` infix in \
+             is_noun_has_noun_literal, with surrounding spaces included \
+             so the find-and-slice semantics round-trip.");
+    }
+
+    /// #877 — `split_at_keyword` returns (lhs, rhs) when the clause
+    /// contains the declared keyword as a substring; otherwise None.
+    /// Mirrors the historic `find(" has ")` + `[..idx]` /
+    /// `[idx + " has ".len()..]` slicing in `is_noun_has_noun_literal`
+    /// exactly.
+    #[test]
+    fn noun_has_noun_literal_table_split_at_keyword_returns_lhs_rhs_or_none() {
+        let table = super::NounHasNounLiteralTable::boot();
+        assert_eq!(
+            table.split_at_keyword("Country has Population"),
+            Some(("Country", "Population")),
+            "first-match-wins on ` has `");
+        assert_eq!(
+            table.split_at_keyword("Foo is Bar"),
+            None,
+            "non-`has` clause must not match");
+        assert_eq!(
+            table.split_at_keyword(""),
+            None,
+            "empty clause cannot contain any keyword");
+    }
+
+    /// #877 — when state's EnumValues cell carries Noun Has Noun
+    /// Literal Keyword values, from_grammar_state lifts them at
+    /// runtime.
+    #[test]
+    fn noun_has_noun_literal_table_from_grammar_state_reads_enum_values() {
+        let state = synthetic_enum_state(&[
+            ("Noun Has Noun Literal Keyword", &[" foo ", " bar "]),
+        ]);
+        let table = super::NounHasNounLiteralTable::from_grammar_state(&state);
+        assert_eq!(table.rows, vec![" foo ", " bar "]);
+    }
+
+    #[test]
+    fn noun_has_noun_literal_table_falls_back_to_boot_on_empty_state() {
+        let state = synthetic_enum_state(&[]);
+        let table = super::NounHasNounLiteralTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 1,
+            "empty grammar state falls back to the 1-keyword boot table");
+    }
+
     // ─── #790: constraint span prefix table ──────────────────────────
 
     /// #790 — `resolve_constraint_span_ft` strips deontic / quantifier
