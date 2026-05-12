@@ -110,13 +110,15 @@ fn is_extraction_clause(clause: &str, noun_names: &[String]) -> bool {
 /// declared `Feature Request concerns API Product`. Only ` some ` and
 /// ` that ` (as whole-word tokens) are removed — the surrounding
 /// noun / verb text is untouched.
+///
+/// #883 Sweep-1 lift — existential quantifier vocabulary lifts to
+/// `ExistentialQuantifierTable` so the keyword set lives in
+/// `readings/forml2-grammar.md` as an `Existential Quantifier
+/// Keyword` enum value type. Boot stays in sync with the grammar;
+/// same chained-replace semantics as the legacy inline
+/// `.replace(" some ", " ").replace(" that ", " ")` cascade.
 fn strip_existential_quantifiers(clause: &str) -> String {
-    clause
-        .replace(" some ", " ")
-        .replace(" that ", " ")
-        .replace("  ", " ")
-        .trim()
-        .to_string()
+    crate::parse_forml2_stage2::ExistentialQuantifierTable::boot().strip(clause)
 }
 
 /// True when `clause` has the shape `<Noun> has <Noun> '<literal>'`

@@ -1212,6 +1212,75 @@ impl TemporalPredicateTable {
     }
 }
 
+/// #883 — `strip_existential_quantifiers` in `parse_forml2.rs` strips
+/// existential / anaphoric quantifier tokens (` some `, ` that `) from
+/// a clause so the surrounding noun/verb text resolves cleanly. Each
+/// marker carries surrounding spaces so the whole-word `replace`
+/// semantics enforce a word boundary. The legacy form chains
+/// `.replace(" some ", " ").replace(" that ", " ")` then collapses
+/// double-spaces — the lift preserves that exact ordering so the
+/// recognizer behaves identically before and after the lift.
+///
+/// Reuses the same `boot` / `from_grammar_state` / `iter` shape as
+/// every other Sweep-1 table; the domain accessor is `strip(clause)`,
+/// returning the clause with each keyword replaced by a single space
+/// and double-spaces collapsed.
+#[derive(Debug, Clone)]
+pub struct ExistentialQuantifierTable {
+    /// The existential / anaphoric quantifier tokens. Order matches
+    /// the `' some ', ' that '` declaration in
+    /// `readings/forml2-grammar.md` and the legacy chained `.replace`
+    /// calls in `strip_existential_quantifiers` so the substitution
+    /// behavior round-trips.
+    pub rows: Vec<String>,
+}
+
+impl ExistentialQuantifierTable {
+    /// Boot table — must stay in sync with `Existential Quantifier
+    /// Keyword` enum-value declaration in
+    /// `readings/forml2-grammar.md`. Two markers (` some `, ` that `)
+    /// in the same declaration order as the legacy chained `.replace`
+    /// calls in `strip_existential_quantifiers`.
+    pub fn boot() -> Self {
+        ExistentialQuantifierTable {
+            rows: alloc::vec![
+                " some ".to_string(),
+                " that ".to_string(),
+            ],
+        }
+    }
+
+    /// Build the table from the runtime `Existential Quantifier
+    /// Keyword` enum-value declaration. Falls back to `boot()` when
+    /// the cell is empty (bare engine, no metamodel loaded).
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_enum_values(state, "Existential Quantifier Keyword");
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            ExistentialQuantifierTable { rows }
+        }
+    }
+
+    /// Iterate the keywords in declaration order.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.rows.iter().map(|s| s.as_str())
+    }
+
+    /// Strip every declared keyword from `clause` and collapse the
+    /// resulting double-spaces. Mirrors the legacy
+    /// `.replace(" some ", " ").replace(" that ", " ").replace("  ", " ").trim()`
+    /// cascade in `strip_existential_quantifiers` exactly.
+    pub fn strip(&self, clause: &str) -> alloc::string::String {
+        let mut out = clause.to_string();
+        for kw in self.rows.iter() {
+            out = out.replace(kw.as_str(), " ");
+        }
+        out = out.replace("  ", " ");
+        out.trim().to_string()
+    }
+}
+
 
 /// #783 first slice — `is_word_comparator_clause` in `parse_forml2.rs`
 /// scans for an inline 8-entry `COMPARATORS` const (` exceeds `,
@@ -5448,6 +5517,8 @@ mod tests {
     /// bumping noun=46, enum=35.
     /// #880 added `Bare Value Comparison Keyword` enum (4 values) —
     /// bumping noun=48, enum=37.
+    /// #883 added `Existential Quantifier Keyword` enum (2 values) —
+    /// bumping noun=50, enum=39.
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
@@ -5455,7 +5526,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 49, "noun count");
+        assert_eq!(noun_count, 50, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -5467,7 +5538,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 38, "enum-valued noun count");
+        assert_eq!(enum_count, 39, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -7871,6 +7942,72 @@ mod tests {
         let table = super::TemporalPredicateTable::from_grammar_state(&state);
         assert_eq!(table.rows.len(), 7,
             "empty grammar state falls back to the 7-keyword boot table");
+    }
+
+    // ─── #883: existential quantifier table ──────────────────────────
+
+    /// #883 — `strip_existential_quantifiers` in parse_forml2.rs strips
+    /// 2 hardcoded quantifier tokens (` some `, ` that `) via a
+    /// chained `.replace(...)` cascade then collapses double-spaces.
+    /// This lift moves the vocabulary to a typed
+    /// `ExistentialQuantifierTable` reading the `Existential
+    /// Quantifier Keyword` grammar enum. Boot order matches the
+    /// historic `.replace(" some ", " ").replace(" that ", " ")`
+    /// chain.
+    #[test]
+    fn existential_quantifier_table_boot_has_two_keywords_in_declared_order() {
+        let table = super::ExistentialQuantifierTable::boot();
+        let words: Vec<&str> = table.iter().collect();
+        assert_eq!(words, vec![" some ", " that "],
+            "boot table must mirror the historic ` some ` / ` that ` \
+             quantifier order in strip_existential_quantifiers");
+    }
+
+    /// #883 — `strip` removes each declared keyword and collapses
+    /// double-spaces. Mirrors the legacy
+    /// `.replace(" some ", " ").replace(" that ", " ").replace("  ", " ").trim()`
+    /// cascade exactly.
+    #[test]
+    fn existential_quantifier_table_strip_collapses_quantifiers() {
+        let table = super::ExistentialQuantifierTable::boot();
+        assert_eq!(
+            table.strip("Feature Request concerns some API Product"),
+            "Feature Request concerns API Product");
+        assert_eq!(
+            table.strip("Order has that Customer"),
+            "Order has Customer");
+        assert_eq!(
+            table.strip("Order has Customer"),
+            "Order has Customer",
+            "no quantifier → unchanged (modulo trim)");
+        assert_eq!(
+            table.strip(" Order has Customer "),
+            "Order has Customer",
+            "trim applied");
+    }
+
+    /// #883 — when state's EnumValues cell carries Existential
+    /// Quantifier Keyword values, from_grammar_state lifts them at
+    /// runtime.
+    #[test]
+    fn existential_quantifier_table_from_grammar_state_reads_enum_values() {
+        let state = synthetic_enum_state(&[
+            ("Existential Quantifier Keyword", &[" any ", " each "]),
+        ]);
+        let table = super::ExistentialQuantifierTable::from_grammar_state(&state);
+        assert_eq!(table.rows, vec![" any ", " each "]);
+        assert_eq!(
+            table.strip("List has any Item"),
+            "List has Item",
+            "runtime-loaded keyword must be honoured");
+    }
+
+    #[test]
+    fn existential_quantifier_table_falls_back_to_boot_on_empty_state() {
+        let state = synthetic_enum_state(&[]);
+        let table = super::ExistentialQuantifierTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 2,
+            "empty grammar state falls back to the 2-keyword boot table");
     }
 
     // ─── #790: constraint span prefix table ──────────────────────────
