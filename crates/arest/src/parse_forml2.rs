@@ -1201,11 +1201,15 @@ pub(crate) fn try_expand_possessive(text: &str, noun_names: &[String]) -> Option
 /// so `has Population >= 1000000` resolves to the base FT `has Population`
 /// with an AntecedentFilter attached restricting that antecedent's population.
 /// Temporal predicates are runtime clock checks with no declared FT.
+///
+/// #881 Sweep-1 lift — temporal-marker vocabulary lifts to
+/// `TemporalPredicateTable` so the keyword set lives in
+/// `readings/forml2-grammar.md` as a `Temporal Predicate Keyword`
+/// enum value type. Boot stays in sync with the grammar; same
+/// any-match-wins iteration as the legacy inline
+/// `l.contains("now is ") || l.contains(" in the past") || ...` chain.
 fn is_temporal_predicate(clause: &str) -> bool {
-    let l = clause.to_lowercase();
-    l.contains("now is ") || l.contains(" in the past") || l.contains(" in the future")
-        || l.contains("is current") || l.contains("is expired")
-        || l.contains("is fresh") || l.contains("is stale")
+    crate::parse_forml2_stage2::TemporalPredicateTable::boot().matches(clause)
 }
 
 fn resolve_derivation_rule(

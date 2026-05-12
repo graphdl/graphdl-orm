@@ -1125,6 +1125,93 @@ impl SubtypeInstanceCheckTable {
     }
 }
 
+/// #881 — `is_temporal_predicate` in `parse_forml2.rs` scans for any
+/// of seven hardcoded substrings (`now is `, ` in the past`, ` in the
+/// future`, `is current`, `is expired`, `is fresh`, `is stale`) via a
+/// chain of `.contains(...)` calls on the lowercased clause. Each
+/// substring is a runtime clock-check predicate: clauses whose body
+/// matches one are skipped during fact-type resolution because there
+/// is no declared FT to bind them to. Some markers carry surrounding
+/// spaces (`now is `, ` in the past`, ` in the future`) and some are
+/// bare (`is current`, `is expired`, `is fresh`, `is stale`) — the
+/// shape mirrors the legacy declaration order in the function body
+/// so the case-insensitive `contains` semantics round-trip without
+/// surprise.
+///
+/// The lift moves the temporal-marker vocabulary to a typed
+/// `TemporalPredicateTable` reading the `Temporal Predicate Keyword`
+/// grammar enum. Boot-table rows store each phrase verbatim — as the
+/// inline `.contains(...)` chain expected. Future keywords (e.g.,
+/// `is overdue`, ` since `, ` until `) extend the grammar declaration
+/// and are picked up automatically; no Rust change is required.
+#[derive(Debug, Clone)]
+pub struct TemporalPredicateTable {
+    /// The seven temporal-predicate markers. Order matches the
+    /// `'now is ', ' in the past', ' in the future', 'is current',
+    /// 'is expired', 'is fresh', 'is stale'` declaration in
+    /// `readings/forml2-grammar.md` and the legacy chained
+    /// `.contains(...)` calls in `is_temporal_predicate` so the
+    /// any-match-wins iteration behavior round-trips.
+    pub rows: Vec<String>,
+}
+
+impl TemporalPredicateTable {
+    /// Boot table — must stay in sync with `Temporal Predicate
+    /// Keyword` enum-value declaration in
+    /// `readings/forml2-grammar.md`. Seven markers in the same
+    /// declaration order as the legacy hardcoded `contains` chain in
+    /// `is_temporal_predicate`.
+    pub fn boot() -> Self {
+        TemporalPredicateTable {
+            rows: alloc::vec![
+                "now is ".to_string(),
+                " in the past".to_string(),
+                " in the future".to_string(),
+                "is current".to_string(),
+                "is expired".to_string(),
+                "is fresh".to_string(),
+                "is stale".to_string(),
+            ],
+        }
+    }
+
+    /// Build the table from the runtime `Temporal Predicate Keyword`
+    /// enum-value declaration. Falls back to `boot()` when the cell
+    /// is empty (bare engine, no metamodel loaded).
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_enum_values(state, "Temporal Predicate Keyword");
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            TemporalPredicateTable { rows }
+        }
+    }
+
+    /// Iterate the keywords in declaration order. Each keyword carries
+    /// its own leading/trailing spaces verbatim; the caller uses
+    /// `matches` for the contains-any form.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.rows.iter().map(|s| s.as_str())
+    }
+
+    /// Return true when the lowercased clause contains any declared
+    /// temporal-predicate marker. Mirrors the legacy
+    /// `let l = clause.to_lowercase(); l.contains("now is ") ||
+    /// l.contains(" in the past") || l.contains(" in the future") ||
+    /// l.contains("is current") || l.contains("is expired") ||
+    /// l.contains("is fresh") || l.contains("is stale")` chain in
+    /// `is_temporal_predicate` exactly: the clause is lowercased once
+    /// before scanning, and the markers themselves are stored in their
+    /// declared (lowercase) form, so substring matching is effectively
+    /// case-insensitive and the surrounding spaces around `now is ` /
+    /// ` in the past` / ` in the future` enforce the word boundary
+    /// where the legacy chain expected one.
+    pub fn matches(&self, clause: &str) -> bool {
+        let l = clause.to_lowercase();
+        self.rows.iter().any(|kw| l.contains(kw.as_str()))
+    }
+}
+
 
 /// #783 first slice — `is_word_comparator_clause` in `parse_forml2.rs`
 /// scans for an inline 8-entry `COMPARATORS` const (` exceeds `,
@@ -5354,6 +5441,9 @@ mod tests {
     /// Literal Keyword` enum (2 values) — bumping noun=45, enum=34.
     /// #884 added `Possessive Marker` enum (1 value) —
     /// bumping noun=47, enum=36.
+    /// #881 added `Temporal Predicate Keyword` enum (7 values) —
+    /// bumping noun=49, enum=38 (next-available pair past
+    /// parallel-agent additions).
     /// #879 added `Subtype Instance Check Keyword` enum (2 values) —
     /// bumping noun=46, enum=35.
     /// #880 added `Bare Value Comparison Keyword` enum (4 values) —
@@ -5365,7 +5455,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 48, "noun count");
+        assert_eq!(noun_count, 49, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -5377,7 +5467,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 37, "enum-valued noun count");
+        assert_eq!(enum_count, 38, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -7677,6 +7767,110 @@ mod tests {
         let table = super::SubtypeInstanceCheckTable::from_grammar_state(&state);
         assert_eq!(table.rows.len(), 2,
             "empty grammar state falls back to the 2-keyword boot table");
+    }
+
+
+    // ─── #881: temporal predicate table ──────────────────────────────
+
+    /// #881 — `is_temporal_predicate` in parse_forml2.rs has a
+    /// hardcoded seven-entry `.contains(...)` chain (`now is `,
+    /// ` in the past`, ` in the future`, `is current`, `is expired`,
+    /// `is fresh`, `is stale`) checked on the lowercased clause. The
+    /// keyword set lives in code, not in the grammar. Each marker is
+    /// stored in its declared (lowercase) form; some markers carry
+    /// surrounding spaces so the contains-match approximates a word
+    /// boundary where the legacy chain expected one. This lift moves
+    /// the temporal-marker vocabulary to a typed
+    /// `TemporalPredicateTable` reading the `Temporal Predicate
+    /// Keyword` grammar enum. Boot table preserves the historic
+    /// seven-keyword order so the recognizer behaves identically
+    /// before and after the lift.
+    #[test]
+    fn temporal_predicate_table_boot_has_seven_keywords_in_declared_order() {
+        let table = super::TemporalPredicateTable::boot();
+        let words: Vec<&str> = table.iter().collect();
+        assert_eq!(words, vec![
+            "now is ",
+            " in the past",
+            " in the future",
+            "is current",
+            "is expired",
+            "is fresh",
+            "is stale",
+        ],
+            "boot table must mirror the historic `now is ` / ` in the past` \
+             / ` in the future` / `is current` / `is expired` / `is fresh` \
+             / `is stale` order in is_temporal_predicate, with each marker \
+             stored verbatim (including any surrounding spaces) so the \
+             contains semantics round-trip on word boundaries where the \
+             legacy chain expected one.");
+    }
+
+    /// #881 — `matches` returns true when the lowercased clause
+    /// contains any declared keyword. Mirrors the legacy
+    /// `let l = clause.to_lowercase(); l.contains("now is ") ||
+    /// l.contains(" in the past") || ...` chain in
+    /// `is_temporal_predicate` exactly: case-insensitive substring
+    /// match across the lowercased clause, surrounding spaces in
+    /// space-bearing keywords enforce the word boundary.
+    #[test]
+    fn temporal_predicate_table_matches_returns_bool() {
+        let table = super::TemporalPredicateTable::boot();
+        assert!(
+            table.matches("now is later than the deadline"),
+            "`now is ` infix matches inside the clause");
+        assert!(
+            table.matches("Birthdate is in the past"),
+            "` in the past` suffix matches inside the clause");
+        assert!(
+            table.matches("Renewal is in the future"),
+            "` in the future` suffix matches inside the clause");
+        assert!(
+            table.matches("Subscription is current"),
+            "`is current` matches inside the clause");
+        assert!(
+            table.matches("Token is expired"),
+            "`is expired` matches inside the clause");
+        assert!(
+            table.matches("Cache is fresh"),
+            "`is fresh` matches inside the clause");
+        assert!(
+            table.matches("Cache is stale"),
+            "`is stale` matches inside the clause");
+        // Case-insensitive: clause is lowercased before scanning.
+        assert!(
+            table.matches("Token IS EXPIRED"),
+            "uppercase clause must still match (clause is lowercased)");
+        assert!(
+            !table.matches("Country has Population"),
+            "non-temporal clause must not match");
+        assert!(
+            !table.matches(""),
+            "empty clause cannot match any keyword");
+    }
+
+    /// #881 — when state's EnumValues cell carries Temporal Predicate
+    /// Keyword values, from_grammar_state lifts them at runtime.
+    #[test]
+    fn temporal_predicate_table_from_grammar_state_reads_enum_values() {
+        let state = synthetic_enum_state(&[
+            ("Temporal Predicate Keyword", &["is overdue", " since "]),
+        ]);
+        let table = super::TemporalPredicateTable::from_grammar_state(&state);
+        assert_eq!(table.rows, vec!["is overdue", " since "]);
+        assert!(table.matches("Invoice is overdue"),
+            "runtime-loaded keyword must be honoured by the accessor");
+        assert!(!table.matches("Token is expired"),
+            "runtime-loaded list replaces boot — boot-only keywords no \
+             longer match when the grammar declares its own set");
+    }
+
+    #[test]
+    fn temporal_predicate_table_falls_back_to_boot_on_empty_state() {
+        let state = synthetic_enum_state(&[]);
+        let table = super::TemporalPredicateTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 7,
+            "empty grammar state falls back to the 7-keyword boot table");
     }
 
     // ─── #790: constraint span prefix table ──────────────────────────
