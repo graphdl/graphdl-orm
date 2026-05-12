@@ -428,4 +428,131 @@ describe('entity-do (cell model)', () => {
       expect(fetched?.data.name).toBe('Bob')
     })
   })
+
+  // ── Sealed-cell prefix fail-loud contract (#888) ────────────────────
+  //
+  // Closes #777 (worker engine-only collapse) and a slice of #779
+  // (security findings, A-9). Pre-#888 the worker would silently parse
+  // a row missing the `SEALED_CELL_PREFIX` as legacy plaintext JSON —
+  // a foot-gun for a supposedly-encrypted DB. After #888 a master-bound
+  // read of a non-prefixed row throws naming the broken cell; rotation
+  // refuses to no-op silently when the bytes are not sealed.
+  describe('sealed-cell prefix is mandatory (#888)', () => {
+    function makeEntityDB(env: Record<string, string | undefined>): EntityDB {
+      const kv: Record<string, unknown> = {}
+      const ctx = {
+        id: { toString: () => 'tenant-888' },
+        storage: {
+          sql: createMockSql(),
+          get: async <T>(key: string): Promise<T | undefined> => kv[key] as T | undefined,
+          put: async (key: string, value: unknown): Promise<void> => { kv[key] = value },
+          delete: async (key: string): Promise<boolean> => {
+            const had = key in kv
+            delete kv[key]
+            return had
+          },
+        },
+      }
+      const db = Object.create(EntityDB.prototype) as EntityDB
+      ;(db as any).ctx = ctx
+      ;(db as any).env = env
+      ;(db as any).initialized = false
+      ;(db as any).master = null
+      // Engine pre-hydrated so put()/get() don't trigger the WASM
+      // compile path; this suite's unit-under-test is the seal-prefix
+      // policy.
+      ;(db as any).engineHandle = 0
+      return db
+    }
+
+    it('round-trips a sealed cell through the master-bound get path', async () => {
+      // Pin the happy path: write a sealed cell, read it back, confirm
+      // the AEAD round-trip closes. Mirrors the lifecycle test above
+      // but lives in the #888 describe block so the regression check
+      // is co-located with the fail-loud assertions.
+      const db = makeEntityDB({
+        TENANT_MASTER_SEED: 'sealed-cell-round-trip-seed-#888',
+      })
+      await db.put({ id: 'ord-888', type: 'Order', data: { status: 'open', total: '42' } })
+      const sql = (db as any).ctx.storage.sql as ReturnType<typeof createMockSql>
+      const row = (sql.tables['cell'] || [])[0]
+      expect((row.data as string).startsWith(SEALED_CELL_PREFIX)).toBe(true)
+      const fetched = await db.get()
+      expect(fetched).not.toBeNull()
+      expect(fetched!.data.status).toBe('open')
+      expect(fetched!.data.total).toBe('42')
+    })
+
+    it('throws when the master is bound but the row has no SEALED_CELL_PREFIX', async () => {
+      // Simulate a corrupt/legacy row that bypassed `storeCellSealed`
+      // (e.g. a pre-#660 plaintext write, an operator manually mucking
+      // with the SQL, or a future codec change that forgot to migrate).
+      // Pre-#888 the worker silently parsed `data` as JSON and returned
+      // a CellContents — leaking plaintext from a supposedly-encrypted
+      // store. After #888 the read must throw, naming the broken cell
+      // so the operator can investigate.
+      const db = makeEntityDB({
+        TENANT_MASTER_SEED: 'sealed-cell-fail-loud-seed-#888',
+      })
+      const sql = (db as any).ctx.storage.sql as ReturnType<typeof createMockSql>
+      // Hand-seed a plaintext row: bypasses storeCellSealed entirely.
+      sql.exec(
+        `INSERT OR REPLACE INTO cell (id, type, data) VALUES (?, ?, ?)`,
+        'corrupt-1', 'Customer', JSON.stringify({ name: 'PlainAlice' }),
+      )
+      let threw: unknown = null
+      try {
+        await db.get()
+      } catch (e) {
+        threw = e
+      }
+      expect(threw, 'master-bound read of a plaintext row must throw').toBeInstanceOf(Error)
+      const msg = (threw as Error).message
+      // Must name the affected cell so the operator can locate it.
+      expect(msg).toContain('corrupt-1')
+      // Must reference the missing seal so the failure mode is obvious.
+      expect(msg.toLowerCase()).toMatch(/seal|aead|encrypt/)
+    })
+
+    it('rotateMaster refuses to silently no-op on a non-sealed row', async () => {
+      // Pre-#888 rotateMaster returned `{ ok: true, rotated: false }`
+      // for any row missing the prefix — effectively the same plaintext
+      // fallback foot-gun. After #888 it surfaces an explicit auth /
+      // truncated kind so the rotation orchestrator can collect it
+      // into its rotation report instead of pretending the row was
+      // legitimately empty.
+      const db = makeEntityDB({
+        TENANT_MASTER_SEED: 'sealed-cell-rotation-fail-loud-seed-#888',
+      })
+      const sql = (db as any).ctx.storage.sql as ReturnType<typeof createMockSql>
+      // Hand-seed a plaintext row, then drive rotation.
+      sql.exec(
+        `INSERT OR REPLACE INTO cell (id, type, data) VALUES (?, ?, ?)`,
+        'corrupt-2', 'Order', JSON.stringify({ status: 'shipped' }),
+      )
+      let result: unknown = null
+      let threw: unknown = null
+      try {
+        result = await db.rotateMaster({
+          oldSeed: 'old-seed-#888',
+          oldSalt: 'old-salt-#888',
+          newSeed: 'new-seed-#888',
+          newSalt: 'new-salt-#888',
+        })
+      } catch (e) {
+        threw = e
+      }
+      // The non-sealed row is no longer treated as a clean no-op.
+      // Acceptable failure shapes: either a thrown Error naming the
+      // cell, or `{ ok: false, kind: 'auth' | 'truncated' }`. Both
+      // surface the broken-row condition; both block silent success.
+      const okFalse = result && typeof result === 'object'
+        && (result as { ok?: boolean }).ok === false
+      const threwError = threw instanceof Error
+      expect(okFalse || threwError, JSON.stringify({ result, threw })).toBe(true)
+      if (threwError) {
+        expect((threw as Error).message).toMatch(/corrupt-2|seal|aead|sealed/i)
+      }
+    })
+  })
 })

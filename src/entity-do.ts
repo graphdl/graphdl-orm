@@ -269,9 +269,20 @@ export function aadVersionFor(
   return pinned ?? 0
 }
 
-/** ↑n — fetch the cell, decrypting if the row carries the sealed
- *  prefix. Returns the same shape as `fetchCell` so callers can
- *  swap the helper without touching their consumers.
+/** ↑n — fetch the cell, decrypting via AEAD. Returns the same shape
+ *  as `fetchCell` so callers can swap the helper without touching
+ *  their consumers.
+ *
+ *  ## Fail-loud contract (#888 / part of #777 + #779 A-9)
+ *
+ *  AEAD encoding is part of the CellSource adapter's payload codec;
+ *  the worker MUST NOT branch on it. Pre-#888 a row missing the
+ *  `SEALED_CELL_PREFIX` was silently parsed as legacy plaintext —
+ *  a security foot-gun in a supposedly-encrypted store (#779 A-9).
+ *  After #888 cells either decode via AEAD or fail loudly: a missing
+ *  prefix throws naming the affected cell, and `cellOpen` failures
+ *  propagate untouched so the operator sees the broken-row condition
+ *  instead of a quiet plaintext leak.
  *
  *  ## AAD version source (#767 / S1e + #768)
  *
@@ -292,20 +303,28 @@ export async function fetchCellSealed(
   if (rows.length === 0) return null
   const row = rows[0] as Record<string, any>
   const dataField: unknown = row.data
-  let data: Record<string, unknown>
-  if (typeof dataField === 'string' && dataField.startsWith(SEALED_CELL_PREFIX)) {
-    const sealed = base64ToBytes(dataField.slice(SEALED_CELL_PREFIX.length))
-    const aadVersion = aadVersionFor(engineHandle, row.id as string)
-    const address = cellAddressFor(row.type as string, row.id as string, aadVersion)
-    const opened = await cellOpen(master, address, sealed)
-    const json = new TextDecoder().decode(opened)
-    data = JSON.parse(json)
-  } else if (typeof dataField === 'string') {
-    // Legacy plaintext row — read as-is during migration window.
-    data = JSON.parse(dataField || '{}')
-  } else {
-    data = (dataField as Record<string, unknown>) ?? {}
+  if (typeof dataField !== 'string' || !dataField.startsWith(SEALED_CELL_PREFIX)) {
+    // Fail-loud: no plaintext fallback. A supposedly-encrypted store
+    // that silently surfaced raw JSON for a missing prefix is the
+    // exact foot-gun #779 A-9 flagged. Throw naming the cell so the
+    // operator can locate it; downstream callers (EntityDB.get,
+    // rotateMaster, fact projection) propagate the failure rather
+    // than degrade to plaintext.
+    const id = typeof row.id === 'string' ? row.id : '<unknown>'
+    throw new Error(
+      `fetchCellSealed: cell "${id}" is not sealed (missing ${SEALED_CELL_PREFIX} prefix). ` +
+        'Encrypted-store reads cannot fall back to plaintext (#888 / #779 A-9). ' +
+        'Cause: a pre-encryption legacy write, an out-of-band SQL edit, or a ' +
+        'truncated row. Investigate the row before attempting recovery; do not ' +
+        'silently re-seal contents whose provenance is unknown.',
+    )
   }
+  const sealed = base64ToBytes(dataField.slice(SEALED_CELL_PREFIX.length))
+  const aadVersion = aadVersionFor(engineHandle, row.id as string)
+  const address = cellAddressFor(row.type as string, row.id as string, aadVersion)
+  const opened = await cellOpen(master, address, sealed)
+  const json = new TextDecoder().decode(opened)
+  const data = JSON.parse(json) as Record<string, unknown>
   return {
     id: row.id,
     type: row.type,
@@ -973,10 +992,14 @@ export class EntityDB extends DurableObject {
   //
   // Returns:
   //   - `{ ok: true, rotated: true }` on a clean rotation
-  //   - `{ ok: true, rotated: false }` when the row is empty / legacy
-  //     plaintext / not in our `SEALED_CELL_PREFIX` form (no-op)
-  //   - `{ ok: false, kind: 'truncated' | 'auth' }` when the old master
-  //     cannot open the row — the row is left untouched, operator
+  //   - `{ ok: true, rotated: false }` when the cell row is absent
+  //     (nothing to rotate)
+  //   - `{ ok: false, kind: 'truncated' | 'auth' }` when the row is
+  //     present but cannot be opened under the old master — either
+  //     because the sealed envelope is missing (#888 / #779 A-9: a
+  //     row without the `SEALED_CELL_PREFIX` is no longer treated as
+  //     a benign no-op; it surfaces as `truncated`) or because the
+  //     AEAD tag check fails. The row is left untouched; operator
   //     decides whether to retry, zeroize, or accept the loss.
   //
   // The two seeds + two salts are passed explicitly rather than
@@ -1037,8 +1060,13 @@ export class EntityDB extends DurableObject {
     const row = rows[0] as Record<string, any>
     const dataField = row.data as unknown
     if (typeof dataField !== 'string' || !dataField.startsWith(SEALED_CELL_PREFIX)) {
-      // Legacy plaintext or empty — no rotation needed.
-      return { ok: true, rotated: false }
+      // Fail-loud: a row that exists but lacks the sealed prefix is
+      // not a benign no-op — it's a corrupted or pre-encryption cell
+      // that the operator must inspect before rotation. Surfacing
+      // `truncated` flows the broken-row condition into the rotation
+      // orchestrator's report instead of silently skipping (#888 /
+      // #779 A-9: the plaintext-fallback foot-gun on rotation).
+      return { ok: false, kind: 'truncated' }
     }
     const oldMaster = await deriveTenantMasterKey(args.oldSeed, args.oldSalt)
     const newMaster = await deriveTenantMasterKey(args.newSeed, args.newSalt)
