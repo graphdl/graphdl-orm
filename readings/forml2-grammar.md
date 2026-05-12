@@ -68,6 +68,8 @@ Universal Quantifier Keyword is a value type.
   The possible values of Universal Quantifier Keyword are 'for each '.
 Extraction Clause Keyword is a value type.
   The possible values of Extraction Clause Keyword are ' is extracted from ', ' is derived from '.
+Noun Has Noun Literal Keyword is a value type.
+  The possible values of Noun Has Noun Literal Keyword are ' has '.
 Ring Constraint Trailing Marker is a value type.
   The possible values of Ring Constraint Trailing Marker are 'is irreflexive', 'is asymmetric', 'is antisymmetric', 'is symmetric', 'is intransitive', 'is transitive', 'is acyclic', 'is reflexive'.
 Ring Constraint Kind Code is a value type.

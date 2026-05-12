@@ -120,20 +120,27 @@ fn strip_existential_quantifiers(clause: &str) -> String {
 }
 
 /// True when `clause` has the shape `<Noun> has <Noun> '<literal>'`
-/// with both nouns declared. Accepts state-machine status filters and
-/// enum-value filters where the underlying FT isn't always declared
-/// textually (e.g. Status is SM-managed).
+/// with both nouns declared (per the boot table; future infix markers
+/// come from the `Noun Has Noun Literal Keyword` grammar enum).
+/// Accepts state-machine status filters and enum-value filters where
+/// the underlying FT isn't always declared textually (e.g. Status is
+/// SM-managed).
+///
+/// #877 Sweep-1 lift — vocabulary lifts to `NounHasNounLiteralTable`
+/// so the keyword set lives in `readings/forml2-grammar.md` as a
+/// `Noun Has Noun Literal Keyword` enum value type. Boot stays in
+/// sync with the grammar; same first-match-wins iteration as the
+/// legacy inline `find(" has ")` call.
 fn is_noun_has_noun_literal(clause: &str, noun_names: &[String]) -> bool {
     let trimmed = clause.trim().trim_end_matches('.');
     // Hand-rolled equivalent of `^(.+?) has (.+?) '[^']*'$`.
     // Strip the trailing space-prefixed quoted literal, then split on
-    // the first ` has ` to recover (subj, attr).
+    // the first table-keyword (` has `) to recover (subj, attr).
     let Some((without_literal, _)) = strip_trailing_quoted_literal(trimmed) else {
         return false;
     };
-    let Some(idx) = without_literal.find(" has ") else { return false; };
-    let subj = without_literal[..idx].trim();
-    let attr = without_literal[idx + " has ".len()..].trim();
+    let Some((subj, attr)) = crate::parse_forml2_stage2::NounHasNounLiteralTable::boot()
+        .split_at_keyword(without_literal.as_str()) else { return false; };
     let is_noun = |s: &str| noun_names.iter().any(|n| n == s);
     is_noun(subj) && is_noun(attr)
 }

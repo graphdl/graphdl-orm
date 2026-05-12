@@ -642,6 +642,82 @@ impl ExtractionClauseTable {
     }
 }
 
+/// #877 — `is_noun_has_noun_literal` in `parse_forml2.rs` scans for
+/// an inline ` has ` infix keyword via `without_literal.find(" has ")`
+/// to recognise filter clauses of the shape `<Noun> has <Noun>
+/// '<literal>'`. The infix is stored with surrounding spaces so the
+/// substring search matches on word boundaries. The lift moves the
+/// infix-marker vocabulary to a typed `NounHasNounLiteralTable`
+/// reading the `Noun Has Noun Literal Keyword` grammar enum. Boot-
+/// table rows store the keyword with its surrounding spaces so the
+/// `find`-and-slice semantics round-trip without surprise. Future
+/// keywords (e.g., ` carries `, ` holds `, ` reports `) extend the
+/// grammar declaration and are picked up automatically; no Rust
+/// change is required.
+#[derive(Debug, Clone)]
+pub struct NounHasNounLiteralTable {
+    /// The noun-has-noun-literal infix markers. Order matches the
+    /// `' has '` declaration in `readings/forml2-grammar.md` and the
+    /// legacy single-keyword `find(" has ")` call in
+    /// `is_noun_has_noun_literal` so first-match-wins iteration
+    /// behavior round-trips.
+    pub rows: Vec<String>,
+}
+
+impl NounHasNounLiteralTable {
+    /// Boot table — must stay in sync with `Noun Has Noun Literal
+    /// Keyword` enum-value declaration in
+    /// `readings/forml2-grammar.md`. One marker (` has `) in the same
+    /// declaration order as the legacy hardcoded find call in
+    /// `is_noun_has_noun_literal`.
+    pub fn boot() -> Self {
+        NounHasNounLiteralTable {
+            rows: alloc::vec![
+                " has ".to_string(),
+            ],
+        }
+    }
+
+    /// Build the table from the runtime `Noun Has Noun Literal
+    /// Keyword` enum-value declaration. Falls back to `boot()` when
+    /// the cell is empty (bare engine, no metamodel loaded).
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_enum_values(state, "Noun Has Noun Literal Keyword");
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            NounHasNounLiteralTable { rows }
+        }
+    }
+
+    /// Iterate the keywords in declaration order. Each keyword
+    /// carries its surrounding spaces; the caller uses
+    /// `split_at_keyword` for the find-and-slice form.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.rows.iter().map(|s| s.as_str())
+    }
+
+    /// Try each keyword in declaration order; on first match return
+    /// `(lhs, rhs)` where `lhs` is the trimmed text before the keyword
+    /// and `rhs` is the trimmed text after it. Mirrors the legacy
+    /// `let Some(idx) = without_literal.find(" has "); let subj =
+    /// without_literal[..idx].trim(); let attr = without_literal[
+    /// idx + " has ".len()..].trim();` shape in
+    /// `is_noun_has_noun_literal` exactly: case-sensitive substring
+    /// search, surrounding spaces in the keyword enforce the word
+    /// boundary.
+    pub fn split_at_keyword<'a>(&self, clause: &'a str) -> Option<(&'a str, &'a str)> {
+        for kw in self.rows.iter() {
+            if let Some(idx) = clause.find(kw.as_str()) {
+                let lhs = clause[..idx].trim();
+                let rhs = clause[idx + kw.len()..].trim();
+                return Some((lhs, rhs));
+            }
+        }
+        None
+    }
+}
+
 /// #783 first slice — `is_word_comparator_clause` in `parse_forml2.rs`
 /// scans for an inline 8-entry `COMPARATORS` const (` exceeds `,
 /// ` is greater than `, ` is less than `, ` is at least `,
@@ -4865,7 +4941,8 @@ mod tests {
     /// — bumping noun=33, enum=22. #875 added `Universal Quantifier
     /// Keyword` enum (1 value) — bumping noun=42, enum=31. #876 added
     /// `Extraction Clause Keyword` enum (2 values) — bumping noun=43,
-    /// enum=32.
+    /// enum=32. #877 added `Noun Has Noun Literal Keyword` enum (1
+    /// value) — bumping noun=44, enum=33.
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
@@ -4873,7 +4950,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 43, "noun count");
+        assert_eq!(noun_count, 44, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -4885,7 +4962,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 32, "enum-valued noun count");
+        assert_eq!(enum_count, 33, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
