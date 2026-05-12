@@ -130,7 +130,25 @@ function createMockCtx(idName = 'test-cell-id'): MockCtx {
 function makeEntityDB(ctx: MockCtx, env: Record<string, unknown> = {}): EntityDB {
   const db = new (EntityDB as unknown as new () => EntityDB)()
   ;(db as unknown as { ctx: MockCtx }).ctx = ctx
-  ;(db as unknown as { env: Record<string, unknown> }).env = env
+  // Post-#888/#902 (`getMaster` fail-loud), an env without
+  // `TENANT_MASTER_SEED` and without the explicit dev-only
+  // `AREST_ALLOW_PLAINTEXT=1` opt-in throws on the first `db.put` /
+  // `db.get`. The #765 cases below predate that hardening and were
+  // written against the legacy plaintext-default path; they pin the
+  // engine-routed read wiring (engine-payload preference, SQL
+  // fallback for class (b)/(c) legacy cells, missing-cell ⊥
+  // graceful-null), NOT the AEAD AAD agreement contract (that's the
+  // #803 sealed-path case in the round-trip suite, and the
+  // sealed-cell SQL fallback test below explicitly constructs its own
+  // master via `deriveTenantMasterKey` instead of going through
+  // EntityDB.getMaster). Default the env to the dev opt-in so the
+  // read-path wiring contracts these tests pin remain observable
+  // through the plaintext branch — mirrors the #803 (commit
+  // 0f47be81) drive-by fix in the round-trip suite. Callers that want
+  // the sealed-cell EntityDB path bind `TENANT_MASTER_SEED`
+  // explicitly to override.
+  const mergedEnv: Record<string, unknown> = { AREST_ALLOW_PLAINTEXT: '1', ...env }
+  ;(db as unknown as { env: Record<string, unknown> }).env = mergedEnv
   return db
 }
 
