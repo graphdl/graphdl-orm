@@ -271,6 +271,13 @@ fn is_that_anaphora_ref(tail: &str, noun_names: &[String]) -> bool {
 /// clause body in a derivation rule uses this form to select the
 /// entity whose ref scheme value equals the literal — equivalent to
 /// `Noun has <RefSchemeVT> '<literal>'`.
+///
+/// #878 Sweep-1 lift — trailing equality vocabulary lifts to
+/// `EntityRefSchemeLiteralTable` so the keyword set lives in
+/// `readings/forml2-grammar.md` as an `Entity Ref Scheme Literal
+/// Keyword` enum value type. Boot stays in sync with the grammar;
+/// same longest-prefix-wins iteration as the legacy inline
+/// `strip_suffix(" is not").or_else(|| strip_suffix(" is"))` chain.
 fn is_entity_ref_scheme_literal(clause: &str, noun_names: &[String]) -> bool {
     let trimmed = clause.trim().trim_end_matches('.');
     // Strip a single leading role qualifier. Only one per clause is
@@ -281,15 +288,12 @@ fn is_entity_ref_scheme_literal(clause: &str, noun_names: &[String]) -> bool {
         .fold(trimmed, |s, q| s.strip_prefix(q).unwrap_or(s));
     // Hand-rolled `^(.+?) (?:is not|is) '[^']*'$`. Strip the trailing
     // quoted literal, then peel off either ` is not` or ` is` from the
-    // right end. Existing code only consumes the captured subject.
+    // right end via the lifted EntityRefSchemeLiteralTable.
     let Some((without_literal, _)) = strip_trailing_quoted_literal(stripped) else {
         return false;
     };
-    let raw_subj = without_literal
-        .strip_suffix(" is not")
-        .or_else(|| without_literal.strip_suffix(" is"));
-    let Some(raw_subj) = raw_subj else { return false; };
-    let raw_subj = raw_subj.trim();
+    let Some(raw_subj) = crate::parse_forml2_stage2::EntityRefSchemeLiteralTable::boot()
+        .strip_trailing_keyword(without_literal.as_str()) else { return false; };
     let (base, _) = parse_role_token(raw_subj);
     noun_names.iter().any(|n| n == base)
 }

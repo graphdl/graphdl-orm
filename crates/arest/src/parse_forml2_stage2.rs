@@ -718,6 +718,84 @@ impl NounHasNounLiteralTable {
     }
 }
 
+/// #878 — `is_entity_ref_scheme_literal` in `parse_forml2.rs` scans
+/// for a trailing equality keyword (` is not` or ` is`) peeled off
+/// the right end of the subject text via `strip_suffix(" is not")
+/// .or_else(|| strip_suffix(" is"))`. The keywords carry a leading
+/// space so the strip matches on word boundary (otherwise `axis` /
+/// `tennis` would mis-strip). Order matters: ` is not` MUST be tried
+/// before ` is` so the longer match wins.
+///
+/// The lift moves the suffix-marker vocabulary to a typed
+/// `EntityRefSchemeLiteralTable` reading the `Entity Ref Scheme
+/// Literal Keyword` grammar enum. Boot-table rows store the keyword
+/// with its leading space so the `strip_suffix` semantics round-trip
+/// without surprise. Future keywords (e.g., ` equals `, ` matches `)
+/// extend the grammar declaration and are picked up automatically;
+/// no Rust change is required.
+#[derive(Debug, Clone)]
+pub struct EntityRefSchemeLiteralTable {
+    /// The entity-ref-scheme-literal trailing equality markers. Order
+    /// matches the `' is not', ' is'` declaration in
+    /// `readings/forml2-grammar.md` and the legacy
+    /// `strip_suffix(" is not").or_else(...strip_suffix(" is"))`
+    /// chain in `is_entity_ref_scheme_literal` so longest-prefix-wins
+    /// iteration behavior round-trips.
+    pub rows: Vec<String>,
+}
+
+impl EntityRefSchemeLiteralTable {
+    /// Boot table — must stay in sync with `Entity Ref Scheme Literal
+    /// Keyword` enum-value declaration in
+    /// `readings/forml2-grammar.md`. Two markers (` is not`, ` is`)
+    /// in the same declaration order as the legacy hardcoded
+    /// `strip_suffix` chain in `is_entity_ref_scheme_literal`.
+    pub fn boot() -> Self {
+        EntityRefSchemeLiteralTable {
+            rows: alloc::vec![
+                " is not".to_string(),
+                " is".to_string(),
+            ],
+        }
+    }
+
+    /// Build the table from the runtime `Entity Ref Scheme Literal
+    /// Keyword` enum-value declaration. Falls back to `boot()` when
+    /// the cell is empty (bare engine, no metamodel loaded).
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_enum_values(state, "Entity Ref Scheme Literal Keyword");
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            EntityRefSchemeLiteralTable { rows }
+        }
+    }
+
+    /// Iterate the keywords in declaration order. Each keyword
+    /// carries its leading space; the caller uses
+    /// `strip_trailing_keyword` for the strip-suffix form.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.rows.iter().map(|s| s.as_str())
+    }
+
+    /// Try each keyword in declaration order; on first match return
+    /// the trimmed text before the keyword. Mirrors the legacy
+    /// `let raw_subj = without_literal.strip_suffix(" is not")
+    /// .or_else(|| without_literal.strip_suffix(" is"));` shape in
+    /// `is_entity_ref_scheme_literal` exactly: case-sensitive suffix
+    /// match, leading space in the keyword enforces the word boundary,
+    /// declaration order ensures ` is not` is tried before ` is` so
+    /// the longer match wins.
+    pub fn strip_trailing_keyword<'a>(&self, clause: &'a str) -> Option<&'a str> {
+        for kw in self.rows.iter() {
+            if let Some(subj) = clause.strip_suffix(kw.as_str()) {
+                return Some(subj.trim());
+            }
+        }
+        None
+    }
+}
+
 /// #783 first slice — `is_word_comparator_clause` in `parse_forml2.rs`
 /// scans for an inline 8-entry `COMPARATORS` const (` exceeds `,
 /// ` is greater than `, ` is less than `, ` is at least `,
@@ -4942,7 +5020,8 @@ mod tests {
     /// Keyword` enum (1 value) — bumping noun=42, enum=31. #876 added
     /// `Extraction Clause Keyword` enum (2 values) — bumping noun=43,
     /// enum=32. #877 added `Noun Has Noun Literal Keyword` enum (1
-    /// value) — bumping noun=44, enum=33.
+    /// value) — bumping noun=44, enum=33. #878 added `Entity Ref Scheme
+    /// Literal Keyword` enum (2 values) — bumping noun=45, enum=34.
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
@@ -4950,7 +5029,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 44, "noun count");
+        assert_eq!(noun_count, 45, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -4962,7 +5041,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 33, "enum-valued noun count");
+        assert_eq!(enum_count, 34, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -6944,6 +7023,77 @@ mod tests {
         let table = super::NounHasNounLiteralTable::from_grammar_state(&state);
         assert_eq!(table.rows.len(), 1,
             "empty grammar state falls back to the 1-keyword boot table");
+    }
+
+    // ─── #878: entity ref scheme literal table ───────────────────────
+
+    /// #878 — `is_entity_ref_scheme_literal` in parse_forml2.rs has a
+    /// hardcoded pair of trailing equality keywords (` is not`, ` is`)
+    /// peeled off via `strip_suffix(" is not").or_else(strip_suffix(
+    /// " is"))`. The keyword set lives in code, not in the grammar.
+    /// Order matters: ` is not` MUST be tried before ` is` so the
+    /// longer match wins (otherwise `... is not` would mis-strip via
+    /// the prefix substring `... is`). This lift moves the suffix-
+    /// marker vocabulary to a typed `EntityRefSchemeLiteralTable`
+    /// reading the `Entity Ref Scheme Literal Keyword` grammar enum.
+    /// Boot table preserves the historic two-keyword order so the
+    /// recognizer behaves identically before and after the lift.
+    #[test]
+    fn entity_ref_scheme_literal_table_boot_has_two_keywords_in_declared_order() {
+        let table = super::EntityRefSchemeLiteralTable::boot();
+        let words: Vec<&str> = table.iter().collect();
+        assert_eq!(words, vec![" is not", " is"],
+            "boot table must mirror the historic ` is not` / ` is` \
+             suffix order in is_entity_ref_scheme_literal, with the \
+             leading space included so the strip_suffix semantics \
+             round-trip on word boundaries.");
+    }
+
+    /// #878 — `strip_trailing_keyword` returns the subject text when
+    /// the clause ends with a declared keyword; otherwise None. First-
+    /// match-wins iteration ensures ` is not` is tried before ` is`,
+    /// mirroring the historic `strip_suffix(" is not").or_else(|| ...
+    /// strip_suffix(" is"))` chain in `is_entity_ref_scheme_literal`
+    /// exactly.
+    #[test]
+    fn entity_ref_scheme_literal_table_strip_trailing_keyword_returns_subj_or_none() {
+        let table = super::EntityRefSchemeLiteralTable::boot();
+        assert_eq!(
+            table.strip_trailing_keyword("Country is"),
+            Some("Country"),
+            "` is` suffix strips to subject");
+        assert_eq!(
+            table.strip_trailing_keyword("Country is not"),
+            Some("Country"),
+            "` is not` is tried first and wins over ` is`");
+        assert_eq!(
+            table.strip_trailing_keyword("Country has"),
+            None,
+            "non-equality suffix must not match");
+        assert_eq!(
+            table.strip_trailing_keyword(""),
+            None,
+            "empty clause cannot end with any keyword");
+    }
+
+    /// #878 — when state's EnumValues cell carries Entity Ref Scheme
+    /// Literal Keyword values, from_grammar_state lifts them at
+    /// runtime.
+    #[test]
+    fn entity_ref_scheme_literal_table_from_grammar_state_reads_enum_values() {
+        let state = synthetic_enum_state(&[
+            ("Entity Ref Scheme Literal Keyword", &[" equals", " matches"]),
+        ]);
+        let table = super::EntityRefSchemeLiteralTable::from_grammar_state(&state);
+        assert_eq!(table.rows, vec![" equals", " matches"]);
+    }
+
+    #[test]
+    fn entity_ref_scheme_literal_table_falls_back_to_boot_on_empty_state() {
+        let state = synthetic_enum_state(&[]);
+        let table = super::EntityRefSchemeLiteralTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 2,
+            "empty grammar state falls back to the 2-keyword boot table");
     }
 
     // ─── #790: constraint span prefix table ──────────────────────────
