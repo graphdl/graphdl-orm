@@ -363,6 +363,11 @@ function parseJsonResult(raw: string): any {
   try { return JSON.parse(raw) } catch { return { raw } }
 }
 
+// Mirrors `escape_atom_for_display` in crates/arest/src/ast.rs.
+function escapeAtom(s: string): string {
+  return s.replace(/[\\<>,]/g, ch => '\\' + ch)
+}
+
 // #831(a) — apply no longer round-trips through mcp.md. cor:closure
 // (AREST.tex Cor. 6 / commit 9630f882 in cli/entry.rs:491) makes the
 // CLI compile preserve population FT cells across recompile, so the
@@ -1142,6 +1147,121 @@ export function parseOrientResponse(raw: string): unknown {
   }
 }
 
+// ── #872 apply footgun-resistance helpers ─────────────────────────────
+//
+// Belt-and-suspenders TS-layer guards mirroring the engine fixes for
+// #867 (apply create without id silently produced an empty-id orphan)
+// and #868 (apply update with partial fields retracted unrelated
+// single-valued facts). Engine fixes landed in f321a9dd; the MCP
+// guards stay so agents get actionable feedback even if a future
+// engine drift reintroduces the silent-failure behavior.
+//
+// Design (#867): refuse-with-clear-message on missing id rather than
+// auto-generate at the MCP layer. Explicit > implicit — agents
+// understand a refusal-with-error message faster than they understand
+// a magic auto-id appearing in their state. The engine still
+// auto-generates as the LAST line of defense per #867; this guard
+// fires first.
+//
+// Design (#868): pre-fetch the existing entity via `get`, layer the
+// payload on top, send the FULL set to the engine. Multi-valued
+// touches (arrays in the get response) skip the merge — re-asserting
+// them would replay every existing fact. Opt-out via
+// `fields_only_replace: true` for the rare case the agent wants the
+// old replace-only behavior.
+
+/**
+ * #867 guard: refuse `apply create` when `id` is missing/empty.
+ *
+ * Returns `null` when the id is present and non-empty; returns an
+ * `{error}` envelope otherwise. The error message names the noun,
+ * mentions reference-scheme semantics, and points the agent at the
+ * `context` verb's rules section (cookbooks are gone). The check is
+ * deliberately string-based — no schema lookup needed, no engine
+ * round-trip before refusal.
+ */
+export function applyCreateMissingIdRefusal(
+  noun: string,
+  id: string | undefined,
+): { error: string } | null {
+  if (id !== undefined && typeof id === 'string' && id.trim() !== '') return null
+  return {
+    error:
+      `apply create requires an explicit id; noun '${noun}' has a reference scheme that takes one. ` +
+      'Auto-generation happens engine-side per #867 (commit f321a9dd) but the MCP refuses silent-id ' +
+      `to keep the contract explicit so agents see the failure they can fix. ` +
+      `Pass an id like '<lowercased-noun>-<n>'. See the 'context.rules' section for the ` +
+      `reference-scheme contract.`,
+  }
+}
+
+/**
+ * #868 guard: merge a partial update payload onto the existing
+ * entity snapshot.
+ *
+ * Only top-level scalar (string) fields are layered. Skipped:
+ *   - the synthetic `id` field (engine takes id from the envelope,
+ *     not from the fields map),
+ *   - array values (multi-valued FT touches — re-asserting these
+ *     would replay every existing touch as a fresh fact),
+ *   - nested-object values (defensive against future HATEOAS
+ *     evolutions of the `get` response shape),
+ *   - null / undefined values (the engine reported "no value" — and
+ *     pushing them back as "" would CREATE an empty fact, the exact
+ *     bug #868 was about).
+ *
+ * Payload values WIN over existing values for the same field, which
+ * gives true update semantics.
+ *
+ * Tolerates `existing` being null/undefined — degrades to "just send
+ * the payload" so the helper is safe to call regardless of whether
+ * the get-fetch hit anything.
+ */
+export function mergeUpdateFields(
+  existing: Record<string, unknown> | null | undefined,
+  payload: Record<string, string>,
+): Record<string, string> {
+  const merged: Record<string, string> = {}
+  if (existing && typeof existing === 'object') {
+    for (const [k, v] of Object.entries(existing)) {
+      if (k === 'id') continue
+      if (v === null || v === undefined) continue
+      if (Array.isArray(v)) continue
+      if (typeof v === 'object') continue
+      merged[k] = String(v)
+    }
+  }
+  for (const [k, v] of Object.entries(payload || {})) {
+    merged[k] = v
+  }
+  return merged
+}
+
+/**
+ * #872 builder: assemble the full merged update payload for the
+ * `apply update` verb. Returns the merged fields map, the merge flag
+ * (whether merging actually happened), and the list of preserved
+ * field names (those layered from the existing snapshot but NOT
+ * overwritten by the payload) — useful as a diff log when debugging.
+ *
+ * When `fields_only_replace` is true, returns the payload unchanged
+ * (no merge), and `preserved` is empty. This is the opt-out for the
+ * rare case the agent wants the old replace-only behavior.
+ */
+export function buildApplyMergedUpdatePayload(args: {
+  existing: Record<string, unknown> | null | undefined
+  payload: Record<string, string>
+  fields_only_replace: boolean
+}): { fields: Record<string, string>; merged: boolean; preserved: string[] } {
+  if (args.fields_only_replace) {
+    return { fields: { ...(args.payload || {}) }, merged: false, preserved: [] }
+  }
+  const fields = mergeUpdateFields(args.existing, args.payload || {})
+  const payloadKeys = new Set(Object.keys(args.payload || {}))
+  const preserved = Object.keys(fields).filter(k => !payloadKeys.has(k))
+  return { fields, merged: true, preserved }
+}
+
 server.registerTool(
   'orient',
   {
@@ -1177,16 +1297,25 @@ server.registerTool(
       context_receipt: z.string().optional().describe(CONTEXT_RECEIPT_FIELD_DESCRIPTION),
       operation: z.enum(['create', 'update', 'transition']).describe('Operation type'),
       noun: z.string().describe('Entity noun type (e.g. "Order", "Case")'),
-      id: z.string().optional().describe('Entity ID. Required for update/transition. Optional for create (auto-generated).'),
+      id: z.string().optional().describe('Entity ID. Required for update/transition AND create (MCP refuses silent-id per #872; engine still auto-generates as last-line-of-defense per #867).'),
       fields: z.record(z.string(), z.string()).optional().describe('Fact pairs for create/update (e.g. {"Name": "Acme", "customer": "alice"})'),
       event: z.string().optional().describe('SM event for transition (e.g. "place", "ship")'),
       sender: z.string().optional().describe('Caller identity for authorization'),
       signature: z.string().optional().describe('HMAC-SHA256 signature'),
+      fields_only_replace: z.boolean().optional().describe('Opt-out (#872) — when true, the MCP skips the merge-with-existing pre-fetch on update and sends ONLY the payload fields to the engine. Use this for the rare case the agent intentionally wants the old replace-only behavior; default (false) is safer (#868 belt-and-suspenders).'),
     },
   },
-  async ({ context_receipt, operation, noun, id, fields, event, sender, signature }) => {
+  async ({ context_receipt, operation, noun, id, fields, event, sender, signature, fields_only_replace }) => {
     const blocked = mutationGateResult('apply', context_receipt, { operation, noun, id, fields, event })
     if (blocked) return blocked
+
+    // #872 / #867 guard: refuse `create` with no explicit id BEFORE any
+    // engine call so the agent sees a clear, actionable failure rather
+    // than a silent orphan that the engine's auto-gen has to clean up.
+    if (operation === 'create') {
+      const refusal = applyCreateMissingIdRefusal(noun, id)
+      if (refusal) return textResult(refusal)
+    }
 
     if (AREST_MODE === 'local') {
       // Mirrors `escape_atom_for_display` in crates/arest/src/ast.rs.
@@ -1204,9 +1333,41 @@ server.registerTool(
           return localApplyResult(raw, { operation, noun, id, fields })
         }
         case 'update': {
-          const pairs = Object.entries(fields || {}).map(([k, v]) => `<${escapeAtom(k)}, ${escapeAtom(v)}>`).join(', ')
+          // #872 / #868 guard: pre-fetch the existing entity and layer
+          // the payload on top so untouched single-valued fields don't
+          // get retracted if a future engine drift breaks the per-field
+          // retract semantics from f321a9dd. Opt-out via
+          // `fields_only_replace: true`.
+          let outboundFields = fields || {}
+          if (id && Object.keys(outboundFields).length > 0) {
+            let existing: Record<string, unknown> | null = null
+            try {
+              const rawExisting = await systemCall(`get:${noun}`, id)
+              const parsed = JSON.parse(rawExisting)
+              if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                existing = parsed as Record<string, unknown>
+              }
+            } catch {
+              // get-fetch miss is non-fatal — the merge degrades to
+              // "just send the payload" so we don't block the update.
+            }
+            const built = buildApplyMergedUpdatePayload({
+              existing,
+              payload: outboundFields,
+              fields_only_replace: fields_only_replace === true,
+            })
+            outboundFields = built.fields
+            // Debug-log the preserved set so a future engine drift is
+            // visible without forcing the agent to dig through cells.
+            if (AREST_DEBUG && built.merged && built.preserved.length > 0) {
+              console.error(
+                `[#872 apply update] preserved by merge: ${built.preserved.join(', ')}`,
+              )
+            }
+          }
+          const pairs = Object.entries(outboundFields).map(([k, v]) => `<${escapeAtom(k)}, ${escapeAtom(v)}>`).join(', ')
           const raw = await systemCall(`update:${noun}`, `<<id, ${escapeAtom(id || '')}>${pairs ? `, ${pairs}` : ''}>`)
-          return localApplyResult(raw, { operation, noun, id, fields })
+          return localApplyResult(raw, { operation, noun, id, fields: outboundFields })
         }
         case 'transition': {
           const raw = await systemCall(`transition:${noun}`, `<${escapeAtom(id || '')}, ${escapeAtom(event || '')}>`)
@@ -1222,6 +1383,38 @@ server.registerTool(
         : { type: 'transition', entityId: id, event, domain: '', sender, signature }
     const data = await httpRequest('/arest/default/apply', { method: 'POST', body: JSON.stringify(command) })
     return textResult(data)
+  },
+)
+
+server.registerTool(
+  'retract',
+  {
+    description: `Retract an exact fact tuple from a FactType cell. Use roles for ordinary fact types; use ordered pairs when a fact type has repeated role names. Stored semiderivations can be removed, but supporting facts may derive them again on the next forward-chain compile. ${MUTATION_TOOL_DESCRIPTION}`,
+    inputSchema: {
+      context_receipt: z.string().optional().describe(CONTEXT_RECEIPT_FIELD_DESCRIPTION),
+      fact_type: z.string().describe('Fact type ID / cell name, e.g. "Order_was_placed_by_Customer"'),
+      roles: z.record(z.string(), z.string()).optional().describe('Role bindings for the exact fact tuple. Use pairs instead when role names repeat.'),
+      pairs: z.array(z.object({
+        role: z.string(),
+        value: z.string(),
+      })).optional().describe('Ordered role/value pairs for exact tuple matching, including repeated role names.'),
+    },
+  },
+  async ({ context_receipt, fact_type, roles, pairs }) => {
+    const blocked = mutationGateResult('retract', context_receipt, { fact_type, roles, pairs })
+    if (blocked) return blocked
+
+    if (AREST_MODE !== 'local') {
+      return textResult({ error: 'retract requires local mode' })
+    }
+
+    const entries = Array.isArray(pairs) && pairs.length
+      ? pairs.map(({ role, value }) => [role, value] as const)
+      : Object.entries(roles || {})
+
+    const input = `<${entries.map(([role, value]) => `<${escapeAtom(role)}, ${escapeAtom(value)}>`).join(', ')}>`
+    const raw = await systemCall(`retract:${fact_type}`, input)
+    return textResult(parseJsonResult(raw))
   },
 )
 

@@ -8,7 +8,16 @@
 import { describe, it, expect } from 'vitest'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
-import { parseQueryResponse, parseSqlResponse, parseCellsResponse, parseInduceResponse, parseOrientResponse } from './server.js'
+import {
+  parseQueryResponse,
+  parseSqlResponse,
+  parseCellsResponse,
+  parseInduceResponse,
+  parseOrientResponse,
+  applyCreateMissingIdRefusal,
+  mergeUpdateFields,
+  buildApplyMergedUpdatePayload,
+} from './server.js'
 
 describe('AREST MCP Server', () => {
   it('registers expected tool names', () => {
@@ -341,5 +350,214 @@ describe('#871 orient verb envelope parsing', () => {
     const result = parseOrientResponse('not json at all') as { error: string; raw: string }
     expect(result.error).toMatch(/malformed/)
     expect(result.raw).toBe('not json at all')
+  })
+})
+
+describe('#872 apply footgun-resistance', () => {
+  // Engine fixes #867 (apply create without id) and #868 (apply update
+  // partial-field retraction) landed in f321a9dd. These tests pin the
+  // MCP TS-layer defensive guards so agents still get actionable
+  // feedback if a future engine drift reintroduces silent-failure
+  // behavior. Belt-and-suspenders per the #869 north-star: "agents get
+  // value without reading the whitepaper".
+
+  describe('#867 apply create without explicit id', () => {
+    it('refuses with reference-scheme message when id is missing/empty', () => {
+      // The MCP layer refuses silent-id to keep the contract explicit
+      // (Option 1 from the task brief: explicit > implicit). The error
+      // message names the noun, mentions reference scheme semantics,
+      // and points the agent at context.rules (cookbooks are gone) for
+      // recovery. The check fires BEFORE any engine call so the agent
+      // gets an immediate failure they can fix.
+      const refusal = applyCreateMissingIdRefusal('Task', undefined)
+      expect(refusal).not.toBeNull()
+      expect(refusal!.error).toMatch(/apply create requires an explicit id/)
+      expect(refusal!.error).toContain("'Task'")
+      expect(refusal!.error).toMatch(/reference scheme/)
+      expect(refusal!.error).toMatch(/#867/)
+      expect(refusal!.error).toMatch(/context\.rules/)
+    })
+
+    it('also refuses when id is an empty string (not just undefined)', () => {
+      // Engine's silent-orphan behavior in pre-f321a9dd was triggered
+      // by empty-string id too, not just undefined. Cover both.
+      const refusalEmpty = applyCreateMissingIdRefusal('Task', '')
+      expect(refusalEmpty).not.toBeNull()
+      expect(refusalEmpty!.error).toMatch(/apply create requires an explicit id/)
+
+      const refusalWhitespace = applyCreateMissingIdRefusal('Task', '   ')
+      expect(refusalWhitespace).not.toBeNull()
+    })
+
+    it('returns null (no refusal) when id is explicitly provided', () => {
+      // Happy path: an explicit id passes the guard so the apply call
+      // proceeds to the engine.
+      expect(applyCreateMissingIdRefusal('Task', 'task-42')).toBeNull()
+      expect(applyCreateMissingIdRefusal('Order', 'ord-1')).toBeNull()
+    })
+  })
+
+  describe('#868 apply update merge-with-existing', () => {
+    it('merges payload fields on top of existing single-valued fields', () => {
+      // The agent passes a partial update (only the fields they want
+      // to change). The MCP layer fetches the existing entity, layers
+      // the payload on top, and sends the full set so the engine can't
+      // accidentally retract untouched single-valued facts (#868).
+      const existing = {
+        id: 'task-42',
+        'Task Status': 'completed',
+        'Task Subject': 'X',
+      }
+      const payload = { 'Task Description': 'new' }
+      const merged = mergeUpdateFields(existing, payload)
+      expect(merged).toEqual({
+        'Task Status': 'completed',
+        'Task Subject': 'X',
+        'Task Description': 'new',
+      })
+    })
+
+    it('payload values WIN over existing for the same field (true update semantics)', () => {
+      // If the agent says "set Task Status to in-progress", the merge
+      // must reflect the new value, not the old. Payload wins.
+      const existing = { id: 'task-42', 'Task Status': 'ready' }
+      const payload = { 'Task Status': 'in-progress' }
+      const merged = mergeUpdateFields(existing, payload)
+      expect(merged['Task Status']).toBe('in-progress')
+    })
+
+    it('preserves multi-valued FT touches without re-asserting them', () => {
+      // For many-to-many fact types like Source File the engine response
+      // surfaces an array of touches. Re-asserting those in the merge
+      // would replay them as fresh facts; the merge must skip arrays so
+      // multi-valued touches pass through directly without being
+      // smuggled back into the update payload.
+      const existing = {
+        id: 'task-42',
+        'Task Status': 'completed',
+        'Source File': [
+          { Source_File: 'a.md' },
+          { Source_File: 'b.md' },
+        ],
+      }
+      const payload = { 'Task Description': 'new' }
+      const merged = mergeUpdateFields(existing, payload)
+      expect(merged).toEqual({
+        'Task Status': 'completed',
+        'Task Description': 'new',
+      })
+      // The Source File array MUST NOT leak into the merged payload —
+      // arrays are multi-valued and live in their own cells.
+      expect('Source File' in merged).toBe(false)
+    })
+
+    it('skips the synthetic id field — id is addressed separately, not as a payload field', () => {
+      // `get` returns the entity with id as a field, but the engine's
+      // update_via_defs takes id from the command envelope, not the
+      // fields map. Smuggling id into the payload triggers a duplicate
+      // <id, ...> pair and confuses the engine.
+      const existing = { id: 'task-42', 'Task Status': 'ready' }
+      const merged = mergeUpdateFields(existing, { 'Task Status': 'completed' })
+      expect('id' in merged).toBe(false)
+    })
+
+    it('skips nested-object fields (only scalar single-valued facts are merged)', () => {
+      // Defensive: if `get` ever evolves to nest related entities (the
+      // synthesize/HATEOAS direction), those should not get smuggled
+      // into the update payload as stringified blobs. Only top-level
+      // string-valued (scalar) facts pass through.
+      const existing = {
+        id: 'task-42',
+        'Task Status': 'ready',
+        related: { Order: 'ord-1' },
+      }
+      const merged = mergeUpdateFields(existing, { 'Task Status': 'completed' })
+      expect('related' in merged).toBe(false)
+      expect(merged['Task Status']).toBe('completed')
+    })
+
+    it('treats null / undefined existing fields as absent (not as "" — would retract)', () => {
+      // A null in the existing snapshot means the engine reported
+      // "no value" for that field; pushing it back as "" would CREATE
+      // an empty fact, the exact bug #868 was about. Skip nulls and
+      // undefineds.
+      const existing = { id: 'task-42', 'Task Status': 'ready', 'Task Subject': null as any }
+      const merged = mergeUpdateFields(existing, { 'Task Description': 'new' })
+      expect('Task Subject' in merged).toBe(false)
+      expect(merged['Task Status']).toBe('ready')
+    })
+
+    it('handles missing/empty existing snapshot gracefully (pass payload through unchanged)', () => {
+      // If the `get` call returns {} or null (engine miss, entity not
+      // yet materialized), the merge degrades to "just send the
+      // payload" — no extra retract risk because there are no
+      // untouched fields to preserve.
+      expect(mergeUpdateFields({}, { 'Task Status': 'ready' })).toEqual({ 'Task Status': 'ready' })
+      expect(mergeUpdateFields(null as any, { 'Task Status': 'ready' })).toEqual({ 'Task Status': 'ready' })
+    })
+  })
+
+  describe('#872 buildApplyMergedUpdatePayload — full end-to-end shape', () => {
+    it('returns merged payload when fields_only_replace is false / absent', () => {
+      // Default behavior: merge with existing. Mock the get-fetcher
+      // returning a typical Task snapshot, call the builder with a
+      // partial payload, verify the merged result.
+      const existing = {
+        id: 'task-42',
+        'Task Status': 'completed',
+        'Task Subject': 'X',
+      }
+      const result = buildApplyMergedUpdatePayload({
+        existing,
+        payload: { 'Task Description': 'new' },
+        fields_only_replace: false,
+      })
+      expect(result.fields).toEqual({
+        'Task Status': 'completed',
+        'Task Subject': 'X',
+        'Task Description': 'new',
+      })
+      expect(result.merged).toBe(true)
+      // The preserved set tells callers which fields the merge layered
+      // back from the existing snapshot — useful diff for debug logs.
+      expect(result.preserved.sort()).toEqual(['Task Status', 'Task Subject'])
+    })
+
+    it('returns the payload unchanged when fields_only_replace is true (opt-out)', () => {
+      // Belt-and-suspenders opt-out for the rare case the agent wants
+      // the old replace-only behavior. The builder must NOT touch the
+      // payload in this case, and preserved must be empty.
+      const existing = {
+        id: 'task-42',
+        'Task Status': 'completed',
+        'Task Subject': 'X',
+      }
+      const result = buildApplyMergedUpdatePayload({
+        existing,
+        payload: { 'Task Description': 'new' },
+        fields_only_replace: true,
+      })
+      expect(result.fields).toEqual({ 'Task Description': 'new' })
+      expect(result.merged).toBe(false)
+      expect(result.preserved).toEqual([])
+    })
+
+    it('confirms #868 fix: unrelated single-valued fields survive a partial update', () => {
+      // The one-line acceptance: against a mocked engine snapshot
+      // {Task Status: "completed", Task Subject: "X"}, an update of
+      // only {Task Description: "new"} must result in an outbound
+      // payload that STILL CARRIES the prior Task Status + Task
+      // Subject. If this assertion regresses, a future engine drift
+      // would re-introduce silent retraction.
+      const existing = { id: 'task-42', 'Task Status': 'completed', 'Task Subject': 'X' }
+      const result = buildApplyMergedUpdatePayload({
+        existing,
+        payload: { 'Task Description': 'new' },
+        fields_only_replace: false,
+      })
+      expect(result.fields['Task Status']).toBe('completed')
+      expect(result.fields['Task Subject']).toBe('X')
+      expect(result.fields['Task Description']).toBe('new')
+    })
   })
 })
