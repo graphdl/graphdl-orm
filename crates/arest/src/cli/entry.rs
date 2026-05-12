@@ -864,7 +864,18 @@ pub fn main_entry() {
                 // stratum-1 over status). forward_chain_stratified
                 // iterates the two strata together until no new facts
                 // appear in an outer round.
-                let stratum1 = collect_derivs("derivation:rule_", &d);
+                // #905: include `_sm_init_<Noun>` synthetic derivations
+                // alongside user-reading `rule_<hash>` rules. Pre-#905
+                // the filter was `derivation:rule_` which silently
+                // dropped every SM init derivation, so user-declared SMs
+                // never materialized their currentlyInStatus cell. The
+                // broader `derivation:` prefix would also pull in
+                // `_cwa_negation_*` per-FT expansions (1120+ on a
+                // metamodel-scale population) which can spike the
+                // fixpoint into multi-minute runtime; keep those out
+                // unless they're proven needed.
+                let mut stratum1 = collect_derivs("derivation:rule_", &d);
+                stratum1.extend(collect_derivs("derivation:_sm_init_", &d));
                 let stratum2 = collect_derivs("derivation_strat2:rule_", &d);
                 let d = if stratum1.is_empty() && stratum2.is_empty() { d } else {
                     let s1_refs: Vec<(&str, &ast::Func)> = stratum1.iter()

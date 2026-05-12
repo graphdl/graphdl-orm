@@ -4797,18 +4797,21 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
                 Func::constant(Object::atom("forResource")),
             ]))),
         );
-        // extract_facts_from_pop returns phi when fact type not found.
-        // Guard: if null, return phi. Otherwise Selector(2) extracts facts.
-        let safe_extract = Func::condition(
-            Func::NullTest,
-            Func::constant(Object::phi()),
-            Func::Selector(2),
-        );
+        // #905: extract_facts_from_pop returns the facts Seq directly
+        // (or phi). The pre-#905 wrapper applied `Selector(2)` here
+        // assuming the result was `<ft_id, [facts]>` (wrapped pair) —
+        // but that's the encoded-FT-entry shape, not the
+        // extract_facts_from_pop return shape. When the cell had a
+        // single empty fact (`<<>>`), the wrapper returned `Bottom`
+        // (Selector(2) on a 1-elem Seq is undefined), poisoning the
+        // downstream `is_new` check so every Task got "F" (not new)
+        // and the rule produced 0 facts. Drop the wrapper — phi /
+        // empty-seq propagates naturally through apply_to_all.
         let get_existing = Func::compose(
             Func::Concat,
             Func::compose(
                 Func::apply_to_all(extract_for_resource),
-                Func::compose(safe_extract, extract_facts_from_pop("StateMachine_has_forResource")),
+                extract_facts_from_pop("StateMachine_has_forResource"),
             ),
         );
 
