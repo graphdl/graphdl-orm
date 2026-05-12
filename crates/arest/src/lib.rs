@@ -1077,6 +1077,7 @@ pub const CORE_READINGS: &[(&str, &str)] = &[
     ("validation",    include_str!("../../../readings/core/validation.md")),
     ("induction",     include_str!("../../../readings/core/induction.md")),
     ("naming",        include_str!("../../../readings/core/naming.md")),
+    ("security",      include_str!("../../../readings/core/security.md")),
 ];
 
 /// Self-modification machinery — Domain Change SM, Signal entities, and

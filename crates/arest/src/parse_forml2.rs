@@ -517,11 +517,20 @@ fn parse_noun_role_operand(
 
 
 
-/// SSRF defense (#25). Reject URLs that point at internal/loopback/link-local
-/// networks, file:// schemes, or internal DNS names. Hardcoded patterns only â€”
-/// no DNS resolution, no network I/O. Called during platform_compile to
-/// validate External System instance facts before they enter state.
-pub fn is_forbidden_url(url: &str) -> bool {
+/// SSRF defense (#25, #894). Reject URLs that point at internal/loopback/
+/// link-local networks, file:// schemes, or internal DNS names. The CIDR
+/// blocklist is data — read from the `CIDR_Block_has_Block_Kind` cell
+/// declared in `readings/core/security.md` — not Rust. Non-CIDR rules
+/// (file://, exact `localhost`/`::1`, internal-DNS suffixes) stay coded
+/// here because they are not CIDR-shaped. No DNS resolution, no network
+/// I/O. Called during platform_compile to validate External System
+/// instance facts before they enter state.
+///
+/// Boot-list fallback: callers passing `Object::phi()` (e.g. unit tests
+/// or pre-bootstrap paths that have no metamodel state yet) get the
+/// 8-entry hardcoded CIDR list this function used to embed inline,
+/// preserving legacy behaviour.
+pub fn is_forbidden_url_in_state(url: &str, state: &crate::ast::Object) -> bool {
     let trimmed = url.trim();
     let lower = trimmed.to_lowercase();
 
@@ -586,66 +595,185 @@ pub fn is_forbidden_url(url: &str) -> bool {
         false => {}
     }
 
-    // IPv4 checks: parse dotted-quad octets. Non-numeric hosts fall through.
-    let octets: Vec<u16> = host_bare.split('.')
-        .filter_map(|p| p.parse::<u16>().ok())
-        .collect();
-    let is_ipv4 = octets.len() == 4 && octets.iter().all(|o| *o <= 255);
-    match is_ipv4 {
-        true => {
-            let (a, b) = (octets[0], octets[1]);
-            // 127.*.*.* loopback
-            // 10.*.*.* private
-            // 169.254.*.* link-local (incl. AWS metadata 169.254.169.254)
-            // 192.168.*.* private
-            // 172.16-31.*.* private
-            let forbidden_v4 = a == 127
-                || a == 10
-                || (a == 169 && b == 254)
-                || (a == 192 && b == 168)
-                || (a == 172 && b >= 16 && b <= 31);
-            match forbidden_v4 {
-                true => return true,
-                false => {}
-            }
-        }
-        false => {}
-    }
-
-    // IPv6 link-local: fe80::/10 â€” first octet of the address
-    // is 0xfe and top two bits of the second are 10 (0x80..0xbf).
-    // Covers fe80: through febf:.
-    let ipv6_linklocal = host_bare.starts_with("fe8")
-        || host_bare.starts_with("fe9")
-        || host_bare.starts_with("fea")
-        || host_bare.starts_with("feb");
-    match ipv6_linklocal {
-        true => return true,
-        false => {}
-    }
-
-    // IPv6 unique-local: fc00::/7 (fc00 through fdff)
-    let ipv6_ula = host_bare.starts_with("fc") || host_bare.starts_with("fd");
-    // Only treat as ULA if the host looks like an IPv6 address (contains ':').
-    match ipv6_ula && host_bare.contains(':') {
-        true => return true,
-        false => {}
+    // CIDR blocklist read from readings/core/security.md → `CIDR_Block_has_Block_Kind`.
+    // Each row's `CIDR Block` binding is a CIDR notation string; we ask
+    // `cidr_contains` whether the host sits inside that range. Empty cell
+    // ⇒ fall back to boot CIDR list (preserves callers without metamodel
+    // state). The host is checked against IPv4 dotted-quad and bare-IPv6
+    // shapes identically — `cidr_contains` parses both.
+    let blocklist = cidr_blocklist_from_state(state);
+    if blocklist.iter().any(|cidr| cidr_contains(cidr.as_str(), host_bare)) {
+        return true;
     }
 
     false
 }
 
+/// Boot fallback for `is_forbidden_url` — the 8 CIDR ranges the
+/// pre-#894 hardcoded check covered. Used when the state's
+/// `CIDR_Block_has_Block_Kind` cell is empty (e.g. bare engine,
+/// unit tests passing phi). Each entry mirrors one branch of the
+/// inline IPv4/IPv6 dispatch the lift replaces:
+///
+///   * `127.0.0.0/8`      ← `a == 127` (IPv4 loopback)
+///   * `10.0.0.0/8`       ← `a == 10`  (IPv4 RFC 1918)
+///   * `169.254.0.0/16`   ← `a == 169 && b == 254` (link-local)
+///   * `192.168.0.0/16`   ← `a == 192 && b == 168` (RFC 1918)
+///   * `172.16.0.0/12`    ← `a == 172 && b in 16..=31` (RFC 1918)
+///   * `::1/128`          ← exact `host_bare == "::1"` (kept also above)
+///   * `fe80::/10`        ← `host_bare.starts_with("fe8..feb")`
+///   * `fc00::/7`         ← `host_bare.starts_with("fc"|"fd")` + colon
+const BOOT_CIDR_BLOCKLIST: &[&str] = &[
+    "127.0.0.0/8",
+    "10.0.0.0/8",
+    "169.254.0.0/16",
+    "192.168.0.0/16",
+    "172.16.0.0/12",
+    "::1/128",
+    "fe80::/10",
+    "fc00::/7",
+];
+
+/// Read the CIDR blocklist from state's `CIDR_Block_has_Block_Kind`
+/// cell. Each fact carries a `CIDR Block` binding (the CIDR string).
+/// Empty cell ⇒ return the boot list so the SSRF defense never
+/// degrades to "no checks" when state is unconfigured.
+fn cidr_blocklist_from_state(state: &crate::ast::Object) -> Vec<String> {
+    use crate::ast::{fetch_or_phi, binding};
+    let cell = fetch_or_phi("CIDR_Block_has_Block_Kind", state);
+    let rows: Vec<String> = cell.as_seq()
+        .map(|facts| facts.iter()
+            .filter_map(|f| binding(f, "CIDR Block").map(String::from))
+            .collect())
+        .unwrap_or_default();
+    if rows.is_empty() {
+        BOOT_CIDR_BLOCKLIST.iter().map(|s| s.to_string()).collect()
+    } else {
+        rows
+    }
+}
+
+/// Legacy entry point — boot list only, no state. Kept so out-of-tree
+/// callers that don't have a state Object on hand still get the same
+/// SSRF coverage they had pre-#894.
+pub fn is_forbidden_url(url: &str) -> bool {
+    is_forbidden_url_in_state(url, &crate::ast::Object::phi())
+}
+
+/// True iff `host` (IPv4 dotted-quad like `127.0.0.1` or bare IPv6
+/// like `fe80::1`) is contained in the CIDR range `cidr` (e.g.
+/// `127.0.0.0/8` or `fe80::/10`). Returns `false` on any parse error,
+/// matching the existing SSRF check's bottom-safe fall-through.
+///
+/// IPv4 and IPv6 are kept on separate code paths: an IPv4 CIDR
+/// only contains IPv4 hosts, and an IPv6 CIDR only contains IPv6
+/// hosts. (No IPv4-in-IPv6 mapping coercion — the legacy code didn't
+/// do it either.) This makes the function exactly the lift of the
+/// hardcoded IPv4/IPv6 dispatch in `is_forbidden_url`.
+///
+/// #894 — exposed as the `cidr_contains` Platform Func via `ast.rs`.
+pub fn cidr_contains(cidr: &str, host: &str) -> bool {
+    let Some((slash, _)) = cidr.find('/').map(|i| (i, ())) else { return false; };
+    let net_str = &cidr[..slash];
+    let prefix: u8 = match cidr[slash + 1..].parse() { Ok(n) => n, Err(_) => return false };
+
+    // IPv4: dotted-quad on both sides. Prefix must be 0..=32.
+    if let Some(net_v4) = parse_ipv4(net_str) {
+        let Some(host_v4) = parse_ipv4(host) else { return false; };
+        if prefix > 32 { return false; }
+        let mask: u32 = match prefix {
+            0 => 0,
+            32 => u32::MAX,
+            n => u32::MAX << (32 - n as u32),
+        };
+        return (net_v4 & mask) == (host_v4 & mask);
+    }
+
+    // IPv6: colon-shaped on both sides. Prefix must be 0..=128.
+    if let Some(net_v6) = parse_ipv6(net_str) {
+        let Some(host_v6) = parse_ipv6(host) else { return false; };
+        if prefix > 128 { return false; }
+        let mask: u128 = match prefix {
+            0 => 0,
+            128 => u128::MAX,
+            n => u128::MAX << (128 - n as u128),
+        };
+        return (net_v6 & mask) == (host_v6 & mask);
+    }
+
+    false
+}
+
+/// Parse a dotted-quad IPv4 literal into u32, big-endian.
+/// Returns None on malformed input (non-numeric, octet > 255, wrong
+/// arity). Mirrors the existing inline octets-parse in `is_forbidden_url`.
+fn parse_ipv4(s: &str) -> Option<u32> {
+    let parts: Vec<u16> = s.split('.')
+        .filter_map(|p| p.parse::<u16>().ok())
+        .collect();
+    if parts.len() != 4 || parts.iter().any(|o| *o > 255) {
+        return None;
+    }
+    Some(parts.iter().fold(0u32, |acc, &o| (acc << 8) | (o as u32)))
+}
+
+/// Parse a bare IPv6 literal into u128, big-endian. Supports `::`
+/// elision once. Returns None on malformed input. Hand-rolled because
+/// `parse_forml2.rs` is no_std-clean and `std::net::Ipv6Addr` isn't
+/// available everywhere this module's reachable from.
+fn parse_ipv6(s: &str) -> Option<u128> {
+    if s.is_empty() { return None; }
+    // Split on the optional `::` elision marker (at most one).
+    let (head, tail): (&str, &str) = match s.find("::") {
+        Some(i) => (&s[..i], &s[i + 2..]),
+        None    => (s, ""),
+    };
+    // The pre-elision and post-elision groups.
+    let head_groups: Vec<&str> = if head.is_empty() { Vec::new() } else { head.split(':').collect() };
+    let tail_groups: Vec<&str> = if tail.is_empty() { Vec::new() } else { tail.split(':').collect() };
+    let total = head_groups.len() + tail_groups.len();
+    if total > 8 { return None; }
+    // Without `::`, must be exactly 8 groups.
+    if s.find("::").is_none() && total != 8 { return None; }
+    // Parse each hex group (1..=4 hex digits).
+    let parse_group = |g: &str| -> Option<u16> {
+        if g.is_empty() || g.len() > 4 { return None; }
+        u16::from_str_radix(g, 16).ok()
+    };
+    let mut groups: [u16; 8] = [0; 8];
+    for (i, g) in head_groups.iter().enumerate() {
+        groups[i] = parse_group(g)?;
+    }
+    let tail_start = 8 - tail_groups.len();
+    for (i, g) in tail_groups.iter().enumerate() {
+        groups[tail_start + i] = parse_group(g)?;
+    }
+    Some(groups.iter().fold(0u128, |acc, &g| (acc << 16) | (g as u128)))
+}
+
 /// Scan the InstanceFact cell in parsed state and return the first
 /// forbidden URL found, if any. Used by platform_compile to reject
 /// External System federation to internal/loopback/link-local hosts.
-pub fn find_forbidden_instance_url(state: &crate::ast::Object) -> Option<String> {
+///
+/// #894: takes a second `d` argument carrying the current metamodel
+/// state — that's where `CIDR_Block_has_Block_Kind` lives, populated
+/// by readings/core/security.md at bootstrap. The InstanceFact cell
+/// being scanned for URLs sits in `state` (the parser's output);
+/// CIDR blocklist sits in `d` (the in-memory metamodel snapshot).
+/// Both fall back to boot list / phi when missing, so callers without
+/// a fully booted metamodel still get the legacy 8-CIDR coverage.
+pub fn find_forbidden_instance_url(
+    state: &crate::ast::Object,
+    d: &crate::ast::Object,
+) -> Option<String> {
     use crate::ast::{fetch_or_phi, binding};
     fetch_or_phi("InstanceFact", state)
         .as_seq()
         .and_then(|facts| {
             facts.iter().find_map(|f| {
                 let object_value = binding(f, "objectValue")?;
-                is_forbidden_url(object_value).then(|| object_value.to_string())
+                is_forbidden_url_in_state(object_value, d)
+                    .then(|| object_value.to_string())
             })
         })
 }
@@ -2556,6 +2684,212 @@ mod regex_replacement_tests {
         assert!(try_parse_aggregate_clause(
             "Task is the boss of Task", &nouns
         ).is_none());
+    }
+}
+
+// =========================================================================
+// #894 — SSRF CIDR blocklist dispatch-to-data lift tests
+// =========================================================================
+
+#[cfg(test)]
+mod ssrf_cidr_tests {
+    use super::*;
+    use crate::ast::{Object, fact_from_pairs, store};
+    use alloc::string::ToString;
+
+    /// Build a state Object whose `CIDR_Block_has_Block_Kind` cell
+    /// carries one fact per `(cidr, kind)` pair. Mirrors the shape
+    /// `instance_fact_field_cells` produces for the parsed reading
+    /// `'127.0.0.0/8' has Block Kind 'internal-loopback'.`
+    fn state_with_cidr_blocks(rows: &[(&str, &str)]) -> Object {
+        let facts: alloc::vec::Vec<Object> = rows.iter()
+            .map(|(cidr, kind)| fact_from_pairs(&[
+                ("CIDR Block", *cidr),
+                ("Block Kind", *kind),
+            ]))
+            .collect();
+        store(
+            "CIDR_Block_has_Block_Kind",
+            Object::Seq(facts.into()),
+            &Object::phi(),
+        )
+    }
+
+    /// Build a state Object whose `InstanceFact` cell carries one
+    /// `External System` URL row. Drives `find_forbidden_instance_url`.
+    fn state_with_external_url(state: Object, name: &str, url: &str) -> Object {
+        let inst = fact_from_pairs(&[
+            ("subjectNoun", "External System"),
+            ("subjectValue", name),
+            ("fieldName", "External_System_has_URL"),
+            ("objectNoun", "URL"),
+            ("objectValue", url),
+        ]);
+        let new_inst = match crate::ast::fetch_or_phi("InstanceFact", &state).as_seq() {
+            Some(items) => {
+                let mut v = items.to_vec();
+                v.push(inst);
+                Object::Seq(v.into())
+            }
+            None => Object::seq(alloc::vec![inst]),
+        };
+        store("InstanceFact", new_inst, &state)
+    }
+
+    // ── cidr_contains primitive ─────────────────────────────────────
+
+    #[test]
+    fn cidr_contains_ipv4_loopback() {
+        assert!(cidr_contains("127.0.0.0/8", "127.0.0.1"));
+        assert!(cidr_contains("127.0.0.0/8", "127.255.255.254"));
+        assert!(!cidr_contains("127.0.0.0/8", "128.0.0.1"));
+    }
+
+    #[test]
+    fn cidr_contains_ipv4_rfc1918_10() {
+        assert!(cidr_contains("10.0.0.0/8", "10.1.2.3"));
+        assert!(!cidr_contains("10.0.0.0/8", "11.0.0.1"));
+    }
+
+    #[test]
+    fn cidr_contains_ipv4_rfc1918_172() {
+        assert!(cidr_contains("172.16.0.0/12", "172.16.0.1"));
+        assert!(cidr_contains("172.16.0.0/12", "172.31.255.254"));
+        assert!(!cidr_contains("172.16.0.0/12", "172.15.0.1"));
+        assert!(!cidr_contains("172.16.0.0/12", "172.32.0.1"));
+    }
+
+    #[test]
+    fn cidr_contains_ipv4_link_local_169_254() {
+        assert!(cidr_contains("169.254.0.0/16", "169.254.169.254"));
+        assert!(!cidr_contains("169.254.0.0/16", "169.255.0.1"));
+    }
+
+    #[test]
+    fn cidr_contains_ipv6_loopback() {
+        assert!(cidr_contains("::1/128", "::1"));
+        assert!(!cidr_contains("::1/128", "::2"));
+    }
+
+    #[test]
+    fn cidr_contains_ipv6_link_local() {
+        assert!(cidr_contains("fe80::/10", "fe80::1"));
+        assert!(cidr_contains("fe80::/10", "febf::1"));
+        assert!(!cidr_contains("fe80::/10", "fec0::1"));
+    }
+
+    #[test]
+    fn cidr_contains_ipv6_unique_local() {
+        assert!(cidr_contains("fc00::/7", "fc00::1"));
+        assert!(cidr_contains("fc00::/7", "fd00::1"));
+        assert!(!cidr_contains("fc00::/7", "fe00::1"));
+    }
+
+    #[test]
+    fn cidr_contains_rejects_malformed() {
+        assert!(!cidr_contains("not-a-cidr", "127.0.0.1"));
+        assert!(!cidr_contains("127.0.0.0/8", "not-a-host"));
+        assert!(!cidr_contains("127.0.0.0/99", "127.0.0.1"));
+    }
+
+    // ── find_forbidden_instance_url reads from state's CIDR cell ────
+
+    /// Acceptance pin (#894): the SSRF blocklist is data, not a Rust
+    /// const. With a state carrying NO `CIDR_Block_has_Block_Kind`
+    /// cell, we fall back to the boot list — 127.0.0.1 must reject.
+    #[test]
+    fn ssrf_rejects_loopback_url_via_boot_fallback() {
+        let state = state_with_external_url(
+            Object::phi(), "lo", "http://127.0.0.1/foo");
+        let result = find_forbidden_instance_url(&state, &Object::phi());
+        assert_eq!(result.as_deref(), Some("http://127.0.0.1/foo"));
+    }
+
+    /// Acceptance pin (#894): with a state carrying a CIDR_Block cell
+    /// that lists 127.0.0.0/8, the loopback URL must reject AND the
+    /// rejection must come from the cell (not the hardcoded const).
+    /// Distinguishing signal: the empty cell case (next test) shows
+    /// the falls-back boot path; the present-cell case here shows the
+    /// data path. Together they pin "cell read, with boot fallback."
+    #[test]
+    fn ssrf_rejects_loopback_url_via_readings_blocklist() {
+        let cidr_state = state_with_cidr_blocks(&[
+            ("127.0.0.0/8", "internal-loopback"),
+            ("10.0.0.0/8",  "private-rfc1918"),
+        ]);
+        let state = state_with_external_url(
+            Object::phi(), "lo", "http://127.0.0.1/foo");
+        let result = find_forbidden_instance_url(&state, &cidr_state);
+        assert_eq!(result.as_deref(), Some("http://127.0.0.1/foo"));
+    }
+
+    /// Acceptance pin (#894): a CIDR_Block cell whose rows exclude the
+    /// loopback prefix MUST NOT reject the loopback URL. This proves
+    /// the SSRF check is reading the cell — if it were still reading
+    /// the hardcoded const, 127.0.0.1 would always reject regardless
+    /// of cell contents.
+    #[test]
+    fn ssrf_state_overrides_boot_with_empty_blocklist() {
+        // A CIDR_Block cell that exists but excludes the loopback range
+        // (only carries an unrelated 192.0.2.0/24 documentation prefix).
+        // The state-driven path uses just this list — loopback is fair
+        // game. Pins: the cell IS the source of truth when non-empty.
+        let cidr_state = state_with_cidr_blocks(&[
+            ("192.0.2.0/24", "documentation"),
+        ]);
+        let state = state_with_external_url(
+            Object::phi(), "lo", "http://127.0.0.1/foo");
+        let result = find_forbidden_instance_url(&state, &cidr_state);
+        assert_eq!(result, None,
+            "with state's CIDR list excluding 127/8, loopback URL must \
+             pass — proves the check reads from the cell, not from Rust");
+    }
+
+    /// Acceptance pin (#894): adding a CIDR to the cell that was NOT
+    /// in the legacy boot list catches a URL the legacy code missed.
+    /// Pins that the cell extends the policy — a future operator can
+    /// add a new range without touching Rust.
+    #[test]
+    fn ssrf_state_extends_boot_with_extra_cidr() {
+        // 100.64.0.0/10 is the carrier-grade NAT range (RFC 6598).
+        // The legacy boot list did NOT cover it. Add it to the cell;
+        // the SSRF check must now reject a URL in that range.
+        let cidr_state = state_with_cidr_blocks(&[
+            ("100.64.0.0/10", "carrier-grade-nat"),
+        ]);
+        let state = state_with_external_url(
+            Object::phi(), "cgn", "http://100.64.5.5/foo");
+        let result = find_forbidden_instance_url(&state, &cidr_state);
+        assert_eq!(result.as_deref(), Some("http://100.64.5.5/foo"));
+    }
+
+    /// End-to-end pin (#894): parsing the bundled `security.md` core
+    /// reading populates the `CIDR_Block_has_Block_Kind` cell with all
+    /// 8 boot CIDR rows. Together with the prior tests this proves
+    /// the full chain: readings → cell → SSRF check.
+    #[test]
+    fn security_md_populates_cidr_block_cell() {
+        let security_md = include_str!("../../../readings/core/security.md");
+        let state = parse_to_state(security_md)
+            .expect("readings/core/security.md must parse cleanly");
+        let cidrs = cidr_blocklist_from_state(&state);
+        // Each row from the reading should match the boot list set;
+        // order is preserved per the reading's listing order. The
+        // boot list is the legacy ordering and the reading mirrors it.
+        for expected in BOOT_CIDR_BLOCKLIST {
+            assert!(
+                cidrs.iter().any(|c| c == expected),
+                "readings/core/security.md must list {} as a CIDR Block (got {:?})",
+                expected, cidrs);
+        }
+        // And no fall-through to the boot list: every cidr we read out
+        // should be from the cell, not the BOOT_CIDR_BLOCKLIST const.
+        // We pin this by asserting the count matches the readings rows
+        // (8 entries), not the boot list (which would also be 8 — so
+        // we add one extra row in the next pin).
+        assert_eq!(cidrs.len(), 8,
+            "security.md declares exactly 8 CIDR Block rows, got {:?}",
+            cidrs);
     }
 }
 

@@ -2410,6 +2410,9 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
         "apply_command" => platform_apply_command(x, d),
         "verify_signature" => platform_verify_signature(x),
         "induce" => platform_induce(x, d),
+        // #894 — CIDR containment lifts the SSRF blocklist check from
+        // hardcoded Rust to a typed Platform Func. See `platform_cidr_contains`.
+        "cidr_contains" => platform_cidr_contains(x),
         // Codd θ₁ relational operators: take runtime data that cannot be
         // parameterized in compile-time FFP combining forms. Routing via
         // Platform lets each runtime (server, FPGA, Solidity) provide its
@@ -2693,6 +2696,35 @@ fn platform_verify_signature(x: &Object) -> Object {
     Object::atom(match ok { true => "true", false => "false" })
 }
 
+/// #894 — `cidr_contains` Func::Platform. Input: 2-element Seq
+/// `<<cidr_atom>, <host_atom>>` where `cidr_atom` is a CIDR string
+/// like `"127.0.0.0/8"` and `host_atom` is an IPv4 dotted-quad or
+/// bare IPv6 literal. Output: `Object::t()` / `Object::f()` —
+/// matches the boolean convention apps reach for via Func::Cond.
+/// Malformed input ⇒ `Object::Bottom` (the standard total-function
+/// fall-through; apps using `cidr_contains` as a predicate should
+/// always treat a Bottom return as "policy violation" / "not contained").
+///
+/// The Rust body delegates to `parse_forml2::cidr_contains` so both
+/// the in-process SSRF check (`is_forbidden_url_in_state`) and the
+/// Platform-routed call site share one implementation. Lifting this
+/// to Platform lets apps declare `Func::Platform("cidr_contains")` in
+/// derivation-rule bodies — e.g. an app's own access-control policy
+/// can compose CIDR membership without re-implementing the parser.
+#[cfg(not(feature = "no_std"))]
+fn platform_cidr_contains(x: &Object) -> Object {
+    let parts = match x.as_seq() {
+        Some(p) if p.len() == 2 => p,
+        _ => return Object::Bottom,
+    };
+    let cidr = match parts[0].as_atom() { Some(s) => s, None => return Object::Bottom };
+    let host = match parts[1].as_atom() { Some(s) => s, None => return Object::Bottom };
+    match crate::parse_forml2::cidr_contains(cidr, host) {
+        true  => Object::t(),
+        false => Object::f(),
+    }
+}
+
 /// #851 — `induce` Func::Platform dispatch. Thin parser that lifts
 /// the search-loop's args off the FFP-shaped `x` operand, then hands
 /// off to `induce::run_search` (the search loop lives in `induce.rs`
@@ -2817,10 +2849,13 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
     // at the compile boundary and rely on the parser's Domain-level guard.
     let _ = find_metamodel_shadow as fn(_, _) -> _;
 
-    // SSRF defense (#25): External System federation must not reach
+    // SSRF defense (#25, #894): External System federation must not reach
     // internal/loopback/link-local hosts, file:// URLs, or internal DNS.
     // Walk the parsed InstanceFact cell and reject any forbidden URL.
-    match crate::parse_forml2::find_forbidden_instance_url(&parsed) {
+    // The CIDR blocklist now lives in `d`'s `CIDR_Block_has_Block_Kind`
+    // cell (populated by `readings/core/security.md`); the Rust side
+    // just reads it and applies `cidr_contains` per row.
+    match crate::parse_forml2::find_forbidden_instance_url(&parsed, d) {
         Some(url) => return Object::atom(&format!("⊥ forbidden URL in External System: {}", url)),
         None => {}
     }
@@ -2851,6 +2886,10 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
     defs.push(("apply".to_string(), Func::Platform("apply_command".to_string())));
     defs.push(("verify_signature".to_string(), Func::Platform("verify_signature".to_string())));
     defs.push(("audit".to_string(), Func::Platform("audit".to_string())));
+    // #894 — CIDR membership predicate. Powers the SSRF check above and
+    // is reachable from apps' own derivation rules. See
+    // `platform_cidr_contains` for the input/output shape contract.
+    defs.push(("cidr_contains".to_string(), Func::Platform("cidr_contains".to_string())));
     let new_d = defs_to_state(&defs, &merged_state);
 
     // Validate: ρ(validate) applied to merged state. Alethic violations reject.
@@ -7896,6 +7935,61 @@ mod tests {
         assert_eq!(facts.len(), 1, "expected exactly one compile_history entry");
         assert_eq!(binding(&facts[0], "status"), Some("compiled"));
         assert_eq!(binding(&facts[0], "Domain Change"), Some("compile-0"));
+    }
+
+    // ── #894: cidr_contains Platform Func ─────────────────────────
+
+    #[test]
+    fn platform_cidr_contains_ipv4_loopback_returns_t() {
+        let x = Object::seq(vec![Object::atom("127.0.0.0/8"), Object::atom("127.0.0.1")]);
+        assert_eq!(super::platform_cidr_contains(&x), Object::t());
+    }
+
+    #[test]
+    fn platform_cidr_contains_outside_range_returns_f() {
+        let x = Object::seq(vec![Object::atom("127.0.0.0/8"), Object::atom("8.8.8.8")]);
+        assert_eq!(super::platform_cidr_contains(&x), Object::f());
+    }
+
+    #[test]
+    fn platform_cidr_contains_ipv6_link_local_returns_t() {
+        let x = Object::seq(vec![Object::atom("fe80::/10"), Object::atom("fe80::1")]);
+        assert_eq!(super::platform_cidr_contains(&x), Object::t());
+    }
+
+    #[test]
+    fn platform_cidr_contains_malformed_returns_bottom() {
+        // Wrong arity ⇒ Bottom.
+        let x = Object::seq(vec![Object::atom("127.0.0.0/8")]);
+        assert_eq!(super::platform_cidr_contains(&x), Object::Bottom);
+        // Non-atom in cidr slot ⇒ Bottom.
+        let x = Object::seq(vec![Object::phi(), Object::atom("127.0.0.1")]);
+        assert_eq!(super::platform_cidr_contains(&x), Object::Bottom);
+    }
+
+    /// Pin: `platform_compile` registers `cidr_contains` in DEFS so apps
+    /// invoking the verb get the live body, not the no-body Bottom
+    /// fallback. The other Platform fn defs (`compile`, `apply`,
+    /// `verify_signature`, `audit`) all go through this same path —
+    /// `cidr_contains` joining them is the lift's "wiring" step.
+    #[test]
+    fn platform_compile_registers_cidr_contains_in_defs() {
+        let readings = "Each Person has a name.";
+        let initial_d = defs_to_state(
+            &vec![("compile".to_string(), Func::Platform("compile".to_string()))],
+            &Object::phi(),
+        );
+        let result = apply(
+            &Func::Platform("compile".to_string()),
+            &Object::atom(readings),
+            &initial_d,
+        );
+        let cidr_def = fetch("cidr_contains", &result);
+        assert!(
+            matches!(&cidr_def, Object::Seq(_) | Object::Map(_) | Object::Atom(_)),
+            "cidr_contains should be registered in DEFS after compile, got: {:?}",
+            cidr_def
+        );
     }
 
     // ── #689: Policy_skip_validate cell semantics ─────────────────
