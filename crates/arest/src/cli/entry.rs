@@ -557,11 +557,24 @@ pub fn main_entry() {
                 // `merge_states`'s identity-aware concat_dedup. Mirrors
                 // `platform_compile`'s `merge_states(d, &parsed)` at
                 // ast.rs:2683.
+                //
+                // #913: ALSO strip `DerivationRule` (and any other cells
+                // in `READINGS_DERIVED_META_CELLS`). The rule registry is
+                // a pure function of the current readings; preserving
+                // stale rule entries across recompile causes
+                // `compile_to_defs_state` to emit `derivation:rule_<id>`
+                // def cells for BOTH the stale rule (whose text hashed
+                // to one id) AND the current rule (whose edited text
+                // hashes to a different id) — forward chain then fires
+                // both and the consequent cell ends up with the UNION of
+                // historical rule firings. Filter is `name.contains(':')`
+                // OR `READINGS_DERIVED_META_CELLS.contains(&name)`.
                 let prior_population: ast::Object = {
                     let loaded = db::load_state(&conn);
                     let map: hashbrown::HashMap<String, ast::Object> =
                         ast::cells_iter(&loaded).into_iter()
-                            .filter(|(name, _)| !name.contains(':'))
+                            .filter(|(name, _)| !name.contains(':')
+                                && !ast::READINGS_DERIVED_META_CELLS.contains(name))
                             .map(|(name, contents)| (name.to_string(), contents.clone()))
                             .collect();
                     ast::Object::Map(map)

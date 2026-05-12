@@ -2825,8 +2825,20 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
         None => {}
     }
 
+    // #913: drop the readings-derived rule-registry cells (DerivationRule)
+    // from the prior state before merging in the freshly parsed state.
+    // `cor:closure` preserves apply-written FT cells across recompile,
+    // but the rule registry is a pure function of the current readings
+    // — preserving stale rule entries causes the next compile to emit
+    // both the stale and current `derivation:rule_<id>` def cells, and
+    // forward chain fires both (consequent cell ends up with the UNION
+    // of historical rule firings). Mirrors the #836 "drop derived
+    // consequent cells before forward chain" fix at the rule-REGISTRY
+    // level.
+    let d_for_merge = drop_readings_derived_meta_cells(d);
+
     // Merge: foldl(concat_cell, D, cells(parsed))
-    let merged_state = merge_states(d, &parsed);
+    let merged_state = merge_states(&d_for_merge, &parsed);
 
     // Structural model validation (#48) — catch FORML2 violations.
     // Warnings only for now — pre-existing metamodel issues need cleanup first.
@@ -4032,6 +4044,60 @@ pub fn merge_states(target: &Object, source: &Object) -> Object {
         let entry = map.get_mut(name).expect("checked above");
         *entry = concat_dedup(entry, contents);
     });
+    Object::Map(map)
+}
+
+/// Cells that are READINGS-DERIVED rule registries: every compile reads
+/// these from the current readings and rebuilds them from scratch. They
+/// MUST NOT survive `cor:closure` across recompile because the rule
+/// registry is a pure function of the current readings — preserving stale
+/// entries (e.g. an old rule body whose text hashed to a different `id`)
+/// causes downstream compile to emit a `derivation:rule_<stale_hash>` def
+/// cell alongside the current one, and forward-chain fires BOTH.
+///
+/// #913: editing a reading's derivation rule body produces a new
+/// `DerivationRule` fact with a new `id` (the FNV hash of the rule
+/// text). `concat_dedup` keys identity on `id`, so the prior rule
+/// survives the merge — and downstream consequent cells end up with
+/// the UNION of historical rule firings instead of the current rule's
+/// firings.
+///
+/// Mirrors the #836 "drop derived consequent cells before forward
+/// chain" fix but at the rule-REGISTRY level. The #836 fix drops the
+/// FT cells that DERIVATION RULES write into; this drops the rule
+/// REGISTRY itself so the rule set is rebuilt from current readings
+/// each recompile.
+///
+/// Constraint, Subtype, EnumValues, UnresolvedClause, Role, FactType,
+/// Noun, InstanceFact are similarly readings-derived BUT they don't
+/// produce the same forward-chain-fires-twice symptom — they're
+/// consumed by compile_to_defs_state to build typed defs that then
+/// run, and the parse re-emits the full set each call so the union
+/// degenerate case only manifests when the IDENTITY KEY changes
+/// across edits (DerivationRule's content-hashed `id` is the only one
+/// in this category that triggers on a rule body edit). Adding
+/// other meta cells to this list is reserved for follow-up tasks
+/// (Constraint identity is `id` which is content-hashed similarly —
+/// likely a sibling bug; track separately when an acceptance test
+/// surfaces it).
+pub const READINGS_DERIVED_META_CELLS: &[&str] = &[
+    "DerivationRule",
+];
+
+/// Drop readings-derived rule-registry cells from `state` so the next
+/// merge_states + compile_to_defs_state rebuilds them from current
+/// readings.
+///
+/// #913: call this on the prior state before re-merging parsed
+/// readings into it. Without this step, `concat_dedup` keeps both the
+/// stale and current rule entries — both fire on forward chain and
+/// consequent cells end up with the UNION of historical rule firings.
+pub fn drop_readings_derived_meta_cells(state: &Object) -> Object {
+    let mut map: HashMap<String, Object> = HashMap::new();
+    for (name, contents) in cells_iter(state).into_iter() {
+        if READINGS_DERIVED_META_CELLS.contains(&name) { continue; }
+        map.insert(name.to_string(), contents.clone());
+    }
     Object::Map(map)
 }
 
