@@ -20,6 +20,7 @@ import {
   applyCreateMissingIdRefusal,
   mergeUpdateFields,
   buildApplyMergedUpdatePayload,
+  smBypassRefusal,
 } from './server.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -565,6 +566,203 @@ describe('#872 apply footgun-resistance', () => {
       expect(result.fields['Task Subject']).toBe('X')
       expect(result.fields['Task Description']).toBe('new')
     })
+  })
+})
+
+describe('#904 SM-bypass guard', () => {
+  // Sibling to #872 (apply footgun-resistance) but a different failure
+  // mode: when an app declares `State Machine Definition X is for Noun
+  // Y`, an agent calling `apply update` on a Y entity that sets its
+  // Status field directly silently bypasses the SM — the status changes
+  // without the transition firing, and derivations depending on SM
+  // state desynchronize. apps/tasks/#861 covered this for Task
+  // specifically; #904 lifts the guard to the MCP layer so it applies
+  // GENERICALLY to every SM-governed noun in every app's schema
+  // (multi-app substrate; new apps inherit the protection without
+  // per-app work).
+  //
+  // Design: refuse-with-message (mirrors #867/#868). The MCP returns
+  // an `{error}` envelope that names the SM, lists legal transitions
+  // from the current status, and suggests `apply transition event=...`
+  // as the right verb. `force: true` is the escape hatch for migration
+  // scripts.
+  //
+  // The guard is a pure helper exported from server.ts:
+  //
+  //   smBypassRefusal({
+  //     noun,              // the noun being updated
+  //     fields,            // the payload fields map
+  //     schema,            // active app schema (debug envelope shape)
+  //     transitions,       // optional: actions-verb-style transitions
+  //                        //   list for the entity's current status
+  //     force,             // when true, skip the guard entirely
+  //   }) => null | { error: string }
+  //
+  // Returns null when the call is safe to pass through. Returns
+  // {error} otherwise.
+
+  const taskSchema = {
+    nouns: ['Task'],
+    factTypes: [
+      { id: 'Task_has_Task_Status', reading: 'Task has Task Status' },
+      { id: 'Task_has_Task_Subject', reading: 'Task has Task Subject' },
+    ],
+    constraints: [],
+    stateMachines: [
+      {
+        noun: 'Task',
+        initial: 'pending',
+        transitions: [
+          { from: 'pending', to: 'in_progress', event: 'start' },
+          { from: 'in_progress', to: 'completed', event: 'finish' },
+          { from: 'completed', to: 'pending', event: 'reopen' },
+        ],
+      },
+    ],
+    totalFacts: 0,
+  }
+
+  const taskActions = [
+    { event: 'start', targetStatus: 'in_progress', fromStatus: 'pending' },
+    { event: 'finish', targetStatus: 'completed', fromStatus: 'in_progress' },
+    { event: 'reopen', targetStatus: 'pending', fromStatus: 'completed' },
+  ]
+
+  it("apply update {Task Status: 'completed'} refuses with SM transition list", () => {
+    // The headline acceptance: an agent calling `apply update noun=Task
+    // fields={Task Status: 'completed'}` against an app whose schema
+    // binds the Task SM must be refused at the MCP layer before any
+    // engine call. The refusal must NAME the SM ("Task SM" or just
+    // "Task"), call out `transition` as the correct verb, and list the
+    // legal events from the current status.
+    const refusal = smBypassRefusal({
+      noun: 'Task',
+      fields: { 'Task Status': 'completed' },
+      schema: taskSchema,
+      transitions: taskActions,
+      force: false,
+    })
+    expect(refusal).not.toBeNull()
+    expect(refusal!.error).toMatch(/Task SM|Task/)
+    expect(refusal!.error).toMatch(/transition/)
+    // The refusal must list each legal event so the agent knows what
+    // to call next — verifies the helper threads transitions through
+    // rather than just emitting a generic "use transition" message.
+    expect(refusal!.error).toContain('start')
+    expect(refusal!.error).toContain('finish')
+    expect(refusal!.error).toContain('reopen')
+    // The refusal points at the field name that triggered it so the
+    // agent can see WHICH field they tried to set.
+    expect(refusal!.error).toMatch(/Task Status/)
+  })
+
+  it('apply update {Task Subject: "X"} on same Task succeeds', () => {
+    // Pass-through case: a non-SM field is fine to update directly.
+    // The guard must NOT refuse — Task Subject, Task Description, Task
+    // Priority are all single-valued facts the agent can flip via
+    // `apply update` without bypassing any SM.
+    const result = smBypassRefusal({
+      noun: 'Task',
+      fields: { 'Task Subject': 'X' },
+      schema: taskSchema,
+      transitions: taskActions,
+      force: false,
+    })
+    expect(result).toBeNull()
+  })
+
+  it('apply update {Task Status: "completed", force: true} bypasses guard', () => {
+    // Opt-out escape hatch for migration scripts / other legitimate
+    // direct-mutation cases (e.g. an admin restoring an entity from
+    // backup, where the SM history can't be replayed). The guard must
+    // be a no-op when force is true.
+    const result = smBypassRefusal({
+      noun: 'Task',
+      fields: { 'Task Status': 'completed' },
+      schema: taskSchema,
+      transitions: taskActions,
+      force: true,
+    })
+    expect(result).toBeNull()
+  })
+
+  it('app without SM passes update through directly', () => {
+    // When the active app's schema has zero state machines, the guard
+    // is a no-op — there is no SM to bypass. This is the "new app
+    // without behavioral entities" case: apps that model only static
+    // relationships shouldn't pay any cost for the guard.
+    const schemaWithoutSm = {
+      nouns: ['Customer'],
+      factTypes: [{ id: 'Customer_has_Email', reading: 'Customer has Email' }],
+      constraints: [],
+      stateMachines: [],
+      totalFacts: 0,
+    }
+    const result = smBypassRefusal({
+      noun: 'Customer',
+      fields: { Email: 'alice@example.com' },
+      schema: schemaWithoutSm,
+      transitions: [],
+      force: false,
+    })
+    expect(result).toBeNull()
+  })
+
+  it('payload with mixed SM + non-SM fields refuses entirely', () => {
+    // The agent might try to "sneak" the SM field through alongside a
+    // non-SM field. That's a worse footgun than the pure-SM case
+    // because partial application would update Task Subject AND
+    // silently mutate Task Status. The guard must refuse the ENTIRE
+    // call rather than partially applying the non-SM field — keeping
+    // the refusal atomic.
+    const refusal = smBypassRefusal({
+      noun: 'Task',
+      fields: {
+        'Task Subject': 'X',
+        'Task Status': 'completed',
+        'Task Description': 'y',
+      },
+      schema: taskSchema,
+      transitions: taskActions,
+      force: false,
+    })
+    expect(refusal).not.toBeNull()
+    expect(refusal!.error).toMatch(/Task Status/)
+    expect(refusal!.error).toMatch(/transition/)
+  })
+
+  it('non-SM-governed noun passes through even when app has SMs', () => {
+    // The same app declares an SM for Task but no SM for Source File.
+    // An `apply update` on Source File should pass through — the
+    // guard only fires on SM-GOVERNED nouns, not on every noun in an
+    // app that happens to have one SM.
+    const result = smBypassRefusal({
+      noun: 'Source File',
+      fields: { path: 'a.md' },
+      schema: taskSchema,
+      transitions: [],
+      force: false,
+    })
+    expect(result).toBeNull()
+  })
+
+  it('empty / missing transitions list still refuses (no swallowed footgun)', () => {
+    // Defensive: if the actions lookup fails (engine miss, entity not
+    // yet materialized), the guard must STILL refuse — the schema
+    // alone is enough to know the noun is SM-governed; missing
+    // transitions just means we can't enumerate them. A generic
+    // "use apply transition instead" message is better than silent
+    // pass-through.
+    const refusal = smBypassRefusal({
+      noun: 'Task',
+      fields: { 'Task Status': 'completed' },
+      schema: taskSchema,
+      transitions: [],
+      force: false,
+    })
+    expect(refusal).not.toBeNull()
+    expect(refusal!.error).toMatch(/Task Status/)
+    expect(refusal!.error).toMatch(/transition/)
   })
 })
 

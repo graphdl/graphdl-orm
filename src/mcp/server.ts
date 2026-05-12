@@ -1272,6 +1272,114 @@ export function buildApplyMergedUpdatePayload(args: {
   return { fields, merged: true, preserved }
 }
 
+// ── #904 SM-bypass guard ─────────────────────────────────────────────
+//
+// When an app declares `State Machine Definition X is for Noun Y`,
+// an `apply update` that sets Y's Status field directly bypasses the
+// SM — the status changes without the transition firing and any
+// derivation depending on SM state desynchronizes. apps/tasks/#861
+// covered this for Task specifically; this guard generalizes it at
+// the MCP layer so EVERY SM-governed noun in EVERY app's schema
+// inherits the protection without per-app work.
+//
+// Design (#904): refuse-with-clear-message (Option 1, mirrors
+// #867/#868). The error message names the SM, lists legal transitions
+// from the current status (resolved via the actions verb upstream),
+// and points at `apply transition event=<X>` as the right verb. The
+// agent learns the transition vocabulary by reading the refusal —
+// no whitepaper required (per #869 north star).
+//
+// Escape hatch: `force: true` bypasses the guard entirely. Used by
+// migration scripts, admin entity-restore flows, and the rare cases
+// where the SM history can't be replayed and direct status mutation
+// is the right call.
+//
+// Why refuse rather than auto-redirect: an auto-redirect would have
+// to GUESS which event the agent intended (some statuses have multiple
+// outgoing transitions). Surfacing the legal events and letting the
+// agent pick keeps the contract explicit. Why not warn-and-proceed:
+// silent SM desync is exactly what #904 exists to prevent.
+
+/**
+ * #904 helper: detect whether a payload field name refers to the
+ * Status value type of an SM-governed noun.
+ *
+ * Convention: an SM bound to noun `N` is fed by a "Task Status"-style
+ * field whose name is `<N> Status` (e.g. `Task Status` for `Task`,
+ * `Order Status` for `Order`). This mirrors the value-type naming the
+ * apps follow in their readings and the cell layout the engine emits
+ * (e.g. `Task_has_Task_Status`).
+ *
+ * Returns the matching field name if any, or null otherwise.
+ */
+export function findSmStatusField(
+  noun: string,
+  fields: Record<string, string> | undefined,
+): string | null {
+  if (!fields) return null
+  const target = `${noun} Status`
+  for (const k of Object.keys(fields)) {
+    if (k === target) return k
+  }
+  return null
+}
+
+/**
+ * #904 guard: refuse `apply update` when the payload sets the Status
+ * field of an SM-governed noun in the active app's schema.
+ *
+ * Returns `null` when the call is safe to pass through:
+ *   - `force: true` (explicit opt-out for migration scripts),
+ *   - the active app has no SMs (guard is a no-op),
+ *   - the noun being updated is not SM-governed in the schema,
+ *   - the payload doesn't set the noun's Status field.
+ *
+ * Returns `{error}` otherwise. The error names the SM (via the
+ * SM-governed noun), names the field that triggered the refusal,
+ * lists legal transitions when available, and points at
+ * `apply transition` as the right verb.
+ *
+ * `transitions` is optional — the actions verb's transitions list
+ * for the entity's current status. When absent or empty, the refusal
+ * still fires (the schema alone tells us the noun is SM-governed),
+ * just without an enumeration of legal events.
+ */
+export function smBypassRefusal(args: {
+  noun: string
+  fields: Record<string, string> | undefined
+  schema: { stateMachines?: Array<{ noun?: string }> } | null | undefined
+  transitions?: Array<{ event?: string }> | null
+  force?: boolean
+}): { error: string } | null {
+  if (args.force === true) return null
+  const stateMachines = args.schema?.stateMachines
+  if (!Array.isArray(stateMachines) || stateMachines.length === 0) return null
+  // Find the SM bound to this noun, if any. We only care about the
+  // *active app's* declared SMs; the schema arg comes from `debug`
+  // (or the `/api/debug/schema/:domain` endpoint upstream).
+  const sm = stateMachines.find(s => s && s.noun === args.noun)
+  if (!sm) return null
+  const statusField = findSmStatusField(args.noun, args.fields)
+  if (!statusField) return null
+  const events = Array.isArray(args.transitions)
+    ? args.transitions.map(t => (t && typeof t.event === 'string') ? t.event : '').filter(e => e.length > 0)
+    : []
+  const eventList = events.length > 0
+    ? ` Legal transitions from the current status: ${events.join(', ')}.`
+    : ' Call the `actions` verb to enumerate the transitions legal for this entity\'s current status.'
+  return {
+    error:
+      `apply update on noun '${args.noun}' refused (#904): the '${statusField}' field is governed ` +
+      `by the '${args.noun} SM' state machine and must change via 'apply transition', not a direct ` +
+      `field update. Setting the Status directly bypasses the SM — the status would flip without ` +
+      `the transition firing, and any derivation depending on SM state would desync.` +
+      eventList +
+      ` Use: apply operation=transition noun='${args.noun}' id=<id> event=<one of the above>. ` +
+      `Pass force=true to bypass this guard for migration scripts or other legitimate ` +
+      `direct-mutation cases (rare).`,
+  }
+}
+
 server.registerTool(
   'orient',
   {
@@ -1315,9 +1423,10 @@ server.registerTool(
       sender: z.string().optional().describe('Caller identity for authorization'),
       signature: z.string().optional().describe('HMAC-SHA256 signature'),
       fields_only_replace: z.boolean().optional().describe('Opt-out (#872) — when true, the MCP skips the merge-with-existing pre-fetch on update and sends ONLY the payload fields to the engine. Use this for the rare case the agent intentionally wants the old replace-only behavior; default (false) is safer (#868 belt-and-suspenders).'),
+      force: z.boolean().optional().describe('Opt-out (#904) — when true, the MCP skips the SM-bypass guard on update and lets the call go through even if a payload field is the Status of an SM-governed noun. Use this for migration scripts or other legitimate direct-mutation cases (rare); default (false) refuses the call and points the agent at `apply transition` instead.'),
     },
   },
-  async ({ context_receipt, operation, noun, id, fields, event, sender, signature, fields_only_replace }) => {
+  async ({ context_receipt, operation, noun, id, fields, event, sender, signature, fields_only_replace, force }) => {
     const blocked = mutationGateResult('apply', context_receipt, { operation, noun, id, fields, event })
     if (blocked) return blocked
 
@@ -1327,6 +1436,70 @@ server.registerTool(
     if (operation === 'create') {
       const refusal = applyCreateMissingIdRefusal(noun, id)
       if (refusal) return textResult(refusal)
+    }
+
+    // #904 guard: refuse `update` when a payload field is the Status of
+    // an SM-governed noun in the active app's schema. The schema is
+    // pulled from the engine's `debug` envelope (same path the schema
+    // verb uses) and the transitions list is best-effort via the
+    // `transitions:<noun>` system call from the entity's current SM
+    // status. Opt-out via `force: true`. Pass-through when the app has
+    // no SMs (no schema cost in that case).
+    if (operation === 'update' && AREST_MODE === 'local' && force !== true) {
+      let schema: { stateMachines?: Array<{ noun?: string }> } | null = null
+      try {
+        const rawSchema = await systemCall('debug', '')
+        const parsed = JSON.parse(rawSchema)
+        // `debug` may emit either a JSON-string atom (debug-def feature
+        // on) or an FFP-shaped Seq summary (feature off). We only want
+        // the former — the latter has no stateMachines list, so the
+        // guard is a no-op.
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          schema = parsed as typeof schema
+        } else if (typeof parsed === 'string') {
+          try { schema = JSON.parse(parsed) as typeof schema } catch {}
+        }
+      } catch {
+        // schema-fetch miss is non-fatal — degrade to "no guard" so
+        // we never block on infrastructure failures. The engine
+        // still validates downstream.
+      }
+      if (schema) {
+        // Resolve transitions from the entity's current status so the
+        // refusal can enumerate legal events. Best-effort: misses fall
+        // back to "call the actions verb to enumerate" in the message.
+        let transitionsList: Array<{ event: string }> = []
+        if (id) {
+          try {
+            const smRaw = await systemCall('get:State Machine', id)
+            const sm = JSON.parse(smRaw)
+            const status = sm && typeof sm === 'object' && typeof sm.currentlyInStatus === 'string'
+              ? sm.currentlyInStatus
+              : ''
+            if (status) {
+              const rawTransitions = await systemCall(`transitions:${noun}`, status)
+              const parsedT = JSON.parse(rawTransitions)
+              if (Array.isArray(parsedT)) {
+                transitionsList = parsedT
+                  .map((t: any) => ({ event: String(t?.event ?? t?.Event ?? '') }))
+                  .filter(t => t.event)
+              }
+            }
+          } catch {
+            // transitions-fetch miss is non-fatal — refusal still fires
+            // with a generic "call the actions verb" hint instead of an
+            // enumeration.
+          }
+        }
+        const refusal = smBypassRefusal({
+          noun,
+          fields,
+          schema,
+          transitions: transitionsList,
+          force: false,
+        })
+        if (refusal) return textResult(refusal)
+      }
     }
 
     if (AREST_MODE === 'local') {
