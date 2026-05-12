@@ -429,6 +429,123 @@ describe('entity-do (cell model)', () => {
     })
   })
 
+  // ── A-9 closure: getMaster hard-fails in production (#902) ──────────
+  //
+  // Closes A-9 from the bridge/legacy security sweep (#779's other half;
+  // A-17 / #903 landed in 8720fdf0). #809 introduced the dual-gate
+  // policy and #888 closed the read-path SEALED_CELL_PREFIX fallback.
+  // This block pins the precise contracts called out in the A-9 ticket:
+  //
+  //   (1) Production with no seed and no dev flag → hard-fail at the
+  //       key-derivation gate, before any plaintext write can land.
+  //   (2) Dev with the explicit `AREST_ALLOW_PLAINTEXT=1` opt-in →
+  //       plaintext mode still works (the dev escape hatch survives).
+  //   (3) `TENANT_MASTER_SEED` bound → returns a master normally.
+  //
+  // There is intentional overlap with #809 / #888 here — A-9 closes a
+  // security finding, so it gets its own permanent regression pin
+  // outside the sibling-task blocks. If a future refactor merges the
+  // gates, deleting these tests should require explicit sign-off.
+  describe('getMaster hard-fail in production (#902 / A-9)', () => {
+    function makeEntityDB(env: Record<string, string | undefined>): EntityDB {
+      const kv: Record<string, unknown> = {}
+      const ctx = {
+        id: { toString: () => 'tenant-902' },
+        storage: {
+          sql: createMockSql(),
+          get: async <T>(key: string): Promise<T | undefined> => kv[key] as T | undefined,
+          put: async (key: string, value: unknown): Promise<void> => { kv[key] = value },
+          delete: async (key: string): Promise<boolean> => {
+            const had = key in kv
+            delete kv[key]
+            return had
+          },
+        },
+      }
+      const db = Object.create(EntityDB.prototype) as EntityDB
+      ;(db as any).ctx = ctx
+      ;(db as any).env = env
+      ;(db as any).initialized = false
+      ;(db as any).master = null
+      ;(db as any).engineHandle = 0
+      return db
+    }
+
+    it('production without TENANT_MASTER_SEED throws at getMaster startup', async () => {
+      // The canonical A-9 scenario: operator deployed to production
+      // and forgot `wrangler secret put TENANT_MASTER_SEED`. No dev
+      // opt-in is set. getMaster() must throw on the first key-
+      // derivation attempt rather than silently writing plaintext.
+      const db = makeEntityDB({ ENVIRONMENT: 'production' })
+      let threw: unknown = null
+      try {
+        await db.put({ id: 'c-902-prod', type: 'Customer', data: { name: 'Eve' } })
+      } catch (e) {
+        threw = e
+      }
+      expect(threw).toBeInstanceOf(Error)
+      const msg = (threw as Error).message
+      // The error must name the missing env var so a deploy-time
+      // grep against the worker logs surfaces it immediately.
+      expect(msg).toContain('TENANT_MASTER_SEED')
+      // And it must NOT have persisted anything — a fail-closed
+      // gate means zero plaintext writes hit the cell table.
+      const sql = (db as any).ctx.storage.sql as ReturnType<typeof createMockSql>
+      expect(sql.tables['cell'] ?? []).toHaveLength(0)
+    })
+
+    it('dev with AREST_ALLOW_PLAINTEXT=1 permits plaintext mode', async () => {
+      // The dev escape hatch is intentionally preserved so a local
+      // worker without secret plumbing remains runnable. With the
+      // dual gate open (non-prod ENVIRONMENT + AREST_ALLOW_PLAINTEXT
+      // == '1'), getMaster() returns null and the write succeeds via
+      // the plaintext SQL helpers. Read-back round-trips cleanly.
+      const db = makeEntityDB({ AREST_ALLOW_PLAINTEXT: '1' })
+      const stored = await db.put({
+        id: 'c-902-dev',
+        type: 'Customer',
+        data: { name: 'Mallory' },
+      })
+      expect(stored.id).toBe('c-902-dev')
+      const fetched = await db.get()
+      expect(fetched?.data.name).toBe('Mallory')
+      // Belt-and-braces: nothing in the persisted row should look
+      // like the sealed envelope — we genuinely took the plaintext
+      // branch, not a silent seal under a default key.
+      const sql = (db as any).ctx.storage.sql as ReturnType<typeof createMockSql>
+      const row = (sql.tables['cell'] || [])[0]
+      expect(typeof row.data === 'string'
+        ? (row.data as string).startsWith(SEALED_CELL_PREFIX)
+        : false).toBe(false)
+    })
+
+    it('getMaster with TENANT_MASTER_SEED set returns the master normally', async () => {
+      // Happy-path regression: a bound seed must continue to derive
+      // a per-tenant master and route writes through the sealed
+      // envelope. If a future refactor of the dual-gate accidentally
+      // shorts this branch (e.g. an over-eager throw), this test
+      // catches it.
+      const db = makeEntityDB({
+        TENANT_MASTER_SEED: 'a-9-closure-seed-#902-not-a-real-secret-32b!',
+        ENVIRONMENT: 'production',
+      })
+      const stored = await db.put({
+        id: 'c-902-prod-ok',
+        type: 'Customer',
+        data: { name: 'Carol' },
+      })
+      expect(stored.data.name).toBe('Carol')
+      // The persisted row is the sealed envelope — proves we took
+      // the encrypted branch, not the plaintext fallback.
+      const sql = (db as any).ctx.storage.sql as ReturnType<typeof createMockSql>
+      const row = (sql.tables['cell'] || [])[0]
+      expect(typeof row.data).toBe('string')
+      expect((row.data as string).startsWith(SEALED_CELL_PREFIX)).toBe(true)
+      const fetched = await db.get()
+      expect(fetched?.data.name).toBe('Carol')
+    })
+  })
+
   // ── Sealed-cell prefix fail-loud contract (#888) ────────────────────
   //
   // Closes #777 (worker engine-only collapse) and a slice of #779
