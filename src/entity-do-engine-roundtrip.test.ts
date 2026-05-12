@@ -921,6 +921,69 @@ describe('EntityDB engine round-trip — chain-as-version-of-record (#769)', () 
     expect(merged!.data.total).toBe('999') // preserved from dbA's write
     expect(merged!.data.region).toBe('eu-west') // overwritten by dbB's write
   }, COMPILE_TIMEOUT_MS)
+
+  // ── (e) #885 / #777 — engine-only writes leave the SQL cell table untouched ─
+  //
+  // #885 contract: `EntityDB.put` must NOT issue an INSERT against the
+  // SQL `cell` table; `EntityDB.get` must NOT issue a SELECT against
+  // it. The worker's parallel SQL bookkeeping (the divergent sidecar
+  // §3.3 / §202 warns against) is gone — the engine's chain is the
+  // version-of-record and the worker's in-memory cell graph is the
+  // read-after-write cache fed by the engine apply path's response
+  // envelope (#797's Map carrier → `__result.entities[].data`).
+  //
+  // Worker-side observation under vitest's SystemTime gap:
+  //   Engine `apply` panics inside `merge_delta` / `platform_now`
+  //   under vitest's wasm32 runtime (see file header). `EntityDB.put`
+  //   catches the panic, and the worker's in-memory cell graph
+  //   (populated from the merged input — the same shape `apply` would
+  //   have emitted) keeps the read path closed. The SQL `cell` table
+  //   stays empty in both runtimes — under live workers because apply
+  //   succeeds and the engine chain is the only persistent store;
+  //   under vitest because apply fails but the in-memory graph carries
+  //   the value within an isolate.
+  //
+  // The load-bearing assertion: after a `put`, `SELECT id, type, data
+  // FROM cell` returns ZERO rows. Any regression that re-introduces
+  // `storeCell` / `storeCellSealed` would surface here.
+
+  it('11. (e) engine-only writes leave the SQL cell table empty (no direct SQL bookkeeping)', async () => {
+    const { ctx, db } = makeSealedEntityDB('Order:ord-rt-11')
+    await db.put({ id: 'ord-rt-11', type: 'Order', data: { total: '11', label: 'engine-only' } })
+
+    // The SQL cell table MUST be empty — `EntityDB.put` no longer
+    // issues an INSERT against it. The engine chain is the version-of-
+    // record (live workers), and the worker's in-memory cell graph
+    // carries the value for read-after-write within an isolate.
+    const rows = ctx.storage.sql
+      .exec(`SELECT id, type, data FROM cell`)
+      .toArray()
+    expect(rows).toHaveLength(0)
+
+    // Read-after-write still closes — the read path sources from the
+    // engine's `fetch_cell` (live workers) or the worker's in-memory
+    // cell graph (vitest gap).
+    const cell = await db.get()
+    expect(cell).not.toBeNull()
+    expect(cell!.id).toBe('ord-rt-11')
+    expect(cell!.type).toBe('Order')
+    expect(cell!.data.total).toBe('11')
+    expect(cell!.data.label).toBe('engine-only')
+
+    // Second put merges through the same engine-only path; SQL stays
+    // empty.
+    await db.put({ id: 'ord-rt-11', type: 'Order', data: { label: 'engine-only-v2', shipped: 'true' } })
+    const rowsAfter = ctx.storage.sql
+      .exec(`SELECT id, type, data FROM cell`)
+      .toArray()
+    expect(rowsAfter).toHaveLength(0)
+
+    const merged = await db.get()
+    expect(merged).not.toBeNull()
+    expect(merged!.data.total).toBe('11') // preserved
+    expect(merged!.data.label).toBe('engine-only-v2') // overwritten
+    expect(merged!.data.shipped).toBe('true') // added
+  }, COMPILE_TIMEOUT_MS)
 })
 
 // ── Local helper: base64 decoder for the AAD verification test ──────
