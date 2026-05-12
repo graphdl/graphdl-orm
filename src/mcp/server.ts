@@ -58,8 +58,6 @@ import {
   enforceMutationContext,
   DEFAULT_MUTATION_PROMPTS,
   CONTEXT_RECEIPT_FIELD_DESCRIPTION,
-  MUTATION_CONTEXT_DESCRIPTION,
-  MUTATION_TOOL_DESCRIPTION,
   type MutationContextDetail,
   type MutationContextTool,
 } from './mutation-context.js'
@@ -571,7 +569,8 @@ function mutationGateResult(
 server.registerTool(
   'context',
   {
-    description: MUTATION_CONTEXT_DESCRIPTION,
+    description:
+      'Load AREST modeling rules + prompt manifest and mint a context_receipt token. WHEN: call FIRST in any session that will mutate state (apply / retract / compile / propose) — those verbs refuse to run without a fresh receipt. Also useful as a cheap "what does AREST consider good practice?" reference. ALTERNATIVE: orient for a one-screen "where are we" snapshot (apps + recent activity, no rules); schema for the formal model surface. GOTCHA: the receipt is scoped to the currently active app — `apps.use` invalidates the prior receipt, so re-call context after switching apps. detail=summary returns rule text + prompt digests (cheap); detail=full also inlines prompt bodies (larger). NEXT: read the returned rules / anti_patterns / how_to, then call apply / compile / propose with context_receipt set to the receipt field of this response.',
     inputSchema: {
       detail: z.enum(['summary', 'full']).optional().describe('summary returns rules and prompt digests. full also includes prompt text.'),
     },
@@ -584,7 +583,8 @@ server.registerTool(
 server.registerTool(
   'apps.current',
   {
-    description: 'Show the active AREST app. The active app determines the local readings directory, SQLite DB path, and mutation context scope.',
+    description:
+      'Show the active AREST app (readings dir, DB path, health). WHEN: you only need a quick "which app am I in?" answer mid-session. ALTERNATIVE: orient when you also want recent activity + sibling apps in one envelope; apps.status when you want full health of a specific (possibly non-active) app; apps.list when you want every app, not just the active one. GOTCHA: this reports the currently selected scope — it does NOT switch apps. NEXT: apps.use name=... to change scope, or apps.compile if the readings have drifted from the DB.',
     inputSchema: {
       detail: z.enum(['summary', 'full']).optional().describe('summary returns compact health. full includes reading file details.'),
     },
@@ -595,7 +595,8 @@ server.registerTool(
 server.registerTool(
   'apps.list',
   {
-    description: 'List AREST apps under the configured apps directory. Each app is an independent UoD with its own readings and SQLite DB.',
+    description:
+      'Enumerate every AREST app under $AREST_APPS_DIR with compact health. WHEN: you want a roster of every UoD the agent can switch into — picking an app to work on, or sweeping for stale DBs. ALTERNATIVE: apps.current for just the active app (cheaper); orient for the same roster PLUS active-app task counts + recent activity (one call instead of two); apps.check when you also want a summary section (counts of ready / stale / library / not-ready) over the same roster. GOTCHA: directory-derived — apps are discovered from disk, not from a catalog fact, so a missing readings/ subdir hides the app. include_ready=false trims ready apps for triage. NEXT: apps.use name=<picked> to switch scope, then context to mint a fresh receipt for that app.',
     inputSchema: {
       detail: z.enum(['summary', 'full']).optional().describe('summary returns compact health. full includes reading file details.'),
       include_ready: z.boolean().optional().describe('Include ready apps. Default true. Set false to see only apps needing action.'),
@@ -616,7 +617,8 @@ server.registerTool(
 server.registerTool(
   'apps.status',
   {
-    description: 'Inspect one AREST app and return health, reading/DB freshness, and next actions. Defaults to the active app.',
+    description:
+      'Deep health report for ONE app — reading-file inventory, DB mtime vs readings, dependency closure, next-action suggestions. Defaults to the active app. WHEN: diagnosing a single app — "is the DB stale?", "which readings does this app depend on?", "why is health=not_ready?". ALTERNATIVE: apps.check when you want the same depth across EVERY app in the registry; apps.current for a one-liner without the dependency closure; apps.list when you want a flat roster only. GOTCHA: detail=full is the default here (not summary like apps.list / apps.current) because the verb is meant for deep inspection. NEXT: apps.compile to refresh DB from readings if stale=true; apps.use if you want to make this app active first.',
     inputSchema: {
       name: z.string().optional().describe('AREST app name. Defaults to the active app.'),
       detail: z.enum(['summary', 'full']).optional().describe('summary returns compact health. full includes reading file details. Default full.'),
@@ -635,7 +637,8 @@ server.registerTool(
 server.registerTool(
   'apps.check',
   {
-    description: 'Check every discovered AREST app and summarize health across the registry. Use this as the first orientation call before choosing an app.',
+    description:
+      'Sweep EVERY app in the registry and roll up a registry-wide summary (counts of ready / stale / library / not-found). WHEN: registry-wide triage — "which apps are stale across the whole repo?", "how many apps need a recompile?". ALTERNATIVE: orient when you only need active-app counts plus one-line "what to do next" pointer (cheaper); apps.list for the same per-app roster WITHOUT the rolled-up summary; apps.status for deep inspection of ONE app. GOTCHA: still directory-derived — apps without a readings/ subdir show as not_found even if the name appears in env. NEXT: apps.use to switch to whichever app needs work, then apps.compile if its DB is stale.',
     inputSchema: {
       detail: z.enum(['summary', 'full']).optional().describe('summary returns compact health. full includes reading file details.'),
       include_ready: z.boolean().optional().describe('Include ready apps. Default true. Set false to return only apps needing action.'),
@@ -681,7 +684,8 @@ server.registerTool(
 server.registerTool(
   'apps.use',
   {
-    description: 'Switch the active local AREST app. Subsequent local reads/writes and context receipts use that app scope.',
+    description:
+      'Switch the active local AREST app — subsequent get / query / sql / cells / apply / compile run against THIS app\'s readings + DB. WHEN: you need to read from or mutate a different UoD than the current one. ALTERNATIVE: apps.create when the app does not yet exist (creates dir + activates in one step); apps.status when you only want to peek at an app without making it active. GOTCHA: this INVALIDATES any context_receipt minted under the prior active app — mutating verbs will reject stale receipts after a switch, so call context again. Library entries (no readings/ + no .db) refuse activation with error="app_is_library". NEXT: context to mint a receipt for the new scope, then orient (or apps.current) to confirm the switch.',
     inputSchema: {
       name: z.string().describe('AREST app name under the apps directory.'),
     },
@@ -747,7 +751,8 @@ server.registerTool(
 server.registerTool(
   'apps.compile',
   {
-    description: 'Compile an app readings directory into that app SQLite DB. This refreshes the app DB from readings as the source of truth.',
+    description:
+      'Re-compile an app\'s readings/*.md INTO its SQLite .db (full refresh; readings are the source of truth). WHEN: apps.status reports stale=true, or you have just edited readings/ for an app and need the engine to see them. ALTERNATIVE: compile (no `apps.` prefix) when you want to ADD readings to the LIVE active engine without rebuilding the DB on disk (Corollary 5 — in-process self-modification, no file write); use apps.compile when you want the DB on disk to reflect the readings. GOTCHA: this rebuilds the DB from scratch — any population data that was not derived from readings (i.e. live entity facts created via `apply`) survives only if it round-trips through the readings + recompile loop. The verb refuses on library entries and on apps with zero .md files. NEXT: apps.status to confirm stale=false, then apps.use (if activate=false was set) and orient.',
     inputSchema: {
       name: z.string().optional().describe('AREST app name. Defaults to the active app.'),
       activate: z.boolean().optional().describe('Make the compiled app active. Default true when name is provided, otherwise leaves current active app.'),
@@ -791,7 +796,8 @@ server.registerTool(
 server.registerTool(
   'get',
   {
-    description: 'Get an entity by ID, or list all entities of a noun type. Returns the entity with its current state, HATEOAS links, and navigation.',
+    description:
+      'Fetch a 3NF view of ONE entity by id, OR list every entity of a noun (omit id). Returns fields + HATEOAS links. WHEN: you already know "give me Order ord-1 with all its current single-valued facts" — get assembles the per-entity row across every fact type the noun participates in. Listing (no id) returns one row per entity instance of the noun. ALTERNATIVE: query when you want rows of ONE fact type filtered by role binding (e.g. "every Task with Priority p0"); sql when you need joins / aggregates / NOT EXISTS across multiple FTs; actions when you specifically want the legal SM transitions for one entity. GOTCHA: federation-aware — if the noun is bound to an external system, get fetches from there and absorbs the result into the local population with a Citation. Multi-valued facts come back as arrays; single-valued facts come back as scalar strings. NEXT: actions noun=<N> id=<X> to see what transitions are legal, or apply operation=update to modify.',
     inputSchema: {
       id: z.string().optional().describe('Entity ID. If omitted, lists all entities of the noun type.'),
       noun: z.string().optional().describe('Noun type (e.g. "Order"). Required when listing, optional when getting by ID (inferred from population).'),
@@ -863,7 +869,8 @@ export function parseQueryResponse(raw: string): unknown {
 server.registerTool(
   'query',
   {
-    description: 'Query facts by fact type. Returns matching facts from the population. Use to explore relationships between entities.',
+    description:
+      'Read-only single-fact-type filtered projection. WHEN: you want every row of ONE fact type, optionally filtered by exact role bindings (e.g. fact_type="Task_has_Task_Priority", filter={"Task Priority":"p0"}). ALTERNATIVE: sql for joins / aggregates / NOT EXISTS / GROUP BY across multiple FTs; get for the 3NF per-entity view by id; cells mode=get when you want the cell contents directly (same data, different framing); orient as the cheaper "session re-entry" call. GOTCHA: returns [] (not an error) for unknown fact_type — engine returns Object::Bottom (#821) and the MCP layer translates it to "no such facts", indistinguishable from "FT exists but is empty". Verify the FT name with `cells mode=list pattern=<glob>` if you get an unexpected empty list. Filter values are compared as strings (no type coercion). NEXT: cross-reference each row with `get noun=<role-noun> id=<row-value>` to fetch the entity view, or feed the result into a downstream apply.',
     inputSchema: {
       fact_type: z.string().describe('Fact type ID (e.g. "Order_was_placed_by_Customer", "Case_has_Observation")'),
       filter: z.record(z.string(), z.string()).optional().describe('Filter by role bindings (e.g. {"Case": "The Speckled Band"})'),
@@ -914,7 +921,8 @@ export function parseSqlResponse(raw: string): unknown {
 server.registerTool(
   'sql',
   {
-    description: 'Read-only SQL SELECT over the relational substrate (#864). Each FactType cell becomes a SQL table named ft_<FactType_id> with columns matching the role names (spaces → underscores). Example: SELECT "Task" FROM ft_Task_has_Task_Priority WHERE "Task_Priority" = \'p0\'. Returns {rows: [{col: val, ...}, ...]} on success or {error: "..."} on parse / exec failure. Use for cross-fact-type joins, NOT EXISTS, and any projection beyond a single fact type with one WHERE clause — for those, prefer `query`. Mutating SQL (INSERT / UPDATE / DELETE) is refused; use `apply` instead.',
+    description:
+      'Read-only SQL SELECT over the relational substrate (#864). Each FactType cell is exposed as table ft_<FactType_id> with columns = role names (spaces→underscores). Example: `SELECT t.Task FROM ft_Task_has_Task_Priority t WHERE t.Task_Priority = \'p0\'`. WHEN: cross-FT JOINs, aggregates (COUNT/GROUP BY), NOT EXISTS / EXISTS subqueries, or any projection more expressive than one-FT-plus-one-equality-filter. ALTERNATIVE: query when one FT with simple role-equality filters is enough (cheaper, no SQL string to build); cells mode=get when you only want the raw contents of a single cell. GOTCHA: SELECT-only — INSERT / UPDATE / DELETE are refused on purpose so derivation + validation always run through `apply`. Returns `{rows:[...]}` on success or `{error:"..."}` envelope on parse / exec failure (no thrown exceptions). Local-mode only — without the std-deps engine feature the verb returns `{error:"engine returned ⊥"}`. Quote identifiers per SQL standard. NEXT: pipe rows into `get noun=<X> id=<row-value>` for per-entity context, or apply for mutations.',
     inputSchema: {
       query: z.string().describe('A SQL SELECT statement. Tables are ft_<FactType_id> (e.g. ft_Task_has_Task_Priority); columns are role names with spaces replaced by underscores. Quote both identifiers and string values per SQL standard.'),
     },
@@ -979,7 +987,8 @@ export function parseCellsResponse(raw: string): unknown {
 server.registerTool(
   'cells',
   {
-    description: 'Read-only cell-graph introspection (#870). Three modes: `list` returns {cells:[{name,size_bytes},...]} optionally filtered by a glob pattern (e.g. "Task_*"); `get` returns {name,contents,size_bytes} for a single cell with FFP-parsed contents; `trace` returns {rule_text,consequent_cell,materialized_count} for a derivation rule (look up by rule_id exact match or rule_pattern substring match). Use this instead of dropping to `sqlite3 cells …` when you need to know what cells exist, inspect a cell\'s contents, or verify a derivation rule populated its consequent cell. For cross-FT JOINs use `sql` instead.',
+    description:
+      'Read-only cell-graph introspection (#870) — list / get / trace. WHEN: you want to know what cells EXIST (mode=list, with optional glob pattern), inspect raw cell contents without writing SQL (mode=get, FFP-parsed into role-keyed objects), or verify a derivation rule actually fired (mode=trace, returns rule_text + consequent_cell + materialized_count). Replaces "drop into sqlite3 to debug" workflows. ALTERNATIVE: query for FT-filtered tuple lists (same data via the projection lens — friendlier role-name keys, but only one FT at a time); sql when you need JOINs / aggregates across multiple cells; schema when you want the formal model (constraints / SMs / DRs) rather than the cell-graph view. GOTCHA: mode=get requires `name` exactly (no globbing); mode=trace needs either rule_id (exact DR.id) or rule_pattern (first substring hit wins) — providing both is fine, rule_id wins. Returns `{error}` envelopes uniformly; ⊥ → {error:"engine returned ⊥"} when std-deps feature absent. NEXT: query / sql for the actual rows once you have confirmed the cell exists and is populated; apply to mutate.',
     inputSchema: {
       mode: z.enum(['list', 'get', 'trace']).describe('Introspection mode: list, get, or trace.'),
       pattern: z.string().optional().describe('Glob pattern for `list` (e.g. "Task_*", "*derivation*"). Defaults to "*" — all cells.'),
@@ -1055,7 +1064,8 @@ export function parseInduceResponse(raw: string): unknown {
 server.registerTool(
   'induce',
   {
-    description: 'Search for Hypothesis Candidates over a fact type using the induce engine (#854). Wraps `Func::Platform("induce")` — enumerates candidates from the cartesian product of the FT\'s role types, gates them through the alethic-violation check, runs the user\'s Scoring Rules, and returns a Seq of Hypothesis Candidates ranked Confidence-Score-descending. `to_explain` (optional) is the seq of InstanceFacts you want the candidate to forward-chain-derive; empty means open-ended search. `bound` (optional) pins specific role values up front. See readings/core/induction.md for the Hypothesis Candidate / Confidence Score / Scoring Rule vocabulary.',
+    description:
+      'Hypothesis-Candidate search over a fact type (#854) — abduction primitive. WHEN: you want the engine to ENUMERATE plausible bindings for a hidden FT, gate them through alethic constraints, score them by your Scoring Rules, and return ranked candidates (Confidence-Score-descending). Use this when "what value of role R best explains the observed evidence?" is the question. Input: ft_id (FT to search), optional to_explain (seq of InstanceFacts the candidate must forward-chain-derive — empty = open-ended), optional bound (pre-pin certain role values). Output: array of Hypothesis Candidate objects, each with hypothesisCandidateId + confidenceScore + the hidden-fact bindings. ALTERNATIVE: apply operation=create when you already KNOW the fact you want to assert (no search needed); query / sql when the answer can be read out of the existing population directly; propose when the candidate change is at the schema level (new FT / new constraint) rather than at the population level. GOTCHA: ⊥ → {error:"engine returned ⊥"} if handle missing or induce verb not wired; ft_id absent from the FactType cell → `[]` (no candidates), NOT an error. Top candidate appears at index 0 (stable sort preserved by the parser). See readings/core/induction.md for the Hypothesis Candidate / Confidence Score / Scoring Rule vocabulary. NEXT: inspect parsed[0].Hypothesis_Candidate_has_hidden__Fact, and if the binding is convincing, materialize it via apply operation=create.',
     inputSchema: {
       ft_id: z.string().describe('Fact type id to search over (e.g. "Hypothesis_has_Plausibility").'),
       to_explain: z.array(z.unknown()).optional().describe('Optional seq of InstanceFact-shaped facts the candidate should forward-chain-derive. Empty (default) means open-ended search.'),
@@ -1265,7 +1275,8 @@ export function buildApplyMergedUpdatePayload(args: {
 server.registerTool(
   'orient',
   {
-    description: 'Read-only session re-orientation envelope (#871). Returns one screen of "where are we": the apps inventory (active app first with ready/in_progress/completed task counts; sibling apps with last_compile timestamps), the currently active app name, a list of recent cell-graph activity (instance fact cells with their row counts), and a one-line suggested-next pointer. Use as the FIRST call in a new session to skip the usual 5-6 probing verbs (apps_list + apps_current + query Task_has_Task_Status + cells trace ...). Optional inputs: `apps_dir` to enumerate sibling apps from disk; `active_app` so the suggestion template names the current app. No state mutation.',
+    description:
+      'One-screen session re-orientation (#871) — apps inventory + active app + recent cell-graph activity + suggested-next pointer, in a single envelope. WHEN: FIRST call in a new session (replaces the old 5-6-verb probe of apps_list + apps_current + query Task_has_Task_Status + cells trace). Also useful any time the agent has lost the thread and wants "where am I, what just happened, what should I do next?". ALTERNATIVE: apps.current when you only need the active app name (cheaper); apps.list / apps.check when you want depth on every app and do NOT need the recent-activity summary; context when you specifically need a mutation receipt (orient does not mint one). GOTCHA: counts come from the ACTIVE app\'s loaded snapshot only — sibling apps appear with last_compile mtimes but no per-app row counts (the engine holds one DB at a time). Pass apps_dir only when you want sibling enumeration; omit it for active-app-only mode. NEXT: follow the `suggested_next` pointer in the response, or call context if the next move is a mutation.',
     inputSchema: {
       apps_dir: z.string().optional().describe('Optional absolute path to the apps directory. When set, sibling apps are enumerated from filesystem (each must carry a `readings/` directory and a `*.db` file). When omitted, only the active app is reported.'),
       active_app: z.string().optional().describe('Optional active app name. The verb uses this to name the active entry in the apps list and to render the suggested_next template. When omitted, suggested_next falls back to a "pick an app" pointer.'),
@@ -1292,7 +1303,8 @@ server.registerTool(
 server.registerTool(
   'apply',
   {
-    description: `Apply an operation to an entity. The operation determines behavior: create (new entity), update (modify fields), transition (fire SM event). Executes the AREST pipeline: resolve -> derive -> validate -> emit. ${MUTATION_TOOL_DESCRIPTION}`,
+    description:
+      'Population-level mutation — create / update / transition an entity. Runs the full pipeline: resolve → derive → validate → emit. WHEN: you have a known fact change to assert. operation=create makes a new entity (REQUIRES explicit id per #867 — MCP refuses silent-id); operation=update modifies fields on an existing id (MERGES with existing single-valued facts by default per #868 / #872, so a partial payload does NOT silently retract untouched fields); operation=transition fires an SM event (engine looks up the legal transition for the current status and target event). ALTERNATIVE: retract for exact-tuple removal from a FactType cell (skips entity-shape envelope); compile when you are changing the SCHEMA not the population (new FT / new constraint); propose when the schema change needs a governed review workflow before taking effect; induce when you want the engine to SEARCH for the right binding instead of you supplying it. GOTCHA: context_receipt is required — call context first, paste its receipt here. Update merge can be opted out with fields_only_replace=true (rare). transition needs `event` not `fields`. Engine will reject on alethic violation or missing reference scheme. NEXT: get noun=<N> id=<id> to confirm the new state, or actions to see what transitions are now legal.',
     inputSchema: {
       context_receipt: z.string().optional().describe(CONTEXT_RECEIPT_FIELD_DESCRIPTION),
       operation: z.enum(['create', 'update', 'transition']).describe('Operation type'),
@@ -1389,7 +1401,8 @@ server.registerTool(
 server.registerTool(
   'retract',
   {
-    description: `Retract an exact fact tuple from a FactType cell. Use roles for ordinary fact types; use ordered pairs when a fact type has repeated role names. Stored semiderivations can be removed, but supporting facts may derive them again on the next forward-chain compile. ${MUTATION_TOOL_DESCRIPTION}`,
+    description:
+      'Remove an exact fact tuple from a FactType cell. WHEN: you want to delete one specific row from one specific FT (e.g. "Order ord-1 was_placed_by alice" — but it really was bob). ALTERNATIVE: apply operation=update when you want to REPLACE a single-valued fact (update merges, retract removes); apply operation=transition for SM-driven status removal (transitions are the modeled way to advance / withdraw entity state, not direct fact retraction); compile when you want to remove the FT itself from the schema. GOTCHA: context_receipt is required. Stored semiderivations CAN be retracted, but the engine may re-derive them on the next forward-chain pass from their supporting facts — the only durable removal is to retract those supporting facts too. Use roles={...} for ordinary FTs; use pairs=[{role, value}, ...] when role names repeat. Local-mode only. NEXT: query fact_type=<X> to confirm the tuple is gone; downstream constraints / derivations re-fire on the next read.',
     inputSchema: {
       context_receipt: z.string().optional().describe(CONTEXT_RECEIPT_FIELD_DESCRIPTION),
       fact_type: z.string().describe('Fact type ID / cell name, e.g. "Order_was_placed_by_Customer"'),
@@ -1423,7 +1436,8 @@ server.registerTool(
 server.registerTool(
   'actions',
   {
-    description: 'Get valid actions for an entity. Returns available SM transitions, navigation links (parent/child), and applicable operations. Pure HATEOAS — the agent discovers what is possible without knowing the schema.',
+    description:
+      'HATEOAS — return the SM transitions currently legal for ONE entity, plus its current entity_data. WHEN: you have an entity id and you want to know "what can I do next?" without reading the state-machine reading by hand. The verb resolves the current status from the State Machine cell (or accepts an explicit `status`), then asks the engine for outgoing edges keyed by that status. ALTERNATIVE: propose for GOVERNED schema evolution (Domain Change with review workflow — propose is to schema what apply is to population); explain to see how the entity arrived at its current state (audit + derivation chain); get for the entity\'s facts without the transitions list; schema if you want the SM definition itself rather than per-entity legal moves. GOTCHA: returns [] for an entity with no SM binding, or for an unknown id — same shape, not an error. If you omit `status` and the entity has no State Machine row, transitions come back as []. NEXT: pick one transition row and call apply operation=transition noun=<N> id=<X> event=<row.event>.',
     inputSchema: {
       noun: z.string().describe('Entity noun type'),
       id: z.string().describe('Entity ID'),
@@ -1512,7 +1526,8 @@ server.registerTool(
 server.registerTool(
   'compile',
   {
-    description: `Compile FORML2 readings into the engine (self-modification, Corollary 5). The engine extends its own program. New nouns, fact types, constraints, derivation rules, and state machines become active immediately. Alethic violations reject. ${MUTATION_TOOL_DESCRIPTION}`,
+    description:
+      'In-process schema self-modification (Corollary 5): feed FORML2 readings text to the LIVE active engine — new nouns, fact types, constraints, derivation rules, and state machines become callable immediately. WHEN: you want to extend the active app\'s model WITHOUT persisting the change to disk yet — quick iteration, exploration, or "what if I add this constraint?" trials. ALTERNATIVE: apps.compile when you want to REBUILD the on-disk SQLite .db from the readings/ directory (full refresh; readings are the source of truth there); propose when the schema change needs a governed Domain Change review workflow before taking effect; apply when you are changing the population, not the schema. GOTCHA: context_receipt is required — call context first, paste its receipt here. Alethic violations REJECT the compile (the engine returns ⊥ and the model stays as it was). This does NOT write to disk — if you want the readings/ directory to reflect the change, you also need to edit the .md file and call apps.compile. NEXT: schema or cells mode=list to confirm the new definitions are visible; apply to start populating the new fact types.',
     inputSchema: {
       context_receipt: z.string().optional().describe(CONTEXT_RECEIPT_FIELD_DESCRIPTION),
       readings: z.string().describe('FORML2 readings as markdown text'),
@@ -1542,7 +1557,8 @@ server.registerTool(
 server.registerTool(
   'schema',
   {
-    description: 'Get the full schema: nouns, fact types, constraints, state machines, derivation rules.',
+    description:
+      'Dump the FULL formal model: every Noun, FactType, Constraint, State Machine, Derivation Rule, plus reference schemes. WHEN: you need the canonical model surface — agent is composing readings and wants to verify naming conventions, or a downstream tool needs the complete picture. ALTERNATIVE: cells mode=list pattern=<glob> for targeted lookups (much smaller payload, faster); query fact_type=FactType to enumerate just the FT cell; orient when you want activity + apps overview not the model. GOTCHA: this is a LARGE payload — for any apps beyond a small toy domain it can run to many KB. Prefer cells/query whenever you have a specific name in mind. Returns the engine\'s raw schema envelope (no contextual receipt needed — read-only). NEXT: pick a specific FT name from the response and call cells mode=get name=<X> for contents, or query fact_type=<X> for a filtered tuple list.',
   },
   async () => {
     if (AREST_MODE === 'local') {
@@ -1651,7 +1667,8 @@ server.registerTool(
 server.registerTool(
   'propose',
   {
-    description: `Propose a change to the schema or population. Creates a Domain Change entity with the proposed elements (readings, nouns, fact types, constraints, verbs, state machines). Enters the review workflow at status "Proposed". Use transition to advance through Under Review -> Approved -> Applied. For immediate changes bypassing review, use compile directly. ${MUTATION_TOOL_DESCRIPTION}`,
+    description:
+      'Governed schema evolution — stage a Domain Change entity that bundles proposed elements (readings / nouns / fact types / constraints / verbs / state machines) and enters the review workflow at status="Proposed". WHEN: the schema change requires human (or another agent) sign-off BEFORE taking effect — audit-tracked, review-tracked, rollback-able. ALTERNATIVE: compile when you want IMMEDIATE in-process schema change with no review (Corollary 5 — fast iteration); apply when the change is at the population level (entity create / update / transition), not the schema; actions when you want to advance an EXISTING Domain Change through its workflow. GOTCHA: context_receipt is required. Creating the Domain Change entity does NOT apply the schema change — you must walk the SM (events: review → approve-change → apply) for the proposed readings to take effect. The verb returns a change_id you will use in the follow-up transitions; the response\'s next_actions array spells out the SM walk. NEXT: apply operation=transition noun="Domain Change" id=<change_id> event=review to advance.',
     inputSchema: {
       context_receipt: z.string().optional().describe(CONTEXT_RECEIPT_FIELD_DESCRIPTION),
       rationale: z.string().describe('Why this change is needed'),

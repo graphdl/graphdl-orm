@@ -8,6 +8,9 @@
 import { describe, it, expect } from 'vitest'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
+import { readFileSync } from 'fs'
+import { resolve, dirname } from 'path'
+import { fileURLToPath } from 'url'
 import {
   parseQueryResponse,
   parseSqlResponse,
@@ -18,6 +21,9 @@ import {
   mergeUpdateFields,
   buildApplyMergedUpdatePayload,
 } from './server.js'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const SERVER_TS = readFileSync(resolve(__dirname, 'server.ts'), 'utf-8')
 
 describe('AREST MCP Server', () => {
   it('registers expected tool names', () => {
@@ -560,4 +566,71 @@ describe('#872 apply footgun-resistance', () => {
       expect(result.fields['Task Description']).toBe('new')
     })
   })
+})
+
+describe('#873 verb descriptions teach when / why / gotchas / next', () => {
+  // Source-of-truth contract: every primary verb's registerTool block
+  // must carry the four-phrase shape so an agent reading any one verb's
+  // description finds the same teaching structure. The cookbook in
+  // CLAUDE.md was deleted (drift-prone) — the structural replacement is
+  // teaching at the call site. This test pins that the call sites
+  // actually teach: WHEN / ALTERNATIVE / GOTCHA / NEXT.
+  //
+  // We extract each verb's registerTool config object literal by string
+  // search rather than instantiating the server (server.ts spawns the
+  // engine on import). The slice runs from `'<verb>'` up to the
+  // matching `inputSchema:` (or, for verbs without input, up to the
+  // closing `},` of the config) — long enough to cover the description
+  // field in its entirety.
+  // Normalize CRLF to LF so the pattern matches regardless of git
+  // checkout line endings (Windows clones with autocrlf=true → CRLF).
+  const SRC = SERVER_TS.replace(/\r\n/g, '\n')
+  const sliceConfig = (verb: string): string => {
+    // Match the two-space-indented `'<verb>',\n` that follows the
+    // top-level `server.registerTool(` line for primary verbs.
+    const head = SRC.indexOf(`server.registerTool(\n  '${verb}',\n`)
+    expect(head, `registerTool('${verb}', ...) block not found`).toBeGreaterThan(0)
+    // Slice forward enough to cover the description + (optional)
+    // inputSchema. 4096 chars is generous for the longest description
+    // we expect (a few hundred words). Stops at the next registerTool.
+    const tail = SRC.indexOf(`server.registerTool(`, head + 1)
+    return SRC.slice(head, tail > 0 ? tail : head + 4096)
+  }
+
+  // The verbs whose descriptions form the agent\'s daily contract.
+  // tutor.* mirror tools and select_component / verify / explain / ask
+  // / synthesize / validate / debug intentionally not pinned — those
+  // are either sandbox mirrors or non-core verbs the agent rarely hits
+  // first.
+  const PINNED_VERBS = [
+    'context',
+    'apps.current',
+    'apps.list',
+    'apps.status',
+    'apps.check',
+    'apps.use',
+    'apps.compile',
+    'get',
+    'query',
+    'sql',
+    'cells',
+    'induce',
+    'orient',
+    'apply',
+    'retract',
+    'actions',
+    'compile',
+    'schema',
+    'propose',
+  ] as const
+
+  for (const verb of PINNED_VERBS) {
+    it(`'${verb}' description includes WHEN / ALTERNATIVE / GOTCHA / NEXT`, () => {
+      const config = sliceConfig(verb)
+      expect(config, `${verb}: missing 'WHEN:' marker`).toContain('WHEN:')
+      expect(config, `${verb}: missing 'ALTERNATIVE:' marker`).toContain('ALTERNATIVE:')
+      expect(config, `${verb}: missing 'GOTCHA:' marker`).toContain('GOTCHA:')
+      expect(config, `${verb}: missing 'NEXT:' marker`).toContain('NEXT:')
+    })
+  }
 })
