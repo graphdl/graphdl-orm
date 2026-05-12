@@ -175,22 +175,34 @@ fn is_noun_has_noun_literal(clause: &str, noun_names: &[String]) -> bool {
 /// the diagnostic output noisier. When the head fails to resolve,
 /// the original clause stays intact and falls through to the
 /// downstream classifier cascade.
+///
+/// #882 Sweep-1 lift — anaphora-pronoun vocabulary lifts to
+/// `AnaphoraPronounTable` so the marker set lives in
+/// `readings/forml2-grammar.md` as an `Anaphora Pronoun` enum value
+/// type. Boot stays in sync with the grammar; same scan-and-expand
+/// semantics as the legacy inline ` that ` substring scan, with the
+/// table's `marker()` accessor providing the single declared marker
+/// (currently ` that `) so future additions (e.g. ` which `,
+/// ` whose `) extend the grammar declaration and are picked up
+/// automatically.
 fn expand_that_relatives(
     antecedent: &str,
     noun_names: &[String],
     catalog: &SchemaCatalog,
 ) -> String {
+    let table = crate::parse_forml2_stage2::AnaphoraPronounTable::boot();
+    let marker = table.marker();
     let mut current = antecedent.to_string();
     loop {
         let positions: Vec<usize> = current
-            .match_indices(" that ")
+            .match_indices(marker)
             .map(|(i, _)| i)
             .collect();
         let expand_at = positions.into_iter().find(|&i| {
-            let tail = &current[i + " that ".len()..];
+            let tail = &current[i + marker.len()..];
             let tail_trim = tail.trim_start();
             if is_that_anaphora_ref(tail_trim, noun_names) { return false; }
-            // Only expand when the head — text up to this ` that ` —
+            // Only expand when the head — text up to this marker —
             // resolves to a declared FT. Otherwise leave the clause
             // for downstream classifiers to handle whole.
             let head = &current[..i];
@@ -198,7 +210,7 @@ fn expand_that_relatives(
         });
         let Some(pos) = expand_at else { break; };
         let head = &current[..pos];
-        let tail = &current[pos + " that ".len()..];
+        let tail = &current[pos + marker.len()..];
         let Some(last_noun) = find_last_noun_in(head, noun_names) else { break; };
         let expanded = alloc::format!("{} and {} {}", head, last_noun, tail);
         if expanded == current { break; }

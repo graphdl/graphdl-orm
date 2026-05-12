@@ -1281,6 +1281,68 @@ impl ExistentialQuantifierTable {
     }
 }
 
+/// #882 — `expand_that_relatives` in `parse_forml2.rs` scans for the
+/// ` that ` anaphora marker and expands `<FT-head> that <tail>` into
+/// `<FT-head> and <last-noun-in-head> <tail>` when the head resolves
+/// to a declared FT. The marker carries surrounding spaces so the
+/// substring scan enforces a word boundary.
+///
+/// The lift moves the anaphora-pronoun vocabulary to a typed
+/// `AnaphoraPronounTable` reading the `Anaphora Pronoun` grammar
+/// enum. Boot table stores the single marker ` that ` verbatim;
+/// future additions (e.g. ` which `, ` whose `) extend the grammar
+/// declaration and are picked up automatically without a Rust
+/// change. The accessor `marker()` returns the first declared
+/// marker — sufficient for the current single-marker shape; a
+/// future multi-marker form would replace `marker()` with `iter()`
+/// at the call site.
+#[derive(Debug, Clone)]
+pub struct AnaphoraPronounTable {
+    /// The anaphora pronoun markers. Order matches the `' that '`
+    /// declaration in `readings/forml2-grammar.md` and the legacy
+    /// inline ` that ` substring scan in `expand_that_relatives` so
+    /// the first-match semantics round-trip.
+    pub rows: Vec<String>,
+}
+
+impl AnaphoraPronounTable {
+    /// Boot table — must stay in sync with `Anaphora Pronoun`
+    /// enum-value declaration in `readings/forml2-grammar.md`. One
+    /// marker (` that `) in the same declaration order as the legacy
+    /// inline ` that ` literal in `expand_that_relatives`.
+    pub fn boot() -> Self {
+        AnaphoraPronounTable {
+            rows: alloc::vec![
+                " that ".to_string(),
+            ],
+        }
+    }
+
+    /// Build the table from the runtime `Anaphora Pronoun`
+    /// enum-value declaration. Falls back to `boot()` when the cell
+    /// is empty (bare engine, no metamodel loaded).
+    pub fn from_grammar_state(state: &Object) -> Self {
+        let rows = read_enum_values(state, "Anaphora Pronoun");
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            AnaphoraPronounTable { rows }
+        }
+    }
+
+    /// Iterate the markers in declaration order.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.rows.iter().map(|s| s.as_str())
+    }
+
+    /// Return the primary marker (first declared). Sufficient for the
+    /// current single-marker shape used by `expand_that_relatives`.
+    /// Future multi-marker callers should use `iter()` instead.
+    pub fn marker(&self) -> &str {
+        self.rows.first().map(|s| s.as_str()).unwrap_or(" that ")
+    }
+}
+
 
 /// #783 first slice — `is_word_comparator_clause` in `parse_forml2.rs`
 /// scans for an inline 8-entry `COMPARATORS` const (` exceeds `,
@@ -5519,6 +5581,8 @@ mod tests {
     /// bumping noun=48, enum=37.
     /// #883 added `Existential Quantifier Keyword` enum (2 values) —
     /// bumping noun=50, enum=39.
+    /// #882 added `Anaphora Pronoun` enum (1 value) —
+    /// bumping noun=51, enum=40.
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
@@ -5526,7 +5590,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 50, "noun count");
+        assert_eq!(noun_count, 51, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -5538,7 +5602,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 39, "enum-valued noun count");
+        assert_eq!(enum_count, 40, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -8008,6 +8072,50 @@ mod tests {
         let table = super::ExistentialQuantifierTable::from_grammar_state(&state);
         assert_eq!(table.rows.len(), 2,
             "empty grammar state falls back to the 2-keyword boot table");
+    }
+
+    // ─── #882: anaphora pronoun table ────────────────────────────────
+
+    /// #882 — `expand_that_relatives` in parse_forml2.rs uses the
+    /// ` that ` substring marker in 4 places to identify anaphora
+    /// expansion opportunities. This lift moves the marker vocabulary
+    /// to a typed `AnaphoraPronounTable` reading the `Anaphora Pronoun`
+    /// grammar enum. Boot table stores the single ` that ` marker;
+    /// future additions extend the grammar declaration only.
+    #[test]
+    fn anaphora_pronoun_table_boot_has_one_marker() {
+        let table = super::AnaphoraPronounTable::boot();
+        let words: Vec<&str> = table.iter().collect();
+        assert_eq!(words, vec![" that "],
+            "boot table mirrors the legacy ` that ` marker order");
+    }
+
+    /// #882 — `marker()` returns the first declared marker.
+    #[test]
+    fn anaphora_pronoun_table_marker_returns_primary() {
+        let table = super::AnaphoraPronounTable::boot();
+        assert_eq!(table.marker(), " that ");
+    }
+
+    /// #882 — when state's EnumValues cell carries Anaphora Pronoun
+    /// values, from_grammar_state lifts them at runtime.
+    #[test]
+    fn anaphora_pronoun_table_from_grammar_state_reads_enum_values() {
+        let state = synthetic_enum_state(&[
+            ("Anaphora Pronoun", &[" which ", " whose "]),
+        ]);
+        let table = super::AnaphoraPronounTable::from_grammar_state(&state);
+        assert_eq!(table.rows, vec![" which ", " whose "]);
+        assert_eq!(table.marker(), " which ",
+            "primary marker comes from first declared value");
+    }
+
+    #[test]
+    fn anaphora_pronoun_table_falls_back_to_boot_on_empty_state() {
+        let state = synthetic_enum_state(&[]);
+        let table = super::AnaphoraPronounTable::from_grammar_state(&state);
+        assert_eq!(table.rows.len(), 1,
+            "empty grammar state falls back to the 1-marker boot table");
     }
 
     // ─── #790: constraint span prefix table ──────────────────────────

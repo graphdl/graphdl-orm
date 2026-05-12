@@ -82,6 +82,8 @@ Subtype Instance Check Keyword is a value type.
   The possible values of Subtype Instance Check Keyword are ' is a ', ' is an '.
 Existential Quantifier Keyword is a value type.
   The possible values of Existential Quantifier Keyword are ' some ', ' that '.
+Anaphora Pronoun is a value type.
+  The possible values of Anaphora Pronoun are ' that '.
 Ring Constraint Trailing Marker is a value type.
   The possible values of Ring Constraint Trailing Marker are 'is irreflexive', 'is asymmetric', 'is antisymmetric', 'is symmetric', 'is intransitive', 'is transitive', 'is acyclic', 'is reflexive'.
 Ring Constraint Kind Code is a value type.
