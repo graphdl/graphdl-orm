@@ -45,15 +45,41 @@ instances_of_noun_func(Sub))` — the byte-for-byte same shape
 equivalence with the pre-#890 per-pair fanout is pinned by
 `crates/arest/tests/subtype_metamodel_rule_e2e.rs`.
 
+## SS Subset-Constraint auto-fill (#891 — replaces the per-SS-Constraint Rust loop)
+
+Whitepaper §5.2 universal modus-ponens schema for Subset Constraint
+auto-fill: every Fact in the antecedent Fact Type is also a Fact in
+the consequent Fact Type, whenever the Subset Constraint's
+antecedent span carries the `subset_autofill = true` marker.
+
+* Fact Type has auto-filled Fact
+    iff some Subset Constraint has antecedent Fact Type Ant and that
+    Subset Constraint has consequent Fact Type Cons and that Subset
+    Constraint has autofill 'true' and that Fact is instance of Ant
+    and that Fact Type is Cons.
+
+The rule's antecedent quantifies over `Subset-Constraint ×
+antecedent-FT-fact` cells; its consequent is the same fact pushed
+into the consequent FT cell. `compile_ss_autofill_metamodel` in
+`crates/arest/src/compile.rs` performs the lift to a Func:
+
+  Concat . [
+    per-SS-Constraint inner Func,
+    ...
+  ]
+
+where each inner Func is the byte-for-byte same shape
+`compile_explicit_derivation` produces for a 1-antecedent
+`FactType(antecedent_ft)` rule with `Literal(consequent_ft)`
+consequent. Behavioural equivalence with the pre-#891 per-SS-
+Constraint fanout is pinned by
+`crates/arest/tests/ss_autofill_metamodel_rule_e2e.rs`.
+
 ## Other structural rules (deferred — still synthesised in compile.rs)
 
 The following rules currently remain as per-binding loops in
 `compile.rs::compile_derivations`. Lifting them to declarative
 metamodel rules here is tracked under #287/#311 follow-ups:
-
-* SS Constraint auto-fill — Fact is in consequent FT iff some SS
-  Constraint with autofill 'true' spans antecedent FT and Fact is
-  instance of that antecedent FT.
 
 * Transitivity of binary FTs — Fact Type has inferred Fact iff some
   Fact uses Resource for the first Role and some other Fact uses

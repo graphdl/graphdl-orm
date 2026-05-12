@@ -169,6 +169,18 @@ name = "subtype_metamodel_rule_e2e"
 path = "tests/subtype_metamodel_rule_e2e.rs"
 required-features = ["test-bins"]
 
+# SS auto-fill metamodel rule end-to-end pin (#891). Acceptance for
+# replacing the per-SS-Constraint Rust synthesizer loop in
+# `compile.rs::compile_derivations` with a single FORML 2 metamodel
+# derivation rule expressed in `readings/core/derivation.md`. Asserts
+# the autofilled fact `<<Academic, 'A1'>, <Department, 'D1'>>` lands
+# in `ft_works` after compile + forward-chain over an SS-with-autofill
+# constraint linking `ft_heads -> ft_works`.
+[[test]]
+name = "ss_autofill_metamodel_rule_e2e"
+path = "tests/ss_autofill_metamodel_rule_e2e.rs"
+required-features = ["test-bins"]
+
 # Unary-consequent derivation rule end-to-end pin (#866 follow-up).
 # The simplified unit test in compile.rs schema_tests was insufficient
 # — it didn't catch the apps/tasks failure mode where the unary FT
