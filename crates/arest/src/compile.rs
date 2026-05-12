@@ -2655,6 +2655,20 @@ fn compile_derivations(data: &CellIndex, state_machines: &[CompiledStateMachine]
     diag!("  [profile] {} SM init derivations", sm_init_derivations.len());
     derivations.extend(sm_init_derivations);
 
+    // task-740: event-fold derivations. For each SM, build a rule
+    // that reads each transition's trigger-fact-type cell and emits
+    // StateMachine_has_currentlyInStatus (+ instanceOf + forResource)
+    // per event-fact occurrence. SM init's `is_new` guard filters out
+    // resources event-fold has already initialized, so we don't
+    // double-emit 'initial' alongside the event-derived status.
+    let sm_event_fold_derivations: Vec<_> = state_machines.iter().map(|sm| {
+        diag!("  [profile] compiling SM event-fold for noun={} ({} transitions)",
+            sm.noun_name, sm.transition_table.len());
+        compile_sm_event_fold(sm)
+    }).collect();
+    diag!("  [profile] {} SM event-fold derivations", sm_event_fold_derivations.len());
+    derivations.extend(sm_event_fold_derivations);
+
     derivations
 }
 
@@ -4870,6 +4884,115 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
         let func = Func::compose(Func::Concat, Func::compose(derive_facts, new_instances));
 
         CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func, uses_negation: false }
+}
+
+/// State machine event-fold as a derivation rule (task-740).
+///
+/// Paper §5.1: "Resource is currently in Status folds those tuples
+/// latest-wins per resource." When an event fact of an SM's
+/// trigger-fact-type exists for a resource, derive the SM instance
+/// (instanceOf + forResource) and set currentlyInStatus to the
+/// transition's target status.
+///
+/// This is the substrate hook that makes event facts auto-update SM
+/// state without going through `apply operation=transition`. Bulk-
+/// readings of event facts (e.g. `Task '905' is finished.`) flow
+/// through the parser → InstanceFact → trigger-FT cell, then
+/// event-fold emits StateMachine_has_currentlyInStatus.
+///
+/// MVP simplification: skip latest-wins. For a resource with one
+/// event fact this produces the correct currentlyInStatus. For a
+/// resource with multiple event facts (e.g. 'started' then
+/// 'finished'), event-fold emits BOTH target statuses and the
+/// "exactly one currentlyInStatus per SM" UC fires — this is
+/// acceptable for the initial-migration use case where each
+/// resource has at most one event fact. A future fix needs an
+/// aggregation primitive (max-by-timestamp / latest-by-recorded-at).
+///
+/// Resource extraction: each event fact carries one role binding
+/// where role_name == `sm.noun_name` (e.g. `Task is started` has a
+/// `Task` role). Pulls the resource value, then synthesizes the
+/// three SM facts using the same shape as `compile_sm_init_for`.
+/// SM init's `is_new` guard filters out resources already in
+/// StateMachine_has_forResource — so init won't double-emit
+/// 'initial' for resources event-fold has already covered.
+fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
+    let sm_noun = sm.noun_name.clone();
+    let id_str = format!("_sm_event_fold_{}", sm_noun);
+    let text_str = format!("SM event-fold for {}", sm_noun);
+
+    // For each (from, to, event_ft) transition, build an inner Func
+    // that reads event_ft's facts, extracts each fact's resource
+    // value (the binding under role_name == sm_noun), and emits the
+    // 3-fact instanceOf + forResource + currentlyInStatus tuple.
+    let inner_funcs: Vec<Func> = sm.transition_table.iter().map(|(_from, to, event_ft)| {
+        let to_obj = Object::atom(to);
+        let sm_noun_obj = Object::atom(&sm_noun);
+        let event_facts = extract_facts_from_pop(event_ft);
+
+        // Per-fact extractor: filter the fact's binding pairs for
+        // role_name == sm_noun, project to the value side. Mirrors
+        // the `extract_for_resource` pattern in compile_sm_init_for.
+        let extract_resource_per_fact = Func::compose(
+            Func::apply_to_all(Func::Selector(2)),
+            Func::filter(Func::compose(Func::Eq, Func::construction(vec![
+                Func::Selector(1),
+                Func::constant(sm_noun_obj.clone()),
+            ]))),
+        );
+        // Concat across all event facts to flatten the per-fact
+        // resource Seqs into one resource stream.
+        let resources = Func::compose(
+            Func::Concat,
+            Func::compose(Func::apply_to_all(extract_resource_per_fact), event_facts),
+        );
+
+        // For each resource, emit the same 3-fact shape as SM init
+        // so the post-event SM cell is byte-identical to the
+        // post-`apply transition` cell. Input to the
+        // apply_to_all is a single resource value (atom).
+        let derive_for_resource = Func::construction(vec![
+            Func::construction(vec![
+                Func::constant(Object::atom("StateMachine_has_instanceOf")),
+                Func::constant(Object::atom("SM event-fold instanceOf")),
+                Func::construction(vec![
+                    Func::construction(vec![Func::constant(Object::atom("State Machine")), Func::Id]),
+                    Func::construction(vec![Func::constant(Object::atom("instanceOf")), Func::constant(sm_noun_obj.clone())]),
+                ]),
+            ]),
+            Func::construction(vec![
+                Func::constant(Object::atom("StateMachine_has_currentlyInStatus")),
+                Func::constant(Object::atom(&format!("SM event-fold to {}", to))),
+                Func::construction(vec![
+                    Func::construction(vec![Func::constant(Object::atom("State Machine")), Func::Id]),
+                    Func::construction(vec![Func::constant(Object::atom("currentlyInStatus")), Func::constant(to_obj.clone())]),
+                ]),
+            ]),
+            Func::construction(vec![
+                Func::constant(Object::atom("StateMachine_has_forResource")),
+                Func::constant(Object::atom("SM event-fold forResource")),
+                Func::construction(vec![
+                    Func::construction(vec![Func::constant(Object::atom("State Machine")), Func::Id]),
+                    Func::construction(vec![Func::constant(Object::atom("forResource")), Func::Id]),
+                ]),
+            ]),
+        ]);
+
+        Func::compose(
+            Func::Concat,
+            Func::compose(Func::apply_to_all(derive_for_resource), resources),
+        )
+    }).collect();
+
+    let func = if inner_funcs.is_empty() {
+        Func::constant(Object::phi())
+    } else if inner_funcs.len() == 1 {
+        inner_funcs.into_iter().next().unwrap()
+    } else {
+        Func::compose(Func::Concat, Func::construction(inner_funcs))
+    };
+
+    CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func, uses_negation: false }
 }
 
 fn compile_constraint(data: &CellIndex, def: &ConstraintDef) -> CompiledConstraint {
