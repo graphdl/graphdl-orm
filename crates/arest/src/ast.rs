@@ -520,14 +520,22 @@ pub fn encode_state_indexed(state: &Object) -> Object {
     let map: HashMap<String, Object> = cells_iter(state).into_iter()
         .filter(|(ft_id, _)| !ft_id.contains(':'))
         .map(|(ft_id, contents)| {
-            let fact_objs: Vec<Object> = contents.as_seq().map(|facts| {
-                facts.iter().map(|fact| {
-                    let bindings: Vec<Object> = fact.as_seq().map(|pairs| {
-                        pairs.iter().cloned().collect::<Vec<Object>>()
-                    }).unwrap_or_default();
-                    Object::Seq(Arc::from(bindings))
-                }).collect::<Vec<Object>>()
-            }).unwrap_or_default();
+            // task-744 phase 3 follow-up: Map-backed cells iterate
+            // values; mirror of encode_state's fix. Without this, the
+            // O(1) lookup form at Selector(4) reports empty facts for
+            // every keyed cell, which breaks MC / UC / derivation
+            // checks that rely on extract_facts_func.
+            let fact_iter: Box<dyn Iterator<Item = &Object>> = match contents {
+                Object::Seq(facts) => Box::new(facts.iter()),
+                Object::Map(m) => Box::new(m.values()),
+                _ => Box::new(core::iter::empty()),
+            };
+            let fact_objs: Vec<Object> = fact_iter.map(|fact| {
+                let bindings: Vec<Object> = fact.as_seq().map(|pairs| {
+                    pairs.iter().cloned().collect::<Vec<Object>>()
+                }).unwrap_or_default();
+                Object::Seq(Arc::from(bindings))
+            }).collect::<Vec<Object>>();
             (ft_id.to_string(), Object::Seq(Arc::from(fact_objs)))
         }).collect();
     Object::Map(map.into())
@@ -545,14 +553,23 @@ pub fn encode_state(state: &Object) -> Object {
     let fact_types: Vec<Object> = cells_iter(state).into_iter()
         .filter(|(ft_id, _)| !ft_id.contains(':'))
         .map(|(ft_id, contents)| {
-            let fact_objs: Vec<Object> = contents.as_seq().map(|facts| {
-                facts.iter().map(|fact| {
-                    let bindings: Vec<Object> = fact.as_seq().map(|pairs| {
-                        pairs.iter().map(|pair: &Object| pair.clone()).collect::<Vec<Object>>()
-                    }).unwrap_or_default();
-                    Object::Seq(Arc::from(bindings))
-                }).collect::<Vec<Object>>()
-            }).unwrap_or_default();
+            // task-744 phase 3 follow-up: Map-backed cells iterate
+            // their values just like Seq-backed cells. Without this,
+            // any cell flipped to Map storage (by `cell_put_keyed`)
+            // shows up as an empty fact list in the encoded pop,
+            // silently dropping facts from constraint / derivation
+            // evaluation.
+            let fact_iter: Box<dyn Iterator<Item = &Object>> = match contents {
+                Object::Seq(facts) => Box::new(facts.iter()),
+                Object::Map(m) => Box::new(m.values()),
+                _ => Box::new(core::iter::empty()),
+            };
+            let fact_objs: Vec<Object> = fact_iter.map(|fact| {
+                let bindings: Vec<Object> = fact.as_seq().map(|pairs| {
+                    pairs.iter().map(|pair: &Object| pair.clone()).collect::<Vec<Object>>()
+                }).unwrap_or_default();
+                Object::Seq(Arc::from(bindings))
+            }).collect::<Vec<Object>>();
             Object::seq(vec![Object::atom(ft_id), Object::Seq(Arc::from(fact_objs))])
         }).collect();
     Object::Seq(fact_types.into())
@@ -2062,13 +2079,20 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
         }
 
         Func::DistL => {
+            // task-744 phase 3 follow-up: Map cells iterate their
+            // values as the right-side collection. Order is incidental
+            // (DistL is a point-wise pair-build).
             match x.as_seq() {
                 Some(items) if items.len() == 2 => {
                     let y = &items[0];
-                    match items[1].as_seq() {
-                        Some(zs) if zs.is_empty() => Object::phi(),
-                        Some(zs) => Object::seq(
+                    match &items[1] {
+                        Object::Seq(zs) if zs.is_empty() => Object::phi(),
+                        Object::Seq(zs) => Object::seq(
                             zs.iter().map(|z| Object::seq(vec![y.clone(), z.clone()])).collect()
+                        ),
+                        Object::Map(m) if m.is_empty() => Object::phi(),
+                        Object::Map(m) => Object::seq(
+                            m.values().map(|z| Object::seq(vec![y.clone(), z.clone()])).collect()
                         ),
                         _ => Object::Bottom,
                     }
@@ -2078,13 +2102,19 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
         }
 
         Func::DistR => {
+            // task-744 phase 3 follow-up: Map cells iterate values as
+            // the left-side collection. Same shape as DistL.
             match x.as_seq() {
                 Some(items) if items.len() == 2 => {
                     let z = &items[1];
-                    match items[0].as_seq() {
-                        Some(ys) if ys.is_empty() => Object::phi(),
-                        Some(ys) => Object::seq(
+                    match &items[0] {
+                        Object::Seq(ys) if ys.is_empty() => Object::phi(),
+                        Object::Seq(ys) => Object::seq(
                             ys.iter().map(|y| Object::seq(vec![y.clone(), z.clone()])).collect()
+                        ),
+                        Object::Map(m) if m.is_empty() => Object::phi(),
+                        Object::Map(m) => Object::seq(
+                            m.values().map(|y| Object::seq(vec![y.clone(), z.clone()])).collect()
                         ),
                         _ => Object::Bottom,
                     }
