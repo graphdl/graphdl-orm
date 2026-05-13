@@ -312,7 +312,23 @@ pub fn candidate_passes_constraints(
     // gate and the chain-check stay shape-aligned (one source of
     // truth for cell-fact translation).
     let projected = project_instance_fact_to_per_ft(candidate);
-    let state_prime = crate::ast::cell_push(ft_id, projected, state);
+
+    // task-820: alethic UCs on keyed FTs lower into the storage layer
+    // — the constraint Func is φ at validate-time, so `validate`
+    // alone can't see the duplicate. Consult `_CellKeyRoles` and try
+    // `cell_put_keyed` for keyed FTs; a returned `Err(KeyConflict)`
+    // means the candidate would violate the UC on insert.
+    let key_roles_by_ft = crate::evaluate::read_cell_key_roles(defs);
+    let state_prime = if let Some(role_names) = key_roles_by_ft.get(ft_id) {
+        let refs: alloc::vec::Vec<&str> = role_names.iter().map(|s| s.as_str()).collect();
+        match crate::ast::cell_put_keyed(ft_id, &refs, projected, state) {
+            Ok(s) => s,
+            Err(_) => return false,
+        }
+    } else {
+        crate::ast::cell_push(ft_id, projected, state)
+    };
+
     // Encode eval context off the candidate-augmented state so
     // `validate`'s constraint funcs (which read the population via
     // Selector(4) / `extract_facts_func`) see the candidate alongside

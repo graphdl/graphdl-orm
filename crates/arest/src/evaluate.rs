@@ -50,7 +50,7 @@ use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 /// `func_to_object` wraps it as `<atom("'"), seq_of_entries>`. Unwrap
 /// the wrapper here so callers see the entries directly. Each entry
 /// is a named-tuple fact: `<<ftId, ft_id_atom>, <keyRoles, "Role1,…">>`.
-fn read_cell_key_roles(d: &ast::Object) -> hashbrown::HashMap<String, Vec<String>> {
+pub(crate) fn read_cell_key_roles(d: &ast::Object) -> hashbrown::HashMap<String, Vec<String>> {
     use hashbrown::HashMap;
     let cell = ast::fetch_or_phi("_CellKeyRoles", d);
     let entries: Vec<ast::Object> = cell.as_seq()
@@ -1098,41 +1098,23 @@ mod tests {
 
     // -- DEFS evaluation path tests ------------------------------------
 
+    /// Post-task-820: alethic UC violations on keyed cells surface
+    /// via `ast::cell_put_keyed` returning `Err(KeyConflict)`, not
+    /// via the constraint evaluator. The Func is a no-op φ for these
+    /// UCs (storage IS the constraint). This test migrated from the
+    /// legacy "constraint detects duplicate" assertion to the new
+    /// "storage layer rejects the write" contract.
     #[test]
-    fn test_evaluate_via_ast_uniqueness_violation() {
-        let mut cells = empty_cells();
-        cells = with_ft(cells, "ft1", &FactTypeDef {
-            schema_id: String::new(),
-            reading: "Person has Name".to_string(),
-            readings: vec![],
-            roles: vec![
-                RoleDef { noun_name: "Person".to_string(), role_index: 0 },
-                RoleDef { noun_name: "Name".to_string(), role_index: 1 },
-            ],
-        });
-        cells = with_constraint(cells, &ConstraintDef {
-            id: "uc1".to_string(),
-            kind: "UC".to_string(),
-            modality: "Alethic".to_string(),
-            text: "Each Person has at most one Name".to_string(),
-            spans: vec![crate::types::SpanDef {
-                fact_type_id: "ft1".to_string(),
-                role_index: 0,
-                subset_autofill: None,
-            }],
-            ..Default::default()
-        });
-
-        let (_meta_state, defs, def_map) = compile_cells(cells);
-
-        let state = state_with_facts("ft1", &[
-            &[("Person", "Alice"), ("Name", "A")],
-            &[("Person", "Alice"), ("Name", "B")],
-        ]);
-
-        let violations = eval_constraints_defs(&defs, &def_map, "", None, &state);
-        assert_eq!(violations.len(), 1);
-        assert_eq!(violations[0].constraint_id, "uc1");
+    fn test_uniqueness_violation_surfaces_via_cell_put_keyed_err() {
+        let f1 = ast::fact_from_pairs(&[("Person", "Alice"), ("Name", "A")]);
+        let f2 = ast::fact_from_pairs(&[("Person", "Alice"), ("Name", "B")]);
+        let state = ast::Object::phi();
+        let state = ast::cell_put_keyed("ft1", &["Person"], f1, &state)
+            .expect("first put must succeed");
+        let conflict = ast::cell_put_keyed("ft1", &["Person"], f2, &state)
+            .expect_err("duplicate Person 'Alice' must be a KeyConflict");
+        assert_eq!(conflict.name, "ft1");
+        assert_eq!(conflict.key, "Alice");
     }
 
     #[test]
@@ -1751,39 +1733,21 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    /// Post-task-820: see comment on the sibling
+    /// `test_uniqueness_violation_surfaces_via_cell_put_keyed_err` —
+    /// the constraint evaluator no longer detects UC violations on
+    /// keyed cells; the storage primitive does.
     #[test]
-    fn test_uniqueness_violation() {
-        let mut cells = empty_cells();
-        cells = with_ft(cells, "ft1", &FactTypeDef {
-            schema_id: String::new(),
-            reading: "Customer has Name".to_string(),
-            readings: vec![],
-            roles: vec![
-                RoleDef { noun_name: "Customer".to_string(), role_index: 0 },
-                RoleDef { noun_name: "Name".to_string(), role_index: 1 },
-            ],
-        });
-        cells = with_constraint(cells, &ConstraintDef {
-            id: "c1".to_string(),
-            kind: "UC".to_string(),
-            modality: "Alethic".to_string(),
-            deontic_operator: None,
-            text: "Each Customer has at most one Name".to_string(),
-            spans: vec![SpanDef { fact_type_id: "ft1".to_string(), role_index: 0, subset_autofill: None }],
-            set_comparison_argument_length: None,
-            clauses: None,
-            entity: None,
-            min_occurrence: None,
-            max_occurrence: None,
-            predicate: None,
-        });
-
-        let state = state_with_facts("ft1", &[&[("Customer", "c1"), ("Name", "Alice")], &[("Customer", "c1"), ("Name", "Bob")]]);
-
-        let (_meta_state, defs, def_map) = compile_cells(cells);
-        let result = eval_constraints_defs(&defs, &def_map, "", None, &state);
-        assert_eq!(result.len(), 1);
-        assert!(result[0].detail.contains("Uniqueness violation"));
+    fn test_uniqueness_violation_customer_via_cell_put_keyed_err() {
+        let f1 = ast::fact_from_pairs(&[("Customer", "c1"), ("Name", "Alice")]);
+        let f2 = ast::fact_from_pairs(&[("Customer", "c1"), ("Name", "Bob")]);
+        let state = ast::Object::phi();
+        let state = ast::cell_put_keyed("ft1", &["Customer"], f1, &state)
+            .expect("first put must succeed");
+        let conflict = ast::cell_put_keyed("ft1", &["Customer"], f2, &state)
+            .expect_err("duplicate Customer 'c1' must be a KeyConflict");
+        assert_eq!(conflict.name, "ft1");
+        assert_eq!(conflict.key, "c1");
     }
 
     #[test]
