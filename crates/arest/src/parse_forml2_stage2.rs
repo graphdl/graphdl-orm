@@ -2306,6 +2306,169 @@ fn extract_reference_scheme(text: &str, head_noun: &str) -> Option<String> {
     if cols.is_empty() { None } else { Some(cols.join(",")) }
 }
 
+/// task-737 — synthesise an alethic UC + MC pair from every
+/// reference-scheme declaration `Noun(.X) is an entity type.`.
+///
+/// In ORM 2 a reference scheme is shorthand for "the role X is the
+/// primary identifier of Noun". This expands into three constraints:
+///
+///   1. Each Noun has at most one X       (UC on the Noun role).
+///   2. Each Noun has at least one X      (MC on the Noun role).
+///   3. Each X identifies at most one Noun (UC on the X role).
+///
+/// Constraints 1 + 3 are the "key uniqueness" pair; constraint 2 is
+/// the mandatory-participation requirement. Without them the engine
+/// has nothing to compile into `CompiledSchema.key_roles` and
+/// `apply create` paths can land two facts with the same primary key
+/// without rejection.
+///
+/// This pass synthesises:
+///   * the primary fact type `<Noun>_has_<RefPart>` (when not already
+///     declared by the user as a Fact Type Reading);
+///   * the two Role facts for that FT;
+///   * one UC Constraint cell entry over the `<RefPart>` role
+///     (acceptance #1 of task-737);
+///   * one MC Constraint cell entry over the `<Noun>` role
+///     (matching acceptance #1's "MC entry over the same FT").
+///
+/// For compound reference schemes `Booking(.Year, .Course)` each
+/// component synthesises its own FT + UC + MC pair so every component
+/// becomes a unique identifier on its own — this matches the
+/// pre-#737 behaviour for single-part schemes when extended to
+/// multi-part schemes (a future task may move compound schemes to a
+/// single multi-span UC if the ORM 2 semantics warrant it).
+///
+/// Idempotent: if the user already declared `Noun has X` as a Fact
+/// Type Reading (so the FT and roles are already in the cells), the
+/// synthesiser reuses the existing FT id and only emits the two
+/// Constraint cell entries. The Constraint id is shaped
+/// `synth_uc_<noun>_<part>` / `synth_mc_<noun>_<part>` so the
+/// downstream check `enrich_constraints_with_spans` sees they
+/// already carry span bindings (we pre-populate spans here) and
+/// passes them through unchanged.
+fn synthesize_ref_scheme_constraints(
+    noun_facts: &[Object],
+    existing_ft_facts: &[Object],
+    existing_role_facts: &[Object],
+) -> (Vec<Object>, Vec<Object>, Vec<Object>) {
+    let mut new_fts: Vec<Object> = Vec::new();
+    let mut new_roles: Vec<Object> = Vec::new();
+    let mut new_constraints: Vec<Object> = Vec::new();
+
+    // Index existing FT ids so we don't re-declare an FT the user
+    // already provided via `Noun has X`.
+    let existing_ft_ids: hashbrown::HashSet<String> = existing_ft_facts.iter()
+        .filter_map(|f| binding(f, "id").map(String::from))
+        .collect();
+
+    // Index roles by (ft_id, position) so we can avoid duplicating
+    // Role facts when the FT is user-declared.
+    let mut roles_by_ft: hashbrown::HashMap<String, Vec<(usize, String)>> =
+        hashbrown::HashMap::new();
+    for r in existing_role_facts.iter() {
+        let (Some(ft), Some(pos_str), Some(noun)) = (
+            binding(r, "factType"),
+            binding(r, "position"),
+            binding(r, "nounName"),
+        ) else { continue };
+        let pos: usize = pos_str.parse().unwrap_or(0);
+        roles_by_ft.entry(ft.to_string()).or_default()
+            .push((pos, noun.to_string()));
+    }
+
+    // Helper: build the canonical FT id `<Noun>_has_<RefPart>` (parser
+    // convention — spaces become underscores; the verb "has" is the
+    // implicit predicate ORM uses for reference-scheme expansion).
+    let synth_ft_id = |noun: &str, part: &str| -> String {
+        alloc::format!("{}_has_{}",
+            noun.replace(' ', "_"),
+            part.replace(' ', "_"))
+    };
+
+    for noun_fact in noun_facts.iter() {
+        let Some(name) = binding(noun_fact, "name") else { continue };
+        let object_type = binding(noun_fact, "objectType").unwrap_or("entity");
+        // Only entity-type nouns get a key uniqueness constraint.
+        // Value-type nouns can have enum values but no key role.
+        if object_type != "entity" { continue; }
+        // Reference scheme is a comma-joined list of part names.
+        let Some(rs) = binding(noun_fact, "referenceScheme") else { continue };
+        let parts: Vec<String> = rs.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.is_empty() { continue; }
+
+        for part in parts.iter() {
+            let ft_id = synth_ft_id(name, part);
+            // Synthesise the FT only when it isn't already declared.
+            // Otherwise reuse the user-declared shape so constraint
+            // spans line up with the user-visible reading.
+            if !existing_ft_ids.contains(&ft_id)
+                && !new_fts.iter().any(|f| binding(f, "id") == Some(ft_id.as_str()))
+            {
+                let reading = alloc::format!("{} has {}", name, part);
+                new_fts.push(fact_from_pairs(&[
+                    ("id", ft_id.as_str()),
+                    ("reading", reading.as_str()),
+                    ("arity", "2"),
+                    // Marker so downstream debuggers can identify
+                    // synthetic ref-scheme FTs (task-737).
+                    ("synthetic", "refScheme"),
+                ]));
+                new_roles.push(fact_from_pairs(&[
+                    ("factType", ft_id.as_str()),
+                    ("nounName", name),
+                    ("position", "0"),
+                ]));
+                new_roles.push(fact_from_pairs(&[
+                    ("factType", ft_id.as_str()),
+                    ("nounName", part.as_str()),
+                    ("position", "1"),
+                ]));
+            }
+            // Pre-populated spans: this is the FT we just (possibly)
+            // synthesised; the UC scope is the identifying role
+            // (position 1, the RefPart) and the MC scope is the
+            // Noun role (position 0). `enrich_constraints_with_spans`
+            // sees `span0_factTypeId` already present and leaves the
+            // synthetic constraint alone.
+            let uc_id = alloc::format!("synth_uc_{}_{}", name, part);
+            let uc_text = alloc::format!(
+                "Each {} has at most one {}.", part, name);
+            new_constraints.push(fact_from_pairs(&[
+                ("id",                uc_id.as_str()),
+                ("kind",              "UC"),
+                ("modality",          "alethic"),
+                ("text",              uc_text.as_str()),
+                ("entity",            name),
+                ("span0_factTypeId",  ft_id.as_str()),
+                ("span0_roleIndex",   "1"),
+                ("span1_factTypeId",  ft_id.as_str()),
+                ("span1_roleIndex",   "1"),
+                ("synthetic",         "refScheme"),
+            ]));
+            let mc_id = alloc::format!("synth_mc_{}_{}", name, part);
+            let mc_text = alloc::format!(
+                "Each {} has at least one {}.", name, part);
+            new_constraints.push(fact_from_pairs(&[
+                ("id",                mc_id.as_str()),
+                ("kind",              "MC"),
+                ("modality",          "alethic"),
+                ("text",              mc_text.as_str()),
+                ("entity",            name),
+                ("span0_factTypeId",  ft_id.as_str()),
+                ("span0_roleIndex",   "0"),
+                ("span1_factTypeId",  ft_id.as_str()),
+                ("span1_roleIndex",   "0"),
+                ("synthetic",         "refScheme"),
+            ]));
+        }
+    }
+
+    (new_fts, new_roles, new_constraints)
+}
+
 /// Post-translator enrichment: emit `span0_factTypeId`/`span0_roleIndex`
 /// (plus `span1_*` mirroring span0 for the UC/MC/VC/FC legacy quirk)
 /// on every Constraint fact so `check.rs`, `command.rs`, and
@@ -5013,9 +5176,20 @@ fn parse_to_state_via_stage12_impl(
         ft_facts.push(ft_fact.clone());
         role_facts.extend(role_fs.clone());
     }
-    let mut constraint_facts: Vec<Object> = tt!("ring",
+    // task-737 — synthesise the alethic UC + MC pair (and, where the
+    // user hasn't already declared it, the primary FT itself) implied
+    // by every `Noun(.X) is an entity type.` reference-scheme
+    // declaration. Constraints flow into the Constraint cell so the
+    // existing compiler path picks them up like any user-declared UC.
+    let (synth_ref_fts, synth_ref_roles, synth_ref_constraints) =
+        tt!("ref_scheme_synth",
+            synthesize_ref_scheme_constraints(&noun_facts, &ft_facts, &role_facts));
+    ft_facts.extend(synth_ref_fts);
+    role_facts.extend(synth_ref_roles);
+    let mut constraint_facts: Vec<Object> = synth_ref_constraints;
+    constraint_facts.extend(tt!("ring",
         translate_ring_constraints_with_tables(
-            &classified, &idx, &ring_kinds, &conditional_matrix));
+            &classified, &idx, &ring_kinds, &conditional_matrix)));
     constraint_facts.extend(tt!("cardinality", translate_cardinality_constraints(&classified, &idx)));
     constraint_facts.extend(tt!("set", translate_set_constraints(&classified, &idx)));
     constraint_facts.extend(tt!("value_c", translate_value_constraints(&classified, &idx)));
@@ -5064,6 +5238,12 @@ fn parse_to_state_via_stage12_impl(
     // from the right and push `{Noun}_has_{Component}` cells carrying
     // the noun id + component value. command.rs / rmap read these.
     let compound_cells = compound_ref_component_cells(&noun_facts, &instance_fact_facts);
+    // task-737: single-part ref scheme `Noun(.X)` — push one
+    // `Noun_has_X: {Noun: id, X: id}` row per distinct instance-fact
+    // subject id. Without this, the synthesised alethic MC over
+    // `Noun_has_X` fires for every parsed instance fact, even though
+    // the entity is fully addressable through its other cells.
+    let single_part_cells = single_part_ref_component_cells(&noun_facts, &instance_fact_facts);
     // Per-field cells for instance facts: `emit_instance_fact` in the
     // legacy cascade writes every instance fact twice — once to the
     // canonical `InstanceFact` cell (stage12 already does this) AND
@@ -5087,6 +5267,23 @@ fn parse_to_state_via_stage12_impl(
     for (cell_name, facts) in compound_cells {
         map.insert(cell_name, Object::Seq(facts.into()));
     }
+    // task-737 single-part synthesised cells. Merge with any existing
+    // entry (the user may have declared `Noun has X` and pushed
+    // instance facts already, in which case those rows survive).
+    for (cell_name, facts) in single_part_cells {
+        map.entry(cell_name)
+            .and_modify(|existing| {
+                let mut all: Vec<Object> = existing.as_seq()
+                    .map(|s| s.to_vec()).unwrap_or_default();
+                for f in facts.iter() {
+                    if !all.iter().any(|e| e == f) {
+                        all.push(f.clone());
+                    }
+                }
+                *existing = Object::Seq(all.into());
+            })
+            .or_insert_with(|| Object::Seq(facts.into()));
+    }
     for (cell_name, facts) in per_field_cells {
         map.entry(cell_name)
             .and_modify(|existing| {
@@ -5098,6 +5295,99 @@ fn parse_to_state_via_stage12_impl(
             .or_insert_with(|| Object::Seq(facts.into()));
     }
     Ok(Object::Map(map.into()))
+}
+
+/// task-737 — for every single-part reference-scheme entity-type
+/// declaration `Noun(.X) is an entity type.`, project each subject id
+/// from an instance fact (or from existing `Noun_has_*` cells) into
+/// a `Noun_has_X` row `{Noun: id, X: id}`. This is the parse-time
+/// counterpart of `command.rs::create_via_defs`'s single-part push:
+/// without it, the synthesised MC over `Noun_has_X` fires on every
+/// Task '1' / Order 'ORD-1' / Customer 'acme' instance fact in
+/// readings that pre-date #737. Pre-existing `Noun_has_X` rows are
+/// preserved unchanged — the synthesiser only adds rows for subject
+/// ids not yet present, matching `cell_push_unique`'s set semantics.
+fn single_part_ref_component_cells(
+    noun_facts: &[Object],
+    instance_facts: &[Object],
+) -> Vec<(String, Vec<Object>)> {
+    // (noun_name, single_part_name) for entity nouns with arity 1.
+    let single: Vec<(String, String)> = noun_facts.iter()
+        .filter_map(|f| {
+            let name = binding(f, "name")?.to_string();
+            let object_type = binding(f, "objectType").unwrap_or("entity");
+            if object_type != "entity" { return None; }
+            let rs = binding(f, "referenceScheme")?;
+            let parts: Vec<String> = rs.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            (parts.len() == 1).then_some((name, parts.into_iter().next().unwrap()))
+        })
+        .collect();
+    if single.is_empty() { return Vec::new(); }
+
+    let mut out: hashbrown::HashMap<String, Vec<Object>> = hashbrown::HashMap::new();
+    for (noun_name, part) in &single {
+        let mut seen: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        // Walk every role of every instance fact and pick up ids
+        // whose role-noun matches `noun_name`. The subject (role 0)
+        // and object (role 1) live in distinct binding pairs; higher-
+        // arity instance facts encode role N as `roleNNoun` /
+        // `roleNValue`. A ring fact like `Task '1' blocks Task '2'`
+        // pushes Task=1 AND Task=2 — both ids need a `Task_has_id`
+        // row so the synthesised MC sees them participate.
+        for f in instance_facts.iter() {
+            // Subject (role 0).
+            if binding(f, "subjectNoun") == Some(noun_name.as_str()) {
+                if let Some(v) = binding(f, "subjectValue") {
+                    if !v.is_empty() && seen.insert(v.to_string()) {
+                        // queued
+                    }
+                }
+            }
+            // Object (role 1).
+            if binding(f, "objectNoun") == Some(noun_name.as_str()) {
+                if let Some(v) = binding(f, "objectValue") {
+                    if !v.is_empty() && seen.insert(v.to_string()) {
+                        // queued
+                    }
+                }
+            }
+            // Roles 2+ from the ternary+ encoding.
+            for n in 2..16 {
+                let role_key = alloc::format!("role{}Noun", n);
+                let val_key = alloc::format!("role{}Value", n);
+                match binding(f, &role_key) {
+                    Some(role_noun) if role_noun == noun_name.as_str() => {
+                        if let Some(v) = binding(f, &val_key) {
+                            if !v.is_empty() {
+                                seen.insert(v.to_string());
+                            }
+                        }
+                    }
+                    _ => break, // chain ends when roleN is absent
+                }
+            }
+        }
+        if seen.is_empty() { continue; }
+        let cell_name = alloc::format!("{}_has_{}",
+            noun_name.replace(' ', "_"),
+            part.replace(' ', "_"));
+        // Emit rows in id-sorted order for determinism (HashSet
+        // iteration order is platform-dependent and previously
+        // surfaced as flaky test ordering).
+        let mut ids: Vec<String> = seen.into_iter().collect();
+        ids.sort();
+        for id in &ids {
+            let fact = fact_from_pairs(&[
+                (noun_name.as_str(), id.as_str()),
+                (part.as_str(),     id.as_str()),
+            ]);
+            out.entry(cell_name.clone()).or_default().push(fact);
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// Decompose compound reference-scheme instance ids into component
@@ -6596,6 +6886,175 @@ mod tests {
         assert_eq!(binding(f, "kind"), Some("VC"));
         assert_eq!(binding(f, "modality"), Some("alethic"));
         assert_eq!(binding(f, "entity"), Some("Priority"));
+    }
+
+    // ------------------------------------------------------------------
+    // task-737 — `Noun(.X) is an entity type.` must synthesise the
+    // alethic UC + MC pair (and the primary FT) the reference scheme
+    // implies. Without these, two `apply create Task id='999'` calls
+    // silently both succeed and the resulting cell ends up with two
+    // facts under the same key — substrate corruption per ORM 2's
+    // reference-scheme semantics.
+    // ------------------------------------------------------------------
+
+    /// Acceptance criterion #1 of task-737. Parsing `Task(.id) is an
+    /// entity type.` must populate the Constraint cell with an alethic
+    /// UC entry over the identifying role (the id role at position 1
+    /// of the synthetic `Task_has_id` FT) and an alethic MC entry over
+    /// the same FT (the Task role at position 0).
+    #[test]
+    fn ref_scheme_declaration_synthesises_uc_and_mc_alethic_constraints() {
+        let state = super::parse_to_state_via_stage12(
+            "Task(.id) is an entity type.\n"
+        ).expect("parse_to_state_via_stage12");
+        let constraints = fetch_or_phi("Constraint", &state);
+        let entries: Vec<&Object> = constraints.as_seq()
+            .map(|s| s.iter().collect()).unwrap_or_default();
+
+        // Find the alethic UC over Task's id role.
+        let uc = entries.iter().find(|c| {
+            binding(c, "kind") == Some("UC")
+                && binding(c, "modality") == Some("alethic")
+                && binding(c, "entity") == Some("Task")
+                && binding(c, "span0_factTypeId") == Some("Task_has_id")
+                && binding(c, "span0_roleIndex") == Some("1")
+        });
+        assert!(uc.is_some(),
+            "expected synthesised alethic UC over Task_has_id's id role (position 1); \
+             got constraints {:?}",
+            entries.iter().map(|c| (
+                binding(c, "id"), binding(c, "kind"),
+                binding(c, "modality"), binding(c, "span0_factTypeId"),
+                binding(c, "span0_roleIndex"),
+            )).collect::<Vec<_>>());
+
+        // Find the alethic MC over Task's Task role.
+        let mc = entries.iter().find(|c| {
+            binding(c, "kind") == Some("MC")
+                && binding(c, "modality") == Some("alethic")
+                && binding(c, "entity") == Some("Task")
+                && binding(c, "span0_factTypeId") == Some("Task_has_id")
+                && binding(c, "span0_roleIndex") == Some("0")
+        });
+        assert!(mc.is_some(),
+            "expected synthesised alethic MC over Task_has_id's Task role (position 0); \
+             got constraints {:?}",
+            entries.iter().map(|c| (
+                binding(c, "id"), binding(c, "kind"),
+                binding(c, "modality"), binding(c, "span0_factTypeId"),
+                binding(c, "span0_roleIndex"),
+            )).collect::<Vec<_>>());
+    }
+
+    /// Acceptance criterion #1 follow-up: the synthetic `Task_has_id`
+    /// fact type and its two roles must also be present in the
+    /// FactType / Role cells so downstream resolvers and compile-time
+    /// schema construction sees the FT.
+    #[test]
+    fn ref_scheme_declaration_synthesises_primary_fact_type_and_roles() {
+        let state = super::parse_to_state_via_stage12(
+            "Task(.id) is an entity type.\n"
+        ).expect("parse_to_state_via_stage12");
+        let ft_cell = fetch_or_phi("FactType", &state);
+        let fts: Vec<&Object> = ft_cell.as_seq()
+            .map(|s| s.iter().collect()).unwrap_or_default();
+        let ft = fts.iter().find(|f| binding(f, "id") == Some("Task_has_id"));
+        assert!(ft.is_some(),
+            "synthetic Task_has_id FT must be present; got {:?}",
+            fts.iter().filter_map(|f| binding(f, "id")).collect::<Vec<_>>());
+
+        let role_cell = fetch_or_phi("Role", &state);
+        let roles: Vec<&Object> = role_cell.as_seq()
+            .map(|s| s.iter().collect()).unwrap_or_default();
+        let task_role = roles.iter().find(|r| {
+            binding(r, "factType") == Some("Task_has_id")
+                && binding(r, "nounName") == Some("Task")
+                && binding(r, "position") == Some("0")
+        });
+        let id_role = roles.iter().find(|r| {
+            binding(r, "factType") == Some("Task_has_id")
+                && binding(r, "nounName") == Some("id")
+                && binding(r, "position") == Some("1")
+        });
+        assert!(task_role.is_some() && id_role.is_some(),
+            "both Task (pos 0) and id (pos 1) Role facts must exist on Task_has_id; \
+             roles for Task_has_id: {:?}",
+            roles.iter().filter(|r| binding(r, "factType") == Some("Task_has_id"))
+                .map(|r| (binding(r, "nounName"), binding(r, "position")))
+                .collect::<Vec<_>>());
+    }
+
+    /// Idempotency: when the user explicitly declares the
+    /// `Task has id` reading themselves, the synthesiser must reuse
+    /// the user-declared FT id rather than emit a duplicate. Both the
+    /// UC and MC constraints should still appear, attached to the
+    /// existing FT.
+    #[test]
+    fn ref_scheme_reuses_user_declared_primary_fact_type_for_uc_and_mc() {
+        let state = super::parse_to_state_via_stage12(
+            "Task(.id) is an entity type.\nTask has id.\n"
+        ).expect("parse_to_state_via_stage12");
+        let ft_cell = fetch_or_phi("FactType", &state);
+        let task_has_id_count = ft_cell.as_seq()
+            .map(|s| s.iter().filter(|f| binding(f, "id") == Some("Task_has_id")).count())
+            .unwrap_or(0);
+        assert_eq!(task_has_id_count, 1,
+            "expected exactly one Task_has_id FT entry; got {} \
+             (user declaration must not be duplicated by the ref-scheme synthesiser)",
+            task_has_id_count);
+        // UC + MC still synthesised.
+        let constraints = fetch_or_phi("Constraint", &state);
+        let synth_uc = constraints.as_seq().map(|s| s.iter()
+            .any(|c| binding(c, "kind") == Some("UC")
+                && binding(c, "modality") == Some("alethic")
+                && binding(c, "span0_factTypeId") == Some("Task_has_id")
+                && binding(c, "synthetic") == Some("refScheme")))
+            .unwrap_or(false);
+        let synth_mc = constraints.as_seq().map(|s| s.iter()
+            .any(|c| binding(c, "kind") == Some("MC")
+                && binding(c, "modality") == Some("alethic")
+                && binding(c, "span0_factTypeId") == Some("Task_has_id")
+                && binding(c, "synthetic") == Some("refScheme")))
+            .unwrap_or(false);
+        assert!(synth_uc && synth_mc,
+            "synthetic UC+MC must still flow into the Constraint cell \
+             even when the FT was user-declared (synth_uc={}, synth_mc={})",
+            synth_uc, synth_mc);
+    }
+
+    /// Value-type nouns must NOT trigger ref-scheme synthesis even
+    /// when they end up with an `enumValues` binding — only entity
+    /// types have a primary identifier. (Belt-and-braces; the
+    /// synthesiser already gates on objectType="entity", but a future
+    /// refactor might lift the gate by accident.)
+    #[test]
+    fn ref_scheme_synthesis_skips_value_type_nouns() {
+        let state = super::parse_to_state_via_stage12(
+            "Priority is a value type.\n\
+             The possible values of Priority are 'low', 'medium', 'high'.\n"
+        ).expect("parse_to_state_via_stage12");
+        let ft_cell = fetch_or_phi("FactType", &state);
+        // No `Priority_has_*` FT should appear from synthesis.
+        let synthetic = ft_cell.as_seq().map(|s| s.iter()
+            .any(|f| binding(f, "synthetic") == Some("refScheme")))
+            .unwrap_or(false);
+        assert!(!synthetic,
+            "value-type Priority must not trigger ref-scheme synthesis");
+    }
+
+    /// Acceptance criterion #2 of task-737. After compile, the
+    /// `Task_has_id` FT's `CompiledSchema.key_roles` must reflect the
+    /// synthesised alethic UC — the identifying role is position 1.
+    #[test]
+    fn ref_scheme_compile_populates_key_roles_on_primary_fact_type() {
+        let state = super::parse_to_state_via_stage12(
+            "Task(.id) is an entity type.\n"
+        ).expect("parse_to_state_via_stage12");
+        let data = crate::compile::cell_index_from_state(&state);
+        let key_roles = crate::compile::resolve_key_roles_for_ft(
+            "Task_has_id", &data.constraints);
+        assert_eq!(key_roles, Some(alloc::vec![1]),
+            "Task_has_id key_roles must be Some([1]); got {:?}", key_roles);
     }
 
     // ------------------------------------------------------------------

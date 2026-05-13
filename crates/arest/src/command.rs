@@ -772,10 +772,25 @@ fn create_via_defs(
         .collect();
     let mut fact_events: Vec<String> = Vec::new();
     let resolved = fields_with_domain.iter().fold(state.clone(), |acc, (field_name, value)| {
+        let lower = field_name.to_lowercase();
         let ft_id_obj = ast::apply(&ast::Func::Def(format!("resolve:{}", noun)),
-            &ast::Object::atom(&field_name.to_lowercase()), d);
-        let ft_id = ft_id_obj.as_atom().map(|s| s.to_string())
-            .unwrap_or_else(|| format!("{}_has_{}", noun, field_name));
+            &ast::Object::atom(&lower), d);
+        // task-737: the resolve chain terminates in `Func::Id`, which
+        // echoes the input atom back when no condition matches. Treat
+        // an echoed input as a miss and fall through to
+        // `<Noun>_has_<Field>`. Pre-#737 most ref-scheme nouns had no
+        // emitted `resolve:{noun}` def at all, so `apply` returned
+        // Bottom and the fallback fired implicitly; now that the
+        // synthesiser guarantees a primary FT, `resolve:{noun}` is
+        // always present and we have to detect the no-match case
+        // ourselves. (Encoding `Func::Constant(Object::Bottom)` as the
+        // terminator collapses the whole encoded def to ⊥ via
+        // §11.2.1 bottom-preservation, so a sentinel-atom approach is
+        // the available path.)
+        let ft_id = match ft_id_obj.as_atom() {
+            Some(s) if s != lower => s.to_string(),
+            _ => format!("{}_has_{}", noun, field_name),
+        };
         fact_events.push(ft_id.clone());
         let fact = ast::fact_from_pairs(&[(noun, &entity_id), (field_name, value)]);
         push_with_uc_check(acc, &ft_id, fact, &key_roles, /*overwrite=*/false, &mut uc_violations)
@@ -1449,18 +1464,24 @@ fn update_via_defs(
     // will not ship an entry for them, preserving the prior chain entry.
     let resolve_key = format!("resolve:{}", noun);
     let new_state = new_fields.iter().fold(state.clone(), |acc, (field_name, value)| {
-        let ft_id = def_func(&resolve_key, d)
-            .map(|f| ast::apply(&f, &ast::Object::atom(&field_name.to_lowercase()), d))
-            .and_then(|o| o.as_atom().map(|s| s.to_string()))
-            .unwrap_or_else(|| format!("{}_has_{}", noun, field_name));
+        let lower = field_name.to_lowercase();
+        let resolved = def_func(&resolve_key, d)
+            .map(|f| ast::apply(&f, &ast::Object::atom(&lower), d));
+        // task-737: identical Func::Id-echo handling to `create_via_defs`.
+        // A miss in the resolve chain returns the input atom; treat that
+        // as a no-mapping and fall through to `<Noun>_has_<Field>`.
+        let ft_id = match resolved.and_then(|o| o.as_atom().map(|s| s.to_string())) {
+            Some(s) if s != lower => s,
+            _ => format!("{}_has_{}", noun, field_name),
+        };
         let fact = ast::fact_from_pairs(&[(noun, entity_id), (field_name.as_str(), value.as_str())]);
         if key_roles.contains_key(&ft_id) {
-            // Keyed (Map-backed) cell: skip the entity-scoped Seq
-            // filter (it can't traverse Map storage anyway) and route
-            // through `push_with_uc_check` with overwrite. The helper
-            // detects byte-equal re-assertion (no-op, returns `state`
-            // unchanged) and otherwise vacates the slot via
-            // `drop_keyed_entry` before re-asserting the new fact.
+            // task-822: keyed (Map-backed) cell. Skip the entity-scoped
+            // Seq filter (it can't traverse Map storage anyway) and
+            // route through `push_with_uc_check` with overwrite. The
+            // helper detects byte-equal re-assertion (no-op) and
+            // otherwise vacates the slot via `drop_keyed_entry` before
+            // re-asserting the new fact.
             push_with_uc_check(acc, &ft_id, fact, &key_roles, /*overwrite=*/true, &mut uc_violations)
         } else {
             // Legacy Seq cell: filter out this entity's prior fact(s),
@@ -3230,6 +3251,71 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         assert!(ast::binding(&sm_facts[0], "Status") == Some("Draft"));
     }
 
+    /// task-737 — acceptance criterion #3. Two `apply create Task`
+    /// calls with the same explicit `id='999'` must surface an
+    /// alethic UC violation on the second call and leave the first
+    /// fact in place. Pre-#737 both creates silently succeeded and
+    /// the resulting cells held two facts per cell — substrate
+    /// corruption per ORM 2 reference-scheme semantics.
+    #[test]
+    fn create_with_duplicate_explicit_id_rejects_second_with_uc_violation() {
+        let src = "Task(.id) is an entity type.\nTask has Description.\n";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_map = ast::defs_to_state(&defs, &state);
+
+        // First create: explicit id='999'. Must succeed.
+        let mut fields = HashMap::new();
+        fields.insert("Description".to_string(), "first".to_string());
+        let create1 = Command::CreateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            id: Some("999".to_string()),
+            fields,
+            sender: None,
+            signature: None,
+        };
+        let result1 = apply_command_defs(&def_map, &create1, &state);
+        assert!(!result1.rejected,
+            "first create must succeed; violations={:?}", result1.violations);
+        let state_after_first = ast::merge_states(&state, &result1.state);
+
+        // Second create: same explicit id='999'. Must surface a UC
+        // violation and reject; the first Task remains intact.
+        let mut fields2 = HashMap::new();
+        fields2.insert("Description".to_string(), "second".to_string());
+        let create2 = Command::CreateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            id: Some("999".to_string()),
+            fields: fields2,
+            sender: None,
+            signature: None,
+        };
+        let result2 = apply_command_defs(&def_map, &create2, &state_after_first);
+        assert!(result2.rejected,
+            "second create with the same id must be rejected; \
+             violations={:?}", result2.violations);
+        assert!(result2.violations.iter().any(|v| v.alethic),
+            "must surface at least one alethic violation; got {:?}",
+            result2.violations);
+
+        // First fact retained: the Description from create1 still
+        // sits in `Task_has_Description`.
+        let desc_cell = ast::fetch_or_phi("Task_has_Description", &state_after_first);
+        let entries: Vec<&ast::Object> = desc_cell.as_seq()
+            .map(|s| s.iter().collect()).unwrap_or_default();
+        let task_999_desc: Option<String> = entries.iter()
+            .find(|f| ast::binding(f, "Task") == Some("999"))
+            .and_then(|f| ast::binding(f, "Description").map(String::from));
+        assert_eq!(task_999_desc.as_deref(), Some("first"),
+            "the first Task '999''s Description must remain 'first' \
+             (the rejected second create must not have replaced or \
+             extended it); got {:?}; entries={:?}",
+            task_999_desc, entries);
+    }
+
     /// #828 — apply path must run the 2-stratum forward chain that
     /// `cli/entry.rs` runs after compile. Otherwise negation rules
     /// emitted under `derivation_strat2:rule_*` are filtered out by
@@ -4001,7 +4087,11 @@ Transition 'start' is defined in State Machine Definition 'Task'.
         assert_eq!(result.entities[0].entity_type, "ReadingLoaded");
         assert_eq!(result.entities[0].data["name"], "catalog");
         assert_eq!(result.entities[0].data["addedNouns"], "Product");
-        assert_eq!(result.derived_count, 1);
+        // task-737: derived_count = added nouns + added fact types + added
+        // derivations. `Product(.SKU) is an entity type.` synthesises the
+        // primary `Product_has_SKU` FT (acceptance #1 of task-737), so the
+        // count is 1 noun + 1 synthetic FT = 2. Pre-#737 the count was 1.
+        assert_eq!(result.derived_count, 2);
         // Delta carries cell mutations.
         assert_ne!(result.state, ast::Object::phi());
     }

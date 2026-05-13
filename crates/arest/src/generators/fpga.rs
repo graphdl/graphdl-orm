@@ -2146,9 +2146,17 @@ Supplier supplies Widget.
         assert!(verilog.contains("module widget"));
         assert!(verilog.contains("module supplier"));
         assert!(verilog.contains("module top"));
-        assert_eq!(verilog.matches("module ").count(),
-                   verilog.matches("endmodule").count(),
-                   "module/endmodule mismatch:\n{}", verilog);
+        // task-737: line-anchored count — substring counting is flaky
+        // against comments like "module synthesisable" inside UC bodies.
+        let modules = verilog.lines()
+            .filter(|l| l.trim_start().starts_with("module "))
+            .count();
+        let endmodules = verilog.lines()
+            .filter(|l| l.trim() == "endmodule")
+            .count();
+        assert_eq!(modules, endmodules,
+            "module/endmodule line-anchored mismatch ({} vs {}):\n{}",
+            modules, endmodules, verilog);
     }
 
     /// Verilog output is well-formed: every module has clk/rst_n ports,
@@ -2166,12 +2174,22 @@ Supplier supplies Widget.
         assert!(verilog.contains("input wire clk"));
         assert!(verilog.contains("input wire rst_n"));
         assert!(verilog.contains("output reg valid"));
-        // Balanced module/endmodule
-        assert_eq!(
-            verilog.matches("module ").count(),
-            verilog.matches("endmodule").count(),
-            "module/endmodule count mismatch:\n{}", verilog
-        );
+        // Balanced module/endmodule. Anchor on line starts so prose
+        // comments inside module bodies (e.g. "module synthesisable")
+        // don't trip the count — pre-#737 only one constraint module
+        // existed so the substring match accidentally balanced;
+        // task-737's ref-scheme synthesis emits the primary FT's UC
+        // module, which carries the same comment and tipped the
+        // substring count over.
+        let modules = verilog.lines()
+            .filter(|l| l.trim_start().starts_with("module "))
+            .count();
+        let endmodules = verilog.lines()
+            .filter(|l| l.trim() == "endmodule")
+            .count();
+        assert_eq!(modules, endmodules,
+            "module/endmodule line-anchored count mismatch ({} vs {}):\n{}",
+            modules, endmodules, verilog);
     }
 
     // ── Top-level module wiring ────────────────────────────────────

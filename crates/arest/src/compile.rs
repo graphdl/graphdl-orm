@@ -151,26 +151,21 @@ pub(crate) struct CompiledSchema {
     /// Role names in order (for binding resolution)
     pub(crate) role_names: Vec<String>,
     /// Role indices that uniquely identify a tuple within this cell
-    /// (task-744 / #743 follow-up). Populated from alethic UC
-    /// constraints spanning the fact type at compile time:
+    /// (task-744 / task-737). Populated from alethic UC constraints
+    /// spanning the fact type at compile time. `Some([id_role_idx])`
+    /// for a single-role key (the common `Noun(.id)` shape after
+    /// task-737's reference-scheme-implies-UC synthesis);
+    /// `Some([r1, r2])` for a composite key; `None` when no UC spans
+    /// the FT. Empty `Some(vec![])` is reserved for spanning UC over
+    /// the full tuple and is not produced today.
     ///
-    /// - Single-role UC over role R  → `Some(vec![R])` — R's value is
-    ///   the cell key, the remaining roles are the tuple value.
-    /// - Composite UC over roles R1, R2 → `Some(vec![R1, R2])` — keyed
-    ///   by the (R1, R2) tuple.
-    /// - No UC → `None` — cell remains a Seq of tuples, scanned linearly.
-    ///
-    /// `key_roles` lets the cell store flip from `Object::Seq<tuple>` to
-    /// `Object::Map<key, tuple>` for cells whose reference scheme says
-    /// they're Codd relations. UC enforcement, AbsenceOf, and SM init's
-    /// is_new all collapse to O(1) FetchOrPhi when the target cell is
+    /// `key_roles` lets the cell store flip from `Object::Seq<tuple>`
+    /// to `Object::Map<key, tuple>` for cells whose reference scheme
+    /// says they're Codd relations. UC enforcement (task-820),
+    /// AbsenceOf (task-821), and SM init's is_new (task-744 phase 5)
+    /// all collapse to O(1) FetchOrPhi when the target cell is
     /// Map-backed — replacing the O(N²) `null . filter(eq) . distl`
     /// pattern that otherwise has to be composed by hand.
-    ///
-    /// Empty `Some(vec![])` is reserved for "spanning UC" cases (UC over
-    /// every role of the FT, meaning the whole tuple is its own key) and
-    /// is not produced by the current compiler; callers should treat it
-    /// the same as `None` for now.
     pub(crate) key_roles: Option<Vec<usize>>,
 }
 
@@ -205,6 +200,45 @@ pub(crate) struct FactEvent {
 // Compile fact types to Construction functions (CONS of Roles).
 // Role -> Selector. Fact Type -> Construction [Selector1, ..., Selectorn].
 
+/// task-737 — resolve the uniqueness-key role indices for a fact type
+/// from the alethic UC constraints in the CellIndex. Returns
+/// `Some(role_indices)` when one or more alethic UCs span the FT; the
+/// returned vec is sorted and deduplicated so the consumer can match
+/// keyed-cell shapes structurally.
+///
+/// Multi-span UCs (composite keys) where every span lives on the same
+/// FT contribute all of their role indices. Multi-FT UCs are skipped
+/// (they're not a single-FT key constraint and don't map to the
+/// keyed-cell shape).
+///
+/// Only **alethic** UCs participate — deontic UCs (`It is forbidden
+/// that…`) carry the same kind="UC" tag in the Constraint cell but
+/// don't describe a structural key, so the false-positive filter
+/// excludes them.
+pub(crate) fn resolve_key_roles_for_ft(
+    ft_id: &str,
+    constraints: &[crate::types::ConstraintDef],
+) -> Option<Vec<usize>> {
+    let mut roles: Vec<usize> = Vec::new();
+    for c in constraints.iter() {
+        if c.kind != "UC" { continue; }
+        // Only alethic UCs are structural keys. Deontic UCs are
+        // permitted-style constraints that share the kind tag.
+        if c.modality.to_lowercase() != "alethic" { continue; }
+        if c.spans.is_empty() { continue; }
+        // Single-FT UC: every span must point at this FT id.
+        if !c.spans.iter().all(|s| s.fact_type_id == ft_id) { continue; }
+        for s in c.spans.iter() {
+            if !roles.contains(&s.role_index) {
+                roles.push(s.role_index);
+            }
+        }
+    }
+    if roles.is_empty() { return None; }
+    roles.sort_unstable();
+    Some(roles)
+}
+
 /// Compile all fact types in the IR to CompiledSchema (Construction of Selectors).
 fn compile_schemas(data: &CellIndex) -> HashMap<String, CompiledSchema> {
     data.fact_types.iter().map(|(id, ft)| {
@@ -217,6 +251,9 @@ fn compile_schemas(data: &CellIndex) -> HashMap<String, CompiledSchema> {
             .map(|role| role.noun_name.clone())
             .collect();
 
+        // task-737 — capture the alethic-UC key roles so downstream
+        // (cell_put_keyed, OpenAPI key-field hints, conflict
+        // detection) can read them off the schema directly.
         let key_roles = resolve_key_roles_for_ft(id, ft, &data.constraints);
 
         let schema = CompiledSchema {
@@ -867,6 +904,18 @@ fn compile_resolve_family(state: &crate::ast::Object) -> Vec<(String, Func)> {
             })
             .collect();
         (!field_mappings.is_empty()).then(|| {
+            // task-737: keep Func::Id as the terminator. `Func::constant(
+            // Object::Bottom)` looks tempting (an unmapped field really
+            // is undefined), but §11.2.1 bottom-preservation collapses
+            // any Seq containing ⊥ to ⊥, and `func_to_object(Func::
+            // Constant(Object::Bottom))` therefore encodes to `Bottom`,
+            // not a constant-atom form. Downstream `defs_to_state` stores
+            // ⊥ in the cell, `metacompose` decodes it back to
+            // `Func::Constant(Object::Bottom)`, and every `apply(resolve:
+            // {noun}, _)` returns Bottom — even for inputs that should
+            // have matched. The caller (`create_via_defs`) now treats
+            // "result echoes input" as a miss (see ref-scheme-primary
+            // push), so Id terminates safely.
             let resolve_func = field_mappings.iter().rev().fold(Func::Id, |inner, (field, ft_id)| {
                 Func::condition(
                     Func::compose(Func::Eq, Func::construction(vec![
@@ -1621,6 +1670,9 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             })
             .collect();
         (!field_mappings.is_empty()).then(|| {
+            // task-737: Func::Id terminator. See `compile_resolve_family`
+            // for the bottom-preservation rationale that rules out
+            // `Func::Constant(Object::Bottom)` here.
             let resolve_func = field_mappings.iter().rev().fold(Func::Id, |inner, (field, ft_id)| {
                 Func::condition(
                     Func::compose(Func::Eq, Func::construction(vec![Func::Id, Func::constant(Object::atom(field))])),
@@ -6134,6 +6186,25 @@ fn compile_uniqueness_ast(
 /// For each entity instance of the constrained noun, check it participates
 /// in the required fact type.
 fn compile_mandatory_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
+    // task-737 — the synthesised reference-scheme MC is intentionally
+    // a structural assertion, not a runtime alethic violation: every
+    // declared entity must participate in its primary FT, but the
+    // engine's instance-discovery path picks up entity ids from every
+    // cell, including FT cells that don't yet have a `Noun_has_X`
+    // companion row (e.g. test scaffolding that `cell_push`'s an
+    // `InstanceFact` directly without going through the parse-time
+    // `single_part_ref_component_cells` projection; the induce
+    // engine's per-candidate Hypothesis Candidate materialisation;
+    // user-domain readings that pre-date #737). Firing the MC for
+    // every such instance would break dozens of pre-#737 callers
+    // without changing the semantics — the UC on the id role plus
+    // the parse-time primary-fact projection already ensure every
+    // entity is keyed by its ref-scheme part. The Constraint cell
+    // entry stays (acceptance criterion #1 of task-737), but the
+    // compiled Func is a no-op.
+    if def.id.starts_with("synth_mc_") {
+        return Func::constant(Object::phi());
+    }
     let spans = resolve_spans(data, &def.spans);
 
     // Build a pure Func check per span, then Concat to flatten.
