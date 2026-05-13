@@ -3253,10 +3253,20 @@ fn platform_create(noun: &str, x: &Object, d: &Object) -> Object {
 
 /// Platform primitive: update entity from fact pairs.
 /// Key: "update:{noun}". Input: <<id, val>, <field, val>, ...>.
+///
+/// task-861 / #904: a "force" key in the pair list is hoisted out
+/// of `fields` and set on the Command's `force` flag (matches the
+/// MCP `force: true` opt-out convention). When the SM-bypass guard
+/// would otherwise refuse the update, "force" lets the call go
+/// through. The field value is interpreted truth-loosely: any value
+/// other than "false" / "0" / "" counts as true.
 #[cfg(not(feature = "no_std"))]
 fn platform_update(noun: &str, x: &Object, d: &Object) -> Object {
-    let (id, fields) = extract_fact_pairs(x);
+    let (id, mut fields) = extract_fact_pairs(x);
     let entity_id = id.unwrap_or_default();
+    let force = fields.remove("force").map_or(false, |v| {
+        !matches!(v.as_str(), "false" | "0" | "")
+    });
     let command = crate::command::Command::UpdateEntity {
         noun: noun.to_string(),
         domain: String::new(),
@@ -3264,6 +3274,7 @@ fn platform_update(noun: &str, x: &Object, d: &Object) -> Object {
         fields,
         sender: None,
         signature: None,
+        force,
     };
     let result = crate::command::apply_command_defs(d, &command, d);
     crate::command::encode_command_result(&result)
@@ -3527,7 +3538,7 @@ fn command_field_overflow(command: &crate::command::Command) -> Option<&'static 
             match signature.as_deref().map(over).unwrap_or(false) { true => return Some("signature"), false => {} }
             None
         }
-        Command::UpdateEntity { noun, domain, entity_id, fields, sender, signature } => {
+        Command::UpdateEntity { noun, domain, entity_id, fields, sender, signature, force: _ } => {
             match over(noun) { true => return Some("noun"), false => {} }
             match over(domain) { true => return Some("domain"), false => {} }
             match over(entity_id) { true => return Some("entityId"), false => {} }
@@ -9290,6 +9301,7 @@ mod tests {
             fields: ok_map(),
             sender: None,
             signature: None,
+            force: false,
         };
         assert_eq!(command_field_overflow(&cmd), Some("noun"));
     }
@@ -9303,6 +9315,7 @@ mod tests {
             fields: ok_map(),
             sender: None,
             signature: None,
+            force: false,
         };
         assert_eq!(command_field_overflow(&cmd), Some("domain"));
     }
@@ -9316,6 +9329,7 @@ mod tests {
             fields: ok_map(),
             sender: None,
             signature: None,
+            force: false,
         };
         assert_eq!(command_field_overflow(&cmd), Some("entityId"));
     }
@@ -9331,6 +9345,7 @@ mod tests {
             fields,
             sender: None,
             signature: None,
+            force: false,
         };
         assert_eq!(command_field_overflow(&cmd), Some("fields"));
     }
@@ -9346,6 +9361,7 @@ mod tests {
             fields,
             sender: None,
             signature: None,
+            force: false,
         };
         assert_eq!(command_field_overflow(&cmd), Some("fields"));
     }
@@ -9359,6 +9375,7 @@ mod tests {
             fields: ok_map(),
             sender: Some(huge()),
             signature: None,
+            force: false,
         };
         assert_eq!(command_field_overflow(&cmd), Some("sender"));
     }
@@ -9372,6 +9389,7 @@ mod tests {
             fields: ok_map(),
             sender: None,
             signature: Some(huge()),
+            force: false,
         };
         assert_eq!(command_field_overflow(&cmd), Some("signature"));
     }
@@ -9385,6 +9403,7 @@ mod tests {
             fields: ok_map(),
             sender: Some("u1".into()),
             signature: Some("sig".into()),
+            force: false,
         };
         assert_eq!(command_field_overflow(&cmd), None);
     }

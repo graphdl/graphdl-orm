@@ -93,7 +93,7 @@ fn arb_update() -> impl Strategy<Value = Command> {
         arb_field_map(),
         proptest::option::of(arb_short_str(32)),  // sender
     ).prop_map(|(noun, domain, entity_id, fields, sender)| {
-        Command::UpdateEntity { noun, domain, entity_id, fields, sender, signature: None }
+        Command::UpdateEntity { noun, domain, entity_id, fields, sender, signature: None, force: false }
     })
 }
 

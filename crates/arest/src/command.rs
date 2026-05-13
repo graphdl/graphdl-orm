@@ -120,6 +120,16 @@ pub enum Command {
         signature: Option<String>,
     },
     /// is-upd: update entity fields (<->F  .  [upd, defs])
+    ///
+    /// `force` (#904 / task-861): opt-out of the SM-bypass guard. The
+    /// engine refuses `apply update` when the payload sets the SM's
+    /// status-role field (e.g. `Task Status` for a Task whose SM is
+    /// declared via `State Machine Definition 'Task' is for Noun 'Task'`)
+    /// because the SM cell is the canonical status — direct mutation
+    /// would silently desync any derivation that reads the status.
+    /// Setting `force: true` bypasses the guard for migration scripts
+    /// and admin entity-restore flows. The default (`false`) refuses
+    /// and points the caller at `apply transition` instead.
     UpdateEntity {
         noun: String,
         domain: String,
@@ -130,6 +140,8 @@ pub enum Command {
         sender: Option<String>,
         #[serde(default)]
         signature: Option<String>,
+        #[serde(default)]
+        force: bool,
     },
     /// is-chg: install or update readings (modify definitions D)
     LoadReadings {
@@ -543,8 +555,8 @@ pub fn apply_command_defs(
         Command::Query { schema_id, domain: _, target, bindings, sender: _, signature: _ } => {
             query_via_defs(d, schema_id, target, bindings, state)
         }
-        Command::UpdateEntity { noun, domain, entity_id, fields, sender: _, signature: _ } => {
-            update_via_defs(d, noun, domain, entity_id, fields, state)
+        Command::UpdateEntity { noun, domain, entity_id, fields, sender: _, signature: _, force } => {
+            update_via_defs(d, noun, domain, entity_id, fields, *force, state)
         }
         Command::LoadReadings { markdown, domain, sender: _, signature: _ } => {
             apply_load_readings(markdown, domain, d, state)
@@ -1304,8 +1316,68 @@ fn update_via_defs(
     _domain: &str,
     entity_id: &str,
     new_fields: &hashbrown::HashMap<String, String>,
+    force: bool,
     state: &ast::Object,
 ) -> CommandResult {
+    // task-861 / #904 — SM-bypass guard. When the noun has a State
+    // Machine bound to it AND the update payload sets the SM's
+    // status-role field (by convention `{noun} Status`, e.g.
+    // `Task Status` for a Task whose SM is declared via
+    // `State Machine Definition 'Task' is for Noun 'Task'`), refuse
+    // the update with an alethic violation that names the SM and
+    // points the caller at `apply transition` instead. The SM cell
+    // (StateMachine_has_currentlyInStatus) is the canonical status —
+    // direct mutation desyncs any derivation reading SM state.
+    //
+    // Lookup: presence of `machine:{noun}` in D (compiled by
+    // `compile_state_machine_from_cells`) means the noun is
+    // SM-governed. Status-role convention is shared with the MCP
+    // guard at src/mcp/server.ts (`findSmStatusField`).
+    //
+    // Opt-out: `force: true` bypasses the guard (migration scripts,
+    // admin restore flows). Matches the MCP convention from #904.
+    if !force {
+        // Use `fetch` (returns Bottom when absent) — `fetch_or_phi`
+        // would degrade absent to `phi()`, which is NOT equal to
+        // Bottom, so the guard would fire even on SM-less nouns.
+        let has_sm = ast::fetch(&format!("machine:{}", noun), d) != ast::Object::Bottom;
+        if has_sm {
+            let status_field = format!("{} Status", noun);
+            if new_fields.contains_key(&status_field) {
+                let violation = crate::types::Violation {
+                    constraint_id: format!("sm:{}:status_immutable", noun),
+                    constraint_text: format!(
+                        "{} Status is governed by the '{}' state machine",
+                        noun, noun
+                    ),
+                    detail: format!(
+                        "{} Status is SM-driven; use apply transition with an event instead",
+                        noun
+                    ),
+                    alethic: true,
+                };
+                let sm_id = entity_id.to_string();
+                let status = extract_sm_status(state, &sm_id);
+                let transitions = hateoas_via_rho(d, noun, entity_id, status.as_deref());
+                let navigation = nav_links_via_rho(d, noun, entity_id);
+                return CommandResult {
+                    entities: vec![EntityResult {
+                        id: entity_id.to_string(),
+                        entity_type: noun.to_string(),
+                        data: hashbrown::HashMap::new(),
+                    }],
+                    status,
+                    transitions,
+                    navigation,
+                    violations: vec![violation],
+                    derived_count: 0,
+                    rejected: true,
+                    state: ast::Object::phi(),
+                };
+            }
+        }
+    }
+
     // #868 — per-field retract-then-insert scoped to the payload.
     //
     // Pre-fix the merge logic scanned ALL cells for facts where any
@@ -3272,6 +3344,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             fields,
             sender: None,
             signature: None,
+            force: false,
         };
         let result = apply_command_defs(&def_map, &cmd, &state);
         assert!(!result.rejected,
@@ -3567,6 +3640,181 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         ));
         assert_eq!(ast::binding(entry, "Task"), Some("t1"));
         assert_eq!(ast::binding(entry, "Status"), Some("draft"));
+    // ── task-861: SM-bypass guard on apply update ────────────────────
+    //
+    // The engine's update_via_defs path refuses to mutate the SM's
+    // status-role field directly. The SM cell
+    // (StateMachine_has_currentlyInStatus) is the canonical status —
+    // direct mutation would silently desync any derivation reading
+    // SM state. The user must invoke `apply transition` instead.
+    // `force: true` is the documented opt-out (#904 convention).
+    //
+    // Test corpus: a Task domain with an SM bound to noun 'Task',
+    // initial status 'pending', and a `Task is started` event that
+    // transitions pending → in_progress. The status-role field name
+    // (by convention) is `Task Status`.
+    const TASK_SM_READINGS: &str = r#"
+# Tasks
+
+## Entity Types
+
+Task(.id) is an entity type.
+
+## Fact Types
+
+Task has Task Status.
+
+## Instance Facts
+
+State Machine Definition 'Task' is for Noun 'Task'.
+Status 'pending' is initial in State Machine Definition 'Task'.
+
+Transition 'start' is defined in State Machine Definition 'Task'.
+  Transition 'start' is from Status 'pending'.
+  Transition 'start' is to Status 'in_progress'.
+  Transition 'start' is triggered by Event Type 'start'.
+"#;
+
+    fn setup_task_sm_defs() -> (ast::Object, ast::Object) {
+        let meta_state = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let tasks_state = crate::parse_forml2::parse_to_state_with_nouns(TASK_SM_READINGS, &meta_state).unwrap();
+        let state = ast::merge_states(&meta_state, &tasks_state);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+        (def_obj, state)
+    }
+
+    /// task-861 acceptance #1: `apply update noun=Task fields={Task
+    /// Status: "in_progress"}` is rejected with an alethic violation
+    /// whose constraint_id matches `sm:Task:status_immutable`. The
+    /// detail string names `apply transition` as the right verb.
+    /// State must NOT change (delta is empty).
+    #[test]
+    fn apply_update_status_sm_transition_refuses_direct_status_mutation() {
+        let (def_map, base_state) = setup_task_sm_defs();
+        // Seed Task t-1 with pending status via the SM cell so the
+        // apply path has an existing entity to address. We push the
+        // SM fact directly because creating via apply would also
+        // exercise the SM-init path; this isolates the guard.
+        let state = ast::cell_push(
+            "StateMachine_has_currentlyInStatus",
+            ast::fact_from_pairs(&[
+                ("State Machine", "t-1"),
+                ("currentlyInStatus", "pending"),
+            ]),
+            &base_state,
+        );
+
+        let mut fields = HashMap::new();
+        fields.insert("Task Status".to_string(), "in_progress".to_string());
+        let cmd = Command::UpdateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            entity_id: "t-1".to_string(),
+            fields,
+            sender: None,
+            signature: None,
+            force: false,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &state);
+
+        assert!(result.rejected,
+            "apply update of SM-driven Task Status must be rejected; \
+             violations={:?}", result.violations);
+        let v = result.violations.iter()
+            .find(|v| v.constraint_id == "sm:Task:status_immutable")
+            .expect("expected sm:Task:status_immutable violation; \
+                     violations={:?}");
+        assert!(v.alethic, "violation must be alethic");
+        assert!(v.detail.contains("apply transition"),
+            "detail must point at apply transition; got '{}'", v.detail);
+
+        // State is unchanged — delta empty.
+        assert_eq!(
+            result.state, ast::Object::phi(),
+            "rejected apply must emit empty delta; got {:?}",
+            result.state
+        );
+        // SM cell still reflects pending.
+        let sm_cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", &state);
+        let status = sm_cell.as_seq().unwrap().iter()
+            .find(|f| ast::binding_matches(f, "State Machine", "t-1"))
+            .and_then(|f| ast::binding(f, "currentlyInStatus"))
+            .unwrap();
+        assert_eq!(status, "pending", "SM status must not have flipped");
+    }
+
+    /// task-861 acceptance #2: `force: true` bypasses the SM-bypass
+    /// guard. The update proceeds; no `sm:Task:status_immutable`
+    /// violation surfaces. Mirrors the MCP `force: true` opt-out
+    /// for migration scripts.
+    #[test]
+    fn apply_update_status_sm_force_true_bypasses_guard() {
+        let (def_map, base_state) = setup_task_sm_defs();
+        let state = ast::cell_push(
+            "StateMachine_has_currentlyInStatus",
+            ast::fact_from_pairs(&[
+                ("State Machine", "t-1"),
+                ("currentlyInStatus", "pending"),
+            ]),
+            &base_state,
+        );
+
+        let mut fields = HashMap::new();
+        fields.insert("Task Status".to_string(), "in_progress".to_string());
+        let cmd = Command::UpdateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            entity_id: "t-1".to_string(),
+            fields,
+            sender: None,
+            signature: None,
+            force: true,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &state);
+
+        let guard_violation = result.violations.iter()
+            .find(|v| v.constraint_id == "sm:Task:status_immutable");
+        assert!(
+            guard_violation.is_none(),
+            "force=true must bypass the SM-immutable guard; \
+             got violation {:?}",
+            guard_violation,
+        );
+    }
+
+    /// task-861 acceptance #3: `apply transition noun=Task id=t-1
+    /// event="start"` still works — the SM cell flips pending →
+    /// in_progress. The transition path is unaffected by the
+    /// update-path guard.
+    #[test]
+    fn apply_update_status_sm_transition_still_advances_state_machine() {
+        let (def_map, base_state) = setup_task_sm_defs();
+        let state = ast::cell_push(
+            "StateMachine_has_currentlyInStatus",
+            ast::fact_from_pairs(&[
+                ("State Machine", "t-1"),
+                ("currentlyInStatus", "pending"),
+            ]),
+            &base_state,
+        );
+
+        let cmd = Command::Transition {
+            entity_id: "t-1".to_string(),
+            event: "start".to_string(),
+            domain: "tasks".to_string(),
+            current_status: Some("pending".to_string()),
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &state);
+
+        assert!(!result.rejected,
+            "transition must not be rejected; violations={:?}", result.violations);
+        assert_eq!(
+            result.status.as_deref(), Some("in_progress"),
+            "transition must flip SM to in_progress"
+        );
     }
 
     #[test]
