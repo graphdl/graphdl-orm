@@ -525,7 +525,7 @@ impl<C: CellStorageBackend> StorageBackend for AsCellStorage<C> {
             let value = self.inner.cell_read(handle, &name)?;
             map.insert(name, value);
         }
-        Ok(Object::Map(map))
+        Ok(Object::Map(map.into()))
     }
 
     fn commit(&self, handle: u32, delta: &Object) -> Result<(), StorageError> {
@@ -576,7 +576,7 @@ impl<C: CellStorageBackend> StorageBackend for AsCellStorage<C> {
         if map.is_empty() {
             return Err(StorageError::NotFound);
         }
-        Ok(Object::Map(map))
+        Ok(Object::Map(map.into()))
     }
 }
 
@@ -595,7 +595,7 @@ mod tests {
             "b".to_string(),
             Object::Seq(alloc::vec![Object::Atom("x".to_string())].into()),
         );
-        Object::Map(m)
+        Object::Map(m.into())
     }
 
     // ── InMemoryBackend ─────────────────────────────────────────────
@@ -939,7 +939,7 @@ mod tests {
         // Later commit changes head but must not disturb the checkpoint.
         let mut later = hashbrown::HashMap::new();
         later.insert("a".to_string(), Object::atom("later"));
-        shim.commit(1, &Object::Map(later)).expect("later commit ok");
+        shim.commit(1, &Object::Map(later.into())).expect("later commit ok");
 
         let restored = shim.restore(1, &id).expect("restore ok");
         assert_eq!(restored, sample(), "checkpoint must pin the earlier state");

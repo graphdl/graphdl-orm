@@ -406,7 +406,7 @@ pub fn encode_command_result(result: &CommandResult) -> ast::Object {
     let mut cells = hashbrown::HashMap::new();
     cells.insert("__state_delta".to_string(), result.state.clone());
     cells.insert("__result".to_string(), ast::Object::atom(&summary));
-    ast::Object::Map(cells)
+    ast::Object::Map(cells.into())
 }
 
 // -- Apply ------------------------------------------------------------
@@ -705,7 +705,7 @@ fn create_via_defs(
                     new_map.insert(name.to_string(), contents.clone());
                 }
             }
-            ast::Object::Map(new_map)
+            ast::Object::Map(new_map.into())
         }
     };
     let (post_s1, mut derived) = if stratum1.is_empty() {
@@ -1209,7 +1209,7 @@ fn update_via_defs(
                     new_map.insert(name.to_string(), contents.clone());
                 }
             }
-            ast::Object::Map(new_map)
+            ast::Object::Map(new_map.into())
         }
     };
     let (new_state, mut derived) = if stratum1.is_empty() {

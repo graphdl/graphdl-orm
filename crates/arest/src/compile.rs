@@ -4964,36 +4964,33 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
             Func::construction(existing_sources),
         );
 
-        let pairs = Func::construction(vec![get_instances, get_existing]);
+        // task-744 / task-817: convert the existing-resources Seq into
+        // a Map<resource_atom, T> once per round. SetFromSeq builds the
+        // hash-set in O(N); thereafter each is_new check is O(1) via
+        // FetchOrPhi against that Map. With Object::Map's HashMap
+        // Arc-shared (task-817), DistR's per-instance clone is a
+        // refcount bump rather than a deep copy — the algorithmic
+        // O(N+M) win is no longer cancelled by allocation overhead.
+        // Synthetic perf at N=M=700 release: ~430µs vs HasMember's
+        // ~1.8ms (~4× faster); regression-guarded by
+        // membership_perf_set_from_seq_beats_has_member_after_arc_map
+        // in ast.rs.
+        let get_existing_set = Func::compose(Func::SetFromSeq, get_existing);
 
-        // task-741 / task-743: is_new takes a pair `<instance, [existing]>`
-        // from DistR (where [existing] is the union of forResource values
-        // + per-trigger-FT resource values) and returns T iff
-        // `instance` ∉ [existing].
-        //
-        // Implemented as `not ∘ has_member`: HasMember:<needle, haystack>
-        // returns T if needle is an element of haystack (primitive
-        // membership test, #743). The DistR pattern clones haystack via
-        // Arc ref-count bumps (Object::Seq is Arc-wrapped), so the
-        // cross-product DistR + HasMember pattern runs in O(N·M) atom
-        // comparisons with O(N) allocation per round.
-        //
-        // task-744 phase 5 tried to replace this with `SetFromSeq +
-        // FetchOrPhi` for O(N+M) hash-set semantics, but Object::Map's
-        // HashMap is NOT Arc-shared — DistR's right-side clone deep-
-        // copies the entire HashMap N times, regressing to O(N²)
-        // entry allocations and ~40× slower in the perf test at
-        // N=M=700 (149ms vs 3.6ms). Reverted; HasMember stays as the
-        // production path. The Map-shared refactor (Arc-wrap
-        // Object::Map's HashMap) is filed as the proper follow-up so
-        // the SetFromSeq+FetchOrPhi composition can pay off.
-        let is_new = Func::compose(Func::Not, Func::HasMember);
+        let pairs = Func::construction(vec![get_instances, get_existing_set]);
+
+        // is_new on `<instance, existing_set>`: T iff instance is NOT a
+        // key of existing_set. `FetchOrPhi:<key, map>` returns the
+        // value at key (here always atom "T") or φ if the key is
+        // absent. NullTest is T iff the result is φ — so T means "not
+        // a member", which is exactly what is_new asks.
+        let is_new = Func::compose(Func::NullTest, Func::FetchOrPhi);
 
         // set_diff = alpha(sel(1)) . Filter(is_new) . distr
-        // is_new = not . has_member
-        // distr : <R, S> -> <<r1,S>,...,<rn,S>>
-        // For each <ri, S>: has_member:<ri, S> = T iff ri ∈ S.
-        // Handles empty S correctly (has_member:<ri, φ> = F → is_new = T).
+        // is_new = null . FetchOrPhi
+        // distr : <R, S> -> <<r1,S>,...,<rn,S>>  where S is the existing-set Map.
+        // For each <ri, S>: FetchOrPhi:<ri, S> = T (member) or φ (not).
+        // null:φ = T → is_new = T → ri is new. Empty S → every ri is new.
         let new_instances = Func::compose(
             Func::apply_to_all(Func::Selector(1)),
             Func::compose(Func::filter(is_new), Func::compose(Func::DistR, pairs)),
@@ -7278,7 +7275,7 @@ mod schema_tests {
                 ("factType", id), ("nounName", *name), ("position", pos.as_str()),
             ]));
         }
-        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect())
+        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect::<hashbrown::HashMap<_, _>>().into())
     }
 
     #[test]
@@ -7387,7 +7384,7 @@ mod schema_tests {
             spans: vec![SpanDef { fact_type_id: "ft1".into(), role_index: 0, subset_autofill: None }],
             ..Default::default()
         };
-        if let Object::Map(ref mut m) = state {
+        if let Object::Map(ref mut m_arc) = state { let m = alloc::sync::Arc::make_mut(m_arc);
             m.insert("Constraint".into(), Object::Seq(vec![
                 crate::parse_forml2::constraint_to_fact_test(&uc),
             ].into()));
@@ -7442,7 +7439,7 @@ mod schema_tests {
             spans: vec![SpanDef { fact_type_id: "ft1".into(), role_index: 0, subset_autofill: None }],
             ..Default::default()
         };
-        if let crate::ast::Object::Map(ref mut m) = state {
+        if let crate::ast::Object::Map(ref mut m_arc) = state { let m = alloc::sync::Arc::make_mut(m_arc);
             m.insert("Constraint".into(), crate::ast::Object::Seq(vec![
                 crate::parse_forml2::constraint_to_fact_test(&uc),
             ].into()));
@@ -7474,7 +7471,7 @@ mod schema_tests {
             spans: vec![SpanDef { fact_type_id: "ft1".into(), role_index: 0, subset_autofill: None }],
             ..Default::default()
         };
-        if let crate::ast::Object::Map(ref mut m) = state {
+        if let crate::ast::Object::Map(ref mut m_arc) = state { let m = alloc::sync::Arc::make_mut(m_arc);
             m.insert("Constraint".into(), crate::ast::Object::Seq(vec![
                 crate::parse_forml2::constraint_to_fact_test(&uc1),
                 crate::parse_forml2::constraint_to_fact_test(&uc2),
@@ -7505,7 +7502,7 @@ mod schema_tests {
             ],
             ..Default::default()
         };
-        if let crate::ast::Object::Map(ref mut m) = state {
+        if let crate::ast::Object::Map(ref mut m_arc) = state { let m = alloc::sync::Arc::make_mut(m_arc);
             m.insert("Constraint".into(), crate::ast::Object::Seq(vec![
                 crate::parse_forml2::constraint_to_fact_test(&uc),
             ].into()));
@@ -7533,7 +7530,7 @@ mod schema_tests {
             ],
             ..Default::default()
         };
-        if let crate::ast::Object::Map(ref mut m) = state {
+        if let crate::ast::Object::Map(ref mut m_arc) = state { let m = alloc::sync::Arc::make_mut(m_arc);
             m.insert("Constraint".into(), crate::ast::Object::Seq(vec![
                 crate::parse_forml2::constraint_to_fact_test(&uc),
             ].into()));
@@ -7612,7 +7609,7 @@ mod schema_tests {
             fact_from_pairs(&[("factType", "schema-uuid-2"), ("nounName", "Customer"), ("position", "0")]),
             fact_from_pairs(&[("factType", "schema-uuid-2"), ("nounName", "plan"), ("position", "1")]),
         ]);
-        let state = Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect());
+        let state = Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect::<hashbrown::HashMap<_, _>>().into());
 
         let model = compile(&state);
 
@@ -7888,7 +7885,7 @@ mod schema_tests {
             ("text", "Order has Status 'open'."),
             ("consequentFactTypeId", consequent_ft),
         ]));
-        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect())
+        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect::<hashbrown::HashMap<_, _>>().into())
     }
 
     /// A user-authored derivation compiles to a `derivation:{id}` def
@@ -8413,7 +8410,7 @@ mod populate_imports_test {
             ("objectNoun",   ""),
             ("objectValue",  "npm"),
         ]));
-        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect())
+        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect::<hashbrown::HashMap<_, _>>().into())
     }
 
     /// Helper: extract a key/value pair from a Constant-Func-encoded
@@ -8539,7 +8536,7 @@ mod deontic_conjunction_test {
         ]));
         Object::Map(cells.into_iter()
             .map(|(k, v)| (k, Object::Seq(v.into())))
-            .collect())
+            .collect::<hashbrown::HashMap<_, _>>().into())
     }
 
     /// A constraint:{id} def must exist in the compiled output for
@@ -8621,7 +8618,7 @@ It is forbidden that some Outbound Email is sent.
             ]));
         let pop_state = Object::Map(pop_cells.into_iter()
             .map(|(k, v)| (k, Object::Seq(v.into())))
-            .collect());
+            .collect::<hashbrown::HashMap<_, _>>().into());
 
         let ctx = ast::encode_eval_context_state("", None, &pop_state);
         let violations_obj = ast::apply(
@@ -8730,7 +8727,7 @@ It is forbidden that some Outbound Email is sent and some User approves that Out
             ]));
         let pop_state = Object::Map(pop_cells.into_iter()
             .map(|(k, v)| (k, Object::Seq(v.into())))
-            .collect());
+            .collect::<hashbrown::HashMap<_, _>>().into());
 
         let validate_key = alloc::format!("validate:{}", entity);
         let ctx = ast::encode_eval_context_state("", None, &pop_state);
@@ -8894,7 +8891,7 @@ It is forbidden that each Noun has a name that ends with 'ies'.\n";
         }
         Object::Map(cells.into_iter()
             .map(|(k, v)| (k, Object::Seq(v.into())))
-            .collect())
+            .collect::<hashbrown::HashMap<_, _>>().into())
     }
 
     /// MC3c (#749, #897): no declared keywords ⇒ empty `text_keywords`
@@ -8970,7 +8967,7 @@ It is forbidden that each Noun has a name that ends with 'ies'.\n";
             ]));
         let pop_state = Object::Map(pop_cells.into_iter()
             .map(|(k, v)| (k, Object::Seq(v.into())))
-            .collect());
+            .collect::<hashbrown::HashMap<_, _>>().into());
 
         let ctx = ast::encode_eval_context_state("", None, &pop_state);
         let violations_obj = ast::apply(
@@ -9071,7 +9068,7 @@ mod mandatory_role_alethic_rejection_tests {
 
         Object::Map(cells.into_iter()
             .map(|(k, v)| (k, Object::Seq(v.into())))
-            .collect())
+            .collect::<hashbrown::HashMap<_, _>>().into())
     }
 
     /// End-to-end: compile the model, run `validate`, decode violations.
@@ -9151,7 +9148,7 @@ mod mandatory_role_alethic_rejection_tests {
             }],
             ..Default::default()
         };
-        if let Object::Map(ref mut m) = state {
+        if let Object::Map(ref mut m_arc) = state { let m = alloc::sync::Arc::make_mut(m_arc);
             // Replace Constraint cell with just the bad MC.
             m.insert("Constraint".into(), Object::Seq(vec![
                 crate::parse_forml2::constraint_to_fact_test(&bad_mc),
@@ -9232,7 +9229,7 @@ mod mandatory_role_alethic_rejection_tests {
     fn mc_no_violation_when_mandatory_bar_present() {
         let mut state = state_missing_mandatory_bar();
         // Add the missing fact: foo1 has bar1.
-        if let Object::Map(ref mut m) = state {
+        if let Object::Map(ref mut m_arc) = state { let m = alloc::sync::Arc::make_mut(m_arc);
             let cell = m.entry("ft_has_bar".into())
                 .or_insert_with(|| Object::Seq(vec![].into()));
             let mut facts: Vec<Object> = cell.as_seq()
@@ -9329,7 +9326,7 @@ mod cell_driven_sm_tests {
             cells.entry("Transition_is_triggered_by_Fact_Type".into()).or_default()
                 .push(fact_from_pairs(&[("Transition", t), ("Fact Type", ev)]));
         }
-        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect())
+        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect::<hashbrown::HashMap<_, _>>().into())
     }
 
     /// Apply the SM transition Func to <current_state, event> and
@@ -9431,7 +9428,7 @@ mod cell_driven_sm_tests {
             cells.entry("Transition_is_triggered_by_Fact_Type".into()).or_default()
                 .push(fact_from_pairs(&[("Transition", t), ("Fact Type", ev)]));
         }
-        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect())
+        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect::<hashbrown::HashMap<_, _>>().into())
     }
 
     #[test]
@@ -9474,7 +9471,7 @@ mod cell_driven_sm_tests {
                     ("State Machine Definition", "OrderSM"),
                 ]));
         }
-        let cells = Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect());
+        let cells = Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect::<hashbrown::HashMap<_, _>>().into());
 
         let constraints: Vec<CompiledConstraint> = vec![];
         let cell_driven = compile_state_machine_from_cells(
@@ -9490,7 +9487,7 @@ mod cell_driven_sm_tests {
     /// caller can fall back to the JSON-blob path.
     #[test]
     fn returns_none_when_no_sm_for_noun_fact() {
-        let cells = Object::Map(HashMap::new());
+        let cells = Object::Map(HashMap::new().into());
         let constraints: Vec<CompiledConstraint> = vec![];
         let result = compile_state_machine_from_cells(
             "NonexistentNoun", &cells, &constraints,
@@ -9511,7 +9508,7 @@ mod cell_driven_sm_tests {
                 ("State Machine Definition", "OrderSM"),
                 ("Noun", "Order"),
             ]));
-        let cells = Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect());
+        let cells = Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect::<hashbrown::HashMap<_, _>>().into());
         let constraints: Vec<CompiledConstraint> = vec![];
         let cell_driven = compile_state_machine_from_cells(
             "Order", &cells, &constraints,
@@ -9592,7 +9589,7 @@ mod cell_driven_sm_tests {
             .push(fact_from_pairs(&[("Transition", "populate_facts"), ("Status", "Facts Populated")]));
         cells.entry("Transition_is_triggered_by_Fact_Type".into()).or_default()
             .push(fact_from_pairs(&[("Transition", "populate_facts"), ("Fact Type", "Merge_facts_populated")]));
-        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect())
+        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect::<hashbrown::HashMap<_, _>>().into())
     }
 
     /// `compile_state_machine_from_cells("Domain Change", ...)` must
@@ -9710,7 +9707,7 @@ mod nav_links_skip_value_types {
             .push(crate::parse_forml2::constraint_to_fact_test(&uc));
         Object::Map(cells.into_iter()
             .map(|(k, v)| (k, Object::Seq(v.into())))
-            .collect())
+            .collect::<hashbrown::HashMap<_, _>>().into())
     }
 
     fn def_value(defs: &[(String, ast::Func)], name: &str) -> Option<Object> {

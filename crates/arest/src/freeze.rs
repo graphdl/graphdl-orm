@@ -148,7 +148,7 @@ fn read_object(bytes: &[u8], cursor: &mut usize) -> Result<Object, String> {
                 let v = read_object(bytes, cursor)?;
                 m.insert(k, v);
             }
-            Ok(Object::Map(m))
+            Ok(Object::Map(m.into()))
         }
         TAG_BOTTOM => Ok(Object::Bottom),
         other => Err(format!("unknown tag 0x{other:02x}")),
@@ -443,7 +443,7 @@ pub fn thaw_sealed(
         )));
     }
 
-    Ok(single_unnamed.unwrap_or(Object::Map(map)))
+    Ok(single_unnamed.unwrap_or(Object::Map(map.into())))
 }
 
 #[cfg(test)]
@@ -485,7 +485,7 @@ mod tests {
         m.insert("one".to_string(), Object::Atom("1".to_string()));
         m.insert("two".to_string(), Object::Atom("2".to_string()));
         m.insert("list".to_string(), Object::Seq(vec![Object::Atom("a".to_string())].into()));
-        let obj = Object::Map(m);
+        let obj = Object::Map(m.into());
         assert_eq!(roundtrip(obj.clone()), obj);
     }
 
@@ -507,7 +507,7 @@ mod tests {
         b.insert("charlie".to_string(), Object::Atom("3".to_string()));
         b.insert("alpha".to_string(), Object::Atom("1".to_string()));
         b.insert("bravo".to_string(), Object::Atom("2".to_string()));
-        assert_eq!(freeze(&Object::Map(a)), freeze(&Object::Map(b)));
+        assert_eq!(freeze(&Object::Map(a.into())), freeze(&Object::Map(b.into())));
     }
 
     #[test]
@@ -569,7 +569,7 @@ mod tests {
             Object::Seq(vec![Object::Atom("x".to_string()), Object::Atom("y".to_string())].into()),
         );
         m.insert("charlie".to_string(), Object::Bottom);
-        let root = Object::Map(m);
+        let root = Object::Map(m.into());
 
         with_entropy([1u8; 32], || {
             let sealed = freeze_sealed(&root, &fixture_master(), "tenant-A", "orders", 7);
@@ -607,7 +607,7 @@ mod tests {
         // Different tenant master → AAD AEAD failure on first cell.
         let mut m = hashbrown::HashMap::new();
         m.insert("k".to_string(), Object::Atom("v".to_string()));
-        let root = Object::Map(m);
+        let root = Object::Map(m.into());
         let master_a = TenantMasterKey::from_bytes([0xA1; 32]);
         let master_b = TenantMasterKey::from_bytes([0xB2; 32]);
         with_entropy([3u8; 32], || {
@@ -629,7 +629,7 @@ mod tests {
         // check fires before the AEAD path.
         let mut m = hashbrown::HashMap::new();
         m.insert("k".to_string(), Object::Atom("v".to_string()));
-        let root = Object::Map(m);
+        let root = Object::Map(m.into());
         with_entropy([5u8; 32], || {
             let sealed = freeze_sealed(&root, &fixture_master(), "t", "d", 2);
             let res = thaw_sealed(&sealed, &fixture_master(), "t", "d", 3);
@@ -679,7 +679,7 @@ mod tests {
         let value = Object::Atom("payload-bytes-of-known-length".to_string());
         let mut m = hashbrown::HashMap::new();
         m.insert("only".to_string(), value.clone());
-        let root = Object::Map(m);
+        let root = Object::Map(m.into());
         with_entropy([9u8; 32], || {
             let plain_len_inner = freeze(&value).len() as i64;
             let sealed = freeze_sealed(&root, &fixture_master(), "s", "d", 0);

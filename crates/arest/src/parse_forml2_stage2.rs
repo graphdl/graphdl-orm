@@ -4467,7 +4467,7 @@ fn bootstrap_grammar_state(text: &str) -> Result<Object, String> {
     map.insert("FactType".into(), Object::Seq(fact_types.into()));
     map.insert("Role".into(), Object::Seq(roles.into()));
     map.insert("DerivationRule".into(), Object::Seq(derivation_rules.into()));
-    Ok(Object::Map(map))
+    Ok(Object::Map(map.into()))
 }
 
 fn cached_grammar() -> Result<&'static GrammarCacheEntry, String> {
@@ -4939,7 +4939,7 @@ fn parse_to_state_via_stage12_impl(
         let map: HashMap<String, Object> = acc_cells.into_iter()
             .map(|(k, v)| (k, Object::Seq(v.into())))
             .collect();
-        Object::Map(map)
+        Object::Map(map.into())
     };
     if trace { crate::diag!("[s12] stage1 tokenize: {:?} ({} lines)",
         t_tok.elapsed(), lines.len()); }
@@ -4993,11 +4993,11 @@ fn parse_to_state_via_stage12_impl(
     let noun_facts = tt!("nouns", translate_nouns(&classified, &idx));
     let classified = {
         let mut map: HashMap<String, Object> = match &classified {
-            Object::Map(m) => m.clone(),
+            Object::Map(m) => (**m).clone(),
             _ => HashMap::new(),
         };
         map.insert("Noun".to_string(), Object::Seq(noun_facts.clone().into()));
-        Object::Map(map)
+        Object::Map(map.into())
     };
 
     let mut subtype_facts: Vec<Object> = tt!("subtypes", translate_subtypes(&classified, &idx));
@@ -5097,7 +5097,7 @@ fn parse_to_state_via_stage12_impl(
             })
             .or_insert_with(|| Object::Seq(facts.into()));
     }
-    Ok(Object::Map(map))
+    Ok(Object::Map(map.into()))
 }
 
 /// Decompose compound reference-scheme instance ids into component
@@ -5635,7 +5635,7 @@ mod tests {
             fact_from_pairs(&[("name", *n), ("objectType", "entity")])
         }).collect();
         map.insert("Noun".to_string(), Object::Seq(noun_facts.into()));
-        Object::Map(map)
+        Object::Map(map.into())
     }
 
     #[test]
@@ -5759,7 +5759,7 @@ mod tests {
                 *entry = Object::Seq(combined.into());
             }
         }
-        let stmt = Object::Map(merged_cells);
+        let stmt = Object::Map(merged_cells.into());
         let classified = classify_statements(&stmt, &grammar_state());
         let noun_facts = super::translate_nouns(&classified, &idx(&classified));
         assert_eq!(noun_facts.len(), 2);
@@ -5797,7 +5797,7 @@ mod tests {
                 *entry = Object::Seq(combined.into());
             }
         }
-        let stmt = Object::Map(merged);
+        let stmt = Object::Map(merged.into());
         let classified = classify_statements(&stmt, &grammar_state());
         let noun_facts = super::translate_nouns(&classified, &idx(&classified));
         assert_eq!(noun_facts.len(), 1);
@@ -6497,13 +6497,13 @@ mod tests {
         // nouns to actually be declared, matching the legacy "nouns
         // in the antecedent are mostly unknown" shape.
         let stmt_only_thing = {
-            let mut map = match stmt {
-                Object::Map(m) => m,
+            let mut map: hashbrown::HashMap<String, Object> = match stmt {
+                Object::Map(m) => (*m).clone(),
                 _ => unreachable!(),
             };
             let noun = fact_from_pairs(&[("name", "Thing"), ("objectType", "entity")]);
             map.insert("Noun".to_string(), Object::Seq(alloc::vec![noun].into()));
-            Object::Map(map)
+            Object::Map(map.into())
         };
         let classified = classify_statements(&stmt_only_thing, &grammar_state());
         let ss = super::translate_set_constraints(&classified, &idx(&classified));
@@ -6927,7 +6927,7 @@ mod tests {
         stmt_cells.insert("Noun".to_string(), noun_facts);
         let stmt_state = Object::Map(stmt_cells.into_iter()
             .map(|(k, v)| (k, Object::Seq(v.into())))
-            .collect());
+            .collect::<hashbrown::HashMap<_, _>>().into());
 
         // 3. Merge with cached grammar — same shape `classify_statements`
         //    builds internally.
@@ -7004,7 +7004,7 @@ mod tests {
         }).collect();
         let mut map: HashMap<String, Object> = HashMap::new();
         map.insert("EnumValues".to_string(), Object::Seq(Arc::from(facts)));
-        Object::Map(map)
+        Object::Map(map.into())
     }
 
     #[test]
@@ -8744,7 +8744,7 @@ mod tests {
         map.insert(
             "Classification_has_Translator".to_string(),
             Object::Seq(Arc::from(facts)));
-        Object::Map(map)
+        Object::Map(map.into())
     }
 
     #[test]
@@ -8832,7 +8832,7 @@ mod tests {
             let mut m: HashMap<String, Object> = HashMap::new();
             m.insert("Classification_has_Translator".to_string(),
                      Object::Seq(alloc::sync::Arc::from(Vec::<Object>::new())));
-            Object::Map(m)
+            Object::Map(m.into())
         };
         let table = super::StatementTranslatorTable::from_grammar_state(&state);
         // boot has all 20 kinds; empty cell would have 0.

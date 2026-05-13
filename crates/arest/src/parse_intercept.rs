@@ -328,7 +328,7 @@ fn synthetic_state_from_nouns(nouns_json: &str) -> Object {
     // but fails type-equality at the constructor site.
     let mut cells: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
     cells.insert("Noun".to_string(), Object::Seq(noun_facts.into()));
-    Object::Map(cells)
+    Object::Map(cells.into())
 }
 
 /// Walk every cell named in `CELLS` and emit one entity per fact.

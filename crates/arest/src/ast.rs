@@ -202,7 +202,15 @@ pub enum Object {
     /// A named store (Backus §13.3.4): cells indexed by name for O(1) fetch/store.
     /// Semantically equivalent to Seq of <CELL, name, contents> triples,
     /// but with HashMap backing for O(1) ↑n:D and ↓n:<x,D> operations.
-    Map(HashMap<String, Object>),
+    ///
+    /// task-817: the HashMap is Arc-wrapped so clones are O(1) ref-count
+    /// bumps instead of full deep copies. This mirrors Object::Seq's
+    /// `Arc<[Object]>` shape and makes DistR-with-Map (where the same
+    /// map is duplicated across N pair sites) cheap. Mutation paths use
+    /// `Arc::make_mut` for copy-on-write semantics — single-reader paths
+    /// stay zero-copy, second-reader paths pay the structural clone only
+    /// when they must.
+    Map(Arc<HashMap<String, Object>>),
 
     /// Bottom (⊥) — undefined. All functions preserve bottom: f(⊥) = ⊥.
     Bottom,
@@ -261,9 +269,18 @@ impl Object {
 
     pub fn as_map(&self) -> Option<&HashMap<String, Object>> {
         match self {
-            Object::Map(m) => Some(m),
+            Object::Map(m) => Some(m.as_ref()),
             _ => None,
         }
+    }
+
+    /// task-817: typed Map constructor that wraps a fresh HashMap in
+    /// an `Arc`. New construction sites should prefer this over
+    /// `Object::Map(Arc::new(map))` for clarity, and existing sites
+    /// that build a local HashMap then construct can switch by
+    /// dropping the intermediate `Arc::new` wrap.
+    pub fn map(m: HashMap<String, Object>) -> Object {
+        Object::Map(Arc::new(m))
     }
 
     /// Convert a Seq-of-cells store to a Map store for O(1) access.
@@ -284,7 +301,7 @@ impl Object {
                         }
                     }
                 }
-                Object::Map(map)
+                Object::Map(Arc::new(map))
             }
             _ => self.clone(),
         }
@@ -513,7 +530,7 @@ pub fn encode_state_indexed(state: &Object) -> Object {
             }).unwrap_or_default();
             (ft_id.to_string(), Object::Seq(Arc::from(fact_objs)))
         }).collect();
-    Object::Map(map)
+    Object::Map(map.into())
 }
 
 /// Encode an Object state in the flat format expected by constraint evaluation.
@@ -1514,7 +1531,7 @@ pub fn defs_to_state(defs: &[(String, Func)], state: &Object) -> Object {
         map.insert(name.clone(), func_to_object(func));
     });
     // Return as Map store — O(1) fetch/store for all subsequent operations
-    Object::Map(map)
+    Object::Map(map.into())
 }
 
 /// Look up `allowed_writes:{def_name}` in DEFS. If it's a Seq of atom
@@ -2101,7 +2118,7 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
             // preprocessor for membership-heavy derivations: build once
             // per round, lookup O(1) via FetchOrPhi thereafter.
             match x {
-                Object::Seq(items) if items.is_empty() => Object::Map(HashMap::new()),
+                Object::Seq(items) if items.is_empty() => Object::Map(HashMap::new().into()),
                 Object::Seq(items) => {
                     let mut m = HashMap::with_capacity(items.len());
                     for v in items.iter() {
@@ -2110,7 +2127,7 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                             None => return Object::Bottom,
                         }
                     }
-                    Object::Map(m)
+                    Object::Map(m.into())
                 }
                 _ => Object::Bottom,
             }
@@ -4087,9 +4104,13 @@ pub fn fetch(name: &str, state: &Object) -> Object {
 pub fn store(name: &str, contents: Object, state: &Object) -> Object {
     match state {
         Object::Map(map) => {
-            let mut new_map = map.clone();
-            new_map.insert(name.to_string(), contents);
-            Object::Map(new_map)
+            // task-817: Arc-shared HashMap. clone() bumps the ref count;
+            // Arc::make_mut clones the inner HashMap only when another
+            // reader holds the same Arc. Single-owner state writes stay
+            // zero-copy through this path.
+            let mut new_arc = Arc::clone(map);
+            Arc::make_mut(&mut new_arc).insert(name.to_string(), contents);
+            Object::Map(new_arc)
         }
         Object::Seq(cells) => {
             let is_target = |c: &Object| c.as_seq().map_or(false, |items|
@@ -4181,7 +4202,7 @@ pub fn cell_put_keyed(
     };
     let existing = fetch_or_phi(name, state);
     let mut map: HashMap<String, Object> = match &existing {
-        Object::Map(m) => m.clone(),
+        Object::Map(m) => (**m).clone(),
         Object::Seq(items) if items.is_empty() => HashMap::new(),
         Object::Seq(items) => {
             // Migration: existing Seq contents rebuild into Map keyed
@@ -4199,7 +4220,7 @@ pub fn cell_put_keyed(
         _ => HashMap::new(),
     };
     map.insert(key, fact);
-    store(name, Object::Map(map), state)
+    store(name, Object::Map(map.into()), state)
 }
 
 /// Extract a key from a fact tuple by joining the values at the
@@ -4266,7 +4287,7 @@ pub fn merge_states(target: &Object, source: &Object) -> Object {
         let entry = map.get_mut(name).expect("checked above");
         *entry = concat_dedup(entry, contents);
     });
-    Object::Map(map)
+    Object::Map(map.into())
 }
 
 /// Cells that are READINGS-DERIVED rule registries: every compile reads
@@ -4320,7 +4341,7 @@ pub fn drop_readings_derived_meta_cells(state: &Object) -> Object {
         if READINGS_DERIVED_META_CELLS.contains(&name) { continue; }
         map.insert(name.to_string(), contents.clone());
     }
-    Object::Map(map)
+    Object::Map(map.into())
 }
 
 /// Concatenate two sequences and drop duplicates, identity-aware.
@@ -4402,7 +4423,7 @@ pub fn diff_cells(old: &Object, new: &Object) -> Object {
         })
         .map(|(k, v)| (k.to_string(), v.clone()))
         .collect();
-    Object::Map(delta)
+    Object::Map(delta.into())
 }
 
 /// Merge a cell delta onto a base store. S1b (#718): for each cell in
@@ -4473,7 +4494,7 @@ pub fn merge_delta(
         };
         base_map.insert(k, new_chain);
     }
-    Object::Map(base_map)
+    Object::Map(base_map.into())
 }
 
 /// Demultiplex events by cell assignment (paper Eq. demux).
@@ -5629,28 +5650,26 @@ mod tests {
         assert!(matches!(func, Func::SetFromSeq));
     }
 
-    /// task-744 phase 6 perf finding (and regression guard).
+    /// task-744 / task-817 perf guard.
     ///
-    /// We expected SetFromSeq+FetchOrPhi to beat HasMember at SM-init
-    /// scale by replacing O(N·M) atom-scan with O(N+M) hash-set
-    /// lookup. The actual result inverted that: at N=M=700 the new
-    /// pattern was ~40× SLOWER (149ms vs 3.6ms). Cause: Object::Map's
-    /// HashMap is not Arc-shared, so the DistR pattern that
-    /// distributes the existing-set across N instances deep-clones
-    /// the entire HashMap N times — O(N²) entry allocations swamp
-    /// the O(N+M) lookups.
+    /// After the Arc-Map refactor (Object::Map's HashMap wrapped in
+    /// Arc, clone-as-refcount-bump), the SetFromSeq+FetchOrPhi
+    /// membership pattern decisively beats the HasMember atom-scan
+    /// at SM-init scale: at N=M=700 release-mode the new pattern is
+    /// ~4× faster (≈430µs vs ≈1.8ms). The pattern is the production
+    /// path in compile_sm_init_for; this test pins the win so any
+    /// future regression — accidental switch back to deep-clone
+    /// Object::Map, change to DistR semantics that drop the Arc
+    /// share, etc. — surfaces immediately.
     ///
-    /// HasMember stays as the production path until Object::Map's
-    /// HashMap is wrapped in Arc (mirror of Object::Seq's Arc<[Object]>
-    /// representation). This test pins the finding so any future
-    /// "let's go back to SetFromSeq" change has to deal with the
-    /// share-cost question first — and it inverts naturally once
-    /// the Arc-Map refactor lands.
-    ///
-    /// Filed as task-817 follow-up: Arc-wrap Object::Map's HashMap
-    /// so SetFromSeq+FetchOrPhi can pay off.
+    /// The asymmetry is structural: SetFromSeq is one O(N) HashMap
+    /// build, then M × O(1) lookups; HasMember is M × O(N) atom
+    /// scans. Arc-shared Map storage means the per-instance DistR
+    /// clone is a refcount bump rather than a full HashMap deep
+    /// copy, so the algorithmic win is no longer cancelled by
+    /// allocation overhead.
     #[test]
-    fn membership_perf_set_from_seq_loses_to_has_member_pending_arc_map() {
+    fn membership_perf_set_from_seq_beats_has_member_after_arc_map() {
         const N: usize = 700;
         const M: usize = 700;
 
@@ -5663,7 +5682,7 @@ mod tests {
         let haystack_seq = Object::Seq(haystack_atoms.into());
         let defs = defs();
 
-        // Pattern A: SetFromSeq + FetchOrPhi.
+        // Pattern A: SetFromSeq + FetchOrPhi. The production path.
         let t_a = crate::time_shim::Instant::now();
         let set = apply(&Func::SetFromSeq, &haystack_seq, &defs);
         let is_new_new = Func::compose(Func::NullTest, Func::FetchOrPhi);
@@ -5676,7 +5695,7 @@ mod tests {
         }
         let elapsed_new = t_a.elapsed();
 
-        // Pattern B: HasMember atom-scan with Arc-shared haystack.
+        // Pattern B: legacy HasMember atom-scan.
         let t_b = crate::time_shim::Instant::now();
         let mut hits_has = 0usize;
         for needle in &needles {
@@ -5691,15 +5710,16 @@ mod tests {
         assert_eq!(hits_new, hits_has, "membership semantics diverged");
         assert_eq!(hits_new, M, "every needle should be a member");
 
-        // Pending the Arc-Map refactor, HasMember wins.
+        // SetFromSeq+FetchOrPhi must win — if not, the Arc-share
+        // invariant has likely been broken somewhere.
         assert!(
-            elapsed_has < elapsed_new,
-            "HasMember should be faster than SetFromSeq+FetchOrPhi at \
-             N=M={} until Object::Map's HashMap is Arc-shared. \
-             Got has={:?} new={:?}. If this inverts, the Arc-Map \
-             refactor may have landed — re-evaluate which pattern \
-             compile_sm_init_for should use.",
-            N, elapsed_has, elapsed_new,
+            elapsed_new < elapsed_has,
+            "SetFromSeq+FetchOrPhi must beat HasMember at N=M={} now \
+             that Object::Map is Arc-shared. Got new={:?} has={:?}. \
+             If this inverts, check whether something in the DistR / \
+             store / cell_put_keyed path lost the Arc share (e.g. an \
+             intermediate clone copying the inner HashMap).",
+            N, elapsed_new, elapsed_has,
         );
     }
 
@@ -7944,14 +7964,14 @@ mod tests {
 
     #[test]
     fn apply_to_all_on_empty_map_returns_phi() {
-        let empty_map: Object = Object::Map(HashMap::new());
+        let empty_map: Object = Object::Map(HashMap::new().into());
         let result = apply(&Func::apply_to_all(Func::Id), &empty_map, &Object::phi());
         assert_eq!(result, Object::phi());
     }
 
     #[test]
     fn filter_on_empty_map_returns_phi() {
-        let empty_map: Object = Object::Map(HashMap::new());
+        let empty_map: Object = Object::Map(HashMap::new().into());
         let result = apply(&Func::filter(Func::Id), &empty_map, &Object::phi());
         assert_eq!(result, Object::phi());
     }
@@ -8036,15 +8056,15 @@ mod tests {
     #[test]
     fn merge_delta_appends_a_new_version_per_call() {
         // Start with an empty Map base.
-        let s0 = Object::Map(HashMap::new());
+        let s0 = Object::Map(HashMap::new().into());
 
         let mut d1 = HashMap::new();
         d1.insert("X".to_string(), Object::atom("v1"));
-        let s1 = merge_delta(&s0, &Object::Map(d1), None);
+        let s1 = merge_delta(&s0, &Object::Map(d1.into()), None);
 
         let mut d2 = HashMap::new();
         d2.insert("X".to_string(), Object::atom("v2"));
-        let s2 = merge_delta(&s1, &Object::Map(d2), None);
+        let s2 = merge_delta(&s1, &Object::Map(d2.into()), None);
 
         // Logical view shows latest.
         assert_eq!(fetch_or_phi("X", &s2), Object::atom("v2"));
@@ -8062,10 +8082,10 @@ mod tests {
 
     #[test]
     fn merge_delta_creates_chain_for_absent_cell() {
-        let s0 = Object::Map(HashMap::new());
+        let s0 = Object::Map(HashMap::new().into());
         let mut d = HashMap::new();
         d.insert("Brand_new".to_string(), Object::atom("hello"));
-        let s1 = merge_delta(&s0, &Object::Map(d), None);
+        let s1 = merge_delta(&s0, &Object::Map(d.into()), None);
 
         let hist = cells_iter_history(&s1, "Brand_new");
         assert_eq!(hist.len(), 1);
@@ -8080,7 +8100,7 @@ mod tests {
 
         let mut d = HashMap::new();
         d.insert("X".to_string(), Object::atom("new"));
-        let s1 = merge_delta(&s0, &Object::Map(d), None);
+        let s1 = merge_delta(&s0, &Object::Map(d.into()), None);
 
         // History: synthetic v0 = "legacy", then v1 = "new".
         let hist = cells_iter_history(&s1, "X");
@@ -8106,7 +8126,7 @@ mod tests {
 
     #[test]
     fn cells_iter_history_empty_for_unknown_cell() {
-        let s = Object::Map(HashMap::new());
+        let s = Object::Map(HashMap::new().into());
         assert!(cells_iter_history(&s, "no_such_cell").is_empty());
     }
 
@@ -8143,11 +8163,11 @@ mod tests {
     // ── S1g (#723): chain compaction ────────────────────────────────
 
     fn build_three_chain_state() -> Object {
-        let mut state = Object::Map(HashMap::new());
+        let mut state = Object::Map(HashMap::new().into());
         for tag in &["a", "b", "c"] {
             let mut d = HashMap::new();
             d.insert("Item".to_string(), Object::atom(tag));
-            state = merge_delta(&state, &Object::Map(d), None);
+            state = merge_delta(&state, &Object::Map(d.into()), None);
         }
         state
     }
@@ -8232,11 +8252,11 @@ mod tests {
     fn merge_delta_on_chain_does_not_lose_prior_versions() {
         // Three sequential merges to the same cell — chain should grow
         // to three entries.
-        let mut state = Object::Map(HashMap::new());
+        let mut state = Object::Map(HashMap::new().into());
         for tag in &["a", "b", "c"] {
             let mut d = HashMap::new();
             d.insert("Item".to_string(), Object::atom(tag));
-            state = merge_delta(&state, &Object::Map(d), None);
+            state = merge_delta(&state, &Object::Map(d.into()), None);
         }
         let hist = cells_iter_history(&state, "Item");
         assert_eq!(hist.len(), 3);
@@ -8258,11 +8278,11 @@ mod tests {
     #[test]
     fn as_of_returns_contents_at_specific_version() {
         // Three sequential merges → chain [v1=a, v2=b, v3=c].
-        let mut state = Object::Map(HashMap::new());
+        let mut state = Object::Map(HashMap::new().into());
         for tag in &["a", "b", "c"] {
             let mut d = HashMap::new();
             d.insert("X".to_string(), Object::atom(tag));
-            state = merge_delta(&state, &Object::Map(d), None);
+            state = merge_delta(&state, &Object::Map(d.into()), None);
         }
         assert_eq!(as_of(&state, "X", 1), Some(Object::atom("a")));
         assert_eq!(as_of(&state, "X", 2), Some(Object::atom("b")));
@@ -8283,11 +8303,11 @@ mod tests {
 
     #[test]
     fn between_returns_chain_slice_in_chronological_order() {
-        let mut state = Object::Map(HashMap::new());
+        let mut state = Object::Map(HashMap::new().into());
         for tag in &["a", "b", "c", "d", "e"] {
             let mut d = HashMap::new();
             d.insert("X".to_string(), Object::atom(tag));
-            state = merge_delta(&state, &Object::Map(d), None);
+            state = merge_delta(&state, &Object::Map(d.into()), None);
         }
         // Inclusive range [2, 4] → entries v2, v3, v4 in order.
         let slice = between(&state, "X", 2, 4);
@@ -8301,11 +8321,11 @@ mod tests {
 
     #[test]
     fn between_handles_singleton_range_and_full_range() {
-        let mut state = Object::Map(HashMap::new());
+        let mut state = Object::Map(HashMap::new().into());
         for tag in &["a", "b", "c"] {
             let mut d = HashMap::new();
             d.insert("Y".to_string(), Object::atom(tag));
-            state = merge_delta(&state, &Object::Map(d), None);
+            state = merge_delta(&state, &Object::Map(d.into()), None);
         }
         // [2, 2] → just v2
         let one = between(&state, "Y", 2, 2);
@@ -8318,10 +8338,10 @@ mod tests {
 
     #[test]
     fn between_returns_empty_for_inverted_range_or_unversioned() {
-        let mut state = Object::Map(HashMap::new());
+        let mut state = Object::Map(HashMap::new().into());
         let mut d = HashMap::new();
         d.insert("Z".to_string(), Object::atom("v"));
-        state = merge_delta(&state, &Object::Map(d), None);
+        state = merge_delta(&state, &Object::Map(d.into()), None);
         // Inverted range — total function, just empty.
         assert!(between(&state, "Z", 5, 1).is_empty());
         // Legacy raw cell — no chain to slice.
@@ -8429,7 +8449,7 @@ mod tests {
             cell("A", Object::atom("1")),
             cell("B", Object::atom("2")),
         ]);
-        let empty_delta = Object::Map(HashMap::new());
+        let empty_delta = Object::Map(HashMap::new().into());
         let merged = merge_delta(&base, &empty_delta, None);
         assert_eq!(fetch_or_phi("A", &merged), Object::atom("1"));
         assert_eq!(fetch_or_phi("B", &merged), Object::atom("2"));
@@ -8701,10 +8721,10 @@ mod tests {
     #[test]
     fn merge_delta_with_event_attaches_event_to_new_chain_entry() {
         let event = fact_from_pairs(&[("operation", "apply:create"), ("sender", "u1")]);
-        let s0 = Object::Map(HashMap::new());
+        let s0 = Object::Map(HashMap::new().into());
         let mut d = HashMap::new();
         d.insert("Order".to_string(), Object::atom("ord-1"));
-        let s1 = merge_delta(&s0, &Object::Map(d), Some(event.clone()));
+        let s1 = merge_delta(&s0, &Object::Map(d.into()), Some(event.clone()));
 
         let hist = cells_iter_history(&s1, "Order");
         assert_eq!(hist.len(), 1);
@@ -8718,10 +8738,10 @@ mod tests {
         // The plain merge_delta delegates to the event variant with
         // None — entries must remain in the pre-S1c 4-field shape so
         // pre-existing freezes keep round-tripping.
-        let s0 = Object::Map(HashMap::new());
+        let s0 = Object::Map(HashMap::new().into());
         let mut d = HashMap::new();
         d.insert("Order".to_string(), Object::atom("ord-1"));
-        let s1 = merge_delta(&s0, &Object::Map(d), None);
+        let s1 = merge_delta(&s0, &Object::Map(d.into()), None);
         let hist = cells_iter_history(&s1, "Order");
         assert!(version_entry_event(&hist[0]).is_none());
     }
@@ -9911,7 +9931,7 @@ mod tests {
     #[test]
     fn strict_off_empty_caps_permits_store() {
         let _pg = crate::declared_writes::permissive_empty_caps_guard();
-        let state = Object::Map(hashbrown::HashMap::new());
+        let state = Object::Map(hashbrown::HashMap::new().into());
         let input = Object::seq(vec![
             Object::atom("any_cell"),
             Object::atom("v"),
@@ -9932,7 +9952,7 @@ mod tests {
     /// missing `allowed_writes:{name}` companion at apply time.
     #[test]
     fn strict_on_empty_caps_refuses_store() {
-        let state = Object::Map(hashbrown::HashMap::new());
+        let state = Object::Map(hashbrown::HashMap::new().into());
         let input = Object::seq(vec![
             Object::atom("any_cell"),
             Object::atom("v"),
@@ -9964,7 +9984,7 @@ mod tests {
                 Func::Id,
             ])),
         );
-        let d0 = Object::Map(hashbrown::HashMap::new());
+        let d0 = Object::Map(hashbrown::HashMap::new().into());
         // No `allowed_writes:undeclared_def` cell → no caps frame is
         // pushed by `defs_writes_scope`, so strict mode bottoms the
         // store inside the body.
@@ -9994,7 +10014,7 @@ mod tests {
                 Func::Id,
             ])),
         );
-        let d0 = Object::Map(hashbrown::HashMap::new());
+        let d0 = Object::Map(hashbrown::HashMap::new().into());
         let d1 = store("declared_def", func_to_object(&body), &d0);
         let d2 = store(
             "allowed_writes:declared_def",
@@ -10018,7 +10038,7 @@ mod tests {
     /// the empty-stack case, not the populated-stack rules.
     #[test]
     fn strict_on_apply_with_caps_inside_allowed_set_permits_store() {
-        let state = Object::Map(hashbrown::HashMap::new());
+        let state = Object::Map(hashbrown::HashMap::new().into());
         let input = Object::seq(vec![
             Object::atom("my_cell"),
             Object::atom("ok"),
@@ -10078,7 +10098,7 @@ mod tests {
     #[cfg(feature = "no_std")]
     #[test]
     fn no_std_empty_caps_permits_func_store() {
-        let state = Object::Map(hashbrown::HashMap::new());
+        let state = Object::Map(hashbrown::HashMap::new().into());
         let input = Object::seq(vec![
             Object::atom("init_cell"),
             Object::atom("kernel-boot"),
@@ -10102,7 +10122,7 @@ mod tests {
     #[cfg(not(feature = "no_std"))]
     #[test]
     fn worker_empty_caps_refuses_func_store_and_leaves_cell_unwritten() {
-        let state = Object::Map(hashbrown::HashMap::new());
+        let state = Object::Map(hashbrown::HashMap::new().into());
         let input = Object::seq(vec![
             Object::atom("some_cell"),
             Object::atom("unauthorized"),
@@ -10130,7 +10150,7 @@ mod tests {
     #[cfg(not(feature = "no_std"))]
     #[test]
     fn worker_populated_caps_permits_func_store_inside_allow_list() {
-        let state = Object::Map(hashbrown::HashMap::new());
+        let state = Object::Map(hashbrown::HashMap::new().into());
         let input = Object::seq(vec![
             Object::atom("my_cell"),
             Object::atom("v"),

@@ -415,7 +415,7 @@ pub fn prune_to_declared(
             .unwrap_or(Object::Bottom);
         out.insert((*target).to_string(), val);
     }
-    Object::Map(out)
+    Object::Map(out.into())
 }
 
 #[cfg(test)]
@@ -426,7 +426,7 @@ mod tests {
         let m: hashbrown::HashMap<String, Object> = pairs.iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect();
-        Object::Map(m)
+        Object::Map(m.into())
     }
 
     #[test]
@@ -517,7 +517,7 @@ mod tests {
     /// Baseline: a store to an out-of-set cell must return Bottom.
     #[test]
     fn apply_with_caps_refuses_store_outside_allowed_set() {
-        let state = Object::Map(hashbrown::HashMap::new());
+        let state = Object::Map(hashbrown::HashMap::new().into());
         // Func::Store:<name, contents, D> — attempts to write "Noun".
         let input = Object::seq(vec![
             Object::atom("Noun"),
@@ -538,7 +538,7 @@ mod tests {
     /// Object) is identical to plain `apply(Func::Store, ...)`.
     #[test]
     fn apply_with_caps_permits_store_inside_allowed_set() {
-        let state = Object::Map(hashbrown::HashMap::new());
+        let state = Object::Map(hashbrown::HashMap::new().into());
         let input = Object::seq(vec![
             Object::atom("my_cell"),
             Object::atom("ok"),
@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn apply_without_caps_permits_all_stores() {
         let _g = permissive_empty_caps_guard();
-        let state = Object::Map(hashbrown::HashMap::new());
+        let state = Object::Map(hashbrown::HashMap::new().into());
         let input = Object::seq(vec![
             Object::atom("Noun"),
             Object::atom("anything"),
@@ -591,7 +591,7 @@ mod tests {
     #[test]
     fn caps_pop_after_apply_with_caps_returns() {
         let _g = permissive_empty_caps_guard();
-        let state = Object::Map(hashbrown::HashMap::new());
+        let state = Object::Map(hashbrown::HashMap::new().into());
         let denied_input = Object::seq(vec![
             Object::atom("x"),
             Object::atom("v"),
@@ -630,7 +630,7 @@ mod tests {
             ])),
         );
         // Seed DEFS with the def body and the allowed_writes cell.
-        let d0 = Object::Map(hashbrown::HashMap::new());
+        let d0 = Object::Map(hashbrown::HashMap::new().into());
         let d1 = ast::store("evil", ast::func_to_object(&body), &d0);
         let d2 = ast::store(
             "allowed_writes:evil",
@@ -657,7 +657,7 @@ mod tests {
                 Func::Id,
             ])),
         );
-        let d0 = Object::Map(hashbrown::HashMap::new());
+        let d0 = Object::Map(hashbrown::HashMap::new().into());
         let d1 = ast::store("good_def", ast::func_to_object(&body), &d0);
         let d2 = ast::store(
             "allowed_writes:good_def",
@@ -692,7 +692,7 @@ mod tests {
                 Func::Id,
             ])),
         );
-        let d0 = Object::Map(hashbrown::HashMap::new());
+        let d0 = Object::Map(hashbrown::HashMap::new().into());
         let d1 = ast::store("legacy", ast::func_to_object(&body), &d0);
         let result = ast::apply(&Func::Def("legacy".to_string()), &d1, &d1);
         assert_eq!(
@@ -710,7 +710,7 @@ mod tests {
     /// frame at all — system mode).
     #[test]
     fn user_frame_cannot_write_protected_metamodel_cell_even_if_declared() {
-        let state = Object::Map(hashbrown::HashMap::new());
+        let state = Object::Map(hashbrown::HashMap::new().into());
         let input = Object::seq(vec![
             Object::atom("Noun"),
             Object::atom("forged"),
@@ -731,7 +731,7 @@ mod tests {
     /// never produce it.
     #[test]
     fn wildcard_frame_permits_writes_to_protected_cells() {
-        let state = Object::Map(hashbrown::HashMap::new());
+        let state = Object::Map(hashbrown::HashMap::new().into());
         let input = Object::seq(vec![
             Object::atom("Noun"),
             Object::atom("compile-write"),
@@ -763,7 +763,7 @@ mod tests {
         let declared_for_each: hashbrown::HashSet<String> =
             protected.iter().map(|s| s.to_string()).collect();
         for name in &protected {
-            let state = Object::Map(hashbrown::HashMap::new());
+            let state = Object::Map(hashbrown::HashMap::new().into());
             let input = Object::seq(vec![
                 Object::atom(name),
                 Object::atom("x"),

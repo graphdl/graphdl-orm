@@ -168,7 +168,7 @@ pub fn rmap_cells_from_state(state: &crate::ast::Object) -> crate::ast::Object {
     let mut map: HashMap<String, Object> = HashMap::new();
     map.insert("RMAPTable".to_string(), Object::Seq(table_rows.into()));
     map.insert("RMAPColumn".to_string(), Object::Seq(column_rows.into()));
-    Object::Map(map)
+    Object::Map(map.into())
 }
 
 // -- Cell reader helpers for downstream generators (#325) -------------
@@ -1122,7 +1122,7 @@ mod tests {
             cells.entry("Constraint".into()).or_default()
                 .push(crate::parse_forml2::constraint_to_fact_test(&cdef));
         }
-        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect())
+        Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect::<hashbrown::HashMap<_, _>>().into())
     }
 
     #[test]
@@ -1249,7 +1249,7 @@ mod tests {
         let mut state = make_state(nouns, fact_types, constraints);
         // Patch existing Noun facts with superType where applicable.
         let sub_map: HashMap<&str, &str> = subtypes.iter().copied().collect();
-        if let Object::Map(ref mut m) = state {
+        if let Object::Map(ref mut m_arc) = state { let m = alloc::sync::Arc::make_mut(m_arc);
             if let Some(Object::Seq(ref mut arc)) = m.get_mut("Noun") {
                 let updated: Vec<Object> = arc.iter().map(|f| {
                     let name = ast::binding(f, "name").unwrap_or("").to_string();
@@ -1355,7 +1355,7 @@ mod tests {
         let rs_map: HashMap<&str, String> = ref_schemes.iter()
             .map(|(n, p)| (*n, p.join(",")))
             .collect();
-        if let Object::Map(ref mut m) = state {
+        if let Object::Map(ref mut m_arc) = state { let m = alloc::sync::Arc::make_mut(m_arc);
             if let Some(Object::Seq(ref mut arc)) = m.get_mut("Noun") {
                 let updated: Vec<Object> = arc.iter().map(|f| {
                     let name = ast::binding(f, "name").unwrap_or("").to_string();

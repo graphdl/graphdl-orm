@@ -1286,7 +1286,7 @@ mod tests {
         }).collect();
         let mut map = HashMap::new();
         map.insert("EnumValues".to_string(), Object::Seq(Arc::from(facts)));
-        Object::Map(map)
+        Object::Map(map.into())
     }
 
     #[test]

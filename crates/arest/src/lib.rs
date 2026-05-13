@@ -634,7 +634,7 @@ impl CompiledState {
                 }
             }
         }
-        ast::Object::Map(map)
+        ast::Object::Map(map.into())
     }
 
     /// S1g (#723): drop chain entries for cell `name` that aren't
@@ -682,7 +682,7 @@ impl CompiledState {
         for (name, lock) in &self.cells {
             map.insert(name.clone(), lock.read().clone());
         }
-        ast::Object::Map(map)
+        ast::Object::Map(map.into())
     }
 
     /// Wholesale rebuild the cell map from a new D. Reuses existing
@@ -691,7 +691,7 @@ impl CompiledState {
     /// cells absent from the new state.
     fn replace_d(&mut self, new_d: ast::Object) {
         let new_map: hashbrown::HashMap<String, ast::Object> = match new_d {
-            ast::Object::Map(m) => m,
+            ast::Object::Map(m) => (*m).clone(),
             ast::Object::Seq(seq) => {
                 // CELL-triple representation: <<CELL, name, contents>, …>.
                 // Fall through to an empty map if the shape doesn't match.
@@ -1773,7 +1773,7 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         let new_cell = ast::Object::Seq(new_items.into());
         let mut delta_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
         delta_map.insert(ft_name.to_string(), new_cell);
-        let delta = ast::Object::Map(delta_map);
+        let delta = ast::Object::Map(delta_map.into());
         let new_d = ast::merge_delta(&snapshot, &delta, None);
         st.replace_d(new_d);
         return "ok".into();
@@ -2436,7 +2436,7 @@ fn augment_delta_with_entity_cells(
         }
 
         let cell_name = format!("{}:{}", noun_name, entity_id);
-        let row_obj = ast::Object::Map(row);
+        let row_obj = ast::Object::Map(row.into());
 
         // Skip emission if the entity cell already exists with the
         // same row contents — chain-extension is wasted work.
@@ -2456,7 +2456,7 @@ fn augment_delta_with_entity_cells(
             .collect(),
     };
     combined.extend(entity_rows);
-    ast::Object::Map(combined)
+    ast::Object::Map(combined.into())
 }
 
 /// Extract declared write targets for known system verbs. Returns
@@ -4037,13 +4037,13 @@ Order has total.
     /// unlike `allocate`, whose `defs_to_state` calls `cells_iter` and
     /// unwraps chains to latest contents).
     fn alloc_with_chain(name: &str, payloads: &[&str]) -> u32 {
-        let mut state = ast::Object::Map(hashbrown::HashMap::new());
+        let mut state = ast::Object::Map(hashbrown::HashMap::new().into());
         for p in payloads {
             let mut d = hashbrown::HashMap::new();
             d.insert(name.to_string(), ast::Object::atom(p));
-            state = ast::merge_delta(&state, &ast::Object::Map(d), None);
+            state = ast::merge_delta(&state, &ast::Object::Map(d.into()), None);
         }
-        let h = allocate(ast::Object::Map(hashbrown::HashMap::new()), vec![]);
+        let h = allocate(ast::Object::Map(hashbrown::HashMap::new().into()), vec![]);
         let tenant = tenant_lock(h).unwrap();
         tenant.write().replace_d(state);
         h
@@ -4161,10 +4161,10 @@ Order has total.
             let cur = st.snapshot_d();
             let mut d = hashbrown::HashMap::new();
             d.insert("Noun".to_string(), ast::Object::atom("c"));
-            let s3 = ast::merge_delta(&cur, &ast::Object::Map(d), None);
+            let s3 = ast::merge_delta(&cur, &ast::Object::Map(d.into()), None);
             let mut d = hashbrown::HashMap::new();
             d.insert("Noun".to_string(), ast::Object::atom("d"));
-            let s4 = ast::merge_delta(&s3, &ast::Object::Map(d), None);
+            let s4 = ast::merge_delta(&s3, &ast::Object::Map(d.into()), None);
             st.replace_d(s4);
         }
         assert_eq!(system_impl(h, "compact", "Noun"), "2",
@@ -5545,7 +5545,7 @@ mod storage_routing_tests {
             "counter".to_string(),
             ast::Object::Atom("42".to_string()),
         );
-        ast::Object::Map(m)
+        ast::Object::Map(m.into())
     }
 
     /// The acceptance round-trip. Commit bytes to a filesystem backend

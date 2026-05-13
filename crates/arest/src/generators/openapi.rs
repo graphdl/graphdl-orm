@@ -978,7 +978,7 @@ mod tests {
             ("fieldName", field_name), ("objectNoun", object_noun),
             ("objectValue", object_value),
         ]);
-        if let Object::Map(ref mut m) = state {
+        if let Object::Map(ref mut m_arc) = state { let m = alloc::sync::Arc::make_mut(m_arc);
             let mut v: Vec<Object> = m.get("InstanceFact")
                 .and_then(|o| o.as_seq())
                 .map(|s| s.to_vec())
@@ -1027,7 +1027,7 @@ mod tests {
             ]));
         }
         let mut state = state;
-        if let Object::Map(ref mut m) = state {
+        if let Object::Map(ref mut m_arc) = state { let m = alloc::sync::Arc::make_mut(m_arc);
             let mut v: Vec<Object> = m.get("InstanceFact")
                 .and_then(|o| o.as_seq())
                 .map(|s| s.to_vec())

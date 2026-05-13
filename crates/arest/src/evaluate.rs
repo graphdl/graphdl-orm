@@ -714,7 +714,7 @@ mod tests {
     fn build(cells: S) -> ast::Object {
         ast::Object::Map(cells.into_iter()
             .map(|(k, v)| (k, ast::Object::Seq(v.into())))
-            .collect())
+            .collect::<hashbrown::HashMap<_, _>>().into())
     }
 
     fn with_noun(mut cells: S, name: &str, def: &NounDef) -> S {

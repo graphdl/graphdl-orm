@@ -575,9 +575,9 @@ pub fn remove_cell(state: &Object, name: &str) -> Object {
             if !map.contains_key(name) {
                 return state.clone();
             }
-            let mut new_map: HashMap<String, Object> = map.clone();
+            let mut new_map: HashMap<String, Object> = (**map).clone();
             new_map.remove(name);
-            Object::Map(new_map)
+            Object::Map(new_map.into())
         }
         Object::Seq(_) => {
             let cells = crate::ast::cells_iter(state);

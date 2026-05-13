@@ -3186,7 +3186,7 @@ Counter has Count.
         }
         let mut map: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
         map.insert("InstanceFact".to_string(), Object::seq(facts));
-        Object::Map(map)
+        Object::Map(map.into())
     }
 
     #[test]
@@ -3239,7 +3239,7 @@ Counter has Count.
     #[test]
     fn sm_module_empty_sms_map_produces_nothing() {
         // State with no InstanceFact cell → no SM modules.
-        let state = Object::Map(hashbrown::HashMap::new());
+        let state = Object::Map(hashbrown::HashMap::new().into());
         let (modules, specs) = emit_sm_modules(&state);
         assert!(modules.is_empty());
         assert!(specs.is_empty());

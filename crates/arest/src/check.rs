@@ -69,7 +69,7 @@ fn encode_diag(d: &ReadingDiagnostic) -> Object {
     if let Some(s) = d.suggestion.as_ref() {
         map.insert("suggestion".to_string(), Object::atom(s));
     }
-    Object::Map(map)
+    Object::Map(map.into())
 }
 
 fn decode_diag(obj: &Object) -> Option<ReadingDiagnostic> {

@@ -163,7 +163,7 @@ mod tests {
         m.insert("FactType".to_string(), Object::phi());
         m.insert("schema:Order".to_string(), Object::phi()); // def — excluded
         m.insert("validate:c1".to_string(), Object::phi());  // def — excluded
-        let state = Object::Map(m);
+        let state = Object::Map(m.into());
         assert_eq!(cell_count(&state), 2);
     }
 }

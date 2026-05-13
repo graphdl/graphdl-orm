@@ -474,7 +474,7 @@ mod tests {
         }).collect();
         let mut map: HashbrownMap<String, Object> = HashbrownMap::new();
         map.insert("EnumValues".to_string(), Object::Seq(Arc::from(facts)));
-        Object::Map(map)
+        Object::Map(map.into())
     }
 
     #[test]
