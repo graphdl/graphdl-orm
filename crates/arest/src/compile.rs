@@ -4845,34 +4845,80 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
                 Func::constant(Object::atom("Resource")),
             ]))),
         );
-        // #905: extract_facts_from_pop returns the facts Seq directly
-        // (or phi). The pre-#905 wrapper applied `Selector(2)` here
-        // assuming the result was `<ft_id, [facts]>` (wrapped pair) —
-        // but that's the encoded-FT-entry shape, not the
-        // extract_facts_from_pop return shape. When the cell had a
-        // single empty fact (`<<>>`), the wrapper returned `Bottom`
-        // (Selector(2) on a 1-elem Seq is undefined), poisoning the
-        // downstream `is_new` check so every Task got "F" (not new)
-        // and the rule produced 0 facts. Drop the wrapper — phi /
-        // empty-seq propagates naturally through apply_to_all.
+        // task-741: extend "existing resources" to ALSO include any
+        // resource that has an event fact in a trigger FT cell. If a
+        // Task has `Task is finished` recorded, event-fold will derive
+        // its currentlyInStatus = 'completed' — init must skip the
+        // same resource to avoid double-emitting 'pending' alongside
+        // event-fold's 'completed' and surfacing a UC violation. The
+        // resource is at the role under sm.noun_name (e.g. "Task")
+        // in each trigger FT cell.
+        //
+        // Build one extractor per trigger FT (after canonical
+        // space→underscore normalization, matching event-fold's
+        // lookup). Concat all the per-cell resource Seqs together
+        // with the forResource Seq → the union of "already covered"
+        // resources.
+        let extract_sm_noun_role = Func::compose(
+            Func::apply_to_all(Func::Selector(2)),
+            Func::filter(Func::compose(Func::Eq, Func::construction(vec![
+                Func::Selector(1),
+                Func::constant(Object::atom(&sm_noun)),
+            ]))),
+        );
+        let mut existing_sources: Vec<Func> = vec![
+            Func::compose(
+                Func::Concat,
+                Func::compose(
+                    Func::apply_to_all(extract_for_resource),
+                    extract_facts_from_pop("State_Machine_is_for_Resource"),
+                ),
+            ),
+        ];
+        let mut seen_event_fts: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        for (_, _, event_ft) in sm.transition_table.iter() {
+            let canonical = event_ft.replace(' ', "_");
+            if seen_event_fts.insert(canonical.clone()) {
+                existing_sources.push(Func::compose(
+                    Func::Concat,
+                    Func::compose(
+                        Func::apply_to_all(extract_sm_noun_role.clone()),
+                        extract_facts_from_pop(&canonical),
+                    ),
+                ));
+            }
+        }
         let get_existing = Func::compose(
             Func::Concat,
-            Func::compose(
-                Func::apply_to_all(extract_for_resource),
-                extract_facts_from_pop("State_Machine_is_for_Resource"),
-            ),
+            Func::construction(existing_sources),
         );
 
         let pairs = Func::construction(vec![get_instances, get_existing]);
 
+        // task-741: is_new takes a pair `<instance, [existing]>` from
+        // DistR (where [existing] is the union of forResource values
+        // + per-trigger-FT resource values) and returns T iff
+        // `instance` ∉ [existing]. The pre-task-741 form used
+        // `compose(Selector(1), Selector(1))` as the left operand of
+        // Eq, expecting filter to expose the outer instance — but
+        // filter only passes the per-element value, so Selector(1)
+        // on the elem atom returns Bottom, the predicate always
+        // evaluated to F, and is_new produced "new" for every
+        // instance regardless of forResource state. Init was
+        // effectively unguarded — every recompile re-emitted
+        // 'pending' alongside event-fold's actual-status emissions.
+        //
+        // The correct shape uses DistL to lift the outer instance
+        // into each per-element pair, then compares Selector(1) ==
+        // Selector(2) per pair.
         let is_new = Func::compose(
             Func::NullTest,
             Func::compose(
                 Func::filter(Func::compose(Func::Eq, Func::construction(vec![
-                    Func::compose(Func::Selector(1), Func::Selector(1)),
-                    Func::Id,
+                    Func::Selector(1),
+                    Func::Selector(2),
                 ]))),
-                Func::Selector(2),
+                Func::DistL,
             ),
         );
 
