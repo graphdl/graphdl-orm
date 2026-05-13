@@ -207,38 +207,6 @@ pub(crate) struct FactEvent {
 /// keyed-cell shapes structurally.
 ///
 /// Multi-span UCs (composite keys) where every span lives on the same
-/// FT contribute all of their role indices. Multi-FT UCs are skipped
-/// (they're not a single-FT key constraint and don't map to the
-/// keyed-cell shape).
-///
-/// Only **alethic** UCs participate — deontic UCs (`It is forbidden
-/// that…`) carry the same kind="UC" tag in the Constraint cell but
-/// don't describe a structural key, so the false-positive filter
-/// excludes them.
-pub(crate) fn resolve_key_roles_for_ft(
-    ft_id: &str,
-    constraints: &[crate::types::ConstraintDef],
-) -> Option<Vec<usize>> {
-    let mut roles: Vec<usize> = Vec::new();
-    for c in constraints.iter() {
-        if c.kind != "UC" { continue; }
-        // Only alethic UCs are structural keys. Deontic UCs are
-        // permitted-style constraints that share the kind tag.
-        if c.modality.to_lowercase() != "alethic" { continue; }
-        if c.spans.is_empty() { continue; }
-        // Single-FT UC: every span must point at this FT id.
-        if !c.spans.iter().all(|s| s.fact_type_id == ft_id) { continue; }
-        for s in c.spans.iter() {
-            if !roles.contains(&s.role_index) {
-                roles.push(s.role_index);
-            }
-        }
-    }
-    if roles.is_empty() { return None; }
-    roles.sort_unstable();
-    Some(roles)
-}
-
 /// Compile all fact types in the IR to CompiledSchema (Construction of Selectors).
 fn compile_schemas(data: &CellIndex) -> HashMap<String, CompiledSchema> {
     data.fact_types.iter().map(|(id, ft)| {
@@ -282,7 +250,7 @@ fn compile_schemas(data: &CellIndex) -> HashMap<String, CompiledSchema> {
 /// Multiplicity-derived UCs (a noun with reference scheme + the FT
 /// that records that scheme value) currently appear in the constraint
 /// list explicitly, so they're picked up by the same scan.
-fn resolve_key_roles_for_ft(
+pub(crate) fn resolve_key_roles_for_ft(
     ft_id: &str,
     ft: &FactTypeDef,
     constraints: &[ConstraintDef],

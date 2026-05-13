@@ -7051,8 +7051,10 @@ mod tests {
             "Task(.id) is an entity type.\n"
         ).expect("parse_to_state_via_stage12");
         let data = crate::compile::cell_index_from_state(&state);
+        let ft = data.fact_types.get("Task_has_id")
+            .expect("synthesised Task_has_id must be in fact_types");
         let key_roles = crate::compile::resolve_key_roles_for_ft(
-            "Task_has_id", &data.constraints);
+            "Task_has_id", ft, &data.constraints);
         assert_eq!(key_roles, Some(alloc::vec![1]),
             "Task_has_id key_roles must be Some([1]); got {:?}", key_roles);
     }

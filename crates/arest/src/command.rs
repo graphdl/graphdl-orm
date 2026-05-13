@@ -749,11 +749,78 @@ fn create_via_defs(
     // against a state augmented by the first via merge_delta at the
     // commit boundary; within a single call the count is stable.
     let entity_id = explicit_id.unwrap_or("").to_string();
+    let explicit_id_provided = !entity_id.is_empty();
     let entity_id = if entity_id.is_empty() {
         auto_generate_entity_id(noun, state)
     } else {
         entity_id
     };
+
+    // task-737 — alethic UC pre-check for the primary reference
+    // scheme. When the caller supplied an explicit id and an entity
+    // with that id already exists in state, reject with a UC-shaped
+    // violation. Without this guard, a second `apply create` with the
+    // same explicit id silently extends the chain with a duplicate
+    // entity row — substrate corruption per ORM2 reference-scheme
+    // semantics. (The keyed-cell write path catches differing facts at
+    // the same key, but identical re-writes are byte-equal no-ops at
+    // that level; the pre-check is what surfaces the duplicate-entity
+    // case to the caller.)
+    if explicit_id_provided {
+        let noun_cell = ast::fetch_or_phi("Noun", state);
+        let ref_scheme = noun_cell.as_seq()
+            .and_then(|facts| facts.iter()
+                .find(|f| ast::binding(f, "name") == Some(noun))
+                .and_then(|f| ast::binding(f, "referenceScheme"))
+                .map(|s| s.to_string()))
+            .filter(|s| !s.is_empty());
+        if let Some(scheme) = ref_scheme {
+            // A Noun N has an entity with id v iff any cell carries a
+            // binding `<N, v>`. Skip internal cells (names containing
+            // ':' — derivation/strat2/cwa) so derived rollups don't
+            // shadow primary facts.
+            let already_exists = ast::cells_iter(state).iter().any(|(name, contents)| {
+                if name.contains(':') { return false; }
+                let mut iter = ast::cell_facts_iter(contents);
+                iter.any(|fact| {
+                    let pairs = match fact.as_seq() { Some(p) => p, None => return false };
+                    pairs.iter().any(|p| {
+                        let kv = match p.as_seq() { Some(s) => s, None => return false };
+                        kv.first().and_then(|k| k.as_atom()) == Some(noun)
+                            && kv.get(1).and_then(|v| v.as_atom()) == Some(entity_id.as_str())
+                    })
+                })
+            });
+            if already_exists {
+                // Use the same `uc:{primary_ft}` violation shape that
+                // cell_put_keyed's KeyConflict surfaces (task-822) so
+                // downstream consumers see one constraint family for
+                // both pre-check and storage-layer rejections.
+                let first_part = scheme.split(',').next().unwrap_or("id").trim();
+                let primary_ft = format!("{}_has_{}", noun, first_part);
+                let viol = crate::types::Violation {
+                    constraint_id: format!("uc:{}", primary_ft),
+                    constraint_text: format!(
+                        "Each {} has at most one {} (reference scheme uniqueness)",
+                        noun, first_part),
+                    detail: format!(
+                        "Uniqueness violation: key '{}' is not unique in {}",
+                        entity_id, primary_ft),
+                    alethic: true,
+                };
+                return CommandResult {
+                    entities: alloc::vec![],
+                    status: None,
+                    transitions: alloc::vec![],
+                    navigation: alloc::vec![],
+                    violations: alloc::vec![viol],
+                    derived_count: 0,
+                    rejected: true,
+                    state: ast::Object::phi(),
+                };
+            }
+        }
+    }
 
     // task-822: read the per-cell key-roles map once. The resolve emit
     // path below routes through `push_with_uc_check`, which consults
