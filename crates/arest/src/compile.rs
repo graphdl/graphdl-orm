@@ -2593,7 +2593,7 @@ fn compile_data_with_state(
 ) -> CompiledModel {
     let t0 = profile_timer::now();
     let constraints: Vec<CompiledConstraint> = data.constraints.iter()
-        .map(|def| compile_constraint(data, def))
+        .map(|def| compile_constraint(data, def, state))
         .collect();
     diag!("  [profile] {} constraints: {:?}", constraints.len(), t0.elapsed());
 
@@ -5197,7 +5197,11 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
     CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func, uses_negation: false }
 }
 
-fn compile_constraint(data: &CellIndex, def: &ConstraintDef) -> CompiledConstraint {
+fn compile_constraint(
+    data: &CellIndex,
+    def: &ConstraintDef,
+    state: Option<&crate::ast::Object>,
+) -> CompiledConstraint {
     let modality = match def.modality.to_lowercase().as_str() {
         "deontic" => {
             let op = match def.deontic_operator.as_deref() {
@@ -5232,7 +5236,7 @@ fn compile_constraint(data: &CellIndex, def: &ConstraintDef) -> CompiledConstrai
             "AT" | "ANS" => compile_ring_antisymmetric_ast(def),
 
             // -- AST with Native evaluation kernel --------------------
-            "UC" => compile_uniqueness_ast(data, def),
+            "UC" => compile_uniqueness_ast(data, def, state),
             "MC" => compile_mandatory_ast(data, def),
 
             // -- AST with Native evaluation kernel (continued) --------
@@ -5692,8 +5696,87 @@ fn compile_ring_reflexive_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
 // Constraint-specific evaluation uses Native where point-free FP
 // would be impractical (grouping, counting, set operations).
 
+/// task-820 predicate: does the Map-storage key of every FT touched
+/// by this UC subsume the UC's own span roles, AND is the FT's
+/// actual cell already Map-backed in `state` at compile time?
+///
+/// Returns `true` iff for every `(ft_id, spans_in_group)` group:
+///   1. `data.fact_types[ft_id]` exists, AND
+///   2. `resolve_key_roles_for_ft(ft_id, ft, constraints)` returns
+///      `Some(rs)` (the storage flipped Seq → Map for this FT), AND
+///   3. every span's `role_index` in this group is contained in `rs`
+///      (the storage key is the same dimension along which this UC
+///      detects duplicates), AND
+///   4. the actual `<ft_id>` cell in `state` is currently an
+///      `Object::Map` (the runtime cell layout has switched, meaning
+///      `cell_put_keyed` has already been ingesting facts through this
+///      cell — every fact reachable from this Func will have passed the
+///      UC check at the keyed-put site).
+///
+/// The state-shape gate (4) is what makes the short-circuit *safe* for
+/// test fixtures and any caller that builds the FT cell via the legacy
+/// `cell_push` Seq-append. Those callers leave the cell as
+/// `Object::Seq` even when the schema's `key_roles` says it should be
+/// Map-backed. Skipping (4) would emit `Constant(phi)` against a Seq-
+/// shaped cell that still admits duplicates, dropping detection.
+///
+/// In production, the cell flips to `Object::Map` after the first
+/// `cell_put_keyed` (which migrates Seq → Map under the hood, see
+/// `ast::cell_put_keyed`). The compile-time gate fires on every
+/// *re-compile* once data has flowed through the keyed path; the very
+/// first compile (over a schema with no facts yet) sees an empty/absent
+/// cell and falls through to the legacy cross-scan — a single round of
+/// redundant work that disappears as soon as the next compile rolls
+/// around. The deferred-optimization tradeoff is intentional: it lets
+/// the predicate stay state-aware *and* keep cross-scan as a safety
+/// net for cell_push-shaped fixtures (induce, legacy evaluate tests).
+///
+/// `state == None` (synthetic compile paths that lack an Object) is
+/// treated as "no information about cell shape" → NOT covered →
+/// cross-scan stays. Same conservative read as missing FT.
+fn uc_storage_covered_for_all_groups(
+    data: &CellIndex,
+    span_groups: &[(String, Vec<ResolvedSpan>)],
+    state: Option<&crate::ast::Object>,
+) -> bool {
+    if span_groups.is_empty() { return false; }
+    let Some(state) = state else { return false; };
+    span_groups.iter().all(|(ft_id, spans_in_group)| {
+        let Some(ft) = data.fact_types.get(ft_id) else { return false; };
+        // resolve_key_roles_for_ft is the single source of truth for
+        // what `CompiledSchema.key_roles` will be at compile time.
+        // Calling it directly here (rather than reaching into a
+        // partially-built model) keeps the predicate stateless and
+        // mirrors what `compile_schemas` does upstream.
+        let Some(key_roles) = resolve_key_roles_for_ft(ft_id, ft, &data.constraints) else {
+            return false;
+        };
+        // "Coverage": every UC span's role is part of the cell key.
+        // Equivalent to (set of span role indices) ⊆ (set of key role
+        // indices). Using `contains` on the Vec is O(|key_roles|) per
+        // span — fine because key sizes are tiny (1 for single-role
+        // UCs, 2-3 for composites) and this runs once per UC at compile.
+        if !spans_in_group.iter().all(|s| key_roles.contains(&s.role_index)) {
+            return false;
+        }
+        // State-shape gate: the actual cell at compile time must be a
+        // Map. `fetch_or_phi` returns φ (an empty Seq) for absent
+        // cells, an `Object::Seq` for cell_push-shaped cells, and an
+        // `Object::Map` once `cell_put_keyed` has migrated. We only
+        // short-circuit on the third shape.
+        matches!(
+            crate::ast::fetch_or_phi(ft_id, state),
+            crate::ast::Object::Map(_)
+        )
+    })
+}
+
 /// UC: |bu(fact_type, scope_value) : P| <= 1. Violation when > 1.
-fn compile_uniqueness_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
+fn compile_uniqueness_ast(
+    data: &CellIndex,
+    def: &ConstraintDef,
+    state: Option<&crate::ast::Object>,
+) -> Func {
     let spans = resolve_spans(data, &def.spans);
 
     let groups: HashMap<String, Vec<ResolvedSpan>> = spans.iter().fold(HashMap::new(), |mut acc, span| {
@@ -5701,6 +5784,61 @@ fn compile_uniqueness_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         acc
     });
     let span_groups: Vec<(String, Vec<ResolvedSpan>)> = groups.into_iter().collect();
+
+    // task-820 early-return: a UC whose spans are entirely covered by
+    // the Map-storage key of every FT it touches AND whose target
+    // cells are *already Map-backed at compile time* is a structural
+    // no-op in the constraint evaluator. The cell-side keyed-store
+    // (`ast::cell_put_keyed`, task-744 phase 2 + #743) returns
+    // `Err(KeyConflict)` the moment a second tuple lands at the same
+    // scope key with a different non-key value, and the forward-chain
+    // emit path `.expect()`s that Err into a visible panic
+    // (`evaluate.rs::integrate_round_facts`, task-818/task-819). When
+    // both conditions hold, the cross-scan `has_any_dup` Func that
+    // the legacy branches build below is strictly redundant: it
+    // would scan a population that, by construction, never contains
+    // the duplicate it's looking for. Emitting `Constant(phi)`
+    // collapses the per-round constraint cost from O(N²) to a single
+    // pattern-match.
+    //
+    // The early-return only fires when ALL FOUR hold:
+    //   (a) every span's FT has `key_roles = Some(rs)` (storage is
+    //       Map-keyed for that FT),
+    //   (b) every span's `role_index` ∈ `rs` (the storage's key
+    //       conflict at this role is what would surface this UC's
+    //       violation),
+    //   (c) every span's actual FT cell in `state` at compile time
+    //       is already an `Object::Map` (the runtime really has been
+    //       going through `cell_put_keyed`, not the legacy
+    //       `cell_push` Seq-append).
+    //
+    // Condition (c) is what keeps cross-scan as the safety net for
+    // tests / callers that build state via `cell_push`. Those leave
+    // the cell as Seq even when the schema-level key_roles says it
+    // should be Map; emitting φ against a Seq cell would silently
+    // drop UC detection. (c) makes the optimization apply only when
+    // the runtime is *actually* Map-shaped — which is the only state
+    // in which `cell_put_keyed` is verifiably enforcing.
+    //
+    // Cross-FT UCs (rare; an external UC tying roles across several
+    // FTs) only short-circuit when every contributing FT
+    // independently satisfies (a)+(b)+(c). Anything not satisfying
+    // them (spanning UC over the full tuple, deontic UC, mixed
+    // Seq + Map cell pair, first-compile-over-empty-state) falls
+    // through to the legacy cross-scan below — the legacy Func
+    // remains the safety net for any case the storage layer doesn't
+    // already enforce.
+    //
+    // CAUTION FOR FUTURE READERS: it is *surprising* that a
+    // constraint compiler can return the no-op φ for a UC the user
+    // explicitly declared. The justification is that the constraint
+    // has been *lowered into the cell representation itself*: the FT
+    // cell is no longer a Seq of tuples to be cross-scanned, but a
+    // Map keyed by the UC's key roles. The "constraint" exists at
+    // every cell write, not at periodic constraint evaluation.
+    if uc_storage_covered_for_all_groups(data, &span_groups, state) {
+        return Func::constant(Object::phi());
+    }
 
     // Pure Func UC: single fact type, any number of spans.
     // Scope = first span's role (the "Each" side). Uniqueness on scope means
@@ -7589,6 +7727,200 @@ mod schema_tests {
         let model = compile(&state);
         let schema = model.schemas.get("ft1").expect("ft1 schema");
         assert_eq!(schema.key_roles, None);
+    }
+
+    // ── task-820: UC compiler emits φ when storage enforces alethic UC ──
+    //
+    // When a fact type's CompiledSchema has `key_roles: Some(rs)`, the
+    // UC's spans land on roles ⊆ rs, AND the actual FT cell in the
+    // state is already `Object::Map`-shaped at compile time, the
+    // Map-backed cell storage is the alethic-UC enforcer (cell_put_keyed
+    // returns Err(KeyConflict) on insert; task-744 phase 2 + phase 4 +
+    // task-819). The cross-scan Func that `compile_uniqueness_ast`
+    // would otherwise build is pure redundant work: it cannot fire,
+    // because a violating fact never lands in the cell in the first
+    // place. The compiler therefore emits a no-op φ Func
+    // (`Func::constant(Object::phi())`).
+    //
+    // The state-shape gate (the third condition) is what protects
+    // callers that build state via `cell_push` (Seq-append): those
+    // bypass cell_put_keyed and the Map storage isn't actually
+    // enforcing, so the constraint Func must keep cross-scanning to
+    // surface duplicates. Tests must seed the FT cell as `Object::Map`
+    // (mirroring what one or more `cell_put_keyed` calls would
+    // produce in production) for the short-circuit to fire.
+
+    /// Helper: install an empty `Object::Map` at the FT cell name so
+    /// the task-820 state-shape gate sees a Map (the production
+    /// runtime shape after `cell_put_keyed` has migrated the cell).
+    fn install_map_cell(state: &mut Object, cell_name: &str) {
+        if let Object::Map(ref mut m_arc) = state {
+            let m = alloc::sync::Arc::make_mut(m_arc);
+            m.insert(
+                cell_name.to_string(),
+                Object::Map(alloc::sync::Arc::new(hashbrown::HashMap::new())),
+            );
+        }
+    }
+
+    /// FT with a single-role alethic UC over role 0 AND a Map-shaped
+    /// FT cell at compile time → the UC compiler returns φ. The cell
+    /// storage layer (Object::Map keyed by role 0) already rejects
+    /// duplicates at insert time via cell_put_keyed.
+    #[test]
+    fn uc_compiler_emits_phi_when_storage_covers_key() {
+        let mut compile_state = person_has_name_with_uc();
+        // Seed the FT cell as a Map. Production gets here via the
+        // first `cell_put_keyed` write migrating Seq → Map; the test
+        // installs an empty Map directly so the state-shape gate fires
+        // without needing to route through forward-chain emit.
+        install_map_cell(&mut compile_state, "ft1");
+        let model = compile(&compile_state);
+        let constraint = model.constraints.iter()
+            .find(|c| c.id == "uc1")
+            .expect("uc1 constraint must be present");
+
+        // Shape assertion: the Func is a single Constant whose payload
+        // is the empty Seq (Object::phi()). No Compose, no Filter, no
+        // DistR — this is the structural marker for "no-op."
+        match &constraint.func {
+            crate::ast::Func::Constant(o) => assert_eq!(*o, Object::phi()),
+            other => panic!(
+                "uc1 over alethic key_roles=[0] AND Map-backed ft1 cell \
+                 must compile to Constant(phi); got {:?}", other),
+        }
+
+        // Behavioral assertion: applying the Func to any context
+        // returns φ — i.e., zero violations. This pins the runtime
+        // contract that the constraint-family fold expects: the
+        // storage layer, not this Func, is the alethic UC enforcer.
+        let viol_state = Object::phi();
+        let ctx = crate::ast::encode_eval_context_state("", None, &viol_state);
+        let defs = Object::phi();
+        assert_eq!(crate::ast::apply(&constraint.func, &ctx, &defs),
+            Object::phi(),
+            "the no-op UC Func must evaluate to phi over a phi context");
+    }
+
+    /// Composite alethic UC over both roles of a ternary FT + Map-shaped
+    /// FT cell → the schema's `key_roles` is `Some([0, 1])` (composite
+    /// key), the UC's spans are exactly {0, 1}, AND the cell is Map at
+    /// compile time → short-circuit to φ.
+    #[test]
+    fn uc_compiler_emits_phi_when_composite_key_covers_uc() {
+        let mut state = make_state_with_fact_type(
+            "ft1", "Membership is for Person in Organization on Date",
+            vec![("Person", 0), ("Organization", 1), ("Date", 2)],
+        );
+        let uc = ConstraintDef {
+            id: "uc-composite".into(),
+            kind: "UC".into(),
+            modality: "Alethic".into(),
+            text: "Each (Person, Organization) pair appears in at most one Membership".into(),
+            spans: vec![
+                SpanDef { fact_type_id: "ft1".into(), role_index: 0, subset_autofill: None },
+                SpanDef { fact_type_id: "ft1".into(), role_index: 1, subset_autofill: None },
+            ],
+            ..Default::default()
+        };
+        if let crate::ast::Object::Map(ref mut m_arc) = state {
+            let m = alloc::sync::Arc::make_mut(m_arc);
+            m.insert("Constraint".into(), crate::ast::Object::Seq(vec![
+                crate::parse_forml2::constraint_to_fact_test(&uc),
+            ].into()));
+        }
+        // Map-backed FT cell — the state-shape gate's precondition.
+        install_map_cell(&mut state, "ft1");
+        let model = compile(&state);
+        // Precondition: schema.key_roles must be Some([0, 1]) per
+        // `key_roles_uses_composite_uc_when_single_role_uc_absent`.
+        let schema = model.schemas.get("ft1").expect("ft1 schema");
+        assert_eq!(schema.key_roles, Some(vec![0, 1]),
+            "composite UC must produce composite key_roles");
+        // Result: φ, because span roles {0,1} ⊆ key_roles {0,1} AND
+        // the ft1 cell is Map.
+        let constraint = model.constraints.iter()
+            .find(|c| c.id == "uc-composite")
+            .expect("uc-composite constraint must be present");
+        match &constraint.func {
+            crate::ast::Func::Constant(o) => assert_eq!(*o, Object::phi()),
+            other => panic!(
+                "composite UC over key-covered roles + Map cell must \
+                 compile to Constant(phi); got {:?}", other),
+        }
+    }
+
+    /// Same single-role UC as `uc_compiler_emits_phi_when_storage_covers_key`
+    /// but with the FT cell built as `Object::Seq` (the legacy
+    /// `cell_push` shape). The state-shape gate is False → the
+    /// short-circuit must NOT fire — the cross-scan Func is the only
+    /// remaining UC enforcer for this cell. Pins acceptance #3: a
+    /// fixture using `cell_push` keeps the legacy detection path.
+    #[test]
+    fn uc_compiler_keeps_cross_scan_for_cell_push_seq_storage() {
+        // person_has_name_with_uc() leaves the ft1 cell unset; that's
+        // equivalent to a Seq-shaped cell as far as the gate is
+        // concerned (fetch_or_phi returns φ, not Object::Map). The
+        // gate condition (4) is false → cross-scan stays.
+        let compile_state = person_has_name_with_uc();
+        let model = compile(&compile_state);
+        let constraint = model.constraints.iter()
+            .find(|c| c.id == "uc1")
+            .expect("uc1 constraint must be present");
+        // Anti-shape: cross-scan UC starts with a Compose at the
+        // outermost layer (see `compile_uniqueness_ast`: the result
+        // is `Func::compose(condition, violating)`). It is NOT a bare
+        // Constant.
+        assert!(!matches!(&constraint.func, crate::ast::Func::Constant(_)),
+            "Seq-backed (cell_push) ft1 cell must keep the legacy \
+             cross-scan Func — gate condition (4) is false; got: {:?}",
+            constraint.func);
+    }
+
+    /// Spanning UC (covers every role of a binary FT) → `key_roles`
+    /// stays None (see `key_roles_skips_spanning_uc_over_full_arity`).
+    /// The UC compiler must keep the legacy cross-scan even when the
+    /// cell is Map: gate condition (1) fails because the schema-level
+    /// `key_roles` is None to begin with.
+    #[test]
+    fn uc_compiler_keeps_cross_scan_for_spanning_uc() {
+        let mut state = make_state_with_fact_type(
+            "ft1", "Tag is for Item",
+            vec![("Tag", 0), ("Item", 1)],
+        );
+        let uc = ConstraintDef {
+            id: "uc-spanning".into(),
+            kind: "UC".into(),
+            modality: "Alethic".into(),
+            text: "Each (Tag, Item) pair appears at most once".into(),
+            spans: vec![
+                SpanDef { fact_type_id: "ft1".into(), role_index: 0, subset_autofill: None },
+                SpanDef { fact_type_id: "ft1".into(), role_index: 1, subset_autofill: None },
+            ],
+            ..Default::default()
+        };
+        if let crate::ast::Object::Map(ref mut m_arc) = state {
+            let m = alloc::sync::Arc::make_mut(m_arc);
+            m.insert("Constraint".into(), crate::ast::Object::Seq(vec![
+                crate::parse_forml2::constraint_to_fact_test(&uc),
+            ].into()));
+        }
+        let model = compile(&state);
+        // key_roles is None for spanning UC — the cross-scan must
+        // remain because nothing else is enforcing.
+        let schema = model.schemas.get("ft1").expect("ft1 schema");
+        assert_eq!(schema.key_roles, None,
+            "spanning UC must not key the cell (precondition)");
+        let constraint = model.constraints.iter()
+            .find(|c| c.id == "uc-spanning")
+            .expect("uc-spanning constraint must be present");
+        // Anti-shape: cross-scan UC starts with a Compose at the
+        // outermost layer (see `compile_uniqueness_ast`: the result is
+        // `Func::compose(condition, violating)`). It is decidedly NOT a
+        // bare Constant.
+        assert!(!matches!(&constraint.func, crate::ast::Func::Constant(_)),
+            "spanning UC must keep the legacy cross-scan Func; got: {:?}",
+            constraint.func);
     }
 
     #[test]
