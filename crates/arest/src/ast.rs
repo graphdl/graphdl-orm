@@ -5629,6 +5629,80 @@ mod tests {
         assert!(matches!(func, Func::SetFromSeq));
     }
 
+    /// task-744 phase 6 perf finding (and regression guard).
+    ///
+    /// We expected SetFromSeq+FetchOrPhi to beat HasMember at SM-init
+    /// scale by replacing O(N·M) atom-scan with O(N+M) hash-set
+    /// lookup. The actual result inverted that: at N=M=700 the new
+    /// pattern was ~40× SLOWER (149ms vs 3.6ms). Cause: Object::Map's
+    /// HashMap is not Arc-shared, so the DistR pattern that
+    /// distributes the existing-set across N instances deep-clones
+    /// the entire HashMap N times — O(N²) entry allocations swamp
+    /// the O(N+M) lookups.
+    ///
+    /// HasMember stays as the production path until Object::Map's
+    /// HashMap is wrapped in Arc (mirror of Object::Seq's Arc<[Object]>
+    /// representation). This test pins the finding so any future
+    /// "let's go back to SetFromSeq" change has to deal with the
+    /// share-cost question first — and it inverts naturally once
+    /// the Arc-Map refactor lands.
+    ///
+    /// Filed as task-817 follow-up: Arc-wrap Object::Map's HashMap
+    /// so SetFromSeq+FetchOrPhi can pay off.
+    #[test]
+    fn membership_perf_set_from_seq_loses_to_has_member_pending_arc_map() {
+        const N: usize = 700;
+        const M: usize = 700;
+
+        let haystack_atoms: Vec<Object> = (0..N)
+            .map(|i| Object::atom(&format!("r-{}", i)))
+            .collect();
+        let needles: Vec<Object> = (0..M)
+            .map(|i| Object::atom(&format!("r-{}", i)))
+            .collect();
+        let haystack_seq = Object::Seq(haystack_atoms.into());
+        let defs = defs();
+
+        // Pattern A: SetFromSeq + FetchOrPhi.
+        let t_a = crate::time_shim::Instant::now();
+        let set = apply(&Func::SetFromSeq, &haystack_seq, &defs);
+        let is_new_new = Func::compose(Func::NullTest, Func::FetchOrPhi);
+        let mut hits_new = 0usize;
+        for needle in &needles {
+            let input = Object::seq(vec![needle.clone(), set.clone()]);
+            if apply(&is_new_new, &input, &defs) == Object::f() {
+                hits_new += 1;
+            }
+        }
+        let elapsed_new = t_a.elapsed();
+
+        // Pattern B: HasMember atom-scan with Arc-shared haystack.
+        let t_b = crate::time_shim::Instant::now();
+        let mut hits_has = 0usize;
+        for needle in &needles {
+            let input = Object::seq(vec![needle.clone(), haystack_seq.clone()]);
+            if apply(&Func::HasMember, &input, &defs) == Object::t() {
+                hits_has += 1;
+            }
+        }
+        let elapsed_has = t_b.elapsed();
+
+        // Both shapes agree on membership.
+        assert_eq!(hits_new, hits_has, "membership semantics diverged");
+        assert_eq!(hits_new, M, "every needle should be a member");
+
+        // Pending the Arc-Map refactor, HasMember wins.
+        assert!(
+            elapsed_has < elapsed_new,
+            "HasMember should be faster than SetFromSeq+FetchOrPhi at \
+             N=M={} until Object::Map's HashMap is Arc-shared. \
+             Got has={:?} new={:?}. If this inverts, the Arc-Map \
+             refactor may have landed — re-evaluate which pattern \
+             compile_sm_init_for should use.",
+            N, elapsed_has, elapsed_new,
+        );
+    }
+
     // ── Compact (#352) — drops ⊥ elements so Filter derives cleanly
     //    from compact ∘ α(p → id ; ⊥) per Backus §11.2.4.
 

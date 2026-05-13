@@ -4964,29 +4964,36 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
             Func::construction(existing_sources),
         );
 
-        // task-744 phase 5: convert the existing-resources Seq into a
-        // Map<resource_atom, T> once per round. SetFromSeq builds the
-        // hash-set in O(N); thereafter each is_new check is O(1) via
-        // FetchOrPhi against that Map. Replaces task-743's allocation-
-        // free-but-still-O(N) HasMember scan, giving O(N+M) total
-        // instead of O(N·M) for the M-instance × N-existing cross
-        // product the SM init derivation walks every round.
-        let get_existing_set = Func::compose(Func::SetFromSeq, get_existing);
+        let pairs = Func::construction(vec![get_instances, get_existing]);
 
-        let pairs = Func::construction(vec![get_instances, get_existing_set]);
-
-        // is_new on `<instance, existing_set>`: T iff instance is NOT a
-        // key of existing_set. `FetchOrPhi:<key, map>` returns the
-        // value at key (here always atom "T") or φ if the key is
-        // absent. NullTest is T iff the result is φ — so T means "not
-        // a member", which is exactly what is_new asks.
-        let is_new = Func::compose(Func::NullTest, Func::FetchOrPhi);
+        // task-741 / task-743: is_new takes a pair `<instance, [existing]>`
+        // from DistR (where [existing] is the union of forResource values
+        // + per-trigger-FT resource values) and returns T iff
+        // `instance` ∉ [existing].
+        //
+        // Implemented as `not ∘ has_member`: HasMember:<needle, haystack>
+        // returns T if needle is an element of haystack (primitive
+        // membership test, #743). The DistR pattern clones haystack via
+        // Arc ref-count bumps (Object::Seq is Arc-wrapped), so the
+        // cross-product DistR + HasMember pattern runs in O(N·M) atom
+        // comparisons with O(N) allocation per round.
+        //
+        // task-744 phase 5 tried to replace this with `SetFromSeq +
+        // FetchOrPhi` for O(N+M) hash-set semantics, but Object::Map's
+        // HashMap is NOT Arc-shared — DistR's right-side clone deep-
+        // copies the entire HashMap N times, regressing to O(N²)
+        // entry allocations and ~40× slower in the perf test at
+        // N=M=700 (149ms vs 3.6ms). Reverted; HasMember stays as the
+        // production path. The Map-shared refactor (Arc-wrap
+        // Object::Map's HashMap) is filed as the proper follow-up so
+        // the SetFromSeq+FetchOrPhi composition can pay off.
+        let is_new = Func::compose(Func::Not, Func::HasMember);
 
         // set_diff = alpha(sel(1)) . Filter(is_new) . distr
-        // is_new = null . FetchOrPhi
-        // distr : <R, S> -> <<r1,S>,...,<rn,S>>  where S is the existing-set Map.
-        // For each <ri, S>: FetchOrPhi:<ri, S> = T (member) or φ (not).
-        // null:φ = T → is_new = T → ri is new. Empty S → every ri is new.
+        // is_new = not . has_member
+        // distr : <R, S> -> <<r1,S>,...,<rn,S>>
+        // For each <ri, S>: has_member:<ri, S> = T iff ri ∈ S.
+        // Handles empty S correctly (has_member:<ri, φ> = F → is_new = T).
         let new_instances = Func::compose(
             Func::apply_to_all(Func::Selector(1)),
             Func::compose(Func::filter(is_new), Func::compose(Func::DistR, pairs)),
