@@ -411,42 +411,10 @@ pub fn encode_command_result(result: &CommandResult) -> ast::Object {
 
 // -- Apply ------------------------------------------------------------
 
-/// task-822: read the `_CellKeyRoles` metadata cell emitted by
-/// `compile_to_defs_state` (task-744 phase 4) into a
-/// `ft_id → role_names` map. Mirrors `evaluate.rs::read_cell_key_roles`
-/// — vendored here because that helper is private to `evaluate.rs` and
-/// task-822 stays within `command.rs`. Keep the two readers structurally
-/// identical so they consume the same encoding without skew.
-///
-/// The cell is stored via `Func::constant(Object::Seq(entries))` so
-/// `func_to_object` wraps it as `<atom("'"), seq_of_entries>`. Unwrap
-/// the wrapper here so callers see the entries directly. Each entry is
-/// a named-tuple fact: `<<ftId, ft_id_atom>, <keyRoles, "Role1,…">>`.
-fn read_cell_key_roles_local(d: &ast::Object) -> hashbrown::HashMap<String, Vec<String>> {
-    let cell = ast::fetch_or_phi("_CellKeyRoles", d);
-    let entries: Vec<ast::Object> = cell.as_seq()
-        .and_then(|items| {
-            if items.len() == 2 && items[0].as_atom() == Some("'") {
-                items[1].as_seq().map(|s| s.to_vec())
-            } else {
-                Some(items.to_vec())
-            }
-        })
-        .unwrap_or_default();
-    let mut out: hashbrown::HashMap<String, Vec<String>> =
-        hashbrown::HashMap::with_capacity(entries.len());
-    for fact in entries.iter() {
-        let Some(ft_id) = ast::binding(fact, "ftId") else { continue };
-        let Some(roles_csv) = ast::binding(fact, "keyRoles") else { continue };
-        let names: Vec<String> = roles_csv.split(',')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect();
-        if names.is_empty() { continue; }
-        out.insert(ft_id.to_string(), names);
-    }
-    out
-}
+// task-822: `read_cell_key_roles_local` was vendored from
+// `evaluate.rs::read_cell_key_roles` because that helper was private.
+// task-820 revision made it `pub(crate)`, so the local vendor is now
+// redundant — apply path uses the shared parser directly.
 
 /// task-822: build a `Violation` mirroring the shape that
 /// `compile_uniqueness_ast` would emit at validate time. Surfaced from
@@ -698,7 +666,7 @@ fn create_via_defs(
     // Conflicts on the keyed path land in `uc_violations` and surface
     // alongside the validate-stage violations the existing pipeline
     // already aggregates.
-    let key_roles = read_cell_key_roles_local(d);
+    let key_roles = crate::evaluate::read_cell_key_roles(d);
     let mut uc_violations: Vec<crate::types::Violation> = Vec::new();
 
     // ── resolve: populate facts via ρ(resolve:{noun}) ──────────────
@@ -1316,7 +1284,7 @@ fn update_via_defs(
     // explicitly replace the prior entry without raising a UC
     // violation (the user's intent on `update`). Cells without a UC
     // stay on the legacy Seq filter-then-push path.
-    let key_roles = read_cell_key_roles_local(d);
+    let key_roles = crate::evaluate::read_cell_key_roles(d);
     let mut uc_violations: Vec<crate::types::Violation> = Vec::new();
 
     // Per-field retract-then-insert SCOPED TO PAYLOAD: only fold over
