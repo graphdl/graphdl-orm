@@ -39,6 +39,86 @@ use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 /// though additional derivations may be possible. This is safe because
 /// each derived fact is individually correct; only completeness is
 /// affected.
+/// Read the `_CellKeyRoles` metadata cell (emitted by
+/// `compile_to_defs_state`) into a `ft_id → role_names` map. Forward-
+/// chain emit paths consult this to route writes for keyed cells
+/// through `ast::cell_put_keyed` (Map storage) instead of the legacy
+/// Seq append. Cells absent from the map keep the legacy Seq path —
+/// behavior-preserving for everything without an alethic UC.
+///
+/// The cell is stored via `Func::constant(Object::Seq(entries))` so
+/// `func_to_object` wraps it as `<atom("'"), seq_of_entries>`. Unwrap
+/// the wrapper here so callers see the entries directly. Each entry
+/// is a named-tuple fact: `<<ftId, ft_id_atom>, <keyRoles, "Role1,…">>`.
+fn read_cell_key_roles(d: &ast::Object) -> hashbrown::HashMap<String, Vec<String>> {
+    use hashbrown::HashMap;
+    let cell = ast::fetch_or_phi("_CellKeyRoles", d);
+    let entries: Vec<ast::Object> = cell.as_seq()
+        .and_then(|items| {
+            if items.len() == 2 && items[0].as_atom() == Some("'") {
+                items[1].as_seq().map(|s| s.to_vec())
+            } else {
+                Some(items.to_vec())
+            }
+        })
+        .unwrap_or_default();
+    let mut out: HashMap<String, Vec<String>> = HashMap::with_capacity(entries.len());
+    for fact in entries.iter() {
+        let Some(ft_id) = ast::binding(fact, "ftId") else { continue };
+        let Some(roles_csv) = ast::binding(fact, "keyRoles") else { continue };
+        let names: Vec<String> = roles_csv.split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if names.is_empty() { continue; }
+        out.insert(ft_id.to_string(), names);
+    }
+    out
+}
+
+/// Integrate one round's `(cell_name → facts)` batch into `state`,
+/// routing each cell write through `cell_put_keyed` when `key_roles`
+/// names that cell as a Map-backed (alethic-UC-keyed) cell, and
+/// through the legacy Seq-append otherwise.
+///
+/// Factored out of the two forward-chain entry points so they share
+/// the routing rule. `key_roles` is built once per forward-chain
+/// invocation via [`read_cell_key_roles`]; this function consults it
+/// without further parsing.
+fn integrate_round_facts(
+    state: ast::Object,
+    by_cell: hashbrown::HashMap<String, Vec<ast::Object>>,
+    key_roles: &hashbrown::HashMap<String, Vec<String>>,
+) -> ast::Object {
+    let mut current_state = state;
+    for (cell_name, facts) in by_cell {
+        if let Some(roles) = key_roles.get(&cell_name) {
+            // Map-backed cell: each fact is upserted by its named-role
+            // key. Multiple facts in the same round at the same key
+            // collapse to the last-write — matches the alethic-UC
+            // semantics (only one tuple per key is structurally
+            // permitted). The first write also migrates any pre-existing
+            // Seq contents into the Map (see `cell_put_keyed`).
+            let role_refs: Vec<&str> = roles.iter().map(|s| s.as_str()).collect();
+            for fact in facts {
+                current_state = ast::cell_put_keyed(&cell_name, &role_refs, fact, &current_state);
+            }
+        } else {
+            let existing = ast::fetch_or_phi(&cell_name, &current_state);
+            let combined = match existing.as_seq() {
+                Some(items) => {
+                    let mut v = items.to_vec();
+                    v.extend(facts);
+                    ast::Object::Seq(v.into())
+                }
+                None => ast::Object::seq(facts),
+            };
+            current_state = ast::store(&cell_name, combined, &current_state);
+        }
+    }
+    current_state
+}
+
 /// Forward-chain derivation rules over D to fixed point. Returns (D', derived_facts).
 /// D contains both population cells and def cells (Backus Sec. 14.3).
 pub fn forward_chain_defs_state(
@@ -182,6 +262,10 @@ pub fn forward_chain_defs_state_semi_naive_with_base_keys(
     let trace = false;
     let mut current_state = d.clone();
     let mut all_derived: Vec<DerivedFact> = Vec::new();
+    // task-744 phase 4: per-FT key-roles for routing Map-backed cell
+    // writes through `cell_put_keyed`. Same metadata-cell pattern as
+    // `forward_chain_defs_state_bounded` — read once, consult per cell.
+    let key_roles = read_cell_key_roles(d);
     // Base set of fact keys in `d`. Built once here and updated
     // incrementally as rounds emit new facts — on core.md this cut
     // ~3ms per round of re-hashing the unchanged grammar portion of
@@ -224,20 +308,8 @@ pub fn forward_chain_defs_state_semi_naive_with_base_keys(
             // doesn't have to re-walk the whole state.
             existing_keys.insert(fact_key(fact));
         }
-        let mut next_dirty = HashSet::new();
-        for (cell_name, facts) in by_cell {
-            next_dirty.insert(cell_name.clone());
-            let existing = ast::fetch_or_phi(&cell_name, &current_state);
-            let combined = match existing.as_seq() {
-                Some(items) => {
-                    let mut v = items.to_vec();
-                    v.extend(facts);
-                    ast::Object::Seq(v.into())
-                }
-                None => ast::Object::seq(facts),
-            };
-            current_state = ast::store(&cell_name, combined, &current_state);
-        }
+        let next_dirty: HashSet<String> = by_cell.keys().cloned().collect();
+        current_state = integrate_round_facts(current_state, by_cell, &key_roles);
         all_derived.extend(new_facts);
         dirty_cells = Some(next_dirty);
     }
@@ -327,6 +399,12 @@ pub fn forward_chain_defs_state_bounded(
     // new facts by cell and appending once per cell makes it O(n).
     let mut current_state = d.clone();
     let mut all_derived: Vec<DerivedFact> = Vec::new();
+    // task-744 phase 4: per-FT key-roles for routing writes to
+    // `cell_put_keyed` (Map storage) when an alethic UC exists. Read
+    // once from the metadata cell `_CellKeyRoles` (constant after
+    // `compile_to_defs_state`); fact-type cells absent from the map
+    // keep the legacy Seq-append path.
+    let key_roles = read_cell_key_roles(d);
     for _ in 0..max_rounds {
         let new_facts = derive_one_round(derivation_defs, &current_state, &all_derived, d);
         if new_facts.is_empty() { break; }
@@ -339,18 +417,7 @@ pub fn forward_chain_defs_state_bounded(
             by_cell.entry(fact.fact_type_id.clone()).or_default()
                 .push(ast::fact_from_pairs(&pairs));
         }
-        for (cell_name, facts) in by_cell {
-            let existing = ast::fetch_or_phi(&cell_name, &current_state);
-            let combined = match existing.as_seq() {
-                Some(items) => {
-                    let mut v = items.to_vec();
-                    v.extend(facts);
-                    ast::Object::Seq(v.into())
-                }
-                None => ast::Object::seq(facts),
-            };
-            current_state = ast::store(&cell_name, combined, &current_state);
-        }
+        current_state = integrate_round_facts(current_state, by_cell, &key_roles);
         all_derived.extend(new_facts);
     }
     (current_state, all_derived)
@@ -3575,5 +3642,143 @@ mod tests {
     // via `with_state_machine`, which now writes only the normalized
     // cells — so each of those tests already exercises the cell-driven
     // compile path end-to-end through `run_machine_defs`.
+
+    // ─── task-744 phase 4: forward-chain Map-backed cell storage ────
+    //
+    // When a fact-type cell carries an alethic UC, the compiler emits
+    // a `_CellKeyRoles` metadata cell with that FT's key-role names.
+    // The forward-chain emit path consults that metadata and routes
+    // derived facts through `cell_put_keyed`, producing `Object::Map`
+    // contents instead of `Object::Seq`.
+    //
+    // Acceptance: a UC-keyed consequent cell ends up as `Object::Map`
+    // after `compile_to_defs_state` + `forward_chain_defs_state`,
+    // while an un-keyed cell in the same compile remains `Object::Seq`.
+
+    #[test]
+    fn forward_chain_routes_keyed_cells_through_map_storage_for_alethic_uc() {
+        // Two FTs with a shared antecedent driver:
+        //   ft_keyed:   "Person has Email"  — alethic UC on Person (role 0)
+        //                                      → cell stores as Map keyed by Person.
+        //   ft_seq:     "Person likes Topic" — no UC at all
+        //                                      → cell stays as Seq.
+        // A derivation rule "Person has Email <id> iff Person likes <id>"
+        // fires for every Person/Topic pair, materialising the keyed cell
+        // through forward-chain.
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "Person", &make_noun("entity"));
+        cells = with_noun(cells, "Email", &make_noun("value"));
+        cells = with_noun(cells, "Topic", &make_noun("value"));
+        cells = with_ft(cells, "ft_keyed", &FactTypeDef {
+            schema_id: String::new(),
+            reading: "Person has Email".to_string(),
+            readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Person".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Email".to_string(), role_index: 1 },
+            ],
+        });
+        cells = with_ft(cells, "ft_seq", &FactTypeDef {
+            schema_id: String::new(),
+            reading: "Person likes Topic".to_string(),
+            readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Person".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Topic".to_string(), role_index: 1 },
+            ],
+        });
+        // Alethic UC on Person (role 0) of ft_keyed: each Person has at
+        // most one Email. `resolve_key_roles_for_ft` picks `vec![0]` →
+        // `_CellKeyRoles` registers `ft_keyed = ["Person"]`.
+        cells = with_constraint(cells, &ConstraintDef {
+            id: "uc_email".to_string(),
+            kind: "UC".to_string(),
+            modality: "Alethic".to_string(),
+            text: "Each Person has at most one Email".to_string(),
+            spans: vec![
+                SpanDef { fact_type_id: "ft_keyed".to_string(), role_index: 0, subset_autofill: None },
+            ],
+            ..Default::default()
+        });
+        let state = build(cells);
+
+        // Compile through the production path so `_CellKeyRoles` lands
+        // in the def overlay alongside everything else.
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        // Verify the metadata cell actually carries ft_keyed.
+        let key_roles_cell = ast::fetch_or_phi("_CellKeyRoles", &d);
+        let entries = key_roles_cell.as_seq().and_then(|items| {
+            if items.len() == 2 && items[0].as_atom() == Some("'") {
+                items[1].as_seq().map(|s| s.to_vec())
+            } else { Some(items.to_vec()) }
+        }).expect("_CellKeyRoles must be present after compile_to_defs_state");
+        assert!(entries.iter().any(|f| {
+            ast::binding(f, "ftId") == Some("ft_keyed")
+                && ast::binding(f, "keyRoles") == Some("Person")
+        }), "_CellKeyRoles must register ft_keyed → Person; got {:?}", entries);
+        // ft_seq has no UC → must NOT appear in the metadata.
+        assert!(!entries.iter().any(|f| ast::binding(f, "ftId") == Some("ft_seq")),
+            "ft_seq (no UC) must be absent from _CellKeyRoles; got {:?}", entries);
+
+        // Hand-author a derivation that writes both into ft_keyed and ft_seq
+        // so the round emits at least one fact for each consequent. We
+        // skip the full DerivationRuleDef wiring here and just push the
+        // facts directly via a Func::Constant — the forward-chain
+        // integration path is what's under test, not the derivation
+        // compiler. Distinct Person values + distinct value-role values
+        // dodge the dedup in `derive_one_round` (cells are seeded empty).
+        let person_facts: [(&str, &str, &str); 2] = [
+            ("p1", "p1@example.com", "topic-a"),
+            ("p2", "p2@example.com", "topic-b"),
+        ];
+        let mut emit_items: Vec<ast::Object> = Vec::new();
+        for (p, email, topic) in &person_facts {
+            emit_items.push(ast::Object::seq(vec![
+                ast::Object::atom("ft_keyed"),
+                ast::Object::atom("Person has Email"),
+                ast::Object::seq(vec![
+                    ast::Object::seq(vec![ast::Object::atom("Person"), ast::Object::atom(p)]),
+                    ast::Object::seq(vec![ast::Object::atom("Email"), ast::Object::atom(email)]),
+                ]),
+            ]));
+            emit_items.push(ast::Object::seq(vec![
+                ast::Object::atom("ft_seq"),
+                ast::Object::atom("Person likes Topic"),
+                ast::Object::seq(vec![
+                    ast::Object::seq(vec![ast::Object::atom("Person"), ast::Object::atom(p)]),
+                    ast::Object::seq(vec![ast::Object::atom("Topic"), ast::Object::atom(topic)]),
+                ]),
+            ]));
+        }
+        let synth_func = ast::Func::constant(ast::Object::Seq(emit_items.into()));
+        let dd: Vec<(&str, &ast::Func)> = vec![("derivation:test", &synth_func)];
+
+        let (new_d, derived) = forward_chain_defs_state(&dd, &d);
+        assert_eq!(derived.len(), 4,
+            "all four candidate facts (2 per cell) must land as DerivedFacts; got {}",
+            derived.len());
+
+        // ft_keyed: expect Object::Map keyed by Person value.
+        let keyed_cell = ast::fetch_or_phi("ft_keyed", &new_d);
+        let map = keyed_cell.as_map().cloned().unwrap_or_else(|| panic!(
+            "ft_keyed must be Object::Map after forward-chain (alethic UC keys it); \
+             got {:?}", keyed_cell));
+        assert_eq!(map.len(), 2, "two distinct Persons → two map entries");
+        assert!(map.contains_key("p1"), "p1 must be a map key; keys={:?}",
+            map.keys().collect::<Vec<_>>());
+        assert!(map.contains_key("p2"), "p2 must be a map key; keys={:?}",
+            map.keys().collect::<Vec<_>>());
+
+        // ft_seq: no UC, no entry in `_CellKeyRoles` → still a Seq.
+        let seq_cell = ast::fetch_or_phi("ft_seq", &new_d);
+        let seq = seq_cell.as_seq().unwrap_or_else(|| panic!(
+            "ft_seq must remain Object::Seq (no UC, absent from key-roles registry); \
+             got {:?}", seq_cell));
+        assert_eq!(seq.len(), 2,
+            "ft_seq should hold both derived facts in Seq order; got {} items",
+            seq.len());
+    }
 }
 

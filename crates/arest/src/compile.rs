@@ -2252,6 +2252,57 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         ]))));
     }
 
+    // task-744 phase 4: emit `_CellKeyRoles` meta cell carrying each
+    // fact-type's `key_roles` (resolved from alethic UCs at schema
+    // compile time). The forward-chain emit path reads this cell to
+    // decide whether to store derived facts via `cell_put_keyed`
+    // (Map-backed cells, keyed on the named roles) or via the legacy
+    // Seq append path. FTs whose `key_roles` is `None` are simply
+    // absent from this registry — readers default to Seq storage.
+    //
+    // Entry shape: a Seq of named-tuple facts. Each fact carries
+    //   <<ftId, ft_id_atom>, <keyRoles, "Role1,Role2,…">>
+    // The comma-separated role-name list matches the `referenceScheme`
+    // encoding used by `c_ref_schemes` (compile.rs:1030). Readers split
+    // on `,` to recover the role-name slice that `cell_put_keyed` takes.
+    //
+    // The cell name is `_CellKeyRoles` (leading underscore reserved for
+    // metadata, mirroring `_sm_init_*` / `_cwa_negation` convention) so
+    // it never collides with a user-facing fact-type cell.
+    {
+        let mut entries: Vec<crate::ast::Object> = Vec::new();
+        for schema in model.schemas.values() {
+            let Some(key_indices) = schema.key_roles.as_ref() else { continue };
+            if key_indices.is_empty() { continue; }
+            // Map 0-indexed role positions to their noun-name labels.
+            // Skip the schema entirely if any index is out of bounds —
+            // shouldn't happen given `resolve_key_roles_for_ft` only
+            // returns indices it found in the FT's spans, but a defensive
+            // skip avoids emitting a partially-keyed entry.
+            let names: Option<Vec<&str>> = key_indices.iter()
+                .map(|i| schema.role_names.get(*i).map(|s| s.as_str()))
+                .collect();
+            let Some(names) = names else { continue };
+            let joined = names.join(",");
+            entries.push(crate::ast::Object::seq(vec![
+                crate::ast::Object::seq(vec![
+                    crate::ast::Object::atom("ftId"),
+                    crate::ast::Object::atom(&schema.id),
+                ]),
+                crate::ast::Object::seq(vec![
+                    crate::ast::Object::atom("keyRoles"),
+                    crate::ast::Object::atom(&joined),
+                ]),
+            ]));
+        }
+        if !entries.is_empty() {
+            defs.push((
+                "_CellKeyRoles".to_string(),
+                Func::constant(crate::ast::Object::Seq(entries.into())),
+            ));
+        }
+    }
+
     // #905/task-740 follow-up: emit `SyntheticDerivedCells` meta cell
     // listing the cells synthetic derivations (`_sm_init_*`,
     // `_sm_event_fold_*`) write into. The LFP-per-request drop logic
