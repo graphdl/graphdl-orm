@@ -3584,6 +3584,7 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
             domain: "tasks".to_string(),
             entity_id: "t1".to_string(),
             fields,
+            force: false,
             sender: None,
             signature: None,
         };
@@ -3640,6 +3641,8 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         ));
         assert_eq!(ast::binding(entry, "Task"), Some("t1"));
         assert_eq!(ast::binding(entry, "Status"), Some("draft"));
+    }
+
     // ── task-861: SM-bypass guard on apply update ────────────────────
     //
     // The engine's update_via_defs path refuses to mutate the SM's
