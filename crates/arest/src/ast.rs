@@ -729,6 +729,19 @@ pub enum Func {
     /// fixpoint.
     HasMember,
 
+    /// Set construction (task-744 follow-up): set:<x₁, ..., xₙ> = Map
+    /// keyed by the atoms of x, each mapped to atom "T". `set:phi = Map{}`.
+    /// Non-atom elements collapse to ⊥.
+    ///
+    /// Together with `FetchOrPhi`, this gives O(N) build + O(1) per
+    /// membership check — replacing the O(N) HasMember scan with a
+    /// hash-set lookup once a set is reused. The compile-time payoff
+    /// is in SM init's `is_new` (one set built per round, M membership
+    /// tests done against it; total O(N+M) vs. O(N·M)). Pairs with the
+    /// existing Map-as-set convention the engine already uses for cell
+    /// stores and metadata caches.
+    SetFromSeq,
+
     /// Transpose: trans:<<a,b>, <c,d>> = <<a,c>, <b,d>>
     Trans,
 
@@ -1718,6 +1731,7 @@ fn variant_name(f: &Func) -> &'static str {
         Func::DistL => "DistL",
         Func::DistR => "DistR",
         Func::HasMember => "HasMember",
+        Func::SetFromSeq => "SetFromSeq",
         Func::Trans => "Trans",
         Func::ApndL => "ApndL",
         Func::Reverse => "Reverse",
@@ -2076,6 +2090,27 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                         }
                         _ => Object::Bottom,
                     }
+                }
+                _ => Object::Bottom,
+            }
+        }
+
+        Func::SetFromSeq => {
+            // O(N) build of a Map<atom, T> from a Seq of atoms. Non-atom
+            // elements break the build → ⊥. Used as the one-shot
+            // preprocessor for membership-heavy derivations: build once
+            // per round, lookup O(1) via FetchOrPhi thereafter.
+            match x {
+                Object::Seq(items) if items.is_empty() => Object::Map(HashMap::new()),
+                Object::Seq(items) => {
+                    let mut m = HashMap::with_capacity(items.len());
+                    for v in items.iter() {
+                        match v.as_atom() {
+                            Some(s) => { m.insert(s.to_string(), Object::t()); }
+                            None => return Object::Bottom,
+                        }
+                    }
+                    Object::Map(m)
                 }
                 _ => Object::Bottom,
             }
@@ -3514,6 +3549,7 @@ pub mod primitives {
     pub const DISTL: &str = "dl";
     pub const DISTR: &str = "dr";
     pub const HAS_MEMBER: &str = "in?";
+    pub const SET_FROM_SEQ: &str = "set";
     pub const LENGTH: &str = "#l";
     pub const TRANS: &str = "tr";
     pub const APNDL: &str = "al";
@@ -4622,6 +4658,7 @@ fn metacompose_atom(name: &str, d: &Object) -> Func {
         primitives::DISTL => Func::DistL,
         primitives::DISTR => Func::DistR,
         primitives::HAS_MEMBER => Func::HasMember,
+        primitives::SET_FROM_SEQ => Func::SetFromSeq,
         primitives::LENGTH => Func::Length,
         primitives::TRANS => Func::Trans,
         primitives::APNDL => Func::ApndL,
@@ -4755,6 +4792,7 @@ pub fn func_to_object(func: &Func) -> Object {
         Func::DistL => Object::atom(primitives::DISTL),
         Func::DistR => Object::atom(primitives::DISTR),
         Func::HasMember => Object::atom(primitives::HAS_MEMBER),
+        Func::SetFromSeq => Object::atom(primitives::SET_FROM_SEQ),
         Func::Trans => Object::atom(primitives::TRANS),
         Func::ApndL => Object::atom(primitives::APNDL),
         Func::Reverse => Object::atom(primitives::REVERSE),
@@ -4979,6 +5017,7 @@ impl fmt::Debug for Func {
             Func::DistL => write!(f, "distl"),
             Func::DistR => write!(f, "distr"),
             Func::HasMember => write!(f, "has_member"),
+            Func::SetFromSeq => write!(f, "set"),
             Func::Trans => write!(f, "trans"),
             Func::ApndL => write!(f, "apndl"),
             Func::Reverse => write!(f, "reverse"),
@@ -5513,6 +5552,81 @@ mod tests {
         assert_eq!(obj.as_atom(), Some(primitives::HAS_MEMBER));
         let func = metacompose(&obj, &defs());
         assert!(matches!(func, Func::HasMember));
+    }
+
+    // task-744 phase 5: SetFromSeq builds a Map<atom,T> from a Seq of
+    // atoms in one pass. Paired with FetchOrPhi this delivers the
+    // O(N+M) replacement for the O(N·M) HasMember scan in is_new.
+
+    #[test]
+    fn set_from_seq_builds_map_with_atom_keys_and_t_values() {
+        let input = Object::seq(vec![
+            Object::atom("task-1"),
+            Object::atom("task-2"),
+            Object::atom("task-3"),
+        ]);
+        let result = apply(&Func::SetFromSeq, &input, &defs());
+        let m = result.as_map().expect("Map result");
+        assert_eq!(m.len(), 3);
+        assert_eq!(m.get("task-1"), Some(&Object::t()));
+        assert_eq!(m.get("task-2"), Some(&Object::t()));
+        assert_eq!(m.get("task-3"), Some(&Object::t()));
+    }
+
+    #[test]
+    fn set_from_seq_dedupes_atoms_by_overwriting_the_key() {
+        let input = Object::seq(vec![
+            Object::atom("dup"),
+            Object::atom("dup"),
+            Object::atom("uniq"),
+        ]);
+        let m = apply(&Func::SetFromSeq, &input, &defs()).as_map().cloned()
+            .expect("Map result");
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn set_from_seq_on_empty_seq_returns_empty_map() {
+        let result = apply(&Func::SetFromSeq, &Object::phi(), &defs());
+        let m = result.as_map().expect("Map result");
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn set_from_seq_with_non_atom_element_returns_bottom() {
+        let input = Object::seq(vec![
+            Object::atom("ok"),
+            Object::seq(vec![Object::atom("nested")]),
+        ]);
+        assert_eq!(apply(&Func::SetFromSeq, &input, &defs()), Object::Bottom);
+    }
+
+    #[test]
+    fn set_membership_via_fetch_or_phi_is_o1() {
+        // The is_new pattern in compile_sm_init_for compiles to
+        // `null . FetchOrPhi`. Verify the composed shape works against
+        // a SetFromSeq-built map.
+        let resources = Object::seq(vec![
+            Object::atom("task-1"),
+            Object::atom("task-2"),
+        ]);
+        let set_map = apply(&Func::SetFromSeq, &resources, &defs());
+        let is_new = Func::compose(Func::NullTest, Func::FetchOrPhi);
+
+        // Membership: task-1 is in set → null(T) = F → not new.
+        let m1 = Object::seq(vec![Object::atom("task-1"), set_map.clone()]);
+        assert_eq!(apply(&is_new, &m1, &defs()), Object::f());
+        // Non-membership: task-99 is absent → null(φ) = T → new.
+        let m2 = Object::seq(vec![Object::atom("task-99"), set_map]);
+        assert_eq!(apply(&is_new, &m2, &defs()), Object::t());
+    }
+
+    #[test]
+    fn set_from_seq_roundtrips_through_object() {
+        let obj = func_to_object(&Func::SetFromSeq);
+        assert_eq!(obj.as_atom(), Some(primitives::SET_FROM_SEQ));
+        let func = metacompose(&obj, &defs());
+        assert!(matches!(func, Func::SetFromSeq));
     }
 
     // ── Compact (#352) — drops ⊥ elements so Filter derives cleanly

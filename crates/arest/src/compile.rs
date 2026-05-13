@@ -4964,28 +4964,29 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
             Func::construction(existing_sources),
         );
 
-        let pairs = Func::construction(vec![get_instances, get_existing]);
+        // task-744 phase 5: convert the existing-resources Seq into a
+        // Map<resource_atom, T> once per round. SetFromSeq builds the
+        // hash-set in O(N); thereafter each is_new check is O(1) via
+        // FetchOrPhi against that Map. Replaces task-743's allocation-
+        // free-but-still-O(N) HasMember scan, giving O(N+M) total
+        // instead of O(N·M) for the M-instance × N-existing cross
+        // product the SM init derivation walks every round.
+        let get_existing_set = Func::compose(Func::SetFromSeq, get_existing);
 
-        // task-741 / task-743: is_new takes a pair `<instance, [existing]>`
-        // from DistR (where [existing] is the union of forResource values
-        // + per-trigger-FT resource values) and returns T iff
-        // `instance` ∉ [existing].
-        //
-        // Implemented as `not ∘ has_member`: HasMember:<needle, haystack>
-        // returns T if needle is an element of haystack (primitive
-        // membership test, #743). The original DistL+filter+NullTest
-        // composition was O(N) per check WITH O(N) allocation
-        // (DistL materialized N pairs before the filter saw any of
-        // them); HasMember is the same big-O but allocation-free, and
-        // on apps/tasks drops SM-init compile from ~5 min back to
-        // ~30 s.
-        let is_new = Func::compose(Func::Not, Func::HasMember);
+        let pairs = Func::construction(vec![get_instances, get_existing_set]);
+
+        // is_new on `<instance, existing_set>`: T iff instance is NOT a
+        // key of existing_set. `FetchOrPhi:<key, map>` returns the
+        // value at key (here always atom "T") or φ if the key is
+        // absent. NullTest is T iff the result is φ — so T means "not
+        // a member", which is exactly what is_new asks.
+        let is_new = Func::compose(Func::NullTest, Func::FetchOrPhi);
 
         // set_diff = alpha(sel(1)) . Filter(is_new) . distr
-        // is_new = not . has_member
-        // distr : <R, S> -> <<r1,S>,...,<rn,S>>
-        // For each <ri, S>: has_member:<ri, S> = T iff ri ∈ S.
-        // Handles empty S correctly (has_member:<ri, φ> = F → is_new = T).
+        // is_new = null . FetchOrPhi
+        // distr : <R, S> -> <<r1,S>,...,<rn,S>>  where S is the existing-set Map.
+        // For each <ri, S>: FetchOrPhi:<ri, S> = T (member) or φ (not).
+        // null:φ = T → is_new = T → ri is new. Empty S → every ri is new.
         let new_instances = Func::compose(
             Func::apply_to_all(Func::Selector(1)),
             Func::compose(Func::filter(is_new), Func::compose(Func::DistR, pairs)),
