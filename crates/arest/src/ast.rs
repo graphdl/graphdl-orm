@@ -4176,29 +4176,63 @@ pub fn cell_push_unique(name: &str, fact: Object, state: &Object) -> Object {
     }
 }
 
+/// Conflict raised by [`cell_put_keyed`] when the cell already holds a
+/// fact at the same key whose non-key contents differ from the
+/// incoming fact. Materializes the four pieces a UC-enforcement caller
+/// needs to render a violation: the cell name, the colliding key, and
+/// both facts. Byte-equal facts at the same key are re-assertions and
+/// do NOT raise a conflict — the conflict is reserved for genuine
+/// non-key disagreement, which is the Codd-style alethic-UC signal.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyConflict {
+    pub name: alloc::string::String,
+    pub key: alloc::string::String,
+    pub existing_fact: Object,
+    pub incoming_fact: Object,
+}
+
 /// task-744 / #743: write a fact into a cell that is keyed by its
 /// reference-scheme roles (`key_roles`). The cell contents become an
 /// `Object::Map<key, fact>` where key is the concatenation of the
-/// values at the given role indices. Overwrites any existing tuple at
-/// the same key — this is the upsert path. UC violation detection
-/// lives in the caller (compile-time emit / apply-path validator);
-/// this primitive is pure storage.
+/// values at the given role indices.
 ///
-/// `key_roles` are 1-indexed role positions matching `Func::Selector`
-/// convention (Selector(1) = first role). Each role's value is
-/// extracted via `binding`-style lookup over the fact's pair sequence.
+/// Collision detection (task-744 phase 4, refines the original phase-2
+/// upsert path): rather than silently last-write-wins, the function
+/// distinguishes three cases at write time:
 ///
-/// Returns the unchanged state if any required role is missing from
-/// the fact (caller treats as a no-op rather than a write of a
-/// partially-keyed tuple).
+/// 1. **No prior entry at this key** — new write. Returns `Ok(state')`
+///    with the fact installed.
+/// 2. **Prior entry byte-equal to the incoming fact** — re-assertion.
+///    Returns `Ok(state.clone())` unchanged; no spurious Arc churn.
+/// 3. **Prior entry differs from the incoming fact in any non-key
+///    role value** — collision. Returns `Err(KeyConflict { … })`. The
+///    state is NOT mutated; the caller decides how to surface the
+///    UC violation (apply-path validator emits a `Violation`; bulk
+///    loaders may aggregate; debug tooling may print).
+///
+/// API choice: `Result<Object, KeyConflict>` over the alternative of
+/// writing collisions into a `_KeyConflicts` meta-cell. The Result
+/// shape is type-system-enforced — a caller cannot accidentally drop
+/// the conflict by forgetting to read a side-channel cell. Existing
+/// callers (currently only the 9 test sites in this module) acquire a
+/// trivial `.expect("…")` at sites that are exercising the happy path.
+///
+/// `key_roles` are role names matching the binding/pair-fact shape
+/// produced by `fact_from_pairs` (and the reading pipeline). Each
+/// role's value is extracted via `binding(fact, role)`.
+///
+/// Returns `Ok(state.clone())` unchanged when any required role is
+/// missing from the fact (caller treats as a no-op rather than a
+/// write of a partially-keyed tuple). A missing role can never be a
+/// UC collision, since the fact is not fully keyed.
 pub fn cell_put_keyed(
     name: &str,
     key_role_names: &[&str],
     fact: Object,
     state: &Object,
-) -> Object {
+) -> Result<Object, KeyConflict> {
     let Some(key) = extract_key_from_fact(&fact, key_role_names) else {
-        return state.clone();
+        return Ok(state.clone());
     };
     let existing = fetch_or_phi(name, state);
     let mut map: HashMap<String, Object> = match &existing {
@@ -4206,9 +4240,12 @@ pub fn cell_put_keyed(
         Object::Seq(items) if items.is_empty() => HashMap::new(),
         Object::Seq(items) => {
             // Migration: existing Seq contents rebuild into Map keyed
-            // by the same role names. Lossy if two existing facts share
-            // a key — last one wins, which is correct for the upsert
-            // semantics this primitive establishes.
+            // by the same role names. If two pre-existing Seq facts
+            // share a key, the later one wins during migration — the
+            // legacy Seq path never enforced uniqueness, so this is
+            // the best we can do without rewriting the migration as
+            // its own conflict-bearing pass. New conflicts (incoming
+            // fact vs. migrated entry) are still detected below.
             let mut m = HashMap::new();
             for f in items.iter() {
                 if let Some(k) = extract_key_from_fact(f, key_role_names) {
@@ -4219,8 +4256,23 @@ pub fn cell_put_keyed(
         }
         _ => HashMap::new(),
     };
+    if let Some(existing_fact) = map.get(&key) {
+        if existing_fact == &fact {
+            // Byte-equal re-assertion: no-op. Return the original
+            // state unchanged so callers can detect a no-op via
+            // structural equality / Arc-pointer identity if they
+            // care.
+            return Ok(state.clone());
+        }
+        return Err(KeyConflict {
+            name: name.into(),
+            key,
+            existing_fact: existing_fact.clone(),
+            incoming_fact: fact,
+        });
+    }
     map.insert(key, fact);
-    store(name, Object::Map(map.into()), state)
+    Ok(store(name, Object::Map(map.into()), state))
 }
 
 /// Extract a key from a fact tuple by joining the values at the
@@ -7799,7 +7851,8 @@ mod tests {
     #[test]
     fn cell_put_keyed_writes_into_map_using_named_role() {
         let f = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
-        let state = cell_put_keyed("Task_has_Status", &["Task"], f.clone(), &Object::phi());
+        let state = cell_put_keyed("Task_has_Status", &["Task"], f.clone(), &Object::phi())
+            .expect("first write — no collision possible");
         let contents = fetch_or_phi("Task_has_Status", &state);
         match &contents {
             Object::Map(m) => {
@@ -7811,24 +7864,38 @@ mod tests {
         }
     }
 
+    // task-744 phase 4: collision detection — writing the same key with a
+    // structurally different fact must now be reported (it used to silently
+    // upsert in phase 2). This test replaces the legacy "_overwrites_"
+    // test, since last-write-wins is exactly what Codd-style UC
+    // enforcement needs to suppress.
     #[test]
-    fn cell_put_keyed_overwrites_same_key_with_new_tuple() {
+    fn cell_put_keyed_same_key_different_non_key_role_value_is_collision() {
         let f1 = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
         let f2 = fact_from_pairs(&[("Task", "t-1"), ("Status", "in_progress")]);
-        let s1 = cell_put_keyed("Task_has_Status", &["Task"], f1, &Object::phi());
-        let s2 = cell_put_keyed("Task_has_Status", &["Task"], f2.clone(), &s1);
-        let contents = fetch_or_phi("Task_has_Status", &s2);
-        let m = contents.as_map().expect("Map contents");
+        let s1 = cell_put_keyed("Task_has_Status", &["Task"], f1.clone(), &Object::phi())
+            .expect("first write");
+        let conflict = cell_put_keyed("Task_has_Status", &["Task"], f2.clone(), &s1)
+            .expect_err("second write at same key, different Status — must collide");
+        assert_eq!(conflict.name, "Task_has_Status");
+        assert_eq!(conflict.key, "t-1");
+        assert_eq!(conflict.existing_fact, f1);
+        assert_eq!(conflict.incoming_fact, f2);
+        // State after the failed write is unchanged — s1 still holds f1.
+        let m = fetch_or_phi("Task_has_Status", &s1).as_map().cloned()
+            .expect("Map contents");
         assert_eq!(m.len(), 1);
-        assert_eq!(m.get("t-1"), Some(&f2));
+        assert_eq!(m.get("t-1"), Some(&f1));
     }
 
     #[test]
     fn cell_put_keyed_distinct_keys_coexist() {
         let f1 = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
         let f2 = fact_from_pairs(&[("Task", "t-2"), ("Status", "done")]);
-        let s1 = cell_put_keyed("Task_has_Status", &["Task"], f1.clone(), &Object::phi());
-        let s2 = cell_put_keyed("Task_has_Status", &["Task"], f2.clone(), &s1);
+        let s1 = cell_put_keyed("Task_has_Status", &["Task"], f1.clone(), &Object::phi())
+            .expect("first key");
+        let s2 = cell_put_keyed("Task_has_Status", &["Task"], f2.clone(), &s1)
+            .expect("distinct second key — no collision");
         let m = fetch_or_phi("Task_has_Status", &s2).as_map().cloned().expect("Map contents");
         assert_eq!(m.len(), 2);
         assert_eq!(m.get("t-1"), Some(&f1));
@@ -7847,7 +7914,7 @@ mod tests {
             &["Person", "Organization"],
             f.clone(),
             &Object::phi(),
-        );
+        ).expect("first write");
         let m = fetch_or_phi("Membership", &state).as_map().cloned().expect("Map contents");
         // Composite key uses the unit-separator joiner — internal detail,
         // but the lookup should find exactly one entry.
@@ -7859,7 +7926,8 @@ mod tests {
     fn cell_put_keyed_returns_unchanged_state_when_role_missing() {
         // Fact has only Status, not Task; not fully keyed for ["Task"].
         let f = fact_from_pairs(&[("Status", "pending")]);
-        let state = cell_put_keyed("Task_has_Status", &["Task"], f, &Object::phi());
+        let state = cell_put_keyed("Task_has_Status", &["Task"], f, &Object::phi())
+            .expect("missing-role no-op is Ok, not a collision");
         // Cell never gets written.
         assert_eq!(fetch_or_phi("Task_has_Status", &state), Object::phi());
     }
@@ -7872,7 +7940,8 @@ mod tests {
         let f1 = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
         let f2 = fact_from_pairs(&[("Task", "t-2"), ("Status", "done")]);
         let s_seq = cell_push("Task_has_Status", f1.clone(), &Object::phi());
-        let s_map = cell_put_keyed("Task_has_Status", &["Task"], f2.clone(), &s_seq);
+        let s_map = cell_put_keyed("Task_has_Status", &["Task"], f2.clone(), &s_seq)
+            .expect("distinct keys after Seq→Map migration");
         let m = fetch_or_phi("Task_has_Status", &s_map).as_map().cloned().expect("Map contents");
         assert_eq!(m.len(), 2);
         assert_eq!(m.get("t-1"), Some(&f1));
@@ -7889,8 +7958,10 @@ mod tests {
         let seq_count = cell_facts_iter(&fetch_or_phi("Cell_A", &seq_state)).count();
         assert_eq!(seq_count, 2);
 
-        let map_state = cell_put_keyed("Cell_B", &["Task"], f1.clone(),
-            &cell_put_keyed("Cell_B", &["Task"], f2.clone(), &Object::phi()));
+        let inner = cell_put_keyed("Cell_B", &["Task"], f2.clone(), &Object::phi())
+            .expect("first key");
+        let map_state = cell_put_keyed("Cell_B", &["Task"], f1.clone(), &inner)
+            .expect("second key");
         let map_count = cell_facts_iter(&fetch_or_phi("Cell_B", &map_state)).count();
         assert_eq!(map_count, 2);
     }
@@ -7902,6 +7973,98 @@ mod tests {
         assert_eq!(extract_key_from_fact(&f, &["Task", "Status"]), None);
     }
 
+    // ─── task-744 phase 4: collision-detection acceptance tests ─────
+    //
+    // The phase-2 doc-comment for cell_put_keyed said:
+    //   "Overwrites any existing tuple at the same key — this is the
+    //   upsert path. UC violation detection lives in the caller …"
+    //
+    // Phase 4 promotes UC violation detection into the storage
+    // primitive itself: the function returns Err(KeyConflict) when an
+    // incoming fact would silently overwrite a structurally distinct
+    // existing fact at the same key. Byte-equal re-assertions remain
+    // ok-no-op; distinct keys remain ok-write. The four tests below
+    // pin each branch.
+
+    #[test]
+    fn cell_put_keyed_collision_acceptance_1_same_key_same_fact_is_no_op() {
+        // AC1: writing the same key + same fact = no collision, state
+        // unchanged structurally. The second call returns Ok and its
+        // resulting state is equal to the first call's state.
+        let f = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
+        let s1 = cell_put_keyed("Task_has_Status", &["Task"], f.clone(), &Object::phi())
+            .expect("first write");
+        let s2 = cell_put_keyed("Task_has_Status", &["Task"], f.clone(), &s1)
+            .expect("byte-equal re-assertion must be Ok, not a collision");
+        // State equal — re-assert produced no structural change.
+        assert_eq!(s1, s2);
+        // And the cell still holds exactly the one fact.
+        let m = fetch_or_phi("Task_has_Status", &s2).as_map().cloned()
+            .expect("Map contents");
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get("t-1"), Some(&f));
+    }
+
+    #[test]
+    fn cell_put_keyed_collision_acceptance_2_same_key_different_value_is_collision() {
+        // AC2: writing the same key with a different non-key role value
+        // is a collision. The state from before the failed write is
+        // returned by the caller (we have s1 in hand); the error
+        // surfaces both facts and the key.
+        let f1 = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
+        let f2 = fact_from_pairs(&[("Task", "t-1"), ("Status", "done")]);
+        let s1 = cell_put_keyed("Task_has_Status", &["Task"], f1.clone(), &Object::phi())
+            .expect("first write");
+        let err = cell_put_keyed("Task_has_Status", &["Task"], f2.clone(), &s1)
+            .expect_err("same key + different Status = collision");
+        assert_eq!(err, KeyConflict {
+            name: "Task_has_Status".into(),
+            key: "t-1".into(),
+            existing_fact: f1.clone(),
+            incoming_fact: f2,
+        });
+        // The state that was passed in is untouched.
+        let m = fetch_or_phi("Task_has_Status", &s1).as_map().cloned()
+            .expect("Map contents");
+        assert_eq!(m.get("t-1"), Some(&f1));
+    }
+
+    #[test]
+    fn cell_put_keyed_collision_acceptance_3_idempotent_reassert_no_collision() {
+        // AC3: same key + same non-key values, even when the two facts
+        // were constructed independently (rather than cloned), is an
+        // idempotent re-assertion and must NOT be flagged as a
+        // collision. fact_from_pairs is deterministic, so two builds
+        // with the same pairs produce byte-equal facts — exercising
+        // structural equality, not identity.
+        let f_first = fact_from_pairs(&[("Task", "t-7"), ("Status", "blocked")]);
+        let f_second = fact_from_pairs(&[("Task", "t-7"), ("Status", "blocked")]);
+        // Sanity: the two independently-built facts are byte-equal.
+        assert_eq!(f_first, f_second);
+        let s1 = cell_put_keyed("Task_has_Status", &["Task"], f_first.clone(), &Object::phi())
+            .expect("first write");
+        let s2 = cell_put_keyed("Task_has_Status", &["Task"], f_second.clone(), &s1)
+            .expect("idempotent re-assertion is Ok");
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn cell_put_keyed_collision_acceptance_4_distinct_keys_no_collision() {
+        // AC4: writing two distinct keys = no collision, both facts
+        // coexist in the Map.
+        let f1 = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
+        let f2 = fact_from_pairs(&[("Task", "t-2"), ("Status", "pending")]);
+        let s1 = cell_put_keyed("Task_has_Status", &["Task"], f1.clone(), &Object::phi())
+            .expect("first write");
+        let s2 = cell_put_keyed("Task_has_Status", &["Task"], f2.clone(), &s1)
+            .expect("distinct second key — no collision");
+        let m = fetch_or_phi("Task_has_Status", &s2).as_map().cloned()
+            .expect("Map contents");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get("t-1"), Some(&f1));
+        assert_eq!(m.get("t-2"), Some(&f2));
+    }
+
     // task-744 phase 3: FFP combinators accept Map cells as the input
     // collection. α and Filter iterate values; Length counts entries.
 
@@ -7909,8 +8072,10 @@ mod tests {
     fn apply_to_all_maps_over_map_values() {
         let f = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
         let g = fact_from_pairs(&[("Task", "t-2"), ("Status", "done")]);
-        let m = cell_put_keyed("X", &["Task"], f,
-            &cell_put_keyed("X", &["Task"], g, &Object::phi()));
+        let inner = cell_put_keyed("X", &["Task"], g, &Object::phi())
+            .expect("first key");
+        let m = cell_put_keyed("X", &["Task"], f, &inner)
+            .expect("second key");
         let cell = fetch_or_phi("X", &m);
         // α(Selector(2)) over a Map of <<Task,T>,<Status,S>> facts gives the
         // sequence of <Status, value> pairs — order is incidental for a Map.
@@ -7935,7 +8100,8 @@ mod tests {
         let h = fact_from_pairs(&[("Task", "t-3"), ("Status", "pending")]);
         let mut state = Object::phi();
         for fact in &[f.clone(), g.clone(), h.clone()] {
-            state = cell_put_keyed("X", &["Task"], fact.clone(), &state);
+            state = cell_put_keyed("X", &["Task"], fact.clone(), &state)
+                .expect("distinct keys across the loop");
         }
         let cell = fetch_or_phi("X", &state);
         // Filter for pending: predicate compares Status pair to "pending".
@@ -7955,8 +8121,10 @@ mod tests {
     fn length_counts_map_entries() {
         let f = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
         let g = fact_from_pairs(&[("Task", "t-2"), ("Status", "done")]);
-        let state = cell_put_keyed("X", &["Task"], f,
-            &cell_put_keyed("X", &["Task"], g, &Object::phi()));
+        let inner = cell_put_keyed("X", &["Task"], g, &Object::phi())
+            .expect("first key");
+        let state = cell_put_keyed("X", &["Task"], f, &inner)
+            .expect("second key");
         let cell = fetch_or_phi("X", &state);
         let result = apply(&Func::Length, &cell, &Object::phi());
         assert_eq!(result, Object::atom("2"));
@@ -7981,7 +8149,8 @@ mod tests {
         let f = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
         let seq = cell_push("X", f.clone(), &Object::phi());
         assert_eq!(cell_fact_count(&fetch_or_phi("X", &seq)), 1);
-        let map = cell_put_keyed("Y", &["Task"], f, &Object::phi());
+        let map = cell_put_keyed("Y", &["Task"], f, &Object::phi())
+            .expect("first write");
         assert_eq!(cell_fact_count(&fetch_or_phi("Y", &map)), 1);
         assert_eq!(cell_fact_count(&Object::phi()), 0);
         assert_eq!(cell_fact_count(&Object::Bottom), 0);
