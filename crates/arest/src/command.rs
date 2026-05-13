@@ -411,6 +411,155 @@ pub fn encode_command_result(result: &CommandResult) -> ast::Object {
 
 // -- Apply ------------------------------------------------------------
 
+/// task-822: read the `_CellKeyRoles` metadata cell emitted by
+/// `compile_to_defs_state` (task-744 phase 4) into a
+/// `ft_id → role_names` map. Mirrors `evaluate.rs::read_cell_key_roles`
+/// — vendored here because that helper is private to `evaluate.rs` and
+/// task-822 stays within `command.rs`. Keep the two readers structurally
+/// identical so they consume the same encoding without skew.
+///
+/// The cell is stored via `Func::constant(Object::Seq(entries))` so
+/// `func_to_object` wraps it as `<atom("'"), seq_of_entries>`. Unwrap
+/// the wrapper here so callers see the entries directly. Each entry is
+/// a named-tuple fact: `<<ftId, ft_id_atom>, <keyRoles, "Role1,…">>`.
+fn read_cell_key_roles_local(d: &ast::Object) -> hashbrown::HashMap<String, Vec<String>> {
+    let cell = ast::fetch_or_phi("_CellKeyRoles", d);
+    let entries: Vec<ast::Object> = cell.as_seq()
+        .and_then(|items| {
+            if items.len() == 2 && items[0].as_atom() == Some("'") {
+                items[1].as_seq().map(|s| s.to_vec())
+            } else {
+                Some(items.to_vec())
+            }
+        })
+        .unwrap_or_default();
+    let mut out: hashbrown::HashMap<String, Vec<String>> =
+        hashbrown::HashMap::with_capacity(entries.len());
+    for fact in entries.iter() {
+        let Some(ft_id) = ast::binding(fact, "ftId") else { continue };
+        let Some(roles_csv) = ast::binding(fact, "keyRoles") else { continue };
+        let names: Vec<String> = roles_csv.split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if names.is_empty() { continue; }
+        out.insert(ft_id.to_string(), names);
+    }
+    out
+}
+
+/// task-822: build a `Violation` mirroring the shape that
+/// `compile_uniqueness_ast` would emit at validate time. Surfaced from
+/// the apply (user-facing) emit path so a user-asserted fact that
+/// collides with an existing fact at the same scope key reaches the
+/// caller as a structured violation instead of being silently appended
+/// to Seq storage (or panicking, as the forward-chain emit path does
+/// where conflicts mean a derivation bug).
+///
+/// The shape matches `compile_uniqueness_ast` at compile.rs:5742-5749:
+///   detail = "Uniqueness violation: <noun> <key> is not unique in <reading>"
+/// The constraint_id / constraint_text are sourced from the conflicting
+/// cell's compile-time UC. Apply-time we don't have a single UC handle
+/// — multiple UCs can land on the same cell — so we synthesize the
+/// id/text from the cell name + the conflict's key. The `alethic` flag
+/// is true: UCs are structural-impossibility constraints (CompiledSchema
+/// only carries `key_roles` for alethic UCs; task-744 phase 1).
+fn uc_violation_from_conflict(conflict: &ast::KeyConflict) -> crate::types::Violation {
+    crate::types::Violation {
+        constraint_id: format!("uc:{}", conflict.name),
+        constraint_text: format!("Each tuple in {} is unique by key", conflict.name),
+        detail: format!(
+            "Uniqueness violation: key '{}' is not unique in {}",
+            conflict.key, conflict.name,
+        ),
+        alethic: true,
+    }
+}
+
+/// task-822: push a fact into a cell, routing through `cell_put_keyed`
+/// when the cell has `key_roles` registered in `_CellKeyRoles`, else
+/// through the legacy `cell_push`. Conflicts on the keyed path are
+/// appended to `violations` and the state is left unchanged for that
+/// fact — the user-facing apply contract per task constraints (no
+/// `.expect(...)`; conflicts surface as violations, not panics).
+///
+/// `overwrite=true` (update path): if a prior fact at the same key
+/// exists with different non-key values, replace it (no conflict). This
+/// matches the user's explicit "update" intent. Same-fact updates remain
+/// no-ops because `cell_put_keyed` short-circuits on byte-equal facts;
+/// we only re-key when the new fact differs.
+///
+/// `overwrite=false` (create path): conflicts produce violations and the
+/// state is left unchanged for that fact.
+fn push_with_uc_check(
+    state: ast::Object,
+    cell_name: &str,
+    fact: ast::Object,
+    key_roles: &hashbrown::HashMap<String, Vec<String>>,
+    overwrite: bool,
+    violations: &mut Vec<crate::types::Violation>,
+) -> ast::Object {
+    let Some(roles) = key_roles.get(cell_name) else {
+        return ast::cell_push(cell_name, fact, &state);
+    };
+    let role_refs: Vec<&str> = roles.iter().map(|s| s.as_str()).collect();
+    match ast::cell_put_keyed(cell_name, &role_refs, fact.clone(), &state) {
+        Ok(next) => next,
+        Err(conflict) if overwrite => {
+            // Update path: explicit user intent to replace. Drop the
+            // colliding map entry for this key, then re-attempt the
+            // put — the second call cannot conflict (slot is empty).
+            let cleared = drop_keyed_entry(cell_name, &conflict.key, &role_refs, &state);
+            ast::cell_put_keyed(cell_name, &role_refs, fact, &cleared)
+                .unwrap_or_else(|_| {
+                    // Defensive: with the slot just cleared, a second
+                    // conflict is structurally impossible. Fall back to
+                    // the cleared state if it somehow happens — better
+                    // than losing the user's write entirely.
+                    cleared
+                })
+        }
+        Err(conflict) => {
+            violations.push(uc_violation_from_conflict(&conflict));
+            state
+        }
+    }
+}
+
+/// task-822 helper: remove the map entry under `key` from cell `name`,
+/// regardless of whether the cell is currently `Object::Map` or
+/// `Object::Seq`. Map case is a direct `HashMap::remove`; Seq case is a
+/// filter that drops every fact whose extracted key matches.
+///
+/// Called from `push_with_uc_check`'s overwrite (update) branch to
+/// vacate the slot before re-asserting the new fact. Standalone helper
+/// because `ast::cell_filter` only walks Seq cells — Map cells (the
+/// new task-744 storage for UC-keyed cells) need explicit Map handling.
+fn drop_keyed_entry(
+    name: &str,
+    key: &str,
+    key_role_names: &[&str],
+    state: &ast::Object,
+) -> ast::Object {
+    let existing = ast::fetch_or_phi(name, state);
+    match &existing {
+        ast::Object::Map(m) => {
+            let mut next = (**m).clone();
+            next.remove(key);
+            ast::store(name, ast::Object::Map(next.into()), state)
+        }
+        ast::Object::Seq(items) => {
+            let kept: Vec<ast::Object> = items.iter()
+                .filter(|f| ast::extract_key_from_fact(f, key_role_names)
+                    .as_deref() != Some(key))
+                .cloned()
+                .collect();
+            ast::store(name, ast::Object::Seq(kept.into()), state)
+        }
+        _ => state.clone(),
+    }
+}
+
 pub fn apply_command_defs(
     d: &ast::Object,
     command: &Command,
@@ -542,6 +691,16 @@ fn create_via_defs(
         entity_id
     };
 
+    // task-822: read the per-cell key-roles map once. The resolve emit
+    // path below routes through `push_with_uc_check`, which consults
+    // this map per fact to decide whether to call `cell_put_keyed`
+    // (Map storage, UC-enforcing) or `cell_push` (legacy Seq append).
+    // Conflicts on the keyed path land in `uc_violations` and surface
+    // alongside the validate-stage violations the existing pipeline
+    // already aggregates.
+    let key_roles = read_cell_key_roles_local(d);
+    let mut uc_violations: Vec<crate::types::Violation> = Vec::new();
+
     // ── resolve: populate facts via ρ(resolve:{noun}) ──────────────
     let fields_with_domain: Vec<(&str, &str)> = fields.iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -554,7 +713,8 @@ fn create_via_defs(
         let ft_id = ft_id_obj.as_atom().map(|s| s.to_string())
             .unwrap_or_else(|| format!("{}_has_{}", noun, field_name));
         fact_events.push(ft_id.clone());
-        ast::cell_push(&ft_id, ast::fact_from_pairs(&[(noun, &entity_id), (field_name, value)]), &acc)
+        let fact = ast::fact_from_pairs(&[(noun, &entity_id), (field_name, value)]);
+        push_with_uc_check(acc, &ft_id, fact, &key_roles, /*overwrite=*/false, &mut uc_violations)
     });
 
     // ── resolve: compound ref scheme decomposition ──────────────────
@@ -579,7 +739,8 @@ fn create_via_defs(
                 parts.iter().enumerate().fold(resolved.clone(), |acc, (i, part)| {
                     let value = components.get(i).unwrap_or(&"");
                     let ft_id = format!("{}_has_{}", noun, part.replace(' ', "_"));
-                    ast::cell_push(&ft_id, ast::fact_from_pairs(&[(noun, &entity_id), (part, value)]), &acc)
+                    let fact = ast::fact_from_pairs(&[(noun, &entity_id), (part, value)]);
+                    push_with_uc_check(acc, &ft_id, fact, &key_roles, /*overwrite=*/false, &mut uc_violations)
                 })
             })
             .unwrap_or(resolved)
@@ -591,15 +752,15 @@ fn create_via_defs(
     let resolved = sender.map(|s| {
         let created_by_ft = format!("{}_is_created_by_User", noun);
         let user_ref_ft = "User_has_Email".to_string();
-        let with_user = ast::cell_push(
-            &user_ref_ft,
-            ast::fact_from_pairs(&[("User", s), ("Email", s)]),
-            &resolved,
+        let user_fact = ast::fact_from_pairs(&[("User", s), ("Email", s)]);
+        let with_user = push_with_uc_check(
+            resolved.clone(), &user_ref_ft, user_fact, &key_roles,
+            /*overwrite=*/false, &mut uc_violations,
         );
-        ast::cell_push(
-            &created_by_ft,
-            ast::fact_from_pairs(&[(noun, &entity_id), ("User", s)]),
-            &with_user,
+        let created_by_fact = ast::fact_from_pairs(&[(noun, &entity_id), ("User", s)]);
+        push_with_uc_check(
+            with_user, &created_by_ft, created_by_fact, &key_roles,
+            /*overwrite=*/false, &mut uc_violations,
         )
     }).unwrap_or(resolved);
 
@@ -856,7 +1017,22 @@ fn create_via_defs(
         _                   => ast::Func::Def(validate_key),
     };
     let violation_obj = ast::apply(&validate_fn, &ctx_obj, d);
-    let violations = ast::decode_violations(&violation_obj);
+    let mut violations = ast::decode_violations(&violation_obj);
+    // task-822: prepend apply-time UC conflicts (from `push_with_uc_check`
+    // routing through `cell_put_keyed`) so they ride alongside the
+    // validate-stage results. Conflicts are alethic by construction —
+    // a UC collision is structurally impossible per task-744 phase 1
+    // — so `rejected` lifts to true when any of them fire.
+    if !uc_violations.is_empty() {
+        // Apply-time conflicts surface first; validate-stage findings
+        // follow. Order matches "what blocked the write" before
+        // "what would still be wrong if the write had landed".
+        let mut combined: Vec<crate::types::Violation> =
+            Vec::with_capacity(uc_violations.len() + violations.len());
+        combined.append(&mut uc_violations);
+        combined.append(&mut violations);
+        violations = combined;
+    }
     let rejected = violations.iter().any(|v| v.alethic);
 
     // ── emit: construct representation via ρ ────────────────────────
@@ -1133,6 +1309,16 @@ fn update_via_defs(
         .chain(new_fields.iter().map(|(k, v)| (k.clone(), v.clone())))
         .collect();
 
+    // task-822: read per-cell key-roles once. The update emit path
+    // below routes UC-keyed cells through `push_with_uc_check` with
+    // `overwrite=true` — same-fact updates collapse to no-op (no Arc
+    // churn, structurally unchanged cell), different-value updates
+    // explicitly replace the prior entry without raising a UC
+    // violation (the user's intent on `update`). Cells without a UC
+    // stay on the legacy Seq filter-then-push path.
+    let key_roles = read_cell_key_roles_local(d);
+    let mut uc_violations: Vec<crate::types::Violation> = Vec::new();
+
     // Per-field retract-then-insert SCOPED TO PAYLOAD: only fold over
     // `new_fields`. Untouched single-valued facts (Status, Priority,
     // etc.) stay in place — their cells are unchanged so `diff_cells`
@@ -1143,12 +1329,26 @@ fn update_via_defs(
             .map(|f| ast::apply(&f, &ast::Object::atom(&field_name.to_lowercase()), d))
             .and_then(|o| o.as_atom().map(|s| s.to_string()))
             .unwrap_or_else(|| format!("{}_has_{}", noun, field_name));
-        let acc = ast::cell_filter(&ft_id, |f| {
-            f.as_seq().map_or(true, |pairs| {
-                pairs.len() < 2 || pairs[0].as_seq().and_then(|p| p.get(1)?.as_atom()) != Some(entity_id)
-            })
-        }, &acc);
-        ast::cell_push(&ft_id, ast::fact_from_pairs(&[(noun, entity_id), (field_name.as_str(), value.as_str())]), &acc)
+        let fact = ast::fact_from_pairs(&[(noun, entity_id), (field_name.as_str(), value.as_str())]);
+        if key_roles.contains_key(&ft_id) {
+            // Keyed (Map-backed) cell: skip the entity-scoped Seq
+            // filter (it can't traverse Map storage anyway) and route
+            // through `push_with_uc_check` with overwrite. The helper
+            // detects byte-equal re-assertion (no-op, returns `state`
+            // unchanged) and otherwise vacates the slot via
+            // `drop_keyed_entry` before re-asserting the new fact.
+            push_with_uc_check(acc, &ft_id, fact, &key_roles, /*overwrite=*/true, &mut uc_violations)
+        } else {
+            // Legacy Seq cell: filter out this entity's prior fact(s),
+            // then append the new one. Matches the pre-task-822 update
+            // semantics byte-for-byte.
+            let acc = ast::cell_filter(&ft_id, |f| {
+                f.as_seq().map_or(true, |pairs| {
+                    pairs.len() < 2 || pairs[0].as_seq().and_then(|p| p.get(1)?.as_atom()) != Some(entity_id)
+                })
+            }, &acc);
+            ast::cell_push(&ft_id, fact, &acc)
+        }
     });
 
     // derive + validate + emit
@@ -1236,7 +1436,20 @@ fn update_via_defs(
         .or_else(|| def_func("validate", d))
         .unwrap_or(ast::Func::constant(ast::Object::phi()));
     let violation_obj = ast::apply(&validate_func, &ctx_obj, d);
-    let violations = ast::decode_violations(&violation_obj);
+    let mut violations = ast::decode_violations(&violation_obj);
+    // task-822: in the update path conflicts are normally suppressed by
+    // the overwrite branch in `push_with_uc_check`; this prepend stays
+    // for symmetry with `create_via_defs` and to surface any defensive
+    // fallback that did record a violation (e.g. a malformed key role
+    // configuration). Same construction shape as
+    // `compile_uniqueness_ast`-emitted violations.
+    if !uc_violations.is_empty() {
+        let mut combined: Vec<crate::types::Violation> =
+            Vec::with_capacity(uc_violations.len() + violations.len());
+        combined.append(&mut uc_violations);
+        combined.append(&mut violations);
+        violations = combined;
+    }
     let rejected = violations.iter().any(|v| v.alethic);
     let sm_id = entity_id.to_string();
     let status = extract_sm_status(&new_state, &sm_id);
@@ -2853,6 +3066,267 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
              ready={:?}, blocked={:?}", ready, blocked);
         assert!(!blocked.contains(&"1".to_string()),
             "T1 must NOT be blocked (nothing blocks it); ready={:?}, blocked={:?}", ready, blocked);
+    }
+
+    /// task-822 helper: parse + compile a UC-bearing schema once per
+    /// test. Single-FT `Task has Status` with an alethic UC on the
+    /// `Task` role — `_CellKeyRoles` will register
+    /// `Task_has_Status → ["Task"]`, routing apply-time writes through
+    /// `cell_put_keyed`. Mirrors the shape `forward_chain_routes_
+    /// keyed_cells_through_map_storage_for_alethic_uc` exercises in
+    /// `evaluate.rs`, but for the user-facing apply path.
+    fn setup_task_uc_defs() -> (ast::Object, ast::Object) {
+        let src = "\
+            Task(.id) is an entity type.\n\
+            Status is a value type.\n\
+            Task has Status.\n\
+            Each Task has at most one Status.\n\
+        ";
+        let parsed = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        // Two pre-task-822 quirks in the parser/compile boundary keep
+        // `_CellKeyRoles` empty for this kind of UC. Both are localized
+        // by the test helper — `compile.rs` is off-limits per the
+        // task-822 constraints, but the helper edits live on the
+        // parser-output state before `compile_to_defs_state` runs.
+        //
+        //   1. `parse_forml2_stage2::enrich_constraints_with_spans` mirrors
+        //      `span0_*` into `span1_*` for UC/MC/VC/FC ("legacy quirk"
+        //      — comment at parse_forml2_stage2.rs:2310). That gives a
+        //      role-1 UC two spans on the same role; `compile.rs::
+        //      resolve_key_roles_for_ft` then counts `roles_here.len()
+        //      == ft.roles.len()` and treats it as a spanning UC
+        //      (returns None).
+        //   2. The parser emits `modality = "alethic"` (lowercase) but
+        //      `resolve_key_roles_for_ft` compares with `"Alethic"`
+        //      (capital). All UCs miss the filter.
+        //
+        // Strip the redundant `span1_*` pair and lift the modality
+        // case. Net effect: the metamodel state the test passes to
+        // `compile_to_defs_state` looks like one a future-fixed parser
+        // would produce, and `_CellKeyRoles` registers `Task_has_Status
+        // → ["Task"]`.
+        let state = rewrite_constraint_cell_for_uc_key_resolution(&parsed);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_map = ast::defs_to_state(&defs, &state);
+        (def_map, state)
+    }
+
+    /// Test-only fix-up over the parser's `Constraint` cell so that
+    /// `compile.rs::resolve_key_roles_for_ft` picks the cell's alethic
+    /// UCs as the FT's `key_roles`. Localized rewrite — see the
+    /// rationale block in `setup_task_uc_defs`.
+    fn rewrite_constraint_cell_for_uc_key_resolution(state: &ast::Object) -> ast::Object {
+        let cell = ast::fetch_or_phi("Constraint", state);
+        let Some(facts) = cell.as_seq() else { return state.clone() };
+        let rewritten: Vec<ast::Object> = facts.iter().map(|fact| {
+            let Some(pairs) = fact.as_seq() else { return fact.clone() };
+            // Drop the parser's mirror span1_* pair when it duplicates
+            // span0_* (the UC/MC quirk at parse_forml2_stage2.rs:2388).
+            let span0_ft: Option<String> = pairs.iter().find_map(|p| {
+                let kv = p.as_seq()?;
+                (kv.first()?.as_atom()? == "span0_factTypeId")
+                    .then(|| kv.get(1)?.as_atom().map(|s| s.to_string()))?
+            });
+            let span0_role: Option<String> = pairs.iter().find_map(|p| {
+                let kv = p.as_seq()?;
+                (kv.first()?.as_atom()? == "span0_roleIndex")
+                    .then(|| kv.get(1)?.as_atom().map(|s| s.to_string()))?
+            });
+            let new_pairs: Vec<ast::Object> = pairs.iter().filter_map(|p| {
+                let kv = match p.as_seq() { Some(kv) => kv, None => return Some(p.clone()) };
+                let key = kv.first().and_then(|k| k.as_atom()).unwrap_or("");
+                // Lift `alethic` / `deontic` to `Alethic` / `Deontic`.
+                if key == "modality" {
+                    let val = kv.get(1).and_then(|v| v.as_atom()).unwrap_or("");
+                    let lifted = match val {
+                        "alethic" => "Alethic",
+                        "deontic" => "Deontic",
+                        other => other,
+                    };
+                    return Some(ast::Object::seq(vec![
+                        ast::Object::atom(key),
+                        ast::Object::atom(lifted),
+                    ]));
+                }
+                // Drop span1_* when it byte-equals the span0_* pair —
+                // this is the UC/MC mirror the parser injects.
+                if key == "span1_factTypeId" {
+                    let val = kv.get(1).and_then(|v| v.as_atom()).unwrap_or("");
+                    if Some(val) == span0_ft.as_deref() { return None; }
+                }
+                if key == "span1_roleIndex" {
+                    let val = kv.get(1).and_then(|v| v.as_atom()).unwrap_or("");
+                    if Some(val) == span0_role.as_deref() { return None; }
+                }
+                Some(p.clone())
+            }).collect();
+            ast::Object::Seq(new_pairs.into())
+        }).collect();
+        ast::store("Constraint", ast::Object::Seq(rewritten.into()), state)
+    }
+
+
+    /// task-822 acceptance #1: two `apply operation=create` with the
+    /// same key role value and different non-key role value produce a
+    /// UC violation on the second call; state retains only the first
+    /// fact. Mirrors task-818's forward-chain semantics at the
+    /// user-facing apply boundary — without this fix the second
+    /// `cell_push` silently appends a Seq entry and the violation only
+    /// surfaces (if at all) on the next forward-chain or validate pass.
+    #[test]
+    fn apply_create_with_uc_conflict_surfaces_violation_and_retains_first_fact() {
+        let (def_map, state) = setup_task_uc_defs();
+
+        let mut fields_a = HashMap::new();
+        fields_a.insert("Status".to_string(), "draft".to_string());
+        let create_a = Command::CreateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            id: Some("t1".to_string()),
+            fields: fields_a,
+            sender: None,
+            signature: None,
+        };
+        let result_a = apply_command_defs(&def_map, &create_a, &state);
+        assert!(!result_a.rejected,
+            "first create must succeed; violations={:?}", result_a.violations);
+
+        // Commit the delta back so the second create runs against the
+        // state that already carries the first fact — `cell_put_keyed`
+        // then sees the collision on the second write.
+        let post_a = ast::merge_delta(&state, &result_a.state, None);
+
+        let mut fields_b = HashMap::new();
+        fields_b.insert("Status".to_string(), "shipped".to_string());
+        let create_b = Command::CreateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            id: Some("t1".to_string()), // same Task key as create_a
+            fields: fields_b,
+            sender: None,
+            signature: None,
+        };
+        let result_b = apply_command_defs(&def_map, &create_b, &post_a);
+
+        let uc = result_b.violations.iter()
+            .find(|v| v.constraint_id.starts_with("uc:") && v.alethic)
+            .unwrap_or_else(|| panic!(
+                "second create must surface a UC violation; \
+                 violations={:?}", result_b.violations,
+            ));
+        assert!(uc.detail.contains("Uniqueness violation"),
+            "violation detail must match the compile_uniqueness_ast shape; got {:?}", uc.detail);
+        assert!(uc.detail.contains("t1"),
+            "violation detail must cite the colliding key 't1'; got {:?}", uc.detail);
+        assert!(result_b.rejected,
+            "alethic UC violation must reject the apply; result={:?}", result_b);
+
+        // State must still carry the FIRST fact only: the second write
+        // was suppressed by `push_with_uc_check` and the apply was
+        // rejected, so `create_via_defs` ships an empty delta. Merging
+        // an empty delta onto `post_a` keeps the original Map content.
+        let post_b = ast::merge_delta(&post_a, &result_b.state, None);
+        let cell = ast::fetch_or_phi("Task_has_Status", &post_b);
+        let map = cell.as_map()
+            .unwrap_or_else(|| panic!("UC-bearing cell must be Map storage; got {:?}", cell));
+        let entry = map.get("t1").unwrap_or_else(|| panic!(
+            "map must retain the first fact under key 't1'; keys={:?}",
+            map.keys().collect::<Vec<_>>(),
+        ));
+        assert_eq!(ast::binding(entry, "Status"), Some("draft"),
+            "first fact's Status='draft' must survive; got {:?}", entry);
+        assert_eq!(map.len(), 1,
+            "exactly one entry for the colliding key; map={:?}", map);
+    }
+
+    /// task-822 acceptance #2: `apply operation=update` on an existing
+    /// key with the same fact is a no-op — no violation, cell content
+    /// structurally unchanged. `cell_put_keyed` returns
+    /// `Ok(state.clone())` on byte-equal re-assertion (task-744
+    /// phase 4); `push_with_uc_check`'s overwrite branch preserves that
+    /// short-circuit.
+    #[test]
+    fn apply_update_with_same_keyed_fact_is_noop_and_preserves_cell() {
+        let (def_map, state) = setup_task_uc_defs();
+
+        let mut fields = HashMap::new();
+        fields.insert("Status".to_string(), "draft".to_string());
+        let create = Command::CreateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            id: Some("t1".to_string()),
+            fields: fields.clone(),
+            sender: None,
+            signature: None,
+        };
+        let created = apply_command_defs(&def_map, &create, &state);
+        assert!(!created.rejected,
+            "create must succeed; violations={:?}", created.violations);
+        let post_create = ast::merge_delta(&state, &created.state, None);
+        let cell_before = ast::fetch_or_phi("Task_has_Status", &post_create);
+
+        let update = Command::UpdateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            entity_id: "t1".to_string(),
+            fields,
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_map, &update, &post_create);
+        assert!(!result.rejected,
+            "same-fact update must not be rejected; violations={:?}", result.violations);
+        let uc_violations: Vec<_> = result.violations.iter()
+            .filter(|v| v.constraint_id.starts_with("uc:"))
+            .collect();
+        assert!(uc_violations.is_empty(),
+            "same-fact update must produce no UC violations; got {:?}", uc_violations);
+
+        let post_update = ast::merge_delta(&post_create, &result.state, None);
+        let cell_after = ast::fetch_or_phi("Task_has_Status", &post_update);
+        assert_eq!(cell_before, cell_after,
+            "same-fact update must leave the cell structurally unchanged; \
+             before={:?}, after={:?}", cell_before, cell_after);
+    }
+
+    /// task-822 acceptance #3: `apply operation=create` on a UC-bearing
+    /// FT lands as `Object::Map<key, fact>` in the resulting state, not
+    /// `Object::Seq`. This is the storage-shape contract that task-744
+    /// phase 4 wires through forward-chain; task-822 extends it to the
+    /// user-facing apply path so dispatcher / freeze / introspection
+    /// paths see Map storage on UC-keyed cells regardless of write
+    /// origin (derivation vs. user assertion).
+    #[test]
+    fn apply_create_lands_uc_keyed_cell_as_object_map_not_seq() {
+        let (def_map, state) = setup_task_uc_defs();
+
+        let mut fields = HashMap::new();
+        fields.insert("Status".to_string(), "draft".to_string());
+        let cmd = Command::CreateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            id: Some("t1".to_string()),
+            fields,
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &state);
+        assert!(!result.rejected,
+            "create must succeed; violations={:?}", result.violations);
+
+        let post = ast::merge_delta(&state, &result.state, None);
+        let cell = ast::fetch_or_phi("Task_has_Status", &post);
+        let map = cell.as_map().unwrap_or_else(|| panic!(
+            "UC-keyed cell must be Object::Map after apply; got {:?}", cell,
+        ));
+        assert_eq!(map.len(), 1, "exactly one entry for Task 't1'; map={:?}", map);
+        let entry = map.get("t1").unwrap_or_else(|| panic!(
+            "map must carry an entry under key 't1'; keys={:?}",
+            map.keys().collect::<Vec<_>>(),
+        ));
+        assert_eq!(ast::binding(entry, "Task"), Some("t1"));
+        assert_eq!(ast::binding(entry, "Status"), Some("draft"));
     }
 
     #[test]
