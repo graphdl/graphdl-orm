@@ -150,6 +150,28 @@ pub(crate) struct CompiledSchema {
     pub(crate) construction: crate::ast::Func,
     /// Role names in order (for binding resolution)
     pub(crate) role_names: Vec<String>,
+    /// Role indices that uniquely identify a tuple within this cell
+    /// (task-744 / #743 follow-up). Populated from alethic UC
+    /// constraints spanning the fact type at compile time:
+    ///
+    /// - Single-role UC over role R  → `Some(vec![R])` — R's value is
+    ///   the cell key, the remaining roles are the tuple value.
+    /// - Composite UC over roles R1, R2 → `Some(vec![R1, R2])` — keyed
+    ///   by the (R1, R2) tuple.
+    /// - No UC → `None` — cell remains a Seq of tuples, scanned linearly.
+    ///
+    /// `key_roles` lets the cell store flip from `Object::Seq<tuple>` to
+    /// `Object::Map<key, tuple>` for cells whose reference scheme says
+    /// they're Codd relations. UC enforcement, AbsenceOf, and SM init's
+    /// is_new all collapse to O(1) FetchOrPhi when the target cell is
+    /// Map-backed — replacing the O(N²) `null . filter(eq) . distl`
+    /// pattern that otherwise has to be composed by hand.
+    ///
+    /// Empty `Some(vec![])` is reserved for "spanning UC" cases (UC over
+    /// every role of the FT, meaning the whole tuple is its own key) and
+    /// is not produced by the current compiler; callers should treat it
+    /// the same as `None` for now.
+    pub(crate) key_roles: Option<Vec<usize>>,
 }
 
 /// The compiled model -- all constraints, derivations, state machines, and schemas as executable functions.
@@ -195,15 +217,64 @@ fn compile_schemas(data: &CellIndex) -> HashMap<String, CompiledSchema> {
             .map(|role| role.noun_name.clone())
             .collect();
 
+        let key_roles = resolve_key_roles_for_ft(id, ft, &data.constraints);
+
         let schema = CompiledSchema {
             id: id.clone(),
             reading: ft.reading.clone(),
             construction: crate::ast::Func::Construction(selectors),
             role_names,
+            key_roles,
         };
 
         (id.clone(), schema)
     }).collect()
+}
+
+/// Resolve which roles act as the cell's key for a fact type
+/// (task-744 / #743). Walks the constraint list for alethic UCs whose
+/// spans land on `ft_id`. The smallest single-role UC is preferred (it
+/// matches Halpin's "preferred reference" choice: a one-role UC fully
+/// keys the tuple by one value). When no single-role UC exists but a
+/// composite UC does, the composite role-set becomes the key.
+///
+/// Returns `None` when the fact type has no UC, or only deontic ones
+/// (deontic doesn't structurally guarantee uniqueness — Map storage
+/// can't safely enforce it without dropping the deontic flag).
+///
+/// Multiplicity-derived UCs (a noun with reference scheme + the FT
+/// that records that scheme value) currently appear in the constraint
+/// list explicitly, so they're picked up by the same scan.
+fn resolve_key_roles_for_ft(
+    ft_id: &str,
+    ft: &FactTypeDef,
+    constraints: &[ConstraintDef],
+) -> Option<Vec<usize>> {
+    let mut ucs: Vec<Vec<usize>> = Vec::new();
+    for c in constraints {
+        if c.kind != "UC" { continue; }
+        if c.modality != "Alethic" { continue; }
+        // Roles this UC spans inside *this* fact type. A UC's spans
+        // can in principle live across multiple FTs (an external UC);
+        // we only key on the part landing here.
+        let roles_here: Vec<usize> = c.spans.iter()
+            .filter(|s| s.fact_type_id == ft_id)
+            .map(|s| s.role_index)
+            .collect();
+        if roles_here.is_empty() { continue; }
+        // Subset-autofill spans (cross-FT) — not yet handled in key
+        // analysis; skip for now to keep the first pass conservative.
+        if c.spans.iter().any(|s| s.subset_autofill.is_some()) { continue; }
+        // A UC spanning every role of the FT is a "spanning UC" — the
+        // whole tuple is its key. Treat it as a degenerate full-tuple
+        // index (we don't get a smaller key from any subset). Skip for
+        // now; Seq storage already handles this case correctly.
+        if roles_here.len() == ft.roles.len() { continue; }
+        ucs.push(roles_here);
+    }
+    // Prefer the smallest UC — Halpin's preferred-reference convention.
+    ucs.sort_by_key(|v| (v.len(), v.clone()));
+    ucs.into_iter().next()
 }
 
 // (Population-struct primitives instances_of/participates_in removed --
@@ -7314,6 +7385,154 @@ mod schema_tests {
             ].into()));
         }
         state
+    }
+
+    // ── task-744 / #743 follow-up: key_roles annotation ────────────
+    //
+    // The compiler walks alethic UCs and assigns each fact-type cell
+    // a key_roles: Option<Vec<usize>>. Downstream phases use this to
+    // switch the cell from Seq to Map storage so constraint
+    // enforcement and AbsenceOf-style membership tests collapse to
+    // O(1) FetchOrPhi. These tests cover the analysis itself; the
+    // storage flip is later phases.
+
+    /// FT with a single-role alethic UC over role 0 → key_roles = [0].
+    #[test]
+    fn key_roles_picks_single_role_alethic_uc() {
+        let compile_state = person_has_name_with_uc();
+        let model = compile(&compile_state);
+        let schema = model.schemas.get("ft1").expect("ft1 schema");
+        assert_eq!(schema.key_roles, Some(vec![0]));
+    }
+
+    /// FT with no UC → key_roles = None (cell stays Seq).
+    #[test]
+    fn key_roles_none_when_fact_type_has_no_uc() {
+        let state = make_state_with_fact_type(
+            "ft1", "Person likes Topic",
+            vec![("Person", 0), ("Topic", 1)],
+        );
+        let model = compile(&state);
+        let schema = model.schemas.get("ft1").expect("ft1 schema");
+        assert_eq!(schema.key_roles, None);
+    }
+
+    /// Deontic UC must not key the cell — deontic obligations don't
+    /// structurally rule out duplicates and Map storage would silently
+    /// drop the deontic violation path.
+    #[test]
+    fn key_roles_none_when_uc_is_only_deontic() {
+        let mut state = make_state_with_fact_type(
+            "ft1", "Person has Name",
+            vec![("Person", 0), ("Name", 1)],
+        );
+        let uc = ConstraintDef {
+            id: "uc-deontic".into(),
+            kind: "UC".into(),
+            modality: "Deontic".into(),
+            text: "Each Person should have at most one Name".into(),
+            spans: vec![SpanDef { fact_type_id: "ft1".into(), role_index: 0, subset_autofill: None }],
+            ..Default::default()
+        };
+        if let crate::ast::Object::Map(ref mut m) = state {
+            m.insert("Constraint".into(), crate::ast::Object::Seq(vec![
+                crate::parse_forml2::constraint_to_fact_test(&uc),
+            ].into()));
+        }
+        let model = compile(&state);
+        let schema = model.schemas.get("ft1").expect("ft1 schema");
+        assert_eq!(schema.key_roles, None);
+    }
+
+    /// Multiple single-role UCs on the same FT (rare but legal — both
+    /// roles independently determine the tuple) → preferred-reference
+    /// pick: the smaller role index wins (deterministic, matches
+    /// Halpin's preferred-UC convention for stable ID choice).
+    #[test]
+    fn key_roles_prefers_smaller_uc_when_multiple_present() {
+        let mut state = make_state_with_fact_type(
+            "ft1", "Person has Personal Email",
+            vec![("Person", 0), ("Personal Email", 1)],
+        );
+        let uc1 = ConstraintDef {
+            id: "uc-person".into(), kind: "UC".into(), modality: "Alethic".into(),
+            text: "Each Person has at most one Personal Email".into(),
+            spans: vec![SpanDef { fact_type_id: "ft1".into(), role_index: 1, subset_autofill: None }],
+            ..Default::default()
+        };
+        let uc2 = ConstraintDef {
+            id: "uc-email".into(), kind: "UC".into(), modality: "Alethic".into(),
+            text: "Each Personal Email belongs to at most one Person".into(),
+            spans: vec![SpanDef { fact_type_id: "ft1".into(), role_index: 0, subset_autofill: None }],
+            ..Default::default()
+        };
+        if let crate::ast::Object::Map(ref mut m) = state {
+            m.insert("Constraint".into(), crate::ast::Object::Seq(vec![
+                crate::parse_forml2::constraint_to_fact_test(&uc1),
+                crate::parse_forml2::constraint_to_fact_test(&uc2),
+            ].into()));
+        }
+        let model = compile(&state);
+        let schema = model.schemas.get("ft1").expect("ft1 schema");
+        // Both UCs are single-role; sort_by_key((len, key)) breaks the
+        // tie on the smallest role index → role 0.
+        assert_eq!(schema.key_roles, Some(vec![0]));
+    }
+
+    /// Composite UC over two roles → key_roles = those roles (still
+    /// preferred over a hypothetical larger UC, but here only the
+    /// composite exists so it wins by default).
+    #[test]
+    fn key_roles_uses_composite_uc_when_single_role_uc_absent() {
+        let mut state = make_state_with_fact_type(
+            "ft1", "Membership is for Person in Organization on Date",
+            vec![("Person", 0), ("Organization", 1), ("Date", 2)],
+        );
+        let uc = ConstraintDef {
+            id: "uc-composite".into(), kind: "UC".into(), modality: "Alethic".into(),
+            text: "Each (Person, Organization) pair appears in at most one Membership".into(),
+            spans: vec![
+                SpanDef { fact_type_id: "ft1".into(), role_index: 0, subset_autofill: None },
+                SpanDef { fact_type_id: "ft1".into(), role_index: 1, subset_autofill: None },
+            ],
+            ..Default::default()
+        };
+        if let crate::ast::Object::Map(ref mut m) = state {
+            m.insert("Constraint".into(), crate::ast::Object::Seq(vec![
+                crate::parse_forml2::constraint_to_fact_test(&uc),
+            ].into()));
+        }
+        let model = compile(&state);
+        let schema = model.schemas.get("ft1").expect("ft1 schema");
+        assert_eq!(schema.key_roles, Some(vec![0, 1]));
+    }
+
+    /// Spanning UC (covers every role of a binary FT) — treated as a
+    /// non-key constraint for now. Storage stays Seq; the existing
+    /// constraint compiler handles set semantics correctly.
+    #[test]
+    fn key_roles_skips_spanning_uc_over_full_arity() {
+        let mut state = make_state_with_fact_type(
+            "ft1", "Tag is for Item",
+            vec![("Tag", 0), ("Item", 1)],
+        );
+        let uc = ConstraintDef {
+            id: "uc-spanning".into(), kind: "UC".into(), modality: "Alethic".into(),
+            text: "Each (Tag, Item) pair appears at most once".into(),
+            spans: vec![
+                SpanDef { fact_type_id: "ft1".into(), role_index: 0, subset_autofill: None },
+                SpanDef { fact_type_id: "ft1".into(), role_index: 1, subset_autofill: None },
+            ],
+            ..Default::default()
+        };
+        if let crate::ast::Object::Map(ref mut m) = state {
+            m.insert("Constraint".into(), crate::ast::Object::Seq(vec![
+                crate::parse_forml2::constraint_to_fact_test(&uc),
+            ].into()));
+        }
+        let model = compile(&state);
+        let schema = model.schemas.get("ft1").expect("ft1 schema");
+        assert_eq!(schema.key_roles, None);
     }
 
     #[test]

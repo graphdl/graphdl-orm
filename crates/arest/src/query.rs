@@ -125,6 +125,7 @@ mod tests {
             reading: String::new(),
             construction: Func::Construction(selectors),
             role_names: role_names.iter().map(|s| s.to_string()).collect(),
+            key_roles: None,
         }
     }
 

@@ -1045,6 +1045,7 @@ fn query_via_defs(
         reading: String::new(),
         construction: def_func(&format!("schema:{}", schema_id), d).unwrap_or(ast::Func::Id),
         role_names: role_names.clone(),
+        key_roles: None,
     };
     let results = crate::query::query_with_ast(state, &schema, target_role, &filter_refs);
 
