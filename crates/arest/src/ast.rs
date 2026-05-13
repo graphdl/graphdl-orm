@@ -716,6 +716,19 @@ pub enum Func {
     /// Distribute from right: distr:<<y₁,...,yₙ>, z> = <<y₁,z>,...,<yₙ,z>>
     DistR,
 
+    /// Set-membership test (AREST extension, #743): has_member:<needle, haystack>
+    /// returns T if `needle` equals any element of the sequence `haystack`,
+    /// F otherwise. ⊥ on shape mismatch.
+    ///
+    /// Replaces the O(N²) `null ∘ filter(eq) ∘ distl` membership-test
+    /// pattern that derivations like SM init's `is_new` and join
+    /// rules' AbsenceOf guards otherwise compose by hand. Same big-O
+    /// (linear scan), but zero allocation per check vs. one Seq of N
+    /// pairs built and immediately discarded — on apps/tasks the
+    /// difference is ~30 s vs. ~5 min per recompile in the joint
+    /// fixpoint.
+    HasMember,
+
     /// Transpose: trans:<<a,b>, <c,d>> = <<a,c>, <b,d>>
     Trans,
 
@@ -1704,6 +1717,7 @@ fn variant_name(f: &Func) -> &'static str {
         Func::Compact => "Compact",
         Func::DistL => "DistL",
         Func::DistR => "DistR",
+        Func::HasMember => "HasMember",
         Func::Trans => "Trans",
         Func::ApndL => "ApndL",
         Func::Reverse => "Reverse",
@@ -2039,6 +2053,25 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                         Some(ys) => Object::seq(
                             ys.iter().map(|y| Object::seq(vec![y.clone(), z.clone()])).collect()
                         ),
+                        _ => Object::Bottom,
+                    }
+                }
+                _ => Object::Bottom,
+            }
+        }
+
+        Func::HasMember => {
+            match x.as_seq() {
+                Some(items) if items.len() == 2 => {
+                    let needle = &items[0];
+                    match items[1].as_seq() {
+                        Some(haystack) => {
+                            if haystack.iter().any(|h| h == needle) {
+                                Object::t()
+                            } else {
+                                Object::f()
+                            }
+                        }
                         _ => Object::Bottom,
                     }
                 }
@@ -3461,6 +3494,7 @@ pub mod primitives {
     pub const COMPACT: &str = "ct";
     pub const DISTL: &str = "dl";
     pub const DISTR: &str = "dr";
+    pub const HAS_MEMBER: &str = "in?";
     pub const LENGTH: &str = "#l";
     pub const TRANS: &str = "tr";
     pub const APNDL: &str = "al";
@@ -4478,6 +4512,7 @@ fn metacompose_atom(name: &str, d: &Object) -> Func {
         primitives::REVERSE => Func::Reverse,
         primitives::DISTL => Func::DistL,
         primitives::DISTR => Func::DistR,
+        primitives::HAS_MEMBER => Func::HasMember,
         primitives::LENGTH => Func::Length,
         primitives::TRANS => Func::Trans,
         primitives::APNDL => Func::ApndL,
@@ -4610,6 +4645,7 @@ pub fn func_to_object(func: &Func) -> Object {
         Func::Length => Object::atom(primitives::LENGTH),
         Func::DistL => Object::atom(primitives::DISTL),
         Func::DistR => Object::atom(primitives::DISTR),
+        Func::HasMember => Object::atom(primitives::HAS_MEMBER),
         Func::Trans => Object::atom(primitives::TRANS),
         Func::ApndL => Object::atom(primitives::APNDL),
         Func::Reverse => Object::atom(primitives::REVERSE),
@@ -4833,6 +4869,7 @@ impl fmt::Debug for Func {
             Func::Length => write!(f, "length"),
             Func::DistL => write!(f, "distl"),
             Func::DistR => write!(f, "distr"),
+            Func::HasMember => write!(f, "has_member"),
             Func::Trans => write!(f, "trans"),
             Func::ApndL => write!(f, "apndl"),
             Func::Reverse => write!(f, "reverse"),
@@ -5299,6 +5336,74 @@ mod tests {
                 Object::seq(vec![Object::atom("user-1"), Object::atom("org-b")]),
             ])
         );
+    }
+
+    // #743 — HasMember: O(N) allocation-free replacement for the
+    // null ∘ filter(eq) ∘ distl pattern. Same big-O as the composed
+    // form, but no intermediate Seq materialization (DistL allocates
+    // N pairs before the filter sees any of them).
+
+    #[test]
+    fn has_member_finds_atom_in_haystack() {
+        let x = Object::seq(vec![
+            Object::atom("task-42"),
+            Object::seq(vec![
+                Object::atom("task-1"),
+                Object::atom("task-42"),
+                Object::atom("task-99"),
+            ]),
+        ]);
+        assert_eq!(apply(&Func::HasMember, &x, &defs()), Object::t());
+    }
+
+    #[test]
+    fn has_member_returns_false_when_needle_absent() {
+        let x = Object::seq(vec![
+            Object::atom("task-42"),
+            Object::seq(vec![Object::atom("task-1"), Object::atom("task-2")]),
+        ]);
+        assert_eq!(apply(&Func::HasMember, &x, &defs()), Object::f());
+    }
+
+    #[test]
+    fn has_member_returns_false_when_haystack_empty() {
+        let x = Object::seq(vec![Object::atom("task-42"), Object::phi()]);
+        assert_eq!(apply(&Func::HasMember, &x, &defs()), Object::f());
+    }
+
+    #[test]
+    fn has_member_compares_seq_needles_structurally() {
+        // Used inside compile_sm_init_for the needles are typically
+        // atoms, but the primitive must support Seq needles too so
+        // the same primitive lifts joins whose role values are
+        // structured (rare but legal).
+        let pair = Object::seq(vec![Object::atom("Task"), Object::atom("task-1")]);
+        let other = Object::seq(vec![Object::atom("Task"), Object::atom("task-2")]);
+        let x = Object::seq(vec![
+            pair.clone(),
+            Object::seq(vec![other.clone(), pair.clone()]),
+        ]);
+        assert_eq!(apply(&Func::HasMember, &x, &defs()), Object::t());
+    }
+
+    #[test]
+    fn has_member_returns_bottom_on_shape_mismatch() {
+        // Single-element input (missing haystack).
+        let x = Object::seq(vec![Object::atom("task-42")]);
+        assert_eq!(apply(&Func::HasMember, &x, &defs()), Object::Bottom);
+
+        // Atom haystack (not a sequence).
+        let y = Object::seq(vec![Object::atom("task-42"), Object::atom("task-1")]);
+        assert_eq!(apply(&Func::HasMember, &y, &defs()), Object::Bottom);
+    }
+
+    #[test]
+    fn has_member_roundtrips_through_object() {
+        // ρ(in?) = Func::HasMember; ρ⁻¹(HasMember) = atom "in?".
+        let obj = func_to_object(&Func::HasMember);
+        assert_eq!(obj.as_atom(), Some(primitives::HAS_MEMBER));
+        let func = metacompose(&obj, &defs());
+        assert!(matches!(func, Func::HasMember));
     }
 
     // ── Compact (#352) — drops ⊥ elements so Filter derives cleanly

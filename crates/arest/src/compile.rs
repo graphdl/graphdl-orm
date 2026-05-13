@@ -4895,38 +4895,26 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
 
         let pairs = Func::construction(vec![get_instances, get_existing]);
 
-        // task-741: is_new takes a pair `<instance, [existing]>` from
-        // DistR (where [existing] is the union of forResource values
+        // task-741 / task-743: is_new takes a pair `<instance, [existing]>`
+        // from DistR (where [existing] is the union of forResource values
         // + per-trigger-FT resource values) and returns T iff
-        // `instance` ∉ [existing]. The pre-task-741 form used
-        // `compose(Selector(1), Selector(1))` as the left operand of
-        // Eq, expecting filter to expose the outer instance — but
-        // filter only passes the per-element value, so Selector(1)
-        // on the elem atom returns Bottom, the predicate always
-        // evaluated to F, and is_new produced "new" for every
-        // instance regardless of forResource state. Init was
-        // effectively unguarded — every recompile re-emitted
-        // 'pending' alongside event-fold's actual-status emissions.
+        // `instance` ∉ [existing].
         //
-        // The correct shape uses DistL to lift the outer instance
-        // into each per-element pair, then compares Selector(1) ==
-        // Selector(2) per pair.
-        let is_new = Func::compose(
-            Func::NullTest,
-            Func::compose(
-                Func::filter(Func::compose(Func::Eq, Func::construction(vec![
-                    Func::Selector(1),
-                    Func::Selector(2),
-                ]))),
-                Func::DistL,
-            ),
-        );
+        // Implemented as `not ∘ has_member`: HasMember:<needle, haystack>
+        // returns T if needle is an element of haystack (primitive
+        // membership test, #743). The original DistL+filter+NullTest
+        // composition was O(N) per check WITH O(N) allocation
+        // (DistL materialized N pairs before the filter saw any of
+        // them); HasMember is the same big-O but allocation-free, and
+        // on apps/tasks drops SM-init compile from ~5 min back to
+        // ~30 s.
+        let is_new = Func::compose(Func::Not, Func::HasMember);
 
-        // set_diff = alpha(sel(1)) . Filter(not_member) . distr
-        // not_member = null . Filter(eq) . distl
+        // set_diff = alpha(sel(1)) . Filter(is_new) . distr
+        // is_new = not . has_member
         // distr : <R, S> -> <<r1,S>,...,<rn,S>>
-        // For each <ri, S>: distl : <ri, S> -> <<ri,s1>,...> then Filter(eq) finds matches.
-        // null : phi -> T when ri not in S. Handles empty S correctly (distl:<ri,phi>=phi, null:phi=T).
+        // For each <ri, S>: has_member:<ri, S> = T iff ri ∈ S.
+        // Handles empty S correctly (has_member:<ri, φ> = F → is_new = T).
         let new_instances = Func::compose(
             Func::apply_to_all(Func::Selector(1)),
             Func::compose(Func::filter(is_new), Func::compose(Func::DistR, pairs)),
