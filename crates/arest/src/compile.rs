@@ -253,14 +253,27 @@ fn resolve_key_roles_for_ft(
     let mut ucs: Vec<Vec<usize>> = Vec::new();
     for c in constraints {
         if c.kind != "UC" { continue; }
-        if c.modality != "Alethic" { continue; }
-        // Roles this UC spans inside *this* fact type. A UC's spans
-        // can in principle live across multiple FTs (an external UC);
-        // we only key on the part landing here.
-        let roles_here: Vec<usize> = c.spans.iter()
+        // Modality is stored lower-case by the parser
+        // (`parse_forml2_stage2::translate_*` writes `"alethic"`
+        // / `"deontic"` per `constraint_to_fact_test`), but the
+        // existing hand-built `ConstraintDef` fixtures in this
+        // module's tests use `"Alethic"` (the historic enum-shaped
+        // form before #821b). Compare in lower-case so both paths
+        // see the same modality.
+        if !c.modality.eq_ignore_ascii_case("alethic") { continue; }
+        // Roles this UC spans inside *this* fact type. Dedup
+        // duplicate spans the parser may emit (`Each Task has at
+        // most one Task Readiness` lands as two identical Span
+        // rows on role 0 because span-enrichment pushes one entry
+        // per recogniser). Without dedup the "spanning UC" check
+        // below misreads a single-role UC as a full-arity one and
+        // drops it, leaving the cell unkeyed.
+        let mut roles_here: Vec<usize> = c.spans.iter()
             .filter(|s| s.fact_type_id == ft_id)
             .map(|s| s.role_index)
             .collect();
+        roles_here.sort_unstable();
+        roles_here.dedup();
         if roles_here.is_empty() { continue; }
         // Subset-autofill spans (cross-FT) — not yet handled in key
         // analysis; skip for now to keep the first pass conservative.
@@ -275,6 +288,20 @@ fn resolve_key_roles_for_ft(
     // Prefer the smallest UC — Halpin's preferred-reference convention.
     ucs.sort_by_key(|v| (v.len(), v.clone()));
     ucs.into_iter().next()
+}
+
+/// task-821: convenience lookup that mirrors `resolve_key_roles_for_ft`
+/// but takes the CellIndex directly — looks up the FT, returns `None`
+/// when the FT id isn't declared (defensive: callers may pass synthetic
+/// or empty FT ids from AbsenceOf placeholders that share the same
+/// CompiledSchema lookup convention). Used by the AbsenceOf-branch
+/// dispatch in `compile_explicit_derivation` to decide whether the
+/// negated cell is Map-backed and can drop the O(N²)
+/// `null ∘ filter(eq) ∘ distl` linear scan in favour of the O(1)
+/// `null ∘ FetchOrPhi` Map lookup.
+fn key_roles_for_ft(data: &CellIndex, ft_id: &str) -> Option<Vec<usize>> {
+    let ft = data.fact_types.get(ft_id)?;
+    resolve_key_roles_for_ft(ft_id, ft, &data.constraints)
 }
 
 // (Population-struct primitives instances_of/participates_in removed --
@@ -3357,20 +3384,49 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
         };
         let guard = absence_guard.or(implicit_dedup);
         let per_instance = match &guard {
-            Some((_ft, ri)) => {
+            Some((ft, ri)) => {
                 let ri = *ri;
-                // Dedup guard: candidate's role[ri] == the outer
-                // instance value. Sourced from
-                // `crate::fol::constraint::explicit_deriv_dedup` —
-                // the outer-instance `Raw(Selector(1))` is a
-                // legitimate residue since `Selector(1)` here
-                // addresses the outer distributed-pair slot, not
-                // "role 1 of the selected fact".
-                let match_pred = crate::fol::constraint::explicit_deriv_dedup(ri).to_func();
-                let not_participates = Func::compose(
-                    Func::NullTest,
-                    Func::compose(Func::filter(match_pred), Func::DistL),
-                );
+                // task-821: when the negated cell is Map-backed (single-
+                // role alethic UC whose key role is exactly the role we
+                // test for absence on), the "is candidate present" test
+                // collapses to one `FetchOrPhi:<outer_instance, cell>`
+                // lookup — same answer, O(1) instead of O(N) scan via
+                // filter+DistL+NullTest. The Map shape only fires when
+                // `key_roles == Some([ri])`; composite UCs and key-role
+                // mismatches stay on the legacy linear-scan path until
+                // a future task lifts those, mirroring the gating in
+                // `compile_sm_init_for`'s `is_new` migration.
+                let key_roles = key_roles_for_ft(data, ft);
+                let map_aware = matches!(&key_roles, Some(roles) if roles.as_slice() == [ri]);
+                let not_participates = if map_aware {
+                    // Input here is the DistR-paired tuple
+                    // `<outer_instance, cell_contents>`. FetchOrPhi
+                    // reads the Map at the instance's key — returns
+                    // the fact when present, φ when absent. NullTest:φ
+                    // is T (= "not_participates") so the condition
+                    // takes the derive branch only when the cell has no
+                    // fact at that key, matching the legacy semantics.
+                    Func::compose(
+                        Func::NullTest,
+                        Func::compose(
+                            Func::FetchOrPhi,
+                            Func::construction(vec![
+                                Func::Selector(1),
+                                Func::Selector(2),
+                            ]),
+                        ),
+                    )
+                } else {
+                    // Legacy linear-scan: candidate's role[ri] == outer
+                    // instance value. `explicit_deriv_dedup`'s `Raw(
+                    // Selector(1))` reads the outer distributed-pair
+                    // slot, not "role 1 of the selected fact".
+                    let match_pred = crate::fol::constraint::explicit_deriv_dedup(ri).to_func();
+                    Func::compose(
+                        Func::NullTest,
+                        Func::compose(Func::filter(match_pred), Func::DistL),
+                    )
+                };
                 Func::condition(
                     not_participates,
                     Func::construction(vec![
@@ -3568,25 +3624,70 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                         .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == *role))
                         .map(|r| r.noun_name.clone())
                         .unwrap_or_else(|| role.clone());
-                    let key_match = Func::compose(Func::Eq, Func::construction(vec![
-                        Func::compose(role_value_by_name(role), Func::Selector(2)),
-                        Func::compose(role_value_by_name(&a0_match_role), Func::Selector(1)),
-                    ]));
-                    let mut neg_pred = key_match;
-                    for arl in rule.antecedent_role_literals.iter()
-                        .filter(|arl| arl.antecedent_index == i)
-                    {
-                        let lit_check = Func::compose(Func::Eq, Func::construction(vec![
-                            Func::compose(role_value_by_name(&arl.role), Func::Selector(2)),
-                            Func::constant(Object::atom(&arl.value)),
+                    // task-821: when the negated cell is Map-backed
+                    // (single-role alethic UC keyed on the AbsenceOf
+                    // role) AND this antecedent has no role-literal
+                    // pins, the "no fact matches key" check collapses
+                    // to `NullTest ∘ FetchOrPhi:<a0_role_value, cell>`
+                    // — O(1) per a0 instead of O(N) filter+DistL.
+                    // Pin-bearing antecedents need a stricter
+                    // "no fact matches key AND pins" semantics that
+                    // doesn't reduce to a single FetchOrPhi, so they
+                    // stay on the legacy path. Each AbsenceOf subterm
+                    // picks its shape independently — mixed multi-
+                    // AbsenceOf rules (some keyed/pin-free, some not)
+                    // get the best of each.
+                    let key_roles = data.fact_types.get(fact_type)
+                        .and_then(|_| key_roles_for_ft(data, fact_type));
+                    let neg_role_index = data.fact_types.get(fact_type)
+                        .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == *role).map(|r| r.role_index));
+                    let has_pins_for_this = rule.antecedent_role_literals.iter()
+                        .any(|arl| arl.antecedent_index == i);
+                    let map_aware = !has_pins_for_this
+                        && match (&key_roles, neg_role_index) {
+                            (Some(kr), Some(ri)) => kr.as_slice() == [ri],
+                            _ => false,
+                        };
+                    let absent_guard = if map_aware {
+                        // Pair input: `<a0_fact, neg_ft_cell>`. Pull
+                        // the join-role value out of `a0_fact` as the
+                        // needle, then read the cell at that key.
+                        // FetchOrPhi returns φ on absent → NullTest=T
+                        // means "no matching fact" → guard passes.
+                        Func::compose(
+                            Func::NullTest,
+                            Func::compose(
+                                Func::FetchOrPhi,
+                                Func::construction(vec![
+                                    Func::compose(
+                                        role_value_by_name(&a0_match_role),
+                                        Func::Selector(1),
+                                    ),
+                                    Func::Selector(2),
+                                ]),
+                            ),
+                        )
+                    } else {
+                        let key_match = Func::compose(Func::Eq, Func::construction(vec![
+                            Func::compose(role_value_by_name(role), Func::Selector(2)),
+                            Func::compose(role_value_by_name(&a0_match_role), Func::Selector(1)),
                         ]));
-                        neg_pred = Func::compose(Func::And, Func::construction(vec![
-                            neg_pred, lit_check,
-                        ]));
-                    }
-                    let any_match = Func::compose(Func::compose(Func::Not, Func::NullTest),
-                        Func::compose(Func::filter(neg_pred), Func::DistL));
-                    let absent_guard = Func::compose(Func::Not, any_match);
+                        let mut neg_pred = key_match;
+                        for arl in rule.antecedent_role_literals.iter()
+                            .filter(|arl| arl.antecedent_index == i)
+                        {
+                            let lit_check = Func::compose(Func::Eq, Func::construction(vec![
+                                Func::compose(role_value_by_name(&arl.role), Func::Selector(2)),
+                                Func::constant(Object::atom(&arl.value)),
+                            ]));
+                            neg_pred = Func::compose(Func::And, Func::construction(vec![
+                                neg_pred, lit_check,
+                            ]));
+                        }
+                        let any_match = Func::compose(Func::compose(Func::Not, Func::NullTest),
+                            Func::compose(Func::filter(neg_pred), Func::DistL));
+                        Func::compose(Func::Not, any_match)
+                    };
                     Some((neg_ft_facts, absent_guard))
                 }).collect();
                 let neg_facts_tuple = Func::construction(
@@ -4088,7 +4189,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     let a0 = Func::Selector(1);
                     let ant_j = Func::compose(Func::Selector(j + 1), Func::Selector(2));
                     if is_absence {
-                        let (_neg_ft_id, neg_role) = match &rule.antecedent_sources[ant_idx] {
+                        let (neg_ft_id, neg_role) = match &rule.antecedent_sources[ant_idx] {
                             crate::types::AntecedentSource::AbsenceOf { fact_type, role } =>
                                 (fact_type.clone(), role.clone()),
                             _ => unreachable!(),
@@ -4097,25 +4198,63 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                             .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == neg_role))
                             .map(|r| r.noun_name.clone())
                             .unwrap_or_else(|| neg_role.clone());
-                        let key_match = Func::compose(Func::Eq, Func::construction(vec![
-                            Func::compose(role_value_by_name(&neg_role), Func::Selector(2)),
-                            Func::compose(role_value_by_name(&a0_match_role), Func::Selector(1)),
-                        ]));
-                        let mut neg_pred = key_match;
-                        for arl in rule.antecedent_role_literals.iter()
-                            .filter(|arl| arl.antecedent_index == ant_idx)
-                        {
-                            let lit_check = Func::compose(Func::Eq, Func::construction(vec![
-                                Func::compose(role_value_by_name(&arl.role), Func::Selector(2)),
-                                Func::constant(Object::atom(&arl.value)),
+                        // task-821: pin-free AbsenceOf over a Map-keyed
+                        // cell (single-role alethic UC matching the
+                        // AbsenceOf role) collapses to `NullTest ∘
+                        // FetchOrPhi:<a0_role_value, neg_cell>`. Pinned
+                        // antecedents keep the filter+DistL form so the
+                        // pin literals get checked. Each AbsenceOf in
+                        // a mixed multi-antecedent rule picks its
+                        // own shape — keyed-pin-free uses Map, the
+                        // rest stays linear.
+                        let key_roles = key_roles_for_ft(data, &neg_ft_id);
+                        let neg_role_index = data.fact_types.get(&neg_ft_id)
+                            .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == neg_role).map(|r| r.role_index));
+                        let has_pins_for_this = rule.antecedent_role_literals.iter()
+                            .any(|arl| arl.antecedent_index == ant_idx);
+                        let map_aware = !has_pins_for_this
+                            && match (&key_roles, neg_role_index) {
+                                (Some(kr), Some(ri)) => kr.as_slice() == [ri],
+                                _ => false,
+                            };
+                        let absent_guard = if map_aware {
+                            // Pair shape `<a0_fact, neg_cell>`. Project
+                            // join-role value from a0 as the needle,
+                            // hand the cell straight to FetchOrPhi.
+                            Func::compose(
+                                Func::NullTest,
+                                Func::compose(
+                                    Func::FetchOrPhi,
+                                    Func::construction(vec![
+                                        Func::compose(
+                                            role_value_by_name(&a0_match_role),
+                                            Func::Selector(1),
+                                        ),
+                                        Func::Selector(2),
+                                    ]),
+                                ),
+                            )
+                        } else {
+                            let key_match = Func::compose(Func::Eq, Func::construction(vec![
+                                Func::compose(role_value_by_name(&neg_role), Func::Selector(2)),
+                                Func::compose(role_value_by_name(&a0_match_role), Func::Selector(1)),
                             ]));
-                            neg_pred = Func::compose(Func::And, Func::construction(vec![
-                                neg_pred, lit_check,
-                            ]));
-                        }
-                        let any_match = Func::compose(Func::compose(Func::Not, Func::NullTest),
-                            Func::compose(Func::filter(neg_pred), Func::DistL));
-                        let absent_guard = Func::compose(Func::Not, any_match);
+                            let mut neg_pred = key_match;
+                            for arl in rule.antecedent_role_literals.iter()
+                                .filter(|arl| arl.antecedent_index == ant_idx)
+                            {
+                                let lit_check = Func::compose(Func::Eq, Func::construction(vec![
+                                    Func::compose(role_value_by_name(&arl.role), Func::Selector(2)),
+                                    Func::constant(Object::atom(&arl.value)),
+                                ]));
+                                neg_pred = Func::compose(Func::And, Func::construction(vec![
+                                    neg_pred, lit_check,
+                                ]));
+                            }
+                            let any_match = Func::compose(Func::compose(Func::Not, Func::NullTest),
+                                Func::compose(Func::filter(neg_pred), Func::DistL));
+                            Func::compose(Func::Not, any_match)
+                        };
                         Func::compose(absent_guard,
                             Func::construction(vec![a0, ant_j]))
                     } else {
@@ -8701,6 +8840,181 @@ mod schema_tests {
         assert!(task_ids.contains(&"1".to_string()),
             "Task_is_parallelizable must include the matching Task '1' \
              (the only pending Task); got {:?}", task_ids);
+    }
+
+    // ── task-821: AbsenceOf branches emit FetchOrPhi when the absence-
+    //              tested cell is Map-backed ─────────────────────────────
+    //
+    // The three sites in `compile_explicit_derivation` that build a
+    // `NullTest ∘ filter(eq) ∘ DistL` linear scan over an AbsenceOf
+    // antecedent's facts collapse to `NullTest ∘ FetchOrPhi:<key, cell>`
+    // when the negated cell has a single-role alethic UC whose key role
+    // matches the AbsenceOf's role. Composite-key cells, key-role
+    // mismatches, and pin-bearing antecedents stay on the legacy path.
+    //
+    // These tests verify the SHAPE of the compiled Func — find FetchOrPhi
+    // in the AbsenceOf branch when conditions match, and absence of
+    // FetchOrPhi otherwise. Structural inspection sidesteps the runtime
+    // question of "is the cell actually a Map yet"; that's tested
+    // upstream by `evaluate::tests::forward_chain_routes_keyed_cells…`.
+    use crate::ast::Func as F;
+
+    /// Walk a Func tree to check whether any node matches `pred`.
+    /// Used as the lightweight, allocation-free shape-inspection
+    /// primitive for the task-821 tests below — covers all Func
+    /// recursion sites that this file builds: Compose, Construction,
+    /// Condition, ApplyToAll, Filter, and Insert.
+    fn func_any(func: &F, pred: &impl Fn(&F) -> bool) -> bool {
+        if pred(func) { return true; }
+        match func {
+            F::Compose(a, b) => func_any(a, pred) || func_any(b, pred),
+            F::Construction(items) => items.iter().any(|f| func_any(f, pred)),
+            F::Condition(p, t, e) => func_any(p, pred) || func_any(t, pred) || func_any(e, pred),
+            F::ApplyToAll(f) => func_any(f, pred),
+            F::Filter(p) => func_any(p, pred),
+            F::Insert(f) => func_any(f, pred),
+            _ => false,
+        }
+    }
+
+    fn has_fetch_or_phi(func: &F) -> bool {
+        func_any(func, &|f| matches!(f, F::FetchOrPhi))
+    }
+
+    /// Single AbsenceOf antecedent over a UC-keyed FT compiles to a
+    /// `NullTest ∘ FetchOrPhi` shape. The rule uses the
+    /// `Task has Task Readiness 'ready' iff Task has Task Status
+    /// 'pending' and Task has no Task Readiness 'blocked'` template:
+    /// `Task_has_Task_Readiness` has a single-role alethic UC on Task
+    /// (each Task has at most one Readiness), so `key_roles =
+    /// Some([0])`, and the AbsenceOf role is `Task` (role 0). The
+    /// gate fires.
+    #[test]
+    fn task821_single_absence_over_uc_keyed_ft_emits_fetch_or_phi() {
+        // Multi-antecedent rule whose sole AbsenceOf branch is *pin-free*:
+        // `Task is unblocked iff Task has Status 'pending' and Task has no
+        // Task Description.` The negated cell `Task_has_Task_Description`
+        // carries a single-role alethic UC on Task (role 0), so
+        // `key_roles == Some([0])`. The AbsenceOf has no role-literal
+        // pin, so Site #3 in `compile_explicit_derivation` emits the
+        // Map-aware shape `NullTest ∘ FetchOrPhi:<key, cell>`.
+        let src = "\
+            Task(.id) is an entity type.\n\
+            Task Status is a value type.\n\
+            Task Description is a value type.\n\
+            Task has Task Status.\n\
+            Task has Task Description.\n\
+            Task is unblocked.\n\
+            Each Task has at most one Task Description.\n\
+            Task is unblocked iff Task has Task Status 'pending' and Task has no Task Description.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let data = cell_index_from_state(&state);
+        let kr = key_roles_for_ft(&data, "Task_has_Task_Description");
+        assert_eq!(kr, Some(vec![0]),
+            "Task_has_Task_Description must carry key_roles = Some([0]) \
+             from the alethic UC; got {:?}", kr);
+
+        // Find the rule whose consequent FT is `Task_is_unblocked`.
+        let rule = data.derivation_rules.iter()
+            .find(|r| r.consequent_cell.literal_id() == "Task_is_unblocked")
+            .expect("rule for Task_is_unblocked must be present");
+        let compiled = compile_explicit_derivation(&data, rule);
+        assert!(has_fetch_or_phi(&compiled.func),
+            "compiled Func for AbsenceOf-over-UC rule must contain \
+             FetchOrPhi (Map-aware shape); got {:?}", compiled.func);
+    }
+
+    /// AbsenceOf antecedent over an un-keyed FT (no alethic UC on the
+    /// negated cell) stays on the legacy linear-scan path — no
+    /// FetchOrPhi appears in the AbsenceOf branch.
+    #[test]
+    fn task821_single_absence_over_unkeyed_ft_keeps_legacy_shape() {
+        let src = "\
+            Task(.id) is an entity type.\n\
+            Task Status is a value type.\n\
+            Task Readiness is a value type.\n\
+            Task has Task Status.\n\
+            Task has Task Readiness.\n\
+            Task has Task Readiness 'ready' iff Task has Task Status 'pending' and Task has no Task Readiness 'blocked'.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let data = cell_index_from_state(&state);
+        // Confirm the negated FT is NOT keyed.
+        let kr = key_roles_for_ft(&data, "Task_has_Task_Readiness");
+        assert_eq!(kr, None,
+            "Task_has_Task_Readiness must carry key_roles = None \
+             without the UC declaration; got {:?}", kr);
+
+        let rule = data.derivation_rules.iter()
+            .find(|r| r.consequent_cell.literal_id() == "Task_has_Task_Readiness")
+            .expect("rule for Task_has_Task_Readiness must be present");
+        let compiled = compile_explicit_derivation(&data, rule);
+        // The compiled Func may still mention FetchOrPhi elsewhere
+        // (e.g. via `extract_facts_func` paths) but the AbsenceOf
+        // branch here is the multi-antecedent path that uses
+        // `extract_facts_from_pop` (filter+Selector composition), so
+        // a stable assert is that NO FetchOrPhi appears at all in the
+        // generated tree under the legacy path. Verify by checking the
+        // legacy filter+DistL pattern is present.
+        assert!(!has_fetch_or_phi(&compiled.func),
+            "compiled Func for AbsenceOf-over-unkeyed rule must NOT \
+             contain FetchOrPhi (legacy linear-scan shape); got {:?}",
+            compiled.func);
+    }
+
+    /// Mixed multi-AbsenceOf: two AbsenceOf antecedents on the same
+    /// rule, one over a UC-keyed FT and pin-free (Map-aware shape
+    /// emits FetchOrPhi), the other over an unkeyed FT (legacy
+    /// filter+DistL stays). Verifies each AbsenceOf subterm picks
+    /// its shape independently. The keyed branch contributes
+    /// FetchOrPhi to the compiled Func tree; the unkeyed branch
+    /// contributes its filter+DistL scan.
+    #[test]
+    fn task821_mixed_multi_absence_per_branch_shape() {
+        let src = "\
+            Task(.id) is an entity type.\n\
+            Task Status is a value type.\n\
+            Task Description is a value type.\n\
+            Task Tag is a value type.\n\
+            Task has Task Status.\n\
+            Task has Task Description.\n\
+            Task has Task Tag.\n\
+            Task is unblocked.\n\
+            Each Task has at most one Task Description.\n\
+            Task is unblocked iff Task has Task Status 'pending' and Task has no Task Description and Task has no Task Tag.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let data = cell_index_from_state(&state);
+
+        let kr_desc = key_roles_for_ft(&data, "Task_has_Task_Description");
+        let kr_tag = key_roles_for_ft(&data, "Task_has_Task_Tag");
+        assert_eq!(kr_desc, Some(vec![0]),
+            "Task_has_Task_Description must be keyed; got {:?}", kr_desc);
+        assert_eq!(kr_tag, None,
+            "Task_has_Task_Tag must be unkeyed; got {:?}", kr_tag);
+
+        let rule = data.derivation_rules.iter()
+            .find(|r| r.consequent_cell.literal_id() == "Task_is_unblocked")
+            .expect("rule for Task_is_unblocked must be present");
+        let compiled = compile_explicit_derivation(&data, rule);
+        // The Map-aware shape for the keyed AbsenceOf contributes a
+        // FetchOrPhi node; the legacy unkeyed AbsenceOf contributes
+        // its `filter(eq) ∘ DistL` scan. The mere presence of
+        // FetchOrPhi confirms the keyed branch took the Map path.
+        assert!(has_fetch_or_phi(&compiled.func),
+            "mixed rule must contain FetchOrPhi from the keyed \
+             branch's Map-aware shape; got {:?}", compiled.func);
+        // The legacy branch lives under a `Func::Filter` wrapping the
+        // candidate predicate. Confirm at least one `Filter` exists
+        // — the keyed branch alone has none (FetchOrPhi replaces it).
+        let has_filter = func_any(&compiled.func, &|f| matches!(f, F::Filter(_)));
+        assert!(has_filter,
+            "mixed rule must still contain a Filter from the unkeyed \
+             branch's legacy scan; got {:?}", compiled.func);
     }
 }
 
