@@ -572,26 +572,40 @@ pub fn apply_command_defs(
     }
 }
 
-/// #867 — auto-generate an entity id when the create command's
-/// `explicit_id` is None. Returns `<noun-lowercased>-<n>` where n is
-/// (count of distinct values playing the noun-role in `state`) + 1.
-/// Spaces in the noun become hyphens so the id stays a single
-/// space-free atom (`State Machine` → `state-machine-1`).
+/// #867 / task-735 — auto-generate an entity id when the create
+/// command's `explicit_id` is None.
+///
+/// **Scheme reconciliation (task-735).** Two id schemes have
+/// historically accumulated in the same noun cell: the legacy
+/// `<noun>-N` form (what this function used to emit) and bare
+/// integers (e.g. `916` from manual assertions / external imports).
+/// A pure counter (`seen.len() + 1`) is oblivious to both: assert
+/// `id='916'` then auto-create and you get `task-1`, then `task-2`,
+/// then eventually `task-916` collides. Fix: scan existing ids of
+/// the same noun, detect which scheme dominates, and pick
+/// `max(existing) + 1` in that scheme. The result never collides
+/// with an existing id.
+///
+/// Scheme detection:
+/// - Existing ids are partitioned into two integer buckets:
+///   - `task_n_max`: max N from ids matching `<prefix>-{digits}`
+///     (where prefix = noun-lowercased-hyphenated).
+///   - `int_max`: max N from ids that parse as bare unsigned
+///     integers (e.g. `916`).
+/// - If `int_max` dominates (strictly greater than `task_n_max`),
+///   emit a bare integer one above it. Otherwise emit
+///   `<prefix>-{N}` where N = max(task_n_max, int_max) + 1. Ties
+///   favor the prefixed form so backward compatibility holds.
+/// - Empty cell: emit `<prefix>-1` (default `task-1` for noun
+///   `Task`).
 ///
 /// Deterministic per (noun, state); platform-independent (no
-/// `SystemTime` so the function compiles on wasm32 / no_std without
-/// the runtime panic that `std::time::SystemTime::now()` triggers
-/// on `wasm32-unknown-unknown`). Counting existing entities means
-/// the second auto-create against the same snapshot generates the
-/// same id as the first — but in practice the platform commits the
-/// first delta back into `D` at the merge_delta boundary before the
-/// second call snapshots, so the count moves forward across
-/// successive calls.
+/// `SystemTime` so the function compiles on wasm32 / no_std).
 fn auto_generate_entity_id(noun: &str, state: &ast::Object) -> String {
     // Distinct entity-role values for this noun across all FT cells.
     // A fact's "entity-id" for noun N is the value of any role binding
     // whose role name matches N. This mirrors `platform_list_noun`'s
-    // entity discovery — same identity discovery, same count surface.
+    // entity discovery — same identity discovery, same scan surface.
     let mut seen: hashbrown::HashSet<String> = hashbrown::HashSet::new();
     for (_, contents) in ast::cells_iter(state) {
         let facts = match contents.as_seq() { Some(s) => s, None => continue };
@@ -611,9 +625,79 @@ fn auto_generate_entity_id(noun: &str, state: &ast::Object) -> String {
             }
         }
     }
-    let n = seen.len() + 1;
+
     let prefix = noun.to_lowercase().replace(' ', "-");
-    format!("{prefix}-{n}")
+    let prefix_dash = format!("{prefix}-");
+
+    // task-735 — scan existing ids for the integer payload in each
+    // scheme. `task_n_max` tracks `<prefix>-{N}` ids; `int_max`
+    // tracks bare-integer ids. Non-integer suffixes are ignored
+    // for max-tracking but still occupy the namespace — the final
+    // collision guard below bumps past any duplicate.
+    let mut task_n_max: Option<u64> = None;
+    let mut int_max: Option<u64> = None;
+    for val in seen.iter() {
+        if let Some(suffix) = val.strip_prefix(&prefix_dash) {
+            if let Ok(n) = suffix.parse::<u64>() {
+                task_n_max = Some(task_n_max.map_or(n, |m| m.max(n)));
+                continue;
+            }
+        }
+        if let Ok(n) = val.parse::<u64>() {
+            int_max = Some(int_max.map_or(n, |m| m.max(n)));
+        }
+    }
+
+    // Empty cell — bootstrap with the prefix scheme (preserves the
+    // legacy `task-1` convention for backward compat with #867).
+    if seen.is_empty() {
+        return format!("{prefix}-1");
+    }
+
+    // Pick the scheme. Bare-integer dominance (strict >) emits a
+    // bare integer; otherwise the prefixed form wins (ties on
+    // `int_max == task_n_max` favor `<prefix>-N` because the
+    // prefixed scheme is the engine's default — assertions of bare
+    // integers happen at the user surface, but the engine emits
+    // the prefixed shape unless the population has overwhelmingly
+    // chosen otherwise).
+    let mut candidate = match (task_n_max, int_max) {
+        (None, None) => format!("{prefix}-1"),
+        (Some(t), None) => format!("{prefix}-{}", t + 1),
+        (None, Some(i)) => format!("{}", i + 1),
+        (Some(t), Some(i)) if i > t => format!("{}", i + 1),
+        (Some(t), Some(i)) => {
+            // Tie or prefix dominates: bump above the global max
+            // (so the new id can never collide with either bucket).
+            let n = t.max(i) + 1;
+            format!("{prefix}-{}", n)
+        }
+    };
+
+    // Defensive collision guard: if scheme detection somehow
+    // produced an id that already exists (e.g. a non-integer suffix
+    // happens to share a number with our pick, or both schemes
+    // co-exist with overlapping integers), keep bumping until free.
+    // Bounded by `seen.len() + 1` iterations.
+    let mut bump: u64 = 1;
+    while seen.contains(&candidate) {
+        let base = task_n_max.unwrap_or(0).max(int_max.unwrap_or(0));
+        // Always escalate via the prefixed scheme on collision —
+        // the bare-integer namespace is shallower (no prefix) so
+        // collisions there are likelier; the prefixed form keeps
+        // the id space disjoint from any future bare-integer
+        // assertion.
+        candidate = format!("{prefix}-{}", base + bump);
+        bump += 1;
+        if bump as usize > seen.len() + 2 {
+            // Unreachable in practice — the loop terminates because
+            // `seen` is finite. This guard exists to prove no
+            // infinite loop under any input.
+            break;
+        }
+    }
+
+    candidate
 }
 
 /// create = emit ∘ validate ∘ derive ∘ resolve (Eq. 5)
@@ -2821,6 +2905,194 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         assert_eq!(result.entities.len(), 1);
         assert!(result.status.is_none());
         assert!(result.transitions.is_empty());
+    }
+
+    // ── task-735 — auto-increment id reconciles both schemes ──────────
+    //
+    // Pre-735 the auto-generator counted distinct entity-role values
+    // and emitted `<noun>-<count+1>`. A user asserting `id='916'` and
+    // then auto-creating would receive `task-1` and the two id
+    // schemes would accumulate without reconciliation. The four tests
+    // below pin the new behaviour:
+    //
+    //   - empty cell → `<prefix>-1` (preserves the legacy default).
+    //   - bare-integer dominant → next bare integer above the max.
+    //   - `<prefix>-N` dominant → next `<prefix>-N` above the max.
+    //   - mixed bag (`<prefix>-N` + bare ints) → max+1 in the dominant
+    //     scheme; never returns an id that already exists.
+
+    /// task-735 (acceptance 2): empty cell → `task-1`.
+    /// Preserves the legacy default established under #867 so existing
+    /// downstream consumers (UI listings, hash-of-pop snapshots, audit
+    /// summaries) still see the same first id.
+    #[test]
+    fn auto_increment_id_empty_state_returns_task_1() {
+        let state = ast::Object::phi();
+        let id = super::auto_generate_entity_id("Task", &state);
+        assert_eq!(id, "task-1",
+            "empty cell must seed with the prefix scheme; got {id:?}");
+    }
+
+    /// task-735 (acceptance 1): `id='999'` asserted → auto-create
+    /// returns an id strictly greater than 999 (bare-integer dominant
+    /// because no `<prefix>-N` ids exist yet).
+    #[test]
+    fn auto_increment_id_bare_integer_picks_next_integer() {
+        let ft_id = "Task has Task Status";
+        let mut state = ast::Object::phi();
+        state = ast::cell_push(ft_id,
+            ast::fact_from_pairs(&[("Task", "999"), ("Task Status", "pending")]),
+            &state);
+
+        let id = super::auto_generate_entity_id("Task", &state);
+        // Bare-integer scheme dominates → expect bare integer 1000.
+        assert_eq!(id, "1000",
+            "single bare-integer id 999 → next must be 1000; got {id:?}");
+        // Defensive: the returned id must never already exist in `seen`.
+        assert_ne!(id, "999",
+            "auto-generated id must not collide with existing 999");
+    }
+
+    /// task-735 (acceptance 3a): pure `<prefix>-N` cell → returns
+    /// `<prefix>-(max+1)`. Counting, the pre-735 emitter would have
+    /// returned the same value here (3+1=4 distinct, +1 = 5) only by
+    /// accident — `task-2` was skipped so the count and the max
+    /// disagree. This test pins the new behaviour: it's max-based,
+    /// not count-based.
+    #[test]
+    fn auto_increment_id_prefixed_scheme_picks_max_plus_one() {
+        let ft_id = "Task has Task Status";
+        let mut state = ast::Object::phi();
+        state = ast::cell_push(ft_id,
+            ast::fact_from_pairs(&[("Task", "task-1"), ("Task Status", "pending")]),
+            &state);
+        state = ast::cell_push(ft_id,
+            ast::fact_from_pairs(&[("Task", "task-5"), ("Task Status", "pending")]),
+            &state);
+        state = ast::cell_push(ft_id,
+            ast::fact_from_pairs(&[("Task", "task-3"), ("Task Status", "pending")]),
+            &state);
+
+        let id = super::auto_generate_entity_id("Task", &state);
+        assert_eq!(id, "task-6",
+            "task-1/task-3/task-5 → max=5, next must be task-6; got {id:?}");
+    }
+
+    /// task-735 (acceptance 3b): mixed `<prefix>-N` and bare-integer
+    /// ids. Bare-integer dominant (916 > 3) → next bare integer
+    /// (917). This is the exact scenario from the user's 2026-05-12
+    /// observation: assert `id='916'`, then auto-create.
+    #[test]
+    fn auto_increment_id_mixed_schemes_bare_int_dominant() {
+        let ft_id = "Task has Task Status";
+        let mut state = ast::Object::phi();
+        state = ast::cell_push(ft_id,
+            ast::fact_from_pairs(&[("Task", "task-3"), ("Task Status", "pending")]),
+            &state);
+        state = ast::cell_push(ft_id,
+            ast::fact_from_pairs(&[("Task", "916"), ("Task Status", "pending")]),
+            &state);
+
+        let id = super::auto_generate_entity_id("Task", &state);
+        // Bare-integer 916 strictly dominates task-3 → next is 917.
+        assert_eq!(id, "917",
+            "task-3 + bare 916 → bare-int dominant, next must be 917; got {id:?}");
+        // Defensive: must not collide with any existing id.
+        assert!(id != "task-3" && id != "916",
+            "auto-generated id must not collide with existing ids; got {id:?}");
+    }
+
+    /// task-735 (acceptance 3c): mixed schemes where `<prefix>-N`
+    /// dominates → next is `<prefix>-(max+1)`. Tie-break also favors
+    /// the prefixed form (engine's default emission shape).
+    #[test]
+    fn auto_increment_id_mixed_schemes_prefixed_dominant() {
+        let ft_id = "Task has Task Status";
+        let mut state = ast::Object::phi();
+        state = ast::cell_push(ft_id,
+            ast::fact_from_pairs(&[("Task", "task-50"), ("Task Status", "pending")]),
+            &state);
+        state = ast::cell_push(ft_id,
+            ast::fact_from_pairs(&[("Task", "10"), ("Task Status", "pending")]),
+            &state);
+
+        let id = super::auto_generate_entity_id("Task", &state);
+        assert_eq!(id, "task-51",
+            "task-50 dominates bare 10 → task-51; got {id:?}");
+    }
+
+    /// task-735 (acceptance 1, integration): assert `id='999'`
+    /// through the full apply_command_defs path, then auto-create.
+    /// The returned id must be strictly greater than 999 and must
+    /// not collide. This is the smoke test for the user's observed
+    /// MCP-surface symptom.
+    #[test]
+    fn auto_increment_id_through_apply_after_explicit_999() {
+        let src = "\
+            Task(.id) is an entity type.\n\
+            Task Status is a value type.\n\
+            Task has Task Status.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_map = ast::defs_to_state(&defs, &state);
+
+        // Step 1: explicit id="999".
+        let mut fields = HashMap::new();
+        fields.insert("Task Status".to_string(), "pending".to_string());
+        let cmd_explicit = Command::CreateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            id: Some("999".to_string()),
+            fields: fields.clone(),
+            sender: None,
+            signature: None,
+        };
+        let result_explicit = apply_command_defs(&def_map, &cmd_explicit, &state);
+        assert!(!result_explicit.rejected,
+            "explicit create with id=999 must not be rejected; violations={:?}",
+            result_explicit.violations);
+
+        // `result_explicit.state` is a delta (#209 — only the cells the
+        // command touched). To set up step 2, merge the delta onto the
+        // base state so the auto-create scans against a base populated
+        // with `Task '999'`. Without merge_delta the auto-id scan would
+        // see only the delta's cells (which still contain the new
+        // 999 fact), but the platform's normal apply path commits the
+        // delta back into D before the next call — `merge_delta` here
+        // mirrors that boundary.
+        let state_after = ast::merge_delta(&state, &result_explicit.state, None);
+
+        // Step 2: auto-create against the post-merge state.
+        let cmd_auto = Command::CreateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            id: None,
+            fields,
+            sender: None,
+            signature: None,
+        };
+        let result_auto = apply_command_defs(&def_map, &cmd_auto, &state_after);
+        assert!(!result_auto.rejected,
+            "auto create after id=999 must not be rejected; violations={:?}",
+            result_auto.violations);
+
+        // The returned id must be strictly greater than 999. Accept
+        // either scheme — bare 1000 (current policy under task-735)
+        // or task-1000 (future toggle). What matters is that the id
+        // is fresh and parses to N > 999 in some scheme.
+        let auto_id = &result_auto.entities[0].id;
+        let payload: u64 = auto_id
+            .strip_prefix("task-")
+            .unwrap_or(auto_id)
+            .parse()
+            .unwrap_or_else(|_| panic!(
+                "auto-generated id must carry an integer payload; got {auto_id:?}"));
+        assert!(payload > 999,
+            "auto-generated id payload must exceed 999; got {auto_id:?} (payload={payload})");
+        assert_ne!(auto_id, "999",
+            "auto-generated id must never collide with existing 999");
     }
 
     #[test]
