@@ -1996,8 +1996,10 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
         }
 
         Func::Length => {
-            match x.as_seq() {
-                Some(items) => Object::Atom(items.len().to_string()),
+            // task-744 phase 3: Map cells answer length by entry count.
+            match x {
+                Object::Seq(items) => Object::Atom(items.len().to_string()),
+                Object::Map(m) => Object::Atom(m.len().to_string()),
                 _ => Object::Bottom,
             }
         }
@@ -2309,9 +2311,13 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
         }
 
         Func::ApplyToAll(f) => {
-            match x.as_seq() {
-                Some(items) if items.is_empty() => Object::phi(),
-                Some(items) => {
+            // task-744 / #743 phase 3: Map cells iterate their values
+            // and produce a Seq result. α is a point-wise transform —
+            // ordering is incidental; the only consumer assumption is
+            // "Seq out, len = len in." Map storage preserves both.
+            match x {
+                Object::Seq(items) if items.is_empty() => Object::phi(),
+                Object::Seq(items) => {
                     // Parallel α: Rayon par_iter for large sequences.
                     // Threshold 64: below this, Rayon spawn overhead exceeds gain.
                     // Stays serial under a fuel cap so the per-element
@@ -2324,6 +2330,8 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                     }
                     Object::seq(items.iter().map(|xi| apply(f, xi, d)).collect())
                 }
+                Object::Map(m) if m.is_empty() => Object::phi(),
+                Object::Map(m) => Object::seq(m.values().map(|xi| apply(f, xi, d)).collect()),
                 _ => Object::Bottom,
             }
         }
@@ -2341,9 +2349,12 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
         }
 
         Func::Filter(p) => {
-            match x.as_seq() {
-                Some(items) if items.is_empty() => Object::phi(),
-                Some(items) => {
+            // task-744 / #743 phase 3: Map cells iterate values, output
+            // a Seq of kept tuples. Filter is point-wise (Bottom only on
+            // shape mismatch / atom input); ordering is incidental.
+            match x {
+                Object::Seq(items) if items.is_empty() => Object::phi(),
+                Object::Seq(items) => {
                     // Parallel filter falls back to serial when a fuel
                     // cap is in effect — same reasoning as ApplyToAll.
                     #[cfg(all(feature = "parallel", not(feature = "no_std")))]
@@ -2355,6 +2366,14 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                         return Object::Seq(kept.into());
                     }
                     let kept: Vec<Object> = items.iter()
+                        .filter(|xi| apply(p, xi, d) == Object::t())
+                        .cloned()
+                        .collect();
+                    Object::Seq(kept.into())
+                }
+                Object::Map(m) if m.is_empty() => Object::phi(),
+                Object::Map(m) => {
+                    let kept: Vec<Object> = m.values()
                         .filter(|xi| apply(p, xi, d) == Object::t())
                         .cloned()
                         .collect();
@@ -7673,6 +7692,80 @@ mod tests {
         let f = fact_from_pairs(&[("Task", "t-1")]);
         assert_eq!(extract_key_from_fact(&f, &["Task"]), Some("t-1".to_string()));
         assert_eq!(extract_key_from_fact(&f, &["Task", "Status"]), None);
+    }
+
+    // task-744 phase 3: FFP combinators accept Map cells as the input
+    // collection. α and Filter iterate values; Length counts entries.
+
+    #[test]
+    fn apply_to_all_maps_over_map_values() {
+        let f = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
+        let g = fact_from_pairs(&[("Task", "t-2"), ("Status", "done")]);
+        let m = cell_put_keyed("X", &["Task"], f,
+            &cell_put_keyed("X", &["Task"], g, &Object::phi()));
+        let cell = fetch_or_phi("X", &m);
+        // α(Selector(2)) over a Map of <<Task,T>,<Status,S>> facts gives the
+        // sequence of <Status, value> pairs — order is incidental for a Map.
+        let extract = Func::apply_to_all(Func::Selector(2));
+        let result = apply(&extract, &cell, &Object::phi());
+        let pairs: Vec<&Object> = result.as_seq().expect("Seq result").iter().collect();
+        assert_eq!(pairs.len(), 2);
+        // Each pair is <Status, value>: Selector(2) of the pair gives the
+        // value atom.
+        let values: Vec<String> = pairs.iter()
+            .map(|p| apply(&Func::Selector(2), p, &Object::phi())
+                .as_atom().map(|s| s.to_string()).unwrap_or_default())
+            .collect();
+        assert!(values.contains(&"pending".to_string()), "got {:?}", values);
+        assert!(values.contains(&"done".to_string()), "got {:?}", values);
+    }
+
+    #[test]
+    fn filter_keeps_matching_map_entries_and_returns_seq() {
+        let f = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
+        let g = fact_from_pairs(&[("Task", "t-2"), ("Status", "done")]);
+        let h = fact_from_pairs(&[("Task", "t-3"), ("Status", "pending")]);
+        let mut state = Object::phi();
+        for fact in &[f.clone(), g.clone(), h.clone()] {
+            state = cell_put_keyed("X", &["Task"], fact.clone(), &state);
+        }
+        let cell = fetch_or_phi("X", &state);
+        // Filter for pending: predicate compares Status pair to "pending".
+        let pending = Func::filter(Func::compose(
+            Func::Eq,
+            Func::construction(vec![
+                Func::compose(Func::Selector(2), Func::Selector(2)),
+                Func::constant(Object::atom("pending")),
+            ]),
+        ));
+        let result = apply(&pending, &cell, &Object::phi());
+        let kept = result.as_seq().expect("Seq result");
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn length_counts_map_entries() {
+        let f = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
+        let g = fact_from_pairs(&[("Task", "t-2"), ("Status", "done")]);
+        let state = cell_put_keyed("X", &["Task"], f,
+            &cell_put_keyed("X", &["Task"], g, &Object::phi()));
+        let cell = fetch_or_phi("X", &state);
+        let result = apply(&Func::Length, &cell, &Object::phi());
+        assert_eq!(result, Object::atom("2"));
+    }
+
+    #[test]
+    fn apply_to_all_on_empty_map_returns_phi() {
+        let empty_map: Object = Object::Map(HashMap::new());
+        let result = apply(&Func::apply_to_all(Func::Id), &empty_map, &Object::phi());
+        assert_eq!(result, Object::phi());
+    }
+
+    #[test]
+    fn filter_on_empty_map_returns_phi() {
+        let empty_map: Object = Object::Map(HashMap::new());
+        let result = apply(&Func::filter(Func::Id), &empty_map, &Object::phi());
+        assert_eq!(result, Object::phi());
     }
 
     #[test]
