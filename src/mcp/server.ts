@@ -1473,8 +1473,8 @@ server.registerTool(
           try {
             const smRaw = await systemCall('get:State Machine', id)
             const sm = JSON.parse(smRaw)
-            const status = sm && typeof sm === 'object' && typeof sm.currentlyInStatus === 'string'
-              ? sm.currentlyInStatus
+            const status = sm && typeof sm === 'object' && typeof sm.Status === 'string'
+              ? sm.Status
               : ''
             if (status) {
               const rawTransitions = await systemCall(`transitions:${noun}`, status)
@@ -1629,8 +1629,8 @@ server.registerTool(
       if (!resolvedStatus) {
         const smRaw = await systemCall(`get:State Machine`, id)
         const sm = parseOr(smRaw, null)
-        if (sm && typeof sm === 'object' && typeof sm.currentlyInStatus === 'string') {
-          resolvedStatus = sm.currentlyInStatus
+        if (sm && typeof sm === 'object' && typeof sm.Status === 'string') {
+          resolvedStatus = sm.Status
         }
       }
       const rawTransitions = await systemCall(`transitions:${noun}`, resolvedStatus)
@@ -2421,7 +2421,7 @@ export async function evalExpectPredicate(
     const [, , id, expectedStatus] = m
     const raw = await call(`get:State Machine`, id)
     const sm: any = safeJson(raw, null)
-    const actual = sm?.currentlyInStatus ?? null
+    const actual = sm?.Status ?? null
     const ok = actual === expectedStatus
     return { ok, detail: ok ? `status=${actual}` : `expected ${expectedStatus}, got ${actual ?? '(none)'}` }
   }

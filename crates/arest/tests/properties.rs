@@ -1850,13 +1850,13 @@ fn sm_init_derivation_produces_facts() {
     let test_pop = test_state.clone();
     let pop_obj = ast::encode_state(&test_pop);
 
-    // Test derive_facts on <ord-1>
+    // Test derive_facts on <ord-1> — task-742: renamed cell + role.
     let make_one_fact = ast::Func::construction(vec![
-        ast::Func::constant(Object::atom("StateMachine_has_forResource")),
+        ast::Func::constant(Object::atom("State_Machine_is_for_Resource")),
         ast::Func::constant(Object::atom("test")),
         ast::Func::construction(vec![
             ast::Func::construction(vec![ast::Func::constant(Object::atom("SM")), ast::Func::Id]),
-            ast::Func::construction(vec![ast::Func::constant(Object::atom("forResource")), ast::Func::Id]),
+            ast::Func::construction(vec![ast::Func::constant(Object::atom("Resource")), ast::Func::Id]),
         ]),
     ]);
     let one_fact_result = ast::apply(&make_one_fact, &Object::atom("ord-1"), &d);

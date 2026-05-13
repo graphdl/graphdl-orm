@@ -152,7 +152,7 @@ export function createRemoteServer(): McpServer {
       const entityId = id.slice(sep + 1)
       const entity = safeJson(await systemCall(`get:${noun}`, entityId), null)
       const sm = safeJson(await systemCall('get:State Machine', entityId), null) as any
-      const status = sm && typeof sm.currentlyInStatus === 'string' ? sm.currentlyInStatus : null
+      const status = sm && typeof sm.Status === 'string' ? sm.Status : null
       return chatgptResult({
         id,
         title: `${noun} ${entityId}`,
@@ -261,7 +261,7 @@ export function createRemoteServer(): McpServer {
       let resolvedStatus = status || ''
       if (!resolvedStatus) {
         const sm = safeJson(await systemCall('get:State Machine', id), null) as any
-        if (sm && typeof sm.currentlyInStatus === 'string') resolvedStatus = sm.currentlyInStatus
+        if (sm && typeof sm.Status === 'string') resolvedStatus = sm.Status
       }
       const transitions = safeJson(await systemCall(`transitions:${noun}`, resolvedStatus), [])
       const entity = safeJson(await systemCall(`get:${noun}`, id), null)

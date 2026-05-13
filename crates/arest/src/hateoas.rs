@@ -404,16 +404,19 @@ pub fn handle_arest_transition(
         return None;
     }
 
-    // Walk State Machine cell to find the row whose `forResource`
+    // Walk State Machine cell to find the row whose Resource binding
     // matches `id`. We need both the row (to update) and its index
-    // (to swap in the rewritten copy).
-    let sm_cell = crate::ast::fetch_or_phi("State Machine", state);
+    // (to swap in the rewritten copy). task-742: pulls cell name +
+    // role names from StateMachineCellShape::boot() so the single
+    // source of truth in command.rs propagates here.
+    let sm_shape = crate::command::StateMachineCellShape::boot();
+    let sm_cell = crate::ast::fetch_or_phi(sm_shape.entity_type_label, state);
     let sm_seq = sm_cell.as_seq()?;
     let (sm_idx, sm_row) = sm_seq
         .iter()
         .enumerate()
-        .find(|(_, sm)| crate::ast::binding(sm, "forResource") == Some(id.as_str()))?;
-    let current_status = crate::ast::binding(sm_row, "currentlyInStatus")?.to_string();
+        .find(|(_, sm)| crate::ast::binding(sm, sm_shape.for_resource_role) == Some(id.as_str()))?;
+    let current_status = crate::ast::binding(sm_row, sm_shape.current_status_role)?.to_string();
 
     // Walk Transition cell for a row matching `(fromStatus, event)`.
     // The worker's engine path additionally scopes by
@@ -432,23 +435,23 @@ pub fn handle_arest_transition(
         .and_then(|t| crate::ast::binding(t, "toStatus"))?
         .to_string();
 
-    // Rebuild State Machine cell with the matched row's
-    // `currentlyInStatus` updated. `cell_push` only appends, so we
-    // hand-build the new seq and `store` it whole.
-    let new_sm_row = update_binding(sm_row, "currentlyInStatus", &new_status);
+    // Rebuild State Machine cell with the matched row's Status
+    // binding updated. `cell_push` only appends, so we hand-build the
+    // new seq and `store` it whole.
+    let new_sm_row = update_binding(sm_row, sm_shape.current_status_role, &new_status);
     let mut new_sm_vec: Vec<Object> = sm_seq.to_vec();
     new_sm_vec[sm_idx] = new_sm_row;
-    let new_state = crate::ast::store("State Machine", Object::seq(new_sm_vec), state);
+    let new_state = crate::ast::store(sm_shape.entity_type_label, Object::seq(new_sm_vec), state);
 
     // Push a new `Event` entity recording the transition. Mirror of
     // the worker's `arestResult.entities` Event persistence
-    // (router.ts:680-684). `forResource`/`type` are the cross-cutting
-    // role bindings the OpenAPI introspection (#148) surfaces.
+    // (router.ts:680-684). Resource/type are the cross-cutting role
+    // bindings the OpenAPI introspection (#148) surfaces.
     let event_counter = NEXT_ENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
     let event_id = alloc::format!("evt-{:08x}", event_counter);
     let event_entity = Object::seq(alloc::vec![
         Object::seq(alloc::vec![Object::atom("id"), Object::atom(&event_id)]),
-        Object::seq(alloc::vec![Object::atom("forResource"), Object::atom(&id)]),
+        Object::seq(alloc::vec![Object::atom(sm_shape.for_resource_role), Object::atom(&id)]),
         Object::seq(alloc::vec![Object::atom("type"), Object::atom(event)]),
     ]);
     let new_state = crate::ast::cell_push("Event", event_entity, &new_state);
@@ -529,13 +532,15 @@ pub fn handle_arest_transitions_for_entity(
     // 404; the worker's "Entity has no state machine" branch returns
     // a 200 with empty transitions, but the kernel direct-write
     // fallback hasn't seeded `_status` so the closer behaviour is
-    // 404 / fall-through).
-    let sm_cell = crate::ast::fetch_or_phi("State Machine", state);
+    // 404 / fall-through). task-742: pulls names from
+    // StateMachineCellShape::boot().
+    let sm_shape = crate::command::StateMachineCellShape::boot();
+    let sm_cell = crate::ast::fetch_or_phi(sm_shape.entity_type_label, state);
     let sm_seq = sm_cell.as_seq()?;
     let sm_row = sm_seq
         .iter()
-        .find(|sm| crate::ast::binding(sm, "forResource") == Some(id.as_str()))?;
-    let current_status = crate::ast::binding(sm_row, "currentlyInStatus")?.to_string();
+        .find(|sm| crate::ast::binding(sm, sm_shape.for_resource_role) == Some(id.as_str()))?;
+    let current_status = crate::ast::binding(sm_row, sm_shape.current_status_role)?.to_string();
 
     // Walk Transition cell for rows whose fromStatus matches.
     let transitions_cell = crate::ast::fetch_or_phi("Transition", state);
@@ -952,8 +957,8 @@ mod tests {
             "State Machine",
             fact(&[
                 ("id", "sm-1"),
-                ("forResource", sr_id),
-                ("currentlyInStatus", "Received"),
+                ("Resource", sr_id),
+                ("Status", "Received"),
             ]),
             &s,
         );
@@ -987,13 +992,13 @@ mod tests {
         assert!(resp.contains("\"status\":\"Categorized\""), "{resp}");
         assert!(resp.contains("\"event\":\"categorize\""), "{resp}");
 
-        // SM row's currentlyInStatus is now Categorized — and the row
-        // is the *same* row (no append-by-mistake).
+        // SM row's Status is now Categorized — and the row is the
+        // *same* row (no append-by-mistake).
         let sm = crate::ast::fetch_or_phi("State Machine", &new_state);
         let sm_seq = sm.as_seq().expect("sm cell present");
         assert_eq!(sm_seq.len(), 1, "SM cell must not gain a duplicate row");
         assert_eq!(
-            crate::ast::binding(&sm_seq[0], "currentlyInStatus"),
+            crate::ast::binding(&sm_seq[0], "Status"),
             Some("Categorized")
         );
 
@@ -1002,7 +1007,7 @@ mod tests {
         let events_seq = events.as_seq().expect("event cell present");
         assert_eq!(events_seq.len(), 1);
         assert_eq!(crate::ast::binding(&events_seq[0], "type"), Some("categorize"));
-        assert_eq!(crate::ast::binding(&events_seq[0], "forResource"), Some("sr-1"));
+        assert_eq!(crate::ast::binding(&events_seq[0], "Resource"), Some("sr-1"));
     }
 
     #[test]
@@ -1109,7 +1114,7 @@ mod tests {
 
     #[test]
     fn transition_preserves_unrelated_sm_rows() {
-        // Two SMs in the cell, one matching forResource, one not. The
+        // Two SMs in the cell, one matching Resource, one not. The
         // transition must update only the matching row and leave the
         // other untouched.
         let s = state_with_sr_state_machine("sr-1");
@@ -1117,8 +1122,8 @@ mod tests {
             "State Machine",
             fact(&[
                 ("id", "sm-other"),
-                ("forResource", "sr-other"),
-                ("currentlyInStatus", "Received"),
+                ("Resource", "sr-other"),
+                ("Status", "Received"),
             ]),
             &s,
         );
@@ -1139,7 +1144,7 @@ mod tests {
             .find(|r| crate::ast::binding(r, "id") == Some("sm-1"))
             .expect("sm-1 still present");
         assert_eq!(
-            crate::ast::binding(target_row, "currentlyInStatus"),
+            crate::ast::binding(target_row, "Status"),
             Some("Categorized")
         );
         let other_row = sm_seq
@@ -1147,7 +1152,7 @@ mod tests {
             .find(|r| crate::ast::binding(r, "id") == Some("sm-other"))
             .expect("sm-other still present");
         assert_eq!(
-            crate::ast::binding(other_row, "currentlyInStatus"),
+            crate::ast::binding(other_row, "Status"),
             Some("Received"),
             "untouched SM keeps its prior status"
         );
@@ -1207,8 +1212,8 @@ mod tests {
             "State Machine",
             fact(&[
                 ("id", "sm-done"),
-                ("forResource", "sr-done"),
-                ("currentlyInStatus", "Resolved"),
+                ("Resource", "sr-done"),
+                ("Status", "Resolved"),
             ]),
             &s,
         );
@@ -1248,9 +1253,9 @@ mod tests {
 
     #[test]
     fn update_binding_replaces_existing_value() {
-        let entity = fact(&[("id", "x"), ("currentlyInStatus", "A")]);
-        let updated = update_binding(&entity, "currentlyInStatus", "B");
-        assert_eq!(crate::ast::binding(&updated, "currentlyInStatus"), Some("B"));
+        let entity = fact(&[("id", "x"), ("Status", "A")]);
+        let updated = update_binding(&entity, "Status", "B");
+        assert_eq!(crate::ast::binding(&updated, "Status"), Some("B"));
         // Other field preserved.
         assert_eq!(crate::ast::binding(&updated, "id"), Some("x"));
     }
@@ -1258,8 +1263,8 @@ mod tests {
     #[test]
     fn update_binding_appends_when_key_missing() {
         let entity = fact(&[("id", "x")]);
-        let updated = update_binding(&entity, "currentlyInStatus", "A");
-        assert_eq!(crate::ast::binding(&updated, "currentlyInStatus"), Some("A"));
+        let updated = update_binding(&entity, "Status", "A");
+        assert_eq!(crate::ast::binding(&updated, "Status"), Some("A"));
         assert_eq!(crate::ast::binding(&updated, "id"), Some("x"));
     }
 }

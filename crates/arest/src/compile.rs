@@ -4842,7 +4842,7 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
             Func::apply_to_all(Func::Selector(2)),
             Func::filter(Func::compose(Func::Eq, Func::construction(vec![
                 Func::Selector(1),
-                Func::constant(Object::atom("forResource")),
+                Func::constant(Object::atom("Resource")),
             ]))),
         );
         // #905: extract_facts_from_pop returns the facts Seq directly

@@ -147,8 +147,8 @@ export async function dispatchVerb(
       let resolvedStatus = status ?? ''
       if (!resolvedStatus) {
         const sm = safeJson(engine.system(h, 'get:State Machine', id))
-        if (sm && typeof (sm as { currentlyInStatus?: string }).currentlyInStatus === 'string') {
-          resolvedStatus = (sm as { currentlyInStatus: string }).currentlyInStatus
+        if (sm && typeof (sm as { Status?: string }).Status === 'string') {
+          resolvedStatus = (sm as { Status: string }).Status
         }
       }
       const transitions = safeJson(engine.system(h, `transitions:${noun}`, resolvedStatus)) ?? []

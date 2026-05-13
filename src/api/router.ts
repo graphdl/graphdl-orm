@@ -768,8 +768,8 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
   for (const smId of smIds) {
     try {
       const sm = await getStub(smId).get()
-      if (sm?.data?.forResource === id) {
-        currentStatus = sm.data.currentlyInStatus as string
+      if (sm?.data?.Resource === id) {
+        currentStatus = sm.data.Status as string
         smEntityId = smId
         break
       }
@@ -785,7 +785,7 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
   // alethic validate gate (D1 / #703) before producing the new SM cell as
   // part of __state (#209). The handler trusts the engine result: every
   // returned entity is persisted, including the State Machine cell whose
-  // currentlyInStatus has flipped. No manual SM cell write — that bypass
+  // Status has flipped. No manual SM cell write — that bypass
   // was the worker-side equivalent of the entity-write hallucination T1
   // closed.
   const populationJson = await loadDomainAndPopulation(registry, getStub, domainSlug)
@@ -809,7 +809,7 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
   }
 
   // Persist every entity from the engine's __state — the new SM cell
-  // (currentlyInStatus updated) and any Event entities the transition
+  // (Status updated) and any Event entities the transition
   // emitted, indexed under the same domain.
   for (const e of arestResult.entities) {
     const eid = e.id || crypto.randomUUID()

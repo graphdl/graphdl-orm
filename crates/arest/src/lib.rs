@@ -3838,16 +3838,17 @@ Transition 'complete' is defined in State Machine Definition 'Task'.
 
         // (b) No spurious `Task_has_<sm-role>` cells from the SM
         // derivations. The pre-fix update merge picked up SM-derived
-        // facts (StateMachine_has_currentlyInStatus / forResource /
-        // instanceOf) — where pairs[0].get(1) happens to equal
+        // facts (State_Machine_is_currently_in_Status / _for_Resource /
+        // _instance_of_Noun, renamed task-742 from the legacy
+        // camelCased forms) — where pairs[0].get(1) happens to equal
         // entity_id because the SM uses the entity id as both the
-        // State Machine id AND the forResource value — and re-pushed
-        // them under wrong cell names like `Task_has_currentlyInStatus`.
+        // State Machine id AND the Resource value — and re-pushed
+        // them under wrong cell names like `Task_has_Status`.
         // The fix scopes the update to payload fields only, leaving
         // SM derivations untouched. (Note: `Task_has_domain` is a
         // create-path artifact from `create_via_defs`'s
         // `chain(("domain", domain))` and is unrelated to #868.)
-        for sm_role in &["currentlyInStatus", "forResource", "instanceOf"] {
+        for sm_role in &["Status", "Resource", "Noun"] {
             let cell = format!("Task_has_{sm_role}");
             let bottom = matches!(ast::fetch(&cell, &post), ast::Object::Bottom);
             let empty = ast::fetch_or_phi(&cell, &post)
