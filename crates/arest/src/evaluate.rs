@@ -101,7 +101,18 @@ fn integrate_round_facts(
             // Seq contents into the Map (see `cell_put_keyed`).
             let role_refs: Vec<&str> = roles.iter().map(|s| s.as_str()).collect();
             for fact in facts {
-                current_state = ast::cell_put_keyed(&cell_name, &role_refs, fact, &current_state);
+                // task-819 (cell_put_keyed → Result): in the forward-
+                // chain emit path, a KeyConflict means a derivation rule
+                // produced two facts at the same scope key with
+                // different non-key values — a logic error in the rule,
+                // and a real alethic-UC violation if the cell has one.
+                // Panicking surfaces the bug loudly during compile /
+                // forward-chain rather than silently overwriting. The
+                // existing dedup via `existing_keys + round_keys`
+                // HashSet upstream means idempotent re-emission never
+                // hits this path; only genuinely-conflicting writes do.
+                current_state = ast::cell_put_keyed(&cell_name, &role_refs, fact, &current_state)
+                    .expect("forward-chain emit produced a UC-violating fact for a keyed cell");
             }
         } else {
             let existing = ast::fetch_or_phi(&cell_name, &current_state);
