@@ -2197,9 +2197,9 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // cells to drop, no work for the dispatcher).
     if !model.state_machines.is_empty() {
         let sm_cell_names = [
-            "StateMachine_has_instanceOf",
-            "StateMachine_has_currentlyInStatus",
-            "StateMachine_has_forResource",
+            "State_Machine_is_instance_of_Noun",
+            "State_Machine_is_currently_in_Status",
+            "State_Machine_is_for_Resource",
         ];
         let entries: Vec<crate::ast::Object> = sm_cell_names.iter()
             .map(|name| crate::ast::Object::seq(vec![
@@ -4859,7 +4859,7 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
             Func::Concat,
             Func::compose(
                 Func::apply_to_all(extract_for_resource),
-                extract_facts_from_pop("StateMachine_has_forResource"),
+                extract_facts_from_pop("State_Machine_is_for_Resource"),
             ),
         );
 
@@ -4890,27 +4890,27 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
         let initial_obj = Object::atom(&initial_status);
         let derive_facts = Func::apply_to_all(Func::construction(vec![
             Func::construction(vec![
-                Func::constant(Object::atom("StateMachine_has_instanceOf")),
-                Func::constant(Object::atom("SM instanceOf")),
+                Func::constant(Object::atom("State_Machine_is_instance_of_Noun")),
+                Func::constant(Object::atom("State Machine is instance of Noun")),
                 Func::construction(vec![
                     Func::construction(vec![Func::constant(Object::atom("State Machine")), Func::Id]),
-                    Func::construction(vec![Func::constant(Object::atom("instanceOf")), Func::constant(sm_noun_obj.clone())]),
+                    Func::construction(vec![Func::constant(Object::atom("Noun")), Func::constant(sm_noun_obj.clone())]),
                 ]),
             ]),
             Func::construction(vec![
-                Func::constant(Object::atom("StateMachine_has_currentlyInStatus")),
-                Func::constant(Object::atom("SM initial status")),
+                Func::constant(Object::atom("State_Machine_is_currently_in_Status")),
+                Func::constant(Object::atom("State Machine is currently in Status (initial)")),
                 Func::construction(vec![
                     Func::construction(vec![Func::constant(Object::atom("State Machine")), Func::Id]),
-                    Func::construction(vec![Func::constant(Object::atom("currentlyInStatus")), Func::constant(initial_obj.clone())]),
+                    Func::construction(vec![Func::constant(Object::atom("Status")), Func::constant(initial_obj.clone())]),
                 ]),
             ]),
             Func::construction(vec![
-                Func::constant(Object::atom("StateMachine_has_forResource")),
-                Func::constant(Object::atom("SM forResource")),
+                Func::constant(Object::atom("State_Machine_is_for_Resource")),
+                Func::constant(Object::atom("State Machine is for Resource")),
                 Func::construction(vec![
                     Func::construction(vec![Func::constant(Object::atom("State Machine")), Func::Id]),
-                    Func::construction(vec![Func::constant(Object::atom("forResource")), Func::Id]),
+                    Func::construction(vec![Func::constant(Object::atom("Resource")), Func::Id]),
                 ]),
             ]),
         ]));
@@ -4994,27 +4994,27 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
         // apply_to_all is a single resource value (atom).
         let derive_for_resource = Func::construction(vec![
             Func::construction(vec![
-                Func::constant(Object::atom("StateMachine_has_instanceOf")),
-                Func::constant(Object::atom("SM event-fold instanceOf")),
+                Func::constant(Object::atom("State_Machine_is_instance_of_Noun")),
+                Func::constant(Object::atom("State Machine is instance of Noun (event-fold)")),
                 Func::construction(vec![
                     Func::construction(vec![Func::constant(Object::atom("State Machine")), Func::Id]),
-                    Func::construction(vec![Func::constant(Object::atom("instanceOf")), Func::constant(sm_noun_obj.clone())]),
+                    Func::construction(vec![Func::constant(Object::atom("Noun")), Func::constant(sm_noun_obj.clone())]),
                 ]),
             ]),
             Func::construction(vec![
-                Func::constant(Object::atom("StateMachine_has_currentlyInStatus")),
-                Func::constant(Object::atom(&format!("SM event-fold to {}", to))),
+                Func::constant(Object::atom("State_Machine_is_currently_in_Status")),
+                Func::constant(Object::atom(&format!("State Machine is currently in Status (event-fold to {})", to))),
                 Func::construction(vec![
                     Func::construction(vec![Func::constant(Object::atom("State Machine")), Func::Id]),
-                    Func::construction(vec![Func::constant(Object::atom("currentlyInStatus")), Func::constant(to_obj.clone())]),
+                    Func::construction(vec![Func::constant(Object::atom("Status")), Func::constant(to_obj.clone())]),
                 ]),
             ]),
             Func::construction(vec![
-                Func::constant(Object::atom("StateMachine_has_forResource")),
-                Func::constant(Object::atom("SM event-fold forResource")),
+                Func::constant(Object::atom("State_Machine_is_for_Resource")),
+                Func::constant(Object::atom("State Machine is for Resource (event-fold)")),
                 Func::construction(vec![
                     Func::construction(vec![Func::constant(Object::atom("State Machine")), Func::Id]),
-                    Func::construction(vec![Func::constant(Object::atom("forResource")), Func::Id]),
+                    Func::construction(vec![Func::constant(Object::atom("Resource")), Func::Id]),
                 ]),
             ]),
         ]);

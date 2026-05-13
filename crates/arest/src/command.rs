@@ -16,15 +16,20 @@ use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 /// State Machine cell shape — the synthesized role-token names the
 /// apply / transition / status-extraction paths read and write to
-/// the `StateMachine_has_currentlyInStatus` cell. These are Rust-side
-/// internal identifiers (not metamodel-declared FactType readings),
-/// so they're centralized as a struct of constants rather than
-/// derived from grammar; mirroring the "single source of truth" goal
-/// of #833's parallel-enum tables for the synthesized side. See task
-/// #835.
+/// the `State_Machine_is_currently_in_Status` cell.
+///
+/// task-742: renamed from the legacy code-shaped form
+/// (`StateMachine_has_currentlyInStatus` + camelCased role names like
+/// `currentlyInStatus`, `forResource`, `instanceOf`) to proper FORML2
+/// verbalization (whitepaper §5.1: "Resource is currently in
+/// Status"). Subject becomes "State Machine" (spaced) to match the
+/// sibling cell `State_Machine_Definition_is_for_Noun`; role names
+/// become proper nouns (Status / Resource / Noun) instead of mashed
+/// single tokens. Same single-source-of-truth pattern as before;
+/// only the strings change.
 pub struct StateMachineCellShape {
-    /// Cell name carrying the synthesized "<state machine> currently
-    /// in <status>" facts.
+    /// Cell name carrying the synthesized "State Machine is currently
+    /// in Status" facts.
     pub cell_name: &'static str,
     /// Subject role binding: the State Machine entity id.
     pub state_machine_role: &'static str,
@@ -41,10 +46,10 @@ pub struct StateMachineCellShape {
 impl StateMachineCellShape {
     pub const fn boot() -> Self {
         StateMachineCellShape {
-            cell_name:           "StateMachine_has_currentlyInStatus",
+            cell_name:           "State_Machine_is_currently_in_Status",
             state_machine_role:  "State Machine",
-            current_status_role: "currentlyInStatus",
-            for_resource_role:   "forResource",
+            current_status_role: "Status",
+            for_resource_role:   "Resource",
             entity_type_label:   "State Machine",
         }
     }
@@ -2582,8 +2587,9 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         assert_eq!(result.entities[0].id, "ORD-100");
         assert_eq!(result.entities[0].entity_type, "Order");
         assert_eq!(result.entities[1].entity_type, "State Machine");
-        assert_eq!(result.entities[1].data["currentlyInStatus"], "Draft");
-        assert_eq!(result.entities[1].data["forResource"], "ORD-100");
+        // task-742: renamed from currentlyInStatus / forResource
+        assert_eq!(result.entities[1].data["Status"], "Draft");
+        assert_eq!(result.entities[1].data["Resource"], "ORD-100");
         assert_eq!(result.status.as_deref(), Some("Draft"));
         assert_eq!(result.transitions.len(), 2); // place, cancel
         assert!(result.transitions.iter().any(|t| t.event == "place"));
@@ -2692,10 +2698,10 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         assert_eq!(customer_facts.len(), 1);
         assert!(ast::binding(&customer_facts[0], "customer") == Some("acme"));
 
-        // SM facts are in the state
-        let sm_cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", &result.state);
+        // SM facts are in the state (task-742: renamed cell + role)
+        let sm_cell = ast::fetch_or_phi("State_Machine_is_currently_in_Status", &result.state);
         let sm_facts = sm_cell.as_seq().unwrap();
-        assert!(ast::binding(&sm_facts[0], "currentlyInStatus") == Some("Draft"));
+        assert!(ast::binding(&sm_facts[0], "Status") == Some("Draft"));
     }
 
     /// #828 — apply path must run the 2-stratum forward chain that
@@ -2877,13 +2883,13 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
 
         assert_eq!(result.status.as_deref(), Some("Placed"));
 
-        // State must contain the updated status
-        let sm_cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", &result.state);
+        // State must contain the updated status (task-742: renamed cell + role)
+        let sm_cell = ast::fetch_or_phi("State_Machine_is_currently_in_Status", &result.state);
         let sm_facts = sm_cell.as_seq().unwrap();
         let sm_fact = sm_facts.iter().find(|f|
             ast::binding_matches(f, "State Machine", "ORD-1")
         ).expect("SM fact must exist for ORD-1");
-        assert_eq!(ast::binding(sm_fact, "currentlyInStatus"), Some("Placed"), "state must reflect new status");
+        assert_eq!(ast::binding(sm_fact, "Status"), Some("Placed"), "state must reflect new status");
     }
 
     #[test]
