@@ -4100,6 +4100,96 @@ pub fn cell_push_unique(name: &str, fact: Object, state: &Object) -> Object {
     }
 }
 
+/// task-744 / #743: write a fact into a cell that is keyed by its
+/// reference-scheme roles (`key_roles`). The cell contents become an
+/// `Object::Map<key, fact>` where key is the concatenation of the
+/// values at the given role indices. Overwrites any existing tuple at
+/// the same key — this is the upsert path. UC violation detection
+/// lives in the caller (compile-time emit / apply-path validator);
+/// this primitive is pure storage.
+///
+/// `key_roles` are 1-indexed role positions matching `Func::Selector`
+/// convention (Selector(1) = first role). Each role's value is
+/// extracted via `binding`-style lookup over the fact's pair sequence.
+///
+/// Returns the unchanged state if any required role is missing from
+/// the fact (caller treats as a no-op rather than a write of a
+/// partially-keyed tuple).
+pub fn cell_put_keyed(
+    name: &str,
+    key_role_names: &[&str],
+    fact: Object,
+    state: &Object,
+) -> Object {
+    let Some(key) = extract_key_from_fact(&fact, key_role_names) else {
+        return state.clone();
+    };
+    let existing = fetch_or_phi(name, state);
+    let mut map: HashMap<String, Object> = match &existing {
+        Object::Map(m) => m.clone(),
+        Object::Seq(items) if items.is_empty() => HashMap::new(),
+        Object::Seq(items) => {
+            // Migration: existing Seq contents rebuild into Map keyed
+            // by the same role names. Lossy if two existing facts share
+            // a key — last one wins, which is correct for the upsert
+            // semantics this primitive establishes.
+            let mut m = HashMap::new();
+            for f in items.iter() {
+                if let Some(k) = extract_key_from_fact(f, key_role_names) {
+                    m.insert(k, f.clone());
+                }
+            }
+            m
+        }
+        _ => HashMap::new(),
+    };
+    map.insert(key, fact);
+    store(name, Object::Map(map), state)
+}
+
+/// Extract a key from a fact tuple by joining the values at the
+/// named roles. Used by `cell_put_keyed` and the Map-backed
+/// constraint enforcement path.
+///
+/// Returns None when any role is absent from the fact — caller's
+/// signal that the fact isn't fully-keyed and should not be stored
+/// in a keyed cell.
+pub fn extract_key_from_fact(fact: &Object, key_role_names: &[&str]) -> Option<String> {
+    let mut parts: Vec<String> = Vec::with_capacity(key_role_names.len());
+    for role in key_role_names {
+        let v = binding(fact, role)?;
+        parts.push(v.to_string());
+    }
+    Some(parts.join("\u{001f}")) // ASCII unit-separator — won't collide with atom contents
+}
+
+/// Iterate over the facts in a cell regardless of storage shape.
+/// Seq cells iterate their items; Map cells iterate their values.
+/// Returns an empty iterator for any other shape (Bottom, Atom, …).
+///
+/// Migration glue for task-744. Readers that previously did
+/// `fetch_or_phi(name, state).as_seq().unwrap_or(&[])` can switch to
+/// `cell_facts_iter(&fetch_or_phi(name, state))` and keep working as
+/// cells flip to Map storage.
+pub fn cell_facts_iter(contents: &Object) -> alloc::boxed::Box<dyn Iterator<Item = &Object> + '_> {
+    match contents {
+        Object::Seq(items) => alloc::boxed::Box::new(items.iter()),
+        Object::Map(m) => alloc::boxed::Box::new(m.values()),
+        _ => alloc::boxed::Box::new(core::iter::empty()),
+    }
+}
+
+/// Count facts in a cell regardless of storage shape. Convenience
+/// wrapper over `cell_facts_iter` for the common "did anything land
+/// here?" check.
+pub fn cell_fact_count(contents: &Object) -> usize {
+    match contents {
+        Object::Seq(items) => items.len(),
+        Object::Map(m) => m.len(),
+        _ => 0,
+    }
+}
+
 /// Merge two states in O(n): collect all cells into a HashMap,
 /// concatenate overlapping cells, return as Map store.
 pub fn merge_states(target: &Object, source: &Object) -> Object {
@@ -7475,6 +7565,125 @@ mod tests {
         let state = cell_push("Noun", f1.clone(), &Object::phi());
         let state2 = cell_push("Noun", f2.clone(), &state);
         assert_eq!(fetch_or_phi("Noun", &state2), Object::seq(vec![f1, f2]));
+    }
+
+    // ─── task-744 / #743 phase 2: Map-backed cell storage primitives ─
+
+    #[test]
+    fn cell_put_keyed_writes_into_map_using_named_role() {
+        let f = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
+        let state = cell_put_keyed("Task_has_Status", &["Task"], f.clone(), &Object::phi());
+        let contents = fetch_or_phi("Task_has_Status", &state);
+        match &contents {
+            Object::Map(m) => {
+                assert_eq!(m.len(), 1);
+                let stored = m.get("t-1").expect("entry for t-1");
+                assert_eq!(stored, &f);
+            }
+            other => panic!("expected Map contents, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cell_put_keyed_overwrites_same_key_with_new_tuple() {
+        let f1 = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
+        let f2 = fact_from_pairs(&[("Task", "t-1"), ("Status", "in_progress")]);
+        let s1 = cell_put_keyed("Task_has_Status", &["Task"], f1, &Object::phi());
+        let s2 = cell_put_keyed("Task_has_Status", &["Task"], f2.clone(), &s1);
+        let contents = fetch_or_phi("Task_has_Status", &s2);
+        let m = contents.as_map().expect("Map contents");
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get("t-1"), Some(&f2));
+    }
+
+    #[test]
+    fn cell_put_keyed_distinct_keys_coexist() {
+        let f1 = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
+        let f2 = fact_from_pairs(&[("Task", "t-2"), ("Status", "done")]);
+        let s1 = cell_put_keyed("Task_has_Status", &["Task"], f1.clone(), &Object::phi());
+        let s2 = cell_put_keyed("Task_has_Status", &["Task"], f2.clone(), &s1);
+        let m = fetch_or_phi("Task_has_Status", &s2).as_map().cloned().expect("Map contents");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get("t-1"), Some(&f1));
+        assert_eq!(m.get("t-2"), Some(&f2));
+    }
+
+    #[test]
+    fn cell_put_keyed_composite_key_joins_role_values() {
+        let f = fact_from_pairs(&[
+            ("Person", "alice"),
+            ("Organization", "acme"),
+            ("Joined", "2024-01-01"),
+        ]);
+        let state = cell_put_keyed(
+            "Membership",
+            &["Person", "Organization"],
+            f.clone(),
+            &Object::phi(),
+        );
+        let m = fetch_or_phi("Membership", &state).as_map().cloned().expect("Map contents");
+        // Composite key uses the unit-separator joiner — internal detail,
+        // but the lookup should find exactly one entry.
+        assert_eq!(m.len(), 1);
+        assert!(m.values().next() == Some(&f));
+    }
+
+    #[test]
+    fn cell_put_keyed_returns_unchanged_state_when_role_missing() {
+        // Fact has only Status, not Task; not fully keyed for ["Task"].
+        let f = fact_from_pairs(&[("Status", "pending")]);
+        let state = cell_put_keyed("Task_has_Status", &["Task"], f, &Object::phi());
+        // Cell never gets written.
+        assert_eq!(fetch_or_phi("Task_has_Status", &state), Object::phi());
+    }
+
+    #[test]
+    fn cell_put_keyed_migrates_seq_cell_to_map_on_first_keyed_write() {
+        // Pre-existing Seq cell (legacy push path), then keyed write
+        // should reshape to Map with the existing fact retained under
+        // its extracted key.
+        let f1 = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
+        let f2 = fact_from_pairs(&[("Task", "t-2"), ("Status", "done")]);
+        let s_seq = cell_push("Task_has_Status", f1.clone(), &Object::phi());
+        let s_map = cell_put_keyed("Task_has_Status", &["Task"], f2.clone(), &s_seq);
+        let m = fetch_or_phi("Task_has_Status", &s_map).as_map().cloned().expect("Map contents");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get("t-1"), Some(&f1));
+        assert_eq!(m.get("t-2"), Some(&f2));
+    }
+
+    #[test]
+    fn cell_facts_iter_uniformly_iterates_seq_and_map_cells() {
+        let f1 = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
+        let f2 = fact_from_pairs(&[("Task", "t-2"), ("Status", "done")]);
+
+        let seq_state = cell_push("Cell_A", f1.clone(),
+            &cell_push("Cell_A", f2.clone(), &Object::phi()));
+        let seq_count = cell_facts_iter(&fetch_or_phi("Cell_A", &seq_state)).count();
+        assert_eq!(seq_count, 2);
+
+        let map_state = cell_put_keyed("Cell_B", &["Task"], f1.clone(),
+            &cell_put_keyed("Cell_B", &["Task"], f2.clone(), &Object::phi()));
+        let map_count = cell_facts_iter(&fetch_or_phi("Cell_B", &map_state)).count();
+        assert_eq!(map_count, 2);
+    }
+
+    #[test]
+    fn extract_key_from_fact_returns_none_when_any_role_missing() {
+        let f = fact_from_pairs(&[("Task", "t-1")]);
+        assert_eq!(extract_key_from_fact(&f, &["Task"]), Some("t-1".to_string()));
+        assert_eq!(extract_key_from_fact(&f, &["Task", "Status"]), None);
+    }
+
+    #[test]
+    fn cell_fact_count_handles_both_storage_shapes() {
+        let f = fact_from_pairs(&[("Task", "t-1"), ("Status", "pending")]);
+        let seq = cell_push("X", f.clone(), &Object::phi());
+        assert_eq!(cell_fact_count(&fetch_or_phi("X", &seq)), 1);
+        let map = cell_put_keyed("Y", &["Task"], f, &Object::phi());
+        assert_eq!(cell_fact_count(&fetch_or_phi("Y", &map)), 1);
+        assert_eq!(cell_fact_count(&Object::phi()), 0);
+        assert_eq!(cell_fact_count(&Object::Bottom), 0);
     }
 
     // ─── VersionEntry shape (S1a, #717) ────────────────────────────────
