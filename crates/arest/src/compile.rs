@@ -2047,13 +2047,18 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         ));
     });
 
-    // Handler defs â€” Î±(noun â†’ <create_def, update_def>)
-    // Platform functions: create:{noun} and update:{noun} take Object fact pairs,
-    // not JSON. Per AREST Eq. 6, input is the 3NF row.
+    // Handler defs â€” Î±(noun â†’ <create_def, update_def, transition_def>)
+    // Platform functions: create:{noun} / update:{noun} take Object fact pairs;
+    // transition:{noun} takes <id, event>. Per AREST Eq. 6, input is the 3NF row
+    // (or the SM-event pair for transition). task-919-mcp-transition-bridge:
+    // transition was the only handler missing this def, so `Func::Def("transition:Task")`
+    // from the CLI's system entry resolved to Bottom and every MCP-driven
+    // status flip ⊥'d while create/update worked.
     defs.extend(c_nouns.keys().flat_map(|noun_name| {
         [
             (format!("create:{}", noun_name), Func::Platform(format!("create:{}", noun_name))),
             (format!("update:{}", noun_name), Func::Platform(format!("update:{}", noun_name))),
+            (format!("transition:{}", noun_name), Func::Platform(format!("transition:{}", noun_name))),
         ]
     }));
 
