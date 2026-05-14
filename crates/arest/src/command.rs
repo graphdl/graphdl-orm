@@ -961,6 +961,7 @@ fn create_via_defs(
                     // SM infrastructure derivations
                     n.contains("StateMachine") || n.contains("machine:") || n.contains("_transitive_Status")
                         || n.contains("_transitive_Transition") || n.contains("sm_init")
+                        || n.contains("sm_for_resource_backfill")
                     // Derivations whose consequent is needed by the SM
                         || sm_event_types.iter().any(|evt| n.contains(evt))
                 } else if !relevant_ids.is_empty() {
@@ -969,6 +970,7 @@ fn create_via_defs(
                         // Always include SM infrastructure
                         || n.contains("StateMachine") || n.contains("machine:")
                         || n.contains("sm_init")
+                        || n.contains("sm_for_resource_backfill")
                 } else {
                     true // no index available, run all
                 }

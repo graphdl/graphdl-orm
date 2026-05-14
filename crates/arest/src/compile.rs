@@ -2629,15 +2629,19 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
     // #905/task-740 follow-up: emit `SyntheticDerivedCells` meta cell
     // listing the cells synthetic derivations (`_sm_init_*`,
-    // `_sm_event_fold_*`) write into. The LFP-per-request drop logic
-    // (cli/entry.rs:810) reads this alongside the DerivationRule cell's
-    // `consequentFactTypeId` field — user rules contribute via the
-    // latter; synthetic rules via this cell. No hand-curated cell list
-    // in dispatch logic. Future synthetic rule kinds extend this cell
-    // by appending their consequents at the same point.
+    // `_sm_event_fold_*`, `_sm_for_resource_backfill_*`) write into.
+    // The LFP-per-request drop logic (cli/entry.rs:810) reads this
+    // alongside the DerivationRule cell's `consequentFactTypeId`
+    // field — user rules contribute via the latter; synthetic rules
+    // via this cell. No hand-curated cell list in dispatch logic.
+    // Future synthetic rule kinds extend this cell by appending their
+    // consequents at the same point.
     //
     // SM init and event-fold both emit to the same three cells:
     // StateMachine_has_instanceOf / _currentlyInStatus / _forResource.
+    // The for_Resource backfill (task-922-sm-init-projection) emits
+    // only to State_Machine_is_for_Resource, which is already in
+    // the list below.
     // Emit the constants only when at least one SM exists in the
     // compiled model — apps without SMs get an empty registry (no
     // cells to drop, no work for the dispatcher).
@@ -3148,6 +3152,34 @@ fn compile_derivations(data: &CellIndex, state_machines: &[CompiledStateMachine]
     }).collect();
     diag!("  [profile] {} SM event-fold derivations", sm_event_fold_derivations.len());
     derivations.extend(sm_event_fold_derivations);
+
+    // task-922-sm-init-projection: for_Resource backfill derivations.
+    //
+    // The transition / create-via-defs paths in `command.rs` write
+    // `State_Machine_is_currently_in_Status` directly via `cell_push`
+    // without a companion write into `State_Machine_is_for_Resource`.
+    // After bulk-recording transitions (apply transition, MCP-driven
+    // edits) the population accumulates SM entities with a status row
+    // but no for_Resource row. The bridge derivation
+    // (`Resource is currently in Status iff some State Machine is for
+    // that Resource and that State Machine is currently in that Status`)
+    // joins on for_Resource × currently_in_Status, so entities missing
+    // their for_Resource row never project into Task_has_Task_Status.
+    //
+    // This backfill closes the gap without disturbing event-fold or
+    // the initial-status emit: extract State Machine ids from
+    // `currently_in_Status`, subtract anything already in `for_Resource`,
+    // and emit exactly one `for_Resource <e, e>` per missing entity.
+    // The "Each Resource has at most one State Machine" UC stays
+    // satisfied because the subtraction guarantees zero duplicate
+    // emits.
+    let sm_for_resource_backfill_derivations: Vec<_> = state_machines.iter().map(|sm| {
+        diag!("  [profile] compiling SM for_Resource backfill for noun={}", sm.noun_name);
+        compile_sm_for_resource_backfill_for(sm)
+    }).collect();
+    diag!("  [profile] {} SM for_Resource backfill derivations",
+        sm_for_resource_backfill_derivations.len());
+    derivations.extend(sm_for_resource_backfill_derivations);
 
     derivations
 }
@@ -5699,6 +5731,120 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
         derivation_dep_metadata_synth(String::new());
     CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func, uses_negation: false,
         consequent_cell, consequent_role_literals, negation_reads }
+}
+
+/// task-922-sm-init-projection — for_Resource backfill.
+///
+/// Project `State_Machine_is_for_Resource` from
+/// `State_Machine_is_currently_in_Status` for entities whose status row
+/// was written without a companion for_Resource row. Closes the gap
+/// left by `command.rs::transition_via_defs` and the create-time SM
+/// flip in `create_via_defs`, which both do `cell_push` directly into
+/// the currently_in_Status cell.
+///
+/// Without this backfill, the bridge derivation
+///   `Resource is currently in Status iff some State Machine is for
+///    that Resource and that State Machine is currently in that
+///    Status.`
+/// can't join on entities that have one half of the SM cell pair but
+/// not the other — so downstream rules that read
+/// `Resource_is_currently_in_Status` (e.g. the
+/// `Task_has_Task_Status` bridge in `apps/tasks/readings/app.md`)
+/// silently drop those entities.
+///
+/// Shape mirrors `compile_sm_event_fold`'s per-resource emit but
+/// produces only the for_Resource fact — the currentlyInStatus row
+/// already exists in the population (that's how we found the
+/// entity), and re-emitting it under the initial status would
+/// violate the "Each State Machine is in exactly one Status" UC.
+/// The "Each Resource has at most one State Machine" UC on
+/// for_Resource stays satisfied because the existing-set
+/// subtraction filters out resources already covered.
+fn compile_sm_for_resource_backfill_for(sm: &CompiledStateMachine) -> CompiledDerivation {
+    let sm_noun = sm.noun_name.clone();
+    let id_str = format!("_sm_for_resource_backfill_{}", sm_noun);
+    let text_str = format!("SM for_Resource backfill for {}", sm_noun);
+
+    // Extract "State Machine" role values from currently_in_Status —
+    // those are the candidate entities (every SM entity must have a
+    // currently_in_Status row by construction; if it doesn't, there's
+    // nothing to backfill).
+    let extract_state_machine = Func::compose(
+        Func::apply_to_all(Func::Selector(2)),
+        Func::filter(Func::compose(Func::Eq, Func::construction(vec![
+            Func::Selector(1),
+            Func::constant(Object::atom("State Machine")),
+        ]))),
+    );
+    let candidates = Func::compose(
+        Func::Concat,
+        Func::compose(
+            Func::apply_to_all(extract_state_machine),
+            extract_facts_from_pop("State_Machine_is_currently_in_Status"),
+        ),
+    );
+
+    // Existing for_Resource set: extract "Resource" role values.
+    let extract_for_resource = Func::compose(
+        Func::apply_to_all(Func::Selector(2)),
+        Func::filter(Func::compose(Func::Eq, Func::construction(vec![
+            Func::Selector(1),
+            Func::constant(Object::atom("Resource")),
+        ]))),
+    );
+    let existing = Func::compose(
+        Func::Concat,
+        Func::compose(
+            Func::apply_to_all(extract_for_resource),
+            extract_facts_from_pop("State_Machine_is_for_Resource"),
+        ),
+    );
+    let existing_set = Func::compose(Func::SetFromSeq, existing);
+
+    // is_new on `<candidate, existing_set>`: T iff candidate is NOT
+    // already in for_Resource. Mirrors the existence guard in
+    // `compile_sm_init_for`'s `is_new` shape — null . FetchOrPhi over
+    // the SetFromSeq-built Map<atom, T>.
+    let is_new = Func::compose(Func::NullTest, Func::FetchOrPhi);
+
+    let pairs = Func::construction(vec![candidates, existing_set]);
+
+    let missing = Func::compose(
+        Func::apply_to_all(Func::Selector(1)),
+        Func::compose(Func::filter(is_new), Func::compose(Func::DistR, pairs)),
+    );
+
+    // Per-resource emit: the State Machine id IS the resource id
+    // (SM cell convention — `command.rs::transition_via_defs` writes
+    // sm_role=entity_id; create-time emits use Id for both roles in
+    // `compile_sm_init_for`). Emit only the for_Resource fact; the
+    // currently_in_Status row already exists in the population.
+    let derive_for_resource = Func::construction(vec![
+        Func::constant(Object::atom("State_Machine_is_for_Resource")),
+        Func::constant(Object::atom("State Machine is for Resource (backfill)")),
+        Func::construction(vec![
+            Func::construction(vec![Func::constant(Object::atom("State Machine")), Func::Id]),
+            Func::construction(vec![Func::constant(Object::atom("Resource")), Func::Id]),
+        ]),
+    ]);
+
+    let func = Func::compose(
+        Func::apply_to_all(derive_for_resource),
+        missing,
+    );
+
+    let (consequent_cell_md, consequent_role_literals_md, negation_reads_md) =
+        derivation_dep_metadata_synth("State_Machine_is_for_Resource".to_string());
+    CompiledDerivation {
+        id: id_str,
+        text: text_str,
+        kind: DerivationKind::SubtypeInheritance,
+        func,
+        uses_negation: false,
+        consequent_cell: consequent_cell_md,
+        consequent_role_literals: consequent_role_literals_md,
+        negation_reads: negation_reads_md,
+    }
 }
 
 fn compile_constraint(

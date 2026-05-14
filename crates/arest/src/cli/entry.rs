@@ -903,6 +903,14 @@ pub fn main_entry() {
                 let mut stratum1 = collect_derivs("derivation:rule_", &d);
                 stratum1.extend(collect_derivs("derivation:_sm_init_", &d));
                 stratum1.extend(collect_derivs("derivation:_sm_event_fold_", &d));
+                // task-922-sm-init-projection: backfill for_Resource
+                // for entities whose currently_in_Status row was
+                // written without a companion for_Resource row
+                // (apply transition / direct cell_push from
+                // command.rs::transition_via_defs paths). Runs in
+                // stratum 1 alongside init + event-fold so the bridge
+                // derivation in stratum 2 sees the complete pair.
+                stratum1.extend(collect_derivs("derivation:_sm_for_resource_backfill_", &d));
                 let stratum2 = collect_derivs("derivation_strat2:rule_", &d);
                 let d = if stratum1.is_empty() && stratum2.is_empty() { d } else {
                     // task-814-stratify-3plus: pull per-rule dep

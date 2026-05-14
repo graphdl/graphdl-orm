@@ -1884,3 +1884,555 @@ Task 't-none' has Candidate Posture 'none'.
     assert_eq!(by_task("t-none"), vec!["none"],
         "t-none via meta-cell round trip — expected exactly 'none'. All pairs: {:?}", pairs);
 }
+
+// ─── SM init emits forResource for entity without transition events ─
+//
+// task-922-sm-init-projection — surfaced by task-922 verification.
+// `ft_State_Machine_is_for_Resource` showed 0 rows for Tasks that have
+// no recorded SM events (e.g. fresh tasks without any
+// `Task_is_started` / `Task_is_finished` etc.). The downstream
+// `Task_has_Task_Status` bridge then can't materialize because its
+// antecedent `Resource is currently in Status` joins on
+// `State_Machine_is_for_Resource` × `State_Machine_is_currently_in_Status`,
+// and the for_Resource side is empty for the fresh-entity case.
+//
+// Acceptance: for every entity of an SM-bound noun that exists in the
+// population (via any FT cell binding) AND has no event facts, SM init
+// must emit BOTH `State_Machine_is_currently_in_Status` (the existing
+// behavior — gives the initial status) AND `State_Machine_is_for_Resource`
+// (the regressed behavior — gives the entity-to-SM binding the bridge
+// rule needs).
+//
+// This test:
+//   1. Declares a Task SM with one transition (start: pending →
+//      in_progress, triggered by `Task is started`).
+//   2. Pushes two Tasks into the population via primary-field facts —
+//      `Task t-no-events has Owner 'Alice'` etc. — but NO event facts.
+//   3. Asserts after forward chain that BOTH SM cells contain a row
+//      per Task.
+
+#[test]
+fn sm_init_emits_for_resource_for_entity_without_any_event_facts() {
+    use crate::ast::{cells_iter, fetch_or_phi};
+
+    // Metamodel — same surface as `readings/core/state.md` plus the
+    // `Fact Type` noun so `Transition 'start' is triggered by Fact
+    // Type '...'` parses as an Instance Fact rather than a Fact Type
+    // declaration. (Mirrors the tasks-app load path: bootstrap +
+    // state.md provide the metamodel scaffolding.)
+    let meta = r#"# State metamodel
+## Entity Types
+Status(.Name) is an entity type.
+State Machine Definition is a subtype of Status.
+Transition(.id) is an entity type.
+Fact Type(.id) is an entity type.
+Noun is an entity type.
+Name is a value type.
+
+## Fact Types
+State Machine Definition is for Noun.
+Status is initial in State Machine Definition.
+Transition is defined in State Machine Definition.
+Transition is from Status.
+Transition is to Status.
+Transition is triggered by Fact Type.
+"#;
+    let domain = r#"# SM init forResource test (task-922-sm-init-projection)
+## Entity Types
+Task(.id) is an entity type.
+
+## Value Types
+Owner is a value type.
+
+## Fact Types
+Task has Owner.
+Task is started.
+
+## Instance Facts
+State Machine Definition 'Task SM' is for Noun 'Task'.
+Status 'pending' is initial in State Machine Definition 'Task SM'.
+
+Transition 'start' is defined in State Machine Definition 'Task SM'.
+Transition 'start' is from Status 'pending'.
+Transition 'start' is to Status 'in_progress'.
+Transition 'start' is triggered by Fact Type 'Task is started'.
+
+Task 't-no-events' has Owner 'Alice'.
+Task 't-also-no-events' has Owner 'Bob'.
+"#;
+    let meta_state = crate::parse_forml2::parse_to_state(meta).expect("parse metamodel");
+    let domain_state = crate::parse_forml2::parse_to_state_with_nouns(domain, &meta_state)
+        .expect("parse domain");
+    let state = crate::ast::merge_states(&meta_state, &domain_state);
+    let defs = crate::compile::compile_to_defs_state(&state);
+    let d = crate::ast::defs_to_state(&defs, &state);
+
+    // Collect SM init + event-fold derivations the way cli/entry.rs does
+    // for the load path.
+    let collect = |prefix: &str| -> Vec<(String, crate::ast::Func)> {
+        let cell_prefix = format!("{}:", prefix);
+        crate::ast::cells_iter(&d).into_iter()
+            .filter(|(n, _)| n.starts_with(cell_prefix.as_str()))
+            .map(|(n, contents)| (n.to_string(), crate::ast::metacompose(contents, &d)))
+            .collect()
+    };
+    let mut stratum1 = collect("derivation:rule_");
+    let init_and_fold: Vec<_> = crate::ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:_sm_init_")
+            || n.starts_with("derivation:_sm_event_fold_")
+            || n.starts_with("derivation:_sm_for_resource_backfill_"))
+        .map(|(n, contents)| (n.to_string(), crate::ast::metacompose(contents, &d)))
+        .collect();
+    stratum1.extend(init_and_fold);
+    let s1_refs: Vec<(&str, &crate::ast::Func)> = stratum1.iter()
+        .map(|(n, f)| (n.as_str(), f)).collect();
+    let (final_state, _derived) =
+        crate::evaluate::forward_chain_defs_state(&s1_refs, &state);
+
+    // Collect Resource values from State_Machine_is_for_Resource cell.
+    let for_res_cell = fetch_or_phi("State_Machine_is_for_Resource", &final_state);
+    let resources: Vec<String> = for_res_cell.as_seq().map(|facts| {
+        facts.iter().filter_map(|f| {
+            let pairs = f.as_seq()?;
+            for p in pairs.iter() {
+                let kv = p.as_seq()?;
+                if kv.len() != 2 { continue; }
+                let k = kv[0].as_atom()?;
+                let v = kv[1].as_atom()?;
+                if k == "Resource" { return Some(v.to_string()); }
+            }
+            None
+        }).collect()
+    }).unwrap_or_default();
+
+    let cells: Vec<&str> = cells_iter(&final_state).iter()
+        .map(|(n, _)| *n).collect();
+
+    assert!(
+        resources.contains(&"t-no-events".to_string()),
+        "SM init must emit State_Machine_is_for_Resource <_, t-no-events> for the \
+         Task entity that has no event facts. Got Resources: {:?}\n\
+         For_Resource cell contents: {:?}\n\
+         All cells: {:?}",
+        resources, for_res_cell, cells,
+    );
+    assert!(
+        resources.contains(&"t-also-no-events".to_string()),
+        "SM init must emit State_Machine_is_for_Resource <_, t-also-no-events> for \
+         the second Task entity that has no event facts. Got Resources: {:?}\n\
+         For_Resource cell contents: {:?}\n\
+         All cells: {:?}",
+        resources, for_res_cell, cells,
+    );
+
+    // ── Also assert the currentlyInStatus emit still fires for the
+    // same entities (this is the "we know this works" baseline per the
+    // task description). If currentlyInStatus is empty too, the bug is
+    // SM init not running at all, not the targeted for_Resource regression.
+    let status_cell = fetch_or_phi("State_Machine_is_currently_in_Status", &final_state);
+    let statuses_by_resource: hashbrown::HashMap<String, String> = {
+        let for_res_pairs: Vec<(String, String)> = for_res_cell.as_seq().map(|facts| {
+            facts.iter().filter_map(|f| {
+                let pairs = f.as_seq()?;
+                let mut sm: Option<String> = None;
+                let mut res: Option<String> = None;
+                for p in pairs.iter() {
+                    let kv = p.as_seq()?;
+                    if kv.len() != 2 { continue; }
+                    let k = kv[0].as_atom()?;
+                    let v = kv[1].as_atom()?;
+                    if k == "State Machine" { sm = Some(v.to_string()); }
+                    if k == "Resource"      { res = Some(v.to_string()); }
+                }
+                Some((sm?, res?))
+            }).collect()
+        }).unwrap_or_default();
+        let sm_to_status: hashbrown::HashMap<String, String> = status_cell.as_seq().map(|facts| {
+            facts.iter().filter_map(|f| {
+                let pairs = f.as_seq()?;
+                let mut sm: Option<String> = None;
+                let mut st: Option<String> = None;
+                for p in pairs.iter() {
+                    let kv = p.as_seq()?;
+                    if kv.len() != 2 { continue; }
+                    let k = kv[0].as_atom()?;
+                    let v = kv[1].as_atom()?;
+                    if k == "State Machine" { sm = Some(v.to_string()); }
+                    if k == "Status"        { st = Some(v.to_string()); }
+                }
+                Some((sm?, st?))
+            }).collect()
+        }).unwrap_or_default();
+        for_res_pairs.into_iter()
+            .filter_map(|(sm, res)| sm_to_status.get(&sm).map(|st| (res, st.clone())))
+            .collect()
+    };
+    assert_eq!(
+        statuses_by_resource.get("t-no-events").map(|s| s.as_str()),
+        Some("pending"),
+        "SM init must also emit currentlyInStatus='pending' for t-no-events \
+         (paired by State Machine binding with for_Resource). Got status map: {:?}",
+        statuses_by_resource,
+    );
+}
+
+// ─── SM init emits forResource when entity's only FT cell is keyed ─
+//
+// task-922-sm-init-projection — the actual production failure mode.
+// The tasks-app reading declares `Task has Task Description` with an
+// "at most one" alethic UC. The compiled `_CellKeyRoles` map registers
+// `Task` as the key role, so `cell_put_keyed` writes the cell as a
+// Map<task_id, fact>. The Seq-walking shape of `instances_of_noun_func`
+// (`apply_to_all . Selector(2)` over the Seq of `<ft_id, facts>` pairs,
+// then walking each fact's bindings) reads `encode_state(pop)` output —
+// which already flattens Map<key, fact> to a Seq of values via
+// `m.values()`. The instances_of_noun walk SHOULD find the same Tasks
+// either way.
+//
+// If this test fails post-fix, the SM init derivation isn't picking
+// up Tasks whose only FT cell is keyed — exactly the production
+// symptom on tasks 919, 922 (and the 78 others surfaced by the task
+// description). Conversely, if it passes alongside the non-keyed test,
+// the SM-init derivation is fine and the production gap is somewhere
+// else (likely the SQL-projection role-mismatch — separate task).
+
+#[test]
+fn sm_init_emits_for_resource_when_entitys_only_ft_cell_is_keyed_by_alethic_uc() {
+    use crate::ast::{cells_iter, fetch_or_phi};
+
+    let meta = r#"# State metamodel
+## Entity Types
+Status(.Name) is an entity type.
+State Machine Definition is a subtype of Status.
+Transition(.id) is an entity type.
+Fact Type(.id) is an entity type.
+Noun is an entity type.
+Name is a value type.
+
+## Fact Types
+State Machine Definition is for Noun.
+Status is initial in State Machine Definition.
+Transition is defined in State Machine Definition.
+Transition is from Status.
+Transition is to Status.
+Transition is triggered by Fact Type.
+"#;
+    // `Task has Task Description` carries `Each Task has at most one
+    // Task Description.` — the parser registers a UC keyed on Task,
+    // and `cell_put_keyed` will write the cell as a Map<task_id, fact>.
+    // This is exactly the shape of `Task_has_Task_Description` and
+    // `Task_has_Task_Priority` in the production tasks-app DB.
+    let domain = r#"# SM init forResource over keyed cell (task-922-sm-init-projection)
+## Entity Types
+Task(.id) is an entity type.
+
+## Value Types
+Task Description is a value type.
+
+## Fact Types
+Task has Task Description.
+  Each Task has at most one Task Description.
+Task is started.
+
+## Instance Facts
+State Machine Definition 'Task SM' is for Noun 'Task'.
+Status 'pending' is initial in State Machine Definition 'Task SM'.
+
+Transition 'start' is defined in State Machine Definition 'Task SM'.
+Transition 'start' is from Status 'pending'.
+Transition 'start' is to Status 'in_progress'.
+Transition 'start' is triggered by Fact Type 'Task is started'.
+
+Task 't-keyed-1' has Task Description 'first task no events'.
+Task 't-keyed-2' has Task Description 'second task no events'.
+"#;
+    let meta_state = crate::parse_forml2::parse_to_state(meta).expect("parse metamodel");
+    let domain_state = crate::parse_forml2::parse_to_state_with_nouns(domain, &meta_state)
+        .expect("parse domain");
+    let state = crate::ast::merge_states(&meta_state, &domain_state);
+    let defs = crate::compile::compile_to_defs_state(&state);
+    let d = crate::ast::defs_to_state(&defs, &state);
+
+    let collect = |prefix: &str| -> Vec<(String, crate::ast::Func)> {
+        let cell_prefix = format!("{}:", prefix);
+        crate::ast::cells_iter(&d).into_iter()
+            .filter(|(n, _)| n.starts_with(cell_prefix.as_str()))
+            .map(|(n, contents)| (n.to_string(), crate::ast::metacompose(contents, &d)))
+            .collect()
+    };
+    let mut stratum1 = collect("derivation:rule_");
+    let init_and_fold: Vec<_> = crate::ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:_sm_init_")
+            || n.starts_with("derivation:_sm_event_fold_")
+            || n.starts_with("derivation:_sm_for_resource_backfill_"))
+        .map(|(n, contents)| (n.to_string(), crate::ast::metacompose(contents, &d)))
+        .collect();
+    stratum1.extend(init_and_fold);
+    let s1_refs: Vec<(&str, &crate::ast::Func)> = stratum1.iter()
+        .map(|(n, f)| (n.as_str(), f)).collect();
+    let (final_state, _derived) =
+        crate::evaluate::forward_chain_defs_state(&s1_refs, &state);
+
+    // Force the Map-storage shape: the parser writes instance-fact
+    // payloads as Seq cells, but the production load path (the
+    // alethic-UC-aware apply pipeline at `command.rs::create_via_defs`
+    // via `push_with_uc_check` → `cell_put_keyed`) rewrites them into
+    // Map<task_id, fact> shape. We simulate that here by walking the
+    // Seq cell and re-keying it via `cell_put_keyed` BEFORE the SM
+    // init derivation runs, so we exercise the same `encode_state` →
+    // `instances_of_noun_func` path the production fixed-point runs
+    // against.
+    let mut keyed_state = state.clone();
+    {
+        let cell = fetch_or_phi("Task_has_Task_Description", &keyed_state);
+        if let Some(facts) = cell.as_seq() {
+            let facts_vec: Vec<crate::ast::Object> = facts.iter().cloned().collect();
+            // Drop the Seq version first by writing a fresh Map.
+            keyed_state = crate::ast::store(
+                "Task_has_Task_Description",
+                crate::ast::Object::Map(Default::default()),
+                &keyed_state,
+            );
+            for fact in facts_vec {
+                keyed_state = crate::ast::cell_put_keyed(
+                    "Task_has_Task_Description",
+                    &["Task"],
+                    fact,
+                    &keyed_state,
+                ).expect("cell_put_keyed first write");
+            }
+        }
+    }
+    // Sanity-check the rewrite landed in Map storage — guards the test's
+    // structural premise that we are exercising the Map-cell path.
+    let desc_cell = fetch_or_phi("Task_has_Task_Description", &keyed_state);
+    assert!(
+        matches!(desc_cell, crate::ast::Object::Map(_)),
+        "test setup: Task_has_Task_Description should now be Map-keyed \
+         after the explicit `cell_put_keyed` rewrite. Got: {:?}",
+        desc_cell,
+    );
+
+    // Re-run forward chain over the keyed state.
+    let (final_state, _derived) =
+        crate::evaluate::forward_chain_defs_state(&s1_refs, &keyed_state);
+
+    let for_res_cell = fetch_or_phi("State_Machine_is_for_Resource", &final_state);
+    let resources: Vec<String> = for_res_cell.as_seq().map(|facts| {
+        facts.iter().filter_map(|f| {
+            let pairs = f.as_seq()?;
+            for p in pairs.iter() {
+                let kv = p.as_seq()?;
+                if kv.len() != 2 { continue; }
+                let k = kv[0].as_atom()?;
+                let v = kv[1].as_atom()?;
+                if k == "Resource" { return Some(v.to_string()); }
+            }
+            None
+        }).collect()
+    }).unwrap_or_default();
+
+    let cells: Vec<&str> = cells_iter(&final_state).iter()
+        .map(|(n, _)| *n).collect();
+
+    assert!(
+        resources.contains(&"t-keyed-1".to_string()),
+        "SM init must emit State_Machine_is_for_Resource <_, t-keyed-1> when \
+         the Task's only FT cell is Map-keyed by alethic UC. Got Resources: \
+         {:?}\nFor_Resource cell: {:?}\nAll cells: {:?}",
+        resources, for_res_cell, cells,
+    );
+    assert!(
+        resources.contains(&"t-keyed-2".to_string()),
+        "SM init must emit State_Machine_is_for_Resource <_, t-keyed-2> when \
+         the Task's only FT cell is Map-keyed by alethic UC. Got Resources: \
+         {:?}\nFor_Resource cell: {:?}\nAll cells: {:?}",
+        resources, for_res_cell, cells,
+    );
+}
+
+// ─── for_Resource backfill picks up entities with only a status row ─
+//
+// task-922-sm-init-projection production failure mode: an entity
+// exists in `State_Machine_is_currently_in_Status` (because
+// `command.rs::transition_via_defs` or `create_via_defs` pushed a
+// status row directly) without a matching `State_Machine_is_for_Resource`
+// row. The legacy SM init scan via `instances_of_noun_func` reads
+// the noun's primary FT cells — it MISSES entities whose only
+// population trace is in the SM cells themselves (no Task_has_*,
+// no Task_is_*, etc.). This shape was task 922 in production:
+// SM cell carried `State_Machine=922, Status=completed` but every
+// `ft_Task_*` table reported zero rows for task 922.
+//
+// After the backfill derivation lands, an SM entity with a status
+// row but no for_Resource row must materialize a for_Resource
+// `<SM=e, Resource=e>` row in the same forward chain. Without that
+// the bridge derivation (`Resource is currently in Status iff some
+// State Machine is for that Resource and that State Machine is
+// currently in that Status`) can't join, and the downstream
+// Task_has_Task_Status projection drops the entity.
+
+#[test]
+fn sm_for_resource_backfill_emits_for_entity_with_only_currently_in_status_row() {
+    use crate::ast::{cells_iter, fetch_or_phi};
+
+    let meta = r#"# State metamodel
+## Entity Types
+Status(.Name) is an entity type.
+State Machine Definition is a subtype of Status.
+Transition(.id) is an entity type.
+Fact Type(.id) is an entity type.
+Noun is an entity type.
+Name is a value type.
+
+## Fact Types
+State Machine Definition is for Noun.
+Status is initial in State Machine Definition.
+Transition is defined in State Machine Definition.
+Transition is from Status.
+Transition is to Status.
+Transition is triggered by Fact Type.
+"#;
+    let domain = r#"# SM init for_Resource backfill (task-922-sm-init-projection)
+## Entity Types
+Task(.id) is an entity type.
+State Machine(.id) is an entity type.
+Resource(.Reference) is an entity type.
+
+Task is a subtype of Resource.
+
+## Value Types
+Status is a value type.
+
+## Fact Types
+Task is started.
+State Machine is currently in Status.
+State Machine is for Resource.
+
+## Instance Facts
+State Machine Definition 'Task SM' is for Noun 'Task'.
+Status 'pending' is initial in State Machine Definition 'Task SM'.
+
+Transition 'start' is defined in State Machine Definition 'Task SM'.
+Transition 'start' is from Status 'pending'.
+Transition 'start' is to Status 'in_progress'.
+Transition 'start' is triggered by Fact Type 'Task is started'.
+
+State Machine 't-orphan' is currently in Status 'completed'.
+"#;
+    let meta_state = crate::parse_forml2::parse_to_state(meta).expect("parse metamodel");
+    let domain_state = crate::parse_forml2::parse_to_state_with_nouns(domain, &meta_state)
+        .expect("parse domain");
+    let state = crate::ast::merge_states(&meta_state, &domain_state);
+    let defs = crate::compile::compile_to_defs_state(&state);
+    let d = crate::ast::defs_to_state(&defs, &state);
+
+    let init_and_fold_and_backfill: Vec<_> = crate::ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:_sm_init_")
+            || n.starts_with("derivation:_sm_event_fold_")
+            || n.starts_with("derivation:_sm_for_resource_backfill_"))
+        .map(|(n, contents)| (n.to_string(), crate::ast::metacompose(contents, &d)))
+        .collect();
+    assert!(
+        init_and_fold_and_backfill.iter().any(|(n, _)| n.contains("for_resource_backfill")),
+        "compile_to_defs_state must emit a `_sm_for_resource_backfill_<Noun>` \
+         derivation alongside _sm_init_ and _sm_event_fold_ for every SM. \
+         Got defs: {:?}",
+        init_and_fold_and_backfill.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+    );
+    let s1_refs: Vec<(&str, &crate::ast::Func)> = init_and_fold_and_backfill.iter()
+        .map(|(n, f)| (n.as_str(), f)).collect();
+    let (final_state, _derived) =
+        crate::evaluate::forward_chain_defs_state(&s1_refs, &state);
+
+    // Pre-condition sanity check: the orphan currently_in_Status row
+    // is still in the population. If it's not, the test setup
+    // regressed and we'd see an empty backfill for the wrong reason.
+    let status_cell = fetch_or_phi("State_Machine_is_currently_in_Status", &final_state);
+    let has_orphan_status = status_cell.as_seq().map(|facts| {
+        facts.iter().any(|f| {
+            let pairs = f.as_seq().unwrap_or(&[]);
+            let mut sm: Option<&str> = None;
+            let mut st: Option<&str> = None;
+            for p in pairs.iter() {
+                let kv = match p.as_seq() { Some(kv) => kv, None => continue };
+                if kv.len() != 2 { continue; }
+                let k = match kv[0].as_atom() { Some(k) => k, None => continue };
+                let v = match kv[1].as_atom() { Some(v) => v, None => continue };
+                if k == "State Machine" { sm = Some(v); }
+                if k == "Status"        { st = Some(v); }
+            }
+            sm == Some("t-orphan") && st == Some("completed")
+        })
+    }).unwrap_or(false);
+    assert!(
+        has_orphan_status,
+        "Pre-condition: the orphan State_Machine_is_currently_in_Status row \
+         must still be in the population after forward chain. Got: {:?}",
+        status_cell,
+    );
+
+    // The actual assertion: after backfill, the orphan SM has a
+    // for_Resource row keyed by the same id (State Machine id == Resource id).
+    let for_res_cell = fetch_or_phi("State_Machine_is_for_Resource", &final_state);
+    let backfilled = for_res_cell.as_seq().map(|facts| {
+        facts.iter().any(|f| {
+            let pairs = f.as_seq().unwrap_or(&[]);
+            let mut sm: Option<&str> = None;
+            let mut res: Option<&str> = None;
+            for p in pairs.iter() {
+                let kv = match p.as_seq() { Some(kv) => kv, None => continue };
+                if kv.len() != 2 { continue; }
+                let k = match kv[0].as_atom() { Some(k) => k, None => continue };
+                let v = match kv[1].as_atom() { Some(v) => v, None => continue };
+                if k == "State Machine" { sm = Some(v); }
+                if k == "Resource"      { res = Some(v); }
+            }
+            sm == Some("t-orphan") && res == Some("t-orphan")
+        })
+    }).unwrap_or(false);
+    assert!(
+        backfilled,
+        "task-922-sm-init-projection: the for_Resource backfill derivation \
+         must emit <SM=t-orphan, Resource=t-orphan> when the SM is in \
+         currently_in_Status but missing from for_Resource. Got for_Resource: \
+         {:?}\nAll cells: {:?}",
+        for_res_cell,
+        cells_iter(&final_state).iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+    );
+
+    // Idempotency: a second forward-chain pass must not introduce a
+    // duplicate row for the same Resource. for_Resource has a
+    // "Each Resource has at most one State Machine" UC; the
+    // existing-set subtraction in `compile_sm_for_resource_backfill_for`
+    // is what guards against re-emit. If this test fires duplicate
+    // rows the UC fixpoint would surface a violation in the
+    // production load path.
+    let (final_state_2, _) =
+        crate::evaluate::forward_chain_defs_state(&s1_refs, &final_state);
+    let for_res_2 = fetch_or_phi("State_Machine_is_for_Resource", &final_state_2);
+    let row_count = |cell: &crate::ast::Object| -> usize {
+        cell.as_seq().map(|s| s.iter().filter(|f| {
+            f.as_seq().map(|pairs| pairs.iter().any(|p| {
+                p.as_seq().map(|kv| {
+                    kv.len() == 2
+                        && kv[0].as_atom() == Some("Resource")
+                        && kv[1].as_atom() == Some("t-orphan")
+                }).unwrap_or(false)
+            })).unwrap_or(false)
+        }).count()).unwrap_or(0)
+    };
+    assert_eq!(
+        row_count(&for_res_cell), 1,
+        "task-922-sm-init-projection: exactly one for_Resource row for \
+         t-orphan after the first forward-chain pass — got {}: {:?}",
+        row_count(&for_res_cell), for_res_cell,
+    );
+    assert_eq!(
+        row_count(&for_res_2), 1,
+        "task-922-sm-init-projection: forward chain must be idempotent — \
+         a second pass must not duplicate the backfilled for_Resource row. \
+         Got {} rows for t-orphan: {:?}",
+        row_count(&for_res_2), for_res_2,
+    );
+}
