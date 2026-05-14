@@ -355,6 +355,19 @@ wasm-lower = ["dep:wasm-encoder", "dep:wasmi"]
 # (sha2 was previously gated here but is now an unconditional dep
 # under default-features = false because the cell-AEAD path #659
 # needs HKDF-SHA256 in the no_std kernel + worker builds too.)
+#
+# task-919-https: `rustls` + `rustls-native-certs` + `webpki-roots`
+# are pulled in for the `command::http_post_callback` HTTPS branch.
+# They are declared as ordinary `[dependencies]` (NOT under a feature
+# gate) and selected by a host-only `cfg(...)` target table further
+# down — see `[target."cfg(not(target_arch = \"wasm32\"))".dependencies]`.
+# The rustls ring backend includes C/asm code that can't compile on
+# wasm32-unknown-unknown, which would break the Cloudflare Worker
+# bundle (`std-deps` is part of the `cloudflare` feature set). The
+# target-cfg gate keeps the host CLI + kernel build's HTTPS support
+# while letting the worker skip TLS — the worker reaches outbound
+# HTTPS through the platform `fetch()` shim, not this Rust-side
+# callback hook.
 std-deps = ["dep:serde", "dep:serde_json", "dep:regex", "dep:hmac", "dep:subtle", "dep:flate2", "hashbrown/serde", "arest-foundation/std-deps"]
 # no_std build target — gates every `use std::*` behind a
 # `std`/`no_std` split so the crate can be embedded in bare-metal
@@ -464,8 +477,39 @@ arest-foundation = { path = "../arest-foundation", default-features = false, fea
 
 # getrandom: gated on non-UEFI; emits compile_error! on *-unknown-uefi.
 # Native (Linux/macOS/Windows) host CLI uses the OS-syscall backend.
+#
+# task-919-https: rustls + cert stores join this target table — they
+# back the HTTPS branch of `command::http_post_callback` (Verb→Function
+# callback URI dispatch). The same cfg predicate already filters out
+# the two non-host targets that can't link a Rust TLS stack:
+#   * `target_arch = "wasm32"` — the Cloudflare Worker reaches outbound
+#     HTTPS through the platform `fetch()` shim, not the Rust callback
+#     hook; rustls' ring crypto backend includes asm that won't compile
+#     on wasm32-unknown-unknown.
+#   * `target_os = "uefi"` — the bare-metal kernel build doesn't link
+#     std::net::TcpStream and won't reach this code path.
+# Workers / kernels skip the deps entirely; the `#[cfg(not(feature =
+# "no_std"))]` guard on `http_post_callback` matches the same boundary.
 [target."cfg(all(not(target_os = \"uefi\"), not(target_arch = \"wasm32\")))".dependencies]
 getrandom = "0.2"
+# `default-features = false` drops rustls' default `aws_lc_rs` backend
+# (requires NASM + a C toolchain on Windows) in favour of the pure-Rust
+# `ring` backend, plus `tls12` and `std`. `logging` is left off — the
+# dispatch path already synthesizes a `dispatch:<uri>` alethic violation
+# on TLS failure, no log noise needed.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+# rustls-native-certs: pulls roots from the OS trust store (Windows
+# SChannel, macOS Keychain, /etc/ssl on Linux). Primary cert source —
+# picks up corporate / enterprise CA chains the bundled Mozilla list
+# misses. Pinned at 0.8 to match rustls 0.23 (its `load_native_certs`
+# returns `CertificateDer<'static>` typed for rustls's RootCertStore).
+rustls-native-certs = { version = "0.8" }
+# webpki-roots: Mozilla bundle. Used only when `rustls-native-certs`
+# lookup returns zero roots (no native store / sandboxed runner). Pinned
+# at 0.26 — exposes `TLS_SERVER_ROOTS` as `&[TrustAnchor<'static>]` that
+# rustls 0.23's `RootCertStore::extend()` accepts directly. The 1.x API
+# changed `TrustAnchor` semantics in a non-source-compatible way.
+webpki-roots = { version = "0.26" }
 
 # wasm32 (Cloudflare Worker / browser bundler): getrandom 0.2 emits a
 # compile-time error on wasm32-unknown-unknown unless the `js` feature

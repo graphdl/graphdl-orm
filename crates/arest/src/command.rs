@@ -1342,42 +1342,62 @@ fn lookup_headers_for_function(d: &ast::Object, fn_id: &str) -> Vec<(String, Str
     }).unwrap_or_default()
 }
 
-/// task-919-http: synchronous HTTP/1.1 POST over a TCP socket.
+/// task-919-http / task-919-https: synchronous HTTP/1.1 POST over a TCP
+/// socket, with optional TLS wrap for `https://`.
 ///
 /// Returns `Ok(status_code)` on a successful round-trip (regardless of
 /// 2xx/non-2xx — the caller decides what counts as success), or
-/// `Err(reason)` on network failure: DNS/parse error, connect timeout,
-/// truncated response, or invalid status line. The dispatch hook treats
-/// both `Err(_)` and `Ok(non-2xx)` as a rejected transition, mirroring
-/// the in-process Bottom branch.
+/// `Err(reason)` on network or TLS failure: DNS/parse error, connect
+/// timeout, TLS handshake failure, truncated response, or invalid status
+/// line. The dispatch hook treats both `Err(_)` and `Ok(non-2xx)` as a
+/// rejected transition, mirroring the in-process Bottom branch.
 ///
-/// Pure std — no new dep, no TLS. Suitable for the in-process callback
-/// surface (sandbox + same-host workers); the production-grade HTTP
-/// client over TLS is a follow-up.
+/// task-919-https: `https://` URIs are now accepted. The TLS layer is
+/// pure-Rust rustls + ring (no OpenSSL / native-tls dep), with root
+/// certificates sourced from the OS trust store via `rustls-native-certs`
+/// and a `webpki-roots` fallback when the native store yields zero
+/// anchors. SNI is set from the host portion of the URL; no ALPN — the
+/// remote sees `Connection: close` and pipes back the same HTTP/1.1
+/// shape the cleartext branch uses. The TLS handshake honours the same
+/// 5-second read/write timeout the cleartext branch sets, so a black-
+/// holed handshake can't wedge the dispatch path any longer than the
+/// cleartext one.
 ///
 /// Implementation notes:
-///   * Only `http://` URIs are accepted. `https://` returns Err(…) so
-///     the dispatch hook surfaces an alethic violation rather than
-///     silently falling through (TLS is out of scope here).
+///   * URL parse: scheme branches on `http://` vs `https://`. Default
+///     port 80 / 443. Anything else returns `Err(…)` so the dispatch
+///     hook surfaces an alethic violation rather than silently NOP-ing.
 ///   * Hard 5-second read/write/connect timeout so a hung callback
-///     can't wedge the SM-transition path.
+///     can't wedge the SM-transition path. The TLS handshake inherits
+///     the read/write deadlines via the underlying `TcpStream` (rustls
+///     calls back into the TCP I/O during handshake, so the same
+///     `TimedOut` / `WouldBlock` short-circuit applies).
 ///   * Response body is consumed but discarded — we only need the
 ///     status line. Connection: close ensures the server can short-
 ///     circuit if it wants to.
-#[cfg(not(feature = "no_std"))]
+///   * Target gate: host CLI / kernel std build only. Wasm32 and UEFI
+///     skip this code path — the cloudflare worker reaches outbound
+///     HTTPS through the platform `fetch()` shim, and the bare-metal
+///     kernel doesn't link `std::net::TcpStream`. The same cfg
+///     predicate gates the rustls deps in `Cargo.toml`.
+#[cfg(all(not(feature = "no_std"), not(target_arch = "wasm32"), not(target_os = "uefi")))]
 fn http_post_callback(
     url: &str,
     body: &[u8],
     headers: &[(String, String)],
 ) -> Result<u16, String> {
     use std::io::{Read, Write};
-    use std::net::{TcpStream, ToSocketAddrs};
-    use std::time::Duration;
 
-    // Parse the URL. Accept `http://host[:port][/path]`; reject anything
-    // else so callers get a clear failure rather than a silent NOP.
-    let rest = url.strip_prefix("http://")
-        .ok_or_else(|| format!("only http:// URIs supported, got: {}", url))?;
+    // Parse the URL. Accept `http://host[:port][/path]` or
+    // `https://host[:port][/path]`; reject anything else so callers
+    // get a clear failure rather than a silent NOP.
+    let (use_tls, rest, default_port) = if let Some(r) = url.strip_prefix("https://") {
+        (true, r, 443u16)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (false, r, 80u16)
+    } else {
+        return Err(format!("only http:// or https:// URIs supported, got: {}", url));
+    };
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None    => (rest, "/"),
@@ -1388,21 +1408,14 @@ fn http_post_callback(
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (h, p.parse::<u16>()
             .map_err(|e| format!("bad port in {}: {}", url, e))?),
-        None         => (authority, 80u16),
+        None         => (authority, default_port),
     };
 
-    let timeout = Duration::from_secs(5);
-    let mut stream = TcpStream::connect_timeout(
-        &(host, port).to_socket_addrs()
-            .map_err(|e| format!("resolve {}:{}: {}", host, port, e))?
-            .next()
-            .ok_or_else(|| format!("no address for {}:{}", host, port))?,
-        timeout,
-    ).map_err(|e| format!("connect {}:{}: {}", host, port, e))?;
-    stream.set_read_timeout(Some(timeout))
-        .map_err(|e| format!("set_read_timeout: {}", e))?;
-    stream.set_write_timeout(Some(timeout))
-        .map_err(|e| format!("set_write_timeout: {}", e))?;
+    let mut stream: Box<dyn ReadWrite + Send> = if use_tls {
+        connect_https(host, port, url)?
+    } else {
+        connect_http(host, port)?
+    };
 
     // Build the request line + headers. The body is sent verbatim;
     // Content-Length is derived from the byte slice. Custom headers
@@ -1460,6 +1473,147 @@ fn http_post_callback(
         .parse::<u16>()
         .map_err(|e| format!("bad status code in '{}': {}", status_line, e))?;
     Ok(code)
+}
+
+/// task-919-http: marker trait for the two callback transport flavours.
+/// `http_post_callback` wraps the concrete stream in a `Box<dyn ReadWrite
+/// + Send>` so the write/read body is shared between cleartext TCP and
+/// TLS-over-TCP. The blanket impl below covers any `T: Read + Write +
+/// Send` (plain `TcpStream` and `rustls::StreamOwned<…, TcpStream>`).
+#[cfg(all(not(feature = "no_std"), not(target_arch = "wasm32"), not(target_os = "uefi")))]
+trait ReadWrite: std::io::Read + std::io::Write {}
+#[cfg(all(not(feature = "no_std"), not(target_arch = "wasm32"), not(target_os = "uefi")))]
+impl<T: std::io::Read + std::io::Write> ReadWrite for T {}
+
+/// task-919-http: cleartext TCP connect helper. Returns a boxed
+/// `ReadWrite` so the write/read body in `http_post_callback` is the
+/// same shape regardless of scheme.
+#[cfg(all(not(feature = "no_std"), not(target_arch = "wasm32"), not(target_os = "uefi")))]
+fn connect_http(host: &str, port: u16) -> Result<Box<dyn ReadWrite + Send>, String> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let timeout = Duration::from_secs(5);
+    let stream = TcpStream::connect_timeout(
+        &(host, port).to_socket_addrs()
+            .map_err(|e| format!("resolve {}:{}: {}", host, port, e))?
+            .next()
+            .ok_or_else(|| format!("no address for {}:{}", host, port))?,
+        timeout,
+    ).map_err(|e| format!("connect {}:{}: {}", host, port, e))?;
+    stream.set_read_timeout(Some(timeout))
+        .map_err(|e| format!("set_read_timeout: {}", e))?;
+    stream.set_write_timeout(Some(timeout))
+        .map_err(|e| format!("set_write_timeout: {}", e))?;
+    Ok(Box::new(stream))
+}
+
+/// task-919-https: TLS-wrapped TCP connect helper. Builds a rustls
+/// `ClientConfig` once per call (cheap — root cert load is the only
+/// real work) with a root store populated from `rustls-native-certs`
+/// (OS trust store; picks up corporate / enterprise CA chains).
+/// Falls back to `webpki-roots` (Mozilla bundle) only when the native
+/// lookup yields zero anchors — e.g. a sandboxed runner that wiped
+/// `/etc/ssl/certs`, or a Windows install where the SChannel store
+/// lookup failed.
+///
+/// Returns a `rustls::StreamOwned` that owns both the rustls
+/// `ClientConnection` and the underlying `TcpStream`, so `Box<dyn
+/// ReadWrite + Send>` is valid for the lifetime of the callback. The
+/// TCP read/write timeouts set here propagate into the handshake's
+/// I/O calls — a black-holed handshake errors out at the same
+/// 5 second deadline the cleartext branch uses.
+#[cfg(all(not(feature = "no_std"), not(target_arch = "wasm32"), not(target_os = "uefi")))]
+fn connect_https(host: &str, port: u16, url: &str) -> Result<Box<dyn ReadWrite + Send>, String> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let timeout = Duration::from_secs(5);
+    let tcp = TcpStream::connect_timeout(
+        &(host, port).to_socket_addrs()
+            .map_err(|e| format!("resolve {}:{}: {}", host, port, e))?
+            .next()
+            .ok_or_else(|| format!("no address for {}:{}", host, port))?,
+        timeout,
+    ).map_err(|e| format!("connect {}:{}: {}", host, port, e))?;
+    tcp.set_read_timeout(Some(timeout))
+        .map_err(|e| format!("set_read_timeout: {}", e))?;
+    tcp.set_write_timeout(Some(timeout))
+        .map_err(|e| format!("set_write_timeout: {}", e))?;
+
+    // Root certs: native first (picks up corporate / enterprise CAs),
+    // webpki-roots fallback for sandboxed runners with no native store.
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        // load_native_certs returns `CertificateDer<'static>` already
+        // typed for rustls; add(); ignores rejected ones so a single
+        // bad anchor in the OS store doesn't poison the whole bundle.
+        let _ = roots.add(cert);
+    }
+    if roots.is_empty() {
+        // Fallback: Mozilla CA bundle. webpki-roots 0.26 exposes
+        // `TLS_SERVER_ROOTS` as `&[TrustAnchor<'static>]`; rustls 0.23
+        // accepts that slice directly via `extend()`.
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+    if roots.is_empty() {
+        return Err(format!(
+            "no TLS root certificates available (native + webpki-roots \
+             both empty) — cannot verify {}", url));
+    }
+
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    // SNI = host portion of the URL (no port). rustls requires an
+    // owned `ServerName<'static>` that owns the host string for the
+    // duration of the connection; the constructor accepts a `String`.
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| format!("invalid SNI host {:?}: {}", host, e))?;
+    let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|e| format!("rustls client init for {}: {}", url, e))?;
+
+    // Drive the handshake to completion before returning. rustls'
+    // `StreamOwned::write_all` would do this lazily on first write,
+    // but doing it eagerly here lets us surface a typed handshake
+    // error in `Err(…)` rather than leaking it through the later
+    // `write {}: {}` site (where the dispatch hook would still
+    // synthesize a `dispatch:<uri>` violation, just with a less
+    // specific detail string).
+    let mut tcp_io = tcp;
+    conn.complete_io(&mut tcp_io)
+        .map_err(|e| format!("TLS handshake to {} failed: {}", url, e))?;
+
+    Ok(Box::new(rustls::StreamOwned::new(conn, tcp_io)))
+}
+
+/// task-919-http / task-919-https: wasm32 + UEFI fallback. The cloudflare
+/// worker reaches outbound HTTP / HTTPS through the platform `fetch()`
+/// shim — not this in-Rust callback path — and the kernel UEFI build
+/// doesn't link `std::net::TcpStream`. Compiling out the rustls + TCP
+/// substrate on these targets keeps the worker / kernel bundle slim and
+/// avoids the asm-on-wasm32 ring backend compile failure.
+///
+/// Behaviour parity with the host implementation: the dispatch hook
+/// at the call site (`transition_via_defs`) only checks the return
+/// `Result<u16, String>` and synthesizes a `dispatch:<uri>` alethic
+/// violation on `Err(_)` or non-2xx. Returning a structured "skipped"
+/// error here is observationally identical to a network failure — the
+/// worker / kernel never reaches a callback URI through this surface
+/// anyway, so the violation is a correct outcome.
+#[cfg(any(feature = "no_std", target_arch = "wasm32", target_os = "uefi"))]
+fn http_post_callback(
+    url: &str,
+    _body: &[u8],
+    _headers: &[(String, String)],
+) -> Result<u16, String> {
+    Err(format!(
+        "callback URI dispatch is unavailable on this target \
+         (wasm32 / UEFI / no_std); reach {} via the platform fetch shim",
+        url))
 }
 
 fn transition_via_defs(
@@ -4106,6 +4260,125 @@ Function 'place_verb' has callback URI '{}'.
         assert!(ast::cells_iter(&result.state).is_empty(),
             "rejected transition must emit an empty state delta; got {:?}",
             result.state);
+    }
+
+    /// task-919-https: `https://` URLs no longer hit the
+    /// "only http:// supported" early-out; they route through the
+    /// TLS-wrap branch. The test points at a cleartext-TCP listener
+    /// that accepts the connection but doesn't speak TLS, so the
+    /// rustls handshake fails — which proves the function *attempted*
+    /// the TLS path rather than rejecting the scheme up-front.
+    ///
+    /// Acceptance shape: the error message contains "TLS handshake"
+    /// (the prefix our connect_https helper attaches) AND not "only
+    /// http://" (the pre-task-919-https rejection text).
+    #[test]
+    fn http_post_callback_routes_https_through_tls_handshake() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        // Bind a loopback port we control. The accepting thread reads
+        // a few bytes (the rustls ClientHello) then closes, so the
+        // handshake fails on the response side.
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind a free loopback port");
+        let addr = listener.local_addr().expect("local_addr");
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                sock.set_read_timeout(Some(std::time::Duration::from_secs(2))).ok();
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf); // consume ClientHello bytes
+                // Drop the socket without sending a ServerHello —
+                // rustls surfaces a handshake failure.
+            }
+        });
+
+        let url = format!("https://127.0.0.1:{}/dispatch", addr.port());
+        let result = http_post_callback(&url, b"{}", &[]);
+        let _ = handle.join();
+
+        let err = result.expect_err(
+            "https:// against a non-TLS listener must fail at the handshake");
+        assert!(!err.contains("only http://"),
+            "task-919-https: https:// must no longer be rejected by scheme; \
+             got: {}", err);
+        // The handshake failure goes through our connect_https path
+        // (which prefixes "TLS handshake to … failed"). If we ever
+        // change the error wrapping, this stays anchored on the
+        // *behavior* — that the request did NOT short-circuit on
+        // scheme — via the `!only http://` check above. The TLS-
+        // specific assertion below pins the wrapping.
+        assert!(err.contains("TLS handshake"),
+            "https:// connect failure must surface the TLS handshake \
+             error wrap; got: {}", err);
+    }
+
+    /// task-919-https: a `https://` URL that names a port nothing is
+    /// listening on still routes through the TLS branch — i.e. it
+    /// fails at TCP connect (default port 443 / parsed port), NOT at
+    /// the "only http://" guard. Locks the scheme-dispatch behavior
+    /// independently from any TLS-handshake substrate.
+    #[test]
+    fn http_post_callback_https_unreachable_port_does_not_reject_scheme() {
+        // Reserve a port by binding-and-dropping. After drop the
+        // OS keeps it in TIME_WAIT for the test process, so a new
+        // connect attempt against the same address sees connection
+        // refused (or timeout on some configurations). Either way
+        // the error is from the TCP layer, not the scheme guard.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind a free loopback port");
+        let port = listener.local_addr().expect("local_addr").port();
+        drop(listener);
+
+        let url = format!("https://127.0.0.1:{}/dispatch", port);
+        let result = http_post_callback(&url, b"{}", &[]);
+        let err = result.expect_err(
+            "https:// against an unreachable port must fail");
+        assert!(!err.contains("only http://"),
+            "task-919-https: https:// must not be rejected by scheme; \
+             got: {}", err);
+    }
+
+    /// task-919-https: the unreachable-port behaviour is identical for
+    /// `http://` and `https://` — both pass the scheme guard and both
+    /// fail at the TCP layer. Pin the symmetry so a future regression
+    /// can't tilt one branch back to a scheme rejection.
+    #[test]
+    fn http_post_callback_http_and_https_both_pass_scheme_guard() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind a free loopback port");
+        let port = listener.local_addr().expect("local_addr").port();
+        drop(listener);
+
+        let http_url = format!("http://127.0.0.1:{}/dispatch", port);
+        let https_url = format!("https://127.0.0.1:{}/dispatch", port);
+        let http_err = http_post_callback(&http_url, b"{}", &[])
+            .expect_err("http:// against unreachable port must fail");
+        let https_err = http_post_callback(&https_url, b"{}", &[])
+            .expect_err("https:// against unreachable port must fail");
+        assert!(!http_err.contains("only http://"));
+        assert!(!https_err.contains("only http://"));
+    }
+
+    /// task-919-https: anything that isn't http:// or https:// is
+    /// rejected up-front with a clear error — the dispatch hook
+    /// surfaces the alethic violation, no socket is ever opened.
+    /// Pins the scheme-guard's positive side; the negative side
+    /// (http/https pass) is covered by the three tests above.
+    #[test]
+    fn http_post_callback_rejects_non_http_schemes() {
+        for url in &["ftp://example.com/dispatch",
+                     "file:///tmp/dispatch",
+                     "ws://example.com/dispatch",
+                     "/no/scheme",
+                     ""]
+        {
+            let err = http_post_callback(url, b"{}", &[])
+                .expect_err(&format!("{:?} must be rejected by scheme guard", url));
+            assert!(err.contains("only http:// or https://"),
+                "non-http(s) URL {:?} must hit the scheme guard; got: {}",
+                url, err);
+        }
     }
 
     /// task-737 — acceptance criterion #3. Two `apply create Task`
