@@ -278,6 +278,100 @@ Order has Total.
     );
 }
 
+// ─── Category 5b: Bridge derivation (role-renaming) — task-922 ──────
+//
+// Shape: `* X has B iff Y has A and B is A and X is Y` — a single
+// antecedent rule that RE-KEYS the antecedent fact's bindings into a
+// consequent FT with DIFFERENT role names. The bridge use case is the
+// SM-cell → Task_has_Task_Status carrier (apps/tasks Stage 2): the
+// antecedent reads `Resource is currently in Status` (roles Resource,
+// Status) and the consequent is `Task has Task Status` (roles Task,
+// Task Status). The computed bindings `Task Status is Status` and
+// `Task is Resource` are the renames.
+//
+// Pre-fix (task-922-sql-projection-rolemismatch): the bindings function
+// was `Concat · [Id, computed_pairs]`, so the emitted fact carried 4
+// bindings — `<<Resource, X>, <Status, X>, <Task Status, X>, <Task, X>>`
+// — exceeding the consequent FT's declared arity (2 roles). SQL
+// projection's position-based column mapping was reading values from
+// the WRONG binding slots (`Resource` slot ⇒ `Task` column, `Status`
+// slot ⇒ `Task_Status` column), producing incorrect projection rows
+// and leaving downstream readiness derivations broken.
+//
+// Post-fix: when `consequent_role_literals` is empty but
+// `consequent_computed_bindings` is non-empty AND the consequent FT
+// resolves, build bindings in the consequent FT's declared role order
+// — literal pin → computed binding (via `compile_arith_expr`) →
+// name-based lookup fallback. Emits exactly `arity(cons)` bindings so
+// SQL position-mapping lands every value in its right column.
+
+#[test]
+fn shape_bridge_derivation_emits_fact_with_consequent_ft_arity() {
+    let src = r#"# Test
+Resource(.Reference) is an entity type.
+Reference is a value type.
+Status is a value type.
+Task(.id) is an entity type.
+id is a value type.
+Task Status is a value type.
+
+## Fact Types
+Resource has Reference.
+Resource is currently in Status.
+Task has Task Status.
+
+## Derivation Rules
+* Task has Task Status iff that Resource is currently in some Status and Task Status is Status and Task is Resource.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    // Shape: single antecedent (Resource_is_currently_in_Status);
+    // two computed bindings for the role renames (Task Status is
+    // Status, Task is Resource); no literal pins.
+    match &rule.consequent_cell {
+        ConsequentCellSource::Literal(id) => assert_eq!(id, "Task_has_Task_Status",
+            "consequent must resolve to Task_has_Task_Status, got {}", id),
+        other => panic!("expected Literal(..), got {:?}", other),
+    }
+    assert_eq!(rule.antecedent_sources.len(), 1,
+        "single antecedent expected (the role-rename clauses are computed bindings, \
+         not antecedents), got {:#?}", rule.antecedent_sources);
+    assert!(rule.consequent_role_literals.is_empty(),
+        "no literal pins on the bridge — both bindings are role-rename computed \
+         bindings, got {:#?}", rule.consequent_role_literals);
+    assert_eq!(rule.consequent_computed_bindings.len(), 2,
+        "two computed-binding role renames expected, got {:#?}",
+        rule.consequent_computed_bindings);
+
+    // Evaluate against one antecedent fact and verify the emitted fact
+    // has EXACTLY 2 bindings (the consequent FT's declared arity), not
+    // 4. Pre-fix, this would emit 4 bindings — `<Resource, X>`,
+    // `<Status, X>`, plus the two computed renames — which the SQL
+    // shadow then mis-mapped positionally.
+    let out = apply_to_facts(&func, &[
+        ("Resource_is_currently_in_Status",
+            &[("Resource", "task-1"), ("Status", "in_progress")]),
+    ]);
+    let derived = decode_derived(&out);
+    assert_eq!(derived.len(), 1, "one derived fact expected, got {:#?}", derived);
+    let (ft, _reading, bindings) = &derived[0];
+    assert_eq!(ft, "Task_has_Task_Status",
+        "fact must land in Task_has_Task_Status cell, got {}", ft);
+    assert_eq!(bindings.len(), 2,
+        "consequent FT declares 2 roles (Task, Task Status); the derived fact's \
+         binding count MUST match — got {} bindings: {:#?}",
+        bindings.len(), bindings);
+    // Position 0 must be the Task role (matches consequent FT's declared
+    // role order). Value comes from the antecedent's Resource role per
+    // the `Task is Resource` computed binding.
+    assert_eq!(bindings[0], ("Task".to_string(), "task-1".to_string()),
+        "first binding must be <Task, task-1> in declared role order, got {:?}",
+        bindings[0]);
+    assert_eq!(bindings[1], ("Task Status".to_string(), "in_progress".to_string()),
+        "second binding must be <Task Status, in_progress>, got {:?}",
+        bindings[1]);
+}
+
 // ─── Category 8: Multi-antecedent `and` chain ───────────────────────
 //
 // Shape: `* X has R '<r>' iff X has A and X has B and X has C` —

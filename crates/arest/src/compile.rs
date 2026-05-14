@@ -3840,17 +3840,70 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             //       facts with two `Classification` bindings each round,
             //       spinning forever.
             let bindings_func: Func = if rule.consequent_role_literals.is_empty() {
-                let computed_pairs: Vec<Func> = data.fact_types.get(ft_id)
-                    .map(|ft| rule.consequent_computed_bindings.iter().map(|cb| {
-                        Func::construction(vec![
-                            Func::constant(Object::atom(&cb.role)),
-                            compile_arith_expr(&cb.expr, ft),
-                        ])
-                    }).collect())
+                // task-922 (bridge / role-rename): when computed bindings
+                // are present AND the consequent FT resolves, build
+                // bindings FRESH in the consequent FT's declared role
+                // order — same shape the literal-pin branch below uses.
+                // The antecedent fact's role keys may not match the
+                // consequent FT's (the SM→FT bridge renames `Resource`
+                // → `Task` and `Status` → `Task Status` via the rule's
+                // `Task is Resource` / `Task Status is Status` clauses),
+                // so the pre-task-922 `Concat · [Id, computed_pairs]`
+                // shape emitted facts whose binding count exceeded the
+                // consequent FT's declared arity. SQL position-based
+                // column projection then read values from the wrong
+                // binding slots.
+                //
+                // Per consequent role:
+                //   (1) computed binding for this role → compile_arith
+                //       (RoleRef resolves to the antecedent role idx)
+                //   (2) otherwise → name-based binding lookup on the
+                //       antecedent (the arith-attribute shape where
+                //       e.g. `Order has Subtotal` flows the `Order`
+                //       role through unchanged).
+                let cons_ft_roles = data.fact_types.get(&consequent_id)
+                    .map(|ft| ft.roles.clone())
                     .unwrap_or_default();
-                if computed_pairs.is_empty() {
+                let ant_ft = data.fact_types.get(ft_id);
+                if !rule.consequent_computed_bindings.is_empty() && !cons_ft_roles.is_empty()
+                    && ant_ft.is_some()
+                {
+                    let ant_ft = ant_ft.unwrap();
+                    let pairs: Vec<Func> = cons_ft_roles.iter().map(|r| {
+                        let key = r.noun_name.clone();
+                        let value_func = rule.consequent_computed_bindings.iter()
+                            .find(|cb| cb.role == r.noun_name)
+                            .map(|cb| compile_arith_expr(&cb.expr, ant_ft))
+                            .unwrap_or_else(|| role_value_by_name(&r.noun_name));
+                        Func::construction(vec![
+                            Func::constant(Object::atom(&key)),
+                            value_func,
+                        ])
+                    }).collect();
+                    Func::construction(pairs)
+                } else if rule.consequent_computed_bindings.is_empty() {
+                    // Pure inheritance: antecedent and consequent FTs
+                    // share the same role schema (subtype-membership,
+                    // CWA negation, transitivity, ring-FT positional
+                    // copy). Id flows the antecedent bindings unchanged.
                     Func::Id
                 } else {
+                    // Defensive: consequent FT didn't resolve (synthetic
+                    // cell like `_cwa_negation:<ft_id>` /
+                    // `_transitive_<a>_<b>`) so we can't drive bindings
+                    // off the FT's declared roles. Fall back to the
+                    // pre-task-922 Concat·[Id,computed] shape so
+                    // synthesized-cell behaviour is byte-for-byte
+                    // unchanged. The narrow path above is the load-
+                    // bearing one for user-authored bridge derivations.
+                    let computed_pairs: Vec<Func> = ant_ft
+                        .map(|ft| rule.consequent_computed_bindings.iter().map(|cb| {
+                            Func::construction(vec![
+                                Func::constant(Object::atom(&cb.role)),
+                                compile_arith_expr(&cb.expr, ft),
+                            ])
+                        }).collect())
+                        .unwrap_or_default();
                     Func::compose(
                         Func::Concat,
                         Func::construction(vec![
