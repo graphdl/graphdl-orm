@@ -1423,3 +1423,147 @@ State Machine 'sm-1' is currently in Status 'pending'.
         cells_iter(&final_state).iter().map(|(n, _)| *n).collect::<Vec<_>>(),
     );
 }
+
+// ─── Two-priority cascade comparator workaround (task-814) ──────────
+//
+// The task-814 audit documents that comparator words ('strongest',
+// 'highest', 'max' over a value type) are NOT recognised by
+// `resolve_derivation_rule`'s cascade. The author-side workaround
+// (see `readings/core/derivation.md` "Workaround: 2-level priority
+// cascade with `has no` negation") is to write ONE rule per priority
+// level, each guarded by an `AbsenceOf` clause that suppresses lower
+// values when a higher value was already derived.
+//
+// TWO-LEVEL CASCADE LIMIT: the workaround composes cleanly for TWO
+// priority levels because the forward-chain stratifier
+// (`forward_chain_stratified` in `crates/arest/src/evaluate.rs`) runs
+// only TWO strata — positive then negation-guarded. With a 3+-level
+// cascade, the second + third level both land in stratum 2 and fire
+// in the SAME inner round, so the third level can't observe the
+// second level's emit and the third's `AbsenceOf` guard fails to
+// suppress it. The substrate-user must either accept multi-emit on
+// 3+-level cascades or pre-compute the priority levels into distinct
+// cells the chainer can stratify by reading dependency. (Audit's
+// "Engine gap: multi-level priority cascade is non-stratifiable"
+// section in `readings/core/derivation.md` cites this.)
+//
+// This test pins the TWO-level cascade that DOES work: a Task whose
+// `Readiness` should be 'ready' when its precomputed `Candidate
+// Readiness` cell carries 'ready', otherwise 'blocked'. Each stage-2
+// rule is a 1-positive-antecedent + AbsenceOf shape, handled correctly
+// by `compile_explicit_derivation`'s multi-AbsenceOf branch (#918).
+//
+// Three Tasks exercise the 2-level cascade:
+//   task-1 has candidate readiness {'ready', 'blocked'}
+//     → expected Task Readiness = 'ready' (higher priority candidate)
+//   task-2 has candidate readiness {'blocked'}
+//     → expected Task Readiness = 'blocked' (only candidate)
+//   task-3 has candidate readiness {'ready'}
+//     → expected Task Readiness = 'ready' (only candidate)
+//
+// The forward chain is stratified — positive rules fire first to
+// fixpoint, then `has no` negation-guarded rules suppress weaker
+// values once a stronger one was emitted. `forward_chain_stratified`
+// alternates strata until both pass with zero novel facts so the
+// cascade reaches a unique least fixed point.
+//
+// If this test fails after a parser or compile refactor, the
+// priority-cascade workaround in `readings/core/derivation.md` no
+// longer holds and that doc needs to be revised alongside the
+// engine change.
+
+#[test]
+fn priority_cascaded_readiness_picks_highest_via_no_negation() {
+    use crate::ast::{cells_iter, fetch_or_phi};
+
+    let src = r#"# Priority-cascade workaround (task-814)
+Task(.id) is an entity type.
+
+Task Readiness is a value type.
+Candidate Readiness is a value type.
+
+## Fact Types
+Task has Candidate Readiness.
+Task has Task Readiness.
+
+## Derivation Rules
+* Task has Task Readiness 'ready' iff Task has Candidate Readiness 'ready'.
+* Task has Task Readiness 'blocked' iff Task has Candidate Readiness 'blocked' and Task has no Task Readiness 'ready'.
+
+## Instance Facts
+Task 'task-1' has Candidate Readiness 'ready'.
+Task 'task-1' has Candidate Readiness 'blocked'.
+Task 'task-2' has Candidate Readiness 'blocked'.
+Task 'task-3' has Candidate Readiness 'ready'.
+"#;
+
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    let model = crate::compile::compile(&state);
+
+    // Stratified forward-chain: positive (uses_negation=false) rules to
+    // fixpoint, then `has no` negation-guarded rules. The cascade
+    // requires alternation so 'ready' lands BEFORE 'blocked' gets a
+    // chance to test for its absence.
+    let pos_refs: Vec<(&str, &crate::ast::Func)> = model.derivations.iter()
+        .filter(|d| !d.uses_negation)
+        .map(|d| (d.id.as_str(), &d.func)).collect();
+    let neg_refs: Vec<(&str, &crate::ast::Func)> = model.derivations.iter()
+        .filter(|d| d.uses_negation)
+        .map(|d| (d.id.as_str(), &d.func)).collect();
+    let (final_state, _) = crate::evaluate::forward_chain_stratified(
+        &pos_refs, &neg_refs, &state, 100);
+
+    // Collect (Task, Task Readiness) pairs from the derived cell.
+    let cell = fetch_or_phi("Task_has_Task_Readiness", &final_state);
+    let pairs: Vec<(String, String)> = cell.as_seq().map(|facts| {
+        facts.iter().filter_map(|f| {
+            let pairs = f.as_seq()?;
+            let mut task: Option<String> = None;
+            let mut readiness: Option<String> = None;
+            for p in pairs.iter() {
+                let kv = p.as_seq()?;
+                if kv.len() != 2 { continue; }
+                let k = kv[0].as_atom()?;
+                let v = kv[1].as_atom()?;
+                if k == "Task" { task = Some(v.to_string()); }
+                if k == "Task Readiness" { readiness = Some(v.to_string()); }
+            }
+            Some((task?, readiness?))
+        }).collect()
+    }).unwrap_or_default();
+
+    // task-1: only 'ready' (higher priority); 'blocked' suppressed by
+    // its `has no Task Readiness 'ready'` guard.
+    let t1: Vec<&String> = pairs.iter()
+        .filter(|(t, _)| t == "task-1").map(|(_, r)| r).collect();
+    assert_eq!(t1, vec!["ready"],
+        "task-1 has candidate readiness at both priority levels — \
+         expected ONLY 'ready' (highest), got {:?}.\n\
+         All pairs: {:?}\n\
+         If 'blocked' leaks in, the AbsenceOf negation guard isn't \
+         suppressing the weaker rule and the cascade is broken; \
+         if NOTHING lands, the 1-positive-plus-AbsenceOf path \
+         (compile_explicit_derivation's multi-AbsenceOf branch, #918) \
+         regressed.",
+        t1, pairs);
+
+    // task-2: only 'blocked'; 'ready' doesn't apply.
+    let t2: Vec<&String> = pairs.iter()
+        .filter(|(t, _)| t == "task-2").map(|(_, r)| r).collect();
+    assert_eq!(t2, vec!["blocked"],
+        "task-2 has only 'blocked' candidate — expected ONLY 'blocked' \
+         (highest available), got {:?}.\n\
+         All pairs: {:?}",
+        t2, pairs);
+
+    // task-3: only 'ready' (single candidate at top priority).
+    let t3: Vec<&String> = pairs.iter()
+        .filter(|(t, _)| t == "task-3").map(|(_, r)| r).collect();
+    assert_eq!(t3, vec!["ready"],
+        "task-3 has only 'ready' candidate — expected exactly 'ready', \
+         got {:?}.\n\
+         All pairs: {:?}\n\
+         Final cells: {:?}",
+        t3, pairs,
+        cells_iter(&final_state).iter().map(|(n, _)| *n).collect::<Vec<_>>());
+}

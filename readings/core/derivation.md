@@ -175,3 +175,325 @@ older, looser shape that doesn't address per-FT consequent
 materialisation. The rule above is the operational form #890
 needs — it spells out the consequent FT and Role explicitly so the
 compiler can lift it without guessing.
+
+## Authoring derivation rules: supported antecedent shapes (task-814)
+
+What follows is a catalogue of derivation-rule antecedent shapes the
+parser currently recognises, plus the comparator vocabulary it does
+NOT recognise. Each shape cites the recogniser in
+`crates/arest/src/parse_forml2.rs::resolve_derivation_rule` and the
+forward-chain lower-bound in
+`crates/arest/src/compile.rs::compile_explicit_derivation` (or
+`compile_join_derivation` / `compile_aggregate_derivation` when the
+classifier routes elsewhere). Author against these shapes; rewrite
+unrecognised vocabulary via the priority-cascade pattern at the
+bottom of this section.
+
+### Shapes the parser recognises
+
+1. **Positive FT reference** — `X has Y` resolves to a declared
+   `X has Y` FT and lands as `AntecedentSource::FactType(ft_id)`.
+   This is the default fallthrough at site (1) of the cascade in
+   `resolve_derivation_rule` (search `// (1) Comparator-stripped FT
+   lookup`). Cited as `shape_literal_in_consequent_pins_role_to_atom`
+   in `compile_explicit_derivation_tests.rs`.
+
+2. **Numeric comparator on a role** — `X has Y >= 100` strips to
+   `X has Y` plus an `AntecedentFilter { op: ">=", value: 100 }` via
+   `split_antecedent_comparator` (Halpin FORML Example 5). Operators
+   accepted: `>=`, `<=`, `>`, `<`, `=`, `!=`, `<>` (normalised to
+   `!=`). See `peel_trailing_comparator` in `parse_forml2.rs`.
+
+3. **Word-form numeric comparator** — `X exceeds 100`,
+   `X is greater than Y`, etc. The phrases live in
+   `parse_forml2_stage2::WordComparatorTable` (8 entries: `exceeds`,
+   `is greater than`, `is less than`, `is at least`, `is at most`,
+   `is more than`, `equals`, `is equal to`). Cross-antecedent
+   role-vs-role comparisons (`X1's Y exceeds X2's Y`) lift to
+   `AntecedentRoleComparison` via the pre-pass at site (1) of
+   `resolve_derivation_rule`; the rule is promoted to `Join` kind
+   and routes through `compile_join_derivation`.
+
+4. **Literal pin on a role** — `X has Y 'present'` resolves to the
+   `X has Y` FT plus an `AntecedentRoleLiteral { role: "Y", value:
+   "present" }` (cited as
+   `shape_some_quantifier_with_multi_word_literal_filters_antecedent`).
+   Multi-word literals (`'In Code Only'`) survive intact.
+
+5. **Existential quantifier on a role** — `<consequent> iff some X
+   has Y 'present'`. The ` some ` token is whole-word-stripped by
+   `parse_forml2_stage2::ExistentialQuantifierTable::strip` (see
+   `strip_existential_quantifiers` in `parse_forml2.rs`). What
+   remains (`X has Y 'present'`) parses as shape 4. The single
+   antecedent fans out one derived fact per matching antecedent
+   fact — pinned by
+   `paper_lift_priority_derivation_fires_through_forward_chain`.
+
+6. **Existential-over-join** — `<consequent> iff X concerns some Y
+   that has Z 'present'`. The ` some ` is stripped, then the
+   `that`-relative is expanded by `expand_that_relatives` (using
+   `parse_forml2_stage2::AnaphoraPronounTable`) into the two-clause
+   join `X concerns Y and Y has Z 'present'`. Both clauses must
+   resolve to declared FTs OR the expansion is skipped (see
+   `head_resolves` in `parse_forml2.rs`). Routes through
+   `compile_join_derivation` because two antecedents share the join
+   noun (Y). Pinned by `shape_join_path_via_possessive_expands_and_fires`.
+
+7. **Negation guard** — `X has Y 'value' and X has no Y 'other-value'`
+   adds an `AntecedentSource::AbsenceOf { fact_type, role }`
+   secondary antecedent (see site (1) of `resolve_derivation_rule`,
+   under `// Detect FORML2 negation patterns BEFORE resolving`).
+   Surface markers recognised: ` has no `, ` is not `, ` does not `,
+   leading `no `, leading `not `. The rule is flagged
+   `uses_negation = true` and routes through
+   `forward_chain_stratified`'s stratum-2 pass so the consequent of
+   any positive rule that emits the cell-under-negation lands FIRST.
+   Pinned by `sm_derivation_bridge_lets_readiness_rule_fire_off_projected_status`.
+
+8. **Numeric aggregation** — `X has Count iff Count is the count of Y
+   where X has Y`. The clause shape `<role> is the <op> of <target>
+   where <body>` lifts to `consequent_aggregates`; routes through
+   `compile_aggregate_derivation`. Operators accepted (see
+   `try_parse_aggregate_clause` in `parse_forml2.rs::AGG_OPS`):
+   `count`, `sum`, `avg`, `min`, `max`, `earliest`, `latest`,
+   `first`, `last`. `min` and `max` fold over NUMERIC role values
+   only — they are NOT a comparator over enum-valued nouns.
+
+9. **Arithmetic-definitional binding** — `Volume is Size * Size *
+   Size`. The clause shape `<RoleName> is <expr>` (where RoleName is
+   a declared noun and `<expr>` parses through `parse_arithmetic_expr`
+   over `+ - * /`) populates `consequent_computed_bindings`. Used by
+   `compile_explicit_derivation`'s 1-antecedent path to project a
+   computed value into the consequent fact.
+
+10. **Subtype membership check** — `X is a Y` / `X is an Y` (both X
+    and Y declared nouns) recognised by `is_subtype_instance_check`
+    in `parse_forml2.rs`. Doesn't emit an antecedent source — the
+    subtype relationship is structural and handled by the metamodel
+    rule earlier in this file.
+
+11. **Temporal predicate** — `now is in the past`, `… in the past`,
+    `… in the future` recognised by `TemporalPredicateTable`.
+    Runtime clock checks; no FT resolution.
+
+### Comparator vocabulary the parser does NOT recognise (task-814)
+
+The following words are surfaced in user readings (Halpin §6
+"sentence-level comparison") but do NOT lift to any
+`AntecedentRoleComparison` or aggregate operator today. A rule whose
+antecedent contains any of these falls through every classifier in
+`resolve_derivation_rule` and lands as an unresolved clause (the
+parser emits an `UnresolvedClause` fact; the rule itself stays in
+the schema with whatever positive FT antecedents survived):
+
+* `strongest` / `weakest`
+* `highest` / `lowest` (only the aggregate forms with
+  `is the highest of` / `is the lowest of` work — and only over
+  numeric roles)
+* `best` / `worst`
+* `most` / `least` (without `at`)
+* `top` / `bottom`
+* Any superlative adjective specific to a value-type's domain
+  (`fastest`, `cheapest`, `safest`, `most recent`)
+
+The chainer treats these as opaque tokens — the rule body's FT
+references that DO resolve still emit derivations, and the
+unrecognised comparator clause is silently dropped via the
+`unresolved_clauses` channel. The behaviour the user observes is
+"attribute inheritance from the last bound antecedent fact": the
+remaining positive antecedents fire, the consequent inherits
+bindings from the last antecedent that carries the consequent's
+role, and the rule appears to ignore the comparator clause entirely.
+
+Author rules that need an ordering / superlative semantic via the
+priority-cascade pattern below.
+
+### Workaround: 2-level priority cascade with `has no` negation
+
+When a target value type has TWO priority levels and the candidate
+input is in a SINGLE-FT cell (not an existential-over-join), encode
+each priority level as its own derivation rule guarded by an
+`AbsenceOf` clause that ensures no higher-priority value was derived
+first. Example for a Task whose Readiness should be 'ready' when its
+precomputed Candidate Readiness cell carries 'ready', otherwise
+'blocked':
+
+```
+Task(.id) is an entity type.
+Task Readiness is a value type.
+Candidate Readiness is a value type.
+
+## Fact Types
+Task has Candidate Readiness.
+Task has Task Readiness.
+
+## Derivation Rules
+* Task has Task Readiness 'ready' iff Task has Candidate Readiness 'ready'.
+* Task has Task Readiness 'blocked' iff Task has Candidate Readiness 'blocked' and Task has no Task Readiness 'ready'.
+```
+
+Stage-1 (positive) rules emit `ready` whenever its precondition is
+met; stage-2 (negation-guarded) rules then emit `blocked` ONLY for
+Tasks that don't already have `ready`. The stratified chainer
+(`forward_chain_stratified` in `crates/arest/src/evaluate.rs`)
+alternates the two strata until both pass with zero novel facts, so
+the priority cascade reaches a unique least fixed point.
+
+Pinned by
+`priority_cascaded_readiness_picks_highest_via_no_negation` in
+`crates/arest/src/compile_explicit_derivation_tests.rs`.
+
+### Engine gaps task-814 surfaced (DO NOT use these shapes)
+
+The audit at task-814 attempted to extend the 2-level cascade to
+THREE priority levels via the existential-over-join shape
+`* Merge has X 'value' iff Merge concerns some Commit that has X 'value'`
+and found three independent engine gaps that make the natural shape
+NOT work end-to-end. Each gap is a follow-up task; see citations
+below.
+
+1. **Existential-over-join globally collapses to first-fact bindings.**
+   The shape `* X has Y 'lit' iff X concerns some Z that has Y 'lit'`
+   parses to a 2-antecedent ModusPonens rule (`join_on=[]` because
+   the `that`-relative is consumed by `expand_that_relatives` rather
+   than appearing as a `that <Noun>` token at antecedent split). It
+   routes to `compile_explicit_derivation`'s multi-antecedent
+   existence-check fallback (`crates/arest/src/compile.rs:4508-4566`)
+   which fires ONCE GLOBALLY whenever every antecedent has any
+   surviving fact — and projects bindings from the FIRST fact of
+   antecedent 0, not from a per-X fanout. Result: only one
+   consequent fact lands, with whatever X value happened to come
+   first in `Merge_concerns_Commit`.
+
+2. **`compile_join_derivation` drops `consequent_role_literals`.**
+   Authoring `* X has Y 'lit' iff X concerns some Z and that Z has Y 'lit'`
+   forces `kind = Join` (the `and that Z has …` form preserves the
+   join-key marker), which routes to `compile_join_derivation`. That
+   function builds binding_parts by walking consequent role names
+   and looking them up in antecedent FTs
+   (`crates/arest/src/compile.rs:4818-4824`); roles like `Posture
+   Witness` that exist ONLY on the consequent FT are silently
+   dropped. The literal pin via `rule.consequent_role_literals` is
+   NEVER applied. Result: derived facts have the right subject
+   binding but NO value binding — the cell ends up populated with
+   `<<Merge, m>>` tuples missing the priority literal.
+
+3. **`compile_join_derivation` drops `AbsenceOf` antecedents.**
+   When a Join-classified rule carries an AbsenceOf guard, the join
+   pipeline indexes fact_extractors by FT id and AbsenceOf returns
+   `""` for `fact_type_id()`. The extract collapses to an empty
+   fact list, the iterative join with an empty antecedent yields
+   ∅, and the rule produces zero consequent facts. (#918's fix
+   targeted only `compile_explicit_derivation`'s implicit-equi-join
+   branch.)
+
+4. **`forward_chain_stratified` is 2-stratum only.**
+   With 3+ priority levels, the second + third level rules both
+   land in stratum 2 and fire within the SAME inner round —
+   neither sees the other's emit. The third level's
+   `has no Y 'middle'` guard evaluates against a state where
+   middle-priority value is still empty, so the third level fires
+   spuriously alongside the second level. To support 3+-level
+   cascades the engine would need dependency-aware stratification
+   (every rule reading negation of cell C lands in a stratum
+   STRICTLY LATER than every rule writing to C).
+
+### Substrate-user workaround for the "strongest of collection" pattern
+
+Until the four gaps above are addressed, encode the
+"strongest-X-among-related-Y" semantics in TWO substrate steps:
+
+* **Step 1: precompute the candidate cell as instance facts (or via
+  a SQL view that materialises them).** For each X, emit one
+  `<X, candidate-value>` fact per related Y whose value contributes.
+  The candidate cell carries one fact per X×Y combination, NOT a
+  reduction.
+
+* **Step 2: run a 2-level priority cascade on the precomputed
+  candidate cell** (per the working pattern above). The cascade
+  reads from the candidate cell (which has no internal join), so
+  it routes through `compile_explicit_derivation`'s 1-positive-
+  antecedent + AbsenceOf path (#918) — the only path that handles
+  the workaround shape correctly.
+
+For more than 2 priority levels, split into MULTIPLE 2-level
+cascades, each writing to a distinct cell, and add a final stratum-1
+projection rule that selects the highest non-empty intermediate
+cell. Each pair of intermediate rules can then stratify cleanly
+within the existing 2-stratum chainer because each AbsenceOf reads
+a distinct cell from what the rule writes.
+
+### Why the comparator gap isn't trivial to close
+
+A faithful `strongest Security Posture among Commits the Merge
+concerns` lowering would need:
+
+1. **Ordering metadata on the value type.** Today
+   `EnumValues` in the grammar cell carries enum members in
+   declaration order. The order IS semantic for stratification
+   purposes (the priority cascade above relies on the author
+   listing strongest-first), but the parser does not promote
+   declaration order into an ordering fact. A
+   `Security Posture has Strength` ordering FT would have to be
+   author-declared (per #890's "explicit metamodel rule" pattern)
+   before the engine could pick a winner by ordering.
+
+2. **A new aggregate operator over ordering.** Codd image-set
+   aggregates (`compile_aggregate_derivation`) fold pairs via a
+   binary `op`, which works for sum/min/max over numbers because
+   `Func::Add` / `Func::Lt` / `Func::Gt` evaluate on raw atoms.
+   For a `strongest` operator over `Security Posture`, the binary
+   op would need to look up each candidate's ordering position
+   in the ordering FT — a non-primitive `Func` that doesn't
+   compose from the current set.
+
+3. **OR: a per-value priority-cascade synthesiser.** A new lift
+   in `compile.rs` could read a `Security Posture has Strength`
+   ordering FT and SYNTHESISE the N rules of the cascade above
+   in `O(N)` of value types — same recipe as
+   `compile_subtype_inheritance_metamodel`. The author's source
+   reading stays the natural-language comparator form;
+   compilation expands it.
+
+The audit at task-814 settled on option (b): document the
+workaround now, defer the synthesiser to a follow-up task once a
+second use site (besides Merge's Security Posture) materialises.
+
+### Audit anchor — files cited above
+
+* `crates/arest/src/parse_forml2.rs::resolve_derivation_rule` —
+  central antecedent classifier (cascade sites (1)–(12)).
+* `crates/arest/src/parse_forml2.rs::try_parse_aggregate_clause` —
+  accepted aggregate ops list (`AGG_OPS` const).
+* `crates/arest/src/parse_forml2.rs::strip_existential_quantifiers`
+  / `expand_that_relatives` — the existential and `that`-anaphora
+  pre-processors that drive shapes 5 and 6.
+* `crates/arest/src/parse_forml2.rs:1932-1947` — `is_join`
+  classifier; the noun-shared-in-2+-antecedent test that promotes
+  a rule to `kind = Join`.
+* `crates/arest/src/parse_forml2_stage2.rs::WordComparatorTable` —
+  the 8 word-form numeric comparators (#783 lift).
+* `crates/arest/src/parse_forml2_stage2.rs::ExistentialQuantifierTable`
+  — the ` some ` / ` that ` quantifier-strip vocabulary (#883 lift).
+* `crates/arest/src/parse_forml2_stage2.rs::AnaphoraPronounTable`
+  — the ` that ` anaphora marker (#882 lift); drives the
+  relative-clause expansion in `expand_that_relatives`.
+* `crates/arest/src/compile.rs::compile_explicit_derivation` —
+  1-antecedent fanout, `AbsenceOf` guard handling.
+* `crates/arest/src/compile.rs:3785-3919` — multi-AbsenceOf branch
+  for n-positive + n-negation (#918); the ONLY path that honors
+  AbsenceOf guards mixed with positive antecedents.
+* `crates/arest/src/compile.rs:4508-4566` — multi-antecedent
+  existence-check fallback; emits ONCE globally with first-fact
+  bindings (the source of gap #1).
+* `crates/arest/src/compile.rs::compile_join_derivation` —
+  2+-antecedent equi-join (path used by `kind = Join`). Drops
+  `consequent_role_literals` (gap #2) and AbsenceOf antecedents
+  (gap #3).
+* `crates/arest/src/compile.rs::compile_aggregate_derivation` —
+  Codd image-set fold over numeric role values.
+* `crates/arest/src/evaluate.rs::forward_chain_stratified` —
+  alternating positive / negation-guarded rounds (2-stratum only;
+  gap #4 is the 3+-level limit).
+* `crates/arest/src/compile_explicit_derivation_tests.rs::priority_cascaded_readiness_picks_highest_via_no_negation`
+  — the working 2-level priority cascade pin.
