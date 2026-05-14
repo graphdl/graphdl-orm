@@ -255,7 +255,7 @@ describe('EntityDB engine round-trip — chain-as-version-of-record (#769)', () 
   //       value) across both writes — the chain doesn't extend, but
   //       it doesn't lie about its head either.
 
-  it('2. monotonic chain growth (vitest gap: pins SQL fallback consistency under failed apply)', async () => {
+  it('2. monotonic chain growth (vitest gap: pins in-memory cell graph consistency under failed apply)', async () => {
     const ctx = createMockCtx('Order:ord-rt-2')
     const db = makeEntityDB(ctx)
     const cellName = ctx.id.toString()
@@ -277,9 +277,11 @@ describe('EntityDB engine round-trip — chain-as-version-of-record (#769)', () 
     // (#767 / S1e + #768) is what AEAD round-trip closure depends on.
     expect(callCellPin(handle, cellName) ?? 0).toBe(v2)
 
-    // SQL-fallback is updated — both writes landed.
-    const sqlCell = await db.get()
-    expect(sqlCell?.data.total).toBe('11')
+    // In-memory cell graph reflects both writes (post-#885 / #887 the
+    // engine-only read path consults this cache when the engine apply
+    // panics on vitest's wasm32 SystemTime gap — no SQL fallback).
+    const cell = await db.get()
+    expect(cell?.data.total).toBe('11')
   }, COMPILE_TIMEOUT_MS)
 
   // ── (3) AEAD replay defence under chain-as-version-of-record ──────
@@ -625,21 +627,23 @@ describe('EntityDB engine round-trip — chain-as-version-of-record (#769)', () 
   //
   // #803 contract (b): EntityDB.get IMMEDIATELY after EntityDB.put
   // must return the just-written value through the engine-routed
-  // read path (`fetchCellSealedViaEngine` / `callFetchCell` →
-  // sealed-SQL fallback). No stale SQL read may surface a pre-write
-  // value, and no version-skew between seal-side and open-side AAD
-  // may surface a CellAeadError.
+  // read path (`fetchCellViaEngine` / `callFetchCell` → in-memory
+  // cell graph cache; no SQL fallback per #885 / #887). No stale SQL
+  // read may surface a pre-write value, and no version-skew between
+  // seal-side and open-side AAD may surface a CellAeadError.
   //
   // Worker-side observation:
   //   The engine apply throws under vitest (file header §), but the
-  //   SQL sealed write still lands and the read decrypts via the
-  //   sealed-SQL fallback path of `fetchCellSealedViaEngine`. The
-  //   crucial #803 invariant is that the read returns the merged
-  //   payload from the write — proving the engine-routed READ helper
-  //   does not regress to a stale snapshot when the write helper's
-  //   engine apply throws. (If a SQL-shadow counter incremented on
-  //   the write but not on the read, the AEAD AAD `version` field
-  //   would diverge and `cellOpen` would fail with kind='auth'.)
+  //   in-memory cell graph still receives the merged-input post-state
+  //   via EntityDB.put's catch arm. The read consults the engine
+  //   first (`callFetchCell` returns ⊥) and then the in-memory cell
+  //   graph (which has the just-written cell). The crucial #803
+  //   invariant is that the read returns the merged payload from the
+  //   write — proving the engine-routed READ helper does not regress
+  //   to a stale snapshot when the write helper's engine apply throws.
+  //   (If a SQL-shadow counter incremented on the write but not on
+  //   the read, the AEAD AAD `version` field would diverge and
+  //   `cellOpen` would fail with kind='auth'.)
   //
   // Under live workers: chain extends, fetch_cell returns the engine
   // payload, no SQL touched — same `cell.data` round-trip closure

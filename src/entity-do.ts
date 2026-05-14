@@ -1079,40 +1079,24 @@ export class EntityDB extends DurableObject {
     | { ok: false; kind: 'truncated' | 'auth' }
   > {
     this.ensureInit()
-    // Hydrate the per-DO engine FIRST so:
-    //   - the AAD `version` field can be sourced from `cell_pin`
-    //     (#767/S1e) — matching whatever the sealing path used to
-    //     mint the AAD,
-    //   - the cell-contents read can route through
-    //     `system(h, "fetch_cell", name)` (#765) for engine-resident
-    //     cells, with the SQL row as the fallback (which rotation
-    //     ALWAYS still requires for the sealed bytes column —
-    //     engine returns plaintext contents, but rotation needs the
-    //     raw AEAD envelope to decrypt+re-encrypt under the new
-    //     master). The engine probe is the read-pattern bookend per
-    //     #765's contract; in practice rotation cells are always in
-    //     the (c) class (engine-silent rewrites) so the probe
-    //     surfaces `⊥` and the SQL row is authoritative anyway.
+    // Hydrate the per-DO engine FIRST so the AAD `version` field can
+    // be sourced from `cell_pin` (#767/S1e) — matching whatever the
+    // sealing path used to mint the AAD. Rotation is an engine-silent
+    // key swap on the SQL `cell` row's sealed bytes; the engine chain
+    // is NOT extended (see "Engine-silent by design" below) so
+    // `cell_pin` reports the same version_id the original seal bound
+    // into its AAD.
+    //
+    // Note: rotation is the ONLY surviving SQL `cell` read in this
+    // file post-#885. The productive read/write path (EntityDB.get /
+    // put) is engine-only. Rotation still needs the SQL row because
+    // the engine surface returns the cell's plaintext contents
+    // (post-thaw), not the raw AEAD envelope that rotation must
+    // decrypt+re-encrypt under the new master. A future
+    // key-rotation-safe apply verb could collapse this last SQL
+    // touchpoint; until then, rotation is the documented exception
+    // to "engine-only IO".
     await this.hydrateEngine()
-    const cellName = this.ctx.id.toString()
-    // Engine-first probe per #765 read-pattern contract. Even when
-    // the probe returns non-null (e.g. a future surface registers an
-    // entity-id cell), rotation MUST still read the SQL row — the
-    // engine returns plaintext cell contents but rotation needs the
-    // SEALED bytes (data column) and the persisted version stamp
-    // (version column) to decrypt+re-encrypt under the new master.
-    // In practice rotation cells are always class (c) (engine-silent
-    // rewrites preserved per the task brief), so the probe surfaces
-    // `⊥` and the SQL row is authoritative. The probe stays wired
-    // so the moment a sibling task adds an engine surface for the
-    // sealed envelope (or the rotated bytes start landing in the
-    // chain through a key-rotation-safe apply), we can collapse the
-    // SQL fallback.
-    if (this.engineHandle >= 0) {
-      // Result intentionally discarded — informational probe only.
-      // Keeps the call-site shape uniform with `EntityDB.get`/`put`.
-      callFetchCell(this.engineHandle, cellName)
-    }
     const rows = this.ctx.storage.sql
       .exec(`SELECT id, type, data FROM cell`)
       .toArray()

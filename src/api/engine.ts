@@ -112,23 +112,23 @@ export function callCellPin(handle: number, cellName: string): number | null {
  * "fetch_cell", name)` that maps the engine's bottom marker to `null`
  * and parses the JSON envelope into a JS value.
  *
+ * ## Engine-only contract (#885 / #777 / #887)
+ *
  * Worker EntityDB read paths (#765) use this helper to source the
- * cell's contents from the engine's authoritative chain instead of
- * the per-DO SQLite sidecar — keeping the host's per-cell storage
- * from drifting from the engine's true storage version. When the
- * engine returns `null` (legacy cell that pre-dates the engine
- * apply path, or rotated bytes that engine-silent rotation
- * preserved), callers MUST fall back to the legacy SQL SELECT so
- * existing-cell envelopes still open during the migration window
- * before #768 drops the `cell.version` SQL column.
+ * cell's contents from the engine's authoritative chain. As of #885
+ * the worker is engine-only — the chain IS the version-of-record per
+ * AREST.tex §202, §462 eq:cellfold, and there is NO SQL fallback for
+ * the productive read path. Callers that observe `null` here route to
+ * the worker's in-memory cell graph cache (the read-after-write
+ * source within an isolate), not to a SQL SELECT.
  *
  * Returns `null` (NOT throw) when:
  *   - `handle` is out of range / not allocated (engine returns "⊥")
  *   - the named cell has no chain entry (engine returns "⊥")
  *   - the engine reply is not parseable JSON (defensive — the engine
  *     contract is `to_json_string`, but we keep the helper total so a
- *     malformed envelope fans out to the SQL fallback path rather
- *     than throwing into the DO method that called us)
+ *     malformed envelope surfaces as a clean null to the caller
+ *     rather than throwing into the DO method that called us)
  */
 export function callFetchCell(handle: number, cellName: string): unknown | null {
   ensureWasm()
@@ -140,9 +140,9 @@ export function callFetchCell(handle: number, cellName: string): unknown | null 
     // Defensive: the engine's `fetch_cell` always returns JSON via
     // `to_json_string` (atoms wrap as JSON strings, Maps as objects,
     // Seqs as arrays), but a malformed reply must not crash the
-    // calling DO method. Returning `null` routes the caller to its
-    // SQL fallback path — same recovery shape the legacy / un-chained
-    // cells already exercise.
+    // calling DO method. Returning `null` surfaces the failure as a
+    // miss; the caller (post-#885 engine-only path) consults its
+    // in-memory cell graph cache.
     return null
   }
 }

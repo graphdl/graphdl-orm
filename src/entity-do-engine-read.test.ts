@@ -1,13 +1,14 @@
 /**
- * EntityDB engine-routed cell reads (#765, #721-followup-b)
+ * EntityDB engine-routed cell reads (#765, #721-followup-b, #887)
  *
  * #764 stood up the per-DO engine handle + freeze/thaw lifecycle.
  * #766 wired the productive cell-write path (`EntityDB.put`) through
  * the engine's `apply` system verb. #767 sourced CellAddress's AAD
- * `version` field from the engine's `cell_pin`. #765 closes the
+ * `version` field from the engine's `cell_pin`. #765 closed the
  * read-side bookend: cell reads route through `system(h, "fetch_cell",
- * name)` (engine prereq commit 11fdc47c) with SQL fallback for cells
- * the engine does not yet know about.
+ * name)` (engine prereq commit 11fdc47c). #885 collapsed the worker
+ * to engine-only IO, and #887 dropped the residual SQL-fallback
+ * contract clauses from `callFetchCell` + its callers.
  *
  * The chain-as-version-of-record contract (AREST.tex §202, §462
  * eq:cellfold) requires that BOTH writes AND reads talk to the engine
@@ -18,11 +19,12 @@
  *      directly (mocked here because today's engine stores facts
  *      under fact-type cells, not under entity-id; the WIRE
  *      contract is what we assert).
- *   2. Class (b) legacy cells: `callFetchCell` returns null (⊥) →
- *      SQL fallback opens the legacy plaintext / sealed row.
- *   3. Class (c) `rotateMaster`-rewritten cells: same fallback path
- *      as (b) — engine-silent rotation preserves chain version.
- *   4. Missing cells: read returns null gracefully (no throw) on
+ *   2. Engine-only null: `callFetchCell` returning null (⊥) yields
+ *      a null result from `fetchCellViaEngine` — there is NO SQL
+ *      fallback (post-#885 / #887). The worker's in-memory cell
+ *      graph at `EntityDB.get` provides the read-after-write closure
+ *      within an isolate.
+ *   3. Missing cells: read returns null gracefully (no throw) on
  *      both engine-bound and engine-unbound paths.
  *
  * The wiring lands so the moment a sibling task adds an engine
@@ -135,12 +137,12 @@ function makeEntityDB(ctx: MockCtx, env: Record<string, unknown> = {}): EntityDB
   // `AREST_ALLOW_PLAINTEXT=1` opt-in throws on the first `db.put` /
   // `db.get`. The #765 cases below predate that hardening and were
   // written against the legacy plaintext-default path; they pin the
-  // engine-routed read wiring (engine-payload preference, SQL
-  // fallback for class (b)/(c) legacy cells, missing-cell ⊥
-  // graceful-null), NOT the AEAD AAD agreement contract (that's the
-  // #803 sealed-path case in the round-trip suite, and the
-  // sealed-cell SQL fallback test below explicitly constructs its own
-  // master via `deriveTenantMasterKey` instead of going through
+  // engine-routed read wiring (engine-payload preference, engine-only
+  // null contract per #885/#887, missing-cell ⊥ graceful-null), NOT
+  // the AEAD AAD agreement contract (that's the #803 sealed-path
+  // case in the round-trip suite, and the sealed-cell engine-only
+  // test below explicitly constructs its own master via
+  // `deriveTenantMasterKey` instead of going through
   // EntityDB.getMaster). Default the env to the dev opt-in so the
   // read-path wiring contracts these tests pin remain observable
   // through the plaintext branch — mirrors the #803 (commit
@@ -176,13 +178,12 @@ describe('EntityDB engine-routed cell reads (#765)', () => {
   //
   // Write a cell via the engine apply path (#766's `EntityDB.put`),
   // then read via the engine path. Today's engine stores facts under
-  // fact-type cells (Order_has_total) not entity-id cells, so the
-  // engine-fetch returns null and the SQL fallback fires — the
-  // round-trip works through the fallback. The brief allows this:
-  //   "the SQL fallback... MUST stay live for as long as legacy cells
-  //    exist in production storage."
-  // The wiring is what we assert; the data-path resolution may shift
-  // when the engine grows entity-cell semantics.
+  // fact-type cells (Order_has_total) not entity-id cells, so
+  // `callFetchCell` typically returns null and the worker's in-memory
+  // cell graph (populated by the engine apply response) closes the
+  // read-after-write within an isolate (post-#885 / #887: no SQL
+  // fallback). The wiring is what we assert; the data-path resolution
+  // may shift when the engine grows entity-cell semantics.
 
   it('round-trips a cell written via EntityDB.put through the engine-routed read', async () => {
     await db.put({ id: 'ord-1', type: 'Order', data: { total: '99', status: 'open' } })
