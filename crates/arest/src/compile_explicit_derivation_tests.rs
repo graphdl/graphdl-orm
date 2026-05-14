@@ -2436,3 +2436,122 @@ State Machine 't-orphan' is currently in Status 'completed'.
         row_count(&for_res_2), for_res_2,
     );
 }
+
+// ─── Category 18: Existential-over-join fans out per X (#814) ───────
+//
+// Shape: `* X has Y 'lit' iff X concerns some Z that has Y 'lit'.`
+//
+// After parsing, `that` is consumed by `expand_that_relatives` into a
+// 2-antecedent rule shape:
+//
+//   antecedent 0: X concerns Z
+//   antecedent 1: Z has Y
+//
+// The join key is Z (the existential variable bound by `some`), NOT a
+// role of the consequent. The consequent's roles are {X, Y}; Z appears
+// in both antecedents but is invisible to the consequent.
+//
+// Before the fix, `compile_explicit_derivation`'s multi-antecedent
+// path computed `join_roles` as `cons_roles ∩ ant0_roles ∩ ant1_roles`
+// — which for this shape is `{X, Y} ∩ {X, Z} ∩ {Z, Y}` = ∅. So it fell
+// through to the existence-check fallback at compile.rs:4026, which
+// fires ONCE GLOBALLY on existence of facts in both antecedents and
+// emits ONE consequent fact using bindings from antecedent 0's first
+// fact — silently dropping every other qualifying X.
+//
+// The fix: when join detection finds no role-of-consequent join key,
+// look for an EXISTENTIAL join key — a role shared between two or more
+// antecedents that doesn't appear in the consequent (here, Z). When
+// found, fanout per binding of antecedent 0 just like the consequent-
+// role-joined branch does, with the existential equality gate carried
+// across to the other antecedent(s).
+//
+// Acceptance: 3 X's each with their own qualifying Z → 3 derived
+// consequents (one per X), not 1.
+#[test]
+fn shape_existential_over_join_fans_out_per_x() {
+    let src = r#"# Existential-over-join test (#814)
+Feature(.Key) is an entity type.
+Product(.Key) is an entity type.
+Key is a value type.
+Status is a value type.
+
+## Fact Types
+Feature has Key.
+Product has Key.
+Feature has Status.
+Product has Status.
+Feature concerns Product.
+
+## Derivation Rules
+* Feature has Status 'critical' iff Feature concerns some Product that has Status 'critical'.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    // Parse shape: 2 antecedents (X concerns Z, Z has Y 'lit'). The
+    // `that` is consumed by expand_that_relatives — so `join_on` is
+    // empty and the rule routes through compile_explicit_derivation's
+    // multi-antecedent path, not compile_join_derivation.
+    assert_eq!(rule.antecedent_sources.len(), 2,
+        "expected 2 antecedents (Feature concerns Product; Product has Status), got {:#?}",
+        rule.antecedent_sources);
+
+    // Consequent: Feature has Status 'critical', pinned via
+    // consequent_role_literals.
+    match &rule.consequent_cell {
+        ConsequentCellSource::Literal(_) => {}
+        other => panic!("expected Literal consequent, got {:?}", other),
+    }
+    assert!(
+        rule.consequent_role_literals.iter()
+            .any(|l| l.role == "Status" && l.value == "critical"),
+        "expected consequent literal Status='critical', got {:#?}",
+        rule.consequent_role_literals);
+
+    // Population: 3 Features, each concerning a different Product
+    // that has Status='critical'. Plus one Feature concerning a
+    // non-critical Product (must NOT derive).
+    let out = apply_to_facts(&func, &[
+        ("Feature_concerns_Product", &[("Feature", "f-a"), ("Product", "p-a")]),
+        ("Feature_concerns_Product", &[("Feature", "f-b"), ("Product", "p-b")]),
+        ("Feature_concerns_Product", &[("Feature", "f-c"), ("Product", "p-c")]),
+        ("Feature_concerns_Product", &[("Feature", "f-d"), ("Product", "p-d")]),
+        ("Product_has_Status", &[("Product", "p-a"), ("Status", "critical")]),
+        ("Product_has_Status", &[("Product", "p-b"), ("Status", "critical")]),
+        ("Product_has_Status", &[("Product", "p-c"), ("Status", "critical")]),
+        ("Product_has_Status", &[("Product", "p-d"), ("Status", "minor")]),
+    ]);
+    let derived = decode_derived(&out);
+
+    // Collect the Feature bindings of every derived fact.
+    let critical_features: Vec<String> = derived.iter()
+        .flat_map(|(_, _, b)| b.iter())
+        .filter(|(k, _)| k == "Feature")
+        .map(|(_, v)| v.clone())
+        .collect();
+
+    // Per-X fanout: f-a, f-b, f-c must EACH derive a consequent.
+    // Pre-fix behavior emits ONE fact globally using antecedent 0's
+    // first fact's bindings (so this would be 1, not 3).
+    assert!(critical_features.iter().any(|f| f == "f-a"),
+        "f-a must derive (concerns p-a/critical); got Feature-bindings {:?}\n\
+         full derived: {:#?}", critical_features, derived);
+    assert!(critical_features.iter().any(|f| f == "f-b"),
+        "f-b must derive (concerns p-b/critical); got Feature-bindings {:?}\n\
+         full derived: {:#?}", critical_features, derived);
+    assert!(critical_features.iter().any(|f| f == "f-c"),
+        "f-c must derive (concerns p-c/critical); got Feature-bindings {:?}\n\
+         full derived: {:#?}", critical_features, derived);
+
+    // f-d (concerns p-d/minor) must NOT derive — its Product's Status
+    // doesn't match the existential's literal filter.
+    assert!(!critical_features.iter().any(|f| f == "f-d"),
+        "f-d must NOT derive (concerns p-d/minor, fails Status='critical' filter);\n\
+         got Feature-bindings {:?}\nfull derived: {:#?}", critical_features, derived);
+
+    // The strict per-X count: exactly 3 qualifying Features.
+    assert_eq!(critical_features.len(), 3,
+        "expected exactly 3 derived consequents (one per qualifying Feature),\n\
+         got {} with Feature-bindings {:?}\nfull derived: {:#?}",
+        critical_features.len(), critical_features, derived);
+}
