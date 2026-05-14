@@ -414,6 +414,151 @@ fn make_violation_func(id: &str, text: &str, detail: Func) -> Func {
     ])
 }
 
+// ─── task-898: violation message template registry ──────────────────
+//
+// Per-constraint violation messages live in readings/core/validation.md
+// as `Constraint Kind 'X' has Violation Template 'Tpl'` instance facts.
+// The compiler reads them at compile time via `from_cell_index(data)`,
+// looks up the kind code (UC, MC, IR, …), and feeds the template
+// through `compile_detail_from_template` with a per-kind resolver that
+// supplies the Funcs for each `{placeholder}` site. Sweep-1 item #15;
+// see #772 for the parent dispatch-to-data discipline.
+
+/// `(kind_code, template_string)` rows, one per
+/// `Constraint Kind has Violation Template` instance fact.
+#[derive(Debug, Clone)]
+pub struct ConstraintViolationTemplateTable {
+    pub rows: Vec<(String, String)>,
+}
+
+impl ConstraintViolationTemplateTable {
+    /// Boot table — must stay in sync with `Constraint Kind has
+    /// Violation Template` instance facts in
+    /// `readings/core/validation.md`. Templates carry `{placeholder}`
+    /// substitution markers; the compiler's per-kind resolver maps
+    /// each name to the runtime Func that emits the value.
+    pub fn boot() -> Self {
+        ConstraintViolationTemplateTable {
+            rows: alloc::vec![
+                ("IR".to_string(),
+                 "Irreflexive violation: {value} references itself".to_string()),
+                ("AS".to_string(),
+                 "Asymmetric violation: {x} relates to {y} and vice versa".to_string()),
+                ("SY".to_string(),
+                 "Symmetric violation: {x} relates to {y} but not the reverse".to_string()),
+                ("AT".to_string(),
+                 "Antisymmetric violation: {x} and {y} relate to each other but are not the same".to_string()),
+                ("IT".to_string(),
+                 "Intransitive violation: {x} relates to {y} relates to {z} but shortcut also exists".to_string()),
+                ("TR".to_string(),
+                 "Transitive violation: {x} relates to {y} relates to {z} but shortcut is missing".to_string()),
+                ("AC".to_string(),
+                 "Acyclic violation: cycle detected through {value}".to_string()),
+                ("RF".to_string(),
+                 "Reflexive violation: {value} does not reference itself".to_string()),
+                ("UC".to_string(),
+                 "Uniqueness violation: {noun} {value} is not unique in {reading}".to_string()),
+                ("MC".to_string(),
+                 "Mandatory violation: {noun} {value} does not participate in {reading}".to_string()),
+                ("FC".to_string(),
+                 "Frequency violation: {noun} {value} in {reading} expected {range}".to_string()),
+                ("VC".to_string(),
+                 "Value constraint violation: {noun} {value} is not in {valid_set}".to_string()),
+                ("XO".to_string(),
+                 "Set-comparison violation: {entity} {value} expected {requirement} of {clause_count} clause fact types".to_string()),
+                ("XC".to_string(),
+                 "Set-comparison violation: {entity} {value} expected {requirement} of {clause_count} clause fact types".to_string()),
+                ("OR".to_string(),
+                 "Set-comparison violation: {entity} {value} expected {requirement} of {clause_count} clause fact types".to_string()),
+                ("SS".to_string(),
+                 "Subset violation: {pairs} participates in {a_ft} but not in {b_ft}".to_string()),
+                ("EQ".to_string(),
+                 "Equality violation: {pairs} in {a_ft} but not in {b_ft}".to_string()),
+                ("DF_pop".to_string(),
+                 "Forbidden fact present in {primary_ft}".to_string()),
+                ("DF_cwa".to_string(),
+                 "Response contains forbidden {noun} {value}".to_string()),
+                ("DF_owa".to_string(),
+                 "Response may violate: {text}".to_string()),
+                ("DO_pop".to_string(),
+                 "Obligation violated in {primary_ft}".to_string()),
+                ("DO_obl".to_string(),
+                 "Response missing obligatory {noun}".to_string()),
+                ("DO_sender".to_string(),
+                 "Response missing obligatory SenderIdentity".to_string()),
+            ],
+        }
+    }
+
+    /// Build the table from the `general_instance_facts` cell. Reads
+    /// `Constraint Kind '<code>' has Violation Template '<template>'`
+    /// instance facts. Falls back to `boot()` when no templates are
+    /// declared so synthetic-call paths (tests that build a
+    /// `CellIndex` directly without loading validation.md) still
+    /// compile constraints with the same byte-equal detail strings.
+    pub fn from_cell_index(data: &CellIndex) -> Self {
+        let rows: Vec<(String, String)> = data.general_instance_facts.iter()
+            .filter(|f| f.subject_noun == "Constraint Kind"
+                     && f.object_noun == "Violation Template")
+            .map(|f| (f.subject_value.clone(), f.object_value.clone()))
+            .collect();
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            ConstraintViolationTemplateTable { rows }
+        }
+    }
+
+    /// Lookup by Constraint Kind code (`UC`, `MC`, …). Returns the
+    /// template string declared for that kind, or `None` when absent.
+    pub fn template_for(&self, kind: &str) -> Option<&str> {
+        self.rows.iter()
+            .find(|(k, _)| k == kind)
+            .map(|(_, t)| t.as_str())
+    }
+}
+
+/// Walk a `{placeholder}`-parameterized violation template into a
+/// `Func::construction` of atom segments + resolver-supplied Funcs.
+/// Each `{name}` site invokes `resolver(name)` and splats the
+/// resulting `Vec<Func>` into the parent construction so multi-segment
+/// substitutions (SS/EQ `{pairs}`, multi-span UC `{value}`) inline
+/// cleanly. Whitespace around literals is trimmed so consecutive
+/// placeholders separated by a single space don't emit an empty atom.
+pub fn compile_detail_from_template<F>(template: &str, mut resolver: F) -> Func
+where
+    F: FnMut(&str) -> Vec<Func>,
+{
+    let mut parts: Vec<Func> = Vec::new();
+    let mut rest = template;
+    loop {
+        match rest.find('{') {
+            Some(open) => {
+                let lit = rest[..open].trim();
+                if !lit.is_empty() {
+                    parts.push(Func::constant(Object::atom(lit)));
+                }
+                let close_rel = rest[open..].find('}').unwrap_or(rest.len() - open);
+                let close = open + close_rel;
+                let name = &rest[open + 1..close];
+                parts.extend(resolver(name));
+                if close + 1 >= rest.len() {
+                    break;
+                }
+                rest = &rest[close + 1..];
+            }
+            None => {
+                let lit = rest.trim();
+                if !lit.is_empty() {
+                    parts.push(Func::constant(Object::atom(lit)));
+                }
+                break;
+            }
+        }
+    }
+    Func::construction(parts)
+}
+
 /// MC4b (#751): build a Func that takes a fact (a `<<key, val>, ...>`
 /// binding seq) and returns T iff the fact's `role` value matches the
 /// predicate. Used by `Func::filter` in the deontic-population path to

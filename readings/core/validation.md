@@ -53,6 +53,72 @@ If Derivation Rule 1 depends on Derivation Rule 2, then Derivation Rule 2 does n
 
 It is obligatory that each variable in a Derivation Rule consequent appears in at least one antecedent of that Derivation Rule.
 
+## Constraint Violation Templates (#898)
+
+Violation Template is a value type.
+
+Constraint Kind has Violation Template.
+  Each Constraint Kind has at most one Violation Template.
+
+### Placeholders
+
+Each template carries one or more `{name}` substitution markers. The
+per-kind resolver in `compile.rs` maps each name to a `Vec<Func>`
+that runtime-evaluates to the atoms inserted at that position:
+
+- `{value}` — the offending role value (single-role kinds: IR, AC,
+  RF), via `role_value(0)` or the role index of the constrained
+  span's single role.
+- `{x}`, `{y}`, `{z}` — role values for binary / ternary ring chains
+  (AS, SY, AT, IT, TR). `{x}` is role 0 of the first fact, `{y}` is
+  role 1 (and the second-fact role 0 for chains), `{z}` is role 1
+  of the second fact.
+- `{noun}` — the constrained noun's declared name, as a string atom.
+- `{reading}` — the constrained fact type's reading string.
+- `{range}` — the frequency constraint's `exactly N` / `between M
+  and N` / `at least N` phrase. Resolver builds the phrase from the
+  constraint's `min_occurrence` / `max_occurrence` at compile time.
+- `{valid_set}` — value-constraint's allowed-value set, joined as
+  `{A, B, C}` (curly braces in the substituted atom, not in the
+  template).
+- `{entity}`, `{requirement}`, `{clause_count}` — set-comparison
+  values: the entity noun being scoped over, the kind's English
+  requirement (`exactly one` / `at most one` / `at least one`), and
+  the clause-fact-type count.
+- `{a_ft}`, `{b_ft}` — subset / equality fact-type IDs (left and
+  right side of the directional subset check).
+- `{pairs}` — subset / equality multi-segment placeholder: expands
+  to one `<noun, value>` pair per common-noun join column.
+
+### Templates
+
+Constraint Kind 'IR' has Violation Template 'Irreflexive violation: {value} references itself'.
+Constraint Kind 'AS' has Violation Template 'Asymmetric violation: {x} relates to {y} and vice versa'.
+Constraint Kind 'SY' has Violation Template 'Symmetric violation: {x} relates to {y} but not the reverse'.
+Constraint Kind 'AT' has Violation Template 'Antisymmetric violation: {x} and {y} relate to each other but are not the same'.
+Constraint Kind 'IT' has Violation Template 'Intransitive violation: {x} relates to {y} relates to {z} but shortcut also exists'.
+Constraint Kind 'TR' has Violation Template 'Transitive violation: {x} relates to {y} relates to {z} but shortcut is missing'.
+Constraint Kind 'AC' has Violation Template 'Acyclic violation: cycle detected through {value}'.
+Constraint Kind 'RF' has Violation Template 'Reflexive violation: {value} does not reference itself'.
+Constraint Kind 'UC' has Violation Template 'Uniqueness violation: {noun} {value} is not unique in {reading}'.
+Constraint Kind 'MC' has Violation Template 'Mandatory violation: {noun} {value} does not participate in {reading}'.
+Constraint Kind 'FC' has Violation Template 'Frequency violation: {noun} {value} in {reading} expected {range}'.
+Constraint Kind 'VC' has Violation Template 'Value constraint violation: {noun} {value} is not in {valid_set}'.
+Constraint Kind 'XO' has Violation Template 'Set-comparison violation: {entity} {value} expected {requirement} of {clause_count} clause fact types'.
+Constraint Kind 'XC' has Violation Template 'Set-comparison violation: {entity} {value} expected {requirement} of {clause_count} clause fact types'.
+Constraint Kind 'OR' has Violation Template 'Set-comparison violation: {entity} {value} expected {requirement} of {clause_count} clause fact types'.
+Constraint Kind 'SS' has Violation Template 'Subset violation: {pairs} participates in {a_ft} but not in {b_ft}'.
+Constraint Kind 'EQ' has Violation Template 'Equality violation: {pairs} in {a_ft} but not in {b_ft}'.
+
+### Deontic-path templates
+
+Constraint Kind 'DF_pop' has Violation Template 'Forbidden fact present in {primary_ft}'.
+Constraint Kind 'DF_cwa' has Violation Template 'Response contains forbidden {noun} {value}'.
+Constraint Kind 'DF_owa' has Violation Template 'Response may violate: {text}'.
+Constraint Kind 'DO_pop' has Violation Template 'Obligation violated in {primary_ft}'.
+Constraint Kind 'DO_obl' has Violation Template 'Response missing obligatory {noun}'.
+Constraint Kind 'DO_sender' has Violation Template 'Response missing obligatory SenderIdentity'.
+
 ## Instance Facts
 
 Domain 'validation' has Access 'public'.
