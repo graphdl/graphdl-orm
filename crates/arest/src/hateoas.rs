@@ -359,11 +359,19 @@ pub fn handle_arest_transition(
     path: &str,
     body: &[u8],
 ) -> Option<(Object, Vec<u8>)> {
-    if method != "POST" {
+    // Clickable HATEOAS: GET fires non-destructive transitions, DELETE
+    // fires deletes, POST stays available for bulk-style command
+    // submission. Method shape ↔ event source:
+    //   GET / DELETE → event read from `?event=` query string
+    //   POST         → event read from JSON body (legacy contract)
+    if method != "GET" && method != "DELETE" && method != "POST" {
         return None;
     }
-    let stripped = path.split('?').next().unwrap_or(path);
-    let inner = stripped.strip_prefix("/arest/entities/")?.trim_end_matches('/');
+    let (path_part, query_part) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
+    let inner = path_part.strip_prefix("/arest/entities/")?.trim_end_matches('/');
     let inner = inner.strip_suffix("/transition")?.trim_end_matches('/');
     if inner.is_empty() {
         return None;
@@ -397,12 +405,29 @@ pub fn handle_arest_transition(
             .or_else(|| crate::naming::resolve_slug_to_noun(state, &slug_decoded))?
     };
 
-    // Body shape mirror of router.ts:620 — `{event, domain?}`.
-    let parsed = crate::json_min::parse(body)?;
-    let event = parsed.get("event").and_then(|v| v.as_str())?;
-    if event.is_empty() {
-        return None;
-    }
+    // Event source depends on method:
+    //   POST  → JSON body `{event, domain?}` (legacy / bulk path,
+    //           mirror of router.ts:620)
+    //   GET   → `?event=<url-encoded>` query string (clickable HATEOAS;
+    //           the producer at command.rs::hateoas_via_rho embeds the
+    //           event so a browser can follow the link directly)
+    //   DELETE → same query-string shape as GET; reserved for
+    //           transitions whose target status is `deleted`
+    let event_owned: String;
+    let event: &str = if method == "POST" {
+        let parsed = crate::json_min::parse(body)?;
+        let raw = parsed.get("event").and_then(|v| v.as_str())?;
+        if raw.is_empty() { return None; }
+        event_owned = raw.to_string();
+        event_owned.as_str()
+    } else {
+        let qs = query_part?;
+        let pair = qs.split('&').find(|p| p.starts_with("event="))?;
+        let raw = pair.strip_prefix("event=")?;
+        if raw.is_empty() { return None; }
+        event_owned = percent_decode(raw);
+        event_owned.as_str()
+    };
 
     // Walk State Machine cell to find the row whose Resource binding
     // matches `id`. We need both the row (to update) and its index
@@ -1028,17 +1053,60 @@ mod tests {
     }
 
     #[test]
-    fn transition_rejects_non_post() {
+    fn transition_accepts_get_with_event_query_param() {
+        // Clickable HATEOAS: a GET with the event in the query string
+        // fires the transition the same way a POST with a JSON body does.
+        // Body is ignored on GET; the source of truth is `?event=`.
+        let s = state_with_sr_state_machine("sr-1");
+        let result = handle_arest_transition(
+            &s, "GET",
+            "/arest/entities/support-requests/sr-1/transition?event=categorize",
+            b"",
+        );
+        assert!(result.is_some(), "GET with ?event=… must fire the transition");
+    }
+
+    #[test]
+    fn transition_accepts_delete_with_event_query_param() {
+        // DELETE is reserved for transitions whose target status is
+        // `deleted` — but the handler itself doesn't gate on target,
+        // only on the (current_status, event) tuple. The producer at
+        // hateoas_via_rho is the one that emits DELETE only for
+        // `to == "deleted"`; the handler accepts the method shape and
+        // dispatches the same way as GET.
+        let s = state_with_sr_state_machine("sr-1");
+        let result = handle_arest_transition(
+            &s, "DELETE",
+            "/arest/entities/support-requests/sr-1/transition?event=categorize",
+            b"",
+        );
+        assert!(result.is_some(), "DELETE with ?event=… must fire the transition");
+    }
+
+    #[test]
+    fn transition_rejects_unsupported_method() {
         let s = state_with_sr_state_machine("sr-1");
         let body = br#"{"event":"categorize"}"#;
         assert!(handle_arest_transition(
-            &s, "GET", "/arest/entities/SupportRequest/sr-1/transition", body
+            &s, "PUT", "/arest/entities/SupportRequest/sr-1/transition", body
         )
-        .is_none());
+        .is_none(), "PUT is not a transition method");
         assert!(handle_arest_transition(
-            &s, "DELETE", "/arest/entities/SupportRequest/sr-1/transition", body
+            &s, "PATCH", "/arest/entities/SupportRequest/sr-1/transition", body
         )
-        .is_none());
+        .is_none(), "PATCH is not a transition method");
+    }
+
+    #[test]
+    fn transition_get_rejects_missing_query_event() {
+        let s = state_with_sr_state_machine("sr-1");
+        // GET without `?event=` — no body fallback, must reject.
+        let result = handle_arest_transition(
+            &s, "GET",
+            "/arest/entities/SupportRequest/sr-1/transition",
+            b"",
+        );
+        assert!(result.is_none(), "GET without ?event= must reject");
     }
 
     #[test]

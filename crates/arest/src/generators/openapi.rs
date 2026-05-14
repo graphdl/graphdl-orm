@@ -424,7 +424,7 @@ fn links_schema() -> serde_json::Value {
                     "properties": {
                         "event": { "type": "string" },
                         "href":  { "type": "string", "format": "uri-reference" },
-                        "method": { "type": "string", "enum": ["POST"] },
+                        "method": { "type": "string", "enum": ["GET", "DELETE", "POST"] },
                     },
                     "required": ["event", "href", "method"],
                 },

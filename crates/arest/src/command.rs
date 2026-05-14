@@ -2640,9 +2640,20 @@ fn hateoas_via_rho(
             let _from = items.get(0)?.as_atom()?;
             let to = items.get(1)?.as_atom()?.to_string();
             let event = items.get(2)?.as_atom()?.to_string();
+            // HATEOAS links are clickable: GET for every non-destructive
+            // transition, DELETE only when the target status is "deleted".
+            // POST stays reserved for bulk / out-of-band command paths.
+            // Event is embedded in the URL as a query param so the link
+            // is self-contained — a browser can follow it without
+            // synthesising a JSON body.
+            let method = if to == "deleted" { "DELETE" } else { "GET" };
+            let event_encoded = event.replace(' ', "%20");
             Some(TransitionAction {
-                event, target_status: to, method: "POST".to_string(),
-                href: format!("/api/entities/{}/{}/transition", encoded, entity_id),
+                event, target_status: to, method: method.to_string(),
+                href: format!(
+                    "/api/entities/{}/{}/transition?event={}",
+                    encoded, entity_id, event_encoded,
+                ),
             })
         }).collect()
     }).unwrap_or_default()

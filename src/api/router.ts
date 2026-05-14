@@ -747,17 +747,33 @@ router.get('/api/entities/:noun/:id/transitions', async (request, env: Env) => {
   })
 })
 
-// POST fire a transition event — AREST command
-router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
-  const noun = decodeURIComponent(request.params.noun); const id = decodeURIComponent(request.params.id)
-  const body = await request.json() as { event: string; domain?: string }
-  if (!body.event) return error(400, { errors: [{ message: 'event required' }] })
+// Fire a transition event — AREST command. Bound to POST / GET / DELETE
+// so HATEOAS links emitted by the engine (clickable shape with the event
+// in the URL query string, see `command.rs::hateoas_via_rho`) round-trip
+// directly:
+//   POST   → JSON body `{ event, domain? }` (legacy / bulk command path)
+//   GET    → `?event=<url-encoded>` query string (non-destructive
+//            transitions; clickable in a browser)
+//   DELETE → same query-string shape; reserved for transitions whose
+//            target status is `deleted`
+//
+// All three paths share the same engine dispatch — they only differ in
+// where the `event` string is read from.
+const runTransition = async (
+  request: any, env: Env, event: string, domainOverride?: string,
+) => {
+  const noun = decodeURIComponent(request.params.noun)
+  const id = decodeURIComponent(request.params.id)
+  if (!event) return error(400, { errors: [{ message: 'event required' }] })
 
   const entityDO = getEntityDO(env, id) as any
   const entity = await entityDO.get()
   if (!entity) return error(404, { errors: [{ message: 'Not Found' }] })
 
-  const domainSlug = body.domain || entity.data?._domain as string || entity.data?.domain as string || ''
+  const domainSlug = domainOverride
+    || entity.data?._domain as string
+    || entity.data?.domain as string
+    || ''
   const registry = getRegistryDO(env, 'global') as any
   const getStub = (eid: string) => getEntityDO(env, eid) as any
 
@@ -792,7 +808,7 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
   const cmd = {
     type: 'transition' as const,
     entityId: id,
-    event: body.event,
+    event,
     currentStatus,
     domain: domainSlug,
   }
@@ -804,7 +820,7 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
 
   if (!arestResult.status) {
     return error(400, { errors: [{
-      message: `Invalid transition: event '${body.event}' not available from status '${currentStatus}'`,
+      message: `Invalid transition: event '${event}' not available from status '${currentStatus}'`,
     }] })
   }
 
@@ -822,10 +838,25 @@ router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
     noun,
     previousStatus: currentStatus,
     status: arestResult.status,
-    event: body.event,
+    event,
     transitions: arestResult.transitions,
   })
+}
+
+router.post('/api/entities/:noun/:id/transition', async (request, env: Env) => {
+  const body = await request.json() as { event: string; domain?: string }
+  return runTransition(request, env, body.event, body.domain)
 })
+
+const transitionFromQuery = async (request: any, env: Env) => {
+  const url = new URL(request.url)
+  const event = url.searchParams.get('event') || ''
+  const domain = url.searchParams.get('domain') || undefined
+  return runTransition(request, env, event, domain)
+}
+
+router.get('/api/entities/:noun/:id/transition', transitionFromQuery)
+router.delete('/api/entities/:noun/:id/transition', transitionFromQuery)
 
 // ── Entity queries (fan-out via pure handlers) ───────────────────────
 // POST /api/entities/:noun — create entity through engine (#699 / Audit T1).
