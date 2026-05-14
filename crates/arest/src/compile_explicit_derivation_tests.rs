@@ -1202,3 +1202,224 @@ Transition 'ship' is triggered by Fact Type 'Order_was_shipped'.
     // The rooted set MUST contain Draft for that gate to ever fire;
     // the assertion above is the load-bearing one.
 }
+
+// ─── SM cell → Task_has_Task_Status bridge (task-860) ───────────────
+//
+// After task-742 renamed the SM cells to FORML2-verbalized form
+// (`State_Machine_is_currently_in_Status` with roles `State Machine`
+// and `Status`; `State_Machine_is_for_Resource` with roles `State
+// Machine` and `Resource`), apps/tasks/readings/app.md migrated the
+// canonical Task status onto the SM cell. Legacy readers — the
+// readiness derivation and queries against `Task_has_Task_Status` —
+// still expect that FT cell to be populated. task-860 adds derivation
+// rules in app.md that bridge the two: they re-project the SM cell's
+// (Resource, Status) tuples into Task_has_Task_Status.
+//
+// The bridge is two stages because FORML2 join derivations don't carry
+// computed bindings through the consequent (the join compiler only
+// projects nouns that appear as roles in the antecedent FTs — see
+// `compile.rs::compile_join_derivation::binding_parts`). Stage 1 joins
+// the two SM cells on State Machine into the metamodel-declared
+// `Resource is currently in Status` cell (roles match exactly).
+// Stage 2 is a 1-antecedent ModusPonens rule that uses computed
+// bindings (`Task is Resource`, `Task Status is Status`) to re-key
+// the projected fact into Task_has_Task_Status's role schema —
+// `compile_explicit_derivation`'s 1-antecedent path DOES honor
+// `consequent_computed_bindings`.
+//
+//   * Resource is currently in Status iff some State Machine is for
+//     that Resource and that State Machine is currently in that Status.
+//   * Task has Task Status iff that Resource is currently in some
+//     Status and Task Status is Status and Task is Resource.
+//
+// `State Machine is for Resource` and `Resource is currently in Status`
+// are both declared in readings/core/instances.md. `State Machine is
+// currently in Status` matches the post-task-742 cell name and is
+// declared in app.md so the catalog resolves the rule's antecedent
+// (its FT id `State_Machine_is_currently_in_Status` lines up with
+// `crates/arest/src/command.rs::StateMachineCellShape::boot()`'s
+// `cell_name` constant).
+//
+// This self-contained test mirrors the app.md rule shape: it declares
+// the FTs, populates the SM cells directly with one Task entity at
+// status 'pending', and asserts the bridge rules land
+// (Task=t-1, Task Status=pending) in `Task_has_Task_Status` after
+// forward-chain.
+
+#[test]
+fn sm_derivation_bridge_projects_currently_in_status_into_task_has_task_status() {
+    use crate::ast::{cells_iter, fetch_or_phi};
+
+    // Self-contained reading: declare the Task entity (subtype of
+    // Resource so role-based lookups treat Task ids as Resource
+    // values), the SM-cell-shape FTs matching the post-task-742 cell
+    // names, and both bridge derivation rules. The instance facts
+    // populate the SM cells directly via the SM cell's natural FT
+    // readings so the test doesn't depend on the SM-init derivation
+    // firing — we want to test the bridge in isolation.
+    let src = r#"# Bridge test (task-860)
+Task(.id) is an entity type.
+State Machine(.id) is an entity type.
+Resource(.Reference) is an entity type.
+
+Task is a subtype of Resource.
+
+Task Status is a value type.
+Status is a value type.
+
+## Fact Types
+Task has Task Status.
+Resource is currently in Status.
+State Machine is for Resource.
+State Machine is currently in Status.
+
+## Derivation Rules
+* Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.
+* Task has Task Status iff that Resource is currently in some Status and Task Status is Status and Task is Resource.
+
+## Instance Facts
+State Machine 'sm-1' is for Resource 't-1'.
+State Machine 'sm-1' is currently in Status 'pending'.
+"#;
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    let model = crate::compile::compile(&state);
+    let derivation_refs: Vec<(&str, &crate::ast::Func)> =
+        model.derivations.iter().map(|d| (d.id.as_str(), &d.func)).collect();
+    let (final_state, _derived) =
+        crate::evaluate::forward_chain_defs_state(&derivation_refs, &state);
+
+    // Collect (Task, Task Status) pairs from the cell.
+    let cell = fetch_or_phi("Task_has_Task_Status", &final_state);
+    let pairs: Vec<(String, String)> = cell.as_seq().map(|facts| {
+        facts.iter().filter_map(|f| {
+            let pairs = f.as_seq()?;
+            let mut task: Option<String> = None;
+            let mut status: Option<String> = None;
+            for p in pairs.iter() {
+                let kv = p.as_seq()?;
+                if kv.len() != 2 { continue; }
+                let k = kv[0].as_atom()?;
+                let v = kv[1].as_atom()?;
+                if k == "Task" { task = Some(v.to_string()); }
+                if k == "Task Status" { status = Some(v.to_string()); }
+            }
+            Some((task?, status?))
+        }).collect()
+    }).unwrap_or_default();
+
+    assert!(
+        pairs.iter().any(|(t, s)| t == "t-1" && s == "pending"),
+        "task-860 bridge: Task_has_Task_Status must contain (Task=t-1, Task Status=pending)\n\
+         derived from State_Machine_is_for_Resource('sm-1','t-1') × \
+         State_Machine_is_currently_in_Status('sm-1','pending') via the \
+         Resource_is_currently_in_Status intermediate.\n\
+         Got pairs: {:?}\nfinal cells: {:?}",
+        pairs,
+        cells_iter(&final_state).iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+    );
+}
+
+// task-860 acceptance criterion 2: the bridge rule's projection
+// into `Task_has_Task_Status` must continue to satisfy the existing
+// readiness derivation (`Task has Task Readiness 'ready' iff Task
+// has Task Status 'pending' and Task has no Task Readiness
+// 'blocked'`) — readiness lands `ready` for pending+unblocked Tasks
+// whose status is sourced from the SM cell.
+
+#[test]
+fn sm_derivation_bridge_lets_readiness_rule_fire_off_projected_status() {
+    use crate::ast::{cells_iter, fetch_or_phi};
+
+    let src = r#"# Bridge + readiness test (task-860)
+Task(.id) is an entity type.
+State Machine(.id) is an entity type.
+Resource(.Reference) is an entity type.
+
+Task is a subtype of Resource.
+
+Task Status is a value type.
+Status is a value type.
+Task Readiness is a value type.
+
+## Fact Types
+Task has Task Status.
+Task has Task Readiness.
+Resource is currently in Status.
+State Machine is for Resource.
+State Machine is currently in Status.
+
+## Derivation Rules
+* Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.
+* Task has Task Status iff that Resource is currently in some Status and Task Status is Status and Task is Resource.
+* Task has Task Readiness 'ready' iff Task has Task Status 'pending' and Task has no Task Readiness 'blocked'.
+
+## Instance Facts
+State Machine 'sm-1' is for Resource 't-1'.
+State Machine 'sm-1' is currently in Status 'pending'.
+"#;
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    let model = crate::compile::compile(&state);
+
+    // Stratified forward-chain: positive rules to fixpoint, then
+    // negation-guarded rules (the readiness rule's `Task has no Task
+    // Readiness 'blocked'` antecedent makes it stratum-2). Mirrors
+    // the order cli/entry.rs uses.
+    let pos_refs: Vec<(&str, &crate::ast::Func)> = model.derivations.iter()
+        .filter(|d| !d.uses_negation)
+        .map(|d| (d.id.as_str(), &d.func)).collect();
+    let neg_refs: Vec<(&str, &crate::ast::Func)> = model.derivations.iter()
+        .filter(|d| d.uses_negation)
+        .map(|d| (d.id.as_str(), &d.func)).collect();
+    let (final_state, _) = crate::evaluate::forward_chain_stratified(
+        &pos_refs, &neg_refs, &state, 100);
+
+    // Acceptance 1: Task_has_Task_Status has (Task=t-1, Task Status=pending).
+    let status_cell = fetch_or_phi("Task_has_Task_Status", &final_state);
+    let has_pending = status_cell.as_seq().map(|facts| {
+        facts.iter().any(|f| {
+            let pairs = f.as_seq().unwrap_or(&[]);
+            let mut task: Option<&str> = None;
+            let mut status: Option<&str> = None;
+            for p in pairs.iter() {
+                let kv = match p.as_seq() { Some(kv) => kv, None => continue };
+                if kv.len() != 2 { continue; }
+                let k = match kv[0].as_atom() { Some(k) => k, None => continue };
+                let v = match kv[1].as_atom() { Some(v) => v, None => continue };
+                if k == "Task" { task = Some(v); }
+                if k == "Task Status" { status = Some(v); }
+            }
+            task == Some("t-1") && status == Some("pending")
+        })
+    }).unwrap_or(false);
+    assert!(has_pending,
+        "task-860: Task_has_Task_Status must contain (t-1, pending) — bridge \
+         from SM cells. Got: {:?}", status_cell);
+
+    // Acceptance 2: readiness rule fires — t-1 is pending + has no
+    // 'blocked' readiness, so Task_has_Task_Readiness contains
+    // (Task=t-1, Task Readiness=ready).
+    let readiness_cell = fetch_or_phi("Task_has_Task_Readiness", &final_state);
+    let is_ready = readiness_cell.as_seq().map(|facts| {
+        facts.iter().any(|f| {
+            let pairs = f.as_seq().unwrap_or(&[]);
+            let mut task: Option<&str> = None;
+            let mut readiness: Option<&str> = None;
+            for p in pairs.iter() {
+                let kv = match p.as_seq() { Some(kv) => kv, None => continue };
+                if kv.len() != 2 { continue; }
+                let k = match kv[0].as_atom() { Some(k) => k, None => continue };
+                let v = match kv[1].as_atom() { Some(v) => v, None => continue };
+                if k == "Task" { task = Some(v); }
+                if k == "Task Readiness" { readiness = Some(v); }
+            }
+            task == Some("t-1") && readiness == Some("ready")
+        })
+    }).unwrap_or(false);
+    assert!(is_ready,
+        "task-860: readiness rule must fire — Task t-1 is pending (per the \
+         bridge) and has no 'blocked' readiness, so Task_has_Task_Readiness \
+         must contain (t-1, ready). Got readiness cell: {:?}\nfinal cells: {:?}",
+        readiness_cell,
+        cells_iter(&final_state).iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+    );
+}

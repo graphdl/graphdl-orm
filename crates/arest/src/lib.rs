@@ -5414,6 +5414,26 @@ Task '1' blocks Task '2'.
     /// Filesystem-dependent (reads C:/Users/lippe/Repos/apps/tasks/
     /// readings/...), so `#[ignore]`d in the default suite. Run with
     /// `cargo test --lib wasm_compile_sequence_preserves -- --ignored`.
+    /// task-860: verify apps/tasks/readings/app.md (with the SM →
+    /// Task_has_Task_Status bridge rules) compiles cleanly. Reads
+    /// app.md from disk so this is filesystem-dependent and gated
+    /// `#[ignore]`; run with `cargo test --lib --features std-deps
+    /// task_860_app_md -- --ignored --nocapture`.
+    #[ignore = "filesystem-dependent integration test against apps/tasks/readings/app.md"]
+    #[test]
+    fn task_860_app_md_with_bridge_rules_compiles_clean() {
+        let app_md = std::fs::read_to_string(
+            "C:/Users/lippe/Repos/apps/tasks/readings/app.md")
+            .expect("read app.md");
+        let h = create_impl();
+        let r = system_impl(h, "compile", &app_md);
+        release_impl(h);
+        assert!(!r.starts_with('⊥') && !r.contains("constraint violation"),
+            "apps/tasks/readings/app.md with the task-860 bridge rules \
+             must compile clean; got: {}",
+            &r[..r.len().min(4000)]);
+    }
+
     #[ignore = "filesystem-dependent integration test against apps/tasks readings"]
     #[test]
     fn wasm_compile_sequence_preserves_all_instance_facts_through_handle() {
