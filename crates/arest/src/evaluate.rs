@@ -3733,6 +3733,252 @@ mod tests {
         assert_eq!(derived_count, 0, "No match should produce no derivation");
     }
 
+    /// task-814-join-absence: a Join rule with one positive antecedent
+    /// AND one AbsenceOf antecedent must fire correctly. Pre-fix the join
+    /// path's `fact_extractors[i]` for the AbsenceOf antecedent indexed
+    /// by `antecedent_ids[i] = ""` and `extract_facts_from_pop("")`
+    /// returned ∅, collapsing the iterative join to ∅ — so the rule
+    /// emitted 0 facts.
+    ///
+    /// Models the task-814 audit shape:
+    ///   `Merge has Target Security Posture 'X' iff
+    ///      Merge concerns Commit
+    ///      that has Security Posture 'X'
+    ///      and no Commit it concerns has Security Posture 'Y'`
+    ///
+    /// We build the positive equi-join (`Merge concerns Commit` ⋈
+    /// `Commit has Security Posture` on `Commit` with `SP='X'`) and
+    /// gate it on AbsenceOf `Commit has Security Posture` with `SP='Y'`
+    /// keyed on `Commit`. The guard fires for any (Merge, Commit) pair
+    /// where Commit has X AND no other Commit (well, no Commit) the
+    /// Merge concerns has Y — i.e. no Commit in the population at all
+    /// has Y for this Merge's `Commit` key. (Per the task description:
+    /// "no other Commit it concerns has Y" — the AbsenceOf role names
+    /// `Commit`, so the guard's key is the joined Commit value.)
+    #[test]
+    fn join_derivation_with_absence_of_guard_fires() {
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "merge_concerns_commit", &FactTypeDef {
+            schema_id: String::new(), reading: "Merge concerns Commit".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Merge".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Commit".to_string(), role_index: 1 },
+            ],
+        });
+        cells = with_ft(cells, "commit_has_sp", &FactTypeDef {
+            schema_id: String::new(), reading: "Commit has Security Posture".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Commit".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Security Posture".to_string(), role_index: 1 },
+            ],
+        });
+        cells = with_ft(cells, "merge_target_sp", &FactTypeDef {
+            schema_id: String::new(), reading: "Merge has Target Security Posture".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Merge".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Security Posture".to_string(), role_index: 1 },
+            ],
+        });
+        // Positive antecedents: Merge concerns Commit, Commit has SP='X'.
+        // AbsenceOf antecedent: no Commit has SP='Y' (keyed on Commit).
+        cells = with_derivation(cells, &DerivationRuleDef {
+            id: "merge_target_sp_X".to_string(),
+            text: "Merge has Target Security Posture 'X' iff Merge concerns Commit that has Security Posture 'X' and no Commit it concerns has Security Posture 'Y'".to_string(),
+            antecedent_sources: vec![
+                AntecedentSource::FactType("merge_concerns_commit".to_string()),
+                AntecedentSource::FactType("commit_has_sp".to_string()),
+                AntecedentSource::AbsenceOf {
+                    fact_type: "commit_has_sp".to_string(),
+                    role: "Commit".to_string(),
+                },
+            ],
+            consequent_cell: ConsequentCellSource::Literal("merge_target_sp".to_string()),
+            consequent_instance_role: String::new(),
+            kind: DerivationKind::Join,
+            join_on: vec!["Commit".to_string()],
+            match_on: vec![],
+            consequent_bindings: vec!["Merge".to_string(), "Security Posture".to_string()],
+            antecedent_filters: vec![],
+            consequent_computed_bindings: vec![],
+            consequent_aggregates: vec![],
+            unresolved_clauses: vec![],
+            antecedent_role_literals: vec![
+                // Positive #1 pins Security Posture='X'.
+                crate::types::AntecedentRoleLiteral {
+                    antecedent_index: 1,
+                    role: "Security Posture".to_string(),
+                    value: "X".to_string(),
+                },
+                // AbsenceOf pins Security Posture='Y' (the role being
+                // sought-and-not-found in the negation FT).
+                crate::types::AntecedentRoleLiteral {
+                    antecedent_index: 2,
+                    role: "Security Posture".to_string(),
+                    value: "Y".to_string(),
+                },
+            ],
+            antecedent_role_comparisons: vec![],
+            consequent_role_literals: vec![
+                crate::types::ConsequentRoleLiteral {
+                    role: "Security Posture".to_string(),
+                    value: "X".to_string(),
+                },
+            ],
+        });
+
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
+
+        // Population:
+        //   m1 concerns c1, c2          c1 SP=X     (← m1 should NOT fire, c2 has Y)
+        //   m2 concerns c3, c4          c3 SP=X     (← m2 SHOULD fire — c3 has X, c4 has Z)
+        //   m3 concerns c5              c5 SP=X     (← m3 SHOULD fire — no Y anywhere keyed on c5)
+        //                              c2 SP=Y
+        //                              c4 SP=Z
+        // Per-AbsenceOf semantics ("no Commit has SP=Y keyed on the joined
+        // Commit"): the guard is keyed on the JOINED Commit value, so we
+        // expect a fact emitted for any (Merge, Commit) where Commit has
+        // X AND the Commit itself does not also have SP=Y.
+        let mut pop_state = ast::Object::phi();
+        pop_state = ast::cell_push("merge_concerns_commit",
+            ast::fact_from_pairs(&[("Merge", "m1"), ("Commit", "c1")]), &pop_state);
+        pop_state = ast::cell_push("merge_concerns_commit",
+            ast::fact_from_pairs(&[("Merge", "m1"), ("Commit", "c2")]), &pop_state);
+        pop_state = ast::cell_push("merge_concerns_commit",
+            ast::fact_from_pairs(&[("Merge", "m2"), ("Commit", "c3")]), &pop_state);
+        pop_state = ast::cell_push("merge_concerns_commit",
+            ast::fact_from_pairs(&[("Merge", "m2"), ("Commit", "c4")]), &pop_state);
+        pop_state = ast::cell_push("merge_concerns_commit",
+            ast::fact_from_pairs(&[("Merge", "m3"), ("Commit", "c5")]), &pop_state);
+        pop_state = ast::cell_push("commit_has_sp",
+            ast::fact_from_pairs(&[("Commit", "c1"), ("Security Posture", "X")]), &pop_state);
+        pop_state = ast::cell_push("commit_has_sp",
+            ast::fact_from_pairs(&[("Commit", "c2"), ("Security Posture", "Y")]), &pop_state);
+        pop_state = ast::cell_push("commit_has_sp",
+            ast::fact_from_pairs(&[("Commit", "c3"), ("Security Posture", "X")]), &pop_state);
+        pop_state = ast::cell_push("commit_has_sp",
+            ast::fact_from_pairs(&[("Commit", "c4"), ("Security Posture", "Z")]), &pop_state);
+        pop_state = ast::cell_push("commit_has_sp",
+            ast::fact_from_pairs(&[("Commit", "c5"), ("Security Posture", "X")]), &pop_state);
+
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
+
+        let merge_targets: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "merge_target_sp").collect();
+
+        // Pre-fix: 0 (join collapses to ∅ because AbsenceOf's empty FT id
+        //   makes fact_extractors[2] return ∅).
+        // Post-fix:
+        //   (m1, c1) — c1 has X. Guard checks: is there a Commit with SP=Y
+        //     keyed on c1? c1 itself has SP=X, no SP=Y for Commit=c1. PASS.
+        //   (m2, c3) — c3 has X. Guard checks Commit=c3: no SP=Y. PASS.
+        //   (m3, c5) — c5 has X. Guard checks Commit=c5: no SP=Y. PASS.
+        // Expect 3 derived facts (one per matching (Merge, Commit) pair
+        // surviving both the equi-join and the absence guard).
+        assert_eq!(merge_targets.len(), 3,
+            "Join + AbsenceOf must fire — pre-fix collapses to 0 facts; \
+             post-fix emits (m1,c1), (m2,c3), (m3,c5). Got: {:?}",
+            merge_targets.iter().map(|d| (&d.bindings)).collect::<Vec<_>>());
+
+        // Spot-check a binding from the consequent.
+        assert!(merge_targets.iter().any(|d|
+            d.bindings.contains(&("Merge".to_string(), "m2".to_string()))
+                && d.bindings.contains(&("Security Posture".to_string(), "X".to_string()))));
+        assert!(merge_targets.iter().any(|d|
+            d.bindings.contains(&("Merge".to_string(), "m3".to_string()))));
+    }
+
+    /// task-814-join-absence: counterfactual — when EVERY commit also has
+    /// SP=Y, no (Merge, Commit) survives the absence guard. Pins down
+    /// the negative direction of the fix: AbsenceOf guards actually
+    /// reject tuples instead of being treated as no-ops.
+    #[test]
+    fn join_derivation_absence_guard_rejects_when_negation_matches() {
+        let mut cells = empty_cells();
+        cells = with_ft(cells, "merge_concerns_commit", &FactTypeDef {
+            schema_id: String::new(), reading: "Merge concerns Commit".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Merge".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Commit".to_string(), role_index: 1 },
+            ],
+        });
+        cells = with_ft(cells, "commit_has_sp", &FactTypeDef {
+            schema_id: String::new(), reading: "Commit has Security Posture".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Commit".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Security Posture".to_string(), role_index: 1 },
+            ],
+        });
+        cells = with_ft(cells, "merge_target_sp", &FactTypeDef {
+            schema_id: String::new(), reading: "Merge has Target Security Posture".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Merge".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Security Posture".to_string(), role_index: 1 },
+            ],
+        });
+        cells = with_derivation(cells, &DerivationRuleDef {
+            id: "merge_target_sp_X_neg".to_string(),
+            text: "Merge has Target Security Posture 'X' iff Merge concerns Commit that has Security Posture 'X' and no Commit it concerns has Security Posture 'Y'".to_string(),
+            antecedent_sources: vec![
+                AntecedentSource::FactType("merge_concerns_commit".to_string()),
+                AntecedentSource::FactType("commit_has_sp".to_string()),
+                AntecedentSource::AbsenceOf {
+                    fact_type: "commit_has_sp".to_string(),
+                    role: "Commit".to_string(),
+                },
+            ],
+            consequent_cell: ConsequentCellSource::Literal("merge_target_sp".to_string()),
+            consequent_instance_role: String::new(),
+            kind: DerivationKind::Join,
+            join_on: vec!["Commit".to_string()],
+            match_on: vec![],
+            consequent_bindings: vec!["Merge".to_string(), "Security Posture".to_string()],
+            antecedent_filters: vec![],
+            consequent_computed_bindings: vec![],
+            consequent_aggregates: vec![],
+            unresolved_clauses: vec![],
+            antecedent_role_literals: vec![
+                crate::types::AntecedentRoleLiteral {
+                    antecedent_index: 1,
+                    role: "Security Posture".to_string(),
+                    value: "X".to_string(),
+                },
+                crate::types::AntecedentRoleLiteral {
+                    antecedent_index: 2,
+                    role: "Security Posture".to_string(),
+                    value: "Y".to_string(),
+                },
+            ],
+            antecedent_role_comparisons: vec![],
+            consequent_role_literals: vec![
+                crate::types::ConsequentRoleLiteral {
+                    role: "Security Posture".to_string(),
+                    value: "X".to_string(),
+                },
+            ],
+        });
+
+        let (_meta_pop, defs, _def_map) = compile_cells(cells);
+
+        // Every commit has BOTH X and Y. Absence guard should reject
+        // every joined pair.
+        let mut pop_state = ast::Object::phi();
+        pop_state = ast::cell_push("merge_concerns_commit",
+            ast::fact_from_pairs(&[("Merge", "m1"), ("Commit", "c1")]), &pop_state);
+        pop_state = ast::cell_push("commit_has_sp",
+            ast::fact_from_pairs(&[("Commit", "c1"), ("Security Posture", "X")]), &pop_state);
+        pop_state = ast::cell_push("commit_has_sp",
+            ast::fact_from_pairs(&[("Commit", "c1"), ("Security Posture", "Y")]), &pop_state);
+
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
+
+        let merge_targets: Vec<_> = derived.iter().filter(|d| d.fact_type_id == "merge_target_sp").collect();
+        assert_eq!(merge_targets.len(), 0,
+            "AbsenceOf guard must reject (m1, c1): c1 has SP=Y, so the \
+             negation predicate matches and the guard blocks emit. Got: {:?}",
+            merge_targets.iter().map(|d| (&d.bindings)).collect::<Vec<_>>());
+    }
+
     fn make_forbidden_text_cells(enum_vals: Vec<String>) -> S {
         let mut cells = empty_cells();
         let pt = "ProhibitedText";

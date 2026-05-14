@@ -5005,8 +5005,37 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
     // anaphora points at declared fact types). InstancesOfNoun entries
     // collapse to empty FT id, which `data.fact_types.get` returns None
     // for, degrading to empty role lists — safe no-op.
-    let antecedent_ids: Vec<String> = rule.antecedent_sources.iter()
+    //
+    // task-814-join-absence: partition antecedents into POSITIVE
+    // (`FactType`) and ABSENCE (`AbsenceOf`). The iterative join builds
+    // only over positives — AbsenceOf antecedents return "" for
+    // `fact_type_id()`, so `extract_facts_from_pop("")` previously
+    // collapsed each AbsenceOf stream to ∅ and the join product
+    // degenerated to ∅. The fix mirrors the implicit-equi-join branch
+    // of `compile_explicit_derivation` (#918 follow-up): treat AbsenceOf
+    // antecedents as final guards over the joined positive product,
+    // sourcing their negation FT from `AbsenceOf { fact_type }` rather
+    // than from `antecedent_ids[i]`. The original-index → role-on-AbsenceOf
+    // metadata for each guard is captured below so post-join filtering
+    // can look up the key value on whichever positive antecedent carries
+    // the role the AbsenceOf names.
+    //
+    // `original_index` (carried alongside the positive-only views) lets
+    // us key `antecedent_filters` / `antecedent_role_literals` /
+    // `antecedent_role_comparisons` back to the user-authored slot
+    // even though the join shape only walks the positive subsequence.
+    let antecedent_ids_all: Vec<String> = rule.antecedent_sources.iter()
         .map(|s| s.fact_type_id().to_string()).collect();
+    let positive_idx: Vec<usize> = rule.antecedent_sources.iter().enumerate()
+        .filter_map(|(i, s)| matches!(s, crate::types::AntecedentSource::FactType(_)).then_some(i))
+        .collect();
+    let absence_idx: Vec<usize> = rule.antecedent_sources.iter().enumerate()
+        .filter_map(|(i, s)| matches!(s, crate::types::AntecedentSource::AbsenceOf { .. }).then_some(i))
+        .collect();
+    // The post-#918 join walks only positive antecedents. `antecedent_ids`
+    // below is the positive-only view; absence guards apply after.
+    let antecedent_ids: Vec<String> = positive_idx.iter()
+        .map(|&i| antecedent_ids_all[i].clone()).collect();
     // Join rules always have a literal consequent — `that FT` anaphora
     // in a user rule points at one specific FT after resolution. The
     // AntecedentRole shape is reserved for metamodel rules that fan out
@@ -5019,7 +5048,8 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
         .map(|ft| ft.reading.clone())
         .unwrap_or_default();
 
-    // Build role-index lookup for each antecedent: (ft_idx, noun_name) -> role_index
+    // Build role-index lookup for each POSITIVE antecedent (the iterative
+    // join only sees positives — AbsenceOf is applied as a final guard).
     let antecedent_roles: Vec<Vec<(String, usize)>> = antecedent_ids.iter().map(|ft_id| {
         data.fact_types.get(ft_id)
             .map(|ft| ft.roles.iter().map(|r| (r.noun_name.clone(), r.role_index)).collect())
@@ -5053,18 +5083,30 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
     // A 'a' and that X has B 'b'` joined the unfiltered A and B
     // populations and emitted spurious facts. Now we mirror the
     // explicit path's preds_by_idx + Filter-wrapped extractor.
+    //
+    // task-814-join-absence: `antecedent_index` on filters/literals
+    // points at the user-authored slot (including AbsenceOf positions).
+    // Translate to the positive-only slot before pushing — and skip
+    // filters whose target is an AbsenceOf antecedent (those literals
+    // are consumed by the guard predicate below, not by the join
+    // extractor).
+    let original_to_positive: hashbrown::HashMap<usize, usize> = positive_idx.iter().enumerate()
+        .map(|(pos, &orig)| (orig, pos))
+        .collect();
     let mut preds_by_idx: Vec<Vec<Func>> = vec![Vec::new(); antecedent_ids.len()];
     for af in rule.antecedent_filters.iter() {
-        if let Some(ft_id) = antecedent_ids.get(af.antecedent_index) {
+        let Some(&pos_idx) = original_to_positive.get(&af.antecedent_index) else { continue };
+        if let Some(ft_id) = antecedent_ids.get(pos_idx) {
             if let Some(ft) = data.fact_types.get(ft_id) {
                 if let Some(p) = build_antecedent_filter_pred(af, ft) {
-                    preds_by_idx[af.antecedent_index].push(p);
+                    preds_by_idx[pos_idx].push(p);
                 }
             }
         }
     }
     for arl in rule.antecedent_role_literals.iter() {
-        if let Some(ft_id) = antecedent_ids.get(arl.antecedent_index) {
+        let Some(&pos_idx) = original_to_positive.get(&arl.antecedent_index) else { continue };
+        if let Some(ft_id) = antecedent_ids.get(pos_idx) {
             if let Some(ft) = data.fact_types.get(ft_id) {
                 if ft.roles.iter().any(|r| r.noun_name == arl.role) {
                     let pred = Func::compose(
@@ -5074,7 +5116,7 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
                             Func::constant(Object::atom(&arl.value)),
                         ]),
                     );
-                    preds_by_idx[arl.antecedent_index].push(pred);
+                    preds_by_idx[pos_idx].push(pred);
                 }
             }
         }
@@ -5198,17 +5240,26 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
     // depth-n product (e.g. `Task1 has lower Task ID than Task2`). The
     // predicate is wrapped as a final Filter over `current` — runs after
     // the join keys + match predicates have already culled the product.
+    //
+    // task-814-join-absence: comparison indices point at user-authored
+    // slots. Translate to positive-only slots and drop comparisons that
+    // reference an AbsenceOf antecedent (their value isn't in the joined
+    // tuple — semantically a cross-antecedent comparison against a
+    // negated FT is undefined).
     let role_comp_preds: Vec<Func> = rule.antecedent_role_comparisons.iter().filter_map(|c| {
-        // Both antecedent indices must fall within range; both roles
-        // must resolve on their respective FTs. Drop silently otherwise
-        // (mirrors antecedent_filters' silent-drop behavior).
-        if c.lhs_antecedent_index >= n || c.rhs_antecedent_index >= n {
+        // Both antecedent indices must point at positive antecedents and
+        // fall within range; both roles must resolve on their respective
+        // FTs. Drop silently otherwise (mirrors antecedent_filters'
+        // silent-drop behavior).
+        let lhs_pos = *original_to_positive.get(&c.lhs_antecedent_index)?;
+        let rhs_pos = *original_to_positive.get(&c.rhs_antecedent_index)?;
+        if lhs_pos >= n || rhs_pos >= n {
             return None;
         }
-        let lhs_ri = find_role(c.lhs_antecedent_index, &c.lhs_role)?;
-        let rhs_ri = find_role(c.rhs_antecedent_index, &c.rhs_role)?;
-        let lhs_val = Func::compose(role_value(lhs_ri), access_fact(c.lhs_antecedent_index, n));
-        let rhs_val = Func::compose(role_value(rhs_ri), access_fact(c.rhs_antecedent_index, n));
+        let lhs_ri = find_role(lhs_pos, &c.lhs_role)?;
+        let rhs_ri = find_role(rhs_pos, &c.rhs_role)?;
+        let lhs_val = Func::compose(role_value(lhs_ri), access_fact(lhs_pos, n));
+        let rhs_val = Func::compose(role_value(rhs_ri), access_fact(rhs_pos, n));
         Some(Func::compose(
             comparator_primitive(&c.op),
             Func::construction(vec![lhs_val, rhs_val]),
@@ -5221,6 +5272,93 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
             Func::compose(Func::And, Func::construction(vec![a, b]))).unwrap();
         Func::compose(Func::filter(combined), current)
     };
+
+    // task-814-join-absence: AbsenceOf antecedents become final guard
+    // predicates over the joined positive product. For each AbsenceOf
+    // `{ fact_type, role }`:
+    //   key_match  := role_value_by_name(role)(neg_fact) == role_value_by_name(role)(joined_tuple)
+    //   neg_pred   := key_match AND every antecedent_role_literal pinned on this slot
+    //   any_match  := !NullTest . Filter(neg_pred) . DistL . <joined, neg_facts>
+    //   guard      := !any_match
+    // Each guard is applied as a final Filter over `current` (the depth-n
+    // join product). The role value side is sourced from the POSITIVE
+    // antecedent that carries the AbsenceOf's role — the parser/resolver
+    // guarantees the role name names a shared join noun (e.g. `Commit`
+    // for `no Commit it concerns has Security Posture 'Y'`).
+    //
+    // Structurally each per-tuple guard receives a pair `<joined_tuple,
+    // neg_facts>` (Selector(1) = joined_tuple, Selector(2) = the AbsenceOf
+    // FT's full population) so we can DistL into per-fact predicates and
+    // test for any match. The pair is built at the population level via
+    // `α(g_k) . DistR . <current, neg_facts_extracts>`-style nesting
+    // applied iteratively per guard.
+    //
+    // Mirrors the implicit-equi-join AbsenceOf branch in
+    // `compile_explicit_derivation` (#918 follow-up); the join path was
+    // missed because pre-fix `fact_extractors[i]` indexed by
+    // `antecedent_ids[i] = ""` for AbsenceOf and degenerated each
+    // AbsenceOf stream to ∅ — collapsing the iterative join to ∅.
+    let absence_specs: Vec<(Func, Func)> = absence_idx.iter().filter_map(|&orig_i| {
+        let (neg_ft_id, neg_role) = match &rule.antecedent_sources[orig_i] {
+            crate::types::AntecedentSource::AbsenceOf { fact_type, role } =>
+                (fact_type.clone(), role.clone()),
+            _ => return None,
+        };
+        // Find the positive antecedent that carries `neg_role`.
+        let (pos_for_role, role_ri) = (0..n).find_map(|pi|
+            find_role(pi, &neg_role).map(|ri| (pi, ri)))?;
+        let neg_facts = extract_facts_from_pop(&neg_ft_id);
+        // Left side: the negation FT candidate's value on `neg_role`
+        // (Selector(2) inside the per-pair step).
+        let lhs = Func::compose(role_value_by_name(&neg_role), Func::Selector(2));
+        // Right side: the joined tuple's value on `neg_role`, reached
+        // by access_fact(pos_for_role, n) then role_value(role_ri).
+        // Selector(1) inside the per-pair step is the joined tuple.
+        let rhs = Func::compose(
+            role_value(role_ri),
+            Func::compose(access_fact(pos_for_role, n), Func::Selector(1)),
+        );
+        let key_match = Func::compose(Func::Eq, Func::construction(vec![lhs, rhs]));
+        // AND every role-literal pinned on this AbsenceOf slot (e.g. the
+        // 'Y' in `no Commit it concerns has Security Posture 'Y'`).
+        let mut neg_pred = key_match;
+        for arl in rule.antecedent_role_literals.iter()
+            .filter(|arl| arl.antecedent_index == orig_i)
+        {
+            let lit_check = Func::compose(Func::Eq, Func::construction(vec![
+                Func::compose(role_value_by_name(&arl.role), Func::Selector(2)),
+                Func::constant(Object::atom(&arl.value)),
+            ]));
+            neg_pred = Func::compose(Func::And, Func::construction(vec![
+                neg_pred, lit_check,
+            ]));
+        }
+        let any_match = Func::compose(
+            Func::compose(Func::Not, Func::NullTest),
+            Func::compose(Func::filter(neg_pred), Func::DistL),
+        );
+        let absent_guard = Func::compose(Func::Not, any_match);
+        Some((neg_facts, absent_guard))
+    }).collect();
+    // Iteratively wrap each AbsenceOf guard around `current`. After step
+    // k, `current` is a sequence of depth-n joined tuples that pass
+    // guards 0..k. The shape per step:
+    //   per_tuple   := if guard(<tuple, neg_facts>) then <tuple> else phi
+    //   current'    := Concat . α(per_tuple) . DistR . <current, neg_facts>
+    // DistR pairs every tuple in `current` with the same `neg_facts`
+    // (resolved once at the outer population level); the per_tuple
+    // condition keeps the tuple iff the absent guard holds; Concat
+    // collapses phi's away.
+    let current = absence_specs.into_iter().fold(current, |acc, (neg_facts, guard)| {
+        let per_tuple = Func::condition(
+            guard,
+            Func::construction(vec![Func::Selector(1)]),
+            Func::constant(Object::phi()),
+        );
+        Func::compose(Func::Concat,
+            Func::compose(Func::apply_to_all(per_tuple),
+                Func::compose(Func::DistR, Func::construction(vec![acc, neg_facts]))))
+    });
 
     // Build the consequent fact from the final joined structure (depth n).
     // For each consequent binding noun, find which FT has it and extract the value.
@@ -5253,7 +5391,15 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
 
     let func = Func::compose(Func::apply_to_all(derived_fact), current);
 
-    CompiledDerivation { id, text, kind, func, uses_negation: false,
+    // task-814-join-absence: any AbsenceOf antecedent makes this rule
+    // stratum-2 (negation-guarded). Without that, the chain orchestrator
+    // would fire this join rule in the positive round before its negated
+    // cell has been populated, and the guard could observe a stale-empty
+    // population — emitting facts that the post-positive-fixpoint state
+    // should have rejected. Mirrors the multi-AbsenceOf branch's
+    // `uses_negation: true` in `compile_explicit_derivation` (#918).
+    let uses_negation = !absence_idx.is_empty();
+    CompiledDerivation { id, text, kind, func, uses_negation,
         consequent_cell: consequent_cell_md,
         consequent_role_literals: consequent_role_literals_md,
         negation_reads: negation_reads_md }
