@@ -1131,10 +1131,17 @@ pub const OS_READINGS: &[(&str, &str)] = &[
 /// Stock app templates / examples (Organization, Agent). Convenience
 /// bundle for callers that want the demo nouns preloaded; hosted
 /// workers that bring their own templates can leave this off.
+///
+/// `sql-dialects` (#896) is also loaded here so the SQL Type Mapping
+/// instance facts populate the `SQL_Dialect_maps_Value_Type_to_SQL_Type`
+/// cell that drives `compile.rs::generate_ddl`. The boot fallback in
+/// `SqlTypeMappingTable::boot()` handles the bare-engine case where
+/// templates aren't enabled.
 #[cfg(feature = "templates")]
 pub const TEMPLATE_READINGS: &[(&str, &str)] = &[
     ("organizations", include_str!("../../../readings/templates/organizations.md")),
     ("agents",        include_str!("../../../readings/templates/agents.md")),
+    ("sql-dialects",  include_str!("../../../readings/templates/sql-dialects.md")),
 ];
 
 /// Windows-via-Wine compat readings (#463). Wine App noun + DLL

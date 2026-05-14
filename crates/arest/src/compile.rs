@@ -1984,9 +1984,12 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         // of a `Vec<TableDef>`. Same bytes out; one less typed-IR hop.
         let rmap_cells = crate::rmap::rmap_cells_from_state(state);
         let names = crate::rmap::table_names(&rmap_cells);
+        // #896: lift dialect type maps to readings — read once per
+        // compile and reuse across every (table × dialect) pair.
+        let type_map = SqlTypeMappingTable::from_readings_state(state);
         for table_name in &names {
             for (dialect_name, dialect) in active_dialects.iter() {
-                let ddl = generate_ddl(&rmap_cells, table_name, dialect);
+                let ddl = generate_ddl(&rmap_cells, table_name, dialect, &type_map);
                 defs.push((
                     format!("sql:{}:{}", dialect_name, table_name),
                     Func::constant(Object::atom(&ddl)),
@@ -7492,53 +7495,171 @@ fn compile_state_machine_from_cells(
 #[derive(Clone, Copy)]
 enum SqlDialect { Sqlite, PostgreSql, MySql, SqlServer, Oracle, Db2, Standard, ClickHouse }
 
+impl SqlDialect {
+    /// Stable string name for cell-fact lookups. Mirrors the
+    /// `'Sqlite', 'PostgreSql', ...` enum-value declaration in
+    /// `readings/templates/sql-dialects.md` so the `SQL Dialect maps
+    /// Value Type to SQL Type` instance facts round-trip through
+    /// `SqlTypeMappingTable::resolve`.
+    fn name(&self) -> &'static str {
+        match self {
+            SqlDialect::Sqlite     => "Sqlite",
+            SqlDialect::PostgreSql => "PostgreSql",
+            SqlDialect::MySql      => "MySql",
+            SqlDialect::SqlServer  => "SqlServer",
+            SqlDialect::Oracle     => "Oracle",
+            SqlDialect::Db2        => "Db2",
+            SqlDialect::Standard   => "Standard",
+            SqlDialect::ClickHouse => "ClickHouse",
+        }
+    }
+}
+
+/// #896 — `generate_ddl`'s value-type → SQL-type mapping lifts from a
+/// hardcoded nested `match dialect { ... match base { ... } }` cascade
+/// into a typed table reading the `SQL_Dialect_maps_Value_Type_to_SQL_Type`
+/// cell at compile time. Each row encodes one `(dialect, value_type,
+/// sql_type)` triple; lookup is O(rows) — fine for compile-time DDL
+/// emission, which iterates a small fixed list (8 dialects × 4 value
+/// types = 32 rows in the boot fallback).
+///
+/// Boot fallback (`SqlTypeMappingTable::boot()`) mirrors the pre-#896
+/// cascade in declaration order — eight dialects in the same order as
+/// the legacy `match dialect`, each contributing TEXT / INTEGER / REAL /
+/// BOOLEAN sub-arms in the same order as the legacy `match base`. The
+/// wildcard `_` arm in every legacy dialect block aliased that
+/// dialect's TEXT mapping, so `resolve` falls through to TEXT for
+/// unknown value-type strings — preserving the legacy default without
+/// adding a "default" row to the readings.
+#[derive(Debug, Clone)]
+pub struct SqlTypeMappingTable {
+    /// One row per `(SQL Dialect, Value Type, SQL Type)` triple. Order
+    /// matches the `SQL Dialect maps Value Type to SQL Type` instance
+    /// facts in `readings/templates/sql-dialects.md` so the legacy
+    /// nested-match arms round-trip through `resolve`.
+    pub rows: Vec<(String, String, String)>,
+}
+
+impl SqlTypeMappingTable {
+    /// Boot table — must stay in sync with the `SQL Dialect maps Value
+    /// Type to SQL Type` instance facts in
+    /// `readings/templates/sql-dialects.md`. Eight dialects × four
+    /// value types = 32 rows in the same declaration order as the
+    /// legacy `match dialect { ... match base { ... } }` cascade in
+    /// `generate_ddl`.
+    pub fn boot() -> Self {
+        let rows: Vec<(String, String, String)> = [
+            // Sqlite
+            ("Sqlite",     "TEXT",    "TEXT"),
+            ("Sqlite",     "INTEGER", "INTEGER"),
+            ("Sqlite",     "REAL",    "REAL"),
+            ("Sqlite",     "BOOLEAN", "INTEGER"),
+            // PostgreSql
+            ("PostgreSql", "TEXT",    "TEXT"),
+            ("PostgreSql", "INTEGER", "INTEGER"),
+            ("PostgreSql", "REAL",    "DOUBLE PRECISION"),
+            ("PostgreSql", "BOOLEAN", "BOOLEAN"),
+            // MySql
+            ("MySql",      "TEXT",    "VARCHAR(255)"),
+            ("MySql",      "INTEGER", "INT"),
+            ("MySql",      "REAL",    "DOUBLE"),
+            ("MySql",      "BOOLEAN", "TINYINT(1)"),
+            // SqlServer
+            ("SqlServer",  "TEXT",    "NVARCHAR(255)"),
+            ("SqlServer",  "INTEGER", "INT"),
+            ("SqlServer",  "REAL",    "FLOAT"),
+            ("SqlServer",  "BOOLEAN", "BIT"),
+            // Oracle
+            ("Oracle",     "TEXT",    "VARCHAR2(255)"),
+            ("Oracle",     "INTEGER", "NUMBER(10)"),
+            ("Oracle",     "REAL",    "NUMBER"),
+            ("Oracle",     "BOOLEAN", "NUMBER(1)"),
+            // Db2
+            ("Db2",        "TEXT",    "VARCHAR(255)"),
+            ("Db2",        "INTEGER", "INTEGER"),
+            ("Db2",        "REAL",    "DOUBLE"),
+            ("Db2",        "BOOLEAN", "SMALLINT"),
+            // ClickHouse
+            ("ClickHouse", "TEXT",    "String"),
+            ("ClickHouse", "INTEGER", "Int64"),
+            ("ClickHouse", "REAL",    "Float64"),
+            ("ClickHouse", "BOOLEAN", "UInt8"),
+            // Standard
+            ("Standard",   "TEXT",    "CHARACTER VARYING(255)"),
+            ("Standard",   "INTEGER", "INTEGER"),
+            ("Standard",   "REAL",    "DOUBLE PRECISION"),
+            ("Standard",   "BOOLEAN", "BOOLEAN"),
+        ].iter().map(|(d, v, s)| (d.to_string(), v.to_string(), s.to_string())).collect();
+        SqlTypeMappingTable { rows }
+    }
+
+    /// Build the table from the runtime
+    /// `SQL_Dialect_maps_Value_Type_to_SQL_Type` cell in `state`.
+    /// Falls back to `boot()` when the cell is empty (bare engine, no
+    /// metamodel loaded).
+    pub fn from_readings_state(state: &crate::ast::Object) -> Self {
+        let cell = fetch_or_phi("SQL_Dialect_maps_Value_Type_to_SQL_Type", state);
+        let rows: Vec<(String, String, String)> = cell.as_seq()
+            .map(|facts| facts.iter().filter_map(|f| {
+                let dialect = binding(f, "SQL Dialect")?.to_string();
+                let value_type = binding(f, "Value Type")?.to_string();
+                let sql_type = binding(f, "SQL Type")?.to_string();
+                Some((dialect, value_type, sql_type))
+            }).collect())
+            .unwrap_or_default();
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            SqlTypeMappingTable { rows }
+        }
+    }
+
+    /// Resolve `(dialect, base)` to the dialect-native SQL type.
+    /// Mirrors the legacy inline `map_type` closure: returns the
+    /// explicit mapping when present, otherwise falls through to the
+    /// dialect's `TEXT` mapping (every legacy `_ =>` branch aliased
+    /// the dialect's `TEXT` row).
+    pub fn resolve<'a>(&'a self, dialect: SqlDialect, base: &str) -> &'a str {
+        let dialect_name = dialect.name();
+        if let Some((_, _, sql_type)) = self.rows.iter().find(|(d, v, _)| {
+            d == dialect_name && v == base
+        }) {
+            return sql_type.as_str();
+        }
+        // Fallback: legacy `_` arm aliases the dialect's TEXT mapping.
+        if let Some((_, _, sql_type)) = self.rows.iter().find(|(d, v, _)| {
+            d == dialect_name && v == "TEXT"
+        }) {
+            return sql_type.as_str();
+        }
+        // Last-resort fallback if neither (dialect, base) nor
+        // (dialect, "TEXT") is in the table — keeps the function
+        // total. Matches the legacy hardcoded "TEXT" string as the
+        // sentinel a Sqlite-shaped boot table would emit.
+        "TEXT"
+    }
+}
+
 /// Generate DDL for a table in the given SQL dialect. Reads the RMAP
 /// cells view directly (#325) — no TableDef allocation, no typed-IR
 /// round-trip. `table_name` is the snake_case name present in the
-/// `RMAPTable` cell.
-fn generate_ddl(cells: &crate::ast::Object, table_name: &str, dialect: &SqlDialect) -> String {
+/// `RMAPTable` cell. The `type_map` argument carries the
+/// `SqlTypeMappingTable` resolved at the call site (#896) — generators
+/// build it once per compile from `SqlTypeMappingTable::from_readings_state`
+/// and reuse it across every (table × dialect) emission.
+fn generate_ddl(
+    cells: &crate::ast::Object,
+    table_name: &str,
+    dialect: &SqlDialect,
+    type_map: &SqlTypeMappingTable,
+) -> String {
     let q = |s: &str| match dialect {
         SqlDialect::MySql => format!("`{}`", s),
         SqlDialect::SqlServer => format!("[{}]", s),
         _ => format!("\"{}\"", s),
     };
 
-    let map_type = |base: &str| -> &str {
-        match dialect {
-            SqlDialect::Sqlite => match base {
-                "TEXT" => "TEXT", "INTEGER" => "INTEGER", "REAL" => "REAL",
-                "BOOLEAN" => "INTEGER", _ => "TEXT",
-            },
-            SqlDialect::PostgreSql => match base {
-                "TEXT" => "TEXT", "INTEGER" => "INTEGER", "REAL" => "DOUBLE PRECISION",
-                "BOOLEAN" => "BOOLEAN", _ => "TEXT",
-            },
-            SqlDialect::MySql => match base {
-                "TEXT" => "VARCHAR(255)", "INTEGER" => "INT", "REAL" => "DOUBLE",
-                "BOOLEAN" => "TINYINT(1)", _ => "VARCHAR(255)",
-            },
-            SqlDialect::SqlServer => match base {
-                "TEXT" => "NVARCHAR(255)", "INTEGER" => "INT", "REAL" => "FLOAT",
-                "BOOLEAN" => "BIT", _ => "NVARCHAR(255)",
-            },
-            SqlDialect::Oracle => match base {
-                "TEXT" => "VARCHAR2(255)", "INTEGER" => "NUMBER(10)", "REAL" => "NUMBER",
-                "BOOLEAN" => "NUMBER(1)", _ => "VARCHAR2(255)",
-            },
-            SqlDialect::Db2 => match base {
-                "TEXT" => "VARCHAR(255)", "INTEGER" => "INTEGER", "REAL" => "DOUBLE",
-                "BOOLEAN" => "SMALLINT", _ => "VARCHAR(255)",
-            },
-            SqlDialect::ClickHouse => match base {
-                "TEXT" => "String", "INTEGER" => "Int64", "REAL" => "Float64",
-                "BOOLEAN" => "UInt8", _ => "String",
-            },
-            SqlDialect::Standard => match base {
-                "TEXT" => "CHARACTER VARYING(255)", "INTEGER" => "INTEGER", "REAL" => "DOUBLE PRECISION",
-                "BOOLEAN" => "BOOLEAN", _ => "CHARACTER VARYING(255)",
-            },
-        }
-    };
+    let map_type = |base: &str| -> &str { type_map.resolve(*dialect, base) };
 
     let columns_view = crate::rmap::columns_for_table(cells, table_name);
     let pk_cols = crate::rmap::primary_key_of_table(cells, table_name);
@@ -9204,6 +9325,262 @@ mod schema_tests {
         assert!(has_filter,
             "mixed rule must still contain a Filter from the unkeyed \
              branch's legacy scan; got {:?}", compiled.func);
+    }
+}
+
+// ── SQL Type Mapping table (#896) ────────────────────────────────────
+
+#[cfg(test)]
+mod sql_type_mapping_tests {
+    use super::*;
+    use crate::ast::{Object, fact_from_pairs, store};
+
+    /// #896 — Boot table must mirror the legacy `match dialect {
+    /// match base { ... } }` cascade exactly. Eight dialects × four
+    /// value types = 32 rows in the same declaration order so the
+    /// per-dialect TEXT / INTEGER / REAL / BOOLEAN mappings round-trip
+    /// to `resolve`.
+    #[test]
+    fn boot_has_expected_dialect_mappings_in_declared_order() {
+        let table = SqlTypeMappingTable::boot();
+        assert_eq!(table.rows.len(), 32,
+            "boot table must have 8 dialects × 4 value types");
+
+        let expected_dialects = [
+            "Sqlite", "PostgreSql", "MySql", "SqlServer",
+            "Oracle", "Db2", "ClickHouse", "Standard",
+        ];
+        let expected_value_types = ["TEXT", "INTEGER", "REAL", "BOOLEAN"];
+
+        for (dialect_i, dialect) in expected_dialects.iter().enumerate() {
+            for (vt_i, vt) in expected_value_types.iter().enumerate() {
+                let row = &table.rows[dialect_i * 4 + vt_i];
+                assert_eq!(&row.0, dialect,
+                    "row {} dialect", dialect_i * 4 + vt_i);
+                assert_eq!(&row.1, vt,
+                    "row {} value type", dialect_i * 4 + vt_i);
+            }
+        }
+
+        // Spot-check a few legacy mappings.
+        assert_eq!(table.resolve(SqlDialect::Sqlite, "BOOLEAN"), "INTEGER");
+        assert_eq!(table.resolve(SqlDialect::MySql, "TEXT"), "VARCHAR(255)");
+        assert_eq!(table.resolve(SqlDialect::Oracle, "INTEGER"), "NUMBER(10)");
+        assert_eq!(table.resolve(SqlDialect::ClickHouse, "REAL"), "Float64");
+    }
+
+    /// #896 — `resolve(dialect, value_type)` covers every (dialect ×
+    /// value_type) pair in the legacy match cascade. Boot fallback
+    /// powers the test; the assertions are the legacy nested-match
+    /// arms transposed into table form so a regression in the lift
+    /// surfaces here before the DDL-level round-trip test sees it.
+    #[test]
+    fn accessor_resolves_dialect_value_type_to_sql_type() {
+        let table = SqlTypeMappingTable::boot();
+
+        // Sqlite
+        assert_eq!(table.resolve(SqlDialect::Sqlite, "TEXT"),    "TEXT");
+        assert_eq!(table.resolve(SqlDialect::Sqlite, "INTEGER"), "INTEGER");
+        assert_eq!(table.resolve(SqlDialect::Sqlite, "REAL"),    "REAL");
+        assert_eq!(table.resolve(SqlDialect::Sqlite, "BOOLEAN"), "INTEGER");
+        // PostgreSql
+        assert_eq!(table.resolve(SqlDialect::PostgreSql, "TEXT"),    "TEXT");
+        assert_eq!(table.resolve(SqlDialect::PostgreSql, "INTEGER"), "INTEGER");
+        assert_eq!(table.resolve(SqlDialect::PostgreSql, "REAL"),    "DOUBLE PRECISION");
+        assert_eq!(table.resolve(SqlDialect::PostgreSql, "BOOLEAN"), "BOOLEAN");
+        // MySql
+        assert_eq!(table.resolve(SqlDialect::MySql, "TEXT"),    "VARCHAR(255)");
+        assert_eq!(table.resolve(SqlDialect::MySql, "INTEGER"), "INT");
+        assert_eq!(table.resolve(SqlDialect::MySql, "REAL"),    "DOUBLE");
+        assert_eq!(table.resolve(SqlDialect::MySql, "BOOLEAN"), "TINYINT(1)");
+        // SqlServer
+        assert_eq!(table.resolve(SqlDialect::SqlServer, "TEXT"),    "NVARCHAR(255)");
+        assert_eq!(table.resolve(SqlDialect::SqlServer, "INTEGER"), "INT");
+        assert_eq!(table.resolve(SqlDialect::SqlServer, "REAL"),    "FLOAT");
+        assert_eq!(table.resolve(SqlDialect::SqlServer, "BOOLEAN"), "BIT");
+        // Oracle
+        assert_eq!(table.resolve(SqlDialect::Oracle, "TEXT"),    "VARCHAR2(255)");
+        assert_eq!(table.resolve(SqlDialect::Oracle, "INTEGER"), "NUMBER(10)");
+        assert_eq!(table.resolve(SqlDialect::Oracle, "REAL"),    "NUMBER");
+        assert_eq!(table.resolve(SqlDialect::Oracle, "BOOLEAN"), "NUMBER(1)");
+        // Db2
+        assert_eq!(table.resolve(SqlDialect::Db2, "TEXT"),    "VARCHAR(255)");
+        assert_eq!(table.resolve(SqlDialect::Db2, "INTEGER"), "INTEGER");
+        assert_eq!(table.resolve(SqlDialect::Db2, "REAL"),    "DOUBLE");
+        assert_eq!(table.resolve(SqlDialect::Db2, "BOOLEAN"), "SMALLINT");
+        // ClickHouse
+        assert_eq!(table.resolve(SqlDialect::ClickHouse, "TEXT"),    "String");
+        assert_eq!(table.resolve(SqlDialect::ClickHouse, "INTEGER"), "Int64");
+        assert_eq!(table.resolve(SqlDialect::ClickHouse, "REAL"),    "Float64");
+        assert_eq!(table.resolve(SqlDialect::ClickHouse, "BOOLEAN"), "UInt8");
+        // Standard
+        assert_eq!(table.resolve(SqlDialect::Standard, "TEXT"),    "CHARACTER VARYING(255)");
+        assert_eq!(table.resolve(SqlDialect::Standard, "INTEGER"), "INTEGER");
+        assert_eq!(table.resolve(SqlDialect::Standard, "REAL"),    "DOUBLE PRECISION");
+        assert_eq!(table.resolve(SqlDialect::Standard, "BOOLEAN"), "BOOLEAN");
+
+        // Wildcard fallback: every legacy `_ =>` branch aliased the
+        // dialect's TEXT mapping. The accessor must preserve that.
+        assert_eq!(table.resolve(SqlDialect::Sqlite,     "DECIMAL"), "TEXT");
+        assert_eq!(table.resolve(SqlDialect::PostgreSql, "JSON"),    "TEXT");
+        assert_eq!(table.resolve(SqlDialect::MySql,      "DATE"),    "VARCHAR(255)");
+        assert_eq!(table.resolve(SqlDialect::SqlServer,  "UUID"),    "NVARCHAR(255)");
+        assert_eq!(table.resolve(SqlDialect::Oracle,     "BLOB"),    "VARCHAR2(255)");
+        assert_eq!(table.resolve(SqlDialect::Db2,        "TIMESTAMP"), "VARCHAR(255)");
+        assert_eq!(table.resolve(SqlDialect::ClickHouse, "Date"),    "String");
+        assert_eq!(table.resolve(SqlDialect::Standard,   "DECIMAL"), "CHARACTER VARYING(255)");
+    }
+
+    /// #896 — `from_readings_state` reads three parallel role
+    /// bindings (`SQL Dialect`, `Value Type`, `SQL Type`) out of the
+    /// `SQL_Dialect_maps_Value_Type_to_SQL_Type` cell. The synthetic
+    /// state below carries two rows so the test pins the role-binding
+    /// reader independently from the readings-text parser.
+    #[test]
+    fn from_readings_state_reads_parallel_enum_triples() {
+        let facts: alloc::vec::Vec<Object> = [
+            ("Sqlite",     "TEXT",    "TEXT"),
+            ("PostgreSql", "BOOLEAN", "BOOLEAN"),
+        ].iter().map(|(d, v, s)| fact_from_pairs(&[
+            ("SQL Dialect", *d),
+            ("Value Type", *v),
+            ("SQL Type", *s),
+        ])).collect();
+        let state = store(
+            "SQL_Dialect_maps_Value_Type_to_SQL_Type",
+            Object::Seq(facts.into()),
+            &Object::phi(),
+        );
+
+        let table = SqlTypeMappingTable::from_readings_state(&state);
+        assert_eq!(table.rows.len(), 2,
+            "synthetic state has two rows; table must mirror that");
+        assert_eq!(table.rows[0], (
+            "Sqlite".to_string(), "TEXT".to_string(), "TEXT".to_string()));
+        assert_eq!(table.rows[1], (
+            "PostgreSql".to_string(), "BOOLEAN".to_string(), "BOOLEAN".to_string()));
+        assert_eq!(table.resolve(SqlDialect::Sqlite, "TEXT"), "TEXT");
+        assert_eq!(table.resolve(SqlDialect::PostgreSql, "BOOLEAN"), "BOOLEAN");
+    }
+
+    /// #896 — empty state must fall back to `boot()` so a bare engine
+    /// (no readings loaded) emits identical DDL to the pre-#896 code.
+    #[test]
+    fn falls_back_to_boot_on_empty_state() {
+        let empty = Object::phi();
+        let table = SqlTypeMappingTable::from_readings_state(&empty);
+        let boot = SqlTypeMappingTable::boot();
+        assert_eq!(table.rows.len(), boot.rows.len(),
+            "empty state must round-trip to boot table");
+        for (i, (got, want)) in table.rows.iter().zip(boot.rows.iter()).enumerate() {
+            assert_eq!(got, want, "row {} differs from boot fallback", i);
+        }
+    }
+
+    /// #896 — the readings file
+    /// `readings/templates/sql-dialects.md` is the canonical source
+    /// for the per-dialect mapping. Parsing it through the metamodel
+    /// bootstrap must surface every legacy mapping arm so the
+    /// readings-driven `from_readings_state` is byte-identical to
+    /// `boot()` on the bundled corpus.
+    #[cfg(all(feature = "templates", not(feature = "no_std")))]
+    #[test]
+    fn readings_corpus_round_trips_to_boot_table() {
+        let sql_dialects_md = include_str!(
+            "../../../readings/templates/sql-dialects.md");
+        let state = crate::parse_forml2::parse_to_state_from(
+            sql_dialects_md, &Object::phi()
+        ).expect("sql-dialects.md must parse");
+
+        let table = SqlTypeMappingTable::from_readings_state(&state);
+        let boot = SqlTypeMappingTable::boot();
+        assert_eq!(table.rows.len(), boot.rows.len(),
+            "readings table must have the same row count as boot");
+
+        // Every boot row must be in the readings table — order may
+        // differ if the parser emits facts in a different sequence, so
+        // compare set-wise instead of index-wise.
+        for (d, v, s) in &boot.rows {
+            assert!(
+                table.rows.iter().any(|(rd, rv, rs)| rd == d && rv == v && rs == s),
+                "readings table missing boot row ({}, {}, {})", d, v, s,
+            );
+        }
+        for (d, v, s) in &table.rows {
+            assert!(
+                boot.rows.iter().any(|(bd, bv, bs)| bd == d && bv == v && bs == s),
+                "boot table missing readings row ({}, {}, {})", d, v, s,
+            );
+        }
+    }
+
+    /// #896 — `generate_ddl` must produce byte-identical output when
+    /// driven by either `boot()` or the readings-derived table. This
+    /// pins the legacy nested-match cascade against the lifted
+    /// table-driven accessor at the DDL-string layer.
+    #[cfg(all(feature = "templates", not(feature = "no_std")))]
+    #[test]
+    fn generate_ddl_byte_identical_across_boot_and_readings() {
+        let sql_dialects_md = include_str!(
+            "../../../readings/templates/sql-dialects.md");
+        let readings_state = crate::parse_forml2::parse_to_state_from(
+            sql_dialects_md, &Object::phi()
+        ).expect("sql-dialects.md must parse");
+        let readings_table = SqlTypeMappingTable::from_readings_state(&readings_state);
+        let boot_table = SqlTypeMappingTable::boot();
+
+        // Synthesize a minimal RMAP cell with one table carrying every
+        // legacy value-type so each (dialect, base) pair exercises a
+        // distinct branch of the lifted accessor.
+        let rmap_cells = crate::ast::Object::map(
+            [(
+                "RMAPTable".to_string(),
+                Object::Seq(alloc::vec![
+                    fact_from_pairs(&[("name", "t"), ("position", "0")]),
+                ].into()),
+            ),
+            (
+                "RMAPColumn".to_string(),
+                Object::Seq(alloc::vec![
+                    fact_from_pairs(&[
+                        ("tableName", "t"), ("name", "c_text"),
+                        ("type", "TEXT"), ("position", "0"),
+                        ("nullable", "true"),
+                    ]),
+                    fact_from_pairs(&[
+                        ("tableName", "t"), ("name", "c_int"),
+                        ("type", "INTEGER"), ("position", "1"),
+                        ("nullable", "true"),
+                    ]),
+                    fact_from_pairs(&[
+                        ("tableName", "t"), ("name", "c_real"),
+                        ("type", "REAL"), ("position", "2"),
+                        ("nullable", "true"),
+                    ]),
+                    fact_from_pairs(&[
+                        ("tableName", "t"), ("name", "c_bool"),
+                        ("type", "BOOLEAN"), ("position", "3"),
+                        ("nullable", "true"),
+                    ]),
+                ].into()),
+            )].into_iter().collect()
+        );
+
+        let dialects = [
+            SqlDialect::Sqlite, SqlDialect::PostgreSql, SqlDialect::MySql,
+            SqlDialect::SqlServer, SqlDialect::Oracle, SqlDialect::Db2,
+            SqlDialect::ClickHouse, SqlDialect::Standard,
+        ];
+        for dialect in dialects.iter() {
+            let boot_ddl = generate_ddl(
+                &rmap_cells, "t", dialect, &boot_table);
+            let readings_ddl = generate_ddl(
+                &rmap_cells, "t", dialect, &readings_table);
+            assert_eq!(boot_ddl, readings_ddl,
+                "DDL for {:?} differs between boot and readings: \
+                 boot={:?}, readings={:?}",
+                dialect.name(), boot_ddl, readings_ddl);
+        }
     }
 }
 
