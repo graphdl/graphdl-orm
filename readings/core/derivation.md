@@ -387,16 +387,45 @@ below.
    targeted only `compile_explicit_derivation`'s implicit-equi-join
    branch.)
 
-4. **`forward_chain_stratified` is 2-stratum only.**
-   With 3+ priority levels, the second + third level rules both
-   land in stratum 2 and fire within the SAME inner round —
-   neither sees the other's emit. The third level's
-   `has no Y 'middle'` guard evaluates against a state where
-   middle-priority value is still empty, so the third level fires
-   spuriously alongside the second level. To support 3+-level
-   cascades the engine would need dependency-aware stratification
-   (every rule reading negation of cell C lands in a stratum
-   STRICTLY LATER than every rule writing to C).
+4. **`forward_chain_stratified` is 2-stratum only.** (Closed by
+   task-814-stratify-3plus.)
+   The prior 2-stratum chainer ran ALL negation-guarded rules in
+   the same inner round. With 3+ priority levels — dual-gate /
+   single-gate / none — both the middle and lowest rules landed
+   in stratum 2 and fired together, so the lowest's
+   `has no Y 'middle'` guard evaluated against pre-emit state and
+   over-fired. The fix:
+   - **`evaluate::forward_chain_stratified_n`** is the
+     dependency-aware n-stratum entry point. It accepts
+     `StratifiedRule` records carrying each rule's
+     `consequent_cell`, `consequent_role_literals`, and
+     `negation_reads` (each AbsenceOf antecedent's cell + role-
+     literal pins). The chainer builds a dep graph where rule B
+     depends on rule A iff A's consequent cell matches one of B's
+     `negation_reads` cells AND the AbsenceOf's pins are
+     compatible with A's consequent pins. Topological depth
+     assignment partitions the rule set into sub-strata; each
+     sub-stratum runs to fixpoint before advancing.
+   - Role-literal pin compatibility (`pins_compatible` in
+     `evaluate.rs`) is what keeps the dep graph cycle-free: three
+     rules all writing to `Task_has_Target_Posture` with
+     different role-literal pins (`'dual-gate'` vs `'single-gate'`
+     vs `'none'`) don't form a dependency cycle because each
+     AbsenceOf only matches the rule whose consequent emits the
+     same literal — not every writer.
+   - Cells `derivation_meta:<rule_id>` carry the dep metadata at
+     runtime so the CLI compile path, apply path, and MCP query
+     path all use n-stratum dispatch automatically without
+     re-running the type-level compiler. Empty meta (no
+     `consequent_cell`, no `negation_reads`) collapses to depth
+     0 and runs in the first sub-stratum — equivalent to the
+     2-stratum bucket.
+   - The legacy 2-stratum `forward_chain_stratified(s1, s2, d, n)`
+     signature is preserved for callers without dep metadata and
+     correctly handles the 2-level cascade. Pinned by
+     `priority_cascaded_readiness_picks_highest_via_no_negation`
+     (unchanged) and the new 3-level pin
+     `priority_cascade_three_levels_fires_exactly_one_via_dependency_aware_stratification`.
 
 ### Substrate-user workaround for the "strongest of collection" pattern
 

@@ -327,6 +327,111 @@ pub fn forward_chain_defs_state_semi_naive_with_base_keys(
     (current_state, all_derived)
 }
 
+/// task-814-stratify-3plus: owned dependency metadata for a
+/// derivation rule, read at runtime from a `derivation_meta:<id>`
+/// cell. The CLI compile path / apply path / MCP query path
+/// reconstruct one `OwnedRuleDeps` per rule from the cells, build
+/// reference-typed `StratifiedRule` records on the fly, and call
+/// [`forward_chain_stratified_n`].
+pub struct OwnedRuleDeps {
+    pub id: String,
+    pub consequent_cell: String,
+    pub consequent_role_literals: Vec<(String, String)>,
+    pub negation_reads: Vec<(String, Vec<(String, String)>)>,
+}
+
+/// task-814-stratify-3plus: decode the
+/// `derivation_meta:<rule_id>` cell back into an `OwnedRuleDeps`.
+/// Returns `None` if the cell is absent (rule has no dep metadata
+/// — runtime treats it as depth 0 with no inbound dependencies).
+///
+/// The encoding (set in `compile_to_defs_state`) is a 3-tuple
+/// `<<consequent_cell, role_lits_seq, neg_reads_seq>>` where
+/// `role_lits_seq` is a sequence of `<role, value>` pairs and
+/// `neg_reads_seq` is a sequence of `<cell, role_lits_seq>` pairs.
+/// `Func::constant(obj)` wraps `obj` as `<atom("'"), obj>` so the
+/// cell content the decoder sees is the 2-tuple; we strip the
+/// `'` sentinel before reading the 3-tuple body.
+pub fn read_derivation_meta(d: &ast::Object, rule_id: &str) -> Option<OwnedRuleDeps> {
+    let cell_name = alloc::format!("derivation_meta:{}", rule_id);
+    let cell = ast::fetch_or_phi(&cell_name, d);
+    let items = cell.as_seq()?;
+    // Strip `Func::constant` wrapper `<atom("'"), payload>`.
+    let payload = if items.len() == 2 && items[0].as_atom() == Some("'") {
+        &items[1]
+    } else { return None; };
+    let body = payload.as_seq()?;
+    if body.len() != 3 { return None; }
+    let consequent_cell = body[0].as_atom().unwrap_or("").to_string();
+    let role_literals: Vec<(String, String)> = body[1].as_seq().map(|seq|
+        seq.iter().filter_map(|p| {
+            let kv = p.as_seq()?;
+            if kv.len() != 2 { return None; }
+            Some((kv[0].as_atom()?.to_string(), kv[1].as_atom()?.to_string()))
+        }).collect()).unwrap_or_default();
+    let negation_reads: Vec<(String, Vec<(String, String)>)> = body[2].as_seq().map(|seq|
+        seq.iter().filter_map(|entry| {
+            let kv = entry.as_seq()?;
+            if kv.len() != 2 { return None; }
+            let cell = kv[0].as_atom()?.to_string();
+            let pins: Vec<(String, String)> = kv[1].as_seq().map(|pin_seq|
+                pin_seq.iter().filter_map(|p| {
+                    let pair = p.as_seq()?;
+                    if pair.len() != 2 { return None; }
+                    Some((pair[0].as_atom()?.to_string(), pair[1].as_atom()?.to_string()))
+                }).collect()).unwrap_or_default();
+            Some((cell, pins))
+        }).collect()).unwrap_or_default();
+    Some(OwnedRuleDeps {
+        id: rule_id.to_string(),
+        consequent_cell,
+        consequent_role_literals: role_literals,
+        negation_reads,
+    })
+}
+
+/// Dependency-graph metadata for a derivation rule, used by
+/// [`forward_chain_stratified_n`] to partition the negation-guarded
+/// stratum into sub-strata that respect the natural dependency
+/// ordering of an N-level priority cascade.
+///
+/// task-814-stratify-3plus: the prior 2-stratum chainer ran ALL
+/// negation-guarded rules in the same inner round. With three
+/// priority levels — e.g. `Task has Target Posture 'dual-gate' /
+/// 'single-gate' / 'none'` where the middle level is guarded by
+/// `has no … 'dual-gate'` and the lowest is guarded by `has no …
+/// 'dual-gate'` AND `has no … 'single-gate'` — both the middle and
+/// the lowest rule land in the same negation bucket. The lowest
+/// rule's AbsenceOf-'single-gate' guard evaluates against state
+/// where the middle rule's emit hasn't been integrated yet, so the
+/// lowest over-fires alongside the correct middle-priority emit.
+///
+/// `consequent_cell` is the literal cell id the rule emits into
+/// (empty string for dynamic shapes — those participate as a single
+/// stratum because their dep edges can't be statically computed).
+/// `consequent_role_literals` is the (role, value) pin set on the
+/// consequent. `negation_reads` enumerates each `AbsenceOf`
+/// antecedent paired with its role-literal pins; an edge `A → B`
+/// (B depends on A) is created when A's `consequent_cell` matches
+/// one of B's `negation_reads` cells AND the AbsenceOf's pins are
+/// satisfied by A's `consequent_role_literals` (every pin in the
+/// AbsenceOf equals the corresponding pin on A's consequent).
+///
+/// Role-literal compatibility is what keeps the dep graph cycle-
+/// free in the priority cascade. Three rules all writing to
+/// `Task_has_Target_Posture` with different role-literal pins
+/// (`'dual-gate'` vs `'single-gate'` vs `'none'`) don't form a
+/// dependency cycle because each AbsenceOf only matches the rule
+/// whose consequent emits the same literal — not all three writers.
+#[derive(Clone, Copy)]
+pub struct StratifiedRule<'a> {
+    pub id: &'a str,
+    pub func: &'a ast::Func,
+    pub consequent_cell: &'a str,
+    pub consequent_role_literals: &'a [(String, String)],
+    pub negation_reads: &'a [(String, Vec<(String, String)>)],
+}
+
 /// Run a 2-stratum forward chain to a JOINT fixpoint: alternate
 /// between stratum 1 (positive `derivation:rule_*`) and stratum 2
 /// (negation-guarded `derivation_strat2:rule_*`) until BOTH passes
@@ -352,6 +457,14 @@ pub fn forward_chain_defs_state_semi_naive_with_base_keys(
 /// `max_outer_rounds` bounds the outer alternation to surface
 /// pathological rule sets (the inner rounds keep the existing 100
 /// cap from [`forward_chain_defs_state`]).
+///
+/// task-814-stratify-3plus: this 2-stratum signature is preserved
+/// for callers that only know `(id, func)` per rule (no dep
+/// metadata available). For 3+-level priority cascades, callers
+/// MUST use [`forward_chain_stratified_n`] and pass [`StratifiedRule`]
+/// records — the 2-stratum form treats every negation-guarded rule
+/// as one inner-round bucket, which over-fires for cascades whose
+/// AbsenceOf guards depend on other negation-guarded rules' emits.
 pub fn forward_chain_stratified(
     stratum1: &[(&str, &ast::Func)],
     stratum2: &[(&str, &ast::Func)],
@@ -377,6 +490,196 @@ pub fn forward_chain_stratified(
         }
     }
     (state, all_derived)
+}
+
+/// task-814-stratify-3plus: dependency-aware n-stratum forward
+/// chain that subsumes the 2-stratum [`forward_chain_stratified`]
+/// and additionally handles 3+-level priority cascades.
+///
+/// `positive` is the positive (no-AbsenceOf) rule set. `negation`
+/// is the negation-guarded rule set with [`StratifiedRule`] dep
+/// metadata. Both slices may be empty.
+///
+/// Algorithm:
+///
+/// 1. **Outer alternation** between positive-fixpoint and the
+///    topologically-ordered negation passes mirrors the 2-stratum
+///    Knaster-Tarski argument: each pass is monotonic, the joint
+///    operator on the powerset lattice has a unique least fixed
+///    point, and we reach it in ≤ |P_max|−|P| iterations.
+///
+/// 2. **Negation sub-stratification**: within the negation set,
+///    build a dependency graph where rule B depends on rule A iff
+///    A's `consequent_cell` matches one of B's `negation_reads`
+///    cells AND the AbsenceOf's role-literal pins are satisfied by
+///    A's `consequent_role_literals` (every pin in the AbsenceOf
+///    has an equal entry in A's consequent pins). Topologically
+///    sort the rules into sub-strata via depth assignment: a rule's
+///    depth is 1 + the max depth of its dependencies, capped at
+///    `negation.len()` to bound pathological mutually-recursive
+///    sets. Rules at the same depth run together in one inner
+///    fixpoint round.
+///
+/// 3. **Cycle handling**: cells whose role-literal compatibility
+///    creates a cycle (rare — only happens when two negation rules
+///    can each suppress the other) stay together in a single
+///    stratum, deferring to inner-fixpoint convergence. The depth
+///    cap guarantees termination even when a graph traversal would
+///    loop indefinitely.
+///
+/// 4. **Empty-metadata fallback**: a rule whose `negation_reads`
+///    is empty (CWA negation, SM-related synthetic rules) lands at
+///    depth 0 and runs in the first negation sub-stratum.
+///
+/// `max_outer_rounds` bounds the outer alternation. Inner rounds
+/// inherit the 100-iteration cap from [`forward_chain_defs_state`].
+pub fn forward_chain_stratified_n(
+    positive: &[StratifiedRule],
+    negation: &[StratifiedRule],
+    d: &ast::Object,
+    max_outer_rounds: usize,
+) -> (ast::Object, Vec<DerivedFact>) {
+    // Pre-compute the negation sub-stratification once — depths
+    // depend only on the rule set, not on the population state.
+    let sub_strata = stratify_negation_topologically(negation);
+
+    let pos_refs: Vec<(&str, &ast::Func)> = positive.iter()
+        .map(|r| (r.id, r.func)).collect();
+    let neg_refs_by_stratum: Vec<Vec<(&str, &ast::Func)>> = sub_strata.iter()
+        .map(|indices| indices.iter()
+            .map(|&i| (negation[i].id, negation[i].func)).collect())
+        .collect();
+
+    let mut state = d.clone();
+    let mut all_derived: Vec<DerivedFact> = Vec::new();
+    for _ in 0..max_outer_rounds {
+        let before = all_derived.len();
+        if !pos_refs.is_empty() {
+            let (s1, d1) = forward_chain_defs_state(&pos_refs, &state);
+            state = s1;
+            all_derived.extend(d1);
+        }
+        // task-814: drive each negation sub-stratum to fixpoint
+        // before advancing. With 3+ levels — dual-gate / single-gate
+        // / none — the middle level (depends only on the
+        // already-emitted top level) lands at depth 0, runs first,
+        // and integrates its emit. The lowest level (depends on
+        // both top and middle) lands at depth 1 and now sees the
+        // middle's emit so its AbsenceOf-'single-gate' guard
+        // correctly suppresses the spurious 'none' emit.
+        for stratum_refs in &neg_refs_by_stratum {
+            if stratum_refs.is_empty() { continue; }
+            let (s2, d2) = forward_chain_defs_state(stratum_refs, &state);
+            state = s2;
+            all_derived.extend(d2);
+        }
+        if all_derived.len() == before {
+            break;
+        }
+    }
+    (state, all_derived)
+}
+
+/// task-814-stratify-3plus: assign each negation-guarded rule a
+/// dependency depth via a memoised DFS over the dep graph induced
+/// by AbsenceOf-cell + role-literal-pin compatibility. Returns a
+/// `Vec<Vec<usize>>` where the outer index is the depth and the
+/// inner Vec is the rule indices at that depth.
+///
+/// Edge semantics: rule B depends on rule A (depth(B) > depth(A))
+/// iff there exists `(neg_cell, neg_pins)` in B.negation_reads
+/// such that A.consequent_cell == neg_cell AND every pin in
+/// neg_pins has an equal entry in A.consequent_role_literals.
+/// Self-edges are skipped (a rule's own consequent doesn't make
+/// it depend on itself; the AbsenceOf guard reads the previous
+/// round's state during fixpoint convergence).
+///
+/// Depth assignment uses post-order DFS so a rule's depth is
+/// known after all its dependencies' depths are. The depth cap
+/// at `n` (the rule count) bounds the recursion in the presence
+/// of mutually-recursive role-literal-compatible cycles — those
+/// rules stay at the same depth and converge via inner-round
+/// fixpoint.
+fn stratify_negation_topologically(rules: &[StratifiedRule]) -> Vec<Vec<usize>> {
+    if rules.is_empty() { return Vec::new(); }
+    let n = rules.len();
+    // Build dependency edges: deps[i] = list of rule indices that
+    // rule i depends on (i.e., must run after).
+    let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (b_idx, b) in rules.iter().enumerate() {
+        for (a_idx, a) in rules.iter().enumerate() {
+            if a_idx == b_idx { continue; }
+            if a.consequent_cell.is_empty() { continue; }
+            // For each AbsenceOf antecedent on B, check whether A's
+            // consequent could satisfy it.
+            let satisfies = b.negation_reads.iter().any(|(neg_cell, neg_pins)| {
+                neg_cell == a.consequent_cell
+                    && pins_compatible(neg_pins, a.consequent_role_literals)
+            });
+            if satisfies {
+                deps[b_idx].push(a_idx);
+            }
+        }
+    }
+    // Memoised DFS to assign depths. depth_cache[i] = Some(depth)
+    // once visited; visiting[i] guards against revisit-mid-traversal
+    // (cycles); cycles cap depth at `n` so the loop terminates.
+    let mut depth: Vec<Option<usize>> = vec![None; n];
+    let mut visiting: Vec<bool> = vec![false; n];
+    for i in 0..n {
+        compute_depth(i, &deps, &mut depth, &mut visiting, n);
+    }
+    // Bucket rule indices by depth.
+    let max_d = depth.iter().filter_map(|d| *d).max().unwrap_or(0);
+    let mut strata: Vec<Vec<usize>> = vec![Vec::new(); max_d + 1];
+    for (i, d) in depth.iter().enumerate() {
+        if let Some(d) = d { strata[*d].push(i); }
+    }
+    strata
+}
+
+/// Are every (role, value) pin in `required` satisfied by some pin
+/// in `provided`? Used to test whether an AbsenceOf's role-literal
+/// pins are compatible with another rule's `consequent_role_literals`.
+///
+/// Empty `required` matches anything (a pin-free AbsenceOf reads the
+/// whole cell). Empty `provided` only satisfies an empty `required`.
+fn pins_compatible(
+    required: &[(String, String)],
+    provided: &[(String, String)],
+) -> bool {
+    required.iter().all(|(role, value)|
+        provided.iter().any(|(r, v)| r == role && v == value))
+}
+
+fn compute_depth(
+    i: usize,
+    deps: &[Vec<usize>],
+    depth: &mut [Option<usize>],
+    visiting: &mut [bool],
+    cap: usize,
+) -> usize {
+    if let Some(d) = depth[i] { return d; }
+    // Cycle guard: if we're already mid-traversal of i, return 0
+    // (treat the back-edge as no contribution). The cap on max
+    // recursion depth via `cap` keeps mutually-recursive cycles
+    // from running away — they collapse to depth 0 and converge
+    // via inner-round fixpoint.
+    if visiting[i] {
+        return 0;
+    }
+    visiting[i] = true;
+    let mut max_dep = 0usize;
+    for &j in &deps[i] {
+        let dj = compute_depth(j, deps, depth, visiting, cap);
+        // dj+1, but capped so a pathological cycle doesn't blow
+        // the stack or the strata vector.
+        let candidate = (dj + 1).min(cap);
+        if candidate > max_dep { max_dep = candidate; }
+    }
+    visiting[i] = false;
+    depth[i] = Some(max_dep);
+    max_dep
 }
 
 /// Like [`forward_chain_defs_state`] but capped at `max_rounds` rule

@@ -1567,3 +1567,320 @@ Task 'task-3' has Candidate Readiness 'ready'.
         t3, pairs,
         cells_iter(&final_state).iter().map(|(n, _)| *n).collect::<Vec<_>>());
 }
+
+// task-814-stratify-3plus: THREE-LEVEL priority cascade pinned end-to-end
+// against `forward_chain_stratified`. The 2-level cascade pinned above
+// composed under the prior 2-stratum chainer because exactly ONE rule
+// (the 'blocked' level) carried an AbsenceOf guard — stratum 1 emitted
+// 'ready', stratum 2 emitted 'blocked' guarded by `has no … 'ready'`,
+// and the inner alternation reached a unique least fixed point.
+//
+// At three levels — dual-gate / single-gate / none — both the
+// middle-priority rule (single-gate, guarded by `has no … 'dual-gate'`)
+// and the lowest-priority rule (none, guarded by `has no … 'dual-gate'`
+// AND `has no … 'single-gate'`) land in the same negation bucket and
+// fire within the SAME inner round. The lowest rule's AbsenceOf check
+// reads `Task_has_Target_Posture` BEFORE the middle rule's emit has
+// integrated into the cell, so 'none' over-fires alongside the correct
+// middle-priority emit.
+//
+// The fix replaces the 2-stratum fixpoint with a dependency-aware
+// n-stratum stratification: rules are partitioned by topological order
+// of their AbsenceOf dependencies on other rules' consequent cells,
+// and each stratum runs to fixpoint before advancing. Three Tasks
+// exercise the full cascade:
+//   t-dual    has Candidate Posture {'dual-gate', 'single-gate', 'none'}
+//     → expected Target Posture = ['dual-gate'] (highest)
+//   t-single  has Candidate Posture {'single-gate', 'none'}
+//     → expected Target Posture = ['single-gate'] (mid, dual-gate absent)
+//   t-none    has Candidate Posture {'none'}
+//     → expected Target Posture = ['none'] (lowest, neither stronger absent)
+//
+// If 'none' (or 'single-gate' for t-single) leaks in, the chainer is
+// still routing both negation-guarded rules through the same round and
+// the AbsenceOf guard on the weaker rule isn't suppressing it.
+#[test]
+fn priority_cascade_three_levels_fires_exactly_one_via_dependency_aware_stratification() {
+    use crate::ast::{cells_iter, fetch_or_phi};
+
+    let src = r#"# Three-level priority cascade (task-814-stratify-3plus)
+Task(.id) is an entity type.
+
+Target Posture is a value type.
+Candidate Posture is a value type.
+
+## Fact Types
+Task has Candidate Posture.
+Task has Target Posture.
+
+## Derivation Rules
+* Task has Target Posture 'dual-gate' iff Task has Candidate Posture 'dual-gate'.
+* Task has Target Posture 'single-gate' iff Task has Candidate Posture 'single-gate' and Task has no Target Posture 'dual-gate'.
+* Task has Target Posture 'none' iff Task has Candidate Posture 'none' and Task has no Target Posture 'dual-gate' and Task has no Target Posture 'single-gate'.
+
+## Instance Facts
+Task 't-dual' has Candidate Posture 'dual-gate'.
+Task 't-dual' has Candidate Posture 'single-gate'.
+Task 't-dual' has Candidate Posture 'none'.
+Task 't-single' has Candidate Posture 'single-gate'.
+Task 't-single' has Candidate Posture 'none'.
+Task 't-none' has Candidate Posture 'none'.
+"#;
+
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    let model = crate::compile::compile(&state);
+
+    // task-814-stratify-3plus: use the dependency-aware n-stratum
+    // entry point `forward_chain_stratified_n`. The old 2-stratum
+    // entry point `forward_chain_stratified` over-fires here because
+    // the 'single-gate' and 'none' rules both land in the same
+    // negation bucket. The new API walks each rule's AbsenceOf
+    // antecedents + role-literal pins to assign a topological depth,
+    // so 'none' (depth 1, depends on 'single-gate') runs strictly
+    // after 'single-gate' (depth 0) — and 'none's
+    // AbsenceOf-'single-gate' guard correctly suppresses the
+    // spurious lowest-priority emit.
+    let positive: Vec<crate::evaluate::StratifiedRule> = model.derivations.iter()
+        .filter(|d| !d.uses_negation)
+        .map(|d| crate::evaluate::StratifiedRule {
+            id: d.id.as_str(),
+            func: &d.func,
+            consequent_cell: d.consequent_cell.as_str(),
+            consequent_role_literals: &d.consequent_role_literals,
+            negation_reads: &d.negation_reads,
+        }).collect();
+    let negation: Vec<crate::evaluate::StratifiedRule> = model.derivations.iter()
+        .filter(|d| d.uses_negation)
+        .map(|d| crate::evaluate::StratifiedRule {
+            id: d.id.as_str(),
+            func: &d.func,
+            consequent_cell: d.consequent_cell.as_str(),
+            consequent_role_literals: &d.consequent_role_literals,
+            negation_reads: &d.negation_reads,
+        }).collect();
+    let (final_state, _) = crate::evaluate::forward_chain_stratified_n(
+        &positive, &negation, &state, 100);
+
+    let cell = fetch_or_phi("Task_has_Target_Posture", &final_state);
+    let pairs: Vec<(String, String)> = cell.as_seq().map(|facts| {
+        facts.iter().filter_map(|f| {
+            let pairs = f.as_seq()?;
+            let mut task: Option<String> = None;
+            let mut posture: Option<String> = None;
+            for p in pairs.iter() {
+                let kv = p.as_seq()?;
+                if kv.len() != 2 { continue; }
+                let k = kv[0].as_atom()?;
+                let v = kv[1].as_atom()?;
+                if k == "Task" { task = Some(v.to_string()); }
+                if k == "Target Posture" { posture = Some(v.to_string()); }
+            }
+            Some((task?, posture?))
+        }).collect()
+    }).unwrap_or_default();
+
+    let by_task = |task_id: &str| -> Vec<String> {
+        let mut out: Vec<String> = pairs.iter()
+            .filter(|(t, _)| t == task_id).map(|(_, p)| p.clone()).collect();
+        out.sort();
+        out
+    };
+
+    // t-dual carries all three candidate postures; only the strongest
+    // ('dual-gate') should land. Pre-fix the chainer routes 'single-gate'
+    // through stratum 2 (its AbsenceOf reads the 'dual-gate'-populated
+    // cell, which IS integrated by then) and gets suppressed — but the
+    // 'none' rule ALSO routes through stratum 2 and its guards evaluate
+    // in the SAME round as the 'single-gate' emit, so 'none' over-fires.
+    assert_eq!(by_task("t-dual"), vec!["dual-gate"],
+        "t-dual carries all 3 candidate postures — expected ONLY \
+         'dual-gate' (highest). All pairs: {:?}", pairs);
+
+    // t-single: 'single-gate' should win; 'none' should be suppressed by
+    // its AbsenceOf-'single-gate' guard. This is the pre-fix failure
+    // mode — both rules land in stratum 2's joint inner round.
+    assert_eq!(by_task("t-single"), vec!["single-gate"],
+        "t-single carries 'single-gate' + 'none' candidate postures — \
+         expected ONLY 'single-gate'. If 'none' leaks in, the chainer \
+         fired 'single-gate' and 'none' in the same inner round and \
+         'none's AbsenceOf-'single-gate' guard evaluated against the \
+         pre-emit state. All pairs: {:?}", pairs);
+
+    // t-none: 'none' is the only level whose candidate matches; neither
+    // stronger AbsenceOf guard is violated, so 'none' fires.
+    assert_eq!(by_task("t-none"), vec!["none"],
+        "t-none has only 'none' candidate — expected exactly 'none', \
+         got {:?}. Final cells: {:?}",
+        by_task("t-none"),
+        cells_iter(&final_state).iter().map(|(n, _)| *n).collect::<Vec<_>>());
+}
+
+// task-814-stratify-3plus: validate the runtime cell-based path
+// that the CLI compile / apply / MCP query paths use. The end-to-end
+// CLI dispatch can't use the typed `CompiledDerivation` records
+// directly — it reads rules from `derivation:rule_*` / `derivation_strat2:rule_*`
+// cells produced by `compile_to_defs_state`. To carry dep metadata
+// through that boundary, the compiler emits parallel
+// `derivation_meta:<rule_id>` cells, and the runtime decodes them
+// into `OwnedRuleDeps` via `evaluate::read_derivation_meta`.
+//
+// This test exercises that round-trip end-to-end:
+//   1. Compile the same 3-tier cascade reading via `compile_to_defs_state`.
+//   2. Build runtime state via `defs_to_state` — the same shape the
+//      CLI sees post-compile.
+//   3. Decode the meta cells with `read_derivation_meta`.
+//   4. Reconstruct `StratifiedRule` records from the decoded
+//      `OwnedRuleDeps` (mirroring `cli::entry`'s post-#814 wiring).
+//   5. Run `forward_chain_stratified_n` against the runtime state
+//      and assert the same 3-tier behavior as the typed-path test.
+//
+// If this regresses, the cell-encoding scheme (`derivation_meta:`)
+// is broken — every downstream consumer (CLI, apply path, MCP query)
+// would fall back to depth-0 negation bucketing and the 3-tier
+// over-fire would resurface.
+#[test]
+fn priority_cascade_three_levels_round_trips_via_derivation_meta_cells() {
+    use crate::ast::{cells_iter, fetch_or_phi};
+
+    let src = r#"# Three-level cascade round-tripped via cell metadata (task-814-stratify-3plus)
+Task(.id) is an entity type.
+
+Target Posture is a value type.
+Candidate Posture is a value type.
+
+## Fact Types
+Task has Candidate Posture.
+Task has Target Posture.
+
+## Derivation Rules
+* Task has Target Posture 'dual-gate' iff Task has Candidate Posture 'dual-gate'.
+* Task has Target Posture 'single-gate' iff Task has Candidate Posture 'single-gate' and Task has no Target Posture 'dual-gate'.
+* Task has Target Posture 'none' iff Task has Candidate Posture 'none' and Task has no Target Posture 'dual-gate' and Task has no Target Posture 'single-gate'.
+
+## Instance Facts
+Task 't-dual' has Candidate Posture 'dual-gate'.
+Task 't-dual' has Candidate Posture 'single-gate'.
+Task 't-dual' has Candidate Posture 'none'.
+Task 't-single' has Candidate Posture 'single-gate'.
+Task 't-single' has Candidate Posture 'none'.
+Task 't-none' has Candidate Posture 'none'.
+"#;
+
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    // Mirror the CLI's post-compile state layout: defs into a Map store.
+    let defs = crate::compile::compile_to_defs_state(&state);
+    let d = crate::ast::defs_to_state(&defs, &state);
+
+    // Mirror `cli::entry`'s collect_derivs + StratifiedRule
+    // reconstruction. The id stripping must match what
+    // `compile_to_defs_state` emitted: `derivation_meta:<rule_id>`
+    // keys the rule by the same id that's the suffix of
+    // `derivation:<rule_id>` / `derivation_strat2:<rule_id>` cells.
+    let collect_derivs = |prefix: &str, state: &crate::ast::Object| -> Vec<(String, crate::ast::Func)> {
+        cells_iter(state).into_iter()
+            .filter(|(n, _)| n.starts_with(prefix))
+            .map(|(n, contents)| (n.to_string(), crate::ast::metacompose(contents, state)))
+            .collect()
+    };
+    let stratum1 = collect_derivs("derivation:rule_", &d);
+    let stratum2 = collect_derivs("derivation_strat2:rule_", &d);
+    assert!(!stratum1.is_empty(), "stratum1 must contain the positive 'dual-gate' rule");
+    assert_eq!(stratum2.len(), 2,
+        "stratum2 must contain BOTH the 'single-gate' and 'none' rules; \
+         pre-fix dispatch lumped them into one inner round. got {} rules",
+        stratum2.len());
+
+    let extract_id = |cell_name: &str, prefix: &str| -> String {
+        cell_name.strip_prefix(prefix).unwrap_or(cell_name).to_string()
+    };
+    let s1_owned: Vec<crate::evaluate::OwnedRuleDeps> = stratum1.iter()
+        .map(|(name, _)| {
+            let id = extract_id(name, "derivation:");
+            crate::evaluate::read_derivation_meta(&d, &id)
+                .unwrap_or_else(|| crate::evaluate::OwnedRuleDeps {
+                    id, consequent_cell: String::new(),
+                    consequent_role_literals: Vec::new(),
+                    negation_reads: Vec::new(),
+                })
+        }).collect();
+    let s2_owned: Vec<crate::evaluate::OwnedRuleDeps> = stratum2.iter()
+        .map(|(name, _)| {
+            let id = extract_id(name, "derivation_strat2:");
+            crate::evaluate::read_derivation_meta(&d, &id)
+                .unwrap_or_else(|| crate::evaluate::OwnedRuleDeps {
+                    id, consequent_cell: String::new(),
+                    consequent_role_literals: Vec::new(),
+                    negation_reads: Vec::new(),
+                })
+        }).collect();
+
+    // Assert the meta-cell round-trip actually populated dep metadata.
+    // Without this, the chainer would silently fall back to depth-0
+    // bucketing — the same bug the typed-path test surfaces.
+    let neg_with_pins: Vec<&crate::evaluate::OwnedRuleDeps> = s2_owned.iter()
+        .filter(|d| !d.negation_reads.is_empty()).collect();
+    assert_eq!(neg_with_pins.len(), 2,
+        "both stratum-2 rules must carry their AbsenceOf cell + role-literal pins \
+         post round-trip. got {:?} rules with pins",
+        neg_with_pins.iter().map(|d| (&d.id, &d.negation_reads)).collect::<Vec<_>>());
+    let cons_with_lit: Vec<&crate::evaluate::OwnedRuleDeps> = s2_owned.iter()
+        .filter(|d| !d.consequent_role_literals.is_empty()).collect();
+    assert_eq!(cons_with_lit.len(), 2,
+        "both stratum-2 rules must carry their consequent role-literal pins \
+         post round-trip. got {:?} rules with pins",
+        cons_with_lit.iter().map(|d| (&d.id, &d.consequent_role_literals)).collect::<Vec<_>>());
+
+    let s1_rules: Vec<crate::evaluate::StratifiedRule> = stratum1.iter()
+        .zip(s1_owned.iter())
+        .map(|((name, func), deps)| crate::evaluate::StratifiedRule {
+            id: name.as_str(),
+            func,
+            consequent_cell: deps.consequent_cell.as_str(),
+            consequent_role_literals: &deps.consequent_role_literals,
+            negation_reads: &deps.negation_reads,
+        }).collect();
+    let s2_rules: Vec<crate::evaluate::StratifiedRule> = stratum2.iter()
+        .zip(s2_owned.iter())
+        .map(|((name, func), deps)| crate::evaluate::StratifiedRule {
+            id: name.as_str(),
+            func,
+            consequent_cell: deps.consequent_cell.as_str(),
+            consequent_role_literals: &deps.consequent_role_literals,
+            negation_reads: &deps.negation_reads,
+        }).collect();
+    let (final_state, _) = crate::evaluate::forward_chain_stratified_n(
+        &s1_rules, &s2_rules, &d, 100);
+
+    let cell = fetch_or_phi("Task_has_Target_Posture", &final_state);
+    let pairs: Vec<(String, String)> = cell.as_seq().map(|facts| {
+        facts.iter().filter_map(|f| {
+            let pairs = f.as_seq()?;
+            let mut task: Option<String> = None;
+            let mut posture: Option<String> = None;
+            for p in pairs.iter() {
+                let kv = p.as_seq()?;
+                if kv.len() != 2 { continue; }
+                let k = kv[0].as_atom()?;
+                let v = kv[1].as_atom()?;
+                if k == "Task" { task = Some(v.to_string()); }
+                if k == "Target Posture" { posture = Some(v.to_string()); }
+            }
+            Some((task?, posture?))
+        }).collect()
+    }).unwrap_or_default();
+    let by_task = |task_id: &str| -> Vec<String> {
+        let mut out: Vec<String> = pairs.iter()
+            .filter(|(t, _)| t == task_id).map(|(_, p)| p.clone()).collect();
+        out.sort();
+        out
+    };
+
+    assert_eq!(by_task("t-dual"), vec!["dual-gate"],
+        "t-dual via meta-cell round trip — expected ONLY 'dual-gate'. All pairs: {:?}", pairs);
+    assert_eq!(by_task("t-single"), vec!["single-gate"],
+        "t-single via meta-cell round trip — expected ONLY 'single-gate'. If 'none' \
+         leaks in, `derivation_meta:` cells didn't round-trip dep info correctly. \
+         All pairs: {:?}", pairs);
+    assert_eq!(by_task("t-none"), vec!["none"],
+        "t-none via meta-cell round trip — expected exactly 'none'. All pairs: {:?}", pairs);
+}
