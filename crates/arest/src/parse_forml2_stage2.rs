@@ -8836,6 +8836,42 @@ mod tests {
             names);
     }
 
+    /// task-919 probe: verify the parser's longest-first noun matching
+    /// actually lets a multi-word noun coexist with a suffix-overlap
+    /// noun. The original task-919 investigation reported that
+    /// `Platform Function(.Name) is an entity type.` failed to register
+    /// because `Function` is already a noun. This test asserts the
+    /// opposite: both must end up in the noun catalog AND in the parsed
+    /// state's Noun cell. If this test fails, the diagnosis was right
+    /// and the parser needs a fix; if it passes, the diagnosis was
+    /// wrong and the substrate already supports this.
+    #[test]
+    fn multi_word_noun_coexists_with_suffix_noun() {
+        let text = "\
+            Function(.id) is an entity type.\n\
+            Platform Function(.Name) is an entity type.\n\
+        ";
+        let names = super::extract_declared_noun_names(text);
+        assert!(names.iter().any(|n| n == "Function"),
+            "extract_declared_noun_names must register Function; got {:?}", names);
+        assert!(names.iter().any(|n| n == "Platform Function"),
+            "extract_declared_noun_names must register Platform Function alongside \
+             Function; got {:?}", names);
+
+        let state = super::parse_to_state_via_stage12(text)
+            .expect("stage12 parse must succeed");
+        let noun_cell = fetch_or_phi("Noun", &state);
+        let noun_facts = noun_cell.as_seq().expect("Noun cell must be a sequence");
+        let cataloged: Vec<String> = noun_facts.iter()
+            .filter_map(|f| binding(f, "name").map(String::from))
+            .collect();
+        assert!(cataloged.iter().any(|n| n == "Function"),
+            "parsed Noun cell must contain Function; got {:?}", cataloged);
+        assert!(cataloged.iter().any(|n| n == "Platform Function"),
+            "parsed Noun cell must contain Platform Function alongside Function; \
+             got {:?}", cataloged);
+    }
+
     /// Coupled regression: `strip_role_literals` (line 2272) ALSO scans
     /// for the close-quote of role literals — this time to STRIP them
     /// before reconstructing the canonical FT id. Without dispatching
