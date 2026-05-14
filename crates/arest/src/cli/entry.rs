@@ -298,7 +298,7 @@ fn system(key: &str, input: &str, d: &ast::Object) -> (String, ast::Object) {
         let new_cell = ast::Object::Seq(new_items.into());
         let mut delta_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
         delta_map.insert(ft_name.to_string(), new_cell);
-        let delta = ast::Object::Map(delta_map);
+        let delta = ast::Object::map(delta_map);
         let new_d = ast::merge_delta(d, &delta, None);
         return ("ok".into(), new_d);
     }
@@ -698,7 +698,7 @@ pub fn main_entry() {
                                 && !ast::READINGS_DERIVED_META_CELLS.contains(name))
                             .map(|(name, contents)| (name.to_string(), contents.clone()))
                             .collect();
-                    ast::Object::Map(map)
+                    ast::Object::map(map)
                 };
                 let prior_cell_count = ast::cells_iter(&prior_population).len();
                 if prior_cell_count > 0 {
@@ -856,7 +856,7 @@ pub fn main_entry() {
                             new_map.insert(name.to_string(), contents.clone());
                         }
                     }
-                    ast::Object::Map(new_map)
+                    ast::Object::map(new_map)
                 };
 
                 // Forward-chain over user `derivation:rule_*` defs to
