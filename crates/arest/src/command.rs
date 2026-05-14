@@ -1229,6 +1229,100 @@ fn create_via_defs(
     }
 }
 
+/// task-919: resolve the State Machine Definition id bound to a noun.
+/// Reads `State_Machine_Definition_is_for_Noun` instance facts.
+fn lookup_sm_def_for_noun(d: &ast::Object, noun: &str) -> Option<String> {
+    ast::fetch_or_phi("State_Machine_Definition_is_for_Noun", d).as_seq()
+        .and_then(|facts| facts.iter().find_map(|f| {
+            (ast::binding(f, "Noun") == Some(noun))
+                .then(|| ast::binding(f, "State Machine Definition").map(String::from))
+                .flatten()
+        }))
+}
+
+/// task-919: resolve the firing Transition's id by joining the three
+/// Transition cells (`is_defined_in_State_Machine_Definition`,
+/// `is_from_Status`, `is_to_Status`). The joined row uniquely identifies
+/// the transition that fires for a given (sm, from, to) tuple.
+fn find_firing_transition_id(
+    d: &ast::Object,
+    sm_def: &str,
+    from_status: &str,
+    to_status: &str,
+) -> Option<String> {
+    let from_cell = ast::fetch_or_phi("Transition_is_from_Status", d);
+    let to_cell = ast::fetch_or_phi("Transition_is_to_Status", d);
+    let in_sm_cell = ast::fetch_or_phi(
+        "Transition_is_defined_in_State_Machine_Definition", d);
+    let in_sm: Vec<String> = in_sm_cell.as_seq().map(|facts| facts.iter().filter_map(|f| {
+        let t = ast::binding(f, "Transition")?;
+        let m = ast::binding(f, "State Machine Definition")?;
+        (m == sm_def).then(|| t.to_string())
+    }).collect()).unwrap_or_default();
+    in_sm.into_iter().find(|t| {
+        let from_match = from_cell.as_seq().map(|facts| facts.iter().any(|f| {
+            ast::binding(f, "Transition") == Some(t.as_str())
+                && ast::binding(f, "Status") == Some(from_status)
+        })).unwrap_or(false);
+        let to_match = to_cell.as_seq().map(|facts| facts.iter().any(|f| {
+            ast::binding(f, "Transition") == Some(t.as_str())
+                && ast::binding(f, "Status") == Some(to_status)
+        })).unwrap_or(false);
+        from_match && to_match
+    })
+}
+
+/// task-919: resolve the Verb performed during a Transition. Tries the
+/// canonical `Verb_is_performed_during_Transition` cell and the
+/// parenthesized `(Mealy semantics)` variant, since the parser may
+/// register either form depending on whether the inline annotation is
+/// folded into the FT id.
+fn lookup_verb_for_transition(d: &ast::Object, transition_id: &str) -> Option<String> {
+    for &cell_name in &[
+        "Verb_is_performed_during_Transition",
+        "Verb_is_performed_during_Transition_(Mealy_semantics)",
+        "Verb_is_performed_during_Transition_(mealy_semantics)",
+    ] {
+        if let Some(v) = ast::fetch_or_phi(cell_name, d).as_seq().and_then(|facts| {
+            facts.iter().find_map(|f| {
+                (ast::binding(f, "Transition") == Some(transition_id))
+                    .then(|| ast::binding(f, "Verb").map(String::from))
+                    .flatten()
+            })
+        }) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// task-919: dispatch target derived from a Function entity. Verb is a
+/// subtype of Function (core.md:15), so the verb id keys directly into
+/// Function FTs. `name` selects the in-process Platform handler;
+/// `callback_uri` selects an HTTP dispatch (deferred follow-up).
+struct DispatchTarget {
+    name: Option<String>,
+    callback_uri: Option<String>,
+}
+
+fn lookup_dispatch_for_function(d: &ast::Object, fn_id: &str) -> DispatchTarget {
+    let name = ast::fetch_or_phi("Function_has_Name", d).as_seq().and_then(|facts| {
+        facts.iter().find_map(|f| {
+            (ast::binding(f, "Function") == Some(fn_id))
+                .then(|| ast::binding(f, "Name").map(String::from))
+                .flatten()
+        })
+    });
+    let callback_uri = ast::fetch_or_phi("Function_has_callback_URI", d).as_seq().and_then(|facts| {
+        facts.iter().find_map(|f| {
+            (ast::binding(f, "Function") == Some(fn_id))
+                .then(|| ast::binding(f, "callback URI").map(String::from))
+                .flatten()
+        })
+    });
+    DispatchTarget { name, callback_uri }
+}
+
 fn transition_via_defs(
     d: &ast::Object,
     entity_id: &str,
@@ -1276,7 +1370,7 @@ fn transition_via_defs(
         .unwrap_or(new_state);
 
     let transition_fired = new_status.is_some();
-    let status = new_status.or_else(|| current_status.map(|s| s.to_string()));
+    let status = new_status.clone().or_else(|| current_status.map(|s| s.to_string()));
 
     // Audit D1 (#703): deontic gate on the post-rewrite state. A
     // transition is a mutation like any other — every deontic
@@ -1288,7 +1382,7 @@ fn transition_via_defs(
     // already follow. Skip when the transition didn't actually fire
     // (no machine matched / event ignored) — there's no new state to
     // validate and no noun to key the per-noun aggregate on.
-    let (violations, rejected) = if transition_fired && !noun.is_empty() {
+    let (mut violations, mut rejected) = if transition_fired && !noun.is_empty() {
         let ctx_obj = ast::encode_eval_context_state("", None, &new_state);
         let validate_key = format!("validate:{}", noun);
         let validate_func = def_func(&validate_key, d)
@@ -1301,6 +1395,51 @@ fn transition_via_defs(
     } else {
         (vec![], false)
     };
+
+    // task-919: dispatch — after validation passes, look up the Function
+    // bound to the firing Transition's Verb (Verb is a subtype of
+    // Function per core.md:15, so the verb id keys Function FTs directly).
+    // Invoke the in-process Platform handler when `Function has Name` is
+    // set; HTTP `callback URI` dispatch is a follow-up. On Bottom, mark
+    // rejected and append a synthesized violation so the delta-emit path
+    // rolls back the SM cell flip (delta = phi when rejected, mirroring
+    // the alethic-violation rollback at L1312).
+    if !rejected && transition_fired && !noun.is_empty() {
+        if let (Some(from), Some(new)) = (current_status, new_status.as_deref()) {
+            let dispatch_lookup = lookup_sm_def_for_noun(d, &noun)
+                .and_then(|sm| find_firing_transition_id(d, &sm, from, new))
+                .and_then(|tid| lookup_verb_for_transition(d, &tid).map(|v| (tid, v)));
+            if let Some((tid, verb_id)) = dispatch_lookup {
+                let target = lookup_dispatch_for_function(d, &verb_id);
+                if let Some(name) = target.name {
+                    let mut ctx_map = hashbrown::HashMap::new();
+                    ctx_map.insert("noun".to_string(), ast::Object::atom(&noun));
+                    ctx_map.insert("id".to_string(), ast::Object::atom(entity_id));
+                    ctx_map.insert("from_status".to_string(), ast::Object::atom(from));
+                    ctx_map.insert("to_status".to_string(), ast::Object::atom(new));
+                    ctx_map.insert("transition_id".to_string(), ast::Object::atom(&tid));
+                    ctx_map.insert("verb_id".to_string(), ast::Object::atom(&verb_id));
+                    ctx_map.insert("event".to_string(), ast::Object::atom(event));
+                    let ctx = ast::Object::map(ctx_map);
+                    let result = ast::apply(&ast::Func::Platform(name.clone()), &ctx, d);
+                    if matches!(result, ast::Object::Bottom) {
+                        violations.push(Violation {
+                            constraint_id: format!("dispatch:{}", name),
+                            constraint_text: format!(
+                                "Platform Function '{}' returned Bottom on transition", name),
+                            detail: format!(
+                                "Transition {} from {} to {} on {} {}",
+                                tid, from, new, noun, entity_id),
+                            alethic: true,
+                        });
+                        rejected = true;
+                    }
+                }
+                // task-919-http: callback_uri branch deferred to follow-up.
+                let _ = target.callback_uri;
+            }
+        }
+    }
 
     let transitions = hateoas_via_rho(d, &noun, entity_id, status.as_deref());
     let navigation = nav_links_via_rho(d, &noun, entity_id);
@@ -3316,6 +3455,203 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         let sm_cell = ast::fetch_or_phi("State_Machine_is_currently_in_Status", &result.state);
         let sm_facts = sm_cell.as_seq().unwrap();
         assert!(ast::binding(&sm_facts[0], "Status") == Some("Draft"));
+    }
+
+    /// task-919: end-to-end dispatch via the Verb→Function chain.
+    ///
+    /// Wires `Verb 'place_verb' is performed during Transition 'place'.`
+    /// + `Function 'place_verb' has Name 'task_919_noop_test'.` into the
+    /// parsed state, installs a platform handler under that Name, fires
+    /// the Order place transition, and asserts the handler ran exactly
+    /// once AND the SM cell still flipped to Placed.
+    ///
+    /// The dispatch hook in transition_via_defs (after L1397) joins
+    /// Transition_is_defined_in_State_Machine_Definition,
+    /// _is_from_Status, _is_to_Status to find the firing transition,
+    /// then chases Verb_is_performed_during_Transition →
+    /// Function_has_Name and invokes apply_platform on the resolved name.
+    ///
+    /// Establishes the substrate; HTTP `Function has callback URI`
+    /// dispatch and the 4 arest-dev rebuild handlers are follow-ups.
+    #[test]
+    fn transition_dispatches_platform_func_via_verb_function_chain() {
+        use crate::ast::{install_platform_fn, uninstall_platform_fn};
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        CALLS.store(0, Ordering::SeqCst);
+
+        const READINGS: &str = r#"
+# Orders with dispatch
+
+## Entity Types
+
+Order(.Order Number) is an entity type.
+Verb(.id) is an entity type.
+Function(.id) is an entity type.
+
+## Fact Types
+
+Order has Amount.
+Verb is performed during Transition.
+Function has Name.
+
+## Instance Facts
+
+State Machine Definition 'Order' is for Noun 'Order'.
+Status 'Draft' is initial in State Machine Definition 'Order'.
+
+Transition 'place' is defined in State Machine Definition 'Order'.
+  Transition 'place' is from Status 'Draft'.
+  Transition 'place' is to Status 'Placed'.
+  Transition 'place' is triggered by Event Type 'place'.
+
+Verb 'place_verb' is performed during Transition 'place'.
+Function 'place_verb' has Name 'task_919_noop_test'.
+"#;
+
+        let meta_state = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let domain_state = crate::parse_forml2::parse_to_state_with_nouns(READINGS, &meta_state)
+            .unwrap();
+        let state = ast::merge_states(&meta_state, &domain_state);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        install_platform_fn(
+            "task_919_noop_test",
+            crate::sync::Arc::new(|x: &ast::Object, _d: &ast::Object| {
+                CALLS.fetch_add(1, Ordering::SeqCst);
+                // Echo a non-Bottom value so the dispatch hook treats
+                // this as success.
+                x.as_map()
+                    .and_then(|m| m.get("id").cloned())
+                    .unwrap_or(ast::Object::atom("ok"))
+            }),
+        );
+
+        let mut fields = HashMap::new();
+        fields.insert("orderNumber".to_string(), "ORD-919".to_string());
+        let create_cmd = Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "orders".to_string(),
+            id: Some("ORD-919".to_string()),
+            fields,
+            sender: None,
+            signature: None,
+        };
+        let created = apply_command_defs(&def_obj, &create_cmd, &state);
+        assert_eq!(created.status.as_deref(), Some("Draft"),
+            "create must land in Draft; status={:?} violations={:?}",
+            created.status, created.violations);
+
+        let txn = Command::Transition {
+            entity_id: "ORD-919".to_string(),
+            event: "place".to_string(),
+            domain: "orders".to_string(),
+            current_status: Some("Draft".to_string()),
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_obj, &txn, &created.state);
+
+        uninstall_platform_fn("task_919_noop_test");
+
+        assert!(!result.rejected,
+            "transition must not be rejected; violations={:?}", result.violations);
+        assert_eq!(result.status.as_deref(), Some("Placed"),
+            "transition must flip status to Placed; got {:?}", result.status);
+        assert_eq!(CALLS.load(Ordering::SeqCst), 1,
+            "platform handler 'task_919_noop_test' must run exactly once \
+             after the Verb→Function dispatch chain resolves");
+    }
+
+    /// task-919 rollback: a Platform Func returning Bottom rejects the
+    /// transition. The dispatch hook synthesizes a `dispatch:<name>`
+    /// alethic Violation; the existing rejected → delta=phi path at
+    /// L1406 emits an empty delta so the SM cell flip is rolled back
+    /// upstream. The transition is reported as rejected with the
+    /// synthesized violation surfaced to the caller.
+    #[test]
+    fn transition_dispatch_bottom_rejects_and_rolls_back() {
+        use crate::ast::{install_platform_fn, uninstall_platform_fn};
+
+        const READINGS: &str = r#"
+# Orders with a failing dispatch
+
+## Entity Types
+
+Order(.Order Number) is an entity type.
+Verb(.id) is an entity type.
+Function(.id) is an entity type.
+
+## Fact Types
+
+Order has Amount.
+Verb is performed during Transition.
+Function has Name.
+
+## Instance Facts
+
+State Machine Definition 'Order' is for Noun 'Order'.
+Status 'Draft' is initial in State Machine Definition 'Order'.
+
+Transition 'place' is defined in State Machine Definition 'Order'.
+  Transition 'place' is from Status 'Draft'.
+  Transition 'place' is to Status 'Placed'.
+  Transition 'place' is triggered by Event Type 'place'.
+
+Verb 'place_verb' is performed during Transition 'place'.
+Function 'place_verb' has Name 'task_919_bottom_test'.
+"#;
+
+        let meta_state = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let domain_state = crate::parse_forml2::parse_to_state_with_nouns(READINGS, &meta_state)
+            .unwrap();
+        let state = ast::merge_states(&meta_state, &domain_state);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        install_platform_fn(
+            "task_919_bottom_test",
+            crate::sync::Arc::new(|_x: &ast::Object, _d: &ast::Object| ast::Object::Bottom),
+        );
+
+        let mut fields = HashMap::new();
+        fields.insert("orderNumber".to_string(), "ORD-919-B".to_string());
+        let created = apply_command_defs(&def_obj, &Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "orders".to_string(),
+            id: Some("ORD-919-B".to_string()),
+            fields,
+            sender: None,
+            signature: None,
+        }, &state);
+        assert_eq!(created.status.as_deref(), Some("Draft"));
+
+        let result = apply_command_defs(&def_obj, &Command::Transition {
+            entity_id: "ORD-919-B".to_string(),
+            event: "place".to_string(),
+            domain: "orders".to_string(),
+            current_status: Some("Draft".to_string()),
+            sender: None,
+            signature: None,
+        }, &created.state);
+
+        uninstall_platform_fn("task_919_bottom_test");
+
+        assert!(result.rejected,
+            "Bottom from platform handler must reject the transition; \
+             violations={:?}", result.violations);
+        assert!(result.violations.iter().any(|v|
+            v.constraint_id == "dispatch:task_919_bottom_test" && v.alethic),
+            "rejected transition must surface a dispatch:<name> alethic \
+             violation; got {:?}", result.violations);
+        // Rejected transitions emit an empty state delta (mirrors the
+        // alethic-violation rollback at L1406), so no SM cell flip
+        // reaches the caller.
+        assert!(ast::cells_iter(&result.state).is_empty(),
+            "rejected transition must emit an empty state delta; got {:?}",
+            result.state);
     }
 
     /// task-737 — acceptance criterion #3. Two `apply create Task`
