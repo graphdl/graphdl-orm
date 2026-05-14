@@ -1323,6 +1323,143 @@ fn lookup_dispatch_for_function(d: &ast::Object, fn_id: &str) -> DispatchTarget 
     DispatchTarget { name, callback_uri }
 }
 
+/// task-919-http: collect `Function has Header` facts for a function id.
+/// FT shape per core.md:206: `<Function, fn_id>, <Header, "Name: Value">`.
+/// Returns parsed (Name, Value) pairs; malformed header strings (no `:`
+/// separator) are skipped silently — the callback URI dispatch should
+/// still fire with whatever headers DO parse rather than rejecting the
+/// transition over a header typo.
+fn lookup_headers_for_function(d: &ast::Object, fn_id: &str) -> Vec<(String, String)> {
+    ast::fetch_or_phi("Function_has_Header", d).as_seq().map(|facts| {
+        facts.iter().filter_map(|f| {
+            if ast::binding(f, "Function") != Some(fn_id) { return None; }
+            let raw = ast::binding(f, "Header")?;
+            let (name, value) = raw.split_once(':')?;
+            Some((name.trim().to_string(), value.trim().to_string()))
+        }).collect()
+    }).unwrap_or_default()
+}
+
+/// task-919-http: synchronous HTTP/1.1 POST over a TCP socket.
+///
+/// Returns `Ok(status_code)` on a successful round-trip (regardless of
+/// 2xx/non-2xx — the caller decides what counts as success), or
+/// `Err(reason)` on network failure: DNS/parse error, connect timeout,
+/// truncated response, or invalid status line. The dispatch hook treats
+/// both `Err(_)` and `Ok(non-2xx)` as a rejected transition, mirroring
+/// the in-process Bottom branch.
+///
+/// Pure std — no new dep, no TLS. Suitable for the in-process callback
+/// surface (sandbox + same-host workers); the production-grade HTTP
+/// client over TLS is a follow-up.
+///
+/// Implementation notes:
+///   * Only `http://` URIs are accepted. `https://` returns Err(…) so
+///     the dispatch hook surfaces an alethic violation rather than
+///     silently falling through (TLS is out of scope here).
+///   * Hard 5-second read/write/connect timeout so a hung callback
+///     can't wedge the SM-transition path.
+///   * Response body is consumed but discarded — we only need the
+///     status line. Connection: close ensures the server can short-
+///     circuit if it wants to.
+#[cfg(not(feature = "no_std"))]
+fn http_post_callback(
+    url: &str,
+    body: &[u8],
+    headers: &[(String, String)],
+) -> Result<u16, String> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    // Parse the URL. Accept `http://host[:port][/path]`; reject anything
+    // else so callers get a clear failure rather than a silent NOP.
+    let rest = url.strip_prefix("http://")
+        .ok_or_else(|| format!("only http:// URIs supported, got: {}", url))?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None    => (rest, "/"),
+    };
+    if authority.is_empty() {
+        return Err(format!("missing authority in URL: {}", url));
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>()
+            .map_err(|e| format!("bad port in {}: {}", url, e))?),
+        None         => (authority, 80u16),
+    };
+
+    let timeout = Duration::from_secs(5);
+    let mut stream = TcpStream::connect_timeout(
+        &(host, port).to_socket_addrs()
+            .map_err(|e| format!("resolve {}:{}: {}", host, port, e))?
+            .next()
+            .ok_or_else(|| format!("no address for {}:{}", host, port))?,
+        timeout,
+    ).map_err(|e| format!("connect {}:{}: {}", host, port, e))?;
+    stream.set_read_timeout(Some(timeout))
+        .map_err(|e| format!("set_read_timeout: {}", e))?;
+    stream.set_write_timeout(Some(timeout))
+        .map_err(|e| format!("set_write_timeout: {}", e))?;
+
+    // Build the request line + headers. The body is sent verbatim;
+    // Content-Length is derived from the byte slice. Custom headers
+    // overwrite nothing — RFC 7230 §3.2.2 allows multiple instances
+    // of the same name, and the dispatch surface is small enough that
+    // we don't bother enforcing uniqueness.
+    let mut req = Vec::with_capacity(256 + body.len());
+    req.extend_from_slice(format!("POST {} HTTP/1.1\r\n", path).as_bytes());
+    req.extend_from_slice(format!("Host: {}\r\n", authority).as_bytes());
+    req.extend_from_slice(b"Content-Type: application/json\r\n");
+    req.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    req.extend_from_slice(b"Connection: close\r\n");
+    for (name, value) in headers {
+        // Skip the headers we set unconditionally; tenants overriding
+        // Host/Content-Length is asking for trouble.
+        let lower = name.to_ascii_lowercase();
+        if matches!(lower.as_str(), "host" | "content-length" | "connection") {
+            continue;
+        }
+        req.extend_from_slice(format!("{}: {}\r\n", name, value).as_bytes());
+    }
+    req.extend_from_slice(b"\r\n");
+    req.extend_from_slice(body);
+
+    stream.write_all(&req)
+        .map_err(|e| format!("write {}: {}", url, e))?;
+
+    // Read the entire response. We only need the status line, but a
+    // server expecting us to consume the body before close may hang
+    // otherwise; the 5 s read timeout caps the worst case. Both
+    // WouldBlock (Windows) and TimedOut (Linux) signal the deadline.
+    let mut resp = Vec::with_capacity(512);
+    let mut buf = [0u8; 1024];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => resp.extend_from_slice(&buf[..n]),
+            Err(e) if matches!(e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
+            Err(e) => return Err(format!("read {}: {}", url, e)),
+        }
+        // Cap the buffered response to prevent a malicious server from
+        // ballooning the engine's working set. The status line is in
+        // the first 100 bytes; anything beyond 64 KB is just noise.
+        if resp.len() > 64 * 1024 { break; }
+    }
+
+    // Parse the status line: "HTTP/1.1 200 OK\r\n…".
+    let head = std::str::from_utf8(&resp)
+        .map_err(|_| format!("non-utf8 response from {}", url))?;
+    let status_line = head.lines().next()
+        .ok_or_else(|| format!("empty response from {}", url))?;
+    let code = status_line.split_whitespace().nth(1)
+        .ok_or_else(|| format!("no status code in '{}'", status_line))?
+        .parse::<u16>()
+        .map_err(|e| format!("bad status code in '{}': {}", status_line, e))?;
+    Ok(code)
+}
+
 fn transition_via_defs(
     d: &ast::Object,
     entity_id: &str,
@@ -1400,7 +1537,8 @@ fn transition_via_defs(
     // bound to the firing Transition's Verb (Verb is a subtype of
     // Function per core.md:15, so the verb id keys Function FTs directly).
     // Invoke the in-process Platform handler when `Function has Name` is
-    // set; HTTP `callback URI` dispatch is a follow-up. On Bottom, mark
+    // set; issue an HTTP POST when `Function has callback URI` is set
+    // (task-919-http). On Bottom / non-2xx / network failure, mark
     // rejected and append a synthesized violation so the delta-emit path
     // rolls back the SM cell flip (delta = phi when rejected, mirroring
     // the alethic-violation rollback at L1312).
@@ -1411,16 +1549,21 @@ fn transition_via_defs(
                 .and_then(|tid| lookup_verb_for_transition(d, &tid).map(|v| (tid, v)));
             if let Some((tid, verb_id)) = dispatch_lookup {
                 let target = lookup_dispatch_for_function(d, &verb_id);
+                // Build the entity-context ctx Map once; both the in-
+                // process Platform branch and the HTTP callback branch
+                // see the same shape (noun / id / from_status /
+                // to_status / transition_id / verb_id / event).
+                let mut ctx_map = hashbrown::HashMap::new();
+                ctx_map.insert("noun".to_string(), ast::Object::atom(&noun));
+                ctx_map.insert("id".to_string(), ast::Object::atom(entity_id));
+                ctx_map.insert("from_status".to_string(), ast::Object::atom(from));
+                ctx_map.insert("to_status".to_string(), ast::Object::atom(new));
+                ctx_map.insert("transition_id".to_string(), ast::Object::atom(&tid));
+                ctx_map.insert("verb_id".to_string(), ast::Object::atom(&verb_id));
+                ctx_map.insert("event".to_string(), ast::Object::atom(event));
+                let ctx = ast::Object::map(ctx_map);
+
                 if let Some(name) = target.name {
-                    let mut ctx_map = hashbrown::HashMap::new();
-                    ctx_map.insert("noun".to_string(), ast::Object::atom(&noun));
-                    ctx_map.insert("id".to_string(), ast::Object::atom(entity_id));
-                    ctx_map.insert("from_status".to_string(), ast::Object::atom(from));
-                    ctx_map.insert("to_status".to_string(), ast::Object::atom(new));
-                    ctx_map.insert("transition_id".to_string(), ast::Object::atom(&tid));
-                    ctx_map.insert("verb_id".to_string(), ast::Object::atom(&verb_id));
-                    ctx_map.insert("event".to_string(), ast::Object::atom(event));
-                    let ctx = ast::Object::map(ctx_map);
                     let result = ast::apply(&ast::Func::Platform(name.clone()), &ctx, d);
                     if matches!(result, ast::Object::Bottom) {
                         violations.push(Violation {
@@ -1435,8 +1578,43 @@ fn transition_via_defs(
                         rejected = true;
                     }
                 }
-                // task-919-http: callback_uri branch deferred to follow-up.
-                let _ = target.callback_uri;
+
+                // task-919-http: callback URI branch. POST the ctx Map
+                // (encoded as JSON) to the URI; read `Function has
+                // Header` for additional request headers. Non-2xx
+                // status AND network failure are both treated as
+                // Bottom — synthesize a `dispatch:<uri>` alethic
+                // violation and mark the transition rejected so the
+                // delta-emit path rolls back the SM cell flip.
+                if !rejected {
+                    if let Some(callback_uri) = target.callback_uri {
+                        let headers = lookup_headers_for_function(d, &verb_id);
+                        let body = ctx.to_json_string();
+                        let outcome = http_post_callback(
+                            &callback_uri, body.as_bytes(), &headers);
+                        let is_success = matches!(outcome, Ok(code) if (200..300).contains(&code));
+                        if !is_success {
+                            let detail = match &outcome {
+                                Ok(code) => format!(
+                                    "Transition {} from {} to {} on {} {} \
+                                     returned HTTP {} from {}",
+                                    tid, from, new, noun, entity_id, code, callback_uri),
+                                Err(e) => format!(
+                                    "Transition {} from {} to {} on {} {} \
+                                     failed to reach {}: {}",
+                                    tid, from, new, noun, entity_id, callback_uri, e),
+                            };
+                            violations.push(Violation {
+                                constraint_id: format!("dispatch:{}", callback_uri),
+                                constraint_text: format!(
+                                    "Callback URI '{}' returned Bottom on transition", callback_uri),
+                                detail,
+                                alethic: true,
+                            });
+                            rejected = true;
+                        }
+                    }
+                }
             }
         }
     }
@@ -3660,6 +3838,269 @@ Function 'place_verb' has Name 'task_919_bottom_test'.
         // Rejected transitions emit an empty state delta (mirrors the
         // alethic-violation rollback at L1406), so no SM cell flip
         // reaches the caller.
+        assert!(ast::cells_iter(&result.state).is_empty(),
+            "rejected transition must emit an empty state delta; got {:?}",
+            result.state);
+    }
+
+    /// task-919-http: a tiny one-shot HTTP/1.1 fake server on a random
+    /// loopback port. Spawns a thread that accepts ONE connection,
+    /// records the request (so the test can assert on body / header
+    /// shape), replies with the configured status + body, then exits.
+    ///
+    /// Pure std — no httpmock dep — to keep the per-feature cold-build
+    /// surface unchanged. Returns the bound URL and a join handle whose
+    /// payload is the captured request bytes; callers `.join()` after
+    /// the dispatch fires to read them.
+    fn spawn_one_shot_http_server(
+        status_code: u16,
+        status_text: &'static str,
+        body: &'static str,
+    ) -> (String, std::thread::JoinHandle<Vec<u8>>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .expect("bind a free loopback port");
+        let addr = listener.local_addr().expect("local_addr");
+        let url = format!("http://{}/dispatch", addr);
+        let handle = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+            // Read until we see the body-length's worth of bytes after
+            // the CRLFCRLF header terminator. The dispatch path sends
+            // Content-Length, so this is bounded.
+            let mut buf = Vec::with_capacity(4096);
+            let mut chunk = [0u8; 1024];
+            let mut header_end: Option<usize> = None;
+            let mut content_length: usize = 0;
+            loop {
+                let n = sock.read(&mut chunk).unwrap_or(0);
+                if n == 0 { break; }
+                buf.extend_from_slice(&chunk[..n]);
+                if header_end.is_none() {
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        header_end = Some(i + 4);
+                        let head = std::str::from_utf8(&buf[..i]).unwrap_or("");
+                        for line in head.lines() {
+                            if let Some(rest) = line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                            {
+                                content_length = rest.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+                if let Some(end) = header_end {
+                    if buf.len() >= end + content_length { break; }
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                status_code, status_text, body.len(), body);
+            let _ = sock.write_all(resp.as_bytes());
+            let _ = sock.flush();
+            buf
+        });
+        (url, handle)
+    }
+
+    /// task-919-http: end-to-end dispatch via the Verb→Function chain
+    /// when the function has a callback URI (not an in-process Name).
+    /// Stands up a one-shot loopback HTTP server, wires
+    /// `Function 'place_verb' has callback URI '<server>'` + a
+    /// `Function 'place_verb' has Header 'X-AREST-Dispatch: 1'` into
+    /// the parsed state, fires the Order place transition, and
+    /// asserts:
+    ///   * the server received exactly one POST,
+    ///   * the request body parses as JSON carrying the ctx Map
+    ///     (noun/id/from_status/to_status/transition_id/verb_id/event),
+    ///   * the custom Header lands on the wire,
+    ///   * the SM cell still flipped to Placed and the transition is
+    ///     not rejected.
+    ///
+    /// Mirrors the substrate from `transition_dispatches_platform_func_
+    /// via_verb_function_chain` so the two branches stay in lockstep.
+    #[test]
+    fn transition_dispatches_via_callback_uri_success() {
+        let (url, handle) = spawn_one_shot_http_server(200, "OK", "{\"ack\":true}");
+
+        // Mirror core.md: "callback URI" and "Header" are value types so
+        // the FT id from `fact_type_id_from_reading` recovers a binary
+        // role list (Function, callback URI) / (Function, Header), and
+        // the parsed instance facts land in the `Function_has_callback_URI`
+        // / `Function_has_Header` cells the dispatch helper queries.
+        let readings = format!(r#"
+# Orders with HTTP dispatch
+
+## Entity Types
+
+Order(.Order Number) is an entity type.
+Verb(.id) is an entity type.
+Function(.id) is an entity type.
+callback URI is a value type.
+Header is a value type.
+
+## Fact Types
+
+Order has Amount.
+Verb is performed during Transition.
+Function has callback URI.
+Function has Header.
+
+## Instance Facts
+
+State Machine Definition 'Order' is for Noun 'Order'.
+Status 'Draft' is initial in State Machine Definition 'Order'.
+
+Transition 'place' is defined in State Machine Definition 'Order'.
+  Transition 'place' is from Status 'Draft'.
+  Transition 'place' is to Status 'Placed'.
+  Transition 'place' is triggered by Event Type 'place'.
+
+Verb 'place_verb' is performed during Transition 'place'.
+Function 'place_verb' has callback URI '{}'.
+Function 'place_verb' has Header 'X-AREST-Dispatch: 1'.
+"#, url);
+
+        let meta_state = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let domain_state = crate::parse_forml2::parse_to_state_with_nouns(&readings, &meta_state)
+            .unwrap();
+        let state = ast::merge_states(&meta_state, &domain_state);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        let mut fields = HashMap::new();
+        fields.insert("orderNumber".to_string(), "ORD-919H".to_string());
+        let created = apply_command_defs(&def_obj, &Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "orders".to_string(),
+            id: Some("ORD-919H".to_string()),
+            fields,
+            sender: None,
+            signature: None,
+        }, &state);
+        assert_eq!(created.status.as_deref(), Some("Draft"),
+            "create must land in Draft; violations={:?}", created.violations);
+
+        let result = apply_command_defs(&def_obj, &Command::Transition {
+            entity_id: "ORD-919H".to_string(),
+            event: "place".to_string(),
+            domain: "orders".to_string(),
+            current_status: Some("Draft".to_string()),
+            sender: None,
+            signature: None,
+        }, &created.state);
+
+        assert!(!result.rejected,
+            "2xx response must not reject the transition; violations={:?}",
+            result.violations);
+        assert_eq!(result.status.as_deref(), Some("Placed"),
+            "transition must flip status to Placed; got {:?}", result.status);
+
+        // Server thread observed exactly one request.
+        let captured = handle.join().expect("server thread");
+        let captured_str = String::from_utf8_lossy(&captured);
+        assert!(captured_str.starts_with("POST /dispatch HTTP/1.1"),
+            "expected POST request; got: {:?}", captured_str);
+        assert!(captured_str.to_ascii_lowercase()
+                    .contains("x-arest-dispatch: 1"),
+            "Function_has_Header fact must land on the wire as a header; \
+             got: {:?}", captured_str);
+        // The body sits after the CRLFCRLF; parse it as JSON and check
+        // a couple of ctx fields.
+        let body_start = captured_str.find("\r\n\r\n").unwrap() + 4;
+        let body = &captured_str[body_start..];
+        let parsed: serde_json::Value = serde_json::from_str(body.trim())
+            .unwrap_or_else(|e| panic!(
+                "request body must be JSON; got: {:?} err: {}", body, e));
+        assert_eq!(parsed.get("noun").and_then(|v| v.as_str()), Some("Order"));
+        assert_eq!(parsed.get("id").and_then(|v| v.as_str()), Some("ORD-919H"));
+        assert_eq!(parsed.get("from_status").and_then(|v| v.as_str()), Some("Draft"));
+        assert_eq!(parsed.get("to_status").and_then(|v| v.as_str()), Some("Placed"));
+        assert_eq!(parsed.get("event").and_then(|v| v.as_str()), Some("place"));
+    }
+
+    /// task-919-http rollback: callback URI returning a non-2xx status
+    /// rejects the transition. The dispatch hook synthesizes a
+    /// `dispatch:<uri>` alethic violation; the existing rejected →
+    /// delta=phi path emits an empty delta so the SM cell flip is
+    /// rolled back upstream. Same observable shape as the Bottom
+    /// branch (`transition_dispatch_bottom_rejects_and_rolls_back`),
+    /// just keyed on the URI instead of the Name.
+    #[test]
+    fn transition_dispatch_callback_uri_non_2xx_rejects_and_rolls_back() {
+        let (url, handle) = spawn_one_shot_http_server(500, "Internal Server Error", "boom");
+
+        let readings = format!(r#"
+# Orders with failing HTTP dispatch
+
+## Entity Types
+
+Order(.Order Number) is an entity type.
+Verb(.id) is an entity type.
+Function(.id) is an entity type.
+callback URI is a value type.
+
+## Fact Types
+
+Order has Amount.
+Verb is performed during Transition.
+Function has callback URI.
+
+## Instance Facts
+
+State Machine Definition 'Order' is for Noun 'Order'.
+Status 'Draft' is initial in State Machine Definition 'Order'.
+
+Transition 'place' is defined in State Machine Definition 'Order'.
+  Transition 'place' is from Status 'Draft'.
+  Transition 'place' is to Status 'Placed'.
+  Transition 'place' is triggered by Event Type 'place'.
+
+Verb 'place_verb' is performed during Transition 'place'.
+Function 'place_verb' has callback URI '{}'.
+"#, url);
+
+        let meta_state = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let domain_state = crate::parse_forml2::parse_to_state_with_nouns(&readings, &meta_state)
+            .unwrap();
+        let state = ast::merge_states(&meta_state, &domain_state);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        let mut fields = HashMap::new();
+        fields.insert("orderNumber".to_string(), "ORD-919H-B".to_string());
+        let created = apply_command_defs(&def_obj, &Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "orders".to_string(),
+            id: Some("ORD-919H-B".to_string()),
+            fields,
+            sender: None,
+            signature: None,
+        }, &state);
+        assert_eq!(created.status.as_deref(), Some("Draft"));
+
+        let result = apply_command_defs(&def_obj, &Command::Transition {
+            entity_id: "ORD-919H-B".to_string(),
+            event: "place".to_string(),
+            domain: "orders".to_string(),
+            current_status: Some("Draft".to_string()),
+            sender: None,
+            signature: None,
+        }, &created.state);
+
+        // Drain the server thread so the OS port is released.
+        let _ = handle.join();
+
+        assert!(result.rejected,
+            "non-2xx response from callback must reject the transition; \
+             violations={:?}", result.violations);
+        // The violation surfaces a `dispatch:<uri>` constraint id.
+        assert!(result.violations.iter().any(|v|
+            v.constraint_id == format!("dispatch:{}", url) && v.alethic),
+            "rejected transition must surface a dispatch:<uri> alethic \
+             violation; got {:?}", result.violations);
+        // The delta is empty so the SM cell flip is rolled back.
         assert!(ast::cells_iter(&result.state).is_empty(),
             "rejected transition must emit an empty state delta; got {:?}",
             result.state);
