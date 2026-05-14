@@ -491,6 +491,120 @@ export function listConnectedSystems(sql: SqlLike): string[] {
   return sql.exec(`SELECT system FROM secrets ORDER BY system`).toArray().map((r: any) => r.system)
 }
 
+// ── SqliteCellSource audit (#798, parent #777 / Storage-1 #334) ────
+//
+// #777 demands the engine reach SQLite ONLY through the registered
+// cell-source adapter — no parallel bypass. The Rust-side audit landed
+// in #886 (see `crates/arest/src/storage.rs:267-315` for the engine-
+// production-code grep); this block is the Worker-side counterpart.
+// Together they pin "single point where engine cells meet SQLite,
+// ready for the worker collapse" (#798 acceptance).
+//
+// Adapter naming. On the Worker / DurableObject target, the
+// `SqliteCellSource` role is filled by the eight helpers above
+// (`fetchCell` / `storeCell` / `removeCell` / `fetchCellSealed` /
+// `storeCellSealed` / `initCellSchema`) plus the engine-routed
+// equivalents (`fetchCellViaEngine` / `fetchCellSealedViaEngine` /
+// `writeCellThroughEngine` defined on the EntityDB class). The free
+// helpers exec `this.ctx.storage.sql.exec(...)` against the DO's
+// SQLite namespace — they are the cell-source adapter. The engine
+// routes its reads through `callFetchCell` (`api/engine.ts:133`) and
+// its writes through `system(h, "apply", …)`; the chain extends via
+// `merge_delta` (engine-internal) and the cell's contents are stored
+// in the engine's in-memory cell graph (carried across isolates via
+// the freeze blob persisted under `ENGINE_STATE_STORAGE_KEY`).
+//
+// Audit grep (2026-05). Every `sql.exec` / `ctx.storage.sql` call site
+// in `src/**/*.ts` outside `*.test.ts`:
+//
+//   ── class (a) — inside the SqliteCellSource adapter itself ──
+//
+//   src/entity-do.ts:70-74  initCellSchema  CREATE TABLE cell
+//   src/entity-do.ts:86     initCellSchema  ALTER TABLE cell DROP COLUMN version
+//   src/entity-do.ts:97     fetchCell       SELECT id, type, data FROM cell
+//   src/entity-do.ts:182    storeCell       INSERT OR REPLACE INTO cell
+//   src/entity-do.ts:193    removeCell      DELETE FROM cell
+//   src/entity-do.ts:298    fetchCellSealed SELECT id, type, data FROM cell
+//   src/entity-do.ts:394    storeCellSealed INSERT OR REPLACE INTO cell
+//
+//   These ARE the cell-source's adapter implementation — by definition
+//   they are not bypasses. The free `storeCell` / `storeCellSealed` /
+//   `removeCell` / `fetchCell` helpers are NO LONGER called from the
+//   productive EntityDB.put / .get / .delete path (collapsed #885 / #887,
+//   verified by `entity-do-engine-roundtrip.test.ts:973-1009` — "engine-
+//   only writes leave the SQL cell table empty"); they remain exported
+//   for test fixtures and for `EntityDB.rotateMaster`'s engine-silent
+//   key swap (class (c) below).
+//
+//   ── class (b) — bypasses outside SqliteCellSource ──
+//
+//   None. The EntityDB class' productive cell I/O (`get` / `put` /
+//   `delete` / `getFacts` / `toPopulation`) goes through:
+//     - `fetchCellViaEngine` → `callFetchCell` → `system(h, "fetch_cell", …)`
+//     - `writeCellThroughEngine` → `system(h, "apply", …)` → engine
+//       merge_delta → chain extension + in-memory cell graph
+//   The worker's SQL `cell` table is never written to on the productive
+//   path; #885's collapse removed the parallel SQL bookkeeping that was
+//   §3.3's divergent sidecar.
+//
+//   ── class (c) — non-cell SQL access (documented exceptions) ──
+//
+//   src/entity-do.ts:467-491   secrets table helpers
+//     Infrastructure config — API keys, OAuth tokens, connection
+//     strings for External Systems. Per the section header above
+//     ("Secrets (infrastructure, not domain facts)"), this is NOT
+//     part of the population P, not a cell payload, not a fact-
+//     producing row. Lives in a separate `secrets` table with a
+//     different schema and is not subject to the cell-source contract.
+//
+//   src/entity-do.ts:615-617  EntityDB.ensureInit  schema bootstrap
+//     `initCellSchema` + `initSecretSchema` are idempotent CREATE TABLE
+//     IF NOT EXISTS calls — schema bootstrap is by definition the
+//     adapter's own DDL, called from within the EntityDB class to
+//     prepare the SqliteCellSource's underlying SQLite namespace
+//     before the first read/write. Not a bypass; equivalent to
+//     opening the adapter's "connection".
+//
+//   src/entity-do.ts:1100-1158  EntityDB.rotateMaster
+//     Tenant master rotation reads the sealed `cell` row directly,
+//     decrypts under the OLD master, re-encrypts under the NEW master,
+//     and writes the rotated bytes back. This is the ONLY surviving
+//     direct SQL touch on the `cell` table from a productive EntityDB
+//     method. The path is documented at the call site (see #885 /
+//     "engine-silent by design" comment, lines 1083-1098 and
+//     1141-1151): the engine surface returns the cell's plaintext
+//     post-thaw, not the raw AEAD envelope rotation must
+//     decrypt+re-encrypt, AND rotation must NOT extend the engine
+//     chain (a fresh VersionEntry would put the rotated AAD=oldVersion
+//     bytes out of lockstep with the engine's chain head and break
+//     every subsequent `cellOpen`). A key-rotation-safe apply verb
+//     could collapse this last touchpoint; until then it is the
+//     documented exception to "engine-only IO" per the audit.
+//
+//   src/registry-do.ts (entire file)  RegistryDB
+//     RegistryDB is a different DurableObject (the cross-entity
+//     directory — population index, schema cache, domain registration,
+//     snapshots) — NOT the per-entity cell DO. EntityDB is one DO
+//     per cell; RegistryDB is one DO per scope. The two DOs deliberately
+//     split so registry reads don't contend with entity writes. The
+//     audit scope is "engine cell reads/writes meet SQLite at a single
+//     point on the DurableObject target"; the cell IS the per-entity
+//     payload in EntityDB. RegistryDB's tables (`domains`, `noun_index`,
+//     `entity_index`, `snapshots`) hold the directory, not the cell
+//     bytes; they are out of scope for #798.
+//
+// Conclusion. On the DurableObject target the engine cell I/O surface
+// (EntityDB.get / put / delete / getFacts / toPopulation) routes
+// EXCLUSIVELY through the cell-source adapter — engine reads via
+// `fetchCellViaEngine` (→ `callFetchCell` / `system(h, "fetch_cell", …)`)
+// and engine writes via `writeCellThroughEngine` (→ `system(h, "apply",
+// …)`). No class (b) bypass exists. Class (c) exceptions are the
+// schema-bootstrap call (adapter DDL), the secrets-table helpers
+// (infrastructure config, not cells), and the rotateMaster path
+// (documented key-swap exception). The "single point where engine
+// cells meet SQLite" invariant holds; the worker collapse (#777) can
+// proceed against this audited surface.
+
 // ── Durable Object ──────────────────────────────────────────────────
 
 /** DO storage key under which each EntityDB persists its engine
