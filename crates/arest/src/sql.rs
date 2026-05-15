@@ -146,13 +146,17 @@ fn materialize_fact_type_tables(conn: &Connection, state: &Object) -> rusqlite::
 /// If FactType is absent (raw test fixture / partially-bootstrapped
 /// state) every cell whose name passes `looks_like_fact_type` is
 /// included so callers can still query.
+///
+/// Reads facts via `cell_facts_iter` so Map-keyed FactType cells
+/// (RMAP storage shape; #744) iterate identically to legacy Seq cells.
+/// Direct `as_seq()` would return None for Map storage and silently
+/// drop every FT id — which is exactly the regression task-922 fixes
+/// for the downstream cell projector.
 fn collect_fact_type_ids(state: &Object) -> HashSet<String> {
     let cell = ast::fetch_or_phi("FactType", state);
-    let parsed: HashSet<String> = cell.as_seq()
-        .map(|facts| facts.iter()
-            .filter_map(|f| ast::binding(f, "id").map(String::from))
-            .collect())
-        .unwrap_or_default();
+    let parsed: HashSet<String> = ast::cell_facts_iter(&cell)
+        .filter_map(|f| ast::binding(f, "id").map(String::from))
+        .collect();
     if !parsed.is_empty() {
         return parsed;
     }
@@ -173,18 +177,19 @@ fn looks_like_fact_type(name: &str) -> bool {
 
 /// Collect role-name lists per FT id from the Role cell. Position-
 /// ordered. Empty when Role is absent.
+///
+/// Reads facts via `cell_facts_iter` (Seq + Map shapes; #744) so a
+/// Map-keyed Role cell still surfaces every role.
 fn collect_role_map(state: &Object) -> BTreeMap<String, Vec<String>> {
     let cell = ast::fetch_or_phi("Role", state);
     let mut tagged: BTreeMap<String, Vec<(usize, String)>> = BTreeMap::new();
-    if let Some(facts) = cell.as_seq() {
-        for fact in facts {
-            let Some(ft) = ast::binding(fact, "factType") else { continue };
-            let Some(name) = ast::binding(fact, "nounName") else { continue };
-            let pos: usize = ast::binding(fact, "position")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            tagged.entry(ft.to_string()).or_default().push((pos, name.to_string()));
-        }
+    for fact in ast::cell_facts_iter(&cell) {
+        let Some(ft) = ast::binding(fact, "factType") else { continue };
+        let Some(name) = ast::binding(fact, "nounName") else { continue };
+        let pos: usize = ast::binding(fact, "position")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        tagged.entry(ft.to_string()).or_default().push((pos, name.to_string()));
     }
     tagged.into_iter()
         .map(|(ft, mut rows)| {
@@ -217,8 +222,13 @@ fn column_names_for(
         // Fallback: first fact's bindings determine the columns by
         // declaration order. Used when the Role cell isn't populated
         // (raw test fixtures, partially-bootstrapped state).
-        contents.as_seq()
-            .and_then(|facts| facts.first())
+        //
+        // Reads via `cell_facts_iter` so Map-keyed cells (#744) still
+        // expose a "first" fact; HashMap iteration order is arbitrary
+        // but the per-fact pair order is preserved by `fact_from_pairs`,
+        // so column names match the fact's binding order regardless of
+        // which fact happens to be visited first.
+        ast::cell_facts_iter(contents).next()
             .and_then(|fact| fact.as_seq())
             .map(|pairs| pairs.iter()
                 .filter_map(|p| {
@@ -296,8 +306,15 @@ fn create_and_populate_table(
     let insert = format!("INSERT INTO \"{}\" ({}) VALUES ({})", table, cols_list, placeholders);
     let mut stmt = conn.prepare(&insert)?;
 
-    let Some(facts) = contents.as_seq() else { return Ok(()); };
-    for fact in facts {
+    // Iterate the cell uniformly across Seq and Map storage shapes.
+    // Pre-task-922 this was `contents.as_seq()` which returned None for
+    // Map-keyed cells (RMAP storage; #744) and silently produced an
+    // empty SQL table — `Task_has_Task_Status` and every other
+    // bridge/SM-driven Map-keyed cell projected zero rows even when
+    // populated. `cell_facts_iter` walks both shapes; the per-fact
+    // role-pair structure inside each fact is still Seq-encoded by
+    // `fact_from_pairs`, so the position-mapping below is unchanged.
+    for fact in ast::cell_facts_iter(contents) {
         let pairs = match fact.as_seq() {
             Some(p) => p,
             None => continue,
@@ -371,7 +388,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{cell_push, fact_from_pairs, Object};
+    use crate::ast::{cell_push, cell_put_keyed, fact_from_pairs, Object};
 
     fn parse_rows(envelope: &str) -> Vec<serde_json::Value> {
         let v: serde_json::Value = serde_json::from_str(envelope)
@@ -636,6 +653,128 @@ mod tests {
         assert_eq!(rows[0].get("b").and_then(|v| v.as_str()), Some("light"));
         assert_eq!(rows[1].get("a").and_then(|v| v.as_str()), Some("light"));
         assert_eq!(rows[1].get("b").and_then(|v| v.as_str()), Some("dark"));
+    }
+
+    #[test]
+    fn map_keyed_cell_projects_to_sql_table() {
+        // Regression for task-922-sql-projector-map-cells: Map-keyed
+        // cells (RMAP storage; #744) populated via cell_put_keyed
+        // MUST surface their facts in the SQL projection. Pre-fix the
+        // projector called `contents.as_seq()` which returned None for
+        // Object::Map and silently produced an empty `ft_<name>` table
+        // even though the cell was populated. The bridge derivation
+        // (task-922-sql-projection-rolemismatch / commit 9c446787) emits
+        // FT-aligned bindings into Map cells; the apps/tasks
+        // `Task_has_Task_Status` cell carried 660 entries while
+        // `SELECT COUNT(*) FROM ft_Task_has_Task_Status` returned 0.
+        // After this fix the SQL count must equal the cell's fact count.
+
+        // Build a Map-shape Task_has_Task_Status cell via cell_put_keyed
+        // — same path the bridge derivation takes for downstream cells.
+        let mut state = Object::phi();
+        state = cell_push("FactType", fact_from_pairs(&[("id", "Task_has_Task_Status")]), &state);
+        state = cell_push("Role", fact_from_pairs(&[
+            ("factType", "Task_has_Task_Status"),
+            ("nounName", "Task"),
+            ("position", "0"),
+        ]), &state);
+        state = cell_push("Role", fact_from_pairs(&[
+            ("factType", "Task_has_Task_Status"),
+            ("nounName", "Task Status"),
+            ("position", "1"),
+        ]), &state);
+        for (task, status) in [("t-1", "pending"), ("t-2", "done"), ("t-3", "in_progress")] {
+            state = cell_put_keyed(
+                "Task_has_Task_Status",
+                &["Task"],
+                fact_from_pairs(&[("Task", task), ("Task Status", status)]),
+                &state,
+            ).expect("distinct keys must not collide");
+        }
+
+        // Confirm the cell really is Map-shaped — defends against a
+        // future refactor flipping cell_put_keyed back to Seq storage,
+        // which would silently make the test pass for the wrong reason.
+        let contents = ast::fetch_or_phi("Task_has_Task_Status", &state);
+        assert!(matches!(contents, Object::Map(_)),
+            "fixture must produce Map-shape contents to pin the regression");
+
+        let env = sql_query(&state,
+            r#"SELECT COUNT(*) AS n FROM ft_Task_has_Task_Status"#);
+        let rows = parse_rows(&env);
+        assert_eq!(rows.len(), 1, "envelope: {}", env);
+        let n = rows[0].get("n").and_then(|v| v.as_i64()).unwrap_or(-1);
+        assert_eq!(n, 3, "Map-keyed cell must project all 3 facts; envelope: {}", env);
+
+        // Round-trip a value to make sure the position-mapped insert
+        // also carries the role binding correctly out of Map storage.
+        let env = sql_query(&state, r#"
+            SELECT "Task_Status" AS s
+            FROM ft_Task_has_Task_Status
+            WHERE "Task" = 't-2'
+        "#);
+        let rows = parse_rows(&env);
+        assert_eq!(rows.len(), 1, "envelope: {}", env);
+        assert_eq!(rows[0].get("s").and_then(|v| v.as_str()), Some("done"));
+    }
+
+    #[test]
+    fn map_keyed_factype_and_role_cells_still_resolve() {
+        // Sibling fix audit: collect_fact_type_ids and collect_role_map
+        // both used to call `cell.as_seq()` directly on the FactType /
+        // Role cells. If either of THOSE cells is Map-shaped (a real
+        // possibility once metamodel cells migrate to keyed storage)
+        // the projector would lose the FT id catalog or the column
+        // map, and every downstream `ft_<name>` table would either
+        // disappear or fall back to the bare-binding column inference.
+        // This test pins both via Map storage.
+        let mut state = Object::phi();
+        state = cell_put_keyed(
+            "FactType",
+            &["id"],
+            fact_from_pairs(&[("id", "Task_has_Task_Priority")]),
+            &state,
+        ).expect("first FactType");
+        state = cell_put_keyed(
+            "Role",
+            &["factType", "nounName"],
+            fact_from_pairs(&[
+                ("factType", "Task_has_Task_Priority"),
+                ("nounName", "Task"),
+                ("position", "0"),
+            ]),
+            &state,
+        ).expect("Task role");
+        state = cell_put_keyed(
+            "Role",
+            &["factType", "nounName"],
+            fact_from_pairs(&[
+                ("factType", "Task_has_Task_Priority"),
+                ("nounName", "Task Priority"),
+                ("position", "1"),
+            ]),
+            &state,
+        ).expect("Task Priority role");
+        state = cell_put_keyed(
+            "Task_has_Task_Priority",
+            &["Task"],
+            fact_from_pairs(&[("Task", "1"), ("Task Priority", "p0")]),
+            &state,
+        ).expect("FT row");
+
+        // Pin the storage shape — sibling regression must fail loudly
+        // if FactType/Role flip back to Seq.
+        assert!(matches!(ast::fetch_or_phi("FactType", &state), Object::Map(_)),
+            "FactType fixture must be Map-shape");
+        assert!(matches!(ast::fetch_or_phi("Role", &state), Object::Map(_)),
+            "Role fixture must be Map-shape");
+
+        let env = sql_query(&state,
+            r#"SELECT "Task", "Task_Priority" AS p FROM ft_Task_has_Task_Priority"#);
+        let rows = parse_rows(&env);
+        assert_eq!(rows.len(), 1, "envelope: {}", env);
+        assert_eq!(rows[0].get("Task").and_then(|v| v.as_str()), Some("1"));
+        assert_eq!(rows[0].get("p").and_then(|v| v.as_str()), Some("p0"));
     }
 
     #[test]
