@@ -2843,3 +2843,322 @@ Doc has Status.
          got Doc bindings {:?}\nfull derived: {:#?}",
         doc_ids_with_urgent, derived);
 }
+
+// ─── Category 15: Subscript-driven join + AbsenceOf (task-918-subscript-and-fallback-absence) ──
+//
+// task-918 follow-up: compile_explicit_derivation has THREE more
+// branches that hardcoded `uses_negation: false` AND don't compose
+// absent_guard predicates at all when the rule has AbsenceOf
+// antecedents:
+//
+//   (1) subscript-driven join branch, success return (compile.rs site
+//       was line ~4428 at task ticket time). Pre-fix: the iterative
+//       join loop walked all `antecedent_ids[k]` including AbsenceOf
+//       positions where antecedent_ids[k] = "" → data.fact_types
+//       lookup failed → fast-path return phi. The whole rule emitted
+//       no facts even when the AbsenceOf guard was satisfied.
+//
+//   (2) subscript-driven join branch, fast-path failure return (compile.rs
+//       site was line ~4258). Same trigger, same emission of phi.
+//
+//   (3) function-end existence-check fallback (compile.rs site was line
+//       ~5031). Pre-fix the fallback's `ant_checks` extracted facts for
+//       all antecedent positions; AbsenceOf positions yielded extract(i,
+//       "") = phi → Not(NullTest)(phi) = false → all_hold conjunction
+//       collapsed → rule never fired.
+//
+// Fix mirrors task-814-join-absence's port to compile_join_derivation:
+// partition antecedent_sources into positive_idx / absence_idx, build
+// the join/extract product over positives only, gate with absent_guard
+// predicates per AbsenceOf antecedent, set uses_negation true when any
+// AbsenceOf is present so the chain orchestrator routes the rule into
+// stratum 2.
+//
+// Three tests, one per branch, each exercising both the positive case
+// (rule fires when AbsenceOf guard is satisfied) and the counterfactual
+// (rule does NOT fire when negation matches).
+
+// ─── Test 1: subscript-driven join, success return ──────────────────
+//
+// Shape:
+//   `Task is critical iff Task is in Project1
+//                          and Project1 has Project Status 'urgent'
+//                          and Task has no Task Approval.`
+//
+// Two POSITIVE antecedents share the `Project1` subscript on `Project`
+// → subscript bridge → routes to the subscript-driven join branch.
+// Third antecedent is AbsenceOf on Task — guard is "no Task Approval
+// fact has Task = current Task in joined tuple".
+//
+// Acceptance: the rule fires for Tasks in 'urgent' Projects with NO
+// Task Approval; doesn't fire for Tasks WITH a Task Approval.
+#[test]
+fn subscript_driven_join_with_absence_of_guard_fires() {
+    let src = r#"# task-918-subscript-and-fallback-absence (1)
+Task(.id) is an entity type.
+Project(.id) is an entity type.
+
+Project Status is a value type.
+Task Approval is a value type.
+
+## Fact Types
+Task is in Project.
+Project has Project Status.
+Task has Task Approval.
+Task is critical.
+
+## Derivation Rules
+* Task is critical iff Task is in Project1 and Project1 has Project Status 'urgent' and Task has no Task Approval.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    // Sanity: 3 antecedents, the third is AbsenceOf, the first two are
+    // positive and share the Project1 subscript so the rule routes
+    // through the subscript-driven join branch (not the multi-AbsenceOf
+    // branch — only ONE AbsenceOf, not all-subsequent).
+    assert_eq!(rule.antecedent_sources.len(), 3,
+        "test fixture must declare exactly 3 antecedents; got {:#?}",
+        rule.antecedent_sources);
+    assert!(matches!(rule.antecedent_sources[2],
+        crate::types::AntecedentSource::AbsenceOf { .. }),
+        "third antecedent must be AbsenceOf to exercise the absent_guard \
+         port; got {:#?}", rule.antecedent_sources[2]);
+    let positive_count = rule.antecedent_sources.iter().filter(|s|
+        matches!(s, crate::types::AntecedentSource::FactType(_))).count();
+    assert_eq!(positive_count, 2,
+        "fixture must have exactly 2 positive antecedents; got {} \
+         (sources: {:#?})", positive_count, rule.antecedent_sources);
+
+    // Positive case: t-2 has no Task Approval AND its Project p-urgent
+    // has Project Status 'urgent', so Task is critical fires for t-2.
+    // t-1 has Task Approval → AbsenceOf guard rejects.
+    // t-3's Project p-normal has Project Status 'normal' → join filter
+    // drops it.
+    let out = apply_to_facts(&func, &[
+        ("Task_is_in_Project",          &[("Task", "t-1"), ("Project", "p-urgent")]),
+        ("Task_is_in_Project",          &[("Task", "t-2"), ("Project", "p-urgent")]),
+        ("Task_is_in_Project",          &[("Task", "t-3"), ("Project", "p-normal")]),
+        ("Project_has_Project_Status",  &[("Project", "p-urgent"), ("Project Status", "urgent")]),
+        ("Project_has_Project_Status",  &[("Project", "p-normal"), ("Project Status", "normal")]),
+        ("Task_has_Task_Approval",      &[("Task", "t-1"), ("Task Approval", "ok")]),
+    ]);
+    let derived = decode_derived(&out);
+    let critical_tasks: Vec<String> = derived.iter()
+        .filter(|(ft, _, _)| ft == "Task_is_critical")
+        .flat_map(|(_, _, b)| b.iter())
+        .filter(|(k, _)| k == "Task")
+        .map(|(_, v)| v.clone())
+        .collect();
+
+    // Pre-fix: the rule emitted ZERO facts because antecedent_ids[2]
+    // = "" → data.fact_types lookup failed → fast-path return phi.
+    // Post-fix: t-2 fires (urgent + no approval).
+    assert!(critical_tasks.iter().any(|t| t == "t-2"),
+        "t-2 (urgent project, no approval) MUST derive Task is critical; \
+         got tasks: {:?}\nfull derived: {:#?}\n\
+         (pre-fix: subscript-join's success branch returned phi for \
+         all subscript-bridge rules with any AbsenceOf antecedent — \
+         antecedent_ids[absence_position] = \"\" failed schema lookup.)",
+        critical_tasks, derived);
+
+    // Counterfactual: t-1 has Task Approval → AbsenceOf guard rejects.
+    assert!(!critical_tasks.iter().any(|t| t == "t-1"),
+        "t-1 has Task Approval → AbsenceOf guard MUST reject; \
+         got tasks: {:?}\nfull derived: {:#?}",
+        critical_tasks, derived);
+    // t-3's Project doesn't have Status 'urgent' → positive filter drops.
+    assert!(!critical_tasks.iter().any(|t| t == "t-3"),
+        "t-3 (project status='normal') MUST NOT derive — antecedent \
+         literal filter rejects; got tasks: {:?}\nfull derived: {:#?}",
+        critical_tasks, derived);
+}
+
+// ─── Test 2: subscript-driven join, fast-path failure return ────────
+//
+// The fast-path failure return at compile.rs line ~4258 (now shifted)
+// triggers when `data.fact_types.get(&antecedent_ids[k])` returns None
+// during the subscript-driven join's iterative loop. Pre-fix this was
+// reachable for ANY rule with an AbsenceOf antecedent (because
+// antecedent_ids[k] = "" for AbsenceOf). Post-fix the loop iterates
+// only positive antecedents, so this branch only triggers for genuine
+// schema corruption (a positive antecedent's FT missing from
+// data.fact_types).
+//
+// We can't easily construct schema corruption via the standard parse
+// pipeline, but we CAN verify the fix's routing behavior: the
+// compile_explicit_derivation now sets uses_negation correctly even
+// when the rule degenerates. This test pins the routing flag for a
+// subscript-bridge rule with an AbsenceOf — pre-fix it would have
+// returned uses_negation=false from the fast-path failure (because
+// the AbsenceOf in position k=2 collapses to schema-lookup-failure);
+// post-fix it never reaches that branch (positive iteration skips
+// the AbsenceOf position) and the success-return path correctly
+// flags uses_negation=true.
+//
+// This is a routing-flag pin test (mirrors task-918-implicit-equi-join-
+// uses-negation's `implicit_equi_join_with_absence_of_sets_uses_negation
+// _true`).
+#[test]
+fn subscript_driven_join_fast_path_failure_sets_uses_negation_true() {
+    // Use the same fixture shape as Test 1 but verify only the routing
+    // flag, not behavior. Pre-fix: even though Test 1's behavior would
+    // fail (rule emits zero facts), the flag was hardcoded false.
+    // Post-fix: flag is true even if the rule degenerates to phi.
+    let src = r#"# task-918-subscript-and-fallback-absence (2)
+Task(.id) is an entity type.
+Project(.id) is an entity type.
+
+Project Status is a value type.
+Task Approval is a value type.
+
+## Fact Types
+Task is in Project.
+Project has Project Status.
+Task has Task Approval.
+Task is critical.
+
+## Derivation Rules
+* Task is critical iff Task is in Project1 and Project1 has Project Status 'urgent' and Task has no Task Approval.
+"#;
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    let model = crate::compile::compile(&state);
+    let cd = model.derivations.iter()
+        .find(|d| d.id.contains("critical") || d.text.contains("is critical"))
+        .unwrap_or_else(|| panic!(
+            "compiled derivation for `Task is critical` rule missing; \
+             derivations: {:?}",
+            model.derivations.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+        ));
+
+    // The subscript-driven join branch must set uses_negation=true
+    // when any AbsenceOf antecedent is present, regardless of which
+    // exit path it takes (success return or fast-path failure return).
+    // Pre-fix: both paths hardcoded false. Post-fix: both derive from
+    // !absence_idx.is_empty().
+    assert!(cd.uses_negation,
+        "subscript-driven join branch must set uses_negation=true when \
+         any AbsenceOf antecedent is present (task-918-subscript-and-\
+         fallback-absence). Pre-fix the fast-path failure return AND the \
+         success return both hardcoded false, routing the rule into \
+         stratum 1 — the absent_guard could observe a stale-empty \
+         negated cell. Got uses_negation={}; rule sources: {:#?}",
+        cd.uses_negation, model.derivations.iter()
+            .find(|d| d.id == cd.id).map(|d| &d.id));
+}
+
+// Test 3: function-end existence-check fallback (path b)
+//
+// Shape:
+//   `Server has Server Status 'flagged' iff some Server is online
+//    and some Region is active and System has no Maintenance Window.`
+//
+// Three antecedents:
+//   ant 0: Server is online        - positive, role: Server
+//   ant 1: Region is active        - positive, role: Region
+//   ant 2: AbsenceOf System has Maintenance Window
+//                                  - guard, role: System
+//
+// Routing analysis:
+//   - Subscript-driven join: no subscripts -> branch doesn't fire.
+//   - Multi-AbsenceOf branch: requires ALL subsequent antecedents to
+//     be AbsenceOf - fails (ant 1 is positive).
+//   - Implicit-equi-join (path a): join_roles = consequent_roles
+//     intersect ant0_role_set intersect (every positive other has the
+//     role). The consequent Server_has_Server_Status has roles [Server,
+//     Server Status]. Server is in ant0 (Server_is_online has role
+//     Server) but NOT in Region_is_active -> join_roles = []. Path a
+//     fails.
+//   - Existential-over-join (path a'): existential_join_roles = ant 0's
+//     roles NOT in consequent that EVERY positive other has. Server is
+//     IN consequent, so it's excluded -> empty. Path a' fails.
+//   - Existence-check fallback (path b) fires.
+//
+// Bindings: Server (consequent role) sourced from ant 0's first fact
+// (Server_is_online has role Server -> role_value_by_name("Server")
+// finds it). Server Status pinned via consequent_role_literals.
+//
+// Pre-fix: ant_checks extracted facts for ALL antecedent positions
+// including AbsenceOf at position 2 where antecedent_ids[2] = "" ->
+// extract(2, "") = phi -> Not(NullTest)(phi) = false -> all_hold
+// short-circuits to false -> rule never fires regardless of population.
+//
+// Post-fix: positive_idx_b = [0, 1] drives the existence check;
+// AbsenceOf becomes a global "no Maintenance Window facts" check via
+// NullTest on extract_facts_from_pop.
+#[test]
+fn existence_check_fallback_path_b_with_absence_of_guard_fires() {
+    let src = r#"# task-918-subscript-and-fallback-absence (3)
+Server(.id) is an entity type.
+Region(.id) is an entity type.
+System(.id) is an entity type.
+
+Server Status is a value type.
+Maintenance Window is a value type.
+
+## Fact Types
+Server is online.
+Region is active.
+System has Maintenance Window.
+Server has Server Status.
+
+## Derivation Rules
+* Server has Server Status 'flagged' iff some Server is online and some Region is active and System has no Maintenance Window.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    // Sanity: 3 antecedents, last is AbsenceOf.
+    assert_eq!(rule.antecedent_sources.len(), 3,
+        "test fixture must declare exactly 3 antecedents; got {:#?}",
+        rule.antecedent_sources);
+    assert!(matches!(rule.antecedent_sources[2],
+        crate::types::AntecedentSource::AbsenceOf { .. }),
+        "third antecedent must be AbsenceOf; got {:#?}",
+        rule.antecedent_sources[2]);
+
+    // Positive case: at least one Server is online + at least one
+    // Region is active + NO Maintenance Window facts → fires.
+    // Path (b) fires once globally and emits a single derived fact
+    // (System has System Status='available' bound from first-fact-of-
+    // first-positive-antecedent — but System Status is a literal pin
+    // so the consequent_role_literals path uses fresh construction).
+    let out_fires = apply_to_facts(&func, &[
+        ("Server_is_online",       &[("Server", "srv-1")]),
+        ("Server_is_online",       &[("Server", "srv-2")]),
+        ("Region_is_active",       &[("Region", "us-east")]),
+        // No System_has_Maintenance_Window facts at all.
+    ]);
+    let derived_fires = decode_derived(&out_fires);
+    let flagged_facts: Vec<_> = derived_fires.iter()
+        .filter(|(ft, _, b)|
+            ft == "Server_has_Server_Status"
+            && b.iter().any(|(k, v)| k == "Server Status" && v == "flagged"))
+        .collect();
+
+    // Pre-fix: zero derived facts because Not(NullTest)(extract(2, ""))
+    // applied to phi short-circuited all_hold to false.
+    // Post-fix: at least one derived fact (path b emits once globally).
+    assert!(!flagged_facts.is_empty(),
+        "path (b) MUST emit Server has Server Status='flagged' when \
+         positives are non-empty AND the AbsenceOf cell is empty.\n\
+         Pre-fix: zero facts (extract(absence_position, \"\") = phi -> \
+         Not(NullTest) = false -> all_hold collapsed).\n\
+         Got derived: {:#?}", derived_fires);
+
+    // Counterfactual: same positives + ONE Maintenance Window fact ->
+    // AbsenceOf guard rejects -> no derivation.
+    let out_blocked = apply_to_facts(&func, &[
+        ("Server_is_online",                  &[("Server", "srv-1")]),
+        ("Region_is_active",                  &[("Region", "us-east")]),
+        ("System_has_Maintenance_Window",     &[("System", "sys-1"), ("Maintenance Window", "mw-1")]),
+    ]);
+    let derived_blocked = decode_derived(&out_blocked);
+    let blocked_flagged: Vec<_> = derived_blocked.iter()
+        .filter(|(ft, _, b)|
+            ft == "Server_has_Server_Status"
+            && b.iter().any(|(k, v)| k == "Server Status" && v == "flagged"))
+        .collect();
+    assert!(blocked_flagged.is_empty(),
+        "path (b) MUST NOT emit Server has Server Status='flagged' when \
+         a Maintenance Window fact exists - the AbsenceOf guard must \
+         reject. Got derived: {:#?}", derived_blocked);
+}

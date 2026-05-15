@@ -4186,46 +4186,73 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             });
 
             if any_subscript_bridge {
+                // task-918-subscript-and-fallback-absence: partition
+                // antecedents into POSITIVE / ABSENCE so the iterative
+                // subscript-join only walks positives. AbsenceOf
+                // antecedents return "" for `fact_type_id()`; pre-fix
+                // the join loop hit "" at position k, failed
+                // `data.fact_types.get("")`, and short-circuited the
+                // whole rule to phi via the fast-path failure return.
+                // Now AbsenceOf antecedents are applied as final guards
+                // over the joined positive product (mirrors task-814-
+                // join-absence's port to compile_join_derivation,
+                // commit a2aa46e8).
+                //
+                // `original_to_positive` lets the post-join binding-
+                // construction phase translate a user-authored
+                // antecedent index back to its slot in the joined
+                // tuple. AbsenceOf positions don't appear in the map
+                // — they don't contribute bindings.
+                let positive_idx_subscript: Vec<usize> = (0..antecedent_ids.len())
+                    .filter(|&i| !matches!(rule.antecedent_sources.get(i),
+                        Some(crate::types::AntecedentSource::AbsenceOf { .. })))
+                    .collect();
+                let pos_count = positive_idx_subscript.len();
+                let original_to_positive: hashbrown::HashMap<usize, usize> =
+                    positive_idx_subscript.iter().enumerate()
+                        .map(|(pos, &orig)| (orig, pos))
+                        .collect();
                 // Build the join chain.
                 //
-                // Tuple shape after step k (0-indexed):
-                //   k_total = 0  → just a0 (no nesting; Id picks it)
-                //   k_total = 1  → <a0, a1>
-                //   k_total = 2  → <<a0, a1>, a2>
-                //   k_total = N  → <<…<a0, a1>, a2>, … aN>
-                // Helper `pick_in_tuple(k_total, ant_idx)` returns a
-                // Func that pulls antecedent `ant_idx` out of the
-                // step-k_total tuple shape:
-                //   ant_idx == k_total       → Selector(2)
+                // Tuple shape after step k_pos (0-indexed in POSITIVE
+                // subsequence):
+                //   k_pos = 0  → just positive[0] (no nesting; Id picks it)
+                //   k_pos = 1  → <pos[0], pos[1]>
+                //   k_pos = 2  → <<pos[0], pos[1]>, pos[2]>
+                //   k_pos = N  → <<…<pos[0], pos[1]>, pos[2]>, … pos[N]>
+                // Helper `pick_in_tuple(k_total, pos_idx)` returns a
+                // Func that pulls positive antecedent `pos_idx` out of
+                // the step-k_total tuple shape (positive position).
+                //   pos_idx == k_total       → Selector(2)
                 //                              (or Id when k_total==0)
-                //   ant_idx == k_total - 1   → Selector(2).Selector(1)
-                //   ant_idx <  k_total - 1   → Selector(2).Selector(1)
+                //   pos_idx == k_total - 1   → Selector(2).Selector(1)
+                //   pos_idx <  k_total - 1   → Selector(2).Selector(1)
                 //                              .Selector(1).….Selector(1)
                 //                              (one Selector(2) plus
-                //                              k_total-ant_idx-1 extra
+                //                              k_total-pos_idx-1 extra
                 //                              Selector(1)s on top)
-                //   ant_idx == 0, k_total>0  → Selector(1).….Selector(1)
+                //   pos_idx == 0, k_total>0  → Selector(1).….Selector(1)
                 //                              (k_total Selector(1)s)
-                let pick_in_tuple = |k_total: usize, ant_idx: usize| -> Func {
-                    debug_assert!(ant_idx <= k_total);
+                let pick_in_tuple = |k_total: usize, pos_idx: usize| -> Func {
+                    debug_assert!(pos_idx <= k_total);
                     if k_total == 0 {
-                        // No nesting yet — the "tuple" is just a0.
+                        // No nesting yet — the "tuple" is just pos[0].
                         return Func::Id;
                     }
-                    if ant_idx == k_total {
-                        // Most-recent antecedent sits at Selector(2).
+                    if pos_idx == k_total {
+                        // Most-recent positive antecedent sits at Selector(2).
                         return Func::Selector(2);
                     }
-                    // Older antecedent: peel into Selector(1) until
-                    // we reach the layer at which `ant_idx` is the
-                    // most-recent, then take Selector(2) (or Id when
-                    // ant_idx == 0).
-                    let mut f = if ant_idx == 0 {
+                    // Older positive antecedent: peel into Selector(1)
+                    // until we reach the layer at which `pos_idx` is
+                    // the most-recent, then take Selector(2) (or Id
+                    // when pos_idx == 0).
+                    let mut f = if pos_idx == 0 {
                         Func::Selector(1)
                     } else {
                         Func::compose(Func::Selector(2), Func::Selector(1))
                     };
-                    let strip_levels = k_total - ant_idx - 1;
+                    let strip_levels = k_total - pos_idx - 1;
                     for _ in 0..strip_levels {
                         f = Func::compose(f, Func::Selector(1));
                     }
@@ -4234,58 +4261,83 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 // Subscripts the rule's antecedent[i] role[ri]
                 // carries. Empty string means no subscript. Lookup
                 // helper avoids re-walking ant_subs in the loops.
+                // Indexed by ORIGINAL antecedent position (because
+                // ant_subs is sized to the user-authored count).
                 let sub_of = |i: usize, ri: usize| -> String {
                     ant_subs.get(i)
                         .and_then(|a| a.iter().find(|(idx, _)| *idx == ri))
                         .map(|(_, s)| s.clone())
                         .unwrap_or_default()
                 };
-                // Step 0: a0_facts.
-                let mut tuple_stream = extract(0, &antecedent_ids[0]);
-                // For each subsequent antecedent, build join key
-                // pairs against PRIOR antecedents that share a
-                // subscript on some role.
-                for k in 1..antecedent_ids.len() {
+                // Degenerate: no positive antecedent at all means we
+                // can't construct a join product. The subscript-bridge
+                // detector shouldn't actually flag a pure-AbsenceOf
+                // rule (subscripts don't bridge across AbsenceOf
+                // positions), but keep the guard for safety.
+                if pos_count == 0 {
+                    let (consequent_cell, consequent_role_literals, negation_reads) =
+                        derivation_dep_metadata(rule);
+                    return CompiledDerivation {
+                        id, text, kind,
+                        func: Func::constant(Object::phi()),
+                        uses_negation: !absence_idx.is_empty(),
+                        consequent_cell, consequent_role_literals, negation_reads,
+                    };
+                }
+                // Step 0: facts of the first POSITIVE antecedent.
+                let mut tuple_stream = extract(positive_idx_subscript[0],
+                                                &antecedent_ids[positive_idx_subscript[0]]);
+                // For each subsequent POSITIVE antecedent, build join
+                // key pairs against PRIOR POSITIVE antecedents that
+                // share a subscript on some role. Subscripts come from
+                // ant_subs (indexed by ORIGINAL position), join shape
+                // walks the positive subsequence.
+                for k_pos in 1..pos_count {
+                    let k = positive_idx_subscript[k_pos]; // original index
                     let ant_k_facts = extract(k, &antecedent_ids[k]);
                     let Some(ft_k) = data.fact_types.get(&antecedent_ids[k]) else {
-                        // Schema lookup failed — degenerate, fall
-                        // back to existence check.
+                        // Schema lookup failed for a positive antecedent
+                        // — degenerate, fall back to phi. uses_negation
+                        // still reflects rule intent (an AbsenceOf in
+                        // scope makes this a stratum-2 routing target
+                        // even though the rule cannot fire).
                         let (consequent_cell, consequent_role_literals, negation_reads) =
                             derivation_dep_metadata(rule);
                         return CompiledDerivation {
                             id: id.clone(), text: text.clone(), kind: kind.clone(),
                             func: Func::constant(Object::phi()),
-                            uses_negation: false,
+                            uses_negation: !absence_idx.is_empty(),
                             consequent_cell, consequent_role_literals, negation_reads,
                         };
                     };
                     let ft_k_role_count = ft_k.roles.len();
                     // Collect equality predicates: for each role rk
                     // of antecedent[k], if its subscript matches a
-                    // subscript on some prior antecedent's role,
-                    // require equality. (We pick the FIRST matching
-                    // prior; multiple prior matches are redundant
-                    // since equality is transitive.)
+                    // subscript on some prior POSITIVE antecedent's
+                    // role, require equality. (We pick the FIRST
+                    // matching prior; multiple prior matches are
+                    // redundant since equality is transitive.)
                     let mut eqs: Vec<Func> = Vec::new();
                     for rk in 0..ft_k_role_count {
                         let sub = sub_of(k, rk);
                         if sub.is_empty() { continue }
-                        // Find first prior antecedent + role with
-                        // the same subscript.
+                        // Find first prior POSITIVE antecedent + role
+                        // with the same subscript.
                         let mut found_prior: Option<(usize, usize)> = None;
-                        'outer: for prior in 0..k {
+                        'outer: for prior_pos in 0..k_pos {
+                            let prior = positive_idx_subscript[prior_pos];
                             let Some(ft_prior) = data.fact_types.get(&antecedent_ids[prior])
                             else { continue };
                             for r_prior in 0..ft_prior.roles.len() {
                                 if sub_of(prior, r_prior) == sub {
-                                    found_prior = Some((prior, r_prior));
+                                    found_prior = Some((prior_pos, r_prior));
                                     break 'outer;
                                 }
                             }
                         }
-                        if let Some((prior_ant, prior_role)) = found_prior {
+                        if let Some((prior_pos, prior_role)) = found_prior {
                             let lhs = Func::compose(role_value(prior_role),
-                                Func::compose(pick_in_tuple(k - 1, prior_ant),
+                                Func::compose(pick_in_tuple(k_pos - 1, prior_pos),
                                     Func::Selector(1)));
                             let rhs = Func::compose(role_value(rk),
                                 Func::Selector(2));
@@ -4298,7 +4350,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     // across two antecedents, no subscript token).
                     // For each role rk of ant[k], if its noun_name
                     // also appears as the noun_name of some prior
-                    // antecedent's role AND neither carries a
+                    // POSITIVE antecedent's role AND neither carries a
                     // disambiguating subscript on this position,
                     // require equality. Skips when rk has a
                     // subscript (handled above).
@@ -4306,19 +4358,20 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                         if !sub_of(k, rk).is_empty() { continue }
                         let noun_k = &ft_k.roles[rk].noun_name;
                         let mut found_prior: Option<(usize, usize)> = None;
-                        'outer2: for prior in 0..k {
+                        'outer2: for prior_pos in 0..k_pos {
+                            let prior = positive_idx_subscript[prior_pos];
                             let Some(ft_prior) = data.fact_types.get(&antecedent_ids[prior])
                             else { continue };
                             for r_prior in 0..ft_prior.roles.len() {
                                 if &ft_prior.roles[r_prior].noun_name != noun_k { continue }
                                 if !sub_of(prior, r_prior).is_empty() { continue }
-                                found_prior = Some((prior, r_prior));
+                                found_prior = Some((prior_pos, r_prior));
                                 break 'outer2;
                             }
                         }
-                        if let Some((prior_ant, prior_role)) = found_prior {
+                        if let Some((prior_pos, prior_role)) = found_prior {
                             let lhs = Func::compose(role_value(prior_role),
-                                Func::compose(pick_in_tuple(k - 1, prior_ant),
+                                Func::compose(pick_in_tuple(k_pos - 1, prior_pos),
                                     Func::Selector(1)));
                             let rhs = Func::compose(role_value(rk),
                                 Func::Selector(2));
@@ -4351,13 +4404,87 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                         ),
                     );
                 }
+                let last_k = pos_count - 1;
+                // task-918-subscript-and-fallback-absence: AbsenceOf
+                // antecedents become final guard predicates over the
+                // joined positive product. Mirrors task-814-join-
+                // absence's pattern in compile_join_derivation. For
+                // each AbsenceOf { fact_type, role }: source neg
+                // facts, build key_match against the joined tuple's
+                // role value (find the positive antecedent that carries
+                // the role and use pick_in_tuple), AND any role-literal
+                // pins, build absent_guard, fold into tuple_stream via
+                // DistR + apply_to_all + Concat.
+                let absence_specs: Vec<(Func, Func)> = absence_idx.iter().filter_map(|&orig_i| {
+                    let (neg_ft_id, neg_role) = match &rule.antecedent_sources[orig_i] {
+                        crate::types::AntecedentSource::AbsenceOf { fact_type, role } =>
+                            (fact_type.clone(), role.clone()),
+                        _ => return None,
+                    };
+                    // Find the positive antecedent that carries
+                    // `neg_role`, plus its role index on that FT.
+                    let (pos_with_role, role_ri) = positive_idx_subscript.iter().enumerate()
+                        .find_map(|(pos_idx, &orig)| {
+                            let ft = data.fact_types.get(&antecedent_ids[orig])?;
+                            let ri = ft.roles.iter().position(|r| r.noun_name == neg_role)?;
+                            Some((pos_idx, ri))
+                        })?;
+                    let neg_facts = extract_facts_from_pop(&neg_ft_id);
+                    // Per-pair shape: <joined_tuple, neg_fact>.
+                    // Selector(1) = joined_tuple, Selector(2) = neg_fact.
+                    let lhs = Func::compose(role_value_by_name(&neg_role), Func::Selector(2));
+                    let rhs = Func::compose(
+                        role_value(role_ri),
+                        Func::compose(pick_in_tuple(last_k, pos_with_role), Func::Selector(1)),
+                    );
+                    let key_match = Func::compose(Func::Eq, Func::construction(vec![lhs, rhs]));
+                    // AND every role-literal pinned on this AbsenceOf slot.
+                    let mut neg_pred = key_match;
+                    for arl in rule.antecedent_role_literals.iter()
+                        .filter(|arl| arl.antecedent_index == orig_i)
+                    {
+                        let lit_check = Func::compose(Func::Eq, Func::construction(vec![
+                            Func::compose(role_value_by_name(&arl.role), Func::Selector(2)),
+                            Func::constant(Object::atom(&arl.value)),
+                        ]));
+                        neg_pred = Func::compose(Func::And, Func::construction(vec![
+                            neg_pred, lit_check,
+                        ]));
+                    }
+                    let any_match = Func::compose(
+                        Func::compose(Func::Not, Func::NullTest),
+                        Func::compose(Func::filter(neg_pred), Func::DistL),
+                    );
+                    let absent_guard = Func::compose(Func::Not, any_match);
+                    Some((neg_facts, absent_guard))
+                }).collect();
+                // Iteratively wrap each AbsenceOf guard around
+                // `tuple_stream`. After step k, `tuple_stream` is a
+                // sequence of joined positive tuples that pass guards
+                // 0..k. Per step:
+                //   per_tuple   := if guard(<tuple, neg_facts>) then <tuple> else phi
+                //   tuple_stream' := Concat . α(per_tuple) . DistR . <tuple_stream, neg_facts>
+                // DistR pairs every tuple with the same `neg_facts`
+                // (resolved once at the outer population level); the
+                // per_tuple condition keeps the tuple iff the absent
+                // guard holds; Concat collapses phi's away.
+                let tuple_stream = absence_specs.into_iter().fold(tuple_stream, |acc, (neg_facts, guard)| {
+                    let per_tuple = Func::condition(
+                        guard,
+                        Func::construction(vec![Func::Selector(1)]),
+                        Func::constant(Object::phi()),
+                    );
+                    Func::compose(Func::Concat,
+                        Func::compose(Func::apply_to_all(per_tuple),
+                            Func::compose(Func::DistR, Func::construction(vec![acc, neg_facts]))))
+                });
                 // Now `tuple_stream` is a flat seq of nested
-                // tuples `<<<a0, a1>, a2>, …>` where every join
-                // constraint holds. Build per-tuple consequent.
+                // tuples `<<<pos[0], pos[1]>, pos[2]>, …>` where every
+                // join + absence constraint holds. Build per-tuple
+                // consequent. last_k references positive positions.
                 let cons_roles = data.fact_types.get(&consequent_id)
                     .map(|ft| ft.roles.clone())
                     .unwrap_or_default();
-                let last_k = antecedent_ids.len() - 1;
                 let pairs: Vec<Func> = cons_roles.iter().enumerate()
                     .map(|(cons_role_idx, r)| {
                         let key = r.noun_name.clone();
@@ -4370,31 +4497,37 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                                 Func::constant(Object::atom(&crl.value)),
                             ]);
                         }
-                        // (2) Subscript-positional projection.
+                        // (2) Subscript-positional projection. Walk
+                        // POSITIVE antecedents (AbsenceOf carries no
+                        // subscripts in ant_subs). Translate
+                        // original→positive position.
                         let cons_sub = cons_subs.iter()
                             .find(|(idx, _)| *idx == cons_role_idx)
                             .map(|(_, s)| s.as_str())
                             .filter(|s| !s.is_empty());
                         if let Some(sub) = cons_sub {
                             for (ant_idx, ant_role_subs) in ant_subs.iter().enumerate() {
+                                let Some(&pos_idx) = original_to_positive.get(&ant_idx) else { continue };
                                 if let Some((ant_role_idx, _)) = ant_role_subs.iter()
                                     .find(|(_, s)| s == sub)
                                 {
                                     return Func::construction(vec![
                                         Func::constant(Object::atom(&key)),
                                         Func::compose(role_value(*ant_role_idx),
-                                            pick_in_tuple(last_k, ant_idx)),
+                                            pick_in_tuple(last_k, pos_idx)),
                                     ]);
                                 }
                             }
                         }
-                        // (3) Name-based fallback against any
+                        // (3) Name-based fallback against any POSITIVE
                         // antecedent that carries a role with the
                         // matching noun_name. Picks the first
                         // antecedent with that role to mirror the
                         // 1-antecedent case's role_value_by_name
-                        // semantics.
+                        // semantics. AbsenceOf positions are skipped
+                        // — their facts aren't in the joined tuple.
                         for (ant_idx, ft_id) in antecedent_ids.iter().enumerate() {
+                            let Some(&pos_idx) = original_to_positive.get(&ant_idx) else { continue };
                             let Some(ft) = data.fact_types.get(ft_id) else { continue };
                             if let Some((role_idx, _)) = ft.roles.iter()
                                 .enumerate()
@@ -4403,7 +4536,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                                 return Func::construction(vec![
                                     Func::constant(Object::atom(&key)),
                                     Func::compose(role_value(role_idx),
-                                        pick_in_tuple(last_k, ant_idx)),
+                                        pick_in_tuple(last_k, pos_idx)),
                                 ]);
                             }
                         }
@@ -4422,10 +4555,19 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 ]);
                 let (consequent_cell, consequent_role_literals, negation_reads) =
                     derivation_dep_metadata(rule);
+                // task-918-subscript-and-fallback-absence: any
+                // AbsenceOf antecedent makes this rule stratum-2
+                // (negation-guarded). Without that, the chain
+                // orchestrator would fire this subscript-driven join
+                // in the positive round before the negated cell is
+                // populated, and the absent_guard could observe a
+                // stale-empty population — emitting facts that the
+                // post-positive-fixpoint state should have rejected.
+                // Mirrors path (a) and the multi-AbsenceOf branch.
                 return CompiledDerivation {
                     id, text, kind,
                     func: Func::compose(Func::apply_to_all(derive_one), tuple_stream),
-                    uses_negation: false,
+                    uses_negation: !absence_idx.is_empty(),
                     consequent_cell, consequent_role_literals, negation_reads,
                 };
             }
@@ -4997,24 +5139,103 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 };
             }
 
-            // (b) Existence-check fallback. Fires when every
-            // antecedent has at least one surviving fact.
-            let ant_checks: Vec<Func> = antecedent_ids.iter().enumerate()
-                .map(|(i, ft_id)| Func::compose(
+            // (b) Existence-check fallback. Fires when every POSITIVE
+            // antecedent has at least one surviving fact AND every
+            // AbsenceOf antecedent's negated FT has no fact matching
+            // its role-literal pins.
+            //
+            // task-918-subscript-and-fallback-absence: pre-fix this
+            // branch extracted facts for ALL antecedent positions
+            // including AbsenceOf, where antecedent_ids[i] = "" →
+            // extract(i, "") = phi → Not(NullTest)(phi) = false →
+            // all_hold conjunction collapsed → rule never fired even
+            // when AbsenceOf was satisfied. Now positives drive the
+            // existence check; AbsenceOf antecedents apply per-guard
+            // "no matching fact" predicates against the negated FT's
+            // full population. Returned via early-return so
+            // uses_negation can be set per AbsenceOf presence (mirrors
+            // paths (a) / (a') and the multi-AbsenceOf branch).
+            //
+            // Note: the existence-check fallback fires once GLOBALLY
+            // — it doesn't fan out per-subject. So AbsenceOf here
+            // reduces to a global "no matching fact in neg_ft (with
+            // pins)" check rather than the per-a0 keyed guard used in
+            // paths (a) / (a'). This matches the semantic shape of
+            // path (b): "every condition holds, emit one consequent".
+            let positive_idx_b: Vec<usize> = (0..antecedent_ids.len())
+                .filter(|&i| !matches!(rule.antecedent_sources.get(i),
+                    Some(crate::types::AntecedentSource::AbsenceOf { .. })))
+                .collect();
+            let pos_checks: Vec<Func> = positive_idx_b.iter()
+                .map(|&i| Func::compose(
                     Func::compose(Func::Not, Func::NullTest),
-                    extract(i, ft_id),
+                    extract(i, &antecedent_ids[i]),
                 ))
                 .collect();
-            let all_hold = ant_checks.into_iter()
-                .reduce(|a, b| Func::compose(Func::And, Func::construction(vec![a, b])))
-                .unwrap();
+            // AbsenceOf existence-checks: "no fact in neg_ft matches
+            // role-literal pins". With no pins, this collapses to "no
+            // facts at all in neg_ft" — NullTest on the population.
+            let neg_checks: Vec<Func> = absence_idx.iter().filter_map(|&orig_i| {
+                let neg_ft_id = match &rule.antecedent_sources[orig_i] {
+                    crate::types::AntecedentSource::AbsenceOf { fact_type, .. } => fact_type.clone(),
+                    _ => return None,
+                };
+                let neg_facts = extract_facts_from_pop(&neg_ft_id);
+                let pinned: Vec<&crate::types::AntecedentRoleLiteral> =
+                    rule.antecedent_role_literals.iter()
+                        .filter(|arl| arl.antecedent_index == orig_i)
+                        .collect();
+                let no_match_pred = if pinned.is_empty() {
+                    // No pins — guard passes iff neg_ft is empty.
+                    Func::NullTest
+                } else {
+                    let mut neg_pred: Option<Func> = None;
+                    for arl in pinned.iter() {
+                        let lit_check = Func::compose(Func::Eq, Func::construction(vec![
+                            role_value_by_name(&arl.role),
+                            Func::constant(Object::atom(&arl.value)),
+                        ]));
+                        neg_pred = Some(match neg_pred {
+                            Some(prev) => Func::compose(Func::And,
+                                Func::construction(vec![prev, lit_check])),
+                            None => lit_check,
+                        });
+                    }
+                    // Filter to facts matching the pins, then NullTest:
+                    // "no matching fact" iff filter result is empty.
+                    Func::compose(Func::NullTest, Func::filter(neg_pred.unwrap()))
+                };
+                Some(Func::compose(no_match_pred, neg_facts))
+            }).collect();
+            let mut all_checks: Vec<Func> = pos_checks;
+            all_checks.extend(neg_checks);
+            let all_hold = if all_checks.is_empty() {
+                // No antecedents at all (degenerate; shouldn't happen
+                // in the multi-antecedent arm but keep total).
+                Func::constant(Object::atom("true"))
+            } else {
+                all_checks.into_iter()
+                    .reduce(|a, b| Func::compose(Func::And, Func::construction(vec![a, b])))
+                    .unwrap()
+            };
             // Bindings: when the rule pins consequent roles to literals
             // (#286 — grammar recognizer rules like Frequency
             // Constraint), construct the consequent fact fresh in the
             // declared role order so forward-chain emits a canonical
             // fact without position drift. Otherwise fall back to the
-            // first-fact-from-first-antecedent shape.
-            let first_fact = Func::compose(Func::Selector(1), extract(0, &antecedent_ids[0]));
+            // first-fact-from-first-POSITIVE-antecedent shape (was
+            // first-fact-from-position-0 pre-task-918; if position 0
+            // is AbsenceOf, antecedent_ids[0] = "" and the pre-fix
+            // first_fact was phi, sourcing junk bindings).
+            let first_pos_idx = positive_idx_b.first().copied();
+            let first_fact = match first_pos_idx {
+                Some(i) => Func::compose(Func::Selector(1), extract(i, &antecedent_ids[i])),
+                // No positive antecedent. Bindings can't be sourced
+                // from the join product; only literal-pin consequents
+                // make sense here. Safe-default to phi for the value
+                // so non-literal roles emit phi rather than wrong data.
+                None => Func::constant(Object::phi()),
+            };
             let bindings = if rule.consequent_role_literals.is_empty() {
                 first_fact
             } else {
@@ -5051,11 +5272,27 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 consequent_reading_func.clone(),
                 bindings,
             ]);
-            Func::condition(
+            let func_b = Func::condition(
                 all_hold,
                 Func::construction(vec![derived]),
                 Func::constant(Object::phi()),
-            )
+            );
+            // task-918-subscript-and-fallback-absence: any AbsenceOf
+            // antecedent makes this rule stratum-2 (negation-guarded).
+            // Without that, the chain orchestrator would fire path (b)
+            // in the positive round before the negated cell has been
+            // populated, and the no-match check could observe a stale-
+            // empty population — emitting a fact that the post-fixpoint
+            // state should reject. Mirrors paths (a) / (a') and the
+            // multi-AbsenceOf branch.
+            let (consequent_cell, consequent_role_literals, negation_reads) =
+                derivation_dep_metadata(rule);
+            return CompiledDerivation {
+                id, text, kind,
+                func: func_b,
+                uses_negation: !absence_idx.is_empty(),
+                consequent_cell, consequent_role_literals, negation_reads,
+            };
         }
     };
     let (consequent_cell, consequent_role_literals, negation_reads) =
