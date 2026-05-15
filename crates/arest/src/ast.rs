@@ -4654,12 +4654,79 @@ pub fn merge_delta(
 
     for (k, v) in delta_pairs {
         let new_chain = match base_map.get(&k) {
-            Some(existing) => chain_append(existing, v, recorded_at.clone(), event.clone()),
+            Some(existing) => {
+                // task-922-map-cell-merge-not-replace: if BOTH the
+                // existing cell's latest contents AND the delta value
+                // are Maps, the new chain entry's contents must be the
+                // UNION (delta entries layered onto the existing Map),
+                // not the delta value alone. Without this, every apply
+                // that emits a single-entity Map delta replaces the
+                // whole cell — multi-entity history is lost.
+                //
+                // The chain layer (chain_append) preserves prior
+                // versions byte-for-byte, but the LOGICAL VIEW (latest
+                // contents) is what readers see, and that view collapses
+                // to one entry on every apply pre-fix.
+                //
+                // Apply-update semantics (same key in delta + existing):
+                // delta entries WIN — we're updating that entry on
+                // purpose. Different keys in the delta are added
+                // alongside; existing keys not in the delta are kept.
+                let merged_contents = merge_map_cell_contents(existing, &v);
+                chain_append(existing, merged_contents, recorded_at.clone(), event.clone())
+            }
             None => wrap_as_chain(v, recorded_at.clone(), event.clone()),
         };
         base_map.insert(k, new_chain);
     }
     Object::Map(base_map.into())
+}
+
+/// Merge a delta cell value onto the existing cell's latest contents
+/// for the Map-form case.
+///
+/// task-922-map-cell-merge-not-replace: when an apply's delta value is
+/// itself a Map (per-entity routing — the cell name is the FT id, the
+/// Map keys are entity ids), the new cell contents must be the UNION
+/// of the existing latest Map and the delta's Map. The cell layer
+/// holds a chain over Map values; without this union the latest version
+/// replaces the cell entirely and only the most recently apply'd
+/// entity is visible.
+///
+/// Behavior:
+/// - existing is a chain → unwrap to its latest contents
+/// - existing latest contents is Map AND delta is Map → union (delta
+///   entries replace same-key existing entries, other keys are kept)
+/// - any other shape → return delta as-is (legacy semantics — a Seq
+///   cell remains last-write-wins, an Atom cell is replaced)
+///
+/// Pure helper: takes references, returns a fresh Object. Callers
+/// thread the returned contents into `chain_append` so the chain still
+/// gets a new VersionEntry per merge.
+fn merge_map_cell_contents(existing_chain: &Object, delta_value: &Object) -> Object {
+    let Some(delta_map) = delta_value.as_map() else {
+        return delta_value.clone();
+    };
+    // Existing is a chain (or legacy raw); read its latest logical
+    // contents. cell_contents_view unwraps chains; non-chain values
+    // pass through.
+    let existing_contents = cell_contents_view(existing_chain);
+    let Some(existing_map) = existing_contents.as_map() else {
+        // Existing isn't a Map (legacy Seq or Atom or absent) — fall
+        // back to legacy replace semantics. Migration of pre-existing
+        // Seq-form data into Map-form is the caller's job (cell_put_keyed
+        // handles it for direct writes); merge_delta plays the
+        // conservative role here so cells that flipped shape mid-history
+        // don't silently mutate.
+        return delta_value.clone();
+    };
+    // Union: start from existing entries, layer delta entries on top.
+    // delta entries WIN at colliding keys (apply-update semantics).
+    let mut merged: HashMap<String, Object> = existing_map.clone();
+    for (k, v) in delta_map.iter() {
+        merged.insert(k.clone(), v.clone());
+    }
+    Object::Map(merged.into())
 }
 
 /// Demultiplex events by cell assignment (paper Eq. demux).
@@ -8627,6 +8694,128 @@ mod tests {
         assert_eq!(version_entry_prev(&hist[0]), None);
         assert_eq!(version_entry_prev(&hist[1]), Some(1));
         assert_eq!(version_entry_prev(&hist[2]), Some(2));
+    }
+
+    // ── task-922-map-cell-merge-not-replace ─────────────────────────────
+    //
+    // When apply emits its delta as a Map-keyed cell `{<entity-id> = fact}`
+    // (the per-entity routing introduced by task-744 / #770 / task-922
+    // round-trip), `merge_delta` must UNION the delta's entries onto the
+    // existing Map cell — not REPLACE the whole cell with just that one
+    // entry. The chain layer faithfully preserves every version's
+    // contents, but if version N's contents is a one-entry Map, then the
+    // logical view (latest contents) is also one entry. Multi-entity
+    // history is gone the moment any single-entity apply lands.
+    //
+    // Pre-fix: ft_Task_has_Task_Priority on the live tasks app went from
+    // 700+ entries to 1 entry per session because every apply replaced
+    // the cell. Post-fix: each apply either inserts a new key or updates
+    // a same-key entry; all other entries are preserved.
+
+    #[test]
+    fn merge_delta_unions_map_cell_entries_instead_of_replacing() {
+        // Base: Map cell already containing two entity-keyed entries.
+        // Set up via two prior merges so the cell is a chain over Maps.
+        let s0 = Object::Map(HashMap::new().into());
+        let mut d1 = HashMap::new();
+        let mut m1 = HashMap::new();
+        m1.insert("ent-1".to_string(), Object::atom("fact-1"));
+        d1.insert("FT".to_string(), Object::Map(m1.into()));
+        let s1 = merge_delta(&s0, &Object::Map(d1.into()), None);
+
+        let mut d2 = HashMap::new();
+        let mut m2 = HashMap::new();
+        m2.insert("ent-2".to_string(), Object::atom("fact-2"));
+        d2.insert("FT".to_string(), Object::Map(m2.into()));
+        let s2 = merge_delta(&s1, &Object::Map(d2.into()), None);
+
+        // Sanity: latest view of FT must hold BOTH ent-1 and ent-2.
+        let view2 = fetch_or_phi("FT", &s2);
+        let m_view2 = view2.as_map().expect("FT cell view must be a Map");
+        assert_eq!(
+            m_view2.len(), 2,
+            "after two single-entry Map deltas, the merged cell must \
+             hold both entries; got keys = {:?}",
+            m_view2.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(m_view2.get("ent-1"), Some(&Object::atom("fact-1")));
+        assert_eq!(m_view2.get("ent-2"), Some(&Object::atom("fact-2")));
+
+        // Third merge: a NEW entity. Must add ent-3 alongside the
+        // existing two — total = 3.
+        let mut d3 = HashMap::new();
+        let mut m3 = HashMap::new();
+        m3.insert("ent-3".to_string(), Object::atom("fact-3"));
+        d3.insert("FT".to_string(), Object::Map(m3.into()));
+        let s3 = merge_delta(&s2, &Object::Map(d3.into()), None);
+
+        let view3 = fetch_or_phi("FT", &s3);
+        let m_view3 = view3.as_map().expect("FT cell view must be a Map");
+        assert_eq!(
+            m_view3.len(), 3,
+            "the third single-entry Map delta must add a NEW key; \
+             cell must hold all three entries; got keys = {:?}",
+            m_view3.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(m_view3.get("ent-1"), Some(&Object::atom("fact-1")));
+        assert_eq!(m_view3.get("ent-2"), Some(&Object::atom("fact-2")));
+        assert_eq!(m_view3.get("ent-3"), Some(&Object::atom("fact-3")));
+    }
+
+    #[test]
+    fn merge_delta_map_cell_same_key_overwrites_within_merged_view() {
+        // When the delta's Map carries a key the existing cell already
+        // has, the new value WINS (apply update semantics) but other
+        // entries are preserved untouched.
+        let s0 = Object::Map(HashMap::new().into());
+        let mut d1 = HashMap::new();
+        let mut m1 = HashMap::new();
+        m1.insert("ent-1".to_string(), Object::atom("v1"));
+        m1.insert("ent-2".to_string(), Object::atom("orig-2"));
+        d1.insert("FT".to_string(), Object::Map(m1.into()));
+        let s1 = merge_delta(&s0, &Object::Map(d1.into()), None);
+
+        // Update ent-1 only.
+        let mut d2 = HashMap::new();
+        let mut m2 = HashMap::new();
+        m2.insert("ent-1".to_string(), Object::atom("v2"));
+        d2.insert("FT".to_string(), Object::Map(m2.into()));
+        let s2 = merge_delta(&s1, &Object::Map(d2.into()), None);
+
+        let view = fetch_or_phi("FT", &s2);
+        let m = view.as_map().expect("FT view must be a Map");
+        assert_eq!(m.len(), 2, "ent-2 must be preserved alongside updated ent-1");
+        assert_eq!(m.get("ent-1"), Some(&Object::atom("v2")),
+            "same-key delta must REPLACE that key's value (apply update wins)");
+        assert_eq!(m.get("ent-2"), Some(&Object::atom("orig-2")),
+            "untouched key must keep its existing value");
+    }
+
+    #[test]
+    fn merge_delta_map_cell_grows_chain_on_each_merge() {
+        // History is preserved per merge. After three single-entry
+        // deltas the chain has three entries; the latest holds the
+        // union of all three keys.
+        let s0 = Object::Map(HashMap::new().into());
+        let entries: &[(&str, &str)] = &[("k1", "v1"), ("k2", "v2"), ("k3", "v3")];
+        let mut state = s0;
+        for (k, v) in entries {
+            let mut delta = HashMap::new();
+            let mut m = HashMap::new();
+            m.insert((*k).to_string(), Object::atom(v));
+            delta.insert("FT".to_string(), Object::Map(m.into()));
+            state = merge_delta(&state, &Object::Map(delta.into()), None);
+        }
+        let hist = cells_iter_history(&state, "FT");
+        assert_eq!(hist.len(), 3,
+            "three sequential merges must extend the chain to three entries");
+        // Latest contents = the merged Map (all three keys).
+        let latest_contents = version_entry_contents(&hist[2])
+            .expect("latest entry has contents");
+        let m = latest_contents.as_map().expect("latest contents is Map");
+        assert_eq!(m.len(), 3,
+            "latest version's contents must hold the UNION of all three \
+             entity-keyed deltas; got keys = {:?}", m.keys().collect::<Vec<_>>());
     }
 
     // ─── S1h: as_of / between derivations (#724) ──────────────────────

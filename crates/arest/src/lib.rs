@@ -3404,6 +3404,119 @@ Order has total.
         release_impl(h);
     }
 
+    /// task-922-map-cell-merge-not-replace: two consecutive `apply
+    /// create` calls for distinct entities must BOTH be visible in the
+    /// FT cell after the second apply — the cell must hold all entries
+    /// across applies, not just the most recent one.
+    ///
+    /// Pre-fix: the FT cell stored a chain over Map values, and each
+    /// merge_delta call appended a new chain entry whose contents was
+    /// the SINGLE-ENTITY map from the apply's delta. The latest
+    /// version's view (what readers see) was therefore one entry; the
+    /// previous entity's row was lost from the visible projection on
+    /// every apply. Live tasks app went from 700+ priority entries to
+    /// 1 entry per session.
+    ///
+    /// Post-fix: merge_delta merges the delta's Map onto the existing
+    /// cell's latest Map contents BEFORE wrapping into the new chain
+    /// entry. Both entities coexist in the latest view.
+    #[test]
+    fn two_consecutive_applies_both_entities_visible_in_ft_cell() {
+        let h = create_bare_impl();
+        let readings = "\
+Task(.id) is an entity type.
+Task has Task Priority.
+  Each Task has at most one Task Priority.
+";
+        let compile_out = system_impl(h, "compile", readings);
+        assert!(!compile_out.starts_with('⊥'),
+            "compile must not reject Task schema, got: {compile_out}");
+
+        // First apply: create Task t-1 with Task Priority=p0.
+        let cmd1 = r#"{"type":"createEntity","noun":"Task","domain":"","id":"t-1","fields":{"Task Priority":"p0"}}"#;
+        let out1 = system_impl(h, "apply", cmd1);
+        assert!(!out1.starts_with('⊥'),
+            "first apply must not return ⊥; got: {out1}");
+
+        // Second apply: create Task t-2 with Task Priority=p1.
+        // Pre-fix the FT cell `Task_has_Task_Priority` collapses to
+        // exactly the one Map entry from this delta — t-1's row is gone
+        // from the visible projection.
+        let cmd2 = r#"{"type":"createEntity","noun":"Task","domain":"","id":"t-2","fields":{"Task Priority":"p1"}}"#;
+        let out2 = system_impl(h, "apply", cmd2);
+        assert!(!out2.starts_with('⊥'),
+            "second apply must not return ⊥; got: {out2}");
+
+        // Both rows must be in the FT cell after the second apply.
+        // Cell name preserves spaces verbatim ("Task has Task Priority"
+        // → "Task_has_Task Priority").
+        let snapshot = peek(h).expect("handle live after applies");
+        let ft = ast::fetch_or_phi("Task_has_Task Priority", &snapshot);
+        let count = ast::cell_fact_count(&ft);
+        assert_eq!(
+            count, 2,
+            "Task_has_Task Priority must hold both t-1 and t-2 after \
+             two consecutive applies; got {} fact(s). \
+             Pre-fix the second apply's Map-form delta REPLACED the \
+             cell with just its one entry (t-1's row lost from view).\n\
+             Cell shape: {ft:?}",
+            count,
+        );
+
+        // Spot-check: both entity ids present in the cell facts.
+        let task_ids: Vec<String> = ast::cell_facts_iter(&ft)
+            .filter_map(|f| ast::binding(f, "Task").map(|s| s.to_string()))
+            .collect();
+        assert!(task_ids.contains(&"t-1".to_string()),
+            "t-1 must be present in Task_has_Task Priority; got ids = {task_ids:?}");
+        assert!(task_ids.contains(&"t-2".to_string()),
+            "t-2 must be present in Task_has_Task Priority; got ids = {task_ids:?}");
+
+        release_impl(h);
+    }
+
+    /// task-922-map-cell-merge-not-replace: three consecutive applies
+    /// across three distinct entities in the SAME FT cell — all three
+    /// must be visible in the latest view. Stresses the
+    /// chain-over-Map / merge-not-replace invariant beyond the binary
+    /// case so the proof scales: every apply preserves prior keys.
+    #[test]
+    fn three_consecutive_applies_accumulate_in_ft_cell() {
+        let h = create_bare_impl();
+        let readings = "\
+Task(.id) is an entity type.
+Task has Task Priority.
+  Each Task has at most one Task Priority.
+";
+        let compile_out = system_impl(h, "compile", readings);
+        assert!(!compile_out.starts_with('⊥'),
+            "compile must not reject Task schema, got: {compile_out}");
+
+        for (id, prio) in [("a-1", "p0"), ("a-2", "p1"), ("a-3", "p2")] {
+            let cmd = format!(
+                r#"{{"type":"createEntity","noun":"Task","domain":"","id":"{id}","fields":{{"Task Priority":"{prio}"}}}}"#
+            );
+            let out = system_impl(h, "apply", &cmd);
+            assert!(!out.starts_with('⊥'),
+                "apply for {id} must not return ⊥; got: {out}");
+        }
+
+        let snapshot = peek(h).expect("handle live after three applies");
+        let ft = ast::fetch_or_phi("Task_has_Task Priority", &snapshot);
+        let count = ast::cell_fact_count(&ft);
+        assert_eq!(
+            count, 3,
+            "Task_has_Task Priority must hold all three entities after \
+             three consecutive applies; got {} fact(s). The pre-fix \
+             merge_delta replaced the cell on each apply, so only the \
+             last entity (a-3) survived the visible view.\n\
+             Cell shape: {ft:?}",
+            count,
+        );
+
+        release_impl(h);
+    }
+
     // ── #770 — per-entity cells (paper §196 + §462 eq:cellfold) ─────────
     //
     // Each entity is a cell whose contents is the 3NF row that Halpin's
