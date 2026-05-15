@@ -116,38 +116,39 @@ mod db {
     }
 
     /// Load state D from SQLite.
+    ///
+    /// Builds an `Object::Map` directly while iterating rows. The
+    /// previous shape folded via `ast::store` starting from
+    /// `Object::phi()` (empty Seq), making each insert O(N) and the
+    /// whole load O(N²). For a tasks-app DB with ~10K combined cells
+    /// + defs, the cold-start `load_state` cost dominated every CLI
+    /// invocation at ~18s — pinning a CPU core for the duration of
+    /// every MCP shell-out. The direct-Map path is O(N) total.
     pub fn load_state(conn: &Connection) -> ast::Object {
-        let mut state = ast::Object::phi();
+        let mut map: hashbrown::HashMap<String, ast::Object> =
+            hashbrown::HashMap::new();
 
         // Load cells (population facts).
-        let mut stmt = match conn.prepare("SELECT name, contents FROM cells") {
-            Ok(s) => s,
-            Err(_) => return state,
-        };
-        state = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        }).unwrap_or_else(|e| { eprintln!("Failed to read cells: {}", e); std::process::exit(1); })
-        .filter_map(|r| r.ok())
-        .fold(state, |acc, (name, contents)| {
-            let obj = ast::Object::parse(&contents);
-            ast::store(&name, obj, &acc)
-        });
+        if let Ok(mut stmt) = conn.prepare("SELECT name, contents FROM cells") {
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            }).unwrap_or_else(|e| { eprintln!("Failed to read cells: {}", e); std::process::exit(1); });
+            for r in rows.filter_map(|r| r.ok()) {
+                map.insert(r.0, ast::Object::parse(&r.1));
+            }
+        }
 
         // Load defs.
-        let mut stmt = match conn.prepare("SELECT name, func FROM defs") {
-            Ok(s) => s,
-            Err(_) => return state,
-        };
-        state = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        }).unwrap_or_else(|e| { eprintln!("Failed to read defs: {}", e); std::process::exit(1); })
-        .filter_map(|r| r.ok())
-        .fold(state, |acc, (name, contents)| {
-            let obj = ast::Object::parse(&contents);
-            ast::store(&name, obj, &acc)
-        });
+        if let Ok(mut stmt) = conn.prepare("SELECT name, func FROM defs") {
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            }).unwrap_or_else(|e| { eprintln!("Failed to read defs: {}", e); std::process::exit(1); });
+            for r in rows.filter_map(|r| r.ok()) {
+                map.insert(r.0, ast::Object::parse(&r.1));
+            }
+        }
 
-        state.to_store()
+        ast::Object::map(map)
     }
 
     #[cfg(test)]
