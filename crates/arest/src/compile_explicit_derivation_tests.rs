@@ -2741,3 +2741,105 @@ Task is recommended.
          Got uses_negation={}, rule sources: {:#?}",
         cd.uses_negation, rule.antecedent_sources);
 }
+
+// ─── Category 14: Join-path with consequent role literal pin (#814) ─
+//
+// Shape: `* X has Y 'y' iff some X has A 'a' and that X has B 'b'` — a
+// Join-routed rule (≥2 antecedents joined on a shared noun) whose
+// consequent FT has a role (`Y`) pinned to a literal value. The role
+// being pinned (`Y`) is NOT shared with any antecedent FT — it's only
+// on the consequent FT.
+//
+// Pre-#814 bug: `compile_join_derivation`'s N≥2 path built
+// `binding_parts` by walking `binding_nouns` (the consequent FT's
+// declared role nouns) and dropping any noun not found on any
+// antecedent — so a target role pinned to a literal in the consequent
+// itself was silently lost. The derived fact was missing that role
+// entirely, breaking downstream queries like `select X where
+// Y = 'y'`.
+//
+// `compile_explicit_derivation` already handles this correctly via
+// its M1b path (compile.rs:3322-3360, the "literal pin wins" branch).
+// This test mirrors the join + consequent-literal-pin shape from the
+// #814 audit's Merge example, in the same `some X ... and that X ...`
+// surface form the existing #818 test exercises (the Merge audit's
+// `concerns some C that has S` surface form is parsed today as a
+// 1-antecedent ModusPonens rule with an embedded `that-clause`, not
+// as a Join routing).
+
+#[test]
+fn shape_join_with_consequent_role_literal_pin_emits_literal() {
+    let src = r#"# Test
+Doc(.ID) is an entity type.
+ID is a value type.
+Priority is a value type.
+Kind is a value type.
+Status is a value type.
+
+## Fact Types
+Doc has ID.
+Doc has Priority.
+Doc has Kind.
+Doc has Status.
+
+## Derivation Rules
+* Doc has Status 'urgent' iff some Doc has Priority 'high' and that Doc has Kind 'critical'.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    // Routing: 2 antecedents joined on Doc → DerivationKind::Join.
+    assert_eq!(rule.kind, DerivationKind::Join,
+        "expected Join routing, got {:?} (rule text: {})", rule.kind, rule.text);
+    assert_eq!(rule.antecedent_sources.len(), 2,
+        "two antecedents expected, got {:#?}", rule.antecedent_sources);
+
+    // Consequent literal-pin must survive parsing — `Status` only
+    // appears on the consequent FT, never on either antecedent. This
+    // is exactly the shape the join compiler used to drop on the
+    // floor.
+    assert!(
+        rule.consequent_role_literals.iter().any(|l|
+            l.role == "Status" && l.value == "urgent"),
+        "expected consequent_role_literals to pin Status='urgent', got {:#?}",
+        rule.consequent_role_literals,
+    );
+
+    // Eval: only the d-yes Doc satisfies both antecedent literals
+    // (Priority='high' AND Kind='critical'), so it must derive a
+    // single Doc-has-Status fact carrying Status='urgent'.
+    let out = apply_to_facts(&func, &[
+        ("Doc_has_Priority", &[("Doc", "d-yes"),    ("Priority", "high")]),
+        ("Doc_has_Kind",     &[("Doc", "d-yes"),    ("Kind", "critical")]),
+        ("Doc_has_Priority", &[("Doc", "d-no-pri"), ("Priority", "low")]),
+        ("Doc_has_Kind",     &[("Doc", "d-no-pri"), ("Kind", "critical")]),
+    ]);
+    let derived = decode_derived(&out);
+
+    // The load-bearing assertion: the derived fact MUST carry the
+    // consequent-pinned literal as a binding. Pre-#814 this binding
+    // is silently absent — the derived fact has only the Doc binding
+    // (or empty bindings) without Status.
+    let urgent_facts: Vec<_> = derived.iter()
+        .filter(|(_, _, b)| b.iter().any(|(k, v)|
+            k == "Status" && v == "urgent"))
+        .collect();
+    assert!(!urgent_facts.is_empty(),
+        "derived fact MUST carry Status='urgent' binding\n\
+         (#814: compile_join_derivation dropped consequent_role_literals)\n\
+         got derived: {:#?}", derived);
+
+    // And it must be the d-yes Doc, not d-no-pri (antecedent literal
+    // filter still applies — Priority='high' only matches d-yes).
+    let doc_ids_with_urgent: Vec<String> = urgent_facts.iter()
+        .flat_map(|(_, _, b)| b.iter())
+        .filter(|(k, _)| k == "Doc")
+        .map(|(_, v)| v.clone())
+        .collect();
+    assert!(doc_ids_with_urgent.iter().any(|d| d == "d-yes"),
+        "d-yes (Priority=high, Kind=critical) MUST derive Status='urgent'; got Doc bindings {:?}\nfull derived: {:#?}",
+        doc_ids_with_urgent, derived);
+    assert!(!doc_ids_with_urgent.iter().any(|d| d == "d-no-pri"),
+        "d-no-pri (Priority=low) must NOT derive Status='urgent' — antecedent literal filter\n\
+         got Doc bindings {:?}\nfull derived: {:#?}",
+        doc_ids_with_urgent, derived);
+}

@@ -5457,11 +5457,45 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
     };
 
     // Î±(noun â†’ extractor) : binding_nouns
+    //
+    // #814 (task-814-join-consequent-literals): for each consequent
+    // binding noun, prefer an antecedent-bound source if available;
+    // otherwise check `consequent_role_literals` for a literal pin.
+    // Pre-#814 the literal-pin path was missing — a target role pinned
+    // to a literal value in the consequent itself (e.g. `Merge has
+    // Target Security Posture 'dual-gate' iff ...` where Target
+    // Security Posture is NOT a noun on either antecedent FT) was
+    // silently dropped because the unfound noun fell off the
+    // `filter_map`. Mirrors the M1b-path pattern in
+    // compile_explicit_derivation (compile.rs:3322-3360, the "literal
+    // pin wins" branch).
     let binding_parts: Vec<Func> = binding_nouns.iter().filter_map(|noun| {
-        let fi = (0..n).find(|&fi| find_role(fi, noun).is_some())?;
-        let ri = find_role(fi, noun)?;
-        let extractor = Func::compose(role_value(ri), access_fact(fi, n));
-        Some(Func::construction(vec![Func::constant(Object::atom(noun)), extractor]))
+        // 1. Antecedent-bound extractor: noun appears on some
+        //    antecedent FT — extract its value via the joined-fact
+        //    accessor. This is the original pre-#814 behavior.
+        if let Some(fi) = (0..n).find(|&fi| find_role(fi, noun).is_some()) {
+            let ri = find_role(fi, noun)?;
+            let extractor = Func::compose(role_value(ri), access_fact(fi, n));
+            return Some(Func::construction(vec![
+                Func::constant(Object::atom(noun)),
+                extractor,
+            ]));
+        }
+        // 2. Consequent-only literal pin: noun is absent from every
+        //    antecedent FT but the rule pinned it to a literal value
+        //    in the consequent. Emit the literal as a constant.
+        if let Some(crl) = rule.consequent_role_literals.iter()
+            .find(|crl| crl.role == *noun)
+        {
+            return Some(Func::construction(vec![
+                Func::constant(Object::atom(noun)),
+                Func::constant(Object::atom(&crl.value)),
+            ]));
+        }
+        // 3. Fallthrough: noun is consequent-only AND has no literal
+        //    pin — drop silently (pre-#814 behavior). The rule is
+        //    underspecified; nothing to bind to.
+        None
     }).collect();
 
     let derived_fact = Func::construction(vec![
