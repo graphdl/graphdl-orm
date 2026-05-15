@@ -178,29 +178,27 @@ pub fn dispatch<O: Write, E: Write>(
     code
 }
 
+/// Load cell state from SQLite. Builds Object::Map directly to avoid
+/// O(N²) Seq-fold cost (mirrors the cli/entry.rs::load_state fix in
+/// commit 6070d056). Object::parse infallibly returns Object::Bottom
+/// on malformed input, so a corrupt cell row simply lands as Bottom
+/// in that slot rather than crashing the load.
 #[cfg(feature = "local")]
 fn load_state_from_conn(conn: &rusqlite::Connection) -> Object {
-    let mut state = Object::phi();
-    let mut stmt = match conn.prepare("SELECT name, contents FROM cells") {
-        Ok(s) => s,
-        Err(_) => return state,
-    };
-    let rows = stmt.query_map([], |row| {
-        let name: String = row.get(0)?;
-        let contents: String = row.get(1)?;
-        Ok((name, contents))
-    });
-    if let Ok(iter) = rows {
-        for r in iter.flatten() {
-            let (name, json) = r;
-            // Object::parse infallibly returns Object::Bottom on
-            // malformed input, so a corrupt cell row simply lands as
-            // Bottom in that slot rather than crashing the load.
-            let parsed = crate::ast::Object::parse(&json);
-            state = crate::ast::store(&name, parsed, &state);
+    let mut map: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT name, contents FROM cells") {
+        let rows = stmt.query_map([], |row| {
+            let name: String = row.get(0)?;
+            let contents: String = row.get(1)?;
+            Ok((name, contents))
+        });
+        if let Ok(iter) = rows {
+            for (name, json) in iter.flatten() {
+                map.insert(name, crate::ast::Object::parse(&json));
+            }
         }
     }
-    state
+    crate::ast::Object::map(map)
 }
 
 #[cfg(feature = "local")]
