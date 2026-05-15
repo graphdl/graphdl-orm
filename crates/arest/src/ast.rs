@@ -352,8 +352,13 @@ fn split_top_level(s: &str) -> Vec<&str> {
     while let Some((i, c)) = chars.next() {
         match c {
             '\\' => { chars.next(); }
-            '<' => depth += 1,
-            '>' => depth -= 1,
+            // Both Seq `<>` and Map `{}` brackets contribute nesting
+            // depth so a `,` inside either kind of nested literal does
+            // NOT split the outer entry. (task-922-object-parse-map-syntax:
+            // before this, a Map value containing a `,` parsed as a
+            // truncated Atom because depth ignored `{}`.)
+            '<' | '{' => depth += 1,
+            '>' | '}' => depth -= 1,
             ',' if depth == 0 => {
                 splits.push(&s[start..i]);
                 start = i + c.len_utf8();
@@ -363,6 +368,26 @@ fn split_top_level(s: &str) -> Vec<&str> {
     }
     splits.push(&s[start..]);
     splits
+}
+
+/// Split `key=value` at the FIRST top-level `=`. Mirrors
+/// `split_top_level` but for the Map entry separator. Returns `None`
+/// when no top-level `=` is present (malformed entry — caller decides
+/// whether to drop it or treat the whole thing as a key with empty
+/// value).
+fn split_first_eq_top_level(s: &str) -> Option<(&str, &str)> {
+    let mut depth = 0i32;
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => { chars.next(); }
+            '<' | '{' => depth += 1,
+            '>' | '}' => depth -= 1,
+            '=' if depth == 0 => return Some((&s[..i], &s[i + c.len_utf8()..])),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Backslash-escape the FFP-syntactic characters (`<`, `>`, `,`) and
@@ -429,6 +454,53 @@ fn parse_with_depth(input: &str, depth: usize) -> Object {
                         .collect::<Vec<_>>()
                         .into()
                 ),
+            }
+        }
+        // Map literal `{k1=v1, k2=v2, ...}` — inverse of the Display
+        // impl at lines 454-458 / item_inside_seq lines 476-480.
+        // Without this branch, a persisted Map cell round-trips back as
+        // an opaque Atom holding the literal text — the cell is then
+        // not iterable and the SQL projector + every consumer reads it
+        // as empty. (task-922-object-parse-map-syntax.)
+        //
+        // Discrimination from JSON: existing callers (notably
+        // `system_impl`'s `Object::parse(input)` for apply commands)
+        // pass `{"type":"createEntity",…}` JSON strings through as
+        // opaque Atoms because JSON uses `:` and quoted keys. We
+        // recognise Map syntax ONLY when EVERY non-empty top-level
+        // entry has a `=` separator. If any entry lacks `=`, fall
+        // through to the Atom branch (preserves the legacy JSON
+        // pass-through and any other `{…}`-shaped opaque payload).
+        map_lit if map_lit.starts_with('{') && map_lit.ends_with('}')
+            && depth >= MAX_PARSE_DEPTH => Object::Bottom,
+        map_lit if map_lit.starts_with('{') && map_lit.ends_with('}')
+            && {
+                let inner = &map_lit[1..map_lit.len()-1];
+                let mut entries = split_top_level(inner)
+                    .into_iter()
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                    .peekable();
+                // Empty `{}` IS valid Map syntax (empty Map).
+                // Non-empty: every entry must split on top-level `=`.
+                entries.peek().is_none()
+                    || entries.all(|e| split_first_eq_top_level(e).is_some())
+            } => {
+            let inner = &map_lit[1..map_lit.len()-1];
+            if inner.trim().is_empty() {
+                Object::map(HashMap::new())
+            } else {
+                let mut map = HashMap::new();
+                for entry in split_top_level(inner) {
+                    let trimmed = entry.trim();
+                    if trimmed.is_empty() { continue; }
+                    if let Some((k, v)) = split_first_eq_top_level(trimmed) {
+                        let key = unescape_atom_from_display(k.trim());
+                        let value = parse_with_depth(v.trim(), depth + 1);
+                        map.insert(key, value);
+                    }
+                }
+                Object::map(map)
             }
         }
         atom => Object::Atom(unescape_atom_from_display(atom)),
@@ -5259,6 +5331,80 @@ mod tests {
              to_string produced {:?}, reparse produced {:?}",
             display, reparsed,
         );
+    }
+
+    /// task-922-object-parse-map-syntax: Object::parse must recognize
+    /// the `{k=v, ...}` Map syntax that Display emits. Without this,
+    /// every persisted Map cell silently round-trips back as an opaque
+    /// Atom — the cell becomes uniterable, the SQL projector reads it
+    /// as empty, and downstream consumers see no rows.
+    ///
+    /// Bug shape: `Object::parse(Object::map(…).to_string())` returned
+    /// `Object::Atom("{...}")` pre-fix.
+    #[test]
+    fn parse_after_to_string_is_identity_for_map_cells() {
+        let mut m = HashMap::new();
+        m.insert("alpha".to_string(),
+            Object::seq(vec![Object::atom("Alpha"), Object::atom("v1")]));
+        m.insert("beta".to_string(),
+            Object::seq(vec![Object::atom("Beta"), Object::atom("v2")]));
+        let map_obj = Object::map(m);
+
+        let display = map_obj.to_string();
+        let reparsed = Object::parse(&display);
+        assert_eq!(reparsed, map_obj,
+            "Object::parse(Object::map(…).to_string()) must equal the original; \
+             to_string produced {:?}, reparse produced {:?}",
+            display, reparsed);
+    }
+
+    /// task-922-object-parse-map-syntax discrimination guard: a JSON
+    /// payload `{"type":"createEntity",…}` (used by `system_impl`'s
+    /// apply path) must NOT be misparsed as Map syntax — JSON uses
+    /// `:` and quoted keys, no `=` separators. The Map branch only
+    /// fires when EVERY non-empty entry has a top-level `=`. JSON
+    /// strings fall through to Atom (legacy behavior).
+    #[test]
+    fn parse_does_not_eat_json_payloads_starting_with_brace() {
+        let json = r#"{"type":"createEntity","noun":"Order","fields":{"total":"100"}}"#;
+        let parsed = Object::parse(json);
+        assert!(matches!(parsed, Object::Atom(_)),
+            "JSON payload starting with `{{` must parse as Atom, not Map; \
+             got {:?}", parsed);
+        assert_eq!(parsed.as_atom(), Some(json),
+            "JSON Atom must be byte-identical to the input");
+    }
+
+    /// Empty Map round-trip (Display emits `{}`).
+    #[test]
+    fn parse_after_to_string_is_identity_for_empty_map() {
+        let map_obj = Object::map(HashMap::new());
+        let display = map_obj.to_string();
+        assert_eq!(display, "{}", "empty Map must serialize as `{{}}`");
+        let reparsed = Object::parse(&display);
+        assert_eq!(reparsed, map_obj,
+            "empty Map must round-trip; reparse produced {:?}", reparsed);
+    }
+
+    /// Nested Map inside a Seq round-trip — covers split_top_level's
+    /// `{}` depth tracking. Without the fix, a `,` inside a nested Map
+    /// value would split the outer Seq entry.
+    #[test]
+    fn parse_after_to_string_is_identity_for_seq_containing_map() {
+        let mut m = HashMap::new();
+        m.insert("k1".to_string(), Object::atom("v with , comma"));
+        m.insert("k2".to_string(), Object::atom("v2"));
+        let seq_with_map = Object::seq(vec![
+            Object::atom("first"),
+            Object::map(m),
+            Object::atom("third"),
+        ]);
+        let display = seq_with_map.to_string();
+        let reparsed = Object::parse(&display);
+        assert_eq!(reparsed, seq_with_map,
+            "Seq containing a Map (whose value has a comma) must round-trip; \
+             to_string produced {:?}, reparse produced {:?}",
+            display, reparsed);
     }
 
     #[test]
