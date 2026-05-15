@@ -2649,3 +2649,95 @@ Feature concerns Product.
          got {} with Feature-bindings {:?}\nfull derived: {:#?}",
         critical_features.len(), critical_features, derived);
 }
+
+// ─── Category 11: Implicit-equi-join + AbsenceOf routing (task-918-implicit-equi-join-uses-negation) ──
+//
+// task-918 fixed AbsenceOf semantics in compile_explicit_derivation's
+// main multi-AbsenceOf branch (1 positive + N AbsenceOf) and a2aa46e8
+// (task-814-join-absence) ported the fix to compile_join_derivation.
+// The implicit-equi-join branch (path "(a)" inside the multi-antecedent
+// arm) handled the AbsenceOf SEMANTICS correctly — it builds an
+// absent_guard predicate per AbsenceOf antecedent and AND-combines it
+// with the per-a0 join check — but hardcoded `uses_negation: false`
+// when constructing the CompiledDerivation. The chain orchestrator
+// reads `uses_negation` to bucket rules into stratum 1 (positive) vs.
+// stratum 2 (negation-guarded). With `false`, an implicit-equi-join
+// rule whose body has at least one AbsenceOf antecedent gets routed
+// into stratum 1 — observing a stale-empty negated cell before the
+// stratum-1 fixpoint has completed and emitting facts that the post-
+// fixpoint state would reject.
+//
+// Shape that lands in path (a) with an AbsenceOf antecedent:
+//   `Task is recommended iff
+//      Task has Task Readiness 'ready'
+//      and Task has Task Priority 'p0'
+//      and Task has no Task Blocker.`
+// Two POSITIVE antecedents (Task Readiness, Task Priority) share the
+// `Task` role with the consequent → join_roles = {Task}, path (a)
+// triggers. The third antecedent is AbsenceOf → not all-subsequent-
+// AbsenceOf, so the multi-AbsenceOf branch (which already sets
+// uses_negation: true) does NOT fire.
+//
+// Acceptance: after the fix, `CompiledDerivation::uses_negation` is
+// `true` for this rule. Pre-fix it is `false` — the test fails.
+#[test]
+fn implicit_equi_join_with_absence_of_sets_uses_negation_true() {
+    let src = r#"# task-918-implicit-equi-join-uses-negation
+Task(.id) is an entity type.
+Task Readiness is a value type.
+Task Priority is a value type.
+Task Blocker is a value type.
+
+## Fact Types
+Task has Task Readiness.
+Task has Task Priority.
+Task has Task Blocker.
+Task is recommended.
+
+## Derivation Rules
+* Task is recommended iff Task has Task Readiness 'ready' and Task has Task Priority 'p0' and Task has no Task Blocker.
+"#;
+
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    let model = crate::compile::compile(&state);
+
+    // Locate the rule for `Task_is_recommended`. The rule must have
+    // 3 antecedents — two positive (Task Readiness, Task Priority)
+    // and one AbsenceOf (Task Blocker). If the parse shape changes
+    // and the rule ends up with all-subsequent-AbsenceOf, the test
+    // would no longer pin the implicit-equi-join branch.
+    let cd = model.derivations.iter()
+        .find(|d| d.id.contains("recommended") || d.text.contains("is recommended"))
+        .unwrap_or_else(|| panic!(
+            "compiled derivation for `Task is recommended` rule missing; \
+             derivations: {:?}",
+            model.derivations.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+        ));
+
+    // Sanity: the source rule shape — 2 positive + 1 AbsenceOf, so
+    // path (a) is the right routing target. Find the matching rule
+    // in the data to inspect its antecedent shape.
+    let data = crate::compile::cell_index_from_state(&state);
+    let rule = data.derivation_rules.iter()
+        .find(|r| r.id == cd.id)
+        .expect("rule must be present in data");
+    let positive_count = rule.antecedent_sources.iter().filter(|s|
+        matches!(s, crate::types::AntecedentSource::FactType(_))).count();
+    let absence_count = rule.antecedent_sources.iter().filter(|s|
+        matches!(s, crate::types::AntecedentSource::AbsenceOf { .. })).count();
+    assert!(positive_count >= 2 && absence_count >= 1,
+        "test assumes 2+ positive + 1+ AbsenceOf so path (a) wins over the \
+         multi-AbsenceOf branch; got positive={}, absence={}, sources={:#?}",
+        positive_count, absence_count, rule.antecedent_sources);
+
+    // The fix: with at least one AbsenceOf antecedent in scope, the
+    // implicit-equi-join branch must set uses_negation=true so the
+    // chain orchestrator routes this rule into stratum 2.
+    assert!(cd.uses_negation,
+        "implicit-equi-join branch must set uses_negation=true when any \
+         AbsenceOf antecedent is present (task-918-implicit-equi-join-uses-\
+         negation). Pre-fix the branch hardcoded false and routed the rule \
+         into stratum 1 — guard could observe a stale-empty negated cell. \
+         Got uses_negation={}, rule sources: {:#?}",
+        cd.uses_negation, rule.antecedent_sources);
+}

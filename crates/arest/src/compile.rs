@@ -3981,6 +3981,25 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             Func::compose(Func::apply_to_all(derive_one), extract(0, ft_id))
         }
         _ => {
+            // task-918-implicit-equi-join-uses-negation: indices of every
+            // AbsenceOf antecedent in the rule. Used below in two places:
+            //   - the multi-AbsenceOf branch already detects "all subsequent
+            //     are AbsenceOf" via its own pattern-match and unconditionally
+            //     sets uses_negation: true, so this set is informational there.
+            //   - the implicit-equi-join branch (path a) and the existential-
+            //     over-join branch (path a') previously hardcoded
+            //     uses_negation: false even when the body included AbsenceOf
+            //     antecedents. They now derive uses_negation from this set
+            //     so the chain orchestrator routes the rule into stratum 2
+            //     when any AbsenceOf is present (mirrors the multi-AbsenceOf
+            //     branch's behavior + task-814-join-absence's port to
+            //     compile_join_derivation, commit a2aa46e8).
+            let absence_idx: Vec<usize> = rule.antecedent_sources.iter().enumerate()
+                .filter_map(|(i, s)|
+                    matches!(s, crate::types::AntecedentSource::AbsenceOf { .. })
+                        .then_some(i))
+                .collect();
+
             // Negation guard (#826b, generalised in #918): a 2+-antecedent
             // rule whose ALL subsequent antecedents are `AbsenceOf` is
             // `<positive ant 0> AND no matching fact in <negated FT 1> AND
@@ -4714,6 +4733,14 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 let other_facts_tuple = Func::construction(other_extracts);
                 let (consequent_cell, consequent_role_literals, negation_reads) =
                     derivation_dep_metadata(rule);
+                // task-918-implicit-equi-join-uses-negation: any AbsenceOf
+                // antecedent makes this rule stratum-2 (negation-guarded).
+                // Without this, the chain orchestrator would fire the rule
+                // in stratum 1 against a stale-empty negated cell, emitting
+                // facts that the post-fixpoint state should reject. Mirrors
+                // the multi-AbsenceOf branch above (`uses_negation: true`)
+                // and `compile_join_derivation`'s task-814-join-absence
+                // port (commit a2aa46e8).
                 return CompiledDerivation {
                     id, text, kind,
                     func: Func::compose(
@@ -4727,7 +4754,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                                 ])),
                         ),
                     ),
-                    uses_negation: false,
+                    uses_negation: !absence_idx.is_empty(),
                     consequent_cell, consequent_role_literals, negation_reads,
                 };
             }
@@ -4945,6 +4972,11 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 let other_facts_tuple = Func::construction(other_extracts);
                 let (consequent_cell, consequent_role_literals, negation_reads) =
                     derivation_dep_metadata(rule);
+                // task-918-implicit-equi-join-uses-negation: same shape
+                // bug as path (a) — an AbsenceOf in the body makes this
+                // rule stratum-2. The branch already wires the absent_guard
+                // predicate per AbsenceOf antecedent; only the routing flag
+                // was missed. Mirrors path (a) above.
                 return CompiledDerivation {
                     id, text, kind,
                     func: Func::compose(
@@ -4958,7 +4990,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                                 ])),
                         ),
                     ),
-                    uses_negation: false,
+                    uses_negation: !absence_idx.is_empty(),
                     consequent_cell,
                     consequent_role_literals,
                     negation_reads,
