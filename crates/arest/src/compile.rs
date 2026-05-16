@@ -575,14 +575,12 @@ impl ConstraintViolationTemplateTable {
         }
     }
 
-    /// Build the table from the `general_instance_facts` cell. Reads
-    /// `Constraint Kind '<code>' has Violation Template '<template>'`
-    /// instance facts. Falls back to `boot()` when no templates are
-    /// declared so synthetic-call paths (tests that build a
-    /// `CellIndex` directly without loading validation.md) still
-    /// compile constraints with the same byte-equal detail strings.
-    pub fn from_cell_index(data: &CellIndex) -> Self {
-        let rows: Vec<(String, String)> = data.general_instance_facts.iter()
+    /// Build the table directly from a slice of `general_instance_facts`.
+    /// Lifted out of `from_cell_index` so the CellIndex constructor —
+    /// which has the facts in hand but no CellIndex yet — can populate
+    /// the `violation_templates` field as it builds.
+    pub fn from_general_facts(facts: &[GeneralInstanceFact]) -> Self {
+        let rows: Vec<(String, String)> = facts.iter()
             .filter(|f| f.subject_noun == "Constraint Kind"
                      && f.object_noun == "Violation Template")
             .map(|f| (f.subject_value.clone(), f.object_value.clone()))
@@ -594,12 +592,48 @@ impl ConstraintViolationTemplateTable {
         }
     }
 
+    /// Build the table from the `general_instance_facts` cell. Reads
+    /// `Constraint Kind '<code>' has Violation Template '<template>'`
+    /// instance facts. Falls back to `boot()` when no templates are
+    /// declared so synthetic-call paths (tests that build a
+    /// `CellIndex` directly without loading validation.md) still
+    /// compile constraints with the same byte-equal detail strings.
+    pub fn from_cell_index(data: &CellIndex) -> Self {
+        Self::from_general_facts(&data.general_instance_facts)
+    }
+
     /// Lookup by Constraint Kind code (`UC`, `MC`, …). Returns the
     /// template string declared for that kind, or `None` when absent.
     pub fn template_for(&self, kind: &str) -> Option<&str> {
         self.rows.iter()
             .find(|(k, _)| k == kind)
             .map(|(_, t)| t.as_str())
+    }
+
+    /// One-call helper for per-kind constraint compilers: look up the
+    /// template for `kind`, then walk it through
+    /// `compile_detail_from_template` with the supplied `resolver`. The
+    /// resolver maps each `{placeholder}` name to a `Vec<Func>` of
+    /// substitution Funcs (multi-element vectors splice cleanly so
+    /// multi-segment placeholders such as SS/EQ `{pairs}` work).
+    ///
+    /// Panics on missing kind so a partial validation.md surfaces
+    /// immediately at compile time rather than producing a violation
+    /// with an empty English form. `boot()` covers every kind the
+    /// engine knows about, so the panic only fires when a user-
+    /// supplied `Constraint Kind has Violation Template` set
+    /// REPLACES the boot table with an incomplete row set.
+    pub fn compile_detail<F>(&self, kind: &str, resolver: F) -> Func
+    where
+        F: FnMut(&str) -> Vec<Func>,
+    {
+        let template = self.template_for(kind).unwrap_or_else(|| panic!(
+            "missing violation template for Constraint Kind '{}' — declare \
+             `Constraint Kind '{}' has Violation Template '<...>'.` in \
+             readings/core/validation.md or extend \
+             ConstraintViolationTemplateTable::boot()",
+            kind, kind));
+        compile_detail_from_template(template, resolver)
     }
 }
 
@@ -2790,6 +2824,15 @@ pub struct CellIndex {
     pub ref_schemes: HashMap<String, Vec<String>>,
     pub enum_values: HashMap<String, Vec<String>>,
     pub general_instance_facts: Vec<GeneralInstanceFact>,
+    /// #898 — per-`Constraint Kind` violation-message templates,
+    /// sourced from `readings/core/validation.md` instance facts of
+    /// `Constraint Kind has Violation Template`. Per-kind constraint
+    /// compilers below splice the template through
+    /// `compile_detail_from_template` with a kind-local resolver
+    /// supplying the `Func`s for each `{placeholder}` site, so the
+    /// English form of every violation is sourced from `S` (the
+    /// schema) rather than baked into `compile.rs` — `cor:verbalize`.
+    pub violation_templates: ConstraintViolationTemplateTable,
 }
 
 /// Build a CellIndex by scanning the cells of state once.
@@ -2896,8 +2939,16 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
         rules
     };
 
+    // #898 — build the violation-template registry from the same
+    // general-instance-fact cell the rest of CellIndex draws from.
+    // Empty cell (e.g. synthetic-call paths that don't load
+    // validation.md) falls back to the boot table so existing
+    // detail strings stay byte-equal.
+    let violation_templates = ConstraintViolationTemplateTable::from_general_facts(&general_instance_facts);
+
     CellIndex { nouns, fact_types, constraints, derivation_rules: resolved_rules,
-        subtypes, ref_schemes, enum_values, general_instance_facts }
+        subtypes, ref_schemes, enum_values, general_instance_facts,
+        violation_templates }
 }
 
 pub(crate) fn compile(state: &crate::ast::Object) -> CompiledModel {
@@ -6615,10 +6666,14 @@ fn compile_constraint(
         }
         Modality::Alethic => match def.kind.as_str() {
             // -- Pure AST constraints --------------------------------
-            "IR" => compile_ring_irreflexive_ast(def),
-            "AS" => compile_ring_asymmetric_ast(def),
-            "SY" => compile_ring_symmetric_ast(def),
-            "AT" | "ANS" => compile_ring_antisymmetric_ast(def),
+            // #898 — every per-kind compiler now reads its violation-
+            // message English form from `data.violation_templates`, so
+            // the ring kinds that previously took only `def` now also
+            // receive `data` to look up their template.
+            "IR" => compile_ring_irreflexive_ast(data, def),
+            "AS" => compile_ring_asymmetric_ast(data, def),
+            "SY" => compile_ring_symmetric_ast(data, def),
+            "AT" | "ANS" => compile_ring_antisymmetric_ast(data, def),
 
             // -- AST with Native evaluation kernel --------------------
             "UC" => compile_uniqueness_ast(data, def),
@@ -6627,9 +6682,9 @@ fn compile_constraint(
             // -- AST with Native evaluation kernel (continued) --------
             "FC" => compile_frequency_ast(data, def),
             "VC" => compile_value_constraint_ast(data, def),
-            "IT" => compile_ring_intransitive_ast(def),
-            "TR" => compile_ring_transitive_ast(def),
-            "AC" => compile_ring_acyclic_ast(def),
+            "IT" => compile_ring_intransitive_ast(data, def),
+            "TR" => compile_ring_transitive_ast(data, def),
+            "AC" => compile_ring_acyclic_ast(data, def),
             "RF" => compile_ring_reflexive_ast(data, def),
             "XO" => compile_set_comparison_ast(data, def, |n| n != 1, "exactly one"),
             "XC" => compile_set_comparison_ast(data, def, |n| n > 1, "at most one"),
@@ -6665,7 +6720,7 @@ fn compile_constraint(
 /// natural FOL atom `Eq(RoleVal(f, 1), RoleVal(f, 2))` and produces
 /// an identical Func to the previous hand-built `Func::compose(
 /// Func::Eq, …)`.
-fn compile_ring_irreflexive_ast(def: &ConstraintDef) -> Func {
+fn compile_ring_irreflexive_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
@@ -6677,12 +6732,15 @@ fn compile_ring_irreflexive_ast(def: &ConstraintDef) -> Func {
     // this is the IR doing the renumbering for us.
     let is_self_ref = crate::fol::constraint::ir_self_ref().to_func();
 
-    // Violation detail: <"Irreflexive violation:", value, "references itself">
-    let detail = Func::construction(vec![
-        Func::constant(Object::atom("Irreflexive violation:")),
-        role_value(0),
-        Func::constant(Object::atom("references itself")),
-    ]);
+    // Violation detail: template `Irreflexive violation: {value}
+    // references itself` from readings/core/validation.md. Placeholder
+    // `{value}` resolves to `role_value(0)` — the role-0 binding of
+    // the self-referencing fact. Sourced from S, not from compile.rs
+    // (#898, cor:verbalize).
+    let detail = data.violation_templates.compile_detail("IR", |name| match name {
+        "value" => vec![role_value(0)],
+        _ => vec![],
+    });
 
     let viol = make_violation_func(&def.id, &def.text, detail);
 
@@ -6695,7 +6753,7 @@ fn compile_ring_irreflexive_ast(def: &ConstraintDef) -> Func {
 
 /// AS: xRy -> not yRx -- if (x,y) exists and (y,x) exists, violation.
 /// Uses DistL + Filter to check for reverse pairs.
-fn compile_ring_asymmetric_ast(def: &ConstraintDef) -> Func {
+fn compile_ring_asymmetric_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
@@ -6725,14 +6783,16 @@ fn compile_ring_asymmetric_ast(def: &ConstraintDef) -> Func {
     // combined: has_reverse  AND  not_self
     let pred = Func::compose(Func::And, Func::construction(vec![check_one, not_self]));
 
-    // violation detail from <fact, all_facts> -- uses fact (sel1)
-    let detail = Func::construction(vec![
-        Func::constant(Object::atom("Asymmetric violation:")),
-        Func::compose(role_value(0), Func::Selector(1)),
-        Func::constant(Object::atom("relates to")),
-        Func::compose(role_value(1), Func::Selector(1)),
-        Func::constant(Object::atom("and vice versa")),
-    ]);
+    // Violation detail (#898). Template `Asymmetric violation: {x}
+    // relates to {y} and vice versa` from readings/core/validation.md.
+    // Input context here is `<fact, all_facts>` (post-DistR), so the
+    // role accessors must Selector(1) into the fact slot before
+    // taking the role binding.
+    let detail = data.violation_templates.compile_detail("AS", |name| match name {
+        "x" => vec![Func::compose(role_value(0), Func::Selector(1))],
+        "y" => vec![Func::compose(role_value(1), Func::Selector(1))],
+        _ => vec![],
+    });
     let viol = make_violation_func(&def.id, &def.text, detail);
 
     // alpha(make_viol)  .  Filter(pred)  .  distr  .  [facts, facts] : ctx
@@ -6746,7 +6806,7 @@ fn compile_ring_asymmetric_ast(def: &ConstraintDef) -> Func {
 }
 
 /// SY: xRy -> yRx -- violation when reverse is missing.
-fn compile_ring_symmetric_ast(def: &ConstraintDef) -> Func {
+fn compile_ring_symmetric_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
@@ -6761,13 +6821,15 @@ fn compile_ring_symmetric_ast(def: &ConstraintDef) -> Func {
 
     let pred = Func::compose(Func::And, Func::construction(vec![has_no_reverse, not_self]));
 
-    let detail = Func::construction(vec![
-        Func::constant(Object::atom("Symmetric violation:")),
-        Func::compose(role_value(0), Func::Selector(1)),
-        Func::constant(Object::atom("relates to")),
-        Func::compose(role_value(1), Func::Selector(1)),
-        Func::constant(Object::atom("but not the reverse")),
-    ]);
+    // Violation detail (#898). Template `Symmetric violation: {x}
+    // relates to {y} but not the reverse`. Same DistR `<fact, all>`
+    // context shape as AS, so role accessors Selector(1) into the
+    // fact slot.
+    let detail = data.violation_templates.compile_detail("SY", |name| match name {
+        "x" => vec![Func::compose(role_value(0), Func::Selector(1))],
+        "y" => vec![Func::compose(role_value(1), Func::Selector(1))],
+        _ => vec![],
+    });
     let viol = make_violation_func(&def.id, &def.text, detail);
 
     Func::compose(
@@ -6780,7 +6842,7 @@ fn compile_ring_symmetric_ast(def: &ConstraintDef) -> Func {
 }
 
 /// AT/ANS: xRy  AND  yRx -> x = y -- violation when both directions exist for distinct entities.
-fn compile_ring_antisymmetric_ast(def: &ConstraintDef) -> Func {
+fn compile_ring_antisymmetric_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
@@ -6795,13 +6857,15 @@ fn compile_ring_antisymmetric_ast(def: &ConstraintDef) -> Func {
 
     let pred = Func::compose(Func::And, Func::construction(vec![has_reverse, not_self]));
 
-    let detail = Func::construction(vec![
-        Func::constant(Object::atom("Antisymmetric violation:")),
-        Func::compose(role_value(0), Func::Selector(1)),
-        Func::constant(Object::atom("and")),
-        Func::compose(role_value(1), Func::Selector(1)),
-        Func::constant(Object::atom("relate to each other but are not the same")),
-    ]);
+    // Violation detail (#898). Template `Antisymmetric violation:
+    // {x} and {y} relate to each other but are not the same`. Same
+    // `<fact, all_facts>` context as AS/SY — Selector(1) into the
+    // fact slot before taking each role binding.
+    let detail = data.violation_templates.compile_detail("AT", |name| match name {
+        "x" => vec![Func::compose(role_value(0), Func::Selector(1))],
+        "y" => vec![Func::compose(role_value(1), Func::Selector(1))],
+        _ => vec![],
+    });
     let viol = make_violation_func(&def.id, &def.text, detail);
 
     Func::compose(
@@ -6814,7 +6878,7 @@ fn compile_ring_antisymmetric_ast(def: &ConstraintDef) -> Func {
 }
 
 /// IT: xRy  AND  yRz -> not xRz -- violation when transitive shortcut exists.
-fn compile_ring_intransitive_ast(def: &ConstraintDef) -> Func {
+fn compile_ring_intransitive_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
@@ -6836,15 +6900,17 @@ fn compile_ring_intransitive_ast(def: &ConstraintDef) -> Func {
         Func::compose(Func::filter(shortcut_match), Func::DistL),
     );
 
-    let detail = Func::construction(vec![
-        Func::constant(Object::atom("Intransitive violation:")),
-        Func::compose(role_value(0), Func::compose(Func::Selector(1), Func::Selector(1))),
-        Func::constant(Object::atom("relates to")),
-        Func::compose(role_value(1), Func::compose(Func::Selector(1), Func::Selector(1))),
-        Func::constant(Object::atom("relates to")),
-        Func::compose(role_value(1), Func::compose(Func::Selector(2), Func::Selector(1))),
-        Func::constant(Object::atom("but shortcut also exists")),
-    ]);
+    // Violation detail (#898). Template `Intransitive violation: {x}
+    // relates to {y} relates to {z} but shortcut also exists`. Input
+    // shape here is `<<chain, all>, ...>` where `chain = <f1, f2>` —
+    // so `{x}` = role0 of f1 (Selector(1).Selector(1)), `{y}` = role1
+    // of f1 (same path), `{z}` = role1 of f2 (Selector(2).Selector(1)).
+    let detail = data.violation_templates.compile_detail("IT", |name| match name {
+        "x" => vec![Func::compose(role_value(0), Func::compose(Func::Selector(1), Func::Selector(1)))],
+        "y" => vec![Func::compose(role_value(1), Func::compose(Func::Selector(1), Func::Selector(1)))],
+        "z" => vec![Func::compose(role_value(1), Func::compose(Func::Selector(2), Func::Selector(1)))],
+        _ => vec![],
+    });
     let viol = make_violation_func(&def.id, &def.text, detail);
 
     // Pipeline:
@@ -6889,7 +6955,7 @@ fn compile_ring_intransitive_ast(def: &ConstraintDef) -> Func {
 }
 
 /// TR: xRy  AND  yRz -> xRz -- violation when transitive chain completion is missing.
-fn compile_ring_transitive_ast(def: &ConstraintDef) -> Func {
+fn compile_ring_transitive_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
@@ -6905,15 +6971,15 @@ fn compile_ring_transitive_ast(def: &ConstraintDef) -> Func {
 
     let find_chains_for_f = Func::compose(Func::filter(is_chain), Func::DistL);
 
-    let detail = Func::construction(vec![
-        Func::constant(Object::atom("Transitive violation:")),
-        Func::compose(role_value(0), Func::compose(Func::Selector(1), Func::Selector(1))),
-        Func::constant(Object::atom("relates to")),
-        Func::compose(role_value(1), Func::compose(Func::Selector(1), Func::Selector(1))),
-        Func::constant(Object::atom("relates to")),
-        Func::compose(role_value(1), Func::compose(Func::Selector(2), Func::Selector(1))),
-        Func::constant(Object::atom("but shortcut is missing")),
-    ]);
+    // Violation detail (#898). Template `Transitive violation: {x}
+    // relates to {y} relates to {z} but shortcut is missing`. Same
+    // `<<chain, all>, ...>` shape as IT (chain = `<f1, f2>`).
+    let detail = data.violation_templates.compile_detail("TR", |name| match name {
+        "x" => vec![Func::compose(role_value(0), Func::compose(Func::Selector(1), Func::Selector(1)))],
+        "y" => vec![Func::compose(role_value(1), Func::compose(Func::Selector(1), Func::Selector(1)))],
+        "z" => vec![Func::compose(role_value(1), Func::compose(Func::Selector(2), Func::Selector(1)))],
+        _ => vec![],
+    });
     let viol = make_violation_func(&def.id, &def.text, detail);
 
     let check_f = Func::compose(
@@ -6934,7 +7000,7 @@ fn compile_ring_transitive_ast(def: &ConstraintDef) -> Func {
 }
 
 /// AC: no cycle x1Rx2...xnRx1 -- DFS cycle detection.
-fn compile_ring_acyclic_ast(def: &ConstraintDef) -> Func {
+fn compile_ring_acyclic_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     let ft_ids: Vec<String> = def.spans.iter().map(|s| s.fact_type_id.clone()).collect();
     let facts = extract_facts_multi(&ft_ids);
 
@@ -6972,11 +7038,14 @@ fn compile_ring_acyclic_ast(def: &ConstraintDef) -> Func {
     // pure Func equivalent. The Native computes the transitive closure by
     // iterating until convergence, bounded by 1000 iterations.
 
-    let detail = Func::construction(vec![
-        Func::constant(Object::atom("Acyclic violation:")),
-        Func::constant(Object::atom("cycle detected through")),
-        role_value(0),
-    ]);
+    // Violation detail (#898). Template `Acyclic violation: cycle
+    // detected through {value}`. AC operates directly on facts (no
+    // DistR pre-step) so role_value(0) extracts the cycle-anchor
+    // role binding from the offending fact.
+    let detail = data.violation_templates.compile_detail("AC", |name| match name {
+        "value" => vec![role_value(0)],
+        _ => vec![],
+    });
     let viol = make_violation_func(&def.id, &def.text, detail);
 
     // The transitive closure step is a Native because the pure Func
@@ -7061,15 +7130,19 @@ fn compile_ring_reflexive_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         ),
     );
 
-    // For each missing instance, produce violation
+    // For each missing instance, produce violation (#898). Template
+    // `Reflexive violation: {value} does not reference itself`. RF's
+    // upstream pipeline projects the missing instance id as `Func::Id`
+    // by the time we reach the per-instance violation builder, so
+    // `{value}` resolves to `Func::Id`.
+    let detail = data.violation_templates.compile_detail("RF", |name| match name {
+        "value" => vec![Func::Id],
+        _ => vec![],
+    });
     let make_viol = Func::apply_to_all(Func::construction(vec![
         Func::constant(id_obj),
         Func::constant(text_obj),
-        Func::construction(vec![
-            Func::constant(Object::atom("Reflexive violation:")),
-            Func::Id,
-            Func::constant(Object::atom("does not reference itself")),
-        ]),
+        detail,
     ]));
 
     Func::compose(make_viol, missing)
@@ -7229,13 +7302,16 @@ fn compile_uniqueness_ast(
         // Detail uses first violating <fact, all> pair.
         let noun = spans_in_group[0].noun_name.clone();
         let reading = spans_in_group[0].reading.clone();
-        let detail = Func::construction(vec![
-            Func::constant(Object::atom("Uniqueness violation:")),
-            Func::constant(Object::atom(&noun)),
-            Func::compose(role_value(scope_idx), Func::Selector(1)),
-            Func::constant(Object::atom("is not unique in")),
-            Func::constant(Object::atom(&reading)),
-        ]);
+        // Violation detail (#898). Template `Uniqueness violation:
+        // {noun} {value} is not unique in {reading}`. Single-span UC
+        // over <fact, all_facts> shape — `{value}` is the constrained
+        // role binding of the offending fact.
+        let detail = data.violation_templates.compile_detail("UC", |name| match name {
+            "noun" => vec![Func::constant(Object::atom(&noun))],
+            "value" => vec![Func::compose(role_value(scope_idx), Func::Selector(1))],
+            "reading" => vec![Func::constant(Object::atom(&reading))],
+            _ => vec![],
+        });
         let viol = make_violation_func(&def.id, &def.text, detail);
 
         // cond(not.null, viol.sel1, phi) . violating
@@ -7287,13 +7363,15 @@ fn compile_uniqueness_ast(
 
             let noun = group_spans[0].noun_name.clone();
             let reading = group_spans[0].reading.clone();
-            let detail = Func::construction(vec![
-                Func::constant(Object::atom("Uniqueness violation:")),
-                Func::constant(Object::atom(&noun)),
-                Func::compose(role_value(scope_idx), Func::Selector(1)),
-                Func::constant(Object::atom("is not unique in")),
-                Func::constant(Object::atom(&reading)),
-            ]);
+            // Violation detail (#898). Same UC template as the
+            // single-FT path above — multi-FT group with a single
+            // constrained role per FT.
+            let detail = data.violation_templates.compile_detail("UC", |name| match name {
+                "noun" => vec![Func::constant(Object::atom(&noun))],
+                "value" => vec![Func::compose(role_value(scope_idx), Func::Selector(1))],
+                "reading" => vec![Func::constant(Object::atom(&reading))],
+                _ => vec![],
+            });
             let viol = make_violation_func(&def.id, &def.text, detail);
 
             Func::compose(
@@ -7346,16 +7424,22 @@ fn compile_uniqueness_ast(
 
             let label = group_spans.iter().map(|s| s.noun_name.as_str()).collect::<Vec<_>>().join(", ");
             let reading = group_spans[0].reading.clone();
-            // Detail: extract the composite scope values from the first violating fact.
-            let mut detail_parts: Vec<Func> = vec![
-                Func::constant(Object::atom("Uniqueness violation:")),
-                Func::constant(Object::atom(&format!("({})", label))),
-            ];
-            // Show each scope role value from the violating fact (Sel(1) of <fact, all> pair)
-            detail_parts.extend(group_spans.iter().map(|s| Func::compose(role_value(s.role_index), Func::Selector(1))));
-            detail_parts.push(Func::constant(Object::atom("is not unique in")));
-            detail_parts.push(Func::constant(Object::atom(&reading)));
-            let detail = Func::construction(detail_parts);
+            // Violation detail (#898). Same UC template; composite
+            // scope uses `({role0, role1, …})` as `{noun}` and
+            // splices one role-binding Func per constrained role
+            // into `{value}` — `compile_detail_from_template` extends
+            // multi-Func resolver returns inline so this matches the
+            // single-role detail shape when there's one span.
+            let noun_label = format!("({})", label);
+            let value_funcs: Vec<Func> = group_spans.iter()
+                .map(|s| Func::compose(role_value(s.role_index), Func::Selector(1)))
+                .collect();
+            let detail = data.violation_templates.compile_detail("UC", |name| match name {
+                "noun" => vec![Func::constant(Object::atom(&noun_label))],
+                "value" => value_funcs.clone(),
+                "reading" => vec![Func::constant(Object::atom(&reading))],
+                _ => vec![],
+            });
             let viol = make_violation_func(&def.id, &def.text, detail);
 
             Func::compose(
@@ -7441,16 +7525,19 @@ fn compile_mandatory_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
             Func::compose(Func::filter(fact_mentions), Func::DistL),
         );
 
-        // detail: <instance, all_facts> -> violation detail sequence
-        let mc_label = String::from("Mandatory violation:");
-        let not_in_msg = String::from("does not participate in");
-        let detail = Func::construction(vec![
-            Func::constant(Object::atom(&mc_label)),
-            Func::constant(Object::atom(noun_name)),
-            Func::Selector(1),  // the instance value
-            Func::constant(Object::atom(&not_in_msg)),
-            Func::constant(Object::atom(reading)),
-        ]);
+        // Violation detail (#898). Template `Mandatory violation:
+        // {noun} {value} does not participate in {reading}`. Context
+        // shape here is `<instance, all_facts>` (DistR over instances
+        // × FT facts), so `{value}` is `Func::Selector(1)` — the
+        // instance value at the head of the pair.
+        let noun_atom = Object::atom(noun_name);
+        let reading_atom = Object::atom(reading);
+        let detail = data.violation_templates.compile_detail("MC", |name| match name {
+            "noun" => vec![Func::constant(noun_atom.clone())],
+            "value" => vec![Func::Selector(1)],
+            "reading" => vec![Func::constant(reading_atom.clone())],
+            _ => vec![],
+        });
         let viol = make_violation_func(&def.id, &def.text, detail);
 
         // apply_to_all(viol) . Filter(not_participating) . DistR . [instances, ft_facts]
@@ -7537,14 +7624,22 @@ fn compile_frequency_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
             Func::compose(Func::DistR, Func::construction(vec![facts.clone(), facts])),
         );
 
-        let detail = Func::construction(vec![
-            Func::constant(Object::atom("Frequency violation:")),
-            Func::constant(Object::atom(&span.noun_name)),
-            Func::compose(role_value(scope_idx), Func::Selector(1)),
-            Func::constant(Object::atom("in")),
-            Func::constant(Object::atom(&span.reading)),
-            Func::constant(Object::atom(&format!("expected {}", range_str))),
-        ]);
+        // Violation detail (#898). Template `Frequency violation:
+        // {noun} {value} in {reading} expected {range}`. `{range}`
+        // carries the bound-phrase the resolver builds from
+        // `range_str` (already includes the `expected ` prefix
+        // removed — the template now owns that word, so the resolver
+        // emits the bare bound phrase).
+        let noun_atom = Object::atom(&span.noun_name);
+        let reading_atom = Object::atom(&span.reading);
+        let range_atom = Object::atom(&range_str);
+        let detail = data.violation_templates.compile_detail("FC", |name| match name {
+            "noun" => vec![Func::constant(noun_atom.clone())],
+            "value" => vec![Func::compose(role_value(scope_idx), Func::Selector(1))],
+            "reading" => vec![Func::constant(reading_atom.clone())],
+            "range" => vec![Func::constant(range_atom.clone())],
+            _ => vec![],
+        });
         let viol = make_violation_func(&def.id, &def.text, detail);
 
         // ONE violation per violating scope value (take first).
@@ -7607,18 +7702,22 @@ fn compile_value_constraint_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
             Func::compose(Func::filter(Func::Eq), Func::DistL),
         );
 
-        // detail: <instance, allowed_seq> -> violation detail
+        // Violation detail (#898). Template `Value constraint
+        // violation: {noun} {value} is not in {valid_set}`. Context
+        // shape `<instance, allowed_seq>` — `{value}` is
+        // `Func::Selector(1)`. `{valid_set}` is the compile-time
+        // `{v1, v2, …}` literal (curly braces in the substituted
+        // atom — see placeholder doc in validation.md).
         let valid_str = valid_values.iter().cloned().collect::<Vec<_>>().join(", ");
-        let vc_label = String::from("Value constraint violation:");
-        let not_in_msg = String::from("is not in");
         let valid_set_str = format!("{{{}}}", valid_str);
-        let detail = Func::construction(vec![
-            Func::constant(Object::atom(&vc_label)),
-            Func::constant(Object::atom(noun_name)),
-            Func::Selector(1),  // the instance value
-            Func::constant(Object::atom(&not_in_msg)),
-            Func::constant(Object::atom(&valid_set_str)),
-        ]);
+        let noun_atom = Object::atom(noun_name);
+        let valid_set_atom = Object::atom(&valid_set_str);
+        let detail = data.violation_templates.compile_detail("VC", |name| match name {
+            "noun" => vec![Func::constant(noun_atom.clone())],
+            "value" => vec![Func::Selector(1)],
+            "valid_set" => vec![Func::constant(valid_set_atom.clone())],
+            _ => vec![],
+        });
         let viol = make_violation_func(&def.id, &def.text, detail);
 
         // apply_to_all(viol) . Filter(not_allowed) . DistR . [instances, allowed_const]
@@ -7644,7 +7743,7 @@ fn compile_value_constraint_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
 /// XO/XC/OR: Set-comparison constraint -- for each entity instance, count how many
 /// of the clause fact types it participates in, and check against the requirement.
 fn compile_set_comparison_ast(
-    _data: &CellIndex,
+    data: &CellIndex,
     def: &ConstraintDef,
     _violates: fn(usize) -> bool,
     requirement: &'static str,
@@ -7711,13 +7810,22 @@ fn compile_set_comparison_ast(
     };
 
     let clause_count = clause_ft_ids.len();
-    let detail = Func::construction(vec![
-        Func::constant(Object::atom("Set-comparison violation:")),
-        Func::constant(Object::atom(&entity_name)),
-        Func::Selector(1), // instance value
-        Func::constant(Object::atom(&format!("expected {}", requirement))),
-        Func::constant(Object::atom(&format!("of {} clause fact types", clause_count))),
-    ]);
+    // Violation detail (#898). Template `Set-comparison violation:
+    // {entity} {value} expected {requirement} of {clause_count}
+    // clause fact types` (identical for XO / XC / OR — `requirement`
+    // is what carries the kind's English bound phrase). Looking up by
+    // `def.kind` keeps the three rows independently overridable in
+    // validation.md even though boot() shares one phrasing today.
+    let entity_atom = Object::atom(&entity_name);
+    let requirement_atom = Object::atom(requirement);
+    let count_atom = Object::atom(&clause_count.to_string());
+    let detail = data.violation_templates.compile_detail(&def.kind, |name| match name {
+        "entity" => vec![Func::constant(entity_atom.clone())],
+        "value" => vec![Func::Selector(1)],
+        "requirement" => vec![Func::constant(requirement_atom.clone())],
+        "clause_count" => vec![Func::constant(count_atom.clone())],
+        _ => vec![],
+    });
     let viol = make_violation_func(&def.id, &def.text, detail);
 
     // DistR . [instances, Id] : ctx -> <<inst1, ctx>, <inst2, ctx>, ...>
@@ -7773,19 +7881,24 @@ fn compile_subset_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         Func::compose(Func::filter(match_pred), Func::DistL),
     );
 
-    // detail: <a_fact, b_facts> -> violation description sequence
-    // Include each common noun name and its value from a_fact.
-    let mut detail_parts: Vec<Func> = core::iter::once(Func::constant(Object::atom("Subset violation:")))
-        .chain(common.iter().flat_map(|&(ai, _)| [
-            Func::constant(Object::atom(&a_nouns[ai])),
-            Func::compose(role_value(ai), Func::Selector(1)),
-        ]))
-        .collect();
-    detail_parts.push(Func::constant(Object::atom("participates in")));
-    detail_parts.push(Func::constant(Object::atom(&a_ft_id)));
-    detail_parts.push(Func::constant(Object::atom("but not in")));
-    detail_parts.push(Func::constant(Object::atom(&b_ft_id)));
-    let detail = Func::construction(detail_parts);
+    // Violation detail (#898). Template `Subset violation: {pairs}
+    // participates in {a_ft} but not in {b_ft}`. `{pairs}` is the
+    // multi-segment placeholder documented in validation.md — it
+    // expands to one `<noun> <value>` pair per common join column,
+    // mirroring the existing flat_map shape that produced two atoms
+    // per common pair.
+    let a_ft_atom = Object::atom(&a_ft_id);
+    let b_ft_atom = Object::atom(&b_ft_id);
+    let pairs_funcs: Vec<Func> = common.iter().flat_map(|&(ai, _)| [
+        Func::constant(Object::atom(&a_nouns[ai])),
+        Func::compose(role_value(ai), Func::Selector(1)),
+    ]).collect();
+    let detail = data.violation_templates.compile_detail("SS", |name| match name {
+        "pairs" => pairs_funcs.clone(),
+        "a_ft" => vec![Func::constant(a_ft_atom.clone())],
+        "b_ft" => vec![Func::constant(b_ft_atom.clone())],
+        _ => vec![],
+    });
 
     let viol = make_violation_func(&def.id, &def.text, detail);
 
@@ -7839,17 +7952,32 @@ fn compile_equality_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     let b_facts = extract_facts_func(&b_ft_id);
 
     // A not in B
+    // EQ runs the SS check in both directions (A⊆B AND B⊆A); each
+    // direction reuses the same `Equality violation: {pairs} in
+    // {a_ft} but not in {b_ft}` template (#898), with the per-
+    // direction noun + role bindings supplied by the resolver. Build
+    // a local helper so the two checks below stay symmetric.
+    let a_ft_atom = Object::atom(&a_ft_id);
+    let b_ft_atom = Object::atom(&b_ft_id);
+    let mk_eq_detail = |pairs: Vec<Func>, left_ft: &Object, right_ft: &Object| -> Func {
+        let left_ft = left_ft.clone();
+        let right_ft = right_ft.clone();
+        data.violation_templates.compile_detail("EQ", |name| match name {
+            "pairs" => pairs.clone(),
+            "a_ft" => vec![Func::constant(left_ft.clone())],
+            "b_ft" => vec![Func::constant(right_ft.clone())],
+            _ => vec![],
+        })
+    };
+
     let match_ab = build_match(&common, false);
     let not_in_b = Func::compose(Func::NullTest, Func::compose(Func::filter(match_ab), Func::DistL));
-    let detail_ab: Vec<Func> = core::iter::once(Func::constant(Object::atom("Equality violation:")))
-        .chain(common.iter().flat_map(|&(ai, _)| [
-            Func::constant(Object::atom(&a_roles[ai].1)),
-            Func::compose(role_value(ai), Func::Selector(1)),
-        ]))
-        .chain([Func::constant(Object::atom("in")), Func::constant(Object::atom(&a_ft_id)),
-                Func::constant(Object::atom("but not in")), Func::constant(Object::atom(&b_ft_id))])
-        .collect();
-    let viol_ab = make_violation_func(&def.id, &def.text, Func::construction(detail_ab));
+    let pairs_ab: Vec<Func> = common.iter().flat_map(|&(ai, _)| [
+        Func::constant(Object::atom(&a_roles[ai].1)),
+        Func::compose(role_value(ai), Func::Selector(1)),
+    ]).collect();
+    let detail_ab = mk_eq_detail(pairs_ab, &a_ft_atom, &b_ft_atom);
+    let viol_ab = make_violation_func(&def.id, &def.text, detail_ab);
     let check_ab = Func::compose(
         Func::apply_to_all(viol_ab),
         Func::compose(Func::filter(not_in_b), Func::compose(Func::DistR, Func::construction(vec![a_facts.clone(), b_facts.clone()]))),
@@ -7858,15 +7986,12 @@ fn compile_equality_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     // B not in A
     let match_ba = build_match(&common, true);
     let not_in_a = Func::compose(Func::NullTest, Func::compose(Func::filter(match_ba), Func::DistL));
-    let detail_ba: Vec<Func> = core::iter::once(Func::constant(Object::atom("Equality violation:")))
-        .chain(common.iter().flat_map(|&(_, bi)| [
-            Func::constant(Object::atom(&b_roles[bi].1)),
-            Func::compose(role_value(bi), Func::Selector(1)),
-        ]))
-        .chain([Func::constant(Object::atom("in")), Func::constant(Object::atom(&b_ft_id)),
-                Func::constant(Object::atom("but not in")), Func::constant(Object::atom(&a_ft_id))])
-        .collect();
-    let viol_ba = make_violation_func(&def.id, &def.text, Func::construction(detail_ba));
+    let pairs_ba: Vec<Func> = common.iter().flat_map(|&(_, bi)| [
+        Func::constant(Object::atom(&b_roles[bi].1)),
+        Func::compose(role_value(bi), Func::Selector(1)),
+    ]).collect();
+    let detail_ba = mk_eq_detail(pairs_ba, &b_ft_atom, &a_ft_atom);
+    let viol_ba = make_violation_func(&def.id, &def.text, detail_ba);
     let check_ba = Func::compose(
         Func::apply_to_all(viol_ba),
         Func::compose(Func::filter(not_in_a), Func::compose(Func::DistR, Func::construction(vec![b_facts, a_facts]))),
@@ -7940,10 +8065,14 @@ fn compile_forbidden_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
             Some(p) => Func::compose(Func::filter(deontic_predicate_func(p)), facts),
             None    => facts,
         };
-        let detail = Func::construction(vec![
-            Func::constant(Object::atom("Forbidden fact present in")),
-            Func::constant(Object::atom(&primary_ft)),
-        ]);
+        // Violation detail (#898). Template `Forbidden fact present
+        // in {primary_ft}` — single-placeholder DF_pop kind for the
+        // population-path forbidden constraint.
+        let primary_ft_atom = Object::atom(&primary_ft);
+        let detail = data.violation_templates.compile_detail("DF_pop", |name| match name {
+            "primary_ft" => vec![Func::constant(primary_ft_atom.clone())],
+            _ => vec![],
+        });
         let viol = make_violation_func(&def.id, &def.text, detail);
         return Func::compose(Func::apply_to_all(viol), facts);
     }
@@ -7977,11 +8106,16 @@ fn compile_forbidden_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
             Func::compose(Func::Selector(2), Func::Selector(1)), // value from pair
         ]));
 
-        let detail = Func::construction(vec![
-            Func::constant(Object::atom("Response contains forbidden")),
-            Func::compose(Func::Selector(1), Func::Selector(1)), // noun name
-            Func::compose(Func::Selector(2), Func::Selector(1)), // value
-        ]);
+        // Violation detail (#898). Template `Response contains
+        // forbidden {noun} {value}` — DF_cwa. Context shape is
+        // `<<noun, value>, response>` from the DistR upstream, so
+        // `{noun}` = Selector(1).Selector(1), `{value}` =
+        // Selector(2).Selector(1).
+        let detail = data.violation_templates.compile_detail("DF_cwa", |name| match name {
+            "noun" => vec![Func::compose(Func::Selector(1), Func::Selector(1))],
+            "value" => vec![Func::compose(Func::Selector(2), Func::Selector(1))],
+            _ => vec![],
+        });
         let viol = make_violation_func(&def.id, &def.text, detail);
 
         Func::compose(
@@ -8009,11 +8143,15 @@ fn compile_forbidden_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
             Func::compose(Func::DistR, Func::construction(vec![kws_const, response.clone()])),
         );
 
-        // Violation if matched count > threshold and >= 2
-        let detail = Func::construction(vec![
-            Func::constant(Object::atom("Response may violate:")),
-            Func::constant(Object::atom(&def.text)),
-        ]);
+        // Violation detail (#898). Template `Response may violate:
+        // {text}` — DF_owa. `{text}` resolves to the original
+        // constraint reading so the human reading the response sees
+        // the alleged violation in its own words.
+        let text_atom = Object::atom(&def.text);
+        let detail = data.violation_templates.compile_detail("DF_owa", |name| match name {
+            "text" => vec![Func::constant(text_atom.clone())],
+            _ => vec![],
+        });
         let viol = make_violation_func(&def.id, &def.text, detail);
 
         // Condition: length(matched) > threshold -> violation.
@@ -8077,10 +8215,14 @@ fn compile_obligatory_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         // predicate Func in Not before filtering.
         let pred = def.predicate.as_ref().map(deontic_predicate_func).unwrap();
         let neg_pred = Func::compose(Func::Not, pred);
-        let detail = Func::construction(vec![
-            Func::constant(Object::atom("Obligation violated in")),
-            Func::constant(Object::atom(&primary_ft)),
-        ]);
+        // Violation detail (#898). Template `Obligation violated in
+        // {primary_ft}` — DO_pop, the population-path obligation
+        // failure when the per-fact text predicate doesn't hold.
+        let primary_ft_atom = Object::atom(&primary_ft);
+        let detail = data.violation_templates.compile_detail("DO_pop", |name| match name {
+            "primary_ft" => vec![Func::constant(primary_ft_atom.clone())],
+            _ => vec![],
+        });
         let viol = make_violation_func(&def.id, &def.text, detail);
         return Func::compose(Func::apply_to_all(viol),
             Func::compose(Func::filter(neg_pred), facts));
@@ -8118,11 +8260,14 @@ fn compile_obligatory_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
             ),
         );
 
-        // Condition: if NOT found_any -> violation
-        let detail = Func::construction(vec![
-            Func::constant(Object::atom("Response missing obligatory")),
-            Func::constant(Object::atom(noun_name)),
-        ]);
+        // Violation detail (#898). Template `Response missing
+        // obligatory {noun}` — DO_obl. Per-noun obligation when the
+        // response text doesn't carry the obligatory noun.
+        let noun_atom = Object::atom(noun_name);
+        let detail = data.violation_templates.compile_detail("DO_obl", |name| match name {
+            "noun" => vec![Func::constant(noun_atom.clone())],
+            _ => vec![],
+        });
         let viol = make_violation_func(&def.id, &def.text, detail);
 
         Func::condition(
@@ -8135,9 +8280,11 @@ fn compile_obligatory_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
     // Sender identity check: NullTest . Selector(2)
     // Use .then() to conditionally produce a check â€” pure Backus cond without side effects.
     let sender_check: Option<Func> = checks_sender.then(|| {
-        let sender_detail = Func::construction(vec![
-            Func::constant(Object::atom("Response missing obligatory SenderIdentity")),
-        ]);
+        // Violation detail (#898). Template `Response missing
+        // obligatory SenderIdentity` — DO_sender. Sole placeholder-
+        // free template; the resolver is exercised but never
+        // dispatched (compile_detail_from_template never finds `{`).
+        let sender_detail = data.violation_templates.compile_detail("DO_sender", |_| vec![]);
         let sender_viol = make_violation_func(&def.id, &def.text, sender_detail);
 
         // Sender empty = Eq . [Selector(2), ""] OR NullTest . Selector(2)
@@ -12070,5 +12217,228 @@ mod nav_links_skip_value_types {
         assert!(!names.iter().any(|n| n == "Task Description"),
             "Task Description (value type) must not appear as a child noun \
              in Task's nav projection. Got {:?}", names);
+    }
+}
+
+// ── #898 — ConstraintViolationTemplateTable + per-kind read-from-readings ──
+//
+// Verifies the violation-template registry (`boot`, `from_general_facts`,
+// `template_for`, `compile_detail` helpers) and that at least one
+// constraint compiler — IR — actually pulls its English form from the
+// CellIndex-resident table rather than from a hardcoded literal. The
+// IR test fixes the substitution path for the simpler kinds; the
+// remaining compilers re-use the same `compile_detail` plumbing so the
+// IR proof generalises.
+#[cfg(test)]
+mod violation_template_tests {
+    use super::*;
+    use crate::ast::{self, Object, fact_from_pairs};
+    use crate::types::GeneralInstanceFact;
+
+    /// Boot table must carry every constraint kind the compilers
+    /// ask for via `compile_detail(kind, …)`. Listed explicitly so
+    /// adding a new kind to `boot()` without wiring a compiler (or
+    /// vice versa) trips this test, not a panic at runtime against
+    /// a freshly-built fixture.
+    #[test]
+    fn violation_template_table_boot_covers_all_constraint_kinds() {
+        let table = ConstraintViolationTemplateTable::boot();
+        let expected_kinds: &[&str] = &[
+            "IR", "AS", "SY", "AT", "IT", "TR", "AC", "RF",
+            "UC", "MC", "FC", "VC",
+            "XO", "XC", "OR",
+            "SS", "EQ",
+            "DF_pop", "DF_cwa", "DF_owa",
+            "DO_pop", "DO_obl", "DO_sender",
+        ];
+        for kind in expected_kinds {
+            assert!(table.template_for(kind).is_some(),
+                "boot() must carry a template for kind '{}'; \
+                 missing means a per-kind compile_detail call would \
+                 panic at compile time", kind);
+        }
+    }
+
+    /// Custom `Constraint Kind has Violation Template` instance
+    /// facts override boot. Empty fact list falls back to boot so
+    /// synthetic-call paths (CellIndex built without loading
+    /// validation.md) still produce byte-equal violation details.
+    #[test]
+    fn violation_template_table_from_general_facts_overrides_boot() {
+        let facts = vec![GeneralInstanceFact {
+            subject_noun: "Constraint Kind".into(),
+            subject_value: "IR".into(),
+            field_name: String::new(),
+            object_noun: "Violation Template".into(),
+            object_value: "CUSTOM IR: {value} is bad".into(),
+        }];
+        let custom = ConstraintViolationTemplateTable::from_general_facts(&facts);
+        assert_eq!(custom.template_for("IR"), Some("CUSTOM IR: {value} is bad"),
+            "custom IR template should be sourced from the supplied facts");
+        // Kinds not declared in the custom set come back as None —
+        // the table is *exactly* the supplied rows, not boot + overlay.
+        assert!(custom.template_for("UC").is_none(),
+            "from_general_facts is replace-not-overlay; UC must be \
+             absent when only IR was declared");
+    }
+
+    /// Empty facts → boot fallback. Pins the contract that lets
+    /// every synthetic-call test (`compile_to_defs_state` on a state
+    /// without validation.md loaded) still emit byte-equal detail
+    /// strings without changing one line of fixture code.
+    #[test]
+    fn violation_template_table_from_general_facts_empty_falls_back_to_boot() {
+        let empty: Vec<GeneralInstanceFact> = Vec::new();
+        let table = ConstraintViolationTemplateTable::from_general_facts(&empty);
+        assert_eq!(table.template_for("IR"),
+            Some("Irreflexive violation: {value} references itself"),
+            "empty facts → boot fallback");
+        assert_eq!(table.template_for("UC"),
+            Some("Uniqueness violation: {noun} {value} is not unique in {reading}"),
+            "empty facts → boot fallback for UC too");
+    }
+
+    /// Lower-level: `compile_detail_from_template` walks a template
+    /// string into a `Func::construction` whose evaluation, joined
+    /// by spaces, produces the substituted form. Exercising the
+    /// helper at the Func level lets us decouple the per-kind
+    /// resolver tests from full-model compile.
+    #[test]
+    fn compile_detail_from_template_round_trips_through_apply() {
+        // Resolver maps `{value}` → constant atom "INSTANCE-X" so
+        // the test asserts the join shape without standing up an
+        // entire FT cell.
+        let detail = compile_detail_from_template(
+            "Irreflexive violation: {value} references itself",
+            |name| match name {
+                "value" => vec![Func::constant(Object::atom("INSTANCE-X"))],
+                _ => vec![],
+            });
+        let out = ast::apply(&detail, &Object::phi(), &Object::phi());
+        // Reconstruct what `decode_violation` would produce: atoms
+        // of the seq joined by single spaces.
+        let joined: String = out.as_seq().expect("seq")
+            .iter()
+            .filter_map(|p| p.as_atom().map(|s| s.to_string()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(joined,
+            "Irreflexive violation: INSTANCE-X references itself",
+            "template walk + resolver must reconstruct the original phrase");
+    }
+
+    /// Missing template panics with a kind-naming message so
+    /// partial validation.md sets surface immediately at compile
+    /// time rather than producing an empty violation detail.
+    #[test]
+    #[should_panic(expected = "missing violation template for Constraint Kind 'NEW_KIND'")]
+    fn compile_detail_panics_on_unknown_kind() {
+        // Build a table that explicitly drops every row — even
+        // boot fallback won't carry 'NEW_KIND', so the lookup must
+        // panic with the helpful message the helper documents.
+        let table = ConstraintViolationTemplateTable {
+            rows: alloc::vec![("IR".into(), "ignored".into())],
+        };
+        let _ = table.compile_detail("NEW_KIND", |_| vec![]);
+    }
+
+    /// End-to-end read-from-readings (the acceptance criterion):
+    /// stand up a minimal model with an IR constraint over a
+    /// self-referential fact type, plant a CUSTOM IR template via
+    /// `Constraint Kind 'IR' has Violation Template '<...>'`
+    /// instance facts, compile, run `validate`, and assert the
+    /// surfaced violation detail uses the CUSTOM phrase — proving
+    /// the IR compiler reads from `data.violation_templates`
+    /// rather than from baked-in `compile.rs` constants.
+    #[test]
+    fn ir_violation_detail_sources_from_validation_md_instance_fact() {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+
+        // Noun: Person (binary self-referential FT subject).
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Person"), ("objectType", "entity"),
+        ]));
+
+        // FT: Person dislikes Person — two roles, both bound to Person.
+        cells.entry("FactType".into()).or_default().push(fact_from_pairs(&[
+            ("id", "ft_dislikes"),
+            ("reading", "Person dislikes Person"),
+            ("arity", "2"),
+        ]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_dislikes"), ("nounName", "Person"), ("position", "0"),
+        ]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_dislikes"), ("nounName", "Person"), ("position", "1"),
+        ]));
+
+        // IR constraint over the FT's two roles.
+        let ir = ConstraintDef {
+            id: "ir_dislikes".into(),
+            kind: "IR".into(),
+            modality: "alethic".into(),
+            text: "Person dislikes Person is irreflexive".into(),
+            spans: vec![
+                SpanDef { fact_type_id: "ft_dislikes".into(), role_index: 0, subset_autofill: None },
+                SpanDef { fact_type_id: "ft_dislikes".into(), role_index: 1, subset_autofill: None },
+            ],
+            ..Default::default()
+        };
+        cells.entry("Constraint".into()).or_default()
+            .push(crate::parse_forml2::constraint_to_fact_test(&ir));
+
+        // CUSTOM IR template via the `Constraint Kind has Violation
+        // Template` InstanceFact — the very lift cor:verbalize
+        // promises: change the reading, change the violation.
+        cells.entry("InstanceFact".into()).or_default().push(fact_from_pairs(&[
+            ("subjectNoun", "Constraint Kind"),
+            ("subjectValue", "IR"),
+            ("fieldName", ""),
+            ("objectNoun", "Violation Template"),
+            ("objectValue", "CUSTOM-PROBE: {value} loops back on itself"),
+        ]));
+
+        // Population: alice dislikes alice — self-reference, fires IR.
+        cells.entry("ft_dislikes".into()).or_default()
+            .push(Object::seq(vec![
+                Object::seq(vec![Object::atom("Person"), Object::atom("alice")]),
+                Object::seq(vec![Object::atom("Person"), Object::atom("alice")]),
+            ]));
+
+        let state = Object::Map(cells.into_iter()
+            .map(|(k, v)| (k, Object::Seq(v.into())))
+            .collect::<hashbrown::HashMap<_, _>>().into());
+
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+        let ctx = ast::encode_eval_context_state("", None, &state);
+        let violations_obj = ast::apply(
+            &ast::Func::Def("validate".to_string()),
+            &ctx,
+            &d,
+        );
+        let violations = ast::decode_violations(&violations_obj);
+
+        let ir_violations: Vec<&crate::types::Violation> = violations.iter()
+            .filter(|v| v.constraint_id == "ir_dislikes")
+            .collect();
+        assert!(!ir_violations.is_empty(),
+            "IR self-reference (alice dislikes alice) must produce ≥1 \
+             violation through validate; got {:?}", violations);
+
+        let v = ir_violations[0];
+        assert!(v.detail.contains("CUSTOM-PROBE"),
+            "violation detail must come from the CUSTOM template \
+             declared in InstanceFact, proving the compiler reads \
+             from data.violation_templates and not from a baked-in \
+             literal; got detail {:?}", v.detail);
+        assert!(v.detail.contains("alice"),
+            "the `{{value}}` placeholder must still resolve to the \
+             self-referencing role binding 'alice'; got detail {:?}",
+            v.detail);
+        assert!(!v.detail.contains("Irreflexive violation"),
+            "the boot template's English form must NOT leak through \
+             when an InstanceFact-supplied template was declared; \
+             got detail {:?}", v.detail);
     }
 }
