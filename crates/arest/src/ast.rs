@@ -4516,10 +4516,27 @@ pub fn drop_readings_derived_meta_cells(state: &Object) -> Object {
 /// and another references it, producing two Noun facts that differ in
 /// bindings but represent the same entity.
 fn concat_dedup(a: &Object, b: &Object) -> Object {
-    let a_items: Vec<Object> = a.as_seq().map(|s| s.to_vec()).unwrap_or_default();
-    let b_items: Vec<Object> = b.as_seq()
-        .map(|s| s.to_vec())
-        .unwrap_or_else(|| vec![b.clone()]);
+    // task-928: extract values from Map inputs so merge_states preserves
+    // Map-backed apply-emitted population across recompile / in-process
+    // compile. Map structure itself isn't preserved through merge
+    // (collapse-the-duality is task-924); this just stops the silent
+    // wipe when the prior side is Map. Pre-fix: `a.as_seq()` returned
+    // None for Map, `unwrap_or_default()` made it empty, prior content
+    // lost. Post-fix: Map values are extracted as fact items and merged
+    // identity-aware just like Seq facts.
+    let extract = |obj: &Object| -> Vec<Object> {
+        match obj {
+            Object::Map(m) => m.values().cloned().collect(),
+            Object::Seq(_) => obj.as_seq().map(|s| s.to_vec()).unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    };
+    let a_items = extract(a);
+    let b_items = if matches!(b, Object::Map(_) | Object::Seq(_)) {
+        extract(b)
+    } else {
+        vec![b.clone()]
+    };
     let mut out = a_items;
     for item in b_items {
         if out.iter().any(|existing| same_identity(existing, &item)) { continue; }
@@ -5705,6 +5722,48 @@ mod tests {
         assert_eq!(facts.len(), 2);
         assert!(facts.contains(&order));
         assert!(facts.contains(&customer));
+    }
+
+    // task-928: when prior cell is Map-backed (cell_put_keyed apply
+    // population) and we merge in a Seq from parse, the prior Map
+    // contents must survive. Pre-fix: concat_dedup's a.as_seq() returned
+    // None for Map, all prior contents silently dropped, apps_compile
+    // wiped ~700 Task_has_Task_Subject entries down to 1.
+    #[test]
+    fn merge_states_preserves_map_cell_when_merging_with_seq() {
+        let t1 = fact_from_pairs(&[("Task", "1"), ("Task Subject", "first")]);
+        let t2 = fact_from_pairs(&[("Task", "2"), ("Task Subject", "second")]);
+        let t3 = fact_from_pairs(&[("Task", "3"), ("Task Subject", "third")]);
+        // Build a Map-backed prior cell via cell_put_keyed (the
+        // post-UC-Map apply path used by cell command_via_defs).
+        let mut prior = Object::phi();
+        prior = cell_put_keyed("Task_has_Task_Subject", &["Task"], t1.clone(), &prior).unwrap();
+        prior = cell_put_keyed("Task_has_Task_Subject", &["Task"], t2.clone(), &prior).unwrap();
+        prior = cell_put_keyed("Task_has_Task_Subject", &["Task"], t3.clone(), &prior).unwrap();
+        // Sanity: prior cell is Map.
+        let prior_cell = fetch("Task_has_Task_Subject", &prior);
+        assert!(matches!(prior_cell, Object::Map(_)),
+            "test fixture: prior cell should be Map, got {:?}", prior_cell);
+
+        // Now merge with a Seq-shaped state (mirrors what parse emits).
+        let from_parse = store("Task_has_Task_Subject",
+            Object::seq(vec![fact_from_pairs(&[("Task", "4"), ("Task Subject", "fourth")])]),
+            &Object::phi());
+
+        let merged = merge_states(&prior, &from_parse);
+        let merged_cell = fetch("Task_has_Task_Subject", &merged);
+        let merged_seq = merged_cell.as_seq()
+            .expect("merge demotes to Seq, but contents must survive");
+        let subjects: Vec<String> = merged_seq.iter()
+            .filter_map(|f| binding(f, "Task Subject").map(String::from))
+            .collect();
+        assert_eq!(merged_seq.len(), 4,
+            "all 3 prior Map entries + 1 new Seq entry must survive merge; \
+             got {:?}", subjects);
+        for expected in ["first", "second", "third", "fourth"] {
+            assert!(subjects.contains(&expected.to_string()),
+                "merged cell must contain '{}'; got {:?}", expected, subjects);
+        }
     }
 
     // ── Combining forms ──────────────────────────────────────────
