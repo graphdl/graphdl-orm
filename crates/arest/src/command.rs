@@ -993,10 +993,18 @@ fn create_via_defs(
     // flips a primary fact (e.g. a Task's Status) leaves stale
     // derived facts (e.g. another Task's blocked-readiness) in the
     // population because forward_chain only adds, never retracts.
+    //
+    // task-929: noun-scope the wipe to derivation_index[noun]'s rules
+    // so cross-noun upstream consequent cells survive (see
+    // transition_via_defs comment for the bridge-rule failure mode).
     let resolved = {
         let drule_cell = ast::fetch_or_phi("DerivationRule", d);
         let derived_cells: hashbrown::HashSet<String> = drule_cell.as_seq()
             .map(|facts| facts.iter()
+                .filter(|f| relevant_ids.is_empty()
+                    || ast::binding(f, "id")
+                        .map(|id| relevant_ids.contains(id))
+                        .unwrap_or(false))
                 .filter_map(|f| ast::binding(f, "consequentFactTypeId"))
                 .map(|encoded| crate::types::ConsequentCellSource::decode(encoded)
                     .literal_id().to_string())
@@ -1710,10 +1718,21 @@ fn transition_via_defs(
         // (LFP per request, AREST.tex §4.3) so a transition that flips
         // Status doesn't leave stale derived facts that the chain
         // would never retract.
+        //
+        // task-929: noun-scope the wipe to derivation_index[noun]'s rules.
+        // The chain only re-derives this noun's rules; wiping a cell whose
+        // deriver belongs to another noun (e.g. Resource_is_currently_in_Status
+        // when applying on Task) leaves it stale-empty for downstream readers
+        // (the bridge `Task has Task Status iff Resource is currently in
+        // Status and ...` reads the wiped-empty upstream and emits nothing).
         let resolved = {
             let drule_cell = ast::fetch_or_phi("DerivationRule", d);
             let derived_cells: hashbrown::HashSet<String> = drule_cell.as_seq()
                 .map(|facts| facts.iter()
+                    .filter(|f| relevant_ids.is_empty()
+                        || ast::binding(f, "id")
+                            .map(|id| relevant_ids.contains(id))
+                            .unwrap_or(false))
                     .filter_map(|f| ast::binding(f, "consequentFactTypeId"))
                     .map(|encoded| crate::types::ConsequentCellSource::decode(encoded)
                         .literal_id().to_string())
@@ -2162,10 +2181,17 @@ fn update_via_defs(
     let stratum2 = collect_stratum("derivation_strat2");
     // #836 — clear derived consequent cells before forward-chain
     // (LFP per request, AREST.tex §4.3). Same fix as create_via_defs.
+    // task-929: noun-scope the wipe to derivation_index[noun]'s rules so
+    // cross-noun upstream consequent cells survive (see transition_via_defs
+    // comment for the bridge-rule failure mode this prevents).
     let new_state = {
         let drule_cell = ast::fetch_or_phi("DerivationRule", d);
         let derived_cells: hashbrown::HashSet<String> = drule_cell.as_seq()
             .map(|facts| facts.iter()
+                .filter(|f| relevant_ids.is_empty()
+                    || ast::binding(f, "id")
+                        .map(|id| relevant_ids.contains(id))
+                        .unwrap_or(false))
                 .filter_map(|f| ast::binding(f, "consequentFactTypeId"))
                 .map(|encoded| crate::types::ConsequentCellSource::decode(encoded)
                     .literal_id().to_string())
