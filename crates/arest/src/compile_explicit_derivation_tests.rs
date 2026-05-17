@@ -3098,6 +3098,58 @@ Task is recommended.
         recs, para_cell, s1.len(), s2.len());
 }
 
+// ─── #927 — tight repro: cross-noun variable unification in
+// derivation rule body. The bridge in apps/tasks reads
+// `Task has Task Status iff Resource is currently in Status and Task
+// Status is Status and Task is Resource` — three antecedents where
+// the second and third are value-equality clauses binding consequent
+// variables (Task, Task Status) to upstream antecedent variables
+// (Resource, Status). This minimal repro tests the same shape:
+// derive `Bar has Color iff Source has Hue and Bar is Source and
+// Color is Hue` — Bar binds to Source, Color binds to Hue.
+#[test]
+#[ignore = "#927: cross-noun variable unification — `Task is Resource` clause not interpreted as per-fact equality binding"]
+fn cross_noun_variable_unification_in_derivation_body() {
+    let src = r#"# task-927 tight repro
+Source(.id) is an entity type.
+Bar(.id) is an entity type.
+Hue is a value type.
+Color is a value type.
+
+## Fact Types
+Source has Hue.
+Bar has Color.
+
+## Derivation Rules
+* Bar has Color iff Source has Hue and Bar is Source and Color is Hue.
+
+## Instance Facts
+Source 'src1' has Hue 'red'.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let model = compile::compile(&state);
+    let bar_color_func = model.derivations.iter()
+        .find(|d| d.text.starts_with("Bar has Color iff"))
+        .map(|d| d.func.clone())
+        .expect("bridge rule must compile");
+
+    let pop = ast::encode_state(&state);
+    let out = ast::apply(&bar_color_func, &pop, &state);
+    let derived = decode_derived(&out);
+    let bar_colors: Vec<(String, String)> = derived.iter()
+        .filter(|(ft, _, _)| ft == "Bar_has_Color")
+        .filter_map(|(_, _, bs)| {
+            let bar = bs.iter().find(|(k, _)| k == "Bar").map(|(_, v)| v.clone())?;
+            let color = bs.iter().find(|(k, _)| k == "Color").map(|(_, v)| v.clone())?;
+            Some((bar, color))
+        })
+        .collect();
+
+    assert_eq!(bar_colors, vec![("src1".to_string(), "red".to_string())],
+        "Bridge rule with cross-noun unification must derive Bar='src1' \
+         Color='red' from Source 'src1' has Hue 'red'. Got: {:?}", derived);
+}
+
 // ─── #927 — load apps/tasks readings verbatim + recompile
 //
 // The 4 synthetic #927 tests above all pass but the live apps/tasks
