@@ -3108,7 +3108,6 @@ Task is recommended.
 // derive `Bar has Color iff Source has Hue and Bar is Source and
 // Color is Hue` — Bar binds to Source, Color binds to Hue.
 #[test]
-#[ignore = "#927: cross-noun variable unification — `Task is Resource` clause not interpreted as per-fact equality binding"]
 fn cross_noun_variable_unification_in_derivation_body() {
     let src = r#"# task-927 tight repro
 Source(.id) is an entity type.
@@ -3148,6 +3147,165 @@ Source 'src1' has Hue 'red'.
     assert_eq!(bar_colors, vec![("src1".to_string(), "red".to_string())],
         "Bridge rule with cross-noun unification must derive Bar='src1' \
          Color='red' from Source 'src1' has Hue 'red'. Got: {:?}", derived);
+}
+
+// ─── #927 — extension of tight repro: upstream antecedent is itself
+// DERIVED rather than stored. The previous test (stored upstream)
+// passes. The live apps/tasks failure has a chain shape where
+// `Task has Task Status` derives from `Resource is currently in
+// Status`, which is itself derived from SM cells. This isolates
+// whether the derived-antecedent interaction is what breaks
+// downstream cross-noun unification.
+//
+// Setup:
+//   Origin has Hue   (stored)
+//   Source has Hue   (derived: iff Origin has Hue and Source is Origin)
+//   Bar has Color    (derived: iff Source has Hue and Bar is Source and Color is Hue)
+//
+// Expectation: both derivations fire to fixpoint and the chain
+// produces Bar='o1', Color='red'. If the bug reproduces here,
+// fingerprint should look like Source_has_Hue or Bar_has_Color
+// carrying empty-bindings Seq([Seq([])]) — same shape as the live
+// apps/tasks symptom.
+#[test]
+fn cross_noun_unification_with_derived_upstream_antecedent() {
+    let src = r#"# task-927 chain repro
+Origin(.id) is an entity type.
+Source(.id) is an entity type.
+Bar(.id) is an entity type.
+Hue is a value type.
+Color is a value type.
+
+## Fact Types
+Origin has Hue.
+Source has Hue.
+Bar has Color.
+
+## Derivation Rules
+* Source has Hue iff Origin has Hue and Source is Origin.
+* Bar has Color iff Source has Hue and Bar is Source and Color is Hue.
+
+## Instance Facts
+Origin 'o1' has Hue 'red'.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let model = compile::compile(&state);
+
+    let derivations: Vec<(&str, &Func)> = model.derivations.iter()
+        .map(|d| (d.id.as_str(), &d.func))
+        .collect();
+
+    let (post, _) = crate::evaluate::forward_chain_defs_state(&derivations, &state);
+
+    let extract = |cell: &Object, role_a: &str, role_b: &str| -> Vec<(String, String)> {
+        let unpack = |f: &Object| -> Option<(String, String)> {
+            let a = ast::binding(f, role_a).map(String::from)?;
+            let b = ast::binding(f, role_b).map(String::from)?;
+            Some((a, b))
+        };
+        match cell {
+            Object::Seq(items) => items.iter().filter_map(unpack).collect(),
+            Object::Map(m) => m.values().filter_map(unpack).collect(),
+            _ => Vec::new(),
+        }
+    };
+
+    let source_hue_cell = ast::fetch_or_phi("Source_has_Hue", &post);
+    let bar_color_cell = ast::fetch_or_phi("Bar_has_Color", &post);
+    let source_hues = extract(&source_hue_cell, "Source", "Hue");
+    let bar_colors = extract(&bar_color_cell, "Bar", "Color");
+
+    assert_eq!(source_hues, vec![("o1".to_string(), "red".to_string())],
+        "Stratum-1: Source has Hue must derive 'o1','red' from Origin \
+         'o1' has Hue 'red' (via `Source is Origin` unification).\n\
+         Source_has_Hue cell raw: {:?}", source_hue_cell);
+
+    assert_eq!(bar_colors, vec![("o1".to_string(), "red".to_string())],
+        "Stratum-2: Bar has Color must derive 'o1','red' from the \
+         derived upstream Source has Hue.\n\
+         Source_has_Hue intermediate: {:?}\nBar_has_Color cell raw: {:?}",
+        source_hue_cell, bar_color_cell);
+}
+
+// ─── #927 — apps/tasks readings: which derivation rules SURVIVE
+// parse + compile? Diagnostic test (no assertion on materialization).
+//
+// Counted from the live DerivationRule cell after the most recent
+// compile, the bridge rules (`Resource is currently in Status iff`,
+// `Task has Task Status iff`) are MISSING. So is `Task is preceded
+// iff`. The other apps/tasks rules survive (Task is recommended,
+// Task is parallelizable, Task is file-conflicting, Task has Task
+// Readiness 'ready'/'blocked').
+//
+// This test pins which rules from the readings reach the model so
+// regressions surface. The failing assertion is the diagnostic
+// signal — currently FAILS, dumping the gap.
+#[test]
+fn apps_tasks_readings_all_derivation_rules_survive_compile() {
+    // Mirror cli/entry.rs ~712: load metamodel + user readings via a
+    // FOLD using parse_to_state_from(text, &merged), not a single
+    // concatenated parse_to_state. The per-reading state passes the
+    // *accumulated* metamodel context to each subsequent parse.
+    let app_md = include_str!("../../../../apps/tasks/readings/app.md");
+    let instances_codex = include_str!("../../../../apps/tasks/readings/instances/codex-retract-and-snapshot-cleanup.md");
+    let instances_epics = include_str!("../../../../apps/tasks/readings/instances/epics.md");
+    let instances_sm = include_str!("../../../../apps/tasks/readings/instances/sm-migration.md");
+    let instances_touches = include_str!("../../../../apps/tasks/readings/instances/source-file-touches.md");
+
+    let user_readings: Vec<(&str, &str)> = vec![
+        ("app.md", app_md),
+        ("instances/codex-retract-and-snapshot-cleanup.md", instances_codex),
+        ("instances/epics.md", instances_epics),
+        ("instances/sm-migration.md", instances_sm),
+        ("instances/source-file-touches.md", instances_touches),
+    ];
+
+    let all_readings: Vec<(&str, &str)> = crate::metamodel_readings().into_iter()
+        .map(|r| (r.0, r.1))
+        .chain(user_readings.iter().copied())
+        .collect();
+
+    let state = all_readings.iter().fold(
+        Object::phi(),
+        |merged, (_name, text)| {
+            let this = crate::parse_forml2::parse_to_state_from(text, &merged)
+                .expect("parse reading");
+            ast::merge_states(&merged, &this)
+        },
+    );
+    let model = compile::compile(&state);
+
+    let expected_rule_prefixes = [
+        "Resource is currently in Status iff",
+        "Task has Task Status iff",
+        "Task2 has Task Readiness 'blocked' iff",
+        "Task has Task Readiness 'ready' iff",
+        "Task2 is file-conflicting iff",
+        "Task2 is preceded iff",
+        "Task is parallelizable iff",
+        "Task is recommended iff",
+    ];
+
+    let compiled_texts: Vec<&str> = model.derivations.iter()
+        .map(|d| d.text.as_str())
+        .collect();
+
+    let mut missing: Vec<&str> = Vec::new();
+    for prefix in &expected_rule_prefixes {
+        if !compiled_texts.iter().any(|t| t.starts_with(prefix)) {
+            missing.push(prefix);
+        }
+    }
+
+    assert!(missing.is_empty(),
+        "These derivation rules from apps/tasks/readings/app.md did \
+         NOT survive parse + compile (silent drop):\n  {}\n\n\
+         All compiled derivations ({}):\n{}",
+        missing.join("\n  "),
+        compiled_texts.len(),
+        compiled_texts.iter().enumerate()
+            .map(|(i, t)| format!("  [{}] {}", i, t))
+            .collect::<Vec<_>>().join("\n"));
 }
 
 // ─── #927 — load apps/tasks readings verbatim + recompile
