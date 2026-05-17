@@ -2885,6 +2885,128 @@ Task is recommended.
         "Task 'c' is not parallelizable; join guard must reject. Got: {:#?}", derived);
 }
 
+// ─── #922 — apply-path: stratum-2 rule whose POSITIVE antecedent reads
+// another stratum-2 rule's consequent.
+//
+// Setup mirrors apps/tasks: file-conflicting + preceded fire from
+// stratum 1 (purely positive); parallelizable + recommended both
+// land in stratum 2 because each carries at least one AbsenceOf.
+// `recommended` reads `Task is parallelizable` as a POSITIVE
+// antecedent — same stratum, just emitted by another rule in the
+// same bucket.
+//
+// command.rs:1020-1033 (create_via_defs) and command.rs:2100-2113
+// (update_via_defs) call `forward_chain_defs_state(stratum1)` then
+// `forward_chain_defs_state(stratum2)` sequentially. The inner
+// fixpoint of the stratum-2 call SHOULD let `recommended` re-fire
+// in round 2 against state where `parallelizable` has integrated.
+// If it doesn't, the cell stays empty even though every antecedent
+// is satisfied — the apps/tasks symptom.
+//
+// This test pins the apply path end-to-end so a regression in
+// either the chain orchestrator or the integrate-derived path
+// surfaces here.
+#[test]
+fn apply_path_chain_fixpoints_stratum2_positive_dep_on_stratum2_emit() {
+    use crate::ast;
+    use crate::evaluate;
+
+    let src = r#"# task-922 apply-path repro
+Task(.id) is an entity type.
+Task Readiness is a value type.
+Task Priority is a value type.
+
+## Fact Types
+Task has Task Readiness.
+Task has Task Priority.
+Task is parallelizable.
+Task is epic.
+Task is recommended.
+
+## Derivation Rules
+* Task is parallelizable iff Task has Task Readiness 'ready' and Task is not epic.
+* Task is recommended iff Task has Task Readiness 'ready' and Task has Task Priority 'p0' and Task is parallelizable and Task is not epic.
+
+## Instance Facts
+Task 'a' has Task Readiness 'ready'.
+Task 'a' has Task Priority 'p0'.
+Task 'b' has Task Readiness 'ready'.
+Task 'b' has Task Priority 'p0'.
+"#;
+
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    let defs = crate::compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+    let model = crate::compile::compile(&state);
+
+    // Partition compiled derivations by uses_negation flag — the
+    // same partitioning compile_to_defs_state uses when emitting
+    // `derivation:rule_*` vs `derivation_strat2:rule_*` cells.
+    let s1: Vec<(&str, &ast::Func)> = model.derivations.iter()
+        .filter(|cd| !cd.uses_negation)
+        .map(|cd| (cd.id.as_str(), &cd.func))
+        .collect();
+    let s2: Vec<(&str, &ast::Func)> = model.derivations.iter()
+        .filter(|cd| cd.uses_negation)
+        .map(|cd| (cd.id.as_str(), &cd.func))
+        .collect();
+    let s1_refs = s1.as_slice();
+    let s2_refs = s2.as_slice();
+
+    // Sequential pattern — what command.rs does today.
+    let (post_s1, _) = if s1_refs.is_empty() {
+        (d.clone(), Vec::new())
+    } else {
+        evaluate::forward_chain_defs_state(s1_refs, &d)
+    };
+    let (post_seq, _) = if s2_refs.is_empty() {
+        (post_s1.clone(), Vec::new())
+    } else {
+        evaluate::forward_chain_defs_state(s2_refs, &post_s1)
+    };
+
+    // Alternating pattern — forward_chain_stratified does outer
+    // alternation until both passes produce nothing novel.
+    let (post_alt, _) = evaluate::forward_chain_stratified(
+        s1_refs, s2_refs, &d, 10);
+
+    let count = |state: &ast::Object, cell: &str| -> usize {
+        match ast::fetch_or_phi(cell, state) {
+            ast::Object::Seq(items) => items.len(),
+            ast::Object::Map(m) => m.len(),
+            _ => 0,
+        }
+    };
+
+    let seq_para = count(&post_seq, "Task_is_parallelizable");
+    let seq_rec = count(&post_seq, "Task_is_recommended");
+    let alt_para = count(&post_alt, "Task_is_parallelizable");
+    let alt_rec = count(&post_alt, "Task_is_recommended");
+
+    // The alternating shape MUST land all 2 tasks in both cells.
+    // The sequential shape (the bug) should leave recommended
+    // empty (or under-firing) when stratum-2 rules emit-depend on
+    // each other in the same bucket. If sequential also produces
+    // 2 in recommended, then the inner fixpoint of
+    // forward_chain_defs_state on stratum2 is doing the work and
+    // the apps/tasks symptom has a different root cause.
+    assert_eq!(alt_para, 2,
+        "alternating chain: both tasks must be parallelizable");
+    assert_eq!(alt_rec, 2,
+        "alternating chain: both tasks must be recommended");
+
+    // The critical assertion: sequential MUST match alternating
+    // (because the inner fixpoint should saturate stratum 2).
+    // If this assertion fails, the bug IS the sequential pattern
+    // and the fix is to switch command.rs to forward_chain_stratified.
+    assert_eq!(seq_rec, alt_rec,
+        "sequential chain produced {} recommended, alternating produced {}. \
+         If sequential under-fires, command.rs:1020/2100 must switch to \
+         forward_chain_stratified for the alternating-fixpoint guarantee. \
+         seq_para={}, alt_para={}.",
+        seq_rec, alt_rec, seq_para, alt_para);
+}
+
 // ─── Category 14: Join-path with consequent role literal pin (#814) ─
 //
 // Shape: `* X has Y 'y' iff some X has A 'a' and that X has B 'b'` — a
