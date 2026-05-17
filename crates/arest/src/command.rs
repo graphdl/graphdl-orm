@@ -1665,6 +1665,95 @@ fn transition_via_defs(
     let transition_fired = new_status.is_some();
     let status = new_status.clone().or_else(|| current_status.map(|s| s.to_string()));
 
+    // #922 — derivation chain MUST run after the SM cell update so
+    // derived cells that depend on Status (directly via the SM cell
+    // or transitively via the task-861 bridge derivation) re-fire
+    // against the post-transition state. Pre-fix `transition_via_defs`
+    // ran SM update + validate + Platform Function dispatch but never
+    // invoked the forward chain, so `Task_is_recommended` / readiness
+    // cells / any derivation reading Task Status stayed at their
+    // pre-transition values across every transition. Mirrors the
+    // 2-stratum chain create_via_defs / update_via_defs already run.
+    let (new_state, derived_count) = if transition_fired && !noun.is_empty() {
+        let relevant_ids: hashbrown::HashSet<String> = {
+            let index_key = format!("derivation_index:{}", noun);
+            let index_obj = ast::fetch(&index_key, d);
+            let value = index_obj.as_seq()
+                .filter(|items| items.len() == 2 && items[0].as_atom() == Some("'"))
+                .and_then(|items| items[1].as_atom())
+                .or_else(|| index_obj.as_atom());
+            value
+                .map(|s| s.split(',').map(|id| id.to_string()).collect())
+                .unwrap_or_default()
+        };
+        let collect_stratum = |prefix: &str| -> Vec<(String, ast::Func)> {
+            let cell_prefix = alloc::format!("{}:", prefix);
+            ast::cells_iter(d).into_iter()
+                .filter(|(n, _)| n.starts_with(cell_prefix.as_str()))
+                .filter(|(n, _)| {
+                    let def_id = n.strip_prefix(cell_prefix.as_str()).unwrap_or(n);
+                    if !relevant_ids.is_empty() {
+                        relevant_ids.contains(def_id)
+                            || n.contains("StateMachine") || n.contains("machine:")
+                            || n.contains("sm_init")
+                            || n.contains("sm_for_resource_backfill")
+                    } else {
+                        true
+                    }
+                })
+                .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, d)))
+                .collect()
+        };
+        let stratum1 = collect_stratum("derivation");
+        let stratum2 = collect_stratum("derivation_strat2");
+        // #836 — clear derived consequent cells before forward-chain
+        // (LFP per request, AREST.tex §4.3) so a transition that flips
+        // Status doesn't leave stale derived facts that the chain
+        // would never retract.
+        let resolved = {
+            let drule_cell = ast::fetch_or_phi("DerivationRule", d);
+            let derived_cells: hashbrown::HashSet<String> = drule_cell.as_seq()
+                .map(|facts| facts.iter()
+                    .filter_map(|f| ast::binding(f, "consequentFactTypeId"))
+                    .map(|encoded| crate::types::ConsequentCellSource::decode(encoded)
+                        .literal_id().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect())
+                .unwrap_or_default();
+            if derived_cells.is_empty() {
+                new_state
+            } else {
+                let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+                for (name, contents) in ast::cells_iter(&new_state).into_iter() {
+                    if derived_cells.contains(name) {
+                        new_map.insert(name.to_string(), ast::Object::phi());
+                    } else {
+                        new_map.insert(name.to_string(), contents.clone());
+                    }
+                }
+                ast::Object::Map(new_map.into())
+            }
+        };
+        let (post_s1, mut derived) = if stratum1.is_empty() {
+            (resolved, Vec::new())
+        } else {
+            let refs: Vec<(&str, &ast::Func)> = stratum1.iter().map(|(n, f)| (n.as_str(), f)).collect();
+            crate::evaluate::forward_chain_defs_state(&refs, &resolved)
+        };
+        let post_s2 = if stratum2.is_empty() {
+            post_s1
+        } else {
+            let refs: Vec<(&str, &ast::Func)> = stratum2.iter().map(|(n, f)| (n.as_str(), f)).collect();
+            let (s2_state, more) = crate::evaluate::forward_chain_defs_state(&refs, &post_s1);
+            derived.extend(more);
+            s2_state
+        };
+        let count = derived.len();
+        (post_s2, count)
+    } else {
+        (new_state, 0)
+    };
+
     // Audit D1 (#703): deontic gate on the post-rewrite state. A
     // transition is a mutation like any other — every deontic
     // constraint over the touched cells must fire, otherwise an
@@ -1793,7 +1882,7 @@ fn transition_via_defs(
         transitions,
         navigation,
         violations,
-        derived_count: 0,
+        derived_count,
         rejected,
         state: delta,
     }
