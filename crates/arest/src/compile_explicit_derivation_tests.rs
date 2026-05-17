@@ -2742,6 +2742,149 @@ Task is recommended.
         cd.uses_negation, rule.antecedent_sources);
 }
 
+// ─── #922 — implicit-equi-join must MATERIALIZE for 2-pos + 1-abs ──
+//
+// `implicit_equi_join_with_absence_of_sets_uses_negation_true` above
+// pins the FLAG but never asserts that the rule actually emits
+// derived facts. apps/tasks evidence: with the recommended rule
+// `* Task is recommended iff Task has Task Readiness 'ready' and Task
+// has Task Priority 'p0' and Task is parallelizable and Task is not
+// epic`, the `Task_is_recommended` cell stays empty even though
+// every antecedent for several tasks (e.g. 775, 780, 814) holds.
+// This test asserts the materialization end-to-end so the gap
+// surfaces at the unit-test layer instead of at apps_compile time.
+#[test]
+fn implicit_equi_join_materializes_for_three_positive_plus_absence() {
+    let src = r#"# task-922 / #918 follow-up
+Task(.id) is an entity type.
+Task Readiness is a value type.
+Task Priority is a value type.
+
+## Fact Types
+Task has Task Readiness.
+Task has Task Priority.
+Task is parallelizable.
+Task is epic.
+Task is recommended.
+
+## Derivation Rules
+* Task is recommended iff Task has Task Readiness 'ready' and Task has Task Priority 'p0' and Task is parallelizable and Task is not epic.
+"#;
+    let (_rule, func) = parse_and_compile(src);
+
+    // Population: Task 'a' satisfies all four antecedents (should
+    // surface in Task_is_recommended). Task 'b' is an epic (the
+    // absence guard rejects). Task 'c' lacks parallelizable (the
+    // third positive guard rejects).
+    let facts: &[(&str, &[(&str, &str)])] = &[
+        ("Task_has_Task_Readiness",   &[("Task", "a"), ("Task Readiness", "ready")]),
+        ("Task_has_Task_Readiness",   &[("Task", "b"), ("Task Readiness", "ready")]),
+        ("Task_has_Task_Readiness",   &[("Task", "c"), ("Task Readiness", "ready")]),
+        ("Task_has_Task_Priority",    &[("Task", "a"), ("Task Priority", "p0")]),
+        ("Task_has_Task_Priority",    &[("Task", "b"), ("Task Priority", "p0")]),
+        ("Task_has_Task_Priority",    &[("Task", "c"), ("Task Priority", "p0")]),
+        ("Task_is_parallelizable",    &[("Task", "a")]),
+        ("Task_is_parallelizable",    &[("Task", "b")]),
+        // Task 'c' deliberately NOT in parallelizable.
+        ("Task_is_epic",              &[("Task", "b")]),
+        // Tasks 'a' and 'c' NOT in epic.
+    ];
+    let out = apply_to_facts(&func, facts);
+    let derived = decode_derived(&out);
+    let recommended_ids: Vec<&str> = derived.iter()
+        .filter(|(ft, _, _)| ft == "Task_is_recommended")
+        .flat_map(|(_, _, bs)| bs.iter().filter(|(k, _)| k == "Task").map(|(_, v)| v.as_str()))
+        .collect();
+
+    // Acceptance: Task 'a' materializes; 'b' rejected by epic
+    // absence; 'c' rejected by missing-parallelizable join.
+    assert!(recommended_ids.contains(&"a"),
+        "Task 'a' has Readiness=ready + Priority=p0 + parallelizable + not epic; \
+         must materialize as Task_is_recommended. Got derived facts: {:#?}",
+        derived);
+    assert!(!recommended_ids.contains(&"b"),
+        "Task 'b' is in epic; AbsenceOf guard must reject it. Got: {:#?}", derived);
+    assert!(!recommended_ids.contains(&"c"),
+        "Task 'c' is not parallelizable; positive-join guard must reject it. \
+         Got: {:#?}", derived);
+}
+
+// ─── #922 — implicit-equi-join over Map-backed antecedents (live shape) ──
+//
+// Above test passes with Seq-backed cells (cell_push). The live
+// apps/tasks shape has UCs that flip those FT cells to Map storage
+// (task-820 `cor:constraint-as-storage`). Re-run the same scenario
+// with the FT-level UCs in place so the Funcs face Map-shaped
+// antecedents the way the live forward-chain does. If THIS test
+// fails while the Seq variant above passes, the implicit-equi-join
+// branch (or one of its primitives) doesn't iterate Map cells the
+// way DistL/Filter primitives do.
+#[test]
+fn implicit_equi_join_materializes_over_map_backed_antecedents() {
+    let src = r#"# task-922 / map-backed shape
+Task(.id) is an entity type.
+Task Readiness is a value type.
+Task Priority is a value type.
+
+## Fact Types
+Task has Task Readiness.
+  Each Task has at most one Task Readiness.
+Task has Task Priority.
+  Each Task has at most one Task Priority.
+Task is parallelizable.
+Task is epic.
+Task is recommended.
+
+## Derivation Rules
+* Task is recommended iff Task has Task Readiness 'ready' and Task has Task Priority 'p0' and Task is parallelizable and Task is not epic.
+"#;
+    let (_rule, func) = parse_and_compile(src);
+
+    // Build the population through the keyed-write path so the
+    // Readiness and Priority cells land as Object::Map (the live
+    // apps/tasks shape). Use `cell_put_keyed` directly with the
+    // Task role as the key — the same primitive the apply path
+    // routes through for FTs whose UC span covers a single role.
+    let mut state = Object::phi();
+    // `cell_put_keyed` takes role NAMES (the cell's key roles), not
+    // values — it extracts the value from the fact's binding at that
+    // role to build the Map key.
+    let map_put = |state: Object, cell: &str, pairs: &[(&str, &str)]| -> Object {
+        let fact = ast::fact_from_pairs(pairs);
+        match ast::cell_put_keyed(cell, &["Task"], fact, &state) {
+            Ok(next) => next,
+            Err(e) => panic!("cell_put_keyed unexpectedly conflicted on {}: {:?}", cell, e),
+        }
+    };
+    state = map_put(state, "Task_has_Task_Readiness", &[("Task", "a"), ("Task Readiness", "ready")]);
+    state = map_put(state, "Task_has_Task_Readiness", &[("Task", "b"), ("Task Readiness", "ready")]);
+    state = map_put(state, "Task_has_Task_Readiness", &[("Task", "c"), ("Task Readiness", "ready")]);
+    state = map_put(state, "Task_has_Task_Priority",  &[("Task", "a"), ("Task Priority", "p0")]);
+    state = map_put(state, "Task_has_Task_Priority",  &[("Task", "b"), ("Task Priority", "p0")]);
+    state = map_put(state, "Task_has_Task_Priority",  &[("Task", "c"), ("Task Priority", "p0")]);
+    // parallelizable and epic stay Seq (no UC); use cell_push.
+    state = ast::cell_push("Task_is_parallelizable", ast::fact_from_pairs(&[("Task", "a")]), &state);
+    state = ast::cell_push("Task_is_parallelizable", ast::fact_from_pairs(&[("Task", "b")]), &state);
+    state = ast::cell_push("Task_is_epic",           ast::fact_from_pairs(&[("Task", "b")]), &state);
+
+    let pop = ast::encode_state(&state);
+    let out = ast::apply(&func, &pop, &state);
+    let derived = decode_derived(&out);
+    let recommended_ids: Vec<&str> = derived.iter()
+        .filter(|(ft, _, _)| ft == "Task_is_recommended")
+        .flat_map(|(_, _, bs)| bs.iter().filter(|(k, _)| k == "Task").map(|(_, v)| v.as_str()))
+        .collect();
+
+    assert!(recommended_ids.contains(&"a"),
+        "Task 'a' has all four antecedents over Map-backed cells; the rule \
+         must materialize against the same cell shapes the live forward-chain \
+         encounters in apps/tasks. Got derived: {:#?}", derived);
+    assert!(!recommended_ids.contains(&"b"),
+        "Task 'b' is in epic; AbsenceOf guard must reject. Got: {:#?}", derived);
+    assert!(!recommended_ids.contains(&"c"),
+        "Task 'c' is not parallelizable; join guard must reject. Got: {:#?}", derived);
+}
+
 // ─── Category 14: Join-path with consequent role literal pin (#814) ─
 //
 // Shape: `* X has Y 'y' iff some X has A 'a' and that X has B 'b'` — a
