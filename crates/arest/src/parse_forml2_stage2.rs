@@ -4517,6 +4517,7 @@ fn bootstrap_grammar_state(text: &str) -> Result<Object, String> {
                 antecedent_role_literals,
                 antecedent_role_comparisons: Vec::new(),
                 consequent_role_literals,
+                materialization: crate::types::MaterializationPolicy::Stored,
             };
             // Hand-rolled canonical serializer (#651) — byte-identical to
             // `serde_json::to_string(&rule)`, asserted by

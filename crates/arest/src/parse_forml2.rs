@@ -1232,6 +1232,28 @@ fn resolve_derivation_rule(
     fact_types_map: &HashMap<String, FactTypeDef>,
     catalog: &SchemaCatalog,
 ) {
+    // task-930: detect and strip the `is a view iff` materialization
+    // marker. Default policy is Stored (the eager forward-chain shape
+    // every existing reading uses). Opt in to View by writing
+    // `* X is a view iff ...` — the rule's consequent cell is then
+    // not materialized; downstream readers compute it lazily.
+    //
+    // The marker is stripped from rule.text BEFORE the rest of the
+    // resolver runs so downstream antecedent parsing / canonical id
+    // hashing don't see it. After this block rule.text matches the
+    // shape any equivalent Stored rule would have.
+    if let Some(at) = rule.text.find(" is a view iff ") {
+        rule.materialization = crate::types::MaterializationPolicy::View;
+        rule.text = format!("{} iff{}",
+            &rule.text[..at],
+            &rule.text[at + " is a view iff".len()..]);
+    } else if let Some(at) = rule.text.find(" is a view if ") {
+        rule.materialization = crate::types::MaterializationPolicy::View;
+        rule.text = format!("{} if{}",
+            &rule.text[..at],
+            &rule.text[at + " is a view if".len()..]);
+    }
+
     // Shim: old code paths referred to `ir.nouns` / `ir.fact_types`.
     // Rebind so the body below compiles unchanged.
     struct IrShim<'a> {

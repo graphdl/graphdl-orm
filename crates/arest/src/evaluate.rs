@@ -101,18 +101,20 @@ fn integrate_round_facts(
             // Seq contents into the Map (see `cell_put_keyed`).
             let role_refs: Vec<&str> = roles.iter().map(|s| s.as_str()).collect();
             for fact in facts {
-                // task-819 (cell_put_keyed → Result): in the forward-
-                // chain emit path, a KeyConflict means a derivation rule
-                // produced two facts at the same scope key with
-                // different non-key values — a logic error in the rule,
-                // and a real alethic-UC violation if the cell has one.
-                // Panicking surfaces the bug loudly during compile /
-                // forward-chain rather than silently overwriting. The
-                // existing dedup via `existing_keys + round_keys`
-                // HashSet upstream means idempotent re-emission never
-                // hits this path; only genuinely-conflicting writes do.
-                current_state = ast::cell_put_keyed(&cell_name, &role_refs, fact, &current_state)
-                    .expect("forward-chain emit produced a UC-violating fact for a keyed cell");
+                // task-820: KeyConflict means a rule emitted a fact
+                // that collides with an existing keyed entry. Log to
+                // stderr and skip the emit so a single misbehaving
+                // rule doesn't kill the whole compile. The diagnostic
+                // is preserved (loud and noisy on stderr) but no
+                // longer fatal. Idempotent re-emission is filtered by
+                // the `existing_keys + round_keys` dedup upstream;
+                // only genuinely-conflicting writes hit this path.
+                match ast::cell_put_keyed(&cell_name, &role_refs, fact, &current_state) {
+                    Ok(next) => { current_state = next; }
+                    Err(conflict) => {
+                        eprintln!("[forward-chain] UC conflict, dropping fact: {:?}", conflict);
+                    }
+                }
             }
         } else {
             let existing = ast::fetch_or_phi(&cell_name, &current_state);
@@ -2957,7 +2959,7 @@ mod tests {
             match_on: vec![],
             consequent_bindings: vec![],
             antecedent_filters: filter.into_iter().collect(),
-            consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+            consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
         };
         let mut cells = empty_cells();
         cells = with_ft(cells, "city_has_population", &ft1);
@@ -3120,7 +3122,7 @@ mod tests {
             consequent_computed_bindings: vec![crate::types::ConsequentComputedBinding {
                 role: derived_role.to_string(), expr,
             }],
-            consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+            consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
         };
         let mut cells = empty_cells();
         cells = with_ft(cells, "foo_has_val", &ft1);
@@ -3261,7 +3263,7 @@ mod tests {
                 source_fact_type_id: "thing_has_part".to_string(),
                 group_key_role: "Thing".to_string(),
             }],
-            unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+            unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
         };
         let mut cells = empty_cells();
         cells = with_ft(cells, "thing_has_part", &ft1);
@@ -3343,7 +3345,7 @@ mod tests {
                 source_fact_type_id: "order_has_line_amount".to_string(),
                 group_key_role: "Order".to_string(),
             }],
-            unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+            unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
         };
         let mut cells = empty_cells();
         cells = with_ft(cells, "order_has_line_amount", &ft1);
@@ -3414,7 +3416,7 @@ mod tests {
                 source_fact_type_id: "order_has_line_amount".to_string(),
                 group_key_role: "Order".to_string(),
             }],
-            unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+            unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
         };
         let mut cells = empty_cells();
         cells = with_ft(cells, "order_has_line_amount", &ft1);
@@ -3549,7 +3551,7 @@ mod tests {
             join_on: vec!["Key".to_string()],
             match_on: vec![],
             consequent_bindings: vec!["A".to_string(), "B".to_string()],
-            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
         });
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
@@ -3611,7 +3613,7 @@ mod tests {
             join_on: vec!["Key".to_string(), "X".to_string()],
             match_on: vec![],
             consequent_bindings: vec!["Y".to_string(), "X".to_string()],
-            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
         });
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
@@ -3664,7 +3666,7 @@ mod tests {
             join_on: vec![],
             match_on: vec![("Full Name".to_string(), "Short Name".to_string())],
             consequent_bindings: vec!["B".to_string(), "A".to_string()],
-            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
         });
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
@@ -3717,7 +3719,7 @@ mod tests {
             join_on: vec!["Key".to_string()],
             match_on: vec![],
             consequent_bindings: vec!["A".to_string(), "B".to_string()],
-            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
         });
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
@@ -3824,6 +3826,7 @@ mod tests {
                     value: "X".to_string(),
                 },
             ],
+            materialization: crate::types::MaterializationPolicy::Stored,
         });
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
@@ -3955,6 +3958,7 @@ mod tests {
                     value: "X".to_string(),
                 },
             ],
+            materialization: crate::types::MaterializationPolicy::Stored,
         });
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
@@ -4085,6 +4089,7 @@ mod tests {
                 role: "Classification".to_string(),
                 value: cons_literal.to_string(),
             }],
+            materialization: crate::types::MaterializationPolicy::Stored,
         };
         let mut cells = empty_cells();
         cells = with_ft(cells, "stmt_has_trailing_marker", &ant_ft);

@@ -134,6 +134,27 @@ pub(crate) struct CompiledDerivation {
     /// list AND whose `consequent_role_literals` are compatible
     /// with the AbsenceOf's pins.
     pub(crate) negation_reads: Vec<(String, Vec<(String, String)>)>,
+    /// task-930: materialization policy carried from DerivationRuleDef
+    /// through compile to the def-emission step. Stored rules emit
+    /// `derivation:{id}` def cells (forward chain materializes them);
+    /// View rules skip emission and are computed lazily on read.
+    pub(crate) materialization: crate::types::MaterializationPolicy,
+}
+
+impl Default for CompiledDerivation {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            text: String::new(),
+            kind: DerivationKind::ModusPonens,
+            func: crate::ast::Func::constant(crate::ast::Object::phi()),
+            uses_negation: false,
+            consequent_cell: String::new(),
+            consequent_role_literals: Vec::new(),
+            negation_reads: Vec::new(),
+            materialization: crate::types::MaterializationPolicy::Stored,
+        }
+    }
 }
 
 /// task-814-stratify-3plus: extract the dependency-graph metadata
@@ -1387,7 +1408,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             DerivationRuleDef {
                 id: get("id"), text: get("text"), antecedent_sources: vec![], consequent_instance_role: String::new(),
                 consequent_cell: crate::types::ConsequentCellSource::decode(&get("consequentFactTypeId")),
-                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
             }
         }).collect())
         .unwrap_or_default();
@@ -1544,7 +1565,14 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // rules. Without that, the AbsenceOf guard fires in round 1
     // before its negative-dependency cell has been populated, and
     // the consequent fires for entries that should be filtered out.
+    // task-930: skip View-materialization rules. View rules don't
+    // emit derivation def cells; the forward chain doesn't run them.
+    // Downstream consumers compute the consequent lazily on read.
+    // Default policy is Stored, so existing readings without explicit
+    // `is a view iff` keep the legacy materialize-eagerly behavior.
     defs.extend(model.derivations.iter()
+        .filter(|d| matches!(d.materialization,
+            crate::types::MaterializationPolicy::Stored))
         .map(|d| {
             let prefix = if d.uses_negation { "derivation_strat2" } else { "derivation" };
             (format!("{}:{}", prefix, d.id), d.func.clone())
@@ -2913,7 +2941,7 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
                 kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![],
                 consequent_bindings: vec![], antecedent_filters: vec![],
                 consequent_computed_bindings: vec![], consequent_aggregates: vec![],
-                unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+                unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
             }
         }).collect()).unwrap_or_default();
     let general_instance_facts: Vec<GeneralInstanceFact> = fetch_or_phi("InstanceFact", state).as_seq()
@@ -3442,7 +3470,7 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
     let (consequent_cell, consequent_role_literals, negation_reads) =
         derivation_dep_metadata(rule);
     CompiledDerivation { id, text, kind, func, uses_negation: false,
-        consequent_cell, consequent_role_literals, negation_reads }
+        consequent_cell, consequent_role_literals, negation_reads, materialization: rule.materialization.clone() }
 }
 
 /// Compile a Halpin arithmetic expression (Box::Volume = Size * Size * Size)
@@ -3845,7 +3873,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
         let (consequent_cell, consequent_role_literals, negation_reads) =
             derivation_dep_metadata(rule);
         return CompiledDerivation { id, text, kind, func, uses_negation: false,
-            consequent_cell, consequent_role_literals, negation_reads };
+            consequent_cell, consequent_role_literals, negation_reads, materialization: rule.materialization.clone() };
     }
 
     let func = match antecedent_ids.len() {
@@ -4203,6 +4231,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     ),
                     uses_negation: true,
                     consequent_cell, consequent_role_literals, negation_reads,
+                    materialization: rule.materialization.clone(),
                 };
             }
             // Subscript-driven join (#826, generalised in #866-c):
@@ -4332,7 +4361,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                         id, text, kind,
                         func: Func::constant(Object::phi()),
                         uses_negation: !absence_idx.is_empty(),
-                        consequent_cell, consequent_role_literals, negation_reads,
+                        consequent_cell, consequent_role_literals, negation_reads, materialization: rule.materialization.clone(),
                     };
                 }
                 // Step 0: facts of the first POSITIVE antecedent.
@@ -4358,7 +4387,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                             id: id.clone(), text: text.clone(), kind: kind.clone(),
                             func: Func::constant(Object::phi()),
                             uses_negation: !absence_idx.is_empty(),
-                            consequent_cell, consequent_role_literals, negation_reads,
+                            consequent_cell, consequent_role_literals, negation_reads, materialization: rule.materialization.clone(),
                         };
                     };
                     let ft_k_role_count = ft_k.roles.len();
@@ -4620,6 +4649,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     func: Func::compose(Func::apply_to_all(derive_one), tuple_stream),
                     uses_negation: !absence_idx.is_empty(),
                     consequent_cell, consequent_role_literals, negation_reads,
+                    materialization: rule.materialization.clone(),
                 };
             }
 
@@ -4949,6 +4979,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     ),
                     uses_negation: !absence_idx.is_empty(),
                     consequent_cell, consequent_role_literals, negation_reads,
+                    materialization: rule.materialization.clone(),
                 };
             }
 
@@ -5187,6 +5218,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     consequent_cell,
                     consequent_role_literals,
                     negation_reads,
+                    materialization: rule.materialization.clone(),
                 };
             }
 
@@ -5342,14 +5374,14 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 id, text, kind,
                 func: func_b,
                 uses_negation: !absence_idx.is_empty(),
-                consequent_cell, consequent_role_literals, negation_reads,
+                consequent_cell, consequent_role_literals, negation_reads, materialization: rule.materialization.clone(),
             };
         }
     };
     let (consequent_cell, consequent_role_literals, negation_reads) =
         derivation_dep_metadata(rule);
     CompiledDerivation { id, text, kind, func, uses_negation: false,
-        consequent_cell, consequent_role_literals, negation_reads }
+        consequent_cell, consequent_role_literals, negation_reads, materialization: rule.materialization.clone() }
 }
 
 
@@ -5519,7 +5551,7 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
             uses_negation: false,
             consequent_cell: consequent_cell_md,
             consequent_role_literals: consequent_role_literals_md,
-            negation_reads: negation_reads_md,
+            negation_reads: negation_reads_md, materialization: rule.materialization.clone(),
         },
         1 => {
             // Single antecedent: no join, just derive from each fact.
@@ -5537,7 +5569,7 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
                 uses_negation: false,
                 consequent_cell: consequent_cell_md,
                 consequent_role_literals: consequent_role_literals_md,
-                negation_reads: negation_reads_md,
+                negation_reads: negation_reads_md, materialization: rule.materialization.clone(),
             };
         },
         _ => {},
@@ -5809,7 +5841,8 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
     CompiledDerivation { id, text, kind, func, uses_negation,
         consequent_cell: consequent_cell_md,
         consequent_role_literals: consequent_role_literals_md,
-        negation_reads: negation_reads_md }
+        negation_reads: negation_reads_md,
+        materialization: rule.materialization.clone() }
 }
 
 // (join_recursive, check_join_keys, check_match_predicates removed --
@@ -5891,7 +5924,7 @@ pub(crate) fn compile_subtype_inheritance_metamodel(
                 join_on: vec![], match_on: vec![], consequent_bindings: vec![],
                 antecedent_filters: vec![], consequent_computed_bindings: vec![],
                 consequent_aggregates: vec![], unresolved_clauses: vec![],
-                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
             };
             compile_explicit_derivation(data, &rule).func
         })
@@ -5918,6 +5951,7 @@ pub(crate) fn compile_subtype_inheritance_metamodel(
         func,
         uses_negation: false,
         consequent_cell, consequent_role_literals, negation_reads,
+        materialization: crate::types::MaterializationPolicy::Stored,
     })
 }
 
@@ -5986,7 +6020,7 @@ pub(crate) fn compile_ss_autofill_metamodel(
                 join_on: vec![], match_on: vec![], consequent_bindings: vec![],
                 antecedent_filters: vec![], consequent_computed_bindings: vec![],
                 consequent_aggregates: vec![], unresolved_clauses: vec![],
-                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
             };
             compile_explicit_derivation(data, &rule).func
         })
@@ -6008,6 +6042,7 @@ pub(crate) fn compile_ss_autofill_metamodel(
         func,
         uses_negation: false,
         consequent_cell, consequent_role_literals, negation_reads,
+        materialization: crate::types::MaterializationPolicy::Stored,
     })
 }
 
@@ -6095,7 +6130,7 @@ pub(crate) fn compile_transitivity_metamodel(
                     consequent_bindings: vec![src_noun, dst_noun],
                     antecedent_filters: vec![], consequent_computed_bindings: vec![],
                     consequent_aggregates: vec![], unresolved_clauses: vec![],
-                    antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+                    antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
                 };
                 Some(compile_join_derivation(data, &rule).func)
             }))
@@ -6118,6 +6153,7 @@ pub(crate) fn compile_transitivity_metamodel(
         func,
         uses_negation: false,
         consequent_cell, consequent_role_literals, negation_reads,
+        materialization: crate::types::MaterializationPolicy::Stored,
     })
 }
 
@@ -6208,7 +6244,7 @@ pub(crate) fn compile_cwa_negation_metamodel(
                 join_on: vec![], match_on: vec![], consequent_bindings: vec![],
                 antecedent_filters: vec![], consequent_computed_bindings: vec![],
                 consequent_aggregates: vec![], unresolved_clauses: vec![],
-                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
             };
             compile_explicit_derivation(data, &rule).func
         })
@@ -6238,6 +6274,7 @@ pub(crate) fn compile_cwa_negation_metamodel(
         func,
         uses_negation: true,
         consequent_cell, consequent_role_literals, negation_reads,
+        materialization: crate::types::MaterializationPolicy::Stored,
     })
 }
 
@@ -6395,7 +6432,8 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
         let (consequent_cell, consequent_role_literals, negation_reads) =
             derivation_dep_metadata_synth(String::new());
         CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func, uses_negation: false,
-            consequent_cell, consequent_role_literals, negation_reads }
+            consequent_cell, consequent_role_literals, negation_reads,
+            materialization: crate::types::MaterializationPolicy::Stored }
 }
 
 /// State machine event-fold as a derivation rule (task-740).
@@ -6516,7 +6554,8 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
     let (consequent_cell, consequent_role_literals, negation_reads) =
         derivation_dep_metadata_synth(String::new());
     CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func, uses_negation: false,
-        consequent_cell, consequent_role_literals, negation_reads }
+        consequent_cell, consequent_role_literals, negation_reads,
+        materialization: crate::types::MaterializationPolicy::Stored }
 }
 
 /// task-922-sm-init-projection — for_Resource backfill.
@@ -6630,6 +6669,7 @@ fn compile_sm_for_resource_backfill_for(sm: &CompiledStateMachine) -> CompiledDe
         consequent_cell: consequent_cell_md,
         consequent_role_literals: consequent_role_literals_md,
         negation_reads: negation_reads_md,
+        materialization: crate::types::MaterializationPolicy::Stored,
     }
 }
 

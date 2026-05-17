@@ -471,6 +471,13 @@ pub struct DerivationRuleDef {
     /// consequent roles inherit bindings from the antecedent fact.
     #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub consequent_role_literals: Vec<ConsequentRoleLiteral>,
+    /// task-930: derivation materialization policy. Stored = eager
+    /// materialization via forward-chain (legacy behavior, current
+    /// default). View = computed lazily on read; never persisted to a
+    /// consequent cell. Default is Stored so existing readings keep
+    /// their behavior; opt into View via `is a view iff` in the reading.
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "MaterializationPolicy::is_default"))]
+    pub materialization: MaterializationPolicy,
 }
 
 // ── Hand-rolled canonical JSON writer for `DerivationRuleDef` ────────
@@ -549,6 +556,30 @@ fn json_write_f64(out: &mut String, v: f64) {
     // as `ryu::Buffer::format_finite`.
     let s = alloc::format!("{:?}", v);
     out.push_str(&s);
+}
+
+impl Default for DerivationRuleDef {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            text: String::new(),
+            antecedent_sources: Vec::new(),
+            consequent_cell: ConsequentCellSource::default(),
+            consequent_instance_role: String::new(),
+            kind: DerivationKind::ModusPonens,
+            join_on: Vec::new(),
+            match_on: Vec::new(),
+            consequent_bindings: Vec::new(),
+            antecedent_filters: Vec::new(),
+            consequent_computed_bindings: Vec::new(),
+            consequent_aggregates: Vec::new(),
+            unresolved_clauses: Vec::new(),
+            antecedent_role_literals: Vec::new(),
+            antecedent_role_comparisons: Vec::new(),
+            consequent_role_literals: Vec::new(),
+            materialization: MaterializationPolicy::Stored,
+        }
+    }
 }
 
 impl DerivationRuleDef {
@@ -701,9 +732,26 @@ impl DerivationRuleDef {
             out.push(']');
         }
 
+        // 17. materialization (task-930 — skip if default Stored so
+        //     existing rule IDs hash-stable).
+        if !self.materialization.is_default() {
+            out.push_str(",\"materialization\":");
+            materialization_policy_write(&mut out, &self.materialization);
+        }
+
         out.push('}');
         out
     }
+}
+
+fn materialization_policy_write(out: &mut String, p: &MaterializationPolicy) {
+    let s = match p {
+        MaterializationPolicy::Stored => "stored",
+        MaterializationPolicy::View => "view",
+    };
+    out.push('"');
+    out.push_str(s);
+    out.push('"');
 }
 
 /// Internally-tagged enum (`tag = "kind", content = "value"`) with
@@ -1013,6 +1061,43 @@ pub enum DerivationKind {
     Transitivity,       // A->B, B->C -> A->C
     ClosedWorldNegation, // Not derivable under CWA -> false
     Join,               // Cross-fact-type equi-join on shared noun names
+}
+
+/// task-930: derivation materialization policy.
+///
+/// * `Stored` — the rule's consequent cell is eagerly materialized by
+///   the forward-chain at apply/compile time. Reading the cell returns
+///   the stored facts directly. This is the legacy behavior and the
+///   default for backwards compatibility (existing readings without
+///   explicit policy stay stored).
+///
+/// * `View` — the rule is not materialized. The consequent cell is
+///   absent from forward-chain emissions; downstream consumers compute
+///   it lazily on read via the rule's compiled func. Analogous to a
+///   SQL `VIEW` (vs `MATERIALIZED VIEW`). Reduces apply-time cost and
+///   eliminates the need to refresh dependent cells when their
+///   antecedents change.
+///
+/// Default is `Stored` so existing rule definitions round-trip
+/// unchanged through canonical JSON; `View` opts in via the reading
+/// (`* X is a view iff …`).
+#[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
+pub enum MaterializationPolicy {
+    #[default]
+    Stored,
+    View,
+}
+
+impl MaterializationPolicy {
+    /// `skip_serializing_if` predicate for the canonical-JSON writer.
+    /// Returning true skips the field, preserving byte-identical JSON
+    /// for the (overwhelmingly common) Stored case so existing rule
+    /// IDs (content-hash of canonical JSON) don't shift.
+    pub fn is_default(&self) -> bool {
+        matches!(self, MaterializationPolicy::Stored)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1381,6 +1466,7 @@ mod canonical_json_tests {
                 role: "Classification".to_string(),
                 value: "Entity Type Declaration".to_string(),
             }],
+            materialization: MaterializationPolicy::Stored,
         }
     }
 
@@ -1402,6 +1488,7 @@ mod canonical_json_tests {
             antecedent_role_literals: Vec::new(),
             antecedent_role_comparisons: Vec::new(),
             consequent_role_literals: Vec::new(),
+            materialization: MaterializationPolicy::Stored,
         }
     }
 
@@ -1437,6 +1524,7 @@ mod canonical_json_tests {
                 role: "Classification".to_string(),
                 value: "Entity Type Declaration".to_string(),
             }],
+            materialization: MaterializationPolicy::Stored,
         }
     }
 
@@ -1467,6 +1555,7 @@ mod canonical_json_tests {
             antecedent_role_literals: Vec::new(),
             antecedent_role_comparisons: Vec::new(),
             consequent_role_literals: Vec::new(),
+            materialization: MaterializationPolicy::Stored,
         }
     }
 
@@ -1493,6 +1582,7 @@ mod canonical_json_tests {
             antecedent_role_literals: Vec::new(),
             antecedent_role_comparisons: Vec::new(),
             consequent_role_literals: Vec::new(),
+            materialization: MaterializationPolicy::Stored,
         }
     }
 
