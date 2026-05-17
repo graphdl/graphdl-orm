@@ -2885,6 +2885,394 @@ Task is recommended.
         "Task 'c' is not parallelizable; join guard must reject. Got: {:#?}", derived);
 }
 
+// ─── #927 — coexist with parallelizable's own derivation
+//
+// Production has BOTH `parallelizable iff ...` AND `recommended iff
+// ... parallelizable ...` in the same readings. The implicit-equi-
+// join branch test above only declares recommended. Adding the
+// parallelizable rule alongside reproduces the resolve-context
+// hypothesis: the parser sees `Task is parallelizable` as both a
+// rule consequent AND as a positive antecedent of recommended, and
+// may resolve them inconsistently.
+#[test]
+fn implicit_equi_join_materializes_when_parallelizable_is_itself_derived() {
+    let src = r#"# task-927
+Task(.id) is an entity type.
+Task Readiness is a value type.
+Task Priority is a value type.
+
+## Fact Types
+Task has Task Readiness.
+Task has Task Priority.
+Task is parallelizable.
+Task is epic.
+Task is recommended.
+
+## Derivation Rules
+* Task is parallelizable iff Task has Task Readiness 'ready' and Task is not epic.
+* Task is recommended iff Task has Task Readiness 'ready' and Task has Task Priority 'p0' and Task is parallelizable and Task is not epic.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let data = compile::cell_index_from_state(&state);
+    assert_eq!(data.derivation_rules.len(), 2);
+    let model = compile::compile(&state);
+
+    // Apply rule funcs to a hand-built population using
+    // forward_chain_defs_state so parallelizable's emit feeds
+    // recommended (mirrors what the apply path does).
+    let mut state = Object::phi();
+    state = ast::cell_push("Task_has_Task_Readiness",
+        ast::fact_from_pairs(&[("Task", "a"), ("Task Readiness", "ready")]), &state);
+    state = ast::cell_push("Task_has_Task_Priority",
+        ast::fact_from_pairs(&[("Task", "a"), ("Task Priority", "p0")]), &state);
+
+    // Partition rules into stratum1 (no negation) and stratum2 (with).
+    let s1: Vec<(&str, &Func)> = model.derivations.iter()
+        .filter(|d| !d.uses_negation)
+        .map(|d| (d.id.as_str(), &d.func)).collect();
+    let s2: Vec<(&str, &Func)> = model.derivations.iter()
+        .filter(|d| d.uses_negation)
+        .map(|d| (d.id.as_str(), &d.func)).collect();
+
+    let (post_s1, _) = if s1.is_empty() {
+        (state.clone(), Vec::new())
+    } else { crate::evaluate::forward_chain_defs_state(&s1, &state) };
+    let (post, _) = if s2.is_empty() {
+        (post_s1, Vec::new())
+    } else { crate::evaluate::forward_chain_defs_state(&s2, &post_s1) };
+
+    let rec_cell = ast::fetch_or_phi("Task_is_recommended", &post);
+    let recs: Vec<String> = match &rec_cell {
+        Object::Seq(items) => items.iter()
+            .filter_map(|f| ast::binding(f, "Task").map(String::from)).collect(),
+        Object::Map(m) => m.values()
+            .filter_map(|f| ast::binding(f, "Task").map(String::from)).collect(),
+        _ => Vec::new(),
+    };
+    assert!(recs.contains(&"a".to_string()),
+        "Task 'a' (ready+p0+derived-parallelizable+not-epic) must be \
+         recommended. recs={:?}, parallelizable cell: {:?}",
+        recs, ast::fetch_or_phi("Task_is_parallelizable", &post));
+}
+
+// ─── #927 — Map-backed Readiness/Priority + derived parallelizable
+//
+// The Seq-backed test above passes. Adds UCs on Readiness/Priority
+// to force Map storage, mirroring apps/tasks. parallelizable still
+// derived. If THIS fails while the Seq variant passes, the issue
+// is implicit-equi-join's handling of Map antecedents WHEN those
+// antecedents are themselves derived by stratum2 rules.
+#[test]
+fn implicit_equi_join_map_backed_with_derived_parallelizable() {
+    let src = r#"# task-927 map + derived parallelizable
+Task(.id) is an entity type.
+Task Readiness is a value type.
+Task Priority is a value type.
+
+## Fact Types
+Task has Task Readiness.
+  Each Task has at most one Task Readiness.
+Task has Task Priority.
+  Each Task has at most one Task Priority.
+Task is parallelizable.
+Task is epic.
+Task is recommended.
+
+## Derivation Rules
+* Task is parallelizable iff Task has Task Readiness 'ready' and Task is not epic.
+* Task is recommended iff Task has Task Readiness 'ready' and Task has Task Priority 'p0' and Task is parallelizable and Task is not epic.
+"#;
+    let state_initial = parse_to_state(src).expect("parse");
+    let model = compile::compile(&state_initial);
+
+    let mut state = state_initial.clone();
+    let map_put = |state: Object, cell: &str, pairs: &[(&str, &str)]| -> Object {
+        ast::cell_put_keyed(cell, &["Task"], ast::fact_from_pairs(pairs), &state).unwrap()
+    };
+    state = map_put(state, "Task_has_Task_Readiness", &[("Task", "a"), ("Task Readiness", "ready")]);
+    state = map_put(state, "Task_has_Task_Priority",  &[("Task", "a"), ("Task Priority", "p0")]);
+
+    let s1: Vec<(&str, &Func)> = model.derivations.iter()
+        .filter(|d| !d.uses_negation)
+        .map(|d| (d.id.as_str(), &d.func)).collect();
+    let s2: Vec<(&str, &Func)> = model.derivations.iter()
+        .filter(|d| d.uses_negation)
+        .map(|d| (d.id.as_str(), &d.func)).collect();
+
+    let (post_s1, _) = if s1.is_empty() {
+        (state.clone(), Vec::new())
+    } else { crate::evaluate::forward_chain_defs_state(&s1, &state) };
+    let (post, _) = if s2.is_empty() {
+        (post_s1, Vec::new())
+    } else { crate::evaluate::forward_chain_defs_state(&s2, &post_s1) };
+
+    let rec_cell = ast::fetch_or_phi("Task_is_recommended", &post);
+    let recs: Vec<String> = match &rec_cell {
+        Object::Seq(items) => items.iter()
+            .filter_map(|f| ast::binding(f, "Task").map(String::from)).collect(),
+        Object::Map(m) => m.values()
+            .filter_map(|f| ast::binding(f, "Task").map(String::from)).collect(),
+        _ => Vec::new(),
+    };
+    let para_cell = ast::fetch_or_phi("Task_is_parallelizable", &post);
+    assert!(recs.contains(&"a".to_string()),
+        "Task 'a' must be recommended. recs={:?}, parallelizable={:?}, \
+         readiness={:?}",
+        recs, para_cell,
+        ast::fetch_or_phi("Task_has_Task_Readiness", &post));
+}
+
+// ─── #927 — round-trip via compile_to_defs_state + metacompose
+//
+// Production goes: compile_to_defs_state -> defs_to_state -> at
+// runtime fetch via cells_iter + metacompose -> apply. My earlier
+// tests used model.derivations directly. If func_to_object /
+// metacompose loses fidelity for the recommended rule's compiled
+// Func shape, the recovered Func may differ from the original.
+#[test]
+fn implicit_equi_join_round_trip_through_defs_state() {
+    let src = r#"# task-927 defs round-trip
+Task(.id) is an entity type.
+Task Readiness is a value type.
+Task Priority is a value type.
+
+## Fact Types
+Task has Task Readiness.
+  Each Task has at most one Task Readiness.
+Task has Task Priority.
+  Each Task has at most one Task Priority.
+Task is parallelizable.
+Task is epic.
+Task is recommended.
+
+## Derivation Rules
+* Task is parallelizable iff Task has Task Readiness 'ready' and Task is not epic.
+* Task is recommended iff Task has Task Readiness 'ready' and Task has Task Priority 'p0' and Task is parallelizable and Task is not epic.
+"#;
+    let state_initial = parse_to_state(src).expect("parse");
+    let defs = compile::compile_to_defs_state(&state_initial);
+    let d = ast::defs_to_state(&defs, &state_initial);
+
+    // Build population the way apply does.
+    let mut pop_state = state_initial.clone();
+    let map_put = |state: Object, cell: &str, pairs: &[(&str, &str)]| -> Object {
+        ast::cell_put_keyed(cell, &["Task"], ast::fact_from_pairs(pairs), &state).unwrap()
+    };
+    pop_state = map_put(pop_state, "Task_has_Task_Readiness", &[("Task", "a"), ("Task Readiness", "ready")]);
+    pop_state = map_put(pop_state, "Task_has_Task_Priority",  &[("Task", "a"), ("Task Priority", "p0")]);
+
+    // Mirror command.rs's collect_stratum: walk d's derivation cells,
+    // metacompose contents back to Func.
+    let collect_stratum = |prefix: &str| -> Vec<(String, ast::Func)> {
+        let cell_prefix = alloc::format!("{}:", prefix);
+        ast::cells_iter(&d).into_iter()
+            .filter(|(n, _)| n.starts_with(cell_prefix.as_str()))
+            .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &d)))
+            .collect()
+    };
+    let stratum1 = collect_stratum("derivation");
+    let stratum2 = collect_stratum("derivation_strat2");
+    let s1: Vec<(&str, &ast::Func)> = stratum1.iter().map(|(n, f)| (n.as_str(), f)).collect();
+    let s2: Vec<(&str, &ast::Func)> = stratum2.iter().map(|(n, f)| (n.as_str(), f)).collect();
+
+    let (post_s1, _) = if s1.is_empty() {
+        (pop_state.clone(), Vec::new())
+    } else { crate::evaluate::forward_chain_defs_state(&s1, &pop_state) };
+    let (post, _) = if s2.is_empty() {
+        (post_s1, Vec::new())
+    } else { crate::evaluate::forward_chain_defs_state(&s2, &post_s1) };
+
+    let rec_cell = ast::fetch_or_phi("Task_is_recommended", &post);
+    let recs: Vec<String> = match &rec_cell {
+        Object::Seq(items) => items.iter()
+            .filter_map(|f| ast::binding(f, "Task").map(String::from)).collect(),
+        Object::Map(m) => m.values()
+            .filter_map(|f| ast::binding(f, "Task").map(String::from)).collect(),
+        _ => Vec::new(),
+    };
+    let para_cell = ast::fetch_or_phi("Task_is_parallelizable", &post);
+    assert!(recs.contains(&"a".to_string()),
+        "After defs_to_state + metacompose round-trip: Task 'a' must \
+         be recommended. recs={:?}, parallelizable={:?}, s1_count={}, \
+         s2_count={}",
+        recs, para_cell, s1.len(), s2.len());
+}
+
+// ─── #927 — load apps/tasks readings verbatim + recompile
+//
+// The 4 synthetic #927 tests above all pass but the live apps/tasks
+// substrate stays empty. Last difference: the full readings context.
+// This test loads apps/tasks/readings/app.md verbatim and checks
+// whether recommended fires for a single hand-built Task that
+// satisfies all four antecedents.
+//
+// **Currently failing** — reproduces the live-state bug. With the
+// bridge derivation (`Task has Task Status iff Resource is
+// currently in Status and Task Status is Status and Task is
+// Resource`) in scope, the chain produces `Task_has_Task_Status =
+// Seq([Seq([])])` — an empty fact in the cell. The bridge's
+// cross-antecedent variable unification (Resource ↔ Task, Status ↔
+// Task Status) emits empty bindings; downstream rules then see
+// no usable Task_has_Task_Status entries; readiness, parallelizable,
+// recommended all stay empty. `#[ignore]` to keep the test as a
+// regression guard without blocking CI until the bridge's
+// variable-unification bug is fixed (separate task — needs
+// resolve_derivation_rule investigation in parse_forml2.rs).
+#[ignore = "#927: bridge derivation's variable unification emits empty bindings; reproduces live-state bug"]
+#[test]
+fn implicit_equi_join_with_actual_apps_tasks_readings() {
+    let src = include_str!("../../../../apps/tasks/readings/app.md");
+    let state_initial = parse_to_state(src).expect("parse apps/tasks readings");
+    let model = compile::compile(&state_initial);
+
+    // Build a minimal qualifying state: one Task that satisfies
+    // every antecedent of the recommended rule.
+    let mut state = state_initial.clone();
+    let map_put = |state: Object, cell: &str, pairs: &[(&str, &str)]| -> Object {
+        ast::cell_put_keyed(cell, &["Task"], ast::fact_from_pairs(pairs), &state).unwrap()
+    };
+    // Task_has_Task_Status is now derived via the bridge rule
+    // (Task has Task Status iff Resource is currently in Status ...).
+    // Populate the SM cell + the for-Resource cell instead so the
+    // bridge derives Task_has_Task_Status from them.
+    state = ast::cell_push("State_Machine_is_currently_in_Status",
+        ast::fact_from_pairs(&[("State Machine", "x1"), ("Status", "pending")]), &state);
+    state = ast::cell_push("State_Machine_is_for_Resource",
+        ast::fact_from_pairs(&[("State Machine", "x1"), ("Resource", "x1")]), &state);
+    state = map_put(state, "Task_has_Task_Priority", &[("Task", "x1"), ("Task Priority", "p0")]);
+
+    let s1: Vec<(&str, &Func)> = model.derivations.iter()
+        .filter(|d| !d.uses_negation)
+        .map(|d| (d.id.as_str(), &d.func)).collect();
+    let s2: Vec<(&str, &Func)> = model.derivations.iter()
+        .filter(|d| d.uses_negation)
+        .map(|d| (d.id.as_str(), &d.func)).collect();
+
+    let (post_s1, _) = if s1.is_empty() {
+        (state.clone(), Vec::new())
+    } else { crate::evaluate::forward_chain_defs_state(&s1, &state) };
+    let (post, _) = if s2.is_empty() {
+        (post_s1, Vec::new())
+    } else { crate::evaluate::forward_chain_defs_state(&s2, &post_s1) };
+
+    let rec_cell = ast::fetch_or_phi("Task_is_recommended", &post);
+    let recs: Vec<String> = match &rec_cell {
+        Object::Seq(items) => items.iter()
+            .filter_map(|f| ast::binding(f, "Task").map(String::from)).collect(),
+        Object::Map(m) => m.values()
+            .filter_map(|f| ast::binding(f, "Task").map(String::from)).collect(),
+        _ => Vec::new(),
+    };
+    let para_cell = ast::fetch_or_phi("Task_is_parallelizable", &post);
+    let read_cell = ast::fetch_or_phi("Task_has_Task_Readiness", &post);
+    let status_cell = ast::fetch_or_phi("Task_has_Task_Status", &post);
+    let s1_names: Vec<&str> = model.derivations.iter()
+        .filter(|d| !d.uses_negation).map(|d| d.id.as_str()).collect();
+    let s2_names: Vec<&str> = model.derivations.iter()
+        .filter(|d| d.uses_negation).map(|d| d.id.as_str()).collect();
+    let rule_texts: Vec<(String, bool, String)> = model.derivations.iter()
+        .map(|d| (d.id.clone(), d.uses_negation, d.text.clone())).collect();
+    assert!(recs.contains(&"x1".to_string()),
+        "Task 'x1' (Status=pending, Priority=p0, parallelizable, not \
+         epic) must be recommended after full apps/tasks readings load.\n\
+         recs={:?}\nparallelizable={:?}\nreadiness={:?}\nstatus={:?}\n\
+         s1 rules: {:?}\ns2 rules: {:?}\nall rules + uses_negation + text:\n{}",
+        recs, para_cell, read_cell, status_cell,
+        s1_names, s2_names,
+        rule_texts.iter().map(|(id, n, t)| format!("  [{}neg] {}: {}", if *n {"+"} else {"-"}, id, t)).collect::<Vec<_>>().join("\n"));
+}
+
+// ─── #927 — production-scale Map-backed antecedents repro attempt
+//
+// The 3-task Map test above passes. apps/tasks has 700+ Tasks and
+// Task_is_recommended stays empty even though ~17 tasks satisfy all
+// four antecedents. Push the same scenario to 50 ready+p0+
+// parallelizable+not-epic tasks plus 8 epics + 100 non-qualifying
+// tasks to see if scale (or specific count interaction with the
+// implicit-equi-join branch) triggers the bug.
+#[test]
+fn implicit_equi_join_materializes_at_production_scale() {
+    let src = r#"# task-927 scale repro
+Task(.id) is an entity type.
+Task Readiness is a value type.
+Task Priority is a value type.
+
+## Fact Types
+Task has Task Readiness.
+  Each Task has at most one Task Readiness.
+Task has Task Priority.
+  Each Task has at most one Task Priority.
+Task is parallelizable.
+Task is epic.
+Task is recommended.
+
+## Derivation Rules
+* Task is recommended iff Task has Task Readiness 'ready' and Task has Task Priority 'p0' and Task is parallelizable and Task is not epic.
+"#;
+    let (_rule, func) = parse_and_compile(src);
+
+    let mut state = Object::phi();
+    let map_put = |state: Object, cell: &str, pairs: &[(&str, &str)]| -> Object {
+        let fact = ast::fact_from_pairs(pairs);
+        ast::cell_put_keyed(cell, &["Task"], fact, &state).unwrap()
+    };
+
+    // 50 fully-qualifying p0 tasks (should all fire recommended).
+    let qualifying: Vec<String> = (0..50).map(|i| format!("q{}", i)).collect();
+    for t in &qualifying {
+        state = map_put(state, "Task_has_Task_Readiness", &[("Task", t.as_str()), ("Task Readiness", "ready")]);
+        state = map_put(state, "Task_has_Task_Priority",  &[("Task", t.as_str()), ("Task Priority", "p0")]);
+        state = ast::cell_push("Task_is_parallelizable", ast::fact_from_pairs(&[("Task", t.as_str())]), &state);
+    }
+
+    // 8 epic tasks (in epic cell, should NOT fire even if other antecedents match).
+    let epics: Vec<String> = (0..8).map(|i| format!("e{}", i)).collect();
+    for t in &epics {
+        state = map_put(state, "Task_has_Task_Readiness", &[("Task", t.as_str()), ("Task Readiness", "ready")]);
+        state = map_put(state, "Task_has_Task_Priority",  &[("Task", t.as_str()), ("Task Priority", "p0")]);
+        state = ast::cell_push("Task_is_parallelizable", ast::fact_from_pairs(&[("Task", t.as_str())]), &state);
+        // duplicate the epic entry ~3 times to mirror apps/tasks's 22-entry / 8-epic shape.
+        for _ in 0..3 {
+            state = ast::cell_push("Task_is_epic", ast::fact_from_pairs(&[("Task", t.as_str())]), &state);
+        }
+    }
+
+    // 100 non-qualifying tasks (have Readiness + Priority but NOT parallelizable).
+    let nonqual: Vec<String> = (0..100).map(|i| format!("n{}", i)).collect();
+    for t in &nonqual {
+        state = map_put(state, "Task_has_Task_Readiness", &[("Task", t.as_str()), ("Task Readiness", "ready")]);
+        state = map_put(state, "Task_has_Task_Priority",  &[("Task", t.as_str()), ("Task Priority", "p0")]);
+    }
+
+    let pop = ast::encode_state(&state);
+    let out = ast::apply(&func, &pop, &state);
+    let derived = decode_derived(&out);
+    let recommended_ids: std::collections::HashSet<String> = derived.iter()
+        .filter(|(ft, _, _)| ft == "Task_is_recommended")
+        .flat_map(|(_, _, bs)| bs.iter().filter(|(k, _)| k == "Task").map(|(_, v)| v.clone()))
+        .collect();
+
+    // All 50 qualifying tasks should fire. None of the 8 epics or
+    // 100 non-qualifying should fire.
+    assert_eq!(recommended_ids.len(), 50,
+        "expected exactly 50 recommended (the qualifying set); got {} \
+         ids: {:?}. Derived total: {}",
+        recommended_ids.len(), recommended_ids, derived.len());
+    for t in &qualifying {
+        assert!(recommended_ids.contains(t),
+            "qualifying task {} must be recommended; got {:?}", t, recommended_ids);
+    }
+    for t in &epics {
+        assert!(!recommended_ids.contains(t),
+            "epic task {} must NOT be recommended; got {:?}", t, recommended_ids);
+    }
+    for t in &nonqual {
+        assert!(!recommended_ids.contains(t),
+            "non-parallelizable task {} must NOT be recommended; got {:?}",
+            t, recommended_ids);
+    }
+}
+
 // ─── #922 — apply-path: stratum-2 rule whose POSITIVE antecedent reads
 // another stratum-2 rule's consequent.
 //
