@@ -4223,11 +4223,12 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     ]);
                     Func::compose(guard.clone(), pair_for_k)
                 }).collect();
-                let combined_absence: Func = if per_guard_checks.len() == 1 {
-                    per_guard_checks.into_iter().next().unwrap()
-                } else {
-                    Func::compose(Func::And, Func::construction(per_guard_checks))
-                };
+                // Func::And only handles 2-element tuples (returns
+                // Bottom on 3+ elements per ast.rs:2416). For N≥3
+                // absences, reduce pairwise: And(And(c1, c2), c3) …
+                let combined_absence: Func = per_guard_checks.into_iter()
+                    .reduce(|a, b| Func::compose(Func::And, Func::construction(vec![a, b])))
+                    .unwrap_or_else(|| Func::constant(Object::t()));
                 let cons_roles = data.fact_types.get(&consequent_id)
                     .map(|ft| ft.roles.clone())
                     .unwrap_or_default();

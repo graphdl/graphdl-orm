@@ -2955,6 +2955,76 @@ Task is recommended.
         recs, ast::fetch_or_phi("Task_is_parallelizable", &post));
 }
 
+// ─── #927 follow-up — apps/tasks-shaped parallelizable with 4
+// antecedents (1 positive + 3 absence). Live Task_is_parallelizable
+// stays empty after apply on Task 927 despite all conditions
+// satisfied: Task 927 has Readiness=ready, not in file-conflicting,
+// not in preceded, not in epic. Reproduce in isolation to isolate
+// whether the 4-antecedent shape compiles correctly.
+#[test]
+fn parallelizable_with_three_absence_antecedents() {
+    let src = r#"# task-927 4-antecedent parallelizable repro
+Task(.id) is an entity type.
+Task Readiness is a value type.
+
+## Fact Types
+Task has Task Readiness.
+  Each Task has at most one Task Readiness.
+Task is file-conflicting.
+Task is preceded.
+Task is epic.
+Task is parallelizable.
+
+## Derivation Rules
+* Task is parallelizable iff Task has Task Readiness 'ready' and Task is not file-conflicting and Task is not preceded and Task is not epic.
+"#;
+    let state_initial = parse_to_state(src).expect("parse");
+    let model = compile::compile(&state_initial);
+
+    let mut state = state_initial.clone();
+    // Task 'a': ready + nothing else → should be parallelizable.
+    state = ast::cell_put_keyed("Task_has_Task_Readiness", &["Task"],
+        ast::fact_from_pairs(&[("Task", "a"), ("Task Readiness", "ready")]),
+        &state).unwrap();
+    // Task 'b': ready + epic → should NOT be parallelizable.
+    state = ast::cell_put_keyed("Task_has_Task_Readiness", &["Task"],
+        ast::fact_from_pairs(&[("Task", "b"), ("Task Readiness", "ready")]),
+        &state).unwrap();
+    state = ast::cell_push("Task_is_epic",
+        ast::fact_from_pairs(&[("Task", "b")]), &state);
+
+    let s1: Vec<(&str, &Func)> = model.derivations.iter()
+        .filter(|d| !d.uses_negation)
+        .map(|d| (d.id.as_str(), &d.func)).collect();
+    let s2: Vec<(&str, &Func)> = model.derivations.iter()
+        .filter(|d| d.uses_negation)
+        .map(|d| (d.id.as_str(), &d.func)).collect();
+    let (post_s1, _) = if s1.is_empty() {
+        (state.clone(), Vec::new())
+    } else { crate::evaluate::forward_chain_defs_state(&s1, &state) };
+    let (post, _) = if s2.is_empty() {
+        (post_s1.clone(), Vec::new())
+    } else { crate::evaluate::forward_chain_defs_state(&s2, &post_s1) };
+
+    let para_cell = ast::fetch_or_phi("Task_is_parallelizable", &post);
+    let para_ids: Vec<String> = match &para_cell {
+        Object::Seq(items) => items.iter()
+            .filter_map(|f| ast::binding(f, "Task").map(String::from)).collect(),
+        Object::Map(m) => m.values()
+            .filter_map(|f| ast::binding(f, "Task").map(String::from)).collect(),
+        _ => Vec::new(),
+    };
+    assert!(para_ids.contains(&"a".to_string()),
+        "Task 'a' (ready + not in any absence cell) must be parallelizable. \
+         Got: {:?}\nreadiness={:?}\nepic={:?}\nparallelizable cell raw: {:?}",
+        para_ids,
+        ast::fetch_or_phi("Task_has_Task_Readiness", &post),
+        ast::fetch_or_phi("Task_is_epic", &post),
+        para_cell);
+    assert!(!para_ids.contains(&"b".to_string()),
+        "Task 'b' (in epic) must NOT be parallelizable. Got: {:?}", para_ids);
+}
+
 // ─── #927 — Map-backed Readiness/Priority + derived parallelizable
 //
 // The Seq-backed test above passes. Adds UCs on Readiness/Priority
