@@ -43,7 +43,7 @@ Deontic Predicate Operator Negated is a value type.
 Non Canonical Negation Hint is a value type.
   The possible values of Non Canonical Negation Hint are ' does not ', ' do not ', ' did not ', ' cannot ', ' can not ', ' must not ', ' will not ', ' would not ', ' never ', ' no longer '.
 Derivation Marker is a value type.
-  The possible values of Derivation Marker are 'fully-derived', 'derived-and-stored', 'semi-derived'.
+  The possible values of Derivation Marker are 'derived-and-stored', 'fully-derived', 'semi-derived'.
 Derivation Marker Symbol is a value type.
   The possible values of Derivation Marker Symbol are '**', '*', '+'.
 Role Position is a value type.
