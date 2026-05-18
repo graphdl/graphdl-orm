@@ -798,15 +798,37 @@ fn fact_key(f: &DerivedFact) -> FactKey {
 /// O(N) pass replaces the K × O(N) linear scans the filter would
 /// otherwise make via `state_contains_fact`. Borrows &str out of the
 /// population — no String allocation per key.
+///
+/// task-927 follow-up: a non-atom binding value (e.g. `Seq([])` which
+/// is `Object::phi()`) is normalized to the canonical "φ" string for
+/// hashing — matching the way chain rules emit vacuous bindings as
+/// `Atom("φ")`. Without this, existing facts with `<Resource, Seq([])>`
+/// produce keys that omit Resource entirely while the matching
+/// candidate `<Resource, Atom("φ")>` includes "φ", so dedup misses,
+/// cell_put_keyed detects a UC collision, drops, and the chain re-fires
+/// the same rule next round — infinite UC-conflict loop until the LFP
+/// cap. Mirrors Object::phi()'s Display rendering at ast.rs:521.
 pub(crate) fn state_keys(state: &ast::Object) -> HashSet<FactKey> {
     let mut set: HashSet<FactKey> = HashSet::new();
     for (cell_name, cell_contents) in ast::cells_iter(state) {
-        let Some(facts) = cell_contents.as_seq() else { continue };
-        for f in facts.iter() {
+        let facts: alloc::vec::Vec<&ast::Object> =
+            ast::cell_facts_iter(cell_contents).collect();
+        for f in facts {
             let Some(pairs) = f.as_seq() else { continue };
-            let mut kv: Vec<(&str, &str)> = pairs.iter().filter_map(|pair| {
+            let mut kv: alloc::vec::Vec<(&str, &str)> = pairs.iter().filter_map(|pair| {
                 let items = pair.as_seq()?;
-                Some((items.get(0)?.as_atom()?, items.get(1)?.as_atom()?))
+                let key = items.get(0)?.as_atom()?;
+                let val = match items.get(1) {
+                    Some(v) => match v.as_atom() {
+                        Some(a) => a,
+                        None => match v {
+                            ast::Object::Seq(s) if s.is_empty() => "φ",
+                            _ => "",
+                        },
+                    },
+                    None => "",
+                };
+                Some((key, val))
             }).collect();
             kv.sort();
             let mut h = fnv_mix(FNV_OFFSET, cell_name.as_bytes());
