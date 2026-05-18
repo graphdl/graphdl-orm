@@ -2329,14 +2329,16 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
             // O(1) on Object::Map, O(n) scan on Object::Seq.
             //
             // task-930: if the cell has a registered view rule
-            // (def `view:{name}`), evaluate it lazily and return the
+            // (def `view:{name}`) in the def-state d, evaluate it
+            // lazily against the population (items[1]) and return the
             // derived facts. Falls through to stored cell read when no
-            // view exists. The view check is a single fetch on the
-            // def-state — O(1) on Map d, dirt-cheap when no views are
-            // declared (the common case).
+            // view exists. View defs live in `d` (the engine state);
+            // the population state items[1] is what the view evaluates
+            // OVER, so we look up the def in d but apply against the
+            // population.
             match x.as_seq() {
                 Some(items) if items.len() == 2 => match items[0].as_atom() {
-                    Some(name) => match resolve_view(name, &items[1]) {
+                    Some(name) => match resolve_view(name, &items[1], d) {
                         Some(view_result) => view_result,
                         None => fetch_or_phi(name, &items[1]),
                     },
@@ -2352,7 +2354,7 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
             match x.as_seq() {
                 Some(items) if items.len() == 2 => {
                     match items[0].as_atom() {
-                        Some(name) => match resolve_view(name, &items[1]) {
+                        Some(name) => match resolve_view(name, &items[1], d) {
                             Some(view_result) => view_result,
                             None => fetch(name, &items[1]),
                         },
@@ -4466,15 +4468,20 @@ pub fn cell_facts_iter(contents: &Object) -> alloc::boxed::Box<dyn Iterator<Item
 /// bindings list `[[[role, value], …], …]`. We unwrap here so
 /// downstream Fetch consumers (other rule funcs, query/get/sql) see
 /// the same shape they get from a stored cell.
-fn resolve_view(cell_name: &str, d: &Object) -> Option<Object> {
+fn resolve_view(cell_name: &str, pop: &Object, defs: &Object) -> Option<Object> {
     let def_key = alloc::format!("view:{}", cell_name);
-    let stored = fetch_raw(&def_key, d);
+    let stored = fetch_raw(&def_key, defs);
     if matches!(stored, Object::Bottom) {
         return None;
     }
-    let func = metacompose(&stored, d);
-    let pop = encode_state(d);
-    let wrapped = apply(&func, &pop, d);
+    let func = metacompose(&stored, defs);
+    // The view's func is a derivation func — it expects an encoded
+    // population. The caller's `pop` IS that population (the second
+    // operand of Func::Fetch); encode it the same way the forward
+    // chain does so derivation funcs see the shape they were
+    // compiled against.
+    let encoded_pop = encode_state(pop);
+    let wrapped = apply(&func, &encoded_pop, defs);
     // Unwrap [ft_id, reading, bindings] envelopes → just the bindings.
     let unwrapped: alloc::vec::Vec<Object> = wrapped.as_seq()
         .map(|items| items.iter()
