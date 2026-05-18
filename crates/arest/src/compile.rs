@@ -2971,6 +2971,30 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
         if needs_resolve {
             crate::parse_forml2::re_resolve_rules(&mut rules, &nouns, &fact_types);
         }
+        // task-930: honor Halpin's derivation-mode marker on FTs.
+        // `Fact Type X has Derivation Mode 'fully-derived'` (from the
+        // `*` suffix on FT declarations) maps each rule whose
+        // consequent FT carries that marker to View. `derived-and-stored`
+        // (`**`) and `semi-derived` (`+`) stay Stored.
+        //
+        // FT reading text → mode lookup, built from general_instance_facts.
+        // For each rule: read its consequent_cell literal id, find the FT
+        // entry whose id matches, get its reading text, look up the mode.
+        let mode_by_ft_reading: hashbrown::HashMap<String, String> = general_instance_facts.iter()
+            .filter(|gif| gif.subject_noun == "Fact Type" && gif.field_name == "Derivation Mode")
+            .map(|gif| (gif.subject_value.clone(), gif.object_value.clone()))
+            .collect();
+        for rule in rules.iter_mut() {
+            let consequent_id = rule.consequent_cell.literal_id();
+            if consequent_id.is_empty() { continue; }
+            let Some(ft) = fact_types.get(consequent_id) else { continue };
+            if let Some(mode) = mode_by_ft_reading.get(&ft.reading) {
+                rule.materialization = match mode.as_str() {
+                    "fully-derived" => crate::types::MaterializationPolicy::View,
+                    _ => crate::types::MaterializationPolicy::Stored,
+                };
+            }
+        }
         rules
     };
 

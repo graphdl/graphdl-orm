@@ -3241,11 +3241,12 @@ Origin 'o1' has Hue 'red'.
 }
 
 // ─── task-930 — view rule materializes lazily on read.
-// Marks `Bar has Color iff Source has Hue and ...` as a view. The
-// chain doesn't run it (compile_to_defs_state filters Stored-only
-// for derivation cells). Reading the consequent cell via Func::Fetch
-// triggers resolve_view, which evaluates the view's func against
-// the current state and returns the derived facts.
+// Marks `Bar has Color` FT as fully derived (`*` suffix per Halpin
+// ORM2). The chain doesn't run the rule (compile_to_defs_state
+// filters Stored-only for derivation cells); reading the consequent
+// cell via Func::Fetch triggers resolve_view, which evaluates the
+// view's func against the current state and returns the derived
+// facts.
 #[test]
 fn view_materialization_computes_lazily_on_read() {
     let src = r#"# task-930 view repro
@@ -3256,10 +3257,10 @@ Color is a value type.
 
 ## Fact Types
 Source has Hue.
-Bar has Color.
+Bar has Color. *
 
 ## Derivation Rules
-* Bar has Color is a view iff Source has Hue and Bar is Source and Color is Hue.
+* Bar has Color iff Source has Hue and Bar is Source and Color is Hue.
 
 ## Instance Facts
 Source 'src1' has Hue 'red'.
@@ -3267,10 +3268,10 @@ Source 'src1' has Hue 'red'.
     let state = parse_to_state(src).expect("parse");
     let data = compile::cell_index_from_state(&state);
 
-    // The rule itself must be flagged as View.
+    // The rule itself must be flagged as View (consequent FT marked `*`).
     let bar_color_rule = data.derivation_rules.iter()
         .find(|r| r.text.starts_with("Bar has Color iff"))
-        .expect("rule must compile (marker stripped from text)");
+        .expect("rule must compile");
     assert!(matches!(bar_color_rule.materialization,
         crate::types::MaterializationPolicy::View),
         "View marker not detected; got materialization={:?}",
