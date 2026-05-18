@@ -3282,11 +3282,16 @@ Source 'src1' has Hue 'red'.
     let defs = compile::compile_to_defs_state(&state);
     let d = ast::defs_to_state(&defs, &state);
 
-    // Sanity: no `derivation:` entry for the view rule.
+    // task-930 v1: views also emit `derivation:` defs so the chain
+    // can materialize them — extract_facts_from_pop reads cells via
+    // direct Selector on the encoded pop, not Func::Fetch, so the
+    // chain only sees populated cells. Until that's reworked, view
+    // marker is a documentation + read-side opt-in (resolve_view
+    // fires via Func::Fetch); chain behavior matches Stored.
     let derivation_def = ast::fetch_raw(
         &format!("derivation:{}", bar_color_rule.id), &d);
-    assert!(matches!(derivation_def, ast::Object::Bottom),
-        "View rule must NOT emit derivation: def; got {:?}", derivation_def);
+    assert!(!matches!(derivation_def, ast::Object::Bottom),
+        "View rule must emit derivation: def too (v1 behavior)");
 
     // Sanity: view def IS present.
     let view_def = ast::fetch_raw("view:Bar_has_Color", &d);

@@ -1565,16 +1565,22 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // rules. Without that, the AbsenceOf guard fires in round 1
     // before its negative-dependency cell has been populated, and
     // the consequent fires for entries that should be filtered out.
-    // task-930: split Stored vs View materialization at def emission.
-    // Stored rules emit under `derivation:{id}` (or `derivation_strat2:{id}`
-    // for negation-guarded) so the forward chain runs them eagerly per
-    // apply. View rules emit under `view:{cell_name}` so the read-side
-    // (Func::Fetch / Func::FetchOrPhi) can evaluate them lazily on demand
-    // — chain skips them entirely. Default policy is Stored; existing
-    // readings without explicit `is a view iff` keep eager materialization.
+    // task-930: emit every derivation under `derivation:{id}` (or
+    // `derivation_strat2:{id}` for negation-guarded) so the forward
+    // chain runs them. View rules ADDITIONALLY emit `view:{cell_name}`
+    // so the read-side resolve_view (Func::Fetch / Func::FetchOrPhi)
+    // can evaluate them lazily.
+    //
+    // V1 caveat: emitting views to `derivation:` means they're still
+    // materialized eagerly per apply (the chain runs them). The
+    // perf-incremental story — chain skips views, reads compute them
+    // — needs extract_facts_from_pop or the encoded-pop builder to
+    // be view-aware, since chain rules read antecedent cells via
+    // direct Selector on the encoded pop, not via Func::Fetch. Until
+    // that lands, marking a rule as a View is a documentation
+    // signal + a read-side opt-in (resolve_view fires when called
+    // via Func::Fetch); chain behavior is the same as Stored.
     defs.extend(model.derivations.iter()
-        .filter(|d| matches!(d.materialization,
-            crate::types::MaterializationPolicy::Stored))
         .map(|d| {
             let prefix = if d.uses_negation { "derivation_strat2" } else { "derivation" };
             (format!("{}:{}", prefix, d.id), d.func.clone())
