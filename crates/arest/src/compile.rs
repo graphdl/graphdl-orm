@@ -1565,11 +1565,13 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // rules. Without that, the AbsenceOf guard fires in round 1
     // before its negative-dependency cell has been populated, and
     // the consequent fires for entries that should be filtered out.
-    // task-930: skip View-materialization rules. View rules don't
-    // emit derivation def cells; the forward chain doesn't run them.
-    // Downstream consumers compute the consequent lazily on read.
-    // Default policy is Stored, so existing readings without explicit
-    // `is a view iff` keep the legacy materialize-eagerly behavior.
+    // task-930: split Stored vs View materialization at def emission.
+    // Stored rules emit under `derivation:{id}` (or `derivation_strat2:{id}`
+    // for negation-guarded) so the forward chain runs them eagerly per
+    // apply. View rules emit under `view:{cell_name}` so the read-side
+    // (Func::Fetch / Func::FetchOrPhi) can evaluate them lazily on demand
+    // — chain skips them entirely. Default policy is Stored; existing
+    // readings without explicit `is a view iff` keep eager materialization.
     defs.extend(model.derivations.iter()
         .filter(|d| matches!(d.materialization,
             crate::types::MaterializationPolicy::Stored))
@@ -1577,6 +1579,11 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             let prefix = if d.uses_negation { "derivation_strat2" } else { "derivation" };
             (format!("{}:{}", prefix, d.id), d.func.clone())
         }));
+    defs.extend(model.derivations.iter()
+        .filter(|d| matches!(d.materialization,
+            crate::types::MaterializationPolicy::View))
+        .filter(|d| !d.consequent_cell.is_empty())
+        .map(|d| (format!("view:{}", d.consequent_cell), d.func.clone())));
 
     // task-814-stratify-3plus: emit per-rule dependency metadata as
     // `derivation_meta:<rule_id>` sidecar defs so the runtime

@@ -2327,9 +2327,19 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
         Func::FetchOrPhi => {
             // fetch_or_phi:<name, D> → fetch with phi fallback for absent.
             // O(1) on Object::Map, O(n) scan on Object::Seq.
+            //
+            // task-930: if the cell has a registered view rule
+            // (def `view:{name}`), evaluate it lazily and return the
+            // derived facts. Falls through to stored cell read when no
+            // view exists. The view check is a single fetch on the
+            // def-state — O(1) on Map d, dirt-cheap when no views are
+            // declared (the common case).
             match x.as_seq() {
                 Some(items) if items.len() == 2 => match items[0].as_atom() {
-                    Some(name) => fetch_or_phi(name, &items[1]),
+                    Some(name) => match resolve_view(name, &items[1]) {
+                        Some(view_result) => view_result,
+                        None => fetch_or_phi(name, &items[1]),
+                    },
                     None => Object::Bottom,
                 },
                 _ => Object::Bottom,
@@ -2338,10 +2348,14 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
 
         Func::Fetch => {
             // fetch:<name, D> → contents of cell named name in D
+            // task-930: same view-resolution as FetchOrPhi above.
             match x.as_seq() {
                 Some(items) if items.len() == 2 => {
                     match items[0].as_atom() {
-                        Some(name) => fetch(name, &items[1]),
+                        Some(name) => match resolve_view(name, &items[1]) {
+                            Some(view_result) => view_result,
+                            None => fetch(name, &items[1]),
+                        },
                         None => Object::Bottom,
                     }
                 }
@@ -4418,6 +4432,47 @@ pub fn cell_facts_iter(contents: &Object) -> alloc::boxed::Box<dyn Iterator<Item
         Object::Map(m) => alloc::boxed::Box::new(m.values()),
         _ => alloc::boxed::Box::new(core::iter::empty()),
     }
+}
+
+/// task-930: read-side eval of a view rule. Returns Some(facts) when
+/// the cell has a registered view def (`view:{cell_name}`), None
+/// otherwise (so the caller falls through to the legacy stored-cell
+/// fetch).
+///
+/// Performance: a single `fetch_raw` on the def-state. When no views
+/// are declared the lookup misses cheaply (one HashMap probe on Map
+/// d, or one O(n) scan on Seq d but n is small for def-only state).
+/// When a view is declared the cost is `apply(view_func, …)` —
+/// equivalent to one chain step but only paid when the cell is
+/// actually read.
+///
+/// Shape conversion: derivation funcs emit the "wrapped derived fact"
+/// envelope `[ft_id, reading, [[role, value], …]]` because that's
+/// what the forward chain consumes. Cell storage is the unwrapped
+/// bindings list `[[[role, value], …], …]`. We unwrap here so
+/// downstream Fetch consumers (other rule funcs, query/get/sql) see
+/// the same shape they get from a stored cell.
+fn resolve_view(cell_name: &str, d: &Object) -> Option<Object> {
+    let def_key = alloc::format!("view:{}", cell_name);
+    let stored = fetch_raw(&def_key, d);
+    if matches!(stored, Object::Bottom) {
+        return None;
+    }
+    let func = metacompose(&stored, d);
+    let pop = encode_state(d);
+    let wrapped = apply(&func, &pop, d);
+    // Unwrap [ft_id, reading, bindings] envelopes → just the bindings.
+    let unwrapped: alloc::vec::Vec<Object> = wrapped.as_seq()
+        .map(|items| items.iter()
+            .filter_map(|item| {
+                let env = item.as_seq()?;
+                if env.len() >= 3 {
+                    Some(env[2].clone())
+                } else { None }
+            })
+            .collect())
+        .unwrap_or_default();
+    Some(Object::seq(unwrapped))
 }
 
 /// Count facts in a cell regardless of storage shape. Convenience

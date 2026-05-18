@@ -3144,6 +3144,19 @@ Source 'src1' has Hue 'red'.
         })
         .collect();
 
+    // Diagnostic: dump the rule shape so we can compare with the live
+    // bridge that fails. The cross-noun clauses (`Bar is Source`,
+    // `Color is Hue`) should appear somewhere in the rule structure.
+    let data = compile::cell_index_from_state(&state);
+    for rule in &data.derivation_rules {
+        if rule.text.starts_with("Bar has Color iff") {
+            eprintln!("[probe-synth] rule {} kind={:?} join_on={:?} match_on={:?} consequent_bindings={:?}",
+                rule.id, rule.kind, rule.join_on, rule.match_on, rule.consequent_bindings);
+            eprintln!("[probe-synth] antecedent_sources: {:?}", rule.antecedent_sources);
+            eprintln!("[probe-synth] antecedent_role_literals: {:?}", rule.antecedent_role_literals);
+        }
+    }
+
     assert_eq!(bar_colors, vec![("src1".to_string(), "red".to_string())],
         "Bridge rule with cross-noun unification must derive Bar='src1' \
          Color='red' from Source 'src1' has Hue 'red'. Got: {:?}", derived);
@@ -3225,6 +3238,199 @@ Origin 'o1' has Hue 'red'.
          derived upstream Source has Hue.\n\
          Source_has_Hue intermediate: {:?}\nBar_has_Color cell raw: {:?}",
         source_hue_cell, bar_color_cell);
+}
+
+// ─── task-930 — view rule materializes lazily on read.
+// Marks `Bar has Color iff Source has Hue and ...` as a view. The
+// chain doesn't run it (compile_to_defs_state filters Stored-only
+// for derivation cells). Reading the consequent cell via Func::Fetch
+// triggers resolve_view, which evaluates the view's func against
+// the current state and returns the derived facts.
+#[test]
+fn view_materialization_computes_lazily_on_read() {
+    let src = r#"# task-930 view repro
+Source(.id) is an entity type.
+Bar(.id) is an entity type.
+Hue is a value type.
+Color is a value type.
+
+## Fact Types
+Source has Hue.
+Bar has Color.
+
+## Derivation Rules
+* Bar has Color is a view iff Source has Hue and Bar is Source and Color is Hue.
+
+## Instance Facts
+Source 'src1' has Hue 'red'.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let data = compile::cell_index_from_state(&state);
+
+    // The rule itself must be flagged as View.
+    let bar_color_rule = data.derivation_rules.iter()
+        .find(|r| r.text.starts_with("Bar has Color iff"))
+        .expect("rule must compile (marker stripped from text)");
+    assert!(matches!(bar_color_rule.materialization,
+        crate::types::MaterializationPolicy::View),
+        "View marker not detected; got materialization={:?}",
+        bar_color_rule.materialization);
+
+    // Build the full def-state — view def gets emitted under
+    // `view:Bar_has_Color` and Func::Fetch should pick it up.
+    let defs = compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+
+    // Sanity: no `derivation:` entry for the view rule.
+    let derivation_def = ast::fetch_raw(
+        &format!("derivation:{}", bar_color_rule.id), &d);
+    assert!(matches!(derivation_def, ast::Object::Bottom),
+        "View rule must NOT emit derivation: def; got {:?}", derivation_def);
+
+    // Sanity: view def IS present.
+    let view_def = ast::fetch_raw("view:Bar_has_Color", &d);
+    assert!(!matches!(view_def, ast::Object::Bottom),
+        "View def missing for Bar_has_Color");
+
+    // Read the cell through Func::Fetch — should trigger lazy view eval
+    // and return derived facts even though nothing materialized them.
+    let fetch_input = Object::seq(vec![
+        Object::atom("Bar_has_Color"),
+        d.clone(),
+    ]);
+    let result = ast::apply(&ast::Func::Fetch, &fetch_input, &d);
+    let bar_colors: Vec<(String, String)> = match &result {
+        Object::Seq(items) => items.iter().filter_map(|f| {
+            let bar = ast::binding(f, "Bar").map(String::from)?;
+            let color = ast::binding(f, "Color").map(String::from)?;
+            Some((bar, color))
+        }).collect(),
+        _ => Vec::new(),
+    };
+    assert_eq!(bar_colors, vec![("src1".to_string(), "red".to_string())],
+        "View must compute on Func::Fetch read. Got: {:?}", result);
+}
+
+// ─── #924 — cross-noun unification with `that .../some...` quantifier.
+// Hypothesis: the live bridge `Task has Task Status iff that Resource
+// is currently in some Status and Task Status is Status and Task is
+// Resource` fails because the `that .../some...` form changes how the
+// compiler captures the cross-noun clauses. Test with the quantifier
+// to isolate.
+#[test]
+fn cross_noun_unification_with_that_some_quantifier() {
+    let src = r#"# task-924 quantifier repro
+Source(.id) is an entity type.
+Bar(.id) is an entity type.
+Hue is a value type.
+Color is a value type.
+
+## Fact Types
+Source has Hue.
+Bar has Color.
+
+## Derivation Rules
+* Bar has Color iff that Source has some Hue and Bar is Source and Color is Hue.
+
+## Instance Facts
+Source 'src1' has Hue 'red'.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let model = compile::compile(&state);
+    let bar_color_func = model.derivations.iter()
+        .find(|d| d.text.starts_with("Bar has Color iff"))
+        .map(|d| d.func.clone())
+        .expect("bridge rule must compile");
+
+    let pop = ast::encode_state(&state);
+    let out = ast::apply(&bar_color_func, &pop, &state);
+    let derived = decode_derived(&out);
+    let bar_colors: Vec<(String, String)> = derived.iter()
+        .filter(|(ft, _, _)| ft == "Bar_has_Color")
+        .filter_map(|(_, _, bs)| {
+            let bar = bs.iter().find(|(k, _)| k == "Bar").map(|(_, v)| v.clone())?;
+            let color = bs.iter().find(|(k, _)| k == "Color").map(|(_, v)| v.clone())?;
+            Some((bar, color))
+        })
+        .collect();
+
+    let data = compile::cell_index_from_state(&state);
+    for rule in &data.derivation_rules {
+        if rule.text.starts_with("Bar has Color iff") {
+            eprintln!("[probe-quant] rule {} kind={:?} join_on={:?} match_on={:?} consequent_bindings={:?}",
+                rule.id, rule.kind, rule.join_on, rule.match_on, rule.consequent_bindings);
+            eprintln!("[probe-quant] antecedent_sources: {:?}", rule.antecedent_sources);
+            eprintln!("[probe-quant] antecedent_role_literals: {:?}", rule.antecedent_role_literals);
+        }
+    }
+
+    assert_eq!(bar_colors, vec![("src1".to_string(), "red".to_string())],
+        "Bridge with `that .../some...` quantifier must derive Bar='src1' Color='red'. \
+         Got: {:?}", derived);
+}
+
+// ─── #924 — cross-noun unification + MAP-backed upstream. Mirrors the
+// live apps/tasks bridge `Task has Task Status iff Resource is
+// currently in Status and Task Status is Status and Task is Resource`
+// shape: cross-noun unification (Task<->Resource, Task Status<->Status)
+// AND the upstream cell is Map-backed (per cell_put_keyed emit path).
+//
+// The prior cross-noun unification tests (stored + derived antecedent)
+// use Seq cells throughout. This test pins what live apps/tasks
+// actually fails on: bridge func reads Map cell, emits nothing.
+#[test]
+fn cross_noun_unification_with_map_backed_upstream() {
+    let src = r#"# task-924 map+cross-noun repro
+Source(.id) is an entity type.
+Bar(.id) is an entity type.
+Hue is a value type.
+Color is a value type.
+
+## Fact Types
+Source has Hue.
+  Each Source has at most one Hue.
+Bar has Color.
+  Each Bar has at most one Color.
+
+## Derivation Rules
+* Bar has Color iff Source has Hue and Bar is Source and Color is Hue.
+"#;
+    let state_initial = parse_to_state(src).expect("parse");
+    let model = compile::compile(&state_initial);
+    let bar_color_func = model.derivations.iter()
+        .find(|d| d.text.starts_with("Bar has Color iff"))
+        .map(|d| d.func.clone())
+        .expect("bridge rule must compile");
+
+    // Build upstream via cell_put_keyed so Source_has_Hue lands as Map
+    // (same shape live forward-chain produces when the FT has a UC).
+    let mut state = state_initial.clone();
+    state = ast::cell_put_keyed(
+        "Source_has_Hue", &["Source"],
+        ast::fact_from_pairs(&[("Source", "src1"), ("Hue", "red")]),
+        &state,
+    ).unwrap();
+    // Sanity: cell is Map.
+    let sh_cell = ast::fetch("Source_has_Hue", &state);
+    assert!(matches!(sh_cell, Object::Map(_)),
+        "test fixture: Source_has_Hue must be Map, got {:?}", sh_cell);
+
+    let pop = ast::encode_state(&state);
+    let out = ast::apply(&bar_color_func, &pop, &state);
+    let derived = decode_derived(&out);
+    let bar_colors: Vec<(String, String)> = derived.iter()
+        .filter(|(ft, _, _)| ft == "Bar_has_Color")
+        .filter_map(|(_, _, bs)| {
+            let bar = bs.iter().find(|(k, _)| k == "Bar").map(|(_, v)| v.clone())?;
+            let color = bs.iter().find(|(k, _)| k == "Color").map(|(_, v)| v.clone())?;
+            Some((bar, color))
+        })
+        .collect();
+
+    assert_eq!(bar_colors, vec![("src1".to_string(), "red".to_string())],
+        "Bridge rule with cross-noun unification + Map-backed upstream must \
+         derive Bar='src1' Color='red'. Got derived: {:?}\n\
+         Source_has_Hue cell: {:?}", derived, sh_cell);
 }
 
 // ─── #927 — apps/tasks readings: which derivation rules SURVIVE
@@ -3328,11 +3534,27 @@ fn apps_tasks_readings_all_derivation_rules_survive_compile() {
 // regression guard without blocking CI until the bridge's
 // variable-unification bug is fixed (separate task — needs
 // resolve_derivation_rule investigation in parse_forml2.rs).
-#[ignore = "#927: bridge derivation's variable unification emits empty bindings; reproduces live-state bug"]
+#[ignore = "#924/#927: bridge 2 (Task has Task Status iff ...) returns Bottom on live shape — separate from Map/Seq duality; see probe output"]
 #[test]
 fn implicit_equi_join_with_actual_apps_tasks_readings() {
-    let src = include_str!("../../../../apps/tasks/readings/app.md");
-    let state_initial = parse_to_state(src).expect("parse apps/tasks readings");
+    // Mirror cli/entry.rs compile-load: fold metamodel + readings via
+    // parse_to_state_from + merge_states. Without metamodel context the
+    // bridge rules' antecedents fail to resolve (kind stays ModusPonens
+    // with empty antecedent_sources, producing empty-binding emits).
+    let app_md = include_str!("../../../../apps/tasks/readings/app.md");
+    let user_readings: Vec<(&str, &str)> = vec![("app.md", app_md)];
+    let all_readings: Vec<(&str, &str)> = crate::metamodel_readings().into_iter()
+        .map(|r| (r.0, r.1))
+        .chain(user_readings.iter().copied())
+        .collect();
+    let state_initial = all_readings.iter().fold(
+        Object::phi(),
+        |merged, (_name, text)| {
+            let this = crate::parse_forml2::parse_to_state_from(text, &merged)
+                .expect("parse reading");
+            ast::merge_states(&merged, &this)
+        },
+    );
     let model = compile::compile(&state_initial);
 
     // Build a minimal qualifying state: one Task that satisfies
@@ -3362,7 +3584,7 @@ fn implicit_equi_join_with_actual_apps_tasks_readings() {
         (state.clone(), Vec::new())
     } else { crate::evaluate::forward_chain_defs_state(&s1, &state) };
     let (post, _) = if s2.is_empty() {
-        (post_s1, Vec::new())
+        (post_s1.clone(), Vec::new())
     } else { crate::evaluate::forward_chain_defs_state(&s2, &post_s1) };
 
     let rec_cell = ast::fetch_or_phi("Task_is_recommended", &post);
@@ -3376,6 +3598,33 @@ fn implicit_equi_join_with_actual_apps_tasks_readings() {
     let para_cell = ast::fetch_or_phi("Task_is_parallelizable", &post);
     let read_cell = ast::fetch_or_phi("Task_has_Task_Readiness", &post);
     let status_cell = ast::fetch_or_phi("Task_has_Task_Status", &post);
+    let resource_cell = ast::fetch_or_phi("Resource_is_currently_in_Status", &post_s1);
+    let sm_status_cell = ast::fetch_or_phi("State_Machine_is_currently_in_Status", &post);
+    let sm_resource_cell = ast::fetch_or_phi("State_Machine_is_for_Resource", &post);
+    eprintln!("[probe] State_Machine_is_currently_in_Status post-chain: {:?}", sm_status_cell);
+    eprintln!("[probe] State_Machine_is_for_Resource post-chain: {:?}", sm_resource_cell);
+    eprintln!("[probe] Resource_is_currently_in_Status post-chain: {:?}", resource_cell);
+    eprintln!("[probe] Task_has_Task_Status post-chain: {:?}", status_cell);
+    // Direct apply of the bridge func against post_s1 state.
+    let bridge_func = model.derivations.iter()
+        .find(|d| d.text.starts_with("Task has Task Status iff"))
+        .map(|d| d.func.clone())
+        .expect("bridge rule must exist");
+    let post_s1_pop = ast::encode_state(&post_s1);
+    let bridge_out = ast::apply(&bridge_func, &post_s1_pop, &post_s1);
+    eprintln!("[probe] direct bridge apply output: {:?}", bridge_out);
+    // Probe: rule kind classification for the two bridges
+    let data_for_probe = crate::compile::cell_index_from_state(&state_initial);
+    for rule in &data_for_probe.derivation_rules {
+        if rule.text.starts_with("Resource is currently in Status iff")
+            || rule.text.starts_with("Task has Task Status iff")
+        {
+            eprintln!("[probe] rule {} text: {}", rule.id, rule.text);
+            eprintln!("[probe]   kind={:?} join_on={:?} match_on={:?} consequent_bindings={:?}",
+                rule.kind, rule.join_on, rule.match_on, rule.consequent_bindings);
+            eprintln!("[probe]   antecedent_sources: {:?}", rule.antecedent_sources);
+        }
+    }
     let s1_names: Vec<&str> = model.derivations.iter()
         .filter(|d| !d.uses_negation).map(|d| d.id.as_str()).collect();
     let s2_names: Vec<&str> = model.derivations.iter()
