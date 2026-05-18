@@ -717,12 +717,29 @@ pub fn main_entry() {
                 // had nothing to emit. Don't drop prior content for
                 // these (an empty-readings recompile should preserve
                 // prior schema for re-validation, not wipe it).
-                let parsed_cell_names: hashbrown::HashSet<String> =
+                let mut parsed_cell_names: hashbrown::HashSet<String> =
                     ast::cells_iter(&parsed_fresh).into_iter()
                         .filter(|(_, c)| c.as_seq().map(|s| !s.is_empty()).unwrap_or(false)
                             || c.as_map().map(|m| !m.is_empty()).unwrap_or(false))
                         .map(|(name, _)| name.to_string())
                         .collect();
+                // Exclude FT cells from the drop set: they're named
+                // after FactType ids, and readings can pre-populate them
+                // (instance facts like `Task '916' has Task Priority 'p1'`
+                // fan out into Task_has_Task_Priority). Dropping the prior
+                // would wipe apply-emitted entries. Schema cells (Noun,
+                // FactType, Role, Constraint, InstanceFact, EnumValues, …)
+                // are NOT FactType ids; they get dropped as intended.
+                // merge_states is identity-aware (id/name/ruleId keys),
+                // so when fresh-parse + prior overlap on an FT cell the
+                // dedupe handles it without losing either side.
+                let ft_ids: hashbrown::HashSet<String> = ast::fetch_or_phi("FactType", &parsed_fresh)
+                    .as_seq()
+                    .map(|facts| facts.iter()
+                        .filter_map(|f| ast::binding(f, "id").map(|s| s.to_string()))
+                        .collect())
+                    .unwrap_or_default();
+                parsed_cell_names.retain(|name| !ft_ids.contains(name));
                 let prior_population: ast::Object = {
                     let loaded = db::load_state(&conn);
                     let map: hashbrown::HashMap<String, ast::Object> =

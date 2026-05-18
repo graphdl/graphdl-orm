@@ -3025,6 +3025,99 @@ Task is parallelizable.
         "Task 'b' (in epic) must NOT be parallelizable. Got: {:?}", para_ids);
 }
 
+// ─── #927 follow-up — recommended-shape (3 positive + 1 absence)
+// chained behind parallelizable. Mirrors live apps/tasks: bridge →
+// readiness → parallelizable → recommended cascade. Parallelizable
+// fires (post the And-pairwise fix) but Task_is_recommended stays
+// empty live; this isolates whether recommended's compile path
+// breaks under chained-dependency on a derived antecedent.
+#[test]
+fn recommended_with_three_positive_plus_absence() {
+    let src = r#"# task-927 recommended-shape with parallelizable chain
+Task(.id) is an entity type.
+Task Readiness is a value type.
+Task Priority is a value type.
+
+## Fact Types
+Task has Task Readiness.
+  Each Task has at most one Task Readiness.
+Task has Task Priority.
+  Each Task has at most one Task Priority.
+Task is file-conflicting.
+Task is preceded.
+Task is parallelizable.
+Task is epic.
+Task is recommended.
+
+## Derivation Rules
+* Task is parallelizable iff Task has Task Readiness 'ready' and Task is not file-conflicting and Task is not preceded and Task is not epic.
+* Task is recommended iff Task has Task Readiness 'ready' and Task has Task Priority 'p0' and Task is parallelizable and Task is not epic.
+"#;
+    let state_initial = parse_to_state(src).expect("parse");
+    let model = compile::compile(&state_initial);
+
+    let mut state = state_initial.clone();
+    let map_put = |state: Object, cell: &str, pairs: &[(&str, &str)]| -> Object {
+        ast::cell_put_keyed(cell, &["Task"], ast::fact_from_pairs(pairs), &state).unwrap()
+    };
+    // Task 'a': all 4 conditions satisfied for both parallelizable
+    // and recommended → should be recommended after the chain.
+    state = map_put(state, "Task_has_Task_Readiness", &[("Task", "a"), ("Task Readiness", "ready")]);
+    state = map_put(state, "Task_has_Task_Priority",  &[("Task", "a"), ("Task Priority", "p0")]);
+    // Task 'b': in epic → should NOT be recommended (and not parallelizable).
+    state = map_put(state, "Task_has_Task_Readiness", &[("Task", "b"), ("Task Readiness", "ready")]);
+    state = map_put(state, "Task_has_Task_Priority",  &[("Task", "b"), ("Task Priority", "p0")]);
+    state = ast::cell_push("Task_is_epic",
+        ast::fact_from_pairs(&[("Task", "b")]), &state);
+
+    // Use the CLI's actual chain: forward_chain_stratified_n
+    // (n-stratum topological negation chain) — mirrors live apps_compile.
+    let pos_rules: Vec<crate::evaluate::StratifiedRule> = model.derivations.iter()
+        .filter(|d| !d.uses_negation)
+        .map(|d| crate::evaluate::StratifiedRule {
+            id: d.id.as_str(),
+            func: &d.func,
+            consequent_cell: d.consequent_cell.as_str(),
+            consequent_role_literals: &d.consequent_role_literals,
+            negation_reads: &d.negation_reads,
+        })
+        .collect();
+    let neg_rules: Vec<crate::evaluate::StratifiedRule> = model.derivations.iter()
+        .filter(|d| d.uses_negation)
+        .map(|d| crate::evaluate::StratifiedRule {
+            id: d.id.as_str(),
+            func: &d.func,
+            consequent_cell: d.consequent_cell.as_str(),
+            consequent_role_literals: &d.consequent_role_literals,
+            negation_reads: &d.negation_reads,
+        })
+        .collect();
+    let (post, _) = crate::evaluate::forward_chain_stratified_n(
+        &pos_rules, &neg_rules, &state, 100);
+    let rec_cell = ast::fetch_or_phi("Task_is_recommended", &post);
+    let recs: Vec<String> = match &rec_cell {
+        Object::Seq(items) => items.iter()
+            .filter_map(|f| ast::binding(f, "Task").map(String::from)).collect(),
+        Object::Map(m) => m.values()
+            .filter_map(|f| ast::binding(f, "Task").map(String::from)).collect(),
+        _ => Vec::new(),
+    };
+
+    // Direct apply probe for diagnostic.
+    let rec_rule = model.derivations.iter()
+        .find(|d| d.text.starts_with("Task is recommended iff"))
+        .expect("rule must exist");
+    let pop = ast::encode_state(&post);
+    let direct = ast::apply(&rec_rule.func, &pop, &post);
+    eprintln!("[probe-rec] direct apply: {:?}", direct);
+
+    assert!(recs.contains(&"a".to_string()),
+        "Task 'a' (ready + p0 + parallelizable + not epic) must be \
+         recommended. Got: {:?}\nrec_cell raw: {:?}", recs, rec_cell);
+    assert!(!recs.contains(&"b".to_string()),
+        "Task 'b' (in epic) must NOT be recommended. Got: {:?}", recs);
+}
+
 // ─── #927 — Map-backed Readiness/Priority + derived parallelizable
 //
 // The Seq-backed test above passes. Adds UCs on Readiness/Priority
