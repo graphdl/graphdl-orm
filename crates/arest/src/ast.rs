@@ -3080,17 +3080,31 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
         None => {}
     }
 
-    // #913: drop the readings-derived rule-registry cells (DerivationRule)
-    // from the prior state before merging in the freshly parsed state.
-    // `cor:closure` preserves apply-written FT cells across recompile,
-    // but the rule registry is a pure function of the current readings
-    // — preserving stale rule entries causes the next compile to emit
-    // both the stale and current `derivation:rule_<id>` def cells, and
-    // forward chain fires both (consequent cell ends up with the UNION
-    // of historical rule firings). Mirrors the #836 "drop derived
-    // consequent cells before forward chain" fix at the rule-REGISTRY
-    // level.
-    let d_for_merge = drop_readings_derived_meta_cells(d);
+    // Drop SCHEMA cells (any cell name with non-empty contents in
+    // the fresh parse) from the prior state before merging. Schema
+    // cells are pure functions of the readings — preserving stale
+    // entries causes both old and new to coexist (the #913
+    // DerivationRule cascade failure; the post-#931 Derivation Mode
+    // InstanceFact stale-wins first-write cascade). User population
+    // cells (FT cells, SM cells — names NOT in the fresh parse) are
+    // preserved. Empty-cell guard: an empty-readings recompile
+    // shouldn't drop anything (otherwise `platform_compile("")`
+    // wipes the pre-loaded model and the MC-violation rejection
+    // never fires).
+    let parsed_cell_names: hashbrown::HashSet<&str> =
+        cells_iter(&parsed).into_iter()
+            .filter(|(_, c)| c.as_seq().map(|s| !s.is_empty()).unwrap_or(false)
+                || c.as_map().map(|m| !m.is_empty()).unwrap_or(false))
+            .map(|(name, _)| name)
+            .collect();
+    let d_for_merge = {
+        let mut map: HashMap<String, Object> = HashMap::new();
+        for (name, contents) in cells_iter(d).into_iter() {
+            if parsed_cell_names.contains(name) { continue; }
+            map.insert(name.to_string(), contents.clone());
+        }
+        Object::Map(map.into())
+    };
 
     // Merge: foldl(concat_cell, D, cells(parsed))
     let merged_state = merge_states(&d_for_merge, &parsed);
@@ -4510,59 +4524,14 @@ pub fn merge_states(target: &Object, source: &Object) -> Object {
     Object::Map(map.into())
 }
 
-/// Cells that are READINGS-DERIVED rule registries: every compile reads
-/// these from the current readings and rebuilds them from scratch. They
-/// MUST NOT survive `cor:closure` across recompile because the rule
-/// registry is a pure function of the current readings — preserving stale
-/// entries (e.g. an old rule body whose text hashed to a different `id`)
-/// causes downstream compile to emit a `derivation:rule_<stale_hash>` def
-/// cell alongside the current one, and forward-chain fires BOTH.
-///
-/// #913: editing a reading's derivation rule body produces a new
-/// `DerivationRule` fact with a new `id` (the FNV hash of the rule
-/// text). `concat_dedup` keys identity on `id`, so the prior rule
-/// survives the merge — and downstream consequent cells end up with
-/// the UNION of historical rule firings instead of the current rule's
-/// firings.
-///
-/// Mirrors the #836 "drop derived consequent cells before forward
-/// chain" fix but at the rule-REGISTRY level. The #836 fix drops the
-/// FT cells that DERIVATION RULES write into; this drops the rule
-/// REGISTRY itself so the rule set is rebuilt from current readings
-/// each recompile.
-///
-/// Constraint, Subtype, EnumValues, UnresolvedClause, Role, FactType,
-/// Noun, InstanceFact are similarly readings-derived BUT they don't
-/// produce the same forward-chain-fires-twice symptom — they're
-/// consumed by compile_to_defs_state to build typed defs that then
-/// run, and the parse re-emits the full set each call so the union
-/// degenerate case only manifests when the IDENTITY KEY changes
-/// across edits (DerivationRule's content-hashed `id` is the only one
-/// in this category that triggers on a rule body edit). Adding
-/// other meta cells to this list is reserved for follow-up tasks
-/// (Constraint identity is `id` which is content-hashed similarly —
-/// likely a sibling bug; track separately when an acceptance test
-/// surfaces it).
-pub const READINGS_DERIVED_META_CELLS: &[&str] = &[
-    "DerivationRule",
-];
-
-/// Drop readings-derived rule-registry cells from `state` so the next
-/// merge_states + compile_to_defs_state rebuilds them from current
-/// readings.
-///
-/// #913: call this on the prior state before re-merging parsed
-/// readings into it. Without this step, `concat_dedup` keeps both the
-/// stale and current rule entries — both fire on forward chain and
-/// consequent cells end up with the UNION of historical rule firings.
-pub fn drop_readings_derived_meta_cells(state: &Object) -> Object {
-    let mut map: HashMap<String, Object> = HashMap::new();
-    for (name, contents) in cells_iter(state).into_iter() {
-        if READINGS_DERIVED_META_CELLS.contains(&name) { continue; }
-        map.insert(name.to_string(), contents.clone());
-    }
-    Object::Map(map.into())
-}
+// READINGS_DERIVED_META_CELLS / drop_readings_derived_meta_cells were
+// removed. They were the hardcoded list of cells the parser emits to
+// (originally just DerivationRule per #913, but FactType / Noun /
+// Constraint / InstanceFact / etc. were silently in the same boat).
+// Callers (platform_compile, cli/entry.rs) now compute the schema-cell
+// set structurally: parse the readings fresh into a state and the cell
+// names in THAT state are exactly the readings-derived cells. Prior
+// state's cells matching those names get dropped before merge.
 
 /// Concatenate two sequences and drop duplicates, identity-aware.
 /// Preserves first-occurrence order. When two facts share an identity

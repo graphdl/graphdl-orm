@@ -665,62 +665,87 @@ pub fn main_entry() {
                 eprintln!("[load] opt-in (App, Generator) pairs: {:?}", opt_in_pairs);
                 eprintln!("[load] generators (set view): {:?}", opted_generators);
 
-                // Fold all readings (metamodel + user) into Object state.
-                // Each reading parses to its own state; consecutive states
-                // merge via cell concatenation. No Domain struct.
+                // Fold readings (metamodel + user) into Object state.
                 //
-                // Closure Under Self-Modification (AREST.tex Corollary 6 +
-                // Migration Remark, #831 / cor:closure): compile is a
-                // SYSTEM application that PRESERVES P. Seed the fold
-                // from existing DB state (population FT cells stripped
-                // of `:` def cells, since defs get regenerated below by
-                // `compile_to_defs_state`). Apply-written facts that
-                // aren't in readings survive across recompile via
-                // `merge_states`'s identity-aware concat_dedup. Mirrors
-                // `platform_compile`'s `merge_states(d, &parsed)` at
-                // ast.rs:2683.
+                // Closure Under Self-Modification (AREST.tex Corollary 6
+                // + Migration Remark, #831 / cor:closure): compile
+                // preserves P. The split:
+                //   - SCHEMA cells (Noun, FactType, Role, Constraint,
+                //     DerivationRule, EnumValues, InstanceFact, Subtype,
+                //     RefScheme, …) are PURE FUNCTIONS of the readings —
+                //     parse-emitted, never apply-emitted. They get
+                //     rebuilt every compile, so we drop prior copies
+                //     before the fold.
+                //   - User POPULATION cells (FT cells like
+                //     Task_has_Task_Subject, SM cells like
+                //     State_Machine_is_currently_in_Status) collect both
+                //     apply-emitted entries and chain-derived entries.
+                //     These survive recompile.
                 //
-                // #913: ALSO strip `DerivationRule` (and any other cells
-                // in `READINGS_DERIVED_META_CELLS`). The rule registry is
-                // a pure function of the current readings; preserving
-                // stale rule entries across recompile causes
-                // `compile_to_defs_state` to emit `derivation:rule_<id>`
-                // def cells for BOTH the stale rule (whose text hashed
-                // to one id) AND the current rule (whose edited text
-                // hashes to a different id) — forward chain then fires
-                // both and the consequent cell ends up with the UNION of
-                // historical rule firings. Filter is `name.contains(':')`
-                // OR `READINGS_DERIVED_META_CELLS.contains(&name)`.
-                let prior_population: ast::Object = {
-                    let loaded = db::load_state(&conn);
-                    let map: hashbrown::HashMap<String, ast::Object> =
-                        ast::cells_iter(&loaded).into_iter()
-                            .filter(|(name, _)| !name.contains(':')
-                                && !ast::READINGS_DERIVED_META_CELLS.contains(name))
-                            .map(|(name, contents)| (name.to_string(), contents.clone()))
-                            .collect();
-                    ast::Object::map(map)
-                };
-                let prior_cell_count = ast::cells_iter(&prior_population).len();
-                if prior_cell_count > 0 {
-                    eprintln!("[load] preserving {} cells from existing DB \
-                              (Closure Under Self-Modification, cor:closure)",
-                              prior_cell_count);
-                }
+                // Identification is structural: parse all readings into
+                // a fresh state (no prior seed), then any cell name in
+                // that parsed state IS readings-derived. Prior cells
+                // matching those names get dropped from the preserve
+                // set; prior cells NOT matching survive. The earlier
+                // `READINGS_DERIVED_META_CELLS` hardcoded list (just
+                // "DerivationRule") was a band-aid for this same
+                // problem — leaving the rest of the schema cells
+                // accumulating stale entries (e.g. the post-#931
+                // Derivation Mode InstanceFact migration: prior
+                // 'derived-and-stored' values stuck around alongside
+                // the corrected 'fully-derived', and index_single's
+                // first-wins picked the stale one).
                 parse_forml2::set_bootstrap_mode(true);
                 parse_forml2::set_strict_mode(strict);
                 let all_readings: Vec<(&str, &str)> = crate::metamodel_readings().into_iter()
                     .map(|r| (r.0, r.1))
                     .chain(readings.iter().map(|(n, t)| (n.as_str(), t.as_str())))
                     .collect();
-                let state = all_readings.iter().fold(
-                    prior_population,
+                // Pass 1: parse fresh to discover which cell names are
+                // readings-derived. This is the structural authority
+                // for "what does the parser write?" — no hardcoded list.
+                let parsed_fresh = all_readings.iter().fold(
+                    ast::Object::phi(),
                     |merged, (name, text)| {
                         let this = parse_forml2::parse_to_state_from(text, &merged)
                             .unwrap_or_else(|e| { eprintln!("{}: {}", name, e); std::process::exit(1); });
                         ast::merge_states(&merged, &this)
                     },
                 );
+                // Empty-cell guard: a cell present-but-empty in the
+                // fresh parse means the parser tagged the name but
+                // had nothing to emit. Don't drop prior content for
+                // these (an empty-readings recompile should preserve
+                // prior schema for re-validation, not wipe it).
+                let parsed_cell_names: hashbrown::HashSet<String> =
+                    ast::cells_iter(&parsed_fresh).into_iter()
+                        .filter(|(_, c)| c.as_seq().map(|s| !s.is_empty()).unwrap_or(false)
+                            || c.as_map().map(|m| !m.is_empty()).unwrap_or(false))
+                        .map(|(name, _)| name.to_string())
+                        .collect();
+                let prior_population: ast::Object = {
+                    let loaded = db::load_state(&conn);
+                    let map: hashbrown::HashMap<String, ast::Object> =
+                        ast::cells_iter(&loaded).into_iter()
+                            .filter(|(name, _)| !name.contains(':')
+                                && !parsed_cell_names.contains(*name))
+                            .map(|(name, contents)| (name.to_string(), contents.clone()))
+                            .collect();
+                    ast::Object::map(map)
+                };
+                let prior_cell_count = ast::cells_iter(&prior_population).len();
+                if prior_cell_count > 0 {
+                    eprintln!("[load] preserving {} user-population cells from existing DB \
+                              (Closure Under Self-Modification, cor:closure)",
+                              prior_cell_count);
+                }
+                // Pass 2 (effective): the merged result is parsed_fresh
+                // (clean schema) layered on prior_population (durable
+                // user FT/SM cells). merge_states is identity-aware so
+                // overlap on FT cells (parser emits some entries via
+                // InstanceFact → chain-derive, but FT cells themselves
+                // aren't parser-emitted) doesn't lose user data.
+                let state = ast::merge_states(&prior_population, &parsed_fresh);
                 parse_forml2::set_bootstrap_mode(false);
                 parse_forml2::set_strict_mode(false);
 
