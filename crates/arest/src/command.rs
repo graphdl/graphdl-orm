@@ -2006,7 +2006,25 @@ fn update_via_defs(
         let has_sm = ast::fetch(&format!("machine:{}", noun), d) != ast::Object::Bottom;
         if has_sm {
             let status_field = format!("{} Status", noun);
-            if new_fields.contains_key(&status_field) {
+            // Local-task #2 — MCP merge-pre-fetch (#868/#872) folds
+            // the entity's current SM Status into every UpdateEntity
+            // payload so untouched fields aren't retracted. The pre-
+            // fix guard rejected any payload that even *named* Status,
+            // breaking edits to non-Status fields (e.g. Task Priority).
+            // Refining to "Status value differs from extract_sm_status"
+            // keeps the SM-mutation refusal (acceptance #1) intact —
+            // attempting `Task Status: in_progress` while the SM still
+            // says `pending` is still rejected — but lets a no-op echo
+            // of the current Status through, so the merged payload
+            // flows.
+            let mutates_status = match new_fields.get(&status_field) {
+                Some(new_val) => {
+                    extract_sm_status(state, entity_id).as_deref()
+                        != Some(new_val.as_str())
+                }
+                None => false,
+            };
+            if mutates_status {
                 let violation = crate::types::Violation {
                     constraint_id: format!("sm:{}:status_immutable", noun),
                     constraint_text: format!(
@@ -5115,6 +5133,132 @@ Transition 'start' is defined in State Machine Definition 'Task'.
              got violation {:?}",
             guard_violation,
         );
+    }
+
+    /// Local-task #2: the MCP server's merge-pre-fetch (#868/#872)
+    /// folds the existing SM-driven Status into every UpdateEntity
+    /// payload so untouched fields don't get retracted. When the user
+    /// only intended to edit a non-Status field (e.g. Task Priority),
+    /// the merged payload still names `Task Status` with the entity's
+    /// *current* SM value. The pre-fix engine guard at
+    /// `update_via_defs` keys solely off `new_fields.contains_key(&
+    /// status_field)`, so it rejects the entire update even though
+    /// Status is byte-identical to the SM cell.
+    ///
+    /// The guard's purpose (task-861 / #904) is to refuse direct
+    /// mutation of the SM-driven status — a no-op overwrite is not
+    /// a mutation, so it must not trip the guard. The fix: only
+    /// reject when the payload's `{noun} Status` value differs from
+    /// `extract_sm_status(state, entity_id)`. The "actually mutating
+    /// Status" case (acceptance #1 above) and the `force: true`
+    /// opt-out (acceptance #2) remain covered.
+    #[test]
+    fn apply_update_non_status_field_on_sm_noun_does_not_trip_status_guard() {
+        // Reuse the task-861 SM fixture and add a non-SM-governed
+        // priority FT so the payload has *something* legitimate to
+        // change alongside the merged-in Status echo.
+        let meta_state = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let readings = r#"
+# Tasks
+
+## Entity Types
+
+Task(.id) is an entity type.
+
+## Fact Types
+
+Task has Task Status.
+Task has Task Priority.
+
+## Instance Facts
+
+State Machine Definition 'Task' is for Noun 'Task'.
+Status 'pending' is initial in State Machine Definition 'Task'.
+"#;
+        let tasks_state = crate::parse_forml2::parse_to_state_with_nouns(readings, &meta_state).unwrap();
+        let merged = ast::merge_states(&meta_state, &tasks_state);
+        let defs = crate::compile::compile_to_defs_state(&merged);
+        let def_map = ast::defs_to_state(&defs, &merged);
+
+        // Seed Task t-1: SM cell says pending; user-facing
+        // Task_has_Task_Priority says p2 (the field the user wants
+        // to edit). No Task_has_Task_Status entry — that role is
+        // purely SM-driven on this schema. Use the canonical
+        // `State_Machine_is_currently_in_Status` cell shape so
+        // `extract_sm_status` actually picks it up — see
+        // `StateMachineCellShape::boot()`. (The pre-existing
+        // acceptance fixtures above push to a stale `StateMachine_
+        // has_currentlyInStatus` cell name; those tests still pass
+        // because the old guard didn't read SM state.)
+        let state = ast::cell_push(
+            "State_Machine_is_currently_in_Status",
+            ast::fact_from_pairs(&[
+                ("State Machine", "t-1"),
+                ("Status", "pending"),
+            ]),
+            &merged,
+        );
+        let state = ast::cell_push(
+            "Task_has_Task_Priority",
+            ast::fact_from_pairs(&[
+                ("Task", "t-1"),
+                ("Task Priority", "p2"),
+            ]),
+            &state,
+        );
+
+        // Mirror the MCP merge-pre-fetch payload shape exactly: the
+        // user's intent is `Task Priority: p0`, but the server
+        // folded in `Task Status: pending` (the entity's current SM
+        // value) so #868's per-field retract-then-insert doesn't
+        // drop Status as if it were retracted. Status value here
+        // equals what `extract_sm_status` returns for t-1 — this is
+        // a no-op for Status and a real change for Priority.
+        let mut fields = HashMap::new();
+        fields.insert("Task Status".to_string(), "pending".to_string());
+        fields.insert("Task Priority".to_string(), "p0".to_string());
+        let cmd = Command::UpdateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            entity_id: "t-1".to_string(),
+            fields,
+            sender: None,
+            signature: None,
+            force: false,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &state);
+
+        let sm_guard = result.violations.iter()
+            .find(|v| v.constraint_id == "sm:Task:status_immutable");
+        assert!(
+            sm_guard.is_none() && !result.rejected,
+            "update of a non-Status field must not trip sm:Task:status_immutable \
+             when the payload's Task Status equals the current SM status; \
+             rejected={}, violations={:?}",
+            result.rejected, result.violations,
+        );
+
+        // Priority edit lands in the merged entity row the caller
+        // sees (existing ∪ payload, payload wins) — that's the
+        // contract the MCP server's response surface depends on.
+        let prio_in_response = result.entities.first()
+            .and_then(|e| e.data.get("Task Priority").cloned());
+        assert_eq!(
+            prio_in_response.as_deref(), Some("p0"),
+            "Task Priority must reflect the edit in entities[0].data; \
+             got {:?}, full data={:?}",
+            prio_in_response, result.entities.first().map(|e| &e.data),
+        );
+
+        // SM status is byte-identical — the no-op Status echo did
+        // not flip the SM cell.
+        let sm_cell = ast::fetch_or_phi("State_Machine_is_currently_in_Status", &state);
+        let status = sm_cell.as_seq().unwrap().iter()
+            .find(|f| ast::binding_matches(f, "State Machine", "t-1"))
+            .and_then(|f| ast::binding(f, "Status"))
+            .unwrap();
+        assert_eq!(status, "pending",
+            "SM status must remain pending after a no-op Status echo");
     }
 
     /// task-861 acceptance #3: `apply transition noun=Task id=t-1
