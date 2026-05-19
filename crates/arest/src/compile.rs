@@ -182,6 +182,12 @@ fn derivation_dep_metadata(rule: &crate::types::DerivationRuleDef) -> (
     let consequent_cell = rule.consequent_cell.literal_id().to_string();
     let consequent_role_literals: Vec<(String, String)> = rule.consequent_role_literals.iter()
         .map(|crl| (crl.role.clone(), crl.value.clone())).collect();
+    // task-7 phase-1: AbsenceOf is deprecated. Parser-emitted rules
+    // never contain it post-2026-05-19, so negation_reads ends up
+    // empty for any new rule. The match below stays defensive for
+    // persisted DBs whose DerivationRule cell still has @absence:
+    // sentinels from before the parser change.
+    #[allow(deprecated)]
     let negation_reads: Vec<(String, Vec<(String, String)>)> = rule.antecedent_sources.iter().enumerate()
         .filter_map(|(idx, src)| {
             if let crate::types::AntecedentSource::AbsenceOf { fact_type, .. } = src {
@@ -3127,6 +3133,7 @@ fn compile_data_with_state(
     let derivation_positive_reads: HashMap<String, Vec<String>> = data.derivation_rules.iter()
         .filter(|r| !r.id.is_empty())
         .map(|r| {
+            #[allow(deprecated)]
             let reads: Vec<String> = r.antecedent_sources.iter()
                 .filter_map(|src| match src {
                     crate::types::AntecedentSource::FactType(id) => Some(id.clone()),
@@ -3908,6 +3915,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
         // Guard resolution — explicit AbsenceOf wins over implicit
         // consequent-based dedup, otherwise fall back to the latter
         // when the consequent FT declares the instance role.
+        #[allow(deprecated)]
         let absence_guard: Option<(String, usize)> = rule.antecedent_sources.get(1)
             .and_then(|s| match s {
                 crate::types::AntecedentSource::AbsenceOf { fact_type, role } => {
@@ -10405,6 +10413,7 @@ mod schema_tests {
     /// blocked (Task 2 blocks Task 1, Task 2 is pending), only Task 2
     /// gets `ready`; Task 1 gets `blocked`.
     #[test]
+    #[ignore = "task-7: AbsenceOf removed from parser 2026-05-19; test depends on `has no` clause parsing to AbsenceOf"]
     fn user_rule_with_has_no_clause_emits_absence_guarded_derivation() {
         let src = "\
             Task(.id) is an entity type.\n\

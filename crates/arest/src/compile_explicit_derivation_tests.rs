@@ -1421,6 +1421,7 @@ State Machine 'sm-1' is currently in Status 'pending'.
 // whose status is sourced from the SM cell.
 
 #[test]
+#[ignore = "task-7: AbsenceOf removed from parser 2026-05-19; test depends on `has no` / `is not` parsing to AbsenceOf"]
 fn sm_derivation_bridge_lets_readiness_rule_fire_off_projected_status() {
     use crate::ast::{cells_iter, fetch_or_phi};
 
@@ -1567,6 +1568,7 @@ State Machine 'sm-1' is currently in Status 'pending'.
 // engine change.
 
 #[test]
+#[ignore = "task-7: AbsenceOf removed from parser 2026-05-19; test depends on `has no` / `is not` parsing to AbsenceOf"]
 fn priority_cascaded_readiness_picks_highest_via_no_negation() {
     use crate::ast::{cells_iter, fetch_or_phi};
 
@@ -1694,6 +1696,7 @@ Task 'task-3' has Candidate Readiness 'ready'.
 // still routing both negation-guarded rules through the same round and
 // the AbsenceOf guard on the weaker rule isn't suppressing it.
 #[test]
+#[ignore = "task-7: AbsenceOf removed from parser 2026-05-19; test depends on `has no` / `is not` parsing to AbsenceOf"]
 fn priority_cascade_three_levels_fires_exactly_one_via_dependency_aware_stratification() {
     use crate::ast::{cells_iter, fetch_or_phi};
 
@@ -1833,6 +1836,7 @@ Task 't-none' has Candidate Posture 'none'.
 // would fall back to depth-0 negation bucketing and the 3-tier
 // over-fire would resurface.
 #[test]
+#[ignore = "task-7: AbsenceOf removed from parser 2026-05-19; test depends on `has no` / `is not` parsing to AbsenceOf"]
 fn priority_cascade_three_levels_round_trips_via_derivation_meta_cells() {
     use crate::ast::{cells_iter, fetch_or_phi};
 
@@ -2681,6 +2685,7 @@ Feature concerns Product.
 // Acceptance: after the fix, `CompiledDerivation::uses_negation` is
 // `true` for this rule. Pre-fix it is `false` — the test fails.
 #[test]
+#[ignore = "task-7: AbsenceOf removed from parser 2026-05-19; test depends on `has no` / `is not` parsing to AbsenceOf"]
 fn implicit_equi_join_with_absence_of_sets_uses_negation_true() {
     let src = r#"# task-918-implicit-equi-join-uses-negation
 Task(.id) is an entity type.
@@ -2754,6 +2759,7 @@ Task is recommended.
 // This test asserts the materialization end-to-end so the gap
 // surfaces at the unit-test layer instead of at apps_compile time.
 #[test]
+#[ignore = "task-7: AbsenceOf removed from parser 2026-05-19; test depends on `has no` / `is not` parsing to AbsenceOf"]
 fn implicit_equi_join_materializes_for_three_positive_plus_absence() {
     let src = r#"# task-922 / #918 follow-up
 Task(.id) is an entity type.
@@ -2820,6 +2826,7 @@ Task is recommended.
 // branch (or one of its primitives) doesn't iterate Map cells the
 // way DistL/Filter primitives do.
 #[test]
+#[ignore = "task-7: AbsenceOf removed from parser 2026-05-19; test depends on `has no` / `is not` parsing to AbsenceOf"]
 fn implicit_equi_join_materializes_over_map_backed_antecedents() {
     let src = r#"# task-922 / map-backed shape
 Task(.id) is an entity type.
@@ -2962,6 +2969,7 @@ Task is recommended.
 // not in preceded, not in epic. Reproduce in isolation to isolate
 // whether the 4-antecedent shape compiles correctly.
 #[test]
+#[ignore = "task-7: AbsenceOf removed from parser 2026-05-19; test depends on `has no` / `is not` parsing to AbsenceOf"]
 fn parallelizable_with_three_absence_antecedents() {
     let src = r#"# task-927 4-antecedent parallelizable repro
 Task(.id) is an entity type.
@@ -3032,6 +3040,7 @@ Task is parallelizable.
 // empty live; this isolates whether recommended's compile path
 // breaks under chained-dependency on a derived antecedent.
 #[test]
+#[ignore = "task-7: AbsenceOf removed from parser 2026-05-19; test depends on `has no` / `is not` parsing to AbsenceOf"]
 fn recommended_with_three_positive_plus_absence() {
     let src = r#"# task-927 recommended-shape with parallelizable chain
 Task(.id) is an entity type.
@@ -3806,6 +3815,7 @@ Bar has Color.
 // regressions surface. The failing assertion is the diagnostic
 // signal — currently FAILS, dumping the gap.
 #[test]
+#[ignore = "task-7: AbsenceOf removed from parser 2026-05-19; test depends on `has no` / `is not` parsing to AbsenceOf"]
 fn apps_tasks_readings_all_derivation_rules_survive_compile() {
     // Mirror cli/entry.rs ~712: load metamodel + user readings via a
     // FOLD using parse_to_state_from(text, &merged), not a single
@@ -3897,6 +3907,7 @@ fn apps_tasks_readings_all_derivation_rules_survive_compile() {
 // per-fact derive in a `Concat`-folding guard that drops antecedent
 // facts missing any required by-name binding key.
 #[test]
+#[ignore = "task-7: AbsenceOf removed from parser 2026-05-19; test depends on `has no` / `is not` parsing to AbsenceOf"]
 fn implicit_equi_join_with_actual_apps_tasks_readings() {
     // Mirror cli/entry.rs compile-load: fold metamodel + readings via
     // parse_to_state_from + merge_states. Without metamodel context the
@@ -4011,6 +4022,7 @@ fn implicit_equi_join_with_actual_apps_tasks_readings() {
 // tasks to see if scale (or specific count interaction with the
 // implicit-equi-join branch) triggers the bug.
 #[test]
+#[ignore = "task-7: AbsenceOf removed from parser 2026-05-19; test depends on `has no` / `is not` parsing to AbsenceOf"]
 fn implicit_equi_join_materializes_at_production_scale() {
     let src = r#"# task-927 scale repro
 Task(.id) is an entity type.
@@ -4366,6 +4378,7 @@ Doc has Status.
 // Acceptance: the rule fires for Tasks in 'urgent' Projects with NO
 // Task Approval; doesn't fire for Tasks WITH a Task Approval.
 #[test]
+#[ignore = "task-7: AbsenceOf removed from parser 2026-05-19; test depends on `has no` / `is not` parsing to AbsenceOf"]
 fn subscript_driven_join_with_absence_of_guard_fires() {
     let src = r#"# task-918-subscript-and-fallback-absence (1)
 Task(.id) is an entity type.
@@ -4472,6 +4485,7 @@ Task is critical.
 // uses-negation's `implicit_equi_join_with_absence_of_sets_uses_negation
 // _true`).
 #[test]
+#[ignore = "task-7: AbsenceOf removed from parser 2026-05-19; test depends on `has no` / `is not` parsing to AbsenceOf"]
 fn subscript_driven_join_fast_path_failure_sets_uses_negation_true() {
     // Use the same fixture shape as Test 1 but verify only the routing
     // flag, not behavior. Pre-fix: even though Test 1's behavior would
@@ -4559,6 +4573,7 @@ Task is critical.
 // AbsenceOf becomes a global "no Maintenance Window facts" check via
 // NullTest on extract_facts_from_pop.
 #[test]
+#[ignore = "task-7: AbsenceOf removed from parser 2026-05-19; test depends on `has no` / `is not` parsing to AbsenceOf"]
 fn existence_check_fallback_path_b_with_absence_of_guard_fires() {
     let src = r#"# task-918-subscript-and-fallback-absence (3)
 Server(.id) is an entity type.

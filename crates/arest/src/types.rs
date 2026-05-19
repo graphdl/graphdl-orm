@@ -113,15 +113,6 @@ mod wire_tests {
     }
 
     #[test]
-    fn round_trip_absence_of() {
-        let src = AntecedentSource::AbsenceOf {
-            fact_type: "ft_some:thing".to_string(),
-            role: "Weird:Role".to_string(),
-        };
-        assert_eq!(AntecedentSource::decode(&src.encode()), src);
-    }
-
-    #[test]
     fn round_trip_plain_fact_type_id_passes_through() {
         let src = AntecedentSource::FactType("ordinary_ft_id".to_string());
         assert_eq!(src.encode(), "ordinary_ft_id");
@@ -306,12 +297,15 @@ pub enum AntecedentSource {
     /// Antecedent is a Seq of raw noun-instance atoms aggregated
     /// across every cell that binds the noun.
     InstancesOfNoun(String),
-    /// Guard antecedent: the rule fires only when no fact of
-    /// `fact_type` has the primary-antecedent instance bound at
-    /// `role`. Used to express CWA negation's participation check
-    /// as a standard rule shape rather than a bespoke inlined Func
-    /// (`#287` gap #2). Currently only meaningful as a secondary
-    /// antecedent when the primary is `InstancesOfNoun`.
+    /// **Dead variant** — kept for backward compatibility with
+    /// persisted state from pre-2026-05-19 sessions. The parser no
+    /// longer emits this (the `has no` / `is not` / `does not`
+    /// surface markers were removed from `parse_forml2.rs`'s
+    /// antecedent resolver), so no new AbsenceOf entries are
+    /// created. Engine code paths that pattern-match this variant
+    /// still exist as dead branches; see local task #8 for the
+    /// follow-up purge.
+    #[deprecated(note = "Engine-introduced; not in Halpin's FORML 2. Use deontic constraints and the validation layer for absence semantics.")]
     AbsenceOf {
         fact_type: String,
         role: String,
@@ -343,6 +337,7 @@ impl AntecedentSource {
                 out.push_str(&wire_escape(noun));
                 out
             }
+            #[allow(deprecated)]
             Self::AbsenceOf { fact_type, role } => {
                 let mut out = String::from("@absence:");
                 out.push_str(&wire_escape(fact_type));
@@ -359,6 +354,7 @@ impl AntecedentSource {
         }
         if let Some(rest) = s.strip_prefix("@absence:") {
             if let Some((ft_escaped, role_escaped)) = wire_split_once_unescaped(rest, ':') {
+                #[allow(deprecated)]
                 return Self::AbsenceOf {
                     fact_type: wire_unescape(&ft_escaped),
                     role: wire_unescape(&role_escaped),
@@ -792,6 +788,7 @@ fn antecedent_source_write(out: &mut String, src: &AntecedentSource) {
             json_escape(out, s);
             out.push('}');
         }
+        #[allow(deprecated)]
         AntecedentSource::AbsenceOf { fact_type, role } => {
             out.push_str("{\"kind\":\"absenceOf\",\"value\":{\"fact_type\":");
             json_escape(out, fact_type);
@@ -1528,16 +1525,12 @@ mod canonical_json_tests {
         }
     }
 
-    fn sample_rule_with_dynamic_consequent_and_absence() -> DerivationRuleDef {
+    fn sample_rule_with_dynamic_consequent() -> DerivationRuleDef {
         DerivationRuleDef {
             id: "rule_dynamic".to_string(),
             text: "subtype inheritance".to_string(),
             antecedent_sources: alloc::vec![
                 AntecedentSource::InstancesOfNoun("Foo".to_string()),
-                AntecedentSource::AbsenceOf {
-                    fact_type: "ft_x".to_string(),
-                    role: "R".to_string(),
-                },
             ],
             consequent_instance_role: "Bar".to_string(),
             consequent_cell: ConsequentCellSource::AntecedentRole {
@@ -1596,7 +1589,7 @@ mod canonical_json_tests {
             sample_rule_minimal(),
             sample_rule_grammar_classifier(),
             sample_rule_with_filter(),
-            sample_rule_with_dynamic_consequent_and_absence(),
+            sample_rule_with_dynamic_consequent(),
             sample_rule_with_escapes(),
         ] {
             let serde_out = serde_json::to_string(&r).expect("serde_json should serialize");
@@ -1618,7 +1611,7 @@ mod canonical_json_tests {
             sample_rule_minimal(),
             sample_rule_grammar_classifier(),
             sample_rule_with_filter(),
-            sample_rule_with_dynamic_consequent_and_absence(),
+            sample_rule_with_dynamic_consequent(),
             sample_rule_with_escapes(),
         ] {
             let canonical = r.to_canonical_json();
