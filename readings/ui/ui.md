@@ -358,10 +358,18 @@ No View Renderer is for the same View on the same Platform more than once.
 
 ## Derivation Rules
 
-+ List Item has display- Text if List Item displays Resource and that Resource has Reference and display- Text is that Reference.
-+ List Item has display- Text if List Item displays Resource and that Resource has Value and that Resource has no Reference and display- Text is that Value.
-+ List Item has display-sub- Text if List Item displays Resource and that Resource has Reference and that Resource has Value and display-sub- Text is that Value.
-+ List Item has Display Status if List Item displays Resource and some State Machine is for that Resource and that State Machine is currently in some Status and Display Status is that Status.
+# Bot-introduced display-* derivations removed 2026-05-19. The FT
+# shapes themselves are fine — `List Item has display- Text` and the
+# sibling display-sub-Text / Display Status fields match the
+# IListItem-style abstraction MonoView (iFactr) and similar
+# cross-platform abstractions natively expose. What was wrong was
+# computing those values inside the schema's forward chain via
+# CWA-stratified negation (`Resource has no Reference`). The native
+# idiom for "prefer A, fall back to B" in abstract rendering is a
+# declarative binding chain on the UI element itself, not an
+# AbsenceOf-guarded derivation. Re-introduce the display-* FTs when
+# the binding-chain model is designed intentionally — the deletion
+# here is about removing the AbsenceOf, not the IListItem fields.
 
 ## Deontic Constraints
 
