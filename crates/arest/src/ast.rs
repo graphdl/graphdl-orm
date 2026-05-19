@@ -2336,11 +2336,32 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
             // the population state items[1] is what the view evaluates
             // OVER, so we look up the def in d but apply against the
             // population.
+            //
+            // task-930 v2: items[1] may be EITHER raw state (Map, or
+            // Seq of CELL_TAG 3-tuples) OR an already-encoded
+            // population (Seq of 2-tuples <ft_id, facts>) produced by
+            // `encode_state`. The chain's `extract_facts_from_pop`
+            // composes Func::FetchOrPhi over the encoded pop, so we
+            // need to:
+            //   1. First try a direct lookup against the encoded-pop
+            //      shape (the common chain path — most cells are
+            //      stored, and the entry already exists in the pop).
+            //   2. Then fall through to `resolve_view`, which knows
+            //      how to handle both shapes (it skips re-encoding
+            //      when given an already-encoded pop).
+            //   3. Finally fall back to legacy `fetch_or_phi`, which
+            //      handles raw state.
+            // The order matters: scanning the encoded pop is O(n) in
+            // pop-size but avoids a wasted view-resolution probe
+            // when the cell is already materialized.
             match x.as_seq() {
                 Some(items) if items.len() == 2 => match items[0].as_atom() {
-                    Some(name) => match resolve_view(name, &items[1], d) {
-                        Some(view_result) => view_result,
-                        None => fetch_or_phi(name, &items[1]),
+                    Some(name) => match encoded_pop_lookup(name, &items[1]) {
+                        Some(facts) => facts,
+                        None => match resolve_view(name, &items[1], d) {
+                            Some(view_result) => view_result,
+                            None => fetch_or_phi(name, &items[1]),
+                        },
                     },
                     None => Object::Bottom,
                 },
@@ -2351,12 +2372,16 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
         Func::Fetch => {
             // fetch:<name, D> → contents of cell named name in D
             // task-930: same view-resolution as FetchOrPhi above.
+            // task-930 v2: same encoded-pop awareness as FetchOrPhi.
             match x.as_seq() {
                 Some(items) if items.len() == 2 => {
                     match items[0].as_atom() {
-                        Some(name) => match resolve_view(name, &items[1], d) {
-                            Some(view_result) => view_result,
-                            None => fetch(name, &items[1]),
+                        Some(name) => match encoded_pop_lookup(name, &items[1]) {
+                            Some(facts) => facts,
+                            None => match resolve_view(name, &items[1], d) {
+                                Some(view_result) => view_result,
+                                None => fetch(name, &items[1]),
+                            },
                         },
                         None => Object::Bottom,
                     }
@@ -4450,6 +4475,67 @@ pub fn cell_facts_iter(contents: &Object) -> alloc::boxed::Box<dyn Iterator<Item
     }
 }
 
+/// task-930 v2: classify the `state` operand of `Func::Fetch` /
+/// `Func::FetchOrPhi`. Two shapes flow through these primitives:
+///
+///   * **Raw state** — `Object::Map` (the post-compile def-state, the
+///     hot path), or `Object::Seq` of `<CELL_TAG, name, contents>`
+///     3-tuples (the canonical "cells stored as a list" form).
+///   * **Encoded population** — `Object::Seq` of `<ft_id, facts>`
+///     2-tuples produced by `encode_state`. This is what the chain's
+///     `extract_facts_from_pop` reads against.
+///
+/// Returns `true` for the encoded-pop shape, `false` for raw state /
+/// unknown. Disambiguator: a non-empty Seq whose first item is a
+/// 2-tuple `<atom, _>` (no CELL_TAG, not a 3-tuple) is treated as
+/// already-encoded. Empty Seq, Map, and Seq-of-3-tuples-with-CELL_TAG
+/// are raw state. Used by `resolve_view` to skip re-encoding when the
+/// caller already supplied an encoded pop, and by `encoded_pop_lookup`
+/// for the direct-scan fast path.
+fn pop_is_encoded(state: &Object) -> bool {
+    let cells = match state.as_seq() {
+        Some(c) => c,
+        None => return false, // Map and other shapes: raw
+    };
+    let first = match cells.first() {
+        Some(f) => f,
+        None => return false, // empty Seq: treat as raw (encode_state is a no-op on empty)
+    };
+    let items = match first.as_seq() {
+        Some(i) => i,
+        None => return false,
+    };
+    // Encoded entry: <atom_ft_id, seq_of_facts>, length 2.
+    // Raw cell entry: <CELL_TAG, atom_name, contents>, length 3.
+    items.len() == 2 && items[0].as_atom().is_some()
+}
+
+/// task-930 v2: direct lookup of `name` in an already-encoded population.
+/// Returns Some(facts_seq) when the encoded pop has an entry for
+/// `name`, None otherwise (so the caller falls through to view
+/// resolution / raw fetch).
+///
+/// Mirrors the per-rule antecedent scan that `compile.rs`'s
+/// `extract_facts_from_pop` builds via Filter+Eq+Selector. Lifting it
+/// here lets `Func::Fetch` / `FetchOrPhi` serve the encoded-pop
+/// callers uniformly with the raw-state callers — the chain's
+/// extractor can compose Func::FetchOrPhi over the encoded pop and
+/// get the right entry without changing its shape.
+fn encoded_pop_lookup(name: &str, state: &Object) -> Option<Object> {
+    if !pop_is_encoded(state) {
+        return None;
+    }
+    let cells = state.as_seq()?;
+    cells.iter().find_map(|cell| {
+        let items = cell.as_seq()?;
+        if items.len() == 2 && items[0].as_atom() == Some(name) {
+            Some(items[1].clone())
+        } else {
+            None
+        }
+    })
+}
+
 /// task-930: read-side eval of a view rule. Returns Some(facts) when
 /// the cell has a registered view def (`view:{cell_name}`), None
 /// otherwise (so the caller falls through to the legacy stored-cell
@@ -4468,6 +4554,12 @@ pub fn cell_facts_iter(contents: &Object) -> alloc::boxed::Box<dyn Iterator<Item
 /// bindings list `[[[role, value], …], …]`. We unwrap here so
 /// downstream Fetch consumers (other rule funcs, query/get/sql) see
 /// the same shape they get from a stored cell.
+///
+/// task-930 v2: `pop` may be either raw state OR an already-encoded
+/// population (the chain's `extract_facts_from_pop` calls Func::Fetch
+/// with the encoded pop as items[1]). `pop_is_encoded` distinguishes,
+/// and we skip the `encode_state` step when already encoded so the
+/// view's derivation func sees the shape it was compiled against.
 fn resolve_view(cell_name: &str, pop: &Object, defs: &Object) -> Option<Object> {
     let def_key = alloc::format!("view:{}", cell_name);
     let stored = fetch_raw(&def_key, defs);
@@ -4476,12 +4568,19 @@ fn resolve_view(cell_name: &str, pop: &Object, defs: &Object) -> Option<Object> 
     }
     let func = metacompose(&stored, defs);
     // The view's func is a derivation func — it expects an encoded
-    // population. The caller's `pop` IS that population (the second
-    // operand of Func::Fetch); encode it the same way the forward
-    // chain does so derivation funcs see the shape they were
-    // compiled against.
-    let encoded_pop = encode_state(pop);
-    let wrapped = apply(&func, &encoded_pop, defs);
+    // population. If the caller already handed us an encoded pop
+    // (task-930 v2 — chain extractor composes Func::Fetch over the
+    // encoded pop), feed it through directly; otherwise encode the
+    // raw state the same way the forward chain does so derivation
+    // funcs see the shape they were compiled against.
+    let encoded_pop_owned;
+    let encoded_pop: &Object = if pop_is_encoded(pop) {
+        pop
+    } else {
+        encoded_pop_owned = encode_state(pop);
+        &encoded_pop_owned
+    };
+    let wrapped = apply(&func, encoded_pop, defs);
     // Unwrap [ft_id, reading, bindings] envelopes → just the bindings.
     let unwrapped: alloc::vec::Vec<Object> = wrapped.as_seq()
         .map(|items| items.iter()
