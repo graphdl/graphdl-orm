@@ -450,19 +450,33 @@ fn extract_facts_func(ft_id: &str) -> Func {
 
 /// Extract facts from a population Object directly (no eval context wrapper).
 /// Used by derivation compilers which receive population, not ctx.
+///
+/// task-930 v2: routes through `Func::FetchOrPhi` rather than an
+/// inline Filter+Eq+Selector dance over the encoded pop. The runtime
+/// primitive is now encoded-pop-aware (`encoded_pop_lookup`) AND
+/// view-aware (`resolve_view` falls through when the cell has a
+/// registered `view:{ft_id}` def). The order in `Func::FetchOrPhi`
+/// is:
+///   1. Direct lookup against the encoded pop (the common case —
+///      most antecedent cells are stored and already populated).
+///   2. View resolution via `view:{ft_id}` def in d (lazy
+///      materialization for View-marked rules whose consequent cell
+///      the chain didn't populate).
+///   3. `fetch_or_phi` for raw-state fallback (no-op here — the
+///      encoded pop won't match a raw cell lookup, so this returns
+///      phi as the legacy "ft not in pop" semantics).
+///
+/// So downstream rules whose antecedent is a View-marked FT see the
+/// view-derived bindings without the v1 emit-to-derivation:
+/// workaround.
 fn extract_facts_from_pop(ft_id: &str) -> Func {
-    let find_ft = Func::filter(
-        Func::compose(Func::Eq, Func::construction(vec![
-            Func::Selector(1),
+    Func::compose(
+        Func::FetchOrPhi,
+        Func::construction(vec![
             Func::constant(Object::atom(ft_id)),
-        ])),
-    );
-    let get_or_phi = Func::condition(
-        Func::NullTest,
-        Func::constant(Object::phi()),
-        Func::compose(Func::Selector(2), Func::Selector(1)),
-    );
-    Func::compose(get_or_phi, find_ft)
+            Func::Id,
+        ]),
+    )
 }
 
 /// Find all instances of a noun across all fact types in a population Object.
@@ -1565,22 +1579,26 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // rules. Without that, the AbsenceOf guard fires in round 1
     // before its negative-dependency cell has been populated, and
     // the consequent fires for entries that should be filtered out.
-    // task-930: emit every derivation under `derivation:{id}` (or
-    // `derivation_strat2:{id}` for negation-guarded) so the forward
-    // chain runs them. View rules ADDITIONALLY emit `view:{cell_name}`
-    // so the read-side resolve_view (Func::Fetch / Func::FetchOrPhi)
-    // can evaluate them lazily.
+    // task-930 v2: split Stored vs View materialization at def
+    // emission.
+    //   * Stored rules emit under `derivation:{id}` (or
+    //     `derivation_strat2:{id}` for negation-guarded) so the
+    //     forward chain runs them eagerly per apply.
+    //   * View rules emit under `view:{cell_name}` so the read-side
+    //     (Func::Fetch / Func::FetchOrPhi → resolve_view) can
+    //     evaluate them lazily on demand. The chain skips them
+    //     entirely — `extract_facts_from_pop` now composes
+    //     Func::FetchOrPhi, which consults the view def when the
+    //     antecedent cell isn't already in the encoded pop, so a
+    //     downstream rule whose antecedent is a `*`-marked FT sees
+    //     the view-derived bindings even though the chain didn't
+    //     materialize the cell.
     //
-    // V1 caveat: emitting views to `derivation:` means they're still
-    // materialized eagerly per apply (the chain runs them). The
-    // perf-incremental story — chain skips views, reads compute them
-    // — needs extract_facts_from_pop or the encoded-pop builder to
-    // be view-aware, since chain rules read antecedent cells via
-    // direct Selector on the encoded pop, not via Func::Fetch. Until
-    // that lands, marking a rule as a View is a documentation
-    // signal + a read-side opt-in (resolve_view fires when called
-    // via Func::Fetch); chain behavior is the same as Stored.
+    // Default policy is Stored; existing readings without explicit
+    // `is a view iff` keep eager materialization.
     defs.extend(model.derivations.iter()
+        .filter(|d| matches!(d.materialization,
+            crate::types::MaterializationPolicy::Stored))
         .map(|d| {
             let prefix = if d.uses_negation { "derivation_strat2" } else { "derivation" };
             (format!("{}:{}", prefix, d.id), d.func.clone())
@@ -3524,10 +3542,23 @@ fn compile_arith_expr(expr: &crate::types::ArithExpr, ft: &crate::types::FactTyp
     match expr {
         ArithExpr::Literal(v) => Func::constant(Object::atom(&format_numeric_atom(*v))),
         ArithExpr::RoleRef(name) => {
-            let idx = ft.roles.iter().find(|r| r.noun_name == *name)
-                .map(|r| r.role_index)
-                .unwrap_or(0);
-            role_value(idx)
+            // task-927: use name-based binding lookup instead of positional
+            // indexing when the FT declares the noun as a role. Derivation
+            // rules whose antecedent FT carries facts with variable shapes
+            // (e.g. derived cells where some entries have only a subset of
+            // bindings) cause positional `role_value` to return Bottom on
+            // the missing slot, which Object::seq then propagates as the
+            // whole apply_to_all output. `role_value_by_name` walks the
+            // binding pairs by key and returns the value when present;
+            // missing keys still surface as Bottom but the surrounding
+            // per-fact derivation guard collapses those via Concat.
+            // Falls back to positional `role_value(0)` for FTs that don't
+            // declare the noun (defensive: matches pre-task-927 IR shape).
+            if ft.roles.iter().any(|r| r.noun_name == *name) {
+                role_value_by_name(name)
+            } else {
+                role_value(0)
+            }
         }
         ArithExpr::Op(op, lhs, rhs) => {
             let l = compile_arith_expr(lhs, ft);
@@ -4094,7 +4125,124 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 consequent_reading_func.clone(),
                 bindings_func,
             ]);
-            Func::compose(Func::apply_to_all(derive_one), extract(0, ft_id))
+            // task-927: bridge rules whose antecedent FT cell carries
+            // mixed-shape facts (e.g. `Resource_is_currently_in_Status`
+            // populated both by the explicit join derivation AND by
+            // metamodel `Status 'X' is initial in ...` instance facts
+            // that translate into partial-binding entries with only the
+            // Status role) need each per-fact derive to be tolerant: a
+            // single Bottom from `role_value_by_name` over a missing
+            // binding propagates through `Object::seq`, collapsing the
+            // ENTIRE apply_to_all output to Bottom. Pre-task-927 the
+            // bridge's per-fact output was therefore Bottom on the very
+            // first ill-shaped antecedent fact, even when later facts
+            // would have derived cleanly. The Concat/Condition wrapper
+            // below converts each ill-shaped fact's per-fact output to
+            // `phi` (which `Func::Concat` collapses away) so well-shaped
+            // facts still flow through. Required bindings = every
+            // RoleRef target on `consequent_computed_bindings` PLUS every
+            // by-name fallback (the consequent noun itself when no CB
+            // pins that role). The predicate AND-folds key-presence
+            // tests over each required noun.
+            // Only the by-name lookup paths (CB RoleRef AND the literal-
+            // pin branch's name-based fallback at compile.rs:4096) need
+            // the per-fact guard. Pure inheritance (Func::Id, no CB, no
+            // literal pin) inherits antecedent bindings verbatim without
+            // any per-role lookup — its emitted facts may carry binding
+            // keys that don't match the consequent FT's role names (the
+            // antecedent's "Priority" flows through unchanged into a
+            // "Task_has_Escalation" cell, by design). Guarding on
+            // consequent-role presence on the antecedent would
+            // incorrectly drop those facts. Gate `required_keys`
+            // accordingly.
+            let uses_by_name_lookup = !rule.consequent_computed_bindings.is_empty()
+                || !rule.consequent_role_literals.is_empty();
+            let required_keys: Vec<String> = if !uses_by_name_lookup {
+                Vec::new()
+            } else {
+                let cons_ft_roles = data.fact_types.get(&consequent_id)
+                    .map(|ft| ft.roles.clone())
+                    .unwrap_or_default();
+                let mut keys: Vec<String> = Vec::new();
+                let push_unique = |k: String, v: &mut Vec<String>| {
+                    if !v.contains(&k) { v.push(k); }
+                };
+                for cb in rule.consequent_computed_bindings.iter() {
+                    if let crate::types::ArithExpr::RoleRef(name) = &cb.expr {
+                        push_unique(name.clone(), &mut keys);
+                    }
+                }
+                // Consequent roles in the literal-pin branch that aren't
+                // pinned to a literal fall back to name-based lookup
+                // (compile.rs:4096 path 3). Mirror that with a key
+                // requirement so missing-binding facts get dropped
+                // rather than Bottom-ing the whole apply_to_all output.
+                // Roles WITH a literal pin (consequent_role_literals) or
+                // a subscript projection (path 2) source their value
+                // independently from the antecedent's by-name slot, so
+                // they don't add a key requirement.
+                if !rule.consequent_role_literals.is_empty() {
+                    let ant_subs = antecedent_role_subscripts(rule, data);
+                    let cons_subs = consequent_role_subscripts(rule, &consequent_id, data);
+                    for (cons_role_idx, r) in cons_ft_roles.iter().enumerate() {
+                        let has_literal = rule.consequent_role_literals.iter()
+                            .any(|crl| crl.role == r.noun_name);
+                        if has_literal { continue; }
+                        let cons_sub = cons_subs.iter()
+                            .find(|(idx, _)| *idx == cons_role_idx)
+                            .map(|(_, s)| s.as_str())
+                            .filter(|s| !s.is_empty());
+                        let has_subscript_match = cons_sub.is_some()
+                            && ant_subs.first()
+                                .map(|ant0_subs| ant0_subs.iter().any(|(_, s)| Some(s.as_str()) == cons_sub))
+                                .unwrap_or(false);
+                        if has_subscript_match { continue; }
+                        push_unique(r.noun_name.clone(), &mut keys);
+                    }
+                }
+                keys
+            };
+            let per_fact = if required_keys.is_empty() {
+                // No required keys → no guard needed. Preserve byte-
+                // identical pre-task-927 output shape (the original
+                // `apply_to_all(derive_one)` over the raw extract).
+                Func::compose(Func::apply_to_all(derive_one), extract(0, ft_id))
+            } else {
+                // Build an AND of `has_binding(key)` predicates. A
+                // binding is present iff `role_value_by_name(key)` does
+                // NOT collapse to Bottom — there's no direct primitive
+                // for "is bottom", so instead we test that filtering the
+                // antecedent's binding-pairs by key yields a non-empty
+                // sequence (NullTest = T means empty → key absent →
+                // predicate F).
+                let has_binding = |name: &str| -> Func {
+                    let match_key = Func::compose(Func::Eq, Func::construction(vec![
+                        Func::Selector(1),
+                        Func::constant(Object::atom(name)),
+                    ]));
+                    // (Not . NullTest) . Filter(match_key) — empty
+                    // post-filter ⇒ NullTest:T ⇒ Not:F (key absent);
+                    // non-empty post-filter ⇒ NullTest:F ⇒ Not:T (key
+                    // present).
+                    Func::compose(
+                        Func::compose(Func::Not, Func::NullTest),
+                        Func::filter(match_key),
+                    )
+                };
+                let pred = required_keys.iter().map(|k| has_binding(k))
+                    .reduce(|a, b| Func::compose(Func::And, Func::construction(vec![a, b])))
+                    .unwrap_or_else(|| Func::constant(Object::t()));
+                // Per-fact: emit Seq([derived_fact]) when all keys are
+                // present, else phi. Concat collapses the phi entries.
+                let guarded = Func::condition(
+                    pred,
+                    Func::construction(vec![derive_one]),
+                    Func::constant(Object::phi()),
+                );
+                Func::compose(Func::Concat,
+                    Func::compose(Func::apply_to_all(guarded), extract(0, ft_id)))
+            };
+            per_fact
         }
         _ => {
             // task-918-implicit-equi-join-uses-negation: indices of every
@@ -10535,8 +10683,22 @@ mod schema_tests {
     }
 
     /// AbsenceOf antecedent over an un-keyed FT (no alethic UC on the
-    /// negated cell) stays on the legacy linear-scan path — no
-    /// FetchOrPhi appears in the AbsenceOf branch.
+    /// negated cell) stays on the legacy linear-scan path — the
+    /// AbsenceOf branch itself uses `Filter ∘ DistL` (no Map-aware
+    /// `NullTest ∘ FetchOrPhi:<key, cell>` shape).
+    ///
+    /// task-930 v2: `extract_facts_from_pop` (positive-antecedent
+    /// extraction) now composes `Func::FetchOrPhi` over the encoded
+    /// pop so views can resolve lazily on read. That means the
+    /// compiled Func tree contains `FetchOrPhi` from the positive
+    /// branches even when the AbsenceOf branch stays on the legacy
+    /// path — so a global "no FetchOrPhi anywhere" assertion no
+    /// longer distinguishes the two AbsenceOf shapes. Pin the
+    /// AbsenceOf branch by checking the legacy `Filter` survives
+    /// AND the positive-extract FetchOrPhi sites are construction
+    /// `[Atom(ft_id), Id]` (the v2 extract_facts_from_pop shape),
+    /// not the keyed `[role_value_extractor, cell_atom]` shape that
+    /// the Map-aware AbsenceOf would emit.
     #[test]
     fn task821_single_absence_over_unkeyed_ft_keeps_legacy_shape() {
         let src = "\
@@ -10560,16 +10722,39 @@ mod schema_tests {
             .find(|r| r.consequent_cell.literal_id() == "Task_has_Task_Readiness")
             .expect("rule for Task_has_Task_Readiness must be present");
         let compiled = compile_explicit_derivation(&data, rule);
-        // The compiled Func may still mention FetchOrPhi elsewhere
-        // (e.g. via `extract_facts_func` paths) but the AbsenceOf
-        // branch here is the multi-antecedent path that uses
-        // `extract_facts_from_pop` (filter+Selector composition), so
-        // a stable assert is that NO FetchOrPhi appears at all in the
-        // generated tree under the legacy path. Verify by checking the
-        // legacy filter+DistL pattern is present.
-        assert!(!has_fetch_or_phi(&compiled.func),
-            "compiled Func for AbsenceOf-over-unkeyed rule must NOT \
-             contain FetchOrPhi (legacy linear-scan shape); got {:?}",
+        // The legacy AbsenceOf path uses Filter; the Map-aware path
+        // does NOT (FetchOrPhi replaces Filter for the keyed branch).
+        // So the legacy-path marker is the presence of Filter.
+        let has_filter = func_any(&compiled.func, &|f| matches!(f, F::Filter(_)));
+        assert!(has_filter,
+            "compiled Func for AbsenceOf-over-unkeyed rule must \
+             contain Filter from the legacy linear-scan shape; got {:?}",
+            compiled.func);
+
+        // Every FetchOrPhi in the tree must be the v2
+        // extract_facts_from_pop shape `FetchOrPhi ∘ [Atom(ft_id),
+        // Id]`. The Map-aware AbsenceOf shape's FetchOrPhi feeds
+        // `[Atom(ft_id), <role_value_extractor>]` where the second
+        // arg is NOT Func::Id. If any FetchOrPhi has a non-Id
+        // construction operand, the unkeyed-AbsenceOf rule has been
+        // misrouted onto the keyed shape.
+        let all_fetches_are_pop_extract = !func_any(&compiled.func, &|f| {
+            // Detect: Compose(FetchOrPhi, Construction([_, second]))
+            // where `second` is NOT Func::Id.
+            if let F::Compose(outer, inner) = f {
+                if matches!(outer.as_ref(), F::FetchOrPhi) {
+                    if let F::Construction(items) = inner.as_ref() {
+                        if items.len() == 2 && !matches!(items[1], F::Id) {
+                            return true; // a non-pop-extract FetchOrPhi
+                        }
+                    }
+                }
+            }
+            false
+        });
+        assert!(all_fetches_are_pop_extract,
+            "AbsenceOf branch over unkeyed FT must not emit Map-aware \
+             FetchOrPhi (key extractor as second arg); got {:?}",
             compiled.func);
     }
 

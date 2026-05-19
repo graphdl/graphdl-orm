@@ -3445,16 +3445,14 @@ Source 'src1' has Hue 'red'.
     let defs = compile::compile_to_defs_state(&state);
     let d = ast::defs_to_state(&defs, &state);
 
-    // task-930 v1: views also emit `derivation:` defs so the chain
-    // can materialize them — extract_facts_from_pop reads cells via
-    // direct Selector on the encoded pop, not Func::Fetch, so the
-    // chain only sees populated cells. Until that's reworked, view
-    // marker is a documentation + read-side opt-in (resolve_view
-    // fires via Func::Fetch); chain behavior matches Stored.
+    // task-930 v2: views emit ONLY under `view:` (chain skips them);
+    // extract_facts_from_pop now consults views via Func::FetchOrPhi
+    // → resolve_view, so downstream rules see view-derived bindings
+    // without the v1 eager-emit workaround.
     let derivation_def = ast::fetch_raw(
         &format!("derivation:{}", bar_color_rule.id), &d);
-    assert!(!matches!(derivation_def, ast::Object::Bottom),
-        "View rule must emit derivation: def too (v1 behavior)");
+    assert!(matches!(derivation_def, ast::Object::Bottom),
+        "View rule must NOT emit derivation: def; got {:?}", derivation_def);
 
     // Sanity: view def IS present.
     let view_def = ast::fetch_raw("view:Bar_has_Color", &d);
@@ -3478,6 +3476,114 @@ Source 'src1' has Hue 'red'.
     };
     assert_eq!(bar_colors, vec![("src1".to_string(), "red".to_string())],
         "View must compute on Func::Fetch read. Got: {:?}", result);
+}
+
+// ─── task-930 v2 — downstream rule whose antecedent is a `*`-marked
+// FT sees view-derived bindings WITHOUT the v1 emit-to-derivation:
+// workaround. Verifies the chain's `extract_facts_from_pop` (which
+// now composes Func::FetchOrPhi) resolves views lazily on read.
+//
+// Shape:
+//   Bar has Color iff Source has Hue and Bar is Source and Color is Hue.   // view
+//   Bar is colorful iff Bar has Color 'red'.                               // stored
+//
+// `Bar has Color` is View-marked (no `derivation:` def emitted). The
+// downstream `Bar is colorful` rule's antecedent reader hits the
+// encoded pop for `Bar_has_Color`, finds nothing (chain skipped the
+// view), falls through to resolve_view via Func::FetchOrPhi, and
+// gets the view-computed bindings. The colorful consequent then
+// fires for src1 (Hue=red).
+#[test]
+fn downstream_rule_sees_view_derived_facts_via_lazy_eval() {
+    let src = r#"# task-930 v2 downstream-view-read repro
+Source(.id) is an entity type.
+Bar(.id) is an entity type.
+Hue is a value type.
+Color is a value type.
+
+## Fact Types
+Source has Hue.
+Bar has Color. *
+Bar is colorful.
+
+## Derivation Rules
+* Bar has Color iff Source has Hue and Bar is Source and Color is Hue.
+Bar is colorful iff Bar has Color 'red'.
+
+## Instance Facts
+Source 'src1' has Hue 'red'.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let data = compile::cell_index_from_state(&state);
+
+    // The Bar-has-Color rule must be flagged View.
+    let bar_color_rule = data.derivation_rules.iter()
+        .find(|r| r.text.starts_with("Bar has Color iff"))
+        .expect("Bar has Color rule must compile");
+    assert!(matches!(bar_color_rule.materialization,
+        crate::types::MaterializationPolicy::View),
+        "Bar has Color must be View-marked; got materialization={:?}",
+        bar_color_rule.materialization);
+
+    // The downstream colorful rule must NOT be View (the `*` lives
+    // on the FT, not the rule; the downstream rule has no `*`).
+    let colorful_rule = data.derivation_rules.iter()
+        .find(|r| r.text.starts_with("Bar is colorful iff"))
+        .expect("Bar is colorful rule must compile");
+    assert!(matches!(colorful_rule.materialization,
+        crate::types::MaterializationPolicy::Stored),
+        "Bar is colorful must be Stored (downstream of view); got {:?}",
+        colorful_rule.materialization);
+
+    // Build the def-state and prove the v2 layout: NO derivation:
+    // def for the view, only a view: def.
+    let defs = compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+    let view_derivation_def = ast::fetch_raw(
+        &format!("derivation:{}", bar_color_rule.id), &d);
+    assert!(matches!(view_derivation_def, ast::Object::Bottom),
+        "View rule must NOT emit a derivation: def under v2; got {:?}",
+        view_derivation_def);
+    let view_def = ast::fetch_raw("view:Bar_has_Color", &d);
+    assert!(!matches!(view_def, ast::Object::Bottom),
+        "View def missing for Bar_has_Color");
+
+    // The downstream Stored rule DOES emit a derivation: def — it's
+    // what the chain runs against the encoded pop, and its
+    // antecedent extractor will lazy-resolve the view at read time.
+    let colorful_derivation_def = ast::fetch_raw(
+        &format!("derivation:{}", colorful_rule.id), &d);
+    assert!(!matches!(colorful_derivation_def, ast::Object::Bottom),
+        "Stored downstream rule must emit a derivation: def");
+
+    // Now apply the colorful rule's compiled func against an encoded
+    // pop containing only the seed Source_has_Hue cell. The view
+    // is NOT populated in the encoded pop. The colorful rule's
+    // extract_facts_from_pop("Bar_has_Color") should hit the lazy
+    // view resolution and find one Bar/Color binding to filter on.
+    let model = compile::compile(&state);
+    let colorful_func = model.derivations.iter()
+        .find(|d| d.id == colorful_rule.id)
+        .expect("colorful derivation func must compile")
+        .func.clone();
+    let pop = ast::encode_state(&state);
+    let out = ast::apply(&colorful_func, &pop, &d);
+    let bars: Vec<String> = out.as_seq().map(|items| items.iter()
+        .filter_map(|f| {
+            let env = f.as_seq()?;
+            if env.len() < 3 { return None; }
+            let bindings = env[2].as_seq()?;
+            bindings.iter().find_map(|p| {
+                let kv = p.as_seq()?;
+                if kv.len() != 2 { return None; }
+                if kv[0].as_atom() == Some("Bar") {
+                    kv[1].as_atom().map(String::from)
+                } else { None }
+            })
+        }).collect()).unwrap_or_default();
+    assert!(bars.contains(&"src1".to_string()),
+        "Downstream `Bar is colorful` must fire for src1 via lazy view \
+         eval. Got bars={:?}; raw colorful output: {:?}", bars, out);
 }
 
 // ─── #924 — cross-noun unification with `that .../some...` quantifier.
@@ -3686,24 +3792,26 @@ fn apps_tasks_readings_all_derivation_rules_survive_compile() {
 // ─── #927 — load apps/tasks readings verbatim + recompile
 //
 // The 4 synthetic #927 tests above all pass but the live apps/tasks
-// substrate stays empty. Last difference: the full readings context.
-// This test loads apps/tasks/readings/app.md verbatim and checks
-// whether recommended fires for a single hand-built Task that
+// substrate used to stay empty. Last difference: the full readings
+// context. This test loads apps/tasks/readings/app.md verbatim and
+// checks whether recommended fires for a single hand-built Task that
 // satisfies all four antecedents.
 //
-// **Currently failing** — reproduces the live-state bug. With the
-// bridge derivation (`Task has Task Status iff Resource is
-// currently in Status and Task Status is Status and Task is
-// Resource`) in scope, the chain produces `Task_has_Task_Status =
-// Seq([Seq([])])` — an empty fact in the cell. The bridge's
-// cross-antecedent variable unification (Resource ↔ Task, Status ↔
-// Task Status) emits empty bindings; downstream rules then see
-// no usable Task_has_Task_Status entries; readiness, parallelizable,
-// recommended all stay empty. `#[ignore]` to keep the test as a
-// regression guard without blocking CI until the bridge's
-// variable-unification bug is fixed (separate task — needs
-// resolve_derivation_rule investigation in parse_forml2.rs).
-#[ignore = "#927 (probe pinpointed 2026-05-18): bridge rule `Task has Task Status iff that Resource is currently in some Status and Task Status is Status and Task is Resource` compiles with consequent_bindings=[] and match_on=[]. The trailing equality clauses (`Task Status is Status`, `Task is Resource`) aren't being recognized as variable-unification clauses that bind consequent roles to antecedent roles, so direct bridge apply returns Bottom even though Resource_is_currently_in_Status has the right entries. Fix in resolve_derivation_rule / compile_explicit_derivation's antecedent-clause parsing."]
+// **Now passing** (post-fix). The original symptom: with the bridge
+// derivation (`Task has Task Status iff Resource is currently in
+// Status and Task Status is Status and Task is Resource`) in scope,
+// the chain produced `Task_has_Task_Status = Seq([])` — an empty
+// cell. The bridge's per-fact derive returned `Bottom` for any
+// antecedent whose role bindings didn't include both `Resource` AND
+// `Status` (e.g. metamodel `Status 'X' is initial in ...` instance
+// facts that translate into partial-binding entries in the
+// `Resource_is_currently_in_Status` cell), and the lone Bottom
+// element collapsed the entire apply_to_all output to Bottom.
+// Fix: (1) `compile_arith_expr`'s RoleRef branch now uses
+// `role_value_by_name` instead of positional `role_value(idx)`, and
+// (2) the 1-antecedent path in `compile_explicit_derivation` wraps
+// per-fact derive in a `Concat`-folding guard that drops antecedent
+// facts missing any required by-name binding key.
 #[test]
 fn implicit_equi_join_with_actual_apps_tasks_readings() {
     // Mirror cli/entry.rs compile-load: fold metamodel + readings via
