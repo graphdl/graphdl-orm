@@ -4529,7 +4529,20 @@ fn encoded_pop_lookup(name: &str, state: &Object) -> Option<Object> {
     cells.iter().find_map(|cell| {
         let items = cell.as_seq()?;
         if items.len() == 2 && items[0].as_atom() == Some(name) {
-            Some(items[1].clone())
+            // task-930 v2 follow-up: return None for empty entries so
+            // Func::Fetch / FetchOrPhi falls through to resolve_view
+            // (the view def may produce facts even when the stored
+            // cell is empty — typical post-`drop derived cells before
+            // forward-chain` shape). Without this, view-marked FTs
+            // whose cell is empty short-circuit to phi and lazy eval
+            // never fires for downstream antecedent reads.
+            let entry = &items[1];
+            let is_empty = match entry {
+                Object::Seq(items) => items.is_empty(),
+                Object::Map(m) => m.is_empty(),
+                _ => false,
+            };
+            if is_empty { None } else { Some(entry.clone()) }
         } else {
             None
         }

@@ -3586,6 +3586,90 @@ Source 'src1' has Hue 'red'.
          eval. Got bars={:?}; raw colorful output: {:?}", bars, out);
 }
 
+// ─── task-930 v2 follow-up: even when the view-marked FT cell is
+// PRESENT-BUT-EMPTY in the encoded population (the typical post
+// `drop derived cells before forward-chain` shape — apps/tasks
+// recompile path), `extract_facts_from_pop` must STILL fall through
+// to lazy view resolution. Without this, encoded_pop_lookup returns
+// the empty entry and Func::FetchOrPhi short-circuits to phi, the
+// downstream rule sees nothing, and the cascade collapses despite
+// the view producing valid derivations from upstream antecedents.
+#[test]
+fn downstream_rule_sees_view_facts_even_when_view_cell_is_empty_in_pop() {
+    let src = r#"# task-930 v2 empty-cell short-circuit repro
+Source(.id) is an entity type.
+Bar(.id) is an entity type.
+Hue is a value type.
+Color is a value type.
+
+## Fact Types
+Source has Hue.
+Bar has Color. *
+Bar is colorful.
+
+## Derivation Rules
+* Bar has Color iff Source has Hue and Bar is Source and Color is Hue.
+Bar is colorful iff Bar has Color 'red'.
+
+## Instance Facts
+Source 'src1' has Hue 'red'.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let model = compile::compile(&state);
+    let defs = compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+
+    // Mirror the chain's pre-chain "drop derived cells" pass: store
+    // an explicit empty Seq under Bar_has_Color in the state before
+    // encoding. This is what the live compile path does for every
+    // derived cell so the chain re-derives from primary facts each
+    // round (LFP per request, #836).
+    let dropped_state = ast::store(
+        "Bar_has_Color",
+        ast::Object::phi(),  // empty Seq, matching pre-chain drop
+        &state,
+    );
+    let pop = ast::encode_state(&dropped_state);
+
+    // Confirm the encoded pop DOES contain Bar_has_Color with an
+    // empty entry. That's the live shape; the test is meaningless
+    // without this precondition.
+    let bar_color_entry = pop.as_seq().and_then(|cells| cells.iter().find(|c| {
+        c.as_seq().and_then(|items| items.first().and_then(|n| n.as_atom())) == Some("Bar_has_Color")
+    }).cloned()).expect("encoded pop must include Bar_has_Color cell (even if empty)");
+    let entry_facts = bar_color_entry.as_seq().and_then(|items| items.get(1).cloned())
+        .expect("Bar_has_Color entry must have a facts slot");
+    let entry_is_empty = matches!(&entry_facts,
+        ast::Object::Seq(items) if items.is_empty());
+    assert!(entry_is_empty,
+        "Bar_has_Color must be present-but-empty in encoded pop \
+         (was: {:?})", entry_facts);
+
+    // Now apply the downstream colorful rule. Its antecedent
+    // extract_facts_from_pop("Bar_has_Color") must NOT short-circuit
+    // on the empty entry — it must fall through to resolve_view.
+    let colorful_func = model.derivations.iter()
+        .find(|der| der.text.starts_with("Bar is colorful iff"))
+        .expect("colorful rule must compile").func.clone();
+    let out = ast::apply(&colorful_func, &pop, &d);
+    let bars: Vec<String> = out.as_seq().map(|items| items.iter()
+        .filter_map(|f| {
+            let env = f.as_seq()?;
+            if env.len() < 3 { return None; }
+            let bindings = env[2].as_seq()?;
+            bindings.iter().find_map(|p| {
+                let kv = p.as_seq()?;
+                if kv.len() == 2 && kv[0].as_atom() == Some("Bar") {
+                    kv[1].as_atom().map(String::from)
+                } else { None }
+            })
+        }).collect()).unwrap_or_default();
+    assert!(bars.contains(&"src1".to_string()),
+        "Downstream colorful must fire for src1 via lazy view eval even \
+         when Bar_has_Color is empty in encoded pop. Got bars={:?}; \
+         raw output: {:?}", bars, out);
+}
+
 // ─── #924 — cross-noun unification with `that .../some...` quantifier.
 // Hypothesis: the live bridge `Task has Task Status iff that Resource
 // is currently in some Status and Task Status is Status and Task is

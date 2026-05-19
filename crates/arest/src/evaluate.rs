@@ -815,30 +815,62 @@ pub(crate) fn state_keys(state: &ast::Object) -> HashSet<FactKey> {
             ast::cell_facts_iter(cell_contents).collect();
         for f in facts {
             let Some(pairs) = f.as_seq() else { continue };
-            let mut kv: alloc::vec::Vec<(&str, &str)> = pairs.iter().filter_map(|pair| {
+            // Collect each binding pair with a list of canonical-key
+            // variants. Vacuous Resource role values arrive in three
+            // shapes in the wild: `Atom("")`, `Atom("φ")`, and
+            // `Seq([])` (Object::phi). The chain emits whichever shape
+            // its dispatch path uses (SM init produces both depending
+            // on the role); persisted state may carry the third.
+            // Emitting BOTH variant keys for the vacuous case ensures
+            // dedup hits whichever shape the candidate's fact_key
+            // hashes to. See state_keys_collides_seq_phi_with_atom_*
+            // tests.
+            let kv: alloc::vec::Vec<(&str, alloc::vec::Vec<&str>)> = pairs.iter().filter_map(|pair| {
                 let items = pair.as_seq()?;
                 let key = items.get(0)?.as_atom()?;
-                let val = match items.get(1) {
+                let variants: alloc::vec::Vec<&str> = match items.get(1) {
                     Some(v) => match v.as_atom() {
-                        Some(a) => a,
+                        Some("φ") | Some("") => alloc::vec![ "", "φ" ],
+                        Some(a) => alloc::vec![a],
                         None => match v {
-                            ast::Object::Seq(s) if s.is_empty() => "φ",
-                            _ => "",
+                            ast::Object::Seq(s) if s.is_empty() => alloc::vec![ "", "φ" ],
+                            _ => alloc::vec![ "" ],
                         },
                     },
-                    None => "",
+                    None => alloc::vec![ "" ],
                 };
-                Some((key, val))
+                Some((key, variants))
             }).collect();
-            kv.sort();
-            let mut h = fnv_mix(FNV_OFFSET, cell_name.as_bytes());
-            for (k, v) in &kv {
-                h = fnv_mix(h, b"|");
-                h = fnv_mix(h, k.as_bytes());
-                h = fnv_mix(h, b"=");
-                h = fnv_mix(h, v.as_bytes());
+
+            // Cartesian-product variant keys; each combination → one
+            // FactKey. For facts with no vacuous bindings, this
+            // degenerates to one key (the common case). For the
+            // typically rare vacuous-binding case we emit 2^N keys
+            // (N = number of vacuous roles, usually 1).
+            let mut combos: alloc::vec::Vec<alloc::vec::Vec<(&str, &str)>> = alloc::vec![alloc::vec![]];
+            for (k, variants) in &kv {
+                let mut next = alloc::vec::Vec::with_capacity(combos.len() * variants.len());
+                for combo in &combos {
+                    for v in variants {
+                        let mut extended = combo.clone();
+                        extended.push((*k, *v));
+                        next.push(extended);
+                    }
+                }
+                combos = next;
             }
-            set.insert(h);
+            for combo in combos {
+                let mut sorted = combo;
+                sorted.sort();
+                let mut h = fnv_mix(FNV_OFFSET, cell_name.as_bytes());
+                for (k, v) in &sorted {
+                    h = fnv_mix(h, b"|");
+                    h = fnv_mix(h, k.as_bytes());
+                    h = fnv_mix(h, b"=");
+                    h = fnv_mix(h, v.as_bytes());
+                }
+                set.insert(h);
+            }
         }
     }
     set
@@ -1074,6 +1106,89 @@ mod tests {
         ConstraintDef, DerivationRuleDef, FactTypeDef, GeneralInstanceFact, NounDef,
         RoleDef, SpanDef, TransitionDef, WorldAssumption,
     };
+
+    // task-927 follow-up pin: when a stored fact carries a non-atom
+    // (phi) binding value, e.g. `<Resource, Seq([])>`, AND the chain
+    // emits the same conceptual fact as `<Resource, Atom("φ")>`, the
+    // two MUST hash to the same FactKey. Without this, the chain
+    // detects a key collision via cell_put_keyed every round but
+    // upstream dedup misses, so the same rule re-fires the same
+    // candidate every round until the LFP cap — burning 100 rounds ×
+    // every rule on no-progress work. Live apps/tasks recompile took
+    // 3+ minutes on this exact shape pre-fix.
+    #[test]
+    fn state_keys_collides_seq_phi_with_atom_phi() {
+        // Build a state with a Seq([])-form Resource binding.
+        let seq_phi_fact = ast::Object::seq(vec![
+            ast::Object::seq(vec![ast::Object::atom("Resource"), ast::Object::phi()]),
+            ast::Object::seq(vec![ast::Object::atom("Status"), ast::Object::atom("Proposed")]),
+        ]);
+        let state = ast::store(
+            "Resource_is_currently_in_Status",
+            ast::Object::seq(vec![seq_phi_fact]),
+            &ast::Object::phi(),
+        );
+
+        // Build the candidate fact_key as the chain would: Atom("φ")
+        // for the vacuous Resource binding.
+        let candidate = DerivedFact {
+            fact_type_id: "Resource_is_currently_in_Status".to_string(),
+            reading: String::new(),
+            bindings: vec![
+                ("Resource".to_string(), "φ".to_string()),
+                ("Status".to_string(), "Proposed".to_string()),
+            ],
+            derived_by: "test".to_string(),
+            confidence: Confidence::Definitive,
+        };
+
+        let existing = state_keys(&state);
+        let cand_key = fact_key(&candidate);
+
+        assert!(existing.contains(&cand_key),
+            "state_keys must hash <Resource, Seq([])> + <Status, Proposed> \
+             identically to fact_key's <Resource, \"φ\"> + <Status, Proposed>. \
+             Without this collision, the chain loops on the same UC-conflict \
+             every round until the LFP cap. existing keys: {:?}; cand_key: {}",
+             existing, cand_key);
+    }
+
+    // task-927 follow-up pin: same as above but with the empty-atom
+    // shape `Atom("")` instead of `Atom("φ")`. The SM init / for-
+    // Resource backfill code emits both shapes depending on the
+    // dispatch path, and the chain must dedup against the stored
+    // Seq([]) shape regardless.
+    #[test]
+    fn state_keys_collides_seq_phi_with_atom_empty() {
+        let seq_phi_fact = ast::Object::seq(vec![
+            ast::Object::seq(vec![ast::Object::atom("Resource"), ast::Object::phi()]),
+            ast::Object::seq(vec![ast::Object::atom("Status"), ast::Object::atom("in_progress")]),
+        ]);
+        let state = ast::store(
+            "Resource_is_currently_in_Status",
+            ast::Object::seq(vec![seq_phi_fact]),
+            &ast::Object::phi(),
+        );
+
+        let candidate = DerivedFact {
+            fact_type_id: "Resource_is_currently_in_Status".to_string(),
+            reading: String::new(),
+            bindings: vec![
+                ("Resource".to_string(), "".to_string()),
+                ("Status".to_string(), "in_progress".to_string()),
+            ],
+            derived_by: "test".to_string(),
+            confidence: Confidence::Definitive,
+        };
+
+        let existing = state_keys(&state);
+        let cand_key = fact_key(&candidate);
+
+        assert!(existing.contains(&cand_key),
+            "state_keys must hash <Resource, Seq([])> identically to \
+             fact_key's <Resource, \"\">. existing: {:?}; cand_key: {}",
+            existing, cand_key);
+    }
 
     // Test-only SM fixture. The production SM compile path is fully
     // cell-driven (#763) — there's no public typed `StateMachineDef`
