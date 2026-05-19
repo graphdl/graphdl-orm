@@ -132,6 +132,40 @@ fn integrate_round_facts(
     current_state
 }
 
+/// task-3-incremental: per-thread instrumentation counting the number
+/// of rule activations across all rounds of the most recent
+/// `semi_naive_inner` invocation. Test-only — the production
+/// chainer never observes it. Tests call
+/// [`reset_chain_eval_count`] before exercising the chainer, then
+/// [`get_chain_eval_count`] after; the delta is the total rule-active
+/// count (Σ active_rules_per_round). On gated runs this should be
+/// O(touched_cells × dependent_rules); on un-gated runs it grows to
+/// O(rules × rounds-to-fixpoint).
+#[cfg(any(test, feature = "test-bins"))]
+mod chain_eval_counter {
+    use core::cell::Cell;
+    std::thread_local! {
+        pub static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+}
+
+#[cfg(any(test, feature = "test-bins"))]
+pub fn reset_chain_eval_count() {
+    chain_eval_counter::COUNT.with(|c| c.set(0));
+}
+
+#[cfg(any(test, feature = "test-bins"))]
+pub fn get_chain_eval_count() -> usize {
+    chain_eval_counter::COUNT.with(|c| c.get())
+}
+
+#[inline]
+#[allow(unused_variables)]
+fn record_chain_eval_count(active_len: usize) {
+    #[cfg(any(test, feature = "test-bins"))]
+    chain_eval_counter::COUNT.with(|c| c.set(c.get() + active_len));
+}
+
 /// Forward-chain derivation rules over D to fixed point. Returns (D', derived_facts).
 /// D contains both population cells and def cells (Backus Sec. 14.3).
 pub fn forward_chain_defs_state(
@@ -267,6 +301,48 @@ pub fn forward_chain_defs_state_semi_naive_with_base_keys(
     max_rounds: usize,
     base_keys: Option<HashSet<FactKey>>,
 ) -> (ast::Object, Vec<DerivedFact>) {
+    semi_naive_inner(derivation_defs, None, d, max_rounds, base_keys)
+}
+
+/// task-3-incremental: forward-chain with an explicit round-1
+/// `dirty_cells` seed. The classical [`forward_chain_defs_state_semi_naive`]
+/// starts every run with `dirty_cells = None`, which forces round 1 to
+/// evaluate every rule — exactly the cost that dominates the apply
+/// path on a 660-task corpus (~125s wall to apply a single Task
+/// Priority edit; ~75 task-relevant rules × 660 facts × N rounds).
+///
+/// `seed` should be the set of cell names that the caller's mutation
+/// just touched (e.g. for `apply update Task Priority`, this is
+/// `{"Task_has_Task_Priority"}`). Round 1 only runs rules whose
+/// declared antecedent cells intersect `seed`. Rules with `None`
+/// antecedent metadata still run conservatively in every round (no
+/// gating possible). Subsequent rounds use the normal next-dirty
+/// propagation — emit cells from this round feed the next round's
+/// filter.
+///
+/// Passing an empty seed produces a no-op chain (round 1 finds no
+/// active rules and breaks immediately). Pass `forward_chain_defs_state_semi_naive`
+/// when you want the round-1-everywhere semantics.
+pub fn forward_chain_defs_state_seeded(
+    derivation_defs: &[(&str, &ast::Func, Option<&[String]>)],
+    seed: HashSet<String>,
+    d: &ast::Object,
+    max_rounds: usize,
+) -> (ast::Object, Vec<DerivedFact>) {
+    semi_naive_inner(derivation_defs, Some(seed), d, max_rounds, None)
+}
+
+/// Shared body of the semi-naive variants. `initial_dirty == None`
+/// matches the classical "round 1 runs everything" behavior; `Some(set)`
+/// seeds the round-1 filter from `set` (used by
+/// [`forward_chain_defs_state_seeded`] for incremental apply).
+fn semi_naive_inner(
+    derivation_defs: &[(&str, &ast::Func, Option<&[String]>)],
+    initial_dirty: Option<HashSet<String>>,
+    d: &ast::Object,
+    max_rounds: usize,
+    base_keys: Option<HashSet<FactKey>>,
+) -> (ast::Object, Vec<DerivedFact>) {
     use hashbrown::HashMap;
     // Same gate as `derive_one_round_with_keys`: trace knob is host-only.
     #[cfg(not(feature = "no_std"))]
@@ -289,8 +365,10 @@ pub fn forward_chain_defs_state_semi_naive_with_base_keys(
         t_ek.elapsed(), existing_keys.len()); }
     // `dirty_cells == None` means "run everything" (initial round or
     // caller wants no filtering); `Some(set)` restricts to rules that
-    // read at least one of those cells.
-    let mut dirty_cells: Option<HashSet<String>> = None;
+    // read at least one of those cells. Callers that want incremental
+    // gating from round 1 pass `Some(seed)` here via the
+    // `forward_chain_defs_state_seeded` entry point.
+    let mut dirty_cells: Option<HashSet<String>> = initial_dirty;
     for round in 0..max_rounds {
         let active: Vec<(&str, &ast::Func)> = derivation_defs.iter()
             .filter(|(_, _, cells)| match (&dirty_cells, cells) {
@@ -305,6 +383,7 @@ pub fn forward_chain_defs_state_semi_naive_with_base_keys(
             crate::diag!("    [sn] round {}: active {}/{} defs",
                 round, active.len(), derivation_defs.len());
         }
+        record_chain_eval_count(active.len());
         if active.is_empty() { break; }
         let new_facts = derive_one_round_with_keys(
             active.as_slice(), &current_state, &all_derived, d, &existing_keys);
@@ -1188,6 +1267,89 @@ mod tests {
             "state_keys must hash <Resource, Seq([])> identically to \
              fact_key's <Resource, \"\">. existing: {:?}; cand_key: {}",
             existing, cand_key);
+    }
+
+    /// task-3-incremental: round-1 rule gating must respect a caller-
+    /// supplied `seed` of dirty cells. The classical semi-naive
+    /// chainer treats `dirty_cells == None` as "run everything in
+    /// round 1", which on the live tasks.db apply path (~75 task-
+    /// relevant rules × 660 facts × N rounds) burns the full LFP
+    /// budget on every single-field apply. `forward_chain_defs_state_seeded`
+    /// is the entry point the apply path will use to seed round 1
+    /// with exactly the cells the apply payload just wrote.
+    ///
+    /// Shape: each rule declares its antecedent reads. Seed with one
+    /// cell. Count the active rules surfaced via
+    /// `record_chain_eval_count` across all rounds. Rules whose reads
+    /// don't intersect the seed (and don't get fed in later rounds)
+    /// must be skipped.
+    #[test]
+    fn seeded_chain_gates_rules_by_dirty_cells_in_round_one() {
+        // Empty population so the chain ends after one round (no
+        // rule has anything to derive). The activation count is the
+        // round-1 gate measurement, not the derivation result.
+        let state = ast::Object::phi();
+        // Each "rule" is the identity-on-phi: applying it yields
+        // nothing, so the chain breaks after round 1 (`new_facts
+        // .is_empty()`). The point of the test is the active-rule
+        // count surfaced before derive_one_round_with_keys runs.
+        let f_noop = ast::Func::constant(ast::Object::phi());
+
+        // Build 10 single-read rules + one without metadata.
+        // Names "rule_00".."rule_09" each read a distinct cell;
+        // "rule_unknown" carries `None` antecedent reads (the
+        // chainer must keep running it conservatively).
+        let cells: Vec<Vec<String>> = (0..10)
+            .map(|i| alloc::vec![alloc::format!("cell_{:02}", i)])
+            .collect();
+        let names: Vec<String> = (0..10)
+            .map(|i| alloc::format!("rule_{:02}", i)).collect();
+        let mut defs: Vec<(&str, &ast::Func, Option<&[String]>)> =
+            names.iter().zip(cells.iter())
+                .map(|(n, reads)| (n.as_str(), &f_noop, Some(reads.as_slice())))
+                .collect();
+        defs.push(("rule_unknown", &f_noop, None));
+
+        // 1) Un-seeded run: classical semi-naive with `None` initial
+        //    dirty. Round 1 runs every rule (10 gated + 1 unknown
+        //    = 11). Chain breaks after round 1 since `f_noop`
+        //    produces nothing.
+        reset_chain_eval_count();
+        let _ = forward_chain_defs_state_semi_naive(&defs, &state, 100);
+        assert_eq!(
+            get_chain_eval_count(), 11,
+            "un-seeded semi-naive must run every rule in round 1 — \
+             that's the cost the seeded variant is designed to skip",
+        );
+
+        // 2) Seeded run with {"cell_03"}: round 1 runs only
+        //    rule_03 (intersects seed) + rule_unknown (conservative
+        //    None metadata). All 9 other gated rules skipped.
+        reset_chain_eval_count();
+        let mut seed: HashSet<String> = HashSet::new();
+        seed.insert("cell_03".to_string());
+        let _ = forward_chain_defs_state_seeded(&defs, seed, &state, 100);
+        assert_eq!(
+            get_chain_eval_count(), 2,
+            "seeded with {{cell_03}}, expected round 1 to activate \
+             rule_03 + rule_unknown only (2 rules). Counter shows {}.",
+            get_chain_eval_count(),
+        );
+
+        // 3) Seeded with an empty set: nothing dirty, no rule
+        //    intersects. Only the conservative `None`-metadata rule
+        //    fires (1 activation). This is the explicit no-op
+        //    boundary case — useful for apply payloads that touch
+        //    cells none of the gated rules read.
+        reset_chain_eval_count();
+        let _ = forward_chain_defs_state_seeded(
+            &defs, HashSet::new(), &state, 100);
+        assert_eq!(
+            get_chain_eval_count(), 1,
+            "empty seed must skip every gated rule; the conservative \
+             unknown-reads rule still fires (count=1). Got {}.",
+            get_chain_eval_count(),
+        );
     }
 
     // Test-only SM fixture. The production SM compile path is fully
