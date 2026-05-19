@@ -433,6 +433,29 @@ pub struct OwnedRuleDeps {
 /// `Func::constant(obj)` wraps `obj` as `<atom("'"), obj>` so the
 /// cell content the decoder sees is the 2-tuple; we strip the
 /// `'` sentinel before reading the 3-tuple body.
+/// task-3 phase 2 / DB-task-929: decode the `derivation_reads:<rule_id>`
+/// sidecar emitted by `compile_to_defs_state`. Returns the positive FT
+/// cells the rule reads (each `AntecedentSource::FactType(cell)` from
+/// the rule), or `None` when the sidecar is absent — in which case the
+/// caller treats the rule as "unknown reads, run unconditionally".
+///
+/// The sidecar lives next to `derivation_meta:<id>` and shares its
+/// `Func::constant(payload)` wrapping convention (`<atom("'"), payload>`).
+/// Payload is a flat Seq of cell-name atoms.
+pub fn read_derivation_reads(d: &ast::Object, rule_id: &str) -> Option<Vec<String>> {
+    let cell_name = alloc::format!("derivation_reads:{}", rule_id);
+    let cell = ast::fetch_or_phi(&cell_name, d);
+    let items = cell.as_seq()?;
+    let payload = if items.len() == 2 && items[0].as_atom() == Some("'") {
+        &items[1]
+    } else { return None; };
+    let reads: Vec<String> = payload.as_seq()?
+        .iter()
+        .filter_map(|c| c.as_atom().map(|s| s.to_string()))
+        .collect();
+    Some(reads)
+}
+
 pub fn read_derivation_meta(d: &ast::Object, rule_id: &str) -> Option<OwnedRuleDeps> {
     let cell_name = alloc::format!("derivation_meta:{}", rule_id);
     let cell = ast::fetch_or_phi(&cell_name, d);

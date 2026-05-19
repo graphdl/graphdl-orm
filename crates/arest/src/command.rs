@@ -14,6 +14,21 @@ use crate::ast;
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
+/// task-3 phase 2 / DB-task-929: convert a packed (name, reads, func)
+/// triple list into the borrowed `(&str, &Func, Option<&[String]>)`
+/// shape that `evaluate::forward_chain_defs_state_seeded` consumes.
+/// Free fn with explicit lifetimes — a closure inferring this signature
+/// can't tie input and output borrows.
+fn to_seeded_refs<'a>(
+    packed: &'a [(String, Vec<String>, ast::Func)],
+) -> Vec<(&'a str, &'a ast::Func, Option<&'a [String]>)> {
+    packed.iter().map(|(n, reads, f)| {
+        let reads_opt: Option<&[String]> =
+            if reads.is_empty() { None } else { Some(reads.as_slice()) };
+        (n.as_str(), f, reads_opt)
+    }).collect()
+}
+
 /// State Machine cell shape — the synthesized role-token names the
 /// apply / transition / status-extraction paths read and write to
 /// the `State_Machine_is_currently_in_Status` cell.
@@ -986,56 +1001,91 @@ fn create_via_defs(
         stratum2.len(),
         ast::cells_iter(d).into_iter().filter(|(n, _)| n.starts_with("derivation_strat2:")).count(),
         noun);
+
+    // task-3 phase 2 / DB-task-929: incremental forward chain. See the
+    // same block in `update_via_defs` for the full rationale. Seed:
+    //   * `fact_events` — cells the per-field push step accumulated
+    //     for this create (line 861).
+    //   * antecedent reads of rules whose consequent was dropped by
+    //     the #836 LFP-clear below.
+    let touched_cells: hashbrown::HashSet<String> = fact_events.iter().cloned().collect();
+    let build_seeded_refs = |stratum: &[(String, ast::Func)]|
+        -> Vec<(String, Vec<String>, ast::Func)>
+    {
+        stratum.iter().map(|(name, func)| {
+            let id = name.split_once(':').map(|(_, id)| id).unwrap_or(name);
+            let reads = crate::evaluate::read_derivation_reads(d, id).unwrap_or_default();
+            (name.clone(), reads, func.clone())
+        }).collect()
+    };
+    let s1_packed = build_seeded_refs(&stratum1);
+    let s2_packed = build_seeded_refs(&stratum2);
+
     // #836 — drop derived consequent cells from `resolved` before
     // forward-chain so the LFP recomputes against the current
-    // primary state. Mirrors the cli/entry.rs compile-path fix per
-    // AREST.tex §4.3 (LFP per request). Without this, an apply that
-    // flips a primary fact (e.g. a Task's Status) leaves stale
-    // derived facts (e.g. another Task's blocked-readiness) in the
-    // population because forward_chain only adds, never retracts.
-    //
-    // task-929: noun-scope the wipe to derivation_index[noun]'s rules
-    // so cross-noun upstream consequent cells survive (see
-    // transition_via_defs comment for the bridge-rule failure mode).
-    let resolved = {
-        let drule_cell = ast::fetch_or_phi("DerivationRule", d);
-        let derived_cells: hashbrown::HashSet<String> = drule_cell.as_seq()
-            .map(|facts| facts.iter()
-                .filter(|f| relevant_ids.is_empty()
-                    || ast::binding(f, "id")
-                        .map(|id| relevant_ids.contains(id))
-                        .unwrap_or(false))
-                .filter_map(|f| ast::binding(f, "consequentFactTypeId"))
-                .map(|encoded| crate::types::ConsequentCellSource::decode(encoded)
-                    .literal_id().to_string())
-                .filter(|s| !s.is_empty())
-                .collect())
-            .unwrap_or_default();
-        if derived_cells.is_empty() {
-            resolved
-        } else {
-            let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
-            for (name, contents) in ast::cells_iter(&resolved).into_iter() {
-                if derived_cells.contains(name) {
-                    new_map.insert(name.to_string(), ast::Object::phi());
-                } else {
-                    new_map.insert(name.to_string(), contents.clone());
-                }
+    // primary state. task-929: noun-scope the wipe to
+    // derivation_index[noun]'s rules so cross-noun upstream consequent
+    // cells survive.
+    let drule_cell = ast::fetch_or_phi("DerivationRule", d);
+    let dropped_cells: hashbrown::HashSet<String> = drule_cell.as_seq()
+        .map(|facts| facts.iter()
+            .filter(|f| relevant_ids.is_empty()
+                || ast::binding(f, "id")
+                    .map(|id| relevant_ids.contains(id))
+                    .unwrap_or(false))
+            .filter_map(|f| ast::binding(f, "consequentFactTypeId"))
+            .map(|encoded| crate::types::ConsequentCellSource::decode(encoded)
+                .literal_id().to_string())
+            .filter(|s| !s.is_empty())
+            .collect())
+        .unwrap_or_default();
+    let resolved = if dropped_cells.is_empty() {
+        resolved
+    } else {
+        let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+        for (name, contents) in ast::cells_iter(&resolved).into_iter() {
+            if dropped_cells.contains(name) {
+                new_map.insert(name.to_string(), ast::Object::phi());
+            } else {
+                new_map.insert(name.to_string(), contents.clone());
             }
-            ast::Object::Map(new_map.into())
         }
+        ast::Object::Map(new_map.into())
     };
+    let drop_writer_reads: hashbrown::HashSet<String> = drule_cell.as_seq()
+        .map(|facts| facts.iter()
+            .filter(|f| relevant_ids.is_empty()
+                || ast::binding(f, "id")
+                    .map(|id| relevant_ids.contains(id))
+                    .unwrap_or(false))
+            .filter_map(|f| {
+                let id = ast::binding(f, "id")?;
+                let consequent_encoded = ast::binding(f, "consequentFactTypeId")?;
+                let consequent = crate::types::ConsequentCellSource::decode(consequent_encoded)
+                    .literal_id().to_string();
+                if dropped_cells.contains(&consequent) {
+                    Some(crate::evaluate::read_derivation_reads(d, id).unwrap_or_default())
+                } else { None }
+            })
+            .flatten()
+            .collect())
+        .unwrap_or_default();
+    let mut seed = touched_cells.clone();
+    seed.extend(drop_writer_reads);
+
     let (post_s1, mut derived) = if stratum1.is_empty() {
         (resolved.clone(), Vec::new())
     } else {
-        let refs: Vec<(&str, &ast::Func)> = stratum1.iter().map(|(n, f)| (n.as_str(), f)).collect();
-        crate::evaluate::forward_chain_defs_state(&refs, &resolved)
+        let refs = to_seeded_refs(&s1_packed);
+        crate::evaluate::forward_chain_defs_state_seeded(
+            &refs, seed.clone(), &resolved, 100)
     };
     let derived_state = if stratum2.is_empty() {
         post_s1
     } else {
-        let refs: Vec<(&str, &ast::Func)> = stratum2.iter().map(|(n, f)| (n.as_str(), f)).collect();
-        let (post_s2, more) = crate::evaluate::forward_chain_defs_state(&refs, &post_s1);
+        let refs = to_seeded_refs(&s2_packed);
+        let (post_s2, more) = crate::evaluate::forward_chain_defs_state_seeded(
+            &refs, seed.clone(), &post_s1, 100);
         derived.extend(more);
         post_s2
     };
@@ -2197,50 +2247,115 @@ fn update_via_defs(
     };
     let stratum1 = collect_stratum("derivation");
     let stratum2 = collect_stratum("derivation_strat2");
-    // #836 — clear derived consequent cells before forward-chain
-    // (LFP per request, AREST.tex §4.3). Same fix as create_via_defs.
-    // task-929: noun-scope the wipe to derivation_index[noun]'s rules so
-    // cross-noun upstream consequent cells survive (see transition_via_defs
-    // comment for the bridge-rule failure mode this prevents).
-    let new_state = {
-        let drule_cell = ast::fetch_or_phi("DerivationRule", d);
-        let derived_cells: hashbrown::HashSet<String> = drule_cell.as_seq()
-            .map(|facts| facts.iter()
-                .filter(|f| relevant_ids.is_empty()
-                    || ast::binding(f, "id")
-                        .map(|id| relevant_ids.contains(id))
-                        .unwrap_or(false))
-                .filter_map(|f| ast::binding(f, "consequentFactTypeId"))
-                .map(|encoded| crate::types::ConsequentCellSource::decode(encoded)
-                    .literal_id().to_string())
-                .filter(|s| !s.is_empty())
-                .collect())
-            .unwrap_or_default();
-        if derived_cells.is_empty() {
-            new_state
-        } else {
-            let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
-            for (name, contents) in ast::cells_iter(&new_state).into_iter() {
-                if derived_cells.contains(name) {
-                    new_map.insert(name.to_string(), ast::Object::phi());
-                } else {
-                    new_map.insert(name.to_string(), contents.clone());
-                }
+
+    // task-3 phase 2 / DB-task-929: incremental forward chain via
+    // `forward_chain_defs_state_seeded`. Round 1 only runs rules whose
+    // positive antecedent reads (from `derivation_reads:<id>` sidecars
+    // emitted by compile.rs) intersect the seed.
+    //
+    // The seed combines:
+    //   * `touched_cells`  — cells the apply payload wrote (≈ the
+    //     `{noun}_has_{field}` for each new_field).
+    //   * `dropped_cells`-antecedents — the antecedent reads of every
+    //     rule whose consequent_cell was wiped by the drop-derived
+    //     step below. Without these, rules that wrote to dropped
+    //     cells whose antecedents weren't touched by the apply would
+    //     skip round 1 and the dropped cells would stay empty —
+    //     `handle_isolation_tests::update_clears_stale_derived_consequents_
+    //     before_forward_chain` exercises this exact case (Task 2
+    //     pending→completed retracts Task 1 'blocked').
+    // Pack rule (id, reads, func) once; reuse for the gate-build pass
+    // and the chainer call.
+    let touched_cells: hashbrown::HashSet<alloc::string::String> = new_fields.iter()
+        .map(|(field_name, _)| {
+            let lower = field_name.to_lowercase();
+            let resolved = def_func(&resolve_key, d)
+                .map(|f| ast::apply(&f, &ast::Object::atom(&lower), d));
+            match resolved.and_then(|o| o.as_atom().map(|s| s.to_string())) {
+                Some(s) if s != lower => s,
+                _ => alloc::format!("{}_has_{}", noun, field_name),
             }
-            ast::Object::Map(new_map.into())
-        }
+        })
+        .collect();
+    let build_seeded_refs = |stratum: &[(alloc::string::String, ast::Func)]|
+        -> alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<alloc::string::String>, ast::Func)>
+    {
+        stratum.iter().map(|(name, func)| {
+            let id = name.split_once(':').map(|(_, id)| id).unwrap_or(name);
+            let reads = crate::evaluate::read_derivation_reads(d, id).unwrap_or_default();
+            (name.clone(), reads, func.clone())
+        }).collect()
     };
-    let (new_state, mut derived) = if stratum1.is_empty() {
-        (new_state, Vec::new())
+    let s1_packed = build_seeded_refs(&stratum1);
+    let s2_packed = build_seeded_refs(&stratum2);
+
+    // #836 — clear derived consequent cells before forward-chain
+    // (LFP per request, AREST.tex §4.3). task-929: noun-scope the
+    // wipe to derivation_index[noun]'s rules so cross-noun upstream
+    // consequent cells survive.
+    let drule_cell = ast::fetch_or_phi("DerivationRule", d);
+    let dropped_cells: hashbrown::HashSet<String> = drule_cell.as_seq()
+        .map(|facts| facts.iter()
+            .filter(|f| relevant_ids.is_empty()
+                || ast::binding(f, "id")
+                    .map(|id| relevant_ids.contains(id))
+                    .unwrap_or(false))
+            .filter_map(|f| ast::binding(f, "consequentFactTypeId"))
+            .map(|encoded| crate::types::ConsequentCellSource::decode(encoded)
+                .literal_id().to_string())
+            .filter(|s| !s.is_empty())
+            .collect())
+        .unwrap_or_default();
+    let new_state = if dropped_cells.is_empty() {
+        new_state
     } else {
-        let refs: Vec<(&str, &ast::Func)> = stratum1.iter().map(|(n, f)| (n.as_str(), f)).collect();
-        crate::evaluate::forward_chain_defs_state(&refs, &new_state)
+        let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+        for (name, contents) in ast::cells_iter(&new_state).into_iter() {
+            if dropped_cells.contains(name) {
+                new_map.insert(name.to_string(), ast::Object::phi());
+            } else {
+                new_map.insert(name.to_string(), contents.clone());
+            }
+        }
+        ast::Object::Map(new_map.into())
+    };
+    // Antecedent reads of rules whose consequent_cell was dropped: the
+    // chainer needs these in dirty so those rules re-fire and
+    // repopulate the cleared cells.
+    let drop_writer_reads: hashbrown::HashSet<String> = drule_cell.as_seq()
+        .map(|facts| facts.iter()
+            .filter(|f| relevant_ids.is_empty()
+                || ast::binding(f, "id")
+                    .map(|id| relevant_ids.contains(id))
+                    .unwrap_or(false))
+            .filter_map(|f| {
+                let id = ast::binding(f, "id")?;
+                let consequent_encoded = ast::binding(f, "consequentFactTypeId")?;
+                let consequent = crate::types::ConsequentCellSource::decode(consequent_encoded)
+                    .literal_id().to_string();
+                if dropped_cells.contains(&consequent) {
+                    Some(crate::evaluate::read_derivation_reads(d, id).unwrap_or_default())
+                } else { None }
+            })
+            .flatten()
+            .collect())
+        .unwrap_or_default();
+    let mut seed = touched_cells.clone();
+    seed.extend(drop_writer_reads);
+
+    let (new_state, mut derived) = if stratum1.is_empty() {
+        (new_state, alloc::vec::Vec::new())
+    } else {
+        let refs = to_seeded_refs(&s1_packed);
+        crate::evaluate::forward_chain_defs_state_seeded(
+            &refs, seed.clone(), &new_state, 100)
     };
     let new_state = if stratum2.is_empty() {
         new_state
     } else {
-        let refs: Vec<(&str, &ast::Func)> = stratum2.iter().map(|(n, f)| (n.as_str(), f)).collect();
-        let (post_s2, more) = crate::evaluate::forward_chain_defs_state(&refs, &new_state);
+        let refs = to_seeded_refs(&s2_packed);
+        let (post_s2, more) = crate::evaluate::forward_chain_defs_state_seeded(
+            &refs, seed.clone(), &new_state, 100);
         derived.extend(more);
         post_s2
     };

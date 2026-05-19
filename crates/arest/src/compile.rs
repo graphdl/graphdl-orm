@@ -289,6 +289,17 @@ pub(crate) struct CompiledModel {
     /// on the state machine for the target noun. Derived from:
     ///   Fact Type is activated by Verb + Verb is performed during Transition.
     pub(crate) fact_events: HashMap<String, FactEvent>,
+    /// task-3 phase 2 / DB-task-929: positive antecedent reads per rule id.
+    /// CompiledDerivation already carries `negation_reads` for stratum
+    /// ordering; this is the complementary set of cells the rule reads
+    /// positively (e.g. an `iff Task has Task Status 'pending' and Task
+    /// blocks Task` rule reads `Task_has_Task_Status` + `Task_blocks_Task`).
+    /// `compile_to_defs_state` emits these as `derivation_reads:<id>`
+    /// sidecar cells so the apply path can build the
+    /// `(name, func, Option<&[String]>)` triples that
+    /// `evaluate::forward_chain_defs_state_seeded` consumes for round-1
+    /// rule gating.
+    pub(crate) derivation_positive_reads: HashMap<String, Vec<String>>,
 }
 
 /// When a fact is created in this schema, fire this event on the entity's state machine.
@@ -1646,6 +1657,24 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                 neg_reads_obj,
             ]);
             (format!("derivation_meta:{}", d.id), Func::constant(meta_obj))
+        }));
+
+    // task-3 phase 2 / DB-task-929: positive antecedent reads sidecar.
+    // One `derivation_reads:<rule_id>` cell per non-empty entry — empty
+    // ones are dropped so the apply-path lookup distinguishes
+    // "rule with no positive FT reads (e.g. pure-aggregate)" (absent
+    // cell, run conservatively) from "rule with cells X, Y" (present
+    // cell, gate against {X, Y}). Storing the empty list explicitly
+    // would force the chainer to gate the rule away from every dirty
+    // set, which is wrong — `InstancesOfNoun` antecedents read across
+    // every cell touching the noun and would be silently skipped.
+    defs.extend(model.derivation_positive_reads.iter()
+        .filter(|(_, reads)| !reads.is_empty())
+        .map(|(id, reads)| {
+            let reads_obj = Object::seq(reads.iter()
+                .map(|c| Object::atom(c.as_str()))
+                .collect());
+            (format!("derivation_reads:{}", id), Func::constant(reads_obj))
         }));
 
     // Migration rules (#349). One derivation-shaped def per Migration
@@ -3084,6 +3113,41 @@ fn compile_data_with_state(
     let derivations = compile_derivations(data, &state_machines);
     diag!("  [profile] {} derivations: {:?}", derivations.len(), t3.elapsed());
 
+    // task-3 phase 2 / DB-task-929: positive antecedent reads per rule
+    // id. Walked from `data.derivation_rules` (resolved upstream by
+    // `re_resolve_rules`), so synthetic rules — subtype inheritance,
+    // CWA negation, SM init/event-fold/for-Resource backfill — won't
+    // appear here. The chainer falls back to "no metadata → run
+    // conservatively" for those, which is safe but defeats incremental
+    // gating for the synthetic stratum. Acceptable trade-off: synthetic
+    // rules are few (single-digit per noun typically) and re-running
+    // them in round 1 is cheap; the cost forward_chain_defs_state_seeded
+    // attacks is the long-tail user-rule cardinality (~75 user rules on
+    // the live tasks.db corpus).
+    let derivation_positive_reads: HashMap<String, Vec<String>> = data.derivation_rules.iter()
+        .filter(|r| !r.id.is_empty())
+        .map(|r| {
+            let reads: Vec<String> = r.antecedent_sources.iter()
+                .filter_map(|src| match src {
+                    crate::types::AntecedentSource::FactType(id) => Some(id.clone()),
+                    // Negative reads are already encoded in
+                    // `derivation_meta:<id>`'s neg_reads (see
+                    // `derivation_dep_metadata`); the chainer pulls
+                    // both when sizing the gate, so they don't need
+                    // to be duplicated here.
+                    crate::types::AntecedentSource::AbsenceOf { .. } => None,
+                    // InstancesOfNoun isn't a single cell — it's a
+                    // virtual scan across every cell the noun appears
+                    // in. Treating it as "no metadata" via `None` lets
+                    // the chainer run the rule unconditionally, which
+                    // is the right default for these aggregate shapes.
+                    crate::types::AntecedentSource::InstancesOfNoun(_) => None,
+                })
+                .collect();
+            (r.id.clone(), reads)
+        })
+        .collect();
+
     let t4 = profile_timer::now();
     let schemas = compile_schemas(data);
     diag!("  [profile] {} schemas: {:?}", schemas.len(), t4.elapsed());
@@ -3108,7 +3172,8 @@ fn compile_data_with_state(
         }))
         .collect();
 
-    CompiledModel { constraints, derivations, state_machines, noun_index, schemas, fact_events }
+    CompiledModel { constraints, derivations, state_machines, noun_index,
+        schemas, fact_events, derivation_positive_reads }
 }
 
 /// Build the NounIndex from CellIndex.
