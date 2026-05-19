@@ -3703,7 +3703,7 @@ fn apps_tasks_readings_all_derivation_rules_survive_compile() {
 // regression guard without blocking CI until the bridge's
 // variable-unification bug is fixed (separate task — needs
 // resolve_derivation_rule investigation in parse_forml2.rs).
-#[ignore = "#924/#927: bridge 2 (Task has Task Status iff ...) returns Bottom on live shape — separate from Map/Seq duality; see probe output"]
+#[ignore = "#927 (probe pinpointed 2026-05-18): bridge rule `Task has Task Status iff that Resource is currently in some Status and Task Status is Status and Task is Resource` compiles with consequent_bindings=[] and match_on=[]. The trailing equality clauses (`Task Status is Status`, `Task is Resource`) aren't being recognized as variable-unification clauses that bind consequent roles to antecedent roles, so direct bridge apply returns Bottom even though Resource_is_currently_in_Status has the right entries. Fix in resolve_derivation_rule / compile_explicit_derivation's antecedent-clause parsing."]
 #[test]
 fn implicit_equi_join_with_actual_apps_tasks_readings() {
     // Mirror cli/entry.rs compile-load: fold metamodel + readings via
