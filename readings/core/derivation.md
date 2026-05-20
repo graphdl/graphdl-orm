@@ -2,13 +2,15 @@
 
 This file holds the FORML 2 declarative form of the structural
 derivation rules that AREST's compiler synthesises during
-`compile_to_defs_state`. Each rule is the universal-modus-ponens or
-universal-CWA schema from whitepaper §5.2 written against the
-metamodel cells (`Subtype`, `FactType`, `Role`, `Noun`).
+`compile_to_defs_state`. Each rule is the universal-modus-ponens
+schema from whitepaper §5.2 written against the metamodel cells
+(`Subtype`, `FactType`, `Role`, `Noun`). (Closed-world negation is
+NOT one of these rules — it is an evaluation-time semantics; see the
+CWA section below.)
 
 The compiler's `compile_subtype_inheritance_metamodel` (and the
 parallel `compile_derivations` paths for SS auto-fill, transitivity,
-CWA negation, SM init) lifts each rule into ONE `CompiledDerivation`
+SM init) lifts each rule into ONE `CompiledDerivation`
 whose Func is the union of the per-binding inner Funcs the rule
 quantifies over. The forward chainer fires that Func at evaluation
 time exactly as it would fire any user-authored derivation, and the
@@ -117,54 +119,44 @@ consequent cell name `_transitive_<Ft1>_<Ft2>` is preserved so
 SM-infrastructure gates in `command.rs` (which key off
 `_transitive_Status` / `_transitive_Transition`) keep working.
 
-## CWA negation (#893 — replaces the per-(CWA-noun, FT, role) Rust loop)
+## CWA negation (whitepaper §305 — an evaluation-time semantics, not a materialised rule)
 
-Whitepaper §5.2 universal CWA-negation schema: every instance of a
-closed-world Noun that does NOT participate in a Fact Type at a
-role played by that Noun is in the complement of that Fact Type at
-that role. Open-world Nouns are skipped — absence of evidence is
-not evidence of absence under OWA.
+The closed-world assumption is **not** a derivation rule and produces
+no synthetic facts. Per whitepaper §305 (citing Halpin ch.7), the
+world assumption is a property of each Noun that governs how absence
+is interpreted at evaluation time:
 
-* Fact Type has CWA-complement Resource
-    iff some Noun has World Assumption 'CWA'
-    and some Fact Type has Role at position P played by that Noun
-    and that Resource is instance of that Noun
-    and no Fact of that Fact Type binds Resource at that Role
-    and that Fact is `<<_neg_<Noun>, Resource>>`
-    and that Fact lives in the synthetic cell `_cwa_negation:<Fact Type id>`.
+> under CWA, a fact not in the population $P$ is false; under OWA, it
+> is unknown.
 
-The rule's antecedent quantifies over `Noun × FactType × Role ×
-<Noun-instances>` cells gated by `Noun.world_assumption = Closed`
-and the role-membership condition `Role.noun_name = Noun.name`; its
-consequent is the synthesized `<<_neg_<Noun>, Resource>>` binding
-pushed into every fresh `_cwa_negation:<FT id>` cell when no Fact
-of `FT id` binds Resource at the Noun's role.
-`compile_cwa_negation_metamodel` in `crates/arest/src/compile.rs`
-performs the lift to a Func:
+This is realised lazily by `evaluate::prove_from_state` in
+`crates/arest/src/compile.rs`'s sibling `evaluate.rs`: when a negation
+is queried, the prover searches $P$ for a matching fact; on a miss it
+returns `Disproven` if the queried Noun is `WorldAssumption::Closed`
+and `Unknown` if `WorldAssumption::Open`. There is no eager complement
+population — no `_cwa_negation:<ft>` cells, no `AbsenceOf` antecedent,
+no negation-guarded stratum. (An earlier implementation materialised
+the complement of every closed-world Noun across every Fact Type; it
+was removed 2026-05-19 as redundant with `prove_from_state`,
+non-faithful to §305's lazy semantics, and unconsumed — every cell
+consumer filtered the `_cwa_negation:` cells out as noise.) Behaviour
+is pinned by `evaluate::tests::test_cwa_vs_owa_negation`.
 
-  Concat . [
-    per-(CWA-Noun, FT, Role) inner Func,
-    ...
-  ]
-
-where each inner Func is the byte-for-byte same shape
-`compile_explicit_derivation` produces for an `InstancesOfNoun` +
-`AbsenceOf` 2-antecedent rule with
-`Literal("_cwa_negation:<FT id>")` consequent and
-`consequent_instance_role = "_neg_<Noun>"`. Behavioural equivalence
-with the pre-#893 per-triple fanout is pinned by
-`crates/arest/tests/cwa_negation_metamodel_rule_e2e.rs`. The
-consequent cell name `_cwa_negation:<FT id>` is preserved so
-SM-infrastructure gates in `command.rs` and the
-`evaluate::derivation_defs_from` consumer (which keys off the
-`_cwa_negation:` cell prefix) keep working.
+NORMA, the ORM2 reference implementation, models negation the same
+way: it is never a standalone "absence" antecedent. Negation is a
+flag on a node of an otherwise-positive role path (`IsNegated`), and
+closed-world completeness is a property of the *derived* Fact Type
+(`DerivationCompleteness = FullyDerived`). AREST follows this: the
+per-Noun world assumption is the CWA; should negated readings be
+needed in a future version, the faithful representation is a negation
+flag on a positive antecedent, not a new antecedent kind.
 
 ## Other structural rules (deferred — still synthesised in compile.rs)
 
-All four of #287/#311's structural-rule lifts (subtype inheritance,
-SS auto-fill, transitivity, CWA negation) are now expressed as
-declarative metamodel rules in this file. Future structural-rule
-lifts that need a similar treatment should follow the same shape:
+Three of #287/#311's structural-rule lifts (subtype inheritance,
+SS auto-fill, transitivity) are expressed as declarative metamodel
+rules in this file. Future structural-rule lifts that need a similar
+treatment should follow the same shape:
 the rule body above + a `compile_<name>_metamodel(data)` lift in
 `compile.rs` + a `<name>_metamodel_rule_e2e.rs` acceptance pin.
 
@@ -239,18 +231,7 @@ bottom of this section.
    `compile_join_derivation` because two antecedents share the join
    noun (Y). Pinned by `shape_join_path_via_possessive_expands_and_fires`.
 
-7. **Negation guard** — `X has Y 'value' and X has no Y 'other-value'`
-   adds an `AntecedentSource::AbsenceOf { fact_type, role }`
-   secondary antecedent (see site (1) of `resolve_derivation_rule`,
-   under `// Detect FORML2 negation patterns BEFORE resolving`).
-   Surface markers recognised: ` has no `, ` is not `, ` does not `,
-   leading `no `, leading `not `. The rule is flagged
-   `uses_negation = true` and routes through
-   `forward_chain_stratified`'s stratum-2 pass so the consequent of
-   any positive rule that emits the cell-under-negation lands FIRST.
-   Pinned by `sm_derivation_bridge_lets_readiness_rule_fire_off_projected_status`.
-
-8. **Numeric aggregation** — `X has Count iff Count is the count of Y
+7. **Numeric aggregation** — `X has Count iff Count is the count of Y
    where X has Y`. The clause shape `<role> is the <op> of <target>
    where <body>` lifts to `consequent_aggregates`; routes through
    `compile_aggregate_derivation`. Operators accepted (see
@@ -259,20 +240,20 @@ bottom of this section.
    `first`, `last`. `min` and `max` fold over NUMERIC role values
    only — they are NOT a comparator over enum-valued nouns.
 
-9. **Arithmetic-definitional binding** — `Volume is Size * Size *
+8. **Arithmetic-definitional binding** — `Volume is Size * Size *
    Size`. The clause shape `<RoleName> is <expr>` (where RoleName is
    a declared noun and `<expr>` parses through `parse_arithmetic_expr`
    over `+ - * /`) populates `consequent_computed_bindings`. Used by
    `compile_explicit_derivation`'s 1-antecedent path to project a
    computed value into the consequent fact.
 
-10. **Subtype membership check** — `X is a Y` / `X is an Y` (both X
+9. **Subtype membership check** — `X is a Y` / `X is an Y` (both X
     and Y declared nouns) recognised by `is_subtype_instance_check`
     in `parse_forml2.rs`. Doesn't emit an antecedent source — the
     subtype relationship is structural and handled by the metamodel
     rule earlier in this file.
 
-11. **Temporal predicate** — `now is in the past`, `… in the past`,
+10. **Temporal predicate** — `now is in the past`, `… in the past`,
     `… in the future` recognised by `TemporalPredicateTable`.
     Runtime clock checks; no FT resolution.
 
@@ -305,152 +286,17 @@ remaining positive antecedents fire, the consequent inherits
 bindings from the last antecedent that carries the consequent's
 role, and the rule appears to ignore the comparator clause entirely.
 
-Author rules that need an ordering / superlative semantic via the
-priority-cascade pattern below.
+### Priority/superlative semantics: an open authoring gap
 
-### Workaround: 2-level priority cascade with `has no` negation
-
-When a target value type has TWO priority levels and the candidate
-input is in a SINGLE-FT cell (not an existential-over-join), encode
-each priority level as its own derivation rule guarded by an
-`AbsenceOf` clause that ensures no higher-priority value was derived
-first. Example for a Task whose Readiness should be 'ready' when its
-precomputed Candidate Readiness cell carries 'ready', otherwise
-'blocked':
-
-```
-Task(.id) is an entity type.
-Task Readiness is a value type.
-Candidate Readiness is a value type.
-
-## Fact Types
-Task has Candidate Readiness.
-Task has Task Readiness.
-
-## Derivation Rules
-* Task has Task Readiness 'ready' iff Task has Candidate Readiness 'ready'.
-* Task has Task Readiness 'blocked' iff Task has Candidate Readiness 'blocked' and Task has no Task Readiness 'ready'.
-```
-
-Stage-1 (positive) rules emit `ready` whenever its precondition is
-met; stage-2 (negation-guarded) rules then emit `blocked` ONLY for
-Tasks that don't already have `ready`. The stratified chainer
-(`forward_chain_stratified` in `crates/arest/src/evaluate.rs`)
-alternates the two strata until both pass with zero novel facts, so
-the priority cascade reaches a unique least fixed point.
-
-Pinned by
-`priority_cascaded_readiness_picks_highest_via_no_negation` in
-`crates/arest/src/compile_explicit_derivation_tests.rs`.
-
-### Engine gaps task-814 surfaced (DO NOT use these shapes)
-
-The audit at task-814 attempted to extend the 2-level cascade to
-THREE priority levels via the existential-over-join shape
-`* Merge has X 'value' iff Merge concerns some Commit that has X 'value'`
-and found three independent engine gaps that make the natural shape
-NOT work end-to-end. Each gap is a follow-up task; see citations
-below.
-
-1. **Existential-over-join globally collapses to first-fact bindings.**
-   The shape `* X has Y 'lit' iff X concerns some Z that has Y 'lit'`
-   parses to a 2-antecedent ModusPonens rule (`join_on=[]` because
-   the `that`-relative is consumed by `expand_that_relatives` rather
-   than appearing as a `that <Noun>` token at antecedent split). It
-   routes to `compile_explicit_derivation`'s multi-antecedent
-   existence-check fallback (`crates/arest/src/compile.rs:4508-4566`)
-   which fires ONCE GLOBALLY whenever every antecedent has any
-   surviving fact — and projects bindings from the FIRST fact of
-   antecedent 0, not from a per-X fanout. Result: only one
-   consequent fact lands, with whatever X value happened to come
-   first in `Merge_concerns_Commit`.
-
-2. **`compile_join_derivation` drops `consequent_role_literals`.**
-   Authoring `* X has Y 'lit' iff X concerns some Z and that Z has Y 'lit'`
-   forces `kind = Join` (the `and that Z has …` form preserves the
-   join-key marker), which routes to `compile_join_derivation`. That
-   function builds binding_parts by walking consequent role names
-   and looking them up in antecedent FTs
-   (`crates/arest/src/compile.rs:4818-4824`); roles like `Posture
-   Witness` that exist ONLY on the consequent FT are silently
-   dropped. The literal pin via `rule.consequent_role_literals` is
-   NEVER applied. Result: derived facts have the right subject
-   binding but NO value binding — the cell ends up populated with
-   `<<Merge, m>>` tuples missing the priority literal.
-
-3. **`compile_join_derivation` drops `AbsenceOf` antecedents.**
-   When a Join-classified rule carries an AbsenceOf guard, the join
-   pipeline indexes fact_extractors by FT id and AbsenceOf returns
-   `""` for `fact_type_id()`. The extract collapses to an empty
-   fact list, the iterative join with an empty antecedent yields
-   ∅, and the rule produces zero consequent facts. (#918's fix
-   targeted only `compile_explicit_derivation`'s implicit-equi-join
-   branch.)
-
-4. **`forward_chain_stratified` is 2-stratum only.** (Closed by
-   task-814-stratify-3plus.)
-   The prior 2-stratum chainer ran ALL negation-guarded rules in
-   the same inner round. With 3+ priority levels — dual-gate /
-   single-gate / none — both the middle and lowest rules landed
-   in stratum 2 and fired together, so the lowest's
-   `has no Y 'middle'` guard evaluated against pre-emit state and
-   over-fired. The fix:
-   - **`evaluate::forward_chain_stratified_n`** is the
-     dependency-aware n-stratum entry point. It accepts
-     `StratifiedRule` records carrying each rule's
-     `consequent_cell`, `consequent_role_literals`, and
-     `negation_reads` (each AbsenceOf antecedent's cell + role-
-     literal pins). The chainer builds a dep graph where rule B
-     depends on rule A iff A's consequent cell matches one of B's
-     `negation_reads` cells AND the AbsenceOf's pins are
-     compatible with A's consequent pins. Topological depth
-     assignment partitions the rule set into sub-strata; each
-     sub-stratum runs to fixpoint before advancing.
-   - Role-literal pin compatibility (`pins_compatible` in
-     `evaluate.rs`) is what keeps the dep graph cycle-free: three
-     rules all writing to `Task_has_Target_Posture` with
-     different role-literal pins (`'dual-gate'` vs `'single-gate'`
-     vs `'none'`) don't form a dependency cycle because each
-     AbsenceOf only matches the rule whose consequent emits the
-     same literal — not every writer.
-   - Cells `derivation_meta:<rule_id>` carry the dep metadata at
-     runtime so the CLI compile path, apply path, and MCP query
-     path all use n-stratum dispatch automatically without
-     re-running the type-level compiler. Empty meta (no
-     `consequent_cell`, no `negation_reads`) collapses to depth
-     0 and runs in the first sub-stratum — equivalent to the
-     2-stratum bucket.
-   - The legacy 2-stratum `forward_chain_stratified(s1, s2, d, n)`
-     signature is preserved for callers without dep metadata and
-     correctly handles the 2-level cascade. Pinned by
-     `priority_cascaded_readiness_picks_highest_via_no_negation`
-     (unchanged) and the new 3-level pin
-     `priority_cascade_three_levels_fires_exactly_one_via_dependency_aware_stratification`.
-
-### Substrate-user workaround for the "strongest of collection" pattern
-
-Until the four gaps above are addressed, encode the
-"strongest-X-among-related-Y" semantics in TWO substrate steps:
-
-* **Step 1: precompute the candidate cell as instance facts (or via
-  a SQL view that materialises them).** For each X, emit one
-  `<X, candidate-value>` fact per related Y whose value contributes.
-  The candidate cell carries one fact per X×Y combination, NOT a
-  reduction.
-
-* **Step 2: run a 2-level priority cascade on the precomputed
-  candidate cell** (per the working pattern above). The cascade
-  reads from the candidate cell (which has no internal join), so
-  it routes through `compile_explicit_derivation`'s 1-positive-
-  antecedent + AbsenceOf path (#918) — the only path that handles
-  the workaround shape correctly.
-
-For more than 2 priority levels, split into MULTIPLE 2-level
-cascades, each writing to a distinct cell, and add a final stratum-1
-projection rule that selects the highest non-empty intermediate
-cell. Each pair of intermediate rules can then stratify cleanly
-within the existing 2-stratum chainer because each AbsenceOf reads
-a distinct cell from what the rule writes.
+An earlier draft documented a `has no`-negation 2-level priority
+cascade as a workaround for ordering/superlative semantics. That
+pattern relied on the parser converting `has no` / `is not` clauses
+into `AntecedentSource::AbsenceOf` antecedents and a negation-guarded
+stratum in the chainer. Both were removed 2026-05-19 (negation is not
+an antecedent kind — see the CWA section and the NORMA model it
+cites), so the cascade no longer parses. Ordering/superlative
+semantics over enum-valued nouns therefore remain an open authoring
+gap; the structural requirements for closing it faithfully are below.
 
 ### Why the comparator gap isn't trivial to close
 
@@ -508,21 +354,12 @@ second use site (besides Merge's Security Posture) materialises.
   — the ` that ` anaphora marker (#882 lift); drives the
   relative-clause expansion in `expand_that_relatives`.
 * `crates/arest/src/compile.rs::compile_explicit_derivation` —
-  1-antecedent fanout, `AbsenceOf` guard handling.
-* `crates/arest/src/compile.rs:3785-3919` — multi-AbsenceOf branch
-  for n-positive + n-negation (#918); the ONLY path that honors
-  AbsenceOf guards mixed with positive antecedents.
-* `crates/arest/src/compile.rs:4508-4566` — multi-antecedent
-  existence-check fallback; emits ONCE globally with first-fact
-  bindings (the source of gap #1).
+  1-antecedent fanout and the multi-antecedent equi-join / existence-
+  check paths.
 * `crates/arest/src/compile.rs::compile_join_derivation` —
-  2+-antecedent equi-join (path used by `kind = Join`). Drops
-  `consequent_role_literals` (gap #2) and AbsenceOf antecedents
-  (gap #3).
+  2+-antecedent equi-join (path used by `kind = Join`).
 * `crates/arest/src/compile.rs::compile_aggregate_derivation` —
   Codd image-set fold over numeric role values.
-* `crates/arest/src/evaluate.rs::forward_chain_stratified` —
-  alternating positive / negation-guarded rounds (2-stratum only;
-  gap #4 is the 3+-level limit).
-* `crates/arest/src/compile_explicit_derivation_tests.rs::priority_cascaded_readiness_picks_highest_via_no_negation`
-  — the working 2-level priority cascade pin.
+* `crates/arest/src/evaluate.rs::prove_from_state` — lazy CWA/OWA
+  negation: a goal absent from the population is Disproven (Closed) or
+  Unknown (Open), per whitepaper §305.
