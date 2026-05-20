@@ -962,6 +962,64 @@ Paper Element 'pe-aspirational' has Implementation Mode 'Aspirational'.
         "pe-aspirational (Mode=Aspirational) must NOT derive Liftable, got {:?}", lift_pairs);
 }
 
+/// task-924: SM-status → normalized-property bridge hop 2. The tasks
+/// app re-keys `Resource is currently in Status` into `Task has Task
+/// Status` via a 1-antecedent rule with identity-binding clauses
+/// (`Task is Resource`, `Task Status is Status`). On the live DB this
+/// fires ZERO (Task_has_Task_Status empty though the source cell has
+/// 751 rows). Pin: a populated Resource_is_currently_in_Status must
+/// re-key into Task_has_Task_Status.
+#[test]
+fn sm_status_bridge_rekeys_into_task_has_task_status() {
+    use crate::ast::fetch_or_phi;
+    let src = r#"# bridge repro
+Task(.id) is an entity type.
+Resource(.id) is an entity type.
+Status is a value type.
+Task Status is a value type.
+
+## Fact Types
+Resource is currently in Status.
+Task has Task Status.
+
+## Constraints
+Each Resource is currently in at most one Status.
+
+## Derivation Rules
+* Task has Task Status iff that Resource is currently in some Status and Task Status is Status and Task is Resource.
+
+## Instance Facts
+Resource 't1' is currently in Status 'Active'.
+"#;
+    let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src).expect("parse");
+    let defs = crate::compile::compile_to_defs_state(&state);
+    let d = crate::ast::defs_to_state(&defs, &state);
+    let stratum1: Vec<(String, crate::ast::Func)> = crate::ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:rule_"))
+        .map(|(n, contents)| (n.to_string(), crate::ast::metacompose(contents, &d)))
+        .collect();
+    let refs: Vec<(&str, &crate::ast::Func)> =
+        stratum1.iter().map(|(n, f)| (n.as_str(), f)).collect();
+    let (final_state, _) = crate::evaluate::forward_chain_defs_state(&refs, &state);
+    let cell = fetch_or_phi("Task_has_Task_Status", &final_state);
+    let pairs: Vec<(String, String)> = cell.as_seq().map(|facts| {
+        facts.iter().filter_map(|f| {
+            let ps = f.as_seq()?;
+            let mut task = None; let mut st = None;
+            for p in ps.iter() {
+                let kv = p.as_seq()?; if kv.len() != 2 { continue; }
+                let k = kv[0].as_atom()?; let v = kv[1].as_atom()?;
+                if k == "Task" { task = Some(v.to_string()); }
+                if k == "Task Status" || k == "Task_Status" { st = Some(v.to_string()); }
+            }
+            Some((task?, st?))
+        }).collect()
+    }).unwrap_or_default();
+    assert!(pairs.iter().any(|(t, s)| t == "t1" && s == "Active"),
+        "bridge hop 2 must re-key <Resource=t1, Status=Active> into \
+         Task_has_Task_Status <Task=t1, Task Status=Active>; got: {:?}", pairs);
+}
+
 // ─── Category 6: Aggregate ─────────────────────────────────────────
 //
 // Shape: `* X has R iff R is the <op> of Y where X has Y` — R is a

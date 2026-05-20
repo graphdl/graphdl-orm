@@ -5921,10 +5921,19 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
             ]))),
         );
         // Concat across all event facts to flatten the per-fact
-        // resource Seqs into one resource stream.
+        // resource Seqs into one resource stream, then drop φ (non-atom)
+        // values. Event cells can carry facts whose SM-noun role is φ
+        // (e.g. `<<Task, φ>>`); without this filter event-fold emits a
+        // status keyed on a φ resource, which propagates into the
+        // SM/Resource cells and Bottoms downstream computed-binding
+        // derivations (the Task_has_Task_Status bridge, task-924).
+        let non_phi = Func::compose(Func::Not, Func::NullTest);
         let resources = Func::compose(
-            Func::Concat,
-            Func::compose(Func::apply_to_all(extract_resource_per_fact), event_facts),
+            Func::filter(non_phi),
+            Func::compose(
+                Func::Concat,
+                Func::compose(Func::apply_to_all(extract_resource_per_fact), event_facts),
+            ),
         );
 
         // For each resource, emit the same 3-fact shape as SM init
