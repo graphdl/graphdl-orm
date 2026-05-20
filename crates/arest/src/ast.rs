@@ -4573,7 +4573,7 @@ fn encoded_pop_lookup(name: &str, state: &Object) -> Option<Object> {
 /// with the encoded pop as items[1]). `pop_is_encoded` distinguishes,
 /// and we skip the `encode_state` step when already encoded so the
 /// view's derivation func sees the shape it was compiled against.
-fn resolve_view(cell_name: &str, pop: &Object, defs: &Object) -> Option<Object> {
+pub(crate) fn resolve_view(cell_name: &str, pop: &Object, defs: &Object) -> Option<Object> {
     let def_key = alloc::format!("view:{}", cell_name);
     let stored = fetch_raw(&def_key, defs);
     if matches!(stored, Object::Bottom) {

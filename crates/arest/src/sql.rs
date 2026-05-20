@@ -128,16 +128,24 @@ fn materialize_fact_type_tables(conn: &Connection, state: &Object) -> rusqlite::
     let ft_ids: HashSet<String> = collect_fact_type_ids(state);
     let role_map: BTreeMap<String, Vec<String>> = collect_role_map(state);
 
-    for (cell_name, contents) in ast::cells_iter(state) {
-        if !ft_ids.contains(cell_name) {
-            continue;
-        }
-        let table = format!("ft_{}", sanitize_identifier(cell_name));
-        let columns = column_names_for(cell_name, contents, &role_map);
+    // Iterate declared FT ids (not just cells that happen to exist) so a
+    // view (derived) FT with no stored cell still gets a table.
+    for ft_id in &ft_ids {
+        // task-924: a view (derived) fact type's population IS its
+        // derivation's output, not the stored cell — the `view:` marker
+        // chooses lazy materialization, not different semantics. Resolve
+        // the view on read so a query reflects the derived facts;
+        // a never-materialized view otherwise reads as an empty cell.
+        let resolved = ast::resolve_view(ft_id, state, state);
+        let stored = resolved.is_none().then(|| ast::fetch_or_phi(ft_id, state));
+        let effective: &Object = resolved.as_ref().or(stored.as_ref())
+            .expect("resolved or stored is always Some");
+        let table = format!("ft_{}", sanitize_identifier(ft_id));
+        let columns = column_names_for(ft_id, effective, &role_map);
         if columns.is_empty() {
             continue;
         }
-        create_and_populate_table(conn, &table, &columns, contents)?;
+        create_and_populate_table(conn, &table, &columns, effective)?;
     }
     Ok(())
 }
@@ -472,6 +480,37 @@ mod tests {
         let err = parse_error(&env);
         assert!(err.to_lowercase().contains("no such table"),
             "expected no-such-table error, got: {}", err);
+    }
+
+    /// task-924: a `*`-marked (view / derived) fact type must resolve its
+    /// derivation when read via SQL — querying it returns the derived
+    /// facts, not the never-materialized (empty) stored cell. Pre-fix the
+    /// materializer read the stored cell and returned zero rows.
+    #[test]
+    fn view_fact_type_resolves_derivation_on_sql_read() {
+        let src = "Thing(.id) is an entity type.\n\
+Base(.id) is an entity type.\n\
+Tag is a value type.\n\
+Thing Tag is a value type.\n\
+\n\
+## Fact Types\n\
+Base has Tag.\n\
+Thing has Thing Tag. *\n\
+\n\
+## Derivation Rules\n\
+* Thing has Thing Tag iff that Base has some Tag and Thing Tag is Tag and Thing is Base.\n\
+\n\
+## Instance Facts\n\
+Base 'b1' has Tag 'hot'.\n";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src).expect("parse");
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let d = crate::ast::defs_to_state(&defs, &state);
+        let env = sql_query(&d, r#"SELECT "Thing", "Thing_Tag" FROM ft_Thing_has_Thing_Tag"#);
+        let rows = parse_rows(&env);
+        assert!(rows.iter().any(|r|
+            r.get("Thing").and_then(|v| v.as_str()) == Some("b1")
+                && r.get("Thing_Tag").and_then(|v| v.as_str()) == Some("hot")),
+            "view FT must resolve to derived facts on SQL read; got: {:?}", rows);
     }
 
     #[test]
