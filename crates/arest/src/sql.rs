@@ -132,14 +132,21 @@ fn materialize_fact_type_tables(conn: &Connection, state: &Object) -> rusqlite::
     // view (derived) FT with no stored cell still gets a table.
     for ft_id in &ft_ids {
         // task-924: a view (derived) fact type's population IS its
-        // derivation's output, not the stored cell — the `view:` marker
-        // chooses lazy materialization, not different semantics. Resolve
-        // the view on read so a query reflects the derived facts;
-        // a never-materialized view otherwise reads as an empty cell.
-        let resolved = ast::resolve_view(ft_id, state, state);
-        let stored = resolved.is_none().then(|| ast::fetch_or_phi(ft_id, state));
-        let effective: &Object = resolved.as_ref().or(stored.as_ref())
-            .expect("resolved or stored is always Some");
+        // derivation's output, not the stored cell. BUT only resolve the
+        // view when the stored cell is EMPTY — many derived cells are
+        // eagerly materialized (Stored) AND carry a `view:` def (mixed
+        // policy across the derivations writing the cell); resolving the
+        // view there would discard the materialized facts and re-derive a
+        // (possibly smaller / stale) population. Stored data, when
+        // present, is the eager truth; resolve only the never-
+        // materialized view (e.g. Task_has_Task_Status).
+        let stored = ast::fetch_or_phi(ft_id, state);
+        let resolved = if ast::cell_fact_count(&stored) == 0 {
+            ast::resolve_view(ft_id, state, state)
+        } else {
+            None
+        };
+        let effective: &Object = resolved.as_ref().unwrap_or(&stored);
         let table = format!("ft_{}", sanitize_identifier(ft_id));
         let columns = column_names_for(ft_id, effective, &role_map);
         if columns.is_empty() {
