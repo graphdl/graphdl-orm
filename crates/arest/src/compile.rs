@@ -5714,7 +5714,19 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
         let id_str = format!("_sm_init_{}", sm_noun);
         let text_str = format!("SM init for {}", sm_noun);
 
-        let get_instances = instances_of_noun_func(&sm_noun);
+        // Drop φ (non-atom) values. Trigger-FT cells can carry facts
+        // whose SM-noun role is φ (e.g. `<<Task, φ>>` in Task_is_started
+        // on the live tasks.db). A φ flowing into `SetFromSeq` makes it
+        // return Bottom (non-atom key — ast.rs SetFromSeq contract), which
+        // collapses the whole init func to Bottom and silently emits NO
+        // initial statuses. Filtering φ out of both the instance set and
+        // the existing-set keeps init total over dirty populations.
+        let non_phi = Func::compose(Func::Not, Func::NullTest);
+
+        let get_instances = Func::compose(
+            Func::filter(non_phi.clone()),
+            instances_of_noun_func(&sm_noun),
+        );
 
         let extract_for_resource = Func::compose(
             Func::apply_to_all(Func::Selector(2)),
@@ -5782,7 +5794,10 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
         // ~1.8ms (~4× faster); regression-guarded by
         // membership_perf_set_from_seq_beats_has_member_after_arc_map
         // in ast.rs.
-        let get_existing_set = Func::compose(Func::SetFromSeq, get_existing);
+        let get_existing_set = Func::compose(
+            Func::SetFromSeq,
+            Func::compose(Func::filter(non_phi.clone()), get_existing),
+        );
 
         let pairs = Func::construction(vec![get_instances, get_existing_set]);
 
@@ -6009,11 +6024,18 @@ fn compile_sm_for_resource_backfill_for(sm: &CompiledStateMachine) -> CompiledDe
             Func::constant(Object::atom("State Machine")),
         ]))),
     );
+    // Drop φ (non-atom) values: a φ candidate or existing entry would
+    // make SetFromSeq/FetchOrPhi return Bottom, collapsing the backfill.
+    // Mirrors the guard in `compile_sm_init_for`.
+    let non_phi = Func::compose(Func::Not, Func::NullTest);
     let candidates = Func::compose(
-        Func::Concat,
+        Func::filter(non_phi.clone()),
         Func::compose(
-            Func::apply_to_all(extract_state_machine),
-            extract_facts_from_pop("State_Machine_is_currently_in_Status"),
+            Func::Concat,
+            Func::compose(
+                Func::apply_to_all(extract_state_machine),
+                extract_facts_from_pop("State_Machine_is_currently_in_Status"),
+            ),
         ),
     );
 
@@ -6032,7 +6054,10 @@ fn compile_sm_for_resource_backfill_for(sm: &CompiledStateMachine) -> CompiledDe
             extract_facts_from_pop("State_Machine_is_for_Resource"),
         ),
     );
-    let existing_set = Func::compose(Func::SetFromSeq, existing);
+    let existing_set = Func::compose(
+        Func::SetFromSeq,
+        Func::compose(Func::filter(non_phi.clone()), existing),
+    );
 
     // is_new on `<candidate, existing_set>`: T iff candidate is NOT
     // already in for_Resource. Mirrors the existence guard in

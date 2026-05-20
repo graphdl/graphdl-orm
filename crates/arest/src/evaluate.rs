@@ -1869,6 +1869,167 @@ mod tests {
         assert_eq!(initial, "Shipped", "explicit declaration overrides graph topology");
     }
 
+    /// task-6 / #6 regression: SM-init must emit the INITIAL status for a
+    /// "bare" instance — one that exists (plays the SM noun's role in some
+    /// cell) but has NO transition events and no prior SM row. In the live
+    /// apps/tasks DB, 0 of 661 entities carried the initial 'pending'
+    /// status: this emit never fired, so only event-fold produced statuses
+    /// and un-transitioned tasks (922-929) ended up with no state machine.
+    #[test]
+    fn sm_init_emits_initial_status_for_bare_instance() {
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "Order", &make_noun("entity"));
+        cells = with_noun(cells, "Name", &make_noun("value"));
+        cells = with_ft(cells, "Order_has_Name", &FactTypeDef {
+            schema_id: String::new(),
+            reading: "Order has Name".to_string(),
+            readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Order".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Name".to_string(), role_index: 1 },
+            ],
+        });
+        cells = with_state_machine(cells, "OrderSM", &StateMachineDef {
+            noun_name: "Order".to_string(),
+            statuses: vec!["Draft".to_string(), "Placed".to_string(), "Shipped".to_string()],
+            transitions: vec![
+                TransitionDef { from: "Draft".to_string(), to: "Placed".to_string(), event: "Order_was_placed".to_string(), guard: None },
+                TransitionDef { from: "Placed".to_string(), to: "Shipped".to_string(), event: "Order_was_shipped".to_string(), guard: None },
+            ],
+            initial: "Draft".to_string(),
+        });
+        // A bare Order instance: exists via Order_has_Name, no events.
+        cells.entry("Order_has_Name".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Order", "o1"), ("Name", "Widget")]));
+
+        let (state, defs, _def_map) = compile_cells(cells);
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &state);
+
+        let got: Vec<_> = derived.iter()
+            .filter(|d| d.fact_type_id == "State_Machine_is_currently_in_Status")
+            .collect();
+        let has_o1_draft = got.iter().any(|d| {
+            let sm = d.bindings.iter().find(|(k, _)| k == "State Machine").map(|(_, v)| v.as_str());
+            let st = d.bindings.iter().find(|(k, _)| k == "Status").map(|(_, v)| v.as_str());
+            sm == Some("o1") && st == Some("Draft")
+        });
+        assert!(has_o1_draft,
+            "SM-init must emit initial status 'Draft' for bare instance o1 \
+             (no events). Got currently_in_Status emits: {:?}", got);
+    }
+
+    /// task-6 / #6 scale repro: a bare instance alongside an
+    /// event-bearing one. In round 1 of recompile, for_Resource is empty
+    /// (just dropped) but event cells are present, so is_new must skip the
+    /// event-bearing instance (event-fold owns it) while still emitting the
+    /// initial status for the bare one.
+    #[test]
+    fn sm_init_emits_initial_for_bare_instance_when_another_has_event() {
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "Order", &make_noun("entity"));
+        cells = with_noun(cells, "Name", &make_noun("value"));
+        cells = with_ft(cells, "Order_has_Name", &FactTypeDef {
+            schema_id: String::new(), reading: "Order has Name".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Order".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Name".to_string(), role_index: 1 },
+            ],
+        });
+        cells = with_ft(cells, "Order_was_placed", &FactTypeDef {
+            schema_id: String::new(), reading: "Order was placed".to_string(), readings: vec![],
+            roles: vec![RoleDef { noun_name: "Order".to_string(), role_index: 0 }],
+        });
+        cells = with_state_machine(cells, "OrderSM", &StateMachineDef {
+            noun_name: "Order".to_string(),
+            statuses: vec!["Draft".to_string(), "Placed".to_string(), "Shipped".to_string()],
+            transitions: vec![
+                TransitionDef { from: "Draft".to_string(), to: "Placed".to_string(), event: "Order_was_placed".to_string(), guard: None },
+                TransitionDef { from: "Placed".to_string(), to: "Shipped".to_string(), event: "Order_was_shipped".to_string(), guard: None },
+            ],
+            initial: "Draft".to_string(),
+        });
+        // o1 bare; o2 has a placed event (event-fold owns it).
+        cells.entry("Order_has_Name".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Order", "o1"), ("Name", "Widget")]));
+        cells.entry("Order_has_Name".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Order", "o2"), ("Name", "Gadget")]));
+        cells.entry("Order_was_placed".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Order", "o2")]));
+
+        let (state, defs, _def_map) = compile_cells(cells);
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &state);
+
+        let status_of = |id: &str| -> Vec<String> {
+            derived.iter()
+                .filter(|d| d.fact_type_id == "State_Machine_is_currently_in_Status")
+                .filter(|d| d.bindings.iter().any(|(k, v)| k == "State Machine" && v == id))
+                .filter_map(|d| d.bindings.iter().find(|(k, _)| k == "Status").map(|(_, v)| v.clone()))
+                .collect()
+        };
+        assert!(status_of("o1").iter().any(|s| s == "Draft"),
+            "bare o1 must get initial 'Draft'; got {:?}", status_of("o1"));
+    }
+
+    /// task-6 / #6 ROOT-CAUSE repro: a transition trigger-FT cell that
+    /// contains a fact with a φ (phi) value in the SM-noun role — e.g.
+    /// `<<Task, φ>>` in Task_is_started (the live tasks.db has these).
+    /// SM-init's get_existing extracts that φ into the existing-set;
+    /// SetFromSeq / FetchOrPhi over a φ key makes the whole init func
+    /// evaluate to Bottom, silently emitting NO initial statuses.
+    #[test]
+    fn sm_init_survives_phi_value_in_event_cell() {
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "Order", &make_noun("entity"));
+        cells = with_noun(cells, "Name", &make_noun("value"));
+        cells = with_ft(cells, "Order_has_Name", &FactTypeDef {
+            schema_id: String::new(), reading: "Order has Name".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Order".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Name".to_string(), role_index: 1 },
+            ],
+        });
+        cells = with_ft(cells, "Order_was_placed", &FactTypeDef {
+            schema_id: String::new(), reading: "Order was placed".to_string(), readings: vec![],
+            roles: vec![RoleDef { noun_name: "Order".to_string(), role_index: 0 }],
+        });
+        cells = with_state_machine(cells, "OrderSM", &StateMachineDef {
+            noun_name: "Order".to_string(),
+            statuses: vec!["Draft".to_string(), "Placed".to_string(), "Shipped".to_string()],
+            transitions: vec![
+                TransitionDef { from: "Draft".to_string(), to: "Placed".to_string(), event: "Order_was_placed".to_string(), guard: None },
+                TransitionDef { from: "Placed".to_string(), to: "Shipped".to_string(), event: "Order_was_shipped".to_string(), guard: None },
+            ],
+            initial: "Draft".to_string(),
+        });
+        // Bare instance o1.
+        cells.entry("Order_has_Name".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Order", "o1"), ("Name", "Widget")]));
+        // A φ-valued event fact: <<Order, φ>> in the trigger cell, as the
+        // live tasks.db carries (`<<Task, ?>, <Task_is_started, ?>>`).
+        cells.entry("Order_was_placed".to_string()).or_default().push(
+            ast::Object::seq(vec![
+                ast::Object::seq(vec![ast::Object::atom("Order"), ast::Object::phi()]),
+            ]));
+
+        let (state, defs, _def_map) = compile_cells(cells);
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &state);
+
+        let got_draft = derived.iter()
+            .filter(|d| d.fact_type_id == "State_Machine_is_currently_in_Status")
+            .any(|d| {
+                let sm = d.bindings.iter().find(|(k, _)| k == "State Machine").map(|(_, v)| v.as_str());
+                let st = d.bindings.iter().find(|(k, _)| k == "Status").map(|(_, v)| v.as_str());
+                sm == Some("o1") && st == Some("Draft")
+            });
+        assert!(got_draft,
+            "bare o1 must get initial 'Draft' even when an event cell has a \
+             φ-valued fact; got: {:?}",
+            derived.iter().filter(|d| d.fact_type_id == "State_Machine_is_currently_in_Status").collect::<Vec<_>>());
+    }
+
     #[test]
     fn test_initial_status_empty_when_cyclic() {
         // Fully cyclic machine: every status is both source and target.
