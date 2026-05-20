@@ -297,19 +297,6 @@ pub enum AntecedentSource {
     /// Antecedent is a Seq of raw noun-instance atoms aggregated
     /// across every cell that binds the noun.
     InstancesOfNoun(String),
-    /// **Dead variant** — kept for backward compatibility with
-    /// persisted state from pre-2026-05-19 sessions. The parser no
-    /// longer emits this (the `has no` / `is not` / `does not`
-    /// surface markers were removed from `parse_forml2.rs`'s
-    /// antecedent resolver), so no new AbsenceOf entries are
-    /// created. Engine code paths that pattern-match this variant
-    /// still exist as dead branches; see local task #8 for the
-    /// follow-up purge.
-    #[deprecated(note = "Engine-introduced; not in Halpin's FORML 2. Use deontic constraints and the validation layer for absence semantics.")]
-    AbsenceOf {
-        fact_type: String,
-        role: String,
-    },
 }
 
 impl AntecedentSource {
@@ -337,29 +324,12 @@ impl AntecedentSource {
                 out.push_str(&wire_escape(noun));
                 out
             }
-            #[allow(deprecated)]
-            Self::AbsenceOf { fact_type, role } => {
-                let mut out = String::from("@absence:");
-                out.push_str(&wire_escape(fact_type));
-                out.push(':');
-                out.push_str(&wire_escape(role));
-                out
-            }
         }
     }
 
     pub fn decode(s: &str) -> Self {
         if let Some(escaped) = s.strip_prefix("@noun:") {
             return Self::InstancesOfNoun(wire_unescape(escaped));
-        }
-        if let Some(rest) = s.strip_prefix("@absence:") {
-            if let Some((ft_escaped, role_escaped)) = wire_split_once_unescaped(rest, ':') {
-                #[allow(deprecated)]
-                return Self::AbsenceOf {
-                    fact_type: wire_unescape(&ft_escaped),
-                    role: wire_unescape(&role_escaped),
-                };
-            }
         }
         Self::FactType(s.to_string())
     }
@@ -788,14 +758,6 @@ fn antecedent_source_write(out: &mut String, src: &AntecedentSource) {
             json_escape(out, s);
             out.push('}');
         }
-        #[allow(deprecated)]
-        AntecedentSource::AbsenceOf { fact_type, role } => {
-            out.push_str("{\"kind\":\"absenceOf\",\"value\":{\"fact_type\":");
-            json_escape(out, fact_type);
-            out.push_str(",\"role\":");
-            json_escape(out, role);
-            out.push_str("}}");
-        }
     }
 }
 
@@ -806,7 +768,6 @@ fn derivation_kind_write(out: &mut String, k: &DerivationKind) {
         DerivationKind::SubtypeInheritance => "subtypeInheritance",
         DerivationKind::ModusPonens => "modusPonens",
         DerivationKind::Transitivity => "transitivity",
-        DerivationKind::ClosedWorldNegation => "closedWorldNegation",
         DerivationKind::Join => "join",
     };
     out.push('"');
@@ -1056,7 +1017,6 @@ pub enum DerivationKind {
     SubtypeInheritance, // X is subtype of Y -> X inherits Y's constraints
     ModusPonens,        // If A then B, A holds -> B holds
     Transitivity,       // A->B, B->C -> A->C
-    ClosedWorldNegation, // Not derivable under CWA -> false
     Join,               // Cross-fact-type equi-join on shared noun names
 }
 

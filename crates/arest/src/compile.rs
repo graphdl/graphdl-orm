@@ -182,23 +182,9 @@ fn derivation_dep_metadata(rule: &crate::types::DerivationRuleDef) -> (
     let consequent_cell = rule.consequent_cell.literal_id().to_string();
     let consequent_role_literals: Vec<(String, String)> = rule.consequent_role_literals.iter()
         .map(|crl| (crl.role.clone(), crl.value.clone())).collect();
-    // task-7 phase-1: AbsenceOf is deprecated. Parser-emitted rules
-    // never contain it post-2026-05-19, so negation_reads ends up
-    // empty for any new rule. The match below stays defensive for
-    // persisted DBs whose DerivationRule cell still has @absence:
-    // sentinels from before the parser change.
-    #[allow(deprecated)]
-    let negation_reads: Vec<(String, Vec<(String, String)>)> = rule.antecedent_sources.iter().enumerate()
-        .filter_map(|(idx, src)| {
-            if let crate::types::AntecedentSource::AbsenceOf { fact_type, .. } = src {
-                let pins: Vec<(String, String)> = rule.antecedent_role_literals.iter()
-                    .filter(|arl| arl.antecedent_index == idx)
-                    .map(|arl| (arl.role.clone(), arl.value.clone()))
-                    .collect();
-                Some((fact_type.clone(), pins))
-            } else { None }
-        })
-        .collect();
+    // task-7: AbsenceOf has been removed. Negation-guarded antecedents
+    // no longer exist, so there are never any negation reads.
+    let negation_reads: Vec<(String, Vec<(String, String)>)> = Vec::new();
     (consequent_cell, consequent_role_literals, negation_reads)
 }
 
@@ -1845,38 +1831,6 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             }
             pairs
         };
-        // #893: collect every (CWA-noun, ft_id) pair the CWA-negation
-        // metamodel rule fans out over — every FT where some CWA
-        // noun (the default `WorldAssumption::Closed`) plays a role.
-        // The single `_cwa_negation` metamodel rule carries no
-        // individual noun name in its id (the merged Func emits the
-        // union of every per-(noun, ft, role) inner Func), so the
-        // substring fallback misses it — same gap #890 patched for
-        // `_subtype_inheritance`, #891 patched for `_ss_autofill`,
-        // and #892 patched for `_transitivity`. We key the rule
-        // under every noun that plays a role in any FT-with-a-CWA-
-        // role, so noun-gated dispatch
-        // (`command::create_via_defs`) finds it for any role of any
-        // FT involved in a CWA-negation derivation.
-        let cwa_negation_ft_pairs: Vec<(String, String)> = {
-            let mut pairs: Vec<(String, String)> = Vec::new();
-            // Walk `c_nouns` (the indexed Noun definitions) keeping
-            // only CWA nouns, mirroring
-            // `compile_cwa_negation_metamodel`'s noun filter exactly,
-            // then walk `c_fact_types` for any role-membership match.
-            // Same source so the index lines up with the compiled
-            // rule's actual fanout.
-            for (noun_name, ndef) in c_nouns.iter() {
-                if ndef.world_assumption != WorldAssumption::Closed { continue; }
-                for (ft_id, ft) in c_fact_types.iter() {
-                    if ft.roles.iter().any(|r| r.noun_name == *noun_name) {
-                        let entry = (noun_name.clone(), ft_id.clone());
-                        if !pairs.contains(&entry) { pairs.push(entry); }
-                    }
-                }
-            }
-            pairs
-        };
         let mut noun_to_derivations: HashMap<String, Vec<String>> = HashMap::new();
         // For each compiled derivation, determine which nouns are involved.
         // Strategy: check the derivation ID and all fact types in the domain
@@ -1976,22 +1930,6 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                         if let Some(ft) = c_fact_types.get(ft_id.as_str()) {
                             for role in &ft.roles { nouns.insert(role.noun_name.clone()); }
                         }
-                    }
-                }
-            }
-            // #893: same patch for the single `_cwa_negation`
-            // metamodel rule — the merged Func emits the union of
-            // every per-(CWA-noun, ft, role) inner Func, so no
-            // single noun appears in the def id. Key under the CWA
-            // noun itself AND every noun that plays a role in the
-            // gated FT (so a peer-role noun's create dispatch also
-            // triggers re-evaluation of the CWA-negation rule that
-            // partly fires on its FT).
-            if did == CWA_NEGATION_ID {
-                for (noun_name, ft_id) in cwa_negation_ft_pairs.iter() {
-                    nouns.insert(noun_name.clone());
-                    if let Some(ft) = c_fact_types.get(ft_id.as_str()) {
-                        for role in &ft.roles { nouns.insert(role.noun_name.clone()); }
                     }
                 }
             }
@@ -3133,16 +3071,9 @@ fn compile_data_with_state(
     let derivation_positive_reads: HashMap<String, Vec<String>> = data.derivation_rules.iter()
         .filter(|r| !r.id.is_empty())
         .map(|r| {
-            #[allow(deprecated)]
             let reads: Vec<String> = r.antecedent_sources.iter()
                 .filter_map(|src| match src {
                     crate::types::AntecedentSource::FactType(id) => Some(id.clone()),
-                    // Negative reads are already encoded in
-                    // `derivation_meta:<id>`'s neg_reads (see
-                    // `derivation_dep_metadata`); the chainer pulls
-                    // both when sizing the gate, so they don't need
-                    // to be duplicated here.
-                    crate::types::AntecedentSource::AbsenceOf { .. } => None,
                     // InstancesOfNoun isn't a single cell — it's a
                     // virtual scan across every cell the noun appears
                     // in. Treating it as "no metadata" via `None` lets
@@ -3320,20 +3251,12 @@ fn compile_derivations(data: &CellIndex, state_machines: &[CompiledStateMachine]
         derivations.push(d);
     }
 
-    // CWA negation (#893): the per-(CWA-noun, FT, role) synthesis
-    // loop is replaced by ONE metamodel derivation rule declared in
-    // `readings/core/derivation.md` and lifted to ONE
-    // CompiledDerivation by `compile_cwa_negation_metamodel`.
-    // Whitepaper §5.2: this is the universal CWA-negation schema —
-    // antecedent quantifies over `Noun × FactType × Role × <Noun-
-    // instances>` cells gated by `world_assumption = Closed` and the
-    // role-membership condition; consequent is the synthesized
-    // `<<_neg_<noun>, instance>>` fact pushed into the synthetic
-    // `_cwa_negation:<ft_id>` cell when no fact of `ft_id` binds
-    // that instance at that role.
-    if let Some(d) = compile_cwa_negation_metamodel(data) {
-        derivations.push(d);
-    }
+    // CWA negation is NOT materialized. Per whitepaper §305, the
+    // closed-world assumption is an evaluation-time semantics scoped
+    // by each noun's `world_assumption`: a fact absent from the
+    // population is false under CWA, unknown under OWA. This is
+    // realized lazily by `evaluate::prove_from_state` at the point a
+    // negation is queried — no synthetic complement cells.
 
     // Implicit: state machine initialization from cell-driven SM defs.
     // MC3b-e (#763): SMs come from `compile_state_machine_from_cells`,
@@ -3888,12 +3811,10 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
     };
 
     // InstancesOfNoun dispatch (#287 gaps #2, #12): primary antecedent
-    // is `InstancesOfNoun(noun)`; optional secondary `AbsenceOf`
-    // antecedent adds a participation guard. Handled ahead of the
-    // antecedent-count dispatch because adding an `AbsenceOf`
-    // secondary shouldn't flip the rule out of the per-instance
-    // fanout shape into the multi-antecedent existence check — it's
-    // a guard on the primary, not an independent antecedent.
+    // is `InstancesOfNoun(noun)` — fan out one consequent fact per
+    // instance of the noun, deduped against the consequent FT when it
+    // declares the instance role. Handled ahead of the antecedent-
+    // count dispatch.
     if let Some(crate::types::AntecedentSource::InstancesOfNoun(noun)) =
         rule.antecedent_sources.first()
     {
@@ -3912,21 +3833,9 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             consequent_reading_func.clone(),
             bindings,
         ]);
-        // Guard resolution — explicit AbsenceOf wins over implicit
-        // consequent-based dedup, otherwise fall back to the latter
-        // when the consequent FT declares the instance role.
-        #[allow(deprecated)]
-        let absence_guard: Option<(String, usize)> = rule.antecedent_sources.get(1)
-            .and_then(|s| match s {
-                crate::types::AntecedentSource::AbsenceOf { fact_type, role } => {
-                    data.fact_types.get(fact_type)
-                        .and_then(|ft| ft.roles.iter()
-                            .find(|r| r.noun_name == *role)
-                            .map(|r| (fact_type.clone(), r.role_index)))
-                }
-                _ => None,
-            });
-        let implicit_dedup: Option<(String, usize)> = {
+        // Guard resolution — dedup against the consequent FT when it
+        // declares the instance role.
+        let guard: Option<(String, usize)> = {
             let cell_id = rule.consequent_cell.literal_id();
             let lookup_id = cell_id.split_once(':').map(|(_, b)| b).unwrap_or(cell_id);
             data.fact_types.get(lookup_id)
@@ -3934,7 +3843,6 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     .find(|r| r.noun_name == rule.consequent_instance_role)
                     .map(|r| (lookup_id.to_string(), r.role_index)))
         };
-        let guard = absence_guard.or(implicit_dedup);
         let per_instance = match &guard {
             Some((ft, ri)) => {
                 let ri = *ri;
@@ -4318,181 +4226,6 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             per_fact
         }
         _ => {
-            // task-918-implicit-equi-join-uses-negation: indices of every
-            // AbsenceOf antecedent in the rule. Used below in two places:
-            //   - the multi-AbsenceOf branch already detects "all subsequent
-            //     are AbsenceOf" via its own pattern-match and unconditionally
-            //     sets uses_negation: true, so this set is informational there.
-            //   - the implicit-equi-join branch (path a) and the existential-
-            //     over-join branch (path a') previously hardcoded
-            //     uses_negation: false even when the body included AbsenceOf
-            //     antecedents. They now derive uses_negation from this set
-            //     so the chain orchestrator routes the rule into stratum 2
-            //     when any AbsenceOf is present (mirrors the multi-AbsenceOf
-            //     branch's behavior + task-814-join-absence's port to
-            //     compile_join_derivation, commit a2aa46e8).
-            let absence_idx: Vec<usize> = rule.antecedent_sources.iter().enumerate()
-                .filter_map(|(i, s)|
-                    matches!(s, crate::types::AntecedentSource::AbsenceOf { .. })
-                        .then_some(i))
-                .collect();
-
-            // Negation guard (#826b, generalised in #918): a 2+-antecedent
-            // rule whose ALL subsequent antecedents are `AbsenceOf` is
-            // `<positive ant 0> AND no matching fact in <negated FT 1> AND
-            // no matching fact in <negated FT 2> AND …`. Fire per a0 in
-            // the positive antecedent only when EVERY negated FT has no
-            // matching fact for that a0's join-role value (and any
-            // pinned role literals on each AbsenceOf).
-            //
-            // Pre-#918 this branch only handled the 2-antecedent special
-            // case (single AbsenceOf at position 1); 3+-antecedent rules
-            // like `Task is parallelizable iff Task has Task Readiness
-            // 'ready' and Task is not file-conflicting and Task is not
-            // epic` fell through to the existence-check fallback, which
-            // emitted ≈0 facts because `extract(i, "")` (AbsenceOf's
-            // empty fact_type_id) collapsed each subsequent antecedent's
-            // stream to empty.
-            let all_subsequent_are_absence = antecedent_ids.len() >= 2
-                && rule.antecedent_sources.iter().skip(1).all(|s|
-                    matches!(s, crate::types::AntecedentSource::AbsenceOf { .. }));
-            if all_subsequent_are_absence {
-                let ant0 = extract(0, &antecedent_ids[0]);
-                let absence_guard_specs: Vec<(Func, Func)> = rule.antecedent_sources.iter().enumerate().skip(1).filter_map(|(i, s)| {
-                    let (fact_type, role) = match s {
-                        crate::types::AntecedentSource::AbsenceOf { fact_type, role } => (fact_type, role),
-                        _ => return None,
-                    };
-                    let neg_ft_facts = extract_facts_from_pop(fact_type);
-                    let a0_match_role: String = data.fact_types.get(&antecedent_ids[0])
-                        .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == *role))
-                        .map(|r| r.noun_name.clone())
-                        .unwrap_or_else(|| role.clone());
-                    // task-821: when the negated cell is Map-backed
-                    // (single-role alethic UC keyed on the AbsenceOf
-                    // role) AND this antecedent has no role-literal
-                    // pins, the "no fact matches key" check collapses
-                    // to `NullTest ∘ FetchOrPhi:<a0_role_value, cell>`
-                    // — O(1) per a0 instead of O(N) filter+DistL.
-                    // Pin-bearing antecedents need a stricter
-                    // "no fact matches key AND pins" semantics that
-                    // doesn't reduce to a single FetchOrPhi, so they
-                    // stay on the legacy path. Each AbsenceOf subterm
-                    // picks its shape independently — mixed multi-
-                    // AbsenceOf rules (some keyed/pin-free, some not)
-                    // get the best of each.
-                    let key_roles = data.fact_types.get(fact_type)
-                        .and_then(|_| key_roles_for_ft(data, fact_type));
-                    let neg_role_index = data.fact_types.get(fact_type)
-                        .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == *role).map(|r| r.role_index));
-                    let has_pins_for_this = rule.antecedent_role_literals.iter()
-                        .any(|arl| arl.antecedent_index == i);
-                    let map_aware = !has_pins_for_this
-                        && match (&key_roles, neg_role_index) {
-                            (Some(kr), Some(ri)) => kr.as_slice() == [ri],
-                            _ => false,
-                        };
-                    let absent_guard = if map_aware {
-                        // Pair input: `<a0_fact, neg_ft_cell>`. Pull
-                        // the join-role value out of `a0_fact` as the
-                        // needle, then read the cell at that key.
-                        // FetchOrPhi returns φ on absent → NullTest=T
-                        // means "no matching fact" → guard passes.
-                        Func::compose(
-                            Func::NullTest,
-                            Func::compose(
-                                Func::FetchOrPhi,
-                                Func::construction(vec![
-                                    Func::compose(
-                                        role_value_by_name(&a0_match_role),
-                                        Func::Selector(1),
-                                    ),
-                                    Func::Selector(2),
-                                ]),
-                            ),
-                        )
-                    } else {
-                        let key_match = Func::compose(Func::Eq, Func::construction(vec![
-                            Func::compose(role_value_by_name(role), Func::Selector(2)),
-                            Func::compose(role_value_by_name(&a0_match_role), Func::Selector(1)),
-                        ]));
-                        let mut neg_pred = key_match;
-                        for arl in rule.antecedent_role_literals.iter()
-                            .filter(|arl| arl.antecedent_index == i)
-                        {
-                            let lit_check = Func::compose(Func::Eq, Func::construction(vec![
-                                Func::compose(role_value_by_name(&arl.role), Func::Selector(2)),
-                                Func::constant(Object::atom(&arl.value)),
-                            ]));
-                            neg_pred = Func::compose(Func::And, Func::construction(vec![
-                                neg_pred, lit_check,
-                            ]));
-                        }
-                        let any_match = Func::compose(Func::compose(Func::Not, Func::NullTest),
-                            Func::compose(Func::filter(neg_pred), Func::DistL));
-                        Func::compose(Func::Not, any_match)
-                    };
-                    Some((neg_ft_facts, absent_guard))
-                }).collect();
-                let neg_facts_tuple = Func::construction(
-                    absence_guard_specs.iter().map(|(facts, _)| facts.clone()).collect()
-                );
-                let per_guard_checks: Vec<Func> = absence_guard_specs.iter().enumerate().map(|(k, (_, guard))| {
-                    let pair_for_k = Func::construction(vec![
-                        Func::Selector(1),
-                        Func::compose(Func::Selector(k + 1), Func::Selector(2)),
-                    ]);
-                    Func::compose(guard.clone(), pair_for_k)
-                }).collect();
-                // Func::And only handles 2-element tuples (returns
-                // Bottom on 3+ elements per ast.rs:2416). For N≥3
-                // absences, reduce pairwise: And(And(c1, c2), c3) …
-                let combined_absence: Func = per_guard_checks.into_iter()
-                    .reduce(|a, b| Func::compose(Func::And, Func::construction(vec![a, b])))
-                    .unwrap_or_else(|| Func::constant(Object::t()));
-                let cons_roles = data.fact_types.get(&consequent_id)
-                    .map(|ft| ft.roles.clone())
-                    .unwrap_or_default();
-                let pairs: Vec<Func> = cons_roles.iter().map(|r| {
-                    let key = r.noun_name.clone();
-                    let value_func = rule.consequent_role_literals.iter()
-                        .find(|crl| crl.role == r.noun_name)
-                        .map(|crl| Func::constant(Object::atom(&crl.value)))
-                        .unwrap_or_else(|| role_value_by_name(&r.noun_name));
-                    Func::construction(vec![
-                        Func::constant(Object::atom(&key)),
-                        value_func,
-                    ])
-                }).collect();
-                let bindings_func = Func::construction(pairs);
-                let derive_one = Func::construction(vec![
-                    consequent_id_func.clone(),
-                    consequent_reading_func.clone(),
-                    bindings_func,
-                ]);
-                let per_a0 = Func::condition(
-                    combined_absence,
-                    Func::construction(vec![
-                        Func::compose(derive_one, Func::Selector(1)),
-                    ]),
-                    Func::constant(Object::phi()),
-                );
-                let (consequent_cell, consequent_role_literals, negation_reads) =
-                    derivation_dep_metadata(rule);
-                return CompiledDerivation {
-                    id, text, kind,
-                    func: Func::compose(
-                        Func::Concat,
-                        Func::compose(
-                            Func::apply_to_all(per_a0),
-                            Func::compose(Func::DistR, Func::construction(vec![ant0, neg_facts_tuple])),
-                        ),
-                    ),
-                    uses_negation: true,
-                    consequent_cell, consequent_role_literals, negation_reads,
-                    materialization: rule.materialization.clone(),
-                };
-            }
             // Subscript-driven join (#826, generalised in #866-c):
             // when a rule's antecedents share a subscript token
             // (`Task1` in both `Task1 blocks Task2` and `Task1 has
@@ -4525,27 +4258,12 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             });
 
             if any_subscript_bridge {
-                // task-918-subscript-and-fallback-absence: partition
-                // antecedents into POSITIVE / ABSENCE so the iterative
-                // subscript-join only walks positives. AbsenceOf
-                // antecedents return "" for `fact_type_id()`; pre-fix
-                // the join loop hit "" at position k, failed
-                // `data.fact_types.get("")`, and short-circuited the
-                // whole rule to phi via the fast-path failure return.
-                // Now AbsenceOf antecedents are applied as final guards
-                // over the joined positive product (mirrors task-814-
-                // join-absence's port to compile_join_derivation,
-                // commit a2aa46e8).
-                //
-                // `original_to_positive` lets the post-join binding-
-                // construction phase translate a user-authored
-                // antecedent index back to its slot in the joined
-                // tuple. AbsenceOf positions don't appear in the map
-                // — they don't contribute bindings.
-                let positive_idx_subscript: Vec<usize> = (0..antecedent_ids.len())
-                    .filter(|&i| !matches!(rule.antecedent_sources.get(i),
-                        Some(crate::types::AntecedentSource::AbsenceOf { .. })))
-                    .collect();
+                // Every antecedent contributes to the iterative
+                // subscript-join. `original_to_positive` maps each
+                // user-authored antecedent index to its slot in the
+                // joined tuple for the post-join binding-construction
+                // phase (identity here, kept for that phase's lookups).
+                let positive_idx_subscript: Vec<usize> = (0..antecedent_ids.len()).collect();
                 let pos_count = positive_idx_subscript.len();
                 let original_to_positive: hashbrown::HashMap<usize, usize> =
                     positive_idx_subscript.iter().enumerate()
@@ -4608,22 +4326,19 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                         .map(|(_, s)| s.clone())
                         .unwrap_or_default()
                 };
-                // Degenerate: no positive antecedent at all means we
-                // can't construct a join product. The subscript-bridge
-                // detector shouldn't actually flag a pure-AbsenceOf
-                // rule (subscripts don't bridge across AbsenceOf
-                // positions), but keep the guard for safety.
+                // Degenerate: no antecedent at all means we can't
+                // construct a join product — fall back to phi.
                 if pos_count == 0 {
                     let (consequent_cell, consequent_role_literals, negation_reads) =
                         derivation_dep_metadata(rule);
                     return CompiledDerivation {
                         id, text, kind,
                         func: Func::constant(Object::phi()),
-                        uses_negation: !absence_idx.is_empty(),
+                        uses_negation: false,
                         consequent_cell, consequent_role_literals, negation_reads, materialization: rule.materialization.clone(),
                     };
                 }
-                // Step 0: facts of the first POSITIVE antecedent.
+                // Step 0: facts of the first antecedent.
                 let mut tuple_stream = extract(positive_idx_subscript[0],
                                                 &antecedent_ids[positive_idx_subscript[0]]);
                 // For each subsequent POSITIVE antecedent, build join
@@ -4635,17 +4350,14 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     let k = positive_idx_subscript[k_pos]; // original index
                     let ant_k_facts = extract(k, &antecedent_ids[k]);
                     let Some(ft_k) = data.fact_types.get(&antecedent_ids[k]) else {
-                        // Schema lookup failed for a positive antecedent
-                        // — degenerate, fall back to phi. uses_negation
-                        // still reflects rule intent (an AbsenceOf in
-                        // scope makes this a stratum-2 routing target
-                        // even though the rule cannot fire).
+                        // Schema lookup failed for an antecedent —
+                        // degenerate, fall back to phi.
                         let (consequent_cell, consequent_role_literals, negation_reads) =
                             derivation_dep_metadata(rule);
                         return CompiledDerivation {
                             id: id.clone(), text: text.clone(), kind: kind.clone(),
                             func: Func::constant(Object::phi()),
-                            uses_negation: !absence_idx.is_empty(),
+                            uses_negation: false,
                             consequent_cell, consequent_role_literals, negation_reads, materialization: rule.materialization.clone(),
                         };
                     };
@@ -4744,83 +4456,9 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     );
                 }
                 let last_k = pos_count - 1;
-                // task-918-subscript-and-fallback-absence: AbsenceOf
-                // antecedents become final guard predicates over the
-                // joined positive product. Mirrors task-814-join-
-                // absence's pattern in compile_join_derivation. For
-                // each AbsenceOf { fact_type, role }: source neg
-                // facts, build key_match against the joined tuple's
-                // role value (find the positive antecedent that carries
-                // the role and use pick_in_tuple), AND any role-literal
-                // pins, build absent_guard, fold into tuple_stream via
-                // DistR + apply_to_all + Concat.
-                let absence_specs: Vec<(Func, Func)> = absence_idx.iter().filter_map(|&orig_i| {
-                    let (neg_ft_id, neg_role) = match &rule.antecedent_sources[orig_i] {
-                        crate::types::AntecedentSource::AbsenceOf { fact_type, role } =>
-                            (fact_type.clone(), role.clone()),
-                        _ => return None,
-                    };
-                    // Find the positive antecedent that carries
-                    // `neg_role`, plus its role index on that FT.
-                    let (pos_with_role, role_ri) = positive_idx_subscript.iter().enumerate()
-                        .find_map(|(pos_idx, &orig)| {
-                            let ft = data.fact_types.get(&antecedent_ids[orig])?;
-                            let ri = ft.roles.iter().position(|r| r.noun_name == neg_role)?;
-                            Some((pos_idx, ri))
-                        })?;
-                    let neg_facts = extract_facts_from_pop(&neg_ft_id);
-                    // Per-pair shape: <joined_tuple, neg_fact>.
-                    // Selector(1) = joined_tuple, Selector(2) = neg_fact.
-                    let lhs = Func::compose(role_value_by_name(&neg_role), Func::Selector(2));
-                    let rhs = Func::compose(
-                        role_value(role_ri),
-                        Func::compose(pick_in_tuple(last_k, pos_with_role), Func::Selector(1)),
-                    );
-                    let key_match = Func::compose(Func::Eq, Func::construction(vec![lhs, rhs]));
-                    // AND every role-literal pinned on this AbsenceOf slot.
-                    let mut neg_pred = key_match;
-                    for arl in rule.antecedent_role_literals.iter()
-                        .filter(|arl| arl.antecedent_index == orig_i)
-                    {
-                        let lit_check = Func::compose(Func::Eq, Func::construction(vec![
-                            Func::compose(role_value_by_name(&arl.role), Func::Selector(2)),
-                            Func::constant(Object::atom(&arl.value)),
-                        ]));
-                        neg_pred = Func::compose(Func::And, Func::construction(vec![
-                            neg_pred, lit_check,
-                        ]));
-                    }
-                    let any_match = Func::compose(
-                        Func::compose(Func::Not, Func::NullTest),
-                        Func::compose(Func::filter(neg_pred), Func::DistL),
-                    );
-                    let absent_guard = Func::compose(Func::Not, any_match);
-                    Some((neg_facts, absent_guard))
-                }).collect();
-                // Iteratively wrap each AbsenceOf guard around
-                // `tuple_stream`. After step k, `tuple_stream` is a
-                // sequence of joined positive tuples that pass guards
-                // 0..k. Per step:
-                //   per_tuple   := if guard(<tuple, neg_facts>) then <tuple> else phi
-                //   tuple_stream' := Concat . α(per_tuple) . DistR . <tuple_stream, neg_facts>
-                // DistR pairs every tuple with the same `neg_facts`
-                // (resolved once at the outer population level); the
-                // per_tuple condition keeps the tuple iff the absent
-                // guard holds; Concat collapses phi's away.
-                let tuple_stream = absence_specs.into_iter().fold(tuple_stream, |acc, (neg_facts, guard)| {
-                    let per_tuple = Func::condition(
-                        guard,
-                        Func::construction(vec![Func::Selector(1)]),
-                        Func::constant(Object::phi()),
-                    );
-                    Func::compose(Func::Concat,
-                        Func::compose(Func::apply_to_all(per_tuple),
-                            Func::compose(Func::DistR, Func::construction(vec![acc, neg_facts]))))
-                });
                 // Now `tuple_stream` is a flat seq of nested
-                // tuples `<<<pos[0], pos[1]>, pos[2]>, …>` where every
-                // join + absence constraint holds. Build per-tuple
-                // consequent. last_k references positive positions.
+                // tuples `<<<a[0], a[1]>, a[2]>, …>` where every
+                // join constraint holds. Build per-tuple consequent.
                 let cons_roles = data.fact_types.get(&consequent_id)
                     .map(|ft| ft.roles.clone())
                     .unwrap_or_default();
@@ -4837,9 +4475,8 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                             ]);
                         }
                         // (2) Subscript-positional projection. Walk
-                        // POSITIVE antecedents (AbsenceOf carries no
-                        // subscripts in ant_subs). Translate
-                        // original→positive position.
+                        // antecedents, translating original→tuple
+                        // position.
                         let cons_sub = cons_subs.iter()
                             .find(|(idx, _)| *idx == cons_role_idx)
                             .map(|(_, s)| s.as_str())
@@ -4858,13 +4495,12 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                                 }
                             }
                         }
-                        // (3) Name-based fallback against any POSITIVE
+                        // (3) Name-based fallback against any
                         // antecedent that carries a role with the
                         // matching noun_name. Picks the first
                         // antecedent with that role to mirror the
                         // 1-antecedent case's role_value_by_name
-                        // semantics. AbsenceOf positions are skipped
-                        // — their facts aren't in the joined tuple.
+                        // semantics.
                         for (ant_idx, ft_id) in antecedent_ids.iter().enumerate() {
                             let Some(&pos_idx) = original_to_positive.get(&ant_idx) else { continue };
                             let Some(ft) = data.fact_types.get(ft_id) else { continue };
@@ -4894,19 +4530,10 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 ]);
                 let (consequent_cell, consequent_role_literals, negation_reads) =
                     derivation_dep_metadata(rule);
-                // task-918-subscript-and-fallback-absence: any
-                // AbsenceOf antecedent makes this rule stratum-2
-                // (negation-guarded). Without that, the chain
-                // orchestrator would fire this subscript-driven join
-                // in the positive round before the negated cell is
-                // populated, and the absent_guard could observe a
-                // stale-empty population — emitting facts that the
-                // post-positive-fixpoint state should have rejected.
-                // Mirrors path (a) and the multi-AbsenceOf branch.
                 return CompiledDerivation {
                     id, text, kind,
                     func: Func::compose(Func::apply_to_all(derive_one), tuple_stream),
-                    uses_negation: !absence_idx.is_empty(),
+                    uses_negation: false,
                     consequent_cell, consequent_role_literals, negation_reads,
                     materialization: rule.materialization.clone(),
                 };
@@ -5009,18 +4636,9 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 }
                 subs
             };
-            // #918 follow-up: AbsenceOf antecedents apply as final guards,
-            // not as join sources. They don't need to carry the join role
-            // — their negation predicate is keyed on the role explicitly
-            // declared by `AbsenceOf { role }`. Skip them when checking
-            // role membership across antecedents.
             let join_roles: Vec<String> = cons_roles_for_join.iter()
                 .filter(|r| ant0_role_set.contains(*r))
-                .filter(|r| antecedent_ids[1..].iter().enumerate().all(|(idx, ft_id)| {
-                    if matches!(rule.antecedent_sources.get(idx + 1),
-                        Some(crate::types::AntecedentSource::AbsenceOf { .. })) {
-                        return true;
-                    }
+                .filter(|r| antecedent_ids[1..].iter().all(|ft_id| {
                     data.fact_types.get(ft_id).map_or(false, |ft|
                         ft.roles.iter().any(|rr| rr.noun_name == **r))
                 }))
@@ -5050,128 +4668,35 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 // Match predicate: a candidate fact `c` from
                 // antecedent[i] matches a0 on join role R iff
                 //   role_value_by_name(R)(c) == role_value_by_name(R)(a0)
-                // The DistL+filter+null-test pattern is the same one
-                // the AbsenceOf branch uses; here we negate the
-                // null-test to mean "≥1 match exists".
+                // The DistL+filter+null-test pattern checks "≥1 match
+                // exists".
                 let n_other = antecedent_ids.len() - 1;
-                // #918 follow-up: AbsenceOf antecedents carry their negation
-                // FT id in `AbsenceOf { fact_type }` rather than in
-                // `antecedent_ids[i]` (which is "" for AbsenceOf since
-                // `fact_type_id()` returns ""). Source the extract from
-                // the AbsenceOf variant in that case so the guard has
-                // facts to scan.
                 let other_extracts: Vec<Func> = antecedent_ids.iter().enumerate()
                     .skip(1)
-                    .map(|(i, ft_id)| {
-                        if let Some(crate::types::AntecedentSource::AbsenceOf { fact_type, .. }) =
-                            rule.antecedent_sources.get(i)
-                        {
-                            extract(i, fact_type)
-                        } else {
-                            extract(i, ft_id)
-                        }
-                    })
+                    .map(|(i, ft_id)| extract(i, ft_id))
                     .collect();
                 // Inside per-a0: input is <a0, <ant1_facts, ant2_facts, …>>.
                 // For each other-antecedent slot j (1-based within the tuple),
                 // pair a0 with ant_facts[j], filter by per-role equality
                 // on join roles, check non-empty.
-                // #918 follow-up: dispatch on antecedent kind. Positive
-                // antecedents use the existing "≥1 match on join roles"
-                // check. AbsenceOf antecedents use the "no match on the
-                // AbsenceOf role (+ any role-literal pins)" guard.
                 let other_checks: Vec<Func> = (0..n_other).map(|j| {
-                    let ant_idx = j + 1;
-                    let is_absence = matches!(rule.antecedent_sources.get(ant_idx),
-                        Some(crate::types::AntecedentSource::AbsenceOf { .. }));
                     let a0 = Func::Selector(1);
                     let ant_j = Func::compose(Func::Selector(j + 1), Func::Selector(2));
-                    if is_absence {
-                        let (neg_ft_id, neg_role) = match &rule.antecedent_sources[ant_idx] {
-                            crate::types::AntecedentSource::AbsenceOf { fact_type, role } =>
-                                (fact_type.clone(), role.clone()),
-                            _ => unreachable!(),
-                        };
-                        let a0_match_role: String = data.fact_types.get(&antecedent_ids[0])
-                            .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == neg_role))
-                            .map(|r| r.noun_name.clone())
-                            .unwrap_or_else(|| neg_role.clone());
-                        // task-821: pin-free AbsenceOf over a Map-keyed
-                        // cell (single-role alethic UC matching the
-                        // AbsenceOf role) collapses to `NullTest ∘
-                        // FetchOrPhi:<a0_role_value, neg_cell>`. Pinned
-                        // antecedents keep the filter+DistL form so the
-                        // pin literals get checked. Each AbsenceOf in
-                        // a mixed multi-antecedent rule picks its
-                        // own shape — keyed-pin-free uses Map, the
-                        // rest stays linear.
-                        let key_roles = key_roles_for_ft(data, &neg_ft_id);
-                        let neg_role_index = data.fact_types.get(&neg_ft_id)
-                            .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == neg_role).map(|r| r.role_index));
-                        let has_pins_for_this = rule.antecedent_role_literals.iter()
-                            .any(|arl| arl.antecedent_index == ant_idx);
-                        let map_aware = !has_pins_for_this
-                            && match (&key_roles, neg_role_index) {
-                                (Some(kr), Some(ri)) => kr.as_slice() == [ri],
-                                _ => false,
-                            };
-                        let absent_guard = if map_aware {
-                            // Pair shape `<a0_fact, neg_cell>`. Project
-                            // join-role value from a0 as the needle,
-                            // hand the cell straight to FetchOrPhi.
-                            Func::compose(
-                                Func::NullTest,
-                                Func::compose(
-                                    Func::FetchOrPhi,
-                                    Func::construction(vec![
-                                        Func::compose(
-                                            role_value_by_name(&a0_match_role),
-                                            Func::Selector(1),
-                                        ),
-                                        Func::Selector(2),
-                                    ]),
-                                ),
-                            )
-                        } else {
-                            let key_match = Func::compose(Func::Eq, Func::construction(vec![
-                                Func::compose(role_value_by_name(&neg_role), Func::Selector(2)),
-                                Func::compose(role_value_by_name(&a0_match_role), Func::Selector(1)),
-                            ]));
-                            let mut neg_pred = key_match;
-                            for arl in rule.antecedent_role_literals.iter()
-                                .filter(|arl| arl.antecedent_index == ant_idx)
-                            {
-                                let lit_check = Func::compose(Func::Eq, Func::construction(vec![
-                                    Func::compose(role_value_by_name(&arl.role), Func::Selector(2)),
-                                    Func::constant(Object::atom(&arl.value)),
-                                ]));
-                                neg_pred = Func::compose(Func::And, Func::construction(vec![
-                                    neg_pred, lit_check,
-                                ]));
-                            }
-                            let any_match = Func::compose(Func::compose(Func::Not, Func::NullTest),
-                                Func::compose(Func::filter(neg_pred), Func::DistL));
-                            Func::compose(Func::Not, any_match)
-                        };
-                        Func::compose(absent_guard,
-                            Func::construction(vec![a0, ant_j]))
-                    } else {
-                        let per_role_match: Vec<Func> = join_roles.iter().map(|jr| {
-                            Func::compose(Func::Eq, Func::construction(vec![
-                                Func::compose(role_value_by_name(jr), Func::Selector(2)),
-                                Func::compose(role_value_by_name(jr), Func::Selector(1)),
-                            ]))
-                        }).collect();
-                        let combined = per_role_match.into_iter()
-                            .reduce(|a, b| Func::compose(Func::And,
-                                Func::construction(vec![a, b])))
-                            .unwrap();
-                        let any_match = Func::compose(
-                            Func::compose(Func::Not, Func::NullTest),
-                            Func::compose(Func::filter(combined), Func::DistL));
-                        Func::compose(any_match,
-                            Func::construction(vec![a0, ant_j]))
-                    }
+                    let per_role_match: Vec<Func> = join_roles.iter().map(|jr| {
+                        Func::compose(Func::Eq, Func::construction(vec![
+                            Func::compose(role_value_by_name(jr), Func::Selector(2)),
+                            Func::compose(role_value_by_name(jr), Func::Selector(1)),
+                        ]))
+                    }).collect();
+                    let combined = per_role_match.into_iter()
+                        .reduce(|a, b| Func::compose(Func::And,
+                            Func::construction(vec![a, b])))
+                        .unwrap();
+                    let any_match = Func::compose(
+                        Func::compose(Func::Not, Func::NullTest),
+                        Func::compose(Func::filter(combined), Func::DistL));
+                    Func::compose(any_match,
+                        Func::construction(vec![a0, ant_j]))
                 }).collect();
                 let all_others_hold = if other_checks.is_empty() {
                     Func::constant(Object::atom("true"))
@@ -5215,14 +4740,6 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 let other_facts_tuple = Func::construction(other_extracts);
                 let (consequent_cell, consequent_role_literals, negation_reads) =
                     derivation_dep_metadata(rule);
-                // task-918-implicit-equi-join-uses-negation: any AbsenceOf
-                // antecedent makes this rule stratum-2 (negation-guarded).
-                // Without this, the chain orchestrator would fire the rule
-                // in stratum 1 against a stale-empty negated cell, emitting
-                // facts that the post-fixpoint state should reject. Mirrors
-                // the multi-AbsenceOf branch above (`uses_negation: true`)
-                // and `compile_join_derivation`'s task-814-join-absence
-                // port (commit a2aa46e8).
                 return CompiledDerivation {
                     id, text, kind,
                     func: Func::compose(
@@ -5236,7 +4753,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                                 ])),
                         ),
                     ),
-                    uses_negation: !absence_idx.is_empty(),
+                    uses_negation: false,
                     consequent_cell, consequent_role_literals, negation_reads,
                     materialization: rule.materialization.clone(),
                 };
@@ -5275,10 +4792,8 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             // regress.
             //
             // Anti-trigger: only fire when there's at least ONE other
-            // (non-AbsenceOf) antecedent — AbsenceOf antecedents are
-            // negative guards, not join sources, and the existence-
-            // check fallback already handles 1-positive rules
-            // correctly via its single-antecedent existence path.
+            // antecedent — the existence-check fallback already handles
+            // 1-antecedent rules via its single-antecedent path.
             let existential_join_roles: Vec<String> = if join_roles.is_empty() {
                 let ant0_roles: Vec<String> = data.fact_types.get(&antecedent_ids[0])
                     .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
@@ -5288,10 +4803,8 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     .collect();
                 ant0_roles.iter()
                     .filter(|r| !cons_role_set.contains(*r))
-                    .filter(|r| antecedent_ids[1..].iter().enumerate()
-                        .filter(|(idx, _)| !matches!(rule.antecedent_sources.get(idx + 1),
-                            Some(crate::types::AntecedentSource::AbsenceOf { .. })))
-                        .all(|(_, ft_id)| data.fact_types.get(ft_id)
+                    .filter(|r| antecedent_ids[1..].iter()
+                        .all(|ft_id| data.fact_types.get(ft_id)
                             .map_or(false, |ft| ft.roles.iter()
                                 .any(|rr| rr.noun_name == **r))))
                     .filter(|r| subscripts_for_role(r).len() <= 1)
@@ -5315,102 +4828,51 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             let all_cons_roles_sourceable = cons_roles_for_source.iter()
                 .all(|r| lit_pinned.contains(&r.noun_name)
                     || ant0_role_names.contains(&r.noun_name));
-            let has_positive_other = antecedent_ids[1..].iter().enumerate()
-                .any(|(idx, _)| !matches!(rule.antecedent_sources.get(idx + 1),
-                    Some(crate::types::AntecedentSource::AbsenceOf { .. })));
+            let has_positive_other = antecedent_ids.len() > 1;
             if !existential_join_roles.is_empty()
                 && all_cons_roles_sourceable
                 && has_positive_other
             {
                 // Build the same per-a0 fanout shape as path (a), but
                 // join on the existential roles instead of consequent
-                // roles. AbsenceOf antecedents reuse path (a)'s
-                // absence-guard wiring verbatim — keyed on the
-                // AbsenceOf role + literal pins, NOT the existential
-                // join role (which by construction doesn't appear in
-                // the consequent and may not appear on the absence
-                // antecedent at all).
+                // roles.
                 let n_other = antecedent_ids.len() - 1;
                 let other_extracts: Vec<Func> = antecedent_ids.iter().enumerate()
                     .skip(1)
-                    .map(|(i, ft_id)| {
-                        if let Some(crate::types::AntecedentSource::AbsenceOf { fact_type, .. }) =
-                            rule.antecedent_sources.get(i)
-                        {
-                            extract(i, fact_type)
-                        } else {
-                            extract(i, ft_id)
-                        }
-                    })
+                    .map(|(i, ft_id)| extract(i, ft_id))
                     .collect();
                 let other_checks: Vec<Func> = (0..n_other).map(|j| {
                     let ant_idx = j + 1;
-                    let is_absence = matches!(rule.antecedent_sources.get(ant_idx),
-                        Some(crate::types::AntecedentSource::AbsenceOf { .. }));
                     let a0 = Func::Selector(1);
                     let ant_j = Func::compose(Func::Selector(j + 1), Func::Selector(2));
-                    if is_absence {
-                        // Mirror path (a)'s AbsenceOf branch exactly.
-                        let (_neg_ft_id, neg_role) = match &rule.antecedent_sources[ant_idx] {
-                            crate::types::AntecedentSource::AbsenceOf { fact_type, role } =>
-                                (fact_type.clone(), role.clone()),
-                            _ => unreachable!(),
-                        };
-                        let a0_match_role: String = data.fact_types.get(&antecedent_ids[0])
-                            .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == neg_role))
-                            .map(|r| r.noun_name.clone())
-                            .unwrap_or_else(|| neg_role.clone());
-                        let key_match = Func::compose(Func::Eq, Func::construction(vec![
-                            Func::compose(role_value_by_name(&neg_role), Func::Selector(2)),
-                            Func::compose(role_value_by_name(&a0_match_role), Func::Selector(1)),
-                        ]));
-                        let mut neg_pred = key_match;
-                        for arl in rule.antecedent_role_literals.iter()
-                            .filter(|arl| arl.antecedent_index == ant_idx)
-                        {
-                            let lit_check = Func::compose(Func::Eq, Func::construction(vec![
-                                Func::compose(role_value_by_name(&arl.role), Func::Selector(2)),
-                                Func::constant(Object::atom(&arl.value)),
-                            ]));
-                            neg_pred = Func::compose(Func::And, Func::construction(vec![
-                                neg_pred, lit_check,
-                            ]));
-                        }
-                        let any_match = Func::compose(Func::compose(Func::Not, Func::NullTest),
-                            Func::compose(Func::filter(neg_pred), Func::DistL));
-                        let absent_guard = Func::compose(Func::Not, any_match);
-                        Func::compose(absent_guard,
-                            Func::construction(vec![a0, ant_j]))
-                    } else {
-                        // Existential-key equality: only require equi-
-                        // join when this antecedent actually carries
-                        // the existential role. Some shapes have an
-                        // existential key shared by SOME but not all
-                        // positive antecedents — `existential_join_roles`
-                        // filters those out above, so every positive
-                        // antecedent reaching here participates in at
-                        // least one existential equi-join.
-                        let ant_ft_roles: HashSet<String> = data.fact_types.get(&antecedent_ids[ant_idx])
-                            .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
-                            .unwrap_or_default();
-                        let per_role_match: Vec<Func> = existential_join_roles.iter()
-                            .filter(|jr| ant_ft_roles.contains(*jr))
-                            .map(|jr| {
-                                Func::compose(Func::Eq, Func::construction(vec![
-                                    Func::compose(role_value_by_name(jr), Func::Selector(2)),
-                                    Func::compose(role_value_by_name(jr), Func::Selector(1)),
-                                ]))
-                            }).collect();
-                        let combined = per_role_match.into_iter()
-                            .reduce(|a, b| Func::compose(Func::And,
-                                Func::construction(vec![a, b])))
-                            .unwrap();
-                        let any_match = Func::compose(
-                            Func::compose(Func::Not, Func::NullTest),
-                            Func::compose(Func::filter(combined), Func::DistL));
-                        Func::compose(any_match,
-                            Func::construction(vec![a0, ant_j]))
-                    }
+                    // Existential-key equality: only require equi-
+                    // join when this antecedent actually carries
+                    // the existential role. Some shapes have an
+                    // existential key shared by SOME but not all
+                    // antecedents — `existential_join_roles` filters
+                    // those out above, so every antecedent reaching
+                    // here participates in at least one existential
+                    // equi-join.
+                    let ant_ft_roles: HashSet<String> = data.fact_types.get(&antecedent_ids[ant_idx])
+                        .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+                        .unwrap_or_default();
+                    let per_role_match: Vec<Func> = existential_join_roles.iter()
+                        .filter(|jr| ant_ft_roles.contains(*jr))
+                        .map(|jr| {
+                            Func::compose(Func::Eq, Func::construction(vec![
+                                Func::compose(role_value_by_name(jr), Func::Selector(2)),
+                                Func::compose(role_value_by_name(jr), Func::Selector(1)),
+                            ]))
+                        }).collect();
+                    let combined = per_role_match.into_iter()
+                        .reduce(|a, b| Func::compose(Func::And,
+                            Func::construction(vec![a, b])))
+                        .unwrap();
+                    let any_match = Func::compose(
+                        Func::compose(Func::Not, Func::NullTest),
+                        Func::compose(Func::filter(combined), Func::DistL));
+                    Func::compose(any_match,
+                        Func::construction(vec![a0, ant_j]))
                 }).collect();
                 let all_others_hold = if other_checks.is_empty() {
                     Func::constant(Object::atom("true"))
@@ -5455,11 +4917,6 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 let other_facts_tuple = Func::construction(other_extracts);
                 let (consequent_cell, consequent_role_literals, negation_reads) =
                     derivation_dep_metadata(rule);
-                // task-918-implicit-equi-join-uses-negation: same shape
-                // bug as path (a) — an AbsenceOf in the body makes this
-                // rule stratum-2. The branch already wires the absent_guard
-                // predicate per AbsenceOf antecedent; only the routing flag
-                // was missed. Mirrors path (a) above.
                 return CompiledDerivation {
                     id, text, kind,
                     func: Func::compose(
@@ -5473,7 +4930,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                                 ])),
                         ),
                     ),
-                    uses_negation: !absence_idx.is_empty(),
+                    uses_negation: false,
                     consequent_cell,
                     consequent_role_literals,
                     negation_reads,
@@ -5481,76 +4938,16 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 };
             }
 
-            // (b) Existence-check fallback. Fires when every POSITIVE
-            // antecedent has at least one surviving fact AND every
-            // AbsenceOf antecedent's negated FT has no fact matching
-            // its role-literal pins.
-            //
-            // task-918-subscript-and-fallback-absence: pre-fix this
-            // branch extracted facts for ALL antecedent positions
-            // including AbsenceOf, where antecedent_ids[i] = "" →
-            // extract(i, "") = phi → Not(NullTest)(phi) = false →
-            // all_hold conjunction collapsed → rule never fired even
-            // when AbsenceOf was satisfied. Now positives drive the
-            // existence check; AbsenceOf antecedents apply per-guard
-            // "no matching fact" predicates against the negated FT's
-            // full population. Returned via early-return so
-            // uses_negation can be set per AbsenceOf presence (mirrors
-            // paths (a) / (a') and the multi-AbsenceOf branch).
-            //
-            // Note: the existence-check fallback fires once GLOBALLY
-            // — it doesn't fan out per-subject. So AbsenceOf here
-            // reduces to a global "no matching fact in neg_ft (with
-            // pins)" check rather than the per-a0 keyed guard used in
-            // paths (a) / (a'). This matches the semantic shape of
-            // path (b): "every condition holds, emit one consequent".
-            let positive_idx_b: Vec<usize> = (0..antecedent_ids.len())
-                .filter(|&i| !matches!(rule.antecedent_sources.get(i),
-                    Some(crate::types::AntecedentSource::AbsenceOf { .. })))
-                .collect();
+            // (b) Existence-check fallback. Fires when every antecedent
+            // has at least one surviving fact.
+            let positive_idx_b: Vec<usize> = (0..antecedent_ids.len()).collect();
             let pos_checks: Vec<Func> = positive_idx_b.iter()
                 .map(|&i| Func::compose(
                     Func::compose(Func::Not, Func::NullTest),
                     extract(i, &antecedent_ids[i]),
                 ))
                 .collect();
-            // AbsenceOf existence-checks: "no fact in neg_ft matches
-            // role-literal pins". With no pins, this collapses to "no
-            // facts at all in neg_ft" — NullTest on the population.
-            let neg_checks: Vec<Func> = absence_idx.iter().filter_map(|&orig_i| {
-                let neg_ft_id = match &rule.antecedent_sources[orig_i] {
-                    crate::types::AntecedentSource::AbsenceOf { fact_type, .. } => fact_type.clone(),
-                    _ => return None,
-                };
-                let neg_facts = extract_facts_from_pop(&neg_ft_id);
-                let pinned: Vec<&crate::types::AntecedentRoleLiteral> =
-                    rule.antecedent_role_literals.iter()
-                        .filter(|arl| arl.antecedent_index == orig_i)
-                        .collect();
-                let no_match_pred = if pinned.is_empty() {
-                    // No pins — guard passes iff neg_ft is empty.
-                    Func::NullTest
-                } else {
-                    let mut neg_pred: Option<Func> = None;
-                    for arl in pinned.iter() {
-                        let lit_check = Func::compose(Func::Eq, Func::construction(vec![
-                            role_value_by_name(&arl.role),
-                            Func::constant(Object::atom(&arl.value)),
-                        ]));
-                        neg_pred = Some(match neg_pred {
-                            Some(prev) => Func::compose(Func::And,
-                                Func::construction(vec![prev, lit_check])),
-                            None => lit_check,
-                        });
-                    }
-                    // Filter to facts matching the pins, then NullTest:
-                    // "no matching fact" iff filter result is empty.
-                    Func::compose(Func::NullTest, Func::filter(neg_pred.unwrap()))
-                };
-                Some(Func::compose(no_match_pred, neg_facts))
-            }).collect();
-            let mut all_checks: Vec<Func> = pos_checks;
-            all_checks.extend(neg_checks);
+            let all_checks: Vec<Func> = pos_checks;
             let all_hold = if all_checks.is_empty() {
                 // No antecedents at all (degenerate; shouldn't happen
                 // in the multi-antecedent arm but keep total).
@@ -5565,17 +4962,13 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             // Constraint), construct the consequent fact fresh in the
             // declared role order so forward-chain emits a canonical
             // fact without position drift. Otherwise fall back to the
-            // first-fact-from-first-POSITIVE-antecedent shape (was
-            // first-fact-from-position-0 pre-task-918; if position 0
-            // is AbsenceOf, antecedent_ids[0] = "" and the pre-fix
-            // first_fact was phi, sourcing junk bindings).
+            // first-fact-from-first-antecedent shape.
             let first_pos_idx = positive_idx_b.first().copied();
             let first_fact = match first_pos_idx {
                 Some(i) => Func::compose(Func::Selector(1), extract(i, &antecedent_ids[i])),
-                // No positive antecedent. Bindings can't be sourced
-                // from the join product; only literal-pin consequents
-                // make sense here. Safe-default to phi for the value
-                // so non-literal roles emit phi rather than wrong data.
+                // No antecedent at all. Safe-default to phi for the
+                // value so non-literal roles emit phi rather than
+                // wrong data.
                 None => Func::constant(Object::phi()),
             };
             let bindings = if rule.consequent_role_literals.is_empty() {
@@ -5619,20 +5012,12 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 Func::construction(vec![derived]),
                 Func::constant(Object::phi()),
             );
-            // task-918-subscript-and-fallback-absence: any AbsenceOf
-            // antecedent makes this rule stratum-2 (negation-guarded).
-            // Without that, the chain orchestrator would fire path (b)
-            // in the positive round before the negated cell has been
-            // populated, and the no-match check could observe a stale-
-            // empty population — emitting a fact that the post-fixpoint
-            // state should reject. Mirrors paths (a) / (a') and the
-            // multi-AbsenceOf branch.
             let (consequent_cell, consequent_role_literals, negation_reads) =
                 derivation_dep_metadata(rule);
             return CompiledDerivation {
                 id, text, kind,
                 func: func_b,
-                uses_negation: !absence_idx.is_empty(),
+                uses_negation: false,
                 consequent_cell, consequent_role_literals, negation_reads, materialization: rule.materialization.clone(),
             };
         }
@@ -5670,34 +5055,14 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
     // collapse to empty FT id, which `data.fact_types.get` returns None
     // for, degrading to empty role lists — safe no-op.
     //
-    // task-814-join-absence: partition antecedents into POSITIVE
-    // (`FactType`) and ABSENCE (`AbsenceOf`). The iterative join builds
-    // only over positives — AbsenceOf antecedents return "" for
-    // `fact_type_id()`, so `extract_facts_from_pop("")` previously
-    // collapsed each AbsenceOf stream to ∅ and the join product
-    // degenerated to ∅. The fix mirrors the implicit-equi-join branch
-    // of `compile_explicit_derivation` (#918 follow-up): treat AbsenceOf
-    // antecedents as final guards over the joined positive product,
-    // sourcing their negation FT from `AbsenceOf { fact_type }` rather
-    // than from `antecedent_ids[i]`. The original-index → role-on-AbsenceOf
-    // metadata for each guard is captured below so post-join filtering
-    // can look up the key value on whichever positive antecedent carries
-    // the role the AbsenceOf names.
-    //
-    // `original_index` (carried alongside the positive-only views) lets
-    // us key `antecedent_filters` / `antecedent_role_literals` /
-    // `antecedent_role_comparisons` back to the user-authored slot
-    // even though the join shape only walks the positive subsequence.
+    // `original_index` (carried alongside the positive views) lets us
+    // key `antecedent_filters` / `antecedent_role_literals` /
+    // `antecedent_role_comparisons` back to the user-authored slot.
     let antecedent_ids_all: Vec<String> = rule.antecedent_sources.iter()
         .map(|s| s.fact_type_id().to_string()).collect();
     let positive_idx: Vec<usize> = rule.antecedent_sources.iter().enumerate()
         .filter_map(|(i, s)| matches!(s, crate::types::AntecedentSource::FactType(_)).then_some(i))
         .collect();
-    let absence_idx: Vec<usize> = rule.antecedent_sources.iter().enumerate()
-        .filter_map(|(i, s)| matches!(s, crate::types::AntecedentSource::AbsenceOf { .. }).then_some(i))
-        .collect();
-    // The post-#918 join walks only positive antecedents. `antecedent_ids`
-    // below is the positive-only view; absence guards apply after.
     let antecedent_ids: Vec<String> = positive_idx.iter()
         .map(|&i| antecedent_ids_all[i].clone()).collect();
     // Join rules always have a literal consequent — `that FT` anaphora
@@ -5937,93 +5302,6 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
         Func::compose(Func::filter(combined), current)
     };
 
-    // task-814-join-absence: AbsenceOf antecedents become final guard
-    // predicates over the joined positive product. For each AbsenceOf
-    // `{ fact_type, role }`:
-    //   key_match  := role_value_by_name(role)(neg_fact) == role_value_by_name(role)(joined_tuple)
-    //   neg_pred   := key_match AND every antecedent_role_literal pinned on this slot
-    //   any_match  := !NullTest . Filter(neg_pred) . DistL . <joined, neg_facts>
-    //   guard      := !any_match
-    // Each guard is applied as a final Filter over `current` (the depth-n
-    // join product). The role value side is sourced from the POSITIVE
-    // antecedent that carries the AbsenceOf's role — the parser/resolver
-    // guarantees the role name names a shared join noun (e.g. `Commit`
-    // for `no Commit it concerns has Security Posture 'Y'`).
-    //
-    // Structurally each per-tuple guard receives a pair `<joined_tuple,
-    // neg_facts>` (Selector(1) = joined_tuple, Selector(2) = the AbsenceOf
-    // FT's full population) so we can DistL into per-fact predicates and
-    // test for any match. The pair is built at the population level via
-    // `α(g_k) . DistR . <current, neg_facts_extracts>`-style nesting
-    // applied iteratively per guard.
-    //
-    // Mirrors the implicit-equi-join AbsenceOf branch in
-    // `compile_explicit_derivation` (#918 follow-up); the join path was
-    // missed because pre-fix `fact_extractors[i]` indexed by
-    // `antecedent_ids[i] = ""` for AbsenceOf and degenerated each
-    // AbsenceOf stream to ∅ — collapsing the iterative join to ∅.
-    let absence_specs: Vec<(Func, Func)> = absence_idx.iter().filter_map(|&orig_i| {
-        let (neg_ft_id, neg_role) = match &rule.antecedent_sources[orig_i] {
-            crate::types::AntecedentSource::AbsenceOf { fact_type, role } =>
-                (fact_type.clone(), role.clone()),
-            _ => return None,
-        };
-        // Find the positive antecedent that carries `neg_role`.
-        let (pos_for_role, role_ri) = (0..n).find_map(|pi|
-            find_role(pi, &neg_role).map(|ri| (pi, ri)))?;
-        let neg_facts = extract_facts_from_pop(&neg_ft_id);
-        // Left side: the negation FT candidate's value on `neg_role`
-        // (Selector(2) inside the per-pair step).
-        let lhs = Func::compose(role_value_by_name(&neg_role), Func::Selector(2));
-        // Right side: the joined tuple's value on `neg_role`, reached
-        // by access_fact(pos_for_role, n) then role_value(role_ri).
-        // Selector(1) inside the per-pair step is the joined tuple.
-        let rhs = Func::compose(
-            role_value(role_ri),
-            Func::compose(access_fact(pos_for_role, n), Func::Selector(1)),
-        );
-        let key_match = Func::compose(Func::Eq, Func::construction(vec![lhs, rhs]));
-        // AND every role-literal pinned on this AbsenceOf slot (e.g. the
-        // 'Y' in `no Commit it concerns has Security Posture 'Y'`).
-        let mut neg_pred = key_match;
-        for arl in rule.antecedent_role_literals.iter()
-            .filter(|arl| arl.antecedent_index == orig_i)
-        {
-            let lit_check = Func::compose(Func::Eq, Func::construction(vec![
-                Func::compose(role_value_by_name(&arl.role), Func::Selector(2)),
-                Func::constant(Object::atom(&arl.value)),
-            ]));
-            neg_pred = Func::compose(Func::And, Func::construction(vec![
-                neg_pred, lit_check,
-            ]));
-        }
-        let any_match = Func::compose(
-            Func::compose(Func::Not, Func::NullTest),
-            Func::compose(Func::filter(neg_pred), Func::DistL),
-        );
-        let absent_guard = Func::compose(Func::Not, any_match);
-        Some((neg_facts, absent_guard))
-    }).collect();
-    // Iteratively wrap each AbsenceOf guard around `current`. After step
-    // k, `current` is a sequence of depth-n joined tuples that pass
-    // guards 0..k. The shape per step:
-    //   per_tuple   := if guard(<tuple, neg_facts>) then <tuple> else phi
-    //   current'    := Concat . α(per_tuple) . DistR . <current, neg_facts>
-    // DistR pairs every tuple in `current` with the same `neg_facts`
-    // (resolved once at the outer population level); the per_tuple
-    // condition keeps the tuple iff the absent guard holds; Concat
-    // collapses phi's away.
-    let current = absence_specs.into_iter().fold(current, |acc, (neg_facts, guard)| {
-        let per_tuple = Func::condition(
-            guard,
-            Func::construction(vec![Func::Selector(1)]),
-            Func::constant(Object::phi()),
-        );
-        Func::compose(Func::Concat,
-            Func::compose(Func::apply_to_all(per_tuple),
-                Func::compose(Func::DistR, Func::construction(vec![acc, neg_facts]))))
-    });
-
     // Build the consequent fact from the final joined structure (depth n).
     // For each consequent binding noun, find which FT has it and extract the value.
     let binding_nouns: Vec<String> = if consequent_binding_names.is_empty() {
@@ -6089,15 +5367,7 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
 
     let func = Func::compose(Func::apply_to_all(derived_fact), current);
 
-    // task-814-join-absence: any AbsenceOf antecedent makes this rule
-    // stratum-2 (negation-guarded). Without that, the chain orchestrator
-    // would fire this join rule in the positive round before its negated
-    // cell has been populated, and the guard could observe a stale-empty
-    // population — emitting facts that the post-positive-fixpoint state
-    // should have rejected. Mirrors the multi-AbsenceOf branch's
-    // `uses_negation: true` in `compile_explicit_derivation` (#918).
-    let uses_negation = !absence_idx.is_empty();
-    CompiledDerivation { id, text, kind, func, uses_negation,
+    CompiledDerivation { id, text, kind, func, uses_negation: false,
         consequent_cell: consequent_cell_md,
         consequent_role_literals: consequent_role_literals_md,
         negation_reads: negation_reads_md,
@@ -6425,127 +5695,6 @@ pub(crate) fn compile_transitivity_metamodel(
 /// merged Func emits the union of every per-pair inner Func, so no
 /// single noun appears in the def name).
 pub(crate) const TRANSITIVITY_ID: &str = "_transitivity";
-
-/// Compile CWA (Closed-World-Assumption) negation as ONE
-/// CompiledDerivation whose Func concatenates per-(CWA-noun, FT,
-/// role) inner Funcs (#893).
-///
-/// Whitepaper §5.2 (universal CWA-negation schema) frames closed-
-/// world negation as a single metamodel derivation rule whose
-/// antecedent quantifies over `Noun × FactType × Role × <Noun-
-/// instances>` cells gated by `Noun.world_assumption = Closed` and
-/// the role-membership condition `Role.noun_name = Noun.name`. Its
-/// consequent is the synthesized `<<_neg_<noun>, instance>>` fact
-/// pushed into the synthetic `_cwa_negation:<ft_id>` cell when no
-/// fact of `ft_id` binds that instance at that role (the `AbsenceOf`
-/// guard antecedent enforces the participation check). The
-/// declarative form lives in `readings/core/derivation.md`; this
-/// function is the compile-time lift of that rule into a Func the
-/// FFP forward chainer fires at evaluation time.
-///
-/// Each per-(noun, ft, role) inner Func is byte-for-byte the same
-/// shape `compile_explicit_derivation` produces for an
-/// `InstancesOfNoun` + `AbsenceOf` 2-antecedent rule with
-/// `Literal("_cwa_negation:<ft_id>")` consequent and
-/// `consequent_instance_role = "_neg_<noun>"` — so behaviour is
-/// preserved across the loop → metamodel-rule transition (#893
-/// acceptance: `cwa_negation_metamodel_rule_e2e.rs`).
-///
-/// Returns `None` when no (CWA-noun, FT) participation triple
-/// exists — the chainer shouldn't see a no-op `Concat . []` def in
-/// that case (matches the pre-#893 loop's "no rules emitted when no
-/// CWA noun plays a role in any FT" behaviour).
-pub(crate) fn compile_cwa_negation_metamodel(
-    data: &CellIndex,
-) -> Option<CompiledDerivation> {
-    // Mirror the pre-#893 loop's triple enumeration exactly: walk
-    // every CWA noun, then every FT, then every role of that FT
-    // whose `noun_name` matches the current noun. Same iteration
-    // order, so emission is byte-for-byte identical at the cell
-    // level.
-    let inner_funcs: Vec<Func> = data.nouns.iter()
-        .filter(|(_, def)| def.world_assumption == WorldAssumption::Closed)
-        .flat_map(|(noun_name, _)| {
-            let noun = noun_name.clone();
-            data.fact_types.iter()
-                .flat_map(move |(ft_id, ft)| {
-                    let noun = noun.clone();
-                    let ft_id = ft_id.clone();
-                    let reading = ft.reading.clone();
-                    let noun_filter = noun.clone();
-                    ft.roles.iter()
-                        .filter(move |r| r.noun_name == noun_filter)
-                        .map(move |_r| (noun.clone(), ft_id.clone(), reading.clone()))
-                })
-        })
-        .map(|(noun, ft_id, reading)| {
-            // Lift each (noun, ft, role) triple to the same
-            // DerivationRuleDef the pre-#893 loop synthesized, then
-            // route through compile_explicit_derivation so the
-            // InstancesOfNoun + AbsenceOf 2-antecedent +
-            // Literal-consequent path produces the per-triple Func.
-            // Discard the wrapper CompiledDerivation — we want only
-            // its `func` to fold into the outer Concat.
-            let rule = DerivationRuleDef {
-                id: format!("_cwa_negation_{}_{}", noun, ft_id),
-                text: format!("NOT: {} (CWA negation for {})", reading, noun),
-                antecedent_sources: vec![
-                    crate::types::AntecedentSource::InstancesOfNoun(noun.clone()),
-                    crate::types::AntecedentSource::AbsenceOf {
-                        fact_type: ft_id.clone(),
-                        role: noun.clone(),
-                    },
-                ],
-                consequent_cell: crate::types::ConsequentCellSource::Literal(
-                    format!("_cwa_negation:{}", ft_id)),
-                consequent_instance_role: format!("_neg_{}", noun),
-                kind: DerivationKind::ClosedWorldNegation,
-                join_on: vec![], match_on: vec![], consequent_bindings: vec![],
-                antecedent_filters: vec![], consequent_computed_bindings: vec![],
-                consequent_aggregates: vec![], unresolved_clauses: vec![],
-                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
-            };
-            compile_explicit_derivation(data, &rule).func
-        })
-        .collect();
-    if inner_funcs.is_empty() { return None; }
-    // Concat the per-triple Funcs into one Func that emits the
-    // union of every per-triple inner Func's tuple sequence.
-    // forward_chain_defs_state routes each emitted
-    // `<consequent_ft_id, reading, bindings>` tuple to its own
-    // `_cwa_negation:<ft_id>` cell (slot 0), so the merged emission
-    // is indistinguishable from the pre-#893 N-Funcs-N-defs shape
-    // at the cell level.
-    let func = Func::compose(Func::Concat, Func::construction(inner_funcs));
-    // CWA negation writes to per-FT `_cwa_negation:<ft_id>` cells
-    // dynamically and reads negatively from each FT cell. The
-    // consequent cell id is not a single literal but the union over
-    // every CWA-noun × FT × role combination — the chainer's runtime
-    // dep graph treats this as "writes nowhere statically known",
-    // so it doesn't participate in topological ordering with the
-    // user-rule negation cascade. Leave dep metadata empty.
-    let (consequent_cell, consequent_role_literals, negation_reads) =
-        derivation_dep_metadata_synth(String::new());
-    Some(CompiledDerivation {
-        id: CWA_NEGATION_ID.to_string(),
-        text: "CWA negation metamodel rule (readings/core/derivation.md)".to_string(),
-        kind: DerivationKind::ClosedWorldNegation,
-        func,
-        uses_negation: true,
-        consequent_cell, consequent_role_literals, negation_reads,
-        materialization: crate::types::MaterializationPolicy::Stored,
-    })
-}
-
-/// Synthetic id for the single CWA-negation metamodel rule (#893).
-/// Recognised by the `derivation_index` synthetic-id fallback in
-/// `compile_to_defs_state` so the index keys this id into every
-/// CWA noun that plays a role in some FT — without that, noun-gated
-/// `command::create_via_defs` paths would skip CWA negation for
-/// lack of a noun-name match in the id (the merged Func emits the
-/// union of every per-(noun, ft, role) inner Func, so no single
-/// noun appears in the def name).
-pub(crate) const CWA_NEGATION_ID: &str = "_cwa_negation";
 
 /// State machine initialization as a derivation rule.
 ///
@@ -10397,84 +9546,6 @@ mod schema_tests {
         assert!(!blocked.contains(&"1".to_string()),
             "Task 1 (blocker, role-0) must NOT be tagged 'blocked'; \
              got blocked={:?}", blocked);
-    }
-
-    /// Negation in a user-rule antecedent: `Task has no Task
-    /// Readiness 'blocked'` should emit `AntecedentSource::AbsenceOf`
-    /// and the engine should fire the consequent only when no
-    /// matching fact exists in the negated FT for the bound entity.
-    /// apps/tasks #826b: without this, the natural rule
-    ///   `Task has Task Readiness 'ready' iff
-    ///    Task has Task Status 'pending' and
-    ///    Task has no Task Readiness 'blocked'.`
-    /// can't be expressed — so we either drop the universal `ready`
-    /// rule (consumer composes query-side) or accept overlap with
-    /// `blocked`. Spec: with two pending Tasks where only Task 1 is
-    /// blocked (Task 2 blocks Task 1, Task 2 is pending), only Task 2
-    /// gets `ready`; Task 1 gets `blocked`.
-    #[test]
-    #[ignore = "task-7: AbsenceOf removed from parser 2026-05-19; test depends on `has no` clause parsing to AbsenceOf"]
-    fn user_rule_with_has_no_clause_emits_absence_guarded_derivation() {
-        let src = "\
-            Task(.id) is an entity type.\n\
-            Task Status is a value type.\n\
-            Task Readiness is a value type.\n\
-            Task has Task Status.\n\
-            Task has Task Readiness.\n\
-            Task blocks Task.\n\
-            Task '1' has Task Status 'pending'.\n\
-            Task '2' has Task Status 'pending'.\n\
-            Task '2' blocks Task '1'.\n\
-            Task1 has Task Readiness 'blocked' iff Task2 blocks Task1 and Task2 has Task Status 'pending'.\n\
-            Task has Task Readiness 'ready' iff Task has Task Status 'pending' and Task has no Task Readiness 'blocked'.\n\
-        ";
-        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
-            .expect("parse must succeed");
-        let defs = compile_to_defs_state(&state);
-        let d = ast::defs_to_state(&defs, &state);
-
-        // Stratified forward chain (#826b): positive rules first,
-        // then negation rules. Mirrors `cli::entry`'s compile path.
-        let collect = |prefix: &str, state: &ast::Object| -> Vec<(String, ast::Func)> {
-            ast::cells_iter(state).into_iter()
-                .filter(|(n, _)| n.starts_with(prefix))
-                .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, state)))
-                .collect()
-        };
-        let s1 = collect("derivation:rule_", &d);
-        let refs1: Vec<(&str, &ast::Func)> = s1.iter().map(|(n, f)| (n.as_str(), f)).collect();
-        let (d, _) = crate::evaluate::forward_chain_defs_state(&refs1, &d);
-        let s2 = collect("derivation_strat2:rule_", &d);
-        let refs2: Vec<(&str, &ast::Func)> = s2.iter().map(|(n, f)| (n.as_str(), f)).collect();
-        let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs2, &d);
-
-        let cell = ast::fetch_or_phi("Task_has_Task_Readiness", &new_d);
-        let entries: Vec<&ast::Object> = cell.as_seq()
-            .map(|s| s.iter().collect()).unwrap_or_default();
-        let by_status = |status: &str| -> Vec<String> {
-            entries.iter()
-                .filter(|f| f.as_seq().map(|pairs| pairs.iter().any(|p| {
-                    let kv = match p.as_seq() { Some(kv) => kv, None => return false };
-                    kv.first().and_then(|k| k.as_atom()) == Some("Task Readiness")
-                        && kv.get(1).and_then(|v| v.as_atom()) == Some(status)
-                })).unwrap_or(false))
-                .filter_map(|f| f.as_seq().and_then(|pairs| pairs.iter().find_map(|p| {
-                    let kv = p.as_seq()?;
-                    let role = kv.first()?.as_atom()?;
-                    if role == "Task" { kv.get(1)?.as_atom().map(String::from) } else { None }
-                })))
-                .collect()
-        };
-        let blocked = by_status("blocked");
-        let ready = by_status("ready");
-        assert!(blocked.contains(&"1".to_string()),
-            "Task 1 must be blocked (blocked by Task 2 which is pending); got blocked={:?}", blocked);
-        assert!(!blocked.contains(&"2".to_string()),
-            "Task 2 must NOT be blocked (nothing blocks it); got blocked={:?}", blocked);
-        assert!(ready.contains(&"2".to_string()),
-            "Task 2 must be ready (pending and not blocked); got ready={:?}", ready);
-        assert!(!ready.contains(&"1".to_string()),
-            "Task 1 must NOT be ready (it has Readiness 'blocked'); got ready={:?}", ready);
     }
 
     /// Two-antecedent ring FT join with subscripts: a derivation that
