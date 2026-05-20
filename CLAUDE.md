@@ -162,6 +162,32 @@ None = wildcard). Skip `from_grammar_state` for wildcard tables
 unless multiple callers need it (parallel-enum representation
 of wildcards is awkward).
 
+## Debug the live artifact before fixing on assumption
+
+When something fails on the live data (a recompile, an apply, a query),
+**instrument the actual running artifact before writing a fix.** Find
+out *empirically* which code path executes, what the real cell/Object
+shapes are, and where the failure originates — don't reason from what
+you assume the code does.
+
+A minimal repro that passes does NOT prove your fix is right. Engine
+behavior is context-dependent: a derivation rule classifies into a
+different compile branch under the full schema than in a 5-fact test;
+a cell is `Map`-backed (UC-keyed) on the live DB but `Seq`-backed in a
+fixture; `φ` (empty-seq) values present in real data are absent in
+hand-built inputs. If a bug doesn't reproduce in a minimal case, that's
+a signal the minimal case is missing the trigger — go instrument the
+live path (dump the compiled `CompiledDerivation`, the cell contents,
+which branch runs, whether `apply` returns `Bottom`), not invent more
+repros. Repro-driven guessing burns hours fixing paths the live code
+never takes.
+
+Concretely: a temporary `eprintln!` of `result.is_bottom()` /
+`variant_name(func)` / cell shapes in the failing path, run against a
+*copy of the live DB*, tells you in one recompile what a dozen
+fixtures won't. Only after you've located the real failure on the real
+data should you write the regression test + fix.
+
 ## Things to remember beyond this file
 
 Per user's global CLAUDE.md: no memory system; use AREST MCP in local
