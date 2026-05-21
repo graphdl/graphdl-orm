@@ -557,7 +557,7 @@ export function listConnectedSystems(sql: SqlLike): string[] {
 //     producing row. Lives in a separate `secrets` table with a
 //     different schema and is not subject to the cell-source contract.
 //
-//   src/entity-do.ts:615-617  EntityDB.ensureInit  schema bootstrap
+//   src/entity-do.ts:727-732  EntityDB.ensureInit  schema bootstrap
 //     `initCellSchema` + `initSecretSchema` are idempotent CREATE TABLE
 //     IF NOT EXISTS calls — schema bootstrap is by definition the
 //     adapter's own DDL, called from within the EntityDB class to
@@ -565,14 +565,15 @@ export function listConnectedSystems(sql: SqlLike): string[] {
 //     before the first read/write. Not a bypass; equivalent to
 //     opening the adapter's "connection".
 //
-//   src/entity-do.ts:1100-1158  EntityDB.rotateMaster
+//   src/entity-do.ts:1186-1278  EntityDB.rotateMaster (SQL touches at
+//   1214 SELECT and 1267 INSERT OR REPLACE)
 //     Tenant master rotation reads the sealed `cell` row directly,
 //     decrypts under the OLD master, re-encrypts under the NEW master,
 //     and writes the rotated bytes back. This is the ONLY surviving
 //     direct SQL touch on the `cell` table from a productive EntityDB
 //     method. The path is documented at the call site (see #885 /
-//     "engine-silent by design" comment, lines 1083-1098 and
-//     1141-1151): the engine surface returns the cell's plaintext
+//     "engine-silent by design" comment, lines 1196-1212 and
+//     1255-1265): the engine surface returns the cell's plaintext
 //     post-thaw, not the raw AEAD envelope rotation must
 //     decrypt+re-encrypt, AND rotation must NOT extend the engine
 //     chain (a fresh VersionEntry would put the rotated AAD=oldVersion
