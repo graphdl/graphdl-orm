@@ -3199,3 +3199,135 @@ Doc has Status.
 // (rule fires when AbsenceOf guard is satisfied) and the counterfactual
 // (rule does NOT fire when negation matches).
 
+// ─── Category 16: Comparator/aggregate derivations fire end-to-end (task-814) ──
+//
+// task-814 (Substrate-2) asks: does an AUTHORED comparator/aggregate
+// derivation actually fire end-to-end (parse → compile → evaluate),
+// returning the comparator-correct value rather than plain attribute
+// inheritance from a bound antecedent?
+//
+// The existing aggregate firing tests in evaluate.rs
+// (count/sum/min/max/avg_aggregate_*) build the DerivationRuleDef
+// struct by hand — they pin compile+evaluate but NOT that the parser
+// recognises the authored rule TEXT. These two tests close that gap by
+// parsing the authored reading text through resolve_derivation_rule.
+//
+// (a) `authored_max_aggregate_fires_end_to_end` authors the canonical
+//     Halpin aggregate form `<role> is the max of <target> where ...`
+//     from text and asserts the engine derives the per-group MAX, not
+//     a passthrough of an arbitrary bound value. This is the SUPPORTED
+//     comparator path: `min`/`max` over a numeric/value role.
+//
+// (b) `authored_strongest_among_superlative_pins_current_behavior`
+//     authors the superlative phrasing the task brief cites verbatim
+//     (`... has the strongest P among ...`). The audit (#814, commit
+//     406f7d12) documented that superlative comparator WORDS
+//     ('strongest'/'highest') over enum-valued nouns are NOT in any
+//     parser recogniser — they fall through resolve_derivation_rule's
+//     cascade and land as an unresolved clause. This test pins that
+//     current behavior so a future recogniser add flips it visibly.
+
+#[test]
+fn authored_max_aggregate_fires_end_to_end() {
+    // Author the `max` aggregate as TEXT — exercises try_parse_aggregate_clause
+    // (parse_forml2.rs AGG_OPS) → compile_aggregate_derivation → forward chain.
+    let src = r#"# Max aggregate derivation
+Order(.ID) is an entity type.
+ID is a value type.
+LineItem Amount is a value type.
+Amount is a value type.
+
+## Fact Types
+Order has ID.
+Order has LineItem Amount.
+Order has Amount.
+
+## Derivation Rules
+* Order has Amount iff Amount is the max of LineItem Amount where Order has LineItem Amount.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    // Shape: the parser must have populated consequent_aggregates with the
+    // `max` op, NOT left it as a plain join/explicit passthrough.
+    assert!(!rule.consequent_aggregates.is_empty(),
+        "authored `is the max of` rule must populate consequent_aggregates; got {:#?}\nrule.text={}\nunresolved={:#?}",
+        rule.consequent_aggregates, rule.text, rule.unresolved_clauses);
+    assert_eq!(rule.consequent_aggregates[0].op, "max",
+        "aggregate op must be max, got {}", rule.consequent_aggregates[0].op);
+
+    // Fire it: O1 has {10, 4, 25} → max 25; O2 has {7} → 7.
+    let out = apply_to_facts(&func, &[
+        ("Order_has_LineItem_Amount", &[("Order", "O1"), ("LineItem Amount", "10")]),
+        ("Order_has_LineItem_Amount", &[("Order", "O1"), ("LineItem Amount", "4")]),
+        ("Order_has_LineItem_Amount", &[("Order", "O1"), ("LineItem Amount", "25")]),
+        ("Order_has_LineItem_Amount", &[("Order", "O2"), ("LineItem Amount", "7")]),
+    ]);
+    let derived = decode_derived(&out);
+    assert!(
+        derived.iter().any(|(_, _, b)|
+            b.iter().any(|(k, v)| k == "Order" && v == "O1") &&
+            b.iter().any(|(k, v)| k == "Amount" && v == "25")),
+        "expected (Order=O1, Amount=25) — the per-group MAX, not a passthrough; got {:#?}", derived);
+    // Negative guard: the lower values must NOT leak through as the result.
+    assert!(
+        !derived.iter().any(|(_, _, b)|
+            b.iter().any(|(k, v)| k == "Order" && v == "O1") &&
+            b.iter().any(|(k, v)| k == "Amount" && (v == "10" || v == "4"))),
+        "O1 must derive only the MAX (25), not lower bound values; got {:#?}", derived);
+}
+
+#[test]
+fn authored_strongest_among_superlative_pins_current_behavior() {
+    // The task brief's verbatim shape: superlative comparator WORD
+    // ('strongest') over an enum-valued noun with author-supplied
+    // ordering. Per the #814 audit this is NOT recognised by any
+    // parser cascade entry. We assert the current behavior: the rule
+    // either fails to populate a comparator aggregate, or the clause
+    // lands unresolved — i.e. it does NOT silently fire as a plain
+    // attribute-inheritance passthrough that masquerades as a
+    // comparator result.
+    let src = r#"# Strongest-among superlative derivation
+Merge(.ID) is an entity type.
+Commit(.SHA) is an entity type.
+ID is a value type.
+SHA is a value type.
+Security Posture is a value type.
+
+## Fact Types
+Merge has ID.
+Commit has SHA.
+Merge concerns Commit.
+Commit has Security Posture.
+Merge has derived Security Posture.
+
+## Derivation Rules
+* Merge has derived Security Posture iff Merge concerns some Commit that has the strongest Security Posture among Commits the Merge concerns.
+"#;
+    // Parse without asserting exactly-one-rule (the harness' parse_and_compile
+    // requires the rule to compile cleanly; a superlative that falls through
+    // may not produce a usable aggregate). Inspect the parsed rule directly.
+    let state = parse_to_state(src).expect("parse");
+    let data = compile::cell_index_from_state(&state);
+    // There should be exactly one authored derivation rule.
+    assert_eq!(data.derivation_rules.len(), 1,
+        "expected exactly one authored rule, got {}", data.derivation_rules.len());
+    let rule = &data.derivation_rules[0];
+
+    // CURRENT BEHAVIOR (pinned): the superlative 'strongest ... among'
+    // is NOT recognised as an aggregate comparator — consequent_aggregates
+    // is empty. The comparator words are not in AGG_OPS and there is no
+    // ordering-FT lift, so no max-over-enum aggregate is built.
+    assert!(rule.consequent_aggregates.is_empty(),
+        "REGRESSION/PROGRESS: 'strongest ... among' now populates consequent_aggregates \
+         (a recogniser was added) — update this pin + the #814 audit doc. Got {:#?}",
+        rule.consequent_aggregates);
+    // The superlative clause should surface as unresolved rather than be
+    // silently absorbed as a plain passthrough. If neither aggregate nor
+    // unresolved-clause is set, the rule would fire as bare attribute
+    // inheritance — exactly the false-positive the task warns about.
+    assert!(!rule.unresolved_clauses.is_empty(),
+        "'strongest ... among' must land as an unresolved clause (not silently \
+         absorbed as attribute-inheritance passthrough). rule.text={}\nrule={:#?}",
+        rule.text, rule);
+}
+
