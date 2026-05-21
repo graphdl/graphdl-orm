@@ -225,10 +225,12 @@ pub struct LoadValidationReport {
 /// reading's manifest and any rows in adjacent cells (Role,
 /// derivation defs) keyed by those identifiers.
 ///
-/// `Migrate` (future) — preserve referencing facts by re-homing
-/// them under a generic uncategorized fact-type bucket. #557
-/// ReloadReading depends on this for atomic unload+load with
-/// backing-fact preservation.
+/// `Migrate` — preserve the population P. Keeps the reading's
+/// nouns / fact-types / roles / primary facts and removes only the
+/// reading's derivation defs + manifest cell, so a subsequent
+/// re-ingestion's derivations recompute over the surviving P.
+/// `ReloadReading`'s `MigrateFacts` policy drives the unload with
+/// this so the reload preserves backing facts and re-derives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnloadPolicy {
     CascadeDelete,
@@ -305,10 +307,12 @@ pub struct UnloadOutcome {
 /// Loses any backing facts referencing dropped FTs. The right
 /// policy when the new body is a strict superset / disjoint
 /// redefinition.
-/// `MigrateFacts` (future) — unload with `Migrate`, preserving
-/// referencing facts under a generic uncategorized bucket so the
-/// reload re-homes them under the new schema. Stubbed today;
-/// returns `ReloadError::NotImplemented`.
+/// `MigrateFacts` — unload with `Migrate` (preserve the population
+/// P), load the new body, then re-derive P from the new readings.
+/// "Migration is ingestion of new readings" (AREST.tex §Conclusion;
+/// Migration remark, §Self-Modification): the new body's derivation
+/// rules transform the surviving facts. The right policy when the
+/// new body refines/extends derivations over an existing population.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReloadPolicy {
     ReplaceAll,
@@ -807,12 +811,7 @@ pub fn unload_reading(
         ));
     }
 
-    // Step 2: gate Migrate.
-    if policy == UnloadPolicy::Migrate {
-        return Err(UnloadError::NotImplemented);
-    }
-
-    // Step 3: manifest lookup.
+    // Step 2: manifest lookup.
     let manifest = match decode_manifest(state, trimmed_name) {
         Some(m) => m,
         None => {
@@ -820,52 +819,94 @@ pub fn unload_reading(
         }
     };
 
-    // Step 4: cascade-delete per identifier list.
-    let mut new_state = state.clone();
-    new_state = remove_rows_by_binding(
-        &new_state,
-        "Noun",
-        "name",
-        &manifest.added_nouns,
-    );
-    new_state = remove_rows_by_binding(
-        &new_state,
-        "FactType",
-        "id",
-        &manifest.added_fact_types,
-    );
-    new_state = remove_rows_by_binding(
-        &new_state,
-        "Role",
-        "factType",
-        &manifest.added_fact_types,
-    );
-    new_state = remove_rows_by_binding(
-        &new_state,
-        "DerivationRule",
-        "ruleId",
-        &manifest.added_derivations,
-    );
-    for rule_id in &manifest.added_derivations {
-        let def_name = alloc::format!("derivation:{}", rule_id);
-        new_state = remove_cell(&new_state, &def_name);
-    }
-
-    // Step 5: drop the manifest cell.
     let manifest_cell = manifest_cell_name(trimmed_name);
-    new_state = remove_cell(&new_state, &manifest_cell);
+    let mut new_state = state.clone();
 
-    let report = UnloadReport {
-        removed_nouns: manifest.added_nouns,
-        removed_fact_types: manifest.added_fact_types,
-        removed_derivations: manifest.added_derivations,
-        // Surface the versioning metadata recorded by the load so
-        // wire callers can see which body version was just removed.
-        // Pre-#558 manifests decode with `""` / `0` defaults, which
-        // we propagate as-is — the wire encoder treats both as
-        // absent-equivalent (#558 / DynRdg-4).
-        content_hash: manifest.content_hash,
-        version_stamp: manifest.version_stamp,
+    // Step 3: dispatch on policy.
+    //
+    // `Migrate` is the *preserve-population* peer of
+    // `ReloadPolicy::MigrateFacts`. Per AREST.tex (§Conclusion:
+    // "migration is ingestion of new readings"; §Self-Modification
+    // Migration remark: migration readings transform P "as derivation
+    // rules, transition triggers, or deontic constraints"), an unload
+    // under migration must NOT cascade-delete the population it is
+    // about to re-ingest over. We drop only the reading's *derivation
+    // defs* (so a subsequent re-ingestion's derivations recompute from
+    // scratch over the surviving P) plus the manifest cell. Nouns,
+    // fact-types, roles and primary facts — the population P — survive
+    // untouched. `CascadeDelete` keeps the historical destructive
+    // semantics (remove every identifier the reading added).
+    let report = match policy {
+        UnloadPolicy::CascadeDelete => {
+            new_state = remove_rows_by_binding(
+                &new_state,
+                "Noun",
+                "name",
+                &manifest.added_nouns,
+            );
+            new_state = remove_rows_by_binding(
+                &new_state,
+                "FactType",
+                "id",
+                &manifest.added_fact_types,
+            );
+            new_state = remove_rows_by_binding(
+                &new_state,
+                "Role",
+                "factType",
+                &manifest.added_fact_types,
+            );
+            new_state = remove_rows_by_binding(
+                &new_state,
+                "DerivationRule",
+                "ruleId",
+                &manifest.added_derivations,
+            );
+            for rule_id in &manifest.added_derivations {
+                let def_name = alloc::format!("derivation:{}", rule_id);
+                new_state = remove_cell(&new_state, &def_name);
+            }
+            new_state = remove_cell(&new_state, &manifest_cell);
+            UnloadReport {
+                removed_nouns: manifest.added_nouns,
+                removed_fact_types: manifest.added_fact_types,
+                removed_derivations: manifest.added_derivations,
+                // Surface the versioning metadata recorded by the load
+                // so wire callers can see which body version was just
+                // removed. Pre-#558 manifests decode with `""` / `0`
+                // defaults, which we propagate as-is — the wire encoder
+                // treats both as absent-equivalent (#558 / DynRdg-4).
+                content_hash: manifest.content_hash,
+                version_stamp: manifest.version_stamp,
+            }
+        }
+        UnloadPolicy::Migrate => {
+            // Drop the reading's derivation defs + DerivationRule rows
+            // so the migration re-ingestion recomputes derived facts
+            // from primary P. Leave Noun/FactType/Role/primary-fact
+            // cells in place.
+            new_state = remove_rows_by_binding(
+                &new_state,
+                "DerivationRule",
+                "ruleId",
+                &manifest.added_derivations,
+            );
+            for rule_id in &manifest.added_derivations {
+                let def_name = alloc::format!("derivation:{}", rule_id);
+                new_state = remove_cell(&new_state, &def_name);
+            }
+            new_state = remove_cell(&new_state, &manifest_cell);
+            // Report only what was actually removed: nouns/FTs are
+            // preserved, so their removed-lists are empty. Derivations
+            // ARE removed (they'll be re-derived by re-ingestion).
+            UnloadReport {
+                removed_nouns: Vec::new(),
+                removed_fact_types: Vec::new(),
+                removed_derivations: manifest.added_derivations,
+                content_hash: manifest.content_hash,
+                version_stamp: manifest.version_stamp,
+            }
+        }
     };
 
     Ok(UnloadOutcome {
@@ -878,8 +919,11 @@ pub fn unload_reading(
 /// a single commit. (#557 / DynRdg-3.)
 ///
 /// Pipeline:
-///   1. Gate `ReloadPolicy::MigrateFacts` → `NotImplemented`. Forward
-///      compatibility hook; depends on `UnloadPolicy::Migrate`.
+///   1. Map `ReloadPolicy` → `UnloadPolicy` for the unload step:
+///      `ReplaceAll` → `CascadeDelete` (destructive redefinition);
+///      `MigrateFacts` → `Migrate` (preserve the population P, then
+///      re-derive it from the new readings in step 5b — migration is
+///      ingestion of new readings, AREST.tex §Conclusion).
 ///   2. Sanitize `name` (empty/whitespace/control → `InvalidName`)
 ///      and `body` (empty/whitespace → `EmptyBody`). Cheap; same
 ///      rules as `load_reading` / `unload_reading`.
@@ -924,10 +968,30 @@ pub fn reload_reading(
     body: &str,
     policy: ReloadPolicy,
 ) -> Result<ReloadOutcome, ReloadError> {
-    // Step 1: gate.
-    if policy == ReloadPolicy::MigrateFacts {
-        return Err(ReloadError::NotImplemented);
-    }
+    // Step 1: select the unload policy from the reload policy.
+    //
+    // `ReplaceAll` (default) drives the unload with `CascadeDelete`:
+    // the prior reading's nouns/FTs/derivations are removed before the
+    // new body loads — the right semantics for a disjoint redefinition
+    // where backing facts should NOT survive.
+    //
+    // `MigrateFacts` is migration in the AREST.tex sense: "migration
+    // is ingestion of new readings" (§Conclusion), and migration
+    // readings transform P "as derivation rules, transition triggers,
+    // or deontic constraints" (§Self-Modification, Migration remark).
+    // So MigrateFacts means PRESERVE the existing population P, then
+    // RE-DERIVE it from the new readings — the new body's derivation
+    // rules perform the migration over the surviving facts. We drive
+    // the unload with `UnloadPolicy::Migrate` (preserve P; drop only
+    // the prior derivation defs so they recompute) and run a
+    // re-derivation pass after the load step. This mirrors the CLI
+    // recompile path (`cli/entry.rs` ~743: load prior population →
+    // merge fresh-parsed schema → drop derived cells → forward-chain),
+    // routed through the existing compile + forward-chain primitives.
+    let unload_policy = match policy {
+        ReloadPolicy::ReplaceAll => UnloadPolicy::CascadeDelete,
+        ReloadPolicy::MigrateFacts => UnloadPolicy::Migrate,
+    };
 
     // Step 2: sanitize. Done up front so we reject cheaply before
     // any unload work runs — duplicates the checks inside
@@ -960,7 +1024,7 @@ pub fn reload_reading(
 
     // Step 4: unload. Treat ManifestMissing as a fall-through to
     // first-time-load. Other unload errors are fatal.
-    let unload_outcome = match unload_reading(state, trimmed_name, UnloadPolicy::CascadeDelete) {
+    let unload_outcome = match unload_reading(state, trimmed_name, unload_policy) {
         Ok(o) => o,
         Err(UnloadError::ManifestMissing(_)) => {
             // First-time-load disguised as reload: synthesize an
@@ -988,14 +1052,151 @@ pub fn reload_reading(
         Err(e) => return Err(ReloadError::LoadFailed(e)),
     };
 
+    // Step 5b (MigrateFacts only): re-derive the preserved population
+    // P from the new readings. The load step (Step 5) merged the new
+    // body's schema + primary facts onto the preserved population, but
+    // it did NOT fire the new body's derivation rules over the
+    // surviving facts. Run the preserve-and-re-derive pass — compile
+    // the new readings' derivations, drop stale derived consequent
+    // cells, and forward-chain to the least fixed point — so the new
+    // derivation rules transform P. This is the "ingestion of new
+    // readings" migration step.
+    let new_state = match policy {
+        ReloadPolicy::ReplaceAll => load_outcome.new_state,
+        ReloadPolicy::MigrateFacts => re_derive_population(&load_outcome.new_state),
+    };
+
     // Step 6: assemble. The new state is the load step's output —
     // it already includes the post-unload cell deletions and the
-    // refreshed manifest cell.
+    // refreshed manifest cell — plus, for MigrateFacts, the
+    // re-derived consequent cells.
     Ok(ReloadOutcome {
         removed: unload_outcome.report,
         added: load_outcome.report,
-        new_state: load_outcome.new_state,
+        new_state,
     })
+}
+
+/// Preserve-and-re-derive: re-derive a population state's derived
+/// consequent cells from its primary facts under its current
+/// derivation rules. Pure-FORML; the migration primitive behind
+/// `ReloadPolicy::MigrateFacts`.
+///
+/// AREST.tex §4.3: "Derivation: forward chaining, monotonic,
+/// evaluated to the least fixed point per request. Derivation only
+/// adds facts over finite P; the fixed point exists by Knaster-Tarski
+/// and is reached in ≤ |P_max|-|P| steps."
+///
+/// This mirrors the CLI recompile path (`cli/entry.rs` ~840-1015) and
+/// the `re_derive` system FFI (`lib.rs` ~1804), routed through the
+/// shared `compile::compile_to_defs_state` + `evaluate` primitives
+/// rather than a bespoke fact-mover:
+///   1. Compile derivation defs from the population's schema +
+///      `DerivationRule` cells into a working def-state `d`.
+///   2. Drop the derived consequent cells (the cells named by each
+///      `DerivationRule`'s `consequentFactTypeId`) so the chain
+///      recomputes them from primary facts — the LFP-per-request
+///      contract (#836). Without this, a stale derived fact whose
+///      primary support changed would survive.
+///   3. Run a 2-stratum forward chain to the least fixed point:
+///      stratum 1 = positive `derivation:rule_*` rules, stratum 2 =
+///      negation-guarded `derivation_strat2:rule_*` rules. Mirrors the
+///      `re_derive` FFI's stratum split.
+///   4. Project back to a *population* state: return the input
+///      population's cells (with derived consequent cells refreshed),
+///      dropping the transient compile-only def cells (`derivation:*`,
+///      `derivation_meta:*`, Platform defs, …). The reload caller and
+///      the `command.rs` reload handler re-compile defs from the
+///      returned population, so leaking def cells here would
+///      double-register them.
+///
+/// Idempotent at the fixed point: re-running over a re-derived
+/// population adds nothing (monotonic chain over the same primary P).
+fn re_derive_population(population: &Object) -> Object {
+    use crate::ast;
+
+    // Step 1: compile defs and materialize them into a working state.
+    let defs = crate::compile::compile_to_defs_state(population);
+    let d = ast::defs_to_state(&defs, population);
+
+    // Step 2: identify + clear derived consequent cells (LFP per
+    // request, #836). Each `DerivationRule` declares its consequent
+    // cell via the encoded `consequentFactTypeId`.
+    let derived_cells: hashbrown::HashSet<String> = {
+        let mut out: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        let drule_cell = ast::fetch_or_phi("DerivationRule", &d);
+        if let Some(facts) = drule_cell.as_seq() {
+            for fact in facts.iter() {
+                let Some(encoded) = ast::binding(fact, "consequentFactTypeId") else {
+                    continue;
+                };
+                let cell_name = crate::types::ConsequentCellSource::decode(encoded)
+                    .literal_id()
+                    .to_string();
+                if !cell_name.is_empty() {
+                    out.insert(cell_name);
+                }
+            }
+        }
+        out
+    };
+    let d = if derived_cells.is_empty() {
+        d
+    } else {
+        let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+        for (name, contents) in ast::cells_iter(&d).into_iter() {
+            if derived_cells.contains(name) {
+                new_map.insert(name.to_string(), ast::Object::phi());
+            } else {
+                new_map.insert(name.to_string(), contents.clone());
+            }
+        }
+        ast::Object::map(new_map)
+    };
+
+    // Step 3: 2-stratum forward chain to the least fixed point.
+    // Mirrors the `re_derive` FFI (lib.rs): positive rules first, then
+    // negation-guarded rules over the resulting state.
+    let collect_stratum = |prefix: &str, state: &ast::Object| -> Vec<(String, ast::Func)> {
+        let cell_prefix = alloc::format!("{}:", prefix);
+        ast::cells_iter(state)
+            .into_iter()
+            .filter(|(n, _)| n.starts_with(cell_prefix.as_str()))
+            .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, state)))
+            .collect()
+    };
+    let stratum1 = collect_stratum("derivation", &d);
+    let stratum2 = collect_stratum("derivation_strat2", &d);
+    let post_s1 = if stratum1.is_empty() {
+        d
+    } else {
+        let refs: Vec<(&str, &ast::Func)> =
+            stratum1.iter().map(|(n, f)| (n.as_str(), f)).collect();
+        crate::evaluate::forward_chain_defs_state(&refs, &d).0
+    };
+    let chained = if stratum2.is_empty() {
+        post_s1
+    } else {
+        let refs: Vec<(&str, &ast::Func)> =
+            stratum2.iter().map(|(n, f)| (n.as_str(), f)).collect();
+        crate::evaluate::forward_chain_defs_state(&refs, &post_s1).0
+    };
+
+    // Step 4: project back to a population state. Keep every cell that
+    // was in the input population (refreshed) plus the derived
+    // consequent cells; drop the transient compile-only def cells so
+    // we don't leak them to the caller (who re-compiles defs anyway).
+    let population_names: hashbrown::HashSet<String> = ast::cells_iter(population)
+        .into_iter()
+        .map(|(n, _)| n.to_string())
+        .collect();
+    let mut out_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+    for (name, contents) in ast::cells_iter(&chained).into_iter() {
+        if population_names.contains(name) || derived_cells.contains(name) {
+            out_map.insert(name.to_string(), contents.clone());
+        }
+    }
+    ast::Object::map(out_map)
 }
 
 /// Decode a `check::check_readings_func` result Object back into the
@@ -1542,17 +1743,31 @@ Category(.Name) is an entity type.
         }
     }
 
-    /// UnloadPolicy::Migrate is stubbed → NotImplemented.
+    /// UnloadPolicy::Migrate now preserves the population: the
+    /// reading's added nouns/FTs survive (NOT cascade-deleted) while
+    /// the manifest is dropped. (Previously stubbed → NotImplemented;
+    /// see `unload_migrate_preserves_population` for the full
+    /// preserve-P assertions.)
     #[test]
-    fn unload_migrate_policy_not_implemented() {
+    fn unload_migrate_policy_preserves_added_nouns() {
         let state = seed_state();
         let body = "Product(.SKU) is an entity type.\n";
         let loaded = load_reading(&state, "catalog", body, LoadReadingPolicy::AllowAll)
             .expect("load succeeds");
-        match unload_reading(&loaded.new_state, "catalog", UnloadPolicy::Migrate) {
-            Err(UnloadError::NotImplemented) => {}
-            other => panic!("expected NotImplemented, got {other:?}"),
-        }
+        let outcome = unload_reading(&loaded.new_state, "catalog", UnloadPolicy::Migrate)
+            .expect("Migrate unload must succeed");
+        let nouns: Vec<String> = ast::fetch_or_phi("Noun", &outcome.new_state)
+            .as_seq()
+            .map(|s| s.iter().filter_map(|f| ast::binding(f, "name").map(String::from)).collect())
+            .unwrap_or_default();
+        assert!(
+            nouns.contains(&"Product".to_string()),
+            "Migrate unload must PRESERVE the reading's added noun; nouns = {nouns:?}"
+        );
+        assert!(
+            decode_manifest(&outcome.new_state, "catalog").is_none(),
+            "Migrate unload must still drop the manifest cell"
+        );
     }
 
     /// Round-trip: load → unload returns the Noun cell to the
@@ -1859,19 +2074,150 @@ Product has SKU.
 
     }
 
-    /// Migrate stub: `ReloadPolicy::MigrateFacts` returns
-    /// `NotImplemented`. State is untouched.
+    /// MigrateFacts is no longer stubbed: it preserves the prior
+    /// population and re-derives. With no derivation rule in either
+    /// body, the reload is a structural no-op over the schema but must
+    /// still succeed (not return NotImplemented). The full
+    /// preserve-P + re-derive behavior is asserted in
+    /// `reload_migrate_facts_preserves_population_and_re_derives`.
     #[test]
-    fn reload_reading_migrate_facts_not_implemented() {
+    fn reload_reading_migrate_facts_succeeds() {
         let state = seed_state();
-        let snapshot = state.clone();
-        let err = reload_reading(&state, "catalog", "# anything\n", ReloadPolicy::MigrateFacts)
-            .expect_err("MigrateFacts must return NotImplemented");
-        match err {
-            ReloadError::NotImplemented => {}
-            other => panic!("expected NotImplemented, got {other:?}"),
-        }
-        assert_eq!(state, snapshot, "MigrateFacts must not mutate input");
+        let body = "Product(.SKU) is an entity type.\n";
+        let loaded = load_reading(&state, "catalog", body, LoadReadingPolicy::AllowAll)
+            .expect("load succeeds");
+        reload_reading(&loaded.new_state, "catalog", body, ReloadPolicy::MigrateFacts)
+            .expect("MigrateFacts reload must succeed, not return NotImplemented");
+    }
+
+    /// Migration is ingestion of new readings (AREST.tex §Conclusion;
+    /// Migration remark, §Self-Modification): re-ingesting readings
+    /// whose derivations transform the existing population P.
+    ///
+    /// `ReloadPolicy::MigrateFacts` must (a) PRESERVE the existing
+    /// population P and (b) RE-DERIVE it from the new readings — so a
+    /// derivation rule introduced by the reload fires over the
+    /// surviving primary facts.
+    ///
+    /// Scenario: v1 declares the Order schema and a primary fact
+    /// `Order 'o1' has Order Status 'pending'` but NO derivation. v2
+    /// (reloaded with MigrateFacts) adds the literal-iff rule
+    /// `Order has Order Readiness 'ready' iff Order has Order Status
+    /// 'pending'`. After the migration: the primary 'pending' fact
+    /// survives, AND the new rule has derived `Order has Order
+    /// Readiness 'ready'` over it.
+    #[test]
+    fn reload_migrate_facts_preserves_population_and_re_derives() {
+        let state = seed_state();
+        let body_v1 = "\
+Order(.id) is an entity type.
+Order Status is a value type.
+Order Readiness is a value type.
+Order has Order Status.
+Order has Order Readiness.
+Order 'o1' has Order Status 'pending'.
+";
+        let v1 = load_reading(&state, "rules", body_v1, LoadReadingPolicy::AllowAll)
+            .expect("v1 loads");
+
+        // Sanity: the primary fact is present, the derived cell is not
+        // yet populated (no rule in v1).
+        let status_v1 = ast::fetch_or_phi("Order_has_Order_Status", &v1.new_state);
+        assert!(
+            status_v1.as_seq().map(|s| !s.is_empty()).unwrap_or(false),
+            "v1 must carry the primary Order Status 'pending' fact"
+        );
+
+        let body_v2 = "\
+Order(.id) is an entity type.
+Order Status is a value type.
+Order Readiness is a value type.
+Order has Order Status.
+Order has Order Readiness.
+Order 'o1' has Order Status 'pending'.
+Order has Order Readiness 'ready' iff Order has Order Status 'pending'.
+";
+        let migrated = reload_reading(&v1.new_state, "rules", body_v2, ReloadPolicy::MigrateFacts)
+            .expect("MigrateFacts reload must succeed (preserve P + re-derive)");
+
+        // (a) Population P preserved: the primary status fact survives.
+        let status_after = ast::fetch_or_phi("Order_has_Order_Status", &migrated.new_state);
+        let status_pending = status_after.as_seq()
+            .map(|s| s.iter().any(|f| {
+                f.as_seq().map(|pairs| pairs.iter().any(|p| {
+                    let kv = match p.as_seq() { Some(kv) => kv, None => return false };
+                    kv.first().and_then(|k| k.as_atom()) == Some("Order Status")
+                        && kv.get(1).and_then(|v| v.as_atom()) == Some("pending")
+                })).unwrap_or(false)
+            }))
+            .unwrap_or(false);
+        assert!(
+            status_pending,
+            "MigrateFacts must preserve the prior primary fact (Order Status 'pending'); \
+             Order_has_Order_Status = {status_after:?}"
+        );
+
+        // (b) Re-derived by the new rule: the readiness fact appears.
+        let readiness = ast::fetch_or_phi("Order_has_Order_Readiness", &migrated.new_state);
+        let readiness_ready = readiness.as_seq()
+            .map(|s| s.iter().any(|f| {
+                f.as_seq().map(|pairs| pairs.iter().any(|p| {
+                    let kv = match p.as_seq() { Some(kv) => kv, None => return false };
+                    kv.first().and_then(|k| k.as_atom()) == Some("Order Readiness")
+                        && kv.get(1).and_then(|v| v.as_atom()) == Some("ready")
+                })).unwrap_or(false)
+            }))
+            .unwrap_or(false);
+        assert!(
+            readiness_ready,
+            "MigrateFacts must RE-DERIVE: the v2 literal-iff rule must fire over the \
+             preserved 'pending' fact and populate Order_has_Order_Readiness 'ready'; \
+             cell = {readiness:?}"
+        );
+    }
+
+    /// `UnloadPolicy::Migrate` is the preserve-population-on-unload
+    /// peer of MigrateFacts: it removes the reading's manifest +
+    /// derivation defs (so a subsequent re-ingestion's derivations
+    /// recompute) but PRESERVES the population P — nouns, fact-types
+    /// and primary facts survive. (Contrast `CascadeDelete`, which
+    /// drops the reading's added nouns/FTs.)
+    #[test]
+    fn unload_migrate_preserves_population() {
+        let state = seed_state();
+        let body = "\
+Order(.id) is an entity type.
+Order Status is a value type.
+Order has Order Status.
+Order 'o1' has Order Status 'pending'.
+";
+        let loaded = load_reading(&state, "rules", body, LoadReadingPolicy::AllowAll)
+            .expect("load succeeds");
+
+        let outcome = unload_reading(&loaded.new_state, "rules", UnloadPolicy::Migrate)
+            .expect("Migrate unload must succeed (preserve P)");
+
+        // Population preserved: the primary fact survives.
+        let status_after = ast::fetch_or_phi("Order_has_Order_Status", &outcome.new_state);
+        assert!(
+            status_after.as_seq().map(|s| !s.is_empty()).unwrap_or(false),
+            "Migrate unload must preserve the population's primary facts; \
+             Order_has_Order_Status = {status_after:?}"
+        );
+        // FactType preserved (NOT cascade-deleted).
+        let ft_after = ast::fetch_or_phi("FactType", &outcome.new_state);
+        let ft_ids: Vec<String> = ft_after.as_seq()
+            .map(|s| s.iter().filter_map(|f| ast::binding(f, "id").map(String::from)).collect())
+            .unwrap_or_default();
+        assert!(
+            !ft_ids.is_empty(),
+            "Migrate unload must preserve fact-types (population P), not cascade-delete them"
+        );
+        // Manifest removed (the reading is no longer registered).
+        assert!(
+            decode_manifest(&outcome.new_state, "rules").is_none(),
+            "Migrate unload must drop the reading's manifest cell"
+        );
     }
 
     /// Empty/whitespace name rejects with `InvalidName` before any

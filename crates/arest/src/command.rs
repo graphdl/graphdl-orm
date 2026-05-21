@@ -189,9 +189,10 @@ pub enum Command {
     /// cell itself. See `crate::load_reading::unload_reading`.
     ///
     /// The optional `policy` field accepts "cascade-delete" (default,
-    /// also accepts "cascade_delete") and "migrate" (currently
-    /// stubbed — returns NotImplemented). Unknown values fall back
-    /// to the default.
+    /// also accepts "cascade_delete") and "migrate" (preserves the
+    /// population P — keeps the reading's nouns/FTs/facts, drops only
+    /// its derivation defs + manifest so a re-ingestion recomputes).
+    /// Unknown values fall back to the default.
     UnloadReading {
         name: String,
         #[serde(default)]
@@ -208,9 +209,10 @@ pub enum Command {
     /// stays exactly as it was — no partial state visible.
     ///
     /// The optional `policy` field accepts "replace-all" (default,
-    /// also accepts "replace_all") and "migrate-facts" (currently
-    /// stubbed — returns NotImplemented). Unknown values fall back
-    /// to the default. See `crate::load_reading::reload_reading`.
+    /// also accepts "replace_all") and "migrate-facts" (preserves the
+    /// population P, then re-derives it from the new readings —
+    /// migration is ingestion of new readings). Unknown values fall
+    /// back to the default. See `crate::load_reading::reload_reading`.
     ///
     /// First-time-load fallthrough: if no `_loaded_reading:{name}`
     /// manifest is present, the unload step is treated as a no-op
@@ -3053,8 +3055,10 @@ fn unload_reading_handler(
 /// strings "replace-all" (default), "replace_all", and
 /// "migrate-facts" (also "migrate_facts") — case-insensitive.
 /// Unknown values fall back to the default (replace-all). The
-/// `MigrateFacts` policy is stubbed; today it returns
-/// `reload_reading.not_implemented`.
+/// `MigrateFacts` policy preserves the existing population P and
+/// re-derives it from the new readings (migration is ingestion of
+/// new readings, AREST.tex §Conclusion); `replace-all` instead
+/// cascade-deletes the prior reading before loading the new body.
 ///
 /// First-time-load fallthrough: if no manifest is present for the
 /// name, the unload step is a no-op and the reload becomes a
@@ -5689,13 +5693,15 @@ Status 'pending' is initial in State Machine Definition 'Task'.
             .any(|v| v.constraint_id == "unload_reading.invalid_name"));
     }
 
-    /// Migrate policy is stubbed: rejects with
-    /// `unload_reading.not_implemented`.
+    /// Migrate policy now preserves the population: the unload
+    /// succeeds (not rejected) and the reading's added noun survives
+    /// in the resulting state. (Previously stubbed → not_implemented;
+    /// migration is now "ingestion of new readings" — preserve P.)
     #[test]
-    fn unload_reading_migrate_policy_not_implemented() {
+    fn unload_reading_migrate_policy_preserves_population() {
         let (def_map, _state) = setup_order_defs();
         // Load first so the manifest is present (otherwise we'd hit
-        // ManifestMissing before reaching the policy gate).
+        // ManifestMissing before reaching the policy dispatch).
         let load_cmd = Command::LoadReading {
             name: "catalog".to_string(),
             body: "Product(.SKU) is an entity type.\n".to_string(),
@@ -5712,11 +5718,16 @@ Status 'pending' is initial in State Machine Definition 'Task'.
             signature: None,
         };
         let result = apply_command_defs(&post_load_d, &cmd, &post_load_d);
-        assert!(result.rejected);
-        assert!(result
-            .violations
-            .iter()
-            .any(|v| v.constraint_id == "unload_reading.not_implemented"));
+        assert!(!result.rejected, "Migrate unload must succeed (preserve P)");
+        let post = ast::merge_delta(&post_load_d, &result.state, None);
+        let nouns: Vec<String> = ast::fetch_or_phi("Noun", &post)
+            .as_seq()
+            .map(|s| s.iter().filter_map(|f| ast::binding(f, "name").map(|n| n.to_string())).collect())
+            .unwrap_or_default();
+        assert!(
+            nouns.contains(&"Product".to_string()),
+            "Migrate unload must PRESERVE the reading's added noun; nouns = {nouns:?}"
+        );
     }
 
     // ── #557 Command::ReloadReading ────────────────────────────────
@@ -5843,11 +5854,25 @@ Status 'pending' is initial in State Machine Definition 'Task'.
         assert_eq!(result.state, ast::Object::phi(), "rejection emits no state delta");
     }
 
-    /// MigrateFacts policy is stubbed: rejects with
-    /// `reload_reading.not_implemented`.
+    /// MigrateFacts policy now succeeds: it preserves the existing
+    /// population and re-derives from the new readings (migration is
+    /// ingestion of new readings, AREST.tex §Conclusion). The reload
+    /// emits a `ReadingReloaded` envelope, not a `not_implemented`
+    /// rejection.
     #[test]
-    fn reload_reading_migrate_facts_not_implemented() {
-        let (def_map, state) = setup_order_defs();
+    fn reload_reading_migrate_facts_succeeds() {
+        let (def_map, _state) = setup_order_defs();
+        // Pre-load so the manifest exists and MigrateFacts has a prior
+        // population to preserve.
+        let load_cmd = Command::LoadReading {
+            name: "catalog".to_string(),
+            body: "Product(.SKU) is an entity type.\n".to_string(),
+            sender: None,
+            signature: None,
+        };
+        let load_result = apply_command_defs(&def_map, &load_cmd, &def_map);
+        let post_load_d = ast::merge_delta(&def_map, &load_result.state, None);
+
         let cmd = Command::ReloadReading {
             name: "catalog".to_string(),
             body: "Product(.SKU) is an entity type.\n".to_string(),
@@ -5855,12 +5880,13 @@ Status 'pending' is initial in State Machine Definition 'Task'.
             sender: None,
             signature: None,
         };
-        let result = apply_command_defs(&def_map, &cmd, &state);
-        assert!(result.rejected);
-        assert!(result
-            .violations
-            .iter()
-            .any(|v| v.constraint_id == "reload_reading.not_implemented"));
+        let result = apply_command_defs(&post_load_d, &cmd, &post_load_d);
+        assert!(
+            !result.rejected,
+            "MigrateFacts reload must succeed, not return not_implemented; violations = {:?}",
+            result.violations
+        );
+        assert_eq!(result.entities[0].entity_type, "ReadingReloaded");
     }
 
     // ── #558 / DynRdg-4 wire-envelope versioning ───────────────────
