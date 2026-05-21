@@ -21,4 +21,4 @@ get Order m1-demo equals {"id": "m1-demo"}
 
 **NOTE:** `audit_trail` is filtered to entries whose `entity` matches the id. If the list is empty, the entity was likely created outside the audited pipeline; federation fetches, for example, do not write audit entries.
 
-**Next:** [Lesson H1: Declare a noun](../hard/01-noun.md)
+**Next:** [Lesson M6: Apply a collection of ops, atomically](./06-apply-bulk.md)

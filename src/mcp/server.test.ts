@@ -21,6 +21,7 @@ import {
   mergeUpdateFields,
   buildApplyMergedUpdatePayload,
   smBypassRefusal,
+  buildApplyCommandForBatch,
 } from './server.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -123,6 +124,59 @@ describe('AREST MCP Server', () => {
       command: { type: 'createEntity', noun: 'Order', domain: 'test', fields: { customer: 'acme' } },
     })
     expect(result.command.type).toBe('createEntity')
+  })
+
+  // task-930: bulk / collection-shaped apply.
+  describe('task-930 bulk / collection-shaped apply', () => {
+    it('apply tool exposes an `ops` array (collection shape)', () => {
+      // The collection shape: an array of {operation, noun, id, fields?, event?}.
+      const opsSchema = z.array(z.object({
+        operation: z.enum(['create', 'update', 'transition']),
+        noun: z.string().optional(),
+        id: z.string().optional(),
+        fields: z.record(z.string(), z.string()).optional(),
+        event: z.string().optional(),
+      }))
+      const parsed = opsSchema.parse([
+        { operation: 'create', noun: 'Order', id: 'ORD-1', fields: { Amount: '10' } },
+        { operation: 'create', noun: 'Order', id: 'ORD-2', fields: { Amount: '20' } },
+        { operation: 'transition', noun: 'Order', id: 'ORD-1', event: 'place' },
+      ])
+      expect(parsed).toHaveLength(3)
+    })
+
+    it('apply tool description documents the collection / atomic shape', () => {
+      // The source must teach agents the bulk shape exists and is atomic.
+      expect(SERVER_TS).toMatch(/COLLECTION/)
+      expect(SERVER_TS).toMatch(/ALETHIC violation in ANY op rejects the WHOLE batch/)
+      expect(SERVER_TS).toMatch(/Backus α/)
+    })
+
+    it('buildApplyCommandForBatch maps each op to the engine Command shape', () => {
+      const ctx = { sender: 'alice@example.com', signature: undefined }
+      const create = buildApplyCommandForBatch(
+        { operation: 'create', noun: 'Order', id: 'ORD-1', fields: { Amount: '10' } }, ctx)
+      expect(create).toMatchObject({ type: 'createEntity', noun: 'Order', id: 'ORD-1', fields: { Amount: '10' }, sender: 'alice@example.com' })
+      const update = buildApplyCommandForBatch(
+        { operation: 'update', noun: 'Order', id: 'ORD-1', fields: { Amount: '11' } }, ctx)
+      expect(update).toMatchObject({ type: 'updateEntity', noun: 'Order', entityId: 'ORD-1', fields: { Amount: '11' } })
+      const txn = buildApplyCommandForBatch(
+        { operation: 'transition', noun: 'Order', id: 'ORD-1', event: 'place' }, ctx)
+      expect(txn).toMatchObject({ type: 'transition', noun: 'Order', entityId: 'ORD-1', event: 'place' })
+    })
+
+    it('a batch of buildApplyCommandForBatch members wraps into the engine batch JSON', () => {
+      const ops = [
+        { operation: 'create' as const, noun: 'Order', id: 'ORD-1', fields: { Amount: '10' } },
+        { operation: 'create' as const, noun: 'Order', id: 'ORD-2', fields: { Amount: '20' } },
+      ]
+      const batch = { type: 'batch', commands: ops.map(o => buildApplyCommandForBatch(o, {})) }
+      expect(batch.type).toBe('batch')
+      expect(batch.commands).toHaveLength(2)
+      // Round-trips to JSON the engine's platform_apply_command parses.
+      const json = JSON.parse(JSON.stringify(batch))
+      expect(json.commands[0].type).toBe('createEntity')
+    })
   })
 })
 

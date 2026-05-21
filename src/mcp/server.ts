@@ -391,10 +391,39 @@ async function localApplyResult(
   return textResult(result)
 }
 
+// task-930: translate one collection member into the engine `Command`
+// JSON shape `platform_apply_command` deserializes. createEntity /
+// updateEntity / transition mirror the remote-mode encoding below; the
+// batch wraps a Vec of these. `sender`/`signature` ride on each member
+// so per-op identity/auth still flows (the engine reads them per op).
+export function buildApplyCommandForBatch(
+  op: { operation: 'create' | 'update' | 'transition'; noun?: string; id?: string; fields?: Record<string, string>; event?: string },
+  ctx: { sender?: string; signature?: string },
+): any {
+  const { sender, signature } = ctx
+  switch (op.operation) {
+    case 'create':
+      return { type: 'createEntity', noun: op.noun, domain: '', id: op.id, fields: op.fields || {}, sender, signature }
+    case 'update':
+      return { type: 'updateEntity', noun: op.noun, domain: '', entityId: op.id, fields: op.fields || {}, sender, signature }
+    case 'transition':
+      return { type: 'transition', noun: op.noun, entityId: op.id, event: op.event, domain: '', sender, signature }
+  }
+}
+
 async function cliApplyCommand(command: any): Promise<any> {
   let key = ''
   let input = ''
   switch (command?.type) {
+    // task-930: a batch is applied atomically by the engine's `apply`
+    // verb (→ platform_apply_command → Command::Batch). We must NOT
+    // decompose it into per-op CLI calls — that would run N independent
+    // applies and lose atomicity. Forward the whole batch JSON as one
+    // `apply` system call.
+    case 'batch': {
+      const raw = await cliSystemCall('apply', JSON.stringify(command))
+      try { return JSON.parse(raw) } catch { return { raw } }
+    }
     case 'createEntity': {
       key = `create:${command.noun}`
       const pairs = Object.entries(command.fields || {}).map(([k, v]) => `<${k}, ${v}>`).join(', ')
@@ -1412,21 +1441,50 @@ server.registerTool(
   'apply',
   {
     description:
-      'Population-level mutation — create / update / transition an entity. Runs the full pipeline: resolve → derive → validate → emit. WHEN: you have a known fact change to assert. operation=create makes a new entity (REQUIRES explicit id per #867 — MCP refuses silent-id); operation=update modifies fields on an existing id (MERGES with existing single-valued facts by default per #868 / #872, so a partial payload does NOT silently retract untouched fields); operation=transition fires an SM event (engine looks up the legal transition for the current status and target event). ALTERNATIVE: retract for exact-tuple removal from a FactType cell (skips entity-shape envelope); compile when you are changing the SCHEMA not the population (new FT / new constraint); propose when the schema change needs a governed review workflow before taking effect; induce when you want the engine to SEARCH for the right binding instead of you supplying it. GOTCHA: context_receipt is required — call context first, paste its receipt here. Update merge can be opted out with fields_only_replace=true (rare). transition needs `event` not `fields`. Engine will reject on alethic violation or missing reference scheme. NEXT: get noun=<N> id=<id> to confirm the new state, or actions to see what transitions are now legal.',
+      'Population-level mutation — create / update / transition an entity, OR a COLLECTION of such ops applied atomically (task-930). Runs the full pipeline: resolve → derive → validate → emit. WHEN: you have a known fact change to assert. operation=create makes a new entity (REQUIRES explicit id per #867 — MCP refuses silent-id); operation=update modifies fields on an existing id (MERGES with existing single-valued facts by default per #868 / #872, so a partial payload does NOT silently retract untouched fields); operation=transition fires an SM event (engine looks up the legal transition for the current status and target event). BULK / COLLECTION SHAPE (task-930): pass `ops` — an ARRAY of {operation, noun, id, fields?, event?} objects — to apply many ops as ONE atomic request. This is Backus α (apply-to-all) over the collection: the batch resolves all ops over a shared cumulatively-built population, derives to the least fixed point ONCE over the combined state, validates, and emits a single delta. An ALETHIC violation in ANY op rejects the WHOLE batch (D\' = D — nothing lands, not even ops before the violation); deontic findings warn but the batch still commits. A single op is just the 1-element collection — you can always pass `ops:[{...}]` instead of the flat fields, or keep the flat single-op shape. ALTERNATIVE: retract for exact-tuple removal from a FactType cell (skips entity-shape envelope); compile when you are changing the SCHEMA not the population (new FT / new constraint); propose when the schema change needs a governed review workflow before taking effect; induce when you want the engine to SEARCH for the right binding instead of you supplying it. GOTCHA: context_receipt is required — call context first, paste its receipt here. Update merge can be opted out with fields_only_replace=true (rare). transition needs `event` not `fields`. Engine will reject on alethic violation or missing reference scheme. NEXT: get noun=<N> id=<id> to confirm the new state, or actions to see what transitions are now legal.',
     inputSchema: {
       context_receipt: z.string().optional().describe(CONTEXT_RECEIPT_FIELD_DESCRIPTION),
-      operation: z.enum(['create', 'update', 'transition']).describe('Operation type'),
-      noun: z.string().describe('Entity noun type (e.g. "Order", "Case")'),
+      operation: z.enum(['create', 'update', 'transition']).optional().describe('Operation type for the single-op shape. Omit when passing `ops` (the collection shape).'),
+      noun: z.string().optional().describe('Entity noun type (e.g. "Order", "Case"). Single-op shape; omit when passing `ops`.'),
       id: z.string().optional().describe('Entity ID. Required for update/transition AND create (MCP refuses silent-id per #872; engine still auto-generates as last-line-of-defense per #867).'),
       fields: z.record(z.string(), z.string()).optional().describe('Fact pairs for create/update (e.g. {"Name": "Acme", "customer": "alice"})'),
       event: z.string().optional().describe('SM event for transition (e.g. "place", "ship")'),
+      ops: z.array(z.object({
+        operation: z.enum(['create', 'update', 'transition']).describe('Operation type for this collection member.'),
+        noun: z.string().optional().describe('Entity noun type. Required for create/update; for transition the engine resolves the SM by entity id.'),
+        id: z.string().optional().describe('Entity ID for this op.'),
+        fields: z.record(z.string(), z.string()).optional().describe('Fact pairs for create/update.'),
+        event: z.string().optional().describe('SM event for transition.'),
+      })).optional().describe('task-930 COLLECTION shape — an array of ops applied atomically as ONE request (Backus α). One derive→validate→emit pass over the combined population; an alethic violation in ANY op rolls back the WHOLE batch (D\' = D). A single op is the natural 1-element collection. When present, the flat operation/noun/id/fields/event are ignored.'),
       sender: z.string().optional().describe('Caller identity for authorization'),
       signature: z.string().optional().describe('HMAC-SHA256 signature'),
       fields_only_replace: z.boolean().optional().describe('Opt-out (#872) — when true, the MCP skips the merge-with-existing pre-fetch on update and sends ONLY the payload fields to the engine. Use this for the rare case the agent intentionally wants the old replace-only behavior; default (false) is safer (#868 belt-and-suspenders).'),
       force: z.boolean().optional().describe('Opt-out (#904) — when true, the MCP skips the SM-bypass guard on update and lets the call go through even if a payload field is the Status of an SM-governed noun. Use this for migration scripts or other legitimate direct-mutation cases (rare); default (false) refuses the call and points the agent at `apply transition` instead.'),
     },
   },
-  async ({ context_receipt, operation, noun, id, fields, event, sender, signature, fields_only_replace, force }) => {
+  async ({ context_receipt, operation, noun, id, fields, event, ops, sender, signature, fields_only_replace, force }) => {
+    // ── task-930: bulk / collection-shaped apply ──────────────────────
+    // When `ops` is supplied, build ONE batch command and route it
+    // through the engine's `apply` verb (platform_apply_command), which
+    // dispatches Command::Batch → apply_command_batch: one atomic
+    // request, one fixpoint over the combined population, alethic
+    // rollback of the whole collection. We deliberately route through
+    // the single `apply` system call (NOT the per-op systemCall path)
+    // so atomicity is the engine's, not N independent CLI/engine calls.
+    if (Array.isArray(ops) && ops.length > 0) {
+      const blockedBatch = mutationGateResult('apply', context_receipt, { operation: 'batch', ops })
+      if (blockedBatch) return blockedBatch
+      const commands = ops.map(op => buildApplyCommandForBatch(op, { sender, signature }))
+      const batch = { type: 'batch', commands }
+      const result = await dispatchCommand(batch)
+      return textResult(result)
+    }
+    if (!operation || !noun) {
+      return textResult(
+        'apply requires either a single op (operation + noun) or a collection (ops: [...]). ' +
+        'See the tool description for the bulk / collection shape (task-930).',
+      )
+    }
     const blocked = mutationGateResult('apply', context_receipt, { operation, noun, id, fields, event })
     if (blocked) return blocked
 
@@ -2569,16 +2627,36 @@ server.registerTool(
 server.registerTool(
   'tutor.apply',
   {
-    description: 'Apply create/update/transition against the tutor sandbox. Same shape as `apply`. Mutations are scoped to the sandbox; the active app is untouched.',
+    description:
+      'Apply create/update/transition against the tutor sandbox. Same shape as `apply`. Mutations are scoped to the sandbox; the active app is untouched. ' +
+      'BULK / COLLECTION SHAPE (task-930): pass `ops` — an ARRAY of {operation, noun, id, fields?, event?} — to apply a COLLECTION of ops in ONE atomic call. This is Backus α (apply-to-all) over the collection: one resolve→derive→validate→emit pass over the combined population, with an ALETHIC violation in ANY op rolling back the WHOLE batch (D\' = D). Practise it here: e.g. seed two Orders and place one of them in a single call, or watch a duplicate-id op roll back the others. A single op is just the 1-element collection.',
     inputSchema: {
-      operation: z.enum(['create', 'update', 'transition']),
-      noun: z.string(),
+      operation: z.enum(['create', 'update', 'transition']).optional(),
+      noun: z.string().optional(),
       id: z.string().optional(),
       event: z.string().optional(),
       fields: z.record(z.string(), z.string()).optional(),
+      ops: z.array(z.object({
+        operation: z.enum(['create', 'update', 'transition']),
+        noun: z.string().optional(),
+        id: z.string().optional(),
+        fields: z.record(z.string(), z.string()).optional(),
+        event: z.string().optional(),
+      })).optional().describe('task-930 COLLECTION shape — an array of ops applied atomically as ONE request. Alethic violation in any op rolls back the whole batch.'),
     },
   },
-  async ({ operation, noun, id, event, fields }) => {
+  async ({ operation, noun, id, event, fields, ops }) => {
+    // task-930: a collection routes through the sandbox `apply` verb
+    // (→ platform_apply_command → Command::Batch) so the SAME atomic
+    // batch semantics the active app gets are taught in the sandbox.
+    if (Array.isArray(ops) && ops.length > 0) {
+      const commands = ops.map(op => buildApplyCommandForBatch(op, {}))
+      const raw = await tutorSystemCall('apply', JSON.stringify({ type: 'batch', commands }))
+      try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
+    }
+    if (!operation || !noun) {
+      return textResult('tutor.apply needs either a single op (operation + noun) or a collection (ops: [...]).')
+    }
     const pairs = Object.entries(fields ?? {}).map(([k, v]) => `<${k}, ${v}>`).join(', ')
     if (operation === 'create') {
       const idPair = id ? `<id, ${id}>${pairs ? ', ' : ''}` : ''

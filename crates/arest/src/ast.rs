@@ -3227,14 +3227,27 @@ fn platform_apply_command(x: &Object, d: &Object) -> Object {
         Ok(v) => v,
         Err(e) => return Object::atom(&format!("⊥ {}", e)),
     };
+    // task-930: a bare top-level JSON array `[ <op>, … ]` is sugar for
+    // the collection-shaped batch — wrap it as `{"type":"batch",
+    // "commands":[…]}` so it deserializes into `Command::Batch`. Both
+    // the raw form and the `{command, population}` envelope may carry a
+    // batch (the envelope's `command` field can itself be an array).
+    let wrap_array = |v: serde_json::Value| -> serde_json::Value {
+        if v.is_array() {
+            serde_json::json!({ "type": "batch", "commands": v })
+        } else {
+            v
+        }
+    };
     let (command_json, population_str): (serde_json::Value, Option<String>) = if parsed.get("command").is_some() {
-        // (b) — extract the inner command + population fields.
-        let cmd = parsed.get("command").cloned().unwrap_or(serde_json::Value::Null);
+        // (b) — extract the inner command + population fields. The inner
+        // command may itself be a collection (batch sugar).
+        let cmd = wrap_array(parsed.get("command").cloned().unwrap_or(serde_json::Value::Null));
         let pop = parsed.get("population")
             .and_then(|v| if v.is_string() { v.as_str().map(String::from) } else { Some(v.to_string()) });
         (cmd, pop)
     } else {
-        (parsed, None)
+        (wrap_array(parsed), None)
     };
     let command: crate::command::Command = match serde_json::from_value(command_json) {
         Ok(c) => c,
@@ -3702,6 +3715,11 @@ fn command_field_overflow(command: &crate::command::Command) -> Option<&'static 
             match sender.as_deref().map(over).unwrap_or(false) { true => return Some("sender"), false => {} }
             match signature.as_deref().map(over).unwrap_or(false) { true => return Some("signature"), false => {} }
             None
+        }
+        // task-930: the batch's bound is the per-op bound — the
+        // collection overflows iff any constituent op overflows.
+        Command::Batch { commands } => {
+            commands.iter().find_map(command_field_overflow)
         }
     }
 }
@@ -10122,6 +10140,54 @@ mod tests {
              keys present = {:?}",
             map.keys().collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn platform_apply_command_accepts_bare_array_as_batch() {
+        // task-930: a bare top-level JSON array is sugar for the
+        // collection-shaped batch. Two creates in one call must emit a
+        // single Map carrier whose __state_delta carries BOTH entities'
+        // FT cells — proof the array routed through Command::Batch /
+        // apply_command_batch (one atomic request), not a parse error.
+        let json = r#"[
+            {"type":"createEntity","noun":"Person","domain":"d","id":"p-1","fields":{"name":"Alice"}},
+            {"type":"createEntity","noun":"Person","domain":"d","id":"p-2","fields":{"name":"Bob"}}
+        ]"#;
+        let input = Object::atom(json);
+        let d = apply_command_phi_state();
+        let result = platform_apply_command(&input, &d);
+
+        let map = result.as_map().expect(
+            "a bare JSON array must apply as a batch and return the Map carrier",
+        );
+        let delta = map.get("__state_delta").expect("__state_delta present");
+        let delta_map = delta.as_map().expect("__state_delta is a Map");
+        // The `Person_has_name` cell must hold BOTH p-1 and p-2 — one
+        // combined delta over the cumulative population.
+        let cell = delta_map.get("Person_has_name").expect("Person_has_name cell in delta");
+        let facts = cell.as_seq().expect("cell is a Seq of facts");
+        assert_eq!(facts.len(), 2,
+            "batch delta must carry both creates' facts in one cell; got {:?}", facts);
+    }
+
+    #[test]
+    fn platform_apply_command_accepts_batch_type_envelope() {
+        // task-930: the explicit `{"type":"batch","commands":[…]}`
+        // shape deserializes into Command::Batch and applies atomically.
+        let json = r#"{"type":"batch","commands":[
+            {"type":"createEntity","noun":"Person","domain":"d","id":"q-1","fields":{"name":"Carol"}},
+            {"type":"createEntity","noun":"Person","domain":"d","id":"q-2","fields":{"name":"Dave"}}
+        ]}"#;
+        let input = Object::atom(json);
+        let d = apply_command_phi_state();
+        let result = platform_apply_command(&input, &d);
+
+        let map = result.as_map().expect("batch envelope must return the Map carrier");
+        let delta = map.get("__state_delta").expect("__state_delta present");
+        let delta_map = delta.as_map().expect("__state_delta is a Map");
+        let cell = delta_map.get("Person_has_name").expect("Person_has_name cell in delta");
+        assert_eq!(cell.as_seq().map(|s| s.len()).unwrap_or(0), 2,
+            "batch envelope delta must carry both creates");
     }
 
     #[test]

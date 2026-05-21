@@ -228,6 +228,24 @@ pub enum Command {
         #[serde(default)]
         signature: Option<String>,
     },
+    /// task-930: bulk / collection-shaped apply. Backus α (apply-to-all)
+    /// over the input sequence — `apply([op1, op2, …])` carries a
+    /// COLLECTION of operations applied as ONE atomic request. The batch
+    /// resolves all ops over a shared, cumulatively-built population,
+    /// derives to the least fixed point, validates, and emits a single
+    /// combined delta. An alethic violation in ANY op rejects the WHOLE
+    /// batch (`D' = D`, AREST.tex "Completeness of State Transfer");
+    /// deontic findings warn but the batch still commits. A lone op is
+    /// the 1-element collection — `Command::Batch { commands: [op] }`
+    /// behaves exactly like applying `op` alone.
+    ///
+    /// Dispatched by `apply_command_defs` to `apply_command_batch`. The
+    /// JSON surface is `{"type":"batch","commands":[ <op>, … ]}`, and
+    /// `platform_apply_command` additionally accepts a bare top-level
+    /// JSON array `[ <op>, … ]` as sugar for this variant.
+    Batch {
+        commands: Vec<Command>,
+    },
 }
 
 // -- Result -----------------------------------------------------------
@@ -587,6 +605,9 @@ pub fn apply_command_defs(
         Command::ReloadReading { name, body, policy, sender: _, signature: _ } => {
             reload_reading_handler(d, name, body, policy.as_deref(), state)
         }
+        Command::Batch { commands } => {
+            apply_command_batch(d, commands, state)
+        }
         #[allow(unreachable_patterns)]
         _ => CommandResult {
             entities: vec![],
@@ -598,6 +619,118 @@ pub fn apply_command_defs(
             rejected: false,
             state: ast::Object::phi(),
         },
+    }
+}
+
+/// task-930: bulk / collection-shaped apply — Backus **α (apply-to-all)**
+/// over the input sequence. `apply([op1, op2, …])` is α(ρ-dispatch) over
+/// the collection, run as ONE atomic request.
+///
+/// **Semantics (AREST.tex "Completeness of State Transfer").** Each op is
+/// dispatched through the existing `apply_command_defs` pipeline (no fork
+/// of the resolve→derive→validate→emit stages), but against a state that
+/// is built up CUMULATIVELY: op *k* sees every fact op *0..k* produced.
+/// Concretely, after each op we `merge_delta` its delta onto the running
+/// state so the next op resolves over the combined population and derives
+/// to the least fixed point against everything before it. The op-local
+/// deltas are accumulated and emitted as ONE combined delta relative to
+/// the original `state` — the caller commits it in a single
+/// `merge_delta`, so the whole collection appears atomically.
+///
+/// **Atomicity / rollback.** An **alethic** violation in ANY op rejects
+/// the WHOLE batch: we stop, discard every accumulated delta, and emit an
+/// empty delta (`D' = D`) — none of the batch's writes land, not even
+/// ops that ran before the violation. **Deontic** findings (warnings)
+/// accumulate but do not reject; the batch still commits. This mirrors
+/// the single-command rule at `create_via_defs`
+/// (`final_state = match rejected { true => state.clone(), … }`), lifted
+/// to the collection.
+///
+/// **1-element collection.** A lone op is the natural shape — a one-entry
+/// `commands` slice runs the single op once and returns its result with
+/// the same delta `apply_command_defs` would have produced. An EMPTY
+/// collection is a no-op success (empty delta).
+///
+/// Intermediate merges thread `event = None` (these are not the commit
+/// boundary — the host attaches the apply event when it merges the
+/// returned combined delta), matching the eventless contract the forward
+/// chain already uses for in-flight state.
+pub fn apply_command_batch(
+    d: &ast::Object,
+    commands: &[Command],
+    state: &ast::Object,
+) -> CommandResult {
+    // Empty collection — α over the empty sequence is the identity:
+    // success with no entities and an empty delta.
+    if commands.is_empty() {
+        return CommandResult {
+            entities: Vec::new(),
+            status: None,
+            transitions: Vec::new(),
+            navigation: Vec::new(),
+            violations: Vec::new(),
+            derived_count: 0,
+            rejected: false,
+            state: ast::diff_cells(state, state), // empty Map delta
+        };
+    }
+
+    // Running state the next op resolves/derives against (combined
+    // population), and the accumulated results.
+    let mut running = state.clone();
+    let mut entities: Vec<EntityResult> = Vec::new();
+    let mut transitions: Vec<TransitionAction> = Vec::new();
+    let mut navigation: Vec<NavigationLink> = Vec::new();
+    let mut violations: Vec<crate::types::Violation> = Vec::new();
+    let mut derived_count: usize = 0;
+    let mut last_status: Option<String> = None;
+
+    for command in commands {
+        let res = apply_command_defs(d, command, &running);
+        // Aggregate the op's report regardless of outcome so the caller
+        // sees every violation that contributed to the decision.
+        entities.extend(res.entities.iter().cloned());
+        transitions.extend(res.transitions.iter().cloned());
+        navigation.extend(res.navigation.iter().cloned());
+        violations.extend(res.violations.iter().cloned());
+        derived_count += res.derived_count;
+        if res.status.is_some() {
+            last_status = res.status.clone();
+        }
+
+        // Alethic violation anywhere → reject the WHOLE batch. Discard
+        // every accumulated write and emit `D' = D` (empty delta).
+        if res.rejected {
+            return CommandResult {
+                entities,
+                status: last_status,
+                transitions,
+                navigation,
+                violations,
+                derived_count,
+                rejected: true,
+                state: ast::diff_cells(state, state), // empty delta — full rollback
+            };
+        }
+
+        // Fold this op's delta onto the running state so the next op
+        // resolves over the combined population. Eventless merge — this
+        // is in-flight state, not the commit boundary.
+        running = ast::merge_delta(&running, &res.state, None);
+    }
+
+    // One combined delta relative to the ORIGINAL state — the host
+    // commits the whole collection in a single merge.
+    let delta = ast::diff_cells(state, &running);
+    CommandResult {
+        entities,
+        status: last_status,
+        transitions,
+        navigation,
+        violations,
+        derived_count,
+        rejected: false,
+        state: delta,
     }
 }
 
@@ -6946,6 +7079,200 @@ Each Status has at least one Verb performed in it.
         // Typo — exact match miss; the CLI's Levenshtein layer handles
         // suggestion separately.
         assert!(wine_app_by_name(&state, "Notpad++").is_none());
+    }
+
+    // ── task-930: bulk / collection-shaped apply ────────────────────
+    //
+    // Backus α (apply-to-all) over the input sequence:
+    // `apply([op1, op2, …])` = α(ρ-dispatch). The batch runs as ONE
+    // request — resolve all → derive to the least fixed point once over
+    // the COMBINED population → validate → emit. An alethic violation in
+    // ANY op rejects the WHOLE batch (`D' = D`, AREST.tex "Completeness
+    // of State Transfer"). A single op is a 1-element collection.
+
+    /// Two creates + a transition applied in ONE batch call. Each op
+    /// sees the prior ops' facts (combined population), the result
+    /// carries every op's entities, and the transition lands the target
+    /// in its post-event status — proof the SM auto-advance ran over the
+    /// state the batch built, not N independent snapshots.
+    #[test]
+    fn batch_two_creates_and_transition_apply_atomically() {
+        const READINGS: &str = r#"
+# Orders batch
+
+## Entity Types
+
+Order(.Order Number) is an entity type.
+
+## Fact Types
+
+Order has Amount.
+
+## Instance Facts
+
+State Machine Definition 'Order' is for Noun 'Order'.
+Status 'Draft' is initial in State Machine Definition 'Order'.
+
+Transition 'place' is defined in State Machine Definition 'Order'.
+  Transition 'place' is from Status 'Draft'.
+  Transition 'place' is to Status 'Placed'.
+  Transition 'place' is triggered by Event Type 'place'.
+"#;
+        let meta_state = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let domain_state =
+            crate::parse_forml2::parse_to_state_with_nouns(READINGS, &meta_state).unwrap();
+        let state = ast::merge_states(&meta_state, &domain_state);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        let mk_create = |id: &str, amount: &str| {
+            let mut fields = HashMap::new();
+            fields.insert("Amount".to_string(), amount.to_string());
+            Command::CreateEntity {
+                noun: "Order".to_string(),
+                domain: "orders".to_string(),
+                id: Some(id.to_string()),
+                fields,
+                sender: None,
+                signature: None,
+            }
+        };
+        let batch = vec![
+            mk_create("ORD-1", "10"),
+            mk_create("ORD-2", "20"),
+            Command::Transition {
+                entity_id: "ORD-1".to_string(),
+                event: "place".to_string(),
+                domain: "orders".to_string(),
+                current_status: Some("Draft".to_string()),
+                sender: None,
+                signature: None,
+            },
+        ];
+
+        let result = apply_command_batch(&def_obj, &batch, &state);
+
+        assert!(!result.rejected,
+            "batch must succeed; violations={:?}", result.violations);
+        // Combined population: BOTH orders' Amount facts ride in the one
+        // delta the batch emits — proof the ops share one state, not N.
+        let merged = ast::merge_states(&state, &result.state);
+        let amounts = ast::fetch_or_phi("Order_has_Amount", &merged);
+        let ord_ids: Vec<String> = amounts.as_seq().map(|s| s.iter()
+            .filter_map(|f| ast::binding(f, "Order").map(String::from))
+            .collect()).unwrap_or_default();
+        assert!(ord_ids.iter().any(|i| i == "ORD-1") && ord_ids.iter().any(|i| i == "ORD-2"),
+            "batch delta must carry both creates; got {:?}", ord_ids);
+        // One fixpoint over the combined state: ORD-1's transition fired
+        // and the SM cell reflects 'Placed'.
+        assert_eq!(extract_sm_status(&merged, "ORD-1").as_deref(), Some("Placed"),
+            "ORD-1 must be transitioned to Placed in the batch result");
+    }
+
+    /// Atomic rollback: a batch whose middle op is alethic-rejected (a
+    /// duplicate explicit id, the task-737 UC) rejects the WHOLE batch.
+    /// The emitted delta is empty (`D' = D`) so NONE of the batch's
+    /// creates land — not even the op that ran before the violation.
+    #[test]
+    fn batch_with_alethic_violation_rolls_back_entire_batch() {
+        let src = "Task(.id) is an entity type.\nTask has Description.\n";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_map = ast::defs_to_state(&defs, &state);
+
+        let mk = |id: &str, desc: &str| {
+            let mut fields = HashMap::new();
+            fields.insert("Description".to_string(), desc.to_string());
+            Command::CreateEntity {
+                noun: "Task".to_string(),
+                domain: "tasks".to_string(),
+                id: Some(id.to_string()),
+                fields,
+                sender: None,
+                signature: None,
+            }
+        };
+        // Op 1 creates T-1 (would succeed alone); op 2 re-uses T-1's id
+        // and is alethic-rejected by the reference-scheme UC; op 3 would
+        // also succeed alone. The whole batch must roll back.
+        let batch = vec![mk("T-1", "first"), mk("T-1", "dup"), mk("T-2", "third")];
+
+        let result = apply_command_batch(&def_map, &batch, &state);
+
+        assert!(result.rejected,
+            "an alethic violation anywhere must reject the batch; \
+             violations={:?}", result.violations);
+        assert!(result.violations.iter().any(|v| v.alethic),
+            "must surface the alethic violation; got {:?}", result.violations);
+        // D' = D: empty delta, so NOTHING from the batch lands.
+        assert!(ast::cells_iter(&result.state).is_empty(),
+            "rejected batch must emit an empty delta (D' = D); got {:?}",
+            result.state);
+        let merged = ast::merge_states(&state, &result.state);
+        assert!(ast::fetch_or_phi("Task_has_Description", &merged).as_seq()
+            .map_or(true, |s| s.is_empty()),
+            "no Task may survive the rolled-back batch");
+    }
+
+    /// A lone op is the natural 1-element collection: `apply_command_batch`
+    /// with a single command behaves exactly like `apply_command_defs`.
+    #[test]
+    fn batch_single_op_matches_single_apply() {
+        let src = "Task(.id) is an entity type.\nTask has Description.\n";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_map = ast::defs_to_state(&defs, &state);
+
+        let mut fields = HashMap::new();
+        fields.insert("Description".to_string(), "solo".to_string());
+        let cmd = Command::CreateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            id: Some("T-solo".to_string()),
+            fields,
+            sender: None,
+            signature: None,
+        };
+        let single = apply_command_defs(&def_map, &cmd, &state);
+        let batch = apply_command_batch(&def_map, &core::slice::from_ref(&cmd), &state);
+        assert_eq!(single.rejected, batch.rejected);
+        assert_eq!(single.entities.len(), batch.entities.len());
+        // Same touched cells.
+        let single_merged = ast::merge_states(&state, &single.state);
+        let batch_merged = ast::merge_states(&state, &batch.state);
+        assert_eq!(
+            ast::fetch_or_phi("Task_has_Description", &single_merged),
+            ast::fetch_or_phi("Task_has_Description", &batch_merged),
+            "1-element batch must produce the same Task_has_Description cell");
+    }
+
+    /// The `Command::Batch` variant deserializes from the collection
+    /// JSON shape `{"type":"batch","commands":[…]}` and dispatches
+    /// through `apply_command_defs` as the natural batch entry point.
+    #[test]
+    fn batch_command_deserializes_and_dispatches() {
+        let src = "Task(.id) is an entity type.\nTask has Description.\n";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_map = ast::defs_to_state(&defs, &state);
+
+        let json = r#"{
+            "type":"batch",
+            "commands":[
+                {"type":"createEntity","noun":"Task","domain":"tasks","id":"T-a","fields":{"Description":"a"}},
+                {"type":"createEntity","noun":"Task","domain":"tasks","id":"T-b","fields":{"Description":"b"}}
+            ]
+        }"#;
+        let cmd: Command = serde_json::from_str(json).expect("batch JSON must parse");
+        let result = apply_command_defs(&def_map, &cmd, &state);
+        assert!(!result.rejected, "batch JSON must apply; {:?}", result.violations);
+        let merged = ast::merge_states(&state, &result.state);
+        let descs = ast::fetch_or_phi("Task_has_Description", &merged);
+        let n = descs.as_seq().map(|s| s.len()).unwrap_or(0);
+        assert_eq!(n, 2, "both batched creates must land; got {n}");
     }
 
 }

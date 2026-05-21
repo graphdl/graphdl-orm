@@ -8,7 +8,7 @@ Every lesson is a single markdown file. You can read them directly, but the inte
 
 **[Easy](./easy/)** takes you from zero to a running app in about five minutes. You describe what you want in plain English and watch the app materialize. The lessons use `propose`, `ask`, `synthesize`, and conversational `apply`. There are four lessons in this track.
 
-**[Medium](./medium/)** asks you to drive the engine yourself. The lessons cover tool-call literacy with explicit `apply`, `get`, `query`, `actions`, and `explain`. There are five lessons. The prerequisite is the Easy track, or a working mental model of entities and fact types.
+**[Medium](./medium/)** asks you to drive the engine yourself. The lessons cover tool-call literacy with explicit `apply`, `get`, `query`, `actions`, and `explain`, including applying a COLLECTION of ops atomically in one call. There are six lessons. The prerequisite is the Easy track, or a working mental model of entities and fact types.
 
 **[Hard](./hard/)** has you author the schema directly. You write FORML2 readings by hand, add constraints, derivation rules, and a state machine, and you finish with self-modification at runtime. There are eight lessons. The prerequisite is the Medium track.
 
@@ -40,6 +40,7 @@ See [_format.md](./_format.md) for the lesson file format and the fence grammar.
 - [Lesson M3: Discover what you can do](./medium/03-actions.md)
 - [Lesson M4: Fire a transition](./medium/04-apply-transition.md)
 - [Lesson M5: Explain what happened](./medium/05-explain.md)
+- [Lesson M6: Apply a collection of ops, atomically](./medium/06-apply-bulk.md)
 
 ### Hard
 - [Lesson H1: Declare a noun](./hard/01-noun.md)
