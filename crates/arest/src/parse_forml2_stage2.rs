@@ -2731,6 +2731,48 @@ fn strip_ring_annotation(line: &str) -> Option<&str> {
     Some(body)
 }
 
+/// task-843 — strip a trailing semantics-annotation parenthetical from
+/// a fact-type reading, e.g. `Verb is performed in Status (Moore
+/// semantics)` → `Verb is performed in Status`.
+///
+/// FORML 2 lets authors annotate a fact type with the *kind* of state-
+/// machine coupling it expresses (`(Mealy semantics)` for verbs keyed
+/// on a Transition, `(Moore semantics)` for verbs keyed on a Status).
+/// The annotation is purely descriptive — the actual distinction is
+/// already carried by the role structure (`… during Transition` vs
+/// `… in Status` produce different role sequences and therefore
+/// different canonical FT ids). Folding the parenthetical into the FT
+/// id (and the stored `reading`) makes the declared id diverge from the
+/// canonical form that the apply / MCP populate paths and the instance-
+/// fact resolver reconstruct from un-annotated statement text. The
+/// result was a split-brain: compile validated one cell while apply's
+/// mandatory checker enforced against the suffixed cell, so apps had to
+/// populate the relation twice. Collapsing to the un-suffixed canonical
+/// form here keeps every path on one cell.
+///
+/// Returns the body with the annotation (and any whitespace before it)
+/// removed, or the input unchanged when there is no recognized
+/// `(… semantics)` suffix. A trailing `.` terminator is preserved.
+fn strip_semantics_annotation(reading: &str) -> &str {
+    let trimmed = reading.trim_end();
+    // Tolerate a trailing terminator so this is robust whether the
+    // statement text still carries its `.` or not.
+    let body = trimmed.strip_suffix('.').map(str::trim_end).unwrap_or(trimmed);
+    let Some(inner) = body.strip_suffix(')') else { return reading };
+    let Some(open_idx) = inner.rfind('(') else { return reading };
+    let annotation = inner[open_idx + 1..].trim();
+    // Only strip the closed `(<word> semantics)` vocabulary — never a
+    // reference-scheme `(.Col)` or any other parenthetical that is part
+    // of the relation's identity.
+    if !annotation.to_ascii_lowercase().ends_with("semantics") {
+        return reading;
+    }
+    // The body slice was only narrowed from `reading`, so its byte
+    // length addresses the same prefix of the original. Every consumer
+    // trims terminators, so returning the un-terminated body is fine.
+    &reading[..inner[..open_idx].trim_end().len()]
+}
+
 /// Extract the quoted values from a `The possible values of <Noun>
 /// are 'v1', 'v2', …` declaration. Returns them joined by `,`.
 fn extract_enum_values(text: &str) -> Option<String> {
@@ -2900,7 +2942,11 @@ pub fn translate_fact_types(classified_state: &Object, idx: &StmtIndex) -> (Vec<
         }
         let roles = role_refs_for(idx,stmt_id);
         let Some(text) = statement_text(idx,stmt_id) else { continue };
-        let reading = text;
+        // task-843 — collapse a trailing `(… semantics)` author
+        // annotation so the canonical FT id and stored reading match
+        // the un-annotated form every populate path reconstructs. See
+        // `strip_semantics_annotation`.
+        let reading = strip_semantics_annotation(&text).to_string();
         // Mirror legacy's `fact_type_id(role_nouns, verb)` shape:
         // noun parts preserve their declared casing, the verb between
         // roles lowercases. Keeps `Noun_has_reference_scheme_Noun`

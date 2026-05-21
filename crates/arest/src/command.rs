@@ -6139,6 +6139,100 @@ Each Order is created by exactly one User.
         assert!(result.rejected, "alethic MC violation should reject the command");
     }
 
+    /// task-843 — apply-path / compile FT-name parity for Moore-
+    /// semantics verbs.
+    ///
+    /// `Verb is performed in Status (Moore semantics).` previously
+    /// compiled to the suffixed FT id `Verb_is_performed_in_Status_
+    /// (moore_semantics)`, while the apply path / instance-fact
+    /// resolver reconstruct the *un*-suffixed `Verb_is_performed_in_
+    /// Status` from un-annotated statement text. The split meant the
+    /// mandatory checker enforced against the suffixed cell, so
+    /// populating only the canonical (un-suffixed) form left the MC
+    /// violation standing — forcing apps to populate the relation
+    /// twice. After the fix the declared FT collapses to the canonical
+    /// id, so a single (un-suffixed) population clears the MC.
+    #[test]
+    fn task_843_moore_semantics_ft_collapses_to_canonical_id() {
+        let readings = r#"# Paper
+
+## Entity Types
+Verb(.VName) is an entity type.
+Status(.SName) is an entity type.
+
+## Value Types
+VName is a value type.
+SName is a value type.
+
+## Fact Types
+### Verb
+Verb is performed in Status (Moore semantics).
+"#;
+        let state = crate::parse_forml2::parse_to_state(readings).unwrap();
+
+        // The declared FactType id must be the canonical un-suffixed
+        // form — not `..._(moore_semantics)`.
+        let ft = crate::ast::fetch_or_phi("FactType", &state);
+        let ids: Vec<String> = ft.as_seq().map(|fs| {
+            fs.iter().filter_map(|f| ast::binding(f, "id").map(String::from)).collect()
+        }).unwrap_or_default();
+        assert!(
+            ids.iter().any(|i| i == "Verb_is_performed_in_Status"),
+            "expected canonical FT id; got {:?}", ids);
+        assert!(
+            !ids.iter().any(|i| i.contains("semantics")),
+            "no FT id should carry a (…semantics) suffix; got {:?}", ids);
+
+        // The stored reading must also be canonical so the constraint /
+        // derivation reading-prefix matcher resolves against it.
+        let readings_stored: Vec<String> = ft.as_seq().map(|fs| {
+            fs.iter().filter_map(|f| ast::binding(f, "reading").map(String::from)).collect()
+        }).unwrap_or_default();
+        assert!(
+            readings_stored.iter().any(|r| r == "Verb is performed in Status"),
+            "expected canonical reading; got {:?}", readings_stored);
+    }
+
+    /// task-843 acceptance — populating ONLY the un-suffixed
+    /// `Verb is performed in Status` clears the mandatory violation that
+    /// the apply path enforces. Before the fix this required a second
+    /// population under the `(Moore semantics)` suffix.
+    #[test]
+    fn task_843_unsuffixed_population_clears_apply_mandatory() {
+        let readings = r#"# Paper
+
+## Entity Types
+Verb(.VName) is an entity type.
+Status(.SName) is an entity type.
+
+## Value Types
+VName is a value type.
+SName is a value type.
+
+## Fact Types
+### Verb
+Verb is performed in Status (Moore semantics).
+
+## Constraints
+Each Status has at least one Verb performed in it.
+"#;
+        let state = crate::parse_forml2::parse_to_state(readings).unwrap();
+
+        // The MC span must target the canonical (un-suffixed) FT id.
+        let constraints = ast::fetch_or_phi("Constraint", &state);
+        let mc_span_ft = constraints.as_seq().and_then(|cs| {
+            cs.iter().find_map(|c| {
+                let is_mc = ast::binding(c, "kind") == Some("MC")
+                    && ast::binding(c, "text").map_or(false, |t| t.contains("performed in"));
+                is_mc.then(|| ast::binding(c, "span0_factTypeId").map(String::from)).flatten()
+            })
+        });
+        assert_eq!(
+            mc_span_ft.as_deref(),
+            Some("Verb_is_performed_in_Status"),
+            "the apply-path MC must validate against the canonical FT id");
+    }
+
     // ── Security #24: event signing (AREST §5.5) ────────────────────
     //
     // Commands can carry an optional `signature` MAC over (sender,
