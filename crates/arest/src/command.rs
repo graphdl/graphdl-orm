@@ -1771,6 +1771,44 @@ fn transition_via_defs(
         })
         .unwrap_or(new_state);
 
+    // task-929 event-durability — persist the trigger fact that fired this
+    // transition so the SM machine fold replays it. AREST.tex §"Facts as
+    // events": "Creating a fact fires an event… a transition that declares
+    // its trigger as a fact type fires automatically when that fact enters
+    // P", and the status is the foldl over that event stream (eq:sm).
+    // Without the fact in P, the imperative status writes above are not
+    // durable: a recompile re-derives status purely from events and resets
+    // any transition that left no event behind (the symptom: apply-
+    // transitioned tasks revert on recompile while event-backed ones
+    // survive). The `event` token IS the trigger Fact Type's reading for a
+    // Fact-Type-triggered SM; assert it for this entity when it names a
+    // declared trigger FT (Event-Type-triggered SMs carry no durable fact
+    // and are skipped). Idempotent so repeated transitions don't bloat the
+    // event cell; the fold is latest-wins so a present fact is harmless.
+    if new_status.is_some() && !noun.is_empty() {
+        let is_ft_trigger = ast::fetch_or_phi("Transition_is_triggered_by_Fact_Type", d)
+            .as_seq()
+            .map(|facts| facts.iter().any(|f| ast::binding(f, "Fact Type") == Some(event)))
+            .unwrap_or(false);
+        if is_ft_trigger {
+            // FT cell id is the reading with spaces → underscores; the
+            // subject role of an SM trigger FT is the SM noun itself
+            // (e.g. `Task is finished` → cell `Task_is_finished`, role
+            // `Task`).
+            let trigger_cell = event.replace(' ', "_");
+            let already_present = ast::fetch_or_phi(&trigger_cell, &new_state)
+                .as_seq()
+                .map(|facts| facts.iter().any(|f| ast::binding_matches(f, &noun, entity_id)))
+                .unwrap_or(false);
+            if !already_present {
+                new_state = ast::cell_push(
+                    &trigger_cell,
+                    ast::fact_from_pairs(&[(noun.as_str(), entity_id)]),
+                    &new_state);
+            }
+        }
+    }
+
     let transition_fired = new_status.is_some();
     let status = new_status.clone().or_else(|| current_status.map(|s| s.to_string()));
 
