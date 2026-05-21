@@ -1720,6 +1720,57 @@ fn transition_via_defs(
         })
         .unwrap_or(new_state);
 
+    // task-929/923/924 — the machine fold (eq:sm) also maintains the
+    // resource-keyed status projection `Resource is currently in Status`.
+    // AREST.tex §"Facts as events": that projection "folds those tuples
+    // latest-wins per resource. The machine fold is the same operation."
+    // The cell is an RMAP keyed-by-Resource Map (Definition: cell
+    // isolation — each resource is its own cell); a transition is one
+    // fold step that replaces ONLY the transitioned resource's entry
+    // (`cell_put_keyed` via `push_with_uc_check` overwrite), leaving every
+    // other resource's cell untouched. The canonical SM-keyed `cell_name`
+    // updated above is the same status keyed by State Machine. Without
+    // this, the projection — and the `Task has Task Status` view, SQL, and
+    // HATEOAS that read it — keep the pre-transition status: the 923/924
+    // readback staleness that forced a live-DB restore. (A monotonic
+    // forward-chain re-derivation can't do this: it cannot retract the old
+    // tuple, the projection depends on view cells absent from P, and on
+    // the live model its deriver carries an unresolved/φ consequent.)
+    new_state = new_status.as_ref()
+        .map(|status| {
+            // `Resource is currently in Status` and `State Machine is for
+            // Resource` are metamodel cells (readings/core/instances.md).
+            const RESOURCE_STATUS_CELL: &str = "Resource_is_currently_in_Status";
+            const FOR_RESOURCE_CELL: &str = "State_Machine_is_for_Resource";
+            // The projection is keyed by Resource. Map this SM to its
+            // resource(s) via `State Machine is for Resource`; fall back to
+            // the SM id (SM id == resource id is the common reference
+            // scheme).
+            let resources: Vec<String> = ast::fetch_or_phi(FOR_RESOURCE_CELL, &new_state)
+                .as_seq()
+                .map(|facts| facts.iter()
+                    .filter(|f| ast::binding_matches(f, sm.state_machine_role, entity_id))
+                    .filter_map(|f| ast::binding(f, sm.for_resource_role).map(String::from))
+                    .collect::<Vec<_>>())
+                .unwrap_or_default();
+            let resources = if resources.is_empty() {
+                vec![entity_id.to_string()]
+            } else { resources };
+            let key_roles = crate::evaluate::read_cell_key_roles(d);
+            let mut viols: Vec<crate::types::Violation> = Vec::new();
+            let mut st = new_state.clone();
+            for res in &resources {
+                let fact = ast::fact_from_pairs(&[
+                    (sm.for_resource_role,   res.as_str()),
+                    (sm.current_status_role, status.as_str()),
+                ]);
+                st = push_with_uc_check(
+                    st, RESOURCE_STATUS_CELL, fact, &key_roles, /* overwrite */ true, &mut viols);
+            }
+            st
+        })
+        .unwrap_or(new_state);
+
     let transition_fired = new_status.is_some();
     let status = new_status.clone().or_else(|| current_status.map(|s| s.to_string()));
 
