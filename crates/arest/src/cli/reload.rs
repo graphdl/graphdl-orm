@@ -319,7 +319,10 @@ Category(.Name) is an entity type.
         let expected_name = path.file_stem().unwrap().to_string_lossy().to_string();
         assert!(out_text.contains(&format!("reload {}", expected_name)),
             "got: {}", out_text);
-        assert!(out_text.contains("+2 nouns"), "got: {}", out_text);
+        // +4: two entities (Product, Category) + their reference value types
+        // (SKU, Name) — ORM 2 reference modes are views of reference fact
+        // types over value types, now materialized into the model.
+        assert!(out_text.contains("+4 nouns"), "got: {}", out_text);
         let _ = std::fs::remove_file(&path);
     }
 

@@ -16,7 +16,8 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest'
-import { EntityDB, ENGINE_STATE_STORAGE_KEY, initCellSchema } from './entity-do'
+import { EntityDB, ENGINE_STATE_STORAGE_KEY, CELL_CONTENTS_STORAGE_KEY, initCellSchema } from './entity-do'
+import { freezeHandle } from './api/engine'
 
 // ── Mock DO state ───────────────────────────────────────────────────
 //
@@ -94,7 +95,13 @@ function createMockCtx(idName = 'test-cell-id'): MockCtx {
 // unset. Casts use `unknown` to satisfy the TS shape without pulling
 // in the full `DurableObjectState` type — the lifecycle test only
 // touches `ctx.storage` and `ctx.id`.
-function makeEntityDB(ctx: MockCtx, env: Record<string, unknown> = {}): EntityDB {
+function makeEntityDB(
+  ctx: MockCtx,
+  // The EntityDB encrypted path hard-fails without a tenant seed (#809);
+  // the per-cell persistence tests below exercise `put` → `getMaster`, so
+  // the mocked env MUST carry a TENANT_MASTER_SEED (see getMaster docs).
+  env: Record<string, unknown> = { TENANT_MASTER_SEED: 'test-tenant-master-seed-0123456789abcdef' },
+): EntityDB {
   const db = new (EntityDB as unknown as new () => EntityDB)()
   ;(db as unknown as { ctx: MockCtx }).ctx = ctx
   ;(db as unknown as { env: Record<string, unknown> }).env = env
@@ -154,74 +161,121 @@ describe('EntityDB per-DO engine lifecycle (#764)', () => {
     expect(a).toBeGreaterThanOrEqual(0)
   }, COMPILE_TIMEOUT_MS)
 
-  it('persist writes a hex freeze blob into DO storage', async () => {
+  it('persist with no population cell writes nothing (metamodel is reconstructable, #935)', async () => {
+    // Pre-#935 this froze the WHOLE engine D (metamodel + cell) to a
+    // hex blob on every persist. Post-#935 only THIS DO's population
+    // cell is persisted — and there is none until a `put`. The bundled
+    // metamodel is reconstructed by compileDomainReadings() on hydrate,
+    // so persisting it would be the redundant 9.2MB write the task
+    // eliminates.
+    const blob = await db.__test_persist()
+    expect(blob).toBe('')
+    // No monolithic freeze key, no per-cell key — storage is clean.
+    const keys = Array.from(ctx.storage.data.keys())
+    expect(keys).not.toContain(ENGINE_STATE_STORAGE_KEY)
+    expect(keys).not.toContain(CELL_CONTENTS_STORAGE_KEY)
+  }, COMPILE_TIMEOUT_MS)
+
+  it('persist writes only THIS DO\'s cell as JSON under the per-cell key (#935)', async () => {
+    await db.put({ id: 'cell-x', type: 'Widget', data: { color: 'red' } })
     const blob = await db.__test_persist()
     expect(typeof blob).toBe('string')
     expect(blob.length).toBeGreaterThan(0)
-    // Plain ASCII hex — no whitespace, no separators, only [0-9a-f].
-    expect(blob).toMatch(/^[0-9a-f]+$/)
-    // The same string is observable through ctx.storage — i.e. it
-    // would survive isolate eviction.
-    const persisted = await ctx.storage.get<string>(ENGINE_STATE_STORAGE_KEY)
-    expect(persisted).toBe(blob)
+    // Per-cell JSON, NOT a hex freeze blob.
+    const parsed = JSON.parse(blob)
+    expect(parsed.id).toBe('cell-x')
+    expect(parsed.type).toBe('Widget')
+    expect(parsed.data.color).toBe('red')
+    // The 9.2MB monolithic freeze key is never written.
+    expect(await ctx.storage.get<string>(ENGINE_STATE_STORAGE_KEY)).toBeUndefined()
+    // The persisted value is well under the 128 KiB DO cap.
+    expect(new TextEncoder().encode(blob).length).toBeLessThan(96 * 1024)
   }, COMPILE_TIMEOUT_MS)
 
-  it('survives DO recreate: a second instance hydrates from persisted bytes', async () => {
-    // 1. First instance allocates + freezes.
-    const handleA = await db.__test_hydrate()
-    expect(handleA).toBeGreaterThanOrEqual(0)
-    const blobA = await db.__test_persist()
-    expect(blobA.length).toBeGreaterThan(0)
+  it('survives DO recreate: a second instance hydrates the persisted cell (#935)', async () => {
+    await db.put({ id: 'cell-x', type: 'Widget', data: { color: 'red', size: 'L' } })
+    await db.__test_persist()
 
-    // 2. Simulate isolate eviction by tearing down the first DO
-    //    instance and constructing a brand-new one against the
-    //    SAME `ctx.storage` (which is what Cloudflare promises:
-    //    storage outlives the isolate).
+    // Simulate isolate eviction: a brand-new EntityDB against the SAME
+    // ctx.storage (storage outlives the isolate per Cloudflare).
     const dbB = makeEntityDB(ctx)
-
-    // 3. The new instance starts with engineHandle = -1 …
-    //    (we can't read the private field from outside, but we
-    //    drive hydrate and check freeze produces the same blob).
     const handleB = await dbB.__test_hydrate()
     expect(handleB).toBeGreaterThanOrEqual(0)
-
-    // 4. Freeze the new instance → byte-identical to the persisted
-    //    blob, proving the second isolate's engine carries the
-    //    same state the first wrote.
-    const blobB = await dbB.__test_persist()
-    expect(blobB).toBe(blobA)
+    // The cold-started instance recovers the persisted cell.
+    const cell = await dbB.get()
+    expect(cell).not.toBeNull()
+    expect(cell!.id).toBe('cell-x')
+    expect(cell!.data.color).toBe('red')
+    expect(cell!.data.size).toBe('L')
   }, COMPILE_TIMEOUT_MS)
 
-  it('survives __test_evict + re-hydrate within one DO', async () => {
-    // Mimics isolate-internal handle release without losing the
-    // persisted blob — the next hydrate must find the storage and
-    // thaw it.
-    const handleA = await db.__test_hydrate()
-    const blobA = await db.__test_persist()
+  it('survives __test_evict + re-hydrate within one DO (#935)', async () => {
+    await db.put({ id: 'cell-x', type: 'Widget', data: { color: 'blue' } })
+    await db.__test_persist()
     await db.__test_evict()
     const handleB = await db.__test_hydrate()
-    // Handles are opaque numeric ids; CompiledState reuse may or
-    // may not produce the same number, but both must be valid.
     expect(handleB).toBeGreaterThanOrEqual(0)
-    expect(handleA).toBeGreaterThanOrEqual(0)
-    const blobB = await db.__test_persist()
-    expect(blobB).toBe(blobA)
+    const cell = await db.get()
+    expect(cell).not.toBeNull()
+    expect(cell!.data.color).toBe('blue')
   }, COMPILE_TIMEOUT_MS)
 
-  it('does NOT touch the SQL cell schema (foundational layer only)', async () => {
-    // Pin the contract that this task is "lifecycle wired" — sibling
-    // tasks #765/#766 are what actually route SQL paths through the
-    // engine. After hydrate + persist, the legacy cell SQL surface
-    // remains untouched; a direct `initCellSchema` + `fetchCell`
-    // path would still work the same way.
-    await db.__test_hydrate()
+  it('one-time migrates a legacy monolithic freeze blob to per-cell, then drops it (#935)', async () => {
+    // Seed a pre-#935 monolithic freeze image: write a cell, freeze the
+    // WHOLE engine D under the legacy key, then wipe the per-cell key to
+    // simulate a DO that only ever wrote the old way.
+    await db.put({ id: 'cell-x', type: 'Widget', data: { color: 'green' } })
+    const handle = await db.__test_hydrate()
+    const legacyHex = freezeHandle(handle)
+    await ctx.storage.put(ENGINE_STATE_STORAGE_KEY, legacyHex)
+    await ctx.storage.delete(CELL_CONTENTS_STORAGE_KEY)
+
+    // Cold-start a fresh instance — hydrate must migrate the legacy blob.
+    const dbB = makeEntityDB(ctx)
+    await dbB.__test_hydrate()
+    const cell = await dbB.get()
+    // On live workers fetch_cell recovers the migrated cell; under the
+    // vitest SystemTime gap the chain never extended on the original
+    // put, so the legacy blob carries an empty population and migration
+    // yields null. Either way the oversized legacy key is GONE.
+    expect(await ctx.storage.get<string>(ENGINE_STATE_STORAGE_KEY)).toBeUndefined()
+    if (cell !== null) {
+      expect(cell.id).toBe('cell-x')
+      expect(cell.data.color).toBe('green')
+    }
+  }, COMPILE_TIMEOUT_MS)
+
+  it('chunks a cell that exceeds the per-key budget and round-trips it (#935)', async () => {
+    // A single legitimately-large cell must split across :chunk:<n>
+    // keys (each under cap) and reassemble on load.
+    const big = 'x'.repeat(200 * 1024) // ~200 KiB > 96 KiB budget
+    await db.put({ id: 'cell-big', type: 'Doc', data: { body: big } })
+    const blob = await db.__test_persist()
+    // Base key holds the chunk manifest, not the contents.
+    const manifest = JSON.parse(blob)
+    expect(manifest.__arest_chunked).toBe(true)
+    expect(manifest.chunks).toBeGreaterThan(1)
+    // Every chunk value is under the DO cap.
+    for (let i = 0; i < manifest.chunks; i++) {
+      const part = await ctx.storage.get<string>(`${CELL_CONTENTS_STORAGE_KEY}:chunk:${i}`)
+      expect(typeof part).toBe('string')
+      expect(new TextEncoder().encode(part!).length).toBeLessThanOrEqual(96 * 1024)
+    }
+    // Reassembly recovers the original contents.
+    const loaded = await db.__test_load_cell()
+    expect(loaded).not.toBeNull()
+    expect(loaded!.id).toBe('cell-big')
+    expect(loaded!.data.body).toBe(big)
+  }, COMPILE_TIMEOUT_MS)
+
+  it('does NOT touch the SQL cell schema; storage carries only the per-cell key (#935)', async () => {
+    await db.put({ id: 'cell-x', type: 'Widget', data: { color: 'red' } })
     await db.__test_persist()
     // Direct cell ops still operate on the legacy SQL surface.
     initCellSchema(ctx.storage.sql)
-    // No engine-side SQL writes happened — we cannot inspect WASM
-    // internals, but we can verify storage carries ONLY the engine
-    // state key (no migration / shadow table sneaked in).
+    // Storage carries the per-cell key — never the 9.2MB monolithic key.
     const keys = Array.from(ctx.storage.data.keys())
-    expect(keys).toEqual([ENGINE_STATE_STORAGE_KEY])
+    expect(keys).toContain(CELL_CONTENTS_STORAGE_KEY)
+    expect(keys).not.toContain(ENGINE_STATE_STORAGE_KEY)
   }, COMPILE_TIMEOUT_MS)
 })

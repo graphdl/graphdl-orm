@@ -40,7 +40,7 @@ import {
   deriveTenantMasterKey,
   rotateCell,
 } from './cell-encryption'
-import { compileDomainReadings, freezeHandle, thawHandle, release_domain, system, callCellPin, callFetchCell } from './api/engine'
+import { compileDomainReadings, thawHandle, release_domain, system, callCellPin, callFetchCell } from './api/engine'
 export type { SqlLike } from './sql-like'
 
 // ── Types ───────────────────────────────────────────────────────────
@@ -421,6 +421,13 @@ function base64ToBytes(b64: string): Uint8Array {
   return out
 }
 
+/** UTF-8 byte length of a string — used to decide per-cell chunking
+ *  against the DO value cap (#935). `TextEncoder` is available in the
+ *  Workers runtime and under vitest's wasm host. */
+function utf8ByteLength(s: string): number {
+  return new TextEncoder().encode(s).length
+}
+
 // ── Fact Projection ─────────────────────────────────────────────────
 // Facts are NOT stored. They are projections of the cell's data.
 // α(project_column) applied to the data record.
@@ -608,10 +615,58 @@ export function listConnectedSystems(sql: SqlLike): string[] {
 
 // ── Durable Object ──────────────────────────────────────────────────
 
-/** DO storage key under which each EntityDB persists its engine
- *  freeze image (#764). Constant — every EntityDB DO uses the same
- *  key inside its own private storage namespace. */
+/** DO storage key under which each EntityDB persisted its WHOLE engine
+ *  freeze image (#764). Retained ONLY for backward-compat: a fresh
+ *  isolate reads this key once to migrate a legacy monolithic blob into
+ *  the per-cell layout, then deletes it (#935). New writes never touch
+ *  this key. See `CELL_CONTENTS_STORAGE_KEY`.
+ *
+ *  ## Why it is no longer the write key (#935)
+ *
+ *  Pre-#935 `persistEngineState()` froze the ENTIRE engine D — the
+ *  bundled metamodel (~9.2MB) PLUS this DO's one cell — and wrote it
+ *  un-chunked under this single key on EVERY cell write. Cloudflare DO
+ *  storage caps a value at 128 KiB, so a model load that triggered cell
+ *  writes either exceeded the cap or wedged miniflare's SQLite (any
+ *  /api/parse or /api/load_reading then hung). It also violated the
+ *  whitepaper's cell-isolation property (Def. 2 / §3.3, eq:cellfold
+ *  §462): each cell's fold `D_n' = foldl μ_n D_n E_n` is INDEPENDENT,
+ *  so a write to cell X must rewrite only cell X — not a monolithic
+ *  snapshot of every cell plus the shared metamodel. */
 export const ENGINE_STATE_STORAGE_KEY = 'engine_state_bytes'
+
+/** DO storage key prefix under which each EntityDB persists ITS OWN
+ *  cell contents — the per-cell population delta — as JSON (#935).
+ *
+ *  Each EntityDB DO IS exactly one cell (its `ctx.id` is the cell name;
+ *  `get`/`put` route a single `cellName = this.ctx.id.toString()`), so
+ *  the per-cell key is a constant inside this DO's private storage
+ *  namespace. A write to this DO rewrites only this key — true per-cell
+ *  isolation (whitepaper Def. 2 / §3.3 eq:cellfold). The bundled
+ *  metamodel is NOT persisted: it is reconstructed deterministically by
+ *  `compileDomainReadings()` on every cold-start hydrate, so persisting
+ *  it on each write was both redundant and the source of the 9.2MB blob.
+ *
+ *  Stored shape: a JSON `CellContents` (`{id, type, data}`). When the
+ *  serialized cell legitimately exceeds the per-key cap it is split
+ *  across `CELL_CONTENTS_STORAGE_KEY:chunk:<n>` keys with a manifest at
+ *  the base key (see `persistEngineState` / `loadPersistedCell`). */
+export const CELL_CONTENTS_STORAGE_KEY = 'cell_contents'
+
+/** Conservative per-value byte budget for a single DO storage key.
+ *  Cloudflare's hard cap is 128 KiB; we chunk well under it to leave
+ *  headroom for the key name, the JSON envelope, and UTF-8 expansion of
+ *  multi-byte payloads. A single cell exceeding this is chunked across
+ *  `CELL_CONTENTS_STORAGE_KEY:chunk:<n>` keys (#935). */
+export const CELL_CHUNK_BYTES = 96 * 1024
+
+/** Manifest written at the base key when a cell's JSON is chunked. The
+ *  `chunks` count tells `loadPersistedCell` how many `:chunk:<n>` keys
+ *  to concatenate before parsing. */
+interface ChunkManifest {
+  __arest_chunked: true
+  chunks: number
+}
 
 /** Extract the engine's authoritative post-state for `entityId` from
  *  an `apply` response envelope (#797 / #885). The response shape is
@@ -755,19 +810,37 @@ export class EntityDB extends DurableObject {
       // — under Cloudflare's single-thread model this can't happen,
       // but it costs nothing and keeps the invariant local).
       if (this.engineHandle >= 0) return
+      // The bundled metamodel is reconstructed deterministically here
+      // on every cold start — it is NOT persisted (#935). This is the
+      // whole point of the fix: only this DO's own cell (the population
+      // delta) needs to survive across isolate eviction.
       const handle = compileDomainReadings()
-      const persisted = await this.ctx.storage.get<string>(
-        ENGINE_STATE_STORAGE_KEY,
-      )
-      if (typeof persisted === 'string' && persisted.length > 0) {
-        // Best-effort hydrate: a malformed / cross-version freeze
-        // image returns `false` and we keep the freshly-allocated
-        // empty engine. Sibling task #769 adds explicit migration;
-        // this task's contract is "lifecycle wired", not "every
-        // possible freeze image is recoverable".
-        thawHandle(handle, persisted)
-      }
       this.engineHandle = handle
+
+      // ── Per-cell hydrate (#935) ──────────────────────────────────
+      // Load THIS DO's persisted cell contents (its single population
+      // cell), migrating a legacy monolithic freeze blob if one is
+      // still present from a pre-#935 deploy.
+      const cell = await this.loadPersistedCell(handle)
+      if (cell) {
+        // Seed the worker's in-memory cell graph so reads round-trip
+        // immediately (and stay correct even when the engine apply
+        // replay below cannot extend the chain — e.g. vitest's wasm32
+        // SystemTime gap inside merge_delta).
+        this.getCellGraph().set(cell.id, cell)
+        // Replay the cell into the engine so `fetch_cell`/`cell_pin`
+        // see it on the chain (live workers). Best-effort: under the
+        // vitest gap this apply panics on platform_now and we rely on
+        // the in-memory graph seeded above. Reconstruct the population
+        // on top of the freshly-compiled metamodel.
+        try {
+          await this.replayCellIntoEngine(handle, cell)
+        } catch {
+          // Engine replay failed (vitest SystemTime gap or transient
+          // engine fault) — the in-memory cell graph already carries
+          // the contents, so read-after-hydrate is closed regardless.
+        }
+      }
     })()
     try {
       await this.hydrateInFlight
@@ -776,15 +849,194 @@ export class EntityDB extends DurableObject {
     }
   }
 
-  /** Snapshot the per-DO engine state and write it back to DO
-   *  storage. Called by sibling tasks #766/#767 after every
-   *  state-mutating engine call (apply / transition). Public for
-   *  those siblings; the lifecycle test below also drives it
-   *  directly to verify the persistence path. */
+  /** Persist THIS DO's single cell — the population delta — back to DO
+   *  storage (#935). Called after every state-mutating engine call
+   *  (`writeCellThroughEngine`). Per-cell by construction: each EntityDB
+   *  DO is one cell (`this.ctx.id`), so this rewrites exactly one logical
+   *  cell's key, never the shared metamodel and never any sibling cell.
+   *
+   *  ## What changed (#935)
+   *
+   *  Pre-#935 this froze the ENTIRE engine D — metamodel (~9.2MB) plus
+   *  this cell — under `ENGINE_STATE_STORAGE_KEY` on every write, blowing
+   *  the 128 KiB DO value cap and wedging miniflare. Now it writes only
+   *  the cell's `{id, type, data}` JSON under `CELL_CONTENTS_STORAGE_KEY`.
+   *  The metamodel is reconstructable via `compileDomainReadings()` on
+   *  hydrate, so it is never persisted. This realizes the whitepaper's
+   *  cell-isolation property (Def. 2 / §3.3 eq:cellfold §462): one writer
+   *  per cell, each cell's fold independent.
+   *
+   *  ## Source of the cell contents
+   *
+   *  Engine-first (`fetch_cell` — the chain is the version-of-record),
+   *  falling back to the worker's in-memory cell graph when the engine
+   *  has no chain entry yet (e.g. vitest's wasm32 SystemTime gap where
+   *  `merge_delta` never extended the chain). Either way the JSON we
+   *  persist is the same `CellContents` shape `loadPersistedCell` thaws.
+   *
+   *  ## Chunking (#935 (b))
+   *
+   *  If a single cell's JSON legitimately exceeds `CELL_CHUNK_BYTES` it is
+   *  split across `CELL_CONTENTS_STORAGE_KEY:chunk:<n>` keys with a
+   *  manifest at the base key; the common case (one entity cell) is a
+   *  single un-chunked value far under the cap. */
   protected async persistEngineState(): Promise<void> {
     if (this.engineHandle < 0) return
-    const hex = freezeHandle(this.engineHandle)
-    await this.ctx.storage.put(ENGINE_STATE_STORAGE_KEY, hex)
+    const cellName = this.ctx.id.toString()
+    // Engine-first, in-memory fallback — same contract as EntityDB.get.
+    const cell =
+      fetchCellViaEngine(this.engineHandle, cellName) ??
+      this.getCellGraph().get(cellName) ??
+      null
+    if (!cell) return
+    await this.writeCellContents(cell)
+  }
+
+  /** Write a single cell's `CellContents` JSON to DO storage, chunking
+   *  across `:chunk:<n>` keys only when the value exceeds the per-key
+   *  budget. Clears any stale chunk keys from a prior larger write so a
+   *  shrinking cell does not leave orphaned chunks behind (#935). */
+  private async writeCellContents(cell: CellContents): Promise<void> {
+    const json = JSON.stringify(cell)
+    const byteLen = utf8ByteLength(json)
+    // Always clear a possibly-stale legacy monolithic blob — once a DO
+    // has written per-cell it never needs the old key again (#935).
+    await this.ctx.storage.delete(ENGINE_STATE_STORAGE_KEY)
+    // Clear any chunk keys from a previous (larger) write so we never
+    // read a mix of new + stale chunks back.
+    await this.clearChunkKeys()
+    if (byteLen <= CELL_CHUNK_BYTES) {
+      await this.ctx.storage.put(CELL_CONTENTS_STORAGE_KEY, json)
+      return
+    }
+    // Chunk: write a manifest at the base key + N slices. Slice on byte
+    // boundaries via the UTF-8 encoding so each value stays under cap.
+    const bytes = new TextEncoder().encode(json)
+    const chunks = Math.ceil(bytes.length / CELL_CHUNK_BYTES)
+    const manifest: ChunkManifest = { __arest_chunked: true, chunks }
+    await this.ctx.storage.put(CELL_CONTENTS_STORAGE_KEY, JSON.stringify(manifest))
+    const decoder = new TextDecoder()
+    for (let i = 0; i < chunks; i++) {
+      const slice = bytes.subarray(i * CELL_CHUNK_BYTES, (i + 1) * CELL_CHUNK_BYTES)
+      // `stream: true` keeps multi-byte sequences spanning a chunk
+      // boundary intact across successive decode calls.
+      const part = decoder.decode(slice, { stream: i < chunks - 1 })
+      await this.ctx.storage.put(`${CELL_CONTENTS_STORAGE_KEY}:chunk:${i}`, part)
+    }
+  }
+
+  /** Remove every `CELL_CONTENTS_STORAGE_KEY:chunk:<n>` key (idempotent).
+   *  Bounded by the previous chunk count; we probe sequentially and stop
+   *  at the first gap, which is safe because chunk indices are dense. */
+  private async clearChunkKeys(): Promise<void> {
+    for (let i = 0; ; i++) {
+      const key = `${CELL_CONTENTS_STORAGE_KEY}:chunk:${i}`
+      const present = await this.ctx.storage.get<string>(key)
+      if (present === undefined) break
+      await this.ctx.storage.delete(key)
+    }
+  }
+
+  /** Load THIS DO's persisted cell contents (#935). Engine handle is
+   *  passed so a migrated legacy blob can be thawed into it.
+   *
+   *  Read order:
+   *    1. Per-cell key (`CELL_CONTENTS_STORAGE_KEY`) — the #935 layout.
+   *       Handles both the inline-JSON case and the chunk-manifest case.
+   *    2. Legacy monolithic freeze blob (`ENGINE_STATE_STORAGE_KEY`) —
+   *       one-time migration: thaw it into the engine, extract this DO's
+   *       cell via `fetch_cell`, re-persist per-cell, and delete the
+   *       legacy key. A DO that only ever ran post-#935 never hits this.
+   *
+   *  Returns the cell's `CellContents`, or `null` when neither layout
+   *  carries data for this DO. */
+  private async loadPersistedCell(handle: number): Promise<CellContents | null> {
+    const cellName = this.ctx.id.toString()
+    // 1. Per-cell layout.
+    const base = await this.ctx.storage.get<string>(CELL_CONTENTS_STORAGE_KEY)
+    if (typeof base === 'string' && base.length > 0) {
+      const parsed = await this.readPersistedCellValue(base)
+      if (parsed) return parsed
+    }
+
+    // 2. Legacy monolithic blob — one-time migration.
+    const legacy = await this.ctx.storage.get<string>(ENGINE_STATE_STORAGE_KEY)
+    if (typeof legacy === 'string' && legacy.length > 0) {
+      // Thaw the whole D into the engine (it already carries the
+      // metamodel from compileDomainReadings; thaw replaces D with the
+      // frozen image, which also carried the metamodel — fine, the
+      // cell we want is in there). Best-effort: a malformed / cross-
+      // version image leaves the freshly-compiled empty engine.
+      if (thawHandle(handle, legacy)) {
+        const migrated = fetchCellViaEngine(handle, cellName)
+        if (migrated) {
+          // Re-persist per-cell + drop the legacy key so the next wake
+          // takes the fast per-cell path and the 9.2MB blob is gone.
+          await this.writeCellContents(migrated)
+          return migrated
+        }
+      }
+      // Could not extract this DO's cell — drop the oversized legacy
+      // key anyway so it stops wedging storage; the cell is gone but a
+      // fresh write will recreate it (documented: fresh DO required for
+      // unrecoverable legacy images).
+      await this.ctx.storage.delete(ENGINE_STATE_STORAGE_KEY)
+    }
+    return null
+  }
+
+  /** Parse a persisted base-key value into `CellContents`, transparently
+   *  reassembling chunks when the value is a `ChunkManifest` (#935). */
+  private async readPersistedCellValue(base: string): Promise<CellContents | null> {
+    let json = base
+    try {
+      const maybeManifest = JSON.parse(base) as Partial<ChunkManifest> & CellContents
+      if ((maybeManifest as ChunkManifest).__arest_chunked === true) {
+        const count = (maybeManifest as ChunkManifest).chunks
+        let assembled = ''
+        for (let i = 0; i < count; i++) {
+          const part = await this.ctx.storage.get<string>(
+            `${CELL_CONTENTS_STORAGE_KEY}:chunk:${i}`,
+          )
+          if (typeof part !== 'string') return null
+          assembled += part
+        }
+        json = assembled
+      } else {
+        // Already the inline CellContents JSON — return as-is.
+        return adaptEngineCellPayload(maybeManifest)
+      }
+    } catch {
+      return null
+    }
+    try {
+      return adaptEngineCellPayload(JSON.parse(json))
+    } catch {
+      return null
+    }
+  }
+
+  /** Replay a hydrated cell back into the engine via `apply` so the
+   *  per-cell chain (`fetch_cell` / `cell_pin`) reflects it on live
+   *  workers (#935). Reconstructs the population on top of the freshly-
+   *  compiled metamodel. Throws on engine fault (caller treats it as the
+   *  vitest SystemTime gap and relies on the in-memory cell graph). */
+  private async replayCellIntoEngine(handle: number, cell: CellContents): Promise<void> {
+    const stringFields: Record<string, string> = {}
+    for (const [k, v] of Object.entries(cell.data)) {
+      if (v === null || v === undefined) continue
+      stringFields[k] = typeof v === 'string' ? v : String(v)
+    }
+    const command = {
+      type: 'createEntity',
+      noun: cell.type,
+      domain: '',
+      id: cell.id,
+      fields: stringFields,
+    }
+    const envelope = JSON.stringify({ command, population: '' })
+    // Throws (rejects) if the engine panics — caller catches.
+    system(handle, 'apply', envelope)
   }
 
   /** Route a cell write through the per-DO engine's `apply` system
@@ -895,16 +1147,27 @@ export class EntityDB extends DurableObject {
     return this.engineHandle
   }
 
-  /** Test hook — exposes the freeze + persist path so the lifecycle
-   *  test can drive a write-back without waiting for sibling tasks
-   *  to land. Returns the hex blob that was written. */
+  /** Test hook — drives the per-cell persist path and returns the
+   *  value written under `CELL_CONTENTS_STORAGE_KEY` (#935). Empty
+   *  string when this DO has no population cell to persist (engine
+   *  carries only the reconstructable metamodel). For a chunked cell
+   *  this returns the manifest JSON, not the reassembled contents —
+   *  use `__test_load_cell` for the round-tripped `CellContents`. */
   async __test_persist(): Promise<string> {
     await this.hydrateEngine()
     await this.persistEngineState()
     const stored = await this.ctx.storage.get<string>(
-      ENGINE_STATE_STORAGE_KEY,
+      CELL_CONTENTS_STORAGE_KEY,
     )
     return stored ?? ''
+  }
+
+  /** Test hook — round-trips this DO's persisted cell back through the
+   *  per-cell load path (handles chunk reassembly + legacy migration),
+   *  returning the `CellContents` or null (#935). */
+  async __test_load_cell(): Promise<CellContents | null> {
+    await this.hydrateEngine()
+    return this.loadPersistedCell(this.engineHandle)
   }
 
   /** Test hook — releases the engine handle (mimics isolate

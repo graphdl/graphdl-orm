@@ -2683,8 +2683,14 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
         s if s.starts_with("list_noun:") => platform_list_noun(&s[10..], d),
         s if s.starts_with("get_noun:") => platform_get_noun(&s[9..], x, d),
         s if s.starts_with("query_ft:") => platform_query_ft(&s[9..], x, d),
-        // S1a (#717): wall-clock primitive — populates VersionEntry's
-        // recorded_at field at write time. See platform_now below.
+        // Wall-clock primitive — opt-in via the `wall-clock` feature.
+        // The fold no longer depends on it (recorded_at is a logical
+        // stamp, see logical_commit_stamp); a domain that explicitly
+        // models time can still call `now` when the feature is compiled
+        // in. Absent (cloudflare/no_std) → this arm drops out and `now`
+        // falls through to the fallback registry (Bottom), so wasm32
+        // never hits SystemTime's panic.
+        #[cfg(feature = "wall-clock")]
         "now" => platform_now(),
         // Fall through to the runtime-installed callback registry for
         // names outside the compile-derived range. See
@@ -2702,19 +2708,37 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
 /// chain (S1, #716). The returned timestamp populates a VersionEntry's
 /// `recorded_at` field at write time.
 ///
-/// std builds: `std::time::SystemTime::now()`. wasm32 (worker) gets it
-/// the same way — the Cloudflare Worker runtime stubs SystemTime to
-/// `Date.now()`. no_std (kernel): host injection is the long-tail
-/// follow-up; until then this primitive returns Bottom (the apply-Func
-/// no_std branch) and S1b can fall back to the chain's monotonic
-/// version_id as logical time when wall-clock is unavailable.
-#[cfg(not(feature = "no_std"))]
+/// OPT-IN: gated on the `wall-clock` feature. The cell-fold does NOT use
+/// this — `VersionEntry.recorded_at` is a logical monotonic stamp (see
+/// `logical_commit_stamp`), so the chain is host-clock-free on every
+/// target. This primitive exists only for domains that explicitly model
+/// time. `wall-clock` is in `default` (native std), absent from
+/// `cloudflare` (wasm32 — `SystemTime::now()` panics; there is no
+/// `Date.now` import) and `no_std` (kernel — no clock). In those builds
+/// the `now` arm drops out and `now` returns Bottom via the fallback
+/// registry — total, never a panic.
+#[cfg(feature = "wall-clock")]
 fn platform_now() -> Object {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
     Object::atom(&ms.to_string())
+}
+
+/// Logical commit stamp for `VersionEntry.recorded_at`. A process-
+/// monotonic counter — NO host clock — so the cell-fold is pure and
+/// deterministic on every target (wasm32 / kernel included) and the
+/// "wasm32 SystemTime gap" the engine tests work around stops existing.
+/// One value per `merge_delta` call (commit-batch atomicity). A
+/// monotonic-nondecreasing decimal atom — the contract the chain's
+/// `latest-by-recorded-at` aggregation relies on, now skew-free and
+/// deterministic instead of wall-clock-dependent.
+fn logical_commit_stamp() -> Object {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static COMMIT_SEQ: AtomicUsize = AtomicUsize::new(1);
+    let n = COMMIT_SEQ.fetch_add(1, Ordering::Relaxed);
+    Object::atom(&alloc::format!("{}", n))
 }
 
 /// Codd π: project:<indices, R> → rows of R restricted to the given column indices.
@@ -3136,10 +3160,27 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
     // Merge: foldl(concat_cell, D, cells(parsed))
     let merged_state = merge_states(&d_for_merge, &parsed);
 
-    // Structural model validation (#48) — catch FORML2 violations.
-    // Warnings only for now — pre-existing metamodel issues need cleanup first.
-    let model_errors = crate::compile::validate_model_from_state(&merged_state);
-    model_errors.iter().for_each(|e| { diag!("[model warning] {}", e); });
+    // Structural model validation (#48, task 807) — catch FORML2 violations
+    // at compile time, partitioned by modality (AREST.tex eq:create §157,
+    // thm:complete §362, §442 "the compile op is itself subject to validate"):
+    // an ALETHIC violation means the merged state is not a valid model ("It is
+    // impossible that …", §328) and MUST reject the compile (D' = D); DEONTIC
+    // findings warn and the compile proceeds (D' = D''). NOTE: reference-scheme
+    // value types are now materialized by synthesize_ref_scheme_constraints
+    // (ORM 2 — a reference mode is a view of a reference fact type over a VALUE
+    // TYPE), so a `.id` role no longer false-flags as an "undeclared noun";
+    // the reject fires only on a genuinely undeclared object type.
+    let model_violations = crate::compile::validate_model_classified_from_state(&merged_state);
+    model_violations.iter()
+        .filter(|v| !v.alethic)
+        .for_each(|v| { diag!("[model warning] {}", v.message); });
+    let model_alethic: Vec<&str> = model_violations.iter()
+        .filter(|v| v.alethic)
+        .map(|v| v.message.as_str())
+        .collect();
+    if !model_alethic.is_empty() {
+        return Object::atom(&format!("⊥ model violation: {}", model_alethic.join("; ")));
+    }
 
     // Compile defs from merged state + re-register platform primitives
     let mut defs = crate::compile::compile_to_defs_state(&merged_state);
@@ -4826,9 +4867,13 @@ pub fn merge_delta(
         _ => Vec::new(),
     };
 
-    // One wall-clock read per merge — every cell in this delta gets the
-    // same recorded_at (commit-batch atomicity).
-    let recorded_at = apply_platform("now", &Object::phi(), &Object::phi());
+    // Logical commit stamp — one per merge, every cell in this delta gets
+    // the same recorded_at (commit-batch atomicity). The fold reads NO
+    // host clock (eq:cellfold orders by chain position, not wall time);
+    // wall-clock is the opt-in `now` primitive for domains that model
+    // time, not a fold dependency. Monotonic, so the chain's
+    // `latest-by-recorded-at` aggregation still holds.
+    let recorded_at = logical_commit_stamp();
 
     for (k, v) in delta_pairs {
         let new_chain = match base_map.get(&k) {
@@ -9114,7 +9159,7 @@ mod tests {
         assert!(between(&raw, "Z", 1, 100).is_empty());
     }
 
-    #[cfg(not(feature = "no_std"))]
+    #[cfg(feature = "wall-clock")]
     #[test]
     fn platform_now_returns_monotonically_nondecreasing_decimal_atom() {
         let t1 = apply_platform("now", &Object::phi(), &Object::phi());

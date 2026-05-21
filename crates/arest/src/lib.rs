@@ -4990,8 +4990,8 @@ Order has total.
             "privileged tenant must accept; got {result}"
         );
         assert!(
-            result.contains(r#""addedNouns":["Customer"]"#),
-            "envelope must include the added noun; got {result}"
+            result.contains(r#""addedNouns":["Customer","Name"]"#),
+            "envelope must include the added noun + its reference value type; got {result}"
         );
 
         // Live state has Customer in the Noun cell.

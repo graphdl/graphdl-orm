@@ -5628,7 +5628,13 @@ Status 'pending' is initial in State Machine Definition 'Task'.
         let result = apply_command_defs(&def_map, &cmd, &state);
         assert!(!result.rejected);
         assert_eq!(result.entities[0].entity_type, "SchemaLoaded");
-        assert_eq!(result.entities[0].data["nouns"], "2");
+        // Newly-introduced nouns against the metamodel context. ORM 2: the
+        // reference modes now materialize value types — `Product(.SKU)` adds
+        // Product + its NOVEL value type SKU; `Category(.Name)` adds Category,
+        // but its value type Name is ALREADY declared in the metamodel
+        // (Function_has_Name), so it is not newly introduced. Hence 3
+        // (Product, SKU, Category), up from the pre-fix 2 (Product, Category).
+        assert_eq!(result.entities[0].data["nouns"], "3");
     }
 
     #[test]
@@ -5665,12 +5671,13 @@ Status 'pending' is initial in State Machine Definition 'Task'.
         assert!(!result.rejected, "valid LoadReading must not reject");
         assert_eq!(result.entities[0].entity_type, "ReadingLoaded");
         assert_eq!(result.entities[0].data["name"], "catalog");
-        assert_eq!(result.entities[0].data["addedNouns"], "Product");
-        // task-737: derived_count = added nouns + added fact types + added
-        // derivations. `Product(.SKU) is an entity type.` synthesises the
-        // primary `Product_has_SKU` FT (acceptance #1 of task-737), so the
-        // count is 1 noun + 1 synthetic FT = 2. Pre-#737 the count was 1.
-        assert_eq!(result.derived_count, 2);
+        assert_eq!(result.entities[0].data["addedNouns"], "Product,SKU");
+        // derived_count = added nouns + added fact types + added derivations.
+        // `Product(.SKU) is an entity type.` now declares the value type SKU
+        // (ORM 2: a reference mode is a view of a reference fact type over a
+        // value type) AND synthesises the `Product_has_SKU` FT, so the count
+        // is 2 nouns (Product, SKU) + 1 synthetic FT = 3.
+        assert_eq!(result.derived_count, 3);
         // Delta carries cell mutations.
         assert_ne!(result.state, ast::Object::phi());
     }
@@ -5785,7 +5792,9 @@ Status 'pending' is initial in State Machine Definition 'Task'.
         assert!(!unload_result.rejected, "unload must succeed");
         assert_eq!(unload_result.entities[0].entity_type, "ReadingUnloaded");
         assert_eq!(unload_result.entities[0].data["name"], "catalog");
-        assert_eq!(unload_result.entities[0].data["removedNouns"], "Product");
+        // `Product(.SKU)` declares the value type SKU (ORM 2), so unload
+        // removes both the entity and its reference value type.
+        assert_eq!(unload_result.entities[0].data["removedNouns"], "Product,SKU");
     }
 
     /// Unload of an unknown name rejects with
@@ -5892,7 +5901,12 @@ Status 'pending' is initial in State Machine Definition 'Task'.
         assert!(!reload_result.rejected, "reload must succeed");
         assert_eq!(reload_result.entities[0].entity_type, "ReadingReloaded");
         assert_eq!(reload_result.entities[0].data["name"], "catalog");
-        assert_eq!(reload_result.entities[0].data["removedNouns"], "Product");
+        // Asymmetry is correct: the first load added Product + its NOVEL value
+        // type SKU (the manifest records both → both removed on reload). The
+        // new body adds Category, but its value type Name is ALREADY declared
+        // in the metamodel context (Function_has_Name in setup_order_defs), so
+        // it is not a newly-added noun.
+        assert_eq!(reload_result.entities[0].data["removedNouns"], "Product,SKU");
         assert_eq!(reload_result.entities[0].data["addedNouns"], "Category");
     }
 
@@ -5913,7 +5927,7 @@ Status 'pending' is initial in State Machine Definition 'Task'.
         assert!(!result.rejected, "first-time-reload must succeed");
         assert_eq!(result.entities[0].entity_type, "ReadingReloaded");
         assert_eq!(result.entities[0].data["removedNouns"], "");
-        assert_eq!(result.entities[0].data["addedNouns"], "Product");
+        assert_eq!(result.entities[0].data["addedNouns"], "Product,SKU");
     }
 
     /// Empty body rejects with `reload_reading.empty_body`.

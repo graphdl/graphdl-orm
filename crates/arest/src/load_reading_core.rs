@@ -1447,16 +1447,21 @@ Category(.Name) is an entity type.
         let outcome = load_reading(&state, "catalog", body, LoadReadingPolicy::AllowAll)
             .expect("valid reading should load");
 
-        // Both new nouns appear in the report (sorted).
+        // Both entity nouns AND their reference value types appear in the
+        // report (sorted). ORM 2: `Product(.SKU)` / `Category(.Name)` declare
+        // SKU / Name as value-type object types (a reference mode is a view of
+        // a reference fact type over a value type), so the model — and the
+        // load report — include them.
         assert_eq!(
             outcome.report.added_nouns,
-            vec!["Category".to_string(), "Product".to_string()]
+            vec!["Category".to_string(), "Name".to_string(),
+                 "Product".to_string(), "SKU".to_string()]
         );
         // The Order noun is unchanged — must not appear as added.
         assert!(!outcome.report.added_nouns.contains(&"Order".to_string()));
 
-        // The new state has the merged Noun cell (3 entries: Order +
-        // Product + Category).
+        // The new state has the merged Noun cell (5 entries: Order +
+        // Product + SKU + Category + Name).
         let nouns_after = ast::fetch_or_phi("Noun", &outcome.new_state);
         let names: Vec<&str> = nouns_after
             .as_seq()
@@ -1636,7 +1641,9 @@ Category(.Name) is an entity type.
         )
         .expect("second load succeeds");
 
-        assert_eq!(second.report.added_nouns, vec!["Category".to_string()]);
+        // `Category(.Name)` adds the entity AND its reference value type Name.
+        assert_eq!(second.report.added_nouns,
+            vec!["Category".to_string(), "Name".to_string()]);
 
         // Merged Noun cell contains all three.
         let nouns_after = ast::fetch_or_phi("Noun", &second.new_state);
@@ -1663,7 +1670,8 @@ Category(.Name) is an entity type.
             .expect("manifest cell must be persisted");
         assert_eq!(
             decoded.added_nouns,
-            vec!["Category".to_string(), "Product".to_string()]
+            vec!["Category".to_string(), "Name".to_string(),
+                 "Product".to_string(), "SKU".to_string()]
         );
         assert_eq!(decoded, outcome.report);
     }
@@ -1691,7 +1699,8 @@ Category(.Name) is an entity type.
             .expect("unload succeeds");
         assert_eq!(
             outcome.report.removed_nouns,
-            vec!["Category".to_string(), "Product".to_string()]
+            vec!["Category".to_string(), "Name".to_string(),
+                 "Product".to_string(), "SKU".to_string()]
         );
 
         // Product / Category are gone, Order (seeded) survives.
@@ -1884,10 +1893,12 @@ Product has SKU.
         let reloaded = reload_reading(&loaded.new_state, "catalog", body_v2, ReloadPolicy::ReplaceAll)
             .expect("reload to v2 succeeds");
 
-        // Old body's noun is gone.
-        assert_eq!(reloaded.removed.removed_nouns, vec!["Product".to_string()]);
-        // New body's noun is added.
-        assert_eq!(reloaded.added.added_nouns, vec!["Category".to_string()]);
+        // Old body's noun + its reference value type are gone.
+        assert_eq!(reloaded.removed.removed_nouns,
+            vec!["Product".to_string(), "SKU".to_string()]);
+        // New body's noun + its reference value type are added.
+        assert_eq!(reloaded.added.added_nouns,
+            vec!["Category".to_string(), "Name".to_string()]);
 
         // Post-state has Category but not Product. (Order is from seed.)
         let nouns_obj = ast::fetch_or_phi("Noun", &reloaded.new_state);
@@ -1906,7 +1917,8 @@ Product has SKU.
         // Manifest reflects v2's added cells, not v1's.
         let manifest = decode_manifest(&reloaded.new_state, "catalog")
             .expect("manifest must persist");
-        assert_eq!(manifest.added_nouns, vec!["Category".to_string()]);
+        assert_eq!(manifest.added_nouns,
+            vec!["Category".to_string(), "Name".to_string()]);
     }
 
     /// First-time load: reload a name that's never been loaded
@@ -1926,8 +1938,9 @@ Product has SKU.
         assert!(outcome.removed.removed_fact_types.is_empty());
         assert!(outcome.removed.removed_derivations.is_empty());
 
-        // Added matches a normal first-time load.
-        assert_eq!(outcome.added.added_nouns, vec!["Product".to_string()]);
+        // Added matches a normal first-time load (entity + ref value type).
+        assert_eq!(outcome.added.added_nouns,
+            vec!["Product".to_string(), "SKU".to_string()]);
 
         // Manifest is now present.
         assert!(decode_manifest(&outcome.new_state, "catalog").is_some());
@@ -2038,9 +2051,11 @@ Product has SKU.
         let reloaded = reload_reading(&fresh.new_state, "catalog", body, ReloadPolicy::ReplaceAll)
             .expect("idempotent reload succeeds");
 
-        // Removed and added describe the round trip — both list Product.
-        assert_eq!(reloaded.removed.removed_nouns, vec!["Product".to_string()]);
-        assert_eq!(reloaded.added.added_nouns, vec!["Product".to_string()]);
+        // Removed and added describe the round trip — both list Product + SKU.
+        assert_eq!(reloaded.removed.removed_nouns,
+            vec!["Product".to_string(), "SKU".to_string()]);
+        assert_eq!(reloaded.added.added_nouns,
+            vec!["Product".to_string(), "SKU".to_string()]);
 
         // The post-state Noun cell equals the fresh-load Noun cell.
         let nouns_fresh = ast::fetch_or_phi("Noun", &fresh.new_state);
@@ -2705,7 +2720,8 @@ Category(.Name) is an entity type.
         // changed; `validation_report` lists what was checked.
         assert_eq!(
             outcome.report.added_nouns,
-            vec!["Category".to_string(), "Product".to_string()],
+            vec!["Category".to_string(), "Name".to_string(),
+                 "Product".to_string(), "SKU".to_string()],
         );
     }
 

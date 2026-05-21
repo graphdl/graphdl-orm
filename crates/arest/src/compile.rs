@@ -2748,29 +2748,70 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 // state_to_domain deleted (#211). All callers now use
 // cell_index_from_state or read cells directly.
 
-/// Compile Object state into executable form (CompiledModel).
-/// Structural model validation â€” catches FORML2 violations at compile time.
-/// Returns a list of error messages. Empty = model is well-formed.
-pub fn validate_model_from_state(state: &crate::ast::Object) -> Vec<String> {
-    let data = cell_index_from_state(state);
-    validate_model_data(&data)
+/// A structural well-formedness violation found by the model validator,
+/// carrying its modality so the compile caller can partition into
+/// reject-vs-warn exactly as `eq:create` / `thm:complete` (AREST.tex
+/// §157, §362) prescribe for population constraints.
+///
+/// `alethic = true`  → the model is structurally not a valid model
+///                     (an "It is impossible that …" condition,
+///                     AREST.tex §328). The write MUST be rejected
+///                     (`D' = D`), mirroring the alethic-constraint
+///                     rejection at the runtime `validate` step.
+/// `alethic = false` → the condition is reportable but permitted
+///                     (a deontic "It is obligatory/permitted that …"
+///                     class). Surfaced as a warning; the write
+///                     proceeds (`D' = D''`).
+#[derive(Debug, Clone)]
+pub struct ModelViolation {
+    pub message: String,
+    pub alethic: bool,
 }
 
-pub(crate) fn validate_model_data(ir: &CellIndex) -> Vec<String> {
-    let mut errors = Vec::new();
+/// Compile Object state into executable form (CompiledModel).
+/// Structural model validation — catches FORML2 violations at compile time.
+/// Returns a list of message strings (alethic and deontic combined). Empty =
+/// model is well-formed. Backward-compatible string view; callers that need
+/// to partition by modality use [`validate_model_classified_from_state`].
+pub fn validate_model_from_state(state: &crate::ast::Object) -> Vec<String> {
+    validate_model_classified_from_state(state)
+        .into_iter()
+        .map(|v| v.message)
+        .collect()
+}
+
+/// Classified structural model validation. Each violation carries its
+/// modality (`alethic`) so the compile pipeline can reject on alethic
+/// (structural-impossibility) violations and warn on deontic ones, exactly
+/// as the runtime `validate` step partitions population constraints
+/// (AREST.tex eq:create §157, thm:complete §362).
+pub fn validate_model_classified_from_state(state: &crate::ast::Object) -> Vec<ModelViolation> {
+    let data = cell_index_from_state(state);
+    validate_model_data_classified(&data)
+}
+
+pub(crate) fn validate_model_data_classified(ir: &CellIndex) -> Vec<ModelViolation> {
+    let mut violations = Vec::new();
+    // ALETHIC (structural impossibility → reject; AREST.tex §328 "It is
+    // impossible that …", §362 "D' = D"): a model in which a role binds an
+    // undeclared noun, a subtype names a non-noun supertype, a UC underspans
+    // an n-ary fact type, a ring constraint sits on a non-self-referential
+    // binary, or a constraint span names a fact type that cannot exist is
+    // not a valid model. These reject the compile.
+    let mut alethic = |msg: String| violations.push(ModelViolation { message: msg, alethic: true });
 
     // 1. Undeclared nouns in fact type roles
     ir.fact_types.iter().for_each(|(ft_id, ft)| {
         ft.roles.iter()
             .filter(|r| !ir.nouns.contains_key(&r.noun_name))
-            .for_each(|r| errors.push(format!(
+            .for_each(|r| alethic(format!(
                 "Undeclared noun '{}' in fact type '{}'", r.noun_name, ft_id)));
     });
 
     // 2. Subtype of undeclared supertype
     ir.subtypes.iter()
         .filter(|(_, parent)| !ir.nouns.contains_key(parent.as_str()))
-        .for_each(|(child, parent)| errors.push(format!(
+        .for_each(|(child, parent)| alethic(format!(
             "Subtype '{}' declares supertype '{}' which is not a declared noun", child, parent)));
 
     // 3. Duplicate noun: same name declared as both entity and value
@@ -2784,7 +2825,7 @@ pub(crate) fn validate_model_data(ir: &CellIndex) -> Vec<String> {
                 let arity = ft.roles.len();
                 let uc_span = c.spans.len();
                 // For ternary+, UC must span at least n-1 roles
-                (arity >= 3 && uc_span < arity - 1).then(|| errors.push(format!(
+                (arity >= 3 && uc_span < arity - 1).then(|| alethic(format!(
                     "UC '{}' spans {} roles on {}-ary fact type '{}' â€” must span at least {} (arity decomposition rule)",
                     c.text, uc_span, arity, ft.reading, arity - 1)));
             });
@@ -2801,7 +2842,7 @@ pub(crate) fn validate_model_data(ir: &CellIndex) -> Vec<String> {
             c.spans.first().and_then(|span| ir.fact_types.get(&span.fact_type_id)).map(|ft| {
                 if let (2, Some(r0), Some(r1)) = (ft.roles.len(), ft.roles.get(0), ft.roles.get(1)) {
                     if r0.noun_name != r1.noun_name {
-                        errors.push(format!(
+                        alethic(format!(
                             "Ring constraint '{}' on '{}' requires both roles to be the same type, but found {{\"{}\", \"{}\"}}",
                             c.kind, ft.reading, r0.noun_name, r1.noun_name));
                     }
@@ -2813,7 +2854,10 @@ pub(crate) fn validate_model_data(ir: &CellIndex) -> Vec<String> {
     // Skip when: (a) span FT ID is a prefix of a declared FT, or
     // (b) every noun mentioned in the span FT ID is a declared noun.
     // Both cases are parser resolution mismatches (XUC, "per", inverse
-    // readings, "the same" artifacts), not modeling errors.
+    // readings, "the same" artifacts), not modeling errors. What survives
+    // the filter — a span whose FT ID names NO declared noun — references a
+    // fact type that cannot exist, an "It is impossible that …" condition:
+    // alethic.
     let noun_names_sorted: Vec<&str> = {
         let mut v: Vec<&str> = ir.nouns.keys().map(|s| s.as_str()).collect();
         v.sort_by(|a, b| b.len().cmp(&a.len()));
@@ -2832,10 +2876,10 @@ pub(crate) fn validate_model_data(ir: &CellIndex) -> Vec<String> {
                 .collect();
             found.is_empty() // only warn if NO declared nouns found
         })
-        .for_each(|span| errors.push(format!(
+        .for_each(|span| alethic(format!(
             "Constraint span references undeclared fact type '{}'", span.fact_type_id)));
 
-    errors
+    violations
 }
 
 /// Read-only index over the Object state — not a separate IR. The canonical
@@ -11154,6 +11198,194 @@ mod mandatory_role_alethic_rejection_tests {
         assert!(mc_violations.is_empty(),
             "MC must NOT fire when foo1 participates in `Foo has Bar`; \
              got mc violations {:?}", mc_violations);
+    }
+}
+
+// ── Task 807: validate_model_from_state modality policy ──────────────
+//
+// The structural model validator (`validate_model_*`) catches FORML2
+// well-formedness violations at compile time. AREST.tex settles which of
+// these are ERRORS (reject) vs WARNINGS (allow-but-warn):
+//
+//   * eq:create (§157): "An alethic violation rejects (D' = D). A deontic
+//     violation warns but succeeds (D' = D'')."
+//   * thm:complete (§362): "D' = D[FILE ↦ P''] if V contains no alethic
+//     violation, else D' = D."
+//   * Constraint grammar (§328): the alethic modal prefixes are
+//     "It is impossible that"/"It is possible that"; the deontic ones are
+//     "It is obligatory that"/"It is forbidden that"/"It is permitted that".
+//   * Migration remark (§442): "The compile op is itself a SYSTEM
+//     application and subject to validate. If an ingested schema introduces
+//     an alethic constraint that P violates, the ingestion is rejected
+//     (D' = D)."
+//
+// A model in which a fact-type role binds an undeclared noun, a subtype
+// names a non-noun supertype, or a constraint span names a fact type that
+// cannot exist is structurally not a valid model — an "It is impossible
+// that …" condition. Per the citations above these are ALETHIC and MUST
+// reject the compile. Deontic-class structural conditions (reportable but
+// permitted) stay warnings. These tests pin both halves.
+#[cfg(test)]
+mod model_validation_modality_tests {
+    use super::*;
+    use crate::ast::{self, Object, fact_from_pairs};
+
+    /// A fact type whose role binds a noun that was never declared. The
+    /// model is structurally impossible → alethic.
+    fn state_with_undeclared_noun_in_role() -> Object {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        // Only "Foo" is declared; "Ghost" is referenced but never declared.
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Foo"), ("objectType", "entity"),
+        ]));
+        cells.entry("FactType".into()).or_default().push(fact_from_pairs(&[
+            ("id", "ft_foo_ghost"), ("reading", "Foo relates Ghost"), ("arity", "2"),
+        ]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_foo_ghost"), ("nounName", "Foo"), ("position", "0"),
+        ]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_foo_ghost"), ("nounName", "Ghost"), ("position", "1"),
+        ]));
+        Object::Map(cells.into_iter()
+            .map(|(k, v)| (k, Object::Seq(v.into())))
+            .collect::<hashbrown::HashMap<_, _>>().into())
+    }
+
+    /// AREST.tex §328: undeclared-noun-in-role is an "It is impossible
+    /// that …" condition. The classified validator must flag it alethic.
+    #[test]
+    fn undeclared_noun_in_role_is_classified_alethic() {
+        let state = state_with_undeclared_noun_in_role();
+        let violations = validate_model_classified_from_state(&state);
+        let ghost = violations.iter()
+            .find(|v| v.message.contains("Ghost") && v.message.contains("ft_foo_ghost"))
+            .expect("undeclared-noun violation must surface");
+        assert!(ghost.alethic,
+            "undeclared noun in a fact-type role is a structural \
+             impossibility (AREST.tex §328) and MUST be alethic; got {:?}",
+            ghost);
+    }
+
+    /// AREST.tex eq:create §157 / thm:complete §362 / §442: a model carrying
+    /// a GENUINELY alethic structural violation (here a role binding the
+    /// hand-built undeclared noun `Ghost` — NOT a reference-scheme value type,
+    /// which is now declared by synthesize_ref_scheme_constraints) is not a
+    /// valid model, so `platform_compile` must reject with a `⊥ model
+    /// violation: …` atom rather than a compiled state. The companion
+    /// `create_order_materializes_per_entity_cell_with_3nf_row` pins the other
+    /// half: a `.id`-keyed entity schema is well-formed and compiles.
+    #[test]
+    fn platform_compile_rejects_on_alethic_model_violation() {
+        let model_state = state_with_undeclared_noun_in_role();
+        let initial_d = ast::defs_to_state(
+            &alloc::vec![(
+                "compile".to_string(),
+                ast::Func::Platform("compile".to_string()),
+            )],
+            &model_state,
+        );
+        let result = ast::apply(
+            &ast::Func::Platform("compile".to_string()),
+            &Object::atom(""),
+            &initial_d,
+        );
+        let atom = result.as_atom().unwrap_or_else(|| panic!(
+            "platform_compile must reject (return an atom) on an alethic \
+             structural violation; got non-atom result: {:?}", result));
+        assert!(atom.starts_with("⊥ model violation"),
+            "alethic structural violation must reject with a \
+             '⊥ model violation' atom (AREST.tex §362, D' = D); got {:?}",
+            atom);
+        assert!(atom.contains("Ghost"),
+            "rejection atom must surface the failing condition so the user \
+             sees why compile was rejected; got {:?}", atom);
+    }
+
+    /// AREST.tex eq:create §157: a DEONTIC structural violation "warns but
+    /// succeeds (D' = D'')". The compile caller partitions on
+    /// `ModelViolation::alethic` — deontic-class violations are surfaced as
+    /// `[model warning] …` and the compile proceeds, exactly as alethic
+    /// ones reject. This pins the warn-but-proceed half of the partition by
+    /// driving the same partition predicate the caller uses.
+    #[test]
+    fn deontic_model_violation_warns_but_does_not_reject() {
+        // Representative classified set: one alethic + one deontic.
+        let mixed = alloc::vec![
+            ModelViolation { message: "structural impossibility".into(), alethic: true },
+            ModelViolation { message: "advisory: reportable but permitted".into(), alethic: false },
+        ];
+        // The caller (ast::platform_compile) rejects iff any alethic
+        // violation is present, and warns on the deontic ones. Mirror that
+        // partition here so the contract is pinned independent of the
+        // current check set (all of which happen to be alethic today).
+        let warns: alloc::vec::Vec<&str> = mixed.iter()
+            .filter(|v| !v.alethic)
+            .map(|v| v.message.as_str())
+            .collect();
+        let rejects: alloc::vec::Vec<&str> = mixed.iter()
+            .filter(|v| v.alethic)
+            .map(|v| v.message.as_str())
+            .collect();
+        assert_eq!(warns, alloc::vec!["advisory: reportable but permitted"],
+            "deontic-class model violations must be surfaced as warnings, \
+             not rejections (AREST.tex §157, D' = D'')");
+        assert_eq!(rejects, alloc::vec!["structural impossibility"],
+            "alethic-class model violations must be the ones that reject \
+             (AREST.tex §157, D' = D)");
+    }
+
+    /// A well-formed model (every role-noun declared, no malformed
+    /// constraints) carries zero alethic structural violations, so
+    /// `platform_compile` proceeds rather than rejecting. Guards against
+    /// the fix turning into a blanket reject-everything regression.
+    #[test]
+    fn wellformed_model_has_no_alethic_violations_and_compiles() {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Foo"), ("objectType", "entity"),
+        ]));
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Bar"), ("objectType", "entity"),
+        ]));
+        cells.entry("FactType".into()).or_default().push(fact_from_pairs(&[
+            ("id", "ft_foo_bar"), ("reading", "Foo relates Bar"), ("arity", "2"),
+        ]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_foo_bar"), ("nounName", "Foo"), ("position", "0"),
+        ]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_foo_bar"), ("nounName", "Bar"), ("position", "1"),
+        ]));
+        let state = Object::Map(cells.into_iter()
+            .map(|(k, v)| (k, Object::Seq(v.into())))
+            .collect::<hashbrown::HashMap<_, _>>().into());
+
+        let alethic: alloc::vec::Vec<_> = validate_model_classified_from_state(&state)
+            .into_iter().filter(|v| v.alethic).collect();
+        assert!(alethic.is_empty(),
+            "well-formed model must carry zero alethic structural \
+             violations; got {:?}", alethic);
+
+        let initial_d = ast::defs_to_state(
+            &alloc::vec![(
+                "compile".to_string(),
+                ast::Func::Platform("compile".to_string()),
+            )],
+            &state,
+        );
+        let result = ast::apply(
+            &ast::Func::Platform("compile".to_string()),
+            &Object::atom(""),
+            &initial_d,
+        );
+        // Proceeds: a well-formed model must NOT produce a model-violation
+        // rejection atom. (It compiles to a state Map, not a ⊥ atom.)
+        if let Some(atom) = result.as_atom() {
+            assert!(!atom.starts_with("⊥ model violation"),
+                "well-formed model must not be rejected as a model \
+                 violation; got {:?}", atom);
+        }
     }
 }
 

@@ -2350,7 +2350,15 @@ fn synthesize_ref_scheme_constraints(
     noun_facts: &[Object],
     existing_ft_facts: &[Object],
     existing_role_facts: &[Object],
-) -> (Vec<Object>, Vec<Object>, Vec<Object>) {
+) -> (Vec<Object>, Vec<Object>, Vec<Object>, Vec<Object>) {
+    // ORM 2 (Halpin): a reference mode is shorthand — "a view of a reference
+    // fact type". The explicit underlying model is `<Noun> has <RefPart>`
+    // where <RefPart> is a VALUE TYPE (an object type). So expanding a
+    // reference scheme must also materialize that value type as a value-type
+    // Noun; emitting only the fact type + roles leaves the `<RefPart>` role
+    // binding an undeclared object type — a half-built model the structural
+    // validator (correctly) rejects. `new_nouns` carries those value types.
+    let mut new_nouns: Vec<Object> = Vec::new();
     let mut new_fts: Vec<Object> = Vec::new();
     let mut new_roles: Vec<Object> = Vec::new();
     let mut new_constraints: Vec<Object> = Vec::new();
@@ -2401,6 +2409,20 @@ fn synthesize_ref_scheme_constraints(
 
         for part in parts.iter() {
             let ft_id = synth_ft_id(name, part);
+            // Materialize the reference VALUE TYPE as a value-type Noun (ORM 2:
+            // the explicit reference fact type binds the entity to a value
+            // type). Skip when already declared — by the user (`X is a value
+            // type.`) or by an earlier entity sharing the same ref-part name.
+            let part_declared =
+                noun_facts.iter().any(|n| binding(n, "name") == Some(part.as_str()))
+                || new_nouns.iter().any(|n| binding(n, "name") == Some(part.as_str()));
+            if !part_declared {
+                new_nouns.push(fact_from_pairs(&[
+                    ("name", part.as_str()),
+                    ("objectType", "value"),
+                    ("synthetic", "refScheme"),
+                ]));
+            }
             // Synthesise the FT only when it isn't already declared.
             // Otherwise reuse the user-declared shape so constraint
             // spans line up with the user-visible reading.
@@ -2466,7 +2488,7 @@ fn synthesize_ref_scheme_constraints(
         }
     }
 
-    (new_fts, new_roles, new_constraints)
+    (new_nouns, new_fts, new_roles, new_constraints)
 }
 
 /// Post-translator enrichment: emit `span0_factTypeId`/`span0_roleIndex`
@@ -5200,7 +5222,7 @@ fn parse_to_state_via_stage12_impl(
     // antecedent-noun-count arbitration and
     // `translate_ring_constraints`' `conditional_ring_kind` helper
     // both need the domain-level catalog.
-    let noun_facts = tt!("nouns", translate_nouns(&classified, &idx));
+    let mut noun_facts = tt!("nouns", translate_nouns(&classified, &idx));
     let classified = {
         let mut map: HashMap<String, Object> = match &classified {
             Object::Map(m) => (**m).clone(),
@@ -5228,9 +5250,10 @@ fn parse_to_state_via_stage12_impl(
     // by every `Noun(.X) is an entity type.` reference-scheme
     // declaration. Constraints flow into the Constraint cell so the
     // existing compiler path picks them up like any user-declared UC.
-    let (synth_ref_fts, synth_ref_roles, synth_ref_constraints) =
+    let (synth_ref_nouns, synth_ref_fts, synth_ref_roles, synth_ref_constraints) =
         tt!("ref_scheme_synth",
             synthesize_ref_scheme_constraints(&noun_facts, &ft_facts, &role_facts));
+    noun_facts.extend(synth_ref_nouns);
     ft_facts.extend(synth_ref_fts);
     role_facts.extend(synth_ref_roles);
     let mut constraint_facts: Vec<Object> = synth_ref_constraints;

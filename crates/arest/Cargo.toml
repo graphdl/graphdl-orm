@@ -300,7 +300,16 @@ templates = []
 # folds external reports into the same graph. Off by default —
 # workers that aren't running Wine apps shouldn't pay the bake cost.
 compat-readings = []
-default = ["wit", "debug-def", "std-deps", "parallel", "core", "evolution-readings", "imports-readings", "ingest-readings", "ui-readings", "os-readings", "templates"]
+# `wall-clock` — gates the host wall-clock `now` platform primitive
+# (epoch-ms via SystemTime). The cell-fold does NOT depend on it:
+# `VersionEntry.recorded_at` is a logical monotonic stamp, so the chain is
+# host-clock-free on every target. This feature only makes `now` available
+# to domains that explicitly model time. In `default` (native std builds)
+# but deliberately ABSENT from `cloudflare` / `no_std`, where SystemTime
+# panics (wasm32 has no Date.now import) or is unavailable (kernel) — those
+# builds get the total, panic-free `now`-returns-Bottom path.
+wall-clock = []
+default = ["wit", "debug-def", "std-deps", "parallel", "core", "evolution-readings", "imports-readings", "ingest-readings", "ui-readings", "os-readings", "templates", "wall-clock"]
 wit = ["dep:wit-bindgen"]
 # cloudflare: Cloudflare Worker build profile. The worker invokes
 # `wasm-pack build --target bundler --no-default-features --features

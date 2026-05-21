@@ -112,15 +112,13 @@ export function callCellPin(handle: number, cellName: string): number | null {
  * "fetch_cell", name)` that maps the engine's bottom marker to `null`
  * and parses the JSON envelope into a JS value.
  *
- * ## Engine-only contract (#885 / #777 / #887)
+ * ## Engine-only contract (#885 / #777)
  *
  * Worker EntityDB read paths (#765) use this helper to source the
- * cell's contents from the engine's authoritative chain. As of #885
- * the worker is engine-only — the chain IS the version-of-record per
- * AREST.tex §202, §462 eq:cellfold, and there is NO SQL fallback for
- * the productive read path. Callers that observe `null` here route to
- * the worker's in-memory cell graph cache (the read-after-write
- * source within an isolate), not to a SQL SELECT.
+ * cell's contents from the engine's authoritative chain — the chain
+ * IS the version-of-record per AREST.tex §202, §462 eq:cellfold.
+ * Callers that observe `null` here route to the worker's in-memory
+ * cell graph cache, the read-after-write source within an isolate.
  *
  * Returns `null` (NOT throw) when:
  *   - `handle` is out of range / not allocated (engine returns "⊥")
