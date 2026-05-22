@@ -116,13 +116,20 @@ fn arb_transition() -> impl Strategy<Value = Command> {
 // ── Properties ──────────────────────────────────────────────────────
 
 fn must_not_panic(cmd: &Command) -> Result<(), String> {
-    // Empty def + state. The dispatch arms should degrade gracefully
-    // when the noun isn't in `d` (no constraint defs, no SM
-    // transitions). Loading the bundled metamodel would multiply
-    // per-case cost ~50× without changing the panic surface — the
-    // create / update / transition handlers don't depend on which
-    // FactType cells are populated, only on whether the lookup
-    // returns something cleanly.
+    // Empty def + state: this fuzzes the dispatch / deserialisation
+    // surface — graceful degradation when the noun isn't in `d` (no
+    // constraint defs, no SM transitions).
+    //
+    // COVERAGE NOTE (#939): this does NOT cover the metamodel-derivation
+    // path. The prior claim here — that loading the metamodel "would not
+    // change the panic surface" — was DISPROVEN: `apply`'s forward-chain
+    // CAN diverge against the loaded metamodel's derivation rules for an
+    // under-defined noun (value type / no reference scheme / undeclared).
+    // The run-time definedness gate now guards that (createEntity/update
+    // reject before the chain runs); the known cases are pinned by
+    // `create_entity_runtime_definedness_gate` and
+    // `create_undeclared_noun_on_metamodel_rejects_not_hangs`. A
+    // complementary metamodel-apply fuzz is tracked in #939.
     let d = Object::phi();
     let state = Object::phi();
     let result = catch_unwind(AssertUnwindSafe(|| {
