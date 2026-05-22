@@ -9686,6 +9686,37 @@ mod schema_tests {
              got blocked tasks {:?}", blocked_tasks);
     }
 
+    /// #923 diagnosis — does a JOIN-derivation rule (two antecedents joined
+    /// on a shared role) resolve its consequent FT id, or leave it φ? The live
+    /// tasks.db carries `consequentFactTypeId = φ` for the SM→status bridge's
+    /// stage-1 join rule, breaking the projection. This isolates whether the
+    /// CURRENT parser is the cause (code bug) or the live DB is merely stale
+    /// (compiled by an older engine → recompile fixes it, no code change).
+    #[test]
+    fn join_iff_rule_resolves_consequent_fact_type_id_923() {
+        let src = "\
+            Resource(.id) is an entity type.\n\
+            State Machine(.id) is an entity type.\n\
+            Status is a value type.\n\
+            State Machine is for Resource.\n\
+            State Machine is currently in Status.\n\
+            Resource is currently in Status.\n\
+            * Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let dr_cell = ast::fetch_or_phi("DerivationRule", &state);
+        let consequent_ids: Vec<String> = dr_cell.as_seq()
+            .map(|s| s.iter()
+                .filter_map(|f| ast::binding(f, "consequentFactTypeId").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        eprintln!("[923] join-rule consequentFactTypeIds: {:?}", consequent_ids);
+        assert!(consequent_ids.iter().any(|id| id == "Resource_is_currently_in_Status"),
+            "join-derivation consequent must resolve to Resource_is_currently_in_Status, not φ; got {:?}",
+            consequent_ids);
+    }
+
     /// #866 — unary derivation rule consequent: `Task is parallelizable
     /// iff Task has Task Status 'pending'` declares a unary FT
     /// (`Task is parallelizable`) and a derivation rule whose consequent
