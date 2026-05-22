@@ -3180,6 +3180,21 @@ mod handle_isolation_tests {
         release_impl(h_new);
     }
 
+    /// #hang regression — createEntity for an undeclared noun against the
+    /// FULL bundled metamodel must reject up front via the run-time
+    /// definedness gate, NOT drive resolve/derivations into a
+    /// non-terminating expansion. If the gate regresses, this test hangs
+    /// (caught by the harness timeout) instead of asserting cleanly.
+    #[test]
+    fn create_undeclared_noun_on_metamodel_rejects_not_hangs() {
+        let h = create_impl();
+        let r = system_impl(h, "apply", r#"{"command":{"type":"createEntity","noun":"Gadget","domain":"","id":"g-1","fields":{"color":"red"}},"population":""}"#);
+        assert!(r.contains("\"rejected\":true"),
+            "undeclared noun must reject; got: {}", &r[..r.len().min(200)]);
+        assert!(r.contains("not_runtime_defined"),
+            "reject must carry the run-time definedness violation; got: {}", &r[..r.len().min(200)]);
+    }
+
     /// create_impl loads the bundled metamodel, so a fresh handle MUST
     /// have a populated Noun cell (from core.md at minimum).
     #[test]

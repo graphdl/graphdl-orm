@@ -898,35 +898,41 @@ fn create_via_defs(
     // snapshot generate distinct ids only because the second runs
     // against a state augmented by the first via merge_delta at the
     // commit boundary; within a single call the count is stable.
-    // Hardening: a noun DECLARED as a non-entity object type cannot be
-    // instantiated. Only entity types have instances (ORM 2); a value type is
-    // a value domain. Applying createEntity for a declared value type yields a
-    // malformed population that a metamodel derivation rule explodes/loops
-    // over inside the forward-chain — the bundled metamodel carries `Order` as
-    // objectType="value", and `createEntity Order` hung the engine
-    // indefinitely (6+ GB, no termination). Reject up front as an alethic
-    // violation. (An UNDECLARED noun is left to the normal path — minimal /
-    // rule-free states legitimately create ad-hoc entities without a hang;
-    // the explosion needs a declared value type that the derivation rules
-    // reference.)
-    let declared_non_entity = [state, d].iter().any(|src|
+    // Run-time definedness gate. Instantiating an entity is a RUN-TIME
+    // operation: it requires a fully-defined entity type — declared
+    // objectType="entity" WITH a reference scheme (its identity). You MAY
+    // *define* an entity without a reference scheme, or a graph schema whose
+    // roles aren't yet connected to entities; those are valid design-time
+    // shapes. But they are not run-time shapes — createEntity over a noun
+    // with no identity has nothing for resolve to ground and drives the
+    // resolve/derivation evaluation into a non-terminating expansion (the
+    // bundled metamodel's `Order` is objectType="value", and an undeclared
+    // noun has no scheme at all — both hung the engine, 6+ GB, no return).
+    // Refuse up front as an alethic violation so derivations never run over
+    // an under-defined noun. (`compile` stays permissive — see compile.rs;
+    // incomplete definitions remain legal at define-time.)
+    let runtime_defined = [state, d].iter().any(|src|
         ast::fetch_or_phi("Noun", src).as_seq().map_or(false, |fs|
             fs.iter().any(|f|
                 ast::binding(f, "name") == Some(noun)
-                    && ast::binding(f, "objectType").map_or(false, |ot| ot != "entity"))));
-    if declared_non_entity {
+                    && ast::binding(f, "objectType") == Some("entity")
+                    && ast::binding(f, "referenceScheme").map_or(false, |rs| !rs.is_empty()))));
+    if !runtime_defined {
         return CommandResult {
             entities: alloc::vec![],
             status: None,
             transitions: alloc::vec![],
             navigation: alloc::vec![],
             violations: alloc::vec![crate::types::Violation {
-                constraint_id: alloc::format!("create.not_entity_type:{}", noun),
+                constraint_id: alloc::format!("create.not_runtime_defined:{}", noun),
                 constraint_text: alloc::format!(
-                    "Only an entity type can be created; '{}' is not a declared entity type",
+                    "'{}' is not a fully-defined entity type; an entity needs a reference \
+                     scheme (identity) before it can be instantiated",
                     noun),
                 detail: alloc::format!(
-                    "createEntity rejected: noun '{}' is not declared with objectType 'entity'",
+                    "createEntity rejected at run-time: noun '{}' must be declared with \
+                     objectType 'entity' and a reference scheme (it may be defined without \
+                     one, but not instantiated)",
                     noun),
                 alethic: true,
             }],
@@ -4059,6 +4065,14 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
     #[test]
     fn create_entity_without_state_machine() {
         let (def_map, state) = setup_order_defs();
+        // Category is an entity type with no state machine. Declaring it (with
+        // a reference scheme) makes it a valid run-time shape — an SM-less
+        // entity, distinct from an under-defined noun the run-time gate refuses.
+        let state = ast::cell_push(
+            "Noun",
+            ast::fact_from_pairs(&[("name", "Category"), ("objectType", "entity"), ("referenceScheme", "id")]),
+            &state,
+        );
 
         let mut fields = HashMap::new();
         fields.insert("name".to_string(), "Electronics".to_string());
@@ -4079,35 +4093,44 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         assert!(result.transitions.is_empty());
     }
 
-    /// Hardening regression: a value type is not instantiable (ORM 2 — only
-    /// entity types have instances). `createEntity` for a noun declared
-    /// objectType="value" MUST reject with an alethic violation, not chain
-    /// over an ill-formed population. (The bundled metamodel carries `Order`
-    /// as a value type; `createEntity Order` previously drove a metamodel
-    /// derivation rule into a non-terminating forward-chain — 6+ GB, no
-    /// return. This pins the up-front reject.)
+    /// Hardening regression — the run-time definedness gate. Instantiating an
+    /// entity is a run-time operation requiring a fully-defined entity type
+    /// (objectType="entity" WITH a reference scheme). A value type, an
+    /// undeclared noun, and an entity declared without a reference scheme are
+    /// all valid *design-time* shapes but NOT run-time ones: createEntity over
+    /// them previously drove resolve / the derivation forward-chain into a
+    /// non-terminating expansion (6+ GB, no return). Each must reject up front,
+    /// so derivations never run over an under-defined noun.
     #[test]
-    fn create_entity_rejects_value_type_noun() {
+    fn create_entity_runtime_definedness_gate() {
         let (def_map, _state) = setup_order_defs();
-        let state = ast::cell_push(
-            "Noun",
-            ast::fact_from_pairs(&[("name", "Color"), ("objectType", "value")]),
-            &ast::Object::phi(),
-        );
-        let cmd = Command::CreateEntity {
-            noun: "Color".to_string(),
-            domain: "d".to_string(),
-            id: Some("red".to_string()),
-            fields: HashMap::new(),
-            sender: None,
-            signature: None,
+        let noun_state = |pairs: &[(&str, &str)]| {
+            ast::cell_push("Noun", ast::fact_from_pairs(pairs), &ast::Object::phi())
         };
-        let result = apply_command_defs(&def_map, &cmd, &state);
-        assert!(result.rejected, "createEntity for a value type must reject, not hang");
-        assert!(
-            result.violations.iter().any(|v| v.constraint_id.contains("not_entity_type")),
-            "rejection must carry the not_entity_type violation; got {:?}", result.violations);
-        assert!(result.entities.is_empty(), "no entity is created for a value type");
+        let try_create = |noun: &str, state: &ast::Object| {
+            apply_command_defs(&def_map, &Command::CreateEntity {
+                noun: noun.to_string(), domain: "d".to_string(),
+                id: Some("x".to_string()), fields: HashMap::new(),
+                sender: None, signature: None,
+            }, state)
+        };
+        let rejected_undefined = |r: &CommandResult| {
+            r.rejected && r.entities.is_empty()
+                && r.violations.iter().any(|v| v.constraint_id.contains("not_runtime_defined"))
+        };
+
+        // value type → reject (a value type is a domain, not instantiable)
+        let r = try_create("Color", &noun_state(&[("name", "Color"), ("objectType", "value")]));
+        assert!(rejected_undefined(&r), "value type must reject; got {:?}", r.violations);
+
+        // undeclared noun → reject up front (gate fires before resolve, so no hang)
+        let r = try_create("Gadget", &ast::Object::phi());
+        assert!(rejected_undefined(&r), "undeclared noun must reject, not hang; got {:?}", r.violations);
+
+        // entity declared WITHOUT a reference scheme → definable, not instantiable
+        let r = try_create("Sketch", &noun_state(&[("name", "Sketch"), ("objectType", "entity")]));
+        assert!(rejected_undefined(&r),
+            "entity without a reference scheme must reject at run-time; got {:?}", r.violations);
     }
 
     // ── task-735 — auto-increment id reconciles both schemes ──────────

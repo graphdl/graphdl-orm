@@ -10151,7 +10151,16 @@ mod tests {
     /// per-field cells under that fallback name so `__state_delta` is
     /// observably non-empty.
     fn apply_command_phi_state() -> Object {
-        Object::phi()
+        // These tests instantiate `Person`. createEntity is a run-time op and
+        // requires a fully-defined entity type (objectType="entity" + a
+        // reference scheme), so the minimal state DECLARES Person — exactly as
+        // a real domain declares its entities before any are created. (Run-time
+        // definedness gate, see command.rs create_via_defs.)
+        cell_push(
+            "Noun",
+            fact_from_pairs(&[("name", "Person"), ("objectType", "entity"), ("referenceScheme", "id")]),
+            &Object::phi(),
+        )
     }
 
     #[test]
