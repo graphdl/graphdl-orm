@@ -550,14 +550,20 @@ pub fn remove_rows_by_binding(
         return state.clone();
     }
     let existing = crate::ast::fetch_or_phi(cell, state);
-    let rows = match existing.as_seq() {
-        Some(rows) => rows,
-        None => return state.clone(),
-    };
+    // #940/#932: cell_facts_iter handles BOTH Seq and Map cells. as_seq()
+    // returns None for a Map (keyed storage) and silently no-ops the removal
+    // — which let stale φ-consequent derivation rules survive a reload (the
+    // persisted DerivationRule cell is Map-shaped, so the pt1 stale-rule drop
+    // never fired and the stale rule shadowed the freshly-resolved one).
+    let rows: Vec<&Object> = crate::ast::cell_facts_iter(&existing).collect();
+    if rows.is_empty() {
+        return state.clone();
+    }
+    let row_count = rows.len();
     use hashbrown::HashSet;
     let drop_set: HashSet<&str> = values.iter().map(|s| s.as_str()).collect();
     let kept: Vec<Object> = rows
-        .iter()
+        .into_iter()
         .filter(|f| {
             !crate::ast::binding(f, key)
                 .map(|v| drop_set.contains(v))
@@ -565,7 +571,7 @@ pub fn remove_rows_by_binding(
         })
         .cloned()
         .collect();
-    if kept.len() == rows.len() {
+    if kept.len() == row_count {
         return state.clone();
     }
     crate::ast::store(cell, Object::Seq(kept.into()), state)
@@ -694,7 +700,7 @@ pub fn load_reading(
         .as_seq()
         .map(|rules| {
             rules.iter()
-                .filter_map(|r| ast::binding(r, "ruleId").map(alloc::string::String::from))
+                .filter_map(|r| ast::binding(r, "id").map(alloc::string::String::from))
                 .collect()
         })
         .unwrap_or_default();
@@ -702,7 +708,7 @@ pub fn load_reading(
     let merge_target: &Object = if reingested_rule_ids.is_empty() {
         state
     } else {
-        let mut s = remove_rows_by_binding(state, "DerivationRule", "ruleId", &reingested_rule_ids);
+        let mut s = remove_rows_by_binding(state, "DerivationRule", "id", &reingested_rule_ids);
         for rule_id in &reingested_rule_ids {
             s = remove_cell(&s, &alloc::format!("derivation:{}", rule_id));
         }

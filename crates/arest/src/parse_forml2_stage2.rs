@@ -5025,18 +5025,26 @@ pub fn parse_to_state_via_stage12_with_context(
             .filter_map(|f| binding(f, "name").map(String::from))
             .collect())
         .unwrap_or_default();
-    let extra_ft_ids: Vec<String> = fetch_or_phi("FactType", ctx).as_seq()
-        .map(|facts| facts.iter()
-            .filter_map(|f| binding(f, "id").map(String::from))
-            .collect())
-        .unwrap_or_default();
-    parse_to_state_via_stage12_impl(text, &extra_nouns, &extra_ft_ids)
+    // #940 pt2: thread the FULL context FactType facts (id + reading),
+    // not just ids — derivation-rule consequent resolution
+    // (`resolve_consequent_fact_type_id`) matches the consequent against
+    // FactType *readings*, so a consequent FT that lives only in the
+    // context (e.g. the metamodel) needs its reading available or it
+    // resolves to "" (φ). Ids are still derived from these facts below.
+    // Use cell_facts_iter (NOT as_seq) so a Map-shaped FactType cell
+    // (#932 storage duality) is read too — as_seq() silently yields []
+    // for a keyed cell, which made this threading a no-op.
+    let ft_cell = fetch_or_phi("FactType", ctx);
+    let extra_ft_facts: Vec<Object> = crate::ast::cell_facts_iter(&ft_cell)
+        .cloned()
+        .collect();
+    parse_to_state_via_stage12_impl(text, &extra_nouns, &extra_ft_facts)
 }
 
 fn parse_to_state_via_stage12_impl(
     text: &str,
     extra_nouns: &[String],
-    extra_ft_ids: &[String],
+    extra_ft_facts: &[Object],
 ) -> Result<Object, String> {
     // Trace gate — std-host reads `AREST_STAGE12_TRACE`; no_std builds
     // compile out the trace branches entirely.
@@ -5273,8 +5281,17 @@ fn parse_to_state_via_stage12_impl(
     // role (legacy quirk preserved for byte-level parity).
     constraint_facts = tt!("enrich_spans",
         enrich_constraints_with_spans(&constraint_facts, &role_facts));
+    // #940 pt2: consequent resolution must see CONTEXT fact types too, not
+    // just the in-text ones. A rule whose consequent FT lives in the
+    // caller-supplied context (e.g. the metamodel's `Resource is currently
+    // in Status`, not re-declared in this reading) otherwise resolves to ""
+    // (φ) — the task-923/940 reload symptom. Combine for resolution ONLY;
+    // `ft_facts` stays in-text so the output FactType cell is not polluted
+    // with context FTs (those arrive via merge from `d`).
+    let ft_facts_with_ctx: Vec<Object> = ft_facts.iter().cloned()
+        .chain(extra_ft_facts.iter().cloned()).collect();
     let derivation_facts = tt!("derivation",
-        translate_derivation_rules_with_matrix(&classified, &idx, &conditional_matrix, &ft_facts));
+        translate_derivation_rules_with_matrix(&classified, &idx, &conditional_matrix, &ft_facts_with_ctx));
     let unresolved_clause_facts = tt!("unresolved",
         translate_unresolved_clauses(&classified, &idx, &ft_facts));
     let mut declared_ft_ids: Vec<String> = ft_facts.iter()
@@ -5290,9 +5307,10 @@ fn parse_to_state_via_stage12_impl(
     // canonical resolution working across context boundaries — the
     // downstream cell-driven SM compiler (#761 et al.) reads
     // `State_Machine_Definition_is_for_Noun` and finds populated facts.
-    for id in extra_ft_ids {
-        if !declared_ft_ids.iter().any(|existing| existing == id) {
-            declared_ft_ids.push(id.clone());
+    for ft in extra_ft_facts {
+        let Some(id) = binding(ft, "id") else { continue };
+        if !declared_ft_ids.iter().any(|existing| existing.as_str() == id) {
+            declared_ft_ids.push(id.to_string());
         }
     }
     let mut instance_fact_facts = tt!("instance_facts",
