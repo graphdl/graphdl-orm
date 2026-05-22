@@ -871,6 +871,23 @@ fn auto_generate_entity_id(noun: &str, state: &ast::Object) -> String {
 /// -- any alethic constraint touching User facts (e.g. "Each Order is created
 /// by exactly one User") will fire if identity is missing. No procedural
 /// middleware. Per AREST §8.
+
+/// Run-time definedness predicate. A noun may be instantiated or mutated at
+/// run-time only if it is a fully-defined entity type — declared
+/// objectType="entity" WITH a reference scheme (its identity). A value type,
+/// an undeclared noun, or an entity declared without a reference scheme are
+/// valid *design-time* shapes but NOT run-time ones: a derivation
+/// forward-chain over them has no identity to ground and can diverge. Gates
+/// createEntity and updateEntity; `compile` stays permissive at design-time.
+fn noun_runtime_defined(noun: &str, state: &ast::Object, d: &ast::Object) -> bool {
+    [state, d].iter().any(|src|
+        ast::fetch_or_phi("Noun", src).as_seq().map_or(false, |fs|
+            fs.iter().any(|f|
+                ast::binding(f, "name") == Some(noun)
+                    && ast::binding(f, "objectType") == Some("entity")
+                    && ast::binding(f, "referenceScheme").map_or(false, |rs| !rs.is_empty()))))
+}
+
 fn create_via_defs(
     d: &ast::Object,
     noun: &str,
@@ -911,13 +928,7 @@ fn create_via_defs(
     // Refuse up front as an alethic violation so derivations never run over
     // an under-defined noun. (`compile` stays permissive — see compile.rs;
     // incomplete definitions remain legal at define-time.)
-    let runtime_defined = [state, d].iter().any(|src|
-        ast::fetch_or_phi("Noun", src).as_seq().map_or(false, |fs|
-            fs.iter().any(|f|
-                ast::binding(f, "name") == Some(noun)
-                    && ast::binding(f, "objectType") == Some("entity")
-                    && ast::binding(f, "referenceScheme").map_or(false, |rs| !rs.is_empty()))));
-    if !runtime_defined {
+    if !noun_runtime_defined(noun, state, d) {
         return CommandResult {
             entities: alloc::vec![],
             status: None,
@@ -2316,6 +2327,36 @@ fn update_via_defs(
     force: bool,
     state: &ast::Object,
 ) -> CommandResult {
+    // Run-time definedness gate (task 938, shared with create_via_defs).
+    // updateEntity is a run-time mutation; an under-defined noun (value type /
+    // no reference scheme / undeclared) has nothing for the derivation
+    // forward-chain to ground and can drive it into a non-terminating
+    // expansion. Refuse up front as an alethic violation, before resolve or
+    // any derivation runs.
+    if !noun_runtime_defined(noun, state, d) {
+        return CommandResult {
+            entities: alloc::vec![],
+            status: None,
+            transitions: alloc::vec![],
+            navigation: alloc::vec![],
+            violations: alloc::vec![crate::types::Violation {
+                constraint_id: alloc::format!("update.not_runtime_defined:{}", noun),
+                constraint_text: alloc::format!(
+                    "'{}' is not a fully-defined entity type; an entity needs a reference \
+                     scheme (identity) before it can be updated",
+                    noun),
+                detail: alloc::format!(
+                    "updateEntity rejected at run-time: noun '{}' must be declared with \
+                     objectType 'entity' and a reference scheme",
+                    noun),
+                alethic: true,
+            }],
+            derived_count: 0,
+            rejected: true,
+            state: ast::Object::phi(),
+        };
+    }
+
     // task-861 / #904 — SM-bypass guard. When the noun has a State
     // Machine bound to it AND the update payload sets the SM's
     // status-role field (by convention `{noun} Status`, e.g.
@@ -4131,6 +4172,34 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         let r = try_create("Sketch", &noun_state(&[("name", "Sketch"), ("objectType", "entity")]));
         assert!(rejected_undefined(&r),
             "entity without a reference scheme must reject at run-time; got {:?}", r.violations);
+    }
+
+    /// Hardening regression (task 938) — updateEntity is gated the same way as
+    /// createEntity: an under-defined noun (here a value type) is refused at
+    /// run-time, before the derivation forward-chain can diverge over it.
+    #[test]
+    fn update_entity_runtime_definedness_gate() {
+        let (def_map, _state) = setup_order_defs();
+        let state = ast::cell_push(
+            "Noun",
+            ast::fact_from_pairs(&[("name", "Color"), ("objectType", "value")]),
+            &ast::Object::phi(),
+        );
+        let mut fields = HashMap::new();
+        fields.insert("hue".to_string(), "crimson".to_string());
+        let result = apply_command_defs(&def_map, &Command::UpdateEntity {
+            noun: "Color".to_string(),
+            domain: "d".to_string(),
+            entity_id: "c1".to_string(),
+            fields,
+            force: false,
+            sender: None,
+            signature: None,
+        }, &state);
+        assert!(result.rejected && result.entities.is_empty(),
+            "updateEntity for a value type must reject; got {:?}", result.violations);
+        assert!(result.violations.iter().any(|v| v.constraint_id.contains("not_runtime_defined")),
+            "rejection must carry the not_runtime_defined violation; got {:?}", result.violations);
     }
 
     // ── task-735 — auto-increment id reconciles both schemes ──────────
