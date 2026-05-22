@@ -677,8 +677,41 @@ pub fn load_reading(
         Err(e) => return Err(LoadError::ParseError(e)),
     };
 
+    // Step 3b (#940 / cor:closure — Closure Under Self-Modification): a
+    // re-ingested reading's freshly-compiled derivation rules MUST replace
+    // their prior compiled forms — AREST.tex's proof says new definitions
+    // enter DEFS via ↓DEFS, which overwrites by name. But `merge_states`'
+    // `concat_dedup` keeps the FIRST (existing) entry on `ruleId` match, so a
+    // stale-compiled rule (e.g. a φ consequent left by an older engine, the
+    // task-923 symptom) would SURVIVE a reload unchanged. Drop the prior
+    // `DerivationRule` rows + `derivation:*` defs that THIS parse re-declares
+    // (keyed by the fresh parse's rule ids) before merge, so the fresh
+    // compile wins. Targeted to derivation rules only: Noun / FactType
+    // keep-first (the rich-vs-reference dedup) is intentional and preserved.
+    // Mirrors the unload-Migrate drop, keyed by the parse instead of a stored
+    // manifest.
+    let reingested_rule_ids: Vec<String> = ast::fetch_or_phi("DerivationRule", &parsed)
+        .as_seq()
+        .map(|rules| {
+            rules.iter()
+                .filter_map(|r| ast::binding(r, "ruleId").map(alloc::string::String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let base_state;
+    let merge_target: &Object = if reingested_rule_ids.is_empty() {
+        state
+    } else {
+        let mut s = remove_rows_by_binding(state, "DerivationRule", "ruleId", &reingested_rule_ids);
+        for rule_id in &reingested_rule_ids {
+            s = remove_cell(&s, &alloc::format!("derivation:{}", rule_id));
+        }
+        base_state = s;
+        &base_state
+    };
+
     // Step 4: merge into scratch state.
-    let scratch = ast::merge_states(state, &parsed);
+    let scratch = ast::merge_states(merge_target, &parsed);
 
     // Step 5: load-time deontic + alethic validation gate (#559 /
     // DynRdg-5).
