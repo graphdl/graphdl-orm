@@ -898,6 +898,43 @@ fn create_via_defs(
     // snapshot generate distinct ids only because the second runs
     // against a state augmented by the first via merge_delta at the
     // commit boundary; within a single call the count is stable.
+    // Hardening: a noun DECLARED as a non-entity object type cannot be
+    // instantiated. Only entity types have instances (ORM 2); a value type is
+    // a value domain. Applying createEntity for a declared value type yields a
+    // malformed population that a metamodel derivation rule explodes/loops
+    // over inside the forward-chain — the bundled metamodel carries `Order` as
+    // objectType="value", and `createEntity Order` hung the engine
+    // indefinitely (6+ GB, no termination). Reject up front as an alethic
+    // violation. (An UNDECLARED noun is left to the normal path — minimal /
+    // rule-free states legitimately create ad-hoc entities without a hang;
+    // the explosion needs a declared value type that the derivation rules
+    // reference.)
+    let declared_non_entity = [state, d].iter().any(|src|
+        ast::fetch_or_phi("Noun", src).as_seq().map_or(false, |fs|
+            fs.iter().any(|f|
+                ast::binding(f, "name") == Some(noun)
+                    && ast::binding(f, "objectType").map_or(false, |ot| ot != "entity"))));
+    if declared_non_entity {
+        return CommandResult {
+            entities: alloc::vec![],
+            status: None,
+            transitions: alloc::vec![],
+            navigation: alloc::vec![],
+            violations: alloc::vec![crate::types::Violation {
+                constraint_id: alloc::format!("create.not_entity_type:{}", noun),
+                constraint_text: alloc::format!(
+                    "Only an entity type can be created; '{}' is not a declared entity type",
+                    noun),
+                detail: alloc::format!(
+                    "createEntity rejected: noun '{}' is not declared with objectType 'entity'",
+                    noun),
+                alethic: true,
+            }],
+            derived_count: 0,
+            rejected: true,
+            state: ast::Object::phi(),
+        };
+    }
     let entity_id = explicit_id.unwrap_or("").to_string();
     let explicit_id_provided = !entity_id.is_empty();
     let entity_id = if entity_id.is_empty() {
@@ -1262,6 +1299,16 @@ fn create_via_defs(
             // The transitions:{noun} def returns <<from, to, event>, ...>.
             let transitions_key = format!("transitions:{}", noun);
             let mut advanced = true;
+            // Cycle guard: a finite SM has finitely many statuses. Positive-
+            // guard auto-advance walks `current` along satisfied transitions;
+            // if the guard graph cycles (a transition leads back to an already-
+            // visited status whose guard stays satisfied), `advanced` never
+            // settles and this loop spins forever — apply must never hang.
+            // Track visited statuses; halt the first time we would revisit one.
+            // (Without this, createEntity against a metamodel SM whose positive-
+            // guard graph cycles hung the engine indefinitely.)
+            let mut visited: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+            visited.insert(current.clone());
             while advanced {
                 advanced = false;
                 let available = ast::apply(
@@ -1322,7 +1369,14 @@ fn create_via_defs(
                             diag!("[sm:guard] {} --{}--> {}", current, event_type, target);
                             current = target.to_string();
                             advanced = true;
-                            break; // restart from new status
+                            // Cycle guard (see above): if this status was
+                            // already visited, the positive-guard graph cycles
+                            // — halt rather than spin forever.
+                            if !visited.insert(current.clone()) {
+                                diag!("[sm:guard] cycle at status '{}' — halting auto-advance", current);
+                                advanced = false;
+                            }
+                            break; // restart from new status (or exit on cycle)
                         }
                     }
                 }
@@ -4023,6 +4077,37 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         assert_eq!(result.entities.len(), 1);
         assert!(result.status.is_none());
         assert!(result.transitions.is_empty());
+    }
+
+    /// Hardening regression: a value type is not instantiable (ORM 2 — only
+    /// entity types have instances). `createEntity` for a noun declared
+    /// objectType="value" MUST reject with an alethic violation, not chain
+    /// over an ill-formed population. (The bundled metamodel carries `Order`
+    /// as a value type; `createEntity Order` previously drove a metamodel
+    /// derivation rule into a non-terminating forward-chain — 6+ GB, no
+    /// return. This pins the up-front reject.)
+    #[test]
+    fn create_entity_rejects_value_type_noun() {
+        let (def_map, _state) = setup_order_defs();
+        let state = ast::cell_push(
+            "Noun",
+            ast::fact_from_pairs(&[("name", "Color"), ("objectType", "value")]),
+            &ast::Object::phi(),
+        );
+        let cmd = Command::CreateEntity {
+            noun: "Color".to_string(),
+            domain: "d".to_string(),
+            id: Some("red".to_string()),
+            fields: HashMap::new(),
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_map, &cmd, &state);
+        assert!(result.rejected, "createEntity for a value type must reject, not hang");
+        assert!(
+            result.violations.iter().any(|v| v.constraint_id.contains("not_entity_type")),
+            "rejection must carry the not_entity_type violation; got {:?}", result.violations);
+        assert!(result.entities.is_empty(), "no entity is created for a value type");
     }
 
     // ── task-735 — auto-increment id reconciles both schemes ──────────
