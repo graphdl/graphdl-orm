@@ -20,7 +20,7 @@
 // FFP lowering can push per-layer logic (`ApplyToAll`, `Filter`,
 // `Selector`) down into the leaves over time.
 
-use crate::ast::{Object, binding, fetch_or_phi, Func};
+use crate::ast::{Object, binding, fetch_cell_seq, Func};
 use crate::parse_forml2::parse_to_state;
 use crate::naming::atom_id_is_valid;
 #[allow(unused_imports)]
@@ -176,14 +176,14 @@ pub fn check_readings(text: &str) -> Vec<ReadingDiagnostic> {
 /// paper's §Distributed Evaluation, diagnostics are pure functions
 /// of the cell state; this keeps them that way.
 fn check_unresolved_clauses(state: &Object) -> Vec<ReadingDiagnostic> {
-    let fact_types = fetch_or_phi("FactType", state);
-    let nouns = fetch_or_phi("Noun", state);
+    let fact_types = fetch_cell_seq("FactType", state);
+    let nouns = fetch_cell_seq("Noun", state);
     let noun_names: Vec<String> = nouns.as_seq()
         .map(|facts| facts.iter()
             .filter_map(|n| binding(n, "name").map(String::from))
             .collect())
         .unwrap_or_default();
-    fetch_or_phi("UnresolvedClause", state).as_seq()
+    fetch_cell_seq("UnresolvedClause", state).as_seq()
         .map(|facts| facts.iter().map(|f| {
             let clause = binding(f, "clause").unwrap_or("");
             let reading = binding(f, "ruleText").unwrap_or("");
@@ -241,8 +241,8 @@ fn suggest_similar_fact_types(
 /// Ring constraints (IR/AS/AT/SY/IT/TR/AC/RF) must span roles on a
 /// single noun. A ring with mixed-noun roles is nonsensical.
 fn check_ring_validity(state: &Object) -> Vec<ReadingDiagnostic> {
-    let constraint_cell = fetch_or_phi("Constraint", state);
-    let role_cell = fetch_or_phi("Role", state);
+    let constraint_cell = fetch_cell_seq("Constraint", state);
+    let role_cell = fetch_cell_seq("Role", state);
     constraint_cell.as_seq()
         .map(|facts| facts.iter()
             .filter(|c| is_ring_kind(binding(c, "kind").unwrap_or("")))
@@ -300,10 +300,10 @@ fn check_ring_validity(state: &Object) -> Vec<ReadingDiagnostic> {
 /// `check_readings(user_text)` call with no metamodel context) it
 /// falls back to `boot()` which preserves the legacy behaviour.
 fn check_ring_completeness(state: &Object) -> Vec<ReadingDiagnostic> {
-    let ft_cell = fetch_or_phi("FactType", state);
-    let role_cell = fetch_or_phi("Role", state);
-    let constraint_cell = fetch_or_phi("Constraint", state);
-    let noun_names: Vec<String> = fetch_or_phi("Noun", state).as_seq()
+    let ft_cell = fetch_cell_seq("FactType", state);
+    let role_cell = fetch_cell_seq("Role", state);
+    let constraint_cell = fetch_cell_seq("Constraint", state);
+    let noun_names: Vec<String> = fetch_cell_seq("Noun", state).as_seq()
         .map(|ns| ns.iter()
             .filter_map(|n| binding(n, "name").map(|s| s.to_string()))
             .collect())
@@ -409,7 +409,7 @@ impl RingCompletenessSuppression {
     /// to `boot()` so legacy callers without the metamodel context
     /// continue to behave as before.
     fn from_state(state: &Object) -> Self {
-        let constraint_cell = fetch_or_phi("Constraint", state);
+        let constraint_cell = fetch_cell_seq("Constraint", state);
         let perm_texts: Vec<&str> = constraint_cell.as_seq()
             .map(|cs| cs.iter()
                 .filter(|c| binding(c, "deonticOperator") == Some("permitted"))
@@ -516,14 +516,14 @@ fn check_atom_ids(state: &Object) -> Vec<ReadingDiagnostic> {
     // type. Suggested Prompt has Prompt Icon.`) carry content, not an
     // identifier, so emoji / non-ASCII object values in those slots
     // are intentional and must not trip the atom-id check.
-    let value_type_nouns: hashbrown::HashSet<String> = fetch_or_phi("Noun", state).as_seq()
+    let value_type_nouns: hashbrown::HashSet<String> = fetch_cell_seq("Noun", state).as_seq()
         .map(|ns| ns.iter()
             .filter(|n| binding(n, "objectType") == Some("value"))
             .filter_map(|n| binding(n, "name").map(|s| s.to_string()))
             .collect())
         .unwrap_or_default();
 
-    fetch_or_phi("InstanceFact", state).as_seq()
+    fetch_cell_seq("InstanceFact", state).as_seq()
         .map(|facts| facts.iter().flat_map(|f| {
             let subject_noun = binding(f, "subjectNoun").unwrap_or("").to_string();
             let subject_value = binding(f, "subjectValue").unwrap_or("").to_string();
@@ -576,6 +576,7 @@ fn is_ring_kind(k: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::fetch_or_phi;
 
     #[test]
     fn clean_readings_produce_no_diagnostics() {

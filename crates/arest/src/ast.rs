@@ -4534,6 +4534,23 @@ pub fn cell_facts_iter(contents: &Object) -> alloc::boxed::Box<dyn Iterator<Item
     }
 }
 
+/// Read a cell's facts as a Seq Object regardless of stored shape (#932).
+/// A Map-backed (keyed) cell is normalized to a Seq of its values so a
+/// legacy `.as_seq()` reader keeps working as cells flip to Map storage
+/// (the silent-no-op bug class fixed in #940); Seq / Bottom / Atom pass
+/// through unchanged. Lets a cell-read site convert by a mechanical 1:1
+/// swap `fetch_or_phi(name, state).as_seq()` -> `fetch_cell_seq(name,
+/// state).as_seq()` with no downstream restructuring. Iterator sibling:
+/// `cell_facts_iter`. Transitional — phase-2 all-Map storage retires it.
+pub fn fetch_cell_seq(name: &str, state: &Object) -> Object {
+    let cell = fetch_or_phi(name, state);
+    if matches!(cell, Object::Map(_)) {
+        Object::seq(cell_facts_iter(&cell).cloned().collect())
+    } else {
+        cell
+    }
+}
+
 /// task-930 v2: classify the `state` operand of `Func::Fetch` /
 /// `Func::FetchOrPhi`. Two shapes flow through these primitives:
 ///
