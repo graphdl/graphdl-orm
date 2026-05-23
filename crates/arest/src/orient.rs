@@ -320,7 +320,9 @@ fn recent_changes(state: &Object) -> Vec<Value> {
         if name.contains(':') {
             continue;
         }
-        let Some(facts) = contents.as_seq() else { continue };
+        // #932 phase-2: collect via cell_facts_iter so a folded (Map)
+        // cell is counted too, not skipped as a non-Seq.
+        let facts: Vec<_> = crate::ast::cell_facts_iter(contents).collect();
         if facts.is_empty() {
             continue;
         }

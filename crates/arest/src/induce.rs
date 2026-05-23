@@ -189,8 +189,9 @@ fn entity_population_for_noun(state: &Object, noun_name: &str) -> Vec<String> {
         _ => Vec::new(),
     };
     for (_cell_name, contents) in cells.iter() {
-        let Some(facts) = contents.as_seq() else { continue };
-        for fact in facts.iter() {
+        // #932 phase-2: cell_facts_iter so a folded (Map) cell's facts
+        // join the entity-population scan too (not just Seq cells).
+        for fact in crate::ast::cell_facts_iter(contents) {
             // Per-FT projection shape: binding key IS the noun name.
             if let Some(v) = binding(fact, noun_name) {
                 push_unique(v, &mut seen);

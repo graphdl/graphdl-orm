@@ -770,8 +770,10 @@ fn auto_generate_entity_id(noun: &str, state: &ast::Object) -> String {
     // entity discovery — same identity discovery, same scan surface.
     let mut seen: hashbrown::HashSet<String> = hashbrown::HashSet::new();
     for (_, contents) in ast::cells_iter(state) {
-        let facts = match contents.as_seq() { Some(s) => s, None => continue };
-        for fact in facts.iter() {
+        // #932 phase-2: cell_facts_iter so a folded (Map) cell's entity
+        // ids are scanned too — auto-increment must see them, not skip
+        // them (the raw-as_seq()-skips-Map bug class).
+        for fact in ast::cell_facts_iter(contents) {
             let pairs = match fact.as_seq() { Some(p) => p, None => continue };
             for pair in pairs.iter() {
                 let kv = match pair.as_seq() { Some(s) => s, None => continue };
@@ -2473,7 +2475,7 @@ fn update_via_defs(
             // — the exact noise the pre-fix merge swept up.
             name.starts_with(&alloc::format!("{}_has_", noun))
         })
-        .flat_map(|(_, contents)| contents.as_seq().into_iter().flat_map(|facts| facts.to_vec()))
+        .flat_map(|(_, contents)| ast::cell_facts_iter(contents).cloned().collect::<Vec<_>>())
         .filter_map(|fact| {
             let pairs = fact.as_seq().filter(|p| p.len() >= 2)?;
             let v0 = pairs[0].as_seq().and_then(|p| p.get(1)?.as_atom().map(|s| s.to_string()));
@@ -3853,12 +3855,10 @@ pub fn wine_app_ids(state: &ast::Object) -> Vec<String> {
     if seen.is_empty() {
         // Fallback: scan every cell for `Wine App` subject bindings.
         for (_name, contents) in ast::cells_iter(state) {
-            if let Some(seq) = contents.as_seq() {
-                for fact in seq.iter() {
-                    if let Some(slug) = ast::binding(fact, "Wine App") {
-                        if !slug.is_empty() {
-                            seen.insert(slug.to_string());
-                        }
+            for fact in ast::cell_facts_iter(contents) {
+                if let Some(slug) = ast::binding(fact, "Wine App") {
+                    if !slug.is_empty() {
+                        seen.insert(slug.to_string());
                     }
                 }
             }
@@ -3905,11 +3905,9 @@ pub fn wine_app_display_title(state: &ast::Object, slug: &str) -> Option<String>
             continue;
         }
         let title = &name[prefix.len()..name.len() - 1];
-        if let Some(seq) = contents.as_seq() {
-            for fact in seq.iter() {
-                if ast::binding(fact, "Wine App") == Some(slug) {
-                    return Some(title.to_string());
-                }
+        for fact in ast::cell_facts_iter(contents) {
+            if ast::binding(fact, "Wine App") == Some(slug) {
+                return Some(title.to_string());
             }
         }
     }

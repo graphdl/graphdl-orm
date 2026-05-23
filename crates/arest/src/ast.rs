@@ -3531,8 +3531,9 @@ fn platform_list_noun(noun: &str, d: &Object) -> Object {
     let mut entities: HashMap<String, HashMap<String, String>> = HashMap::new();
 
     cells_iter(&d).iter().for_each(|(_, contents)| {
-        let facts = contents.as_seq().map(|s| s.to_vec()).unwrap_or_default();
-        facts.iter().for_each(|fact| {
+        // #932 phase-2: cell_facts_iter so a folded (Map) cell is scanned
+        // too, not just Seq cells (the raw-as_seq()-skips-Map bug class).
+        cell_facts_iter(contents).for_each(|fact| {
             let pairs = match fact.as_seq() {
                 Some(p) => p.to_vec(),
                 None => return,
@@ -5141,14 +5142,31 @@ pub fn visible_population(state: &Object) -> Object {
     for (cell_name, contents) in cells_iter(state) {
         if cell_name.contains(':') { continue; }
         if cell_name == "MigrationApplication" || cell_name == "Migration" { continue; }
-        let Some(facts) = contents.as_seq() else { continue; };
-        let filtered: Vec<Object> = facts.iter().filter(|f| {
-            let fid = synthesize_fact_id(&cell_name, f);
-            !hidden_ids.contains(&fid)
-        }).cloned().collect();
-        if filtered.len() != facts.len() {
-            out = store(&cell_name, Object::Seq(filtered.into()), &out);
-        }
+        // #932 phase-2: scan via cell_facts_iter (Map-tolerant — the bare
+        // `contents.as_seq()` skipped folded Map cells) and re-store
+        // preserving the cell's shape, so the migration projection never
+        // de-keys a folded (D_n) cell. Skip-unchanged kept to avoid churn.
+        let total = cell_facts_iter(contents).count();
+        let new_contents = match contents {
+            Object::Map(m) => {
+                let kept: HashMap<String, Object> = m
+                    .iter()
+                    .filter(|(_, v)| !hidden_ids.contains(&synthesize_fact_id(&cell_name, v)))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                if kept.len() == total { continue; }
+                Object::Map(kept.into())
+            }
+            _ => {
+                let kept: Vec<Object> = cell_facts_iter(contents)
+                    .filter(|f| !hidden_ids.contains(&synthesize_fact_id(&cell_name, f)))
+                    .cloned()
+                    .collect();
+                if kept.len() == total { continue; }
+                Object::Seq(kept.into())
+            }
+        };
+        out = store(&cell_name, new_contents, &out);
     }
     out
 }

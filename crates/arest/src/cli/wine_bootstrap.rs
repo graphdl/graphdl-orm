@@ -225,11 +225,9 @@ pub fn win64_variant_for(state: &ast::Object, recipe: &str) -> Option<String> {
     for (name, contents) in ast::cells_iter(state) {
         let Some(rest) = name.strip_prefix("has win64- Recipe '") else { continue };
         let Some(r64) = rest.strip_suffix('\'') else { continue };
-        if let Some(seq) = contents.as_seq() {
-            for fact in seq.iter() {
-                if ast::binding(fact, "Required Component Anchor") == Some(&anchor_id) {
-                    return Some(r64.to_string());
-                }
+        for fact in ast::cell_facts_iter(contents) {
+            if ast::binding(fact, "Required Component Anchor") == Some(&anchor_id) {
+                return Some(r64.to_string());
             }
         }
     }
