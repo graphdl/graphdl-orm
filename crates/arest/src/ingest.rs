@@ -37,7 +37,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
-use crate::ast::{binding, fetch_or_phi, Object};
+use crate::ast::{binding, fetch_cell_seq, Object};
 
 // ── Entry point ──────────────────────────────────────────────────────
 
@@ -198,7 +198,7 @@ struct InstFact {
 }
 
 fn read_instance_facts(state: &Object) -> Vec<InstFact> {
-    let cell = fetch_or_phi("InstanceFact", state);
+    let cell = fetch_cell_seq("InstanceFact", state);
     let Some(items) = cell.as_seq() else { return Vec::new() };
     items.iter().filter_map(|f| {
         let mut out = InstFact::default();
@@ -259,7 +259,7 @@ fn harvest_inst_facts_from_readings(state: &Object) -> Vec<InstFact> {
     // the `reading` binding even when it can't fully classify the
     // statement (e.g. SM directives without the metamodel loaded land
     // here as Fact Type Reading).
-    let ft_cell = fetch_or_phi("FactType", state);
+    let ft_cell = fetch_cell_seq("FactType", state);
     if let Some(items) = ft_cell.as_seq() {
         for f in items {
             if let Some(reading) = binding(f, "reading") {
@@ -277,7 +277,7 @@ fn harvest_inst_facts_from_readings(state: &Object) -> Vec<InstFact> {
     // parser dropped (e.g. `Transition 'place' is from Status 'In Cart'`
     // when neither Transition nor Status is a declared noun in the
     // bare engine).
-    let src_cell = fetch_or_phi("_arest_source_text", state);
+    let src_cell = fetch_cell_seq("_arest_source_text", state);
     if let Some(items) = src_cell.as_seq() {
         for f in items {
             if let Some(text) = binding(f, "text") {
@@ -344,8 +344,8 @@ fn directive_pattern_table_compat() -> Vec<DirectivePattern> {
 /// compat list when state's FactType cell has no binary FTs (bare
 /// engine, no metamodel loaded). De-dupes by (subject, verb, object).
 fn directive_patterns_for_state(state: &Object) -> Vec<DirectivePattern> {
-    let ft_cell = fetch_or_phi("FactType", state);
-    let role_cell = fetch_or_phi("Role", state);
+    let ft_cell = fetch_cell_seq("FactType", state);
+    let role_cell = fetch_cell_seq("Role", state);
     let role_facts: Vec<&Object> = role_cell.as_seq()
         .map(|s| s.iter().collect()).unwrap_or_default();
 
@@ -526,7 +526,7 @@ type ReadingAliases = HashMap<String, Vec<String>>;
 
 fn build_reading_aliases(state: &Object) -> ReadingAliases {
     let mut out: ReadingAliases = HashMap::new();
-    let ft_cell = fetch_or_phi("FactType", state);
+    let ft_cell = fetch_cell_seq("FactType", state);
     let Some(items) = ft_cell.as_seq() else { return out };
     for f in items {
         let Some(reading) = binding(f, "reading") else { continue };
@@ -573,7 +573,7 @@ fn resolve_aliases(reading: &str, aliases: &ReadingAliases) -> Vec<String> {
 fn build_supertype_chains(state: &Object) -> HashMap<String, Vec<String>> {
     use alloc::collections::BTreeSet;
     let mut direct: HashMap<String, Vec<String>> = HashMap::new();
-    let cell = fetch_or_phi("Subtype", state);
+    let cell = fetch_cell_seq("Subtype", state);
     if let Some(items) = cell.as_seq() {
         for f in items {
             let Some(sub) = binding(f, "subtype") else { continue };
@@ -585,7 +585,7 @@ fn build_supertype_chains(state: &Object) -> HashMap<String, Vec<String>> {
     // Also harvest from the InstanceFact cell shape produced by the
     // implicit `Noun is subtype of Noun` reading in core.md, which
     // lands as `subjectNoun=Noun, fieldName=is subtype of, objectNoun=Noun`.
-    let inst_cell = fetch_or_phi("InstanceFact", state);
+    let inst_cell = fetch_cell_seq("InstanceFact", state);
     if let Some(items) = inst_cell.as_seq() {
         for f in items {
             let Some(snoun) = binding(f, "subjectNoun") else { continue };
@@ -654,7 +654,7 @@ fn run_subtype_inheritance(
 /// cell is absent.
 fn read_noun_ref_schemes(state: &Object) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
-    let noun_cell = fetch_or_phi("Noun", state);
+    let noun_cell = fetch_cell_seq("Noun", state);
     if let Some(items) = noun_cell.as_seq() {
         for f in items {
             let Some(name) = binding(f, "name") else { continue };
@@ -1192,12 +1192,12 @@ pub fn inspect_to_json(state: &Object) -> String {
 
     // Dump raw FactType readings + Statement_has_Text texts so we can
     // see what the harvester is being given.
-    let ft_readings: Vec<String> = fetch_or_phi("FactType", state).as_seq()
+    let ft_readings: Vec<String> = fetch_cell_seq("FactType", state).as_seq()
         .map(|items| items.iter()
             .filter_map(|f| binding(f, "reading").map(|s| s.to_string()))
             .collect())
         .unwrap_or_default();
-    let stmt_texts: Vec<String> = fetch_or_phi("Statement_has_Text", state).as_seq()
+    let stmt_texts: Vec<String> = fetch_cell_seq("Statement_has_Text", state).as_seq()
         .map(|items| items.iter()
             .filter_map(|f| binding(f, "Text")
                 .or_else(|| binding(f, "text"))

@@ -15,7 +15,7 @@
 #[allow(unused_imports)]
 use alloc::{format, string::{String, ToString}, vec::Vec};
 
-use crate::ast::{binding, fetch_or_phi, Object};
+use crate::ast::{binding, fetch_cell_seq, Object};
 use crate::naming::resolve_slug_to_noun;
 
 /// Handle a HATEOAS read against `state`. Returns `Some(json_bytes)`
@@ -52,7 +52,7 @@ pub fn handle_arest_read(state: &Object, method: &str, path: &str) -> Option<Vec
     }
 
     let noun = resolve_slug_to_noun(state, slug)?;
-    let cell = fetch_or_phi(&noun, state);
+    let cell = fetch_cell_seq(&noun, state);
 
     match id {
         Some(id) if !id.is_empty() => {
@@ -194,7 +194,7 @@ pub fn handle_arest_create_for_slug(
     // (e.g. `/arest/entities/Organization`), not the kebab-pluralised
     // slug. Try noun-name match first; fall back to slug-projection
     // resolution to keep the kernel forgiving.
-    let noun = if crate::ast::fetch_or_phi("Noun", state)
+    let noun = if crate::ast::fetch_cell_seq("Noun", state)
         .as_seq()
         .map(|ns| ns.iter().any(|n| crate::ast::binding(n, "name") == Some(&slug_decoded)))
         .unwrap_or(false)
@@ -276,7 +276,7 @@ pub fn handle_arest_create(
     // Verify the noun is registered. Mirror of the slug resolver's
     // safety net — unknown nouns 404 rather than silently creating
     // a stray cell.
-    let noun_registered = crate::ast::fetch_or_phi("Noun", state)
+    let noun_registered = crate::ast::fetch_cell_seq("Noun", state)
         .as_seq()
         .map(|ns| ns.iter().any(|n| crate::ast::binding(n, "name") == Some(noun_raw)))
         .unwrap_or(false);
@@ -394,7 +394,7 @@ pub fn handle_arest_transition(
     // `handle_arest_create_for_slug` (noun-name match first, then
     // kebab-pluralised slug projection).
     let slug_decoded = percent_decode(slug);
-    let noun = if crate::ast::fetch_or_phi("Noun", state)
+    let noun = if crate::ast::fetch_cell_seq("Noun", state)
         .as_seq()
         .map(|ns| ns.iter().any(|n| crate::ast::binding(n, "name") == Some(&slug_decoded)))
         .unwrap_or(false)
@@ -435,7 +435,7 @@ pub fn handle_arest_transition(
     // role names from StateMachineCellShape::boot() so the single
     // source of truth in command.rs propagates here.
     let sm_shape = crate::command::StateMachineCellShape::boot();
-    let sm_cell = crate::ast::fetch_or_phi(sm_shape.entity_type_label, state);
+    let sm_cell = crate::ast::fetch_cell_seq(sm_shape.entity_type_label, state);
     let sm_seq = sm_cell.as_seq()?;
     let (sm_idx, sm_row) = sm_seq
         .iter()
@@ -449,7 +449,7 @@ pub fn handle_arest_transition(
     // assumes one SM definition per noun (the apis e2e fixture
     // `Support Request → Categorize` is the only flow exercised
     // today), so the scoping reduces to (status, event).
-    let transitions_cell = crate::ast::fetch_or_phi("Transition", state);
+    let transitions_cell = crate::ast::fetch_cell_seq("Transition", state);
     let new_status = transitions_cell
         .as_seq()?
         .iter()
@@ -542,7 +542,7 @@ pub fn handle_arest_transitions_for_entity(
     // Verify the noun is registered (mirror of /transition's check —
     // unknown nouns 404 rather than emit a stub envelope).
     let slug_decoded = percent_decode(slug);
-    let _noun = if crate::ast::fetch_or_phi("Noun", state)
+    let _noun = if crate::ast::fetch_cell_seq("Noun", state)
         .as_seq()
         .map(|ns| ns.iter().any(|n| crate::ast::binding(n, "name") == Some(&slug_decoded)))
         .unwrap_or(false)
@@ -560,7 +560,7 @@ pub fn handle_arest_transitions_for_entity(
     // 404 / fall-through). task-742: pulls names from
     // StateMachineCellShape::boot().
     let sm_shape = crate::command::StateMachineCellShape::boot();
-    let sm_cell = crate::ast::fetch_or_phi(sm_shape.entity_type_label, state);
+    let sm_cell = crate::ast::fetch_cell_seq(sm_shape.entity_type_label, state);
     let sm_seq = sm_cell.as_seq()?;
     let sm_row = sm_seq
         .iter()
@@ -568,7 +568,7 @@ pub fn handle_arest_transitions_for_entity(
     let current_status = crate::ast::binding(sm_row, sm_shape.current_status_role)?.to_string();
 
     // Walk Transition cell for rows whose fromStatus matches.
-    let transitions_cell = crate::ast::fetch_or_phi("Transition", state);
+    let transitions_cell = crate::ast::fetch_cell_seq("Transition", state);
     let mut entries: Vec<(String, String)> = Vec::new();
     if let Some(rows) = transitions_cell.as_seq() {
         for t in rows {
@@ -747,7 +747,7 @@ pub fn parse_stats(state: &Object) -> Vec<u8> {
 }
 
 fn cell_count(state: &Object, name: &str) -> usize {
-    crate::ast::fetch_or_phi(name, state)
+    crate::ast::fetch_cell_seq(name, state)
         .as_seq()
         .map(|s| s.len())
         .unwrap_or(0)
