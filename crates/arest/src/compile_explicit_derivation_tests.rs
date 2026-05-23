@@ -1019,6 +1019,91 @@ Paper Element 'pe-aspirational' has Implementation Mode 'Aspirational'.
         "pe-aspirational (Mode=Aspirational) must NOT derive Liftable, got {:?}", lift_pairs);
 }
 
+// ─── Category 13b: Forward-chained readiness over a subscript ring-join ─
+//
+// The motivating self-ring derivation: a "blocked" state propagates up a
+// dependency chain. The rule joins the ring `Task depends on Task` to the
+// derived `Task has Readiness` ON THE SUBSCRIPT `Task2` — the equi-join
+// key `compile_join_derivation` builds via eq:join's `s_sh` from the
+// rule's Halpin subscripts. Category 7b proves the single-application
+// join; this proves it RECURSIVELY through `forward_chain_defs_state` to
+// the least fixed point, plus the serde round-trip of `RingJoinPlan`
+// (the rule is rebuilt from cells via `cell_index_from_state`) and the
+// consequent literal-pin (`Readiness 'blocked'`).
+//
+// Population: t1 depends on t2 depends on t3; t3 seeded 'blocked'.
+// Forward chain: t3 (seed) -> t2 -> t1 all reach 'blocked' at the LFP.
+#[test]
+fn readiness_blocked_propagates_through_forward_chain_over_subscript_ring() {
+    use crate::ast::{fact_from_pairs, cell_push, fetch_cell_seq};
+
+    let src = r#"# Readiness
+Task(.Name) is an entity type.
+Name is a value type.
+Readiness is a value type.
+
+## Fact Types
+Task has Name.
+Task depends on Task.
+Task has Readiness.
+
+## Derivation Rules
+* Task1 has Readiness 'blocked' iff Task1 depends on Task2 and Task2 has Readiness 'blocked'.
+"#;
+
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    let model = crate::compile::compile(&state);
+
+    // The readiness rule must route to a positional Join keyed on the
+    // Task2 subscript — rebuilt from cells, so this also covers the
+    // RingJoinPlan serde round-trip.
+    let rule = crate::compile::cell_index_from_state(&state).derivation_rules
+        .into_iter().find(|r| r.text.contains("Readiness"))
+        .expect("readiness derivation rule");
+    assert_eq!(rule.kind, DerivationKind::Join,
+        "readiness rule must route to a positional Join via the Task2 subscript; got {:?}",
+        rule.kind);
+    assert!(rule.ring_join.is_some(),
+        "readiness rule must carry a RingJoinPlan after the cell round-trip");
+
+    // Dependency chain t1 -> t2 -> t3, with t3 seeded 'blocked'.
+    let state = cell_push("Task_depends_on_Task",
+        fact_from_pairs(&[("Task", "t1"), ("Task", "t2")]), &state);
+    let state = cell_push("Task_depends_on_Task",
+        fact_from_pairs(&[("Task", "t2"), ("Task", "t3")]), &state);
+    let state = cell_push("Task_has_Readiness",
+        fact_from_pairs(&[("Task", "t3"), ("Readiness", "blocked")]), &state);
+
+    let derivation_refs: Vec<(&str, &crate::ast::Func)> =
+        model.derivations.iter().map(|d| (d.id.as_str(), &d.func)).collect();
+    let (final_state, _derived) =
+        crate::evaluate::forward_chain_defs_state(&derivation_refs, &state);
+
+    let cell = fetch_cell_seq("Task_has_Readiness", &final_state);
+    let pairs: Vec<(String, String)> = cell.as_seq().map(|facts| {
+        facts.iter().filter_map(|f| {
+            let kvs = f.as_seq()?;
+            let mut task: Option<String> = None;
+            let mut readiness: Option<String> = None;
+            for p in kvs.iter() {
+                let kv = p.as_seq()?;
+                if kv.len() != 2 { continue; }
+                let k = kv[0].as_atom()?;
+                let v = kv[1].as_atom()?;
+                if k == "Task" { task = Some(v.to_string()); }
+                if k == "Readiness" { readiness = Some(v.to_string()); }
+            }
+            Some((task?, readiness?))
+        }).collect()
+    }).unwrap_or_default();
+
+    // LFP: every task in the chain reaches 'blocked' (t3 seed -> t2 -> t1).
+    for t in ["t1", "t2", "t3"] {
+        assert!(pairs.iter().any(|(task, r)| task == t && r == "blocked"),
+            "{} must reach Readiness 'blocked' at the fixed point; got {:?}", t, pairs);
+    }
+}
+
 /// task-924: SM-status → normalized-property bridge hop 2. The tasks
 /// app re-keys `Resource is currently in Status` into `Task has Task
 /// Status` via a 1-antecedent rule with identity-binding clauses
