@@ -2386,8 +2386,10 @@ fn augment_delta_with_entity_cells(
     // an entity cell — collect the unique routings.
     let mut touched: HashSet<(String, String)> = HashSet::new();
     for (ft_id, contents) in ast::cells_iter(delta) {
-        let Some(facts) = contents.as_seq() else { continue };
-        for fact in facts.iter() {
+        // #932 phase-2: cell_facts_iter so folded (Map) delta cells route
+        // into entity cells too — the raw-as_seq()-skips-Map bug class
+        // (this scan was missed by the d5b07975 sweep).
+        for fact in ast::cell_facts_iter(contents) {
             if let Some(routing) = router.route_fact(ft_id, fact) {
                 touched.insert((routing.noun_name, routing.entity_id));
             }
