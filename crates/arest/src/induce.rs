@@ -22,7 +22,7 @@
 // that produces Hypothesis Candidates.
 
 use alloc::{string::{String, ToString}, vec::Vec};
-use crate::ast::{Object, fetch_or_phi, fact_from_pairs, binding};
+use crate::ast::{Object, fetch_cell_seq, fact_from_pairs, binding};
 
 /// Enumerate every candidate fact of shape `ft_id` over the finite
 /// domain of each role.
@@ -85,7 +85,7 @@ pub fn enumerate_candidates_for_fact_type(state: &Object, ft_id: &str) -> Vec<Ob
 fn role_nouns_for_ft(state: &Object, ft_id: &str) -> Vec<String> {
     // Confirm the FT itself exists; if not, no candidates regardless
     // of what roles happen to be lying around.
-    let ft_cell = fetch_or_phi("FactType", state);
+    let ft_cell = fetch_cell_seq("FactType", state);
     let ft_seq = match ft_cell.as_seq() {
         Some(s) => s,
         None => return Vec::new(),
@@ -93,7 +93,7 @@ fn role_nouns_for_ft(state: &Object, ft_id: &str) -> Vec<String> {
     if !ft_seq.iter().any(|f| binding(f, "id") == Some(ft_id)) {
         return Vec::new();
     }
-    let role_cell = fetch_or_phi("Role", state);
+    let role_cell = fetch_cell_seq("Role", state);
     let role_seq = match role_cell.as_seq() {
         Some(s) => s,
         None => return Vec::new(),
@@ -126,7 +126,7 @@ fn domain_for_noun(state: &Object, noun_name: &str) -> Vec<String> {
 /// Read `objectType` for a noun from the Noun cell. Returns `None`
 /// if the noun is undeclared.
 fn noun_object_type(state: &Object, noun_name: &str) -> Option<String> {
-    let cell = fetch_or_phi("Noun", state);
+    let cell = fetch_cell_seq("Noun", state);
     let seq = cell.as_seq()?;
     for f in seq.iter() {
         if binding(f, "name") == Some(noun_name) {
@@ -139,7 +139,7 @@ fn noun_object_type(state: &Object, noun_name: &str) -> Option<String> {
 /// Read enum values for a value-typed noun from the EnumValues
 /// cell. Returns an empty vec when no row matches.
 fn enum_values_for_noun(state: &Object, noun_name: &str) -> Vec<String> {
-    let cell = fetch_or_phi("EnumValues", state);
+    let cell = fetch_cell_seq("EnumValues", state);
     let seq = match cell.as_seq() {
         Some(s) => s,
         None => return Vec::new(),
@@ -591,7 +591,7 @@ fn score_candidate(
     let (post_state, _derived) =
         crate::evaluate::forward_chain_defs_state(&refs, &chained_input);
 
-    let cs_cell = crate::ast::fetch_or_phi(
+    let cs_cell = crate::ast::fetch_cell_seq(
         "Hypothesis_Candidate_has_Confidence_Score", &post_state);
     let Some(rows) = cs_cell.as_seq() else { return String::new(); };
 
@@ -745,7 +745,7 @@ fn target_in_post_state(target: &Object, post_state: &Object) -> bool {
         }).collect(),
         None => return false,
     };
-    let cell = fetch_or_phi(ft_id, post_state);
+    let cell = fetch_cell_seq(ft_id, post_state);
     let Some(facts) = cell.as_seq() else { return false; };
     facts.iter().any(|fact| {
         target_pairs.iter().all(|(k, v)| binding(fact, k) == Some(*v))
