@@ -696,7 +696,7 @@ pub fn load_reading(
     // keep-first (the rich-vs-reference dedup) is intentional and preserved.
     // Mirrors the unload-Migrate drop, keyed by the parse instead of a stored
     // manifest.
-    let reingested_rule_ids: Vec<String> = ast::fetch_or_phi("DerivationRule", &parsed)
+    let reingested_rule_ids: Vec<String> = ast::fetch_cell_seq("DerivationRule", &parsed)
         .as_seq()
         .map(|rules| {
             rules.iter()
@@ -1163,7 +1163,7 @@ fn re_derive_population(population: &Object) -> Object {
     // cell via the encoded `consequentFactTypeId`.
     let derived_cells: hashbrown::HashSet<String> = {
         let mut out: hashbrown::HashSet<String> = hashbrown::HashSet::new();
-        let drule_cell = ast::fetch_or_phi("DerivationRule", &d);
+        let drule_cell = ast::fetch_cell_seq("DerivationRule", &d);
         if let Some(facts) = drule_cell.as_seq() {
             for fact in facts.iter() {
                 let Some(encoded) = ast::binding(fact, "consequentFactTypeId") else {
@@ -1315,7 +1315,7 @@ pub fn build_report(before: &Object, after: &Object) -> LoadReport {
     use hashbrown::HashSet;
 
     fn names_in(cell: &str, key: &str, state: &Object) -> HashSet<String> {
-        crate::ast::fetch_or_phi(cell, state)
+        crate::ast::fetch_cell_seq(cell, state)
             .as_seq()
             .map(|facts| {
                 facts

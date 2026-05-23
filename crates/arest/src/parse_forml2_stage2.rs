@@ -29,7 +29,7 @@
 extern crate alloc;
 use alloc::{string::{String, ToString}, vec::Vec};
 use hashbrown::HashMap;
-use crate::ast::{Object, fetch_or_phi, fact_from_pairs, binding};
+use crate::ast::{Object, fetch_or_phi, fetch_cell_seq, fact_from_pairs, binding};
 use crate::time_shim::Instant;
 
 // ── MC2 Stage-2 dispatch tables (#713) ──────────────────────────────
@@ -3179,7 +3179,7 @@ fn build_stmt_index(state: &Object) -> StmtIndex {
     let mut idx = StmtIndex::default();
     let index_single = |cell: &str, key_field: &str, value_field: &str,
                         target: &mut hashbrown::HashMap<String, String>| {
-        if let Some(seq) = fetch_or_phi(cell, state).as_seq() {
+        if let Some(seq) = fetch_cell_seq(cell, state).as_seq() {
             for f in seq.iter() {
                 let (Some(k), Some(v)) = (binding(f, key_field), binding(f, value_field))
                     else { continue };
@@ -3188,7 +3188,7 @@ fn build_stmt_index(state: &Object) -> StmtIndex {
         }
     };
     // classifications: many-per-statement → Vec
-    if let Some(seq) = fetch_or_phi("Statement_has_Classification", state).as_seq() {
+    if let Some(seq) = fetch_cell_seq("Statement_has_Classification", state).as_seq() {
         for f in seq.iter() {
             let (Some(stmt), Some(cls)) = (
                 binding(f, "Statement"), binding(f, "Classification")
@@ -3205,7 +3205,7 @@ fn build_stmt_index(state: &Object) -> StmtIndex {
     index_single("Statement_has_Derivation_Marker", "Statement", "Derivation_Marker",
         &mut idx.derivation_markers);
     // Role-reference chain: stmt → [ref_id], ref_id → position / head noun / literal.
-    if let Some(seq) = fetch_or_phi("Statement_has_Role_Reference", state).as_seq() {
+    if let Some(seq) = fetch_cell_seq("Statement_has_Role_Reference", state).as_seq() {
         for f in seq.iter() {
             let (Some(stmt), Some(rref)) = (
                 binding(f, "Statement"), binding(f, "Role_Reference")
@@ -3221,7 +3221,7 @@ fn build_stmt_index(state: &Object) -> StmtIndex {
     index_single("Role_Reference_has_Literal_Value", "Role_Reference", "Literal_Value",
         &mut idx.role_literal_by_ref);
     index_single("Statement_has_Verb", "Statement", "Verb", &mut idx.verbs);
-    if let Some(seq) = fetch_or_phi("Statement", state).as_seq() {
+    if let Some(seq) = fetch_cell_seq("Statement", state).as_seq() {
         idx.statement_ids = alloc::sync::Arc::new(seq.iter()
             .filter_map(|f| binding(f, "id").map(String::from))
             .collect());
@@ -5020,7 +5020,7 @@ pub fn parse_to_state_via_stage12_with_context(
     text: &str,
     ctx: &Object,
 ) -> Result<Object, String> {
-    let extra_nouns: Vec<String> = fetch_or_phi("Noun", ctx).as_seq()
+    let extra_nouns: Vec<String> = fetch_cell_seq("Noun", ctx).as_seq()
         .map(|facts| facts.iter()
             .filter_map(|f| binding(f, "name").map(String::from))
             .collect())
