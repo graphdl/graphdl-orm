@@ -118,7 +118,7 @@ pub fn search_files(state: &Object, query: &SearchQuery) -> Vec<FileMatch> {
     // mandatory cell for every File (the readings declare "Each
     // File has exactly one Name."), so every File is reachable from
     // it. This avoids needing a separate "all files" cell.
-    let names_cell = ast::fetch_or_phi("File_has_Name", state);
+    let names_cell = ast::fetch_cell_seq("File_has_Name", state);
     let names = match names_cell.as_seq() {
         Some(s) => s,
         None => return Vec::new(),
@@ -194,7 +194,7 @@ impl TagFilter {
     fn build(wanted: &str, state: &Object) -> TagFilter {
         // Step 1: collect Tag ids whose Name == wanted.
         let mut tag_ids: Vec<String> = Vec::new();
-        let tag_names = ast::fetch_or_phi("Tag_has_Name", state);
+        let tag_names = ast::fetch_cell_seq("Tag_has_Name", state);
         if let Some(facts) = tag_names.as_seq() {
             for fact in facts {
                 if ast::binding(fact, "Name") == Some(wanted) {
@@ -212,7 +212,7 @@ impl TagFilter {
         // the cell-id remains a faithful echo of the reading text).
         let mut file_ids: Vec<String> = Vec::new();
         if !tag_ids.is_empty() {
-            let joins = ast::fetch_or_phi("File_has-tag_Tag", state);
+            let joins = ast::fetch_cell_seq("File_has-tag_Tag", state);
             if let Some(facts) = joins.as_seq() {
                 for fact in facts {
                     let tag = match ast::binding(fact, "Tag") { Some(t) => t, None => continue };
@@ -248,7 +248,7 @@ fn content_contains(file_id: &str, needle: &str, state: &Object) -> bool {
         // standard string-search semantics.
         return true;
     }
-    let cell = ast::fetch_or_phi("File_has_ContentRef", state);
+    let cell = ast::fetch_cell_seq("File_has_ContentRef", state);
     let cref = match cell.as_seq().and_then(|facts| {
         facts.iter().find_map(|f| {
             if ast::binding(f, "File") == Some(file_id) {

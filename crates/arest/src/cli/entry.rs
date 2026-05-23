@@ -262,7 +262,7 @@ fn system(key: &str, input: &str, d: &ast::Object) -> (String, ast::Object) {
         if pairs.is_empty() {
             return ("⊥".into(), d.clone());
         }
-        let cell = ast::fetch_or_phi(ft_name, d);
+        let cell = ast::fetch_cell_seq(ft_name, d);
         let items: Vec<ast::Object> = match cell.as_seq() {
             Some(it) => it.to_vec(),
             None => return ("⊥".into(), d.clone()),
@@ -733,7 +733,7 @@ pub fn main_entry() {
                 // merge_states is identity-aware (id/name/ruleId keys),
                 // so when fresh-parse + prior overlap on an FT cell the
                 // dedupe handles it without losing either side.
-                let ft_ids: hashbrown::HashSet<String> = ast::fetch_or_phi("FactType", &parsed_fresh)
+                let ft_ids: hashbrown::HashSet<String> = ast::fetch_cell_seq("FactType", &parsed_fresh)
                     .as_seq()
                     .map(|facts| facts.iter()
                         .filter_map(|f| ast::binding(f, "id").map(|s| s.to_string()))
@@ -767,11 +767,11 @@ pub fn main_entry() {
                 parse_forml2::set_strict_mode(false);
 
                 // Diagnostics: read cell sizes from the Object state.
-                let cell_len = |name: &str| ast::fetch_or_phi(name, &state)
+                let cell_len = |name: &str| ast::fetch_cell_seq(name, &state)
                     .as_seq().map(|s| s.len()).unwrap_or(0);
                 eprintln!("[load] {} nouns, {} fts, {} instance facts",
                     cell_len("Noun"), cell_len("FactType"), cell_len("InstanceFact"));
-                let ft_cell = ast::fetch_or_phi("FactType", &state);
+                let ft_cell = ast::fetch_cell_seq("FactType", &state);
                 let generator_fts: Vec<String> = ft_cell.as_seq()
                     .map(|facts| facts.iter()
                         .filter_map(|f| ast::binding(f, "id").map(|s| s.to_string()))
@@ -779,7 +779,7 @@ pub fn main_entry() {
                         .collect())
                     .unwrap_or_default();
                 eprintln!("[load] Generator-related FTs: {:?}", generator_fts);
-                let inst_cell = ast::fetch_or_phi("InstanceFact", &state);
+                let inst_cell = ast::fetch_cell_seq("InstanceFact", &state);
                 let app_ifs: Vec<String> = inst_cell.as_seq()
                     .map(|facts| facts.iter()
                         .filter(|f| ast::binding(f, "subjectNoun") == Some("App")
@@ -852,7 +852,7 @@ pub fn main_entry() {
                 // the population (the #772 stuck-blocked symptom).
                 let derived_cells: hashbrown::HashSet<String> = {
                     let mut out: hashbrown::HashSet<String> = hashbrown::HashSet::new();
-                    let drule_cell = ast::fetch_or_phi("DerivationRule", &d);
+                    let drule_cell = ast::fetch_cell_seq("DerivationRule", &d);
                     if let Some(facts) = drule_cell.as_seq() {
                         for fact in facts.iter() {
                             let Some(encoded) = ast::binding(fact, "consequentFactTypeId") else { continue };
@@ -872,7 +872,7 @@ pub fn main_entry() {
                     // which `func_to_object` stores as a 2-elem Seq
                     // `<atom("'"), seq_of_entries>` — the FFP const-fn
                     // wrapper. Unwrap the wrapper before iterating.
-                    let synth_cell = ast::fetch_or_phi("SyntheticDerivedCells", &d);
+                    let synth_cell = ast::fetch_cell_seq("SyntheticDerivedCells", &d);
                     let synth_entries = synth_cell.as_seq()
                         .and_then(|items| {
                             if items.len() == 2 && items[0].as_atom() == Some("'") {

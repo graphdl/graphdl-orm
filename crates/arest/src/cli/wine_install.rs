@@ -230,7 +230,7 @@ pub fn install_app(
 /// orchestrator transitions to `Installing` and surfaces the
 /// diagnostic).
 pub fn installer_url_for(state: &ast::Object, app_id: &str) -> Option<String> {
-    let cell = ast::fetch_or_phi("Wine_App_has_Installer_URL", state);
+    let cell = ast::fetch_cell_seq("Wine_App_has_Installer_URL", state);
     let seq = cell.as_seq()?;
     for fact in seq.iter() {
         if ast::binding(fact, "Wine App") == Some(app_id) {
@@ -243,7 +243,7 @@ pub fn installer_url_for(state: &ast::Object, app_id: &str) -> Option<String> {
 /// Lookup the Installer Filename for `app_id` from
 /// `Wine_App_has_Installer_Filename`. Returns `None` if missing.
 pub fn installer_filename_for(state: &ast::Object, app_id: &str) -> Option<String> {
-    let cell = ast::fetch_or_phi("Wine_App_has_Installer_Filename", state);
+    let cell = ast::fetch_cell_seq("Wine_App_has_Installer_Filename", state);
     let seq = cell.as_seq()?;
     for fact in seq.iter() {
         if ast::binding(fact, "Wine App") == Some(app_id) {

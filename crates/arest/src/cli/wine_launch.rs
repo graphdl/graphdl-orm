@@ -260,7 +260,7 @@ pub fn run_log_path(prefix_dir: &Path) -> PathBuf {
 /// fact for the app — the orchestrator transitions to `Exited` with
 /// a diagnostic in that case rather than spawning blindly.
 pub fn main_exe_path_for(state: &ast::Object, app_id: &str) -> Option<String> {
-    let cell = ast::fetch_or_phi("Wine_App_has_Main_Exe_Path", state);
+    let cell = ast::fetch_cell_seq("Wine_App_has_Main_Exe_Path", state);
     let seq = cell.as_seq()?;
     for fact in seq.iter() {
         if ast::binding(fact, "Wine App") == Some(app_id) {
@@ -276,7 +276,7 @@ pub fn main_exe_path_for(state: &ast::Object, app_id: &str) -> Option<String> {
 /// enum mapping mirrors `RunStatus::as_label` so a fact pushed via
 /// `push_run_status` round-trips through this read.
 pub fn current_run_status(state: &ast::Object, app_id: &str) -> Option<RunStatus> {
-    let cell = ast::fetch_or_phi("Wine_App_run_status", state);
+    let cell = ast::fetch_cell_seq("Wine_App_run_status", state);
     let seq = cell.as_seq()?;
     let mut latest: Option<RunStatus> = None;
     for fact in seq.iter() {

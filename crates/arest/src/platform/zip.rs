@@ -260,7 +260,7 @@ fn walk_recursive(
     let mut had_child = false;
 
     // Files in this directory.
-    let file_in = ast::fetch_or_phi("File_is_in_Directory", d);
+    let file_in = ast::fetch_cell_seq("File_is_in_Directory", d);
     if let Some(facts) = file_in.as_seq() {
         for fact in facts {
             if ast::binding(fact, "Directory") == Some(dir_id) {
@@ -276,7 +276,7 @@ fn walk_recursive(
     }
 
     // Child Directories.
-    let dir_parent = ast::fetch_or_phi("Directory_has_parent_Directory", d);
+    let dir_parent = ast::fetch_cell_seq("Directory_has_parent_Directory", d);
     if let Some(facts) = dir_parent.as_seq() {
         for fact in facts {
             if ast::binding(fact, "parent Directory") == Some(dir_id) {
@@ -299,7 +299,7 @@ fn walk_recursive(
 }
 
 fn directory_name(dir_id: &str, d: &Object) -> Option<String> {
-    let cell = ast::fetch_or_phi("Directory_has_Name", d);
+    let cell = ast::fetch_cell_seq("Directory_has_Name", d);
     cell.as_seq()?.iter().find_map(|f| {
         if ast::binding(f, "Directory") == Some(dir_id) {
             ast::binding(f, "Name").map(|s| s.to_string())
@@ -308,7 +308,7 @@ fn directory_name(dir_id: &str, d: &Object) -> Option<String> {
 }
 
 fn directory_parent(dir_id: &str, d: &Object) -> Option<String> {
-    let cell = ast::fetch_or_phi("Directory_has_parent_Directory", d);
+    let cell = ast::fetch_cell_seq("Directory_has_parent_Directory", d);
     cell.as_seq()?.iter().find_map(|f| {
         if ast::binding(f, "Directory") == Some(dir_id) {
             ast::binding(f, "parent Directory").map(|s| s.to_string())
@@ -326,7 +326,7 @@ pub fn file_name_for(file_id: &str, d: &Object) -> Option<String> {
 }
 
 fn file_name(file_id: &str, d: &Object) -> Option<String> {
-    let cell = ast::fetch_or_phi("File_has_Name", d);
+    let cell = ast::fetch_cell_seq("File_has_Name", d);
     cell.as_seq()?.iter().find_map(|f| {
         if ast::binding(f, "File") == Some(file_id) {
             ast::binding(f, "Name").map(|s| s.to_string())
@@ -338,7 +338,7 @@ fn file_name(file_id: &str, d: &Object) -> Option<String> {
 /// Returns `None` if the File is missing or the ContentRef cannot
 /// be decoded (see `decode_content_ref` for the inline scheme).
 pub fn file_content_bytes(file_id: &str, d: &Object) -> Option<Vec<u8>> {
-    let cell = ast::fetch_or_phi("File_has_ContentRef", d);
+    let cell = ast::fetch_cell_seq("File_has_ContentRef", d);
     let cref = cell.as_seq()?.iter().find_map(|f| {
         if ast::binding(f, "File") == Some(file_id) {
             ast::binding(f, "ContentRef").map(|s| s.to_string())

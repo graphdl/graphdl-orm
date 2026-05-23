@@ -30,7 +30,7 @@
 // for the types users actually browse, so compile can see them). The
 // shape defined here is the foundation that layer would sit on.
 
-use crate::ast::{Object, cell_push_unique, fact_from_pairs, fetch_or_phi};
+use crate::ast::{Object, cell_push_unique, fact_from_pairs, fetch_cell_seq};
 use crate::sync::OnceLock;
 use alloc::{string::{String, ToString}, vec::Vec, vec, format, borrow::ToOwned};
 use hashbrown::{HashMap, HashSet};
@@ -298,7 +298,7 @@ fn mount_core_types(state: Object) -> Object {
 /// Returns true if schema.org has already been mounted into `state`.
 /// Used by callers that want to mount-on-demand without racing.
 pub fn is_mounted(state: &Object) -> bool {
-    let cell = fetch_or_phi("External System", state);
+    let cell = fetch_cell_seq("External System", state);
     cell.as_seq()
         .map(|items| items.iter()
             .any(|f| crate::ast::binding(f, "name") == Some(SYSTEM_NAME)))
@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn mount_produces_external_system_cell() {
         let state = mount(&Object::phi());
-        let cell = fetch_or_phi("External System", &state);
+        let cell = fetch_cell_seq("External System", &state);
         let facts = cell.as_seq().expect("External System cell must exist");
         assert!(facts.iter().any(|f| binding(f, "name") == Some(SYSTEM_NAME)));
     }
@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn mount_is_minimal_six_core_nouns_not_thousands() {
         let state = mount(&Object::phi());
-        let cell = fetch_or_phi("Noun", &state);
+        let cell = fetch_cell_seq("Noun", &state);
         let facts = cell.as_seq().expect("Noun cell must exist");
         let backed: Vec<&str> = facts.iter()
             .filter(|f| binding(f, "is_backed_by_external_system") == Some(SYSTEM_NAME))
@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn mount_adds_backed_by_instance_facts_for_core_types() {
         let state = mount(&Object::phi());
-        let inst = fetch_or_phi("InstanceFact", &state);
+        let inst = fetch_cell_seq("InstanceFact", &state);
         let facts = inst.as_seq().expect("InstanceFact cell must exist");
         // compile.rs:1444 filter shape — if this breaks, federation
         // discovery breaks silently.
@@ -459,8 +459,8 @@ mod tests {
         let a = mount(&Object::phi());
         let b = mount(&a);
         for cell in ["External System", "Noun", "InstanceFact"] {
-            let la = fetch_or_phi(cell, &a).as_seq().map(|s| s.len()).unwrap_or(0);
-            let lb = fetch_or_phi(cell, &b).as_seq().map(|s| s.len()).unwrap_or(0);
+            let la = fetch_cell_seq(cell, &a).as_seq().map(|s| s.len()).unwrap_or(0);
+            let lb = fetch_cell_seq(cell, &b).as_seq().map(|s| s.len()).unwrap_or(0);
             assert_eq!(la, lb, "mount({cell}) must be idempotent");
         }
     }

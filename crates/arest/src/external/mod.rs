@@ -19,7 +19,7 @@
 
 pub mod schema_org;
 
-use crate::ast::{Object, binding, fetch_or_phi};
+use crate::ast::{Object, binding, fetch_cell_seq};
 use alloc::{string::{String, ToString}, vec::Vec, format};
 
 /// Response shape for `external_browse` / `/external/{system}/types/{name}`.
@@ -95,7 +95,7 @@ fn json_escape(s: &str) -> String {
 /// System" cell). Used by `generators/openapi` to decide which
 /// `/external/{system}/...` routes to emit.
 pub fn mounted_systems(state: &Object) -> Vec<String> {
-    let cell = fetch_or_phi("External System", state);
+    let cell = fetch_cell_seq("External System", state);
     cell.as_seq()
         .map(|facts| facts.iter()
             .filter_map(|f| binding(f, "name").map(String::from))
@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn browse_is_stateless_no_cells_added() {
         let mounted = schema_org::mount(&Object::phi());
-        let noun_len = |s: &Object| fetch_or_phi("Noun", s).as_seq().map(|x| x.len()).unwrap_or(0);
+        let noun_len = |s: &Object| fetch_cell_seq("Noun", s).as_seq().map(|x| x.len()).unwrap_or(0);
         let before = noun_len(&mounted);
         let _ = browse(&mounted, "schema.org", &["Patient".to_string()]);
         let _ = browse(&mounted, "schema.org", &["Organization".to_string()]);

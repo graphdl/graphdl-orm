@@ -152,7 +152,7 @@ pub fn bootstrap_prefix(
 /// matches the cell's facts; deduplication is left to the caller
 /// (winetricks itself is idempotent on the same recipe).
 pub fn required_components_for(state: &ast::Object, app_id: &str) -> Vec<String> {
-    let cell = ast::fetch_or_phi("Wine_App_requires_Required_Component", state);
+    let cell = ast::fetch_cell_seq("Wine_App_requires_Required_Component", state);
     let mut out: Vec<String> = Vec::new();
     let Some(seq) = cell.as_seq() else { return out };
     for fact in seq.iter() {
@@ -172,7 +172,7 @@ pub fn required_components_for(state: &ast::Object, app_id: &str) -> Vec<String>
 /// readings — every Wine App must have Prefix Architecture — but we
 /// don't enforce it here; bootstrap proceeds with the win32 default).
 pub fn wine_app_prefix_architecture(state: &ast::Object, app_id: &str) -> Option<String> {
-    let cell = ast::fetch_or_phi("Wine_App_has_Prefix_Architecture", state);
+    let cell = ast::fetch_cell_seq("Wine_App_has_Prefix_Architecture", state);
     let seq = cell.as_seq()?;
     for fact in seq.iter() {
         if ast::binding(fact, "Wine App") == Some(app_id) {
@@ -215,7 +215,7 @@ pub fn win64_variant_for(state: &ast::Object, recipe: &str) -> Option<String> {
     // matching fact.
     let anchor_id = {
         let recipe_cell_name = format!("has Recipe '{}'", recipe);
-        let cell = ast::fetch_or_phi(&recipe_cell_name, state);
+        let cell = ast::fetch_cell_seq(&recipe_cell_name, state);
         let seq = cell.as_seq()?;
         let fact = seq.iter().next()?;
         ast::binding(fact, "Required Component Anchor")?.to_string()

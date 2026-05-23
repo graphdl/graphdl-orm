@@ -23,7 +23,7 @@
 //   - The function is total: missing cells yield a valid empty program.
 //   - Output is solc-compilable.
 
-use crate::ast::{Object, binding, fetch_or_phi};
+use crate::ast::{Object, binding, fetch_cell_seq};
 use crate::rmap::{self, ColumnView};
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
@@ -42,7 +42,7 @@ use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 /// Resolve the SM name attached to a noun, if any.
 fn sm_name_for_noun(state: &Object, noun_name: &str) -> Option<String> {
-    fetch_or_phi("InstanceFact", state).as_seq()?
+    fetch_cell_seq("InstanceFact", state).as_seq()?
         .iter()
         .find(|f| binding(f, "subjectNoun") == Some("State Machine Definition")
             && binding(f, "fieldName").map(|s| s.contains("is for")).unwrap_or(false)
@@ -55,7 +55,7 @@ fn sm_name_for_noun(state: &Object, noun_name: &str) -> Option<String> {
 /// by `emit_create`).
 fn sm_statuses(state: &Object, noun_name: &str) -> Vec<String> {
     let Some(sm_name) = sm_name_for_noun(state, noun_name) else { return vec![]; };
-    let inst = fetch_or_phi("InstanceFact", state);
+    let inst = fetch_cell_seq("InstanceFact", state);
     let Some(facts) = inst.as_seq() else { return vec![]; };
     let mut out: Vec<String> = Vec::new();
     for f in facts.iter().filter(|f|
@@ -77,7 +77,7 @@ fn sm_statuses(state: &Object, noun_name: &str) -> Vec<String> {
 /// `triggered` fields; fold them into per-event tuples.
 fn sm_transitions(state: &Object, noun_name: &str) -> Vec<(String, String, String)> {
     if sm_name_for_noun(state, noun_name).is_none() { return vec![]; }
-    let inst = fetch_or_phi("InstanceFact", state);
+    let inst = fetch_cell_seq("InstanceFact", state);
     let Some(facts) = inst.as_seq() else { return vec![]; };
     let mut by_event: Vec<(String, String, String)> = Vec::new();
     for f in facts.iter().filter(|f| binding(f, "subjectNoun") == Some("Transition")) {
@@ -136,7 +136,7 @@ fn compile_to_solidity_inner(
     // `RMAPColumn` facts — no typed IR struct in flight.
     let cells = rmap::rmap_cells_from_state(state);
 
-    let nouns = fetch_or_phi("Noun", state);
+    let nouns = fetch_cell_seq("Noun", state);
     let contracts: Vec<String> = nouns.as_seq().map(|ns| {
         ns.iter().filter_map(|n| {
             let name = binding(n, "name")?.to_string();
@@ -236,7 +236,7 @@ fn emit_off_chain_comment(noun_name: &str, state: &Object) -> String {
         ("IR", "IR"), ("AS", "AS"), ("AT", "AT"), ("SY", "SY"),
         ("IT", "IT"), ("TR", "TR"), ("AC", "AC"), ("RF", "RF"),
     ];
-    let constraints = fetch_or_phi("Constraint", state);
+    let constraints = fetch_cell_seq("Constraint", state);
     let Some(facts) = constraints.as_seq() else { return String::new(); };
     let relevant: Vec<String> = facts.iter()
         .filter_map(|c| {
@@ -301,8 +301,8 @@ fn emit_events(
     state: &Object,
     scope: Option<&hashbrown::HashSet<&str>>,
 ) -> String {
-    let ft_cell = fetch_or_phi("FactType", state);
-    let role_cell = fetch_or_phi("Role", state);
+    let ft_cell = fetch_cell_seq("FactType", state);
+    let role_cell = fetch_cell_seq("Role", state);
     let fts = ft_cell.as_seq().unwrap_or(&[]);
     let roles = role_cell.as_seq().unwrap_or(&[]);
 
@@ -436,7 +436,7 @@ fn emit_create(
 /// per task #304's field-resolution note). Parse the text locally —
 /// Legacy emits `Each <entity> <verb> some <field>.` for MC shapes.
 fn mandatory_fields_for(noun_name: &str, state: &Object) -> Vec<String> {
-    let constraints = fetch_or_phi("Constraint", state);
+    let constraints = fetch_cell_seq("Constraint", state);
     let facts = constraints.as_seq().unwrap_or(&[]);
     facts.iter()
         .filter(|c| binding(c, "kind") == Some("MC"))
@@ -467,8 +467,8 @@ fn column_value_type_noun(
     entity_name: &str,
     state: &Object,
 ) -> Option<String> {
-    let ft_cell = fetch_or_phi("FactType", state);
-    let role_cell = fetch_or_phi("Role", state);
+    let ft_cell = fetch_cell_seq("FactType", state);
+    let role_cell = fetch_cell_seq("Role", state);
     let fts = ft_cell.as_seq()?;
     let roles = role_cell.as_seq()?;
 
@@ -496,7 +496,7 @@ fn column_value_type_noun(
 /// Read enum values declared for a value-type noun from the
 /// `EnumValues` cell. Empty vec if none.
 fn enum_values_for_value_type(noun_name: &str, state: &Object) -> Vec<String> {
-    let cell = fetch_or_phi("EnumValues", state);
+    let cell = fetch_cell_seq("EnumValues", state);
     let Some(facts) = cell.as_seq() else { return vec![]; };
     for f in facts {
         if binding(f, "noun") != Some(noun_name) { continue; }

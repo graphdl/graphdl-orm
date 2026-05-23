@@ -44,7 +44,7 @@
 
 use hashbrown::HashMap;
 
-use crate::ast::{Object, binding, fetch_or_phi};
+use crate::ast::{Object, binding, fetch_cell_seq};
 use crate::rmap::{self, ColumnView};
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
@@ -56,7 +56,7 @@ use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
 /// Resolve the SM name attached to a noun, if any.
 fn sm_name_for_noun(state: &Object, noun_name: &str) -> Option<String> {
-    fetch_or_phi("InstanceFact", state).as_seq()?
+    fetch_cell_seq("InstanceFact", state).as_seq()?
         .iter()
         .find(|f| binding(f, "subjectNoun") == Some("State Machine Definition")
             && binding(f, "fieldName").map(|s| s.contains("is for")).unwrap_or(false)
@@ -67,7 +67,7 @@ fn sm_name_for_noun(state: &Object, noun_name: &str) -> Option<String> {
 /// Statuses for the SM attached to `noun_name`, in declaration order.
 fn sm_statuses(state: &Object, noun_name: &str) -> Vec<String> {
     let Some(sm_name) = sm_name_for_noun(state, noun_name) else { return vec![]; };
-    let inst = fetch_or_phi("InstanceFact", state);
+    let inst = fetch_cell_seq("InstanceFact", state);
     let Some(facts) = inst.as_seq() else { return vec![]; };
     let mut out: Vec<String> = Vec::new();
     for f in facts.iter().filter(|f|
@@ -87,7 +87,7 @@ fn sm_statuses(state: &Object, noun_name: &str) -> Vec<String> {
 /// `(event, from, to)` tuples.
 fn sm_transitions(state: &Object, noun_name: &str) -> Vec<(String, String, String)> {
     if sm_name_for_noun(state, noun_name).is_none() { return vec![]; }
-    let inst = fetch_or_phi("InstanceFact", state);
+    let inst = fetch_cell_seq("InstanceFact", state);
     let Some(facts) = inst.as_seq() else { return vec![]; };
     let mut by_event: Vec<(String, String, String)> = Vec::new();
     for f in facts.iter().filter(|f| binding(f, "subjectNoun") == Some("Transition")) {
@@ -134,7 +134,7 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
     // crosses the generator boundary.
     let cells = rmap::rmap_cells_from_state(state);
 
-    let nouns_cell = fetch_or_phi("Noun", state);
+    let nouns_cell = fetch_cell_seq("Noun", state);
     let nouns_seq = nouns_cell.as_seq().unwrap_or(&[]);
 
     // noun_name -> objectType map
@@ -162,7 +162,7 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
         .collect();
 
     // InstanceFact cell for general_instance_facts (plural / app description)
-    let inst_cell = fetch_or_phi("InstanceFact", state);
+    let inst_cell = fetch_cell_seq("InstanceFact", state);
     let inst_seq = inst_cell.as_seq().unwrap_or(&[]);
 
     let mut schemas: serde_json::Map<String, serde_json::Value> = noun_types.iter()
@@ -179,9 +179,9 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
         .or_insert_with(violation_component_schema);
 
     // FactType + Role cells for Theorem 4b navigation
-    let ft_cell = fetch_or_phi("FactType", state);
+    let ft_cell = fetch_cell_seq("FactType", state);
     let ft_seq = ft_cell.as_seq().unwrap_or(&[]);
-    let role_cell = fetch_or_phi("Role", state);
+    let role_cell = fetch_cell_seq("Role", state);
     let role_seq = role_cell.as_seq().unwrap_or(&[]);
 
     let paths: serde_json::Map<String, serde_json::Value> = noun_types.iter()

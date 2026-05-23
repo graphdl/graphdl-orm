@@ -12,7 +12,7 @@
 // clock/reset/id and a trivial always block that holds `valid` high after
 // reset release. FP style: fold/map only, no for loops, no control-flow ifs.
 
-use crate::ast::{binding, fetch_or_phi, Object};
+use crate::ast::{binding, fetch_cell_seq, Object};
 use crate::rmap::{self, ColumnView};
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
@@ -35,7 +35,7 @@ pub fn compile_to_verilog(state: &Object) -> String {
     let header = "// Generated from arest FORML2 readings\n\
                   // Backus FP combining forms synthesize to parallel hardware\n\n";
 
-    let nouns = fetch_or_phi("Noun", state);
+    let nouns = fetch_cell_seq("Noun", state);
     // Read RMAP as cells (#325): per-noun columns come from
     // `columns_for_table` against an `rmap_cells_from_state` snapshot.
     // No typed RMAP struct crosses the generator boundary.
@@ -218,7 +218,7 @@ endmodule
 /// "State Machine Definition … is for …" instance fact, sorted by
 /// `noun_name` for deterministic emitter output.
 fn sm_entries(state: &Object) -> Vec<(String, String)> {
-    let inst = fetch_or_phi("InstanceFact", state);
+    let inst = fetch_cell_seq("InstanceFact", state);
     let Some(facts) = inst.as_seq() else { return vec![]; };
     let mut out: Vec<(String, String)> = facts.iter().filter_map(|f| {
         if binding(f, "subjectNoun") != Some("State Machine Definition") { return None; }
@@ -234,7 +234,7 @@ fn sm_entries(state: &Object) -> Vec<(String, String)> {
 
 /// Statuses for a given SM, in declaration order.
 fn sm_statuses(state: &Object, sm_name: &str) -> Vec<String> {
-    let inst = fetch_or_phi("InstanceFact", state);
+    let inst = fetch_cell_seq("InstanceFact", state);
     let Some(facts) = inst.as_seq() else { return vec![]; };
     let mut out: Vec<String> = Vec::new();
     for f in facts.iter().filter(|f|
@@ -252,7 +252,7 @@ fn sm_statuses(state: &Object, sm_name: &str) -> Vec<String> {
 
 /// Transitions for a given SM as `(event, from, to)` tuples.
 fn sm_transitions(state: &Object) -> Vec<(String, String, String)> {
-    let inst = fetch_or_phi("InstanceFact", state);
+    let inst = fetch_cell_seq("InstanceFact", state);
     let Some(facts) = inst.as_seq() else { return vec![]; };
     let mut by_event: Vec<(String, String, String)> = Vec::new();
     for f in facts.iter().filter(|f| binding(f, "subjectNoun") == Some("Transition")) {
@@ -398,7 +398,7 @@ pub fn compile_to_bundle(state: &Object) -> FpgaBundle {
 /// Build the JSON manifest — minimal shape to keep downstream
 /// consumers simple. No serde dep outside what the crate already uses.
 fn build_bundle_manifest(state: &Object, verilog: &str, rom: &[u8]) -> String {
-    let nouns = fetch_or_phi("Noun", state);
+    let nouns = fetch_cell_seq("Noun", state);
     let entity_names: Vec<String> = nouns.as_seq()
         .map(|ns| ns.iter()
             .filter_map(|n| {
@@ -961,7 +961,7 @@ const CONSTRAINT_DEFAULT_DEPTH: usize = 8;
 /// indirectly: the top emitter reads the module name and its kind
 /// prefix (`constraint_<kind>_<id>`) to pick the correct port list.
 fn emit_constraint_modules(state: &Object) -> (Vec<String>, Vec<String>) {
-    let constraints = fetch_or_phi("Constraint", state);
+    let constraints = fetch_cell_seq("Constraint", state);
     let mut modules: Vec<String> = Vec::new();
     let mut names: Vec<String> = Vec::new();
     if let Some(cs) = constraints.as_seq() {
@@ -1014,7 +1014,7 @@ fn emit_constraint_modules(state: &Object) -> (Vec<String>, Vec<String>) {
 /// values land under `value0`, `value1`, …; the read walks the dense
 /// prefix until a key is absent.
 fn enum_values_for_noun_in_state(noun_name: &str, state: &Object) -> Vec<String> {
-    let cell = fetch_or_phi("EnumValues", state);
+    let cell = fetch_cell_seq("EnumValues", state);
     let Some(facts) = cell.as_seq() else { return Vec::new(); };
     for f in facts.iter() {
         if binding(f, "noun") != Some(noun_name) { continue; }

@@ -139,7 +139,7 @@ pub fn parse_dll_overrides_from_state(
     state: &ast::Object,
     app_id: &str,
 ) -> BTreeMap<String, String> {
-    let cell = ast::fetch_or_phi(
+    let cell = ast::fetch_cell_seq(
         "Wine_App_requires_dll_override_of_DLL_Name_with_DLL_Behavior",
         state);
     let mut out: BTreeMap<String, String> = BTreeMap::new();
@@ -225,7 +225,7 @@ pub fn parse_registry_keys_from_state(
     state: &ast::Object,
     app_id: &str,
 ) -> Vec<RegistryKey> {
-    let cell = ast::fetch_or_phi(
+    let cell = ast::fetch_cell_seq(
         "Wine_App_requires_registry_key_at_Registry_Path_with_Registry_Value",
         state);
     let mut out: Vec<RegistryKey> = Vec::new();
