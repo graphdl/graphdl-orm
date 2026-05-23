@@ -926,7 +926,7 @@ Paper Element 'pe-aspirational' has Implementation Mode 'Aspirational'.
         crate::evaluate::forward_chain_defs_state(&derivation_refs, &state);
 
     // Read the derived cell.
-    let lift_cell = fetch_or_phi("Paper_Element_has_Lift_Priority", &final_state);
+    let lift_cell = crate::ast::fetch_cell_seq("Paper_Element_has_Lift_Priority", &final_state);
     let lift_pairs: Vec<(String, String)> = lift_cell.as_seq().map(|facts| {
         facts.iter().filter_map(|f| {
             let pairs = f.as_seq()?;
@@ -1001,7 +1001,7 @@ Resource 't1' is currently in Status 'Active'.
     let refs: Vec<(&str, &crate::ast::Func)> =
         stratum1.iter().map(|(n, f)| (n.as_str(), f)).collect();
     let (final_state, _) = crate::evaluate::forward_chain_defs_state(&refs, &state);
-    let cell = fetch_or_phi("Task_has_Task_Status", &final_state);
+    let cell = crate::ast::fetch_cell_seq("Task_has_Task_Status", &final_state);
     let pairs: Vec<(String, String)> = cell.as_seq().map(|facts| {
         facts.iter().filter_map(|f| {
             let ps = f.as_seq()?;
@@ -1163,7 +1163,7 @@ Status 'Placed' is defined in State Machine Definition 'OrderSM'.
     // Collect the Status-name set in Status_is_defined_in_SM to verify
     // both the directly-asserted Placed AND the initial-derived Draft
     // landed in the cell (Pass 2 + Pass 2b parity with compile.rs).
-    let defined_cell = fetch_or_phi("Status_is_defined_in_State_Machine_Definition", &final_state);
+    let defined_cell = crate::ast::fetch_cell_seq("Status_is_defined_in_State_Machine_Definition", &final_state);
     let defined_pairs: Vec<(String, String)> = defined_cell.as_seq().map(|facts| {
         facts.iter().filter_map(|f| {
             let pairs = f.as_seq()?;
@@ -1193,7 +1193,7 @@ Status 'Placed' is defined in State Machine Definition 'OrderSM'.
     );
 
     // The initial-marking cell entry must still exist for the initial Status.
-    let initial_cell = fetch_or_phi("Status_is_initial_in_State_Machine_Definition", &final_state);
+    let initial_cell = crate::ast::fetch_cell_seq("Status_is_initial_in_State_Machine_Definition", &final_state);
     let initial_pairs: Vec<(String, String)> = initial_cell.as_seq().map(|facts| {
         facts.iter().filter_map(|f| {
             let pairs = f.as_seq()?;
@@ -1299,7 +1299,7 @@ Transition 'ship' is triggered by Fact Type 'Order_was_shipped'.
     let (final_state, _derived) =
         crate::evaluate::forward_chain_defs_state(&derivation_refs, &state);
 
-    let rooted_cell = fetch_or_phi("Status_is_rooted_in_State_Machine_Definition", &final_state);
+    let rooted_cell = crate::ast::fetch_cell_seq("Status_is_rooted_in_State_Machine_Definition", &final_state);
     let rooted_pairs: Vec<(String, String)> = rooted_cell.as_seq().map(|facts| {
         facts.iter().filter_map(|f| {
             let pairs = f.as_seq()?;
@@ -1441,7 +1441,7 @@ State Machine 'sm-1' is currently in Status 'pending'.
         crate::evaluate::forward_chain_defs_state(&derivation_refs, &state);
 
     // Collect (Task, Task Status) pairs from the cell.
-    let cell = fetch_or_phi("Task_has_Task_Status", &final_state);
+    let cell = crate::ast::fetch_cell_seq("Task_has_Task_Status", &final_state);
     let pairs: Vec<(String, String)> = cell.as_seq().map(|facts| {
         facts.iter().filter_map(|f| {
             let pairs = f.as_seq()?;
@@ -1631,7 +1631,7 @@ Task 't-also-no-events' has Owner 'Bob'.
         crate::evaluate::forward_chain_defs_state(&s1_refs, &state);
 
     // Collect Resource values from State_Machine_is_for_Resource cell.
-    let for_res_cell = fetch_or_phi("State_Machine_is_for_Resource", &final_state);
+    let for_res_cell = crate::ast::fetch_cell_seq("State_Machine_is_for_Resource", &final_state);
     let resources: Vec<String> = for_res_cell.as_seq().map(|facts| {
         facts.iter().filter_map(|f| {
             let pairs = f.as_seq()?;
@@ -1670,7 +1670,7 @@ Task 't-also-no-events' has Owner 'Bob'.
     // same entities (this is the "we know this works" baseline per the
     // task description). If currentlyInStatus is empty too, the bug is
     // SM init not running at all, not the targeted for_Resource regression.
-    let status_cell = fetch_or_phi("State_Machine_is_currently_in_Status", &final_state);
+    let status_cell = crate::ast::fetch_cell_seq("State_Machine_is_currently_in_Status", &final_state);
     let statuses_by_resource: hashbrown::HashMap<String, String> = {
         let for_res_pairs: Vec<(String, String)> = for_res_cell.as_seq().map(|facts| {
             facts.iter().filter_map(|f| {
@@ -1858,7 +1858,7 @@ Task 't-keyed-2' has Task Description 'second task no events'.
     let (final_state, _derived) =
         crate::evaluate::forward_chain_defs_state(&s1_refs, &keyed_state);
 
-    let for_res_cell = fetch_or_phi("State_Machine_is_for_Resource", &final_state);
+    let for_res_cell = crate::ast::fetch_cell_seq("State_Machine_is_for_Resource", &final_state);
     let resources: Vec<String> = for_res_cell.as_seq().map(|facts| {
         facts.iter().filter_map(|f| {
             let pairs = f.as_seq()?;
@@ -1989,7 +1989,7 @@ State Machine 't-orphan' is currently in Status 'completed'.
     // Pre-condition sanity check: the orphan currently_in_Status row
     // is still in the population. If it's not, the test setup
     // regressed and we'd see an empty backfill for the wrong reason.
-    let status_cell = fetch_or_phi("State_Machine_is_currently_in_Status", &final_state);
+    let status_cell = crate::ast::fetch_cell_seq("State_Machine_is_currently_in_Status", &final_state);
     let has_orphan_status = status_cell.as_seq().map(|facts| {
         facts.iter().any(|f| {
             let pairs = f.as_seq().unwrap_or(&[]);
@@ -2015,7 +2015,7 @@ State Machine 't-orphan' is currently in Status 'completed'.
 
     // The actual assertion: after backfill, the orphan SM has a
     // for_Resource row keyed by the same id (State Machine id == Resource id).
-    let for_res_cell = fetch_or_phi("State_Machine_is_for_Resource", &final_state);
+    let for_res_cell = crate::ast::fetch_cell_seq("State_Machine_is_for_Resource", &final_state);
     let backfilled = for_res_cell.as_seq().map(|facts| {
         facts.iter().any(|f| {
             let pairs = f.as_seq().unwrap_or(&[]);
@@ -2051,7 +2051,7 @@ State Machine 't-orphan' is currently in Status 'completed'.
     // production load path.
     let (final_state_2, _) =
         crate::evaluate::forward_chain_defs_state(&s1_refs, &final_state);
-    let for_res_2 = fetch_or_phi("State_Machine_is_for_Resource", &final_state_2);
+    let for_res_2 = crate::ast::fetch_cell_seq("State_Machine_is_for_Resource", &final_state_2);
     let row_count = |cell: &crate::ast::Object| -> usize {
         cell.as_seq().map(|s| s.iter().filter(|f| {
             f.as_seq().map(|pairs| pairs.iter().any(|p| {

@@ -3694,7 +3694,7 @@ Task1 has Task Readiness 'blocked' iff Task2 blocks Task1 and Task2 has Task Sta
         // Pre-condition: forward-chain populates the derived consequent.
         let _ = system_impl(h, "re_derive", "");
         let pre = peek(h).expect("handle live after compile + re_derive");
-        let pre_readiness = ast::fetch_or_phi("Task_has_Task_Readiness", &pre);
+        let pre_readiness = ast::fetch_cell_seq("Task_has_Task_Readiness", &pre);
         let pre_blocked: Vec<String> = pre_readiness.as_seq()
             .map(|s| s.iter().filter_map(|f| {
                 let task = ast::binding(f, "Task")?.to_string();
@@ -3715,7 +3715,7 @@ Task1 has Task Readiness 'blocked' iff Task2 blocks Task1 and Task2 has Task Sta
         // status is no longer 'pending'), so Task_has_Task_Readiness
         // must not retain Task=1 with Readiness='blocked'.
         let post = peek(h).expect("handle live after update");
-        let post_readiness = ast::fetch_or_phi("Task_has_Task_Readiness", &post);
+        let post_readiness = ast::fetch_cell_seq("Task_has_Task_Readiness", &post);
         let post_blocked: Vec<String> = post_readiness.as_seq()
             .map(|s| s.iter().filter_map(|f| {
                 let task = ast::binding(f, "Task")?.to_string();

@@ -1501,7 +1501,7 @@ Category(.Name) is an entity type.
 
         // The new state has the merged Noun cell (5 entries: Order +
         // Product + SKU + Category + Name).
-        let nouns_after = ast::fetch_or_phi("Noun", &outcome.new_state);
+        let nouns_after = ast::fetch_cell_seq("Noun", &outcome.new_state);
         let names: Vec<&str> = nouns_after
             .as_seq()
             .map(|s| s.iter().filter_map(|f| ast::binding(f, "name")).collect())
@@ -2195,7 +2195,7 @@ Order has Order Readiness 'ready' iff Order has Order Status 'pending'.
             .expect("MigrateFacts reload must succeed (preserve P + re-derive)");
 
         // (a) Population P preserved: the primary status fact survives.
-        let status_after = ast::fetch_or_phi("Order_has_Order_Status", &migrated.new_state);
+        let status_after = ast::fetch_cell_seq("Order_has_Order_Status", &migrated.new_state);
         let status_pending = status_after.as_seq()
             .map(|s| s.iter().any(|f| {
                 f.as_seq().map(|pairs| pairs.iter().any(|p| {
@@ -2212,7 +2212,7 @@ Order has Order Readiness 'ready' iff Order has Order Status 'pending'.
         );
 
         // (b) Re-derived by the new rule: the readiness fact appears.
-        let readiness = ast::fetch_or_phi("Order_has_Order_Readiness", &migrated.new_state);
+        let readiness = ast::fetch_cell_seq("Order_has_Order_Readiness", &migrated.new_state);
         let readiness_ready = readiness.as_seq()
             .map(|s| s.iter().any(|f| {
                 f.as_seq().map(|pairs| pairs.iter().any(|p| {

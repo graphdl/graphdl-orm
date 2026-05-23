@@ -9554,7 +9554,7 @@ mod schema_tests {
             .map(|(n, f)| (n.as_str(), f)).collect();
         let (new_d, _derived) = crate::evaluate::forward_chain_defs_state(&derivation_refs, &d);
 
-        let readiness_cell = ast::fetch_or_phi("Order_has_Order_Readiness", &new_d);
+        let readiness_cell = ast::fetch_cell_seq("Order_has_Order_Readiness", &new_d);
         let readiness_facts = readiness_cell.as_seq()
             .map(|s| s.iter().cloned().collect::<Vec<_>>())
             .unwrap_or_default();
@@ -9603,7 +9603,7 @@ mod schema_tests {
             .map(|(n, f)| (n.as_str(), f)).collect();
         let (new_d, _) = crate::evaluate::forward_chain_defs_state(&derivation_refs, &d);
 
-        let cell = ast::fetch_or_phi("Task_has_Task_Readiness", &new_d);
+        let cell = ast::fetch_cell_seq("Task_has_Task_Readiness", &new_d);
         let entries: Vec<&ast::Object> = cell.as_seq()
             .map(|s| s.iter().collect()).unwrap_or_default();
         let blocked: Vec<String> = entries.iter()
@@ -9661,7 +9661,7 @@ mod schema_tests {
             .map(|(n, f)| (n.as_str(), f)).collect();
         let (new_d, _derived) = crate::evaluate::forward_chain_defs_state(&derivation_refs, &d);
 
-        let readiness_cell = ast::fetch_or_phi("Task_has_Task_Readiness", &new_d);
+        let readiness_cell = ast::fetch_cell_seq("Task_has_Task_Readiness", &new_d);
         let entries: Vec<&ast::Object> = readiness_cell.as_seq()
             .map(|s| s.iter().collect()).unwrap_or_default();
         let blocked_tasks: Vec<String> = entries.iter()
@@ -9829,7 +9829,7 @@ mod schema_tests {
 
         // Spec assertion: the unary consequent FT cell must exist and
         // carry one row per matching antecedent (Task '1' is pending).
-        let parallel_cell = ast::fetch_or_phi("Task_is_parallelizable", &new_d);
+        let parallel_cell = ast::fetch_cell_seq("Task_is_parallelizable", &new_d);
         let parallel_facts = parallel_cell.as_seq()
             .map(|s| s.iter().cloned().collect::<Vec<_>>())
             .unwrap_or_default();

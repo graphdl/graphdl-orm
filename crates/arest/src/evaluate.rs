@@ -78,8 +78,10 @@ pub(crate) fn read_cell_key_roles(d: &ast::Object) -> hashbrown::HashMap<String,
 
 /// Integrate one round's `(cell_name → facts)` batch into `state`,
 /// routing each cell write through `cell_put_keyed` when `key_roles`
-/// names that cell as a Map-backed (alethic-UC-keyed) cell, and
-/// through the legacy Seq-append otherwise.
+/// names that cell as a Map-backed (alethic-UC-keyed) cell, and through
+/// `cell_put_folded` (full-tuple keyed fold — #932 phase-2) otherwise.
+/// Both paths produce a Map-backed cell (`eq:cellfold` `D_n`); the Seq
+/// append path is retired.
 ///
 /// Factored out of the two forward-chain entry points so they share
 /// the routing rule. `key_roles` is built once per forward-chain
@@ -117,16 +119,15 @@ fn integrate_round_facts(
                 }
             }
         } else {
-            let existing = ast::fetch_cell_seq(&cell_name, &current_state);
-            let combined = match existing.as_seq() {
-                Some(items) => {
-                    let mut v = items.to_vec();
-                    v.extend(facts);
-                    ast::Object::Seq(v.into())
-                }
-                None => ast::Object::seq(facts),
-            };
-            current_state = ast::store(&cell_name, combined, &current_state);
+            // #932 phase-2: keyless fact cells fold to a Map keyed by the
+            // full tuple (cell_put_folded) — set semantics per eq:cellfold
+            // — rather than an un-folded Seq append. Re-derivation of an
+            // identical fact is an idempotent no-op; distinct tuples (incl.
+            // ring fact types whose duplicate role names a by-name key
+            // cannot tell apart) each get their own row.
+            for fact in facts {
+                current_state = ast::cell_put_folded(&cell_name, fact, &current_state);
+            }
         }
     }
     current_state
@@ -4488,14 +4489,18 @@ mod tests {
         assert!(map.contains_key("p2"), "p2 must be a map key; keys={:?}",
             map.keys().collect::<Vec<_>>());
 
-        // ft_seq: no UC, no entry in `_CellKeyRoles` → still a Seq.
+        // ft_seq: no narrower UC, so #932 phase-2 folds it to a Map keyed
+        // by the full tuple (synthesize_fact_id, via cell_put_folded) — the
+        // SAME Map shape as a keyed cell, differing only in the key. The
+        // two distinct (Person, Topic) tuples give two entries (set
+        // semantics per eq:cellfold); the Seq-append path is retired.
         let seq_cell = ast::fetch_or_phi("ft_seq", &new_d);
-        let seq = seq_cell.as_seq().unwrap_or_else(|| panic!(
-            "ft_seq must remain Object::Seq (no UC, absent from key-roles registry); \
-             got {:?}", seq_cell));
-        assert_eq!(seq.len(), 2,
-            "ft_seq should hold both derived facts in Seq order; got {} items",
-            seq.len());
+        let folded = seq_cell.as_map().cloned().unwrap_or_else(|| panic!(
+            "ft_seq must be Object::Map after forward-chain (#932 phase-2: a \
+             keyless cell folds by full tuple); got {:?}", seq_cell));
+        assert_eq!(folded.len(), 2,
+            "two distinct (Person,Topic) tuples → two folded entries; got {}",
+            folded.len());
     }
 }
 

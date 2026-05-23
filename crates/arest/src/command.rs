@@ -4442,13 +4442,13 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         let result = apply_command_defs(&def_map, &cmd, &state);
 
         // Entity fields are facts in the state
-        let customer_cell = ast::fetch_or_phi("Order_has_customer", &result.state);
+        let customer_cell = ast::fetch_cell_seq("Order_has_customer", &result.state);
         let customer_facts = customer_cell.as_seq().unwrap();
         assert_eq!(customer_facts.len(), 1);
         assert!(ast::binding(&customer_facts[0], "customer") == Some("acme"));
 
         // SM facts are in the state (task-742: renamed cell + role)
-        let sm_cell = ast::fetch_or_phi("State_Machine_is_currently_in_Status", &result.state);
+        let sm_cell = ast::fetch_cell_seq("State_Machine_is_currently_in_Status", &result.state);
         let sm_facts = sm_cell.as_seq().unwrap();
         assert!(ast::binding(&sm_facts[0], "Status") == Some("Draft"));
     }
