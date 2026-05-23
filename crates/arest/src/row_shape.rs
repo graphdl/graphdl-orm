@@ -17,7 +17,7 @@
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
-use crate::ast::{Object, binding, fetch_or_phi};
+use crate::ast::{Object, binding, fetch_cell_seq};
 use crate::sync::Arc;
 
 // ── TypedSeq ────────────────────────────────────────────────────────────────
@@ -50,7 +50,7 @@ impl TypedSeq {
     ///  - the cell contents are not a `Seq`, or
     ///  - the first row has no recognisable key-value pairs.
     pub fn from_cell(cell_name: &str, obj: &Object) -> Option<Self> {
-        let cell_obj = fetch_or_phi(cell_name, obj);
+        let cell_obj = fetch_cell_seq(cell_name, obj);
         let rows = cell_obj.as_seq()?;
         if rows.is_empty() {
             return None;

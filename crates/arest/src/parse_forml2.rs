@@ -688,8 +688,8 @@ const BOOT_CIDR_BLOCKLIST: &[&str] = &[
 /// Empty cell ⇒ return the boot list so the SSRF defense never
 /// degrades to "no checks" when state is unconfigured.
 fn cidr_blocklist_from_state(state: &crate::ast::Object) -> Vec<String> {
-    use crate::ast::{fetch_or_phi, binding};
-    let cell = fetch_or_phi("CIDR_Block_has_Block_Kind", state);
+    use crate::ast::{fetch_cell_seq, binding};
+    let cell = fetch_cell_seq("CIDR_Block_has_Block_Kind", state);
     let rows: Vec<String> = cell.as_seq()
         .map(|facts| facts.iter()
             .filter_map(|f| binding(f, "CIDR Block").map(String::from))
@@ -815,8 +815,8 @@ pub fn find_forbidden_instance_url(
     state: &crate::ast::Object,
     d: &crate::ast::Object,
 ) -> Option<String> {
-    use crate::ast::{fetch_or_phi, binding};
-    fetch_or_phi("InstanceFact", state)
+    use crate::ast::{fetch_cell_seq, binding};
+    fetch_cell_seq("InstanceFact", state)
         .as_seq()
         .and_then(|facts| {
             facts.iter().find_map(|f| {
@@ -845,8 +845,8 @@ pub fn parse_to_state(input: &str) -> Result<crate::ast::Object, String> {
 
 /// Extract nouns directly from the Noun cell in D.
 pub fn nouns_from_state(state: &crate::ast::Object) -> HashMap<String, NounDef> {
-    use crate::ast::{fetch_or_phi, binding};
-    fetch_or_phi("Noun", state)
+    use crate::ast::{fetch_cell_seq, binding};
+    fetch_cell_seq("Noun", state)
         .as_seq().map(|facts| facts.iter().filter_map(|f| {
             let name = binding(f, "name")?.to_string();
             let obj_type = binding(f, "objectType").unwrap_or("entity").to_string();
@@ -860,14 +860,14 @@ pub fn nouns_from_state(state: &crate::ast::Object) -> HashMap<String, NounDef> 
 /// `roles: vec![]` stub — callers no longer need a per-caller compat
 /// shim (see `_reports/e3-handoff-2026-04-20.md` §"Ownership #2").
 pub fn fact_types_from_state(state: &crate::ast::Object) -> HashMap<String, FactTypeDef> {
-    use crate::ast::{fetch_or_phi, binding};
+    use crate::ast::{fetch_cell_seq, binding};
     // Pre-collect Role cell facts so each FactType iteration is O(|R|)
     // rather than re-fetching per FT.
-    let role_cell = fetch_or_phi("Role", state);
+    let role_cell = fetch_cell_seq("Role", state);
     let role_facts: Vec<&crate::ast::Object> = role_cell.as_seq()
         .map(|s| s.iter().collect())
         .unwrap_or_default();
-    fetch_or_phi("FactType", state)
+    fetch_cell_seq("FactType", state)
         .as_seq().map(|facts| facts.iter().filter_map(|f| {
             let id = binding(f, "id")?.to_string();
             let reading = binding(f, "reading").unwrap_or("").to_string();

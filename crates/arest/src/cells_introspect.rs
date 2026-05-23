@@ -145,7 +145,7 @@ fn get_cell(state: &Object, name: &str) -> String {
 /// the current row count of that cell (so callers can verify the rule
 /// actually fired during the last forward-chain pass).
 fn trace_rule_by_id(state: &Object, rule_id: &str) -> String {
-    let dr = ast::fetch_or_phi("DerivationRule", state);
+    let dr = ast::fetch_cell_seq("DerivationRule", state);
     let rule = dr.as_seq()
         .and_then(|facts| facts.iter().find(|f| ast::binding(f, "id") == Some(rule_id)).cloned());
     match rule {
@@ -158,7 +158,7 @@ fn trace_rule_by_id(state: &Object, rule_id: &str) -> String {
 /// (text matching is approximate by design — patterns like "is
 /// overdue" pick whichever rule exposes that phrase).
 fn trace_rule_by_pattern(state: &Object, pattern: &str) -> String {
-    let dr = ast::fetch_or_phi("DerivationRule", state);
+    let dr = ast::fetch_cell_seq("DerivationRule", state);
     let rule = dr.as_seq()
         .and_then(|facts| facts.iter().find(|f| {
             ast::binding(f, "text").map_or(false, |t| t.contains(pattern))
@@ -175,7 +175,7 @@ fn trace_envelope(state: &Object, rule: &Object) -> String {
     let materialized = if consequent.is_empty() {
         0
     } else {
-        ast::fetch_or_phi(&consequent, state)
+        ast::fetch_cell_seq(&consequent, state)
             .as_seq().map(|s| s.len()).unwrap_or(0)
     };
     let mut env = Map::with_capacity(3);

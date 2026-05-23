@@ -164,7 +164,7 @@ impl PluralizationRuleTable {
 /// `parse_forml2_stage2.rs` — duplicated here so `naming.rs` stays
 /// self-contained without exporting a stage-2 internal.
 fn read_enum_values(state: &crate::ast::Object, type_name: &str) -> Vec<String> {
-    let cell = crate::ast::fetch_or_phi("EnumValues", state);
+    let cell = crate::ast::fetch_cell_seq("EnumValues", state);
     let facts = match cell.as_seq() {
         Some(s) => s,
         None => return Vec::new(),
@@ -265,7 +265,7 @@ pub fn resolve_entity_id(
     noun_name: &str,
     fields: &hashbrown::HashMap<String, String>,
 ) -> Option<String> {
-    let noun_cell = crate::ast::fetch_or_phi("Noun", state);
+    let noun_cell = crate::ast::fetch_cell_seq("Noun", state);
     let noun_def = noun_cell.as_seq()?
         .iter()
         .find(|n| crate::ast::binding(n, "name") == Some(noun_name))?;
@@ -294,7 +294,7 @@ pub fn resolve_entity_id(
 ///     identical so behaviour stays bit-for-bit equivalent across
 ///     deployment targets — same e2e suite passes).
 pub fn resolve_slug_to_noun(state: &crate::ast::Object, slug: &str) -> Option<String> {
-    crate::ast::fetch_or_phi("Noun", state)
+    crate::ast::fetch_cell_seq("Noun", state)
         .as_seq()?
         .iter()
         .filter_map(|n| crate::ast::binding(n, "name"))

@@ -140,7 +140,7 @@ impl Vocab {
     /// missing or empty.
     pub fn from_grammar_state(state: &Object) -> Self {
         let boot = Self::boot();
-        let cell = crate::ast::fetch_or_phi("EnumValues", state);
+        let cell = crate::ast::fetch_cell_seq("EnumValues", state);
         let facts = match cell.as_seq() {
             Some(s) => s,
             None => return boot,

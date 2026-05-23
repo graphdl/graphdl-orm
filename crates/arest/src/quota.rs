@@ -93,7 +93,7 @@ pub fn app_quota_limit(state: &Object, app: &str, resource: Resource) -> Option<
         Resource::CpuNanos        => "Cpu Ms Quota",
         Resource::MemoryCells     => "Memory Cells Limit",
     };
-    let inst = crate::ast::fetch_or_phi("InstanceFact", state);
+    let inst = crate::ast::fetch_cell_seq("InstanceFact", state);
     inst.as_seq()
         .and_then(|facts| facts.iter()
             .find(|f| binding(f, "subjectNoun") == Some("App")

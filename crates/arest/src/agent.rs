@@ -33,7 +33,7 @@
 #[allow(unused_imports)]
 use alloc::string::{String, ToString};
 
-use crate::ast::{binding, fetch_or_phi, Object};
+use crate::ast::{binding, fetch_cell_seq, Object};
 
 /// Resolved agent-call binding: the Model.code the registered
 /// Platform handler should target, plus the Prompt text from the
@@ -116,7 +116,7 @@ pub fn record_completion(
 /// engine walker.
 pub fn resolve_agent_verb(state: &Object, verb_name: &str) -> Option<AgentBinding> {
     // 1. Verb cell — find the entry whose `name` matches.
-    let verb_id = fetch_or_phi("Verb", state)
+    let verb_id = fetch_cell_seq("Verb", state)
         .as_seq()?
         .iter()
         .find(|v| binding(v, "name") == Some(verb_name))
@@ -124,7 +124,7 @@ pub fn resolve_agent_verb(state: &Object, verb_name: &str) -> Option<AgentBindin
         .to_string();
 
     // 2. Verb_invokes_Agent_Definition — find the binding for this verb.
-    let agent_def_id = fetch_or_phi("Verb_invokes_Agent_Definition", state)
+    let agent_def_id = fetch_cell_seq("Verb_invokes_Agent_Definition", state)
         .as_seq()?
         .iter()
         .find(|f| binding(f, "Verb") == Some(&verb_id))
@@ -132,7 +132,7 @@ pub fn resolve_agent_verb(state: &Object, verb_name: &str) -> Option<AgentBindin
         .to_string();
 
     // 3. Agent_Definition_uses_Model — find the binding for this agent def.
-    let model_code = fetch_or_phi("Agent_Definition_uses_Model", state)
+    let model_code = fetch_cell_seq("Agent_Definition_uses_Model", state)
         .as_seq()?
         .iter()
         .find(|f| binding(f, "Agent Definition") == Some(&agent_def_id))
@@ -140,7 +140,7 @@ pub fn resolve_agent_verb(state: &Object, verb_name: &str) -> Option<AgentBindin
         .to_string();
 
     // 4. Agent_Definition_has_Prompt — find the binding for this agent def.
-    let prompt = fetch_or_phi("Agent_Definition_has_Prompt", state)
+    let prompt = fetch_cell_seq("Agent_Definition_has_Prompt", state)
         .as_seq()?
         .iter()
         .find(|f| binding(f, "Agent Definition") == Some(&agent_def_id))

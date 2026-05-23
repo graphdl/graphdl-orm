@@ -119,7 +119,7 @@ pub fn select_component(
     let limit = constraints.limit.unwrap_or(5);
 
     // (Component name, Component Role) pairs.
-    let role_cell = ast::fetch_or_phi("Component_has_Component_Role", state);
+    let role_cell = ast::fetch_cell_seq("Component_has_Component_Role", state);
     let candidates: Vec<(String, String)> = role_cell.as_seq().map(|facts| facts.iter()
         .filter_map(|f| {
             let comp = ast::binding(f, "Component")?.to_string();
@@ -138,7 +138,7 @@ pub fn select_component(
         }).collect()).unwrap_or_default();
 
     // For each candidate Component, enumerate its ImplementationBindings.
-    let bind_cell = ast::fetch_or_phi(
+    let bind_cell = ast::fetch_cell_seq(
         "Component_is_implemented_by_Toolkit_at_Toolkit_Symbol",
         state,
     );
@@ -194,7 +194,7 @@ pub(crate) fn normalize_a11y(token: &str) -> String {
 
 /// Collect the trait set declared on the abstract Component.
 pub(crate) fn component_traits(component: &str, state: &Object) -> Vec<String> {
-    let cell = ast::fetch_or_phi("Component_has_Trait", state);
+    let cell = ast::fetch_cell_seq("Component_has_Trait", state);
     cell.as_seq().map(|facts| facts.iter()
         .filter(|f| ast::binding_matches(f, "Component", component))
         .filter_map(|f| ast::binding(f, "Component Trait").map(|s| s.to_string()))
@@ -204,7 +204,7 @@ pub(crate) fn component_traits(component: &str, state: &Object) -> Vec<String> {
 
 /// Collect the trait set declared on a specific ImplementationBinding.
 pub(crate) fn binding_traits(binding_name: &str, state: &Object) -> Vec<String> {
-    let cell = ast::fetch_or_phi("ImplementationBinding_has_Trait", state);
+    let cell = ast::fetch_cell_seq("ImplementationBinding_has_Trait", state);
     cell.as_seq().map(|facts| facts.iter()
         .filter(|f| ast::binding_matches(f, "ImplementationBinding", binding_name))
         .filter_map(|f| ast::binding(f, "Component Trait").map(|s| s.to_string()))
@@ -215,7 +215,7 @@ pub(crate) fn binding_traits(binding_name: &str, state: &Object) -> Vec<String> 
 /// Find the binding-anchor name for a (component, toolkit) pair.
 /// Returns the `ImplementationBinding` row's name field (e.g. "button.qt6").
 pub(crate) fn binding_name_for(component: &str, toolkit: &str, state: &Object) -> Option<String> {
-    let cell = ast::fetch_or_phi(
+    let cell = ast::fetch_cell_seq(
         "ImplementationBinding_pivots_Component_is_implemented_by_Toolkit_at_Toolkit_Symbol",
         state,
     );
@@ -229,7 +229,7 @@ pub(crate) fn binding_name_for(component: &str, toolkit: &str, state: &Object) -
 /// Look up the Toolkit Slug for a Toolkit row (slug == name in the
 /// seeded population, but the rules condition on Slug specifically).
 pub(crate) fn toolkit_slug(toolkit: &str, state: &Object) -> String {
-    let cell = ast::fetch_or_phi("Toolkit_has_Toolkit_Slug", state);
+    let cell = ast::fetch_cell_seq("Toolkit_has_Toolkit_Slug", state);
     cell.as_seq().and_then(|facts| facts.iter()
         .find(|f| ast::binding_matches(f, "Toolkit", toolkit))
         .and_then(|f| ast::binding(f, "Toolkit Slug").map(|s| s.to_string())))

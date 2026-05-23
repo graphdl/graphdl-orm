@@ -24,7 +24,7 @@ use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 /// Convert facts from an Object state for a given fact type into a positional Object sequence.
 /// Each fact becomes a sequence ordered by the schema's role_names.
 pub(crate) fn state_to_object(state: &Object, schema: &CompiledSchema) -> Object {
-    let facts = ast::fetch_or_phi(&schema.id, state);
+    let facts = ast::fetch_cell_seq(&schema.id, state);
     let items = match facts.as_seq() {
         Some(fact_objs) => fact_objs.iter().map(|fact| {
             let bindings: Vec<Object> = schema.role_names.iter().map(|role_name| {

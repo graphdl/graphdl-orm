@@ -29,7 +29,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use alloc::format;
-use crate::ast::{Object, fetch_or_phi, binding};
+use crate::ast::{Object, fetch_cell_seq, binding};
 
 /// Cell-name → worker-facing entity type. Order matters only for
 /// determinism: the worker doesn't care about element order, but
@@ -341,7 +341,7 @@ fn serialize_entities(state: &Object, domain: &str) -> String {
     let mut first = true;
 
     for (cell_name, type_name) in CELLS {
-        let cell = fetch_or_phi(cell_name, state);
+        let cell = fetch_cell_seq(cell_name, state);
         let facts = match cell.as_seq() {
             Some(f) => f,
             None => continue,
