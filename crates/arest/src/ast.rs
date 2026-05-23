@@ -4582,8 +4582,18 @@ pub fn cell_facts_iter(contents: &Object) -> alloc::boxed::Box<dyn Iterator<Item
 /// `cell_facts_iter`. Transitional — phase-2 all-Map storage retires it.
 pub fn fetch_cell_seq(name: &str, state: &Object) -> Object {
     let cell = fetch_or_phi(name, state);
-    if matches!(cell, Object::Map(_)) {
-        Object::seq(cell_facts_iter(&cell).cloned().collect())
+    if let Object::Map(m) = &cell {
+        // #932 phase-2 (D3): flatten a folded Map cell to a Seq in
+        // deterministic KEY order. `m.values()` is HashMap-nondeterministic,
+        // so the resulting fact array (and any JSON serialization of it,
+        // which preserves array order) would vary per run — breaking the
+        // canonical representation thm:derive caches and the deterministic
+        // replay cor:consensus relies on. The key is the RMAP / full-tuple
+        // identity, so key-order is a stable canonical order; D_n is a set,
+        // so the order carries no semantics, only reproducibility.
+        let mut entries: alloc::vec::Vec<(&alloc::string::String, &Object)> = m.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        Object::seq(entries.into_iter().map(|(_, v)| v.clone()).collect())
     } else {
         cell
     }
@@ -8548,6 +8558,23 @@ mod tests {
         let m = fetch_or_phi("App_uses_Generator", &folded).as_map().cloned()
             .expect("Seq migrated to Map");
         assert_eq!(m.len(), 2, "migrated f1 + new f2");
+    }
+
+    #[test]
+    fn fetch_cell_seq_flattens_map_in_key_sorted_order() {
+        // #932 phase-2 D3: a folded Map cell flattens to a Seq in
+        // deterministic KEY order (not nondeterministic HashMap order), so
+        // the serialized fact array is reproducible across runs.
+        let mut m: HashMap<String, Object> = HashMap::new();
+        m.insert("k-c".into(), Object::atom("val-c"));
+        m.insert("k-a".into(), Object::atom("val-a"));
+        m.insert("k-b".into(), Object::atom("val-b"));
+        let state = store("CellX", Object::Map(m.into()), &Object::phi());
+        let seq = fetch_cell_seq("CellX", &state);
+        let vals: Vec<&str> = seq.as_seq().unwrap().iter()
+            .filter_map(|o| o.as_atom()).collect();
+        assert_eq!(vals, vec!["val-a", "val-b", "val-c"],
+            "fetch_cell_seq must yield Map values in key-sorted (deterministic) order");
     }
 
     #[test]
