@@ -1425,7 +1425,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             DerivationRuleDef {
                 id: get("id"), text: get("text"), antecedent_sources: vec![], consequent_instance_role: String::new(),
                 consequent_cell: crate::types::ConsequentCellSource::decode(&get("consequentFactTypeId")),
-                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
+                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None,
             }
         }).collect())
         .unwrap_or_default();
@@ -2989,7 +2989,7 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
                 kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![],
                 consequent_bindings: vec![], antecedent_filters: vec![],
                 consequent_computed_bindings: vec![], consequent_aggregates: vec![],
-                unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
+                unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None,
             }
         }).collect()).unwrap_or_default();
     let general_instance_facts: Vec<GeneralInstanceFact> = fetch_cell_seq("InstanceFact", state).as_seq()
@@ -5260,7 +5260,26 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
         // one spec per join key, resolved to a pre-built accessor
         // Func. `crate::fol::constraint::join_deriv_atoms` turns
         // these into `FolTerm::Eq(FactRole, FactRole)` atoms.
-        let join_key_specs: Vec<(Func, usize, usize)> = join_keys.iter().filter_map(|key| {
+        // eq:join `s_sh` selects the SHARED roles BY POSITION. For a
+        // self-ring / ring-FT join the shared roles carry the same base
+        // noun, so `join_keys` (noun names) can't name them; `ring_join`
+        // carries the (antecedent, role) slots resolved from the rule's
+        // Halpin subscripts. Drive the equi-join from those positions when
+        // present; otherwise fall back to noun-name resolution.
+        let join_key_specs: Vec<(Func, usize, usize)> = if let Some(rj) = &rule.ring_join {
+            rj.join_groups.iter().filter_map(|group| {
+                // Link antecedent j's slot in this variable's group to its
+                // first earlier antecedent's slot — the equi-join key.
+                let (_, j_role) = group.iter().copied().find(|(a, _)| *a == j)?;
+                let (ref_ft, ref_role) = group.iter().copied().find(|(a, _)| *a < j)?;
+                Some((
+                    Func::compose(access_fact(ref_ft, j), Func::Selector(1)),
+                    ref_role,
+                    j_role,
+                ))
+            }).collect()
+        } else {
+            join_keys.iter().filter_map(|key| {
             let j_role = find_role(j, key)?;
             let ref_ft = (0..j).find(|&fi| find_role(fi, key).is_some())?;
             let ref_role = find_role(ref_ft, key)?;
@@ -5274,7 +5293,8 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
                 ref_role,
                 j_role,
             ))
-        }).collect();
+            }).collect()
+        };
 
         // Î±(match_pair â†’ contains Func) : match_pairs â€”
         // Contains isn't a FolTerm atom (yet); each pair lowers
@@ -5370,7 +5390,33 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
     // `filter_map`. Mirrors the M1b-path pattern in
     // compile_explicit_derivation (compile.rs:3322-3360, the "literal
     // pin wins" branch).
-    let binding_parts: Vec<Func> = binding_nouns.iter().filter_map(|noun| {
+    let binding_parts: Vec<Func> = if let Some(rj) = &rule.ring_join {
+        // Positional consequent (eq:join): each consequent role draws its
+        // value from the (antecedent, role) slot the subscript resolved.
+        // The binding key is the CONSEQUENT role's noun name — same
+        // <noun, value> shape the noun-name path below emits.
+        let cons_nouns: Vec<String> = data.fact_types.get(&consequent_id)
+            .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+            .unwrap_or_default();
+        rj.consequent_positions.iter().enumerate().filter_map(|(cons_idx, &(ai, ri))| {
+            let noun = cons_nouns.get(cons_idx)?;
+            // Consequent literal pin wins (mirrors the noun-name path's
+            // step 2): a role the consequent fixes to a literal — e.g.
+            // `Task Readiness 'blocked'` — takes that value, not the
+            // joined antecedent's.
+            if let Some(crl) = rule.consequent_role_literals.iter().find(|c| c.role == *noun) {
+                return Some(Func::construction(vec![
+                    Func::constant(Object::atom(noun)),
+                    Func::constant(Object::atom(&crl.value)),
+                ]));
+            }
+            Some(Func::construction(vec![
+                Func::constant(Object::atom(noun)),
+                Func::compose(role_value(ri), access_fact(ai, n)),
+            ]))
+        }).collect()
+    } else {
+        binding_nouns.iter().filter_map(|noun| {
         // 1. Antecedent-bound extractor: noun appears on some
         //    antecedent FT — extract its value via the joined-fact
         //    accessor. This is the original pre-#814 behavior.
@@ -5397,7 +5443,8 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
         //    pin — drop silently (pre-#814 behavior). The rule is
         //    underspecified; nothing to bind to.
         None
-    }).collect();
+        }).collect()
+    };
 
     let derived_fact = Func::construction(vec![
         Func::constant(Object::atom(&consequent_id)),
@@ -5497,7 +5544,7 @@ pub(crate) fn compile_subtype_inheritance_metamodel(
                 join_on: vec![], match_on: vec![], consequent_bindings: vec![],
                 antecedent_filters: vec![], consequent_computed_bindings: vec![],
                 consequent_aggregates: vec![], unresolved_clauses: vec![],
-                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
+                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None,
             };
             compile_explicit_derivation(data, &rule).func
         })
@@ -5593,7 +5640,7 @@ pub(crate) fn compile_ss_autofill_metamodel(
                 join_on: vec![], match_on: vec![], consequent_bindings: vec![],
                 antecedent_filters: vec![], consequent_computed_bindings: vec![],
                 consequent_aggregates: vec![], unresolved_clauses: vec![],
-                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
+                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None,
             };
             compile_explicit_derivation(data, &rule).func
         })
@@ -5703,7 +5750,7 @@ pub(crate) fn compile_transitivity_metamodel(
                     consequent_bindings: vec![src_noun, dst_noun],
                     antecedent_filters: vec![], consequent_computed_bindings: vec![],
                     consequent_aggregates: vec![], unresolved_clauses: vec![],
-                    antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
+                    antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None,
                 };
                 Some(compile_join_derivation(data, &rule).func)
             }))

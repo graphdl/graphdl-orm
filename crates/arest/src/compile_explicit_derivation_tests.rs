@@ -630,6 +630,63 @@ Person is ancestor of Person.
     }
 }
 
+// ─── Category 7b: Two-hop self-ring JOIN via repeated subscript ─────
+//
+// Shape: `* X is grandparent of Z iff X is parent of Y and Y is parent
+// of Z` on the self-ring `Person is parent of Person`. The join
+// variable is the REPEATED Halpin subscript `Person2` (Y), marking
+// parent.role1 of the first antecedent and parent.role0 of the second
+// as the SAME variable. Per whitepaper eq:join the join is
+// `Filter(eq ∘ [s_sh]) ∘ distl`, with `s_sh` selecting those shared
+// roles — positional, driven by the subscript, not the noun name.
+//
+// "that" anaphora cannot express this (it points only at the most-
+// recent antecedent; a 3-variable join has no "that"), so subscripts
+// are the only way to say which role binds which. Today the join-key
+// detector keys off noun-name and explicitly skips a noun carrying
+// >1 subscript token (parse_forml2.rs ~1847), so this compiles as a
+// 2-antecedent ModusPonens existence-check and never fires — the gap
+// noted at shape_transitive_closure_parses_as_two_antecedent_literal.
+#[test]
+fn shape_subscript_join_two_hop_self_ring_fires() {
+    let src = r#"# Test
+Person(.Name) is an entity type.
+Name is a value type.
+
+## Fact Types
+Person has Name.
+Person is parent of Person.
+Person is grandparent of Person.
+
+## Derivation Rules
+* Person1 is grandparent of Person3 iff Person1 is parent of Person2 and Person2 is parent of Person3.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    // Routing: the repeated subscript Person2 is the join key → Join.
+    assert_eq!(rule.kind, DerivationKind::Join,
+        "repeated subscript Person2 must route to a positional Join (eq:join); got {:?}",
+        rule.kind);
+
+    // Semantics: parent(alice,bob) ⋈ parent(bob,carol) on Person2=bob
+    // → grandparent(alice, carol).
+    let out = apply_to_facts(&func, &[
+        ("Person_is_parent_of_Person", &[("Person", "alice"), ("Person", "bob")]),
+        ("Person_is_parent_of_Person", &[("Person", "bob"), ("Person", "carol")]),
+    ]);
+    let derived = decode_derived(&out);
+    assert_eq!(derived.len(), 1,
+        "one grandparent fact from the 2-hop self-ring join, got {:#?}", derived);
+    let (ft, _reading, bindings) = &derived[0];
+    assert_eq!(ft, "Person_is_grandparent_of_Person",
+        "derived fact lands in the grandparent cell, got {}", ft);
+    assert_eq!(bindings.len(), 2, "two positional Person bindings, got {:#?}", bindings);
+    assert_eq!(bindings[0], ("Person".to_string(), "alice".to_string()),
+        "grandparent role0 = hop-1 parent (alice), got {:?}", bindings[0]);
+    assert_eq!(bindings[1], ("Person".to_string(), "carol".to_string()),
+        "grandparent role1 = hop-2 child (carol), got {:?}", bindings[1]);
+}
+
 // ─── Category 4: Join-path derivation via possessive syntax ─────────
 //
 // Shape: `* X has Z iff X's Y has Z` — the antecedent `X's Y`

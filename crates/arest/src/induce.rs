@@ -960,6 +960,7 @@ fn build_multiplier_rule(
         antecedent_role_comparisons: Vec::new(),
         consequent_role_literals: Vec::new(),
         materialization: crate::types::MaterializationPolicy::Stored,
+        ring_join: None,
     }
 }
 

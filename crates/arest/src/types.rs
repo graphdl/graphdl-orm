@@ -444,6 +444,11 @@ pub struct DerivationRuleDef {
     /// their behavior; opt into View via `is a view iff` in the reading.
     #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "MaterializationPolicy::is_default"))]
     pub materialization: MaterializationPolicy,
+    /// Positional join plan for self-ring / ring-FT Join rules (see
+    /// `RingJoinPlan`). `None` for every other rule shape, including
+    /// ordinary noun-name "that"-anaphora joins (which use `join_on`).
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub ring_join: Option<RingJoinPlan>,
 }
 
 // ── Hand-rolled canonical JSON writer for `DerivationRuleDef` ────────
@@ -544,6 +549,7 @@ impl Default for DerivationRuleDef {
             antecedent_role_comparisons: Vec::new(),
             consequent_role_literals: Vec::new(),
             materialization: MaterializationPolicy::Stored,
+            ring_join: None,
         }
     }
 }
@@ -705,9 +711,45 @@ impl DerivationRuleDef {
             materialization_policy_write(&mut out, &self.materialization);
         }
 
+        // 18. ringJoin (skip if None).
+        if let Some(rj) = &self.ring_join {
+            out.push_str(",\"ringJoin\":");
+            ring_join_plan_write(&mut out, rj);
+        }
+
         out.push('}');
         out
     }
+}
+
+/// `RingJoinPlan` → `{"joinGroups":[[[a,b],…],…],"consequentPositions":[[a,b],…]}`.
+/// Both fields always present (no `skip_serializing_if`); each
+/// `(usize,usize)` tuple serializes as a 2-element array, matching serde.
+fn ring_join_plan_write(out: &mut String, p: &RingJoinPlan) {
+    out.push_str("{\"joinGroups\":[");
+    for (i, group) in p.join_groups.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        out.push('[');
+        for (j, (a, b)) in group.iter().enumerate() {
+            if j > 0 { out.push(','); }
+            out.push('[');
+            json_write_usize(out, *a);
+            out.push(',');
+            json_write_usize(out, *b);
+            out.push(']');
+        }
+        out.push(']');
+    }
+    out.push_str("],\"consequentPositions\":[");
+    for (i, (a, b)) in p.consequent_positions.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        out.push('[');
+        json_write_usize(out, *a);
+        out.push(',');
+        json_write_usize(out, *b);
+        out.push(']');
+    }
+    out.push_str("]}");
 }
 
 fn materialization_policy_write(out: &mut String, p: &MaterializationPolicy) {
@@ -931,6 +973,31 @@ pub struct AntecedentRoleComparison {
     pub rhs_antecedent_index: usize,
     /// Role name on the RHS antecedent's fact type.
     pub rhs_role: String,
+}
+
+/// Positional join plan for a self-ring / ring-FT `Join` derivation,
+/// where several antecedent (and consequent) roles share a base noun and
+/// Halpin numeric subscripts (`Person1`, `Person2`) are the only thing
+/// distinguishing the variables. Resolved at parse time, consumed by
+/// `compile_join_derivation`.
+///
+/// Whitepaper eq:join: `R * S ≡ Filter(eq ∘ [s_sh]) ∘ distl`, where
+/// `s_sh` selects the SHARED roles BY POSITION. The noun-name `join_on`
+/// path cannot name a specific role of a self-ring (both roles carry the
+/// same noun); these `(antecedent_index, role_index)` positions can.
+/// `None` for ordinary "that"-anaphora joins, which stay on `join_on`.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
+pub struct RingJoinPlan {
+    /// Equi-join groups. Each inner vec is the set of
+    /// `(antecedent_index, role_index)` slots bound to one subscript
+    /// variable; all slots in a group must hold equal values (the
+    /// variable appears in ≥2 antecedents — that is the join key).
+    pub join_groups: Vec<Vec<(usize, usize)>>,
+    /// Source of each consequent role, in consequent role order:
+    /// the `(antecedent_index, role_index)` the value is drawn from.
+    pub consequent_positions: Vec<(usize, usize)>,
 }
 
 /// Fixed string literal bound to a consequent role.
@@ -1424,6 +1491,7 @@ mod canonical_json_tests {
                 value: "Entity Type Declaration".to_string(),
             }],
             materialization: MaterializationPolicy::Stored,
+            ring_join: None,
         }
     }
 
@@ -1446,6 +1514,7 @@ mod canonical_json_tests {
             antecedent_role_comparisons: Vec::new(),
             consequent_role_literals: Vec::new(),
             materialization: MaterializationPolicy::Stored,
+            ring_join: None,
         }
     }
 
@@ -1482,6 +1551,7 @@ mod canonical_json_tests {
                 value: "Entity Type Declaration".to_string(),
             }],
             materialization: MaterializationPolicy::Stored,
+            ring_join: None,
         }
     }
 
@@ -1509,6 +1579,7 @@ mod canonical_json_tests {
             antecedent_role_comparisons: Vec::new(),
             consequent_role_literals: Vec::new(),
             materialization: MaterializationPolicy::Stored,
+            ring_join: None,
         }
     }
 
@@ -1536,6 +1607,39 @@ mod canonical_json_tests {
             antecedent_role_comparisons: Vec::new(),
             consequent_role_literals: Vec::new(),
             materialization: MaterializationPolicy::Stored,
+            ring_join: None,
+        }
+    }
+
+    fn sample_rule_with_ring_join() -> DerivationRuleDef {
+        // Exercises the `ringJoin` field's canonical-JSON serialization
+        // (join groups + consequent positions), checked against serde
+        // byte-for-byte by the fixture below.
+        DerivationRuleDef {
+            id: "rule_ring_join".to_string(),
+            text: "* Person1 is grandparent of Person3 iff Person1 is parent of Person2 and Person2 is parent of Person3".to_string(),
+            antecedent_sources: alloc::vec![
+                AntecedentSource::FactType("Person_is_parent_of_Person".to_string()),
+                AntecedentSource::FactType("Person_is_parent_of_Person".to_string()),
+            ],
+            consequent_instance_role: String::new(),
+            consequent_cell: ConsequentCellSource::Literal("Person_is_grandparent_of_Person".to_string()),
+            kind: DerivationKind::Join,
+            join_on: Vec::new(),
+            match_on: Vec::new(),
+            consequent_bindings: Vec::new(),
+            antecedent_filters: Vec::new(),
+            consequent_computed_bindings: Vec::new(),
+            consequent_aggregates: Vec::new(),
+            unresolved_clauses: Vec::new(),
+            antecedent_role_literals: Vec::new(),
+            antecedent_role_comparisons: Vec::new(),
+            consequent_role_literals: Vec::new(),
+            materialization: MaterializationPolicy::Stored,
+            ring_join: Some(RingJoinPlan {
+                join_groups: alloc::vec![alloc::vec![(0usize, 1usize), (1usize, 0usize)]],
+                consequent_positions: alloc::vec![(0usize, 0usize), (1usize, 1usize)],
+            }),
         }
     }
 
@@ -1551,6 +1655,7 @@ mod canonical_json_tests {
             sample_rule_with_filter(),
             sample_rule_with_dynamic_consequent(),
             sample_rule_with_escapes(),
+            sample_rule_with_ring_join(),
         ] {
             let serde_out = serde_json::to_string(&r).expect("serde_json should serialize");
             let canonical = r.to_canonical_json();
@@ -1573,6 +1678,7 @@ mod canonical_json_tests {
             sample_rule_with_filter(),
             sample_rule_with_dynamic_consequent(),
             sample_rule_with_escapes(),
+            sample_rule_with_ring_join(),
         ] {
             let canonical = r.to_canonical_json();
             let parsed: DerivationRuleDef = serde_json::from_str(&canonical)

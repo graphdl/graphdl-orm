@@ -1889,6 +1889,29 @@ fn resolve_derivation_rule(
             .unwrap_or_default();
     });
 
+    // Ring / self-join (whitepaper eq:join): when a Halpin numeric
+    // subscript (`Person2`) recurs across >=2 antecedent clauses it is a
+    // join VARIABLE that noun-name `join_on` cannot name — the base noun
+    // fills more than one role of a self-ring fact type. Resolve the join
+    // key(s) and each consequent role's value-source POSITIONALLY from the
+    // subscripts and route to `DerivationKind::Join`; compile_join_derivation
+    // consumes `ring_join`. Returns None (kind / join_on left as-is) unless
+    // the rule actually uses recurring subscripts over a self-ring, so
+    // ordinary rules and "that"-anaphora joins are untouched.
+    if rule.antecedent_sources.len() >= 2 {
+        if let Some(plan) = compute_ring_join_plan(
+            &rule.text,
+            &rule.antecedent_sources,
+            &resolved_part_text,
+            rule.consequent_cell.literal_id(),
+            &noun_names,
+            ir.fact_types,
+        ) {
+            rule.kind = DerivationKind::Join;
+            rule.ring_join = Some(plan);
+        }
+    }
+
     // Set rule ID from the FULL rule text. Multiple rules often share
     // a consequent FT (the FORML 2 grammar has 28 rules all producing
     // `Statement has Classification`), so keying on consequent alone
@@ -1901,6 +1924,106 @@ fn resolve_derivation_rule(
         h = h.wrapping_mul(0x100000001b3);
     }
     rule.id = format!("rule_{h:x}");
+}
+
+/// Consequent text of a derivation rule: everything before the leftmost
+/// ` iff ` / ` if ` / ` when ` keyword, with any leading bullet marker
+/// stripped (markers are usually normalized away upstream; stripping
+/// here is idempotent).
+fn derivation_consequent_text(rule_text: &str) -> &str {
+    let mut t = rule_text.trim();
+    for m in ["** ", "* ", "+ "] {
+        if let Some(rest) = t.strip_prefix(m) { t = rest; break; }
+    }
+    match t.find(" iff ").or_else(|| t.find(" if ")).or_else(|| t.find(" when ")) {
+        Some(i) => t[..i].trim(),
+        None => t,
+    }
+}
+
+/// Resolve a self-ring / ring-FT Join derivation's positional join plan
+/// (whitepaper eq:join — `s_sh` selects the shared roles BY POSITION)
+/// from the rule's Halpin numeric subscripts. Returns `None` (so the
+/// caller leaves the rule on its existing path) unless every antecedent
+/// resolves to a fact type, at least one antecedent is a self-ring (a
+/// base noun fills >1 role), a SUBSCRIPTED variable recurs across >=2
+/// antecedents (the join key), and clause tokenisation lines up with the
+/// fact-type role arities. The subscript gate keeps "that"-anaphora and
+/// noun-name joins on their existing path.
+///
+/// `antecedent_clauses[i]` is the resolved text of `antecedent_sources[i]`
+/// (same index alignment the #914 comparison pass relies on); the k-th
+/// noun token in a clause fills role k of that antecedent's fact type.
+fn compute_ring_join_plan(
+    rule_text: &str,
+    antecedent_sources: &[crate::types::AntecedentSource],
+    antecedent_clauses: &[String],
+    consequent_ft_id: &str,
+    noun_names: &[String],
+    fact_types: &HashMap<String, FactTypeDef>,
+) -> Option<crate::types::RingJoinPlan> {
+    let n = antecedent_sources.len();
+    if n < 2 || antecedent_clauses.len() < n { return None; }
+
+    // Ordered noun tokens (subscripts preserved) of a clause.
+    let tokens_in_order = |clause: &str| -> Vec<String> {
+        let mut occ: Vec<(usize, String)> = find_nouns(clause, noun_names)
+            .into_iter().map(|(s, _, t)| (s, t)).collect();
+        occ.sort_by_key(|(s, _)| *s);
+        occ.into_iter().map(|(_, t)| t).collect()
+    };
+    let is_subscripted = |t: &str| -> bool {
+        let (base, _) = parse_role_token(t);
+        base.len() != t.len()
+    };
+
+    // token -> (antecedent_index, role_index) occurrences.
+    let mut token_positions: Vec<(String, Vec<(usize, usize)>)> = Vec::new();
+    let mut any_self_ring = false;
+    for i in 0..n {
+        let ft_id = antecedent_sources[i].fact_type_id();
+        if ft_id.is_empty() { return None; }
+        let ft = fact_types.get(ft_id)?;
+        let mut bases: Vec<&str> = ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
+        let role_count = bases.len();
+        bases.sort_unstable();
+        if bases.windows(2).any(|w| w[0] == w[1]) { any_self_ring = true; }
+        let toks = tokens_in_order(&antecedent_clauses[i]);
+        if toks.len() != role_count { return None; }
+        for (role_idx, tok) in toks.into_iter().enumerate() {
+            match token_positions.iter_mut().find(|(t, _)| *t == tok) {
+                Some((_, ps)) => ps.push((i, role_idx)),
+                None => token_positions.push((tok, alloc::vec![(i, role_idx)])),
+            }
+        }
+    }
+    if !any_self_ring { return None; }
+
+    // Join keys: SUBSCRIPTED variables occupying >=2 DISTINCT antecedents.
+    let join_groups: Vec<Vec<(usize, usize)>> = token_positions.iter()
+        .filter(|(tok, ps)| {
+            if !is_subscripted(tok) { return false; }
+            let mut ants: Vec<usize> = ps.iter().map(|(a, _)| *a).collect();
+            ants.sort_unstable();
+            ants.dedup();
+            ants.len() >= 2
+        })
+        .map(|(_, ps)| ps.clone())
+        .collect();
+    if join_groups.is_empty() { return None; }
+
+    // Consequent role sources: k-th consequent noun token -> consequent
+    // role k; its value comes from that token's first antecedent slot.
+    let cons_ft = fact_types.get(consequent_ft_id)?;
+    let cons_toks = tokens_in_order(derivation_consequent_text(rule_text));
+    if cons_toks.len() != cons_ft.roles.len() { return None; }
+    let mut consequent_positions: Vec<(usize, usize)> = Vec::with_capacity(cons_toks.len());
+    for tok in cons_toks {
+        let (_, ps) = token_positions.iter().find(|(t, _)| *t == tok)?;
+        consequent_positions.push(*ps.first()?);
+    }
+
+    Some(crate::types::RingJoinPlan { join_groups, consequent_positions })
 }
 
 
