@@ -2424,7 +2424,11 @@ fn augment_delta_with_entity_cells(
 
         for (ft_id, target) in shard_map.iter() {
             if *target != target_snake { continue; }
-            let cell = ast::fetch_or_phi(ft_id, &merged);
+            // #932 phase-2: fetch_cell_seq so a folded (Map) FT cell's rows
+            // project into the per-entity 3NF row too — raw as_seq() here
+            // returned None for a Map cell, leaving the row with only its
+            // seeded id (no total/customer).
+            let cell = ast::fetch_cell_seq(ft_id, &merged);
             let Some(facts) = cell.as_seq() else { continue };
             for fact in facts.iter() {
                 if ast::binding(fact, &noun_name) != Some(&entity_id) { continue; }
@@ -3814,7 +3818,7 @@ Task has Task Status.
         // id. Find any non-empty Task id from the FT cells, then probe
         // get:Task with it. If auto-generate worked, get must succeed.
         let generated_id: Option<String> = task_cells.iter().find_map(|(_, contents)| {
-            contents.as_seq()?.iter().find_map(|f| {
+            ast::cell_facts_iter(contents).find_map(|f| {
                 ast::binding(f, "Task").filter(|s| !s.is_empty()).map(|s| s.to_string())
             })
         });
@@ -3917,7 +3921,7 @@ Transition 'complete' is defined in State Machine Definition 'Task'.
         // the role name preserves spaces verbatim, only the head noun
         // and `_has_` suffix are joined with underscores.
         let pre = peek(h).expect("handle live after create");
-        let pre_status_cell = ast::fetch_or_phi("Task_has_Task Status", &pre);
+        let pre_status_cell = ast::fetch_cell_seq("Task_has_Task Status", &pre);
         let pre_status: Option<String> = pre_status_cell.as_seq().and_then(|facts|
             facts.iter().find_map(|f| {
                 if ast::binding_matches(f, "Task", "t1") {
@@ -3945,7 +3949,7 @@ Transition 'complete' is defined in State Machine Definition 'Task'.
         let post = peek(h).expect("handle live after update");
 
         let read_field = |cell: &str, role: &str| -> Option<String> {
-            ast::fetch_or_phi(cell, &post).as_seq()?.iter().find_map(|f| {
+            ast::fetch_cell_seq(cell, &post).as_seq()?.iter().find_map(|f| {
                 if ast::binding_matches(f, "Task", "t1") {
                     ast::binding(f, role).map(|s| s.to_string())
                 } else { None }
@@ -3988,7 +3992,7 @@ Transition 'complete' is defined in State Machine Definition 'Task'.
         for sm_role in &["Status", "Resource", "Noun"] {
             let cell = format!("Task_has_{sm_role}");
             let bottom = matches!(ast::fetch(&cell, &post), ast::Object::Bottom);
-            let empty = ast::fetch_or_phi(&cell, &post)
+            let empty = ast::fetch_cell_seq(&cell, &post)
                 .as_seq().map_or(true, |s| s.is_empty());
             assert!(bottom || empty,
                 "#868: spurious cell '{cell}' must NOT be created by update; \

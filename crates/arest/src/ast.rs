@@ -10348,7 +10348,7 @@ mod tests {
         // The `Person_has_name` cell must hold BOTH p-1 and p-2 — one
         // combined delta over the cumulative population.
         let cell = delta_map.get("Person_has_name").expect("Person_has_name cell in delta");
-        let facts = cell.as_seq().expect("cell is a Seq of facts");
+        let facts: alloc::vec::Vec<_> = cell_facts_iter(cell).collect();
         assert_eq!(facts.len(), 2,
             "batch delta must carry both creates' facts in one cell; got {:?}", facts);
     }
@@ -10369,7 +10369,7 @@ mod tests {
         let delta = map.get("__state_delta").expect("__state_delta present");
         let delta_map = delta.as_map().expect("__state_delta is a Map");
         let cell = delta_map.get("Person_has_name").expect("Person_has_name cell in delta");
-        assert_eq!(cell.as_seq().map(|s| s.len()).unwrap_or(0), 2,
+        assert_eq!(cell_facts_iter(cell).count(), 2,
             "batch envelope delta must carry both creates");
     }
 

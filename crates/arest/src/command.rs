@@ -515,7 +515,10 @@ fn push_with_uc_check(
     violations: &mut Vec<crate::types::Violation>,
 ) -> ast::Object {
     let Some(roles) = key_roles.get(cell_name) else {
-        return ast::cell_push(cell_name, fact, &state);
+        if cell_name.contains(':') {
+            return ast::cell_push(cell_name, fact, &state);
+        }
+        return ast::cell_put_folded(cell_name, fact, &state);
     };
     let role_refs: Vec<&str> = roles.iter().map(|s| s.as_str()).collect();
     match ast::cell_put_keyed(cell_name, &role_refs, fact.clone(), &state) {
@@ -5082,7 +5085,7 @@ Function 'place_verb' has callback URI '{}'.
 
         // First fact retained: the Description from create1 still
         // sits in `Task_has_Description`.
-        let desc_cell = ast::fetch_or_phi("Task_has_Description", &state_after_first);
+        let desc_cell = ast::fetch_cell_seq("Task_has_Description", &state_after_first);
         let entries: Vec<&ast::Object> = desc_cell.as_seq()
             .map(|s| s.iter().collect()).unwrap_or_default();
         let task_999_desc: Option<String> = entries.iter()
@@ -7346,7 +7349,7 @@ Transition 'place' is defined in State Machine Definition 'Order'.
         // Combined population: BOTH orders' Amount facts ride in the one
         // delta the batch emits — proof the ops share one state, not N.
         let merged = ast::merge_states(&state, &result.state);
-        let amounts = ast::fetch_or_phi("Order_has_Amount", &merged);
+        let amounts = ast::fetch_cell_seq("Order_has_Amount", &merged);
         let ord_ids: Vec<String> = amounts.as_seq().map(|s| s.iter()
             .filter_map(|f| ast::binding(f, "Order").map(String::from))
             .collect()).unwrap_or_default();
@@ -7459,7 +7462,7 @@ Transition 'place' is defined in State Machine Definition 'Order'.
         let result = apply_command_defs(&def_map, &cmd, &state);
         assert!(!result.rejected, "batch JSON must apply; {:?}", result.violations);
         let merged = ast::merge_states(&state, &result.state);
-        let descs = ast::fetch_or_phi("Task_has_Description", &merged);
+        let descs = ast::fetch_cell_seq("Task_has_Description", &merged);
         let n = descs.as_seq().map(|s| s.len()).unwrap_or(0);
         assert_eq!(n, 2, "both batched creates must land; got {n}");
     }
