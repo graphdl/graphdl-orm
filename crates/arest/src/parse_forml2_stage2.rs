@@ -2553,6 +2553,38 @@ fn enrich_constraints_with_spans(
 
         // Preference 1: resolve by full noun-sequence match.
         let text = binding(c, "text").unwrap_or("");
+
+        // G0 (#932): SS / EQ set constraints compare TWO distinct fact types
+        // (antecedent FT subset_of / = consequent FT). The single-FT
+        // resolution below sets span0 == span1, degenerating
+        // `compile_subset_ast` to `A subset_of A` (trivially true → never a
+        // violation → no enforcement). Resolve each clause-half separately so
+        // the two spans are distinct. Falls through to the single-FT path when
+        // a half does not resolve to an exact role-sequence match (e.g.
+        // join-path subsets, whose subsumed side is a join — handled
+        // separately). The single-FT path (UC/MC/ring/value) is unaffected.
+        let kind = binding(c, "kind").unwrap_or("");
+        if kind == "SS" || kind == "EQ" {
+            let split = text.split_once(" then ")
+                .or_else(|| text.split_once(" if and only if "));
+            if let Some((ante, cons)) = split {
+                if let (Some((a_ft, a_pos)), Some((b_ft, b_pos))) = (
+                    resolve_constraint_span_ft(ante, &roles_by_ft, &declared_nouns),
+                    resolve_constraint_span_ft(cons, &roles_by_ft, &declared_nouns),
+                ) {
+                    let mut new_pairs = pairs;
+                    let push = |np: &mut Vec<Object>, k: &str, v: &str| {
+                        np.push(Object::seq(vec![Object::atom(k), Object::atom(v)]));
+                    };
+                    push(&mut new_pairs, "span0_factTypeId", &a_ft);
+                    push(&mut new_pairs, "span0_roleIndex", &a_pos);
+                    push(&mut new_pairs, "span1_factTypeId", &b_ft);
+                    push(&mut new_pairs, "span1_roleIndex", &b_pos);
+                    return Object::Seq(new_pairs.into());
+                }
+            }
+        }
+
         let resolved = resolve_constraint_span_ft(text, &roles_by_ft, &declared_nouns);
         // Preference 2: fall back to entity-based first-match.
         let fallback = || -> Option<(String, String)> {
@@ -6856,6 +6888,39 @@ mod tests {
         assert!(rules.is_empty(),
             "expected no Derivation Rule emission (SS wins); got {:?}",
             rules);
+    }
+
+    #[test]
+    fn enrich_set_constraint_spans_resolves_two_distinct_fts() {
+        // G0 (#932): an SS subset constraint compares TWO different fact
+        // types (antecedent FT subset_of consequent FT). enrich must resolve
+        // them to DISTINCT spans, not span0 == span1 (which makes
+        // compile_subset_ast check A subset_of A — trivially true → no
+        // enforcement, the bug this branch repairs).
+        let text = "If some Task has some Note then that Task has some Mark";
+        let ss = fact_from_pairs(&[
+            ("id", text),
+            ("kind", "SS"),
+            ("modality", "alethic"),
+            ("text", text),
+            ("entity", "Task"),
+        ]);
+        let role_facts = alloc::vec![
+            fact_from_pairs(&[("nounName", "Task"), ("factType", "Task_has_Note"), ("position", "0")]),
+            fact_from_pairs(&[("nounName", "Note"), ("factType", "Task_has_Note"), ("position", "1")]),
+            fact_from_pairs(&[("nounName", "Task"), ("factType", "Task_has_Mark"), ("position", "0")]),
+            fact_from_pairs(&[("nounName", "Mark"), ("factType", "Task_has_Mark"), ("position", "1")]),
+        ];
+        let enriched = super::enrich_constraints_with_spans(&[ss], &role_facts);
+        assert_eq!(enriched.len(), 1);
+        let span0 = binding(&enriched[0], "span0_factTypeId");
+        let span1 = binding(&enriched[0], "span1_factTypeId");
+        assert_eq!(span0, Some("Task_has_Note"),
+            "span0 must be the antecedent FT; got {:?}", span0);
+        assert_eq!(span1, Some("Task_has_Mark"),
+            "span1 must be the consequent FT; got {:?}", span1);
+        assert_ne!(span0, span1,
+            "SS spans must be DISTINCT FTs (else compile_subset_ast checks A subset_of A)");
     }
 
     #[test]

@@ -11093,6 +11093,104 @@ mod mandatory_role_alethic_rejection_tests {
              fails to participate in; got {:?}", v.detail);
     }
 
+    /// End-to-end (#932 G0, downstream half): an SS subset constraint with
+    /// DISTINCT spans (antecedent ft_has_note subset_of consequent ft_has_mark,
+    /// joined on Task) must produce an alethic violation through `validate`
+    /// when a Task has a Note but no Mark. Combined with
+    /// `enrich_set_constraint_spans_resolves_two_distinct_fts` (which proves
+    /// enrich now emits distinct spans for a textual SS reading), this proves
+    /// the textual subset ENFORCES end-to-end. With the pre-G0 span0==span1
+    /// bug the check was `A subset_of A` and never fired.
+    #[test]
+    fn ss_violation_alethic_with_distinct_spans() {
+        let mut cells: HashMap<String, Vec<Object>> = HashMap::new();
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Task"), ("objectType", "entity")]));
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Note"), ("objectType", "value")]));
+        cells.entry("Noun".into()).or_default().push(fact_from_pairs(&[
+            ("name", "Mark"), ("objectType", "value")]));
+        cells.entry("FactType".into()).or_default().push(fact_from_pairs(&[
+            ("id", "ft_has_note"), ("reading", "Task has Note"), ("arity", "2")]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_has_note"), ("nounName", "Task"), ("position", "0")]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_has_note"), ("nounName", "Note"), ("position", "1")]));
+        cells.entry("FactType".into()).or_default().push(fact_from_pairs(&[
+            ("id", "ft_has_mark"), ("reading", "Task has Mark"), ("arity", "2")]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_has_mark"), ("nounName", "Task"), ("position", "0")]));
+        cells.entry("Role".into()).or_default().push(fact_from_pairs(&[
+            ("factType", "ft_has_mark"), ("nounName", "Mark"), ("position", "1")]));
+        let ss = ConstraintDef {
+            id: "ss_note_mark".into(),
+            kind: "SS".into(),
+            modality: "alethic".into(),
+            text: "If some Task has some Note then that Task has some Mark".into(),
+            spans: vec![
+                SpanDef { fact_type_id: "ft_has_note".into(), role_index: 0, subset_autofill: None },
+                SpanDef { fact_type_id: "ft_has_mark".into(), role_index: 0, subset_autofill: None },
+            ],
+            ..Default::default()
+        };
+        cells.entry("Constraint".into()).or_default()
+            .push(crate::parse_forml2::constraint_to_fact_test(&ss));
+        // Population per the subset SEMANTICS (violation set must equal A \ B):
+        //   t1 has a Note but NO Mark   -> in A, not in B -> WITNESS (must flag).
+        //   t2 has a Note AND a Mark    -> in A and in B  -> SATISFIER (must NOT flag).
+        cells.entry("ft_has_note".into()).or_default().push(Object::seq(vec![
+            Object::seq(vec![Object::atom("Task"), Object::atom("t1")]),
+            Object::seq(vec![Object::atom("Note"), Object::atom("n1")]),
+        ]));
+        cells.entry("ft_has_note".into()).or_default().push(Object::seq(vec![
+            Object::seq(vec![Object::atom("Task"), Object::atom("t2")]),
+            Object::seq(vec![Object::atom("Note"), Object::atom("n2")]),
+        ]));
+        cells.entry("ft_has_mark".into()).or_default().push(Object::seq(vec![
+            Object::seq(vec![Object::atom("Task"), Object::atom("t2")]),
+            Object::seq(vec![Object::atom("Mark"), Object::atom("m2")]),
+        ]));
+        let state = Object::Map(cells.into_iter()
+            .map(|(k, v)| (k, Object::Seq(v.into())))
+            .collect::<hashbrown::HashMap<_, _>>().into());
+
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+        let ctx = ast::encode_eval_context_state("", None, &state);
+        let violations_obj = ast::apply(&ast::Func::Def("validate".to_string()), &ctx, &d);
+        let violations = ast::decode_violations(&violations_obj);
+
+        let ss_violations: Vec<&crate::types::Violation> = violations.iter()
+            .filter(|v| v.constraint_id == "ss_note_mark")
+            .collect();
+        // Theory (whitepaper): `pop(A) subset_of pop(B)` compiles to a Filter
+        // restriction whose violation set is EXACTLY A \ B (the witnesses),
+        // empty iff the subset holds; alethic -> reject (thm:complete); the
+        // violation verbalizes as the original reading (cor:verbalize).
+
+        // (1) Violated -> non-empty.
+        assert!(!ss_violations.is_empty(),
+            "subset violated (t1 in A, not in B) -> expected >=1 violation; got constraint_ids {:?}",
+            violations.iter().map(|v| v.constraint_id.as_str()).collect::<Vec<_>>());
+        // (2) Witness set == A \ B == {t1}: the witness t1 IS flagged, and the
+        //     satisfier t2 (in A AND B) is NOT — i.e. it is a real subset, not
+        //     a blanket "A is non-empty" check.
+        assert!(ss_violations.iter().any(|v| v.detail.contains("t1")),
+            "violation must name the witness t1 (A \\ B); details {:?}",
+            ss_violations.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>());
+        assert!(!ss_violations.iter().any(|v| v.detail.contains("t2")),
+            "satisfier t2 (in A AND B) must NOT be flagged; details {:?}",
+            ss_violations.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>());
+        // (3) cor:verbalize: the violation carries the original reading.
+        assert!(ss_violations[0].constraint_text.contains(
+                "If some Task has some Note then that Task has some Mark"),
+            "cor:verbalize -- violation must carry the original reading; got constraint_text {:?}",
+            ss_violations[0].constraint_text);
+        // (4) Alethic -> rejects (thm:complete: D' = D).
+        assert!(ss_violations[0].alethic,
+            "SS violation must be alethic (rejects); got {:?}", ss_violations[0]);
+    }
+
     /// Silent-MC gap: if an MC arrives with no resolvable spans (e.g.
     /// the FT id cannot be matched by `enrich_constraints_with_spans`),
     /// `compile_mandatory_ast` falls through to `Func::constant(phi())`
