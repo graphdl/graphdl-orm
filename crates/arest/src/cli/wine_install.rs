@@ -253,11 +253,12 @@ pub fn installer_filename_for(state: &ast::Object, app_id: &str) -> Option<Strin
     None
 }
 
-/// Push a state-machine transition fact onto the
-/// `Wine_App_install_status` cell. Returns the new state with the
-/// fact appended. Mirrors the #212 SM-as-derivation pattern: every
-/// transition is one fact; the final state is the last fact in the
-/// cell.
+/// Set the current `Install Status` for an app on the
+/// `Wine_App_install_status` cell. #932 phase-2: the cell is functional
+/// (`Wine App` -> `Install Status`), so this retracts the app's prior
+/// status and writes the new one keyed by `Wine App` — the cell holds
+/// exactly one Map row per app (the current state), not an
+/// append-history.
 ///
 /// Public so the dispatcher can chain transitions explicitly if it
 /// needs to (e.g. for richer telemetry); the production caller
@@ -272,7 +273,19 @@ pub fn push_install_status(
         ("Wine App", app_id),
         ("Install Status", status.as_label()),
     ]);
-    ast::cell_push("Wine_App_install_status", fact, state)
+    // #932 phase-2: `Wine App` -> `Install Status` is functional (one
+    // current status per app; no Timestamp role, so a set has no
+    // well-defined "latest" — it must be one row). Retract the app's
+    // prior status, then write keyed by `Wine App` so the cell is a Map
+    // (eq:cellfold D_n) with one row per app, replacing the old
+    // append-a-history / read-the-last-fact pattern.
+    let cleared = ast::cell_filter(
+        "Wine_App_install_status",
+        |f| !ast::binding_matches(f, "Wine App", app_id),
+        state,
+    );
+    ast::cell_put_keyed("Wine_App_install_status", &["Wine App"], fact, &cleared)
+        .unwrap_or(cleared)
 }
 
 /// Format an `InstallReport` as a human-readable progress block for
@@ -370,11 +383,12 @@ mod tests {
     }
 
     #[test]
-    fn push_install_status_appends_fact() {
+    fn push_install_status_writes_functional_row() {
+        // #932 phase-2: status is functional — one Map-backed row per app.
         let state = seeded_state();
         let after = push_install_status(&state, "notepad-plus-plus", InstallStatus::Installed);
-        let cell = ast::fetch_or_phi("Wine_App_install_status", &after);
-        let seq = cell.as_seq().expect("cell must be a seq");
+        let cell = ast::fetch_cell_seq("Wine_App_install_status", &after);
+        let seq = cell.as_seq().expect("cell facts");
         assert_eq!(seq.len(), 1);
         let fact = seq.iter().next().unwrap();
         assert_eq!(ast::binding(fact, "Wine App"), Some("notepad-plus-plus"));
@@ -382,19 +396,18 @@ mod tests {
     }
 
     #[test]
-    fn push_install_status_chains_transitions() {
-        // Transition stream: Downloaded → Installing → Installed.
-        // The final state is always the last fact in the cell.
+    fn push_install_status_replaces_to_current() {
+        // #932 phase-2: status is functional — each transition REPLACES,
+        // so after Downloaded → Installing → Installed the cell holds
+        // exactly one row (the current status), not the history.
         let mut s = ast::Object::phi();
         s = push_install_status(&s, "x", InstallStatus::Downloaded);
         s = push_install_status(&s, "x", InstallStatus::Installing);
         s = push_install_status(&s, "x", InstallStatus::Installed);
-        let cell = ast::fetch_or_phi("Wine_App_install_status", &s);
+        let cell = ast::fetch_cell_seq("Wine_App_install_status", &s);
         let seq = cell.as_seq().unwrap();
-        let labels: Vec<&str> = seq.iter()
-            .map(|f| ast::binding(f, "Install Status").unwrap_or("?"))
-            .collect();
-        assert_eq!(labels, vec!["Downloaded", "Installing", "Installed"]);
+        assert_eq!(seq.len(), 1, "functional: one current row per app");
+        assert_eq!(ast::binding(&seq[0], "Install Status"), Some("Installed"));
     }
 
     #[test]

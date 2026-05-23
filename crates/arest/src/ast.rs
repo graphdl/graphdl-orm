@@ -5053,9 +5053,24 @@ pub fn binding_matches(fact: &Object, key: &str, val: &str) -> bool {
 /// Replaces: instances.retain(|inst| predicate(inst))
 pub fn cell_filter(name: &str, predicate: impl Fn(&Object) -> bool, state: &Object) -> Object {
     let existing = fetch_or_phi(name, state);
-    let filtered = match existing.as_seq() {
-        Some(items) => Object::Seq(items.iter().filter(|f| predicate(f)).cloned().collect()),
-        None => Object::phi(),
+    // #932 phase-2: both-tolerant. A Seq cell filters its items (Seq
+    // preserved); a Map cell (folded D_n) filters by value, preserving
+    // the keyed Map shape — so a retract on a folded cell drops only the
+    // matching rows instead of collapsing the whole cell to empty (the
+    // raw-as_seq()-on-Map silent-wipe bug class). Other shapes hold no
+    // facts to retain.
+    let filtered = match &existing {
+        Object::Seq(items) => {
+            Object::Seq(items.iter().filter(|f| predicate(f)).cloned().collect())
+        }
+        Object::Map(m) => Object::Map(
+            m.iter()
+                .filter(|(_, v)| predicate(v))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect::<HashMap<String, Object>>()
+                .into(),
+        ),
+        _ => Object::phi(),
     };
     store(name, filtered, state)
 }

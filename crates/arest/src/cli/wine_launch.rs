@@ -293,11 +293,12 @@ pub fn current_run_status(state: &ast::Object, app_id: &str) -> Option<RunStatus
     latest
 }
 
-/// Push a state-machine transition fact onto the
-/// `Wine_App_run_status` cell. Returns the new state with the fact
-/// appended. Mirrors `wine_install::push_install_status`: every
-/// transition is one fact; the final state is the last fact in the
-/// cell.
+/// Set the current `Run Status` for an app on the `Wine_App_run_status`
+/// cell. #932 phase-2: the cell is functional (`Wine App` -> `Run
+/// Status`), so this retracts the app's prior status and writes the new
+/// one keyed by `Wine App` — the cell holds exactly one Map row per app
+/// (the current state), not an append-history. Mirrors
+/// `wine_install::push_install_status` and the SM-status discipline.
 pub fn push_run_status(
     state: &ast::Object,
     app_id: &str,
@@ -307,7 +308,19 @@ pub fn push_run_status(
         ("Wine App", app_id),
         ("Run Status", status.as_label()),
     ]);
-    ast::cell_push("Wine_App_run_status", fact, state)
+    // #932 phase-2: `Wine App` -> `Run Status` is functional (one current
+    // status per app; no Timestamp role, so a set has no well-defined
+    // "latest" — it must be one row). Retract the app's prior status, then
+    // write keyed by `Wine App` so the cell is a Map (eq:cellfold D_n)
+    // with one row per app, replacing the old append-a-history /
+    // read-the-last-fact pattern. Mirrors the SM-status discipline.
+    let cleared = ast::cell_filter(
+        "Wine_App_run_status",
+        |f| !ast::binding_matches(f, "Wine App", app_id),
+        state,
+    );
+    ast::cell_put_keyed("Wine_App_run_status", &["Wine App"], fact, &cleared)
+        .unwrap_or(cleared)
 }
 
 /// Format a `LaunchReport` as a human-readable progress block for
@@ -386,11 +399,12 @@ mod tests {
     }
 
     #[test]
-    fn push_run_status_appends_fact() {
+    fn push_run_status_writes_functional_row() {
+        // #932 phase-2: status is functional — one Map-backed row per app.
         let state = seeded_state();
         let after = push_run_status(&state, "notepad-plus-plus", RunStatus::Running);
-        let cell = ast::fetch_or_phi("Wine_App_run_status", &after);
-        let seq = cell.as_seq().expect("cell must be a seq");
+        let cell = ast::fetch_cell_seq("Wine_App_run_status", &after);
+        let seq = cell.as_seq().expect("cell facts");
         assert_eq!(seq.len(), 1);
         let fact = seq.iter().next().unwrap();
         assert_eq!(ast::binding(fact, "Wine App"), Some("notepad-plus-plus"));
@@ -398,19 +412,18 @@ mod tests {
     }
 
     #[test]
-    fn push_run_status_chains_transitions() {
-        // Transition stream: Running → Paused → Crashed. The final
-        // state is always the last fact in the cell.
+    fn push_run_status_replaces_to_current() {
+        // #932 phase-2: status is functional — each transition REPLACES,
+        // so after Running → Paused → Crashed the cell holds exactly one
+        // row (the current status), not the three-step history.
         let mut s = ast::Object::phi();
         s = push_run_status(&s, "x", RunStatus::Running);
         s = push_run_status(&s, "x", RunStatus::Paused);
         s = push_run_status(&s, "x", RunStatus::Crashed);
-        let cell = ast::fetch_or_phi("Wine_App_run_status", &s);
+        let cell = ast::fetch_cell_seq("Wine_App_run_status", &s);
         let seq = cell.as_seq().unwrap();
-        let labels: Vec<&str> = seq.iter()
-            .map(|f| ast::binding(f, "Run Status").unwrap_or("?"))
-            .collect();
-        assert_eq!(labels, vec!["Running", "Paused", "Crashed"]);
+        assert_eq!(seq.len(), 1, "functional: one current row per app");
+        assert_eq!(ast::binding(&seq[0], "Run Status"), Some("Crashed"));
     }
 
     #[test]
