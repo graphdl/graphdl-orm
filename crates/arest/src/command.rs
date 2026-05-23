@@ -881,7 +881,7 @@ fn auto_generate_entity_id(noun: &str, state: &ast::Object) -> String {
 /// createEntity and updateEntity; `compile` stays permissive at design-time.
 fn noun_runtime_defined(noun: &str, state: &ast::Object, d: &ast::Object) -> bool {
     [state, d].iter().any(|src|
-        ast::fetch_or_phi("Noun", src).as_seq().map_or(false, |fs|
+        ast::fetch_cell_seq("Noun", src).as_seq().map_or(false, |fs|
             fs.iter().any(|f|
                 ast::binding(f, "name") == Some(noun)
                     && ast::binding(f, "objectType") == Some("entity")
@@ -971,7 +971,7 @@ fn create_via_defs(
     // that level; the pre-check is what surfaces the duplicate-entity
     // case to the caller.)
     if explicit_id_provided {
-        let noun_cell = ast::fetch_or_phi("Noun", state);
+        let noun_cell = ast::fetch_cell_seq("Noun", state);
         let ref_scheme = noun_cell.as_seq()
             .and_then(|facts| facts.iter()
                 .find(|f| ast::binding(f, "name") == Some(noun))
@@ -1072,7 +1072,7 @@ fn create_via_defs(
     // For compound schemes (.Owner, .Seq), split entity_id on '-' (rsplitn)
     // and push component facts: Thing_has_Owner, Thing_has_Seq.
     let resolved = {
-        let noun_cell = ast::fetch_or_phi("Noun", &resolved);
+        let noun_cell = ast::fetch_cell_seq("Noun", &resolved);
         let ref_scheme: Option<Vec<String>> = noun_cell.as_seq()
             .and_then(|facts| facts.iter()
                 .find(|f| ast::binding(f, "name") == Some(noun))
@@ -1124,7 +1124,7 @@ fn create_via_defs(
         .any(|(n, _)| n.starts_with("sql:trigger:"));
     // Collect fact types that SM transitions subscribe to.
     let sm_event_types: hashbrown::HashSet<String> = if has_sql_triggers {
-        let trigger_cell = ast::fetch_or_phi("Transition_is_triggered_by_Event_Type", d);
+        let trigger_cell = ast::fetch_cell_seq("Transition_is_triggered_by_Event_Type", d);
         trigger_cell.as_seq().map(|facts| {
             facts.iter().filter_map(|f| {
                 ast::binding(f, "Event Type").map(|s| s.to_string())
@@ -1215,7 +1215,7 @@ fn create_via_defs(
     // primary state. task-929: noun-scope the wipe to
     // derivation_index[noun]'s rules so cross-noun upstream consequent
     // cells survive.
-    let drule_cell = ast::fetch_or_phi("DerivationRule", d);
+    let drule_cell = ast::fetch_cell_seq("DerivationRule", d);
     let dropped_cells: hashbrown::HashSet<String> = drule_cell.as_seq()
         .map(|facts| facts.iter()
             .filter(|f| relevant_ids.is_empty()
@@ -1367,7 +1367,7 @@ fn create_via_defs(
                                 (role_name == noun).then(|| role_name.to_string())
                             }).collect())
                             .unwrap_or_default();
-                        let cell = ast::fetch_or_phi(event_type, &st);
+                        let cell = ast::fetch_cell_seq(event_type, &st);
                         let has_facts = cell.as_seq().map_or(false, |facts| {
                             // If the SM noun plays a role in this fact type,
                             // check that specific role for the entity_id.
@@ -1498,7 +1498,7 @@ fn create_via_defs(
 /// task-919: resolve the State Machine Definition id bound to a noun.
 /// Reads `State_Machine_Definition_is_for_Noun` instance facts.
 fn lookup_sm_def_for_noun(d: &ast::Object, noun: &str) -> Option<String> {
-    ast::fetch_or_phi("State_Machine_Definition_is_for_Noun", d).as_seq()
+    ast::fetch_cell_seq("State_Machine_Definition_is_for_Noun", d).as_seq()
         .and_then(|facts| facts.iter().find_map(|f| {
             (ast::binding(f, "Noun") == Some(noun))
                 .then(|| ast::binding(f, "State Machine Definition").map(String::from))
@@ -1516,9 +1516,9 @@ fn find_firing_transition_id(
     from_status: &str,
     to_status: &str,
 ) -> Option<String> {
-    let from_cell = ast::fetch_or_phi("Transition_is_from_Status", d);
-    let to_cell = ast::fetch_or_phi("Transition_is_to_Status", d);
-    let in_sm_cell = ast::fetch_or_phi(
+    let from_cell = ast::fetch_cell_seq("Transition_is_from_Status", d);
+    let to_cell = ast::fetch_cell_seq("Transition_is_to_Status", d);
+    let in_sm_cell = ast::fetch_cell_seq(
         "Transition_is_defined_in_State_Machine_Definition", d);
     let in_sm: Vec<String> = in_sm_cell.as_seq().map(|facts| facts.iter().filter_map(|f| {
         let t = ast::binding(f, "Transition")?;
@@ -1549,7 +1549,7 @@ fn lookup_verb_for_transition(d: &ast::Object, transition_id: &str) -> Option<St
         "Verb_is_performed_during_Transition_(Mealy_semantics)",
         "Verb_is_performed_during_Transition_(mealy_semantics)",
     ] {
-        if let Some(v) = ast::fetch_or_phi(cell_name, d).as_seq().and_then(|facts| {
+        if let Some(v) = ast::fetch_cell_seq(cell_name, d).as_seq().and_then(|facts| {
             facts.iter().find_map(|f| {
                 (ast::binding(f, "Transition") == Some(transition_id))
                     .then(|| ast::binding(f, "Verb").map(String::from))
@@ -1572,14 +1572,14 @@ struct DispatchTarget {
 }
 
 fn lookup_dispatch_for_function(d: &ast::Object, fn_id: &str) -> DispatchTarget {
-    let name = ast::fetch_or_phi("Function_has_Name", d).as_seq().and_then(|facts| {
+    let name = ast::fetch_cell_seq("Function_has_Name", d).as_seq().and_then(|facts| {
         facts.iter().find_map(|f| {
             (ast::binding(f, "Function") == Some(fn_id))
                 .then(|| ast::binding(f, "Name").map(String::from))
                 .flatten()
         })
     });
-    let callback_uri = ast::fetch_or_phi("Function_has_callback_URI", d).as_seq().and_then(|facts| {
+    let callback_uri = ast::fetch_cell_seq("Function_has_callback_URI", d).as_seq().and_then(|facts| {
         facts.iter().find_map(|f| {
             (ast::binding(f, "Function") == Some(fn_id))
                 .then(|| ast::binding(f, "callback URI").map(String::from))
@@ -1596,7 +1596,7 @@ fn lookup_dispatch_for_function(d: &ast::Object, fn_id: &str) -> DispatchTarget 
 /// still fire with whatever headers DO parse rather than rejecting the
 /// transition over a header typo.
 fn lookup_headers_for_function(d: &ast::Object, fn_id: &str) -> Vec<(String, String)> {
-    ast::fetch_or_phi("Function_has_Header", d).as_seq().map(|facts| {
+    ast::fetch_cell_seq("Function_has_Header", d).as_seq().map(|facts| {
         facts.iter().filter_map(|f| {
             if ast::binding(f, "Function") != Some(fn_id) { return None; }
             let raw = ast::binding(f, "Header")?;
@@ -1952,7 +1952,7 @@ fn transition_via_defs(
             // resource(s) via `State Machine is for Resource`; fall back to
             // the SM id (SM id == resource id is the common reference
             // scheme).
-            let resources: Vec<String> = ast::fetch_or_phi(FOR_RESOURCE_CELL, &new_state)
+            let resources: Vec<String> = ast::fetch_cell_seq(FOR_RESOURCE_CELL, &new_state)
                 .as_seq()
                 .map(|facts| facts.iter()
                     .filter(|f| ast::binding_matches(f, sm.state_machine_role, entity_id))
@@ -1992,7 +1992,7 @@ fn transition_via_defs(
     // and are skipped). Idempotent so repeated transitions don't bloat the
     // event cell; the fold is latest-wins so a present fact is harmless.
     if new_status.is_some() && !noun.is_empty() {
-        let is_ft_trigger = ast::fetch_or_phi("Transition_is_triggered_by_Fact_Type", d)
+        let is_ft_trigger = ast::fetch_cell_seq("Transition_is_triggered_by_Fact_Type", d)
             .as_seq()
             .map(|facts| facts.iter().any(|f| ast::binding(f, "Fact Type") == Some(event)))
             .unwrap_or(false);
@@ -2002,7 +2002,7 @@ fn transition_via_defs(
             // (e.g. `Task is finished` → cell `Task_is_finished`, role
             // `Task`).
             let trigger_cell = event.replace(' ', "_");
-            let already_present = ast::fetch_or_phi(&trigger_cell, &new_state)
+            let already_present = ast::fetch_cell_seq(&trigger_cell, &new_state)
                 .as_seq()
                 .map(|facts| facts.iter().any(|f| ast::binding_matches(f, &noun, entity_id)))
                 .unwrap_or(false);
@@ -2071,7 +2071,7 @@ fn transition_via_defs(
         // (the bridge `Task has Task Status iff Resource is currently in
         // Status and ...` reads the wiped-empty upstream and emits nothing).
         let resolved = {
-            let drule_cell = ast::fetch_or_phi("DerivationRule", d);
+            let drule_cell = ast::fetch_cell_seq("DerivationRule", d);
             let derived_cells: hashbrown::HashSet<String> = drule_cell.as_seq()
                 .map(|facts| facts.iter()
                     .filter(|f| relevant_ids.is_empty()
@@ -2266,7 +2266,7 @@ fn query_via_defs(
     // matched, role_names came back empty, and target_role degenerated
     // to 0 — query_via_defs silently returned empty matches against
     // any parse-populated state. (#819)
-    let role_cell = ast::fetch_or_phi("Role", state);
+    let role_cell = ast::fetch_cell_seq("Role", state);
     let role_names: Vec<String> = role_cell.as_seq()
         .map(|roles| {
             let mut matched: Vec<(usize, String)> = roles.iter()
@@ -2618,7 +2618,7 @@ fn update_via_defs(
     // (LFP per request, AREST.tex §4.3). task-929: noun-scope the
     // wipe to derivation_index[noun]'s rules so cross-noun upstream
     // consequent cells survive.
-    let drule_cell = ast::fetch_or_phi("DerivationRule", d);
+    let drule_cell = ast::fetch_cell_seq("DerivationRule", d);
     let dropped_cells: hashbrown::HashSet<String> = drule_cell.as_seq()
         .map(|facts| facts.iter()
             .filter(|f| relevant_ids.is_empty()
@@ -2819,7 +2819,7 @@ fn evaluate_join_chain(
     let mut current_values: Vec<String> = vec![entity_id.to_string()];
 
     for (ft_id, from_role, to_role) in chain {
-        let cell = ast::fetch_or_phi(ft_id, state);
+        let cell = ast::fetch_cell_seq(ft_id, state);
         let facts = cell.as_seq().unwrap_or_default();
         let mut next_values = Vec::new();
         for val in &current_values {
@@ -2836,7 +2836,7 @@ fn evaluate_join_chain(
     }
 
     // Check if any collected value appears in the target fact type.
-    let target_cell = ast::fetch_or_phi(target_ft, state);
+    let target_cell = ast::fetch_cell_seq(target_ft, state);
     let target_facts = target_cell.as_seq().unwrap_or_default();
     current_values.iter().any(|val| {
         target_facts.iter().any(|f| ast::binding_matches(f, final_noun, val))
@@ -2890,10 +2890,10 @@ fn apply_load_readings(
     };
 
     // Count genuinely new nouns (in parsed but not in D)
-    let existing_noun_names: hashbrown::HashSet<String> = ast::fetch_or_phi("Noun", d).as_seq()
+    let existing_noun_names: hashbrown::HashSet<String> = ast::fetch_cell_seq("Noun", d).as_seq()
         .map(|facts| facts.iter().filter_map(|f| ast::binding(f, "name").map(|s| s.to_string())).collect())
         .unwrap_or_default();
-    let new_noun_count = ast::fetch_or_phi("Noun", &parsed).as_seq()
+    let new_noun_count = ast::fetch_cell_seq("Noun", &parsed).as_seq()
         .map(|facts| facts.iter().filter(|f| {
             ast::binding(f, "name").map_or(false, |n| !existing_noun_names.contains(n))
         }).count())
@@ -3611,7 +3611,7 @@ fn nav_links_via_rho(d: &ast::Object, noun: &str, entity_id: &str) -> Vec<Naviga
 
 fn extract_sm_status(state: &ast::Object, sm_id: &str) -> Option<String> {
     let sm = StateMachineCellShape::boot();
-    let cell = ast::fetch_or_phi(sm.cell_name, state);
+    let cell = ast::fetch_cell_seq(sm.cell_name, state);
     cell.as_seq()?.iter()
         .find(|fact| {
             ast::binding_matches(fact, sm.state_machine_role, sm_id)
@@ -3748,7 +3748,7 @@ pub fn select_component_json(state: &ast::Object, body: &str) -> String {
 /// noun id at runtime. Hand-pushed cells from `cell_push` follow the
 /// same convention so the two sources stay binding-compatible.
 pub fn wine_prefix_for(state: &ast::Object, app_id: &str) -> Option<String> {
-    let cell = ast::fetch_or_phi("Wine_App_has_prefix_Directory", state);
+    let cell = ast::fetch_cell_seq("Wine_App_has_prefix_Directory", state);
     cell.as_seq()?.iter().find_map(|fact| {
         if ast::binding(fact, "Wine App") == Some(app_id) {
             ast::binding(fact, "Directory").map(|s| s.to_string())
@@ -3840,7 +3840,7 @@ pub fn wine_prefix_for_json(state: &ast::Object, body: &str) -> String {
 /// renamed but the apps are still in the population).
 pub fn wine_app_ids(state: &ast::Object) -> Vec<String> {
     let mut seen: hashbrown::HashSet<String> = hashbrown::HashSet::new();
-    let cell = ast::fetch_or_phi("Wine_App_has_Compat_Rating", state);
+    let cell = ast::fetch_cell_seq("Wine_App_has_Compat_Rating", state);
     if let Some(seq) = cell.as_seq() {
         for fact in seq.iter() {
             if let Some(slug) = ast::binding(fact, "Wine App") {
@@ -3884,7 +3884,7 @@ pub fn wine_app_display_title(state: &ast::Object, slug: &str) -> Option<String>
     // Canonical cell: emitted by the parser when the
     // `Wine App has display- Title.` FT is in scope. Each fact carries
     // `(Wine App, <slug>) (Title, <title>)`.
-    let canonical = ast::fetch_or_phi("Wine_App_has_display-_Title", state);
+    let canonical = ast::fetch_cell_seq("Wine_App_has_display-_Title", state);
     if let Some(seq) = canonical.as_seq() {
         for fact in seq.iter() {
             if ast::binding(fact, "Wine App") == Some(slug) {
