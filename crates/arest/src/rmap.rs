@@ -195,7 +195,7 @@ pub(crate) struct ColumnView {
 /// `None` so callers can skip them uniformly.
 pub fn table_name_for_noun(cells: &crate::ast::Object, noun_name: &str) -> Option<String> {
     let snake = to_snake(noun_name);
-    let rows = crate::ast::fetch_or_phi("RMAPTable", cells);
+    let rows = crate::ast::fetch_cell_seq("RMAPTable", cells);
     rows.as_seq()?.iter()
         .find(|f| crate::ast::binding(f, "name") == Some(snake.as_str()))
         .and_then(|f| crate::ast::binding(f, "name").map(String::from))
@@ -204,7 +204,7 @@ pub fn table_name_for_noun(cells: &crate::ast::Object, noun_name: &str) -> Optio
 /// Return every column of a table in declaration order (sorted by the
 /// `position` field). Returns an empty vec if the table is unknown.
 pub(crate) fn columns_for_table(cells: &crate::ast::Object, table_name: &str) -> Vec<ColumnView> {
-    let rows = crate::ast::fetch_or_phi("RMAPColumn", cells);
+    let rows = crate::ast::fetch_cell_seq("RMAPColumn", cells);
     let Some(seq) = rows.as_seq() else { return Vec::new(); };
     let mut with_pos: Vec<(usize, ColumnView)> = seq.iter()
         .filter(|f| crate::ast::binding(f, "table") == Some(table_name))
@@ -234,7 +234,7 @@ pub(crate) fn columns_for_table(cells: &crate::ast::Object, table_name: &str) ->
 /// groups, commas within a group). Matches the encoding from
 /// `rmap_cells_from_state`.
 pub fn unique_constraints_of_table(cells: &crate::ast::Object, table_name: &str) -> Vec<Vec<String>> {
-    let rows = crate::ast::fetch_or_phi("RMAPTable", cells);
+    let rows = crate::ast::fetch_cell_seq("RMAPTable", cells);
     let Some(seq) = rows.as_seq() else { return Vec::new(); };
     seq.iter()
         .find(|f| crate::ast::binding(f, "name") == Some(table_name))
@@ -248,7 +248,7 @@ pub fn unique_constraints_of_table(cells: &crate::ast::Object, table_name: &str)
 
 /// Every table name in the RMAP cells view, in declaration order.
 pub fn table_names(cells: &crate::ast::Object) -> Vec<String> {
-    let rows = crate::ast::fetch_or_phi("RMAPTable", cells);
+    let rows = crate::ast::fetch_cell_seq("RMAPTable", cells);
     rows.as_seq()
         .map(|seq| seq.iter()
             .filter_map(|f| crate::ast::binding(f, "name").map(String::from))
@@ -259,7 +259,7 @@ pub fn table_names(cells: &crate::ast::Object) -> Vec<String> {
 /// Return the primary-key columns of a table in order. Empty when the
 /// table has no `RMAPTable` row or the `primaryKey` binding is empty.
 pub fn primary_key_of_table(cells: &crate::ast::Object, table_name: &str) -> Vec<String> {
-    let rows = crate::ast::fetch_or_phi("RMAPTable", cells);
+    let rows = crate::ast::fetch_cell_seq("RMAPTable", cells);
     let Some(seq) = rows.as_seq() else { return Vec::new(); };
     seq.iter()
         .find(|f| crate::ast::binding(f, "name") == Some(table_name))
@@ -318,12 +318,12 @@ pub fn decode_rmap_result(obj: &crate::ast::Object) -> Vec<TableDef> {
 }
 
 pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
-    use crate::ast::{fetch_or_phi, binding};
+    use crate::ast::{fetch_cell_seq, binding};
     use crate::types::*;
 
     // Build typed lookups from cells â€” same data state_to_domain
     // produced, without the Domain struct.
-    let noun_cell = fetch_or_phi("Noun", state);
+    let noun_cell = fetch_cell_seq("Noun", state);
     let mut nouns: HashMap<String, NounDef> = HashMap::new();
     let mut subtypes: HashMap<String, String> = HashMap::new();
     let mut ref_schemes: HashMap<String, Vec<String>> = HashMap::new();
@@ -338,8 +338,8 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
             if let Some(v) = binding(f, "enumValues") { enum_values.insert(name.clone(), v.split(',').map(|s| s.to_string()).collect()); }
         }
     }
-    let role_cell = fetch_or_phi("Role", state);
-    let fact_types: HashMap<String, FactTypeDef> = fetch_or_phi("FactType", state).as_seq()
+    let role_cell = fetch_cell_seq("Role", state);
+    let fact_types: HashMap<String, FactTypeDef> = fetch_cell_seq("FactType", state).as_seq()
         .map(|facts| facts.iter().filter_map(|f| {
             let id = binding(f, "id")?.to_string();
             let reading = binding(f, "reading").unwrap_or("").to_string();
@@ -354,7 +354,7 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
             Some((id, FactTypeDef { schema_id: String::new(), reading, readings: vec![], roles }))
         }).collect())
         .unwrap_or_default();
-    let constraints: Vec<ConstraintDef> = fetch_or_phi("Constraint", state).as_seq()
+    let constraints: Vec<ConstraintDef> = fetch_cell_seq("Constraint", state).as_seq()
         .map(|facts| facts.iter().map(|f| {
             let get = |key: &str| binding(f, key).map(|s| s.to_string());
             let spans = (0..4).filter_map(|i| {
@@ -792,11 +792,11 @@ pub fn rmap_cell_map_from_state(state: &crate::ast::Object) -> HashMap<String, S
 }
 
 pub fn rmap_cell_map(state: &crate::ast::Object) -> HashMap<String, String> {
-    use crate::ast::{fetch_or_phi, binding};
+    use crate::ast::{fetch_cell_seq, binding};
     use crate::types::*;
     let mut nouns: HashMap<String, NounDef> = HashMap::new();
     let mut subtypes: HashMap<String, String> = HashMap::new();
-    if let Some(ns) = fetch_or_phi("Noun", state).as_seq() {
+    if let Some(ns) = fetch_cell_seq("Noun", state).as_seq() {
         for f in ns.iter() {
             let name = binding(f, "name").unwrap_or("").to_string();
             let obj_type = binding(f, "objectType").unwrap_or("entity").to_string();
@@ -804,8 +804,8 @@ pub fn rmap_cell_map(state: &crate::ast::Object) -> HashMap<String, String> {
             if let Some(st) = binding(f, "superType") { subtypes.insert(name.clone(), st.to_string()); }
         }
     }
-    let role_cell = fetch_or_phi("Role", state);
-    let fact_types: HashMap<String, FactTypeDef> = fetch_or_phi("FactType", state).as_seq()
+    let role_cell = fetch_cell_seq("Role", state);
+    let fact_types: HashMap<String, FactTypeDef> = fetch_cell_seq("FactType", state).as_seq()
         .map(|facts| facts.iter().filter_map(|f| {
             let id = binding(f, "id")?.to_string();
             let reading = binding(f, "reading").unwrap_or("").to_string();
@@ -820,7 +820,7 @@ pub fn rmap_cell_map(state: &crate::ast::Object) -> HashMap<String, String> {
             Some((id, FactTypeDef { schema_id: String::new(), reading, readings: vec![], roles }))
         }).collect())
         .unwrap_or_default();
-    let constraints: Vec<ConstraintDef> = fetch_or_phi("Constraint", state).as_seq()
+    let constraints: Vec<ConstraintDef> = fetch_cell_seq("Constraint", state).as_seq()
         .map(|facts| facts.iter().map(|f| {
             let get = |key: &str| binding(f, key).map(|s| s.to_string());
             let spans = (0..4).filter_map(|i| {
@@ -964,13 +964,13 @@ impl EntityCellRouter {
     /// cell. One state pass; per-fact routing thereafter is HashMap
     /// lookups.
     pub fn new(state: &crate::ast::Object) -> Self {
-        use crate::ast::{fetch_or_phi, binding};
+        use crate::ast::{fetch_cell_seq, binding};
 
         let shard_map = rmap_cell_map(state);
 
         let mut noun_by_snake: HashMap<String, String> = HashMap::new();
         let mut id_field_by_noun: HashMap<String, String> = HashMap::new();
-        if let Some(ns) = fetch_or_phi("Noun", state).as_seq() {
+        if let Some(ns) = fetch_cell_seq("Noun", state).as_seq() {
             for n in ns.iter() {
                 let Some(name) = binding(n, "name") else { continue };
                 noun_by_snake.insert(to_snake(name), name.to_string());

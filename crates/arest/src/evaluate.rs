@@ -1102,14 +1102,14 @@ pub fn synthesize_from_state(state: &ast::Object, noun_name: &str, depth: usize)
     let wa = WorldAssumption::Closed;
 
     // 1. Find schemas where this noun plays a role (via Role facts)
-    let role_cell = ast::fetch_or_phi("Role", state);
+    let role_cell = ast::fetch_cell_seq("Role", state);
     let role_facts = role_cell.as_seq().unwrap_or(&[]);
     let schema_ids_for_noun: Vec<(String, usize)> = role_facts.iter()
         .filter(|r| b(r, "nounName") == noun_name)
         .map(|r| (b(r, "factType"), b(r, "position").parse().unwrap_or(0)))
         .collect();
 
-    let schema_cell = ast::fetch_or_phi("FactType", state);
+    let schema_cell = ast::fetch_cell_seq("FactType", state);
     let schema_facts = schema_cell.as_seq().unwrap_or(&[]);
     let participates_in: Vec<FactTypeSummary> = schema_ids_for_noun.iter()
         .filter_map(|(sid, role_idx)| {
@@ -1125,7 +1125,7 @@ pub fn synthesize_from_state(state: &ast::Object, noun_name: &str, depth: usize)
     // before the move into SynthesisResult at end of function.
     let applicable_constraints: Vec<ConstraintSummary> = {
         let ft_ids: HashSet<&str> = participates_in.iter().map(|f| f.id.as_str()).collect();
-        let constraint_cell = ast::fetch_or_phi("Constraint", state);
+        let constraint_cell = ast::fetch_cell_seq("Constraint", state);
         let constraint_facts = constraint_cell.as_seq().unwrap_or(&[]);
         let mut seen = HashSet::new();
         constraint_facts.iter()
@@ -1148,7 +1148,7 @@ pub fn synthesize_from_state(state: &ast::Object, noun_name: &str, depth: usize)
     };
 
     // 3. State machines (from InstanceFact: "State Machine Definition 'X' is for Noun 'noun'")
-    let inst_cell = ast::fetch_or_phi("InstanceFact", state);
+    let inst_cell = ast::fetch_cell_seq("InstanceFact", state);
     let inst_facts = inst_cell.as_seq().unwrap_or(&[]);
     let state_machines: Vec<StateMachineSummary> = inst_facts.iter()
         .filter(|f| b(f, "subjectNoun") == "State Machine Definition" && b(f, "objectNoun") == "Noun" && b(f, "objectValue") == noun_name)
