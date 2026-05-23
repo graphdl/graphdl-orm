@@ -15,7 +15,7 @@
 use hashbrown::{HashMap, HashSet};
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
-use crate::ast::{fetch_or_phi, binding};
+use crate::ast::{fetch_cell_seq, binding};
 
 // WASM-safe timing shim. The wasm32-unknown-unknown target panics on
 // std::time::Instant::now() (the Rust stdlib has no clock there). On
@@ -898,7 +898,7 @@ fn apps_opted_into_generator(
         .map(|f| f.subject_value.clone())
         .collect();
 
-    let from_cell: HashSet<String> = crate::ast::fetch_or_phi("App_uses_Generator", state)
+    let from_cell: HashSet<String> = crate::ast::fetch_cell_seq("App_uses_Generator", state)
         .as_seq()
         .map(|facts| facts.iter()
             .filter_map(|fact| {
@@ -1093,7 +1093,7 @@ fn compile_per_noun_platform_family(
     prefix: &str,
     platform_key: &str,
 ) -> Vec<(String, Func)> {
-    fetch_or_phi("Noun", state).as_seq()
+    fetch_cell_seq("Noun", state).as_seq()
         .map(|ns| ns.iter()
             .filter_map(|n| binding(n, "name").map(|s| s.to_string()))
             .map(|noun_name| (
@@ -1135,9 +1135,9 @@ fn compile_shard_family(state: &crate::ast::Object) -> Vec<(String, Func)> {
 /// `compile_to_defs_state`, without its pass through the full
 /// compile pipeline.
 fn compile_resolve_family(state: &crate::ast::Object) -> Vec<(String, Func)> {
-    let noun_cell = fetch_or_phi("Noun", state);
-    let ft_cell = fetch_or_phi("FactType", state);
-    let role_cell = fetch_or_phi("Role", state);
+    let noun_cell = fetch_cell_seq("Noun", state);
+    let ft_cell = fetch_cell_seq("FactType", state);
+    let role_cell = fetch_cell_seq("Role", state);
 
     let noun_names: Vec<String> = noun_cell.as_seq()
         .map(|ns| ns.iter()
@@ -1250,7 +1250,7 @@ pub(crate) fn compile_migration_defs(state: &crate::ast::Object) -> Vec<(String,
     use alloc::sync::Arc;
     use crate::ast::Object;
 
-    let migration_cell = fetch_or_phi("Migration", state);
+    let migration_cell = fetch_cell_seq("Migration", state);
     let Some(migs) = migration_cell.as_seq() else { return Vec::new(); };
     migs.iter().filter_map(|mig_fact| {
         let mig_id = binding(mig_fact, "id")?.to_string();
@@ -1355,12 +1355,12 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // state-based shims (rmap_from_state, rmap_cell_map_from_state).
 
     // â”€â”€ Cell-based lookups (read from state, not domain) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    let noun_cell = fetch_or_phi("Noun", state);
-    let ft_cell = fetch_or_phi("FactType", state);
-    let role_cell = fetch_or_phi("Role", state);
-    let constraint_cell = fetch_or_phi("Constraint", state);
-    let rule_cell = fetch_or_phi("DerivationRule", state);
-    let inst_cell = fetch_or_phi("InstanceFact", state);
+    let noun_cell = fetch_cell_seq("Noun", state);
+    let ft_cell = fetch_cell_seq("FactType", state);
+    let role_cell = fetch_cell_seq("Role", state);
+    let constraint_cell = fetch_cell_seq("Constraint", state);
+    let rule_cell = fetch_cell_seq("DerivationRule", state);
+    let inst_cell = fetch_cell_seq("InstanceFact", state);
 
     // Build typed local collections from cells.
     // c_nouns: HashMap<String, NounDef> â€” noun name â†’ definition
@@ -1728,7 +1728,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         // `compile_subtype_inheritance_metamodel` actually consumes.
         let subtype_pairs: Vec<(String, String)> = {
             let mut pairs: Vec<(String, String)> = Vec::new();
-            let st_cell = crate::ast::fetch_or_phi("Subtype", state);
+            let st_cell = crate::ast::fetch_cell_seq("Subtype", state);
             if let Some(facts) = st_cell.as_seq() {
                 for f in facts.iter() {
                     if let (Some(sub), Some(sup)) = (
@@ -1739,7 +1739,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                     }
                 }
             }
-            let noun_cell_for_pairs = crate::ast::fetch_or_phi("Noun", state);
+            let noun_cell_for_pairs = crate::ast::fetch_cell_seq("Noun", state);
             if let Some(facts) = noun_cell_for_pairs.as_seq() {
                 for f in facts.iter() {
                     if let (Some(sub), Some(sup)) = (
@@ -1768,7 +1768,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         // and we don't have access to its result here.
         let ss_autofill_ft_pairs: Vec<(String, String)> = {
             let mut pairs: Vec<(String, String)> = Vec::new();
-            let c_cell = crate::ast::fetch_or_phi("Constraint", state);
+            let c_cell = crate::ast::fetch_cell_seq("Constraint", state);
             if let Some(facts) = c_cell.as_seq() {
                 for f in facts.iter() {
                     // Lossless std-deps JSON path mirrors
@@ -2913,13 +2913,13 @@ pub struct CellIndex {
 
 /// Build a CellIndex by scanning the cells of state once.
 pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
-    use crate::ast::{fetch_or_phi, binding};
+    use crate::ast::{fetch_cell_seq, binding};
 
     let mut nouns: HashMap<String, NounDef> = HashMap::new();
     let mut subtypes: HashMap<String, String> = HashMap::new();
     let mut ref_schemes: HashMap<String, Vec<String>> = HashMap::new();
     let mut enum_values: HashMap<String, Vec<String>> = HashMap::new();
-    if let Some(ns) = fetch_or_phi("Noun", state).as_seq() {
+    if let Some(ns) = fetch_cell_seq("Noun", state).as_seq() {
         for f in ns.iter() {
             let name = binding(f, "name").unwrap_or("").to_string();
             let obj_type = binding(f, "objectType").unwrap_or("entity").to_string();
@@ -2933,8 +2933,8 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
             if let Some(v) = binding(f, "enumValues") { enum_values.insert(name.clone(), v.split(',').map(|s| s.to_string()).collect()); }
         }
     }
-    let role_cell = fetch_or_phi("Role", state);
-    let fact_types: HashMap<String, FactTypeDef> = fetch_or_phi("FactType", state).as_seq()
+    let role_cell = fetch_cell_seq("Role", state);
+    let fact_types: HashMap<String, FactTypeDef> = fetch_cell_seq("FactType", state).as_seq()
         .map(|facts| facts.iter().filter_map(|f| {
             let id = binding(f, "id")?.to_string();
             let reading = binding(f, "reading").unwrap_or("").to_string();
@@ -2947,7 +2947,7 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
                     }).collect()).unwrap_or_default();
             Some((id, FactTypeDef { schema_id: String::new(), reading, readings: vec![], roles }))
         }).collect()).unwrap_or_default();
-    let constraints: Vec<ConstraintDef> = fetch_or_phi("Constraint", state).as_seq()
+    let constraints: Vec<ConstraintDef> = fetch_cell_seq("Constraint", state).as_seq()
         .map(|facts| facts.iter().map(|f| {
             // Lossless JSON path under std-deps.
             #[cfg(feature = "std-deps")]
@@ -2970,7 +2970,7 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
                 predicate: get("predicate").as_deref().and_then(DeonticPredicate::decode),
             }
         }).collect()).unwrap_or_default();
-    let derivation_rules: Vec<DerivationRuleDef> = fetch_or_phi("DerivationRule", state).as_seq()
+    let derivation_rules: Vec<DerivationRuleDef> = fetch_cell_seq("DerivationRule", state).as_seq()
         .map(|facts| facts.iter().map(|f| {
             // Lossless path: deserialize full struct from the `json` field
             // if present (written by domain_to_state under std-deps).
@@ -2992,7 +2992,7 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
                 unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored,
             }
         }).collect()).unwrap_or_default();
-    let general_instance_facts: Vec<GeneralInstanceFact> = fetch_or_phi("InstanceFact", state).as_seq()
+    let general_instance_facts: Vec<GeneralInstanceFact> = fetch_cell_seq("InstanceFact", state).as_seq()
         .map(|facts| facts.iter().map(|f| {
             let get = |key: &str| binding(f, key).unwrap_or("").to_string();
             GeneralInstanceFact {
@@ -8079,8 +8079,8 @@ fn compile_state_machine(
 /// every Noun bound to an SM via the normalized cells, so
 /// `compile_data_with_state` can iterate the cell-driven SM set.
 fn discover_sm_nouns_from_cells(cells: &crate::ast::Object) -> Vec<String> {
-    use crate::ast::{fetch_or_phi, binding};
-    fetch_or_phi("State_Machine_Definition_is_for_Noun", cells)
+    use crate::ast::{fetch_cell_seq, binding};
+    fetch_cell_seq("State_Machine_Definition_is_for_Noun", cells)
         .as_seq()
         .map(|facts| {
             let mut seen: Vec<String> = Vec::new();
@@ -8100,13 +8100,13 @@ fn compile_state_machine_from_cells(
     cells: &crate::ast::Object,
     constraints: &[CompiledConstraint],
 ) -> Option<CompiledStateMachine> {
-    use crate::ast::{fetch_or_phi, binding};
+    use crate::ast::{fetch_cell_seq, binding};
 
     // -- Step 1: bind the SM definition name(s) for this noun. --------
     // Cell shape produced by the parser's instance-fact fanout for
     // `State Machine Definition 'X' is for Noun 'Y'`:
     //   <<State Machine Definition, X>, <Noun, Y>>
-    let sm_for_noun = fetch_or_phi(
+    let sm_for_noun = fetch_cell_seq(
         "State_Machine_Definition_is_for_Noun", cells);
     let sm_names: Vec<String> = sm_for_noun.as_seq().map(|facts| {
         facts.iter().filter_map(|f| {
@@ -8123,7 +8123,7 @@ fn compile_state_machine_from_cells(
     // matches our `sm_name`. The cell facts are 2-tuples of named pairs
     // shaped <<Status, S>, <State Machine Definition, X>>.
     let statuses_for_sm = |cell_name: &str| -> Vec<String> {
-        fetch_or_phi(cell_name, cells).as_seq().map(|facts| {
+        fetch_cell_seq(cell_name, cells).as_seq().map(|facts| {
             facts.iter().filter_map(|f| {
                 let s = binding(f, "Status")?;
                 let m = binding(f, "State Machine Definition")?;
@@ -8145,7 +8145,7 @@ fn compile_state_machine_from_cells(
     // First gather (transition_name -> sm_name) ownership so we know
     // which transitions belong to this SM. Cell shape:
     //   <<Transition, T>, <State Machine Definition, X>>
-    let t_in_sm: Vec<String> = fetch_or_phi(
+    let t_in_sm: Vec<String> = fetch_cell_seq(
         "Transition_is_defined_in_State_Machine_Definition", cells)
         .as_seq().map(|facts| {
             facts.iter().filter_map(|f| {
@@ -8157,7 +8157,7 @@ fn compile_state_machine_from_cells(
 
     // Per-transition source/target/event lookups. Use Vec to keep the
     // hashbrown ban (M1, #694).
-    let t_from_pairs: Vec<(String, String)> = fetch_or_phi(
+    let t_from_pairs: Vec<(String, String)> = fetch_cell_seq(
         "Transition_is_from_Status", cells).as_seq().map(|facts| {
             facts.iter().filter_map(|f| {
                 let t = binding(f, "Transition")?;
@@ -8165,7 +8165,7 @@ fn compile_state_machine_from_cells(
                 Some((t.to_string(), s.to_string()))
             }).collect()
         }).unwrap_or_default();
-    let t_to_pairs: Vec<(String, String)> = fetch_or_phi(
+    let t_to_pairs: Vec<(String, String)> = fetch_cell_seq(
         "Transition_is_to_Status", cells).as_seq().map(|facts| {
             facts.iter().filter_map(|f| {
                 let t = binding(f, "Transition")?;
@@ -8173,7 +8173,7 @@ fn compile_state_machine_from_cells(
                 Some((t.to_string(), s.to_string()))
             }).collect()
         }).unwrap_or_default();
-    let t_event_pairs: Vec<(String, String)> = fetch_or_phi(
+    let t_event_pairs: Vec<(String, String)> = fetch_cell_seq(
         "Transition_is_triggered_by_Fact_Type", cells).as_seq().map(|facts| {
             facts.iter().filter_map(|f| {
                 let t = binding(f, "Transition")?;
@@ -8344,7 +8344,7 @@ impl SqlTypeMappingTable {
     /// Falls back to `boot()` when the cell is empty (bare engine, no
     /// metamodel loaded).
     pub fn from_readings_state(state: &crate::ast::Object) -> Self {
-        let cell = fetch_or_phi("SQL_Dialect_maps_Value_Type_to_SQL_Type", state);
+        let cell = fetch_cell_seq("SQL_Dialect_maps_Value_Type_to_SQL_Type", state);
         let rows: Vec<(String, String, String)> = cell.as_seq()
             .map(|facts| facts.iter().filter_map(|f| {
                 let dialect = binding(f, "SQL Dialect")?.to_string();
