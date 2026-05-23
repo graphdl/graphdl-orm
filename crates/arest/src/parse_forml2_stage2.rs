@@ -1972,7 +1972,7 @@ impl StatementTranslatorTable {
     /// grammar state. Falls back to `boot()` when the cell is empty
     /// or missing — same defensive pattern as `RingKindTable`.
     pub fn from_grammar_state(state: &Object) -> Self {
-        let cell = fetch_or_phi("Classification_has_Translator", state);
+        let cell = fetch_cell_seq("Classification_has_Translator", state);
         let facts = match cell.as_seq() {
             Some(s) => s,
             None => return Self::boot(),
@@ -2032,7 +2032,7 @@ impl StatementTranslatorTable {
 /// grammar state, keyed by `noun: <type_name>`. Returns an empty
 /// `Vec` if no row matches.
 fn read_enum_values(state: &Object, type_name: &str) -> Vec<String> {
-    let cell = fetch_or_phi("EnumValues", state);
+    let cell = fetch_cell_seq("EnumValues", state);
     let facts = match cell.as_seq() {
         Some(s) => s,
         None => return Vec::new(),
@@ -3982,7 +3982,7 @@ pub fn translate_set_constraints(classified_state: &Object, idx: &StmtIndex) -> 
 /// All declared noun names in a classified state, sorted longest-first
 /// so substring-style matching prefers `Fact Type` over `Fact` etc.
 fn declared_noun_names(state: &Object) -> Vec<String> {
-    let cell = fetch_or_phi("Noun", state);
+    let cell = fetch_cell_seq("Noun", state);
     let mut names: Vec<String> = cell.as_seq()
         .map(|s| s.iter()
             .filter_map(|f| binding(f, "name").map(String::from))
@@ -4132,7 +4132,7 @@ pub fn translate_value_constraints(classified_state: &Object, idx: &StmtIndex) -
 }
 
 fn enum_values_for(state: &Object, stmt_id: &str) -> Vec<String> {
-    fetch_or_phi("Statement_has_Enum_Value", state)
+    fetch_cell_seq("Statement_has_Enum_Value", state)
         .as_seq()
         .map(|facts| facts.iter()
             .filter(|f| binding(f, "Statement") == Some(stmt_id))
@@ -4291,7 +4291,7 @@ fn parse_deontic_text_predicate(text: &str) -> Option<crate::types::DeonticPredi
 }
 
 fn deontic_operator_for(state: &Object, stmt_id: &str) -> Option<String> {
-    fetch_or_phi("Statement_has_Deontic_Operator", state)
+    fetch_cell_seq("Statement_has_Deontic_Operator", state)
         .as_seq()?
         .iter()
         .find(|f| binding(f, "Statement") == Some(stmt_id))
@@ -4313,15 +4313,15 @@ fn trailing_marker_for(idx: &StmtIndex, stmt_id: &str) -> Option<String> {
 }
 
 fn role_noun_at_position(state: &Object, stmt_id: &str, position: usize) -> Option<String> {
-    let refs = fetch_or_phi("Statement_has_Role_Reference", state);
+    let refs = fetch_cell_seq("Statement_has_Role_Reference", state);
     let refs_seq = refs.as_seq()?;
     let role_ids: Vec<String> = refs_seq.iter()
         .filter(|f| binding(f, "Statement") == Some(stmt_id))
         .filter_map(|f| binding(f, "Role_Reference").map(String::from))
         .collect();
-    let positions = fetch_or_phi("Role_Reference_has_Role_Position", state);
+    let positions = fetch_cell_seq("Role_Reference_has_Role_Position", state);
     let pos_seq = positions.as_seq()?;
-    let head_nouns = fetch_or_phi("Role_Reference_has_Head_Noun", state);
+    let head_nouns = fetch_cell_seq("Role_Reference_has_Head_Noun", state);
     let hn_seq = head_nouns.as_seq()?;
     // Find the role_id at the requested position.
     let target_id = role_ids.iter().find(|id| {
@@ -4907,7 +4907,7 @@ fn build_native_classifier(
         let mut stmts: Option<hashbrown::HashSet<String>> = None;
         for (cell_name, lit) in &clauses {
             let local: hashbrown::HashSet<String> = if use_state_path {
-                let cell = crate::ast::fetch_or_phi(cell_name, input);
+                let cell = crate::ast::fetch_cell_seq(cell_name, input);
                 let Some(facts) = cell.as_seq() else {
                     return Object::phi();
                 };
@@ -4969,7 +4969,7 @@ fn specialize_grammar_classifiers(
     defs: &mut alloc::vec::Vec<(String, crate::ast::Func)>,
 ) -> Vec<Option<Vec<String>>> {
     let mut antecedents: Vec<Option<Vec<String>>> = vec![None; defs.len()];
-    let rule_cell = crate::ast::fetch_or_phi("DerivationRule", grammar_state);
+    let rule_cell = crate::ast::fetch_cell_seq("DerivationRule", grammar_state);
     let Some(rules) = rule_cell.as_seq() else { return antecedents };
     let mut id_to_spec: hashbrown::HashMap<String, (String, Vec<(String, Option<String>)>)>
         = hashbrown::HashMap::new();

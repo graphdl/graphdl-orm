@@ -117,7 +117,7 @@ fn integrate_round_facts(
                 }
             }
         } else {
-            let existing = ast::fetch_or_phi(&cell_name, &current_state);
+            let existing = ast::fetch_cell_seq(&cell_name, &current_state);
             let combined = match existing.as_seq() {
                 Some(items) => {
                     let mut v = items.to_vec();
@@ -989,8 +989,8 @@ pub(crate) fn state_keys(state: &ast::Object) -> HashSet<FactKey> {
 /// The engine searches the population for a matching fact, then tries derivation
 /// Prove from Object state directly. No Domain reconstruction.
 pub fn prove_from_state(state: &ast::Object, goal: &str, world_assumption: &WorldAssumption) -> ProofResult {
-    let schemas = ast::fetch_or_phi("FactType", state);
-    let rules = ast::fetch_or_phi("DerivationRule", state);
+    let schemas = ast::fetch_cell_seq("FactType", state);
+    let rules = ast::fetch_cell_seq("DerivationRule", state);
     let proof = prove_goal_state_pop(state, goal, &HashSet::new(), &schemas, &rules);
     let status = match &proof {
         Some(_) => ProofStatus::Proven,
@@ -1020,7 +1020,7 @@ fn prove_goal_state_pop(
     ast::cells_iter(state).into_iter()
         .filter_map(|(ft_id, contents)| {
             let reading = schema_reading(ft_id)?;
-            contents.as_seq()?.iter()
+            ast::cell_facts_iter(contents)
                 .map(|fact| {
                     let bindings = extract_bindings(fact);
                     format_fact(&reading, &bindings)
