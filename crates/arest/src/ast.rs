@@ -4518,6 +4518,43 @@ pub fn extract_key_from_fact(fact: &Object, key_role_names: &[&str]) -> Option<S
     Some(parts.join("\u{001f}")) // ASCII unit-separator — won't collide with atom contents
 }
 
+/// #932 phase-2: fold a fact into a cell that has NO narrower uniqueness
+/// constraint, keyed by its full tuple via `synthesize_fact_id`. This is
+/// the keyless counterpart to [`cell_put_keyed`] and the fold μ_n
+/// (`eq:cellfold`) for keyless cells — the 3NF row's natural identity
+/// when a fact type's only UC is the spanning one over all roles (ORM:
+/// every fact type has a uniqueness constraint; absent a narrower one it
+/// is the whole tuple).
+///
+/// Set semantics, per P-as-set (`eq:pop`): re-asserting a byte-identical
+/// fact is an idempotent no-op (same tuple → same key); two facts that
+/// differ in ANY role get distinct keys, so every distinct row is
+/// preserved. There is no `KeyConflict` — with the full tuple as the key
+/// there is no non-key role left to disagree on.
+///
+/// Unlike `cell_put_keyed`'s `extract_key_from_fact` (binding-by-name),
+/// the FNV hash over all sorted (role,value) pairs is dup-role-name-safe:
+/// a ring fact type like `Task blocks Task` stores two `Task` pairs that
+/// a by-name key cannot tell apart, but the full-tuple hash can.
+///
+/// A pre-existing Seq cell is migrated to the keyed Map in the same pass
+/// (each Seq fact re-keyed by its own `synthesize_fact_id`), mirroring
+/// `cell_put_keyed`'s Seq→Map migration.
+pub fn cell_put_folded(name: &str, fact: Object, state: &Object) -> Object {
+    let key = synthesize_fact_id(name, &fact);
+    let existing = fetch_or_phi(name, state);
+    let mut map: HashMap<String, Object> = match &existing {
+        Object::Map(m) => (**m).clone(),
+        Object::Seq(items) => items
+            .iter()
+            .map(|f| (synthesize_fact_id(name, f), f.clone()))
+            .collect(),
+        _ => HashMap::new(),
+    };
+    map.insert(key, fact);
+    store(name, Object::Map(map.into()), state)
+}
+
 /// Iterate over the facts in a cell regardless of storage shape.
 /// Seq cells iterate their items; Map cells iterate their values.
 /// Returns an empty iterator for any other shape (Bottom, Atom, …).
@@ -8436,6 +8473,48 @@ mod tests {
         assert_eq!(m.len(), 2);
         assert_eq!(m.get("t-1"), Some(&f1));
         assert_eq!(m.get("t-2"), Some(&f2));
+    }
+
+    // #932 phase-2: keyless fold (cell_put_folded) — set semantics keyed
+    // by the full tuple via synthesize_fact_id.
+    #[test]
+    fn cell_put_folded_dedups_identical_and_keeps_distinct() {
+        let f1 = fact_from_pairs(&[("App", "a1"), ("Generator", "solidity")]);
+        let f2 = fact_from_pairs(&[("App", "a1"), ("Generator", "openapi")]);
+        let s = cell_put_folded("App_uses_Generator", f1.clone(), &Object::phi());
+        let s = cell_put_folded("App_uses_Generator", f1.clone(), &s); // re-assert → no-op
+        let s = cell_put_folded("App_uses_Generator", f2.clone(), &s);
+        let m = fetch_or_phi("App_uses_Generator", &s).as_map().cloned()
+            .expect("folded cell is a Map");
+        assert_eq!(m.len(), 2, "f1 deduped, f2 distinct → 2 rows");
+        let vals: Vec<&Object> = m.values().collect();
+        assert!(vals.contains(&&f1) && vals.contains(&&f2));
+    }
+
+    #[test]
+    fn cell_put_folded_distinguishes_ring_fact_duplicate_role_names() {
+        // `Task blocks Task` stores two same-named `Task` pairs; the
+        // full-tuple hash must tell (112,113) from (112,114) — a
+        // binding-by-name key would collapse both to "112".
+        let f1 = fact_from_pairs(&[("Task", "112"), ("Task", "113")]);
+        let f2 = fact_from_pairs(&[("Task", "112"), ("Task", "114")]);
+        let s = cell_put_folded("Task_blocks_Task", f1.clone(), &Object::phi());
+        let s = cell_put_folded("Task_blocks_Task", f2.clone(), &s);
+        let m = fetch_or_phi("Task_blocks_Task", &s).as_map().cloned()
+            .expect("folded cell is a Map");
+        assert_eq!(m.len(), 2, "two distinct ring tuples must coexist");
+    }
+
+    #[test]
+    fn cell_put_folded_migrates_existing_seq_cell_to_map() {
+        let f1 = fact_from_pairs(&[("App", "a1"), ("Generator", "solidity")]);
+        let f2 = fact_from_pairs(&[("App", "a2"), ("Generator", "fpga")]);
+        let seq_state = cell_push("App_uses_Generator", f1.clone(), &Object::phi());
+        assert!(matches!(fetch_or_phi("App_uses_Generator", &seq_state), Object::Seq(_)));
+        let folded = cell_put_folded("App_uses_Generator", f2.clone(), &seq_state);
+        let m = fetch_or_phi("App_uses_Generator", &folded).as_map().cloned()
+            .expect("Seq migrated to Map");
+        assert_eq!(m.len(), 2, "migrated f1 + new f2");
     }
 
     #[test]
