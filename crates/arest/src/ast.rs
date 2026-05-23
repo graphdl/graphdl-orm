@@ -3067,7 +3067,7 @@ pub(crate) const RESERVED_METAMODEL_NOUNS: &[&str] = &[
 /// Does the given state's `Noun` cell already declare this name?
 /// Pure scan — no side effects, no allocation beyond the cell walk.
 fn noun_cell_has(state: &Object, name: &str) -> bool {
-    fetch_or_phi("Noun", state)
+    fetch_cell_seq("Noun", state)
         .as_seq()
         .map(|facts| facts.iter().any(|f| binding(f, "name") == Some(name)))
         .unwrap_or(false)
@@ -3078,7 +3078,7 @@ fn noun_cell_has(state: &Object, name: &str) -> bool {
 /// because the parsed state does not touch the metamodel namespace, or because
 /// this is the bootstrap compile that legitimately owns the first declaration).
 fn find_metamodel_shadow(parsed: &Object, existing: &Object) -> Option<String> {
-    let parsed_nouns = fetch_or_phi("Noun", parsed);
+    let parsed_nouns = fetch_cell_seq("Noun", parsed);
     let facts = parsed_nouns.as_seq()?;
     facts.iter().find_map(|fact| {
         let name = binding(fact, "name")?;
@@ -3226,7 +3226,7 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
 /// See readings/evolution.md §4.2 and AREST paper §4.2 (Self-modification
 /// is ingesting readings).
 fn record_compile_event(state: &Object, status: &str) -> Object {
-    let seq = fetch_or_phi("compile_history", state)
+    let seq = fetch_cell_seq("compile_history", state)
         .as_seq()
         .map(|items| items.len())
         .unwrap_or(0);
@@ -3356,7 +3356,7 @@ fn ingest_population_into(d: &Object, population_json: &str) -> Object {
     // validate looks up (`Outbound_Email_is_sent`). Without this
     // canonicalization the cell name diverges between ingest path and
     // validate path, and constraints silently never fire.
-    let ft_cell = fetch_or_phi("FactType", d);
+    let ft_cell = fetch_cell_seq("FactType", d);
     let mut reading_to_id: HashMap<String, String> = HashMap::new();
     if let Some(items) = ft_cell.as_seq() {
         for f in items {
@@ -3473,7 +3473,7 @@ fn platform_transition(_noun: &str, x: &Object, d: &Object) -> Object {
     let event = items.get(1).and_then(|o| o.as_atom()).unwrap_or("").to_string();
     // Extract current status from state for the entity
     let sm = crate::command::StateMachineCellShape::boot();
-    let current_status = fetch_or_phi(sm.cell_name, d).as_seq()
+    let current_status = fetch_cell_seq(sm.cell_name, d).as_seq()
         .and_then(|facts| facts.iter()
             .find(|f| binding_matches(f, sm.state_machine_role, &entity_id))
             .and_then(|f| binding(f, sm.current_status_role).map(|s| s.to_string())));
@@ -3583,7 +3583,7 @@ fn platform_query_ft(ft_id: &str, x: &Object, d: &Object) -> Object {
     // ρ-projection (#350): query_ft is a population read path, so
     // migrated-away sources must not appear in results.
     let d = visible_population(d);
-    let facts = fetch_or_phi(ft_id, &d);
+    let facts = fetch_cell_seq(ft_id, &d);
     let facts_seq = facts.as_seq().map(|s| s.to_vec()).unwrap_or_default();
 
     let filter: hashbrown::HashMap<String, String> = x.as_atom()
@@ -4200,8 +4200,8 @@ pub fn cell_versions_pinned_by_citations(
 ) -> alloc::collections::BTreeSet<u64> {
     use alloc::collections::BTreeMap;
     let mut out = alloc::collections::BTreeSet::new();
-    let name_cell = fetch_or_phi("Citation_pins_Cell_Name", state);
-    let ver_cell = fetch_or_phi("Citation_pins_Cell_Version_Id", state);
+    let name_cell = fetch_cell_seq("Citation_pins_Cell_Name", state);
+    let ver_cell = fetch_cell_seq("Citation_pins_Cell_Version_Id", state);
     let name_facts = match name_cell.as_seq() {
         Some(s) => s,
         None => return out,
@@ -5070,12 +5070,12 @@ pub fn synthesize_fact_id(ft_id: &str, fact: &Object) -> String {
 /// drives the projection.
 pub fn visible_population(state: &Object) -> Object {
     use hashbrown::HashSet;
-    let migrations = fetch_or_phi("Migration", state);
+    let migrations = fetch_cell_seq("Migration", state);
     let active_migrations: HashSet<String> = migrations.as_seq()
         .map(|s| s.iter().filter_map(|m| binding(m, "id").map(String::from)).collect())
         .unwrap_or_default();
     if active_migrations.is_empty() { return state.clone(); }
-    let mas = fetch_or_phi("MigrationApplication", state);
+    let mas = fetch_cell_seq("MigrationApplication", state);
     let hidden_ids: HashSet<String> = mas.as_seq()
         .map(|s| s.iter().filter_map(|ma| {
             let m_id = binding(ma, "migration")?;
