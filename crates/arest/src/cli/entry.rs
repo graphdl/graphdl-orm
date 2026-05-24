@@ -1038,6 +1038,39 @@ pub fn main_entry() {
                     new_d
                 };
 
+                // Final subjectless-GC: extend cor:closure sanitation to the
+                // compiled output. The preserve-time GC (above) only cleans
+                // the prior population; this also drops subjectless /
+                // arity-deficient relics RE-PRODUCED by the parse or
+                // forward-chain — empty `{}` event facts and the
+                // ⟨State Machine=∅, Status⟩ orphan — which lives in the
+                // SYNTHETIC SM-output cell `State_Machine_is_currently_in_Status`
+                // (NOT a declared FactType, so not in `ft_ids`; that's why the
+                // ft_ids-scoped GC missed it). Declared FT data cells (uniform
+                // arity) get the full arity+subject GC; other data cells
+                // (synthetic SM outputs etc.) get the arity-free empty-subject
+                // drop, safe without a uniformity assumption; ':' view / meta
+                // cells are left untouched (they regenerate from data cells).
+                let d = {
+                    let ft_ids: hashbrown::HashSet<String> =
+                        ast::fetch_cell_seq("FactType", &d).as_seq()
+                            .map(|facts| facts.iter()
+                                .filter_map(|f| ast::binding(f, "id").map(|s| s.to_string()))
+                                .collect())
+                            .unwrap_or_default();
+                    let map: hashbrown::HashMap<String, ast::Object> =
+                        ast::cells_iter(&d).into_iter()
+                            .map(|(name, contents)| if ft_ids.contains(name) {
+                                (name.to_string(), ast::drop_subjectless_facts(contents))
+                            } else if !name.contains(':') {
+                                (name.to_string(), ast::drop_empty_subject_facts(contents))
+                            } else {
+                                (name.to_string(), contents.clone())
+                            })
+                            .collect();
+                    ast::Object::map(map)
+                };
+
                 // Persist state to SQLite (tables + triggers).
                 db::apply_ddl(&conn, &d);
                 db::persist_state(&conn, &d);

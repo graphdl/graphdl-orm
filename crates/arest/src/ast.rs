@@ -4900,6 +4900,31 @@ pub(crate) fn drop_subjectless_facts(contents: &Object) -> Object {
     Object::seq(kept)
 }
 
+/// Drop only facts with a provably-empty SUBJECT — the first `<role,value>`
+/// binding's value is empty-string or φ. Unlike `drop_subjectless_facts`,
+/// this makes NO arity assumption, so it is safe on cells that are NOT
+/// declared FactTypes and may not be uniform-arity — in particular the
+/// synthetic SM-output cells (`State_Machine_is_currently_in_Status`, …)
+/// the SM machinery emits to, which aren't in the FactType registry. Those
+/// are where the `⟨State Machine=∅, Status⟩` orphan is re-produced, so this
+/// is the safe GC to run over the whole compiled output. Non-`<role,value>`
+/// entries pass through untouched.
+pub(crate) fn drop_empty_subject_facts(contents: &Object) -> Object {
+    let facts = match contents.as_seq() {
+        Some(f) => f,
+        None => return contents.clone(),
+    };
+    let kept: Vec<Object> = facts.iter().filter(|f| {
+        match f.as_seq().and_then(|pairs| pairs.first()).and_then(|p| p.as_seq()) {
+            // first binding is <role, value>: keep iff the subject value is
+            // a non-empty atom (φ / empty-string / non-atom → drop).
+            Some(kv) if kv.len() == 2 => matches!(kv[1].as_atom(), Some(v) if !v.is_empty()),
+            _ => true,
+        }
+    }).cloned().collect();
+    Object::seq(kept)
+}
+
 /// Diff two cell stores: return an Object::Map containing only cells
 /// whose contents differ between `old` and `new`. Cells present in
 /// `new` but absent from `old` are included. Cells present only in
