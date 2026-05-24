@@ -704,8 +704,28 @@ pub fn main_entry() {
                 // Pass 1: parse fresh to discover which cell names are
                 // readings-derived. This is the structural authority
                 // for "what does the parser write?" — no hardcoded list.
+                // Seed the fold with the GLOBAL noun catalog so every slice
+                // sees all declared nouns regardless of fold order. The #932
+                // metamodel split declares `Transition` in state.md but uses
+                // it in core.md (folded earlier); the deps are circular
+                // (state.md uses `Verb` from core.md), so no fold order works.
+                // Without the global seed, the earlier slice tokenizes the
+                // unrecognized role noun into `fact_type_id_from_reading`'s
+                // lowercased tail and mints a divergent phantom FT
+                // (`Verb_is_performed_during_transition`) that case-collides
+                // with the canonical `…_Transition` cell and breaks SQL
+                // materialization on recompile of an existing app DB.
+                let noun_seed: ast::Object = {
+                    let corpus: String = all_readings.iter()
+                        .map(|(_, t)| *t).collect::<Vec<_>>().join("\n\n");
+                    let full = parse_forml2::parse_to_state_from(&corpus, &ast::Object::phi())
+                        .unwrap_or_else(|e| { eprintln!("metamodel corpus parse: {}", e); std::process::exit(1); });
+                    let mut m: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+                    m.insert("Noun".to_string(), ast::fetch_cell_seq("Noun", &full));
+                    ast::Object::map(m)
+                };
                 let parsed_fresh = all_readings.iter().fold(
-                    ast::Object::phi(),
+                    noun_seed,
                     |merged, (name, text)| {
                         let this = parse_forml2::parse_to_state_from(text, &merged)
                             .unwrap_or_else(|e| { eprintln!("{}: {}", name, e); std::process::exit(1); });

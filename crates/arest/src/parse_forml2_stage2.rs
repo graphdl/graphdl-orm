@@ -3094,6 +3094,20 @@ fn possibility_synthetic_fact_type(
         .or_else(|| body.strip_prefix("more than one "))
         .unwrap_or(body);
 
+    // A residual multiplicity quantifier (`more than one X` / `at most one
+    // X` on a non-leading role) marks a multiplicity CONSTRAINT on an
+    // existing fact type, not a new comparison fact type. Synthesizing a
+    // phantom FT for it produces a junk cell divergent from the declared
+    // form (e.g. `Verb is performed during more than one Transition` →
+    // `Verb_is_performed_during_more_than_one_Transition`, vs the declared
+    // `Verb is performed during Transition`). The #301 comparison-FT case
+    // (`more than one Noun has the same Alias`) carries its quantifier only
+    // as the leading existential, already stripped above — so this guard
+    // leaves it untouched.
+    if body.contains("more than one ") || body.contains("at most one ") {
+        return None;
+    }
+
     // Longest-first noun matching. Mirrors Stage-1.
     let mut sorted: Vec<&str> = nouns.iter().map(|s| s.as_str()).collect();
     sorted.sort_by(|a, b| b.len().cmp(&a.len()));
