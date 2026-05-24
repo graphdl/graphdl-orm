@@ -3508,7 +3508,14 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
             Func::Insert(Box::new(Func::Add)),
             project_values(filtered),
         ),
-        "min" => Func::compose(
+        // `earliest`/`first` are the temporal spelling of `min`, and
+        // `latest`/`last` of `max` — the recognizer
+        // (parse_forml2::try_parse_aggregate_clause) accepts all four for
+        // time-series readings (`Date is the earliest Timestamp`). Without
+        // these arms they fell through to `_ => Length` and silently
+        // computed a count. Folded the same way as min/max via Backus
+        // Insert over the projected target values.
+        "min" | "earliest" | "first" => Func::compose(
             Func::Insert(Box::new(Func::condition(
                 Func::Lt,
                 Func::Selector(1),
@@ -3516,7 +3523,7 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
             ))),
             project_values(filtered),
         ),
-        "max" => Func::compose(
+        "max" | "latest" | "last" => Func::compose(
             Func::Insert(Box::new(Func::condition(
                 Func::Gt,
                 Func::Selector(1),
