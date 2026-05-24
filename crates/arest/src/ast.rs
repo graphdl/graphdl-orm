@@ -4871,58 +4871,63 @@ pub fn cells_iter(state: &Object) -> Vec<(&str, &Object)> {
 /// valid fact of one fact type shares that arity, so dropping the short ones
 /// only ever removes malformed relics. Non-`<role,value>`-shaped entries and
 /// non-Seq contents pass through untouched.
+///
+/// Cells are stored either as a `Seq` of facts or — for hash-keyed /
+/// content-addressed fact stores like the SM `currently_in_Status`
+/// latest-wins fold — as a `Map<key, fact>`. Both layouts are handled: for a
+/// Map the *values* are the facts. (The orphan that motivated this lived as a
+/// Map value `⟨State Machine='', Status='Proposed'⟩`, which every prior
+/// `as_seq()`-only pass silently skipped.) Other shapes pass through.
 pub(crate) fn drop_subjectless_facts(contents: &Object) -> Object {
+    // A relic is a fact missing a role (fewer bindings than the cell's modal
+    // arity) or with an empty subject (first binding's value empty/φ).
+    fn keep(f: &Object, arity: usize) -> bool {
+        match f.as_seq() {
+            Some(pairs) => pairs.len() >= arity && has_nonempty_subject(f),
+            None => true, // not a fact-shaped entry: leave it alone.
+        }
+    }
+    if let Some(m) = contents.as_map() {
+        let arity = m.values().filter_map(|f| f.as_seq().map(|p| p.len())).max().unwrap_or(0);
+        return Object::map(m.iter()
+            .filter(|&(_, f)| keep(f, arity))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect());
+    }
     let facts = match contents.as_seq() {
         Some(f) => f,
         None => return contents.clone(),
     };
-    let arity = facts.iter()
-        .filter_map(|f| f.as_seq().map(|pairs| pairs.len()))
-        .max()
-        .unwrap_or(0);
-    let kept: Vec<Object> = facts.iter().filter(|f| {
-        let pairs = match f.as_seq() {
-            Some(p) => p,
-            None => return true, // not a fact-shaped entry: leave it alone.
-        };
-        // Missing a role (fewer bindings than the cell's arity) → relic.
-        if pairs.len() < arity {
-            return false;
-        }
-        match pairs.first().and_then(|p| p.as_seq()) {
-            // first binding is <role, value>: keep iff the value (the
-            // subject) is a non-empty atom.
-            Some(kv) if kv.len() == 2 => matches!(kv[1].as_atom(), Some(v) if !v.is_empty()),
-            // not a <role,value>-shaped fact: leave it alone.
-            _ => true,
-        }
-    }).cloned().collect();
-    Object::seq(kept)
+    let arity = facts.iter().filter_map(|f| f.as_seq().map(|p| p.len())).max().unwrap_or(0);
+    Object::seq(facts.iter().filter(|&f| keep(f, arity)).cloned().collect())
 }
 
 /// Drop only facts with a provably-empty SUBJECT — the first `<role,value>`
-/// binding's value is empty-string or φ. Unlike `drop_subjectless_facts`,
-/// this makes NO arity assumption, so it is safe on cells that are NOT
-/// declared FactTypes and may not be uniform-arity — in particular the
-/// synthetic SM-output cells (`State_Machine_is_currently_in_Status`, …)
-/// the SM machinery emits to, which aren't in the FactType registry. Those
-/// are where the `⟨State Machine=∅, Status⟩` orphan is re-produced, so this
-/// is the safe GC to run over the whole compiled output. Non-`<role,value>`
-/// entries pass through untouched.
+/// binding's value is empty-string or φ. Makes NO arity assumption, so it is
+/// safe on non-uniform cells — in particular synthetic SM-output cells not in
+/// the FactType registry. Handles both `Seq` and hash-keyed `Map` layouts
+/// (for a Map the values are the facts). Non-`<role,value>` entries untouched.
 pub(crate) fn drop_empty_subject_facts(contents: &Object) -> Object {
-    let facts = match contents.as_seq() {
-        Some(f) => f,
-        None => return contents.clone(),
-    };
-    let kept: Vec<Object> = facts.iter().filter(|f| {
-        match f.as_seq().and_then(|pairs| pairs.first()).and_then(|p| p.as_seq()) {
-            // first binding is <role, value>: keep iff the subject value is
-            // a non-empty atom (φ / empty-string / non-atom → drop).
-            Some(kv) if kv.len() == 2 => matches!(kv[1].as_atom(), Some(v) if !v.is_empty()),
-            _ => true,
-        }
-    }).cloned().collect();
-    Object::seq(kept)
+    if let Some(m) = contents.as_map() {
+        return Object::map(m.iter()
+            .filter(|&(_, f)| has_nonempty_subject(f))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect());
+    }
+    match contents.as_seq() {
+        Some(facts) => Object::seq(facts.iter().filter(|&f| has_nonempty_subject(f)).cloned().collect()),
+        None => contents.clone(),
+    }
+}
+
+/// True iff the fact's first `<role,value>` binding has a non-empty atom
+/// value — i.e. its subject is present. Non-`<role,value>`-shaped entries
+/// return true (left untouched). Shared by the subjectless-GC variants.
+fn has_nonempty_subject(f: &Object) -> bool {
+    match f.as_seq().and_then(|pairs| pairs.first()).and_then(|p| p.as_seq()) {
+        Some(kv) if kv.len() == 2 => matches!(kv[1].as_atom(), Some(v) if !v.is_empty()),
+        _ => true,
+    }
 }
 
 /// Diff two cell stores: return an Object::Map containing only cells

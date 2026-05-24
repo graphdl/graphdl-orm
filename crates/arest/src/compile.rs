@@ -5820,10 +5820,17 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
         // initial statuses. Filtering φ out of both the instance set and
         // the existing-set keeps init total over dirty populations.
         let non_phi = Func::compose(Func::Not, Func::NullTest);
+        // Also drop empty-string subjects (the ⟨State Machine='', Status⟩
+        // orphan): non_phi only catches φ = Seq([]); Atom("") slips through.
+        let non_empty = Func::compose(Func::Not, Func::compose(Func::Eq,
+            Func::construction(vec![Func::Id, Func::constant(Object::atom(""))])));
 
         let get_instances = Func::compose(
-            Func::filter(non_phi.clone()),
-            instances_of_noun_func(&sm_noun),
+            Func::filter(non_empty),
+            Func::compose(
+                Func::filter(non_phi.clone()),
+                instances_of_noun_func(&sm_noun),
+            ),
         );
 
         let extract_for_resource = Func::compose(
@@ -6026,11 +6033,19 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
         // SM/Resource cells and Bottoms downstream computed-binding
         // derivations (the Task_has_Task_Status bridge, task-924).
         let non_phi = Func::compose(Func::Not, Func::NullTest);
+        // Also drop empty-string subjects: a `<State Machine, ''>` resource is
+        // a degenerate SM with no entity (the ⟨SM='', Status⟩ orphan). non_phi
+        // only catches φ = Seq([]); the Atom("") subject slips through it.
+        let non_empty = Func::compose(Func::Not, Func::compose(Func::Eq,
+            Func::construction(vec![Func::Id, Func::constant(Object::atom(""))])));
         let resources = Func::compose(
-            Func::filter(non_phi),
+            Func::filter(non_empty),
             Func::compose(
-                Func::Concat,
-                Func::compose(Func::apply_to_all(extract_resource_per_fact), event_facts),
+                Func::filter(non_phi),
+                Func::compose(
+                    Func::Concat,
+                    Func::compose(Func::apply_to_all(extract_resource_per_fact), event_facts),
+                ),
             ),
         );
 
