@@ -747,9 +747,9 @@ pub fn main_entry() {
                             .filter(|(name, _)| !name.contains(':')
                                 && !parsed_cell_names.contains(*name))
                             // cor:closure preserves the population, but with no GC it
-                            // would also carry forward malformed subjectless relics
-                            // (e.g. a State_Machine_is_currently_in_Status row with an
-                            // empty State Machine). Drop those on the way in.
+                            // would also carry forward malformed subjectless relics —
+                            // a State_Machine_is_currently_in_Status row whose State
+                            // Machine binding is empty or missing entirely. Drop those.
                             .map(|(name, contents)| (name.to_string(), ast::drop_subjectless_facts(contents)))
                             .collect();
                     ast::Object::map(map)

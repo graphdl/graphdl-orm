@@ -4852,21 +4852,44 @@ pub fn cells_iter(state: &Object) -> Vec<(&str, &Object)> {
     }
 }
 
-/// Drop "subjectless" facts from a cell's contents — facts whose first
-/// `<role, value>` binding has an empty-string or φ value. A stored fact
-/// identifies its subject by its first role (the subject entity), so an
-/// empty/φ subject is a malformed relic — e.g. a `State Machine is
-/// currently in Status` row with an empty State Machine, left by an older
-/// write path and re-preserved every compile by cor:closure with no GC.
-/// Non-`<role,value>`-shaped entries and non-Seq contents pass through
-/// untouched, so this only ever removes provably-malformed rows.
+/// Drop "subjectless" / malformed facts from a cell's contents. A stored
+/// elementary fact populates every role of its fact type and identifies its
+/// subject by its first role, so two shapes are provably-malformed relics —
+/// left by an older write path and re-preserved every compile by cor:closure
+/// with no GC — and are removed:
+///
+///   1. **Missing a role.** Fewer `<role,value>` bindings than the cell's
+///      arity. This is the `null`-subject shape seen on the live tasks.db: a
+///      `State Machine is currently in Status` row carrying only
+///      `<Status, 'Proposed'>` with no `State Machine` binding at all (the
+///      subject role is absent, so SQL materializes it as NULL).
+///   2. **Empty subject.** First `<role,value>` binding has an empty-string
+///      or φ value.
+///
+/// Arity is the modal (max) binding-count among the cell's *own* facts, so a
+/// uniformly unary cell keeps all its rows and we never need the schema. Every
+/// valid fact of one fact type shares that arity, so dropping the short ones
+/// only ever removes malformed relics. Non-`<role,value>`-shaped entries and
+/// non-Seq contents pass through untouched.
 pub(crate) fn drop_subjectless_facts(contents: &Object) -> Object {
     let facts = match contents.as_seq() {
         Some(f) => f,
         None => return contents.clone(),
     };
+    let arity = facts.iter()
+        .filter_map(|f| f.as_seq().map(|pairs| pairs.len()))
+        .max()
+        .unwrap_or(0);
     let kept: Vec<Object> = facts.iter().filter(|f| {
-        match f.as_seq().and_then(|pairs| pairs.first()).and_then(|p| p.as_seq()) {
+        let pairs = match f.as_seq() {
+            Some(p) => p,
+            None => return true, // not a fact-shaped entry: leave it alone.
+        };
+        // Missing a role (fewer bindings than the cell's arity) → relic.
+        if pairs.len() < arity {
+            return false;
+        }
+        match pairs.first().and_then(|p| p.as_seq()) {
             // first binding is <role, value>: keep iff the value (the
             // subject) is a non-empty atom.
             Some(kv) if kv.len() == 2 => matches!(kv[1].as_atom(), Some(v) if !v.is_empty()),
@@ -5693,6 +5716,18 @@ mod tests {
         let cell2 = Object::seq(vec![empty_value]);
         assert_eq!(drop_subjectless_facts(&cell2).as_seq().expect("seq").len(), 1,
             "empty value on a non-subject role must be preserved");
+
+        // Missing the subject role entirely — the live tasks.db relic shape:
+        // a `currently in Status` row holding only <Status,'Proposed'> with no
+        // <State Machine,…> binding. Arity-deficient (1 < 2) → dropped.
+        let missing_subject_role = Object::seq(vec![
+            Object::seq(vec![Object::atom("Status"), Object::atom("Proposed")]),
+        ]);
+        let cell3 = Object::seq(vec![valid.clone(), missing_subject_role]);
+        let rows3 = drop_subjectless_facts(&cell3);
+        let rows3 = rows3.as_seq().expect("seq");
+        assert_eq!(rows3.len(), 1, "missing-subject-role relic dropped; got {:?}", rows3);
+        assert_eq!(rows3[0], valid);
     }
 
     // ── Object construction ──────────────────────────────────────
