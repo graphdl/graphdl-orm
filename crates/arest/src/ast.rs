@@ -4852,6 +4852,31 @@ pub fn cells_iter(state: &Object) -> Vec<(&str, &Object)> {
     }
 }
 
+/// Drop "subjectless" facts from a cell's contents — facts whose first
+/// `<role, value>` binding has an empty-string or φ value. A stored fact
+/// identifies its subject by its first role (the subject entity), so an
+/// empty/φ subject is a malformed relic — e.g. a `State Machine is
+/// currently in Status` row with an empty State Machine, left by an older
+/// write path and re-preserved every compile by cor:closure with no GC.
+/// Non-`<role,value>`-shaped entries and non-Seq contents pass through
+/// untouched, so this only ever removes provably-malformed rows.
+pub(crate) fn drop_subjectless_facts(contents: &Object) -> Object {
+    let facts = match contents.as_seq() {
+        Some(f) => f,
+        None => return contents.clone(),
+    };
+    let kept: Vec<Object> = facts.iter().filter(|f| {
+        match f.as_seq().and_then(|pairs| pairs.first()).and_then(|p| p.as_seq()) {
+            // first binding is <role, value>: keep iff the value (the
+            // subject) is a non-empty atom.
+            Some(kv) if kv.len() == 2 => matches!(kv[1].as_atom(), Some(v) if !v.is_empty()),
+            // not a <role,value>-shaped fact: leave it alone.
+            _ => true,
+        }
+    }).cloned().collect();
+    Object::seq(kept)
+}
+
 /// Diff two cell stores: return an Object::Map containing only cells
 /// whose contents differ between `old` and `new`. Cells present in
 /// `new` but absent from `old` are included. Cells present only in
@@ -5634,6 +5659,41 @@ mod tests {
     use super::*;
 
     fn defs() -> Object { Object::phi() }
+
+    #[test]
+    fn drop_subjectless_facts_removes_empty_subject_keeps_valid() {
+        // Valid fact (non-empty subject) — kept.
+        let valid = Object::seq(vec![
+            Object::seq(vec![Object::atom("State Machine"), Object::atom("task-1")]),
+            Object::seq(vec![Object::atom("Status"), Object::atom("pending")]),
+        ]);
+        // Empty-string subject — the 'Proposed'/'in_progress' orphan shape; dropped.
+        let empty_subject = Object::seq(vec![
+            Object::seq(vec![Object::atom("State Machine"), Object::atom("")]),
+            Object::seq(vec![Object::atom("Status"), Object::atom("Proposed")]),
+        ]);
+        // φ subject — dropped.
+        let phi_subject = Object::seq(vec![
+            Object::seq(vec![Object::atom("State Machine"), Object::phi()]),
+            Object::seq(vec![Object::atom("Status"), Object::atom("in_progress")]),
+        ]);
+        let cell = Object::seq(vec![valid.clone(), empty_subject, phi_subject]);
+        let rows = drop_subjectless_facts(&cell);
+        let rows = rows.as_seq().expect("seq");
+        assert_eq!(rows.len(), 1, "only the valid fact survives; got {:?}", rows);
+        assert_eq!(rows[0], valid);
+
+        // An empty VALUE on a non-subject role (e.g. an empty Description) on a
+        // valid subject must be preserved — we key only on the subject (first
+        // binding), never on value roles.
+        let empty_value = Object::seq(vec![
+            Object::seq(vec![Object::atom("Task"), Object::atom("t9")]),
+            Object::seq(vec![Object::atom("Task Description"), Object::atom("")]),
+        ]);
+        let cell2 = Object::seq(vec![empty_value]);
+        assert_eq!(drop_subjectless_facts(&cell2).as_seq().expect("seq").len(), 1,
+            "empty value on a non-subject role must be preserved");
+    }
 
     // ── Object construction ──────────────────────────────────────
 
