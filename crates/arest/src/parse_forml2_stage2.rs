@@ -2585,6 +2585,48 @@ fn enrich_constraints_with_spans(
             }
         }
 
+        // task-952: composite/spanning uniqueness — "Each X, Y[, Z]
+        // combination occurs at most once in the population of <reading>"
+        // (and the "In each population of <reading>, each X, Y, Z
+        // combination occurs at most once" variant). The combination
+        // nouns are a subsequence of the target fact type's roles; emit
+        // one span per combination role (matched positionally so repeated
+        // nouns like "App, App" land on distinct roles) so NORMA / RMAP /
+        // validation see a real composite UC rather than the head-role
+        // duplicate the single-FT path below would produce.
+        if kind == "UC" && text.contains("combination occurs at most once") {
+            if let Some((combo, reading)) = parse_spanning_uc(text) {
+                if let Some((ft_id, _)) =
+                    resolve_constraint_span_ft(&reading, &roles_by_ft, &declared_nouns)
+                {
+                    if let Some(ft_roles) = roles_by_ft.get(&ft_id) {
+                        let combo_nouns = find_noun_sequence(&combo, &declared_nouns);
+                        let mut role_idxs: Vec<usize> = Vec::new();
+                        let mut from = 0usize;
+                        for cn in &combo_nouns {
+                            if let Some((pos, _)) =
+                                ft_roles.iter().find(|(p, n)| *p >= from && n == cn)
+                            {
+                                role_idxs.push(*pos);
+                                from = *pos + 1;
+                            }
+                        }
+                        if role_idxs.len() == combo_nouns.len() && role_idxs.len() >= 2 {
+                            let mut new_pairs = pairs;
+                            let push = |np: &mut Vec<Object>, k: &str, v: &str| {
+                                np.push(Object::seq(vec![Object::atom(k), Object::atom(v)]));
+                            };
+                            for (i, pos) in role_idxs.iter().enumerate() {
+                                push(&mut new_pairs, &alloc::format!("span{}_factTypeId", i), &ft_id);
+                                push(&mut new_pairs, &alloc::format!("span{}_roleIndex", i), &alloc::format!("{}", pos));
+                            }
+                            return Object::Seq(new_pairs.into());
+                        }
+                    }
+                }
+            }
+        }
+
         let resolved = resolve_constraint_span_ft(text, &roles_by_ft, &declared_nouns);
         // Preference 2: fall back to entity-based first-match.
         let fallback = || -> Option<(String, String)> {
@@ -2606,6 +2648,47 @@ fn enrich_constraints_with_spans(
         push(&mut new_pairs, "span1_roleIndex", &pos);
         Object::Seq(new_pairs.into())
     }).collect()
+}
+
+/// task-952: parse the composite/spanning uniqueness verbalization into
+/// `(combination-noun-text, target-reading-text)`. Handles both shapes
+/// the readings use:
+///   "Each X, Y[, Z] combination occurs at most once in the population of <reading>"
+///   "In each population of <reading>, each X, Y, Z combination occurs at most once"
+/// Returns None for anything else; the caller then falls back to the
+/// single-FT span resolution.
+fn parse_spanning_uc(text: &str) -> Option<(String, String)> {
+    let norm: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let t = norm.trim().trim_end_matches('.').trim();
+    const MARKER: &str = "combination occurs at most once";
+    // Shape 1: "<combo> combination occurs at most once in the population of <reading>"
+    let tail = alloc::format!("{} in the population of ", MARKER);
+    if let Some(idx) = t.find(&tail) {
+        let left = t[..idx].trim();
+        let reading = t[idx + tail.len()..].trim();
+        let combo = left.strip_prefix("Each ")
+            .or_else(|| left.strip_prefix("each "))
+            .unwrap_or(left)
+            .trim();
+        if !combo.is_empty() && !reading.is_empty() {
+            return Some((combo.to_string(), reading.to_string()));
+        }
+    }
+    // Shape 2: "In each population of <reading>, each <combo> combination occurs at most once"
+    if let Some(idx) = t.find(MARKER) {
+        let left = t[..idx].trim_end();
+        if let Some((pop, combo)) = left.rsplit_once(", each ") {
+            let reading = pop.trim()
+                .strip_prefix("In each population of ")
+                .unwrap_or(pop.trim())
+                .trim();
+            let combo = combo.trim();
+            if !combo.is_empty() && !reading.is_empty() {
+                return Some((combo.to_string(), reading.to_string()));
+            }
+        }
+    }
+    None
 }
 
 /// Resolve a Constraint's target fact type by noun-sequence match
@@ -6936,6 +7019,57 @@ mod tests {
             "span1 must be the consequent FT; got {:?}", span1);
         assert_ne!(span0, span1,
             "SS spans must be DISTINCT FTs (else compile_subset_ast checks A subset_of A)");
+    }
+
+    #[test]
+    fn parse_spanning_uc_handles_both_verbalization_shapes() {
+        // task-952: Shape 1 — "<combo> combination occurs at most once in
+        // the population of <reading>".
+        assert_eq!(
+            super::parse_spanning_uc("Each Component, Toolkit combination occurs at most once in the population of Component is implemented by Toolkit at Toolkit Symbol."),
+            Some(("Component, Toolkit".to_string(),
+                  "Component is implemented by Toolkit at Toolkit Symbol".to_string())));
+        // Shape 2 — "In each population of <reading>, each <combo>
+        // combination occurs at most once" (the prefix variant).
+        assert_eq!(
+            super::parse_spanning_uc("In each population of Fact triggered Transition for Resource, each Fact, Transition, Resource combination occurs at most once."),
+            Some(("Fact, Transition, Resource".to_string(),
+                  "Fact triggered Transition for Resource".to_string())));
+        // An attribute UC must NOT be mistaken for a spanning UC.
+        assert_eq!(super::parse_spanning_uc("Each Citation has at most one URI."), None);
+    }
+
+    #[test]
+    fn enrich_spanning_uc_resolves_composite_role_spans() {
+        // task-952: "Each Component, Toolkit combination occurs at most once
+        // in the population of <ternary reading>" must produce a composite
+        // UC spanning the Component (role 0) AND Toolkit (role 1) roles of
+        // the ternary fact type — NOT the head-role duplicate
+        // (span0 == span1 == role 0) the single-FT path would emit.
+        let text = "Each Component, Toolkit combination occurs at most once in the population of Component is implemented by Toolkit at Toolkit Symbol";
+        let uc = fact_from_pairs(&[
+            ("id", text),
+            ("kind", "UC"),
+            ("modality", "alethic"),
+            ("text", text),
+            ("entity", "Component"),
+        ]);
+        let role_facts = alloc::vec![
+            fact_from_pairs(&[("nounName", "Component"), ("factType", "FT_impl"), ("position", "0")]),
+            fact_from_pairs(&[("nounName", "Toolkit"), ("factType", "FT_impl"), ("position", "1")]),
+            fact_from_pairs(&[("nounName", "Toolkit Symbol"), ("factType", "FT_impl"), ("position", "2")]),
+        ];
+        let enriched = super::enrich_constraints_with_spans(&[uc], &role_facts);
+        assert_eq!(enriched.len(), 1);
+        let c = &enriched[0];
+        assert_eq!(binding(c, "span0_factTypeId"), Some("FT_impl"));
+        assert_eq!(binding(c, "span0_roleIndex"), Some("0"),
+            "first combo noun (Component) maps to role 0");
+        assert_eq!(binding(c, "span1_factTypeId"), Some("FT_impl"));
+        assert_eq!(binding(c, "span1_roleIndex"), Some("1"),
+            "second combo noun (Toolkit) maps to role 1");
+        assert_ne!(binding(c, "span0_roleIndex"), binding(c, "span1_roleIndex"),
+            "composite UC spans must be distinct roles, not the head-role duplicate");
     }
 
     #[test]

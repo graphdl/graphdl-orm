@@ -55,7 +55,7 @@ Deontic Operator is a value type.
 Literal Role is a value type.
 Enum Value is a value type.
 Constraint Keyword is a value type.
-  The possible values of Constraint Keyword are 'if and only if', 'at most one of the following holds', 'exactly one of the following holds', 'at least one of the following holds', 'if some then that'.
+  The possible values of Constraint Keyword are 'if and only if', 'at most one of the following holds', 'exactly one of the following holds', 'at least one of the following holds', 'if some then that', 'combination occurs at most once'.
 Ring Adjective is a value type.
   The possible values of Ring Adjective are 'irreflexive', 'asymmetric', 'antisymmetric', 'symmetric', 'intransitive', 'transitive', 'acyclic', 'reflexive'.
 Word Comparator is a value type.
@@ -223,6 +223,8 @@ Statement has Classification 'Instance Fact' iff Statement has Literal Role.
 Statement has Classification 'Uniqueness Constraint' iff Statement has Quantifier 'at most one'.
 
 Statement has Classification 'Uniqueness Constraint' iff Statement has Quantifier 'exactly one'.
+
+Statement has Classification 'Uniqueness Constraint' iff Statement has Constraint Keyword 'combination occurs at most once'.
 
 Statement has Classification 'Mandatory Role Constraint' iff Statement has Quantifier 'at least one'.
 

@@ -105,6 +105,13 @@ impl Vocab {
                 "at most one of the following holds",
                 "exactly one of the following holds",
                 "at least one of the following holds",
+                // task-952: composite/spanning uniqueness marker. The
+                // generic Constraint Keyword scan emits a token whenever
+                // the body contains this literal, so the grammar can
+                // classify it as a Uniqueness Constraint (see the
+                // recognizer in forml2-grammar.md) instead of letting it
+                // fall through to a degenerate Fact Type Reading.
+                "combination occurs at most once",
             ].iter().map(|s| s.to_string()).collect(),
             deontic_operators: ["obligatory", "forbidden", "permitted"]
                 .iter().map(|s| s.to_string()).collect(),
