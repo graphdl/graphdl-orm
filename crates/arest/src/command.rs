@@ -1902,10 +1902,28 @@ fn transition_via_defs(
             let noun = name.strip_prefix("machine:")?;
             let func = ast::metacompose(contents, d);
             let initial_key = format!("{}:initial", name);
-            let from_status = current_status.map(|s| s.to_string()).or_else(|| {
-                ast::apply(&ast::Func::Def(initial_key), &ast::Object::phi(), d)
-                    .as_atom().map(|s| s.to_string())
-            })?;
+            let from_status = current_status.map(|s| s.to_string())
+                .or_else(|| {
+                    // task-954: the batch path (buildApplyCommandForBatch)
+                    // omits current_status, so resolve the entity's CURRENT
+                    // status from the SM cell in `state` (the cumulative
+                    // running state threaded by apply_command_batch). Without
+                    // this, a 2nd+ transition on the same entity inside one
+                    // batch resolved `from = initial` (e.g. pending) and
+                    // no-op'd — the batch silently partial-applied. Falls
+                    // through to the machine initial only when the entity has
+                    // no status yet (its first transition).
+                    let sm = StateMachineCellShape::boot();
+                    ast::fetch_cell_seq(sm.cell_name, state).as_seq().and_then(|facts|
+                        facts.iter()
+                            .find(|f| ast::binding_matches(f, sm.state_machine_role, entity_id))
+                            .and_then(|f| ast::binding(f, sm.current_status_role)
+                                .map(|s| s.to_string())))
+                })
+                .or_else(|| {
+                    ast::apply(&ast::Func::Def(initial_key), &ast::Object::phi(), d)
+                        .as_atom().map(|s| s.to_string())
+                })?;
             let input = ast::Object::seq(vec![ast::Object::atom(&from_status), ast::Object::atom(event)]);
             ast::apply(&func, &input, d).as_atom()
                 .filter(|next| *next != from_status)
@@ -7359,6 +7377,91 @@ Transition 'place' is defined in State Machine Definition 'Order'.
         // and the SM cell reflects 'Placed'.
         assert_eq!(extract_sm_status(&merged, "ORD-1").as_deref(), Some("Placed"),
             "ORD-1 must be transitioned to Placed in the batch result");
+    }
+
+    /// task-954: a batch carrying TWO transitions on the SAME entity
+    /// (start then finish) must drive it all the way to the final status.
+    /// The MCP batch path (`buildApplyCommandForBatch`) supplies
+    /// `current_status: None`, so the engine must resolve `from_status`
+    /// from the CUMULATIVE running state — not the machine's initial
+    /// status. Before the fix, the second op (`finish`) resolved
+    /// `from = pending` (the initial) instead of `in_progress`, found no
+    /// `pending --finish-->` edge, and silently no-op'd — leaving the
+    /// entity stuck `in_progress` while the batch still reported success.
+    #[test]
+    fn batch_sequential_transitions_same_entity_resolve_from_running_state() {
+        const READINGS: &str = r#"
+# Widget batch SM
+
+## Entity Types
+
+Widget(.id) is an entity type.
+
+## Fact Types
+
+Widget has Label.
+
+## Instance Facts
+
+State Machine Definition 'Widget' is for Noun 'Widget'.
+Status 'pending' is initial in State Machine Definition 'Widget'.
+
+Transition 'start' is defined in State Machine Definition 'Widget'.
+  Transition 'start' is from Status 'pending'.
+  Transition 'start' is to Status 'in_progress'.
+  Transition 'start' is triggered by Event Type 'start'.
+
+Transition 'finish' is defined in State Machine Definition 'Widget'.
+  Transition 'finish' is from Status 'in_progress'.
+  Transition 'finish' is to Status 'completed'.
+  Transition 'finish' is triggered by Event Type 'finish'.
+"#;
+        let meta_state = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let domain_state =
+            crate::parse_forml2::parse_to_state_with_nouns(READINGS, &meta_state).unwrap();
+        let state = ast::merge_states(&meta_state, &domain_state);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        let mut fields = HashMap::new();
+        fields.insert("Label".to_string(), "w".to_string());
+        // current_status: None on BOTH transitions — exactly what
+        // buildApplyCommandForBatch emits for the MCP `ops` shape.
+        let batch = vec![
+            Command::CreateEntity {
+                noun: "Widget".to_string(),
+                domain: "widgets".to_string(),
+                id: Some("W1".to_string()),
+                fields,
+                sender: None,
+                signature: None,
+            },
+            Command::Transition {
+                entity_id: "W1".to_string(),
+                event: "start".to_string(),
+                domain: "widgets".to_string(),
+                current_status: None,
+                sender: None,
+                signature: None,
+            },
+            Command::Transition {
+                entity_id: "W1".to_string(),
+                event: "finish".to_string(),
+                domain: "widgets".to_string(),
+                current_status: None,
+                sender: None,
+                signature: None,
+            },
+        ];
+
+        let result = apply_command_batch(&def_obj, &batch, &state);
+        assert!(!result.rejected,
+            "batch must succeed; violations={:?}", result.violations);
+        let merged = ast::merge_states(&state, &result.state);
+        assert_eq!(extract_sm_status(&merged, "W1").as_deref(), Some("completed"),
+            "W1 must reach 'completed' — both transitions in one batch must \
+             resolve from_status from the cumulative running state, not the \
+             machine initial");
     }
 
     /// Atomic rollback: a batch whose middle op is alethic-rejected (a
