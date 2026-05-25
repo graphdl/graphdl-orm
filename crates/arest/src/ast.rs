@@ -4834,6 +4834,14 @@ fn concat_dedup(a: &Object, b: &Object) -> Object {
 /// when they are structurally equal.
 fn same_identity(a: &Object, b: &Object) -> bool {
     if a == b { return true; }
+    // task-956: the fan-out writes a unary predicate's object value as
+    // Object::Atom("φ"), but a recompile round-trips it through SQLite where
+    // Object::parse turns the token φ back into Object::phi() (empty Seq).
+    // The two are display-equal but structurally unequal, so the `a == b`
+    // above misses them and concat_dedup appends a fresh copy every recompile
+    // (the Task_is_finished bloat, ~+653 rows/recompile). Compare φ-canonical
+    // forms so such facts dedup regardless of φ representation.
+    if canon_phi(a) == canon_phi(b) { return true; }
     const IDENTITY_KEYS: &[&str] = &["id", "name", "ruleId", "Change Id", "Signal Id"];
     for key in IDENTITY_KEYS {
         let av = binding(a, key);
@@ -4843,6 +4851,17 @@ fn same_identity(a: &Object, b: &Object) -> bool {
         }
     }
     false
+}
+
+/// task-956: canonicalize the φ representation so the fan-out's
+/// `Object::Atom("φ")` and the parse/round-trip's `Object::phi()` (empty Seq)
+/// compare equal. Recurses into Seq facts/pairs; other values pass through.
+fn canon_phi(o: &Object) -> Object {
+    if o.as_atom() == Some("φ") { return Object::phi(); }
+    match o {
+        Object::Seq(items) => Object::seq(items.iter().map(canon_phi).collect()),
+        _ => o.clone(),
+    }
 }
 
 /// Concatenate two sequences: <a₁,...,aₙ> ++ <b₁,...,bₘ> = <a₁,...,aₙ,b₁,...,bₘ>
@@ -11105,6 +11124,29 @@ Base 'b1' has Tag 'hot'.\n";
             "field from a _transitive_* cell must NOT be folded into the entity; got {w1:?}");
         assert!(!w1.contains_key("Schemic"),
             "field from a ':'-namespaced cell must NOT be folded into the entity; got {w1:?}");
+    }
+
+    /// task-956 — `same_identity`/`concat_dedup` must treat the fan-out's
+    /// `Atom("φ")` and the round-tripped `phi()` (empty Seq) as the SAME fact,
+    /// so unary instance facts dedup across recompile instead of accumulating
+    /// (the Task_is_finished bloat). Without this, every recompile re-appends
+    /// the φ-declared facts because the two φ shapes compare unequal.
+    #[test]
+    fn concat_dedup_collapses_phi_atom_vs_empty_seq() {
+        // As the fan-out writes a unary fact: object value = Atom("φ").
+        let fact_atom = fact_from_pairs(&[("Task", "1"), ("Task_is_finished", "φ")]);
+        // As a SQLite round-trip yields the same fact: object value = phi().
+        let fact_phi = Object::seq(vec![
+            Object::seq(vec![Object::atom("Task"), Object::atom("1")]),
+            Object::seq(vec![Object::atom("Task_is_finished"), Object::phi()]),
+        ]);
+        assert!(same_identity(&fact_atom, &fact_phi),
+            "Atom(φ) and phi() forms of the same unary fact must share identity");
+        let merged = concat_dedup(
+            &Object::seq(vec![fact_atom.clone()]),
+            &Object::seq(vec![fact_phi.clone()]));
+        assert_eq!(merged.as_seq().map(|s| s.len()), Some(1),
+            "φ-asymmetric duplicate must collapse to a single fact; got {merged:?}");
     }
 
     /// #840 follow-up — filter on a ring FT must accept both bare role
