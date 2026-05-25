@@ -1381,6 +1381,15 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         }).collect())
         .unwrap_or_default();
 
+    // c_supertypes: subtype name -> supertype name (ORM IsA). A subtype is
+    // identified through its supertype, so the NORMA exporter emits SubtypeFacts.
+    let c_supertypes: HashMap<String, String> = noun_cell.as_seq()
+        .map(|facts| facts.iter().filter_map(|f| {
+            let name = binding(f, "name")?.to_string();
+            Some((name, binding(f, "superType")?.to_string()))
+        }).collect())
+        .unwrap_or_default();
+
     // c_fact_types: HashMap<String, FactTypeDef>
     let c_fact_types: HashMap<String, FactTypeDef> = ft_cell.as_seq()
         .map(|facts| facts.iter().filter_map(|f| {
@@ -2514,6 +2523,393 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             Object::seq(vec![Object::atom("constraints"), constraints]),
         ])))
     }));
+
+    // -- Generator: NORMA (ORM2 .orm) -- whole-model export, one cell.
+    // The acceptance test for the ORM2/NORMA membrane: a domain should drop
+    // into NORMA and a model pop out. This walks the ORM2 surface
+    // (nouns -> object types, fact types -> facts + roles + readings) into
+    // the .orm structure (format matched to the real ORM metamodel file).
+    // First cut: objects, facts, roles, readings, a text data type. Internal
+    // uniqueness/mandatory constraints and reference-mode expansion are the
+    // next increment (NORMA opens the model with validation warnings without
+    // them, which is enough to confirm the format round-trips).
+    fn build_norma_orm(
+        c_nouns: &HashMap<String, NounDef>,
+        c_fact_types: &HashMap<String, FactTypeDef>,
+        c_constraints: &[ConstraintDef],
+        c_ref_schemes: &HashMap<String, Vec<String>>,
+        c_supertypes: &HashMap<String, String>,
+    ) -> String {
+        fn xesc(s: &str) -> String {
+            s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+        }
+        // NORMA's deserializer types element `id`/`ref` as GUIDs, so readable
+        // ids fail to load. Derive a deterministic GUID-shaped id from a stable
+        // string key (two FNV-1a passes -> 128 bits) so the same element gets
+        // the same id every run and every ref resolves.
+        fn guid(s: &str) -> String {
+            fn fnv(s: &str, seed: u64) -> u64 {
+                let mut h = seed;
+                for b in s.bytes() { h ^= b as u64; h = h.wrapping_mul(0x0000_0100_0000_01b3); }
+                h
+            }
+            let a = fnv(s, 0xcbf2_9ce4_8422_2325);
+            let b = fnv(s, 0x8422_2325_cbf2_9ce4);
+            format!("_{:08X}-{:04X}-{:04X}-{:04X}-{:012X}",
+                (a >> 32) as u32, (a >> 16) as u16, a as u16,
+                (b >> 48) as u16, b & 0xFFFF_FFFF_FFFF)
+        }
+        let oid = |n: &str| guid(&format!("obj:{}", n));
+        let rid = |ft: &str, p: usize| guid(&format!("role:{}:{}", ft, p));
+        let dt_text = guid("dt:text");
+        // Reference schemes become compact NORMA reference modes (_ReferenceMode
+        // on the entity, shown inline as "Entity (.id)"), NOT explicit "Entity has
+        // id" facts + a shared id value type. A ref-scheme fact is one that uses a
+        // reference-mode value type (the shared "id", etc.) as a role player; drop
+        // those, and the now-unplayed reference-mode value type is removed by the
+        // unplayed-object filter below.
+        let refmode_vts: alloc::collections::BTreeSet<String> =
+            c_ref_schemes.values().flatten().cloned().collect();
+        let ref_fact_ids: alloc::collections::BTreeSet<String> = c_fact_types.iter()
+            .filter(|(_, d)| d.roles.iter().any(|r| refmode_vts.contains(&r.noun_name)))
+            .map(|(id, _)| id.clone())
+            .collect();
+        // task-951 isolation: BINARY facts only (exclude unary 1-role AND n-ary
+        // 3+-role) plus the ref-scheme facts. The reference-scheme rewrite did not
+        // clear the assertion, so n-ary facts are the next suspect (the working
+        // minimals are binary-only). If this binary-only model loads, n-ary is it.
+        // Skip constraint verbalizations the FactType registry carries as
+        // degenerate "fact types" (uniqueness/frequency phrasings like "... at
+        // most once", "For each pair of ...", "In each population of ..."). They
+        // are not fact types; the underlying facts + real constraints are emitted
+        // separately, and emitting these malformed n-aries is what trips NORMA.
+        let is_constraint_reading = |r: &str| {
+            let t = r.trim_start();
+            t.starts_with("Each ") || t.starts_with("For each ") || t.starts_with("In each ")
+                || t.starts_with("It is impossible") || t.starts_with("No ")
+        };
+        // Binary facts only for now: unary (1-role) and n-ary (3+) are deferred.
+        // n-ary is blocked on task 952 (external uniqueness must compile to a UC
+        // function before NORMA will load n-ary facts); unaries (task 951) need the
+        // implicit-boolean form. Switch to `>= 2` once 952 lands. Ref-scheme
+        // verbalization fact types are also excluded (they aren't fact types).
+        let mut fts: Vec<(&String, &FactTypeDef)> = c_fact_types.iter()
+            .filter(|(id, d)| d.roles.len() == 2 && !ref_fact_ids.contains(id.as_str())
+                && !is_constraint_reading(&d.reading))
+            .collect();
+        fts.sort_by(|a, b| a.0.cmp(b.0));
+        let fts_set: alloc::collections::BTreeSet<String> =
+            fts.iter().map(|&(id, _)| id.clone()).collect();
+        let mut nouns: Vec<(&String, &NounDef)> = c_nouns.iter().collect();
+        nouns.sort_by(|a, b| a.0.cmp(b.0));
+        let mut played: alloc::collections::BTreeMap<String, Vec<String>> =
+            alloc::collections::BTreeMap::new();
+        for &(ft, def) in &fts {
+            for (p, r) in def.roles.iter().enumerate() {
+                played.entry(r.noun_name.clone()).or_default().push(rid(ft, p));
+            }
+        }
+        // Internal UC/MC constraints. SpanDef.fact_type_id is the c_fact_types
+        // key (the schema build matches roles by `factType == id`), so
+        // rid(span.fact_type_id, role_index) is exactly the role id emitted in
+        // the fact. Emit only constraints whose spans all land on ONE resolved
+        // fact type with in-range roles (internal) -> no dangling refs; other
+        // kinds (FC/VC/ring/SS/EQ, external) are deferred.
+        let mut per_fact: alloc::collections::BTreeMap<String, String> =
+            alloc::collections::BTreeMap::new();
+        let mut mandatory_roles: alloc::collections::BTreeSet<String> =
+            alloc::collections::BTreeSet::new();
+        let mut constraints_block = String::new();
+        let (mut uc_n, mut mc_n) = (0u32, 0u32);
+        for c in c_constraints {
+            if c.spans.is_empty() || (c.kind != "UC" && c.kind != "MC") { continue; }
+            let ft0 = &c.spans[0].fact_type_id;
+            // Only constraints whose fact is actually emitted (skips unary,
+            // ref-scheme, and any other excluded facts) so no role ref dangles.
+            if !fts_set.contains(ft0) { continue; }
+            let ftd = match c_fact_types.get(ft0) { Some(d) => d, None => continue };
+            if !c.spans.iter().all(|s| &s.fact_type_id == ft0 && s.role_index < ftd.roles.len()) {
+                continue;
+            }
+            let nid = guid(&format!("cstr:{}", c.id));
+            // Synthetic refScheme constraints duplicate span0/span1 onto the
+            // same role; a UC/MC role sequence lists each role once -> dedup by
+            // role id, preserving first-seen order.
+            let mut seen = alloc::collections::BTreeSet::new();
+            let seq: String = c.spans.iter()
+                .map(|s| rid(ft0, s.role_index))
+                .filter(|r| seen.insert(r.clone()))
+                .map(|r| format!("\n          <orm:Role ref=\"{}\" />", r))
+                .collect();
+            if c.kind == "UC" {
+                uc_n += 1;
+                constraints_block.push_str(&format!(
+                    "\n      <orm:UniquenessConstraint id=\"{}\" Name=\"InternalUniquenessConstraint{}\" IsInternal=\"true\">\n        <orm:RoleSequence>{}\n        </orm:RoleSequence>\n      </orm:UniquenessConstraint>",
+                    nid, uc_n, seq));
+                per_fact.entry(ft0.clone()).or_default().push_str(&format!(
+                    "\n          <orm:UniquenessConstraint ref=\"{}\" />", nid));
+            } else {
+                mc_n += 1;
+                constraints_block.push_str(&format!(
+                    "\n      <orm:MandatoryConstraint id=\"{}\" Name=\"SimpleMandatoryConstraint{}\" IsSimple=\"true\">\n        <orm:RoleSequence>{}\n        </orm:RoleSequence>\n      </orm:MandatoryConstraint>",
+                    nid, mc_n, seq));
+                per_fact.entry(ft0.clone()).or_default().push_str(&format!(
+                    "\n          <orm:MandatoryConstraint ref=\"{}\" />", nid));
+                for s in &c.spans { mandatory_roles.insert(rid(ft0, s.role_index)); }
+            }
+        }
+        // Per-entity reference schemes (compact display). The AREST model
+        // identifies entities by a shared reference value (".id"); NORMA needs each
+        // entity's scheme expanded into its OWN value type + has-fact + internal UC
+        // (the preferred identifier) + simple MC, which it then displays inline as
+        // "Entity (.mode)". Synthesize that per entity (the shared AREST id facts /
+        // value type were dropped above) and emit NO diagram shapes for it, so it
+        // renders as the compact reference mode rather than a drawn fact. Without
+        // this the entity is unidentified and NORMA flags it (red).
+        let mut ref_objects = String::new();
+        let mut ref_facts = String::new();
+        let mut entity_refmode: alloc::collections::BTreeMap<String, String> =
+            alloc::collections::BTreeMap::new();
+        for &(n, def) in &nouns {
+            if def.object_type.as_str() != "entity" || !played.contains_key(n) { continue; }
+            // Reference mode: the declared scheme, else a fallback "id" so the
+            // entity is identifiable (no red). Skip entities identified via an
+            // entity supertype (their SubtypeFact carries identification).
+            let refmode: String = match c_ref_schemes.get(n) {
+                Some(p) if !p.is_empty() => p.join(", "),
+                _ => {
+                    let via_super = c_supertypes.get(n)
+                        .map_or(false, |sup| c_nouns.get(sup).map_or(false, |d| d.object_type == "entity"));
+                    if via_super { continue; }
+                    "id".to_string()
+                }
+            };
+            entity_refmode.insert(n.clone(), refmode.clone());
+            let r0 = guid(&format!("refrole:{}:0", n));
+            let r1 = guid(&format!("refrole:{}:1", n));
+            let uc = guid(&format!("refuc:{}", n));
+            let mc = guid(&format!("refmc:{}", n));
+            let vt = guid(&format!("refvt:{}", n));
+            played.entry(n.clone()).or_default().push(r0.clone());
+            ref_objects.push_str(&format!(
+                "\n      <orm:ValueType id=\"{}\" Name=\"{}\">\n        <orm:PlayedRoles>\n          <orm:Role ref=\"{}\" />\n        </orm:PlayedRoles>\n        <orm:ConceptualDataType id=\"{}\" ref=\"{}\" Scale=\"0\" Length=\"0\" />\n      </orm:ValueType>",
+                vt, xesc(&format!("{}_{}", n, refmode.replace(", ", "_"))), r1, guid(&format!("refcdt:{}", n)), dt_text));
+            ref_facts.push_str(&format!(
+                "\n      <orm:Fact id=\"{}\">\n        <orm:FactRoles>\n          <orm:Role id=\"{}\" Name=\"\" _IsMandatory=\"true\" _Multiplicity=\"Unspecified\">\n            <orm:RolePlayer ref=\"{}\" />\n          </orm:Role>\n          <orm:Role id=\"{}\" Name=\"\" _IsMandatory=\"false\" _Multiplicity=\"Unspecified\">\n            <orm:RolePlayer ref=\"{}\" />\n          </orm:Role>\n        </orm:FactRoles>\n        <orm:ReadingOrders>\n          <orm:ReadingOrder id=\"{}\">\n            <orm:Readings>\n              <orm:Reading id=\"{}\">\n                <orm:Data>{{0}} has {{1}}</orm:Data>\n              </orm:Reading>\n            </orm:Readings>\n            <orm:RoleSequence>\n              <orm:Role ref=\"{}\" />\n              <orm:Role ref=\"{}\" />\n            </orm:RoleSequence>\n          </orm:ReadingOrder>\n        </orm:ReadingOrders>\n        <orm:InternalConstraints>\n          <orm:UniquenessConstraint ref=\"{}\" />\n          <orm:MandatoryConstraint ref=\"{}\" />\n        </orm:InternalConstraints>\n      </orm:Fact>",
+                guid(&format!("reffact:{}", n)), r0, oid(n), r1, vt, guid(&format!("refrdgord:{}", n)), guid(&format!("refrdg:{}", n)), r0, r1, uc, mc));
+            constraints_block.push_str(&format!(
+                "\n      <orm:UniquenessConstraint id=\"{}\" Name=\"RefSchemeUC{}\" IsInternal=\"true\">\n        <orm:RoleSequence>\n          <orm:Role ref=\"{}\" />\n        </orm:RoleSequence>\n        <orm:PreferredIdentifierFor ref=\"{}\" />\n      </orm:UniquenessConstraint>\n      <orm:MandatoryConstraint id=\"{}\" Name=\"RefSchemeMC{}\" IsSimple=\"true\">\n        <orm:RoleSequence>\n          <orm:Role ref=\"{}\" />\n        </orm:RoleSequence>\n      </orm:MandatoryConstraint>",
+                uc, uc_n, r1, oid(n), mc, mc_n, r0));
+            uc_n += 1; mc_n += 1;
+        }
+        // Subtypes (ORM IsA). The model records `superType` per subtype; ORM
+        // identifies a subtype THROUGH its supertype, so emit a SubtypeFact (with
+        // PreferredIdentificationPath) per relationship and add the supertype/
+        // subtype meta-roles to each entity's played roles. The implied meta-role
+        // constraints are left for NORMA to infer. Without this the subtypes
+        // (e.g. Noun, Fact Type) are unidentified and render red.
+        let mut extra_played: alloc::collections::BTreeMap<String, String> =
+            alloc::collections::BTreeMap::new();
+        let mut subtype_facts = String::new();
+        let mut sub_pairs: Vec<(&String, &String)> = c_supertypes.iter().collect();
+        sub_pairs.sort();
+        for (sub, sup) in sub_pairs {
+            if c_nouns.get(sub).map_or(true, |d| d.object_type != "entity")
+                || c_nouns.get(sup).map_or(true, |d| d.object_type != "entity") { continue; }
+            let submeta = guid(&format!("submeta:{}", sub));
+            let supmeta = guid(&format!("supmeta:{}", sub));
+            subtype_facts.push_str(&format!(
+                "\n      <orm:SubtypeFact id=\"{}\" _Name=\"{}\" PreferredIdentificationPath=\"true\">\n        <orm:FactRoles>\n          <orm:SubtypeMetaRole id=\"{}\" _IsMandatory=\"true\" _Multiplicity=\"ZeroToOne\" Name=\"\">\n            <orm:RolePlayer ref=\"{}\" />\n          </orm:SubtypeMetaRole>\n          <orm:SupertypeMetaRole id=\"{}\" _IsMandatory=\"false\" _Multiplicity=\"ExactlyOne\" Name=\"\">\n            <orm:RolePlayer ref=\"{}\" />\n          </orm:SupertypeMetaRole>\n        </orm:FactRoles>\n      </orm:SubtypeFact>",
+                guid(&format!("subfact:{}", sub)), xesc(&format!("{} isa {}", sub, sup)), submeta, oid(sub), supmeta, oid(sup)));
+            extra_played.entry(sub.clone()).or_default().push_str(&format!(
+                "\n          <orm:SubtypeMetaRole ref=\"{}\" />", submeta));
+            extra_played.entry(sup.clone()).or_default().push_str(&format!(
+                "\n          <orm:SupertypeMetaRole ref=\"{}\" />", supmeta));
+        }
+        let mut objects = String::new();
+        for &(n, def) in &nouns {
+            // Domain filter: skip object types that play no roles. These are
+            // unused enum / grammar value types (metamodel noise lifted by the
+            // Sweep-1 work) that aren't part of any fact in the exported model;
+            // every fact's role players ARE in `played`, so this drops nothing
+            // a fact references.
+            if !played.contains_key(n) && !extra_played.contains_key(n) { continue; }
+            let mut pr: String = played.get(n).map(|rs| rs.iter()
+                .map(|r| format!("\n          <orm:Role ref=\"{}\" />", r)).collect())
+                .unwrap_or_default();
+            if let Some(ex) = extra_played.get(n) { pr.push_str(ex); }
+            if def.object_type.as_str() == "value" {
+                objects.push_str(&format!(
+                    "\n      <orm:ValueType id=\"{}\" Name=\"{}\">\n        <orm:PlayedRoles>{}\n        </orm:PlayedRoles>\n        <orm:ConceptualDataType id=\"{}\" ref=\"{}\" Scale=\"0\" Length=\"0\" />\n      </orm:ValueType>",
+                    oid(n), xesc(n), pr, guid(&format!("cdt:{}", n)), dt_text));
+            } else {
+                // Compact reference mode (Entity (.mode)) + preferred identifier
+                // pointing at the synthesized reference-scheme UC above.
+                let (rm, pi) = match entity_refmode.get(n) {
+                    Some(mode) => (
+                        format!(" _ReferenceMode=\"{}\"", xesc(mode)),
+                        format!("\n        <orm:PreferredIdentifier ref=\"{}\" />", guid(&format!("refuc:{}", n))),
+                    ),
+                    None => (String::new(), String::new()),
+                };
+                objects.push_str(&format!(
+                    "\n      <orm:EntityType id=\"{}\" Name=\"{}\"{}>\n        <orm:PlayedRoles>{}\n        </orm:PlayedRoles>{}\n      </orm:EntityType>",
+                    oid(n), xesc(n), rm, pr, pi));
+            }
+        }
+        let mut facts = String::new();
+        for &(ft, def) in &fts {
+            let mut fr = String::new();
+            let mut rs = String::new();
+            for (p, r) in def.roles.iter().enumerate() {
+                let rp = rid(ft, p);
+                let mand = if mandatory_roles.contains(&rp) { "true" } else { "false" };
+                fr.push_str(&format!(
+                    "\n          <orm:Role id=\"{}\" Name=\"\" _IsMandatory=\"{}\" _Multiplicity=\"Unspecified\">\n            <orm:RolePlayer ref=\"{}\" />\n          </orm:Role>",
+                    rp, mand, oid(&r.noun_name)));
+                rs.push_str(&format!("\n              <orm:Role ref=\"{}\" />", rp));
+            }
+            let mut order: Vec<(usize, &str)> = def.roles.iter().enumerate()
+                .map(|(i, r)| (i, r.noun_name.as_str())).collect();
+            order.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+            let mut reading = def.reading.clone();
+            for (i, noun) in order {
+                reading = reading.replacen(noun, &alloc::format!("{{{}}}", i), 1);
+            }
+            // ExpandedData: the text following each role placeholder, per role.
+            // NORMA reconstructs multi-segment (n-ary) readings from this; without
+            // it the deserializer can't rebuild the predicate and fails. Roles with
+            // no following text are omitted (matches NORMA's own output).
+            let mut role_text = String::new();
+            {
+                let rb = reading.as_bytes();
+                let (mut i, mut cur, mut seg_start) = (0usize, None::<usize>, 0usize);
+                while i < reading.len() {
+                    if rb[i] == b'{' {
+                        if let Some(rel) = reading[i..].find('}') {
+                            let close = i + rel;
+                            if let Ok(k) = reading[i + 1..close].parse::<usize>() {
+                                if let Some(r) = cur {
+                                    let t = reading[seg_start..i].trim();
+                                    if !t.is_empty() {
+                                        role_text.push_str(&format!("\n                  <orm:RoleText FollowingText=\"{}\" RoleIndex=\"{}\" />", xesc(t), r));
+                                    }
+                                }
+                                cur = Some(k);
+                                i = close + 1;
+                                seg_start = i;
+                                continue;
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+                if let Some(r) = cur {
+                    let t = reading[seg_start..].trim();
+                    if !t.is_empty() {
+                        role_text.push_str(&format!("\n                  <orm:RoleText FollowingText=\"{}\" RoleIndex=\"{}\" />", xesc(t), r));
+                    }
+                }
+            }
+            let expanded = if role_text.is_empty() { String::new() } else {
+                format!("\n                <orm:ExpandedData>{}\n                </orm:ExpandedData>", role_text)
+            };
+            let ic = per_fact.get(ft).map(|refs| format!(
+                "\n        <orm:InternalConstraints>{}\n        </orm:InternalConstraints>", refs))
+                .unwrap_or_default();
+            facts.push_str(&format!(
+                "\n      <orm:Fact id=\"{}\">\n        <orm:FactRoles>{}\n        </orm:FactRoles>\n        <orm:ReadingOrders>\n          <orm:ReadingOrder id=\"{}\">\n            <orm:Readings>\n              <orm:Reading id=\"{}\">\n                <orm:Data>{}</orm:Data>{}\n              </orm:Reading>\n            </orm:Readings>\n            <orm:RoleSequence>{}\n            </orm:RoleSequence>\n          </orm:ReadingOrder>\n        </orm:ReadingOrders>{}\n      </orm:Fact>",
+                guid(&format!("fact:{}", ft)), fr, guid(&format!("rdgord:{}", ft)), guid(&format!("rdg:{}", ft)), xesc(&reading), expanded, rs, ic));
+        }
+        // --- Navigation-graph layout (whitepaper Theorem 4b) --------------
+        // Object types are nodes; each binary fact type is a navigation edge
+        // between its two role players. Position by BFS from the most-connected
+        // hub so co-navigable types cluster (mirroring how the resource graph is
+        // walked); disconnected components go in successive column bands. Fact
+        // shapes sit at the midpoint of their two role players.
+        let mut adj: alloc::collections::BTreeMap<String, alloc::collections::BTreeSet<String>> =
+            alloc::collections::BTreeMap::new();
+        for &(_, def) in &fts {
+            if def.roles.len() == 2 {
+                let a = def.roles[0].noun_name.clone();
+                let b = def.roles[1].noun_name.clone();
+                if a != b {
+                    adj.entry(a.clone()).or_default().insert(b.clone());
+                    adj.entry(b).or_default().insert(a);
+                }
+            }
+        }
+        let mut node_names: Vec<String> = Vec::new();
+        for &(n, _) in &nouns {
+            if played.contains_key(n) { node_names.push(n.clone()); }
+        }
+        node_names.sort_by(|a, b| adj.get(b).map_or(0, |v| v.len())
+            .cmp(&adj.get(a).map_or(0, |v| v.len())).then(a.cmp(b)));
+        let mut pos: alloc::collections::BTreeMap<String, (f64, f64)> =
+            alloc::collections::BTreeMap::new();
+        let mut visited: alloc::collections::BTreeSet<String> =
+            alloc::collections::BTreeSet::new();
+        let mut col_base = 0usize;
+        for seed in &node_names {
+            if visited.contains(seed) { continue; }
+            visited.insert(seed.clone());
+            let mut layer: Vec<String> = Vec::new();
+            layer.push(seed.clone());
+            let mut depth = 0usize;
+            let mut last_col = col_base;
+            while !layer.is_empty() {
+                for (i, node) in layer.iter().enumerate() {
+                    pos.insert(node.clone(), ((col_base + depth) as f64 * 2.6, i as f64 * 1.0));
+                }
+                last_col = col_base + depth;
+                let mut next: Vec<String> = Vec::new();
+                for node in &layer {
+                    if let Some(ns) = adj.get(node) {
+                        for nb in ns {
+                            if visited.insert(nb.clone()) { next.push(nb.clone()); }
+                        }
+                    }
+                }
+                layer = next;
+                depth += 1;
+            }
+            col_base = last_col + 2;
+        }
+        let mut shapes = String::new();
+        for &(n, _) in &nouns {
+            if let Some(&(x, y)) = pos.get(n) {
+                shapes.push_str(&format!(
+                    "\n      <ormDiagram:ObjectTypeShape id=\"{}\" IsExpanded=\"true\" AbsoluteBounds=\"{:.3}, {:.3}, 1.2, 0.4\">\n        <ormDiagram:Subject ref=\"{}\" />\n      </ormDiagram:ObjectTypeShape>",
+                    guid(&format!("shp:obj:{}", n)), x, y, oid(n)));
+            }
+        }
+        for &(ft, def) in &fts {
+            if def.roles.len() != 2 { continue; }
+            if let (Some(&(x0, y0)), Some(&(x1, y1))) =
+                (pos.get(&def.roles[0].noun_name), pos.get(&def.roles[1].noun_name)) {
+                let (fx, fy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0 + 0.5);
+                shapes.push_str(&format!(
+                    "\n      <ormDiagram:FactTypeShape id=\"{}\" IsExpanded=\"true\" AbsoluteBounds=\"{:.3}, {:.3}, 0.6, 0.25\">\n        <ormDiagram:RelativeShapes>\n          <ormDiagram:ReadingShape id=\"{}\" IsExpanded=\"true\" AbsoluteBounds=\"{:.3}, {:.3}, 0.6, 0.15\">\n            <ormDiagram:Subject ref=\"{}\" />\n          </ormDiagram:ReadingShape>\n        </ormDiagram:RelativeShapes>\n        <ormDiagram:Subject ref=\"{}\" />\n      </ormDiagram:FactTypeShape>",
+                    guid(&format!("shp:fact:{}", ft)), fx, fy, guid(&format!("shp:rdg:{}", ft)), fx, fy + 0.3, guid(&format!("rdgord:{}", ft)), guid(&format!("fact:{}", ft))));
+            }
+        }
+        let constraints_xml = if constraints_block.is_empty() { String::new() } else {
+            format!("\n    <orm:Constraints>{}\n    </orm:Constraints>", constraints_block)
+        };
+        objects.push_str(&ref_objects);
+        facts.push_str(&ref_facts);
+        facts.push_str(&subtype_facts);
+        let model_id = guid("model");
+        format!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<ormRoot:ORM2 xmlns:orm=\"http://schemas.neumont.edu/ORM/2006-04/ORMCore\" xmlns:ormDiagram=\"http://schemas.neumont.edu/ORM/2006-04/ORMDiagram\" xmlns:ormRoot=\"http://schemas.neumont.edu/ORM/2006-04/ORMRoot\">\n  <orm:ORMModel id=\"{m}\" Name=\"ArestModel\">\n    <orm:Objects>{o}\n    </orm:Objects>\n    <orm:Facts>{f}\n    </orm:Facts>{c}\n    <orm:DataTypes>\n      <orm:VariableLengthTextDataType id=\"{d}\" />\n    </orm:DataTypes>\n  </orm:ORMModel>\n  <ormDiagram:ORMDiagram id=\"{dg}\" IsCompleteView=\"false\" Name=\"ArestModel\" BaseFontName=\"Tahoma\" BaseFontSize=\"0.0972222238779068\">\n    <ormDiagram:Shapes>{s}\n    </ormDiagram:Shapes>\n    <ormDiagram:Subject ref=\"{m}\" />\n  </ormDiagram:ORMDiagram>\n</ormRoot:ORM2>",
+            m = model_id, o = objects, f = facts, c = constraints_xml, d = dt_text, dg = guid("diagram"), s = shapes)
+    }
+    let norma_orm = build_norma_orm(&c_nouns, &c_fact_types, &c_constraints, &c_ref_schemes, &c_supertypes);
+    #[cfg(not(feature = "no_std"))]
+    if std::env::var("AREST_DUMP_NORMA").is_ok() {
+        eprintln!("===NORMA-ORM-START===\n{}\n===NORMA-ORM-END===", norma_orm);
+    }
+    defs.push(("norma:model".to_string(), Func::constant(Object::atom(&norma_orm))));
 
     // â”€ï¿½ï¿½ Generator 12: NHibernate Mapping â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     // #325: read RMAP via cells; no TableDef hop.
