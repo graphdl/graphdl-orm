@@ -578,7 +578,7 @@ pub fn main_entry() {
     // Parse flags.
     let no_validate = args.iter().any(|a| a == "--no-validate");
     let strict = args.iter().any(|a| a == "--strict");
-    let (db_path, rest, _) = args.iter()
+    let (db_path, mut rest, _) = args.iter()
         .filter(|a| !matches!(a.as_str(), "--no-validate" | "--strict"))
         .fold(
         ("arest.db".to_string(), Vec::<String>::new(), false),
@@ -595,11 +595,27 @@ pub fn main_entry() {
                 println!("  --db <path>        SQLite database path (default: arest.db)");
                 println!("  --no-validate      skip constraint validation during compile");
                 println!("  --strict           reject undeclared nouns (no auto-creation)");
+                println!("  --export-norma <f> compile, write NORMA .orm to <f>, exit (no persist)");
                 std::process::exit(0);
             }
             (false, _) => { rest.push(arg.clone()); (db, rest, false) }
         },
     );
+
+    // task-951: `--export-norma <file>` — compile the readings (which builds
+    // the `norma:model` cell when the app opts into the `norma` generator),
+    // write that .orm to <file>, and exit WITHOUT persisting — export is
+    // read-only w.r.t. the DB. Extracted after the fold so the flag and its
+    // value aren't mistaken for readings directories.
+    let export_norma_path: Option<String> = {
+        let idx = rest.iter().position(|a| a == "--export-norma");
+        idx.map(|i| {
+            let v = rest.get(i + 1).cloned().unwrap_or_default();
+            rest.remove(i);
+            if i < rest.len() { rest.remove(i); }
+            v
+        }).filter(|v| !v.is_empty())
+    };
 
     // Wire parsed flags to their engine surface. `--no-validate` is now
     // a state cell installed on the def store below (see #689); `--strict`
@@ -608,7 +624,7 @@ pub fn main_entry() {
 
     #[cfg(not(feature = "local"))]
     {
-        let _ = &db_path; let _ = &rest; let _ = no_validate; // flags-only invocation
+        let _ = &db_path; let _ = &rest; let _ = no_validate; let _ = &export_norma_path; // flags-only invocation
         eprintln!("Build with --features local for SQLite support.");
         eprintln!("  cargo run --bin arest-cli --features local -- <readings_dir>");
         std::process::exit(1);
@@ -863,6 +879,30 @@ pub fn main_entry() {
                 // apps/tasks).
                 let compile_defs = crate::compile::compile_to_defs_state(&state);
                 let d = ast::defs_to_state(&compile_defs, &d);
+
+                // task-951: `--export-norma <file>` short-circuits here.
+                // `compile_to_defs_state` has just built the `norma:model`
+                // def cell (compile.rs:2912) from the `norma` generator; we
+                // write it and exit before the forward-chain + persist, so
+                // export never mutates the DB.
+                if let Some(out_path) = &export_norma_path {
+                    let orm = ast::apply(&ast::Func::Def("norma:model".to_string()),
+                        &ast::Object::phi(), &d).as_atom().map(str::to_string).unwrap_or_default();
+                    if orm.is_empty() {
+                        eprintln!("export-norma: no norma:model cell — does the app opt in with \"App '<name>' uses Generator 'norma'.\"?");
+                        std::process::exit(1);
+                    }
+                    match std::fs::write(out_path, &orm) {
+                        Ok(()) => {
+                            eprintln!("[export-norma] wrote {} bytes to {}", orm.len(), out_path);
+                            std::process::exit(0);
+                        }
+                        Err(e) => {
+                            eprintln!("export-norma: failed to write {}: {}", out_path, e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
 
                 // #836 — drop derived consequent cells before forward-
                 // chain so the LFP recomputes from primary facts. Per
