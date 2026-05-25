@@ -578,19 +578,36 @@ pub fn forward_chain_stratified(
 ) -> (ast::Object, Vec<DerivedFact>) {
     let mut state = d.clone();
     let mut all_derived: Vec<DerivedFact> = Vec::new();
+    // Measure outer-alternation progress by the set of DISTINCT derived
+    // fact-keys, not `all_derived.len()`. A candidate whose UC key collides
+    // with a different stored tuple is dropped by `integrate_round_facts`
+    // and never enters `state`; the next outer pass rebuilds the inner
+    // chain's `existing_keys` from `state` (which lacks it), re-derives it,
+    // and returns it again. A length check counts each re-derivation as
+    // progress, so the "zero new facts" termination never fires and the
+    // alternation spins to `max_outer_rounds` (observed: a value-less
+    // `MonoView has default Pane Mode` looping 100×, ~400 drop logs).
+    // Keying on distinct fact-keys converges — a perpetually-dropped fact
+    // is counted once — and de-dups the returned list. Same loop class as
+    // the φ-key mismatch fixed in `state_keys` (task-927).
+    let mut derived_keys: HashSet<FactKey> = HashSet::new();
     for _ in 0..max_outer_rounds {
-        let before = all_derived.len();
+        let before = derived_keys.len();
         if !stratum1.is_empty() {
             let (s1, d1) = forward_chain_defs_state(stratum1, &state);
             state = s1;
-            all_derived.extend(d1);
+            for f in d1 {
+                if derived_keys.insert(fact_key(&f)) { all_derived.push(f); }
+            }
         }
         if !stratum2.is_empty() {
             let (s2, d2) = forward_chain_defs_state(stratum2, &state);
             state = s2;
-            all_derived.extend(d2);
+            for f in d2 {
+                if derived_keys.insert(fact_key(&f)) { all_derived.push(f); }
+            }
         }
-        if all_derived.len() == before {
+        if derived_keys.len() == before {
             break;
         }
     }
@@ -657,12 +674,18 @@ pub fn forward_chain_stratified_n(
 
     let mut state = d.clone();
     let mut all_derived: Vec<DerivedFact> = Vec::new();
+    // See `forward_chain_stratified`: terminate on distinct derived
+    // fact-keys, not list length, so a perpetually-UC-dropped fact
+    // (counted once) can't keep the alternation spinning to the cap.
+    let mut derived_keys: HashSet<FactKey> = HashSet::new();
     for _ in 0..max_outer_rounds {
-        let before = all_derived.len();
+        let before = derived_keys.len();
         if !pos_refs.is_empty() {
             let (s1, d1) = forward_chain_defs_state(&pos_refs, &state);
             state = s1;
-            all_derived.extend(d1);
+            for f in d1 {
+                if derived_keys.insert(fact_key(&f)) { all_derived.push(f); }
+            }
         }
         // task-814: drive each negation sub-stratum to fixpoint
         // before advancing. With 3+ levels — dual-gate / single-gate
@@ -676,9 +699,11 @@ pub fn forward_chain_stratified_n(
             if stratum_refs.is_empty() { continue; }
             let (s2, d2) = forward_chain_defs_state(stratum_refs, &state);
             state = s2;
-            all_derived.extend(d2);
+            for f in d2 {
+                if derived_keys.insert(fact_key(&f)) { all_derived.push(f); }
+            }
         }
-        if all_derived.len() == before {
+        if derived_keys.len() == before {
             break;
         }
     }
