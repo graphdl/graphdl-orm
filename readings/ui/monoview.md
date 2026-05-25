@@ -95,6 +95,9 @@ MonoView has display- Title.
 MonoView has default Pane Mode.
   Each MonoView has exactly one default Pane Mode.
 
+MonoView has effective Pane Mode.
+  Each MonoView has at most one effective Pane Mode.
+
 MonoView has default Density Scale.
   Each MonoView has exactly one default Density Scale.
 

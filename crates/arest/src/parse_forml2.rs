@@ -1397,6 +1397,31 @@ fn resolve_derivation_rule(
             .or_else(|| catalog.resolve(&role_refs, None))
     };
 
+    // A derivation CONSEQUENT must name a fact type that actually exists.
+    // The role-set-only fallback above is correct for antecedent clauses
+    // (authors phrase verbs loosely there), but for the head it silently
+    // maps an undeclared FT onto a same-role-set / different-verb one — an
+    // undeclared `MonoView has effective Pane Mode` resolves to the
+    // declared `MonoView has default Pane Mode`, then emits a value-less
+    // head the chainer drops every round. The head therefore resolves
+    // verb-specifically ONLY (no role-set fallback); an unresolved head is
+    // handled by the caller (recorded + consequent left empty = rule dropped).
+    let resolve_consequent_strict = |fragment: &str| -> Option<String> {
+        let cleaned = strip_anaphora(fragment);
+        let found_nouns: Vec<(usize, usize, String)> = find_nouns(&cleaned, &noun_names);
+        if found_nouns.is_empty() { return None; }
+        let base_refs: Vec<String> = found_nouns.iter()
+            .map(|(_, _, n)| parse_role_token(n).0.to_string())
+            .collect();
+        let role_refs: Vec<&str> = base_refs.iter().map(|s| s.as_str()).collect();
+        let verb = match found_nouns.len() {
+            1 => cleaned[found_nouns[0].1..].trim(),
+            _ => cleaned[found_nouns[0].1..found_nouns[1].0].trim(),
+        };
+        let verb_opt = (!verb.is_empty()).then_some(verb);
+        catalog.resolve(&role_refs, verb_opt)
+    };
+
     // Detect "that X" anaphoric references -- nouns preceded by "that " in
     // antecedent parts become join keys. Mutable because the #914
     // cross-antecedent-comparison branch below can append synthesised
@@ -1424,7 +1449,22 @@ fn resolve_derivation_rule(
     // single-quoted literal at end of string, after a leading space.
     let consequent_trailing_literal =
         strip_trailing_quoted_literal(consequent_text).map(|(_, lit)| lit);
-    let resolved_consequent = resolve_fact_type(consequent_text).unwrap_or_default();
+    let consequent_strict = resolve_consequent_strict(consequent_text);
+    // If the head only resolves through the fuzzy role-set fallback (the
+    // verb-specific match failed), it names a fact type that isn't declared
+    // with that reading. Record it and leave the consequent empty so the
+    // rule is dropped at the `!consequent_cell.is_empty()` filter — a
+    // derivation that names a missing fact type refuses to run rather than
+    // silently writing a value-less fact into a same-role-set FT.
+    if consequent_strict.is_none() {
+        if let Some(fuzzy) = resolve_fact_type(consequent_text) {
+            rule.unresolved_clauses.push(format!(
+                "consequent '{}' references no declared fact type \
+                 (nearest by role set: {})",
+                consequent_text.trim(), fuzzy));
+        }
+    }
+    let resolved_consequent = consequent_strict.unwrap_or_default();
     rule.consequent_cell = crate::types::ConsequentCellSource::Literal(resolved_consequent);
     if let Some(lit) = consequent_trailing_literal {
         if !rule.consequent_cell.is_empty_literal() {
