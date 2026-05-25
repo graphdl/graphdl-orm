@@ -225,11 +225,14 @@ bottom of this section.
    that has Z 'present'`. The ` some ` is stripped, then the
    `that`-relative is expanded by `expand_that_relatives` (using
    `parse_forml2_stage2::AnaphoraPronounTable`) into the two-clause
-   join `X concerns Y and Y has Z 'present'`. Both clauses must
+   form `X concerns Y and Y has Z 'present'`. Both clauses must
    resolve to declared FTs OR the expansion is skipped (see
-   `head_resolves` in `parse_forml2.rs`). Routes through
-   `compile_join_derivation` because two antecedents share the join
-   noun (Y). Pinned by `shape_join_path_via_possessive_expands_and_fires`.
+   `head_resolves` in `parse_forml2.rs`). Because `expand_that_relatives`
+   CONSUMES the `that`, no anaphora survives, so `join_on` is empty and
+   the rule is NOT promoted to `Join` kind — it routes through
+   `compile_explicit_derivation`'s multi-antecedent existential-over-join
+   path, NOT `compile_join_derivation`. Pinned by
+   `shape_existential_over_join_fans_out_per_x`.
 
 7. **Numeric aggregation** — `X has Count iff Count is the count of Y
    where X has Y`. The clause shape `<role> is the <op> of <target>
