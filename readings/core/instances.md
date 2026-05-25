@@ -90,6 +90,17 @@ State Machine is for Resource. *
 Resource is currently in Status.
   Each Resource is currently in at most one Status.
 
+# task-955/924: key the SM-keyed status projection so it stays single-valued.
+# The engine's imperative transition write AND the SM event-fold both write
+# `State_Machine_is_currently_in_Status`; without this UC the cell is un-keyed,
+# so the chain folds it by full tuple and the event-fold (which emits one
+# status per triggered event) ACCUMULATES every historical status — the
+# 923/924 readback artifact. Keyed by State Machine, integrate_round_facts'
+# keyed-upsert collapses the per-resource emits to last-write-wins (the latest
+# transition target, in transition_table declaration order).
+State Machine is currently in Status.
+  Each State Machine is currently in at most one Status.
+
 ### Fact Triggered Transition (objectification of "Fact triggered Transition for Resource")
 Fact triggered Transition for Resource.
   In each population of Fact triggered Transition for Resource, each Fact, Transition, Resource combination occurs at most once.
