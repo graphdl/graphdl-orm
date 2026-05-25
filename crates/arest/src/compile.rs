@@ -2588,13 +2588,24 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             t.starts_with("Each ") || t.starts_with("For each ") || t.starts_with("In each ")
                 || t.starts_with("It is impossible") || t.starts_with("No ")
         };
-        // Binary facts only for now: unary (1-role) and n-ary (3+) are deferred.
-        // n-ary is blocked on task 952 (external uniqueness must compile to a UC
-        // function before NORMA will load n-ary facts); unaries (task 951) need the
-        // implicit-boolean form. Switch to `>= 2` once 952 lands. Ref-scheme
-        // verbalization fact types are also excluded (they aren't fact types).
+        // task-951/952: n-ary fact types are now emitted, but only when they
+        // carry a composite INTERNAL uniqueness constraint (>= 2 spans, all on
+        // the same FT). That spanning UC is exactly what stops NORMA decomposing
+        // the n-ary on load; emitting an under-constrained n-ary is what tripped
+        // NORMA before. task 952 now compiles the "Each X, Y combination occurs
+        // at most once ..." verbalization into such a UC (see
+        // enrich_constraints_with_spans), so the ternaries / 4-aries that carry
+        // it become NORMA-valid. Binary FTs are always emitted; unaries (1-role)
+        // remain deferred; ref-scheme verbalization fact types stay excluded.
+        let composite_uc_fts: alloc::collections::BTreeSet<String> = c_constraints.iter()
+            .filter(|c| c.kind == "UC" && c.spans.len() >= 2
+                && c.spans.iter().all(|s| s.fact_type_id == c.spans[0].fact_type_id))
+            .map(|c| c.spans[0].fact_type_id.clone())
+            .collect();
         let mut fts: Vec<(&String, &FactTypeDef)> = c_fact_types.iter()
-            .filter(|(id, d)| d.roles.len() == 2 && !ref_fact_ids.contains(id.as_str())
+            .filter(|(id, d)| (d.roles.len() == 2
+                    || (d.roles.len() > 2 && composite_uc_fts.contains(id.as_str())))
+                && !ref_fact_ids.contains(id.as_str())
                 && !is_constraint_reading(&d.reading))
             .collect();
         fts.sort_by(|a, b| a.0.cmp(b.0));
