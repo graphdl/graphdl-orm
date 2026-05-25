@@ -3530,7 +3530,15 @@ fn platform_list_noun(noun: &str, d: &Object) -> Object {
     let d = visible_population(d);
     let mut entities: HashMap<String, HashMap<String, String>> = HashMap::new();
 
-    cells_iter(&d).iter().for_each(|(_, contents)| {
+    cells_iter(&d).iter().for_each(|(name, contents)| {
+        // task-955 Fix 2: only BASE population cells contribute an entity's
+        // fields. ':'-namespaced cells (derivation:/schema:/view:/sql:/…) and
+        // `_transitive_*` closure cells are derived, not base — folding their
+        // role bindings into the entity below (the last-write `insert`) made
+        // SM status reads NONDETERMINISTIC: a transitive-closure cell could
+        // supply a phantom 'Status' that overwrote the keyed base value in
+        // arbitrary iteration order (the 923/924 actions/get artifact).
+        if name.contains(':') || name.starts_with("_transitive_") { return; }
         // #932 phase-2: cell_facts_iter so a folded (Map) cell is scanned
         // too, not just Seq cells (the raw-as_seq()-skips-Map bug class).
         cell_facts_iter(contents).for_each(|fact| {
@@ -3584,7 +3592,16 @@ fn platform_query_ft(ft_id: &str, x: &Object, d: &Object) -> Object {
     // ρ-projection (#350): query_ft is a population read path, so
     // migrated-away sources must not appear in results.
     let d = visible_population(d);
-    let facts = fetch_cell_seq(ft_id, &d);
+    // task-955 Fix 3: a view (derived) fact type's population IS its
+    // derivation's output, not the stored cell. When the stored cell is
+    // empty, resolve the view — mirrors sql.rs::materialize_fact_type_tables
+    // so MCP `query` and `sql` agree on view-backed FTs (e.g.
+    // Task_has_Task_Status, whose stored cell stays empty while its 2-stage
+    // bridge derivation populates it on read). Stored data, when present, is
+    // the eager truth, so only resolve the view for a never-materialized cell.
+    let stored = fetch_cell_seq(ft_id, &d);
+    let resolved = if cell_fact_count(&stored) == 0 { resolve_view(ft_id, &d, &d) } else { None };
+    let facts = resolved.unwrap_or(stored);
     let facts_seq = facts.as_seq().map(|s| s.to_vec()).unwrap_or_default();
 
     let filter: hashbrown::HashMap<String, String> = x.as_atom()
@@ -11016,6 +11033,78 @@ mod tests {
         assert!(values.contains(&"113"),
             "blocked Task=113 must appear in the projection; got row={row:?}. \
              #840: see comment above.");
+    }
+
+    /// task-955 Fix 3 — `query_ft` on a VIEW-backed fact type (stored cell
+    /// empty; populated only by its derivation) must RESOLVE the view, the
+    /// same way the SQL read path does (sql.rs::materialize_fact_type_tables).
+    /// Before the fix, query_ft read the empty stored cell and returned `[]`
+    /// while SQL returned the derived rows — the silent reader split that
+    /// left MCP `query Task_has_Task_Status` empty while `sql` had 777.
+    /// Fixture mirrors `sql::tests::view_fact_type_resolves_derivation_on_sql_read`.
+    #[test]
+    fn query_ft_resolves_view_backed_fact_type() {
+        let src = "Thing(.id) is an entity type.\n\
+Base(.id) is an entity type.\n\
+Tag is a value type.\n\
+Thing Tag is a value type.\n\
+\n\
+## Fact Types\n\
+Base has Tag.\n\
+Thing has Thing Tag. *\n\
+\n\
+## Derivation Rules\n\
+* Thing has Thing Tag iff that Base has some Tag and Thing Tag is Tag and Thing is Base.\n\
+\n\
+## Instance Facts\n\
+Base 'b1' has Tag 'hot'.\n";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src).expect("parse");
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let d = defs_to_state(&defs, &state);
+        // The stored Thing_has_Thing_Tag cell is empty (view materialization);
+        // query_ft must resolve the view to return the derived fact.
+        let result = platform_query_ft("Thing_has_Thing_Tag", &Object::atom(""), &d);
+        let json_str = result.as_atom().expect("result must be a JSON atom");
+        let parsed: serde_json::Value = serde_json::from_str(json_str)
+            .unwrap_or_else(|e| panic!("query_ft must return valid JSON; got {json_str:?} err={e}"));
+        let arr = parsed.as_array().expect("query_ft must return a JSON array");
+        assert!(arr.iter().any(|row| {
+            let m = match row.as_object() { Some(m) => m, None => return false };
+            m.values().any(|v| v.as_str() == Some("b1"))
+                && m.values().any(|v| v.as_str() == Some("hot"))
+        }), "query_ft must resolve the view to derived facts (Thing=b1, Thing Tag=hot); got {arr:?}");
+    }
+
+    /// task-955 Fix 2 — `platform_list_noun` (the `list:`/`get:` 3NF assembly)
+    /// must fold ONLY base population cells, never derived `_transitive_*`
+    /// closure cells or ':'-namespaced cells. Folding the latter made SM
+    /// status reads nondeterministic (a transitive cell could supply a
+    /// phantom 'Status' that overwrote the keyed base value). A field present
+    /// ONLY in such a cell must NOT appear on the entity — deterministic to
+    /// assert (unlike "which status wins", which depends on iteration order).
+    #[test]
+    fn list_noun_excludes_transitive_and_namespaced_cells() {
+        let s0 = Object::phi();
+        let s1 = cell_push("Widget_has_Color",
+            fact_from_pairs(&[("Widget", "w1"), ("Color", "red")]), &s0);
+        let s2 = cell_push("_transitive_Widget_phantom",
+            fact_from_pairs(&[("Widget", "w1"), ("Phantom", "ghost")]), &s1);
+        let s3 = cell_push("schema:Widget_has_Color",
+            fact_from_pairs(&[("Widget", "w1"), ("Schemic", "x")]), &s2);
+
+        let result = platform_list_noun("Widget", &s3);
+        let json_str = result.as_atom().expect("list result must be a JSON atom");
+        let parsed: serde_json::Value = serde_json::from_str(json_str).expect("valid JSON");
+        let arr = parsed.as_array().expect("array");
+        let w1 = arr.iter()
+            .find(|r| r.get("id").and_then(|v| v.as_str()) == Some("w1"))
+            .expect("w1 must be listed").as_object().expect("object");
+        assert_eq!(w1.get("Color").and_then(|v| v.as_str()), Some("red"),
+            "base field must be present; got {w1:?}");
+        assert!(!w1.contains_key("Phantom"),
+            "field from a _transitive_* cell must NOT be folded into the entity; got {w1:?}");
+        assert!(!w1.contains_key("Schemic"),
+            "field from a ':'-namespaced cell must NOT be folded into the entity; got {w1:?}");
     }
 
     /// #840 follow-up — filter on a ring FT must accept both bare role

@@ -99,7 +99,7 @@ Resource is currently in Status.
 # keyed-upsert collapses the per-resource emits to last-write-wins (the latest
 # transition target, in transition_table declaration order).
 State Machine is currently in Status.
-  Each State Machine is currently in at most one Status.
+  Each State Machine is currently in exactly one Status.
 
 ### Fact Triggered Transition (objectification of "Fact triggered Transition for Resource")
 Fact triggered Transition for Resource.
