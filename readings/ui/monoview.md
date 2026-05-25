@@ -95,9 +95,6 @@ MonoView has display- Title.
 MonoView has default Pane Mode.
   Each MonoView has exactly one default Pane Mode.
 
-MonoView has effective Pane Mode.
-  Each MonoView has at most one effective Pane Mode.
-
 MonoView has default Density Scale.
   Each MonoView has exactly one default Density Scale.
 
@@ -211,17 +208,6 @@ It is obligatory that each Interaction Mode has some minimum Hit Target Size.
     if PanePreference is for App Role
     and that App Role is a REPL
     and PanePreference has Override Source 'app-default'.
-
-+ MonoView has effective Pane Mode if MonoView is for App Role
-    and some PanePreference is for that App Role
-    and that PanePreference has Override Source 'user'
-    and effective Pane Mode is that PanePreference's Pane Mode.
-
-+ MonoView has effective Pane Mode if MonoView is for App Role
-    and some PanePreference is for that App Role
-    and that PanePreference has Override Source 'app-default'
-    and no PanePreference is for that App Role with Override Source 'user'
-    and effective Pane Mode is that PanePreference's Pane Mode.
 
 ## Instance Facts
 
