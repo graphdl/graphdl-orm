@@ -133,6 +133,7 @@ pub fn check_readings_func() -> Func {
         Func::Concat,
         Func::construction(vec![
             layer_native(check_unresolved_clauses),
+            layer_native(check_unresolved_instance_facts),
             layer_native(check_ring_validity),
             layer_native(check_ring_completeness),
             layer_native(check_atom_ids),
@@ -196,6 +197,43 @@ fn check_unresolved_clauses(state: &Object) -> Vec<ReadingDiagnostic> {
                 message: format!(
                     "antecedent clause did not resolve to a declared fact type: `{}`",
                     clause,
+                ),
+                suggestion: Some(suggestion),
+            }
+        }).collect())
+        .unwrap_or_default()
+}
+
+/// Layer 1b: unresolved instance-fact analysis. Mirrors
+/// `check_unresolved_clauses` but for Instance Fact statements whose
+/// canonical reading matches no declared fact type — those tuples are
+/// mis-filed under their raw verb (see
+/// `translate_instance_facts_with_ft_ids` ~line 3459) and never reach
+/// the intended fact-type cell, a silent data loss. Surfacing it as a
+/// resolve warning gives the author the offending reading + candidate
+/// fact types.
+fn check_unresolved_instance_facts(state: &Object) -> Vec<ReadingDiagnostic> {
+    let fact_types = fetch_cell_seq("FactType", state);
+    let nouns = fetch_cell_seq("Noun", state);
+    let noun_names: Vec<String> = nouns.as_seq()
+        .map(|facts| facts.iter()
+            .filter_map(|n| binding(n, "name").map(String::from))
+            .collect())
+        .unwrap_or_default();
+    fetch_cell_seq("UnresolvedInstanceFact", state).as_seq()
+        .map(|facts| facts.iter().map(|f| {
+            let reading = binding(f, "stmtText").unwrap_or("");
+            let verb = binding(f, "verb").unwrap_or("");
+            let subject = binding(f, "subjectNoun").unwrap_or("");
+            let suggestion = suggest_similar_fact_types(reading, &noun_names, &fact_types);
+            ReadingDiagnostic {
+                line: 0,
+                reading: reading.to_string(),
+                level: Level::Warning,
+                source: Source::Resolve,
+                message: format!(
+                    "instance fact did not resolve to a declared fact type (verb `{}` on subject `{}`); the tuple is mis-filed under the raw verb and never reaches the intended fact-type cell",
+                    verb, subject,
                 ),
                 suggestion: Some(suggestion),
             }
@@ -733,6 +771,37 @@ mod tests {
         let suggestion = mystery_warning.suggestion.as_ref().expect("suggestion present");
         assert!(suggestion.contains("Order has Amount") || suggestion.contains("Order has Customer"),
             "suggestion must name declared FT candidates involving `Order`, got {:?}", suggestion);
+    }
+
+    /// warn-unmatched-instance-facts — an Instance Fact whose verb
+    /// resolves to no declared fact type must surface a resolve warning.
+    /// Without it the tuple is silently mis-filed under the raw verb
+    /// (translate_instance_facts_with_ft_ids ~line 3459), the 941
+    /// data-loss class. The declared `has Amount` fact must NOT warn,
+    /// guarding against false positives.
+    #[test]
+    fn unmatched_instance_fact_verb_warns() {
+        let input = "Order(.Id) is an entity type.\n\
+                     Amount is a value type.\n\
+                     Total is a value type.\n\
+                     ## Fact Types\n\
+                     Order has Amount.\n\
+                     ## Instance Facts\n\
+                     Order 'o1' has Amount '5'.\n\
+                     Order 'o1' has Total '7'.";
+        let diags = check_readings(input);
+        // `has Total` matches no declared FT -> must surface a resolve warning.
+        assert!(
+            diags.iter().any(|d| d.source == Source::Resolve
+                && d.reading.contains("Total")
+                && d.message.contains("did not resolve to a declared fact type")),
+            "expected an unresolved-instance-fact warning for `has Total`. Full diags: {:#?}", diags);
+        // `has Amount` IS declared -> it must NOT warn (no false positive).
+        assert!(
+            !diags.iter().any(|d| d.source == Source::Resolve
+                && d.reading.contains("Amount")
+                && d.message.contains("did not resolve to a declared fact type")),
+            "`has Amount` is declared and must not warn. Full diags: {:#?}", diags);
     }
 
     /// #277 Category F — `<Noun> has <Noun> within <anaphora>` is

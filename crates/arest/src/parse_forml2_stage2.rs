@@ -4003,6 +4003,63 @@ pub fn translate_unresolved_clauses(
     out
 }
 
+/// Scan Instance Fact statements whose canonical FT reading matches no
+/// declared FactType id. Emits `UnresolvedInstanceFact` facts with
+/// `subjectNoun`, `subjectValue`, `verb`, `canonical`, and `stmtText`
+/// bindings — `check.rs`'s `check_unresolved_instance_facts` reads these
+/// to warn the author. Without it the fact is silently mis-filed: in
+/// `translate_instance_facts_with_ft_ids` an unmatched canonical falls
+/// back to the raw `verb` as `fieldName` (line ~3459), so the tuple fans
+/// out into a non-canonical cell and never reaches the intended
+/// fact-type cell (the data loss `warn-unmatched-instance-facts` fixes).
+/// Mirrors the `translate_unresolved_clauses` path that covers
+/// derivation-rule antecedents; instance facts had no equivalent.
+pub fn translate_unresolved_instance_facts(
+    _classified_state: &Object,
+    idx: &StmtIndex,
+    declared_ft_ids: &[String],
+) -> Vec<Object> {
+    let table = StatementTranslatorTable::boot();
+    let kinds: Vec<&str> = table.kinds_for("translate_instance_facts");
+    let statement_ids = collect_statement_ids(idx);
+    let mut out: Vec<Object> = Vec::new();
+    for stmt_id in statement_ids.iter() {
+        if !kinds.iter().any(|k| classifications_contains(idx, stmt_id, k)) {
+            continue;
+        }
+        // Same arbitration as translate_instance_facts_with_ft_ids: a
+        // derivation rule with a literal body fires the Instance Fact
+        // recognizer too; it is not an instance fact, so skip it.
+        if classifications_contains(idx, stmt_id, "Derivation Rule") {
+            continue;
+        }
+        let roles = role_refs_with_literals(idx, stmt_id);
+        if roles.is_empty() { continue; }
+        let text = statement_text(idx, stmt_id).unwrap_or_default();
+        let verb = statement_verb(idx, stmt_id).unwrap_or_default();
+        let subject_noun = roles[0].0.clone();
+        let subject_value = roles[0].1.as_deref().unwrap_or("").to_string();
+        // Rebuild the canonical id exactly as
+        // translate_instance_facts_with_ft_ids does (line ~3452); when it
+        // is NOT among the declared FT ids the sibling translator falls
+        // back to the verb — that is the silent drop we flag here.
+        let role_nouns: Vec<String> = roles.iter().map(|(n, _)| n.clone()).collect();
+        let reading = strip_role_literals(&text, &roles);
+        let canonical = fact_type_id_from_reading(&reading, &role_nouns);
+        if declared_ft_ids.iter().any(|id| *id == canonical) {
+            continue;
+        }
+        out.push(fact_from_pairs(&[
+            ("subjectNoun",  subject_noun.as_str()),
+            ("subjectValue", subject_value.as_str()),
+            ("verb",         verb.as_str()),
+            ("canonical",    canonical.as_str()),
+            ("stmtText",     text.as_str()),
+        ]));
+    }
+    out
+}
+
 /// FNV-1a 64-bit hash of the rule text, formatted as `rule_<hex>` to
 /// match legacy's stable id. Multiple rules may share a consequent FT
 /// (the grammar has 28 rules all producing `Statement has
@@ -5446,6 +5503,8 @@ fn parse_to_state_via_stage12_impl(
     let mut instance_fact_facts = tt!("instance_facts",
         translate_instance_facts_with_ft_ids(&classified, &idx, &declared_ft_ids));
     instance_fact_facts.extend(tt!("deriv_mode", translate_derivation_mode_facts(&classified, &idx)));
+    let unresolved_instance_fact_facts = tt!("unresolved_if",
+        translate_unresolved_instance_facts(&classified, &idx, &declared_ft_ids));
     let enum_values_facts = tt!("enum_values", translate_enum_values(&classified, &idx));
     if trace { crate::diag!("[s12] translators: {:?}", t_tr.elapsed()); }
     if trace { crate::diag!("[s12] TOTAL: {:?}", t0.elapsed()); }
@@ -5482,6 +5541,7 @@ fn parse_to_state_via_stage12_impl(
     map.insert("InstanceFact".to_string(), Object::Seq(instance_fact_facts.into()));
     map.insert("EnumValues".to_string(), Object::Seq(enum_values_facts.into()));
     map.insert("UnresolvedClause".to_string(), Object::Seq(unresolved_clause_facts.into()));
+    map.insert("UnresolvedInstanceFact".to_string(), Object::Seq(unresolved_instance_fact_facts.into()));
     for (cell_name, facts) in compound_cells {
         map.insert(cell_name, Object::Seq(facts.into()));
     }
