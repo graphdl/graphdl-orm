@@ -1116,7 +1116,7 @@ Customer wrote Review.
     #[test]
     fn check_readings_func_top_level_is_concat_of_construction() {
         // Structural assertion — the top-level Func must remain
-        // Concat ∘ Construction([…]) with exactly 4 layers. This is
+        // Concat ∘ Construction([…]) with exactly 5 layers. This is
         // the paper-aligned shape (Backus Concat + Construction).
         // MC4b (#751) dropped the singular-naming layer; the
         // equivalent diagnostic now flows from the deontic constraint
@@ -1127,8 +1127,8 @@ Customer wrote Review.
                 assert!(matches!(**outer, Func::Concat),
                     "top-level must compose Concat onto the construction");
                 match &**inner {
-                    Func::Construction(layers) => assert_eq!(layers.len(), 4,
-                        "check_readings_func must expose exactly 4 layer Funcs"),
+                    Func::Construction(layers) => assert_eq!(layers.len(), 5,
+                        "check_readings_func must expose exactly 5 layer Funcs"),
                     other => panic!("inner must be Construction, got {:?}", other),
                 }
             }

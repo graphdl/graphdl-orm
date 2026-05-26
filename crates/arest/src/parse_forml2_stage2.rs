@@ -4034,7 +4034,15 @@ pub fn translate_unresolved_instance_facts(
             continue;
         }
         let roles = role_refs_with_literals(idx, stmt_id);
-        if roles.is_empty() { continue; }
+        // Only flag MULTI-role facts. A single detected role usually
+        // means the object value type is only implicitly declared (via
+        // the fact type, not an explicit `... is a value type`), so role
+        // detection under-counts it and flagging would false-positive on
+        // a perfectly valid fact (e.g. `Order has Amount '100'` when the
+        // reading never says `Amount is a value type`). The motivating
+        // case (941: a declared value type read with the wrong verb)
+        // detects >=2 roles, so the warning stays sound.
+        if roles.len() < 2 { continue; }
         let text = statement_text(idx, stmt_id).unwrap_or_default();
         let verb = statement_verb(idx, stmt_id).unwrap_or_default();
         let subject_noun = roles[0].0.clone();
