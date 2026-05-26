@@ -1622,44 +1622,9 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         .filter(|d| !d.consequent_cell.is_empty())
         .map(|d| (format!("view:{}", d.consequent_cell), d.func.clone())));
 
-    // task-814-stratify-3plus: emit per-rule dependency metadata as
-    // `derivation_meta:<rule_id>` sidecar defs so the runtime
-    // forward chainer (CLI compile path, apply path, MCP query) can
-    // reconstruct `StratifiedRule` records and drive n-stratum
-    // topological dispatch. Each meta def is a Func::constant of a
-    // 3-tuple `<<consequent_cell, role_lits, neg_reads>>` where
-    // role_lits and neg_reads are encoded as sequences of pairs.
-    //
-    // Rules whose dep metadata is fully empty (consequent_cell ==
-    // "" AND no role_lits AND no neg_reads) skip emission — the
-    // runtime treats an absent meta cell as a depth-0 negation rule
-    // (no inbound deps; no upgrade over the 2-stratum bucket).
-    defs.extend(model.derivations.iter()
-        .filter(|d| !d.consequent_cell.is_empty()
-            || !d.consequent_role_literals.is_empty()
-            || !d.negation_reads.is_empty())
-        .map(|d| {
-            let role_lits_obj = Object::seq(d.consequent_role_literals.iter()
-                .map(|(role, value)| Object::seq(vec![
-                    Object::atom(role.as_str()), Object::atom(value.as_str())]))
-                .collect());
-            let neg_reads_obj = Object::seq(d.negation_reads.iter()
-                .map(|(cell, pins)| Object::seq(vec![
-                    Object::atom(cell.as_str()),
-                    Object::seq(pins.iter()
-                        .map(|(role, value)| Object::seq(vec![
-                            Object::atom(role.as_str()),
-                            Object::atom(value.as_str())]))
-                        .collect()),
-                ]))
-                .collect());
-            let meta_obj = Object::seq(vec![
-                Object::atom(d.consequent_cell.as_str()),
-                role_lits_obj,
-                neg_reads_obj,
-            ]);
-            (format!("derivation_meta:{}", d.id), Func::constant(meta_obj))
-        }));
+    // (negation-strat-strip) the per-rule `derivation_meta:<id>` sidecar
+    // emission was removed: its only consumer, evaluate::read_derivation_meta,
+    // was deleted with the negation-stratification subsystem (fa069f85).
 
     // task-3 phase 2 / DB-task-929: positive antecedent reads sidecar.
     // One `derivation_reads:<rule_id>` cell per non-empty entry — empty
