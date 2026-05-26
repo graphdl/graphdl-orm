@@ -1744,7 +1744,8 @@ impl ConditionalRingPatternTable {
 /// per-kind arbitration predicate. Five rows in declaration order:
 /// Equality / Subset / Exclusive-Or / Or / Exclusion Constraint →
 /// `EQ` / `SS` / `XO` / `OR` / `XC`. Subset uses
-/// `antecedent_diversity_min_2`; everyone else uses
+/// `subset_wins` (the `If some ... then that ...` frame is a subset by
+/// grammar — thm:grammar(b)); everyone else uses
 /// `derivation_rule_wins`. Order matters — translate_set_constraints
 /// picks the first matching row, mirroring the legacy if-else cascade.
 #[derive(Debug, Clone)]
@@ -1764,7 +1765,7 @@ impl SetConstraintKindTable {
         SetConstraintKindTable {
             rows: alloc::vec![
                 ("Equality Constraint".to_string(),     "EQ".to_string(), "derivation_rule_wins".to_string()),
-                ("Subset Constraint".to_string(),       "SS".to_string(), "antecedent_diversity_min_2".to_string()),
+                ("Subset Constraint".to_string(),       "SS".to_string(), "subset_wins".to_string()),
                 ("Exclusive-Or Constraint".to_string(), "XO".to_string(), "derivation_rule_wins".to_string()),
                 ("Or Constraint".to_string(),           "OR".to_string(), "derivation_rule_wins".to_string()),
                 ("Exclusion Constraint".to_string(),    "XC".to_string(), "derivation_rule_wins".to_string()),
@@ -1842,12 +1843,22 @@ fn skip_on_derivation_rule(_text: &str, _nouns: &[String], idx: &StmtIndex, stmt
     classifications_contains(idx, stmt_id, "Derivation Rule")
 }
 
-/// Skip when the antecedent has fewer than 2 distinct declared nouns.
-/// Used for SS where the synthetic `if some then that` constraint
-/// keyword also fires for single-antecedent-noun cases that legacy
-/// hands to translate_derivation_rules.
-fn skip_on_low_antecedent_diversity(text: &str, declared_nouns: &[String], _idx: &StmtIndex, _stmt_id: &str) -> bool {
-    antecedent_distinct_nouns(text, declared_nouns) < 2
+/// Subset constraints always claim the `If some ... then that ...`
+/// frame, so the set-constraint translator never defers them. Stage-1's
+/// `if some then that` recognizer (parse_forml2_stage1.rs) emits the
+/// Subset Constraint classification only for an existential-`some`
+/// antecedent + anaphoric-`that` consequent — exactly thm:grammar(b)
+/// ("Subset constraints by existential `some` in the antecedent and
+/// anaphoric `that` in the consequent; derivation rules occupy the
+/// remainder"). A Statement that reaches here already classified Subset,
+/// so the grammar test is done; returning `false` keeps it on the SS
+/// path. The symmetric DR-side skip lives in
+/// `translate_derivation_rules_with_matrix`. Replaces the legacy
+/// `antecedent_distinct_nouns >= 2` proxy, which wrongly demoted
+/// single-noun subset frames (`If some X <r> then that X <s>`) to
+/// derivation rules.
+fn subset_wins(_text: &str, _declared_nouns: &[String], _idx: &StmtIndex, _stmt_id: &str) -> bool {
+    false
 }
 
 /// Registry of arbitration-rule name → predicate. The string keys must
@@ -1857,7 +1868,7 @@ fn skip_on_low_antecedent_diversity(text: &str, declared_nouns: &[String], _idx:
 pub fn set_constraint_arbitration_registry() -> hashbrown::HashMap<&'static str, SetConstraintArbitrationFn> {
     let mut m: hashbrown::HashMap<&'static str, SetConstraintArbitrationFn> = hashbrown::HashMap::new();
     m.insert("derivation_rule_wins",        skip_on_derivation_rule        as SetConstraintArbitrationFn);
-    m.insert("antecedent_diversity_min_2",  skip_on_low_antecedent_diversity as SetConstraintArbitrationFn);
+    m.insert("subset_wins",                 subset_wins                      as SetConstraintArbitrationFn);
     m
 }
 
@@ -3811,14 +3822,14 @@ pub fn translate_derivation_rules_with_matrix(
             continue;
         }
         let text = statement_text(idx,stmt_id).unwrap_or_default();
-        // Arbitrate with `translate_set_constraints`: when the
-        // Statement also classifies as Subset Constraint AND the
-        // antecedent has ≥2 distinct declared nouns, the SS
-        // translator claims this statement — skip DR emission.
-        // Legacy's pass-2b priority gives try_subset first dibs;
-        // only on semantic failure does try_derivation take over.
-        let is_subset = classifications_contains(idx,stmt_id, "Subset Constraint");
-        if is_subset && antecedent_distinct_nouns(&text, &declared_nouns) >= 2 {
+        // thm:grammar(b): an `If some ... then that ...` frame is a
+        // Subset Constraint, not a derivation rule. Stage-1's
+        // `if some then that` recognizer (parse_forml2_stage1.rs) fires
+        // only on that grammar, so whenever the Statement also classified
+        // Subset Constraint the set-constraint translator owns it — skip
+        // DR emission. Symmetric with `subset_wins` on the SS side;
+        // replaces the prior `>= 2 distinct antecedent nouns` proxy.
+        if classifications_contains(idx, stmt_id, "Subset Constraint") {
             continue;
         }
         // Arbitrate with `translate_ring_constraints`: when the
@@ -4184,42 +4195,6 @@ fn declared_noun_names(state: &Object) -> Vec<String> {
         .unwrap_or_default();
     names.sort_by(|a, b| b.len().cmp(&a.len()));
     names
-}
-
-/// Count the distinct declared-noun names that appear in the
-/// antecedent of a `If ... then ...` shape. Used to match legacy's
-/// `try_subset` pass-2b precedence: a subset constraint requires
-/// antecedent-noun diversity ≥ 2, otherwise the derivation-rule
-/// branch wins.
-///
-/// Longest-first pass with masking — `Fact Type` wins over `Fact`
-/// when both are declared, preventing substring double-counts.
-fn antecedent_distinct_nouns(text: &str, declared: &[String]) -> usize {
-    let Some((ante, _)) = text.split_once(" then ") else { return 0 };
-    let bytes = ante.as_bytes();
-    let mut masked: Vec<bool> = alloc::vec![false; bytes.len()];
-    let mut distinct: alloc::collections::BTreeSet<String> =
-        alloc::collections::BTreeSet::new();
-    // `declared` is already sorted longest-first by
-    // `declared_noun_names`.
-    for noun in declared {
-        let needle = noun.as_str();
-        if needle.is_empty() { continue; }
-        let mut start = 0;
-        while start <= bytes.len().saturating_sub(needle.len()) {
-            let Some(rel) = ante[start..].find(needle) else { break };
-            let abs = start + rel;
-            let end = abs + needle.len();
-            if (abs..end).any(|i| masked[i]) {
-                start = abs + 1;
-                continue;
-            }
-            for i in abs..end { masked[i] = true; }
-            distinct.insert(noun.clone());
-            start = end;
-        }
-    }
-    distinct.len()
 }
 
 /// Translate Uniqueness / Mandatory Role / Frequency Constraint
@@ -7141,21 +7116,19 @@ mod tests {
     }
 
     #[test]
-    fn translate_derivation_rules_wins_when_subset_has_under_two_nouns() {
-        // Same `If some ... then that ...` shape but only ONE distinct
-        // declared noun in the antecedent — legacy's `try_subset`
-        // would fail the multi-noun check, and `try_derivation` picks
-        // up the slack. Match that precedence.
-        //
-        // "some Stuff" — "Stuff" is not a declared noun. antecedent
-        // distinct count = 0 < 2. DR wins, SS defers.
+    fn translate_subset_wins_if_some_then_that_regardless_of_noun_count() {
+        // thm:grammar(b): an `If some ... then that ...` frame is a
+        // Subset Constraint by grammar (existential `some` antecedent +
+        // anaphoric `that` consequent). The legacy noun-count proxy
+        // (`antecedent_distinct_nouns >= 2`) wrongly demoted this 1-noun
+        // frame to a derivation rule; the structural classifier keeps it
+        // a subset no matter how many antecedent nouns are declared.
         let stmt = stage1_state(
             "s1",
             "If some Stuff matches some Thing then that Stuff is Thing.",
             &["Stuff", "Thing"]);
-        // Override the Noun cell to force only one of the referenced
-        // nouns to actually be declared, matching the legacy "nouns
-        // in the antecedent are mostly unknown" shape.
+        // Force only ONE referenced noun to be declared — exactly the
+        // shape the old proxy demoted. The structural rule ignores count.
         let stmt_only_thing = {
             let mut map: hashbrown::HashMap<String, Object> = match stmt {
                 Object::Map(m) => (*m).clone(),
@@ -7167,10 +7140,12 @@ mod tests {
         };
         let classified = classify_statements(&stmt_only_thing, &grammar_state());
         let ss = super::translate_set_constraints(&classified, &idx(&classified));
-        assert!(ss.is_empty(), "SS defers when antecedent nouns < 2; got {:?}", ss);
+        assert_eq!(ss.len(), 1,
+            "subset wins the if-some-then-that frame regardless of noun count; got {:?}", ss);
+        assert_eq!(binding(&ss[0], "kind"), Some("SS"));
         let rules = super::translate_derivation_rules(&classified, &idx(&classified));
-        assert_eq!(rules.len(), 1,
-            "DR picks up the statement when SS defers; got {:?}", rules);
+        assert!(rules.is_empty(),
+            "DR defers to the subset translator for the if-some-then-that frame; got {:?}", rules);
     }
 
     #[test]
@@ -9275,7 +9250,7 @@ mod tests {
         let triples: Vec<(&str, &str, &str)> = table.iter().collect();
         assert_eq!(triples, vec![
             ("Equality Constraint",     "EQ", "derivation_rule_wins"),
-            ("Subset Constraint",       "SS", "antecedent_diversity_min_2"),
+            ("Subset Constraint",       "SS", "subset_wins"),
             ("Exclusive-Or Constraint", "XO", "derivation_rule_wins"),
             ("Or Constraint",           "OR", "derivation_rule_wins"),
             ("Exclusion Constraint",    "XC", "derivation_rule_wins"),
@@ -9291,7 +9266,7 @@ mod tests {
                 "Exclusion Constraint"]),
             ("Set Constraint Kind Code", &["EQ", "SS", "XO", "OR", "XC"]),
             ("Set Constraint Arbitration Rule", &[
-                "derivation_rule_wins", "antecedent_diversity_min_2",
+                "derivation_rule_wins", "subset_wins",
                 "derivation_rule_wins", "derivation_rule_wins",
                 "derivation_rule_wins"]),
         ]);
