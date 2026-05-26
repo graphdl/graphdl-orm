@@ -5727,18 +5727,21 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
         let cons_nouns: Vec<String> = data.fact_types.get(&consequent_id)
             .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
             .unwrap_or_default();
-        rj.consequent_positions.iter().enumerate().filter_map(|(cons_idx, &(ai, ri))| {
+        rj.consequent_positions.iter().enumerate().filter_map(|(cons_idx, slot)| {
             let noun = cons_nouns.get(cons_idx)?;
             // Consequent literal pin wins (mirrors the noun-name path's
             // step 2): a role the consequent fixes to a literal — e.g.
             // `Task Readiness 'blocked'` — takes that value, not the
-            // joined antecedent's.
+            // joined antecedent's. Such a role carries `None` for its slot
+            // (it sources from no antecedent); the literal supplies the
+            // value via `Func::constant`, an existing θ-set primitive.
             if let Some(crl) = rule.consequent_role_literals.iter().find(|c| c.role == *noun) {
                 return Some(Func::construction(vec![
                     Func::constant(Object::atom(noun)),
                     Func::constant(Object::atom(&crl.value)),
                 ]));
             }
+            let (ai, ri) = (*slot)?;
             Some(Func::construction(vec![
                 Func::constant(Object::atom(noun)),
                 Func::compose(role_value(ri), access_fact(ai, n)),

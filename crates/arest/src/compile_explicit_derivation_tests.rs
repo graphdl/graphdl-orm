@@ -1104,6 +1104,88 @@ Task has Readiness.
     }
 }
 
+// ─── Category 13c: literal-only consequent role over a subscript ring-join ─
+//
+// Regression for `ring-join-consequent-literal-edge`: when a consequent
+// role's noun appears ONLY as a consequent literal pin and NEVER in an
+// antecedent, `compute_ring_join_plan` used to bail (returning None for the
+// whole plan), dropping the rule onto the noun-name path that cannot bind a
+// self-ring. The producer now records such a role as a `None` slot
+// (literal-sourced); `compile_join_derivation`'s literal-pin branch supplies
+// the value via `Func::constant` (an existing θ primitive — no new one).
+//
+// Rule: `Task1 has Alert 'raised' iff Task1 depends on Task2 and Task2 has
+// Readiness 'blocked'.` — `Alert` is never an antecedent noun. t1 depends on
+// t2; t2 'blocked' -> t1 Alert 'raised'.
+#[test]
+fn ring_join_consequent_literal_only_role_still_plans_and_fires() {
+    use crate::ast::{fact_from_pairs, cell_push, fetch_cell_seq};
+
+    let src = r#"# Alert
+Task(.Name) is an entity type.
+Name is a value type.
+Readiness is a value type.
+Alert is a value type.
+
+## Fact Types
+Task has Name.
+Task depends on Task.
+Task has Readiness.
+Task has Alert.
+
+## Derivation Rules
+* Task1 has Alert 'raised' iff Task1 depends on Task2 and Task2 has Readiness 'blocked'.
+"#;
+
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    let model = crate::compile::compile(&state);
+
+    // Rebuilt from cells (covers the RingJoinPlan serde round-trip too).
+    let rule = crate::compile::cell_index_from_state(&state).derivation_rules
+        .into_iter().find(|r| r.text.contains("Alert"))
+        .expect("alert derivation rule");
+    assert_eq!(rule.kind, DerivationKind::Join,
+        "literal-only-consequent ring rule must still route to a positional Join; got {:?}",
+        rule.kind);
+    let rj = rule.ring_join.as_ref()
+        .expect("ring rule must carry a RingJoinPlan even when a consequent role is literal-only");
+    // The `Alert` consequent role is literal-sourced -> recorded as None.
+    assert!(rj.consequent_positions.iter().any(|p| p.is_none()),
+        "the literal-only consequent role must be a None slot; got {:?}",
+        rj.consequent_positions);
+
+    // t1 depends on t2; t2 seeded 'blocked' -> rule fires -> t1 Alert 'raised'.
+    let state = cell_push("Task_depends_on_Task",
+        fact_from_pairs(&[("Task", "t1"), ("Task", "t2")]), &state);
+    let state = cell_push("Task_has_Readiness",
+        fact_from_pairs(&[("Task", "t2"), ("Readiness", "blocked")]), &state);
+
+    let derivation_refs: Vec<(&str, &crate::ast::Func)> =
+        model.derivations.iter().map(|d| (d.id.as_str(), &d.func)).collect();
+    let (final_state, _derived) =
+        crate::evaluate::forward_chain_defs_state(&derivation_refs, &state);
+
+    let cell = fetch_cell_seq("Task_has_Alert", &final_state);
+    let pairs: Vec<(String, String)> = cell.as_seq().map(|facts| {
+        facts.iter().filter_map(|f| {
+            let kvs = f.as_seq()?;
+            let mut task: Option<String> = None;
+            let mut alert: Option<String> = None;
+            for p in kvs.iter() {
+                let kv = p.as_seq()?;
+                if kv.len() != 2 { continue; }
+                let k = kv[0].as_atom()?;
+                let v = kv[1].as_atom()?;
+                if k == "Task" { task = Some(v.to_string()); }
+                if k == "Alert" { alert = Some(v.to_string()); }
+            }
+            Some((task?, alert?))
+        }).collect()
+    }).unwrap_or_default();
+    assert!(pairs.iter().any(|(task, a)| task == "t1" && a == "raised"),
+        "forward chain must derive `t1 has Alert 'raised'`; got {:?}", pairs);
+}
+
 /// task-924: SM-status → normalized-property bridge hop 2. The tasks
 /// app re-keys `Resource is currently in Status` into `Task has Task
 /// Status` via a 1-antecedent rule with identity-binding clauses

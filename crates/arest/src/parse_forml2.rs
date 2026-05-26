@@ -1946,6 +1946,7 @@ fn resolve_derivation_rule(
             rule.consequent_cell.literal_id(),
             &noun_names,
             ir.fact_types,
+            &rule.consequent_role_literals,
         ) {
             rule.kind = DerivationKind::Join;
             rule.ring_join = Some(plan);
@@ -2001,6 +2002,7 @@ fn compute_ring_join_plan(
     consequent_ft_id: &str,
     noun_names: &[String],
     fact_types: &HashMap<String, FactTypeDef>,
+    consequent_role_literals: &[crate::types::ConsequentRoleLiteral],
 ) -> Option<crate::types::RingJoinPlan> {
     let n = antecedent_sources.len();
     if n < 2 || antecedent_clauses.len() < n { return None; }
@@ -2057,10 +2059,26 @@ fn compute_ring_join_plan(
     let cons_ft = fact_types.get(consequent_ft_id)?;
     let cons_toks = tokens_in_order(derivation_consequent_text(rule_text));
     if cons_toks.len() != cons_ft.roles.len() { return None; }
-    let mut consequent_positions: Vec<(usize, usize)> = Vec::with_capacity(cons_toks.len());
-    for tok in cons_toks {
-        let (_, ps) = token_positions.iter().find(|(t, _)| *t == tok)?;
-        consequent_positions.push(*ps.first()?);
+    let mut consequent_positions: Vec<Option<(usize, usize)>> = Vec::with_capacity(cons_toks.len());
+    for (k, tok) in cons_toks.iter().enumerate() {
+        match token_positions.iter().find(|(t, _)| t == tok) {
+            // Drawn from a joined antecedent slot (its first occurrence).
+            Some((_, ps)) => consequent_positions.push(Some(*ps.first()?)),
+            // Not in any antecedent. A literal-pinned consequent role
+            // (`... then that X has Y 'lit'`) is legitimately literal-sourced:
+            // record `None` and let compile_join_derivation's literal-pin
+            // branch (#814) supply the value via `Func::constant`. Any other
+            // unfound token is genuinely unbindable — bail so the rule keeps
+            // its existing (noun-name) path.
+            None => {
+                let role_noun = &cons_ft.roles[k].noun_name;
+                if consequent_role_literals.iter().any(|c| c.role == *role_noun) {
+                    consequent_positions.push(None);
+                } else {
+                    return None;
+                }
+            }
+        }
     }
 
     Some(crate::types::RingJoinPlan { join_groups, consequent_positions })

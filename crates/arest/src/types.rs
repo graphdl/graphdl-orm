@@ -722,9 +722,11 @@ impl DerivationRuleDef {
     }
 }
 
-/// `RingJoinPlan` → `{"joinGroups":[[[a,b],…],…],"consequentPositions":[[a,b],…]}`.
-/// Both fields always present (no `skip_serializing_if`); each
-/// `(usize,usize)` tuple serializes as a 2-element array, matching serde.
+/// `RingJoinPlan` → `{"joinGroups":[[[a,b],…],…],"consequentPositions":[[a,b]|null,…]}`.
+/// Both fields always present (no `skip_serializing_if`); join-group
+/// `(usize,usize)` tuples serialize as 2-element arrays; a consequent
+/// position serializes as `[a,b]` (antecedent-sourced) or `null`
+/// (literal-sourced), matching serde's `Option<(usize,usize)>`.
 fn ring_join_plan_write(out: &mut String, p: &RingJoinPlan) {
     out.push_str("{\"joinGroups\":[");
     for (i, group) in p.join_groups.iter().enumerate() {
@@ -741,13 +743,18 @@ fn ring_join_plan_write(out: &mut String, p: &RingJoinPlan) {
         out.push(']');
     }
     out.push_str("],\"consequentPositions\":[");
-    for (i, (a, b)) in p.consequent_positions.iter().enumerate() {
+    for (i, slot) in p.consequent_positions.iter().enumerate() {
         if i > 0 { out.push(','); }
-        out.push('[');
-        json_write_usize(out, *a);
-        out.push(',');
-        json_write_usize(out, *b);
-        out.push(']');
+        match slot {
+            Some((a, b)) => {
+                out.push('[');
+                json_write_usize(out, *a);
+                out.push(',');
+                json_write_usize(out, *b);
+                out.push(']');
+            }
+            None => out.push_str("null"),
+        }
     }
     out.push_str("]}");
 }
@@ -996,8 +1003,12 @@ pub struct RingJoinPlan {
     /// variable appears in ≥2 antecedents — that is the join key).
     pub join_groups: Vec<Vec<(usize, usize)>>,
     /// Source of each consequent role, in consequent role order:
-    /// the `(antecedent_index, role_index)` the value is drawn from.
-    pub consequent_positions: Vec<(usize, usize)>,
+    /// `Some((antecedent_index, role_index))` when the value is drawn
+    /// from a joined antecedent slot; `None` when the role is pinned to
+    /// a literal in the consequent (e.g. `... then that X has Y 'lit'`)
+    /// and never appears in an antecedent — `compile_join_derivation`'s
+    /// literal-pin branch (#814) supplies the value.
+    pub consequent_positions: Vec<Option<(usize, usize)>>,
 }
 
 /// Fixed string literal bound to a consequent role.
@@ -1638,7 +1649,7 @@ mod canonical_json_tests {
             materialization: MaterializationPolicy::Stored,
             ring_join: Some(RingJoinPlan {
                 join_groups: alloc::vec![alloc::vec![(0usize, 1usize), (1usize, 0usize)]],
-                consequent_positions: alloc::vec![(0usize, 0usize), (1usize, 1usize)],
+                consequent_positions: alloc::vec![Some((0usize, 0usize)), Some((1usize, 1usize))],
             }),
         }
     }
