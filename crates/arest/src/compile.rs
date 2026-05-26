@@ -92,16 +92,6 @@ pub(crate) struct CompiledDerivation {
     pub(crate) text: String,
     pub(crate) kind: DerivationKind,
     pub(crate) func: crate::ast::Func,
-    /// Stratification (#826b): a rule that reads another rule's
-    /// consequent cell negatively (`<noun> has no <FT clause>`)
-    /// must run AFTER positive-only rules reach fixpoint, otherwise
-    /// the AbsenceOf guard fires in round 1 before the positive
-    /// derivations have populated their consequent cells. Set in
-    /// the AbsenceOf branch of `compile_explicit_derivation`; the
-    /// def-emission path uses it to bucket the rule under
-    /// `derivation_strat2:<id>` so callers (CLI compile, apply
-    /// path, MCP query) can drive a 2-stratum forward chain.
-    pub(crate) uses_negation: bool,
     /// task-814-stratify-3plus: the literal cell id the consequent
     /// emits into (when `consequent_cell` is `Literal(..)`). Empty
     /// for dynamic consequent shapes (`AntecedentRole`, aggregates
@@ -111,29 +101,6 @@ pub(crate) struct CompiledDerivation {
     /// can stratify topologically rather than collapsing into a
     /// single stratum-2 round.
     pub(crate) consequent_cell: String,
-    /// task-814-stratify-3plus: the consequent's role-literal pins.
-    /// Each entry is `(role_name, literal_value)` — e.g. a rule
-    /// emitting `Target Posture 'single-gate'` carries
-    /// `[("Target Posture", "single-gate")]`. Used to refine
-    /// dependency edges: rule A depends on rule B iff B's
-    /// `consequent_cell` matches one of A's `negation_reads` cells
-    /// AND the AbsenceOf's role-literal pins are compatible with
-    /// B's `consequent_role_literals`. Without role-literal
-    /// matching, three rules that all write to the same cell would
-    /// form a dependency cycle even when their role-literal pins
-    /// (e.g. 'dual-gate' vs 'single-gate') make them genuinely
-    /// non-overlapping.
-    pub(crate) consequent_role_literals: Vec<(String, String)>,
-    /// task-814-stratify-3plus: cells this rule reads negatively
-    /// via `AbsenceOf` antecedents, paired with each AbsenceOf's
-    /// role-literal pins. Each entry is `(fact_type_cell,
-    /// role_literal_pins)` where `role_literal_pins` is a vector
-    /// of `(role_name, literal_value)`. The forward chainer reads
-    /// this to compute dependency edges: this rule depends on any
-    /// other rule whose `consequent_cell` matches a cell in this
-    /// list AND whose `consequent_role_literals` are compatible
-    /// with the AbsenceOf's pins.
-    pub(crate) negation_reads: Vec<(String, Vec<(String, String)>)>,
     /// task-930: materialization policy carried from DerivationRuleDef
     /// through compile to the def-emission step. Stored rules emit
     /// `derivation:{id}` def cells (forward chain materializes them);
@@ -148,10 +115,7 @@ impl Default for CompiledDerivation {
             text: String::new(),
             kind: DerivationKind::ModusPonens,
             func: crate::ast::Func::constant(crate::ast::Object::phi()),
-            uses_negation: false,
             consequent_cell: String::new(),
-            consequent_role_literals: Vec::new(),
-            negation_reads: Vec::new(),
             materialization: crate::types::MaterializationPolicy::Stored,
         }
     }
@@ -3941,10 +3905,9 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
         ),
     );
 
-    let (consequent_cell, consequent_role_literals, negation_reads) =
+    let (consequent_cell, _, _) =
         derivation_dep_metadata(rule);
-    CompiledDerivation { id, text, kind, func, uses_negation: false,
-        consequent_cell, consequent_role_literals, negation_reads, materialization: rule.materialization.clone() }
+    CompiledDerivation { id, text, kind, func,         consequent_cell, materialization: rule.materialization.clone() }
 }
 
 /// Compile a Halpin arithmetic expression (Box::Volume = Size * Size * Size)
@@ -4343,10 +4306,9 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 ),
             ),
         };
-        let (consequent_cell, consequent_role_literals, negation_reads) =
+        let (consequent_cell, _, _) =
             derivation_dep_metadata(rule);
-        return CompiledDerivation { id, text, kind, func, uses_negation: false,
-            consequent_cell, consequent_role_literals, negation_reads, materialization: rule.materialization.clone() };
+        return CompiledDerivation { id, text, kind, func,             consequent_cell, materialization: rule.materialization.clone() };
     }
 
     let func = match antecedent_ids.len() {
@@ -4753,13 +4715,12 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 // Degenerate: no antecedent at all means we can't
                 // construct a join product — fall back to phi.
                 if pos_count == 0 {
-                    let (consequent_cell, consequent_role_literals, negation_reads) =
+                    let (consequent_cell, _, _) =
                         derivation_dep_metadata(rule);
                     return CompiledDerivation {
                         id, text, kind,
                         func: Func::constant(Object::phi()),
-                        uses_negation: false,
-                        consequent_cell, consequent_role_literals, negation_reads, materialization: rule.materialization.clone(),
+                                    consequent_cell, materialization: rule.materialization.clone(),
                     };
                 }
                 // Step 0: facts of the first antecedent.
@@ -4776,13 +4737,12 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     let Some(ft_k) = data.fact_types.get(&antecedent_ids[k]) else {
                         // Schema lookup failed for an antecedent —
                         // degenerate, fall back to phi.
-                        let (consequent_cell, consequent_role_literals, negation_reads) =
+                        let (consequent_cell, _, _) =
                             derivation_dep_metadata(rule);
                         return CompiledDerivation {
                             id: id.clone(), text: text.clone(), kind: kind.clone(),
                             func: Func::constant(Object::phi()),
-                            uses_negation: false,
-                            consequent_cell, consequent_role_literals, negation_reads, materialization: rule.materialization.clone(),
+                                            consequent_cell, materialization: rule.materialization.clone(),
                         };
                     };
                     let ft_k_role_count = ft_k.roles.len();
@@ -4952,13 +4912,12 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     consequent_reading_func.clone(),
                     bindings_func,
                 ]);
-                let (consequent_cell, consequent_role_literals, negation_reads) =
+                let (consequent_cell, _, _) =
                     derivation_dep_metadata(rule);
                 return CompiledDerivation {
                     id, text, kind,
                     func: Func::compose(Func::apply_to_all(derive_one), tuple_stream),
-                    uses_negation: false,
-                    consequent_cell, consequent_role_literals, negation_reads,
+                            consequent_cell,
                     materialization: rule.materialization.clone(),
                 };
             }
@@ -5162,7 +5121,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     Func::constant(Object::phi()),
                 );
                 let other_facts_tuple = Func::construction(other_extracts);
-                let (consequent_cell, consequent_role_literals, negation_reads) =
+                let (consequent_cell, _, _) =
                     derivation_dep_metadata(rule);
                 return CompiledDerivation {
                     id, text, kind,
@@ -5177,8 +5136,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                                 ])),
                         ),
                     ),
-                    uses_negation: false,
-                    consequent_cell, consequent_role_literals, negation_reads,
+                            consequent_cell,
                     materialization: rule.materialization.clone(),
                 };
             }
@@ -5339,7 +5297,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                     Func::constant(Object::phi()),
                 );
                 let other_facts_tuple = Func::construction(other_extracts);
-                let (consequent_cell, consequent_role_literals, negation_reads) =
+                let (consequent_cell, _, _) =
                     derivation_dep_metadata(rule);
                 return CompiledDerivation {
                     id, text, kind,
@@ -5354,10 +5312,7 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                                 ])),
                         ),
                     ),
-                    uses_negation: false,
                     consequent_cell,
-                    consequent_role_literals,
-                    negation_reads,
                     materialization: rule.materialization.clone(),
                 };
             }
@@ -5436,20 +5391,18 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
                 Func::construction(vec![derived]),
                 Func::constant(Object::phi()),
             );
-            let (consequent_cell, consequent_role_literals, negation_reads) =
+            let (consequent_cell, _, _) =
                 derivation_dep_metadata(rule);
             return CompiledDerivation {
                 id, text, kind,
                 func: func_b,
-                uses_negation: false,
-                consequent_cell, consequent_role_literals, negation_reads, materialization: rule.materialization.clone(),
+                    consequent_cell, materialization: rule.materialization.clone(),
             };
         }
     };
-    let (consequent_cell, consequent_role_literals, negation_reads) =
+    let (consequent_cell, _, _) =
         derivation_dep_metadata(rule);
-    CompiledDerivation { id, text, kind, func, uses_negation: false,
-        consequent_cell, consequent_role_literals, negation_reads, materialization: rule.materialization.clone() }
+    CompiledDerivation { id, text, kind, func,         consequent_cell, materialization: rule.materialization.clone() }
 }
 
 
@@ -5590,16 +5543,14 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
         .collect();
 
     // Dispatch on antecedent count: 0 â†’ phi, 1 â†’ Î±(derive), â‰¥2 â†’ iterative join
-    let (consequent_cell_md, consequent_role_literals_md, negation_reads_md) =
+    let (consequent_cell_md, _, _) =
         derivation_dep_metadata(rule);
     match n {
         0 => return CompiledDerivation {
             id, text, kind,
             func: Func::constant(Object::phi()),
-            uses_negation: false,
             consequent_cell: consequent_cell_md,
-            consequent_role_literals: consequent_role_literals_md,
-            negation_reads: negation_reads_md, materialization: rule.materialization.clone(),
+                        materialization: rule.materialization.clone(),
         },
         1 => {
             // Single antecedent: no join, just derive from each fact.
@@ -5614,10 +5565,8 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
             return CompiledDerivation {
                 id, text, kind,
                 func: Func::compose(Func::apply_to_all(derived), fact_extractors.into_iter().next().unwrap()),
-                uses_negation: false,
-                consequent_cell: consequent_cell_md,
-                consequent_role_literals: consequent_role_literals_md,
-                negation_reads: negation_reads_md, materialization: rule.materialization.clone(),
+                    consequent_cell: consequent_cell_md,
+                                materialization: rule.materialization.clone(),
             };
         },
         _ => {},
@@ -5838,10 +5787,7 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
 
     let func = Func::compose(Func::apply_to_all(derived_fact), current);
 
-    CompiledDerivation { id, text, kind, func, uses_negation: false,
-        consequent_cell: consequent_cell_md,
-        consequent_role_literals: consequent_role_literals_md,
-        negation_reads: negation_reads_md,
+    CompiledDerivation { id, text, kind, func,         consequent_cell: consequent_cell_md,
         materialization: rule.materialization.clone() }
 }
 
@@ -5942,15 +5888,14 @@ pub(crate) fn compile_subtype_inheritance_metamodel(
     // expansion. Leave dep metadata empty: the rule has no negative
     // dependencies and writes shapes the stratifier doesn't need to
     // sequence against AbsenceOf guards.
-    let (consequent_cell, consequent_role_literals, negation_reads) =
+    let (consequent_cell, _, _) =
         derivation_dep_metadata_synth(String::new());
     Some(CompiledDerivation {
         id: SUBTYPE_INHERITANCE_ID.to_string(),
         text: "Subtype inheritance metamodel rule (readings/core/derivation.md)".to_string(),
         kind: DerivationKind::SubtypeInheritance,
         func,
-        uses_negation: false,
-        consequent_cell, consequent_role_literals, negation_reads,
+                consequent_cell,
         materialization: crate::types::MaterializationPolicy::Stored,
     })
 }
@@ -6033,15 +5978,14 @@ pub(crate) fn compile_ss_autofill_metamodel(
     // ft_id cell (slot 0), so the merged emission is indistinguishable
     // from the pre-#891 N-Funcs-N-defs shape at the cell level.
     let func = Func::compose(Func::Concat, Func::construction(inner_funcs));
-    let (consequent_cell, consequent_role_literals, negation_reads) =
+    let (consequent_cell, _, _) =
         derivation_dep_metadata_synth(String::new());
     Some(CompiledDerivation {
         id: SS_AUTOFILL_ID.to_string(),
         text: "SS Subset-Constraint auto-fill metamodel rule (readings/core/derivation.md)".to_string(),
         kind: DerivationKind::ModusPonens,
         func,
-        uses_negation: false,
-        consequent_cell, consequent_role_literals, negation_reads,
+                consequent_cell,
         materialization: crate::types::MaterializationPolicy::Stored,
     })
 }
@@ -6144,15 +6088,14 @@ pub(crate) fn compile_transitivity_metamodel(
     // emission is indistinguishable from the pre-#892 N-Funcs-N-defs
     // shape at the cell level.
     let func = Func::compose(Func::Concat, Func::construction(inner_funcs));
-    let (consequent_cell, consequent_role_literals, negation_reads) =
+    let (consequent_cell, _, _) =
         derivation_dep_metadata_synth(String::new());
     Some(CompiledDerivation {
         id: TRANSITIVITY_ID.to_string(),
         text: "Transitivity metamodel rule (readings/core/derivation.md)".to_string(),
         kind: DerivationKind::Transitivity,
         func,
-        uses_negation: false,
-        consequent_cell, consequent_role_literals, negation_reads,
+                consequent_cell,
         materialization: crate::types::MaterializationPolicy::Stored,
     })
 }
@@ -6330,10 +6273,9 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
         // SM init fans out to multiple FT cells; no AbsenceOf antecedents.
         // Leave dep metadata empty so the stratifier doesn't try to
         // sequence this against user-rule negation cascades.
-        let (consequent_cell, consequent_role_literals, negation_reads) =
+        let (consequent_cell, _, _) =
             derivation_dep_metadata_synth(String::new());
-        CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func, uses_negation: false,
-            consequent_cell, consequent_role_literals, negation_reads,
+        CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func,             consequent_cell,
             materialization: crate::types::MaterializationPolicy::Stored }
 }
 
@@ -6469,10 +6411,9 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
 
     // SM event-fold writes State_Machine_is_currently_in_Status + companions;
     // no AbsenceOf antecedents. Leave dep metadata empty.
-    let (consequent_cell, consequent_role_literals, negation_reads) =
+    let (consequent_cell, _, _) =
         derivation_dep_metadata_synth(String::new());
-    CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func, uses_negation: false,
-        consequent_cell, consequent_role_literals, negation_reads,
+    CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func,         consequent_cell,
         materialization: crate::types::MaterializationPolicy::Stored }
 }
 
@@ -6586,17 +6527,14 @@ fn compile_sm_for_resource_backfill_for(sm: &CompiledStateMachine) -> CompiledDe
         missing,
     );
 
-    let (consequent_cell_md, consequent_role_literals_md, negation_reads_md) =
+    let (consequent_cell_md, _, _) =
         derivation_dep_metadata_synth("State_Machine_is_for_Resource".to_string());
     CompiledDerivation {
         id: id_str,
         text: text_str,
         kind: DerivationKind::SubtypeInheritance,
         func,
-        uses_negation: false,
-        consequent_cell: consequent_cell_md,
-        consequent_role_literals: consequent_role_literals_md,
-        negation_reads: negation_reads_md,
+                consequent_cell: consequent_cell_md,
         materialization: crate::types::MaterializationPolicy::Stored,
     }
 }

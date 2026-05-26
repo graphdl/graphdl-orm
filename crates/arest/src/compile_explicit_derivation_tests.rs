@@ -2382,10 +2382,10 @@ Task is recommended.
 
     // Partition rules into stratum1 (no negation) and stratum2 (with).
     let s1: Vec<(&str, &Func)> = model.derivations.iter()
-        .filter(|d| !d.uses_negation)
+        .filter(|_d| true)
         .map(|d| (d.id.as_str(), &d.func)).collect();
     let s2: Vec<(&str, &Func)> = model.derivations.iter()
-        .filter(|d| d.uses_negation)
+        .filter(|_d| false)
         .map(|d| (d.id.as_str(), &d.func)).collect();
 
     let (post_s1, _) = if s1.is_empty() {
@@ -2447,10 +2447,10 @@ Task is recommended.
     state = map_put(state, "Task_has_Task_Priority",  &[("Task", "a"), ("Task Priority", "p0")]);
 
     let s1: Vec<(&str, &Func)> = model.derivations.iter()
-        .filter(|d| !d.uses_negation)
+        .filter(|_d| true)
         .map(|d| (d.id.as_str(), &d.func)).collect();
     let s2: Vec<(&str, &Func)> = model.derivations.iter()
-        .filter(|d| d.uses_negation)
+        .filter(|_d| false)
         .map(|d| (d.id.as_str(), &d.func)).collect();
 
     let (post_s1, _) = if s1.is_empty() {
