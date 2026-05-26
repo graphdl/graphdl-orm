@@ -177,7 +177,7 @@ The runtime registers functions into $\mathit{DEFS}$ via $\downarrow\!\mathit{DE
 \end{align*}
 Runtime functions that interact with external state execute during $\mathit{resolve}$~(\ref{eq:create}), populating cells before $\mathit{derive}$ runs. Functions that consume the representation execute after $\mathit{emit}$. This keeps $\mathit{derive}$ pure and terminating over $P$. A single $\mathit{SYSTEM}$ serves browser, server, and storage runtimes by varying $\mathit{DEFS}$, not by varying the logic.
 
-The binding is live: when a cell's contents change via $\downarrow$, every $\rho$-application over that cell re-evaluates. This is streaming. There is no separate pub/sub layer, no event bus, no callback registry. A subscriber is a $\rho$-application that has not yet been evaluated against the current $D$. When $D$ changes, it evaluates. A sensor reading, a Kafka message, a derived inference, and a user click are all facts in $P$ or events in $E$. They enter $D$ through the same $\downarrow$ operator, and every bound $\rho$-application sees the update through the same mechanism.
+The binding is live: when a cell's contents change via $\downarrow$, every $\rho$-application over that cell re-evaluates. This is streaming. There is no need for a separate pub/sub layer, event bus, or callback registry. A subscriber is a $\rho$-application that has not yet been evaluated against the current $D$. When $D$ changes, it evaluates. A sensor reading, a Kafka message, a derived inference, and a user click are all facts in $P$ or events in $E$. They enter $D$ through the same $\downarrow$ operator, and every bound $\rho$-application sees the update through the same mechanism.
 
 \subsection{Data Federation}
 
@@ -473,7 +473,7 @@ For anonymous peers, events carry cryptographic signatures for identity, schema 
 
 \section{Middleware Elimination}
 
-Traditional middleware (authentication, validation, rate limiting, transformation) is either a restriction over $P$, a composition, or a fact in $P$. Authorization is a derivation: ``User accesses Domain iff User belongs to Organization that manages Domain'' compiles to $\langle\mathit{COMP}, f, g\rangle$ whose $\rho$-image computes the access predicate over $P$. External service calls, database persistence, and UI rendering are runtime functions registered into $\mathit{DEFS}$ and applied via $\rho$. Theorem~\ref{thm:derive} leaves no room for a computation layer outside $\rho$.
+Traditional middleware (authentication, validation, rate limiting, transformation) is either a restriction over $P$, a composition, or a fact in $P$. Authorization is a derivation: ``User accesses Domain iff User belongs to Organization that manages Domain'' compiles to $\langle\mathit{COMP}, f, g\rangle$ whose $\rho$-image computes the access predicate over $P$. External service calls, database persistence, and UI rendering can be expressed as runtime functions registered into $\mathit{DEFS}$ and applied via $\rho$. Theorem~\ref{thm:derive} leaves no need for a computation layer outside $\rho$.
 
 \section{Conclusion}
 
