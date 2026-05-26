@@ -13,6 +13,13 @@
  *   AREST_MODE=remote    — call a deployed Cloudflare Worker at
  *                            $AREST_URL using $AREST_API_KEY.
  *
+ *   AREST_PERSIST_ACTIVE_APP — local mode: when not 0/false/no/off (the
+ *                            default), the app selected via apps.use is
+ *                            written to <appsDir>/.arest-active-app and
+ *                            resumed on the next startup, so an MCP
+ *                            reconnect stays on the app you were last
+ *                            using instead of snapping back to $AREST_APP.
+ *
  * Usage from a plugin config (Claude Desktop / Claude Code):
  *   {
  *     "mcpServers": {
@@ -36,7 +43,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
-import { readFileSync, readdirSync, existsSync } from 'fs'
+import { readFileSync, writeFileSync, readdirSync, existsSync } from 'fs'
 import { resolve, dirname, join } from 'path'
 import { fileURLToPath } from 'url'
 import { spawn } from 'child_process'
@@ -44,6 +51,7 @@ import {
   buildAppCompileArgs,
   checkArestApps,
   createArestApp,
+  defaultAppsDir,
   inferInitialAppName,
   inspectArestApp,
   listArestReadingFiles,
@@ -68,6 +76,61 @@ import { checkCliStaleness } from './cli-staleness.js'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(__dirname, '..', '..')
 
+// ── Active-app persistence ──────────────────────────────────────────
+//
+// When AREST_PERSIST_ACTIVE_APP is on (default), apps.use writes the active
+// app's name to `<appsDir>/.arest-active-app`, and startup resumes it — so an
+// MCP reconnect stays on the app you were last using instead of snapping back
+// to the env-inferred default ($AREST_APP / 'default'). Set the env var to
+// 0/false/no/off to disable. The marker is a hidden file (never a directory),
+// so listArestApps never mistakes it for an app.
+
+const ACTIVE_APP_STATE_FILE = '.arest-active-app'
+
+export function persistActiveAppEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = (env.AREST_PERSIST_ACTIVE_APP ?? '').trim().toLowerCase()
+  return !['0', 'false', 'no', 'off'].includes(v)
+}
+
+export function activeAppStateFile(appsDir: string): string {
+  return join(appsDir, ACTIVE_APP_STATE_FILE)
+}
+
+/**
+ * Startup app name. The persisted last-active app wins over the env-inferred
+ * default WHEN persistence is enabled and the persisted name still resolves to
+ * a real app — that is the whole point of "resume where I was", so it must
+ * override $AREST_APP. Falls back to `inferInitialAppName` when persistence is
+ * disabled, nothing is persisted, or the persisted app no longer exists.
+ */
+export function chooseInitialAppName(opts: {
+  persistEnabled: boolean
+  persistedName: string
+  persistedExists: boolean
+  env: NodeJS.ProcessEnv
+}): string {
+  if (opts.persistEnabled && opts.persistedName && opts.persistedExists) {
+    return opts.persistedName
+  }
+  return inferInitialAppName(opts.env)
+}
+
+function readPersistedAppName(appsDir: string): string {
+  try {
+    return readFileSync(activeAppStateFile(appsDir), 'utf8').trim()
+  } catch {
+    return ''
+  }
+}
+
+function writePersistedAppName(appsDir: string, name: string): void {
+  try {
+    writeFileSync(activeAppStateFile(appsDir), `${name}\n`, 'utf8')
+  } catch {
+    // Best-effort: a read-only apps dir must not break app switching.
+  }
+}
+
 // ── Mode selection ──────────────────────────────────────────────────
 
 const AREST_URL = process.env.AREST_URL || ''
@@ -81,7 +144,19 @@ const AREST_DB = process.env.AREST_DB || ''
 const AREST_CLI = process.env.AREST_CLI || resolveArestCli(REPO_ROOT)
 const AREST_MODE = (process.env.AREST_MODE || (AREST_URL ? 'remote' : 'local')).toLowerCase()
 const AREST_DEBUG = process.env.AREST_DEBUG === '1'
-const INITIAL_APP_NAME = inferInitialAppName(process.env)
+const PERSIST_ACTIVE_APP = persistActiveAppEnabled(process.env)
+// Resolved apps workspace where the `.arest-active-app` marker lives (local
+// mode only; defaultAppsDir honors $AREST_APPS_DIR, else <repo>/../apps).
+const APPS_DIR = AREST_MODE === 'local' ? defaultAppsDir(REPO_ROOT) : ''
+const PERSISTED_APP_NAME = (PERSIST_ACTIVE_APP && APPS_DIR) ? readPersistedAppName(APPS_DIR) : ''
+const INITIAL_APP_NAME = chooseInitialAppName({
+  persistEnabled: Boolean(PERSIST_ACTIVE_APP && APPS_DIR),
+  persistedName: PERSISTED_APP_NAME,
+  persistedExists: PERSISTED_APP_NAME
+    ? resolveArestApp(PERSISTED_APP_NAME, { appsDir: APPS_DIR, cwd: REPO_ROOT }).exists
+    : false,
+  env: process.env,
+})
 const APP_MODE_ENABLED = Boolean(AREST_DB || process.env.AREST_APP || AREST_APPS_DIR)
 
 function appRegistryOptions() {
@@ -111,6 +186,10 @@ function resetLocalHandle() {
 function activateApp(name: string): ArestApp {
   activeApp = resolveArestApp(name, appRegistryOptions())
   resetLocalHandle()
+  // Remember the most-recently-activated app so a restart resumes it.
+  if (PERSIST_ACTIVE_APP && APPS_DIR && activeApp.exists) {
+    writePersistedAppName(APPS_DIR, activeApp.name)
+  }
   return activeApp
 }
 

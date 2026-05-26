@@ -22,10 +22,45 @@ import {
   buildApplyMergedUpdatePayload,
   smBypassRefusal,
   buildApplyCommandForBatch,
+  persistActiveAppEnabled,
+  chooseInitialAppName,
+  activeAppStateFile,
 } from './server.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const SERVER_TS = readFileSync(resolve(__dirname, 'server.ts'), 'utf-8')
+
+describe('active-app persistence (AREST_PERSIST_ACTIVE_APP)', () => {
+  it('is on by default, off only for explicit falsey values', () => {
+    expect(persistActiveAppEnabled({})).toBe(true)
+    expect(persistActiveAppEnabled({ AREST_PERSIST_ACTIVE_APP: '' })).toBe(true)
+    expect(persistActiveAppEnabled({ AREST_PERSIST_ACTIVE_APP: '1' })).toBe(true)
+    expect(persistActiveAppEnabled({ AREST_PERSIST_ACTIVE_APP: 'true' })).toBe(true)
+    for (const off of ['0', 'false', 'no', 'off', 'OFF', 'False', ' off ']) {
+      expect(persistActiveAppEnabled({ AREST_PERSIST_ACTIVE_APP: off })).toBe(false)
+    }
+  })
+
+  it('resumes the persisted app over the env default, with safe fallbacks', () => {
+    const env = { AREST_APP: 'claude' } as NodeJS.ProcessEnv
+    // enabled + persisted + still resolves -> persisted wins over $AREST_APP
+    expect(chooseInitialAppName({ persistEnabled: true, persistedName: 'tasks', persistedExists: true, env }))
+      .toBe('tasks')
+    // disabled -> env-inferred default
+    expect(chooseInitialAppName({ persistEnabled: false, persistedName: 'tasks', persistedExists: true, env }))
+      .toBe('claude')
+    // persisted app no longer exists -> env-inferred default
+    expect(chooseInitialAppName({ persistEnabled: true, persistedName: 'tasks', persistedExists: false, env }))
+      .toBe('claude')
+    // nothing persisted -> env-inferred default
+    expect(chooseInitialAppName({ persistEnabled: true, persistedName: '', persistedExists: false, env }))
+      .toBe('claude')
+  })
+
+  it('stores the marker as a hidden file inside the apps dir', () => {
+    expect(activeAppStateFile('/abs/apps')).toMatch(/[\\/]\.arest-active-app$/)
+  })
+})
 
 describe('AREST MCP Server', () => {
   it('registers expected tool names', () => {
