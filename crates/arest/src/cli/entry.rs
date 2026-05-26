@@ -1018,63 +1018,20 @@ pub fn main_entry() {
                 // stratum 1 alongside init + event-fold so the bridge
                 // derivation in stratum 2 sees the complete pair.
                 stratum1.extend(collect_derivs("derivation:_sm_for_resource_backfill_", &d));
-                let stratum2 = collect_derivs("derivation_strat2:rule_", &d);
-                let d = if stratum1.is_empty() && stratum2.is_empty() { d } else {
-                    // task-814-stratify-3plus: pull per-rule dep
-                    // metadata from `derivation_meta:<id>` cells so
-                    // the chainer can topologically sub-stratify the
-                    // negation rules. For 3+-level priority cascades,
-                    // the negation bucket needs more than one inner
-                    // round — depth-1 rules' AbsenceOf guards depend
-                    // on depth-0 rules' emits being integrated first.
-                    let extract_id = |cell_name: &str, prefix: &str| -> String {
-                        cell_name.strip_prefix(prefix).unwrap_or(cell_name).to_string()
-                    };
-                    let s1_owned: Vec<crate::evaluate::OwnedRuleDeps> = stratum1.iter()
-                        .map(|(name, _)| {
-                            // The rule's id is the cell name minus the
-                            // `derivation:` / `derivation_strat2:` prefix
-                            // (e.g. `derivation:rule_abc123` → `rule_abc123`).
-                            let id = extract_id(name, "derivation:");
-                            crate::evaluate::read_derivation_meta(&d, &id)
-                                .unwrap_or_else(|| crate::evaluate::OwnedRuleDeps {
-                                    id, consequent_cell: String::new(),
-                                    consequent_role_literals: Vec::new(),
-                                    negation_reads: Vec::new(),
-                                })
-                        }).collect();
-                    let s2_owned: Vec<crate::evaluate::OwnedRuleDeps> = stratum2.iter()
-                        .map(|(name, _)| {
-                            let id = extract_id(name, "derivation_strat2:");
-                            crate::evaluate::read_derivation_meta(&d, &id)
-                                .unwrap_or_else(|| crate::evaluate::OwnedRuleDeps {
-                                    id, consequent_cell: String::new(),
-                                    consequent_role_literals: Vec::new(),
-                                    negation_reads: Vec::new(),
-                                })
-                        }).collect();
-                    let s1_rules: Vec<crate::evaluate::StratifiedRule> = stratum1.iter()
-                        .zip(s1_owned.iter())
-                        .map(|((name, func), deps)| crate::evaluate::StratifiedRule {
-                            id: name.as_str(),
-                            func,
-                            consequent_cell: deps.consequent_cell.as_str(),
-                            consequent_role_literals: &deps.consequent_role_literals,
-                            negation_reads: &deps.negation_reads,
-                        }).collect();
-                    let s2_rules: Vec<crate::evaluate::StratifiedRule> = stratum2.iter()
-                        .zip(s2_owned.iter())
-                        .map(|((name, func), deps)| crate::evaluate::StratifiedRule {
-                            id: name.as_str(),
-                            func,
-                            consequent_cell: deps.consequent_cell.as_str(),
-                            consequent_role_literals: &deps.consequent_role_literals,
-                            negation_reads: &deps.negation_reads,
-                        }).collect();
-                    let (new_d, derived) = crate::evaluate::forward_chain_stratified_n(
-                        &s1_rules, &s2_rules, &d, 100);
-                    eprintln!("[load] stratified joint fixpoint: {} stratum-1 + {} stratum-2 rules, {} facts derived",
-                        stratum1.len(), stratum2.len(), derived.len());
+                // negation-strat-reroute: the negation-stratification
+                // subsystem is dead — `uses_negation` is never set true
+                // (every CompiledDerivation hardcodes `false`), so the
+                // `derivation_strat2:` stratum is provably always empty
+                // and `forward_chain_stratified_n(positive, [], …)` reduces
+                // to a single `forward_chain_defs_state` over the positive
+                // rules (see evaluate.rs:683-684). Call that directly.
+                let d = if stratum1.is_empty() { d } else {
+                    let pos_refs: Vec<(&str, &ast::Func)> = stratum1.iter()
+                        .map(|(name, func)| (name.as_str(), func)).collect();
+                    let (new_d, derived) =
+                        crate::evaluate::forward_chain_defs_state(&pos_refs, &d);
+                    eprintln!("[load] forward-chain fixpoint: {} rules, {} facts derived",
+                        stratum1.len(), derived.len());
                     new_d
                 };
 

@@ -1612,8 +1612,9 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         .filter(|d| matches!(d.materialization,
             crate::types::MaterializationPolicy::Stored))
         .map(|d| {
-            let prefix = if d.uses_negation { "derivation_strat2" } else { "derivation" };
-            (format!("{}:{}", prefix, d.id), d.func.clone())
+            // negation-strat-reroute: uses_negation is never set true, so
+            // the strat2 prefix was dead — always emit `derivation:`.
+            (format!("derivation:{}", d.id), d.func.clone())
         }));
     defs.extend(model.derivations.iter()
         .filter(|d| matches!(d.materialization,
