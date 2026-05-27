@@ -6510,6 +6510,30 @@ mod tests {
             canonical_id);
     }
 
+    /// engine-casing-skew-cell-name-regression: a reading whose TRAILING word
+    /// is a DECLARED noun must parse that noun as a ROLE (binary) so its
+    /// casing is preserved in the FT id. fact_type_id_from_reading lowercases
+    /// the verb span and the tail but preserves role-noun casing; if
+    /// `Transition` landed in the tail (a UNARY parse) the id would be the
+    /// lowercase `Verb_is_performed_during_transition`, which case-collides
+    /// with the canonical `..._Transition` cell on recompile and breaks SQL
+    /// materialization + lookup_verb_for_transition. noun_seed (cli/entry.rs)
+    /// makes every declared noun visible to role detection across slices;
+    /// declaring both nouns here is the same precondition. Pins the parse-layer
+    /// invariant the mitigation relies on (verified end-to-end: a fresh
+    /// recompile of the tasks corpus yields zero case-only cell collisions and
+    /// the canonical `Verb_is_performed_during_Transition` only).
+    #[test]
+    fn declared_trailing_noun_kept_as_casing_preserved_role_not_lowercased_tail() {
+        let stmt = stage1_state(
+            "s1", "Verb is performed during Transition.", &["Verb", "Transition"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let (ft_facts, _roles) = super::translate_fact_types(&classified, &idx(&classified));
+        assert_eq!(ft_facts.len(), 1, "expected exactly one FactType");
+        assert_eq!(binding(&ft_facts[0], "id"), Some("Verb_is_performed_during_Transition"),
+            "trailing declared noun must stay a casing-preserved role, not a lowercased tail");
+    }
+
     #[test]
     fn translate_instance_facts_skips_non_instance_statements() {
         let stmt = stage1_state(
