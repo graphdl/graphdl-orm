@@ -3248,6 +3248,54 @@ pub struct CellIndex {
     pub violation_templates: ConstraintViolationTemplateTable,
 }
 
+/// Reachability core for the per-app UoD tree-shake (task
+/// `tree-shake-app-uod-to-reachable-closure`). Given the app's *root*
+/// fact-type ids — the FTs declared in the app's own readings, as opposed
+/// to the bundled-metamodel base enumerated by `lib.rs::metamodel_readings` —
+/// return the fact-type ids the app actually depends on: the roots plus,
+/// transitively, the antecedent FTs of every derivation rule whose consequent
+/// FT is already kept.
+///
+/// It deliberately does NOT keep a derivation's *consequent* merely because
+/// its antecedents are kept, so auto-generated consequents the app never
+/// names (e.g. the `_transitive_<Ft1>_<Ft2>` compositions) stay unreached and
+/// prune away; it only pulls in the *sources* a wanted (kept) derived FT needs
+/// in order to be computable.
+///
+/// Pure — no I/O, no cell mutation, nothing wired into the compile path on its
+/// own — so it is unit-testable in isolation. Edges covered so far:
+/// derivation-antecedent -> consequent. Constraint-span and subtype edges, and
+/// the union with the always-kept core-substrate FTs, belong to the separate
+/// pruning step that will call this.
+pub fn reachable_fact_types(
+    idx: &CellIndex,
+    roots: &hashbrown::HashSet<String>,
+) -> hashbrown::HashSet<String> {
+    let mut keep = roots.clone();
+    // Least fixpoint: keeping a derived FT pulls in its source FTs; iterate
+    // until no new id is added.
+    loop {
+        let mut added = false;
+        for rule in &idx.derivation_rules {
+            let consequent = rule.consequent_cell.literal_id();
+            if consequent.is_empty() || !keep.contains(consequent) {
+                continue;
+            }
+            for ant in &rule.antecedent_sources {
+                if let crate::types::AntecedentSource::FactType(id) = ant {
+                    if keep.insert(id.clone()) {
+                        added = true;
+                    }
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    keep
+}
+
 /// Build a CellIndex by scanning the cells of state once.
 pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
     use crate::ast::{fetch_cell_seq, binding};
@@ -8994,6 +9042,40 @@ pub fn generate_derivation_triggers(
 mod schema_tests {
     use super::*;
     use crate::ast::{self, Object, fact_from_pairs};
+
+    #[test]
+    fn reachable_fact_types_keeps_derivation_sources_and_prunes_unrelated() {
+        // Person->City->Country chain with a derived "Person is in Country",
+        // plus an unrelated Widget->Color FT. Rooting on the derived FT must
+        // pull in its two antecedent FTs and leave Widget_has_Color pruned.
+        let src = "\
+            Person(.id) is an entity type.\n\
+            City(.id) is an entity type.\n\
+            Country(.id) is an entity type.\n\
+            Widget(.id) is an entity type.\n\
+            Color is a value type.\n\
+            Person has City.\n\
+            City is in Country.\n\
+            Person is in Country.\n\
+            Widget has Color.\n\
+            * Person is in Country iff Person has City and City is in Country.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse");
+        let idx = cell_index_from_state(&state);
+        let fts: Vec<&String> = idx.fact_types.keys().collect();
+
+        let mut roots: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        roots.insert("Person_is_in_Country".to_string());
+        let reach = reachable_fact_types(&idx, &roots);
+
+        assert!(reach.contains("Person_has_City"),
+            "antecedent Person_has_City must be kept; reach={:?} fts={:?}", reach, fts);
+        assert!(reach.contains("City_is_in_Country"),
+            "antecedent City_is_in_Country must be kept; reach={:?} fts={:?}", reach, fts);
+        assert!(!reach.contains("Widget_has_Color"),
+            "unrelated Widget_has_Color must be pruned; reach={:?}", reach);
+    }
 
     /// Build Object state with a single fact type + its roles. Emits
     /// FactType + Role cells directly (no Domain intermediate).
