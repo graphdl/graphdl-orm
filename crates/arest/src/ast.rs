@@ -4915,7 +4915,28 @@ pub fn cells_iter(state: &Object) -> Vec<(&str, &Object)> {
 /// Map value `⟨State Machine='', Status='Proposed'⟩`, which every prior
 /// `as_seq()`-only pass silently skipped.) Other shapes pass through.
 pub(crate) fn drop_subjectless_facts(contents: &Object) -> Object {
-    // A relic is a fact missing a role (fewer bindings than the cell's modal
+    drop_subjectless_facts_with_arity(contents, None)
+}
+
+/// As [`drop_subjectless_facts`], but when `declared_arity` is `Some(n)` the
+/// schema arity `n` is the keep-threshold instead of the modal (max) binding
+/// count inferred from the cell's own facts.
+///
+/// Inferring arity from contents is only correct when the cell is uniform —
+/// the documented assumption ("every valid fact of one fact type shares that
+/// arity"). A cell that ALSO carries malformed OVER-arity relics violates it:
+/// e.g. the unary `Task_is_finished` cell holding both the correct 1-binding
+/// `<<Task,930>>` (apply/transition-written) and 2-binding
+/// `<<Task,X>,<Task_is_finished,φ>>` rows (an older bulk-reading write path).
+/// The malformed rows inflate the inferred max to 2, so the CORRECT 1-binding
+/// rows are then dropped as "missing a role" — inverting the GC (drops the
+/// valid facts, keeps the relics; tasks-db task-958). For cells in the
+/// FactType registry the declared arity is authoritative — callers pass it.
+/// The `>=` threshold is kept (not `==`): over-arity relics still pass, so
+/// this never drops a status-bearing event; it only stops the inflation from
+/// discarding the correct shorter rows.
+pub(crate) fn drop_subjectless_facts_with_arity(contents: &Object, declared_arity: Option<usize>) -> Object {
+    // A relic is a fact missing a role (fewer bindings than the cell's
     // arity) or with an empty subject (first binding's value empty/φ).
     fn keep(f: &Object, arity: usize) -> bool {
         match f.as_seq() {
@@ -4924,7 +4945,8 @@ pub(crate) fn drop_subjectless_facts(contents: &Object) -> Object {
         }
     }
     if let Some(m) = contents.as_map() {
-        let arity = m.values().filter_map(|f| f.as_seq().map(|p| p.len())).max().unwrap_or(0);
+        let arity = declared_arity.unwrap_or_else(||
+            m.values().filter_map(|f| f.as_seq().map(|p| p.len())).max().unwrap_or(0));
         return Object::map(m.iter()
             .filter(|&(_, f)| keep(f, arity))
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -4934,7 +4956,8 @@ pub(crate) fn drop_subjectless_facts(contents: &Object) -> Object {
         Some(f) => f,
         None => return contents.clone(),
     };
-    let arity = facts.iter().filter_map(|f| f.as_seq().map(|p| p.len())).max().unwrap_or(0);
+    let arity = declared_arity.unwrap_or_else(||
+        facts.iter().filter_map(|f| f.as_seq().map(|p| p.len())).max().unwrap_or(0));
     Object::seq(facts.iter().filter(|&f| keep(f, arity)).cloned().collect())
 }
 

@@ -776,6 +776,21 @@ pub fn main_entry() {
                         .collect())
                     .unwrap_or_default();
                 parsed_cell_names.retain(|name| !ft_ids.contains(name));
+                // task-958: declared arity per FT id, so the subjectless-GC
+                // below keys off the SCHEMA arity, not the malformed-inflated
+                // modal arity — otherwise a unary FT cell holding both the
+                // correct 1-binding apply/transition rows and 2-binding
+                // bulk-reading relics infers arity 2 and drops the correct rows
+                // (then those resources lose their event facts and SM-init
+                // re-seeds them 'pending' on recompile).
+                let ft_arity: hashbrown::HashMap<String, usize> =
+                    ast::fetch_cell_seq("FactType", &parsed_fresh).as_seq()
+                        .map(|facts| facts.iter()
+                            .filter_map(|f| Some((
+                                ast::binding(f, "id")?.to_string(),
+                                ast::binding(f, "arity")?.parse::<usize>().ok()?)))
+                            .collect())
+                        .unwrap_or_default();
                 let prior_population: ast::Object = {
                     let loaded = db::load_state(&conn);
                     let map: hashbrown::HashMap<String, ast::Object> =
@@ -786,7 +801,9 @@ pub fn main_entry() {
                             // would also carry forward malformed subjectless relics —
                             // a State_Machine_is_currently_in_Status row whose State
                             // Machine binding is empty or missing entirely. Drop those.
-                            .map(|(name, contents)| (name.to_string(), ast::drop_subjectless_facts(contents)))
+                            // Pass declared arity (task-958) so correct shorter rows survive.
+                            .map(|(name, contents)| (name.to_string(),
+                                ast::drop_subjectless_facts_with_arity(contents, ft_arity.get(name).copied())))
                             .collect();
                     ast::Object::map(map)
                 };
@@ -1091,10 +1108,22 @@ pub fn main_entry() {
                                 .filter_map(|f| ast::binding(f, "id").map(|s| s.to_string()))
                                 .collect())
                             .unwrap_or_default();
+                    // task-958: declared arity per FT id (mirrors the
+                    // prior-population GC above) — use schema arity so the
+                    // arity+subject GC doesn't drop correct shorter rows from
+                    // a cell that also holds malformed over-arity relics.
+                    let ft_arity: hashbrown::HashMap<String, usize> =
+                        ast::fetch_cell_seq("FactType", &d).as_seq()
+                            .map(|facts| facts.iter()
+                                .filter_map(|f| Some((
+                                    ast::binding(f, "id")?.to_string(),
+                                    ast::binding(f, "arity")?.parse::<usize>().ok()?)))
+                                .collect())
+                            .unwrap_or_default();
                     let map: hashbrown::HashMap<String, ast::Object> =
                         ast::cells_iter(&d).into_iter()
                             .map(|(name, contents)| if ft_ids.contains(name) {
-                                (name.to_string(), ast::drop_subjectless_facts(contents))
+                                (name.to_string(), ast::drop_subjectless_facts_with_arity(contents, ft_arity.get(name).copied()))
                             } else if !name.contains(':') {
                                 (name.to_string(), ast::drop_empty_subject_facts(contents))
                             } else {
