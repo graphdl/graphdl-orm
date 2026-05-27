@@ -1050,7 +1050,7 @@ fn allocate(state: ast::Object, defs: Vec<(String, ast::Func)>) -> u32 {
 //   * `UI_READINGS`       — UI surfaces; gated on `ui-readings`.
 //   * `OS_READINGS`       — OS-only nouns; gated on `os-readings`.
 //   * `TEMPLATE_READINGS` — stock app templates; gated on `templates`.
-//   * `COMPAT_READINGS`   — Windows-via-Wine compat (#463); gated on `compat-readings`.
+//   * `COMPAT_READINGS`   — Windows-via-Wine compat (#463); gated on `wine`.
 //
 // The pre-#437 `METAMODEL_READINGS` constant is replaced by the
 // `metamodel_readings()` runtime assembler, which folds the enabled
@@ -1147,7 +1147,7 @@ pub const TEMPLATE_READINGS: &[(&str, &str)] = &[
 /// prefix; the ProtonDB ingest (#462e) folds external compat reports
 /// in via the federation pipeline. Workers that don't run Wine apps
 /// (pure CRM, FPGA targets) leave this slice off.
-#[cfg(feature = "compat-readings")]
+#[cfg(feature = "wine")]
 pub const COMPAT_READINGS: &[(&str, &str)] = &[
     ("wine",          include_str!("../../../readings/compat/wine.md")),
 ];
@@ -1176,7 +1176,7 @@ pub fn metamodel_readings() -> Vec<&'static (&'static str, &'static str)> {
     { out.extend(UI_READINGS.iter()); }
     #[cfg(feature = "os-readings")]
     { out.extend(OS_READINGS.iter()); }
-    #[cfg(feature = "compat-readings")]
+    #[cfg(feature = "wine")]
     { out.extend(COMPAT_READINGS.iter()); }
     out
 }

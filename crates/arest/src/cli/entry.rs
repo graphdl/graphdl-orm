@@ -550,7 +550,7 @@ pub fn main_entry() {
             // its (slug, prefix Directory) pair via wine_app_by_name.
             // Read-only; doesn't load --db, doesn't compile, doesn't
             // execve `wine`. Wine prefix bootstrap lands in #504.
-            #[cfg(feature = "compat-readings")]
+            #[cfg(feature = "wine")]
             {
                 let rest: Vec<String> = args.iter().skip(1).cloned().collect();
                 // `metamodel_readings()` hands back &'static (&str, &str)
@@ -566,10 +566,10 @@ pub fn main_entry() {
                 let code = crate::cli::run::dispatch(&rest, &readings, &mut stdout, &mut stderr);
                 std::process::exit(code);
             }
-            #[cfg(not(feature = "compat-readings"))]
+            #[cfg(not(feature = "wine"))]
             {
-                eprintln!("`arest run` requires the `compat-readings` feature.");
-                eprintln!("  cargo run --bin arest-cli --features compat-readings -- run \"App Name\"");
+                eprintln!("`arest run` requires the `wine` feature.");
+                eprintln!("  cargo run --bin arest-cli --features wine -- run \"App Name\"");
                 std::process::exit(2);
             }
         }

@@ -203,13 +203,13 @@ pub fn usage_text() -> &'static str {
     "Usage: arest-cli run <app-name>\n\
      \n\
      Resolve a Wine App name (slug or display title) to its prefix\n\
-     Directory id. Reads from the bundled compat-readings metamodel.\n\
+     Directory id. Reads from the bundled wine metamodel.\n\
      \n\
      Examples:\n\
        arest-cli run \"Notepad++\"           # display title\n\
        arest-cli run notepad-plus-plus     # slug\n\
      \n\
-     Build with --features compat-readings to include the Wine App\n\
+     Build with --features wine to include the Wine App\n\
      catalogue."
 }
 
@@ -455,13 +455,13 @@ mod tests {
     }
 
     /// End-to-end test against the real bundled wine.md corpus.
-    /// Gated on `compat-readings` because the slice is conditionally
+    /// Gated on `wine` because the slice is conditionally
     /// included via `crate::COMPAT_READINGS`. Uses
     /// `dispatch_with_prefix_root` so each test owns a distinct
     /// scratch directory without manipulating the process-global
     /// `AREST_WINE_PREFIX_ROOT` env var (which would race across
     /// libtest's parallel test threads).
-    #[cfg(feature = "compat-readings")]
+    #[cfg(feature = "wine")]
     #[test]
     fn dispatch_resolves_known_display_title() {
         let readings: Vec<(&str, &str)> = crate::metamodel_readings()
@@ -483,7 +483,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[cfg(feature = "compat-readings")]
+    #[cfg(feature = "wine")]
     #[test]
     fn dispatch_resolves_known_slug() {
         let readings: Vec<(&str, &str)> = crate::metamodel_readings()
@@ -507,7 +507,7 @@ mod tests {
     /// DLL Overrides) and verify the resulting `system.reg` contains
     /// the expected entries. Confirms the run-dispatch → bootstrap →
     /// wine_overrides chain end-to-end.
-    #[cfg(feature = "compat-readings")]
+    #[cfg(feature = "wine")]
     #[test]
     fn dispatch_bootstraps_steam_windows_prefix() {
         let readings: Vec<(&str, &str)> = crate::metamodel_readings()
@@ -534,7 +534,7 @@ mod tests {
 
     /// Spotify writes an HKCU registry key. Confirms registry keys
     /// at HKCU land in `user.reg`, not `system.reg`.
-    #[cfg(feature = "compat-readings")]
+    #[cfg(feature = "wine")]
     #[test]
     fn dispatch_bootstraps_spotify_registry_key() {
         let readings: Vec<(&str, &str)> = crate::metamodel_readings()
@@ -560,7 +560,7 @@ mod tests {
     /// Re-running `arest run` against the same app must produce a
     /// byte-identical prefix state — the idempotency invariant the
     /// bootstrap module promises.
-    #[cfg(feature = "compat-readings")]
+    #[cfg(feature = "wine")]
     #[test]
     fn dispatch_idempotent_bootstrap() {
         let readings: Vec<(&str, &str)> = crate::metamodel_readings()
@@ -618,7 +618,7 @@ mod tests {
         path
     }
 
-    #[cfg(feature = "compat-readings")]
+    #[cfg(feature = "wine")]
     #[test]
     fn dispatch_typo_returns_suggestion() {
         let readings: Vec<(&str, &str)> = crate::metamodel_readings()
@@ -634,7 +634,7 @@ mod tests {
         assert!(err_text.contains("Notepad++"), "got stderr: {}", err_text);
     }
 
-    #[cfg(feature = "compat-readings")]
+    #[cfg(feature = "wine")]
     #[test]
     fn dispatch_unrelated_name_returns_no_suggestion() {
         let readings: Vec<(&str, &str)> = crate::metamodel_readings()
@@ -655,7 +655,7 @@ mod tests {
     /// after the bootstrap block. Confirms `wine_install::format_report`
     /// is reached for an app that has Installer URL declared in
     /// the bundled wine.md.
-    #[cfg(feature = "compat-readings")]
+    #[cfg(feature = "wine")]
     #[test]
     fn dispatch_prints_install_report_for_notepad_plus_plus() {
         let readings: Vec<(&str, &str)> = crate::metamodel_readings()
@@ -678,7 +678,7 @@ mod tests {
     /// after the install-report block. Confirms `wine_launch::format_report`
     /// is reached for an app that has Main Exe Path declared in
     /// the bundled wine.md.
-    #[cfg(feature = "compat-readings")]
+    #[cfg(feature = "wine")]
     #[test]
     fn dispatch_prints_launch_report_for_notepad_plus_plus() {
         let readings: Vec<(&str, &str)> = crate::metamodel_readings()
@@ -703,7 +703,7 @@ mod tests {
     /// Idempotency: when the `_install_complete` marker is already
     /// present, dispatch must report `(already installed; ...)` and
     /// exit 0 without spawning anything network-bound.
-    #[cfg(feature = "compat-readings")]
+    #[cfg(feature = "wine")]
     #[test]
     fn dispatch_idempotent_install_with_marker() {
         let readings: Vec<(&str, &str)> = crate::metamodel_readings()

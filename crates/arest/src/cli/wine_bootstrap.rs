@@ -567,7 +567,7 @@ mod tests {
     /// uses None as the winetricks_path so winetricks recipes are
     /// either short-circuited (logged) or marked WinetricksUnavailable
     /// — never actually run.
-    #[cfg(feature = "compat-readings")]
+    #[cfg(feature = "wine")]
     #[test]
     fn bootstrap_prefix_walks_real_wine_md_for_office() {
         let filesystem_md = include_str!("../../../../readings/os/filesystem.md");
@@ -591,7 +591,7 @@ mod tests {
                 "system.reg must include the riched20 override; got: {}", body);
     }
 
-    #[cfg(feature = "compat-readings")]
+    #[cfg(feature = "wine")]
     #[test]
     fn bootstrap_prefix_walks_real_wine_md_for_steam_windows() {
         let filesystem_md = include_str!("../../../../readings/os/filesystem.md");

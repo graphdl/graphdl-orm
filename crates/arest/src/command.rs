@@ -7167,11 +7167,11 @@ Each Status has at least one Verb performed in it.
     /// `Wine App has prefix Directory` fact type can resolve its
     /// second role. This mirrors the load order
     /// `metamodel_readings()` uses in production
-    /// (os-readings → compat-readings, see lib.rs).
+    /// (os-readings → wine, see lib.rs).
     ///
-    /// Gated on `compat-readings` so it only runs when the wine.md
+    /// Gated on `wine` so it only runs when the wine.md
     /// slice is enabled (default-off).
-    #[cfg(feature = "compat-readings")]
+    #[cfg(feature = "wine")]
     #[test]
     fn wine_prefix_for_resolves_every_seeded_wine_app() {
         let filesystem_md = include_str!("../../../readings/os/filesystem.md");
@@ -7337,7 +7337,7 @@ Each Status has at least one Verb performed in it.
     /// `Directory` noun) and confirm `wine_app_by_name` resolves both
     /// known slugs and known display titles. Mirrors the shape of
     /// `wine_prefix_for_resolves_every_seeded_wine_app` above.
-    #[cfg(feature = "compat-readings")]
+    #[cfg(feature = "wine")]
     #[test]
     fn wine_app_by_name_resolves_every_seeded_wine_app() {
         let filesystem_md = include_str!("../../../readings/os/filesystem.md");

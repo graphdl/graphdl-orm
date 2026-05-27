@@ -6615,7 +6615,7 @@ mod tests {
     /// role bindings. The bundled steam-windows / spotify / notion-
     /// desktop instance facts cover DLL Override, Registry Key, and
     /// Environment Variable shapes respectively.
-    #[cfg(feature = "compat-readings")]
+    #[cfg(feature = "wine")]
     #[test]
     fn ternary_instance_facts_land_in_canonical_cells_via_real_parse() {
         let filesystem_md = include_str!("../../../readings/os/filesystem.md");

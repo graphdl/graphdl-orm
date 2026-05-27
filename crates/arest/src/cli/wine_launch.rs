@@ -608,7 +608,7 @@ mod tests {
     /// Main Exe Path cell is populated for at least one Wine App
     /// after the parser walks the readings (per the new instance
     /// facts added in this commit).
-    #[cfg(feature = "compat-readings")]
+    #[cfg(feature = "wine")]
     #[test]
     fn main_exe_path_resolves_for_notepad_plus_plus_in_real_corpus() {
         let filesystem_md = include_str!("../../../../readings/os/filesystem.md");
