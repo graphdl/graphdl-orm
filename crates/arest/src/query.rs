@@ -24,7 +24,15 @@ use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 /// Convert facts from an Object state for a given fact type into a positional Object sequence.
 /// Each fact becomes a sequence ordered by the schema's role_names.
 pub(crate) fn state_to_object(state: &Object, schema: &CompiledSchema) -> Object {
-    let facts = ast::fetch_cell_seq(&schema.id, state);
+    let mut facts = ast::fetch_cell_seq(&schema.id, state);
+    // task-962: an RMAP-absorbed FT has no data cell of its own — its values
+    // are folded into the subject entity cell. Reconstitute the elementary
+    // tuples so query / get see them (the up-FILE direction of eq:pop).
+    if facts.as_seq().map_or(true, |s| s.is_empty()) {
+        if let Some(recon) = crate::rmap::reconstitute_absorbed_ft(state, &schema.id) {
+            facts = recon;
+        }
+    }
     let items = match facts.as_seq() {
         Some(fact_objs) => fact_objs.iter().map(|fact| {
             let bindings: Vec<Object> = schema.role_names.iter().map(|role_name| {

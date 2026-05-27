@@ -903,6 +903,73 @@ pub fn rmap_cell_map(state: &crate::ast::Object) -> HashMap<String, String> {
     map
 }
 
+/// Inverse of `EntityCellRouter::route_fact` (task-962): given an absorbed
+/// binary fact-type id that has no data cell of its own, project the
+/// absorbing entity cell's facts back into elementary-fact tuples
+/// `<<subjectRole, id>, <valueRole, value>>` so query / get / derivations
+/// over the 5NF population P see the RMAP-absorbed column (the `up-FILE`
+/// reconstitution of eq:pop). Presence-driven: a tuple is emitted only
+/// where the value binding is actually present. Returns `None` for
+/// self / junction cells or non-binary fact types.
+///
+/// Handles the metamodel entity-cell regime: `translate_nouns` stores the
+/// subject under `name` and each functional property under
+/// `lower_camel(valueRole)` (e.g. Noun's `objectType`, `referenceScheme`).
+/// Runtime per-entity cells (`<Noun>:<id>`) are a follow-up.
+pub fn reconstitute_absorbed_ft(
+    state: &crate::ast::Object,
+    ft_id: &str,
+) -> Option<crate::ast::Object> {
+    use crate::ast::{fetch_cell_seq, binding, fact_from_pairs, Object};
+
+    // Absorbed FTs only: rmap routes them into an entity cell whose snake
+    // name differs from the FT's own snake (self / junction cells route to
+    // themselves and keep a real data cell — nothing to reconstitute).
+    let target = rmap_cell_map(state).get(ft_id)?.clone();
+    if target == to_snake(ft_id) { return None; }
+
+    // FT roles, ordered by position.
+    let role_cell = fetch_cell_seq("Role", state);
+    let mut roles: Vec<(usize, String)> = role_cell.as_seq()
+        .map(|rs| rs.iter()
+            .filter(|r| binding(r, "factType") == Some(ft_id))
+            .filter_map(|r| Some((
+                binding(r, "position")?.parse::<usize>().ok()?,
+                binding(r, "nounName")?.to_string(),
+            )))
+            .collect())
+        .unwrap_or_default();
+    roles.sort_by_key(|(p, _)| *p);
+    if roles.len() != 2 { return None; }
+
+    // Subject = the absorbing entity (snake(noun) == target); value = the other.
+    let subject_role = roles.iter().find(|(_, n)| to_snake(n) == target)?.1.clone();
+    let value_role = roles.iter().find(|(_, n)| to_snake(n) != target)?.1.clone();
+
+    // The absorbing cell is the subject entity type's registry cell, named
+    // for the subject role's noun (metamodel regime — e.g. the `Noun` cell).
+    // Project: subject under `name`, value under lower_camel(valueRole).
+    // Presence-driven; sorted for replay determinism (D_n is a set).
+    let value_key = crate::naming::lower_camel(&value_role);
+    let cell = fetch_cell_seq(&subject_role, state);
+    let mut rows: Vec<(String, String)> = cell.as_seq()
+        .map(|fs| fs.iter()
+            .filter_map(|f| Some((
+                binding(f, "name")?.to_string(),
+                binding(f, &value_key)?.to_string(),
+            )))
+            .collect())
+        .unwrap_or_default();
+    rows.sort();
+    let facts: Vec<Object> = rows.into_iter()
+        .map(|(subj, val)| fact_from_pairs(&[
+            (subject_role.as_str(), subj.as_str()),
+            (value_role.as_str(), val.as_str()),
+        ]))
+        .collect();
+    Some(Object::seq(facts))
+}
+
 // ── #770 — per-entity cell routing (paper §196 + §462 eq:cellfold) ──
 //
 // Given a fact stored in an FT cell, decide which per-entity cell
@@ -1123,6 +1190,30 @@ mod tests {
                 .push(crate::parse_forml2::constraint_to_fact_test(&cdef));
         }
         Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect::<hashbrown::HashMap<_, _>>().into())
+    }
+
+    #[test]
+    fn reconstitutes_absorbed_metamodel_object_type() {
+        // task-962: `Noun has Object Type` is functional, so RMAP absorbs
+        // Object Type into the Noun cell (UC on the dependent role, like
+        // "Order was placed by Customer"). reconstitute_absorbed_ft must
+        // project it back out of the Noun registry into elementary
+        // <<Noun,id>,<Object Type,val>> tuples (the up-FILE direction).
+        let state = make_state(
+            vec![("Task", "entity"), ("Order", "entity")],
+            vec![("Noun_has_Object_Type", "Noun has Object Type",
+                  vec![("Noun", 0), ("Object Type", 1)])],
+            vec![("UC", vec![("Noun_has_Object_Type", 1)])],
+        );
+        let out = reconstitute_absorbed_ft(&state, "Noun_has_Object_Type")
+            .expect("absorbed FT should reconstitute");
+        let facts = out.as_seq().expect("seq of tuples");
+        assert_eq!(facts.len(), 2, "one tuple per Noun (Task, Order)");
+        // Sorted by subject id: Order before Task.
+        assert_eq!(ast::binding(&facts[0], "Noun"), Some("Order"));
+        assert_eq!(ast::binding(&facts[0], "Object Type"), Some("entity"));
+        assert_eq!(ast::binding(&facts[1], "Noun"), Some("Task"));
+        assert_eq!(ast::binding(&facts[1], "Object Type"), Some("entity"));
     }
 
     #[test]

@@ -4718,7 +4718,10 @@ pub(crate) fn resolve_view(cell_name: &str, pop: &Object, defs: &Object) -> Opti
     let def_key = alloc::format!("view:{}", cell_name);
     let stored = fetch_raw(&def_key, defs);
     if matches!(stored, Object::Bottom) {
-        return None;
+        // No `view:` def — try absorbed-FT reconstitution (task-962): the FT
+        // may be RMAP-absorbed into an entity cell with no data cell of its
+        // own. Read from `defs` (carries the FactType / Role / Noun cells).
+        return crate::rmap::reconstitute_absorbed_ft(defs, cell_name);
     }
     let func = metacompose(&stored, defs);
     // The view's func is a derivation func — it expects an encoded

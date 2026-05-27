@@ -324,9 +324,46 @@ pub fn atom_id_is_valid(s: &str) -> bool {
         && s.bytes().all(|b| (0x20..=0x7E).contains(&b))
 }
 
+/// Map a role / value-type name to its lowerCamelCase metamodel binding
+/// key — the key under which a RMAP-absorbed functional-mandatory binary
+/// stores its value on the subject entity cell's facts. `translate_nouns`
+/// (parse_forml2_stage2) writes these literally: "Object Type" ->
+/// `objectType`, "Reference Scheme" -> `referenceScheme`, "World
+/// Assumption" -> `worldAssumption`; single words lowercase fully
+/// ("Plural" -> `plural`). Best-effort: absorbed-FT reconstitution
+/// (task-962) uses this to LOCATE the stored value and stays
+/// presence-driven (no tuple emitted when the key is absent), so a role
+/// whose stored key diverges from this transform yields nothing rather
+/// than a wrong projection.
+pub fn lower_camel(name: &str) -> String {
+    let mut out = String::new();
+    for (i, word) in name.split_whitespace().enumerate() {
+        if i == 0 {
+            out.push_str(&word.to_lowercase());
+        } else {
+            let mut chars = word.chars();
+            if let Some(first) = chars.next() {
+                out.extend(first.to_uppercase());
+                out.push_str(&chars.as_str().to_lowercase());
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_lower_camel() {
+        // Metamodel reference-scheme / property keys — task-962 absorbed-FT
+        // reconstitution locates stored values via this transform.
+        assert_eq!(lower_camel("Object Type"), "objectType");
+        assert_eq!(lower_camel("Reference Scheme"), "referenceScheme");
+        assert_eq!(lower_camel("World Assumption"), "worldAssumption");
+        assert_eq!(lower_camel("Plural"), "plural");
+    }
 
     #[test]
     fn test_pluralize() {
