@@ -6534,6 +6534,27 @@ mod tests {
             "trailing declared noun must stay a casing-preserved role, not a lowercased tail");
     }
 
+    /// task-919 gap 2: a fact type whose object role is a MULTI-WORD noun
+    /// (`Platform Function`) whose trailing word (`Function`) is itself a
+    /// declared noun must bind the FULL noun as the role, not the suffix.
+    /// gap 1 (f5b6650e) fixed the multi-word *declaration*; this pins the FT
+    /// *role-detection* path (longest-first noun matching), the prerequisite
+    /// for the SM -> Platform-Function dispatch wiring (gap 3).
+    #[test]
+    fn multiword_object_role_binds_full_noun_not_declared_suffix() {
+        let stmt = stage1_state(
+            "s1", "Transition is performed by Platform Function.",
+            &["Transition", "Platform Function", "Function"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let (ft_facts, role_facts) = super::translate_fact_types(&classified, &idx(&classified));
+        assert_eq!(ft_facts.len(), 1, "expected exactly one FactType");
+        assert_eq!(binding(&ft_facts[0], "id"), Some("Transition_is_performed_by_Platform_Function"),
+            "FT id must use the full multi-word object noun, not the declared suffix");
+        let pos1 = role_facts.iter().find(|r| binding(r, "position") == Some("1"));
+        assert_eq!(pos1.and_then(|r| binding(r, "nounName")), Some("Platform Function"),
+            "object role must bind 'Platform Function', not the suffix 'Function'");
+    }
+
     #[test]
     fn translate_instance_facts_skips_non_instance_statements() {
         let stmt = stage1_state(
