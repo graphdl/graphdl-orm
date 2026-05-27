@@ -3296,6 +3296,103 @@ pub fn reachable_fact_types(
     keep
 }
 
+/// Prune a compiled state's cells down to a set of reachable fact types
+/// (task `tree-shake-app-uod-to-reachable-closure`). `reachable` is the
+/// caller-computed keep-set — typically `reachable_fact_types(idx, roots)`
+/// unioned with the always-kept core-substrate FTs.
+///
+/// v1 (conservative): drops the per-FT data cell of every unreachable fact
+/// type, and filters the `FactType` and `Role` schema cells to reachable
+/// ids. Everything else — `Noun`, `Constraint`, `DerivationRule`,
+/// `InstanceFact`, `EnumValues`, the substrate, and derived cells such as
+/// `_transitive_*` — is kept whole: a constraint/derivation that now
+/// references a dropped FT degrades to a no-op over an absent population
+/// rather than dangling, and removing the `FactType` declaration stops the
+/// synthesized transitivity from re-composing the dropped FT. (Coherent
+/// `Constraint` / `DerivationRule` / `_transitive_*` filtering is a v2
+/// follow-up.) Pure — builds a fresh state, mutates nothing, wires nothing
+/// into the compile path on its own.
+pub fn prune_unreachable_fact_types(
+    state: &crate::ast::Object,
+    reachable: &hashbrown::HashSet<String>,
+) -> crate::ast::Object {
+    // Every declared FactType id — lets us recognise per-FT *data* cells
+    // (named exactly after a fact-type id) so unreachable ones drop.
+    let all_ft_ids: hashbrown::HashSet<String> =
+        crate::ast::fetch_cell_seq("FactType", state).as_seq()
+            .map(|fs| fs.iter()
+                .filter_map(|f| crate::ast::binding(f, "id").map(|s| s.to_string()))
+                .collect())
+            .unwrap_or_default();
+
+    let mut out: hashbrown::HashMap<String, crate::ast::Object> = hashbrown::HashMap::new();
+    for (name, contents) in crate::ast::cells_iter(state) {
+        match name {
+            "FactType" => {
+                let kept: Vec<crate::ast::Object> = contents.as_seq()
+                    .map(|s| s.iter()
+                        .filter(|f| crate::ast::binding(f, "id")
+                            .map(|id| reachable.contains(id)).unwrap_or(true))
+                        .cloned().collect())
+                    .unwrap_or_default();
+                out.insert(name.to_string(), crate::ast::Object::Seq(kept.into()));
+            }
+            "Role" => {
+                let kept: Vec<crate::ast::Object> = contents.as_seq()
+                    .map(|s| s.iter()
+                        .filter(|f| crate::ast::binding(f, "factType")
+                            .map(|ft| reachable.contains(ft)).unwrap_or(true))
+                        .cloned().collect())
+                    .unwrap_or_default();
+                out.insert(name.to_string(), crate::ast::Object::Seq(kept.into()));
+            }
+            // Per-FT data cell whose fact type is unreachable: drop it.
+            _ if all_ft_ids.contains(name) && !reachable.contains(name) => {}
+            _ => {
+                out.insert(name.to_string(), contents.clone());
+            }
+        }
+    }
+    crate::ast::Object::map(out)
+}
+
+/// Fact-type ids declared by the bundled *domain* metamodel modules
+/// (ui/design/monoview/components/render, os/filesystem,
+/// templates/organizations+agents+sql-dialects, compat/wine) — the
+/// shared-library vocabulary the per-app tree-shake
+/// (`tree-shake-app-uod-to-reachable-closure`) may drop when an app reaches
+/// none of it. The CORE substrate modules (core/state/naming/validation/
+/// security/…) are deliberately excluded: they are always kept.
+///
+/// Parses the domain corpus seeded with the full bundled Noun catalog so
+/// role-noun ids resolve to their canonical form — avoiding
+/// `fact_type_id_from_reading`'s unseeded lowercased-tail divergence (the
+/// same hazard `cli/entry.rs`'s `noun_seed` guards against on app compile).
+pub fn bundled_domain_fact_type_ids() -> hashbrown::HashSet<String> {
+    const DOMAIN_MODULES: &[&str] = &[
+        "ui", "design", "monoview", "components", "render",
+        "filesystem", "organizations", "agents", "sql-dialects", "wine",
+    ];
+    let seed = {
+        let mut m: hashbrown::HashMap<String, crate::ast::Object> = hashbrown::HashMap::new();
+        m.insert("Noun".to_string(),
+            crate::ast::fetch_cell_seq("Noun", crate::metamodel_state()));
+        crate::ast::Object::map(m)
+    };
+    let corpus: String = crate::metamodel_readings().into_iter()
+        .filter(|r| DOMAIN_MODULES.contains(&r.0))
+        .map(|r| r.1)
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let parsed = crate::parse_forml2::parse_to_state_from(&corpus, &seed)
+        .unwrap_or_else(|_| crate::ast::Object::phi());
+    crate::ast::fetch_cell_seq("FactType", &parsed).as_seq()
+        .map(|fs| fs.iter()
+            .filter_map(|f| crate::ast::binding(f, "id").map(|s| s.to_string()))
+            .collect())
+        .unwrap_or_default()
+}
+
 /// Build a CellIndex by scanning the cells of state once.
 pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
     use crate::ast::{fetch_cell_seq, binding};
@@ -9075,6 +9172,70 @@ mod schema_tests {
             "antecedent City_is_in_Country must be kept; reach={:?} fts={:?}", reach, fts);
         assert!(!reach.contains("Widget_has_Color"),
             "unrelated Widget_has_Color must be pruned; reach={:?}", reach);
+    }
+
+    #[test]
+    fn prune_unreachable_fact_types_drops_unreached_cells_and_filters_factype() {
+        // Same chain, plus instance data so both Person_has_City (reachable)
+        // and Widget_has_Color (unreachable) get per-FT data cells. Pruning
+        // to the reachable closure must drop the Widget cell + its FactType
+        // entry, and keep the Person one.
+        let src = "\
+            Person(.id) is an entity type.\n\
+            City(.id) is an entity type.\n\
+            Country(.id) is an entity type.\n\
+            Widget(.id) is an entity type.\n\
+            Color is a value type.\n\
+            Person has City.\n\
+            City is in Country.\n\
+            Person is in Country.\n\
+            Widget has Color.\n\
+            Person 'p1' has City 'c1'.\n\
+            Widget 'w1' has Color 'red'.\n\
+            * Person is in Country iff Person has City and City is in Country.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse");
+        let idx = cell_index_from_state(&state);
+        let mut roots: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        roots.insert("Person_is_in_Country".to_string());
+        let reach = reachable_fact_types(&idx, &roots);
+
+        let pruned = prune_unreachable_fact_types(&state, &reach);
+
+        let ft_ids: hashbrown::HashSet<String> =
+            crate::ast::fetch_cell_seq("FactType", &pruned).as_seq()
+                .map(|fs| fs.iter()
+                    .filter_map(|f| crate::ast::binding(f, "id").map(|s| s.to_string()))
+                    .collect())
+                .unwrap_or_default();
+        assert!(ft_ids.contains("Person_has_City"),
+            "reachable FT kept in FactType; got {:?}", ft_ids);
+        assert!(!ft_ids.contains("Widget_has_Color"),
+            "unreachable FT dropped from FactType; got {:?}", ft_ids);
+
+        let cells: hashbrown::HashSet<String> = crate::ast::cells_iter(&pruned)
+            .into_iter().map(|(n, _)| n.to_string()).collect();
+        assert!(!cells.contains("Widget_has_Color"),
+            "unreachable per-FT data cell dropped; cells={:?}", cells);
+        assert!(cells.contains("Person_has_City"),
+            "reachable per-FT data cell kept; cells={:?}", cells);
+    }
+
+    #[test]
+    fn bundled_domain_fact_type_ids_covers_ui_and_excludes_core_and_app() {
+        let domain = bundled_domain_fact_type_ids();
+        assert!(!domain.is_empty(), "domain module parse produced no fact types");
+        // UI-vocabulary fact types are in the domain (prunable) set.
+        assert!(domain.iter().any(|id|
+            id.starts_with("MonoView") || id.starts_with("ColorToken")
+            || id.starts_with("Component") || id.starts_with("IconToken")
+            || id.starts_with("MotionToken")),
+            "expected UI fact types in the domain set; got {} ids: {:?}",
+            domain.len(), domain.iter().take(10).collect::<Vec<_>>());
+        // Core substrate + app fact types are NOT (they aren't domain modules).
+        assert!(!domain.iter().any(|id| id.starts_with("Task_")),
+            "app fact types must never appear in the bundled domain set");
     }
 
     /// Build Object state with a single fact type + its roles. Emits

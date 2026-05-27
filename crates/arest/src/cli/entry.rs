@@ -803,6 +803,42 @@ pub fn main_entry() {
                 // InstanceFact → chain-derive, but FT cells themselves
                 // aren't parser-emitted) doesn't lose user data.
                 let state = ast::merge_states(&prior_population, &parsed_fresh);
+                // Tree-shake the UoD (tree-shake-app-uod-to-reachable-closure):
+                // drop bundled-metamodel DOMAIN fact types (ui/os/templates/
+                // compat) the app never reaches — and the relics cor:closure
+                // carried forward — so an app's UoD is its own schema plus the
+                // core substrate, not the whole shared library. Conservative:
+                // ONLY domain-module FTs are eligible, and only when unreached
+                // from the app's own (non-base) fact types; app and core FTs
+                // are always kept. Runs while bootstrap mode is still on so the
+                // domain-module re-parse ids match `parsed_fresh`.
+                let state = {
+                    let ft_ids = |st: &ast::Object| -> hashbrown::HashSet<String> {
+                        ast::fetch_cell_seq("FactType", st).as_seq()
+                            .map(|fs| fs.iter()
+                                .filter_map(|f| ast::binding(f, "id").map(|s| s.to_string()))
+                                .collect())
+                            .unwrap_or_default()
+                    };
+                    let all_ft_ids = ft_ids(&state);
+                    let base_ft_ids = ft_ids(crate::metamodel_state());
+                    let domain_ft_ids = crate::compile::bundled_domain_fact_type_ids();
+                    // App roots = fact types the app itself declares (not base).
+                    let roots: hashbrown::HashSet<String> =
+                        all_ft_ids.difference(&base_ft_ids).cloned().collect();
+                    let idx = crate::compile::cell_index_from_state(&state);
+                    let reachable = crate::compile::reachable_fact_types(&idx, &roots);
+                    let keep: hashbrown::HashSet<String> = all_ft_ids.iter()
+                        .filter(|id| !domain_ft_ids.contains(*id) || reachable.contains(*id))
+                        .cloned()
+                        .collect();
+                    let pruned = all_ft_ids.len().saturating_sub(keep.len());
+                    if pruned > 0 {
+                        eprintln!("[load] tree-shake: pruned {} unreached domain fact \
+                                   types ({} of {} kept)", pruned, keep.len(), all_ft_ids.len());
+                    }
+                    crate::compile::prune_unreachable_fact_types(&state, &keep)
+                };
                 parse_forml2::set_bootstrap_mode(false);
                 parse_forml2::set_strict_mode(false);
 
