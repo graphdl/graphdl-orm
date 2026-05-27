@@ -131,6 +131,25 @@ fn is_protected_metamodel(cell: &str) -> bool {
         || PROTECTED_METAMODEL_PREFIXES.iter().any(|p| cell.starts_with(p))
 }
 
+/// compile-gc-orphaned-derived-facts: a cell carried forward by cor:closure is
+/// an orphan relic when (a) its name is NOT a declared FactType id in the fresh
+/// parse, (b) it is not a protected metamodel cell, and (c) its contents are
+/// FT-population-shaped. That is the population of a fact type / derivation rule
+/// that was DELETED from the readings (e.g. `Task_has_Task_Readiness` after its
+/// derivation rule was removed) which cor:closure would otherwise re-preserve
+/// every recompile. Declared-FT populations (durable runtime data) and
+/// non-population cells are never orphans. Also subsumes casing-skew duplicates:
+/// the non-canonical name (`Task_has_Task Readiness`) is not a declared FT id.
+pub(crate) fn is_orphan_population_cell(
+    name: &str,
+    contents: &crate::ast::Object,
+    declared_ft_ids: &hashbrown::HashSet<String>,
+) -> bool {
+    !declared_ft_ids.contains(name)
+        && !is_protected_metamodel(name)
+        && crate::ast::looks_like_population_cell(contents)
+}
+
 /// True when a store to `cell` is permitted by the current capability
 /// frame. Decision lattice (top to bottom, first match wins):
 ///   1. Empty stack + strict OFF → system mode, unrestricted (legacy).
@@ -723,6 +742,40 @@ mod tests {
             result, Object::Bottom,
             "protected metamodel cell 'Noun' must not be writable from user scope even if declared"
         );
+    }
+
+    /// compile-gc-orphaned-derived-facts: the orphan predicate drops a
+    /// carried-forward population whose FactType is no longer declared (the live
+    /// Task_has_Task_Readiness relic after its derivation rule was removed) and
+    /// its casing-skew duplicate, while preserving declared-FT runtime data,
+    /// protected metamodel cells, and non-population shapes.
+    #[test]
+    fn is_orphan_population_cell_drops_undeclared_ft_keeps_declared_and_metamodel() {
+        use crate::ast::Object;
+        let pop = Object::seq(vec![
+            Object::seq(vec![
+                Object::seq(vec![Object::atom("Task"), Object::atom("597")]),
+                Object::seq(vec![Object::atom("Task Readiness"), Object::atom("ready")]),
+            ]),
+        ]);
+        let declared: hashbrown::HashSet<String> =
+            ["Task_has_Task_Subject".to_string()].into_iter().collect();
+
+        // Undeclared FT population (derivation rule deleted) → orphan, GC it.
+        assert!(is_orphan_population_cell("Task_has_Task_Readiness", &pop, &declared),
+            "undeclared FT-population cell is an orphan");
+        // Casing-skew duplicate (non-canonical name, also undeclared) → orphan.
+        assert!(is_orphan_population_cell("Task_has_Task Readiness", &pop, &declared),
+            "casing-skew duplicate name is also an orphan");
+        // Declared FT population → durable runtime data, never an orphan.
+        assert!(!is_orphan_population_cell("Task_has_Task_Subject", &pop, &declared),
+            "declared-FT population is durable user data, not an orphan");
+        // Protected metamodel cell → never GC'd, even if FT-shaped + undeclared.
+        assert!(!is_orphan_population_cell("FactType", &pop, &declared),
+            "protected metamodel cell is never an orphan");
+        // Non-population shape → never an orphan.
+        assert!(!is_orphan_population_cell("WhateverCell", &Object::atom("x"), &declared),
+            "non-population cell is never an orphan");
     }
 
     /// `"*"` wildcard marks a system/compile-machinery scope — those

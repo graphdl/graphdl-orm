@@ -4992,6 +4992,31 @@ fn has_nonempty_subject(f: &Object) -> bool {
     }
 }
 
+/// compile-gc-orphaned-derived-facts: true when a cell's contents look like a
+/// fact-type POPULATION — a `Seq` (or hash-keyed `Map`) carrying at least one
+/// elementary fact, where a fact is a `Seq` of `<role, value>` pairs (each pair
+/// a 2-element `Seq` whose first element is an atom role name). cor:closure uses
+/// this to distinguish a carried-forward FT population (an orphan to drop when
+/// its FactType is no longer declared) from a non-population cell (always kept).
+/// Conservative: at least one fact-shaped row must be present, so empty cells
+/// and non-`<role,value>`-shaped cells are NOT treated as populations.
+pub(crate) fn looks_like_population_cell(contents: &Object) -> bool {
+    fn is_fact(o: &Object) -> bool {
+        match o.as_seq() {
+            Some(pairs) => !pairs.is_empty() && pairs.iter().all(|p|
+                matches!(p.as_seq(), Some(kv) if kv.len() == 2 && kv[0].as_atom().is_some())),
+            None => false,
+        }
+    }
+    if let Some(m) = contents.as_map() {
+        return m.values().any(is_fact);
+    }
+    if let Some(items) = contents.as_seq() {
+        return items.iter().any(is_fact);
+    }
+    false
+}
+
 /// Diff two cell stores: return an Object::Map containing only cells
 /// whose contents differ between `old` and `new`. Cells present in
 /// `new` but absent from `old` are included. Cells present only in
@@ -5820,6 +5845,35 @@ mod tests {
         let rows3 = rows3.as_seq().expect("seq");
         assert_eq!(rows3.len(), 1, "missing-subject-role relic dropped; got {:?}", rows3);
         assert_eq!(rows3[0], valid);
+    }
+
+    #[test]
+    fn looks_like_population_cell_detects_ft_facts() {
+        // The live Task_has_Task_Readiness orphan shape: Seq of <role,value>-pair facts.
+        let readiness = Object::seq(vec![
+            Object::seq(vec![
+                Object::seq(vec![Object::atom("Task"), Object::atom("597")]),
+                Object::seq(vec![Object::atom("Task Readiness"), Object::atom("ready")]),
+            ]),
+        ]);
+        assert!(looks_like_population_cell(&readiness),
+            "Seq of <role,value>-pair facts is a population cell");
+
+        // Hash-keyed Map layout (latest-wins fold) — the underscore-form orphan.
+        let mut m: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        m.insert("597".to_string(), Object::seq(vec![
+            Object::seq(vec![Object::atom("Task"), Object::atom("597")]),
+            Object::seq(vec![Object::atom("Task Readiness"), Object::atom("ready")]),
+        ]));
+        assert!(looks_like_population_cell(&Object::map(m)),
+            "Map of key->fact is a population cell");
+
+        // Non-population shapes are NOT populations (conservative — never GC'd).
+        assert!(!looks_like_population_cell(&Object::atom("x")), "atom is not a population");
+        assert!(!looks_like_population_cell(&Object::seq(vec![])), "empty seq has no facts");
+        assert!(!looks_like_population_cell(
+            &Object::seq(vec![Object::atom("a"), Object::atom("b")])),
+            "seq of bare atoms (not <role,value> pairs) is not a population");
     }
 
     // ── Object construction ──────────────────────────────────────
