@@ -1207,7 +1207,7 @@ pub(crate) fn try_expand_possessive(text: &str, noun_names: &[String]) -> Option
 /// Resolve a derivation rule's text into structured fact type references.
 ///
 /// Splits on " if "/" iff " to get consequent and antecedent parts,
-/// then matches each part's nouns against ir.fact_types by role noun names.
+/// then matches each part's nouns against fact_types_map by role noun names.
 /// Anaphoric "that X" references are stripped to bare noun name "X".
 ///
 /// Per-antecedent inline numeric comparisons (Halpin FORML Example 5) are
@@ -1238,15 +1238,8 @@ fn resolve_derivation_rule(
     // the materialization field arrives via the DR cell deserialize path
     // in compile::cell_index_from_state.
 
-    // Shim: old code paths referred to `ir.nouns` / `ir.fact_types`.
-    // Rebind so the body below compiles unchanged.
-    struct IrShim<'a> {
-        nouns: &'a HashMap<String, NounDef>,
-        fact_types: &'a HashMap<String, FactTypeDef>,
-    }
-    let ir = IrShim { nouns: nouns_map, fact_types: fact_types_map };
     // Longest-first noun list for Theorem 1 matching
-    let mut noun_names: Vec<String> = ir.nouns.keys().cloned().collect();
+    let mut noun_names: Vec<String> = nouns_map.keys().cloned().collect();
     noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
 
     // #914 — Pre-pass: extract cross-antecedent role-vs-role value
@@ -1468,7 +1461,7 @@ fn resolve_derivation_rule(
     rule.consequent_cell = crate::types::ConsequentCellSource::Literal(resolved_consequent);
     if let Some(lit) = consequent_trailing_literal {
         if !rule.consequent_cell.is_empty_literal() {
-            let role = ir.fact_types.get(rule.consequent_cell.literal_id())
+            let role = fact_types_map.get(rule.consequent_cell.literal_id())
                 .and_then(|ft| ft.roles.last())
                 .map(|r| r.noun_name.clone())
                 .unwrap_or_default();
@@ -1509,7 +1502,7 @@ fn resolve_derivation_rule(
             let (stripped, _) = split_antecedent_comparator(&where_clause);
             if let Some(ft_id) = resolve_fact_type(&stripped) {
                 // Group-key role = any role on source FT other than target.
-                let group_key_role = ir.fact_types.get(&ft_id)
+                let group_key_role = fact_types_map.get(&ft_id)
                     .and_then(|ft| ft.roles.iter().find(|r| r.noun_name != target))
                     .map(|r| r.noun_name.clone())
                     .unwrap_or_default();
@@ -1572,7 +1565,7 @@ fn resolve_derivation_rule(
 
         if let Some(ft_id) = ft_resolved {
             if let Some((op, value)) = comparator.clone() {
-                let role = ir.fact_types.get(&ft_id)
+                let role = fact_types_map.get(&ft_id)
                     .and_then(|ft| ft.roles.last())
                     .map(|r| r.noun_name.clone())
                     .unwrap_or_default();
@@ -1582,7 +1575,7 @@ fn resolve_derivation_rule(
                 });
             }
             if let Some(lit) = trailing_literal.clone() {
-                let role = ir.fact_types.get(&ft_id)
+                let role = fact_types_map.get(&ft_id)
                     .and_then(|ft| ft.roles.last())
                     .map(|r| r.noun_name.clone())
                     .unwrap_or_default();
@@ -1808,7 +1801,7 @@ fn resolve_derivation_rule(
                 let src = rule.antecedent_sources.get(i)?;
                 let ft_id = src.fact_type_id();
                 if ft_id.is_empty() { continue; }
-                let ft = ir.fact_types.get(ft_id)?;
+                let ft = fact_types_map.get(ft_id)?;
                 if ft.roles.iter().any(|r| r.noun_name == role) {
                     return Some(i);
                 }
@@ -1872,11 +1865,11 @@ fn resolve_derivation_rule(
         for src in rule.antecedent_sources.iter() {
             let ft_id = src.fact_type_id();
             if ft_id.is_empty() { continue; }
-            let Some(ft) = ir.fact_types.get(ft_id) else { continue; };
+            let Some(ft) = fact_types_map.get(ft_id) else { continue; };
             for r in ft.roles.iter() {
                 if comparison_roles.contains(&r.noun_name) { continue; }
                 let appears = rule.antecedent_sources.iter()
-                    .filter_map(|s| ir.fact_types.get(s.fact_type_id()))
+                    .filter_map(|s| fact_types_map.get(s.fact_type_id()))
                     .filter(|ft| ft.roles.iter().any(|rr| rr.noun_name == r.noun_name))
                     .count();
                 if appears < 2 { continue; }
@@ -1912,7 +1905,7 @@ fn resolve_derivation_rule(
             rule.antecedent_sources.iter()
                 .filter_map(|s| {
                     let ft_id = s.fact_type_id();
-                    if ft_id.is_empty() { None } else { ir.fact_types.get(ft_id) }
+                    if ft_id.is_empty() { None } else { fact_types_map.get(ft_id) }
                 })
                 .filter(|ft| ft.roles.iter().any(|r| r.noun_name == *key))
                 .count() >= 2
@@ -1924,7 +1917,7 @@ fn resolve_derivation_rule(
             .map(|key| (key.clone(), key.clone()))
             .collect();
         // Consequent bindings: nouns from the consequent fact type
-        rule.consequent_bindings = ir.fact_types.get(rule.consequent_cell.literal_id())
+        rule.consequent_bindings = fact_types_map.get(rule.consequent_cell.literal_id())
             .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
             .unwrap_or_default();
     });
@@ -1945,7 +1938,7 @@ fn resolve_derivation_rule(
             &resolved_part_text,
             rule.consequent_cell.literal_id(),
             &noun_names,
-            ir.fact_types,
+            fact_types_map,
             &rule.consequent_role_literals,
         ) {
             rule.kind = DerivationKind::Join;
@@ -2105,7 +2098,7 @@ fn compute_ring_join_plan(
 
 
 /// #283 — Every fact-type id in the `FactType` cell. Replaces
-/// `ir.fact_types.keys()`. Test-only helper.
+/// `fact_types_map.keys()`. Test-only helper.
 #[cfg(test)]
 fn fact_type_ids(
     cells: &HashMap<String, Vec<crate::ast::Object>>,
