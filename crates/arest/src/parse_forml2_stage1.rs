@@ -256,6 +256,24 @@ pub fn tokenize_statement_with_buckets(statement_id: &str, text: &str, buckets: 
     tokenize_statement_with_buckets_vocab(statement_id, text, buckets, &Vocab::boot())
 }
 
+/// task-919: extract the subject noun of an entity/value-type declaration —
+/// the phrase before `is an entity type` / `is a value type`. Returns None
+/// when `body` isn't such a declaration. Reference-scheme parens are already
+/// stripped from `body` at the call site, but strip defensively here too so
+/// the helper is correct for any caller.
+fn declaration_subject_noun(body: &str) -> Option<String> {
+    let b = body.trim().trim_end_matches('.').trim_end();
+    for suffix in [" is an entity type", " is a value type"] {
+        if let Some(subj) = b.strip_suffix(suffix) {
+            let subj = subj.split('(').next().unwrap_or(subj).trim();
+            if !subj.is_empty() {
+                return Some(subj.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Vocab-aware tokenizer (#712 / MC1). Stage-2's per-line loop calls
 /// this with a `Vocab` distilled from the cached grammar state's
 /// EnumValues cell, so token recognition follows the readings.
@@ -304,7 +322,15 @@ pub fn tokenize_statement_with_buckets_vocab(
     let role_refs = match_role_references(body, buckets);
 
     // 4. Head Noun + Verb derivation from role refs.
-    let head_noun = role_refs.first().map(|r| r.noun.clone());
+    // task-919: an entity/value-type DECLARATION introduces its subject noun.
+    // That noun isn't in the declared-noun buckets yet, and its trailing word
+    // can collide with an already-declared noun (`Platform Function` vs the
+    // declared `Function`) — so longest-first role matching would pick the
+    // suffix noun as the head, and the new multi-word noun never registers.
+    // For a declaration the head noun is the literal subject phrase before
+    // `is a(n) … type`, not the first matched role ref.
+    let head_noun = declaration_subject_noun(body)
+        .or_else(|| role_refs.first().map(|r| r.noun.clone()));
     let mut verb = extract_verb(body, &role_refs);
 
     // 5. Trailing Marker.
@@ -903,6 +929,22 @@ mod tests {
                    Some("is an entity type"));
         assert_eq!(stmt_binding(&c, "Statement_has_Text", "Text").as_deref(),
                    Some("Customer is an entity type"));
+    }
+
+    #[test]
+    fn multiword_entity_declaration_head_noun_is_full_subject_not_declared_suffix() {
+        // task-919: declaring `Platform Function` while `Function` is ALREADY a
+        // declared noun must register the full multi-word subject as the head
+        // noun. Longest-first role matching over the body would otherwise pick
+        // the declared suffix `Function` (the noun being introduced isn't in
+        // the buckets yet), so the new noun never registers.
+        let c = tokenize_statement("s1", "Platform Function(.Name) is an entity type.",
+                                   &nouns(&["Function"]));
+        assert_eq!(stmt_binding(&c, "Statement_has_Head_Noun", "Head_Noun").as_deref(),
+                   Some("Platform Function"),
+                   "the multi-word subject, not the declared suffix noun");
+        assert_eq!(stmt_binding(&c, "Statement_has_Trailing_Marker", "Trailing_Marker").as_deref(),
+                   Some("is an entity type"));
     }
 
     #[test]
