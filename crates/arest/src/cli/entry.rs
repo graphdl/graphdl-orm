@@ -1146,10 +1146,16 @@ pub fn main_entry() {
                             .unwrap_or_default();
                     let map: hashbrown::HashMap<String, ast::Object> =
                         ast::cells_iter(&d).into_iter()
+                            // compile-gc-orphaned-derived-facts (duplicated half):
+                            // dedup identity-equal facts before persist so asserted
+                            // cells (Task_is_epic et al.) don't accrue one copy per
+                            // recompile. ':' meta/view cells regenerate from data
+                            // cells, so leave them untouched.
                             .map(|(name, contents)| if ft_ids.contains(name) {
-                                (name.to_string(), ast::drop_subjectless_facts_with_arity(contents, ft_arity.get(name).copied()))
+                                (name.to_string(), ast::dedup_cell_facts(
+                                    &ast::drop_subjectless_facts_with_arity(contents, ft_arity.get(name).copied())))
                             } else if !name.contains(':') {
-                                (name.to_string(), ast::drop_empty_subject_facts(contents))
+                                (name.to_string(), ast::dedup_cell_facts(&ast::drop_empty_subject_facts(contents)))
                             } else {
                                 (name.to_string(), contents.clone())
                             })

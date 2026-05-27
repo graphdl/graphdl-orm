@@ -4856,11 +4856,21 @@ fn same_identity(a: &Object, b: &Object) -> bool {
     false
 }
 
-/// task-956: canonicalize the φ representation so the fan-out's
-/// `Object::Atom("φ")` and the parse/round-trip's `Object::phi()` (empty Seq)
-/// compare equal. Recurses into Seq facts/pairs; other values pass through.
+/// task-956 + compile-gc-orphaned-derived-facts: canonicalize the empty/absent
+/// representations of a (unary) predicate's object slot so they compare equal
+/// for fact IDENTITY. The same logical fact reaches the cell store in three
+/// encodings depending on the write path: `Object::Atom("φ")` (the fan-out's
+/// literal token), `Object::phi()` (empty Seq, after a SQLite round-trip where
+/// the parser turns the φ token back into an empty Seq), and `Object::Atom("")`
+/// (a blank from the apply/SM write path — the task-932 write-path duality).
+/// All three denote "no object"; canonicalizing them to phi() makes
+/// re-assertion idempotent regardless of encoding, so the same fact dedups
+/// instead of accruing a copy per recompile (the Task_is_epic / Task_is_finished
+/// bloat). This only affects fact identity (same_identity, dedup) — never a
+/// stored value — and a fact differing by a REAL binding (id/name/value) still
+/// canonicalizes distinctly. Recurses into Seq facts/pairs; others pass through.
 fn canon_phi(o: &Object) -> Object {
-    if o.as_atom() == Some("φ") { return Object::phi(); }
+    if matches!(o.as_atom(), Some("φ") | Some("")) { return Object::phi(); }
     match o {
         Object::Seq(items) => Object::seq(items.iter().map(canon_phi).collect()),
         _ => o.clone(),
@@ -5015,6 +5025,34 @@ pub(crate) fn looks_like_population_cell(contents: &Object) -> bool {
         return items.iter().any(is_fact);
     }
     false
+}
+
+/// compile-gc-orphaned-derived-facts (duplicated half): collapse
+/// structurally-equal duplicate facts within a `Seq` cell, preserving
+/// first-occurrence order. cor:closure carries asserted-fact cells forward
+/// across recompiles, and `concat_dedup` only dedups the incoming side
+/// against the accumulator — never the accumulator's OWN internal dups — so
+/// a cell like `Task_is_epic` accrues one extra identity-equal copy per
+/// recompile (312 bindings for 8 distinct tasks observed live), bloating the
+/// persisted cell without bound. Running this over the final state before
+/// persist breaks the cycle: the stored cell is always dup-free, so the next
+/// recompile loads a clean prior. O(n) via a canonical-form hash set (`{:?}`
+/// over the φ-canonicalized fact). Non-`Seq` contents (hash-keyed Map cells
+/// are already dup-free by construction) pass through unchanged. Returns the
+/// input clone untouched when there were no duplicates.
+pub(crate) fn dedup_cell_facts(contents: &Object) -> Object {
+    let Some(items) = contents.as_seq() else { return contents.clone(); };
+    let mut seen: hashbrown::HashSet<alloc::string::String> = hashbrown::HashSet::new();
+    let mut out: alloc::vec::Vec<Object> = alloc::vec::Vec::with_capacity(items.len());
+    for item in items {
+        if seen.insert(alloc::format!("{:?}", canon_phi(item))) {
+            out.push(item.clone());
+        }
+    }
+    if out.len() == items.len() {
+        return contents.clone();
+    }
+    Object::seq(out)
 }
 
 /// Diff two cell stores: return an Object::Map containing only cells
@@ -5874,6 +5912,37 @@ mod tests {
         assert!(!looks_like_population_cell(
             &Object::seq(vec![Object::atom("a"), Object::atom("b")])),
             "seq of bare atoms (not <role,value> pairs) is not a population");
+    }
+
+    #[test]
+    fn dedup_cell_facts_collapses_structural_duplicates() {
+        // Task_is_epic shape: unary <<Task, id>> facts; cor:closure had been
+        // accruing one identity-equal copy per recompile.
+        let fact = |t: &str| Object::seq(vec![
+            Object::seq(vec![Object::atom("Task"), Object::atom(t)]),
+        ]);
+        let cell = Object::seq(vec![fact("772"), fact("772"), fact("773"), fact("772")]);
+        let rows = dedup_cell_facts(&cell);
+        let rows = rows.as_seq().expect("seq");
+        assert_eq!(rows.len(), 2, "collapsed to 2 distinct facts; got {:?}", rows);
+        assert_eq!(rows[0], fact("772"), "first-occurrence order preserved");
+        assert_eq!(rows[1], fact("773"));
+
+        // Already-distinct cell returns unchanged.
+        let distinct = Object::seq(vec![fact("a"), fact("b")]);
+        assert_eq!(dedup_cell_facts(&distinct), distinct);
+
+        // The live Task_is_epic root: the unary predicate's empty object slot
+        // is written as Atom("φ") by one path and Atom("") by another. Both
+        // denote "no object", so canon_phi unifies them and the SAME fact
+        // dedups to one — this is what makes re-assertion idempotent.
+        let epic = |v: &str| Object::seq(vec![
+            Object::seq(vec![Object::atom("Task"), Object::atom("9")]),
+            Object::seq(vec![Object::atom("Task_is_epic"), Object::atom(v)]),
+        ]);
+        let dual = Object::seq(vec![epic("φ"), epic("")]);
+        assert_eq!(dedup_cell_facts(&dual).as_seq().expect("seq").len(), 1,
+            "φ-token and empty-string encodings of the same unary fact collapse to one");
     }
 
     // ── Object construction ──────────────────────────────────────
