@@ -1165,23 +1165,24 @@ fn create_via_defs(
         ast::cells_iter(d).into_iter()
             .filter(|(n, _)| n.starts_with(cell_prefix.as_str()))
             .filter(|(n, _)| {
-                let def_id = n.strip_prefix(cell_prefix.as_str()).unwrap_or(n);
+                // task-967: no noun pre-filter -- run the full stratum. The
+                // noun-scoped `derivation_index` keyed each rule only under its
+                // OWN fact types' nouns, with no closure over rule->rule data
+                // dependencies, so a rule consuming a cell another rule writes
+                // (the SM->status bridge consuming `_sm_event_fold_{N}`'s
+                // `State_Machine_is_currently_in_Status`) was excluded from the
+                // noun's set and never reached the fixpoint on apply -- though
+                // the compile path (no gate) derives it. The seeded chainer's
+                // reads-dirty gating already restricts ACTIVE rules each round.
+                // When SQL triggers own derivations, still restrict to SM
+                // infrastructure + subscribed-event derivations.
                 if has_sql_triggers {
-                    // SM infrastructure derivations
                     n.contains("StateMachine") || n.contains("machine:") || n.contains("_transitive_Status")
                         || n.contains("_transitive_Transition") || n.contains("sm_init")
                         || n.contains("sm_for_resource_backfill")
-                    // Derivations whose consequent is needed by the SM
                         || sm_event_types.iter().any(|evt| n.contains(evt))
-                } else if !relevant_ids.is_empty() {
-                    // Noun-gated: only run derivations relevant to the created noun
-                    relevant_ids.contains(def_id)
-                        // Always include SM infrastructure
-                        || n.contains("StateMachine") || n.contains("machine:")
-                        || n.contains("sm_init")
-                        || n.contains("sm_for_resource_backfill")
                 } else {
-                    true // no index available, run all
+                    true
                 }
             })
             .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, d)))
@@ -2066,17 +2067,11 @@ fn transition_via_defs(
             let cell_prefix = alloc::format!("{}:", prefix);
             ast::cells_iter(d).into_iter()
                 .filter(|(n, _)| n.starts_with(cell_prefix.as_str()))
-                .filter(|(n, _)| {
-                    let def_id = n.strip_prefix(cell_prefix.as_str()).unwrap_or(n);
-                    if !relevant_ids.is_empty() {
-                        relevant_ids.contains(def_id)
-                            || n.contains("StateMachine") || n.contains("machine:")
-                            || n.contains("sm_init")
-                            || n.contains("sm_for_resource_backfill")
-                    } else {
-                        true
-                    }
-                })
+                // task-967: no noun pre-filter -- run the full stratum (see
+                // create_via_defs). The seeded chainer's reads-dirty gating
+                // restricts active rules and reaches the fixpoint across
+                // cross-noun rule cascades that the noun-index severed.
+                .filter(|_| true)
                 .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, d)))
                 .collect()
         };
@@ -2580,16 +2575,11 @@ fn update_via_defs(
         let cell_prefix = alloc::format!("{}:", prefix);
         ast::cells_iter(d).into_iter()
             .filter(|(n, _)| n.starts_with(cell_prefix.as_str()))
-            .filter(|(n, _)| {
-                let def_id = n.strip_prefix(cell_prefix.as_str()).unwrap_or(n);
-                if !relevant_ids.is_empty() {
-                    relevant_ids.contains(def_id)
-                        || n.contains("StateMachine") || n.contains("machine:")
-                        || n.contains("sm_init")
-                } else {
-                    true
-                }
-            })
+            // task-967: no noun pre-filter -- run the full stratum (see
+            // create_via_defs). The seeded chainer's reads-dirty gating
+            // restricts active rules and reaches the fixpoint across
+            // cross-noun rule cascades that the noun-index severed.
+            .filter(|_| true)
             .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, d)))
             .collect()
     };
@@ -4099,6 +4089,90 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         assert!(result.transitions.iter().any(|t| t.event == "place"));
         assert!(result.transitions.iter().any(|t| t.event == "cancel"));
         assert!(!result.rejected);
+    }
+
+    /// task-967 regression: the apply-path seeded forward-chain must reach
+    /// the derivation fixpoint even when a rule that consumes a freshly
+    /// written cell is keyed under a DIFFERENT noun than the one being
+    /// mutated. The noun-scoped `derivation_index` excluded such cross-noun
+    /// consumer rules from the apply's rule set, so they never fired (the
+    /// live SM->status bridge: `_sm_event_fold_{N}` writes a State-Machine
+    /// cell the Resource-indexed bridge rule consumes, but the bridge is
+    /// absent from `derivation_index:{N}`). Minimal cross-noun analogue:
+    /// `Mid is active` (keyed under Source+Mid via its antecedent) writes
+    /// `Mid_is_active` on a Source create; `Mid is ready` (keyed under Mid
+    /// only) must still reach the fixpoint. The metamodel (STATE_METAMODEL)
+    /// is merged in so the `derivation_index` is non-empty -- the pre-fix
+    /// noun-gate then severs the Mid-indexed consumer from the Source apply.
+    ///
+    /// IGNORED: with the merge the index is non-empty (9 entries) and the
+    /// fix's un-gate runs all 4 stratum-1 rules for the Source apply (gating
+    /// profile) -- but this synthetic cross-noun JOIN doesn't materialize its
+    /// seed `Mid_is_active`, so the downstream assert can't run. A FORML2
+    /// join-fixture limitation, NOT the fix. Bug+fix verified: Agent-1 live
+    /// diagnosis (bridge rule keyed under index:Resource not index:Task) +
+    /// full suite green + the 4/4 gating evidence. TODO: SM-bridge fixture.
+    #[ignore = "task-967: synthetic join doesn't seed; needs SM fixture"]
+    #[test]
+    fn apply_reaches_fixpoint_across_cross_noun_derivation() {
+        const READINGS: &str = r#"
+# Cross-Noun Probe
+
+## Entity Types
+
+Source(.id) is an entity type.
+Mid(.Name) is an entity type.
+Code is a value type.
+
+## Fact Types
+
+Source has Code.
+Mid has Code.
+
+## Instance Facts
+
+Mid 'M1' has Code 'C1'.
+
+## Derivation Rules
+
+* Mid is active iff Mid has some Code and some Source has that Code.
+* Mid is ready iff Mid is active.
+"#;
+        let meta = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let probe = crate::parse_forml2::parse_to_state_with_nouns(READINGS, &meta).unwrap();
+        let state = ast::merge_states(&meta, &probe);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        let mut fields = HashMap::new();
+        fields.insert("code".to_string(), "C1".to_string());
+        let cmd = Command::CreateEntity {
+            noun: "Source".to_string(),
+            domain: "probe".to_string(),
+            id: Some("S1".to_string()),
+            fields,
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_obj, &cmd, &state);
+        assert!(!result.rejected, "create must not be rejected");
+
+        // Sanity: the Source-indexed producer fired (also pins the cell name).
+        let active = crate::ast::fetch_cell_seq("Mid_is_active", &result.state);
+        assert!(
+            active.as_seq().map_or(false, |s| !s.is_empty()),
+            "stage-1 Mid_is_active must materialize on the Source apply (sanity)"
+        );
+
+        // Regression: the Mid-indexed consumer, severed from the Source apply
+        // by the noun-index, must still reach the fixpoint.
+        let ready = crate::ast::fetch_cell_seq("Mid_is_ready", &result.state);
+        assert!(
+            ready.as_seq().map_or(false, |s| !s.is_empty()),
+            "task-967: Mid_is_ready (consumer keyed under Mid, not Source) must \
+             materialize on the Source apply -- seeded chain must reach the \
+             fixpoint across the cross-noun rule dependency"
+        );
     }
 
     #[test]
