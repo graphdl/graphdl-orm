@@ -20,6 +20,8 @@ State Machine Definition is for Noun.
 ### Status
 Verb is performed in Status.
   Each Verb is performed in at most one Status.
+Status has HTTP Method.
+  Each Status has at most one HTTP Method.
 
 ### Transition
 Transition is defined in State Machine Definition.
@@ -134,3 +136,9 @@ If some Status is initial in some State Machine Definition then that Status is d
 ## Instance Facts
 
 Domain 'state' has Access 'public'.
+
+<!-- task-965: the HATEOAS destructive-affordance rule, lifted from a Rust
+     literal (command.rs http_method_for_status) into a reading. A transition
+     whose target Status has a declared HTTP Method surfaces with that method;
+     all others default to GET. -->
+Status 'deleted' has HTTP Method 'DELETE'.

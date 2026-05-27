@@ -3568,10 +3568,10 @@ fn hateoas_via_rho(
             // Event is embedded in the URL as a query param so the link
             // is self-contained — a browser can follow it without
             // synthesising a JSON body.
-            let method = if to == "deleted" { "DELETE" } else { "GET" };
+            let method = http_method_for_status(d, &to);
             let event_encoded = event.replace(' ', "%20");
             Some(TransitionAction {
-                event, target_status: to, method: method.to_string(),
+                event, target_status: to, method,
                 href: format!(
                     "/api/entities/{}/{}/transition?event={}",
                     encoded, entity_id, event_encoded,
@@ -3579,6 +3579,25 @@ fn hateoas_via_rho(
             })
         }).collect()
     }).unwrap_or_default()
+}
+
+/// task-965: HTTP method for a target status, lifted from a Rust literal
+/// (`if to == "deleted" { "DELETE" } else { "GET" }`) to the
+/// `Status has HTTP Method` reading (e.g. `Status 'deleted' has HTTP Method
+/// 'DELETE'` in readings/core/state.md). Defaults to GET when no method is
+/// declared for the status. Keeps the destructive-affordance rule in
+/// readings, not in compiled code (facts-all-the-way-down).
+fn http_method_for_status(d: &ast::Object, status: &str) -> String {
+    ast::fetch_cell_seq("Status_has_HTTP_Method", d)
+        .as_seq()
+        .and_then(|facts| facts.iter().find_map(|f| {
+            if ast::binding(f, "Status") == Some(status) {
+                ast::binding(f, "HTTP Method").map(|m| m.to_string())
+            } else {
+                None
+            }
+        }))
+        .unwrap_or_else(|| "GET".to_string())
 }
 
 /// Theorem 4b: nav(e, n) = children(n) ∪ parent(n).
@@ -4173,6 +4192,21 @@ Mid 'M1' has Code 'C1'.
              materialize on the Source apply -- seeded chain must reach the \
              fixpoint across the cross-noun rule dependency"
         );
+    }
+
+    /// task-965: the destructive-affordance rule (deleted -> DELETE) is read
+    /// from the `Status has HTTP Method` reading, defaulting to GET. This
+    /// keeps the HATEOAS method rule in readings, not a Rust literal.
+    #[test]
+    fn http_method_for_status_lifts_delete_rule_from_reading() {
+        let state = ast::cell_push(
+            "Status_has_HTTP_Method",
+            ast::fact_from_pairs(&[("Status", "deleted"), ("HTTP Method", "DELETE")]),
+            &ast::Object::phi(),
+        );
+        assert_eq!(http_method_for_status(&state, "deleted"), "DELETE");
+        assert_eq!(http_method_for_status(&state, "placed"), "GET");
+        assert_eq!(http_method_for_status(&ast::Object::phi(), "deleted"), "GET");
     }
 
     #[test]
