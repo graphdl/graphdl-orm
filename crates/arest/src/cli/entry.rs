@@ -793,43 +793,19 @@ pub fn main_entry() {
                         .unwrap_or_default();
                 let prior_population: ast::Object = {
                     let loaded = db::load_state(&conn);
-                    // compile-gc-orphaned-derived-facts: cor:closure carries the
-                    // prior population forward so runtime data survives a recompile,
-                    // but with no GC it ALSO re-preserves whole cells whose FactType
-                    // / derivation rule was DELETED from the readings (e.g.
-                    // Task_has_Task_Readiness after its rule was removed — see the
-                    // tasks app.md note). Such a relic is an FT-population-shaped cell
-                    // whose name is no longer a declared FactType id; drop it. Keeps
-                    // declared-FT populations (durable user data), protected metamodel
-                    // cells, and any non-population shape. Also clears casing-skew
-                    // duplicates: the non-canonical name isn't a declared FT id either.
-                    let mut gc_orphans: Vec<String> = Vec::new();
-                    let map: hashbrown::HashMap<String, ast::Object> =
-                        ast::cells_iter(&loaded).into_iter()
-                            .filter(|(name, contents)| {
-                                if name.contains(':') || parsed_cell_names.contains(*name) {
-                                    return false;
-                                }
-                                if crate::declared_writes::is_orphan_population_cell(*name, *contents, &ft_ids) {
-                                    gc_orphans.push((*name).to_string());
-                                    return false;
-                                }
-                                true
-                            })
-                            // cor:closure preserves the population, but with no GC it
-                            // would also carry forward malformed subjectless relics —
-                            // a State_Machine_is_currently_in_Status row whose State
-                            // Machine binding is empty or missing entirely. Drop those.
-                            // Pass declared arity (task-958) so correct shorter rows survive.
-                            .map(|(name, contents)| (name.to_string(),
-                                ast::drop_subjectless_facts_with_arity(contents, ft_arity.get(name).copied())))
-                            .collect();
+                    // compile-gc-orphaned-derived-facts: cor:closure carries the prior
+                    // DB population forward so runtime data survives a recompile; the
+                    // preserve-and-GC logic (drop sidecar `:` / fresh-re-emitted cells +
+                    // orphan relics whose FactType is no longer declared, then scrub
+                    // subjectless rows) lives in ast::preserve_prior_population so it is
+                    // unit-testable rather than buried in this binary-only path.
+                    let (pop, gc_orphans) = ast::preserve_prior_population(
+                        &loaded, &parsed_cell_names, &ft_ids, &ft_arity);
                     if !gc_orphans.is_empty() {
-                        gc_orphans.sort();
                         eprintln!("[load] cor:closure GC: dropped {} orphaned cell(s) whose \
                                    FactType is no longer declared: {:?}", gc_orphans.len(), gc_orphans);
                     }
-                    ast::Object::map(map)
+                    pop
                 };
                 let prior_cell_count = ast::cells_iter(&prior_population).len();
                 if prior_cell_count > 0 {

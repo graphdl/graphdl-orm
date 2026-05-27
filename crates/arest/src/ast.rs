@@ -5055,6 +5055,43 @@ pub(crate) fn dedup_cell_facts(contents: &Object) -> Object {
     Object::seq(out)
 }
 
+/// compile-gc-orphaned-derived-facts: the cor:closure "preserve prior
+/// population" step, extracted from cli/entry.rs's dirs-compile so it is
+/// unit-testable (the binary path is otherwise unreachable from cargo tests).
+/// Carries the prior DB population forward across a recompile so runtime data
+/// survives, while dropping (a) sidecar `:` cells and cells the fresh parse
+/// re-emits (`parsed_cell_names`), and (b) orphan relics whose FactType is no
+/// longer declared (`is_orphan_population_cell`) — then scrubs malformed
+/// subjectless rows from what remains (declared arity per task-958). Returns
+/// the preserved cell map plus the SORTED names of the orphan cells dropped
+/// (for the caller's `[load]` diagnostic). DATA-CRITICAL: a regression here
+/// drops declared-FT runtime data on recompile.
+pub(crate) fn preserve_prior_population(
+    loaded: &Object,
+    parsed_cell_names: &hashbrown::HashSet<String>,
+    declared_ft_ids: &hashbrown::HashSet<String>,
+    ft_arity: &hashbrown::HashMap<String, usize>,
+) -> (Object, Vec<String>) {
+    let mut gc_orphans: Vec<String> = Vec::new();
+    let map: hashbrown::HashMap<String, Object> =
+        cells_iter(loaded).into_iter()
+            .filter(|(name, contents)| {
+                if name.contains(':') || parsed_cell_names.contains(*name) {
+                    return false;
+                }
+                if crate::declared_writes::is_orphan_population_cell(*name, *contents, declared_ft_ids) {
+                    gc_orphans.push((*name).to_string());
+                    return false;
+                }
+                true
+            })
+            .map(|(name, contents)| (name.to_string(),
+                drop_subjectless_facts_with_arity(contents, ft_arity.get(name).copied())))
+            .collect();
+    gc_orphans.sort();
+    (Object::map(map), gc_orphans)
+}
+
 /// Diff two cell stores: return an Object::Map containing only cells
 /// whose contents differ between `old` and `new`. Cells present in
 /// `new` but absent from `old` are included. Cells present only in
@@ -5943,6 +5980,39 @@ mod tests {
         let dual = Object::seq(vec![epic("φ"), epic("")]);
         assert_eq!(dedup_cell_facts(&dual).as_seq().expect("seq").len(), 1,
             "φ-token and empty-string encodings of the same unary fact collapse to one");
+    }
+
+    #[test]
+    fn preserve_prior_population_drops_orphans_keeps_declared_runtime_data() {
+        let fact = |role: &str, subj: &str| Object::seq(vec![
+            Object::seq(vec![Object::atom(role), Object::atom(subj)]),
+        ]);
+        let mut loaded: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        // declared-FT runtime population — DATA-CRITICAL, must survive recompile
+        loaded.insert("Task_has_Task_Subject".to_string(),
+            Object::seq(vec![fact("Task", "772"), fact("Task", "773")]));
+        // orphan: FactType no longer declared (removed-rule relic) — must be GC'd
+        loaded.insert("Task_has_Task_Readiness".to_string(),
+            Object::seq(vec![fact("Task", "772")]));
+        // sidecar ':' view cell — dropped (regenerates from data cells)
+        loaded.insert("derivation_index:Task".to_string(), fact("noun", "Task"));
+        let loaded = Object::map(loaded);
+
+        let declared: hashbrown::HashSet<String> =
+            ["Task_has_Task_Subject".to_string()].into_iter().collect();
+        let parsed: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        let arity: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
+
+        let (pop, gc_orphans) = preserve_prior_population(&loaded, &parsed, &declared, &arity);
+
+        assert_eq!(fetch_cell_seq("Task_has_Task_Subject", &pop).as_seq().map_or(0, |s| s.len()), 2,
+            "declared-FT runtime population must survive recompile (data-critical)");
+        assert!(gc_orphans.contains(&"Task_has_Task_Readiness".to_string()),
+            "an undeclared-FactType relic must be reported as a GC'd orphan");
+        assert_eq!(fetch_cell_seq("Task_has_Task_Readiness", &pop).as_seq().map_or(0, |s| s.len()), 0,
+            "orphan cell dropped from the preserved population");
+        assert_eq!(fetch_cell_seq("derivation_index:Task", &pop).as_seq().map_or(0, |s| s.len()), 0,
+            "':' sidecar cells are not carried forward");
     }
 
     // ── Object construction ──────────────────────────────────────
