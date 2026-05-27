@@ -10194,6 +10194,132 @@ mod schema_tests {
                 .collect::<Vec<_>>());
     }
 
+    /// task-957: minimal repro of the SM->FT bridge re-key (task-922).
+    /// A 1-antecedent ModusPonens rule whose computed bindings RENAME the
+    /// antecedent's roles into a KEYED consequent FT (Resource->Task,
+    /// Status->Task Status), exactly like
+    /// `Task has Task Status iff that Resource is currently in some Status
+    ///  and Task Status is Status and Task is Resource`. The live bridge
+    /// materializes 0; this isolates whether the re-key Func + keyed-cell
+    /// write is the cause (and is the regression gate for the fix).
+    #[test]
+    fn bridge_rekey_modus_ponens_materializes_keyed_consequent() {
+        let src = "\
+            Resource(.id) is an entity type.\n\
+            Task(.id) is an entity type.\n\
+            Status is a value type.\n\
+            Task Status is a value type.\n\
+            Resource has Status.\n\
+            Task has Task Status.\n\
+              Each Task has exactly one Task Status.\n\
+            Resource 'r1' has Status 'pending'.\n\
+            Task has Task Status iff Resource has Status and Task Status is Status and Task is Resource.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+        let refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+            .filter(|(n, _)| n.starts_with("derivation:rule_"))
+            .map(|(n, c)| (n.to_string(), ast::metacompose(c, &d)))
+            .collect();
+        let refs: Vec<(&str, &ast::Func)> = refs_owned.iter()
+            .map(|(n, f)| (n.as_str(), f)).collect();
+        let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+        let cell = ast::fetch_cell_seq("Task_has_Task_Status", &new_d);
+        let n = cell.as_seq().map(|s| s.len()).unwrap_or(0);
+        assert!(n > 0,
+            "bridge re-key must materialize Task_has_Task_Status; got empty. cell={:?}", cell);
+    }
+
+    /// task-957: like the above, but the re-key's antecedent
+    /// (Resource has Status) is itself DERIVED (from base Resource has Raw),
+    /// replicating the real bridge where Resource_is_currently_in_Status is
+    /// derived by stage-1. Isolates whether chaining a re-key rule over a
+    /// DERIVED antecedent through forward_chain_defs_state is the cause of
+    /// the live bridge's 0.
+    #[test]
+    fn bridge_rekey_over_derived_antecedent_materializes() {
+        let src = "\
+            Resource(.id) is an entity type.\n\
+            Task(.id) is an entity type.\n\
+            Raw is a value type.\n\
+            Status is a value type.\n\
+            Task Status is a value type.\n\
+            Resource has Raw.\n\
+            Resource has Status.\n\
+            Task has Task Status.\n\
+              Each Task has exactly one Task Status.\n\
+            Resource 'r1' has Raw 'pending'.\n\
+            Resource has Status iff Resource has Raw and Status is Raw.\n\
+            Task has Task Status iff Resource has Status and Task Status is Status and Task is Resource.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+        let refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+            .filter(|(n, _)| n.starts_with("derivation:rule_"))
+            .map(|(n, c)| (n.to_string(), ast::metacompose(c, &d)))
+            .collect();
+        let refs: Vec<(&str, &ast::Func)> = refs_owned.iter()
+            .map(|(n, f)| (n.as_str(), f)).collect();
+        let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+        // sanity: stage-1 derived the antecedent
+        let ante = ast::fetch_cell_seq("Resource_has_Status", &new_d);
+        let ante_n = ante.as_seq().map(|s| s.len()).unwrap_or(0);
+        let cell = ast::fetch_cell_seq("Task_has_Task_Status", &new_d);
+        let n = cell.as_seq().map(|s| s.len()).unwrap_or(0);
+        assert!(n > 0,
+            "re-key over DERIVED antecedent must materialize Task_has_Task_Status \
+             (chained-derivation); got empty. Resource_has_Status had {} facts; \
+             Task_has_Task_Status cell={:?}", ante_n, cell);
+    }
+
+    /// task-957: closest to the real bridge -- stage-1 is a JOIN producing
+    /// the antecedent (`Resource is currently in Status iff some State
+    /// Machine is for that Resource and that State Machine is currently in
+    /// that Status`), then stage-2 re-keys from it. Discriminates whether
+    /// the live bridge's 0 is the JOIN-output -> re-key interaction
+    /// (engine-fixable) vs purely environmental (cor:closure/#836/tree-shake).
+    #[test]
+    fn bridge_rekey_over_join_derived_antecedent_materializes() {
+        let src = "\
+            Resource(.id) is an entity type.\n\
+            Task(.id) is an entity type.\n\
+            State Machine(.id) is an entity type.\n\
+            Status is a value type.\n\
+            Task Status is a value type.\n\
+            State Machine is for Resource.\n\
+            State Machine is currently in Status.\n\
+            Resource is currently in Status.\n\
+            Task has Task Status.\n\
+              Each Task has exactly one Task Status.\n\
+            State Machine 'sm1' is for Resource 'r1'.\n\
+            State Machine 'sm1' is currently in Status 'pending'.\n\
+            Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.\n\
+            Task has Task Status iff that Resource is currently in some Status and Task Status is Status and Task is Resource.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+        let refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+            .filter(|(n, _)| n.starts_with("derivation:rule_"))
+            .map(|(n, c)| (n.to_string(), ast::metacompose(c, &d)))
+            .collect();
+        let refs: Vec<(&str, &ast::Func)> = refs_owned.iter()
+            .map(|(n, f)| (n.as_str(), f)).collect();
+        let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+        let s1 = ast::fetch_cell_seq("Resource_is_currently_in_Status", &new_d);
+        let s1n = s1.as_seq().map(|s| s.len()).unwrap_or(0);
+        let cell = ast::fetch_cell_seq("Task_has_Task_Status", &new_d);
+        let n = cell.as_seq().map(|s| s.len()).unwrap_or(0);
+        assert!(n > 0,
+            "re-key over JOIN-derived antecedent must materialize Task_has_Task_Status; \
+             got empty. Resource_is_currently_in_Status had {} facts; cell={:?}", s1n, cell);
+    }
+
     /// Single-antecedent ring FT consequent binding: when an
     /// antecedent FT has two roles that share a noun (`Task blocks
     /// Task`), the rule's role subscript (`Task2` vs `Task1`) must
