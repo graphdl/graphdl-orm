@@ -925,9 +925,6 @@ pub fn reconstitute_absorbed_ft(
     // Absorbed FTs only: rmap routes them into an entity cell whose snake
     // name differs from the FT's own snake (self / junction cells route to
     // themselves and keep a real data cell — nothing to reconstitute).
-    let target = rmap_cell_map(state).get(ft_id)?.clone();
-    if target == to_snake(ft_id) { return None; }
-
     // FT roles, ordered by position.
     let role_cell = fetch_cell_seq("Role", state);
     let mut roles: Vec<(usize, String)> = role_cell.as_seq()
@@ -942,9 +939,30 @@ pub fn reconstitute_absorbed_ft(
     roles.sort_by_key(|(p, _)| *p);
     if roles.len() != 2 { return None; }
 
-    // Subject = the absorbing entity (snake(noun) == target); value = the other.
-    let subject_role = roles.iter().find(|(_, n)| to_snake(n) == target)?.1.clone();
-    let value_role = roles.iter().find(|(_, n)| to_snake(n) != target)?.1.clone();
+    // task-962: classify absorption by ROLE OBJECT-TYPE, local to this
+    // up-FILE projection (NOT via rmap_cell_map, whose classification drives
+    // routing -- changing it there regresses MC/deontic/ring tests). A binary
+    // FT is RMAP-absorbed into an entity cell (no own data cell) precisely when
+    // exactly one role is VALUE-typed -- the dependent value, e.g. `Object
+    // Type` in `Noun has Object Type` -- and the other is entity-typed (the
+    // subject). Both-entity FTs are NOT folded this way: entity rings
+    // (`Task blocks Task`) and entity-valued functional FTs (`Order was placed
+    // by Customer`). Reconstituting those fabricates tuples that break
+    // MC/deontic/ring checks, so return None. (A single-role-UC gate was
+    // over-broad: it fired for entity-valued functional FTs too.)
+    let value_nouns: HashSet<String> = fetch_cell_seq("Noun", state).as_seq()
+        .map(|ns| ns.iter()
+            .filter(|f| binding(f, "objectType") == Some("value"))
+            .filter_map(|f| binding(f, "name").map(|s| s.to_string()))
+            .collect())
+        .unwrap_or_default();
+    let value_roles: Vec<&(usize, String)> =
+        roles.iter().filter(|(_, n)| value_nouns.contains(n)).collect();
+    let entity_roles: Vec<&(usize, String)> =
+        roles.iter().filter(|(_, n)| !value_nouns.contains(n)).collect();
+    if value_roles.len() != 1 || entity_roles.len() != 1 { return None; }
+    let value_role = value_roles[0].1.clone();
+    let subject_role = entity_roles[0].1.clone();
 
     // The absorbing cell is the subject entity type's registry cell, named
     // for the subject role's noun (metamodel regime — e.g. the `Noun` cell).
@@ -967,6 +985,13 @@ pub fn reconstitute_absorbed_ft(
             (value_role.as_str(), val.as_str()),
         ]))
         .collect();
+    // task-962: an empty projection means the FT is NOT actually folded into
+    // the subject cell (e.g. a value-typed FT that keeps its OWN data cell) --
+    // return None so callers fall back to the FT's own cell rather than
+    // SHADOWING it with an empty reconstitution (which masked an SS subset
+    // violation: `resolve_view` used the empty result instead of the real
+    // ft_has_note cell). Folded metamodel FTs project a non-empty set.
+    if facts.is_empty() { return None; }
     Some(Object::seq(facts))
 }
 
@@ -1200,7 +1225,7 @@ mod tests {
         // project it back out of the Noun registry into elementary
         // <<Noun,id>,<Object Type,val>> tuples (the up-FILE direction).
         let state = make_state(
-            vec![("Task", "entity"), ("Order", "entity")],
+            vec![("Task", "entity"), ("Order", "entity"), ("Object Type", "value")],
             vec![("Noun_has_Object_Type", "Noun has Object Type",
                   vec![("Noun", 0), ("Object Type", 1)])],
             vec![("UC", vec![("Noun_has_Object_Type", 1)])],
@@ -1208,12 +1233,32 @@ mod tests {
         let out = reconstitute_absorbed_ft(&state, "Noun_has_Object_Type")
             .expect("absorbed FT should reconstitute");
         let facts = out.as_seq().expect("seq of tuples");
-        assert_eq!(facts.len(), 2, "one tuple per Noun (Task, Order)");
-        // Sorted by subject id: Order before Task.
-        assert_eq!(ast::binding(&facts[0], "Noun"), Some("Order"));
-        assert_eq!(ast::binding(&facts[0], "Object Type"), Some("entity"));
-        assert_eq!(ast::binding(&facts[1], "Noun"), Some("Task"));
+        // One tuple per Noun (every Noun has an Object Type), sorted by
+        // subject: Object Type (value), Order (entity), Task (entity).
+        assert_eq!(facts.len(), 3);
+        assert_eq!(ast::binding(&facts[0], "Noun"), Some("Object Type"));
+        assert_eq!(ast::binding(&facts[0], "Object Type"), Some("value"));
+        assert_eq!(ast::binding(&facts[1], "Noun"), Some("Order"));
         assert_eq!(ast::binding(&facts[1], "Object Type"), Some("entity"));
+        assert_eq!(ast::binding(&facts[2], "Noun"), Some("Task"));
+        assert_eq!(ast::binding(&facts[2], "Object Type"), Some("entity"));
+    }
+
+    #[test]
+    fn reconstitute_skips_entity_valued_functional_ft() {
+        // task-962: an entity-valued functional FT (both roles entity, e.g.
+        // `Order was placed by Customer`) is NOT folded into an entity cell the
+        // way a value-typed property is; reconstituting it would fabricate
+        // tuples that break MC/deontic/ring checks. The value-typed-value-role
+        // gate must return None (no value-typed role).
+        let state = make_state(
+            vec![("Order", "entity"), ("Customer", "entity")],
+            vec![("ft1", "Order was placed by Customer",
+                  vec![("Order", 0), ("Customer", 1)])],
+            vec![("UC", vec![("ft1", 0)])],
+        );
+        assert!(reconstitute_absorbed_ft(&state, "ft1").is_none(),
+            "entity-valued functional FT must not reconstitute");
     }
 
     #[test]
