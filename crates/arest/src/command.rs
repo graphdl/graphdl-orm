@@ -173,7 +173,7 @@ pub enum Command {
     /// diagnostic tree on failure. The plural `LoadReadings` variant
     /// stays for the bake-time / multi-file path; the singular form
     /// is the runtime peer that downstream target adapters
-    /// (#560-#564) consume. See `crate::load_reading::load_reading`.
+    /// (#560-#564) consume. See `crate::load_reading_core::load_reading`.
     LoadReading {
         name: String,
         body: String,
@@ -186,7 +186,7 @@ pub enum Command {
     /// previously-loaded reading from the cell graph. Looks up the
     /// `_loaded_reading:{name}` manifest, cascade-deletes the listed
     /// nouns / fact types / derivations, and removes the manifest
-    /// cell itself. See `crate::load_reading::unload_reading`.
+    /// cell itself. See `crate::load_reading_core::unload_reading`.
     ///
     /// The optional `policy` field accepts "cascade-delete" (default,
     /// also accepts "cascade_delete") and "migrate" (preserves the
@@ -212,7 +212,7 @@ pub enum Command {
     /// also accepts "replace_all") and "migrate-facts" (preserves the
     /// population P, then re-derives it from the new readings —
     /// migration is ingestion of new readings). Unknown values fall
-    /// back to the default. See `crate::load_reading::reload_reading`.
+    /// back to the default. See `crate::load_reading_core::reload_reading`.
     ///
     /// First-time-load fallthrough: if no `_loaded_reading:{name}`
     /// manifest is present, the unload step is treated as a no-op
@@ -2931,7 +2931,7 @@ fn apply_load_readings(
     // batch load — the recompile + persist below is skipped, the
     // returned state is phi() so the writer-path classifier treats it
     // as no-commit. Mirrors `load_reading_core::load_reading` step 5.
-    let validation = crate::load_reading::validate_loaded_state(&merged_state);
+    let validation = crate::load_reading_core::validate_loaded_state(&merged_state);
     if !validation.passes {
         let violations: Vec<crate::types::Violation> = validation.alethic_violations
             .into_iter()
@@ -2996,7 +2996,7 @@ fn apply_load_readings(
 /// SystemVerb::LoadReading (#555 DynRdg-1) — runtime parse + validate +
 /// register a single named reading body.
 ///
-/// Pure wrapper over `crate::load_reading::load_reading`: encodes the
+/// Pure wrapper over `crate::load_reading_core::load_reading`: encodes the
 /// outcome as a `CommandResult` so the existing command dispatch loop
 /// can surface it through the same `__state_delta` carrier
 /// (`encode_command_result` semantics). On rejection, the state field
@@ -3016,7 +3016,7 @@ fn load_reading_handler(
     body: &str,
     state: &ast::Object,
 ) -> CommandResult {
-    use crate::load_reading::{load_reading, LoadError, LoadReadingPolicy};
+    use crate::load_reading_core::{load_reading, LoadError, LoadReadingPolicy};
 
     // The verb operates on the def-state `d`. Population state is
     // unaffected by schema mutation under this verb (added cells go
@@ -3161,7 +3161,7 @@ fn load_reading_handler(
 /// graph and either cascade-deletes its facts (default) or migrates
 /// them (stubbed; see `UnloadPolicy`).
 ///
-/// Pure wrapper over `crate::load_reading::unload_reading`: encodes
+/// Pure wrapper over `crate::load_reading_core::unload_reading`: encodes
 /// the outcome as a `CommandResult` so the existing dispatch loop
 /// can surface it through the same `__state_delta` carrier. On
 /// rejection, the result state is `phi()` so the writer-path
@@ -3180,7 +3180,7 @@ fn unload_reading_handler(
     policy: Option<&str>,
     state: &ast::Object,
 ) -> CommandResult {
-    use crate::load_reading::{unload_reading, UnloadError, UnloadPolicy};
+    use crate::load_reading_core::{unload_reading, UnloadError, UnloadPolicy};
 
     let parsed_policy = match policy.map(|s| s.to_ascii_lowercase()) {
         Some(ref s) if s == "migrate" => UnloadPolicy::Migrate,
@@ -3301,7 +3301,7 @@ fn unload_reading_handler(
 /// Either the new body fully replaces the old, or the old reading
 /// stays exactly as it was. No partial state is visible.
 ///
-/// Pure wrapper over `crate::load_reading::reload_reading`: encodes
+/// Pure wrapper over `crate::load_reading_core::reload_reading`: encodes
 /// the outcome as a `CommandResult` so the existing dispatch loop
 /// can surface it through the same `__state_delta` carrier. On
 /// rejection, the result state is `phi()` (no commit). On success,
@@ -3328,7 +3328,7 @@ fn reload_reading_handler(
     policy: Option<&str>,
     state: &ast::Object,
 ) -> CommandResult {
-    use crate::load_reading::{reload_reading, LoadError, ReloadError, ReloadPolicy, UnloadError};
+    use crate::load_reading_core::{reload_reading, LoadError, ReloadError, ReloadPolicy, UnloadError};
 
     let parsed_policy = match policy.map(|s| s.to_ascii_lowercase()) {
         Some(ref s) if s == "migrate-facts" || s == "migrate_facts" => {
@@ -5951,7 +5951,7 @@ Status 'pending' is initial in State Machine Definition 'Task'.
         // input def-state hasn't been folded forward; the test
         // verifies the handler doesn't crash on the second call.
         // True idempotency-with-new-state is exercised by the
-        // load_reading::tests::re_load_same_body_is_idempotent test
+        // load_reading_core::tests::re_load_same_body_is_idempotent test
         // which threads state forward.
         assert_eq!(second.entities[0].entity_type, "ReadingLoaded");
     }

@@ -193,11 +193,8 @@ pub mod parse_forml2_stage1;
 //     shim under no_std in #652 (commit 516bc993).
 // Closes #588.
 pub mod parse_forml2_stage2;
-// `load_reading` is now a thin `pub use crate::load_reading_core::*`
-// shim (#586). Lifting the gate is purely re-export plumbing — the
-// pure-FORML core has always been no_std-aware; the function itself
-// is still cfg-gated inside `load_reading_core` (see comment below).
-pub mod load_reading;
+// `load_reading` re-export shim (#586) removed (task-780): the public
+// API and in-crate consumers now reference `load_reading_core` directly.
 // `load_reading_core` (#586) — pure-FORML core extracted from
 // `load_reading` for kernel reach (mirroring JJJJJ's `select_component_core`
 // pattern in #565 part 2). The TYPES (`LoadReadingPolicy`,
@@ -2126,11 +2123,11 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         if tenant.read().register_mode != RegisterMode::Privileged {
             return r#"{"ok":false,"error":"disallowed","detail":"runtime LoadReading is gated by register_mode; flip to Privileged via set_register_mode"}"#.to_string();
         }
-        let policy = crate::load_reading::LoadReadingPolicy::AllowAll;
+        let policy = crate::load_reading_core::LoadReadingPolicy::AllowAll;
         // Snapshot under read lock first; on success escalate to write
         // for atomic replace_d. Mirrors the snapshot/rollback path.
         let snapshot = tenant.read().snapshot_d();
-        let outcome = match crate::load_reading::load_reading(&snapshot, name, input, policy) {
+        let outcome = match crate::load_reading_core::load_reading(&snapshot, name, input, policy) {
             Ok(o) => o,
             Err(err) => {
                 return load_reading_error_envelope(name, &err);
@@ -2559,7 +2556,7 @@ fn classify_writer_result(result: &ast::Object) -> WriterResult {
 #[cfg(not(feature = "no_std"))]
 fn load_reading_success_envelope(
     name: &str,
-    report: &crate::load_reading::LoadReport,
+    report: &crate::load_reading_core::LoadReport,
 ) -> String {
     let nouns = json_string_array(&report.added_nouns);
     let fts = json_string_array(&report.added_fact_types);
@@ -2571,8 +2568,8 @@ fn load_reading_success_envelope(
 }
 
 #[cfg(not(feature = "no_std"))]
-fn load_reading_error_envelope(name: &str, err: &crate::load_reading::LoadError) -> String {
-    use crate::load_reading::LoadError;
+fn load_reading_error_envelope(name: &str, err: &crate::load_reading_core::LoadError) -> String {
+    use crate::load_reading_core::LoadError;
     let (class, detail, violations_json): (&str, String, String) = match err {
         LoadError::Disallowed => (
             "disallowed",
