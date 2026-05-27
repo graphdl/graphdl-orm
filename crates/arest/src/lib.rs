@@ -3218,6 +3218,121 @@ mod handle_isolation_tests {
         release_impl(h);
     }
 
+    // #939: complementary fuzz — `apply` against the LOADED metamodel.
+    // The empty-state apply_command_fuzz (tests/apply_command_fuzz.rs)
+    // fuzzes apply_command_defs with d = φ; it can NEVER reach the
+    // metamodel derivation / SM / run-time-definedness path — which is
+    // exactly where the apply non-termination lived. This drives
+    // system(h,"apply",..) over a create_impl() handle (metamodel loaded).
+    // A fresh handle per case (create_impl clones the cached metamodel —
+    // an Arc bump) keeps cases isolated and shrinking clean. Pin: the call
+    // must RETURN (no panic; a hang trips the harness timeout — the
+    // run-time-definedness gate must keep create/update terminating, so a
+    // hang would signal a gate hole). Fuzz strings are JSON-safe (no quote
+    // / backslash) so the input is built with format! and needs no escaping
+    // layer; quote/backslash deserialise robustness is a separate surface.
+    #[cfg(not(feature = "no_std"))]
+    mod metamodel_apply_fuzz {
+        use crate::{create_impl, release_impl, system_impl};
+        use proptest::prelude::*;
+
+        fn arb_json_safe(max: usize) -> impl Strategy<Value = String> {
+            proptest::collection::vec(
+                prop_oneof![
+                    proptest::char::range('a', 'z'),
+                    proptest::char::range('A', 'Z'),
+                    proptest::char::range('0', '9'),
+                    Just(' '),
+                    Just('_'),
+                    Just('-'),
+                ],
+                0..max,
+            )
+            .prop_map(|cs| cs.into_iter().collect())
+        }
+
+        // Mix declared metamodel nouns (exercise the per-noun validate +
+        // derivation forward-chain) with random strings (mostly the
+        // run-time-definedness reject path).
+        fn arb_noun() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just("Noun".to_string()),
+                Just("Domain".to_string()),
+                Just("App".to_string()),
+                Just("Fact Type".to_string()),
+                Just("Constraint".to_string()),
+                arb_json_safe(24),
+            ]
+        }
+
+        fn arb_fields() -> impl Strategy<Value = Vec<(String, String)>> {
+            proptest::collection::vec((arb_json_safe(16), arb_json_safe(48)), 0..6)
+        }
+
+        fn fields_json(f: &[(String, String)]) -> String {
+            f.iter()
+                .map(|(k, v)| format!(r#""{k}":"{v}""#))
+                .collect::<Vec<_>>()
+                .join(",")
+        }
+
+        #[derive(Clone, Debug)]
+        enum Op {
+            Create { noun: String, id: String, fields: Vec<(String, String)> },
+            Update { noun: String, entity_id: String, fields: Vec<(String, String)> },
+            Transition { entity_id: String, event: String },
+        }
+
+        fn arb_op() -> impl Strategy<Value = Op> {
+            prop_oneof![
+                (arb_noun(), arb_json_safe(24), arb_fields())
+                    .prop_map(|(noun, id, fields)| Op::Create { noun, id, fields }),
+                (arb_noun(), arb_json_safe(24), arb_fields())
+                    .prop_map(|(noun, entity_id, fields)| Op::Update { noun, entity_id, fields }),
+                (arb_json_safe(24), arb_json_safe(24))
+                    .prop_map(|(entity_id, event)| Op::Transition { entity_id, event }),
+            ]
+        }
+
+        fn input_json(op: &Op) -> String {
+            match op {
+                Op::Create { noun, id, fields } => format!(
+                    r#"{{"command":{{"type":"createEntity","noun":"{noun}","domain":"","id":"{id}","fields":{{{f}}}}},"population":""}}"#,
+                    f = fields_json(fields)
+                ),
+                Op::Update { noun, entity_id, fields } => format!(
+                    r#"{{"command":{{"type":"updateEntity","noun":"{noun}","domain":"","entity_id":"{entity_id}","fields":{{{f}}}}},"population":""}}"#,
+                    f = fields_json(fields)
+                ),
+                Op::Transition { entity_id, event } => format!(
+                    r#"{{"command":{{"type":"transition","entity_id":"{entity_id}","event":"{event}","domain":""}},"population":""}}"#
+                ),
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+            // #[ignore]'d: this fuzz EXPOSED task-960 — createEntity noun="App"
+            // (a declared metamodel noun, past the definedness gate) drives the
+            // apply forward-chain into unbounded allocation (OOM). Running this
+            // un-ignored OOMs the test process. Un-ignore once apply terminates /
+            // the gate rejects App-create, then it serves as the regression guard.
+            #[test]
+            #[ignore = "exposes open bug task-960 (createEntity 'App' OOMs the apply forward-chain); un-ignore when fixed"]
+            fn apply_against_loaded_metamodel_returns_without_panic(op in arb_op()) {
+                let input = input_json(&op);
+                let h = create_impl();
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    system_impl(h, "apply", &input)
+                }));
+                release_impl(h);
+                // No panic, and reaching this line means the call RETURNED
+                // (no divergence — a hang trips the harness timeout instead).
+                prop_assert!(outcome.is_ok(), "apply panicked on {:?} (input: {})", op, input);
+            }
+        }
+    }
+
     #[test]
     fn create_bare_impl_skips_metamodel() {
         let h = create_bare_impl();
