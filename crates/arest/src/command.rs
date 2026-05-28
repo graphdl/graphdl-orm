@@ -2644,6 +2644,33 @@ fn update_via_defs(
             .filter(|s| !s.is_empty())
             .collect())
         .unwrap_or_default();
+    // Bridge-clobber guard (this session): snapshot the pre-drop value
+    // of every cell we're about to clear, plus the rule_id ->
+    // consequent_cell map. After the chain runs, cells whose producing
+    // rule was NEVER ACTIVATED during the chain are restored from the
+    // snapshot -- the rule's antecedents didn't change on this apply
+    // so its consequent must not be clobbered to empty (the
+    // Task_has_Task_Status / Task_is_recommended class of bug observed
+    // tasks.db this session: an updateEntity touching only a
+    // description wiped the bridge cell). Cells whose rule WAS
+    // activated stay as the chain emitted them (including empty -- the
+    // legitimate stale-clear from
+    // update_clears_stale_derived_consequents_before_forward_chain).
+    let pre_drop_snapshot: hashbrown::HashMap<String, ast::Object> = dropped_cells.iter()
+        .map(|name| (name.clone(), ast::fetch_or_phi(name, &new_state).clone()))
+        .collect();
+    let rule_id_to_consequent_cell: hashbrown::HashMap<String, String> = drule_cell.as_seq()
+        .map(|facts| facts.iter()
+            .filter_map(|f| {
+                let id = ast::binding(f, "id")?;
+                let encoded = ast::binding(f, "consequentFactTypeId")?;
+                let cell = crate::types::ConsequentCellSource::decode(encoded)
+                    .literal_id().to_string();
+                if cell.is_empty() { return None; }
+                Some((id.to_string(), cell))
+            })
+            .collect())
+        .unwrap_or_default();
     let new_state = if dropped_cells.is_empty() {
         new_state
     } else {
@@ -2681,21 +2708,45 @@ fn update_via_defs(
     let mut seed = touched_cells.clone();
     seed.extend(drop_writer_reads);
 
+    let mut activated_rule_defs: hashbrown::HashSet<String> = hashbrown::HashSet::new();
     let (new_state, mut derived) = if stratum1.is_empty() {
         (new_state, alloc::vec::Vec::new())
     } else {
         let refs = to_seeded_refs(&s1_packed);
-        crate::evaluate::forward_chain_defs_state_seeded(
-            &refs, seed.clone(), &new_state, 100)
+        crate::evaluate::forward_chain_defs_state_seeded_tracked(
+            &refs, seed.clone(), &new_state, 100, &mut activated_rule_defs)
     };
     let new_state = if stratum2.is_empty() {
         new_state
     } else {
         let refs = to_seeded_refs(&s2_packed);
-        let (post_s2, more) = crate::evaluate::forward_chain_defs_state_seeded(
-            &refs, seed.clone(), &new_state, 100);
+        let (post_s2, more) = crate::evaluate::forward_chain_defs_state_seeded_tracked(
+            &refs, seed.clone(), &new_state, 100, &mut activated_rule_defs);
         derived.extend(more);
         post_s2
+    };
+
+    // Restore cells whose producing rule was never activated. Bare rule
+    // id from the def name (e.g. "derivation:rule_XYZ" -> "rule_XYZ")
+    // matches rule_id_to_consequent_cell's keys.
+    let new_state = if dropped_cells.is_empty() {
+        new_state
+    } else {
+        let activated_consequent_cells: hashbrown::HashSet<String> = activated_rule_defs.iter()
+            .filter_map(|def_name| def_name.split_once(':').map(|(_, id)| id))
+            .filter_map(|id| rule_id_to_consequent_cell.get(id).cloned())
+            .collect();
+        let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+        for (name, contents) in ast::cells_iter(&new_state).into_iter() {
+            if dropped_cells.contains(name) && !activated_consequent_cells.contains(name) {
+                if let Some(snap) = pre_drop_snapshot.get(name) {
+                    new_map.insert(name.to_string(), snap.clone());
+                    continue;
+                }
+            }
+            new_map.insert(name.to_string(), contents.clone());
+        }
+        ast::Object::Map(new_map.into())
     };
 
     // Prefer per-noun validate aggregate (O(FTs-touching-noun)) over the

@@ -302,7 +302,7 @@ pub fn forward_chain_defs_state_semi_naive_with_base_keys(
     max_rounds: usize,
     base_keys: Option<HashSet<FactKey>>,
 ) -> (ast::Object, Vec<DerivedFact>) {
-    semi_naive_inner(derivation_defs, None, d, max_rounds, base_keys)
+    semi_naive_inner(derivation_defs, None, d, max_rounds, base_keys, None)
 }
 
 /// task-3-incremental: forward-chain with an explicit round-1
@@ -330,19 +330,49 @@ pub fn forward_chain_defs_state_seeded(
     d: &ast::Object,
     max_rounds: usize,
 ) -> (ast::Object, Vec<DerivedFact>) {
-    semi_naive_inner(derivation_defs, Some(seed), d, max_rounds, None)
+    semi_naive_inner(derivation_defs, Some(seed), d, max_rounds, None, None)
+}
+
+/// Same as [`forward_chain_defs_state_seeded`] but also reports every
+/// rule id the per-round gate selected as `active`. Used by the
+/// drop-and-rederive bridge-preservation guard in command::update_via_defs:
+/// the caller pre-drops derived consequents to phi() and runs this
+/// chain; cells whose producing rule was NEVER activated are restored
+/// from the pre-drop snapshot (the rule's antecedents didn't change on
+/// this apply, so its consequent shouldn't be clobbered). Cells whose
+/// rule WAS activated stay at whatever the chain wrote (including
+/// empty -- the legitimate stale-clear case from
+/// `update_clears_stale_derived_consequents_before_forward_chain`).
+pub fn forward_chain_defs_state_seeded_tracked(
+    derivation_defs: &[(&str, &ast::Func, Option<&[String]>)],
+    seed: HashSet<String>,
+    d: &ast::Object,
+    max_rounds: usize,
+    activated: &mut HashSet<String>,
+) -> (ast::Object, Vec<DerivedFact>) {
+    semi_naive_inner(derivation_defs, Some(seed), d, max_rounds, None, Some(activated))
 }
 
 /// Shared body of the semi-naive variants. `initial_dirty == None`
 /// matches the classical "round 1 runs everything" behavior; `Some(set)`
 /// seeds the round-1 filter from `set` (used by
 /// [`forward_chain_defs_state_seeded`] for incremental apply).
+///
+/// `activated_rules`, when `Some`, accumulates the id of every rule
+/// that the per-round gate selected as `active` -- regardless of
+/// whether the rule actually emitted facts. Caller uses the set to
+/// distinguish "rule was activated but emitted nothing" (correctly
+/// cleared consequent, e.g. a stale-clear) from "rule never activated"
+/// (drop-and-rederive should NOT clobber the pre-drop snapshot; e.g.
+/// the bridge case where antecedents didn't change). Optional so the
+/// non-seeded full-chain caller pays no extra bookkeeping.
 fn semi_naive_inner(
     derivation_defs: &[(&str, &ast::Func, Option<&[String]>)],
     initial_dirty: Option<HashSet<String>>,
     d: &ast::Object,
     max_rounds: usize,
     base_keys: Option<HashSet<FactKey>>,
+    mut activated_rules: Option<&mut HashSet<String>>,
 ) -> (ast::Object, Vec<DerivedFact>) {
     use hashbrown::HashMap;
     // Same gate as `derive_one_round_with_keys`: trace knob is host-only.
@@ -385,6 +415,11 @@ fn semi_naive_inner(
                 round, active.len(), derivation_defs.len());
         }
         record_chain_eval_count(active.len());
+        if let Some(ref mut acc) = activated_rules {
+            for (name, _) in &active {
+                acc.insert((*name).to_string());
+            }
+        }
         if active.is_empty() { break; }
         let new_facts = derive_one_round_with_keys(
             active.as_slice(), &current_state, &all_derived, d, &existing_keys);
