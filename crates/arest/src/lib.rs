@@ -3965,9 +3965,10 @@ Task has Task Status.
     /// `cells_iter(state).flat_map(...)` to gather facts where pairs[0]
     /// has the entity_id at position 1. This naive scan also picks up
     /// SM-derived facts whose `State Machine` role value happens to
-    /// equal the Task id (e.g. `StateMachine_has_currentlyInStatus`),
-    /// then re-pushes them under wrong cell names like
-    /// `Task_has_currentlyInStatus` — manufacturing whole-row noise.
+    /// equal the Task id (e.g. `State_Machine_is_currently_in_Status`,
+    /// post-task-742), then re-pushes them under wrong cell names
+    /// like `Task_has_currentlyInStatus` — manufacturing whole-row
+    /// noise.
     /// In domains where the user's role name collides with an SM-emitted
     /// role (e.g. a `Task Status` field where the SM also names its
     /// initial status `pending`), the merge overwrites the user's

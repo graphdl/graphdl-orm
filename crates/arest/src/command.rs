@@ -2409,8 +2409,9 @@ fn update_via_defs(
     // `State Machine Definition 'Task' is for Noun 'Task'`), refuse
     // the update with an alethic violation that names the SM and
     // points the caller at `apply transition` instead. The SM cell
-    // (StateMachine_has_currentlyInStatus) is the canonical status —
-    // direct mutation desyncs any derivation reading SM state.
+    // (State_Machine_is_currently_in_Status, post-task-742) is the
+    // canonical status -- direct mutation desyncs any derivation
+    // reading SM state.
     //
     // Lookup: presence of `machine:{noun}` in D (compiled by
     // `compile_state_machine_from_cells`) means the noun is
@@ -5860,9 +5861,10 @@ Function 'place_verb' has callback URI '{}'.
     //
     // The engine's update_via_defs path refuses to mutate the SM's
     // status-role field directly. The SM cell
-    // (StateMachine_has_currentlyInStatus) is the canonical status —
-    // direct mutation would silently desync any derivation reading
-    // SM state. The user must invoke `apply transition` instead.
+    // (State_Machine_is_currently_in_Status, post-task-742) is the
+    // canonical status -- direct mutation would silently desync any
+    // derivation reading SM state. The user must invoke
+    // `apply transition` instead.
     // `force: true` is the documented opt-out (#904 convention).
     //
     // Test corpus: a Task domain with an SM bound to noun 'Task',
@@ -5913,10 +5915,10 @@ Transition 'start' is defined in State Machine Definition 'Task'.
         // SM fact directly because creating via apply would also
         // exercise the SM-init path; this isolates the guard.
         let state = ast::cell_push(
-            "StateMachine_has_currentlyInStatus",
+            "State_Machine_is_currently_in_Status",
             ast::fact_from_pairs(&[
                 ("State Machine", "t-1"),
-                ("currentlyInStatus", "pending"),
+                ("Status", "pending"),
             ]),
             &base_state,
         );
@@ -5952,10 +5954,10 @@ Transition 'start' is defined in State Machine Definition 'Task'.
             result.state
         );
         // SM cell still reflects pending.
-        let sm_cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", &state);
+        let sm_cell = ast::fetch_or_phi("State_Machine_is_currently_in_Status", &state);
         let status = sm_cell.as_seq().unwrap().iter()
             .find(|f| ast::binding_matches(f, "State Machine", "t-1"))
-            .and_then(|f| ast::binding(f, "currentlyInStatus"))
+            .and_then(|f| ast::binding(f, "Status"))
             .unwrap();
         assert_eq!(status, "pending", "SM status must not have flipped");
     }
@@ -5968,10 +5970,10 @@ Transition 'start' is defined in State Machine Definition 'Task'.
     fn apply_update_status_sm_force_true_bypasses_guard() {
         let (def_map, base_state) = setup_task_sm_defs();
         let state = ast::cell_push(
-            "StateMachine_has_currentlyInStatus",
+            "State_Machine_is_currently_in_Status",
             ast::fact_from_pairs(&[
                 ("State Machine", "t-1"),
-                ("currentlyInStatus", "pending"),
+                ("Status", "pending"),
             ]),
             &base_state,
         );
@@ -6133,10 +6135,10 @@ Status 'pending' is initial in State Machine Definition 'Task'.
     fn apply_update_status_sm_transition_still_advances_state_machine() {
         let (def_map, base_state) = setup_task_sm_defs();
         let state = ast::cell_push(
-            "StateMachine_has_currentlyInStatus",
+            "State_Machine_is_currently_in_Status",
             ast::fact_from_pairs(&[
                 ("State Machine", "t-1"),
-                ("currentlyInStatus", "pending"),
+                ("Status", "pending"),
             ]),
             &base_state,
         );

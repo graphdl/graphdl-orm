@@ -24,7 +24,7 @@
 //                   that uses an instance from cell A IS a directed
 //                   edge A → B in the derivation graph).
 //   * State Machine — for any instance whose noun participates in a
-//                     `StateMachine_has_currentlyInStatus` fact,
+//                     `State_Machine_is_currently_in_Status` fact,
 //                     navigate to the SM cell so the user can see /
 //                     act on the next-states. The actual transition
 //                     invocation is #514's job; #512 only surfaces the
@@ -261,7 +261,10 @@ fn targets_for_instance(
     if instance_has_state_machine(noun, instance, state) {
         out.push(NavigationTarget::new(
             CurrentCell::FactCell {
-                cell_name: "StateMachine_has_currentlyInStatus".to_string(),
+                // task-742 canonical SM cell name (post-rename from
+                // `StateMachine_has_currentlyInStatus`); matches what
+                // every live db carries today.
+                cell_name: "State_Machine_is_currently_in_Status".to_string(),
             },
             NavigationKind::StateMachine,
         ));
