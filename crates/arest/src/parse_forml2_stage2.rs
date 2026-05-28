@@ -3080,6 +3080,7 @@ pub fn translate_partitions(classified_state: &Object, idx: &StmtIndex) -> Vec<O
 /// declaration shape `Customer is an entity type` also matches Fact
 /// Type Reading because it has a Role Reference.
 pub fn translate_fact_types(classified_state: &Object, idx: &StmtIndex) -> (Vec<Object>, Vec<Object>) {
+    let _ = classified_state;
     let statement_ids = collect_statement_ids(idx);
     let mut ft_facts: Vec<Object> = Vec::new();
     let mut role_facts: Vec<Object> = Vec::new();
@@ -3424,6 +3425,7 @@ pub fn translate_instance_facts_with_ft_ids(
     idx: &StmtIndex,
     declared_ft_ids: &[String],
 ) -> Vec<Object> {
+    let _ = classified_state;
     let table = StatementTranslatorTable::boot();
     let kinds: Vec<&str> = table.kinds_for("translate_instance_facts");
     let statement_ids = collect_statement_ids(idx);
@@ -4318,6 +4320,7 @@ pub fn translate_cardinality_constraints(classified_state: &Object, idx: &StmtIn
 /// `parse_forml2::enum_values_for_noun`) and attaches the constraint
 /// to every role where the noun appears.
 pub fn translate_value_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+    let _ = classified_state;
     let table = StatementTranslatorTable::boot();
     let kinds: Vec<&str> = table.kinds_for("translate_value_constraints");
     let statement_ids = collect_statement_ids(idx);

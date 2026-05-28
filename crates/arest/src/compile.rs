@@ -6897,7 +6897,7 @@ fn compile_sm_for_resource_backfill_for(sm: &CompiledStateMachine) -> CompiledDe
 fn compile_constraint(
     data: &CellIndex,
     def: &ConstraintDef,
-    state: Option<&crate::ast::Object>,
+    _state: Option<&crate::ast::Object>,
 ) -> CompiledConstraint {
     let modality = match def.modality.to_lowercase().as_str() {
         "deontic" => {

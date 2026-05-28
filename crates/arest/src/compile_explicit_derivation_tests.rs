@@ -2034,7 +2034,7 @@ Task 't-keyed-2' has Task Description 'second task no events'.
     stratum1.extend(init_and_fold);
     let s1_refs: Vec<(&str, &crate::ast::Func)> = stratum1.iter()
         .map(|(n, f)| (n.as_str(), f)).collect();
-    let (final_state, _derived) =
+    let (_final_state, _derived) =
         crate::evaluate::forward_chain_defs_state(&s1_refs, &state);
 
     // Force the Map-storage shape: the parser writes instance-fact
