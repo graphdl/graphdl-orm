@@ -44,7 +44,8 @@
 //   * Instance        — `apply update <Noun>::<id>` (edit form);
 //                       `apply destroy <Noun>::<id>`;
 //                       `transition <SM>::<id> <next-state>` per SM
-//                       fact whose `forResource` matches the instance.
+//                       fact whose `Resource` role matches the
+//                       instance (canonical post-task-742 role name).
 //   * FactCell        — `apply remove fact <fact-id>` per fact in cell;
 //                       `Fetch <cell_name>` to inspect raw contents.
 //   * ComponentInstance — `apply update Component_property <name>`
@@ -2463,7 +2464,8 @@ mod tests {
     }
 
     /// End-to-end roundtrip — Apply transition rewrites the
-    /// SYSTEM-installed SM row's `currentlyInStatus`.
+    /// SYSTEM-installed SM row's `Status` binding (canonical
+    /// post-task-742 role name).
     #[test]
     fn dispatch_transition_commits_to_system_state() {
         crate::system::init();
