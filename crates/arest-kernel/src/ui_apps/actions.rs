@@ -516,7 +516,7 @@ fn actions_for_instance(
 
     // State machine: per legal outgoing transition (#514, EPIC #496).
     // For any Instance with an SM (detected via
-    // `StateMachine_has_currentlyInStatus`), surface the *specific*
+    // `State_Machine_is_currently_in_Status`), surface the *specific*
     // legal next transitions as one-click actions, with their event
     // names as labels. Each outgoing Transition becomes its own
     // button; disabled ones (guard violations) carry the violation
@@ -760,15 +760,15 @@ fn instances_of(noun: &str, state: &Object) -> Vec<String> {
 }
 
 /// Look up the SM identifier for a (noun, instance) pair if any
-/// `StateMachine_has_currentlyInStatus` fact references the instance
-/// (either as the SM itself or as the `forResource`). Returns the SM
+/// `State_Machine_is_currently_in_Status` fact references the instance
+/// (either as the SM itself or as the `Resource`). Returns the SM
 /// identifier so the action panel can populate the `transition` verb's
 /// `sm` arg.
 fn state_machine_for(noun: &str, instance: &str, state: &Object) -> Option<String> {
-    let cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", state);
+    let cell = ast::fetch_or_phi("State_Machine_is_currently_in_Status", state);
     let facts = cell.as_seq()?;
     facts.iter().find_map(|fact| {
-        if ast::binding_matches(fact, "forResource", instance) {
+        if ast::binding_matches(fact, "Resource", instance) {
             ast::binding(fact, "State Machine").map(|s| s.to_string())
         } else if ast::binding_matches(fact, "State Machine", instance) {
             Some(instance.to_string())
@@ -781,32 +781,32 @@ fn state_machine_for(noun: &str, instance: &str, state: &Object) -> Option<Strin
 }
 
 /// Look up the SM's currently-in Status. Reads
-/// `StateMachine_has_currentlyInStatus` and returns the bound
-/// `currentlyInStatus` for any fact that mentions `sm_or_resource_id`
-/// in the SM, forResource, or instance role positions. Mirrors
+/// `State_Machine_is_currently_in_Status` and returns the bound
+/// `Status` for any fact that mentions `sm_or_resource_id`
+/// in the SM, Resource, or instance role positions. Mirrors
 /// `state_machine_for`'s tolerant matching shape.
 fn current_status_for(sm_or_resource_id: &str, state: &Object) -> Option<String> {
-    let cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", state);
+    let cell = ast::fetch_or_phi("State_Machine_is_currently_in_Status", state);
     let facts = cell.as_seq()?;
     facts.iter().find_map(|fact| {
         let mentions = ast::binding_matches(fact, "State Machine", sm_or_resource_id)
-            || ast::binding_matches(fact, "forResource", sm_or_resource_id);
+            || ast::binding_matches(fact, "Resource", sm_or_resource_id);
         if !mentions {
             return None;
         }
-        ast::binding(fact, "currentlyInStatus").map(|s| s.to_string())
+        ast::binding(fact, "Status").map(|s| s.to_string())
     })
 }
 
 /// Look up the SM Definition that this SM instance is an instance of.
-/// Reads `StateMachine_is_instance_of_State_Machine_Definition` per
+/// Reads `State_Machine_is_instance_of_State_Machine_Definition` per
 /// the canonical shape in `readings/core/instances.md`. Falls back to
 /// using the SM id itself as the definition when the instance fact
 /// isn't bound (the simplified test fixtures + the legacy "SM and
 /// SMDef share id" convention used by some compile paths).
 fn state_machine_def_for(sm_id: &str, state: &Object) -> String {
     let cell = ast::fetch_or_phi(
-        "StateMachine_is_instance_of_State_Machine_Definition",
+        "State_Machine_is_instance_of_State_Machine_Definition",
         state,
     );
     if let Some(facts) = cell.as_seq() {
@@ -1208,7 +1208,7 @@ pub fn apply_destroy(args: &[(String, String)], state: &Object) -> Result<Object
 /// Compute the post-state for the rich-shape `Transition` verb.
 /// Mirrors `arest::hateoas::handle_arest_transition` against the
 /// kernel-side cell shape `actions_for_instance` + `transitions_for_sm`
-/// emit (rich shape: `StateMachine_has_currentlyInStatus` +
+/// emit (rich shape: `State_Machine_is_currently_in_Status` +
 /// `Transition_is_from_Status` / `Transition_is_to_Status` +
 /// `Transition_is_triggered_by_Event_Type`).
 ///
@@ -1216,7 +1216,7 @@ pub fn apply_destroy(args: &[(String, String)], state: &Object) -> Result<Object
 ///   * `sm`   — required; the State Machine instance id.
 ///   * `next` — required; the target Status the SM lands in.
 ///
-/// Side effect: rewrites the SM's `currentlyInStatus` to `next`.
+/// Side effect: rewrites the SM's `Status` to `next`.
 /// Per-fact validation (does the rich shape say this transition is
 /// legal from the current Status?) happens in the action enumerator
 /// (`actions_for_instance` only emits legal outgoing transitions);
@@ -1232,7 +1232,7 @@ pub fn apply_transition(args: &[(String, String)], state: &Object) -> Result<Obj
     if next.is_empty() {
         return Err("missing next".to_string());
     }
-    let cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", state);
+    let cell = ast::fetch_or_phi("State_Machine_is_currently_in_Status", state);
     let Some(rows) = cell.as_seq() else {
         return Err(format!("State Machine {sm_id} not found"));
     };
@@ -1240,7 +1240,7 @@ pub fn apply_transition(args: &[(String, String)], state: &Object) -> Result<Obj
     let mut new_rows: Vec<Object> = Vec::with_capacity(rows.len());
     for row in rows {
         if ast::binding_matches(row, "State Machine", &sm_id) {
-            new_rows.push(update_binding_inplace(row, "currentlyInStatus", &next));
+            new_rows.push(update_binding_inplace(row, "Status", &next));
             updated = true;
         } else {
             new_rows.push(row.clone());
@@ -1250,7 +1250,7 @@ pub fn apply_transition(args: &[(String, String)], state: &Object) -> Result<Obj
         return Err(format!("State Machine {sm_id} not found"));
     }
     Ok(ast::store(
-        "StateMachine_has_currentlyInStatus",
+        "State_Machine_is_currently_in_Status",
         Object::seq(new_rows),
         state,
     ))
@@ -1714,11 +1714,11 @@ mod tests {
             &s,
         );
         let s = cell_push(
-            "StateMachine_has_currentlyInStatus",
+            "State_Machine_is_currently_in_Status",
             fact_from_pairs(&[
                 ("State Machine", "OrderSM"),
-                ("currentlyInStatus", "draft"),
-                ("forResource", "f1"),
+                ("Status", "draft"),
+                ("Resource", "f1"),
             ]),
             &s,
         );
@@ -1965,7 +1965,7 @@ mod tests {
     #[test]
     fn instance_actions_omit_transition_when_no_sm() {
         let state = synth_state();
-        // f2 is a File but no StateMachine_has_currentlyInStatus fact
+        // f2 is a File but no State_Machine_is_currently_in_Status fact
         // references it.
         let actions = compute_actions(
             &CurrentCell::Instance {
@@ -2302,11 +2302,11 @@ mod tests {
         // Seed an SM row at `start`; transition `next=middle` rewrites
         // it.
         let s = cell_push(
-            "StateMachine_has_currentlyInStatus",
+            "State_Machine_is_currently_in_Status",
             fact_from_pairs(&[
                 ("State Machine", "sm1"),
-                ("currentlyInStatus", "start"),
-                ("forResource", "f1"),
+                ("Status", "start"),
+                ("Resource", "f1"),
             ]),
             &Object::phi(),
         );
@@ -2317,24 +2317,24 @@ mod tests {
         ];
         let new_state = apply_transition(&args, &s).expect("transition");
         let cell =
-            ast::fetch_or_phi("StateMachine_has_currentlyInStatus", &new_state);
+            ast::fetch_or_phi("State_Machine_is_currently_in_Status", &new_state);
         let rows = cell.as_seq().expect("cell populated");
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            ast::binding(&rows[0], "currentlyInStatus"),
+            ast::binding(&rows[0], "Status"),
             Some("middle"),
         );
-        // forResource binding survives the rewrite.
-        assert_eq!(ast::binding(&rows[0], "forResource"), Some("f1"));
+        // Resource binding survives the rewrite.
+        assert_eq!(ast::binding(&rows[0], "Resource"), Some("f1"));
     }
 
     #[test]
     fn apply_transition_unknown_sm_errors() {
         let s = cell_push(
-            "StateMachine_has_currentlyInStatus",
+            "State_Machine_is_currently_in_Status",
             fact_from_pairs(&[
                 ("State Machine", "sm1"),
-                ("currentlyInStatus", "start"),
+                ("Status", "start"),
             ]),
             &Object::phi(),
         );
@@ -2471,10 +2471,10 @@ mod tests {
         // the init'd `sm-sr-1` row.
         let pre = crate::system::with_state(|s| s.clone()).expect("init ran");
         let seeded = cell_push(
-            "StateMachine_has_currentlyInStatus",
+            "State_Machine_is_currently_in_Status",
             fact_from_pairs(&[
                 ("State Machine", "sm-554-probe"),
-                ("currentlyInStatus", "start"),
+                ("Status", "start"),
             ]),
             &pre,
         );
@@ -2493,12 +2493,12 @@ mod tests {
 
         // Post-state: sm-554-probe is now in `middle`.
         let post_status = crate::system::with_state(|s| {
-            let cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", s);
+            let cell = ast::fetch_or_phi("State_Machine_is_currently_in_Status", s);
             cell.as_seq()
                 .and_then(|rows| {
                     rows.iter()
                         .find(|r| ast::binding_matches(r, "State Machine", "sm-554-probe"))
-                        .and_then(|r| ast::binding(r, "currentlyInStatus"))
+                        .and_then(|r| ast::binding(r, "Status"))
                         .map(|s| s.to_string())
                 })
                 .unwrap_or_default()
@@ -2586,7 +2586,7 @@ mod tests {
         );
         // SM instance pointing at SM Definition.
         let s = cell_push(
-            "StateMachine_is_instance_of_State_Machine_Definition",
+            "State_Machine_is_instance_of_State_Machine_Definition",
             fact_from_pairs(&[
                 ("State Machine", "sm1"),
                 ("State Machine Definition", "FileLifecycle"),
@@ -2594,11 +2594,11 @@ mod tests {
             &s,
         );
         let s = cell_push(
-            "StateMachine_has_currentlyInStatus",
+            "State_Machine_is_currently_in_Status",
             fact_from_pairs(&[
                 ("State Machine", "sm1"),
-                ("currentlyInStatus", "start"),
-                ("forResource", "f1"),
+                ("Status", "start"),
+                ("Resource", "f1"),
             ]),
             &s,
         );
@@ -2660,19 +2660,19 @@ mod tests {
     /// `status`. Used to walk the 3-state SM through start → middle →
     /// end and observe each step's action surface.
     fn set_current_status(state: &Object, status: &str) -> Object {
-        // Drop facts in `StateMachine_has_currentlyInStatus` that
+        // Drop facts in `State_Machine_is_currently_in_Status` that
         // mention sm1, then push a fresh fact at the new status.
         let cleaned = ast::cell_filter(
-            "StateMachine_has_currentlyInStatus",
+            "State_Machine_is_currently_in_Status",
             |f| !ast::binding_matches(f, "State Machine", "sm1"),
             state,
         );
         ast::cell_push(
-            "StateMachine_has_currentlyInStatus",
+            "State_Machine_is_currently_in_Status",
             fact_from_pairs(&[
                 ("State Machine", "sm1"),
-                ("currentlyInStatus", status),
-                ("forResource", "f1"),
+                ("Status", status),
+                ("Resource", "f1"),
             ]),
             &cleaned,
         )
@@ -2961,7 +2961,7 @@ mod tests {
             &s,
         );
         let s = cell_push(
-            "StateMachine_is_instance_of_State_Machine_Definition",
+            "State_Machine_is_instance_of_State_Machine_Definition",
             fact_from_pairs(&[
                 ("State Machine", "sm1"),
                 ("State Machine Definition", "Demo"),
@@ -2969,11 +2969,11 @@ mod tests {
             &s,
         );
         let s = cell_push(
-            "StateMachine_has_currentlyInStatus",
+            "State_Machine_is_currently_in_Status",
             fact_from_pairs(&[
                 ("State Machine", "sm1"),
-                ("currentlyInStatus", "draft"),
-                ("forResource", "f1"),
+                ("Status", "draft"),
+                ("Resource", "f1"),
             ]),
             &s,
         );

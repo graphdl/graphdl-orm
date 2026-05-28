@@ -473,18 +473,18 @@ fn cells_referencing_instance(
     set.into_iter().collect()
 }
 
-/// True iff any `StateMachine_has_currentlyInStatus` fact references
+/// True iff any `State_Machine_is_currently_in_Status` fact references
 /// the (noun, instance) pair — either as the State Machine itself or
-/// as the `forResource` value. Mirrors the SM lookup pattern used in
+/// as the `Resource` value. Mirrors the SM lookup pattern used in
 /// `arest::command::extract_sm_status`.
 fn instance_has_state_machine(noun: &str, instance: &str, state: &Object) -> bool {
-    let cell = ast::fetch_or_phi("StateMachine_has_currentlyInStatus", state);
+    let cell = ast::fetch_or_phi("State_Machine_is_currently_in_Status", state);
     let Some(facts) = cell.as_seq() else {
         return false;
     };
     facts.iter().any(|fact| {
         ast::binding_matches(fact, "State Machine", instance)
-            || ast::binding_matches(fact, "forResource", instance)
+            || ast::binding_matches(fact, "Resource", instance)
             || ast::binding_matches(fact, noun, instance)
     })
 }
@@ -529,11 +529,11 @@ mod tests {
             &s,
         );
         cell_push(
-            "StateMachine_has_currentlyInStatus",
+            "State_Machine_is_currently_in_Status",
             fact_from_pairs(&[
                 ("State Machine", "f1"),
-                ("currentlyInStatus", "draft"),
-                ("forResource", "f1"),
+                ("Status", "draft"),
+                ("Resource", "f1"),
             ]),
             &s,
         )

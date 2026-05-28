@@ -197,7 +197,7 @@ pub fn init() {
 
         // State-machine prerequisites for #617/#618 — `POST /arest/
         // entities/support-requests/{id}/transition` walks
-        // `State Machine` (forResource → currentlyInStatus) and
+        // `State Machine` (Resource → Status) and
         // `Transition` (fromStatus + event → toStatus). Hand-stage:
         //   * a State Machine row mirroring an SR's initial status,
         //   * a Transition row that fires `categorize` from
@@ -220,9 +220,9 @@ pub fn init() {
 
         let sm_demo = Object::seq(alloc::vec![
             Object::seq(alloc::vec![Object::atom("id"), Object::atom("sm-sr-1")]),
-            Object::seq(alloc::vec![Object::atom("forResource"), Object::atom("sr-1")]),
+            Object::seq(alloc::vec![Object::atom("Resource"), Object::atom("sr-1")]),
             Object::seq(alloc::vec![
-                Object::atom("currentlyInStatus"),
+                Object::atom("Status"),
                 Object::atom("Received"),
             ]),
         ]);
