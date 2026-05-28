@@ -32,7 +32,7 @@
 
 use crate::ast::{Object, cell_push_unique, fact_from_pairs, fetch_cell_seq};
 use crate::sync::OnceLock;
-use alloc::{string::{String, ToString}, vec::Vec, vec, format, borrow::ToOwned};
+use alloc::{string::{String, ToString}, vec::Vec, vec, borrow::ToOwned};
 use hashbrown::{HashMap, HashSet};
 use serde_json::Value;
 

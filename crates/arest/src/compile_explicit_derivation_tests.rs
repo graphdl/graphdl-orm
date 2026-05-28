@@ -939,7 +939,7 @@ Paper Element has Lift Priority.
 
 #[test]
 fn paper_lift_priority_derivation_fires_through_forward_chain() {
-    use crate::ast::{cells_iter, fetch_or_phi};
+    use crate::ast::cells_iter;
 
     let src = r#"# Paper Forward-Chain Test
 Paper Element(.ID) is an entity type.
@@ -1195,7 +1195,6 @@ Task has Alert.
 /// re-key into Task_has_Task_Status.
 #[test]
 fn sm_status_bridge_rekeys_into_task_has_task_status() {
-    use crate::ast::fetch_or_phi;
     let src = r#"# bridge repro
 Task(.id) is an entity type.
 Resource(.id) is an entity type.
@@ -1341,7 +1340,7 @@ Thing has Arity.
 
 #[test]
 fn sm_derivation_rules_populate_normalized_cells_from_initial_and_defined_facts() {
-    use crate::ast::{cells_iter, fetch_or_phi};
+    use crate::ast::cells_iter;
 
     // (1) The Pass-2 derivation rule must be present in
     // readings/core/state.md — this is the file change #759 ships.
@@ -1467,7 +1466,7 @@ Status 'Placed' is defined in State Machine Definition 'OrderSM'.
 
 #[test]
 fn sm_derivation_rules_populate_rooted_cell_from_graph_topology_when_no_initial_fact() {
-    use crate::ast::{cells_iter, fetch_or_phi};
+    use crate::ast::cells_iter;
 
     // (1) The Pass-4 derivation rule must be present in
     // readings/core/state.md — this is the file change #760 ships.
@@ -1624,7 +1623,7 @@ Transition 'ship' is triggered by Fact Type 'Order_was_shipped'.
 
 #[test]
 fn sm_derivation_bridge_projects_currently_in_status_into_task_has_task_status() {
-    use crate::ast::{cells_iter, fetch_or_phi};
+    use crate::ast::cells_iter;
 
     // Self-contained reading: declare the Task entity (subtype of
     // Resource so role-based lookups treat Task ids as Resource
@@ -1778,7 +1777,7 @@ State Machine 'sm-1' is currently in Status 'pending'.
 
 #[test]
 fn sm_init_emits_for_resource_for_entity_without_any_event_facts() {
-    use crate::ast::{cells_iter, fetch_or_phi};
+    use crate::ast::cells_iter;
 
     // Metamodel — same surface as `readings/core/state.md` plus the
     // `Fact Type` noun so `Transition 'start' is triggered by Fact
@@ -2139,7 +2138,7 @@ Task 't-keyed-2' has Task Description 'second task no events'.
 
 #[test]
 fn sm_for_resource_backfill_emits_for_entity_with_only_currently_in_status_row() {
-    use crate::ast::{cells_iter, fetch_or_phi};
+    use crate::ast::cells_iter;
 
     let meta = r#"# State metamodel
 ## Entity Types

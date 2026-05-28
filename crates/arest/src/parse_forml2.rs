@@ -2743,7 +2743,6 @@ mod regex_replacement_tests {
 mod ssrf_cidr_tests {
     use super::*;
     use crate::ast::{Object, fact_from_pairs, store};
-    use alloc::string::ToString;
 
     /// Build a state Object whose `CIDR_Block_has_Block_Kind` cell
     /// carries one fact per `(cidr, kind)` pair. Mirrors the shape
