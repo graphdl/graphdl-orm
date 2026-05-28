@@ -4937,9 +4937,13 @@ pub fn cells_iter(state: &Object) -> Vec<(&str, &Object)> {
 /// Map the *values* are the facts. (The orphan that motivated this lived as a
 /// Map value `⟨State Machine='', Status='Proposed'⟩`, which every prior
 /// `as_seq()`-only pass silently skipped.) Other shapes pass through.
-pub(crate) fn drop_subjectless_facts(contents: &Object) -> Object {
-    drop_subjectless_facts_with_arity(contents, None)
-}
+// task-drop-deadcode-cleanup: the bare-arity wrapper had only test
+// callers and was never reachable from production -- the cli/entry.rs
+// loader (the single production site) always passes the declared
+// arity through `drop_subjectless_facts_with_arity`. Tests now call
+// the *_with_arity variant directly with `None` for the auto-infer
+// case, which removes a pub(crate) surface that was only ever a
+// convenience.
 
 /// As [`drop_subjectless_facts`], but when `declared_arity` is `Some(n)` the
 /// schema arity `n` is the keep-threshold instead of the modal (max) binding
@@ -5903,7 +5907,7 @@ mod tests {
             Object::seq(vec![Object::atom("Status"), Object::atom("in_progress")]),
         ]);
         let cell = Object::seq(vec![valid.clone(), empty_subject, phi_subject]);
-        let rows = drop_subjectless_facts(&cell);
+        let rows = drop_subjectless_facts_with_arity(&cell, None);
         let rows = rows.as_seq().expect("seq");
         assert_eq!(rows.len(), 1, "only the valid fact survives; got {:?}", rows);
         assert_eq!(rows[0], valid);
@@ -5916,7 +5920,7 @@ mod tests {
             Object::seq(vec![Object::atom("Task Description"), Object::atom("")]),
         ]);
         let cell2 = Object::seq(vec![empty_value]);
-        assert_eq!(drop_subjectless_facts(&cell2).as_seq().expect("seq").len(), 1,
+        assert_eq!(drop_subjectless_facts_with_arity(&cell2, None).as_seq().expect("seq").len(), 1,
             "empty value on a non-subject role must be preserved");
 
         // Missing the subject role entirely — the live tasks.db relic shape:
@@ -5926,7 +5930,7 @@ mod tests {
             Object::seq(vec![Object::atom("Status"), Object::atom("Proposed")]),
         ]);
         let cell3 = Object::seq(vec![valid.clone(), missing_subject_role]);
-        let rows3 = drop_subjectless_facts(&cell3);
+        let rows3 = drop_subjectless_facts_with_arity(&cell3, None);
         let rows3 = rows3.as_seq().expect("seq");
         assert_eq!(rows3.len(), 1, "missing-subject-role relic dropped; got {:?}", rows3);
         assert_eq!(rows3[0], valid);
