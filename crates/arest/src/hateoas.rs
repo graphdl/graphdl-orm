@@ -162,8 +162,12 @@ fn json_string(s: &str) -> String {
 /// non-POST methods, unknown slugs, malformed JSON, or missing `id`.
 ///
 /// Direct-write fallback only — the engine path (validate / derive /
-/// apply via `system::apply`) lands once #588 lifts Stage-2 to no_std.
-/// Until then this is the only POST path the kernel honours, mirror
+/// apply via `system::apply`) is pending the kernel engine-path
+/// migration tracked by task-780 sweep item 5. #588 already lifted
+/// Stage-2 to no_std (commit `097577ff`); what remains is routing
+/// kernel HTTP handlers through `naming::resolve_entity_id` + the
+/// transition resolver instead of this direct-write path. Until
+/// that lands, this is the only POST path the kernel honours, mirror
 /// of the worker's `router.ts::handleEntitiesPost` create-side
 /// fallback.
 ///
@@ -246,10 +250,13 @@ pub fn handle_arest_create_for_slug(
 /// `{"noun":"Organization","domain":"organizations","fields":{...}}`.
 /// Mirror of the worker's AREST-command create path
 /// (`router.ts::handleArestRoute` POST branch). The kernel today
-/// can't run the engine path (gated on #588), so this is the
-/// direct-write fallback only — same shape `handle_arest_create_for_slug`
-/// uses, but with the noun read from the body and a random id
-/// (`arest::csprng::random_bytes`) since the request doesn't supply one.
+/// still runs the direct-write fallback rather than the engine
+/// path (pending the kernel engine-path migration tracked by
+/// task-780 sweep item 5; #588's no_std lift already landed), so
+/// this is the direct-write fallback only — same shape
+/// `handle_arest_create_for_slug` uses, but with the noun read from
+/// the body and a random id (`arest::csprng::random_bytes`) since
+/// the request doesn't supply one.
 ///
 /// Returns `None` for non-matching paths, non-POST methods, malformed
 /// JSON, missing/unknown noun. Caller commits the new state via
@@ -350,9 +357,11 @@ pub fn handle_arest_create(
 ///   * No Transition row matches `(currentStatus, event)`.
 ///
 /// The kernel HTTP handler maps `None` to `404`/`400` per the worker's
-/// error envelope (`router.ts:646-671`); the engine path lands once
-/// #588 lifts Stage-2 to no_std and the kernel can compile readings
-/// at runtime.
+/// error envelope (`router.ts:646-671`); the engine path is pending
+/// the kernel engine-path migration (task-780 sweep item 5). #588
+/// already shipped the no_std Stage-2 lift; what remains is rewiring
+/// kernel HTTP handlers to runtime-compile readings via the lifted
+/// `load_reading_core` path.
 pub fn handle_arest_transition(
     state: &Object,
     method: &str,
@@ -485,7 +494,8 @@ pub fn handle_arest_transition(
     // `json({ id, noun, previousStatus, status, event, transitions })`
     // (router.ts:686). `transitions` is omitted today because the
     // direct-write fallback doesn't compute the legal next-step set
-    // (the engine path's job once #588 lands).
+    // (the engine path's job; pending the kernel engine-path migration
+    // tracked by task-780 sweep item 5).
     let mut out = String::new();
     out.push('{');
     out.push_str("\"id\":");
