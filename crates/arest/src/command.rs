@@ -3919,10 +3919,10 @@ pub fn wine_prefix_for_json(state: &ast::Object, body: &str) -> String {
 /// Pulls from `Wine_App_has_Compat_Rating` (the mandatory-cardinality
 /// cell — "Each Wine App has exactly one Compat Rating." in
 /// `readings/compat/wine.md`), so every declared app contributes
-/// exactly one entry. Falls back to scanning every cell whose facts
-/// carry a `Wine App` binding when the Compat Rating cell is empty
-/// (e.g. an in-flight migration where the rating fact-type has been
-/// renamed but the apps are still in the population).
+/// exactly one entry. A prior cross-cell scan fallback (for an
+/// in-flight rename of the Compat Rating FT) was removed: the
+/// mandatory UC guarantees the canonical cell is populated whenever
+/// any Wine App is declared, and live state confirms it.
 pub fn wine_app_ids(state: &ast::Object) -> Vec<String> {
     let mut seen: hashbrown::HashSet<String> = hashbrown::HashSet::new();
     let cell = ast::fetch_cell_seq("Wine_App_has_Compat_Rating", state);
@@ -3931,18 +3931,6 @@ pub fn wine_app_ids(state: &ast::Object) -> Vec<String> {
             if let Some(slug) = ast::binding(fact, "Wine App") {
                 if !slug.is_empty() {
                     seen.insert(slug.to_string());
-                }
-            }
-        }
-    }
-    if seen.is_empty() {
-        // Fallback: scan every cell for `Wine App` subject bindings.
-        for (_name, contents) in ast::cells_iter(state) {
-            for fact in ast::cell_facts_iter(contents) {
-                if let Some(slug) = ast::binding(fact, "Wine App") {
-                    if !slug.is_empty() {
-                        seen.insert(slug.to_string());
-                    }
                 }
             }
         }
