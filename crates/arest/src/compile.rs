@@ -3564,6 +3564,13 @@ pub fn prune_unreachable_fact_types(
 /// role-noun ids resolve to their canonical form — avoiding
 /// `fact_type_id_from_reading`'s unseeded lowercased-tail divergence (the
 /// same hazard `cli/entry.rs`'s `noun_seed` guards against on app compile).
+///
+/// Gated to std-only because it reads through `crate::metamodel_state()` /
+/// `crate::metamodel_readings()`, which are themselves std-only (they
+/// expose the bundled metamodel corpus the kernel doesn't link in).
+/// Callers (`rebuild`, `cli::entry`, and the in-module test) are all
+/// already in std-only contexts.
+#[cfg(not(feature = "no_std"))]
 pub fn bundled_domain_fact_type_ids() -> hashbrown::HashSet<String> {
     const DOMAIN_MODULES: &[&str] = &[
         "ui", "design", "monoview", "components", "render",

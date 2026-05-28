@@ -456,7 +456,7 @@ pub fn handle_arest_transition(
     // (to swap in the rewritten copy). task-742: pulls cell name +
     // role names from StateMachineCellShape::boot() so the single
     // source of truth in command.rs propagates here.
-    let sm_shape = crate::command::StateMachineCellShape::boot();
+    let sm_shape = crate::ast::StateMachineCellShape::boot();
     let sm_cell = crate::ast::fetch_cell_seq(sm_shape.entity_type_label, state);
     let sm_seq = sm_cell.as_seq()?;
     let (sm_idx, sm_row) = sm_seq
@@ -582,7 +582,7 @@ pub fn handle_arest_transitions_for_entity(
     // fallback hasn't seeded `_status` so the closer behaviour is
     // 404 / fall-through). task-742: pulls names from
     // StateMachineCellShape::boot().
-    let sm_shape = crate::command::StateMachineCellShape::boot();
+    let sm_shape = crate::ast::StateMachineCellShape::boot();
     let sm_cell = crate::ast::fetch_cell_seq(sm_shape.entity_type_label, state);
     let sm_seq = sm_cell.as_seq()?;
     let sm_row = sm_seq

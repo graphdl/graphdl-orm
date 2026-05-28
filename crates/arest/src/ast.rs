@@ -703,6 +703,51 @@ pub fn encode_violation(v: &Violation) -> Object {
 /// A boxed function: Object → Object. Thread-safe, cloneable.
 pub type Fn1 = Arc<dyn Fn(&Object) -> Object + Send + Sync>;
 
+/// State Machine cell shape — the synthesized role-token names the
+/// apply / transition / status-extraction paths read and write to
+/// the `State_Machine_is_currently_in_Status` cell.
+///
+/// task-742: renamed from the legacy code-shaped form
+/// (`StateMachine_has_currentlyInStatus` + camelCased role names like
+/// `currentlyInStatus`, `forResource`, `instanceOf`) to proper FORML2
+/// verbalization (whitepaper §5.1: "Resource is currently in
+/// Status"). Subject becomes "State Machine" (spaced) to match the
+/// sibling cell `State_Machine_Definition_is_for_Noun`; role names
+/// become proper nouns (Status / Resource / Noun) instead of mashed
+/// single tokens. Same single-source-of-truth pattern as before;
+/// only the strings change.
+///
+/// Lives in `ast` (not `command`) so the no_std kernel HATEOAS
+/// direct-write fallback can reach the same role-name constants
+/// without crossing the std-only `command` gate.
+pub struct StateMachineCellShape {
+    /// Cell name carrying the synthesized "State Machine is currently
+    /// in Status" facts.
+    pub cell_name: &'static str,
+    /// Subject role binding: the State Machine entity id.
+    pub state_machine_role: &'static str,
+    /// Object role binding: the current status value.
+    pub current_status_role: &'static str,
+    /// Result entity binding: the target resource id (alias of the
+    /// State Machine entity id at the API surface).
+    pub for_resource_role: &'static str,
+    /// HATEOAS / API entity_type label for the synthesized SM
+    /// representation entity.
+    pub entity_type_label: &'static str,
+}
+
+impl StateMachineCellShape {
+    pub const fn boot() -> Self {
+        StateMachineCellShape {
+            cell_name:           "State_Machine_is_currently_in_Status",
+            state_machine_role:  "State Machine",
+            current_status_role: "Status",
+            for_resource_role:   "Resource",
+            entity_type_label:   "State Machine",
+        }
+    }
+}
+
 /// The program AST. Every node is a function Object → Object.
 #[derive(Clone)]
 pub enum Func {
@@ -3482,7 +3527,7 @@ fn platform_transition(_noun: &str, x: &Object, d: &Object) -> Object {
     let entity_id = items.first().and_then(|o| o.as_atom()).unwrap_or("").to_string();
     let event = items.get(1).and_then(|o| o.as_atom()).unwrap_or("").to_string();
     // Extract current status from state for the entity
-    let sm = crate::command::StateMachineCellShape::boot();
+    let sm = StateMachineCellShape::boot();
     let current_status = fetch_cell_seq(sm.cell_name, d).as_seq()
         .and_then(|facts| facts.iter()
             .find(|f| binding_matches(f, sm.state_machine_role, &entity_id))

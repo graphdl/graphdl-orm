@@ -1451,7 +1451,6 @@ fn format_unload_error(err: &arest::load_reading_core::UnloadError) -> String {
         }
         UnloadError::InvalidName(msg) => format!("invalid name: {msg}"),
         UnloadError::Disallowed => "unload disallowed by policy".to_string(),
-        UnloadError::NotImplemented => "policy not implemented".to_string(),
     }
 }
 

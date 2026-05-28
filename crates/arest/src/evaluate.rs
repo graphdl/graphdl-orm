@@ -114,7 +114,7 @@ fn integrate_round_facts(
                 match ast::cell_put_keyed(&cell_name, &role_refs, fact, &current_state) {
                     Ok(next) => { current_state = next; }
                     Err(conflict) => {
-                        eprintln!("[forward-chain] UC conflict, dropping fact: {:?}", conflict);
+                        crate::diag!("[forward-chain] UC conflict, dropping fact: {:?}", conflict);
                     }
                 }
             }

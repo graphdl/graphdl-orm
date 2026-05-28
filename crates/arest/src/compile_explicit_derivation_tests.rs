@@ -1613,7 +1613,7 @@ Transition 'ship' is triggered by Fact Type 'Order_was_shipped'.
 // currently in Status` matches the post-task-742 cell name and is
 // declared in app.md so the catalog resolves the rule's antecedent
 // (its FT id `State_Machine_is_currently_in_Status` lines up with
-// `crates/arest/src/command.rs::StateMachineCellShape::boot()`'s
+// `crates/arest/src/ast.rs::StateMachineCellShape::boot()`'s
 // `cell_name` constant).
 //
 // This self-contained test mirrors the app.md rule shape: it declares

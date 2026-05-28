@@ -29,46 +29,10 @@ fn to_seeded_refs<'a>(
     }).collect()
 }
 
-/// State Machine cell shape — the synthesized role-token names the
-/// apply / transition / status-extraction paths read and write to
-/// the `State_Machine_is_currently_in_Status` cell.
-///
-/// task-742: renamed from the legacy code-shaped form
-/// (`StateMachine_has_currentlyInStatus` + camelCased role names like
-/// `currentlyInStatus`, `forResource`, `instanceOf`) to proper FORML2
-/// verbalization (whitepaper §5.1: "Resource is currently in
-/// Status"). Subject becomes "State Machine" (spaced) to match the
-/// sibling cell `State_Machine_Definition_is_for_Noun`; role names
-/// become proper nouns (Status / Resource / Noun) instead of mashed
-/// single tokens. Same single-source-of-truth pattern as before;
-/// only the strings change.
-pub struct StateMachineCellShape {
-    /// Cell name carrying the synthesized "State Machine is currently
-    /// in Status" facts.
-    pub cell_name: &'static str,
-    /// Subject role binding: the State Machine entity id.
-    pub state_machine_role: &'static str,
-    /// Object role binding: the current status value.
-    pub current_status_role: &'static str,
-    /// Result entity binding: the target resource id (alias of the
-    /// State Machine entity id at the API surface).
-    pub for_resource_role: &'static str,
-    /// HATEOAS / API entity_type label for the synthesized SM
-    /// representation entity.
-    pub entity_type_label: &'static str,
-}
-
-impl StateMachineCellShape {
-    pub const fn boot() -> Self {
-        StateMachineCellShape {
-            cell_name:           "State_Machine_is_currently_in_Status",
-            state_machine_role:  "State Machine",
-            current_status_role: "Status",
-            for_resource_role:   "Resource",
-            entity_type_label:   "State Machine",
-        }
-    }
-}
+/// Re-export of the canonical SM cell shape; the type itself now
+/// lives in `ast` so no_std consumers (kernel HATEOAS direct-write)
+/// can reach it without crossing the std-only `command` gate.
+pub use crate::ast::StateMachineCellShape;
 
 /// Resolve a def from D: Fetch + metacompose (Backus 13.3.2: ρ).
 /// Returns the Func if the def exists, or None.
