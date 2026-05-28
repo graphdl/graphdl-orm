@@ -86,7 +86,17 @@ State Machine is for Resource. *
 
 * State Machine is for Resource iff Resource is instance of Noun and some State Machine Definition is for that Noun.
 
-### State (absorbed into Resource cell by RMAP)
+### State (projected from SM via State Machine is for Resource × State Machine is currently in Status)
+<!-- task-742 rename context: post-rename the canonical SM status
+     lives in State_Machine_is_currently_in_Status, keyed by the
+     SM entity id; the per-Resource projection materialises via the
+     SM-for-Resource role chain. Resource is an abstract noun so
+     RMAP cannot absorb the status into a Resource cell -- there
+     IS no Resource cell. App-level readings (e.g. apps/tasks/
+     readings/app.md) carry the explicit projection
+     "Resource is currently in Status iff some State Machine is
+     for that Resource and that State Machine is currently in
+     that Status."  -->
 Resource is currently in Status.
   Each Resource is currently in at most one Status.
 
