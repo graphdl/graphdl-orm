@@ -1057,20 +1057,39 @@ pub fn apply_create(args: &[(String, String)], state: &Object) -> Result<Object,
     if noun.is_empty() {
         return Err("missing noun".to_string());
     }
-    // Derive an id when none was supplied. The action panel today
-    // only pre-binds `noun` for ApplyCreate (see `actions_for_root`
-    // / `actions_for_noun`); the future parameter editor will let
-    // the user fill in `id` + arbitrary fields. Synthetic id is
-    // `<noun>-<count>` so two successive creates against the same
-    // noun produce distinguishable rows the post-state assertions
-    // can pin down.
+    // Derive an id when none was supplied. Three paths in priority
+    // order:
+    //   1. Explicit `id` arg — caller supplied it directly.
+    //   2. Reference-scheme arg — look up the noun's declared
+    //      `referenceScheme` in the Noun cell (task-735 / engine path),
+    //      and if the corresponding arg is present use its value. This
+    //      makes UI-panel creates substrate-driven (the schema decides
+    //      the id field) without forcing every caller to know the
+    //      ref-scheme name.
+    //   3. Synthetic `<noun>-<count>` — when neither (1) nor (2)
+    //      applies. The action panel today pre-binds only `noun` for
+    //      ApplyCreate (see `actions_for_root` / `actions_for_noun`),
+    //      so most live invocations land here; the synthetic shape
+    //      keeps two successive creates against the same noun
+    //      observably distinguishable in post-state assertions.
     let supplied_id = arg(args, "id");
-    let id = if supplied_id.is_empty() {
-        let existing = ast::fetch_or_phi(&noun, state);
-        let n = existing.as_seq().map(|s| s.len()).unwrap_or(0);
-        format!("{noun}-{n}")
-    } else {
+    let id = if !supplied_id.is_empty() {
         supplied_id
+    } else {
+        let scheme = ast::fetch_cell_seq("Noun", state)
+            .as_seq()
+            .and_then(|ns| ns.iter()
+                .find(|n| ast::binding(n, "name") == Some(&noun))
+                .and_then(|n| ast::binding(n, "referenceScheme").map(String::from)))
+            .unwrap_or_else(|| "id".to_string());
+        let scheme_value = arg(args, &scheme);
+        if !scheme_value.is_empty() {
+            scheme_value
+        } else {
+            let existing = ast::fetch_or_phi(&noun, state);
+            let n = existing.as_seq().map(|s| s.len()).unwrap_or(0);
+            format!("{noun}-{n}")
+        }
     };
     // Build a named-tuple entity carrying just the id binding. Same
     // shape `handle_arest_create_for_slug` produces for an empty
@@ -2160,6 +2179,34 @@ mod tests {
         let state = Object::phi();
         let err = apply_create(&[], &state).unwrap_err();
         assert!(err.contains("missing noun"), "{err}");
+    }
+
+    #[test]
+    fn apply_create_uses_declared_reference_scheme_when_field_supplied() {
+        // Noun cell declares `Wine App(.Slug)`-style ref scheme:
+        // a Noun fact with `referenceScheme=Slug`. When the caller
+        // supplies a `Slug` arg, the new entity's id comes from that
+        // value instead of the synthetic `<noun>-<count>` fallback.
+        let state = Object::phi();
+        let noun_decl = Object::seq(alloc::vec![
+            Object::seq(alloc::vec![Object::atom("name"), Object::atom("Wine App")]),
+            Object::seq(alloc::vec![Object::atom("referenceScheme"), Object::atom("Slug")]),
+        ]);
+        let state = ast::cell_push("Noun", noun_decl, &state);
+
+        let args = vec![
+            ("noun".to_string(), "Wine App".to_string()),
+            ("Slug".to_string(), "notepad-plus-plus".to_string()),
+        ];
+        let new_state = apply_create(&args, &state).expect("create");
+        let rows = ast::fetch_or_phi("Wine App", &new_state);
+        let rows = rows.as_seq().expect("cell populated");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            ast::binding(&rows[0], "id"),
+            Some("notepad-plus-plus"),
+            "id must come from the declared reference-scheme arg"
+        );
     }
 
     #[test]
