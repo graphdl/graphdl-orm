@@ -292,23 +292,36 @@ pub fn handle_arest_create(
     }
     let noun = noun_raw.to_string();
 
-    // Generate an id. The worker uses `crypto.randomUUID()`; the
-    // kernel can't always reach a hardware entropy source (QEMU
-    // commonly hides RDSEED/RDRAND, and `csprng::random_bytes`
-    // panics on reseed failure — #571 tracks the EFI_RNG_PROTOCOL
-    // fallback). Until that lands, we generate a stable opaque id
-    // from a per-process atomic counter + an FNV-1a hash of the
-    // request body. Counter ensures uniqueness across requests in
-    // the same boot; FNV-hash makes it opaque so callers can't
-    // predict the next id from request shape alone. This is the
-    // direct-write fallback's id strategy — the engine path will
-    // route through `arest::naming::resolve_entity_id` once #588
-    // unblocks the no_std Stage-2 parser.
-    let counter = NEXT_ENTITY_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let body_hash = fnv1a_64(body);
-    let id = alloc::format!("k{:08x}{:016x}", counter, body_hash);
+    // task-780 sweep item 5: id derives from the noun's reference
+    // scheme via the engine-path resolver, not the legacy synthetic
+    // `k{counter}{fnv}` shape. Build a stringified `fields` map first
+    // (only stringifiable JSON values participate) so
+    // `naming::resolve_entity_id` can look up the ref-scheme field;
+    // the entity construction below re-iterates the parsed JSON to
+    // preserve field order in the response envelope.
+    let mut fields_map: hashbrown::HashMap<String, String> = hashbrown::HashMap::new();
+    if let Some(JsonValue::Object(fields)) = parsed.get("fields") {
+        for (k, v) in fields {
+            let val = match v {
+                JsonValue::Str(s) => s.as_str(),
+                JsonValue::Num(n) => n.as_str(),
+                JsonValue::Bool(true) => "T",
+                JsonValue::Bool(false) => "F",
+                _ => continue,
+            };
+            fields_map.insert(k.to_string(), val.to_string());
+        }
+    }
 
-    // Same flatten policy as `handle_arest_create_for_slug`.
+    // If the caller did not supply the noun's reference-scheme field,
+    // refuse the create -- a synthetic id would let the request bypass
+    // the FORML identity contract. Callers fix this by setting the
+    // appropriate field (e.g. `id` for nouns declared as `(.id)`).
+    let id = crate::naming::resolve_entity_id(state, &noun, &fields_map)?;
+
+    // Same flatten policy as `handle_arest_create_for_slug`. Iterate
+    // the parsed JSON directly so response field order tracks request
+    // field order rather than HashMap iteration order.
     let mut pairs: Vec<Object> = Vec::new();
     pairs.push(Object::seq(alloc::vec![Object::atom("id"), Object::atom(&id)]));
     if let Some(JsonValue::Object(fields)) = parsed.get("fields") {
@@ -654,17 +667,6 @@ use core::sync::atomic::{AtomicU32, Ordering};
 /// kernel lifetime, not globally. Once the engine path lands the
 /// engine's reference-scheme resolver replaces this.
 static NEXT_ENTITY_COUNTER: AtomicU32 = AtomicU32::new(0);
-
-/// 64-bit FNV-1a hash. Good enough to make the id opaque to callers
-/// (no preimage from request shape); not a cryptographic hash.
-fn fnv1a_64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in bytes {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
 
 /// Decode `%20` and `%XX` percent-escapes in a URL path segment.
 /// The kernel's HTTP path arrives raw — we decode it lazily here so
@@ -1344,5 +1346,66 @@ mod tests {
         let updated = update_binding(&entity, "Status", "A");
         assert_eq!(crate::ast::binding(&updated, "Status"), Some("A"));
         assert_eq!(crate::ast::binding(&updated, "id"), Some("x"));
+    }
+
+    // task-780 sweep item 5: handle_arest_create now routes through
+    // `naming::resolve_entity_id` instead of the synthetic
+    // `k{counter}{fnv}` id. Three tests cover the contract: default
+    // ref-scheme (`id`), declared ref-scheme (a named field), and
+    // refusal when the ref-scheme field is missing.
+
+    #[test]
+    fn arest_create_uses_default_id_reference_scheme() {
+        // Noun declares no explicit referenceScheme; resolver falls
+        // back to "id" (the default). Supplying `id` in fields lets
+        // the create succeed and the response echoes that id.
+        let s = Object::phi();
+        let s = cell_push("Noun", fact(&[("name", "Widget")]), &s);
+        let body = br#"{"noun":"Widget","fields":{"id":"w-42","color":"red"}}"#;
+        let (new_state, resp) = handle_arest_create(&s, "POST", "/arest/entity", body)
+            .expect("create must succeed with default id scheme");
+        let resp = String::from_utf8(resp).unwrap();
+        assert!(resp.contains("\"id\":\"w-42\""), "{resp}");
+        assert!(resp.contains("\"type\":\"Widget\""), "{resp}");
+        assert!(resp.contains("\"color\":\"red\""), "{resp}");
+
+        // Round-trip: the new state should now hold one Widget.
+        let widget_cell = crate::ast::fetch_cell_seq("Widget", &new_state);
+        let count = widget_cell.as_seq().map(|s| s.len()).unwrap_or(0);
+        assert_eq!(count, 1, "Widget cell must hold exactly the new entity");
+    }
+
+    #[test]
+    fn arest_create_uses_declared_reference_scheme() {
+        // Noun declares `name` as its reference scheme. Caller
+        // supplies `name` (not `id`) and the resolver picks that up
+        // as the entity id.
+        let s = Object::phi();
+        let s = cell_push(
+            "Noun",
+            fact(&[("name", "Organization"), ("referenceScheme", "name")]),
+            &s,
+        );
+        let body = br#"{"noun":"Organization","fields":{"name":"Acme","tier":"gold"}}"#;
+        let (_new_state, resp) = handle_arest_create(&s, "POST", "/arest/entity", body)
+            .expect("create must succeed with declared ref scheme");
+        let resp = String::from_utf8(resp).unwrap();
+        assert!(resp.contains("\"id\":\"Acme\""), "id must come from name field: {resp}");
+        assert!(resp.contains("\"name\":\"Acme\""), "{resp}");
+        assert!(resp.contains("\"tier\":\"gold\""), "{resp}");
+    }
+
+    #[test]
+    fn arest_create_rejects_when_reference_scheme_field_missing() {
+        // Default ref-scheme is "id"; caller omits it entirely. The
+        // handler must refuse rather than synthesize an id -- a
+        // synthetic id would let the request bypass the FORML
+        // identity contract.
+        let s = cell_push("Noun", fact(&[("name", "Widget")]), &Object::phi());
+        let body = br#"{"noun":"Widget","fields":{"color":"red"}}"#;
+        assert!(
+            handle_arest_create(&s, "POST", "/arest/entity", body).is_none(),
+            "create must refuse when the id field is missing"
+        );
     }
 }

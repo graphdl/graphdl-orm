@@ -332,11 +332,11 @@ pub fn arest_http_handler(req: &http::Request) -> http::Response {
     // POST /arest/entity — AREST command path (#614/#615), engine-less
     // direct-write fallback. Mirror of the worker's
     // `router.ts::handleArestRoute` POST branch when the engine traps.
-    // Body shape: `{noun, fields:{...}, domain?}`. ID generated via
-    // `arest::csprng::random_bytes` (16 random bytes hex-encoded), so
-    // entropy must be installed before this fires (it is — see
-    // `entry_uefi.rs::kernel_run_uefi` which calls `entropy::install`
-    // pre-`net::init`).
+    // Body shape: `{noun, fields:{...}, domain?}`. ID derives from the
+    // noun's reference-scheme field via `naming::resolve_entity_id`
+    // (task-780 sweep item 5); the caller MUST supply that field in
+    // `fields` or the handler returns None and the kernel surfaces a
+    // 404. No entropy is consumed in this path.
     if req.method == "POST" && req.path == "/arest/entity" {
         let result = system::with_state(|s| {
             arest::hateoas::handle_arest_create(s, &req.method, &req.path, &req.body)
