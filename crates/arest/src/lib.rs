@@ -5563,7 +5563,7 @@ Order has total.
     /// `RingConstraintType.Asymmetric`). A single directed (1,2) edge
     /// must compile clean — no reverse pair, no violation.
     #[test]
-    fn ring_AS_trailing_marker_compiles_clean_for_directed_edge() {
+    fn ring_as_trailing_marker_compiles_clean_for_directed_edge() {
         let src = "\
 Task(.id) is an entity type.
 Task blocks Task.
@@ -5583,7 +5583,7 @@ Task '1' blocks Task '2'.
     /// `VerbalizationCoreSnippets.xml` line 91/97
     /// (`ModalPossibilityOperator alethic sign=negative`).
     #[test]
-    fn ring_AS_modal_impossible_compiles_clean_for_directed_edge() {
+    fn ring_as_modal_impossible_compiles_clean_for_directed_edge() {
         let src = "\
 Task(.id) is an entity type.
 Task blocks Task.
@@ -5603,7 +5603,7 @@ Task '1' blocks Task '2'.
     /// `If <ant> then <reversed-ant> is not.` Mirrors AREST's
     /// pre-existing `isnot-conse` matcher path.
     #[test]
-    fn ring_AS_isnot_consequent_compiles_clean_for_directed_edge() {
+    fn ring_as_isnot_consequent_compiles_clean_for_directed_edge() {
         let src = "\
 Task(.id) is an entity type.
 Task blocks Task.
@@ -5646,7 +5646,7 @@ Task '1' blocks Task '2'.
     /// the prose. Authors should use the canonical trailing-marker
     /// or `it is impossible that` form.
     #[test]
-    fn ring_AS_unrecognised_prose_does_not_silently_misclassify_as_symmetric() {
+    fn ring_as_unrecognised_prose_does_not_silently_misclassify_as_symmetric() {
         let src = "\
 Task(.id) is an entity type.
 Task blocks Task.

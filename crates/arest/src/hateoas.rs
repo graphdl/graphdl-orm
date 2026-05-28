@@ -810,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn collection_emits_docs_plus_totalDocs() {
+    fn collection_emits_docs_plus_total_docs() {
         let s = state_with_org("acme", "Acme Corp");
         let body = handle_arest_read(&s, "GET", "/arest/organizations").expect("matched");
         let body = String::from_utf8(body).unwrap();
@@ -821,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_cell_returns_zero_totalDocs() {
+    fn empty_cell_returns_zero_total_docs() {
         // Noun is registered, but no entities exist — fallback should
         // still emit a valid envelope with empty docs.
         let noun_decl = fact(&[("name", "Organization")]);
