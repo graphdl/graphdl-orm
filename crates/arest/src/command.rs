@@ -7790,7 +7790,12 @@ Transition 'finish' is defined in State Machine Definition 'Widget'.
             "rejected batch must emit an empty delta (D' = D); got {:?}",
             result.state);
         let merged = ast::merge_states(&state, &result.state);
-        assert!(ast::fetch_or_phi("Task_has_Description", &merged).as_seq()
+        // task-950 ripple: read via fetch_cell_seq so a folded-Map cell
+        // flattens to Seq before the empty check. fetch_or_phi returns
+        // the raw cell, so a Map result trips as_seq() -> None and the
+        // map_or(true, ...) default makes the assertion trivially pass
+        // even when Tasks DID survive -- a false-pass once cells fold.
+        assert!(ast::fetch_cell_seq("Task_has_Description", &merged).as_seq()
             .map_or(true, |s| s.is_empty()),
             "no Task may survive the rolled-back batch");
     }
