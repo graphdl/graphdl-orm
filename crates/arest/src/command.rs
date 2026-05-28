@@ -1561,28 +1561,21 @@ fn find_firing_transition_id(
     })
 }
 
-/// task-919: resolve the Verb performed during a Transition. Tries the
-/// canonical `Verb_is_performed_during_Transition` cell and the
-/// parenthesized `(Mealy semantics)` variant, since the parser may
-/// register either form depending on whether the inline annotation is
-/// folded into the FT id.
+/// task-919: resolve the Verb performed during a Transition. The
+/// canonical cell name is `Verb_is_performed_during_Transition`;
+/// task-843 (`strip_semantics_annotation` in parse_forml2_stage2)
+/// guarantees the parser never folds the `(Mealy semantics)` inline
+/// annotation into the FT id, so the suffixed variants the fallback
+/// used to scan are unreachable from any compiled state. Pinned by
+/// `task_843_moore_semantics_ft_collapses_to_canonical_id`.
 fn lookup_verb_for_transition(d: &ast::Object, transition_id: &str) -> Option<String> {
-    for &cell_name in &[
-        "Verb_is_performed_during_Transition",
-        "Verb_is_performed_during_Transition_(Mealy_semantics)",
-        "Verb_is_performed_during_Transition_(mealy_semantics)",
-    ] {
-        if let Some(v) = ast::fetch_cell_seq(cell_name, d).as_seq().and_then(|facts| {
-            facts.iter().find_map(|f| {
-                (ast::binding(f, "Transition") == Some(transition_id))
-                    .then(|| ast::binding(f, "Verb").map(String::from))
-                    .flatten()
-            })
-        }) {
-            return Some(v);
-        }
-    }
-    None
+    ast::fetch_cell_seq("Verb_is_performed_during_Transition", d)
+        .as_seq()
+        .and_then(|facts| facts.iter().find_map(|f| {
+            (ast::binding(f, "Transition") == Some(transition_id))
+                .then(|| ast::binding(f, "Verb").map(String::from))
+                .flatten()
+        }))
 }
 
 /// task-919: dispatch target derived from a Function entity. Verb is a
