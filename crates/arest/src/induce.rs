@@ -163,7 +163,7 @@ fn enum_values_for_noun(state: &Object, noun_name: &str) -> Vec<String> {
 /// raw stage-2 output (before per-FT cell projection) participates.
 fn entity_population_for_noun(state: &Object, noun_name: &str) -> Vec<String> {
     let mut seen: Vec<String> = Vec::new();
-    let mut push_unique = |v: &str, seen: &mut Vec<String>| {
+    let push_unique = |v: &str, seen: &mut Vec<String>| {
         if !v.is_empty() && !seen.iter().any(|s| s == v) {
             seen.push(v.to_string());
         }
