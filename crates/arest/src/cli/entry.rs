@@ -485,6 +485,27 @@ pub fn main_entry() {
         .expect("tenant master install (#663): \
                  could not read or generate ~/.arest/tenant_master.bin");
 
+    // task-919 gap-4 production wiring: when AREST_APPS_DIR points at a
+    // real directory and the local feature is on (rusqlite reach), register
+    // the four arest-dev Rebuild SM Platform Functions
+    // (rebuild_snapshot/verify/apply_bulk/init) so an arest-dev SM
+    // transition can dispatch to them. The install is opt-in by env var so
+    // default invocations don't require an apps_dir layout: the names stay
+    // absent from PLATFORM_FALLBACK until the operator sets the env. The
+    // four names are pre-approved in `ast::APPROVED_PLATFORM_FN_NAMES`
+    // (sec-2 audit, _reports/sec-2-platform-audit-2026-04-21.md);
+    // filesystem reach inside each handler is bounded to this `apps_dir`
+    // via the closure capture in `rebuild::install_rebuild_fns`. The unit
+    // pin `rebuild_install_fns_handlers_are_dispatchable_via_platform_apply`
+    // covers the install side; this hook is the production caller.
+    #[cfg(feature = "local")]
+    if let Ok(apps_dir) = std::env::var("AREST_APPS_DIR") {
+        let path = std::path::PathBuf::from(&apps_dir);
+        if path.is_dir() {
+            crate::rebuild::install_rebuild_fns(path);
+        }
+    }
+
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // ── Subcommand dispatch ────────────────────────────────────────────
