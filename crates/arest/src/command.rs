@@ -3942,47 +3942,16 @@ pub fn wine_app_ids(state: &ast::Object) -> Vec<String> {
 
 /// Return the display title for a Wine App slug, if one was declared.
 ///
-/// First reads the canonical `Wine_App_has_display-_Title` cell —
-/// the parser's standard emission for `Wine App has display- Title.`
-/// once the FT is in scope (full bundled metamodel). Falls back to
-/// the legacy mis-bucketed `has display- Title '<Title>'` cells for
-/// partial-metamodel states (the command-module unit-test fixture
-/// shape that pre-dates the FT being declared).
-///
-/// Returns `None` if no matching binding is found in either source
-/// OR if the slug isn't a known Wine App.
+/// Reads the canonical `Wine_App_has_display-_Title` cell -- the
+/// parser's emission for `Wine App has display- Title.`. Each fact
+/// carries `(Wine App, <slug>) (Title, <title>)`. Returns `None` if
+/// no matching binding is found or if the slug isn't a known Wine App.
 pub fn wine_app_display_title(state: &ast::Object, slug: &str) -> Option<String> {
-    // Canonical cell: emitted by the parser when the
-    // `Wine App has display- Title.` FT is in scope. Each fact carries
-    // `(Wine App, <slug>) (Title, <title>)`.
-    let canonical = ast::fetch_cell_seq("Wine_App_has_display-_Title", state);
-    if let Some(seq) = canonical.as_seq() {
-        for fact in seq.iter() {
-            if ast::binding(fact, "Wine App") == Some(slug) {
-                if let Some(title) = ast::binding(fact, "Title") {
-                    return Some(title.to_string());
-                }
-            }
-        }
-    }
-    // Fallback: legacy mis-bucketed cells of the form
-    // `has display- Title '<actual title>'`. Pre-FT-declaration states
-    // (and the command-module unit-test fixture) populate this shape;
-    // production callers under the bundled metamodel hit the
-    // canonical-cell branch above first.
-    for (name, contents) in ast::cells_iter(state) {
-        let prefix = "has display- Title '";
-        if !name.starts_with(prefix) || !name.ends_with('\'') {
-            continue;
-        }
-        let title = &name[prefix.len()..name.len() - 1];
-        for fact in ast::cell_facts_iter(contents) {
-            if ast::binding(fact, "Wine App") == Some(slug) {
-                return Some(title.to_string());
-            }
-        }
-    }
-    None
+    ast::fetch_cell_seq("Wine_App_has_display-_Title", state)
+        .as_seq()?
+        .iter()
+        .find(|f| ast::binding(f, "Wine App") == Some(slug))
+        .and_then(|f| ast::binding(f, "Title").map(|s| s.to_string()))
 }
 
 /// Resolve a user-supplied name into a `(slug, prefix Directory id)`
@@ -4006,7 +3975,7 @@ pub fn wine_app_by_name(state: &ast::Object, name: &str) -> Option<(String, Stri
         return Some((name.to_string(), prefix));
     }
     // Path 2: exact display title (case-sensitive match against the
-    // mis-bucketed `has display- Title '<X>'` cell names).
+    // canonical `Wine_App_has_display-_Title` cell).
     for slug in &known {
         if let Some(title) = wine_app_display_title(state, slug) {
             if title == name {
@@ -7608,10 +7577,10 @@ Each Status has at least one Verb performed in it.
             &d,
         );
         let d = ast::cell_push(
-            "has display- Title 'Notepad++'",
+            "Wine_App_has_display-_Title",
             ast::fact_from_pairs(&[
                 ("Wine App", "notepad-plus-plus"),
-                ("has display- Title 'Notepad++'", ""),
+                ("Title", "Notepad++"),
             ]),
             &d,
         );
@@ -7633,10 +7602,10 @@ Each Status has at least one Verb performed in it.
             &d,
         );
         ast::cell_push(
-            "has display- Title 'Adobe Photoshop CS6'",
+            "Wine_App_has_display-_Title",
             ast::fact_from_pairs(&[
                 ("Wine App", "photoshop-cs6"),
-                ("has display- Title 'Adobe Photoshop CS6'", ""),
+                ("Title", "Adobe Photoshop CS6"),
             ]),
             &d,
         )
@@ -7674,8 +7643,8 @@ Each Status has at least one Verb performed in it.
     #[test]
     fn wine_app_by_name_resolves_display_title() {
         let state = seeded_wine_app_state();
-        // Display title — falls through to the `has display- Title '<X>'`
-        // cell scan.
+        // Display title -- reads the canonical `Wine_App_has_display-_Title`
+        // cell.
         assert_eq!(
             wine_app_by_name(&state, "Notepad++"),
             Some(("notepad-plus-plus".to_string(),
