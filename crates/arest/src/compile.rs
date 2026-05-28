@@ -3234,11 +3234,13 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // Future synthetic rule kinds extend this cell by appending their
     // consequents at the same point.
     //
-    // SM init and event-fold both emit to the same three cells:
-    // StateMachine_has_instanceOf / _currentlyInStatus / _forResource.
-    // The for_Resource backfill (task-922-sm-init-projection) emits
-    // only to State_Machine_is_for_Resource, which is already in
-    // the list below.
+    // SM init and event-fold both emit to the same three cells (the
+    // canonical FORML2 forms post-task-742):
+    // State_Machine_is_instance_of_Noun / _is_currently_in_Status /
+    // _is_for_Resource. The for_Resource backfill
+    // (task-922-sm-init-projection) emits only to
+    // State_Machine_is_for_Resource, which is already in the list
+    // below.
     // Emit the constants only when at least one SM exists in the
     // compiled model — apps without SMs get an empty registry (no
     // cells to drop, no work for the dispatcher).
@@ -3990,8 +3992,9 @@ fn compile_derivations(data: &CellIndex, state_machines: &[CompiledStateMachine]
 
     // task-740: event-fold derivations. For each SM, build a rule
     // that reads each transition's trigger-fact-type cell and emits
-    // StateMachine_has_currentlyInStatus (+ instanceOf + forResource)
-    // per event-fact occurrence. SM init's `is_new` guard filters out
+    // State_Machine_is_currently_in_Status (+ _is_instance_of_Noun +
+    // _is_for_Resource, the canonical post-task-742 forms) per
+    // event-fact occurrence. SM init's `is_new` guard filters out
     // resources event-fold has already initialized, so we don't
     // double-emit 'initial' alongside the event-derived status.
     let sm_event_fold_derivations: Vec<_> = state_machines.iter().map(|sm| {
@@ -6459,7 +6462,8 @@ pub(crate) const TRANSITIVITY_ID: &str = "_transitivity";
 ///
 /// For each noun with a state machine definition, when an entity of that noun
 /// exists in the population but no State Machine is for that entity, derive:
-///   - State Machine instance (instanceOf, forResource, currentlyInStatus = initial)
+///   - State Machine instance (_is_instance_of_Noun, _is_for_Resource,
+///     _is_currently_in_Status = initial) — the canonical post-task-742 cells.
 fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
         let sm_noun = sm.noun_name.clone();
         // Use the cell-driven initial — explicit `Status is initial in SM`
@@ -6626,30 +6630,30 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
 /// Paper §5.1: "Resource is currently in Status folds those tuples
 /// latest-wins per resource." When an event fact of an SM's
 /// trigger-fact-type exists for a resource, derive the SM instance
-/// (instanceOf + forResource) and set currentlyInStatus to the
-/// transition's target status.
+/// (_is_instance_of_Noun + _is_for_Resource) and set
+/// _is_currently_in_Status to the transition's target status.
 ///
 /// This is the substrate hook that makes event facts auto-update SM
 /// state without going through `apply operation=transition`. Bulk-
 /// readings of event facts (e.g. `Task '905' is finished.`) flow
 /// through the parser → InstanceFact → trigger-FT cell, then
-/// event-fold emits StateMachine_has_currentlyInStatus.
+/// event-fold emits State_Machine_is_currently_in_Status.
 ///
 /// MVP simplification: skip latest-wins. For a resource with one
-/// event fact this produces the correct currentlyInStatus. For a
-/// resource with multiple event facts (e.g. 'started' then
-/// 'finished'), event-fold emits BOTH target statuses and the
-/// "exactly one currentlyInStatus per SM" UC fires — this is
-/// acceptable for the initial-migration use case where each
-/// resource has at most one event fact. A future fix needs an
-/// aggregation primitive (max-by-timestamp / latest-by-recorded-at).
+/// event fact this produces the correct status. For a resource with
+/// multiple event facts (e.g. 'started' then 'finished'), event-fold
+/// emits BOTH target statuses and the "exactly one
+/// _is_currently_in_Status per SM" UC fires — this is acceptable
+/// for the initial-migration use case where each resource has at
+/// most one event fact. A future fix needs an aggregation primitive
+/// (max-by-timestamp / latest-by-recorded-at).
 ///
 /// Resource extraction: each event fact carries one role binding
 /// where role_name == `sm.noun_name` (e.g. `Task is started` has a
 /// `Task` role). Pulls the resource value, then synthesizes the
 /// three SM facts using the same shape as `compile_sm_init_for`.
 /// SM init's `is_new` guard filters out resources already in
-/// StateMachine_has_forResource — so init won't double-emit
+/// State_Machine_is_for_Resource — so init won't double-emit
 /// 'initial' for resources event-fold has already covered.
 fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
     let sm_noun = sm.noun_name.clone();
@@ -6659,7 +6663,8 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
     // For each (from, to, event_ft) transition, build an inner Func
     // that reads event_ft's facts, extracts each fact's resource
     // value (the binding under role_name == sm_noun), and emits the
-    // 3-fact instanceOf + forResource + currentlyInStatus tuple.
+    // 3-fact _is_instance_of_Noun + _is_for_Resource +
+    // _is_currently_in_Status tuple.
     let inner_funcs: Vec<Func> = sm.transition_table.iter().map(|(_from, to, event_ft)| {
         let to_obj = Object::atom(to);
         let sm_noun_obj = Object::atom(&sm_noun);
@@ -6779,10 +6784,11 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
 /// silently drop those entities.
 ///
 /// Shape mirrors `compile_sm_event_fold`'s per-resource emit but
-/// produces only the for_Resource fact — the currentlyInStatus row
-/// already exists in the population (that's how we found the
-/// entity), and re-emitting it under the initial status would
-/// violate the "Each State Machine is in exactly one Status" UC.
+/// produces only the State_Machine_is_for_Resource fact -- the
+/// _is_currently_in_Status row already exists in the population
+/// (that's how we found the entity), and re-emitting it under the
+/// initial status would violate the "Each State Machine is in
+/// exactly one Status" UC.
 /// The "Each Resource has at most one State Machine" UC on
 /// for_Resource stays satisfied because the existing-set
 /// subtraction filters out resources already covered.
