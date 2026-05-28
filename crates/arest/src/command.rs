@@ -4300,14 +4300,44 @@ Resource is mirroring Status.
     /// SM-bridge fixture from task-968) the test PASSES -- the bridge
     /// cell is preserved correctly on the no-op update. That LOCATES
     /// the live tasks.db bug NOT in the in-memory apply path but in the
-    /// PERSIST/COMMIT layer between apply and SQLite (the path that
-    /// writes the apply delta back to disk). Hypothesis: the commit
-    /// path overwrites cells with the delta value (empty if the
-    /// derivation didn't re-emit) instead of merging with existing,
-    /// so a stratum-1 rule that doesn't fire on the dirty noun's keys
-    /// drops its consequent cell. Pinning the in-memory invariant
-    /// here keeps the apply layer honest; a separate failing repro at
-    /// the persist scope is the path to fixing the live bug.
+    /// PERSIST/COMMIT layer.
+    ///
+    /// Diagnosis (deepened later in the same session): the
+    /// drop-then-rederive at command.rs:2630+ clears every derived
+    /// consequent whose rule id is in `derivation_index:{noun}` to phi()
+    /// before the seeded forward chain runs. The seed combines
+    /// `touched_cells` (the apply payload's writes) with the antecedent
+    /// reads of every dropped-cell-producing rule. If a rule's
+    /// antecedents are NOT in `touched_cells` (the bridge case: an
+    /// updateEntity touching only Task_has_Description, where the
+    /// bridge reads Resource_is_currently_in_Status), the rule doesn't
+    /// fire, and its dropped consequent stays phi(). `diff_cells` then
+    /// captures phi() vs the populated existing cell; `merge_delta`'s
+    /// non-Map delta path REPLACES the existing Map with phi(), wiping
+    /// the bridge population.
+    ///
+    /// The naive fix -- have merge_map_cell_contents preserve existing
+    /// when delta is phi() -- breaks
+    /// `update_clears_stale_derived_consequents_before_forward_chain`,
+    /// which DEPENDS on phi() replacing the existing entry (Task 1's
+    /// stale "blocked" Readiness must clear when Task 2 transitions out
+    /// of pending; the rule's antecedent becomes false, no facts are
+    /// emitted, and the cell must wipe). Both invariants conflict at
+    /// the merge layer: stale-clear requires phi-replace; bridge-preserve
+    /// requires phi-no-op. The discriminator lives one layer up -- did
+    /// the rule's antecedents *actually* change on this apply?
+    ///
+    /// A static drop filter ("only drop cells whose producing rule's
+    /// reads intersect touched_cells") fixes the bridge case but breaks
+    /// multi-step chains: a downstream rule R2 reading R1's consequent
+    /// can't be expressed at drop time because R1's writes aren't in
+    /// touched_cells yet. The real fix likely needs adaptive (per-round)
+    /// drop semantics or an explicit "clear cell" emission from the
+    /// chain. Out of scope for a single iteration.
+    ///
+    /// Pinning the in-memory invariant here keeps the apply layer
+    /// honest; a failing repro at the persist scope is the path to
+    /// fixing the live bug.
     ///
     /// Companion to task-968 (materialization on create); both rely on
     /// the same BRIDGE_READINGS fixture.
