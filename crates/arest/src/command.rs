@@ -885,6 +885,23 @@ fn auto_generate_entity_id(noun: &str, state: &ast::Object) -> String {
 /// forward-chain over them has no identity to ground and can diverge. Gates
 /// createEntity and updateEntity; `compile` stays permissive at design-time.
 fn noun_runtime_defined(noun: &str, state: &ast::Object, d: &ast::Object) -> bool {
+    // task-961 lift: prefer the metamodel reading
+    //   * Noun is instantiable iff Noun has Object Type 'entity'
+    //     and Noun has some Reference Scheme Noun.
+    // (declared in readings/core/core.md with the `**` marker so the
+    // consequent is stored as the Noun_is_instantiable cell). When the
+    // cell is populated, this is a one-step set-membership check; the
+    // predicate logic lives in the readings, not here.
+    let lifted = [state, d].iter().any(|src|
+        ast::fetch_cell_seq("Noun_is_instantiable", src).as_seq().map_or(false, |fs|
+            fs.iter().any(|f| ast::binding(f, "Noun") == Some(noun))));
+    if lifted { return true; }
+    // Procedural fallback for states where the derivation hasn't yet
+    // materialized into a stored cell (task-961's earlier attempt hit
+    // the RMAP absorbed-FT reconstitution gap that task-962 is closing).
+    // Same predicate, evaluated inline against the Noun cell -- safe
+    // because the gate only ever needs to admit fewer creates than the
+    // reading would; never more.
     [state, d].iter().any(|src|
         ast::fetch_cell_seq("Noun", src).as_seq().map_or(false, |fs|
             fs.iter().any(|f|

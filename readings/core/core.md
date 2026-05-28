@@ -138,16 +138,18 @@ Noun plays Role.
   Each Noun plays some Role.
   For each Role, exactly one Noun plays that Role.
   It is possible that some Noun plays more than one Role.
-Noun is instantiable. *
+Noun is instantiable. **
   <!-- task-961 lift: a Noun is instantiable iff it is an entity type
        (objectType='entity') AND it has a reference scheme (identity).
        The derivation under ## Derivation Rules below carries the logic;
        the Rust create/update gate at command.rs::noun_runtime_defined
-       remains as a defensive fallback until the engine queries this
-       derived cell directly. View-materialized (the `*` marker) so the
-       compute happens on read -- no separate stored cell, no risk of
-       the absorb-vs-data-cell asymmetry that task-961's earlier attempt
-       hit on the Noun_has_Object_Type FT read. -->
+       reads this stored cell first, falling back to the procedural
+       Noun-cell scan when the cell is empty (covers states where the
+       derivation hasn't materialized -- task-961's RMAP absorbed-FT
+       reconstitution gap, addressed by task-962 in flight). The `**`
+       marker stores the consequent; once 962 closes the absorbed-FT
+       gap, the procedural fallback can delete and the gate becomes
+       a pure cell query. -->
 
 ### Reading
 Reading has Text.
