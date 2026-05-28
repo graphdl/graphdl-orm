@@ -226,7 +226,7 @@ impl DeonticShapeTable {
 /// `_with_*` variants take extra dispatch tables. Per AREST.tex §3.2
 /// Platform Binding, registered functions occupy the platform-layer
 /// complement of compiled readings; together they span DEFS.
-pub type TranslatorFn = fn(&Object, &StmtIndex) -> Vec<Object>;
+type TranslatorFn = fn(&Object, &StmtIndex) -> Vec<Object>;
 
 /// Registry of translator-name → fn pointer. The string keys must
 /// match the second column of the
@@ -239,7 +239,7 @@ pub type TranslatorFn = fn(&Object, &StmtIndex) -> Vec<Object>;
 /// Multi-output translators (translate_fact_types) and arg-bearing
 /// variants (translate_*_with_table[s]/_matrix/_ft_ids) live outside
 /// the registry — the stage-2 pipeline still calls them by name.
-pub fn translator_function_registry() -> hashbrown::HashMap<&'static str, TranslatorFn> {
+fn translator_function_registry() -> hashbrown::HashMap<&'static str, TranslatorFn> {
     let mut m: hashbrown::HashMap<&'static str, TranslatorFn> = hashbrown::HashMap::new();
     m.insert("translate_nouns",                  translate_nouns                 as TranslatorFn);
     m.insert("translate_subtypes",               translate_subtypes              as TranslatorFn);
@@ -1803,13 +1803,13 @@ impl SetConstraintKindTable {
 /// should be skipped (a different translator owns it). Each predicate
 /// is registered in `set_constraint_arbitration_registry` keyed by the
 /// rule name declared in the readings parallel-enum.
-pub type SetConstraintArbitrationFn = fn(text: &str, declared_nouns: &[String], idx: &StmtIndex, stmt_id: &str) -> bool;
+type SetConstraintArbitrationFn = fn(text: &str, declared_nouns: &[String], idx: &StmtIndex, stmt_id: &str) -> bool;
 
 /// Translator pre-gate predicate: returns `true` when the Statement
 /// should be skipped before the translator's per-kind dispatch. Used
 /// uniformly across all of a translator's kinds (e.g. cardinality's
 /// "skip if Derivation Rule" applies to FC + UC + MC alike).
-pub type CardinalityArbitrationFn = fn(state: &Object, idx: &StmtIndex, stmt_id: &str) -> bool;
+type CardinalityArbitrationFn = fn(state: &Object, idx: &StmtIndex, stmt_id: &str) -> bool;
 
 /// Skip when the Statement is also classified as Derivation Rule —
 /// `iff` makes the whole sentence a rule even when it incidentally
@@ -1828,7 +1828,7 @@ fn skip_card_on_deontic_operator(state: &Object, _idx: &StmtIndex, stmt_id: &str
 /// Registry of cardinality pre-gate name → predicate. Both predicates
 /// are uniform skip rules applied before the per-kind FC/UC/MC
 /// dispatch in translate_cardinality_constraints.
-pub fn cardinality_arbitration_registry() -> hashbrown::HashMap<&'static str, CardinalityArbitrationFn> {
+fn cardinality_arbitration_registry() -> hashbrown::HashMap<&'static str, CardinalityArbitrationFn> {
     let mut m: hashbrown::HashMap<&'static str, CardinalityArbitrationFn> = hashbrown::HashMap::new();
     m.insert("derivation_rule_wins", skip_card_on_derivation_rule as CardinalityArbitrationFn);
     m.insert("deontic_operator_wins", skip_card_on_deontic_operator as CardinalityArbitrationFn);
@@ -1865,7 +1865,7 @@ fn subset_wins(_text: &str, _declared_nouns: &[String], _idx: &StmtIndex, _stmt_
 /// match the third column of `SetConstraintKindTable` so the
 /// `set_constraint_arbitration_registry_covers_kind_table` regression
 /// catches typos and renames.
-pub fn set_constraint_arbitration_registry() -> hashbrown::HashMap<&'static str, SetConstraintArbitrationFn> {
+fn set_constraint_arbitration_registry() -> hashbrown::HashMap<&'static str, SetConstraintArbitrationFn> {
     let mut m: hashbrown::HashMap<&'static str, SetConstraintArbitrationFn> = hashbrown::HashMap::new();
     m.insert("derivation_rule_wins",        skip_on_derivation_rule        as SetConstraintArbitrationFn);
     m.insert("subset_wins",                 subset_wins                      as SetConstraintArbitrationFn);
@@ -1916,7 +1916,7 @@ impl CardinalityConstraintKindTable {
 
     /// Return the kind code for the first registered classification
     /// the statement is classified as, or `None` if none match.
-    pub fn code_for_statement(&self, idx: &StmtIndex, stmt_id: &str) -> Option<&str> {
+    fn code_for_statement(&self, idx: &StmtIndex, stmt_id: &str) -> Option<&str> {
         self.rows.iter()
             .find(|(kind, _)| classifications_contains(idx, stmt_id, kind))
             .map(|(_, code)| code.as_str())
@@ -2203,7 +2203,7 @@ pub fn classify_statements(statements_state: &Object, grammar_state: &Object) ->
 ///
 /// Grouped by Head Noun: one Noun fact per distinct name, with the
 /// most specific objectType across its classifications applied.
-pub fn translate_nouns(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+fn translate_nouns(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     use alloc::collections::BTreeMap;
     let statement_ids = collect_statement_ids(idx);
     let mut by_noun: BTreeMap<String, String> = BTreeMap::new();
@@ -2955,7 +2955,7 @@ fn extract_enum_values(text: &str) -> Option<String> {
 /// facts: `(subtype, supertype)` pairs. The subtype is the Statement's
 /// Head Noun; the supertype is the noun at Role Position 1 (the only
 /// other role reference in `A is a subtype of B`).
-pub fn translate_subtypes(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+fn translate_subtypes(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     let table = StatementTranslatorTable::boot();
     let kinds: Vec<&str> = table.kinds_for("translate_subtypes");
     let statement_ids = collect_statement_ids(idx);
@@ -2988,7 +2988,7 @@ pub fn translate_subtypes(classified_state: &Object, idx: &StmtIndex) -> Vec<Obj
 /// the derivation-marker on derivation-rule statements (where the
 /// `*` prefix is a readability marker, not a mode signal on a Fact
 /// Type) doesn't spawn spurious InstanceFacts.
-pub fn translate_derivation_mode_facts(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+fn translate_derivation_mode_facts(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     let _ = classified_state;
     let statement_ids = collect_statement_ids(idx);
     let mut out: Vec<Object> = Vec::new();
@@ -3047,7 +3047,7 @@ fn derivation_marker_for(idx: &StmtIndex, stmt_id: &str) -> Option<String> {
 /// `StatementTranslatorTable::boot()` rather than hardcoded — the
 /// Rust function name is the registry key. Per AREST.tex §3 (eq:sys)
 /// new operations are registered without modifying any entity.
-pub fn translate_partitions(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+fn translate_partitions(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     let _ = classified_state; // statement classification flows via idx
     let table = StatementTranslatorTable::boot();
     let kinds: Vec<&str> = table.kinds_for("translate_partitions");
@@ -3079,7 +3079,7 @@ pub fn translate_partitions(classified_state: &Object, idx: &StmtIndex) -> Vec<O
 /// current FORML 2 corpus relies on this separation — the noun-
 /// declaration shape `Customer is an entity type` also matches Fact
 /// Type Reading because it has a Role Reference.
-pub fn translate_fact_types(classified_state: &Object, idx: &StmtIndex) -> (Vec<Object>, Vec<Object>) {
+fn translate_fact_types(classified_state: &Object, idx: &StmtIndex) -> (Vec<Object>, Vec<Object>) {
     let _ = classified_state;
     let statement_ids = collect_statement_ids(idx);
     let mut ft_facts: Vec<Object> = Vec::new();
@@ -3401,7 +3401,7 @@ fn build_stmt_index(state: &Object) -> StmtIndex {
 ///
 /// Unary instance-facts (value assertions like `Customer 'alice' is
 /// active`) currently emit with empty objectNoun/objectValue.
-pub fn translate_instance_facts(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+fn translate_instance_facts(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     translate_instance_facts_with_ft_ids(classified_state, idx, &[])
 }
 
@@ -3420,7 +3420,7 @@ pub fn translate_instance_facts(classified_state: &Object, idx: &StmtIndex) -> V
 /// per-role literals), so it picks up the inter-role verb chunks
 /// (`with`, `at`, `and …`) that the per-statement Verb cell only
 /// records for the role-0 ↔ role-1 gap.
-pub fn translate_instance_facts_with_ft_ids(
+fn translate_instance_facts_with_ft_ids(
     classified_state: &Object,
     idx: &StmtIndex,
     declared_ft_ids: &[String],
@@ -3591,7 +3591,7 @@ fn statement_verb(idx: &StmtIndex, stmt_id: &str) -> Option<String> {
 /// `text` (Statement text), and `entity` (Head Noun). Spans
 /// (fact_type_id resolution) are left empty — a follow-up
 /// commit will populate them once the FactType cell exists.
-pub fn translate_ring_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+fn translate_ring_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     translate_ring_constraints_with_tables(
         classified_state,
         idx,
@@ -3605,7 +3605,7 @@ pub fn translate_ring_constraints(classified_state: &Object, idx: &StmtIndex) ->
 /// the cached grammar state's EnumValues cell and threads them through.
 /// Bare callers (legacy unit tests) get the `boot()` fallback via
 /// `translate_ring_constraints`.
-pub fn translate_ring_constraints_with_tables(
+fn translate_ring_constraints_with_tables(
     classified_state: &Object,
     idx: &StmtIndex,
     ring_kinds: &RingKindTable,
@@ -3803,7 +3803,7 @@ fn encode_conditional_ring_pattern(
 /// will migrate in a follow-up commit once the
 /// FactType + Role cells have been populated by Stage-2 earlier in
 /// the pipeline.
-pub fn translate_derivation_rules(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+fn translate_derivation_rules(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     translate_derivation_rules_with_matrix(
         classified_state, idx, &ConditionalRingMatrix::boot(), &[])
 }
@@ -3821,7 +3821,7 @@ pub fn translate_derivation_rules(classified_state: &Object, idx: &StmtIndex) ->
 /// FT facts in scope (the older unit tests) pass `&[]` and accept the
 /// empty consequent id — `re_resolve_rules` (compile-time fallback)
 /// will retry from the rule text alone.
-pub fn translate_derivation_rules_with_matrix(
+fn translate_derivation_rules_with_matrix(
     classified_state: &Object,
     idx: &StmtIndex,
     conditional_matrix: &ConditionalRingMatrix,
@@ -3965,7 +3965,7 @@ fn derivation_rule_consequent(rule_text: &str) -> &str {
 /// subscripts). For the common shape
 /// `<rule-consequent> if|when <ante> and <ante> and …`, each
 /// `and`-separated chunk is a clause candidate.
-pub fn translate_unresolved_clauses(
+fn translate_unresolved_clauses(
     classified_state: &Object,
     idx: &StmtIndex,
     _ft_facts: &[Object],
@@ -4040,7 +4040,7 @@ pub fn translate_unresolved_clauses(
 /// fact-type cell (the data loss `warn-unmatched-instance-facts` fixes).
 /// Mirrors the `translate_unresolved_clauses` path that covers
 /// derivation-rule antecedents; instance facts had no equivalent.
-pub fn translate_unresolved_instance_facts(
+fn translate_unresolved_instance_facts(
     _classified_state: &Object,
     idx: &StmtIndex,
     declared_ft_ids: &[String],
@@ -4117,7 +4117,7 @@ fn derivation_rule_id(text: &str) -> String {
 /// The Value Type `Noun` fact is still emitted by `translate_nouns`
 /// from the preceding `Priority is a value type.` statement — this
 /// translator only contributes the value list.
-pub fn translate_enum_values(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+fn translate_enum_values(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     let table = StatementTranslatorTable::boot();
     let kinds: Vec<&str> = table.kinds_for("translate_enum_values");
     let statement_ids = collect_statement_ids(idx);
@@ -4159,7 +4159,7 @@ pub fn translate_enum_values(classified_state: &Object, idx: &StmtIndex) -> Vec<
 /// `translate_cardinality_constraints` because the grammar keys the
 /// two families on different tokens (Quantifier vs Constraint
 /// Keyword vs Trailing Marker).
-pub fn translate_set_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+fn translate_set_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     let kind_table = SetConstraintKindTable::boot();
     let arbitration_registry = set_constraint_arbitration_registry();
     let statement_ids = collect_statement_ids(idx);
@@ -4235,7 +4235,7 @@ fn extract_cardinality_bound(text: &str, marker: &str) -> Option<usize> {
 /// `translate_fact_types`, and span binding is a follow-up pass that
 /// reads both cells. This matches the deferred-span shape used by
 /// `translate_ring_constraints`.
-pub fn translate_cardinality_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+fn translate_cardinality_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     let kind_table = CardinalityConstraintKindTable::boot();
     let arbitration_registry = cardinality_arbitration_registry();
     let statement_ids = collect_statement_ids(idx);
@@ -4319,7 +4319,7 @@ pub fn translate_cardinality_constraints(classified_state: &Object, idx: &StmtIn
 /// from the EnumValues cell directly (see
 /// `parse_forml2::enum_values_for_noun`) and attaches the constraint
 /// to every role where the noun appears.
-pub fn translate_value_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+fn translate_value_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     let _ = classified_state;
     let table = StatementTranslatorTable::boot();
     let kinds: Vec<&str> = table.kinds_for("translate_value_constraints");
@@ -4357,7 +4357,7 @@ fn enum_values_for(state: &Object, stmt_id: &str) -> Vec<String> {
 /// cell facts with modality="deontic" and the stripped deontic
 /// operator. Entity defaults to the Head Noun of the body (after
 /// the `It is X that` prefix was stripped by Stage-1).
-pub fn translate_deontic_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+fn translate_deontic_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     translate_deontic_constraints_with_table(
         classified_state, idx, &DeonticShapeTable::boot())
 }
@@ -4371,7 +4371,7 @@ pub fn translate_deontic_constraints(classified_state: &Object, idx: &StmtIndex)
 /// (e.g. a `Quantifier` shadowed the operator atom), we fall back to
 /// the first table row's shape — matching the legacy hardcoded
 /// `kind="UC", modality="deontic"` defaults.
-pub fn translate_deontic_constraints_with_table(
+fn translate_deontic_constraints_with_table(
     classified_state: &Object,
     idx: &StmtIndex,
     deontic_shapes: &DeonticShapeTable,
@@ -4553,21 +4553,21 @@ fn head_noun_for(idx: &StmtIndex, stmt_id: &str) -> Option<String> {
 
 /// Return the list of classification names attached to a given
 /// Statement id.
-pub fn classifications_for(idx: &StmtIndex, statement_id: &str) -> Vec<String> {
+fn classifications_for(idx: &StmtIndex, statement_id: &str) -> Vec<String> {
     idx.classifications.get(statement_id).cloned().unwrap_or_default()
 }
 
 /// Fast membership check — returns `true` when `statement_id` carries
 /// a classification equal to `name`. Avoids the `Vec<String>` clone
 /// that `classifications_for` pays on every call.
-pub fn classifications_contains(idx: &StmtIndex, statement_id: &str, name: &str) -> bool {
+fn classifications_contains(idx: &StmtIndex, statement_id: &str, name: &str) -> bool {
     idx.classifications.get(statement_id)
         .is_some_and(|v| v.iter().any(|k| k == name))
 }
 
 /// Fast disjoint-membership check — returns `true` when any of the
 /// given names matches a classification on `statement_id`.
-pub fn classifications_contains_any(idx: &StmtIndex, statement_id: &str, names: &[&str]) -> bool {
+fn classifications_contains_any(idx: &StmtIndex, statement_id: &str, names: &[&str]) -> bool {
     idx.classifications.get(statement_id)
         .is_some_and(|v| v.iter().any(|k| names.iter().any(|n| *n == k.as_str())))
 }

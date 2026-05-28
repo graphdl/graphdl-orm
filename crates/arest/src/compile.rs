@@ -9100,7 +9100,7 @@ impl SqlTypeMappingTable {
     /// explicit mapping when present, otherwise falls through to the
     /// dialect's `TEXT` mapping (every legacy `_ =>` branch aliased
     /// the dialect's `TEXT` row).
-    pub fn resolve<'a>(&'a self, dialect: SqlDialect, base: &str) -> &'a str {
+    fn resolve<'a>(&'a self, dialect: SqlDialect, base: &str) -> &'a str {
         let dialect_name = dialect.name();
         if let Some((_, _, sql_type)) = self.rows.iter().find(|(d, v, _)| {
             d == dialect_name && v == base
