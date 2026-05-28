@@ -1309,6 +1309,63 @@ fn copy_target_item(target_ft: &str, source_fact: &crate::ast::Object) -> crate:
     ])
 }
 
+/// task-951: shared helper for cleaning an enum/value-constraint literal —
+/// strips surrounding whitespace, then either single- or double-quote
+/// delimiters, then any residual whitespace. Used in the synthesized NORMA
+/// ValueRange MinValue/MaxValue attributes; module-level so it gets its own
+/// unit test (the in-place chained trims inside the nested NORMA generator
+/// closure were untestable in isolation).
+fn clean_enum_value(raw: &str) -> String {
+    raw.trim().trim_matches('\'').trim_matches('"').trim().to_string()
+}
+
+/// task-951: derive a unary fact type's "predicate" phrase (the bit after the
+/// noun in the reading) by removing the first occurrence of the noun name and
+/// collapsing whitespace runs. NORMA encodes a unary "Task is recommended" as
+/// a synthesized ValueType named "Task is recommended" — this helper produces
+/// the "is recommended" portion. `split_whitespace().join(" ")` handles the
+/// edge case where the noun appears mid-reading (replacen leaves a double
+/// space after removal, which would surface in the synthesized VT Name).
+fn extract_unary_predicate(reading: &str, noun_name: &str) -> String {
+    reading
+        .replacen(noun_name, "", 1)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// task-951: shape-filter for readings that NORMA's binary/unary emission
+/// should skip. Catches constraint readings (Each/For each/In each…, "It is
+/// impossible", "No …") and enum-value declarations ("X enumerates …") — the
+/// latter being a 1-role FT entry the parser emits for declaration purposes,
+/// NOT a real unary fact. Lifted out of build_norma_orm's closure so it can
+/// be unit-tested.
+fn is_constraint_reading(r: &str) -> bool {
+    let t = r.trim_start();
+    t.starts_with("Each ")
+        || t.starts_with("For each ")
+        || t.starts_with("In each ")
+        || t.starts_with("It is impossible")
+        || t.starts_with("No ")
+        || t.contains(" enumerates ")
+}
+
+/// task-951: ConstraintDef.kind code → NORMA ORM2 RingConstraint `Type`
+/// attribute. The arest-side kind codes mirror parse_forml2_stage2's
+/// RingKindTable; NORMA's enum names are CamelCase. Returns None for
+/// non-ring kinds so the caller can short-circuit (used to gate emission
+/// in build_norma_orm). Module-level for unit testability.
+fn ring_kind_to_norma_type(kind: &str) -> Option<&'static str> {
+    match kind {
+        "IR" => Some("Irreflexive"),
+        "TR" => Some("Transitive"),
+        "AS" => Some("Asymmetric"),
+        "SY" => Some("Symmetric"),
+        "AC" => Some("Acyclic"),
+        _ => None,
+    }
+}
+
 pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> {
     let t = profile_timer::now();
     let model = compile(state);
@@ -1341,6 +1398,18 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         .map(|facts| facts.iter().filter_map(|f| {
             let name = binding(f, "name")?.to_string();
             let v = binding(f, "referenceScheme")?;
+            Some((name, v.split(',').map(|s| s.to_string()).collect()))
+        }).collect())
+        .unwrap_or_default();
+
+    // c_enum_values: HashMap<value-type-noun, allowed values> -- populated
+    // from Noun cell's `enumValues` binding (declared as "X enumerates 'a',
+    // 'b', …"). The NORMA exporter uses this to emit a <ValueRestriction> on
+    // each value-type with allowed values (Halpin Ch 6.3 value constraint).
+    let c_enum_values: HashMap<String, Vec<String>> = noun_cell.as_seq()
+        .map(|facts| facts.iter().filter_map(|f| {
+            let name = binding(f, "name")?.to_string();
+            let v = binding(f, "enumValues")?;
             Some((name, v.split(',').map(|s| s.to_string()).collect()))
         }).collect())
         .unwrap_or_default();
@@ -1385,7 +1454,8 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                 modality: get("modality").unwrap_or_default(), deontic_operator: get("deonticOperator"),
                 text: get("text").unwrap_or_default(), spans,
                 set_comparison_argument_length: None, clauses: None, entity: get("entity"),
-                min_occurrence: None, max_occurrence: None,
+                min_occurrence: get("minOccurrence").and_then(|s| s.parse().ok()),
+                max_occurrence: get("maxOccurrence").and_then(|s| s.parse().ok()),
                 predicate: get("predicate").as_deref().and_then(DeonticPredicate::decode),
             }
         }).collect())
@@ -2469,6 +2539,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         c_constraints: &[ConstraintDef],
         c_ref_schemes: &HashMap<String, Vec<String>>,
         c_supertypes: &HashMap<String, String>,
+        c_enum_values: &HashMap<String, Vec<String>>,
     ) -> String {
         fn xesc(s: &str) -> String {
             s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
@@ -2513,11 +2584,8 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         // most once", "For each pair of ...", "In each population of ..."). They
         // are not fact types; the underlying facts + real constraints are emitted
         // separately, and emitting these malformed n-aries is what trips NORMA.
-        let is_constraint_reading = |r: &str| {
-            let t = r.trim_start();
-            t.starts_with("Each ") || t.starts_with("For each ") || t.starts_with("In each ")
-                || t.starts_with("It is impossible") || t.starts_with("No ")
-        };
+        // `is_constraint_reading` is a module-level helper (lifted for
+        // testability) — see its definition just above compile_to_defs_state.
         // task-951/952: n-ary fact types are now emitted, but only when they
         // carry a composite INTERNAL uniqueness constraint (>= 2 spans, all on
         // the same FT). That spanning UC is exactly what stops NORMA decomposing
@@ -2550,6 +2618,25 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                 played.entry(r.noun_name.clone()).or_default().push(rid(ft, p));
             }
         }
+        // task-951(c): UNARY fact types are emitted alongside binaries as
+        // NORMA implicit-boolean — each unary becomes a binary Fact with the
+        // original noun role + a synthesized ValueType marked
+        // IsImplicitBooleanValue="true" (Boolean ConceptualDataType, restricted
+        // to True only). NORMA debinarizes on load. Spec confirmed against
+        // XML/GenerationSamples/SampleModel.orm (e.g. "Person isDead"). Collect
+        // the unaries now and pre-populate `played` with the noun-role so the
+        // entity emission below includes the unary connection in PlayedRoles.
+        let mut unary_fts: Vec<(&String, &FactTypeDef)> = c_fact_types.iter()
+            .filter(|(id, d)| d.roles.len() == 1
+                && !ref_fact_ids.contains(id.as_str())
+                && !is_constraint_reading(&d.reading))
+            .collect();
+        unary_fts.sort_by(|a, b| a.0.cmp(b.0));
+        for &(ft, def) in &unary_fts {
+            if let Some(role) = def.roles.first() {
+                played.entry(role.noun_name.clone()).or_default().push(rid(ft, 0));
+            }
+        }
         // Internal UC/MC constraints. SpanDef.fact_type_id is the c_fact_types
         // key (the schema build matches roles by `factType == id`), so
         // rid(span.fact_type_id, role_index) is exactly the role id emitted in
@@ -2561,9 +2648,51 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         let mut mandatory_roles: alloc::collections::BTreeSet<String> =
             alloc::collections::BTreeSet::new();
         let mut constraints_block = String::new();
-        let (mut uc_n, mut mc_n) = (0u32, 0u32);
+        let (mut uc_n, mut mc_n, mut fc_n, mut ss_n, mut ring_n) =
+            (0u32, 0u32, 0u32, 0u32, 0u32);
         for c in c_constraints {
-            if c.spans.is_empty() || (c.kind != "UC" && c.kind != "MC") { continue; }
+            if c.spans.is_empty() { continue; }
+            // task-951: ring constraints (IR/TR/AS) lift to a NORMA
+            // RingConstraint with a `Type` attribute. Single binary FT, two
+            // roles -- fits the existing single-FT filter + role-seq builder
+            // below, so just route into the kind-branching.
+            let ring_type: Option<&str> = ring_kind_to_norma_type(c.kind.as_str());
+            // task-951: SS (subset) — `Each X also Y` emits a NORMA
+            // SubsetConstraint with TWO RoleSequences (subset first, superset
+            // second), partitioned by `set_comparison_argument_length`. Spans
+            // may live on different fact types (cross-FT subset is the common
+            // case), so this branch handles SS BEFORE the single-FT filter
+            // for UC/MC/FC below.
+            if c.kind == "SS" {
+                let partition = c.set_comparison_argument_length.unwrap_or(c.spans.len() / 2);
+                if partition == 0 || partition >= c.spans.len() { continue; }
+                // Skip if any span's fact type isn't emitted or role is out of
+                // range -- a dangling ref crashes NORMA load.
+                let all_resolved = c.spans.iter().all(|s|
+                    fts_set.contains(&s.fact_type_id)
+                    && c_fact_types.get(&s.fact_type_id)
+                        .map(|ftd| s.role_index < ftd.roles.len()).unwrap_or(false));
+                if !all_resolved { continue; }
+                ss_n += 1;
+                let nid_ss = guid(&format!("cstr:{}", c.id));
+                let subset_roles: String = c.spans[..partition].iter()
+                    .map(|s| format!("\n            <orm:Role ref=\"{}\" />", rid(&s.fact_type_id, s.role_index)))
+                    .collect();
+                let superset_roles: String = c.spans[partition..].iter()
+                    .map(|s| format!("\n            <orm:Role ref=\"{}\" />", rid(&s.fact_type_id, s.role_index)))
+                    .collect();
+                let subset_seq = format!(
+                    "\n          <orm:RoleSequence id=\"{}\">{}\n          </orm:RoleSequence>",
+                    guid(&format!("rseq_ss:{}:sub", c.id)), subset_roles);
+                let superset_seq = format!(
+                    "\n          <orm:RoleSequence id=\"{}\">{}\n          </orm:RoleSequence>",
+                    guid(&format!("rseq_ss:{}:super", c.id)), superset_roles);
+                constraints_block.push_str(&format!(
+                    "\n      <orm:SubsetConstraint id=\"{}\" Name=\"SubsetConstraint{}\">\n        <orm:RoleSequences>{}{}\n        </orm:RoleSequences>\n      </orm:SubsetConstraint>",
+                    nid_ss, ss_n, subset_seq, superset_seq));
+                continue;
+            }
+            if c.kind != "UC" && c.kind != "MC" && c.kind != "FC" && ring_type.is_none() { continue; }
             let ft0 = &c.spans[0].fact_type_id;
             // Only constraints whose fact is actually emitted (skips unary,
             // ref-scheme, and any other excluded facts) so no role ref dangles.
@@ -2589,7 +2718,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                     nid, uc_n, seq));
                 per_fact.entry(ft0.clone()).or_default().push_str(&format!(
                     "\n          <orm:UniquenessConstraint ref=\"{}\" />", nid));
-            } else {
+            } else if c.kind == "MC" {
                 mc_n += 1;
                 constraints_block.push_str(&format!(
                     "\n      <orm:MandatoryConstraint id=\"{}\" Name=\"SimpleMandatoryConstraint{}\" IsSimple=\"true\">\n        <orm:RoleSequence>{}\n        </orm:RoleSequence>\n      </orm:MandatoryConstraint>",
@@ -2597,6 +2726,26 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                 per_fact.entry(ft0.clone()).or_default().push_str(&format!(
                     "\n          <orm:MandatoryConstraint ref=\"{}\" />", nid));
                 for s in &c.spans { mandatory_roles.insert(rid(ft0, s.role_index)); }
+            } else if c.kind == "FC" {
+                // task-951: FC (frequency) — bounds come from the Constraint
+                // cell's minOccurrence/maxOccurrence bindings, populated by
+                // parse_forml2_stage2::translate_cardinality_constraints. Skip
+                // if either is missing (the constraint would be vacuous).
+                if let (Some(min), Some(max)) = (c.min_occurrence, c.max_occurrence) {
+                    fc_n += 1;
+                    constraints_block.push_str(&format!(
+                        "\n      <orm:FrequencyConstraint id=\"{}\" Name=\"FrequencyConstraint{}\" MinFrequency=\"{}\" MaxFrequency=\"{}\">\n        <orm:RoleSequence>{}\n        </orm:RoleSequence>\n      </orm:FrequencyConstraint>",
+                        nid, fc_n, min, max, seq));
+                    per_fact.entry(ft0.clone()).or_default().push_str(&format!(
+                        "\n          <orm:FrequencyConstraint ref=\"{}\" />", nid));
+                }
+            } else if let Some(rtype) = ring_type {
+                ring_n += 1;
+                constraints_block.push_str(&format!(
+                    "\n      <orm:RingConstraint id=\"{}\" Name=\"RingConstraint{}\" Type=\"{}\">\n        <orm:RoleSequence>{}\n        </orm:RoleSequence>\n      </orm:RingConstraint>",
+                    nid, ring_n, rtype, seq));
+                per_fact.entry(ft0.clone()).or_default().push_str(&format!(
+                    "\n          <orm:RingConstraint ref=\"{}\" />", nid));
             }
         }
         // Per-entity reference schemes (compact display). The AREST model
@@ -2680,9 +2829,30 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                 .unwrap_or_default();
             if let Some(ex) = extra_played.get(n) { pr.push_str(ex); }
             if def.object_type.as_str() == "value" {
+                // task-951: emit declared enum values as a NORMA ValueRestriction
+                // on the ValueType. Values come from `enumValues` (a noun-level
+                // binding); CSV split + per-value strip of surrounding quotes/
+                // whitespace so atoms like `'pending'` show as `pending` in the
+                // ValueRange. Halpin Ch 6.3.
+                let value_restriction = match c_enum_values.get(n).filter(|v| !v.is_empty()) {
+                    Some(vals) => {
+                        let ranges: String = vals.iter().enumerate()
+                            .map(|(i, v)| {
+                                let clean = clean_enum_value(v);
+                                format!(
+                                    "\n              <orm:ValueRange id=\"{}\" MinValue=\"{}\" MaxValue=\"{}\" MinInclusion=\"NotSet\" MaxInclusion=\"NotSet\" />",
+                                    guid(&format!("evr:{}:{}", n, i)), xesc(&clean), xesc(&clean))
+                            })
+                            .collect();
+                        format!(
+                            "\n        <orm:ValueRestriction>\n          <orm:ValueConstraint id=\"{}\" Name=\"EnumVC_{}\">\n            <orm:ValueRanges>{}\n            </orm:ValueRanges>\n          </orm:ValueConstraint>\n        </orm:ValueRestriction>",
+                            guid(&format!("evc:{}", n)), xesc(n), ranges)
+                    }
+                    None => String::new(),
+                };
                 objects.push_str(&format!(
-                    "\n      <orm:ValueType id=\"{}\" Name=\"{}\">\n        <orm:PlayedRoles>{}\n        </orm:PlayedRoles>\n        <orm:ConceptualDataType id=\"{}\" ref=\"{}\" Scale=\"0\" Length=\"0\" />\n      </orm:ValueType>",
-                    oid(n), xesc(n), pr, guid(&format!("cdt:{}", n)), dt_text));
+                    "\n      <orm:ValueType id=\"{}\" Name=\"{}\">\n        <orm:PlayedRoles>{}\n        </orm:PlayedRoles>\n        <orm:ConceptualDataType id=\"{}\" ref=\"{}\" Scale=\"0\" Length=\"0\" />{}\n      </orm:ValueType>",
+                    oid(n), xesc(n), pr, guid(&format!("cdt:{}", n)), dt_text, value_restriction));
             } else {
                 // Compact reference mode (Entity (.mode)) + preferred identifier
                 // pointing at the synthesized reference-scheme UC above.
@@ -2761,6 +2931,30 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             facts.push_str(&format!(
                 "\n      <orm:Fact id=\"{}\">\n        <orm:FactRoles>{}\n        </orm:FactRoles>\n        <orm:ReadingOrders>\n          <orm:ReadingOrder id=\"{}\">\n            <orm:Readings>\n              <orm:Reading id=\"{}\">\n                <orm:Data>{}</orm:Data>{}\n              </orm:Reading>\n            </orm:Readings>\n            <orm:RoleSequence>{}\n            </orm:RoleSequence>\n          </orm:ReadingOrder>\n        </orm:ReadingOrders>{}\n      </orm:Fact>",
                 guid(&format!("fact:{}", ft)), fr, guid(&format!("rdgord:{}", ft)), guid(&format!("rdg:{}", ft)), xesc(&reading), expanded, rs, ic));
+        }
+        // task-951(c): emit the unary FTs collected above as NORMA
+        // implicit-boolean binaries. NORMA's stable Boolean ConceptualDataType
+        // GUID matches the sample (XML/GenerationSamples/SampleModel.orm); each
+        // synthesized VT is restricted to True only so the unary's "asserted"
+        // semantics survive the debinarize.
+        let bool_dt_ref = "_D4949F6A-FBB7-494A-BBBF-07646C6A1FC4";
+        for (uidx, &(ft, def)) in unary_fts.iter().enumerate() {
+            let role = match def.roles.first() { Some(r) => r, None => continue };
+            let r0 = rid(ft, 0);
+            let r1 = guid(&format!("implbool_role:{}", ft));
+            let vt = guid(&format!("implbool_vt:{}", ft));
+            let cdt = guid(&format!("implbool_cdt:{}", ft));
+            let vc = guid(&format!("implbool_vc:{}", ft));
+            let vr = guid(&format!("implbool_vr:{}", ft));
+            let predicate: String = extract_unary_predicate(&def.reading, &role.noun_name);
+            let vt_name = if predicate.is_empty() { ft.clone() } else { format!("{} {}", role.noun_name, predicate) };
+            let reading_data = if predicate.is_empty() { "{0}".to_string() } else { format!("{{0}} {}", predicate) };
+            objects.push_str(&format!(
+                "\n      <orm:ValueType id=\"{}\" Name=\"{}\" IsImplicitBooleanValue=\"true\">\n        <orm:PlayedRoles>\n          <orm:Role ref=\"{}\" />\n        </orm:PlayedRoles>\n        <orm:ConceptualDataType id=\"{}\" ref=\"{}\" Scale=\"0\" Length=\"0\" />\n        <orm:ValueRestriction>\n          <orm:ValueConstraint id=\"{}\" Name=\"ImplBoolVC{}\">\n            <orm:ValueRanges>\n              <orm:ValueRange id=\"{}\" MinValue=\"True\" MaxValue=\"True\" MinInclusion=\"NotSet\" MaxInclusion=\"NotSet\" />\n            </orm:ValueRanges>\n          </orm:ValueConstraint>\n        </orm:ValueRestriction>\n      </orm:ValueType>",
+                vt, xesc(&vt_name), r1, cdt, bool_dt_ref, vc, uidx, vr));
+            facts.push_str(&format!(
+                "\n      <orm:Fact id=\"{}\">\n        <orm:FactRoles>\n          <orm:Role id=\"{}\" Name=\"\" _IsMandatory=\"false\" _Multiplicity=\"Unspecified\">\n            <orm:RolePlayer ref=\"{}\" />\n          </orm:Role>\n          <orm:Role id=\"{}\" Name=\"\" _IsMandatory=\"false\" _Multiplicity=\"Unspecified\">\n            <orm:RolePlayer ref=\"{}\" />\n          </orm:Role>\n        </orm:FactRoles>\n        <orm:ReadingOrders>\n          <orm:ReadingOrder id=\"{}\">\n            <orm:Readings>\n              <orm:Reading id=\"{}\">\n                <orm:Data>{}</orm:Data>\n              </orm:Reading>\n            </orm:Readings>\n            <orm:RoleSequence>\n              <orm:Role ref=\"{}\" />\n              <orm:Role ref=\"{}\" />\n            </orm:RoleSequence>\n          </orm:ReadingOrder>\n        </orm:ReadingOrders>\n      </orm:Fact>",
+                guid(&format!("implbool_fact:{}", ft)), r0, oid(&role.noun_name), r1, vt, guid(&format!("implbool_rdgord:{}", ft)), guid(&format!("implbool_rdg:{}", ft)), xesc(&reading_data), r0, r1));
         }
         // --- Navigation-graph layout (whitepaper Theorem 4b) --------------
         // Object types are nodes; each binary fact type is a navigation edge
@@ -2845,7 +3039,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<ormRoot:ORM2 xmlns:orm=\"http://schemas.neumont.edu/ORM/2006-04/ORMCore\" xmlns:ormDiagram=\"http://schemas.neumont.edu/ORM/2006-04/ORMDiagram\" xmlns:ormRoot=\"http://schemas.neumont.edu/ORM/2006-04/ORMRoot\">\n  <orm:ORMModel id=\"{m}\" Name=\"ArestModel\">\n    <orm:Objects>{o}\n    </orm:Objects>\n    <orm:Facts>{f}\n    </orm:Facts>{c}\n    <orm:DataTypes>\n      <orm:VariableLengthTextDataType id=\"{d}\" />\n    </orm:DataTypes>\n  </orm:ORMModel>\n  <ormDiagram:ORMDiagram id=\"{dg}\" IsCompleteView=\"false\" Name=\"ArestModel\" BaseFontName=\"Tahoma\" BaseFontSize=\"0.0972222238779068\">\n    <ormDiagram:Shapes>{s}\n    </ormDiagram:Shapes>\n    <ormDiagram:Subject ref=\"{m}\" />\n  </ormDiagram:ORMDiagram>\n</ormRoot:ORM2>",
             m = model_id, o = objects, f = facts, c = constraints_xml, d = dt_text, dg = guid("diagram"), s = shapes)
     }
-    let norma_orm = build_norma_orm(&c_nouns, &c_fact_types, &c_constraints, &c_ref_schemes, &c_supertypes);
+    let norma_orm = build_norma_orm(&c_nouns, &c_fact_types, &c_constraints, &c_ref_schemes, &c_supertypes, &c_enum_values);
     #[cfg(not(feature = "no_std"))]
     if std::env::var("AREST_DUMP_NORMA").is_ok() {
         eprintln!("===NORMA-ORM-START===\n{}\n===NORMA-ORM-END===", norma_orm);
@@ -9139,6 +9333,88 @@ pub fn generate_derivation_triggers(
 mod schema_tests {
     use super::*;
     use crate::ast::{self, Object, fact_from_pairs};
+
+    #[test]
+    fn ring_kind_to_norma_type_maps_all_known_codes() {
+        // task-951: the 5 ring constraint kinds the arest parser produces
+        // (IR/TR/AS/SY/AC) all map to NORMA's RingConstraint Type attribute.
+        // Anything else returns None so the caller falls through.
+        assert_eq!(ring_kind_to_norma_type("IR"), Some("Irreflexive"));
+        assert_eq!(ring_kind_to_norma_type("TR"), Some("Transitive"));
+        assert_eq!(ring_kind_to_norma_type("AS"), Some("Asymmetric"));
+        assert_eq!(ring_kind_to_norma_type("SY"), Some("Symmetric"));
+        assert_eq!(ring_kind_to_norma_type("AC"), Some("Acyclic"));
+        // Non-ring kinds return None.
+        assert_eq!(ring_kind_to_norma_type("UC"), None);
+        assert_eq!(ring_kind_to_norma_type("MC"), None);
+        assert_eq!(ring_kind_to_norma_type("FC"), None);
+        assert_eq!(ring_kind_to_norma_type("SS"), None);
+        assert_eq!(ring_kind_to_norma_type("VC"), None);
+        // Edge cases.
+        assert_eq!(ring_kind_to_norma_type(""), None);
+        assert_eq!(ring_kind_to_norma_type("ir"), None); // case-sensitive
+    }
+
+    #[test]
+    fn is_constraint_reading_catches_each_for_each_no_and_enumerates() {
+        // task-951: shape-filter for NORMA binary/unary emission. Constraint
+        // readings + enum declarations are 1-role FT entries the parser emits
+        // for bookkeeping; this filter keeps them out of the fact emission.
+        assert!(is_constraint_reading("Each Order has at most one Line Item"));
+        assert!(is_constraint_reading("For each X, Y has Z"));
+        assert!(is_constraint_reading("In each population of …, …"));
+        assert!(is_constraint_reading("It is impossible that …"));
+        assert!(is_constraint_reading("No Task itself"));
+        // Enum declarations (1-role FT but not a real unary).
+        assert!(is_constraint_reading("Task Status enumerates 'pending', 'completed'"));
+        // Real unary readings must NOT be filtered.
+        assert!(!is_constraint_reading("Task is recommended"));
+        assert!(!is_constraint_reading("Domain Change is applied"));
+        // Leading whitespace tolerated.
+        assert!(is_constraint_reading("   Each thing has it"));
+    }
+
+    #[test]
+    fn extract_unary_predicate_handles_typical_and_mid_string_nouns() {
+        // task-951: standard form -- noun at start of reading.
+        assert_eq!(extract_unary_predicate("Task is recommended", "Task"), "is recommended");
+        // Multi-word noun.
+        assert_eq!(
+            extract_unary_predicate("Task Status is enumerated", "Task Status"),
+            "is enumerated"
+        );
+        // Noun appears mid-reading (replacen removes first occurrence; the
+        // second occurrence is preserved in the predicate). split_whitespace
+        // collapses the double space that would otherwise surface.
+        assert_eq!(
+            extract_unary_predicate("Noun API accepts Noun as parameter", "Noun"),
+            "API accepts Noun as parameter"
+        );
+        // Extra whitespace at edges.
+        assert_eq!(
+            extract_unary_predicate("  Task is dead  ", "Task"),
+            "is dead"
+        );
+        // Reading equals just the noun -> empty predicate.
+        assert_eq!(extract_unary_predicate("Task", "Task"), "");
+    }
+
+    #[test]
+    fn clean_enum_value_strips_quotes_and_whitespace() {
+        // task-951: pins the cleanup applied to enum literals before they
+        // land in NORMA's MinValue/MaxValue attributes.
+        assert_eq!(clean_enum_value("hello"), "hello");
+        assert_eq!(clean_enum_value("'hello'"), "hello");
+        assert_eq!(clean_enum_value("\"hello\""), "hello");
+        assert_eq!(clean_enum_value("  hello  "), "hello");
+        assert_eq!(clean_enum_value("  'hello'  "), "hello");
+        assert_eq!(clean_enum_value("  ' hello '  "), "hello");
+        assert_eq!(clean_enum_value(""), "");
+        assert_eq!(clean_enum_value("''"), "");
+        // Real-world CSV-from-binding shape: "' pending '" survives split(',') + trim.
+        assert_eq!(clean_enum_value(" 'pending'"), "pending");
+        assert_eq!(clean_enum_value("'in_progress'"), "in_progress");
+    }
 
     #[test]
     fn reachable_fact_types_keeps_derivation_sources_and_prunes_unrelated() {
