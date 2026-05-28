@@ -1493,7 +1493,17 @@ pub fn uninstall_platform_fn(name: &str) {
 /// MUST add its name here and revise the audit; the integration test
 /// `tests/sec_2_platform_fallback_audit.rs` fails otherwise.
 #[cfg(not(feature = "no_std"))]
-pub const APPROVED_PLATFORM_FN_NAMES: &[&str] = &[];
+pub const APPROVED_PLATFORM_FN_NAMES: &[&str] = &[
+    // task-919 gap-4: arest-dev Rebuild SM Platform Functions. Classified in
+    // _reports/sec-2-platform-audit-2026-04-21.md. Filesystem reach bounded to
+    // the apps_dir captured by install_rebuild_fns; per-fn Bottom-on-failure
+    // rolls back the SM transition. Listing is declarative — the install call
+    // at MCP/CLI boot remains a separate production-wiring step.
+    "rebuild_snapshot",
+    "rebuild_verify",
+    "rebuild_apply_bulk",
+    "rebuild_init",
+];
 
 /// Sorted names currently installed in `PLATFORM_FALLBACK`. Reads from
 /// the `Policy_platform` cell mirror — the cell is the authority for

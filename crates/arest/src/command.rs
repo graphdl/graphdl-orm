@@ -3162,8 +3162,10 @@ fn load_reading_handler(
 /// strings "cascade-delete" (default), "cascade_delete", and
 /// "migrate" — case-insensitive. Unknown values fall back to the
 /// default (cascade-delete) so older callers can ignore the field.
-/// The `Migrate` policy is stubbed; it returns
-/// `unload_reading.not_implemented` violation today.
+/// Both policies are implemented: CascadeDelete drops nouns/FTs/
+/// derivations introduced by the reading; Migrate preserves them on
+/// P (eq:pop, set semantics) and only drops the derivation defs +
+/// manifest, mirroring cor:closure's preserve-population principle.
 fn unload_reading_handler(
     d: &ast::Object,
     name: &str,
@@ -3263,12 +3265,6 @@ fn unload_reading_handler(
                          or migrate legacy state by running LoadReading first",
                         missing_name
                     ),
-                    alethic: true,
-                }],
-                UnloadError::NotImplemented => vec![crate::types::Violation {
-                    constraint_id: "unload_reading.not_implemented".to_string(),
-                    constraint_text: "requested UnloadPolicy is not implemented".to_string(),
-                    detail: "Migrate policy is reserved for #557 ReloadReading; use cascade-delete for now".to_string(),
                     alethic: true,
                 }],
             };
@@ -3455,12 +3451,6 @@ fn reload_reading_handler(
                         constraint_id: "reload_reading.unload_failed".to_string(),
                         constraint_text: "unload step rejected: manifest missing".to_string(),
                         detail: format!("no _loaded_reading:{} cell found", missing_name),
-                        alethic: true,
-                    }],
-                    UnloadError::NotImplemented => vec![crate::types::Violation {
-                        constraint_id: "reload_reading.unload_failed".to_string(),
-                        constraint_text: "unload step rejected: policy not implemented".to_string(),
-                        detail: "Migrate unload policy is stubbed".to_string(),
                         alethic: true,
                     }],
                 },
@@ -4775,6 +4765,91 @@ Function 'place_verb' has Name 'task_919_bottom_test'.
         assert!(ast::cells_iter(&result.state).is_empty(),
             "rejected transition must emit an empty state delta; got {:?}",
             result.state);
+    }
+
+    /// task-919 gap-5: pin that `install_rebuild_fns(apps_dir)` wires the
+    /// four arest-dev rebuild Platform Functions into PLATFORM_FALLBACK
+    /// under their canonical names AND that they are reachable through
+    /// the `apply(Func::Platform(name), x, d)` dispatch path (the same
+    /// path the gap-3 transition_via_defs hook uses, exercised by
+    /// `transition_dispatches_platform_func_via_verb_function_chain`
+    /// above on a synthetic verb). End-to-end: install -> the registered
+    /// rebuild_snapshot is callable through the registry -> the handler
+    /// resolves the App Target via `d` and writes a snapshot file under
+    /// the apps_dir captured at install time. The full SM-driven dispatch
+    /// path is exercised by the synthetic-verb gap-3 tests above; this
+    /// pins that the REAL rebuild handlers slot into that same path.
+    #[cfg(feature = "local")]
+    #[test]
+    fn rebuild_install_fns_handlers_are_dispatchable_via_platform_apply() {
+        use crate::ast::{uninstall_platform_fn, installed_platform_fn_names};
+
+        let root = std::env::temp_dir().join(format!(
+            "arest_rebuild_install_test_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos()).unwrap_or(0)
+        ));
+        let target = "installtarget";
+        let tdir = root.join(target);
+        std::fs::create_dir_all(&tdir).expect("mk target dir");
+        {
+            let conn = rusqlite::Connection::open(tdir.join(format!("{}.db", target)))
+                .expect("open target db");
+            conn.execute_batch(
+                "CREATE TABLE cells (name TEXT PRIMARY KEY, contents TEXT);
+                 INSERT INTO cells VALUES ('Task_is_epic', '<<Task, 772>>');",
+            ).expect("seed target db");
+        }
+
+        crate::rebuild::install_rebuild_fns(root.clone());
+
+        // 1. The four canonical names are now in PLATFORM_FALLBACK.
+        let installed = installed_platform_fn_names();
+        for name in &["rebuild_snapshot", "rebuild_verify", "rebuild_apply_bulk", "rebuild_init"] {
+            assert!(installed.contains(&name.to_string()),
+                "{} must be in PLATFORM_FALLBACK after install_rebuild_fns; installed = {:?}",
+                name, installed);
+        }
+
+        // 2. apply(Func::Platform(name), x, d) routes to the installed
+        //    handler (same dispatch path the gap-3 transition hook uses).
+        //    Build the d the handler reads: it needs `Rebuild concerns App
+        //    Target` to resolve our temp target. Build an x with the id.
+        let mut dm: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+        dm.insert(
+            "Rebuild_concerns_App_Target".to_string(),
+            ast::Object::seq(vec![ast::Object::seq(vec![
+                ast::Object::seq(vec![ast::Object::atom("Rebuild"), ast::Object::atom("rb-install")]),
+                ast::Object::seq(vec![ast::Object::atom("App Target"), ast::Object::atom(target)]),
+            ])]),
+        );
+        let d = ast::Object::map(dm);
+        let mut xm: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+        xm.insert("id".to_string(), ast::Object::atom("rb-install"));
+        let x = ast::Object::map(xm);
+
+        let result = ast::apply(
+            &ast::Func::Platform("rebuild_snapshot".to_string()),
+            &x,
+            &d,
+        );
+
+        for name in &["rebuild_snapshot", "rebuild_verify", "rebuild_apply_bulk", "rebuild_init"] {
+            uninstall_platform_fn(name);
+        }
+
+        assert!(!matches!(result, ast::Object::Bottom),
+            "apply(Func::Platform('rebuild_snapshot')) must reach the installed \
+             handler and succeed on a valid target; got Bottom");
+        let snap_dir = root.join(target).join("rebuild-snapshots");
+        let snapshots: Vec<_> = std::fs::read_dir(&snap_dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).collect())
+            .unwrap_or_default();
+        assert!(!snapshots.is_empty(),
+            "installed handler must have written a snapshot under {:?}", snap_dir);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// task-919-http: a tiny one-shot HTTP/1.1 fake server on a random

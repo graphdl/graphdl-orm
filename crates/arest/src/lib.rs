@@ -103,6 +103,10 @@ pub mod fol;
 pub mod types;
 pub mod freeze;
 pub mod row_shape;
+// task-919 gap-4: arest-dev substrate-rebuild Platform Functions (reads a
+// target app's SQLite DB → gated on `local`/rusqlite).
+#[cfg(feature = "local")]
+pub mod rebuild;
 
 // compile.rs is no_std-clean as of #653: `profile_timer` already
 // cfg-selects between `std::time::Instant` (native std) and a

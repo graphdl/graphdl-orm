@@ -268,14 +268,11 @@ pub struct UnloadReport {
 /// (#556) and the `_loaded_reading:{name}` cell was not written.
 /// `InvalidName` — same sanitization rules as `LoadReading::name`.
 /// `Disallowed` — reserved for future host-policy gating.
-/// `NotImplemented` — the requested policy is not yet implemented
-/// (today: `UnloadPolicy::Migrate`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnloadError {
     ManifestMissing(String),
     InvalidName(String),
     Disallowed,
-    NotImplemented,
 }
 
 /// Outcome of a successful unload: the new state plus a structured
