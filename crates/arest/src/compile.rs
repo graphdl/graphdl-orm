@@ -6512,16 +6512,16 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
         // task-741: extend "existing resources" to ALSO include any
         // resource that has an event fact in a trigger FT cell. If a
         // Task has `Task is finished` recorded, event-fold will derive
-        // its currentlyInStatus = 'completed' — init must skip the
-        // same resource to avoid double-emitting 'pending' alongside
-        // event-fold's 'completed' and surfacing a UC violation. The
-        // resource is at the role under sm.noun_name (e.g. "Task")
-        // in each trigger FT cell.
+        // its Status = 'completed' — init must skip the same resource
+        // to avoid double-emitting 'pending' alongside event-fold's
+        // 'completed' and surfacing a UC violation. The resource is
+        // at the role under sm.noun_name (e.g. "Task") in each
+        // trigger FT cell.
         //
         // Build one extractor per trigger FT (after canonical
         // space→underscore normalization, matching event-fold's
         // lookup). Concat all the per-cell resource Seqs together
-        // with the forResource Seq → the union of "already covered"
+        // with the for_Resource Seq → the union of "already covered"
         // resources.
         let extract_sm_noun_role = Func::compose(
             Func::apply_to_all(Func::Selector(2)),

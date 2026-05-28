@@ -350,11 +350,12 @@ pub fn handle_arest_create(
 /// state-machine transition event. Mirror of the worker's
 /// `router.ts::POST /api/entities/:noun/:id/transition` (line 617),
 /// minus the engine path: the kernel direct-write fallback walks the
-/// `State Machine` cell (entity rows with `forResource` +
-/// `currentlyInStatus` bindings, mirror of the worker's DurableObject
-/// shape) to read current status, walks the `Transition` cell to find
-/// a matching `(fromStatus, event)` row, then rewrites the SM row's
-/// `currentlyInStatus` and pushes a new `Event` entity.
+/// `State Machine` cell (entity rows with `Resource` + `Status`
+/// bindings, the canonical post-task-742 role names that
+/// `StateMachineCellShape::boot` exposes) to read current status,
+/// walks the `Transition` cell to find a matching
+/// `(fromStatus, event)` row, then rewrites the SM row's `Status`
+/// and pushes a new `Event` entity.
 ///
 /// Returns `(new_state, response_bytes)` on success — caller commits
 /// via `system::apply` and emits the body. The response envelope
@@ -366,7 +367,7 @@ pub fn handle_arest_create(
 ///   * Method isn't POST or the path doesn't end in `/transition`.
 ///   * The slug doesn't resolve to a registered noun.
 ///   * The body isn't valid JSON or `event` is missing/empty.
-///   * No State Machine row has `forResource == id`.
+///   * No State Machine row has `Resource == id`.
 ///   * No Transition row matches `(currentStatus, event)`.
 ///
 /// The kernel HTTP handler maps `None` to `404`/`400` per the worker's
@@ -630,9 +631,9 @@ pub fn handle_arest_transitions_for_entity(
 
 /// Replace (or append) the value at `key` in a named-tuple `entity`
 /// (`Seq([Seq([k,v]), ...])`). Used by the transition handler to
-/// rewrite an SM row's `currentlyInStatus` without disturbing other
-/// fields. Lives here rather than in `ast` because the named-tuple
-/// shape is a hateoas convention, not an engine primitive.
+/// rewrite an SM row's `Status` without disturbing other fields.
+/// Lives here rather than in `ast` because the named-tuple shape is
+/// a hateoas convention, not an engine primitive.
 fn update_binding(entity: &Object, key: &str, new_value: &str) -> Object {
     let mut out: Vec<Object> = Vec::new();
     let mut updated = false;
@@ -975,8 +976,8 @@ mod tests {
     }
 
     /// Fixture: a state seeded with a Support Request entity, a State
-    /// Machine row pointing at it (currentlyInStatus = "Received"),
-    /// and a Transition row that turns "Received" + "categorize" into
+    /// Machine row pointing at it (Status = "Received"), and a
+    /// Transition row that turns "Received" + "categorize" into
     /// "Categorized". Mirror of the apis e2e fixture
     /// (`apis/__e2e__/arest.test.ts:286`) the kernel direct-write
     /// fallback is the kernel-side counterpart for.

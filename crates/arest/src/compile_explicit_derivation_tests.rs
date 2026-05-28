@@ -1750,7 +1750,7 @@ State Machine 'sm-1' is currently in Status 'pending'.
 // longer holds and that doc needs to be revised alongside the
 // engine change.
 
-// ─── SM init emits forResource for entity without transition events ─
+// ─── SM init emits for_Resource for entity without transition events ─
 //
 // task-922-sm-init-projection — surfaced by task-922 verification.
 // `ft_State_Machine_is_for_Resource` showed 0 rows for Tasks that have
@@ -1802,7 +1802,7 @@ Transition is from Status.
 Transition is to Status.
 Transition is triggered by Fact Type.
 "#;
-    let domain = r#"# SM init forResource test (task-922-sm-init-projection)
+    let domain = r#"# SM init for_Resource test (task-922-sm-init-projection)
 ## Entity Types
 Task(.id) is an entity type.
 
@@ -1890,9 +1890,9 @@ Task 't-also-no-events' has Owner 'Bob'.
         resources, for_res_cell, cells,
     );
 
-    // ── Also assert the currentlyInStatus emit still fires for the
+    // ── Also assert the is_currently_in_Status emit still fires for the
     // same entities (this is the "we know this works" baseline per the
-    // task description). If currentlyInStatus is empty too, the bug is
+    // task description). If is_currently_in_Status is empty too, the bug is
     // SM init not running at all, not the targeted for_Resource regression.
     let status_cell = crate::ast::fetch_cell_seq("State_Machine_is_currently_in_Status", &final_state);
     let statuses_by_resource: hashbrown::HashMap<String, String> = {
@@ -1935,13 +1935,13 @@ Task 't-also-no-events' has Owner 'Bob'.
     assert_eq!(
         statuses_by_resource.get("t-no-events").map(|s| s.as_str()),
         Some("pending"),
-        "SM init must also emit currentlyInStatus='pending' for t-no-events \
+        "SM init must also emit Status='pending' for t-no-events \
          (paired by State Machine binding with for_Resource). Got status map: {:?}",
         statuses_by_resource,
     );
 }
 
-// ─── SM init emits forResource when entity's only FT cell is keyed ─
+// ─── SM init emits for_Resource when entity's only FT cell is keyed ─
 //
 // task-922-sm-init-projection — the actual production failure mode.
 // The tasks-app reading declares `Task has Task Description` with an
@@ -1987,7 +1987,7 @@ Transition is triggered by Fact Type.
     // and `cell_put_keyed` will write the cell as a Map<task_id, fact>.
     // This is exactly the shape of `Task_has_Task_Description` and
     // `Task_has_Task_Priority` in the production tasks-app DB.
-    let domain = r#"# SM init forResource over keyed cell (task-922-sm-init-projection)
+    let domain = r#"# SM init for_Resource over keyed cell (task-922-sm-init-projection)
 ## Entity Types
 Task(.id) is an entity type.
 
