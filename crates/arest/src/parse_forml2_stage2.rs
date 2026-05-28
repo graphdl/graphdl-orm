@@ -226,6 +226,7 @@ impl DeonticShapeTable {
 /// `_with_*` variants take extra dispatch tables. Per AREST.tex §3.2
 /// Platform Binding, registered functions occupy the platform-layer
 /// complement of compiled readings; together they span DEFS.
+#[cfg(all(test, feature = "std-deps"))]
 type TranslatorFn = fn(&Object, &StmtIndex) -> Vec<Object>;
 
 /// Registry of translator-name → fn pointer. The string keys must
@@ -239,6 +240,7 @@ type TranslatorFn = fn(&Object, &StmtIndex) -> Vec<Object>;
 /// Multi-output translators (translate_fact_types) and arg-bearing
 /// variants (translate_*_with_table[s]/_matrix/_ft_ids) live outside
 /// the registry — the stage-2 pipeline still calls them by name.
+#[cfg(all(test, feature = "std-deps"))]
 fn translator_function_registry() -> hashbrown::HashMap<&'static str, TranslatorFn> {
     let mut m: hashbrown::HashMap<&'static str, TranslatorFn> = hashbrown::HashMap::new();
     m.insert("translate_nouns",                  translate_nouns                 as TranslatorFn);
@@ -3401,6 +3403,9 @@ fn build_stmt_index(state: &Object) -> StmtIndex {
 ///
 /// Unary instance-facts (value assertions like `Customer 'alice' is
 /// active`) currently emit with empty objectNoun/objectValue.
+// Dispatched via `translator_function_registry` (hash-keyed fn-pointer
+// table); rustc's dead-code lint can't see the registry indirection.
+#[allow(dead_code)]
 fn translate_instance_facts(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     translate_instance_facts_with_ft_ids(classified_state, idx, &[])
 }
@@ -3591,6 +3596,9 @@ fn statement_verb(idx: &StmtIndex, stmt_id: &str) -> Option<String> {
 /// `text` (Statement text), and `entity` (Head Noun). Spans
 /// (fact_type_id resolution) are left empty — a follow-up
 /// commit will populate them once the FactType cell exists.
+// Dispatched via `translator_function_registry` (hash-keyed fn-pointer
+// table); rustc's dead-code lint can't see the registry indirection.
+#[allow(dead_code)]
 fn translate_ring_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     translate_ring_constraints_with_tables(
         classified_state,
@@ -3803,6 +3811,9 @@ fn encode_conditional_ring_pattern(
 /// will migrate in a follow-up commit once the
 /// FactType + Role cells have been populated by Stage-2 earlier in
 /// the pipeline.
+// Dispatched via `translator_function_registry` (hash-keyed fn-pointer
+// table); rustc's dead-code lint can't see the registry indirection.
+#[allow(dead_code)]
 fn translate_derivation_rules(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     translate_derivation_rules_with_matrix(
         classified_state, idx, &ConditionalRingMatrix::boot(), &[])
@@ -4357,6 +4368,9 @@ fn enum_values_for(state: &Object, stmt_id: &str) -> Vec<String> {
 /// cell facts with modality="deontic" and the stripped deontic
 /// operator. Entity defaults to the Head Noun of the body (after
 /// the `It is X that` prefix was stripped by Stage-1).
+// Dispatched via `translator_function_registry` (hash-keyed fn-pointer
+// table); rustc's dead-code lint can't see the registry indirection.
+#[allow(dead_code)]
 fn translate_deontic_constraints(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     translate_deontic_constraints_with_table(
         classified_state, idx, &DeonticShapeTable::boot())
@@ -4553,6 +4567,7 @@ fn head_noun_for(idx: &StmtIndex, stmt_id: &str) -> Option<String> {
 
 /// Return the list of classification names attached to a given
 /// Statement id.
+#[cfg(all(test, feature = "std-deps"))]
 fn classifications_for(idx: &StmtIndex, statement_id: &str) -> Vec<String> {
     idx.classifications.get(statement_id).cloned().unwrap_or_default()
 }

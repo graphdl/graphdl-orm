@@ -3747,10 +3747,6 @@ pub(crate) fn compile(state: &crate::ast::Object) -> CompiledModel {
 /// is optional so synthetic-call paths that build a CellIndex without
 /// an Object (vanishingly rare) still work; when present it unlocks
 /// the cell-driven SM path (#761).
-fn compile_data(data: &CellIndex) -> CompiledModel {
-    compile_data_with_state(data, None)
-}
-
 fn compile_data_with_state(
     data: &CellIndex,
     state: Option<&crate::ast::Object>,
