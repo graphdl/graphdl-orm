@@ -195,8 +195,9 @@ pub struct SelectedComponent {
 /// kernel walks the camelCase `Component_has_ComponentRole`
 /// inherited from #511. Reconciling needs the kernel-side state
 /// migrated to the parser's projection — landing alongside #589
-/// (kernel adopts the engine `load_reading` directly) once #588
-/// lifts Stage-2 to no_std.
+/// (kernel adopts the engine `load_reading` directly) once the
+/// kernel engine-path migration (task-780 sweep item 5) lands.
+/// #588's no_std Stage-2 lift is already in.
 ///
 /// The tie-breaker rule from #492 — Slint always wins under equal
 /// scores — survives intact: every Slint binding gets a +1 floor

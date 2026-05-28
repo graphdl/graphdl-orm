@@ -163,8 +163,9 @@ pub fn init() {
         // Demo Noun + entity so the HATEOAS read fallback (#608/#609/#610)
         // returns something concrete instead of always hitting `None` on
         // a bare boot. Mirror of how the worker seeds noun_index from
-        // readings — the kernel's metamodel-loaded path lands later
-        // (#588 lifts the Stage-2 parser to no_std), so for now we
+        // readings — the kernel's metamodel-loaded path is pending the
+        // kernel engine-path migration (task-780 sweep item 5; #588's
+        // no_std Stage-2 lift has already shipped), so for now we
         // hand-stage a single Noun fact + a single Organization entity.
         // `GET /arest/organizations` and `/arest/organizations/acme`
         // both round-trip through `arest::hateoas::handle_arest_read`,
@@ -183,9 +184,11 @@ pub fn init() {
 
         // Support Request noun (#624 — supports the apis e2e suite's
         // `/arest/support-requests` test slice). Same hand-stage shape
-        // as Organization above; drops once #588 lifts Stage-2 to
-        // no_std and the kernel can compile readings/support/*.md
-        // at boot.
+        // as Organization above; drops once the kernel engine-path
+        // migration (task-780 sweep item 5) lets the kernel compile
+        // readings/support/*.md at boot. #588's no_std Stage-2 lift
+        // is in; the remaining work is rewiring the kernel's load-
+        // reading path.
         let noun_sr = Object::seq(alloc::vec![Object::seq(alloc::vec![
             Object::atom("name"),
             Object::atom("Support Request"),

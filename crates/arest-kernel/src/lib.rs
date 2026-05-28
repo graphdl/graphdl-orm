@@ -258,8 +258,10 @@ pub fn arest_http_handler(req: &http::Request) -> http::Response {
     // different (it's a stats endpoint, not an entity lookup) — the
     // generic handler would otherwise try to resolve "parse" as a
     // slug and 404 it. POST/DELETE remain unhandled here today
-    // because the kernel can't yet compile readings at runtime
-    // (gated on #588 lifting Stage-2 to no_std).
+    // because the kernel still goes through the engine-less HATEOAS
+    // direct-write fallback rather than runtime-compiling readings
+    // (#588's no_std Stage-2 lift is in; the kernel engine-path
+    // migration is open as task-780 sweep item 5).
     if req.method == "GET" && (req.path == "/arest/parse" || req.path.starts_with("/arest/parse?")) {
         if let Some(body) = system::with_state(|s| arest::hateoas::parse_stats(s)) {
             return http::Response::ok("application/json", body);
@@ -393,12 +395,14 @@ pub fn arest_http_handler(req: &http::Request) -> http::Response {
 
     // POST /arest/entities/{slug} — direct-write fallback (#616).
     // Mirror of the worker's `router.ts::handleEntitiesPost`
-    // create-side fallback. Engine path (#613) waits on #588's
-    // no_std Stage-2 lift; until then this is the only POST entity
-    // surface the kernel honours, sufficient for the apis e2e
-    // suite's `POST /arest/entities/Organization with explicit id`
-    // (`apis/__e2e__/arest.test.ts:153`) and `POST /arest/entities/
-    // Support%20Request with explicit id` (line 240) cases.
+    // create-side fallback. Engine path (#613) is pending the
+    // kernel engine-path migration tracked by task-780 sweep
+    // item 5 (#588's no_std Stage-2 lift is already in); until
+    // that lands this is the only POST entity surface the kernel
+    // honours, sufficient for the apis e2e suite's `POST /arest/
+    // entities/Organization with explicit id` (`apis/__e2e__/
+    // arest.test.ts:153`) and `POST /arest/entities/Support%20
+    // Request with explicit id` (line 240) cases.
     if req.method == "POST" && req.path.starts_with("/arest/entities/") {
         let result = system::with_state(|s| {
             arest::hateoas::handle_arest_create_for_slug(s, &req.method, &req.path, &req.body)
@@ -452,8 +456,10 @@ pub fn arest_http_handler(req: &http::Request) -> http::Response {
 // gate, see `system.rs:7-12`), so the only verb shipped on the kernel
 // today is `extract` (registered as `Func::Platform("extract")` at
 // `system::init`). Hand-coded `/arest/{slug}` HATEOAS fallbacks stay
-// hand-coded — they're engine-less direct-write paths because the
-// kernel can't yet runtime-compile readings (#588).
+// hand-coded — they're engine-less direct-write paths pending the
+// kernel engine-path migration (task-780 sweep item 5; #588's no_std
+// Stage-2 lift has shipped, but kernel HTTP handlers have not yet
+// been rewired through `load_reading_core`).
 //
 // Each test below asserts that the refactored handler routes the
 // `POST /api/{verb}` shape through the same dispatcher as the
@@ -601,11 +607,12 @@ mod handler_tests {
 
     /// Engine-less HATEOAS fallback routes (the `/arest/entities/*`
     /// POST/GET surface, `/arest/entity` POST, `/arest/parse` GET, and
-    /// the `/arest/{slug}` read fallback) stay hand-coded by design:
-    /// the engine traps in the kernel because Stage-2 compile is
-    /// std-only (#588). Once #588 lifts these can flow through
-    /// `dispatch_verb` like `extract` does today, but T3 does not
-    /// gate on that work.
+    /// the `/arest/{slug}` read fallback) stay hand-coded by design
+    /// pending the kernel engine-path migration (task-780 sweep item
+    /// 5). #588 already shipped the Stage-2 no_std lift; what remains
+    /// is rewiring kernel HTTP handlers through `load_reading_core`
+    /// so they can flow through `dispatch_verb` like `extract` does
+    /// today. T3 does not gate on that work.
     ///
     /// This test asserts the fallback is still wired by sending
     /// `GET /arest/parse` (the simplest one — a stats projection over
