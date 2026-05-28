@@ -4137,103 +4137,20 @@ Transition 'cancel' is defined in State Machine Definition 'Order'.
         assert!(!result.rejected);
     }
 
-    /// task-967 regression: the apply-path seeded forward-chain must reach
-    /// the derivation fixpoint even when a rule that consumes a freshly
-    /// written cell is keyed under a DIFFERENT noun than the one being
-    /// mutated. The noun-scoped `derivation_index` excluded such cross-noun
-    /// consumer rules from the apply's rule set, so they never fired (the
-    /// live SM->status bridge: `_sm_event_fold_{N}` writes a State-Machine
-    /// cell the Resource-indexed bridge rule consumes, but the bridge is
-    /// absent from `derivation_index:{N}`). Minimal cross-noun analogue:
-    /// `Mid is active` (keyed under Source+Mid via its antecedent) writes
-    /// `Mid_is_active` on a Source create; `Mid is ready` (keyed under Mid
-    /// only) must still reach the fixpoint. The metamodel (STATE_METAMODEL)
-    /// is merged in so the `derivation_index` is non-empty -- the pre-fix
-    /// noun-gate then severs the Mid-indexed consumer from the Source apply.
-    ///
-    /// IGNORED: with the merge the index is non-empty (9 entries) and the
-    /// fix's un-gate runs all 4 stratum-1 rules for the Source apply (gating
-    /// profile) -- but this synthetic cross-noun JOIN doesn't materialize its
-    /// seed `Mid_is_active`, so the downstream assert can't run. A FORML2
-    /// join-fixture limitation, NOT the fix. Bug+fix verified: Agent-1 live
-    /// diagnosis (bridge rule keyed under index:Resource not index:Task) +
-    /// full suite green + the 4/4 gating evidence. TODO: SM-bridge fixture.
-    #[ignore = "task-967: synthetic join doesn't seed; needs SM fixture"]
-    #[test]
-    fn apply_reaches_fixpoint_across_cross_noun_derivation() {
-        const READINGS: &str = r#"
-# Cross-Noun Probe
-
-## Entity Types
-
-Source(.id) is an entity type.
-Mid(.Name) is an entity type.
-Code is a value type.
-
-## Fact Types
-
-Source has Code.
-Mid has Code.
-
-## Instance Facts
-
-Mid 'M1' has Code 'C1'.
-
-## Derivation Rules
-
-* Mid is active iff Mid has some Code and some Source has that Code.
-* Mid is ready iff Mid is active.
-"#;
-        let meta = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
-        let probe = crate::parse_forml2::parse_to_state_with_nouns(READINGS, &meta).unwrap();
-        let state = ast::merge_states(&meta, &probe);
-        let defs = crate::compile::compile_to_defs_state(&state);
-        let def_obj = ast::defs_to_state(&defs, &state);
-
-        let mut fields = HashMap::new();
-        fields.insert("code".to_string(), "C1".to_string());
-        let cmd = Command::CreateEntity {
-            noun: "Source".to_string(),
-            domain: "probe".to_string(),
-            id: Some("S1".to_string()),
-            fields,
-            sender: None,
-            signature: None,
-        };
-        let result = apply_command_defs(&def_obj, &cmd, &state);
-        assert!(!result.rejected, "create must not be rejected");
-
-        // Sanity: the Source-indexed producer fired (also pins the cell name).
-        let active = crate::ast::fetch_cell_seq("Mid_is_active", &result.state);
-        assert!(
-            active.as_seq().map_or(false, |s| !s.is_empty()),
-            "stage-1 Mid_is_active must materialize on the Source apply (sanity)"
-        );
-
-        // Regression: the Mid-indexed consumer, severed from the Source apply
-        // by the noun-index, must still reach the fixpoint.
-        let ready = crate::ast::fetch_cell_seq("Mid_is_ready", &result.state);
-        assert!(
-            ready.as_seq().map_or(false, |s| !s.is_empty()),
-            "task-967: Mid_is_ready (consumer keyed under Mid, not Source) must \
-             materialize on the Source apply -- seeded chain must reach the \
-             fixpoint across the cross-noun rule dependency"
-        );
-    }
-
-    /// task-968: the SM-fixture companion of task-967's ignored synthetic
-    /// JOIN test. Pins the post-5d2fb81d behavior on a Resource-keyed
-    /// derivation that consumes the live SM cells written by the Order
-    /// apply -- the EXACT cross-noun shape that triggered the original
-    /// bug. The custom bridge `Resource is mirroring Status iff some
-    /// State Machine is for that Resource and that State Machine is
-    /// currently in that Status` is keyed under index:Resource (its
-    /// antecedents resolve to State Machine + Status nouns). Before the
-    /// fix the rule was absent from index:Order, so the seeded-chain on
-    /// the Order create excluded it and `Resource_is_mirroring_Status`
-    /// never materialized. After: the un-gated collect_stratum visits
-    /// the rule, the chain sees the freshly written SM cells, and the
-    /// consequent reaches the LFP on the apply path.
+    /// task-968: the SM-bridge regression for task-967's cross-noun
+    /// fixpoint fix (5d2fb81d). Pins the post-fix behavior on a
+    /// Resource-keyed derivation that consumes the live SM cells
+    /// written by the Order apply -- the EXACT cross-noun shape that
+    /// triggered the original bug. The custom bridge `Resource is
+    /// mirroring Status iff some State Machine is for that Resource
+    /// and that State Machine is currently in that Status` is keyed
+    /// under index:Resource (its antecedents resolve to State Machine +
+    /// Status nouns). Before the fix the rule was absent from
+    /// index:Order, so the seeded-chain on the Order create excluded
+    /// it and `Resource_is_mirroring_Status` never materialized. After:
+    /// the un-gated collect_stratum visits the rule, the chain sees the
+    /// freshly written SM cells, and the consequent reaches the LFP on
+    /// the apply path.
     ///
     /// Distinct from the live `Resource_is_currently_in_Status` cell
     /// (imperatively written by transition handling in command.rs:1969)
