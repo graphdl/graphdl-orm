@@ -3693,15 +3693,17 @@ fn nav_links_via_rho(d: &ast::Object, noun: &str, entity_id: &str) -> Vec<Naviga
 }
 
 fn extract_sm_status(state: &ast::Object, sm_id: &str) -> Option<String> {
+    // Lookup is keyed on the canonical `State Machine` role binding.
+    // A prior `pair.get(1) == sm_id` scan branch was defensive
+    // against malformed cells but also overly permissive (it would
+    // match the Status value when sm_id collided with a status
+    // literal). Compiled SM cells always bind `State Machine` to
+    // the entity id; the fallback is dead against any real state.
     let sm = StateMachineCellShape::boot();
-    let cell = ast::fetch_cell_seq(sm.cell_name, state);
-    cell.as_seq()?.iter()
-        .find(|fact| {
-            ast::binding_matches(fact, sm.state_machine_role, sm_id)
-                || fact.as_seq().map_or(false, |pairs| {
-                    pairs.iter().any(|pair| pair.as_seq().and_then(|p| p.get(1)?.as_atom()) == Some(sm_id))
-                })
-        })
+    ast::fetch_cell_seq(sm.cell_name, state)
+        .as_seq()?
+        .iter()
+        .find(|fact| ast::binding_matches(fact, sm.state_machine_role, sm_id))
         .and_then(|fact| ast::binding(fact, sm.current_status_role).map(|s| s.to_string()))
 }
 
