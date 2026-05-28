@@ -210,6 +210,17 @@ Statement has Classification 'Partition Declaration' iff Statement has Verb 'is 
 
 Statement has Classification 'Abstract Declaration' iff Statement has Trailing Marker 'is abstract'.
 
+<!-- task-951: two surface forms lower to the same Verb token, so a single
+     recognizer covers both. Stage-1's extract_enum_values accepts either:
+
+       1. "The possible values of <Noun> are 'v1', 'v2', ..."  (FORML2 spec)
+       2. "<Noun> enumerates 'v1', 'v2', ..."                  (shorthand alias)
+
+     Form (2) is mechanical sugar — stage-1 strips the Noun and the literal
+     'enumerates' keyword, then routes the remaining 'v1', 'v2', ... list to
+     the same Enum_Value tokenizer, and overrides Verb to 'the possible
+     values of' so this classifier fires identically. There is no separate
+     classifier rule for the shorthand. -->
 Statement has Classification 'Enum Values Declaration' iff Statement has Verb 'the possible values of'.
 
 Statement has Classification 'Derivation Rule' iff Statement has Keyword 'iff'.

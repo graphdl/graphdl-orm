@@ -878,9 +878,19 @@ fn inner_quantifiers(body: &str, vocab: &Vocab) -> Vec<String> {
 /// only when the sentence opens with the literal prefix so ordinary
 /// fact type readings can't be mistaken for enum declarations.
 fn extract_enum_values(body: &str) -> Option<Vec<String>> {
-    const PREFIX: &str = "The possible values of ";
-    let rest = body.strip_prefix(PREFIX)?;
-    let (_noun_part, tail) = rest.split_once(" are ")?;
+    // Two recognised syntaxes:
+    //   1. "The possible values of <Noun> are 'v1', 'v2', …"  (FORML2 spec)
+    //   2. "<Noun> enumerates 'v1', 'v2', …"                  (shorthand alias)
+    // Both lower to the same Enum Values Declaration; the call site overrides
+    // Verb to "the possible values of" either way so the downstream recognizer
+    // fires identically.
+    let tail = if let Some(rest) = body.strip_prefix("The possible values of ") {
+        rest.split_once(" are ")?.1
+    } else if let Some((_, post)) = body.split_once(" enumerates ") {
+        post
+    } else {
+        return None;
+    };
     let values: Vec<String> = tail.split(',')
         .filter_map(|chunk| chunk.trim()
             .strip_prefix('\'')
@@ -1310,6 +1320,29 @@ mod tests {
                 .collect())
             .unwrap_or_default();
         assert_eq!(vals, vec!["low", "medium", "high"]);
+    }
+
+    #[test]
+    fn enum_values_declaration_recognises_enumerates_shorthand() {
+        // task-951: `<Noun> enumerates 'v1', 'v2', ...` is the shorthand
+        // alias for the FORML2 spec form. Stage-1 should emit the same
+        // Verb override + Enum_Value tokens so the downstream classifier
+        // and translate_enum_values fire identically.
+        let c = tokenize_statement(
+            "s1",
+            "Task Status enumerates 'pending', 'in_progress', 'completed', 'deleted'.",
+            &nouns(&["Task Status"]),
+        );
+        assert_eq!(stmt_binding(&c, "Statement_has_Head_Noun", "Head_Noun").as_deref(),
+                   Some("Task Status"));
+        assert_eq!(stmt_binding(&c, "Statement_has_Verb", "Verb").as_deref(),
+                   Some("the possible values of"));
+        let vals: Vec<String> = c.get("Statement_has_Enum_Value")
+            .map(|facts| facts.iter()
+                .filter_map(|f| binding(f, "Enum_Value").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert_eq!(vals, vec!["pending", "in_progress", "completed", "deleted"]);
     }
 
     // ─── #712 / MC1: cell-driven vocab tests ──────────────────────────

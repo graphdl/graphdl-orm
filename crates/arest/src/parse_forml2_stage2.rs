@@ -2262,6 +2262,9 @@ pub fn translate_nouns(classified_state: &Object, idx: &StmtIndex) -> Vec<Object
         }
 
         // Enum values: `The possible values of Priority are 'low', 'medium', 'high'.`
+        // or the shorthand `Priority enumerates 'low', 'medium', 'high'.` Both
+        // forms produce the same Verb="the possible values of" routing in
+        // stage1, so this block fires for either.
         if classifications_contains(idx,stmt_id, "Enum Values Declaration") {
             if let Some(text) = statement_text(idx,stmt_id) {
                 if let Some(vals) = extract_enum_values(&text) {
@@ -2925,8 +2928,18 @@ fn strip_semantics_annotation(reading: &str) -> &str {
 /// are 'v1', 'v2', …` declaration. Returns them joined by `,`.
 fn extract_enum_values(text: &str) -> Option<String> {
     let lower = text.to_ascii_lowercase();
-    let are_idx = lower.find(" are ")?;
-    let tail = &text[are_idx + 5..];
+    // Mirrors parse_forml2_stage1::extract_enum_values's syntax matrix —
+    // " are " for the spec form (... possible values of X are 'a' ...) and
+    // " enumerates " for the shorthand (X enumerates 'a', 'b' ...). The
+    // quote scanner below extracts identically from whichever tail we land on.
+    let (start, len) = if let Some(i) = lower.find(" are ") {
+        (i, 5)
+    } else if let Some(i) = lower.find(" enumerates ") {
+        (i, 12) // " enumerates " is 12 chars (space + 10 letters + space)
+    } else {
+        return None;
+    };
+    let tail = &text[start + len..];
     let mut vals: Vec<String> = Vec::new();
     let mut rest = tail;
     while let Some(open) = rest.find('\'') {
@@ -4197,6 +4210,17 @@ fn declared_noun_names(state: &Object) -> Vec<String> {
     names
 }
 
+/// task-951: Pull a cardinality bound (`at most N` / `at least M`) out of a
+/// Frequency Constraint reading text. Returns the digit run immediately
+/// following `marker`, or None if the marker is absent or not followed by
+/// digits. Lifted to module level so it can be unit-tested.
+fn extract_cardinality_bound(text: &str, marker: &str) -> Option<usize> {
+    let idx = text.find(marker)?;
+    let rest = text[idx + marker.len()..].trim_start();
+    let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    num.parse().ok()
+}
+
 /// Translate Uniqueness / Mandatory Role / Frequency Constraint
 /// classifications into `Constraint` cell facts. Kinds:
 ///
@@ -4258,13 +4282,29 @@ pub fn translate_cardinality_constraints(classified_state: &Object, idx: &StmtIn
             continue;
         }
 
-        out.push(fact_from_pairs(&[
+        // task-951: FC needs min/max bounds for NORMA's FrequencyConstraint.
+        // The grammar's classifier fires on the dual "at most"/"at least"
+        // quantifiers but the cardinality kind table doesn't carry the
+        // numerics; extract_cardinality_bound pulls them from the text. UC/MC
+        // never have bounds. Populating the bindings here (not in the NORMA
+        // exporter) means any downstream consumer of the Constraint cell
+        // gets the populated ConstraintDef.min/max_occurrence fields.
+        let min_str: Option<String> = if kind == "FC" {
+            extract_cardinality_bound(&text, "at least ").map(|n| n.to_string())
+        } else { None };
+        let max_str: Option<String> = if kind == "FC" {
+            extract_cardinality_bound(&text, "at most ").map(|n| n.to_string())
+        } else { None };
+        let mut pairs: Vec<(&str, &str)> = vec![
             ("id",       text.as_str()),
             ("kind",     kind),
             ("modality", "alethic"),
             ("text",     text.as_str()),
             ("entity",   entity.as_str()),
-        ]));
+        ];
+        if let Some(ref s) = min_str { pairs.push(("minOccurrence", s.as_str())); }
+        if let Some(ref s) = max_str { pairs.push(("maxOccurrence", s.as_str())); }
+        out.push(fact_from_pairs(&pairs));
     }
     out
 }
@@ -6073,6 +6113,54 @@ mod tests {
     fn grammar_state() -> Object {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
         parse_to_state(grammar).expect("grammar must parse")
+    }
+
+    #[test]
+    fn extract_cardinality_bound_pulls_at_most_and_at_least_numerics() {
+        // Standard FC reading: bounds extracted on both sides of "and".
+        let fc = "Each Order has at most 5 and at least 2 Line Items";
+        assert_eq!(extract_cardinality_bound(fc, "at most "), Some(5));
+        assert_eq!(extract_cardinality_bound(fc, "at least "), Some(2));
+        // Marker absent -> None.
+        assert_eq!(
+            extract_cardinality_bound("Each Book is written by an Author", "at most "),
+            None
+        );
+        // Marker present but not followed by digits (the "at most one" UC form):
+        // must NOT pick up "one" as a digit.
+        assert_eq!(
+            extract_cardinality_bound("Each Order has at most one Line Item", "at most "),
+            None
+        );
+        // Multi-digit number.
+        assert_eq!(
+            extract_cardinality_bound("Each X has at most 42 Y", "at most "),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn extract_enum_values_recognises_both_syntaxes() {
+        // task-951: stage-2's extract_enum_values must handle both the spec
+        // form (" are " marker) and the "enumerates" shorthand. The
+        // off-by-one fix (" enumerates " is 12 chars, not 13) was bug-fix
+        // territory -- this test pins both paths so a regression is loud.
+        assert_eq!(
+            extract_enum_values("The possible values of Priority are 'low', 'medium', 'high'."),
+            Some("low,medium,high".to_string()),
+        );
+        assert_eq!(
+            extract_enum_values("Task Status enumerates 'pending', 'in_progress', 'completed', 'deleted'."),
+            Some("pending,in_progress,completed,deleted".to_string()),
+        );
+        // Single-value enum (degenerate but valid).
+        assert_eq!(
+            extract_enum_values("Mood enumerates 'happy'."),
+            Some("happy".to_string()),
+        );
+        // No quoted values -> None.
+        assert_eq!(extract_enum_values("Each Order has Line Item."), None);
+        assert_eq!(extract_enum_values("Topic enumerates everything."), None);
     }
 
     /// Test helper: build a fresh StmtIndex from a classified state.
