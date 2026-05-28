@@ -1215,6 +1215,32 @@ fn create_via_defs(
             .filter(|s| !s.is_empty())
             .collect())
         .unwrap_or_default();
+    // Bridge-clobber guard (mirror of update_via_defs's fix from
+    // b4cfcb6f): snapshot the pre-drop value of every cell about to
+    // clear, plus the rule_id -> consequent_cell map. After the chain
+    // runs, restore cells whose producing rule was NEVER activated --
+    // the rule's antecedents didn't change on this create so its
+    // consequent must not be clobbered to empty. Cells whose rule WAS
+    // activated stay as the chain emitted them (including empty -- the
+    // legitimate stale-clear case). Without this guard, a createEntity
+    // whose touched cells don't include the SM bridge antecedents
+    // wipes Task_has_Task_Status / Task_is_recommended the same way an
+    // updateEntity of an unrelated field used to before b4cfcb6f.
+    let pre_drop_snapshot: hashbrown::HashMap<String, ast::Object> = dropped_cells.iter()
+        .map(|name| (name.clone(), ast::fetch_or_phi(name, &resolved).clone()))
+        .collect();
+    let rule_id_to_consequent_cell: hashbrown::HashMap<String, String> = drule_cell.as_seq()
+        .map(|facts| facts.iter()
+            .filter_map(|f| {
+                let id = ast::binding(f, "id")?;
+                let encoded = ast::binding(f, "consequentFactTypeId")?;
+                let cell = crate::types::ConsequentCellSource::decode(encoded)
+                    .literal_id().to_string();
+                if cell.is_empty() { return None; }
+                Some((id.to_string(), cell))
+            })
+            .collect())
+        .unwrap_or_default();
     let resolved = if dropped_cells.is_empty() {
         resolved
     } else {
@@ -1249,21 +1275,48 @@ fn create_via_defs(
     let mut seed = touched_cells.clone();
     seed.extend(drop_writer_reads);
 
+    let mut activated_rule_defs: hashbrown::HashSet<String> = hashbrown::HashSet::new();
     let (post_s1, mut derived) = if stratum1.is_empty() {
         (resolved.clone(), Vec::new())
     } else {
         let refs = to_seeded_refs(&s1_packed);
-        crate::evaluate::forward_chain_defs_state_seeded(
-            &refs, seed.clone(), &resolved, 100)
+        crate::evaluate::forward_chain_defs_state_seeded_tracked(
+            &refs, seed.clone(), &resolved, 100, &mut activated_rule_defs)
     };
     let derived_state = if stratum2.is_empty() {
         post_s1
     } else {
         let refs = to_seeded_refs(&s2_packed);
-        let (post_s2, more) = crate::evaluate::forward_chain_defs_state_seeded(
-            &refs, seed.clone(), &post_s1, 100);
+        let (post_s2, more) = crate::evaluate::forward_chain_defs_state_seeded_tracked(
+            &refs, seed.clone(), &post_s1, 100, &mut activated_rule_defs);
         derived.extend(more);
         post_s2
+    };
+
+    // Bridge-clobber restore: for any dropped cell whose producing rule
+    // was NEVER activated during the chain (its antecedents were not in
+    // the seed and therefore the per-round gate never selected it),
+    // restore the pre-drop value. Cells whose rule WAS activated keep
+    // whatever the chain emitted (including empty -- legitimate stale
+    // clear). Mirror of update_via_defs (b4cfcb6f).
+    let derived_state = if dropped_cells.is_empty() {
+        derived_state
+    } else {
+        let activated_consequent_cells: hashbrown::HashSet<String> = activated_rule_defs.iter()
+            .filter_map(|def_name| def_name.split_once(':').map(|(_, id)| id))
+            .filter_map(|id| rule_id_to_consequent_cell.get(id).cloned())
+            .collect();
+        let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+        for (name, contents) in ast::cells_iter(&derived_state).into_iter() {
+            if dropped_cells.contains(name) && !activated_consequent_cells.contains(name) {
+                if let Some(snap) = pre_drop_snapshot.get(name) {
+                    new_map.insert(name.to_string(), snap.clone());
+                    continue;
+                }
+            }
+            new_map.insert(name.to_string(), contents.clone());
+        }
+        ast::Object::Map(new_map.into())
     };
 
     // Collect fact type IDs from derived facts as additional events.
@@ -4407,6 +4460,105 @@ Resource is mirroring Status.
              after an updateEntity that does NOT touch SM antecedents -- the live bug \
              clobbered Task_has_Task_Status from 36k bytes to 1 byte on a description \
              update. post-update bindings: {:?}", update_bindings
+        );
+    }
+
+    /// Create-side sibling of `bridge_derivation_survives_no_op_update_to_
+    /// non_sm_field`. b4cfcb6f patched the bridge-clobber on
+    /// update_via_defs but deferred the create_via_defs sibling pending
+    /// a failing repro. This test pins the create scope: after creating
+    /// ORD-1 (bridge populates for ORD-1 → Draft), creating ORD-2 must
+    /// NOT clobber ORD-1's bridge entry. The drop-then-rederive cycle
+    /// in create_via_defs zeroes every dropped consequent before the
+    /// seeded chain; rules whose antecedent reads weren't in the seed
+    /// (or weren't activated for any other reason) used to leave their
+    /// consequents empty even though their pre-drop state should
+    /// survive. Mirror of the activation-tracking fix in update_via_defs.
+    #[test]
+    fn bridge_derivation_survives_second_create_in_unrelated_entity() {
+        const BRIDGE_READINGS: &str = r#"
+# SM-bridge for create-side bridge-clobber test
+
+## Entity Types
+
+Resource(.Reference) is an entity type.
+State Machine(.id) is an entity type.
+
+## Fact Types
+
+State Machine is for Resource.
+State Machine is currently in Status.
+Resource is mirroring Status.
+
+## Derivation Rules
+
+* Resource is mirroring Status iff some State Machine is for that Resource and that State Machine is currently in that Status.
+"#;
+
+        let meta = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let orders = crate::parse_forml2::parse_to_state_with_nouns(ORDER_READINGS, &meta).unwrap();
+        let bridge = crate::parse_forml2::parse_to_state_with_nouns(BRIDGE_READINGS, &meta).unwrap();
+        let state = ast::merge_states(&ast::merge_states(&meta, &orders), &bridge);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        // Step 1: create ORD-1 -- bridge populates ORD-1 → Draft.
+        let mut create1_fields = HashMap::new();
+        create1_fields.insert("orderNumber".to_string(), "ORD-1".to_string());
+        create1_fields.insert("amount".to_string(), "100".to_string());
+        let create1 = apply_command_defs(&def_obj, &Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "orders".to_string(),
+            id: Some("ORD-1".to_string()),
+            fields: create1_fields,
+            sender: None,
+            signature: None,
+        }, &state);
+        assert!(!create1.rejected, "first create must succeed; violations={:?}", create1.violations);
+        let post_create1 = ast::merge_states(&state, &create1.state);
+        let bridge1 = crate::ast::fetch_cell_seq("Resource_is_mirroring_Status", &post_create1);
+        let bindings1: alloc::vec::Vec<ast::Object> = bridge1.as_seq()
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            bindings1.iter().any(|f| {
+                crate::ast::binding(f, "Resource") == Some("ORD-1")
+                    && crate::ast::binding(f, "Status") == Some("Draft")
+            }),
+            "sanity: bridge must hold ORD-1 → Draft after first create; got {:?}", bindings1
+        );
+
+        // Step 2: create ORD-2 -- ORD-1's bridge entry MUST survive.
+        let mut create2_fields = HashMap::new();
+        create2_fields.insert("orderNumber".to_string(), "ORD-2".to_string());
+        create2_fields.insert("amount".to_string(), "200".to_string());
+        let create2 = apply_command_defs(&def_obj, &Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "orders".to_string(),
+            id: Some("ORD-2".to_string()),
+            fields: create2_fields,
+            sender: None,
+            signature: None,
+        }, &post_create1);
+        assert!(!create2.rejected, "second create must succeed; violations={:?}", create2.violations);
+
+        // Step 3: bridge must STILL have ORD-1 → Draft after the second create.
+        let post_create2 = ast::merge_states(&post_create1, &create2.state);
+        let bridge2 = crate::ast::fetch_cell_seq("Resource_is_mirroring_Status", &post_create2);
+        let bindings2: alloc::vec::Vec<ast::Object> = bridge2.as_seq()
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        let has_ord1 = bindings2.iter().any(|f| {
+            crate::ast::binding(f, "Resource") == Some("ORD-1")
+                && crate::ast::binding(f, "Status") == Some("Draft")
+        });
+        assert!(
+            has_ord1,
+            "regression: bridge cell must preserve Resource=ORD-1 → Status=Draft \
+             after a second createEntity for an unrelated Order -- the create-side \
+             drop+rederive used to clobber bridge entries for entities whose SM \
+             antecedents weren't in the new entity's touched-cells seed. \
+             post-create2 bindings: {:?}", bindings2
         );
     }
 
