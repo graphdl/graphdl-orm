@@ -4184,6 +4184,108 @@ Mid 'M1' has Code 'C1'.
         );
     }
 
+    /// task-968: the SM-fixture companion of task-967's ignored synthetic
+    /// JOIN test. Pins the post-5d2fb81d behavior on a Resource-keyed
+    /// derivation that consumes the live SM cells written by the Order
+    /// apply -- the EXACT cross-noun shape that triggered the original
+    /// bug. The custom bridge `Resource is mirroring Status iff some
+    /// State Machine is for that Resource and that State Machine is
+    /// currently in that Status` is keyed under index:Resource (its
+    /// antecedents resolve to State Machine + Status nouns). Before the
+    /// fix the rule was absent from index:Order, so the seeded-chain on
+    /// the Order create excluded it and `Resource_is_mirroring_Status`
+    /// never materialized. After: the un-gated collect_stratum visits
+    /// the rule, the chain sees the freshly written SM cells, and the
+    /// consequent reaches the LFP on the apply path.
+    ///
+    /// Distinct from the live `Resource_is_currently_in_Status` cell
+    /// (imperatively written by transition handling in command.rs:1969)
+    /// -- this uses a SEPARATE custom FT so any pass is attributable to
+    /// the derivation reaching LFP, not the imperative side-channel.
+    #[test]
+    fn apply_reaches_fixpoint_across_sm_bridge_derivation_task_968() {
+        const BRIDGE_READINGS: &str = r#"
+# task-968 SM-bridge fixture
+
+## Entity Types
+
+Resource(.Reference) is an entity type.
+State Machine(.id) is an entity type.
+
+## Fact Types
+
+State Machine is for Resource.
+State Machine is currently in Status.
+Resource is mirroring Status.
+
+## Derivation Rules
+
+* Resource is mirroring Status iff some State Machine is for that Resource and that State Machine is currently in that Status.
+"#;
+
+        let meta = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let orders = crate::parse_forml2::parse_to_state_with_nouns(ORDER_READINGS, &meta).unwrap();
+        let bridge = crate::parse_forml2::parse_to_state_with_nouns(BRIDGE_READINGS, &meta).unwrap();
+        let state = ast::merge_states(&ast::merge_states(&meta, &orders), &bridge);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        let mut fields = HashMap::new();
+        fields.insert("orderNumber".to_string(), "ORD-968".to_string());
+        fields.insert("amount".to_string(), "100".to_string());
+
+        let cmd = Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "orders".to_string(),
+            id: Some("ORD-968".to_string()),
+            fields,
+            sender: None,
+            signature: None,
+        };
+
+        let result = apply_command_defs(&def_obj, &cmd, &state);
+        assert!(!result.rejected,
+            "create must not be rejected; violations={:?}", result.violations);
+
+        // Sanity: the SM init wrote the antecedents the bridge consumes
+        // (`State_Machine_is_currently_in_Status` + `State_Machine_is_for_Resource`).
+        let sm_status = crate::ast::fetch_cell_seq("State_Machine_is_currently_in_Status", &result.state);
+        let sm_for_res = crate::ast::fetch_cell_seq("State_Machine_is_for_Resource", &result.state);
+        assert!(
+            sm_status.as_seq().map_or(false, |s| !s.is_empty()),
+            "SM init must materialize State_Machine_is_currently_in_Status on Order create (sanity)"
+        );
+        assert!(
+            sm_for_res.as_seq().map_or(false, |s| !s.is_empty()),
+            "SM init must materialize State_Machine_is_for_Resource on Order create (sanity)"
+        );
+
+        // Regression: the Resource-indexed bridge consumer -- severed from
+        // the Order apply by the pre-fix noun-gate at collect_stratum --
+        // must reach the LFP and materialize the bridge consequent.
+        let mirror = crate::ast::fetch_cell_seq("Resource_is_mirroring_Status", &result.state);
+        let bindings: alloc::vec::Vec<ast::Object> = mirror.as_seq()
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            !bindings.is_empty(),
+            "task-968 regression: Resource_is_mirroring_Status must materialize \
+             on the Order apply -- the seeded chain must reach the fixpoint across \
+             the cross-noun SM-bridge. SM status cell: {:?}", sm_status
+        );
+
+        // Stronger: the binding ties the new Order resource to its initial Status.
+        let has_ord_draft = bindings.iter().any(|f| {
+            crate::ast::binding(f, "Resource") == Some("ORD-968")
+                && crate::ast::binding(f, "Status") == Some("Draft")
+        });
+        assert!(
+            has_ord_draft,
+            "Resource_is_mirroring_Status must bind Resource=ORD-968 -> Status=Draft; \
+             got bindings={:?}", bindings
+        );
+    }
+
     /// task-965: the destructive-affordance rule (deleted -> DELETE) is read
     /// from the `Status has HTTP Method` reading, defaulting to GET. This
     /// keeps the HATEOAS method rule in readings, not a Rust literal.
