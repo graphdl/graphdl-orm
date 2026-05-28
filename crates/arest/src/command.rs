@@ -6884,13 +6884,6 @@ Transition 'place' is to Status 'Placed'.
             result.violations);
     }
 
-    // S1c (#719): the 5 #26 audit_log tests are removed — the chain
-    // (S1b/c) is the audit surface now. Wiring the apply path to
-    // thread the Command into VersionEntry's `event` field is the
-    // #719-followup; until then, no equivalent assertions exist here.
-    // Pre-S1c freezes that contain a populated `audit_log` cell still
-    // read back via `platform_audit_log` (legacy compatibility only).
-
     /// #35: MC compile must catch entities missing a mandatory role.
     /// Creating an Order on a domain where "Each Order is created by
     /// exactly one User" without a sender (no User fact) must produce
