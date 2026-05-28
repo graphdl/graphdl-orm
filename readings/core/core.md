@@ -138,6 +138,16 @@ Noun plays Role.
   Each Noun plays some Role.
   For each Role, exactly one Noun plays that Role.
   It is possible that some Noun plays more than one Role.
+Noun is instantiable. *
+  <!-- task-961 lift: a Noun is instantiable iff it is an entity type
+       (objectType='entity') AND it has a reference scheme (identity).
+       The derivation under ## Derivation Rules below carries the logic;
+       the Rust create/update gate at command.rs::noun_runtime_defined
+       remains as a defensive fallback until the engine queries this
+       derived cell directly. View-materialized (the `*` marker) so the
+       compute happens on read -- no separate stored cell, no risk of
+       the absorb-vs-data-cell asymmetry that task-961's earlier attempt
+       hit on the Noun_has_Object_Type FT read. -->
 
 ### Reading
 Reading has Text.
@@ -317,6 +327,8 @@ Derivation Rule depends on Derivation Rule. *
 * Fact Type has Arity iff Arity is the count of Role where Fact Type has Role.
 
 * Derivation Rule depends on Derivation Rule iff Derivation Rule has antecedent Fact Type and some other Derivation Rule produces that Fact Type.
+
+* Noun is instantiable iff Noun has Object Type 'entity' and Noun has some Reference Scheme Noun.
 
 Constraint is semantic iff Constraint has modality of Modality Type 'Deontic' and Constraint spans some Role and that Role is played by some Noun and no Resource is instance of that Noun.
 
