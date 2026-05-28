@@ -4286,6 +4286,116 @@ Resource is mirroring Status.
         );
     }
 
+    /// Regression: a derived bridge cell whose antecedents are UNTOUCHED
+    /// by an updateEntity MUST survive the update unchanged. Discovered
+    /// in tasks.db this session: an updateEntity changing only a Task's
+    /// description clobbered `Task_has_Task_Status` (a derived bridge
+    /// cell consuming State_Machine_is_currently_in_Status -- task-957's
+    /// `**`-materialized bridge) from 36453 bytes to 1 (`φ`). The
+    /// derivedCount on those applies was unusually low (800 vs 13204 on
+    /// a prior apply), suggesting the bridge derivation ran with partial
+    /// antecedents and the empty delta got committed.
+    ///
+    /// At THIS scope (in-memory `apply_command_defs` on the synthetic
+    /// SM-bridge fixture from task-968) the test PASSES -- the bridge
+    /// cell is preserved correctly on the no-op update. That LOCATES
+    /// the live tasks.db bug NOT in the in-memory apply path but in the
+    /// PERSIST/COMMIT layer between apply and SQLite (the path that
+    /// writes the apply delta back to disk). Hypothesis: the commit
+    /// path overwrites cells with the delta value (empty if the
+    /// derivation didn't re-emit) instead of merging with existing,
+    /// so a stratum-1 rule that doesn't fire on the dirty noun's keys
+    /// drops its consequent cell. Pinning the in-memory invariant
+    /// here keeps the apply layer honest; a separate failing repro at
+    /// the persist scope is the path to fixing the live bug.
+    ///
+    /// Companion to task-968 (materialization on create); both rely on
+    /// the same BRIDGE_READINGS fixture.
+    #[test]
+    fn bridge_derivation_survives_no_op_update_to_non_sm_field() {
+        const BRIDGE_READINGS: &str = r#"
+# SM-bridge for no-op-update test
+
+## Entity Types
+
+Resource(.Reference) is an entity type.
+State Machine(.id) is an entity type.
+
+## Fact Types
+
+State Machine is for Resource.
+State Machine is currently in Status.
+Resource is mirroring Status.
+
+## Derivation Rules
+
+* Resource is mirroring Status iff some State Machine is for that Resource and that State Machine is currently in that Status.
+"#;
+
+        let meta = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let orders = crate::parse_forml2::parse_to_state_with_nouns(ORDER_READINGS, &meta).unwrap();
+        let bridge = crate::parse_forml2::parse_to_state_with_nouns(BRIDGE_READINGS, &meta).unwrap();
+        let state = ast::merge_states(&ast::merge_states(&meta, &orders), &bridge);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        // Step 1: create -- bridge populates.
+        let mut create_fields = HashMap::new();
+        create_fields.insert("orderNumber".to_string(), "ORD-NOMUT".to_string());
+        create_fields.insert("amount".to_string(), "100".to_string());
+        let create = apply_command_defs(&def_obj, &Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "orders".to_string(),
+            id: Some("ORD-NOMUT".to_string()),
+            fields: create_fields,
+            sender: None,
+            signature: None,
+        }, &state);
+        assert!(!create.rejected, "create must succeed; violations={:?}", create.violations);
+        let bridge_after_create = crate::ast::fetch_cell_seq("Resource_is_mirroring_Status", &create.state);
+        let create_bindings: alloc::vec::Vec<ast::Object> = bridge_after_create.as_seq()
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        assert!(!create_bindings.is_empty(),
+            "sanity: bridge must populate on create (task-968 already pinned this)");
+
+        // Step 2: merge the create delta into a working state.
+        let post_create = ast::merge_states(&state, &create.state);
+
+        // Step 3: updateEntity touching only Amount (NOT a Status field).
+        //         The bridge's antecedents (State_Machine_*) are untouched.
+        let mut update_fields = HashMap::new();
+        update_fields.insert("amount".to_string(), "200".to_string());
+        let update = apply_command_defs(&def_obj, &Command::UpdateEntity {
+            noun: "Order".to_string(),
+            domain: "orders".to_string(),
+            entity_id: "ORD-NOMUT".to_string(),
+            fields: update_fields,
+            force: false,
+            sender: None,
+            signature: None,
+        }, &post_create);
+        assert!(!update.rejected, "update must succeed; violations={:?}", update.violations);
+
+        // Step 4: bridge MUST still have ORD-NOMUT -> Draft after the update.
+        let post_update = ast::merge_states(&post_create, &update.state);
+        let bridge_after_update = crate::ast::fetch_cell_seq("Resource_is_mirroring_Status", &post_update);
+        let update_bindings: alloc::vec::Vec<ast::Object> = bridge_after_update.as_seq()
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        let has_ord = update_bindings.iter().any(|f| {
+            crate::ast::binding(f, "Resource") == Some("ORD-NOMUT")
+                && crate::ast::binding(f, "Status") == Some("Draft")
+        });
+        assert!(
+            has_ord,
+            "regression: bridge cell must preserve Resource=ORD-NOMUT -> Status=Draft \
+             after an updateEntity that does NOT touch SM antecedents -- the live bug \
+             clobbered Task_has_Task_Status from 36k bytes to 1 byte on a description \
+             update. post-update bindings: {:?}", update_bindings
+        );
+    }
+
     /// task-965: the destructive-affordance rule (deleted -> DELETE) is read
     /// from the `Status has HTTP Method` reading, defaulting to GET. This
     /// keeps the HATEOAS method rule in readings, not a Rust literal.
