@@ -144,12 +144,12 @@ Noun is instantiable. **
        The derivation under ## Derivation Rules below carries the logic;
        the Rust create/update gate at command.rs::noun_runtime_defined
        reads this stored cell first, falling back to the procedural
-       Noun-cell scan when the cell is empty (covers states where the
-       derivation hasn't materialized -- task-961's RMAP absorbed-FT
-       reconstitution gap, addressed by task-962 in flight). The `**`
-       marker stores the consequent; once 962 closes the absorbed-FT
-       gap, the procedural fallback can delete and the gate becomes
-       a pure cell query. -->
+       Noun-cell scan when the cell is empty (covers states whose
+       binary db has not yet been recompiled with task-962's RMAP
+       absorbed-FT reconstitution, shipped 83aab604/28f8028a). The
+       `**` marker stores the consequent; once every live db has
+       been recompiled past 962, the procedural fallback can delete
+       and the gate becomes a pure cell query. -->
 
 ### Reading
 Reading has Text.
