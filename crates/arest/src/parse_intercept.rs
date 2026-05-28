@@ -171,6 +171,7 @@ fn parse_dispatch_inner(input: &str, with_nouns: bool) -> String {
 /// fallback misses those, which is acceptable since the bundled
 /// readings that need them are baked into the metamodel and never
 /// hit this path.
+#[cfg(any(target_arch = "wasm32", test))]
 fn regex_fallback_parse(markdown: &str, domain: &str) -> String {
     let mut out = String::from("[");
     let mut first = true;
@@ -218,6 +219,7 @@ fn regex_fallback_parse(markdown: &str, domain: &str) -> String {
 
 /// Recognise noun-declaration shape. Returns `(name, objectType)`
 /// where objectType is one of "entity" / "value" / "abstract".
+#[cfg(any(target_arch = "wasm32", test))]
 fn noun_from_decl(stmt: &str) -> Option<(String, &'static str)> {
     // Lowercase suffix scan for tolerance to leading capitalization
     // and incidental whitespace.
@@ -247,6 +249,7 @@ fn noun_from_decl(stmt: &str) -> Option<(String, &'static str)> {
 
 /// Emit one `{id, type, domain, data}` entity as JSON. Inline so
 /// the fallback doesn't need to build an intermediate Object tree.
+#[cfg(any(target_arch = "wasm32", test))]
 fn push_entity(out: &mut String, domain: &str, type_name: &str, key: &str, fields: &[(&str, &str)]) {
     out.push('{');
     out.push_str("\"id\":");

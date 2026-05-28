@@ -610,6 +610,10 @@ mod tests {
     /// tempdir. The label keeps directories distinct so the parallel
     /// test runner doesn't have two tests fighting over the same
     /// path. Each test should remove the dir on exit.
+    ///
+    /// Every caller is wine-feature-gated; without the cfg the function
+    /// looks unused to the compiler and warns. Match the callers.
+    #[cfg(feature = "wine")]
     fn test_prefix_root(label: &str) -> std::path::PathBuf {
         let pid = std::process::id();
         let path = std::env::temp_dir().join(format!("arest-run-test-{}-{}", pid, label));
