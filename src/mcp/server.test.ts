@@ -25,6 +25,7 @@ import {
   persistActiveAppEnabled,
   chooseInitialAppName,
   activeAppStateFile,
+  shouldPersistResolvedApp,
 } from './server.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -59,6 +60,32 @@ describe('active-app persistence (AREST_PERSIST_ACTIVE_APP)', () => {
 
   it('stores the marker as a hidden file inside the apps dir', () => {
     expect(activeAppStateFile('/abs/apps')).toMatch(/[\\/]\.arest-active-app$/)
+  })
+
+  // task-959 fix #1: the gate that decides whether to write the
+  // `.arest-active-app` marker -- used by BOTH the startup resolution
+  // AND `apps.use` so a reconnect deterministically resumes the actually-
+  // active app, even when that app came from an inferInitialAppName
+  // fallback ($AREST_APP) rather than an explicit apps.use.
+  it('shouldPersistResolvedApp gates writes: persist + apps dir + app exists', () => {
+    // happy path: all three present -> write the marker.
+    expect(shouldPersistResolvedApp({
+      persistEnabled: true, appsDir: '/abs/apps', appExists: true,
+    })).toBe(true)
+    // persistence disabled (e.g. AREST_PERSIST_ACTIVE_APP=0) -> do not write.
+    expect(shouldPersistResolvedApp({
+      persistEnabled: false, appsDir: '/abs/apps', appExists: true,
+    })).toBe(false)
+    // no apps workspace (remote-mode boot) -> do not write.
+    expect(shouldPersistResolvedApp({
+      persistEnabled: true, appsDir: '', appExists: true,
+    })).toBe(false)
+    // resolved app does not exist on disk -> do NOT promote a fallback
+    // over a valid earlier marker (the fallback would clobber 'tasks'
+    // with 'claude' if $AREST_APP misses a real app).
+    expect(shouldPersistResolvedApp({
+      persistEnabled: true, appsDir: '/abs/apps', appExists: false,
+    })).toBe(false)
   })
 })
 

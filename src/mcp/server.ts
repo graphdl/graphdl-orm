@@ -115,6 +115,24 @@ export function chooseInitialAppName(opts: {
   return inferInitialAppName(opts.env)
 }
 
+/**
+ * Common gate for writing the `.arest-active-app` marker. Used by BOTH
+ * the explicit `apps.use` path (activateApp) AND the startup-resolution
+ * persist (task-959 fix #1) so a reconnect resumes the actually-active
+ * app regardless of how it was resolved.
+ *
+ * Returns true iff persistence is enabled, an apps workspace exists,
+ * and the resolved app actually exists on disk -- we never promote a
+ * non-existent fallback over a valid earlier marker.
+ */
+export function shouldPersistResolvedApp(opts: {
+  persistEnabled: boolean
+  appsDir: string
+  appExists: boolean
+}): boolean {
+  return Boolean(opts.persistEnabled && opts.appsDir && opts.appExists)
+}
+
 function readPersistedAppName(appsDir: string): string {
   try {
     return readFileSync(activeAppStateFile(appsDir), 'utf8').trim()
@@ -171,6 +189,22 @@ function appRegistryOptions() {
 
 let activeApp = resolveArestApp(INITIAL_APP_NAME, appRegistryOptions())
 
+// task-959 fix #1: persist the resolved initial app so a future
+// reconnect deterministically resumes here -- the apps.use path
+// (activateApp below) writes the marker on every explicit switch,
+// but startup resolutions that came from $AREST_APP via
+// inferInitialAppName used to leave the marker stale or empty, so a
+// reconnect with a stale marker fell back to $AREST_APP again
+// instead of the app the session was actually using. Mirrors the
+// activateApp gate via shouldPersistResolvedApp.
+if (shouldPersistResolvedApp({
+  persistEnabled: PERSIST_ACTIVE_APP,
+  appsDir: APPS_DIR,
+  appExists: activeApp.exists,
+})) {
+  writePersistedAppName(APPS_DIR, activeApp.name)
+}
+
 // ── Local mode: bundled WASM engine via engine.ts ───────────────────
 // Lazily imported so remote-mode users don't pay the WASM cost.
 
@@ -187,7 +221,11 @@ function activateApp(name: string): ArestApp {
   activeApp = resolveArestApp(name, appRegistryOptions())
   resetLocalHandle()
   // Remember the most-recently-activated app so a restart resumes it.
-  if (PERSIST_ACTIVE_APP && APPS_DIR && activeApp.exists) {
+  if (shouldPersistResolvedApp({
+    persistEnabled: PERSIST_ACTIVE_APP,
+    appsDir: APPS_DIR,
+    appExists: activeApp.exists,
+  })) {
     writePersistedAppName(APPS_DIR, activeApp.name)
   }
   return activeApp
