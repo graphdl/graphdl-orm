@@ -971,10 +971,10 @@ server.registerTool(
     if (AREST_MODE === 'local') {
       if (id) {
         const raw = await systemCall(`get:${noun}`, id)
-        try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
+        return textResult(parseGetResponse(raw, noun, activeApp.name))
       }
       const raw = await systemCall(`list:${noun}`, '')
-      try { return textResult(JSON.parse(raw)) } catch { return textResult({ raw }) }
+      return textResult(parseGetResponse(raw, noun, activeApp.name))
     }
     const path = id
       ? `/arest/default/${encodeURIComponent(noun)}/${encodeURIComponent(id)}`
@@ -1007,6 +1007,36 @@ export function parseQueryResponse(raw: string): unknown {
   try {
     const parsed = JSON.parse(raw)
     return parsed ?? []
+  } catch {
+    return { raw }
+  }
+}
+
+/**
+ * Translate the engine's raw response to the `get` / `list` shape.
+ *
+ * task-959 fix #3: when the engine returns bare `⊥` for get/list, the
+ * single most likely cause is the requested noun isn't declared in the
+ * active app's UoD -- a get:<Noun> def the engine doesn't have. Until
+ * this fix, the MCP runtime returned `{ raw: '⊥' }`, which looks like
+ * data loss when the data is fine and just lives in a different app.
+ *
+ * The envelope here keeps the bare `raw: '⊥'` so existing tooling that
+ * matched against it still sees it, but adds an `error` + `hint` that
+ * names the active app and points at apps_list / apps_use. The warning
+ * is intentionally framed as "possible cause" -- bare `⊥` can also be
+ * an engine internal -- so this never falsely asserts.
+ */
+export function parseGetResponse(raw: string, noun: string, activeAppName: string): unknown {
+  if (raw === '⊥') {
+    return {
+      error: `Bottom: get/list for '${noun}' returned ⊥ in active app '${activeAppName}'`,
+      hint: `'${noun}' is most likely not declared in '${activeAppName}'. Try \`apps_list\` to see other apps and \`apps_use <name>\` to switch UoDs -- the entity may be in a different app.`,
+      raw: '⊥',
+    }
+  }
+  try {
+    return JSON.parse(raw)
   } catch {
     return { raw }
   }

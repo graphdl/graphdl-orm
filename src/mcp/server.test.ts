@@ -26,6 +26,7 @@ import {
   chooseInitialAppName,
   activeAppStateFile,
   shouldPersistResolvedApp,
+  parseGetResponse,
 } from './server.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -60,6 +61,31 @@ describe('active-app persistence (AREST_PERSIST_ACTIVE_APP)', () => {
 
   it('stores the marker as a hidden file inside the apps dir', () => {
     expect(activeAppStateFile('/abs/apps')).toMatch(/[\\/]\.arest-active-app$/)
+  })
+
+  // task-959 fix #3: bare ⊥ from get/list (engine has no get:<Noun> def
+  // because the noun isn't in the active app's UoD) surfaces a wrong-UoD
+  // warning that names the active app and points at apps_list/apps_use.
+  // Before this fix the UI showed only `{ raw: '⊥' }`, which read as
+  // data loss when the data is fine and just lives in a different app.
+  it('parseGetResponse surfaces a wrong-UoD warning when the engine returns ⊥', () => {
+    const out = parseGetResponse('⊥', 'Task', 'claude') as Record<string, unknown>
+    expect(out.error).toMatch(/Bottom: get.list for 'Task' returned ⊥ in active app 'claude'/)
+    expect(out.hint).toMatch(/apps_use/)
+    expect(out.hint).toMatch(/'Task'/)
+    expect(out.hint).toMatch(/'claude'/)
+    expect(out.raw).toBe('⊥')
+  })
+
+  it('parseGetResponse passes through valid JSON unchanged', () => {
+    const valid = '{"id":"ORD-1","type":"Order","data":{"Amount":"100"}}'
+    expect(parseGetResponse(valid, 'Order', 'orders')).toEqual({
+      id: 'ORD-1', type: 'Order', data: { Amount: '100' },
+    })
+  })
+
+  it('parseGetResponse falls back to raw on non-JSON, non-⊥ output', () => {
+    expect(parseGetResponse('not json', 'Order', 'orders')).toEqual({ raw: 'not json' })
   })
 
   // task-959 fix #1: the gate that decides whether to write the
