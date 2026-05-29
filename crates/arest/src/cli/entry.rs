@@ -24,7 +24,9 @@
 // Everything goes through SYSTEM. No separate bootstrap, synthesize,
 // or forward-chain commands. Per AREST paper: SYSTEM:x = ⟨o, D'⟩.
 
-use crate::{ast, compile, parse_forml2};
+#[cfg(feature = "local")]
+use crate::{ast, compile};
+use crate::parse_forml2;
 
 // =========================================================================
 // SQLite persistence (feature = "local")
