@@ -137,8 +137,8 @@ If some Status is initial in some State Machine Definition then that Status is d
 
 Domain 'state' has Access 'public'.
 
-<!-- task-965: the HATEOAS destructive-affordance rule, lifted from a Rust
-     literal (command.rs http_method_for_status) into a reading. A transition
-     whose target Status has a declared HTTP Method surfaces with that method;
-     all others default to GET. -->
+<!-- task-965 lift (shipped 6393ceb3): the HATEOAS destructive-affordance
+     rule, lifted from a Rust literal (command.rs http_method_for_status)
+     into a reading. A transition whose target Status has a declared HTTP
+     Method surfaces with that method; all others default to GET. -->
 Status 'deleted' has HTTP Method 'DELETE'.
