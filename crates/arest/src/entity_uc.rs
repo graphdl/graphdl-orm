@@ -138,6 +138,38 @@ pub fn reconstitute_ft_from_entity_rows<'a>(
     facts
 }
 
+/// How to reconstitute one absorbed binary FT from its entity table's
+/// rows: the subject entity role + its id field, and the value role +
+/// the row field the value lives under. In P2 these are derived from
+/// `rmap`; here they are explicit so the census stays a pure unit.
+#[derive(Clone, Debug)]
+pub struct AbsorbedFtRoute<'a> {
+    pub subject_role: &'a str,
+    pub id_field: &'a str,
+    pub value_role: &'a str,
+    pub value_field: &'a str,
+}
+
+/// Runtime ↑FILE for a whole entity table: union the reconstituted
+/// elementary facts of every absorbed FT over the table's rows — the
+/// `P_after` side of the migration census (`P = ⋃ₙ ↑FILE:Dₙ`).
+pub fn reconstitute_table_population(
+    rows: &[Object],
+    routes: &[AbsorbedFtRoute<'_>],
+) -> Vec<Object> {
+    let mut p: Vec<Object> = Vec::new();
+    for r in routes {
+        p.extend(reconstitute_ft_from_entity_rows(
+            rows.iter(),
+            r.subject_role,
+            r.id_field,
+            r.value_role,
+            r.value_field,
+        ));
+    }
+    p
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +321,28 @@ mod tests {
         assert_eq!(binding(&facts[0], "Task"), Some("909"));
         assert_eq!(binding(&facts[0], "Task Description"), Some("fix the core"));
         assert_eq!(binding(&facts[1], "Task"), Some("910"));
+    }
+
+    #[test]
+    fn census_table_population_unions_all_absorbed_fts() {
+        use crate::ast::binding;
+        let rows = [
+            row(&[("id", "909"), ("task_description", "fix core"), ("task_subject", "Core")]),
+            row(&[("id", "910"), ("task_description", "write P1"), ("task_subject", "P1")]),
+        ];
+        let routes = [
+            AbsorbedFtRoute { subject_role: "Task", id_field: "id", value_role: "Task Description", value_field: "task_description" },
+            AbsorbedFtRoute { subject_role: "Task", id_field: "id", value_role: "Task Subject", value_field: "task_subject" },
+        ];
+        let p = reconstitute_table_population(&rows, &routes);
+        // 2 rows × 2 absorbed FTs = 4 elementary facts (eq:pop union).
+        assert_eq!(p.len(), 4);
+        // Deterministic order: route order, then row order.
+        assert_eq!(binding(&p[0], "Task"), Some("909"));
+        assert_eq!(binding(&p[0], "Task Description"), Some("fix core"));
+        assert_eq!(binding(&p[1], "Task Description"), Some("write P1"));
+        assert_eq!(binding(&p[2], "Task"), Some("909"));
+        assert_eq!(binding(&p[2], "Task Subject"), Some("Core"));
+        assert_eq!(binding(&p[3], "Task Subject"), Some("P1"));
     }
 }
