@@ -47,6 +47,51 @@ instances_of_noun_func(Sub))` — the byte-for-byte same shape
 equivalence with the pre-#890 per-pair fanout is pinned by
 `crates/arest/tests/subtype_metamodel_rule_e2e.rs`.
 
+<!--
+  Substrate-lift TODO (deletion plan for `compile_subtype_inheritance_metamodel`):
+
+  The rule above is the FORML 2 form of what
+  `crates/arest/src/compile.rs::compile_subtype_inheritance_metamodel`
+  (~lines 6179-6249) synthesises procedurally. Once the parser learns
+  to lift derivation antecedents that quantify over the METAMODEL cells
+  (`Subtype`, `FactType`, `Role`, `Noun`) — not just user-declared FTs —
+  the Rust synthesiser becomes pure ceremony and can be retired.
+
+  Deletion plan (do not apply until prerequisites land):
+
+  1. Parser prerequisite — `resolve_derivation_rule`
+     (crates/arest/src/parse_forml2.rs) must recognise antecedents whose
+     FT references are metamodel cells. Today these clauses fall through
+     `// (1) Comparator-stripped FT lookup` and land as
+     `UnresolvedClause` because Subtype/Role/FactType are not in the
+     declared-FT catalog of a user reading set.
+
+  2. Compiler prerequisite — `compile_explicit_derivation` must handle
+     a `Literal(ft_id)` consequent whose ft_id is itself a binding from
+     a metamodel-cell antecedent (today it expects ft_id to be a
+     compile-time-known literal).
+
+  3. Once (1) and (2) ship, this rule body parses into a single
+     `CompiledDerivation` whose Func quantifies over
+     `Subtype × FactType × Role × <Sub-instances>` directly. At that
+     point delete `compile_subtype_inheritance_metamodel` (compile.rs
+     ~6179-6249), the `SUBTYPE_INHERITANCE_ID` constant (~6257), the
+     synthetic-id branch in `compile_to_defs_state` (~1907) that keys
+     this id into every subtype's relevance set, and the call site at
+     ~3935. The pin `crates/arest/tests/subtype_metamodel_rule_e2e.rs`
+     stays — it verifies emission shape, not the lift mechanism.
+
+  Cascading callers (BLOCKING — `compile_subtype_inheritance_metamodel`
+  has non-synthesiser consumers, so the lift is option-6 "document and
+  stop" until prerequisites (1) and (2) land):
+    * `compile_to_defs_state` `derivation_index` synthetic-id fallback
+      (compile.rs ~1737, ~1907) — needs to know "this id covers every
+      subtype". Once the rule is parser-lifted to a normal
+      CompiledDerivation, the index keys it from its bindings instead
+      of the synthetic-id allowlist.
+    * `compile_derivations` direct call (compile.rs ~3935).
+-->
+
 ## SS Subset-Constraint auto-fill (#891 — replaces the per-SS-Constraint Rust loop)
 
 Whitepaper §5.2 universal modus-ponens schema for Subset Constraint

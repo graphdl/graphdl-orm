@@ -6176,6 +6176,17 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
 ///
 /// Returns `None` when no subtypes are declared — the chainer
 /// shouldn't see a no-op `Concat . []` def in that case.
+///
+/// SUBSTRATE-LIFT TODO: this synthesiser is option-6 ("document and
+/// stop") — its callers `compile_derivations` (~3935) and the
+/// `derivation_index` synthetic-id fallback (~1907) cascade into the
+/// chainer's relevance-set keying. The deletion plan lives next to
+/// the parsed reading body in `readings/core/derivation.md` (look
+/// for the `Substrate-lift TODO` HTML comment under the
+/// "Subtype inheritance" section). Prerequisites: parser support for
+/// metamodel-cell antecedents (`Subtype`/`Role`/`FactType`) and a
+/// `Literal(ft_id)` consequent whose ft_id binds from an antecedent
+/// rather than a compile-time literal.
 pub(crate) fn compile_subtype_inheritance_metamodel(
     data: &CellIndex,
 ) -> Option<CompiledDerivation> {
