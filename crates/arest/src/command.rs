@@ -310,8 +310,7 @@ pub fn decode_command_result(obj: &ast::Object) -> CommandResult {
             let entities = parsed.get("entities").and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|e| {
                     let id = e.get("id")?.as_str()?.to_string();
-                    let entity_type = e.get("type").or_else(|| e.get("entityType"))
-                        .and_then(|v| v.as_str())?.to_string();
+                    let entity_type = e.get("type").and_then(|v| v.as_str())?.to_string();
                     let data: hashbrown::HashMap<String, String> = e.get("data")
                         .and_then(|v| v.as_object())
                         .map(|m| m.iter().filter_map(|(k, v)|
