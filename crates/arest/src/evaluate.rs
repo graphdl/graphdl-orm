@@ -594,6 +594,26 @@ fn fact_key(f: &DerivedFact) -> FactKey {
 pub(crate) fn state_keys(state: &ast::Object) -> HashSet<FactKey> {
     let mut set: HashSet<FactKey> = HashSet::new();
     for (cell_name, cell_contents) in ast::cells_iter(state) {
+        // task-960: skip compiled-def / codegen cells. The post-compile
+        // def-state bundles population fact cells together with thousands
+        // of compiled defs (`derivation:*`, `validate:*`, `schema:*`,
+        // `get:*`, `create:*`, codegen targets, …) whose Func bodies are
+        // encoded as Object trees. `cell_facts_iter` can't tell a func
+        // node from a fact tuple, so without this guard state_keys mis-
+        // reads a def's encoded structure as facts and the vacuous-binding
+        // cartesian product below explodes (one `validate:` def fanned out
+        // to 1024+ combos × thousands of def cells), allocating until OOM
+        // on the full metamodel. Def cells carry no population facts, so
+        // dedup never needs their keys. Discriminator: a `<prefix>:` name
+        // not starting with `_`. Derived-fact cells dedup DOES need are
+        // kept — colon-free FT ids (`Task_has_…`, `_transitive_…`) or
+        // `_`-prefixed (`_cwa_negation:*`, `_sm_event_fold:*`), all retained
+        // by the `!starts_with('_')` test. (The earlier plain
+        // `contains(':')` filter wrongly dropped those `_`-prefixed derived
+        // facts and broke dedup — hence the `_` carve-out.)
+        if cell_name.contains(':') && !cell_name.starts_with('_') {
+            continue;
+        }
         let facts: alloc::vec::Vec<&ast::Object> =
             ast::cell_facts_iter(cell_contents).collect();
         for f in facts {
@@ -632,6 +652,21 @@ pub(crate) fn state_keys(state: &ast::Object) -> HashSet<FactKey> {
             // (N = number of vacuous roles, usually 1).
             let mut combos: alloc::vec::Vec<alloc::vec::Vec<(&str, &str)>> = alloc::vec![alloc::vec![]];
             for (k, variants) in &kv {
+                // task-960 guard: this cartesian product is 2^N in the
+                // number of vacuous-valued roles. A real population fact has
+                // at most a handful (the note above: N is usually 1), so
+                // `combos` stays tiny. But a def cell that slips past the
+                // `<prefix>:`-skip above by having NO colon — the aggregate
+                // `validate` cell, whose encoded body read as a single
+                // pseudo-fact with kv=828 — would fan out to 2^N and exhaust
+                // memory (the #960 OOM). Cap the expansion: no real fact
+                // reaches 4096 variant keys, so this only ever bounds a
+                // degenerate non-fact, whose partial keys are harmless (they
+                // are FNV-namespaced by cell_name and cannot collide with a
+                // real fact's key, so dedup of real facts is unaffected).
+                if combos.len() > 4096 {
+                    break;
+                }
                 let mut next = alloc::vec::Vec::with_capacity(combos.len() * variants.len());
                 for combo in &combos {
                     for v in variants {
@@ -934,6 +969,51 @@ mod tests {
              Without this collision, the chain loops on the same UC-conflict \
              every round until the LFP cap. existing keys: {:?}; cand_key: {}",
              existing, cand_key);
+    }
+
+    // task-960 regression guard. state_keys must NOT explode on a def cell
+    // whose encoded body, mis-read as a single "fact", carries many
+    // vacuous-valued pseudo-bindings — the post-compile def-state's
+    // aggregate `validate` cell (no colon, so it slips past the
+    // `<prefix>:` def-skip) read as one pseudo-fact with kv=828, and the
+    // vacuous-variant cartesian product fanned out to 2^N, OOMing the
+    // full-metamodel createEntity. It must ALSO still key `_`-prefixed
+    // derived-fact cells (`_cwa_negation:*`) that dedup needs — those are
+    // deliberately carved out of the def-skip. Without the combos cap this
+    // test allocates ~2^30 combos and OOMs the process.
+    #[test]
+    fn state_keys_caps_vacuous_explosion_and_keeps_underscore_derived() {
+        // A `validate`-like def cell: one pseudo-fact with 30 vacuous bindings.
+        let pseudo_fact = ast::Object::seq(
+            (0..30).map(|i| ast::Object::seq(vec![
+                ast::Object::atom(&format!("r{}", i)),
+                ast::Object::phi(),
+            ])).collect()
+        );
+        // A `_cwa_negation:` derived-fact cell dedup must track.
+        let cwa_fact = ast::Object::seq(vec![
+            ast::Object::seq(vec![ast::Object::atom("Task"), ast::Object::atom("t1")]),
+        ]);
+        let base = ast::Object::phi();
+        let s1 = ast::store("_cwa_negation:Task", ast::Object::seq(vec![cwa_fact]), &base);
+        let state = ast::store("validate", ast::Object::seq(vec![pseudo_fact]), &s1);
+
+        // Completes (the cap prevents the 2^30 blow-up); a hang/OOM here is
+        // the #960 regression.
+        let keys = state_keys(&state);
+
+        // The `_`-prefixed derived fact is kept (carve-out) and keyed, so
+        // dedup recognises it as already-present.
+        let cwa_candidate = DerivedFact {
+            fact_type_id: "_cwa_negation:Task".to_string(),
+            reading: String::new(),
+            bindings: vec![("Task".to_string(), "t1".to_string())],
+            derived_by: "test".to_string(),
+            confidence: Confidence::Definitive,
+        };
+        assert!(keys.contains(&fact_key(&cwa_candidate)),
+            "`_cwa_negation:` derived-fact key must be retained for dedup \
+             (the `_`-leading carve-out from the def-cell skip). keys={:?}", keys);
     }
 
     // task-927 follow-up pin: same as above but with the empty-atom

@@ -3333,6 +3333,23 @@ mod handle_isolation_tests {
                 prop_assert!(outcome.is_ok(), "apply panicked on {:?} (input: {})", op, input);
             }
         }
+
+        // task-960 e2e repro: createEntity for a metamodel noun ("App")
+        // against the loaded full metamodel used to OOM the apply forward
+        // chain (state_keys exploding on compiled-def cells). Fixed by the
+        // def-cell skip + vacuous-combo cap in evaluate.rs::state_keys; this
+        // now completes. Kept #[ignore]'d only because the full-metamodel
+        // create is slow (~40s — a separate perf follow-up, no longer a
+        // DoS); the fast unit guard is
+        // evaluate::tests::state_keys_caps_vacuous_explosion_and_keeps_underscore_derived.
+        #[test]
+        #[ignore = "task-960 e2e repro; passes since the state_keys fix, but the full-metamodel create is ~40s — run manually / in CI"]
+        fn task960_create_app_death_point() {
+            let h = create_impl();
+            let input = r#"{"command":{"type":"createEntity","noun":"App","domain":"","id":"diag1","fields":{}},"population":""}"#;
+            let _ = system_impl(h, "apply", input);
+            release_impl(h);
+        }
     }
 
     #[test]
