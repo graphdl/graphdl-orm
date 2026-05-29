@@ -2278,6 +2278,18 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     // `try_commit_declared` then locks only those O(|targets|) cells
     // instead of diffing all O(|cells|). Opaque ops still fall back
     // to `try_commit_diff`.
+    // task-969 layer B: avoid the metamodel-create double-derive. A
+    // createEntity always mints a new `<Noun>:<id>` cell, so Tier-1's
+    // optimistic CAS commit always returns StructuralChange; pre-fix the
+    // fully-derived result was then DISCARDED and recomputed identically
+    // under the Tier-2 write lock (~halving wasted derive time on every
+    // structural create). StructuralChange means the snapshot is CURRENT
+    // (a stale existing-cell conflict returns StaleSnapshot instead), so
+    // Tier-1's `new_d` is valid and can be reused in Tier 2 as long as no
+    // writer committed in the read->write lock gap. Carry it forward and
+    // reuse it iff the Tier-2 snapshot is unchanged, eliding the second
+    // `ast::apply` (the dominant cost).
+    let mut carried: Option<(ast::Object, ast::Object, String)> = None;
     {
         let st = tenant.read();
         let snapshot = st.snapshot_d();
@@ -2288,12 +2300,14 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
                 // Full-state commit (compile paths). Diff against the
                 // snapshot under shared lock; if clean, CAS the changed
                 // cells only. Schema-changing ops fall back to Tier 2.
-                let outcome = st.try_commit_diff(&snapshot, &new_d);
-                match outcome {
+                match st.try_commit_diff(&snapshot, &new_d) {
                     CommitOutcome::Committed => return response,
-                    CommitOutcome::StaleSnapshot | CommitOutcome::StructuralChange => {
-                        // fall through to Tier 2
-                    }
+                    // Snapshot still current; only new cells block the
+                    // CAS. Carry the derived result for Tier-2 reuse.
+                    CommitOutcome::StructuralChange => carried = Some((snapshot, new_d, response)),
+                    // A concurrent writer moved a cell we read: snapshot
+                    // is stale, so Tier 2 must re-derive.
+                    CommitOutcome::StaleSnapshot => {}
                 }
             }
             WriterResult::CommitDelta { delta, response } => {
@@ -2317,12 +2331,10 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
                 let event = ast::apply_event(key, obj.clone());
                 let augmented = augment_delta_with_entity_cells(&snapshot, &delta);
                 let new_d = ast::merge_delta(&snapshot, &augmented, Some(event));
-                let outcome = st.try_commit_diff(&snapshot, &new_d);
-                match outcome {
+                match st.try_commit_diff(&snapshot, &new_d) {
                     CommitOutcome::Committed => return response,
-                    CommitOutcome::StaleSnapshot | CommitOutcome::StructuralChange => {
-                        // fall through to Tier 2
-                    }
+                    CommitOutcome::StructuralChange => carried = Some((snapshot, new_d, response)),
+                    CommitOutcome::StaleSnapshot => {}
                 }
             }
         }
@@ -2331,6 +2343,19 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     // Tier 2: exclusive-lock escalation.
     let mut st = tenant.write();
     let snapshot = st.snapshot_d();
+    // task-969 layer B reuse: if Tier 1 only escalated to introduce new
+    // cells and no writer committed in the read->write lock gap, the
+    // snapshot is identical and Tier-1's derived `new_d` is exactly what
+    // a re-derive would produce. Commit it directly and skip the
+    // redundant `ast::apply`. The `==` is O(cells) — negligible beside
+    // the elided forward chain. Any change (a writer slipped into the
+    // gap) falls through to a correct re-apply against the fresh state.
+    if let Some((tier1_snapshot, new_d, response)) = carried {
+        if snapshot == tier1_snapshot {
+            st.replace_d(new_d);
+            return response;
+        }
+    }
     let apply_result = ast::apply(&ast::Func::Def(key.to_string()), &obj, &snapshot);
     match classify_writer_result(&apply_result) {
         WriterResult::NoCommit { response } => response,
