@@ -16,45 +16,6 @@ use hashbrown::HashMap;
 #[allow(unused_imports)]
 use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 
-// ── Parse mode stubs ────────────────────────────────────────────────
-//
-// The legacy cascade consulted per-thread BOOTSTRAP_MODE (allow
-// metamodel noun redeclaration during bundled-readings load) and
-// STRICT_MODE (reject undeclared partition subtypes instead of
-// auto-creating them). Both behaviours are gone: stage12 doesn't
-// apply the metamodel-redeclaration guard (that check lives in
-// `ast::find_metamodel_shadow`, disabled at the platform_compile
-// boundary for unrelated reasons), and stage12's noun detection
-// derives declared names directly from text so the loose
-// auto-creation path never triggers either.
-//
-// The public setters are kept as no-ops so `lib.rs`, `main.rs`, and
-// the example binaries compile unchanged — their calls were
-// scaffolding around the legacy guard, not a behavioural request.
-
-/// No-op after #285: stage12 doesn't apply the legacy metamodel
-/// redeclaration guard. Retained for API compatibility with callers
-/// that wrap bundled-reading loads in `set_bootstrap_mode(true)` /
-/// `set_bootstrap_mode(false)` guards.
-pub fn set_bootstrap_mode(_on: bool) {}
-
-/// No-op after #285: the loose/strict distinction disappeared with
-/// the legacy cascade. Retained so `main.rs --strict` still
-/// type-checks.
-#[allow(dead_code)]
-pub(crate) fn set_strict_mode(_on: bool) {}
-
-
-
-
-
-
-
-
-
-
-
-
 /// True when `clause` starts with a universal-quantifier keyword
 /// (`for each ` per the boot table; future keywords come from the
 /// `Universal Quantifier Keyword` grammar enum) followed by `<Noun>`

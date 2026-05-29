@@ -248,7 +248,6 @@ pub fn format_miss(name: &str, suggestions: &[String]) -> String {
 /// the strict-mode "undeclared noun" check the way a fresh user
 /// corpus would.
 pub fn build_state(readings: &[(&str, &str)]) -> ast::Object {
-    crate::parse_forml2::set_bootstrap_mode(true);
     let state = readings.iter().fold(ast::Object::phi(), |acc, (name, text)| {
         match crate::parse_forml2::parse_to_state_from(text, &acc) {
             Ok(this) => ast::merge_states(&acc, &this),
@@ -258,7 +257,6 @@ pub fn build_state(readings: &[(&str, &str)]) -> ast::Object {
             }
         }
     });
-    crate::parse_forml2::set_bootstrap_mode(false);
     state
 }
 

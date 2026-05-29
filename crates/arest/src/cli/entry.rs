@@ -26,7 +26,38 @@
 
 #[cfg(feature = "local")]
 use crate::{ast, compile};
+#[cfg(feature = "local")]
 use crate::parse_forml2;
+
+// KEYROLES-PROBE (temporary): report _CellKeyRoles entry-count and
+// Task_has_Task_Description size/shape at each pipeline stage so the
+// recompile clobber can be localized. Remove after fix.
+#[cfg(feature = "local")]
+fn keyroles_probe(stage: &str, d: &ast::Object) {
+    let ckr = ast::fetch_cell_seq("_CellKeyRoles", d);
+    // unwrap FFP const wrapper <'>, entries...
+    let ckr_entries = ckr.as_seq().map(|items| {
+        if items.len() >= 1 && items[0].as_atom() == Some("'") {
+            items.len().saturating_sub(1)
+        } else { items.len() }
+    });
+    let ckr_dbg = format!("{:?}", ckr);
+    let ckr_dbg = if ckr_dbg.len() > 80 { format!("{}…", &ckr_dbg[..80]) } else { ckr_dbg };
+    let desc = ast::fetch_cell_seq("Task_has_Task_Description", d);
+    let (desc_kind, desc_count) = if let Some(m) = desc.as_map() {
+        ("Map", m.len())
+    } else if let Some(s) = desc.as_seq() {
+        ("Seq", s.len())
+    } else { ("other", 0) };
+    let subj = ast::fetch_cell_seq("Task_has_Task_Subject", d);
+    let (subj_kind, subj_count) = if let Some(m) = subj.as_map() {
+        ("Map", m.len())
+    } else if let Some(s) = subj.as_seq() {
+        ("Seq", s.len())
+    } else { ("other", 0) };
+    eprintln!("[KRPROBE] {:<32} _CellKeyRoles entries={:?} ({}) | Desc {} count={} | Subj {} count={}",
+        stage, ckr_entries, ckr_dbg, desc_kind, desc_count, subj_kind, subj_count);
+}
 
 // =========================================================================
 // SQLite persistence (feature = "local")
@@ -600,7 +631,6 @@ pub fn main_entry() {
 
     // Parse flags.
     let no_validate = args.iter().any(|a| a == "--no-validate");
-    let strict = args.iter().any(|a| a == "--strict");
     let (db_path, mut rest, _) = args.iter()
         .filter(|a| !matches!(a.as_str(), "--no-validate" | "--strict"))
         .fold(
@@ -639,11 +669,6 @@ pub fn main_entry() {
             v
         }).filter(|v| !v.is_empty())
     };
-
-    // Wire parsed flags to their engine surface. `--no-validate` is now
-    // a state cell installed on the def store below (see #689); `--strict`
-    // is still a parser-side mode toggle.
-    if strict { parse_forml2::set_strict_mode(true); }
 
     #[cfg(not(feature = "local"))]
     {
@@ -734,8 +759,6 @@ pub fn main_entry() {
                 // 'derived-and-stored' values stuck around alongside
                 // the corrected 'fully-derived', and index_single's
                 // first-wins picked the stale one).
-                parse_forml2::set_bootstrap_mode(true);
-                parse_forml2::set_strict_mode(strict);
                 let all_readings: Vec<(&str, &str)> = crate::metamodel_readings().into_iter()
                     .map(|r| (r.0, r.1))
                     .chain(readings.iter().map(|(n, t)| (n.as_str(), t.as_str())))
@@ -814,8 +837,14 @@ pub fn main_entry() {
                                 ast::binding(f, "arity")?.parse::<usize>().ok()?)))
                             .collect())
                         .unwrap_or_default();
+                keyroles_probe("00 parsed_fresh", &parsed_fresh);
+                eprintln!("[KRPROBE] parsed_cell_names has _CellKeyRoles? {} ; has Desc? {} ; Desc in ft_ids? {}",
+                    parsed_cell_names.contains("_CellKeyRoles"),
+                    parsed_cell_names.contains("Task_has_Task_Description"),
+                    ft_ids.contains("Task_has_Task_Description"));
                 let prior_population: ast::Object = {
                     let loaded = db::load_state(&conn);
+                    keyroles_probe("01 loaded-from-db", &loaded);
                     // compile-gc-orphaned-derived-facts: cor:closure carries the prior
                     // DB population forward so runtime data survives a recompile; the
                     // preserve-and-GC logic (drop sidecar `:` / fresh-re-emitted cells +
@@ -828,6 +857,7 @@ pub fn main_entry() {
                         eprintln!("[load] cor:closure GC: dropped {} orphaned cell(s) whose \
                                    FactType is no longer declared: {:?}", gc_orphans.len(), gc_orphans);
                     }
+                    keyroles_probe("02 after-preserve_prior_pop", &pop);
                     pop
                 };
                 let prior_cell_count = ast::cells_iter(&prior_population).len();
@@ -843,6 +873,7 @@ pub fn main_entry() {
                 // InstanceFact → chain-derive, but FT cells themselves
                 // aren't parser-emitted) doesn't lose user data.
                 let state = ast::merge_states(&prior_population, &parsed_fresh);
+                keyroles_probe("03 after-merge_states", &state);
                 // Tree-shake the UoD (tree-shake-app-uod-to-reachable-closure):
                 // drop bundled-metamodel DOMAIN fact types (ui/os/templates/
                 // compat) the app never reaches — and the relics cor:closure
@@ -879,8 +910,7 @@ pub fn main_entry() {
                     }
                     crate::compile::prune_unreachable_fact_types(&state, &keep)
                 };
-                parse_forml2::set_bootstrap_mode(false);
-                parse_forml2::set_strict_mode(false);
+                keyroles_probe("04 after-tree-shake-prune", &state);
 
                 // Diagnostics: read cell sizes from the Object state.
                 let cell_len = |name: &str| ast::fetch_cell_seq(name, &state)
@@ -943,6 +973,7 @@ pub fn main_entry() {
                     ("audit".to_string(), ast::Func::Platform("audit".to_string())),
                 ];
                 let d = ast::defs_to_state(&defs, &state);
+                keyroles_probe("05 after-defs_to_state(base)", &d);
                 let compiled = readings.len();
 
                 // Materialize compile defs (schemas, derivations,
@@ -954,7 +985,21 @@ pub fn main_entry() {
                 // iff rules, leaving consequent FT cells empty (#822 in
                 // apps/tasks).
                 let compile_defs = crate::compile::compile_to_defs_state(&state);
+                {
+                    let ckr_in_defs = compile_defs.iter().find(|(n, _)| n == "_CellKeyRoles");
+                    match ckr_in_defs {
+                        Some((_, f)) => {
+                            let obj = ast::func_to_object(f);
+                            let n = obj.as_seq().map(|s| if s.len()>=1 && s[0].as_atom()==Some("'") { s.len()-1 } else { s.len() });
+                            eprintln!("[KRPROBE] compile_defs EMITS _CellKeyRoles: entries={:?}", n);
+                        }
+                        None => eprintln!("[KRPROBE] compile_defs does NOT emit _CellKeyRoles (entries empty at compile.rs:3219)"),
+                    }
+                    let desc_in_defs = compile_defs.iter().any(|(n, _)| n == "Task_has_Task_Description");
+                    eprintln!("[KRPROBE] compile_defs emits Task_has_Task_Description? {}", desc_in_defs);
+                }
                 let d = ast::defs_to_state(&compile_defs, &d);
+                keyroles_probe("06 after-compile_to_defs_state", &d);
 
                 // task-951: `--export-norma <file>` short-circuits here.
                 // `compile_to_defs_state` has just built the `norma:model`
@@ -1041,6 +1086,9 @@ pub fn main_entry() {
                     }
                     ast::Object::map(new_map)
                 };
+                eprintln!("[KRPROBE] derived_cells set contains _CellKeyRoles? {} ; Desc? {}",
+                    derived_cells.contains("_CellKeyRoles"), derived_cells.contains("Task_has_Task_Description"));
+                keyroles_probe("07 after-drop-derived", &d);
 
                 // Forward-chain over user `derivation:rule_*` defs to
                 // materialize derived FT cells (e.g.
@@ -1110,6 +1158,7 @@ pub fn main_entry() {
                         stratum1.len(), derived.len());
                     new_d
                 };
+                keyroles_probe("08 after-forward-chain", &d);
 
                 // Final subjectless-GC: extend cor:closure sanitation to the
                 // compiled output. The preserve-time GC (above) only cleans
@@ -1131,6 +1180,7 @@ pub fn main_entry() {
                 // persist paths -- single source of truth (task-958 schema-
                 // arity GC + ':' meta/view pass-through + identity dedup).
                 let d = super::dedup_state_for_persist(&d);
+                keyroles_probe("09 after-dedup_state_for_persist", &d);
 
                 // Persist state to SQLite (tables + triggers).
                 db::apply_ddl(&conn, &d);

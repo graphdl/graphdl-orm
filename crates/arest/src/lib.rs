@@ -1317,25 +1317,12 @@ fn create_bare_impl() -> u32 {
 ///   - Metamodel Constraint cell
 ///   - 3 platform primitive defs (compile, apply, verify_signature)
 ///
-/// Bootstrap mode (#23 guard bypass) wraps the parse fold.
 #[cfg(not(feature = "no_std"))]
 static METAMODEL_STATE: OnceLock<ast::Object> = OnceLock::new();
 
 #[cfg(not(feature = "no_std"))]
 fn metamodel_state() -> &'static ast::Object {
     METAMODEL_STATE.get_or_init(|| {
-        struct BootstrapGuard;
-        impl BootstrapGuard {
-            fn enter() -> Self {
-                parse_forml2::set_bootstrap_mode(true);
-                BootstrapGuard
-            }
-        }
-        impl Drop for BootstrapGuard {
-            fn drop(&mut self) { parse_forml2::set_bootstrap_mode(false); }
-        }
-        let _guard = BootstrapGuard::enter();
-
         // Fold every enabled metamodel reading into a single merged
         // state (parser only). The set of slices that contributes
         // depends on the enabled features (`ui-readings`, `os-readings`,

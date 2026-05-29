@@ -335,7 +335,6 @@ fn rebuild_init(apps_dir: &Path, x: &Object, d: &Object) -> Object {
     // Metamodel readings FIRST, then the app's — the fresh parse's schema cells
     // (FactType / Noun / Role / …) must include the metamodel, else the merge
     // would land an app-only schema.
-    crate::parse_forml2::set_bootstrap_mode(true);
     let all_readings: Vec<(&str, &str)> = crate::metamodel_readings()
         .into_iter()
         .map(|r| (r.0, r.1))
@@ -355,7 +354,6 @@ fn rebuild_init(apps_dir: &Path, x: &Object, d: &Object) -> Object {
             Object::map(m)
         }
         Err(_) => {
-            crate::parse_forml2::set_bootstrap_mode(false);
             return Object::Bottom;
         }
     };
@@ -364,7 +362,6 @@ fn rebuild_init(apps_dir: &Path, x: &Object, d: &Object) -> Object {
         match crate::parse_forml2::parse_to_state_from(text, &parsed) {
             Ok(this) => parsed = ast::merge_states(&parsed, &this),
             Err(_) => {
-                crate::parse_forml2::set_bootstrap_mode(false);
                 return Object::Bottom;
             }
         }
@@ -398,7 +395,6 @@ fn rebuild_init(apps_dir: &Path, x: &Object, d: &Object) -> Object {
             .collect();
         crate::compile::prune_unreachable_fact_types(&parsed, &keep)
     };
-    crate::parse_forml2::set_bootstrap_mode(false);
     // Compile defs (platform primitives + schema-derived) into the state.
     let mut defs: Vec<(String, ast::Func)> = Vec::new();
     defs.push(("compile".to_string(), ast::Func::Platform("compile".to_string())));
