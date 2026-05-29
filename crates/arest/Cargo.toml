@@ -181,15 +181,15 @@ name = "ss_autofill_metamodel_rule_e2e"
 path = "tests/ss_autofill_metamodel_rule_e2e.rs"
 required-features = ["test-bins"]
 
-# Transitivity metamodel rule end-to-end pin (#892). Acceptance for
-# replacing the per-(ft1, ft2) Rust synthesizer loop in
-# `compile.rs::compile_derivations` (was lines ~2514-2559) with a
-# single FORML 2 metamodel derivation rule expressed in
-# `readings/core/derivation.md`. Asserts the transitively inferred
-# fact `<<Person, 'p1'>, <Country, 'us'>>` lands in the synthetic
-# cell `_transitive_Person_has_City_City_is_in_Country` after
-# compile + forward-chain over a `Person has City` + `City is in
-# Country` fixture sharing the `City` join noun.
+# Transitivity removal pin (task-969). The eager `_transitivity`
+# metamodel derivation that materialized the all-pairs transitive
+# composition of chaining binary Fact Types into
+# `_transitive_<ft1>_<ft2>` cells (originally #892) was DELETED as an
+# unconsumed eager materialization. This test now asserts the ABSENCE:
+# the `Person has City` + `City is in Country` fixture (sharing the
+# `City` join noun) that the old rule fanned out over produces NO
+# `_transitive_*` closure cell after compile + forward-chain. See
+# `readings/core/derivation.md`.
 [[test]]
 name = "transitivity_metamodel_rule_e2e"
 path = "tests/transitivity_metamodel_rule_e2e.rs"

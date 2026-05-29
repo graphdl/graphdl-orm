@@ -122,47 +122,45 @@ consequent. Behavioural equivalence with the pre-#891 per-SS-
 Constraint fanout is pinned by
 `crates/arest/tests/ss_autofill_metamodel_rule_e2e.rs`.
 
-## Transitivity of binary Fact Types (#892 — replaces the per-(ft1, ft2) Rust loop)
+## Transitivity of binary Fact Types (eager materialisation removed — task-969)
 
-Whitepaper §5.2 universal modus-ponens schema for transitive
-composition: any two binary Fact Types whose join nouns chain
-(ft1's second role and ft2's first role share a noun) compose into
-a fresh transitive Fact Type whose facts pair ft1's source-role
-binding with ft2's destination-role binding.
+Transitive composition of binary Fact Types is **not** eagerly
+materialised and produces no synthetic closure facts.
 
-* Fact Type has inferred transitive Fact
-    iff some Fact Type Ft1 has Role at position 1 played by Noun J
-    and some Fact Type Ft2 has Role at position 0 played by Noun J
-    and that Ft1 has Source Noun S at position 0
-    and that Ft2 has Destination Noun D at position 1
-    and some Fact F1 in Ft1 binds Resource X at Source S and Resource Y at Join J
-    and some Fact F2 in Ft2 binds Resource Y at Join J and Resource Z at Destination D
-    and that Fact Type is `_transitive_<Ft1>_<Ft2>`
-    and that Fact has Source S at Resource X and Destination D at Resource Z.
+An earlier implementation (#892) lifted the universal modus-ponens
+schema for transitive composition — any two binary Fact Types whose
+join nouns chain (Ft1's second role and Ft2's first role share a noun
+J) compose into a fresh `_transitive_<Ft1>_<Ft2>` Fact Type pairing
+Ft1's source binding with Ft2's destination binding — into a single
+`_transitivity` metamodel `CompiledDerivation`. Its Func was
+`Concat . [per-(Ft1, Ft2) inner Func, ...]`, and every forward-chain
+round it materialised the all-pairs transitive composition of every
+chaining binary Fact Type into `_transitive_<Ft1>_<Ft2>` cells.
 
-The rule's antecedent quantifies over `(FactType × FactType) ×
-<Ft1-Fact × Ft2-Fact>` cells gated by the shared-join-noun
-condition; its consequent is the synthesized `<<S, X>, <D, Z>>`
-binding pushed into every fresh `_transitive_<Ft1>_<Ft2>` cell.
-`compile_transitivity_metamodel` in `crates/arest/src/compile.rs`
-performs the lift to a Func:
+It was removed 2026-05-29 as an unconsumed eager materialisation:
+no consumer ever read those cells. State-machine transition validation
+joins the explicit `Transition_is_from_Status` /
+`Transition_is_to_Status` /
+`Transition_is_defined_in_State_Machine_Definition` cells directly,
+never a transitive closure; the `command.rs` SM-stratum gate's
+`_transitive_Status` / `_transitive_Transition` substring matches were
+dead (the only transitivity def id was `_transitivity`, which never
+contains the substring `_transitive_`); and the TS/MCP layer has zero
+references to `_transitive`. On the dominant repro it was the all-pairs
+fanout (~10342 candidate facts per chain round) that drove the
+metamodel-create cost. This mirrors the eager CWA-negation complement
+below: an eager materialisation every consumer filtered out as noise.
 
-  Concat . [
-    per-(Ft1, Ft2) inner Func,
-    ...
-  ]
+The intentional absence is pinned by
+`crates/arest/tests/transitivity_metamodel_rule_e2e.rs`
+(`no_eager_transitive_closure_cell_is_materialised`), which asserts
+that the Person → City → Country fixture the old rule fanned out over
+produces NO `_transitive_*` cell after forward-chain.
 
-where each inner Func is the byte-for-byte same shape
-`compile_join_derivation` produces for a 2-antecedent
-`[FactType(Ft1), FactType(Ft2)]` rule with
-`Literal("_transitive_<Ft1>_<Ft2>")` consequent,
-`join_on = [shared_noun]`, and
-`consequent_bindings = [src_noun, dst_noun]`. Behavioural
-equivalence with the pre-#892 per-pair fanout is pinned by
-`crates/arest/tests/transitivity_metamodel_rule_e2e.rs`. The
-consequent cell name `_transitive_<Ft1>_<Ft2>` is preserved so
-SM-infrastructure gates in `command.rs` (which key off
-`_transitive_Status` / `_transitive_Transition`) keep working.
+(A user-authored transitive *ring constraint* — `TR`: `xRy ∧ yRz → xRz`,
+violation when the shortcut is missing — is a separate, still-supported
+feature compiled by `compile_ring_transitive_ast`; it enforces, it does
+not eagerly materialise a closure.)
 
 ## CWA negation (whitepaper §305 — an evaluation-time semantics, not a materialised rule)
 

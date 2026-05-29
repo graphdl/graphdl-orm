@@ -3055,8 +3055,19 @@ mod tests {
         assert!(derived.len() < 100, "Forward chaining should reach fixed point quickly");
     }
 
+    // task-969: the eager transitivity materialisation was REMOVED as
+    // an unconsumed eager rule (no consumer ever read the
+    // `_transitive_*` closure cells; SM validation joins the explicit
+    // `Transition_is_from/to_Status` cells, not a closure). This test
+    // (formerly `test_transitivity_derivation`, which asserted the
+    // eager rule fired) now PINS THE ABSENCE on the same City → State →
+    // Country fixture the old rule fanned out over: forward-chaining
+    // every compiled derivation must yield NO `transitivity`-tagged
+    // derived fact and NO `_transitive_*` cell. Mirrors the e2e pin
+    // `transitivity_metamodel_rule_e2e::no_eager_transitive_closure_cell_is_materialised`
+    // and the CWA-removal pin `test_cwa_vs_owa_negation`.
     #[test]
-    fn test_transitivity_derivation() {
+    fn no_eager_transitivity_materialisation() {
         let mut cells = empty_cells();
 
         cells = with_noun(cells, "City", &make_noun("entity"));
@@ -3084,31 +3095,34 @@ mod tests {
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
-        // Behaviour assertion (#287 gap #10): the transitivity
-        // derivation's presence is confirmed by its output below.
-        // Cell name / id format is compile-time detail.
-
-        // Forward chain: Austin isIn Texas, Texas isIn USA -> Austin (transitively) in USA
+        // The classic transitivity fixture: Austin isIn Texas, Texas
+        // isIn USA. The removed eager rule would have derived
+        // Austin (transitively) in USA into `_transitive_<a>_<b>`.
         let mut pop_state = ast::Object::phi();
         pop_state = ast::cell_push("ft_city_state", ast::fact_from_pairs(&[("City", "Austin"), ("State", "Texas")]), &pop_state);
         pop_state = ast::cell_push("ft_state_country", ast::fact_from_pairs(&[("State", "Texas"), ("Country", "USA")]), &pop_state);
 
         let dd = derivation_defs_from(&defs);
-        let (_new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
+        let (new_state, derived) = forward_chain_defs_state(&dd, &pop_state);
 
+        // No derived fact may be tagged as produced by a transitivity rule.
         let transitive_facts: Vec<_> = derived.iter()
             .filter(|d| d.derived_by.contains("transitivity"))
             .collect();
-        assert!(!transitive_facts.is_empty(),
-            "Expected transitivity to derive Austin->USA relationship");
+        assert!(transitive_facts.is_empty(),
+            "eager transitivity materialisation was removed (task-969); \
+             no `transitivity`-tagged derived fact may be produced, got: {:?}",
+            transitive_facts);
 
-        // Verify the derived fact connects City to Country
-        let city_country = transitive_facts.iter().find(|d| {
-            d.bindings.iter().any(|(_, v)| v == "Austin")
-                && d.bindings.iter().any(|(_, v)| v == "USA")
-        });
-        assert!(city_country.is_some(),
-            "Expected derived fact linking Austin to USA. Derived: {:?}", transitive_facts);
+        // And no `_transitive_*` closure cell may exist post-chain.
+        let transitive_cells: Vec<String> = ast::cells_iter(&new_state)
+            .into_iter()
+            .map(|(n, _)| n.to_string())
+            .filter(|n| n.starts_with("_transitive_"))
+            .collect();
+        assert!(transitive_cells.is_empty(),
+            "no eager `_transitive_*` closure cell may be materialised (task-969); got: {:?}",
+            transitive_cells);
     }
 
     #[test]

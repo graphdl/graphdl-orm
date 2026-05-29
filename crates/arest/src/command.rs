@@ -1192,8 +1192,7 @@ fn create_via_defs(
                 // When SQL triggers own derivations, still restrict to SM
                 // infrastructure + subscribed-event derivations.
                 if has_sql_triggers {
-                    n.contains("StateMachine") || n.contains("machine:") || n.contains("_transitive_Status")
-                        || n.contains("_transitive_Transition") || n.contains("sm_init")
+                    n.contains("StateMachine") || n.contains("machine:") || n.contains("sm_init")
                         || n.contains("sm_for_resource_backfill")
                         || sm_event_types.iter().any(|evt| n.contains(evt))
                 } else {
