@@ -102,3 +102,30 @@ This is drift, not the design. Evidence the canonical model is already in place 
 2. **Junction‑cell keying for M:N with no UC** (`rmap_cell_map` "No UC → own cell"): confirm the synthetic key is stable across freeze/thaw.
 3. **no_std/kernel freeze is `planned`** (portability table): this rework targets the local SQLite `Native` first; kernel/WASM keep in‑memory entity cells, no on‑disk format change required by this work.
 4. **Phasing.** Large enough to land in stages: (a) entity‑cell store + migrator + census behind a flag; (b) flip load/persist; (c) retire the dead machinery once green. Each stage independently testable.
+
+---
+
+## 9. Blast radius & revised risk (consumer audit, 2026‑05‑29)
+
+A read‑only audit of every population‑cell consumer (compiled evaluator + apply + derivation + induce + REST/MCP surfaces) refines §8.1 and the §5 UC story. Headline: **the read path is largely already ↑FILE‑aware; the write path and UC enforcement are the real work.**
+
+**Read path — mostly already done.** The compiled evaluator reads population through `Func::Fetch`/`FetchOrPhi` (`ast.rs:2409/2454`), which already fall through to `resolve_view → reconstitute_absorbed_ft`. So derivation antecedents (`extract_facts_from_pop`), the MCP `query` verb (`query.rs:26`), `platform_query_ft`, and `sql.rs` materialization read absorbed FTs correctly with **no change**. The remaining reads are *raw helper* reads (`fetch_cell_seq` / `cells_iter`+`cell_facts_iter`) that bypass ↑FILE — mechanical redirects.
+
+**Write path — `EntityCellRouter` must become primary.** Today the router (`lib.rs:2383 augment_delta_with_entity_cells`) *derives* `<Noun>:<id>` cells **alongside** the FT‑cell writes; the real writers still key by FT id: `evaluate.rs:90 integrate_round_facts` (forward‑chain fold), `command.rs push_with_uc_check` + the create/update/transition/SM write sites, and `induce.rs` candidate injection — all via `cell_put_keyed`/`cell_put_folded`/`cell_push`. These must route through the router so entity cells are the store, not a derived shadow.
+
+**UC enforcement — load‑bearing, but smaller than it first looks.** Alethic UC is enforced *inside* `cell_put_keyed` (`KeyConflict` on a same‑reference‑scheme‑key write), read at `command.rs:1021/2015/2544` + `induce.rs:322` + the `command.rs:958` pre‑check, shared by the chain at `evaluate.rs:114`. In the entity‑cell model it **splits by UC kind**:
+- **Functional UCs** (absorb as columns) become **structural** — the entity cell holds a single‑valued field; a second write last‑writes. The majority of UCs; *simpler*.
+- **Reference‑scheme uniqueness** becomes entity‑cell‑namespace uniqueness: "does `Task:909` already exist?" (replaces the `command.rs:958` raw scan).
+- **Non‑functional UCs** (1:1 *reverse*, external/spanning cross‑FT, junction spanning) need an explicit cross‑entity check → persisted **SQL `UNIQUE`** (rmap already emits these) + an **in‑memory uniqueness index** built per snapshot. This residual is the net‑new code; `EntityCellRouter` has no `KeyConflict` counterpart yet.
+
+**Genuine gaps needing new code (4):**
+1. `encode_state`/`encode_state_indexed` (`ast.rs:651/618`) build the validate/derive population from raw `cells_iter` without reconstitution — the `Selector(3)` Seq form reads absorbed FTs empty.
+2. `evaluate.rs:594 state_keys` (chain dedup/fixpoint index) keys off raw cell contents — must key off the entity‑cell shape or re‑fire loops appear.
+3. `platform_list_noun` / `visible_population` / `hateoas.rs` actively **exclude `:`‑named cells** — exactly the `<Noun>:<id>` names the rework introduces; needs redesign.
+4. Proof engine `evaluate.rs:672/701` axiom‑searches raw cells.
+
+**Revised phasing (supersedes §8.4):**
+- **P0 — UC‑enforcement spike (de‑risk first).** Prototype the in‑memory entity‑cell uniqueness index + the structural‑UC collapse on one entity (`Task`) and prove alethic rejection still fires. The load‑bearing unknown; settle before committing.
+- **P1 — entity‑cell store + migrator + census** behind a flag (read path leans on existing ↑FILE).
+- **P2 — re‑home writers** through `EntityCellRouter`; fix the 4 gaps; redirect raw helper reads.
+- **P3 — flip load/persist; retire** the FT‑blob store + preserve/dedup/keyroles machinery once census + property tests are green.
