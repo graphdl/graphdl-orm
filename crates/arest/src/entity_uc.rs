@@ -170,6 +170,31 @@ pub fn reconstitute_table_population(
     p
 }
 
+/// Migrate one absorbed FT's blob facts into entity rows — the inverse
+/// of [`reconstitute_ft_from_entity_rows`]. Each blob fact
+/// `<<subjectRole, id>, <valueRole, val>>` sets `id_field` and
+/// `value_field` on the shared entity row `<subjectRole>:<id>`, so a
+/// Task's row gathers every absorbed column across FTs (the 3NF row Dₙ).
+/// Route-parameterized (pure); P2 derives routes from `rmap`.
+pub fn migrate_ft_into_rows(
+    facts: &[Object],
+    route: &AbsorbedFtRoute<'_>,
+    rows: &mut HashMap<String, HashMap<String, Object>>,
+) {
+    for fact in facts {
+        if let (Some(id), Some(val)) = (
+            crate::ast::binding(fact, route.subject_role),
+            crate::ast::binding(fact, route.value_role),
+        ) {
+            let row = rows
+                .entry(format!("{}:{}", route.subject_role, id))
+                .or_default();
+            row.insert(route.id_field.to_string(), Object::atom(id));
+            row.insert(route.value_field.to_string(), Object::atom(val));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +369,42 @@ mod tests {
         assert_eq!(binding(&p[2], "Task"), Some("909"));
         assert_eq!(binding(&p[2], "Task Subject"), Some("Core"));
         assert_eq!(binding(&p[3], "Task Subject"), Some("P1"));
+    }
+
+    #[test]
+    fn census_migrate_then_uffile_is_identity_on_population() {
+        use crate::ast::fact_from_pairs;
+        // P_blob: two absorbed FTs over two tasks — the elementary facts
+        // as they live in the blob FT cells today.
+        let desc = [
+            fact_from_pairs(&[("Task", "909"), ("Task Description", "fix core")]),
+            fact_from_pairs(&[("Task", "910"), ("Task Description", "write P1")]),
+        ];
+        let subj = [
+            fact_from_pairs(&[("Task", "909"), ("Task Subject", "Core")]),
+            fact_from_pairs(&[("Task", "910"), ("Task Subject", "P1")]),
+        ];
+        let desc_route = AbsorbedFtRoute { subject_role: "Task", id_field: "id", value_role: "Task Description", value_field: "task_description" };
+        let subj_route = AbsorbedFtRoute { subject_role: "Task", id_field: "id", value_role: "Task Subject", value_field: "task_subject" };
+
+        // migrate blob facts -> entity rows (each Task row gathers both columns)
+        let mut rows: HashMap<String, HashMap<String, Object>> = HashMap::new();
+        migrate_ft_into_rows(&desc, &desc_route, &mut rows);
+        migrate_ft_into_rows(&subj, &subj_route, &mut rows);
+        assert_eq!(rows.len(), 2); // Task:909, Task:910
+
+        // up-FILE the rows back to P_after
+        let row_objs: Vec<Object> = rows.into_values().map(Object::map).collect();
+        let p_after = reconstitute_table_population(&row_objs, &[desc_route, subj_route]);
+
+        // census: migrate ∘ up-FILE == identity on P (compared as sets)
+        let canon = |fs: &[Object]| {
+            let mut v: Vec<String> = fs.iter().map(|f| format!("{}", f)).collect();
+            v.sort();
+            v
+        };
+        let mut p_blob: Vec<Object> = desc.to_vec();
+        p_blob.extend(subj.iter().cloned());
+        assert_eq!(canon(&p_blob), canon(&p_after));
     }
 }
