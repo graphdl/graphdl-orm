@@ -3895,6 +3895,7 @@ Task1 has Task Readiness 'blocked' iff Task2 blocks Task1 and Task2 has Task Sta
         let h = create_bare_impl();
         let readings = "\
 Task(.id) is an entity type.
+Task has an auto-generated id.
 Task has Task Subject.
   Each Task has at most one Task Subject.
 Task has Task Status.

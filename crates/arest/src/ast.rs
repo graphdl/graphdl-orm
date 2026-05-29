@@ -10953,7 +10953,7 @@ mod tests {
         // create_via_defs (#867) auto-generates the entity id when none
         // is supplied; the FT-cell fallback (command.rs:550) ensures at
         // least one cell is pushed into the delta.
-        let json = r#"{"type":"createEntity","noun":"Person","domain":"d","fields":{"name":"Alice"}}"#;
+        let json = r#"{"type":"createEntity","noun":"Person","domain":"d","id":"p-1","fields":{"name":"Alice"}}"#;
         let input = Object::atom(json);
         let d = apply_command_phi_state();
         let result = platform_apply_command(&input, &d);
@@ -11035,7 +11035,7 @@ mod tests {
         // bare return value. Worker callers that pull `__result` back
         // out (writer-dispatcher response field, command.rs::decode_command_result)
         // must see the same parseable JSON shape.
-        let json = r#"{"type":"createEntity","noun":"Person","domain":"d","fields":{"name":"Alice"}}"#;
+        let json = r#"{"type":"createEntity","noun":"Person","domain":"d","id":"p-1","fields":{"name":"Alice"}}"#;
         let input = Object::atom(json);
         let d = apply_command_phi_state();
         let result = platform_apply_command(&input, &d);
@@ -11066,7 +11066,7 @@ mod tests {
         // `createEntity` with one field, at least one FT cell appears
         // (the `<noun>_has_<field>` cell pushed by create_via_defs
         // command.rs:550).
-        let json = r#"{"type":"createEntity","noun":"Person","domain":"d","fields":{"name":"Alice"}}"#;
+        let json = r#"{"type":"createEntity","noun":"Person","domain":"d","id":"p-1","fields":{"name":"Alice"}}"#;
         let input = Object::atom(json);
         let d = apply_command_phi_state();
         let result = platform_apply_command(&input, &d);
@@ -11143,7 +11143,7 @@ mod tests {
         // classify_writer_result inspects (lib.rs::classify_writer_result).
         // If any predicate fails, the dispatcher routes to NoCommit and
         // merge_delta never runs — the #766 / #777 regression.
-        let json = r#"{"type":"createEntity","noun":"Person","domain":"d","fields":{"name":"Alice"}}"#;
+        let json = r#"{"type":"createEntity","noun":"Person","domain":"d","id":"p-1","fields":{"name":"Alice"}}"#;
         let input = Object::atom(json);
         let result = platform_apply_command(&input, &apply_command_phi_state());
 

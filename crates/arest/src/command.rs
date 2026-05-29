@@ -940,6 +940,41 @@ fn create_via_defs(
     let entity_id = explicit_id.unwrap_or("").to_string();
     let explicit_id_provided = !entity_id.is_empty();
     let entity_id = if entity_id.is_empty() {
+        // task-964: auto-generate an id ONLY for nouns explicitly opted in
+        // via `<Noun> has an auto-generated id.` (the `autoId` Noun
+        // binding). An UNMARKED noun must be created with an explicit
+        // reference value -- minting a `<noun>-<n>` surrogate would shadow
+        // its (possibly natural/compound) reference scheme: the latent
+        // #867 auto-gen-for-all bug. The MCP #872 silent-id refusal is the
+        // correct default; the engine now enforces opt-in per noun.
+        let noun_cell = ast::fetch_cell_seq("Noun", state);
+        let marked_auto_id = noun_cell.as_seq()
+            .and_then(|facts| facts.iter()
+                .find(|f| ast::binding(f, "name") == Some(noun))
+                .and_then(|f| ast::binding(f, "autoId"))
+                .map(|s| s == "true"))
+            .unwrap_or(false);
+        if !marked_auto_id {
+            return CommandResult {
+                entities: alloc::vec![],
+                status: None,
+                transitions: alloc::vec![],
+                navigation: alloc::vec![],
+                violations: alloc::vec![crate::types::Violation {
+                    constraint_id: alloc::format!("create.id_required:{}", noun),
+                    constraint_text: alloc::format!(
+                        "createEntity for '{}' requires an explicit reference value; \
+                         '{}' is not marked for auto-generated ids", noun, noun),
+                    detail: alloc::format!(
+                        "provide the reference-scheme value, or declare \
+                         '{} has an auto-generated id.' to opt the noun in", noun),
+                    alethic: true,
+                }],
+                derived_count: 0,
+                rejected: true,
+                state: ast::Object::phi(),
+            };
+        }
         auto_generate_entity_id(noun, state)
     } else {
         entity_id
@@ -4737,6 +4772,7 @@ Resource is mirroring Status.
     fn auto_increment_id_through_apply_after_explicit_999() {
         let src = "\
             Task(.id) is an entity type.\n\
+            Task has an auto-generated id.\n\
             Task Status is a value type.\n\
             Task has Task Status.\n\
         ";
@@ -6867,6 +6903,7 @@ Transition is to Status.
 
 ## Entity Types
 Order(.OrderId) is an entity type.
+Order has an auto-generated id.
 Customer(.Name) is an entity type.
 Priority(.Label) is an entity type.
 

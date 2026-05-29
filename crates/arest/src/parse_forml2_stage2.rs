@@ -2216,6 +2216,12 @@ fn translate_nouns(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     let mut ref_schemes: BTreeMap<String, String> = BTreeMap::new();
     let mut enum_values: BTreeMap<String, String> = BTreeMap::new();
     let mut super_types: BTreeMap<String, String> = BTreeMap::new();
+    // task-964: nouns explicitly opted into auto-generated ids. A
+    // `<Noun> has an auto-generated id.` reading sets the `autoId` Noun
+    // binding the create gate reads; an UNMARKED noun rejects a no-id
+    // create rather than minting a `<noun>-<n>` surrogate that shadows a
+    // natural/compound reference scheme (the #867 auto-gen-for-all bug).
+    let mut auto_ids: Vec<String> = Vec::new();
     let object_type_table = ObjectTypeKindTable::boot();
     for stmt_id in statement_ids.iter() {
         let Some(head) = head_noun_for(idx,stmt_id) else { continue };
@@ -2256,6 +2262,18 @@ fn translate_nouns(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
             }
         }
 
+        // task-964: opt-in auto-generated-id mark. `<Noun> has an
+        // auto-generated id.` tags this statement's head noun so the
+        // builder emits its `autoId` binding (read by the create gate).
+        if let Some(text) = statement_text(idx, stmt_id) {
+            let lt = text.to_ascii_lowercase();
+            if (lt.contains("auto-generated id") || lt.contains("auto generated id"))
+                && !auto_ids.contains(&head)
+            {
+                auto_ids.push(head.clone());
+            }
+        }
+
         // Supertype binding: `Subtype is a subtype of Supertype.`
         if classifications_contains(idx,stmt_id, "Subtype Declaration") {
             if let Some(sup) = role_noun_at_position(classified_state, stmt_id, 1) {
@@ -2289,6 +2307,9 @@ fn translate_nouns(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
         }
         if let Some(ev) = enum_values.get(&name) {
             pairs.push(("enumValues", ev.as_str()));
+        }
+        if auto_ids.contains(&name) {
+            pairs.push(("autoId", "true"));
         }
         fact_from_pairs(&pairs)
     }).collect()
@@ -6370,6 +6391,23 @@ mod tests {
         assert_eq!(noun_facts.len(), 1);
         assert_eq!(binding(&noun_facts[0], "name"), Some("Customer"));
         assert_eq!(binding(&noun_facts[0], "objectType"), Some("entity"));
+    }
+
+    #[test]
+    fn task_964_auto_generated_id_mark_sets_autoid_binding() {
+        // `<Noun> has an auto-generated id.` opts a noun into surrogate
+        // auto-id; its Noun fact carries autoId="true". An unmarked noun
+        // has no autoId binding (the create gate then requires an id).
+        let src = "# T\n\n## Entity Types\n\nFoo(.id) is an entity type.\nBar(.code) is an entity type.\n\n## Fact Types\n\nFoo has an auto-generated id.\n";
+        let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+        let nouns = crate::ast::fetch_cell_seq("Noun", &state);
+        let facts = nouns.as_seq().expect("Noun cell is a Seq");
+        let foo = facts.iter().find(|f| binding(f, "name") == Some("Foo")).expect("Foo noun fact");
+        let bar = facts.iter().find(|f| binding(f, "name") == Some("Bar")).expect("Bar noun fact");
+        assert_eq!(binding(foo, "autoId"), Some("true"),
+            "Foo marked `has an auto-generated id` must carry autoId=true; got {foo:?}");
+        assert_eq!(binding(bar, "autoId"), None,
+            "Bar (unmarked) must have no autoId binding; got {bar:?}");
     }
 
     #[test]
