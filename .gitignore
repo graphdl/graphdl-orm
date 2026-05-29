@@ -54,10 +54,29 @@ media/
 *.bbl
 *.blg
 comment.cut
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.toc
+*.lof
+*.lot
+*.bcf
+*.run.xml
 
 *.db
 *.db-journal
 arest-kernel.bios.img
+
+# Scratch / debug capture (mem-capped build & ad-hoc test runs) — task 909
+testout.txt
+trace.txt
+
+# Bootable UEFI image staging (regenerable kernel build output) — task 909
+esp/
+
+# Dated DB backup snapshots (ignore only — never delete) — task 909
+*.db.bak-*
+*.db.backup-*
 
 # Tutor sandbox SQLite (per-developer, ephemeral)
 tutor/.sandbox/
