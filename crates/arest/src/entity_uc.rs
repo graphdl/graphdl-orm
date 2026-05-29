@@ -109,6 +109,35 @@ fn join_key(row: &Object, columns: &[String]) -> Option<String> {
     Some(parts.join("\u{1f}"))
 }
 
+/// Runtime ↑FILE for one absorbed binary FT: project the absorbing
+/// `<Noun>:<id>` entity rows back into elementary facts
+/// `<<subjectRole, id>, <valueRole, value>>`. The runtime-regime
+/// counterpart of `rmap::reconstitute_absorbed_ft` (which reads
+/// metamodel registry cells) — the rmap.rs:918 follow-up. Presence-
+/// driven: a fact is emitted only where the value field is present, so
+/// `P = ⋃ₙ ↑FILE:Dₙ` (arest.tex eq:pop) is reproduced from the entity
+/// rows without a serialized-blob round-trip.
+pub fn reconstitute_ft_from_entity_rows<'a>(
+    rows: impl Iterator<Item = &'a Object>,
+    subject_role: &str,
+    id_field: &str,
+    value_role: &str,
+    value_field: &str,
+) -> Vec<Object> {
+    let mut facts: Vec<Object> = Vec::new();
+    for row in rows {
+        if let (Some(id), Some(val)) =
+            (row_field(row, id_field), row_field(row, value_field))
+        {
+            facts.push(crate::ast::fact_from_pairs(&[
+                (subject_role, id),
+                (value_role, val),
+            ]));
+        }
+    }
+    facts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +266,28 @@ mod tests {
         assert!(idx
             .check(&uc, &row(&[("id", "c2"), ("api_key", "K")]), "id")
             .is_some());
+    }
+
+    #[test]
+    fn runtime_uffile_reconstitutes_elementary_facts_from_entity_rows() {
+        use crate::ast::binding;
+        // Three Task entity rows; the third has no description.
+        let rows = [
+            row(&[("id", "909"), ("task_description", "fix the core")]),
+            row(&[("id", "910"), ("task_description", "write P1")]),
+            row(&[("id", "911")]), // presence-driven: no description → skipped
+        ];
+        let facts = reconstitute_ft_from_entity_rows(
+            rows.iter(),
+            "Task",
+            "id",
+            "Task Description",
+            "task_description",
+        );
+        // ↑FILE emits one elementary fact per present value (eq:pop).
+        assert_eq!(facts.len(), 2);
+        assert_eq!(binding(&facts[0], "Task"), Some("909"));
+        assert_eq!(binding(&facts[0], "Task Description"), Some("fix the core"));
+        assert_eq!(binding(&facts[1], "Task"), Some("910"));
     }
 }
