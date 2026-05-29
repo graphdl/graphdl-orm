@@ -125,7 +125,7 @@ A read‑only audit of every population‑cell consumer (compiled evaluator + ap
 4. Proof engine `evaluate.rs:672/701` axiom‑searches raw cells.
 
 **Revised phasing (supersedes §8.4):**
-- **P0 — UC‑enforcement spike (de‑risk first).** Prototype the in‑memory entity‑cell uniqueness index + the structural‑UC collapse on one entity (`Task`) and prove alethic rejection still fires. The load‑bearing unknown; settle before committing.
+- **P0 — UC‑enforcement spike (de‑risk first).** Prototype the in‑memory entity‑cell uniqueness index + the structural‑UC collapse on one entity (`Task`) and prove alethic rejection still fires. The load‑bearing unknown; settle before committing. **✅ P0 SETTLED (commit `b6be4ded`):** verified in `crates/arest/src/entity_uc.rs` — 6 tests green. Functional UCs are structural (single‑valued entity‑cell field); reference‑scheme uniqueness is a namespace lookup (`entity_exists`); non‑functional UCs (1:1‑reverse / external / junction) use `EntityUniquenessIndex`, raising the same `uc:{name}` / `alethic:true` `Violation` the apply path rejects on. No dead end — **P1 unblocked.**
 - **P1 — entity‑cell store + migrator + census** behind a flag (read path leans on existing ↑FILE).
 - **P2 — re‑home writers** through `EntityCellRouter`; fix the 4 gaps; redirect raw helper reads.
 - **P3 — flip load/persist; retire** the FT‑blob store + preserve/dedup/keyroles machinery once census + property tests are green.
