@@ -1342,12 +1342,11 @@ export function parseOrientResponse(raw: string): unknown {
 // guards stay so agents get actionable feedback even if a future
 // engine drift reintroduces the silent-failure behavior.
 //
-// Design (#867): refuse-with-clear-message on missing id rather than
-// auto-generate at the MCP layer. Explicit > implicit — agents
-// understand a refusal-with-error message faster than they understand
-// a magic auto-id appearing in their state. The engine still
-// auto-generates as the LAST line of defense per #867; this guard
-// fires first.
+// Design (#867, revised task-964): the MCP no longer refuses no-id
+// creates. The engine enforces opt-in auto-gen per noun (a marked noun
+// auto-generates; an unmarked no-id create is rejected with
+// create.id_required), so a blanket MCP refusal would block a marked
+// noun's intended auto-gen. The #868 update-merge guard below stays.
 //
 // Design (#868): pre-fetch the existing entity via `get`, layer the
 // payload on top, send the FULL set to the engine. Multi-valued
@@ -1356,30 +1355,11 @@ export function parseOrientResponse(raw: string): unknown {
 // `fields_only_replace: true` for the rare case the agent wants the
 // old replace-only behavior.
 
-/**
- * #867 guard: refuse `apply create` when `id` is missing/empty.
- *
- * Returns `null` when the id is present and non-empty; returns an
- * `{error}` envelope otherwise. The error message names the noun,
- * mentions reference-scheme semantics, and points the agent at the
- * `context` verb's rules section (cookbooks are gone). The check is
- * deliberately string-based — no schema lookup needed, no engine
- * round-trip before refusal.
- */
-export function applyCreateMissingIdRefusal(
-  noun: string,
-  id: string | undefined,
-): { error: string } | null {
-  if (id !== undefined && typeof id === 'string' && id.trim() !== '') return null
-  return {
-    error:
-      `apply create requires an explicit id; noun '${noun}' has a reference scheme that takes one. ` +
-      'Auto-generation happens engine-side per #867 (commit f321a9dd) but the MCP refuses silent-id ' +
-      `to keep the contract explicit so agents see the failure they can fix. ` +
-      `Pass an id like '<lowercased-noun>-<n>'. See the 'context.rules' section for the ` +
-      `reference-scheme contract.`,
-  }
-}
+// task-964: the #867/#872 create-id refusal helper was removed. The
+// engine now enforces opt-in auto-gen per noun (create.id_required for
+// an unmarked no-id create; auto-gen for a noun marked
+// `<Noun> has an auto-generated id.`), so the MCP defers rather than
+// duplicating an id check that would block marked nouns' auto-gen.
 
 /**
  * #868 guard: merge a partial update payload onto the existing
@@ -1593,7 +1573,7 @@ server.registerTool(
       context_receipt: z.string().optional().describe(CONTEXT_RECEIPT_FIELD_DESCRIPTION),
       operation: z.enum(['create', 'update', 'transition']).optional().describe('Operation type for the single-op shape. Omit when passing `ops` (the collection shape).'),
       noun: z.string().optional().describe('Entity noun type (e.g. "Order", "Case"). Single-op shape; omit when passing `ops`.'),
-      id: z.string().optional().describe('Entity ID. Required for update/transition AND create (MCP refuses silent-id per #872; engine still auto-generates as last-line-of-defense per #867).'),
+      id: z.string().optional().describe('Entity ID. Required for update/transition. For create: required unless the noun opts into auto-gen via the reading `<Noun> has an auto-generated id.` (task-964) -- an unmarked no-id create is rejected engine-side with create.id_required.'),
       fields: z.record(z.string(), z.string()).optional().describe('Fact pairs for create/update (e.g. {"Name": "Acme", "customer": "alice"})'),
       event: z.string().optional().describe('SM event for transition (e.g. "place", "ship")'),
       ops: z.array(z.object({
@@ -1635,13 +1615,13 @@ server.registerTool(
     const blocked = mutationGateResult('apply', context_receipt, { operation, noun, id, fields, event })
     if (blocked) return blocked
 
-    // #872 / #867 guard: refuse `create` with no explicit id BEFORE any
-    // engine call so the agent sees a clear, actionable failure rather
-    // than a silent orphan that the engine's auto-gen has to clean up.
-    if (operation === 'create') {
-      const refusal = applyCreateMissingIdRefusal(noun, id)
-      if (refusal) return textResult(refusal)
-    }
+    // task-964: no MCP-layer id refusal on `create`. The engine now
+    // enforces opt-in auto-gen per noun -- a noun marked
+    // `<Noun> has an auto-generated id.` auto-generates; an unmarked
+    // no-id create is a hard alethic reject (create.id_required)
+    // surfaced to the agent. The old #867/#872 blanket refusal would
+    // block a marked noun's legitimate auto-gen, so we defer to the
+    // engine's predicate-driven gate rather than duplicating it here.
 
     // #904 guard: refuse `update` when a payload field is the Status of
     // an SM-governed noun in the active app's schema. The schema is

@@ -17,7 +17,6 @@ import {
   parseCellsResponse,
   parseInduceResponse,
   parseOrientResponse,
-  applyCreateMissingIdRefusal,
   mergeUpdateFields,
   buildApplyMergedUpdatePayload,
   smBypassRefusal,
@@ -503,48 +502,15 @@ describe('#871 orient verb envelope parsing', () => {
 })
 
 describe('#872 apply footgun-resistance', () => {
-  // Engine fixes #867 (apply create without id) and #868 (apply update
-  // partial-field retraction) landed in f321a9dd. These tests pin the
-  // MCP TS-layer defensive guards so agents still get actionable
-  // feedback if a future engine drift reintroduces silent-failure
-  // behavior. Belt-and-suspenders per the #869 north-star: "agents get
-  // value without reading the whitepaper".
-
-  describe('#867 apply create without explicit id', () => {
-    it('refuses with reference-scheme message when id is missing/empty', () => {
-      // The MCP layer refuses silent-id to keep the contract explicit
-      // (Option 1 from the task brief: explicit > implicit). The error
-      // message names the noun, mentions reference scheme semantics,
-      // and points the agent at context.rules (cookbooks are gone) for
-      // recovery. The check fires BEFORE any engine call so the agent
-      // gets an immediate failure they can fix.
-      const refusal = applyCreateMissingIdRefusal('Task', undefined)
-      expect(refusal).not.toBeNull()
-      expect(refusal!.error).toMatch(/apply create requires an explicit id/)
-      expect(refusal!.error).toContain("'Task'")
-      expect(refusal!.error).toMatch(/reference scheme/)
-      expect(refusal!.error).toMatch(/#867/)
-      expect(refusal!.error).toMatch(/context\.rules/)
-    })
-
-    it('also refuses when id is an empty string (not just undefined)', () => {
-      // Engine's silent-orphan behavior in pre-f321a9dd was triggered
-      // by empty-string id too, not just undefined. Cover both.
-      const refusalEmpty = applyCreateMissingIdRefusal('Task', '')
-      expect(refusalEmpty).not.toBeNull()
-      expect(refusalEmpty!.error).toMatch(/apply create requires an explicit id/)
-
-      const refusalWhitespace = applyCreateMissingIdRefusal('Task', '   ')
-      expect(refusalWhitespace).not.toBeNull()
-    })
-
-    it('returns null (no refusal) when id is explicitly provided', () => {
-      // Happy path: an explicit id passes the guard so the apply call
-      // proceeds to the engine.
-      expect(applyCreateMissingIdRefusal('Task', 'task-42')).toBeNull()
-      expect(applyCreateMissingIdRefusal('Order', 'ord-1')).toBeNull()
-    })
-  })
+  // Engine fix #868 (apply update partial-field retraction) landed in
+  // f321a9dd; the MCP update-merge guard below pins it so agents still
+  // get actionable feedback if a future engine drift reintroduces the
+  // silent-retraction behavior. The #867 create-id refusal was removed
+  // in task-964 -- the engine now enforces opt-in auto-gen per noun
+  // (create.id_required for an unmarked no-id create, auto-gen for a
+  // noun marked `<Noun> has an auto-generated id.`), so a blanket MCP
+  // refusal would block a marked noun's legitimate auto-gen. The kernel
+  // tests pin that behavior; no MCP-layer create-id test remains.
 
   describe('#868 apply update merge-with-existing', () => {
     it('merges payload fields on top of existing single-valued fields', () => {
