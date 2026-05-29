@@ -547,8 +547,15 @@ impl fmt::Display for Object {
                 // depth tracking on the way back. (See
                 // `escape_atom_for_display` — the 787→0 Map-cell data-loss
                 // fix.)
+                // W5/D3 (task-932): key-sorted so serialization is
+                // deterministic. Object::Map is Arc<HashMap> (non-stable
+                // iteration order); thm:derive cacheability and
+                // cor:consensus deterministic replay require a canonical
+                // byte form, and key order is NOT semantic (D_n is a set).
+                let mut entries: Vec<_> = map.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
                 write!(f, "{{{}}}",
-                    map.iter().map(|(k, v)| format!("{}={}", escape_atom_for_display(k), item_inside_seq(v)))
+                    entries.into_iter().map(|(k, v)| format!("{}={}", escape_atom_for_display(k), item_inside_seq(v)))
                         .collect::<Vec<_>>().join(", "))
             }
             Object::Bottom => write!(f, "⊥"),
@@ -573,8 +580,12 @@ fn item_inside_seq(item: &Object) -> alloc::string::String {
             // so a Map nested inside a Seq/Map round-trips when its key
             // carries a Map/Seq delimiter (`{`/`}`/`=`/`<`/`>`/`,`). The
             // value already recurses through `item_inside_seq`.
+            // W5/D3 (task-932): key-sorted for deterministic serialization
+            // (symmetric with the top-level Map Display above).
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
             alloc::format!("{{{}}}",
-                map.iter().map(|(k, v)| alloc::format!("{}={}", escape_atom_for_display(k), item_inside_seq(v)))
+                entries.into_iter().map(|(k, v)| alloc::format!("{}={}", escape_atom_for_display(k), item_inside_seq(v)))
                     .collect::<Vec<_>>().join(", "))
         }
         Object::Bottom => "⊥".into(),
@@ -5972,6 +5983,33 @@ impl fmt::Debug for Func {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_display_is_key_sorted_for_determinism() {
+        // W5/D3 (task-932): Object::Map must serialize in canonical
+        // key-sorted order so the wire form is deterministic regardless
+        // of Arc<HashMap> iteration order (thm:derive cacheability /
+        // cor:consensus deterministic replay). Keys inserted out of
+        // sorted order must come back sorted.
+        let mut m: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        m.insert("charlie".into(), Object::atom("3"));
+        m.insert("alpha".into(), Object::atom("1"));
+        m.insert("bravo".into(), Object::atom("2"));
+        let s = Object::map(m).to_string();
+        assert_eq!(s, "{alpha=1, bravo=2, charlie=3}",
+            "top-level Map Display must be key-sorted; got {}", s);
+
+        // Round-trips back to an equal-size Map (order is not semantic).
+        assert_eq!(Object::parse(&s).as_map().map(|mm| mm.len()), Some(3));
+
+        // The nested-Map path (item_inside_seq) is sorted too.
+        let mut inner: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        inner.insert("y".into(), Object::atom("2"));
+        inner.insert("x".into(), Object::atom("1"));
+        let outer = Object::seq(vec![Object::map(inner)]).to_string();
+        assert_eq!(outer, "<{x=1, y=2}>",
+            "nested Map Display must be key-sorted; got {}", outer);
+    }
 
     fn defs() -> Object { Object::phi() }
 

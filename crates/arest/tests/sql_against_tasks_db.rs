@@ -136,3 +136,34 @@ fn task_864_parallel_paths_query_returns_non_empty_excluding_in_progress() {
         "parallel-paths result must not include in_progress tasks; intersection: {:?}",
         intersection);
 }
+
+// Regression for the legacy-unescaped free-text data loss. Before the
+// escaping fix (413dbe45), atom values carrying FFP delimiters (`,` `<`
+// `>` `{` `}` `=`) were persisted UNescaped, so the escaping-aware
+// `Object::parse` collapsed the whole Map cell to an opaque Atom and
+// `ft_Task_has_Task_Subject` / `_Description` materialized 0 rows (the
+// silent 791->0 / 787->0 loss). The prior tests only exercised
+// simple-valued cells (Status/Priority/Readiness), so they never caught
+// it. This pins that the free-text cells materialize their full
+// population — RED on a legacy DB, GREEN once re-escaped.
+#[test]
+fn task_free_text_cells_subject_and_description_materialize() {
+    let path = tasks_db_path();
+    if !path.exists() {
+        eprintln!("[reescape] skip: {} not present (set AREST_TASKS_DB to override)",
+            path.display());
+        return;
+    }
+    let state = load_population_state(&path);
+    for (cell, floor) in [("ft_Task_has_Task_Subject", 700i64),
+                          ("ft_Task_has_Task_Description", 700i64)] {
+        let env = sql_query(&state, &format!("SELECT COUNT(*) AS n FROM {}", cell));
+        let v: serde_json::Value = serde_json::from_str(&env).expect("envelope is JSON");
+        let n = v.get("rows").and_then(|r| r.as_array()).and_then(|a| a.first())
+            .and_then(|row| row.get("n")).and_then(|x| x.as_i64())
+            .unwrap_or_else(|| panic!("expected n for {}: {}", cell, env));
+        assert!(n >= floor,
+            "{} must materialize >= {} rows (free-text round-trip); got {}: {}",
+            cell, floor, n, env);
+    }
+}

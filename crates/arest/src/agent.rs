@@ -65,9 +65,11 @@ pub struct AgentBinding {
 ///     provenance.
 ///
 /// The `completion_id` is caller-supplied (typically content-addressed
-/// over `(agent_id, input, timestamp)` so re-emitting the same call
-/// is idempotent at the cell level — `cell_push` itself doesn't
-/// dedupe, but the caller can use `cell_push_unique` if needed).
+/// over `(agent_id, input, timestamp)`). Re-emitting the same call is
+/// idempotent at the cell level: each `Completion_*` fact is written
+/// via `cell_put_keyed` keyed by `Completion`, so an identical
+/// re-record overwrites in place (same key, same value) rather than
+/// duplicating.
 pub fn record_completion(
     state: &Object,
     completion_id: &str,
@@ -76,28 +78,42 @@ pub fn record_completion(
     output_text: &str,
     timestamp: &str,
 ) -> Object {
-    use crate::ast::{cell_push, fact_from_pairs};
+    // W2 (task-932): write Completion facts through the canonical
+    // keyed-Map primitive instead of cell_push (Seq). Each Completion_*
+    // FT is functional (one value per Completion), so the uniqueness
+    // constraint is the `Completion` role — cell_put_keyed enforces it
+    // (re-recording the same Completion with a different value is a
+    // KeyConflict, not a silent duplicate). Completion ids are unique
+    // per event so no conflict arises in practice; on the defensive
+    // conflict path keep the prior state rather than panic. Production
+    // reads already go through fetch_cell_seq (phase-1), so the Map
+    // storage shape is transparent to them.
+    use crate::ast::{cell_put_keyed, fact_from_pairs};
 
-    let s = cell_push(
+    let s = cell_put_keyed(
         "Completion_belongs_to_Agent",
+        &["Completion"],
         fact_from_pairs(&[("Completion", completion_id), ("Agent", agent_id)]),
         state,
-    );
-    let s = cell_push(
+    ).unwrap_or_else(|_| state.clone());
+    let s = cell_put_keyed(
         "Completion_has_input_Text",
+        &["Completion"],
         fact_from_pairs(&[("Completion", completion_id), ("input Text", input_text)]),
         &s,
-    );
-    let s = cell_push(
+    ).unwrap_or_else(|_| s.clone());
+    let s = cell_put_keyed(
         "Completion_has_output_Text",
+        &["Completion"],
         fact_from_pairs(&[("Completion", completion_id), ("output Text", output_text)]),
         &s,
-    );
-    cell_push(
+    ).unwrap_or_else(|_| s.clone());
+    cell_put_keyed(
         "Completion_occurred_at_Timestamp",
+        &["Completion"],
         fact_from_pairs(&[("Completion", completion_id), ("Timestamp", timestamp)]),
         &s,
-    )
+    ).unwrap_or_else(|_| s.clone())
 }
 
 /// Walk `state` to find the Agent Definition that `verb_name`
@@ -355,23 +371,23 @@ mod tests {
             "2026-04-29T12:00:00Z",
         );
 
-        let agent = crate::ast::fetch_or_phi("Completion_belongs_to_Agent", &s);
+        let agent = crate::ast::fetch_cell_seq("Completion_belongs_to_Agent", &s);
         let agent_seq = agent.as_seq().expect("agent cell populated");
         assert_eq!(agent_seq.len(), 1);
         assert_eq!(crate::ast::binding(&agent_seq[0], "Completion"), Some("comp-001"));
         assert_eq!(crate::ast::binding(&agent_seq[0], "Agent"), Some("agent-extractor"));
 
-        let input = crate::ast::fetch_or_phi("Completion_has_input_Text", &s);
+        let input = crate::ast::fetch_cell_seq("Completion_has_input_Text", &s);
         let input_seq = input.as_seq().expect("input cell populated");
         assert_eq!(crate::ast::binding(&input_seq[0], "input Text"),
             Some("summarise this paragraph"));
 
-        let output = crate::ast::fetch_or_phi("Completion_has_output_Text", &s);
+        let output = crate::ast::fetch_cell_seq("Completion_has_output_Text", &s);
         let output_seq = output.as_seq().expect("output cell populated");
         assert_eq!(crate::ast::binding(&output_seq[0], "output Text"),
             Some("the paragraph asserts X."));
 
-        let ts = crate::ast::fetch_or_phi("Completion_occurred_at_Timestamp", &s);
+        let ts = crate::ast::fetch_cell_seq("Completion_occurred_at_Timestamp", &s);
         let ts_seq = ts.as_seq().expect("timestamp cell populated");
         assert_eq!(crate::ast::binding(&ts_seq[0], "Timestamp"),
             Some("2026-04-29T12:00:00Z"));
@@ -386,7 +402,7 @@ mod tests {
         let s = record_completion(&s, "comp-001", "agent-a", "in1", "out1", "t1");
         let s = record_completion(&s, "comp-002", "agent-a", "in2", "out2", "t2");
 
-        let agent = crate::ast::fetch_or_phi("Completion_belongs_to_Agent", &s);
+        let agent = crate::ast::fetch_cell_seq("Completion_belongs_to_Agent", &s);
         assert_eq!(agent.as_seq().map(|s| s.len()), Some(2));
     }
 

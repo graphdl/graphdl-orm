@@ -241,7 +241,15 @@ pub fn handle_arest_create_for_slug(
     }
     let entity = Object::seq(pairs);
 
-    let new_state = crate::ast::cell_push(&noun, entity.clone(), state);
+    // W2 (task-932): route entity creation through the canonical
+    // keyed-Map primitive. The entity is built id-first (`<id, ID>`),
+    // so the noun cell is keyed by the `id` role — cell_put_keyed
+    // enforces one-entity-per-id (a re-create with different data is a
+    // KeyConflict, where cell_push silently appended a duplicate row).
+    // On the defensive conflict path keep prior state. Reads already go
+    // through fetch_cell_seq (phase-1), so Map storage is transparent.
+    let new_state = crate::ast::cell_put_keyed(&noun, &["id"], entity.clone(), state)
+        .unwrap_or_else(|_| state.clone());
     let response_body = entity_to_json(&noun, &entity).into_bytes();
     Some((new_state, response_body))
 }
@@ -341,7 +349,15 @@ pub fn handle_arest_create(
     }
     let entity = Object::seq(pairs);
 
-    let new_state = crate::ast::cell_push(&noun, entity.clone(), state);
+    // W2 (task-932): route entity creation through the canonical
+    // keyed-Map primitive. The entity is built id-first (`<id, ID>`),
+    // so the noun cell is keyed by the `id` role — cell_put_keyed
+    // enforces one-entity-per-id (a re-create with different data is a
+    // KeyConflict, where cell_push silently appended a duplicate row).
+    // On the defensive conflict path keep prior state. Reads already go
+    // through fetch_cell_seq (phase-1), so Map storage is transparent.
+    let new_state = crate::ast::cell_put_keyed(&noun, &["id"], entity.clone(), state)
+        .unwrap_or_else(|_| state.clone());
     let response_body = entity_to_json(&noun, &entity).into_bytes();
     Some((new_state, response_body))
 }
@@ -502,7 +518,13 @@ pub fn handle_arest_transition(
         Object::seq(alloc::vec![Object::atom(sm_shape.for_resource_role), Object::atom(&id)]),
         Object::seq(alloc::vec![Object::atom("type"), Object::atom(event)]),
     ]);
-    let new_state = crate::ast::cell_push("Event", event_entity, &new_state);
+    // W2 (task-932): canonical keyed-Map write for the Event log. Each
+    // Event has a unique `id` (evt-counter), so cell_put_keyed by `id`
+    // accumulates distinct events while staying set-semantic (D4) under
+    // identical re-fires; cell_push silently appended. (NEXT_ENTITY_COUNTER
+    // itself is task-780 item-5's removal target -- separate change.)
+    let new_state = crate::ast::cell_put_keyed("Event", &["id"], event_entity, &new_state)
+        .unwrap_or_else(|_| new_state.clone());
 
     // Build the response envelope — order keys to match the worker's
     // `json({ id, noun, previousStatus, status, event, transitions })`
@@ -1049,8 +1071,9 @@ mod tests {
             Some("Categorized")
         );
 
-        // Event row landed on the Event cell.
-        let events = crate::ast::fetch_or_phi("Event", &new_state);
+        // Event row landed on the Event cell. (W2: the Event cell is a
+        // keyed Map now, so read it through fetch_cell_seq to flatten.)
+        let events = crate::ast::fetch_cell_seq("Event", &new_state);
         let events_seq = events.as_seq().expect("event cell present");
         assert_eq!(events_seq.len(), 1);
         assert_eq!(crate::ast::binding(&events_seq[0], "type"), Some("categorize"));
