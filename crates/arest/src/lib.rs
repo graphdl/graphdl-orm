@@ -217,6 +217,7 @@ pub mod load_reading_core;
 // verbalize.rs deleted — zero production callers, tests were self-referential.
 #[cfg(not(feature = "no_std"))]
 pub mod command;
+pub mod entity_uc;
 // CLI subcommand handlers (#543) — `arest run <app>`, future
 // `arest install`, etc. std-only because the dispatchers print to
 // stdout/stderr and read process argv.
