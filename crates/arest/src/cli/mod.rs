@@ -162,6 +162,30 @@ pub(crate) fn dedup_state_for_persist(d: &crate::ast::Object) -> crate::ast::Obj
                     ast::binding(f, "arity")?.parse::<usize>().ok()?)))
             .collect())
             .unwrap_or_default();
+    // engine-casing-skew-cell-name-regression safeguard: surface any
+    // case-only cell-name collisions BEFORE persist so a re-introduced
+    // regression (or a stale relic carried in via cor:closure) is
+    // visible at the boundary it would otherwise corrupt. Warns rather
+    // than panics: an existing app DB carrying a relic from a pre-fix
+    // compile must still re-persist successfully so a subsequent
+    // recompile (now seeded by `cli/entry.rs::noun_seed` / `rebuild.rs`
+    // / `compile::bundled_domain_fact_type_ids`) can scrub it. The
+    // mitigation guarantees fresh compiles emit only the canonical
+    // name; this detector pins that contract end-to-end and turns any
+    // future skew (e.g., a new role-noun-shadowing reading shape that
+    // the seed misses) into a build-time eprint instead of silent SQL
+    // materialization breakage. FT-cell-scoped because they are the
+    // only cells whose names come from `fact_type_id_from_reading`'s
+    // role-noun walk; `:` meta/view cells and schema cells (`Noun`,
+    // `Role`, …) are not at risk.
+    let collisions = detect_case_only_ft_cell_collisions(d, &ft_ids);
+    for (lower, names) in &collisions {
+        eprintln!(
+            "[persist] WARNING: case-only FT cell-name collision under '{}': {:?} \
+             — likely engine-casing-skew-cell-name-regression relic; recompile \
+             with seeded noun catalog should canonicalize.",
+            lower, names);
+    }
     let map: hashbrown::HashMap<String, ast::Object> =
         ast::cells_iter(d).into_iter()
             .map(|(name, contents)| if ft_ids.contains(name) {
@@ -174,4 +198,147 @@ pub(crate) fn dedup_state_for_persist(d: &crate::ast::Object) -> crate::ast::Obj
             })
             .collect();
     ast::Object::map(map)
+}
+
+/// engine-casing-skew-cell-name-regression detector. Returns groups of
+/// FT cell names that share a lowercase form but differ in casing —
+/// the live shape of a `fact_type_id_from_reading` skew (e.g.
+/// `Verb_is_performed_during_transition` colliding with the canonical
+/// `Verb_is_performed_during_Transition`). Empty when no collisions.
+///
+/// Scoped to FT cells (names present in the supplied `ft_ids`): only
+/// they derive from the readings walk that can produce skew. Schema
+/// cells (`Noun`, `Role`, `FactType`, …) and `:` meta cells are
+/// excluded — they are not minted by `fact_type_id_from_reading` and
+/// would yield false positives if someone declared an FT whose id
+/// happens to lowercase-collide with a schema cell.
+///
+/// Returned as `(lowercase_key, sorted_distinct_names)` pairs, sorted
+/// by key for deterministic diagnostic output.
+#[cfg(all(not(feature = "no_std"), feature = "local"))]
+pub(crate) fn detect_case_only_ft_cell_collisions(
+    d: &crate::ast::Object,
+    ft_ids: &hashbrown::HashSet<String>,
+) -> Vec<(String, Vec<String>)> {
+    let mut by_lower: hashbrown::HashMap<String, hashbrown::HashSet<String>> =
+        hashbrown::HashMap::new();
+    for (name, _) in crate::ast::cells_iter(d) {
+        if !ft_ids.contains(name) { continue; }
+        by_lower.entry(name.to_lowercase()).or_default().insert(name.to_string());
+    }
+    let mut out: Vec<(String, Vec<String>)> = by_lower.into_iter()
+        .filter(|(_, names)| names.len() > 1)
+        .map(|(k, names)| {
+            let mut v: Vec<String> = names.into_iter().collect();
+            v.sort();
+            (k, v)
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+#[cfg(all(not(feature = "no_std"), feature = "local"))]
+#[cfg(test)]
+mod tests {
+    use crate::ast;
+
+    /// engine-casing-skew-cell-name-regression pin: when two FT cells
+    /// share a lowercase form but differ in casing (the exact shape of
+    /// the original regression — `Verb_is_performed_during_transition`
+    /// vs canonical `…_Transition`), the detector surfaces them so the
+    /// persist boundary can warn before they hit SQLite. This pins the
+    /// safeguard the noun_seed mitigation (`cli/entry.rs:757-765`)
+    /// relies on as a defense-in-depth: even if a future reading shape
+    /// or seed gap re-introduces the skew, the build emits a visible
+    /// warning instead of silently corrupting SQL materialization.
+    #[test]
+    fn detect_case_only_ft_cell_collisions_finds_canonical_vs_skewed() {
+        let ft_canonical = ast::fact_from_pairs(&[
+            ("id", "Verb_is_performed_during_Transition"),
+            ("arity", "2"),
+        ]);
+        let ft_skewed = ast::fact_from_pairs(&[
+            ("id", "Verb_is_performed_during_transition"),
+            ("arity", "2"),
+        ]);
+        let state = {
+            let s = ast::Object::phi();
+            let s = ast::store("FactType",
+                ast::Object::seq(vec![ft_canonical, ft_skewed]), &s);
+            let s = ast::store("Verb_is_performed_during_Transition",
+                ast::Object::seq(vec![]), &s);
+            ast::store("Verb_is_performed_during_transition",
+                ast::Object::seq(vec![]), &s)
+        };
+        let ft_ids: hashbrown::HashSet<String> = [
+            "Verb_is_performed_during_Transition".to_string(),
+            "Verb_is_performed_during_transition".to_string(),
+        ].into_iter().collect();
+        let collisions = super::detect_case_only_ft_cell_collisions(&state, &ft_ids);
+        assert_eq!(collisions.len(), 1,
+            "expected exactly one case-only collision group, got {:?}", collisions);
+        let (lower, names) = &collisions[0];
+        assert_eq!(lower, "verb_is_performed_during_transition");
+        assert_eq!(names, &vec![
+            "Verb_is_performed_during_Transition".to_string(),
+            "Verb_is_performed_during_transition".to_string(),
+        ]);
+    }
+
+    /// Negative pin: a clean state (only the canonical-cased FT cell)
+    /// must yield NO collisions. Guards against the detector firing on
+    /// the every-day post-noun_seed compile output and spamming
+    /// `[persist] WARNING` lines on healthy builds.
+    #[test]
+    fn detect_case_only_ft_cell_collisions_silent_on_canonical_state() {
+        let ft = ast::fact_from_pairs(&[
+            ("id", "Verb_is_performed_during_Transition"),
+            ("arity", "2"),
+        ]);
+        let state = {
+            let s = ast::Object::phi();
+            let s = ast::store("FactType", ast::Object::seq(vec![ft]), &s);
+            ast::store("Verb_is_performed_during_Transition",
+                ast::Object::seq(vec![]), &s)
+        };
+        let ft_ids: hashbrown::HashSet<String> =
+            ["Verb_is_performed_during_Transition".to_string()].into_iter().collect();
+        let collisions = super::detect_case_only_ft_cell_collisions(&state, &ft_ids);
+        assert!(collisions.is_empty(),
+            "clean state must yield no collisions, got {:?}", collisions);
+    }
+
+    /// Schema cells (`Noun`, `Role`, `FactType`, `:`-prefixed view
+    /// cells, etc.) are NOT FT cells and must be excluded from the
+    /// collision scan — they are not minted by
+    /// `fact_type_id_from_reading`'s role-noun walk, so a hypothetical
+    /// lowercase clash between them and an FT id (or among themselves)
+    /// is not a casing-skew relic. Scoping prevents false positives.
+    #[test]
+    fn detect_case_only_ft_cell_collisions_ignores_non_ft_cells() {
+        // A canonical FT cell + a non-FT cell whose name happens to
+        // lowercase-collide with the FT id. ft_ids contains only the
+        // FT id, so the non-FT cell is filtered out and no collision
+        // is reported.
+        let ft = ast::fact_from_pairs(&[
+            ("id", "Verb_is_performed_during_Transition"),
+            ("arity", "2"),
+        ]);
+        let state = {
+            let s = ast::Object::phi();
+            let s = ast::store("FactType", ast::Object::seq(vec![ft]), &s);
+            let s = ast::store("Verb_is_performed_during_Transition",
+                ast::Object::seq(vec![]), &s);
+            // Non-FT cell with a colliding lowercase form.
+            ast::store("verb_is_performed_during_transition",
+                ast::Object::seq(vec![]), &s)
+        };
+        let ft_ids: hashbrown::HashSet<String> =
+            ["Verb_is_performed_during_Transition".to_string()].into_iter().collect();
+        let collisions = super::detect_case_only_ft_cell_collisions(&state, &ft_ids);
+        assert!(collisions.is_empty(),
+            "non-FT cells must be ignored by the FT-scoped detector, got {:?}",
+            collisions);
+    }
 }
