@@ -1122,43 +1122,13 @@ pub fn main_entry() {
                 // (synthetic SM outputs etc.) get the arity-free empty-subject
                 // drop, safe without a uniformity assumption; ':' view / meta
                 // cells are left untouched (they regenerate from data cells).
-                let d = {
-                    let ft_ids: hashbrown::HashSet<String> =
-                        ast::fetch_cell_seq("FactType", &d).as_seq()
-                            .map(|facts| facts.iter()
-                                .filter_map(|f| ast::binding(f, "id").map(|s| s.to_string()))
-                                .collect())
-                            .unwrap_or_default();
-                    // task-958: declared arity per FT id (mirrors the
-                    // prior-population GC above) — use schema arity so the
-                    // arity+subject GC doesn't drop correct shorter rows from
-                    // a cell that also holds malformed over-arity relics.
-                    let ft_arity: hashbrown::HashMap<String, usize> =
-                        ast::fetch_cell_seq("FactType", &d).as_seq()
-                            .map(|facts| facts.iter()
-                                .filter_map(|f| Some((
-                                    ast::binding(f, "id")?.to_string(),
-                                    ast::binding(f, "arity")?.parse::<usize>().ok()?)))
-                                .collect())
-                            .unwrap_or_default();
-                    let map: hashbrown::HashMap<String, ast::Object> =
-                        ast::cells_iter(&d).into_iter()
-                            // compile-gc-orphaned-derived-facts (duplicated half):
-                            // dedup identity-equal facts before persist so asserted
-                            // cells (Task_is_epic et al.) don't accrue one copy per
-                            // recompile. ':' meta/view cells regenerate from data
-                            // cells, so leave them untouched.
-                            .map(|(name, contents)| if ft_ids.contains(name) {
-                                (name.to_string(), ast::dedup_cell_facts(
-                                    &ast::drop_subjectless_facts_with_arity(contents, ft_arity.get(name).copied())))
-                            } else if !name.contains(':') {
-                                (name.to_string(), ast::dedup_cell_facts(&ast::drop_empty_subject_facts(contents)))
-                            } else {
-                                (name.to_string(), contents.clone())
-                            })
-                            .collect();
-                    ast::Object::map(map)
-                };
+                // compile-gc-orphaned-derived-facts: dedup identity-equal
+                // facts before persist so asserted cells (Task_is_epic et al.)
+                // don't accrue one copy per recompile. Helper lives in
+                // cli/mod.rs and is shared with the reload/watch sibling
+                // persist paths -- single source of truth (task-958 schema-
+                // arity GC + ':' meta/view pass-through + identity dedup).
+                let d = super::dedup_state_for_persist(&d);
 
                 // Persist state to SQLite (tables + triggers).
                 db::apply_ddl(&conn, &d);

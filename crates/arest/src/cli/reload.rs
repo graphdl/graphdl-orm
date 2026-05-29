@@ -204,6 +204,15 @@ fn load_state_from_conn(conn: &rusqlite::Connection) -> Object {
 #[cfg(feature = "local")]
 fn persist_state_to_conn(conn: &rusqlite::Connection, d: &Object) -> Result<(), rusqlite::Error> {
     use rusqlite::params;
+    // compile-gc-orphaned-derived-facts (asserted-cell dup-fact bloat):
+    // mirror the bake-time site at `cli/entry.rs:1144-1160`. The
+    // runtime-load path (`load_reading_core::load_reading` ->
+    // `ast::merge_states` -> `concat_dedup`) never scrubs the prior
+    // cell's INTERNAL identity-equal duplicates, so a bloated cell
+    // loaded from disk would round-trip back to disk at the same size
+    // on every reload. The shared helper lives in `cli/mod.rs`.
+    let d = super::dedup_state_for_persist(d);
+    let d = &d;
     let tx = conn.unchecked_transaction()?;
     for (name, contents) in crate::ast::cells_iter(d) {
         let is_def = name.contains(':')
@@ -390,5 +399,71 @@ Category(.Name) is an entity type.
         let report = LoadReport::default();
         let s = format_success("test", &report);
         assert!(s.contains("idempotent"), "got: {}", s);
+    }
+
+    /// compile-gc-orphaned-derived-facts (asserted-cell dup-fact bloat,
+    /// reload-path half): a bloated Task_is_epic cell loaded from the
+    /// pre-fix DB (312 identity-equal facts over 8 distinct tasks)
+    /// would round-trip back to disk at the same size on every
+    /// `arest reload` because `load_reading_core` -> `merge_states` ->
+    /// `concat_dedup` never scrubs the accumulator's own internal
+    /// dups. With the new `dedup_state_for_persist` pass in
+    /// `cli/mod.rs`, the cell shrinks to its 8 distinct facts the
+    /// first time a reload writes it back.
+    ///
+    /// The test pokes the bloated cell into an in-memory SQLite, calls
+    /// `persist_state_to_conn` directly (the same code path
+    /// `dispatch` runs after `load_reading` succeeds), then reads the
+    /// row back and asserts on its parsed length.
+    #[cfg(feature = "local")]
+    #[test]
+    fn persist_dedups_bloated_asserted_cells_on_reload() {
+        use rusqlite::Connection;
+
+        // Shape mirrors `ast::dedup_cell_facts_collapses_structural_duplicates`:
+        // unary <<Task, id>> facts, the live Task_is_epic root.
+        let fact = |t: &str| ast::Object::seq(vec![
+            ast::Object::seq(vec![ast::Object::atom("Task"), ast::Object::atom(t)]),
+        ]);
+        // 312 bindings over 8 distinct tasks — match the live observation.
+        let ids: [&str; 8] = ["772", "773", "774", "775", "776", "777", "778", "779"];
+        let mut bloated: Vec<ast::Object> = Vec::with_capacity(312);
+        for _ in 0..39 {
+            for t in &ids { bloated.push(fact(t)); }
+        }
+        assert_eq!(bloated.len(), 312, "fixture sanity: 39*8 = 312");
+
+        // Also declare Task_is_epic as a FactType so the helper takes the
+        // arity+subject path (the entry.rs:1144-1160 branch, which is the
+        // same dedup but exercises the declared-FT branch of the helper).
+        let ft = ast::fact_from_pairs(&[
+            ("id", "Task_is_epic"),
+            ("arity", "1"),
+        ]);
+        let state = {
+            let mut s = seed_state();
+            s = ast::store("FactType", ast::Object::seq(vec![ft]), &s);
+            ast::store("Task_is_epic", ast::Object::seq(bloated), &s)
+        };
+
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cells (name TEXT PRIMARY KEY, contents TEXT);
+             CREATE TABLE IF NOT EXISTS defs (name TEXT PRIMARY KEY, func TEXT);"
+        ).expect("create tables");
+
+        super::persist_state_to_conn(&conn, &state).expect("persist");
+
+        // Read back the persisted Task_is_epic cell — must be 8, not 312.
+        let row: String = conn.query_row(
+            "SELECT contents FROM cells WHERE name = ?1",
+            ["Task_is_epic"],
+            |r| r.get(0),
+        ).expect("Task_is_epic row exists");
+        let parsed = ast::Object::parse(&row);
+        let kept = parsed.as_seq().map(|s| s.len()).unwrap_or(0);
+        assert_eq!(kept, ids.len(),
+            "bloated Task_is_epic cell (312 rows) must dedup to {} on persist; \
+             got {} — `dedup_state_for_persist` regressed", ids.len(), kept);
     }
 }

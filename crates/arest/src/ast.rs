@@ -5121,10 +5121,15 @@ pub(crate) fn dedup_cell_facts(contents: &Object) -> Object {
 /// survives, while dropping (a) sidecar `:` cells and cells the fresh parse
 /// re-emits (`parsed_cell_names`), and (b) orphan relics whose FactType is no
 /// longer declared (`is_orphan_population_cell`) — then scrubs malformed
-/// subjectless rows from what remains (declared arity per task-958). Returns
-/// the preserved cell map plus the SORTED names of the orphan cells dropped
-/// (for the caller's `[load]` diagnostic). DATA-CRITICAL: a regression here
-/// drops declared-FT runtime data on recompile.
+/// subjectless rows from what remains (declared arity per task-958) AND
+/// dedupes identity-equal facts so legacy bloat (accrued before the post-merge
+/// dedup at cli/entry.rs landed, or carried forward by recompile paths that
+/// bypass that site — `load_reading_core::load_reading` via `arest reload` /
+/// `arest watch`) self-heals at the canonical preserve step instead of riding
+/// through the entire merge + forward-chain + persist pipeline. Returns the
+/// preserved cell map plus the SORTED names of the orphan cells dropped (for
+/// the caller's `[load]` diagnostic). DATA-CRITICAL: a regression here drops
+/// declared-FT runtime data on recompile.
 pub(crate) fn preserve_prior_population(
     loaded: &Object,
     parsed_cell_names: &hashbrown::HashSet<String>,
@@ -5144,8 +5149,17 @@ pub(crate) fn preserve_prior_population(
                 }
                 true
             })
-            .map(|(name, contents)| (name.to_string(),
-                drop_subjectless_facts_with_arity(contents, ft_arity.get(name).copied())))
+            .map(|(name, contents)| {
+                // Order matters: subjectless-GC FIRST (it preserves arity invariants
+                // the dedup canon doesn't reason about), then dedup the remainder.
+                // `dedup_cell_facts` is identity-aware (φ-canonical, task-956 +
+                // commit 00196eb3) so all three empty-encoding forms of the same
+                // unary fact (`Atom("φ")`, `Atom("")`, `phi()`) collapse to one —
+                // this is what makes the Task_is_epic / Task_is_finished bloat
+                // self-heal across a recompile on legacy DBs.
+                let cleaned = drop_subjectless_facts_with_arity(contents, ft_arity.get(name).copied());
+                (name.to_string(), dedup_cell_facts(&cleaned))
+            })
             .collect();
     gc_orphans.sort();
     (Object::map(map), gc_orphans)
@@ -6072,6 +6086,73 @@ mod tests {
             "orphan cell dropped from the preserved population");
         assert_eq!(fetch_cell_seq("derivation_index:Task", &pop).as_seq().map_or(0, |s| s.len()), 0,
             "':' sidecar cells are not carried forward");
+    }
+
+    /// compile-gc-orphaned-derived-facts: the canonical preserve step
+    /// `preserve_prior_population` must dedupe identity-equal facts so the live
+    /// tasks.db `Task_is_epic` shape — a unary "Task is epic." instance fact
+    /// whose object slot reaches the cell store in multiple empty-encodings
+    /// (`Atom("φ")`, `Atom("")`, `phi()`) — collapses to one fact per task
+    /// regardless of how many recompiles preceded the fix. Without this, a
+    /// recompile path that bypasses the cli/entry.rs post-merge dedup site
+    /// (`arest reload` / `arest watch` through `load_reading_core`) would carry
+    /// the legacy bloat forward and keep accruing one extra copy per epic per
+    /// recompile. A second pass through the same helper must be a no-op
+    /// (idempotency: `preserve(preserve(x)) == preserve(x)` on the cell map).
+    #[test]
+    fn preserve_prior_population_dedupes_identity_equal_asserted_facts() {
+        // "Task is epic." unary instance fact, with the three empty-encodings of
+        // the object slot the live tasks.db has accrued across recompiles.
+        let epic_phi_token = Object::seq(vec![
+            Object::seq(vec![Object::atom("Task"), Object::atom("772")]),
+            Object::seq(vec![Object::atom("Task_is_epic"), Object::atom("φ")]),
+        ]);
+        let epic_empty_string = Object::seq(vec![
+            Object::seq(vec![Object::atom("Task"), Object::atom("772")]),
+            Object::seq(vec![Object::atom("Task_is_epic"), Object::atom("")]),
+        ]);
+        let epic_phi_seq = Object::seq(vec![
+            Object::seq(vec![Object::atom("Task"), Object::atom("772")]),
+            Object::seq(vec![Object::atom("Task_is_epic"), Object::phi()]),
+        ]);
+        // A second distinct epic — must survive (only same-identity dups collapse).
+        let epic_other = Object::seq(vec![
+            Object::seq(vec![Object::atom("Task"), Object::atom("773")]),
+            Object::seq(vec![Object::atom("Task_is_epic"), Object::atom("φ")]),
+        ]);
+
+        // Simulate the legacy bloat: 4 entries (3 identity-equal for Task 772,
+        // 1 distinct for Task 773) carried in from a prior recompile-fold.
+        let mut loaded: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        loaded.insert("Task_is_epic".to_string(), Object::seq(vec![
+            epic_phi_token.clone(), epic_empty_string, epic_phi_seq, epic_other.clone(),
+        ]));
+        let loaded = Object::map(loaded);
+
+        let declared: hashbrown::HashSet<String> =
+            ["Task_is_epic".to_string()].into_iter().collect();
+        let parsed: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        let mut arity: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
+        arity.insert("Task_is_epic".to_string(), 2);
+
+        let (pop, _orphans) = preserve_prior_population(&loaded, &parsed, &declared, &arity);
+
+        let preserved_len = fetch_cell_seq("Task_is_epic", &pop)
+            .as_seq().map_or(0, |s| s.len());
+        assert_eq!(preserved_len, 2,
+            "the three empty-encoding forms of the same `Task is epic` instance fact \
+             must collapse to one (identity-aware dedup); the distinct second epic \
+             must survive — got {} facts in the preserved cell", preserved_len);
+
+        // Idempotency: a second recompile over the already-preserved population
+        // must NOT append another copy. This is the property that makes the
+        // Task_is_epic cell stable across recompiles (the user-visible fix).
+        let (pop2, _) = preserve_prior_population(&pop, &parsed, &declared, &arity);
+        let twice_len = fetch_cell_seq("Task_is_epic", &pop2)
+            .as_seq().map_or(0, |s| s.len());
+        assert_eq!(twice_len, 2,
+            "recompile must be idempotent on the preserved-population — a second \
+             pass through preserve_prior_population must NOT grow the cell");
     }
 
     // ── Object construction ──────────────────────────────────────

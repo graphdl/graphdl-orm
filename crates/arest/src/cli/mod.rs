@@ -116,3 +116,62 @@ pub mod watch;
 // shim, and each source file compiles exactly once.
 #[cfg(not(feature = "no_std"))]
 pub mod entry;
+
+// compile-gc-orphaned-derived-facts (asserted-cell dup-fact bloat): the
+// pattern matches `cli/entry.rs:1144-1160` — the bake-time compile path
+// applies an identity-aware dedup pass over the final state before
+// persisting, so cells like `Task_is_epic` that accrue one extra
+// identity-equal copy per recompile (312 bindings for 8 distinct tasks
+// observed live) are scrubbed before the row hits SQLite.
+//
+// `arest reload <file.md>` and `arest watch <dir>` bypass that site —
+// they thread through `load_reading_core::load_reading`, which merges
+// the new reading into the prior state via `ast::merge_states` /
+// `ast::concat_dedup`. `concat_dedup` dedups the INCOMING side against
+// the accumulator but never the accumulator's OWN internal duplicates
+// (documented at `ast::dedup_cell_facts`), so a bloated prior cell
+// loaded from disk stays bloated through the merge and re-persists at
+// the same size on every reload. This helper applies the same dedup
+// pattern to the runtime-load paths so their persisted result self-
+// heals identically to the dirs-compile path.
+//
+// Layout mirrors entry.rs:1144-1160:
+//   * declared-FT data cells (in `FactType.id`) get the full
+//     arity+subject GC plus identity dedup;
+//   * non-`:` non-meta cells get the arity-free empty-subject drop plus
+//     identity dedup (safe without a uniformity assumption for
+//     synthetic SM outputs etc.);
+//   * `:` view / meta cells pass through (they regenerate from data).
+//
+// TODO(arest#TBD): extract the matching block in `cli/entry.rs:1144-
+// 1160` to call this helper too, so the three sites stop drifting.
+#[cfg(all(not(feature = "no_std"), feature = "local"))]
+pub(crate) fn dedup_state_for_persist(d: &crate::ast::Object) -> crate::ast::Object {
+    use crate::ast;
+    let ft_ids: hashbrown::HashSet<String> =
+        ast::fetch_cell_seq("FactType", d).as_seq()
+            .map(|facts| facts.iter()
+                .filter_map(|f| ast::binding(f, "id").map(|s| s.to_string()))
+                .collect())
+            .unwrap_or_default();
+    let ft_arity: hashbrown::HashMap<String, usize> =
+        ast::fetch_cell_seq("FactType", d).as_seq()
+            .map(|facts| facts.iter()
+                .filter_map(|f| Some((
+                    ast::binding(f, "id")?.to_string(),
+                    ast::binding(f, "arity")?.parse::<usize>().ok()?)))
+            .collect())
+            .unwrap_or_default();
+    let map: hashbrown::HashMap<String, ast::Object> =
+        ast::cells_iter(d).into_iter()
+            .map(|(name, contents)| if ft_ids.contains(name) {
+                (name.to_string(), ast::dedup_cell_facts(
+                    &ast::drop_subjectless_facts_with_arity(contents, ft_arity.get(name).copied())))
+            } else if !name.contains(':') {
+                (name.to_string(), ast::dedup_cell_facts(&ast::drop_empty_subject_facts(contents)))
+            } else {
+                (name.to_string(), contents.clone())
+            })
+            .collect();
+    ast::Object::map(map)
+}

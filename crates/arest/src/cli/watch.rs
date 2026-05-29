@@ -292,6 +292,12 @@ fn load_state_from_conn(conn: &rusqlite::Connection) -> Object {
 #[cfg(feature = "local")]
 fn persist_state_to_conn(conn: &rusqlite::Connection, d: &Object) -> Result<(), rusqlite::Error> {
     use rusqlite::params;
+    // compile-gc-orphaned-derived-facts (asserted-cell dup-fact bloat):
+    // share the dedup pass with `cli/reload::persist_state_to_conn` so
+    // the watch loop self-heals bloated cells on every successful
+    // reload too. See `cli/mod.rs::dedup_state_for_persist`.
+    let d = super::dedup_state_for_persist(d);
+    let d = &d;
     let tx = conn.unchecked_transaction()?;
     for (name, contents) in crate::ast::cells_iter(d) {
         let is_def = name.contains(':')
@@ -529,5 +535,56 @@ Product(.SKU) is an entity type.
         assert_eq!(files.len(), 1, "only top.md should be visible, got: {:?}", files);
         assert!(files[0].file_name().unwrap().to_string_lossy().ends_with("top.md"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sibling of
+    /// `cli::reload::tests::persist_dedups_bloated_asserted_cells_on_reload`.
+    /// `arest watch` uses its own `persist_state_to_conn` -- pin that
+    /// it routes through the shared `super::dedup_state_for_persist`
+    /// helper too, so a bloated Task_is_epic cell that lands via a
+    /// watch-loop iteration self-heals on persist.
+    #[cfg(feature = "local")]
+    #[test]
+    fn persist_dedups_bloated_asserted_cells_on_watch_iteration() {
+        use rusqlite::Connection;
+
+        // Shape mirrors the reload test: 312 unary <<Task, id>> bindings
+        // across 8 distinct epic-task ids -- match the live observation.
+        let fact = |t: &str| ast::Object::seq(vec![
+            ast::Object::seq(vec![ast::Object::atom("Task"), ast::Object::atom(t)]),
+        ]);
+        let ids: [&str; 8] = ["772", "773", "774", "775", "776", "777", "778", "779"];
+        let mut bloated: Vec<ast::Object> = Vec::with_capacity(312);
+        for _ in 0..39 {
+            for t in &ids { bloated.push(fact(t)); }
+        }
+        assert_eq!(bloated.len(), 312, "fixture sanity: 39*8 = 312");
+
+        let ft = ast::fact_from_pairs(&[("id", "Task_is_epic"), ("arity", "1")]);
+        let state = {
+            let mut s = seed_state();
+            s = ast::store("FactType", ast::Object::seq(vec![ft]), &s);
+            ast::store("Task_is_epic", ast::Object::seq(bloated), &s)
+        };
+
+        let conn = Connection::open_in_memory().expect("in-memory db");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cells (name TEXT PRIMARY KEY, contents TEXT);
+             CREATE TABLE IF NOT EXISTS defs (name TEXT PRIMARY KEY, func TEXT);"
+        ).expect("create tables");
+
+        super::persist_state_to_conn(&conn, &state).expect("persist");
+
+        let row: String = conn.query_row(
+            "SELECT contents FROM cells WHERE name = ?1",
+            ["Task_is_epic"],
+            |r| r.get(0),
+        ).expect("Task_is_epic row exists");
+        let parsed = ast::Object::parse(&row);
+        let kept = parsed.as_seq().map(|s| s.len()).unwrap_or(0);
+        assert_eq!(kept, ids.len(),
+            "watch path must dedup bloated Task_is_epic cell (312 rows) to {} \
+             on persist; got {} -- `dedup_state_for_persist` regressed for watch",
+            ids.len(), kept);
     }
 }
