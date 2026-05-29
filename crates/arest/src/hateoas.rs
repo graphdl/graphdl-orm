@@ -663,10 +663,19 @@ fn update_binding(entity: &Object, key: &str, new_value: &str) -> Object {
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-/// Per-process counter for entity-id generation in the direct-write
-/// fallback. Reset across kernel boots; ids are unique within a single
-/// kernel lifetime, not globally. Once the engine path lands the
-/// engine's reference-scheme resolver replaces this.
+/// Per-process counter for synthetic Event entity ids in the kernel
+/// direct-write transition handler (`handle_arest_transition`'s
+/// `evt-{counter:08x}` shape). Each transition needs a unique Event
+/// row so the event cell distinguishes successive fires of the same
+/// transition; the counter provides that without consuming entropy.
+/// Reset across kernel boots; ids are unique within a single kernel
+/// lifetime, not globally.
+///
+/// 3c5d7628 retired the prior use for entity-id generation in
+/// `handle_arest_create`; that path now derives ids from the noun's
+/// reference scheme via `naming::resolve_entity_id`. The synthetic
+/// Event id stays because Events are auto-generated per transition --
+/// no user-supplied id, no natural identity scheme.
 static NEXT_ENTITY_COUNTER: AtomicU32 = AtomicU32::new(0);
 
 /// Decode `%20` and `%XX` percent-escapes in a URL path segment.
