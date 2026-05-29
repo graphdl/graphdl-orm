@@ -195,6 +195,18 @@ name = "transitivity_metamodel_rule_e2e"
 path = "tests/transitivity_metamodel_rule_e2e.rs"
 required-features = ["test-bins"]
 
+# Ring-constraint enforcement e2e pin. Verifies the `Task blocks Task`
+# irreflexive + asymmetric ring constraints (apps/tasks/readings/app.md)
+# actually emit alethic violations on a self-block / reciprocal pair and
+# stay silent on a clean block graph — closing the coverage gap that let
+# "ring constraint issues" hide (the `validate` verb is blind to it: it
+# reads the stored, already-clean population, so injected violations
+# never enter the evaluated state).
+[[test]]
+name = "ring_constraint_enforcement_e2e"
+path = "tests/ring_constraint_enforcement_e2e.rs"
+required-features = ["test-bins"]
+
 # CWA negation metamodel rule end-to-end pin (#893). Acceptance for
 # replacing the per-(CWA-noun, FT, role) Rust synthesizer loop in
 # `compile.rs::compile_derivations` (was lines ~2585-2639) with a
