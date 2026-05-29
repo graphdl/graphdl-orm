@@ -390,19 +390,34 @@ fn split_first_eq_top_level(s: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// Backslash-escape the FFP-syntactic characters (`<`, `>`, `,`) and
-/// the escape character itself when emitting an atom to the FFP
-/// wire format. Without this, an instance fact value like
-/// `reachable in < 30 s` (a perfectly legitimate atom) round-trips
-/// through `db::persist_state` → `db::load_state` as a malformed
-/// nested `Seq`, silently corrupting the cell. Escaping is a pure
+/// Backslash-escape the FFP-syntactic characters and the escape
+/// character itself when emitting an atom to the FFP wire format.
+/// Without this, an instance fact value like `reachable in < 30 s`
+/// (a perfectly legitimate atom) round-trips through
+/// `db::persist_state` → `db::load_state` as a malformed nested
+/// `Seq`, silently corrupting the cell. Escaping is a pure
 /// `Display`-side concern; the in-memory `Object::Atom("reachable
 /// in < 30 s")` is unchanged.
+///
+/// The reserved set is BOTH the Seq delimiters (`<`, `>`, `,`) AND
+/// the Map delimiters (`{`, `}`, `=`). `Object::parse` discriminates
+/// Map literals from opaque atoms via `split_top_level` (which tracks
+/// `<>`/`{}` nesting depth) and `split_first_eq_top_level` (which
+/// splits on the first top-level `=`). An atom VALUE inside a Map —
+/// e.g. a Task Description containing `BASE=localhost`, `${BASE}`,
+/// `{slug}`, or a net-unbalanced `>` — would otherwise corrupt that
+/// depth tracking on the way back, so the whole persisted cell
+/// re-parses as a single opaque Atom (`as_map()`/`as_seq()` → None)
+/// and reads as EMPTY on load. That silently destroyed every keyed
+/// Map FT cell (Task_has_Task_Description / _Subject, 787 → 0) on a
+/// full readings-recompile. `{`/`}`/`=` join the reserved set so
+/// Map-backed cells round-trip losslessly; `unescape_atom_from_display`
+/// already strips any `\X` → `X`, so no decode-side change is needed.
 fn escape_atom_for_display(s: &str) -> alloc::string::String {
     let mut out = alloc::string::String::with_capacity(s.len());
     for c in s.chars() {
         match c {
-            '\\' | '<' | '>' | ',' => { out.push('\\'); out.push(c); }
+            '\\' | '<' | '>' | ',' | '{' | '}' | '=' => { out.push('\\'); out.push(c); }
             _ => out.push(c),
         }
     }
@@ -524,8 +539,16 @@ impl fmt::Display for Object {
                     .collect::<Vec<_>>().join(", "))
             }
             Object::Map(map) => {
+                // Key AND value escaped so a Map cell round-trips through
+                // `Object::parse`. The value goes via `item_inside_seq`
+                // (not its bare top-level Display) so a nested atom value
+                // carrying `{`/`}`/`=`/`<`/`>`/`,` is escaped and does not
+                // corrupt `split_top_level` / `split_first_eq_top_level`
+                // depth tracking on the way back. (See
+                // `escape_atom_for_display` — the 787→0 Map-cell data-loss
+                // fix.)
                 write!(f, "{{{}}}",
-                    map.iter().map(|(k, v)| format!("{}={}", k, v))
+                    map.iter().map(|(k, v)| format!("{}={}", escape_atom_for_display(k), item_inside_seq(v)))
                         .collect::<Vec<_>>().join(", "))
             }
             Object::Bottom => write!(f, "⊥"),
@@ -546,8 +569,12 @@ fn item_inside_seq(item: &Object) -> alloc::string::String {
                 .collect::<Vec<_>>().join(", "))
         }
         Object::Map(map) => {
+            // Symmetric with the top-level Map Display: escape the KEY too,
+            // so a Map nested inside a Seq/Map round-trips when its key
+            // carries a Map/Seq delimiter (`{`/`}`/`=`/`<`/`>`/`,`). The
+            // value already recurses through `item_inside_seq`.
             alloc::format!("{{{}}}",
-                map.iter().map(|(k, v)| alloc::format!("{}={}", k, item_inside_seq(v)))
+                map.iter().map(|(k, v)| alloc::format!("{}={}", escape_atom_for_display(k), item_inside_seq(v)))
                     .collect::<Vec<_>>().join(", "))
         }
         Object::Bottom => "⊥".into(),
@@ -6263,6 +6290,49 @@ mod tests {
             "Object::parse(Object::map(…).to_string()) must equal the original; \
              to_string produced {:?}, reparse produced {:?}",
             display, reparsed);
+    }
+
+    /// REGRESSION (Map-cell data-loss, 787→0): a keyed Map FT cell whose
+    /// VALUES contain the Map/Seq delimiters `=`, `{`, `}`, `<`, `>`, `,`
+    /// must round-trip through `Display → Object::parse` preserving EVERY
+    /// entry. This is the exact shape that destroyed Task_has_Task_Description
+    /// / Task_has_Task_Subject on a full readings-recompile: descriptions
+    /// like "312 = 8x39", "set BASE={url}", or "reachable in < 30 s" carried
+    /// unescaped delimiters that corrupted `split_top_level` /
+    /// `split_first_eq_top_level` depth tracking, so the whole persisted Map
+    /// re-parsed as one opaque Atom (`as_map()` → None) and read as EMPTY.
+    /// The fix escapes `{`/`}`/`=` in `escape_atom_for_display` and routes
+    /// both Map Display arms through escaped keys + `item_inside_seq` values.
+    ///
+    /// This is the BINARY/multi-valued FT class the prior dedup test
+    /// (unary Task_is_epic) never covered.
+    #[test]
+    fn map_cell_with_delimiter_laden_values_round_trips_all_entries() {
+        // Three distinct Task-keyed facts; each Description value carries a
+        // different reserved delimiter that would break naive parsing.
+        let fact = |id: &str, desc: &str| Object::seq(vec![
+            Object::seq(vec![Object::atom("Task"), Object::atom(id)]),
+            Object::seq(vec![Object::atom("Task Description"), Object::atom(desc)]),
+        ]);
+        let mut m = HashMap::new();
+        m.insert("656".to_string(), fact("656", "312 = 8x39 dup copies per epic"));
+        m.insert("129".to_string(), fact("129", "set BASE={url} then ${BASE}/api"));
+        m.insert("717".to_string(), fact("717", "reachable in < 30 s, maybe > 10"));
+        let cell = Object::map(m);
+
+        let display = cell.to_string();
+        let reparsed = Object::parse(&display);
+        // Must re-parse as a Map (not collapse to an opaque Atom)...
+        assert!(reparsed.as_map().is_some(),
+            "delimiter-laden Map cell must re-parse as a Map, not an opaque Atom; \
+             Display produced {:?}, reparse produced {:?}", display, reparsed);
+        // ...with ALL THREE distinct entries preserved (the 787→0 collapse
+        // kept only one).
+        assert_eq!(reparsed.as_map().map(|m| m.len()), Some(3),
+            "all 3 Task-keyed facts must survive the round-trip; got {:?}", reparsed);
+        assert_eq!(reparsed, cell,
+            "delimiter-laden Map cell must round-trip byte-identically; \
+             Display produced {:?}, reparse produced {:?}", display, reparsed);
     }
 
     /// task-922-object-parse-map-syntax discrimination guard: a JSON
