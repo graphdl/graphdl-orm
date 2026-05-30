@@ -8,10 +8,12 @@ Fact is an entity type.
 State Machine(.id) is an entity type.
 Guard Run(.Name) is an entity type.
 Citation(.id) is an entity type.
+User(.Email) is an entity type.
 
 ## Value Types
 
 Reference is a value type.
+Email is a value type.
 Value is a value type.
 Retrieval Date is a value type.
 

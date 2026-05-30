@@ -1349,22 +1349,45 @@ fn create_via_defs(
     };
 
     // ── identity: push User facts when sender is present ──────────
-    // This is the data that auth derivations + alethic constraints evaluate.
-    // Fact type IDs follow parser convention: "Noun_predicate_Target".
-    let resolved = sender.map(|s| {
-        let created_by_ft = format!("{}_is_created_by_User", noun);
-        let user_ref_ft = "User_has_Email".to_string();
-        let user_fact = ast::fact_from_pairs(&[("User", s), ("Email", s)]);
-        let with_user = push_with_uc_check(
-            resolved.clone(), &user_ref_ft, user_fact, &key_roles,
-            /*overwrite=*/false, &mut uc_violations,
-        );
+    // task-966: lifted from bespoke "Email" hard-coding to generic
+    // compound-ref decomposition. User's declared reference scheme is
+    // read from the Noun cell (same pattern as the compound-ref block
+    // above) so the fact-type id — typically User_has_Email — is driven
+    // by the metamodel declaration rather than a hard-coded string.
+    // User(.Email) is declared in readings/core/instances.md so the
+    // lookup always resolves in the bundled metamodel; apps declaring a
+    // different User ref scheme (e.g. User(.Username)) automatically get
+    // the correct User_has_Username fact instead.
+    // The {noun}_is_created_by_User push is also preserved verbatim:
+    // it must fire for ALL authenticated creates regardless of whether
+    // the application reading declares the FT, so it cannot be routed
+    // purely through resolve:{noun} (which only fires when declared).
+    let resolved = if let Some(s) = sender {
+        // ① User reference-scheme facts — generic: read User's ref scheme
+        //    from the Noun cell, push User_has_{part} for each part.
+        let user_noun_cell = ast::fetch_cell_seq("Noun", &resolved);
+        let user_ref_parts: Vec<String> = user_noun_cell.as_seq()
+            .and_then(|facts| facts.iter()
+                .find(|f| ast::binding(f, "name") == Some("User"))
+                .and_then(|f| ast::binding(f, "referenceScheme"))
+                .map(|rs| rs.split(',').map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty()).collect()))
+            .unwrap_or_else(|| alloc::vec!["Email".to_string()]); // fallback: bundled metamodel default
+        let with_user = user_ref_parts.iter().fold(resolved.clone(), |acc, part| {
+            let user_ref_ft = alloc::format!("User_has_{}", part.replace(' ', "_"));
+            let user_fact = ast::fact_from_pairs(&[("User", s), (part.as_str(), s)]);
+            push_with_uc_check(acc, &user_ref_ft, user_fact, &key_roles,
+                /*overwrite=*/false, &mut uc_violations)
+        });
+        // ② {noun}_is_created_by_User — always emitted for authenticated creates
+        //    so auth derivations and alethic constraints can evaluate identity.
+        let created_by_ft = alloc::format!("{}_is_created_by_User", noun);
         let created_by_fact = ast::fact_from_pairs(&[(noun, &entity_id), ("User", s)]);
-        push_with_uc_check(
-            with_user, &created_by_ft, created_by_fact, &key_roles,
-            /*overwrite=*/false, &mut uc_violations,
-        )
-    }).unwrap_or(resolved);
+        push_with_uc_check(with_user, &created_by_ft, created_by_fact, &key_roles,
+            /*overwrite=*/false, &mut uc_violations)
+    } else {
+        resolved
+    };
 
     // ── derive: forward chain via ρ(derivation:*) to lfp ───────────
     // Gate derivations by noun relevance: only run rules whose antecedent or
@@ -7331,6 +7354,83 @@ Each Order is created by exactly one User.
             "MC should fire: ord-1 has no User. violations={:?}", result.violations
         );
         assert!(result.rejected, "alethic MC violation should reject the command");
+    }
+
+    /// task-966 guard — authenticated create must emit BOTH User_has_Email
+    /// and {noun}_is_created_by_User when sender is present.
+    ///
+    /// This test is the behavior-preservation anchor for the task-966
+    /// lift. It must pass BOTH before and after the refactoring of the
+    /// bespoke sender block in `create_via_defs`. If it fails after the
+    /// refactor, the lift regressed the auth/identity emission path.
+    #[test]
+    fn task_966_authenticated_create_emits_user_has_email_and_created_by_user() {
+        let readings = r#"# Auth Guard
+
+## Entity Types
+Order(.OrderId) is an entity type.
+User(.Email) is an entity type.
+
+## Value Types
+OrderId is a value type.
+Email is a value type.
+
+## Fact Types
+### Order
+Order is created by User.
+
+## Constraints
+Each Order is created by at most one User.
+"#;
+        let state = crate::parse_forml2::parse_to_state(readings).unwrap();
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_map = ast::defs_to_state(&defs, &state);
+
+        let mut fields = HashMap::new();
+        fields.insert("OrderId".to_string(), "ord-1".to_string());
+        let sender_email = "alice@example.com";
+        let cmd = Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "test".to_string(),
+            id: Some("ord-1".to_string()),
+            fields,
+            sender: Some(sender_email.to_string()),
+            signature: None,
+        };
+
+        let result = apply_command_defs(&def_map, &cmd, &state);
+        assert!(
+            !result.rejected,
+            "authenticated create must not be rejected; violations={:?}", result.violations
+        );
+
+        // User_has_Email must be present with <User=sender, Email=sender>
+        let user_email_cell = ast::fetch_cell_seq("User_has_Email", &result.state);
+        let has_user_email = user_email_cell.as_seq().map_or(false, |facts| {
+            facts.iter().any(|f| {
+                ast::binding(f, "User") == Some(sender_email)
+                    && ast::binding(f, "Email") == Some(sender_email)
+            })
+        });
+        assert!(
+            has_user_email,
+            "User_has_Email must be emitted on authenticated create; \
+             cell={:?}", user_email_cell
+        );
+
+        // Order_is_created_by_User must be present with <Order=entity_id, User=sender>
+        let created_by_cell = ast::fetch_cell_seq("Order_is_created_by_User", &result.state);
+        let has_created_by = created_by_cell.as_seq().map_or(false, |facts| {
+            facts.iter().any(|f| {
+                ast::binding(f, "Order") == Some("ord-1")
+                    && ast::binding(f, "User") == Some(sender_email)
+            })
+        });
+        assert!(
+            has_created_by,
+            "Order_is_created_by_User must be emitted on authenticated create; \
+             cell={:?}", created_by_cell
+        );
     }
 
     /// task-843 — apply-path / compile FT-name parity for Moore-
