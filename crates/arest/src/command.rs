@@ -4053,6 +4053,45 @@ pub(crate) fn menu_component_role(d: &ast::Object, entity_id: &str) -> Option<St
         .and_then(|f| ast::binding(f, "Component Role").map(String::from)))
 }
 
+/// task-crudl-menu-projection: the permission-gated CRUDL action menu for a
+/// fetched entity/collection — the iFactr ActionButtons (create/edit/delete/
+/// save/…) the USER may perform in the given VIEW CONTEXT (collection/instance/
+/// edit). Synthesizes a transient View for the Noun in the context, then
+/// resolves the gated menu view (`ViewElement_renders_Operation` — the
+/// readings/ui/crudl.md operation catalog joined with the role-based authz),
+/// returning the operations permitted to `user`. NEITHER the context filter NOR
+/// the permission gate is hardcoded — both are the derivation (the skolem
+/// ViewElement IS the objectification). Returns [] where ui-readings is compiled
+/// out (no `view:` def) or the user has no grants for the context.
+///
+/// The engine seam the get (instance) / list (collection) response attaches the
+/// CRUDL menu from; mirrors `menu_component_role` (SM-transition menu) and
+/// `view_via_rho` (detail form).
+pub fn crudl_menu_operations(d: &ast::Object, noun: &str, view_context: &str, user: &str) -> Vec<String> {
+    // Synthesize the View the menu join is gated on (View is for Noun + View has
+    // View Context). Transient — the menu is a projection, not stored.
+    let view_id = format!("crudl-view:{}:{}", noun, view_context);
+    let s = ast::cell_push("View_is_for_Noun",
+        ast::fact_from_pairs(&[("View", view_id.as_str()), ("Noun", noun)]), d);
+    let pop = ast::cell_push("View_has_View_Context",
+        ast::fact_from_pairs(&[("View", view_id.as_str()), ("View Context", view_context)]), &s);
+    let Some(renders) = ast::resolve_view("ViewElement_renders_Operation", &pop, &pop) else {
+        return Vec::new();
+    };
+    // The skolem frontier carries (View, Operation, User, …); keep this view's
+    // items permitted to this user.
+    let mut ops: Vec<String> = renders.as_seq()
+        .map(|items| items.iter().filter_map(|f| {
+            (ast::binding(f, "View") == Some(view_id.as_str())
+                && ast::binding(f, "User") == Some(user))
+                .then(|| ast::binding(f, "Operation").map(String::from)).flatten()
+        }).collect())
+        .unwrap_or_default();
+    ops.sort();
+    ops.dedup();
+    ops
+}
+
 /// task-965: HTTP method for a target status, lifted from a Rust literal
 /// (`if to == "deleted" { "DELETE" } else { "GET" }`) to the
 /// `Status has HTTP Method` reading (e.g. `Status 'deleted' has HTTP Method
