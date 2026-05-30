@@ -260,6 +260,14 @@ pub struct CommandResult {
     pub violations: Vec<Violation>,
     pub derived_count: usize,
     pub rejected: bool,
+    /// task-viewproj / 934-2(b) / 934-3(b): the abstract control tree
+    /// (iFactr/MonoView) projected for the fetched entity — the view layer of
+    /// the Theorem-4 representation, so the View rides WITH the resource (the
+    /// thin HATEOAS wrapper). None for commands with no single subject entity,
+    /// or when `ui-readings` is compiled out (no `view:` defs → None). Populated
+    /// in `ui-readings` builds (kernel, ui.do/cloudflare worker).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<ViewProjection>,
     /// The transformed state -- the authoritative state after this command.
     #[serde(skip)]
     pub state: ast::Object,
@@ -419,6 +427,7 @@ pub fn decode_command_result(obj: &ast::Object) -> CommandResult {
             return CommandResult {
                 entities, status, transitions, navigation, violations,
                 derived_count, rejected,
+                view: None,
                 state,
             };
         }
@@ -465,7 +474,7 @@ pub fn decode_command_result(obj: &ast::Object) -> CommandResult {
     let rejected = sel(5).and_then(|o| o.as_atom()) == Some("T");
     let new_state = sel(6).cloned().unwrap_or(ast::Object::phi());
 
-    CommandResult { entities, status, transitions, navigation: vec![], violations, derived_count, rejected, state: new_state }
+    CommandResult { entities, status, transitions, navigation: vec![], violations, derived_count, rejected, view: None, state: new_state }
 }
 
 /// Encode a CommandResult as an Object for the dispatch layer.
@@ -655,6 +664,7 @@ pub fn apply_command_defs(
             violations: vec![],
             derived_count: 0,
             rejected: false,
+            view: None,
             state: ast::Object::phi(),
         },
     }
@@ -709,6 +719,7 @@ pub fn apply_command_batch(
             violations: Vec::new(),
             derived_count: 0,
             rejected: false,
+            view: None,
             state: ast::diff_cells(state, state), // empty Map delta
         };
     }
@@ -747,6 +758,7 @@ pub fn apply_command_batch(
                 violations,
                 derived_count,
                 rejected: true,
+                view: None,
                 state: ast::diff_cells(state, state), // empty delta — full rollback
             };
         }
@@ -768,6 +780,7 @@ pub fn apply_command_batch(
         violations,
         derived_count,
         rejected: false,
+        view: None,
         state: delta,
     }
 }
@@ -805,6 +818,7 @@ fn assert_fact_via_defs(
             }],
             derived_count: 0,
             rejected: true,
+            view: None,
             state: ast::Object::phi(),
         };
     }
@@ -913,6 +927,7 @@ fn assert_fact_via_defs(
         violations: all_violations,
         derived_count: derived.len(),
         rejected,
+        view: None,
         state: delta,
     }
 }
@@ -1201,6 +1216,7 @@ fn create_via_defs(
             }],
             derived_count: 0,
             rejected: true,
+            view: None,
             state: ast::Object::phi(),
         };
     }
@@ -1239,6 +1255,7 @@ fn create_via_defs(
                 }],
                 derived_count: 0,
                 rejected: true,
+                view: None,
                 state: ast::Object::phi(),
             };
         }
@@ -1307,6 +1324,7 @@ fn create_via_defs(
                     violations: alloc::vec![viol],
                     derived_count: 0,
                     rejected: true,
+                    view: None,
                     state: ast::Object::phi(),
                 };
             }
@@ -1822,6 +1840,10 @@ fn create_via_defs(
     let status = extract_sm_status(&derived_state, &entity_id);
     let transitions = hateoas_via_rho(d, noun, &entity_id, status.as_deref());
     let navigation = nav_links_via_rho(d, noun, &entity_id);
+    // task-viewproj: project the entity's abstract control tree so it rides
+    // WITH the get response (the thin HATEOAS wrapper). None where ui-readings
+    // is compiled out; populated in kernel / ui.do builds.
+    let view = view_via_rho(d, noun, &entity_id);
 
     let entity_data: hashbrown::HashMap<String, String> = fields_with_domain.iter()
         .map(|(k, v)| (k.to_string(), v.to_string())).collect();
@@ -1853,7 +1875,7 @@ fn create_via_defs(
     let delta = ast::diff_cells(state, &final_state);
     CommandResult {
         entities, status, transitions, navigation, violations,
-        derived_count: derived.len(), rejected,
+        derived_count: derived.len(), rejected, view,
         state: delta,
     }
 }
@@ -2620,6 +2642,7 @@ fn transition_via_defs(
         violations,
         derived_count,
         rejected,
+        view: None,
         state: delta,
     }
 }
@@ -2685,6 +2708,7 @@ fn query_via_defs(
         violations: vec![],
         derived_count: 0,
         rejected: false,
+        view: None,
         // #209: queries don't mutate state — empty delta.
         state: ast::Object::phi(),
     }
@@ -2725,6 +2749,7 @@ fn update_via_defs(
             }],
             derived_count: 0,
             rejected: true,
+            view: None,
             state: ast::Object::phi(),
         };
     }
@@ -2801,6 +2826,7 @@ fn update_via_defs(
                     violations: vec![violation],
                     derived_count: 0,
                     rejected: true,
+                    view: None,
                     state: ast::Object::phi(),
                 };
             }
@@ -3149,6 +3175,7 @@ fn update_via_defs(
         violations,
         derived_count: derived.len(),
         rejected,
+        view: None,
         state: delta,
     }
 }
@@ -3302,6 +3329,7 @@ fn apply_load_readings(
                 }],
                 derived_count: 0,
                 rejected: true,
+                view: None,
                 // #209: parse failed — no state change.
                 state: ast::Object::phi(),
             };
@@ -3352,6 +3380,7 @@ fn apply_load_readings(
             violations,
             derived_count: 0,
             rejected: true,
+            view: None,
             state: ast::Object::phi(),
         };
     }
@@ -3385,6 +3414,7 @@ fn apply_load_readings(
         violations: vec![],
         derived_count: new_noun_count,
         rejected: false,
+        view: None,
         state: delta,
     }
 }
@@ -3479,6 +3509,7 @@ fn load_reading_handler(
                 violations: vec![],
                 derived_count,
                 rejected: false,
+                view: None,
                 state: delta,
             }
         }
@@ -3544,6 +3575,7 @@ fn load_reading_handler(
                 violations,
                 derived_count: 0,
                 rejected: true,
+                view: None,
                 // No state mutation on rejection — phi() so the
                 // writer-path classifier treats this as a no-commit.
                 state: ast::Object::phi(),
@@ -3646,6 +3678,7 @@ fn unload_reading_handler(
                 violations: vec![],
                 derived_count,
                 rejected: false,
+                view: None,
                 state: delta,
             }
         }
@@ -3682,6 +3715,7 @@ fn unload_reading_handler(
                 violations,
                 derived_count: 0,
                 rejected: true,
+                view: None,
                 state: ast::Object::phi(),
             }
         }
@@ -3812,6 +3846,7 @@ fn reload_reading_handler(
                 violations: vec![],
                 derived_count,
                 rejected: false,
+                view: None,
                 state: delta,
             }
         }
@@ -3919,6 +3954,7 @@ fn reload_reading_handler(
                 violations,
                 derived_count: 0,
                 rejected: true,
+                view: None,
                 state: ast::Object::phi(),
             }
         }
@@ -4438,6 +4474,7 @@ mod tests {
             violations: vec![],
             derived_count: 2,
             rejected: false,
+            view: None,
             state: ast::Object::phi(),
         };
         let obj = encode_command_result(&result);
