@@ -1127,6 +1127,7 @@ pub const UI_READINGS: &[(&str, &str)] = &[
     ("components",       include_str!("../../../readings/ui/components.md")),
     ("render",           include_str!("../../../readings/ui/render.md")),
     ("view-projection",  include_str!("../../../readings/ui/view-projection.md")),
+    ("view-menu",        include_str!("../../../readings/ui/view-menu.md")),
 ];
 
 /// OS-only nouns. Included only when AREST runs as the kernel, where

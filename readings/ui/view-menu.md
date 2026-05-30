@@ -1,10 +1,13 @@
 # AREST UI: Menu-View Derivation — task-934-3
 
-> **Status: task-934-3 part (a) — mechanism PROVEN GREEN in test-only increment.
-> NOT yet registered in lib.rs UI_READINGS (requires parser surface syntax for
-> the skolem head; see §5 of readings/ui/skolem-head-design.md).
-> The test `menu_view_derivation_via_skolem_head_lazy_idempotent` in
-> `compile_explicit_derivation_tests.rs` proves the mechanism end-to-end.**
+> **Status: task-934-3 part (a) — LIVE. The `(E)` skolem-head surface syntax
+> is wired through the parser + join compiler, and these two rules are
+> REGISTERED in `lib.rs` UI_READINGS; the full ~593-FT metamodel compiles
+> GREEN (no hang, `*`-View lazy only). Proven by
+> `menu_view_derivation_compiled_from_authored_reading_reproduces_proven_func`
+> (the COMPILED authored reading reproduces the hand-built target func) and
+> `menu_view_derivation_via_skolem_head_lazy_idempotent` (the hand-built
+> target) in `compile_explicit_derivation_tests.rs`.**
 
 ## Overview
 
@@ -43,6 +46,27 @@ and the companion rule (same frontier → same `E`):
 
 Both rules carry `*` (lazy, `View` materialization policy — never enters the
 eager forward chain that caused the task-934 metamodel hang).
+
+## Fact Types
+
+`ViewElement has Component Role` is already declared `*` (fully-derived) in
+`view-projection.md`; only the menu-specific `renders Transition` link is
+declared here. The `*` suffix marks it View-materialized so the
+forward chain never eager-evaluates the 5-way join over the ~593-FT metamodel.
+
+ViewElement renders Transition. *
+
+## Derivation Rules
+
+The two shared-frontier skolem rules (single-line registration form of the
+prose above). The `(E)` head variable is fresh (existential); the parser
+records a `SkolemHeadRole` and promotes the 5-way `and`-chain to a Join whose
+skolem frontier is the entity-typed antecedent nouns `(Resource, Transition,
+State Machine Definition, Noun)` — identical across both rules, so the invented
+`ve_<fnv>` id is shared. `Transition (Tr)` carries the rendered transition.
+
+* ViewElement (E) renders Transition (Tr) iff Resource is currently in Status and Transition (Tr) is from Status and Transition (Tr) is defined in State Machine Definition and State Machine Definition is for Noun and Resource is instance of Noun.
+* ViewElement (E) has Component Role 'button' iff Resource is currently in Status and Transition (Tr) is from Status and Transition (Tr) is defined in State Machine Definition and State Machine Definition is for Noun and Resource is instance of Noun.
 
 ## Metamodel Fact-Type Names (Verified)
 
@@ -91,11 +115,17 @@ Frontier hash seed: `fnv1a64(Resource + "|" + Transition)` → `ve_<16 hex>` id.
 
 ## Remaining Work
 
-### (1) Parser surface syntax (skolem-head-design.md §5)
-The `(E)` parenthesised existential variable is not yet supported by the
-parser. Until it lands, the rule must be constructed directly as a
-`DerivationRuleDef` (as in the test). The `spec_skolem_head_authored_in_forml2_resolves_lazily`
-test (currently `#[ignore]`d) pins the target.
+### (1) Parser surface syntax (skolem-head-design.md §5) — DONE
+The `(E)` parenthesised existential variable is supported:
+`resolve_derivation_rule` records a `SkolemHeadRole` and promotes a
+multi-antecedent `and`-chain to a Join (`compile_join_derivation` emits the
+`Compose(Platform("skolem"), Construction[frontier extractors])`). For a JOIN
+skolem head the frontier is the entity-typed antecedent nouns (here
+`Resource, Transition, State Machine Definition, Noun`), which is identical
+across the two sibling rules so the invented `ve_<fnv>` matches — the
+"shared frontier → shared entity" invariant. `spec_skolem_head_authored_in_forml2_resolves_lazily`
+(2-antecedent) and `menu_view_derivation_compiled_from_authored_reading_reproduces_proven_func`
+(5-way) both pass through the real parser+compiler.
 
 ### (2) Guard-filtering negation
 Design §4.5: `Guard prevents Transition → omit the ViewElement`. This requires
@@ -103,13 +133,13 @@ the parser-negation idiom (`no Guard prevents Tr` or AbsenceOf in the antecedent
 which is not yet available as a user-authoring surface in FORML 2.
 The basic menu (all legal transitions, no guard filter) is what is proven here.
 
-### (3) Registration in UI_READINGS (lib.rs)
-Once (1) is done:
-- Add `("view-menu", include_str!("../../../readings/ui/view-menu.md"))` to
-  `UI_READINGS` in `crates/arest/src/lib.rs` after `view-projection`.
-- Rebuild and verify the metamodel compiles green (no hang, no checker errors).
-- The `*` materialization policy on both FT declarations ensures the rules
-  never enter the eager forward chain.
+### (3) Registration in UI_READINGS (lib.rs) — DONE
+`("view-menu", include_str!("../../../readings/ui/view-menu.md"))` is
+registered after `view-projection`. The full metamodel compiles green (no
+hang, no checker errors) — `handle_isolation_tests::create_impl_loads_metamodel`
+exercises the full `compile_to_defs_state` over the registered reading. The
+`*` View policy on `ViewElement renders Transition` keeps both rules out of
+the eager forward chain (`view:` defs only, no `derivation:` def).
 
 ### (4) Collection-list and detail views (934-2)
 `readings/ui/view-projection-design.md` §4.6 (collection rows) and §3.2

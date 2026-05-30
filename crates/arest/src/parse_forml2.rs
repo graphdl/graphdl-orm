@@ -2463,23 +2463,47 @@ fn resolve_derivation_rule(
                     && rule.antecedent_sources.len() >= 2
                     && rule.kind != DerivationKind::Join
                 {
-                    // Shared nouns = nouns that appear as a role on
-                    // EVERY antecedent FT.
+                    // Shared nouns = nouns that appear as a role on ≥2
+                    // antecedent FTs (an equi-join CHAIN, not a star). The
+                    // menu view's 5-way join is a chain — each shared noun
+                    // (Status, Transition, SMD, Noun, Resource) bridges
+                    // exactly TWO antecedents, so the older "appears on
+                    // EVERY antecedent" predicate found none and left the
+                    // rule as a ModusPonens existence check. Mirrors the
+                    // shared-by-≥2 detection the #914 comparison-block uses
+                    // (compile_join_derivation builds one equi-join atom per
+                    // key over whichever antecedent pair carries it).
                     let ant_fts: Vec<Option<&FactTypeDef>> = rule.antecedent_sources.iter()
                         .map(|s| fact_types_map.get(s.fact_type_id()))
                         .collect();
                     if ant_fts.iter().all(|ft| ft.is_some()) {
-                        let mut shared_nouns: Vec<String> = Vec::new();
-                        // Candidate nouns from the first antecedent
-                        if let Some(ft0) = ant_fts[0] {
-                            for r in ft0.roles.iter() {
-                                let appears_in_all = ant_fts[1..].iter().all(|ft| {
-                                    ft.map(|ft| ft.roles.iter().any(|rr| rr.noun_name == r.noun_name))
-                                        .unwrap_or(false)
-                                });
-                                if appears_in_all && !shared_nouns.contains(&r.noun_name) {
-                                    shared_nouns.push(r.noun_name.clone());
+                        // A noun appearing under >1 distinct subscript token
+                        // across antecedent clauses is independent variables
+                        // (Halpin `Task1` vs `Task2`), NOT a join key — the
+                        // ring-join path (compute_ring_join_plan) handles
+                        // those positionally. Same guard the comparison block
+                        // and compile_explicit_derivation's subscript path use.
+                        let tokens_for_noun = |noun: &str| -> hashbrown::HashSet<String> {
+                            let mut toks: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+                            for clause in resolved_part_text.iter() {
+                                for (_, _, t) in find_nouns(clause, &noun_names) {
+                                    let (base, _) = parse_role_token(&t);
+                                    if base == noun { toks.insert(t.clone()); }
                                 }
+                            }
+                            toks
+                        };
+                        let mut shared_nouns: Vec<String> = Vec::new();
+                        for ft in ant_fts.iter().flatten() {
+                            for r in ft.roles.iter() {
+                                if shared_nouns.contains(&r.noun_name) { continue; }
+                                let appears = ant_fts.iter().flatten()
+                                    .filter(|ft| ft.roles.iter()
+                                        .any(|rr| rr.noun_name == r.noun_name))
+                                    .count();
+                                if appears < 2 { continue; }
+                                if tokens_for_noun(&r.noun_name).len() > 1 { continue; }
+                                shared_nouns.push(r.noun_name.clone());
                             }
                         }
                         if !shared_nouns.is_empty() {
@@ -2497,6 +2521,45 @@ fn resolve_derivation_rule(
                             // compile_join_derivation uses all antecedent
                             // nouns (which includes the skolem role nouns
                             // from the consequent FT).
+
+                            // Skolem frontier over a JOIN: the §5 minimal
+                            // heuristic (antecedent-bound roles of the
+                            // CONSEQUENT FT) cannot recover the menu's
+                            // (Resource, Transition) identity — Resource is
+                            // in NEITHER consequent FT, and the literal-pinned
+                            // `Component Role 'button'` sibling has NO
+                            // antecedent-bound consequent role at all, so the
+                            // two shared-head rules would skolemise off
+                            // DIFFERENT frontiers and invent DIFFERENT ids
+                            // (breaking the "shared frontier → shared entity"
+                            // invariant). Over a join, the frontier that both
+                            // makes the head per-(distinct join row) AND is
+                            // identical across sibling rules is the join's
+                            // ENTITY-typed antecedent nouns — the labelled-null
+                            // frontier of the chase. Value-typed bridge keys
+                            // (Status) are excluded: they are join seams, not
+                            // entity identities, and a transition belongs to
+                            // exactly one (SMD, Status) so they add no
+                            // distinguishing power. Ordered by first
+                            // (antecedent, role) occurrence for determinism.
+                            let mut entity_frontier: Vec<String> = Vec::new();
+                            for ft in ant_fts.iter().flatten() {
+                                for r in ft.roles.iter() {
+                                    let is_entity = nouns_map.get(&r.noun_name)
+                                        .map(|n| n.object_type == "entity")
+                                        .unwrap_or(false);
+                                    if is_entity
+                                        && !entity_frontier.contains(&r.noun_name)
+                                    {
+                                        entity_frontier.push(r.noun_name.clone());
+                                    }
+                                }
+                            }
+                            if !entity_frontier.is_empty() {
+                                for shr in rule.skolem_head_roles.iter_mut() {
+                                    shr.frontier = entity_frontier.clone();
+                                }
+                            }
                         }
                     }
                 }

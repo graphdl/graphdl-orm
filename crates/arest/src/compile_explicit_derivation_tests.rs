@@ -4602,6 +4602,242 @@ fn menu_view_derivation_via_skolem_head_lazy_idempotent() {
         "Rule B must be LAZY (view: only, no derivation: def — the metamodel-hang guard)");
 }
 
+// ─── task-934-3a (b): LIVE-AUTHORABLE menu view — compile the authored rule ──
+//
+// THIS is the task-934-3 part (a) payoff: the COMPILER must reproduce the
+// hand-built menu view func above from the AUTHORED skolem-head reading,
+// driven end-to-end through the REAL parser + join compiler.
+//
+// The hand-built `menu_view_derivation_via_skolem_head_lazy_idempotent` test
+// pre-populates a single `MenuFrontierFT` (Resource, Transition) cell to
+// isolate the skolem-head mechanism. This test does the OPPOSITE: it authors
+// the two shared-frontier skolem rules as FORML 2 prose over the FULL
+// multi-antecedent metamodel join, compiles them through `parse_to_state` +
+// `compile`, and asserts the COMPILED `view:` func reproduces the SAME proven
+// behaviour:
+//   (a) entity in a non-terminal status → one VE per legal departure transition
+//   (b) entity in a terminal status     → ZERO ViewElements
+//   (c) deterministic `ve_<fnv>` ids
+//   (d) idempotent across two resolve passes
+//   (e) `renders Transition` rule → VE carries its Transition
+//   (f) `has Component Role 'button'` rule → SAME VE id (shared frontier)
+//   (g) NO eager `derivation:` def (lazy-only)
+//
+// The frontier (Resource, Transition) is produced by the 5-way join
+//   Resource is currently in Status     (Resource → Status)
+//     ⋈ Transition is from Status       (Transition → Status)   [join on Status]
+//     ⋈ Transition is defined in State Machine Definition (Transition → SMD)
+//     ⋈ State Machine Definition is for Noun              (SMD → Noun)
+//     ⋈ Resource is instance of Noun    (Resource → Noun)       [join on Noun]
+// NONE of {Status, Transition, SMD, Noun, Resource} appears on ALL five FTs —
+// each shared noun bridges exactly two antecedents (a join CHAIN, not a star).
+// The skolem-head join-promotion must therefore key off "shared by ≥2
+// antecedents", which is what `resolve_derivation_rule` now does.
+#[test]
+fn menu_view_derivation_compiled_from_authored_reading_reproduces_proven_func() {
+    use crate::ast::{defs_to_state, resolve_view};
+
+    // Authored reading — the two shared-frontier skolem rules from
+    // readings/ui/view-menu.md, over the verified metamodel FT names.
+    // `ViewElement renders Transition. *` and `ViewElement has Component
+    // Role. *` mark both heads View-materialized (lazy). The 5-way join
+    // antecedents are spelled exactly as the metamodel declares them.
+    let src = r#"# task-934-3 authored menu view
+Resource(.Reference) is an entity type.
+Reference is a value type.
+Status is a value type.
+Transition(.id) is an entity type.
+id is a value type.
+State Machine Definition(.Name) is an entity type.
+Name is a value type.
+Noun(.NounName) is an entity type.
+NounName is a value type.
+ViewElement(.veid) is an entity type.
+veid is a value type.
+Component Role is a value type.
+
+## Fact Types
+Resource is currently in Status.
+Transition is from Status.
+Transition is defined in State Machine Definition.
+State Machine Definition is for Noun.
+Resource is instance of Noun.
+ViewElement renders Transition. *
+ViewElement has Component Role. *
+
+## Derivation Rules
+* ViewElement (E) renders Transition (Tr) iff Resource is currently in Status and Transition (Tr) is from Status and Transition (Tr) is defined in State Machine Definition and State Machine Definition is for Noun and Resource is instance of Noun.
+* ViewElement (E) has Component Role 'button' iff Resource is currently in Status and Transition (Tr) is from Status and Transition (Tr) is defined in State Machine Definition and State Machine Definition is for Noun and Resource is instance of Noun.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let data = compile::cell_index_from_state(&state);
+
+    // ── Both rules must parse as View-materialized Joins with a skolem head ──
+    let renders_rule = data.derivation_rules.iter()
+        .find(|r| r.text.contains("renders Transition"))
+        .expect("renders rule must parse");
+    let role_rule = data.derivation_rules.iter()
+        .find(|r| r.text.contains("Component Role"))
+        .expect("Component Role rule must parse");
+    for (label, rule) in [("renders", renders_rule), ("role", role_rule)] {
+        assert!(matches!(rule.materialization, crate::types::MaterializationPolicy::View),
+            "{label} rule must be View-materialized (lazy); got {:?}", rule.materialization);
+        assert_eq!(rule.kind, DerivationKind::Join,
+            "{label} rule must promote to a Join over the 5-way chain (shared-by-≥2 \
+             join keys); got {:?}\njoin_on: {:?}\ntext: {}",
+            rule.kind, rule.join_on, rule.text);
+        assert!(rule.skolem_head_roles.iter().any(|s| s.role == "ViewElement"),
+            "{label} rule must record a SkolemHeadRole for the fresh ViewElement (E); \
+             got {:#?}\ntext: {}", rule.skolem_head_roles, rule.text);
+        // The skolem frontier over the join is the ENTITY-typed antecedent
+        // nouns — it MUST include both Resource and Transition so the head is
+        // per-(entity, transition) and never collapses two resources sharing a
+        // transition. (Status is value-typed → excluded as a join seam.)
+        let shr = rule.skolem_head_roles.iter().find(|s| s.role == "ViewElement").unwrap();
+        assert!(shr.frontier.contains(&"Transition".to_string()),
+            "{label} skolem frontier must include Transition; got {:?}", shr.frontier);
+        assert!(shr.frontier.contains(&"Resource".to_string()),
+            "{label} skolem frontier must include Resource (else two resources \
+             sharing a transition collapse to one ViewElement); got {:?}", shr.frontier);
+        assert!(!shr.frontier.contains(&"Status".to_string()),
+            "{label} skolem frontier must EXCLUDE value-typed Status (a join \
+             seam, not an entity identity); got {:?}", shr.frontier);
+    }
+    // SHARED FRONTIER (parse level): both sibling rules must skolemise off the
+    // IDENTICAL frontier so the fresh ViewElement id matches across them.
+    {
+        let fa = &renders_rule.skolem_head_roles.iter()
+            .find(|s| s.role == "ViewElement").unwrap().frontier;
+        let fb = &role_rule.skolem_head_roles.iter()
+            .find(|s| s.role == "ViewElement").unwrap().frontier;
+        assert_eq!(fa, fb,
+            "renders and Component Role heads MUST share an identical skolem \
+             frontier (shared-frontier invariant); renders {:?} vs role {:?}", fa, fb);
+    }
+    // The renders rule's consequent FT carries Transition as an antecedent-bound
+    // frontier role; the join must equi-join Status AND Noun (the two chain seams).
+    assert!(renders_rule.join_on.contains(&"Status".to_string()),
+        "Status must be a join key (Transition.from == Resource.currentStatus); got {:?}",
+        renders_rule.join_on);
+    assert!(renders_rule.join_on.contains(&"Noun".to_string()),
+        "Noun must be a join key (Resource instance-of == SMD for-Noun); got {:?}",
+        renders_rule.join_on);
+
+    // ── Compile to defs; both heads emit a `view:` def, NO `derivation:` def ──
+    let defs = compile::compile_to_defs_state(&state);
+    let d = defs_to_state(&defs, &state);
+    let cons_renders = "ViewElement_renders_Transition";
+    let cons_role = "ViewElement_has_Component_Role";
+    assert!(!matches!(ast::fetch_raw(&format!("view:{}", cons_renders), &d), Object::Bottom),
+        "renders head must emit a view: def");
+    assert!(!matches!(ast::fetch_raw(&format!("view:{}", cons_role), &d), Object::Bottom),
+        "Component Role head must emit a view: def");
+    // (g) LAZY guard — no eager derivation: def for EITHER head (metamodel-hang guard).
+    assert!(matches!(ast::fetch_raw(&format!("derivation:{}", renders_rule.id), &d), Object::Bottom),
+        "renders head must be lazy (view: only, no derivation: def)");
+    assert!(matches!(ast::fetch_raw(&format!("derivation:{}", role_rule.id), &d), Object::Bottom),
+        "Component Role head must be lazy (view: only, no derivation: def)");
+
+    // ── Population: the SM model from apps/tasks (mirrors the hand-built test) ──
+    //   Status 'pending' → transitions 'start', 'delete-from-pending'  (NON-TERMINAL)
+    //   Status 'deleted' → (none)                                       (TERMINAL)
+    //   task-1 currently in 'pending'  → 2 legal transitions → 2 ViewElements
+    //   task-2 currently in 'deleted'  → 0 legal transitions → 0 ViewElements
+    // Both tasks are instances of Noun 'Task'; the SMD 'TaskSM' is for 'Task'.
+    let pop = {
+        let push = |s, cell: &str, pairs: &[(&str, &str)]|
+            ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+        let s = d.clone();
+        // current status
+        let s = push(s, "Resource_is_currently_in_Status", &[("Resource", "task-1"), ("Status", "pending")]);
+        let s = push(s, "Resource_is_currently_in_Status", &[("Resource", "task-2"), ("Status", "deleted")]);
+        // transitions from status
+        let s = push(s, "Transition_is_from_Status", &[("Transition", "start"), ("Status", "pending")]);
+        let s = push(s, "Transition_is_from_Status", &[("Transition", "delete-from-pending"), ("Status", "pending")]);
+        // transitions defined in the TaskSM definition
+        let s = push(s, "Transition_is_defined_in_State_Machine_Definition", &[("Transition", "start"), ("State Machine Definition", "TaskSM")]);
+        let s = push(s, "Transition_is_defined_in_State_Machine_Definition", &[("Transition", "delete-from-pending"), ("State Machine Definition", "TaskSM")]);
+        // the TaskSM definition is for the Task noun
+        let s = push(s, "State_Machine_Definition_is_for_Noun", &[("State Machine Definition", "TaskSM"), ("Noun", "Task")]);
+        // both resources are instances of the Task noun
+        let s = push(s, "Resource_is_instance_of_Noun", &[("Resource", "task-1"), ("Noun", "Task")]);
+        let s = push(s, "Resource_is_instance_of_Noun", &[("Resource", "task-2"), ("Noun", "Task")]);
+        s
+    };
+
+    // ── (a)+(b): resolve the renders view lazily; task-1 → 2 VEs, task-2 → 0 ──
+    let pass1 = resolve_view(cons_renders, &pop, &d)
+        .expect("compiled renders view: def must resolve via resolve_view");
+    let elems: Vec<(String, String, String)> = pass1.as_seq()
+        .map(|items| items.iter().filter_map(|f| {
+            let ve = ast::binding(f, "ViewElement").map(String::from)?;
+            let tr = ast::binding(f, "Transition").map(String::from)?;
+            let rs = ast::binding(f, "Resource").map(String::from)?;
+            Some((ve, tr, rs))
+        }).collect())
+        .unwrap_or_default();
+
+    let task1: Vec<&(String, String, String)> =
+        elems.iter().filter(|(_, _, rs)| rs == "task-1").collect();
+    assert_eq!(task1.len(), 2,
+        "COMPILED authored reading: task-1 (pending) must produce 2 ViewElements \
+         (start + delete-from-pending); got {:?}\nfull: {:#?}", task1, elems);
+    let task2: Vec<&(String, String, String)> =
+        elems.iter().filter(|(_, _, rs)| rs == "task-2").collect();
+    assert_eq!(task2.len(), 0,
+        "COMPILED authored reading: task-2 (deleted = terminal) must produce ZERO \
+         ViewElements; got {:?}\nfull: {:#?}", task2, elems);
+
+    // (c) deterministic ve_<16 hex> ids
+    for (id, tr, rs) in &elems {
+        assert!(id.starts_with("ve_") && id.len() == "ve_".len() + 16,
+            "VE id must be ve_<16 hex>; got {:?} for ({}, {})", id, rs, tr);
+    }
+
+    // (e) Transition carried through
+    let t1_trs: Vec<&str> = task1.iter().map(|(_, tr, _)| tr.as_str()).collect();
+    assert!(t1_trs.contains(&"start"),
+        "start must be in task-1's compiled menu; got {:?}", t1_trs);
+    assert!(t1_trs.contains(&"delete-from-pending"),
+        "delete-from-pending must be in task-1's compiled menu; got {:?}", t1_trs);
+
+    // (d) idempotent across a second resolve pass
+    let pass2 = resolve_view(cons_renders, &pop, &d)
+        .expect("compiled renders view: def must resolve on pass 2");
+    let mut ids1: Vec<String> = elems.iter().map(|(id, ..)| id.clone()).collect();
+    let mut ids2: Vec<String> = pass2.as_seq()
+        .map(|items| items.iter()
+            .filter_map(|f| ast::binding(f, "ViewElement").map(String::from)).collect())
+        .unwrap_or_default();
+    ids1.sort();
+    ids2.sort();
+    assert_eq!(ids1, ids2,
+        "COMPILED menu view must be idempotent (same frontier → same ve_<fnv>); \
+         pass1 {:?} vs pass2 {:?}", ids1, ids2);
+
+    // (f) shared frontier: the Component Role head produces the SAME ve_<fnv> ids
+    let role_view = resolve_view(cons_role, &pop, &d)
+        .expect("compiled Component Role view: def must resolve");
+    let mut role_ids: Vec<String> = role_view.as_seq()
+        .map(|items| items.iter()
+            .filter_map(|f| ast::binding(f, "ViewElement").map(String::from)).collect())
+        .unwrap_or_default();
+    let role_vals: Vec<String> = role_view.as_seq()
+        .map(|items| items.iter()
+            .filter_map(|f| ast::binding(f, "Component Role").map(String::from)).collect())
+        .unwrap_or_default();
+    assert_eq!(role_ids.len(), 2,
+        "Component Role head must produce 2 VE bindings (one per legal transition \
+         for task-1); got {:?}", role_ids);
+    role_ids.sort();
+    assert_eq!(ids1, role_ids,
+        "SHARED FRONTIER: renders and Component Role heads MUST produce identical \
+         ve_<fnv> ids (same (Resource,Transition) → same hash). renders {:?} vs role {:?}",
+        ids1, role_ids);
+    assert!(role_vals.iter().all(|v| v == "button"),
+        "all compiled menu VEs must have Component Role 'button'; got {:?}", role_vals);
+}
+
 // ─── task-934-3a: VERIFIED METAMODEL FACT-TYPE NAMES ────────────────────────
 //
 // The following names have been verified against readings/core/state.md,
