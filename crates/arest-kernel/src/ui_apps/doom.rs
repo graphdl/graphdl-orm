@@ -688,7 +688,17 @@ fn tic(
                     // captured frame is up to date.
                 }
                 Err(e) => {
-                    crate::println!("doom: tickGame trapped: {e} (disabling Doom guest)");
+                    // #595 probe: dump the guest's linear-memory size + trap
+                    // code so we can tell a too-small / un-grown memory (OOB
+                    // just past the end) from a wild guest pointer.
+                    let pages = guest.instance
+                        .get_memory(&guest.store, "memory")
+                        .map(|m| m.size(&guest.store))
+                        .unwrap_or(0);
+                    crate::println!(
+                        "doom: tickGame trapped: {e} (disabling Doom guest) [linear-mem={} pages (~{} KiB); trap={:?}]",
+                        pages, pages * 64, e.as_trap_code()
+                    );
                     guest.dead = true;
                     return;
                 }

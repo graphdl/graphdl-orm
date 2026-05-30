@@ -97,6 +97,16 @@ use crate::println;
 // code (`println!` transcodes args via a `String` on the UEFI serial
 // path). Must NOT move later without switching to a crate that
 // supports delayed init.
+// #595: Doom's wasmi linear memory grows to ~14.6 MiB (not the ~5 MiB the
+// budget below assumed) on top of wasmi's ~9 MiB module tables; against a
+// 32 MiB heap the next `memory.grow` (finishing Doom's ~16 MiB zone) fails
+// on host-heap exhaustion and the zone allocator walks OOB on the first
+// tickGame. The doom build gets 64 MiB (it boots with `-m 1024` so OVMF can
+// hand it out); non-doom stays 32 MiB so the 128-MiB-guest smoke harnesses
+// (boot-kernel-uefi*.ps1 -Smoke, no -m) still load under OVMF.
+#[cfg(feature = "doom")]
+const HEAP_SIZE: usize = 64 * 1024 * 1024;
+#[cfg(not(feature = "doom"))]
 const HEAP_SIZE: usize = 32 * 1024 * 1024;
 const HEAP_PAGES: usize = HEAP_SIZE / 4096;
 
@@ -251,6 +261,9 @@ fn efi_main() -> Status {
     // heap = no UCS-2 transcode buffer for ConOut). Without these the
     // failure mode is a silent boot-time hang, indistinguishable from
     // OVMF refusing to load the image.
+    #[cfg(feature = "doom")]
+    raw_com1_str("\nheap: requesting 64 MiB via boot::allocate_pages...");
+    #[cfg(not(feature = "doom"))]
     raw_com1_str("\nheap: requesting 32 MiB via boot::allocate_pages...");
     let heap_ptr = match uefi::boot::allocate_pages(
         AllocateType::AnyPages,
