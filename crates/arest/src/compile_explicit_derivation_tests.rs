@@ -4931,6 +4931,88 @@ fn crudl_operation_catalog_parses_and_compiles_grounded_in_ifactr() {
     }
 }
 
+// crudl-menu-projection (authorization model): the permission gate
+// 'User is permitted Operation on Noun' derived role-based from 'User has Role'
+// + 'Role permits Operation on Noun'. DE-RISKS THE TERNARY FORK: both the
+// antecedent 'Role permits Operation on Noun' and the consequent 'User is
+// permitted Operation on Noun' are TERNARY (3 entity roles).
+//
+// FINDING (live-debugged 2026-05-30): ternary fact types PARSE + STORE
+// correctly, but the non-skolem multi-antecedent join BINDS THE CONSEQUENT FROM
+// THE FIRST ANTECEDENT ONLY -- it emits (User='alice', Role='editor') into the
+// (User, Operation, Noun) cell, so the correct permissions never materialize.
+// The view derivations avoid this with the SKOLEM path (their (Resource,
+// Transition) frontier spans antecedents correctly). So the authz gate must
+// OBJECTIFY via skolem, OR compile_join_derivation's non-skolem cross-antecedent
+// consequent binding must be fixed. This test holds the TARGET spec; #[ignore]'d
+// until the authz model is objectified (see crudl-menu-projection +
+// nonskolem-cross-antecedent-join).
+#[ignore = "non-skolem cross-antecedent ternary join mis-binds the consequent; authz must objectify via skolem -- see nonskolem-cross-antecedent-join task"]
+#[test]
+fn authorization_model_ternary_permission_derivation() {
+    let src = r#"
+User(.Username) is an entity type.
+Username is a value type.
+Role(.RoleName) is an entity type.
+RoleName is a value type.
+Operation(.OpName) is an entity type.
+OpName is a value type.
+Noun(.NounName) is an entity type.
+NounName is a value type.
+
+## Fact Types
+User has Role.
+Role permits Operation on Noun.
+User is permitted Operation on Noun. **
+
+## Derivation Rules
+* User is permitted Operation on Noun iff User has Role and Role permits Operation on Noun.
+"#;
+    let state = parse_to_state(src).expect("authorization model (ternary FTs) must parse");
+    let defs = compile::compile_to_defs_state(&state);
+    let d0 = ast::defs_to_state(&defs, &state);
+
+    // alice has role editor; editor permits Edit + Create on Task (NOT Delete).
+    // bob has no role.
+    let push = |s, cell: &str, pairs: &[(&str, &str)]|
+        ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+    let d = {
+        let s = d0.clone();
+        let s = push(s, "User_has_Role", &[("User", "alice"), ("Role", "editor")]);
+        let s = push(s, "Role_permits_Operation_on_Noun", &[("Role", "editor"), ("Operation", "Edit"), ("Noun", "Task")]);
+        let s = push(s, "Role_permits_Operation_on_Noun", &[("Role", "editor"), ("Operation", "Create"), ("Noun", "Task")]);
+        s
+    };
+
+    // Forward-chain the eager permission join over the derivation:* defs.
+    let refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &d)))
+        .collect();
+    let refs: Vec<(&str, &ast::Func)> = refs_owned.iter().map(|(n, f)| (n.as_str(), f)).collect();
+    let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+
+    // The derived ternary gate: (User, Operation, Noun) tuples.
+    let cell = ast::fetch_cell_seq("User_is_permitted_Operation_on_Noun", &new_d);
+    let perms: Vec<(String, String, String)> = cell.as_seq()
+        .map(|items| items.iter().filter_map(|f| {
+            let u = ast::binding(f, "User")?.to_string();
+            let op = ast::binding(f, "Operation")?.to_string();
+            let n = ast::binding(f, "Noun")?.to_string();
+            Some((u, op, n))
+        }).collect())
+        .unwrap_or_default();
+
+    assert!(perms.iter().any(|(u, op, n)| u == "alice" && op == "Edit" && n == "Task"),
+        "alice (role editor permits Edit on Task) must be permitted Edit on Task; got {:?}", perms);
+    assert!(perms.iter().any(|(u, op, n)| u == "alice" && op == "Create" && n == "Task"),
+        "alice must be permitted Create on Task; got {:?}", perms);
+    assert!(!perms.iter().any(|(_, op, _)| op == "Delete"),
+        "alice must NOT be permitted Delete (editor does not permit it); got {:?}", perms);
+    assert!(!perms.iter().any(|(u, _, _)| u == "bob"),
+        "bob (no role) must have no permissions; got {:?}", perms);
+}
+
 // ─── task-934-3a: VERIFIED METAMODEL FACT-TYPE NAMES ────────────────────────
 //
 // The following names have been verified against readings/core/state.md,
