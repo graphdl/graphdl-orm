@@ -1782,6 +1782,54 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         return "ok".into();
     }
 
+    // ── Assert FFI (task-971) ────────────────────────────────────────
+    //
+    //   system(h, "assert:<ft_name>", "<<role1, val1>, <role2, val2>, ...>>") → "ok" | "⊥"
+    //
+    // Append an exact fact tuple to the named FactType cell, then run
+    // the full derive→validate→emit pipeline.  Symmetric inverse of the
+    // `retract:` FFI above.  Repeated role names are allowed (ring facts).
+    // An alethic violation causes D'=D (nothing is committed) and "⊥".
+    if let Some(ft_name) = key.strip_prefix("assert:") {
+        let input_obj = ast::Object::parse(input);
+        let pairs: Vec<crate::command::RolePair> = match input_obj.as_seq() {
+            Some(items) if !items.is_empty() => items.iter()
+                .filter_map(|item| {
+                    let kv = item.as_seq()?;
+                    if kv.len() != 2 { return None; }
+                    let role = kv[0].as_atom()?.to_string();
+                    let value = kv[1].as_atom()?.to_string();
+                    Some(crate::command::RolePair { role, value })
+                })
+                .collect(),
+            _ => return "⊥".into(),
+        };
+        if pairs.is_empty() {
+            return "⊥".into();
+        }
+        // Dispatch through the full assert_fact pipeline (derive+validate).
+        let cmd = crate::command::Command::AssertFact {
+            fact_type: ft_name.to_string(),
+            pairs,
+            sender: None,
+            signature: None,
+        };
+        let st_read = tenant.read();
+        let snapshot = st_read.snapshot_d();
+        drop(st_read);
+        let result = crate::command::apply_command_defs(&snapshot, &cmd, &snapshot);
+        if result.rejected {
+            return "⊥".into();
+        }
+        // Commit the delta.
+        let event = ast::apply_event(key, ast::Object::parse(input));
+        let augmented = augment_delta_with_entity_cells(&snapshot, &result.state);
+        let new_d = ast::merge_delta(&snapshot, &augmented, Some(event));
+        let mut st = tenant.write();
+        st.replace_d(new_d);
+        return "ok".into();
+    }
+
     // ── Re-derive FFI (#305 follow-up to #14/#15) ────────────────────
     //
     //   system(h, "re_derive", "") → "<count>"

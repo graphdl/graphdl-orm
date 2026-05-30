@@ -3914,6 +3914,17 @@ fn command_field_overflow(command: &crate::command::Command) -> Option<&'static 
         Command::Batch { commands } => {
             commands.iter().find_map(command_field_overflow)
         }
+        // task-971: check fact_type + each pair's role and value.
+        Command::AssertFact { fact_type, pairs, sender, signature } => {
+            match over(fact_type) { true => return Some("factType"), false => {} }
+            for p in pairs {
+                match over(&p.role) { true => return Some("role"), false => {} }
+                match over(&p.value) { true => return Some("value"), false => {} }
+            }
+            match sender.as_deref().map(over).unwrap_or(false) { true => return Some("sender"), false => {} }
+            match signature.as_deref().map(over).unwrap_or(false) { true => return Some("signature"), false => {} }
+            None
+        }
     }
 }
 

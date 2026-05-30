@@ -210,6 +210,40 @@ pub enum Command {
     Batch {
         commands: Vec<Command>,
     },
+    /// task-971: assert an exact fact tuple into a FactType cell using
+    /// ordered role/value pairs (the symmetric inverse of the `retract`
+    /// verb's `pairs` form). This is the ONLY way to write a same-noun
+    /// ring fact (e.g. `Task blocks Task`) via the `apply` write-path,
+    /// because the entity-oriented variants (`CreateEntity`, `UpdateEntity`)
+    /// accept a MAP (unique keys), which collapses duplicate role names.
+    ///
+    /// The `pairs` slice carries ordered `(role, value)` bindings.
+    /// Repeated role names ARE allowed — `[("Task","A"),("Task","B")]`
+    /// correctly represents `<<Task,A>,<Task,B>>`.
+    ///
+    /// After the fact is appended the full derive→validate→emit pipeline
+    /// runs. An alethic violation (e.g. an irreflexive ring asserting
+    /// A blocks A) causes `D'=D` — nothing is committed.
+    ///
+    /// JSON surface: `{"type":"assertFact","factType":"Task_blocks_Task",
+    /// "pairs":[{"role":"Task","value":"A"},{"role":"Task","value":"B"}]}`
+    AssertFact {
+        #[serde(rename = "factType")]
+        fact_type: String,
+        pairs: Vec<RolePair>,
+        #[serde(default)]
+        sender: Option<String>,
+        #[serde(default)]
+        signature: Option<String>,
+    },
+}
+
+/// task-971: an ordered (role, value) pair for the `AssertFact` command.
+/// Repeated role names are legal — ring facts require them.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RolePair {
+    pub role: String,
+    pub value: String,
 }
 
 // -- Result -----------------------------------------------------------
@@ -574,6 +608,9 @@ pub fn apply_command_defs(
         Command::Batch { commands } => {
             apply_command_batch(d, commands, state)
         }
+        Command::AssertFact { fact_type, pairs, sender: _, signature: _ } => {
+            assert_fact_via_defs(d, fact_type, pairs, state)
+        }
         #[allow(unreachable_patterns)]
         _ => CommandResult {
             entities: vec![],
@@ -696,6 +733,151 @@ pub fn apply_command_batch(
         violations,
         derived_count,
         rejected: false,
+        state: delta,
+    }
+}
+
+/// task-971: Assert an ordered fact tuple into a named FactType cell
+/// and run the full derive→validate→emit pipeline.
+///
+/// This is the symmetric inverse of the `retract` write-path: instead
+/// of removing a matching tuple it APPENDS one, then forwards-chains
+/// and validates. Same-noun ring facts (e.g. `Task blocks Task`) work
+/// correctly because `pairs` is an ORDERED slice — repeated role names
+/// are preserved in insertion order, exactly as stored in the cell.
+///
+/// Alethic violations (irreflexive / asymmetric ring constraints, UC
+/// conflicts) cause `D' = D`: nothing is committed and `rejected=true`
+/// is returned. Deontic violations warn but do not block the commit.
+fn assert_fact_via_defs(
+    d: &ast::Object,
+    fact_type: &str,
+    pairs: &[RolePair],
+    state: &ast::Object,
+) -> CommandResult {
+    // Reject clearly-malformed inputs up front.
+    if fact_type.is_empty() || pairs.is_empty() {
+        return CommandResult {
+            entities: alloc::vec![],
+            status: None,
+            transitions: alloc::vec![],
+            navigation: alloc::vec![],
+            violations: alloc::vec![crate::types::Violation {
+                constraint_id: "assert_fact.invalid_input".to_string(),
+                constraint_text: "assertFact requires a non-empty factType and at least one pair".to_string(),
+                detail: "Provide factType and at least one { role, value } pair".to_string(),
+                alethic: true,
+            }],
+            derived_count: 0,
+            rejected: true,
+            state: ast::Object::phi(),
+        };
+    }
+
+    // Build the fact object: <<role1, val1>, <role2, val2>, ...>
+    let fact = ast::Object::Seq(
+        pairs.iter().map(|p| {
+            ast::Object::seq(vec![
+                ast::Object::atom(&p.role),
+                ast::Object::atom(&p.value),
+            ])
+        }).collect()
+    );
+
+    // Determine which nouns this fact type involves (for derive gating).
+    // Collect the distinct noun role names from the pairs to seed derivation.
+    let touched_nouns: hashbrown::HashSet<String> = pairs.iter()
+        .map(|p| p.role.clone())
+        .collect();
+
+    // Append the new fact to the cell.
+    let post_assert = ast::cell_push(fact_type, fact, state);
+
+    // ── derive: 2-stratum forward chain ────────────────────────────────
+    // Mirror the same gating as create_via_defs: all rules (no per-noun
+    // filter) so cross-noun bridge derivations (e.g. Task Readiness) fire.
+    let collect_stratum_all = |prefix: &str| -> Vec<(String, ast::Func)> {
+        let cell_prefix = alloc::format!("{}:", prefix);
+        ast::cells_iter(d).into_iter()
+            .filter(|(n, _)| n.starts_with(cell_prefix.as_str()))
+            .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, d)))
+            .collect()
+    };
+    let stratum1 = collect_stratum_all("derivation");
+    let stratum2 = collect_stratum_all("derivation_strat2");
+
+    // Seed the incremental chainer with the just-written cell.
+    let seed: hashbrown::HashSet<String> = core::iter::once(fact_type.to_string()).collect();
+
+    let build_seeded_refs = |stratum: &[(String, ast::Func)]|
+        -> Vec<(String, Vec<String>, ast::Func)>
+    {
+        stratum.iter().map(|(name, func)| {
+            let id = name.split_once(':').map(|(_, id)| id).unwrap_or(name);
+            let reads = crate::evaluate::read_derivation_reads(d, id).unwrap_or_default();
+            (name.clone(), reads, func.clone())
+        }).collect()
+    };
+    let s1_packed = build_seeded_refs(&stratum1);
+    let s2_packed = build_seeded_refs(&stratum2);
+
+    let mut activated_rule_defs: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+    let (post_s1, mut derived) = if stratum1.is_empty() {
+        (post_assert.clone(), Vec::new())
+    } else {
+        let refs = to_seeded_refs(&s1_packed);
+        crate::evaluate::forward_chain_defs_state_seeded_tracked(
+            &refs, seed.clone(), &post_assert, 100, &mut activated_rule_defs)
+    };
+    let derived_state = if stratum2.is_empty() {
+        post_s1
+    } else {
+        let refs = to_seeded_refs(&s2_packed);
+        let (post_s2, more) = crate::evaluate::forward_chain_defs_state_seeded_tracked(
+            &refs, seed.clone(), &post_s1, 100, &mut activated_rule_defs);
+        derived.extend(more);
+        post_s2
+    };
+
+    // ── validate ───────────────────────────────────────────────────────
+    // Run each noun's validate function (or the global fallback).
+    // For a ring fact type the relevant nouns are the role nouns.
+    let all_violations: Vec<crate::types::Violation> = {
+        let ctx_obj = ast::encode_eval_context_state("", None, &derived_state);
+        // Try per-noun validators for each distinct noun in the pairs,
+        // then fall back to the global validator.
+        let mut all_v: Vec<crate::types::Violation> = Vec::new();
+        let mut ran_noun_validator = false;
+        for noun in &touched_nouns {
+            let validate_key = alloc::format!("validate:{}", noun);
+            if ast::fetch(&validate_key, d) != ast::Object::Bottom {
+                let viol_obj = ast::apply(&ast::Func::Def(validate_key), &ctx_obj, d);
+                all_v.extend(ast::decode_violations(&viol_obj));
+                ran_noun_validator = true;
+            }
+        }
+        if !ran_noun_validator {
+            // Global validate as fallback.
+            let viol_obj = ast::apply(&ast::Func::Def("validate".to_string()), &ctx_obj, d);
+            all_v.extend(ast::decode_violations(&viol_obj));
+        }
+        all_v
+    };
+
+    let rejected = all_violations.iter().any(|v| v.alethic);
+
+    // ── emit ───────────────────────────────────────────────────────────
+    let final_state = if rejected { state.clone() } else { derived_state };
+    let delta = ast::diff_cells(state, &final_state);
+
+    CommandResult {
+        entities: alloc::vec![],
+        status: None,
+        transitions: alloc::vec![],
+        navigation: alloc::vec![],
+        violations: all_violations,
+        derived_count: derived.len(),
+        rejected,
         state: delta,
     }
 }
@@ -8216,6 +8398,193 @@ Transition 'finish' is defined in State Machine Definition 'Widget'.
         let descs = ast::fetch_cell_seq("Task_has_Description", &merged);
         let n = descs.as_seq().map(|s| s.len()).unwrap_or(0);
         assert_eq!(n, 2, "both batched creates must land; got {n}");
+    }
+
+    // ── task-971: assert same-noun-ring facts via AssertFact ─────────────
+    //
+    // A Task blocks Task ring fact type has irreflexive + asymmetric ring
+    // constraints AND a derivation (`Task2 has Task Readiness 'blocked' iff
+    // Task1 blocks Task2`).  The test verifies:
+    //   (a) assertFact with pairs=[Task A, Task B] lands in Task_blocks_Task
+    //   (b) the derivation fires (Task B is tagged 'blocked')
+    //   (c) assertFact with pairs=[Task A, Task A] is REJECTED (irreflexive)
+    //       and nothing is committed.
+    //
+    // This is IMPOSSIBLE via the entity-oriented apply paths because they
+    // use a MAP (unique keys), collapsing both roles into one "Task" key.
+
+    const TASK_RING_READINGS: &str = r#"
+# task-971 ring fixture
+
+## Entity Types
+
+Task(.id) is an entity type.
+
+## Value Types
+
+Task Readiness is a value type.
+
+## Fact Types
+
+Task blocks Task.
+Task has Task Readiness.
+
+## Constraints
+
+Task blocks Task is irreflexive.
+Task blocks Task is asymmetric.
+
+## Derivation Rules
+
+* Task2 has Task Readiness 'blocked' iff Task1 blocks Task2.
+"#;
+
+    fn setup_ring_defs() -> (ast::Object, ast::Object) {
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(TASK_RING_READINGS)
+            .expect("task-971 ring readings must parse");
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+        (def_obj, state)
+    }
+
+    /// task-971 acceptance (a+b): assert Task A blocks Task B →
+    /// fact lands in cell; derivation fires (Task B is blocked).
+    #[test]
+    fn assert_fact_ring_lands_in_cell_and_fires_derivation() {
+        let (def_obj, state) = setup_ring_defs();
+
+        let cmd = Command::AssertFact {
+            fact_type: "Task_blocks_Task".to_string(),
+            pairs: vec![
+                RolePair { role: "Task".to_string(), value: "task-A".to_string() },
+                RolePair { role: "Task".to_string(), value: "task-B".to_string() },
+            ],
+            sender: None,
+            signature: None,
+        };
+
+        let result = apply_command_defs(&def_obj, &cmd, &state);
+        assert!(!result.rejected,
+            "assertFact Task A blocks Task B must NOT be rejected; violations={:?}",
+            result.violations);
+
+        // (a) Fact must land in the Task_blocks_Task cell.
+        let merged = ast::merge_states(&state, &result.state);
+        let ring_cell = ast::fetch_cell_seq("Task_blocks_Task", &merged);
+        let facts: Vec<_> = ring_cell.as_seq()
+            .map(|s| s.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let fact_landed = facts.iter().any(|f| {
+            let pairs_seq = match f.as_seq() { Some(p) => p, None => return false };
+            let roles_values: Vec<(&str, &str)> = pairs_seq.iter().filter_map(|p| {
+                let kv = p.as_seq()?;
+                let r = kv.first()?.as_atom()?;
+                let v = kv.get(1)?.as_atom()?;
+                Some((r, v))
+            }).collect();
+            roles_values.len() == 2
+                && roles_values[0] == ("Task", "task-A")
+                && roles_values[1] == ("Task", "task-B")
+        });
+        assert!(fact_landed,
+            "task-971: <<Task,task-A>,<Task,task-B>> must be present in \
+             Task_blocks_Task after assertFact; got facts={:?}", facts);
+
+        // (b) Derivation must have fired: Task B should be tagged 'blocked'.
+        let readiness_cell = ast::fetch_cell_seq("Task_has_Task_Readiness", &merged);
+        let blocked = readiness_cell.as_seq()
+            .map(|facts| facts.iter().any(|f| {
+                ast::binding(f, "Task") == Some("task-B")
+                    && ast::binding(f, "Task Readiness") == Some("blocked")
+            }))
+            .unwrap_or(false);
+        assert!(blocked,
+            "task-971: derivation must fire — Task B must have Task Readiness 'blocked' \
+             after asserting Task A blocks Task B; readiness_cell={:?}", readiness_cell);
+        // Sanity: Task A is the blocker, not the blocked.
+        let a_blocked = readiness_cell.as_seq()
+            .map(|facts| facts.iter().any(|f| {
+                ast::binding(f, "Task") == Some("task-A")
+                    && ast::binding(f, "Task Readiness") == Some("blocked")
+            }))
+            .unwrap_or(false);
+        assert!(!a_blocked,
+            "task-971: Task A (the blocker) must NOT be tagged 'blocked'; \
+             readiness_cell={:?}", readiness_cell);
+    }
+
+    /// task-971 acceptance (c): assert Task A blocks Task A →
+    /// REJECTED by the irreflexive constraint; D' = D (nothing committed).
+    #[test]
+    fn assert_fact_ring_irreflexive_violation_is_rejected() {
+        let (def_obj, state) = setup_ring_defs();
+
+        let cmd = Command::AssertFact {
+            fact_type: "Task_blocks_Task".to_string(),
+            pairs: vec![
+                RolePair { role: "Task".to_string(), value: "task-X".to_string() },
+                RolePair { role: "Task".to_string(), value: "task-X".to_string() },
+            ],
+            sender: None,
+            signature: None,
+        };
+
+        let result = apply_command_defs(&def_obj, &cmd, &state);
+        assert!(result.rejected,
+            "task-971: assertFact Task X blocks Task X must be REJECTED by \
+             the irreflexive constraint; violations={:?}", result.violations);
+        assert!(result.violations.iter().any(|v| v.alethic),
+            "task-971: at least one alethic violation must be reported; \
+             got {:?}", result.violations);
+
+        // D' = D: nothing may be committed.
+        assert!(ast::cells_iter(&result.state).is_empty(),
+            "task-971: rejected assertFact must emit an empty delta (D'=D); \
+             got delta cells={:?}", ast::cells_iter(&result.state));
+
+        // The ring cell in the original state must be unchanged.
+        let merged = ast::merge_states(&state, &result.state);
+        let ring_cell = ast::fetch_cell_seq("Task_blocks_Task", &merged);
+        let self_ref = ring_cell.as_seq()
+            .map(|facts| facts.iter().any(|f| {
+                let pairs = match f.as_seq() { Some(p) => p, None => return false };
+                pairs.iter().all(|p| {
+                    p.as_seq()
+                        .and_then(|kv| kv.get(1)?.as_atom())
+                        == Some("task-X")
+                })
+            }))
+            .unwrap_or(false);
+        assert!(!self_ref,
+            "task-971: the self-referencing fact must NOT persist in the cell \
+             after the alethic rejection; ring_cell={:?}", ring_cell);
+    }
+
+    /// task-971: the JSON `{"type":"assertFact",...}` shape deserializes
+    /// into Command::AssertFact (schema smoke test).
+    #[test]
+    fn assert_fact_command_deserializes_from_json() {
+        let json = r#"{
+            "type": "assertFact",
+            "factType": "Task_blocks_Task",
+            "pairs": [
+                { "role": "Task", "value": "task-1" },
+                { "role": "Task", "value": "task-2" }
+            ]
+        }"#;
+        let cmd: Command = serde_json::from_str(json)
+            .expect("assertFact JSON must deserialize into Command::AssertFact");
+        match cmd {
+            Command::AssertFact { fact_type, pairs, .. } => {
+                assert_eq!(fact_type, "Task_blocks_Task");
+                assert_eq!(pairs.len(), 2);
+                assert_eq!(pairs[0].role, "Task");
+                assert_eq!(pairs[0].value, "task-1");
+                assert_eq!(pairs[1].role, "Task");
+                assert_eq!(pairs[1].value, "task-2");
+            }
+            other => panic!("expected AssertFact, got {:?}", other),
+        }
     }
 
 }

@@ -209,11 +209,16 @@ export function mutationModelingViolations(tool: MutationContextTool, payload: R
   }
   if (tool === 'apply') {
     const operation = String(payload.operation ?? '')
-    if ((operation === 'create' || operation === 'update') && suspiciousFieldNames(payload.fields).length) {
-      violations.push(`fields contain catch-all prose-memory names: ${suspiciousFieldNames(payload.fields).join(', ')}`)
-    }
-    if (operation === 'transition' && (!payload.id || !payload.event)) {
-      violations.push('transition requires id and event')
+    // task-971: assertFact path (fact_type + pairs) skips entity-op checks
+    const isRingAssert = typeof payload.fact_type === 'string' && payload.fact_type.trim().length > 0
+      && Array.isArray(payload.pairs) && (payload.pairs as unknown[]).length > 0
+    if (!isRingAssert) {
+      if ((operation === 'create' || operation === 'update') && suspiciousFieldNames(payload.fields).length) {
+        violations.push(`fields contain catch-all prose-memory names: ${suspiciousFieldNames(payload.fields).join(', ')}`)
+      }
+      if (operation === 'transition' && (!payload.id || !payload.event)) {
+        violations.push('transition requires id and event')
+      }
     }
   }
   if (tool === 'retract') {

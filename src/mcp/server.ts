@@ -1587,9 +1587,19 @@ server.registerTool(
       signature: z.string().optional().describe('HMAC-SHA256 signature'),
       fields_only_replace: z.boolean().optional().describe('Opt-out (#872) — when true, the MCP skips the merge-with-existing pre-fetch on update and sends ONLY the payload fields to the engine. Use this for the rare case the agent intentionally wants the old replace-only behavior; default (false) is safer (#868 belt-and-suspenders).'),
       force: z.boolean().optional().describe('Opt-out (#904) — when true, the MCP skips the SM-bypass guard on update and lets the call go through even if a payload field is the Status of an SM-governed noun. Use this for migration scripts or other legitimate direct-mutation cases (rare); default (false) refuses the call and points the agent at `apply transition` instead.'),
+      // task-971: same-noun ring fact assertion (e.g. "Task blocks Task").
+      // The entity-oriented paths use a MAP for fields (unique keys), so
+      // they CANNOT express a fact where the same role name appears twice
+      // (both blocker and blocked project to "Task"). Use fact_type +
+      // pairs for the ordered-tuple assertion path instead.
+      fact_type: z.string().optional().describe('task-971: Fact type cell name for a same-noun ring assertion (e.g. "Task_blocks_Task"). Use with `pairs` — not with `operation`/`noun`.'),
+      pairs: z.array(z.object({
+        role: z.string(),
+        value: z.string(),
+      })).optional().describe('task-971: Ordered role/value pairs for ring fact assertion. Repeated role names are allowed — required for same-noun ring facts (e.g. [{role:"Task",value:"A"},{role:"Task",value:"B"}] asserts Task A blocks Task B). Use with `fact_type`.'),
     },
   },
-  async ({ context_receipt, operation, noun, id, fields, event, ops, sender, signature, fields_only_replace, force }) => {
+  async ({ context_receipt, operation, noun, id, fields, event, ops, sender, signature, fields_only_replace, force, fact_type, pairs }) => {
     // ── task-930: bulk / collection-shaped apply ──────────────────────
     // When `ops` is supplied, build ONE batch command and route it
     // through the engine's `apply` verb (platform_apply_command), which
@@ -1606,10 +1616,31 @@ server.registerTool(
       const result = await dispatchCommand(batch)
       return textResult(result)
     }
+
+    // task-971: same-noun ring fact assertion via fact_type + pairs.
+    // This is the only path that can express <<Task,A>,<Task,B>> because
+    // the entity-oriented paths use a MAP (unique keys).
+    if (fact_type && Array.isArray(pairs) && pairs.length > 0) {
+      const blockedRing = mutationGateResult('apply', context_receipt, { operation: 'assertFact', fact_type, pairs })
+      if (blockedRing) return blockedRing
+      if (AREST_MODE === 'local') {
+        const escapeAtom = (s: string) => s.replace(/[\\<>,]/g, ch => '\\' + ch)
+        const input = `<${pairs.map(({ role, value }) => `<${escapeAtom(role)}, ${escapeAtom(value)}>`).join(', ')}>`
+        const raw = await systemCall(`assert:${fact_type}`, input)
+        const ok = raw === 'ok'
+        return textResult(ok ? { status: 'ok', fact_type, pairs } : { error: raw, fact_type })
+      }
+      // Remote mode: dispatch via HTTP using the assertFact Command shape.
+      const command = { type: 'assertFact', factType: fact_type, pairs, sender, signature }
+      const data = await httpRequest('/arest/default/apply', { method: 'POST', body: JSON.stringify(command) })
+      return textResult(data)
+    }
+
     if (!operation || !noun) {
       return textResult(
-        'apply requires either a single op (operation + noun) or a collection (ops: [...]). ' +
-        'See the tool description for the bulk / collection shape (task-930).',
+        'apply requires either a single op (operation + noun), a collection (ops: [...]), ' +
+        'or a ring fact assertion (fact_type + pairs). ' +
+        'See the tool description for the bulk / collection shape (task-930) or task-971 ring assertion.',
       )
     }
     const blocked = mutationGateResult('apply', context_receipt, { operation, noun, id, fields, event })
