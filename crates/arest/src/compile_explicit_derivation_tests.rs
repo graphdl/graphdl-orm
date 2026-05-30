@@ -3766,6 +3766,261 @@ ViewElement 'e2' renders Fact Type 'ft2'.
          Got pairs: {:?}", widget_pairs);
 }
 
+// ─── task-970 — lazy existential / Skolem derivation head ────────────────
+//
+// The view-projection menu rule (design §4.5) has a head whose CONSEQUENT
+// introduces a FRESH entity not in the antecedent — one `ViewElement` per
+// matching `(View, Transition)` binding. This is a tuple-generating
+// dependency (TGD) with an existential head variable; AREST satisfies it
+// with the SKOLEM (semi-oblivious) chase: the fresh entity's id is a
+// DETERMINISTIC fnv hash of the frontier binding, so re-derivation is
+// IDEMPOTENT (same binding → same id → no duplicate across passes).
+//
+// This test proves the RESOLVE-TIME mechanism end-to-end, lazily, through
+// the SAME `view:` / `resolve_view` path 934-1 established — independent of
+// the parser surface syntax (deferred; see the `#[ignore]`d spec test
+// below and `readings/ui/skolem-head-design.md` §5). It builds the exact
+// view-func subtree the compiler's 1-antecedent fanout must emit for a
+// skolem head:
+//
+//   ApplyToAll( [ const(cons_id), const(reading), bindings ] )
+//     ∘ extract_facts_from_pop(ant_ft)
+//
+// where `bindings` appends the synthesized head-entity pair
+//   <ViewElement, Platform("skolem"):[ View-value, Transition-value ]>
+// to the inherited antecedent bindings. The antecedent FT `MenuBinding`
+// models the post-join frontier (one fact per (View, Transition) the menu
+// projection would yield) so the test isolates the HEAD value-invention
+// from the join (which 934-1 already covers).
+//
+// Asserts: (a) one fresh ViewElement per binding; (b) deterministic
+// `ve_<fnv>` ids; (c) distinct bindings → distinct ids; (d) IDEMPOTENT
+// across two `resolve_view` passes (byte-identical id set); (e) the head
+// also carries the literal `Component Role 'button'` (design §4.5).
+#[test]
+fn skolem_head_resolve_view_invents_one_idempotent_entity_per_binding() {
+    use crate::ast::{apply, encode_state, func_to_object, resolve_view, store};
+
+    // The consequent FT cell (what `View Element renders Transition` maps
+    // to) and the antecedent frontier FT.
+    let cons_cell = "ViewElement_renders_Transition";
+    let ant_ft = "MenuBinding";
+
+    // bindings_func (input = one antecedent fact in <<role,val>,…> shape):
+    //   inherit the antecedent bindings (Func::Id) and APPEND
+    //   <ViewElement, skolem(<View, Transition>)> + <Component Role, 'button'>.
+    // The skolem frontier reads View and Transition off the SAME antecedent
+    // fact under apply_to_all (role_value_by_name equivalent).
+    let role_value_by_name = |name: &str| -> Func {
+        Func::compose(
+            Func::compose(Func::Selector(2), Func::Selector(1)),
+            Func::filter(Func::compose(Func::Eq, Func::construction(vec![
+                Func::Selector(1),
+                Func::constant(Object::atom(name)),
+            ]))),
+        )
+    };
+    let skolem_id = Func::compose(
+        Func::Platform("skolem".to_string()),
+        Func::construction(vec![
+            role_value_by_name("View"),
+            role_value_by_name("Transition"),
+        ]),
+    );
+    let head_pairs = Func::construction(vec![
+        // fresh head entity (the existential variable, Skolem-invented)
+        Func::construction(vec![Func::constant(Object::atom("ViewElement")), skolem_id]),
+        // literal-pinned head role (design §4.5: ... has Component Role 'button')
+        Func::construction(vec![
+            Func::constant(Object::atom("Component Role")),
+            Func::constant(Object::atom("button")),
+        ]),
+        // carry the Transition through so the rendered transition is visible
+        Func::construction(vec![
+            Func::constant(Object::atom("Transition")),
+            role_value_by_name("Transition"),
+        ]),
+    ]);
+    // Concat([Id, head_pairs]) flattens inherited + appended pairs one level.
+    let bindings = Func::compose(
+        Func::Concat,
+        Func::construction(vec![Func::Id, head_pairs]),
+    );
+    let derive_one = Func::construction(vec![
+        Func::constant(Object::atom(cons_cell)),
+        Func::constant(Object::atom("ViewElement renders Transition")),
+        bindings,
+    ]);
+    // The 1-antecedent fanout shape (compile.rs ~5193): one derived envelope
+    // per antecedent fact.
+    let extract = Func::compose(
+        Func::FetchOrPhi,
+        Func::construction(vec![Func::constant(Object::atom(ant_ft)), Func::Id]),
+    );
+    let view_func = Func::compose(Func::apply_to_all(derive_one), extract);
+
+    // Register it under `view:{cell}` exactly as compile.rs's view_by_cell
+    // fold does — the LAZY path (no `derivation:` def, never eager-chained).
+    let defs = store(&format!("view:{}", cons_cell), func_to_object(&view_func), &Object::phi());
+
+    // Population: two menu bindings (the frontier the join would produce).
+    let pop = {
+        let mut s = Object::phi();
+        s = ast::cell_push(ant_ft, ast::fact_from_pairs(&[
+            ("View", "Order Menu"), ("Transition", "approve"),
+        ]), &s);
+        s = ast::cell_push(ant_ft, ast::fact_from_pairs(&[
+            ("View", "Order Menu"), ("Transition", "reject"),
+        ]), &s);
+        s
+    };
+
+    // ── Pass 1 ──
+    let pass1 = resolve_view(cons_cell, &pop, &defs)
+        .expect("view: def must resolve via resolve_view");
+    let elems1: Vec<(String, String, String)> = pass1.as_seq().map(|items| items.iter()
+        .filter_map(|f| Some((
+            ast::binding(f, "ViewElement").map(String::from)?,
+            ast::binding(f, "Transition").map(String::from)?,
+            ast::binding(f, "Component Role").map(String::from)?,
+        ))).collect()).unwrap_or_default();
+
+    // (a) one fresh ViewElement per binding.
+    assert_eq!(elems1.len(), 2,
+        "skolem head must invent exactly one ViewElement per (View,Transition) \
+         binding; got {:#?}\nraw: {:?}", elems1, pass1);
+    // (b) deterministic `ve_<fnv>` ids, (e) literal Component Role 'button',
+    //     transition carried through.
+    for (id, tr, role) in &elems1 {
+        assert!(id.starts_with("ve_") && id.len() == "ve_".len() + 16,
+            "head entity id must be a Skolem `ve_<16 hex>`; got {:?}", id);
+        assert_eq!(role, "button",
+            "head must pin Component Role 'button' (design §4.5); got {:?}", role);
+        assert!(tr == "approve" || tr == "reject",
+            "head must render its frontier Transition; got {:?}", tr);
+    }
+    // (c) distinct bindings → distinct ids.
+    let id_approve = elems1.iter().find(|(_, tr, _)| tr == "approve").map(|(id, ..)| id.clone());
+    let id_reject  = elems1.iter().find(|(_, tr, _)| tr == "reject").map(|(id, ..)| id.clone());
+    assert!(id_approve.is_some() && id_reject.is_some(),
+        "both transitions must produce a head element; got {:#?}", elems1);
+    assert_ne!(id_approve, id_reject,
+        "distinct (View,Transition) frontiers must invent distinct ViewElement \
+         ids (no Skolem collision); both = {:?}", id_approve);
+
+    // ── Pass 2 — IDEMPOTENCE (the Skolem-chase correctness crux) ──
+    let pass2 = resolve_view(cons_cell, &pop, &defs)
+        .expect("view: def must resolve on the second pass too");
+    let mut ids1: Vec<String> = elems1.iter().map(|(id, ..)| id.clone()).collect();
+    let mut ids2: Vec<String> = pass2.as_seq().map(|items| items.iter()
+        .filter_map(|f| ast::binding(f, "ViewElement").map(String::from))
+        .collect()).unwrap_or_default();
+    ids1.sort();
+    ids2.sort();
+    assert_eq!(ids1, ids2,
+        "re-deriving the same population MUST reproduce the SAME ViewElement \
+         id set (idempotent Skolem chase — same frontier → same id → no \
+         duplicate). pass1 ids: {:?}; pass2 ids: {:?}", ids1, ids2);
+
+    // Sanity: the registered def is a `view:` def, NOT a `derivation:` def —
+    // it never enters the eager forward chain that hangs the metamodel.
+    assert!(matches!(ast::fetch_raw(&format!("derivation:{}", cons_cell), &defs),
+        Object::Bottom),
+        "skolem head must resolve lazily as a view, never as an eager \
+         derivation: def (the task-934 metamodel-hang guard)");
+
+    // Belt-and-suspenders: the encoded-pop path resolve_view takes when fed
+    // an already-encoded population is the same — exercise it so the lazy
+    // read-side contract is pinned both ways.
+    let encoded = encode_state(&pop);
+    let via_encoded = apply(&view_func, &encoded, &defs);
+    assert!(via_encoded.as_seq().map(|s| s.len()).unwrap_or(0) == 2,
+        "view func over an encoded pop must also yield 2 envelopes; got {:?}",
+        via_encoded);
+}
+
+// task-970 — SPEC (ignored until the parser + compiler wiring lands).
+//
+// Pins the TARGET the FORML 2 surface syntax + `compile_explicit_derivation`
+// emission must hit: a `*`-marked existential head rule, authored in prose,
+// that compiles to a `view:` def and resolves (lazily, idempotently) to one
+// fresh ViewElement per binding — WITHOUT the test hand-building the func.
+//
+// Remaining work to un-ignore (see skolem-head-design.md §4-5):
+//   1. parse_forml2.rs `resolve_derivation_rule` (~1490): detect a head
+//      role variable (`ViewElement (E)`) bound by NEITHER an antecedent
+//      role NOR an `X is Y` rename → record `SkolemHeadRole{role, frontier}`.
+//   2. types.rs: add `skolem_head_roles: Vec<SkolemHeadRole>` to
+//      DerivationRuleDef (+ canonical-JSON writer field 19) and the
+//      SkolemHeadRole struct.
+//   3. compile.rs `compile_explicit_derivation` 1-antecedent `bindings_func`
+//      (~5059 / ~5153): for each SkolemHeadRole, append
+//      `<role, Platform("skolem"):[frontier role_value_by_name…]>`; exclude
+//      the skolem role from `required_keys` (~5230).
+//
+// The mechanism this test would exercise is ALREADY PROVEN green by
+// `skolem_head_resolve_view_invents_one_idempotent_entity_per_binding`
+// (the `view:` func + skolem primitive + idempotent resolve_view); only the
+// prose→rule→func authoring path is outstanding.
+#[test]
+#[ignore = "task-970: needs FORML 2 fresh-head-variable parsing + \
+            compile_explicit_derivation skolem emission (see \
+            readings/ui/skolem-head-design.md §4-5)"]
+fn spec_skolem_head_authored_in_forml2_resolves_lazily() {
+    // TARGET surface form (design §4.5, single-consequent-FT slice):
+    //   ViewElement (E) renders Transition (Tr)
+    //     iff MenuBinding has View (Vw) and MenuBinding has Transition (Tr).
+    // with `ViewElement renders Transition. *` marking the head fully-derived.
+    let src = r#"# task-970 skolem head spec
+ViewElement(.id) is an entity type.
+View(.Name) is an entity type.
+Transition(.id) is an entity type.
+MenuBinding(.id) is an entity type.
+
+## Fact Types
+MenuBinding has View.
+MenuBinding has Transition.
+ViewElement renders Transition. *
+
+## Derivation Rules
+* ViewElement (E) renders Transition (Tr) iff MenuBinding has View and MenuBinding has Transition (Tr).
+
+## Instance Facts
+MenuBinding 'mb1' has View 'Order Menu'.
+MenuBinding 'mb1' has Transition 'approve'.
+MenuBinding 'mb2' has View 'Order Menu'.
+MenuBinding 'mb2' has Transition 'reject'.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let data = compile::cell_index_from_state(&state);
+
+    // The head rule must be View-materialized (lazy) and carry a skolem
+    // head role for the fresh `ViewElement`.
+    let rule = data.derivation_rules.iter()
+        .find(|r| r.text.contains("renders Transition"))
+        .expect("skolem head rule must parse");
+    assert!(matches!(rule.materialization, crate::types::MaterializationPolicy::View),
+        "skolem head must be View-materialized (lazy); got {:?}", rule.materialization);
+
+    // Resolve lazily and assert one idempotent fresh ViewElement per binding.
+    let defs = compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+    let view_def = ast::fetch_raw("view:ViewElement_renders_Transition", &d);
+    assert!(!matches!(view_def, ast::Object::Bottom),
+        "skolem head must emit a view: def");
+
+    let fetch_input = Object::seq(vec![
+        Object::atom("ViewElement_renders_Transition"), d.clone(),
+    ]);
+    let r1 = ast::apply(&ast::Func::Fetch, &fetch_input, &d);
+    let ids: Vec<String> = r1.as_seq().map(|items| items.iter()
+        .filter_map(|f| ast::binding(f, "ViewElement").map(String::from))
+        .collect()).unwrap_or_default();
+    assert_eq!(ids.len(), 2, "one fresh ViewElement per binding; got {:?}", r1);
+    assert!(ids.iter().all(|id| id.starts_with("ve_")),
+        "fresh entity ids must be Skolem `ve_<fnv>`; got {:?}", ids);
+}
+
 // ─── Category 6b: Count over a complex `where`-body (ring + literal) ──
 //
 // Repro for the count-aggregate parsing gap. Shape:

@@ -2797,6 +2797,13 @@ fn apply_platform(name: &str, x: &Object, d: &Object) -> Object {
         "compose_rel" => platform_compose_rel(x),
         "tc" => platform_tc(x),
         "tc_cycles" => platform_tc_cycles(x),
+        // task-970: deterministic Skolem value-invention for existential
+        // (TGD) derivation heads. Input is a frontier tuple (a seq of atom
+        // values); output is a stable `ve_<fnv1a64>` id. Same FNV-1a-64 the
+        // forward-chain dedup uses, so re-derivation is idempotent
+        // (same frontier → same id → no duplicate entity). See
+        // `platform_skolem` and `readings/ui/skolem-head-design.md`.
+        "skolem" => platform_skolem(x),
         // H4 (#692): RMAP (Halpin Ch. 10 relational mapping) was the
         // last production Func::Native leaf. Routing through Platform
         // makes it introspectable and lets each runtime (server, FPGA,
@@ -5507,6 +5514,60 @@ pub fn synthesize_fact_id(ft_id: &str, fact: &Object) -> String {
     alloc::format!("{}#{:016x}", ft_id, h)
 }
 
+/// task-970: deterministic Skolem id for an existential derivation head.
+///
+/// The value-invention leaf for a TGD head (`Func::Platform("skolem")`).
+/// `x` is the FRONTIER tuple — a sequence whose elements are the
+/// antecedent-bound role values that distinguish one head instance from
+/// another (e.g. `<View.Name, Transition.id>` for the §4.5 menu rule).
+/// Returns `Atom("ve_" ++ fnv1a64_hex(seed))` where `seed` is the
+/// frontier values joined with `|`.
+///
+/// Why this is the correctness crux of the Skolem (semi-oblivious) chase:
+/// the id is a PURE FUNCTION of the frontier — no clock, counter, or RNG
+/// — so re-deriving the same head over the same population reproduces the
+/// SAME id, and the lazy `resolve_view` recomputation stays idempotent
+/// (same frontier → same id → no duplicate entity across passes). The
+/// hash is the same FNV-1a-64 `fact_key`/`synthesize_fact_id` use, so a
+/// Skolem id is stable across runs and code paths.
+///
+/// Shape contract (total — Bottom, never panic): `x` must be a sequence;
+/// each element is coerced to its atom form (a non-atom element renders
+/// via `Object::to_string`, so nested values still contribute
+/// deterministically). A non-sequence `x` → Bottom.
+///
+/// The `ve_` prefix and `|` separator are fixed in this minimal version;
+/// a future generalisation parameterises them so the one primitive serves
+/// any existential head (`<prefix, frontier…>` input shape).
+#[cfg(not(feature = "no_std"))]
+fn platform_skolem(x: &Object) -> Object {
+    let items = match x.as_seq() {
+        Some(items) => items,
+        None => return Object::Bottom,
+    };
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME:  u64 = 0x100000001b3;
+    let mut h: u64 = FNV_OFFSET;
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            h ^= b'|' as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+        // Prefer the bare atom; fall back to Display for non-atoms so the
+        // seed is still deterministic (Object's Display is stable).
+        let owned;
+        let s: &str = match item.as_atom() {
+            Some(a) => a,
+            None => { owned = alloc::format!("{}", item); &owned }
+        };
+        for b in s.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+    }
+    Object::Atom(alloc::format!("ve_{:016x}", h))
+}
+
 /// ρ-projection of the population, hiding facts migrated away by an
 /// active Migration (paper §5, #350).
 ///
@@ -7830,6 +7891,57 @@ mod tests {
         let result = apply(&Func::Def("e3_test_no_body".to_string()), &Object::atom("hi"), &d);
         assert_eq!(result, Object::Bottom,
             "name marked in DEFS but with no installed body must return ⊥");
+    }
+
+    // ── task-970: Skolem value-invention primitive ─────────────────────
+    //
+    // The deterministic head-id leaf for existential (TGD) derivation
+    // heads. The Skolem (semi-oblivious) chase needs the id to be a pure
+    // function of the frontier so re-derivation is idempotent. These tests
+    // pin the three load-bearing properties — determinism, frontier-keying,
+    // and total Bottom-on-bad-shape — independent of the parser/compiler.
+
+    #[test]
+    fn platform_skolem_is_deterministic_and_frontier_keyed() {
+        let f = Func::Platform("skolem".to_string());
+        let d = Object::phi();
+        let frontier_a = Object::seq(vec![Object::atom("Menu View"), Object::atom("approve")]);
+        let frontier_b = Object::seq(vec![Object::atom("Menu View"), Object::atom("reject")]);
+
+        let id_a1 = apply(&f, &frontier_a, &d);
+        let id_a2 = apply(&f, &frontier_a, &d);
+        let id_b = apply(&f, &frontier_b, &d);
+
+        // Determinism: same frontier → byte-identical id (idempotence crux).
+        assert_eq!(id_a1, id_a2,
+            "skolem id must be deterministic for the same frontier; got {:?} vs {:?}",
+            id_a1, id_a2);
+        // Shape: `ve_` prefix + 16 hex chars.
+        let s = id_a1.as_atom().expect("skolem id must be an atom");
+        assert!(s.starts_with("ve_") && s.len() == "ve_".len() + 16,
+            "skolem id must be `ve_<16 hex>`; got {:?}", s);
+        // Frontier-keying: a different frontier → a different id (no
+        // collision across the distinct (View,Transition) pairs a menu
+        // projection produces).
+        assert_ne!(id_a1, id_b,
+            "distinct frontiers must yield distinct skolem ids; both = {:?}", id_a1);
+    }
+
+    #[test]
+    fn platform_skolem_order_sensitive_and_total() {
+        let f = Func::Platform("skolem".to_string());
+        let d = Object::phi();
+        // Order matters: <a,b> and <b,a> are distinct frontier tuples.
+        let ab = apply(&f, &Object::seq(vec![Object::atom("a"), Object::atom("b")]), &d);
+        let ba = apply(&f, &Object::seq(vec![Object::atom("b"), Object::atom("a")]), &d);
+        assert_ne!(ab, ba, "skolem must be order-sensitive over the frontier tuple");
+        // The `|` separator prevents the <\"ab\"> vs <\"a\",\"b\"> ambiguity.
+        let joined = apply(&f, &Object::seq(vec![Object::atom("ab")]), &d);
+        assert_ne!(ab, joined,
+            "separator must disambiguate <a,b> from <ab>");
+        // Total: a non-sequence operand → Bottom (never panic).
+        let bad = apply(&f, &Object::atom("not-a-seq"), &d);
+        assert_eq!(bad, Object::Bottom, "non-seq frontier must yield Bottom");
     }
 
     #[test]
