@@ -334,8 +334,6 @@ impl Default for ReloadPolicy {
 /// `reload_reading` doc comment for the rationale.)
 /// `LoadFailed` — the load step rejected; `new_state` rolls back to the
 /// pre-reload snapshot, fulfilling the atomicity contract.
-/// `NotImplemented` — reserved; no current code path emits this variant
-/// (`MigrateFacts` is fully implemented — task-806).
 ///
 /// `PartialEq` is intentionally NOT derived because `LoadError`
 /// itself does not implement Eq under std builds (the
@@ -351,7 +349,6 @@ pub enum ReloadError {
     /// is no longer cfg-gated since the underlying parse + check
     /// modules became no_std-reachable.
     LoadFailed(LoadError),
-    NotImplemented,
 }
 
 /// Outcome of a successful reload: structured reports for both
