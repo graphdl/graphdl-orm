@@ -839,4 +839,205 @@ Base 'b1' has Tag 'hot'.\n";
         let env = sql_query(&state, "SELECT * FROM ft_FactType");
         assert!(parse_error(&env).to_lowercase().contains("no such table"));
     }
+
+    // ── Decisive crate-round-trip experiment ───────────────────────
+    //
+    // Isolates "crate round-trip bug" from "MCP-server routing bug" for
+    // the confirmed divergence: a newly-created Task's keyed Map-cell
+    // fields (Task_has_Task_Subject / _Priority / _Description, written
+    // by apply-create via `cell_put_keyed`) DO NOT surface in `sql`,
+    // while the Status cell (a folded Map cell) DOES, and `get`/`query`
+    // see all of them.
+    //
+    // The MCP `sql` verb runs `sql::sql_query(d, raw)` where `d` came
+    // from `db::load_state(conn)` over the app's sqlite — i.e. the cells
+    // were last written by `db::persist_state` as `contents.to_string()`
+    // and re-read as `Object::parse(contents)`. This test reproduces
+    // THAT EXACT round-trip entirely in-process:
+    //
+    //   apply-create keyed write (cell_put_keyed, same call
+    //     push_with_uc_check makes for a keyed FT cell)
+    //     → persist (Display/`to_string`) → SQLite cells table
+    //     → load (`Object::parse`)
+    //     → sql_query(&reloaded, ...)
+    //
+    // `db` is a private module in cli/entry.rs, so the persist/load is
+    // reproduced here byte-for-byte: persist = `INSERT OR REPLACE INTO
+    // cells(name, contents) VALUES (name, contents.to_string())` for
+    // every non-`:` cell (entry.rs:125-134); load = `Object::parse`
+    // per row (entry.rs:160-185). No def round-trip — `sql_query` reads
+    // no def, and the population cells are what matter.
+    //
+    // If this assert FAILS  → the bug is in the crate round-trip; trace
+    //                         where the new entry is dropped (printed
+    //                         below at each stage).
+    // If this assert PASSES → the crate round-trip is sound and the
+    //                         divergence is MCP-server routing (apply
+    //                         mutates a live in-process tenant; sql
+    //                         reads a disk snapshot that only syncs on
+    //                         persist) — see the report.
+
+    /// Faithful reproduction of `cli/entry.rs::db::persist_state` +
+    /// `load_state` for the POPULATION cells (the ones `sql` reads).
+    /// Persist serializes each cell via `Display` (`to_string`); load
+    /// re-parses via `Object::parse`. Mirrors the exact `INSERT OR
+    /// REPLACE` / `SELECT name, contents FROM cells` the MCP path runs.
+    fn persist_then_load(state: &Object) -> Object {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cells (name TEXT PRIMARY KEY, contents TEXT);",
+        ).expect("create cells table");
+        // persist_state: population cells only (skip `:`-namespaced defs
+        // and the handful of reserved def names). entry.rs:125-134.
+        for (name, contents) in ast::cells_iter(state) {
+            if name.contains(':')
+                || ["validate", "compile", "apply", "verify_signature",
+                    "debug", "_defs_compiled"].contains(&name)
+            {
+                continue;
+            }
+            conn.execute(
+                "INSERT OR REPLACE INTO cells (name, contents) VALUES (?1, ?2)",
+                rusqlite::params![name, contents.to_string()],
+            ).expect("insert cell");
+        }
+        // load_state: re-parse each row. entry.rs:160-185. Uses the same
+        // hashbrown::HashMap the real load_state builds (entry.rs:161).
+        // Make the SERIALIZED on-disk form of the keyed Map cell visible —
+        // this is the exact `contents` byte string the MCP `sql` path
+        // re-parses via Object::parse on load.
+        if let Ok(serialized) = conn.query_row(
+            "SELECT contents FROM cells WHERE name='Task_has_Task_Subject'",
+            [],
+            |r| r.get::<_, String>(0),
+        ) {
+            eprintln!("[cells-table] Task_has_Task_Subject contents = {}", serialized);
+        }
+        let mut map: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        let mut stmt = conn.prepare("SELECT name, contents FROM cells").expect("prepare");
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        }).expect("query_map");
+        for r in rows.filter_map(|r| r.ok()) {
+            map.insert(r.0, Object::parse(&r.1));
+        }
+        Object::map(map)
+    }
+
+    fn count_for(state: &Object, table: &str, where_clause: &str) -> i64 {
+        let env = sql_query(state, &format!(
+            "SELECT COUNT(*) AS n FROM {} WHERE {}", table, where_clause));
+        let rows = parse_rows(&env);
+        rows.first().and_then(|r| r.get("n")).and_then(|v| v.as_i64())
+            .unwrap_or_else(|| panic!("expected n in {}: {}", table, env))
+    }
+
+    #[test]
+    fn apply_create_keyed_map_cell_survives_persist_load_into_sql() {
+        // 1. Seed a small state with the Task FT cells + Role metadata,
+        //    plus a couple of pre-existing rows (so the cells start as
+        //    populated keyed Map cells — exactly the apps/tasks shape).
+        let mut state = Object::phi();
+        for ft in ["Task_has_Task_Subject", "Task_has_Task_Priority",
+                   "Task_has_Task_Description", "Task_has_Task_Status"] {
+            state = cell_push("FactType", fact_from_pairs(&[("id", ft)]), &state);
+        }
+        for (ft, vrole) in [
+            ("Task_has_Task_Subject", "Task Subject"),
+            ("Task_has_Task_Priority", "Task Priority"),
+            ("Task_has_Task_Description", "Task Description"),
+            ("Task_has_Task_Status", "Task Status"),
+        ] {
+            state = cell_push("Role", fact_from_pairs(&[
+                ("factType", ft), ("nounName", "Task"), ("position", "0")]), &state);
+            state = cell_push("Role", fact_from_pairs(&[
+                ("factType", ft), ("nounName", vrole), ("position", "1")]), &state);
+        }
+        // Pre-existing rows: keyed by "Task" (the reference role), the
+        // same key apply-create uses. Written via cell_put_keyed so the
+        // cells are already Map-shaped before the new create — matching
+        // a live tasks.db.
+        for (task, subj, prio, desc) in [
+            ("task-001", "first subject", "p0", "first description"),
+            ("task-002", "second subject", "p1", "second description"),
+        ] {
+            state = cell_put_keyed("Task_has_Task_Subject", &["Task"],
+                fact_from_pairs(&[("Task", task), ("Task Subject", subj)]), &state).unwrap();
+            state = cell_put_keyed("Task_has_Task_Priority", &["Task"],
+                fact_from_pairs(&[("Task", task), ("Task Priority", prio)]), &state).unwrap();
+            state = cell_put_keyed("Task_has_Task_Description", &["Task"],
+                fact_from_pairs(&[("Task", task), ("Task Description", desc)]), &state).unwrap();
+            // Status is the FOLDED (full-tuple keyed) Map cell — the path
+            // push_with_uc_check takes for a cell with NO key_roles. This
+            // is the cell the bug report says DOES surface in sql.
+            state = ast::cell_put_folded("Task_has_Task_Status",
+                fact_from_pairs(&[("Task", task), ("Task Status", "pending")]), &state);
+        }
+
+        // 2. apply-create of a NEW Task via the SAME keyed write the
+        //    apply pipeline performs (push_with_uc_check → cell_put_keyed
+        //    for a keyed FT cell; the new key "task-NEW" does not collide,
+        //    so this is the exact Ok(next) branch). Subject + Priority +
+        //    Description, plus the folded Status the create initializes.
+        const NEW: &str = "task-NEW";
+        state = cell_put_keyed("Task_has_Task_Subject", &["Task"],
+            fact_from_pairs(&[("Task", NEW), ("Task Subject", "brand new subject")]), &state).unwrap();
+        state = cell_put_keyed("Task_has_Task_Priority", &["Task"],
+            fact_from_pairs(&[("Task", NEW), ("Task Priority", "p0")]), &state).unwrap();
+        state = cell_put_keyed("Task_has_Task_Description", &["Task"],
+            fact_from_pairs(&[("Task", NEW), ("Task Description", "brand new description")]), &state).unwrap();
+        state = ast::cell_put_folded("Task_has_Task_Status",
+            fact_from_pairs(&[("Task", NEW), ("Task Status", "pending")]), &state);
+
+        // Stage A — the new entry IS in the in-memory cell post-create.
+        let subj_cell = ast::fetch_or_phi("Task_has_Task_Subject", &state);
+        eprintln!("[stageA] Task_has_Task_Subject cell = {}", subj_cell);
+        assert!(matches!(subj_cell, Object::Map(_)),
+            "keyed cell must be Map-shaped after apply-create");
+        assert_eq!(ast::cell_fact_count(&subj_cell), 3,
+            "in-memory Subject cell must hold 3 rows (2 seeded + new)");
+
+        // 3. persist (Display) → SQLite → load (Object::parse).
+        let reloaded = persist_then_load(&state);
+
+        // Stage B — the new entry survives the persist/load round-trip
+        // in the reloaded cell (Display ↔ parse), before SQL touches it.
+        let subj_reloaded = ast::fetch_or_phi("Task_has_Task_Subject", &reloaded);
+        eprintln!("[stageB] reloaded Task_has_Task_Subject cell = {}", subj_reloaded);
+        eprintln!("[stageB] reloaded cell shape is_map={} fact_count={}",
+            matches!(subj_reloaded, Object::Map(_)), ast::cell_fact_count(&subj_reloaded));
+
+        // 4. sql_query over the RELOADED state — the exact MCP `sql` path.
+        let subj_env = sql_query(&reloaded,
+            &format!(r#"SELECT "Task_Subject" AS s FROM ft_Task_has_Task_Subject WHERE "Task" = '{}'"#, NEW));
+        eprintln!("[stageC] sql Subject envelope = {}", subj_env);
+
+        // Cross-check the Status cell the report says DOES surface.
+        let status_new = count_for(&reloaded, "ft_Task_has_Task_Status",
+            &format!(r#""Task" = '{}'"#, NEW));
+        eprintln!("[stageC] sql Status rows for new = {}", status_new);
+
+        // Assertions: the new keyed-cell fields MUST surface in sql.
+        let subj_rows = parse_rows(&subj_env);
+        assert_eq!(subj_rows.len(), 1,
+            "NEW task Subject must surface in sql after persist+load; envelope: {}", subj_env);
+        assert_eq!(subj_rows[0].get("s").and_then(|v| v.as_str()), Some("brand new subject"),
+            "NEW task Subject value must round-trip; envelope: {}", subj_env);
+
+        assert_eq!(count_for(&reloaded, "ft_Task_has_Task_Subject", &format!(r#""Task" = '{}'"#, NEW)), 1,
+            "ft_Task_has_Task_Subject must have the new row");
+        assert_eq!(count_for(&reloaded, "ft_Task_has_Task_Priority", &format!(r#""Task" = '{}'"#, NEW)), 1,
+            "ft_Task_has_Task_Priority must have the new row");
+        assert_eq!(count_for(&reloaded, "ft_Task_has_Task_Description", &format!(r#""Task" = '{}'"#, NEW)), 1,
+            "ft_Task_has_Task_Description must have the new row");
+        assert_eq!(status_new, 1,
+            "ft_Task_has_Task_Status must have the new row (control: report says this one works)");
+
+        // And the full counts (2 seeded + 1 new) all surface.
+        for ft in ["ft_Task_has_Task_Subject", "ft_Task_has_Task_Priority",
+                   "ft_Task_has_Task_Description", "ft_Task_has_Task_Status"] {
+            let total = count_for(&reloaded, ft, "1=1");
+            assert_eq!(total, 3, "{} must materialize all 3 rows post round-trip", ft);
+        }
+    }
 }
