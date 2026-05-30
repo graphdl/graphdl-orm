@@ -2609,11 +2609,15 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         // task-951(c): UNARY fact types are emitted alongside binaries as
         // NORMA implicit-boolean — each unary becomes a binary Fact with the
         // original noun role + a synthesized ValueType marked
-        // IsImplicitBooleanValue="true" (Boolean ConceptualDataType, restricted
-        // to True only). NORMA debinarizes on load. Spec confirmed against
-        // XML/GenerationSamples/SampleModel.orm (e.g. "Person isDead"). Collect
-        // the unaries now and pre-populate `played` with the noun-role so the
-        // entity emission below includes the unary connection in PlayedRoles.
+        // IsImplicitBooleanValue="true" (TrueOrFalse ConceptualDataType,
+        // restricted to True only). NORMA debinarizes on load. Shape confirmed
+        // against two agreeing samples: XML/GenerationSamples/SampleModel.orm
+        // ("Person isDead") and TestSuites/RelationalTests/FullRegeneration/
+        // Tests.Test1.Load.orm ("UserIsActive"). The full per-element emission
+        // (incl. the model-local Boolean datatype declaration + one-role reading
+        // sequence) is below. Collect the unaries now and pre-populate `played`
+        // with the noun-role so the entity emission below includes the unary
+        // connection in PlayedRoles.
         let mut unary_fts: Vec<(&String, &FactTypeDef)> = c_fact_types.iter()
             .filter(|(id, d)| d.roles.len() == 1
                 && !ref_fact_ids.contains(id.as_str())
@@ -2921,11 +2925,26 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                 guid(&format!("fact:{}", ft)), fr, guid(&format!("rdgord:{}", ft)), guid(&format!("rdg:{}", ft)), xesc(&reading), expanded, rs, ic));
         }
         // task-951(c): emit the unary FTs collected above as NORMA
-        // implicit-boolean binaries. NORMA's stable Boolean ConceptualDataType
-        // GUID matches the sample (XML/GenerationSamples/SampleModel.orm); each
-        // synthesized VT is restricted to True only so the unary's "asserted"
-        // semantics survive the debinarize.
-        let bool_dt_ref = "_D4949F6A-FBB7-494A-BBBF-07646C6A1FC4";
+        // implicit-boolean binaries. Each unary becomes a binary Fact: the
+        // original noun role + a synthesized `IsImplicitBooleanValue="true"`
+        // ValueType (restricted to True only) whose ConceptualDataType is the
+        // model-local TrueOrFalseLogicalDataType. NORMA debinarizes back to a
+        // unary on load. Shape matched against two NORMA samples that agree:
+        //   - TestSuites/.../FullRegeneration/Tests.Test1.Load.orm  (UserIsActive)
+        //   - XML/GenerationSamples/SampleModel.orm                 (Person isDead)
+        // Two load-critical details from those samples:
+        //   1. The Boolean datatype is NOT a fixed GUID — each model declares its
+        //      own `<orm:TrueOrFalseLogicalDataType id="…"/>` in <orm:DataTypes>
+        //      and the implicit-boolean ConceptualDataTypes ref THAT id. Emitting
+        //      the ref without the declaration leaves a dangling xs:IDREF, which
+        //      fails ORM2Core.xsd validation and NORMA load. So we mint a
+        //      deterministic id here and emit the matching declaration below
+        //      (only when there is at least one unary).
+        //   2. The reading's RoleSequence lists ONLY the noun role (the unary
+        //      reading `{0} <predicate>` references role 0 alone); the implicit-
+        //      boolean role is left un-read. That asymmetry is the debinarize
+        //      signal — including the boolean role would make it a real binary.
+        let bool_dt_ref = guid("dt:bool");
         for (uidx, &(ft, def)) in unary_fts.iter().enumerate() {
             let role = match def.roles.first() { Some(r) => r, None => continue };
             let r0 = rid(ft, 0);
@@ -2939,10 +2958,14 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             let reading_data = if predicate.is_empty() { "{0}".to_string() } else { format!("{{0}} {}", predicate) };
             objects.push_str(&format!(
                 "\n      <orm:ValueType id=\"{}\" Name=\"{}\" IsImplicitBooleanValue=\"true\">\n        <orm:PlayedRoles>\n          <orm:Role ref=\"{}\" />\n        </orm:PlayedRoles>\n        <orm:ConceptualDataType id=\"{}\" ref=\"{}\" Scale=\"0\" Length=\"0\" />\n        <orm:ValueRestriction>\n          <orm:ValueConstraint id=\"{}\" Name=\"ImplBoolVC{}\">\n            <orm:ValueRanges>\n              <orm:ValueRange id=\"{}\" MinValue=\"True\" MaxValue=\"True\" MinInclusion=\"NotSet\" MaxInclusion=\"NotSet\" />\n            </orm:ValueRanges>\n          </orm:ValueConstraint>\n        </orm:ValueRestriction>\n      </orm:ValueType>",
-                vt, xesc(&vt_name), r1, cdt, bool_dt_ref, vc, uidx, vr));
+                vt, xesc(&vt_name), r1, cdt, &bool_dt_ref, vc, uidx, vr));
+            // The ReadingOrder RoleSequence carries ONLY the noun role (r0); the
+            // implicit-boolean role (r1) is deliberately left un-read so NORMA
+            // debinarizes the fact back to a unary on load (see the two samples
+            // cited above — UserIsActive / Person isDead both list one role here).
             facts.push_str(&format!(
-                "\n      <orm:Fact id=\"{}\">\n        <orm:FactRoles>\n          <orm:Role id=\"{}\" Name=\"\" _IsMandatory=\"false\" _Multiplicity=\"Unspecified\">\n            <orm:RolePlayer ref=\"{}\" />\n          </orm:Role>\n          <orm:Role id=\"{}\" Name=\"\" _IsMandatory=\"false\" _Multiplicity=\"Unspecified\">\n            <orm:RolePlayer ref=\"{}\" />\n          </orm:Role>\n        </orm:FactRoles>\n        <orm:ReadingOrders>\n          <orm:ReadingOrder id=\"{}\">\n            <orm:Readings>\n              <orm:Reading id=\"{}\">\n                <orm:Data>{}</orm:Data>\n              </orm:Reading>\n            </orm:Readings>\n            <orm:RoleSequence>\n              <orm:Role ref=\"{}\" />\n              <orm:Role ref=\"{}\" />\n            </orm:RoleSequence>\n          </orm:ReadingOrder>\n        </orm:ReadingOrders>\n      </orm:Fact>",
-                guid(&format!("implbool_fact:{}", ft)), r0, oid(&role.noun_name), r1, vt, guid(&format!("implbool_rdgord:{}", ft)), guid(&format!("implbool_rdg:{}", ft)), xesc(&reading_data), r0, r1));
+                "\n      <orm:Fact id=\"{}\">\n        <orm:FactRoles>\n          <orm:Role id=\"{}\" Name=\"\" _IsMandatory=\"false\" _Multiplicity=\"Unspecified\">\n            <orm:RolePlayer ref=\"{}\" />\n          </orm:Role>\n          <orm:Role id=\"{}\" Name=\"\" _IsMandatory=\"false\" _Multiplicity=\"Unspecified\">\n            <orm:RolePlayer ref=\"{}\" />\n          </orm:Role>\n        </orm:FactRoles>\n        <orm:ReadingOrders>\n          <orm:ReadingOrder id=\"{}\">\n            <orm:Readings>\n              <orm:Reading id=\"{}\">\n                <orm:Data>{}</orm:Data>\n              </orm:Reading>\n            </orm:Readings>\n            <orm:RoleSequence>\n              <orm:Role ref=\"{}\" />\n            </orm:RoleSequence>\n          </orm:ReadingOrder>\n        </orm:ReadingOrders>\n      </orm:Fact>",
+                guid(&format!("implbool_fact:{}", ft)), r0, oid(&role.noun_name), r1, vt, guid(&format!("implbool_rdgord:{}", ft)), guid(&format!("implbool_rdg:{}", ft)), xesc(&reading_data), r0));
         }
         // --- Navigation-graph layout (whitepaper Theorem 4b) --------------
         // Object types are nodes; each binary fact type is a navigation edge
@@ -3022,10 +3045,19 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         objects.push_str(&ref_objects);
         facts.push_str(&ref_facts);
         facts.push_str(&subtype_facts);
+        // task-951(c): declare the model-local Boolean datatype that every
+        // implicit-boolean ValueType's ConceptualDataType refs. Emitted ONLY
+        // when at least one unary exists, so models without unaries keep the
+        // minimal DataTypes block (and never carry an unreferenced datatype).
+        // `bool_dt_ref` was minted next to the unary emission above; this is the
+        // matching `<id>` declaration that resolves that xs:IDREF.
+        let bool_dt_decl = if unary_fts.is_empty() { String::new() } else {
+            format!("\n      <orm:TrueOrFalseLogicalDataType id=\"{}\" />", bool_dt_ref)
+        };
         let model_id = guid("model");
         format!(
-            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<ormRoot:ORM2 xmlns:orm=\"http://schemas.neumont.edu/ORM/2006-04/ORMCore\" xmlns:ormDiagram=\"http://schemas.neumont.edu/ORM/2006-04/ORMDiagram\" xmlns:ormRoot=\"http://schemas.neumont.edu/ORM/2006-04/ORMRoot\">\n  <orm:ORMModel id=\"{m}\" Name=\"ArestModel\">\n    <orm:Objects>{o}\n    </orm:Objects>\n    <orm:Facts>{f}\n    </orm:Facts>{c}\n    <orm:DataTypes>\n      <orm:VariableLengthTextDataType id=\"{d}\" />\n    </orm:DataTypes>\n  </orm:ORMModel>\n  <ormDiagram:ORMDiagram id=\"{dg}\" IsCompleteView=\"false\" Name=\"ArestModel\" BaseFontName=\"Tahoma\" BaseFontSize=\"0.0972222238779068\">\n    <ormDiagram:Shapes>{s}\n    </ormDiagram:Shapes>\n    <ormDiagram:Subject ref=\"{m}\" />\n  </ormDiagram:ORMDiagram>\n</ormRoot:ORM2>",
-            m = model_id, o = objects, f = facts, c = constraints_xml, d = dt_text, dg = guid("diagram"), s = shapes)
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<ormRoot:ORM2 xmlns:orm=\"http://schemas.neumont.edu/ORM/2006-04/ORMCore\" xmlns:ormDiagram=\"http://schemas.neumont.edu/ORM/2006-04/ORMDiagram\" xmlns:ormRoot=\"http://schemas.neumont.edu/ORM/2006-04/ORMRoot\">\n  <orm:ORMModel id=\"{m}\" Name=\"ArestModel\">\n    <orm:Objects>{o}\n    </orm:Objects>\n    <orm:Facts>{f}\n    </orm:Facts>{c}\n    <orm:DataTypes>\n      <orm:VariableLengthTextDataType id=\"{d}\" />{bd}\n    </orm:DataTypes>\n  </orm:ORMModel>\n  <ormDiagram:ORMDiagram id=\"{dg}\" IsCompleteView=\"false\" Name=\"ArestModel\" BaseFontName=\"Tahoma\" BaseFontSize=\"0.0972222238779068\">\n    <ormDiagram:Shapes>{s}\n    </ormDiagram:Shapes>\n    <ormDiagram:Subject ref=\"{m}\" />\n  </ormDiagram:ORMDiagram>\n</ormRoot:ORM2>",
+            m = model_id, o = objects, f = facts, c = constraints_xml, d = dt_text, bd = bool_dt_decl, dg = guid("diagram"), s = shapes)
     }
     let norma_orm = build_norma_orm(&c_nouns, &c_fact_types, &c_constraints, &c_ref_schemes, &c_supertypes, &c_enum_values);
     #[cfg(not(feature = "no_std"))]
@@ -9797,6 +9829,114 @@ mod schema_tests {
         );
         // Reading equals just the noun -> empty predicate.
         assert_eq!(extract_unary_predicate("Task", "Task"), "");
+    }
+
+    /// Pull the `norma:model` .orm document out of a compiled defs vec.
+    /// The NORMA generator stores the whole export as one constant-atom
+    /// cell (compile_to_defs_state -> `defs.push(("norma:model", ...))`),
+    /// so this is just a name lookup + atom read.
+    fn norma_orm_from_src(src: &str) -> String {
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse");
+        let defs = compile_to_defs_state(&state);
+        let func = defs.iter()
+            .find(|(name, _)| name == "norma:model")
+            .map(|(_, f)| f.clone())
+            .expect("compile_to_defs_state must emit a `norma:model` cell");
+        match func {
+            crate::ast::Func::Constant(obj) => obj.as_atom()
+                .expect("norma:model is a constant atom")
+                .to_string(),
+            other => panic!("norma:model must be a constant atom, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unary_fact_round_trips_to_norma_implicit_boolean_binary() {
+        // task-951(c): NORMA has no native unary fact type — it binarizes a
+        // unary (e.g. `Task is finished`) against an implicit boolean value and
+        // debinarizes on load. Assert the exporter emits that exact shape:
+        //   * an `IsImplicitBooleanValue="true"` ValueType named "Task is finished"
+        //   * a model-local `<orm:TrueOrFalseLogicalDataType>` declaration
+        //   * the unary's noun role (Task) bound to that implicit-boolean fact,
+        //     with the reading sequence carrying ONLY the noun role
+        // Shape matched against NORMA's own samples (Tests.Test1.Load.orm
+        // `UserIsActive` / SampleModel.orm `Person isDead`).
+        let src = "\
+            Task(.id) is an entity type.\n\
+            \n\
+            ## Fact Types\n\
+            Task is finished.\n\
+        ";
+        let orm = norma_orm_from_src(src);
+
+        // 1. The implicit-boolean value object exists, named "<Noun> <predicate>"
+        //    exactly as NORMA names it (e.g. "Person isDead").
+        assert!(
+            orm.contains("Name=\"Task is finished\" IsImplicitBooleanValue=\"true\""),
+            "expected an IsImplicitBooleanValue ValueType named `Task is finished`; \
+             got:\n{}", orm);
+
+        // 2. The model-local Boolean datatype is DECLARED (not just referenced) —
+        //    otherwise the ConceptualDataType ref is a dangling xs:IDREF and the
+        //    document fails ORM2Core.xsd validation / NORMA load.
+        assert!(
+            orm.contains("<orm:TrueOrFalseLogicalDataType id=\""),
+            "implicit-boolean export must declare a TrueOrFalseLogicalDataType in \
+             <orm:DataTypes>; got:\n{}", orm);
+
+        // 3. That declared datatype id is the SAME id the implicit-boolean
+        //    ValueType's ConceptualDataType refs — the IDREF resolves.
+        let dt_id = {
+            let marker = "<orm:TrueOrFalseLogicalDataType id=\"";
+            let start = orm.find(marker).unwrap() + marker.len();
+            let end = orm[start..].find('"').unwrap();
+            orm[start..start + end].to_string()
+        };
+        assert!(
+            orm.contains(&format!("<orm:ConceptualDataType id=\"")) &&
+            orm.matches(&format!("ref=\"{}\"", dt_id)).count() >= 1,
+            "the implicit-boolean ConceptualDataType must ref the declared Boolean \
+             datatype id `{}`; got:\n{}", dt_id, orm);
+
+        // 4. The unary's noun (Task) plays the implicit-boolean fact, and the
+        //    ValueRestriction pins the value to True (the asserted-unary
+        //    semantics that survive debinarization).
+        assert!(orm.contains("Name=\"Task\""),
+            "the Task entity must be present as a role player; got:\n{}", orm);
+        assert!(
+            orm.contains("MinValue=\"True\" MaxValue=\"True\""),
+            "implicit-boolean value must be restricted to True only; got:\n{}", orm);
+
+        // 5. The synthesized fact reads as a unary (`{0} is finished`) — a single
+        //    placeholder — which is the debinarize signal NORMA keys on.
+        assert!(
+            orm.contains("<orm:Data>{0} is finished</orm:Data>"),
+            "implicit-boolean fact reading must be the unary form `{{0}} is \
+             finished`; got:\n{}", orm);
+    }
+
+    #[test]
+    fn model_without_unaries_emits_no_boolean_datatype() {
+        // Guard the conditional: a binary-only model must NOT carry the
+        // TrueOrFalse datatype declaration (it would be an unreferenced
+        // datatype, and signals the unary path fired spuriously).
+        let src = "\
+            Person(.id) is an entity type.\n\
+            City(.id) is an entity type.\n\
+            \n\
+            ## Fact Types\n\
+            Person has City.\n\
+        ";
+        let orm = norma_orm_from_src(src);
+        assert!(
+            !orm.contains("TrueOrFalseLogicalDataType"),
+            "a model with no unary fact types must not declare a Boolean \
+             datatype; got:\n{}", orm);
+        assert!(
+            !orm.contains("IsImplicitBooleanValue"),
+            "a model with no unary fact types must not emit an implicit-boolean \
+             ValueType; got:\n{}", orm);
     }
 
     #[test]
