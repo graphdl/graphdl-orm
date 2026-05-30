@@ -5147,6 +5147,92 @@ ViewElement renders Operation. *
     assert!(!detail_ops.contains(&"create".to_string()), "task-detail (instance) must NOT include create (collection op); got {:?}", detail_ops);
 }
 
+// crudl-menu-projection: the FULL permission-gated CRUDL menu. Extends the
+// context-filter core with the authz gate, INLINED as a role-permission join
+// (User has Role + Role permits Operation on Noun -- base/eager cells, so no
+// lazy-on-lazy with the lazy Grant view). A 5-antecedent skolem ViewElement
+// join (the menu view's proven size). The skolem ViewElement IS the
+// objectification, so the bare-ternary ModusPonens bug is sidestepped. Proves:
+// a menu item appears only when the Operation applies in the View's context AND
+// the user is permitted that Operation on the View's Noun.
+#[test]
+fn crudl_menu_derivation_permission_gated() {
+    let src = r#"
+View(.Name) is an entity type.
+Name is a value type.
+View Context is a value type.
+  The possible values of View Context are 'collection', 'instance', 'edit'.
+Operation(.OpName) is an entity type.
+OpName is a value type.
+Noun(.NounName) is an entity type.
+NounName is a value type.
+User(.Username) is an entity type.
+Username is a value type.
+Role(.RoleName) is an entity type.
+RoleName is a value type.
+ViewElement(.veid) is an entity type.
+veid is a value type.
+
+## Fact Types
+View is for Noun.
+View has View Context.
+Operation applies in View Context.
+User has Role.
+Role permits Operation on Noun.
+ViewElement renders Operation. *
+
+## Derivation Rules
+* ViewElement (E) renders Operation iff View is for Noun and View has View Context and Operation applies in View Context and User has Role and Role permits Operation on Noun.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let defs = compile::compile_to_defs_state(&state);
+    let d0 = ast::defs_to_state(&defs, &state);
+    let push = |s, cell: &str, pairs: &[(&str, &str)]|
+        ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+    let d = {
+        let s = d0.clone();
+        let s = push(s, "View_is_for_Noun", &[("View", "task-list"), ("Noun", "Task")]);
+        let s = push(s, "View_has_View_Context", &[("View", "task-list"), ("View Context", "collection")]);
+        let s = push(s, "View_is_for_Noun", &[("View", "task-detail"), ("Noun", "Task")]);
+        let s = push(s, "View_has_View_Context", &[("View", "task-detail"), ("View Context", "instance")]);
+        let s = push(s, "Operation_applies_in_View_Context", &[("Operation", "create"), ("View Context", "collection")]);
+        let s = push(s, "Operation_applies_in_View_Context", &[("Operation", "search"), ("View Context", "collection")]);
+        let s = push(s, "Operation_applies_in_View_Context", &[("Operation", "edit"), ("View Context", "instance")]);
+        let s = push(s, "Operation_applies_in_View_Context", &[("Operation", "delete"), ("View Context", "instance")]);
+        // alice (editor) is permitted Edit + Create on Task -- NOT search or delete.
+        let s = push(s, "User_has_Role", &[("User", "alice"), ("Role", "editor")]);
+        let s = push(s, "Role_permits_Operation_on_Noun", &[("Role", "editor"), ("Operation", "edit"), ("Noun", "Task")]);
+        let s = push(s, "Role_permits_Operation_on_Noun", &[("Role", "editor"), ("Operation", "create"), ("Noun", "Task")]);
+        s
+    };
+    let renders = ast::resolve_view("ViewElement_renders_Operation", &d, &d)
+        .expect("gated menu view resolves");
+    let rows: Vec<(String, String)> = renders.as_seq()
+        .map(|items| items.iter().filter_map(|f| {
+            let view = ast::binding(f, "View")?.to_string();
+            let op = ast::binding(f, "Operation")?.to_string();
+            Some((view, op))
+        }).collect())
+        .unwrap_or_default();
+    let ops_for = |v: &str| -> Vec<String> {
+        rows.iter().filter(|(view, _)| view == v).map(|(_, o)| o.clone()).collect()
+    };
+    let list_ops = ops_for("task-list");
+    // collection context ∩ alice-permitted = {create} (search not permitted).
+    assert!(list_ops.contains(&"create".to_string()),
+        "task-list: create is collection-context AND permitted; got {:?}", list_ops);
+    assert!(!list_ops.contains(&"search".to_string()),
+        "task-list: search is collection-context but NOT permitted -> gated out; got {:?}", list_ops);
+    let detail_ops = ops_for("task-detail");
+    // instance context ∩ alice-permitted = {edit} (delete not permitted).
+    assert!(detail_ops.contains(&"edit".to_string()),
+        "task-detail: edit is instance-context AND permitted; got {:?}", detail_ops);
+    assert!(!detail_ops.contains(&"delete".to_string()),
+        "task-detail: delete is instance-context but NOT permitted -> gated out; got {:?}", detail_ops);
+    assert!(!detail_ops.contains(&"create".to_string()),
+        "task-detail: create is permitted but WRONG context (collection) -> excluded; got {:?}", detail_ops);
+}
+
 // ─── task-934-3a: VERIFIED METAMODEL FACT-TYPE NAMES ────────────────────────
 //
 // The following names have been verified against readings/core/state.md,
