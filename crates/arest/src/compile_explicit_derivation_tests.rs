@@ -4947,7 +4947,11 @@ fn crudl_operation_catalog_parses_and_compiles_grounded_in_ifactr() {
 // consequent binding must be fixed. This test holds the TARGET spec; #[ignore]'d
 // until the authz model is objectified (see crudl-menu-projection +
 // nonskolem-cross-antecedent-join).
-#[ignore = "non-skolem cross-antecedent ternary join mis-binds the consequent; authz must objectify via skolem -- see nonskolem-cross-antecedent-join task"]
+// nonskolem-cross-antecedent-join FIXED (2026-05-30): the bridge-key join
+// detector is hoisted out of the `!pending_role_comparisons.is_empty()` gate
+// in parse_forml2.rs, so this bare ternary equi-join now classifies as Join
+// (join_on=[Role]) and binds the consequent across BOTH antecedents instead
+// of falling through to ModusPonens (first-antecedent only). Un-ignored.
 #[test]
 fn authorization_model_ternary_permission_derivation() {
     let src = r#"

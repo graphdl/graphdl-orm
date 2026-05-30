@@ -2222,30 +2222,64 @@ fn resolve_derivation_rule(
                 });
         }
 
-        // Step 4: promote the rule to `Join` kind and synthesise
-        // `join_on` keys so it routes through `compile_join_derivation`
-        // (the only compile path that picks up
-        // `antecedent_role_comparisons`). Join keys are the natural
-        // shared nouns across antecedents that are NOT the comparison
-        // roles themselves — typically Source File-style shared values
-        // that the user expects to equi-join.
-        //
-        // Subscript-aware filtering: only nouns whose token appears
-        // IDENTICALLY across every antecedent clause that mentions
-        // them are eligible. Ring-FT subscripts (`Task1` vs `Task2`)
-        // identify DIFFERENT variables of the same base noun; equi-
-        // joining them would collapse the two subscripts onto the
-        // same value (which is exactly what the comparison clause is
-        // contradicting). The compile_explicit_derivation subscript
-        // path applies the same guard; here we duplicate it at the
-        // parse layer because compile_join_derivation doesn't carry
-        // its own subscript discipline.
-        //
-        // The classifier below (`is_join` check) re-validates the
-        // rule against the standard "shared by ≥2 antecedent FTs"
-        // predicate before flipping `kind`, so synthesised keys that
-        // don't actually appear on multiple antecedent FTs degrade
-        // back to no-op.
+        // Comparison-key reordering complete (Steps 1-3). The bridge-key
+        // synthesis that used to be "Step 4" here is hoisted below so it
+        // runs for EVERY >=2-antecedent rule, not only comparison ones.
+    }
+
+    // Bridge-variable join detection (RBAC-style equi-join, no surface
+    // marker) — HOISTED out of the `!pending_role_comparisons.is_empty()`
+    // gate so it runs for bare >=2-antecedent equi-joins like `User is
+    // permitted Operation on Noun iff User has Role and Role permits
+    // Operation on Noun`, where `Role` is a BRIDGE variable (on >=2
+    // antecedent FTs, joined-then-discarded — not projected to the
+    // consequent). While this block lived inside the comparison gate, such
+    // a bare rule kept `join_on` empty and fell through to ModusPonens,
+    // whose N>=2 branch copies bindings from the FIRST antecedent only — a
+    // SILENT mis-join (task nonskolem-cross-antecedent-join).
+    //
+    // GATED to SKIP skolem-head rules: a consequent carrying a FRESH
+    // existential `(VAR)` (one not bound in any antecedent) is owned by the
+    // skolem-head path below (~"task-970"), which does its OWN skolem-aware
+    // shared-noun join setup + id minting and is gated on `kind != Join`.
+    // Promoting such a rule to a plain Join here would pre-empt that path
+    // and break the View / Grant derivations. The `is_join` re-validation
+    // below still gates the actual `kind` flip, and the subscript guard
+    // defers ring self-joins to `compute_ring_join_plan`.
+    let consequent_has_fresh_existential = {
+        // Mirrors `extract_paren_vars` in the skolem-head block below; kept
+        // local so this gate needs no reorder of that detection.
+        let paren_vars = |text: &str| -> Vec<String> {
+            let mut vars: Vec<String> = Vec::new();
+            let bytes = text.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'(' {
+                    if let Some(close) = text[i + 1..].find(')') {
+                        let interior = text[i + 1..i + 1 + close].trim();
+                        if !interior.is_empty()
+                            && !interior.contains('\'')
+                            && interior.chars().all(|c| c.is_alphanumeric() || c == '-' || c == ' ' || c == '_')
+                        {
+                            vars.push(interior.to_string());
+                        }
+                        i += close + 2;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            vars
+        };
+        let cons_text = rule.text.find(" iff ").map(|i| &rule.text[..i])
+            .or_else(|| rule.text.find(" if ").map(|i| &rule.text[..i]))
+            .unwrap_or(rule.text.as_str());
+        let ant_vars: hashbrown::HashSet<String> = antecedent_parts.iter()
+            .flat_map(|p| paren_vars(p))
+            .collect();
+        paren_vars(cons_text).into_iter().any(|v| !ant_vars.contains(&v))
+    };
+    if !consequent_has_fresh_existential {
         let comparison_roles: hashbrown::HashSet<String> = rule.antecedent_role_comparisons
             .iter()
             .flat_map(|c| [c.lhs_role.clone(), c.rhs_role.clone()])
@@ -2272,10 +2306,9 @@ fn resolve_derivation_rule(
                     .filter(|ft| ft.roles.iter().any(|rr| rr.noun_name == r.noun_name))
                     .count();
                 if appears < 2 { continue; }
-                // Skip nouns appearing with multiple distinct
-                // subscript tokens across antecedent clauses —
-                // those are independent variables, not a shared
-                // join key.
+                // Skip nouns appearing with multiple distinct subscript
+                // tokens across antecedent clauses — those are independent
+                // ring variables, not a shared equi-join key.
                 if tokens_for_noun(&r.noun_name).len() > 1 { continue; }
                 if !shared.contains(&r.noun_name) {
                     shared.push(r.noun_name.clone());
