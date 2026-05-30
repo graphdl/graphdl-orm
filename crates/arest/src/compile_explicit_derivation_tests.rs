@@ -5078,6 +5078,75 @@ Grant applies to Noun. *
         "Grant {gid} applies to Task (shared skolem frontier); got {:?}", appl);
 }
 
+// crudl-menu-projection: the CRUDL menu derivation CORE -- one ViewElement per
+// (View, Operation) where the Operation applies in the View's context. A skolem
+// ViewElement join (mirrors the detail view), carrying the View's Noun so the
+// permission gate (join the Grant on (Operation, Noun)) is a follow-on. Proves
+// the context filter: a collection/list view shows create/search; an instance/
+// detail view shows edit/delete -- straight from the iFactr-grounded crudl.md
+// catalog's 'Operation applies in View Context'.
+#[test]
+fn crudl_menu_derivation_operations_per_context() {
+    let src = r#"
+View(.Name) is an entity type.
+Name is a value type.
+View Context is a value type.
+  The possible values of View Context are 'collection', 'instance', 'edit'.
+Operation(.OpName) is an entity type.
+OpName is a value type.
+Noun(.NounName) is an entity type.
+NounName is a value type.
+ViewElement(.veid) is an entity type.
+veid is a value type.
+
+## Fact Types
+View is for Noun.
+View has View Context.
+Operation applies in View Context.
+ViewElement renders Operation. *
+
+## Derivation Rules
+* ViewElement (E) renders Operation iff View is for Noun and View has View Context and Operation applies in View Context.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let defs = compile::compile_to_defs_state(&state);
+    let d0 = ast::defs_to_state(&defs, &state);
+    let push = |s, cell: &str, pairs: &[(&str, &str)]|
+        ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+    let d = {
+        let s = d0.clone();
+        let s = push(s, "View_is_for_Noun", &[("View", "task-list"), ("Noun", "Task")]);
+        let s = push(s, "View_has_View_Context", &[("View", "task-list"), ("View Context", "collection")]);
+        let s = push(s, "View_is_for_Noun", &[("View", "task-detail"), ("Noun", "Task")]);
+        let s = push(s, "View_has_View_Context", &[("View", "task-detail"), ("View Context", "instance")]);
+        let s = push(s, "Operation_applies_in_View_Context", &[("Operation", "create"), ("View Context", "collection")]);
+        let s = push(s, "Operation_applies_in_View_Context", &[("Operation", "search"), ("View Context", "collection")]);
+        let s = push(s, "Operation_applies_in_View_Context", &[("Operation", "edit"), ("View Context", "instance")]);
+        let s = push(s, "Operation_applies_in_View_Context", &[("Operation", "delete"), ("View Context", "instance")]);
+        s
+    };
+    let renders = ast::resolve_view("ViewElement_renders_Operation", &d, &d)
+        .expect("renders view resolves");
+    let rows: Vec<(String, String)> = renders.as_seq()
+        .map(|items| items.iter().filter_map(|f| {
+            let view = ast::binding(f, "View")?.to_string();
+            let op = ast::binding(f, "Operation")?.to_string();
+            Some((view, op))
+        }).collect())
+        .unwrap_or_default();
+    let ops_for = |v: &str| -> Vec<String> {
+        rows.iter().filter(|(view, _)| view == v).map(|(_, o)| o.clone()).collect()
+    };
+    let list_ops = ops_for("task-list");
+    assert!(list_ops.contains(&"create".to_string()), "task-list menu must include create; got {:?}", list_ops);
+    assert!(list_ops.contains(&"search".to_string()), "task-list menu must include search; got {:?}", list_ops);
+    assert!(!list_ops.contains(&"edit".to_string()), "task-list (collection) must NOT include edit (instance op); got {:?}", list_ops);
+    let detail_ops = ops_for("task-detail");
+    assert!(detail_ops.contains(&"edit".to_string()), "task-detail menu must include edit; got {:?}", detail_ops);
+    assert!(detail_ops.contains(&"delete".to_string()), "task-detail menu must include delete; got {:?}", detail_ops);
+    assert!(!detail_ops.contains(&"create".to_string()), "task-detail (instance) must NOT include create (collection op); got {:?}", detail_ops);
+}
+
 // ─── task-934-3a: VERIFIED METAMODEL FACT-TYPE NAMES ────────────────────────
 //
 // The following names have been verified against readings/core/state.md,
