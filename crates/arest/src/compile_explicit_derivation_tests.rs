@@ -5013,6 +5013,71 @@ User is permitted Operation on Noun. **
         "bob (no role) must have no permissions; got {:?}", perms);
 }
 
+// crudl-menu-projection (authz, OBJECTIFIED): the role-based permission gate as
+// a skolem-minted Grant, mirroring the proven view-derivation Join+skolem path
+// (which is the ONLY path that cross-antecedent-joins; see
+// nonskolem-cross-antecedent-join). Three shared-frontier skolem rules mint one
+// Grant per (User, Role, Operation, Noun); the Grant links User + Operation +
+// Noun, so 'is alice permitted Edit on Task' = EXISTS a Grant authorizing alice,
+// granting Edit, applying Task. This is what the CRUDL menu derivation gates on.
+#[test]
+fn objectified_grant_authz_via_skolem() {
+    let src = r#"
+User(.Username) is an entity type.
+Username is a value type.
+Role(.RoleName) is an entity type.
+RoleName is a value type.
+Operation(.OpName) is an entity type.
+OpName is a value type.
+Noun(.NounName) is an entity type.
+NounName is a value type.
+Grant(.gid) is an entity type.
+gid is a value type.
+
+## Fact Types
+User has Role.
+Role permits Operation on Noun.
+Grant authorizes User. *
+Grant grants Operation. *
+Grant applies to Noun. *
+
+## Derivation Rules
+* Grant (G) authorizes User iff User has Role and Role permits Operation on Noun.
+* Grant (G) grants Operation iff User has Role and Role permits Operation on Noun.
+* Grant (G) applies to Noun iff User has Role and Role permits Operation on Noun.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let defs = compile::compile_to_defs_state(&state);
+    let d0 = ast::defs_to_state(&defs, &state);
+    let push = |s, cell: &str, pairs: &[(&str, &str)]|
+        ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+    let d = {
+        let s = d0.clone();
+        let s = push(s, "User_has_Role", &[("User", "alice"), ("Role", "editor")]);
+        let s = push(s, "Role_permits_Operation_on_Noun", &[("Role", "editor"), ("Operation", "Edit"), ("Noun", "Task")]);
+        s
+    };
+    let extract = |cell: &str, role: &str| -> Vec<(String, String)> {
+        ast::resolve_view(cell, &d, &d)
+            .and_then(|o| o.as_seq().map(|items| items.iter().filter_map(|f| {
+                let g = ast::binding(f, "Grant")?.to_string();
+                let v = ast::binding(f, role)?.to_string();
+                Some((g, v))
+            }).collect()))
+            .unwrap_or_default()
+    };
+    let auth = extract("Grant_authorizes_User", "User");
+    let grnt = extract("Grant_grants_Operation", "Operation");
+    let appl = extract("Grant_applies_to_Noun", "Noun");
+    assert_eq!(auth.len(), 1, "exactly one Grant authorizes a user; got {:?}", auth);
+    let gid = auth[0].0.clone();
+    assert_eq!(auth[0].1, "alice", "the Grant authorizes alice; got {:?}", auth);
+    assert!(grnt.iter().any(|(g, op)| *g == gid && op == "Edit"),
+        "Grant {gid} grants Edit (shared skolem frontier); got {:?}", grnt);
+    assert!(appl.iter().any(|(g, n)| *g == gid && n == "Task"),
+        "Grant {gid} applies to Task (shared skolem frontier); got {:?}", appl);
+}
+
 // ─── task-934-3a: VERIFIED METAMODEL FACT-TYPE NAMES ────────────────────────
 //
 // The following names have been verified against readings/core/state.md,
