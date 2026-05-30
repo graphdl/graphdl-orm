@@ -1115,11 +1115,12 @@ pub const INGEST_READINGS: &[(&str, &str)] = &[
 /// hosted ui.do worker.
 #[cfg(feature = "ui-readings")]
 pub const UI_READINGS: &[(&str, &str)] = &[
-    ("ui",            include_str!("../../../readings/ui/ui.md")),
-    ("design",        include_str!("../../../readings/ui/design.md")),
-    ("monoview",      include_str!("../../../readings/ui/monoview.md")),
-    ("components",    include_str!("../../../readings/ui/components.md")),
-    ("render",        include_str!("../../../readings/ui/render.md")),
+    ("ui",               include_str!("../../../readings/ui/ui.md")),
+    ("design",           include_str!("../../../readings/ui/design.md")),
+    ("monoview",         include_str!("../../../readings/ui/monoview.md")),
+    ("components",       include_str!("../../../readings/ui/components.md")),
+    ("render",           include_str!("../../../readings/ui/render.md")),
+    ("view-projection",  include_str!("../../../readings/ui/view-projection.md")),
 ];
 
 /// OS-only nouns. Included only when AREST runs as the kernel, where
