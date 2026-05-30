@@ -4897,3 +4897,234 @@ fn menu_view_derivation_metamodel_ft_name_audit() {
     assert!(!cons_role.is_empty());
 }
 
+// ─── task-934-2: COLLECTION-LIST VIEW ────────────────────────────────────────
+//
+// The collection-list view generates one ViewElement per Resource instance of
+// the collection View's Noun. The join is a 3-antecedent chain:
+//
+//   View_is_for_Noun (View→Noun_N)
+//     ⋈ View_has_View_Kind filtered to 'collection' (View→ViewKind)
+//     ⋈ Resource_is_instance_of_Noun (Resource→Noun_N)  [join key: Noun]
+//
+// Frontier (entity-typed antecedent nouns): [View, Noun, Resource].
+// Since each View is for exactly one Noun, the (View, Noun) prefix collapses
+// to (View), giving one VE per (View, Resource) pair.
+//
+// Component Role 'list' — already in the components.md enum, maps to the
+// list-row widget (iFactr IContentCell / iItem shape).
+//
+// Consequent FTs:
+//   ViewElement_renders_Resource   (declared in readings/ui/view-list.md, * View-lazy)
+//   ViewElement_has_Component_Role (declared in readings/ui/view-projection.md, *)
+#[test]
+fn collection_list_view_derivation_compiled_from_authored_reading() {
+    use crate::ast::{defs_to_state, resolve_view};
+
+    // Authored reading — the two shared-frontier skolem rules from
+    // readings/ui/view-list.md, over the verified metamodel FT names.
+    // `ViewElement renders Resource. *` and `ViewElement has Component
+    // Role. *` mark both heads View-materialized (lazy). The 3-way join
+    // antecedents are spelled exactly as the metamodel declares them.
+    let src = r#"# task-934-2 authored collection-list view
+Resource(.Reference) is an entity type.
+Reference is a value type.
+Noun(.NounName) is an entity type.
+NounName is a value type.
+View(.Name) is an entity type.
+Name is a value type.
+View Kind is a value type.
+  The possible values of View Kind are 'collection', 'instance', 'menu'.
+ViewElement(.veid) is an entity type.
+veid is a value type.
+Component Role is a value type.
+
+## Fact Types
+View is for Noun.
+  Each View is for exactly one Noun.
+View has View Kind.
+  Each View has exactly one View Kind.
+Resource is instance of Noun.
+ViewElement renders Resource. *
+ViewElement has Component Role. *
+
+## Derivation Rules
+* ViewElement (E) renders Resource (R) iff View is for Noun and View has View Kind 'collection' and Resource (R) is instance of Noun.
+* ViewElement (E) has Component Role 'list' iff View is for Noun and View has View Kind 'collection' and Resource (R) is instance of Noun.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let data = compile::cell_index_from_state(&state);
+
+    // ── Both rules must parse as View-materialized Joins with a skolem head ──
+    let renders_rule = data.derivation_rules.iter()
+        .find(|r| r.text.contains("renders Resource"))
+        .expect("renders Resource rule must parse");
+    let role_rule = data.derivation_rules.iter()
+        .find(|r| r.text.contains("Component Role"))
+        .expect("Component Role rule must parse");
+    for (label, rule) in [("renders", renders_rule), ("role", role_rule)] {
+        assert!(matches!(rule.materialization, crate::types::MaterializationPolicy::View),
+            "{label} rule must be View-materialized (lazy); got {:?}", rule.materialization);
+        assert_eq!(rule.kind, DerivationKind::Join,
+            "{label} rule must promote to a Join over the 3-way chain; got {:?}\n\
+             join_on: {:?}\ntext: {}", rule.kind, rule.join_on, rule.text);
+        assert!(rule.skolem_head_roles.iter().any(|s| s.role == "ViewElement"),
+            "{label} rule must record a SkolemHeadRole for the fresh ViewElement (E); \
+             got {:#?}\ntext: {}", rule.skolem_head_roles, rule.text);
+        // The entity-typed frontier must include View and Resource (the two
+        // entity nouns that discriminate one row from another). Noun is also
+        // entity-typed and will be included; since View is for exactly one Noun
+        // this is harmless (same effective granularity).
+        let shr = rule.skolem_head_roles.iter().find(|s| s.role == "ViewElement").unwrap();
+        assert!(shr.frontier.contains(&"View".to_string()),
+            "{label} skolem frontier must include View; got {:?}", shr.frontier);
+        assert!(shr.frontier.contains(&"Resource".to_string()),
+            "{label} skolem frontier must include Resource; got {:?}", shr.frontier);
+        // View Kind is value-typed — it must be excluded (it is a filter seam,
+        // not an entity identity).
+        assert!(!shr.frontier.contains(&"View Kind".to_string()),
+            "{label} skolem frontier must EXCLUDE value-typed View Kind; got {:?}", shr.frontier);
+        // The join must equi-join on Noun (the bridge between View and Resource)
+        assert!(rule.join_on.contains(&"Noun".to_string()),
+            "{label} Noun must be a join key (View.forNoun == Resource.instanceOf); \
+             got {:?}", rule.join_on);
+    }
+
+    // SHARED FRONTIER: both sibling rules must skolemise off the IDENTICAL frontier
+    {
+        let fa = &renders_rule.skolem_head_roles.iter()
+            .find(|s| s.role == "ViewElement").unwrap().frontier;
+        let fb = &role_rule.skolem_head_roles.iter()
+            .find(|s| s.role == "ViewElement").unwrap().frontier;
+        assert_eq!(fa, fb,
+            "renders and Component Role heads MUST share an identical skolem \
+             frontier (shared-frontier invariant); renders {:?} vs role {:?}", fa, fb);
+    }
+
+    // ── Compile to defs; both heads emit a `view:` def, NO `derivation:` def ──
+    let defs = compile::compile_to_defs_state(&state);
+    let d = defs_to_state(&defs, &state);
+    let cons_renders = "ViewElement_renders_Resource";
+    let cons_role = "ViewElement_has_Component_Role";
+    assert!(!matches!(ast::fetch_raw(&format!("view:{}", cons_renders), &d), Object::Bottom),
+        "renders Resource head must emit a view: def");
+    assert!(!matches!(ast::fetch_raw(&format!("view:{}", cons_role), &d), Object::Bottom),
+        "Component Role head must emit a view: def");
+    // (g) LAZY guard — no eager derivation: def for EITHER head
+    assert!(matches!(ast::fetch_raw(&format!("derivation:{}", renders_rule.id), &d), Object::Bottom),
+        "renders Resource head must be lazy (view: only, no derivation: def)");
+    assert!(matches!(ast::fetch_raw(&format!("derivation:{}", role_rule.id), &d), Object::Bottom),
+        "Component Role head must be lazy (view: only, no derivation: def)");
+
+    // ── Population ──────────────────────────────────────────────────────────
+    //   Noun 'Task'  → 3 instances: task-1, task-2, task-3
+    //   Noun 'Bug'   → 0 instances
+    //   View 'task-list'  → for Noun 'Task', View Kind 'collection'  → 3 VEs
+    //   View 'bug-list'   → for Noun 'Bug',  View Kind 'collection'  → 0 VEs
+    //   View 'task-form'  → for Noun 'Task', View Kind 'instance'    → 0 VEs (filter)
+    let pop = {
+        let push = |s, cell: &str, pairs: &[(&str, &str)]|
+            ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+        let s = d.clone();
+        // Views and their Nouns
+        let s = push(s, "View_is_for_Noun", &[("View", "task-list"), ("Noun", "Task")]);
+        let s = push(s, "View_is_for_Noun", &[("View", "bug-list"),  ("Noun", "Bug")]);
+        let s = push(s, "View_is_for_Noun", &[("View", "task-form"), ("Noun", "Task")]);
+        // View Kinds
+        let s = push(s, "View_has_View_Kind", &[("View", "task-list"), ("View Kind", "collection")]);
+        let s = push(s, "View_has_View_Kind", &[("View", "bug-list"),  ("View Kind", "collection")]);
+        let s = push(s, "View_has_View_Kind", &[("View", "task-form"), ("View Kind", "instance")]);
+        // Task instances
+        let s = push(s, "Resource_is_instance_of_Noun", &[("Resource", "task-1"), ("Noun", "Task")]);
+        let s = push(s, "Resource_is_instance_of_Noun", &[("Resource", "task-2"), ("Noun", "Task")]);
+        let s = push(s, "Resource_is_instance_of_Noun", &[("Resource", "task-3"), ("Noun", "Task")]);
+        // Bug: no instances
+        s
+    };
+
+    // ── (a)+(b): resolve the renders view lazily ──────────────────────────
+    let pass1 = resolve_view(cons_renders, &pop, &d)
+        .expect("compiled renders view: def must resolve via resolve_view");
+    let elems: Vec<(String, String, String)> = pass1.as_seq()
+        .map(|items| items.iter().filter_map(|f| {
+            let ve  = ast::binding(f, "ViewElement").map(String::from)?;
+            let res = ast::binding(f, "Resource").map(String::from)?;
+            let vw  = ast::binding(f, "View").map(String::from)?;
+            Some((ve, res, vw))
+        }).collect())
+        .unwrap_or_default();
+
+    // (a) task-list → exactly 3 ViewElements (one per Task instance)
+    let task_list_elems: Vec<&(String, String, String)> =
+        elems.iter().filter(|(_, _, vw)| vw == "task-list").collect();
+    assert_eq!(task_list_elems.len(), 3,
+        "task-list (collection, Noun=Task, 3 instances) must produce 3 ViewElements; \
+         got {:?}\nfull: {:#?}", task_list_elems, elems);
+
+    // (b) bug-list → 0 ViewElements (Noun=Bug has no instances)
+    let bug_list_elems: Vec<&(String, String, String)> =
+        elems.iter().filter(|(_, _, vw)| vw == "bug-list").collect();
+    assert_eq!(bug_list_elems.len(), 0,
+        "bug-list (collection, Noun=Bug, 0 instances) must produce ZERO ViewElements; \
+         got {:?}\nfull: {:#?}", bug_list_elems, elems);
+
+    // (h) task-form → 0 ViewElements (View Kind 'instance', not 'collection')
+    let task_form_elems: Vec<&(String, String, String)> =
+        elems.iter().filter(|(_, _, vw)| vw == "task-form").collect();
+    assert_eq!(task_form_elems.len(), 0,
+        "task-form (View Kind 'instance') must produce ZERO ViewElements — the \
+         'collection' literal filter must exclude it; got {:?}\nfull: {:#?}",
+        task_form_elems, elems);
+
+    // (c) deterministic ve_<16 hex> ids
+    for (id, res, vw) in &elems {
+        assert!(id.starts_with("ve_") && id.len() == "ve_".len() + 16,
+            "VE id must be ve_<16 hex>; got {:?} for ({}, {})", id, vw, res);
+    }
+
+    // (e) Resource values carried through
+    let task_list_resources: Vec<&str> =
+        task_list_elems.iter().map(|(_, res, _)| res.as_str()).collect();
+    assert!(task_list_resources.contains(&"task-1"),
+        "task-1 must appear in task-list renders; got {:?}", task_list_resources);
+    assert!(task_list_resources.contains(&"task-2"),
+        "task-2 must appear in task-list renders; got {:?}", task_list_resources);
+    assert!(task_list_resources.contains(&"task-3"),
+        "task-3 must appear in task-list renders; got {:?}", task_list_resources);
+
+    // (d) idempotent across a second resolve pass
+    let pass2 = resolve_view(cons_renders, &pop, &d)
+        .expect("compiled renders view: def must resolve on pass 2");
+    let mut ids1: Vec<String> = elems.iter().map(|(id, ..)| id.clone()).collect();
+    let mut ids2: Vec<String> = pass2.as_seq()
+        .map(|items| items.iter()
+            .filter_map(|f| ast::binding(f, "ViewElement").map(String::from)).collect())
+        .unwrap_or_default();
+    ids1.sort();
+    ids2.sort();
+    assert_eq!(ids1, ids2,
+        "COMPILED collection-list view must be idempotent (same frontier → same ve_<fnv>); \
+         pass1 {:?} vs pass2 {:?}", ids1, ids2);
+
+    // (f) shared frontier: the Component Role head produces the SAME ve_<fnv> ids
+    let role_view = resolve_view(cons_role, &pop, &d)
+        .expect("compiled Component Role view: def must resolve");
+    let mut role_ids: Vec<String> = role_view.as_seq()
+        .map(|items| items.iter()
+            .filter_map(|f| ast::binding(f, "ViewElement").map(String::from)).collect())
+        .unwrap_or_default();
+    let role_vals: Vec<String> = role_view.as_seq()
+        .map(|items| items.iter()
+            .filter_map(|f| ast::binding(f, "Component Role").map(String::from)).collect())
+        .unwrap_or_default();
+    assert_eq!(role_ids.len(), 3,
+        "Component Role head must produce 3 VE bindings (one per Task instance); \
+         got {:?}", role_ids);
+    role_ids.sort();
+    assert_eq!(ids1, role_ids,
+        "SHARED FRONTIER: renders and Component Role heads MUST produce identical \
+         ve_<fnv> ids (same (View,Noun,Resource) → same hash). renders {:?} vs role {:?}",
+        ids1, role_ids);
+    assert!(role_vals.iter().all(|v| v == "list"),
+        "all compiled collection-list VEs must have Component Role 'list'; got {:?}", role_vals);
+}
+
