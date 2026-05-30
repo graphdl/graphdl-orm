@@ -6534,6 +6534,21 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
 pub(crate) fn compile_subtype_inheritance_metamodel(
     data: &CellIndex,
 ) -> Option<CompiledDerivation> {
+    // task-961: subtype inheritance must NOT fan a subtype-instance into a
+    // DERIVED Fact Type (a derivation consequent). The pre-#890 loop emitted
+    // a presence-binding `<<Sup-role, instance>>` into EVERY FT where the
+    // supertype plays a role; for an ASSERTED FT (e.g. `Vehicle has Color`)
+    // that is the intended supertype-membership fact every consumer needs.
+    // But a DERIVED FT (e.g. `Noun is instantiable`, whose membership is
+    // COMPUTED by its own derivation rule) must be populated ONLY by that
+    // rule. Force-asserting subtype members into it bypasses the rule's
+    // guard (`Noun has Object Type 'entity' …`) and contaminates the cell
+    // with every Fact-Type / Status instance (since `Fact Type` and `Status`
+    // are subtypes of `Noun`, and `Noun is instantiable` has a `Noun` role).
+    // Skip any FT that is some derivation rule's consequent cell.
+    let derived_ft_ids: HashSet<String> = data.derivation_rules.iter()
+        .map(|r| r.consequent_cell.literal_id().to_string())
+        .collect();
     // Collect per-(sub, sup, ft, super_role) Funcs in declaration
     // order. The fanout matches the pre-#890 loop exactly: every
     // (subtype, supertype) pair × every FT where the supertype plays
@@ -6541,6 +6556,8 @@ pub(crate) fn compile_subtype_inheritance_metamodel(
     let inner_funcs: Vec<Func> = data.subtypes.iter()
         .flat_map(|(sub_name, super_name)| {
             data.fact_types.iter()
+                // task-961: never inherit into a derived (consequent) FT.
+                .filter(|(ft_id, _)| !derived_ft_ids.contains(*ft_id))
                 .flat_map(move |(ft_id, ft)| {
                     let sub = sub_name.clone();
                     let sup = super_name.clone();
@@ -12609,6 +12626,125 @@ mod mandatory_role_alethic_rejection_tests {
         assert!(mc_violations.is_empty(),
             "MC must NOT fire when foo1 participates in `Foo has Bar`; \
              got mc violations {:?}", mc_violations);
+    }
+
+    /// task-961 contamination repro: the `Noun is instantiable` metamodel
+    /// derivation must materialize ONLY true entity types, never Fact-Type /
+    /// Status / SM / event instances.
+    ///
+    /// Live symptom (tasks.db): `Noun_is_instantiable` carried 35 rows that
+    /// were fact types ("App displays Noun"), statuses ("pending"), SMs
+    /// ("Task SM") and events ("Task is started"), with the real entity types
+    /// (Task, App, Domain, Source File) MISSING.
+    ///
+    /// Root cause (NOT a regression from the 1e3fb787 Insert-unit fix): the
+    /// subtype-inheritance metamodel derivation (`compile_subtype_inheritance_
+    /// metamodel`, #890) fans an instance of a Noun-subtype into EVERY Fact
+    /// Type where the supertype `Noun` plays a role — INCLUDING the DERIVED FT
+    /// `Noun is instantiable` (a derivation consequent). Because `Fact Type is
+    /// a subtype of Noun` (core.md:7) and `Status is a subtype of Noun`
+    /// (core.md:8), every Fact-Type / Status instance gets force-asserted into
+    /// `Noun_is_instantiable` as `<<Noun, X>>`, bypassing the rule's
+    /// objectType='entity' guard. A subtype member is NOT automatically
+    /// instantiable; a derived predicate must be populated ONLY by its own
+    /// derivation rule.
+    ///
+    /// Fixture: `Fact Type` is a subtype of `Noun`; `Noun is instantiable`
+    /// is the derived consequent; two Fact-Type instances are reflected so
+    /// subtype inheritance fans them out, and two true entity types carry the
+    /// antecedent facts the real rule needs. RED before the fix
+    /// (`Noun_is_instantiable` contains the fact-type instances); GREEN after
+    /// (subtype inheritance skips derivation-consequent FTs, so the cell is
+    /// exactly the two true entity types the rule derived).
+    #[test]
+    fn noun_is_instantiable_materializes_only_true_entity_types() {
+        let src = "\
+            Noun(.name) is an entity type.\n\
+            Fact Type(.id) is an entity type.\n\
+              Fact Type is a subtype of Noun.\n\
+            Object Type is a value type.\n\
+            Arity is a value type.\n\
+            Reference is a value type.\n\
+            Noun has Object Type.\n\
+              Each Noun has at most one Object Type.\n\
+            Fact Type has Arity.\n\
+            Noun has Reference Scheme Noun.\n\
+            Noun is instantiable.\n\
+            * Noun is instantiable iff Noun has Object Type 'entity' and Noun has some Reference Scheme Noun.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let defs = compile_to_defs_state(&state);
+        let mut d = ast::defs_to_state(&defs, &state);
+
+        // Two TRUE entity types. They carry the antecedent facts the real rule
+        // needs: a value-bearing `Noun has Object Type 'entity'` row and a
+        // `Noun has some Reference Scheme Noun` row — so the legitimate
+        // derivation fires for them (proving the GREEN side is the real
+        // entities, not merely "empty").
+        for name in ["Task", "Source File"] {
+            d = ast::cell_push("Noun", ast::fact_from_pairs(&[
+                ("name", name), ("objectType", "entity"), ("referenceScheme", "id"),
+                ("worldAssumption", "closed"),
+            ]), &d);
+            d = ast::cell_push("Noun_has_Object_Type", ast::fact_from_pairs(&[
+                ("Noun", name), ("Object Type", "entity"),
+            ]), &d);
+            d = ast::cell_push("Noun_has_Reference_scheme_Noun", ast::fact_from_pairs(&[
+                ("Noun", name), ("Reference", "id"),
+            ]), &d);
+        }
+        // Two Fact-Type instances — subtypes of Noun. Bound to the `Fact Type`
+        // role of `Fact Type has Arity` so `instances_of_noun("Fact Type")`
+        // finds them; subtype inheritance then (pre-fix) sweeps them into the
+        // DERIVED `Noun_is_instantiable` FT as subject-only `<<Noun, X>>`.
+        for ftid in ["App displays Noun", "Task has Task Status"] {
+            d = ast::cell_push("FactType", ast::fact_from_pairs(&[
+                ("id", ftid), ("reading", ftid), ("arity", "2"),
+            ]), &d);
+            d = ast::cell_push("Fact_Type_has_Arity", ast::fact_from_pairs(&[
+                ("Fact Type", ftid), ("Arity", "2"),
+            ]), &d);
+        }
+
+        // Chain the FULL derivation set — crucially INCLUDING the synthetic
+        // subtype-inheritance derivation (`derivation:_subtype_*`), which the
+        // live engine runs and which is the contamination source. Filtering to
+        // `derivation:rule_` would hide the bug.
+        let refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d)
+            .into_iter()
+            .filter(|(n, _)| n.starts_with("derivation:"))
+            .map(|(n, c)| (n.to_string(), ast::metacompose(c, &d)))
+            .collect();
+        let refs: Vec<(&str, &ast::Func)> = refs_owned.iter()
+            .map(|(n, f)| (n.as_str(), f)).collect();
+        let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+
+        let inst: Vec<String> = ast::fetch_cell_seq("Noun_is_instantiable", &new_d)
+            .as_seq()
+            .map(|s| s.iter()
+                .filter_map(|f| ast::binding(f, "Noun").map(String::from))
+                .collect())
+            .unwrap_or_default();
+
+        // The two true entity types MUST be present.
+        assert!(inst.iter().any(|n| n == "Task"),
+            "Noun_is_instantiable must include the entity type `Task`; got {:?}", inst);
+        assert!(inst.iter().any(|n| n == "Source File"),
+            "Noun_is_instantiable must include the entity type `Source File`; got {:?}", inst);
+        // No Fact-Type instance may leak in (subtype-inheritance contamination).
+        assert!(!inst.iter().any(|n| n == "App displays Noun"),
+            "Noun_is_instantiable must NOT include the fact-type `App displays Noun` \
+             (subtype-inheritance must skip derived-consequent FTs); got {:?}", inst);
+        assert!(!inst.iter().any(|n| n == "Task has Task Status"),
+            "Noun_is_instantiable must NOT include the fact-type `Task has Task Status` \
+             (subtype-inheritance must skip derived-consequent FTs); got {:?}", inst);
+        // Tight check: instantiable is EXACTLY the two true entity types.
+        let mut got = inst.clone();
+        got.sort();
+        got.dedup();
+        assert_eq!(got, vec!["Source File".to_string(), "Task".to_string()],
+            "Noun_is_instantiable must be EXACTLY the true entity types; got {:?}", inst);
     }
 }
 
