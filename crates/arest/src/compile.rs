@@ -6418,6 +6418,20 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
                 nouns.push(shr.role.clone());
             }
         }
+        // task-934-2: Append consequent-only literal-pinned roles that are
+        // NOT already present. For skolem join rules the consequent_bindings
+        // is left empty (to use all antecedent nouns + skolem head), but a
+        // consequent_role_literal like `Component Role ‘text-input’` is on a
+        // role that appears ONLY in the consequent FT, never in any antecedent
+        // FT. Without this step the literal-pin branch in binding_parts (step
+        // 2) never fires for that role because it is not in `binding_nouns`,
+        // so the derived fact omits the pinned value. Adding the role here
+        // ensures step 2 emits `<Component Role, ‘text-input’>` in the output.
+        for crl in rule.consequent_role_literals.iter() {
+            if !nouns.contains(&crl.role) {
+                nouns.push(crl.role.clone());
+            }
+        }
         nouns
     };
 

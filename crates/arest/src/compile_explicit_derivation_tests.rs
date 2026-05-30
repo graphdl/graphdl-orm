@@ -5128,3 +5128,325 @@ ViewElement has Component Role. *
         "all compiled collection-list VEs must have Component Role 'list'; got {:?}", role_vals);
 }
 
+// ─── task-934-2 — instance-detail (form) view derivation ────────────────────
+//
+// The instance/detail view projects one ViewElement per Fact Type that a Noun
+// participates in, with the Component Role chosen by the Fact Type's value-type
+// Format (§3.2 of view-projection-design.md). The derivation uses the SKOLEM
+// head + JOIN mechanism proven for the collection-list and menu views.
+//
+// Key differences from collection-list:
+//   - 4 antecedent FTs (vs 3): View_is_for_Noun, View_has_View_Kind,
+//     Fact_Type_has_Role, Role_is_played_by_Noun
+//   - Widget rules add a 5th antecedent: Fact_Type_has_Format (literal filter)
+//   - Frontier is (View, Noun, Fact Type, Role) — 4 entity-typed nouns
+//   - One VE per (View, FT), not per (View, Resource)
+//
+// Layout (mini-schema):
+//
+//   Entity types  : Noun, Role, Fact Type, View, ViewElement
+//   Value types   : NounName, RoleName, FTName, Name, veid,
+//                   View Kind, Component Role, Format
+//   Fact types    : View is for Noun
+//                   View has View Kind     (literal 'instance' filter)
+//                   Fact Type has Role
+//                   Role is played by Noun (join bridge: Role → Noun)
+//                   Fact Type has Format   (literal 'text'/'date'/'boolean')
+//                   ViewElement renders Fact Type. *
+//                   ViewElement has Component Role. *
+//
+//   Five skolem rules (all with View-lazy `*`):
+//     renders       iff 4-antecedent join (no Format filter)
+//     'text-input'  iff 5-antecedent join (Format 'text')
+//     'date-picker' iff 5-antecedent join (Format 'date')
+//     'checkbox'    iff 5-antecedent join (Format 'boolean')
+//
+//   Population:
+//     Noun 'Task'
+//     FT 'ft-title'  → Role 'r-title'  → Noun 'Task', Format 'text'
+//     FT 'ft-due'    → Role 'r-due'    → Noun 'Task', Format 'date'
+//     FT 'ft-active' → Role 'r-active' → Noun 'Task', Format 'boolean'
+//     View 'task-form'  → Noun 'Task',  Kind 'instance'   → 3 VEs (renders)
+//     View 'task-list'  → Noun 'Task',  Kind 'collection' → 0 VEs (filter)
+//
+// Assertions:
+//   (a) 3 VEs for task-form (one per FT of Task)
+//   (b) 0 VEs for task-list (View Kind 'collection' filtered out)
+//   (c) deterministic ve_<16 hex> ids
+//   (d) idempotent across a second resolve pass
+//   (e) Fact Type values carried through
+//   (f) shared frontier: renders and Component Role heads produce SAME ve_<fnv>
+//   (g) LAZY — no eager derivation: def for any head
+//   (h) correct widget per Format: text→text-input, date→date-picker,
+//       boolean→checkbox
+#[test]
+fn instance_detail_view_derivation_compiled_from_authored_reading() {
+    use crate::ast::{defs_to_state, resolve_view};
+
+    // Authored reading — the five shared-frontier skolem rules from
+    // readings/ui/view-detail.md, over the verified metamodel FT names.
+    // `ViewElement renders Fact Type. *` and `ViewElement has Component
+    // Role. *` mark all heads View-materialized (lazy). The antecedents
+    // are spelled exactly as the metamodel declares them.
+    let src = r#"# task-934-2 authored instance-detail view
+Noun(.NounName) is an entity type.
+NounName is a value type.
+Role(.RoleName) is an entity type.
+RoleName is a value type.
+Fact Type(.FTName) is an entity type.
+FTName is a value type.
+View(.Name) is an entity type.
+Name is a value type.
+ViewElement(.veid) is an entity type.
+veid is a value type.
+View Kind is a value type.
+  The possible values of View Kind are 'collection', 'instance', 'menu'.
+Component Role is a value type.
+Format is a value type.
+
+## Fact Types
+View is for Noun.
+  Each View is for exactly one Noun.
+View has View Kind.
+  Each View has exactly one View Kind.
+Fact Type has Role.
+  Each Fact Type has some Role.
+  For each Role, exactly one Fact Type has that Role.
+Role is played by Noun.
+  For each Role, exactly one Noun is played by that Role.
+Fact Type has Format.
+  Each Fact Type has at most one Format.
+ViewElement renders Fact Type. *
+ViewElement has Component Role. *
+
+## Derivation Rules
+* ViewElement (E) renders Fact Type (FT) iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun.
+* ViewElement (E) has Component Role 'text-input' iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has Format 'text'.
+* ViewElement (E) has Component Role 'date-picker' iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has Format 'date'.
+* ViewElement (E) has Component Role 'checkbox' iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has Format 'boolean'.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let data = compile::cell_index_from_state(&state);
+
+    // ── All rules must parse as View-materialized Joins with a skolem head ──
+    let renders_rule = data.derivation_rules.iter()
+        .find(|r| r.text.contains("renders Fact Type"))
+        .expect("renders Fact Type rule must parse");
+    let text_rule = data.derivation_rules.iter()
+        .find(|r| r.text.contains("'text-input'"))
+        .expect("text-input rule must parse");
+    let date_rule = data.derivation_rules.iter()
+        .find(|r| r.text.contains("'date-picker'"))
+        .expect("date-picker rule must parse");
+    let checkbox_rule = data.derivation_rules.iter()
+        .find(|r| r.text.contains("'checkbox'"))
+        .expect("checkbox rule must parse");
+
+    for (label, rule) in [
+        ("renders", renders_rule),
+        ("text-input", text_rule),
+        ("date-picker", date_rule),
+        ("checkbox", checkbox_rule),
+    ] {
+        assert!(matches!(rule.materialization, crate::types::MaterializationPolicy::View),
+            "{label} rule must be View-materialized (lazy); got {:?}", rule.materialization);
+        assert_eq!(rule.kind, DerivationKind::Join,
+            "{label} rule must promote to a Join over the antecedent chain; \
+             got {:?}\njoin_on: {:?}\ntext: {}", rule.kind, rule.join_on, rule.text);
+        assert!(rule.skolem_head_roles.iter().any(|s| s.role == "ViewElement"),
+            "{label} rule must record a SkolemHeadRole for the fresh ViewElement (E); \
+             got {:#?}\ntext: {}", rule.skolem_head_roles, rule.text);
+        // Entity-typed frontier must include View, Noun, Fact Type, Role.
+        let shr = rule.skolem_head_roles.iter().find(|s| s.role == "ViewElement").unwrap();
+        for expected in ["View", "Noun", "Fact Type", "Role"] {
+            assert!(shr.frontier.contains(&expected.to_string()),
+                "{label} skolem frontier must include {expected}; got {:?}", shr.frontier);
+        }
+        // Value-typed nouns must be excluded (View Kind, Format, Component Role).
+        for excluded in ["View Kind", "Format", "Component Role"] {
+            assert!(!shr.frontier.contains(&excluded.to_string()),
+                "{label} skolem frontier must EXCLUDE value-typed {excluded}; got {:?}", shr.frontier);
+        }
+        // Join keys must include Noun (View→Noun join with Role→Noun) and
+        // Role (Fact_Type_has_Role ↔ Role_is_played_by_Noun).
+        assert!(rule.join_on.contains(&"Noun".to_string()),
+            "{label} Noun must be a join key; got {:?}", rule.join_on);
+        assert!(rule.join_on.contains(&"Role".to_string()),
+            "{label} Role must be a join key; got {:?}", rule.join_on);
+    }
+
+    // SHARED FRONTIER: all four sibling rules must skolemise off the IDENTICAL
+    // frontier so the ve_<fnv> id matches across renders and all Component Role heads.
+    {
+        let fa = &renders_rule.skolem_head_roles.iter()
+            .find(|s| s.role == "ViewElement").unwrap().frontier;
+        for (label, rule) in [("text-input", text_rule), ("date-picker", date_rule), ("checkbox", checkbox_rule)] {
+            let fb = &rule.skolem_head_roles.iter()
+                .find(|s| s.role == "ViewElement").unwrap().frontier;
+            assert_eq!(fa, fb,
+                "renders and {label} heads MUST share an identical skolem frontier \
+                 (shared-frontier invariant); renders {:?} vs {label} {:?}", fa, fb);
+        }
+    }
+
+    // ── Compile to defs; all heads emit a `view:` def, NO `derivation:` def ──
+    let defs = compile::compile_to_defs_state(&state);
+    let d = defs_to_state(&defs, &state);
+    let cons_renders = "ViewElement_renders_Fact_Type";
+    let cons_role    = "ViewElement_has_Component_Role";
+    assert!(!matches!(ast::fetch_raw(&format!("view:{}", cons_renders), &d), Object::Bottom),
+        "renders Fact Type head must emit a view: def");
+    assert!(!matches!(ast::fetch_raw(&format!("view:{}", cons_role), &d), Object::Bottom),
+        "Component Role head must emit a view: def");
+    // (g) LAZY guard — no eager derivation: def for ANY head
+    for (label, rule) in [
+        ("renders", renders_rule), ("text-input", text_rule),
+        ("date-picker", date_rule), ("checkbox", checkbox_rule),
+    ] {
+        assert!(matches!(ast::fetch_raw(&format!("derivation:{}", rule.id), &d), Object::Bottom),
+            "{label} head must be lazy (view: only, no derivation: def)");
+    }
+
+    // ── Population ──────────────────────────────────────────────────────────
+    //   Noun 'Task' with 3 FTs:
+    //     ft-title  → role r-title  → Noun Task, Format 'text'
+    //     ft-due    → role r-due    → Noun Task, Format 'date'
+    //     ft-active → role r-active → Noun Task, Format 'boolean'
+    //   View 'task-form'  → Noun Task, Kind 'instance'   → 3 VEs
+    //   View 'task-list'  → Noun Task, Kind 'collection' → 0 VEs (filter)
+    let pop = {
+        let push = |s, cell: &str, pairs: &[(&str, &str)]|
+            ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+        let s = d.clone();
+        // Views
+        let s = push(s, "View_is_for_Noun", &[("View", "task-form"), ("Noun", "Task")]);
+        let s = push(s, "View_is_for_Noun", &[("View", "task-list"), ("Noun", "Task")]);
+        // View Kinds
+        let s = push(s, "View_has_View_Kind", &[("View", "task-form"), ("View Kind", "instance")]);
+        let s = push(s, "View_has_View_Kind", &[("View", "task-list"), ("View Kind", "collection")]);
+        // FT role membership: FT → Role → Noun
+        let s = push(s, "Fact_Type_has_Role", &[("Fact Type", "ft-title"),  ("Role", "r-title")]);
+        let s = push(s, "Fact_Type_has_Role", &[("Fact Type", "ft-due"),    ("Role", "r-due")]);
+        let s = push(s, "Fact_Type_has_Role", &[("Fact Type", "ft-active"), ("Role", "r-active")]);
+        // Role → Noun bindings (entity side: all roles played by Task)
+        let s = push(s, "Role_is_played_by_Noun", &[("Role", "r-title"),  ("Noun", "Task")]);
+        let s = push(s, "Role_is_played_by_Noun", &[("Role", "r-due"),    ("Noun", "Task")]);
+        let s = push(s, "Role_is_played_by_Noun", &[("Role", "r-active"), ("Noun", "Task")]);
+        // Format (value-type side, direct link to FT for test convenience)
+        let s = push(s, "Fact_Type_has_Format", &[("Fact Type", "ft-title"),  ("Format", "text")]);
+        let s = push(s, "Fact_Type_has_Format", &[("Fact Type", "ft-due"),    ("Format", "date")]);
+        let s = push(s, "Fact_Type_has_Format", &[("Fact Type", "ft-active"), ("Format", "boolean")]);
+        s
+    };
+
+    // ── (a)+(b): resolve the renders view lazily ──────────────────────────
+    let pass1 = resolve_view(cons_renders, &pop, &d)
+        .expect("compiled renders view: def must resolve via resolve_view");
+    let elems: Vec<(String, String, String)> = pass1.as_seq()
+        .map(|items| items.iter().filter_map(|f| {
+            let ve = ast::binding(f, "ViewElement").map(String::from)?;
+            let ft = ast::binding(f, "Fact Type").map(String::from)?;
+            let vw = ast::binding(f, "View").map(String::from)?;
+            Some((ve, ft, vw))
+        }).collect())
+        .unwrap_or_default();
+
+    // (a) task-form → exactly 3 ViewElements (one per FT of Task)
+    let form_elems: Vec<&(String, String, String)> =
+        elems.iter().filter(|(_, _, vw)| vw == "task-form").collect();
+    assert_eq!(form_elems.len(), 3,
+        "task-form (instance, Noun=Task, 3 FTs) must produce 3 ViewElements; \
+         got {:?}\nfull: {:#?}", form_elems, elems);
+
+    // (b) task-list → 0 ViewElements (View Kind 'collection' filtered out)
+    let list_elems: Vec<&(String, String, String)> =
+        elems.iter().filter(|(_, _, vw)| vw == "task-list").collect();
+    assert_eq!(list_elems.len(), 0,
+        "task-list (collection kind) must produce ZERO ViewElements — the \
+         'instance' literal filter must exclude it; got {:?}\nfull: {:#?}",
+        list_elems, elems);
+
+    // (c) deterministic ve_<16 hex> ids
+    for (id, ft, vw) in &elems {
+        assert!(id.starts_with("ve_") && id.len() == "ve_".len() + 16,
+            "VE id must be ve_<16 hex>; got {:?} for ({}, {})", id, vw, ft);
+    }
+
+    // (e) Fact Type values carried through (all three FTs appear)
+    let form_fts: Vec<&str> =
+        form_elems.iter().map(|(_, ft, _)| ft.as_str()).collect();
+    assert!(form_fts.contains(&"ft-title"),
+        "ft-title must appear in task-form renders; got {:?}", form_fts);
+    assert!(form_fts.contains(&"ft-due"),
+        "ft-due must appear in task-form renders; got {:?}", form_fts);
+    assert!(form_fts.contains(&"ft-active"),
+        "ft-active must appear in task-form renders; got {:?}", form_fts);
+
+    // (d) idempotent across a second resolve pass
+    let pass2 = resolve_view(cons_renders, &pop, &d)
+        .expect("compiled renders view: def must resolve on pass 2");
+    let mut ids1: Vec<String> = form_elems.iter().map(|(id, ..)| id.clone()).collect();
+    let mut ids2: Vec<String> = pass2.as_seq()
+        .map(|items| items.iter()
+            .filter_map(|f| {
+                let ve = ast::binding(f, "ViewElement").map(String::from)?;
+                let vw = ast::binding(f, "View").map(String::from)?;
+                (vw == "task-form").then_some(ve)
+            }).collect())
+        .unwrap_or_default();
+    ids1.sort();
+    ids2.sort();
+    assert_eq!(ids1, ids2,
+        "COMPILED instance-detail view must be idempotent (same frontier → same ve_<fnv>); \
+         pass1 {:?} vs pass2 {:?}", ids1, ids2);
+
+    // (f) shared frontier: all Component Role heads produce the SAME ve_<fnv> ids
+    let role_view = resolve_view(cons_role, &pop, &d)
+        .expect("compiled Component Role view: def must resolve");
+    let role_rows: Vec<(String, String, String)> = role_view.as_seq()
+        .map(|items| items.iter().filter_map(|f| {
+            let ve   = ast::binding(f, "ViewElement").map(String::from)?;
+            let role = ast::binding(f, "Component Role").map(String::from)?;
+            let vw   = ast::binding(f, "View").map(String::from)?;
+            Some((ve, role, vw))
+        }).collect())
+        .unwrap_or_default();
+    let form_role_rows: Vec<&(String, String, String)> =
+        role_rows.iter().filter(|(_, _, vw)| vw == "task-form").collect();
+    assert_eq!(form_role_rows.len(), 3,
+        "Component Role head must produce 3 VE bindings for task-form; \
+         got {:?}", form_role_rows);
+    let mut role_ids: Vec<String> = form_role_rows.iter().map(|(id, _, _)| id.clone()).collect();
+    role_ids.sort();
+    assert_eq!(ids1, role_ids,
+        "SHARED FRONTIER: renders and Component Role heads MUST produce identical \
+         ve_<fnv> ids (same (View,Noun,Fact Type,Role) → same hash). \
+         renders {:?} vs role {:?}", ids1, role_ids);
+
+    // (h) correct widget per Format
+    //   ft-title  (Format 'text')    → Component Role 'text-input'
+    //   ft-due    (Format 'date')    → Component Role 'date-picker'
+    //   ft-active (Format 'boolean') → Component Role 'checkbox'
+    //
+    // Resolve each widget view and look up by VE id.
+    let ft_to_ve: std::collections::HashMap<String, String> =
+        form_elems.iter().map(|(ve, ft, _)| (ft.clone(), ve.clone())).collect();
+
+    let title_ve  = ft_to_ve.get("ft-title").expect("ft-title must have a VE id");
+    let due_ve    = ft_to_ve.get("ft-due").expect("ft-due must have a VE id");
+    let active_ve = ft_to_ve.get("ft-active").expect("ft-active must have a VE id");
+
+    let role_by_ve: std::collections::HashMap<String, String> =
+        form_role_rows.iter().map(|(ve, role, _)| (ve.clone(), role.clone())).collect();
+
+    assert_eq!(role_by_ve.get(title_ve).map(String::as_str), Some("text-input"),
+        "ft-title (Format 'text') → VE {title_ve} must have Component Role 'text-input'; \
+         got {:?}\nrole_by_ve: {:?}", role_by_ve.get(title_ve), role_by_ve);
+    assert_eq!(role_by_ve.get(due_ve).map(String::as_str), Some("date-picker"),
+        "ft-due (Format 'date') → VE {due_ve} must have Component Role 'date-picker'; \
+         got {:?}\nrole_by_ve: {:?}", role_by_ve.get(due_ve), role_by_ve);
+    assert_eq!(role_by_ve.get(active_ve).map(String::as_str), Some("checkbox"),
+        "ft-active (Format 'boolean') → VE {active_ve} must have Component Role 'checkbox'; \
+         got {:?}\nrole_by_ve: {:?}", role_by_ve.get(active_ve), role_by_ve);
+}
+
