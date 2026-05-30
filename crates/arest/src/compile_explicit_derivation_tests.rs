@@ -5450,6 +5450,109 @@ ViewElement has Component Role. *
          got {:?}\nrole_by_ve: {:?}", role_by_ve.get(active_ve), role_by_ve);
 }
 
+// ─── task-viewproj — view_via_rho projection (hybrid: default + override) ─────
+//
+// Proves the COMMAND-layer View projection (the iFactr/MonoView "abstract UI"
+// half of the Theorem-4 HATEOAS representation) over the SAME view-detail
+// skolem rules the GREEN derivation test above exercises:
+//   - Tier 1 (iFactr default): NO authored View → view_via_rho SYNTHESIZES a
+//     transient instance View; one widget per value-typed Fact Type, the widget
+//     keyed off the Format (text→text-input, date→date-picker, bool→checkbox).
+//   - Tier 2 (MonoView override): an authored instance View for the Noun WINS
+//     (source='authored', the authored View id surfaces) — the hybrid the user
+//     chose: synthesized default, authored override.
+// This is the seam the kernel HATEOAS browser / ui.do worker consume to render
+// a form for an entity. Returns None where ui-readings is off (no view: defs).
+#[test]
+fn view_via_rho_synthesizes_default_and_honors_authored_override() {
+    let src = r#"# task-viewproj projection test — view-detail rules
+Noun(.NounName) is an entity type.
+NounName is a value type.
+Role(.RoleName) is an entity type.
+RoleName is a value type.
+Fact Type(.FTName) is an entity type.
+FTName is a value type.
+View(.Name) is an entity type.
+Name is a value type.
+ViewElement(.veid) is an entity type.
+veid is a value type.
+View Kind is a value type.
+  The possible values of View Kind are 'collection', 'instance', 'menu'.
+Component Role is a value type.
+Format is a value type.
+
+## Fact Types
+View is for Noun.
+  Each View is for exactly one Noun.
+View has View Kind.
+  Each View has exactly one View Kind.
+Fact Type has Role.
+  Each Fact Type has some Role.
+  For each Role, exactly one Fact Type has that Role.
+Role is played by Noun.
+  For each Role, exactly one Noun is played by that Role.
+Fact Type has Format.
+  Each Fact Type has at most one Format.
+ViewElement renders Fact Type. *
+ViewElement has Component Role. *
+
+## Derivation Rules
+* ViewElement (E) renders Fact Type (FT) iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun.
+* ViewElement (E) has Component Role 'text-input' iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has Format 'text'.
+* ViewElement (E) has Component Role 'date-picker' iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has Format 'date'.
+* ViewElement (E) has Component Role 'checkbox' iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has Format 'boolean'.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let defs = compile::compile_to_defs_state(&state);
+    let d0 = ast::defs_to_state(&defs, &state);
+
+    // Base population: Noun 'Task' with 3 value-typed FTs. NO View authored.
+    let push = |s: ast::Object, cell: &str, pairs: &[(&str, &str)]|
+        ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+    let base = {
+        let s = d0.clone();
+        let s = push(s, "Fact_Type_has_Role", &[("Fact Type", "ft-title"),  ("Role", "r-title")]);
+        let s = push(s, "Fact_Type_has_Role", &[("Fact Type", "ft-due"),    ("Role", "r-due")]);
+        let s = push(s, "Fact_Type_has_Role", &[("Fact Type", "ft-active"), ("Role", "r-active")]);
+        let s = push(s, "Role_is_played_by_Noun", &[("Role", "r-title"),  ("Noun", "Task")]);
+        let s = push(s, "Role_is_played_by_Noun", &[("Role", "r-due"),    ("Noun", "Task")]);
+        let s = push(s, "Role_is_played_by_Noun", &[("Role", "r-active"), ("Noun", "Task")]);
+        let s = push(s, "Fact_Type_has_Format", &[("Fact Type", "ft-title"),  ("Format", "text")]);
+        let s = push(s, "Fact_Type_has_Format", &[("Fact Type", "ft-due"),    ("Format", "date")]);
+        let s = push(s, "Fact_Type_has_Format", &[("Fact Type", "ft-active"), ("Format", "boolean")]);
+        s
+    };
+
+    // ── Tier 1: synthesized default (no authored View) ──
+    let vp = crate::command::view_via_rho(&base, "Task", "task-1")
+        .expect("synthesized instance view must project for a Noun with value-typed FTs");
+    assert_eq!(vp.source, "synthesized", "no authored View → iFactr default tier");
+    assert_eq!(vp.kind, "instance");
+    assert_eq!(vp.view, "instance-view-Task", "synthesized View id is the deterministic slug");
+    assert_eq!(vp.elements.len(), 3, "one widget per value-typed FT; got {:#?}", vp.elements);
+    let widget = |ft: &str| vp.elements.iter().find(|e| e.fact_type == ft).map(|e| e.component_role.as_str());
+    assert_eq!(widget("ft-title"),  Some("text-input"),  "text Format → text-input");
+    assert_eq!(widget("ft-due"),    Some("date-picker"), "date Format → date-picker");
+    assert_eq!(widget("ft-active"), Some("checkbox"),    "boolean Format → checkbox");
+    for e in &vp.elements {
+        assert!(e.id.starts_with("ve_") && e.id.len() == "ve_".len() + 16,
+            "element id must be the skolem ve_<16hex>; got {:?}", e.id);
+    }
+
+    // ── Tier 2: authored override wins (source='authored', authored id) ──
+    let authored = {
+        let s = push(base.clone(), "View_is_for_Noun", &[("View", "task-custom"), ("Noun", "Task")]);
+        push(s, "View_has_View_Kind", &[("View", "task-custom"), ("View Kind", "instance")])
+    };
+    let vp2 = crate::command::view_via_rho(&authored, "Task", "task-1")
+        .expect("authored instance view must project");
+    assert_eq!(vp2.source, "authored", "an authored instance View overrides the synthesized default");
+    assert_eq!(vp2.view, "task-custom", "the authored View id surfaces");
+    assert_eq!(vp2.elements.len(), 3, "authored View derives the same 3 widgets; got {:#?}", vp2.elements);
+    let widget2 = |ft: &str| vp2.elements.iter().find(|e| e.fact_type == ft).map(|e| e.component_role.as_str());
+    assert_eq!(widget2("ft-due"), Some("date-picker"), "widgets still value-type-driven under override");
+}
+
 // ─── task-934-2 — real-data format projection ────────────────────────────────
 //
 // Proves that `Fact_Type_has_Format` and `Fact_Type_has_Enum_Values` are
