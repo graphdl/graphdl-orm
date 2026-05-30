@@ -152,7 +152,7 @@ projection (the identifying fact + at most one or two summary facts).
 | --- | --- | --- | --- |
 | the Noun itself | `RootElement(title)` / a screen | — (the surface) | `IListView` (`ViewKind:"ListView"`), `Title` = Noun `Plural` |
 | each instance | a `StringElement` row (drill-in) | `list` Component, one row each | `Section.Cells[]` of `IContentCell` **or** legacy `iList.Items[]` of `iItem` |
-| Noun **reference scheme** (`Noun has Reference Scheme Noun`) → the identifying value | the row's caption | row primary text | `IContentCell.TextLabel` / `iItem.Text` |
+| Noun **reference scheme** (`Noun has Reference Scheme` → the absorbed `referenceScheme` identifying value) | the row's caption | row primary text | `IContentCell.TextLabel` / `iItem.Text` |
 | a designated **summary** Fact Type (see §6 Q3) | row subtitle | row subtext | `IContentCell.SubtextLabel` / `SubtextItem.Subtext` |
 | drill-in to the instance | tappable row → nested `RootElement` | `list` selection event | `IContentCell.NavigationLink` (`Link.Address` = instance URL) |
 | SM transitions on the Noun that are *creational* (no `from` Status) | top "+" button | `button` (primary) | `iLayer.ActionButtons[]` `Button{Action:Add}` / `IMenu` button |
@@ -350,7 +350,7 @@ projection** viewed at two fidelities.
     and Vw has View Kind 'collection'.
 
 + <row caption> is the reference-scheme value of the instance
-    if N has Reference Scheme Noun (R)
+    if N has Reference Scheme (R)
     and <instance's R-valued fact>.        -- row primary text = identifying value
 ```
 

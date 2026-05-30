@@ -12746,6 +12746,153 @@ mod mandatory_role_alethic_rejection_tests {
         assert_eq!(got, vec!["Source File".to_string(), "Task".to_string()],
             "Noun_is_instantiable must be EXACTLY the true entity types; got {:?}", inst);
     }
+
+    /// task-961 Phase A — the derivation rework. The 2nd conjunct of
+    /// `Noun is instantiable` must materialize REAL entity types from the
+    /// absorbed `referenceScheme` field on the Noun cell, NOT from a manually
+    /// populated entity-valued `Noun has Reference Scheme Noun` fact (which
+    /// never lands for real entities — their identity lives in the absorbed
+    /// field). The fix is a VALUE-typed presence projection `Noun has
+    /// Reference Scheme`: `Reference Scheme` is a value type, so the
+    /// functional binary is RMAP-absorbed into the Noun cell and
+    /// `reconstitute_absorbed_ft` projects `<<Noun, X>, <Reference Scheme,
+    /// "id">>` for exactly those Nouns whose `referenceScheme` key is present.
+    ///
+    /// This test mirrors PRODUCTION (tasks.db) faithfully: it pushes ONLY the
+    /// Noun-cell registry facts — `objectType` for every noun and
+    /// `referenceScheme` ONLY on the true entity types — and pushes NO
+    /// `Noun_has_Object_Type` / `Noun_has_Reference_Scheme` fact-type facts at
+    /// all. BOTH conjuncts must reconstitute from the absorbed fields through
+    /// the view path (`FetchOrPhi -> resolve_view -> reconstitute_absorbed_ft`)
+    /// driving the join. Pre-Phase-A the 2nd conjunct pointed at the
+    /// entity-valued FT and reconstitution returned nothing, so the cell was
+    /// EMPTY for real entities; post-fix it materializes exactly Task +
+    /// Source File. A value-type (`Color`, no reference scheme) and a
+    /// fact-type instance must NOT appear.
+    #[test]
+    fn noun_is_instantiable_materializes_real_entities_from_reference_scheme_field() {
+        // Phase-A readings shape: value-typed `Reference Scheme` + the
+        // value-typed presence FT + the reworked derivation. No entity-valued
+        // `Noun has Reference Scheme Noun` anywhere.
+        let src = "\
+            Noun(.name) is an entity type.\n\
+            Fact Type(.id) is an entity type.\n\
+              Fact Type is a subtype of Noun.\n\
+            Object Type is a value type.\n\
+            Arity is a value type.\n\
+            Reference Scheme is a value type.\n\
+            Noun has Object Type.\n\
+              Each Noun has at most one Object Type.\n\
+            Fact Type has Arity.\n\
+            Noun has Reference Scheme.\n\
+              Each Noun has at most one Reference Scheme.\n\
+            Noun is instantiable.\n\
+            * Noun is instantiable iff Noun has Object Type 'entity' and Noun has some Reference Scheme.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let defs = compile_to_defs_state(&state);
+        let mut d = ast::defs_to_state(&defs, &state);
+
+        // True entity types: objectType='entity' AND a referenceScheme field
+        // (their `(.id)` identity). NO Noun_has_* fact-type facts pushed — the
+        // derivation must reconstitute both conjuncts from these fields.
+        for name in ["Task", "Source File"] {
+            d = ast::cell_push("Noun", ast::fact_from_pairs(&[
+                ("name", name), ("objectType", "entity"), ("referenceScheme", "id"),
+                ("worldAssumption", "closed"),
+            ]), &d);
+        }
+        // A value type: objectType='value', NO referenceScheme — entity-type
+        // conjunct fails AND reference-scheme conjunct fails. Must be excluded.
+        d = ast::cell_push("Noun", ast::fact_from_pairs(&[
+            ("name", "Color"), ("objectType", "value"),
+            ("worldAssumption", "closed"),
+        ]), &d);
+        // An ENTITY declared WITHOUT a reference scheme: objectType='entity'
+        // but NO referenceScheme field. 1st conjunct holds, 2nd fails — so it
+        // must be excluded (this is exactly the run-time-definedness gate's
+        // discriminator). Proves the projection is presence-driven, not just
+        // "every entity".
+        d = ast::cell_push("Noun", ast::fact_from_pairs(&[
+            ("name", "Schemaless"), ("objectType", "entity"),
+            ("worldAssumption", "closed"),
+        ]), &d);
+        // A Fact-Type instance — subtype of Noun. Bound to the `Fact Type`
+        // role so `instances_of_noun("Fact Type")` finds it; subtype
+        // inheritance must NOT sweep it into the derived consequent (69f96ff1).
+        d = ast::cell_push("FactType", ast::fact_from_pairs(&[
+            ("id", "App displays Noun"), ("reading", "App displays Noun"), ("arity", "2"),
+        ]), &d);
+        d = ast::cell_push("Fact_Type_has_Arity", ast::fact_from_pairs(&[
+            ("Fact Type", "App displays Noun"), ("Arity", "2"),
+        ]), &d);
+
+        // Chain the FULL derivation set (including synthetic subtype/SS rules).
+        let refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d)
+            .into_iter()
+            .filter(|(n, _)| n.starts_with("derivation:"))
+            .map(|(n, c)| (n.to_string(), ast::metacompose(c, &d)))
+            .collect();
+        let refs: Vec<(&str, &ast::Func)> = refs_owned.iter()
+            .map(|(n, f)| (n.as_str(), f)).collect();
+        let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+
+        let mut inst: Vec<String> = ast::fetch_cell_seq("Noun_is_instantiable", &new_d)
+            .as_seq()
+            .map(|s| s.iter()
+                .filter_map(|f| ast::binding(f, "Noun").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        inst.sort();
+        inst.dedup();
+
+        // PHASE-A CORE CLAIM: the real entity types materialize purely from
+        // the absorbed `referenceScheme` field — no entity-valued ref-scheme
+        // facts and no hand-pushed Noun_has_Object_Type facts were supplied.
+        // Pre-fix this cell was EMPTY for these (the 2nd conjunct pointed at
+        // the never-populated entity-valued FT); the join now fires because
+        // both conjuncts reconstitute from the Noun-cell fields.
+        assert!(inst.iter().any(|n| n == "Task"),
+            "Noun_is_instantiable must include `Task` (entity + referenceScheme) \
+             materialized from the absorbed field; got {:?}", inst);
+        assert!(inst.iter().any(|n| n == "Source File"),
+            "Noun_is_instantiable must include `Source File`; got {:?}", inst);
+
+        // PRESENCE-DRIVEN DISCRIMINATORS (the 2nd-conjunct fix proper):
+        //   * a VALUE type (objectType='value') fails the 1st conjunct, and
+        //     has no referenceScheme, so it must be absent;
+        //   * an ENTITY declared WITHOUT a reference scheme satisfies the 1st
+        //     conjunct but NOT the 2nd — it must be absent. This is exactly
+        //     the run-time-definedness gate's discriminator, now in readings.
+        assert!(!inst.iter().any(|n| n == "Color"),
+            "value type `Color` must NOT be instantiable; got {:?}", inst);
+        assert!(!inst.iter().any(|n| n == "Schemaless"),
+            "entity `Schemaless` WITHOUT a reference scheme must NOT be \
+             instantiable (presence-driven 2nd conjunct); got {:?}", inst);
+
+        // SUBTYPE-INHERITANCE CONTAMINATION GUARD (69f96ff1): a Fact-Type
+        // INSTANCE is a subtype member of Noun but must never be force-swept
+        // into this derived consequent.
+        assert!(!inst.iter().any(|n| n == "App displays Noun"),
+            "fact-type INSTANCE `App displays Noun` must NOT leak in via \
+             subtype inheritance; got {:?}", inst);
+
+        // EXACT SET: precisely the entity types that have a reference scheme.
+        // That is the four schema-declared entity types carrying a `(.col)`
+        // identity — the two fixture entities (Task, Source File) PLUS the
+        // metamodel entity types `Noun(.name)` and `Fact Type(.id)`, which are
+        // themselves legitimately instantiable (entity + reference scheme).
+        // The value type `Color`, the schemaless entity, and the fact-type
+        // instance are all correctly excluded.
+        assert_eq!(inst, vec![
+            "Fact Type".to_string(),
+            "Noun".to_string(),
+            "Source File".to_string(),
+            "Task".to_string(),
+        ], "Noun_is_instantiable must be EXACTLY the entity types with a \
+            reference scheme; got {:?}", inst);
+    }
 }
 
 // ── Task 807: validate_model_from_state modality policy ──────────────

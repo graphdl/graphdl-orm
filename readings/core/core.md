@@ -42,6 +42,7 @@ External System(.Name) is an entity type.
 
 URL is a value type.
 Secret Reference is a value type.
+Reference Scheme is a value type.
 
 Arity is a value type.
 Position is a value type.
@@ -125,7 +126,20 @@ Noun has Min Length.
 Noun has Max Length.
   Each Noun has at most one Max Length.
 Noun has Permission.
-Noun has Reference Scheme Noun.
+Noun has Reference Scheme.
+  Each Noun has at most one Reference Scheme.
+  <!-- task-961 Phase A: a VALUE-typed presence projection of the absorbed
+       `referenceScheme` field on the Noun cell. `Reference Scheme` is a
+       value type, so this functional binary is RMAP-absorbed into the Noun
+       cell (no own data cell) and `rmap::reconstitute_absorbed_ft` projects
+       it back out as `<<Noun, X>, <Reference Scheme, "id,…">>` for exactly
+       those Nouns whose `referenceScheme` key is present (an entity with a
+       declared `(.col)` reference scheme). lower_camel("Reference Scheme")
+       == "referenceScheme", so reconstitution locates the stored value.
+       This is the materializable 2nd conjunct of `Noun is instantiable`
+       below — it replaces the entity-valued `Noun has Reference Scheme
+       Noun`, which never populated for real entities (their identity lives
+       in the absorbed field, not an entity-valued fact). -->
 Noun is subtype of Noun.
 Noun is described to AI by prompt Text.
 Noun has World Assumption.
@@ -144,12 +158,21 @@ Noun is instantiable. **
        scheme (identity). The derivation under ## Derivation Rules below
        carries the logic; the Rust create/update gate at
        command.rs::noun_runtime_defined reads this stored cell first,
-       falling back to the procedural Noun-cell scan when the cell is empty
-       (covers states whose binary db has not yet been recompiled with
-       task-962's RMAP absorbed-FT reconstitution, shipped
-       83aab604/28f8028a). The `**` marker stores the consequent; once
-       every live db has been recompiled past 962, the procedural fallback
-       can delete and the gate becomes a pure cell query. -->
+       falling back to the procedural Noun-cell scan when the cell is empty.
+
+       task-961 Phase A (derivation rework): the 2nd conjunct now reads the
+       VALUE-typed presence projection `Noun has Reference Scheme` (above),
+       which reconstitutes from the absorbed `referenceScheme` field — so the
+       derivation MATERIALIZES the real entity types (Task, Source File, App,
+       Domain, …). Previously the 2nd conjunct pointed at the entity-valued
+       `Noun has Reference Scheme Noun`, which is never populated for real
+       entities, so this cell stayed empty for them and the procedural
+       fallback alone carried the gate. The `**` marker stores the consequent.
+
+       Phase B (follow-up, gated on Phase A verified materializing real
+       entities): add the alethic instantiability constraint over this cell
+       and delete the procedural fallback + Rust gate, making it a pure cell
+       query. DO NOT add a constraint over this cell while it could be empty. -->
 
 ### Reading
 Reading has Text.
@@ -330,7 +353,7 @@ Derivation Rule depends on Derivation Rule. *
 
 * Derivation Rule depends on Derivation Rule iff Derivation Rule has antecedent Fact Type and some other Derivation Rule produces that Fact Type.
 
-* Noun is instantiable iff Noun has Object Type 'entity' and Noun has some Reference Scheme Noun.
+* Noun is instantiable iff Noun has Object Type 'entity' and Noun has some Reference Scheme.
 
 Constraint is semantic iff Constraint has modality of Modality Type 'Deontic' and Constraint spans some Role and that Role is played by some Noun and no Resource is instance of that Noun.
 
