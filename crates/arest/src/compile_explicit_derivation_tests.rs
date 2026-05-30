@@ -5450,3 +5450,281 @@ ViewElement has Component Role. *
          got {:?}\nrole_by_ve: {:?}", role_by_ve.get(active_ve), role_by_ve);
 }
 
+// ─── task-934-2 — real-data format projection ────────────────────────────────
+//
+// Proves that `Fact_Type_has_Format` and `Fact_Type_has_Enum_Values` are
+// derived EAGERLY (via `**` rules), WITHOUT manually populating those cells.
+// The test populates only the raw metamodel facts:
+//   - Fact_Type_has_Role (FT → entity-side Role)
+//   - Role_is_played_by_Noun (entity-side Role → entity Noun)
+//   - Noun_has_Object_Type (value-type Noun → 'value')
+//   - Noun_has_Format (value-type Noun → Format string)
+//   - Noun_has_Enum_Values (enum Noun → Enum Values string)
+//
+// Then runs forward_chain to materialize the eager projections, and
+// assert_resolves the lazy widget rules against the derived population.
+//
+// Assertions:
+//   (1) Format projection rule is EAGER (Stored materialization)
+//   (2) Enum Values projection rule is EAGER (Stored materialization)
+//   (3) After forward chain: Fact_Type_has_Format populated (no manual push)
+//   (4) After forward chain: Fact_Type_has_Enum_Values populated (no manual push)
+//   (5) resolve_view for Component Role gives correct widgets:
+//       ft-title  (text)    → 'text-input'
+//       ft-due    (date)    → 'date-picker'
+//       ft-active (boolean) → 'checkbox'
+//       ft-prio   (enum)    → 'combo-box'
+//   (6) No overlap: each FT gets exactly ONE Component Role
+#[test]
+fn instance_detail_view_real_data_format_projection() {
+    use crate::ast::{defs_to_state, resolve_view};
+    use crate::types::MaterializationPolicy;
+
+    // ── Schema: full real-data structure ─────────────────────────────────────
+    // Includes Noun has Object Type, Noun has Format, Noun has Enum Values,
+    // Fact Type has Format (** eager), Fact Type has Enum Values (** eager),
+    // the two eager projection derivation rules, and the six lazy view rules.
+    let src = r#"# task-934-2 real-data format projection test
+Noun(.NounName) is an entity type.
+NounName is a value type.
+Role(.RoleName) is an entity type.
+RoleName is a value type.
+Fact Type(.FTName) is an entity type.
+FTName is a value type.
+View(.Name) is an entity type.
+Name is a value type.
+ViewElement(.veid) is an entity type.
+veid is a value type.
+View Kind is a value type.
+  The possible values of View Kind are 'collection', 'instance', 'menu'.
+Component Role is a value type.
+Format is a value type.
+Enum Values is a value type.
+Object Type is a value type.
+  The possible values of Object Type are 'entity', 'value'.
+
+## Fact Types
+View is for Noun.
+  Each View is for exactly one Noun.
+View has View Kind.
+  Each View has exactly one View Kind.
+Fact Type has Role.
+  Each Fact Type has some Role.
+  For each Role, exactly one Fact Type has that Role.
+Role is played by Noun.
+  For each Role, exactly one Noun is played by that Role.
+Noun has Object Type.
+  Each Noun has exactly one Object Type.
+Noun has Format.
+  Each Noun has at most one Format.
+Noun has Enum Values.
+  Each Noun has at most one Enum Values.
+Fact Type has Format. **
+  Each Fact Type has at most one Format.
+Fact Type has Enum Values. **
+  Each Fact Type has at most one Enum Values.
+ViewElement renders Fact Type. *
+ViewElement has Component Role. *
+
+## Derivation Rules
+** Fact Type has Format iff Fact Type has some Role and that Role is played by some Noun and that Noun has Object Type 'value' and that Noun has Format.
+** Fact Type has Enum Values iff Fact Type has some Role and that Role is played by some Noun and that Noun has Object Type 'value' and that Noun has some Enum Values.
+* ViewElement (E) renders Fact Type (FT) iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun.
+* ViewElement (E) has Component Role 'text-input' iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has Format 'text'.
+* ViewElement (E) has Component Role 'date-picker' iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has Format 'date'.
+* ViewElement (E) has Component Role 'checkbox' iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has Format 'boolean'.
+* ViewElement (E) has Component Role 'combo-box' iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has some Enum Values.
+"#;
+
+    let state = parse_to_state(src).expect("parse");
+    let model = compile::compile(&state);
+
+    // ── (1)+(2) Eager rule assertions ────────────────────────────────────────
+    // Format projection rule must be Stored (eager), not View.
+    let format_proj = model.derivations.iter()
+        .find(|d| d.text.contains("Fact Type has Format iff"))
+        .expect("Format projection rule must parse and compile");
+    assert!(matches!(format_proj.materialization, MaterializationPolicy::Stored),
+        "Format projection rule must be EAGER (Stored); got {:?}", format_proj.materialization);
+
+    let enum_proj = model.derivations.iter()
+        .find(|d| d.text.contains("Fact Type has Enum Values iff"))
+        .expect("Enum Values projection rule must parse and compile");
+    assert!(matches!(enum_proj.materialization, MaterializationPolicy::Stored),
+        "Enum Values projection rule must be EAGER (Stored); got {:?}", enum_proj.materialization);
+
+    // View rules must remain lazy (View materialization).
+    for label in ["renders Fact Type", "text-input", "date-picker", "checkbox", "combo-box"] {
+        let rule = model.derivations.iter()
+            .find(|d| d.text.contains(label))
+            .unwrap_or_else(|| panic!("{label} rule must parse and compile"));
+        assert!(matches!(rule.materialization, MaterializationPolicy::View),
+            "{label} rule must be LAZY (View); got {:?}", rule.materialization);
+    }
+
+    // ── Build defs state + empty population ──────────────────────────────────
+    let defs = compile::compile_to_defs_state(&state);
+    let d = defs_to_state(&defs, &state);
+
+    // ── Population: raw metamodel facts — NO manual Fact_Type_has_Format ─────
+    //
+    // Four entity FTs — each has one entity-side Role (played by Task).
+    // Four value-type Nouns — each plays one Role in its FT.
+    //
+    //   ft-title   → r-title-e  → Task (entity side)
+    //                r-title-v  → TitleT (value: Object Type 'value', Format 'text')
+    //   ft-due     → r-due-e    → Task
+    //                r-due-v    → DueT   (value: Object Type 'value', Format 'date')
+    //   ft-active  → r-active-e → Task
+    //                r-active-v → BoolT  (value: Object Type 'value', Format 'boolean')
+    //   ft-prio    → r-prio-e   → Task
+    //                r-prio-v   → PrioT  (value: Object Type 'value', Enum Values 'high,medium,low')
+    //
+    // View 'task-form' is for Noun 'Task', Kind 'instance'.
+    let pop = {
+        let push = |s, cell: &str, pairs: &[(&str, &str)]|
+            ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+        let s = d.clone();
+        // View
+        let s = push(s, "View_is_for_Noun",   &[("View", "task-form"), ("Noun", "Task")]);
+        let s = push(s, "View_has_View_Kind",  &[("View", "task-form"), ("View Kind", "instance")]);
+        // FT → entity-side Role → Task
+        let s = push(s, "Fact_Type_has_Role",       &[("Fact Type", "ft-title"),  ("Role", "r-title-e")]);
+        let s = push(s, "Role_is_played_by_Noun",   &[("Role", "r-title-e"),  ("Noun", "Task")]);
+        let s = push(s, "Fact_Type_has_Role",       &[("Fact Type", "ft-due"),    ("Role", "r-due-e")]);
+        let s = push(s, "Role_is_played_by_Noun",   &[("Role", "r-due-e"),    ("Noun", "Task")]);
+        let s = push(s, "Fact_Type_has_Role",       &[("Fact Type", "ft-active"), ("Role", "r-active-e")]);
+        let s = push(s, "Role_is_played_by_Noun",   &[("Role", "r-active-e"), ("Noun", "Task")]);
+        let s = push(s, "Fact_Type_has_Role",       &[("Fact Type", "ft-prio"),   ("Role", "r-prio-e")]);
+        let s = push(s, "Role_is_played_by_Noun",   &[("Role", "r-prio-e"),   ("Noun", "Task")]);
+        // FT → value-side Role → value-type Noun
+        let s = push(s, "Fact_Type_has_Role",       &[("Fact Type", "ft-title"),  ("Role", "r-title-v")]);
+        let s = push(s, "Role_is_played_by_Noun",   &[("Role", "r-title-v"),  ("Noun", "TitleT")]);
+        let s = push(s, "Fact_Type_has_Role",       &[("Fact Type", "ft-due"),    ("Role", "r-due-v")]);
+        let s = push(s, "Role_is_played_by_Noun",   &[("Role", "r-due-v"),    ("Noun", "DueT")]);
+        let s = push(s, "Fact_Type_has_Role",       &[("Fact Type", "ft-active"), ("Role", "r-active-v")]);
+        let s = push(s, "Role_is_played_by_Noun",   &[("Role", "r-active-v"), ("Noun", "BoolT")]);
+        let s = push(s, "Fact_Type_has_Role",       &[("Fact Type", "ft-prio"),   ("Role", "r-prio-v")]);
+        let s = push(s, "Role_is_played_by_Noun",   &[("Role", "r-prio-v"),   ("Noun", "PrioT")]);
+        // Value-type Nouns: Object Type + Format or Enum Values
+        let s = push(s, "Noun_has_Object_Type", &[("Noun", "TitleT"), ("Object Type", "value")]);
+        let s = push(s, "Noun_has_Object_Type", &[("Noun", "DueT"),   ("Object Type", "value")]);
+        let s = push(s, "Noun_has_Object_Type", &[("Noun", "BoolT"),  ("Object Type", "value")]);
+        let s = push(s, "Noun_has_Object_Type", &[("Noun", "PrioT"),  ("Object Type", "value")]);
+        let s = push(s, "Noun_has_Format",      &[("Noun", "TitleT"), ("Format", "text")]);
+        let s = push(s, "Noun_has_Format",      &[("Noun", "DueT"),   ("Format", "date")]);
+        let s = push(s, "Noun_has_Format",      &[("Noun", "BoolT"),  ("Format", "boolean")]);
+        let s = push(s, "Noun_has_Enum_Values", &[("Noun", "PrioT"),  ("Enum Values", "high,medium,low")]);
+        s
+    };
+
+    // ── (3)+(4) Forward chain materializes the eager projections ─────────────
+    // Run only the EAGER (Stored-materialized) derivation rules.
+    let eager_refs: Vec<(&str, &ast::Func)> = model.derivations.iter()
+        .filter(|d| matches!(d.materialization, MaterializationPolicy::Stored))
+        .map(|d| (d.id.as_str(), &d.func))
+        .collect();
+    let (derived_pop, derived_facts) =
+        crate::evaluate::forward_chain_defs_state(&eager_refs, &pop);
+
+    // Fact_Type_has_Format must now be populated (NOT hand-pushed).
+    let fmt_cell = ast::fetch_cell_seq("Fact_Type_has_Format", &derived_pop);
+    let fmt_rows: Vec<(String, String)> = fmt_cell.as_seq()
+        .map(|facts| facts.iter().filter_map(|f| {
+            let ft  = ast::binding(f, "Fact Type").map(String::from)?;
+            let fmt = ast::binding(f, "Format").map(String::from)?;
+            Some((ft, fmt))
+        }).collect())
+        .unwrap_or_default();
+    assert_eq!(fmt_rows.len(), 3,
+        "eager Format projection must produce 3 rows (text/date/boolean FTs); \
+         got {} derived_facts:{:#?}\nfmt_rows:{:?}", fmt_rows.len(), derived_facts, fmt_rows);
+    let fmt_map: std::collections::HashMap<String, String> =
+        fmt_rows.into_iter().collect();
+    assert_eq!(fmt_map.get("ft-title").map(String::as_str), Some("text"),
+        "ft-title must have Format 'text'; map: {:?}", fmt_map);
+    assert_eq!(fmt_map.get("ft-due").map(String::as_str), Some("date"),
+        "ft-due must have Format 'date'; map: {:?}", fmt_map);
+    assert_eq!(fmt_map.get("ft-active").map(String::as_str), Some("boolean"),
+        "ft-active must have Format 'boolean'; map: {:?}", fmt_map);
+    assert!(!fmt_map.contains_key("ft-prio"),
+        "ft-prio (enum, no Format) must NOT appear in Format projection; map: {:?}", fmt_map);
+
+    // Fact_Type_has_Enum_Values must now be populated.
+    let enum_cell = ast::fetch_cell_seq("Fact_Type_has_Enum_Values", &derived_pop);
+    let enum_rows: Vec<(String, String)> = enum_cell.as_seq()
+        .map(|facts| facts.iter().filter_map(|f| {
+            let ft   = ast::binding(f, "Fact Type").map(String::from)?;
+            let enms = ast::binding(f, "Enum Values").map(String::from)?;
+            Some((ft, enms))
+        }).collect())
+        .unwrap_or_default();
+    assert_eq!(enum_rows.len(), 1,
+        "eager Enum Values projection must produce 1 row (enum FT only); \
+         got {}: {:?}", enum_rows.len(), enum_rows);
+    assert_eq!(enum_rows[0].0, "ft-prio",
+        "Enum Values projection row must be for ft-prio; got {:?}", enum_rows);
+
+    // ── (5) Lazy widget rules fire correctly ──────────────────────────────────
+    // resolve_view evaluates the widget rules against the derived population.
+    let cons_role = "ViewElement_has_Component_Role";
+    let role_view = resolve_view(cons_role, &derived_pop, &d)
+        .expect("Component Role view: def must resolve");
+    let role_rows: Vec<(String, String, String)> = role_view.as_seq()
+        .map(|items| items.iter().filter_map(|f| {
+            let ve   = ast::binding(f, "ViewElement").map(String::from)?;
+            let role = ast::binding(f, "Component Role").map(String::from)?;
+            let vw   = ast::binding(f, "View").map(String::from)?;
+            Some((ve, role, vw))
+        }).collect())
+        .unwrap_or_default();
+
+    let form_role_rows: Vec<&(String, String, String)> =
+        role_rows.iter().filter(|(_, _, vw)| vw == "task-form").collect();
+
+    // (6) Exactly 4 VEs — one per FT
+    assert_eq!(form_role_rows.len(), 4,
+        "task-form must produce 4 Component Role VEs (text/date/boolean/enum); \
+         got {:?}", form_role_rows);
+
+    // Build map: FT → (VE, Component Role) via the renders view
+    let cons_renders = "ViewElement_renders_Fact_Type";
+    let renders_view = resolve_view(cons_renders, &derived_pop, &d)
+        .expect("renders Fact Type view: def must resolve");
+    let renders_rows: Vec<(String, String, String)> = renders_view.as_seq()
+        .map(|items| items.iter().filter_map(|f| {
+            let ve = ast::binding(f, "ViewElement").map(String::from)?;
+            let ft = ast::binding(f, "Fact Type").map(String::from)?;
+            let vw = ast::binding(f, "View").map(String::from)?;
+            Some((ve, ft, vw))
+        }).collect())
+        .unwrap_or_default();
+    let ft_to_ve: std::collections::HashMap<String, String> =
+        renders_rows.iter()
+            .filter(|(_, _, vw)| vw == "task-form")
+            .map(|(ve, ft, _)| (ft.clone(), ve.clone()))
+            .collect();
+
+    let ve_to_role: std::collections::HashMap<String, String> =
+        form_role_rows.iter().map(|(ve, role, _)| (ve.clone(), role.clone())).collect();
+
+    let title_ve  = ft_to_ve.get("ft-title").expect("ft-title must have a VE");
+    let due_ve    = ft_to_ve.get("ft-due").expect("ft-due must have a VE");
+    let active_ve = ft_to_ve.get("ft-active").expect("ft-active must have a VE");
+    let prio_ve   = ft_to_ve.get("ft-prio").expect("ft-prio must have a VE");
+
+    assert_eq!(ve_to_role.get(title_ve).map(String::as_str), Some("text-input"),
+        "ft-title (Format 'text') must get Component Role 'text-input'; \
+         ve={title_ve} map={:?}", ve_to_role);
+    assert_eq!(ve_to_role.get(due_ve).map(String::as_str), Some("date-picker"),
+        "ft-due (Format 'date') must get Component Role 'date-picker'; \
+         ve={due_ve} map={:?}", ve_to_role);
+    assert_eq!(ve_to_role.get(active_ve).map(String::as_str), Some("checkbox"),
+        "ft-active (Format 'boolean') must get Component Role 'checkbox'; \
+         ve={active_ve} map={:?}", ve_to_role);
+    assert_eq!(ve_to_role.get(prio_ve).map(String::as_str), Some("combo-box"),
+        "ft-prio (enum type) must get Component Role 'combo-box' — \
+         derived from REAL Noun Enum Values (no hand-populated Fact_Type_has_Format); \
+         ve={prio_ve} map={:?}", ve_to_role);
+}
+
