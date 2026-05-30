@@ -26,10 +26,15 @@
 
 FROM rust:latest AS builder
 
-RUN rustup toolchain install nightly --profile minimal \
-    && rustup component add rust-src --toolchain nightly \
-    && rustup target add x86_64-unknown-uefi --toolchain nightly \
-    && rustup target add aarch64-unknown-uefi --toolchain nightly
+# Pin to the known-good nightly from crates/arest-kernel/rust-toolchain.toml
+# (nightly-2026-04-21). Plain `nightly` installs the LATEST, which drifts:
+# rust-1.97.0-nightly's LLVM SIGILLs (ICE in SelectionDAGISel/ThinLTO)
+# compiling poly1305 for x86_64-unknown-uefi. Keep this date in sync with
+# rust-toolchain.toml when bumping (smoke-verify all UEFI targets first).
+RUN rustup toolchain install nightly-2026-04-21 --profile minimal \
+    && rustup component add rust-src --toolchain nightly-2026-04-21 \
+    && rustup target add x86_64-unknown-uefi --toolchain nightly-2026-04-21 \
+    && rustup target add aarch64-unknown-uefi --toolchain nightly-2026-04-21
 
 WORKDIR /build
 
@@ -46,6 +51,11 @@ COPY crates/arest-kernel/assets/ crates/arest-kernel/assets/
 COPY crates/arest-kernel/doom_assets/ crates/arest-kernel/doom_assets/
 COPY crates/arest/Cargo.toml crates/arest/Cargo.toml
 COPY crates/arest/src/ crates/arest/src/
+# arest-foundation was extracted out of crates/arest after this Dockerfile
+# was last updated; crates/arest depends on it via `path = "../arest-foundation"`,
+# so the build context must stage it or cargo fails to read its Cargo.toml.
+COPY crates/arest-foundation/Cargo.toml crates/arest-foundation/Cargo.toml
+COPY crates/arest-foundation/src/ crates/arest-foundation/src/
 COPY readings/ readings/
 COPY crates/arest-kernel/vendor/ crates/arest-kernel/vendor/
 
@@ -63,8 +73,15 @@ COPY crates/arest-kernel/vendor/ crates/arest-kernel/vendor/
 # `loop { net::poll(); pause }` (see net.rs `now()` — #655 wired
 # the smoltcp clock to the PIT-backed `arch::time::now_ms()` so
 # DHCPv4 retries align with wall-clock real-network latency).
+# poly1305_force_soft: libLLVM 22.1's -O optimizer SIGILLs while compiling
+# poly1305's SIMD backend on this host's Hyper-V/WSL2 vCPU (it advertises
+# AVX-512 but mishandles an instruction LLVM's own optimizer executes —
+# reproduced in isolation; opt-0 host builds fine, opt>=1 uefi dies).
+# Forcing poly1305's portable backend sidesteps the crashing IR. The
+# x86_64-unknown-uefi target is baseline x86-64, so this costs a little
+# AEAD throughput, not correctness. (Builds clean on CI without it too.)
 RUN cd crates/arest-kernel \
-    && cargo +nightly build --target x86_64-unknown-uefi --release \
+    && RUSTFLAGS="--cfg poly1305_force_soft" cargo +nightly-2026-04-21 build --target x86_64-unknown-uefi --release \
        --no-default-features --features server,static-ip
 
 FROM debian:bookworm-slim AS runner
