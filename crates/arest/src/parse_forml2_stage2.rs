@@ -2180,8 +2180,10 @@ pub fn classify_statements(statements_state: &Object, grammar_state: &Object) ->
     // false so the eprintln branches compile out entirely. The kernel
     // gets equivalent observability via the `check` system verb that
     // pipes diag! through its serial sink.
+    // task-931-1: no_std gate, MUST KEEP — std arm reads AREST_STAGE12_TRACE env var.
     #[cfg(not(feature = "no_std"))]
     let trace = std::env::var("AREST_STAGE12_TRACE").is_ok();
+    // task-931-1: no_std gate, MUST KEEP — kernel/WASM arm compiles trace to const false.
     #[cfg(feature = "no_std")]
     let trace = false;
     let tc0 = Instant::now();
@@ -5359,8 +5361,10 @@ fn parse_to_state_via_stage12_impl(
 ) -> Result<Object, String> {
     // Trace gate — std-host reads `AREST_STAGE12_TRACE`; no_std builds
     // compile out the trace branches entirely.
+    // task-931-1: no_std gate, MUST KEEP — std arm reads AREST_STAGE12_TRACE env var.
     #[cfg(not(feature = "no_std"))]
     let trace = std::env::var("AREST_STAGE12_TRACE").is_ok();
+    // task-931-1: no_std gate, MUST KEEP — kernel/WASM arm compiles trace to const false.
     #[cfg(feature = "no_std")]
     let trace = false;
     let t0 = Instant::now();

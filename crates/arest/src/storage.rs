@@ -26,6 +26,7 @@
 // The kernel / no_std target uses `freeze::thaw` directly against
 // baked ROM bytes and does not route through this trait.
 
+// task-931-1: no_std gate, MUST KEEP — storage module is std-only (std::fs required).
 #![cfg(not(feature = "no_std"))]
 
 use crate::ast::Object;

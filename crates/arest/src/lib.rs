@@ -6,6 +6,7 @@
 // One function. Readings in, applications out.
 // State = P (facts) + DEFS (named Func).
 
+// task-931-1: no_std gate, MUST KEEP — enables kernel + WASM targets.
 #![cfg_attr(feature = "no_std", no_std)]
 
 // ── Feature-conflict guards (#592) ─────────────────────────────────
@@ -20,6 +21,7 @@
 // targets where the dep happens to compile (e.g. UEFI today, via
 // transitive resolver luck), the runtime would not have an OS thread
 // to schedule on. Reject the combination.
+// task-931-1: no_std gate, MUST KEEP — feature-conflict guard; rejects no_std+parallel combo.
 #[cfg(all(feature = "no_std", feature = "parallel"))]
 compile_error!(
     "feature combination not supported: `no_std` + `parallel` — rayon \
@@ -36,6 +38,7 @@ compile_error!(
 // E0425 "function not found" errors. The Cloudflare worker build is
 // the only `wit` consumer today and it always carries std-deps; the
 // kernel build does not need wit. Reject the combination.
+// task-931-1: no_std gate, MUST KEEP — feature-conflict guard; rejects no_std+wit combo.
 #[cfg(all(feature = "no_std", feature = "wit"))]
 compile_error!(
     "feature combination not supported: `no_std` + `wit` — wit-bindgen \
@@ -60,12 +63,14 @@ extern crate alloc;
 /// Conditional diagnostic macro. Under std, forwards to `eprintln!`.
 /// Under no_std, it's a no-op — kernel callers wire their own serial
 /// sink via the `check` system verb instead of relying on stderr.
+// task-931-1: no_std gate, MUST KEEP — std arm of diag! macro.
 #[cfg(not(feature = "no_std"))]
 #[macro_export]
 macro_rules! diag {
     ($($arg:tt)*) => { eprintln!($($arg)*) }
 }
 
+// task-931-1: no_std gate, MUST KEEP — no-op arm of diag! macro for kernel/WASM builds.
 #[cfg(feature = "no_std")]
 #[macro_export]
 macro_rules! diag {
@@ -213,6 +218,7 @@ pub mod parse_forml2_stage2;
 // load_reading` becomes a working call site (PPPPP-2's #560 closure
 // caller will adopt it in a follow-up commit).
 pub mod load_reading_core;
+// task-931-1: no_std gate, MUST KEEP — command module is std-only (parse + check surface).
 #[cfg(not(feature = "no_std"))]
 // verbalize.rs deleted — zero production callers, tests were self-referential.
 #[cfg(not(feature = "no_std"))]

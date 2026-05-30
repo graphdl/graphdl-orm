@@ -1369,6 +1369,7 @@ pub fn build_report(before: &Object, after: &Object) -> LoadReport {
 // identical (the test surface didn't change — only the source file
 // did).
 
+// task-931-1: no_std gate, MUST KEEP — load_reading_core tests require std (serde, env).
 #[cfg(all(test, not(feature = "no_std")))]
 mod tests {
     use super::*;

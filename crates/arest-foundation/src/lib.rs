@@ -23,6 +23,7 @@
 //   3. Test cells live next to their module (`#[cfg(test)] mod tests`).
 //      No integration tests — those belong in the consuming crate.
 
+// task-931-1: no_std gate, MUST KEEP — enables kernel + WASM targets for arest-foundation.
 #![cfg_attr(feature = "no_std", no_std)]
 
 extern crate alloc;
@@ -39,6 +40,7 @@ pub mod csprng;
 // no_std-clean module bodies respectively. Both depend on csprng +
 // entropy which now live as siblings; their `crate::csprng` /
 // `crate::entropy` imports resolve to the foundation's own modules.
+// task-931-1: no_std gate, MUST KEEP — crypto module requires std (env::var, Vec).
 #[cfg(not(feature = "no_std"))]
 pub mod crypto;
 pub mod cell_aead;

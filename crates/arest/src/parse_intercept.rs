@@ -24,6 +24,7 @@
 // "no_std"`) — the parser itself requires std, so the kernel build
 // can skip the whole module.
 
+// task-931-1: no_std gate, MUST KEEP — parse_intercept requires std-deps (serde, regex).
 #![cfg(all(feature = "std-deps", not(feature = "no_std")))]
 
 use alloc::string::{String, ToString};

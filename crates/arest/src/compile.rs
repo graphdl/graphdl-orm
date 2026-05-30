@@ -24,11 +24,13 @@ use crate::ast::{fetch_cell_seq, binding};
 // Timing shim. Real clock on native std builds; zero-duration stub on
 // WASM (no clock) and no_std (no std::time). The profile eprintlns
 // still compile but report 0ns where no clock is available.
+// task-931-1: no_std gate, MUST KEEP — std/wasm32 timing shim selector.
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "no_std")))]
 mod profile_timer {
     pub type Timer = std::time::Instant;
     pub fn now() -> Timer { std::time::Instant::now() }
 }
+// task-931-1: no_std gate, MUST KEEP — zero-duration stub for wasm32 and no_std builds.
 #[cfg(any(target_arch = "wasm32", feature = "no_std"))]
 mod profile_timer {
     #[derive(Clone, Copy)]
@@ -1881,7 +1883,19 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                     }
                 }
             }
-            // Synthetic rules: extract noun from ID pattern
+            // DEPRECATED (task-931-1): derivation_index synthetic-id fallback.
+            // When neither the domain-rule FT path (above) nor the empty-id
+            // antecedent overlap path produced any nouns, this substring-match
+            // heuristic extracts a noun name from the rule ID string (e.g.
+            // `_cwa_negation_Order` → "Order"). It was the only indexing
+            // mechanism before the structured domain-rule path landed; it now
+            // fires only for synthesised metamodel rules whose IDs happen not
+            // to embed a noun name (superseded by the explicit #890 and #891
+            // patches below that handle `_subtype_inheritance` and
+            // `_ss_autofill` directly). SAFETY NET — do NOT delete; the
+            // dedicated patches below call `nouns.insert` only for those two
+            // known IDs, and any future synthetic rule without a recognised ID
+            // would silently miss the index without this fallback.
             if nouns.is_empty() {
                 // _cwa_negation_X, _sm_init_Order, _subtype_A_B
                 for noun_name in c_nouns.keys() {
@@ -7784,6 +7798,17 @@ fn compile_uniqueness_ast(
         return Func::constant(Object::phi());
     }
 
+    // DEPRECATED (task-931-1): legacy cross-scan UC path.
+    // All UC types whose FT cell storage is Map-backed (keyed by key_roles)
+    // are short-circuited above: the cell_put_keyed enforcer is the
+    // constraint; the Func below is redundant for them. This cross-scan
+    // path fires only for: (a) spanning UCs (key_roles is None because
+    // the span covers every role — no key is possible), (b) deontic UCs
+    // (also key_roles None), and (c) any caller that seeds state via the
+    // legacy cell_push Seq-append path rather than cell_put_keyed.
+    // Superseded by Map-backed storage for alethic non-spanning UCs
+    // (task-820). SAFETY NET — do NOT delete; spanning UCs and deontic
+    // UCs still require this procedural scan for enforcement.
     // Pure Func UC: single fact type, any number of spans.
     // Scope = first span's role (the "Each" side). Uniqueness on scope means
     // for each scope value, at most one distinct tuple across the other roles.
@@ -8847,8 +8872,20 @@ fn compile_obligatory_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
 /// 'overnight'` therefore lands as an InstanceFact with
 /// `subjectNoun = "Constraint"`, `subjectValue = <full text>`,
 /// `objectNoun = "Constraint Match Keyword"`, `objectValue =
-/// "overnight"`. Empty result means "no facts declared" — the caller
-/// falls back to the legacy text-walking extractor.
+/// "overnight"`.
+///
+/// DEPRECATED (task-931-1): extract_constraint_keywords text-walk superseded.
+/// The legacy procedural in-Rust text-walking extractor
+/// (`extract_constraint_keywords`) — which scanned the raw constraint
+/// text string for keyword tokens — was removed once corpora migrated to
+/// explicit `Constraint has Constraint Match Keyword` facts (MC3c,
+/// #749/#897). This function is its declarative replacement. An empty
+/// result now means "no keyword facts declared"; the caller
+/// (`compile_forbidden_ast`) treats that as "no OWA-keyword check" and
+/// falls through to the `else if !text_keywords.is_empty()` guard,
+/// emitting φ. The old text-walk code path no longer exists; there is
+/// no fallback to a procedural text-walker. SAFETY NET — do NOT delete
+/// this function; it is the only path for MC3c keyword routing.
 fn constraint_match_keywords_from_cell(data: &CellIndex, constraint_id: &str)
     -> Vec<String>
 {

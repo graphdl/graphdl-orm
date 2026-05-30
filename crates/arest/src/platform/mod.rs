@@ -22,6 +22,7 @@
 // (returns `Object::Bottom` under no_std). The kernel build never
 // reaches the install paths.
 
+// task-931-1: no_std gate, MUST KEEP — platform module is std-only (requires OS + I/O).
 #![cfg(not(feature = "no_std"))]
 
 pub mod zip;
