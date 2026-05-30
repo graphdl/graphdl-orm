@@ -3855,7 +3855,7 @@ fn reload_reading_handler(
                 ReloadError::NotImplemented => vec![crate::types::Violation {
                     constraint_id: "reload_reading.not_implemented".to_string(),
                     constraint_text: "requested ReloadPolicy is not implemented".to_string(),
-                    detail: "MigrateFacts policy is reserved; use replace-all for now".to_string(),
+                    detail: "reserved ReloadPolicy variant (unreachable: MigrateFacts is fully implemented in task-806)".to_string(),
                     alethic: true,
                 }],
             };

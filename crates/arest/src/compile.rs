@@ -3287,6 +3287,13 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 pub struct ModelViolation {
     pub message: String,
     pub alethic: bool,
+    /// The fact-type id whose population cell should be dropped when this
+    /// violation is alethic and migration filtering is active.  `None` for
+    /// violations that do not name a specific fact type (e.g. subtype/
+    /// undeclared-FT-in-constraint-span checks).  Set by
+    /// `validate_model_data_classified`; consumed by
+    /// `load_reading_core::apply_alethic_migration_filter` (task-806).
+    pub fact_type_id: Option<String>,
 }
 
 /// Compile Object state into executable form (CompiledModel).
@@ -3326,12 +3333,15 @@ pub(crate) fn validate_model_data_classified(ir: &CellIndex) -> Vec<ModelViolati
 
     // 1. Undeclared nouns in fact type roles.
     // No constraint object involved — always ALETHIC (structural impossibility).
+    // fact_type_id is populated so the migration filter (task-806) can drop
+    // the corresponding population cell when this violation is alethic.
     ir.fact_types.iter().for_each(|(ft_id, ft)| {
         ft.roles.iter()
             .filter(|r| !ir.nouns.contains_key(&r.noun_name))
             .for_each(|r| violations.push(ModelViolation {
                 message: format!("Undeclared noun '{}' in fact type '{}'", r.noun_name, ft_id),
                 alethic: true,
+                fact_type_id: Some(ft_id.clone()),
             }));
     });
 
@@ -3343,6 +3353,7 @@ pub(crate) fn validate_model_data_classified(ir: &CellIndex) -> Vec<ModelViolati
             message: format!(
                 "Subtype '{}' declares supertype '{}' which is not a declared noun", child, parent),
             alethic: true,
+            fact_type_id: None,
         }));
 
     // 3. Duplicate noun: same name declared as both entity and value
@@ -3355,7 +3366,10 @@ pub(crate) fn validate_model_data_classified(ir: &CellIndex) -> Vec<ModelViolati
     ir.constraints.iter()
         .filter(|c| c.kind == "UC" && !c.spans.is_empty())
         .for_each(|c| {
-            c.spans.first().and_then(|span| ir.fact_types.get(&span.fact_type_id)).map(|ft| {
+            c.spans.first().and_then(|span| {
+                let ft_id = span.fact_type_id.clone();
+                ir.fact_types.get(&ft_id).map(|ft| (ft_id, ft))
+            }).map(|(ft_id, ft)| {
                 let arity = ft.roles.len();
                 let uc_span = c.spans.len();
                 // For ternary+, UC must span at least n-1 roles
@@ -3365,6 +3379,7 @@ pub(crate) fn validate_model_data_classified(ir: &CellIndex) -> Vec<ModelViolati
                             "UC '{}' spans {} roles on {}-ary fact type '{}' -- must span at least {} (arity decomposition rule)",
                             c.text, uc_span, arity, ft.reading, arity - 1),
                         alethic: modality_is_alethic(&c.modality),
+                        fact_type_id: Some(ft_id),
                     });
                 }
             });
@@ -3377,7 +3392,10 @@ pub(crate) fn validate_model_data_classified(ir: &CellIndex) -> Vec<ModelViolati
     ir.constraints.iter()
         .filter(|c| ["IR", "AS", "SY", "TR", "IT", "AC", "RF", "AT"].contains(&c.kind.as_str()))
         .for_each(|c| {
-            c.spans.first().and_then(|span| ir.fact_types.get(&span.fact_type_id)).map(|ft| {
+            c.spans.first().and_then(|span| {
+                let ft_id = span.fact_type_id.clone();
+                ir.fact_types.get(&ft_id).map(|ft| (ft_id, ft))
+            }).map(|(ft_id, ft)| {
                 if let (2, Some(r0), Some(r1)) = (ft.roles.len(), ft.roles.get(0), ft.roles.get(1)) {
                     if r0.noun_name != r1.noun_name {
                         violations.push(ModelViolation {
@@ -3385,6 +3403,7 @@ pub(crate) fn validate_model_data_classified(ir: &CellIndex) -> Vec<ModelViolati
                                 "Ring constraint '{}' on '{}' requires both roles to be the same type, but found {{\"{}\", \"{}\"}}",
                                 c.kind, ft.reading, r0.noun_name, r1.noun_name),
                             alethic: modality_is_alethic(&c.modality),
+                            fact_type_id: Some(ft_id),
                         });
                     }
                 }
@@ -3421,6 +3440,8 @@ pub(crate) fn validate_model_data_classified(ir: &CellIndex) -> Vec<ModelViolati
             message: format!(
                 "Constraint span references undeclared fact type '{}'", span.fact_type_id),
             alethic: modality_is_alethic(modality),
+            // The FT doesn't exist in the model, so there is no population cell to drop.
+            fact_type_id: None,
         }));
 
     violations
@@ -13114,8 +13135,8 @@ mod model_validation_modality_tests {
     fn deontic_model_violation_warns_but_does_not_reject() {
         // Representative classified set: one alethic + one deontic.
         let mixed = alloc::vec![
-            ModelViolation { message: "structural impossibility".into(), alethic: true },
-            ModelViolation { message: "advisory: reportable but permitted".into(), alethic: false },
+            ModelViolation { message: "structural impossibility".into(), alethic: true, fact_type_id: None },
+            ModelViolation { message: "advisory: reportable but permitted".into(), alethic: false, fact_type_id: None },
         ];
         // The caller (ast::platform_compile) rejects iff any alethic
         // violation is present, and warns on the deontic ones. Mirror that

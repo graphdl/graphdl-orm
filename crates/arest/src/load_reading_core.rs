@@ -293,10 +293,11 @@ pub struct UnloadOutcome {
 //
 // `ReplaceAll` (default) drives the unload step with
 // `UnloadPolicy::CascadeDelete` and the load step with
-// `LoadReadingPolicy::AllowAll`. `MigrateFacts` is forward-looking
-// and currently stubs out to `NotImplemented` — it depends on
-// `UnloadPolicy::Migrate` (also stubbed) to preserve referencing
-// facts when the new body re-declares the same fact-types.
+// `LoadReadingPolicy::AllowAll`. `MigrateFacts` drives the unload with
+// `UnloadPolicy::Migrate` (preserve P), loads the new body, re-derives P
+// from the new readings, and then applies the alethic migration filter
+// (task-806): population cells whose fact-type has an alethic structural
+// violation under the new model are dropped; deontic violations warn only.
 
 /// Caller's policy for how to compose unload+load atomically.
 ///
@@ -333,7 +334,8 @@ impl Default for ReloadPolicy {
 /// `reload_reading` doc comment for the rationale.)
 /// `LoadFailed` — the load step rejected; `new_state` rolls back to the
 /// pre-reload snapshot, fulfilling the atomicity contract.
-/// `NotImplemented` — `ReloadPolicy::MigrateFacts` is reserved.
+/// `NotImplemented` — reserved; no current code path emits this variant
+/// (`MigrateFacts` is fully implemented — task-806).
 ///
 /// `PartialEq` is intentionally NOT derived because `LoadError`
 /// itself does not implement Eq under std builds (the
@@ -360,11 +362,17 @@ pub enum ReloadError {
 /// `reload_reading` doc).
 /// `added` — what the load step put in.
 /// `new_state` — the post-reload def-state for the caller to commit.
+/// `migration_flags` — violations detected by the alethic migration filter
+/// (task-806, `ReloadPolicy::MigrateFacts` only). Each entry carries
+/// `alethic = true` for violations that caused a population cell to be
+/// dropped, and `alethic = false` (deontic) for warnings that did NOT
+/// block migration. Always empty for `ReplaceAll` reloads.
 #[derive(Debug, Clone)]
 pub struct ReloadOutcome {
     pub removed: UnloadReport,
     pub added: LoadReport,
     pub new_state: Object,
+    pub migration_flags: alloc::vec::Vec<crate::compile::ModelViolation>,
 }
 
 /// Cell-name prefix for the per-reading manifest. The full cell
@@ -1097,20 +1105,84 @@ pub fn reload_reading(
     // cells, and forward-chain to the least fixed point — so the new
     // derivation rules transform P. This is the "ingestion of new
     // readings" migration step.
-    let new_state = match policy {
-        ReloadPolicy::ReplaceAll => load_outcome.new_state,
-        ReloadPolicy::MigrateFacts => re_derive_population(&load_outcome.new_state),
+    //
+    // Step 5c (MigrateFacts only, task-806): alethic-constraint-gated
+    // fact migration. After re-derivation, run the new model's
+    // structural validation (reusing task-807's classified validator)
+    // against the post-derivation state. Facts whose schema context
+    // produces an alethic violation under the new model are dropped;
+    // deontic violations warn but do not block. The filter is a
+    // no-op for ReplaceAll.
+    let (new_state, migration_flags) = match policy {
+        ReloadPolicy::ReplaceAll => (load_outcome.new_state, alloc::vec::Vec::new()),
+        ReloadPolicy::MigrateFacts => {
+            let re_derived = re_derive_population(&load_outcome.new_state);
+            apply_alethic_migration_filter(re_derived)
+        }
     };
 
     // Step 6: assemble. The new state is the load step's output —
     // it already includes the post-unload cell deletions and the
     // refreshed manifest cell — plus, for MigrateFacts, the
-    // re-derived consequent cells.
+    // re-derived consequent cells filtered through the alethic
+    // migration gate (task-806).
     Ok(ReloadOutcome {
         removed: unload_outcome.report,
         added: load_outcome.report,
         new_state,
+        migration_flags,
     })
+}
+
+/// Alethic-constraint-gated migration filter (task-806).
+///
+/// Applies the new model's structural validation (task-807's classified
+/// validator, `compile::validate_model_classified_from_state`) to the
+/// post-re-derivation population state and partitions the results:
+///
+/// * **Alethic violations** (`ModelViolation::alethic = true`): the
+///   corresponding population cell (identified via
+///   `ModelViolation::fact_type_id`) is dropped from the returned state
+///   and the violation is recorded in `migration_flags`. Per the AREST.tex
+///   §157 ("It is impossible that …") semantics, a carried fact that
+///   would be structurally impossible under the new model MUST NOT migrate.
+///
+/// * **Deontic violations** (`alethic = false`): the violation is recorded
+///   in `migration_flags` as a warning, but the population cell is NOT
+///   dropped — deontic conditions are reportable but permitted
+///   (`D' = D''`).
+///
+/// The returned `Vec<ModelViolation>` is the full ordered list of both
+/// alethic and deontic findings; callers can partition on `.alethic` to
+/// distinguish errors from warnings.
+///
+/// Reuses task-807's `modality_is_alethic` contract via
+/// `compile::validate_model_classified_from_state` — no bespoke
+/// alethic/deontic switch is needed here.
+fn apply_alethic_migration_filter(
+    state: Object,
+) -> (Object, alloc::vec::Vec<crate::compile::ModelViolation>) {
+    let violations = crate::compile::validate_model_classified_from_state(&state);
+    if violations.is_empty() {
+        return (state, violations);
+    }
+
+    // Collect the fact-type cell names that must be dropped because an
+    // ALETHIC violation names them.  Deontic violations are recorded but
+    // do NOT cause a cell drop — they warn, they do not block.
+    use hashbrown::HashSet;
+    let drop_cells: HashSet<String> = violations.iter()
+        .filter(|v| v.alethic)
+        .filter_map(|v| v.fact_type_id.clone())
+        .collect();
+
+    let new_state = if drop_cells.is_empty() {
+        state
+    } else {
+        drop_cells.iter().fold(state, |s, cell_name| remove_cell(&s, cell_name))
+    };
+
+    (new_state, violations)
 }
 
 /// Preserve-and-re-derive: re-derive a population state's derived
@@ -2818,5 +2890,183 @@ Category(.Name) is an entity type.
             assert_eq!(d.level, crate::check::Level::Error);
             assert_eq!(d.source, crate::check::Source::Deontic);
         }
+    }
+
+    // ── task-806: alethic-constraint-gated fact migration ──────────
+
+    /// A fact-type whose every role noun is declared in the new
+    /// model has NO alethic structural violation.  The migration
+    /// filter must pass the population cell through unchanged —
+    /// it satisfies the new model's alethic constraints.
+    ///
+    /// This pins the "migrates" half of the alethic gate: zero
+    /// violations → zero drops.
+    #[test]
+    fn migrate_fact_satisfying_alethic_constraint_passes_through() {
+        use crate::ast::{self, Object, fact_from_pairs};
+
+        // Build a state with a well-formed fact-type: Foo has Bar,
+        // both nouns declared.  No constraint violations.
+        let mut cells: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        cells.insert("Noun".into(), Object::seq(vec![
+            fact_from_pairs(&[("name", "Foo"), ("objectType", "entity")]),
+            fact_from_pairs(&[("name", "Bar"), ("objectType", "value")]),
+        ]));
+        cells.insert("FactType".into(), Object::seq(vec![
+            fact_from_pairs(&[("id", "Foo_has_Bar"), ("reading", "Foo has Bar"), ("arity", "2")]),
+        ]));
+        cells.insert("Role".into(), Object::seq(vec![
+            fact_from_pairs(&[("factType", "Foo_has_Bar"), ("nounName", "Foo"), ("position", "0")]),
+            fact_from_pairs(&[("factType", "Foo_has_Bar"), ("nounName", "Bar"), ("position", "1")]),
+        ]));
+        // Seed the population cell for Foo_has_Bar.
+        cells.insert("Foo_has_Bar".into(), Object::seq(vec![
+            fact_from_pairs(&[("Foo", "foo1"), ("Bar", "bar1")]),
+        ]));
+        let state = Object::Map(cells.into());
+
+        let (filtered, flags) = apply_alethic_migration_filter(state.clone());
+
+        // No alethic violations → the population cell must be untouched.
+        let alethic_flags: alloc::vec::Vec<_> =
+            flags.iter().filter(|v| v.alethic).collect();
+        assert!(
+            alethic_flags.is_empty(),
+            "well-formed schema must produce zero alethic migration flags; got {alethic_flags:?}"
+        );
+        let cell_after = ast::fetch_or_phi("Foo_has_Bar", &filtered);
+        assert_eq!(
+            cell_after,
+            ast::fetch_or_phi("Foo_has_Bar", &state),
+            "population cell must be preserved when the schema satisfies the new model"
+        );
+    }
+
+    /// A fact-type whose role references an UNDECLARED noun is an
+    /// alethic structural impossibility (task-807 check 1: "It is
+    /// impossible that a fact type role names an undeclared noun").
+    /// The migration filter must DROP the corresponding population
+    /// cell and record an `alethic = true` flag.
+    ///
+    /// This pins the "dropped/flagged" half of the alethic gate.
+    #[test]
+    fn migrate_fact_violating_alethic_constraint_is_dropped_and_flagged() {
+        use crate::ast::{Object, fact_from_pairs};
+
+        // Foo is declared, Ghost is NOT.  Foo_has_Ghost's role
+        // references Ghost → alethic structural violation.
+        let mut cells: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        cells.insert("Noun".into(), Object::seq(vec![
+            fact_from_pairs(&[("name", "Foo"), ("objectType", "entity")]),
+            // Ghost intentionally absent.
+        ]));
+        cells.insert("FactType".into(), Object::seq(vec![
+            fact_from_pairs(&[("id", "Foo_has_Ghost"), ("reading", "Foo has Ghost"), ("arity", "2")]),
+        ]));
+        cells.insert("Role".into(), Object::seq(vec![
+            fact_from_pairs(&[("factType", "Foo_has_Ghost"), ("nounName", "Foo"), ("position", "0")]),
+            fact_from_pairs(&[("factType", "Foo_has_Ghost"), ("nounName", "Ghost"), ("position", "1")]),
+        ]));
+        // Population cell contains a carried fact.
+        cells.insert("Foo_has_Ghost".into(), Object::seq(vec![
+            fact_from_pairs(&[("Foo", "foo1"), ("Ghost", "haunted")]),
+        ]));
+        let state = Object::Map(cells.into());
+
+        let (filtered, flags) = apply_alethic_migration_filter(state);
+
+        // There must be at least one alethic flag naming Foo_has_Ghost.
+        let alethic_flags: alloc::vec::Vec<_> =
+            flags.iter().filter(|v| v.alethic).collect();
+        assert!(
+            !alethic_flags.is_empty(),
+            "undeclared-noun-in-role must produce an alethic migration flag"
+        );
+        assert!(
+            alethic_flags.iter().any(|v| v.fact_type_id.as_deref() == Some("Foo_has_Ghost")),
+            "alethic flag must name the offending fact-type id; flags = {alethic_flags:?}"
+        );
+
+        // The population cell for Foo_has_Ghost must be DROPPED from
+        // the filtered state (it is impossible under the new model).
+        let cell_after = crate::ast::fetch_or_phi("Foo_has_Ghost", &filtered);
+        assert!(
+            cell_after.as_seq().map(|s| s.is_empty()).unwrap_or(true),
+            "alethically-rejected population cell must be dropped; got {cell_after:?}"
+        );
+    }
+
+    /// A fact-type that violates a DEONTIC constraint (ring constraint
+    /// with deontic modality on a non-self-referential binary FT) must
+    /// STILL MIGRATE — deontic violations warn but do not block.
+    /// The flag carries `alethic = false`; the population cell survives.
+    ///
+    /// This pins the "deontic warns, does not block" half of the gate.
+    #[test]
+    fn migrate_fact_under_deontic_constraint_still_migrates() {
+        use crate::ast::{Object, fact_from_pairs};
+
+        // Person and Animal are different nouns (non-self-referential)
+        // with a DEONTIC ring constraint (IR = irreflexive, modality
+        // "deontic").  Structurally this is a deontic violation per
+        // task-807 check 5: classify by the constraint's own modality.
+        let mut cells: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        cells.insert("Noun".into(), Object::seq(vec![
+            fact_from_pairs(&[("name", "Person"), ("objectType", "entity")]),
+            fact_from_pairs(&[("name", "Animal"), ("objectType", "entity")]),
+        ]));
+        cells.insert("FactType".into(), Object::seq(vec![
+            fact_from_pairs(&[
+                ("id", "Person_likes_Animal"),
+                ("reading", "Person likes Animal"),
+                ("arity", "2"),
+            ]),
+        ]));
+        cells.insert("Role".into(), Object::seq(vec![
+            fact_from_pairs(&[("factType", "Person_likes_Animal"), ("nounName", "Person"), ("position", "0")]),
+            fact_from_pairs(&[("factType", "Person_likes_Animal"), ("nounName", "Animal"), ("position", "1")]),
+        ]));
+        // DEONTIC ring constraint on the non-self-referential FT.
+        cells.insert("Constraint".into(), Object::seq(vec![
+            fact_from_pairs(&[
+                ("id",               "c_ir_deontic"),
+                ("kind",             "IR"),
+                ("modality",         "deontic"),
+                ("text",             "Person likes Animal is irreflexive"),
+                ("span0_factTypeId", "Person_likes_Animal"),
+                ("span0_roleIndex",  "0"),
+            ]),
+        ]));
+        // Population cell with a carried fact.
+        cells.insert("Person_likes_Animal".into(), Object::seq(vec![
+            fact_from_pairs(&[("Person", "alice"), ("Animal", "cat1")]),
+        ]));
+        let state = Object::Map(cells.into());
+
+        let (filtered, flags) = apply_alethic_migration_filter(state.clone());
+
+        // The deontic violation must be flagged (alethic = false).
+        let deontic_flags: alloc::vec::Vec<_> =
+            flags.iter().filter(|v| !v.alethic).collect();
+        assert!(
+            !deontic_flags.is_empty(),
+            "deontic ring-constraint violation must produce a deontic migration flag (alethic=false)"
+        );
+
+        // No alethic flags — the deontic constraint must NOT trigger a drop.
+        let alethic_flags: alloc::vec::Vec<_> =
+            flags.iter().filter(|v| v.alethic).collect();
+        assert!(
+            alethic_flags.is_empty(),
+            "deontic constraint must NOT produce alethic flags; got {alethic_flags:?}"
+        );
+
+        // The population cell must SURVIVE (deontic warns, does not block).
+        let cell_after = crate::ast::fetch_or_phi("Person_likes_Animal", &filtered);
+        assert_eq!(
+            cell_after,
+            crate::ast::fetch_or_phi("Person_likes_Animal", &state),
+            "deontic violation must NOT drop the population cell"
+        );
     }
 }
