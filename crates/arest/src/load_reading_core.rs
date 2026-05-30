@@ -3066,4 +3066,154 @@ Category(.Name) is an entity type.
             "deontic violation must NOT drop the population cell"
         );
     }
+
+    /// task-migration-dogfood: `ReloadPolicy::MigrateFacts` clears every
+    /// derivation-consequent cell and re-derives it from scratch (via
+    /// `re_derive_population`). A STALE row — a tuple present in the derived
+    /// cell before the reload that the fresh forward chain would NOT produce —
+    /// must be absent after the migrate pass, and the rows the rule actually
+    /// derives must be present.
+    ///
+    /// Finding (806): `re_derive_population` sets each consequent cell to φ
+    /// (empty) and runs the 2-stratum forward chain to the LFP. `MigrateFacts`
+    /// calls `re_derive_population` before `apply_alethic_migration_filter`, so
+    /// the 961-style stale-row contamination is eliminated.
+    ///
+    /// Scenario:
+    ///   v1: schema + primary fact (no rule) → derived cell is empty.
+    ///   v2: same + literal-iff rule → MigrateFacts derives 'o1'/'ready'.
+    ///   After v2, inject stale row ('stale_ghost'/'bogus_value') into the
+    ///   derived cell to simulate 961-style contamination.
+    ///   v3: reload with MigrateFacts using the same body as v2.
+    ///       Expected: stale row GONE, 'o1'/'ready' still present.
+    #[test]
+    fn migrate_facts_redrives_stale_derived_cell() {
+        let state = seed_state();
+
+        // ── Step 1: load v1 — schema + primary fact, no derivation rule ──
+        let body_v1 = "\
+Order(.id) is an entity type.
+Order Status is a value type.
+Order Readiness is a value type.
+Order has Order Status.
+Order has Order Readiness.
+Order 'o1' has Order Status 'pending'.
+";
+        let v1 = load_reading(&state, "rules", body_v1, LoadReadingPolicy::AllowAll)
+            .expect("v1 must load");
+
+        // Sanity: derived cell is empty (no rule yet).
+        let readiness_v1 = ast::fetch_cell_seq("Order_has_Order_Readiness", &v1.new_state);
+        assert!(
+            readiness_v1.as_seq().map(|s| s.is_empty()).unwrap_or(true),
+            "sanity: no rule → derived cell must be empty; got {readiness_v1:?}"
+        );
+
+        // ── Step 2: reload with MigrateFacts + the literal-iff rule ──
+        //
+        // Derivation: Order has Order Readiness 'ready'
+        //              iff Order has Order Status 'pending'.
+        // After this pass the forward chain derives 'o1'/'ready'.
+        let body_v2 = "\
+Order(.id) is an entity type.
+Order Status is a value type.
+Order Readiness is a value type.
+Order has Order Status.
+Order has Order Readiness.
+Order 'o1' has Order Status 'pending'.
+Order has Order Readiness 'ready' iff Order has Order Status 'pending'.
+";
+        let v2 = reload_reading(&v1.new_state, "rules", body_v2, ReloadPolicy::MigrateFacts)
+            .expect("v2 MigrateFacts reload must succeed");
+
+        // Sanity: the rule must have derived 'ready' for 'o1'.
+        let readiness_v2 = ast::fetch_cell_seq("Order_has_Order_Readiness", &v2.new_state);
+        let v2_has_ready = readiness_v2.as_seq()
+            .map(|s| s.iter().any(|f| {
+                f.as_seq().map(|pairs| pairs.iter().any(|p| {
+                    let kv = match p.as_seq() { Some(kv) => kv, None => return false };
+                    kv.first().and_then(|k| k.as_atom()) == Some("Order Readiness")
+                        && kv.get(1).and_then(|v| v.as_atom()) == Some("ready")
+                })).unwrap_or(false)
+            }))
+            .unwrap_or(false);
+        assert!(
+            v2_has_ready,
+            "sanity: v2 MigrateFacts must derive 'ready' for 'o1'; \
+             Order_has_Order_Readiness = {readiness_v2:?}"
+        );
+
+        // ── Step 3: inject a STALE row into the derived cell ──
+        //
+        // 'stale_ghost' has no primary Order_has_Order_Status row, so the rule
+        // would never produce 'stale_ghost'/'bogus_value'. This simulates the
+        // 961-style contamination — a derived-cell tuple whose primary support
+        // has been retracted (or never existed).
+        let stale_row = ast::fact_from_pairs(&[
+            ("Order", "stale_ghost"),
+            ("Order Readiness", "bogus_value"),
+        ]);
+        let contaminated = ast::cell_push("Order_has_Order_Readiness", stale_row, &v2.new_state);
+
+        // Pre-condition: stale row is present in the contaminated state.
+        let cell_before = ast::fetch_cell_seq("Order_has_Order_Readiness", &contaminated);
+        let stale_present_before = cell_before.as_seq()
+            .map(|s| s.iter().any(|f| {
+                f.as_seq().map(|pairs| pairs.iter().any(|p| {
+                    let kv = match p.as_seq() { Some(kv) => kv, None => return false };
+                    kv.first().and_then(|k| k.as_atom()) == Some("Order")
+                        && kv.get(1).and_then(|v| v.as_atom()) == Some("stale_ghost")
+                })).unwrap_or(false)
+            }))
+            .unwrap_or(false);
+        assert!(
+            stale_present_before,
+            "pre-condition: stale row must be present before the migrate pass; \
+             cell = {cell_before:?}"
+        );
+
+        // ── Step 4: re-run MigrateFacts with the same body_v2 ──
+        //
+        // `re_derive_population` sets Order_has_Order_Readiness to φ, then the
+        // forward chain re-derives only what the rule produces — 'o1'/'ready'.
+        // 'stale_ghost' has no primary support and must NOT survive.
+        let v3 = reload_reading(&contaminated, "rules", body_v2, ReloadPolicy::MigrateFacts)
+            .expect("v3 MigrateFacts reload must succeed");
+
+        let cell_after = ast::fetch_cell_seq("Order_has_Order_Readiness", &v3.new_state);
+
+        // ── Assert 4a: stale row must be GONE ──
+        let stale_survives = cell_after.as_seq()
+            .map(|s| s.iter().any(|f| {
+                f.as_seq().map(|pairs| pairs.iter().any(|p| {
+                    let kv = match p.as_seq() { Some(kv) => kv, None => return false };
+                    kv.first().and_then(|k| k.as_atom()) == Some("Order")
+                        && kv.get(1).and_then(|v| v.as_atom()) == Some("stale_ghost")
+                })).unwrap_or(false)
+            }))
+            .unwrap_or(false);
+        assert!(
+            !stale_survives,
+            "task-migration-dogfood: MigrateFacts MUST clear stale derived rows — \
+             'stale_ghost' survived the re-derive pass; \
+             Order_has_Order_Readiness after = {cell_after:?}"
+        );
+
+        // ── Assert 4b: correctly-derived row must be PRESENT ──
+        let correct_derived = cell_after.as_seq()
+            .map(|s| s.iter().any(|f| {
+                f.as_seq().map(|pairs| pairs.iter().any(|p| {
+                    let kv = match p.as_seq() { Some(kv) => kv, None => return false };
+                    kv.first().and_then(|k| k.as_atom()) == Some("Order Readiness")
+                        && kv.get(1).and_then(|v| v.as_atom()) == Some("ready")
+                })).unwrap_or(false)
+            }))
+            .unwrap_or(false);
+        assert!(
+            correct_derived,
+            "task-migration-dogfood: MigrateFacts must re-derive 'ready' for 'o1' \
+             from the preserved primary 'pending' fact; \
+             Order_has_Order_Readiness after = {cell_after:?}"
+        );
+    }
 }
