@@ -4899,6 +4899,7 @@ fn bootstrap_grammar_state(text: &str) -> Result<Object, String> {
                 consequent_role_literals,
                 materialization: crate::types::MaterializationPolicy::Stored,
                 ring_join: None,
+                skolem_head_roles: Vec::new(),
             };
             // Hand-rolled canonical serializer (#651) — byte-identical to
             // `serde_json::to_string(&rule)`, asserted by

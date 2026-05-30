@@ -1498,6 +1498,9 @@ fn resolve_derivation_rule(
     // re_resolve_rules re-runs this function and would otherwise
     // accumulate duplicates from prior passes.
     rule.consequent_role_literals.clear();
+    // task-970: clear skolem head roles so re_resolve_rules re-derives
+    // them without accumulating duplicates from prior passes.
+    rule.skolem_head_roles.clear();
     // Hand-rolled equivalent of regex ` '([^']*)'\s*$`: capture the
     // single-quoted literal at end of string, after a leading space.
     let consequent_trailing_literal =
@@ -2339,6 +2342,165 @@ fn resolve_derivation_rule(
         ) {
             rule.kind = DerivationKind::Join;
             rule.ring_join = Some(plan);
+        }
+    }
+
+    // task-970 — Detect existential (Skolem) head variables for single-
+    // consequent-FT rules. A parenthesised variable `(VAR)` immediately
+    // following a noun token in the consequent clause names a role
+    // variable for that role. If that variable does NOT appear (as a
+    // parenthesised variable) in any antecedent clause, it is a fresh
+    // existential → record a `SkolemHeadRole`. The frontier is all
+    // role names of the consequent FT whose variables DO appear in at
+    // least one antecedent clause.
+    //
+    // When skolem head roles are detected on a multi-antecedent rule,
+    // shared nouns across antecedents are auto-added as join keys and
+    // the rule is classified as Join so `compile_join_derivation` handles
+    // the per-binding fanout + skolem id emission.
+    //
+    // SCOPE: single-consequent-FT only (the deferred two-consequent
+    // shared-E case is documented in readings/ui/skolem-head-design.md §5).
+    {
+        // Extract `(VARNAME)` patterns from a text snippet. Returns the
+        // variable name (interior of the parens) for each match.
+        let extract_paren_vars = |text: &str| -> Vec<String> {
+            let mut vars: Vec<String> = Vec::new();
+            let bytes = text.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'(' {
+                    // find matching ')'
+                    if let Some(close) = text[i+1..].find(')') {
+                        let interior = text[i+1..i+1+close].trim();
+                        // A valid paren var: non-empty, all alphanumeric/hyphen/space,
+                        // no single quotes (not a literal value).
+                        if !interior.is_empty()
+                            && !interior.contains('\'')
+                            && interior.chars().all(|c| c.is_alphanumeric() || c == '-' || c == ' ' || c == '_')
+                        {
+                            vars.push(interior.to_string());
+                        }
+                        i += close + 2; // skip past ')'
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            vars
+        };
+
+        // Collect all paren vars that appear in antecedent clauses.
+        let antecedent_bound_vars: Vec<String> = antecedent_parts.iter()
+            .flat_map(|part| extract_paren_vars(part))
+            .collect();
+
+        // Attempt skolem detection whenever the consequent resolved to a
+        // real FT. Materialization is set AFTER re_resolve_rules returns
+        // (in compile.rs), so we cannot check it here; the skolem roles
+        // are harmless for non-View rules (compile_join_derivation only
+        // uses them for fully-derived View rules).
+        let cons_ft_id = rule.consequent_cell.literal_id().to_string();
+        if !cons_ft_id.is_empty() {
+            if let Some(cons_ft) = fact_types_map.get(&cons_ft_id) {
+                // Walk the noun tokens in the consequent text in order.
+                // For each noun, check if it is followed by a `(VAR)` token.
+                // The nouns align positionally with the FT's role list.
+                let cons_nouns = find_nouns(consequent_text, &noun_names);
+
+                // Build a list of (role_name, Option<var_name>) per
+                // consequent FT role in surface order.
+                let mut role_vars: Vec<(String, Option<String>)> = Vec::new();
+                for (role_idx, (_start, end, _token)) in cons_nouns.iter().enumerate() {
+                    let role_name = if role_idx < cons_ft.roles.len() {
+                        cons_ft.roles[role_idx].noun_name.clone()
+                    } else {
+                        break;
+                    };
+                    // Look for a `(VAR)` immediately after the noun token
+                    // (possibly with whitespace).
+                    let after = &consequent_text[*end..];
+                    let after_trimmed = after.trim_start();
+                    let var_name = if after_trimmed.starts_with('(') {
+                        if let Some(close) = after_trimmed.find(')') {
+                            let interior = after_trimmed[1..close].trim();
+                            if !interior.is_empty() && !interior.contains('\'') {
+                                Some(interior.to_string())
+                            } else { None }
+                        } else { None }
+                    } else { None };
+                    role_vars.push((role_name, var_name));
+                }
+
+                // Detect skolem head roles: roles whose variable is NOT
+                // in antecedent_bound_vars.
+                let mut skolem_roles: Vec<crate::types::SkolemHeadRole> = Vec::new();
+                let antecedent_bound_role_names: Vec<String> = role_vars.iter()
+                    .filter(|(_, var_opt)| {
+                        var_opt.as_ref().map(|v| antecedent_bound_vars.contains(v))
+                            .unwrap_or(false)
+                    })
+                    .map(|(role, _)| role.clone())
+                    .collect();
+                for (role, var_opt) in role_vars.iter() {
+                    let Some(var) = var_opt else { continue; };
+                    if !antecedent_bound_vars.contains(var) {
+                        // This role's variable is fresh (existential).
+                        // Frontier = all antecedent-bound role names in
+                        // the same consequent FT (in declaration order).
+                        skolem_roles.push(crate::types::SkolemHeadRole {
+                            role: role.clone(),
+                            frontier: antecedent_bound_role_names.clone(),
+                        });
+                    }
+                }
+                rule.skolem_head_roles = skolem_roles;
+
+                // For multi-antecedent skolem rules, auto-detect shared
+                // nouns across antecedents and promote to Join so
+                // compile_join_derivation handles the per-binding fanout.
+                if !rule.skolem_head_roles.is_empty()
+                    && rule.antecedent_sources.len() >= 2
+                    && rule.kind != DerivationKind::Join
+                {
+                    // Shared nouns = nouns that appear as a role on
+                    // EVERY antecedent FT.
+                    let ant_fts: Vec<Option<&FactTypeDef>> = rule.antecedent_sources.iter()
+                        .map(|s| fact_types_map.get(s.fact_type_id()))
+                        .collect();
+                    if ant_fts.iter().all(|ft| ft.is_some()) {
+                        let mut shared_nouns: Vec<String> = Vec::new();
+                        // Candidate nouns from the first antecedent
+                        if let Some(ft0) = ant_fts[0] {
+                            for r in ft0.roles.iter() {
+                                let appears_in_all = ant_fts[1..].iter().all(|ft| {
+                                    ft.map(|ft| ft.roles.iter().any(|rr| rr.noun_name == r.noun_name))
+                                        .unwrap_or(false)
+                                });
+                                if appears_in_all && !shared_nouns.contains(&r.noun_name) {
+                                    shared_nouns.push(r.noun_name.clone());
+                                }
+                            }
+                        }
+                        if !shared_nouns.is_empty() {
+                            // Add shared nouns as join keys (avoid duplicates)
+                            for noun in shared_nouns.iter() {
+                                if !rule.join_on.contains(noun) {
+                                    rule.join_on.push(noun.clone());
+                                }
+                            }
+                            rule.kind = DerivationKind::Join;
+                            rule.match_on = rule.join_on.iter()
+                                .map(|k| (k.clone(), k.clone()))
+                                .collect();
+                            // consequent_bindings stays empty so
+                            // compile_join_derivation uses all antecedent
+                            // nouns (which includes the skolem role nouns
+                            // from the consequent FT).
+                        }
+                    }
+                }
+            }
         }
     }
 

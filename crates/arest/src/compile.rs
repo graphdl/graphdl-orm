@@ -1470,7 +1470,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             DerivationRuleDef {
                 id: get("id"), text: get("text"), antecedent_sources: vec![], consequent_instance_role: String::new(),
                 consequent_cell: crate::types::ConsequentCellSource::decode(&get("consequentFactTypeId")),
-                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None,
+                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
             }
         }).collect())
         .unwrap_or_default();
@@ -3662,7 +3662,7 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
                 kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![],
                 consequent_bindings: vec![], antecedent_filters: vec![],
                 consequent_computed_bindings: vec![], consequent_aggregates: vec![],
-                consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None,
+                consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
             }
         }).collect()).unwrap_or_default();
     let general_instance_facts: Vec<GeneralInstanceFact> = fetch_cell_seq("InstanceFact", state).as_seq()
@@ -6400,13 +6400,25 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
 
     // Build the consequent fact from the final joined structure (depth n).
     // For each consequent binding noun, find which FT has it and extract the value.
-    let binding_nouns: Vec<String> = if consequent_binding_names.is_empty() {
-        // Î±(roles â†’ nouns) : antecedents â€” deduplicated
-        antecedent_roles.iter()
-            .flat_map(|roles| roles.iter().map(|(noun, _)| noun.clone()))
-            .fold(Vec::new(), |mut acc, noun| { if !acc.contains(&noun) { acc.push(noun); } acc })
-    } else {
-        consequent_binding_names
+    // task-970: include skolem head role names in the binding nouns so the
+    // consequent fact carries the fresh entity id alongside the normal roles.
+    let binding_nouns: Vec<String> = {
+        let mut nouns = if consequent_binding_names.is_empty() {
+            // Î±(roles â†’ nouns) : antecedents â€” deduplicated
+            antecedent_roles.iter()
+                .flat_map(|roles| roles.iter().map(|(noun, _)| noun.clone()))
+                .fold(Vec::new(), |mut acc, noun| { if !acc.contains(&noun) { acc.push(noun); } acc })
+        } else {
+            consequent_binding_names
+        };
+        // Append skolem head role names that are NOT already present
+        // (they don’t appear on any antecedent FT — they are synthesised).
+        for shr in rule.skolem_head_roles.iter() {
+            if !nouns.contains(&shr.role) {
+                nouns.push(shr.role.clone());
+            }
+        }
+        nouns
     };
 
     // Î±(noun â†’ extractor) : binding_nouns
@@ -6474,9 +6486,31 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
                 Func::constant(Object::atom(&crl.value)),
             ]));
         }
+        // 2.5 task-970: Skolem head role — emit a deterministic fresh
+        // entity id by hashing the frontier role values. The frontier
+        // values are extracted from the appropriate antecedent in the
+        // joined depth-n tuple via `access_fact(fi, n) ∘ role_value(ri)`.
+        if let Some(shr) = rule.skolem_head_roles.iter().find(|shr| shr.role == *noun) {
+            let frontier_funcs: Vec<Func> = shr.frontier.iter().filter_map(|fname| {
+                // Find which antecedent carries this frontier role.
+                let fi = (0..n).find(|&fi| find_role(fi, fname).is_some())?;
+                let ri = find_role(fi, fname)?;
+                Some(Func::compose(role_value(ri), access_fact(fi, n)))
+            }).collect();
+            if !frontier_funcs.is_empty() {
+                let skolem_id = Func::compose(
+                    Func::Platform("skolem".to_string()),
+                    Func::construction(frontier_funcs),
+                );
+                return Some(Func::construction(vec![
+                    Func::constant(Object::atom(noun)),
+                    skolem_id,
+                ]));
+            }
+        }
         // 3. Fallthrough: noun is consequent-only AND has no literal
-        //    pin — drop silently (pre-#814 behavior). The rule is
-        //    underspecified; nothing to bind to.
+        //    pin and no skolem spec — drop silently (pre-#814 behavior).
+        //    The rule is underspecified; nothing to bind to.
         None
         }).collect()
     };
@@ -6604,7 +6638,7 @@ pub(crate) fn compile_subtype_inheritance_metamodel(
                 join_on: vec![], match_on: vec![], consequent_bindings: vec![],
                 antecedent_filters: vec![], consequent_computed_bindings: vec![],
                 consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![],
-                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None,
+                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
             };
             compile_explicit_derivation(data, &rule).func
         })
@@ -6699,7 +6733,7 @@ pub(crate) fn compile_ss_autofill_metamodel(
                 join_on: vec![], match_on: vec![], consequent_bindings: vec![],
                 antecedent_filters: vec![], consequent_computed_bindings: vec![],
                 consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![],
-                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None,
+                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
             };
             compile_explicit_derivation(data, &rule).func
         })

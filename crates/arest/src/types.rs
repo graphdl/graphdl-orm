@@ -455,6 +455,26 @@ pub struct DerivationRuleDef {
     /// ordinary noun-name "that"-anaphora joins (which use `join_on`).
     #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Option::is_none"))]
     pub ring_join: Option<RingJoinPlan>,
+    /// task-970: Skolem (existential) head roles — consequent roles whose
+    /// values are fresh entities invented per frontier binding (the
+    /// semi-oblivious / Skolem chase). Each entry names the consequent
+    /// role that receives the fresh id and the ordered antecedent role
+    /// names whose values seed the FNV-1a-64 hash. Empty for every rule
+    /// that does not introduce a fresh entity in its head.
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
+    pub skolem_head_roles: Vec<SkolemHeadRole>,
+}
+
+/// A single existential (Skolem) role in a derivation rule head.
+/// `role` is the consequent role name that receives the fresh entity id;
+/// `frontier` is the ordered list of antecedent role names whose bound
+/// values seed the deterministic FNV-1a-64 hash (see ast.rs
+/// `platform_skolem`). Only used when `materialization == View`.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "std-deps", derive(serde::Serialize, serde::Deserialize))]
+pub struct SkolemHeadRole {
+    pub role: String,
+    pub frontier: Vec<String>,
 }
 
 // ── Hand-rolled canonical JSON writer for `DerivationRuleDef` ────────
@@ -557,6 +577,7 @@ impl Default for DerivationRuleDef {
             consequent_role_literals: Vec::new(),
             materialization: MaterializationPolicy::Stored,
             ring_join: None,
+            skolem_head_roles: Vec::new(),
         }
     }
 }
@@ -736,6 +757,16 @@ impl DerivationRuleDef {
             ring_join_plan_write(&mut out, rj);
         }
 
+        // 19. skolemHeadRoles (task-970 — skip if empty Vec).
+        if !self.skolem_head_roles.is_empty() {
+            out.push_str(",\"skolemHeadRoles\":[");
+            for (i, shr) in self.skolem_head_roles.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                skolem_head_role_write(&mut out, shr);
+            }
+            out.push(']');
+        }
+
         out.push('}');
         out
     }
@@ -786,6 +817,18 @@ fn materialization_policy_write(out: &mut String, p: &MaterializationPolicy) {
     out.push('"');
     out.push_str(s);
     out.push('"');
+}
+
+/// task-970: `SkolemHeadRole` → `{"role":"…","frontier":["…",…]}`.
+fn skolem_head_role_write(out: &mut String, shr: &SkolemHeadRole) {
+    out.push_str("{\"role\":");
+    json_escape(out, &shr.role);
+    out.push_str(",\"frontier\":[");
+    for (i, f) in shr.frontier.iter().enumerate() {
+        if i > 0 { out.push(','); }
+        json_escape(out, f);
+    }
+    out.push_str("]}");
 }
 
 /// Internally-tagged enum (`tag = "kind", content = "value"`) with
@@ -1686,6 +1729,7 @@ mod canonical_json_tests {
             }],
             materialization: MaterializationPolicy::Stored,
             ring_join: None,
+            skolem_head_roles: Vec::new(),
         }
     }
 
@@ -1710,6 +1754,7 @@ mod canonical_json_tests {
             consequent_role_literals: Vec::new(),
             materialization: MaterializationPolicy::Stored,
             ring_join: None,
+            skolem_head_roles: Vec::new(),
         }
     }
 
@@ -1748,6 +1793,7 @@ mod canonical_json_tests {
             }],
             materialization: MaterializationPolicy::Stored,
             ring_join: None,
+            skolem_head_roles: Vec::new(),
         }
     }
 
@@ -1777,6 +1823,7 @@ mod canonical_json_tests {
             consequent_role_literals: Vec::new(),
             materialization: MaterializationPolicy::Stored,
             ring_join: None,
+            skolem_head_roles: Vec::new(),
         }
     }
 
@@ -1806,6 +1853,7 @@ mod canonical_json_tests {
             consequent_role_literals: Vec::new(),
             materialization: MaterializationPolicy::Stored,
             ring_join: None,
+            skolem_head_roles: Vec::new(),
         }
     }
 
@@ -1839,6 +1887,7 @@ mod canonical_json_tests {
                 join_groups: alloc::vec![alloc::vec![(0usize, 1usize), (1usize, 0usize)]],
                 consequent_positions: alloc::vec![Some((0usize, 0usize)), Some((1usize, 1usize))],
             }),
+            skolem_head_roles: Vec::new(),
         }
     }
 
@@ -1874,6 +1923,7 @@ mod canonical_json_tests {
             consequent_role_literals: Vec::new(),
             materialization: MaterializationPolicy::Stored,
             ring_join: None,
+            skolem_head_roles: Vec::new(),
         }
     }
 
@@ -1917,6 +1967,7 @@ mod canonical_json_tests {
             consequent_role_literals: Vec::new(),
             materialization: MaterializationPolicy::Stored,
             ring_join: None,
+            skolem_head_roles: Vec::new(),
         }
     }
 

@@ -3963,9 +3963,6 @@ fn skolem_head_resolve_view_invents_one_idempotent_entity_per_binding() {
 // (the `view:` func + skolem primitive + idempotent resolve_view); only the
 // prose→rule→func authoring path is outstanding.
 #[test]
-#[ignore = "task-970: needs FORML 2 fresh-head-variable parsing + \
-            compile_explicit_derivation skolem emission (see \
-            readings/ui/skolem-head-design.md §4-5)"]
 fn spec_skolem_head_authored_in_forml2_resolves_lazily() {
     // TARGET surface form (design §4.5, single-consequent-FT slice):
     //   ViewElement (E) renders Transition (Tr)

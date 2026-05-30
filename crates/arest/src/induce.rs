@@ -962,6 +962,7 @@ fn build_multiplier_rule(
         consequent_role_literals: Vec::new(),
         materialization: crate::types::MaterializationPolicy::Stored,
         ring_join: None,
+        skolem_head_roles: Vec::new(),
     }
 }
 
