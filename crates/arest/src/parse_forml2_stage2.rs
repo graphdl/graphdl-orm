@@ -1455,6 +1455,68 @@ impl RangeOperatorTable {
     }
 }
 
+/// task-953 — superlative/ordering comparator vocabulary
+/// (`strongest`/`highest`/`best`, `weakest`/`lowest`/`worst`) used in
+/// `<X> has the <super> <ValueType> among <Ys> …` derivation-rule
+/// antecedents over ENUM-valued nouns. Each word maps to the existing
+/// numeric aggregate op applied to the value's declaration-order RANK:
+/// the strongest-family (first-declared = rank 0) folds via `min`; the
+/// weakest-family via `max`. Same parallel-enum lift as
+/// `DeonticPredicateOperatorTable` — the word list and the op list live
+/// in `readings/forml2-grammar.md` as `Superlative Comparator` /
+/// `Superlative Comparator Aggregate Op`.
+#[derive(Debug, Clone)]
+pub struct SuperlativeComparatorTable {
+    /// Pairs of `(word, aggregate_op)`, e.g. `("strongest", "min")`.
+    /// `word` is the bare superlative adjective (no surrounding spaces);
+    /// the caller matches it as a whole token.
+    pub rows: Vec<(String, String)>,
+}
+
+impl SuperlativeComparatorTable {
+    /// Boot table — must stay in sync with the parallel
+    /// `Superlative Comparator` / `Superlative Comparator Aggregate Op`
+    /// enum-value declarations in `readings/forml2-grammar.md`.
+    pub fn boot() -> Self {
+        SuperlativeComparatorTable {
+            rows: alloc::vec![
+                ("strongest".to_string(), "min".to_string()),
+                ("highest".to_string(),   "min".to_string()),
+                ("best".to_string(),      "min".to_string()),
+                ("weakest".to_string(),   "max".to_string()),
+                ("lowest".to_string(),    "max".to_string()),
+                ("worst".to_string(),     "max".to_string()),
+            ],
+        }
+    }
+
+    /// Build the table from the runtime parallel-enum declarations.
+    /// Falls back to `boot()` when either list is empty or lengths
+    /// disagree — matches the `read_parallel_enum_pair` contract.
+    pub fn from_grammar_state(state: &Object) -> Self {
+        match read_parallel_enum_pair(
+            state,
+            "Superlative Comparator",
+            "Superlative Comparator Aggregate Op",
+        ) {
+            Some(pairs) => SuperlativeComparatorTable { rows: pairs },
+            None => Self::boot(),
+        }
+    }
+
+    /// Look up the aggregate op for a superlative word, if recognised.
+    pub fn op_for(&self, word: &str) -> Option<&str> {
+        self.rows.iter()
+            .find(|(w, _)| w == word)
+            .map(|(_, op)| op.as_str())
+    }
+
+    /// Iterate `(word, op)` pairs in declaration order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.rows.iter().map(|(w, o)| (w.as_str(), o.as_str()))
+    }
+}
+
 /// Sweep-1 lift of the FORML2 single-quoted literal escape convention
 /// (#844 enabling work). Stage-1's `extract_following_literal_span` in
 /// `parse_forml2_stage1.rs` historically used `body.find('\'')` to
@@ -6262,6 +6324,10 @@ mod tests {
     /// bumping noun=50, enum=39.
     /// #882 added `Anaphora Pronoun` enum (1 value) —
     /// bumping noun=51, enum=40.
+    /// task-953 added the parallel `Superlative Comparator` (6 values) /
+    /// `Superlative Comparator Aggregate Op` (6 values) enums so superlative
+    /// ordering words (`strongest`/`weakest` etc.) map to the min/max rank
+    /// aggregate — bumping noun=53, enum=42.
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
@@ -6269,7 +6335,7 @@ mod tests {
 
         let noun_count = fetch_or_phi("Noun", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(noun_count, 51, "noun count");
+        assert_eq!(noun_count, 53, "noun count");
 
         let ft_count = fetch_or_phi("FactType", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
@@ -6281,7 +6347,7 @@ mod tests {
 
         let enum_count = fetch_or_phi("EnumValues", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);
-        assert_eq!(enum_count, 40, "enum-valued noun count");
+        assert_eq!(enum_count, 42, "enum-valued noun count");
 
         let dr_count = fetch_or_phi("DerivationRule", &state)
             .as_seq().map(|s| s.len()).unwrap_or(0);

@@ -954,6 +954,14 @@ fn consequent_aggregate_write(out: &mut String, a: &ConsequentAggregate) {
         }
         out.push(']');
     }
+    // task-953 — enum-rank superlative markers (skip when default).
+    if a.enum_rank {
+        out.push_str(",\"enumRank\":true");
+    }
+    if !a.join_fact_type_id.is_empty() {
+        out.push_str(",\"joinFactTypeId\":");
+        json_escape(out, &a.join_fact_type_id);
+    }
     out.push('}');
 }
 
@@ -1178,6 +1186,27 @@ pub struct ConsequentAggregate {
     /// `ref_fact_type_id` with `filter_role = value`.
     #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub filters: Vec<AggregateFilter>,
+    /// task-953 — when set, `target_role` is an ENUM-valued noun and the
+    /// fold runs over each value's RANK (its index in the value type's
+    /// `enumerates 'v0','v1',…` declaration order, first-declared = rank 0)
+    /// rather than the raw value. `compile_aggregate_derivation` wraps the
+    /// target projection in a rank lookup sourced from
+    /// `CellIndex::enum_values[target value type]`, folds `min`/`max` over
+    /// the ranks, then projects the WINNING enum value (not the rank) onto
+    /// the consequent. This is how superlative comparators
+    /// (`strongest`/`weakest` etc.) over enum-valued nouns lower onto the
+    /// existing numeric min/max aggregate — the superlative is the numeric
+    /// extremum of a declaration-order rank.
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "core::ops::Not::not"))]
+    pub enum_rank: bool,
+    /// task-953 — for a superlative `… among Ys the X …`, the GROUP set is
+    /// the join of this FT (`X concerns Y`, carrying the group key + the
+    /// shared join entity) with `source_fact_type_id` (`Y has P`, carrying
+    /// the join entity + the folded value) on the shared entity. Empty for
+    /// the single-FT aggregate (where `source_fact_type_id` already carries
+    /// both the group key and the folded value).
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "String::is_empty"))]
+    pub join_fact_type_id: String,
 }
 
 /// One literal-equality predicate over the entity being aggregated, sourced
@@ -1641,6 +1670,7 @@ mod canonical_json_tests {
                 source_fact_type_id: "Fact_Type_has_Role".to_string(),
                 group_key_role: "Fact Type".to_string(),
                 group_key_index: None, target_index: None, filters: alloc::vec![],
+                enum_rank: false, join_fact_type_id: String::new(),
             }],
             consequent_universals: alloc::vec![],
             unresolved_clauses: alloc::vec!["weird".to_string()],
@@ -1847,6 +1877,49 @@ mod canonical_json_tests {
         }
     }
 
+    fn sample_rule_with_enum_rank_aggregate() -> DerivationRuleDef {
+        // task-953 — exercises the `enumRank` + `joinFactTypeId` fields'
+        // canonical-JSON serialization, checked against serde byte-for-byte
+        // below. Mirrors the lift `resolve_derivation_rule` builds for a
+        // superlative `… among …` clause over an enum-valued noun.
+        DerivationRuleDef {
+            id: "rule_superlative".to_string(),
+            text: "* Merge has derived Security Posture iff Merge concerns some Commit that has the strongest Security Posture among Commits the Merge concerns".to_string(),
+            antecedent_sources: alloc::vec![AntecedentSource::FactType(
+                "Merge_concerns_Commit".to_string(),
+            )],
+            consequent_instance_role: String::new(),
+            consequent_cell: ConsequentCellSource::Literal(
+                "Merge_has_derived_Security_Posture".to_string(),
+            ),
+            kind: DerivationKind::ModusPonens,
+            join_on: Vec::new(),
+            match_on: Vec::new(),
+            consequent_bindings: Vec::new(),
+            antecedent_filters: Vec::new(),
+            consequent_computed_bindings: Vec::new(),
+            consequent_aggregates: alloc::vec![ConsequentAggregate {
+                role: "Security Posture".to_string(),
+                op: "min".to_string(),
+                target_role: "Security Posture".to_string(),
+                source_fact_type_id: "Commit_has_Security_Posture".to_string(),
+                group_key_role: "Merge".to_string(),
+                group_key_index: None,
+                target_index: None,
+                filters: Vec::new(),
+                enum_rank: true,
+                join_fact_type_id: "Merge_concerns_Commit".to_string(),
+            }],
+            consequent_universals: Vec::new(),
+            unresolved_clauses: Vec::new(),
+            antecedent_role_literals: Vec::new(),
+            antecedent_role_comparisons: Vec::new(),
+            consequent_role_literals: Vec::new(),
+            materialization: MaterializationPolicy::Stored,
+            ring_join: None,
+        }
+    }
+
     /// Byte-for-byte fixture compare against serde_json. This is the
     /// load-bearing contract: `bootstrap_grammar_state` keys the rule
     /// cache on the JSON string, so any diff here means cache misses
@@ -1861,6 +1934,7 @@ mod canonical_json_tests {
             sample_rule_with_escapes(),
             sample_rule_with_ring_join(),
             sample_rule_with_universal(),
+            sample_rule_with_enum_rank_aggregate(),
         ] {
             let serde_out = serde_json::to_string(&r).expect("serde_json should serialize");
             let canonical = r.to_canonical_json();
@@ -1878,6 +1952,7 @@ mod canonical_json_tests {
     #[test]
     fn derivation_rule_def_canonical_json_round_trips() {
         for r in [
+            sample_rule_with_enum_rank_aggregate(),
             sample_rule_minimal(),
             sample_rule_grammar_classifier(),
             sample_rule_with_filter(),

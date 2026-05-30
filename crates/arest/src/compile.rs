@@ -4086,6 +4086,113 @@ fn format_numeric_atom(v: f64) -> String {
 /// facts with the same group key produce three identical derivations.
 /// The forward-chain layer deduplicates derived facts by (fact_type_id,
 /// bindings) after emission.
+/// task-953 — build a Func mapping an enum value (produced by
+/// `value_func`) to its DECLARATION-ORDER RANK, given the value type's
+/// `enumerates 'v0','v1',…` list (`order`, first-declared = rank 0).
+///
+/// Compile-time-unrolled nested conditional (Backus §11.2.3 `p → f ; g`):
+///   rank(v) = (v = v0) → 0 ; (v = v1) → 1 ; … ; len
+/// An unlisted value ranks `len` (worse than every listed value) so it
+/// never wins a `min` (strongest) nor loses a `max` (weakest) spuriously.
+/// Ranks are emitted as numeric atoms so the existing numeric `Lt`/`Gt`
+/// fold compares them directly. No new Func variant — a superlative is the
+/// numeric extremum of a declaration-order rank.
+fn enum_rank_lookup(order: &[String], value_func: Func) -> Func {
+    // Fold from the LAST value back to the first so the first-declared
+    // value ends up as the OUTERMOST conditional (rank 0 checked first).
+    let fallback = Func::constant(Object::atom(&format_numeric_atom(order.len() as f64)));
+    order.iter().enumerate().rev().fold(fallback, |else_branch, (idx, val)| {
+        Func::condition(
+            Func::compose(
+                Func::Eq,
+                Func::construction(vec![
+                    value_func.clone(),
+                    Func::constant(Object::atom(val)),
+                ]),
+            ),
+            Func::constant(Object::atom(&format_numeric_atom(idx as f64))),
+            else_branch,
+        )
+    })
+}
+
+/// task-953 — synthesise the group source for a superlative-over-join
+/// aggregate. Joins `join_ft` (carrying the group key at `gk_on_join` and
+/// the shared entity at `entity_on_join`) with `value_ft` (carrying the
+/// shared entity at `entity_on_val` and the folded value at `value_on_val`)
+/// on the shared entity, emitting one synthetic fact per matching pair.
+/// Each synthetic fact is the bare BINDINGS Seq the encoded population
+/// uses (see `ast::encode_state`), group-key-then-value:
+///   <<group_key_role, gk>, <value_type, val>>
+/// so the image-set fold groups by index 0 and folds the value at index 1.
+///
+/// Shape (Backus §11.2.4, mirroring the image-set construction in
+/// `compile_aggregate_derivation`). `DistR`/`DistL` here pair ONE side with
+/// the WHOLE other collection (they are not a flat cross product), so the
+/// join is built as a nested map exactly like the existing fold:
+///   Concat . α( α(emit) . Filter(entity match) . DistL . [j, V] )
+///          . DistR . [join_facts, value_facts]
+/// `DistR . [J, V]` yields `<<j1, V>, <j2, V>, …>` (each join fact paired
+/// with the whole value-fact list V); for each `<j, V>` the inner
+/// `DistL . [j, V]` yields `<<j, v1>, …>`, the filter keeps the pairs whose
+/// shared-entity values agree, and `emit` projects `<gk(j), value(v)>` into
+/// a fresh fact. `Concat` flattens the per-join Seqs into one fact Seq.
+fn build_superlative_join_source(
+    join_ft_id: &str, gk_on_join: usize, entity_on_join: usize,
+    value_ft_id: &str, entity_on_val: usize, value_on_val: usize,
+    group_key_role: &str, value_type: &str,
+) -> Func {
+    let join_facts = extract_facts_from_pop(join_ft_id);
+    let value_facts = extract_facts_from_pop(value_ft_id);
+    // Over an inner <join_fact, value_fact> pair:
+    let join_side = Func::Selector(1);
+    let value_side = Func::Selector(2);
+    let entity_join = Func::compose(role_value(entity_on_join), join_side.clone());
+    let entity_val = Func::compose(role_value(entity_on_val), value_side.clone());
+    let entity_matches = Func::compose(
+        Func::Eq,
+        Func::construction(vec![entity_join, entity_val]),
+    );
+    // A "fact" in the encoded population (per `ast::encode_state`) is the
+    // bare BINDINGS Seq `<<role,val>, …>`, NOT a `<ft_id, reading,
+    // bindings>` tuple — `extract_facts_from_pop` returns that bindings
+    // form and `role_value(i)` indexes into it. So the synthetic fact is
+    // just the two binding pairs, in group-key-then-value order, matching
+    // `group_key_idx = 0` / `target_idx = 1` in the fold.
+    let emit = Func::construction(vec![
+        Func::construction(vec![
+            Func::constant(Object::atom(group_key_role)),
+            Func::compose(role_value(gk_on_join), join_side.clone()),
+        ]),
+        Func::construction(vec![
+            Func::constant(Object::atom(value_type)),
+            Func::compose(role_value(value_on_val), value_side.clone()),
+        ]),
+    ]);
+    // per-join over <j, V>: α(emit) . Filter(entity match) . DistL . [j, V]
+    let per_join = Func::compose(
+        Func::apply_to_all(emit),
+        Func::compose(
+            Func::filter(entity_matches),
+            Func::compose(
+                Func::DistL,
+                Func::construction(vec![Func::Selector(1), Func::Selector(2)]),
+            ),
+        ),
+    );
+    // Concat . α(per_join) . DistR . [join_facts, value_facts]
+    Func::compose(
+        Func::Concat,
+        Func::compose(
+            Func::apply_to_all(per_join),
+            Func::compose(
+                Func::DistR,
+                Func::construction(vec![join_facts, value_facts]),
+            ),
+        ),
+    )
+}
+
 fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> CompiledDerivation {
     let id = rule.id.clone();
     let text = rule.text.clone();
@@ -4103,22 +4210,62 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
         .expect("caller routed an empty-aggregates rule here");
 
     let source_ft = data.fact_types.get(&agg.source_fact_type_id);
+
+    // task-953 — superlative-over-join source. When the aggregate carries
+    // a `join_fact_type_id` (`Merge concerns Commit`), the GROUP set is the
+    // join of that FT (group key + shared entity) with the value FT
+    // (`Commit has Security Posture`, shared entity + folded value) on the
+    // shared entity. We synthesise a Seq of facts shaped
+    //   <_join, "", <<group_key_role, gk>, <value_type, val>>>
+    // so the EXISTING image-set fold below groups by index 0 and folds the
+    // value at index 1 — no change to the fold machinery. The shared entity
+    // is whatever noun the two FTs have in common that is NOT the group key.
+    let join_ft = (!agg.join_fact_type_id.is_empty())
+        .then(|| data.fact_types.get(&agg.join_fact_type_id))
+        .flatten();
+    let joined_source: Option<Func> = join_ft.and_then(|jft| {
+        let vft = source_ft?;
+        // Group-key index on the join FT (the consequent subject).
+        let gk_on_join = jft.roles.iter()
+            .find(|r| r.noun_name == agg.group_key_role)?.role_index;
+        // Shared entity = the join FT role that is NOT the group key.
+        let entity_noun = &jft.roles.iter()
+            .find(|r| r.noun_name != agg.group_key_role)?.noun_name;
+        let entity_on_join = jft.roles.iter()
+            .find(|r| &r.noun_name == entity_noun)?.role_index;
+        let entity_on_val = vft.roles.iter()
+            .find(|r| &r.noun_name == entity_noun)?.role_index;
+        // Folded value = the value FT role that is NOT the shared entity.
+        let value_on_val = vft.roles.iter()
+            .find(|r| &r.noun_name != entity_noun)?.role_index;
+        Some(build_superlative_join_source(
+            &agg.join_fact_type_id, gk_on_join, entity_on_join,
+            &agg.source_fact_type_id, entity_on_val, value_on_val,
+            &agg.group_key_role, &agg.target_role,
+        ))
+    });
+
     // Prefer the parser's explicit positional indices (set for self-ring
     // sources where both roles share a noun name and name lookup can't
     // disambiguate). Fall back to name-based lookup for the legacy
-    // single-distinct-role aggregate.
-    let group_key_idx = agg.group_key_index.or_else(|| source_ft
-        .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == agg.group_key_role))
-        .map(|r| r.role_index))
-        .unwrap_or(0);
+    // single-distinct-role aggregate. For a synthesised join source the
+    // group key is always at index 0 and the folded value at index 1.
+    let group_key_idx = if joined_source.is_some() { 0 } else {
+        agg.group_key_index.or_else(|| source_ft
+            .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == agg.group_key_role))
+            .map(|r| r.role_index))
+            .unwrap_or(0)
+    };
     // Target-role index: for sum/avg/min/max, the role whose values we
     // fold over. For count, only group membership matters â€” target is
     // informational so any row match is fine. The counted-entity value at
     // this index is also what the aggregate filters semi-join on.
-    let target_idx = agg.target_index.or_else(|| source_ft
-        .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == agg.target_role))
-        .map(|r| r.role_index))
-        .unwrap_or(1);
+    let target_idx = if joined_source.is_some() { 1 } else {
+        agg.target_index.or_else(|| source_ft
+            .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == agg.target_role))
+            .map(|r| r.role_index))
+            .unwrap_or(1)
+    };
 
     // Pre-filter the source facts by any aggregate filters BEFORE the
     // image-set fold. Each filter is a semi-join: keep a source fact only
@@ -4129,7 +4276,10 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
     // then the haystack is stripped back off — leaving the surviving
     // source facts. Composing filters left-to-right ANDs them.
     let source_facts = {
-        let raw = extract_facts_from_pop(&agg.source_fact_type_id);
+        // task-953 — use the synthesised join source when present;
+        // otherwise the raw single-FT population.
+        let raw = joined_source.clone()
+            .unwrap_or_else(|| extract_facts_from_pop(&agg.source_fact_type_id));
         agg.filters.iter().fold(raw, |facts, filt| {
             let ref_ft = data.fact_types.get(&filt.ref_fact_type_id);
             let entity_idx = ref_ft
@@ -4212,7 +4362,50 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
         Func::apply_to_all(Func::compose(t_val.clone(), Func::Selector(2))),
         filt,
     );
-    let agg_value = match agg.op.as_str() {
+    // task-953 — when the aggregate is enum-ranked, the fold runs over the
+    // value's DECLARATION-ORDER RANK rather than the raw value, but the
+    // WINNING enum value (not its rank) is what we project. To carry the
+    // value through the rank fold, project each `<key, fact>` into a pair
+    // `<rank, value>`; fold min/max by comparing the rank (Selector(1) of
+    // the pair) while keeping the whole winning pair; then extract the
+    // value (Selector(2)) from the winner. The rank lookup is a compile-
+    // time-unrolled nested conditional over `enum_values[value type]`
+    // (first-declared = rank 0); an unlisted value ranks last
+    // (`enum.len()`), so it never wins a `min` nor loses a `max` spuriously.
+    let agg_value = if agg.enum_rank {
+        let order = data.enum_values.get(&agg.target_role).cloned()
+            .unwrap_or_default();
+        let rank_of = |value_func: Func| enum_rank_lookup(&order, value_func);
+        let value_of = Func::compose(t_val.clone(), Func::Selector(2));
+        // α( <rank(value), value> ) . filtered
+        let rank_value_pairs = Func::compose(
+            Func::apply_to_all(Func::construction(vec![
+                rank_of(value_of.clone()),
+                value_of.clone(),
+            ])),
+            filtered.clone(),
+        );
+        // Compare the rank (Selector(1)) of the two folded pairs; keep the
+        // whole winning pair. min for strongest-family, max for weakest.
+        let cmp = match agg.op.as_str() {
+            "max" | "latest" | "last" => Func::Gt,
+            _ => Func::Lt, // min / strongest-family (default)
+        };
+        let pick = Func::condition(
+            Func::compose(cmp, Func::construction(vec![
+                Func::compose(Func::Selector(1), Func::Selector(1)),
+                Func::compose(Func::Selector(1), Func::Selector(2)),
+            ])),
+            Func::Selector(1),
+            Func::Selector(2),
+        );
+        // Extract the value from the winning <rank, value> pair.
+        Func::compose(
+            Func::Selector(2),
+            Func::compose(Func::Insert(Box::new(pick)), rank_value_pairs),
+        )
+    } else {
+    match agg.op.as_str() {
         "count" => Func::compose(Func::Length, filtered),
         "sum" => Func::compose(
             Func::Insert(Box::new(Func::Add)),
@@ -4250,6 +4443,7 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
         // Unknown ops collapse to count so the rule still fires with a
         // sane value rather than Ï†.
         _ => Func::compose(Func::Length, filtered),
+    }
     };
 
     // Derived fact: <derived_id, reading, <<group_key_role, key>, <agg_role, value>>>

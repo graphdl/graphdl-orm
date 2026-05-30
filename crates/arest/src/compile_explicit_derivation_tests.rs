@@ -3319,14 +3319,11 @@ Doc has Status.
 //     a passthrough of an arbitrary bound value. This is the SUPPORTED
 //     comparator path: `min`/`max` over a numeric/value role.
 //
-// (b) `authored_strongest_among_superlative_pins_current_behavior`
-//     authors the superlative phrasing the task brief cites verbatim
-//     (`... has the strongest P among ...`). The audit (#814, commit
-//     406f7d12) documented that superlative comparator WORDS
-//     ('strongest'/'highest') over enum-valued nouns are NOT in any
-//     parser recogniser — they fall through resolve_derivation_rule's
-//     cascade and land as an unresolved clause. This test pins that
-//     current behavior so a future recogniser add flips it visibly.
+// (b) Superlative comparator WORDS over enum-valued nouns
+//     (`... has the strongest P among ...`). task-953 closed the audit's
+//     (#814) gap: these now lift to the rank-min/max aggregate. The
+//     end-to-end firing tests live under the `task-953` header below
+//     (superlative_strongest_among_selects_enum_earliest_posture et al.).
 
 #[test]
 fn authored_max_aggregate_fires_end_to_end() {
@@ -3378,21 +3375,18 @@ Order has Amount.
 }
 
 #[test]
-fn authored_strongest_among_superlative_pins_current_behavior() {
-    // The task brief's verbatim shape: superlative comparator WORD
-    // ('strongest') over an enum-valued noun with author-supplied
-    // ordering. Per the #814 audit this is NOT recognised by any
-    // parser cascade entry. We assert the current behavior: the rule
-    // either fails to populate a comparator aggregate, or the clause
-    // lands unresolved — i.e. it does NOT silently fire as a plain
-    // attribute-inheritance passthrough that masquerades as a
-    // comparator result.
+fn authored_strongest_among_superlative_now_lifts_to_rank_aggregate() {
+    // task-953 flips the prior #814 pin. The brief's verbatim shape
+    // (`strongest … among`, enum-valued noun, ordering from the enumerate
+    // declaration order) now lifts to the rank-min aggregate — it is
+    // RECOGNISED, not left unresolved.
     let src = r#"# Strongest-among superlative derivation
 Merge(.ID) is an entity type.
 Commit(.SHA) is an entity type.
 ID is a value type.
 SHA is a value type.
 Security Posture is a value type.
+Security Posture enumerates 'verified', 'unverified', 'compromised'.
 
 ## Fact Types
 Merge has ID.
@@ -3404,32 +3398,223 @@ Merge has derived Security Posture.
 ## Derivation Rules
 * Merge has derived Security Posture iff Merge concerns some Commit that has the strongest Security Posture among Commits the Merge concerns.
 "#;
-    // Parse without asserting exactly-one-rule (the harness' parse_and_compile
-    // requires the rule to compile cleanly; a superlative that falls through
-    // may not produce a usable aggregate). Inspect the parsed rule directly.
     let state = parse_to_state(src).expect("parse");
     let data = compile::cell_index_from_state(&state);
-    // There should be exactly one authored derivation rule.
     assert_eq!(data.derivation_rules.len(), 1,
         "expected exactly one authored rule, got {}", data.derivation_rules.len());
     let rule = &data.derivation_rules[0];
 
-    // CURRENT BEHAVIOR (pinned): the superlative 'strongest ... among'
-    // is NOT recognised as an aggregate comparator — consequent_aggregates
-    // is empty. The comparator words are not in AGG_OPS and there is no
-    // ordering-FT lift, so no max-over-enum aggregate is built.
-    assert!(rule.consequent_aggregates.is_empty(),
-        "REGRESSION/PROGRESS: 'strongest ... among' now populates consequent_aggregates \
-         (a recogniser was added) — update this pin + the #814 audit doc. Got {:#?}",
-        rule.consequent_aggregates);
-    // The superlative clause should surface as unresolved rather than be
-    // silently absorbed as a plain passthrough. If neither aggregate nor
-    // unresolved-clause is set, the rule would fire as bare attribute
-    // inheritance — exactly the false-positive the task warns about.
-    assert!(!rule.unresolved_clauses.is_empty(),
-        "'strongest ... among' must land as an unresolved clause (not silently \
-         absorbed as attribute-inheritance passthrough). rule.text={}\nrule={:#?}",
-        rule.text, rule);
+    // NEW BEHAVIOR (task-953): the superlative lifts to a rank aggregate.
+    assert!(!rule.consequent_aggregates.is_empty(),
+        "'strongest … among' must now populate consequent_aggregates; got {:#?}",
+        rule);
+    assert_eq!(rule.consequent_aggregates[0].op, "min");
+    assert!(rule.consequent_aggregates[0].enum_rank);
+    // The clause is consumed, not dropped as unresolved.
+    assert!(rule.unresolved_clauses.is_empty(),
+        "the superlative clause must be consumed; got {:#?}", rule.unresolved_clauses);
+}
+
+// ─── task-953 — enum-declaration-order superlative comparators ────────────
+//
+// A superlative (`strongest`/`highest`/`best`, `weakest`/`lowest`/`worst`)
+// `… among …` over an ENUM-valued noun is the existing numeric min/max
+// aggregate (compile_aggregate_derivation) applied to a RANK derived from
+// the value type's `enumerates 'v0','v1',…` declaration order
+// (first-declared = strongest = rank 0). The recogniser
+// (parse_forml2::try_parse_superlative_among_clause) routes the superlative
+// word to min (strongest-family) / max (weakest-family) and marks the
+// aggregate `enum_rank`; the compiler wraps the target-value projection in a
+// rank lookup sourced from CellIndex::enum_values. The "among Ys the X …"
+// set is the join of the group FT (`X concerns Y`) with the value FT
+// (`Y has P`) on the shared entity.
+//
+// These tests flip the prior pin (authored_strongest_among_superlative_*):
+// the superlative now BUILDS a comparator aggregate and fires end-to-end,
+// selecting the enum-earliest value rather than last-bound inheritance.
+
+#[test]
+fn superlative_strongest_among_selects_enum_earliest_posture() {
+    // ACCEPTANCE (task-953): the brief's verbatim Merge/Security Posture
+    // reading. `strongest … among Commits the Merge concerns` must select
+    // the Commit whose Security Posture is EARLIEST in the declaration
+    // order (rank 0), projected onto the Merge — NOT last-bound inheritance.
+    let src = r#"# Strongest-among superlative derivation
+Merge(.ID) is an entity type.
+Commit(.SHA) is an entity type.
+ID is a value type.
+SHA is a value type.
+Security Posture is a value type.
+Security Posture enumerates 'verified', 'unverified', 'compromised'.
+
+## Fact Types
+Merge has ID.
+Commit has SHA.
+Merge concerns Commit.
+Commit has Security Posture.
+Merge has derived Security Posture.
+
+## Derivation Rules
+* Merge has derived Security Posture iff Merge concerns some Commit that has the strongest Security Posture among Commits the Merge concerns.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let data = compile::cell_index_from_state(&state);
+    assert_eq!(data.derivation_rules.len(), 1,
+        "expected exactly one authored rule, got {}", data.derivation_rules.len());
+    let rule = &data.derivation_rules[0];
+
+    // The superlative now lifts to a comparator aggregate: op=min (strongest
+    // → rank 0), enum_rank set, source = the value FT, group key = Merge.
+    assert!(!rule.consequent_aggregates.is_empty(),
+        "`strongest … among` must populate consequent_aggregates; rule={:#?}", rule);
+    let agg = &rule.consequent_aggregates[0];
+    assert_eq!(agg.op, "min", "strongest maps to min (rank 0 = strongest)");
+    assert!(agg.enum_rank, "aggregate must be flagged enum_rank");
+    assert!(rule.unresolved_clauses.is_empty(),
+        "the superlative clause must be consumed, not left unresolved; got {:#?}",
+        rule.unresolved_clauses);
+
+    let model = compile::compile(&state);
+    let cd = model.derivations.iter().find(|d| d.id == rule.id)
+        .expect("compiled derivation missing");
+
+    // M1 concerns C1(verified=rank0=strongest), C2(compromised=rank2).
+    // M2 concerns C3(unverified=rank1). Strongest-per-Merge: M1→verified,
+    // M2→unverified.
+    let out = apply_to_facts(&cd.func, &[
+        ("Merge_concerns_Commit", &[("Merge", "M1"), ("Commit", "C1")]),
+        ("Merge_concerns_Commit", &[("Merge", "M1"), ("Commit", "C2")]),
+        ("Merge_concerns_Commit", &[("Merge", "M2"), ("Commit", "C3")]),
+        ("Commit_has_Security_Posture", &[("Commit", "C1"), ("Security Posture", "verified")]),
+        ("Commit_has_Security_Posture", &[("Commit", "C2"), ("Security Posture", "compromised")]),
+        ("Commit_has_Security_Posture", &[("Commit", "C3"), ("Security Posture", "unverified")]),
+    ]);
+    let derived = decode_derived(&out);
+    assert!(
+        derived.iter().any(|(_, _, b)|
+            b.iter().any(|(k, v)| k == "Merge" && v == "M1") &&
+            b.iter().any(|(k, v)| k == "Security Posture" && v == "verified")),
+        "M1 must derive STRONGEST posture 'verified' (rank 0), not last-bound; got {:#?}", derived);
+    // Negative guard: the weaker posture must NOT leak through for M1.
+    assert!(
+        !derived.iter().any(|(_, _, b)|
+            b.iter().any(|(k, v)| k == "Merge" && v == "M1") &&
+            b.iter().any(|(k, v)| k == "Security Posture" && v == "compromised")),
+        "M1 must derive ONLY the strongest posture, not 'compromised'; got {:#?}", derived);
+    assert!(
+        derived.iter().any(|(_, _, b)|
+            b.iter().any(|(k, v)| k == "Merge" && v == "M2") &&
+            b.iter().any(|(k, v)| k == "Security Posture" && v == "unverified")),
+        "M2 (single commit) must derive 'unverified'; got {:#?}", derived);
+}
+
+#[test]
+fn superlative_highest_priority_among_selects_p0_over_p1() {
+    // Second use site (task-953): Task Priority. `highest … among` = min
+    // index → selects p0 over p1. Confirms the lift generalises past
+    // Security Posture to a second enum-ordered value type.
+    let src = r#"# Highest-priority-among superlative derivation
+Sprint(.Name) is an entity type.
+Task(.Key) is an entity type.
+Name is a value type.
+Key is a value type.
+Priority is a value type.
+Priority enumerates 'p0', 'p1', 'p2'.
+
+## Fact Types
+Sprint has Name.
+Task has Key.
+Sprint includes Task.
+Task has Priority.
+Sprint has top Priority.
+
+## Derivation Rules
+* Sprint has top Priority iff Sprint includes some Task that has the highest Priority among Tasks the Sprint includes.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let data = compile::cell_index_from_state(&state);
+    let rule = &data.derivation_rules[0];
+    assert!(!rule.consequent_aggregates.is_empty(),
+        "`highest … among` must populate consequent_aggregates; rule={:#?}", rule);
+    assert_eq!(rule.consequent_aggregates[0].op, "min",
+        "highest maps to min (rank 0 = highest)");
+    assert!(rule.consequent_aggregates[0].enum_rank);
+
+    let model = compile::compile(&state);
+    let cd = model.derivations.iter().find(|d| d.id == rule.id)
+        .expect("compiled derivation missing");
+    // S1 includes T1(p1), T2(p0) → highest p0. S2 includes T3(p2) → p2.
+    let out = apply_to_facts(&cd.func, &[
+        ("Sprint_includes_Task", &[("Sprint", "S1"), ("Task", "T1")]),
+        ("Sprint_includes_Task", &[("Sprint", "S1"), ("Task", "T2")]),
+        ("Sprint_includes_Task", &[("Sprint", "S2"), ("Task", "T3")]),
+        ("Task_has_Priority", &[("Task", "T1"), ("Priority", "p1")]),
+        ("Task_has_Priority", &[("Task", "T2"), ("Priority", "p0")]),
+        ("Task_has_Priority", &[("Task", "T3"), ("Priority", "p2")]),
+    ]);
+    let derived = decode_derived(&out);
+    assert!(
+        derived.iter().any(|(_, _, b)|
+            b.iter().any(|(k, v)| k == "Sprint" && v == "S1") &&
+            b.iter().any(|(k, v)| k == "Priority" && v == "p0")),
+        "S1 must derive HIGHEST priority p0 (rank 0), not p1; got {:#?}", derived);
+    assert!(
+        !derived.iter().any(|(_, _, b)|
+            b.iter().any(|(k, v)| k == "Sprint" && v == "S1") &&
+            b.iter().any(|(k, v)| k == "Priority" && v == "p1")),
+        "S1 must NOT derive the weaker p1; got {:#?}", derived);
+}
+
+#[test]
+fn superlative_weakest_among_selects_enum_latest_posture() {
+    // The opposite direction: `weakest`/`lowest`/`worst` maps to MAX rank
+    // (last-declared). M1 concerns verified(0) + compromised(2) → weakest
+    // is 'compromised'.
+    let src = r#"# Weakest-among superlative derivation
+Merge(.ID) is an entity type.
+Commit(.SHA) is an entity type.
+ID is a value type.
+SHA is a value type.
+Security Posture is a value type.
+Security Posture enumerates 'verified', 'unverified', 'compromised'.
+
+## Fact Types
+Merge has ID.
+Commit has SHA.
+Merge concerns Commit.
+Commit has Security Posture.
+Merge has derived Security Posture.
+
+## Derivation Rules
+* Merge has derived Security Posture iff Merge concerns some Commit that has the weakest Security Posture among Commits the Merge concerns.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let data = compile::cell_index_from_state(&state);
+    let rule = &data.derivation_rules[0];
+    assert!(!rule.consequent_aggregates.is_empty(),
+        "`weakest … among` must populate consequent_aggregates; rule={:#?}", rule);
+    assert_eq!(rule.consequent_aggregates[0].op, "max",
+        "weakest maps to max (last-declared = weakest)");
+    let model = compile::compile(&state);
+    let cd = model.derivations.iter().find(|d| d.id == rule.id)
+        .expect("compiled derivation missing");
+    let out = apply_to_facts(&cd.func, &[
+        ("Merge_concerns_Commit", &[("Merge", "M1"), ("Commit", "C1")]),
+        ("Merge_concerns_Commit", &[("Merge", "M1"), ("Commit", "C2")]),
+        ("Commit_has_Security_Posture", &[("Commit", "C1"), ("Security Posture", "verified")]),
+        ("Commit_has_Security_Posture", &[("Commit", "C2"), ("Security Posture", "compromised")]),
+    ]);
+    let derived = decode_derived(&out);
+    assert!(
+        derived.iter().any(|(_, _, b)|
+            b.iter().any(|(k, v)| k == "Merge" && v == "M1") &&
+            b.iter().any(|(k, v)| k == "Security Posture" && v == "compromised")),
+        "M1 must derive WEAKEST posture 'compromised' (rank 2); got {:#?}", derived);
+    assert!(
+        !derived.iter().any(|(_, _, b)|
+            b.iter().any(|(k, v)| k == "Merge" && v == "M1") &&
+            b.iter().any(|(k, v)| k == "Security Posture" && v == "verified")),
+        "M1 must NOT derive the stronger 'verified'; got {:#?}", derived);
 }
 
 // ─── task-934-1 — §4.2 value-type→widget LAZY VIEW mechanism ──────────────

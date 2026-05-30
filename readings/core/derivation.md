@@ -303,25 +303,55 @@ bottom of this section.
     `… in the future` recognised by `TemporalPredicateTable`.
     Runtime clock checks; no FT resolution.
 
-### Comparator vocabulary the parser does NOT recognise (task-814)
+11. **Enum-declaration-order superlative** (task-953) — `<X> has
+    derived <P> iff <X> <verb> some <Y> that has the <super> <P> among
+    <Y>s the <X> <verb>` where `<super>` is a superlative word
+    (`strongest`/`highest`/`best` or `weakest`/`lowest`/`worst`) and
+    `<P>` is an ENUM-valued noun. Recognised by
+    `try_parse_superlative_among_clause` in `parse_forml2.rs`; the
+    superlative word maps to the existing `min`/`max` aggregate op via
+    `SuperlativeComparatorTable` (`readings/forml2-grammar.md` enums
+    `Superlative Comparator` / `Superlative Comparator Aggregate Op`),
+    and the clause lifts to a `ConsequentAggregate` with `enum_rank =
+    true`. The KEY INSIGHT: a superlative is the numeric min/max fold
+    applied to a RANK derived from the value type's `enumerates
+    'v0','v1',…` declaration order (first-declared = strongest = rank
+    0) — there is NO new binary op and NO per-value cascade. The
+    `among Ys the X …` group set is the join of the group FT
+    (`X concerns Y`) with the value FT (`Y has P`) on the shared
+    entity; `compile_aggregate_derivation` synthesises that join
+    (`build_superlative_join_source`), promotes each candidate value to
+    its declaration-order rank (`enum_rank_lookup`), folds `min`/`max`
+    over the ranks, and projects the WINNING enum value (not the rank)
+    onto the consequent. Pinned by
+    `superlative_strongest_among_selects_enum_earliest_posture`,
+    `superlative_highest_priority_among_selects_p0_over_p1`, and
+    `superlative_weakest_among_selects_enum_latest_posture` in
+    `compile_explicit_derivation_tests.rs`. OUT OF SCOPE (follow-up):
+    domain-specific superlatives needing a non-enum ordering
+    (`most-recent`/`fastest`/`cheapest` over dates/numbers) — those
+    need an ordering source other than the enumerate declaration order.
 
-The following words are surfaced in user readings (Halpin §6
-"sentence-level comparison") but do NOT lift to any
-`AntecedentRoleComparison` or aggregate operator today. A rule whose
-antecedent contains any of these falls through every classifier in
-`resolve_derivation_rule` and lands as an unresolved clause (the
-parser emits an `UnresolvedClause` fact; the rule itself stays in
-the schema with whatever positive FT antecedents survived):
+### Comparator vocabulary the parser does NOT recognise
 
-* `strongest` / `weakest`
-* `highest` / `lowest` (only the aggregate forms with
-  `is the highest of` / `is the lowest of` work — and only over
-  numeric roles)
-* `best` / `worst`
+The `… among …` enum-declaration-order superlatives
+(`strongest`/`weakest`, `highest`/`lowest`, `best`/`worst`) ARE now
+recognised — see shape 11 above (task-953). The following words still
+surface in user readings (Halpin §6 "sentence-level comparison") but
+do NOT lift to any `AntecedentRoleComparison` or aggregate operator. A
+rule whose antecedent contains any of these falls through every
+classifier in `resolve_derivation_rule` and lands as an unresolved
+clause (the parser emits an `UnresolvedClause` fact; the rule itself
+stays in the schema with whatever positive FT antecedents survived):
+
 * `most` / `least` (without `at`)
 * `top` / `bottom`
-* Any superlative adjective specific to a value-type's domain
-  (`fastest`, `cheapest`, `safest`, `most recent`)
+* Any superlative adjective specific to a value-type's domain whose
+  ordering is NOT the enum declaration order — `fastest`/`cheapest`
+  over a numeric role, `most recent` over a date. The enum-ordered
+  family is handled by shape 11; these need a different ordering
+  source (a numeric/date role, not `enumerates …`) and are the
+  documented task-953 follow-up.
 
 The chainer treats these as opaque tokens — the rule body's FT
 references that DO resolve still emit derivations, and the
@@ -332,7 +362,7 @@ remaining positive antecedents fire, the consequent inherits
 bindings from the last antecedent that carries the consequent's
 role, and the rule appears to ignore the comparator clause entirely.
 
-### Priority/superlative semantics: an open authoring gap
+### How the enum-superlative gap was closed (task-953, approach 4)
 
 An earlier draft documented a `has no`-negation 2-level priority
 cascade as a workaround for ordering/superlative semantics. That
@@ -340,11 +370,40 @@ pattern relied on the parser converting `has no` / `is not` clauses
 into `AntecedentSource::AbsenceOf` antecedents and a negation-guarded
 stratum in the chainer. Both were removed 2026-05-19 (negation is not
 an antecedent kind — see the CWA section and the NORMA model it
-cites), so the cascade no longer parses. Ordering/superlative
-semantics over enum-valued nouns therefore remain an open authoring
-gap; the structural requirements for closing it faithfully are below.
+cites), so the cascade no longer parses.
 
-### Why the comparator gap isn't trivial to close
+task-953 closed the gap for enum-ordered superlatives WITHOUT a
+cascade synthesiser (approach 3) or a new `Func` (approach 2), per the
+owner directive to prefer FFP forms over procedural Rust. The chosen
+approach (4) is an FFP fold: a superlative is the EXISTING numeric
+min/max aggregate applied to a RANK promoted from the value type's
+`enumerates …` declaration order. The three structural requirements
+the task-814 audit flagged (below) were met thus:
+
+1. **Ordering metadata on the value type** — sourced directly from the
+   existing `EnumValues` cell (already in `CellIndex::enum_values`),
+   read in declaration order. No separate ordering FT is authored; the
+   acceptance reading declares none. (The audit's worry that the order
+   "is semantic but not promoted" was unfounded — `enum_rank_lookup`
+   reads the declaration order at compile time.)
+
+2. **An aggregate operator over ordering** — NOT a new binary op. The
+   enum value is rank-PROMOTED to a numeric atom
+   (`enum_rank_lookup`, a compile-time-unrolled nested conditional),
+   then the EXISTING `min`/`max` Insert-fold runs over the ranks. This
+   sidesteps the audit's "doesn't compose" objection (which was about
+   plugging a primitive op into the aggregate slot): decoupling via
+   rank-promotion-then-numeric-fold means the fold never sees an enum.
+
+3. **NO per-value priority-cascade synthesiser** — rejected. The
+   author's reading stays the natural-language superlative form;
+   compilation lifts it to one rank-aggregate, not N cascade rules.
+
+The historical "structural requirements" framing is retained below for
+provenance; items 1–2 are now satisfied by rank-promotion and item 3
+was the rejected alternative.
+
+### Why the comparator gap wasn't trivial to close (historical, task-814 audit)
 
 A faithful `strongest Security Posture among Commits the Merge
 concerns` lowering would need:
@@ -377,8 +436,12 @@ concerns` lowering would need:
    compilation expands it.
 
 The audit at task-814 settled on option (b): document the
-workaround now, defer the synthesiser to a follow-up task once a
-second use site (besides Merge's Security Posture) materialises.
+workaround now, defer to a follow-up task once a second use site
+(besides Merge's Security Posture) materialised. task-953 picked it up
+with the second use site (Task Priority) and chose NEITHER (b)'s
+cascade NOR the binary-op of item 2 — it added rank-promotion (item 1
+sourced from `EnumValues`) plus a join, feeding the EXISTING numeric
+fold. See "How the enum-superlative gap was closed" above.
 
 ### Audit anchor — files cited above
 
@@ -405,7 +468,19 @@ second use site (besides Merge's Security Posture) materialises.
 * `crates/arest/src/compile.rs::compile_join_derivation` —
   2+-antecedent equi-join (path used by `kind = Join`).
 * `crates/arest/src/compile.rs::compile_aggregate_derivation` —
-  Codd image-set fold over numeric role values.
+  Codd image-set fold over numeric role values; task-953 added the
+  `enum_rank` branch (rank-promote enum values, fold min/max over the
+  ranks, project the winning value) and the join source.
+* `crates/arest/src/parse_forml2.rs::try_parse_superlative_among_clause`
+  — recogniser for shape 11 (`<X> has the <super> <P> among <Y>s …`);
+  routes to a `ConsequentAggregate { enum_rank: true }` (task-953).
+* `crates/arest/src/parse_forml2_stage2.rs::SuperlativeComparatorTable`
+  — superlative-word → `min`/`max` mapping; boot table mirrors the
+  `Superlative Comparator` / `Superlative Comparator Aggregate Op`
+  grammar enums (task-953).
+* `crates/arest/src/compile.rs::enum_rank_lookup` /
+  `build_superlative_join_source` — rank-promotion (value → declaration-
+  order index) and the group-FT ⋈ value-FT join (task-953).
 * `crates/arest/src/evaluate.rs::prove_from_state` — lazy CWA/OWA
   negation: a goal absent from the population is Disproven (Closed) or
   Unknown (Open), per whitepaper §305.

@@ -1052,6 +1052,74 @@ fn try_parse_aggregate_clause(text: &str, noun_names: &[String]) -> Option<(Stri
     Some((role, op, target, where_clause))
 }
 
+/// task-953 — recognise a superlative/ordering comparator clause of the
+/// shape `<EntityA> has the <super> <ValueType> among <rest>` where
+/// `<super>` is a recognised superlative word
+/// (`strongest`/`highest`/`best`/`weakest`/`lowest`/`worst`) and
+/// `<ValueType>` is a declared (enum-valued) noun.
+///
+/// Returns `(op, entity_noun, value_type, among_rest)` where `op` is the
+/// aggregate the superlative maps to (`min` for the strongest-family,
+/// `max` for the weakest-family — see `SuperlativeComparatorTable`),
+/// `entity_noun` is the subject that carries the value (`Commit`),
+/// `value_type` is the enum-valued noun being compared (`Security
+/// Posture`), and `among_rest` is the text after `among` naming the
+/// group join (`Commits the Merge concerns`). The caller resolves the
+/// value FT (`entity_noun has value_type`) and the among-join FT against
+/// the catalog and assembles the `ConsequentAggregate` — keeping FT
+/// resolution co-located with the other clause handlers.
+///
+/// FFP framing: a superlative is the existing numeric min/max aggregate
+/// applied to the value's enum-declaration-order RANK. No new binary op
+/// — rank-promotion decouples the enum from the numeric fold.
+fn try_parse_superlative_among_clause(
+    text: &str,
+    noun_names: &[String],
+) -> Option<(String, String, String, String)> {
+    let t = text.trim().trim_end_matches('.').trim();
+    // Split on ` among ` — required for the ordering-superlative form.
+    // (A bare `X has the strongest P` with no comparison set is not a
+    // well-formed superlative; the `among` set defines what we rank over.)
+    let among_idx = t.find(" among ")?;
+    let head = t[..among_idx].trim();
+    let among_rest = t[among_idx + " among ".len()..].trim().to_string();
+
+    // Head must contain a superlative word as a whole token. Find it via
+    // the lifted table; capture the op and the text before/after the word.
+    let table = crate::parse_forml2_stage2::SuperlativeComparatorTable::boot();
+    let (op, before_super, after_super) = table.iter().find_map(|(word, op)| {
+        // Whole-word match: ` <word> ` (the head always has `has the`
+        // before and the value type after, so both sides are non-empty).
+        let needle = alloc::format!(" {} ", word);
+        let idx = head.find(needle.as_str())?;
+        Some((
+            op.to_string(),
+            head[..idx].to_string(),
+            head[idx + needle.len()..].trim().to_string(),
+        ))
+    })?;
+
+    // `before_super` should be `<EntityA> has the` (possibly with a
+    // leading determiner). Extract the entity noun = the LAST noun in it.
+    let entity_noun = find_nouns(&before_super, noun_names)
+        .last()
+        .map(|(_, _, n)| parse_role_token(n).0.to_string())?;
+
+    // `after_super` should be the value type, possibly trailed by other
+    // tokens. The value type = the FIRST noun in it.
+    let value_type = find_nouns(&after_super, noun_names)
+        .first()
+        .map(|(_, _, n)| parse_role_token(n).0.to_string())?;
+
+    // Entity and value type must differ (a noun can't be the superlative
+    // of itself) and both must be declared.
+    if entity_noun == value_type { return None; }
+    if !noun_names.iter().any(|n| n == &entity_noun) { return None; }
+    if !noun_names.iter().any(|n| n == &value_type) { return None; }
+
+    Some((op, entity_noun, value_type, among_rest))
+}
+
 /// Parse an arithmetic antecedent clause of Halpin FORML attribute-style
 /// form: `<RoleName> is <expr>` (e.g. `Volume is Size * Size * Size`).
 ///
@@ -1663,9 +1731,79 @@ fn resolve_derivation_rule(
                     group_key_index,
                     target_index,
                     filters,
+                    // The `is the <op> of …` numeric aggregate folds raw role
+                    // values, not enum ranks, and sources from one FT.
+                    enum_rank: false,
+                    join_fact_type_id: String::new(),
                 });
             }
             continue;
+        }
+        // task-953 — superlative/ordering comparator clause
+        // (`<EntityA> has the <super> <ValueType> among <Ys> …`). Lifts to
+        // a rank aggregate: the existing numeric min/max fold (`min` for
+        // strongest-family, `max` for weakest-family) over the value's
+        // enum-declaration-order rank, grouped by the consequent subject.
+        // The "among <Ys> …" set is the join of the GROUP FT (consequent
+        // subject ⋈ entity, e.g. `Merge concerns Commit`) with the VALUE
+        // FT (`Commit has Security Posture`) on the shared entity.
+        if let Some((op, entity_noun, value_type, _among_rest)) =
+            try_parse_superlative_among_clause(part, &noun_names)
+        {
+            // Value FT: the declared FT whose roles are exactly the
+            // entity + the enum value type (`Commit has Security Posture`).
+            let value_ft = fact_types_map.iter().find(|(_, ft)| {
+                let has = |n: &str| ft.roles.iter().any(|r| r.noun_name == n);
+                ft.roles.len() == 2 && has(&entity_noun) && has(&value_type)
+            }).map(|(id, _)| id.clone());
+
+            // Group key = the consequent subject noun (`Merge`).
+            let group_key = find_nouns(consequent_text, &noun_names).first()
+                .map(|(_, _, n)| parse_role_token(n).0.to_string());
+
+            // Join FT: the declared binary FT relating the group key with
+            // the entity (`Merge concerns Commit`). Distinct from the
+            // value FT. When the group key equals the entity (a degenerate
+            // single-FT superlative `X has the strongest P among Xs …`),
+            // no join is needed and `join_fact_type_id` stays empty.
+            let join_ft = group_key.as_ref().and_then(|gk| {
+                if gk == &entity_noun { return None; }
+                fact_types_map.iter().find(|(_, ft)| {
+                    let has = |n: &str| ft.roles.iter().any(|r| r.noun_name == n);
+                    ft.roles.len() == 2 && has(gk) && has(&entity_noun)
+                }).map(|(id, _)| id.clone())
+            });
+
+            // Require the value FT and a group key; require the join FT
+            // unless degenerate. A superlative whose FTs aren't declared
+            // falls through to the unresolved-clause channel below.
+            match (value_ft, group_key) {
+                (Some(value_ft_id), Some(group_key_role))
+                    if join_ft.is_some() || group_key_role == entity_noun =>
+                {
+                    aggregates.push(crate::types::ConsequentAggregate {
+                        // The consequent role receiving the winning value
+                        // is the value type itself (`Security Posture`).
+                        role: value_type.clone(),
+                        op,
+                        target_role: value_type.clone(),
+                        source_fact_type_id: value_ft_id,
+                        group_key_role,
+                        group_key_index: None,
+                        target_index: None,
+                        filters: Vec::new(),
+                        enum_rank: true,
+                        join_fact_type_id: join_ft.unwrap_or_default(),
+                    });
+                    continue;
+                }
+                _ => {
+                    // FTs not all declared — record as unresolved so the
+                    // rule doesn't silently fire as bare inheritance.
+                    rule.unresolved_clauses.push(part.to_string());
+                    continue;
+                }
+            }
         }
         // Definitional clauses claim the part outright â€” they bind a
         // consequent role's value and don't belong in antecedent FTs.

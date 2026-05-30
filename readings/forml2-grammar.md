@@ -62,6 +62,10 @@ Word Comparator is a value type.
   The possible values of Word Comparator are 'exceeds', 'is greater than', 'is less than', 'is at least', 'is at most', 'is more than', 'equals', 'is equal to'.
 Range Operator is a value type.
   The possible values of Range Operator are 'within', 'before', 'after'.
+Superlative Comparator is a value type.
+  The possible values of Superlative Comparator are 'strongest', 'highest', 'best', 'weakest', 'lowest', 'worst'.
+Superlative Comparator Aggregate Op is a value type.
+  The possible values of Superlative Comparator Aggregate Op are 'min', 'min', 'min', 'max', 'max', 'max'.
 Quote Escape is a value type.
   The possible values of Quote Escape are 'doubled-quote'.
 Universal Quantifier Keyword is a value type.
