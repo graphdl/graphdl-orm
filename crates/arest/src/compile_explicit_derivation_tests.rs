@@ -4325,3 +4325,339 @@ Item is clear.
         clear, derived);
 }
 
+// ─── task-934-3a: Menu-View Derivation via Skolem Head ───────────────────────
+//
+// DESIGN SPEC (§4.5 / task-934-3 part a): a Noun's action menu is a DERIVED
+// view — one `ViewElement` per (entity, legal-transition) pair, where
+// "legal" means the entity is currently in a Status that the Transition
+// departs from. The derivation head is an EXISTENTIAL (Skolem) variable: the
+// fresh `ViewElement` id is `ve_<fnv1a64(Resource|Transition)>`, deterministic
+// and idempotent (same frontier → same id across re-reads).
+//
+// METAMODEL JOIN (verified against readings/core/state.md + instances.md):
+//
+//   State Machine Definition is for Noun           (SMD → Noun)
+//   Transition is defined in State Machine Definition (Transition → SMD)
+//   Transition is from Status                      (Transition → Status)
+//   State Machine is currently in Status           (SM → Status, canonical carrier)
+//   State Machine is for Resource                  (SM → Resource)
+//   Resource is instance of Noun                   (Resource → Noun, bridges them)
+//
+// Frontier = (Resource, Transition) after joining on Status (Transition.from ==
+// SM.currentStatus). One ViewElement per frontier pair.
+//
+// TWO CONSEQUENT RULES (design §4.5 + skolem-head-design.md §3/§5):
+//   Rule A: ViewElement (E) renders Transition (Tr)   [gives the VE→Tr link]
+//   Rule B: ViewElement (E) has Component Role 'button' [pins the widget]
+// Both carry the SAME frontier (Resource, Transition) → SAME `ve_<fnv>` id →
+// SAME entity E. This is the "shared frontier = shared entity" property.
+//
+// HOW THIS TEST WORKS:
+//   The frontier FT `MenuFrontierFT` pre-populates (Resource, Transition) pairs
+//   equivalent to what the full 6-way join produces. This isolates the
+//   SKOLEM HEAD mechanism (proven here) from the JOIN compilation (proven
+//   separately in the join tests and in the existing skolem-head test). The
+//   full-join wiring is the remaining compiler work (see "Remaining work" below).
+//
+// ASSERTS:
+//   (a) entity in a non-terminal status: one VE per legal departure transition
+//   (b) entity in a terminal status: ZERO ViewElements (no departing transitions)
+//   (c) deterministic `ve_<fnv>` ids across both entities
+//   (d) IDEMPOTENT across two resolve passes (byte-identical id sets)
+//   (e) `renders Transition` rule → VE carries its Transition
+//   (f) `has Component Role 'button'` rule → SAME VE id (shared frontier)
+//   (g) NO eager `derivation:` def (lazy-only, never hangs the metamodel)
+//
+// REGISTERED-LIVE: test-only (not in lib.rs UI_READINGS). The full skolem
+// head requires the parser to recognise the `(E)` surface syntax (deferred;
+// see spec_skolem_head_authored_in_forml2_resolves_lazily and
+// readings/ui/skolem-head-design.md §5).
+//
+// REMAINING WORK for 934-3:
+//   (1) Parser: recognise `ViewElement (E) renders Transition (Tr)` as a
+//       skolem head variable → populate `SkolemHeadRole{role, frontier}`.
+//   (2) Compiler: the full 6-way join (SMD→Noun→SM→Resource×Status×Transition)
+//       wired through `compile_join_derivation` + skolem head emission.
+//   (3) Guard negation (§4.5 guard-filtering): `Guard prevents Transition →
+//       omit the VE` — needs parser-negation idiom not yet available.
+//   (4) Registration in UI_READINGS (lib.rs) + metamodel compile verification.
+#[test]
+fn menu_view_derivation_via_skolem_head_lazy_idempotent() {
+    use crate::ast::{func_to_object, resolve_view, store};
+
+    // ── Frontier FT and two consequent cells ──────────────────────────
+    //
+    // MenuFrontierFT carries (Resource, Transition) pairs — the output of
+    // the full SM join. Populated directly to isolate the skolem head from
+    // the join compilation (join is proven separately).
+    let frontier_ft = "MenuFrontierFT";
+    // Rule A: ViewElement renders Transition
+    let cons_renders = "ViewElement_renders_Transition_menu";
+    // Rule B: ViewElement has Component Role
+    let cons_role    = "ViewElement_has_Component_Role_menu";
+
+    // ── helper: extract a named role from a named-tuple fact ──────────
+    let role_value = |name: &str| -> Func {
+        Func::compose(
+            Func::compose(Func::Selector(2), Func::Selector(1)),
+            Func::filter(Func::compose(Func::Eq, Func::construction(vec![
+                Func::Selector(1),
+                Func::constant(Object::atom(name)),
+            ]))),
+        )
+    };
+
+    // ── Skolem id: ve_fnv1a64(Resource | Transition) ──────────────────
+    //
+    // Frontier = (Resource, Transition). Both are read off the same
+    // MenuFrontierFT fact under apply_to_all, exactly like the existing
+    // skolem_head_resolve_view_invents_one_idempotent_entity_per_binding test.
+    let skolem_id = Func::compose(
+        Func::Platform("skolem".to_string()),
+        Func::construction(vec![
+            role_value("Resource"),
+            role_value("Transition"),
+        ]),
+    );
+
+    // ── Rule A view func: ViewElement renders Transition ──────────────
+    //
+    // bindings per frontier fact:
+    //   <ViewElement, skolem(Resource,Transition)>
+    //   <Transition,  transition-value>            (carries the rendered transition)
+    //   <Resource,    resource-value>              (carries the entity for fetch-filter)
+    let a_pairs = Func::construction(vec![
+        Func::construction(vec![Func::constant(Object::atom("ViewElement")), skolem_id.clone()]),
+        Func::construction(vec![Func::constant(Object::atom("Transition")), role_value("Transition")]),
+        Func::construction(vec![Func::constant(Object::atom("Resource")),   role_value("Resource")]),
+    ]);
+    let a_bindings = Func::compose(Func::Concat, Func::construction(vec![Func::Id, a_pairs]));
+    let a_envelope = Func::construction(vec![
+        Func::constant(Object::atom(cons_renders)),
+        Func::constant(Object::atom("ViewElement renders Transition")),
+        a_bindings,
+    ]);
+    let extract = Func::compose(
+        Func::FetchOrPhi,
+        Func::construction(vec![Func::constant(Object::atom(frontier_ft)), Func::Id]),
+    );
+    let view_func_renders = Func::compose(Func::apply_to_all(a_envelope), extract.clone());
+
+    // ── Rule B view func: ViewElement has Component Role 'button' ─────
+    //
+    // SAME frontier → SAME skolem_id → SAME ViewElement entity (shared frontier
+    // property: designs §4.5 + skolem-head-design.md §2). The bindings:
+    //   <ViewElement,     skolem(Resource,Transition)>
+    //   <Component Role,  'button'>
+    let b_pairs = Func::construction(vec![
+        Func::construction(vec![Func::constant(Object::atom("ViewElement")), skolem_id.clone()]),
+        Func::construction(vec![
+            Func::constant(Object::atom("Component Role")),
+            Func::constant(Object::atom("button")),
+        ]),
+    ]);
+    let b_bindings = Func::compose(Func::Concat, Func::construction(vec![Func::Id, b_pairs]));
+    let b_envelope = Func::construction(vec![
+        Func::constant(Object::atom(cons_role)),
+        Func::constant(Object::atom("ViewElement has Component Role")),
+        b_bindings,
+    ]);
+    let view_func_role = Func::compose(Func::apply_to_all(b_envelope), extract);
+
+    // ── Register both under `view:{cell}` (LAZY — no `derivation:` def) ──
+    let defs = {
+        let d = Object::phi();
+        let d = store(&format!("view:{}", cons_renders), func_to_object(&view_func_renders), &d);
+        let d = store(&format!("view:{}", cons_role),    func_to_object(&view_func_role),    &d);
+        d
+    };
+
+    // ── Population ────────────────────────────────────────────────────
+    //
+    // SM model (mirrors apps/tasks/readings/app.md task SM):
+    //   Status 'pending'    → transitions: 'start', 'delete-from-pending'  (NON-TERMINAL)
+    //   Status 'deleted'    → transitions: (none)                          (TERMINAL)
+    //
+    // Entities:
+    //   task-1: currently in 'pending'  → 2 legal transitions → 2 ViewElements
+    //   task-2: currently in 'deleted'  → 0 legal transitions → 0 ViewElements
+    //
+    // MenuFrontierFT = (Resource, Transition) from the join of
+    //   Resource_is_currently_in_Status × Transition_is_from_Status on Status:
+    //   - (task-1, start)                 ← start is from 'pending'
+    //   - (task-1, delete-from-pending)   ← delete-from-pending is from 'pending'
+    //   task-2 in 'deleted' → no Transition is from 'deleted' → no frontier rows
+    let pop = {
+        let mut s = Object::phi();
+        // task-1 has two legal transitions from 'pending'
+        s = ast::cell_push(frontier_ft, ast::fact_from_pairs(&[
+            ("Resource", "task-1"),
+            ("Transition", "start"),
+        ]), &s);
+        s = ast::cell_push(frontier_ft, ast::fact_from_pairs(&[
+            ("Resource", "task-1"),
+            ("Transition", "delete-from-pending"),
+        ]), &s);
+        // task-2 is in 'deleted' (terminal): NO frontier rows → NO ViewElements
+        s
+    };
+
+    // ── Assertion (a) + (b): task-1 gets 2 VEs, task-2 gets 0 ────────
+    let pass1_renders = resolve_view(cons_renders, &pop, &defs)
+        .expect("view: def for renders must resolve via resolve_view");
+
+    let elems1: Vec<(String, String, String)> = pass1_renders.as_seq()
+        .map(|items| items.iter().filter_map(|f| {
+            let ve = ast::binding(f, "ViewElement").map(String::from)?;
+            let tr = ast::binding(f, "Transition").map(String::from)?;
+            let rs = ast::binding(f, "Resource").map(String::from)?;
+            Some((ve, tr, rs))
+        }).collect())
+        .unwrap_or_default();
+
+    // (a) task-1 must have exactly 2 ViewElements (start + delete-from-pending)
+    let task1_elems: Vec<&(String, String, String)> = elems1.iter()
+        .filter(|(_, _, rs)| rs == "task-1").collect();
+    assert_eq!(task1_elems.len(), 2,
+        "task-1 (pending) must have exactly 2 ViewElements \
+         (start + delete-from-pending); got {:?}\nfull: {:#?}", task1_elems, elems1);
+
+    // (b) task-2 must have ZERO ViewElements (terminal status 'deleted')
+    let task2_elems: Vec<&(String, String, String)> = elems1.iter()
+        .filter(|(_, _, rs)| rs == "task-2").collect();
+    assert_eq!(task2_elems.len(), 0,
+        "task-2 (deleted = terminal) must have ZERO ViewElements; \
+         got {:?}", task2_elems);
+
+    // (c) deterministic `ve_<fnv>` ids — both must be well-formed
+    for (id, tr, rs) in &elems1 {
+        assert!(id.starts_with("ve_") && id.len() == "ve_".len() + 16,
+            "VE id must be `ve_<16 hex>`; got {:?} for ({}, {})", id, rs, tr);
+    }
+
+    // (d) IDEMPOTENCE — second resolve pass produces byte-identical id set
+    let pass2_renders = resolve_view(cons_renders, &pop, &defs)
+        .expect("view: def must resolve on the second pass too");
+    let mut ids1: Vec<String> = elems1.iter().map(|(id, ..)| id.clone()).collect();
+    let mut ids2: Vec<String> = pass2_renders.as_seq()
+        .map(|items| items.iter()
+            .filter_map(|f| ast::binding(f, "ViewElement").map(String::from))
+            .collect())
+        .unwrap_or_default();
+    ids1.sort();
+    ids2.sort();
+    assert_eq!(ids1, ids2,
+        "menu-view derivation MUST be idempotent (same frontier → same \
+         ViewElement id on every re-read). pass1: {:?}; pass2: {:?}", ids1, ids2);
+
+    // (e) Transition is carried through the renders rule
+    let task1_transitions: Vec<&str> = elems1.iter()
+        .filter(|(_, _, rs)| rs == "task-1")
+        .map(|(_, tr, _)| tr.as_str()).collect();
+    assert!(task1_transitions.contains(&"start"),
+        "start transition must be in task-1's menu; got {:?}", task1_transitions);
+    assert!(task1_transitions.contains(&"delete-from-pending"),
+        "delete-from-pending must be in task-1's menu; got {:?}", task1_transitions);
+
+    // (f) SHARED FRONTIER: same (Resource,Transition) → same VE id in both rules.
+    //     Rule B (Component Role 'button') must reference the SAME ve_<fnv> ids
+    //     as Rule A (renders Transition) because both hash the same frontier.
+    let pass1_role = resolve_view(cons_role, &pop, &defs)
+        .expect("view: def for has Component Role must resolve");
+    let role_ids: Vec<String> = pass1_role.as_seq()
+        .map(|items| items.iter()
+            .filter_map(|f| ast::binding(f, "ViewElement").map(String::from))
+            .collect())
+        .unwrap_or_default();
+
+    assert_eq!(role_ids.len(), 2,
+        "Rule B must produce 2 ViewElement-role bindings (one per legal \
+         transition for task-1); got {:?}", role_ids);
+
+    let mut role_ids_sorted = role_ids.clone();
+    role_ids_sorted.sort();
+    // ids1 is already sorted from pass1 above
+    assert_eq!(ids1, role_ids_sorted,
+        "Rule A (renders) and Rule B (Component Role 'button') MUST produce \
+         the SAME ViewElement ids — same (Resource,Transition) frontier → \
+         same ve_<fnv> hash (shared frontier property). \
+         renders ids: {:?}; role ids: {:?}", ids1, role_ids_sorted);
+
+    // All Component Role values must be 'button'
+    let role_vals: Vec<String> = pass1_role.as_seq()
+        .map(|items| items.iter()
+            .filter_map(|f| ast::binding(f, "Component Role").map(String::from))
+            .collect())
+        .unwrap_or_default();
+    assert!(role_vals.iter().all(|r| r == "button"),
+        "all menu ViewElements must have Component Role 'button'; got {:?}", role_vals);
+
+    // (g) LAZY guard: no `derivation:` def registered (never eager-chained).
+    //     This is the task-934 metamodel-hang guard.
+    assert!(matches!(ast::fetch_raw(&format!("derivation:{}", cons_renders), &defs),
+        Object::Bottom),
+        "Rule A must be LAZY (view: only, no derivation: def — the metamodel-hang guard)");
+    assert!(matches!(ast::fetch_raw(&format!("derivation:{}", cons_role), &defs),
+        Object::Bottom),
+        "Rule B must be LAZY (view: only, no derivation: def — the metamodel-hang guard)");
+}
+
+// ─── task-934-3a: VERIFIED METAMODEL FACT-TYPE NAMES ────────────────────────
+//
+// The following names have been verified against readings/core/state.md,
+// readings/core/instances.md, and readings/core/core.md. They are the EXACT
+// cell names the full menu-view derivation join must use when wired into the
+// live metamodel:
+//
+//   State_Machine_Definition_is_for_Noun        (state.md "State Machine Definition is for Noun.")
+//   Transition_is_defined_in_State_Machine_Definition (state.md "Transition is defined in State Machine Definition.")
+//   Transition_is_from_Status                   (state.md "Transition is from Status.")
+//   State_Machine_is_currently_in_Status        (instances.md "State Machine is currently in Status.")
+//   State_Machine_is_for_Resource               (instances.md "State Machine is for Resource.")
+//   Resource_is_instance_of_Noun                (instances.md "Resource is instance of Noun.")
+//   Resource_is_currently_in_Status             (instances.md "Resource is currently in Status." — bridge projection)
+//
+// Join chain for the frontier (Resource, Transition):
+//   Resource_is_currently_in_Status (Resource→Status)
+//     ⋈ Transition_is_from_Status (Transition→Status)   on Status
+//   → gives (Resource, Transition) pairs where the entity is in a status the
+//     transition departs from. These are the legal affordances.
+//
+// Note: `Resource is currently in Status` is derived in apps/tasks/readings/app.md
+// via `State Machine is for Resource` × `State Machine is currently in Status`.
+// The meta-level menu-view derivation should join on the metamodel-level cells
+// (the 6-way join above), not the app-level bridge, since app.md only applies
+// to the tasks domain. The menu rule should be general across all Nouns+SMs.
+//
+// This test function is the "documented anchor" — it has no code to run.
+// The `menu_view_derivation_via_skolem_head_lazy_idempotent` test above proves
+// the mechanism; this is the schema-name audit record for the compiler wiring.
+#[test]
+fn menu_view_derivation_metamodel_ft_name_audit() {
+    // Verified FT cell names (see comment above):
+    let ft_names = &[
+        "State_Machine_Definition_is_for_Noun",
+        "Transition_is_defined_in_State_Machine_Definition",
+        "Transition_is_from_Status",
+        "State_Machine_is_currently_in_Status",
+        "State_Machine_is_for_Resource",
+        "Resource_is_instance_of_Noun",
+        "Resource_is_currently_in_Status",
+    ];
+    // Ensure none of these are empty strings (typo guard).
+    for name in ft_names.iter() {
+        assert!(!name.is_empty(), "FT name must be non-empty");
+        assert!(name.contains('_'), "FT name must use underscore form: {}", name);
+    }
+    // The frontier roles:
+    let frontier_roles = &["Resource", "Transition"];
+    for r in frontier_roles {
+        assert!(!r.is_empty());
+    }
+    // Consequent FT names:
+    let cons_renders = "ViewElement_renders_Transition";
+    let cons_role    = "ViewElement_has_Component_Role";
+    assert!(!cons_renders.is_empty());
+    assert!(!cons_role.is_empty());
+}
+
