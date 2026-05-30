@@ -5233,6 +5233,68 @@ ViewElement renders Operation. *
         "task-detail: create is permitted but WRONG context (collection) -> excluded; got {:?}", detail_ops);
 }
 
+// crudl-menu-projection: the gated menu composed with the REAL iFactr-grounded
+// catalog (readings/ui/crudl.md, commit 8f70be88) rather than inline stand-in
+// operations. Proves the catalog<->menu seam end-to-end: the operations' View
+// Contexts come straight from crudl.md's iFactr ActionType import, and they
+// correctly gate the menu. (Concatenates crudl.md + the View/User/Role FTs +
+// the menu rule -- the readings compose.)
+#[test]
+fn crudl_gated_menu_over_real_ifactr_catalog() {
+    let additions = r#"
+View(.ViewName) is an entity type.
+ViewName is a value type.
+User(.Username) is an entity type.
+Username is a value type.
+Role(.RoleName) is an entity type.
+RoleName is a value type.
+ViewElement(.veid) is an entity type.
+veid is a value type.
+Noun(.NounName) is an entity type.
+NounName is a value type.
+
+## Fact Types
+View is for Noun.
+View has View Context.
+User has Role.
+Role permits Operation on Noun.
+ViewElement renders Operation. *
+
+## Derivation Rules
+* ViewElement (E) renders Operation iff View is for Noun and View has View Context and Operation applies in View Context and User has Role and Role permits Operation on Noun.
+"#;
+    let src = format!("{}\n{}", include_str!("../../../readings/ui/crudl.md"), additions);
+    let state = parse_to_state(&src).expect("crudl.md + menu rule must parse together");
+    let defs = compile::compile_to_defs_state(&state);
+    let d0 = ast::defs_to_state(&defs, &state);
+    let push = |s, cell: &str, pairs: &[(&str, &str)]|
+        ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+    let d = {
+        let s = d0.clone();
+        let s = push(s, "View_is_for_Noun", &[("View", "task-list"), ("Noun", "Task")]);
+        let s = push(s, "View_has_View_Context", &[("View", "task-list"), ("View Context", "collection")]);
+        // alice (editor) permitted create + edit on Task.
+        let s = push(s, "User_has_Role", &[("User", "alice"), ("Role", "editor")]);
+        let s = push(s, "Role_permits_Operation_on_Noun", &[("Role", "editor"), ("Operation", "create"), ("Noun", "Task")]);
+        let s = push(s, "Role_permits_Operation_on_Noun", &[("Role", "editor"), ("Operation", "edit"), ("Noun", "Task")]);
+        s
+    };
+    let renders = ast::resolve_view("ViewElement_renders_Operation", &d, &d)
+        .expect("menu resolves over the real crudl.md catalog");
+    let ops: Vec<String> = renders.as_seq()
+        .map(|items| items.iter().filter_map(|f| {
+            (ast::binding(f, "View") == Some("task-list"))
+                .then(|| ast::binding(f, "Operation").map(String::from)).flatten()
+        }).collect())
+        .unwrap_or_default();
+    // 'create' is collection-context (crudl.md) AND permitted -> in the list menu.
+    assert!(ops.contains(&"create".to_string()),
+        "task-list menu (real crudl.md catalog) must include create; got {:?}", ops);
+    // 'edit' is permitted but instance-context (crudl.md) -> excluded from a collection view.
+    assert!(!ops.contains(&"edit".to_string()),
+        "edit is permitted but instance-context per crudl.md -> excluded from the collection menu; got {:?}", ops);
+}
+
 // ─── task-934-3a: VERIFIED METAMODEL FACT-TYPE NAMES ────────────────────────
 //
 // The following names have been verified against readings/core/state.md,
