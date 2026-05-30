@@ -840,6 +840,59 @@ fn auto_generate_entity_id(noun: &str, state: &ast::Object) -> String {
 /// by exactly one User") will fire if identity is missing. No procedural
 /// middleware. Per AREST §8.
 
+/// Declarative instantiability constraint (task-961 Phase B). Reads ONLY the
+/// `Noun_is_instantiable` cell — the consequent materialized by the metamodel
+/// derivation
+///   * Noun is instantiable iff Noun has Object Type 'entity'
+///     and Noun has some Reference Scheme.
+/// (declared in readings/core/core.md with the `**` marker). This is the
+/// declarative form of the alethic constraint "It is impossible that a
+/// Resource is an instance of a Noun that is not instantiable" — a one-step
+/// set-membership test whose predicate logic lives in the readings, not here.
+///
+/// Returns:
+///   * `Some(true)`  — the cell is populated AND `noun` is a member: the
+///     constraint is SATISFIED, the create/update is admitted declaratively.
+///   * `Some(false)` — the cell is populated AND `noun` is ABSENT: the
+///     constraint is VIOLATED (a structural impossibility — the noun is not
+///     instantiable per the materialized cell).
+///   * `None`        — the cell is EMPTY in every source: the constraint
+///     cannot answer (a metamodel compiled before Phase A materialized the
+///     cell, e.g. the minimal test metamodel or a live DB not yet recompiled
+///     past Phase A). The constraint NEVER fires on an empty cell — SAFETY:
+///     it must not reject every create.
+fn noun_instantiable_per_cell(noun: &str, state: &ast::Object, d: &ast::Object) -> Option<bool> {
+    let mut any_populated = false;
+    for src in [state, d] {
+        if let Some(fs) = ast::fetch_cell_seq("Noun_is_instantiable", src).as_seq() {
+            if !fs.is_empty() {
+                any_populated = true;
+                if fs.iter().any(|f| ast::binding(f, "Noun") == Some(noun)) {
+                    return Some(true);
+                }
+            }
+        }
+    }
+    // Cell populated somewhere but `noun` not found anywhere → constraint
+    // violated. Cell empty everywhere → constraint cannot answer.
+    if any_populated { Some(false) } else { None }
+}
+
+/// Procedural run-time definedness scan (task-961 Phase A and earlier). The
+/// belt-and-suspenders fallback for states whose `Noun_is_instantiable` cell
+/// has not yet materialized (the minimal test metamodel, or a live DB not yet
+/// recompiled past Phase A). Same predicate as the derivation, evaluated
+/// inline against the Noun registry cell: objectType="entity" WITH a
+/// non-empty reference scheme.
+fn noun_runtime_defined_procedural(noun: &str, state: &ast::Object, d: &ast::Object) -> bool {
+    [state, d].iter().any(|src|
+        ast::fetch_cell_seq("Noun", src).as_seq().map_or(false, |fs|
+            fs.iter().any(|f|
+                ast::binding(f, "name") == Some(noun)
+                    && ast::binding(f, "objectType") == Some("entity")
+                    && ast::binding(f, "referenceScheme").map_or(false, |rs| !rs.is_empty()))))
+}
+
 /// Run-time definedness predicate. A noun may be instantiated or mutated at
 /// run-time only if it is a fully-defined entity type — declared
 /// objectType="entity" WITH a reference scheme (its identity). A value type,
@@ -847,30 +900,27 @@ fn auto_generate_entity_id(noun: &str, state: &ast::Object) -> String {
 /// valid *design-time* shapes but NOT run-time ones: a derivation
 /// forward-chain over them has no identity to ground and can diverge. Gates
 /// createEntity and updateEntity; `compile` stays permissive at design-time.
+///
+/// task-961 Phase B — belt-and-suspenders. The declarative alethic
+/// instantiability constraint (`noun_instantiable_per_cell`, derived from the
+/// Phase-A `Noun_is_instantiable` cell) is the PRIMARY check; the procedural
+/// scan is the fallback. A create is admitted iff EITHER source admits it,
+/// so the constraint can only CONFIRM the procedural gate — it adds no new
+/// rejection a recompiled cell wouldn't already encode, and never rejects on
+/// an empty cell. Full removal of the procedural fallback (making this a pure
+/// cell query) is gated on a live-DB recompile pass that guarantees a
+/// populated cell in every reachable state.
 fn noun_runtime_defined(noun: &str, state: &ast::Object, d: &ast::Object) -> bool {
-    // task-961 lift: prefer the metamodel reading
-    //   * Noun is instantiable iff Noun has Object Type 'entity'
-    //     and Noun has some Reference Scheme Noun.
-    // (declared in readings/core/core.md with the `**` marker so the
-    // consequent is stored as the Noun_is_instantiable cell). When the
-    // cell is populated, this is a one-step set-membership check; the
-    // predicate logic lives in the readings, not here.
-    let lifted = [state, d].iter().any(|src|
-        ast::fetch_cell_seq("Noun_is_instantiable", src).as_seq().map_or(false, |fs|
-            fs.iter().any(|f| ast::binding(f, "Noun") == Some(noun))));
-    if lifted { return true; }
-    // Procedural fallback for states where the derivation hasn't yet
-    // materialized into a stored cell (task-961's earlier attempt hit
-    // the RMAP absorbed-FT reconstitution gap that task-962 is closing).
-    // Same predicate, evaluated inline against the Noun cell -- safe
-    // because the gate only ever needs to admit fewer creates than the
-    // reading would; never more.
-    [state, d].iter().any(|src|
-        ast::fetch_cell_seq("Noun", src).as_seq().map_or(false, |fs|
-            fs.iter().any(|f|
-                ast::binding(f, "name") == Some(noun)
-                    && ast::binding(f, "objectType") == Some("entity")
-                    && ast::binding(f, "referenceScheme").map_or(false, |rs| !rs.is_empty()))))
+    // Declarative constraint first: when the cell is populated AND admits
+    // the noun, that is sufficient (it is the readings-driven source of
+    // truth). When the cell is populated but does NOT admit the noun
+    // (Some(false)), or cannot answer (None), defer to the procedural
+    // scan so a not-yet-recompiled metamodel still gates correctly and no
+    // currently-passing create regresses.
+    if noun_instantiable_per_cell(noun, state, d) == Some(true) {
+        return true;
+    }
+    noun_runtime_defined_procedural(noun, state, d)
 }
 
 fn create_via_defs(
@@ -4650,6 +4700,87 @@ Resource is mirroring Status.
             "updateEntity for a value type must reject; got {:?}", result.violations);
         assert!(result.violations.iter().any(|v| v.constraint_id.contains("not_runtime_defined")),
             "rejection must carry the not_runtime_defined violation; got {:?}", result.violations);
+    }
+
+    /// task-961 Phase B — the DECLARATIVE instantiability constraint predicate.
+    /// `noun_instantiable_per_cell` reads ONLY the `Noun_is_instantiable` cell
+    /// (Phase A's materialized consequent) and answers the alethic constraint
+    /// "It is impossible that a Resource is an instance of a Noun that is not
+    /// instantiable" as pure set-membership. Pins the three-way contract that
+    /// makes the constraint safe to run alongside the procedural gate:
+    ///   * populated cell + member        → Some(true)  (admitted declaratively)
+    ///   * populated cell + non-member     → Some(false) (constraint violated)
+    ///   * empty cell everywhere           → None        (defer; never reject)
+    #[test]
+    fn instantiability_constraint_predicate_reads_the_cell() {
+        let inst_cell = |names: &[&str]| {
+            names.iter().fold(ast::Object::phi(), |acc, n| {
+                ast::cell_push("Noun_is_instantiable",
+                    ast::fact_from_pairs(&[("Noun", n)]), &acc)
+            })
+        };
+        let phi = ast::Object::phi();
+
+        // Populated cell: member is instantiable, non-member is NOT.
+        let state = inst_cell(&["Task", "Source File"]);
+        assert_eq!(super::noun_instantiable_per_cell("Task", &state, &phi), Some(true),
+            "a noun present in a populated Noun_is_instantiable cell must be admitted");
+        assert_eq!(super::noun_instantiable_per_cell("Gadget", &state, &phi), Some(false),
+            "a noun absent from a populated Noun_is_instantiable cell must be a violation");
+
+        // Empty cell everywhere → the constraint must DEFER (None), never
+        // reject — the SAFETY invariant (an empty cell must not reject every
+        // create on a not-yet-recompiled metamodel).
+        assert_eq!(super::noun_instantiable_per_cell("Task", &phi, &phi), None,
+            "an empty Noun_is_instantiable cell must defer (None), never reject");
+
+        // The cell may live in either source (population `state` or defs `d`).
+        assert_eq!(super::noun_instantiable_per_cell("Task", &phi, &state), Some(true),
+            "the constraint must read the cell from the defs source too");
+    }
+
+    /// task-961 Phase B — the constraint, driven end-to-end through
+    /// `createEntity`, REJECTS a non-instantiable-noun create and ACCEPTS an
+    /// instantiable one, decided PURELY by the `Noun_is_instantiable` cell.
+    /// This is the readings/constraint replacement for the procedural gate:
+    /// with the cell populated, the declarative set-membership alone drives
+    /// the run-time-definedness verdict (the procedural Noun-registry scan is
+    /// deliberately NOT satisfiable here — no objectType/referenceScheme facts
+    /// are pushed for either noun — so the cell is the sole discriminator).
+    #[test]
+    fn instantiability_constraint_gates_create_via_cell() {
+        let (def_map, _state) = setup_order_defs();
+        // A populated cell naming exactly one instantiable entity type.
+        // No Noun-registry (objectType/referenceScheme) facts are pushed, so
+        // the procedural fallback would reject BOTH nouns — proving the
+        // ACCEPT verdict for `Widget` comes from the declarative cell alone.
+        let state = ast::cell_push("Noun_is_instantiable",
+            ast::fact_from_pairs(&[("Noun", "Widget")]), &ast::Object::phi());
+        let try_create = |noun: &str, state: &ast::Object| {
+            apply_command_defs(&def_map, &Command::CreateEntity {
+                noun: noun.to_string(), domain: "d".to_string(),
+                id: Some("x".to_string()), fields: HashMap::new(),
+                sender: None, signature: None,
+            }, state)
+        };
+        let rejected_not_runtime_defined = |r: &CommandResult| {
+            r.rejected && r.entities.is_empty()
+                && r.violations.iter().any(|v| v.constraint_id.contains("not_runtime_defined"))
+        };
+
+        // ACCEPT: `Widget` is a member of the populated cell → the constraint
+        // admits the create; no not_runtime_defined violation surfaces.
+        let r = try_create("Widget", &state);
+        assert!(!rejected_not_runtime_defined(&r),
+            "a create of a noun in Noun_is_instantiable must NOT be rejected as \
+             not-runtime-defined; got {:?}", r.violations);
+
+        // REJECT: `Gizmo` is ABSENT from the populated cell → the alethic
+        // instantiability constraint rejects (D' = D).
+        let r = try_create("Gizmo", &state);
+        assert!(rejected_not_runtime_defined(&r),
+            "a create of a noun ABSENT from a populated Noun_is_instantiable cell \
+             must be rejected by the declarative constraint; got {:?}", r.violations);
     }
 
     // ── task-735 — auto-increment id reconciles both schemes ──────────

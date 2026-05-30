@@ -169,10 +169,30 @@ Noun is instantiable. **
        entities, so this cell stayed empty for them and the procedural
        fallback alone carried the gate. The `**` marker stores the consequent.
 
-       Phase B (follow-up, gated on Phase A verified materializing real
-       entities): add the alethic instantiability constraint over this cell
-       and delete the procedural fallback + Rust gate, making it a pure cell
-       query. DO NOT add a constraint over this cell while it could be empty. -->
+       task-961 Phase B (this change): the alethic instantiability constraint
+       below makes the rejection of a non-instantiable-noun create/update
+       DECLARATIVE. `command.rs::noun_runtime_defined` now treats this stored
+       cell as the AUTHORITATIVE source whenever it is NON-EMPTY: a create of
+       a noun absent from a populated `Noun_is_instantiable` is rejected
+       (D' = D, per AREST.tex eq:create §157). The procedural Noun-cell scan
+       is RETAINED as a fallback ONLY for states where the cell is still
+       empty (a metamodel compiled before Phase A materialized it — e.g. the
+       minimal test metamodel, or a live DB not yet recompiled past Phase A).
+       The constraint never fires on an empty cell, so it can only ever
+       tighten — never reject a create the procedural gate would have allowed.
+       Full removal of the procedural fallback is gated on a live-DB
+       recompile pass that guarantees every reachable state carries a
+       populated cell. -->
+
+It is impossible that a Resource is an instance of a Noun that is not instantiable.
+  <!-- task-961 Phase B — the declarative instantiability constraint. ALETHIC
+       (AREST.tex §328 "It is impossible that …"): instantiating an entity of
+       a noun that is not in the derived `Noun_is_instantiable` cell is a
+       structural impossibility and rejects (D' = D). The check is a one-step
+       set-membership test against the Phase-A-materialized cell — the
+       predicate logic lives in the `Noun is instantiable` derivation, not in
+       procedural Rust. Evaluated by `command.rs::noun_runtime_defined` (cell-
+       authoritative when populated) as the create/update run-time gate. -->
 
 ### Reading
 Reading has Text.
