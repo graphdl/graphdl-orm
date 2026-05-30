@@ -1,0 +1,132 @@
+# crates/arest-kernel/Dockerfile.uefi-graphical
+#
+# Sibling of Dockerfile.uefi — same builder + runtime stages, same
+# uefi-disk.img + disk.img + OVMF staging — but built with
+# `--features doom,linuxkpi` so the Doom launcher app is registered
+# alongside REPL + keyboard + HATEOAS browser. Used by the
+# native-QEMU play path documented in the kernel README:
+#
+#   docker build -t arest-kernel-uefi-graphical \
+#       -f crates/arest-kernel/Dockerfile.uefi-graphical .
+#   docker create --name tmp arest-kernel-uefi-graphical
+#   docker cp tmp:/uefi-disk.img .
+#   docker cp tmp:/disk.img ./arest-disk.img
+#   docker cp tmp:/usr/share/ovmf/OVMF.fd ./OVMF.fd
+#   docker rm tmp
+#   qemu-system-x86_64 -bios .\OVMF.fd -display sdl ... (see README)
+#
+# Why a sibling rather than editing Dockerfile.uefi:
+#   * Dockerfile.uefi is the smoke-test pipeline (boot-kernel-uefi.ps1
+#     -Smoke). Its `--features linuxkpi` build + `-display none` CMD
+#     are tuned for the headless banner-assertion harness; flipping
+#     features or the display would break the smoke.
+#   * `docker build --build-arg` would let one Dockerfile carry both,
+#     but the original was checked in without ARG support. Cleaner to
+#     keep the smoke Dockerfile stable and ship the play variant
+#     beside it.
+#
+# Skipped opt-ins (and why):
+#   musl-libc / busybox — runtime container has no clang; the build-
+#                         script's cc::Build pass would degrade to
+#                         `cargo:warning=ToolNotFound` and produce no
+#                         artifacts. Add via a separate Dockerfile
+#                         that apt-installs clang if you want them.
+#   qt-adapter / gtk-adapter — would dlopen libqt6widgets / libgtk-4
+#                              which are not in the container; falls
+#                              back to LibraryNotFound stubs. No
+#                              user-visible effect today.
+#   compositor-test — pure dev affordance (#489 LLLL checkerboard
+#                     renderer). Not gameplay-relevant.
+
+FROM rust:latest AS builder
+
+# Pin to nightly-2026-04-21 (rust-toolchain.toml); plain `nightly` drifts.
+RUN rustup toolchain install nightly-2026-04-21 --profile minimal \
+    && rustup component add rust-src --toolchain nightly-2026-04-21 \
+    && rustup target add x86_64-unknown-uefi --toolchain nightly-2026-04-21 \
+    && rustup target add aarch64-unknown-uefi --toolchain nightly-2026-04-21
+
+WORKDIR /build
+
+# Source-copy layout shared with Dockerfile.uefi so layer caching
+# kicks in when both Dockerfiles build on the same host.
+COPY crates/arest-kernel/Cargo.toml crates/arest-kernel/Cargo.toml
+COPY crates/arest-kernel/build.rs crates/arest-kernel/build.rs
+COPY crates/arest-kernel/src/ crates/arest-kernel/src/
+COPY crates/arest-kernel/rust-toolchain.toml crates/arest-kernel/rust-toolchain.toml
+COPY crates/arest-kernel/ui/ crates/arest-kernel/ui/
+COPY crates/arest-kernel/assets/ crates/arest-kernel/assets/
+COPY apps/ui.do/dist/ apps/ui.do/dist/
+COPY crates/arest-kernel/doom_assets/ crates/arest-kernel/doom_assets/
+COPY crates/arest/Cargo.toml crates/arest/Cargo.toml
+COPY crates/arest/src/ crates/arest/src/
+# arest-foundation: path-dep extracted from crates/arest; stage it.
+COPY crates/arest-foundation/Cargo.toml crates/arest-foundation/Cargo.toml
+COPY crates/arest-foundation/src/ crates/arest-foundation/src/
+COPY readings/ readings/
+COPY crates/arest-kernel/vendor/ crates/arest-kernel/vendor/
+
+# The only meaningful diff vs Dockerfile.uefi: add `doom` to the
+# feature list so jacobenget/doom.wasm v0.1.0 gets baked in and the
+# launcher's fourth app icon (#455 / #456 Track VVV) is wired up.
+# Inherits the AGPL-3.0-or-later + GPL-2.0 license combination per
+# #396; users opt in by building this Dockerfile rather than
+# Dockerfile.uefi.
+# #595 follow-up: dropped `doom` from the feature list. The Doom WASM
+# binary OOB-traps deterministically at fuel=2759 inside `tickGame`,
+# and every attempt to drain the trap (drop the guest, set a dead
+# flag, even just printing the trap) reliably triggers a kernel #DF
+# downstream of the wasmi destructor cascade or an interaction with
+# the launcher`s super-loop. Building without `doom` ships a stable
+# launcher (REPL + virtio-input + Slint) without the per-frame Doom
+# timer; investigation of the underlying OOB stays open under #595.
+# #595 debug: doom RE-ENABLED to repro the WASM OOB (fuel=2759 in tickGame)
+# -> kernel #DF and fix it. poly1305_force_soft + pinned nightly per the
+# sibling Dockerfiles (libLLVM 22.1 -O SIGILLs on this Hyper-V/WSL2 vCPU).
+RUN cd crates/arest-kernel \
+    && RUSTFLAGS="--cfg poly1305_force_soft" cargo +nightly-2026-04-21 build --target x86_64-unknown-uefi --release --features doom,linuxkpi
+
+# ── Runtime stage: identical to Dockerfile.uefi ────────────────────
+#
+# Native-QEMU users won't actually `docker run` this image — they
+# extract /uefi-disk.img, /disk.img, /usr/share/ovmf/OVMF.fd and run
+# qemu-system-x86_64 directly on the host (see README). The runtime
+# stage is kept intact so the image is also bootable headlessly via
+# `docker run -p 8080:8080 arest-kernel-uefi-graphical` for users who
+# want the curl-only path.
+
+FROM debian:bookworm-slim AS runner
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    qemu-system-x86 \
+    ovmf \
+    dosfstools \
+    mtools \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/crates/arest-kernel/target/x86_64-unknown-uefi/release/arest-kernel.efi /arest-kernel.efi
+
+RUN dd if=/dev/zero of=/uefi-disk.img bs=1M count=64 status=none \
+    && mkfs.fat -F 32 /uefi-disk.img >/dev/null \
+    && mmd -i /uefi-disk.img ::/EFI \
+    && mmd -i /uefi-disk.img ::/EFI/BOOT \
+    && mcopy -i /uefi-disk.img /arest-kernel.efi ::/EFI/BOOT/BOOTX64.EFI
+
+RUN dd if=/dev/zero of=/disk.img bs=1M count=1 status=none
+
+EXPOSE 8080
+
+CMD ["qemu-system-x86_64", \
+     "-bios", "/usr/share/ovmf/OVMF.fd", \
+     "-m", "1024", \
+     "-drive", "format=raw,file=/uefi-disk.img,if=ide", \
+     "-netdev", "user,id=net0,hostfwd=tcp::8080-:80", \
+     "-device", "virtio-net-pci,netdev=net0,disable-legacy=on", \
+     "-drive", "file=/disk.img,format=raw,if=none,id=disk0", \
+     "-device", "virtio-blk-pci,drive=disk0,disable-legacy=on", \
+     "-device", "virtio-gpu-pci", \
+     "-device", "virtio-keyboard-pci", \
+     "-device", "virtio-tablet-pci", \
+     "-serial", "stdio", \
+     "-display", "none", \
+     "-no-reboot", "-no-shutdown"]
