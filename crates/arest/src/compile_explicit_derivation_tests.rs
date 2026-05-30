@@ -4899,6 +4899,38 @@ ViewElement has Component Role. *
         "a terminal entity has no menu element → None (no procedural fallback)");
 }
 
+// crudl-menu-projection: the CRUDL operation catalog (readings/ui/crudl.md) is
+// the iFactr ActionType vocabulary (Add/Edit/Delete/Submit/Cancel from
+// iFactr-Android/iFactr.UI Controls/ActionType.cs) imported DIRECTLY as
+// predicate facts — the data foundation for the permission-gated menu
+// derivation. Pins that the reading is valid FORML2 that compiles, with the
+// Operation entity type declared and the six operations present.
+#[test]
+fn crudl_operation_catalog_parses_and_compiles_grounded_in_ifactr() {
+    let src = include_str!("../../../readings/ui/crudl.md");
+    let state = parse_to_state(src).expect("crudl.md must parse as valid FORML2");
+    // Compiles without checker errors (structural validity of the catalog schema).
+    let _defs = compile::compile_to_defs_state(&state);
+    // The Operation entity type is declared (grounded in iFactr ActionType).
+    let nouns: Vec<String> = ast::fetch_cell_seq("Noun", &state).as_seq()
+        .map(|items| items.iter()
+            .filter_map(|f| ast::binding(f, "name").map(String::from)).collect())
+        .unwrap_or_default();
+    assert!(nouns.iter().any(|n| n == "Operation"),
+        "crudl.md must declare the Operation entity type; got {:?}", nouns);
+    // The six CRUDL operations are present as instance-fact subjects.
+    let inst = ast::fetch_cell_seq("InstanceFact", &state);
+    let subjects: Vec<String> = inst.as_seq()
+        .map(|items| items.iter()
+            .filter_map(|f| ast::binding(f, "subjectValue").map(String::from)).collect())
+        .unwrap_or_default();
+    for op in ["create", "edit", "delete", "multi-delete", "save", "cancel"] {
+        assert!(subjects.iter().any(|s| s == op),
+            "crudl.md must declare Operation '{op}' (grounded in iFactr ActionType); \
+             got subjects {:?}", subjects);
+    }
+}
+
 // ─── task-934-3a: VERIFIED METAMODEL FACT-TYPE NAMES ────────────────────────
 //
 // The following names have been verified against readings/core/state.md,
