@@ -846,11 +846,17 @@ pub fn synthesize_from_state(state: &ast::Object, noun_name: &str, depth: usize)
         let mut seen = HashSet::new();
         constraint_facts.iter()
             .filter(|c| {
-                (0..4).any(|i| {
+                // Scan spans contiguously (0,1,2,…) until the first gap so
+                // n-ary role-SEQUENCE subset constraints (>4 spans) are not
+                // truncated — the superset-side FT can sit past index 3.
+                let mut i = 0usize;
+                loop {
                     let ft_key = format!("span{}_factTypeId", i);
                     let ft_id = b(c, &ft_key);
-                    !ft_id.is_empty() && ft_ids.contains(ft_id.as_str())
-                })
+                    if ft_id.is_empty() { break false; }
+                    if ft_ids.contains(ft_id.as_str()) { break true; }
+                    i += 1;
+                }
             })
             .filter(|c| seen.insert(b(c, "id")))
             .map(|c| ConstraintSummary {

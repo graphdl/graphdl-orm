@@ -2615,7 +2615,16 @@ fn synthesize_ref_scheme_constraints(
 fn enrich_constraints_with_spans(
     constraints: &[Object],
     role_facts: &[Object],
+    ft_facts: &[Object],
 ) -> Vec<Object> {
+    // `id → reading` so the SS/EQ role-sequence resolver can
+    // disambiguate two fact types that share the SAME role-noun
+    // sequence (e.g. `User performs Operation on Noun` vs `User is
+    // authorized for Operation on Noun` — both `[User, Operation,
+    // Noun]`) by matching the verb phrase against the clause text.
+    let readings_by_ft: hashbrown::HashMap<String, String> = ft_facts.iter()
+        .filter_map(|f| Some((binding(f, "id")?.to_string(), binding(f, "reading")?.to_string())))
+        .collect();
     // Roles indexed two ways: by noun (first-match fallback) and by
     // fact type (full-sequence resolution).
     let mut roles_by_noun: hashbrown::HashMap<String, (String, String)> =
@@ -2654,33 +2663,84 @@ fn enrich_constraints_with_spans(
         // Preference 1: resolve by full noun-sequence match.
         let text = binding(c, "text").unwrap_or("");
 
-        // G0 (#932): SS / EQ set constraints compare TWO distinct fact types
-        // (antecedent FT subset_of / = consequent FT). The single-FT
-        // resolution below sets span0 == span1, degenerating
-        // `compile_subset_ast` to `A subset_of A` (trivially true → never a
-        // violation → no enforcement). Resolve each clause-half separately so
-        // the two spans are distinct. Falls through to the single-FT path when
-        // a half does not resolve to an exact role-sequence match (e.g.
-        // join-path subsets, whose subsumed side is a join — handled
-        // separately). The single-FT path (UC/MC/ring/value) is unaffected.
+        // G0 (#932) + ORM2 role-SEQUENCE (tuple) subset: SS / EQ set
+        // constraints compare TWO RoleSequences (antecedent subset_of /
+        // = consequent), per ORM2Core.xsd `ConstraintRoleSequencesType`
+        // (a container of `RoleSequence`s, each an ordered Role list).
+        // Resolve each clause-half to the FT *and its full shared-role
+        // tuple* so an n-ary subset (`performs(U,O,N) ⊆ authorized(U,O,N)`)
+        // constrains over ALL shared variables, not one role. The
+        // binary single-role-per-side case (`Task has Note ⊆ Task has
+        // Mark`, shared role = Task) degenerates to one span per side —
+        // byte-identical to the pre-existing 2-span output.
+        //
+        // Encoding (matches the NORMA exporter at compile.rs ~2658 and
+        // compile_subset_ast): emit the SUBSET side's shared-role spans
+        // first, then the SUPERSET side's, with
+        // `setComparisonArgumentLength` = the subset-side span count
+        // (the partition). The shared roles are the nouns common to both
+        // fact types — exactly the join columns `compile_subset_ast`
+        // matches the A\B witness tuple on.
+        //
+        // Falls through to the single-FT path when a half does not
+        // resolve to an exact role-sequence match (e.g. join-path
+        // subsets, whose subsumed side is a join — handled separately).
+        // The single-FT path (UC/MC/ring/value) is unaffected.
+        //
+        // TODO(JoinRule): ORM2 RoleSequences may carry an optional
+        // `JoinRule` (ConstraintRoleSequenceWithJoinType in ORM2Core.xsd)
+        // for join-path subsets. That case is out of scope here — when
+        // either half is a join we fall through to the single-FT path.
         let kind = binding(c, "kind").unwrap_or("");
         if kind == "SS" || kind == "EQ" {
             let split = text.split_once(" then ")
                 .or_else(|| text.split_once(" if and only if "));
             if let Some((ante, cons)) = split {
-                if let (Some((a_ft, a_pos)), Some((b_ft, b_pos))) = (
-                    resolve_constraint_span_ft(ante, &roles_by_ft, &declared_nouns),
-                    resolve_constraint_span_ft(cons, &roles_by_ft, &declared_nouns),
+                if let (Some((a_ft, a_roles)), Some((b_ft, b_roles))) = (
+                    resolve_constraint_span_seq(ante, &roles_by_ft, &readings_by_ft, &declared_nouns),
+                    resolve_constraint_span_seq(cons, &roles_by_ft, &readings_by_ft, &declared_nouns),
                 ) {
-                    let mut new_pairs = pairs;
-                    let push = |np: &mut Vec<Object>, k: &str, v: &str| {
-                        np.push(Object::seq(vec![Object::atom(k), Object::atom(v)]));
-                    };
-                    push(&mut new_pairs, "span0_factTypeId", &a_ft);
-                    push(&mut new_pairs, "span0_roleIndex", &a_pos);
-                    push(&mut new_pairs, "span1_factTypeId", &b_ft);
-                    push(&mut new_pairs, "span1_roleIndex", &b_pos);
-                    return Object::Seq(new_pairs.into());
+                    // Shared nouns = the tuple the subset is enforced
+                    // over. Map each shared noun to its role index in A
+                    // and in B (positional, repetition-preserving).
+                    let mut a_avail: Vec<bool> = alloc::vec![true; a_roles.len()];
+                    let mut b_avail: Vec<bool> = alloc::vec![true; b_roles.len()];
+                    let mut shared: Vec<(usize, usize)> = Vec::new();
+                    for (ai, (_, a_noun)) in a_roles.iter().enumerate() {
+                        if !a_avail[ai] { continue; }
+                        if let Some(bi) = b_roles.iter().enumerate().position(|(bi, (_, bn))| {
+                            b_avail[bi] && bn == a_noun
+                        }) {
+                            a_avail[ai] = false;
+                            b_avail[bi] = false;
+                            shared.push((ai, bi));
+                        }
+                    }
+                    if !shared.is_empty() {
+                        let mut new_pairs = pairs;
+                        let push = |np: &mut Vec<Object>, k: &str, v: &str| {
+                            np.push(Object::seq(vec![Object::atom(k), Object::atom(v)]));
+                        };
+                        let mut span_i = 0usize;
+                        // Subset side (A) shared-role spans.
+                        for &(ai, _) in &shared {
+                            push(&mut new_pairs, &alloc::format!("span{}_factTypeId", span_i), &a_ft);
+                            push(&mut new_pairs, &alloc::format!("span{}_roleIndex", span_i),
+                                 &alloc::format!("{}", a_roles[ai].0));
+                            span_i += 1;
+                        }
+                        let partition = span_i;
+                        // Superset side (B) shared-role spans.
+                        for &(_, bi) in &shared {
+                            push(&mut new_pairs, &alloc::format!("span{}_factTypeId", span_i), &b_ft);
+                            push(&mut new_pairs, &alloc::format!("span{}_roleIndex", span_i),
+                                 &alloc::format!("{}", b_roles[bi].0));
+                            span_i += 1;
+                        }
+                        push(&mut new_pairs, "setComparisonArgumentLength",
+                             &alloc::format!("{}", partition));
+                        return Object::Seq(new_pairs.into());
+                    }
                 }
             }
         }
@@ -2806,6 +2866,37 @@ fn resolve_constraint_span_ft(
     roles_by_ft: &hashbrown::HashMap<String, Vec<(usize, String)>>,
     sorted_nouns_longest_first: &[String],
 ) -> Option<(String, String)> {
+    let found_nouns = constraint_clause_nouns(text, sorted_nouns_longest_first);
+    if found_nouns.len() < 2 { return None; }
+
+    // Find an FT whose role noun sequence matches the found noun sequence.
+    for (ft_id, roles) in roles_by_ft {
+        if roles.len() != found_nouns.len() { continue; }
+        let role_nouns: Vec<&str> = roles.iter().map(|(_, n)| n.as_str()).collect();
+        if role_nouns.iter().zip(found_nouns.iter())
+            .all(|(a, b)| a == &b.as_str())
+        {
+            let first = found_nouns[0].as_str();
+            let role_index = roles.iter()
+                .find(|(_, n)| n == first)
+                .map(|(p, _)| *p)
+                .unwrap_or(0);
+            return Some((ft_id.clone(), alloc::format!("{}", role_index)));
+        }
+    }
+    None
+}
+
+/// Shared text-normalisation for constraint-clause resolution: strip
+/// quoted literals + deontic/quantifier prefixes + digit subscripts,
+/// then tokenise the declared-noun sequence (with the ring-constraint
+/// `itself`-expansion and same-noun truncation). Factored out of
+/// `resolve_constraint_span_ft` so the SS/EQ role-SEQUENCE resolver
+/// (`resolve_constraint_span_seq`) shares identical tokenisation.
+fn constraint_clause_nouns(
+    text: &str,
+    sorted_nouns_longest_first: &[String],
+) -> Vec<String> {
     // Strip quoted literals (constraint body may carry `'Overnight'` etc.).
     let stripped = {
         let mut s = text.to_string();
@@ -2860,32 +2951,92 @@ fn resolve_constraint_span_ft(
     // ("Noun1 … Noun2 … Noun3"). The self-referential FT `X R X` has
     // two roles; truncate the found sequence to `[X, X]` so the
     // role-sequence match lands.
-    let found_nouns: Vec<String> = if found_nouns.len() > 2
+    if found_nouns.len() > 2
         && found_nouns.iter().all(|n| n == &found_nouns[0])
     {
         alloc::vec![found_nouns[0].clone(), found_nouns[0].clone()]
     } else {
         found_nouns
-    };
-
-    if found_nouns.len() < 2 { return None; }
-
-    // Find an FT whose role noun sequence matches the found noun sequence.
-    for (ft_id, roles) in roles_by_ft {
-        if roles.len() != found_nouns.len() { continue; }
-        let role_nouns: Vec<&str> = roles.iter().map(|(_, n)| n.as_str()).collect();
-        if role_nouns.iter().zip(found_nouns.iter())
-            .all(|(a, b)| a == &b.as_str())
-        {
-            let first = found_nouns[0].as_str();
-            let role_index = roles.iter()
-                .find(|(_, n)| n == first)
-                .map(|(p, _)| *p)
-                .unwrap_or(0);
-            return Some((ft_id.clone(), alloc::format!("{}", role_index)));
-        }
     }
-    None
+}
+
+/// SS/EQ role-SEQUENCE resolver: resolve one clause-half of an `If
+/// some … then that …` subset/equality reading to its fact type AND
+/// the fact type's ordered role list `[(role_index, noun), …]`. Unlike
+/// `resolve_constraint_span_ft` (which returns a single head role),
+/// this returns the whole role sequence so the caller can constrain
+/// over the full shared-variable tuple — the ORM2 `RoleSequence`
+/// semantics (ORM2Core.xsd `ConstraintRoleSequenceWithJoinType`).
+///
+/// Disambiguates fact types that share an identical role-noun sequence
+/// by verb: when several FTs match the clause's noun sequence, prefer
+/// the one whose reading's verb tokens (the reading with role nouns
+/// removed) all appear in the clause text. `User performs Operation on
+/// Noun` and `User is authorized for Operation on Noun` both have role
+/// nouns `[User, Operation, Noun]`; only the verb ("performs" vs
+/// "authorized") tells them apart. Falls back to the first noun-
+/// sequence match (legacy HashMap-iteration behaviour) when no verb
+/// uniquely matches, so single-FT readings are unaffected.
+fn resolve_constraint_span_seq(
+    text: &str,
+    roles_by_ft: &hashbrown::HashMap<String, Vec<(usize, String)>>,
+    readings_by_ft: &hashbrown::HashMap<String, String>,
+    sorted_nouns_longest_first: &[String],
+) -> Option<(String, Vec<(usize, String)>)> {
+    let found_nouns = constraint_clause_nouns(text, sorted_nouns_longest_first);
+    if found_nouns.len() < 2 { return None; }
+    let clause_lc = text.to_lowercase();
+
+    // All FTs whose role-noun sequence matches the clause's nouns.
+    let mut candidates: Vec<&String> = roles_by_ft.iter()
+        .filter(|(_, roles)| {
+            roles.len() == found_nouns.len()
+                && roles.iter().zip(found_nouns.iter()).all(|((_, n), f)| n == f)
+        })
+        .map(|(ft_id, _)| ft_id)
+        .collect();
+    // Deterministic order regardless of HashMap iteration so a tie
+    // resolves the same way every run.
+    candidates.sort();
+    let chosen = match candidates.len() {
+        0 => return None,
+        1 => candidates[0].clone(),
+        _ => {
+            // Disambiguate by verb: the FT whose reading's non-noun
+            // (verb) tokens all appear in the clause text wins.
+            let by_verb = candidates.iter().find(|ft_id| {
+                let Some(reading) = readings_by_ft.get(**ft_id) else { return false };
+                let verb = reading_verb_tokens(reading, sorted_nouns_longest_first);
+                !verb.is_empty() && verb.iter().all(|w| clause_lc.contains(w.as_str()))
+            });
+            match by_verb {
+                Some(ft_id) => (*ft_id).clone(),
+                None => candidates[0].clone(),
+            }
+        }
+    };
+    let roles = roles_by_ft.get(&chosen)?.clone();
+    Some((chosen, roles))
+}
+
+/// The verb (non-noun) word tokens of a reading: the reading with all
+/// declared-noun spans removed, lowercased, split on whitespace.
+/// `User is authorized for Operation on Noun` → `["is","authorized",
+/// "for","on"]`. Used to disambiguate same-noun-sequence fact types.
+fn reading_verb_tokens(
+    reading: &str,
+    sorted_nouns_longest_first: &[String],
+) -> Vec<String> {
+    // Blank out each declared-noun occurrence so only verb text remains.
+    let mut s = reading.to_string();
+    for n in sorted_nouns_longest_first {
+        if n.is_empty() { continue; }
+        s = s.replace(n.as_str(), " ");
+    }
+    s.split_whitespace()
+        .map(|w| w.to_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect()
 }
 
 /// Walk `text` left-to-right, matching declared nouns longest-first at
@@ -5596,7 +5747,7 @@ fn parse_to_state_via_stage12_impl(
     // role UC/MC/VC get span0 and span1 both pointing at the same
     // role (legacy quirk preserved for byte-level parity).
     constraint_facts = tt!("enrich_spans",
-        enrich_constraints_with_spans(&constraint_facts, &role_facts));
+        enrich_constraints_with_spans(&constraint_facts, &role_facts, &ft_facts));
     // #940 pt2: consequent resolution must see CONTEXT fact types too, not
     // just the in-text ones. A rule whose consequent FT lives in the
     // caller-supplied context (e.g. the metamodel's `Resource is currently
@@ -7314,7 +7465,11 @@ mod tests {
             fact_from_pairs(&[("nounName", "Task"), ("factType", "Task_has_Mark"), ("position", "0")]),
             fact_from_pairs(&[("nounName", "Mark"), ("factType", "Task_has_Mark"), ("position", "1")]),
         ];
-        let enriched = super::enrich_constraints_with_spans(&[ss], &role_facts);
+        let ft_facts = alloc::vec![
+            fact_from_pairs(&[("id", "Task_has_Note"), ("reading", "Task has Note"), ("arity", "2")]),
+            fact_from_pairs(&[("id", "Task_has_Mark"), ("reading", "Task has Mark"), ("arity", "2")]),
+        ];
+        let enriched = super::enrich_constraints_with_spans(&[ss], &role_facts, &ft_facts);
         assert_eq!(enriched.len(), 1);
         let span0 = binding(&enriched[0], "span0_factTypeId");
         let span1 = binding(&enriched[0], "span1_factTypeId");
@@ -7324,6 +7479,63 @@ mod tests {
             "span1 must be the consequent FT; got {:?}", span1);
         assert_ne!(span0, span1,
             "SS spans must be DISTINCT FTs (else compile_subset_ast checks A subset_of A)");
+        // Single shared role (Task) per side → partition = 1 (one
+        // subset-side span before the superset side). This is the
+        // degenerate binary case of the role-SEQUENCE encoding.
+        assert_eq!(binding(&enriched[0], "setComparisonArgumentLength"), Some("1"));
+    }
+
+    #[test]
+    fn enrich_ternary_ss_spans_resolves_full_role_sequence_with_verb_disambiguation() {
+        // ORM2 role-SEQUENCE (tuple) subset: a ternary `If some User
+        // performs some Operation on some Noun then that User is
+        // authorized for that Operation on that Noun` must emit the FULL
+        // shared (User, Operation, Noun) tuple per side — 3 subset-side
+        // spans then 3 superset-side spans, partition = 3 — NOT a single
+        // role. The two fact types share an IDENTICAL role-noun sequence
+        // `[User, Operation, Noun]`; only the verb ("performs" vs
+        // "authorized") distinguishes them, so enrich must disambiguate
+        // by reading verb. Pre-fix, both clause-halves resolved to the
+        // SAME FT (HashMap iteration order) → trivial `performs ⊆
+        // performs` → never a violation.
+        let text = "If some User performs some Operation on some Noun then that User is authorized for that Operation on that Noun";
+        let ss = fact_from_pairs(&[
+            ("id", text),
+            ("kind", "SS"),
+            ("modality", "alethic"),
+            ("text", text),
+            ("entity", "User"),
+        ]);
+        let role_facts = alloc::vec![
+            fact_from_pairs(&[("nounName", "User"), ("factType", "User_performs_Operation_on_Noun"), ("position", "0")]),
+            fact_from_pairs(&[("nounName", "Operation"), ("factType", "User_performs_Operation_on_Noun"), ("position", "1")]),
+            fact_from_pairs(&[("nounName", "Noun"), ("factType", "User_performs_Operation_on_Noun"), ("position", "2")]),
+            fact_from_pairs(&[("nounName", "User"), ("factType", "User_is_authorized_for_Operation_on_Noun"), ("position", "0")]),
+            fact_from_pairs(&[("nounName", "Operation"), ("factType", "User_is_authorized_for_Operation_on_Noun"), ("position", "1")]),
+            fact_from_pairs(&[("nounName", "Noun"), ("factType", "User_is_authorized_for_Operation_on_Noun"), ("position", "2")]),
+        ];
+        let ft_facts = alloc::vec![
+            fact_from_pairs(&[("id", "User_performs_Operation_on_Noun"), ("reading", "User performs Operation on Noun"), ("arity", "3")]),
+            fact_from_pairs(&[("id", "User_is_authorized_for_Operation_on_Noun"), ("reading", "User is authorized for Operation on Noun"), ("arity", "3")]),
+        ];
+        let enriched = super::enrich_constraints_with_spans(&[ss], &role_facts, &ft_facts);
+        let c = &enriched[0];
+        // 3 subset-side spans (performs, roles 0/1/2) then 3 superset-side
+        // spans (authorized, roles 0/1/2); partition = 3.
+        assert_eq!(binding(c, "span0_factTypeId"), Some("User_performs_Operation_on_Noun"));
+        assert_eq!(binding(c, "span1_factTypeId"), Some("User_performs_Operation_on_Noun"));
+        assert_eq!(binding(c, "span2_factTypeId"), Some("User_performs_Operation_on_Noun"));
+        assert_eq!(binding(c, "span3_factTypeId"), Some("User_is_authorized_for_Operation_on_Noun"));
+        assert_eq!(binding(c, "span4_factTypeId"), Some("User_is_authorized_for_Operation_on_Noun"));
+        assert_eq!(binding(c, "span5_factTypeId"), Some("User_is_authorized_for_Operation_on_Noun"));
+        // Role indices walk the shared tuple in order on both sides.
+        assert_eq!(binding(c, "span0_roleIndex"), Some("0"));
+        assert_eq!(binding(c, "span1_roleIndex"), Some("1"));
+        assert_eq!(binding(c, "span2_roleIndex"), Some("2"));
+        assert_eq!(binding(c, "span3_roleIndex"), Some("0"));
+        assert_eq!(binding(c, "span4_roleIndex"), Some("1"));
+        assert_eq!(binding(c, "span5_roleIndex"), Some("2"));
+        assert_eq!(binding(c, "setComparisonArgumentLength"), Some("3"));
     }
 
     #[test]
@@ -7364,7 +7576,10 @@ mod tests {
             fact_from_pairs(&[("nounName", "Toolkit"), ("factType", "FT_impl"), ("position", "1")]),
             fact_from_pairs(&[("nounName", "Toolkit Symbol"), ("factType", "FT_impl"), ("position", "2")]),
         ];
-        let enriched = super::enrich_constraints_with_spans(&[uc], &role_facts);
+        let ft_facts = alloc::vec![
+            fact_from_pairs(&[("id", "FT_impl"), ("reading", "Component is implemented by Toolkit at Toolkit Symbol"), ("arity", "3")]),
+        ];
+        let enriched = super::enrich_constraints_with_spans(&[uc], &role_facts, &ft_facts);
         assert_eq!(enriched.len(), 1);
         let c = &enriched[0];
         assert_eq!(binding(c, "span0_factTypeId"), Some("FT_impl"));

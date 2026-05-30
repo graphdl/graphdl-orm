@@ -503,6 +503,30 @@ fn make_violation_func(id: &str, text: &str, detail: Func) -> Func {
     ])
 }
 
+/// Decode the `span{i}_factTypeId` / `span{i}_roleIndex` pairs of a
+/// Constraint cell fact into the ordered `Vec<SpanDef>`. Reads spans
+/// contiguously from index 0, stopping at the first gap — so an n-ary
+/// role-SEQUENCE subset (the ORM2 tuple-subset case) with more than the
+/// historic 4 spans (e.g. a ternary `performs(U,O,N) ⊆ authorized(U,O,N)`
+/// has 6: 3 subset + 3 superset) decodes fully. `getter` resolves a
+/// flat key to its `Option<String>` value on the fact.
+pub(crate) fn decode_constraint_spans<F>(getter: &F) -> Vec<SpanDef>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+    loop {
+        let Some(ft_id) = getter(&alloc::format!("span{}_factTypeId", i)) else { break };
+        let role_index = getter(&alloc::format!("span{}_roleIndex", i))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        spans.push(SpanDef { fact_type_id: ft_id, role_index, subset_autofill: None });
+        i += 1;
+    }
+    spans
+}
+
 // ─── task-898: violation message template registry ──────────────────
 //
 // Per-constraint violation messages live in readings/core/validation.md
@@ -1446,16 +1470,14 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     let c_constraints: Vec<ConstraintDef> = constraint_cell.as_seq()
         .map(|facts| facts.iter().map(|f| {
             let get = |key: &str| binding(f, key).map(|s| s.to_string());
-            let spans = (0..4).filter_map(|i| {
-                let ft_id = get(&alloc::format!("span{}_factTypeId", i))?;
-                let ri = get(&alloc::format!("span{}_roleIndex", i))?;
-                Some(SpanDef { fact_type_id: ft_id, role_index: ri.parse().unwrap_or(0), subset_autofill: None })
-            }).collect();
+            let spans = decode_constraint_spans(&get);
             ConstraintDef {
                 id: get("id").unwrap_or_default(), kind: get("kind").unwrap_or_default(),
                 modality: get("modality").unwrap_or_default(), deontic_operator: get("deonticOperator"),
                 text: get("text").unwrap_or_default(), spans,
-                set_comparison_argument_length: None, clauses: None, entity: get("entity"),
+                set_comparison_argument_length: get("setComparisonArgumentLength")
+                    .and_then(|s| s.parse().ok()),
+                clauses: None, entity: get("entity"),
                 min_occurrence: get("minOccurrence").and_then(|s| s.parse().ok()),
                 max_occurrence: get("maxOccurrence").and_then(|s| s.parse().ok()),
                 predicate: get("predicate").as_deref().and_then(DeonticPredicate::decode),
@@ -3705,16 +3727,14 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
             }
             // Fallback: reconstruct from flat fields.
             let get = |key: &str| binding(f, key).map(|s| s.to_string());
-            let spans = (0..4).filter_map(|i| {
-                let ft_id = get(&format!("span{}_factTypeId", i))?;
-                let ri = get(&format!("span{}_roleIndex", i))?;
-                Some(SpanDef { fact_type_id: ft_id, role_index: ri.parse().unwrap_or(0), subset_autofill: None })
-            }).collect();
+            let spans = decode_constraint_spans(&get);
             ConstraintDef {
                 id: get("id").unwrap_or_default(), kind: get("kind").unwrap_or_default(),
                 modality: get("modality").unwrap_or_default(), deontic_operator: get("deonticOperator"),
                 text: get("text").unwrap_or_default(), spans,
-                set_comparison_argument_length: None, clauses: None, entity: get("entity"),
+                set_comparison_argument_length: get("setComparisonArgumentLength")
+                    .and_then(|s| s.parse().ok()),
+                clauses: None, entity: get("entity"),
                 min_occurrence: None, max_occurrence: None,
                 predicate: get("predicate").as_deref().and_then(DeonticPredicate::decode),
             }
@@ -8517,8 +8537,20 @@ fn compile_subset_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         _ => {},
     }
 
+    // ORM2 role-SEQUENCE (tuple) subset: the spans encode TWO
+    // RoleSequences (ORM2Core.xsd `ConstraintRoleSequencesType`) — the
+    // SUBSET side `spans[..partition]` then the SUPERSET side
+    // `spans[partition..]`, where `partition` is
+    // `set_comparison_argument_length` (default `spans.len()/2`, which
+    // recovers the historic single-role-per-side binary case). The
+    // subset FT is `spans[0]`, the superset FT is `spans[partition]`.
+    // The A\B witness tuple is matched over ALL shared nouns (`common`
+    // below) — for a ternary `performs(U,O,N) ⊆ authorized(U,O,N)` that
+    // is the full (User, Operation, Noun) tuple, not one role.
+    let partition = def.set_comparison_argument_length.unwrap_or(def.spans.len() / 2)
+        .clamp(1, def.spans.len().saturating_sub(1));
     let a_ft_id = def.spans[0].fact_type_id.clone();
-    let b_ft_id = def.spans[1].fact_type_id.clone();
+    let b_ft_id = def.spans[partition].fact_type_id.clone();
 
     let a_nouns: Vec<String> = data.fact_types.get(&a_ft_id)
         .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
@@ -8588,9 +8620,14 @@ fn compile_equality_ast(data: &CellIndex, def: &ConstraintDef) -> Func {
         _ => {},
     }
 
-    // EQ = SS(A,B) union SS(B,A). Build both subset checks.
+    // EQ = SS(A,B) union SS(B,A). Build both subset checks. Spans
+    // encode the two role sequences partitioned by
+    // `set_comparison_argument_length` (see compile_subset_ast); the
+    // first sequence's FT is `spans[0]`, the second's `spans[partition]`.
+    let partition = def.set_comparison_argument_length.unwrap_or(def.spans.len() / 2)
+        .clamp(1, def.spans.len().saturating_sub(1));
     let a_ft_id = def.spans[0].fact_type_id.clone();
-    let b_ft_id = def.spans[1].fact_type_id.clone();
+    let b_ft_id = def.spans[partition].fact_type_id.clone();
 
     let a_roles: Vec<(usize, String)> = data.fact_types.get(&a_ft_id)
         .map(|ft| ft.roles.iter().enumerate().map(|(i, r)| (i, r.noun_name.clone())).collect())

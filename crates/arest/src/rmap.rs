@@ -357,16 +357,14 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
     let constraints: Vec<ConstraintDef> = fetch_cell_seq("Constraint", state).as_seq()
         .map(|facts| facts.iter().map(|f| {
             let get = |key: &str| binding(f, key).map(|s| s.to_string());
-            let spans = (0..4).filter_map(|i| {
-                let ft_id = get(&format!("span{}_factTypeId", i))?;
-                let ri = get(&format!("span{}_roleIndex", i))?;
-                Some(SpanDef { fact_type_id: ft_id, role_index: ri.parse().unwrap_or(0), subset_autofill: None })
-            }).collect();
+            let spans = crate::compile::decode_constraint_spans(&get);
             ConstraintDef {
                 id: get("id").unwrap_or_default(), kind: get("kind").unwrap_or_default(),
                 modality: get("modality").unwrap_or_default(), deontic_operator: get("deonticOperator"),
                 text: get("text").unwrap_or_default(), spans,
-                set_comparison_argument_length: None, clauses: None, entity: get("entity"),
+                set_comparison_argument_length: get("setComparisonArgumentLength")
+                    .and_then(|s| s.parse().ok()),
+                clauses: None, entity: get("entity"),
                 min_occurrence: None, max_occurrence: None,
                 predicate: None,
             }
@@ -823,16 +821,14 @@ pub fn rmap_cell_map(state: &crate::ast::Object) -> HashMap<String, String> {
     let constraints: Vec<ConstraintDef> = fetch_cell_seq("Constraint", state).as_seq()
         .map(|facts| facts.iter().map(|f| {
             let get = |key: &str| binding(f, key).map(|s| s.to_string());
-            let spans = (0..4).filter_map(|i| {
-                let ft_id = get(&format!("span{}_factTypeId", i))?;
-                let ri = get(&format!("span{}_roleIndex", i))?;
-                Some(SpanDef { fact_type_id: ft_id, role_index: ri.parse().unwrap_or(0), subset_autofill: None })
-            }).collect();
+            let spans = crate::compile::decode_constraint_spans(&get);
             ConstraintDef {
                 id: get("id").unwrap_or_default(), kind: get("kind").unwrap_or_default(),
                 modality: get("modality").unwrap_or_default(), deontic_operator: get("deonticOperator"),
                 text: get("text").unwrap_or_default(), spans,
-                set_comparison_argument_length: None, clauses: None, entity: get("entity"),
+                set_comparison_argument_length: get("setComparisonArgumentLength")
+                    .and_then(|s| s.parse().ok()),
+                clauses: None, entity: get("entity"),
                 min_occurrence: None, max_occurrence: None,
                 predicate: None,
             }

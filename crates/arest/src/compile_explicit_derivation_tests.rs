@@ -5095,6 +5095,169 @@ User is authorized for Operation on Noun. **
         "bob (viewer) must NOT be authorized Delete; got {:?}", perms);
 }
 
+// ── ORM2 role-SEQUENCE (tuple) subset constraint ────────────────────
+//
+// AREST subset constraints used to handle only a SINGLE role per side;
+// a reading-driven TERNARY tuple-subset mis-compiled to a trivial `A ⊆
+// A` (0 violations) because stage-2 span extraction collapsed both
+// clause-halves onto the same fact type (two FTs sharing the role-noun
+// sequence `[User, Operation, Noun]` are indistinguishable by nouns
+// alone). These two tests pin the fix: the subset is enforced over the
+// FULL shared-variable tuple, per ORM2Core.xsd `ConstraintRoleSequences`
+// (two ordered `RoleSequence`s). See the verb-disambiguation stage-2
+// unit test `enrich_ternary_ss_spans_resolves_full_role_sequence_*`.
+
+/// (1) DIRECT ternary tuple-subset (no derivation): `performs(U,O,N) ⊆
+/// may-perform(U,O,N)`. Seed performs={(alice,Delete,Task),(alice,Drop,
+/// Task)}, may-perform={(alice,Delete,Task)}. The witness set is
+/// performs \ may-perform = {(alice,Drop,Task)} — exactly ONE alethic
+/// subset violation naming `Drop` (the A\B tuple), NOT `Delete` (the
+/// satisfier present on both sides).
+#[test]
+fn ternary_tuple_subset_direct_flags_only_the_a_minus_b_tuple() {
+    let src = r#"
+User(.Username) is an entity type.
+Username is a value type.
+Operation(.OpName) is an entity type.
+OpName is a value type.
+Noun(.NounName) is an entity type.
+NounName is a value type.
+
+## Fact Types
+User performs Operation on Noun.
+User may perform Operation on Noun.
+
+## Constraints
+If some User performs some Operation on some Noun then that User may perform that Operation on that Noun.
+"#;
+    let state = parse_to_state(src).expect("ternary direct tuple-subset model must parse");
+    let defs = compile::compile_to_defs_state(&state);
+    let d0 = ast::defs_to_state(&defs, &state);
+    let push = |s, cell: &str, pairs: &[(&str, &str)]|
+        ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+    let d = {
+        let s = d0.clone();
+        // performs: alice does Delete AND Drop on Task.
+        let s = push(s, "User_performs_Operation_on_Noun", &[("User", "alice"), ("Operation", "Delete"), ("Noun", "Task")]);
+        let s = push(s, "User_performs_Operation_on_Noun", &[("User", "alice"), ("Operation", "Drop"), ("Noun", "Task")]);
+        // may-perform: alice may only Delete on Task. (Drop is missing → witness.)
+        let s = push(s, "User_may_perform_Operation_on_Noun", &[("User", "alice"), ("Operation", "Delete"), ("Noun", "Task")]);
+        s
+    };
+
+    // validate reads the population from the eval CONTEXT (Selector 3/4),
+    // not the `d` argument — so the seeded `d` must be the context state.
+    let ctx = ast::encode_eval_context_state("", None, &d);
+    let v = ast::decode_violations(&ast::apply(&ast::Func::Def("validate".to_string()), &ctx, &d));
+
+    // Only the subset (SS) constraint's violations.
+    let ss: Vec<&crate::types::Violation> = v.iter()
+        .filter(|x| x.constraint_text.contains("performs")
+                 && x.constraint_text.contains("may perform"))
+        .collect();
+    assert_eq!(ss.len(), 1,
+        "tuple-subset must flag EXACTLY one witness tuple (alice,Drop,Task); got {:?}",
+        v.iter().map(|x| (x.constraint_id.as_str(), x.detail.as_str())).collect::<Vec<_>>());
+    let viol = ss[0];
+    assert!(viol.alethic, "subset constraint is alethic; got {:?}", viol);
+    // Detail names the A\B witness tuple — `Drop`, not `Delete`.
+    assert!(viol.detail.contains("Drop"),
+        "violation detail must name the witness Operation `Drop`; got {:?}", viol.detail);
+    assert!(viol.detail.contains("alice") && viol.detail.contains("Task"),
+        "violation detail must name the full witness tuple (alice, …, Task); got {:?}", viol.detail);
+    assert!(!viol.detail.contains("Delete"),
+        "the satisfier tuple (alice,Delete,Task) is in BOTH sides and must NOT be flagged; got {:?}",
+        viol.detail);
+}
+
+/// (2) Authz-enforcement use case — ternary tuple-subset over a DERIVED
+/// consequent. `authorized(U,O,N)` is derived from
+/// `has-access-level` ⋈ `permits`; the subset constraint
+/// `performs(U,O,N) ⊆ authorized(U,O,N)` then flags any performed
+/// operation the user is not authorized for. Forward-chain the
+/// `derivation:*` defs FIRST (so `authorized` is populated) THEN
+/// validate over the chained state. alice (admin) is authorized Delete
+/// on Task but performs BOTH Delete and Drop → (alice,Drop,Task) is the
+/// sole witness; (alice,Delete,Task) is authorized and must NOT flag.
+#[test]
+fn ternary_tuple_subset_over_derived_authorized_flags_unauthorized_performed_op() {
+    let src = r#"
+User(.Username) is an entity type.
+Username is a value type.
+Access Level is a value type.
+Operation(.OpName) is an entity type.
+OpName is a value type.
+Noun(.NounName) is an entity type.
+NounName is a value type.
+
+## Fact Types
+User has Access Level.
+Access Level permits Operation on Noun.
+User is authorized for Operation on Noun. **
+User performs Operation on Noun.
+
+## Derivation Rules
+* User is authorized for Operation on Noun iff User has Access Level and Access Level permits Operation on Noun.
+
+## Constraints
+If some User performs some Operation on some Noun then that User is authorized for that Operation on that Noun.
+"#;
+    let state = parse_to_state(src).expect("authz tuple-subset model must parse");
+    let defs = compile::compile_to_defs_state(&state);
+    let d0 = ast::defs_to_state(&defs, &state);
+    let push = |s, cell: &str, pairs: &[(&str, &str)]|
+        ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+    let d = {
+        let s = d0.clone();
+        let s = push(s, "User_has_Access_Level", &[("User", "alice"), ("Access Level", "admin")]);
+        let s = push(s, "Access_Level_permits_Operation_on_Noun", &[("Access Level", "admin"), ("Operation", "Delete"), ("Noun", "Task")]);
+        // alice performs BOTH Delete (authorized) and Drop (NOT authorized).
+        let s = push(s, "User_performs_Operation_on_Noun", &[("User", "alice"), ("Operation", "Delete"), ("Noun", "Task")]);
+        let s = push(s, "User_performs_Operation_on_Noun", &[("User", "alice"), ("Operation", "Drop"), ("Noun", "Task")]);
+        s
+    };
+
+    // Forward-chain the derivation:* defs so `authorized` is populated.
+    let refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &d)))
+        .collect();
+    let refs: Vec<(&str, &ast::Func)> = refs_owned.iter().map(|(n, f)| (n.as_str(), f)).collect();
+    let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+
+    // Sanity: alice is authorized Delete (derived), but NOT Drop.
+    let auth = ast::fetch_cell_seq("User_is_authorized_for_Operation_on_Noun", &new_d);
+    let auth_rows: Vec<(String, String, String)> = auth.as_seq()
+        .map(|items| items.iter().filter_map(|f| Some((
+            ast::binding(f, "User")?.to_string(),
+            ast::binding(f, "Operation")?.to_string(),
+            ast::binding(f, "Noun")?.to_string(),
+        ))).collect())
+        .unwrap_or_default();
+    assert!(auth_rows.iter().any(|(u, o, n)| u == "alice" && o == "Delete" && n == "Task"),
+        "derivation must authorize alice Delete on Task; got {:?}", auth_rows);
+    assert!(!auth_rows.iter().any(|(_, o, _)| o == "Drop"),
+        "alice must NOT be authorized Drop (admin doesn't permit it); got {:?}", auth_rows);
+
+    // Validate the subset constraint over the forward-chained state.
+    let ctx = ast::encode_eval_context_state("", None, &new_d);
+    let v = ast::decode_violations(&ast::apply(&ast::Func::Def("validate".to_string()), &ctx, &new_d));
+    let ss: Vec<&crate::types::Violation> = v.iter()
+        .filter(|x| x.constraint_text.contains("performs")
+                 && x.constraint_text.contains("authorized"))
+        .collect();
+    assert_eq!(ss.len(), 1,
+        "exactly one performs-tuple is unauthorized: (alice,Drop,Task); got {:?}",
+        v.iter().map(|x| (x.constraint_id.as_str(), x.detail.as_str())).collect::<Vec<_>>());
+    let viol = ss[0];
+    assert!(viol.alethic, "subset constraint is alethic; got {:?}", viol);
+    assert!(viol.detail.contains("Drop") && viol.detail.contains("alice") && viol.detail.contains("Task"),
+        "(alice,Drop,Task) must be the flagged witness (performs \\ authorized); got {:?}", viol.detail);
+    assert!(!viol.detail.contains("Delete"),
+        "(alice,Delete,Task) IS authorized (in performs AND authorized) and must NOT flag; got {:?}",
+        viol.detail);
+}
+
 // crudl-menu-projection (authz, OBJECTIFIED): the role-based permission gate as
 // a skolem-minted Grant, mirroring the proven view-derivation Join+skolem path
 // (which is the ONLY path that cross-antecedent-joins; see
