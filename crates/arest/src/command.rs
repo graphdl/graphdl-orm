@@ -4092,6 +4092,38 @@ pub fn crudl_menu_operations(d: &ast::Object, noun: &str, view_context: &str, us
     ops
 }
 
+/// One CRUDL menu item — an iFactr ActionButton: the operation + its iFactr
+/// control (Button/SubmitButton/CancelButton) + HTTP method + whether it needs
+/// confirmation, all sourced from the readings/ui/crudl.md catalog.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrudlMenuItem {
+    pub operation: String,
+    pub control_kind: String,
+    pub request_type: String,
+    pub requires_confirmation: bool,
+}
+
+/// The permission-gated CRUDL menu as full iFactr ActionButtons — wraps
+/// `crudl_menu_operations` and decorates each permitted operation with its
+/// catalog metadata (Control Kind, CRUDL Request Type, Confirmation) from
+/// crudl.md, so a renderer has everything to draw the button.
+pub fn crudl_menu(d: &ast::Object, noun: &str, view_context: &str, user: &str) -> Vec<CrudlMenuItem> {
+    crudl_menu_operations(d, noun, view_context, user).into_iter().map(|op| {
+        let attr = |cell: &str, role: &str| ast::fetch_cell_seq(cell, d).as_seq()
+            .and_then(|fs| fs.iter().find_map(|f| (ast::binding(f, "Operation") == Some(op.as_str()))
+                .then(|| ast::binding(f, role).map(String::from)).flatten()));
+        let flag = |cell: &str| ast::fetch_cell_seq(cell, d).as_seq()
+            .map_or(false, |fs| fs.iter().any(|f| ast::binding(f, "Operation") == Some(op.as_str())));
+        CrudlMenuItem {
+            control_kind: attr("Operation_has_Control_Kind", "Control Kind").unwrap_or_default(),
+            request_type: attr("Operation_has_CRUDL_Request_Type", "CRUDL Request Type").unwrap_or_default(),
+            requires_confirmation: flag("Operation_requires_Confirmation"),
+            operation: op,
+        }
+    }).collect()
+}
+
 /// task-965: HTTP method for a target status, lifted from a Rust literal
 /// (`if to == "deleted" { "DELETE" } else { "GET" }`) to the
 /// `Status has HTTP Method` reading (e.g. `Status 'deleted' has HTTP Method

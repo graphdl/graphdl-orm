@@ -5349,6 +5349,12 @@ ViewElement renders Operation. *
     // bob (no grants) -> empty menu (the permission gate).
     let bob = crate::command::crudl_menu_operations(&d, "Task", "collection", "bob");
     assert!(bob.is_empty(), "bob (no grants) gets an empty menu; got {:?}", bob);
+    // The full menu items carry the iFactr catalog metadata (Control Kind, method).
+    let coll_full = crate::command::crudl_menu(&d, "Task", "collection", "alice");
+    let create = coll_full.iter().find(|m| m.operation == "create")
+        .expect("create must be in alice's full collection menu");
+    assert_eq!(create.control_kind, "Button", "create's iFactr Control Kind from crudl.md");
+    assert_eq!(create.request_type, "POST", "create's CRUDL Request Type from crudl.md");
 }
 
 // ─── task-934-3a: VERIFIED METAMODEL FACT-TYPE NAMES ────────────────────────
