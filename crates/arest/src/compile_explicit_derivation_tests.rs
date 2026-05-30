@@ -3432,3 +3432,144 @@ Merge has derived Security Posture.
         rule.text, rule);
 }
 
+// ─── task-934-1 — §4.2 value-type→widget LAZY VIEW mechanism ──────────────
+//
+// Three derivation rules share ONE consequent FT (`ViewElement has
+// Component Role. *`).  The compile.rs fix (task-934-1, `view_by_cell`
+// grouping) must Concat them into a single `view:ViewElement_has_Component_Role`
+// def.  Without the fix, the HashMap last-write-wins — only the last rule
+// survives, breaking the two-element verification below.
+//
+// Layout:
+//
+//   Entity types  : ViewElement, Fact Type, Role, Noun
+//   Value types   : Component Role, Format
+//   Fact types    : ViewElement renders Fact Type
+//                   Fact Type has Role
+//                   Role is played by Noun
+//                   Noun has Format
+//                   ViewElement has Component Role. *   ← the crux
+//
+//   Three view rules (all write into ViewElement_has_Component_Role):
+//     'text-input'  iff ... Noun has Format 'text'
+//     'date-picker' iff ... Noun has Format 'date'
+//     'checkbox'    iff ... Noun has Format 'boolean'
+//
+//   Instance facts: ViewElement e1 → ft1 → role1 → noun1 (Format 'text')
+//                   ViewElement e2 → ft2 → role2 → noun2 (Format 'date')
+//
+// Assertions:
+//   (a) All three rules compile with materialization = View.
+//   (b) NO `derivation:` def emitted for ViewElement_has_Component_Role.
+//   (c) A `view:ViewElement_has_Component_Role` def IS present (the
+//       multi-rule Concat is the compile.rs fix under test).
+//   (d) Func::Fetch resolves e1 → 'text-input' and e2 → 'date-picker'
+//       lazily (no forward chain run).
+#[test]
+fn view_projection_section_4_2_lazy_widget_rules_merge() {
+    let src = r#"# task-934-1 §4.2 view test
+ViewElement(.id) is an entity type.
+Fact Type(.id) is an entity type.
+Role(.id) is an entity type.
+Noun(.id) is an entity type.
+Component Role is a value type.
+Format is a value type.
+
+## Fact Types
+ViewElement renders Fact Type.
+Fact Type has Role.
+Role is played by Noun.
+Noun has Format.
+ViewElement has Component Role. *
+
+## Derivation Rules
+* ViewElement has Component Role 'text-input' iff ViewElement renders some Fact Type and that Fact Type has some Role and that Role is played by some Noun and that Noun has Format 'text'.
+* ViewElement has Component Role 'date-picker' iff ViewElement renders some Fact Type and that Fact Type has some Role and that Role is played by some Noun and that Noun has Format 'date'.
+* ViewElement has Component Role 'checkbox' iff ViewElement renders some Fact Type and that Fact Type has some Role and that Role is played by some Noun and that Noun has Format 'boolean'.
+
+## Instance Facts
+Fact Type 'ft1' has Role 'role1'.
+Role 'role1' is played by Noun 'noun1'.
+Noun 'noun1' has Format 'text'.
+ViewElement 'e1' renders Fact Type 'ft1'.
+
+Fact Type 'ft2' has Role 'role2'.
+Role 'role2' is played by Noun 'noun2'.
+Noun 'noun2' has Format 'date'.
+ViewElement 'e2' renders Fact Type 'ft2'.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let data = compile::cell_index_from_state(&state);
+
+    // (a) All three widget rules must be View-materialized.
+    let view_rules: Vec<&crate::types::DerivationRuleDef> = data.derivation_rules.iter()
+        .filter(|r| r.text.contains("ViewElement has Component Role"))
+        .collect();
+    assert_eq!(view_rules.len(), 3,
+        "Expected exactly 3 Component Role rules, got {}; rules: {:#?}",
+        view_rules.len(),
+        data.derivation_rules.iter().map(|r| r.text.as_str()).collect::<Vec<_>>());
+    for r in &view_rules {
+        assert!(matches!(r.materialization, crate::types::MaterializationPolicy::View),
+            "Rule '{}' must be View-materialized; got {:?}", r.text, r.materialization);
+    }
+
+    // Build the full def-state (view defs, instance cells, etc.).
+    let defs = compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+
+    // (b) NO `derivation:` def may exist for any of the three rules
+    //     (View rules must NOT be emitted into the forward chain).
+    for r in &view_rules {
+        let derivation_def = ast::fetch_raw(&format!("derivation:{}", r.id), &d);
+        assert!(matches!(derivation_def, ast::Object::Bottom),
+            "View rule '{}' must NOT emit a derivation: def; got {:?}",
+            r.text, derivation_def);
+    }
+
+    // (c) A single `view:ViewElement_has_Component_Role` def MUST be
+    //     present (the compile.rs fix groups all 3 rules via Concat).
+    let view_def = ast::fetch_raw("view:ViewElement_has_Component_Role", &d);
+    assert!(!matches!(view_def, ast::Object::Bottom),
+        "view:ViewElement_has_Component_Role def must be present (compile.rs \
+         multi-rule Concat grouping fix). Got Bottom.");
+
+    // (d) Lazy resolution via Func::Fetch — no forward chain run.
+    //     The fetch_input passes `d` as the state; resolve_view encodes
+    //     it and applies the merged view func against the instance cells.
+    let fetch_input = Object::seq(vec![
+        Object::atom("ViewElement_has_Component_Role"),
+        d.clone(),
+    ]);
+    let result = ast::apply(&ast::Func::Fetch, &fetch_input, &d);
+
+    // Collect (ViewElement, Component Role) pairs from the lazy result.
+    let widget_pairs: Vec<(String, String)> = match &result {
+        Object::Seq(items) => items.iter().filter_map(|f| {
+            let elem = ast::binding(f, "ViewElement").map(String::from)?;
+            let role = ast::binding(f, "Component Role").map(String::from)?;
+            Some((elem, role))
+        }).collect(),
+        _ => Vec::new(),
+    };
+
+    assert!(
+        widget_pairs.iter().any(|(e, r)| e == "e1" && r == "text-input"),
+        "Lazy view must resolve e1 → 'text-input' (Format 'text' rule).\n\
+         Got pairs: {:?}\nRaw Fetch result: {:?}", widget_pairs, result);
+    assert!(
+        widget_pairs.iter().any(|(e, r)| e == "e2" && r == "date-picker"),
+        "Lazy view must resolve e2 → 'date-picker' (Format 'date' rule).\n\
+         Got pairs: {:?}\nRaw Fetch result: {:?}", widget_pairs, result);
+    // Verify e1 does NOT get 'date-picker' and e2 does NOT get 'text-input'
+    // (proves the antecedent Format literal filters are applied correctly).
+    assert!(
+        !widget_pairs.iter().any(|(e, r)| e == "e1" && r == "date-picker"),
+        "e1 must NOT derive 'date-picker' (its Format is 'text', not 'date').\n\
+         Got pairs: {:?}", widget_pairs);
+    assert!(
+        !widget_pairs.iter().any(|(e, r)| e == "e2" && r == "text-input"),
+        "e2 must NOT derive 'text-input' (its Format is 'date', not 'text').\n\
+         Got pairs: {:?}", widget_pairs);
+}
+

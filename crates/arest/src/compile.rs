@@ -1650,11 +1650,34 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             // the strat2 prefix was dead — always emit `derivation:`.
             (format!("derivation:{}", d.id), d.func.clone())
         }));
-    defs.extend(model.derivations.iter()
-        .filter(|d| matches!(d.materialization,
-            crate::types::MaterializationPolicy::View))
-        .filter(|d| !d.consequent_cell.is_empty())
-        .map(|d| (format!("view:{}", d.consequent_cell), d.func.clone())));
+    // task-934-1: group View rules by consequent_cell and Concat their
+    // funcs. Multiple `*`-marked rules can share ONE consequent FT (the
+    // §4.2 value-type->widget mapping has 4 rules for
+    // ViewElement_has_Component_Role; state.md has 2 for
+    // Status_is_defined_in_State_Machine_Definition). The prior plain
+    // `.map()` folded into the defs HashMap last-write-wins, silently
+    // dropping all but the last rule per cell. Mirror the validate:{noun}
+    // fold above; per-cell funcs stay in derivation order (deterministic),
+    // the defs HashMap is keyed by `view:{cell}` so outer order is moot.
+    {
+        let mut view_by_cell: HashMap<String, Vec<Func>> = HashMap::new();
+        for d in model.derivations.iter()
+            .filter(|d| matches!(d.materialization,
+                crate::types::MaterializationPolicy::View))
+            .filter(|d| !d.consequent_cell.is_empty())
+        {
+            view_by_cell.entry(d.consequent_cell.clone())
+                .or_default()
+                .push(d.func.clone());
+        }
+        defs.extend(view_by_cell.into_iter().map(|(cell, funcs)| {
+            let func = match funcs.len() {
+                1 => funcs.into_iter().next().unwrap(),
+                _ => Func::compose(Func::Concat, Func::construction(funcs)),
+            };
+            (format!("view:{}", cell), func)
+        }));
+    }
 
     // (negation-strat-strip) the per-rule `derivation_meta:<id>` sidecar
     // emission was removed: its only consumer, evaluate::read_derivation_meta,
