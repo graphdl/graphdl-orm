@@ -147,7 +147,13 @@ fn ss_autofill_lands_consequent_fact_in_consequent_ft_cell() {
     // binds to 'A1' AND Department role binds to 'D1' — that is the
     // SS-autofilled fact. Without the autofill step (loop removed,
     // no metamodel rule), the cell would be empty.
-    let works_cell = ast::fetch_or_phi("ft_works", &new_d);
+    // task-744/#940: FT cells flip to Map-backed (keyed by full-tuple
+    // identity) under runtime entity-cell storage. `fetch_or_phi(...)
+    // .as_seq()` silently returns None on a Map cell — the documented
+    // silent-no-op bug class. `fetch_cell_seq` normalises a Map cell to
+    // a key-sorted Seq so the autofilled fact is visible regardless of
+    // the cell's stored shape (see ast::fetch_cell_seq migration glue).
+    let works_cell = ast::fetch_cell_seq("ft_works", &new_d);
     let entries: Vec<&ast::Object> = works_cell.as_seq()
         .map(|s| s.iter().collect()).unwrap_or_default();
 

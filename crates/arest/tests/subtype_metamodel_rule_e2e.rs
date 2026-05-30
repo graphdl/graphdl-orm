@@ -62,7 +62,14 @@ fn subtype_inheritance_lands_supertype_membership_in_supertype_ft_cell() {
     // supertype-membership emission. Without the inheritance step
     // (loop removed, no metamodel rule), the cell would either be
     // empty or contain only user-pushed facts (none in this fixture).
-    let vh_cell = ast::fetch_or_phi("Vehicle_has_Color", &new_d);
+    // task-744/#940: FT cells flip to Map-backed (keyed by full-tuple
+    // identity) under runtime entity-cell storage. `fetch_or_phi(...)
+    // .as_seq()` silently returns None on a Map cell — the documented
+    // silent-no-op bug class. `fetch_cell_seq` normalises a Map cell to
+    // a key-sorted Seq so the inherited supertype-membership binding is
+    // visible regardless of the cell's stored shape (see
+    // ast::fetch_cell_seq migration glue).
+    let vh_cell = ast::fetch_cell_seq("Vehicle_has_Color", &new_d);
     let entries: Vec<&ast::Object> = vh_cell.as_seq()
         .map(|s| s.iter().collect()).unwrap_or_default();
 
