@@ -1456,18 +1456,21 @@ impl RangeOperatorTable {
 }
 
 /// task-953 — superlative/ordering comparator vocabulary
-/// (`strongest`/`highest`/`best`, `weakest`/`lowest`/`worst`) used in
-/// `<X> has the <super> <ValueType> among <Ys> …` derivation-rule
-/// antecedents over ENUM-valued nouns. Each word maps to the existing
-/// numeric aggregate op applied to the value's declaration-order RANK:
-/// the strongest-family (first-declared = rank 0) folds via `min`; the
-/// weakest-family via `max`. Same parallel-enum lift as
+/// (`highest`/`lowest`) used in `<X> has the <super> <ValueType> among
+/// <Ys> …` derivation-rule antecedents over ENUM-valued nouns. Each word
+/// maps to the existing numeric aggregate op applied to the value's
+/// declaration-order RANK: `highest` (first-declared = rank 0) folds via
+/// `min`; `lowest` (last-declared) via `max`. Per the cruft directive,
+/// only the ORM-verbalization superlatives (`highest`/`lowest` — Halpin &
+/// Curland, "Automated Verbalization for ORM 2") ship as engine grammar;
+/// domain superlatives (`strongest`/`best`/`worst`/…) are author-
+/// extensible per-app, not engine defaults. Same parallel-enum lift as
 /// `DeonticPredicateOperatorTable` — the word list and the op list live
 /// in `readings/forml2-grammar.md` as `Superlative Comparator` /
 /// `Superlative Comparator Aggregate Op`.
 #[derive(Debug, Clone)]
 pub struct SuperlativeComparatorTable {
-    /// Pairs of `(word, aggregate_op)`, e.g. `("strongest", "min")`.
+    /// Pairs of `(word, aggregate_op)`, e.g. `("highest", "min")`.
     /// `word` is the bare superlative adjective (no surrounding spaces);
     /// the caller matches it as a whole token.
     pub rows: Vec<(String, String)>,
@@ -1480,12 +1483,8 @@ impl SuperlativeComparatorTable {
     pub fn boot() -> Self {
         SuperlativeComparatorTable {
             rows: alloc::vec![
-                ("strongest".to_string(), "min".to_string()),
-                ("highest".to_string(),   "min".to_string()),
-                ("best".to_string(),      "min".to_string()),
-                ("weakest".to_string(),   "max".to_string()),
-                ("lowest".to_string(),    "max".to_string()),
-                ("worst".to_string(),     "max".to_string()),
+                ("highest".to_string(), "min".to_string()),
+                ("lowest".to_string(),  "max".to_string()),
             ],
         }
     }
@@ -6324,10 +6323,12 @@ mod tests {
     /// bumping noun=50, enum=39.
     /// #882 added `Anaphora Pronoun` enum (1 value) —
     /// bumping noun=51, enum=40.
-    /// task-953 added the parallel `Superlative Comparator` (6 values) /
-    /// `Superlative Comparator Aggregate Op` (6 values) enums so superlative
-    /// ordering words (`strongest`/`weakest` etc.) map to the min/max rank
-    /// aggregate — bumping noun=53, enum=42.
+    /// task-953 added the parallel `Superlative Comparator` (2 values) /
+    /// `Superlative Comparator Aggregate Op` (2 values) enums so superlative
+    /// ordering words (`highest`/`lowest`) map to the min/max rank
+    /// aggregate — bumping noun=53, enum=42. (The cruft pass narrowed the
+    /// value lists from 6 to 2 — `highest`/`lowest` only — but both remain
+    /// enum-valued nouns, so the noun/enum-valued-noun counts are unchanged.)
     #[test]
     fn bootstrap_grammar_covers_expected_shapes() {
         let grammar = include_str!("../../../readings/forml2-grammar.md");

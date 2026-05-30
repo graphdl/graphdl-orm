@@ -306,27 +306,33 @@ bottom of this section.
 11. **Enum-declaration-order superlative** (task-953) — `<X> has
     derived <P> iff <X> <verb> some <Y> that has the <super> <P> among
     <Y>s the <X> <verb>` where `<super>` is a superlative word
-    (`strongest`/`highest`/`best` or `weakest`/`lowest`/`worst`) and
-    `<P>` is an ENUM-valued noun. Recognised by
-    `try_parse_superlative_among_clause` in `parse_forml2.rs`; the
-    superlative word maps to the existing `min`/`max` aggregate op via
-    `SuperlativeComparatorTable` (`readings/forml2-grammar.md` enums
-    `Superlative Comparator` / `Superlative Comparator Aggregate Op`),
-    and the clause lifts to a `ConsequentAggregate` with `enum_rank =
-    true`. The KEY INSIGHT: a superlative is the numeric min/max fold
-    applied to a RANK derived from the value type's `enumerates
-    'v0','v1',…` declaration order (first-declared = strongest = rank
-    0) — there is NO new binary op and NO per-value cascade. The
-    `among Ys the X …` group set is the join of the group FT
-    (`X concerns Y`) with the value FT (`Y has P`) on the shared
-    entity; `compile_aggregate_derivation` synthesises that join
+    (`highest` or `lowest`) and `<P>` is an ENUM-valued noun.
+    Recognised by `try_parse_superlative_among_clause` in
+    `parse_forml2.rs`; the superlative word maps to the existing
+    `min`/`max` aggregate op via `SuperlativeComparatorTable`
+    (`readings/forml2-grammar.md` enums `Superlative Comparator` /
+    `Superlative Comparator Aggregate Op`), and the clause lifts to a
+    `ConsequentAggregate` with `enum_rank = true`. Only the
+    ORM-verbalization superlatives ship as engine grammar: `highest` /
+    `lowest` are the ORM 2 verbalization forms (Halpin & Curland,
+    "Automated Verbalization for ORM 2"); domain superlatives
+    (`strongest`/`best`/`worst`/`weakest`/…) are author-extensible
+    per-app, NOT engine defaults (cruft directive — vocabulary not
+    grounded in ORM verbalization does not ship as engine grammar). The
+    KEY INSIGHT: a superlative is the numeric min/max fold applied to a
+    RANK derived from the value type's `enumerates 'v0','v1',…`
+    declaration order (first-declared = `highest` = rank 0) — there is
+    NO new binary op and NO per-value cascade. The `among Ys the X …`
+    group set is the join of the group FT (`X concerns Y`) with the
+    value FT (`Y has P`) on the shared entity;
+    `compile_aggregate_derivation` synthesises that join
     (`build_superlative_join_source`), promotes each candidate value to
     its declaration-order rank (`enum_rank_lookup`), folds `min`/`max`
     over the ranks, and projects the WINNING enum value (not the rank)
     onto the consequent. Pinned by
-    `superlative_strongest_among_selects_enum_earliest_posture`,
+    `superlative_highest_among_selects_enum_earliest_posture`,
     `superlative_highest_priority_among_selects_p0_over_p1`, and
-    `superlative_weakest_among_selects_enum_latest_posture` in
+    `superlative_lowest_among_selects_enum_latest_posture` in
     `compile_explicit_derivation_tests.rs`. OUT OF SCOPE (follow-up):
     domain-specific superlatives needing a non-enum ordering
     (`most-recent`/`fastest`/`cheapest` over dates/numbers) — those
@@ -334,11 +340,19 @@ bottom of this section.
 
 ### Comparator vocabulary the parser does NOT recognise
 
-The `… among …` enum-declaration-order superlatives
-(`strongest`/`weakest`, `highest`/`lowest`, `best`/`worst`) ARE now
-recognised — see shape 11 above (task-953). The following words still
-surface in user readings (Halpin §6 "sentence-level comparison") but
-do NOT lift to any `AntecedentRoleComparison` or aggregate operator. A
+The `… among …` enum-declaration-order superlatives `highest` /
+`lowest` ARE now recognised — see shape 11 above (task-953). These are
+the only superlatives that ship as engine grammar: per the cruft
+directive, vocabulary not grounded in ORM verbalization is not an
+engine default, and a primary-source check (Halpin & Curland,
+"Automated Verbalization for ORM 2") confirms only `highest`/`lowest`
+are ORM verbalization forms. Domain superlatives
+(`strongest`/`weakest`/`best`/`worst`/…) are author-extensible per-app
+(declare the two parallel enums `Superlative Comparator` /
+`Superlative Comparator Aggregate Op` in your own readings to add
+them), NOT engine-shipped. The following words still surface in user
+readings (Halpin §6 "sentence-level comparison") but do NOT lift to
+any `AntecedentRoleComparison` or aggregate operator. A
 rule whose antecedent contains any of these falls through every
 classifier in `resolve_derivation_rule` and lands as an unresolved
 clause (the parser emits an `UnresolvedClause` fact; the rule itself
@@ -346,6 +360,13 @@ stays in the schema with whatever positive FT antecedents survived):
 
 * `most` / `least` (without `at`)
 * `top` / `bottom`
+* Domain superlatives (`strongest`/`weakest`/`best`/`worst`/`safest`/
+  `cheapest`/…) — NOT in the engine's `Superlative Comparator` enum.
+  Even when the intended ordering IS the enum declaration order, the
+  engine does not recognise these out of the box; an author who wants
+  one extends the two parallel enums in their own readings (shape 11's
+  machinery is vocabulary-driven). This is the cruft-directive boundary:
+  only `highest`/`lowest` (ORM verbalization) ship as engine grammar.
 * Any superlative adjective specific to a value-type's domain whose
   ordering is NOT the enum declaration order — `fastest`/`cheapest`
   over a numeric role, `most recent` over a date. The enum-ordered
