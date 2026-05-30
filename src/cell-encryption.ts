@@ -99,8 +99,8 @@ const HKDF_INFO_MASTER = new TextEncoder().encode('arest-tenant-master/v1')
  * if the same (seed, salt) pair is fed in. Implemented via Web
  * Crypto's HKDF (which Workers expose) rather than the WASM module
  * because the master derivation is a pure function the worker
- * already paid for in #659; only the per-cell AEAD primitive needed
- * to migrate to ChaCha20-Poly1305 for cross-tier compat.
+ * already paid for in #659; the per-cell AEAD primitive has since
+ * migrated to ChaCha20-Poly1305 (via WASM) for cross-tier compat.
  */
 export async function deriveTenantMasterKey(
   seed: Uint8Array | string,

@@ -161,15 +161,10 @@ fn json_string(s: &str) -> String {
 /// (`{id, type, ...data}`). Returns `None` for non-matching paths,
 /// non-POST methods, unknown slugs, malformed JSON, or missing `id`.
 ///
-/// Direct-write fallback only — the engine path (validate / derive /
-/// apply via `system::apply`) is pending the kernel engine-path
-/// migration tracked by task-780 sweep item 5. #588 already lifted
-/// Stage-2 to no_std (commit `097577ff`); what remains is routing
-/// kernel HTTP handlers through `naming::resolve_entity_id` + the
-/// transition resolver instead of this direct-write path. Until
-/// that lands, this is the only POST path the kernel honours, mirror
-/// of the worker's `router.ts::handleEntitiesPost` create-side
-/// fallback.
+/// Direct-write fallback only — mirror of the worker's
+/// `router.ts::handleEntitiesPost` create-side fallback. Full
+/// engine-path migration (validate / derive / apply via
+/// `system::apply`) is a separate follow-up.
 ///
 /// Caller is responsible for committing the returned state via
 /// `system::apply` and emitting the response bytes back over HTTP.
@@ -257,14 +252,12 @@ pub fn handle_arest_create_for_slug(
 /// Handle `POST /arest/entity` with a body of
 /// `{"noun":"Organization","domain":"organizations","fields":{...}}`.
 /// Mirror of the worker's AREST-command create path
-/// (`router.ts::handleArestRoute` POST branch). The kernel today
-/// still runs the direct-write fallback rather than the engine
-/// path (pending the kernel engine-path migration tracked by
-/// task-780 sweep item 5; #588's no_std lift already landed), so
-/// this is the direct-write fallback only — same shape
-/// `handle_arest_create_for_slug` uses, but with the noun read from
-/// the body and a random id (`arest::csprng::random_bytes`) since
-/// the request doesn't supply one.
+/// (`router.ts::handleArestRoute` POST branch). Runs the
+/// direct-write fallback — same shape as `handle_arest_create_for_slug`
+/// but with the noun read from the body and the entity id derived via
+/// `naming::resolve_entity_id` from the noun's declared reference
+/// scheme field (e.g. `id` by default, or a named field set by
+/// `referenceScheme`).
 ///
 /// Returns `None` for non-matching paths, non-POST methods, malformed
 /// JSON, missing/unknown noun. Caller commits the new state via
@@ -300,10 +293,9 @@ pub fn handle_arest_create(
     }
     let noun = noun_raw.to_string();
 
-    // task-780 sweep item 5: id derives from the noun's reference
-    // scheme via the engine-path resolver, not the legacy synthetic
-    // `k{counter}{fnv}` shape. Build a stringified `fields` map first
-    // (only stringifiable JSON values participate) so
+    // Id derives from the noun's reference scheme via the engine-path
+    // resolver. Build a stringified `fields` map first (only
+    // stringifiable JSON values participate) so
     // `naming::resolve_entity_id` can look up the ref-scheme field;
     // the entity construction below re-iterates the parsed JSON to
     // preserve field order in the response envelope.
@@ -387,11 +379,9 @@ pub fn handle_arest_create(
 ///   * No Transition row matches `(currentStatus, event)`.
 ///
 /// The kernel HTTP handler maps `None` to `404`/`400` per the worker's
-/// error envelope (`router.ts:646-671`); the engine path is pending
-/// the kernel engine-path migration (task-780 sweep item 5). #588
-/// already shipped the no_std Stage-2 lift; what remains is rewiring
-/// kernel HTTP handlers to runtime-compile readings via the lifted
-/// `load_reading_core` path.
+/// error envelope (`router.ts:646-671`); full engine-path migration
+/// (runtime-compile readings via `load_reading_core`) is a separate
+/// follow-up.
 pub fn handle_arest_transition(
     state: &Object,
     method: &str,
@@ -521,8 +511,7 @@ pub fn handle_arest_transition(
     // W2 (task-932): canonical keyed-Map write for the Event log. Each
     // Event has a unique `id` (evt-counter), so cell_put_keyed by `id`
     // accumulates distinct events while staying set-semantic (D4) under
-    // identical re-fires; cell_push silently appended. (NEXT_ENTITY_COUNTER
-    // itself is task-780 item-5's removal target -- separate change.)
+    // identical re-fires; cell_push silently appended.
     let new_state = crate::ast::cell_put_keyed("Event", &["id"], event_entity, &new_state)
         .unwrap_or_else(|_| new_state.clone());
 
@@ -530,8 +519,7 @@ pub fn handle_arest_transition(
     // `json({ id, noun, previousStatus, status, event, transitions })`
     // (router.ts:686). `transitions` is omitted today because the
     // direct-write fallback doesn't compute the legal next-step set
-    // (the engine path's job; pending the kernel engine-path migration
-    // tracked by task-780 sweep item 5).
+    // (the engine path's job; pending the kernel engine-path migration).
     let mut out = String::new();
     out.push('{');
     out.push_str("\"id\":");
@@ -1381,11 +1369,10 @@ mod tests {
         assert_eq!(crate::ast::binding(&updated, "id"), Some("x"));
     }
 
-    // task-780 sweep item 5: handle_arest_create now routes through
-    // `naming::resolve_entity_id` instead of the synthetic
-    // `k{counter}{fnv}` id. Three tests cover the contract: default
-    // ref-scheme (`id`), declared ref-scheme (a named field), and
-    // refusal when the ref-scheme field is missing.
+    // handle_arest_create routes through `naming::resolve_entity_id`.
+    // Three tests cover the contract: default ref-scheme (`id`),
+    // declared ref-scheme (a named field), and refusal when the
+    // ref-scheme field is missing.
 
     #[test]
     fn arest_create_uses_default_id_reference_scheme() {
