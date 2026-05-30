@@ -947,10 +947,17 @@ pub fn main_entry() {
                 // single-SYSTEM and REPL branches below.
                 // Store (App, Generator) opt-ins as a cell so compile can
                 // emit per-App artifacts (openapi, eventually sqlite/etc.).
+                // W2 (task-932): App_uses_Generator is a junction — the pair
+                // (App, Generator) is unique, so write via cell_put_keyed
+                // keyed by both roles. Idempotent re-registration of the same
+                // pair is a set-semantic no-op; a fresh pair gets its own
+                // Map entry. On the defensive KeyConflict path (same pair
+                // with different non-key roles — structurally impossible for
+                // this two-role fact) keep prior state.
                 opt_in_pairs.iter().for_each(|(app, g)| {
-                    state = ast::cell_push("App_uses_Generator",
-                        ast::fact_from_pairs(&[("App", app.as_str()), ("Generator", g.as_str())]),
-                        &state);
+                    let fact = ast::fact_from_pairs(&[("App", app.as_str()), ("Generator", g.as_str())]);
+                    state = ast::cell_put_keyed("App_uses_Generator", &["App", "Generator"], fact, &state)
+                        .unwrap_or_else(|_| state.clone());
                 });
                 // `sql:trigger:*` DDL is already emitted by
                 // `compile::compile_to_defs_state` (see compile.rs:1363

@@ -2085,17 +2085,21 @@ fn transition_via_defs(
             // subject role of an SM trigger FT is the SM noun itself
             // (e.g. `Task is finished` → cell `Task_is_finished`, role
             // `Task`).
+            // W2 (task-932): trigger FT cells are functional — `Task is
+            // finished` has exactly one row per Task (unary fact, keyed by
+            // the SM noun role). Write via cell_put_keyed by that role so
+            // re-firing the same transition is a set-semantic no-op (same
+            // key, same value) rather than a silent duplicate append.
+            // The `already_present` guard was the old idempotency mechanism;
+            // cell_put_keyed enforces it structurally. On the defensive
+            // KeyConflict path (identical re-fire) keep prior state.
             let trigger_cell = event.replace(' ', "_");
-            let already_present = ast::fetch_cell_seq(&trigger_cell, &new_state)
-                .as_seq()
-                .map(|facts| facts.iter().any(|f| ast::binding_matches(f, &noun, entity_id)))
-                .unwrap_or(false);
-            if !already_present {
-                new_state = ast::cell_push(
-                    &trigger_cell,
-                    ast::fact_from_pairs(&[(noun.as_str(), entity_id)]),
-                    &new_state);
-            }
+            new_state = ast::cell_put_keyed(
+                &trigger_cell,
+                &[noun.as_str()],
+                ast::fact_from_pairs(&[(noun.as_str(), entity_id)]),
+                &new_state)
+                .unwrap_or(new_state);
         }
     }
 
