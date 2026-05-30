@@ -4838,6 +4838,67 @@ ViewElement has Component Role. *
         "all compiled menu VEs must have Component Role 'button'; got {:?}", role_vals);
 }
 
+// task-934-3(b): command::menu_component_role projects the iFactr IMenu widget
+// role for an entity's legal transitions from the SAME compiled menu reading
+// (view-menu.md). The transitions ARE the menu (their consumer is the state
+// machine); the role ('button') is DERIVED, not hardcoded. Proves the
+// hateoas_via_rho enrichment: a non-terminal entity's transitions self-describe
+// as buttons; a terminal entity (no departing transitions) yields no menu.
+#[test]
+fn menu_component_role_types_legal_transitions_as_button() {
+    let src = r#"# task-934-3 authored menu view (component_role wiring)
+Resource(.Reference) is an entity type.
+Reference is a value type.
+Status is a value type.
+Transition(.id) is an entity type.
+id is a value type.
+State Machine Definition(.Name) is an entity type.
+Name is a value type.
+Noun(.NounName) is an entity type.
+NounName is a value type.
+ViewElement(.veid) is an entity type.
+veid is a value type.
+Component Role is a value type.
+
+## Fact Types
+Resource is currently in Status.
+Transition is from Status.
+Transition is defined in State Machine Definition.
+State Machine Definition is for Noun.
+Resource is instance of Noun.
+ViewElement renders Transition. *
+ViewElement has Component Role. *
+
+## Derivation Rules
+* ViewElement (E) renders Transition (Tr) iff Resource is currently in Status and Transition (Tr) is from Status and Transition (Tr) is defined in State Machine Definition and State Machine Definition is for Noun and Resource is instance of Noun.
+* ViewElement (E) has Component Role 'button' iff Resource is currently in Status and Transition (Tr) is from Status and Transition (Tr) is defined in State Machine Definition and State Machine Definition is for Noun and Resource is instance of Noun.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let defs = compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+    let pop = {
+        let push = |s, cell: &str, pairs: &[(&str, &str)]|
+            ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+        let s = d.clone();
+        let s = push(s, "Resource_is_currently_in_Status", &[("Resource", "task-1"), ("Status", "pending")]);
+        let s = push(s, "Resource_is_currently_in_Status", &[("Resource", "task-2"), ("Status", "deleted")]);
+        let s = push(s, "Transition_is_from_Status", &[("Transition", "start"), ("Status", "pending")]);
+        let s = push(s, "Transition_is_from_Status", &[("Transition", "delete-from-pending"), ("Status", "pending")]);
+        let s = push(s, "Transition_is_defined_in_State_Machine_Definition", &[("Transition", "start"), ("State Machine Definition", "TaskSM")]);
+        let s = push(s, "Transition_is_defined_in_State_Machine_Definition", &[("Transition", "delete-from-pending"), ("State Machine Definition", "TaskSM")]);
+        let s = push(s, "State_Machine_Definition_is_for_Noun", &[("State Machine Definition", "TaskSM"), ("Noun", "Task")]);
+        let s = push(s, "Resource_is_instance_of_Noun", &[("Resource", "task-1"), ("Noun", "Task")]);
+        let s = push(s, "Resource_is_instance_of_Noun", &[("Resource", "task-2"), ("Noun", "Task")]);
+        s
+    };
+    // task-1 (pending, 2 legal transitions) → the DERIVED iFactr IMenu role 'button'.
+    assert_eq!(crate::command::menu_component_role(&pop, "task-1").as_deref(), Some("button"),
+        "an entity with legal transitions gets the derived iFactr IMenu role 'button'");
+    // task-2 (deleted = terminal, no departing transitions) → no menu element → None.
+    assert_eq!(crate::command::menu_component_role(&pop, "task-2"), None,
+        "a terminal entity has no menu element → None (no procedural fallback)");
+}
+
 // ─── task-934-3a: VERIFIED METAMODEL FACT-TYPE NAMES ────────────────────────
 //
 // The following names have been verified against readings/core/state.md,

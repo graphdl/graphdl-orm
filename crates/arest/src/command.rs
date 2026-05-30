@@ -289,6 +289,13 @@ pub struct TransitionAction {
     pub target_status: String,
     pub method: String,
     pub href: String,
+    /// task-934-3(b): the iFactr IMenu widget role for this transition, derived
+    /// from the menu view (readings/ui/view-menu.md) — every legal transition
+    /// from the current status is typed 'button'. The transitions ARE the menu
+    /// (their consumer is the state machine), so each self-describes its derived
+    /// widget. None where ui-readings is compiled out (no menu view: def).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_role: Option<String>,
 }
 
 /// Theorem 4b: navigation link — parent/child relationship from UC projections.
@@ -405,6 +412,7 @@ pub fn decode_command_result(obj: &ast::Object) -> CommandResult {
                         target_status: t.get("targetStatus")?.as_str()?.to_string(),
                         method: t.get("method")?.as_str()?.to_string(),
                         href: t.get("href")?.as_str()?.to_string(),
+                        component_role: t.get("componentRole").and_then(|v| v.as_str()).map(String::from),
                     })
                 }).collect()).unwrap_or_default();
             let violations = parsed.get("violations").and_then(|v| v.as_array())
@@ -461,6 +469,7 @@ pub fn decode_command_result(obj: &ast::Object) -> CommandResult {
                 target_status: parts.get(1)?.as_atom()?.to_string(),
                 method: parts.get(2)?.as_atom()?.to_string(),
                 href: parts.get(3)?.as_atom()?.to_string(),
+                component_role: None,
             })
         }).collect()
     }).unwrap_or_default();
@@ -3982,6 +3991,11 @@ fn hateoas_via_rho(
         d,
     );
 
+    // task-934-3(b): the iFactr IMenu widget role for this entity's legal
+    // transitions, resolved from the menu view (view-menu.md). The transitions
+    // ARE the menu, so each self-describes its derived widget ('button').
+    let menu_role = menu_component_role(d, entity_id);
+
     result.as_seq().map(|triples| {
         triples.iter().filter_map(|t| {
             let items = t.as_seq()?;
@@ -4002,9 +4016,41 @@ fn hateoas_via_rho(
                     "/api/entities/{}/{}/transition?event={}",
                     encoded, entity_id, event_encoded,
                 ),
+                component_role: menu_role.clone(),
             })
         }).collect()
     }).unwrap_or_default()
+}
+
+/// task-934-3(b): the iFactr IMenu widget role for an entity's legal
+/// transitions, resolved from the menu view (readings/ui/view-menu.md). That
+/// derivation types every legal transition from the entity's current status as
+/// a 'button' (the action menu IS the SM transitions — Theorem 4 as a view).
+/// Returns the derived role, or None where ui-readings is compiled out (no
+/// `view:ViewElement_renders_Transition` def → resolve_view yields None) or the
+/// entity is in a terminal status (no departing transitions → no menu element).
+///
+/// Uniform across an entity's transitions in this slice (the rule assigns
+/// 'button' to every legal transition), so the role is read once and applied to
+/// each TransitionAction. Per-transition roles (guard-filtered menus) are a
+/// later view-menu slice.
+pub(crate) fn menu_component_role(d: &ast::Object, entity_id: &str) -> Option<String> {
+    // The menu ViewElements rendering THIS entity's transitions — the skolem
+    // frontier carries Resource = the entity, so filter on it.
+    let renders = ast::resolve_view("ViewElement_renders_Transition", d, d)?;
+    let my_ves: hashbrown::HashSet<String> = renders.as_seq()
+        .map(|items| items.iter()
+            .filter(|f| ast::binding(f, "Resource") == Some(entity_id))
+            .filter_map(|f| ast::binding(f, "ViewElement").map(String::from))
+            .collect())
+        .unwrap_or_default();
+    if my_ves.is_empty() { return None; }
+    // Their Component Role (the shared ViewElement_has_Component_Role cell,
+    // filtered to this entity's menu ViewElements).
+    let roles = ast::resolve_view("ViewElement_has_Component_Role", d, d)?;
+    roles.as_seq().and_then(|items| items.iter()
+        .find(|f| ast::binding(f, "ViewElement").map_or(false, |v| my_ves.contains(v)))
+        .and_then(|f| ast::binding(f, "Component Role").map(String::from)))
 }
 
 /// task-965: HTTP method for a target status, lifted from a Rust literal
@@ -4469,6 +4515,7 @@ mod tests {
             transitions: vec![TransitionAction {
                 event: "place".into(), target_status: "Placed".into(),
                 method: "POST".into(), href: "/orders/ord-1/transition".into(),
+                component_role: None,
             }],
             navigation: vec![],
             violations: vec![],
