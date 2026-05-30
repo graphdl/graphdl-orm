@@ -1349,6 +1349,13 @@ fn resolve_derivation_rule(
         let verb_opt = (!verb.is_empty()).then_some(verb);
         catalog.resolve(&role_refs, verb_opt)
             .or_else(|| catalog.resolve(&role_refs, None))
+            // #963: objectified-pivot abbreviation. A 4-role objectified FT
+            // (`X pivots A is implemented by B at C`) is referenced in rule
+            // bodies by its abbreviated 3-role reading with the trailing
+            // `at C` dropped. Both exact lookups above miss on the 3-vs-4
+            // noun-set mismatch, so the binding never forms; fall back to a
+            // superset-by-one reading-prefix match.
+            .or_else(|| catalog.resolve_objectified_abbrev(&role_refs, &cleaned))
     };
 
     // A derivation CONSEQUENT must name a fact type that actually exists.
@@ -2144,6 +2151,36 @@ impl SchemaCatalog {
             )
             .map(|(id, _, _)| id.clone())
     }
+
+    /// Objectified-pivot abbreviation fallback (#963). An objectified fact
+    /// type declared with a trailing reference role —
+    /// `X pivots A is implemented by B at C` (4 roles) — is referenced in
+    /// rule bodies by its abbreviated reading `X pivots A is implemented by
+    /// B` (3 role-refs; the trailing `at C` dropped). The exact noun-set
+    /// lookup in `resolve` misses because the stored key carries 4 nouns
+    /// and the abbreviated clause yields 3. Match the fact type whose
+    /// noun-set is the query set plus exactly one extra noun AND whose
+    /// reading equals the clause once a trailing ` at <Role>` is removed.
+    /// Narrow by construction — only consulted after both `resolve`
+    /// attempts return None — so it can only bind a clause that was
+    /// otherwise unresolved.
+    fn resolve_objectified_abbrev(&self, role_nouns: &[&str], clause: &str) -> Option<String> {
+        let mut qkey: Vec<String> = role_nouns.iter()
+            .map(|n| parse_role_token(n).0.to_lowercase())
+            .collect();
+        qkey.sort();
+        let norm = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let clause_norm = norm(&clause.to_lowercase());
+        self.by_noun_set.iter()
+            .filter(|(k, _)| k.len() == qkey.len() + 1)
+            .filter(|(k, _)| qkey.iter().all(|n| k.contains(n)))
+            .flat_map(|(_, entries)| entries.iter())
+            .find(|(_, _, reading)| {
+                reading.split(" at ").next()
+                    .map_or(false, |head| norm(head) == clause_norm)
+            })
+            .map(|(id, _, _)| id.clone())
+    }
 }
 
 
@@ -2414,6 +2451,83 @@ fn peel_trailing_comparator(text: &str) -> Option<(String, &'static str, f64)> {
 // =========================================================================
 // Instance fact parsing (state machines)
 // =========================================================================
+
+#[cfg(test)]
+mod objectified_pivot_tests {
+    use super::*;
+
+    // #963: a 4-role objectified fact type
+    //   `ImplementationBinding pivots Component is implemented by Toolkit at Toolkit Symbol`
+    // is referenced in rule bodies by its abbreviated 3-role reading
+    //   `ImplementationBinding pivots Component is implemented by Toolkit`
+    // with the trailing `at Toolkit Symbol` dropped. The exact noun-set
+    // lookup misses (3-set query vs the stored 4-set key), so without the
+    // abbreviation fallback the antecedent never binds and every derived
+    // preference scores zero.
+    #[test]
+    fn objectified_pivot_abbreviation_resolves() {
+        let pivot_id =
+            "ImplementationBinding_pivots_Component_is_implemented_by_Toolkit_at_Toolkit_Symbol";
+        let mut cat = SchemaCatalog::new();
+        cat.register(
+            pivot_id,
+            &["ImplementationBinding", "Component", "Toolkit", "Toolkit Symbol"],
+            "pivots",
+            "ImplementationBinding pivots Component is implemented by Toolkit at Toolkit Symbol",
+        );
+
+        // Exact 4-role lookup still resolves (no regression).
+        assert_eq!(
+            cat.resolve(
+                &["ImplementationBinding", "Component", "Toolkit", "Toolkit Symbol"],
+                Some("pivots"),
+            ).as_deref(),
+            Some(pivot_id),
+        );
+
+        // The abbreviated 3-role clause misses BOTH exact lookups...
+        assert!(cat
+            .resolve(&["ImplementationBinding", "Component", "Toolkit"], Some("pivots"))
+            .is_none());
+        assert!(cat
+            .resolve(&["ImplementationBinding", "Component", "Toolkit"], None)
+            .is_none());
+
+        // ...but resolves through the objectified-pivot abbreviation fallback.
+        assert_eq!(
+            cat.resolve_objectified_abbrev(
+                &["ImplementationBinding", "Component", "Toolkit"],
+                "ImplementationBinding pivots Component is implemented by Toolkit",
+            ).as_deref(),
+            Some(pivot_id),
+        );
+    }
+
+    // The fallback is narrow by construction: a same-noun subset whose
+    // reading is NOT the stored reading's `at`-truncation must not bind,
+    // and a subset that is not exactly one noun short must not bind.
+    #[test]
+    fn objectified_pivot_abbreviation_stays_narrow() {
+        let mut cat = SchemaCatalog::new();
+        cat.register(
+            "ImplementationBinding_pivots_Component_is_implemented_by_Toolkit_at_Toolkit_Symbol",
+            &["ImplementationBinding", "Component", "Toolkit", "Toolkit Symbol"],
+            "pivots",
+            "ImplementationBinding pivots Component is implemented by Toolkit at Toolkit Symbol",
+        );
+        // Same 3-noun subset, different verb/reading → no spurious match.
+        assert!(cat.resolve_objectified_abbrev(
+            &["ImplementationBinding", "Component", "Toolkit"],
+            "ImplementationBinding pivots Component is rendered by Toolkit",
+        ).is_none());
+        // Two nouns short of the stored 4-set key → no match (must be
+        // exactly one extra noun).
+        assert!(cat.resolve_objectified_abbrev(
+            &["ImplementationBinding", "Component"],
+            "ImplementationBinding pivots Component",
+        ).is_none());
+    }
+}
 
 #[cfg(test)]
 mod regex_replacement_tests {
