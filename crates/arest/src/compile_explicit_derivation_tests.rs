@@ -5017,6 +5017,84 @@ User is permitted Operation on Noun. **
         "bob (no role) must have no permissions; got {:?}", perms);
 }
 
+// Subtype membership is realised relationally as a joinable DISCRIMINATOR
+// (Halpin absorption/separation: a subtype-table FK, a non-null subtype
+// column, a unary flag, or an enum). So the categorical authz join is
+// authorable TODAY over that discriminator — it does NOT need the structural
+// `X is a Y` declaration to be a join antecedent (that lift is pure
+// procedural-removal; see task subtype-join-antecedent). Here the
+// discriminator is the VALUE TYPE `Access Level` (an absorbed-subtype enum);
+// `User has Access Level` ⋈ `Access Level permits Operation on Noun` joins on
+// it via the hoisted bridge-key path (1d3d3ebf), binding (User, Operation,
+// Noun). This is the deployable, non-colliding form of the authz gate
+// (`Access Level` does not collide with core's `Role(.id)`), and it proves a
+// VALUE-TYPE bridge key works (the sibling test above used an entity).
+#[test]
+fn authorization_via_subtype_discriminator_enum() {
+    let src = r#"
+User(.Username) is an entity type.
+Username is a value type.
+Access Level is a value type.
+Operation(.OpName) is an entity type.
+OpName is a value type.
+Noun(.NounName) is an entity type.
+NounName is a value type.
+
+## Fact Types
+User has Access Level.
+Access Level permits Operation on Noun.
+User is authorized for Operation on Noun. **
+
+## Derivation Rules
+* User is authorized for Operation on Noun iff User has Access Level and Access Level permits Operation on Noun.
+"#;
+    let state = parse_to_state(src).expect("subtype-discriminator authz model must parse");
+    let defs = compile::compile_to_defs_state(&state);
+    let d0 = ast::defs_to_state(&defs, &state);
+
+    let push = |s, cell: &str, pairs: &[(&str, &str)]|
+        ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+    let d = {
+        let s = d0.clone();
+        // alice is an admin (the discriminator), bob a viewer.
+        let s = push(s, "User_has_Access_Level", &[("User", "alice"), ("Access Level", "admin")]);
+        let s = push(s, "User_has_Access_Level", &[("User", "bob"), ("Access Level", "viewer")]);
+        // admin may Delete + Edit Task; viewer may only Read Task.
+        let s = push(s, "Access_Level_permits_Operation_on_Noun", &[("Access Level", "admin"), ("Operation", "Delete"), ("Noun", "Task")]);
+        let s = push(s, "Access_Level_permits_Operation_on_Noun", &[("Access Level", "admin"), ("Operation", "Edit"), ("Noun", "Task")]);
+        let s = push(s, "Access_Level_permits_Operation_on_Noun", &[("Access Level", "viewer"), ("Operation", "Read"), ("Noun", "Task")]);
+        s
+    };
+
+    let refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &d)))
+        .collect();
+    let refs: Vec<(&str, &ast::Func)> = refs_owned.iter().map(|(n, f)| (n.as_str(), f)).collect();
+    let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+
+    let cell = ast::fetch_cell_seq("User_is_authorized_for_Operation_on_Noun", &new_d);
+    let perms: Vec<(String, String, String)> = cell.as_seq()
+        .map(|items| items.iter().filter_map(|f| {
+            let u = ast::binding(f, "User")?.to_string();
+            let op = ast::binding(f, "Operation")?.to_string();
+            let n = ast::binding(f, "Noun")?.to_string();
+            Some((u, op, n))
+        }).collect())
+        .unwrap_or_default();
+
+    assert!(perms.iter().any(|(u, op, n)| u == "alice" && op == "Delete" && n == "Task"),
+        "alice (admin discriminator) must be authorized Delete on Task; got {:?}", perms);
+    assert!(perms.iter().any(|(u, op, n)| u == "alice" && op == "Edit" && n == "Task"),
+        "alice (admin) must be authorized Edit on Task; got {:?}", perms);
+    assert!(perms.iter().any(|(u, op, n)| u == "bob" && op == "Read" && n == "Task"),
+        "bob (viewer) must be authorized Read on Task; got {:?}", perms);
+    assert!(!perms.iter().any(|(u, op, _)| u == "alice" && op == "Read"),
+        "alice (admin) must NOT be authorized Read here (admin doesn't permit it); got {:?}", perms);
+    assert!(!perms.iter().any(|(u, op, _)| u == "bob" && op == "Delete"),
+        "bob (viewer) must NOT be authorized Delete; got {:?}", perms);
+}
+
 // crudl-menu-projection (authz, OBJECTIFIED): the role-based permission gate as
 // a skolem-minted Grant, mirroring the proven view-derivation Join+skolem path
 // (which is the ONLY path that cross-antecedent-joins; see
