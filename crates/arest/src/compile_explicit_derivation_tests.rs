@@ -3573,3 +3573,310 @@ ViewElement 'e2' renders Fact Type 'ft2'.
          Got pairs: {:?}", widget_pairs);
 }
 
+// ─── Category 6b: Count over a complex `where`-body (ring + literal) ──
+//
+// Repro for the count-aggregate parsing gap. Shape:
+//   `* Item has Open Dep Count iff Open Dep Count is the count of Item1
+//      where Item1 blocks the Item and Item1 has Status 'open'.`
+//
+// The `where`-body is MULTI-CLAUSE, traverses a same-noun RING FT
+// (`Item blocks Item`), and ends in a LITERAL status filter
+// (`Item1 has Status 'open'`). The counted entity is `Item1` (the
+// blocker); the group key is `Item` (the blocked subject); only blockers
+// whose Status is 'open' should be counted.
+//
+// Pre-fix, `try_parse_aggregate_clause` handed the ENTIRE multi-clause
+// where-body to a single `resolve_fact_type`, which could not resolve a
+// multi-clause string with a trailing literal — so either the aggregate
+// never formed (rule misrouted) or the trailing `'open'` literal leaked
+// into the derived value. Either way the count is wrong.
+//
+// Population for one subject `item-A`:
+//   blk-1 blocks item-A, blk-1 Status='open'    → counts
+//   blk-2 blocks item-A, blk-2 Status='open'    → counts
+//   blk-3 blocks item-A, blk-3 Status='closed'  → filtered out
+// Expected: Open Dep Count = 2 for item-A (NOT a literal "open"/"closed",
+// NOT 3, NOT nothing).
+#[test]
+fn shape_aggregate_count_over_ring_with_literal_filter() {
+    let src = r#"# Test
+Item(.ID) is an entity type.
+ID is a value type.
+Status is a value type.
+Open Dep Count is a value type.
+
+## Fact Types
+Item has ID.
+Item blocks Item.
+Item has Status.
+Item has Open Dep Count.
+
+## Derivation Rules
+* Item has Open Dep Count iff Open Dep Count is the count of Item1 where Item1 blocks the Item and Item1 has Status 'open'.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    // The rule must route to the aggregate compiler.
+    assert!(!rule.consequent_aggregates.is_empty(),
+        "consequent_aggregates must be populated so the rule routes to \
+         compile_aggregate_derivation; got {:#?}\nrule text: {}",
+        rule.consequent_aggregates, rule.text);
+    let agg = &rule.consequent_aggregates[0];
+    assert_eq!(agg.op, "count", "aggregate op must be count, got {}", agg.op);
+    assert_eq!(agg.role, "Open Dep Count",
+        "aggregate result role, got {}", agg.role);
+    // Source FT is the ring relation `Item blocks Item`.
+    assert_eq!(agg.source_fact_type_id, "Item_blocks_Item",
+        "aggregate source FT must be the ring `Item blocks Item`, got {}",
+        agg.source_fact_type_id);
+    // The literal filter `Item1 has Status 'open'` must be captured as an
+    // aggregate filter over the counted blocker, not dropped.
+    assert_eq!(agg.filters.len(), 1,
+        "the `Item1 has Status 'open'` where-clause must become one aggregate \
+         filter; got {:#?}", agg.filters);
+    let f = &agg.filters[0];
+    assert_eq!(f.ref_fact_type_id, "Item_has_Status");
+    assert_eq!(f.filter_role, "Status");
+    assert_eq!(f.value, "open");
+
+    // item-A: two OPEN blockers (blk-1, blk-2) + one CLOSED blocker (blk-3).
+    // The ring `Item blocks Item` carries <blocker, blocked> with both
+    // roles named `Item` (positional). The literal filter `Item1 has
+    // Status 'open'` restricts the counted blocker.
+    let out = apply_to_facts(&func, &[
+        ("Item_blocks_Item", &[("Item", "blk-1"), ("Item", "item-A")]),
+        ("Item_blocks_Item", &[("Item", "blk-2"), ("Item", "item-A")]),
+        ("Item_blocks_Item", &[("Item", "blk-3"), ("Item", "item-A")]),
+        ("Item_has_Status",  &[("Item", "blk-1"), ("Status", "open")]),
+        ("Item_has_Status",  &[("Item", "blk-2"), ("Status", "open")]),
+        ("Item_has_Status",  &[("Item", "blk-3"), ("Status", "closed")]),
+    ]);
+    let derived = decode_derived(&out);
+    assert!(!derived.is_empty(),
+        "at least one aggregate derivation expected for item-A, got nothing");
+
+    // The derived value for item-A's Open Dep Count must be the integer 2
+    // (the two open blockers), NOT a literal status string and NOT 3.
+    let count_for_a: Option<String> = derived.iter().find_map(|(_, _, bindings)| {
+        let is_a = bindings.iter().any(|(k, v)| k == "Item" && v == "item-A");
+        if !is_a { return None; }
+        bindings.iter()
+            .find(|(k, _)| k == "Open Dep Count")
+            .map(|(_, v)| v.clone())
+    });
+    let count_for_a = count_for_a.unwrap_or_else(|| panic!(
+        "no Open Dep Count binding for item-A in derivations: {:#?}", derived));
+    assert_eq!(count_for_a, "2",
+        "Open Dep Count for item-A must be 2 (blk-1, blk-2 are open; blk-3 is \
+         closed). Got `{}` — a literal status string or wrong count means the \
+         where-body filter/target was mis-parsed.\nfull derived: {:#?}",
+        count_for_a, derived);
+}
+
+// ─── Category 6d: empty-image aggregate fold = the operator's unit ──────
+//
+// Backus §11.2.4: `/f:<>` is the right unit of `f`. The aggregate compiler
+// emits sum as `(/+) ∘ α(target ∘ s2) ∘ Filter(key) ∘ image_pairs` and count
+// as `length ∘ Filter(key) ∘ image_pairs`. When the inner image is EMPTY the
+// fold sees `<>`; with `ast::unit_of` that now yields the unit (0 for +,
+// `length:<>` = 0) rather than ⊥ — the empty-set value Backus prescribes.
+//
+// This test exercises that EXACT emitted Func shape directly over an empty
+// input (the part of the aggregate pipeline downstream of the image, fed an
+// empty pair Seq) so the empty-fold path is reached deterministically:
+//   - sum  `(/+) ∘ α(s2):<>`        ⇒ "0"   (was ⊥ before the unit fix)
+//   - count `length:<>`             ⇒ "0"
+//
+// NOTE on the *whole-rule* count-over-empty case (a subject whose `where`
+// matches nothing): with the in-tree aggregate-filter semi-join, a subject
+// whose source rows are all filtered out is dropped from the group-key
+// enumeration entirely, so it derives NO row at all (count absent, observed),
+// independent of this fold-unit fix — the empty group never reaches the fold.
+// An enumerated group always contains at least its own outer row, so the
+// empty fold is not reachable through the aggregate compiler for a present
+// subject; the reachable empty-fold consumer is the universal-quantifier
+// fold (`shape_universal_for_each_over_ring_with_literal_predicate`'s
+// vacuous item-C), which this fix is what makes correct without a guard.
+#[test]
+fn aggregate_fold_over_empty_image_is_operator_unit() {
+    use ast::Func;
+    // The aggregate sum fold shape, applied to an empty projected image.
+    // `(/+) ∘ α(Selector(2))` over `<>` reduces to `/+:<>` = unit(+) = 0.
+    let sum_fold = Func::compose(
+        Func::insert(Func::Add),
+        Func::apply_to_all(Func::Selector(2)),
+    );
+    assert_eq!(
+        ast::apply(&sum_fold, &Object::phi(), &Object::phi()),
+        Object::atom("0"),
+        "empty SUM image must fold to the + unit 0 (Backus /+:<>), not Bottom",
+    );
+    // The count fold shape: `length:<>` = 0 (length carries its own empty case).
+    let count_fold = Func::Length;
+    assert_eq!(
+        ast::apply(&count_fold, &Object::phi(), &Object::phi()),
+        Object::atom("0"),
+        "empty COUNT image must be 0",
+    );
+}
+
+// ─── Category 6c: the verified-live repro vocabulary (multi-word enum) ─
+//
+// Exact-shape regression for the originally-reported bug: a `Task blocks
+// Task` ring + the MULTI-WORD enum-valued `Task has Task Status` filter
+// ending in a `'pending'` literal. The live reading
+//   `* Task has Open Blocker Count iff Open Blocker Count is the count of
+//      Task1 where Task1 blocks the Task and Task1 has Task Status
+//      'pending'.`
+// produced the literal `"pending"` (or a wrong count) instead of counting
+// the pending blockers. This guards the two-word filter-role path (the
+// trailing literal binds the LAST role, `Task Status`, not `Task`).
+#[test]
+fn shape_aggregate_count_live_repro_task_blocks_task_pending() {
+    let src = r#"# Test
+Task(.ID) is an entity type.
+ID is a value type.
+Task Status is a value type.
+Open Blocker Count is a value type.
+
+## Fact Types
+Task has ID.
+Task blocks Task.
+Task has Task Status.
+Task has Open Blocker Count.
+
+## Derivation Rules
+* Task has Open Blocker Count iff Open Blocker Count is the count of Task1 where Task1 blocks the Task and Task1 has Task Status 'pending'.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    assert!(!rule.consequent_aggregates.is_empty(),
+        "live-repro aggregate must populate consequent_aggregates; got {:#?}\n\
+         rule text: {}", rule.consequent_aggregates, rule.text);
+    let agg = &rule.consequent_aggregates[0];
+    assert_eq!(agg.op, "count");
+    assert_eq!(agg.source_fact_type_id, "Task_blocks_Task");
+    assert_eq!(agg.filters.len(), 1,
+        "the `Task1 has Task Status 'pending'` clause must become an aggregate \
+         filter; got {:#?}", agg.filters);
+    let f = &agg.filters[0];
+    assert_eq!(f.ref_fact_type_id, "Task_has_Task_Status");
+    assert_eq!(f.filter_role, "Task Status",
+        "the multi-word LAST role must be the filter role, got {}", f.filter_role);
+    assert_eq!(f.value, "pending");
+
+    // subj-1: two pending blockers (p1, p2) + one done blocker (d1).
+    let out = apply_to_facts(&func, &[
+        ("Task_blocks_Task",    &[("Task", "p1"), ("Task", "subj-1")]),
+        ("Task_blocks_Task",    &[("Task", "p2"), ("Task", "subj-1")]),
+        ("Task_blocks_Task",    &[("Task", "d1"), ("Task", "subj-1")]),
+        ("Task_has_Task_Status", &[("Task", "p1"), ("Task Status", "pending")]),
+        ("Task_has_Task_Status", &[("Task", "p2"), ("Task Status", "pending")]),
+        ("Task_has_Task_Status", &[("Task", "d1"), ("Task Status", "done")]),
+    ]);
+    let derived = decode_derived(&out);
+    let count: Option<String> = derived.iter().find_map(|(_, _, b)| {
+        if !b.iter().any(|(k, v)| k == "Task" && v == "subj-1") { return None; }
+        b.iter().find(|(k, _)| k == "Open Blocker Count").map(|(_, v)| v.clone())
+    });
+    let count = count.unwrap_or_else(|| panic!(
+        "no Open Blocker Count for subj-1 in {:#?}", derived));
+    assert_eq!(count, "2",
+        "Open Blocker Count for subj-1 must be 2 (p1, p2 pending; d1 done), \
+         NOT the literal 'pending'. Got `{}`\nfull derived: {:#?}", count, derived);
+}
+
+// ─── Category 14: Universal quantifier ("for each") over a ring + literal ─
+//
+// Repro for the universal-quantifier compilation gap. Shape:
+//   `* Item is clear iff for each Item1 that blocks the Item,
+//      Item1 has Status 'done'.`
+//
+// The ENTIRE antecedent is the universal `for each <X> that <R> the
+// <Subject>, <X has P>`. Pre-fix, `resolve_derivation_rule`'s classifier
+// recognised the universal via `is_universal_quantifier_clause` and then
+// `continue`d — DROPPING it. With no surviving antecedent the rule fell
+// onto the 0-antecedent path and either derived `clear` for nothing or
+// (worse) emitted a single constant fact. Either way the per-subject
+// universal semantics were lost.
+//
+// The compiled form is the Backus fold ∀x∈S. P(x) = (/∧) ∘ (αP), filtered
+// to the X's that R-relate to the subject, with the EMPTY-fold case made
+// VACUOUSLY TRUE (a subject with no blockers is clear).
+//
+// Population (the `Item blocks Item` ring is positional <blocker, blocked>):
+//   item-A: two blockers (a-blk-1, a-blk-2), BOTH Status='done'  → clear
+//   item-B: one blocker  (b-blk-1),          Status='open'       → NOT clear
+//   item-C: NO blockers                                          → clear (VACUOUS)
+//
+// Assertion: the derived `clear` set CONTAINS item-A and item-C, and does
+// NOT contain item-B. (Blockers that are themselves blocker-free Items
+// derive `clear` vacuously too — correct, and not asserted against.)
+#[test]
+fn shape_universal_for_each_over_ring_with_literal_predicate() {
+    let src = r#"# Test
+Item(.ID) is an entity type.
+ID is a value type.
+Status is a value type.
+
+## Fact Types
+Item has ID.
+Item blocks Item.
+Item has Status.
+Item is clear.
+
+## Derivation Rules
+* Item is clear iff for each Item1 that blocks the Item, Item1 has Status 'done'.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    // The universal must be captured as a consequent universal so the rule
+    // compiles to the fold (not dropped, not an empty-antecedent constant).
+    assert!(!rule.consequent_universals.is_empty(),
+        "the `for each` antecedent must populate consequent_universals; got {:#?}\n\
+         rule text: {}\nunresolved: {:#?}",
+        rule.consequent_universals, rule.text, rule.unresolved_clauses);
+    let u = &rule.consequent_universals[0];
+    assert_eq!(u.relation_fact_type_id, "Item_blocks_Item",
+        "the relating FT must be the ring `Item blocks Item`, got {}",
+        u.relation_fact_type_id);
+    assert_eq!(u.predicate_fact_type_id, "Item_has_Status",
+        "the predicate FT must be `Item has Status`, got {}",
+        u.predicate_fact_type_id);
+    assert_eq!(u.predicate_filter_role, "Status");
+    assert_eq!(u.predicate_value, "done");
+
+    // item-A: 2 done blockers → clear. item-B: 1 open blocker → NOT clear.
+    // item-C: seeded via `Item has ID` so it is enumerated as an Item, but
+    // has NO blocker → clear (vacuous). The blockers (a-blk-*, b-blk-1) are
+    // also Items with no blockers of their own, so they derive clear too —
+    // correct (vacuous), and not asserted against here.
+    let out = apply_to_facts(&func, &[
+        ("Item_blocks_Item", &[("Item", "a-blk-1"), ("Item", "item-A")]),
+        ("Item_blocks_Item", &[("Item", "a-blk-2"), ("Item", "item-A")]),
+        ("Item_blocks_Item", &[("Item", "b-blk-1"), ("Item", "item-B")]),
+        ("Item_has_Status",  &[("Item", "a-blk-1"), ("Status", "done")]),
+        ("Item_has_Status",  &[("Item", "a-blk-2"), ("Status", "done")]),
+        ("Item_has_Status",  &[("Item", "b-blk-1"), ("Status", "open")]),
+        ("Item_has_ID",      &[("Item", "item-C"), ("ID", "item-C")]),
+    ]);
+    let derived = decode_derived(&out);
+
+    // Collect the Item values that derived `clear`.
+    let clear: Vec<String> = derived.iter()
+        .filter(|(ft, _, _)| ft == "Item_is_clear")
+        .filter_map(|(_, _, b)| b.iter()
+            .find(|(k, _)| k == "Item").map(|(_, v)| v.clone()))
+        .collect();
+
+    assert!(clear.iter().any(|i| i == "item-A"),
+        "item-A (both blockers done) MUST be clear; got clear set {:?}\nderived: {:#?}",
+        clear, derived);
+    assert!(clear.iter().any(|i| i == "item-C"),
+        "item-C (NO blockers) MUST be clear VACUOUSLY (empty fold = TRUE); \
+         got clear set {:?}\nderived: {:#?}", clear, derived);
+    assert!(!clear.iter().any(|i| i == "item-B"),
+        "item-B (one OPEN blocker) MUST NOT be clear; got clear set {:?}\nderived: {:#?}",
+        clear, derived);
+}
+

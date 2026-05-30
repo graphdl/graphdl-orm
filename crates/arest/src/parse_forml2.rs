@@ -163,10 +163,24 @@ fn expand_that_relatives(
             let tail = &current[i + marker.len()..];
             let tail_trim = tail.trim_start();
             if is_that_anaphora_ref(tail_trim, noun_names) { return false; }
+            let head = &current[..i];
+            // Don't expand a `that` inside a universal-quantifier clause
+            // (`for each X that R the Subject, …`). The universal is
+            // classified whole later; splitting it on `that` would
+            // shatter the quantified restriction into a stray ` and `
+            // conjunction (`for each X and Subject R the Subject`), so
+            // the `for each` recognizer never fires. The head's current
+            // clause segment is the text after the last top-level
+            // ` and ` — if it opens with a quantifier keyword, skip.
+            let clause_seg = head.rsplit(" and ").next().unwrap_or(head);
+            if crate::parse_forml2_stage2::UniversalQuantifierTable::boot()
+                .match_prefix(clause_seg.trim_start()).is_some()
+            {
+                return false;
+            }
             // Only expand when the head — text up to this marker —
             // resolves to a declared FT. Otherwise leave the clause
             // for downstream classifiers to handle whole.
-            let head = &current[..i];
             head_resolves(head, noun_names, catalog)
         });
         let Some(pos) = expand_at else { break; };
@@ -1021,9 +1035,19 @@ fn try_parse_aggregate_clause(text: &str, noun_names: &[String]) -> Option<(Stri
     // declared: derivation rules may introduce implicit role names
     // for derived aggregates (e.g. `done Task Count`) that never
     // appear as standalone entity / value types.
+    //
+    // Halpin ring subscripts: a counted entity in a self-ring `where`-body
+    // is referenced subscripted (`count of Item1 where Item1 blocks the
+    // Item`). The subscripted token isn't a declared noun, so strip the
+    // trailing ASCII-digit subscript (via parse_role_token) before the
+    // catalog check while leaving `target` verbatim for the positional
+    // role resolution downstream.
+    let target_base = parse_role_token(&target).0;
+    let first_tok_base = target.split_whitespace().next()
+        .map(|first| parse_role_token(first).0);
     let target_resolves = noun_names.iter().any(|n| n == &target)
-        || target.split_whitespace().next()
-            .map_or(false, |first| noun_names.iter().any(|n| n == first));
+        || noun_names.iter().any(|n| n == target_base)
+        || first_tok_base.map_or(false, |first| noun_names.iter().any(|n| n == first));
     if !target_resolves { return None; }
     Some((role, op, target, where_clause))
 }
@@ -1457,29 +1481,188 @@ fn resolve_derivation_rule(
     let mut role_literals: Vec<crate::types::AntecedentRoleLiteral> = Vec::new();
     let mut computed: Vec<crate::types::ConsequentComputedBinding> = Vec::new();
     let mut aggregates: Vec<crate::types::ConsequentAggregate> = Vec::new();
-    for part in antecedent_parts.iter() {
+    let mut universals: Vec<crate::types::ConsequentUniversal> = Vec::new();
+    // Cursor for aggregate where-body absorption. The outer
+    // `split_top_level_and` over `antecedent_text` (line ~1295) breaks an
+    // aggregate's MULTI-CLAUSE `where`-body apart at its top-level ` and `s
+    // — so `… count of Item1 where Item1 blocks the Item and Item1 has
+    // Status 'open'` arrives as TWO parts: the aggregate head (with a
+    // truncated where-body `Item1 blocks the Item`) and a stray
+    // `Item1 has Status 'open'`. When an aggregate head is recognized we
+    // RE-JOIN it with the trailing parts to recover the full where-body,
+    // and advance this cursor past them so the loop doesn't re-process the
+    // absorbed filter clauses as independent antecedents.
+    let mut skip_until: usize = 0;
+    for (part_idx, part) in antecedent_parts.iter().enumerate() {
+        if part_idx < skip_until { continue; }
         // Aggregate clauses (Halpin `<role> is the <op> of <target> where â€¦`).
         // They resolve the where-clause to a source FT and record the
         // group-key role â€” the non-target role on that FT. Match ahead of
         // the generic definitional path so `â€¦ is the count of â€¦` isn't
         // mistaken for arithmetic.
-        if let Some((role, op, target, where_clause)) =
+        if let Some((role, op, target, head_where)) =
             try_parse_aggregate_clause(part, &noun_names)
         {
-            // Resolve where-clause to an FT id via the catalog.
-            let (stripped, _) = split_antecedent_comparator(&where_clause);
-            if let Some(ft_id) = resolve_fact_type(&stripped) {
-                // Group-key role = any role on source FT other than target.
-                let group_key_role = fact_types_map.get(&ft_id)
-                    .and_then(|ft| ft.roles.iter().find(|r| r.noun_name != target))
+            // Recover the FULL where-body: the aggregate head carries only
+            // the first where-clause (`head_where`); subsequent parts are
+            // the remaining top-level ` and `-joined where-clauses. Join
+            // them back and mark them consumed. (An aggregate's `where`
+            // filter extends to the end of the antecedent in FORML2 — the
+            // canonical Halpin examples and the ring-count readings put the
+            // aggregate as the whole/last RHS.)
+            // Only absorb trailing parts when the head actually opened a
+            // `where`-body — a no-where aggregate (`done Task Count is the
+            // count of Task`) must not swallow an unrelated sibling clause.
+            let where_clause = if !head_where.is_empty()
+                && part_idx + 1 < antecedent_parts.len()
+            {
+                let tail = antecedent_parts[part_idx + 1..].join(" and ");
+                skip_until = antecedent_parts.len();
+                format!("{} and {}", head_where, tail)
+            } else {
+                head_where
+            };
+            // The `where`-body may be MULTI-CLAUSE: a source clause that
+            // establishes the counted entity (`Item1 blocks the Item`) plus
+            // zero or more literal-filter clauses over that entity
+            // (`Item1 has Status 'open'`). Split on top-level ` and ` and
+            // classify each sub-clause. A single-clause body (the legacy
+            // `… count of Part where Thing has Part`) yields exactly the
+            // source clause and no filters, so this path is a strict
+            // generalization of the old single-resolve.
+            let where_clauses = split_top_level_and(&where_clause);
+
+            // The counted-entity token is the aggregate target (`Item1`);
+            // its base noun (`Item`) is what the source/filter FTs carry.
+            let target_base = parse_role_token(target.trim()).0.to_string();
+            // The consequent subject noun (`Item` in `Item has Open Dep
+            // Count`) is the group key — it groups the counted entities.
+            let consequent_subject: Option<String> =
+                find_nouns(consequent_text, &noun_names).first()
+                    .map(|(_, _, n)| parse_role_token(n).0.to_string());
+
+            // First pass: find the SOURCE clause — one that resolves to an
+            // FT, carries the target base noun, and is NOT a pure literal
+            // filter (literal filters carry a trailing quoted value and are
+            // handled as restrictions, not the counted relation).
+            let mut source: Option<(String, &str)> = None; // (ft_id, clause)
+            let mut filter_clauses: Vec<&str> = Vec::new();
+            for clause in where_clauses.iter() {
+                let (clause_no_lit, has_lit) =
+                    match strip_trailing_quoted_literal(clause.trim()) {
+                        Some((without, _)) => (without, true),
+                        None => (clause.trim().to_string(), false),
+                    };
+                let (clause_stripped, _) = split_antecedent_comparator(&clause_no_lit);
+                let resolved = resolve_fact_type(&clause_stripped);
+                let carries_target = resolved.as_ref().and_then(|id| fact_types_map.get(id))
+                    .map(|ft| ft.roles.iter().any(|r| r.noun_name == target_base))
+                    .unwrap_or(false);
+                if source.is_none() && !has_lit && carries_target {
+                    source = resolved.map(|id| (id, *clause));
+                } else {
+                    filter_clauses.push(clause);
+                }
+            }
+            // Fallback: if no clause matched the strict source criteria
+            // (e.g. a self-ring source whose target noun matching is
+            // ambiguous), accept the first clause that resolves at all.
+            if source.is_none() {
+                if let Some(pos) = filter_clauses.iter().position(|c| {
+                    let (c_no_lit, has_lit) = match strip_trailing_quoted_literal(c.trim()) {
+                        Some((w, _)) => (w, true), None => (c.trim().to_string(), false),
+                    };
+                    !has_lit && resolve_fact_type(&split_antecedent_comparator(&c_no_lit).0).is_some()
+                }) {
+                    let c = filter_clauses.remove(pos);
+                    let (c_no_lit, _) = match strip_trailing_quoted_literal(c.trim()) {
+                        Some((w, l)) => (w, Some(l)), None => (c.trim().to_string(), None),
+                    };
+                    if let Some(id) = resolve_fact_type(&split_antecedent_comparator(&c_no_lit).0) {
+                        source = Some((id, c));
+                    }
+                }
+            }
+
+            if let Some((ft_id, source_clause)) = source {
+                let src_ft = fact_types_map.get(&ft_id);
+                // Positional role resolution over the SOURCE clause so
+                // self-ring sources (both roles named `Item`) bind the
+                // right position. Walk the clause's nouns in order; the
+                // i-th noun token aligns with the i-th role of the FT
+                // reading. The TARGET position is the token whose text
+                // equals the aggregate target (`Item1`); the GROUP-KEY
+                // position is the other role — preferring the token whose
+                // base noun matches the consequent subject.
+                let clause_tokens: Vec<(String, String)> =
+                    find_nouns(source_clause, &noun_names).into_iter()
+                        .map(|(_, _, n)| (parse_role_token(&n).0.to_string(), n))
+                        .collect();
+                let n_roles = src_ft.map(|ft| ft.roles.len()).unwrap_or(0);
+                // target index: position of a token equal to `target`, else
+                // first token whose base == target_base.
+                let target_index = clause_tokens.iter().position(|(_, full)| full == target.trim())
+                    .or_else(|| clause_tokens.iter().position(|(base, _)| base == &target_base))
+                    .filter(|&i| i < n_roles);
+                // group-key index: a position != target_index, preferring a
+                // token whose base matches the consequent subject.
+                let group_key_index = consequent_subject.as_ref().and_then(|subj| {
+                    clause_tokens.iter().enumerate()
+                        .find(|(i, (base, _))| Some(*i) != target_index && base == subj)
+                        .map(|(i, _)| i)
+                }).or_else(|| {
+                    (0..n_roles).find(|i| Some(*i) != target_index)
+                }).filter(|&i| i < n_roles);
+
+                // Name-based group key kept for back-compat / fallback.
+                let group_key_role = group_key_index
+                    .and_then(|i| src_ft.and_then(|ft| ft.roles.get(i)))
                     .map(|r| r.noun_name.clone())
+                    .or_else(|| src_ft
+                        .and_then(|ft| ft.roles.iter().find(|r| r.noun_name != target_base))
+                        .map(|r| r.noun_name.clone()))
                     .unwrap_or_default();
+
+                // Build aggregate filters from the remaining clauses. Each
+                // must be `<entity> has <role> '<literal>'` over the counted
+                // entity; resolve it to a ref FT and capture the entity
+                // role (matching target_base) + the literal role + value.
+                let mut filters: Vec<crate::types::AggregateFilter> = Vec::new();
+                for clause in filter_clauses.iter() {
+                    let Some((without_lit, lit)) =
+                        strip_trailing_quoted_literal(clause.trim()) else { continue };
+                    let (clause_stripped, _) = split_antecedent_comparator(&without_lit);
+                    let Some(ref_id) = resolve_fact_type(&clause_stripped) else { continue };
+                    let Some(ref_ft) = fact_types_map.get(&ref_id) else { continue };
+                    // Entity role = role on the ref FT matching the counted
+                    // entity's base noun. Filter role = the LAST role (the
+                    // one the trailing literal pins, mirroring how
+                    // antecedent role-literals bind the last role).
+                    let entity_role = ref_ft.roles.iter()
+                        .find(|r| r.noun_name == target_base)
+                        .map(|r| r.noun_name.clone());
+                    let filter_role = ref_ft.roles.last().map(|r| r.noun_name.clone());
+                    if let (Some(entity_role), Some(filter_role)) = (entity_role, filter_role) {
+                        if entity_role != filter_role {
+                            filters.push(crate::types::AggregateFilter {
+                                ref_fact_type_id: ref_id,
+                                entity_role,
+                                filter_role,
+                                value: lit,
+                            });
+                        }
+                    }
+                }
+
                 aggregates.push(crate::types::ConsequentAggregate {
                     role,
                     op,
                     target_role: target,
                     source_fact_type_id: ft_id,
                     group_key_role,
+                    group_key_index,
+                    target_index,
+                    filters,
                 });
             }
             continue;
@@ -1632,13 +1815,119 @@ fn resolve_derivation_rule(
         //      Category C.
         if is_entity_ref_scheme_literal(part, &noun_names) { continue; }
 
-        // (10) Universal quantifier: `for each <Noun> <predicate>`.
-        //      Recognised when the clause starts with `for each` and
-        //      contains a declared noun. The compiled form is a
-        //      population-level restriction; classification here just
-        //      suppresses the noise so legitimate universals don't
-        //      flag as unresolved.
-        if is_universal_quantifier_clause(part, &noun_names) { continue; }
+        // (10) Universal quantifier: `for each <X> that <R> the <Subject>,
+        //      <X has P 'value'>`. Recognised when the clause starts with a
+        //      universal keyword and names a declared noun. Compiled as the
+        //      Backus fold ∀x∈S. P(x) = (/∧) ∘ (αP) restricted to the X's
+        //      that R-relate to the subject (whitepaper §4 / Backus
+        //      §11.2.4). Recorded here as a `ConsequentUniversal`; the
+        //      compiler lowers it to a per-subject guard. It is a POSITIVE
+        //      conjunct (a fold of a positive predicate) — it does not
+        //      violate the positive-derivation discipline above.
+        if is_universal_quantifier_clause(part, &noun_names) {
+            // Strip the quantifier keyword → `<X> that <R> the <Subject>,
+            // <X has P 'value'>`.
+            if let Some(tail) = crate::parse_forml2_stage2::UniversalQuantifierTable::boot()
+                .match_prefix(part.trim())
+            {
+                // Split into the relation clause and the predicate clause at
+                // the first top-level comma. `for each X that R the S, X has
+                // P` — the comma separates the (restriction) relation from
+                // the (body) predicate.
+                if let Some((rel_raw, pred_raw)) = tail.split_once(',') {
+                    let rel_clause = rel_raw.trim();
+                    let pred_clause = pred_raw.trim().trim_end_matches('.').trim();
+
+                    // The consequent subject noun (`Item` in `Item is clear`)
+                    // is the ∀-subject. It is the relating clause's role that
+                    // is NOT the quantified X.
+                    let subject_noun: Option<String> =
+                        find_nouns(consequent_text, &noun_names).first()
+                            .map(|(_, _, n)| parse_role_token(n).0.to_string());
+
+                    // ── Relation clause: `Item1 that blocks the Item` ──
+                    // Quantified X = the FIRST noun token (carries the
+                    // subscript that distinguishes it from the subject in a
+                    // ring). Resolve the FT on the anaphora-stripped form.
+                    let rel_tokens = find_nouns(rel_clause, &noun_names);
+                    let x_token: Option<String> = rel_tokens.first().map(|(_, _, n)| n.clone());
+                    let x_base: Option<String> = x_token.as_ref()
+                        .map(|t| parse_role_token(t).0.to_string());
+
+                    let rel_ft = resolve_fact_type(rel_clause);
+                    // Predicate clause: `Item1 has Status 'done'` — strip the
+                    // trailing quoted literal, resolve the base FT.
+                    let (pred_no_lit, pred_lit) =
+                        match strip_trailing_quoted_literal(pred_clause) {
+                            Some((without, lit)) => (without, Some(lit)),
+                            None => (pred_clause.to_string(), None),
+                        };
+                    let pred_ft = resolve_fact_type(&pred_no_lit);
+
+                    if let (Some(rel_id), Some(pred_id), Some(subject), Some(x_full), Some(x_base), Some(lit)) =
+                        (rel_ft, pred_ft, subject_noun, x_token, x_base, pred_lit)
+                    {
+                        let rel_ft_def = fact_types_map.get(&rel_id);
+                        let pred_ft_def = fact_types_map.get(&pred_id);
+                        if let (Some(rel_ft_def), Some(pred_ft_def)) = (rel_ft_def, pred_ft_def) {
+                            // Positional role alignment over the relation
+                            // clause: walk its noun tokens in declaration
+                            // order, align with the FT's roles (the i-th token
+                            // that matches role i's base noun). The X position
+                            // is the token equal to `x_full`; the subject
+                            // position is the OTHER role.
+                            let rel_aligned = align_tokens_to_roles(&rel_tokens, rel_ft_def);
+                            let relation_x_index = rel_aligned.iter()
+                                .find(|(_, full)| full == &x_full)
+                                .map(|(i, _)| *i)
+                                .or_else(|| rel_aligned.iter()
+                                    .find(|(_, full)| parse_role_token(full).0 == x_base.as_str())
+                                    .map(|(i, _)| *i));
+                            let relation_subject_index = relation_x_index.and_then(|xi| {
+                                // Prefer a role whose base matches the subject
+                                // noun and isn't the X position; else any
+                                // other role position.
+                                rel_aligned.iter()
+                                    .find(|(i, full)| *i != xi
+                                        && parse_role_token(full).0 == subject.as_str())
+                                    .map(|(i, _)| *i)
+                                    .or_else(|| (0..rel_ft_def.roles.len()).find(|i| *i != xi))
+                            });
+
+                            // Predicate clause role alignment: X is the role
+                            // matching the quantified entity's base noun; the
+                            // filter role is the LAST role (the trailing
+                            // literal pins it, mirroring antecedent role
+                            // literals).
+                            let predicate_x_index = pred_ft_def.roles.iter()
+                                .position(|r| r.noun_name == x_base);
+                            let filter_role = pred_ft_def.roles.last()
+                                .map(|r| r.noun_name.clone());
+
+                            if let (Some(rx), Some(rs), Some(px), Some(fr)) =
+                                (relation_x_index, relation_subject_index,
+                                 predicate_x_index, filter_role)
+                            {
+                                universals.push(crate::types::ConsequentUniversal {
+                                    subject_role: subject,
+                                    relation_fact_type_id: rel_id,
+                                    relation_x_index: rx,
+                                    relation_subject_index: rs,
+                                    predicate_fact_type_id: pred_id,
+                                    predicate_x_index: px,
+                                    predicate_filter_role: fr,
+                                    predicate_value: lit,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            // Recognised as a universal but couldn't extract a structured
+            // form — suppress the unresolved-clause noise (legacy behavior).
+            continue;
+        }
 
         // (11) `<Noun> is extracted from <Noun>` / `<Noun> is derived from <Noun>`.
         //      Used for ML-style computed bindings where the RHS is a
@@ -1668,6 +1957,7 @@ fn resolve_derivation_rule(
     rule.antecedent_role_literals = role_literals;
     rule.consequent_computed_bindings = computed;
     rule.consequent_aggregates = aggregates;
+    rule.consequent_universals = universals;
 
     // #914 — map each pre-pass-recorded cross-antecedent comparison
     // spec to an `AntecedentRoleComparison` by locating the antecedent
@@ -2195,6 +2485,29 @@ pub(crate) fn parse_role_token(token: &str) -> (&str, &str) {
         .map(|(i, _)| i)
         .unwrap_or(token.len());
     (&token[..boundary], token)
+}
+
+/// Align a clause's noun tokens (from `find_nouns`, in surface order) to a
+/// fact type's role positions. Returns `(role_index, full_token)` pairs.
+/// Walks the tokens in order, advancing a role cursor whenever the token's
+/// base noun matches the next role's noun — the same positional alignment
+/// `compile::antecedent_role_subscripts` uses to disambiguate self-ring
+/// FTs (both roles share a noun name), where the subscripted token
+/// (`Item1`) identifies which position a reference targets.
+pub(crate) fn align_tokens_to_roles(
+    tokens: &[(usize, usize, String)],
+    ft: &FactTypeDef,
+) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    let mut role_cursor = 0;
+    for (_, _, token) in tokens {
+        let (base, _) = parse_role_token(token);
+        if role_cursor < ft.roles.len() && ft.roles[role_cursor].noun_name == base {
+            out.push((role_cursor, token.clone()));
+            role_cursor += 1;
+        }
+    }
+    out
 }
 
 

@@ -4829,6 +4829,7 @@ fn bootstrap_grammar_state(text: &str) -> Result<Object, String> {
                 antecedent_filters: Vec::new(),
                 consequent_computed_bindings: Vec::new(),
                 consequent_aggregates: Vec::new(),
+                consequent_universals: Vec::new(),
                 unresolved_clauses: Vec::new(),
                 antecedent_role_literals,
                 antecedent_role_comparisons: Vec::new(),

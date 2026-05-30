@@ -1029,7 +1029,10 @@ pub enum Func {
     /// Processes right to left: the last element is the base case,
     /// then each preceding element is combined with the accumulated result.
     /// For a single-element sequence, /f:<x> = x (identity).
-    /// For an empty sequence, /f:phi = Bottom (undefined).
+    /// For an empty sequence, /f:phi = the right UNIT of f (§11.2.4): T for
+    /// ∧, F for ∨, 0 for +, 1 for ×, <> for concat (see `unit_of`). An
+    /// operator with no known unit yields Bottom (undefined) on the empty
+    /// sequence.
     ///
     /// Example: /+:<1, 2, 3> = +:<1, +:<2, 3>> = +:<1, 5> = 6.
     /// For non-commutative f, order matters: /-:<1, 2, 3> = -:<1, -:<2, 3>>
@@ -1117,6 +1120,32 @@ fn apply_compare(x: &Object, op: fn(f64, f64) -> bool) -> Object {
             }
         }
         _ => Object::Bottom,
+    }
+}
+
+/// The right unit (identity element) of a fold operator `f`, used to give
+/// `Insert(f):<>` (Backus `/f` over the EMPTY sequence) a paper-faithful
+/// value instead of `⊥`. Backus §11.2.4 defines `/f:<>` as the right unit
+/// of `f` when one exists — e.g. `/+:<> = 0`, `/∧:<> = T` (vacuous truth).
+/// Only operators with a well-known unit are mapped; anything else returns
+/// `None`, leaving `Insert` to fall back to `⊥` (still Backus-faithful: an
+/// operator without a unit has no defined empty-fold).
+///
+/// The operator is matched on its first-class `Func` variant — the form
+/// the compiler emits for these folds (`Func::And` for `/∧`, `Func::Add`
+/// for `/+`, etc.), as constructed by `compile_aggregate_derivation`'s sum
+/// and the universal-quantifier fold in `compile_explicit_derivation`.
+/// Number units are the decimal-string atoms the arithmetic primitives
+/// produce (`apply_arithmetic` formats integral results as `i64` strings),
+/// so `0`/`1` round-trip through `+`/`×` unchanged.
+fn unit_of(f: &Func) -> Option<Object> {
+    match f {
+        Func::And => Some(Object::t()),          // ∧ unit = T
+        Func::Or => Some(Object::f()),           // ∨ unit = F
+        Func::Add => Some(Object::atom("0")),    // + unit = 0
+        Func::Mul => Some(Object::atom("1")),    // × unit = 1
+        Func::Concat => Some(Object::phi()),     // concat unit = <>
+        _ => None,
     }
 }
 
@@ -2626,6 +2655,11 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
 
         Func::Insert(f) => {
             match x.as_seq() {
+                // Backus §11.2.4: `/f:<>` is the right UNIT of `f` (the
+                // empty-fold base case), not ⊥ — `/∧:<> = T`, `/+:<> = 0`.
+                // Operators with no known unit keep ⊥ (still paper-faithful).
+                Some(items) if items.is_empty() =>
+                    unit_of(f).unwrap_or(Object::Bottom),
                 Some(items) if items.len() == 1 => items[0].clone(),
                 Some(items) if items.len() >= 2 => {
                     let rest = Object::Seq(items[1..].into());
@@ -5076,6 +5110,13 @@ pub(crate) fn drop_subjectless_facts_with_arity(contents: &Object, declared_arit
 /// safe on non-uniform cells — in particular synthetic SM-output cells not in
 /// the FactType registry. Handles both `Seq` and hash-keyed `Map` layouts
 /// (for a Map the values are the facts). Non-`<role,value>` entries untouched.
+///
+/// Gated to match its sole caller, `cli::dedup_state_for_persist`
+/// (`#[cfg(all(not(feature = "no_std"), feature = "local"))]`): without the
+/// `local`/rusqlite feature that persist path is compiled out, so an ungated
+/// definition is genuinely dead there and trips `dead_code`. (Not deleted —
+/// removing it would break the `local` build, which still references it.)
+#[cfg(all(not(feature = "no_std"), feature = "local"))]
 pub(crate) fn drop_empty_subject_facts(contents: &Object) -> Object {
     if let Some(m) = contents.as_map() {
         return Object::map(m.iter()
@@ -8345,6 +8386,39 @@ mod tests {
 
         let seq2 = Object::seq(vec![Object::t(), Object::f(), Object::t()]);
         assert_eq!(apply(&f, &seq2, &defs()), Object::f());
+    }
+
+    // ── Insert on the EMPTY sequence = the right unit of the fold op ──
+    // Backus §11.2.4: `/f:<>` is the right unit of `f`, not ⊥. This is the
+    // empty-fold base case the universal-quantifier fold and the count/sum
+    // aggregates rely on (vacuous truth, empty sum = 0, …).
+    #[test]
+    fn insert_over_empty_yields_unit_of_op() {
+        let empty = Object::phi();
+        // /∧:<> = T (vacuous truth)
+        assert_eq!(apply(&Func::insert(Func::And), &empty, &defs()), Object::t());
+        // /∨:<> = F
+        assert_eq!(apply(&Func::insert(Func::Or), &empty, &defs()), Object::f());
+        // /+:<> = 0
+        assert_eq!(apply(&Func::insert(Func::Add), &empty, &defs()), Object::atom("0"));
+        // /×:<> = 1
+        assert_eq!(apply(&Func::insert(Func::Mul), &empty, &defs()), Object::atom("1"));
+        // /concat:<> = <>
+        assert_eq!(apply(&Func::insert(Func::Concat), &empty, &defs()), Object::phi());
+        // An operator with no known unit stays ⊥ (Backus-faithful: undefined).
+        assert_eq!(apply(&Func::insert(Func::Sub), &empty, &defs()), Object::Bottom);
+
+        // unit_of itself: known ops map, unknown ops are None.
+        assert_eq!(unit_of(&Func::And), Some(Object::t()));
+        assert_eq!(unit_of(&Func::Add), Some(Object::atom("0")));
+        assert_eq!(unit_of(&Func::Sub), None);
+
+        // Non-empty folds are unchanged: the unit does not leak in.
+        let one_two = Object::seq(vec![Object::atom("1"), Object::atom("2")]);
+        assert_eq!(apply(&Func::insert(Func::Add), &one_two, &defs()), Object::atom("3"));
+        // Single-element fold still returns the element (identity), not the unit.
+        let single = Object::seq(vec![Object::atom("5")]);
+        assert_eq!(apply(&Func::insert(Func::Add), &single, &defs()), Object::atom("5"));
     }
 
     // ── Codd θ₁ relational operations ─────────────────────────

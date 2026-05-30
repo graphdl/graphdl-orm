@@ -955,6 +955,7 @@ fn build_multiplier_rule(
             ),
         }],
         consequent_aggregates: Vec::new(),
+        consequent_universals: Vec::new(),
         unresolved_clauses: Vec::new(),
         antecedent_role_literals: Vec::new(),
         antecedent_role_comparisons: Vec::new(),

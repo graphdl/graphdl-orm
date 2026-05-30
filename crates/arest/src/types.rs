@@ -409,6 +409,12 @@ pub struct DerivationRuleDef {
     ///     Type has Role.
     #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub consequent_aggregates: Vec<ConsequentAggregate>,
+    /// Universal-quantifier antecedents (`for each X that R the Subject,
+    /// X has P`). Each lowers to a per-subject Backus fold guard (/∧ ∘ αP)
+    /// at compile time. Populated by `resolve_derivation_rule`'s classifier
+    /// loop; empty for every non-universal rule.
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
+    pub consequent_universals: Vec<ConsequentUniversal>,
     /// Clauses the parser saw in the derivation body but could not
     /// classify into any known form (FT reference, comparison,
     /// aggregate, computed binding, anaphora, negation). The checker
@@ -544,6 +550,7 @@ impl Default for DerivationRuleDef {
             antecedent_filters: Vec::new(),
             consequent_computed_bindings: Vec::new(),
             consequent_aggregates: Vec::new(),
+            consequent_universals: Vec::new(),
             unresolved_clauses: Vec::new(),
             antecedent_role_literals: Vec::new(),
             antecedent_role_comparisons: Vec::new(),
@@ -660,6 +667,18 @@ impl DerivationRuleDef {
             for (i, a) in self.consequent_aggregates.iter().enumerate() {
                 if i > 0 { out.push(','); }
                 consequent_aggregate_write(&mut out, a);
+            }
+            out.push(']');
+        }
+
+        // 12b. consequentUniversals (skip if empty Vec). Field order
+        //      follows the struct declaration (right after
+        //      consequentAggregates) so serde's output matches byte-for-byte.
+        if !self.consequent_universals.is_empty() {
+            out.push_str(",\"consequentUniversals\":[");
+            for (i, u) in self.consequent_universals.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                consequent_universal_write(&mut out, u);
             }
             out.push(']');
         }
@@ -917,6 +936,56 @@ fn consequent_aggregate_write(out: &mut String, a: &ConsequentAggregate) {
     json_escape(out, &a.source_fact_type_id);
     out.push_str(",\"groupKeyRole\":");
     json_escape(out, &a.group_key_role);
+    // Optional positional indices (skip_serializing_if = Option::is_none).
+    if let Some(i) = a.group_key_index {
+        out.push_str(",\"groupKeyIndex\":");
+        json_write_usize(out, i);
+    }
+    if let Some(i) = a.target_index {
+        out.push_str(",\"targetIndex\":");
+        json_write_usize(out, i);
+    }
+    // Optional filter list (skip_serializing_if = Vec::is_empty).
+    if !a.filters.is_empty() {
+        out.push_str(",\"filters\":[");
+        for (i, f) in a.filters.iter().enumerate() {
+            if i > 0 { out.push(','); }
+            aggregate_filter_write(out, f);
+        }
+        out.push(']');
+    }
+    out.push('}');
+}
+
+fn aggregate_filter_write(out: &mut String, f: &AggregateFilter) {
+    out.push_str("{\"refFactTypeId\":");
+    json_escape(out, &f.ref_fact_type_id);
+    out.push_str(",\"entityRole\":");
+    json_escape(out, &f.entity_role);
+    out.push_str(",\"filterRole\":");
+    json_escape(out, &f.filter_role);
+    out.push_str(",\"value\":");
+    json_escape(out, &f.value);
+    out.push('}');
+}
+
+fn consequent_universal_write(out: &mut String, u: &ConsequentUniversal) {
+    out.push_str("{\"subjectRole\":");
+    json_escape(out, &u.subject_role);
+    out.push_str(",\"relationFactTypeId\":");
+    json_escape(out, &u.relation_fact_type_id);
+    out.push_str(",\"relationXIndex\":");
+    json_write_usize(out, u.relation_x_index);
+    out.push_str(",\"relationSubjectIndex\":");
+    json_write_usize(out, u.relation_subject_index);
+    out.push_str(",\"predicateFactTypeId\":");
+    json_escape(out, &u.predicate_fact_type_id);
+    out.push_str(",\"predicateXIndex\":");
+    json_write_usize(out, u.predicate_x_index);
+    out.push_str(",\"predicateFilterRole\":");
+    json_escape(out, &u.predicate_filter_role);
+    out.push_str(",\"predicateValue\":");
+    json_escape(out, &u.predicate_value);
     out.push('}');
 }
 
@@ -1086,6 +1155,88 @@ pub struct ConsequentAggregate {
     /// For `Fact Type has Arity iff Arity is the count of Role where Fact
     /// Type has Role`, this is `"Fact Type"`.
     pub group_key_role: String,
+    /// Explicit role-index of the group-key role on the source FT, when the
+    /// parser can resolve it positionally (Halpin subscripts). Required for
+    /// SELF-RING sources (`Item blocks Item`) where both roles share a noun
+    /// name, so `group_key_role` alone can't disambiguate which position is
+    /// the group key vs the counted entity. `None` falls back to the
+    /// name-based `group_key_role` lookup (the legacy single-role-name case).
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub group_key_index: Option<usize>,
+    /// Explicit role-index of the counted/target role on the source FT. Same
+    /// self-ring rationale as `group_key_index`; `None` falls back to the
+    /// name-based `target_role` lookup.
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub target_index: Option<usize>,
+    /// Literal-equality filters over the counted entity, extracted from the
+    /// non-source clauses of a multi-clause `where`-body. For
+    /// `… count of Item1 where Item1 blocks the Item and Item1 has Status
+    /// 'open'`, the `Item1 has Status 'open'` clause becomes one filter that
+    /// restricts the count to blockers whose Status is `open`. Empty for the
+    /// simple single-clause aggregate. Each filter is a semi-join: a source
+    /// fact is counted only if its counted-entity value appears in
+    /// `ref_fact_type_id` with `filter_role = value`.
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
+    pub filters: Vec<AggregateFilter>,
+}
+
+/// One literal-equality predicate over the entity being aggregated, sourced
+/// from a secondary fact type. See `ConsequentAggregate::filters`.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
+pub struct AggregateFilter {
+    /// Fact type carrying the filter predicate (e.g. `Item_has_Status`).
+    pub ref_fact_type_id: String,
+    /// Role on `ref_fact_type_id` whose value equals the counted entity
+    /// (e.g. `Item` — the blocker that `Item_blocks_Item` also counts).
+    pub entity_role: String,
+    /// Role on `ref_fact_type_id` whose value is compared to `value`
+    /// (e.g. `Status`).
+    pub filter_role: String,
+    /// Literal the `filter_role` must equal (e.g. `open`).
+    pub value: String,
+}
+
+/// A universal-quantifier antecedent of the shape
+///   `for each <X> that <R> the <Subject>, <X has P 'value'>`.
+///
+/// Backus FP form (whitepaper §4 / Backus §11.2.4): the universal is the
+/// right-fold ∀x∈S. P(x) = (/∧) ∘ (αP), restricted to the X's that R-relate
+/// to the subject. At compile time `compile_explicit_derivation` lowers
+/// this to a per-subject guard over the subject population:
+///   holds(S) = OR[ (/∧) ∘ α(P) ∘ filter(R relates X to S) , null? ∘ filter(…) ]
+/// where the right disjunct supplies VACUOUS TRUTH (a subject with no
+/// R-related X is satisfied) — Backus's `/f:<>` is ⊥, not the unit of `f`,
+/// so the empty-fold case is made explicit rather than inherited.
+///
+/// It is a POSITIVE conjunct (a fold of a positive predicate), so it does
+/// not violate the positive-derivation discipline (parse_forml2.rs:1516).
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
+pub struct ConsequentUniversal {
+    /// Consequent entity noun that is the ∀-subject (e.g. `Item` in
+    /// `Item is clear`). The rule fans out one consequent fact per instance
+    /// of this noun for which the universal holds.
+    pub subject_role: String,
+    /// Resolved relating FT id (e.g. `Item_blocks_Item`) — the `X R the
+    /// Subject` clause. May be a self-ring (both roles share a noun).
+    pub relation_fact_type_id: String,
+    /// Role index of the quantified variable X on the relating FT.
+    pub relation_x_index: usize,
+    /// Role index of the subject on the relating FT.
+    pub relation_subject_index: usize,
+    /// Resolved predicate FT id (e.g. `Item_has_Status`) — the `X has P`
+    /// clause whose last role is pinned to `predicate_value`.
+    pub predicate_fact_type_id: String,
+    /// Role index of X on the predicate FT (the entity the predicate is about).
+    pub predicate_x_index: usize,
+    /// Role name on the predicate FT pinned to the literal (e.g. `Status`).
+    pub predicate_filter_role: String,
+    /// Literal the `predicate_filter_role` must equal for P(X) to hold
+    /// (e.g. `done`).
+    pub predicate_value: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1489,7 +1640,9 @@ mod canonical_json_tests {
                 target_role: "Role".to_string(),
                 source_fact_type_id: "Fact_Type_has_Role".to_string(),
                 group_key_role: "Fact Type".to_string(),
+                group_key_index: None, target_index: None, filters: alloc::vec![],
             }],
+            consequent_universals: alloc::vec![],
             unresolved_clauses: alloc::vec!["weird".to_string()],
             antecedent_role_literals: alloc::vec![AntecedentRoleLiteral {
                 antecedent_index: 0,
@@ -1520,6 +1673,7 @@ mod canonical_json_tests {
             antecedent_filters: Vec::new(),
             consequent_computed_bindings: Vec::new(),
             consequent_aggregates: Vec::new(),
+            consequent_universals: Vec::new(),
             unresolved_clauses: Vec::new(),
             antecedent_role_literals: Vec::new(),
             antecedent_role_comparisons: Vec::new(),
@@ -1550,6 +1704,7 @@ mod canonical_json_tests {
             antecedent_filters: Vec::new(),
             consequent_computed_bindings: Vec::new(),
             consequent_aggregates: Vec::new(),
+            consequent_universals: Vec::new(),
             unresolved_clauses: Vec::new(),
             antecedent_role_literals: alloc::vec![AntecedentRoleLiteral {
                 antecedent_index: 0,
@@ -1585,6 +1740,7 @@ mod canonical_json_tests {
             antecedent_filters: Vec::new(),
             consequent_computed_bindings: Vec::new(),
             consequent_aggregates: Vec::new(),
+            consequent_universals: Vec::new(),
             unresolved_clauses: Vec::new(),
             antecedent_role_literals: Vec::new(),
             antecedent_role_comparisons: Vec::new(),
@@ -1613,6 +1769,7 @@ mod canonical_json_tests {
             antecedent_filters: Vec::new(),
             consequent_computed_bindings: Vec::new(),
             consequent_aggregates: Vec::new(),
+            consequent_universals: Vec::new(),
             unresolved_clauses: Vec::new(),
             antecedent_role_literals: Vec::new(),
             antecedent_role_comparisons: Vec::new(),
@@ -1642,6 +1799,7 @@ mod canonical_json_tests {
             antecedent_filters: Vec::new(),
             consequent_computed_bindings: Vec::new(),
             consequent_aggregates: Vec::new(),
+            consequent_universals: Vec::new(),
             unresolved_clauses: Vec::new(),
             antecedent_role_literals: Vec::new(),
             antecedent_role_comparisons: Vec::new(),
@@ -1651,6 +1809,41 @@ mod canonical_json_tests {
                 join_groups: alloc::vec![alloc::vec![(0usize, 1usize), (1usize, 0usize)]],
                 consequent_positions: alloc::vec![Some((0usize, 0usize)), Some((1usize, 1usize))],
             }),
+        }
+    }
+
+    fn sample_rule_with_universal() -> DerivationRuleDef {
+        // Exercises the `consequentUniversals` field's canonical-JSON
+        // serialization, checked against serde byte-for-byte below.
+        DerivationRuleDef {
+            id: "rule_universal".to_string(),
+            text: "* Item is clear iff for each Item1 that blocks the Item, Item1 has Status 'done'".to_string(),
+            antecedent_sources: Vec::new(),
+            consequent_instance_role: String::new(),
+            consequent_cell: ConsequentCellSource::Literal("Item_is_clear".to_string()),
+            kind: DerivationKind::ModusPonens,
+            join_on: Vec::new(),
+            match_on: Vec::new(),
+            consequent_bindings: Vec::new(),
+            antecedent_filters: Vec::new(),
+            consequent_computed_bindings: Vec::new(),
+            consequent_aggregates: Vec::new(),
+            consequent_universals: alloc::vec![ConsequentUniversal {
+                subject_role: "Item".to_string(),
+                relation_fact_type_id: "Item_blocks_Item".to_string(),
+                relation_x_index: 0,
+                relation_subject_index: 1,
+                predicate_fact_type_id: "Item_has_Status".to_string(),
+                predicate_x_index: 0,
+                predicate_filter_role: "Status".to_string(),
+                predicate_value: "done".to_string(),
+            }],
+            unresolved_clauses: Vec::new(),
+            antecedent_role_literals: Vec::new(),
+            antecedent_role_comparisons: Vec::new(),
+            consequent_role_literals: Vec::new(),
+            materialization: MaterializationPolicy::Stored,
+            ring_join: None,
         }
     }
 
@@ -1667,6 +1860,7 @@ mod canonical_json_tests {
             sample_rule_with_dynamic_consequent(),
             sample_rule_with_escapes(),
             sample_rule_with_ring_join(),
+            sample_rule_with_universal(),
         ] {
             let serde_out = serde_json::to_string(&r).expect("serde_json should serialize");
             let canonical = r.to_canonical_json();
@@ -1690,6 +1884,7 @@ mod canonical_json_tests {
             sample_rule_with_dynamic_consequent(),
             sample_rule_with_escapes(),
             sample_rule_with_ring_join(),
+            sample_rule_with_universal(),
         ] {
             let canonical = r.to_canonical_json();
             let parsed: DerivationRuleDef = serde_json::from_str(&canonical)

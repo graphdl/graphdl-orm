@@ -1468,7 +1468,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             DerivationRuleDef {
                 id: get("id"), text: get("text"), antecedent_sources: vec![], consequent_instance_role: String::new(),
                 consequent_cell: crate::types::ConsequentCellSource::decode(&get("consequentFactTypeId")),
-                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None,
+                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None,
             }
         }).collect())
         .unwrap_or_default();
@@ -3648,7 +3648,7 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
                 kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![],
                 consequent_bindings: vec![], antecedent_filters: vec![],
                 consequent_computed_bindings: vec![], consequent_aggregates: vec![],
-                unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None,
+                consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None,
             }
         }).collect()).unwrap_or_default();
     let general_instance_facts: Vec<GeneralInstanceFact> = fetch_cell_seq("InstanceFact", state).as_seq()
@@ -3667,6 +3667,7 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
             r.antecedent_sources.is_empty()
                 && r.consequent_aggregates.is_empty()
                 && r.consequent_computed_bindings.is_empty()
+                && r.consequent_universals.is_empty()
         );
         if needs_resolve {
             crate::parse_forml2::re_resolve_rules(&mut rules, &nouns, &fact_types);
@@ -4102,19 +4103,77 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
         .expect("caller routed an empty-aggregates rule here");
 
     let source_ft = data.fact_types.get(&agg.source_fact_type_id);
-    let group_key_idx = source_ft
+    // Prefer the parser's explicit positional indices (set for self-ring
+    // sources where both roles share a noun name and name lookup can't
+    // disambiguate). Fall back to name-based lookup for the legacy
+    // single-distinct-role aggregate.
+    let group_key_idx = agg.group_key_index.or_else(|| source_ft
         .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == agg.group_key_role))
-        .map(|r| r.role_index)
+        .map(|r| r.role_index))
         .unwrap_or(0);
     // Target-role index: for sum/avg/min/max, the role whose values we
     // fold over. For count, only group membership matters â€” target is
-    // informational so any row match is fine.
-    let target_idx = source_ft
+    // informational so any row match is fine. The counted-entity value at
+    // this index is also what the aggregate filters semi-join on.
+    let target_idx = agg.target_index.or_else(|| source_ft
         .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == agg.target_role))
-        .map(|r| r.role_index)
+        .map(|r| r.role_index))
         .unwrap_or(1);
 
-    let source_facts = extract_facts_from_pop(&agg.source_fact_type_id);
+    // Pre-filter the source facts by any aggregate filters BEFORE the
+    // image-set fold. Each filter is a semi-join: keep a source fact only
+    // if its counted-entity value (role `target_idx`) appears in the
+    // filter's ref FT with `filter_role = value`. The haystack (the set of
+    // entity values satisfying the literal) is computed once at the pop
+    // level, paired with every source fact via DistR, membership-tested,
+    // then the haystack is stripped back off — leaving the surviving
+    // source facts. Composing filters left-to-right ANDs them.
+    let source_facts = {
+        let raw = extract_facts_from_pop(&agg.source_fact_type_id);
+        agg.filters.iter().fold(raw, |facts, filt| {
+            let ref_ft = data.fact_types.get(&filt.ref_fact_type_id);
+            let entity_idx = ref_ft
+                .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == filt.entity_role))
+                .map(|r| r.role_index)
+                .unwrap_or(0);
+            let filter_idx = ref_ft
+                .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == filt.filter_role))
+                .map(|r| r.role_index)
+                .unwrap_or(1);
+            // haystack(pop) = α(entity_value) . Filter(filter_value == lit)
+            //                   . facts_of(ref_ft)
+            let ref_facts = extract_facts_from_pop(&filt.ref_fact_type_id);
+            let lit_matches = Func::compose(
+                Func::Eq,
+                Func::construction(vec![
+                    role_value(filter_idx),
+                    Func::constant(Object::atom(&filt.value)),
+                ]),
+            );
+            let haystack = Func::compose(
+                Func::apply_to_all(role_value(entity_idx)),
+                Func::compose(Func::filter(lit_matches), ref_facts),
+            );
+            // <<f1, H>, <f2, H>, ...> ; keep where t_val(f) ∈ H ; strip H.
+            let member_pred = Func::compose(
+                Func::HasMember,
+                Func::construction(vec![
+                    Func::compose(role_value(target_idx), Func::Selector(1)),
+                    Func::Selector(2),
+                ]),
+            );
+            Func::compose(
+                Func::apply_to_all(Func::Selector(1)),
+                Func::compose(
+                    Func::filter(member_pred),
+                    Func::compose(
+                        Func::DistR,
+                        Func::construction(vec![facts, haystack]),
+                    ),
+                ),
+            )
+        })
+    };
     let g_key = role_value(group_key_idx);
     let t_val = role_value(target_idx);
 
@@ -4623,6 +4682,128 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
         let (consequent_cell, _, _) =
             derivation_dep_metadata(rule);
         return CompiledDerivation { id, text, kind, func,             consequent_cell, materialization: rule.materialization.clone() };
+    }
+
+    // ── Universal-quantifier dispatch (`for each X that R the S, X has P`) ──
+    // Lower the recorded `ConsequentUniversal` to a per-subject Backus fold.
+    // For each instance S of the subject noun, derive the consequent fact iff
+    // ∀ X with `X R S`: P(X). The fold is (/∧) ∘ (αP) over the X's that
+    // R-relate to S; the EMPTY-fold case (S has no R-related X) is VACUOUSLY
+    // TRUE because `/∧:<>` evaluates to the unit of ∧ (= T) per Backus
+    // §11.2.4 (`ast::unit_of`) — so the bare fold already carries vacuous
+    // truth and no short-circuit guard is needed. All role indices come from
+    // the recorded `ConsequentUniversal` (resolved positionally at parse
+    // time), so only the predicate FT is looked up here for the
+    // literal-filter role index.
+    if let Some(u) = rule.consequent_universals.first() {
+        let pred_ft = data.fact_types.get(&u.predicate_fact_type_id);
+        // Filter-role index on the predicate FT (the role the literal pins).
+        let filter_idx = pred_ft
+            .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == u.predicate_filter_role))
+            .map(|r| r.role_index)
+            .unwrap_or_else(|| pred_ft.map(|ft| ft.roles.len().saturating_sub(1)).unwrap_or(1));
+
+        // Hgood(pop) = α(X-value) ∘ Filter(P.filter == value) ∘ P-facts.
+        // The set of X's that satisfy the predicate.
+        let pred_facts = extract_facts_from_pop(&u.predicate_fact_type_id);
+        let lit_matches = Func::compose(
+            Func::Eq,
+            Func::construction(vec![
+                role_value(filter_idx),
+                Func::constant(Object::atom(&u.predicate_value)),
+            ]),
+        );
+        let hgood_all = Func::compose(
+            Func::apply_to_all(role_value(u.predicate_x_index)),
+            Func::compose(Func::filter(lit_matches), pred_facts),
+        );
+        let rel_facts_all = extract_facts_from_pop(&u.relation_fact_type_id);
+
+        // Per-subject input after DistR: <S, <rel_facts_all, hgood_all>>.
+        let s_func = Func::Selector(1);
+        let rel_facts = Func::compose(Func::Selector(1), Func::Selector(2));
+        let hgood = Func::compose(Func::Selector(2), Func::Selector(2));
+
+        // relatedXs(<S, ctx>) = the X values of rel facts whose subject role
+        // equals S.  α(X ∘ s2) ∘ Filter(S == subj ∘ s2) ∘ DistL:<S, rel_facts>.
+        let pair_s_with_facts = Func::compose(
+            Func::DistL,
+            Func::construction(vec![s_func.clone(), rel_facts.clone()]),
+        );
+        let subj_matches = Func::compose(
+            Func::Eq,
+            Func::construction(vec![
+                Func::Selector(1),
+                Func::compose(role_value(u.relation_subject_index), Func::Selector(2)),
+            ]),
+        );
+        let related_xs = Func::compose(
+            Func::apply_to_all(
+                Func::compose(role_value(u.relation_x_index), Func::Selector(2)),
+            ),
+            Func::compose(Func::filter(subj_matches), pair_s_with_facts),
+        );
+
+        // member over <hgood, X> = HasMember:<X, hgood>.
+        let member = Func::compose(
+            Func::HasMember,
+            Func::construction(vec![Func::Selector(2), Func::Selector(1)]),
+        );
+        // holds = /∧ ∘ α(member) ∘ DistL:<hgood, relatedXs>.
+        // The bare Backus right-fold IS the universal: ∀x∈relatedXs. P(x).
+        // The empty case (subject with no R-related X) is vacuously TRUE
+        // because `/∧:<>` now evaluates to the unit of ∧ (= T) per Backus
+        // §11.2.4 / `ast::unit_of` — no `Condition(null?, T̄, …)` guard is
+        // needed, and none is emitted. (Previously a guard short-circuited
+        // the empty case because the substrate returned ⊥ there; with
+        // units-on-empty the fold supplies vacuous truth directly, so the
+        // emitted Func reduces to the clean fold with no ⊥ to leak into the
+        // surrounding ⊥-preserving Construction.)
+        let holds = Func::compose(
+            Func::Insert(Box::new(Func::And)),
+            Func::compose(
+                Func::apply_to_all(member),
+                Func::compose(
+                    Func::DistL,
+                    Func::construction(vec![hgood.clone(), related_xs.clone()]),
+                ),
+            ),
+        );
+
+        // Derived fact: <consequent_id, reading, <<subject_role, S>>>.
+        let derive_one = Func::construction(vec![
+            consequent_id_func.clone(),
+            consequent_reading_func.clone(),
+            Func::construction(vec![
+                Func::construction(vec![
+                    Func::constant(Object::atom(&u.subject_role)),
+                    s_func.clone(),
+                ]),
+            ]),
+        ]);
+        // Per-subject: Seq([derived]) when holds, else phi (Concat drops phi).
+        let per_subject = Func::condition(
+            holds,
+            Func::construction(vec![derive_one]),
+            Func::constant(Object::phi()),
+        );
+        // Over all subjects: Concat ∘ α(per_subject) ∘ DistR ∘
+        //   [ instances_of(subject), [rel_facts_all, hgood_all] ].
+        let func = Func::compose(
+            Func::Concat,
+            Func::compose(
+                Func::apply_to_all(per_subject),
+                Func::compose(
+                    Func::DistR,
+                    Func::construction(vec![
+                        instances_of_noun_func(&u.subject_role),
+                        Func::construction(vec![rel_facts_all, hgood_all]),
+                    ]),
+                ),
+            ),
+        );
+        let (consequent_cell, _, _) = derivation_dep_metadata(rule);
+        return CompiledDerivation { id, text, kind, func, consequent_cell, materialization: rule.materialization.clone() };
     }
 
     let func = match antecedent_ids.len() {
@@ -6197,7 +6378,7 @@ pub(crate) fn compile_subtype_inheritance_metamodel(
                 kind: DerivationKind::SubtypeInheritance,
                 join_on: vec![], match_on: vec![], consequent_bindings: vec![],
                 antecedent_filters: vec![], consequent_computed_bindings: vec![],
-                consequent_aggregates: vec![], unresolved_clauses: vec![],
+                consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![],
                 antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None,
             };
             compile_explicit_derivation(data, &rule).func
@@ -6292,7 +6473,7 @@ pub(crate) fn compile_ss_autofill_metamodel(
                 kind: DerivationKind::ModusPonens,
                 join_on: vec![], match_on: vec![], consequent_bindings: vec![],
                 antecedent_filters: vec![], consequent_computed_bindings: vec![],
-                consequent_aggregates: vec![], unresolved_clauses: vec![],
+                consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![],
                 antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None,
             };
             compile_explicit_derivation(data, &rule).func
