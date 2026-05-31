@@ -42,29 +42,20 @@ import { Card } from "../components/Card.slint";
 export component AppLauncher inherits Window {
     // ---- Callbacks (Rust glue navigates) --------------------------
 
-    // Fired when the user clicks the "Unified REPL" button. Rust
-    // glue (`launcher.rs`) hides this window and shows
-    // `crate::ui_apps::unified_repl::build_app()`'s window. The
-    // unified panel co-locates the HATEOAS resource browse (left
-    // pane) and the REPL prompt + scrollback (right pane) — replaces
-    // the prior separate `open-hateoas` + `open-repl` callbacks per
-    // #510 / EPIC #496.
-    callback open-unified-repl();
-
-    // Fired when the user clicks the "Doom" button. Rust glue hides
-    // this window and shows `crate::ui_apps::doom::build_app()`'s
-    // window. Only reachable when `show-doom` is true (Rust sets it
-    // when `cfg(feature = "doom")` is on — see `launcher.rs`).
-    callback open-doom();
-
-    // Fired when the user clicks the "Keyboard" button (Track QQQQ
-    // #465). Rust glue hides this window and shows
-    // `crate::ui_apps::keyboard::build_app()`'s window. Always
-    // available — the on-screen QWERTY is the foundation for the
-    // touch-only "phone shape" milestone (boot-kernel-uefi.ps1
-    // -Smoke under QEMU with no host keyboard), so the button row
-    // is unconditional rather than feature-gated like Doom.
-    callback open-keyboard();
+    // Cell-driven app selection (#709, Task U1): fired when the user
+    // clicks any app button in the dynamic list. The index corresponds
+    // to the position of the app in `app-names` (and equivalently in
+    // the `LaunchableApp_has_Symbol` cell sequence the Rust glue read
+    // to populate `app-names`). Rust glue resolves `idx` → app slug
+    // and executes the corresponding navigation transition.
+    //
+    // This replaces the prior hardcoded `open-unified-repl`,
+    // `open-doom`, and `open-keyboard` callbacks: instead of one
+    // callback per hard-listed app, a single index-based callback
+    // covers the full cell-derived app set so adding a new
+    // `LaunchableApp_has_Symbol` fact is sufficient to surface the app
+    // in the launcher — no .slint change required.
+    callback app-selected(int /* index into app-names */);
 
     // Theme toggle, surfaced through the top bar so the user can
     // flip dark/light at the splash. Mirrors HateoasBrowser / Repl —
@@ -75,14 +66,16 @@ export component AppLauncher inherits Window {
 
     // ---- Inputs (driven by the Rust glue) -------------------------
 
-    // Whether to show the "Doom" button row. The Slint side has no
-    // `cfg` of its own, so we expose this as a property and Rust
-    // sets it true when the kernel is built with `--features doom`
-    // (Track VVV #455 + #456). When false (default kernel build,
-    // AGPL-3.0-or-later only), the row is omitted from the layout
-    // entirely so the splash card stays the same height as the
-    // pre-#455 two-app splash.
-    in property <bool> show-doom: false;
+    // Cell-driven app list (#709, Task U1). Each entry is the display
+    // name of one registered launcher app read from the
+    // `LaunchableApp_has_Symbol` cells (populated via
+    // `ui_apps::registry::build_slint_component_state` at boot). The
+    // Slint side renders one primary Button per entry in a `for` loop
+    // so the rendered set is driven by the cells, not by hardcoded
+    // .slint markup. The Rust glue keeps the `app-names` list
+    // index-aligned with its own `LAUNCHER_APP_SLUGS` slice so
+    // `app-selected(idx)` resolves unambiguously.
+    in property <[string]> app-names;
 
     title: "AREST";
     background: Theme.surface;
@@ -220,44 +213,24 @@ export component AppLauncher inherits Window {
                                 // but no kernel app exercises that path
                                 // today — keeping splash on the proven
                                 // text path).
-                                // Track #510 / EPIC #496: HATEOAS
-                                // Browser + REPL merged into one
-                                // unified panel. The previous two
-                                // separate buttons are collapsed into
-                                // this single icon.
-                                Button {
-                                    text: "Unified REPL";
+                                // Cell-driven app buttons (#709, Task U1).
+                                // One primary Button per entry in
+                                // `app-names`. The `app-names` list is
+                                // populated by Rust from the
+                                // `LaunchableApp_has_Symbol` cells
+                                // (seeded by
+                                // `ui_apps::registry::build_slint_component_state`
+                                // at boot), so the rendered set is
+                                // driven by the AREST cells, not by
+                                // hardcoded .slint markup. Adding a new
+                                // `LaunchableApp_has_Symbol` fact and
+                                // extending the Rust navigation switch
+                                // is sufficient to surface a new app —
+                                // no .slint change required.
+                                for name[idx] in root.app-names : Button {
+                                    text: name;
                                     variant: ButtonVariant.primary;
-                                    clicked => { root.open-unified-repl(); }
-                                }
-
-                                // Track VVV #455: Doom row, only
-                                // visible when the kernel was built
-                                // with `--features doom`. Slint
-                                // doesn't have `cfg` so the Rust
-                                // glue (`launcher.rs`) sets the
-                                // `show-doom` property at startup;
-                                // the `if` here drops the button
-                                // out of layout entirely when off,
-                                // preserving the visual spacing of
-                                // the pre-#455 splash.
-                                if root.show-doom : Button {
-                                    text: "Doom";
-                                    variant: ButtonVariant.primary;
-                                    clicked => { root.open-doom(); }
-                                }
-
-                                // Track QQQQ #465: virtual keyboard
-                                // row. Always shown (no cargo
-                                // feature gate — the on-screen
-                                // QWERTY is the path to making
-                                // AREST usable on a touch-only
-                                // display under QEMU, so it ships
-                                // in the default build).
-                                Button {
-                                    text: "Keyboard";
-                                    variant: ButtonVariant.primary;
-                                    clicked => { root.open-keyboard(); }
+                                    clicked => { root.app-selected(idx); }
                                 }
                             }
                         }

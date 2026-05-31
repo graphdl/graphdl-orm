@@ -79,10 +79,12 @@
 
 use alloc::boxed::Box;
 use alloc::rc::Rc;
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU64, Ordering as AtomOrd};
 
-use slint::ComponentHandle;
+use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
 
 use crate::arch::uefi::keyboard;
@@ -100,21 +102,76 @@ use crate::ui_apps::{keyboard as kbd_app, unified_repl};
 #[cfg(feature = "doom")]
 use crate::ui_apps::doom;
 
+// ── Cell-driven app set (#709 Task U1) ────────────────────────────
+//
+// Pure extraction functions live in `crate::launcher_app_set` so they
+// can be unit-tested on the host target (this module is UEFI-gated).
+// Import them here by name so the rest of `run()` can use them directly.
+use crate::launcher_app_set::{
+    LAUNCHER_APP_SLUGS,
+    launcher_app_display_names,
+    launcher_app_slugs_from_cells,
+    slug_to_display_name,
+};
+
+/// Populate the `app-names` property on the `AppLauncher` Slint component
+/// from the registered `LaunchableApp_has_Symbol` cells.
+fn populate_app_names(launcher: &AppLauncher) {
+    let names: Vec<String> = crate::system::with_state(|state| {
+        launcher_app_display_names(state)
+    })
+    .unwrap_or_else(|| {
+        // Fallback when system::init() hasn't run (smoke tests, headless
+        // builds). Use the static slug list converted to display names.
+        LAUNCHER_APP_SLUGS
+            .iter()
+            .filter(|slug| {
+                #[cfg(not(feature = "doom"))]
+                if **slug == "doom" { return false; }
+                true
+            })
+            .map(|s| slug_to_display_name(s))
+            .collect()
+    });
+
+    let model: ModelRc<SharedString> = ModelRc::new(VecModel::from_iter(
+        names.iter().map(SharedString::from),
+    ));
+    launcher.set_app_names(model);
+}
+
+/// Resolve a click index from `app-selected(idx)` to an `Active` variant.
+/// `idx` is the position in the display list as returned by
+/// `launcher_app_slugs_from_cells`. Returns `None` when the index is
+/// out of range or the slug isn't navigable (e.g. doom slug on non-doom
+/// build — unreachable by construction).
+fn active_for_app_index(idx: i32, slugs: &[String]) -> Option<Active> {
+    let slug = slugs.get(idx as usize)?;
+    match slug.as_str() {
+        "unified-repl" => Some(Active::UnifiedRepl),
+        "keyboard" => Some(Active::Keyboard),
+        #[cfg(feature = "doom")]
+        "doom" => Some(Active::Doom),
+        _ => None,
+    }
+}
+
 /// Which Slint surface is currently visible. Driven by the
-/// open-unified-repl / open-doom / open-keyboard callbacks (forward)
-/// and the Esc intercept in `drain_keyboard_with_esc_intercept`
-/// (back). The `Doom` variant is unconditional in the enum so the
-/// navigation state machine doesn't fork on `cfg`; the actual
-/// transition into `Active::Doom` is gated behind `cfg(feature =
-/// "doom")` at the callback registration site below — when the
-/// feature is off the state can never reach Doom because `open-doom`
-/// is never wired. The `Keyboard` variant (Track QQQQ #465) is always
-/// available; the on-screen QWERTY is the foundation for the touch-
-/// only "phone shape" milestone.
+/// cell-derived `on_app_selected(idx)` callback (forward) and the
+/// Esc intercept in `drain_keyboard_with_esc_intercept` (back).
 ///
-/// Track #510 (this commit): the prior `Hateoas` + `Repl` variants
-/// are folded into a single `UnifiedRepl` variant — both panes live
-/// in one Window now (`crate::ui_apps::unified_repl`).
+/// The `Doom` variant is unconditional in the enum so the navigation
+/// state machine doesn't fork on `cfg`; the actual transition into
+/// `Active::Doom` is gated behind `cfg(feature = "doom")` in
+/// `active_for_app_index` — when the feature is off the slug is
+/// filtered from the display list so the index is never reachable.
+/// The `Keyboard` variant (Track QQQQ #465) is always available.
+///
+/// Track #510: the prior `Hateoas` + `Repl` variants are folded into
+/// a single `UnifiedRepl` variant. Track #709 (Task U1): the
+/// per-app `open-*` callbacks are replaced by the single cell-driven
+/// `app-selected(int)` callback; `active_for_app_index` maps the
+/// index to this variant.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Active {
     Launcher,
@@ -248,7 +305,8 @@ pub fn run(
     // Build the side apps (launcher splash, keyboard, optional Doom)
     // FIRST and the unified REPL LAST so the user lands on the REPL
     // instead of the on-screen QWERTY. The keyboard and launcher
-    // splash are still reachable via the open-* navigation callbacks.
+    // splash are still reachable via the app-selected navigation
+    // callback.
     let launcher = AppLauncher::new()
         .expect("AppLauncher::new() failed under installed Slint platform");
     // Track QQQQ #465: virtual keyboard. Always constructed (no
@@ -260,82 +318,93 @@ pub fn run(
     let keyboard_app = kbd_app::build_app()
         .expect("Keyboard construction failed");
     // Track VVV (#455 + #456): Doom is feature-gated. When the
-    // feature is off, `doom_app` is never constructed and the
-    // launcher's `open-doom` callback is never wired (so the Slint
-    // side's `show-doom` stays false and the button row is omitted
-    // from layout entirely — see `AppLauncher.slint`'s `if
-    // root.show-doom` block).
+    // feature is off, `doom_app` is never constructed and doom's
+    // slug is filtered from the cell-derived display list so the
+    // button never appears.
     #[cfg(feature = "doom")]
     let mut doom_app = doom::build_app()
         .expect("Doom construction failed");
-    #[cfg(feature = "doom")]
-    launcher.set_show_doom(true);
     // Track #510: HateoasBrowser + Repl merged into UnifiedRepl.
     // Built LAST so it wins the renderer`s root-component slot; the
     // user lands on the REPL surface at boot per #496.
     let unified_repl_app = unified_repl::build_app()
         .expect("UnifiedRepl construction failed");
 
+    // Track #709 Task U1: populate the AppLauncher's `app-names`
+    // property from the `LaunchableApp_has_Symbol` cells. This is the
+    // cell-driven app-set: the button list the user sees is derived
+    // from registered-app facts, not from hardcoded .slint markup or
+    // a procedural Rust list.
+    populate_app_names(&launcher);
+
+    // Cache the slug list at the same point so the `on_app_selected`
+    // closure can resolve idx → Active without re-reading the cells
+    // (the list is stable for the boot lifetime; re-reading would be
+    // sound but unnecessary).
+    let app_slugs: Vec<String> = crate::system::with_state(|state| {
+        launcher_app_slugs_from_cells(state)
+    })
+    .unwrap_or_else(|| {
+        // Fallback when system::init() hasn't run (smoke tests).
+        LAUNCHER_APP_SLUGS
+            .iter()
+            .filter(|slug| {
+                #[cfg(not(feature = "doom"))]
+                if **slug == "doom" { return false; }
+                true
+            })
+            .map(|s| s.to_string())
+            .collect()
+    });
+
     // Track #510: the unified REPL is the default landing app. Boot
     // straight into it instead of the launcher splash so the user
     // lands in the "system as current screen" surface immediately.
     let nav: NavState = Rc::new(RefCell::new(Active::UnifiedRepl));
 
-    // Wire the launcher's open-* callbacks. Each one swaps the
-    // visible Slint Window: hide the launcher, show the chosen app,
-    // and update `nav` so the keyboard pump knows where to route Esc.
-    //
-    // Track #510: HateoasBrowser + Repl merged into one
-    // `open-unified-repl` callback fed by `UnifiedRepl`.
+    // Track #709 Task U1: single cell-driven app-selection callback.
+    // Replaces the prior hardcoded `on_open_unified_repl`,
+    // `on_open_keyboard`, and `on_open_doom` callbacks with a single
+    // `app-selected(int)` callback whose index resolves to an `Active`
+    // variant via `active_for_app_index`. The slug list is captured by
+    // value so the closure is `'static`-compatible.
     {
         let nav = nav.clone();
         let launcher_weak = launcher.as_weak();
         let unified_weak = unified_repl_app.window.as_weak();
-        launcher.on_open_unified_repl(move || {
-            let Some(launcher) = launcher_weak.upgrade() else { return };
-            let Some(unified) = unified_weak.upgrade() else { return };
-            let _ = launcher.hide();
-            let _ = unified.show();
-            *nav.borrow_mut() = Active::UnifiedRepl;
-        });
-    }
-    // Track QQQQ #465: Keyboard open callback. Always wired (no
-    // feature gate). When active, the Esc-intercept arm in the
-    // super-loop below short-circuits back to the launcher when the
-    // user presses a real Esc on the host keyboard (or when a future
-    // on-screen Esc cell pushes U+001B onto the ring); otherwise
-    // taps on the on-screen keys push synthesised
-    // `DecodedKey::Unicode(c)` values via
-    // `arch::uefi::keyboard::push_keystroke` (see
-    // `crate::ui_apps::keyboard::build_app`'s `on_key_pressed`
-    // closure).
-    {
-        let nav = nav.clone();
-        let launcher_weak = launcher.as_weak();
         let keyboard_weak = keyboard_app.window.as_weak();
-        launcher.on_open_keyboard(move || {
-            let Some(launcher) = launcher_weak.upgrade() else { return };
-            let Some(keyboard_window) = keyboard_weak.upgrade() else { return };
-            let _ = launcher.hide();
-            let _ = keyboard_window.show();
-            *nav.borrow_mut() = Active::Keyboard;
-        });
-    }
-    // Track VVV #455: Doom open callback. Only registered when the
-    // feature is on; otherwise the Slint side's button row stays
-    // hidden (see `set_show_doom(true)` above) and the callback is
-    // never invoked. The shape mirrors the Hateoas / Repl wiring.
-    #[cfg(feature = "doom")]
-    {
-        let nav = nav.clone();
-        let launcher_weak = launcher.as_weak();
+        #[cfg(feature = "doom")]
         let doom_weak = doom_app.window.as_weak();
-        launcher.on_open_doom(move || {
+        let slugs = app_slugs.clone();
+        launcher.on_app_selected(move |idx| {
             let Some(launcher) = launcher_weak.upgrade() else { return };
-            let Some(doom_window) = doom_weak.upgrade() else { return };
+            let Some(active) = active_for_app_index(idx, &slugs) else { return };
             let _ = launcher.hide();
-            let _ = doom_window.show();
-            *nav.borrow_mut() = Active::Doom;
+            match active {
+                Active::UnifiedRepl => {
+                    if let Some(unified) = unified_weak.upgrade() {
+                        let _ = unified.show();
+                    }
+                }
+                Active::Keyboard => {
+                    if let Some(kw) = keyboard_weak.upgrade() {
+                        let _ = kw.show();
+                    }
+                }
+                #[cfg(feature = "doom")]
+                Active::Doom => {
+                    if let Some(dw) = doom_weak.upgrade() {
+                        let _ = dw.show();
+                    }
+                }
+                Active::Launcher => {
+                    // Selecting the launcher from within the launcher
+                    // is filtered out of the display list; this branch
+                    // is unreachable by construction.
+                    let _ = launcher.show();
+                }
+            }
+            *nav.borrow_mut() = active;
         });
     }
     // Theme toggle is a passive forward — Theme.toggle-mode() has
@@ -1212,3 +1281,4 @@ fn paint_cursor_sprite(
         );
     }
 }
+

@@ -100,6 +100,14 @@ pub mod assets;
 pub mod dma;
 pub mod fonts;
 pub mod icons;
+// Cell-driven AppLauncher app-set extraction (#709 Task U1). Pure
+// functions over `&Object` that read `LaunchableApp_has_Symbol` cells
+// and return the ordered set of navigable app slugs + display labels.
+// Extracted from `ui_apps::launcher` (which is UEFI-gated) so the
+// cell-query logic can be unit-tested on the host target. The
+// `ui_apps::launcher::run` path re-imports these via
+// `crate::launcher_app_set::*`.
+pub mod launcher_app_set;
 // `ui_apps` is the Slint-driven boot UI surface (Unified REPL,
 // launcher, keyboard, doom). Every submodule that touches the
 // runtime imports `slint::*`, and the launcher's `run(...)`
