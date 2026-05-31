@@ -353,7 +353,7 @@ pub fn run(
                 if **slug == "doom" { return false; }
                 true
             })
-            .map(|s| s.to_string())
+            .map(|s| String::from(*s))
             .collect()
     });
 
