@@ -209,6 +209,10 @@ COPY apps/ui.do/dist/ apps/ui.do/dist/
 # Dockerfile.
 COPY crates/arest/Cargo.toml crates/arest/Cargo.toml
 COPY crates/arest/src/       crates/arest/src/
+# arest-foundation: extracted out of crates/arest; crates/arest path-depends
+# on it, so the build context must stage it (else cargo can't read its manifest).
+COPY crates/arest-foundation/Cargo.toml crates/arest-foundation/Cargo.toml
+COPY crates/arest-foundation/src/ crates/arest-foundation/src/
 COPY readings/               readings/
 
 # Build the armv7 UEFI .efi. The custom target JSON + `-Z build-std`
@@ -229,10 +233,14 @@ COPY readings/               readings/
 # up in a follow-up commit, this build can move to `--release` for
 # the smaller .efi footprint.
 #
+# RUSTFLAGS --cfg poly1305_force_soft: libLLVM 22.1's -O optimizer SIGILLs
+# compiling poly1305's SIMD backend on this Hyper-V/WSL2 vCPU (see commit
+# afd1731b / task kernel-dockerfile-sweep). Forces the portable backend.
+#
 # Output lands at
 # target/arest-kernel-armv7-uefi/debug/arest-kernel.efi.
 RUN cd crates/arest-kernel \
-    && cargo +nightly build \
+    && RUSTFLAGS="--cfg poly1305_force_soft" cargo +nightly build \
         --target ./arest-kernel-armv7-uefi.json \
         -Z build-std=core,compiler_builtins,alloc \
         -Z unstable-options \
