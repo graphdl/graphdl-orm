@@ -268,6 +268,15 @@ pub struct CommandResult {
     /// in `ui-readings` builds (kernel, ui.do/cloudflare worker).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<ViewProjection>,
+    /// task-crudl-deploy: the permission-gated CRUDL action menu — the iFactr
+    /// ActionButtons the user may perform on this resource in its view context,
+    /// projected at the HATEOAS level (`command::crudl_menu`) from the SUBSTRATE
+    /// `authorized` predicate. Rides beside `transitions` (SM) and `navigation`,
+    /// NOT inside `view` (the thin view never sees permissions). Empty when the
+    /// user is unauthorized for the context or the access/ui readings are compiled
+    /// out. The permission gate is server-side (enforced with no UI).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crudl: Vec<CrudlMenuItem>,
     /// The transformed state -- the authoritative state after this command.
     #[serde(skip)]
     pub state: ast::Object,
@@ -436,6 +445,7 @@ pub fn decode_command_result(obj: &ast::Object) -> CommandResult {
                 entities, status, transitions, navigation, violations,
                 derived_count, rejected,
                 view: None,
+                crudl: Vec::new(),
                 state,
             };
         }
@@ -483,7 +493,7 @@ pub fn decode_command_result(obj: &ast::Object) -> CommandResult {
     let rejected = sel(5).and_then(|o| o.as_atom()) == Some("T");
     let new_state = sel(6).cloned().unwrap_or(ast::Object::phi());
 
-    CommandResult { entities, status, transitions, navigation: vec![], violations, derived_count, rejected, view: None, state: new_state }
+    CommandResult { entities, status, transitions, navigation: vec![], violations, derived_count, rejected, view: None, crudl: Vec::new(), state: new_state }
 }
 
 /// Encode a CommandResult as an Object for the dispatch layer.
@@ -674,6 +684,7 @@ pub fn apply_command_defs(
             derived_count: 0,
             rejected: false,
             view: None,
+            crudl: Vec::new(),
             state: ast::Object::phi(),
         },
     }
@@ -729,6 +740,7 @@ pub fn apply_command_batch(
             derived_count: 0,
             rejected: false,
             view: None,
+            crudl: Vec::new(),
             state: ast::diff_cells(state, state), // empty Map delta
         };
     }
@@ -768,6 +780,7 @@ pub fn apply_command_batch(
                 derived_count,
                 rejected: true,
                 view: None,
+                crudl: Vec::new(),
                 state: ast::diff_cells(state, state), // empty delta — full rollback
             };
         }
@@ -790,6 +803,7 @@ pub fn apply_command_batch(
         derived_count,
         rejected: false,
         view: None,
+        crudl: Vec::new(),
         state: delta,
     }
 }
@@ -828,6 +842,7 @@ fn assert_fact_via_defs(
             derived_count: 0,
             rejected: true,
             view: None,
+            crudl: Vec::new(),
             state: ast::Object::phi(),
         };
     }
@@ -937,6 +952,7 @@ fn assert_fact_via_defs(
         derived_count: derived.len(),
         rejected,
         view: None,
+        crudl: Vec::new(),
         state: delta,
     }
 }
@@ -1226,6 +1242,7 @@ fn create_via_defs(
             derived_count: 0,
             rejected: true,
             view: None,
+            crudl: Vec::new(),
             state: ast::Object::phi(),
         };
     }
@@ -1265,6 +1282,7 @@ fn create_via_defs(
                 derived_count: 0,
                 rejected: true,
                 view: None,
+                crudl: Vec::new(),
                 state: ast::Object::phi(),
             };
         }
@@ -1334,6 +1352,7 @@ fn create_via_defs(
                     derived_count: 0,
                     rejected: true,
                     view: None,
+                    crudl: Vec::new(),
                     state: ast::Object::phi(),
                 };
             }
@@ -1853,6 +1872,11 @@ fn create_via_defs(
     // WITH the get response (the thin HATEOAS wrapper). None where ui-readings
     // is compiled out; populated in kernel / ui.do builds.
     let view = view_via_rho(d, noun, &entity_id);
+    // task-crudl-deploy (d): the permission-gated CRUDL action menu for this
+    // instance — projected at the HATEOAS level (beside transitions + nav) from
+    // the substrate `authorized` predicate, gated on the sender. "instance" view
+    // context. Empty when unauthorized or access readings are compiled out.
+    let crudl = crudl_menu(d, noun, "instance", sender.unwrap_or(""));
 
     let entity_data: hashbrown::HashMap<String, String> = fields_with_domain.iter()
         .map(|(k, v)| (k.to_string(), v.to_string())).collect();
@@ -1884,7 +1908,7 @@ fn create_via_defs(
     let delta = ast::diff_cells(state, &final_state);
     CommandResult {
         entities, status, transitions, navigation, violations,
-        derived_count: derived.len(), rejected, view,
+        derived_count: derived.len(), rejected, view, crudl,
         state: delta,
     }
 }
@@ -2652,6 +2676,7 @@ fn transition_via_defs(
         derived_count,
         rejected,
         view: None,
+        crudl: Vec::new(),
         state: delta,
     }
 }
@@ -2718,6 +2743,7 @@ fn query_via_defs(
         derived_count: 0,
         rejected: false,
         view: None,
+        crudl: Vec::new(),
         // #209: queries don't mutate state — empty delta.
         state: ast::Object::phi(),
     }
@@ -2759,6 +2785,7 @@ fn update_via_defs(
             derived_count: 0,
             rejected: true,
             view: None,
+            crudl: Vec::new(),
             state: ast::Object::phi(),
         };
     }
@@ -2836,6 +2863,7 @@ fn update_via_defs(
                     derived_count: 0,
                     rejected: true,
                     view: None,
+                    crudl: Vec::new(),
                     state: ast::Object::phi(),
                 };
             }
@@ -3185,6 +3213,7 @@ fn update_via_defs(
         derived_count: derived.len(),
         rejected,
         view: None,
+        crudl: Vec::new(),
         state: delta,
     }
 }
@@ -3339,6 +3368,7 @@ fn apply_load_readings(
                 derived_count: 0,
                 rejected: true,
                 view: None,
+                crudl: Vec::new(),
                 // #209: parse failed — no state change.
                 state: ast::Object::phi(),
             };
@@ -3390,6 +3420,7 @@ fn apply_load_readings(
             derived_count: 0,
             rejected: true,
             view: None,
+            crudl: Vec::new(),
             state: ast::Object::phi(),
         };
     }
@@ -3424,6 +3455,7 @@ fn apply_load_readings(
         derived_count: new_noun_count,
         rejected: false,
         view: None,
+        crudl: Vec::new(),
         state: delta,
     }
 }
@@ -3519,6 +3551,7 @@ fn load_reading_handler(
                 derived_count,
                 rejected: false,
                 view: None,
+                crudl: Vec::new(),
                 state: delta,
             }
         }
@@ -3585,6 +3618,7 @@ fn load_reading_handler(
                 derived_count: 0,
                 rejected: true,
                 view: None,
+                crudl: Vec::new(),
                 // No state mutation on rejection — phi() so the
                 // writer-path classifier treats this as a no-commit.
                 state: ast::Object::phi(),
@@ -3688,6 +3722,7 @@ fn unload_reading_handler(
                 derived_count,
                 rejected: false,
                 view: None,
+                crudl: Vec::new(),
                 state: delta,
             }
         }
@@ -3725,6 +3760,7 @@ fn unload_reading_handler(
                 derived_count: 0,
                 rejected: true,
                 view: None,
+                crudl: Vec::new(),
                 state: ast::Object::phi(),
             }
         }
@@ -3856,6 +3892,7 @@ fn reload_reading_handler(
                 derived_count,
                 rejected: false,
                 view: None,
+                crudl: Vec::new(),
                 state: delta,
             }
         }
@@ -3964,6 +4001,7 @@ fn reload_reading_handler(
                 derived_count: 0,
                 rejected: true,
                 view: None,
+                crudl: Vec::new(),
                 state: ast::Object::phi(),
             }
         }
@@ -4596,6 +4634,7 @@ mod tests {
             derived_count: 2,
             rejected: false,
             view: None,
+            crudl: Vec::new(),
             state: ast::Object::phi(),
         };
         let obj = encode_command_result(&result);
