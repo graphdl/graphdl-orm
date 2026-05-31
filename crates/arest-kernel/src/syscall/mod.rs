@@ -64,6 +64,7 @@ pub mod futex;
 pub mod getrandom;
 pub mod getpid;
 pub mod identity;
+pub mod ioctl;
 pub mod openat;
 pub mod write;
 

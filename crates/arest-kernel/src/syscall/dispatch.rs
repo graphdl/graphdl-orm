@@ -60,6 +60,7 @@ use crate::syscall::futex;
 use crate::syscall::getrandom;
 use crate::syscall::getpid;
 use crate::syscall::identity;
+use crate::syscall::ioctl;
 use crate::syscall::openat;
 use crate::syscall::write;
 
@@ -205,6 +206,17 @@ pub const SYS_GETEGID: u64 = 108;
 /// Per #501.
 pub const SYS_ARCH_PRCTL: u64 = 158;
 
+/// Linux x86_64 syscall number for
+/// `ioctl(int fd, unsigned long request, ...)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_ioctl` (= 16).
+/// The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_ioctl`. Routes to
+/// `ioctl::handle`, which dispatches on the request code:
+/// TIOCGWINSZ (0x5413) — fill `struct winsize` (24 rows × 80 cols);
+/// TCGETS (0x5401) — fill a zeroed `struct termios`;
+/// unknown → -ENOTTY. Per #502.
+pub const SYS_IOCTL: u64 = 16;
+
 /// The dispatch entry point. Match on `rax` and forward the argument
 /// registers (rdi / rsi / rdx / r10 / r8 / r9) to the per-syscall
 /// handler. Handlers that take fewer than six args simply ignore the
@@ -280,6 +292,14 @@ pub fn dispatch(
             // so that errno / pthread_self / stack-canary all work.
             // rdi = code (u64), rsi = addr (u64). Per #501.
             arch_prctl::handle(rdi, rsi)
+        }
+        SYS_IOCTL => {
+            // ioctl(fd, request, arg) — terminal query stubs.
+            // rdi = fd, rsi = request, rdx = arg (pointer to output
+            // struct). TIOCGWINSZ (0x5413) fills winsize 24×80;
+            // TCGETS (0x5401) fills a zeroed termios; unknown → -ENOTTY.
+            // Per #502.
+            ioctl::handle(rdi, rsi, rdx)
         }
         SYS_EXIT | SYS_EXIT_GROUP => {
             // exit / exit_group both transition the Process state
@@ -419,6 +439,13 @@ mod tests {
     #[test]
     fn sys_brk_number_matches_linux_uapi() {
         assert_eq!(SYS_BRK, 12);
+    }
+
+    /// `SYS_IOCTL` is 16 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_ioctl`.
+    #[test]
+    fn sys_ioctl_number_matches_linux_uapi() {
+        assert_eq!(SYS_IOCTL, 16);
     }
 
     /// `dispatch(SYS_BRK, 0, ...)` (query form) returns 0 when no
