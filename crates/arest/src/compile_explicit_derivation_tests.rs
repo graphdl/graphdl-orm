@@ -5323,6 +5323,62 @@ Grant applies to Noun. *
         "Grant {gid} applies to Task (shared skolem frontier); got {:?}", appl);
 }
 
+// access.md (the deploy artifact for the access-control substrate) implements the
+// FULL authz model as a registered-shape reading: the `authorized` discriminator-
+// join derivation (READ) AND the alethic `performs ⊆ authorized` tuple-subset
+// constraint (ENFORCE), composed with the metamodel's User + Noun. Proves the
+// reading FILE is correct FORML end-to-end (the semantics are also pinned inline by
+// authorization_via_subtype_discriminator_enum + the role-sequence subset tests).
+// User/Noun are declared inline as core stand-ins; in the bundle they come from core.
+#[test]
+fn access_reading_derives_authorized_and_enforces_performs_subset() {
+    let src = format!("{}\n{}", r#"
+User(.Username) is an entity type.
+Username is a value type.
+Noun(.NounName) is an entity type.
+NounName is a value type.
+"#, include_str!("../../../readings/access/access.md"));
+    let state = parse_to_state(&src).expect("access.md + core stand-ins must parse");
+    let defs = compile::compile_to_defs_state(&state);
+    let d0 = ast::defs_to_state(&defs, &state);
+    let push = |s, cell: &str, pairs: &[(&str, &str)]|
+        ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+    let d = {
+        let s = d0.clone();
+        let s = push(s, "User_has_Access_Level", &[("User", "alice"), ("Access Level", "admin")]);
+        let s = push(s, "Access_Level_permits_Operation_on_Noun", &[("Access Level", "admin"), ("Operation", "delete"), ("Noun", "Task")]);
+        // alice performs delete (authorized) AND drop (NOT permitted -> unauthorized).
+        let s = push(s, "User_performs_Operation_on_Noun", &[("User", "alice"), ("Operation", "delete"), ("Noun", "Task")]);
+        let s = push(s, "User_performs_Operation_on_Noun", &[("User", "alice"), ("Operation", "drop"), ("Noun", "Task")]);
+        s
+    };
+    // READ half: `authorized` derives (alice, delete, Task) via the discriminator join.
+    let refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &d)))
+        .collect();
+    let refs: Vec<(&str, &ast::Func)> = refs_owned.iter().map(|(n, f)| (n.as_str(), f)).collect();
+    let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+    let authz = ast::fetch_cell_seq("User_is_authorized_for_Operation_on_Noun", &new_d);
+    let has_delete = authz.as_seq().map_or(false, |items| items.iter().any(|f|
+        ast::binding(f, "User") == Some("alice")
+            && ast::binding(f, "Operation") == Some("delete")
+            && ast::binding(f, "Noun") == Some("Task")));
+    assert!(has_delete, "access.md: alice (admin) must be authorized to delete Task");
+    // ENFORCE half: the unauthorized `drop` performs is an alethic Subset violation.
+    // validate reads the population from the eval CONTEXT, so encode it from the
+    // forward-chained, seeded state (new_d) -- NOT the empty readings `state`.
+    let ctx = ast::encode_eval_context_state("", None, &new_d);
+    let violations = ast::decode_violations(&ast::apply(&ast::Func::Def("validate".to_string()), &ctx, &new_d));
+    let subset_v: Vec<&crate::types::Violation> = violations.iter()
+        .filter(|v| v.constraint_text.contains("performs") && v.constraint_text.contains("authorized"))
+        .collect();
+    assert!(subset_v.iter().any(|v| v.detail.contains("drop")),
+        "access.md: unauthorized `drop` performs must be a Subset violation; got {:?}",
+        subset_v.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>());
+    assert!(subset_v.iter().all(|v| v.alethic), "access.md: enforcement must be alethic (reject)");
+}
+
 // crudl-menu-projection: the prior view-level `ViewElement renders Operation`
 // skolem derivation tests (crudl_menu_derivation_operations_per_context /
 // crudl_menu_derivation_permission_gated / crudl_gated_menu_over_real_ifactr_catalog)
