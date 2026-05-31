@@ -485,6 +485,7 @@ arest = { path = "../arest", default-features = false, features = [
     "imports-readings",
     "ingest-readings",
     "ui-readings",
+    "access-readings",
     "os-readings",
     "templates",
 ] }
@@ -501,6 +502,7 @@ arest = { path = "../arest", features = [
     "imports-readings",
     "ingest-readings",
     "ui-readings",
+    "access-readings",
     "os-readings",
     "templates",
 ] }
