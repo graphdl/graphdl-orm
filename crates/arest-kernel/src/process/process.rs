@@ -287,6 +287,24 @@ pub struct Process {
     /// how `fs_base` + `arch_prctl` gate the MSR write behind
     /// `#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]`.
     pub heap_break: u64,
+    /// Monotonic bump pointer for anonymous `mmap(2)` allocations.
+    /// SYS_MMAP (9) with MAP_ANONYMOUS advances this pointer forward by
+    /// `len` rounded up to PAGE_SIZE (4096) and returns the pre-advance
+    /// value as the allocated base address (#497). This is a pure
+    /// bookkeeping field — the same "no real page-table manipulation on
+    /// this foundation slice" rationale that `heap_break` uses applies
+    /// here: the real page-frame allocation + PTE install is deferred to
+    /// the boot-integration track (UEFI target, future #497 child tasks).
+    ///
+    /// Initialised to `MMAP_BASE` (0x7000_0000_0000) in `Process::new`,
+    /// a canonical start of the mmap region on Linux x86_64 (below the
+    /// 128 TiB user address-space limit, above any typical heap). Two
+    /// consecutive mmaps return non-overlapping regions by construction.
+    ///
+    /// `munmap` does not advance or retreat this pointer (no per-mapping
+    /// free list in tier-1 — documented no-op). A real allocator that
+    /// tracks individual mappings is a future child task of #497.
+    pub mmap_bump: u64,
 }
 
 impl Process {
@@ -336,6 +354,13 @@ impl Process {
             // page-table mapping of the heap region is deferred to
             // the boot-integration track (UEFI target only).
             heap_break: 0,
+            // mmap bump pointer starts at the canonical mmap base for
+            // Linux x86_64 (0x7000_0000_0000). The first anonymous
+            // mmap returns this address; each subsequent call advances
+            // the pointer by len-rounded-up-to-4096. No real PTE
+            // install happens on this foundation slice — same
+            // rationale as heap_break above.
+            mmap_bump: crate::syscall::mmap::MMAP_BASE,
         }
     }
 

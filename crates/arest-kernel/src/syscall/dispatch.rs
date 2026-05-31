@@ -61,7 +61,9 @@ use crate::syscall::getrandom;
 use crate::syscall::getpid;
 use crate::syscall::identity;
 use crate::syscall::ioctl;
+use crate::syscall::mmap;
 use crate::syscall::openat;
+use crate::syscall::read;
 use crate::syscall::write;
 
 /// Linux errno value for "Bad file descriptor". Returned by `write`
@@ -89,6 +91,34 @@ pub const EINVAL: i64 = 22;
 /// (futex, getrandom, etc.) so the negative return propagates as a
 /// clean "this kernel can't" rather than silent failure.
 pub const ENOSYS: i64 = 38;
+
+/// Linux x86_64 syscall number for `read(fd, buf, count)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_read` (= 0).
+/// The vendored musl tree confirms the same value at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_read`. Routes to
+/// `read::handle`, which drains decoded Unicode keystrokes from the
+/// kernel PS/2 keyboard ring (`arch::uefi::keyboard`) into the
+/// caller's buffer for fd 0 (stdin). Non-blocking: returns 0 when the
+/// ring is empty, `-EBADF` for any fd != 0. Per #508.
+pub const SYS_READ: u64 = 0;
+
+/// Linux x86_64 syscall number for
+/// `mmap(addr, len, prot, flags, fd, off)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_mmap` (= 9).
+/// The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_mmap`. Routes to
+/// `mmap::handle_mmap`, which implements a monotonic bump allocator for
+/// the anonymous (MAP_ANONYMOUS) path; file-backed requests return
+/// `-ENODEV`. Per #497.
+pub const SYS_MMAP: u64 = 9;
+
+/// Linux x86_64 syscall number for `munmap(addr, len)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_munmap` (= 11).
+/// The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_munmap`. Routes to
+/// `mmap::handle_munmap`, which is a documented no-op in tier-1 (no
+/// per-mapping free list; the bump allocator never retreats). Per #497.
+pub const SYS_MUNMAP: u64 = 11;
 
 /// Linux x86_64 syscall number for `close(fd)`. Source:
 /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_close` (= 3).
@@ -245,7 +275,29 @@ pub fn dispatch(
     r9: u64,
 ) -> i64 {
     match rax {
+        SYS_READ => {
+            // read(fd, buf, count) — keyboard ring → user buffer.
+            // rdi = fd (must be 0 for stdin), rsi = buf pointer,
+            // rdx = count (max bytes to fill). Non-blocking: returns 0
+            // when the ring is empty, -EBADF for fd != 0. Per #508.
+            read::handle(rdi, rsi, rdx)
+        }
         SYS_WRITE => write::handle(rdi, rsi, rdx),
+        SYS_MMAP => {
+            // mmap(addr, len, prot, flags, fd, off) — anonymous mapping.
+            // rdi=addr, rsi=len, rdx=prot, r10=flags, r8=fd, r9=off.
+            // Fourth syscall arg is r10 (not rcx) per Linux x86_64 ABI
+            // (`vendor/musl/arch/x86_64/syscall_arch.h:__syscall6`).
+            // MAP_ANONYMOUS (flags & 0x20 != 0): bump-allocate a page-
+            // aligned region; file-backed → -ENODEV. Per #497.
+            mmap::handle_mmap(rdi, rsi, rdx, r10, r8, r9)
+        }
+        SYS_MUNMAP => {
+            // munmap(addr, len) — rdi=addr, rsi=len.
+            // Documented no-op in tier-1 (no per-mapping free list).
+            // Returns 0 (success). Per #497.
+            mmap::handle_munmap(rdi, rsi)
+        }
         SYS_BRK => {
             // brk(addr) — heap-break management. `addr` = rdi.
             // Returns the resulting break (current or new) as a
@@ -446,6 +498,20 @@ mod tests {
     #[test]
     fn sys_ioctl_number_matches_linux_uapi() {
         assert_eq!(SYS_IOCTL, 16);
+    }
+
+    /// `SYS_MMAP` is 9 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_mmap`.
+    #[test]
+    fn sys_mmap_number_matches_linux_uapi() {
+        assert_eq!(SYS_MMAP, 9);
+    }
+
+    /// `SYS_MUNMAP` is 11 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_munmap`.
+    #[test]
+    fn sys_munmap_number_matches_linux_uapi() {
+        assert_eq!(SYS_MUNMAP, 11);
     }
 
     /// `dispatch(SYS_BRK, 0, ...)` (query form) returns 0 when no

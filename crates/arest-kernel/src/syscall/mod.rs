@@ -65,7 +65,9 @@ pub mod getrandom;
 pub mod getpid;
 pub mod identity;
 pub mod ioctl;
+pub mod mmap;
 pub mod openat;
+pub mod read;
 pub mod write;
 
 // Re-export the dispatcher as the public surface — this is what the
