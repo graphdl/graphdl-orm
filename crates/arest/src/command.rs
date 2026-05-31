@@ -1181,21 +1181,6 @@ fn noun_instantiable_per_cell(noun: &str, state: &ast::Object, d: &ast::Object) 
     if any_populated { Some(false) } else { None }
 }
 
-/// Procedural run-time definedness scan â retained as fallback (task-961 Phase C).
-/// Used when `_Noun_is_instantiable_compiled` is absent (states built without
-/// `compile_to_defs_state`, e.g. phi-state test fixtures) or when a noun was
-/// added to `state` after the last compile (post-compile dynamic addition).
-/// Same predicate as the FORML derivation: objectType="entity" WITH a
-/// non-empty reference scheme, evaluated inline against the Noun cell.
-fn noun_runtime_defined_procedural(noun: &str, state: &ast::Object, d: &ast::Object) -> bool {
-    [state, d].iter().any(|src|
-        ast::fetch_cell_seq("Noun", src).as_seq().map_or(false, |fs|
-            fs.iter().any(|f|
-                ast::binding(f, "name") == Some(noun)
-                    && ast::binding(f, "objectType") == Some("entity")
-                    && ast::binding(f, "referenceScheme").map_or(false, |rs| !rs.is_empty()))))
-}
-
 /// Run-time definedness predicate. A noun may be instantiated or mutated at
 /// run-time only if it is a fully-defined entity type â declared
 /// objectType="entity" WITH a reference scheme (its identity). A value type,
@@ -1204,33 +1189,30 @@ fn noun_runtime_defined_procedural(noun: &str, state: &ast::Object, d: &ast::Obj
 /// forward-chain over them has no identity to ground and can diverge. Gates
 /// createEntity and updateEntity; `compile` stays permissive at design-time.
 ///
-/// task-961 Phase C: the declarative `noun_instantiable_per_cell` now checks
-/// BOTH the forward-chain-produced `Noun_is_instantiable` cell AND the
-/// compile-time `_Noun_is_instantiable_compiled` cell emitted by
-/// `compile_to_defs_state`. When EITHER cell is populated AND admits the noun,
-/// the noun is admitted declaratively (fast path).  The procedural
-/// `noun_runtime_defined_procedural` fallback is RETAINED for cases where
-/// BOTH cells are absent or empty (states built without `compile_to_defs_state`,
-/// e.g. `apply_command_phi_state()` test fixtures, or nouns added to `state`
-/// after the last compile).  Full removal of the procedural fallback requires
-/// guaranteeing every `apply` path passes through `compile_to_defs_state` â
-/// a follow-up child task (scope guard per task-961).
+/// task-961-b: the declarative `Noun_is_instantiable` cell is now the SOLE
+/// authority. The procedural fallback (`noun_runtime_defined_procedural`) is
+/// REMOVED. `noun_instantiable_per_cell` checks BOTH the forward-chain-produced
+/// `Noun_is_instantiable` cell AND the compile-time `_Noun_is_instantiable_compiled`
+/// cell emitted by `compile_to_defs_state` (compile.rs task-961 Phase C), so the
+/// gate decides PURELY from the cell. Every production apply path routes through
+/// `compile_to_defs_state` -> `defs_to_state`, which seeds the compiled cell into
+/// `d`, so it is always populated for compiled state. Bypass paths that build a
+/// state WITHOUT that pass (phi-state test fixtures, a noun added to `state`
+/// after the last compile) seed it via `ast::seed_instantiable_cell` -- the same
+/// compiled form of the FORML rule.
 fn noun_runtime_defined(noun: &str, state: &ast::Object, d: &ast::Object) -> bool {
-    // Declarative constraint first: when any cell is populated AND admits the
-    // noun, that is sufficient.  `noun_instantiable_per_cell` now checks BOTH
-    // the forward-chain cell and the compile-time cell (Phase C), so it gives
-    // Some(true) for any noun known at compile time or derived at runtime.
-    if noun_instantiable_per_cell(noun, state, d) == Some(true) {
-        return true;
-    }
-    // Procedural fallback (Phase A/B semantics): covers nouns added to state
-    // after compile (see `create_entity_without_state_machine` test) and
-    // states built without `compile_to_defs_state` (phi-state test fixtures).
-    // When `noun_instantiable_per_cell` returns `Some(false)` (cell populated
-    // but noun absent), we STILL check the Noun cell — a noun absent from the
-    // compile-time cell may have been added to state after compile, and the
-    // procedural check is the authoritative answer for that case.
-    noun_runtime_defined_procedural(noun, state, d)
+    // task-961-b: the `Noun_is_instantiable` cell is the SOLE authority. The
+    // procedural fallback is removed; the gate decides PURELY from the cell.
+    //   * Some(true)  -> admitted (noun is a member of a populated cell);
+    //   * Some(false) -> rejected (a cell is populated but does not name it);
+    //   * None        -> rejected (no cell populated: no positive evidence of
+    //                    instantiability; SAFETY: never admit on cell absence).
+    // `noun_instantiable_per_cell` reads BOTH the forward-chain-produced
+    // `Noun_is_instantiable` cell and the compile-time
+    // `_Noun_is_instantiable_compiled` cell `compile_to_defs_state` seeds, so
+    // every compiled state has a populated cell. Bypass paths that build a
+    // state without that pass seed it via `ast::seed_instantiable_cell`.
+    noun_instantiable_per_cell(noun, state, d) == Some(true)
 }
 
 fn create_via_defs(
@@ -5315,11 +5297,16 @@ Resource is mirroring Status.
         // Category is an entity type with no state machine. Declaring it (with
         // a reference scheme) makes it a valid run-time shape — an SM-less
         // entity, distinct from an under-defined noun the run-time gate refuses.
+        // task-961-b: `Category` is added to `state` AFTER `setup_order_defs`'s
+        // compile, so the compiled instantiability cell in `def_map` does not
+        // name it; seed `Noun_is_instantiable` for the post-compile addition so
+        // the run-time gate (now cell-only) admits it.
         let state = ast::cell_push(
             "Noun",
             ast::fact_from_pairs(&[("name", "Category"), ("objectType", "entity"), ("referenceScheme", "id")]),
             &state,
         );
+        let state = ast::seed_instantiable_cell(&state);
 
         let mut fields = HashMap::new();
         fields.insert("name".to_string(), "Electronics".to_string());
@@ -5484,6 +5471,116 @@ Resource is mirroring Status.
         assert!(rejected_not_runtime_defined(&r),
             "a create of a noun ABSENT from a populated Noun_is_instantiable cell \
              must be rejected by the declarative constraint; got {:?}", r.violations);
+    }
+
+    // ── task-961-b regression: bypass-path seeding via seed_instantiable_cell ──
+    //
+    // With the procedural fallback (`noun_runtime_defined_procedural`) REMOVED,
+    // a state built WITHOUT `compile_to_defs_state` (so no
+    // `_Noun_is_instantiable_compiled` cell) must seed `Noun_is_instantiable`
+    // itself via `ast::seed_instantiable_cell` for the run-time gate to admit a
+    // valid entity create. The two tests below pin both halves of the contract
+    // on the two bypass shapes the task calls out — a phi-built state and a
+    // dynamic-noun-after-compile state — proving a valid entity create still
+    // SUCCEEDS and an undeclared / non-entity create still REJECTS.
+
+    /// Bypass shape A — a phi-built state (`cell_push("Noun", …)` then
+    /// `seed_instantiable_cell`), the exact shape `apply_command_phi_state()`
+    /// uses. The seeded `Noun_is_instantiable` cell is the SOLE authority:
+    ///   * a declared entity-with-scheme (`Person`) → create SUCCEEDS;
+    ///   * a declared value type (`Color`)          → create REJECTS;
+    ///   * an undeclared noun (`Gadget`)            → create REJECTS, no hang.
+    #[test]
+    fn task_961b_phi_built_state_seed_gates_create_without_procedural() {
+        // Declare one valid entity + one value type, then seed from the Noun
+        // cell. No `compile_to_defs_state` runs — the cell is hand-seeded.
+        let mut state = ast::cell_push("Noun",
+            ast::fact_from_pairs(&[("name", "Person"), ("objectType", "entity"), ("referenceScheme", "id")]),
+            &ast::Object::phi());
+        state = ast::cell_push("Noun",
+            ast::fact_from_pairs(&[("name", "Color"), ("objectType", "value"), ("referenceScheme", "")]),
+            &state);
+        let state = ast::seed_instantiable_cell(&state);
+
+        // Sanity: the seed admitted Person (entity+scheme) and excluded Color.
+        let inst = ast::fetch_cell_seq("Noun_is_instantiable", &state);
+        let members: alloc::vec::Vec<&str> = inst.as_seq()
+            .map(|fs| fs.iter().filter_map(|f| ast::binding(f, "Noun")).collect())
+            .unwrap_or_default();
+        assert!(members.contains(&"Person"),
+            "seed_instantiable_cell must admit the entity-with-scheme Person; got {:?}", members);
+        assert!(!members.contains(&"Color"),
+            "seed_instantiable_cell must exclude the value type Color; got {:?}", members);
+
+        // Drive createEntity with the seeded state as BOTH d and population —
+        // exactly how platform_apply_command dispatches (apply_command_defs(&s, …, &s)).
+        let try_create = |noun: &str| apply_command_defs(&state, &Command::CreateEntity {
+            noun: noun.to_string(), domain: "d".to_string(),
+            id: Some("x".to_string()), fields: HashMap::new(),
+            sender: None, signature: None,
+        }, &state);
+        let rejected = |r: &CommandResult| r.rejected && r.entities.is_empty()
+            && r.violations.iter().any(|v| v.constraint_id.contains("not_runtime_defined"));
+
+        // ACCEPT: Person is a cell member → admitted (no not_runtime_defined).
+        assert!(!rejected(&try_create("Person")),
+            "phi-built seed: a valid entity create must SUCCEED with the procedural gone; got {:?}",
+            try_create("Person").violations);
+        // REJECT: Color is a declared value type, absent from the seeded cell.
+        assert!(rejected(&try_create("Color")),
+            "phi-built seed: a value-type create must REJECT; got {:?}", try_create("Color").violations);
+        // REJECT: Gadget is undeclared, absent from the seeded cell → no hang.
+        assert!(rejected(&try_create("Gadget")),
+            "phi-built seed: an undeclared-noun create must REJECT, not hang; got {:?}",
+            try_create("Gadget").violations);
+    }
+
+    /// Bypass shape B — a dynamic noun added to `state` AFTER
+    /// `setup_order_defs`'s compile (so `def_map`'s compiled cell does not name
+    /// it), re-seeded via `seed_instantiable_cell`, the exact shape
+    /// `create_entity_without_state_machine` uses. The freshly-seeded cell in
+    /// `state` admits the post-compile entity; an undeclared noun still rejects
+    /// (decided by `def_map`'s compiled cell, which is populated).
+    #[test]
+    fn task_961b_dynamic_noun_after_compile_seed_gates_create_without_procedural() {
+        let (def_map, state) = setup_order_defs();
+        // Add a NEW entity type the original compile never saw, then re-seed.
+        let state = ast::cell_push("Noun",
+            ast::fact_from_pairs(&[("name", "Category"), ("objectType", "entity"), ("referenceScheme", "id")]),
+            &state);
+        let state = ast::seed_instantiable_cell(&state);
+
+        let try_create = |noun: &str, st: &ast::Object| apply_command_defs(&def_map, &Command::CreateEntity {
+            noun: noun.to_string(), domain: "catalog".to_string(),
+            id: Some("c-1".to_string()), fields: HashMap::new(),
+            sender: None, signature: None,
+        }, st);
+        let rejected = |r: &CommandResult| r.rejected && r.entities.is_empty()
+            && r.violations.iter().any(|v| v.constraint_id.contains("not_runtime_defined"));
+
+        // ACCEPT: Category was seeded into `state`'s Noun_is_instantiable cell,
+        // even though `def_map`'s compiled cell predates it → create SUCCEEDS.
+        assert!(!rejected(&try_create("Category", &state)),
+            "dynamic-noun seed: a post-compile entity create must SUCCEED with the \
+             procedural gone; got {:?}", try_create("Category", &state).violations);
+        // REJECT: Gizmo is neither in the seeded state cell nor the compiled
+        // def_map cell (which IS populated, e.g. Order) → create REJECTS.
+        assert!(rejected(&try_create("Gizmo", &state)),
+            "dynamic-noun seed: an undeclared-noun create must REJECT; got {:?}",
+            try_create("Gizmo", &state).violations);
+        // GUARD (seed is load-bearing): a genuinely UNSEEDED population that
+        // declares Category but never seeds the cell. `def_map`'s compiled cell
+        // is populated (e.g. Order) but lacks Category → noun_instantiable_per_cell
+        // returns Some(false) → the gate REJECTS. This is exactly why the bypass
+        // path MUST seed; with the procedural gone, the Noun cell alone no longer
+        // admits anything.
+        let unseeded_phi = ast::cell_push("Noun",
+            ast::fact_from_pairs(&[("name", "Category"), ("objectType", "entity"), ("referenceScheme", "id")]),
+            &ast::Object::phi());
+        assert!(rejected(&try_create("Category", &unseeded_phi)),
+            "dynamic-noun WITHOUT re-seed: Category absent from the populated compiled \
+             cell must REJECT — demonstrates the seed is load-bearing; got {:?}",
+            try_create("Category", &unseeded_phi).violations);
     }
 
     // ── task-735 — auto-increment id reconciles both schemes ──────────

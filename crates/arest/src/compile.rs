@@ -3340,13 +3340,14 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // predicate, the result is identical.
     //
     // Effect on `noun_runtime_defined` (command.rs): the procedural
-    // `noun_runtime_defined_procedural` fallback is no longer needed — the cell is
-    // now ALWAYS populated after `compile_to_defs_state` and `defs_to_state`.  See
-    // `noun_runtime_defined` in command.rs for the removal.
+    // `noun_runtime_defined_procedural` fallback is REMOVED (task-961-b) -- the
+    // cell is now the SOLE authority and is ALWAYS populated after
+    // `compile_to_defs_state` and `defs_to_state`. Bypass paths that build a
+    // state without this pass seed the same cell via `ast::seed_instantiable_cell`.
     //
-    // Oracle-equivalence pinned by:
-    //   `compile_noun_is_instantiable_compile_time_cell_matches_procedural_predicate`
-    //   in the test module below (task-961 Phase C).
+    // Oracle set pinned by:
+    //   `compile_noun_is_instantiable_compile_time_cell_matches_entity_type_set`
+    //   in the test module below (task-961-b).
     {
         let instantiable_facts: Vec<crate::ast::Object> = c_nouns.iter()
             .filter(|(name, ndef)| {
@@ -13371,12 +13372,16 @@ mod mandatory_role_alethic_rejection_tests {
             "Task".to_string(),
         ], "Noun_is_instantiable must be EXACTLY the entity types with a \
             reference scheme; got {:?}", inst);
-    }
-    /// task-961 Phase C oracle-equivalence: the compile-time
-    /// `_Noun_is_instantiable_compiled` cell agrees exactly with the
-    /// procedural predicate (objectType='entity' AND non-empty referenceScheme).
+    }
+    /// task-961-b oracle: the compile-time `_Noun_is_instantiable_compiled`
+    /// cell is EXACTLY the set of entity types that carry a non-empty reference
+    /// scheme. The procedural gate (`noun_runtime_defined_procedural`) was the
+    /// prior authority and has been REMOVED; this test no longer compares the
+    /// cell to a re-derived procedural predicate, it asserts the cell equals the
+    /// expected entity-type set directly. The cell is now the SOLE authority for
+    /// `command::noun_runtime_defined`.
     #[test]
-    fn compile_noun_is_instantiable_compile_time_cell_matches_procedural_predicate() {
+    fn compile_noun_is_instantiable_compile_time_cell_matches_entity_type_set() {
         let src = "\r
             Noun(.name) is an entity type.
 \r
@@ -13423,23 +13428,19 @@ mod mandatory_role_alethic_rejection_tests {
             })
             .unwrap_or_default();
         compiled.sort(); compiled.dedup();
-        let noun_cell = ast::fetch_cell_seq("Noun", &extra);
-        let mut procedural: Vec<String> = noun_cell.as_seq()
-            .map(|fs| fs.iter().filter_map(|f| {
-                let name = ast::binding(f, "name")?;
-                let otype = ast::binding(f, "objectType")?;
-                let rscheme = ast::binding(f, "referenceScheme").unwrap_or("");
-                if otype == "entity" && !rscheme.is_empty() { Some(name.to_string()) } else { None }
-            }).collect())
-            .unwrap_or_default();
-        procedural.sort(); procedural.dedup();
-        assert_eq!(compiled, procedural,
-            "compile-time _Noun_is_instantiable_compiled must match the procedural \r
-             predicate; compiled={:?} procedural={:?}", compiled, procedural);
-        assert!(compiled.iter().any(|n| n == "Task"));
-        assert!(compiled.iter().any(|n| n == "Source File"));
-        assert!(!compiled.iter().any(|n| n == "Schemaless"));
-        assert!(!compiled.iter().any(|n| n == "Color"));
+        // EXACT expected set: every entity type with a non-empty reference
+        // scheme. The two metamodel entities `Noun(.name)` / `Fact Type(.id)`
+        // PLUS the two fixture entities `Task(.id)` / `Source File(.path)`. The
+        // schemaless entity (`Schemaless`, entity but no scheme) and the value
+        // type (`Color`) are excluded — exactly the run-time-definedness gate's
+        // discriminator, now materialized declaratively and asserted directly.
+        assert_eq!(compiled, vec![
+            "Fact Type".to_string(),
+            "Noun".to_string(),
+            "Source File".to_string(),
+            "Task".to_string(),
+        ], "compile-time _Noun_is_instantiable_compiled must be EXACTLY the entity \
+            types with a reference scheme; got {:?}", compiled);
     }
 
 }

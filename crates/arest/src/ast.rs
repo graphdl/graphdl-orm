@@ -4578,6 +4578,48 @@ pub fn cell_push_unique(name: &str, fact: Object, state: &Object) -> Object {
     }
 }
 
+/// Seed the `Noun_is_instantiable` cell from a state's `Noun` cell
+/// (task-961-b). This is the COMPILED FORM of the FORML derivation
+/// `Noun is instantiable iff Noun has Object Type 'entity' and Noun has
+/// some Reference Scheme` (readings/core/core.md §Derivation Rules,
+/// marked `**`), evaluated eagerly against the `Noun` cell already in
+/// `state` — the SAME predicate `compile_to_defs_state` emits as the
+/// `_Noun_is_instantiable_compiled` cell (compile.rs §task-961 Phase C).
+///
+/// Production apply paths always route through `compile_to_defs_state`,
+/// which seeds `_Noun_is_instantiable_compiled` into `d`. This helper is
+/// for BYPASS paths that build a defs/population state WITHOUT that pass
+/// (phi-state test fixtures that `cell_push` a `Noun` directly, or a
+/// noun added to `state` after the last compile) — it lets those states
+/// carry an authoritative instantiability cell so the run-time gate in
+/// `command::noun_runtime_defined` can decide PURELY from the cell, with
+/// no procedural fallback.
+///
+/// Predicate: `objectType == "entity"` AND a non-empty `referenceScheme`
+/// (at least one non-empty comma-separated part) — byte-for-byte the
+/// predicate `compile_to_defs_state` evaluates against `c_nouns` /
+/// `c_ref_schemes`. Idempotent: re-seeding adds no duplicate facts.
+pub fn seed_instantiable_cell(state: &Object) -> Object {
+    let noun_cell = fetch_cell_seq("Noun", state);
+    let instantiable: Vec<&str> = match noun_cell.as_seq() {
+        Some(facts) => facts.iter().filter_map(|f| {
+            let name = binding(f, "name")?;
+            if binding(f, "objectType") == Some("entity")
+                && binding(f, "referenceScheme")
+                    .map_or(false, |rs| rs.split(',').any(|s| !s.is_empty()))
+            {
+                Some(name)
+            } else {
+                None
+            }
+        }).collect(),
+        None => return state.clone(),
+    };
+    instantiable.into_iter().fold(state.clone(), |acc, noun| {
+        cell_push_unique("Noun_is_instantiable", fact_from_pairs(&[("Noun", noun)]), &acc)
+    })
+}
+
 /// Conflict raised by [`cell_put_keyed`] when the cell already holds a
 /// fact at the same key whose non-key contents differ from the
 /// incoming fact. Materializes the four pieces a UC-enforcement caller
@@ -11149,11 +11191,16 @@ mod tests {
         // reference scheme), so the minimal state DECLARES Person — exactly as
         // a real domain declares its entities before any are created. (Run-time
         // definedness gate, see command.rs create_via_defs.)
-        cell_push(
+        //
+        // task-961-b: this fixture bypasses `compile_to_defs_state`, so it must
+        // seed the `Noun_is_instantiable` cell itself — the run-time gate now
+        // decides PURELY from that cell (procedural fallback removed).
+        let s = cell_push(
             "Noun",
             fact_from_pairs(&[("name", "Person"), ("objectType", "entity"), ("referenceScheme", "id")]),
             &Object::phi(),
-        )
+        );
+        seed_instantiable_cell(&s)
     }
 
     #[test]
