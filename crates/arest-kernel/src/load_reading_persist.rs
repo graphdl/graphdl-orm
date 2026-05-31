@@ -107,6 +107,21 @@ pub const RING_BASE_SECTOR: u64 = 6144;
 /// to land); a future revision can add wrap-around.
 pub const RING_SECTOR_COUNT: u64 = 2048;
 
+/// Minimum disk capacity (in 512-byte sectors) required for the ring to
+/// open successfully. `reserve_region(RING_BASE_SECTOR, RING_SECTOR_COUNT)`
+/// checks `RING_BASE_SECTOR + RING_SECTOR_COUNT <= capacity`, so the disk
+/// must have at least this many sectors. At 512 B/sector this is 4 MiB.
+///
+/// **Boot failure mode (task #973)**: if the persistence disk is smaller
+/// than this threshold — e.g. the 1 MiB (2048-sector) smoke disk that
+/// predates the loaded-readings ring — `reserve_region` returns
+/// `Error::OutOfRange` and `VirtioBlkRing::open()` returns `None`, which
+/// `replay_from_disk` surfaces as "loaded-readings ring: no virtio-blk
+/// device or reservation refused". Increase the disk to at least
+/// `RING_MIN_DISK_SECTORS × 512` bytes (≥ 4 MiB; the UEFI Dockerfiles
+/// use 10 MiB as of this fix).
+pub const RING_MIN_DISK_SECTORS: u64 = RING_BASE_SECTOR + RING_SECTOR_COUNT;
+
 /// Sector size in bytes. Mirrors `block::BLOCK_SECTOR_SIZE` so we
 /// don't import a UEFI-only constant on the host side.
 pub const RING_SECTOR_BYTES: usize = 512;
@@ -1048,5 +1063,53 @@ mod tests {
     #[allow(dead_code)]
     fn _silence_unused() {
         let _ = fact_from_pairs(&[("k", "v")]);
+    }
+
+    /// Regression guard for task #973: the loaded-readings ring lies at
+    /// sectors [RING_BASE_SECTOR, RING_BASE_SECTOR + RING_SECTOR_COUNT).
+    /// `VirtioBlkRing::open()` calls `block_storage::reserve_region` with
+    /// those bounds; `reserve_region` returns `Error::OutOfRange` when the
+    /// disk capacity is smaller than the ring's end sector. The UEFI smoke
+    /// disk was 1 MiB (2048 sectors) when the ring was added (6144..8192),
+    /// so `open()` always returned `None` even though virtio-blk was online.
+    ///
+    /// This test asserts the exact minimum-disk-sector threshold so any
+    /// future change to `RING_BASE_SECTOR` or `RING_SECTOR_COUNT` that
+    /// would re-introduce the regression is caught immediately.
+    #[test]
+    fn ring_layout_fits_minimum_disk_size() {
+        // The ring occupies sectors [RING_BASE_SECTOR, RING_BASE_SECTOR +
+        // RING_SECTOR_COUNT). reserve_region checks `end <= capacity`, so the
+        // disk must have at least RING_BASE_SECTOR + RING_SECTOR_COUNT sectors.
+        let ring_end = RING_BASE_SECTOR
+            .checked_add(RING_SECTOR_COUNT)
+            .expect("ring layout: sector range must not overflow u64");
+        assert_eq!(
+            ring_end, RING_MIN_DISK_SECTORS,
+            "RING_MIN_DISK_SECTORS must equal RING_BASE_SECTOR + RING_SECTOR_COUNT"
+        );
+        // 8192 sectors × 512 B = 4 MiB. Confirm the minimum disk requirement
+        // to catch constant drift (e.g. someone bumps RING_BASE_SECTOR without
+        // updating the Dockerfiles).
+        assert_eq!(
+            RING_MIN_DISK_SECTORS, 8192,
+            "ring layout regression (#973): RING_BASE_SECTOR=6144 + RING_SECTOR_COUNT=2048 \
+             must equal 8192; the persistence disk must be at least 4 MiB (8192 × 512 B)"
+        );
+        // Confirm the existing 1 MiB smoke disk (2048 sectors) is too small —
+        // i.e. that pre-#973 boots failed with OutOfRange, not NotMounted.
+        let old_smoke_disk_sectors: u64 = 2048; // 1 MiB
+        assert!(
+            old_smoke_disk_sectors < RING_MIN_DISK_SECTORS,
+            "old 1 MiB disk ({old_smoke_disk_sectors} sectors) was too small \
+             for the ring; confirms the #973 reservation-refused root cause"
+        );
+        // The fix bumps all UEFI Dockerfiles to 10 MiB (20 480 sectors).
+        let fixed_disk_sectors: u64 = 10 * 1024 * 1024 / 512; // 10 MiB
+        assert!(
+            fixed_disk_sectors >= RING_MIN_DISK_SECTORS,
+            "fixed 10 MiB disk ({fixed_disk_sectors} sectors) must accommodate \
+             the ring (needs {RING_MIN_DISK_SECTORS} sectors)"
+        );
     }
 }

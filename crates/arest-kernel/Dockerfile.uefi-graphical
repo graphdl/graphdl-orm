@@ -112,7 +112,7 @@ RUN dd if=/dev/zero of=/uefi-disk.img bs=1M count=64 status=none \
     && mmd -i /uefi-disk.img ::/EFI/BOOT \
     && mcopy -i /uefi-disk.img /arest-kernel.efi ::/EFI/BOOT/BOOTX64.EFI
 
-RUN dd if=/dev/zero of=/disk.img bs=1M count=1 status=none
+RUN dd if=/dev/zero of=/disk.img bs=1M count=10 status=none
 
 EXPOSE 8080
 
