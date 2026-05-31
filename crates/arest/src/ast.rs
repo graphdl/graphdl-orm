@@ -3925,6 +3925,18 @@ fn command_field_overflow(command: &crate::command::Command) -> Option<&'static 
             match signature.as_deref().map(over).unwrap_or(false) { true => return Some("signature"), false => {} }
             None
         }
+        // task-crudl-deploy-readpath: read commands — check noun, entity_id, sender.
+        Command::GetEntity { noun, entity_id, sender } => {
+            match over(noun) { true => return Some("noun"), false => {} }
+            match over(entity_id) { true => return Some("entityId"), false => {} }
+            match sender.as_deref().map(over).unwrap_or(false) { true => return Some("sender"), false => {} }
+            None
+        }
+        Command::ListEntities { noun, sender } => {
+            match over(noun) { true => return Some("noun"), false => {} }
+            match sender.as_deref().map(over).unwrap_or(false) { true => return Some("sender"), false => {} }
+            None
+        }
     }
 }
 

@@ -236,6 +236,32 @@ pub enum Command {
         #[serde(default)]
         signature: Option<String>,
     },
+    /// task-crudl-deploy-readpath (get-by-id): fetch a single entity by id and
+    /// return the full Theorem-4 HATEOAS+CRUDL representation — transitions, nav,
+    /// view (ui-readings), and the "instance" CRUDL action menu. Read-only: emits
+    /// an empty delta (D'=D). Distinguishes this from the raw `get:{noun}` platform
+    /// primitive (which returns only data) by adding the HATEOAS layer.
+    ///
+    /// JSON surface: `{"type":"getEntity","noun":"Task","entityId":"t-1"}`
+    GetEntity {
+        noun: String,
+        #[serde(alias = "entityId")]
+        entity_id: String,
+        #[serde(default)]
+        sender: Option<String>,
+    },
+    /// task-crudl-deploy-readpath (list/collection): list all entities of a noun
+    /// and return the "collection" CRUDL action menu for the authenticated sender.
+    /// Read-only: emits an empty delta (D'=D). The CRUDL menu carries the actions
+    /// available at the collection level (e.g. "create"). No per-entity view or
+    /// transitions are projected for the collection (those live on the instance).
+    ///
+    /// JSON surface: `{"type":"listEntities","noun":"Task"}`
+    ListEntities {
+        noun: String,
+        #[serde(default)]
+        sender: Option<String>,
+    },
 }
 
 /// task-971: an ordered (role, value) pair for the `AssertFact` command.
@@ -673,6 +699,16 @@ pub fn apply_command_defs(
         }
         Command::AssertFact { fact_type, pairs, sender: _, signature: _ } => {
             assert_fact_via_defs(d, fact_type, pairs, state)
+        }
+        // task-crudl-deploy-readpath: enriched read commands — populate view + crudl.
+        // Gated on std-deps (serde_json + platform primitives required).
+        #[cfg(not(feature = "no_std"))]
+        Command::GetEntity { noun, entity_id, sender } => {
+            get_entity_via_defs(d, noun, entity_id, sender.as_deref(), state)
+        }
+        #[cfg(not(feature = "no_std"))]
+        Command::ListEntities { noun, sender } => {
+            list_entities_via_defs(d, noun, sender.as_deref(), state)
         }
         #[allow(unreachable_patterns)]
         _ => CommandResult {
@@ -4005,6 +4041,138 @@ fn reload_reading_handler(
                 state: ast::Object::phi(),
             }
         }
+    }
+}
+
+// -- Read-path handlers (task-crudl-deploy-readpath) -----------------
+
+/// task-crudl-deploy-readpath (get-by-id): fetch a single entity by id and
+/// return the full Theorem-4 HATEOAS representation — transitions (SM), nav,
+/// view (ui-readings gate), and the "instance" CRUDL action menu populated
+/// from the substrate `authorized` predicate gated on `sender`.
+///
+/// Read-only — emits an empty delta (D'=D). Mirrors the emit block of
+/// `create_via_defs` but without the resolve→derive→validate stages (the
+/// entity already exists in `state`). Returns Bottom-shaped empty result when
+/// no entity with `entity_id` is found in state.
+#[cfg(not(feature = "no_std"))]
+fn get_entity_via_defs(
+    d: &ast::Object,
+    noun: &str,
+    entity_id: &str,
+    sender: Option<&str>,
+    state: &ast::Object,
+) -> CommandResult {
+    // Fetch the entity's 3NF row via the platform primitive (same path as
+    // `get:{noun}` but called directly so we can enrich the result).
+    let entity_json_obj = ast::apply(
+        &ast::Func::Platform(alloc::format!("get_noun:{}", noun)),
+        &ast::Object::atom(entity_id),
+        state,
+    );
+    let entity_json = match entity_json_obj.as_atom() {
+        Some(s) if !s.is_empty() && s != "⊥" => s.to_string(),
+        _ => {
+            // Entity not found — return a clean empty result (no violation: caller
+            // may have passed a missing id; the read path is not alethic).
+            return CommandResult {
+                entities: vec![],
+                status: None,
+                transitions: vec![],
+                navigation: vec![],
+                violations: vec![],
+                derived_count: 0,
+                rejected: false,
+                view: None,
+                crudl: Vec::new(),
+                state: ast::Object::phi(),
+            };
+        }
+    };
+    // Parse entity data fields from the JSON row.
+    let entity_data: hashbrown::HashMap<String, String> = serde_json::from_str::<serde_json::Value>(&entity_json)
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .map(|obj| obj.iter()
+            .filter(|(k, _)| k.as_str() != "id")
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect())
+        .unwrap_or_default();
+    // SM status + HATEOAS transitions + navigation (mirrors create_via_defs emit block).
+    let status = extract_sm_status(state, entity_id);
+    let transitions = hateoas_via_rho(d, noun, entity_id, status.as_deref());
+    let navigation = nav_links_via_rho(d, noun, entity_id);
+    // View projection (ui-readings gate — None when ui-readings not compiled in).
+    let view = view_via_rho(d, noun, entity_id);
+    // task-crudl-deploy-readpath: "instance" CRUDL menu — gated on sender.
+    let crudl = crudl_menu(d, noun, "instance", sender.unwrap_or(""));
+    CommandResult {
+        entities: alloc::vec![EntityResult {
+            id: entity_id.to_string(),
+            entity_type: noun.to_string(),
+            data: entity_data,
+        }],
+        status,
+        transitions,
+        navigation,
+        violations: vec![],
+        derived_count: 0,
+        rejected: false,
+        view,
+        crudl,
+        state: ast::Object::phi(), // read-only: D' = D
+    }
+}
+
+/// task-crudl-deploy-readpath (list/collection): list all entities of a noun
+/// and return the "collection" CRUDL action menu for the authenticated sender.
+///
+/// Read-only — emits an empty delta (D'=D). Per-entity transitions and view are
+/// NOT projected here (those live on the instance); only the collection-level
+/// CRUDL menu (e.g. "create") is attached. Returns an empty entity list when
+/// no entities exist for the noun.
+#[cfg(not(feature = "no_std"))]
+fn list_entities_via_defs(
+    d: &ast::Object,
+    noun: &str,
+    sender: Option<&str>,
+    state: &ast::Object,
+) -> CommandResult {
+    // Fetch all entities via the platform primitive (same path as `list:{noun}`).
+    let list_json_obj = ast::apply(
+        &ast::Func::Platform(alloc::format!("list_noun:{}", noun)),
+        &ast::Object::phi(),
+        state,
+    );
+    let entities: Vec<EntityResult> = list_json_obj.as_atom()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|item| {
+            let id = item.get("id")?.as_str()?.to_string();
+            let data: hashbrown::HashMap<String, String> = item.as_object()
+                .map(|obj| obj.iter()
+                    .filter(|(k, _)| k.as_str() != "id")
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect())
+                .unwrap_or_default();
+            Some(EntityResult { id, entity_type: noun.to_string(), data })
+        })
+        .collect();
+    // task-crudl-deploy-readpath: "collection" CRUDL menu — gated on sender.
+    let crudl = crudl_menu(d, noun, "collection", sender.unwrap_or(""));
+    CommandResult {
+        entities,
+        status: None,
+        transitions: vec![],
+        navigation: vec![],
+        violations: vec![],
+        derived_count: 0,
+        rejected: false,
+        view: None,
+        crudl,
+        state: ast::Object::phi(), // read-only: D' = D
     }
 }
 
@@ -8974,6 +9142,225 @@ Task blocks Task is asymmetric.
         assert!(!self_ref,
             "task-971: the self-referencing fact must NOT persist in the cell \
              after the alethic rejection; ring_cell={:?}", ring_cell);
+    }
+
+    // ── task-crudl-deploy-readpath tests ─────────────────────────────
+
+    /// task-crudl-deploy-readpath (smoke): the new Command variants deserialize
+    /// from their JSON surface forms.
+    #[test]
+    fn get_entity_command_deserializes_from_json() {
+        let json = r#"{"type":"getEntity","noun":"Task","entityId":"t-1"}"#;
+        let cmd: Command = serde_json::from_str(json)
+            .expect("getEntity JSON must deserialize");
+        match cmd {
+            Command::GetEntity { noun, entity_id, sender } => {
+                assert_eq!(noun, "Task");
+                assert_eq!(entity_id, "t-1");
+                assert!(sender.is_none());
+            }
+            other => panic!("expected GetEntity, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn list_entities_command_deserializes_from_json() {
+        let json = r#"{"type":"listEntities","noun":"Task","sender":"alice"}"#;
+        let cmd: Command = serde_json::from_str(json)
+            .expect("listEntities JSON must deserialize");
+        match cmd {
+            Command::ListEntities { noun, sender } => {
+                assert_eq!(noun, "Task");
+                assert_eq!(sender.as_deref(), Some("alice"));
+            }
+            other => panic!("expected ListEntities, got {:?}", other),
+        }
+    }
+
+    /// task-crudl-deploy-readpath: get-by-id (instance) returns a populated crudl
+    /// menu for an authorized sender. The test:
+    ///   1. Sets up Order schema + SM defs.
+    ///   2. Creates an Order entity (ORD-rdp) so the instance exists.
+    ///   3. Pushes substrate CRUDL facts: Operation_applies_in_View_Context for
+    ///      'edit' in 'instance', User_is_authorized_for_Operation_on_Noun for
+    ///      alice on 'edit' on 'Order'.
+    ///   4. Calls GetEntity and asserts crudl is populated with 'edit'.
+    ///   5. Asserts an unauthorized sender (bob) gets an empty crudl.
+    #[test]
+    fn get_entity_via_defs_populates_instance_crudl() {
+        let (def_obj, state) = setup_order_defs();
+
+        // Step 2: create an Order entity so there is something to get.
+        let create_cmd = Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "".to_string(),
+            id: Some("ORD-rdp".to_string()),
+            fields: {
+                let mut f = HashMap::new();
+                f.insert("amount".to_string(), "42".to_string());
+                f
+            },
+            sender: None,
+            signature: None,
+        };
+        let create_result = apply_command_defs(&def_obj, &create_cmd, &state);
+        assert!(!create_result.rejected, "setup create must not reject; violations={:?}", create_result.violations);
+        let post_create = ast::merge_delta(&state, &create_result.state, None);
+        let post_create_d = ast::merge_delta(&def_obj, &create_result.state, None);
+
+        // Step 3: push substrate CRUDL facts into d.
+        // `Operation applies in View Context` — 'edit' applies in 'instance'.
+        let d_with_crudl = {
+            let d = ast::cell_push(
+                "Operation_applies_in_View_Context",
+                ast::fact_from_pairs(&[("Operation", "edit"), ("View Context", "instance")]),
+                &post_create_d,
+            );
+            // `User is authorized for Operation on Noun` — alice may 'edit' Order.
+            ast::cell_push(
+                "User_is_authorized_for_Operation_on_Noun",
+                ast::fact_from_pairs(&[("User", "alice"), ("Operation", "edit"), ("Noun", "Order")]),
+                &d,
+            )
+        };
+
+        // Step 4: call GetEntity as alice — must return crudl = [edit].
+        let get_cmd = Command::GetEntity {
+            noun: "Order".to_string(),
+            entity_id: "ORD-rdp".to_string(),
+            sender: Some("alice".to_string()),
+        };
+        let result = apply_command_defs(&d_with_crudl, &get_cmd, &post_create);
+        assert!(!result.rejected, "GetEntity must not reject");
+        assert_eq!(result.entities.len(), 1, "must return exactly one entity");
+        assert_eq!(result.entities[0].id, "ORD-rdp");
+        assert!(
+            result.crudl.iter().any(|m| m.operation == "edit"),
+            "instance crudl must contain 'edit' for alice; got {:?}", result.crudl
+        );
+        assert!(
+            result.crudl.iter().all(|m| m.operation != "create"),
+            "instance crudl must NOT contain 'create' (collection op); got {:?}", result.crudl
+        );
+
+        // Step 5: call GetEntity as bob (no grants) — must return empty crudl.
+        let get_bob = Command::GetEntity {
+            noun: "Order".to_string(),
+            entity_id: "ORD-rdp".to_string(),
+            sender: Some("bob".to_string()),
+        };
+        let bob_result = apply_command_defs(&d_with_crudl, &get_bob, &post_create);
+        assert!(bob_result.crudl.is_empty(),
+            "bob (no grants) must get an empty instance crudl; got {:?}", bob_result.crudl);
+    }
+
+    /// task-crudl-deploy-readpath: list (collection) returns a populated crudl
+    /// menu for an authorized sender. The test:
+    ///   1. Sets up Order schema + SM defs.
+    ///   2. Creates an Order entity (ORD-lst) so the collection is non-empty.
+    ///   3. Pushes substrate CRUDL facts: Operation_applies_in_View_Context for
+    ///      'create' in 'collection', User_is_authorized_for_Operation_on_Noun
+    ///      for alice on 'create' on 'Order'.
+    ///   4. Calls ListEntities and asserts crudl is populated with 'create'.
+    ///   5. Asserts an unauthorized sender (bob) gets an empty crudl.
+    #[test]
+    fn list_entities_via_defs_populates_collection_crudl() {
+        let (def_obj, state) = setup_order_defs();
+
+        // Step 2: create an entity so the collection is non-empty.
+        let create_cmd = Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "".to_string(),
+            id: Some("ORD-lst".to_string()),
+            fields: {
+                let mut f = HashMap::new();
+                f.insert("amount".to_string(), "99".to_string());
+                f
+            },
+            sender: None,
+            signature: None,
+        };
+        let create_result = apply_command_defs(&def_obj, &create_cmd, &state);
+        assert!(!create_result.rejected, "setup create must not reject; violations={:?}", create_result.violations);
+        let post_create = ast::merge_delta(&state, &create_result.state, None);
+        let post_create_d = ast::merge_delta(&def_obj, &create_result.state, None);
+
+        // Step 3: push substrate CRUDL facts for the collection context.
+        // 'create' applies in 'collection'.
+        let d_with_crudl = {
+            let d = ast::cell_push(
+                "Operation_applies_in_View_Context",
+                ast::fact_from_pairs(&[("Operation", "create"), ("View Context", "collection")]),
+                &post_create_d,
+            );
+            // alice is authorized to 'create' Order.
+            ast::cell_push(
+                "User_is_authorized_for_Operation_on_Noun",
+                ast::fact_from_pairs(&[("User", "alice"), ("Operation", "create"), ("Noun", "Order")]),
+                &d,
+            )
+        };
+
+        // Step 4: call ListEntities as alice — must return crudl = [create].
+        let list_cmd = Command::ListEntities {
+            noun: "Order".to_string(),
+            sender: Some("alice".to_string()),
+        };
+        let result = apply_command_defs(&d_with_crudl, &list_cmd, &post_create);
+        assert!(!result.rejected, "ListEntities must not reject");
+        assert!(
+            result.entities.iter().any(|e| e.id == "ORD-lst"),
+            "list must contain the created entity 'ORD-lst'; got {:?}", result.entities
+        );
+        assert!(
+            result.crudl.iter().any(|m| m.operation == "create"),
+            "collection crudl must contain 'create' for alice; got {:?}", result.crudl
+        );
+        assert!(
+            result.crudl.iter().all(|m| m.operation != "edit"),
+            "collection crudl must NOT contain 'edit' (instance op); got {:?}", result.crudl
+        );
+
+        // Step 5: call ListEntities as bob (no grants) — must return empty crudl.
+        let list_bob = Command::ListEntities {
+            noun: "Order".to_string(),
+            sender: Some("bob".to_string()),
+        };
+        let bob_result = apply_command_defs(&d_with_crudl, &list_bob, &post_create);
+        assert!(bob_result.crudl.is_empty(),
+            "bob (no grants) must get an empty collection crudl; got {:?}", bob_result.crudl);
+    }
+
+    /// task-crudl-deploy-readpath: get_entity_via_defs returns empty result
+    /// (not a rejection) when the entity_id is not found.
+    #[test]
+    fn get_entity_via_defs_missing_entity_returns_empty() {
+        let (def_obj, state) = setup_order_defs();
+        let cmd = Command::GetEntity {
+            noun: "Order".to_string(),
+            entity_id: "DOES-NOT-EXIST".to_string(),
+            sender: Some("alice".to_string()),
+        };
+        let result = apply_command_defs(&def_obj, &cmd, &state);
+        assert!(!result.rejected, "GetEntity for missing id must not reject");
+        assert!(result.entities.is_empty(), "GetEntity for missing id must return empty entity list");
+        assert!(result.crudl.is_empty(), "GetEntity for missing id must return empty crudl");
+    }
+
+    /// task-crudl-deploy-readpath: list_entities_via_defs returns empty entities
+    /// (not a rejection) when no entities exist.
+    #[test]
+    fn list_entities_via_defs_empty_collection_returns_clean_result() {
+        let (def_obj, state) = setup_order_defs();
+        let cmd = Command::ListEntities {
+            noun: "Order".to_string(),
+            sender: None,
+        };
+        let result = apply_command_defs(&def_obj, &cmd, &state);
+        assert!(!result.rejected, "ListEntities on empty collection must not reject");
+        assert!(result.entities.is_empty(), "ListEntities on empty collection must return no entities");
+        // No sender → crudl is always empty (no user to authorize against).
+        assert!(result.crudl.is_empty(), "ListEntities with no sender must return empty crudl");
     }
 
     /// task-971: the JSON `{"type":"assertFact",...}` shape deserializes
