@@ -49,7 +49,7 @@ Derivation Marker Symbol is a value type.
 Role Position is a value type.
 Literal Value is a value type.
 Keyword is a value type.
-  The possible values of Keyword are 'iff', 'if', 'when'.
+  The possible values of Keyword are 'iff', 'if'.
 Deontic Operator is a value type.
   The possible values of Deontic Operator are 'obligatory', 'forbidden', 'permitted'.
 Literal Role is a value type.
@@ -229,7 +229,6 @@ Statement has Classification 'Enum Values Declaration' iff Statement has Verb 't
 
 Statement has Classification 'Derivation Rule' iff Statement has Keyword 'iff'.
 Statement has Classification 'Derivation Rule' iff Statement has Keyword 'if'.
-Statement has Classification 'Derivation Rule' iff Statement has Keyword 'when'.
 
 Statement has Classification 'Fact Type Reading' iff Statement has Role Reference.
 

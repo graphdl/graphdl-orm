@@ -2623,7 +2623,7 @@ fn derivation_consequent_text(rule_text: &str) -> &str {
     for m in ["** ", "* ", "+ "] {
         if let Some(rest) = t.strip_prefix(m) { t = rest; break; }
     }
-    match t.find(" iff ").or_else(|| t.find(" if ")).or_else(|| t.find(" when ")) {
+    match t.find(" iff ").or_else(|| t.find(" if ")) {
         Some(i) => t[..i].trim(),
         None => t,
     }

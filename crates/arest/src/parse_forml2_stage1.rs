@@ -68,7 +68,7 @@ pub struct Vocab {
     /// `some`, `no`, `at most`, `at least`). Used for both leading
     /// quantifier stripping and inner quantifier detection.
     pub quantifiers: Vec<String>,
-    /// Conditional/derivation keywords (e.g. `iff`, `if`, `when`).
+    /// Conditional/derivation keywords (e.g. `iff`, `if`).
     pub keywords: Vec<String>,
     /// Multi-clause constraint keyword phrases (e.g. `if and only if`,
     /// `at most one of the following holds`).
@@ -98,7 +98,7 @@ impl Vocab {
             quantifiers: ["each", "at most one", "at least one", "exactly one",
                           "some", "no", "at most", "at least"]
                 .iter().map(|s| s.to_string()).collect(),
-            keywords: ["iff", "if", "when"]
+            keywords: ["iff", "if"]
                 .iter().map(|s| s.to_string()).collect(),
             constraint_keywords: [
                 "if and only if",
@@ -1378,7 +1378,7 @@ mod tests {
         // A `Vocab` derived from that state must include those atoms.
         let state = synthetic_vocab_state(&[
             ("Quantifier", &["each", "some", "no"]),
-            ("Keyword", &["iff", "if", "when"]),
+            ("Keyword", &["iff", "if"]),
             ("Deontic Operator", &["obligatory"]),
             ("Constraint Keyword", &["if and only if"]),
         ]);
@@ -1395,7 +1395,7 @@ mod tests {
     fn vocab_from_grammar_state_falls_back_to_boot_for_missing_types() {
         // EnumValues missing the Quantifier type → boot fallback.
         let state = synthetic_vocab_state(&[
-            ("Keyword", &["iff", "if", "when"]),
+            ("Keyword", &["iff", "if"]),
         ]);
         let vocab = Vocab::from_grammar_state(&state);
         // Boot values present.
@@ -1415,7 +1415,7 @@ mod tests {
         // Statement_has_Quantifier fact.
         let state = synthetic_vocab_state(&[
             ("Quantifier", &["each", "exactly one", "at most", "at least", "some", "no", "at most one", "at least one"]),
-            ("Keyword", &["iff", "if", "when"]),
+            ("Keyword", &["iff", "if"]),
             ("Deontic Operator", &["obligatory", "forbidden", "permitted"]),
             ("Constraint Keyword", &["if and only if"]),
         ]);
@@ -1443,7 +1443,7 @@ mod tests {
         // cell-driven (no fallback to a hardcoded `each`).
         let state = synthetic_vocab_state(&[
             ("Quantifier", &["some", "no"]),  // no `each`
-            ("Keyword", &["iff", "if", "when"]),
+            ("Keyword", &["iff", "if"]),
             ("Deontic Operator", &["obligatory"]),
             ("Constraint Keyword", &["if and only if"]),
         ]);
@@ -1465,7 +1465,7 @@ mod tests {
     fn tokenize_with_vocab_recognizes_keyword_via_cell_path() {
         let state = synthetic_vocab_state(&[
             ("Quantifier", &["each"]),
-            ("Keyword", &["iff", "if", "when"]),
+            ("Keyword", &["iff", "if"]),
             ("Deontic Operator", &["obligatory"]),
             ("Constraint Keyword", &["if and only if"]),
         ]);
@@ -1487,7 +1487,7 @@ mod tests {
     fn tokenize_with_vocab_recognizes_deontic_via_cell_path() {
         let state = synthetic_vocab_state(&[
             ("Quantifier", &["each"]),
-            ("Keyword", &["iff", "if", "when"]),
+            ("Keyword", &["iff", "if"]),
             ("Deontic Operator", &["obligatory", "forbidden", "permitted"]),
             ("Constraint Keyword", &["if and only if"]),
         ]);

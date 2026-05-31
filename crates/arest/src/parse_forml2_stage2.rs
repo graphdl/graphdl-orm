@@ -4179,7 +4179,7 @@ fn strip_role_subscripts(text: &str) -> String {
 
 /// Extract the consequent text from a derivation rule. Strips bullet
 /// markers and trailing terminator, then returns everything before the
-/// leftmost ` iff ` / ` if ` / ` when ` keyword. Falls back to the
+/// leftmost ` iff ` / ` if ` keyword. Falls back to the
 /// stripped rule text when no antecedent keyword is present (well-
 /// formed rules always have one, but the parser's non-rule paths may
 /// still feed in stray classifications).
@@ -4192,7 +4192,7 @@ fn derivation_rule_consequent(rule_text: &str) -> &str {
         }
     }
     t = t.trim_end_matches('.').trim_end();
-    let split_keywords: &[&str] = &[" iff ", " if ", " when "];
+    let split_keywords: &[&str] = &[" iff ", " if "];
     match split_keywords.iter().filter_map(|kw| t.find(kw)).min() {
         Some(idx) => t[..idx].trim_end(),
         None => t,
@@ -4234,7 +4234,7 @@ fn translate_unresolved_clauses(
         let text = match statement_text(idx,stmt_id) {
             Some(t) => t, None => continue,
         };
-        let split_keywords: &[&str] = &[" iff ", " if ", " when "];
+        let split_keywords: &[&str] = &[" iff ", " if "];
         let Some(ante_start) = split_keywords.iter()
             .filter_map(|kw| text.find(kw).map(|i| i + kw.len()))
             .min() else { continue };
