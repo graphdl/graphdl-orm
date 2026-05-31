@@ -64,6 +64,7 @@ use crate::syscall::ioctl;
 use crate::syscall::mmap;
 use crate::syscall::openat;
 use crate::syscall::read;
+use crate::syscall::stat;
 use crate::syscall::write;
 
 /// Linux errno value for "Bad file descriptor". Returned by `write`
@@ -126,6 +127,26 @@ pub const SYS_MUNMAP: u64 = 11;
 /// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_close`. Routes to
 /// `close::handle`, which releases the per-process fd-table slot.
 pub const SYS_CLOSE: u64 = 3;
+
+/// Linux x86_64 syscall number for `stat(pathname, statbuf)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_stat` (= 4).
+/// The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_stat`. Routes to
+/// `stat::handle_stat`, which fills a stubbed `struct stat` (144-byte
+/// Linux x86_64 ABI layout) at the caller's statbuf pointer. In tier-1
+/// there is no VFS path-resolution layer; any non-null path returns a
+/// char-device stat stub. Full path resolution is a follow-up (#500).
+pub const SYS_STAT: u64 = 4;
+
+/// Linux x86_64 syscall number for `fstat(fd, statbuf)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_fstat` (= 5).
+/// The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_fstat`. Routes to
+/// `stat::handle_fstat`, which fills a stubbed `struct stat` for the
+/// known tier-1 file descriptors (0/1/2 as char devices with
+/// `S_IFCHR | 0o666` and `st_blksize = 4096`); returns `-EBADF` for
+/// any other fd. Per #500 (file-state surface).
+pub const SYS_FSTAT: u64 = 5;
 
 /// Linux x86_64 syscall number for `write(fd, buf, count)`. Source:
 /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_write`. The
@@ -306,6 +327,21 @@ pub fn dispatch(
             brk::handle(rdi)
         }
         SYS_CLOSE => close::handle(rdi as i32),
+        SYS_STAT => {
+            // stat(pathname, statbuf) — fill struct stat at statbuf.
+            // rdi = pathname pointer (const char *), rsi = statbuf pointer.
+            // Tier-1: no VFS — returns a char-device stub for any non-null
+            // path. Returns -EFAULT for null pathname or statbuf. Per #500.
+            stat::handle_stat(rdi, rsi)
+        }
+        SYS_FSTAT => {
+            // fstat(fd, statbuf) — fill struct stat at statbuf.
+            // rdi = fd (u64), rsi = statbuf pointer (struct stat *).
+            // Known tier-1 fds (0/1/2) → char-device stub (S_IFCHR|0o666,
+            // st_blksize=4096). Unknown fd → -EBADF. Null statbuf → -EFAULT.
+            // Per #500 (file-state surface).
+            stat::handle_fstat(rdi, rsi)
+        }
         SYS_OPENAT => openat::handle(rdi as i32, rsi, rdx as u32, r10 as u32),
         SYS_FUTEX => {
             // futex(uaddr, futex_op, val, timeout, uaddr2, val3) per
@@ -428,6 +464,20 @@ mod tests {
     #[test]
     fn sys_close_number_matches_linux_uapi() {
         assert_eq!(SYS_CLOSE, 3);
+    }
+
+    /// `SYS_STAT` is 4 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_stat`.
+    #[test]
+    fn sys_stat_number_matches_linux_uapi() {
+        assert_eq!(SYS_STAT, 4);
+    }
+
+    /// `SYS_FSTAT` is 5 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_fstat`.
+    #[test]
+    fn sys_fstat_number_matches_linux_uapi() {
+        assert_eq!(SYS_FSTAT, 5);
     }
 
     /// `SYS_FUTEX` is 202 — matches
@@ -578,16 +628,27 @@ mod tests {
         assert_eq!(result, -ENOSYS);
     }
 
-    /// `write(2, ...)` (stderr — currently unsupported) returns
-    /// `-EBADF`. Verifies the dispatcher correctly routes to the
-    /// write handler and the write handler's fd-validation arm fires.
-    /// (Tier-1 only opens fd 1; fd 2 is reserved by the Process
-    /// construction but the handler currently treats anything other
-    /// than 1 as closed.)
+    /// `write(2, ...)` (stderr) now routes to the kernel serial console
+    /// (same as stdout in tier-1). With zero count it returns 0 — the
+    /// POSIX no-op short circuit fires before the fd check matters.
+    /// Verifies the dispatcher routes SYS_WRITE (1) and that fd=2 is
+    /// accepted after the #500 stderr-routing addition to write::handle.
     #[test]
-    fn dispatch_write_to_unsupported_fd_returns_ebadf() {
-        // fd 2 (stderr), arbitrary buf, zero count
+    fn dispatch_write_to_stderr_returns_zero_for_zero_count() {
+        // fd 2 (stderr), null buf, zero count — count=0 is a POSIX no-op
+        // and returns 0 (the zero-count short-circuit fires before the
+        // fd check; then fd=2 is accepted by the updated handle()).
         let result = dispatch(SYS_WRITE, 2, 0, 0, 0, 0, 0);
+        assert_eq!(result, 0);
+    }
+
+    /// `write(5, ...)` (fd 5 — not a valid tier-1 fd) returns `-EBADF`.
+    /// Verifies the dispatcher routes to the write handler and the
+    /// fd-validation arm fires for fds beyond 0/1/2.
+    #[test]
+    fn dispatch_write_to_unknown_fd_returns_ebadf() {
+        let payload = b"unused";
+        let result = dispatch(SYS_WRITE, 5, payload.as_ptr() as u64, payload.len() as u64, 0, 0, 0);
         assert_eq!(result, -EBADF);
     }
 }

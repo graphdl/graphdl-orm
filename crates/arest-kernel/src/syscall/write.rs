@@ -74,12 +74,21 @@ use crate::syscall::dispatch::{EBADF, EFAULT};
 /// magic number.
 pub const STDOUT_FD: u64 = 1;
 
+/// File-descriptor number for stderr per POSIX
+/// (`<unistd.h>:STDERR_FILENO`). Linux libc defines it as 2. Both
+/// stdout (fd 1) and stderr (fd 2) route to the kernel serial console
+/// in tier-1 — there is a single output stream (the UEFI serial port
+/// or ConOut), so merging them is the correct tier-1 behaviour.
+pub const STDERR_FD: u64 = 2;
+
 /// Handle a `write(fd, buf, count)` syscall. Returns the number of
-/// bytes written on success (always == `count` for fd 1, which never
+/// bytes written on success (always == `count` for fd 1/2, which never
 /// short-writes), or a negative `errno` on failure.
 ///
 /// Tier-1 supported fds:
 ///   * `1` (stdout) → routes to the kernel serial console.
+///   * `2` (stderr) → routes to the kernel serial console (same sink as
+///     stdout; tier-1 has a single output stream).
 ///
 /// Every other fd returns `-EBADF`.
 ///
@@ -93,13 +102,10 @@ pub const STDOUT_FD: u64 = 1;
 /// handler dereferences it directly. Once #527 lands real page tables,
 /// the deref needs to route through the per-process AddressSpace.
 pub fn handle(fd: u64, buf: u64, count: u64) -> i64 {
-    // Reject any fd other than stdout. Tier-1 only opens fd 0/1/2 in
-    // the Process constructor (`Serial` for all three); the handler
-    // currently routes only fd 1. fd 0 is read-only (handled by #508);
-    // fd 2 (stderr) is symmetric to fd 1 but deferred so the demo
-    // surface stays minimal — adding it is a one-line `STDOUT_FD |
-    // STDERR_FD` change in the next slice.
-    if fd != STDOUT_FD {
+    // Accept stdout (fd 1) and stderr (fd 2) — both route to the kernel
+    // serial console in tier-1 (single output stream). fd 0 is read-only
+    // (handled by read::handle / #508); all other fds return -EBADF.
+    if fd != STDOUT_FD && fd != STDERR_FD {
         return -EBADF;
     }
     // Fast-path: zero-length write is a no-op per POSIX. Doing this
@@ -219,14 +225,26 @@ mod tests {
         assert_eq!(result, -EBADF);
     }
 
-    /// `write(2, ..., 10)` — stderr is currently unsupported per the
-    /// tier-1 minimal surface (only stdout). Returns `-EBADF`. Adding
-    /// stderr is a one-line change in a follow-up.
+    /// `write(2, "err", 3)` — stderr routes to the kernel serial console
+    /// (same sink as stdout in tier-1). Returns 3 (the byte count written).
+    /// Added in #500 (file-state surface) — the one-line `STDOUT_FD |
+    /// STDERR_FD` extension anticipated by the original write.rs comment.
     #[test]
-    fn write_to_stderr_returns_ebadf_under_tier_1() {
-        let payload = b"unused";
-        let result = handle(2, payload.as_ptr() as u64, payload.len() as u64);
-        assert_eq!(result, -EBADF);
+    fn write_to_stderr_routes_to_console_and_returns_count() {
+        let payload = b"err";
+        // Use do_write with a mock sink to verify the bytes reach the
+        // sink (same pattern as write_to_stdout_routes_to_sink_and_returns_count).
+        let mut recorded: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        let result = do_write(payload.as_ptr() as u64, payload.len() as u64, &mut |bytes| {
+            recorded.extend_from_slice(bytes);
+        });
+        assert_eq!(result, payload.len() as i64);
+        assert_eq!(recorded.as_slice(), payload);
+        // Also verify handle() accepts fd=2 (does not return -EBADF).
+        // We can't easily capture the serial output in a unit test, but
+        // verifying the return value is sufficient.
+        let handle_result = handle(STDERR_FD, payload.as_ptr() as u64, payload.len() as u64);
+        assert_eq!(handle_result, payload.len() as i64, "write(fd=2) must return count");
     }
 
     /// `write(1, NULL, 0)` is a POSIX no-op — returns 0 without
