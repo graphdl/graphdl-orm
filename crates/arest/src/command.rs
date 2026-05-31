@@ -4053,39 +4053,42 @@ pub(crate) fn menu_component_role(d: &ast::Object, entity_id: &str) -> Option<St
         .and_then(|f| ast::binding(f, "Component Role").map(String::from)))
 }
 
-/// task-crudl-menu-projection: the permission-gated CRUDL action menu for a
-/// fetched entity/collection — the iFactr ActionButtons (create/edit/delete/
-/// save/…) the USER may perform in the given VIEW CONTEXT (collection/instance/
-/// edit). Synthesizes a transient View for the Noun in the context, then
-/// resolves the gated menu view (`ViewElement_renders_Operation` — the
-/// readings/ui/crudl.md operation catalog joined with the role-based authz),
-/// returning the operations permitted to `user`. NEITHER the context filter NOR
-/// the permission gate is hardcoded — both are the derivation (the skolem
-/// ViewElement IS the objectification). Returns [] where ui-readings is compiled
-/// out (no `view:` def) or the user has no grants for the context.
+/// task-crudl-menu-projection (CORRECTED 2026-05-30): the permission-gated CRUDL
+/// action menu for a fetched entity/collection — the iFactr ActionButtons
+/// (create/edit/delete/save/…) the USER may perform in the given VIEW CONTEXT
+/// (collection/instance/edit).
 ///
-/// The engine seam the get (instance) / list (collection) response attaches the
-/// CRUDL menu from; mirrors `menu_component_role` (SM-transition menu) and
-/// `view_via_rho` (detail form).
+/// This is a HATEOAS-level projection (Theorem 4 ρ), NOT a view-level derivation:
+/// permissions are FACTS and must never be verbalized in the view (the server
+/// enforces them with no UI at all; the view is a thin wrapper of value-typed
+/// widgets). So this reads the SUBSTRATE permission predicate
+/// `User is authorized for Operation on Noun` (the discriminator-join authz)
+/// intersected with the operations that apply in this context
+/// (`Operation applies in View Context`, from readings/ui/crudl.md), and projects
+/// them into action links — beside `hateoas_via_rho` (transitions) and
+/// `nav_links_via_rho` (nav). No transient View, no `ViewElement` skolem: the
+/// conflated view-level `ViewElement renders Operation` gate is retired in favour
+/// of this clean predicate-plus-projection. Returns [] when the user is
+/// unauthorized for the context, or the catalog / authz readings aren't loaded.
 pub fn crudl_menu_operations(d: &ast::Object, noun: &str, view_context: &str, user: &str) -> Vec<String> {
-    // Synthesize the View the menu join is gated on (View is for Noun + View has
-    // View Context). Transient — the menu is a projection, not stored.
-    let view_id = format!("crudl-view:{}:{}", noun, view_context);
-    let s = ast::cell_push("View_is_for_Noun",
-        ast::fact_from_pairs(&[("View", view_id.as_str()), ("Noun", noun)]), d);
-    let pop = ast::cell_push("View_has_View_Context",
-        ast::fact_from_pairs(&[("View", view_id.as_str()), ("View Context", view_context)]), &s);
-    let Some(renders) = ast::resolve_view("ViewElement_renders_Operation", &pop, &pop) else {
-        return Vec::new();
-    };
-    // The skolem frontier carries (View, Operation, User, …); keep this view's
-    // items permitted to this user.
-    let mut ops: Vec<String> = renders.as_seq()
+    // The operations the user is authorized for on this noun — the substrate
+    // predicate (the permission lives in facts, gated server-side regardless of UI).
+    let authorized: Vec<String> = ast::fetch_cell_seq("User_is_authorized_for_Operation_on_Noun", d)
+        .as_seq()
         .map(|items| items.iter().filter_map(|f| {
-            (ast::binding(f, "View") == Some(view_id.as_str())
-                && ast::binding(f, "User") == Some(user))
+            (ast::binding(f, "User") == Some(user) && ast::binding(f, "Noun") == Some(noun))
                 .then(|| ast::binding(f, "Operation").map(String::from)).flatten()
         }).collect())
+        .unwrap_or_default();
+    // ∩ the operations that apply in this view context (collection/instance/edit),
+    // from the crudl.md catalog. The menu item appears iff it is BOTH applicable
+    // here AND authorized for the user.
+    let mut ops: Vec<String> = ast::fetch_cell_seq("Operation_applies_in_View_Context", d)
+        .as_seq()
+        .map(|items| items.iter().filter_map(|f| {
+            (ast::binding(f, "View Context") == Some(view_context))
+                .then(|| ast::binding(f, "Operation").map(String::from)).flatten()
+        }).filter(|op| authorized.contains(op)).collect())
         .unwrap_or_default();
     ops.sort();
     ops.dedup();

@@ -5540,47 +5540,38 @@ ViewElement renders Operation. *
         "edit is permitted but instance-context per crudl.md -> excluded from the collection menu; got {:?}", ops);
 }
 
-// crudl-menu-projection (EMISSION): command::crudl_menu_operations is the engine
-// seam -- it synthesizes a View for (Noun, context) and resolves the gated menu
-// over the crudl.md catalog + the user's grants, returning the operations the
-// USER may perform. Proves the emission end-to-end through the function the
-// get/list response will call (mirrors menu_component_role / view_via_rho).
+// crudl-menu-projection (EMISSION, CORRECTED 2026-05-30): command::crudl_menu_operations
+// is the HATEOAS seam -- it projects the SUBSTRATE permission predicate
+// `User is authorized for Operation on Noun` (∩ the operations applicable in the
+// view context, from crudl.md) into the operations the USER may perform.
+// Permissions are FACTS, never verbalized in the view (the server gates them with
+// no UI at all); the menu is a HATEOAS projection beside hateoas_via_rho /
+// nav_links_via_rho. No ViewElement-skolem permission derivation (that conflation
+// is retired). Proves the emission through the function the get/list response calls.
 #[test]
 fn crudl_menu_operations_emits_gated_menu_for_user() {
     let additions = r#"
-View(.ViewName) is an entity type.
-ViewName is a value type.
 User(.Username) is an entity type.
 Username is a value type.
-Role(.RoleName) is an entity type.
-RoleName is a value type.
 Noun(.NounName) is an entity type.
 NounName is a value type.
-ViewElement(.veid) is an entity type.
-veid is a value type.
 
 ## Fact Types
-View is for Noun.
-View has View Context.
-User has Role.
-Role permits Operation on Noun.
-ViewElement renders Operation. *
-
-## Derivation Rules
-* ViewElement (E) renders Operation iff View is for Noun and View has View Context and Operation applies in View Context and User has Role and Role permits Operation on Noun.
+User is authorized for Operation on Noun.
 "#;
     let src = format!("{}\n{}", include_str!("../../../readings/ui/crudl.md"), additions);
-    let state = parse_to_state(&src).expect("crudl.md + menu rule parse");
+    let state = parse_to_state(&src).expect("crudl.md + authz FT parse");
     let defs = compile::compile_to_defs_state(&state);
     let d0 = ast::defs_to_state(&defs, &state);
     let push = |s, cell: &str, pairs: &[(&str, &str)]|
         ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
-    // Auth data only -- crudl_menu_operations synthesizes the View itself.
+    // Substrate authz facts only -- crudl_menu_operations reads `authorized`
+    // (User is authorized for Operation on Noun) ∩ `Operation applies in View
+    // Context` (the latter from crudl.md). alice is authorized for create + edit.
     let d = {
         let s = d0.clone();
-        let s = push(s, "User_has_Role", &[("User", "alice"), ("Role", "editor")]);
-        let s = push(s, "Role_permits_Operation_on_Noun", &[("Role", "editor"), ("Operation", "create"), ("Noun", "Task")]);
-        let s = push(s, "Role_permits_Operation_on_Noun", &[("Role", "editor"), ("Operation", "edit"), ("Noun", "Task")]);
+        let s = push(s, "User_is_authorized_for_Operation_on_Noun", &[("User", "alice"), ("Operation", "create"), ("Noun", "Task")]);
+        let s = push(s, "User_is_authorized_for_Operation_on_Noun", &[("User", "alice"), ("Operation", "edit"), ("Noun", "Task")]);
         s
     };
     // alice's collection menu = [create] (collection-context + permitted; edit is permitted but instance).
