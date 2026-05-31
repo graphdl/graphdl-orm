@@ -157,8 +157,7 @@ Noun is instantiable. **
        it is an entity type (objectType='entity') AND it has a reference
        scheme (identity). The derivation under ## Derivation Rules below
        carries the logic; the Rust create/update gate at
-       command.rs::noun_runtime_defined reads this stored cell first,
-       falling back to the procedural Noun-cell scan when the cell is empty.
+       command.rs::noun_runtime_defined reads this stored cell first.
 
        task-961 Phase A (derivation rework): the 2nd conjunct now reads the
        VALUE-typed presence projection `Noun has Reference Scheme` (above),
@@ -169,30 +168,41 @@ Noun is instantiable. **
        entities, so this cell stayed empty for them and the procedural
        fallback alone carried the gate. The `**` marker stores the consequent.
 
-       task-961 Phase B (this change): the alethic instantiability constraint
-       below makes the rejection of a non-instantiable-noun create/update
-       DECLARATIVE. `command.rs::noun_runtime_defined` now treats this stored
-       cell as the AUTHORITATIVE source whenever it is NON-EMPTY: a create of
-       a noun absent from a populated `Noun_is_instantiable` is rejected
-       (D' = D, per AREST.tex eq:create §157). The procedural Noun-cell scan
-       is RETAINED as a fallback ONLY for states where the cell is still
-       empty (a metamodel compiled before Phase A materialized it — e.g. the
-       minimal test metamodel, or a live DB not yet recompiled past Phase A).
-       The constraint never fires on an empty cell, so it can only ever
-       tighten — never reject a create the procedural gate would have allowed.
-       Full removal of the procedural fallback is gated on a live-DB
-       recompile pass that guarantees every reachable state carries a
-       populated cell. -->
+       task-961 Phase B: the alethic instantiability constraint below makes
+       the rejection of a non-instantiable-noun create/update DECLARATIVE.
+       `command.rs::noun_runtime_defined` treats the cell as the AUTHORITATIVE
+       source whenever it is NON-EMPTY. A create of a noun absent from a
+       populated `Noun_is_instantiable` is rejected (D' = D, per AREST.tex
+       eq:create §157). The procedural Noun-cell scan was retained as a
+       fallback ONLY for states where the cell was still empty.
+
+       task-961 Phase C (this codebase): `compile_to_defs_state` now ALWAYS
+       emits `_Noun_is_instantiable_compiled` (same predicate: objectType='entity'
+       AND non-empty referenceScheme, evaluated at compile time against the Noun
+       cell). `noun_instantiable_per_cell` checks BOTH `Noun_is_instantiable`
+       (forward-chain-produced) AND `_Noun_is_instantiable_compiled` (compile-time
+       constant, with FFP `[', Seq]` wrapper unwrapped), providing a fast-path
+       declarative admit for any noun known at compile time.  The procedural
+       fallback `noun_runtime_defined_procedural` is RETAINED for:
+         (a) states built without `compile_to_defs_state` (phi-state test
+             fixtures like `apply_command_phi_state()`), and
+         (b) nouns added to `state` dynamically after the last compile.
+       Full procedural removal requires guaranteeing every `apply` path passes
+       through `compile_to_defs_state` — a follow-up child task.
+       Oracle-equivalence pinned by
+       `compile_noun_is_instantiable_compile_time_cell_matches_procedural_predicate`
+       in compile.rs. -->
 
 It is impossible that a Resource is an instance of a Noun that is not instantiable.
-  <!-- task-961 Phase B — the declarative instantiability constraint. ALETHIC
+  <!-- task-961 Phase B/C — the declarative instantiability constraint. ALETHIC
        (AREST.tex §328 "It is impossible that …"): instantiating an entity of
-       a noun that is not in the derived `Noun_is_instantiable` cell is a
-       structural impossibility and rejects (D' = D). The check is a one-step
-       set-membership test against the Phase-A-materialized cell — the
-       predicate logic lives in the `Noun is instantiable` derivation, not in
-       procedural Rust. Evaluated by `command.rs::noun_runtime_defined` (cell-
-       authoritative when populated) as the create/update run-time gate. -->
+       a noun that is not in either the derived `Noun_is_instantiable` cell OR
+       the compile-time `_Noun_is_instantiable_compiled` cell is a structural
+       impossibility and rejects (D' = D). The check is a set-membership test
+       whose predicate logic lives in the `Noun is instantiable` derivation
+       and the compile-time materialisation in `compile_to_defs_state`.
+       Evaluated by `command.rs::noun_runtime_defined` as the create/update
+       run-time gate (with procedural fallback for uncomplied states). -->
 
 ### Reading
 Reading has Text.

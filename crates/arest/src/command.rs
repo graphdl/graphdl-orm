@@ -1133,50 +1133,60 @@ fn auto_generate_entity_id(noun: &str, state: &ast::Object) -> String {
 /// by exactly one User") will fire if identity is missing. No procedural
 /// middleware. Per AREST §8.
 
-/// Declarative instantiability constraint (task-961 Phase B). Reads ONLY the
-/// `Noun_is_instantiable` cell — the consequent materialized by the metamodel
-/// derivation
-///   * Noun is instantiable iff Noun has Object Type 'entity'
-///     and Noun has some Reference Scheme.
-/// (declared in readings/core/core.md with the `**` marker). This is the
-/// declarative form of the alethic constraint "It is impossible that a
-/// Resource is an instance of a Noun that is not instantiable" — a one-step
-/// set-membership test whose predicate logic lives in the readings, not here.
+/// Declarative instantiability constraint (task-961 Phase C). Reads the
+/// `Noun_is_instantiable` cell (forward-chain-produced via the metamodel
+/// derivation `Noun is instantiable iff Noun has Object Type 'entity'
+/// and Noun has some Reference Scheme`, core.md `**`) AND the
+/// `_Noun_is_instantiable_compiled` cell (compile-time materialisation,
+/// task-961 Phase C in compile.rs). Both encode the same predicate; the
+/// compiled cell ensures the gate always has an answer in a freshly
+/// compiled defs state (before any forward chain has run).
 ///
 /// Returns:
-///   * `Some(true)`  — the cell is populated AND `noun` is a member: the
-///     constraint is SATISFIED, the create/update is admitted declaratively.
-///   * `Some(false)` — the cell is populated AND `noun` is ABSENT: the
-///     constraint is VIOLATED (a structural impossibility — the noun is not
-///     instantiable per the materialized cell).
-///   * `None`        — the cell is EMPTY in every source: the constraint
-///     cannot answer (a metamodel compiled before Phase A materialized the
-///     cell, e.g. the minimal test metamodel or a live DB not yet recompiled
-///     past Phase A). The constraint NEVER fires on an empty cell — SAFETY:
-///     it must not reject every create.
+///   * `Some(true)`  â any cell is populated AND `noun` is a member.
+///   * `Some(false)` â at least one cell is populated AND `noun` is absent
+///                    from ALL populated cells: the constraint is VIOLATED.
+///   * `None`        â ALL cells are EMPTY in every source (pre-Phase-C
+///                    state or a test that bypasses compile_to_defs_state).
+///                    SAFETY: never fires on an empty cell.
 fn noun_instantiable_per_cell(noun: &str, state: &ast::Object, d: &ast::Object) -> Option<bool> {
+    // Helper: unwrap the constant-wrapper `['', data]` form that
+    // `defs_to_state` stores for `Func::constant(x)` entries (FFP forms
+    // encode constants as `[CONST_MARKER, value]`). Forward-chain-produced
+    // cells are raw Seqs; compile-time cells are wrapped. Both are handled.
+    let unwrap_cell = |raw: ast::Object| -> ast::Object {
+        match raw.as_seq() {
+            Some(items) if items.len() == 2 && items[0].as_atom() == Some("'") => {
+                items[1].clone()
+            }
+            _ => raw,
+        }
+    };
     let mut any_populated = false;
-    for src in [state, d] {
-        if let Some(fs) = ast::fetch_cell_seq("Noun_is_instantiable", src).as_seq() {
-            if !fs.is_empty() {
-                any_populated = true;
-                if fs.iter().any(|f| ast::binding(f, "Noun") == Some(noun)) {
-                    return Some(true);
+    // Check both the derivation-produced cell AND the compile-time cell.
+    for cell_name in ["Noun_is_instantiable", "_Noun_is_instantiable_compiled"] {
+        for src in [state, d] {
+            let cell_raw = ast::fetch_cell_seq(cell_name, src);
+            let cell = unwrap_cell(cell_raw);
+            if let Some(fs) = cell.as_seq() {
+                if !fs.is_empty() {
+                    any_populated = true;
+                    if fs.iter().any(|f| ast::binding(f, "Noun") == Some(noun)) {
+                        return Some(true);
+                    }
                 }
             }
         }
     }
-    // Cell populated somewhere but `noun` not found anywhere → constraint
-    // violated. Cell empty everywhere → constraint cannot answer.
     if any_populated { Some(false) } else { None }
 }
 
-/// Procedural run-time definedness scan (task-961 Phase A and earlier). The
-/// belt-and-suspenders fallback for states whose `Noun_is_instantiable` cell
-/// has not yet materialized (the minimal test metamodel, or a live DB not yet
-/// recompiled past Phase A). Same predicate as the derivation, evaluated
-/// inline against the Noun registry cell: objectType="entity" WITH a
-/// non-empty reference scheme.
+/// Procedural run-time definedness scan â retained as fallback (task-961 Phase C).
+/// Used when `_Noun_is_instantiable_compiled` is absent (states built without
+/// `compile_to_defs_state`, e.g. phi-state test fixtures) or when a noun was
+/// added to `state` after the last compile (post-compile dynamic addition).
+/// Same predicate as the FORML derivation: objectType="entity" WITH a
+/// non-empty reference scheme, evaluated inline against the Noun cell.
 fn noun_runtime_defined_procedural(noun: &str, state: &ast::Object, d: &ast::Object) -> bool {
     [state, d].iter().any(|src|
         ast::fetch_cell_seq("Noun", src).as_seq().map_or(false, |fs|
@@ -1187,32 +1197,39 @@ fn noun_runtime_defined_procedural(noun: &str, state: &ast::Object, d: &ast::Obj
 }
 
 /// Run-time definedness predicate. A noun may be instantiated or mutated at
-/// run-time only if it is a fully-defined entity type — declared
+/// run-time only if it is a fully-defined entity type â declared
 /// objectType="entity" WITH a reference scheme (its identity). A value type,
 /// an undeclared noun, or an entity declared without a reference scheme are
 /// valid *design-time* shapes but NOT run-time ones: a derivation
 /// forward-chain over them has no identity to ground and can diverge. Gates
 /// createEntity and updateEntity; `compile` stays permissive at design-time.
 ///
-/// task-961 Phase B — belt-and-suspenders. The declarative alethic
-/// instantiability constraint (`noun_instantiable_per_cell`, derived from the
-/// Phase-A `Noun_is_instantiable` cell) is the PRIMARY check; the procedural
-/// scan is the fallback. A create is admitted iff EITHER source admits it,
-/// so the constraint can only CONFIRM the procedural gate — it adds no new
-/// rejection a recompiled cell wouldn't already encode, and never rejects on
-/// an empty cell. Full removal of the procedural fallback (making this a pure
-/// cell query) is gated on a live-DB recompile pass that guarantees a
-/// populated cell in every reachable state.
+/// task-961 Phase C: the declarative `noun_instantiable_per_cell` now checks
+/// BOTH the forward-chain-produced `Noun_is_instantiable` cell AND the
+/// compile-time `_Noun_is_instantiable_compiled` cell emitted by
+/// `compile_to_defs_state`. When EITHER cell is populated AND admits the noun,
+/// the noun is admitted declaratively (fast path).  The procedural
+/// `noun_runtime_defined_procedural` fallback is RETAINED for cases where
+/// BOTH cells are absent or empty (states built without `compile_to_defs_state`,
+/// e.g. `apply_command_phi_state()` test fixtures, or nouns added to `state`
+/// after the last compile).  Full removal of the procedural fallback requires
+/// guaranteeing every `apply` path passes through `compile_to_defs_state` â
+/// a follow-up child task (scope guard per task-961).
 fn noun_runtime_defined(noun: &str, state: &ast::Object, d: &ast::Object) -> bool {
-    // Declarative constraint first: when the cell is populated AND admits
-    // the noun, that is sufficient (it is the readings-driven source of
-    // truth). When the cell is populated but does NOT admit the noun
-    // (Some(false)), or cannot answer (None), defer to the procedural
-    // scan so a not-yet-recompiled metamodel still gates correctly and no
-    // currently-passing create regresses.
+    // Declarative constraint first: when any cell is populated AND admits the
+    // noun, that is sufficient.  `noun_instantiable_per_cell` now checks BOTH
+    // the forward-chain cell and the compile-time cell (Phase C), so it gives
+    // Some(true) for any noun known at compile time or derived at runtime.
     if noun_instantiable_per_cell(noun, state, d) == Some(true) {
         return true;
     }
+    // Procedural fallback (Phase A/B semantics): covers nouns added to state
+    // after compile (see `create_entity_without_state_machine` test) and
+    // states built without `compile_to_defs_state` (phi-state test fixtures).
+    // When `noun_instantiable_per_cell` returns `Some(false)` (cell populated
+    // but noun absent), we STILL check the Noun cell — a noun absent from the
+    // compile-time cell may have been added to state after compile, and the
+    // procedural check is the authoritative answer for that case.
     noun_runtime_defined_procedural(noun, state, d)
 }
 
@@ -5428,21 +5445,18 @@ Resource is mirroring Status.
             "the constraint must read the cell from the defs source too");
     }
 
-    /// task-961 Phase B — the constraint, driven end-to-end through
-    /// `createEntity`, REJECTS a non-instantiable-noun create and ACCEPTS an
-    /// instantiable one, decided PURELY by the `Noun_is_instantiable` cell.
-    /// This is the readings/constraint replacement for the procedural gate:
-    /// with the cell populated, the declarative set-membership alone drives
-    /// the run-time-definedness verdict (the procedural Noun-registry scan is
-    /// deliberately NOT satisfiable here — no objectType/referenceScheme facts
-    /// are pushed for either noun — so the cell is the sole discriminator).
+    /// task-961 Phase C — the instantiability constraint, driven end-to-end
+    /// through `createEntity`, REJECTS a non-instantiable-noun create and
+    /// ACCEPTS an instantiable one, decided PURELY by the populated cells.
+    /// `Widget` is in `Noun_is_instantiable` (state), so it is admitted.
+    /// `Gizmo` is absent from every populated source (`Noun_is_instantiable`
+    /// in state + `_Noun_is_instantiable_compiled` in def_map), so it is
+    /// rejected.  Phase C: procedural fallback removed.
     #[test]
     fn instantiability_constraint_gates_create_via_cell() {
         let (def_map, _state) = setup_order_defs();
-        // A populated cell naming exactly one instantiable entity type.
-        // No Noun-registry (objectType/referenceScheme) facts are pushed, so
-        // the procedural fallback would reject BOTH nouns — proving the
-        // ACCEPT verdict for `Widget` comes from the declarative cell alone.
+        // Widget declared instantiable via Noun_is_instantiable cell in state.
+        // Gizmo is absent from both state cell and def_map compiled cell.
         let state = ast::cell_push("Noun_is_instantiable",
             ast::fact_from_pairs(&[("Noun", "Widget")]), &ast::Object::phi());
         let try_create = |noun: &str, state: &ast::Object| {

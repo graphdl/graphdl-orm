@@ -3313,6 +3313,55 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         ));
     }
 
+    // ── task-961 Phase C: compile-time materialisation of Noun_is_instantiable ──
+    //
+    // The FORML reading `Noun is instantiable iff Noun has Object Type 'entity'
+    // and Noun has some Reference Scheme` (core.md Â§Derivation Rules, marked `**`)
+    // is the AUTHORITATIVE declarative source of truth.  That reading fires as a
+    // derivation at forward-chain time, but `create_via_defs` / `update_via_defs`
+    // check the `Noun_is_instantiable` cell *before* the forward chain runs — so
+    // the cell would be empty for any defs state whose forward chain has not yet
+    // been seeded (every test fixture that calls `compile_to_defs_state` then
+    // `apply_command_defs` directly).
+    //
+    // Compile-time materialisation bridges the gap: we evaluate the same predicate
+    // (objectType='entity' AND referenceScheme non-empty) eagerly against the `Noun`
+    // cell that is already in `c_nouns` / `c_ref_schemes`, and push the resulting
+    // set as a constant `Noun_is_instantiable` cell into defs.  This is NOT a new
+    // predicate — it is the compiled form of the FORML rule, evaluated once at
+    // compile time instead of re-evaluated procedurally at every create/update call.
+    //
+    // The `**` marker on `Noun is instantiable` makes the derivation write the cell
+    // too, so a reachable state that DID run a forward chain sees a forward-chain-
+    // produced cell.  `defs_to_state` OVERLAYS defs on top of the state: the compile-
+    // time constant lands in `d` unconditionally.  `noun_instantiable_per_cell` reads
+    // from both `state` and `d`, so whichever source is populated wins.  Because
+    // both the compile-time cell and the derivation-produced cell encode the same
+    // predicate, the result is identical.
+    //
+    // Effect on `noun_runtime_defined` (command.rs): the procedural
+    // `noun_runtime_defined_procedural` fallback is no longer needed — the cell is
+    // now ALWAYS populated after `compile_to_defs_state` and `defs_to_state`.  See
+    // `noun_runtime_defined` in command.rs for the removal.
+    //
+    // Oracle-equivalence pinned by:
+    //   `compile_noun_is_instantiable_compile_time_cell_matches_procedural_predicate`
+    //   in the test module below (task-961 Phase C).
+    {
+        let instantiable_facts: Vec<crate::ast::Object> = c_nouns.iter()
+            .filter(|(name, ndef)| {
+                ndef.object_type == "entity"
+                    && c_ref_schemes.get(name.as_str())
+                        .map_or(false, |rs| !rs.is_empty() && rs.iter().any(|s| !s.is_empty()))
+            })
+            .map(|(name, _)| crate::ast::fact_from_pairs(&[("Noun", name.as_str())]))
+            .collect();
+        defs.push((
+            "_Noun_is_instantiable_compiled".to_string(),
+            Func::constant(crate::ast::Object::Seq(instantiable_facts.into())),
+        ));
+    }
+
     // Algebraic rewrite pass (Backus Â§12). Normalize every emitted Func
     // to its smallest equivalent form before it enters D. Rewrites are
     // observational equivalences, so runtime semantics are unchanged;
@@ -13322,7 +13371,77 @@ mod mandatory_role_alethic_rejection_tests {
             "Task".to_string(),
         ], "Noun_is_instantiable must be EXACTLY the entity types with a \
             reference scheme; got {:?}", inst);
+    }
+    /// task-961 Phase C oracle-equivalence: the compile-time
+    /// `_Noun_is_instantiable_compiled` cell agrees exactly with the
+    /// procedural predicate (objectType='entity' AND non-empty referenceScheme).
+    #[test]
+    fn compile_noun_is_instantiable_compile_time_cell_matches_procedural_predicate() {
+        let src = "\r
+            Noun(.name) is an entity type.
+\r
+            Fact Type(.id) is an entity type.
+\r
+              Fact Type is a subtype of Noun.
+\r
+            Object Type is a value type.
+\r
+            Reference Scheme is a value type.
+\r
+            Noun has Object Type.
+\r
+            Noun has Reference Scheme.
+\r
+              Each Noun has at most one Reference Scheme.
+\r
+            Noun is instantiable.
+\r
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let mut extra = state.clone();
+        for (name, obj_type, ref_scheme) in [
+            ("Task",        "entity", "id"),
+            ("Source File", "entity", "path"),
+            ("Schemaless",  "entity", ""),
+            ("Color",       "value",  ""),
+        ] {
+            extra = ast::cell_push("Noun", ast::fact_from_pairs(&[
+                ("name", name), ("objectType", obj_type),
+                ("referenceScheme", ref_scheme), ("worldAssumption", "closed"),
+            ]), &extra);
+        }
+        let defs = compile_to_defs_state(&extra);
+        // Read the cell directly from the defs vec to avoid the func_to_object
+        // constant-wrapper `['', Seq([...])]` that defs_to_state produces.
+        let mut compiled: Vec<String> = defs.iter()
+            .find(|(name, _)| name == "_Noun_is_instantiable_compiled")
+            .and_then(|(_, func)| match func {
+                crate::ast::Func::Constant(obj) => obj.as_seq()
+                    .map(|s| s.iter().filter_map(|f| ast::binding(f, "Noun").map(String::from)).collect()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        compiled.sort(); compiled.dedup();
+        let noun_cell = ast::fetch_cell_seq("Noun", &extra);
+        let mut procedural: Vec<String> = noun_cell.as_seq()
+            .map(|fs| fs.iter().filter_map(|f| {
+                let name = ast::binding(f, "name")?;
+                let otype = ast::binding(f, "objectType")?;
+                let rscheme = ast::binding(f, "referenceScheme").unwrap_or("");
+                if otype == "entity" && !rscheme.is_empty() { Some(name.to_string()) } else { None }
+            }).collect())
+            .unwrap_or_default();
+        procedural.sort(); procedural.dedup();
+        assert_eq!(compiled, procedural,
+            "compile-time _Noun_is_instantiable_compiled must match the procedural \r
+             predicate; compiled={:?} procedural={:?}", compiled, procedural);
+        assert!(compiled.iter().any(|n| n == "Task"));
+        assert!(compiled.iter().any(|n| n == "Source File"));
+        assert!(!compiled.iter().any(|n| n == "Schemaless"));
+        assert!(!compiled.iter().any(|n| n == "Color"));
     }
+
 }
 
 // ── Task 807: validate_model_from_state modality policy ──────────────
