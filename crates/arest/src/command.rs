@@ -827,6 +827,41 @@ pub fn apply_command_batch(
         running = ast::merge_delta(&running, &res.state, None);
     }
 
+    // blocked-status-sm-2 — bounded reconciliation once at the batch tail,
+    // AFTER the per-op forward chains have populated every trigger cell.
+    // A Transition op inside the batch (e.g. completing the blocker) flips
+    // a trigger cell (`Job_is_unblocked`) for a DIFFERENT entity, and that
+    // entity's `unblock` must fire. The per-op reconcile in
+    // create/update/assert doesn't cover this because Transition isn't one
+    // of those paths — so do it here over the cumulative `running`.
+    //
+    // Gate (the "trigger-cell-changed check"): the set of SM nouns whose
+    // trigger cell content differs between the original `state` and the
+    // post-batch `running`. Empty → reconcile early-returns a no-op. This
+    // is noun-agnostic, so it handles the Transition case (whose command
+    // carries no noun) correctly.
+    let changed_trigger_nouns: hashbrown::HashSet<String> = {
+        let mut set = hashbrown::HashSet::new();
+        for (noun, _reading, cell) in sm_fact_triggers(d) {
+            let before = ast::fetch_cell_seq(&cell, state);
+            let after = ast::fetch_cell_seq(&cell, &running);
+            if before != after {
+                set.insert(noun);
+            }
+        }
+        set
+    };
+    if !changed_trigger_nouns.is_empty() {
+        let (reconciled, fired) =
+            reconcile_derived_transitions(d, &running, &changed_trigger_nouns);
+        if !fired.is_empty() {
+            derived_count += fired.len();
+            if let Some((_, st)) = fired.last() { last_status = Some(st.clone()); }
+            diag!("[reconcile] batch tail: fired {:?}", fired);
+        }
+        running = reconciled;
+    }
+
     // One combined delta relative to the ORIGINAL state — the host
     // commits the whole collection in a single merge.
     let delta = ast::diff_cells(state, &running);
@@ -946,6 +981,21 @@ fn assert_fact_via_defs(
             &refs, seed.clone(), &post_s1, 100, &mut activated_rule_defs);
         derived.extend(more);
         post_s2
+    };
+
+    // blocked-status-sm-2 — bounded reconciliation of derived (Fact-Type)
+    // transition triggers. e.g. asserting `Job blocks Job` makes another
+    // Job's derived `Job_is_blocked` true → fire `block`. Gated on the
+    // touched (role) nouns so it's a no-op when no SM-trigger cell could
+    // have changed. Runs BEFORE validate so the post-reconcile state is
+    // the one validated/emitted (parity with create_via_defs).
+    let derived_state = {
+        let (reconciled, fired) =
+            reconcile_derived_transitions(d, &derived_state, &touched_nouns);
+        if !fired.is_empty() {
+            diag!("[reconcile] assertFact {}: fired {:?}", fact_type, fired);
+        }
+        reconciled
     };
 
     // ── validate ───────────────────────────────────────────────────────
@@ -1861,6 +1911,22 @@ fn create_via_defs(
         }
     };
 
+    // blocked-status-sm-2 — bounded reconciliation of derived (Fact-Type)
+    // transition triggers (e.g. a create that asserts `Job blocks Job`
+    // makes another Job's derived `Job_is_blocked` true → fire `block`).
+    // Runs AFTER the forward chain has populated trigger cells; gated on
+    // the created noun so it's a no-op when no SM-trigger cell could have
+    // changed. No derivation writes the status cell — see fn docs.
+    let derived_state = {
+        let touched: hashbrown::HashSet<String> =
+            core::iter::once(noun.to_string()).collect();
+        let (reconciled, fired) = reconcile_derived_transitions(d, &derived_state, &touched);
+        if !fired.is_empty() {
+            diag!("[reconcile] create {} {}: fired {:?}", noun, entity_id, fired);
+        }
+        reconciled
+    };
+
     // ── validate: ρ(validate:{noun}) applied to population ─────────
     // Prefer the per-noun aggregate that runs only the constraints
     // spanning fact types this noun participates in. Bulk `validate`
@@ -2324,6 +2390,236 @@ fn http_post_callback(
         "callback URI dispatch is unavailable on this target \
          (wasm32 / UEFI / no_std); reach {} via the platform fetch shim",
         url))
+}
+
+/// blocked-status-sm-2 — BOUNDED reconciliation of derived (Fact-Type)
+/// transition triggers.
+///
+/// ## What this fixes
+/// `State_Machine_is_currently_in_Status` has TWO writers. (A) An
+/// explicit `transition_via_defs` does a remove-then-add with
+/// overwrite=true and WINS. (B) The event-fold derivation that runs
+/// inside the forward chain (`cell_put_keyed`, evaluate.rs) writes with
+/// overwrite=FALSE and DROPS its derived status on a key conflict, so a
+/// derived `blocked` is silently lost behind a stored `in_progress`.
+///
+/// The naive fix (let the derivation overwrite the status cell) blows up:
+/// status is both a fold OUTPUT and — via the `Task has Task Status`
+/// bridge — an INPUT to the `unblocked` guard, so block⇄unblock
+/// oscillates and the append-only dedup ledger × per-round full-state
+/// clone exploded memory (task 932-5: 15.7 GB). So a derivation must
+/// NEVER write the status cell.
+///
+/// ## What this does instead
+/// After the normal forward chain has populated the derived TRIGGER cells
+/// (e.g. `Job_is_blocked`, `Job_is_unblocked`), we read those cells and
+/// fire the corresponding *explicit* transition through the SAME
+/// `transition_via_defs` path the user-driven transition takes — but only
+/// when that transition is LEGAL from the entity's current stored status
+/// AND would CHANGE it (the exact filter from `transition_via_defs`,
+/// command.rs ~L2368-2371). This routes the derived event back through the
+/// remove-then-add writer (A), so the status cell is updated by the one
+/// writer that is allowed to touch it. No derivation writes status.
+///
+/// ## Why it is bounded (this is the whole point — preserve it)
+/// * `block` depends on the BLOCKER's status, not the blocked entity's own,
+///   so firing `block` does not change `block`'s own input → it fires at
+///   most once per in_progress episode, then is an illegal no-op (`block`
+///   is illegal from `blocked`).
+/// * `unblock`'s guard reads the entity's OWN status `== 'blocked'`; after
+///   `unblock` writes `in_progress` the guard is FALSE → self-extinguishing
+///   → fixpoint in one pass.
+/// * No derivation writes the status cell, so the forward-chain dedup
+///   invariant is intact and 932-5's oscillation cannot arise.
+///
+/// A FIXED cap of [`RECONCILE_MAX_PASSES`] passes guarantees termination
+/// regardless: if a real modeling cycle ever hit the cap we emit a diag and
+/// stop the loop (we never force more passes). Returns the reconciled state
+/// plus the `(entity_id, new_status)` pairs that fired (for observability
+/// and test pass-count assertions).
+const RECONCILE_MAX_PASSES: usize = 8;
+
+/// blocked-status-sm-2 — test-only instrumentation recording the number
+/// of reconciliation passes the MOST RECENT `reconcile_derived_transitions`
+/// ran. The bounded design guarantees the legitimate block/unblock
+/// scenarios converge in ≤2 passes; the test asserts this small bound to
+/// prove no oscillation. Mirrors `evaluate::chain_eval_counter`.
+#[cfg(test)]
+mod reconcile_pass_counter {
+    use core::cell::Cell;
+    std::thread_local! {
+        pub static PASSES: Cell<usize> = const { Cell::new(0) };
+    }
+}
+#[cfg(test)]
+fn last_reconcile_passes() -> usize {
+    reconcile_pass_counter::PASSES.with(|c| c.get())
+}
+#[inline]
+#[allow(unused_variables)]
+fn record_reconcile_passes(passes: usize) {
+    #[cfg(test)]
+    reconcile_pass_counter::PASSES.with(|c| c.set(passes));
+}
+
+/// blocked-status-sm-2 — the `(noun, reading, cell)` index of every
+/// Fact-Type SM trigger declared in `d`. The trigger cell name is the
+/// Fact-Type reading with spaces→underscores; the entity-role in that
+/// cell is the SM noun itself (command.rs ~L2476: "the subject role of an
+/// SM trigger FT is the SM noun"). Built by joining the three transition
+/// cells:
+///   Transition_is_defined_in_State_Machine_Definition (T → SM def)
+///   State_Machine_Definition_is_for_Noun              (SM def → Noun)
+///   Transition_is_triggered_by_Fact_Type              (T → Fact Type)
+/// Shared by `reconcile_derived_transitions` and the batch-tail gate so
+/// both agree on which cells are SM triggers.
+fn sm_fact_triggers(d: &ast::Object) -> Vec<(String, String, String)> {
+    let t_in_sm = ast::fetch_cell_seq(
+        "Transition_is_defined_in_State_Machine_Definition", d);
+    let sm_for_noun = ast::fetch_cell_seq(
+        "State_Machine_Definition_is_for_Noun", d);
+    let t_trigger_ft = ast::fetch_cell_seq(
+        "Transition_is_triggered_by_Fact_Type", d);
+
+    let sm_to_noun: Vec<(String, String)> = sm_for_noun.as_seq()
+        .map(|facts| facts.iter().filter_map(|f| {
+            let sm = ast::binding(f, "State Machine Definition")?;
+            let noun = ast::binding(f, "Noun")?;
+            Some((sm.to_string(), noun.to_string()))
+        }).collect())
+        .unwrap_or_default();
+    let t_to_sm: Vec<(String, String)> = t_in_sm.as_seq()
+        .map(|facts| facts.iter().filter_map(|f| {
+            let t = ast::binding(f, "Transition")?;
+            let sm = ast::binding(f, "State Machine Definition")?;
+            Some((t.to_string(), sm.to_string()))
+        }).collect())
+        .unwrap_or_default();
+
+    t_trigger_ft.as_seq()
+        .map(|facts| facts.iter().filter_map(|f| {
+            let t = ast::binding(f, "Transition")?;
+            let reading = ast::binding(f, "Fact Type")?;
+            let sm = t_to_sm.iter().find_map(|(tt, s)| (tt == t).then(|| s.clone()))?;
+            let noun = sm_to_noun.iter().find_map(|(s, n)| (s == &sm).then(|| n.clone()))?;
+            let cell = reading.replace(' ', "_");
+            Some((noun, reading.to_string(), cell))
+        }).collect())
+        .unwrap_or_default()
+}
+
+fn reconcile_derived_transitions(
+    d: &ast::Object,
+    state: &ast::Object,
+    touched_nouns: &hashbrown::HashSet<String>,
+) -> (ast::Object, Vec<(String, String)>) {
+    // Restrict to triggers whose owning SM noun is in `touched_nouns`
+    // (the gate: a trigger cell can only have changed for a noun the
+    // command touched). When the caller can't name the SM noun (the batch
+    // tail, where a Transition op carries only an entity id) it passes the
+    // full SM-noun set — the per-trigger legal-and-changing test below is
+    // still the real guard.
+    let triggers: Vec<(String, String, String)> = sm_fact_triggers(d)
+        .into_iter()
+        .filter(|(noun, _, _)| touched_nouns.contains(noun))
+        .collect();
+
+    if triggers.is_empty() {
+        return (state.clone(), Vec::new());
+    }
+
+    let mut running = state.clone();
+    let mut fired: Vec<(String, String)> = Vec::new();
+
+    let mut pass = 0usize;
+    loop {
+        pass += 1;
+        let mut fired_this_pass = false;
+
+        for (noun, reading, cell) in &triggers {
+            let machine_key = alloc::format!("machine:{}", noun);
+            // Entities named by a LIVE trigger fact in the current running
+            // state. `fetch_cell_seq` flattens a folded Map cell to a Seq.
+            let entities: Vec<String> = ast::fetch_cell_seq(cell, &running)
+                .as_seq()
+                .map(|fs| {
+                    let mut ids: Vec<String> = Vec::new();
+                    for fact in fs.iter() {
+                        if let Some(id) = ast::binding(fact, noun) {
+                            if !ids.iter().any(|e| e == id) { ids.push(id.to_string()); }
+                        }
+                    }
+                    ids
+                })
+                .unwrap_or_default();
+
+            for entity in entities {
+                // Current stored status from the SM cell.
+                let from_status = match extract_sm_status(&running, &entity) {
+                    Some(s) => s,
+                    None => continue, // no SM status yet → nothing to reconcile
+                };
+                // EXACT legality filter from transition_via_defs: apply the
+                // machine func to <from_status, event> and require the
+                // result to be a real change (`!= from_status`). If the
+                // transition is illegal from `from_status` the func returns
+                // the current state via its `Selector(1)` fallback, so the
+                // `!= from_status` test rejects it — a clean no-op.
+                let func = ast::apply(&ast::Func::Def(machine_key.clone()),
+                    &ast::Object::seq(vec![
+                        ast::Object::atom(&from_status),
+                        ast::Object::atom(reading),
+                    ]), d);
+                let legal_and_changing = func.as_atom()
+                    .map(|next| next != from_status)
+                    .unwrap_or(false);
+                if !legal_and_changing { continue; }
+
+                // Fire the derived transition through the SAME writer the
+                // user-driven path uses. current_status=None so it re-resolves
+                // `from` from the SM cell in `running` (the batch contract).
+                let res = transition_via_defs(d, &entity, reading, "", None, &running);
+                if res.rejected {
+                    // An alethic deontic/dispatch gate refused this derived
+                    // transition. Don't thread its (empty) delta; leave the
+                    // entity as-is and move on. Reconciliation never forces a
+                    // rejected transition.
+                    crate::diag!(
+                        "[reconcile] derived '{}' on {} {} rejected: {:?}",
+                        reading, noun, entity, res.violations);
+                    continue;
+                }
+                let new_status = res.status.clone()
+                    .unwrap_or_else(|| from_status.clone());
+                if new_status == from_status {
+                    // transition_via_defs decided it was a no-op after
+                    // re-resolving `from` (e.g. the cumulative running state
+                    // already advanced this entity). Nothing fired.
+                    continue;
+                }
+                running = ast::merge_delta(&running, &res.state, None);
+                fired.push((entity.clone(), new_status));
+                fired_this_pass = true;
+            }
+        }
+
+        if !fired_this_pass {
+            break; // fixpoint: a pass that fires nothing
+        }
+        if pass >= RECONCILE_MAX_PASSES {
+            // Observability: a real modeling cycle would hit this. STOP the
+            // loop (do NOT spin / force) — the bounded design guarantees the
+            // legitimate scenarios converge in ≤2 passes, so reaching the cap
+            // means the model has a block⇄unblock-style cycle to inspect.
+            crate::diag!(
+                "[reconcile] hit pass cap {} — stopping (possible modeling \
+                 cycle); fired so far: {:?}", RECONCILE_MAX_PASSES, fired);
+            break;
+        }
+    }
+
+    record_reconcile_passes(pass);
+    (running, fired)
 }
 
 fn transition_via_defs(
@@ -3200,6 +3496,21 @@ fn update_via_defs(
             new_map.insert(name.to_string(), contents.clone());
         }
         ast::Object::Map(new_map.into())
+    };
+
+    // blocked-status-sm-2 — bounded reconciliation of derived (Fact-Type)
+    // transition triggers. e.g. updating a field that flips a blocker's
+    // status can make a derived `Job_is_unblocked` true → fire `unblock`.
+    // Gated on the updated noun; runs BEFORE validate (parity with
+    // create_via_defs). No derivation writes the status cell — see fn docs.
+    let new_state = {
+        let touched: hashbrown::HashSet<String> =
+            core::iter::once(noun.to_string()).collect();
+        let (reconciled, fired) = reconcile_derived_transitions(d, &new_state, &touched);
+        if !fired.is_empty() {
+            diag!("[reconcile] update {} {}: fired {:?}", noun, entity_id, fired);
+        }
+        reconciled
     };
 
     // Prefer per-noun validate aggregate (O(FTs-touching-noun)) over the
@@ -8897,6 +9208,235 @@ Transition 'place' is defined in State Machine Definition 'Order'.
         // and the SM cell reflects 'Placed'.
         assert_eq!(extract_sm_status(&merged, "ORD-1").as_deref(), Some("Placed"),
             "ORD-1 must be transitioned to Placed in the batch result");
+    }
+
+    /// blocked-status-sm-2 — the blocked-proto scenario, ported as a unit
+    /// test. Mirrors `apps/blocked-proto/readings/app.md`: a Job SM
+    /// (pending/in_progress/blocked/completed/deleted) whose `block` and
+    /// `unblock` transitions are Fact-Type-triggered by `Job is blocked` /
+    /// `Job is unblocked`. The bounded reconciliation step must:
+    ///   1. fire `block` on a started Job when its `Job is blocked` trigger
+    ///      goes live (a pending blocker exists),
+    ///   2. NOT loop while it stays blocked (block is illegal from blocked →
+    ///      at most once; unblock's guard is false while a blocker is open),
+    ///   3. fire `unblock` (self-extinguishing) once `Job is unblocked` goes
+    ///      live (all blockers completed).
+    /// The fixed pass cap guarantees termination; we assert the pass count
+    /// stays small (≤3) to prove no oscillation (the 932-5 failure mode).
+    ///
+    /// The trigger cells are driven here by asserting the trigger Fact Types
+    /// directly — the SAME facts blocked-proto's `Job is blocked` /
+    /// `Job is unblocked` derivations are meant to produce. (Those
+    /// multi-antecedent rules whose consequent role comes from an antecedent
+    /// currently compile to phi — a SEPARATE derivation-compilation limit,
+    /// ORTHOGONAL to the reconciliation step under test, which only has to
+    /// fire the right transition off whatever the trigger cell says.)
+    /// Asserting `Job_is_blocked` exercises the `assert_fact_via_defs`
+    /// reconcile call site end-to-end; the idle + unblock checks drive
+    /// `reconcile_derived_transitions` directly.
+    #[test]
+    fn blocked_proto_reconciles_block_then_unblock_bounded() {
+        const JOB_READINGS: &str = r#"
+# Blocked Proto (ported)
+
+## Entity Types
+
+Job(.id) is an entity type.
+
+## Value Types
+
+Job Subject is a value type.
+Job Status is a value type.
+
+## Fact Types
+
+Job has Job Subject.
+  Each Job has at most one Job Subject.
+
+Job has Job Status. **
+  Each Job has at most one Job Status.
+
+Job is blocked. **
+
+Job is unblocked. **
+
+Job blocks Job.
+  Job blocks Job is irreflexive.
+  Job blocks Job is asymmetric.
+
+Job is started.
+Job is finished.
+Job is reopened.
+Job is deleted.
+
+## State Machine
+
+State Machine Definition 'Job SM' is for Noun 'Job'.
+Status 'pending' is initial in State Machine Definition 'Job SM'.
+
+Transition 'start' is defined in State Machine Definition 'Job SM'.
+Transition 'start' is from Status 'pending'.
+Transition 'start' is to Status 'in_progress'.
+Transition 'start' is triggered by Fact Type 'Job is started'.
+
+Transition 'finish' is defined in State Machine Definition 'Job SM'.
+Transition 'finish' is from Status 'in_progress'.
+Transition 'finish' is to Status 'completed'.
+Transition 'finish' is triggered by Fact Type 'Job is finished'.
+
+Transition 'block' is defined in State Machine Definition 'Job SM'.
+Transition 'block' is from Status 'in_progress'.
+Transition 'block' is to Status 'blocked'.
+Transition 'block' is triggered by Fact Type 'Job is blocked'.
+
+Transition 'unblock' is defined in State Machine Definition 'Job SM'.
+Transition 'unblock' is from Status 'blocked'.
+Transition 'unblock' is to Status 'in_progress'.
+Transition 'unblock' is triggered by Fact Type 'Job is unblocked'.
+
+Transition 'reopen' is defined in State Machine Definition 'Job SM'.
+Transition 'reopen' is from Status 'completed'.
+Transition 'reopen' is to Status 'pending'.
+Transition 'reopen' is triggered by Fact Type 'Job is reopened'.
+
+Transition 'delete-from-progress' is defined in State Machine Definition 'Job SM'.
+Transition 'delete-from-progress' is from Status 'in_progress'.
+Transition 'delete-from-progress' is to Status 'deleted'.
+Transition 'delete-from-progress' is triggered by Fact Type 'Job is deleted'.
+
+## Constraints
+
+Job Status enumerates 'pending', 'in_progress', 'blocked', 'completed', 'deleted'.
+
+## Derivation Rules
+
+# The intended blocked-proto trigger derivations (kept for documentation —
+# these unary, antecedent-role-consequent rules currently compile to phi, so
+# the test drives the trigger cells by asserting the Fact Types directly):
+#   Job is blocked   iff some open Job blocks the Job.
+#   Job is unblocked iff the Job is blocked and every blocker completed.
+"#;
+
+        let meta = crate::parse_forml2::parse_to_state(&crate::metamodel_corpus())
+            .expect("metamodel parse");
+        let jobs = crate::parse_forml2::parse_to_state_with_nouns(JOB_READINGS, &meta)
+            .expect("job readings parse");
+        let state = ast::merge_states(&meta, &jobs);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        let touched_job: hashbrown::HashSet<String> =
+            core::iter::once("Job".to_string()).collect();
+        let dump = |st: &ast::Object, tag: &str| -> String {
+            let cells = ["State_Machine_is_currently_in_Status",
+                         "Job_is_blocked", "Job_is_unblocked"];
+            let mut s = format!("--- {tag} ---\n");
+            for c in cells { s.push_str(&format!("  {c} = {:?}\n", ast::fetch_cell_seq(c, st))); }
+            s
+        };
+        // Build a CLEAN population: exactly one SM-status row per entity plus
+        // the live trigger facts. Driving the SM-status cell via real command
+        // threading fragments the keyed Map across `merge_delta` in a test
+        // harness (a pre-existing keyed-cell interaction, ORTHOGONAL to this
+        // fix); constructing it directly keeps `extract_sm_status` honest and
+        // isolates the reconcile mechanism under test.
+        let mk_state = |statuses: &[(&str, &str)],
+                        blocked: &[&str], unblocked: &[&str]| -> ast::Object {
+            let mut st = state.clone();
+            st = ast::cell_filter("State_Machine_is_currently_in_Status", |_| false, &st);
+            st = ast::cell_filter("Job_is_blocked", |_| false, &st);
+            st = ast::cell_filter("Job_is_unblocked", |_| false, &st);
+            for (id, status) in statuses {
+                st = ast::cell_push("State_Machine_is_currently_in_Status",
+                    ast::fact_from_pairs(&[("State Machine", id), ("Status", status)]), &st);
+            }
+            for id in blocked {
+                st = ast::cell_push("Job_is_blocked",
+                    ast::fact_from_pairs(&[("Job", id)]), &st);
+            }
+            for id in unblocked {
+                st = ast::cell_push("Job_is_unblocked",
+                    ast::fact_from_pairs(&[("Job", id)]), &st);
+            }
+            st
+        };
+
+        // Sanity: the Job machine compiled the Fact-Type-triggered block /
+        // unblock edges the reconcile fires (machine func over <from,event>).
+        let mfn = |from: &str, event: &str| -> Option<String> {
+            ast::apply(&ast::Func::Def("machine:Job".to_string()),
+                &ast::Object::seq(vec![ast::Object::atom(from), ast::Object::atom(event)]), &d)
+                .as_atom().map(String::from)
+        };
+        assert_eq!(mfn("in_progress", "Job is blocked").as_deref(), Some("blocked"),
+            "machine must define block: in_progress --Job is blocked--> blocked");
+        assert_eq!(mfn("blocked", "Job is unblocked").as_deref(), Some("in_progress"),
+            "machine must define unblock: blocked --Job is unblocked--> in_progress");
+        assert_eq!(mfn("blocked", "Job is blocked").as_deref(), Some("blocked"),
+            "block must be illegal (no-op) from 'blocked' (self-loop / no edge)");
+
+        // ── STEP 1 ────────────────────────────────────────────────────────
+        // A started (in_progress), B pending, B blocks A → A's `Job is
+        // blocked` trigger is live. Assert it through the real command path
+        // (assert_fact_via_defs), whose TAIL reconcile must fire `block`
+        // (in_progress→blocked) → A.status == 'blocked'. The CommandResult's
+        // `status` carries the post-transition status the reconcile produced.
+        let s1 = mk_state(&[("A", "in_progress"), ("B", "pending")], &["A"], &[]);
+        let res1 = apply_command_defs(&d, &Command::AssertFact {
+            fact_type: "Job_is_blocked".to_string(),
+            pairs: vec![RolePair { role: "Job".to_string(), value: "A".to_string() }],
+            sender: None, signature: None,
+        }, &s1);
+        assert!(!res1.rejected, "STEP 1 assert rejected: {:?}", res1.violations);
+        let s1_after = ast::merge_delta(&s1, &res1.state, None);
+        assert_eq!(extract_sm_status(&s1_after, "A").as_deref(), Some("blocked"),
+            "STEP 1: asserting `Job is blocked` must drive A to 'blocked' via \
+             the assert-tail reconcile\n{}", dump(&s1_after, "step1"));
+        assert!(last_reconcile_passes() >= 1 && last_reconcile_passes() <= 3,
+            "STEP 1: reconcile must converge in ≤3 passes; got {}",
+            last_reconcile_passes());
+
+        // ── STEP 2 ────────────────────────────────────────────────────────
+        // A blocked, B still open → `Job is blocked` live, `Job is unblocked`
+        // NOT live. reconcile must fire NOTHING and settle in a single idle
+        // pass: `block` is illegal from `blocked`, `unblock` has no trigger.
+        // This is the no-loop property — the whole point of the bound.
+        let s2 = mk_state(&[("A", "blocked"), ("B", "pending")], &["A"], &[]);
+        let (s2_after, fired2) = reconcile_derived_transitions(&d, &s2, &touched_job);
+        assert!(fired2.is_empty(),
+            "STEP 2: reconcile must fire nothing while A blocked & B open \
+             (no block⇄unblock loop); fired={:?}\n{}", fired2, dump(&s2, "step2"));
+        assert_eq!(last_reconcile_passes(), 1,
+            "STEP 2: an idle reconcile is exactly one (no-op) pass; got {}",
+            last_reconcile_passes());
+        assert_eq!(extract_sm_status(&s2_after, "A").as_deref(), Some("blocked"),
+            "STEP 2: A must STAY 'blocked' (block illegal from blocked — no loop)");
+
+        // ── STEP 3 ────────────────────────────────────────────────────────
+        // B completes → A's `Job is unblocked` trigger is live (and the now-
+        // false `Job is blocked` is cleared). reconcile must fire `unblock`
+        // (blocked→in_progress) → A.status == 'in_progress', then self-
+        // extinguish (unblock's guard 'own status == blocked' is now false).
+        let s3 = mk_state(&[("A", "blocked"), ("B", "completed")], &[], &["A"]);
+        let (s3_after, fired3) = reconcile_derived_transitions(&d, &s3, &touched_job);
+        assert_eq!(extract_sm_status(&s3_after, "A").as_deref(), Some("in_progress"),
+            "STEP 3: with `Job is unblocked` live, reconcile must drive A to \
+             'in_progress' (unblock fired, self-extinguished); fired={:?}\n{}",
+            fired3, dump(&s3_after, "step3"));
+        assert_eq!(fired3.len(), 1,
+            "STEP 3: exactly one transition (unblock on A) must fire; got {:?}", fired3);
+        assert!(last_reconcile_passes() >= 1 && last_reconcile_passes() <= 3,
+            "STEP 3: unblock reconcile must converge in ≤3 passes; got {}",
+            last_reconcile_passes());
+
+        // STEP 3b: re-running reconcile on the post-unblock state fires
+        // nothing — the fixpoint is stable (unblock self-extinguished, no
+        // block trigger live). Proves termination + idempotence.
+        let (s3b, fired3b) = reconcile_derived_transitions(&d, &s3_after, &touched_job);
+        assert!(fired3b.is_empty(),
+            "STEP 3b: post-unblock reconcile must be idle; fired={:?}", fired3b);
+        assert_eq!(extract_sm_status(&s3b, "A").as_deref(), Some("in_progress"),
+            "STEP 3b: A must remain 'in_progress' at the fixpoint");
     }
 
     /// task-954: a batch carrying TWO transitions on the SAME entity
