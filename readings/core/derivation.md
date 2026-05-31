@@ -120,6 +120,36 @@ consequent. Behavioural equivalence with the pre-#891 per-SS-
 Constraint fanout is pinned by
 `crates/arest/tests/ss_autofill_metamodel_rule_e2e.rs`.
 
+  Substrate-lift STATUS (ss-autofill-retire-1 — the parse/expose
+  prerequisite, the task-978 analog; ADDITIVE infra only):
+    Epic: ss-autofill-retire (retire `compile_ss_autofill_metamodel`)
+    * `try_classify_metamodel_clause` (`parse_forml2.rs`) now recognises
+      the `subset constraint ` (→ `SubsetConstraint`) and `constraint `
+      (→ `Constraint`) prefixes, so the rule body above resolves its
+      antecedent to a BOUND metamodel-cell source
+      `FactType("SubsetConstraint")` instead of an `UnresolvedClause`.
+      The anaphoric back-references (`that Subset Constraint …`,
+      `that Fact is instance of Ant`, `that Fact Type is Cons`) are
+      silently skipped, exactly as the subtype rule's anaphora are.
+    * `CellIndex::ss_autofill_pairs()` (`compile.rs`, the `data.subtypes`
+      analog) exposes each autofill-opted SS Constraint's
+      `(antecedent_ft, consequent_ft)` edge — derived from the
+      `Constraint` cell's lossless `json` spans, the same source
+      `compile_ss_autofill_metamodel` reads — so the reading that binds
+      this antecedent (ss-autofill-retire-2) can resolve the
+      quantification to concrete FT pairs.
+    * `compile_ss_autofill_metamodel` + `SS_AUTOFILL_ID` + the
+      create-path noun-gating are RETAINED unchanged: the procedural
+      synthesizer stays the live path until ss-autofill-retire-2 swaps
+      in the reading. The pin
+      `crates/arest/tests/ss_autofill_metamodel_rule_e2e.rs` stays GREEN.
+    * Pins: `parse_forml2::ss_autofill_metamodel_clause_tests::*`
+      (recogniser) and
+      `compile_explicit_derivation_tests::ss_autofill_metamodel_cell_antecedent_resolves_without_unresolved_clauses`
+      (the antecedent RESOLVES) +
+      `…::ss_autofill_pairs_binds_antecedent_and_consequent_fact_types`
+      (the pairs BIND).
+
 ## Transitivity of binary Fact Types (eager materialisation removed — task-969)
 
 Transitive composition of binary Fact Types is **not** eagerly

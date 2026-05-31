@@ -454,7 +454,8 @@ fn word_comparator_to_op(phrase: &str) -> &'static str {
 
 /// task subtype-join-antecedent (child 1) — Classify an antecedent clause that
 /// quantifies over one of the substrate's own metamodel cells (`Subtype`,
-/// `FactType`, `Role`, `Noun`) rather than over a user-declared Fact Type.
+/// `FactType`, `Role`, `Noun`, `Constraint`, `SubsetConstraint`) rather than
+/// over a user-declared Fact Type.
 ///
 /// The input `stripped_text` must already have anaphora / quantifier words
 /// removed (call `strip_anaphora` before invoking).
@@ -482,12 +483,27 @@ fn try_classify_metamodel_clause(stripped_text: &str) -> Option<String> {
     // "Fact Type" appears as two words in FORML text; the state stores it as
     // "FactType" (no space).  "Resource" is NOT a metamodel cell — it is a
     // domain-variable in the subtype-inheritance rule — so it has no entry here.
+    //
+    // ss-autofill-retire-1 (the task-978 analog): `subset constraint ` /
+    // `constraint ` expose the `Constraint` cell's SS-autofill spans as a
+    // bindable metamodel-cell antecedent so the SS auto-fill metamodel rule
+    // (`readings/core/derivation.md` §"SS Subset-Constraint auto-fill":
+    // `some Subset Constraint has antecedent Fact Type Ant …`) resolves to a
+    // bound cell antecedent instead of an UnresolvedClause. The bound
+    // (antecedent_ft, consequent_ft) pairs are exposed to the derivation
+    // compiler via `CellIndex::ss_autofill_pairs` (the `data.subtypes`
+    // analog). `subset constraint ` MUST precede `constraint ` so the more
+    // specific cell id wins — a `subset constraint …` clause maps to the
+    // dedicated `SubsetConstraint` view (autofill-opted SS spans only),
+    // never the broader `Constraint` cell.
     const METAMODEL_PREFIXES: &[(&str, &str)] = &[
         ("subtype ", "Subtype"),
         ("fact type ", "FactType"),
         ("facttype ", "FactType"),
         ("role ", "Role"),
         ("noun ", "Noun"),
+        ("subset constraint ", "SubsetConstraint"),
+        ("constraint ", "Constraint"),
     ];
     let lower = stripped_text.to_lowercase();
     for (prefix, cell_id) in METAMODEL_PREFIXES {
@@ -3925,6 +3941,93 @@ mod ssrf_cidr_tests {
         assert_eq!(cidrs.len(), 8,
             "security.md declares exactly 8 CIDR Block rows, got {:?}",
             cidrs);
+    }
+}
+
+#[cfg(test)]
+mod ss_autofill_metamodel_clause_tests {
+    //! ss-autofill-retire-1 (the task-978 analog): pin that the SS
+    //! auto-fill metamodel rule's antecedent — `some Subset Constraint
+    //! has antecedent Fact Type Ant` (`readings/core/derivation.md`
+    //! §"SS Subset-Constraint auto-fill") — is RECOGNISED by
+    //! `try_classify_metamodel_clause` as a bound metamodel-cell
+    //! antecedent (`Some("SubsetConstraint")`), not a fall-through
+    //! `None` that would land the clause in `UnresolvedClause`.
+    //!
+    //! This is the parse/expose prerequisite that unblocks
+    //! ss-autofill-retire-2 (the reading that binds the cell). The
+    //! end-to-end "resolves to an antecedent_source + binds the
+    //! (antecedent_ft, consequent_ft) pairs" pin lives in
+    //! `compile_explicit_derivation_tests::ss_autofill_*` (which drives
+    //! the full `resolve_derivation_rule` cascade + the
+    //! `CellIndex::ss_autofill_pairs` accessor).
+    use super::*;
+
+    #[test]
+    fn primary_subset_constraint_antecedent_resolves_to_bound_cell() {
+        // The anaphora-stripped form of `some Subset Constraint has
+        // antecedent Fact Type Ant` (the SS auto-fill rule's PRIMARY
+        // quantification). Before ss-autofill-retire-1 this returned
+        // `None`; the caller then pushed the clause to
+        // `unresolved_clauses`. Now it binds the dedicated
+        // `SubsetConstraint` metamodel-cell view.
+        assert_eq!(
+            try_classify_metamodel_clause("Subset Constraint has antecedent Fact Type Ant"),
+            Some("SubsetConstraint".to_string()),
+            "the SS auto-fill rule's primary antecedent must resolve to a \
+             bound metamodel-cell id, not fall through to UnresolvedClause",
+        );
+        // The consequent-FT and autofill-marker clauses share the prefix.
+        assert_eq!(
+            try_classify_metamodel_clause("Subset Constraint has consequent Fact Type Cons"),
+            Some("SubsetConstraint".to_string()),
+        );
+        assert_eq!(
+            try_classify_metamodel_clause("Subset Constraint has autofill 'true'"),
+            Some("SubsetConstraint".to_string()),
+        );
+    }
+
+    #[test]
+    fn subset_constraint_prefix_beats_bare_constraint_prefix() {
+        // `subset constraint ` is the more specific cell; the prefix
+        // table must check it before the bare `constraint ` prefix so a
+        // `subset constraint …` clause never collapses to the broader
+        // `Constraint` view.
+        assert_eq!(
+            try_classify_metamodel_clause("Subset Constraint spans Role"),
+            Some("SubsetConstraint".to_string()),
+        );
+        // A bare `Constraint …` clause still resolves to the broad cell.
+        assert_eq!(
+            try_classify_metamodel_clause("Constraint spans Role"),
+            Some("Constraint".to_string()),
+        );
+    }
+
+    #[test]
+    fn case_insensitive_and_lowercase_surface_forms_resolve() {
+        // `try_classify_metamodel_clause` lowercases before matching, so
+        // the all-caps and all-lowercase author surface forms both bind.
+        assert_eq!(
+            try_classify_metamodel_clause("SUBSET CONSTRAINT has antecedent Fact Type Ant"),
+            Some("SubsetConstraint".to_string()),
+        );
+        assert_eq!(
+            try_classify_metamodel_clause("subset constraint has antecedent fact type ant"),
+            Some("SubsetConstraint".to_string()),
+        );
+    }
+
+    #[test]
+    fn non_constraint_clause_still_falls_through() {
+        // A clause that names neither a metamodel cell nor the
+        // instance-of predicate still returns `None` — the new prefixes
+        // don't widen the recogniser beyond constraint vocabulary.
+        assert_eq!(
+            try_classify_metamodel_clause("Customer has Tier 'Gold'"),
+            None,
+        );
     }
 }
 

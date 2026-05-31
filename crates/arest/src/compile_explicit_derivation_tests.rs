@@ -6876,3 +6876,173 @@ Car '1' has Color 'red'.
     // the reading-lift rule is present.  Epic subtype-join-antecedent is COMPLETE.
 }
 
+/// ss-autofill-retire-1 (the task-978 analog) — the PARSE/EXPOSE prerequisite
+/// for retiring `compile_ss_autofill_metamodel`.
+///
+/// Mirrors `metamodel_cell_antecedents_resolve_without_unresolved_clauses`
+/// (the subtype task-978 pin) for the SS (Subset) Constraint auto-fill
+/// metamodel rule. The declarative rule already lives in
+/// `readings/core/derivation.md` §"SS Subset-Constraint auto-fill":
+///
+/// ```text
+/// Fact Type has auto-filled Fact
+///     iff some Subset Constraint has antecedent Fact Type Ant and that
+///     Subset Constraint has consequent Fact Type Cons and that Subset
+///     Constraint has autofill 'true' and that Fact is instance of Ant
+///     and that Fact Type is Cons.
+/// ```
+///
+/// Before ss-autofill-retire-1 the primary `some Subset Constraint has
+/// antecedent Fact Type Ant` clause fell through `try_classify_metamodel_clause`
+/// to `None` and landed in `unresolved_clauses` — so child 2 (the reading that
+/// binds it) could not be written. This pins the post-fix behaviour:
+///
+///  1. The primary `some Subset Constraint has antecedent Fact Type Ant`
+///     clause resolves to `AntecedentSource::FactType("SubsetConstraint")`.
+///  2. The anaphoric back-references (`that Subset Constraint has consequent
+///     Fact Type Cons`, `that Subset Constraint has autofill 'true'`,
+///     `that Fact is instance of Ant`, `that Fact Type is Cons`) are silently
+///     skipped — ZERO unresolved clauses, no spurious extra antecedent sources.
+#[test]
+fn ss_autofill_metamodel_cell_antecedent_resolves_without_unresolved_clauses() {
+    use crate::types::AntecedentSource;
+    // Verbatim antecedent from readings/core/derivation.md, with a
+    // user-declared FT (`Vehicle has Color`) as the consequent so the rule
+    // is not dropped by the empty-consequent filter (same harness as the
+    // subtype pin above).
+    let src = r#"
+Vehicle(.id) is an entity type.
+Color is a value type.
+Vehicle has Color.
+
+## Derivation Rules
+* Vehicle has Color
+    iff some Subset Constraint has antecedent Fact Type Ant and that
+    Subset Constraint has consequent Fact Type Cons and that Subset
+    Constraint has autofill 'true' and that Fact is instance of Ant
+    and that Fact Type is Cons.
+"#;
+    let state = parse_to_state(src).expect("model with SS-autofill metamodel antecedents must parse");
+    let data = crate::compile::cell_index_from_state(&state);
+    let rule = data.derivation_rules.iter()
+        .find(|r| r.text.starts_with("Vehicle has Color"))
+        .unwrap_or_else(|| panic!(
+            "user rule `Vehicle has Color iff ...` not found; rules={:#?}",
+            data.derivation_rules.iter().map(|r| r.text.as_str()).collect::<Vec<_>>()));
+
+    // (1) Zero unresolved clauses — every antecedent clause is classified.
+    assert!(
+        rule.unresolved_clauses.is_empty(),
+        "SS-autofill metamodel-cell antecedent clauses must NOT produce \
+         UnresolvedClause; got: {:?}", rule.unresolved_clauses,
+    );
+
+    // (2) The primary clause binds the dedicated `SubsetConstraint` cell.
+    let has_ss_source = rule.antecedent_sources.iter().any(|s| {
+        matches!(s, AntecedentSource::FactType(id) if id == "SubsetConstraint")
+    });
+    assert!(
+        has_ss_source,
+        "antecedent_sources must contain FactType(\"SubsetConstraint\") for \
+         `some Subset Constraint has antecedent Fact Type Ant`; sources={:#?}",
+        rule.antecedent_sources,
+    );
+
+    // (3) No spurious additional antecedent sources from the anaphoric clauses.
+    let non_ss_sources: Vec<_> = rule.antecedent_sources.iter()
+        .filter(|s| !matches!(s, AntecedentSource::FactType(id) if id == "SubsetConstraint"))
+        .collect();
+    assert!(
+        non_ss_sources.is_empty(),
+        "anaphoric SS-autofill back-references must NOT produce additional \
+         antecedent sources; extra sources={:#?}", non_ss_sources,
+    );
+}
+
+/// ss-autofill-retire-1 — the EXPOSE half: `CellIndex::ss_autofill_pairs`
+/// surfaces every autofill-opted SS Constraint's
+/// `(antecedent_fact_type, consequent_fact_type)` edge (the `data.subtypes`
+/// analog), so child 2's derivation compiler can BIND the metamodel-cell
+/// antecedent recognised above to concrete FT pairs.
+///
+/// Uses the same `Academic heads/works-for Department` SS-autofill fixture as
+/// `crates/arest/tests/ss_autofill_metamodel_rule_e2e.rs`: the `subset_autofill
+/// = Some(true)` marker round-trips through `cell_index_from_state`'s lossless
+/// std-deps `json` path, and the accessor reads `spans[0]` (copy-from) →
+/// `spans[1]` (copy-into).
+#[test]
+fn ss_autofill_pairs_binds_antecedent_and_consequent_fact_types() {
+    use crate::types::{ConstraintDef, SpanDef};
+
+    // Minimal state: two FTs + one SS Constraint with autofill on its
+    // antecedent span. The accessor only reads the Constraint cell's spans,
+    // so the FactType/Role cells are not required to populate the pairs (but
+    // we add them so the fixture is a faithful schema).
+    let mut state = ast::Object::phi();
+    state = ast::cell_push("FactType", ast::fact_from_pairs(&[
+        ("id", "ft_heads"), ("reading", "Academic heads Department"), ("arity", "2"),
+    ]), &state);
+    state = ast::cell_push("FactType", ast::fact_from_pairs(&[
+        ("id", "ft_works"), ("reading", "Academic works for Department"), ("arity", "2"),
+    ]), &state);
+
+    let cdef = ConstraintDef {
+        id: "ss1".to_string(),
+        kind: "SS".to_string(),
+        modality: "Alethic".to_string(),
+        text: "If some Academic heads some Department then that Academic \
+               works for that Department".to_string(),
+        spans: vec![
+            SpanDef { fact_type_id: "ft_heads".to_string(), role_index: 0,
+                      subset_autofill: Some(true) },
+            SpanDef { fact_type_id: "ft_works".to_string(), role_index: 0,
+                      subset_autofill: None },
+        ],
+        entity: None,
+        deontic_operator: None,
+        set_comparison_argument_length: None,
+        clauses: None,
+        min_occurrence: None,
+        max_occurrence: None,
+        predicate: None,
+    };
+    let json = serde_json::to_string(&cdef).expect("ConstraintDef serializes");
+    state = ast::cell_push("Constraint", ast::fact_from_pairs(&[
+        ("id", "ss1"), ("kind", "SS"), ("modality", "Alethic"),
+        ("text", cdef.text.as_str()), ("json", json.as_str()),
+    ]), &state);
+
+    let data = crate::compile::cell_index_from_state(&state);
+    let pairs = data.ss_autofill_pairs();
+    assert_eq!(
+        pairs,
+        vec![("ft_heads".to_string(), "ft_works".to_string())],
+        "ss_autofill_pairs must bind the autofill SS Constraint's \
+         (antecedent_ft, consequent_ft) edge; got {:?}", pairs,
+    );
+
+    // Negative control: an SS Constraint with NO autofill span must not
+    // contribute a pair (matches `compile_ss_autofill_metamodel`'s filter,
+    // which returns None when no span opts in).
+    let cdef_no_autofill = ConstraintDef {
+        id: "ss2".to_string(),
+        spans: vec![
+            SpanDef { fact_type_id: "ft_heads".to_string(), role_index: 0, subset_autofill: None },
+            SpanDef { fact_type_id: "ft_works".to_string(), role_index: 0, subset_autofill: None },
+        ],
+        ..cdef.clone()
+    };
+    let json2 = serde_json::to_string(&cdef_no_autofill).expect("serializes");
+    let mut state2 = ast::Object::phi();
+    state2 = ast::cell_push("Constraint", ast::fact_from_pairs(&[
+        ("id", "ss2"), ("kind", "SS"), ("modality", "Alethic"),
+        ("text", cdef_no_autofill.text.as_str()), ("json", json2.as_str()),
+    ]), &state2);
+    let data2 = crate::compile::cell_index_from_state(&state2);
+    assert!(
+        data2.ss_autofill_pairs().is_empty(),
+        "an SS Constraint with no autofill-opted span must contribute no pair; \
+         got {:?}", data2.ss_autofill_pairs(),
+    );
+}
+

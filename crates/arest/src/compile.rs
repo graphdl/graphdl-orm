@@ -3587,6 +3587,45 @@ pub struct CellIndex {
     pub violation_templates: ConstraintViolationTemplateTable,
 }
 
+impl CellIndex {
+    /// ss-autofill-retire-1 (the `data.subtypes` analog) — expose every
+    /// SS (Subset) Constraint that opts into auto-fill as its
+    /// `(antecedent_fact_type_id, consequent_fact_type_id)` pair, in
+    /// Constraint declaration order.
+    ///
+    /// Mirrors how `data.subtypes` surfaces the `(sub, sup)` pairs for the
+    /// subtype-inheritance metamodel rule: the SS auto-fill metamodel rule
+    /// (`readings/core/derivation.md` §"SS Subset-Constraint auto-fill")
+    /// quantifies over the `Subset Constraint` cell, and the derivation
+    /// compiler needs the concrete antecedent→consequent FT edges to bind
+    /// that quantification. The pairs are derived from `self.constraints`,
+    /// which preserve `SpanDef::subset_autofill` through
+    /// `cell_index_from_state`'s lossless std-deps JSON path — the same
+    /// source `compile_ss_autofill_metamodel` reads. (The flat `span<i>_*`
+    /// Constraint-cell fields strip the marker, so a no_std / flat-only
+    /// `CellIndex` correctly yields no pairs, matching the synthesizer.)
+    ///
+    /// The filter is byte-for-byte the synthesizer's: SS kind, ≥2 spans,
+    /// any span with `subset_autofill == Some(true)`; `spans[0]` is the
+    /// antecedent FT (copy-from) and `spans[1]` is the consequent FT
+    /// (copy-into). This is ADDITIVE infra for ss-autofill-retire-2 (the
+    /// reading that binds it); the synthesizer stays the live path until
+    /// then.
+    pub fn ss_autofill_pairs(&self) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for cdef in self.constraints.iter() {
+            if cdef.kind != "SS" || cdef.spans.len() < 2 { continue; }
+            if !cdef.spans.iter().any(|s| s.subset_autofill == Some(true)) { continue; }
+            let entry = (
+                cdef.spans[0].fact_type_id.clone(),
+                cdef.spans[1].fact_type_id.clone(),
+            );
+            if !pairs.contains(&entry) { pairs.push(entry); }
+        }
+        pairs
+    }
+}
+
 /// Reachability core for the per-app UoD tree-shake (task
 /// `tree-shake-app-uod-to-reachable-closure`). Given the app's *root*
 /// fact-type ids — the FTs declared in the app's own readings, as opposed
