@@ -242,6 +242,65 @@ pub fn init() {
         ]);
         initial = ast::cell_push("Transition", t_categorize, &initial);
 
+        // Landing-pass bundle — seed an App noun and two demo instances
+        // so the boot UI has something to show in the "Apps" root view
+        // instead of an empty resource list. The tutor (mcp tutor_*
+        // suite) is not bundleable as static readings and is noted as a
+        // follow-up. The Tasks app is a real AREST app whose full
+        // readings load at runtime via LoadReading. The Demo app is a
+        // tiny always-on illustration of AREST fact types.
+        //
+        // Cell shape mirrors the Noun/Organization hand-stage above: one
+        // Noun fact names the type; App_has_Name / App_has_Description
+        // facts carry per-instance data. The App noun surfaces in the
+        // Resources sidebar (project_root walks _has_ cells and picks the
+        // leading noun token); clicking an app instance shows its name
+        // and description.
+        let noun_app = Object::seq(alloc::vec![Object::seq(alloc::vec![
+            Object::atom("name"),
+            Object::atom("App"),
+        ])]);
+        initial = ast::cell_push("Noun", noun_app, &initial);
+
+        // Demo app — always-on illustration of AREST fact types.
+        let app_demo_name = Object::seq(alloc::vec![
+            Object::seq(alloc::vec![Object::atom("App"), Object::atom("demo")]),
+            Object::seq(alloc::vec![Object::atom("Name"), Object::atom("Demo")]),
+        ]);
+        initial = ast::cell_push("App_has_Name", app_demo_name, &initial);
+        let app_demo_desc = Object::seq(alloc::vec![
+            Object::seq(alloc::vec![Object::atom("App"), Object::atom("demo")]),
+            Object::seq(alloc::vec![
+                Object::atom("Description"),
+                Object::atom(
+                    "Illustrates AREST facts: Organizations and Support Requests. \
+                     Click a resource on the left to explore.",
+                ),
+            ]),
+        ]);
+        initial = ast::cell_push("App_has_Description", app_demo_desc, &initial);
+
+        // Tasks app — real workstream substrate. Full readings ship in
+        // apps/tasks/readings/app.md; load at runtime via: LoadReading
+        // tasks <body>. Seeded here so the launcher shows it on boot.
+        let app_tasks_name = Object::seq(alloc::vec![
+            Object::seq(alloc::vec![Object::atom("App"), Object::atom("tasks")]),
+            Object::seq(alloc::vec![Object::atom("Name"), Object::atom("Tasks")]),
+        ]);
+        initial = ast::cell_push("App_has_Name", app_tasks_name, &initial);
+        let app_tasks_desc = Object::seq(alloc::vec![
+            Object::seq(alloc::vec![Object::atom("App"), Object::atom("tasks")]),
+            Object::seq(alloc::vec![
+                Object::atom("Description"),
+                Object::atom(
+                    "Workstream substrate for the AREST agent — Tasks, epics, \
+                     and status tracking. Load full readings via: \
+                     LoadReading tasks <body>.",
+                ),
+            ]),
+        ]);
+        initial = ast::cell_push("App_has_Description", app_tasks_desc, &initial);
+
         // #620 / HATEOAS-6b — register the `extract` agent verb as a
         // Func::Platform slot at boot. The kernel profile installs no
         // body (cf. `Func::Platform(_) → Bottom` in the `no_std` arm

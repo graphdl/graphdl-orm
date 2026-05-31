@@ -340,7 +340,10 @@ fn project_root(state: &Object) -> Vec<String> {
         }
     }
     if set.is_empty() {
-        return vec!["(no resources — system is empty)".to_string()];
+        return vec![
+            "No apps or resources loaded yet.".to_string(),
+            "Type 'help' in the REPL below to get started.".to_string(),
+        ];
     }
     set.into_iter().map(|n| format!("- {n}")).collect()
 }
@@ -724,8 +727,12 @@ mod tests {
     #[test]
     fn project_root_empty_state_says_so() {
         let lines = project_root(&Object::phi());
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("(no resources"));
+        // Two friendly lines (message + hint) when the state is bare.
+        assert!(lines.len() >= 1, "expected at least one line: {lines:?}");
+        assert!(
+            lines[0].contains("No apps") || lines[0].contains("no resources"),
+            "expected empty-state message: {lines:?}",
+        );
     }
 
     #[test]

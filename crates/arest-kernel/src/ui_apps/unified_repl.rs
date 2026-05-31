@@ -71,10 +71,10 @@ type StringModel = ModelRc<SharedString>;
 const SCROLLBACK_MAX: usize = 1000;
 
 /// First line shown in the scrollback panel before the user types.
-/// Updated for the unified panel — the user sees both the REPL and
-/// the HATEOAS browse on first launch, so the welcome calls them out.
+/// Friendly intro — tells the user what they are looking at and how
+/// to get started without internal jargon.
 const WELCOME: &str =
-    "AREST Unified REPL — type `help` for commands; navigate the system on the left.";
+    "Welcome to AREST. Select an app on the left to explore, or type 'help' for commands.";
 
 // ── Breadcrumb (same shape as the prior hateoas.rs) ────────────────
 
@@ -178,21 +178,28 @@ struct UnifiedReplState {
 
 impl UnifiedReplState {
     fn new() -> Self {
-        // Seed the breadcrumb history with the initial Root cell so
-        // the persistent strip across the top of the panel has
-        // something to render on first paint and so the first
-        // navigation push lands on top of a real entry rather than an
-        // empty ring.
+        // Boot into the App noun list — the landing-pass goal is to
+        // show a meaningful org→app root instead of an empty "Resources"
+        // cell. The breadcrumb history is seeded with Root first so that
+        // the back button can return to the full resource list, then
+        // the App noun is pushed as the initial current cell, matching
+        // the system::init seeding of App_has_Name / App_has_Description.
         let mut breadcrumb = BreadcrumbState::new();
         breadcrumb.push(CurrentCell::Root);
+        let boot_noun = "App".to_string();
+        let boot_cell = CurrentCell::Noun { noun: boot_noun.clone() };
+        breadcrumb.push(boot_cell.clone());
         Self {
-            nav_stack: vec![Breadcrumb::Root],
+            nav_stack: vec![
+                Breadcrumb::Root,
+                Breadcrumb::Noun { noun: boot_noun },
+            ],
             subscriber_id: None,
             scrollback: vec![WELCOME.to_string()],
             history: Vec::new(),
             history_idx: None,
             pending_input: String::new(),
-            current_cell: CurrentCell::Root,
+            current_cell: boot_cell,
             nav_targets: Vec::new(),
             system_actions: Vec::new(),
             breadcrumb,
@@ -1553,7 +1560,11 @@ mod tests {
     #[test]
     fn nav_pop_refuses_to_drop_root() {
         let mut s = UnifiedReplState::new();
+        // Boot state starts at Noun{App} — pop once returns to Root.
+        assert!(matches!(s.current_nav(), Breadcrumb::Noun { .. }));
+        s.nav_pop();
         assert!(matches!(s.current_nav(), Breadcrumb::Root));
+        // Second pop: refuses to drop Root — stack stays at length 1.
         s.nav_pop();
         assert!(matches!(s.current_nav(), Breadcrumb::Root));
         assert_eq!(s.nav_stack.len(), 1);
@@ -1693,21 +1704,30 @@ mod tests {
         let _ = slint::platform::set_platform(alloc::boxed::Box::new(platform));
 
         let app = build_app().expect("UnifiedRepl construction failed");
-        // Welcome banner present after construction; navigation at Root.
+        // Welcome banner present after construction.
         assert_eq!(app.scrollback_len(), 1);
         assert_eq!(app.history_len(), 0);
-        assert_eq!(app.nav_depth(), 1);
-        // Cell-as-screen invariant (#511): on construction the
-        // current cell is Root.
-        assert_eq!(app.current_cell_label(), "Resources");
+        // Landing-pass: boot into the App noun list (nav_depth = 2:
+        // Root + Noun{App}). current_cell is Noun{App} so the user
+        // sees the app list immediately.
+        assert_eq!(app.nav_depth(), 2);
+        assert_eq!(app.current_cell_label(), "App");
     }
 
     // ---- Cell-as-screen pane (#511) coverage ----------------------
 
     #[test]
-    fn new_state_seeds_root_as_current_cell() {
+    fn new_state_boots_into_app_noun() {
+        // Landing-pass: initial current cell is the App noun list so
+        // the user sees apps immediately instead of an empty "Resources".
         let s = UnifiedReplState::new();
-        assert_eq!(s.current_cell, CurrentCell::Root);
+        assert_eq!(
+            s.current_cell,
+            CurrentCell::Noun { noun: "App".into() },
+        );
+        // Root is still reachable via back / nav_pop.
+        assert_eq!(s.nav_stack.len(), 2);
+        assert!(matches!(s.nav_stack[0], Breadcrumb::Root));
     }
 
     #[test]
@@ -1736,14 +1756,17 @@ mod tests {
 
     #[test]
     fn nav_pop_resyncs_current_cell_to_remaining_top() {
+        // Boot state: [Root, Noun{App}]. Push File then an instance, then pop back.
         let mut s = UnifiedReplState::new();
         s.nav_push(Breadcrumb::Noun { noun: "File".into() });
         s.nav_push(Breadcrumb::Instance {
             noun: "File".into(),
             instance: "f1".into(),
         });
-        s.nav_pop(); // back to Noun
+        s.nav_pop(); // back to Noun{File}
         assert_eq!(s.current_cell, CurrentCell::Noun { noun: "File".into() });
+        s.nav_pop(); // back to Noun{App} (the landing-pass boot entry)
+        assert_eq!(s.current_cell, CurrentCell::Noun { noun: "App".into() });
         s.nav_pop(); // back to Root
         assert_eq!(s.current_cell, CurrentCell::Root);
         s.nav_pop(); // refuses past Root → no change
@@ -1856,10 +1879,11 @@ mod tests {
     #[test]
     fn submit_non_nav_line_falls_through_to_repl() {
         let mut s = UnifiedReplState::new();
+        let initial_cell = s.current_cell.clone();
         s.scrollback.clear();
         s.submit("> ", "help".to_string());
-        // Current cell unchanged.
-        assert_eq!(s.current_cell, CurrentCell::Root);
+        // Current cell unchanged — non-nav submissions don't move the cursor.
+        assert_eq!(s.current_cell, initial_cell);
         // help response present.
         let blob = s.scrollback.join("\n");
         assert!(blob.contains("help"), "help response missing: {blob}");
@@ -2028,14 +2052,18 @@ mod tests {
     // ---- Navigation history integration (#516) coverage ----------
 
     #[test]
-    fn new_state_seeds_breadcrumb_with_root() {
-        // The constructor pushes Root so the persistent strip across
-        // the top has something to render on first paint.
+    fn new_state_seeds_breadcrumb_with_root_and_boot_app() {
+        // The constructor pushes Root then the boot App noun so the
+        // persistent strip has something to render on first paint and
+        // the user lands on the App list immediately.
         let s = UnifiedReplState::new();
-        assert_eq!(s.breadcrumb.len(), 1);
+        assert_eq!(s.breadcrumb.len(), 2);
         let path = s.breadcrumb.current_path();
-        assert!(path[0].is_current);
+        // Index 0: Root (oldest); index 1: Noun{App} (current).
         assert_eq!(path[0].cell, CurrentCell::Root);
+        assert!(!path[0].is_current);
+        assert_eq!(path[1].cell, CurrentCell::Noun { noun: "App".into() });
+        assert!(path[1].is_current);
     }
 
     #[test]
@@ -2043,20 +2071,26 @@ mod tests {
         // Navigation events flow through `set_current_cell`; each
         // call must contribute to the history trail so back / forward
         // can walk over it.
+        // Boot state seeds Root + App (2 entries). Two more pushes = 4.
         let mut s = UnifiedReplState::new();
+        let boot_len = s.breadcrumb.len(); // 2: Root + Noun{App}
         s.set_current_cell(CurrentCell::Noun { noun: "File".into() });
         s.set_current_cell(CurrentCell::Instance {
             noun: "File".into(),
             instance: "f1".into(),
         });
-        // Root (seeded) + Noun + Instance = 3 entries.
-        assert_eq!(s.breadcrumb.len(), 3);
+        // boot_len + Noun + Instance entries.
+        assert_eq!(s.breadcrumb.len(), boot_len + 2);
         assert!(s.breadcrumb.can_go_back());
         assert!(!s.breadcrumb.can_go_forward());
     }
 
     #[test]
     fn back_walks_breadcrumb_and_updates_current_cell() {
+        // Start fresh; set_current_cell from the boot cell to File.
+        // Boot state is [Root, App]; pushing File and then Instance
+        // gives [Root, App, File, Instance]. Back twice returns to App
+        // and then to Root.
         let mut s = UnifiedReplState::new();
         s.set_current_cell(CurrentCell::Noun { noun: "File".into() });
         s.set_current_cell(CurrentCell::Instance {
@@ -2064,13 +2098,16 @@ mod tests {
             instance: "f1".into(),
         });
 
-        // Back to Noun.
+        // Back to Noun{File}.
         let prev = s.back();
         assert_eq!(prev, Some(CurrentCell::Noun { noun: "File".into() }));
         assert_eq!(s.current_cell, CurrentCell::Noun { noun: "File".into() });
-        // History length unchanged — back walks the cursor, doesn't push.
-        assert_eq!(s.breadcrumb.len(), 3);
         assert!(s.breadcrumb.can_go_forward());
+
+        // Back to Noun{App} (boot entry).
+        let prev = s.back();
+        assert_eq!(prev, Some(CurrentCell::Noun { noun: "App".into() }));
+        assert_eq!(s.current_cell, CurrentCell::Noun { noun: "App".into() });
 
         // Back to Root.
         let prev = s.back();
@@ -2112,18 +2149,22 @@ mod tests {
     fn navigate_after_back_clears_forward_stack() {
         // Browser-style: stepping back then navigating somewhere new
         // drops everything past the cursor.
+        // Boot state: [Root, App]. Push File → Tag, back to File, push Component.
+        // Result: [Root, App, File, Component] (Tag dropped).
         let mut s = UnifiedReplState::new();
+        let boot_len = s.breadcrumb.len(); // 2
         s.set_current_cell(CurrentCell::Noun { noun: "File".into() });
         s.set_current_cell(CurrentCell::Noun { noun: "Tag".into() });
         s.back();
         // Cursor at Noun(File). Navigate somewhere new.
         s.set_current_cell(CurrentCell::Noun { noun: "Component".into() });
-        // History: Root, File, Component (Tag dropped).
-        assert_eq!(s.breadcrumb.len(), 3);
+        // History: boot_len + File + Component (Tag dropped).
+        assert_eq!(s.breadcrumb.len(), boot_len + 2);
         assert!(!s.breadcrumb.can_go_forward());
         let path = s.breadcrumb.current_path();
-        assert_eq!(path[2].cell, CurrentCell::Noun { noun: "Component".into() });
-        assert!(path[2].is_current);
+        let last = path.last().expect("non-empty path");
+        assert_eq!(last.cell, CurrentCell::Noun { noun: "Component".into() });
+        assert!(last.is_current);
     }
 
     #[test]

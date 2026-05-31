@@ -430,9 +430,9 @@ export component UnifiedRepl inherits Window {
                         Rectangle {
                             width: 160px;
                             Card {
-                                title: "Resources";
+                                title: "Apps";
                                 if root.resources.length == 0 : Text {
-                                    text: "(no resources)";
+                                    text: "Loading...";
                                     color: Theme.text-muted;
                                     font-family: Theme.type-body-sm.family;
                                     font-size: Theme.type-body-sm.size;
@@ -587,7 +587,7 @@ export component UnifiedRepl inherits Window {
                             Card {
                                 title: "Navigate";
                                 if root.navigation-targets.length == 0 : Text {
-                                    text: "(no navigation targets — this cell is a leaf)";
+                                    text: "Nothing to navigate from here. Try the actions below or type 'help'.";
                                     color: Theme.text-muted;
                                     font-family: Theme.type-body-sm.family;
                                     font-size: Theme.type-body-sm.size;
