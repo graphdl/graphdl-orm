@@ -621,3 +621,176 @@ mod tests {
         assert!(path.last().map(|e| e.is_current).unwrap_or(false));
     }
 }
+
+// ── AppTrail ───────────────────────────────────────────────────────
+
+/// Ordered sequence of visited app slugs — a flat trail of which apps
+/// the user navigated into, in insertion order.
+///
+/// Unlike `BreadcrumbState` (which tracks cell-level within-REPL
+/// navigation), `AppTrail` tracks the coarser launcher-level navigation:
+/// which top-level app slugs have been visited (e.g. "unified-repl",
+/// "keyboard"). The launcher can use this to implement "previous app"
+/// UX or analytics without coupling to `BreadcrumbState`'s cell model.
+///
+/// # API
+///
+///   * `push_app(slug)` — append a slug to the trail (duplicates allowed;
+///     each visit is an independent entry).
+///   * `current_app()` — the most-recently-pushed slug, or `None` if empty.
+///   * `app_history()` — the full history slice in insertion order
+///     (oldest → most recent).
+///
+/// # Host-testability
+///
+/// No Slint, no UEFI, no `system::*` — runs under
+/// `cargo test --lib --target x86_64-pc-windows-msvc`.
+#[derive(Debug, Clone, Default)]
+pub struct AppTrail {
+    /// Slugs in insertion order. Unbounded — for boot sessions where the
+    /// user navigates between apps, the list stays small (typically < 20
+    /// entries). A future PR can cap it with a `VecDeque` eviction shape.
+    history: Vec<String>,
+}
+
+impl AppTrail {
+    /// Create a new empty trail.
+    pub fn new() -> Self {
+        Self { history: Vec::new() }
+    }
+
+    /// Append `slug` to the trail. Every call to `push_app` adds an
+    /// entry unconditionally, including duplicates — each visit is
+    /// distinct. Duplicates are expected (e.g. user returns to the
+    /// REPL multiple times in a session).
+    pub fn push_app(&mut self, slug: impl Into<String>) {
+        self.history.push(slug.into());
+    }
+
+    /// The most-recently-pushed slug, or `None` when the trail is empty.
+    pub fn current_app(&self) -> Option<&str> {
+        self.history.last().map(|s| s.as_str())
+    }
+
+    /// Full history in insertion order (oldest → most recent).
+    /// Returns an empty slice when no app has been visited.
+    pub fn app_history(&self) -> &[String] {
+        &self.history
+    }
+
+    /// Number of entries in the trail. Zero when empty.
+    pub fn len(&self) -> usize {
+        self.history.len()
+    }
+
+    /// True iff no app has been visited yet.
+    pub fn is_empty(&self) -> bool {
+        self.history.is_empty()
+    }
+}
+
+// ── AppTrail tests ─────────────────────────────────────────────────
+
+#[cfg(test)]
+mod app_trail_tests {
+    use super::*;
+    use alloc::string::ToString;
+
+    // ── Default / new ─────────────────────────────────────────────
+
+    #[test]
+    fn new_trail_is_empty() {
+        let t = AppTrail::new();
+        assert!(t.is_empty());
+        assert_eq!(t.len(), 0);
+        assert_eq!(t.current_app(), None);
+        assert_eq!(t.app_history(), &[] as &[String]);
+    }
+
+    #[test]
+    fn default_trail_is_empty() {
+        let t = AppTrail::default();
+        assert!(t.is_empty());
+    }
+
+    // ── push_app ──────────────────────────────────────────────────
+
+    #[test]
+    fn push_one_app_sets_current() {
+        let mut t = AppTrail::new();
+        t.push_app("unified-repl");
+        assert_eq!(t.current_app(), Some("unified-repl"));
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn push_multiple_apps_tracks_all() {
+        let mut t = AppTrail::new();
+        t.push_app("unified-repl");
+        t.push_app("keyboard");
+        t.push_app("unified-repl");
+
+        assert_eq!(t.len(), 3);
+        assert_eq!(t.current_app(), Some("unified-repl"));
+        let history = t.app_history();
+        assert_eq!(history[0].as_str(), "unified-repl");
+        assert_eq!(history[1].as_str(), "keyboard");
+        assert_eq!(history[2].as_str(), "unified-repl");
+    }
+
+    // ── current_app ───────────────────────────────────────────────
+
+    #[test]
+    fn current_app_updates_on_each_push() {
+        let mut t = AppTrail::new();
+        t.push_app("unified-repl");
+        assert_eq!(t.current_app(), Some("unified-repl"));
+        t.push_app("keyboard");
+        assert_eq!(t.current_app(), Some("keyboard"));
+        t.push_app("doom");
+        assert_eq!(t.current_app(), Some("doom"));
+    }
+
+    // ── app_history ───────────────────────────────────────────────
+
+    #[test]
+    fn app_history_returns_insertion_order() {
+        let mut t = AppTrail::new();
+        let apps = ["a", "b", "c", "d"];
+        for a in apps {
+            t.push_app(a);
+        }
+        let history = t.app_history();
+        assert_eq!(history.len(), 4);
+        for (i, app) in apps.iter().enumerate() {
+            assert_eq!(history[i].as_str(), *app);
+        }
+    }
+
+    #[test]
+    fn app_history_allows_duplicate_slugs() {
+        let mut t = AppTrail::new();
+        t.push_app("repl");
+        t.push_app("repl");
+        t.push_app("repl");
+        assert_eq!(t.len(), 3);
+        assert!(t.app_history().iter().all(|s| s == "repl"));
+    }
+
+    // ── push_app with Into<String> ─────────────────────────────────
+
+    #[test]
+    fn push_app_accepts_owned_string() {
+        let mut t = AppTrail::new();
+        t.push_app("unified-repl".to_string());
+        assert_eq!(t.current_app(), Some("unified-repl"));
+    }
+
+    #[test]
+    fn push_app_accepts_string_slice() {
+        let mut t = AppTrail::new();
+        let slug: &str = "keyboard";
+        t.push_app(slug);
+        assert_eq!(t.current_app(), Some("keyboard"));
+    }
+}

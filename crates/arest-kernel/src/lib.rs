@@ -133,6 +133,15 @@ pub mod theme_pref;
 // the Esc key path and any future button path into a single fact-driven
 // dispatch. No Slint, no UEFI, no `system::*` calls — host-testable.
 pub mod back_action;
+// CommandShortcut cell — fact-driven RawKey forwarding (Task U3c).
+// Pure functions over `&Object` that seed the `Command_has_Shortcut` cell
+// (history-up→ArrowUp, history-down→ArrowDown, clear→Ctrl-L, back→Escape)
+// and expose `resolve_command` / `is_forwarded_raw_shortcut`. The UEFI-gated
+// `drain_keyboard_with_esc_intercept` in `ui_apps::launcher` calls
+// `is_forwarded_raw_shortcut` in the RawKey arm to decide forward vs. drop,
+// replacing the hardcoded silent drop that broke Up/Down history navigation.
+// No Slint, no UEFI, no `system::*` calls — host-testable.
+pub mod command_shortcut;
 // `ui_apps` is the Slint-driven boot UI surface (Unified REPL,
 // launcher, keyboard, doom). Every submodule that touches the
 // runtime imports `slint::*`, and the launcher's `run(...)`

@@ -132,6 +132,21 @@ use crate::back_action::{
     seed_back_action_cell,
 };
 
+// ── Cell-driven CommandShortcut RawKey forwarding (#U3c) ──────────
+//
+// Pure cell functions live in `crate::command_shortcut` (host-testable;
+// no Slint/UEFI dependency). `is_forwarded_raw_shortcut` replaces the
+// hardcoded `RawKey(_) => { /* drop */ }` arm in
+// `drain_keyboard_with_esc_intercept` with a fact-driven lookup: only
+// raw keys whose shortcut name appears in the `Command_has_Shortcut`
+// cell are forwarded to the active Slint window; all others are still
+// dropped. `seed_command_shortcut_cell` is called at boot (after
+// `seed_back_action_cell`) to populate the cell graph.
+use crate::command_shortcut::{
+    is_forwarded_raw_shortcut,
+    seed_command_shortcut_cell,
+};
+
 // ── Cell-driven app set (#709 Task U1) ────────────────────────────
 //
 // Pure extraction functions live in `crate::launcher_app_set` so they
@@ -375,6 +390,16 @@ pub fn run(
     // Escape (or any future button press) maps to, unifying the key
     // path and button path into one fact-driven dispatch.
     seed_back_action_into_system();
+
+    // Task U3c: seed the CommandShortcut cell into SYSTEM so that
+    // RawKey forwarding in `drain_keyboard_with_esc_intercept` is
+    // fact-driven. The four shortcuts (history-up→ArrowUp,
+    // history-down→ArrowDown, clear→Ctrl-L, back→Escape) are now
+    // first-class facts; the drain's RawKey arm calls
+    // `is_forwarded_raw_shortcut` to decide forward vs. drop, fixing
+    // the silent-discard bug that broke Up/Down REPL history
+    // navigation via the launcher boot path.
+    seed_command_shortcut_into_system();
 
     // Track #709 Task U1: populate the AppLauncher's `app-names`
     // property from the `LaunchableApp_has_Symbol` cells. This is the
@@ -988,22 +1013,30 @@ fn drain_keyboard_into_focused_toolkit_pump() -> bool {
 /// `slint_input::decoded_key_to_text` either (it's private to that
 /// module, and Track QQ owns slint_input.rs per the ownership map).
 ///
-/// `RawKey` entries (Arrow keys, Function row, modifiers, navigation
-/// cluster) are dropped silently here. The REPL app's history walk
-/// uses Up/Down which the pc-keyboard US-104 layout decodes to RawKey
-/// — so history navigation is broken when the REPL is launched
-/// through the launcher (it works fine when the REPL window receives
-/// keystrokes directly through `drain_keyboard_into_slint_window`,
-/// which has the full RawKey table). Documented limitation; widening
-/// this helper would duplicate ~50 lines of mapping code from
-/// slint_input.rs. A follow-up that adds a peek API to
-/// arch::uefi::keyboard (so we can check for Esc without consuming
-/// the entry) lets this helper collapse to a one-line wrapper around
-/// `drain_keyboard_into_slint_window`.
+/// `RawKey` entries: Task U3c fixes the prior silent-drop bug. The
+/// REPL's history navigation (Up/Down) uses `pc_keyboard::KeyCode::
+/// ArrowUp` / `ArrowDown` (the US-104 layout decodes those scancodes
+/// as `DecodedKey::RawKey`, not `Unicode`). With the old hardcoded
+/// `RawKey(_) => { /* drop */ }` arm, history navigation was silently
+/// discarded whenever the REPL was launched through the launcher
+/// (the normal UEFI boot path).
+///
+/// The fix: `rawkey_to_shortcut_name` maps a `KeyCode` to its
+/// cell-vocabulary name (e.g. `ArrowUp` → "ArrowUp"); then
+/// `is_forwarded_raw_shortcut(name, state)` consults the
+/// `Command_has_Shortcut` cell seeded at boot. Only raw keys whose
+/// name appears in the cell are forwarded to Slint; all other raw
+/// keys (modifiers, function row, navigation cluster) are still dropped,
+/// preserving the previous behaviour for unregistered keys.
+///
+/// For forwarding, `rawkey_to_slint_text` maps the same `KeyCode` to
+/// the `SharedString` payload Slint expects (using `slint::platform::Key`
+/// constants directly, mirroring `slint_input.rs::raw_keycode_to_slint_key`
+/// for the subset of keys that are forwarded).
 fn drain_keyboard_with_esc_intercept(window: &slint::Window) -> bool {
-    use pc_keyboard::DecodedKey;
+    use pc_keyboard::{DecodedKey, KeyCode};
     use slint::SharedString;
-    use slint::platform::WindowEvent;
+    use slint::platform::{Key, WindowEvent};
 
     let mut esc_seen = false;
     while let Some(decoded) = keyboard::read_keystroke() {
@@ -1027,14 +1060,123 @@ fn drain_keyboard_with_esc_intercept(window: &slint::Window) -> bool {
                     );
                 }
             }
-            DecodedKey::RawKey(_) => {
-                // Drop. See doc comment for the "RawKey forwarding
-                // requires the full mapping table from
-                // slint_input.rs" rationale.
+            DecodedKey::RawKey(kc) => {
+                // Task U3c: fact-driven RawKey forwarding. Rather than
+                // dropping all raw keys (the prior silent-drop that broke
+                // Up/Down REPL history), consult the `Command_has_Shortcut`
+                // cell to decide which raw keys should be forwarded to
+                // the active Slint window. Only keys whose shortcut name
+                // appears in the cell are forwarded; all others are dropped.
+                if !esc_seen {
+                    if let Some(name) = rawkey_to_shortcut_name(kc) {
+                        let should_forward = crate::system::with_state(|s| {
+                            is_forwarded_raw_shortcut(name, s)
+                        });
+                        if should_forward == Some(true) {
+                            if let Some(text) = rawkey_to_slint_text(kc) {
+                                let _ = window.try_dispatch_event(
+                                    WindowEvent::KeyPressed { text: text.clone() },
+                                );
+                                let _ = window.try_dispatch_event(
+                                    WindowEvent::KeyReleased { text },
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
     esc_seen
+}
+
+/// Map a `pc_keyboard::KeyCode` to the cell-vocabulary shortcut name
+/// used in `Command_has_Shortcut` facts. Returns `None` for keycodes
+/// that have no registered shortcut name (modifiers, OEM keys, etc.).
+///
+/// Only covers the subset of keycodes that the `Command_has_Shortcut`
+/// cell seeds at boot (ArrowUp, ArrowDown) plus a few other arrow/nav
+/// keys that may be seeded in future tasks. Extending coverage means
+/// adding a row here AND seeding a fact in `seed_command_shortcut_cell`.
+///
+/// This mapping is separate from `slint_input.rs::raw_keycode_to_slint_key`
+/// (which is private to that module) — it operates on the *cell vocabulary*
+/// names rather than on `slint::platform::Key` constants. The two tables
+/// are consistent (both use the same key names), but this table is the
+/// fact-lookup layer while `rawkey_to_slint_text` below is the dispatch
+/// layer that converts to the actual Slint `SharedString`.
+fn rawkey_to_shortcut_name(code: pc_keyboard::KeyCode) -> Option<&'static str> {
+    use pc_keyboard::KeyCode;
+    Some(match code {
+        KeyCode::ArrowUp    => "ArrowUp",
+        KeyCode::ArrowDown  => "ArrowDown",
+        KeyCode::ArrowLeft  => "ArrowLeft",
+        KeyCode::ArrowRight => "ArrowRight",
+        // Navigation cluster — seeded as-needed by future tasks.
+        KeyCode::Insert     => "Insert",
+        KeyCode::Home       => "Home",
+        KeyCode::End        => "End",
+        KeyCode::PageUp     => "PageUp",
+        KeyCode::PageDown   => "PageDown",
+        // Function keys — seeded as-needed.
+        KeyCode::F1  => "F1",
+        KeyCode::F2  => "F2",
+        KeyCode::F3  => "F3",
+        KeyCode::F4  => "F4",
+        KeyCode::F5  => "F5",
+        KeyCode::F6  => "F6",
+        KeyCode::F7  => "F7",
+        KeyCode::F8  => "F8",
+        KeyCode::F9  => "F9",
+        KeyCode::F10 => "F10",
+        KeyCode::F11 => "F11",
+        KeyCode::F12 => "F12",
+        // Modifiers and everything else — no cell vocabulary name;
+        // these are not forwardable via the fact-driven path.
+        _ => return None,
+    })
+}
+
+/// Map a `pc_keyboard::KeyCode` to the `SharedString` Slint expects in
+/// a `KeyPressed` / `KeyReleased` event — the Unicode private-use char
+/// that `slint::platform::Key` assigns to each named key.
+///
+/// Mirrors `slint_input.rs::raw_keycode_to_slint_key` for the subset
+/// of keys that `rawkey_to_shortcut_name` covers. Returns `None` for
+/// keycodes outside this subset (same as the drop path above).
+///
+/// Why duplicate the mapping rather than re-using `slint_input.rs`?
+/// `raw_keycode_to_slint_key` is private to the `arch::uefi::slint_input`
+/// module (Track QQ ownership), and we only need the small subset
+/// covered by the forwarded shortcuts. This helper stays small and is
+/// the canonical place to extend when a future task seeds a new key.
+fn rawkey_to_slint_text(code: pc_keyboard::KeyCode) -> Option<slint::SharedString> {
+    use pc_keyboard::KeyCode;
+    use slint::platform::Key;
+    Some(slint::SharedString::from(match code {
+        KeyCode::ArrowUp    => Key::UpArrow,
+        KeyCode::ArrowDown  => Key::DownArrow,
+        KeyCode::ArrowLeft  => Key::LeftArrow,
+        KeyCode::ArrowRight => Key::RightArrow,
+        KeyCode::Insert     => Key::Insert,
+        KeyCode::Home       => Key::Home,
+        KeyCode::End        => Key::End,
+        KeyCode::PageUp     => Key::PageUp,
+        KeyCode::PageDown   => Key::PageDown,
+        KeyCode::F1  => Key::F1,
+        KeyCode::F2  => Key::F2,
+        KeyCode::F3  => Key::F3,
+        KeyCode::F4  => Key::F4,
+        KeyCode::F5  => Key::F5,
+        KeyCode::F6  => Key::F6,
+        KeyCode::F7  => Key::F7,
+        KeyCode::F8  => Key::F8,
+        KeyCode::F9  => Key::F9,
+        KeyCode::F10 => Key::F10,
+        KeyCode::F11 => Key::F11,
+        KeyCode::F12 => Key::F12,
+        _ => return None,
+    }))
 }
 
 /// Track XXXXX #466: drain every pending `pointer::PointerEvent` and
@@ -1294,6 +1436,37 @@ fn seed_back_action_into_system() {
     if let Some(new_state) = new_state {
         // apply_unchecked: the BackAction cell is a UI shortcut binding,
         // not a metamodel constraint — skip the validate gate.
+        let _ = crate::system::apply_unchecked(new_state);
+    }
+}
+
+/// Task U3c: seed the `Command_has_Shortcut` cell into the live SYSTEM
+/// state at boot. Seeds four canonical shortcuts:
+///
+///   history-up   → ArrowUp   (REPL history-previous)
+///   history-down → ArrowDown (REPL history-next)
+///   clear        → Ctrl-L    (REPL clear — decoded as Unicode '\x0c')
+///   back         → Escape    (back-to-launcher — redundant with U3b,
+///                             included for cell-graph completeness)
+///
+/// The `drain_keyboard_with_esc_intercept` RawKey arm reads this cell
+/// via `is_forwarded_raw_shortcut` to decide forward vs. drop, fixing
+/// the silent-discard bug that broke Up/Down history navigation in the
+/// REPL when launched via the launcher boot path.
+///
+/// Idempotent: `cell_push` appends; `is_forwarded_raw_shortcut` /
+/// `resolve_command` use `find_map` which returns on the first match,
+/// so a duplicate fact from re-seeding on reboot is harmless.
+///
+/// On error (SYSTEM not yet initialised) the seeding is skipped
+/// silently; `system::with_state` returning `None` surfaces it.
+fn seed_command_shortcut_into_system() {
+    let new_state = crate::system::with_state(|state| {
+        seed_command_shortcut_cell(state)
+    });
+    if let Some(new_state) = new_state {
+        // apply_unchecked: command-shortcut bindings are UI preferences,
+        // not metamodel constraints — skip the validate gate.
         let _ = crate::system::apply_unchecked(new_state);
     }
 }
