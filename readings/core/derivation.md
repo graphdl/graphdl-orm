@@ -49,47 +49,75 @@ equivalence with the pre-#890 per-pair fanout is pinned by
 
 <!--
   Substrate-lift TODO (deletion plan for `compile_subtype_inheritance_metamodel`):
+  Task: subtype-join-antecedent
 
   The rule above is the FORML 2 form of what
   `crates/arest/src/compile.rs::compile_subtype_inheritance_metamodel`
-  (~lines 6179-6249) synthesises procedurally. Once the parser learns
+  (~lines 6692-6779) synthesises procedurally. Once the parser learns
   to lift derivation antecedents that quantify over the METAMODEL cells
   (`Subtype`, `FactType`, `Role`, `Noun`) — not just user-declared FTs —
   the Rust synthesiser becomes pure ceremony and can be retired.
 
-  Deletion plan (do not apply until prerequisites land):
+  Child-task breakdown (subtype-join-antecedent epic):
 
-  1. Parser prerequisite — `resolve_derivation_rule`
-     (crates/arest/src/parse_forml2.rs) must recognise antecedents whose
-     FT references are metamodel cells. Today these clauses fall through
-     `// (1) Comparator-stripped FT lookup` and land as
-     `UnresolvedClause` because Subtype/Role/FactType are not in the
-     declared-FT catalog of a user reading set.
+  Child 1 — parse: recognise metamodel-cell antecedents in derivation rule bodies
+    File: crates/arest/src/parse_forml2.rs::resolve_derivation_rule
+    What: `Subtype`, `FactType`, `Role` referenced in rule antecedents must
+    resolve to `AntecedentSource::FactType("<cell_name>")` rather than landing
+    as `UnresolvedClause`. Today these fall through `// (1) Comparator-stripped
+    FT lookup` because the metamodel cells are NOT in the declared-FT catalog
+    of a user reading set.
+    HOW: the `SchemaCatalog` receives a flag / supplemental map of metamodel
+    cells so `resolve_fact_type` can match them; the resolved antecedent
+    sources are `FactType("Subtype")`, `FactType("FactType")`, etc.
+    Acceptance: a rule body `iff some Subtype has subtype Sub and ...` parses
+    with `antecedent_sources = [FactType("Subtype")]` and zero unresolved clauses.
 
-  2. Compiler prerequisite — `compile_explicit_derivation` must handle
-     a `Literal(ft_id)` consequent whose ft_id is itself a binding from
-     a metamodel-cell antecedent (today it expects ft_id to be a
-     compile-time-known literal).
+  Child 2 — compile: AntecedentRole consequent cell in compile_explicit_derivation
+    File: crates/arest/src/compile.rs::compile_explicit_derivation
+    What: the consequent cell id `ft_id` is itself a BINDING from an antecedent
+    fact — specifically the `FactType.id` binding from the antecedent
+    `Fact Type has that Role` clause. Today the compiler expects ft_id to be a
+    compile-time-known literal (`ConsequentCellSource::Literal(ft_id)`). For the
+    metamodel rule the cell-source must be `AntecedentRole { antecedent_index,
+    role: "id" }` (or equivalent).
+    Acceptance: a rule with `consequent_cell = AntecedentRole { ... }` compiles
+    to a `CompiledDerivation` whose Func emits `<antecedent_ft_id, reading,
+    bindings>` tuples for each matching antecedent combination.
 
-  3. Once (1) and (2) ship, this rule body parses into a single
-     `CompiledDerivation` whose Func quantifies over
-     `Subtype × FactType × Role × <Sub-instances>` directly. At that
-     point delete `compile_subtype_inheritance_metamodel` (compile.rs
-     ~6179-6249), the `SUBTYPE_INHERITANCE_ID` constant (~6257), the
-     synthetic-id branch in `compile_to_defs_state` (~1907) that keys
-     this id into every subtype's relevance set, and the call site at
-     ~3935. The pin `crates/arest/tests/subtype_metamodel_rule_e2e.rs`
-     stays — it verifies emission shape, not the lift mechanism.
+  Child 3 — retire: delete compile_subtype_inheritance_metamodel
+    Prerequisite: children 1 AND 2 are DONE and the reading above parses +
+    compiles into a single CompiledDerivation that produces the same emission as
+    the procedural synthesiser.
+    What to delete:
+      * `compile_subtype_inheritance_metamodel` (compile.rs ~6692-6779)
+      * `SUBTYPE_INHERITANCE_ID` constant (compile.rs ~6787)
+      * synthetic-id branch in `compile_to_defs_state` that keys `_subtype_
+        inheritance` into every subtype's relevance set (compile.rs ~1907-1942)
+      * direct call to `compile_subtype_inheritance_metamodel` (compile.rs ~4020)
+    Keep: `crates/arest/tests/subtype_metamodel_rule_e2e.rs` (verifies emission
+    shape, not the lift mechanism) and the new tests in
+    `compile_explicit_derivation_tests.rs` (subtype_is_a_clause_* tests).
 
   Cascading callers (BLOCKING — `compile_subtype_inheritance_metamodel`
   has non-synthesiser consumers, so the lift is option-6 "document and
-  stop" until prerequisites (1) and (2) land):
+  stop" until children 1 and 2 land):
     * `compile_to_defs_state` `derivation_index` synthetic-id fallback
       (compile.rs ~1737, ~1907) — needs to know "this id covers every
       subtype". Once the rule is parser-lifted to a normal
       CompiledDerivation, the index keys it from its bindings instead
       of the synthetic-id allowlist.
-    * `compile_derivations` direct call (compile.rs ~3935).
+    * `compile_derivations` direct call (compile.rs ~4020).
+
+  Current state pinned by:
+    * `crates/arest/src/compile_explicit_derivation_tests.rs::
+       subtype_is_a_clause_in_rule_antecedent_is_not_unresolved`
+       (pins that X is a Y doesn't produce UnresolvedClause)
+    * `crates/arest/src/compile_explicit_derivation_tests.rs::
+       subtype_inheritance_derivation_reading_text_in_derivation_md_is_present_and_facts_derive`
+       (pins the procedural-path behavior + verifies the reading text exists)
+    * `crates/arest/tests/subtype_metamodel_rule_e2e.rs`
+       (pins the full E2E emission shape)
 -->
 
 ## SS Subset-Constraint auto-fill (#891 — replaces the per-SS-Constraint Rust loop)

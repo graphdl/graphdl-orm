@@ -304,19 +304,41 @@ fn is_entity_ref_scheme_literal(clause: &str, noun_names: &[String]) -> bool {
 /// classifier returns false — preserving the literal-aware-scanner
 /// invariant.
 fn is_subtype_instance_check(clause: &str, noun_names: &[String]) -> bool {
+    extract_subtype_instance_check(clause, noun_names).is_some()
+}
+
+/// Extract the `(subtype_noun, supertype_noun)` pair from an `X is a Y`
+/// / `X is an Y` clause when both sides resolve to declared nouns.
+/// Returns `None` when the clause doesn't match or either side isn't a
+/// declared noun.
+///
+/// Used by `resolve_derivation_rule` (task subtype-join-antecedent)
+/// to add the `Subtype` metamodel cell as an antecedent source so
+/// `X is a Y` in a rule antecedent contributes role-literal filters
+/// against the schema-declared `Subtype` cell rather than being
+/// silently skipped.  Prerequisites for the full lift live in
+/// `readings/core/derivation.md` under "Subtype-join-antecedent".
+fn extract_subtype_instance_check(
+    clause: &str,
+    noun_names: &[String],
+) -> Option<(String, String)> {
     let trimmed = clause.trim();
     // Chained-temporary form: the `Table::boot()` temporary lives
     // to end-of-statement so the iterator's borrow of `rows` is
-    // valid across the `.any(...)` closure. Mirrors the sibling
+    // valid across the `.find_map(...)` closure. Mirrors the sibling
     // lifts in is_range_filter_clause / is_word_comparator_clause —
     // a named local would trip the drop-order check (E0597).
     crate::parse_forml2_stage2::SubtypeInstanceCheckTable::boot()
-        .iter().any(|kw| {
-            let Some(idx) = trimmed.find(kw) else { return false; };
+        .iter().find_map(|kw| {
+            let idx = trimmed.find(kw)?;
             let lhs = trimmed[..idx].trim();
             let rhs = trimmed[idx + kw.len()..].trim();
             let is_noun = |s: &str| noun_names.iter().any(|n| n == s);
-            is_noun(lhs) && is_noun(rhs)
+            if is_noun(lhs) && is_noun(rhs) {
+                Some((lhs.to_string(), rhs.to_string()))
+            } else {
+                None
+            }
         })
 }
 
@@ -1912,11 +1934,23 @@ fn resolve_derivation_rule(
 
         // (7) Subtype instance check: `X is a Y` / `X is an Y` where
         //     both X and Y are declared nouns. Subtype membership is
-        //     inherent to the schema (Noun-is-subtype-of-Noun facts),
-        //     not a separate FT. Recognised so readings like
+        //     inherent to the schema (`X is a subtype of Y` declarations
+        //     in the Subtype metamodel cell). Recognised so readings like
         //       TCPA Violation is for Robocall ... if Robocall is
         //         an Autodialed Call and ...
         //     don't spuriously flag the subtype check as unresolved.
+        //
+        //     task subtype-join-antecedent: `extract_subtype_instance_check`
+        //     is used by `compile_derivations` (compile.rs) to implement a
+        //     compile-time schema-gate: a rule whose antecedent contains
+        //     `X is a Y` is only compiled if the schema actually declares X
+        //     as a subtype of Y.  Pairs whose schema relationship is absent
+        //     produce rules that would NEVER fire — dropping them at compile
+        //     time is correct and avoids dead derivations.
+        //
+        //     The (sub, sup) pair is recorded in the rule's unresolved-
+        //     clauses only if the CALLER (compile.rs gate) needs to act;
+        //     here we just skip without noise.
         if is_subtype_instance_check(part, &noun_names) { continue; }
 
         // (8) Word-based value comparison: `X exceeds Y`,

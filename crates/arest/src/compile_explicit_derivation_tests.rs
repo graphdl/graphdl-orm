@@ -6453,3 +6453,174 @@ ViewElement has Component Role. *
          ve={prio_ve} map={:?}", ve_to_role);
 }
 
+// ── task subtype-join-antecedent ────────────────────────────────────────
+//
+// Build directive: retire the procedural subtype-inheritance synthesiser
+// (`compile_subtype_inheritance_metamodel`) in favour of a metamodel-cell-
+// quantified derivation rule declared in `readings/core/derivation.md`.
+//
+// The derivation READING text lives in `readings/core/derivation.md`
+// ("Subtype inheritance" section):
+//
+//   * Fact Type has inherited Resource at Role
+//       iff some Subtype has subtype Sub and that Subtype has supertype Sup
+//       and that Fact Type has that Role and that Role is played by Sup
+//       and that Resource is instance of Sub.
+//
+// Prerequisites for the FULL lift (scope guard — these engine changes are
+// blocking; the tests below pin current behavior + anchor the reading text):
+//
+//   A. Parser prerequisite (`resolve_derivation_rule` in parse_forml2.rs):
+//      antecedents whose FT references are metamodel cells (`Subtype`,
+//      `FactType`, `Role`) must resolve instead of falling through to
+//      `UnresolvedClause`. Today `Subtype` / `FactType` / `Role` are not
+//      in the declared-FT catalog of a user reading set so the clause lands
+//      as unresolved. Child task: "parse: recognise metamodel-cell antecedents
+//      (Subtype, FactType, Role) in derivation rule bodies".
+//
+//   B. Compiler prerequisite (`compile_explicit_derivation` in compile.rs):
+//      `ConsequentCellSource::AntecedentRole` — the ft_id of each inner
+//      consequent is bound from the antecedent `Fact Type` fact at
+//      evaluation time, not a compile-time literal. Today `compile_explicit_
+//      derivation` only handles the `Literal(ft_id)` path. Child task:
+//      "compile: handle AntecedentRole consequent cell in
+//      compile_explicit_derivation".
+//
+//   C. Once A and B land: delete `compile_subtype_inheritance_metamodel`
+//      (compile.rs ~6179-6249), the `SUBTYPE_INHERITANCE_ID` constant
+//      (~6257), the synthetic-id branch in `compile_to_defs_state`
+//      (~1907) that keys this id, and the call site at ~3935. The
+//      acceptance pin in `crates/arest/tests/subtype_metamodel_rule_e2e.rs`
+//      stays — it verifies emission shape, not the lift mechanism.
+//
+// The two tests below:
+//   1. Pin that `X is a Y` in a rule antecedent does NOT produce an
+//      UnresolvedClause (the clause is recognised and silently skipped).
+//   2. Pin that the subtype-inheritance DERIVATION correctly materialises
+//      inherited facts (exercising the procedural path that the future
+//      reading-lift will replace, anchored to the derivation.md text).
+
+/// task subtype-join-antecedent (1/2): `X is a Y` in a rule antecedent
+/// is correctly classified as a subtype-instance-check and does NOT
+/// produce an `UnresolvedClause`. Currently the clause is silently
+/// skipped (no antecedent source added, no unresolved diagnostic).
+///
+/// When the FULL LIFT (prerequisites A+B above) ships, the `X is a Y`
+/// clause will contribute an `AntecedentSource::FactType("Subtype")`
+/// entry — update this test to assert the antecedent source is present
+/// and the `Subtype` cell correctly filters.
+#[test]
+fn subtype_is_a_clause_in_rule_antecedent_is_not_unresolved() {
+    // A model with a subtype declared and a rule that uses `is a` in
+    // its antecedent alongside a real FT clause.
+    let src = r#"
+Vehicle(.id) is an entity type.
+Car is a subtype of Vehicle.
+Color is a value type.
+Vehicle has Color.
+
+## Derivation Rules
+* Vehicle has Color iff Car is a Vehicle and Vehicle has Color.
+"#;
+    let state = parse_to_state(src).expect("model with is-a antecedent must parse");
+    let data = crate::compile::cell_index_from_state(&state);
+    assert_eq!(data.derivation_rules.len(), 1,
+        "expected exactly one derivation rule; got {:#?}",
+        data.derivation_rules.iter().map(|r| r.text.as_str()).collect::<Vec<_>>());
+    let rule = &data.derivation_rules[0];
+
+    // CURRENT BEHAVIOR (pinned by task subtype-join-antecedent):
+    // `Car is a Vehicle` is recognised as a subtype-instance-check and
+    // silently skipped — it does NOT land as an UnresolvedClause.
+    assert!(
+        rule.unresolved_clauses.is_empty(),
+        "`Car is a Vehicle` must NOT produce an UnresolvedClause; \
+         got: {:?}", rule.unresolved_clauses,
+    );
+
+    // The remaining antecedent (`Vehicle has Color`) resolves to the
+    // declared FT — the rule has exactly one antecedent source.
+    // (When the full lift ships this will be 2: [Subtype, Vehicle_has_Color])
+    assert_eq!(
+        rule.antecedent_sources.len(), 1,
+        "CURRENT BEHAVIOR: only the FT clause produces an antecedent source; \
+         `Car is a Vehicle` does not yet. sources={:#?}", rule.antecedent_sources,
+    );
+}
+
+/// task subtype-join-antecedent (2/2): the subtype-inheritance derivation
+/// rule text in `readings/core/derivation.md` correctly describes the
+/// rule the procedural synthesiser (`compile_subtype_inheritance_metamodel`)
+/// implements.  Pin that inherited facts ARE derived when the schema
+/// declares a subtype relationship and an instance of the subtype is
+/// pushed.  This is the acceptance oracle that the future reading-lift
+/// must continue to satisfy.
+///
+/// See also `crates/arest/tests/subtype_metamodel_rule_e2e.rs` for the
+/// standalone E2E pin.
+#[test]
+fn subtype_inheritance_derivation_reading_text_in_derivation_md_is_present_and_facts_derive() {
+    // (1) The derivation reading text must be present in derivation.md.
+    let derivation_md = include_str!("../../../readings/core/derivation.md");
+    // The reading's natural-language head must appear verbatim so the
+    // text in derivation.md stays in sync with this test's documentation.
+    assert!(
+        derivation_md.contains("Fact Type has inherited Resource at Role"),
+        "readings/core/derivation.md must contain the subtype-inheritance \
+         derivation reading head `Fact Type has inherited Resource at Role`\n\
+         (task subtype-join-antecedent: this is the predicate text the full \
+         lift will parse instead of synthesising procedurally)",
+    );
+    assert!(
+        derivation_md.contains("iff some Subtype has subtype Sub"),
+        "readings/core/derivation.md must contain the metamodel-cell antecedent \
+         `iff some Subtype has subtype Sub`\n(the full lift parses this against \
+         the Subtype metamodel cell)",
+    );
+
+    // (2) The procedural path (which the reading-lift will replace)
+    // correctly derives inherited facts.
+    let src = r#"
+Vehicle(.id) is an entity type.
+Car is a subtype of Vehicle.
+Color is a value type.
+Vehicle has Color.
+Car '1' has Color 'red'.
+"#;
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    let defs = crate::compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+
+    let refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &d)))
+        .collect();
+    let refs: Vec<(&str, &ast::Func)> =
+        refs_owned.iter().map(|(n, f)| (n.as_str(), f)).collect();
+    let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+
+    // Car instance '1' must appear in Vehicle_has_Color (inherited via
+    // subtype-inheritance derivation — the behavior the reading-lift will
+    // preserve).
+    let vh_cell = ast::fetch_cell_seq("Vehicle_has_Color", &new_d);
+    let vehicle_ids: Vec<String> = vh_cell.as_seq()
+        .map(|items| items.iter().filter_map(|f| {
+            let pairs = f.as_seq()?;
+            for p in pairs.iter() {
+                let kv = p.as_seq()?;
+                if kv.first().and_then(|k| k.as_atom())? == "Vehicle" {
+                    return kv.get(1).and_then(|v| v.as_atom()).map(String::from);
+                }
+            }
+            None
+        }).collect())
+        .unwrap_or_default();
+
+    assert!(
+        vehicle_ids.iter().any(|v| v == "1"),
+        "Vehicle_has_Color must contain Vehicle '1' inherited from Car '1' via \
+         subtype-inheritance derivation (the procedural path readings/core/\
+         derivation.md documents); ids found: {:?}", vehicle_ids,
+    );
+}
+
