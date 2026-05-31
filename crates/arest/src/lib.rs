@@ -1130,6 +1130,7 @@ pub const UI_READINGS: &[(&str, &str)] = &[
     ("view-menu",        include_str!("../../../readings/ui/view-menu.md")),
     ("view-list",        include_str!("../../../readings/ui/view-list.md")),
     ("view-detail",      include_str!("../../../readings/ui/view-detail.md")),
+    ("ifactr-android",   include_str!("../../../readings/ui/ifactr-android.md")),
 ];
 
 /// Access-control SUBSTRATE (server-enforced, no UI). Declares Operation /
