@@ -606,6 +606,32 @@ pub const CURSOR_W: usize = 12;
 /// Height in pixels of the `CURSOR_ARROW` bitmap.
 pub const CURSOR_H: usize = 18;
 
+/// Scale a device-space absolute value (`0..=value_max` — e.g. a
+/// virtio-tablet `EV_ABS` coordinate over QEMU's `0..=32767` range)
+/// to a framebuffer pixel coordinate in `[0, extent)`.
+///
+/// #596: virtio-input absolute pointers report position in their own
+/// calibrated range, not screen pixels. The pointer-drain consumer
+/// (`launcher::drain_pointer_into_slint_window`) must apply this
+/// mapping — per `arch::uefi::pointer::PointerEvent::AbsMove`'s "the
+/// consumer applies the device's calibration to map to screen pixels"
+/// contract — before the value becomes a cursor coordinate. Without
+/// it the cursor lands at e.g. (22000, 17000) on a 1280×800 surface,
+/// far off every edge, which reads as "no cursor on screen".
+///
+/// Guarded + clamped: a non-positive `value_max` or zero `extent`
+/// yields 0, negative inputs floor at 0, and a value at or beyond
+/// `value_max` maps to the last on-screen pixel (`extent - 1`) rather
+/// than off the edge.
+pub fn scale_to_extent(value: i32, value_max: i64, extent: usize) -> i32 {
+    if value_max <= 0 || extent == 0 {
+        return 0;
+    }
+    let v = value.max(0) as i64;
+    let last = extent as i64 - 1;
+    ((v * last) / value_max).clamp(0, last) as i32
+}
+
 /// Paint the cursor-arrow sprite into a raw `*mut u32` framebuffer.
 ///
 /// Each pixel slot is one `u32` in the framebuffer's native pixel
@@ -671,6 +697,28 @@ pub unsafe fn paint_cursor_sprite_into(
 mod cursor_tests {
     use super::*;
     use alloc::vec;
+
+    /// #596 regression: `scale_to_extent` maps a virtio-tablet device-
+    /// space coordinate (0..=32767) into framebuffer pixels, so the
+    /// cursor lands on-screen instead of at the raw off-screen value
+    /// that produced "no cursor on screen".
+    #[test]
+    fn scale_to_extent_maps_device_range_into_screen() {
+        // Edges and midpoint of QEMU's 0..=32767 abs range → 1280 wide.
+        assert_eq!(scale_to_extent(0, 32767, 1280), 0);
+        assert_eq!(scale_to_extent(32767, 32767, 1280), 1279);
+        assert_eq!(scale_to_extent(16384, 32767, 1280), 639);
+        // The repro coordinates (22000, 17000) that landed off-screen
+        // when used raw are on-screen once scaled.
+        assert!(scale_to_extent(22000, 32767, 1280) < 1280);
+        assert!(scale_to_extent(17000, 32767, 800) < 800);
+        // A value past the device max clamps to the last pixel.
+        assert_eq!(scale_to_extent(40000, 32767, 1280), 1279);
+        // Degenerate inputs are guarded, not panics.
+        assert_eq!(scale_to_extent(100, 0, 1280), 0);
+        assert_eq!(scale_to_extent(100, 32767, 0), 0);
+        assert_eq!(scale_to_extent(-5, 32767, 1280), 0);
+    }
 
     /// `paint_cursor_sprite_into` writes the expected white pixels at
     /// the correct framebuffer offsets for a given (cx, cy). We use a

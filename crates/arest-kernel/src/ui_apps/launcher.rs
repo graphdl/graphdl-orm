@@ -904,11 +904,26 @@ fn drain_pointer_into_slint_window(window: &slint::Window) {
                 // both EV_ABS axes resolved to 0) write through
                 // both. This handles the realistic device output
                 // without a per-axis state machine.
+                // #596: EV_ABS `value` is DEVICE space (QEMU's virtio-
+                // tablet reports absolute position over 0..=ABS_MAX,
+                // not screen pixels), so scale to the framebuffer
+                // resolution via `framebuffer::scale_to_extent` before
+                // it becomes a cursor coordinate. Without this the
+                // cursor landed at e.g. (22000, 17000) on a 1280×800
+                // surface — off every edge, read as "no cursor on
+                // screen". ABS_MAX is the QEMU virtio-tablet range; a
+                // device-reported `input_abs_get_max` would be more
+                // precise for real hardware, but every boot target is
+                // QEMU.
+                const ABS_MAX: i64 = 32767;
+                let (fb_w, fb_h) = crate::framebuffer::info()
+                    .map(|i| (i.width, i.height))
+                    .unwrap_or((1280, 800));
                 if x != 0 {
-                    cx = x;
+                    cx = crate::framebuffer::scale_to_extent(x, ABS_MAX, fb_w);
                 }
                 if y != 0 {
-                    cy = y;
+                    cy = crate::framebuffer::scale_to_extent(y, ABS_MAX, fb_h);
                 }
                 if x == 0 && y == 0 {
                     cx = 0;
