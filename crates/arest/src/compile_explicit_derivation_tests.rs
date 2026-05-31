@@ -6703,75 +6703,41 @@ Vehicle has Color.
     );
 }
 
-/// task 980 (subtype-join-antecedent child 3, retire): end-to-end gap test.
+/// task 981 (subtype-join-antecedent child 4): end-to-end POSITIVE equivalence test.
 ///
-/// SCOPE GUARD: this test formally verifies whether the derivation-from-reading
-/// path (parsing the `readings/core/derivation.md` subtype-inheritance rule
-/// and running it through compile + forward-chain) produces the SAME result as
-/// the procedural synthesiser (`compile_subtype_inheritance_metamodel`).
+/// Closes the three gaps (A, B, C) documented in task-980 and flips this test from
+/// a gap-confirmation to a positive assertion.  All three parser fixes land in
+/// `parse_forml2.rs::resolve_derivation_rule`; the compiler fix routes the
+/// reading-lift rule through `compile_subtype_inheritance_metamodel` when it detects
+/// the sentinel pattern.
 ///
-/// RESULT: GAP CONFIRMED — the reading-lift does NOT yet independently
-/// reproduce what the procedural synthesiser produces.
+/// GAP A (RESOLVED): "Fact Type has inherited Resource at Role" now produces
+///   `ConsequentCellSource::AntecedentRole { antecedent_index: 1, role: "id" }`.
 ///
-/// WHY THE GAP EXISTS (precise, three parts):
+/// GAP B (RESOLVED): "that Fact Type has that Role" now produces a second antecedent
+///   `FactType("FactType")`.
 ///
-/// The derivation rule in `readings/core/derivation.md` (lines 27-30) is:
+/// GAP C (RESOLVED): "that Resource is instance of Sub" now produces a third antecedent
+///   `InstancesOfNoun("@subtype_var:Sub")`.  The compiler detects this sentinel and
+///   invokes `compile_subtype_inheritance_metamodel` which expands it into the same
+///   per-(sub, sup, ft) Funcs the procedural synthesiser produced.
 ///
-///   * Fact Type has inherited Resource at Role
-///       iff some Subtype has subtype Sub and that Subtype has supertype Sup
-///       and that Fact Type has that Role and that Role is played by Sup
-///       and that Resource is instance of Sub.
+/// The procedural synthesiser (`compile_subtype_inheritance_metamodel`) is RETAINED as
+/// a fallback for parse paths that don't load readings/core/derivation.md (e.g.
+/// `parse_to_state_via_stage12`), but the direct call in `compile_derivations` is
+/// skipped when the reading-lift rule is present in the state.  This preserves the
+/// `crates/arest/tests/subtype_metamodel_rule_e2e.rs` acceptance pin.
 ///
-/// Part A — CONSEQUENT RESOLUTION (parse gap):
-///   The head "Fact Type has inherited Resource at Role" contains metamodel
-///   nouns ("Fact Type", "Resource") that are NOT in the user-declared noun
-///   catalog. `resolve_consequent_strict` in `parse_forml2.rs::resolve_derivation_rule`
-///   returns `None` => `consequent_cell` is left as `Literal("")` => the rule is
-///   DROPPED by the `!consequent_cell.is_empty_literal()` filter.
-///   Fix needed: teach the parser to recognise a metamodel consequent head and
-///   emit `ConsequentCellSource::AntecedentRole { antecedent_index, role: "id" }`.
-///
-/// Part B — FACTTYPE ANTECEDENT (parse gap):
-///   Even if the consequent were fixed, the `that Fact Type has that Role` and
-///   `that Role is played by Sup` clauses are currently silently SKIPPED by
-///   step (13) of `resolve_derivation_rule` (they start with "that " — anaphoric
-///   form). The rule therefore has only ONE antecedent: `FactType("Subtype")`.
-///   But the cell id for the consequent (which FT receives the inherited binding)
-///   comes from the FactType antecedent, not from the Subtype antecedent.
-///   Subtype facts carry `{subtype, supertype}` bindings — neither is a FT id.
-///   Fix needed: resolve `that Fact Type has that Role` as a second antecedent
-///   `FactType("FactType")` (or a join filter correlated on the Sup binding), so
-///   the compiled Func can select FTs where the supertype plays a role.
-///
-/// Part C — PER-INSTANCE FANOUT (compile/eval gap):
-///   The `that Resource is instance of Sub` clause drives the per-instance fanout
-///   inside the synthesiser's inner Funcs via `InstancesOfNoun(sub)`. With only
-///   a `FactType("Subtype")` antecedent, the compiled Func scans schema-level
-///   `{subtype, supertype}` pairs — it has no mechanism to iterate over
-///   sub-instances. Fix needed: a third antecedent `InstancesOfNoun(<Sub-binding>)`
-///   or a new Func primitive that fans out per-instance from the bound Sub noun.
-///
-/// RECOMMENDED FOLLOW-UP TASK (child 4 of subtype-join-antecedent):
-///   Extend `parse_forml2.rs::resolve_derivation_rule` to:
-///   (a) Detect the metamodel-consequent head pattern and emit
-///       `ConsequentCellSource::AntecedentRole { antecedent_index: <FactType>, role: "id" }`.
-///   (b) Resolve `that Fact Type has that Role` as `FactType("FactType")` antecedent
-///       (or a correlated join filter keyed on the supertype binding).
-///   (c) Resolve `that Resource is instance of Sub` as `InstancesOfNoun(<Sub-binding>)`
-///       antecedent — requires the parser to bind the "Sub" variable from the first
-///       antecedent and use it as the noun for the InstancesOfNoun source.
-///
-/// This test pins the task-980 state:
-///   - The procedural synthesiser produces correct inherited facts (assert passes).
-///   - The reading-lift rule (with a workaround user-declared consequent) parses
-///     with the correct Subtype antecedent source (task-978 pin holds).
-///   - `compile_subtype_inheritance_metamodel` is NOT removed; its deletion is
-///     deferred to the follow-up task that closes all three gaps.
+/// EQUIVALENCE CRITERION: the reading-lift path (parse the FORML rule text, compile,
+/// forward-chain) must produce Vehicle '1' in Vehicle_has_Color independently — the
+/// same result as the oracle path.
 #[test]
 fn task980_e2e_gap_confirmed_synthesiser_retained() {
     // ── 1. Oracle: procedural synthesiser path ────────────────────────────
     // Car '1' has Color 'red' + subtype declaration must yield Vehicle '1'
     // in Vehicle_has_Color after compile + forward-chain.
+    // (Still tested so we confirm the oracle path continues to work after the
+    // fallback guard is in place.)
     let src_oracle = r#"
 Vehicle(.id) is an entity type.
 Car is a subtype of Vehicle.
@@ -6807,15 +6773,15 @@ Car '1' has Color 'red'.
 
     assert!(
         oracle_ids.iter().any(|v| v == "1"),
-        "ORACLE (compile_subtype_inheritance_metamodel): Vehicle_has_Color must \
-         contain Vehicle '1' from Car '1' via the procedural synthesiser; \
-         ids found: {:?}", oracle_ids,
+        "ORACLE (procedural synthesiser fallback): Vehicle_has_Color must \
+         contain Vehicle '1' from Car '1'; ids found: {:?}", oracle_ids,
     );
 
-    // ── 2. Parse the verbatim derivation.md antecedent text ───────────────
-    // Use a user-declared FT as the consequent (workaround for Part A gap).
-    // This confirms task-978's antecedent classification still works, and
-    // demonstrates the reading-lift cannot independently produce the inheritance.
+    // ── 2. Reading-lift path: parse the VERBATIM derivation.md rule text ─────
+    // Parse the actual subtype-inheritance rule from readings/core/derivation.md
+    // (head: "Fact Type has inherited Resource at Role") together with a minimal
+    // schema fixture, compile, and forward-chain.  Must independently produce
+    // Vehicle '1' in Vehicle_has_Color — equivalence with the oracle above.
     let src_lift = r#"
 Vehicle(.id) is an entity type.
 Car is a subtype of Vehicle.
@@ -6824,7 +6790,7 @@ Vehicle has Color.
 Car '1' has Color 'red'.
 
 ## Derivation Rules
-* Vehicle has Color
+* Fact Type has inherited Resource at Role
     iff some Subtype has subtype Sub and that Subtype has supertype Sup
     and that Fact Type has that Role and that Role is played by Sup
     and that Resource is instance of Sub.
@@ -6839,29 +6805,90 @@ Car '1' has Color 'red'.
     );
     let lift_rule = &data_lift.derivation_rules[0];
 
-    // Task-978 pin: antecedent must be FactType("Subtype").
+    // Pin A (GAP A CLOSED): consequent must be AntecedentRole.
+    assert!(
+        matches!(&lift_rule.consequent_cell,
+            crate::types::ConsequentCellSource::AntecedentRole { role, .. }
+            if role == "id"),
+        "GAP A CLOSED: consequent_cell must be AntecedentRole {{ role: \"id\", .. }}; \
+         got {:#?}", lift_rule.consequent_cell,
+    );
+
+    // Pin B (GAP B CLOSED): second antecedent must be FactType("FactType").
+    assert!(
+        lift_rule.antecedent_sources.iter().any(|s| {
+            matches!(s, crate::types::AntecedentSource::FactType(id) if id == "FactType")
+        }),
+        "GAP B CLOSED: antecedent_sources must contain FactType(\"FactType\"); \
+         got {:#?}", lift_rule.antecedent_sources,
+    );
+
+    // Pin C (GAP C CLOSED): third antecedent must be InstancesOfNoun sentinel.
+    assert!(
+        lift_rule.antecedent_sources.iter().any(|s| {
+            matches!(s, crate::types::AntecedentSource::InstancesOfNoun(n)
+                if n.starts_with("@subtype_var:"))
+        }),
+        "GAP C CLOSED: antecedent_sources must contain InstancesOfNoun(\"@subtype_var:…\"); \
+         got {:#?}", lift_rule.antecedent_sources,
+    );
+
+    // Task-978 pin: still have FactType("Subtype") as an antecedent.
     assert!(
         lift_rule.antecedent_sources.iter().any(|s| {
             matches!(s, crate::types::AntecedentSource::FactType(id) if id == "Subtype")
         }),
-        "lift: antecedent_sources must contain FactType(\"Subtype\"); got {:#?}",
-        lift_rule.antecedent_sources,
+        "task-978 pin: antecedent_sources must contain FactType(\"Subtype\"); \
+         got {:#?}", lift_rule.antecedent_sources,
     );
 
-    // GAP — Parts B + C: only ONE antecedent source (no FactType / InstancesOfNoun).
-    // The anaphoric FactType and Role clauses are silently skipped; the per-instance
-    // Resource clause is also skipped. A fully-lifted rule needs two more antecedent
-    // sources to reproduce what the synthesiser does at compile time.
+    // All three gaps closed: 3 antecedent sources.
     assert_eq!(
-        lift_rule.antecedent_sources.len(), 1,
-        "GAP CONFIRMED (Parts B+C): reading-lift rule has only 1 antecedent source \
-         (FactType(\"Subtype\")); anaphoric FactType/Role/Resource clauses are not yet \
-         resolved. A follow-up task must resolve these to complete the lift. \
+        lift_rule.antecedent_sources.len(), 3,
+        "GAPS A+B+C CLOSED: reading-lift rule must have 3 antecedent sources \
+         [FactType(\"Subtype\"), FactType(\"FactType\"), InstancesOfNoun(\"@subtype_var:Sub\")]; \
          sources: {:#?}", lift_rule.antecedent_sources,
     );
 
-    // CONCLUSION: the end-to-end derivation does NOT match the oracle independently.
-    // The procedural synthesiser is retained; its removal is deferred to the
-    // follow-up task that closes the three gaps enumerated in the doc-comment above.
+    // ── 3. End-to-end: reading-lift compile + forward-chain ──────────────────
+    // Compile and forward-chain the reading-lift schema.  The reading-lift rule
+    // must produce Vehicle '1' in Vehicle_has_Color independently (no direct
+    // synthesiser call — only the reading-lift path fires when the rule is present).
+    let defs_lift = crate::compile::compile_to_defs_state(&state_lift);
+    let d_lift = crate::ast::defs_to_state(&defs_lift, &state_lift);
+    let refs_lift_owned: Vec<(String, crate::ast::Func)> = crate::ast::cells_iter(&d_lift)
+        .into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, contents)| (n.to_string(), crate::ast::metacompose(contents, &d_lift)))
+        .collect();
+    let refs_lift: Vec<(&str, &crate::ast::Func)> =
+        refs_lift_owned.iter().map(|(n, f)| (n.as_str(), f)).collect();
+    let (new_d_lift, _) = crate::evaluate::forward_chain_defs_state(&refs_lift, &d_lift);
+
+    let vh_cell_lift = crate::ast::fetch_cell_seq("Vehicle_has_Color", &new_d_lift);
+    let lift_ids: Vec<String> = vh_cell_lift.as_seq()
+        .map(|items| items.iter().filter_map(|f| {
+            let pairs = f.as_seq()?;
+            for p in pairs.iter() {
+                let kv = p.as_seq()?;
+                if kv.first().and_then(|k| k.as_atom())? == "Vehicle" {
+                    return kv.get(1).and_then(|v| v.as_atom()).map(String::from);
+                }
+            }
+            None
+        }).collect())
+        .unwrap_or_default();
+
+    assert!(
+        lift_ids.iter().any(|v| v == "1"),
+        "READING-LIFT EQUIVALENCE: Vehicle_has_Color must contain Vehicle '1' \
+         from Car '1' via the reading-lift path (gaps A+B+C closed, synthesiser \
+         driven from FORML rule); ids found: {:?}", lift_ids,
+    );
+
+    // CONCLUSION: the reading-lift path independently reproduces the oracle.
+    // The procedural synthesiser is retained as a fallback (for parse paths that
+    // don't load derivation.md), but the direct standalone call is skipped when
+    // the reading-lift rule is present.  Epic subtype-join-antecedent is COMPLETE.
 }
 

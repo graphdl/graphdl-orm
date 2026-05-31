@@ -1924,14 +1924,30 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                     if did.contains(noun_name) { nouns.insert(noun_name.clone()); }
                 }
             }
-            // #890: the single `_subtype_inheritance` metamodel rule
-            // doesn't carry any one noun in its id (it's the lifted
-            // `Concat . [per-(sub, sup, ft) inner Func]` form), so the
-            // substring fallback above misses it. Insert it under
-            // every declared subtype noun + every supertype noun so
-            // noun-gated dispatch (command::create_via_defs) finds it
-            // for either side of an inheritance edge.
-            if did == SUBTYPE_INHERITANCE_ID {
+            // #890 + task subtype-join-antecedent child 4: the subtype-inheritance
+            // metamodel rule (now compiled from the reading-lift path in
+            // readings/core/derivation.md) doesn't carry any one noun in its
+            // compiled id — it's the lifted `Concat . [per-(sub, sup, ft) inner Func]`
+            // form. Insert it under every declared subtype noun + every supertype
+            // noun so noun-gated dispatch (command::create_via_defs) finds it for
+            // either side of an inheritance edge.
+            // Detection: the domain_rule has FactType("Subtype") as the first
+            // antecedent AND an InstancesOfNoun("@subtype_var:…") sentinel.
+            // The old `SUBTYPE_INHERITANCE_ID` ("_subtype_inheritance") id is kept
+            // as a fallback in case the reading hasn't been parsed into the state
+            // (e.g. bootstrap paths that skip the derivation.md load).
+            let is_subtype_lift = did == SUBTYPE_INHERITANCE_ID || {
+                domain_rule.map(|r| {
+                    let has_subtype = r.antecedent_sources.first()
+                        .map(|s| s.fact_type_id() == "Subtype")
+                        .unwrap_or(false);
+                    let has_sentinel = r.antecedent_sources.iter()
+                        .any(|s| matches!(s, crate::types::AntecedentSource::InstancesOfNoun(n)
+                            if n.starts_with("@subtype_var:")));
+                    has_subtype && has_sentinel
+                }).unwrap_or(false)
+            };
+            if is_subtype_lift {
                 for (sub, sup) in subtype_pairs.iter() {
                     nouns.insert(sub.clone());
                     nouns.insert(sup.clone());
@@ -4003,22 +4019,36 @@ fn compile_derivations(data: &CellIndex, state_machines: &[CompiledStateMachine]
         }
     }));
 
-    // Subtype inheritance (#890): the per-(subtype, supertype, ft)
-    // synthesis loop is replaced by ONE metamodel derivation rule
-    // declared in `readings/core/derivation.md` and lifted to ONE
-    // CompiledDerivation by `compile_subtype_inheritance_metamodel`.
-    // Whitepaper §5.2: this is the universal modus-ponens schema for
-    // subtype membership — antecedent quantifies over Subtype × FactType
-    // × Role cells, consequent is the synthesized supertype-membership
-    // fact in every FT cell where the supertype plays a role. Behavior
-    // is byte-for-byte identical to the pre-#890 fanout (acceptance:
-    // crates/arest/tests/subtype_metamodel_rule_e2e.rs); pre-#890 the
-    // chainer saw N defs `derivation:_subtype_X_Y_FT`, post-#890 it
-    // sees ONE def `derivation:_subtype_inheritance` whose Func emits
-    // the same union of `<super_ft_id, reading, <<super_role, instance>>>`
-    // tuples in one Concat step.
-    if let Some(d) = compile_subtype_inheritance_metamodel(data) {
-        derivations.push(d);
+    // Subtype inheritance (#890, lifted to reading-driven in task subtype-join-antecedent
+    // child 4): the declarative FORML rule in readings/core/derivation.md is compiled
+    // via the reading-lift path (compile_explicit_derivation detects the
+    // FactType("Subtype")+FactType("FactType")+InstancesOfNoun("@subtype_var:…") pattern
+    // and routes to compile_subtype_inheritance_metamodel internally) when the rule is
+    // present in the state.
+    //
+    // FALLBACK (legacy): when the state does NOT include readings/core/derivation.md
+    // (e.g. standalone parse calls that don't embed the core readings), the reading-lift
+    // rule is absent and the direct call below fires.  Removing this fallback would break
+    // crates/arest/tests/subtype_metamodel_rule_e2e.rs (which calls
+    // parse_to_state_via_stage12 without derivation.md) and every other call site that
+    // parses user text without the core readings bundle.
+    //
+    // The guard: skip the direct call when the derivation_rules loop already produced a
+    // subtype-inheritance derivation (identified by its reading-lift antecedent pattern).
+    // This prevents double-emission when both paths are active.
+    let already_has_subtype_lift = derivations.iter().any(|d| {
+        data.derivation_rules.iter().any(|r| {
+            r.id == d.id
+                && r.antecedent_sources.first().map(|s| s.fact_type_id() == "Subtype").unwrap_or(false)
+                && r.antecedent_sources.iter().any(|s| matches!(
+                    s, crate::types::AntecedentSource::InstancesOfNoun(n)
+                        if n.starts_with("@subtype_var:")))
+        })
+    });
+    if !already_has_subtype_lift {
+        if let Some(d) = compile_subtype_inheritance_metamodel(data) {
+            derivations.push(d);
+        }
     }
 
     // SS auto-fill (#891): the per-SS-Constraint synthesis loop is
@@ -4760,6 +4790,55 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
     // rather than relying on the FT id.
     let antecedent_ids: Vec<String> = rule.antecedent_sources.iter()
         .map(|s| s.fact_type_id().to_string()).collect();
+
+    // task subtype-join-antecedent child 4 — READING-LIFT DETECTION.
+    // When the parser emits the subtype-inheritance rule from the FORML text
+    // in readings/core/derivation.md, it produces a specific antecedent
+    // pattern:
+    //   [0] FactType("Subtype")           — "some Subtype has subtype Sub"
+    //   [1] FactType("FactType")           — "that Fact Type has that Role" (GAP B)
+    //   [2] InstancesOfNoun("@subtype_var:Sub") — "that Resource is instance of Sub" (GAP C)
+    // and a consequent:
+    //   AntecedentRole { antecedent_index: 1, role: "id" }  (GAP A)
+    //
+    // This exact shape cannot be handled by the generic multi-antecedent paths
+    // (the AntecedentRole + InstancesOfNoun combination needs compile-time schema
+    // expansion, not runtime join). Detect it and route to the same
+    // compile_subtype_inheritance_metamodel function the procedural synthesiser
+    // uses — producing byte-for-byte the same CompiledDerivation.
+    let is_subtype_inheritance_reading_lift = {
+        let has_subtype_ant = rule.antecedent_sources.first()
+            .map(|s| s.fact_type_id() == "Subtype")
+            .unwrap_or(false);
+        let has_instances_sentinel = rule.antecedent_sources.iter()
+            .any(|s| matches!(s, crate::types::AntecedentSource::InstancesOfNoun(n)
+                if n.starts_with("@subtype_var:")));
+        let has_antecedent_role_consequent =
+            matches!(&rule.consequent_cell, crate::types::ConsequentCellSource::AntecedentRole { .. });
+        has_subtype_ant && has_instances_sentinel && has_antecedent_role_consequent
+    };
+    if is_subtype_inheritance_reading_lift {
+        // Route to the oracle. compile_subtype_inheritance_metamodel returns
+        // None when no subtypes are declared; fall through to a no-op empty
+        // derivation in that case (same behaviour as the synthesiser guard).
+        if let Some(mut compiled) = compile_subtype_inheritance_metamodel(data) {
+            // Preserve the reading-lift rule's id and text so the derivation
+            // index and diagnostics show the rule that was declared, not the
+            // synthesiser's synthetic id.
+            compiled.id = id;
+            compiled.text = text;
+            return compiled;
+        }
+        // No subtypes declared — emit a no-op derivation (Concat of empty Seq).
+        let (consequent_cell, _, _) = derivation_dep_metadata_synth(String::new());
+        return CompiledDerivation {
+            id, text, kind,
+            func: Func::compose(Func::Concat, Func::constant(crate::ast::Object::phi())),
+            consequent_cell,
+            materialization: rule.materialization.clone(),
+        };
+    }
+
     // Consequent cell key & reading:
     //   Literal(id) — resolved at compile time. Every user-authored
     //     rule takes this path; the first tuple element is a constant

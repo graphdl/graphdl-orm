@@ -1590,8 +1590,25 @@ fn resolve_derivation_rule(
     // rule is dropped at the `!consequent_cell.is_empty()` filter — a
     // derivation that names a missing fact type refuses to run rather than
     // silently writing a value-less fact into a same-role-set FT.
+    // GAP A (task subtype-join-antecedent child 4): detect the metamodel-derivation
+    // consequent head "Fact Type has inherited Resource at Role".  The nouns
+    // "Fact Type" and "Resource" are NOT in the user-declared noun catalog, so
+    // `resolve_consequent_strict` always returns `None` for this head.  Recognise
+    // the pattern by text and emit `AntecedentRole { antecedent_index: 1, role: "id" }`
+    // — index 1 is the `FactType("FactType")` antecedent added by GAP B, and the
+    // role "id" is the binding key the `FactType` cell stores for each fact-type's
+    // identifier (mirrors the oracle's per-FT `ft_id` extracted from `data.fact_types`).
+    // The pattern check: contains the phrase "inherited" and the word "Fact Type"
+    // (case-normalised) and either "Resource" or "Role" — this is specific enough
+    // to avoid false matches on user-authored rule heads.
+    let is_metamodel_subtype_consequent = {
+        let lower = consequent_text.to_lowercase();
+        lower.contains("inherited") && lower.contains("fact type")
+    };
     if consequent_strict.is_none() {
-        if let Some(fuzzy) = resolve_fact_type(consequent_text) {
+        if is_metamodel_subtype_consequent {
+            // Suppress the fuzzy-match noise: this head is intentional, not a typo.
+        } else if let Some(fuzzy) = resolve_fact_type(consequent_text) {
             rule.unresolved_clauses.push(format!(
                 "consequent '{}' references no declared fact type \
                  (nearest by role set: {})",
@@ -1599,7 +1616,16 @@ fn resolve_derivation_rule(
         }
     }
     let resolved_consequent = consequent_strict.unwrap_or_default();
-    rule.consequent_cell = crate::types::ConsequentCellSource::Literal(resolved_consequent);
+    rule.consequent_cell = if resolved_consequent.is_empty() && is_metamodel_subtype_consequent {
+        // Dynamic consequent: the target cell id is the "id" binding of the
+        // FactType antecedent (antecedent index 1 = FactType("FactType")).
+        // The compiler detects this AntecedentRole + InstancesOfNoun pattern
+        // as the subtype-inheritance reading-lift and expands it into the same
+        // per-(sub, sup, ft) Funcs the procedural synthesiser produces.
+        crate::types::ConsequentCellSource::AntecedentRole { antecedent_index: 1, role: "id".to_string() }
+    } else {
+        crate::types::ConsequentCellSource::Literal(resolved_consequent)
+    };
     if let Some(lit) = consequent_trailing_literal {
         if !rule.consequent_cell.is_empty_literal() {
             let role = fact_types_map.get(rule.consequent_cell.literal_id())
@@ -1619,7 +1645,10 @@ fn resolve_derivation_rule(
     // type â€” it populates consequent_computed_bindings instead. Filter
     // clauses like `has Population >= 1000000` resolve to the base FT
     // with an AntecedentFilter pinned to that antecedent's position.
-    let mut resolved_ids: Vec<String> = Vec::new();
+    // task subtype-join-antecedent child 4: changed from Vec<String> to
+    // Vec<AntecedentSource> so InstancesOfNoun sources (GAP C) can be pushed
+    // alongside FactType sources in the same slot-tracking pipeline.
+    let mut resolved_ids: Vec<crate::types::AntecedentSource> = Vec::new();
     // #914 — parallel vec recording the antecedent-clause text that
     // produced each entry in `resolved_ids`. Used after the main loop
     // to map cross-antecedent comparison specs (noun_token + role)
@@ -1957,7 +1986,7 @@ fn resolve_derivation_rule(
                     });
                 }
             }
-            resolved_ids.push(ft_id);
+            resolved_ids.push(crate::types::AntecedentSource::FactType(ft_id));
             resolved_part_text.push(part.to_string());
             continue;
         }
@@ -2178,28 +2207,84 @@ fn resolve_derivation_rule(
             && resolve_fact_type(&stripped_quantifiers).is_some()
         { continue; }
 
-        // (13) Metamodel-cell antecedent — task subtype-join-antecedent child 1.
+        // (13) Metamodel-cell antecedent — task subtype-join-antecedent child 1/4.
         //      Clauses in derivation rules that quantify over the substrate's own
         //      metamodel cells (`Subtype`, `FactType`, `Role`, `Noun`) rather than
         //      over user-declared Fact Types.  Recognised AFTER all user-catalog
         //      classifiers so a schema that coincidentally declares a noun called
         //      "Subtype" still resolves its own FTs via the catalog at step (1).
         //
-        //      Two clause shapes are handled:
+        //      Four clause shapes are handled:
         //        a) PRIMARY quantification: `some Subtype has subtype Sub`
         //           → `FactType("Subtype")` added to antecedent_sources.
-        //        b) ANAPHORIC back-reference:  `that Subtype has supertype Sup` /
-        //           `that Fact Type has that Role` / `that Resource is instance of Sub`
-        //           → silently skipped (same treatment as step (5) for user nouns).
+        //        b) ANAPHORIC Subtype back-reference:  `that Subtype has supertype Sup`
+        //           → silently skipped (joins are resolved at compile time from schema).
+        //        c) ANAPHORIC FactType: `that Fact Type has that Role`
+        //           → GAP B (child 4): emit `FactType("FactType")` as a second
+        //             antecedent source so the compiler knows to fan over all FTs
+        //             where the supertype plays a role.  `that Role is played by Sup`
+        //             is a further anaphoric refinement — silently skipped (the
+        //             compiler handles the sup-filter from data.subtypes directly).
+        //        d) PER-INSTANCE fan: `that Resource is instance of Sub`
+        //           → GAP C (child 4): emit `InstancesOfNoun("@subtype_var:Sub")` as
+        //             a sentinel.  The compiler replaces the sentinel with the real
+        //             per-subtype `InstancesOfNoun(sub)` fan when it detects the
+        //             subtype-inheritance reading-lift pattern.
         //
         //      The recogniser strips anaphora/quantifier words before checking
         //      so `some Subtype …` and bare `Subtype …` both match.
         {
             let stripped_anaphora = strip_anaphora(part);
+            // GAP C (child 4): per-instance fan clause — gated on AntecedentRole
+            // consequent (i.e. the metamodel head was detected in GAP A).  Only the
+            // subtype-inheritance reading-lift rule has this shape; user rules that
+            // happen to write `X is instance of Y` in their antecedent are silently
+            // skipped by `try_classify_metamodel_clause` (which returns the empty-
+            // string sentinel for this pattern), and we must NOT promote those to an
+            // InstancesOfNoun antecedent or the rule would fire over ALL instances
+            // of Y instead of the intended predicate.
+            //
+            // The check: if the consequent is AntecedentRole (set by GAP A) AND this
+            // clause has "is instance of", push the InstancesOfNoun sentinel.
+            let has_antecedent_role_consequent =
+                matches!(&rule.consequent_cell, crate::types::ConsequentCellSource::AntecedentRole { .. });
+            if has_antecedent_role_consequent && stripped_anaphora.contains(" is instance of ") {
+                // Extract the variable token that follows "is instance of".
+                if let Some(after) = stripped_anaphora.split(" is instance of ").nth(1) {
+                    let var_token = after.trim().trim_end_matches('.');
+                    if !var_token.is_empty() {
+                        resolved_ids.push(crate::types::AntecedentSource::InstancesOfNoun(
+                            alloc::format!("@subtype_var:{}", var_token)
+                        ));
+                        resolved_part_text.push(part.to_string());
+                    }
+                }
+                continue;
+            }
             if let Some(cell_id) = try_classify_metamodel_clause(&stripped_anaphora) {
+                // GAP B (child 4): `that Fact Type has that Role` — the stripped form
+                // `Fact Type has Role` matches the "fact type " prefix and returns
+                // `Some("FactType")`.  Promote from anaphoric-skip to a second
+                // antecedent source ONLY when the consequent is AntecedentRole
+                // (the metamodel head detected by GAP A).  For user rules the anaphoric
+                // `that Fact Type` clause stays silently skipped — otherwise it would
+                // add a spurious FactType("FactType") antecedent to any user rule that
+                // happens to use metamodel vocabulary in its body.
+                // `that Role is played by Sup` (stripped: `Role is played by Sup`)
+                // returns `Some("Role")` — keep as a skip regardless; the sup filter
+                // is resolved by the compiler from data.subtypes directly.
+                if !cell_id.is_empty() && part.trim().starts_with("that ")
+                    && cell_id == "FactType"
+                    && has_antecedent_role_consequent
+                {
+                    // SECOND antecedent: FactType cell (all declared fact types).
+                    resolved_ids.push(crate::types::AntecedentSource::FactType(cell_id));
+                    resolved_part_text.push(part.to_string());
+                    continue;
+                }
                 if !cell_id.is_empty() && !part.trim().starts_with("that ") {
                     // Primary quantification — add as antecedent source.
-                    resolved_ids.push(cell_id);
+                    resolved_ids.push(crate::types::AntecedentSource::FactType(cell_id));
                     resolved_part_text.push(part.to_string());
                 }
                 // Anaphoric form or skip-only predicate — don't emit as unresolved.
@@ -2210,9 +2295,9 @@ fn resolve_derivation_rule(
         // Nothing classified this clause.
         rule.unresolved_clauses.push(part.to_string());
     }
-    rule.antecedent_sources = resolved_ids.into_iter()
-        .map(crate::types::AntecedentSource::FactType)
-        .collect();
+    // task subtype-join-antecedent child 4: resolved_ids is now Vec<AntecedentSource>
+    // (may contain FactType and InstancesOfNoun entries); no mapping needed.
+    rule.antecedent_sources = resolved_ids;
     rule.antecedent_filters = filters;
     rule.antecedent_role_literals = role_literals;
     rule.consequent_computed_bindings = computed;

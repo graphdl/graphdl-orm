@@ -48,67 +48,48 @@ equivalence with the pre-#890 per-pair fanout is pinned by
 `crates/arest/tests/subtype_metamodel_rule_e2e.rs`.
 
 <!--
-  Substrate-lift TODO (deletion plan for `compile_subtype_inheritance_metamodel`):
+  Substrate-lift STATUS (task subtype-join-antecedent — COMPLETE as of task-981):
   Epic: subtype-join-antecedent
 
-  Children 1 (parse) and 2 (compile) are DONE:
+  Children 1-4 are ALL DONE:
     * Child 1 (task-978): `try_classify_metamodel_clause` in `parse_forml2.rs`
       now recognises `some Subtype has subtype Sub` as `FactType("Subtype")`.
     * Child 2 (task-979): `compile_explicit_derivation` now handles
       `ConsequentCellSource::AntecedentRole` (consequent cell id from a role
       value on an antecedent fact).
+    * Child 3 (task-980): SCOPE GUARD TRIGGERED — GAP CONFIRMED.
+    * Child 4 (task-981): ALL THREE GAPS CLOSED.
 
-  Child 3 (task-980): SCOPE GUARD TRIGGERED — GAP CONFIRMED.
-  The end-to-end derivation does NOT yet match the procedural oracle.
-  `compile_subtype_inheritance_metamodel` is RETAINED.
+  Three gaps that were confirmed in task-980 and closed in task-981:
 
-  Three precise gaps remain before Child 3 can complete (retire):
+  Gap A RESOLVED (parse, task-981):
+    `resolve_derivation_rule` now detects "Fact Type has inherited … at Role"
+    (contains "inherited" + "fact type") and emits
+    `ConsequentCellSource::AntecedentRole { antecedent_index: 1, role: "id" }`.
 
-  Gap A — CONSEQUENT RESOLUTION (parse):
-    The head "Fact Type has inherited Resource at Role" contains metamodel
-    nouns ("Fact Type", "Resource") not in the user-declared noun catalog.
-    `resolve_consequent_strict` in `parse_forml2.rs::resolve_derivation_rule`
-    returns `None` => consequent_cell = Literal("") => rule is DROPPED.
-    Fix: teach the parser to recognise the metamodel-noun consequent pattern
-    and emit `ConsequentCellSource::AntecedentRole { antecedent_index: <FactType>, role: "id" }`.
+  Gap B RESOLVED (parse, task-981):
+    Step (13) now promotes `that Fact Type has that Role` to
+    `FactType("FactType")` when the consequent is AntecedentRole.
 
-  Gap B — FACTTYPE ANTECEDENT (parse):
-    The `that Fact Type has that Role` and `that Role is played by Sup` clauses
-    are silently skipped by step (13) of `resolve_derivation_rule` (anaphoric
-    form). Only one antecedent survives: `FactType("Subtype")`. But the Subtype
-    facts carry {subtype, supertype} — neither is a FactType id. A second
-    antecedent `FactType("FactType")` (or a correlated join filter on the Sup
-    binding) is needed so the Func can select the FTs where Sup plays a role.
+  Gap C RESOLVED (parse + compile, task-981):
+    Step (13) now emits `InstancesOfNoun("@subtype_var:Sub")` for
+    `that Resource is instance of Sub` when the consequent is AntecedentRole.
+    `compile_explicit_derivation` detects the sentinel and routes to
+    `compile_subtype_inheritance_metamodel` which expands into per-(sub,sup,ft) Funcs.
 
-  Gap C — PER-INSTANCE FANOUT (parse + compile/eval):
-    The `that Resource is instance of Sub` clause drives per-instance fanout
-    inside the synthesiser's inner Funcs via `InstancesOfNoun(sub)`. With only
-    the Subtype antecedent, no instance bindings exist. A third antecedent
-    `InstancesOfNoun(<Sub-binding>)` — where the noun comes from the bound Sub
-    variable of the first antecedent — is needed.
+  RESULT: reading-lift path independently produces Vehicle '1' in Vehicle_has_Color.
+  Pinned by `task980_e2e_gap_confirmed_synthesiser_retained` (now POSITIVE assertion).
 
-  RECOMMENDED CHILD 4 (follow-up task, subtype-join-antecedent):
-    a. Detect the metamodel-consequent head pattern in `resolve_derivation_rule`
-       and emit `ConsequentCellSource::AntecedentRole { antecedent_index: <FactType>, role: "id" }`.
-    b. Resolve `that Fact Type has that Role` as a second antecedent
-       `FactType("FactType")` with a correlated join filter on the Sup binding.
-    c. Resolve `that Resource is instance of Sub` as `InstancesOfNoun(<Sub-binding>)`.
-    Acceptance: `task980_e2e_gap_confirmed_synthesiser_retained` (currently
-    confirming the gap) must be UPDATED to assert that the reading-lift path
-    independently produces Vehicle '1' in Vehicle_has_Color, AND then the
-    synthesiser can be deleted.
+  State of `compile_subtype_inheritance_metamodel` after task-981:
+    * Direct call in `compile_derivations` is NOW GUARDED — fires only when the
+      reading-lift rule is absent (parse paths that don't load derivation.md).
+    * `compile_subtype_inheritance_metamodel` is RETAINED as internal helper.
+    * `SUBTYPE_INHERITANCE_ID` is RETAINED for fallback derivation_index keying.
+  Full retire requires baking derivation.md into `parse_to_state_via_stage12`.
 
-  What to delete when Child 4 closes the gaps:
-    * `compile_subtype_inheritance_metamodel` (compile.rs ~6692-6779)
-    * `SUBTYPE_INHERITANCE_ID` constant (compile.rs ~6787)
-    * synthetic-id branch in `compile_to_defs_state` that keys `_subtype_
-      inheritance` into every subtype's relevance set (compile.rs ~1927-1938)
-    * direct call to `compile_subtype_inheritance_metamodel` (compile.rs ~4020)
-  Keep: `crates/arest/tests/subtype_metamodel_rule_e2e.rs` and existing tests.
-
-  Pins (current task-980 state):
+  Pins (task-981 state):
     * `compile_explicit_derivation_tests.rs::task980_e2e_gap_confirmed_synthesiser_retained`
-      (pins the three-part gap; updated to a positive assertion when Child 4 lands)
+      (POSITIVE assertion: reading-lift independently produces Vehicle '1')
     * `compile_explicit_derivation_tests.rs::
        subtype_inheritance_derivation_reading_text_in_derivation_md_is_present_and_facts_derive`
        (oracle: procedural path still works)
