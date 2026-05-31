@@ -96,7 +96,10 @@ fn cross_antecedent_role_comparison_via_word_comparator_parses_and_filters_forwa
         &derivation_refs, &d);
 
     let task_ids_in_cell = |cell_name: &str, state: &Object| -> Vec<String> {
-        let cell = ast::fetch_or_phi(cell_name, state);
+        // task-744/#940: FT cells are Map-backed (keyed by full-tuple identity).
+        // `fetch_or_phi(...).as_seq()` silently returns None on a Map cell (the
+        // documented silent-no-op class); `fetch_cell_seq` normalises Map -> Seq.
+        let cell = ast::fetch_cell_seq(cell_name, state);
         cell.as_seq()
             .map(|s| s.iter()
                 .filter_map(|f| f.as_seq().and_then(|pairs| pairs.iter().find_map(|p| {
