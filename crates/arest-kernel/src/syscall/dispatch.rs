@@ -53,6 +53,7 @@
 // tier-1 the negative return is enough.
 
 use crate::syscall::arch_prctl;
+use crate::syscall::brk;
 use crate::syscall::close;
 use crate::syscall::exit;
 use crate::syscall::futex;
@@ -101,6 +102,17 @@ pub const SYS_CLOSE: u64 = 3;
 /// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_write` — the
 /// kernel and libc agree by construction.
 pub const SYS_WRITE: u64 = 1;
+
+/// Linux x86_64 syscall number for `brk(unsigned long addr)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_brk` (= 12).
+/// The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_brk`. There is no
+/// separate SYS_SBRK on Linux x86_64 — `sbrk(3)` is a C-library
+/// wrapper that issues two `brk` calls. Routes to `brk::handle`,
+/// which queries or advances `Process::heap_break`; the real
+/// page-table install (mapping new heap pages) is gated behind the
+/// UEFI boot-integration track (#527 follow-up). Per #509.
+pub const SYS_BRK: u64 = 12;
 
 /// Linux x86_64 syscall number for `exit(status)`. Source:
 /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_exit`. Tier-1
@@ -222,6 +234,13 @@ pub fn dispatch(
 ) -> i64 {
     match rax {
         SYS_WRITE => write::handle(rdi, rsi, rdx),
+        SYS_BRK => {
+            // brk(addr) — heap-break management. `addr` = rdi.
+            // Returns the resulting break (current or new) as a
+            // non-negative i64 — never a negative errno per Linux
+            // raw-syscall convention. Per #509.
+            brk::handle(rdi)
+        }
         SYS_CLOSE => close::handle(rdi as i32),
         SYS_OPENAT => openat::handle(rdi as i32, rsi, rdx as u32, r10 as u32),
         SYS_FUTEX => {
@@ -393,6 +412,22 @@ mod tests {
     #[test]
     fn sys_arch_prctl_number_matches_linux_uapi() {
         assert_eq!(SYS_ARCH_PRCTL, 158);
+    }
+
+    /// `SYS_BRK` is 12 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_brk`.
+    #[test]
+    fn sys_brk_number_matches_linux_uapi() {
+        assert_eq!(SYS_BRK, 12);
+    }
+
+    /// `dispatch(SYS_BRK, 0, ...)` (query form) returns 0 when no
+    /// process is installed (the kernel boot state before any spawn).
+    /// Verifies the dispatcher routes SYS_BRK (12) to brk::handle
+    /// and that the "no current process" sentinel fires.
+    #[test]
+    fn dispatch_brk_zero_returns_zero_with_no_process() {
+        assert_eq!(dispatch(SYS_BRK, 0, 0, 0, 0, 0, 0), 0);
     }
 
     /// `dispatch(SYS_GETUID, ...)` returns 0 — tier-1 root uid.

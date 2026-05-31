@@ -56,6 +56,7 @@
 #![allow(dead_code)]
 
 pub mod arch_prctl;
+pub mod brk;
 pub mod close;
 pub mod dispatch;
 pub mod exit;

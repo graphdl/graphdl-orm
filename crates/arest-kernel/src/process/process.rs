@@ -271,6 +271,22 @@ pub struct Process {
     /// verify only that the field is stored correctly (no real MSR in
     /// test). `ARCH_GET_FS` reads it back symmetrically.
     pub fs_base: u64,
+    /// Current program-break — the first byte ABOVE the process heap.
+    /// Set by the `brk(2)` syscall (SYS_BRK = 12, #509). Linux brk
+    /// semantics: `brk(0)` returns the current break; `brk(addr ≥
+    /// heap_start)` extends (or shrinks) the heap to `addr` and
+    /// returns the new break; an invalid or too-low address leaves the
+    /// break unchanged and returns the current value.
+    ///
+    /// Initialised to 0 in `Process::new`. A break of 0 is the
+    /// "uninitialised / no heap yet" sentinel: `brk(0)` returns 0 and
+    /// `brk(non_zero_addr)` installs the first real break. The actual
+    /// page-table install (mapping the [heap_start, new_break) region)
+    /// is the boot-integration half (real UEFI target); unit tests
+    /// verify only the bookkeeping + validation logic here, mirroring
+    /// how `fs_base` + `arch_prctl` gate the MSR write behind
+    /// `#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]`.
+    pub heap_break: u64,
 }
 
 impl Process {
@@ -310,6 +326,16 @@ impl Process {
             // The handler writes the real pointer here and, on the
             // x86_64-UEFI target, also programs the IA32_FS_BASE MSR.
             fs_base: 0,
+            // Heap break starts at 0 — no heap yet. The first
+            // `brk(non_zero_addr)` from userspace installs the initial
+            // break. `brk(0)` before any real brk call returns 0,
+            // which is the conventional "heap not yet mapped" sentinel
+            // libc uses to discover the initial break on startup
+            // (e.g., musl's `__brk` init path). The handler in
+            // syscall::brk (#509) updates this field; the real
+            // page-table mapping of the heap region is deferred to
+            // the boot-integration track (UEFI target only).
+            heap_break: 0,
         }
     }
 
