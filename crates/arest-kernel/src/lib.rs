@@ -118,6 +118,14 @@ pub mod launcher_app_set;
 // `crate::unified_repl_regions::seed_region_cells` before the
 // super-loop and uses `region_layout_for` to populate Slint props.
 pub mod unified_repl_regions;
+// Cell-driven ThemePref extraction (Task U3a). Pure functions over
+// `&Object` that seed and read `ThemePref_has_Mode` cells and expose
+// a `Send`-safe `PENDING_THEME_MODE` `AtomicU8` staging slot for the
+// subscriber → super-loop handoff. The `ui_apps::launcher` module
+// re-imports the seeding / toggle functions and registers the
+// `subscribe_changes` handler; the super-loop swaps the atomic and
+// calls `.global::<Theme>().set_mode(m)` on the live component handles.
+pub mod theme_pref;
 // `ui_apps` is the Slint-driven boot UI surface (Unified REPL,
 // launcher, keyboard, doom). Every submodule that touches the
 // runtime imports `slint::*`, and the launcher's `run(...)`

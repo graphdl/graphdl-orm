@@ -94,13 +94,30 @@ use crate::arch::uefi::pointer;
 /// Logged first 5 and every 50th so we confirm Sync reaches Slint.
 static DRAIN_SYNC_COUNT: AtomicU64 = AtomicU64::new(0);
 use crate::arch::uefi::slint_backend::{
-    AppLauncher, FramebufferBackend, FramebufferPixelOrder, UefiSlintPlatform,
+    AppLauncher, FramebufferBackend, FramebufferPixelOrder, Theme, ThemeMode, UefiSlintPlatform,
 };
 use crate::arch::uefi::slint_input::drain_keyboard_into_slint_window;
 use crate::toolkit_loop;
 use crate::ui_apps::{keyboard as kbd_app, unified_repl};
 #[cfg(feature = "doom")]
 use crate::ui_apps::doom;
+
+// ── Cell-driven ThemePref (#U3a) ──────────────────────────────────
+//
+// Pure cell functions live in `crate::theme_pref` (host-testable;
+// no Slint/UEFI dependency). The AtomicU8 staging slot
+// `PENDING_THEME_MODE` is also declared there and imported here for
+// the Send-safe subscriber → super-loop handoff.
+use crate::theme_pref::{
+    PENDING_THEME_MODE,
+    ThemePrefMode,
+    pending_to_mode,
+    mode_to_pending,
+    read_theme_pref_mode,
+    seed_theme_pref_cell,
+    toggle_theme_pref,
+    THEME_PREF_CELL,
+};
 
 // ── Cell-driven app set (#709 Task U1) ────────────────────────────
 //
@@ -330,6 +347,15 @@ pub fn run(
     let unified_repl_app = unified_repl::build_app()
         .expect("UnifiedRepl construction failed");
 
+    // Task U3a: seed the ThemePref cell into SYSTEM at boot so the
+    // dark-mode default (design.md canonical) is present as a fact
+    // rather than implied by absence. The seed is idempotent: if a
+    // prior boot already committed a preference via the toggle, the
+    // new seed fact appends to the cell and `read_theme_pref_mode`'s
+    // last-write-wins semantics keep reading the most-recently-pushed
+    // mode (the boot-time seed is older than any prior stored toggle).
+    seed_theme_pref_into_system();
+
     // Track #709 Task U1: populate the AppLauncher's `app-names`
     // property from the `LaunchableApp_has_Symbol` cells. This is the
     // cell-driven app-set: the button list the user sees is derived
@@ -407,11 +433,31 @@ pub fn run(
             *nav.borrow_mut() = active;
         });
     }
-    // Theme toggle is a passive forward — Theme.toggle-mode() has
-    // already swapped the global mode inside the Slint handler. No
-    // host-side persistence yet; the callback's existence keeps the
-    // hook reachable for a future `ThemePref` cell wire-up.
-    launcher.on_theme_toggled(|| {});
+    // Task U3a: wire the ThemePref cell into the theme-toggle callback.
+    // The Slint `toggle-mode()` callback (defined in theme.slint) has
+    // ALREADY flipped `Theme.mode` inside the Slint handler before
+    // `on_theme_toggled` fires — so we don't need to call `.set_mode`
+    // here. We only need to persist the new mode into the SYSTEM cell
+    // graph so the subscriber can pick it up and the round-trip is
+    // complete. `toggle_theme_pref` reads the current cell state and
+    // pushes the opposite mode fact; `system::apply` commits the diff.
+    //
+    // The closure is `move` with no component captures (just the unit
+    // closure shape Slint's callback API wants), so the Send bound of
+    // `on_theme_toggled` is satisfied. The apply side-effect runs on
+    // the super-loop thread (same thread that owns component handles),
+    // which is the only place SYSTEM writes happen; no data races.
+    launcher.on_theme_toggled(|| {
+        let new_state = crate::system::with_state(|state| {
+            toggle_theme_pref(state)
+        });
+        if let Some(new_state) = new_state {
+            // apply_unchecked: the ThemePref cell is a user preference,
+            // not a metamodel constraint — skip the validate gate so
+            // the toggle is instant even if no validate Def is loaded.
+            let _ = crate::system::apply_unchecked(new_state);
+        }
+    });
 
     // Track MMMM #490: register the kernel-resident SlintPump with
     // the toolkit_loop multiplexer. Qt + GTK pump registrations
@@ -451,6 +497,44 @@ pub fn run(
     // `subscribe_changes` diff returns an empty changed-set on the
     // re-apply path and downstream consumers see no spurious churn.
     apply_touch_mode_if_tablet_present();
+
+    // Task U3a: register the Send-safe ThemePref subscriber.
+    //
+    // The subscriber closure must be `Send` (the `SUBSCRIBERS` registry
+    // is `Mutex<BTreeMap<…, Arc<dyn Fn(…) + Send + Sync>>>`). A Slint
+    // `ComponentHandle` is `!Send`, so the subscriber CANNOT capture
+    // `launcher` / `unified_repl_app` / etc. to call `.global::<Theme>
+    // ().set_mode(…)` directly. Instead:
+    //
+    //   1. Subscriber (Send): on `ThemePref_has_Mode` change, read the
+    //      new mode from the current SYSTEM state and store it in
+    //      `PENDING_THEME_MODE` (`AtomicU8`, `Send + Sync`). No
+    //      component access in the closure.
+    //
+    //   2. Super-loop (single-threaded, owns component handles): each
+    //      frame, `swap` the atomic; if non-zero, map to `ThemeMode`
+    //      and call `.global::<Theme>().set_mode(m)` on the launcher
+    //      AND the unified_repl component so the toggle is visible.
+    //
+    // The subscriber id is leaked (`let _`): the subscriber should live
+    // for the entire boot lifetime (same as the component handles), so
+    // there is no Drop path to unsubscribe from. This matches the
+    // launcher's general "one subscriber per app, lives forever" pattern
+    // established by the touch-mode wiring.
+    let _ = crate::system::subscribe_changes(Box::new(|changed: &[String]| {
+        if !changed.iter().any(|c| c == THEME_PREF_CELL) {
+            return;
+        }
+        // Read the new mode from the live SYSTEM state and store it
+        // atomically so the super-loop can pick it up on the next frame.
+        let mode = crate::system::with_state(|state| read_theme_pref_mode(state));
+        if let Some(mode) = mode {
+            PENDING_THEME_MODE.store(
+                mode_to_pending(mode),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }));
 
     // Slint's MinimalSoftwareWindow paints whichever component last
     // registered itself with the shared `Rc<MinimalSoftwareWindow>`.
@@ -516,6 +600,36 @@ pub fn run(
         {
             crate::linuxkpi::tick();
             crate::linuxkpi::virtio::poll_all_vqs();
+        }
+
+        // 0b. Task U3a: apply any pending ThemePref mode change.
+        //
+        // The `subscribe_changes` handler (which must be `Send`) stored
+        // the new mode in `PENDING_THEME_MODE`. We swap it to 0 here
+        // (single consumer, single thread) and, if non-zero, decode and
+        // push the mode to every visible component's `Theme` global.
+        //
+        // Why both launcher AND unified_repl: the Slint `Theme` global
+        // is shared across all components that `import "theme.slint"`.
+        // Updating one component's global instance updates the shared
+        // global state for the whole rendered frame — but to be safe
+        // (and to match the spec's "launcher AND the visible landing
+        // component") we set it on both. The Doom and Keyboard apps also
+        // bind the Theme global; we set those too so a future navigation
+        // into those apps sees the right mode without a separate toggle.
+        {
+            let pending = PENDING_THEME_MODE.swap(0, core::sync::atomic::Ordering::Relaxed);
+            if let Some(mode) = pending_to_mode(pending) {
+                let slint_mode = match mode {
+                    ThemePrefMode::Dark => ThemeMode::Dark,
+                    ThemePrefMode::Light => ThemeMode::Light,
+                };
+                launcher.global::<Theme>().set_mode(slint_mode);
+                unified_repl_app.window.global::<Theme>().set_mode(slint_mode);
+                keyboard_app.window.global::<Theme>().set_mode(slint_mode);
+                #[cfg(feature = "doom")]
+                doom_app.window.global::<Theme>().set_mode(slint_mode);
+            }
         }
 
         // 1. Drain the keyboard ring. When an app is active, intercept
@@ -1102,6 +1216,38 @@ fn drain_pointer_into_slint_window(window: &slint::Window) {
         // Persist for the cursor-sprite painter and next drain seed,
         // same as the Sync path — EV_REL without EV_SYN still moves.
         pointer::set_position(cx, cy);
+    }
+}
+
+/// Task U3a: seed the `ThemePref_has_Mode` cell into the live SYSTEM
+/// state at boot so the dark-mode default is present as an explicit
+/// fact rather than implied by cell absence.
+///
+/// Only seeds when the cell is absent — if a prior boot already
+/// committed a preference it remains the operative fact (last-write-wins
+/// in `read_theme_pref_mode`). Idempotent: re-seeding appends the Dark
+/// default as an older fact under any existing preferred-mode fact, so
+/// `read_theme_pref_mode`'s reverse-iteration still picks up the most-
+/// recently-pushed mode.
+///
+/// On error (SYSTEM not yet initialised — a programmer error) the
+/// seeding is skipped silently; the boot log surfaces the condition via
+/// `system::with_state` returning `None`.
+fn seed_theme_pref_into_system() {
+    let new_state = crate::system::with_state(|state| {
+        // Only seed if the cell is absent.
+        use arest::ast;
+        let cell = ast::fetch_or_phi(THEME_PREF_CELL, state);
+        if cell.as_seq().map(|s| !s.is_empty()).unwrap_or(false) {
+            // Already seeded — return current state unchanged.
+            return state.clone();
+        }
+        seed_theme_pref_cell(ThemePrefMode::Dark, state)
+    });
+    if let Some(new_state) = new_state {
+        // apply_unchecked: the ThemePref cell is a user preference,
+        // not a metamodel constraint — skip the validate gate.
+        let _ = crate::system::apply_unchecked(new_state);
     }
 }
 
