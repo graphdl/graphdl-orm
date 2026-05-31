@@ -6624,3 +6624,82 @@ Car '1' has Color 'red'.
     );
 }
 
+/// task subtype-join-antecedent child 1 (parse): metamodel-cell antecedents
+/// in derivation rules resolve to `FactType("<cell_name>")` rather than
+/// landing as `UnresolvedClause`.
+///
+/// The subtype-inheritance derivation in `readings/core/derivation.md`
+/// (lines 27-30) contains antecedents that quantify over the substrate's
+/// metamodel cells (`Subtype`, `FactType`, `Role`) — not over user-declared
+/// Fact Types.  Before this fix, every one of those antecedent clauses
+/// would land in `unresolved_clauses` because the nouns `Subtype` /
+/// `Fact Type` / `Role` are not in the user noun catalog.
+///
+/// This test pins the post-fix behaviour:
+///  1. The primary quantification `some Subtype has subtype Sub` resolves
+///     to `AntecedentSource::FactType("Subtype")`.
+///  2. All anaphoric back-references (`that Subtype has supertype Sup`,
+///     `that Fact Type has that Role`, `that Role is played by Sup`,
+///     `that Resource is instance of Sub`) are silently skipped — they
+///     produce ZERO unresolved clauses.
+///  3. The overall `unresolved_clauses` list for the rule is empty.
+#[test]
+fn metamodel_cell_antecedents_resolve_without_unresolved_clauses() {
+    use crate::types::AntecedentSource;
+    // Use the verbatim rule text from readings/core/derivation.md (lines 27-30)
+    // with a user-declared FT (`Vehicle has Color`) as the consequent so the
+    // rule is not dropped by the empty-consequent filter.
+    let src = r#"
+Vehicle(.id) is an entity type.
+Car is a subtype of Vehicle.
+Color is a value type.
+Vehicle has Color.
+
+## Derivation Rules
+* Vehicle has Color
+    iff some Subtype has subtype Sub and that Subtype has supertype Sup
+    and that Fact Type has that Role and that Role is played by Sup
+    and that Resource is instance of Sub.
+"#;
+    let state = parse_to_state(src).expect("model with metamodel antecedents must parse");
+    let data = crate::compile::cell_index_from_state(&state);
+    // The derivation rule should be present (the consequent `Vehicle has Color`
+    // resolves to the declared FT).
+    assert_eq!(data.derivation_rules.len(), 1,
+        "expected exactly one derivation rule; got {:#?}",
+        data.derivation_rules.iter().map(|r| r.text.as_str()).collect::<Vec<_>>());
+    let rule = &data.derivation_rules[0];
+
+    // (1) Zero unresolved clauses — all five antecedent clauses are classified.
+    assert!(
+        rule.unresolved_clauses.is_empty(),
+        "metamodel-cell antecedent clauses must NOT produce UnresolvedClause; \
+         got: {:?}", rule.unresolved_clauses,
+    );
+
+    // (2) The primary `some Subtype has subtype Sub` clause must produce an
+    //     antecedent source of `FactType("Subtype")`.
+    let has_subtype_source = rule.antecedent_sources.iter().any(|s| {
+        matches!(s, AntecedentSource::FactType(id) if id == "Subtype")
+    });
+    assert!(
+        has_subtype_source,
+        "antecedent_sources must contain FactType(\"Subtype\") for \
+         `some Subtype has subtype Sub`; sources={:#?}",
+        rule.antecedent_sources,
+    );
+
+    // (3) No spurious additional antecedent sources from the anaphoric clauses
+    //     (`that Subtype …`, `that Fact Type …`, `that Role …`,
+    //      `that Resource is instance of Sub`).  Those are back-references and
+    //     must be silently skipped, not each produce a separate antecedent scan.
+    let non_subtype_sources: Vec<_> = rule.antecedent_sources.iter()
+        .filter(|s| !matches!(s, AntecedentSource::FactType(id) if id == "Subtype"))
+        .collect();
+    assert!(
+        non_subtype_sources.is_empty(),
+        "anaphoric metamodel back-references must NOT produce additional \
+         antecedent sources; extra sources={:#?}", non_subtype_sources,
+    );
+}
+

@@ -452,6 +452,62 @@ fn word_comparator_to_op(phrase: &str) -> &'static str {
     }
 }
 
+/// task subtype-join-antecedent (child 1) — Classify an antecedent clause that
+/// quantifies over one of the substrate's own metamodel cells (`Subtype`,
+/// `FactType`, `Role`, `Noun`) rather than over a user-declared Fact Type.
+///
+/// The input `stripped_text` must already have anaphora / quantifier words
+/// removed (call `strip_anaphora` before invoking).
+///
+/// Returns:
+///  * `Some(cell_id)` — a non-empty cell id — when the clause is a PRIMARY
+///    quantification over that cell (e.g. `Subtype has subtype Sub`).  The
+///    caller adds `FactType(cell_id)` to `antecedent_sources`.
+///  * `Some("")`  — an empty-string sentinel — when the clause uses a
+///    metamodel-adjacent predicate that should be silently skipped without
+///    becoming an antecedent source (e.g. `Resource is instance of Sub`).
+///  * `None`  — the clause is not a metamodel reference; the caller continues
+///    its normal classification cascade.
+///
+/// Why a dedicated recogniser instead of extending the `SchemaCatalog`:
+///   The catalog maps (noun-set, verb) → FT-id, but metamodel-rule clauses
+///   bind local *variable* names (`Sub`, `Sup`) that differ from the cell's
+///   own role names (`subtype`, `supertype`). A catalog entry would have to
+///   hard-code the variable name in the reading, making it brittle to any
+///   author rephrasing.  A prefix-check on the cell name is simpler, more
+///   robust, and limited in scope to the handful of metamodel cell names
+///   (`readings/core/derivation.md`).
+fn try_classify_metamodel_clause(stripped_text: &str) -> Option<String> {
+    // Recognised metamodel cell name prefixes (lowercased) → canonical cell ids.
+    // "Fact Type" appears as two words in FORML text; the state stores it as
+    // "FactType" (no space).  "Resource" is NOT a metamodel cell — it is a
+    // domain-variable in the subtype-inheritance rule — so it has no entry here.
+    const METAMODEL_PREFIXES: &[(&str, &str)] = &[
+        ("subtype ", "Subtype"),
+        ("fact type ", "FactType"),
+        ("facttype ", "FactType"),
+        ("role ", "Role"),
+        ("noun ", "Noun"),
+    ];
+    let lower = stripped_text.to_lowercase();
+    for (prefix, cell_id) in METAMODEL_PREFIXES {
+        if lower.starts_with(prefix) {
+            // Word-boundary guard: the first char after the prefix must not
+            // extend an identifier (e.g. "subtype_id" would false-match
+            // "subtype ").  The prefix already ends with a space so this is
+            // structurally guaranteed by the METAMODEL_PREFIXES entries.
+            return Some(cell_id.to_string());
+        }
+    }
+    // The `X is instance of Y` predicate appears in the subtype-inheritance
+    // rule body (`that Resource is instance of Sub`) — it's an anaphoric
+    // membership check, not a new antecedent scan.  Skip it silently.
+    if lower.contains(" is instance of ") {
+        return Some(String::new()); // skip-only sentinel
+    }
+    None
+}
+
 /// #914 — Recognise a cross-antecedent role-vs-role value comparison
 /// clause. Two operand shapes are accepted:
 ///
@@ -2121,6 +2177,35 @@ fn resolve_derivation_rule(
         if stripped_quantifiers.as_str() != *part
             && resolve_fact_type(&stripped_quantifiers).is_some()
         { continue; }
+
+        // (13) Metamodel-cell antecedent — task subtype-join-antecedent child 1.
+        //      Clauses in derivation rules that quantify over the substrate's own
+        //      metamodel cells (`Subtype`, `FactType`, `Role`, `Noun`) rather than
+        //      over user-declared Fact Types.  Recognised AFTER all user-catalog
+        //      classifiers so a schema that coincidentally declares a noun called
+        //      "Subtype" still resolves its own FTs via the catalog at step (1).
+        //
+        //      Two clause shapes are handled:
+        //        a) PRIMARY quantification: `some Subtype has subtype Sub`
+        //           → `FactType("Subtype")` added to antecedent_sources.
+        //        b) ANAPHORIC back-reference:  `that Subtype has supertype Sup` /
+        //           `that Fact Type has that Role` / `that Resource is instance of Sub`
+        //           → silently skipped (same treatment as step (5) for user nouns).
+        //
+        //      The recogniser strips anaphora/quantifier words before checking
+        //      so `some Subtype …` and bare `Subtype …` both match.
+        {
+            let stripped_anaphora = strip_anaphora(part);
+            if let Some(cell_id) = try_classify_metamodel_clause(&stripped_anaphora) {
+                if !cell_id.is_empty() && !part.trim().starts_with("that ") {
+                    // Primary quantification — add as antecedent source.
+                    resolved_ids.push(cell_id);
+                    resolved_part_text.push(part.to_string());
+                }
+                // Anaphoric form or skip-only predicate — don't emit as unresolved.
+                continue;
+            }
+        }
 
         // Nothing classified this clause.
         rule.unresolved_clauses.push(part.to_string());
