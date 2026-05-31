@@ -120,6 +120,28 @@ fn ss_autofill_lands_consequent_fact_in_consequent_ft_cell() {
         predicate: None,
     };
     state = ast::cell_push("Constraint", constraint_fact(&cdef), &state);
+    // ss-autofill-retire-2: the procedural `compile_ss_autofill_metamodel`
+    // synthesiser is RETIRED — SS auto-fill is now produced by the reading-lift
+    // derivation rule from readings/core/derivation.md §"SS Subset-Constraint
+    // auto-fill". `parse_to_state_via_stage12_impl` injects that rule when an
+    // SS-autofill constraint is present, but this fixture builds state cell-by-
+    // cell (no parse path, and `subset_autofill` has no FORML surface syntax),
+    // so we inject the metamodel DerivationRule cell fact here — the manual-
+    // state analog of the parse-path injection. `cell_index_from_state`
+    // re-resolves its `FactType("SubsetConstraint")` antecedent from the text,
+    // and `compile_explicit_derivation`'s reading-lift drives the copy-fanout
+    // off `CellIndex::ss_autofill_pairs`. (id = FNV-1a of the text, matching
+    // `parse_forml2_stage2::SS_AUTOFILL_RULE_ID`.)
+    state = ast::cell_push("DerivationRule", ast::fact_from_pairs(&[
+        ("id", "rule_c210dd625f8eeaf3"),
+        ("text",
+         "Fact Type has auto-filled Fact \
+          iff some Subset Constraint has antecedent Fact Type Ant and that \
+          Subset Constraint has consequent Fact Type Cons and that Subset \
+          Constraint has autofill 'true' and that Fact is instance of Ant \
+          and that Fact Type is Cons"),
+        ("consequentFactTypeId", ""),
+    ]), &state);
     // Antecedent fact: <<Academic, 'A1'>, <Department, 'D1'>> in ft_heads
     state = ast::cell_push("ft_heads", ast::fact_from_pairs(&[
         ("Academic", "A1"), ("Department", "D1"),

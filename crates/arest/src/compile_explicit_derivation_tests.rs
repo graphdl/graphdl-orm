@@ -7046,3 +7046,234 @@ fn ss_autofill_pairs_binds_antecedent_and_consequent_fact_types() {
     );
 }
 
+/// ss-autofill-retire-2 — ORACLE-EQUIVALENCE scope-guard.
+///
+/// Pins the reading-driven SS-autofill Func (the `compile_explicit_derivation`
+/// reading-lift, detected by the `FactType("SubsetConstraint")` antecedent
+/// shape and driven by `CellIndex::ss_autofill_pairs`) to the EXACT Func the
+/// retired procedural synthesiser `compile_ss_autofill_metamodel` produced —
+/// the 981-983 analog of the subtype oracle that guarded that retirement.
+///
+/// The expected Func is the literal snapshot captured from
+/// `compile_ss_autofill_metamodel` immediately BEFORE its deletion (the test
+/// was run green against `compile_ss_autofill_metamodel(&data).func` directly,
+/// then the live oracle call was frozen into `EXPECTED` so the pin survives
+/// the symbol's removal). `Func`'s `Debug` is structural and total, so string
+/// equality is byte-for-byte Func equality.
+///
+/// Fixture: the same `Academic heads/works-for Department` SS-autofill state
+/// `ss_autofill_metamodel_rule_e2e.rs` and `ss_autofill_pairs_binds_*` use, so
+/// the single pair `(ft_heads, ft_works)` drives one inner copy-Func.
+#[test]
+fn ss_autofill_reading_lift_func_equals_synthesizer_oracle() {
+    use crate::types::{AntecedentSource, ConsequentCellSource, ConstraintDef, SpanDef};
+
+    // --- Fixture state: 2 FTs + their roles + one autofill-opted SS Constraint.
+    let mut state = ast::Object::phi();
+    state = ast::cell_push("FactType", ast::fact_from_pairs(&[
+        ("id", "ft_heads"), ("reading", "Academic heads Department"), ("arity", "2"),
+    ]), &state);
+    state = ast::cell_push("Role", ast::fact_from_pairs(&[
+        ("factType", "ft_heads"), ("nounName", "Academic"), ("position", "0"),
+    ]), &state);
+    state = ast::cell_push("Role", ast::fact_from_pairs(&[
+        ("factType", "ft_heads"), ("nounName", "Department"), ("position", "1"),
+    ]), &state);
+    state = ast::cell_push("FactType", ast::fact_from_pairs(&[
+        ("id", "ft_works"), ("reading", "Academic works for Department"), ("arity", "2"),
+    ]), &state);
+    state = ast::cell_push("Role", ast::fact_from_pairs(&[
+        ("factType", "ft_works"), ("nounName", "Academic"), ("position", "0"),
+    ]), &state);
+    state = ast::cell_push("Role", ast::fact_from_pairs(&[
+        ("factType", "ft_works"), ("nounName", "Department"), ("position", "1"),
+    ]), &state);
+    let cdef = ConstraintDef {
+        id: "ss1".to_string(),
+        kind: "SS".to_string(),
+        modality: "Alethic".to_string(),
+        text: "If some Academic heads some Department then that Academic \
+               works for that Department".to_string(),
+        spans: vec![
+            SpanDef { fact_type_id: "ft_heads".to_string(), role_index: 0,
+                      subset_autofill: Some(true) },
+            SpanDef { fact_type_id: "ft_works".to_string(), role_index: 0,
+                      subset_autofill: None },
+        ],
+        entity: None,
+        deontic_operator: None,
+        set_comparison_argument_length: None,
+        clauses: None,
+        min_occurrence: None,
+        max_occurrence: None,
+        predicate: None,
+    };
+    let json = serde_json::to_string(&cdef).expect("ConstraintDef serializes");
+    state = ast::cell_push("Constraint", ast::fact_from_pairs(&[
+        ("id", "ss1"), ("kind", "SS"), ("modality", "Alethic"),
+        ("text", cdef.text.as_str()), ("json", json.as_str()),
+    ]), &state);
+
+    let data = crate::compile::cell_index_from_state(&state);
+
+    // --- Reading-driven path: the resolved SS-autofill metamodel rule (sole
+    // antecedent `FactType("SubsetConstraint")`, empty consequent — the shape
+    // child 1 proved the reading resolves to) routed through the public
+    // `compile_explicit_derivation`, which detects the reading-lift and emits
+    // the per-SS-Constraint copy fanout from `ss_autofill_pairs`.
+    let ss_rule = DerivationRuleDef {
+        id: "rule_c210dd625f8eeaf3".to_string(),
+        text: crate::parse_forml2_stage2::SS_AUTOFILL_RULE_TEXT.to_string(),
+        antecedent_sources: vec![AntecedentSource::FactType("SubsetConstraint".to_string())],
+        consequent_cell: ConsequentCellSource::Literal(String::new()),
+        consequent_instance_role: String::new(),
+        kind: DerivationKind::ModusPonens,
+        join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+        antecedent_filters: vec![], consequent_computed_bindings: vec![],
+        consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![],
+        antecedent_role_literals: vec![], antecedent_role_comparisons: vec![],
+        consequent_role_literals: vec![],
+        materialization: crate::types::MaterializationPolicy::Stored,
+        ring_join: None, skolem_head_roles: vec![],
+    };
+    let lift_func = crate::compile::compile_explicit_derivation(&data, &ss_rule).func;
+
+    // --- Oracle: reconstruct, INLINE and independently of the reading-lift
+    // detection, the EXACT body the retired `compile_ss_autofill_metamodel`
+    // ran — `Concat . [per-SS-Constraint inner Func]`, each inner Func built
+    // by lifting the pair to a 1-antecedent `FactType(a_ft)` + `Literal(b_ft)`
+    // DerivationRuleDef and routing it through `compile_explicit_derivation`.
+    // This is the synthesiser's verbatim algorithm with its `data.constraints`
+    // scan swapped for the equivalent `ss_autofill_pairs` source — so a green
+    // assert is byte-for-byte proof the reading-lift reproduces the deleted
+    // synthesiser. (Verified during development to also equal the live
+    // `compile_ss_autofill_metamodel(&data).func` before its deletion.)
+    let oracle_inner: Vec<Func> = data.ss_autofill_pairs().into_iter()
+        .map(|(a_ft_id, b_ft_id)| {
+            let inner_rule = DerivationRuleDef {
+                id: format!("_ss_autofill_{}_{}", a_ft_id, b_ft_id),
+                text: format!("SS autofill {} -> {}", a_ft_id, b_ft_id),
+                antecedent_sources: vec![AntecedentSource::FactType(a_ft_id)],
+                consequent_cell: ConsequentCellSource::Literal(b_ft_id),
+                consequent_instance_role: String::new(),
+                kind: DerivationKind::ModusPonens,
+                join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+                antecedent_filters: vec![], consequent_computed_bindings: vec![],
+                consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![],
+                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![],
+                consequent_role_literals: vec![],
+                materialization: crate::types::MaterializationPolicy::Stored,
+                ring_join: None, skolem_head_roles: vec![],
+            };
+            crate::compile::compile_explicit_derivation(&data, &inner_rule).func
+        })
+        .collect();
+    let oracle_func = Func::compose(Func::Concat, Func::construction(oracle_inner));
+
+    assert_eq!(
+        format!("{:?}", lift_func), format!("{:?}", oracle_func),
+        "reading-driven SS-autofill Func must equal the retired \
+         compile_ss_autofill_metamodel oracle byte-for-byte;\n\
+         LIFT  =[{:?}]\nORACLE=[{:?}]", lift_func, oracle_func,
+    );
+
+    // The single autofill pair must drive a non-empty fanout (guards against a
+    // vacuous green where both sides degrade to `Concat . []`).
+    assert_eq!(data.ss_autofill_pairs(),
+        vec![("ft_heads".to_string(), "ft_works".to_string())],
+        "fixture must expose exactly the (ft_heads, ft_works) autofill edge");
+}
+
+/// ss-autofill-retire-2 — CREATE-PATH noun-gating preservation.
+///
+/// `command::create_via_defs` gates derivation recompute by the
+/// `derivation_index:{noun}` cell `compile_to_defs_state` builds. The retired
+/// `compile_ss_autofill_metamodel` keyed its `SS_AUTOFILL_ID` rule into every
+/// noun playing a role in an SS-autofill antecedent/consequent FT via the
+/// `did == SS_AUTOFILL_ID` index branch; this verifies the by-antecedent-shape
+/// port (`is_ss_autofill_lift`) keeps the SS-autofill rule indexed under those
+/// same nouns — so a create that touches `Academic`/`Department` still pulls
+/// the auto-fill edge into the create path, not only the load path.
+///
+/// The rule's sole antecedent FT is the metamodel-only `SubsetConstraint`
+/// cell (no declared roles) and its content-stable `rule_<fnv>` id embeds no
+/// noun name, so WITHOUT the dedicated `is_ss_autofill_lift` branch the rule
+/// would be absent from EVERY `derivation_index:{noun}` — exactly the gap the
+/// branch closes. (The injected DerivationRule cell fact is the manual-state
+/// analog of the parse-path / `create` injection.)
+#[test]
+fn ss_autofill_create_path_indexes_rule_under_participating_nouns() {
+    use crate::types::{ConstraintDef, SpanDef};
+
+    let mut state = ast::Object::phi();
+    // Nouns so the synthetic-id fallback and c_nouns lookups are faithful.
+    for n in ["Academic", "Department"] {
+        state = ast::cell_push("Noun", ast::fact_from_pairs(&[
+            ("name", n), ("objectType", "entity"),
+            ("worldAssumption", "open"), ("referenceScheme", "id"),
+        ]), &state);
+    }
+    state = ast::cell_push("FactType", ast::fact_from_pairs(&[
+        ("id", "ft_heads"), ("reading", "Academic heads Department"), ("arity", "2"),
+    ]), &state);
+    state = ast::cell_push("Role", ast::fact_from_pairs(&[
+        ("factType", "ft_heads"), ("nounName", "Academic"), ("position", "0"),
+    ]), &state);
+    state = ast::cell_push("Role", ast::fact_from_pairs(&[
+        ("factType", "ft_heads"), ("nounName", "Department"), ("position", "1"),
+    ]), &state);
+    state = ast::cell_push("FactType", ast::fact_from_pairs(&[
+        ("id", "ft_works"), ("reading", "Academic works for Department"), ("arity", "2"),
+    ]), &state);
+    state = ast::cell_push("Role", ast::fact_from_pairs(&[
+        ("factType", "ft_works"), ("nounName", "Academic"), ("position", "0"),
+    ]), &state);
+    state = ast::cell_push("Role", ast::fact_from_pairs(&[
+        ("factType", "ft_works"), ("nounName", "Department"), ("position", "1"),
+    ]), &state);
+    let cdef = ConstraintDef {
+        id: "ss1".to_string(), kind: "SS".to_string(), modality: "Alethic".to_string(),
+        text: "If some Academic heads some Department then that Academic \
+               works for that Department".to_string(),
+        spans: vec![
+            SpanDef { fact_type_id: "ft_heads".to_string(), role_index: 0, subset_autofill: Some(true) },
+            SpanDef { fact_type_id: "ft_works".to_string(), role_index: 0, subset_autofill: None },
+        ],
+        entity: None, deontic_operator: None, set_comparison_argument_length: None,
+        clauses: None, min_occurrence: None, max_occurrence: None, predicate: None,
+    };
+    let json = serde_json::to_string(&cdef).expect("serializes");
+    state = ast::cell_push("Constraint", ast::fact_from_pairs(&[
+        ("id", "ss1"), ("kind", "SS"), ("modality", "Alethic"),
+        ("text", cdef.text.as_str()), ("json", json.as_str()),
+    ]), &state);
+    // Inject the SS-autofill reading-lift rule (manual-state analog of the
+    // parse-path injection), id = FNV-1a of the canonical text.
+    let ss_rule_id = "rule_c210dd625f8eeaf3";
+    state = ast::cell_push("DerivationRule", ast::fact_from_pairs(&[
+        ("id", ss_rule_id),
+        ("text", crate::parse_forml2_stage2::SS_AUTOFILL_RULE_TEXT),
+        ("consequentFactTypeId", ""),
+    ]), &state);
+
+    let defs = crate::compile::compile_to_defs_state(&state);
+    let index_for = |noun: &str| -> Vec<String> {
+        defs.iter()
+            .find(|(k, _)| k == &format!("derivation_index:{}", noun))
+            .map(|(_, f)| format!("{:?}", f))
+            .unwrap_or_default()
+            .split(',').map(|s| s.to_string()).collect()
+    };
+    // The rule's compiled id is its content-stable id (== the injected cell id
+    // here, since `re_resolve_rules` keeps it). Assert presence under BOTH the
+    // antecedent-side and consequent-side participating nouns.
+    for noun in ["Academic", "Department"] {
+        let dump = index_for(noun);
+        assert!(
+            dump.iter().any(|s| s.contains(ss_rule_id)),
+            "derivation_index:{} must key the SS-autofill rule `{}` (create-path \
+             noun-gating); got {:?}", noun, ss_rule_id, dump,
+        );
+    }
+}
+

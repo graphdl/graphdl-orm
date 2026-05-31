@@ -5832,6 +5832,31 @@ fn parse_to_state_via_stage12_impl(
         }
     }
 
+    // ss-autofill-retire-2 (the 981-983 analog of the subtype injection
+    // above): bake the SS (Subset) Constraint auto-fill derivation rule from
+    // readings/core/derivation.md into every parse path that carries at least
+    // one SS-autofill-opted constraint, so the reading-lift route in
+    // `compile_explicit_derivation` fires and the deleted procedural
+    // synthesiser is never needed.  Guard: inject only when an SS constraint
+    // opts into auto-fill, so schemas without one don't acquire an extra no-op
+    // derivation rule (avoids breaking test assertions that count exactly N
+    // user rules).  Idempotent: skip if the rule is already present.
+    //
+    // NOTE: the `subset_autofill` span marker is set only programmatically
+    // (no FORML surface syntax produces it), so for ordinary parse text this
+    // guard never fires — the injection is the faithful structural mirror of
+    // the subtype path, kept active for any future SS-autofill source and for
+    // states whose Constraint cell already carries the marker (e.g. a context
+    // merge of pre-built cells).
+    if constraint_facts_have_ss_autofill(&constraint_facts) {
+        let rule_id = SS_AUTOFILL_RULE_ID;
+        if !derivation_facts.iter().any(|f| {
+            crate::ast::binding(f, "id") == Some(rule_id)
+        }) {
+            derivation_facts.push(ss_autofill_derivation_rule_fact());
+        }
+    }
+
     let mut map: HashMap<String, Object> = HashMap::new();
     map.insert("Noun".to_string(), Object::Seq(noun_facts.into()));
     map.insert("Subtype".to_string(), Object::Seq(subtype_facts.into()));
@@ -5905,6 +5930,68 @@ fn subtype_inheritance_derivation_rule_fact() -> Object {
         ("text",                 SUBTYPE_INHERITANCE_RULE_TEXT),
         ("consequentFactTypeId", ""),
     ])
+}
+
+// ss-autofill-retire-2 — canonical text of the SS (Subset) Constraint
+// auto-fill derivation rule from readings/core/derivation.md §"SS Subset-
+// Constraint auto-fill", after continuation-joining and `*`-prefix +
+// `.`-suffix stripping (the form stored in `DerivationRule.text`).  The
+// 981-983 analog of `SUBTYPE_INHERITANCE_RULE_TEXT`: every parse path that
+// calls `parse_to_state_via_stage12_impl` injects this rule as a static fact
+// when SS-autofill constraints are present, so `compile_derivations` always
+// sees the reading-lift antecedent pattern (`FactType("SubsetConstraint")`)
+// and the deleted procedural synthesiser is never needed.
+pub(crate) const SS_AUTOFILL_RULE_TEXT: &str =
+    "Fact Type has auto-filled Fact \
+     iff some Subset Constraint has antecedent Fact Type Ant and that \
+     Subset Constraint has consequent Fact Type Cons and that Subset \
+     Constraint has autofill 'true' and that Fact is instance of Ant \
+     and that Fact Type is Cons";
+
+/// FNV-1a 64-bit hash of `SS_AUTOFILL_RULE_TEXT` — precomputed so the id is
+/// available as a `&str` constant without a runtime allocation.  Must stay in
+/// sync with `derivation_rule_id`'s fnv1a64 implementation.
+pub(crate) const SS_AUTOFILL_RULE_ID: &str = "rule_c210dd625f8eeaf3";
+
+/// Build the static `DerivationRule` cell fact for the SS-autofill rule.  The
+/// `consequentFactTypeId` is left empty: the SS-autofill reading-lift in
+/// `compile_explicit_derivation` drives the per-SS-Constraint fanout off
+/// `CellIndex::ss_autofill_pairs()` (each inner Func carries its own consequent
+/// FT), so the rule's own consequent value is unused.  `re_resolve_rules` /
+/// `resolve_derivation_rule` rebuild the `FactType("SubsetConstraint")`
+/// antecedent from the rule text when `cell_index_from_state` processes state.
+fn ss_autofill_derivation_rule_fact() -> Object {
+    crate::ast::fact_from_pairs(&[
+        ("id",                   SS_AUTOFILL_RULE_ID),
+        ("text",                 SS_AUTOFILL_RULE_TEXT),
+        ("consequentFactTypeId", ""),
+    ])
+}
+
+/// ss-autofill-retire-2 — does any Constraint cell fact declare an SS
+/// (Subset) Constraint with `subset_autofill = Some(true)` on a span?  The
+/// guard for injecting `ss_autofill_derivation_rule_fact`.  Detection mirrors
+/// `compile.rs::compile_to_defs_state`'s `ss_autofill_ft_pairs` (and
+/// `CellIndex::ss_autofill_pairs`): the marker round-trips only through the
+/// lossless std-deps `json` span path — the flat `span<i>_*` Constraint-cell
+/// fields strip it — so a no_std / flat-only fact correctly yields `false`,
+/// matching the synthesizer's source of truth.
+fn constraint_facts_have_ss_autofill(_constraint_facts: &[Object]) -> bool {
+    #[cfg(feature = "std-deps")]
+    {
+        for f in _constraint_facts.iter() {
+            if let Some(json) = binding(f, "json") {
+                if let Ok(cdef) = serde_json::from_str::<crate::types::ConstraintDef>(json) {
+                    if cdef.kind == "SS" && cdef.spans.len() >= 2
+                        && cdef.spans.iter().any(|s| s.subset_autofill == Some(true))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 /// task-737 — for every single-part reference-scheme entity-type

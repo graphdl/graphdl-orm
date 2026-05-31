@@ -1234,6 +1234,39 @@ mod tests {
         cells
     }
 
+    /// ss-autofill-retire-2 — the SS (Subset) Constraint auto-fill metamodel
+    /// rule as a `DerivationRuleDef` in its post-resolution shape: sole
+    /// antecedent `FactType("SubsetConstraint")`, empty consequent. The
+    /// procedural `compile_ss_autofill_metamodel` synthesiser is RETIRED;
+    /// `compile_explicit_derivation` detects this antecedent shape as the
+    /// reading-lift and drives the per-SS-Constraint copy-fanout off
+    /// `CellIndex::ss_autofill_pairs`. These cell-built fixtures bypass the
+    /// `parse_to_state_via_stage12_impl` injection (and `subset_autofill` has
+    /// no FORML surface syntax), so they inject the rule explicitly — the
+    /// manual-state analog of the parse-path injection. Building the struct
+    /// directly (not from text) means `cell_index_from_state`'s lossless JSON
+    /// path keeps the `FactType("SubsetConstraint")` antecedent as-is.
+    fn ss_autofill_rule() -> DerivationRuleDef {
+        DerivationRuleDef {
+            id: "rule_c210dd625f8eeaf3".to_string(),
+            text: "Fact Type has auto-filled Fact iff some Subset Constraint \
+                   has antecedent Fact Type Ant and that Subset Constraint has \
+                   consequent Fact Type Cons and that Subset Constraint has \
+                   autofill 'true' and that Fact is instance of Ant and that \
+                   Fact Type is Cons".to_string(),
+            antecedent_sources: vec![AntecedentSource::FactType("SubsetConstraint".to_string())],
+            consequent_cell: ConsequentCellSource::Literal(String::new()),
+            consequent_instance_role: String::new(),
+            kind: DerivationKind::ModusPonens,
+            join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![],
+            consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![],
+            antecedent_role_literals: vec![], antecedent_role_comparisons: vec![],
+            consequent_role_literals: vec![], materialization: MaterializationPolicy::Stored,
+            ring_join: None, skolem_head_roles: vec![],
+        }
+    }
+
     /// Push SM cells (cell-driven path only — #763 retired the JSON-blob
     /// `StateMachine` cell and the typed-struct fallback).
     ///
@@ -2249,6 +2282,8 @@ Academic has Rank.\n\
             deontic_operator: None,
             predicate: None,
         });
+        // ss-autofill-retire-2: synthesiser retired — inject the reading-lift rule.
+        cells = with_derivation(cells, &ss_autofill_rule());
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
 
@@ -2818,6 +2853,8 @@ Car 'my_car' has Color 'red'.\n\
             max_occurrence: None,
             predicate: None,
         });
+        // ss-autofill-retire-2: synthesiser retired — inject the reading-lift rule.
+        cells = with_derivation(cells, &ss_autofill_rule());
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
 

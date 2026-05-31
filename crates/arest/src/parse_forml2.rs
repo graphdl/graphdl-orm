@@ -1621,8 +1621,23 @@ fn resolve_derivation_rule(
         let lower = consequent_text.to_lowercase();
         lower.contains("inherited") && lower.contains("fact type")
     };
+    // ss-autofill-retire-2 — the SS (Subset) Constraint auto-fill metamodel
+    // rule's consequent head is "Fact Type has auto-filled Fact" (readings/
+    // core/derivation.md §"SS Subset-Constraint auto-fill").  "Fact Type" and
+    // "Fact" are NOT user-declared nouns, so `resolve_consequent_strict`
+    // returns `None`.  Recognise the head by text (mirrors the subtype
+    // `is_metamodel_subtype_consequent` recognition above) so the fuzzy-match
+    // fallback does NOT push a spurious UnresolvedClause.  The consequent cell
+    // is left empty: the SS-autofill reading-lift in
+    // `compile_explicit_derivation` drives the per-SS-Constraint fanout off
+    // `CellIndex::ss_autofill_pairs()` (each inner Func carries its own
+    // `Literal(consequent_ft)`), so this rule's own consequent value is unused.
+    let is_metamodel_ss_autofill_consequent = {
+        let lower = consequent_text.to_lowercase();
+        lower.contains("auto-filled") && lower.contains("fact type")
+    };
     if consequent_strict.is_none() {
-        if is_metamodel_subtype_consequent {
+        if is_metamodel_subtype_consequent || is_metamodel_ss_autofill_consequent {
             // Suppress the fuzzy-match noise: this head is intentional, not a typo.
         } else if let Some(fuzzy) = resolve_fact_type(consequent_text) {
             rule.unresolved_clauses.push(format!(

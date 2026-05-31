@@ -1806,11 +1806,13 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             }
             pairs
         };
-        // #891: collect every (antecedent FT, consequent FT) pair an
-        // SS-autofill Constraint spans. The single `_ss_autofill`
-        // metamodel rule carries no individual noun name in its id,
-        // so the substring fallback misses it — same gap #890
-        // patched for `_subtype_inheritance`. We key the rule under
+        // #891 + ss-autofill-retire-2: collect every (antecedent FT,
+        // consequent FT) pair an SS-autofill Constraint spans. The single
+        // SS-autofill metamodel rule's sole antecedent FT is the
+        // metamodel-only `SubsetConstraint` cell (no declared roles), and
+        // its content-stable `rule_<fnv>` id carries no individual noun
+        // name, so the FT-path and substring fallbacks both miss it — same
+        // gap #890 patched for subtype inheritance. We key the rule under
         // every noun that plays a role in either the antecedent or
         // consequent FT of every SS-autofill span, so noun-gated
         // dispatch (`command::create_via_defs`) finds it for either
@@ -1910,11 +1912,13 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             // mechanism before the structured domain-rule path landed; it now
             // fires only for synthesised metamodel rules whose IDs happen not
             // to embed a noun name (superseded by the explicit #890 and #891
-            // patches below that handle `_subtype_inheritance` and
-            // `_ss_autofill` directly). SAFETY NET — do NOT delete; the
-            // dedicated patches below call `nouns.insert` only for those two
-            // known IDs, and any future synthetic rule without a recognised ID
-            // would silently miss the index without this fallback.
+            // patches below that handle the subtype-inheritance and SS-autofill
+            // metamodel rules by antecedent SHAPE — `is_subtype_lift` /
+            // `is_ss_autofill_lift` — not by id). SAFETY NET — do NOT delete;
+            // the dedicated patches below call `nouns.insert` only for those
+            // two recognised antecedent shapes, and any future synthetic rule
+            // without a recognised id would silently miss the index without
+            // this fallback.
             if nouns.is_empty() {
                 // _cwa_negation_X, _sm_init_Order, _subtype_A_B
                 for noun_name in c_nouns.keys() {
@@ -1944,13 +1948,47 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                     nouns.insert(sup.clone());
                 }
             }
-            // #891: same patch for the single `_ss_autofill`
-            // metamodel rule — the merged Func emits the union of
-            // every per-SS-Constraint inner Func, so no single
-            // antecedent noun appears in the def id. Key under
-            // every noun that plays a role in either the antecedent
-            // or consequent FT of any SS-autofill span.
-            if did == SS_AUTOFILL_ID {
+            // #891 + ss-autofill-retire-2: same patch for the single
+            // SS-autofill metamodel rule — the merged Func emits the
+            // union of every per-SS-Constraint inner Func, so no single
+            // antecedent noun appears in the def id (its sole antecedent
+            // FT is the metamodel-only `SubsetConstraint` cell, which has
+            // no declared roles, so the FT-path and substring fallbacks
+            // above both leave `nouns` empty). Key under every noun that
+            // plays a role in either the antecedent or consequent FT of
+            // any SS-autofill span so noun-gated dispatch
+            // (command::create_via_defs) finds it for either side of the
+            // auto-fill edge. Detection is by antecedent SHAPE (the sole
+            // `FactType("SubsetConstraint")` antecedent the reading-lift
+            // recognises) — NOT a synthetic id — mirroring how
+            // `is_subtype_lift` replaced the deleted `SS_AUTOFILL_ID`
+            // string match when the procedural synthesiser was retired.
+            // NOTE: `c_derivation_rules` are built directly from the
+            // `DerivationRule` cell (line ~1489) WITHOUT re-resolution, so
+            // their `antecedent_sources` are empty on the flat path. The
+            // antecedent-shape check still wins on the lossless-JSON path
+            // where rules arrive pre-resolved; otherwise fall back to the
+            // canonical metamodel rule's distinctive TEXT signature
+            // (`Subset Constraint has antecedent Fact Type` + `auto-filled
+            // Fact`), which survives on both `domain_rule.text` and the
+            // resolved `compiled.text`.
+            let is_ss_autofill_lift = {
+                let by_shape = domain_rule.map(|r| {
+                    r.antecedent_sources.len() == 1
+                        && r.antecedent_sources.first()
+                            .map(|s| s.fact_type_id() == "SubsetConstraint")
+                            .unwrap_or(false)
+                }).unwrap_or(false);
+                let by_text = |t: &str| {
+                    let l = t.to_lowercase();
+                    l.contains("subset constraint has antecedent fact type")
+                        && l.contains("auto-filled fact")
+                };
+                by_shape
+                    || by_text(&compiled.text)
+                    || domain_rule.map(|r| by_text(&r.text)).unwrap_or(false)
+            };
+            if is_ss_autofill_lift {
                 for (a_ft, b_ft) in ss_autofill_ft_pairs.iter() {
                     for ft_id in [a_ft, b_ft] {
                         if let Some(ft) = c_fact_types.get(ft_id.as_str()) {
@@ -4108,23 +4146,21 @@ fn compile_derivations(data: &CellIndex, state_machines: &[CompiledStateMachine]
     // `compile_explicit_derivation` now fires for every code path.
     // `compile_subtype_inheritance_metamodel` is DELETED (task 983).
 
-    // SS auto-fill (#891): the per-SS-Constraint synthesis loop is
-    // replaced by ONE metamodel derivation rule declared in
-    // `readings/core/derivation.md` and lifted to ONE
-    // CompiledDerivation by `compile_ss_autofill_metamodel`.
-    // Whitepaper §5.2: this is the universal modus-ponens schema for
-    // Subset Constraint auto-fill — antecedent quantifies over
-    // Subset-Constraint × antecedent-FT-fact cells, consequent is
-    // the same fact pushed into the consequent FT cell. Behaviour
-    // is byte-for-byte identical to the pre-#891 fanout (acceptance:
-    // `crates/arest/tests/ss_autofill_metamodel_rule_e2e.rs`);
-    // pre-#891 the chainer saw N defs `derivation:_ss_autofill_<X>`,
-    // post-#891 it sees ONE def `derivation:_ss_autofill` whose Func
-    // emits the same union of `<consequent_ft_id, reading, bindings>`
-    // tuples in one Concat step.
-    if let Some(d) = compile_ss_autofill_metamodel(data) {
-        derivations.push(d);
-    }
+    // SS auto-fill (#891, ss-autofill-retire-2): the declarative FORML rule
+    // from readings/core/derivation.md §"SS Subset-Constraint auto-fill" is
+    // baked into every `parse_to_state_via_stage12_impl` output that carries an
+    // autofill-opted SS Constraint (and into the manual-state fixtures that
+    // bypass the parse path) — so the reading-lift route in
+    // `compile_explicit_derivation` (detected by the sole
+    // `FactType("SubsetConstraint")` antecedent, driven by
+    // `CellIndex::ss_autofill_pairs`) fires for every code path.
+    // `compile_ss_autofill_metamodel` + `SS_AUTOFILL_ID` are DELETED
+    // (ss-autofill-retire-2). The emitted Func is byte-for-byte the retired
+    // synthesiser's `Concat . [per-SS-Constraint inner Func]` — proven by
+    // `compile_explicit_derivation_tests::\
+    // ss_autofill_reading_lift_func_equals_synthesizer_oracle` — so the
+    // acceptance pin `crates/arest/tests/ss_autofill_metamodel_rule_e2e.rs`
+    // stays GREEN.
 
     // Transitivity of binary Fact Types is NOT eagerly materialized.
     // An earlier implementation (#892) lifted the per-(ft1, ft2)
@@ -4835,7 +4871,7 @@ fn consequent_role_subscripts(
 
 /// population Seq. Requires a fold-based search (Insert + Condition) that
 /// would be more complex than the direct Object traversal below.
-fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> CompiledDerivation {
+pub(crate) fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> CompiledDerivation {
     let id = rule.id.clone();
     let text = rule.text.clone();
     let kind = rule.kind.clone();
@@ -4932,6 +4968,83 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
             func: Func::compose(Func::Concat, Func::constant(crate::ast::Object::phi())),
             consequent_cell,
             materialization: rule.materialization.clone(),
+        };
+    }
+
+    // ss-autofill-retire-2 — READING-LIFT DETECTION (the 981-983 analog
+    // of the subtype reading-lift above).  When the SS (Subset) Constraint
+    // auto-fill metamodel rule from readings/core/derivation.md §"SS
+    // Subset-Constraint auto-fill" is in scope, the parser resolves its
+    // primary clause `some Subset Constraint has antecedent Fact Type Ant`
+    // to the dedicated metamodel-cell antecedent `FactType("SubsetConstraint")`
+    // (child 1, `try_classify_metamodel_clause`); the anaphoric back-
+    // references (`that Subset Constraint has consequent Fact Type Cons`,
+    // `that Subset Constraint has autofill 'true'`, `that Fact is instance
+    // of Ant`, `that Fact Type is Cons`) are skip-sentinels, so the resolved
+    // rule carries exactly `[FactType("SubsetConstraint")]` and no other
+    // antecedent source — distinctive, since `SubsetConstraint` is a
+    // metamodel-only cell view no user rule names directly.
+    //
+    // This is the 981-983 analog of `is_subtype_lift`: detect by antecedent
+    // shape (NOT by a deleted synthetic id) and compile the rule by reading
+    // the concrete (antecedent_ft, consequent_ft) edges off
+    // `CellIndex::ss_autofill_pairs()` (child 1's `data.subtypes` analog).
+    // The emitted Func is byte-for-byte what the deleted
+    // `compile_ss_autofill_metamodel` produced: a `Concat . [per-SS-Constraint
+    // inner Func]`, each inner Func the same shape `compile_explicit_derivation`
+    // produces for a 1-antecedent `FactType(antecedent_ft)` rule with
+    // `Literal(consequent_ft)` consequent (copy every fact of the antecedent
+    // FT into the consequent FT cell).
+    let is_ss_autofill_reading_lift = {
+        let only_subset_constraint_ant = rule.antecedent_sources.len() == 1
+            && rule.antecedent_sources.first()
+                .map(|s| s.fact_type_id() == "SubsetConstraint")
+                .unwrap_or(false);
+        only_subset_constraint_ant
+    };
+    if is_ss_autofill_reading_lift {
+        // Drive the synthesis off the reading-exposed pairs (child 1's
+        // accessor), inlining the deleted synthesizer's per-SS-Constraint
+        // fanout. Each pair lifts to the same 1-antecedent
+        // `FactType(a_ft)` + `Literal(b_ft)` DerivationRuleDef the deleted
+        // `compile_ss_autofill_metamodel` synthesized, then routes through
+        // `compile_explicit_derivation` so we reuse the canonical
+        // per-fact-fanout Func shape (NOT a hand-rolled Func) — keeping the
+        // output byte-for-byte identical to the pre-retirement loop.
+        let inner_funcs: Vec<Func> = data.ss_autofill_pairs().into_iter()
+            .map(|(a_ft_id, b_ft_id)| {
+                let inner_rule = DerivationRuleDef {
+                    id: format!("_ss_autofill_{}_{}", a_ft_id, b_ft_id),
+                    text: format!("SS autofill {} -> {}", a_ft_id, b_ft_id),
+                    antecedent_sources: vec![
+                        crate::types::AntecedentSource::FactType(a_ft_id),
+                    ],
+                    consequent_cell: crate::types::ConsequentCellSource::Literal(b_ft_id),
+                    consequent_instance_role: String::new(),
+                    kind: DerivationKind::ModusPonens,
+                    join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+                    antecedent_filters: vec![], consequent_computed_bindings: vec![],
+                    consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![],
+                    antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
+                };
+                compile_explicit_derivation(data, &inner_rule).func
+            })
+            .collect();
+        // Concat the per-SS-Constraint Funcs into one Func emitting the union
+        // of every inner Func's tuple sequence. forward_chain_defs_state routes
+        // each emitted `<consequent_ft_id, reading, bindings>` tuple to its own
+        // ft_id cell, so the merged emission is indistinguishable from the
+        // pre-retirement N-Funcs-N-defs shape at the cell level. When no SS
+        // Constraint opts into auto-fill, `inner_funcs` is empty and the Func
+        // is `Concat . []` — a harmless no-op that emits nothing (matching the
+        // synthesizer's "no rules when no SS constraint opts in" via the
+        // already-present rule fact carrying an empty fanout).
+        let func = Func::compose(Func::Concat, Func::construction(inner_funcs));
+        let (consequent_cell, _, _) = derivation_dep_metadata_synth(String::new());
+        return CompiledDerivation {
+            id, text, kind: DerivationKind::ModusPonens,
+            func, consequent_cell,
+            materialization: crate::types::MaterializationPolicy::Stored,
         };
     }
 
@@ -6826,97 +6939,21 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
 // inheritance is now produced solely by the reading-lift derivation rule
 // injected by parse_to_state_via_stage12.
 
-/// Compile SS Subset-Constraint auto-fill as ONE CompiledDerivation
-/// whose Func concatenates per-Subset-Constraint inner Funcs (#891).
-///
-/// Whitepaper §5.2 (universal modus-ponens schema) frames Subset
-/// Constraint auto-fill as a single metamodel derivation rule whose
-/// antecedent quantifies over `Subset Constraint × antecedent-FT
-/// facts` and whose consequent is the same fact pushed into the
-/// consequent FT cell when the antecedent span carries
-/// `subset_autofill = true`. The declarative form lives in
-/// `readings/core/derivation.md`; this function is the compile-time
-/// lift of that rule into a Func the FFP forward chainer fires at
-/// evaluation time.
-///
-/// Each per-SS-Constraint inner Func is byte-for-byte the same shape
-/// `compile_explicit_derivation` produces for a 1-antecedent
-/// `FactType(antecedent_ft)` rule with `Literal(consequent_ft)`
-/// consequent — so behaviour is preserved across the loop →
-/// metamodel-rule transition (#891 acceptance:
-/// `ss_autofill_metamodel_rule_e2e.rs`).
-///
-/// Returns `None` when no SS Constraint declares `subset_autofill =
-/// Some(true)` — the chainer shouldn't see a no-op `Concat . []` def
-/// in that case (matches the pre-#891 loop's "no rules emitted when
-/// no SS constraint opts in" behaviour).
-pub(crate) fn compile_ss_autofill_metamodel(
-    data: &CellIndex,
-) -> Option<CompiledDerivation> {
-    // Collect per-SS-Constraint inner Funcs in declaration order.
-    // The fanout matches the pre-#891 loop exactly: every SS
-    // Constraint whose any-span carries `subset_autofill = Some(true)`
-    // produces one inner Func that copies every fact of
-    // `spans[0].fact_type_id` into `spans[1].fact_type_id`.
-    let inner_funcs: Vec<Func> = data.constraints.iter()
-        .filter(|cdef| cdef.kind == "SS" && cdef.spans.len() >= 2)
-        .filter(|cdef| cdef.spans.iter().any(|s| s.subset_autofill == Some(true)))
-        .map(|cdef| {
-            // Lift each SS Constraint to the same DerivationRuleDef
-            // the pre-#891 loop synthesized, then route through
-            // compile_explicit_derivation so the 1-antecedent
-            // `FactType` + `Literal`-consequent path produces the
-            // per-SS-Constraint Func. Discard the wrapper
-            // CompiledDerivation — we want only its `func` to fold
-            // into the outer Concat.
-            let a_ft_id = cdef.spans[0].fact_type_id.clone();
-            let b_ft_id = cdef.spans[1].fact_type_id.clone();
-            let rule = DerivationRuleDef {
-                id: format!("_ss_autofill_{}", cdef.id),
-                text: format!("SS autofill from {}", cdef.text),
-                antecedent_sources: vec![
-                    crate::types::AntecedentSource::FactType(a_ft_id),
-                ],
-                consequent_cell: crate::types::ConsequentCellSource::Literal(b_ft_id),
-                consequent_instance_role: String::new(),
-                kind: DerivationKind::ModusPonens,
-                join_on: vec![], match_on: vec![], consequent_bindings: vec![],
-                antecedent_filters: vec![], consequent_computed_bindings: vec![],
-                consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![],
-                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
-            };
-            compile_explicit_derivation(data, &rule).func
-        })
-        .collect();
-    if inner_funcs.is_empty() { return None; }
-    // Concat the per-SS-Constraint Funcs into one Func that emits
-    // the union of every per-SS-Constraint inner Func's tuple
-    // sequence. forward_chain_defs_state routes each emitted
-    // `<consequent_ft_id, reading, bindings>` tuple to its own
-    // ft_id cell (slot 0), so the merged emission is indistinguishable
-    // from the pre-#891 N-Funcs-N-defs shape at the cell level.
-    let func = Func::compose(Func::Concat, Func::construction(inner_funcs));
-    let (consequent_cell, _, _) =
-        derivation_dep_metadata_synth(String::new());
-    Some(CompiledDerivation {
-        id: SS_AUTOFILL_ID.to_string(),
-        text: "SS Subset-Constraint auto-fill metamodel rule (readings/core/derivation.md)".to_string(),
-        kind: DerivationKind::ModusPonens,
-        func,
-                consequent_cell,
-        materialization: crate::types::MaterializationPolicy::Stored,
-    })
-}
-
-/// Synthetic id for the single SS auto-fill metamodel rule (#891).
-/// Recognised by the `derivation_index` synthetic-id fallback in
-/// `compile_to_defs_state` so the index keys this id into every
-/// noun that participates in an SS-autofill consequent FT — without
-/// that, noun-gated `command::create_via_defs` paths would skip SS
-/// auto-fill for lack of a noun-name match in the id (the merged
-/// Func emits the union of every per-SS-Constraint inner Func, so
-/// no single antecedent noun appears in the def name).
-pub(crate) const SS_AUTOFILL_ID: &str = "_ss_autofill";
+// compile_ss_autofill_metamodel + SS_AUTOFILL_ID deleted (ss-autofill-retire-2):
+// the SS Subset-Constraint auto-fill synthesiser is RETIRED. Its body — a
+// `Concat . [per-SS-Constraint inner Func]` where each inner Func copies every
+// fact of `spans[0].fact_type_id` into `spans[1].fact_type_id` — is inlined at
+// the reading-lift detection site in `compile_explicit_derivation` (detected by
+// the sole `FactType("SubsetConstraint")` antecedent, driven by
+// `CellIndex::ss_autofill_pairs`), and the guarded direct call in
+// `compile_derivations` is removed. SS auto-fill is now produced solely by the
+// reading-lift derivation rule injected by `parse_to_state_via_stage12_impl`
+// (and by the manual-state fixtures' explicit rule fact). The derivation-index
+// noun-gating that keyed `SS_AUTOFILL_ID` into every SS-autofill FT noun is
+// ported to the `is_ss_autofill_lift` antecedent-shape detection in
+// `compile_to_defs_state`. Byte-for-byte equivalence with the retired
+// synthesiser is pinned by `compile_explicit_derivation_tests::\
+// ss_autofill_reading_lift_func_equals_synthesizer_oracle`.
 
 /// State machine initialization as a derivation rule.
 ///
