@@ -256,6 +256,21 @@ pub struct Process {
     /// for a `Process` that survives that far, is the entire process
     /// lifetime.
     pub at_random: Box<[u8; AT_RANDOM_WIDTH]>,
+    /// Base address of the FS segment register — the per-thread
+    /// pointer musl and glibc install via `arch_prctl(ARCH_SET_FS, …)`
+    /// in `_start`'s first instructions (#501 syscall 158). Everything
+    /// that relies on TLS (errno, `pthread_self`, stack guard, pointer
+    /// canaries) reads through this base: `FS:0x0` is the `pthread`
+    /// struct; `FS:0x28` is the stack canary.
+    ///
+    /// Initialised to 0 in `Process::new` (FS base is undefined until
+    /// `arch_prctl(ARCH_SET_FS)` runs — accessing TLS before that is
+    /// UB on the x86_64 ABI). On the real x86_64-UEFI target the
+    /// `arch_prctl` handler also programs the IA32_FS_BASE MSR
+    /// (0xC0000100) so the CPU's FS.base reads this value; unit tests
+    /// verify only that the field is stored correctly (no real MSR in
+    /// test). `ARCH_GET_FS` reads it back symmetrically.
+    pub fs_base: u64,
 }
 
 impl Process {
@@ -287,6 +302,14 @@ impl Process {
             // pointer in the auxv. The Box keeps the bytes pinned even
             // when the Process moves into CURRENT_PROCESS post-spawn.
             at_random: Box::new([0u8; AT_RANDOM_WIDTH]),
+            // FS base starts undefined (0). musl's `_start` calls
+            // `arch_prctl(ARCH_SET_FS, tp)` in its very first
+            // instructions (#501); until that syscall fires, any TLS
+            // access (errno, stack canary, pthread_self) would read
+            // through FS:0 — undefined behaviour on the x86_64 ABI.
+            // The handler writes the real pointer here and, on the
+            // x86_64-UEFI target, also programs the IA32_FS_BASE MSR.
+            fs_base: 0,
         }
     }
 

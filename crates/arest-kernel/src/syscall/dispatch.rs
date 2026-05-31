@@ -52,10 +52,13 @@
 // unknown syscall is logged rather than silently failing — but for
 // tier-1 the negative return is enough.
 
+use crate::syscall::arch_prctl;
 use crate::syscall::close;
 use crate::syscall::exit;
 use crate::syscall::futex;
 use crate::syscall::getrandom;
+use crate::syscall::getpid;
+use crate::syscall::identity;
 use crate::syscall::openat;
 use crate::syscall::write;
 
@@ -152,6 +155,44 @@ pub const SYS_FUTEX: u64 = 202;
 /// — AREST has a single entropy stream. Per #576 (Track Rand-C2).
 pub const SYS_GETRANDOM: u64 = 318;
 
+/// Linux x86_64 syscall number for `getpid(void)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_getpid` (= 39).
+/// Returns the calling process's pid. Per #501 (process-identity).
+pub const SYS_GETPID: u64 = 39;
+
+/// Linux x86_64 syscall number for `getuid(void)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_getuid` (= 102).
+/// Tier-1 returns 0 (root uid — single-user kernel). Per #501.
+pub const SYS_GETUID: u64 = 102;
+
+/// Linux x86_64 syscall number for `getgid(void)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_getgid` (= 104).
+/// Tier-1 returns 0 (root gid). Per #501.
+pub const SYS_GETGID: u64 = 104;
+
+/// Linux x86_64 syscall number for `geteuid(void)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_geteuid` (= 107).
+/// Tier-1 returns 0. Effective uid == real uid in tier-1 (no setuid).
+/// Per #501.
+pub const SYS_GETEUID: u64 = 107;
+
+/// Linux x86_64 syscall number for `getegid(void)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_getegid` (= 108).
+/// Tier-1 returns 0. Effective gid == real gid in tier-1. Per #501.
+pub const SYS_GETEGID: u64 = 108;
+
+/// Linux x86_64 syscall number for `arch_prctl(int code, unsigned long
+/// addr)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_arch_prctl`
+/// (= 158). The foundational TLS-setup syscall: musl's `__init_tp`
+/// calls `ARCH_SET_FS` in `_start`'s first instructions so that every
+/// FS-relative access (errno, `pthread_self`, stack canary) resolves
+/// through the correct thread pointer. Routes to `arch_prctl::handle`,
+/// which stores `fs_base` in the Process struct and, on the real
+/// x86_64-UEFI target, also programs the IA32_FS_BASE MSR (0xC0000100).
+/// Per #501.
+pub const SYS_ARCH_PRCTL: u64 = 158;
+
 /// The dispatch entry point. Match on `rax` and forward the argument
 /// registers (rdi / rsi / rdx / r10 / r8 / r9) to the per-syscall
 /// handler. Handlers that take fewer than six args simply ignore the
@@ -198,6 +239,28 @@ pub fn dispatch(
             // per call (POSIX-conformant short read); flags are
             // accepted but ignored — AREST has one CSPRNG stream.
             getrandom::handle(rdi, rsi, rdx as u32)
+        }
+        SYS_GETPID => {
+            // getpid() — no arguments; returns current pid as i64.
+            // Per #501 (process-identity). Zero-arg: ignore all rdi..r9.
+            getpid::handle()
+        }
+        SYS_GETUID | SYS_GETEUID => {
+            // getuid() / geteuid() — tier-1 returns 0 (root uid).
+            // No uid model yet; effective == real. Per #501.
+            identity::handle_uid()
+        }
+        SYS_GETGID | SYS_GETEGID => {
+            // getgid() / getegid() — tier-1 returns 0 (root gid).
+            // Per #501.
+            identity::handle_gid()
+        }
+        SYS_ARCH_PRCTL => {
+            // arch_prctl(code, addr) — TLS setup. musl's `__init_tp`
+            // calls ARCH_SET_FS (0x1002) in _start's first instructions
+            // so that errno / pthread_self / stack-canary all work.
+            // rdi = code (u64), rsi = addr (u64). Per #501.
+            arch_prctl::handle(rdi, rsi)
         }
         SYS_EXIT | SYS_EXIT_GROUP => {
             // exit / exit_group both transition the Process state
@@ -288,6 +351,80 @@ mod tests {
     #[test]
     fn sys_getrandom_number_matches_linux_uapi() {
         assert_eq!(SYS_GETRANDOM, 318);
+    }
+
+    /// `SYS_GETPID` is 39 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_getpid`.
+    #[test]
+    fn sys_getpid_number_matches_linux_uapi() {
+        assert_eq!(SYS_GETPID, 39);
+    }
+
+    /// `SYS_GETUID` is 102 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_getuid`.
+    #[test]
+    fn sys_getuid_number_matches_linux_uapi() {
+        assert_eq!(SYS_GETUID, 102);
+    }
+
+    /// `SYS_GETGID` is 104 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_getgid`.
+    #[test]
+    fn sys_getgid_number_matches_linux_uapi() {
+        assert_eq!(SYS_GETGID, 104);
+    }
+
+    /// `SYS_GETEUID` is 107 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_geteuid`.
+    #[test]
+    fn sys_geteuid_number_matches_linux_uapi() {
+        assert_eq!(SYS_GETEUID, 107);
+    }
+
+    /// `SYS_GETEGID` is 108 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_getegid`.
+    #[test]
+    fn sys_getegid_number_matches_linux_uapi() {
+        assert_eq!(SYS_GETEGID, 108);
+    }
+
+    /// `SYS_ARCH_PRCTL` is 158 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_arch_prctl`.
+    #[test]
+    fn sys_arch_prctl_number_matches_linux_uapi() {
+        assert_eq!(SYS_ARCH_PRCTL, 158);
+    }
+
+    /// `dispatch(SYS_GETUID, ...)` returns 0 — tier-1 root uid.
+    #[test]
+    fn dispatch_getuid_returns_zero() {
+        assert_eq!(dispatch(SYS_GETUID, 0, 0, 0, 0, 0, 0), 0);
+    }
+
+    /// `dispatch(SYS_GETGID, ...)` returns 0 — tier-1 root gid.
+    #[test]
+    fn dispatch_getgid_returns_zero() {
+        assert_eq!(dispatch(SYS_GETGID, 0, 0, 0, 0, 0, 0), 0);
+    }
+
+    /// `dispatch(SYS_GETEUID, ...)` returns 0 — effective == real uid.
+    #[test]
+    fn dispatch_geteuid_returns_zero() {
+        assert_eq!(dispatch(SYS_GETEUID, 0, 0, 0, 0, 0, 0), 0);
+    }
+
+    /// `dispatch(SYS_GETEGID, ...)` returns 0 — effective == real gid.
+    #[test]
+    fn dispatch_getegid_returns_zero() {
+        assert_eq!(dispatch(SYS_GETEGID, 0, 0, 0, 0, 0, 0), 0);
+    }
+
+    /// `dispatch(SYS_ARCH_PRCTL, unknown_code, ...)` returns -EINVAL.
+    /// Verifies the dispatcher routes to arch_prctl::handle and the
+    /// unknown-subcode guard fires.
+    #[test]
+    fn dispatch_arch_prctl_unknown_code_returns_einval() {
+        assert_eq!(dispatch(SYS_ARCH_PRCTL, 0x0001, 0, 0, 0, 0, 0), -EINVAL);
     }
 
     /// `futex(NULL, FUTEX_WAIT, 0, ...)` returns -EFAULT — null

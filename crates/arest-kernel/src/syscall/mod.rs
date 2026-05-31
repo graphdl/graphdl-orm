@@ -55,11 +55,14 @@
 
 #![allow(dead_code)]
 
+pub mod arch_prctl;
 pub mod close;
 pub mod dispatch;
 pub mod exit;
 pub mod futex;
 pub mod getrandom;
+pub mod getpid;
+pub mod identity;
 pub mod openat;
 pub mod write;
 
