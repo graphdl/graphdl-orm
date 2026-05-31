@@ -58,6 +58,7 @@ use crate::ui_apps::actions::{self, SystemAction};
 use crate::ui_apps::breadcrumb::{BreadcrumbState, CrumbEntry};
 use crate::ui_apps::cell_renderer::{self, CurrentCell, RenderedScreen};
 use crate::ui_apps::navigation::NavigationTarget;
+use crate::unified_repl_regions;
 
 /// Convenience alias — every Slint `[string]` property is bridged
 /// through a `ModelRc<SharedString>` backed by a `VecModel`. Same
@@ -1098,6 +1099,90 @@ impl UnifiedReplApp {
     }
 }
 
+/// Push cell-derived region layout properties to the Slint window.
+///
+/// Reads `UnifiedReplRegion_has_*` cells from the live SYSTEM state
+/// (via `crate::system::with_state`) and sets the corresponding Slint
+/// `in property` fields introduced by #710 Task U2. Falls back to the
+/// property defaults (which match the prior hardcoded literals) when
+/// the cells are absent, so a missing SYSTEM state is a no-op.
+///
+/// Called once from `build_app` after the initial `redraw` so the
+/// layout geometry is cell-driven before any frame is painted.
+fn populate_region_props(window: &UnifiedRepl) {
+    let layouts = crate::system::with_state(|state| {
+        unified_repl_regions::region_layouts_from_cells(state)
+    });
+    // If SYSTEM is not yet initialised the cells are unavailable —
+    // the Slint defaults (matching the prior literals) stay in place.
+    let Some(layouts) = layouts else { return };
+
+    // Slint's generated setters for `length` properties take `f32`
+    // (the `sp::Coord` alias used internally by the Rust code generator).
+    // Each `u32` pixel value is cast to `f32` directly — no unit
+    // conversion needed since the cells store logical pixel values.
+    for layout in &layouts {
+        match layout.name {
+            "left-pane" => {
+                if let Some(w) = layout.pixel_width {
+                    window.set_left_pane_width(w as f32);
+                }
+            }
+            "resources" => {
+                if let Some(w) = layout.pixel_width {
+                    window.set_resources_col_width(w as f32);
+                }
+            }
+            "detail" => {
+                if let Some(w) = layout.pixel_width {
+                    window.set_detail_col_width(w as f32);
+                }
+            }
+            "typed-surface" => {
+                if let Some(h) = layout.min_height_px {
+                    window.set_typed_surface_min_height(h as f32);
+                }
+            }
+            "scrollback" => {
+                if let Some(h) = layout.min_height_px {
+                    window.set_scrollback_min_height(h as f32);
+                }
+                window.set_scrollback_vert_stretch(layout.vert_stretch as i32);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Seed `UnifiedReplRegion_has_*` cells into the live SYSTEM state if
+/// they are not already present. Called from `build_app` before the
+/// initial `redraw` so the cells exist when `populate_region_props`
+/// reads them.
+///
+/// Uses `system::with_state` + `system::apply` to extend the state;
+/// the extension is a pure cell-graph append (no destructive mutation).
+/// On error (SYSTEM not yet initialised — a programmer error) the
+/// seeding is skipped silently; the Slint property defaults cover the
+/// fallback path.
+fn seed_region_cells_into_system() {
+    let new_state = crate::system::with_state(|state| {
+        // Only seed if the cells are absent — check presence of one
+        // sentinel fact to avoid re-seeding on every build_app call.
+        use arest::ast;
+        let cell = ast::fetch_or_phi("UnifiedReplRegion_has_PixelWidth", state);
+        if cell.as_seq().map(|s| !s.is_empty()).unwrap_or(false) {
+            // Already seeded — return the current state unchanged.
+            return state.clone();
+        }
+        unified_repl_regions::seed_region_cells(state)
+    });
+    if let Some(new_state) = new_state {
+        // Ignore error — SYSTEM not yet initialised is a programmer
+        // error surfaced by the boot log, not a runtime panic.
+        let _ = crate::system::apply(new_state);
+    }
+}
+
 /// Construct the Unified REPL window and wire its callbacks.
 ///
 /// The Slint platform must be installed before this is called
@@ -1110,9 +1195,19 @@ pub fn build_app() -> Result<UnifiedReplApp, slint::PlatformError> {
     let window = UnifiedRepl::new()?;
     let state = Rc::new(RefCell::new(UnifiedReplState::new()));
 
+    // Seed UnifiedReplRegion cells into SYSTEM so the layout geometry
+    // is cell-driven. Must run before `redraw` so the first paint
+    // uses cell-derived values rather than property defaults.
+    // (#710 Task U2)
+    seed_region_cells_into_system();
+
     // Initial paint — populates every Slint property from the empty
     // state before any user interaction.
     redraw(&window, &mut state.borrow_mut());
+    // Populate region layout props from cells (runs after redraw so
+    // the cells seeded above are visible to the extraction layer).
+    // (#710 Task U2)
+    populate_region_props(&window);
     window.set_prompt(SharedString::from("arest> "));
 
     // ---- HATEOAS pane callbacks ----------------------------------

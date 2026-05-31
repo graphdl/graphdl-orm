@@ -63,6 +63,35 @@ import { Keyboard } from "./Keyboard.slint";
 export { AppShell, Theme, ThemeMode, AppLauncher, Doom, Keyboard }
 
 export component UnifiedRepl inherits Window {
+    // ---- Region layout props (#710 Task U2, EPIC #496) --------------
+    //
+    // These replace the magic pixel literals previously hand-typed in
+    // this file. The Rust glue seeds `UnifiedReplRegion_has_*` cells
+    // via `crate::unified_repl_regions::seed_region_cells` and reads
+    // them back via `region_layout_for` before the super-loop starts,
+    // pushing the derived values here. The Slint layout then uses
+    // these properties instead of literals so the cell graph is the
+    // single source of truth for region geometry.
+    //
+    // Defaults match the prior hardcoded values exactly — the visual
+    // render is unchanged from the baseline even when the Rust side
+    // does not call `populate_region_props` (graceful degradation).
+    //
+    // left-pane: fixed-width HATEOAS browse column block.
+    in property <length> left-pane-width: 520px;
+    // resources: sidebar sub-column inside the left pane.
+    in property <length> resources-col-width: 160px;
+    // detail: rightmost sub-column inside the left pane.
+    in property <length> detail-col-width: 200px;
+    // typed-surface: cell-as-screen card min-height.
+    in property <length> typed-surface-min-height: 200px;
+    // scrollback: REPL scrollback card min-height and vert-stretch.
+    // `scrollback-vert-stretch` is an int multiplier; Slint does not
+    // have a `vertical-stretch` property type — the layout uses it as
+    // the integer factor in a `vertical-stretch` binding expression.
+    in property <length> scrollback-min-height: 200px;
+    in property <int> scrollback-vert-stretch: 2;
+
     // ---- HATEOAS-side inputs (left pane, mirrors HateoasBrowser) ----
 
     // Sidebar: every Noun the metamodel knows about (sorted).
@@ -420,15 +449,19 @@ export component UnifiedRepl inherits Window {
                 // Same three-pane shape HateoasBrowser shipped, but
                 // collapsed into a fixed-width column so the right
                 // pane (REPL) gets the rest of the surface.
+                // Width is driven from the `left-pane-width` property
+                // seeded from `UnifiedReplRegion_has_PixelWidth` cells
+                // (#710 Task U2) — no longer a hard-typed literal.
                 Rectangle {
-                    width: 520px;
+                    width: root.left-pane-width;
 
                     HorizontalLayout {
                         spacing: Theme.spacing-md;
 
                         // ---- Pane 1a: Resources sidebar ------------
+                        // Width from `resources-col-width` cell property.
                         Rectangle {
-                            width: 160px;
+                            width: root.resources-col-width;
                             Card {
                                 title: "Apps";
                                 if root.resources.length == 0 : Text {
@@ -480,8 +513,9 @@ export component UnifiedRepl inherits Window {
                         }
 
                         // ---- Pane 1c: Detail panel -----------------
+                        // Width from `detail-col-width` cell property.
                         Rectangle {
-                            width: 200px;
+                            width: root.detail-col-width;
                             Card {
                                 title: "Detail";
                                 if root.detail-lines.length == 0 : Text {
@@ -520,8 +554,10 @@ export component UnifiedRepl inherits Window {
                         spacing: Theme.spacing-md;
 
                         // ---- Typed surface (cell-as-screen) -------
+                        // min-height driven from `typed-surface-min-height`
+                        // cell property (#710 Task U2).
                         Rectangle {
-                            min-height: 200px;
+                            min-height: root.typed-surface-min-height;
                             vertical-stretch: 1;
                             Card {
                                 // Header: cell label, with the
@@ -773,26 +809,16 @@ export component UnifiedRepl inherits Window {
                         // the symptom is text overlapping the navigation
                         // and action panes).
                         Rectangle {
-                            // Scrollback claims leftover vertical space
-                            // (vertical-stretch=2 vs the other right-
-                            // pane cards at default stretch=1, so it
-                            // gets a bit over its fair share without
-                            // dominating). Avoid stretch=4: previous
-                            // attempt pushed the input-frame off-
-                            // screen because the Card`s natural height
-                            // (driven by viewport-height = scrollback
-                            // line count × 20px) was big enough that
-                            // even VerticalLayout`s post-stretch
-                            // distribution couldn`t fit the prompt.
-                            //
-                            // FIXME(#598-style follow-up): these
-                            // numbers should come from
-                            // readings/ui/monoview.md`s Region weights
-                            // via theme.slint, not be hand-typed
-                            // magic. Leaving the literal values until
-                            // the Region-as-cell binding lands.
-                            min-height: 200px;
-                            vertical-stretch: 2;
+                            // Scrollback claims leftover vertical space.
+                            // Both `min-height` and `vertical-stretch`
+                            // are now driven from cell properties seeded
+                            // by `crate::unified_repl_regions::seed_region_cells`
+                            // (#710 Task U2) — the FIXME that previously
+                            // lived here is resolved. Default values
+                            // (200px / stretch=2) match the prior literals
+                            // exactly so the visual render is unchanged.
+                            min-height: root.scrollback-min-height;
+                            vertical-stretch: root.scrollback-vert-stretch;
                             clip: true;
                             Card {
                                 title: "REPL";

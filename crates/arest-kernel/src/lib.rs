@@ -108,6 +108,16 @@ pub mod icons;
 // `ui_apps::launcher::run` path re-imports these via
 // `crate::launcher_app_set::*`.
 pub mod launcher_app_set;
+// Cell-driven UnifiedRepl region/layout extraction (#710 Task U2).
+// Pure functions over `&Object` that read `UnifiedReplRegion_has_*`
+// cells and return `RegionLayout` structs (pixel-width, min-height,
+// vert-stretch) for the five named UnifiedRepl layout regions. Lifts
+// the magic pixel constants previously hand-typed in
+// `ui/apps/UnifiedRepl.slint` into the cell graph. The
+// `ui_apps::unified_repl` module re-imports the seeding function via
+// `crate::unified_repl_regions::seed_region_cells` before the
+// super-loop and uses `region_layout_for` to populate Slint props.
+pub mod unified_repl_regions;
 // `ui_apps` is the Slint-driven boot UI surface (Unified REPL,
 // launcher, keyboard, doom). Every submodule that touches the
 // runtime imports `slint::*`, and the launcher's `run(...)`
