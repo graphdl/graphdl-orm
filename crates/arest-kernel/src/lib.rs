@@ -126,6 +126,13 @@ pub mod unified_repl_regions;
 // `subscribe_changes` handler; the super-loop swaps the atomic and
 // calls `.global::<Theme>().set_mode(m)` on the live component handles.
 pub mod theme_pref;
+// BackAction cell — fact-driven back-navigation shortcut dispatch (Task U3b).
+// Pure functions over `&Object` that seed the `BackAction_has_Shortcut` cell
+// and resolve a shortcut key → action id. The UEFI-gated `dispatch_shortcut`
+// helper in `ui_apps::launcher` calls `resolve_shortcut` from here to unify
+// the Esc key path and any future button path into a single fact-driven
+// dispatch. No Slint, no UEFI, no `system::*` calls — host-testable.
+pub mod back_action;
 // `ui_apps` is the Slint-driven boot UI surface (Unified REPL,
 // launcher, keyboard, doom). Every submodule that touches the
 // runtime imports `slint::*`, and the launcher's `run(...)`

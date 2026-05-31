@@ -119,6 +119,19 @@ use crate::theme_pref::{
     THEME_PREF_CELL,
 };
 
+// ── Cell-driven BackAction shortcut (#U3b) ────────────────────────
+//
+// Pure cell functions live in `crate::back_action` (host-testable;
+// no Slint/UEFI dependency). `resolve_shortcut` is the fact-driven
+// lookup called by `dispatch_shortcut` below to unify the Esc key
+// path and any future button path.
+use crate::back_action::{
+    BACK_ACTION_ID,
+    BACK_SHORTCUT_KEY,
+    resolve_shortcut,
+    seed_back_action_cell,
+};
+
 // ── Cell-driven app set (#709 Task U1) ────────────────────────────
 //
 // Pure extraction functions live in `crate::launcher_app_set` so they
@@ -355,6 +368,13 @@ pub fn run(
     // last-write-wins semantics keep reading the most-recently-pushed
     // mode (the boot-time seed is older than any prior stored toggle).
     seed_theme_pref_into_system();
+
+    // Task U3b: seed the BackAction shortcut cell into SYSTEM so the
+    // "Escape → back" binding is a first-class fact in the cell graph.
+    // `dispatch_shortcut` reads this cell to resolve which action an
+    // Escape (or any future button press) maps to, unifying the key
+    // path and button path into one fact-driven dispatch.
+    seed_back_action_into_system();
 
     // Track #709 Task U1: populate the AppLauncher's `app-names`
     // property from the `LaunchableApp_has_Symbol` cells. This is the
@@ -662,11 +682,16 @@ pub fn run(
                 drain_keyboard_into_slint_window(&launcher.window());
             }
             // Track #510: HateoasBrowser + Repl merged into UnifiedRepl.
+            // Task U3b: the back-navigation is fact-driven via `dispatch_shortcut`.
+            // `drain_keyboard_with_esc_intercept` returns `true` on Esc;
+            // `dispatch_shortcut` resolves Escape → "back" from the
+            // `BackAction_has_Shortcut` cell and performs the unified
+            // hide/show/set-nav transition in one place.
             Active::UnifiedRepl => {
                 if drain_keyboard_with_esc_intercept(&unified_repl_app.window.window()) {
-                    let _ = unified_repl_app.window.hide();
-                    let _ = launcher.show();
-                    *nav.borrow_mut() = Active::Launcher;
+                    dispatch_shortcut(BACK_SHORTCUT_KEY, &nav, &launcher, || {
+                        let _ = unified_repl_app.window.hide();
+                    });
                 }
             }
             // Track QQQQ #465: when the on-screen Keyboard is active
@@ -679,16 +704,13 @@ pub fn run(
             // present) or feedback loops where the user has somehow
             // gotten the Keyboard to receive its own taps (not
             // possible under the current single-Window pattern but
-            // worth defending against). Esc still routes back to
-            // the launcher; non-Esc keys are dispatched into the
-            // Keyboard window where Slint's default handling drops
-            // them (the Keyboard surface has no FocusScope that
-            // consumes keys — taps drive the only input path).
+            // worth defending against). Esc routes back via the
+            // unified `dispatch_shortcut` helper (Task U3b).
             Active::Keyboard => {
                 if drain_keyboard_with_esc_intercept(&keyboard_app.window.window()) {
-                    let _ = keyboard_app.window.hide();
-                    let _ = launcher.show();
-                    *nav.borrow_mut() = Active::Launcher;
+                    dispatch_shortcut(BACK_SHORTCUT_KEY, &nav, &launcher, || {
+                        let _ = keyboard_app.window.hide();
+                    });
                 }
             }
             // Track VVV #455: when Doom is active the keystroke
@@ -711,12 +733,13 @@ pub fn run(
             // shows whatever the WASM guest renders, no Slint-
             // side input wiring needed (the Window's FocusScope
             // rejects any keystroke that somehow reaches it).
+            // Task U3b: back-navigation goes through dispatch_shortcut.
             #[cfg(feature = "doom")]
             Active::Doom => {
                 if doom_app.drain_keystrokes_intercept_esc() {
-                    let _ = doom_app.window.hide();
-                    let _ = launcher.show();
-                    *nav.borrow_mut() = Active::Launcher;
+                    dispatch_shortcut(BACK_SHORTCUT_KEY, &nav, &launcher, || {
+                        let _ = doom_app.window.hide();
+                    });
                 }
             }
         }
@@ -1249,6 +1272,94 @@ fn seed_theme_pref_into_system() {
         // not a metamodel constraint — skip the validate gate.
         let _ = crate::system::apply_unchecked(new_state);
     }
+}
+
+/// Task U3b: seed the `BackAction_has_Shortcut` cell into the live
+/// SYSTEM state at boot so the "Escape → back" binding is present as
+/// a first-class fact in the cell graph.
+///
+/// Idempotent: `cell_push` appends to the sequence; `resolve_shortcut`
+/// returns on the first match, so a duplicate fact on re-boot is
+/// harmless. The seed is not guarded by a cell-absent check (unlike
+/// `seed_theme_pref_into_system`) because the shortcut binding is
+/// stable and canonical — re-seeding is safe.
+///
+/// On error (SYSTEM not yet initialised — a programmer error) the
+/// seeding is skipped silently; the boot log surfaces the condition via
+/// `system::with_state` returning `None`.
+fn seed_back_action_into_system() {
+    let new_state = crate::system::with_state(|state| {
+        seed_back_action_cell(state)
+    });
+    if let Some(new_state) = new_state {
+        // apply_unchecked: the BackAction cell is a UI shortcut binding,
+        // not a metamodel constraint — skip the validate gate.
+        let _ = crate::system::apply_unchecked(new_state);
+    }
+}
+
+/// Task U3b: unified shortcut dispatch helper.
+///
+/// Both the keyboard Esc path (`drain_keyboard_with_esc_intercept`
+/// returning `true`) and any future button path call this helper with
+/// the shortcut key that fired. The helper:
+///
+///   1. Reads the `BackAction_has_Shortcut` cell via `resolve_shortcut`
+///      to look up which action the key maps to.
+///   2. If the action is `BACK_ACTION_ID` ("back"), performs the
+///      back-to-launcher navigation: calls `hide_active()` to hide the
+///      current app, shows the launcher, sets `nav` to
+///      `Active::Launcher`.
+///   3. Ignores unrecognised actions (cell absent or key not mapped).
+///
+/// This removes the previously-duplicated "hide/show/set-nav" block
+/// that appeared once per active-app arm (UnifiedRepl, Keyboard, Doom).
+/// A single fact-driven lookup replaces three identical procedural
+/// bodies, exactly as the build directive requires.
+///
+/// `hide_active` is a `FnOnce()` closure that the caller provides to
+/// hide the active app's Slint window. Each call site passes the
+/// specific `ComponentHandle::hide()` call for its arm; the dispatch
+/// helper doesn't need to know which component is active.
+///
+/// Example call site (UnifiedRepl arm):
+///
+/// ```ignore
+/// dispatch_shortcut(BACK_SHORTCUT_KEY, &nav, &launcher, || {
+///     let _ = unified_repl_app.window.hide();
+/// });
+/// ```
+fn dispatch_shortcut(
+    shortcut_key: &str,
+    nav: &NavState,
+    launcher: &AppLauncher,
+    hide_active: impl FnOnce(),
+) {
+    // Resolve the shortcut from the SYSTEM cell graph. If SYSTEM is
+    // not yet initialised (programmer error — should not happen at
+    // runtime) or the shortcut is not mapped, bail silently. The
+    // resolution is pure (reads cells only); no mutation happens here.
+    // `with_state` returns `Option<T>` (None if SYSTEM not init).
+    // `resolve_shortcut` returns `Option<String>` (None if no match).
+    // Flatten: `Option<Option<String>>` → `Option<String>`.
+    let action = crate::system::with_state(|state| {
+        resolve_shortcut(shortcut_key, state)
+    });
+    let Some(Some(action)) = action else { return };
+
+    if action != BACK_ACTION_ID {
+        // Unknown action — future shortcuts (e.g. "forward") will be
+        // handled by additional arms here without touching the Esc path.
+        return;
+    }
+
+    // Back action: this is the single canonical "navigate back to
+    // launcher" implementation. Previously duplicated as three identical
+    // blocks (one per active-app arm in the super-loop match); now a
+    // single body called by each arm via dispatch_shortcut.
+    hide_active();
+    let _ = launcher.show();
+    *nav.borrow_mut() = Active::Launcher;
 }
 
 /// Track XXXXX #466: at boot, when the linuxkpi virtio-input shim
