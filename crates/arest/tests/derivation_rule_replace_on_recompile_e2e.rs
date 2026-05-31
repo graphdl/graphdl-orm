@@ -28,7 +28,9 @@ use arest::ast::{self, Object};
 /// Helper: extract Task ids from a unary FT consequent cell whose
 /// entries are shaped `<<Task, id>>`.
 fn task_ids_in_cell(cell_name: &str, state: &Object) -> Vec<String> {
-    let cell = ast::fetch_or_phi(cell_name, state);
+    // task-744/#940: FT consequent cells are Map-backed; `fetch_or_phi(...).as_seq()`
+    // silently returns None on a Map cell. `fetch_cell_seq` normalises Map -> Seq.
+    let cell = ast::fetch_cell_seq(cell_name, state);
     cell.as_seq()
         .map(|s| s.iter()
             .filter_map(|f| f.as_seq().and_then(|pairs| pairs.iter().find_map(|p| {
