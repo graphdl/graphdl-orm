@@ -571,4 +571,173 @@ mod tests {
         let layout = region_layout_for("scrollback", &Object::phi());
         assert_eq!(layout.vert_stretch, 2, "scrollback vert-stretch baseline is 2");
     }
+
+    // ── Readings-derived layout extraction ───────────────────────────
+    //
+    // These tests verify that the layout weights in `readings/ui/monoview.md`
+    // (the FORML predicate-text source of truth) parse into cells whose
+    // values are read back correctly by `region_layouts_from_cells`.
+    //
+    // The path: monoview.md instance facts → parse_to_state_from →
+    // `UnifiedReplRegion_has_PixelWidth` / `_has_MinHeightPx` /
+    // `_has_VertStretch` cells → `region_layouts_from_cells` → RegionLayout.
+    //
+    // This is the "readings-derived" leg of #710 Task 599: the numeric
+    // layout values live in monoview.md as FORML facts, not in Rust
+    // constants. A change to any pixel value in monoview.md
+    // immediately surfaces here as a test failure, and the Rust
+    // `default_region_layout()` can be updated to match.
+
+    /// Monoview.md parses without error (smoke test for the new
+    /// UnifiedReplRegion entity type + fact types + instance facts).
+    #[test]
+    fn monoview_md_parses_cleanly() {
+        let monoview_md = include_str!("../../../readings/ui/monoview.md");
+        let result = arest::parse_forml2::parse_to_state(monoview_md);
+        assert!(
+            result.is_ok(),
+            "readings/ui/monoview.md must parse without error; got: {:?}",
+            result.err()
+        );
+    }
+
+    /// Parsing monoview.md produces a state with non-empty
+    /// `UnifiedReplRegion_has_PixelWidth` cells — the readings-derived
+    /// fact type is registered and instance facts landed in the cell.
+    #[test]
+    fn monoview_md_produces_unified_repl_region_pixel_width_cell() {
+        let monoview_md = include_str!("../../../readings/ui/monoview.md");
+        let state = arest::parse_forml2::parse_to_state(monoview_md)
+            .expect("monoview.md must parse");
+        let cell = arest::ast::fetch_or_phi("UnifiedReplRegion_has_PixelWidth", &state);
+        assert!(
+            cell.as_seq().map(|s| !s.is_empty()).unwrap_or(false),
+            "UnifiedReplRegion_has_PixelWidth cell must be non-empty after parsing monoview.md"
+        );
+    }
+
+    /// The readings-derived PixelWidth values match `default_region_layout()`.
+    /// This is the end-to-end readings→cells→RegionLayout round-trip.
+    #[test]
+    fn readings_derived_pixel_widths_match_defaults() {
+        let monoview_md = include_str!("../../../readings/ui/monoview.md");
+        let state = arest::parse_forml2::parse_to_state(monoview_md)
+            .expect("monoview.md must parse");
+        let layouts = region_layouts_from_cells(&state);
+
+        // left-pane: 520px from readings.
+        let left = layouts.iter().find(|r| r.name == "left-pane").unwrap();
+        assert_eq!(
+            left.pixel_width, Some(520),
+            "readings-derived left-pane pixel_width must be 520; got {:?}",
+            left.pixel_width
+        );
+
+        // resources: 160px from readings.
+        let resources = layouts.iter().find(|r| r.name == "resources").unwrap();
+        assert_eq!(
+            resources.pixel_width, Some(160),
+            "readings-derived resources pixel_width must be 160; got {:?}",
+            resources.pixel_width
+        );
+
+        // detail: 200px from readings.
+        let detail = layouts.iter().find(|r| r.name == "detail").unwrap();
+        assert_eq!(
+            detail.pixel_width, Some(200),
+            "readings-derived detail pixel_width must be 200; got {:?}",
+            detail.pixel_width
+        );
+
+        // typed-surface: no fixed width (fills remaining space).
+        let typed = layouts.iter().find(|r| r.name == "typed-surface").unwrap();
+        assert_eq!(
+            typed.pixel_width, None,
+            "typed-surface must have no fixed pixel_width; got {:?}",
+            typed.pixel_width
+        );
+
+        // scrollback: no fixed width (fills remaining space).
+        let scrollback = layouts.iter().find(|r| r.name == "scrollback").unwrap();
+        assert_eq!(
+            scrollback.pixel_width, None,
+            "scrollback must have no fixed pixel_width; got {:?}",
+            scrollback.pixel_width
+        );
+    }
+
+    /// The readings-derived MinHeightPx values match `default_region_layout()`.
+    #[test]
+    fn readings_derived_min_heights_match_defaults() {
+        let monoview_md = include_str!("../../../readings/ui/monoview.md");
+        let state = arest::parse_forml2::parse_to_state(monoview_md)
+            .expect("monoview.md must parse");
+        let layouts = region_layouts_from_cells(&state);
+
+        // typed-surface: 200px min-height from readings.
+        let typed = layouts.iter().find(|r| r.name == "typed-surface").unwrap();
+        assert_eq!(
+            typed.min_height_px, Some(200),
+            "readings-derived typed-surface min_height_px must be 200; got {:?}",
+            typed.min_height_px
+        );
+
+        // scrollback: 200px min-height from readings.
+        let scrollback = layouts.iter().find(|r| r.name == "scrollback").unwrap();
+        assert_eq!(
+            scrollback.min_height_px, Some(200),
+            "readings-derived scrollback min_height_px must be 200; got {:?}",
+            scrollback.min_height_px
+        );
+    }
+
+    /// The readings-derived VertStretch values match `default_region_layout()`.
+    #[test]
+    fn readings_derived_vert_stretches_match_defaults() {
+        let monoview_md = include_str!("../../../readings/ui/monoview.md");
+        let state = arest::parse_forml2::parse_to_state(monoview_md)
+            .expect("monoview.md must parse");
+        let layouts = region_layouts_from_cells(&state);
+
+        // All regions except scrollback: vert_stretch = 1 from readings.
+        for name in &["left-pane", "resources", "detail", "typed-surface"] {
+            let region = layouts.iter().find(|r| r.name == *name).unwrap();
+            assert_eq!(
+                region.vert_stretch, 1,
+                "readings-derived {} vert_stretch must be 1; got {}",
+                name, region.vert_stretch
+            );
+        }
+
+        // scrollback: vert_stretch = 2 from readings (claims more vertical space).
+        let scrollback = layouts.iter().find(|r| r.name == "scrollback").unwrap();
+        assert_eq!(
+            scrollback.vert_stretch, 2,
+            "readings-derived scrollback vert_stretch must be 2; got {}",
+            scrollback.vert_stretch
+        );
+    }
+
+    /// Full readings→cells→defaults round-trip: the layouts derived from
+    /// monoview.md cells match `default_region_layout()` exactly.
+    /// This is the integration test ensuring readings == Rust defaults.
+    #[test]
+    fn readings_derived_layouts_match_default_region_layout() {
+        let monoview_md = include_str!("../../../readings/ui/monoview.md");
+        let state = arest::parse_forml2::parse_to_state(monoview_md)
+            .expect("monoview.md must parse");
+        let from_readings = region_layouts_from_cells(&state);
+        let defaults = default_region_layout();
+        assert_eq!(
+            from_readings.len(), defaults.len(),
+            "readings-derived region count must match default_region_layout()"
+        );
+        for (got, want) in from_readings.iter().zip(defaults.iter()) {
+            assert_eq!(
+                got, want,
+                "readings-derived layout for '{}' must match default_region_layout();\n  got: {:?}\n  want: {:?}",
+                got.name, got, want
+            );
+        }
+    }
 }

@@ -37,7 +37,10 @@ App Role(.Name) is an entity type.
   REPL is a subtype of App Role.
   FileBrowser is a subtype of App Role.
   Settings is a subtype of App Role.
-  {HateoasBrowser, REPL, FileBrowser, Settings} are mutually exclusive subtypes of App Role.
+  UnifiedRepl is a subtype of App Role.
+  {HateoasBrowser, REPL, FileBrowser, Settings, UnifiedRepl} are mutually exclusive subtypes of App Role.
+
+UnifiedReplRegion(.Name) is an entity type.
 
 ## Value Types
 
@@ -81,6 +84,12 @@ Override Source is a value type.
 Hit Target Size is a value type.
 
 Z Index is a value type.
+
+PixelWidth is a value type.
+
+MinHeightPx is a value type.
+
+VertStretch is a value type.
 
 ## Fact Types
 
@@ -144,6 +153,17 @@ PanePreference has Override Source.
 
 PanePreference has Description.
   Each PanePreference has at most one Description.
+
+### UnifiedReplRegion layout weights
+
+UnifiedReplRegion has PixelWidth.
+  Each UnifiedReplRegion has at most one PixelWidth.
+
+UnifiedReplRegion has MinHeightPx.
+  Each UnifiedReplRegion has at most one MinHeightPx.
+
+UnifiedReplRegion has VertStretch.
+  Each UnifiedReplRegion has exactly one VertStretch.
 
 ### Density / Interaction cross-product
 
@@ -423,3 +443,86 @@ PanePreference 'settings.default' is for App Role 'settings'.
 PanePreference 'settings.default' has Pane Mode 'master-detail'.
 PanePreference 'settings.default' has Override Source 'app-default'.
 PanePreference 'settings.default' has Description 'Two-column categories + panel; collapses to stack on small viewports.'.
+
+### App: UnifiedRepl
+
+App Role 'unified-repl' is a UnifiedRepl.
+
+MonoView 'unified-repl' is for App Role 'unified-repl'.
+MonoView 'unified-repl' has display- Title 'Unified REPL'.
+MonoView 'unified-repl' has default Pane Mode 'master-detail'.
+MonoView 'unified-repl' has default Density Scale 'regular'.
+MonoView 'unified-repl' has default Interaction Mode 'keyboard'.
+MonoView 'unified-repl' has default A11y Profile 'screen-reader-aware'.
+MonoView 'unified-repl' has Description 'HATEOAS-browse block on the left (resources + detail sub-columns), typed cell card and scrollback REPL on the right. Vertical-stretch weights drive Slint layout; all pixel values are FORML facts, not Slint literals.'.
+
+Region 'unified-repl.left-pane' belongs to MonoView 'unified-repl'.
+Region 'unified-repl.left-pane' has Region Slot 'sidebar'.
+Region 'unified-repl.left-pane' has Region Role 'navigation'.
+Region 'unified-repl.left-pane' has Transition Style 'none'.
+Region 'unified-repl.left-pane' has Surface Tier 'panel'.
+Region 'unified-repl.left-pane' has Z Index 10.
+Region 'unified-repl.left-pane' has display- Title 'Browse'.
+Region 'unified-repl.left-pane' is visible in Pane Mode 'master-detail'.
+
+Region 'unified-repl.resources' belongs to MonoView 'unified-repl'.
+Region 'unified-repl.resources' has Region Slot 'sidebar'.
+Region 'unified-repl.resources' has Region Role 'navigation'.
+Region 'unified-repl.resources' has Transition Style 'none'.
+Region 'unified-repl.resources' has Surface Tier 'panel'.
+Region 'unified-repl.resources' has Z Index 10.
+Region 'unified-repl.resources' has display- Title 'Resources'.
+Region 'unified-repl.resources' is visible in Pane Mode 'master-detail'.
+
+Region 'unified-repl.detail' belongs to MonoView 'unified-repl'.
+Region 'unified-repl.detail' has Region Slot 'detail'.
+Region 'unified-repl.detail' has Region Role 'detail'.
+Region 'unified-repl.detail' has Transition Style 'swap'.
+Region 'unified-repl.detail' has Surface Tier 'panel'.
+Region 'unified-repl.detail' has Z Index 20.
+Region 'unified-repl.detail' has display- Title 'Detail'.
+Region 'unified-repl.detail' is visible in Pane Mode 'master-detail'.
+
+Region 'unified-repl.typed-surface' belongs to MonoView 'unified-repl'.
+Region 'unified-repl.typed-surface' has Region Slot 'content'.
+Region 'unified-repl.typed-surface' has Region Role 'context'.
+Region 'unified-repl.typed-surface' has Transition Style 'none'.
+Region 'unified-repl.typed-surface' has Surface Tier 'backdrop'.
+Region 'unified-repl.typed-surface' has Z Index 0.
+Region 'unified-repl.typed-surface' has display- Title 'Typed Surface'.
+Region 'unified-repl.typed-surface' is visible in Pane Mode 'master-detail'.
+
+Region 'unified-repl.scrollback' belongs to MonoView 'unified-repl'.
+Region 'unified-repl.scrollback' has Region Slot 'content'.
+Region 'unified-repl.scrollback' has Region Role 'context'.
+Region 'unified-repl.scrollback' has Transition Style 'none'.
+Region 'unified-repl.scrollback' has Surface Tier 'backdrop'.
+Region 'unified-repl.scrollback' has Z Index 0.
+Region 'unified-repl.scrollback' has display- Title 'Scrollback'.
+Region 'unified-repl.scrollback' is visible in Pane Mode 'master-detail'.
+
+PanePreference 'unified-repl.default' is for App Role 'unified-repl'.
+PanePreference 'unified-repl.default' has Pane Mode 'master-detail'.
+PanePreference 'unified-repl.default' has Override Source 'app-default'.
+PanePreference 'unified-repl.default' has Description 'HATEOAS-browse column on the left, REPL surface on the right; master-detail is the only sensible default.'.
+
+### UnifiedRepl region layout weights
+### Source: crates/arest-kernel/src/unified_repl_regions.rs default_region_layout()
+### These predicate-text values are the single source of truth for the five
+### Slint layout numbers. The kernel reads them back via
+### UnifiedReplRegion_has_PixelWidth / _has_MinHeightPx / _has_VertStretch cells.
+
+UnifiedReplRegion 'left-pane' has PixelWidth '520'.
+UnifiedReplRegion 'left-pane' has VertStretch '1'.
+
+UnifiedReplRegion 'resources' has PixelWidth '160'.
+UnifiedReplRegion 'resources' has VertStretch '1'.
+
+UnifiedReplRegion 'detail' has PixelWidth '200'.
+UnifiedReplRegion 'detail' has VertStretch '1'.
+
+UnifiedReplRegion 'typed-surface' has MinHeightPx '200'.
+UnifiedReplRegion 'typed-surface' has VertStretch '1'.
+
+UnifiedReplRegion 'scrollback' has MinHeightPx '200'.
+UnifiedReplRegion 'scrollback' has VertStretch '2'.
