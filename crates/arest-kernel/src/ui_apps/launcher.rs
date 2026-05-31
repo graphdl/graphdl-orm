@@ -1108,14 +1108,23 @@ fn push_touch_mode_facts() {
 /// has no compositor below it to render a host cursor, so the kernel
 /// is the only place a cursor can be drawn.
 ///
-/// 12x18 pixel arrow, white on whatever was already there. Uses the
+/// 12×18 pixel arrow, white on whatever was already there. Uses the
 /// raw GOP MMIO pointer + stride captured at boot — no Slint surface
 /// involvement, so the next `draw_if_needed` will overwrite the
 /// cursor area, which is the correct behaviour: the cursor follows
 /// the mouse on top of the latest UI state, redrawn every frame.
 ///
+/// The pixel-painting inner loop lives in
+/// `framebuffer::paint_cursor_sprite_into` so it compiles on the
+/// host target (framebuffer is unconditionally compiled; ui_apps is
+/// UEFI-gated) and can be unit-tested without UEFI. This wrapper
+/// adds the sentinel check and coordinate clamping that belong at the
+/// launcher level.
+///
 /// `gop_fmt_idx`: 0 = RGBX, 1 = BGRX (the two formats our GOP path
-/// installs after filtering Bitmask/BltOnly).
+/// installs after filtering Bitmask/BltOnly). Unused by the pixel
+/// writer (white is channel-order-agnostic) but retained for future
+/// coloured-cursor follow-ups.
 fn paint_cursor_sprite(
     gop_ptr: usize,
     gop_w: usize,
@@ -1137,63 +1146,28 @@ fn paint_cursor_sprite(
     }
     // Clamp so a wild position (e.g. EV_ABS device coordinates that
     // haven`t been calibrated to screen pixels) doesn`t walk off the
-    // framebuffer. We saturate at (0,0) and (w-1, h-1) inclusive.
+    // framebuffer. Saturate at (0, 0) and (w-1, h-1) inclusive.
     let cx = cx.clamp(0, gop_w as i32 - 1) as usize;
     let cy = cy.clamp(0, gop_h as i32 - 1) as usize;
 
-    // Tiny arrow bitmap. 1 = paint, 0 = skip. 12 wide × 18 tall.
-    // Hot-spot is the top-left corner so on-screen position matches
-    // the pointer position.
-    const ARROW: [u16; 18] = [
-        0b100000000000,
-        0b110000000000,
-        0b111000000000,
-        0b111100000000,
-        0b111110000000,
-        0b111111000000,
-        0b111111100000,
-        0b111111110000,
-        0b111111111000,
-        0b111111111100,
-        0b111111110000,
-        0b111110000000,
-        0b110011000000,
-        0b100011000000,
-        0b000001100000,
-        0b000001100000,
-        0b000000110000,
-        0b000000110000,
-    ];
-
-    // White pixel: 0xFFFFFFFF works for both BGRX and RGBX (every
-    // channel max). Format index doesn`t actually matter for the
-    // pixel value but we keep it as a parameter so a future-coloured
-    // cursor (e.g. focus-tinted) can choose channel order.
+    // Format index unused by the pixel writer (0xFFFF_FFFF is white
+    // in both RGBX and BGRX). Kept as a parameter for future use.
     let _ = gop_fmt_idx;
-    let pixel: u32 = 0xFFFFFFFF;
 
     // SAFETY: `gop_ptr` is the GOP MMIO base captured at boot from
     // the firmware`s GraphicsOutput protocol. `gop_stride` is the
     // pixel pitch (not byte pitch). Bounds clamps above keep every
     // write inside `[gop_ptr, gop_ptr + gop_stride*gop_h*4)`.
-    let fb = gop_ptr as *mut u32;
-    for (row, mask) in ARROW.iter().enumerate() {
-        let y = cy + row;
-        if y >= gop_h {
-            break;
-        }
-        for col in 0..12usize {
-            let bit = (mask >> (11 - col)) & 1;
-            if bit == 0 {
-                continue;
-            }
-            let x = cx + col;
-            if x >= gop_w {
-                continue;
-            }
-            unsafe {
-                fb.add(y * gop_stride + x).write_volatile(pixel);
-            }
-        }
+    // `framebuffer::paint_cursor_sprite_into` bounds-checks every
+    // pixel write against `(gop_w, gop_h)` — doubly safe.
+    unsafe {
+        crate::framebuffer::paint_cursor_sprite_into(
+            gop_ptr as *mut u32,
+            gop_w,
+            gop_h,
+            gop_stride,
+            cx,
+            cy,
+        );
     }
 }

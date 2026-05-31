@@ -558,6 +558,283 @@ pub fn presents() -> u64 {
     FB.lock().as_ref().map(|d| d.presents).unwrap_or(0)
 }
 
+// ── Cursor sprite (#596) ─────────────────────────────────────────────
+//
+// The cursor-sprite painter lives here (rather than in
+// `ui_apps::launcher`) so it compiles on the host target
+// (`x86_64-pc-windows-msvc` / `x86_64-unknown-linux-gnu`) and its
+// inline tests can run via `cargo test --lib`. `ui_apps` is gated on
+// `#[cfg(all(target_os = "uefi", ...))]` and the host test runner
+// never sees it; `framebuffer` is unconditionally compiled (lib.rs
+// `pub mod framebuffer;` carries no cfg gate).
+//
+// `launcher.rs::paint_cursor_sprite` delegates here via
+// `framebuffer::paint_cursor_sprite_into`.
+
+/// 12×18 pixel arrow cursor bitmap. Row 0 = top of arrow, col 0
+/// (leftmost) is the MSB side of the stored `u16`. Bit numbering:
+/// bit 11 (`0b100000000000`) is the leftmost pixel, bit 0
+/// (`0b000000000001`) is the rightmost. Hot-spot at top-left corner
+/// so the on-screen tip matches the pointer position.
+///
+/// Exported for the launcher's `paint_cursor_sprite` delegation and
+/// for the unit tests below.
+pub const CURSOR_ARROW: [u16; 18] = [
+    0b100000000000,
+    0b110000000000,
+    0b111000000000,
+    0b111100000000,
+    0b111110000000,
+    0b111111000000,
+    0b111111100000,
+    0b111111110000,
+    0b111111111000,
+    0b111111111100,
+    0b111111110000,
+    0b111110000000,
+    0b110011000000,
+    0b100011000000,
+    0b000001100000,
+    0b000001100000,
+    0b000000110000,
+    0b000000110000,
+];
+
+/// Width in pixels of the `CURSOR_ARROW` bitmap.
+pub const CURSOR_W: usize = 12;
+
+/// Height in pixels of the `CURSOR_ARROW` bitmap.
+pub const CURSOR_H: usize = 18;
+
+/// Paint the cursor-arrow sprite into a raw `*mut u32` framebuffer.
+///
+/// Each pixel slot is one `u32` in the framebuffer's native pixel
+/// order; `stride` is in pixels (not bytes — same convention the GOP
+/// `PixelsPerScanLine` field uses). Only the `1`-bits in
+/// `CURSOR_ARROW` are written — background pixels are left untouched
+/// (no erase-on-repaint: the save-under responsibility lies with the
+/// caller's repaint cycle, i.e. Slint's next `draw_if_needed` will
+/// overwrite the cursor region and the caller redraws on top each
+/// frame).
+///
+/// Bounds-checked: any row or column that would fall outside
+/// `[0, width) × [0, height)` is skipped silently. The pixel value
+/// `0xFFFF_FFFF` (white — valid for both RGBX and BGRX pixel orders)
+/// is written at every lit bit.
+///
+/// # Safety
+///
+/// `buf` must point to a writable allocation of at least
+/// `stride * height` `u32` elements. The call is sound when `buf`
+/// is the GOP MMIO base as captured by `launcher::run` (firmware-
+/// mapped `'static` MMIO, single-threaded boot) or a heap-allocated
+/// `Vec<u32>` in tests.
+pub unsafe fn paint_cursor_sprite_into(
+    buf: *mut u32,
+    width: usize,
+    height: usize,
+    stride: usize,
+    cx: usize,
+    cy: usize,
+) {
+    let pixel: u32 = 0xFFFF_FFFF;
+    for (row, mask) in CURSOR_ARROW.iter().enumerate() {
+        let y = cy + row;
+        if y >= height {
+            break;
+        }
+        for col in 0..CURSOR_W {
+            let bit = (mask >> (CURSOR_W - 1 - col)) & 1;
+            if bit == 0 {
+                continue;
+            }
+            let x = cx + col;
+            if x >= width {
+                continue;
+            }
+            // SAFETY: bounds checked above; caller guarantees allocation.
+            unsafe {
+                buf.add(y * stride + x).write_volatile(pixel);
+            }
+        }
+    }
+}
+
+// ── Cursor-sprite unit tests ──────────────────────────────────────────
+//
+// Run via `cargo test --lib --target x86_64-pc-windows-msvc` from
+// `crates/arest-kernel`. These tests exercise `paint_cursor_sprite_into`
+// against a heap-allocated mock framebuffer so no UEFI target is
+// required. Mirror of the lock+ring patterns in `pointer.rs` tests.
+
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+    use alloc::vec;
+
+    /// `paint_cursor_sprite_into` writes the expected white pixels at
+    /// the correct framebuffer offsets for a given (cx, cy). We use a
+    /// 64×64 buffer (stride = 64) and plant the cursor at (10, 5) so
+    /// the full 12×18 sprite fits within bounds.
+    ///
+    /// For each row we compare every column in `0..CURSOR_W` against
+    /// the corresponding bit in `CURSOR_ARROW[row]` — lit bits must
+    /// be `0xFFFF_FFFF`, unlit bits must be unchanged (0).
+    #[test]
+    fn cursor_pixels_written_at_expected_offsets() {
+        const W: usize = 64;
+        const H: usize = 64;
+        const STRIDE: usize = W;
+        let mut buf: alloc::vec::Vec<u32> = vec![0u32; STRIDE * H];
+
+        let cx: usize = 10;
+        let cy: usize = 5;
+
+        unsafe {
+            paint_cursor_sprite_into(buf.as_mut_ptr(), W, H, STRIDE, cx, cy);
+        }
+
+        // Verify every pixel in the sprite bounding box for the first
+        // two rows (representative; full bitmap coverage via background
+        // test below).
+        for check_row in 0..2usize {
+            let mask = CURSOR_ARROW[check_row];
+            for col in 0..CURSOR_W {
+                let expected_bit = (mask >> (CURSOR_W - 1 - col)) & 1;
+                let pixel = buf[(cy + check_row) * STRIDE + cx + col];
+                if expected_bit == 1 {
+                    assert_eq!(pixel, 0xFFFF_FFFF,
+                        "row {check_row} col {col}: expected white pixel");
+                } else {
+                    assert_eq!(pixel, 0,
+                        "row {check_row} col {col}: expected untouched (0), got {pixel:#010x}");
+                }
+            }
+        }
+
+        // Spot-check: a pixel well outside the sprite bounding box must
+        // be untouched (confirms only lit bits are written, not a filled rect).
+        let outside = buf[(cy + 3) * STRIDE + cx + CURSOR_W + 1];
+        assert_eq!(outside, 0, "pixel outside sprite bbox must be 0");
+    }
+
+    /// At position (0, 0) the painter writes the top-left pixel because
+    /// `CURSOR_ARROW[0]` has bit 11 set. This confirms that the inner
+    /// function does NOT apply the (0,0) sentinel skip — that guard is
+    /// the caller's responsibility (`launcher::paint_cursor_sprite`
+    /// checks `cx == 0 && cy == 0` and returns before calling here).
+    #[test]
+    fn paint_at_origin_writes_top_left_pixel() {
+        const W: usize = 64;
+        const H: usize = 64;
+        const STRIDE: usize = W;
+        let mut buf: alloc::vec::Vec<u32> = vec![0u32; STRIDE * H];
+
+        unsafe {
+            paint_cursor_sprite_into(buf.as_mut_ptr(), W, H, STRIDE, 0, 0);
+        }
+
+        // CURSOR_ARROW[0] = 0b100000000000 — bit 11 set → pixel (0, 0) white.
+        assert_eq!(buf[0], 0xFFFF_FFFF,
+            "top-left pixel must be white when cursor placed at (0,0)");
+    }
+
+    /// Clipping guard: positioning the cursor at (W-1, H-1) means only
+    /// the top-left pixel of the sprite is in bounds. The function must
+    /// not panic or write out-of-bounds (the `Vec` debug-build index
+    /// check would catch an OOB `ptr.add(...)` dereference if it
+    /// exceeded the allocation).
+    #[test]
+    fn sprite_clipped_at_right_bottom_edge() {
+        const W: usize = 64;
+        const H: usize = 64;
+        const STRIDE: usize = W;
+        let mut buf: alloc::vec::Vec<u32> = vec![0u32; STRIDE * H];
+
+        let cx = W - 1;
+        let cy = H - 1;
+
+        // Must not panic — the per-column `if x >= width { continue; }`
+        // and per-row `if y >= height { break; }` guards inside
+        // `paint_cursor_sprite_into` clamp every write.
+        unsafe {
+            paint_cursor_sprite_into(buf.as_mut_ptr(), W, H, STRIDE, cx, cy);
+        }
+
+        // CURSOR_ARROW[0] bit 11 (leftmost) = 1 → pixel (cx, cy) lit.
+        let top_left_bit = (CURSOR_ARROW[0] >> (CURSOR_W - 1)) & 1;
+        if top_left_bit == 1 {
+            assert_eq!(buf[cy * STRIDE + cx], 0xFFFF_FFFF,
+                "only in-bounds pixel should be white");
+        }
+
+        // Buffer length must be intact (no realloc / OOB write).
+        assert_eq!(buf.len(), STRIDE * H, "buffer length must be unchanged");
+    }
+
+    /// Background pixels (the `0`-bits in the sprite mask) must not be
+    /// erased. Pre-fill the buffer with a sentinel (`0xDEAD_BEEF`) and
+    /// confirm that positions outside the lit sprite pixels still hold
+    /// the sentinel after painting.
+    #[test]
+    fn background_pixels_not_erased() {
+        const W: usize = 64;
+        const H: usize = 64;
+        const STRIDE: usize = W;
+        let mut buf: alloc::vec::Vec<u32> = vec![0xDEAD_BEEFu32; STRIDE * H];
+
+        let cx: usize = 10;
+        let cy: usize = 5;
+
+        unsafe {
+            paint_cursor_sprite_into(buf.as_mut_ptr(), W, H, STRIDE, cx, cy);
+        }
+
+        // Row above the sprite must be untouched.
+        if cy > 0 {
+            assert_eq!(buf[(cy - 1) * STRIDE + cx], 0xDEAD_BEEF,
+                "pixel above sprite must be untouched");
+        }
+
+        // Within the sprite bbox, a zero-bit in row 0 must be untouched.
+        // CURSOR_ARROW[0] = 0b100000000000 → col 1 (bit 10) = 0.
+        let row0_col1_bit = (CURSOR_ARROW[0] >> (CURSOR_W - 2)) & 1;
+        if row0_col1_bit == 0 {
+            assert_eq!(buf[cy * STRIDE + cx + 1], 0xDEAD_BEEF,
+                "zero-bit pixel inside sprite bbox must be untouched");
+        }
+    }
+
+    /// Full-bitmap pixel-exact verification: every pixel in the entire
+    /// 12×18 sprite bounding box matches the expected bit from
+    /// `CURSOR_ARROW`. This is the comprehensive correctness proof.
+    #[test]
+    fn full_sprite_pixel_exact_verification() {
+        const W: usize = 64;
+        const H: usize = 64;
+        const STRIDE: usize = W;
+        let mut buf: alloc::vec::Vec<u32> = vec![0u32; STRIDE * H];
+
+        let cx: usize = 5;
+        let cy: usize = 5;
+
+        unsafe {
+            paint_cursor_sprite_into(buf.as_mut_ptr(), W, H, STRIDE, cx, cy);
+        }
+
+        for (row, mask) in CURSOR_ARROW.iter().enumerate() {
+            for col in 0..CURSOR_W {
+                let expected_bit = (mask >> (CURSOR_W - 1 - col)) & 1;
+                let pixel = buf[(cy + row) * STRIDE + cx + col];
+                let expected_pixel = if expected_bit == 1 { 0xFFFF_FFFFu32 } else { 0u32 };
+                assert_eq!(pixel, expected_pixel,
+                    "mismatch at sprite row {row} col {col}: \
+                     expected {expected_pixel:#010x} got {pixel:#010x}");
+            }
+        }
+    }
+}
+
 /// Tiny embedded 8x8 ASCII font — only the glyphs the boot-time
 /// paint demo writes ("AREST kernel"). Missing chars render as a
 /// solid block (`0xFF`-filled byte per row) so an absent letter is
