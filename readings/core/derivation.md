@@ -49,75 +49,70 @@ equivalence with the pre-#890 per-pair fanout is pinned by
 
 <!--
   Substrate-lift TODO (deletion plan for `compile_subtype_inheritance_metamodel`):
-  Task: subtype-join-antecedent
+  Epic: subtype-join-antecedent
 
-  The rule above is the FORML 2 form of what
-  `crates/arest/src/compile.rs::compile_subtype_inheritance_metamodel`
-  (~lines 6692-6779) synthesises procedurally. Once the parser learns
-  to lift derivation antecedents that quantify over the METAMODEL cells
-  (`Subtype`, `FactType`, `Role`, `Noun`) — not just user-declared FTs —
-  the Rust synthesiser becomes pure ceremony and can be retired.
+  Children 1 (parse) and 2 (compile) are DONE:
+    * Child 1 (task-978): `try_classify_metamodel_clause` in `parse_forml2.rs`
+      now recognises `some Subtype has subtype Sub` as `FactType("Subtype")`.
+    * Child 2 (task-979): `compile_explicit_derivation` now handles
+      `ConsequentCellSource::AntecedentRole` (consequent cell id from a role
+      value on an antecedent fact).
 
-  Child-task breakdown (subtype-join-antecedent epic):
+  Child 3 (task-980): SCOPE GUARD TRIGGERED — GAP CONFIRMED.
+  The end-to-end derivation does NOT yet match the procedural oracle.
+  `compile_subtype_inheritance_metamodel` is RETAINED.
 
-  Child 1 — parse: recognise metamodel-cell antecedents in derivation rule bodies
-    File: crates/arest/src/parse_forml2.rs::resolve_derivation_rule
-    What: `Subtype`, `FactType`, `Role` referenced in rule antecedents must
-    resolve to `AntecedentSource::FactType("<cell_name>")` rather than landing
-    as `UnresolvedClause`. Today these fall through `// (1) Comparator-stripped
-    FT lookup` because the metamodel cells are NOT in the declared-FT catalog
-    of a user reading set.
-    HOW: the `SchemaCatalog` receives a flag / supplemental map of metamodel
-    cells so `resolve_fact_type` can match them; the resolved antecedent
-    sources are `FactType("Subtype")`, `FactType("FactType")`, etc.
-    Acceptance: a rule body `iff some Subtype has subtype Sub and ...` parses
-    with `antecedent_sources = [FactType("Subtype")]` and zero unresolved clauses.
+  Three precise gaps remain before Child 3 can complete (retire):
 
-  Child 2 — compile: AntecedentRole consequent cell in compile_explicit_derivation
-    File: crates/arest/src/compile.rs::compile_explicit_derivation
-    What: the consequent cell id `ft_id` is itself a BINDING from an antecedent
-    fact — specifically the `FactType.id` binding from the antecedent
-    `Fact Type has that Role` clause. Today the compiler expects ft_id to be a
-    compile-time-known literal (`ConsequentCellSource::Literal(ft_id)`). For the
-    metamodel rule the cell-source must be `AntecedentRole { antecedent_index,
-    role: "id" }` (or equivalent).
-    Acceptance: a rule with `consequent_cell = AntecedentRole { ... }` compiles
-    to a `CompiledDerivation` whose Func emits `<antecedent_ft_id, reading,
-    bindings>` tuples for each matching antecedent combination.
+  Gap A — CONSEQUENT RESOLUTION (parse):
+    The head "Fact Type has inherited Resource at Role" contains metamodel
+    nouns ("Fact Type", "Resource") not in the user-declared noun catalog.
+    `resolve_consequent_strict` in `parse_forml2.rs::resolve_derivation_rule`
+    returns `None` => consequent_cell = Literal("") => rule is DROPPED.
+    Fix: teach the parser to recognise the metamodel-noun consequent pattern
+    and emit `ConsequentCellSource::AntecedentRole { antecedent_index: <FactType>, role: "id" }`.
 
-  Child 3 — retire: delete compile_subtype_inheritance_metamodel
-    Prerequisite: children 1 AND 2 are DONE and the reading above parses +
-    compiles into a single CompiledDerivation that produces the same emission as
-    the procedural synthesiser.
-    What to delete:
-      * `compile_subtype_inheritance_metamodel` (compile.rs ~6692-6779)
-      * `SUBTYPE_INHERITANCE_ID` constant (compile.rs ~6787)
-      * synthetic-id branch in `compile_to_defs_state` that keys `_subtype_
-        inheritance` into every subtype's relevance set (compile.rs ~1907-1942)
-      * direct call to `compile_subtype_inheritance_metamodel` (compile.rs ~4020)
-    Keep: `crates/arest/tests/subtype_metamodel_rule_e2e.rs` (verifies emission
-    shape, not the lift mechanism) and the new tests in
-    `compile_explicit_derivation_tests.rs` (subtype_is_a_clause_* tests).
+  Gap B — FACTTYPE ANTECEDENT (parse):
+    The `that Fact Type has that Role` and `that Role is played by Sup` clauses
+    are silently skipped by step (13) of `resolve_derivation_rule` (anaphoric
+    form). Only one antecedent survives: `FactType("Subtype")`. But the Subtype
+    facts carry {subtype, supertype} — neither is a FactType id. A second
+    antecedent `FactType("FactType")` (or a correlated join filter on the Sup
+    binding) is needed so the Func can select the FTs where Sup plays a role.
 
-  Cascading callers (BLOCKING — `compile_subtype_inheritance_metamodel`
-  has non-synthesiser consumers, so the lift is option-6 "document and
-  stop" until children 1 and 2 land):
-    * `compile_to_defs_state` `derivation_index` synthetic-id fallback
-      (compile.rs ~1737, ~1907) — needs to know "this id covers every
-      subtype". Once the rule is parser-lifted to a normal
-      CompiledDerivation, the index keys it from its bindings instead
-      of the synthetic-id allowlist.
-    * `compile_derivations` direct call (compile.rs ~4020).
+  Gap C — PER-INSTANCE FANOUT (parse + compile/eval):
+    The `that Resource is instance of Sub` clause drives per-instance fanout
+    inside the synthesiser's inner Funcs via `InstancesOfNoun(sub)`. With only
+    the Subtype antecedent, no instance bindings exist. A third antecedent
+    `InstancesOfNoun(<Sub-binding>)` — where the noun comes from the bound Sub
+    variable of the first antecedent — is needed.
 
-  Current state pinned by:
-    * `crates/arest/src/compile_explicit_derivation_tests.rs::
-       subtype_is_a_clause_in_rule_antecedent_is_not_unresolved`
-       (pins that X is a Y doesn't produce UnresolvedClause)
-    * `crates/arest/src/compile_explicit_derivation_tests.rs::
+  RECOMMENDED CHILD 4 (follow-up task, subtype-join-antecedent):
+    a. Detect the metamodel-consequent head pattern in `resolve_derivation_rule`
+       and emit `ConsequentCellSource::AntecedentRole { antecedent_index: <FactType>, role: "id" }`.
+    b. Resolve `that Fact Type has that Role` as a second antecedent
+       `FactType("FactType")` with a correlated join filter on the Sup binding.
+    c. Resolve `that Resource is instance of Sub` as `InstancesOfNoun(<Sub-binding>)`.
+    Acceptance: `task980_e2e_gap_confirmed_synthesiser_retained` (currently
+    confirming the gap) must be UPDATED to assert that the reading-lift path
+    independently produces Vehicle '1' in Vehicle_has_Color, AND then the
+    synthesiser can be deleted.
+
+  What to delete when Child 4 closes the gaps:
+    * `compile_subtype_inheritance_metamodel` (compile.rs ~6692-6779)
+    * `SUBTYPE_INHERITANCE_ID` constant (compile.rs ~6787)
+    * synthetic-id branch in `compile_to_defs_state` that keys `_subtype_
+      inheritance` into every subtype's relevance set (compile.rs ~1927-1938)
+    * direct call to `compile_subtype_inheritance_metamodel` (compile.rs ~4020)
+  Keep: `crates/arest/tests/subtype_metamodel_rule_e2e.rs` and existing tests.
+
+  Pins (current task-980 state):
+    * `compile_explicit_derivation_tests.rs::task980_e2e_gap_confirmed_synthesiser_retained`
+      (pins the three-part gap; updated to a positive assertion when Child 4 lands)
+    * `compile_explicit_derivation_tests.rs::
        subtype_inheritance_derivation_reading_text_in_derivation_md_is_present_and_facts_derive`
-       (pins the procedural-path behavior + verifies the reading text exists)
-    * `crates/arest/tests/subtype_metamodel_rule_e2e.rs`
-       (pins the full E2E emission shape)
+       (oracle: procedural path still works)
+    * `crates/arest/tests/subtype_metamodel_rule_e2e.rs` (E2E emission shape)
 -->
 
 ## SS Subset-Constraint auto-fill (#891 — replaces the per-SS-Constraint Rust loop)
