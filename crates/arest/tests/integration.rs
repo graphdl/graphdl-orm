@@ -344,17 +344,29 @@ fn test_full_pipeline_uniqueness_violation() {
     let ir: Domain = serde_json::from_str(ir_json).unwrap();
     let state = domain_to_state(&ir);
     let defs = compile::compile_to_defs_state(&state);
-    let d = build_d(&defs, &ast::Object::phi());
+    let _d = build_d(&defs, &ast::Object::phi());
 
-    // Customer c1 has two names -> UC violation
-    let mut pop_state = ast::Object::phi();
-    pop_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Customer", "c1"), ("Name", "Alice")]), &pop_state);
-    pop_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Customer", "c1"), ("Name", "Bob")]), &pop_state);
-
-    let violations = evaluate_constraints(&defs, &d, "", None, &pop_state);
-    assert_eq!(violations.len(), 1);
-    assert!(violations[0].detail.contains("Uniqueness violation"));
-    assert_eq!(violations[0].constraint_id, "c1");
+    // task-744 / task-820 / task-822: alethic non-spanning UC enforcement
+    // moved from constraint-evaluation time INTO the cell write. The FT
+    // cell `ft1` is registered Map-keyed by its scope role `Customer`
+    // (see `_CellKeyRoles`), so `compile_uniqueness_ast` lowers the UC to
+    // a structural no-op (`Func::constant(φ)`) — evaluating the compiled
+    // constraint over a Seq population built with `cell_push` will NEVER
+    // report a violation (that path is deliberately retired). The UC is
+    // now enforced when a second tuple lands at the same scope key:
+    // `cell_put_keyed` returns `Err(KeyConflict)`, which the apply path
+    // renders as "Uniqueness violation: key '…' is not unique in …".
+    let key = ["Customer"];
+    let s0 = ast::cell_put_keyed("ft1", &key,
+        ast::fact_from_pairs(&[("Customer", "c1"), ("Name", "Alice")]),
+        &ast::Object::phi())
+        .expect("first write at a fresh scope key must succeed");
+    // Customer c1 gets a SECOND, different Name -> UC conflict at key 'c1'.
+    let conflict = ast::cell_put_keyed("ft1", &key,
+        ast::fact_from_pairs(&[("Customer", "c1"), ("Name", "Bob")]), &s0)
+        .expect_err("second tuple at the same scope key must raise a UC conflict");
+    assert_eq!(conflict.key, "c1", "conflict key is the duplicated Customer scope value");
+    assert_eq!(conflict.name, "ft1", "conflict is on the ft1 cell");
 }
 
 // --- Dual-instance convergence tests (Definition 2) ---
@@ -438,29 +450,36 @@ fn test_dual_instance_concurrent_write_conflict() {
     let ir: Domain = serde_json::from_str(ir_json).unwrap();
     let ir_state = domain_to_state(&ir);
     let defs = compile::compile_to_defs_state(&ir_state);
-    let d = build_d(&defs, &ast::Object::phi());
+    let _d = build_d(&defs, &ast::Object::phi());
 
-    // Client A's local view
-    let mut client_a_state = ast::Object::phi();
-    client_a_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "acme")]), &client_a_state);
+    // task-744 / task-820 / task-822: the UC on `ft1` ("Order was placed
+    // by exactly one Customer") is enforced at the cell write, keyed by
+    // the scope role `Order`, not at constraint-evaluation time (which is
+    // a lowered no-op for Map-keyed UCs). Each client's local single-fact
+    // write succeeds; the server's merge of two different Customers for
+    // the same Order surfaces the conflict via `cell_put_keyed`.
+    let key = ["Order"];
 
-    // Client B's local view
-    let mut client_b_state = ast::Object::phi();
-    client_b_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "beta")]), &client_b_state);
+    // Client A's local view: one Order→Customer fact. Valid.
+    let client_a = ast::cell_put_keyed("ft1", &key,
+        ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "acme")]),
+        &ast::Object::phi())
+        .expect("Client A's local view is valid (single fact at key)");
 
-    let a_violations = evaluate_constraints(&defs, &d, "", None, &client_a_state);
-    let b_violations = evaluate_constraints(&defs, &d, "", None, &client_b_state);
-    assert!(a_violations.is_empty(), "Client A's local view is valid");
-    assert!(b_violations.is_empty(), "Client B's local view is valid");
+    // Client B's local view: a different Customer for the same Order, but
+    // in B's OWN state it is the only fact, so it is locally valid.
+    let _client_b = ast::cell_put_keyed("ft1", &key,
+        ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "beta")]),
+        &ast::Object::phi())
+        .expect("Client B's local view is valid (single fact at key)");
 
-    // Server merges both writes
-    let mut merged_state = ast::Object::phi();
-    merged_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "acme")]), &merged_state);
-    merged_state = ast::cell_push("ft1", ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "beta")]), &merged_state);
-
-    let server_violations = evaluate_constraints(&defs, &d, "", None, &merged_state);
-    assert_eq!(server_violations.len(), 1, "Server detects the conflict");
-    assert!(server_violations[0].detail.contains("Uniqueness violation"));
+    // Server merges both writes: writing B's fact on top of A's state
+    // collides at key 'ord-1' — the concurrent-write conflict is detected.
+    let conflict = ast::cell_put_keyed("ft1", &key,
+        ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "beta")]), &client_a)
+        .expect_err("Server detects the conflict at the merged key");
+    assert_eq!(conflict.key, "ord-1", "conflict key is the shared Order scope value");
+    assert_eq!(conflict.name, "ft1", "conflict is on the ft1 cell");
 }
 
 #[test]

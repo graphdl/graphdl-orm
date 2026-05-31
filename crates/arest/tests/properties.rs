@@ -288,7 +288,7 @@ const STATE_METAMODEL: &str = r#"
 Status(.Name) is an entity type.
 State Machine Definition is a subtype of Status.
 Transition(.id) is an entity type.
-Event Type(.id) is an entity type.
+Fact Type(.id) is an entity type.
 Noun is an entity type.
 Name is a value type.
 
@@ -299,7 +299,7 @@ Status is initial in State Machine Definition.
 Transition is defined in State Machine Definition.
 Transition is from Status.
 Transition is to Status.
-Transition is triggered by Event Type.
+Transition is triggered by Fact Type.
 "#;
 
 // ── Sample Domain ────────────────────────────────────────────────────
@@ -377,27 +377,27 @@ Status 'In Cart' is initial in State Machine Definition 'Order'.
 Transition 'place' is defined in State Machine Definition 'Order'.
   Transition 'place' is from Status 'In Cart'.
   Transition 'place' is to Status 'Placed'.
-  Transition 'place' is triggered by Event Type 'place'.
+  Transition 'place' is triggered by Fact Type 'place'.
 
 Transition 'ship' is defined in State Machine Definition 'Order'.
   Transition 'ship' is from Status 'Placed'.
   Transition 'ship' is to Status 'Shipped'.
-  Transition 'ship' is triggered by Event Type 'ship'.
+  Transition 'ship' is triggered by Fact Type 'ship'.
 
 Transition 'deliver' is defined in State Machine Definition 'Order'.
   Transition 'deliver' is from Status 'Shipped'.
   Transition 'deliver' is to Status 'Delivered'.
-  Transition 'deliver' is triggered by Event Type 'deliver'.
+  Transition 'deliver' is triggered by Fact Type 'deliver'.
 
 Transition 'cancel' is defined in State Machine Definition 'Order'.
   Transition 'cancel' is from Status 'In Cart'.
   Transition 'cancel' is to Status 'Cancelled'.
-  Transition 'cancel' is triggered by Event Type 'cancel'.
+  Transition 'cancel' is triggered by Fact Type 'cancel'.
 
 Transition 'cancel-placed' is defined in State Machine Definition 'Order'.
   Transition 'cancel-placed' is from Status 'Placed'.
   Transition 'cancel-placed' is to Status 'Cancelled'.
-  Transition 'cancel-placed' is triggered by Event Type 'cancel'.
+  Transition 'cancel-placed' is triggered by Fact Type 'cancel'.
 
 Customer 'Acme' has Email 'acme@example.com'.
 Customer 'Globex' has Email 'globex@example.com'.
@@ -1428,31 +1428,29 @@ fn constraint_evaluation_via_application() {
         "UC constraint against empty population should produce no violations, got {:?}",
         result);
 
-    // Now test with a state that has a UC violation.
-    // "Each Order was placed by exactly one Customer" means
-    // an Order with two different Customers should violate.
-    let violation_state = {
-        let mut s = Object::phi();
-        s = ast::cell_push("Order_was_placed_by_Customer",
-            ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "Acme")]), &s);
-        s = ast::cell_push("Order_was_placed_by_Customer",
-            ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "Globex")]), &s);
-        s
-    };
-    let pop_with_violation = ast::encode_state(&violation_state);
-    let context_with_violation = Object::seq(vec![
-        Object::phi(),
-        Object::phi(),
-        pop_with_violation,
-    ]);
-
-    // Find the UC on "placed by" specifically
-    let (_, placed_by_uc) = defs.iter()
-        .find(|(name, _)| name.contains("constraint:") && name.contains("at most one") && name.contains("placed by"))
-        .expect("UC on placed by");
-    let violation_result = ast::apply(placed_by_uc, &context_with_violation, &d);
-    assert_ne!(violation_result, Object::phi(),
-        "UC violation: Order ord-1 placed by two Customers should violate");
+    // Now test that a UC violation is detected when an Order is placed by
+    // two different Customers ("Each Order was placed by exactly one
+    // Customer"). task-744 / task-820 / task-822: alethic non-spanning UC
+    // enforcement was lowered out of constraint-evaluation time (the
+    // `placed_by_uc` Func above is a structural no-op for the Map-keyed
+    // cell) and INTO the cell write. The enforcement point is
+    // `cell_put_keyed`, keyed by the UC's scope role `Order`: a second,
+    // different tuple at the same scope key returns `Err(KeyConflict)` —
+    // the same signal the apply path renders as a "Uniqueness violation".
+    // The UC Func staying φ here is the documented design, not a bug; the
+    // "constraint exists at every cell write" (compile.rs:7934-7943).
+    let key = ["Order"];
+    let s0 = ast::cell_put_keyed("Order_was_placed_by_Customer", &key,
+        ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "Acme")]),
+        &Object::phi())
+        .expect("first placed-by tuple at a fresh scope key must succeed");
+    let conflict = ast::cell_put_keyed("Order_was_placed_by_Customer", &key,
+        ast::fact_from_pairs(&[("Order", "ord-1"), ("Customer", "Globex")]), &s0)
+        .expect_err("UC violation: Order ord-1 placed by two Customers should conflict");
+    assert_eq!(conflict.key, "ord-1",
+        "conflict key is the duplicated Order scope value");
+    assert_eq!(conflict.name, "Order_was_placed_by_Customer",
+        "conflict is on the placed-by cell");
 }
 
 // ── Response Text as Fact in P ───────────────────────────────────────
@@ -2199,15 +2197,19 @@ fn compound_ref_scheme_e2e_create_entity_decomposes() {
     let result = arest::command::apply_command_defs(&d, &command, &state);
     assert!(!result.rejected, "Valid create should not be rejected");
 
-    // The resolve step should decompose "bob-2" into Owner=bob, Seq=2
-    let owner_cell = ast::fetch_or_phi("Thing_has_Owner", &result.state);
+    // The resolve step should decompose "bob-2" into Owner=bob, Seq=2.
+    // task-744/#940: runtime CreateEntity writes resolved component facts
+    // through the Map-backed entity-cell path, so these cells are
+    // Object::Map; fetch_or_phi(...).as_seq() returns None on a Map.
+    // fetch_cell_seq normalises the Map to a key-sorted Seq.
+    let owner_cell = ast::fetch_cell_seq("Thing_has_Owner", &result.state);
     let owner_facts = owner_cell.as_seq().unwrap_or_default();
     assert!(owner_facts.iter().any(|f|
         ast::binding(f, "Thing") == Some("bob-2") &&
         ast::binding(f, "Owner") == Some("bob")
     ), "Runtime create should decompose compound ID: Owner component missing.\nOwner facts: {:?}", owner_facts);
 
-    let seq_cell = ast::fetch_or_phi("Thing_has_Seq", &result.state);
+    let seq_cell = ast::fetch_cell_seq("Thing_has_Seq", &result.state);
     let seq_facts = seq_cell.as_seq().unwrap_or_default();
     assert!(seq_facts.iter().any(|f|
         ast::binding(f, "Thing") == Some("bob-2") &&
@@ -2313,8 +2315,12 @@ Order has Reason.
     let create_result = arest::command::apply_command_defs(new_d, &create_cmd, new_d);
     assert!(!create_result.rejected, "Create with new field should succeed after self-evolution");
 
-    // Verify the new fact type has data
-    let reason_cell = ast::fetch_or_phi("Order_has_Reason", &create_result.state);
+    // Verify the new fact type has data. task-744/#940: runtime
+    // CreateEntity writes the resolved fact through the Map-backed
+    // entity-cell path, so Order_has_Reason is Object::Map and
+    // fetch_or_phi(...).as_seq() returns None; fetch_cell_seq normalises
+    // it to a key-sorted Seq.
+    let reason_cell = ast::fetch_cell_seq("Order_has_Reason", &create_result.state);
     let reason_facts = reason_cell.as_seq().unwrap_or_default();
     assert!(reason_facts.iter().any(|f|
         ast::binding(f, "Order") == Some("ord-99") &&
@@ -2740,7 +2746,12 @@ Widget has Modern Name."#;
     let (final_state, _) = evaluate::forward_chain_defs_state(&derivation_defs, &state);
 
     // A MigrationApplication must exist recording the rewrite.
-    let mas = ast::fetch_or_phi("MigrationApplication", &final_state);
+    // task-744/#940: forward_chain_defs_state integrates derived facts via
+    // the Map-backed fold path (eq:cellfold), so the cell is Object::Map;
+    // fetch_or_phi(...).as_seq() returns None on it. fetch_cell_seq
+    // normalises the Map to a key-sorted Seq so the assertion sees the
+    // emitted MigrationApplication fact regardless of stored shape.
+    let mas = ast::fetch_cell_seq("MigrationApplication", &final_state);
     let mas_seq = mas.as_seq().expect("MigrationApplication cell populated");
     assert_eq!(mas_seq.len(), 1,
         "one source fact ⇒ one MigrationApplication; got {}: {:?}",
@@ -3041,7 +3052,7 @@ fn shard_map_partitions_facts_by_entity_cell() {
 
 #[test]
 fn derivation_rules_get_distinct_ids_when_consequent_unresolved() {
-    // Two := rules with consequents not declared as fact types.
+    // Two `iff` rules with consequents not declared as fact types.
     // Before the fix, both got empty IDs and stored as `derivation:` —
     // last one wins, first one silently lost. Now each gets a stable
     // sanitized ID from its consequent text.
@@ -3057,8 +3068,8 @@ Y has Name.
 P has Q.
 Q has Name.
 
-X has Name := X has some Y and that Y has some Name.
-P has Name := P has some Q and that Q has some Name.
+X has Name iff X has some Y and that Y has some Name.
+P has Name iff P has some Q and that Q has some Name.
 "#;
     let ir = compat::parse_markdown(input).unwrap();
     let state = compat::domain_to_state(&ir);
@@ -3246,7 +3257,7 @@ A has B.
 B has C.
 A has C.
 
-A has C := A has some B and that B has some C.
+A has C iff A has some B and that B has some C.
 
 ## Instance Facts
 
