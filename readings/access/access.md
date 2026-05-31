@@ -47,6 +47,20 @@ User performs Operation on Noun.
 Operation applies in View Context.
   Each Operation applies in exactly one View Context.
 
+## Instance Facts
+
+The CRUDL verbs and the HATEOAS resource kind each shows up in. The iFactr
+ActionType / Control Kind / Request Type decoration of these same Operations
+lives in readings/ui/crudl.md (gated by `ui-readings`); the view-context
+applicability is SUBSTRATE and stays here.
+
+Operation 'create' applies in View Context 'collection'.
+Operation 'edit' applies in View Context 'instance'.
+Operation 'delete' applies in View Context 'instance'.
+Operation 'multi-delete' applies in View Context 'collection'.
+Operation 'save' applies in View Context 'edit'.
+Operation 'cancel' applies in View Context 'edit'.
+
 ## Derivation Rules
 
 The permission predicate: a User is authorized for an Operation on a Noun when the

@@ -295,6 +295,13 @@ ingest-readings = []
 # by default so a Cloudflare Worker doing pure CRM doesn't bake in
 # design-token / render-tree definitions it never references.
 ui-readings = []
+# `access-readings` — pulls in readings/access/access.md, the access-
+# control SUBSTRATE: Operation / Access Level / View Context, the
+# `User is authorized for Operation on Noun **` discriminator-join
+# derivation, and the alethic `performs ⊆ authorized` subset constraint.
+# Authorization is server-enforced (no UI), so it is ON BY DEFAULT —
+# every host that mutates state needs the permission gate.
+access-readings = []
 # `os-readings` (#437) — pulls in readings/os/filesystem.md. Enabled
 # only when AREST runs as the kernel (VFS + block device + process
 # semantics actually have a referent). Hosted workers leave this off.
@@ -321,7 +328,7 @@ wine = []
 # panics (wasm32 has no Date.now import) or is unavailable (kernel) — those
 # builds get the total, panic-free `now`-returns-Bottom path.
 wall-clock = []
-default = ["wit", "debug-def", "std-deps", "parallel", "core", "evolution-readings", "imports-readings", "ingest-readings", "ui-readings", "os-readings", "templates", "wall-clock"]
+default = ["wit", "debug-def", "std-deps", "parallel", "core", "evolution-readings", "imports-readings", "ingest-readings", "ui-readings", "access-readings", "os-readings", "templates", "wall-clock"]
 wit = ["dep:wit-bindgen"]
 # cloudflare: Cloudflare Worker build profile. The worker invokes
 # `wasm-pack build --target bundler --no-default-features --features
@@ -350,6 +357,7 @@ cloudflare = [
     "imports-readings",
     "ingest-readings",
     "ui-readings",
+    "access-readings",
     "templates",
 ]
 local = ["dep:rusqlite"]

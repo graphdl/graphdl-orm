@@ -1132,6 +1132,19 @@ pub const UI_READINGS: &[(&str, &str)] = &[
     ("view-detail",      include_str!("../../../readings/ui/view-detail.md")),
 ];
 
+/// Access-control SUBSTRATE (server-enforced, no UI). Declares Operation /
+/// Access Level / View Context, derives `User is authorized for Operation on
+/// Noun **` from the access-level discriminator join, and enforces the alethic
+/// `performs ⊆ authorized` subset constraint on the mutation path. ON BY
+/// DEFAULT — every host that mutates state needs the permission gate; the
+/// HATEOAS CRUDL menu (command::crudl_menu_operations) projects `authorized`
+/// ∩ `Operation applies in View Context`. The iFactr ActionType decoration of
+/// these Operations lives in readings/ui/crudl.md (gated by `ui-readings`).
+#[cfg(feature = "access-readings")]
+pub const ACCESS_READINGS: &[(&str, &str)] = &[
+    ("access",           include_str!("../../../readings/access/access.md")),
+];
+
 /// OS-only nouns. Included only when AREST runs as the kernel, where
 /// VFS / block-device / process semantics actually have a referent.
 /// Hosted Cloudflare Workers leave this slice off.
@@ -1187,6 +1200,12 @@ pub fn metamodel_readings() -> Vec<&'static (&'static str, &'static str)> {
     { out.extend(INGEST_READINGS.iter()); }
     #[cfg(feature = "templates")]
     { out.extend(TEMPLATE_READINGS.iter()); }
+    // access BEFORE ui: access.md declares `Operation` + `Operation applies in
+    // View Context`, which readings/ui/crudl.md (in UI_READINGS) references for
+    // its iFactr decoration — the substrate must land first so the reference
+    // resolves slice-by-slice.
+    #[cfg(feature = "access-readings")]
+    { out.extend(ACCESS_READINGS.iter()); }
     #[cfg(feature = "ui-readings")]
     { out.extend(UI_READINGS.iter()); }
     #[cfg(feature = "os-readings")]

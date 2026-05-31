@@ -4902,23 +4902,30 @@ ViewElement has Component Role. *
 // crudl-menu-projection: the CRUDL operation catalog (readings/ui/crudl.md) is
 // the iFactr ActionType vocabulary (Add/Edit/Delete/Submit/Cancel from
 // iFactr-Android/iFactr.UI Controls/ActionType.cs) imported DIRECTLY as
-// predicate facts — the data foundation for the permission-gated menu
-// derivation. Pins that the reading is valid FORML2 that compiles, with the
-// Operation entity type declared and the six operations present.
+// predicate facts — the iFactr DECORATION over the access-control `Operation`.
+// Post-split (2026-05-30) `Operation(.Name)` itself is the access SUBSTRATE
+// (readings/access/access.md); crudl.md REFERENCES it and only pins the per-verb
+// iFactr metadata. So this compiles the bundle pair (access BEFORE ui, exactly
+// as lib.rs assembles them) and pins that `Operation` resolves and the six
+// operations carry their iFactr decoration.
 #[test]
 fn crudl_operation_catalog_parses_and_compiles_grounded_in_ifactr() {
-    let src = include_str!("../../../readings/ui/crudl.md");
-    let state = parse_to_state(src).expect("crudl.md must parse as valid FORML2");
+    let src = format!("{}\n{}",
+        include_str!("../../../readings/access/access.md"),
+        include_str!("../../../readings/ui/crudl.md"));
+    let state = parse_to_state(&src).expect("access.md + crudl.md must parse as valid FORML2");
     // Compiles without checker errors (structural validity of the catalog schema).
     let _defs = compile::compile_to_defs_state(&state);
-    // The Operation entity type is declared (grounded in iFactr ActionType).
+    // The Operation entity type is declared by the access substrate (access.md);
+    // crudl.md references it. Resolves in the combined source.
     let nouns: Vec<String> = ast::fetch_cell_seq("Noun", &state).as_seq()
         .map(|items| items.iter()
             .filter_map(|f| ast::binding(f, "name").map(String::from)).collect())
         .unwrap_or_default();
     assert!(nouns.iter().any(|n| n == "Operation"),
-        "crudl.md must declare the Operation entity type; got {:?}", nouns);
-    // The six CRUDL operations are present as instance-fact subjects.
+        "access.md must declare the Operation entity type crudl.md decorates; got {:?}", nouns);
+    // The six CRUDL operations are present as instance-fact subjects — they carry
+    // their iFactr decoration in crudl.md (and applies-in-context in access.md).
     let inst = ast::fetch_cell_seq("InstanceFact", &state);
     let subjects: Vec<String> = inst.as_seq()
         .map(|items| items.iter()
@@ -4926,7 +4933,7 @@ fn crudl_operation_catalog_parses_and_compiles_grounded_in_ifactr() {
         .unwrap_or_default();
     for op in ["create", "edit", "delete", "multi-delete", "save", "cancel"] {
         assert!(subjects.iter().any(|s| s == op),
-            "crudl.md must declare Operation '{op}' (grounded in iFactr ActionType); \
+            "Operation '{op}' (grounded in iFactr ActionType) must be present; \
              got subjects {:?}", subjects);
     }
 }
@@ -5403,24 +5410,31 @@ NounName is a value type.
 // is retired). Proves the emission through the function the get/list response calls.
 #[test]
 fn crudl_menu_operations_emits_gated_menu_for_user() {
+    // Operation + `Operation applies in View Context` (+ its per-op instances) and
+    // `User is authorized for Operation on Noun` are the access SUBSTRATE
+    // (access.md); the iFactr Control Kind / Request Type decoration is crudl.md.
+    // The emission reads `authorized` ∩ applies-in-context, so include BOTH —
+    // exactly as the bundle assembles them (access BEFORE ui). User/Noun are core
+    // stand-ins (in the bundle they come from readings/core).
     let additions = r#"
 User(.Username) is an entity type.
 Username is a value type.
 Noun(.NounName) is an entity type.
 NounName is a value type.
-
-## Fact Types
-User is authorized for Operation on Noun.
 "#;
-    let src = format!("{}\n{}", include_str!("../../../readings/ui/crudl.md"), additions);
-    let state = parse_to_state(&src).expect("crudl.md + authz FT parse");
+    let src = format!("{}\n{}\n{}",
+        include_str!("../../../readings/access/access.md"),
+        include_str!("../../../readings/ui/crudl.md"),
+        additions);
+    let state = parse_to_state(&src).expect("access.md + crudl.md + core stand-ins parse");
     let defs = compile::compile_to_defs_state(&state);
     let d0 = ast::defs_to_state(&defs, &state);
     let push = |s, cell: &str, pairs: &[(&str, &str)]|
         ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
     // Substrate authz facts only -- crudl_menu_operations reads `authorized`
     // (User is authorized for Operation on Noun) ∩ `Operation applies in View
-    // Context` (the latter from crudl.md). alice is authorized for create + edit.
+    // Context` (both the access SUBSTRATE, from access.md). alice is authorized
+    // for create + edit.
     let d = {
         let s = d0.clone();
         let s = push(s, "User_is_authorized_for_Operation_on_Noun", &[("User", "alice"), ("Operation", "create"), ("Noun", "Task")]);
