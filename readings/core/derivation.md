@@ -48,10 +48,10 @@ equivalence with the pre-#890 per-pair fanout is pinned by
 `crates/arest/tests/subtype_metamodel_rule_e2e.rs`.
 
 <!--
-  Substrate-lift STATUS (task subtype-join-antecedent — COMPLETE as of task-981):
+  Substrate-lift STATUS (task subtype-join-antecedent — COMPLETE as of task-982):
   Epic: subtype-join-antecedent
 
-  Children 1-4 are ALL DONE:
+  All 5 children are DONE:
     * Child 1 (task-978): `try_classify_metamodel_clause` in `parse_forml2.rs`
       now recognises `some Subtype has subtype Sub` as `FactType("Subtype")`.
     * Child 2 (task-979): `compile_explicit_derivation` now handles
@@ -59,40 +59,34 @@ equivalence with the pre-#890 per-pair fanout is pinned by
       value on an antecedent fact).
     * Child 3 (task-980): SCOPE GUARD TRIGGERED — GAP CONFIRMED.
     * Child 4 (task-981): ALL THREE GAPS CLOSED.
+    * Child 5 (task-982): PROCEDURAL SYNTHESISER FALLBACK DELETED.
 
-  Three gaps that were confirmed in task-980 and closed in task-981:
+  Task-982 changes:
+    * `parse_to_state_via_stage12_impl` now injects the subtype-inheritance
+      derivation rule as a static `DerivationRule` cell fact (constant
+      `SUBTYPE_INHERITANCE_RULE_TEXT`, id `SUBTYPE_INHERITANCE_RULE_ID`)
+      into every parse output — so every compile path has the reading-lift
+      rule in the state without loading this file explicitly.
+    * The guarded direct call in `compile_derivations` is DELETED.
+    * `SUBTYPE_INHERITANCE_ID` constant is DELETED (superseded by the FNV
+      hash id `SUBTYPE_INHERITANCE_RULE_ID` in `parse_forml2_stage2.rs`).
+    * `compile_subtype_inheritance_metamodel` is RETAINED as an internal
+      helper called by `compile_explicit_derivation`'s reading-lift route.
+    * The `did == SUBTYPE_INHERITANCE_ID` fallback in `compile_to_defs_state`'s
+      derivation-index builder is DELETED.
 
-  Gap A RESOLVED (parse, task-981):
-    `resolve_derivation_rule` now detects "Fact Type has inherited … at Role"
-    (contains "inherited" + "fact type") and emits
-    `ConsequentCellSource::AntecedentRole { antecedent_index: 1, role: "id" }`.
+  Procedural→declarative lift: COMPLETE.
+    The FORML rule in this file IS the implementation.
+    `compile_subtype_inheritance_metamodel` performs the compile-time expansion
+    from the rule's antecedent pattern into per-(sub,sup,ft) Funcs — it is an
+    optimising compiler pass, not a procedural bypass.
 
-  Gap B RESOLVED (parse, task-981):
-    Step (13) now promotes `that Fact Type has that Role` to
-    `FactType("FactType")` when the consequent is AntecedentRole.
-
-  Gap C RESOLVED (parse + compile, task-981):
-    Step (13) now emits `InstancesOfNoun("@subtype_var:Sub")` for
-    `that Resource is instance of Sub` when the consequent is AntecedentRole.
-    `compile_explicit_derivation` detects the sentinel and routes to
-    `compile_subtype_inheritance_metamodel` which expands into per-(sub,sup,ft) Funcs.
-
-  RESULT: reading-lift path independently produces Vehicle '1' in Vehicle_has_Color.
-  Pinned by `task980_e2e_gap_confirmed_synthesiser_retained` (now POSITIVE assertion).
-
-  State of `compile_subtype_inheritance_metamodel` after task-981:
-    * Direct call in `compile_derivations` is NOW GUARDED — fires only when the
-      reading-lift rule is absent (parse paths that don't load derivation.md).
-    * `compile_subtype_inheritance_metamodel` is RETAINED as internal helper.
-    * `SUBTYPE_INHERITANCE_ID` is RETAINED for fallback derivation_index keying.
-  Full retire requires baking derivation.md into `parse_to_state_via_stage12`.
-
-  Pins (task-981 state):
+  Pins (task-982 state):
     * `compile_explicit_derivation_tests.rs::task980_e2e_gap_confirmed_synthesiser_retained`
       (POSITIVE assertion: reading-lift independently produces Vehicle '1')
     * `compile_explicit_derivation_tests.rs::
        subtype_inheritance_derivation_reading_text_in_derivation_md_is_present_and_facts_derive`
-       (oracle: procedural path still works)
+      (oracle: procedural path still works via reading-lift)
     * `crates/arest/tests/subtype_metamodel_rule_e2e.rs` (E2E emission shape)
 -->
 

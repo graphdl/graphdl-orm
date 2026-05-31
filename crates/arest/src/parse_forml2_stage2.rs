@@ -5811,6 +5811,27 @@ fn parse_to_state_via_stage12_impl(
     // negations, etc.) need them present.
     let per_field_cells = instance_fact_field_cells(&instance_fact_facts);
 
+    // task 982 (subtype-join-antecedent child 5): bake the subtype-inheritance
+    // derivation rule from readings/core/derivation.md into every parse path that
+    // declares at least one subtype.  This ensures the reading-lift route in
+    // `compile_explicit_derivation` fires — the procedural synthesiser's direct
+    // call in `compile_derivations` is deleted, and this injection is the only
+    // source of the rule for schemas that don't load derivation.md explicitly.
+    // Guard: inject only when the text declares at least one subtype, so schemas
+    // with no subtypes don't acquire an extra no-op derivation rule (avoids
+    // breaking test assertions that count exactly N user rules).
+    // Idempotent: skip if the rule is already present (user declared the verbatim
+    // derivation.md text, or a prior context merge already injected it).
+    let mut derivation_facts = derivation_facts;
+    if !subtype_facts.is_empty() {
+        let rule_id = SUBTYPE_INHERITANCE_RULE_ID;
+        if !derivation_facts.iter().any(|f| {
+            crate::ast::binding(f, "id") == Some(rule_id)
+        }) {
+            derivation_facts.push(subtype_inheritance_derivation_rule_fact());
+        }
+    }
+
     let mut map: HashMap<String, Object> = HashMap::new();
     map.insert("Noun".to_string(), Object::Seq(noun_facts.into()));
     map.insert("Subtype".to_string(), Object::Seq(subtype_facts.into()));
@@ -5853,6 +5874,37 @@ fn parse_to_state_via_stage12_impl(
             .or_insert_with(|| Object::Seq(facts.into()));
     }
     Ok(Object::Map(map.into()))
+}
+
+// task 982 — canonical text of the subtype-inheritance derivation rule from
+// readings/core/derivation.md (lines 27-30), after continuation-joining and
+// `*`-prefix + `.`-suffix stripping (the form stored in `DerivationRule.text`).
+// Every parse path that calls `parse_to_state_via_stage12_impl` now injects
+// this rule as a static fact so `compile_derivations` always sees the
+// reading-lift antecedent pattern and the procedural synthesiser fallback is
+// never needed.
+pub(crate) const SUBTYPE_INHERITANCE_RULE_TEXT: &str =
+    "Fact Type has inherited Resource at Role \
+     iff some Subtype has subtype Sub and that Subtype has supertype Sup \
+     and that Fact Type has that Role and that Role is played by Sup \
+     and that Resource is instance of Sub";
+
+/// FNV-1a 64-bit hash of `SUBTYPE_INHERITANCE_RULE_TEXT` — precomputed so
+/// the id is available as a `&str` constant without a runtime allocation.
+/// Must stay in sync with `derivation_rule_id`'s fnv1a64 implementation.
+pub(crate) const SUBTYPE_INHERITANCE_RULE_ID: &str = "rule_bdabc589693e5cb5";
+
+/// Build the static `DerivationRule` cell fact for the subtype-inheritance
+/// rule.  The `consequentFactTypeId` is left empty because the consequent
+/// is `AntecedentRole` (dynamic at runtime); `re_resolve_rules` /
+/// `resolve_derivation_rule` will fill in the full structured fields from
+/// the rule text when `cell_index_from_state` processes the state.
+fn subtype_inheritance_derivation_rule_fact() -> Object {
+    crate::ast::fact_from_pairs(&[
+        ("id",                   SUBTYPE_INHERITANCE_RULE_ID),
+        ("text",                 SUBTYPE_INHERITANCE_RULE_TEXT),
+        ("consequentFactTypeId", ""),
+    ])
 }
 
 /// task-737 — for every single-part reference-scheme entity-type

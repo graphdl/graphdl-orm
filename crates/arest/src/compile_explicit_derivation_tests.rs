@@ -6467,38 +6467,21 @@ ViewElement has Component Role. *
 //       and that Fact Type has that Role and that Role is played by Sup
 //       and that Resource is instance of Sub.
 //
-// Prerequisites for the FULL lift (scope guard — these engine changes are
-// blocking; the tests below pin current behavior + anchor the reading text):
-//
-//   A. Parser prerequisite (`resolve_derivation_rule` in parse_forml2.rs):
-//      antecedents whose FT references are metamodel cells (`Subtype`,
-//      `FactType`, `Role`) must resolve instead of falling through to
-//      `UnresolvedClause`. Today `Subtype` / `FactType` / `Role` are not
-//      in the declared-FT catalog of a user reading set so the clause lands
-//      as unresolved. Child task: "parse: recognise metamodel-cell antecedents
-//      (Subtype, FactType, Role) in derivation rule bodies".
-//
-//   B. Compiler prerequisite (`compile_explicit_derivation` in compile.rs):
-//      `ConsequentCellSource::AntecedentRole` — the ft_id of each inner
-//      consequent is bound from the antecedent `Fact Type` fact at
-//      evaluation time, not a compile-time literal. Today `compile_explicit_
-//      derivation` only handles the `Literal(ft_id)` path. Child task:
-//      "compile: handle AntecedentRole consequent cell in
-//      compile_explicit_derivation".
-//
-//   C. Once A and B land: delete `compile_subtype_inheritance_metamodel`
-//      (compile.rs ~6179-6249), the `SUBTYPE_INHERITANCE_ID` constant
-//      (~6257), the synthetic-id branch in `compile_to_defs_state`
-//      (~1907) that keys this id, and the call site at ~3935. The
-//      acceptance pin in `crates/arest/tests/subtype_metamodel_rule_e2e.rs`
-//      stays — it verifies emission shape, not the lift mechanism.
+// LIFT STATUS (task-982 — COMPLETE):
+//   Prerequisites A (parse), B (compile/AntecedentRole), and C (bake into
+//   parse path + delete standalone synthesiser call) are ALL DONE.
+//   The rule is baked as a static `DerivationRule` fact into every parse
+//   output by `parse_to_state_via_stage12_impl` (SUBTYPE_INHERITANCE_RULE_TEXT).
+//   `SUBTYPE_INHERITANCE_ID` and the guarded standalone call in
+//   `compile_derivations` are deleted.  `compile_subtype_inheritance_metamodel`
+//   is retained as an internal helper called by `compile_explicit_derivation`.
+//   Acceptance pin in `crates/arest/tests/subtype_metamodel_rule_e2e.rs` stays.
 //
 // The two tests below:
 //   1. Pin that `X is a Y` in a rule antecedent does NOT produce an
 //      UnresolvedClause (the clause is recognised and silently skipped).
 //   2. Pin that the subtype-inheritance DERIVATION correctly materialises
-//      inherited facts (exercising the procedural path that the future
-//      reading-lift will replace, anchored to the derivation.md text).
+//      inherited facts (now driven by the reading-lift route).
 
 /// task subtype-join-antecedent (1/2): `X is a Y` in a rule antecedent
 /// is correctly classified as a subtype-instance-check and does NOT
@@ -6524,10 +6507,14 @@ Vehicle has Color.
 "#;
     let state = parse_to_state(src).expect("model with is-a antecedent must parse");
     let data = crate::compile::cell_index_from_state(&state);
-    assert_eq!(data.derivation_rules.len(), 1,
-        "expected exactly one derivation rule; got {:#?}",
-        data.derivation_rules.iter().map(|r| r.text.as_str()).collect::<Vec<_>>());
-    let rule = &data.derivation_rules[0];
+    // task-982: parse_to_state_via_stage12_impl now bakes the subtype-inheritance
+    // rule into every state, so schemas with subtypes get 2 rules: the user's
+    // rule + the injected subtype-inheritance rule.  Find the user's rule by text.
+    let rule = data.derivation_rules.iter()
+        .find(|r| r.text.contains("Vehicle has Color iff"))
+        .unwrap_or_else(|| panic!(
+            "user rule `Vehicle has Color iff ...` not found; rules={:#?}",
+            data.derivation_rules.iter().map(|r| r.text.as_str()).collect::<Vec<_>>()));
 
     // CURRENT BEHAVIOR (pinned by task subtype-join-antecedent):
     // `Car is a Vehicle` is recognised as a subtype-instance-check and
@@ -6540,11 +6527,10 @@ Vehicle has Color.
 
     // The remaining antecedent (`Vehicle has Color`) resolves to the
     // declared FT — the rule has exactly one antecedent source.
-    // (When the full lift ships this will be 2: [Subtype, Vehicle_has_Color])
     assert_eq!(
         rule.antecedent_sources.len(), 1,
-        "CURRENT BEHAVIOR: only the FT clause produces an antecedent source; \
-         `Car is a Vehicle` does not yet. sources={:#?}", rule.antecedent_sources,
+        "only the FT clause produces an antecedent source; \
+         `Car is a Vehicle` is silently skipped. sources={:#?}", rule.antecedent_sources,
     );
 }
 
@@ -6663,12 +6649,13 @@ Vehicle has Color.
 "#;
     let state = parse_to_state(src).expect("model with metamodel antecedents must parse");
     let data = crate::compile::cell_index_from_state(&state);
-    // The derivation rule should be present (the consequent `Vehicle has Color`
-    // resolves to the declared FT).
-    assert_eq!(data.derivation_rules.len(), 1,
-        "expected exactly one derivation rule; got {:#?}",
-        data.derivation_rules.iter().map(|r| r.text.as_str()).collect::<Vec<_>>());
-    let rule = &data.derivation_rules[0];
+    // task-982: the injected subtype-inheritance rule is also present.
+    // The user's rule has consequent `Vehicle has Color` — find it by text.
+    let rule = data.derivation_rules.iter()
+        .find(|r| r.text.starts_with("Vehicle has Color"))
+        .unwrap_or_else(|| panic!(
+            "user rule `Vehicle has Color iff ...` not found; rules={:#?}",
+            data.derivation_rules.iter().map(|r| r.text.as_str()).collect::<Vec<_>>()));
 
     // (1) Zero unresolved clauses — all five antecedent clauses are classified.
     assert!(
@@ -6722,22 +6709,19 @@ Vehicle has Color.
 ///   invokes `compile_subtype_inheritance_metamodel` which expands it into the same
 ///   per-(sub, sup, ft) Funcs the procedural synthesiser produced.
 ///
-/// The procedural synthesiser (`compile_subtype_inheritance_metamodel`) is RETAINED as
-/// a fallback for parse paths that don't load readings/core/derivation.md (e.g.
-/// `parse_to_state_via_stage12`), but the direct call in `compile_derivations` is
-/// skipped when the reading-lift rule is present in the state.  This preserves the
-/// `crates/arest/tests/subtype_metamodel_rule_e2e.rs` acceptance pin.
+/// task-982 (child 5 / final retire): the guarded direct synthesiser call in
+/// `compile_derivations` is DELETED; `parse_to_state_via_stage12_impl` now bakes
+/// the subtype-inheritance rule into every parse output.  Both the "oracle" path
+/// (no explicit rule text in the schema) and the "lift" path (verbatim rule text
+/// in the schema) now go through the same reading-lift route.
 ///
-/// EQUIVALENCE CRITERION: the reading-lift path (parse the FORML rule text, compile,
-/// forward-chain) must produce Vehicle '1' in Vehicle_has_Color independently — the
-/// same result as the oracle path.
+/// EQUIVALENCE CRITERION: both paths produce Vehicle '1' in Vehicle_has_Color.
 #[test]
 fn task980_e2e_gap_confirmed_synthesiser_retained() {
-    // ── 1. Oracle: procedural synthesiser path ────────────────────────────
+    // ── 1. Oracle path (no explicit rule text) ────────────────────────────
     // Car '1' has Color 'red' + subtype declaration must yield Vehicle '1'
     // in Vehicle_has_Color after compile + forward-chain.
-    // (Still tested so we confirm the oracle path continues to work after the
-    // fallback guard is in place.)
+    // The rule is now baked in by parse_to_state_via_stage12_impl.
     let src_oracle = r#"
 Vehicle(.id) is an entity type.
 Car is a subtype of Vehicle.

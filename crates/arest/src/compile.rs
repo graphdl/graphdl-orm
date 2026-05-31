@@ -1773,14 +1773,11 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // consequent fact types. At runtime, create_via_defs fetches the index for the
     // created noun to gate which derivations run (O(relevant) instead of O(all)).
     {
-        // #890: pre-compute the (subtype, supertype) pairs once so the
-        // synthetic-id branch for `_subtype_inheritance` doesn't pay
-        // a per-derivation `cell_index_from_state` rebuild. Source
-        // both the dedicated `Subtype` cell (parse_forml2_stage2.rs:4301)
-        // AND the `Noun.superType` binding the synthetic-cells test
-        // helper `evaluate::with_subtype` writes — `cell_index_from_state`
-        // reads `Noun.superType` at line ~2121 to populate `data.subtypes`,
-        // so honoring both keeps this index synthesis aligned with what
+        // #890 + task 982: pre-compute (subtype, supertype) pairs for
+        // the `is_subtype_lift` index-insertion branch.  Source both the
+        // dedicated `Subtype` cell AND the `Noun.superType` binding that
+        // `evaluate::with_subtype` writes — both contribute to `data.subtypes`
+        // so honoring both keeps the index aligned with what
         // `compile_subtype_inheritance_metamodel` actually consumes.
         let subtype_pairs: Vec<(String, String)> = {
             let mut pairs: Vec<(String, String)> = Vec::new();
@@ -1924,29 +1921,23 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                     if did.contains(noun_name) { nouns.insert(noun_name.clone()); }
                 }
             }
-            // #890 + task subtype-join-antecedent child 4: the subtype-inheritance
-            // metamodel rule (now compiled from the reading-lift path in
-            // readings/core/derivation.md) doesn't carry any one noun in its
-            // compiled id — it's the lifted `Concat . [per-(sub, sup, ft) inner Func]`
-            // form. Insert it under every declared subtype noun + every supertype
-            // noun so noun-gated dispatch (command::create_via_defs) finds it for
-            // either side of an inheritance edge.
-            // Detection: the domain_rule has FactType("Subtype") as the first
+            // #890 + task 982: the subtype-inheritance metamodel rule is now baked
+            // into every parse path via `parse_to_state_via_stage12_impl`.  Its
+            // compiled id is the FNV hash of SUBTYPE_INHERITANCE_RULE_TEXT; it
+            // doesn't carry any single noun name.  Insert it under every declared
+            // subtype noun + every supertype noun so noun-gated dispatch
+            // (command::create_via_defs) finds it for either side of an inheritance
+            // edge.  Detection: the domain_rule has FactType("Subtype") as the first
             // antecedent AND an InstancesOfNoun("@subtype_var:…") sentinel.
-            // The old `SUBTYPE_INHERITANCE_ID` ("_subtype_inheritance") id is kept
-            // as a fallback in case the reading hasn't been parsed into the state
-            // (e.g. bootstrap paths that skip the derivation.md load).
-            let is_subtype_lift = did == SUBTYPE_INHERITANCE_ID || {
-                domain_rule.map(|r| {
-                    let has_subtype = r.antecedent_sources.first()
-                        .map(|s| s.fact_type_id() == "Subtype")
-                        .unwrap_or(false);
-                    let has_sentinel = r.antecedent_sources.iter()
-                        .any(|s| matches!(s, crate::types::AntecedentSource::InstancesOfNoun(n)
-                            if n.starts_with("@subtype_var:")));
-                    has_subtype && has_sentinel
-                }).unwrap_or(false)
-            };
+            let is_subtype_lift = domain_rule.map(|r| {
+                let has_subtype = r.antecedent_sources.first()
+                    .map(|s| s.fact_type_id() == "Subtype")
+                    .unwrap_or(false);
+                let has_sentinel = r.antecedent_sources.iter()
+                    .any(|s| matches!(s, crate::types::AntecedentSource::InstancesOfNoun(n)
+                        if n.starts_with("@subtype_var:")));
+                has_subtype && has_sentinel
+            }).unwrap_or(false);
             if is_subtype_lift {
                 for (sub, sup) in subtype_pairs.iter() {
                     nouns.insert(sub.clone());
@@ -4019,23 +4010,18 @@ fn compile_derivations(data: &CellIndex, state_machines: &[CompiledStateMachine]
         }
     }));
 
-    // Subtype inheritance (#890, lifted to reading-driven in task subtype-join-antecedent
-    // child 4): the declarative FORML rule in readings/core/derivation.md is compiled
-    // via the reading-lift path (compile_explicit_derivation detects the
-    // FactType("Subtype")+FactType("FactType")+InstancesOfNoun("@subtype_var:…") pattern
-    // and routes to compile_subtype_inheritance_metamodel internally) when the rule is
-    // present in the state.
+    // Subtype inheritance (#890, task 982): the declarative FORML rule from
+    // readings/core/derivation.md is baked into every `parse_to_state_via_stage12_impl`
+    // output when subtypes are present — so the reading-lift path in
+    // `compile_explicit_derivation` fires for all stage-1-2 parse outputs.
     //
-    // FALLBACK (legacy): when the state does NOT include readings/core/derivation.md
-    // (e.g. standalone parse calls that don't embed the core readings), the reading-lift
-    // rule is absent and the direct call below fires.  Removing this fallback would break
-    // crates/arest/tests/subtype_metamodel_rule_e2e.rs (which calls
-    // parse_to_state_via_stage12 without derivation.md) and every other call site that
-    // parses user text without the core readings bundle.
-    //
-    // The guard: skip the direct call when the derivation_rules loop already produced a
-    // subtype-inheritance derivation (identified by its reading-lift antecedent pattern).
-    // This prevents double-emission when both paths are active.
+    // SCOPE GUARD (task 982): direct-cell paths (`evaluate.rs` test helpers,
+    // `build(cells)` in `evaluate::tests`) bypass `parse_to_state_via_stage12_impl`
+    // and therefore do not receive the injected rule.  For those paths the reading-lift
+    // rule is absent and the direct call below fires — same as the pre-982 fallback.
+    // The guard: skip the direct call when the derivation_rules loop already produced
+    // a subtype-inheritance derivation (identified by its reading-lift antecedent
+    // pattern).  This prevents double-emission when both paths are active.
     let already_has_subtype_lift = derivations.iter().any(|d| {
         data.derivation_rules.iter().any(|r| {
             r.id == d.id
@@ -6848,7 +6834,7 @@ pub(crate) fn compile_subtype_inheritance_metamodel(
     let (consequent_cell, _, _) =
         derivation_dep_metadata_synth(String::new());
     Some(CompiledDerivation {
-        id: SUBTYPE_INHERITANCE_ID.to_string(),
+        id: crate::parse_forml2_stage2::SUBTYPE_INHERITANCE_RULE_ID.to_string(),
         text: "Subtype inheritance metamodel rule (readings/core/derivation.md)".to_string(),
         kind: DerivationKind::SubtypeInheritance,
         func,
@@ -6857,13 +6843,6 @@ pub(crate) fn compile_subtype_inheritance_metamodel(
     })
 }
 
-/// Synthetic id for the single subtype-inheritance metamodel rule
-/// (#890). Recognised by the derivation_index synthetic-id fallback
-/// in `compile_to_defs_state` so the index keys this id into every
-/// declared subtype's relevance set — without that, noun-gated
-/// `command::create_via_defs` paths would skip subtype inheritance
-/// for lack of a noun-name match in the id.
-pub(crate) const SUBTYPE_INHERITANCE_ID: &str = "_subtype_inheritance";
 
 /// Compile SS Subset-Constraint auto-fill as ONE CompiledDerivation
 /// whose Func concatenates per-Subset-Constraint inner Funcs (#891).
