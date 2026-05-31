@@ -29,7 +29,10 @@ fn main() {
         std::process::exit(1);
     }
 
-    parse_forml2::set_bootstrap_mode(true);
+    // #931/#285: `parse_forml2::set_bootstrap_mode` was a no-op (the
+    // loose/strict parser-mode distinction disappeared with the legacy
+    // cascade) and was deleted. The bundled-reading fold below needs no
+    // mode guard.
     let meta_state = arest::metamodel_readings().into_iter().fold(ast::Object::phi(), |acc, r| {
         let (name, text) = (r.0, r.1);
         parse_forml2::parse_to_state_from(text, &acc)
@@ -39,7 +42,6 @@ fn main() {
                 std::process::exit(1);
             })
     });
-    parse_forml2::set_bootstrap_mode(false);
     let meta_nouns = entity_nouns(&meta_state);
 
     let state = user_readings.iter().fold(meta_state, |acc, (name, text)| {

@@ -20,7 +20,7 @@ use compat::{Domain, domain_to_state};
 
 mod compat {
     use arest::ast;
-    use arest::types::{NounDef, FactTypeDef, ConstraintDef, RoleDef, SpanDef, StateMachineDef, TransitionDef, WorldAssumption};
+    use arest::types::{NounDef, FactTypeDef, ConstraintDef, RoleDef, SpanDef, TransitionDef, WorldAssumption};
     use hashbrown::HashMap;
     use serde::{Deserialize, Serialize};
 
@@ -153,6 +153,7 @@ mod compat {
                 entity: None,
                 min_occurrence: None,
                 max_occurrence: None,
+                ..Default::default()
             };
             let json = serde_json::to_string(&real).unwrap_or_default();
             let pairs = vec![
@@ -198,7 +199,7 @@ mod compat {
         }
 
         // Silence unused imports when no branch exercises them.
-        let _ = std::marker::PhantomData::<(NounDef, FactTypeDef, RoleDef, WorldAssumption, StateMachineDef, TransitionDef)>;
+        let _ = std::marker::PhantomData::<(NounDef, FactTypeDef, RoleDef, WorldAssumption, TransitionDef)>;
 
         state
     }

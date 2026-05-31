@@ -47,7 +47,20 @@ fn task_ids_in_cell(cell_name: &str, state: &Object) -> Vec<String> {
 /// `READINGS_DERIVED_META_CELLS` from the prior state before merge so
 /// the rule registry is rebuilt from current readings each compile.
 fn compile_and_chain(src: &str, prior: &Object) -> Object {
-    let prior_stripped = ast::drop_readings_derived_meta_cells(prior);
+    // #913: `ast::drop_readings_derived_meta_cells` was removed (c80ac6d9)
+    // in favor of structural schema-cell discovery in cli/entry.rs. Its
+    // behavior was simply to strip the `DerivationRule` cell from the
+    // prior state so the rule registry rebuilds from current readings.
+    // Inline that exact strip here so this pin keeps exercising the
+    // recompile path.
+    let prior_stripped: Object = {
+        let cells: hashbrown::HashMap<String, Object> = ast::cells_iter(prior)
+            .into_iter()
+            .filter(|(name, _)| *name != "DerivationRule")
+            .map(|(name, contents)| (name.to_string(), contents.clone()))
+            .collect();
+        Object::Map(cells.into())
+    };
     let parsed = arest::parse_forml2::parse_to_state_from(src, &prior_stripped)
         .expect("parse must succeed");
     let merged = ast::merge_states(&prior_stripped, &parsed);
@@ -78,7 +91,7 @@ fn compile_and_chain(src: &str, prior: &Object) -> Object {
                 new_map.insert(name.to_string(), contents.clone());
             }
         }
-        Object::Map(new_map)
+        Object::Map(new_map.into())
     };
 
     let derivation_refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d)
@@ -148,7 +161,7 @@ fn editing_rule_body_drops_stale_rule_on_recompile() {
             .filter(|(name, _)| !name.contains(':'))
             .map(|(name, contents)| (name.to_string(), contents.clone()))
             .collect();
-        Object::Map(cells)
+        Object::Map(cells.into())
     };
 
     // Second compile (rule B): only Task 2 (in_progress) must be

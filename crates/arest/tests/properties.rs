@@ -130,6 +130,7 @@ mod compat {
                     entity: get("entity"),
                     min_occurrence: None,
                     max_occurrence: None,
+                    ..Default::default()
                 }
             }).collect())
             .unwrap_or_default();
@@ -157,6 +158,7 @@ mod compat {
                     unresolved_clauses: vec![],
                     antecedent_role_literals: vec![],
                     consequent_role_literals: vec![],
+                    ..Default::default()
                 }
             }).collect())
             .unwrap_or_default();

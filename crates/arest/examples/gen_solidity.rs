@@ -32,10 +32,10 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Bootstrap mode bypasses the metamodel-namespace guard so the
-    // metamodel can redeclare its own nouns across files. The guard is
-    // only needed for user-domain compiles.
-    parse_forml2::set_bootstrap_mode(true);
+    // #931/#285: `parse_forml2::set_bootstrap_mode` was a no-op after the
+    // legacy parser cascade (and its loose/strict mode distinction) was
+    // removed, then the stub itself was deleted. The metamodel-namespace
+    // guard it once toggled no longer exists, so no guard is needed here.
     // The bundled metamodel readings. User readings parse on top of these
     // so SM wiring like "State Machine Definition 'Order' is for Noun 'Order'"
     // resolves with the correct role nouns (State Machine Definition, Noun)
@@ -50,7 +50,6 @@ fn main() {
             }
         }
     });
-    parse_forml2::set_bootstrap_mode(false);
 
     // Capture the metamodel's entity noun names so we can exclude them
     // from the generated output: users want contracts for their own

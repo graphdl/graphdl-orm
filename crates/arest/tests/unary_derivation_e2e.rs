@@ -674,7 +674,7 @@ fn apps_tasks_live_db_materializes_all_three_unary_consequents() {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
     }).expect("query_map").filter_map(|r| r.ok()).collect();
     drop(stmt);
-    let mut prior_population = Object::Map(hashbrown::HashMap::new());
+    let mut prior_population = Object::Map(hashbrown::HashMap::new().into());
     for (name, contents) in rows {
         if name.contains(':') { continue }  // skip defs
         let obj = Object::parse(&contents);
