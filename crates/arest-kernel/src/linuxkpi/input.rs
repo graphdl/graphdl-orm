@@ -49,8 +49,13 @@
 
 use core::ffi::{c_char, c_int};
 use core::ptr;
+use core::sync::atomic::{AtomicU64, Ordering as AtomOrd};
 
 use crate::arch::uefi::pointer::{push as pointer_push, PointerEvent};
+
+/// Counts EV_ABS/EV_REL/EV_SYN events that pass through `input_event`.
+/// Logged at first event, every 50th, to confirm translation path.
+static IE_DBG_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // Linux event type constants (drivers read these by name; the C
 // header `vendor/linux/include/uapi/linux/input-event-codes.h`
@@ -262,6 +267,11 @@ pub extern "C" fn input_event(_dev: *mut InputDev, type_: c_int, code: c_int, va
     let code = code as u16;
     match type_ {
         EV_SYN => {
+            // Log every 50th Sync so we can confirm EV_SYN is arriving.
+            let n = IE_DBG_COUNT.fetch_add(1, AtomOrd::Relaxed);
+            if n < 5 || n % 50 == 0 {
+                crate::println!("ptr-dbg: input_event EV_SYN (ie_count={})", n + 1);
+            }
             pointer_push(PointerEvent::Sync);
         }
         EV_KEY => {
@@ -270,6 +280,15 @@ pub extern "C" fn input_event(_dev: *mut InputDev, type_: c_int, code: c_int, va
             // input emits both kinds depending on whether the host
             // device is a mouse, keyboard, or touchscreen.
             if (0x100..0x200).contains(&code) {
+                let n = IE_DBG_COUNT.fetch_add(1, AtomOrd::Relaxed);
+                if n < 10 || n % 50 == 0 {
+                    crate::println!(
+                        "ptr-dbg: input_event EV_KEY btn code={:#x} pressed={} (ie_count={})",
+                        code,
+                        value != 0,
+                        n + 1,
+                    );
+                }
                 pointer_push(PointerEvent::Button {
                     button: code as u32,
                     pressed: value != 0,
@@ -294,6 +313,15 @@ pub extern "C" fn input_event(_dev: *mut InputDev, type_: c_int, code: c_int, va
             // accumulating internally — Slint's PointerMoved
             // expects a delta, and its consumer at #459b will
             // accumulate REL_X / REL_Y across the EV_SYN window.
+            let n = IE_DBG_COUNT.fetch_add(1, AtomOrd::Relaxed);
+            if n < 10 || n % 50 == 0 {
+                crate::println!(
+                    "ptr-dbg: input_event EV_REL code={} value={} (ie_count={})",
+                    code,
+                    value,
+                    n + 1,
+                );
+            }
             match code {
                 REL_X => pointer_push(PointerEvent::RelMove { dx: value, dy: 0 }),
                 REL_Y => pointer_push(PointerEvent::RelMove { dx: 0, dy: value }),
@@ -301,11 +329,22 @@ pub extern "C" fn input_event(_dev: *mut InputDev, type_: c_int, code: c_int, va
                 _ => {}
             }
         }
-        EV_ABS => match code {
-            ABS_X => pointer_push(PointerEvent::AbsMove { x: value, y: 0 }),
-            ABS_Y => pointer_push(PointerEvent::AbsMove { x: 0, y: value }),
-            _ => {}
-        },
+        EV_ABS => {
+            let n = IE_DBG_COUNT.fetch_add(1, AtomOrd::Relaxed);
+            if n < 10 || n % 50 == 0 {
+                crate::println!(
+                    "ptr-dbg: input_event EV_ABS code={} value={} (ie_count={})",
+                    code,
+                    value,
+                    n + 1,
+                );
+            }
+            match code {
+                ABS_X => pointer_push(PointerEvent::AbsMove { x: value, y: 0 }),
+                ABS_Y => pointer_push(PointerEvent::AbsMove { x: 0, y: value }),
+                _ => {}
+            }
+        }
         // EV_MSC / EV_LED / EV_SND / EV_REP / EV_FF / EV_PWR —
         // ignored. The driver's own `event` callback handles the
         // outbound LED/SND/etc directions; inbound MSC is the

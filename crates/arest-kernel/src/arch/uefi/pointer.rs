@@ -27,8 +27,14 @@
 // Drop-oldest under back-pressure.
 
 use alloc::collections::VecDeque;
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use spin::Mutex;
+
+/// Counts pushes into the pointer ring. Logged at first push and
+/// every 50th so we confirm events reach the ring.
+static PUSH_DBG_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Counts `set_position` calls. Logged at first call and every 50th.
+static SET_POS_DBG_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// One pointer event. Mirrors the subset of Linux input events that
 /// virtio-input emits for a typical mouse / touchpad / touchscreen
@@ -84,6 +90,10 @@ static RING: Mutex<VecDeque<PointerEvent>> = Mutex::new(VecDeque::new());
 /// uses. Designed to be called from the linuxkpi `input_event`
 /// translation path (which itself runs at IRQ-or-tick context).
 pub fn push(event: PointerEvent) {
+    let n = PUSH_DBG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 10 || n % 50 == 0 {
+        crate::println!("ptr-dbg: pointer::push {:?} (push_count={})", event, n + 1);
+    }
     let mut ring = RING.lock();
     if ring.len() >= RING_CAP {
         ring.pop_front();
@@ -184,6 +194,15 @@ pub fn current_position() -> (i32, i32) {
 /// Transitional shim for the launcher's super-loop (#647). See
 /// `current_position` for the two-`AtomicI32` rationale.
 pub fn set_position(x: i32, y: i32) {
+    let n = SET_POS_DBG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n < 10 || n % 50 == 0 {
+        crate::println!(
+            "ptr-dbg: pointer::set_position ({}, {}) (set_pos_count={})",
+            x,
+            y,
+            n + 1,
+        );
+    }
     CURSOR_X.store(x, Ordering::Relaxed);
     CURSOR_Y.store(y, Ordering::Relaxed);
 }

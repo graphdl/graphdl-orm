@@ -96,7 +96,15 @@ use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ffi::{c_char, c_int, c_void};
+use core::sync::atomic::{AtomicU64, Ordering as AtomOrd};
 use spin::{Mutex, Once};
+
+/// Total events delivered through `poll_all_vqs` → `input_event`.
+/// Logged at first event, every 100th event, to show device delivery.
+static PTR_DBG_EVENT_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Polls where `pop_pending_event` returned None immediately (device
+/// idle). Logged at first occurrence and every 10_000th poll.
+static PTR_DBG_EMPTY_POLLS: AtomicU64 = AtomicU64::new(0);
 
 /// `struct virtio_device` — Linux's per-device handle. Layout
 /// matches the C stub `vendor/linux/include/linux/virtio.h`. Field
@@ -790,6 +798,7 @@ pub fn poll_all_vqs() {
         // buffer, and re-issues `Transport::notify` if needed —
         // exactly mirroring what virtio_input.c's
         // `virtinput_recv_events` does on the C side.
+        let mut got_any = false;
         loop {
             let event = {
                 let mut g = driver.lock();
@@ -797,8 +806,36 @@ pub fn poll_all_vqs() {
             };
             let event = match event {
                 Some(e) => e,
-                None => break,
+                None => {
+                    // Log when a device that exists yields no events
+                    // on the first pop of this poll tick (helps detect
+                    // the "device has nowhere to write" failure mode).
+                    if !got_any {
+                        let n = PTR_DBG_EMPTY_POLLS.fetch_add(1, AtomOrd::Relaxed);
+                        if n == 0 || n % 10_000 == 0 {
+                            crate::println!(
+                                "ptr-dbg: poll#{} device has no pending events (empty_polls={})",
+                                n,
+                                n + 1,
+                            );
+                        }
+                    }
+                    break;
+                }
             };
+            got_any = true;
+            // Log the first 10 events and every 100th thereafter to
+            // confirm the device is delivering EV_ABS/EV_REL tuples.
+            let n = PTR_DBG_EVENT_COUNT.fetch_add(1, AtomOrd::Relaxed);
+            if n < 10 || n % 100 == 0 {
+                crate::println!(
+                    "ptr-dbg: pop type={} code={} value={} (total={})",
+                    event.event_type,
+                    event.code,
+                    event.value,
+                    n + 1,
+                );
+            }
             // Translate to AAAA's `input_event` thunk (which routes
             // EV_KEY → keyboard ring, EV_REL/EV_ABS → pointer ring).
             // `dev` argument is reserved for future per-device

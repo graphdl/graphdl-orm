@@ -80,12 +80,17 @@
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use core::cell::RefCell;
+use core::sync::atomic::{AtomicU64, Ordering as AtomOrd};
 
 use slint::ComponentHandle;
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
 
 use crate::arch::uefi::keyboard;
 use crate::arch::uefi::pointer;
+
+/// Counts Sync flushes dispatched in `drain_pointer_into_slint_window`.
+/// Logged first 5 and every 50th so we confirm Sync reaches Slint.
+static DRAIN_SYNC_COUNT: AtomicU64 = AtomicU64::new(0);
 use crate::arch::uefi::slint_backend::{
     AppLauncher, FramebufferBackend, FramebufferPixelOrder, UefiSlintPlatform,
 };
@@ -917,6 +922,15 @@ fn drain_pointer_into_slint_window(window: &slint::Window) {
                 // logical frame; the Slint surface gets one motion
                 // edge per frame's worth of EV_REL/EV_ABS events.
                 if moved {
+                    let n = DRAIN_SYNC_COUNT.fetch_add(1, AtomOrd::Relaxed);
+                    if n < 5 || n % 50 == 0 {
+                        crate::println!(
+                            "ptr-dbg: drain Sync flush ({},{}) → set_position (sync_count={})",
+                            cx,
+                            cy,
+                            n + 1,
+                        );
+                    }
                     let _ = window.try_dispatch_event(
                         WindowEvent::PointerMoved {
                             position: LogicalPosition::new(cx as f32, cy as f32),
@@ -987,11 +1001,23 @@ fn drain_pointer_into_slint_window(window: &slint::Window) {
     // EV_REL without an immediate EV_SYN (rare but observed under
     // some virtio-tablet QEMU configurations on the boot smoke).
     if moved {
+        let n = DRAIN_SYNC_COUNT.fetch_add(1, AtomOrd::Relaxed);
+        if n < 5 || n % 50 == 0 {
+            crate::println!(
+                "ptr-dbg: drain no-Sync flush ({},{}) → set_position (sync_count={})",
+                cx,
+                cy,
+                n + 1,
+            );
+        }
         let _ = window.try_dispatch_event(
             WindowEvent::PointerMoved {
                 position: LogicalPosition::new(cx as f32, cy as f32),
             },
         );
+        // Persist for the cursor-sprite painter and next drain seed,
+        // same as the Sync path — EV_REL without EV_SYN still moves.
+        pointer::set_position(cx, cy);
     }
 }
 
