@@ -1773,12 +1773,12 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // consequent fact types. At runtime, create_via_defs fetches the index for the
     // created noun to gate which derivations run (O(relevant) instead of O(all)).
     {
-        // #890 + task 982: pre-compute (subtype, supertype) pairs for
+        // #890 + task 982 + task 983: pre-compute (subtype, supertype) pairs for
         // the `is_subtype_lift` index-insertion branch.  Source both the
         // dedicated `Subtype` cell AND the `Noun.superType` binding that
         // `evaluate::with_subtype` writes — both contribute to `data.subtypes`
-        // so honoring both keeps the index aligned with what
-        // `compile_subtype_inheritance_metamodel` actually consumes.
+        // so honoring both keeps the index aligned with the inlined reading-lift
+        // synthesis in compile_explicit_derivation.
         let subtype_pairs: Vec<(String, String)> = {
             let mut pairs: Vec<(String, String)> = Vec::new();
             let st_cell = crate::ast::fetch_cell_seq("Subtype", state);
@@ -4010,32 +4010,14 @@ fn compile_derivations(data: &CellIndex, state_machines: &[CompiledStateMachine]
         }
     }));
 
-    // Subtype inheritance (#890, task 982): the declarative FORML rule from
-    // readings/core/derivation.md is baked into every `parse_to_state_via_stage12_impl`
-    // output when subtypes are present — so the reading-lift path in
-    // `compile_explicit_derivation` fires for all stage-1-2 parse outputs.
-    //
-    // SCOPE GUARD (task 982): direct-cell paths (`evaluate.rs` test helpers,
-    // `build(cells)` in `evaluate::tests`) bypass `parse_to_state_via_stage12_impl`
-    // and therefore do not receive the injected rule.  For those paths the reading-lift
-    // rule is absent and the direct call below fires — same as the pre-982 fallback.
-    // The guard: skip the direct call when the derivation_rules loop already produced
-    // a subtype-inheritance derivation (identified by its reading-lift antecedent
-    // pattern).  This prevents double-emission when both paths are active.
-    let already_has_subtype_lift = derivations.iter().any(|d| {
-        data.derivation_rules.iter().any(|r| {
-            r.id == d.id
-                && r.antecedent_sources.first().map(|s| s.fact_type_id() == "Subtype").unwrap_or(false)
-                && r.antecedent_sources.iter().any(|s| matches!(
-                    s, crate::types::AntecedentSource::InstancesOfNoun(n)
-                        if n.starts_with("@subtype_var:")))
-        })
-    });
-    if !already_has_subtype_lift {
-        if let Some(d) = compile_subtype_inheritance_metamodel(data) {
-            derivations.push(d);
-        }
-    }
+    // Subtype inheritance (#890, task 982, task 983): the declarative FORML
+    // rule from readings/core/derivation.md is baked into every
+    // `parse_to_state_via_stage12_impl` output when subtypes are present.
+    // All tests that formerly bypassed the parse path (evaluate.rs test
+    // helpers) have been converted to build their fixture state via
+    // `parse_to_state_via_stage12` (task 983), so the reading-lift path in
+    // `compile_explicit_derivation` now fires for every code path.
+    // `compile_subtype_inheritance_metamodel` is DELETED (task 983).
 
     // SS auto-fill (#891): the per-SS-Constraint synthesis loop is
     // replaced by ONE metamodel derivation rule declared in
@@ -4789,9 +4771,9 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
     //
     // This exact shape cannot be handled by the generic multi-antecedent paths
     // (the AntecedentRole + InstancesOfNoun combination needs compile-time schema
-    // expansion, not runtime join). Detect it and route to the same
-    // compile_subtype_inheritance_metamodel function the procedural synthesiser
-    // uses — producing byte-for-byte the same CompiledDerivation.
+    // expansion, not runtime join). Detect it and expand inline (task 983:
+    // compile_subtype_inheritance_metamodel deleted) — producing a Concat of
+    // per-(sub, sup, ft) InstancesOfNoun inner Funcs.
     let is_subtype_inheritance_reading_lift = {
         let has_subtype_ant = rule.antecedent_sources.first()
             .map(|s| s.fact_type_id() == "Subtype")
@@ -4804,16 +4786,55 @@ fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Co
         has_subtype_ant && has_instances_sentinel && has_antecedent_role_consequent
     };
     if is_subtype_inheritance_reading_lift {
-        // Route to the oracle. compile_subtype_inheritance_metamodel returns
-        // None when no subtypes are declared; fall through to a no-op empty
-        // derivation in that case (same behaviour as the synthesiser guard).
-        if let Some(mut compiled) = compile_subtype_inheritance_metamodel(data) {
-            // Preserve the reading-lift rule's id and text so the derivation
-            // index and diagnostics show the rule that was declared, not the
-            // synthesiser's synthetic id.
-            compiled.id = id;
-            compiled.text = text;
-            return compiled;
+        // task 983: compile_subtype_inheritance_metamodel is DELETED —
+        // inline its logic here (the reading-lift detection path is its
+        // only remaining caller). Produces a Concat of per-(sub, sup, ft)
+        // InstancesOfNoun inner Funcs, same as the deleted synthesiser did.
+        let derived_ft_ids: HashSet<String> = data.derivation_rules.iter()
+            .map(|r| r.consequent_cell.literal_id().to_string())
+            .collect();
+        let inner_funcs: Vec<Func> = data.subtypes.iter()
+            .flat_map(|(sub_name, super_name)| {
+                data.fact_types.iter()
+                    .filter(|(ft_id, _)| !derived_ft_ids.contains(*ft_id))
+                    .flat_map(move |(ft_id, ft)| {
+                        let sub = sub_name.clone();
+                        let sup = super_name.clone();
+                        let ft_id = ft_id.clone();
+                        let reading = ft.reading.clone();
+                        let sup_filter = sup.clone();
+                        ft.roles.iter()
+                            .filter(move |r| r.noun_name == sup_filter)
+                            .map(move |r| (sub.clone(), sup.clone(), ft_id.clone(),
+                                reading.clone(), r.noun_name.clone()))
+                    })
+            })
+            .map(|(sub, sup, ft_id, reading, super_role)| {
+                let inner_rule = DerivationRuleDef {
+                    id: format!("_subtype_{}_{}_{}", sub, sup, ft_id),
+                    text: format!("{} is a subtype of {} — inherits {}", sub, sup, reading),
+                    antecedent_sources: vec![
+                        crate::types::AntecedentSource::InstancesOfNoun(sub),
+                    ],
+                    consequent_cell: crate::types::ConsequentCellSource::Literal(ft_id),
+                    consequent_instance_role: super_role,
+                    kind: DerivationKind::SubtypeInheritance,
+                    join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+                    antecedent_filters: vec![], consequent_computed_bindings: vec![],
+                    consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![],
+                    antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
+                };
+                compile_explicit_derivation(data, &inner_rule).func
+            })
+            .collect();
+        if !inner_funcs.is_empty() {
+            let func = Func::compose(Func::Concat, Func::construction(inner_funcs));
+            let (consequent_cell, _, _) = derivation_dep_metadata_synth(String::new());
+            return CompiledDerivation {
+                id, text, kind: DerivationKind::SubtypeInheritance,
+                func, consequent_cell,
+                materialization: crate::types::MaterializationPolicy::Stored,
+            };
         }
         // No subtypes declared — emit a no-op derivation (Concat of empty Seq).
         let (consequent_cell, _, _) = derivation_dep_metadata_synth(String::new());
@@ -6710,139 +6731,11 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
 //  join logic now expressed as pure Func via pairwise DistR/DistL/Filter/Concat.)
 
 // compile_subtype_inheritance + compile_cwa_negation deleted (#287).
-// Subtype inheritance: now driven by ONE metamodel derivation rule
-// expressed in `readings/core/derivation.md` (#890) and lifted to ONE
-// CompiledDerivation by `compile_subtype_inheritance_metamodel`
-// below — the Func is `Concat . [per-(sub, sup, ft) inner Func]`,
-// each inner Func reusing `compile_explicit_derivation`'s
-// `InstancesOfNoun` 1-antecedent shape so behavior is byte-for-byte
-// identical to the pre-#890 per-pair fanout. Replaces the per-(sub,
-// sup, ft) Rust loop that lived in `compile_derivations` (was
-// `compile.rs:2378-2409`).
-// CWA negation: the custom Func is inlined at its one point of use
-// in compile_derivations so the named function can go away without
-// introducing a "negative antecedent" DerivationRuleDef shape.
-
-/// Compile subtype inheritance as ONE CompiledDerivation whose Func
-/// concatenates per-(subtype, supertype, fact-type) inner Funcs (#890).
-///
-/// Whitepaper §5.2 (universal modus-ponens schema) frames subtype
-/// inheritance as a single metamodel derivation rule whose antecedent
-/// quantifies over `Subtype × FactType × Role` cells and whose
-/// consequent is the synthesized supertype-membership fact in every
-/// FT cell where the supertype plays a role. The declarative form
-/// lives in `readings/core/derivation.md`; this function is the
-/// compile-time lift of that rule into a Func the FFP forward chainer
-/// fires at evaluation time.
-///
-/// Each per-pair inner Func is byte-for-byte the same shape
-/// `compile_explicit_derivation` produces for an `InstancesOfNoun`
-/// 1-antecedent rule with `Literal(ft_id)` consequent — so behavior
-/// is preserved across the loop → metamodel-rule transition (#890
-/// acceptance: `subtype_metamodel_rule_e2e.rs`).
-///
-/// Returns `None` when no subtypes are declared — the chainer
-/// shouldn't see a no-op `Concat . []` def in that case.
-///
-/// SUBSTRATE-LIFT TODO: this synthesiser is option-6 ("document and
-/// stop") — its callers `compile_derivations` (~3935) and the
-/// `derivation_index` synthetic-id fallback (~1907) cascade into the
-/// chainer's relevance-set keying. The deletion plan lives next to
-/// the parsed reading body in `readings/core/derivation.md` (look
-/// for the `Substrate-lift TODO` HTML comment under the
-/// "Subtype inheritance" section). Prerequisites: parser support for
-/// metamodel-cell antecedents (`Subtype`/`Role`/`FactType`) and a
-/// `Literal(ft_id)` consequent whose ft_id binds from an antecedent
-/// rather than a compile-time literal.
-pub(crate) fn compile_subtype_inheritance_metamodel(
-    data: &CellIndex,
-) -> Option<CompiledDerivation> {
-    // task-961: subtype inheritance must NOT fan a subtype-instance into a
-    // DERIVED Fact Type (a derivation consequent). The pre-#890 loop emitted
-    // a presence-binding `<<Sup-role, instance>>` into EVERY FT where the
-    // supertype plays a role; for an ASSERTED FT (e.g. `Vehicle has Color`)
-    // that is the intended supertype-membership fact every consumer needs.
-    // But a DERIVED FT (e.g. `Noun is instantiable`, whose membership is
-    // COMPUTED by its own derivation rule) must be populated ONLY by that
-    // rule. Force-asserting subtype members into it bypasses the rule's
-    // guard (`Noun has Object Type 'entity' …`) and contaminates the cell
-    // with every Fact-Type / Status instance (since `Fact Type` and `Status`
-    // are subtypes of `Noun`, and `Noun is instantiable` has a `Noun` role).
-    // Skip any FT that is some derivation rule's consequent cell.
-    let derived_ft_ids: HashSet<String> = data.derivation_rules.iter()
-        .map(|r| r.consequent_cell.literal_id().to_string())
-        .collect();
-    // Collect per-(sub, sup, ft, super_role) Funcs in declaration
-    // order. The fanout matches the pre-#890 loop exactly: every
-    // (subtype, supertype) pair × every FT where the supertype plays
-    // some role, one inner Func per resulting tuple.
-    let inner_funcs: Vec<Func> = data.subtypes.iter()
-        .flat_map(|(sub_name, super_name)| {
-            data.fact_types.iter()
-                // task-961: never inherit into a derived (consequent) FT.
-                .filter(|(ft_id, _)| !derived_ft_ids.contains(*ft_id))
-                .flat_map(move |(ft_id, ft)| {
-                    let sub = sub_name.clone();
-                    let sup = super_name.clone();
-                    let ft_id = ft_id.clone();
-                    let reading = ft.reading.clone();
-                    let sup_filter = sup.clone();
-                    ft.roles.iter()
-                        .filter(move |r| r.noun_name == sup_filter)
-                        .map(move |r| (sub.clone(), sup.clone(), ft_id.clone(),
-                            reading.clone(), r.noun_name.clone()))
-                })
-        })
-        .map(|(sub, sup, ft_id, reading, super_role)| {
-            // Lift each (sub, sup, ft) triple to the same
-            // DerivationRuleDef the pre-#890 loop synthesized, then
-            // route through compile_explicit_derivation so the
-            // InstancesOfNoun + Literal-consequent + implicit-dedup
-            // path produces the per-pair Func. Discard the wrapper
-            // CompiledDerivation — we want only its `func` to fold
-            // into the outer Concat.
-            let rule = DerivationRuleDef {
-                id: format!("_subtype_{}_{}_{}", sub, sup, ft_id),
-                text: format!("{} is a subtype of {} — inherits {}", sub, sup, reading),
-                antecedent_sources: vec![
-                    crate::types::AntecedentSource::InstancesOfNoun(sub),
-                ],
-                consequent_cell: crate::types::ConsequentCellSource::Literal(ft_id),
-                consequent_instance_role: super_role,
-                kind: DerivationKind::SubtypeInheritance,
-                join_on: vec![], match_on: vec![], consequent_bindings: vec![],
-                antecedent_filters: vec![], consequent_computed_bindings: vec![],
-                consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![],
-                antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
-            };
-            compile_explicit_derivation(data, &rule).func
-        })
-        .collect();
-    if inner_funcs.is_empty() { return None; }
-    // Concat the per-pair Funcs into one Func that emits the union of
-    // every per-pair inner Func's tuple sequence. forward_chain_defs_state
-    // routes each emitted `<ft_id, reading, bindings>` tuple to its
-    // own ft_id cell (slot 0), so the merged emission is indistinguishable
-    // from the pre-#890 N-Funcs-N-defs shape at the cell level.
-    let func = Func::compose(Func::Concat, Func::construction(inner_funcs));
-    // Subtype inheritance writes to multiple FT cells (one per
-    // <super_ft_id>); the consequent cell is dynamic at evaluation
-    // time. No AbsenceOf antecedents — purely positive metamodel
-    // expansion. Leave dep metadata empty: the rule has no negative
-    // dependencies and writes shapes the stratifier doesn't need to
-    // sequence against AbsenceOf guards.
-    let (consequent_cell, _, _) =
-        derivation_dep_metadata_synth(String::new());
-    Some(CompiledDerivation {
-        id: crate::parse_forml2_stage2::SUBTYPE_INHERITANCE_RULE_ID.to_string(),
-        text: "Subtype inheritance metamodel rule (readings/core/derivation.md)".to_string(),
-        kind: DerivationKind::SubtypeInheritance,
-        func,
-                consequent_cell,
-        materialization: crate::types::MaterializationPolicy::Stored,
-    })
-}
-
+// compile_subtype_inheritance_metamodel deleted (task 983): its logic
+// is inlined at the reading-lift detection site in compile_explicit_derivation
+// and the guarded direct call in compile_derivations is removed. Subtype
+// inheritance is now produced solely by the reading-lift derivation rule
+// injected by parse_to_state_via_stage12.
 
 /// Compile SS Subset-Constraint auto-fill as ONE CompiledDerivation
 /// whose Func concatenates per-Subset-Constraint inner Funcs (#891).
@@ -11802,10 +11695,10 @@ mod schema_tests {
     /// fact per antecedent, targeting the cell named by the `id` binding.
     ///
     /// Acceptance pin for `compile_explicit_derivation` handling
-    /// `ConsequentCellSource::AntecedentRole`. The oracle
-    /// (`compile_subtype_inheritance_metamodel`) achieves the same per-FT
-    /// emission via compile-time synthesis; this test pins the same semantics
-    /// via the runtime `AntecedentRole` path.
+    /// `ConsequentCellSource::AntecedentRole`. The reading-lift detection in
+    /// `compile_explicit_derivation` achieves the same per-FT emission via
+    /// compile-time synthesis (task 983: oracle deleted); this test pins the
+    /// same semantics via the runtime `AntecedentRole` path.
     ///
     /// Population:
     ///   FactType cell has two facts:

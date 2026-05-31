@@ -2178,35 +2178,32 @@ mod tests {
     fn test_forward_chain_ast_subtype_inheritance() {
         // Teacher is subtype of Academic. Academic has Rank.
         // Forward chaining should terminate without panicking.
-        let mut cells = empty_cells();
-        cells = with_noun(cells, "Academic", &make_noun("entity"));
-        cells = with_noun(cells, "Teacher", &make_noun("entity"));
-        cells = with_subtype(cells, "Teacher", "Academic");
-        cells = with_noun(cells, "Rank", &make_noun("value"));
-        cells = with_ft(cells, "ft1", &FactTypeDef {
-            schema_id: String::new(),
-            reading: "Academic has Rank".to_string(),
-            readings: vec![],
-            roles: vec![
-                RoleDef { noun_name: "Academic".to_string(), role_index: 0 },
-                RoleDef { noun_name: "Rank".to_string(), role_index: 1 },
-            ],
-        });
-        let (_meta_pop, defs, _def_map) = compile_cells(cells);
+        // task 983: built via parse path so the subtype-inheritance
+        // derivation rule is injected by parse_to_state_via_stage12.
+        let src = "\
+Academic(.id) is an entity type.\n\
+Teacher(.id) is an entity type.\n\
+  Teacher is a subtype of Academic.\n\
+Rank is a value type.\n\
+Academic has Rank.\n\
+";
+        let schema_state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let (defs, _def_map) = state_to_defs(&schema_state);
 
         // Behaviour assertion (#287 gap #10): at least one derivation
-        // rule exists whose DerivationKind is SubtypeInheritance —
-        // the kind tag survives renaming unlike the cell-name
-        // substring. compile_explicit_derivation propagates
-        // `rule.kind` into the CompiledDerivation emitted per
-        // (subtype, super_ft) triple.
+        // rule exists — the kind tag survives the parse path.
         let dd = derivation_defs_from(&defs);
         assert!(!dd.is_empty(),
             "Expected at least one derivation for Teacher-is-subtype-of-Academic schema");
 
         // Teacher T1 has Rank P — forward chain doesn't panic.
-        let state = state_with_facts("ft1", &[&[("Academic", "T1"), ("Rank", "P")]]);
-        let (_new_state, _derived) = forward_chain_defs_state(&dd, &state);
+        let pop = ast::cell_push(
+            "Academic_has_Rank",
+            ast::fact_from_pairs(&[("Academic", "T1"), ("Rank", "P")]),
+            &schema_state,
+        );
+        let (_new_state, _derived) = forward_chain_defs_state(&dd, &pop);
     }
 
     #[test]
@@ -2755,51 +2752,35 @@ mod tests {
 
     #[test]
     fn test_subtype_inheritance_derivation() {
-        let mut cells = empty_cells();
-
-        cells = with_noun(cells, "Vehicle", &make_noun("entity"));
-        cells = with_noun(cells, "Car", &make_noun("entity"));
-        cells = with_subtype(cells, "Car", "Vehicle");
-        cells = with_noun(cells, "License", &make_noun("entity"));
-
-        cells = with_ft(cells, "ft_vehicle_license", &FactTypeDef {
-            schema_id: String::new(),
-            reading: "Vehicle has License".to_string(),
-            readings: vec![],
-            roles: vec![
-                RoleDef { noun_name: "Vehicle".to_string(), role_index: 0 },
-                RoleDef { noun_name: "License".to_string(), role_index: 1 },
-            ],
-        });
-
-        cells = with_ft(cells, "ft_car_color", &FactTypeDef {
-            schema_id: String::new(),
-            reading: "Car has Color".to_string(),
-            readings: vec![],
-            roles: vec![
-                RoleDef { noun_name: "Car".to_string(), role_index: 0 },
-            ],
-        });
-
-        let (_meta_pop, defs, _def_map) = compile_cells(cells);
+        // task 983: built via parse path so the subtype-inheritance
+        // derivation rule is injected by parse_to_state_via_stage12.
+        let src = "\
+Vehicle(.id) is an entity type.\n\
+Car(.id) is an entity type.\n\
+  Car is a subtype of Vehicle.\n\
+License is a value type.\n\
+Color is a value type.\n\
+Vehicle has License.\n\
+Car has Color.\n\
+Car 'my_car' has Color 'red'.\n\
+";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let (defs, _def_map) = state_to_defs(&state);
         let dd = derivation_defs_from(&defs);
 
         // Behaviour assertion (#287 gap #10): forward chain over a
         // population with a Car instance must derive an inherited
         // fact into the supertype (Vehicle) FT. Inspect derived
         // facts directly — no cell-name substring probing.
-        let mut pop_state = ast::Object::phi();
-        pop_state = ast::cell_push("ft_car_color", ast::fact_from_pairs(&[("Car", "my_car")]), &pop_state);
-        let state = pop_state;
-
         let (_new_state, derived) = forward_chain_defs_state(&dd, &state);
 
         let inheritance_facts: Vec<_> = derived.iter()
-            .filter(|d| d.fact_type_id == "ft_vehicle_license"
+            .filter(|d| d.fact_type_id == "Vehicle_has_License"
                 && d.bindings.iter().any(|(_, v)| v == "my_car"))
             .collect();
         assert!(!inheritance_facts.is_empty(),
-            "Expected inherited fact in ft_vehicle_license for Car instance 'my_car'; got {:?}", derived);
+            "Expected inherited fact in Vehicle_has_License for Car instance 'my_car'; got {:?}", derived);
     }
 
     #[test]
@@ -2883,74 +2864,56 @@ mod tests {
     }
 
     /// #287 gap #11 — focused test for the AntecedentSource::InstancesOfNoun
-    /// shape in compile_explicit_derivation. Constructs a minimal
-    /// DerivationRuleDef with that antecedent + a Literal consequent
-    /// + a target role name. Populates the would-be consequent cell
-    /// with an "existing" fact for one instance to exercise the
-    /// dedup guard (gap #12). Verifies the derivation emits one
-    /// <consequent_id, reading, <<role, atom>>> fact per MISSING
+    /// shape in compile_explicit_derivation. Builds fixture state via
+    /// parse_to_state_via_stage12 (task 983) so the subtype-inheritance
+    /// derivation rule is injected by the parse path. Populates the
+    /// would-be consequent cell with an "existing" fact for one instance
+    /// to exercise the dedup guard (gap #12). Verifies the derivation
+    /// emits one <consequent_id, reading, <<role, atom>>> fact per MISSING
     /// instance, skipping the one that already participates.
     #[test]
     fn test_instances_of_noun_antecedent_with_dedup_guard() {
-        let mut cells = empty_cells();
-
-        cells = with_noun(cells, "Dog", &make_noun("entity"));
-        cells = with_noun(cells, "Animal", &make_noun("entity"));
-        cells = with_subtype(cells, "Dog", "Animal");
-        cells = with_noun(cells, "Name", &make_noun("value"));
-
-        cells = with_ft(cells, "ft_dog_name", &FactTypeDef {
-            schema_id: String::new(),
-            reading: "Dog has Name".to_string(),
-            readings: vec![],
-            roles: vec![
-                RoleDef { noun_name: "Dog".to_string(), role_index: 0 },
-                RoleDef { noun_name: "Name".to_string(), role_index: 1 },
-            ],
-        });
-        cells = with_ft(cells, "ft_animal_owner", &FactTypeDef {
-            schema_id: String::new(),
-            reading: "Animal has Owner".to_string(),
-            readings: vec![],
-            roles: vec![
-                RoleDef { noun_name: "Animal".to_string(), role_index: 0 },
-                RoleDef { noun_name: "Name".to_string(), role_index: 1 },
-            ],
-        });
-
-        let (_meta_pop, defs, _def_map) = compile_cells(cells);
+        // task 983: built via parse path so the subtype-inheritance
+        // derivation rule is injected by parse_to_state_via_stage12.
+        let src = "\
+Animal(.id) is an entity type.\n\
+Dog(.id) is an entity type.\n\
+  Dog is a subtype of Animal.\n\
+Name is a value type.\n\
+Owner is a value type.\n\
+Dog has Name.\n\
+Animal has Owner.\n\
+Dog 'fido' has Name 'Fido'.\n\
+Dog 'rex' has Name 'Rex'.\n\
+Animal 'fido' has Owner 'alice'.\n\
+";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let (defs, _def_map) = state_to_defs(&state);
         let dd = derivation_defs_from(&defs);
 
-        // Two dogs; one already has an Animal-owner record, the
-        // other doesn't. The dedup guard should skip the already-
+        // Two dogs; one already has an Animal-owner record (parsed in),
+        // the other doesn't. The dedup guard should skip the already-
         // participating one.
-        let mut pop = ast::Object::phi();
-        pop = ast::cell_push("ft_dog_name",
-            ast::fact_from_pairs(&[("Dog", "fido"), ("Name", "Fido")]), &pop);
-        pop = ast::cell_push("ft_dog_name",
-            ast::fact_from_pairs(&[("Dog", "rex"), ("Name", "Rex")]), &pop);
-        pop = ast::cell_push("ft_animal_owner",
-            ast::fact_from_pairs(&[("Animal", "fido"), ("Name", "alice")]), &pop);
+        let (_s, derived) = forward_chain_defs_state(&dd, &state);
 
-        let (_s, derived) = forward_chain_defs_state(&dd, &pop);
-
-        // Inherited Animal facts in ft_animal_owner, from Dog instances.
+        // Inherited Animal facts in Animal_has_Owner, from Dog instances.
         let inherited: Vec<_> = derived.iter()
-            .filter(|d| d.fact_type_id == "ft_animal_owner")
+            .filter(|d| d.fact_type_id == "Animal_has_Owner")
             .collect();
 
-        // fido is already in ft_animal_owner with <Animal, fido> at
+        // fido is already in Animal_has_Owner with <Animal, fido> at
         // role 0 — dedup guard must skip it.
         let fido_inherited = inherited.iter()
             .any(|d| d.bindings.iter().any(|(_, v)| v == "fido"));
         assert!(!fido_inherited,
-            "Dedup guard failed: fido already participates in ft_animal_owner but got re-emitted: {:?}", inherited);
+            "Dedup guard failed: fido already participates in Animal_has_Owner but got re-emitted: {:?}", inherited);
 
         // rex has no Animal record — dedup guard must emit.
         let rex_inherited = inherited.iter()
             .any(|d| d.bindings.iter().any(|(_, v)| v == "rex"));
         assert!(rex_inherited,
-            "Expected inherited fact for Dog 'rex' into ft_animal_owner; got {:?}", inherited);
+            "Expected inherited fact for Dog 'rex' into Animal_has_Owner; got {:?}", inherited);
     }
 
     #[test]
