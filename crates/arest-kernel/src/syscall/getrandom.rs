@@ -188,13 +188,43 @@ mod tests {
     use alloc::vec::Vec;
     use arest::entropy::{self, DeterministicSource};
 
-    /// Test fixture mirror of `process::tests::with_deterministic_entropy`
-    /// (process/process.rs:673). Installs a deterministic source,
-    /// forces a CSPRNG reseed, runs the body, then uninstalls + reseeds
-    /// so the next test starts clean. Required because
-    /// `handle`/`fill_userspace` reach `arest::csprng::random_bytes`
-    /// which panics if no entropy source is installed.
+    // ── Test serialization lock ──────────────────────────────────────────
+    //
+    // `arest::csprng::STATE` and `arest::entropy::GLOBAL_SOURCE` are
+    // process-wide singletons. `cargo test` runs tests in parallel by
+    // default. Without a module-level lock, two `with_deterministic_
+    // entropy` calls can race:
+    //
+    //   Thread A: entropy::install(seed_A), csprng::reseed()
+    //   Thread B: entropy::install(seed_B), csprng::reseed()   ← overwrites A
+    //   Thread A: handle(…)  ← CSPRNG is now keyed from seed_B, not seed_A
+    //
+    // or worse: a test from `arest-foundation::csprng::tests` holds
+    // `arest::entropy::TEST_LOCK` and calls `entropy::uninstall() +
+    // csprng::reseed()` mid-way through our body, causing `seed_from_entropy`
+    // to panic ("no entropy source installed").
+    //
+    // `TEST_ENTROPY_LOCK` serialises the install / body / uninstall
+    // sequence so each test sees an undisturbed entropy world. This
+    // mirrors `process::tests::TEST_ENTROPY_LOCK` (process.rs:786)
+    // and explains why getrandom_fills_buffer / getrandom_flags_ignored
+    // were flaky: they were the only module-level tests missing this guard.
+    //
+    // Note: `arest::entropy::TEST_LOCK` is `pub(crate)` to arest-foundation
+    // and not re-exported from `arest`, so it is unreachable here; we carry
+    // our own lock. The spin::Mutex has no poison state, so a test that
+    // panics with the lock held leaves it accessible to subsequent tests
+    // — the intentional `#[should_panic]` cases in arest-foundation rely
+    // on this same property.
+    static TEST_ENTROPY_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+    /// Install a deterministic entropy source, force a CSPRNG reseed,
+    /// run `body`, then uninstall + reseed so the next test starts clean.
+    ///
+    /// Holds `TEST_ENTROPY_LOCK` for the entire duration so no concurrent
+    /// test can swap the global source under us.
     fn with_deterministic_entropy<F: FnOnce()>(seed: [u8; 32], body: F) {
+        let _guard = TEST_ENTROPY_LOCK.lock();
         entropy::install(alloc::boxed::Box::new(DeterministicSource::new(seed)));
         arest::csprng::reseed();
         body();
@@ -202,38 +232,58 @@ mod tests {
         arest::csprng::reseed();
     }
 
-    /// `getrandom(buf, 32, 0)` fills all 32 bytes and returns 32. The
-    /// deterministic source guarantees the bytes aren't all zero
-    /// (a zero-init buffer that the fill skipped would otherwise
-    /// pass a "returns 32" check while silently doing nothing).
+    /// `getrandom(buf, 32, 0)` fills all 32 bytes and returns 32.
+    ///
+    /// The assertion uses the exact 32-byte ChaCha20 keystream produced
+    /// by `DeterministicSource([7u8; 32])` after one reseed — a fixed
+    /// test vector derived from the deterministic seed. This replaces the
+    /// former probabilistic `any(|&b| b != 0)` check that was flaky under
+    /// concurrent execution (the previous check relied on the CSPRNG state
+    /// not having been corrupted by a racing test; with the lock it is
+    /// strictly deterministic and the exact-bytes check proves the fill
+    /// reached the right keystream, not just any non-zero output).
     #[test]
     fn getrandom_fills_buffer() {
+        // Expected: ChaCha20 keystream from DeterministicSource([7u8; 32]),
+        // first 32 bytes after one reseed. Computed once and pinned here
+        // so a regression in csprng.rs or DeterministicSource shows up as
+        // a diff in this constant, not as a flaky pass.
+        const EXPECTED: [u8; 32] = [
+            80, 209, 88, 52, 57, 26, 251, 129, 3, 215, 234, 162, 41, 105, 133, 207,
+            102, 168, 46, 67, 246, 26, 242, 88, 37, 56, 145, 173, 89, 168, 240, 33,
+        ];
         with_deterministic_entropy([7u8; 32], || {
             let mut buf = [0u8; 32];
             let result = handle(buf.as_mut_ptr() as u64, buf.len() as u64, 0);
             assert_eq!(result, 32);
-            // ChaCha20 keystream from the deterministic seed has the
-            // not-all-zero property by construction (the cipher's
-            // output is uniformly distributed); a 32-byte all-zero
-            // run has probability ~2^-256.
-            assert!(buf.iter().any(|&b| b != 0),
-                "getrandom must actually fill the buffer; got all-zero");
+            assert_eq!(buf, EXPECTED,
+                "getrandom must fill the buffer with the exact CSPRNG keystream");
         });
     }
 
     /// `getrandom(buf, 2 MiB, 0)` short-reads to the 1 MiB cap and
     /// returns 1 MiB. Userspace libc loops on the remainder.
+    ///
+    /// The first-32-bytes assertion is a deterministic test vector from
+    /// `DeterministicSource([3u8; 32])`, replacing a probabilistic
+    /// `any(|&b| b != 0)` that was vulnerable to the same concurrent-
+    /// state-corruption flake as `getrandom_fills_buffer`.
     #[test]
     fn getrandom_short_read_at_cap() {
+        // Expected: first 32 bytes of the 1 MiB fill from seed [3u8; 32].
+        const EXPECTED_HEAD: [u8; 32] = [
+            181, 192, 64, 108, 129, 130, 5, 8, 42, 249, 48, 232, 222, 192, 46, 16,
+            167, 251, 249, 68, 2, 156, 23, 92, 45, 127, 35, 161, 73, 207, 185, 254,
+        ];
         with_deterministic_entropy([3u8; 32], || {
             let mut buf: Vec<u8> = vec![0u8; (2 * GETRANDOM_MAX) as usize];
             let result = handle(buf.as_mut_ptr() as u64, 2 * GETRANDOM_MAX, 0);
             assert_eq!(result, GETRANDOM_MAX as i64);
-            // The first `GETRANDOM_MAX` bytes should be filled (not
-            // all zero); the tail past the cap should remain at its
-            // initial zero state.
-            assert!(buf[..GETRANDOM_MAX as usize].iter().any(|&b| b != 0),
-                "first MiB must be CSPRNG-filled");
+            // First 32 bytes of the filled region must match the pinned
+            // test vector — proves the fill reached the right keystream.
+            assert_eq!(&buf[..32], &EXPECTED_HEAD,
+                "first 32 bytes of filled region must match seed-3 test vector");
+            // The tail past the cap must remain at the zero-init value.
             assert!(buf[GETRANDOM_MAX as usize..].iter().all(|&b| b == 0),
                 "bytes past the cap must be untouched");
         });
@@ -262,9 +312,18 @@ mod tests {
     /// The dispatch table routes syscall 318 to this handler.
     /// `getrandom(buf, 32, 0)` invoked through `dispatch::dispatch`
     /// returns 32 (the count) — confirms the wire-up.
+    ///
+    /// The exact-bytes assertion uses the pinned test vector for seed
+    /// [5u8; 32] rather than a probabilistic non-zero check.
     #[test]
     fn getrandom_dispatch_route() {
         use crate::syscall::dispatch::{dispatch, SYS_GETRANDOM};
+        // Expected: ChaCha20 keystream from DeterministicSource([5u8; 32]),
+        // first 32 bytes after one reseed.
+        const EXPECTED: [u8; 32] = [
+            32, 225, 175, 251, 252, 174, 235, 213, 92, 227, 205, 197, 2, 29, 147, 254,
+            104, 81, 204, 14, 75, 21, 236, 192, 187, 203, 138, 184, 114, 121, 232, 203,
+        ];
         with_deterministic_entropy([5u8; 32], || {
             let mut buf = [0u8; 32];
             let result = dispatch(
@@ -277,8 +336,8 @@ mod tests {
                 0,
             );
             assert_eq!(result, 32);
-            assert!(buf.iter().any(|&b| b != 0),
-                "dispatch route must reach the real CSPRNG fill");
+            assert_eq!(buf, EXPECTED,
+                "dispatch route must fill with exact CSPRNG keystream for seed-5");
         });
     }
 
@@ -286,15 +345,24 @@ mod tests {
     /// GRND_RANDOM)` produces a successful fill identical in shape
     /// (length, returns) to `getrandom(buf, n, 0)`. AREST has one
     /// entropy stream; no flag changes the behaviour.
+    ///
+    /// The exact-bytes assertion replaces the former probabilistic
+    /// `any(|&b| b != 0)` that was flaky under concurrent test execution.
     #[test]
     fn getrandom_flags_ignored() {
+        // Expected: ChaCha20 keystream from DeterministicSource([9u8; 32]),
+        // first 16 bytes after one reseed.
+        const EXPECTED: [u8; 16] = [
+            128, 246, 217, 43, 250, 12, 250, 184, 116, 159, 239, 241, 115, 7, 98, 24,
+        ];
         with_deterministic_entropy([9u8; 32], || {
             let mut buf = [0u8; 16];
             // 0x0001 = GRND_NONBLOCK; 0x0002 = GRND_RANDOM. Both are
             // accepted as no-ops.
             let result = handle(buf.as_mut_ptr() as u64, buf.len() as u64, 0x0003);
             assert_eq!(result, 16);
-            assert!(buf.iter().any(|&b| b != 0));
+            assert_eq!(buf, EXPECTED,
+                "flags must be ignored; fill must match seed-9 test vector");
         });
     }
 
