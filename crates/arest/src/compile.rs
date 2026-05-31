@@ -11668,6 +11668,179 @@ mod schema_tests {
             "mixed rule must still contain a Filter from the unkeyed \
              branch's legacy scan; got {:?}", compiled.func);
     }
+
+    // ── task-979: AntecedentRole consequent cell in compile_explicit_derivation ─
+    //
+    // The consequent cell id is a BINDING extracted from the antecedent fact
+    // at evaluation time (ConsequentCellSource::AntecedentRole), not a
+    // compile-time literal. This is the compile-side prerequisite for the
+    // subtype-inheritance derivation reading in readings/core/derivation.md:
+    // the "Fact Type" whose cell receives the derived binding is itself bound
+    // from the antecedent FactType scan.
+    //
+    // The 1-antecedent branch in compile_explicit_derivation already handles
+    // this correctly:
+    //   - consequent_id_func = role_value_by_name("id") (extracts cell key)
+    //   - bindings_func = Func::Id (inherits antecedent bindings unchanged)
+    // These two tests verify the shape compiles and that the Func correctly
+    // fans out one derived fact per antecedent, each targeting the cell named
+    // by the antecedent's "id" binding.
+
+    /// task-979 (compile): AntecedentRole consequent compiles without panic.
+    ///
+    /// `compile_explicit_derivation` must NOT crash or return phi when the
+    /// rule's `consequent_cell` is `AntecedentRole { antecedent_index: 0,
+    /// role: "id" }`. The antecedent is `FactType("FactType")` (the metamodel
+    /// schema cell), which has no entry in `data.fact_types` — compile
+    /// falls through to the pure-inheritance (`Func::Id`) bindings branch,
+    /// which is the correct shape for this rule.
+    #[test]
+    fn task979_antecedent_role_consequent_compiles_without_panic() {
+        let data = CellIndex {
+            nouns: Default::default(),
+            fact_types: Default::default(),
+            constraints: vec![],
+            derivation_rules: vec![],
+            subtypes: Default::default(),
+            ref_schemes: Default::default(),
+            enum_values: Default::default(),
+            general_instance_facts: vec![],
+            violation_templates: ConstraintViolationTemplateTable::boot(),
+        };
+        let rule = DerivationRuleDef {
+            id: "test_antecedent_role_panics".into(),
+            text: "test rule for AntecedentRole consequent".into(),
+            antecedent_sources: vec![
+                crate::types::AntecedentSource::FactType("FactType".into()),
+            ],
+            consequent_cell: crate::types::ConsequentCellSource::AntecedentRole {
+                antecedent_index: 0,
+                role: "id".into(),
+            },
+            consequent_instance_role: String::new(),
+            kind: DerivationKind::ModusPonens,
+            join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![],
+            consequent_aggregates: vec![], consequent_universals: vec![],
+            unresolved_clauses: vec![], antecedent_role_literals: vec![],
+            antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+            materialization: crate::types::MaterializationPolicy::Stored,
+            ring_join: None, skolem_head_roles: vec![],
+        };
+        // Must not panic.
+        let compiled = compile_explicit_derivation(&data, &rule);
+        // The compiled Func must be non-trivial: it should include a
+        // FetchOrPhi node emitted by extract_facts_from_pop (the antecedent
+        // cell fetch). A Constant(phi) output would mean the branch
+        // silently degenerated and never fires.
+        let has_fetch = func_any(&compiled.func, &|f| matches!(f, F::FetchOrPhi));
+        assert!(has_fetch,
+            "AntecedentRole consequent must produce a Func that fetches the \
+             antecedent cell (FetchOrPhi), not a constant/phi; got {:?}",
+            compiled.func);
+    }
+
+    /// task-979 (compile+eval): AntecedentRole consequent emits one derived
+    /// fact per antecedent, targeting the cell named by the `id` binding.
+    ///
+    /// Acceptance pin for `compile_explicit_derivation` handling
+    /// `ConsequentCellSource::AntecedentRole`. The oracle
+    /// (`compile_subtype_inheritance_metamodel`) achieves the same per-FT
+    /// emission via compile-time synthesis; this test pins the same semantics
+    /// via the runtime `AntecedentRole` path.
+    ///
+    /// Population:
+    ///   FactType cell has two facts:
+    ///     { id: "FT_A", reading: "A relates B" }
+    ///     { id: "FT_B", reading: "B contains C" }
+    ///
+    /// Expected: two derived facts:
+    ///   - cell_id = "FT_A", bindings include (id, "FT_A") and (reading, "A relates B")
+    ///   - cell_id = "FT_B", bindings include (id, "FT_B") and (reading, "B contains C")
+    #[test]
+    fn task979_antecedent_role_consequent_fans_out_one_fact_per_antecedent() {
+        let data = CellIndex {
+            nouns: Default::default(),
+            fact_types: Default::default(),
+            constraints: vec![],
+            derivation_rules: vec![],
+            subtypes: Default::default(),
+            ref_schemes: Default::default(),
+            enum_values: Default::default(),
+            general_instance_facts: vec![],
+            violation_templates: ConstraintViolationTemplateTable::boot(),
+        };
+        let rule = DerivationRuleDef {
+            id: "test_antecedent_role_fanout".into(),
+            text: "test rule for AntecedentRole fanout".into(),
+            antecedent_sources: vec![
+                crate::types::AntecedentSource::FactType("FactType".into()),
+            ],
+            consequent_cell: crate::types::ConsequentCellSource::AntecedentRole {
+                antecedent_index: 0,
+                role: "id".into(),
+            },
+            consequent_instance_role: String::new(),
+            kind: DerivationKind::ModusPonens,
+            join_on: vec![], match_on: vec![], consequent_bindings: vec![],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![],
+            consequent_aggregates: vec![], consequent_universals: vec![],
+            unresolved_clauses: vec![], antecedent_role_literals: vec![],
+            antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
+            materialization: crate::types::MaterializationPolicy::Stored,
+            ring_join: None, skolem_head_roles: vec![],
+        };
+        let compiled = compile_explicit_derivation(&data, &rule);
+
+        // Hand-build a population with two FactType schema facts.
+        let ft1 = fact_from_pairs(&[("id", "FT_A"), ("reading", "A relates B")]);
+        let ft2 = fact_from_pairs(&[("id", "FT_B"), ("reading", "B contains C")]);
+        let state = ast::cell_push("FactType", ft1, &Object::phi());
+        let state = ast::cell_push("FactType", ft2, &state);
+        let pop = ast::encode_state(&state);
+        let out = ast::apply(&compiled.func, &pop, &state);
+
+        // Decode the output: each emitted triple is <cell_id, reading, bindings>.
+        let derived: Vec<(String, Vec<(String, String)>)> =
+            out.as_seq().map(|items| items.iter().filter_map(|item| {
+                let fact = item.as_seq()?;
+                if fact.len() < 3 { return None; }
+                let cell_id = fact[0].as_atom()?.to_string();
+                let bindings: Vec<(String, String)> = fact[2].as_seq()
+                    .map(|pairs| pairs.iter().filter_map(|p| {
+                        let kv = p.as_seq()?;
+                        if kv.len() != 2 { return None; }
+                        Some((kv[0].as_atom()?.to_string(), kv[1].as_atom()?.to_string()))
+                    }).collect())
+                    .unwrap_or_default();
+                Some((cell_id, bindings))
+            }).collect()).unwrap_or_default();
+
+        assert_eq!(derived.len(), 2,
+            "AntecedentRole consequent must emit one fact per FactType antecedent; \
+             got {:#?}", derived);
+
+        // Verify cell_id comes from the antecedent's "id" binding.
+        assert!(
+            derived.iter().any(|(id, _)| id == "FT_A"),
+            "first derived fact must target cell 'FT_A'; got {:#?}", derived
+        );
+        assert!(
+            derived.iter().any(|(id, _)| id == "FT_B"),
+            "second derived fact must target cell 'FT_B'; got {:#?}", derived
+        );
+
+        // Verify bindings are inherited from the antecedent (Func::Id path).
+        let fa = derived.iter().find(|(id, _)| id == "FT_A").unwrap();
+        assert!(
+            fa.1.iter().any(|(k, v)| k == "id" && v == "FT_A"),
+            "FT_A derived fact must carry (id, 'FT_A') binding; got {:#?}", fa.1
+        );
+        assert!(
+            fa.1.iter().any(|(k, v)| k == "reading" && v == "A relates B"),
+            "FT_A derived fact must carry (reading, 'A relates B') binding; got {:#?}", fa.1
+        );
+    }
 }
 
 // ── SQL Type Mapping table (#896) ────────────────────────────────────
