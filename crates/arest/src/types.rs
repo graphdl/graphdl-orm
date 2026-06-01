@@ -463,6 +463,13 @@ pub struct DerivationRuleDef {
     /// that does not introduce a fresh entity in its head.
     #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub skolem_head_roles: Vec<SkolemHeadRole>,
+    /// Cardinality (`at most N` / `at least N`) count premises on
+    /// antecedents. Each lifts the named bridge FT out of the positive
+    /// equi-join and applies it as a per-group count guard on the
+    /// remaining antecedents. Empty for every rule whose antecedents are
+    /// all plain existentials. See `AntecedentCardinality`.
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Vec::is_empty"))]
+    pub antecedent_cardinalities: Vec<AntecedentCardinality>,
 }
 
 /// A single existential (Skolem) role in a derivation rule head.
@@ -578,6 +585,7 @@ impl Default for DerivationRuleDef {
             materialization: MaterializationPolicy::Stored,
             ring_join: None,
             skolem_head_roles: Vec::new(),
+            antecedent_cardinalities: Vec::new(),
         }
     }
 }
@@ -767,6 +775,17 @@ impl DerivationRuleDef {
             out.push(']');
         }
 
+        // 20. antecedentCardinalities (derivation-cardinality-count —
+        //     skip if empty Vec so existing rule IDs stay hash-stable).
+        if !self.antecedent_cardinalities.is_empty() {
+            out.push_str(",\"antecedentCardinalities\":[");
+            for (i, c) in self.antecedent_cardinalities.iter().enumerate() {
+                if i > 0 { out.push(','); }
+                antecedent_cardinality_write(&mut out, c);
+            }
+            out.push(']');
+        }
+
         out.push('}');
         out
     }
@@ -829,6 +848,24 @@ fn skolem_head_role_write(out: &mut String, shr: &SkolemHeadRole) {
         json_escape(out, f);
     }
     out.push_str("]}");
+}
+
+/// `AntecedentCardinality` → `{"antecedentIndex":N,"atMost":bool,
+/// "count":N,"groupKeyRole":"…","countRole":"…"}`. Field order/casing
+/// mirrors serde's `rename_all = "camelCase"` derive; `atMost` is a bare
+/// JSON boolean.
+fn antecedent_cardinality_write(out: &mut String, c: &AntecedentCardinality) {
+    out.push_str("{\"antecedentIndex\":");
+    json_write_usize(out, c.antecedent_index);
+    out.push_str(",\"atMost\":");
+    out.push_str(if c.at_most { "true" } else { "false" });
+    out.push_str(",\"count\":");
+    json_write_usize(out, c.count);
+    out.push_str(",\"groupKeyRole\":");
+    json_escape(out, &c.group_key_role);
+    out.push_str(",\"countRole\":");
+    json_escape(out, &c.count_role);
+    out.push('}');
 }
 
 /// Internally-tagged enum (`tag = "kind", content = "value"`) with
@@ -1100,6 +1137,37 @@ pub struct AntecedentRoleComparison {
     pub rhs_antecedent_index: usize,
     /// Role name on the RHS antecedent's fact type.
     pub rhs_role: String,
+}
+
+/// Cardinality quantifier on a derivation antecedent — the `at most N` /
+/// `at least N` count premise. See `DerivationRuleDef::antecedent_cardinalities`.
+///
+/// FORML 2 (Halpin) lets a derivation antecedent count a bridge role:
+///   * Item is guarded clear iff Item is named and Item is marked by
+///     at most 0 Tag.
+/// Here the `Item is marked by ... Tag` antecedent is a COUNT premise, not a
+/// plain existential join: the rule fires for an Item only when the number of
+/// `Tag`s marking it satisfies the bound. Recorded against the bridge FT's
+/// `antecedent_index`; `group_key_role` is the noun the count groups by (the
+/// shared join noun, e.g. `Item`) and `count_role` is the counted role (the
+/// other role on the bridge FT, e.g. `Tag`). At compile time the bridge FT is
+/// LIFTED OUT of the positive equi-join and applied as a group-by-and-count
+/// guard on the remaining (guard) antecedents (see `compile_join_derivation`).
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "std-deps", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "std-deps", serde(rename_all = "camelCase"))]
+pub struct AntecedentCardinality {
+    /// Index into `antecedent_sources` of the bridge (counted) FT.
+    pub antecedent_index: usize,
+    /// `true` → `at most N` (count ≤ N); `false` → `at least N` (count ≥ N).
+    pub at_most: bool,
+    /// The bound N (a non-negative count).
+    pub count: usize,
+    /// Noun the count groups by — the shared join noun (e.g. `Item`).
+    pub group_key_role: String,
+    /// Noun whose occurrences are counted per group (the other bridge
+    /// role, e.g. `Tag`).
+    pub count_role: String,
 }
 
 /// Positional join plan for a self-ring / ring-FT `Join` derivation,
@@ -1730,6 +1798,7 @@ mod canonical_json_tests {
             materialization: MaterializationPolicy::Stored,
             ring_join: None,
             skolem_head_roles: Vec::new(),
+            antecedent_cardinalities: Vec::new(),
         }
     }
 
@@ -1755,6 +1824,7 @@ mod canonical_json_tests {
             materialization: MaterializationPolicy::Stored,
             ring_join: None,
             skolem_head_roles: Vec::new(),
+            antecedent_cardinalities: Vec::new(),
         }
     }
 
@@ -1794,6 +1864,7 @@ mod canonical_json_tests {
             materialization: MaterializationPolicy::Stored,
             ring_join: None,
             skolem_head_roles: Vec::new(),
+            antecedent_cardinalities: Vec::new(),
         }
     }
 
@@ -1824,6 +1895,7 @@ mod canonical_json_tests {
             materialization: MaterializationPolicy::Stored,
             ring_join: None,
             skolem_head_roles: Vec::new(),
+            antecedent_cardinalities: Vec::new(),
         }
     }
 
@@ -1854,6 +1926,7 @@ mod canonical_json_tests {
             materialization: MaterializationPolicy::Stored,
             ring_join: None,
             skolem_head_roles: Vec::new(),
+            antecedent_cardinalities: Vec::new(),
         }
     }
 
@@ -1888,6 +1961,7 @@ mod canonical_json_tests {
                 consequent_positions: alloc::vec![Some((0usize, 0usize)), Some((1usize, 1usize))],
             }),
             skolem_head_roles: Vec::new(),
+            antecedent_cardinalities: Vec::new(),
         }
     }
 
@@ -1924,6 +1998,7 @@ mod canonical_json_tests {
             materialization: MaterializationPolicy::Stored,
             ring_join: None,
             skolem_head_roles: Vec::new(),
+            antecedent_cardinalities: Vec::new(),
         }
     }
 
@@ -1968,6 +2043,48 @@ mod canonical_json_tests {
             materialization: MaterializationPolicy::Stored,
             ring_join: None,
             skolem_head_roles: Vec::new(),
+            antecedent_cardinalities: Vec::new(),
+        }
+    }
+
+    fn sample_rule_with_cardinality() -> DerivationRuleDef {
+        // derivation-cardinality-count — exercises the
+        // `antecedentCardinalities` field's canonical-JSON serialization
+        // (bool `atMost`, integer `count`, the two role strings) against
+        // serde byte-for-byte. Mirrors the lift `resolve_derivation_rule`
+        // builds for `Item is guarded clear iff Item is named and Item is
+        // marked by at most 0 Tag`.
+        DerivationRuleDef {
+            id: "rule_guarded_clear".to_string(),
+            text: "Item is guarded clear iff Item is named and Item is marked by at most 0 Tag".to_string(),
+            antecedent_sources: alloc::vec![
+                AntecedentSource::FactType("Item_is_named".to_string()),
+                AntecedentSource::FactType("Item_is_marked_by_Tag".to_string()),
+            ],
+            consequent_instance_role: String::new(),
+            consequent_cell: ConsequentCellSource::Literal("Item_is_guarded_clear".to_string()),
+            kind: DerivationKind::Join,
+            join_on: alloc::vec!["Item".to_string()],
+            match_on: alloc::vec![("Item".to_string(), "Item".to_string())],
+            consequent_bindings: alloc::vec!["Item".to_string()],
+            antecedent_filters: Vec::new(),
+            consequent_computed_bindings: Vec::new(),
+            consequent_aggregates: Vec::new(),
+            consequent_universals: Vec::new(),
+            unresolved_clauses: Vec::new(),
+            antecedent_role_literals: Vec::new(),
+            antecedent_role_comparisons: Vec::new(),
+            consequent_role_literals: Vec::new(),
+            materialization: MaterializationPolicy::View,
+            ring_join: None,
+            skolem_head_roles: Vec::new(),
+            antecedent_cardinalities: alloc::vec![AntecedentCardinality {
+                antecedent_index: 1,
+                at_most: true,
+                count: 0,
+                group_key_role: "Item".to_string(),
+                count_role: "Tag".to_string(),
+            }],
         }
     }
 
@@ -1986,6 +2103,7 @@ mod canonical_json_tests {
             sample_rule_with_ring_join(),
             sample_rule_with_universal(),
             sample_rule_with_enum_rank_aggregate(),
+            sample_rule_with_cardinality(),
         ] {
             let serde_out = serde_json::to_string(&r).expect("serde_json should serialize");
             let canonical = r.to_canonical_json();
@@ -2011,6 +2129,7 @@ mod canonical_json_tests {
             sample_rule_with_escapes(),
             sample_rule_with_ring_join(),
             sample_rule_with_universal(),
+            sample_rule_with_cardinality(),
         ] {
             let canonical = r.to_canonical_json();
             let parsed: DerivationRuleDef = serde_json::from_str(&canonical)

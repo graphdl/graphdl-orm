@@ -1321,6 +1321,50 @@ fn split_antecedent_comparator(text: &str) -> (String, Option<(String, f64)>) {
     }
 }
 
+/// Pull a cardinality quantifier (`at most N` / `at least N`) out of a
+/// derivation-antecedent clause. FORML 2 (Halpin) writes a COUNT premise as
+///   `Item is marked by at most 0 Tag`   (count of Tags marking Item ≤ 0)
+///   `Item is marked by at least 1 Tag`  (count ≥ 1)
+/// where the `at most N` / `at least N` phrase sits between the verb and the
+/// trailing counted noun. This is NOT the same as the trailing numeric
+/// comparator `peel_trailing_comparator` handles (`has Population >= 1000000`,
+/// which compares a role VALUE) — here `N` bounds the CARDINALITY of a role's
+/// image set.
+///
+/// Returns `Some((at_most, count, stripped))` when such a phrase is present,
+/// where `at_most == true` for `at most`, `false` for `at least`, `count` is
+/// the integer bound, and `stripped` is the clause with the `at most N ` /
+/// `at least N ` phrase removed so the bridge fact type resolves cleanly
+/// (`Item is marked by Tag`). `None` when no cardinality phrase is present.
+///
+/// Only integer bounds match — `at most one` (the UC spelling, no digit) is
+/// left for the constraint classifier and returns `None` here.
+fn extract_antecedent_cardinality(text: &str) -> Option<(bool, usize, String)> {
+    // Longest-/specific-first: both markers carry a trailing space so the
+    // digit run starts immediately after.
+    for (marker, at_most) in [("at most ", true), ("at least ", false)] {
+        let Some(idx) = text.find(marker) else { continue };
+        let after = &text[idx + marker.len()..];
+        // The bound is the leading ASCII digit run. `at most one`/`at least
+        // one` (word form) has no digit → skip (returns None for that marker).
+        let digit_end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+        if digit_end == 0 { continue; }
+        let Ok(count) = after[..digit_end].parse::<usize>() else { continue };
+        // Strip `<marker><digits>` plus the single following space (if any) so
+        // the remaining text reads as the bare fact-type clause. Collapse any
+        // resulting double space at the splice point.
+        let mut stripped = String::with_capacity(text.len());
+        stripped.push_str(text[..idx].trim_end());
+        let tail = after[digit_end..].trim_start();
+        if !tail.is_empty() {
+            stripped.push(' ');
+            stripped.push_str(tail);
+        }
+        return Some((at_most, count, stripped.trim().to_string()));
+    }
+    None
+}
+
 /// Expand possessive syntax in a derivation body clause.
 ///
 /// Pattern: `<Noun1>'s <Noun2>` is syntactic sugar for a join through Noun2:
@@ -1751,6 +1795,7 @@ fn resolve_derivation_rule(
     let mut resolved_part_text: Vec<String> = Vec::new();
     let mut filters: Vec<crate::types::AntecedentFilter> = Vec::new();
     let mut role_literals: Vec<crate::types::AntecedentRoleLiteral> = Vec::new();
+    let mut cardinalities: Vec<crate::types::AntecedentCardinality> = Vec::new();
     let mut computed: Vec<crate::types::ConsequentComputedBinding> = Vec::new();
     let mut aggregates: Vec<crate::types::ConsequentAggregate> = Vec::new();
     let mut universals: Vec<crate::types::ConsequentUniversal> = Vec::new();
@@ -2019,8 +2064,23 @@ fn resolve_derivation_rule(
         // Each pipeline already knows its own patterns. We call them
         // in order; the first match wins. No keyword arrays here.
 
+        // derivation-cardinality-count: pull an `at most N` / `at least N`
+        // COUNT premise (`Item is marked by at most 0 Tag`) off the clause
+        // BEFORE fact-type resolution. Without this the cardinal phrase
+        // survives in the verb (`is marked by at most 0`) and the bridge FT
+        // still resolves via the unique-noun-set fallback — silently
+        // dropping the bound and collapsing the premise to a plain
+        // existential. We strip the phrase so the bridge resolves cleanly,
+        // then record the bound as an `AntecedentCardinality` once the FT id
+        // is known (below). The group/count roles are the bridge's two roles:
+        // the group key is the role matching the consequent subject noun
+        // (the join noun, e.g. `Item`), the counted role is the other one
+        // (e.g. `Tag`).
+        let cardinality = extract_antecedent_cardinality(part);
+        let part_decard: &str = cardinality.as_ref().map(|(_, _, s)| s.as_str()).unwrap_or(part);
+
         // (1) Comparator-stripped FT lookup (direct + hyphen fallback + negation fallback)
-        let (stripped, comparator) = split_antecedent_comparator(part);
+        let (stripped, comparator) = split_antecedent_comparator(part_decard);
         let dehyphenated = stripped.replace("- ", " ").replace(" -", " ");
         // Strip a trailing `' <value>'` literal (single-quoted) so
         // `Task has Status 'Done'` resolves to the FT `Task has Status`
@@ -2078,6 +2138,36 @@ fn resolve_derivation_rule(
                         role,
                         value: lit,
                     });
+                }
+            }
+            // derivation-cardinality-count: record the count bound now that
+            // the bridge FT id is known. group_key_role = the bridge role
+            // whose noun matches the consequent subject (the join noun);
+            // count_role = the other role. Only binary bridges are handled
+            // (the Halpin `is marked by at most N Tag` shape); a non-binary
+            // or single-role match leaves the cardinality unrecorded (it
+            // degrades to the existing existential behaviour rather than
+            // mis-counting).
+            if let Some((at_most, count, _)) = cardinality.clone() {
+                if let Some(ft) = fact_types_map.get(&ft_id) {
+                    if ft.roles.len() == 2 {
+                        let subj: Option<String> =
+                            find_nouns(consequent_text, &noun_names).first()
+                                .map(|(_, _, n)| parse_role_token(n).0.to_string());
+                        // group key prefers the role matching the consequent
+                        // subject; fall back to the first role.
+                        let gk_idx = subj.as_ref()
+                            .and_then(|s| ft.roles.iter().position(|r| &r.noun_name == s))
+                            .unwrap_or(0);
+                        let ck_idx = 1 - gk_idx;
+                        cardinalities.push(crate::types::AntecedentCardinality {
+                            antecedent_index: resolved_ids.len(),
+                            at_most,
+                            count,
+                            group_key_role: ft.roles[gk_idx].noun_name.clone(),
+                            count_role: ft.roles[ck_idx].noun_name.clone(),
+                        });
+                    }
                 }
             }
             resolved_ids.push(crate::types::AntecedentSource::FactType(ft_id));
@@ -2394,6 +2484,7 @@ fn resolve_derivation_rule(
     rule.antecedent_sources = resolved_ids;
     rule.antecedent_filters = filters;
     rule.antecedent_role_literals = role_literals;
+    rule.antecedent_cardinalities = cardinalities;
     rule.consequent_computed_bindings = computed;
     rule.consequent_aggregates = aggregates;
     rule.consequent_universals = universals;
@@ -3458,6 +3549,58 @@ fn peel_trailing_comparator(text: &str) -> Option<(String, &'static str, f64)> {
 // =========================================================================
 // Instance fact parsing (state machines)
 // =========================================================================
+
+#[cfg(test)]
+mod antecedent_cardinality_tests {
+    //! derivation-cardinality-count: the parse-side extraction contract for
+    //! `at most N` / `at least N` COUNT premises in a derivation antecedent.
+    use super::*;
+
+    #[test]
+    fn extracts_at_most_and_strips_phrase() {
+        // `at most 0` between the verb and the counted noun → (at_most, 0)
+        // and a stripped clause that resolves as the bare bridge FT.
+        assert_eq!(
+            extract_antecedent_cardinality("Item is marked by at most 0 Tag"),
+            Some((true, 0, "Item is marked by Tag".to_string())),
+        );
+    }
+
+    #[test]
+    fn extracts_at_least_and_strips_phrase() {
+        assert_eq!(
+            extract_antecedent_cardinality("Item is marked by at least 1 Tag"),
+            Some((false, 1, "Item is marked by Tag".to_string())),
+        );
+    }
+
+    #[test]
+    fn multi_digit_bound_parses() {
+        assert_eq!(
+            extract_antecedent_cardinality("Order has at most 12 Line Item"),
+            Some((true, 12, "Order has Line Item".to_string())),
+        );
+    }
+
+    #[test]
+    fn plain_existential_is_unaffected() {
+        // No `at most`/`at least` phrase → None (plain join, unchanged).
+        assert_eq!(
+            extract_antecedent_cardinality("Item is marked by Tag"),
+            None,
+        );
+    }
+
+    #[test]
+    fn word_form_at_most_one_is_not_a_count_premise() {
+        // `at most one` (no digit) is the UC spelling — left for the
+        // constraint classifier, not a derivation count premise.
+        assert_eq!(
+            extract_antecedent_cardinality("Item is marked by at most one Tag"),
+            None,
+        );
+    }
+}
 
 #[cfg(test)]
 mod objectified_pivot_tests {

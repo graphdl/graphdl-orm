@@ -1263,7 +1263,7 @@ mod tests {
             consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![],
             antecedent_role_literals: vec![], antecedent_role_comparisons: vec![],
             consequent_role_literals: vec![], materialization: MaterializationPolicy::Stored,
-            ring_join: None, skolem_head_roles: vec![],
+            ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
         }
     }
 
@@ -3176,7 +3176,7 @@ Animal 'fido' has Owner 'alice'.\n\
             match_on: vec![],
             consequent_bindings: vec![],
             antecedent_filters: filter.into_iter().collect(),
-            consequent_computed_bindings: vec![], consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
+            consequent_computed_bindings: vec![], consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
         };
         let mut cells = empty_cells();
         cells = with_ft(cells, "city_has_population", &ft1);
@@ -3339,7 +3339,7 @@ Animal 'fido' has Owner 'alice'.\n\
             consequent_computed_bindings: vec![crate::types::ConsequentComputedBinding {
                 role: derived_role.to_string(), expr,
             }],
-            consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
+            consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
         };
         let mut cells = empty_cells();
         cells = with_ft(cells, "foo_has_val", &ft1);
@@ -3483,7 +3483,7 @@ Animal 'fido' has Owner 'alice'.\n\
                 enum_rank: false, join_fact_type_id: String::new(),
             }],
             consequent_universals: vec![],
-            unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
+            unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
         };
         let mut cells = empty_cells();
         cells = with_ft(cells, "thing_has_part", &ft1);
@@ -3568,7 +3568,7 @@ Animal 'fido' has Owner 'alice'.\n\
                 enum_rank: false, join_fact_type_id: String::new(),
             }],
             consequent_universals: vec![],
-            unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
+            unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
         };
         let mut cells = empty_cells();
         cells = with_ft(cells, "order_has_line_amount", &ft1);
@@ -3642,7 +3642,7 @@ Animal 'fido' has Owner 'alice'.\n\
                 enum_rank: false, join_fact_type_id: String::new(),
             }],
             consequent_universals: vec![],
-            unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
+            unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
         };
         let mut cells = empty_cells();
         cells = with_ft(cells, "order_has_line_amount", &ft1);
@@ -3777,7 +3777,7 @@ Animal 'fido' has Owner 'alice'.\n\
             join_on: vec!["Key".to_string()],
             match_on: vec![],
             consequent_bindings: vec!["A".to_string(), "B".to_string()],
-            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
         });
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
@@ -3839,7 +3839,7 @@ Animal 'fido' has Owner 'alice'.\n\
             join_on: vec!["Key".to_string(), "X".to_string()],
             match_on: vec![],
             consequent_bindings: vec!["Y".to_string(), "X".to_string()],
-            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
         });
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
@@ -3892,7 +3892,7 @@ Animal 'fido' has Owner 'alice'.\n\
             join_on: vec![],
             match_on: vec![("Full Name".to_string(), "Short Name".to_string())],
             consequent_bindings: vec!["B".to_string(), "A".to_string()],
-            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
         });
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
@@ -3945,7 +3945,7 @@ Animal 'fido' has Owner 'alice'.\n\
             join_on: vec!["Key".to_string()],
             match_on: vec![],
             consequent_bindings: vec!["A".to_string(), "B".to_string()],
-            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
+            antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
         });
 
         let (_meta_pop, defs, _def_map) = compile_cells(cells);
@@ -4069,7 +4069,7 @@ Animal 'fido' has Owner 'alice'.\n\
                 value: cons_literal.to_string(),
             }],
             materialization: crate::types::MaterializationPolicy::Stored,
-            ring_join: None, skolem_head_roles: vec![],
+            ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
         };
         let mut cells = empty_cells();
         cells = with_ft(cells, "stmt_has_trailing_marker", &ant_ft);

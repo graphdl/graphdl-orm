@@ -7144,7 +7144,7 @@ fn ss_autofill_reading_lift_func_equals_synthesizer_oracle() {
         antecedent_role_literals: vec![], antecedent_role_comparisons: vec![],
         consequent_role_literals: vec![],
         materialization: crate::types::MaterializationPolicy::Stored,
-        ring_join: None, skolem_head_roles: vec![],
+        ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
     };
     let lift_func = crate::compile::compile_explicit_derivation(&data, &ss_rule).func;
 
@@ -7173,7 +7173,7 @@ fn ss_autofill_reading_lift_func_equals_synthesizer_oracle() {
                 antecedent_role_literals: vec![], antecedent_role_comparisons: vec![],
                 consequent_role_literals: vec![],
                 materialization: crate::types::MaterializationPolicy::Stored,
-                ring_join: None, skolem_head_roles: vec![],
+                ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
             };
             crate::compile::compile_explicit_derivation(&data, &inner_rule).func
         })

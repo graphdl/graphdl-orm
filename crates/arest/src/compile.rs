@@ -1517,7 +1517,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             DerivationRuleDef {
                 id: get("id"), text: get("text"), antecedent_sources: vec![], consequent_instance_role: String::new(),
                 consequent_cell: crate::types::ConsequentCellSource::decode(&get("consequentFactTypeId")),
-                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
+                kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![], consequent_bindings: vec![], antecedent_filters: vec![], consequent_computed_bindings: vec![], consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
             }
         }).collect())
         .unwrap_or_default();
@@ -3933,7 +3933,7 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
                 kind: DerivationKind::ModusPonens, join_on: vec![], match_on: vec![],
                 consequent_bindings: vec![], antecedent_filters: vec![],
                 consequent_computed_bindings: vec![], consequent_aggregates: vec![],
-                consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
+                consequent_universals: vec![], unresolved_clauses: vec![], antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
             }
         }).collect()).unwrap_or_default();
     let general_instance_facts: Vec<GeneralInstanceFact> = fetch_cell_seq("InstanceFact", state).as_seq()
@@ -4925,6 +4925,84 @@ pub(crate) fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRul
     let antecedent_ids: Vec<String> = rule.antecedent_sources.iter()
         .map(|s| s.fact_type_id().to_string()).collect();
 
+    // derivation-cardinality-count: a cardinality premise that reaches the
+    // EXPLICIT (non-Join) path is UNGUARDED — its group-key noun is bound
+    // only by the count premise itself (`Item is unguarded clear iff Item is
+    // marked by at most 0 Tag`), with no positive guard antecedent to range-
+    // restrict the Item universe. (Guarded cardinality rules are classified
+    // Join and handled in `compile_join_derivation`.)
+    //
+    //   * `at least N` is still SAFE here: the qualifying group keys are
+    //     exactly the bridge rows whose per-group count ≥ N — a semi-join on
+    //     the bridge itself, no external universe needed. Emit one consequent
+    //     fact per such group key.
+    //   * `at most N` (incl. 0) is range-UNRESTRICTED: "every Item with ≤ N
+    //     tags" ranges over Items the bridge never mentions, and no antecedent
+    //     supplies that universe. Materializing it from the bridge rows would
+    //     emit the COMPLEMENT (the very bug we are fixing). Suppress it (φ)
+    //     until a range-restriction follow-up gives it a bound universe.
+    if let Some(card) = rule.antecedent_cardinalities.first()
+        .filter(|_| rule.antecedent_sources.len() == 1)
+    {
+        // Only the single-bridge unguarded shape is handled here; a rule with
+        // additional positive antecedents would have been a Join (and the
+        // cardinality applied there as a count guard).
+        let consequent_id = rule.consequent_cell.literal_id().to_string();
+        let consequent_reading = data.fact_types.get(&consequent_id)
+            .map(|ft| ft.reading.clone()).unwrap_or_else(|| rule.text.clone());
+        let (consequent_cell, _, _) = derivation_dep_metadata(rule);
+        if card.at_most {
+            return CompiledDerivation {
+                id, text, kind,
+                func: Func::constant(Object::phi()),
+                consequent_cell,
+                materialization: rule.materialization.clone(),
+            };
+        }
+        // `at least N`: keep bridge group keys whose count ≥ N, emit one
+        // consequent fact per qualifying group key. Build the per-group count
+        // the same way the aggregate path does (DistL image + Length).
+        let bridge_ft_id = card.antecedent_index;
+        let bridge_id = antecedent_ids.get(bridge_ft_id).cloned().unwrap_or_default();
+        let bridge_facts = extract_facts_from_pop(&bridge_id);
+        let gk = || role_value_by_name(&card.group_key_role);
+        // Over <fact, all_bridge>: count bridge rows sharing this fact's key.
+        let key = Func::compose(gk(), Func::Selector(1));
+        let image = Func::compose(Func::DistL,
+            Func::construction(vec![key, Func::Selector(2)]));
+        let key_matches = Func::compose(Func::Eq, Func::construction(vec![
+            Func::Selector(1), Func::compose(gk(), Func::Selector(2)),
+        ]));
+        let cnt = Func::compose(Func::Length,
+            Func::compose(Func::filter(key_matches), image));
+        let count_ok = Func::compose(Func::Ge, Func::construction(vec![
+            cnt, Func::constant(Object::atom(&card.count.to_string())),
+        ]));
+        // One consequent fact per qualifying bridge fact, keyed by the group
+        // role. Duplicate group keys across bridge rows collapse on the cell
+        // (Map keyed by the group role), so the per-fact fanout is fine.
+        let derived = Func::construction(vec![
+            Func::constant(Object::atom(&consequent_id)),
+            Func::constant(Object::atom(&consequent_reading)),
+            Func::construction(vec![Func::construction(vec![
+                Func::constant(Object::atom(&card.group_key_role)),
+                Func::compose(gk(), Func::Selector(1)),
+            ])]),
+        ]);
+        let func = Func::compose(
+            Func::apply_to_all(derived),
+            Func::compose(
+                Func::filter(count_ok),
+                Func::compose(Func::DistR,
+                    Func::construction(vec![bridge_facts.clone(), bridge_facts])),
+            ),
+        );
+        return CompiledDerivation {
+            id, text, kind, func, consequent_cell,
+            materialization: rule.materialization.clone(),
+        };
+    }
+
     // task subtype-join-antecedent child 4 — READING-LIFT DETECTION.
     // When the parser emits the subtype-inheritance rule from the FORML text
     // in readings/core/derivation.md, it produces a specific antecedent
@@ -4988,7 +5066,7 @@ pub(crate) fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRul
                     join_on: vec![], match_on: vec![], consequent_bindings: vec![],
                     antecedent_filters: vec![], consequent_computed_bindings: vec![],
                     consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![],
-                    antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
+                    antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
                 };
                 compile_explicit_derivation(data, &inner_rule).func
             })
@@ -5066,7 +5144,7 @@ pub(crate) fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRul
                     join_on: vec![], match_on: vec![], consequent_bindings: vec![],
                     antecedent_filters: vec![], consequent_computed_bindings: vec![],
                     consequent_aggregates: vec![], consequent_universals: vec![], unresolved_clauses: vec![],
-                    antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![],
+                    antecedent_role_literals: vec![], antecedent_role_comparisons: vec![], consequent_role_literals: vec![], materialization: crate::types::MaterializationPolicy::Stored, ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
                 };
                 compile_explicit_derivation(data, &inner_rule).func
             })
@@ -6534,6 +6612,78 @@ pub(crate) fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRul
 }
 
 
+/// derivation-cardinality-count: wrap a GUARD antecedent's fact extractor with
+/// an `at most N` / `at least N` group-by-and-count guard sourced from a BRIDGE
+/// fact type. Returns a Func `pop -> <guard_fact, …>` keeping only those guard
+/// facts whose `group_key_role` value has a bridge-row count satisfying the
+/// bound.
+///
+/// Shape (mirrors `compile_aggregate_derivation`'s image-set count):
+///   α(Selector(1))                       — project the guard fact back out
+///     ∘ Filter(count_ok)                 — keep pairs satisfying the bound
+///     ∘ DistR ∘ [guard_facts, bridge]    — pair EACH guard fact with the whole
+///                                          bridge population (read from `pop`)
+/// where, over a pair `<g, B>`:
+///   key      = group_key value of g
+///   image    = DistL ∘ [key, B]                       → <key, b> pairs
+///   matching = Filter(key == group_key value of b) ∘ image
+///   count_ok = (Le|Ge) ∘ [Length(matching), N̄]
+///
+/// `at most N` uses `Le` (count ≤ N); `at least N` uses `Ge` (count ≥ N). The
+/// `at most 0` case naturally yields the guard facts with ZERO bridge rows (an
+/// anti-join) without any special-casing, because such facts are present in the
+/// guard universe but absent from the bridge — exactly the rows a positive
+/// equi-join would have dropped.
+fn build_cardinality_count_guard(
+    guard_facts: Func,
+    bridge_ft_id: &str,
+    card: &crate::types::AntecedentCardinality,
+) -> Func {
+    let bridge_facts = extract_facts_from_pop(bridge_ft_id);
+    // Group-key value extractors. The guard fact and the bridge fact both
+    // carry a role whose noun is `group_key_role`; `role_value_by_name`
+    // finds it positionally-independently, so extra bindings on either side
+    // don't break the match.
+    let gk = || role_value_by_name(&card.group_key_role);
+
+    // Over the outer pair <g, B>:
+    let key = Func::compose(gk(), Func::Selector(1));         // group key of g
+    // image = DistL ∘ [key, B] : <key, b> for each bridge fact b
+    let image = Func::compose(
+        Func::DistL,
+        Func::construction(vec![key, Func::Selector(2)]),
+    );
+    // keep <key, b> where b's group key == the outer key
+    let key_matches = Func::compose(
+        Func::Eq,
+        Func::construction(vec![
+            Func::Selector(1),
+            Func::compose(gk(), Func::Selector(2)),
+        ]),
+    );
+    let matching = Func::compose(Func::filter(key_matches), image);
+    let cnt = Func::compose(Func::Length, matching);
+    let cmp = if card.at_most { Func::Le } else { Func::Ge };
+    let count_ok = Func::compose(
+        cmp,
+        Func::construction(vec![
+            cnt,
+            Func::constant(Object::atom(&card.count.to_string())),
+        ]),
+    );
+
+    Func::compose(
+        Func::apply_to_all(Func::Selector(1)),
+        Func::compose(
+            Func::filter(count_ok),
+            Func::compose(
+                Func::DistR,
+                Func::construction(vec![guard_facts, bridge_facts]),
+            ),
+        ),
+    )
+}
+
 /// Compile a Join derivation rule -- cross-fact-type equi-join on shared noun names.
 ///
 /// For each combination of facts from the antecedent fact types, if all join keys
@@ -6565,8 +6715,16 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
     // `antecedent_role_comparisons` back to the user-authored slot.
     let antecedent_ids_all: Vec<String> = rule.antecedent_sources.iter()
         .map(|s| s.fact_type_id().to_string()).collect();
+    // derivation-cardinality-count: antecedents carrying an `at most N` /
+    // `at least N` count premise are LIFTED OUT of the positive equi-join.
+    // They re-enter as a group-by-and-count guard over the surviving (guard)
+    // antecedents (see below), so a bare existential join on the bridge never
+    // forms — that join is exactly what dropped the cardinality.
+    let cardinality_idx: hashbrown::HashSet<usize> = rule.antecedent_cardinalities
+        .iter().map(|c| c.antecedent_index).collect();
     let positive_idx: Vec<usize> = rule.antecedent_sources.iter().enumerate()
-        .filter_map(|(i, s)| matches!(s, crate::types::AntecedentSource::FactType(_)).then_some(i))
+        .filter_map(|(i, s)| (matches!(s, crate::types::AntecedentSource::FactType(_))
+            && !cardinality_idx.contains(&i)).then_some(i))
         .collect();
     let antecedent_ids: Vec<String> = positive_idx.iter()
         .map(|&i| antecedent_ids_all[i].clone()).collect();
@@ -6655,7 +6813,7 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
             }
         }
     }
-    let fact_extractors: Vec<Func> = antecedent_ids.iter().enumerate()
+    let mut fact_extractors: Vec<Func> = antecedent_ids.iter().enumerate()
         .map(|(idx, ft_id)| {
             let raw = extract_facts_from_pop(ft_id);
             match preds_by_idx.get(idx) {
@@ -6670,6 +6828,27 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
         })
         .collect();
 
+    // derivation-cardinality-count: apply each lifted cardinality as a
+    // group-by-and-count guard over the GUARD antecedent that carries the
+    // group-key noun. The bridge FT (the counted relation) is read from the
+    // population inside the guard (`build_cardinality_count_guard`), so it
+    // never has to participate in the equi-join. A rule whose ONLY antecedent
+    // was the cardinality bridge has no guard to bind the group key — the
+    // positive set is empty and `n == 0`; such an (unguarded) rule is left to
+    // the φ branch below as a rule-safety concern (range restriction is a
+    // separate follow-up).
+    for card in rule.antecedent_cardinalities.iter() {
+        // Pick the guard antecedent carrying the group-key noun.
+        let guard_pos = antecedent_roles.iter().position(|roles|
+            roles.iter().any(|(noun, _)| noun == &card.group_key_role));
+        if let Some(gp) = guard_pos {
+            let bridge_ft_id = antecedent_ids_all[card.antecedent_index].clone();
+            let guarded = build_cardinality_count_guard(
+                fact_extractors[gp].clone(), &bridge_ft_id, card);
+            fact_extractors[gp] = guarded;
+        }
+    }
+
     // Dispatch on antecedent count: 0 â†' phi, 1 â†' Î±(derive), â‰¥2 â†' iterative join
     let (consequent_cell_md, _, _) =
         derivation_dep_metadata(rule);
@@ -6682,8 +6861,33 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
         },
         1 => {
             // Single antecedent: no join, just derive from each fact.
+            // Each consequent binding noun draws from the antecedent fact
+            // when that noun is one of its roles; otherwise a consequent
+            // role-literal pin supplies the value (a `<noun, 'lit'>` pair).
+            // The literal-pin branch matters when a cardinality lift drops a
+            // guarded rule to a single guard antecedent that does NOT carry a
+            // literal-pinned consequent role — e.g. `Item has Rank 'clear'
+            // iff Item is named and Item is marked by at most 0 Tag`, where
+            // `Rank` lives only on the consequent. (Mirrors the n≥2 path's
+            // binding_parts step 2.)
             let binding_parts: Vec<Func> = consequent_binding_names.iter()
-                .filter_map(|noun| find_role(0, noun).map(|ri| Func::compose(Func::Selector(ri + 1), Func::Id)))
+                .filter_map(|noun| {
+                    // Antecedent-bound role: emit the antecedent fact's own
+                    // `<noun, val>` pair (Selector(ri+1) of the fact). This is
+                    // byte-identical to the pre-cardinality behaviour.
+                    if let Some(ri) = find_role(0, noun) {
+                        return Some(Func::compose(Func::Selector(ri + 1), Func::Id));
+                    }
+                    // Consequent-only literal pin: noun is absent from the
+                    // guard antecedent but pinned to a literal in the head
+                    // (e.g. `Rank 'clear'`). Emit the `<noun, 'lit'>` pair.
+                    rule.consequent_role_literals.iter()
+                        .find(|crl| &crl.role == noun)
+                        .map(|crl| Func::construction(vec![
+                            Func::constant(Object::atom(noun)),
+                            Func::constant(Object::atom(&crl.value)),
+                        ]))
+                })
                 .collect();
             let derived = Func::construction(vec![
                 Func::constant(Object::atom(&consequent_id)),
@@ -11610,6 +11814,91 @@ mod schema_tests {
         new_d
     }
 
+    /// derivation-cardinality-count LIVE-COMPILE-PATH regression. A
+    /// derivation antecedent that COUNTS a bridge role —
+    /// `Item is marked by at most 0 Tag` / `at least 1 Tag` — must honor the
+    /// bound N. Pre-fix the cardinal phrase survived into the verb, the bridge
+    /// FT resolved via the unique-noun-set fallback, and the premise collapsed
+    /// to a plain existential join: `Item_is_guarded_clear` came out {i2}
+    /// (i2 HAS a tag) instead of {i1} (i1 has none). This drives the SAME
+    /// dirs pipeline `arest-cli <dir> --db` runs and asserts the STORED cells
+    /// — read exactly as `cells get` reads them — carry the
+    /// cardinality-correct rows. The consequent FTs are `*`-marked (View) so
+    /// the eager fold (ae72ebf3) must still run them into the substrate.
+    ///
+    /// i1: named, 0 tags. i2: named, 1 tag (t1).
+    ///   guarded_clear (named ∧ ≤0 tags)  → {i1}
+    ///   has_Rank 'clear' (named ∧ ≤0)    → {i1, Rank:clear}
+    ///   multimarked (named ∧ ≥1 tag)     → {i2}
+    ///   plainmarked (named ∧ ∃ tag)      → {i2}  (control: plain existential)
+    #[test]
+    fn derivation_cardinality_count_honors_bound_via_live_compile() {
+        let app = "\
+            Item(.id) is an entity type.\n\
+            Tag(.id) is an entity type.\n\
+            Rank is a value type.\n\
+              The possible values of Rank are 'clear', 'marked'.\n\
+            Item is named.\n\
+            Item is marked by Tag.\n\
+            Item has Rank. *\n\
+            Item is guarded clear. *\n\
+            Item is multimarked. *\n\
+            Item is plainmarked. *\n\
+            Item is guarded clear iff Item is named and Item is marked by at most 0 Tag.\n\
+            Item is multimarked iff Item is named and Item is marked by at least 1 Tag.\n\
+            Item is plainmarked iff Item is named and Item is marked by Tag.\n\
+            Item has Rank 'clear' iff Item is named and Item is marked by at most 0 Tag.\n\
+            Item 'i1' is named.\n\
+            Item 'i2' is named.\n\
+            Item 'i2' is marked by Tag 't1'.\n\
+        ";
+        let new_d = live_compile_dirs_pipeline(app);
+
+        // Helper: the set of `Item` values stored in a derived cell, read the
+        // same way `cells get` reads it (fetch → Bottom == no such cell).
+        let items_in = |cell_name: &str| -> Vec<String> {
+            let cell = ast::fetch_cell_seq(cell_name, &new_d);
+            let mut v: Vec<String> = cell.as_seq()
+                .map(|s| s.iter()
+                    .filter_map(|f| ast::binding(f, "Item").map(|x| x.to_string()))
+                    .collect())
+                .unwrap_or_default();
+            v.sort();
+            v
+        };
+
+        // at most 0: i1 (0 tags) matches; i2 (1 tag) must NOT.
+        assert_eq!(items_in("Item_is_guarded_clear"), vec!["i1".to_string()],
+            "guarded_clear (named ∧ marked by at most 0 Tag) must be {{i1}} — i1 \
+             has 0 tags; i2 has 1. The `at most 0` count must be honored, not \
+             collapsed to a bare existential (which would yield {{i2}}). \
+             cell={:?}", ast::fetch_cell_seq("Item_is_guarded_clear", &new_d));
+
+        // at least 1: i2 (1 tag) matches; i1 (0 tags) must NOT.
+        assert_eq!(items_in("Item_is_multimarked"), vec!["i2".to_string()],
+            "multimarked (named ∧ marked by at least 1 Tag) must be {{i2}}; \
+             cell={:?}", ast::fetch_cell_seq("Item_is_multimarked", &new_d));
+
+        // Control: plain existential is unaffected — i2 has a tag, i1 doesn't.
+        assert_eq!(items_in("Item_is_plainmarked"), vec!["i2".to_string()],
+            "plainmarked (named ∧ marked by Tag) must stay {{i2}}; cell={:?}",
+            ast::fetch_cell_seq("Item_is_plainmarked", &new_d));
+
+        // Literal-in-consequent count rule: head pins Rank 'clear'; the body
+        // is the same `at most 0` count → {i1, Rank:clear}.
+        let rank_cell = ast::fetch_cell_seq("Item_has_Rank", &new_d);
+        let rank_facts: Vec<&ast::Object> = rank_cell.as_seq()
+            .map(|s| s.iter().collect()).unwrap_or_default();
+        assert_eq!(rank_facts.len(), 1,
+            "Item_has_Rank must hold exactly one fact; got {} (cell={:?})",
+            rank_facts.len(), rank_cell);
+        assert_eq!(
+            (ast::binding(rank_facts[0], "Item"), ast::binding(rank_facts[0], "Rank")),
+            (Some("i1"), Some("clear")),
+            "Item_has_Rank must be {{Item:i1, Rank:clear}} — the `at most 0` \
+             count premise selects i1, NOT i2; got {:?}", rank_facts[0]);
+    }
+
     /// Single-antecedent ring FT consequent binding: when an
     /// antecedent FT has two roles that share a noun (`Task blocks
     /// Task`), the rule's role subscript (`Task2` vs `Task1`) must
@@ -12162,7 +12451,7 @@ mod schema_tests {
             unresolved_clauses: vec![], antecedent_role_literals: vec![],
             antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
             materialization: crate::types::MaterializationPolicy::Stored,
-            ring_join: None, skolem_head_roles: vec![],
+            ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
         };
         // Must not panic.
         let compiled = compile_explicit_derivation(&data, &rule);
@@ -12225,7 +12514,7 @@ mod schema_tests {
             unresolved_clauses: vec![], antecedent_role_literals: vec![],
             antecedent_role_comparisons: vec![], consequent_role_literals: vec![],
             materialization: crate::types::MaterializationPolicy::Stored,
-            ring_join: None, skolem_head_roles: vec![],
+            ring_join: None, skolem_head_roles: vec![], antecedent_cardinalities: vec![],
         };
         let compiled = compile_explicit_derivation(&data, &rule);
 
