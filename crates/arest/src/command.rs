@@ -2534,6 +2534,25 @@ fn reconcile_derived_transitions(
 
     let mut running = state.clone();
     let mut fired: Vec<(String, String)> = Vec::new();
+    // cli-apply-large-tasksdb-nonterminating (Bug B — cyclic-trigger guard):
+    // the per-pass cap below bounds the OUTER loop, but each fire runs a full
+    // forward chain over the whole population (~seconds on a large db), so an
+    // entity whose trigger facts form a CYCLE (e.g. a single Task carrying
+    // `is started` + `is finished` + `is reopened` simultaneously — corrupt
+    // data observed live on `eud-valuetype-bridge-join`) flip-flops
+    // pending→in_progress→completed→pending… firing 3 costly chains every
+    // pass until the cap, which on the live tasks.db is minutes (effectively
+    // non-terminating). Track the (entity, status) states each entity has
+    // already occupied during THIS reconcile; refuse a fire that would RETURN
+    // an entity to a status it has already been in — that is a cycle, by
+    // definition, and the legitimate reconcile semantics (a status change
+    // propagating OUTWARD to other entities, AREST.tex §4.3) never revisits a
+    // status on the same entity. Healthy data is unaffected (each entity fires
+    // monotonically, visiting each status at most once); only a true cycle is
+    // short-circuited, exactly the case the pass-cap was meant to catch but
+    // could not bound cheaply.
+    let mut visited_status: hashbrown::HashMap<String, hashbrown::HashSet<String>> =
+        hashbrown::HashMap::new();
 
     let mut pass = 0usize;
     loop {
@@ -2574,10 +2593,30 @@ fn reconcile_derived_transitions(
                         ast::Object::atom(&from_status),
                         ast::Object::atom(reading),
                     ]), d);
-                let legal_and_changing = func.as_atom()
+                let next_status = func.as_atom().map(|s| s.to_string());
+                let legal_and_changing = next_status.as_deref()
                     .map(|next| next != from_status)
                     .unwrap_or(false);
                 if !legal_and_changing { continue; }
+
+                // Cyclic-trigger short-circuit (Bug B). The machine func above
+                // already gives us the TARGET status cheaply (no chain). Record
+                // `from_status` as visited for this entity, and if the target is
+                // a status the entity has ALREADY occupied this reconcile, firing
+                // would close a cycle — skip it BEFORE paying for the full
+                // forward chain inside `transition_via_defs`. (See the
+                // `visited_status` rationale above.)
+                let seen = visited_status.entry(entity.clone()).or_default();
+                seen.insert(from_status.clone());
+                if let Some(next) = &next_status {
+                    if seen.contains(next) {
+                        crate::diag!(
+                            "[reconcile] cyclic trigger on {} {}: '{}' would return it to \
+                             already-visited status '{}' — skipping (cycle)",
+                            noun, entity, reading, next);
+                        continue;
+                    }
+                }
 
                 // Fire the derived transition through the SAME writer the
                 // user-driven path uses. current_status=None so it re-resolves
@@ -2602,6 +2641,10 @@ fn reconcile_derived_transitions(
                     continue;
                 }
                 running = ast::merge_delta(&running, &res.state, None);
+                // Record the entity's new status so a later pass that would
+                // bring it back here is recognised as a cycle and skipped.
+                visited_status.entry(entity.clone()).or_default()
+                    .insert(new_status.clone());
                 fired.push((entity.clone(), new_status));
                 fired_this_pass = true;
             }
@@ -9433,6 +9476,112 @@ Job Status enumerates 'pending', 'in_progress', 'blocked', 'completed', 'deleted
             "STEP 3b: post-unblock reconcile must be idle; fired={:?}", fired3b);
         assert_eq!(extract_sm_status(&s3b, "A").as_deref(), Some("in_progress"),
             "STEP 3b: A must remain 'in_progress' at the fixpoint");
+    }
+
+    /// cli-apply-large-tasksdb-nonterminating (Bug B). A single entity that
+    /// carries a CYCLE of live trigger facts — `Job is started` + `Job is
+    /// finished` + `Job is reopened` all at once (the corrupt
+    /// `eud-valuetype-bridge-join` Task observed on the live tasks.db) — drives
+    /// the Job SM pending→in_progress→completed→pending… The reconcile loop's
+    /// per-pass cap bounds the OUTER loop, but each fire runs a full forward
+    /// chain (seconds on a large population), so without the cyclic-status
+    /// short-circuit the entity re-fires every pass and the apply runs for
+    /// minutes. The guard records the statuses an entity has visited THIS
+    /// reconcile and refuses a fire that would RETURN it to one — so the cycle
+    /// is cut after one lap, NOT re-walked every pass.
+    ///
+    /// Assert: reconcile TERMINATES, the cyclic entity visits each status at
+    /// most once (no status repeats in `fired`), and it does not reach the
+    /// pass cap (the short-circuit settled it earlier).
+    #[test]
+    fn reconcile_short_circuits_cyclic_trigger_entity() {
+        const JOB_READINGS: &str = r#"
+# Cyclic-trigger Job SM
+
+## Entity Types
+
+Job(.id) is an entity type.
+
+## Fact Types
+
+Job is started.
+Job is finished.
+Job is reopened.
+
+## State Machine
+
+State Machine Definition 'Job SM' is for Noun 'Job'.
+Status 'pending' is initial in State Machine Definition 'Job SM'.
+
+Transition 'start' is defined in State Machine Definition 'Job SM'.
+Transition 'start' is from Status 'pending'.
+Transition 'start' is to Status 'in_progress'.
+Transition 'start' is triggered by Fact Type 'Job is started'.
+
+Transition 'finish' is defined in State Machine Definition 'Job SM'.
+Transition 'finish' is from Status 'in_progress'.
+Transition 'finish' is to Status 'completed'.
+Transition 'finish' is triggered by Fact Type 'Job is finished'.
+
+Transition 'reopen' is defined in State Machine Definition 'Job SM'.
+Transition 'reopen' is from Status 'completed'.
+Transition 'reopen' is to Status 'pending'.
+Transition 'reopen' is triggered by Fact Type 'Job is reopened'.
+
+## Constraints
+
+Job Status enumerates 'pending', 'in_progress', 'completed'.
+"#;
+        let meta = crate::parse_forml2::parse_to_state(&crate::metamodel_corpus())
+            .expect("metamodel parse");
+        let jobs = crate::parse_forml2::parse_to_state_with_nouns(JOB_READINGS, &meta)
+            .expect("job readings parse");
+        let state = ast::merge_states(&meta, &jobs);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        // Sanity: the SM compiled the 3-transition cycle.
+        let mfn = |from: &str, event: &str| -> Option<String> {
+            ast::apply(&ast::Func::Def("machine:Job".to_string()),
+                &ast::Object::seq(vec![ast::Object::atom(from), ast::Object::atom(event)]), &d)
+                .as_atom().map(String::from)
+        };
+        assert_eq!(mfn("pending", "Job is started").as_deref(), Some("in_progress"));
+        assert_eq!(mfn("in_progress", "Job is finished").as_deref(), Some("completed"));
+        assert_eq!(mfn("completed", "Job is reopened").as_deref(), Some("pending"));
+
+        // Corrupt entity X (status pending) carrying ALL THREE trigger facts.
+        let mut st = state.clone();
+        st = ast::cell_filter("State_Machine_is_currently_in_Status", |_| false, &st);
+        st = ast::cell_push("State_Machine_is_currently_in_Status",
+            ast::fact_from_pairs(&[("State Machine", "X"), ("Status", "pending")]), &st);
+        for cell in ["Job_is_started", "Job_is_finished", "Job_is_reopened"] {
+            st = ast::cell_filter(cell, |_| false, &st);
+            st = ast::cell_push(cell, ast::fact_from_pairs(&[("Job", "X")]), &st);
+        }
+
+        let touched: hashbrown::HashSet<String> =
+            core::iter::once("Job".to_string()).collect();
+
+        // Must TERMINATE (the test process returning IS the assertion that it
+        // did not spin) and not re-walk the cycle every pass.
+        let (_after, fired) = reconcile_derived_transitions(&d, &st, &touched);
+
+        // No status is fired twice for X — the cycle was cut, not re-walked.
+        let x_targets: Vec<&str> = fired.iter()
+            .filter(|(e, _)| e == "X").map(|(_, s)| s.as_str()).collect();
+        let mut seen = hashbrown::HashSet::new();
+        for s in &x_targets {
+            assert!(seen.insert(*s),
+                "cyclic entity X fired status '{}' twice — cycle was re-walked, \
+                 the short-circuit failed: fired={:?}", s, fired);
+        }
+        // And the loop must have settled BEFORE the pass cap (the guard ended
+        // it; the cap is the last-resort backstop, not the normal exit).
+        assert!(last_reconcile_passes() < RECONCILE_MAX_PASSES,
+            "reconcile must settle the cyclic entity via the short-circuit \
+             ({} passes), not grind to the {}-pass cap",
+            last_reconcile_passes(), RECONCILE_MAX_PASSES);
     }
 
     /// task-954: a batch carrying TWO transitions on the SAME entity

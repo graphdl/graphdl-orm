@@ -426,21 +426,75 @@ fn read_readings(dirs: &[String]) -> Vec<(String, String)> {
 }
 
 /// Load population from SQLite, compile defs in memory.
-/// Defs are never persisted — population cells only on disk.
 /// Compile takes ~500ms and produces the full D for SYSTEM calls.
+///
+/// cli-apply-large-tasksdb-nonterminating: `persist_state` writes the
+/// compiled defs (every `:`-named cell — `derivation:`, `schema:`,
+/// `validate:`, …) to the `defs` table alongside the population, and
+/// `load_state` reads them back. Those defs are RECOMPUTED here on every
+/// load, so the persisted copies are pure cache — but a STALE one whose
+/// name the current compiler no longer emits is an orphan that survives
+/// the recompile (`defs_to_state` only overwrites SAME-named defs) and is
+/// then picked up by the apply-time forward chain as a real rule.
+///
+/// On the live tasks.db this is exactly what happened: an older engine
+/// persisted `derivation:_subtype_inheritance` — a 101 KB pre-expanded
+/// Concat-of-`InstancesOfNoun` func (the subtype-inheritance reading-lift
+/// before task-982/983 re-keyed it to `derivation:rule_bdabc589693e5cb5`).
+/// The current compiler emits the small `rule_bdabc…` form, but the stale
+/// 101 KB `_subtype_inheritance` orphan lingered in `defs` with NO
+/// `derivation_reads:` sidecar, so the seeded chain treated it as a
+/// run-every-round rule. ONE round of it over the ~870-entity population
+/// was ~20 s / ~95 k candidate facts — by itself the difference between a
+/// create/update that converges in ~2 s and one that runs for minutes
+/// (tripping the chain's wall-clock ⊥ guard).
+///
+/// Fix: the compiled defs are authoritative as freshly compiled. Drop
+/// every persisted COMPILED-def cell from the loaded snapshot before
+/// recompiling — population cells never contain `:` (verified: zero
+/// `:`-named rows in the `cells` table), so "name contains `:`" cleanly
+/// selects the def families, and the platform singletons are dropped by
+/// name. `compile_to_defs_state` then regenerates all of them, so a stale
+/// orphan can never reach the apply chain. (This mirrors the existing
+/// `ast::preserve_prior_population` "drop sidecar `:` cells on load"
+/// discipline the recompile-watch path at L828 already follows.)
+///
+/// `population_only` is the (testable) heart of the fix: from a loaded
+/// snapshot it keeps ONLY the population cells — every cell whose name is
+/// `:`-free and not a platform-singleton def — dropping all persisted
+/// compiled-def families (`derivation:`, `schema:`, `validate:`,
+/// `resolve:`, `view:`, the generator prefixes, …). The recompile then
+/// regenerates the live set, so a stale orphan in `defs` cannot survive.
+#[cfg(feature = "local")]
+fn population_only(loaded: &ast::Object) -> ast::Object {
+    // Platform singletons `persist_state` writes to the `defs` table by a
+    // bare (colon-free) name; everything else compiled carries a `:`.
+    const PLATFORM_DEFS: [&str; 6] =
+        ["compile", "apply", "verify_signature", "validate", "audit", "induce"];
+    let kept: hashbrown::HashMap<String, ast::Object> = ast::cells_iter(loaded)
+        .into_iter()
+        .filter(|(name, _)| !name.contains(':') && !PLATFORM_DEFS.contains(name))
+        .map(|(name, contents)| (name.to_string(), contents.clone()))
+        .collect();
+    ast::Object::map(kept)
+}
+
 #[cfg(feature = "local")]
 fn load_and_compile(conn: &rusqlite::Connection) -> ast::Object {
     let t = std::time::Instant::now();
     let loaded = db::load_state(conn);
     eprintln!("[profile] load_state: {:?}", t.elapsed());
+    // Strip stale persisted compiled defs — keep population cells only.
+    // Recompiled below; a stale orphan must not survive into the apply D.
+    let population = population_only(&loaded);
     let t = std::time::Instant::now();
-    let mut defs = compile::compile_to_defs_state(&loaded);
+    let mut defs = compile::compile_to_defs_state(&population);
     defs.push(("compile".to_string(), ast::Func::Platform("compile".to_string())));
     defs.push(("apply".to_string(), ast::Func::Platform("apply_command".to_string())));
     defs.push(("verify_signature".to_string(), ast::Func::Platform("verify_signature".to_string())));
     defs.push(("audit".to_string(), ast::Func::Platform("audit".to_string())));
     defs.push(("induce".to_string(), ast::Func::Platform("induce".to_string())));
-    let d = ast::defs_to_state(&defs, &loaded);
+    let d = ast::defs_to_state(&defs, &population);
     eprintln!("[profile] compile: {:?} ({} defs)", t.elapsed(), defs.len());
     d
 }
@@ -1236,5 +1290,62 @@ pub fn main_entry() {
                 }
             }
         }
+    }
+}
+
+// ── cli-apply-large-tasksdb-nonterminating regression guards ───────────
+#[cfg(all(test, feature = "local"))]
+mod stale_def_tests {
+    use super::*;
+
+    /// Bug A guard. `population_only` must DROP every persisted compiled-def
+    /// cell (any `:`-named cell, plus the platform singletons) and KEEP
+    /// population cells, so a stale orphan compiled def in the loaded
+    /// snapshot can never survive the recompile and reach the apply chain.
+    ///
+    /// This is the exact shape that hung the live tasks.db: a 101 KB
+    /// `derivation:_subtype_inheritance` orphan (no longer emitted by the
+    /// current compiler) lingered in the persisted `defs` and, with no
+    /// reads sidecar, ran every forward-chain round over the whole
+    /// population (~20 s / round). Dropping it on load is the fix.
+    #[test]
+    fn population_only_drops_stale_compiled_defs_keeps_population() {
+        // A loaded snapshot mixing population cells, a STALE orphan
+        // derivation def, a few other compiled-def families, and the
+        // platform singletons — exactly what `load_state` returns.
+        let mut map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+        // Population cells (colon-free) — must survive.
+        map.insert("Task".to_string(), ast::Object::atom("task-pop"));
+        map.insert("Task_has_Task_Description".to_string(), ast::Object::atom("desc-pop"));
+        map.insert("DerivationRule".to_string(), ast::Object::atom("rules-pop"));
+        // Stale / compiled defs (colon-named) — must be dropped.
+        map.insert("derivation:_subtype_inheritance".to_string(),
+            ast::Object::atom("STALE-101kb-orphan"));
+        map.insert("derivation:rule_abc".to_string(), ast::Object::atom("d"));
+        map.insert("schema:Task_has_Task_Description".to_string(), ast::Object::atom("s"));
+        map.insert("validate:Task".to_string(), ast::Object::atom("v"));
+        map.insert("derivation_reads:rule_abc".to_string(), ast::Object::atom("r"));
+        // Platform singletons (colon-free but still defs) — must be dropped.
+        map.insert("compile".to_string(), ast::Object::atom("p"));
+        map.insert("apply".to_string(), ast::Object::atom("p"));
+        map.insert("validate".to_string(), ast::Object::atom("p"));
+        let loaded = ast::Object::map(map);
+
+        let pop = population_only(&loaded);
+
+        // The stale orphan and every other compiled def are gone.
+        assert_eq!(ast::fetch("derivation:_subtype_inheritance", &pop), ast::Object::Bottom,
+            "stale orphan derivation def must NOT survive into the recompile input");
+        assert_eq!(ast::fetch("derivation:rule_abc", &pop), ast::Object::Bottom);
+        assert_eq!(ast::fetch("schema:Task_has_Task_Description", &pop), ast::Object::Bottom);
+        assert_eq!(ast::fetch("validate:Task", &pop), ast::Object::Bottom);
+        assert_eq!(ast::fetch("derivation_reads:rule_abc", &pop), ast::Object::Bottom);
+        assert_eq!(ast::fetch("compile", &pop), ast::Object::Bottom);
+        assert_eq!(ast::fetch("apply", &pop), ast::Object::Bottom);
+        assert_eq!(ast::fetch("validate", &pop), ast::Object::Bottom);
+        // Population cells survive untouched.
+        assert_eq!(ast::fetch("Task", &pop), ast::Object::atom("task-pop"));
+        assert_eq!(ast::fetch("Task_has_Task_Description", &pop), ast::Object::atom("desc-pop"));
+        assert_eq!(ast::fetch("DerivationRule", &pop), ast::Object::atom("rules-pop"));
     }
 }
