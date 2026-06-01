@@ -1816,10 +1816,10 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     {
         // #890 + task 982 + task 983: pre-compute (subtype, supertype) pairs for
         // the `is_subtype_lift` index-insertion branch.  Source both the
-        // dedicated `Subtype` cell AND the `Noun.superType` binding that
-        // `evaluate::with_subtype` writes — both contribute to `data.subtypes`
-        // so honoring both keeps the index aligned with the inlined reading-lift
-        // synthesis in compile_explicit_derivation.
+        // dedicated `Subtype` cell AND the `Noun.superType` binding — both
+        // contribute to `data.subtypes` so honoring both keeps the index
+        // aligned with the inlined reading-lift synthesis in
+        // compile_explicit_derivation.
         let subtype_pairs: Vec<(String, String)> = {
             let mut pairs: Vec<(String, String)> = Vec::new();
             let st_cell = crate::ast::fetch_cell_seq("Subtype", state);

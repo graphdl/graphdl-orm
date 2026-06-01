@@ -1400,29 +1400,6 @@ mod tests {
         cells
     }
 
-    fn with_subtype(mut cells: S, sub: &str, sup: &str) -> S {
-        // Patch existing Noun fact for `sub`: add/update superType field.
-        // If the Noun wasn't declared, push a new one.
-        let nouns = cells.entry("Noun".into()).or_default();
-        let pos = nouns.iter().position(|f| ast::binding(f, "name") == Some(sub));
-        let name = sub;
-        let old = pos.map(|i| nouns[i].clone());
-        let obj_type = old.as_ref().and_then(|f| ast::binding(f, "objectType")).unwrap_or("entity").to_string();
-        let wa = old.as_ref().and_then(|f| ast::binding(f, "worldAssumption")).unwrap_or("closed").to_string();
-        let rs = old.as_ref().and_then(|f| ast::binding(f, "referenceScheme")).map(|s| s.to_string());
-        let mut pairs: Vec<(&str, &str)> = vec![
-            ("name", name), ("objectType", obj_type.as_str()),
-            ("worldAssumption", wa.as_str()), ("superType", sup),
-        ];
-        if let Some(ref rs_s) = rs { pairs.push(("referenceScheme", rs_s.as_str())); }
-        let new_fact = ast::fact_from_pairs(&pairs);
-        match pos {
-            Some(i) => nouns[i] = new_fact,
-            None => nouns.push(new_fact),
-        }
-        cells
-    }
-
     fn with_enum_values(mut cells: S, name: &str, obj_type: &str, values: &[String]) -> S {
         let wa = "closed";
         let ref_scheme = (obj_type == "entity").then(|| "id");
