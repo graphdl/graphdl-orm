@@ -1765,52 +1765,51 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         // #932 W6: `ft_name` is an arbitrary FT-image cell (the live tenant
         // folds instance-fact / reference-scheme cells to `Object::Map`).
         // A raw `fetch_or_phi(ft_name, &snapshot).as_seq()` returns None on a
-        // Map, so this retract silently returned "⊥" for every fact in a
-        // folded cell. `fetch_cell_seq` flattens Map -> key-sorted Seq (and
-        // passes a legacy Seq through) so the row match below runs.
-        // NOTE: the write-back below builds a fresh Seq delta and lets
-        // `merge_delta` replace the cell (merge_map_cell_contents falls back
-        // to delta-replace when the delta is a Seq) — pre-existing behaviour,
-        // unchanged here; it flips the cell to Seq shape on retract.
+        // Map, so the row match has to run over `fetch_cell_seq`, which
+        // flattens Map -> key-sorted Seq (and passes a legacy Seq through).
+        // Existence check first: if no row matches, retract is a no-op (⊥),
+        // leaving D untouched.
         let cell = ast::fetch_cell_seq(ft_name, &snapshot);
         let items: Vec<ast::Object> = match cell.as_seq() {
             Some(it) => it.to_vec(),
             None => return "⊥".into(),
         };
-        let mut found_idx: Option<usize> = None;
-        for (i, fact) in items.iter().enumerate() {
-            let fact_pairs: Vec<(String, String)> = match fact.as_seq() {
-                Some(ps) => ps.iter()
-                    .filter_map(|p| {
-                        let kv = p.as_seq()?;
-                        if kv.len() != 2 { return None; }
-                        let r = kv[0].as_atom()?.to_string();
-                        let v = kv[1].as_atom()?.to_string();
-                        Some((r, v))
-                    })
-                    .collect(),
-                None => continue,
-            };
-            if fact_pairs.len() != pairs.len() { continue; }
-            let all_match = pairs.iter().all(|(role, value)| {
-                fact_pairs.iter().any(|(fr, fv)| fr == role && fv == value)
-            });
-            if all_match {
-                found_idx = Some(i);
-                break;
-            }
-        }
+        let found_idx = items
+            .iter()
+            .position(|fact| ast::fact_matches_pairs(fact, &pairs));
         let idx = match found_idx {
             Some(i) => i,
             None => return "⊥".into(),
         };
-        let mut new_items = items;
-        new_items.remove(idx);
-        let new_cell = ast::Object::Seq(new_items.into());
-        let mut delta_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
-        delta_map.insert(ft_name.to_string(), new_cell);
-        let delta = ast::Object::Map(delta_map.into());
-        let new_d = ast::merge_delta(&snapshot, &delta, None);
+        // #932 W7-b: write-back is shape-preserving. A folded FT-image cell
+        // is `Object::Map` (key = full-tuple id, value = the fact); drop the
+        // matching row via `cell_filter`, which filters Map VALUES and
+        // re-wraps as Map — so the cell stays Map instead of being demoted
+        // to Seq. Map keys are the full-tuple hash, so structurally-identical
+        // facts can't coexist; "drop all matching" == "drop the one row".
+        // A genuine legacy Seq cell keeps the remove-first-index + Seq delta
+        // through `merge_delta`, preserving its append-a-new-chain-version
+        // audit behaviour.
+        let new_d = match ast::fetch_or_phi(ft_name, &snapshot) {
+            ast::Object::Map(_) => {
+                let pairs_for_pred = pairs.clone();
+                ast::cell_filter(
+                    ft_name,
+                    move |f| !ast::fact_matches_pairs(f, &pairs_for_pred),
+                    &snapshot,
+                )
+            }
+            _ => {
+                let mut new_items = items;
+                new_items.remove(idx);
+                let new_cell = ast::Object::Seq(new_items.into());
+                let mut delta_map: hashbrown::HashMap<String, ast::Object> =
+                    hashbrown::HashMap::new();
+                delta_map.insert(ft_name.to_string(), new_cell);
+                let delta = ast::Object::Map(delta_map.into());
+                ast::merge_delta(&snapshot, &delta, None)
+            }
+        };
         st.replace_d(new_d);
         return "ok".into();
     }
@@ -3758,6 +3757,77 @@ Task has Task Priority.
              Cell shape: {ft:?}",
             count,
         );
+
+        release_impl(h);
+    }
+
+    /// #932 W7-b — `retract:<ft>` on a folded FT-image cell must PRESERVE
+    /// the `Object::Map` shape. Pre-fix the write-back built an
+    /// `Object::Seq` delta and let `merge_delta` replace the cell —
+    /// `merge_map_cell_contents` falls back to delta-replace when the delta
+    /// is a Seq, so a single retract demoted the whole cell Map → Seq
+    /// (losing the keyed identity the fold establishes). Post-fix the
+    /// write-back routes Map cells through `ast::cell_filter`, which filters
+    /// Map VALUES and re-wraps as Map: the matching row is dropped, the
+    /// shape and every other row are kept.
+    #[test]
+    fn retract_preserves_map_shape_for_folded_ft_image_cell() {
+        let h = create_bare_impl();
+        let readings = "\
+Task(.id) is an entity type.
+Task has Task Priority.
+  Each Task has at most one Task Priority.
+";
+        let compile_out = system_impl(h, "compile", readings);
+        assert!(!compile_out.starts_with('⊥'),
+            "compile must not reject Task schema, got: {compile_out}");
+
+        // Two applies → the FT-image cell folds to a 2-entry Map.
+        for (id, prio) in [("t-1", "p0"), ("t-2", "p1")] {
+            let cmd = format!(
+                r#"{{"type":"createEntity","noun":"Task","domain":"","id":"{id}","fields":{{"Task Priority":"{prio}"}}}}"#
+            );
+            let out = system_impl(h, "apply", &cmd);
+            assert!(!out.starts_with('⊥'),
+                "apply for {id} must not return ⊥; got: {out}");
+        }
+
+        // Precondition: the cell IS a Map holding both rows before retract.
+        let before = peek(h).expect("handle live after applies");
+        let cell_before = ast::fetch_or_phi("Task_has_Task Priority", &before);
+        assert!(matches!(cell_before, ast::Object::Map(_)),
+            "FT-image cell must be folded to a Map before retract; got: {cell_before:?}");
+        assert_eq!(ast::cell_fact_count(&cell_before), 2,
+            "cell must hold both t-1 and t-2 before retract; got: {cell_before:?}");
+
+        // Retract exactly the t-1 / p0 row. Roles match the FT tuple shape
+        // (`Task`, `Task Priority`); arity 2 == the binary FT's arity.
+        let retract_out = system_impl(
+            h,
+            "retract:Task_has_Task Priority",
+            "<<Task, t-1>, <Task Priority, p0>>",
+        );
+        assert_eq!(retract_out, "ok",
+            "retract of an existing row must return ok; got: {retract_out}");
+
+        // Postcondition — the W7-b invariant:
+        //   (1) the cell is STILL an Object::Map (NOT demoted to Seq), and
+        //   (2) the retracted row is gone (only t-2 remains).
+        let after = peek(h).expect("handle live after retract");
+        let cell_after = ast::fetch_or_phi("Task_has_Task Priority", &after);
+        assert!(matches!(cell_after, ast::Object::Map(_)),
+            "retract MUST preserve the Map shape of a folded FT-image cell; \
+             got: {cell_after:?}");
+        assert_eq!(ast::cell_fact_count(&cell_after), 1,
+            "exactly one row must remain after retracting t-1; got: {cell_after:?}");
+
+        let remaining_tasks: Vec<String> = ast::cell_facts_iter(&cell_after)
+            .filter_map(|f| ast::binding(f, "Task").map(|s| s.to_string()))
+            .collect();
+        assert!(!remaining_tasks.contains(&"t-1".to_string()),
+            "retracted row t-1 must be gone; remaining = {remaining_tasks:?}");
+        assert!(remaining_tasks.contains(&"t-2".to_string()),
+            "untouched row t-2 must survive the retract; remaining = {remaining_tasks:?}");
 
         release_impl(h);
     }

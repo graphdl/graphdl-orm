@@ -265,45 +265,46 @@ fn system(key: &str, input: &str, d: &ast::Object) -> (String, ast::Object) {
         if pairs.is_empty() {
             return ("⊥".into(), d.clone());
         }
+        // Row match runs over the Map->Seq flattening so a folded FT-image
+        // cell is searchable; existence check first (no match → ⊥, D
+        // unchanged).
         let cell = ast::fetch_cell_seq(ft_name, d);
         let items: Vec<ast::Object> = match cell.as_seq() {
             Some(it) => it.to_vec(),
             None => return ("⊥".into(), d.clone()),
         };
-        let mut found_idx: Option<usize> = None;
-        for (i, fact) in items.iter().enumerate() {
-            let fact_pairs: Vec<(String, String)> = match fact.as_seq() {
-                Some(ps) => ps.iter()
-                    .filter_map(|p| {
-                        let kv = p.as_seq()?;
-                        if kv.len() != 2 { return None; }
-                        let r = kv[0].as_atom()?.to_string();
-                        let v = kv[1].as_atom()?.to_string();
-                        Some((r, v))
-                    })
-                    .collect(),
-                None => continue,
-            };
-            if fact_pairs.len() != pairs.len() { continue; }
-            let all_match = pairs.iter().all(|(role, value)| {
-                fact_pairs.iter().any(|(fr, fv)| fr == role && fv == value)
-            });
-            if all_match {
-                found_idx = Some(i);
-                break;
-            }
-        }
+        let found_idx = items
+            .iter()
+            .position(|fact| ast::fact_matches_pairs(fact, &pairs));
         let idx = match found_idx {
             Some(i) => i,
             None => return ("⊥".into(), d.clone()),
         };
-        let mut new_items = items;
-        new_items.remove(idx);
-        let new_cell = ast::Object::Seq(new_items.into());
-        let mut delta_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
-        delta_map.insert(ft_name.to_string(), new_cell);
-        let delta = ast::Object::map(delta_map);
-        let new_d = ast::merge_delta(d, &delta, None);
+        // #932 W7-b: shape-preserving write-back. A folded FT-image cell is
+        // `Object::Map`; `cell_filter` drops the matching row by filtering
+        // Map VALUES and re-wrapping as Map, so the cell stays Map (no
+        // demotion to Seq). A genuine legacy Seq cell keeps the
+        // remove-first-index + Seq delta through `merge_delta`.
+        let new_d = match ast::fetch_or_phi(ft_name, d) {
+            ast::Object::Map(_) => {
+                let pairs_for_pred = pairs.clone();
+                ast::cell_filter(
+                    ft_name,
+                    move |f| !ast::fact_matches_pairs(f, &pairs_for_pred),
+                    d,
+                )
+            }
+            _ => {
+                let mut new_items = items;
+                new_items.remove(idx);
+                let new_cell = ast::Object::Seq(new_items.into());
+                let mut delta_map: hashbrown::HashMap<String, ast::Object> =
+                    hashbrown::HashMap::new();
+                delta_map.insert(ft_name.to_string(), new_cell);
+                let delta = ast::Object::map(delta_map);
+                ast::merge_delta(d, &delta, None)
+            }
+        };
         return ("ok".into(), new_d);
     }
 

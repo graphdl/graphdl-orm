@@ -5524,6 +5524,39 @@ pub fn binding_matches(fact: &Object, key: &str, val: &str) -> bool {
     binding(fact, key) == Some(val)
 }
 
+/// Whole-tuple equality between a named-tuple fact `<<role,val>,...>` and a
+/// list of `(role, value)` pairs. True iff the fact has exactly the same
+/// arity and every requested `(role, value)` is present (set-membership
+/// per pair, matching the role-name-keyed semantics of the retract FFI).
+///
+/// Shared by the `retract:<ft>` FFI write-back (lib.rs / cli/entry.rs):
+/// it both detects whether a row exists and drives the `cell_filter`
+/// predicate that drops the matching row while preserving the cell's
+/// Map shape (W7-b). Pure, references-only.
+pub fn fact_matches_pairs(fact: &Object, pairs: &[(String, String)]) -> bool {
+    let fact_pairs: alloc::vec::Vec<(&str, &str)> = match fact.as_seq() {
+        Some(ps) => ps
+            .iter()
+            .filter_map(|p| {
+                let kv = p.as_seq()?;
+                if kv.len() != 2 {
+                    return None;
+                }
+                Some((kv[0].as_atom()?, kv[1].as_atom()?))
+            })
+            .collect(),
+        None => return false,
+    };
+    if fact_pairs.len() != pairs.len() {
+        return false;
+    }
+    pairs.iter().all(|(role, value)| {
+        fact_pairs
+            .iter()
+            .any(|(fr, fv)| *fr == role.as_str() && *fv == value.as_str())
+    })
+}
+
 /// Retain only facts in a cell that satisfy a predicate. Pure functional filter.
 /// Replaces: instances.retain(|inst| predicate(inst))
 pub fn cell_filter(name: &str, predicate: impl Fn(&Object) -> bool, state: &Object) -> Object {
