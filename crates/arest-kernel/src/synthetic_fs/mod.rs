@@ -126,10 +126,11 @@ mod tests {
 
     #[test]
     fn resolve_dev_devices_dispatch() {
-        // The three #537 devices resolve (existence signal for openat /
-        // HTTP); their streaming bytes come from the fd read/write path,
+        // The #537 devices plus `/dev/tty` (#538) resolve (existence
+        // signal for openat / HTTP); their streaming bytes come from the
+        // fd read/write path (and, for `/dev/tty`, live console state),
         // so the snapshot is empty.
-        for p in ["/dev/null", "/dev/zero", "/dev/random"] {
+        for p in ["/dev/null", "/dev/zero", "/dev/random", "/dev/tty"] {
             let snap = resolve(p).unwrap_or_else(|| panic!("{} must resolve", p));
             assert!(snap.is_empty(), "{} snapshot must be empty", p);
         }
@@ -141,6 +142,10 @@ mod tests {
         // table for the syscall handlers.
         assert_eq!(device_behavior("/dev/null").map(|b| b.write), Some(WriteKind::Discard));
         assert_eq!(device_behavior("/dev/random").map(|b| b.read), Some(ReadKind::Random));
+        // `/dev/tty` (#538) is tagged Console in both directions — the
+        // markers the read/write handlers translate to the live console.
+        assert_eq!(device_behavior("/dev/tty").map(|b| b.read), Some(ReadKind::Console));
+        assert_eq!(device_behavior("/dev/tty").map(|b| b.write), Some(WriteKind::Console));
         assert!(device_behavior("/proc/cpuinfo").is_none());
     }
 

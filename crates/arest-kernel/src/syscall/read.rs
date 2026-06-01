@@ -83,7 +83,7 @@
 use crate::process::current_process_fd_table;
 use crate::process::fd_table::FdEntry;
 use crate::syscall::dispatch::{EBADF, EFAULT};
-use crate::synthetic_fs;
+use crate::synthetic_fs::{self, ReadKind};
 
 /// Linux x86_64 syscall number for `read(fd, buf, count)`. Source:
 /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_read` (= 0).
@@ -142,13 +142,23 @@ pub fn handle(fd: u64, buf: u64, count: u64) -> i64 {
     read_device_fd(fd, buf, count)
 }
 
-/// Read from a `/dev/*` device fd (#537). Looks the fd up in the current
-/// process's fd table; when it resolves to a `Synthetic` device path,
-/// fills the caller's buffer per the device's `ReadKind` (`/dev/null` →
-/// EOF, `/dev/zero` → zeros, `/dev/random` → CSPRNG bytes) and returns
-/// the byte count written. Returns `-EBADF` for any fd that isn't a
-/// readable device (unknown fd, File-cell fd, non-device synthetic path,
-/// or no process installed).
+/// Read from a `/dev/*` device fd (#537, #538). Looks the fd up in the
+/// current process's fd table; when it resolves to a `Synthetic` device
+/// path, fills the caller's buffer per the device's `ReadKind`:
+///
+///   * `Eof` / `Zeros` / `Random` (`/dev/null`, `/dev/zero`,
+///     `/dev/random`) — bytes are table-computable; sourced from
+///     `synthetic_fs::device_read` and copied into the buffer.
+///   * `Console` (`/dev/tty`, #538) — bytes come from the kernel's
+///     primary console input, the same keyboard ring fd 0 drains. We
+///     route through `do_read(buf, count, &mut keyboard_source())` —
+///     the identical stdin path — so `/dev/tty` and fd 0 deliver byte-
+///     for-byte the same input (a process can `read` either and see the
+///     same keystrokes). The device table tells us *that* this fd is
+///     console-sourced; the existing stdin machinery does the fill.
+///
+/// Returns `-EBADF` for any fd that isn't a readable device (unknown fd,
+/// File-cell fd, non-device synthetic path, or no process installed).
 ///
 /// SAFETY: same identity-mapped buffer write as `do_read` — `buf` is
 /// non-null (caller checked) and the fill never exceeds `count` bytes.
@@ -161,7 +171,8 @@ fn read_device_fd(fd: u64, buf: u64, count: u64) -> i64 {
 
     // Extract the device path out of the fd table inside the lock, then
     // drop the lock before sourcing bytes (the CSPRNG fill for
-    // `/dev/random` takes its own lock — don't nest).
+    // `/dev/random` and the keyboard ring for `/dev/tty` each take their
+    // own lock — don't nest).
     let path = current_process_fd_table(|maybe_table| {
         let table = maybe_table?;
         match table.lookup(fd_i32) {
@@ -179,9 +190,26 @@ fn read_device_fd(fd: u64, buf: u64, count: u64) -> i64 {
         return -EFAULT;
     }
 
-    // Source the device bytes from the single device-table entry point.
-    // `None` means the synthetic path isn't a `/dev/*` device (e.g. a
-    // `/proc/*` fd) — out of #537 scope, return -EBADF.
+    // Consult the device table for the read behaviour. `None` means the
+    // synthetic path isn't a `/dev/*` device (e.g. a `/proc/*` fd) — out
+    // of device-fd scope, return -EBADF.
+    let Some(behavior) = synthetic_fs::device_behavior(&path) else {
+        return -EBADF;
+    };
+
+    // `/dev/tty` (`ReadKind::Console`) sources from the live console
+    // input — the same keyboard ring fd 0 uses. Route through the
+    // identical stdin path so the two fds deliver the same keystrokes.
+    // The table-computable devices fall through to `device_read`.
+    if behavior.read == ReadKind::Console {
+        return do_read(buf, count, &mut keyboard_source());
+    }
+
+    // Table-computable devices (`/dev/null` → EOF, `/dev/zero` → zeros,
+    // `/dev/random` → CSPRNG): source the bytes from the single device-
+    // table entry point. (`Console` was handled above; `device_read`
+    // returns `None` for it, which would be -EBADF — but we never reach
+    // here for it.)
     let Some(bytes) = synthetic_fs::device_read(&path, count as usize) else {
         return -EBADF;
     };
@@ -682,5 +710,91 @@ mod tests {
         let result = handle(fd as u64, 0, 16);
         assert_eq!(result, -EFAULT);
         current_process_uninstall();
+    }
+
+    // ---------------------------------------------------------------
+    // /dev/tty device-fd read tests (#538)
+    // ---------------------------------------------------------------
+    //
+    // `/dev/tty` reads source the kernel's primary console input — the
+    // same keyboard ring fd 0 drains. On the host test build the real
+    // keyboard ring is unavailable (`keyboard_source` always returns
+    // `None`), so a `handle`-level read of `/dev/tty` returns 0 (empty
+    // ring), exactly like a `read(0, …)` on an idle stdin. The crucial
+    // assertion is that it returns 0 (the console path) and NOT -EBADF
+    // (which is what a mis-wired `/dev/tty` would yield if it fell
+    // through to `device_read`, since `device_read` returns `None` for
+    // the `Console` marker). The byte-delivery half of the contract —
+    // that console input actually lands in the buffer — is verified via
+    // `do_read` with an injected source (the same seam the fd-0 tests
+    // use), since the host build can't push into the real ring.
+
+    /// `read` of a `/dev/tty` fd takes the console-input path: with the
+    /// host keyboard ring empty it returns 0 (no input), the same as an
+    /// idle `read(0, …)`. It must NOT return -EBADF — that would mean
+    /// the device fell through to the table `device_read` instead of the
+    /// keyboard source. This pins the routing of the `Console` read
+    /// marker to the stdin path.
+    #[test]
+    fn read_dev_tty_fd_routes_to_console_input_empty_ring_returns_zero() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let fd = install_with_device_fd("/dev/tty");
+        let mut buf = [0xAAu8; 16];
+        let result = handle(fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64);
+        assert_eq!(
+            result, 0,
+            "/dev/tty read must take the console path (0 on empty ring), not -EBADF"
+        );
+        assert_ne!(result, -EBADF, "/dev/tty must not fall through to device_read");
+        // Empty ring → no bytes written, buffer untouched (same as fd 0).
+        assert!(buf.iter().all(|&b| b == 0xAA), "buffer must be untouched");
+        current_process_uninstall();
+    }
+
+    /// `/dev/tty`'s console-input source is byte-for-byte the same as
+    /// fd 0's: a `read(/dev/tty fd, …)` and a `read(0, …)` both drain the
+    /// keyboard ring through `do_read(buf, count, &mut keyboard_source())`.
+    /// On the host both see an empty ring and return 0 — this asserts the
+    /// two paths agree (the contract that `/dev/tty` IS the same console
+    /// input as stdin), so a regression that wired `/dev/tty` to a
+    /// different source would diverge here.
+    #[test]
+    fn read_dev_tty_matches_stdin_fd0_on_empty_ring() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let fd = install_with_device_fd("/dev/tty");
+        let mut tty_buf = [0u8; 8];
+        let tty_result = handle(fd as u64, tty_buf.as_mut_ptr() as u64, tty_buf.len() as u64);
+        // fd 0 (stdin) read of the same empty ring.
+        let mut stdin_buf = [0u8; 8];
+        let stdin_result = handle(STDIN_FD, stdin_buf.as_mut_ptr() as u64, stdin_buf.len() as u64);
+        assert_eq!(
+            tty_result, stdin_result,
+            "/dev/tty and fd 0 must source the same console input"
+        );
+        assert_eq!(tty_result, 0, "both empty-ring reads return 0 on host");
+        current_process_uninstall();
+    }
+
+    /// The console-input source `/dev/tty` shares with fd 0 delivers
+    /// keystrokes into the buffer. Verified through `do_read` with an
+    /// injected source (the production `/dev/tty` path is `do_read(buf,
+    /// count, &mut keyboard_source())`; this exercises the same `do_read`
+    /// with a mock source standing in for the keyboard ring the host
+    /// build can't populate). Confirms the read side returns console
+    /// INPUT bytes, not EOF/zeros — i.e. `/dev/tty` is an input device.
+    #[test]
+    fn read_dev_tty_console_source_delivers_input_bytes() {
+        // Mock the console-input source the way the keyboard ring would
+        // feed `do_read` for a `/dev/tty` read: a sequence of decoded
+        // Unicode codepoints, then `None` when drained.
+        let mut buf = [0u8; 16];
+        let mut keystrokes = b"tty-in".iter().map(|&b| b as u32);
+        let result = do_read(
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            &mut || keystrokes.next(),
+        );
+        assert_eq!(result, 6, "console input must land in the buffer");
+        assert_eq!(&buf[..6], b"tty-in", "/dev/tty read returns console input bytes");
     }
 }

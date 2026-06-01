@@ -127,42 +127,61 @@ pub fn handle(fd: u64, buf: u64, count: u64) -> i64 {
     if buf == 0 {
         return -EFAULT;
     }
-    do_write(buf, count, &mut |bytes| {
-        // Lossy UTF-8 conversion — a non-UTF-8 byte sequence (which a
-        // C program could emit via a printf("\xff\xff")) prints as
-        // U+FFFD replacement chars rather than dropping the byte.
-        // crate::print! accepts a `core::fmt::Arguments` so we wrap
-        // the lossy `str` in `format_args!`; the underlying serial
-        // path handles the (transcoded) UCS-2 / UART byte stream.
-        match str::from_utf8(bytes) {
-            Ok(s) => crate::print!("{}", s),
-            Err(_) => {
-                // Invalid UTF-8 sequence — print byte-by-byte, replacing
-                // out-of-range bytes with U+FFFD. Avoids pulling in
-                // `alloc::string::String::from_utf8_lossy` which would
-                // be a heap allocation per write and a synchronisation
-                // hazard inside the print path.
-                for &b in bytes {
-                    if b < 0x80 {
-                        crate::print!("{}", b as char);
-                    } else {
-                        crate::print!("\u{FFFD}");
-                    }
+    do_write(buf, count, &mut console_sink)
+}
+
+/// The kernel-console sink shared by every write that reaches the
+/// primary console: fd 1 (stdout), fd 2 (stderr), and the `/dev/tty`
+/// device fd (#538 — `WriteKind::Console`). Routes `bytes` to
+/// `crate::print!`, which fans into `arch::_print` (UEFI ConOut pre-EBS,
+/// UART 16550 / PL011 serial post-EBS — see the module header). Sharing
+/// one sink keeps the three console write paths byte-identical: a
+/// `write(1, …)`, a `write(2, …)`, and a `write(/dev/tty fd, …)` all
+/// transcode and emit the same way, so `/dev/tty` is genuinely "the
+/// console" rather than a parallel implementation that could drift.
+///
+/// Lossy UTF-8 conversion — a non-UTF-8 byte sequence (which a C program
+/// could emit via `printf("\xff\xff")`) prints as U+FFFD replacement
+/// chars rather than dropping the byte. `crate::print!` accepts a
+/// `core::fmt::Arguments` so we wrap the lossy `str` in `format_args!`;
+/// the underlying serial path handles the (transcoded) UCS-2 / UART
+/// byte stream.
+fn console_sink(bytes: &[u8]) {
+    match str::from_utf8(bytes) {
+        Ok(s) => crate::print!("{}", s),
+        Err(_) => {
+            // Invalid UTF-8 sequence — print byte-by-byte, replacing
+            // out-of-range bytes with U+FFFD. Avoids pulling in
+            // `alloc::string::String::from_utf8_lossy` which would
+            // be a heap allocation per write and a synchronisation
+            // hazard inside the print path.
+            for &b in bytes {
+                if b < 0x80 {
+                    crate::print!("{}", b as char);
+                } else {
+                    crate::print!("\u{FFFD}");
                 }
             }
         }
-    })
+    }
 }
 
-/// Write to a `/dev/*` device fd (#537). Looks the fd up in the current
-/// process's fd table; when it resolves to a `Synthetic` device path,
-/// applies the device's write behaviour:
+/// Write to a `/dev/*` device fd (#537, #538). Looks the fd up in the
+/// current process's fd table; when it resolves to a `Synthetic` device
+/// path, applies the device's write behaviour:
 ///
 ///   * `WriteKind::Discard` (`/dev/null`, `/dev/zero`) — the bytes are
 ///     consumed and the full `count` is reported as written (a real
 ///     `/dev/null` accepts any volume and discards it). The buffer is
 ///     still validated (null `buf` with `count > 0` → `-EFAULT`) so a
 ///     bad pointer surfaces the same way it would for a real write.
+///   * `WriteKind::Console` (`/dev/tty`, #538) — the bytes go to the
+///     kernel's primary console output, the same ConOut + serial sink
+///     fd 1/2 drive. We route through `do_write(buf, count,
+///     &mut console_sink)` — the identical stdout/stderr path — so a
+///     `write(/dev/tty fd, …)` reaches the console byte-for-byte the way
+///     `write(1, …)` does. Reports the full `count` (the console never
+///     short-writes in tier-1). The same null-buffer validation applies.
 ///   * `WriteKind::Reject` (`/dev/random`) — `-EBADF`. The device is
 ///     read-only; the fd was opened `O_RDONLY` and writing to it is the
 ///     same error Linux returns for a write to a read-only fd.
@@ -207,6 +226,17 @@ fn write_device_fd(fd: u64, buf: u64, count: u64) -> i64 {
             // Discard the bytes — nothing reads them — but report the
             // full count as written, which is `/dev/null`'s contract.
             count as i64
+        }
+        WriteKind::Console => {
+            // Validate the buffer like any real write (null buf with
+            // count > 0 is -EFAULT). `count == 0` was short-circuited in
+            // `handle`.
+            if buf == 0 {
+                return -EFAULT;
+            }
+            // Route to the same console sink fd 1/2 use — `/dev/tty` IS
+            // the console, so its writes are byte-identical to stdout's.
+            do_write(buf, count, &mut console_sink)
         }
         WriteKind::Reject => -EBADF,
     }
@@ -474,6 +504,118 @@ mod tests {
         let payload = b"x";
         let result = handle(fd as u64, payload.as_ptr() as u64, payload.len() as u64);
         assert_eq!(result, -EBADF);
+        current_process_uninstall();
+    }
+
+    // ---------------------------------------------------------------
+    // /dev/tty device-fd write tests (#538)
+    // ---------------------------------------------------------------
+    //
+    // `/dev/tty` writes go to the kernel's primary console output — the
+    // same ConOut + serial sink fd 1/2 drive (`console_sink` →
+    // `crate::print!`). On the host build `crate::print!` is a no-op
+    // stub, so we verify the contract in two complementary ways:
+    //   1. The marshalling — that the exact write bytes reach a console
+    //      sink — via `do_write` with a captured (mock) sink, the same
+    //      seam the stdout/stderr tests use. This is the "writes reach
+    //      console output" assertion against a captured console.
+    //   2. The routing — that a `handle`-level `write(/dev/tty fd, …)`
+    //      takes the `Console` path (returns the full count, not -EBADF
+    //      or -EFAULT) — proving the device dispatch wires `/dev/tty` to
+    //      the console sink rather than rejecting/discarding it.
+
+    /// The console sink `/dev/tty` writes through delivers the exact
+    /// bytes to console output. Captured via a mock sink fed by
+    /// `do_write` — the production `/dev/tty` write path is `do_write(
+    /// buf, count, &mut console_sink)`; this swaps `console_sink` for a
+    /// recorder to assert the bytes that would reach the console. Same
+    /// pattern as `write_to_stdout_routes_to_sink_and_returns_count`,
+    /// confirming `/dev/tty` output is byte-identical to stdout's.
+    #[test]
+    fn write_dev_tty_console_sink_receives_exact_bytes() {
+        let payload = b"hello tty";
+        let mut captured_console: Vec<u8> = Vec::new();
+        let result = do_write(payload.as_ptr() as u64, payload.len() as u64, &mut |bytes| {
+            captured_console.extend_from_slice(bytes);
+        });
+        assert_eq!(result, payload.len() as i64, "/dev/tty write returns the full count");
+        assert_eq!(
+            captured_console.as_slice(),
+            payload,
+            "/dev/tty write must deliver the exact bytes to console output"
+        );
+    }
+
+    /// `console_sink` (the shared fd 1/2 + `/dev/tty` console output sink)
+    /// runs to completion on both well-formed UTF-8 and invalid byte
+    /// sequences without panicking — the lossy path replaces out-of-range
+    /// bytes with U+FFFD. Exercises the production sink itself (it routes
+    /// to the host `print!` no-op stub, so the assertion is "does not
+    /// panic / handles binary input"); the byte-exactness is covered by
+    /// the captured-sink test above.
+    #[test]
+    fn write_dev_tty_console_sink_handles_utf8_and_binary() {
+        // Well-formed UTF-8 (multi-byte char included).
+        console_sink("ok-é-中".as_bytes());
+        // Invalid UTF-8 — must take the byte-by-byte U+FFFD replacement
+        // branch without panicking.
+        console_sink(&[0xff, 0x41, 0xfe, 0x80]);
+        // Empty slice is a no-op.
+        console_sink(&[]);
+    }
+
+    /// `write` to a `/dev/tty` fd takes the `Console` path: returns the
+    /// full byte count (the console never short-writes) and must NOT
+    /// return -EBADF (which would mean the device was rejected like a
+    /// read-only one). This pins the routing of the `WriteKind::Console`
+    /// marker to the console sink through the real `handle` dispatch.
+    #[test]
+    fn write_dev_tty_fd_routes_to_console_and_returns_count() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let fd = install_with_device_fd("/dev/tty");
+        let payload = b"to the console";
+        let result = handle(fd as u64, payload.as_ptr() as u64, payload.len() as u64);
+        assert_eq!(
+            result,
+            payload.len() as i64,
+            "/dev/tty write must report the full count (console path)"
+        );
+        assert_ne!(result, -EBADF, "/dev/tty must not be rejected like a read-only device");
+        current_process_uninstall();
+    }
+
+    /// A large `write` to `/dev/tty` reports the full count — the console
+    /// path doesn't short-write (matches the fd 1/2 contract).
+    #[test]
+    fn write_dev_tty_large_count_reports_full_count() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let fd = install_with_device_fd("/dev/tty");
+        let payload = alloc::vec![b'.'; 4096];
+        let result = handle(fd as u64, payload.as_ptr() as u64, payload.len() as u64);
+        assert_eq!(result, payload.len() as i64);
+        current_process_uninstall();
+    }
+
+    /// `write(/dev/tty, NULL, 0)` is a POSIX no-op — returns 0 (the
+    /// zero-count short-circuit fires before the device dispatch).
+    #[test]
+    fn write_dev_tty_zero_count_returns_zero() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let fd = install_with_device_fd("/dev/tty");
+        let result = handle(fd as u64, 0, 0);
+        assert_eq!(result, 0);
+        current_process_uninstall();
+    }
+
+    /// `write(/dev/tty, NULL, n>0)` returns `-EFAULT` — the console
+    /// device still validates its buffer (a bad pointer is an error even
+    /// for the terminal, same as a real `write(1, NULL, n)`).
+    #[test]
+    fn write_dev_tty_null_buf_returns_efault() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let fd = install_with_device_fd("/dev/tty");
+        let result = handle(fd as u64, 0, 16);
+        assert_eq!(result, -EFAULT);
         current_process_uninstall();
     }
 }

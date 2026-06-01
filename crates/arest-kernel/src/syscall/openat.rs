@@ -261,15 +261,18 @@ pub fn read_pathname(ptr: u64) -> Result<String, i64> {
 
 /// True when `path` is a `/dev/*` device whose write behaviour accepts
 /// an `O_WRONLY` / `O_RDWR` open — i.e. the write handler will consume
-/// (discard) writes rather than reject them. `/dev/null` and `/dev/zero`
-/// return true; `/dev/random` (read-only) and every non-device synthetic
-/// path return false. Drives openat's access-mode check off the device
-/// table's `WriteKind` so a future writable device needs no change here.
+/// the writes (discard them, or emit them to the console) rather than
+/// reject them. `/dev/null` + `/dev/zero` (`Discard`) and `/dev/tty`
+/// (`Console`, #538) return true; `/dev/random` (read-only, `Reject`)
+/// and every non-device synthetic path return false. Drives openat's
+/// access-mode check off the device table's `WriteKind` so a future
+/// writable device needs no change here — any non-`Reject` write
+/// behaviour is openable for writing.
 fn device_accepts_write(path: &str) -> bool {
     use crate::synthetic_fs::WriteKind;
     matches!(
         synthetic_fs::device_behavior(path),
-        Some(b) if b.write == WriteKind::Discard
+        Some(b) if b.write != WriteKind::Reject
     )
 }
 
@@ -511,6 +514,42 @@ mod tests {
         let path = cstring("/dev/null");
         let fd = handle(AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0);
         assert!(fd >= 3, "/dev/null O_RDONLY should return a valid fd, got {}", fd);
+        current_process_uninstall();
+    }
+
+    /// `openat(AT_FDCWD, "/dev/tty", O_RDWR, 0)` succeeds (#538):
+    /// `/dev/tty` is the controlling terminal — readable (console input)
+    /// and writable (console output) — so O_RDWR is the natural mode a
+    /// shell opens it with. `device_accepts_write` returns true for the
+    /// `Console` write behaviour, so it is not rejected with -EACCES.
+    #[test]
+    fn open_dev_tty_rdwr_succeeds() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        install_test_process();
+        let path = cstring("/dev/tty");
+        let fd = handle(AT_FDCWD, path.as_ptr() as u64, O_RDWR, 0);
+        assert!(fd >= 3, "/dev/tty O_RDWR should return a valid fd, got {}", fd);
+        use crate::process::fd_table::FdEntry;
+        let lookup = current_process_fd_table(|t| t.and_then(|t| t.lookup(fd as i32).cloned()));
+        assert_eq!(
+            lookup,
+            Some(FdEntry::Synthetic {
+                path: "/dev/tty".into()
+            })
+        );
+        current_process_uninstall();
+    }
+
+    /// `openat(AT_FDCWD, "/dev/tty", O_WRONLY, 0)` also succeeds —
+    /// opening the terminal write-only (e.g. a process that only emits to
+    /// the console) is legitimate.
+    #[test]
+    fn open_dev_tty_wronly_succeeds() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        install_test_process();
+        let path = cstring("/dev/tty");
+        let fd = handle(AT_FDCWD, path.as_ptr() as u64, O_WRONLY, 0);
+        assert!(fd >= 3, "/dev/tty O_WRONLY should return a valid fd, got {}", fd);
         current_process_uninstall();
     }
 
