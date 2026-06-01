@@ -1478,7 +1478,15 @@ fn resolve_derivation_rule(
     // Split on top-level " and " only — a literal like `'if and only
     // if'` contains an `and` that must not break the clause. Walk the
     // text and break only when not inside a single-quoted span.
-    let antecedent_parts: Vec<&str> = split_top_level_and(antecedent_text)
+    //
+    // `_raw` because an n-ary objectified FT whose READING itself contains
+    // ` and ` (e.g. the ternary mapping `A Val and B Val map to C Val`,
+    // referenced in a body as `that A Val and that B Val map to that C Val`)
+    // is OVER-SPLIT here into `that A Val` + `that B Val map to that C Val`,
+    // neither of which resolves to the declared FT. The catalog-aware
+    // re-join pass below (run once `resolve_fact_type` is in scope) coalesces
+    // such fragments back into the single FT clause.
+    let antecedent_parts_raw: Vec<&str> = split_top_level_and(antecedent_text)
         .into_iter()
         .map(|s| s.trim().trim_end_matches('.'))
         .filter(|s| !s.is_empty())
@@ -1567,6 +1575,61 @@ fn resolve_derivation_rule(
         };
         let verb_opt = (!verb.is_empty()).then_some(verb);
         catalog.resolve(&role_refs, verb_opt)
+    };
+
+    // eud-valuetype-bridge-join: catalog-aware re-join of FT-reading clauses
+    // that `split_top_level_and` over-split. An objectified n-ary FT whose
+    // declared READING contains ` and ` — the canonical case is a ternary
+    // value-type mapping `A Val and B Val map to C Val` referenced in a body
+    // as `that A Val and that B Val map to that C Val` — is split into
+    // fragments (`that A Val`, `that B Val map to that C Val`) that each fail
+    // to resolve to the declared FT. Without this pass the clause is silently
+    // dropped (it slips past the unresolved-clause guard via the lenient
+    // bare-noun / existential branches), the FT never enters
+    // `antecedent_sources`, and a Join head whose value role lives ONLY on
+    // that FT (e.g. `C Val`) is left unbound → a NULL projection (zero useful
+    // rows). SPD-1's `... Valence Range and Arousal Range map to Affect
+    // Region` has the identical shape.
+    //
+    // Discipline (avoid over-generation): only MERGE a run of >=2 fragments
+    // when (a) the FIRST fragment does NOT resolve to a declared FT on its
+    // own — so two independently-valid adjacent antecedents are never
+    // glued — AND (b) the joined run DOES resolve to a declared FT. The
+    // longest such run starting at each position wins; a single fragment that
+    // already resolves (or that no merge can complete) passes through
+    // unchanged. This keys on declared-FT membership, not on incidental
+    // shared enum values, so it cannot fabricate spurious joins.
+    let antecedent_parts: Vec<String> = {
+        let raw = &antecedent_parts_raw;
+        let mut out: Vec<String> = Vec::with_capacity(raw.len());
+        let mut i = 0usize;
+        while i < raw.len() {
+            // A fragment that already resolves on its own is a complete
+            // clause — never absorb following fragments into it.
+            let solo_resolves = resolve_fact_type(raw[i]).is_some();
+            let mut chosen_end = i + 1; // exclusive; default = no merge
+            if !solo_resolves {
+                // Greedily extend the run; remember the LONGEST end whose
+                // joined text resolves to a declared FT.
+                let mut acc = raw[i].to_string();
+                let mut j = i + 1;
+                while j < raw.len() {
+                    acc.push_str(" and ");
+                    acc.push_str(raw[j]);
+                    if resolve_fact_type(&acc).is_some() {
+                        chosen_end = j + 1;
+                    }
+                    j += 1;
+                }
+            }
+            if chosen_end > i + 1 {
+                out.push(raw[i..chosen_end].join(" and "));
+            } else {
+                out.push(raw[i].to_string());
+            }
+            i = chosen_end;
+        }
+        out
     };
 
     // Detect "that X" anaphoric references -- nouns preceded by "that " in

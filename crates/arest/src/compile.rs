@@ -11244,6 +11244,145 @@ mod schema_tests {
              got empty. Resource_is_currently_in_Status had {} facts; cell={:?}", s1n, cell);
     }
 
+    /// eud-valuetype-bridge-join: neutral repro of the SPD-1 Affect Region
+    /// shape (apps/deriv-probe). Two single-valued entity facts joined on
+    /// their shared entity (`Item`), then an objectified TERNARY mapping
+    /// joined on two VALUE-TYPE roles (`A Val`, `B Val`) to project a third
+    /// value (`C Val`). The bridge keys here are VALUE TYPES, not nouns, so
+    /// the multi-antecedent equi-join detector must collect them as join
+    /// keys; otherwise the rule falls through to ModusPonens-on-first-
+    /// antecedent with `C Val` unbound and materializes ZERO rows.
+    ///
+    /// Expected: Item_has_C_Val materializes {i1 -> c1}.
+    #[test]
+    fn valuetype_bridge_join_ternary_mapping_materializes() {
+        let src = "\
+            Item(.id) is an entity type.\n\
+            A Val is a value type.\n\
+            B Val is a value type.\n\
+            C Val is a value type.\n\
+            Item has A Val.\n\
+              Each Item has at most one A Val.\n\
+            Item has B Val.\n\
+              Each Item has at most one B Val.\n\
+            Item has C Val.\n\
+              Each Item has at most one C Val.\n\
+            A Val and B Val map to C Val.\n\
+            A Val 'a1' and B Val 'b1' map to C Val 'c1'.\n\
+            Item 'i1' has A Val 'a1'.\n\
+            Item 'i1' has B Val 'b1'.\n\
+            Item has C Val iff Item has A Val and Item has B Val and that A Val and that B Val map to that C Val.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+        let refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+            .filter(|(n, _)| n.starts_with("derivation:rule_"))
+            .map(|(n, c)| (n.to_string(), ast::metacompose(c, &d)))
+            .collect();
+        let refs: Vec<(&str, &ast::Func)> = refs_owned.iter()
+            .map(|(n, f)| (n.as_str(), f)).collect();
+        let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+        let cell = ast::fetch_cell_seq("Item_has_C_Val", &new_d);
+        let facts: Vec<&ast::Object> = cell.as_seq()
+            .map(|s| s.iter().collect()).unwrap_or_default();
+        // The join must not only fire (binding Item) but PROJECT C Val from
+        // the ternary mapping antecedent: exactly one fact, {Item:i1, C Val:c1}.
+        // A NULL/absent C Val means the value-type role was joined-and-discarded
+        // but never carried into the consequent (the real eud bug).
+        assert_eq!(facts.len(), 1,
+            "value-type bridge join must materialize exactly one Item_has_C_Val \
+             fact; got {} (cell={:?})", facts.len(), cell);
+        let item = ast::binding(facts[0], "Item");
+        let cval = ast::binding(facts[0], "C Val");
+        assert_eq!((item, cval), (Some("i1"), Some("c1")),
+            "Item_has_C_Val must be {{Item:i1, C Val:c1}}; got {{Item:{:?}, C Val:{:?}}}. \
+             A null C Val means the value-type bridge key was joined-then-discarded \
+             instead of projected to the head. fact={:?}", item, cval, facts[0]);
+    }
+
+    /// eud-valuetype-bridge-join DIAGNOSTIC: verbatim apps/deriv-probe body,
+    /// parsed through the CLI entry path (`parse_to_state_from` with empty
+    /// context) instead of stage12, including the spanning-uniqueness
+    /// constraint on the mapping FT. Pins down whether the live-app 0-rows is
+    /// the CLI parse-context path (vs stage12) or simply a stale deployed
+    /// binary. Also asserts the rule classifies as a Join with the value-type
+    /// keys in join_on.
+    #[test]
+    fn valuetype_bridge_join_via_cli_path_and_classification() {
+        let src = "\
+            Item(.id) is an entity type.\n\
+            A Val is a value type.\n\
+              The possible values of A Val are 'a1', 'a2'.\n\
+            B Val is a value type.\n\
+              The possible values of B Val are 'b1', 'b2'.\n\
+            C Val is a value type.\n\
+              The possible values of C Val are 'c1', 'c2'.\n\
+            Item has A Val.\n\
+              Each Item has at most one A Val.\n\
+            Item has B Val.\n\
+              Each Item has at most one B Val.\n\
+            Item has C Val.\n\
+              Each Item has at most one C Val.\n\
+            A Val and B Val map to C Val.\n\
+              For each A Val and B Val, at most one C Val maps from that A Val and that B Val.\n\
+            A Val 'a1' and B Val 'b1' map to C Val 'c1'.\n\
+            Item 'i1' has A Val 'a1'.\n\
+            Item 'i1' has B Val 'b1'.\n\
+            Item has C Val iff Item has A Val and Item has B Val and that A Val and that B Val map to that C Val.\n\
+        ";
+        let state = crate::parse_forml2::parse_to_state_from(src, &ast::Object::phi())
+            .expect("parse must succeed");
+
+        // ROOT-CAUSE GUARD: the ternary FT clause `that A Val and that B Val
+        // map to that C Val` must resolve to a SINGLE antecedent source
+        // (A_Val_and_B_Val_map_to_C_Val) — not be over-split by
+        // `split_top_level_and` into fragments that silently drop. Pre-fix the
+        // rule resolved with only 2 antecedents (the two Item_has_* FTs) and
+        // the ternary missing, leaving the consequent's `C Val` unbound.
+        let nouns = crate::parse_forml2::nouns_from_state(&state);
+        let fts = crate::parse_forml2::fact_types_from_state(&state);
+        let mut rules: Vec<crate::types::DerivationRuleDef> = vec![
+            crate::types::DerivationRuleDef {
+                text: "Item has C Val iff Item has A Val and Item has B Val and that A Val and that B Val map to that C Val".to_string(),
+                ..Default::default()
+            }
+        ];
+        crate::parse_forml2::re_resolve_rules_pub(&mut rules, &nouns, &fts);
+        let ant_ids: Vec<String> = rules[0].antecedent_sources.iter()
+            .map(|s| s.fact_type_id().to_string()).collect();
+        assert!(ant_ids.iter().any(|id| id == "A_Val_and_B_Val_map_to_C_Val"),
+            "the ternary mapping clause must resolve to the \
+             A_Val_and_B_Val_map_to_C_Val antecedent (not be over-split and \
+             dropped); resolved antecedents were {:?}", ant_ids);
+        assert_eq!(rules[0].antecedent_sources.len(), 3,
+            "all three antecedent clauses must resolve; got {:?}", ant_ids);
+        assert_eq!(rules[0].kind, crate::types::DerivationKind::Join,
+            "the bridged ternary equi-join must classify as Join; got {:?}",
+            rules[0].kind);
+
+        let defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+        let refs_owned: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+            .filter(|(n, _)| n.starts_with("derivation:rule_"))
+            .map(|(n, c)| (n.to_string(), ast::metacompose(c, &d)))
+            .collect();
+        let refs: Vec<(&str, &ast::Func)> = refs_owned.iter()
+            .map(|(n, f)| (n.as_str(), f)).collect();
+        let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+        let cell = ast::fetch_cell_seq("Item_has_C_Val", &new_d);
+        let facts: Vec<&ast::Object> = cell.as_seq()
+            .map(|s| s.iter().collect()).unwrap_or_default();
+        assert_eq!(facts.len(), 1,
+            "CLI-path value-type bridge join must materialize exactly one \
+             Item_has_C_Val fact; got {} (cell={:?})", facts.len(), cell);
+        assert_eq!(
+            (ast::binding(facts[0], "Item"), ast::binding(facts[0], "C Val")),
+            (Some("i1"), Some("c1")),
+            "Item_has_C_Val must be {{Item:i1, C Val:c1}}; got {:?}", facts[0]);
+    }
+
     /// Single-antecedent ring FT consequent binding: when an
     /// antecedent FT has two roles that share a noun (`Task blocks
     /// Task`), the rule's role subscript (`Task2` vs `Task1`) must
