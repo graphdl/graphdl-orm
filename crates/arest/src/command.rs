@@ -7424,8 +7424,12 @@ Status 'pending' is initial in State Machine Definition 'Task'.
 
         assert_eq!(result.status.as_deref(), Some("Placed"));
 
-        // State must contain the updated status (task-742: renamed cell + role)
-        let sm_cell = ast::fetch_or_phi("State_Machine_is_currently_in_Status", &result.state);
+        // State must contain the updated status (task-742: renamed cell + role).
+        // W6 runtime sibling of #932: the transition runtime writer folds
+        // State_Machine_is_currently_in_Status to Object::Map, so read it
+        // through fetch_cell_seq (matching the create-path SM reads above at
+        // L5247/L6098). A raw fetch_or_phi(...).as_seq() returns None on a Map.
+        let sm_cell = ast::fetch_cell_seq("State_Machine_is_currently_in_Status", &result.state);
         let sm_facts = sm_cell.as_seq().unwrap();
         let sm_fact = sm_facts.iter().find(|f|
             ast::binding_matches(f, "State Machine", "ORD-1")

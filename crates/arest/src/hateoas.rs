@@ -1050,8 +1050,12 @@ mod tests {
         assert!(resp.contains("\"event\":\"categorize\""), "{resp}");
 
         // SM row's Status is now Categorized — and the row is the
-        // *same* row (no append-by-mistake).
-        let sm = crate::ast::fetch_or_phi("State Machine", &new_state);
+        // *same* row (no append-by-mistake). (W6 runtime sibling of
+        // #932 W2: "State Machine" is a bare-noun runtime keyed-entity
+        // cell — read it through fetch_cell_seq so a Map-folded SM cell
+        // flattens, matching the Event read below. A raw
+        // fetch_or_phi(...).as_seq() yields None on a Map.)
+        let sm = crate::ast::fetch_cell_seq("State Machine", &new_state);
         let sm_seq = sm.as_seq().expect("sm cell present");
         assert_eq!(sm_seq.len(), 1, "SM cell must not gain a duplicate row");
         assert_eq!(
@@ -1236,7 +1240,10 @@ mod tests {
             body,
         )
         .expect("transition succeeds");
-        let sm = crate::ast::fetch_or_phi("State Machine", &new_state);
+        // W6 runtime sibling of #932 W2: bare-noun keyed-entity cell —
+        // read via fetch_cell_seq so a Map-folded SM cell flattens
+        // (raw fetch_or_phi(...).as_seq() yields None on a Map).
+        let sm = crate::ast::fetch_cell_seq("State Machine", &new_state);
         let sm_seq = sm.as_seq().expect("sm cell");
         assert_eq!(sm_seq.len(), 2, "both rows preserved");
         // Find each by id and check status — order isn't part of the contract.
