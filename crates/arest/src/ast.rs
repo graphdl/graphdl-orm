@@ -153,6 +153,176 @@ fn current_fuel() -> u64 { APPLY_FUEL.with(|c| c.get()) }
 fn current_fuel() -> u64 {
     APPLY_FUEL_ATOMIC.load(core::sync::atomic::Ordering::Relaxed)
 }
+
+// ── ⊥-trace: why-NOT provenance for a computation that bottomed out ──
+//
+// ⊥ is absorbing and provenance-lossless: `f:⊥ = ⊥` for every `f`, so a
+// top-level ⊥ has lost every trace of WHERE it first arose. The engine
+// can only say "⊥" with no context. This is the negative twin of the
+// `explain` verb — why-NOT provenance for a structurally-bottomed
+// computation.
+//
+// The carry is a `Result::Err`-context pattern realized as a thread-
+// local, materialized ONLY when ⊥ is produced AND a caller has *armed*
+// tracing via `with_bottom_trace`. Internal evaluation (Filter via
+// `α(p→id;⊥)`, compact, etc.) produces ⊥ constantly as ordinary
+// intermediate scaffolding; recording on every such ⊥ would tax the hot
+// path. So recording is gated on an `armed` flag whose unset (default)
+// fast path costs exactly one `Cell<bool>::get` compare — the same
+// "sentinel short-circuit" shape the fuel counter uses. When unarmed,
+// `note_bottom_*` is a no-op and the success path is untouched.
+//
+// When armed, frames record bottom-up as the ⊥ unwinds: the DEEPEST
+// frame (a `Fetch`/`Store` over a cell) fills `cell` + `binding` first;
+// the enclosing `Def` frame fills `rule` on the way out. Each field is
+// written once (first writer wins per field), so the trace names the
+// ORIGIN frame, not the outermost re-throw.
+//
+// Gated `not(no_std)`: the only ⊥→user-message surfaces (`system_impl`,
+// the CLI dispatcher) are host builds. The kernel never renders ⊥ to a
+// user, so the trace is dead weight there — and `thread_local!` +
+// `RefCell` are std-only anyway. The recording call sites in `apply`
+// compile to nothing under `no_std`.
+
+/// Origin of a structurally-produced ⊥, captured as the ⊥ unwinds the
+/// application spine. Each field is `Some` only if a frame that knew it
+/// was crossed: `rule` from the enclosing `Func::Def`, `cell` + `binding`
+/// from the `Fetch`/`FetchOrPhi`/`Store` frame where the ⊥ first arose.
+#[cfg(not(feature = "no_std"))]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BottomTrace {
+    /// The rule / def being applied at the frame that bottomed out.
+    pub rule: Option<String>,
+    /// The cell (FactType image / store name) under which ⊥ arose.
+    pub cell: Option<String>,
+    /// The frame's argument binding at the point ⊥ first arose.
+    pub binding: Option<String>,
+}
+
+#[cfg(not(feature = "no_std"))]
+impl BottomTrace {
+    fn is_empty(&self) -> bool {
+        self.rule.is_none() && self.cell.is_none() && self.binding.is_none()
+    }
+
+    /// Human-readable one-line origin, e.g.
+    /// `origin: <App, a1> in rule `view:Ready` over cell `App_uses_Generator``.
+    /// Falls back through whichever fields are known. Returns `None` when
+    /// nothing was captured (no armed frame carried context).
+    pub fn describe(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut s = String::from("⊥ origin:");
+        if let Some(b) = &self.binding {
+            s.push_str(&alloc::format!(" {}", b));
+        }
+        if let Some(r) = &self.rule {
+            s.push_str(&alloc::format!(" in rule `{}`", r));
+        }
+        if let Some(c) = &self.cell {
+            s.push_str(&alloc::format!(" over cell `{}`", c));
+        }
+        Some(s)
+    }
+}
+
+#[cfg(not(feature = "no_std"))]
+thread_local! {
+    /// `true` only inside a `with_bottom_trace` scope. Unset = the hot
+    /// default; `note_bottom_*` short-circuits on a single `get`.
+    static BOTTOM_TRACE_ARMED: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// The accumulating trace; meaningful only while armed.
+    static BOTTOM_TRACE: core::cell::RefCell<BottomTrace> =
+        const { core::cell::RefCell::new(BottomTrace {
+            rule: None, cell: None, binding: None,
+        }) };
+}
+
+/// Record the `rule` (Def name) at a frame that just bottomed out.
+/// No-op unless tracing is armed (the hot default). First writer wins —
+/// the innermost Def that bottomed names the rule.
+#[cfg(not(feature = "no_std"))]
+fn note_bottom_rule(name: &str) {
+    if !BOTTOM_TRACE_ARMED.with(|c| c.get()) {
+        return;
+    }
+    BOTTOM_TRACE.with(|t| {
+        let mut t = t.borrow_mut();
+        if t.rule.is_none() {
+            t.rule = Some(name.to_string());
+        }
+    });
+}
+
+/// Record the `cell` and the frame `binding` at the `Fetch`/`Store`
+/// frame where ⊥ first arose. No-op unless armed. First writer wins, so
+/// the DEEPEST (origin) cell access is the one named.
+#[cfg(not(feature = "no_std"))]
+fn note_bottom_cell(cell: &str, binding: &Object) {
+    if !BOTTOM_TRACE_ARMED.with(|c| c.get()) {
+        return;
+    }
+    BOTTOM_TRACE.with(|t| {
+        let mut t = t.borrow_mut();
+        if t.cell.is_none() {
+            t.cell = Some(cell.to_string());
+        }
+        if t.binding.is_none() {
+            t.binding = Some(binding.to_string());
+        }
+    });
+}
+
+/// No_std shims: tracing is host-only, so under `no_std` the recording
+/// hooks compile to nothing (the kernel never renders ⊥ to a user).
+#[cfg(feature = "no_std")]
+fn note_bottom_rule(_name: &str) {}
+#[cfg(feature = "no_std")]
+fn note_bottom_cell(_cell: &str, _binding: &Object) {}
+
+/// Evaluate `f` with ⊥-tracing armed, returning the result alongside the
+/// captured `BottomTrace` (`None` when nothing carried context). Arms the
+/// thread-local flag for the duration, clears any prior trace on entry,
+/// and restores both on return so nested / sibling scopes compose. ZERO
+/// effect on `apply` callers that don't opt in — the recording hooks
+/// observe `armed == false` outside this scope.
+///
+/// Use at the ⊥→user-message boundary: when `apply` returns ⊥, the
+/// trace de-opaques "engine returned ⊥" into "⊥ origin: <binding> in
+/// rule `…` over cell `…`".
+///
+/// CONTRACT: the trace is meaningful only when the top-level `result` is
+/// itself ⊥. A frame can record an origin for an intermediate ⊥ that is
+/// later absorbed (e.g. `compact` dropping a ⊥ element) into a non-⊥
+/// result; callers therefore gate on `matches!(result, Object::Bottom)`
+/// before surfacing the trace (both the CLI dispatcher and `system_impl`
+/// do exactly this). The helper itself cannot inspect the generic `T`.
+#[cfg(not(feature = "no_std"))]
+pub fn with_bottom_trace<T, F: FnOnce() -> T>(f: F) -> (T, Option<BottomTrace>) {
+    struct Restore {
+        prev_armed: bool,
+        prev_trace: BottomTrace,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BOTTOM_TRACE_ARMED.with(|c| c.set(self.prev_armed));
+            BOTTOM_TRACE.with(|t| *t.borrow_mut() = core::mem::take(&mut self.prev_trace));
+        }
+    }
+    let _guard = {
+        let prev_armed = BOTTOM_TRACE_ARMED.with(|c| c.replace(true));
+        let prev_trace = BOTTOM_TRACE.with(|t| core::mem::take(&mut *t.borrow_mut()));
+        Restore { prev_armed, prev_trace }
+    };
+    let out = f();
+    let trace = BOTTOM_TRACE.with(|t| {
+        let t = t.borrow();
+        if t.is_empty() { None } else { Some(t.clone()) }
+    });
+    (out, trace)
+}
+
 //
 // All framework objects compile to these types:
 //   Role        → Selector
@@ -2478,13 +2648,23 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
             // when the cell is already materialized.
             match x.as_seq() {
                 Some(items) if items.len() == 2 => match items[0].as_atom() {
-                    Some(name) => match encoded_pop_lookup(name, &items[1]) {
-                        Some(facts) => facts,
-                        None => match resolve_view(name, &items[1], d) {
-                            Some(view_result) => view_result,
-                            None => fetch_or_phi(name, &items[1]),
-                        },
-                    },
+                    Some(name) => {
+                        let r = match encoded_pop_lookup(name, &items[1]) {
+                            Some(facts) => facts,
+                            None => match resolve_view(name, &items[1], d) {
+                                Some(view_result) => view_result,
+                                None => fetch_or_phi(name, &items[1]),
+                            },
+                        };
+                        // ⊥-trace origin: a view rule that bottomed out, or
+                        // a cell access that resolved to ⊥, names this cell
+                        // and the population it was read over. No-op unless
+                        // armed; the success path skips the branch.
+                        if r.is_bottom() {
+                            note_bottom_cell(name, &items[1]);
+                        }
+                        r
+                    }
                     None => Object::Bottom,
                 },
                 _ => Object::Bottom,
@@ -2498,13 +2678,22 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
             match x.as_seq() {
                 Some(items) if items.len() == 2 => {
                     match items[0].as_atom() {
-                        Some(name) => match encoded_pop_lookup(name, &items[1]) {
-                            Some(facts) => facts,
-                            None => match resolve_view(name, &items[1], d) {
-                                Some(view_result) => view_result,
-                                None => fetch(name, &items[1]),
-                            },
-                        },
+                        Some(name) => {
+                            let r = match encoded_pop_lookup(name, &items[1]) {
+                                Some(facts) => facts,
+                                None => match resolve_view(name, &items[1], d) {
+                                    Some(view_result) => view_result,
+                                    None => fetch(name, &items[1]),
+                                },
+                            };
+                            // ⊥-trace origin: name the cell + binding at the
+                            // frame where the fetch bottomed out. No-op
+                            // unless armed.
+                            if r.is_bottom() {
+                                note_bottom_cell(name, &items[1]);
+                            }
+                            r
+                        }
                         None => Object::Bottom,
                     }
                 }
@@ -2542,16 +2731,22 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                         // gates it out) so kernel boot paths keep the
                         // unrestricted system-mode semantics.
                         #[cfg(not(feature = "no_std"))]
-                        Some(_) if crate::declared_writes::cap_stack_is_empty()
-                            && !crate::declared_writes::is_permissive_empty_caps_mode() =>
-                            Object::Bottom,
+                        Some(name) if crate::declared_writes::cap_stack_is_empty()
+                            && !crate::declared_writes::is_permissive_empty_caps_mode() => {
+                            // ⊥-trace: a Sec-5 cap refusal names the cell it
+                            // tried (and failed) to write. No-op unless armed.
+                            note_bottom_cell(name, &items[1]);
+                            Object::Bottom
+                        }
                         // declared_writes is now no_std-reachable (#565);
                         // its no_std shim returns true unconditionally
                         // (kernel runs only compile-authored code, no
                         // user-code threat surface), so this arm is a
                         // no-op there but enforces caps under std.
-                        Some(name) if !crate::declared_writes::is_store_allowed(name) =>
-                            Object::Bottom,
+                        Some(name) if !crate::declared_writes::is_store_allowed(name) => {
+                            note_bottom_cell(name, &items[1]);
+                            Object::Bottom
+                        }
                         Some(name) => store(name, items[1].clone(), &items[2]),
                         None => Object::Bottom,
                     }
@@ -2749,7 +2944,13 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
         Func::Def(name) => {
             let def_obj = fetch(name, d);
             match def_obj {
-                Object::Bottom => Object::Bottom,
+                // The named def itself is absent → ⊥. Name the rule so a
+                // top-level "engine returned ⊥" reports the missing def
+                // as the origin rather than a bare ⊥.
+                Object::Bottom => {
+                    note_bottom_rule(name);
+                    Object::Bottom
+                }
                 obj => {
                     // Sec-5: if DEFS contains `allowed_writes:{name}`
                     // as a Seq of atom cell names, scope the body under
@@ -2758,7 +2959,14 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                     // Now no_std-reachable (#565) — kernel build's
                     // shimmed `push_caps` is a no-op so this is safe.
                     let _caps_guard = defs_writes_scope(name, d);
-                    apply(&metacompose(&obj, d), x, d)
+                    let result = apply(&metacompose(&obj, d), x, d);
+                    // ⊥-trace: if the rule body bottomed out, record this
+                    // def as the enclosing rule frame. No-op unless armed;
+                    // the success path skips the `is_bottom` branch.
+                    if result.is_bottom() {
+                        note_bottom_rule(name);
+                    }
+                    result
                 }
             }
         }
@@ -9486,6 +9694,146 @@ mod tests {
         let m = fetch_or_phi("Task_blocks_Task", &s).as_map().cloned()
             .expect("folded cell is a Map");
         assert_eq!(m.len(), 2, "two distinct ring tuples must coexist");
+    }
+
+    // ── ⊥-trace (derivation-bottom-trace) ───────────────────────────
+    //
+    // ⊥ is provenance-lossless (`f:⊥ = ⊥`), so a top-level ⊥ loses its
+    // origin — the engine can only say "⊥". These tests pin the negative
+    // twin of `explain`: `with_bottom_trace` materializes the frame
+    // context (rule / cell / binding) ONLY when ⊥ is produced, turning a
+    // bare "⊥" into "⊥ origin: <binding> in rule `…` over cell `…`".
+
+    /// Ring-derivation over the `Task_blocks_Task` self-ring: a rule whose
+    /// body fetches a cell that is ABSENT bottoms out. BEFORE: a bare "⊥".
+    /// AFTER: the trace names the rule (Def) AND the cell + binding (Fetch)
+    /// at the frame where ⊥ first arose.
+    #[test]
+    fn bottom_trace_ring_apply_names_rule_cell_and_binding() {
+        // Rule `derive:Blocked` ≡ Fetch — over an EMPTY def-state, so the
+        // `Task_blocks_Task` cell the body fetches does not exist. The
+        // applied binding <Task_blocks_Task, φ> resolves through fetch →
+        // ⊥ (absent cell, no view).
+        let d = defs_to_state(
+            &[("derive:Blocked".to_string(), Func::Fetch)],
+            &Object::phi(),
+        );
+        let binding = Object::seq(vec![
+            Object::atom("Task_blocks_Task"),
+            Object::phi(), // empty population — cell genuinely absent
+        ]);
+
+        // BEFORE: unarmed apply returns ⊥; the user-facing render is a
+        // bare, origin-less "⊥".
+        let bare = apply(&Func::Def("derive:Blocked".to_string()), &binding, &d);
+        assert_eq!(bare, Object::Bottom);
+        assert_eq!(bare.to_string(), "⊥",
+            "BEFORE: a top-level ⊥ renders as a bare, provenance-lossless ⊥");
+
+        // AFTER: armed apply captures the origin frame.
+        let (result, trace) = with_bottom_trace(
+            || apply(&Func::Def("derive:Blocked".to_string()), &binding, &d));
+        assert_eq!(result, Object::Bottom, "still ⊥ — tracing is non-invasive");
+        let trace = trace.expect("a structural ⊥ over a named cell must capture a trace");
+        assert_eq!(trace.rule.as_deref(), Some("derive:Blocked"),
+            "origin names the enclosing rule (Func::Def frame)");
+        assert_eq!(trace.cell.as_deref(), Some("Task_blocks_Task"),
+            "origin names the cell the Fetch frame bottomed out over");
+        assert!(trace.binding.is_some(),
+            "origin names the frame binding at the ⊥ site");
+
+        let described = trace.describe().expect("non-empty trace describes");
+        assert!(described.contains("derive:Blocked")
+                && described.contains("Task_blocks_Task"),
+            "AFTER: traced origin de-opaques the ⊥ — got `{described}`");
+        assert_ne!(described, "⊥",
+            "AFTER must NOT be a bare ⊥ — it carries the origin");
+        // Pin the literal BEFORE→AFTER de-opaquing for the ring-apply ⊥:
+        //   BEFORE: "⊥"
+        //   AFTER : "⊥ origin: φ in rule `derive:Blocked` over cell `Task_blocks_Task`"
+        assert_eq!(described,
+            "⊥ origin: φ in rule `derive:Blocked` over cell `Task_blocks_Task`",
+            "AFTER is the exact traced origin form");
+    }
+
+    /// std-deps real ⊥: a `Func::Store` to a cell under an empty
+    /// capability stack is refused (Sec-5) and collapses to ⊥. The trace
+    /// names the cell the refused write targeted.
+    #[test]
+    fn bottom_trace_std_deps_cap_refused_store_names_cell() {
+        // Empty cap stack (test default) + not-permissive ⇒ the store
+        // refusal arm fires. <cell, contents, D>.
+        let binding = Object::seq(vec![
+            Object::atom("Task_blocks_Task"),
+            fact_from_pairs(&[("Task", "112"), ("Task", "113")]),
+            Object::phi(),
+        ]);
+
+        let bare = apply(&Func::Store, &binding, &Object::phi());
+        assert_eq!(bare.to_string(), "⊥",
+            "BEFORE: a cap-refused store is a bare ⊥");
+
+        let (result, trace) = with_bottom_trace(
+            || apply(&Func::Store, &binding, &Object::phi()));
+        assert_eq!(result, Object::Bottom);
+        let trace = trace.expect("a cap-refused store must capture a trace");
+        assert_eq!(trace.cell.as_deref(), Some("Task_blocks_Task"),
+            "origin names the cell the refused write targeted");
+    }
+
+    /// Absent-def ⊥: applying `Func::Def(name)` where the def is not in
+    /// state bottoms out; the trace names the missing rule.
+    #[test]
+    fn bottom_trace_absent_def_names_rule() {
+        let (result, trace) = with_bottom_trace(
+            || apply(&Func::Def("derive:DoesNotExist".to_string()),
+                     &Object::phi(), &Object::phi()));
+        assert_eq!(result, Object::Bottom);
+        let trace = trace.expect("an absent def must capture a trace");
+        assert_eq!(trace.rule.as_deref(), Some("derive:DoesNotExist"),
+            "origin names the missing rule");
+    }
+
+    /// Zero-cost / non-invasive on the SUCCESS path: a rule that does NOT
+    /// bottom out captures NO trace, even inside an armed scope, and the
+    /// result is identical to the unarmed apply. This pins that arming
+    /// tracing never alters a successful computation.
+    #[test]
+    fn bottom_trace_success_path_captures_nothing() {
+        // Rule `derive:First` ≡ Selector(1); over a non-empty seq it
+        // succeeds and never produces ⊥.
+        let d = defs_to_state(
+            &[("derive:First".to_string(), Func::Selector(1))],
+            &Object::phi(),
+        );
+        let x = Object::seq(vec![Object::atom("a"), Object::atom("b")]);
+
+        let unarmed = apply(&Func::Def("derive:First".to_string()), &x, &d);
+        let (armed, trace) = with_bottom_trace(
+            || apply(&Func::Def("derive:First".to_string()), &x, &d));
+
+        assert_eq!(unarmed, Object::atom("a"));
+        assert_eq!(armed, unarmed,
+            "arming the ⊥-trace must not change a successful result");
+        assert!(trace.is_none(),
+            "the success path must capture NO trace — recording is ⊥-only");
+    }
+
+    /// Intermediate ⊥ that is legitimately absorbed (compact drops ⊥
+    /// elements → a non-⊥ seq) must NOT surface a trace: the top-level
+    /// result is not ⊥, so `with_bottom_trace` reports `None`. Pins that
+    /// "⊥ as ordinary scaffolding" is not mistaken for a bottomed-out
+    /// computation.
+    #[test]
+    fn bottom_trace_absorbed_intermediate_bottom_is_not_reported() {
+        // compact:<a, ⊥, b> = <a, b> — a ⊥ element is consumed, the
+        // overall apply succeeds.
+        let x = Object::Seq(
+            vec![Object::atom("a"), Object::Bottom, Object::atom("b")].into());
+        let (result, trace) = with_bottom_trace(|| apply(&Func::Compact, &x, &Object::phi()));
+        assert_eq!(result, Object::seq(vec![Object::atom("a"), Object::atom("b")]));
+        assert!(trace.is_none(),
+            "an absorbed intermediate ⊥ that yields a non-⊥ result reports no trace");
     }
 
     #[test]

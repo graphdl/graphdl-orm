@@ -2311,7 +2311,19 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         let st = tenant.read();
         let obj = ast::Object::parse(input);
         let snapshot = st.snapshot_d();
-        let result = ast::apply(&ast::Func::Def(key.to_string()), &obj, &snapshot);
+        // ⊥-trace: arm why-NOT provenance. Zero cost on the success path;
+        // the trace materializes only if the read-only dispatch
+        // structurally bottoms out. When it does AND a frame captured the
+        // origin, surface "⊥ origin: …" (still ⊥-recognizable by the
+        // pervasive `starts_with('⊥')` checks) instead of the
+        // provenance-lossless JSON `null` that to_json_string would emit.
+        let (result, trace) = ast::with_bottom_trace(
+            || ast::apply(&ast::Func::Def(key.to_string()), &obj, &snapshot));
+        if let ast::Object::Bottom = result {
+            if let Some(origin) = trace.as_ref().and_then(|t| t.describe()) {
+                return origin;
+            }
+        }
         return result.to_json_string();
     }
 

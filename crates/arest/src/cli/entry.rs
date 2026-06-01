@@ -309,7 +309,13 @@ fn system(key: &str, input: &str, d: &ast::Object) -> (String, ast::Object) {
     }
 
     let obj = ast::Object::parse(input);
-    let result = ast::apply(&ast::Func::Def(key.to_string()), &obj, d);
+    // ⊥-trace: arm why-NOT provenance around the dispatch apply. ZERO
+    // cost on the success path — the trace materializes only if the
+    // computation structurally bottoms out (see ast::with_bottom_trace).
+    // De-opaques the bare "⊥" the `_` arm below would otherwise print
+    // into "⊥ origin: <binding> in rule `…` over cell `…`".
+    let (result, bottom_trace) =
+        ast::with_bottom_trace(|| ast::apply(&ast::Func::Def(key.to_string()), &obj, d));
 
     // Three result shapes the dispatcher must distinguish:
     //
@@ -348,6 +354,16 @@ fn system(key: &str, input: &str, d: &ast::Object) -> (String, ast::Object) {
         }
         ast::Object::Seq(_) if ast::fetch("Noun", &result) != ast::Object::Bottom => {
             (result.to_string(), result.clone())
+        }
+        // ⊥-trace surfacing: a top-level ⊥ is provenance-lossless on its
+        // own. If an armed frame captured the origin, print the traced
+        // form instead of a bare "⊥". State is unchanged either way.
+        ast::Object::Bottom => {
+            let rendered = bottom_trace
+                .as_ref()
+                .and_then(|t| t.describe())
+                .unwrap_or_else(|| result.to_string());
+            (rendered, d.clone())
         }
         _ => (result.to_string(), d.clone()),
     };
