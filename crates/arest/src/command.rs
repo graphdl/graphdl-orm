@@ -9753,6 +9753,172 @@ Task blocks Task is asymmetric.
              after the alethic rejection; ring_cell={:?}", ring_cell);
     }
 
+    /// blocked-status-sm-1 — POSITIVE-materialization regression guard for
+    /// the same-noun ring-fact apply path (the last blocker before the live
+    /// `blocked` Task-status SM, blocked-status-sm-3).
+    ///
+    /// The bug class this pins: asserting a SAME-NOUN ring fact
+    /// (`Task A blocks Task B`, where the noun `Task` fills BOTH roles of
+    /// `Task_blocks_Task`) via `apply` must MATERIALIZE the exact ordered
+    /// tuple `<<Task,A>,<Task,B>>` — NOT collapse the two same-noun roles
+    /// into one binding, and NOT bottom out to ⊥. The trap is that the
+    /// surrogate / reference-role binding can fold the two `Task` values
+    /// together (they share a role name), or the ring-FT cell write can
+    /// reject the duplicate-role tuple, either of which surfaces as the
+    /// ⊥-traced `... over cell `Task_blocks_Task``.
+    ///
+    /// Unlike the sibling `assert_fact_ring_lands_in_cell_and_fires_derivation`
+    /// (which checks one pair), this test proves the fact is ACTUALLY THERE
+    /// by asserting the EXACT positional shape (pos-0 = the blocker, pos-1 =
+    /// the blocked, two DISTINCT values), then drives a SECOND independent
+    /// pair to prove the append coexists with the first (no clobber), then
+    /// reconfirms the irreflexive self-loop is rejected and never lands. All
+    /// three on one tiny synthetic state — no large tasks.db.
+    #[test]
+    fn assert_fact_same_noun_ring_materializes_exact_tuple_not_bottom() {
+        let (def_obj, state) = setup_ring_defs();
+
+        // Helper: collect a cell's facts as positional (role, value) tuple
+        // lists. `ast::binding` finds only the FIRST role of a name, so for a
+        // same-noun ring it cannot distinguish the two `Task` slots — the
+        // POSITIONAL read below is the load-bearing check that the two
+        // same-noun values are preserved in order and NOT collapsed. `cell`
+        // is the output of `ast::fetch_cell_seq` (already a Seq of facts,
+        // folded-Map cells flattened), so a plain `as_seq` walk suffices.
+        fn positional_tuples(cell: &ast::Object) -> Vec<Vec<(String, String)>> {
+            cell.as_seq()
+                .map(|facts| facts.iter().filter_map(|f| {
+                    let pairs = f.as_seq()?;
+                    Some(pairs.iter().filter_map(|p| {
+                        let kv = p.as_seq()?;
+                        Some((kv.first()?.as_atom()?.to_string(),
+                              kv.get(1)?.as_atom()?.to_string()))
+                    }).collect::<Vec<(String, String)>>())
+                }).collect())
+                .unwrap_or_default()
+        }
+
+        // ── (1) Assert `Task task-A blocks Task task-B`. ─────────────────
+        let cmd = Command::AssertFact {
+            fact_type: "Task_blocks_Task".to_string(),
+            pairs: vec![
+                RolePair { role: "Task".to_string(), value: "task-A".to_string() },
+                RolePair { role: "Task".to_string(), value: "task-B".to_string() },
+            ],
+            sender: None,
+            signature: None,
+        };
+        let r1 = apply_command_defs(&def_obj, &cmd, &state);
+
+        // NOT ⊥: the apply must not be rejected and must carry no alethic
+        // violation. (A bottomed ring assertion historically surfaced as a
+        // rejection with a constraint-shaped ⊥, or an empty/φ delta.)
+        assert!(!r1.rejected,
+            "blocked-status-sm-1: same-noun ring apply must NOT bottom/reject; \
+             violations={:?}", r1.violations);
+        assert!(!r1.violations.iter().any(|v| v.alethic),
+            "blocked-status-sm-1: no alethic violation expected for distinct \
+             A≠B; violations={:?}", r1.violations);
+        // A non-empty delta proves SOMETHING was committed (not D'=D / φ).
+        assert!(!ast::cells_iter(&r1.state).is_empty(),
+            "blocked-status-sm-1: a successful ring apply must emit a non-empty \
+             delta (the materialized tuple); delta={:?}", r1.state);
+
+        let s1 = ast::merge_states(&state, &r1.state);
+
+        // The fact is ACTUALLY THERE — exact positional tuple, two DISTINCT
+        // same-noun values in insertion order (the anti-collapse proof).
+        let ring1 = positional_tuples(&ast::fetch_cell_seq("Task_blocks_Task", &s1));
+        assert_eq!(ring1.len(), 1,
+            "blocked-status-sm-1: exactly one ring fact must be present after the \
+             first assert; got {:?}", ring1);
+        assert_eq!(ring1[0],
+            vec![("Task".to_string(), "task-A".to_string()),
+                 ("Task".to_string(), "task-B".to_string())],
+            "blocked-status-sm-1: the materialized tuple must be the EXACT ordered \
+             <<Task,task-A>,<Task,task-B>> — the two same-noun roles must NOT \
+             collapse and the values must keep position (pos-0 blocker, pos-1 \
+             blocked); got {:?}", ring1[0]);
+        // Belt-and-suspenders: the two Task values in the stored tuple differ.
+        assert_ne!(ring1[0][0].1, ring1[0][1].1,
+            "blocked-status-sm-1: the two same-noun Task values must remain \
+             DISTINCT in storage (no surrogate collapse); got {:?}", ring1[0]);
+
+        // ── (2) Derivation over the self-ring fired for the BLOCKED slot. ─
+        // `Task2 has Task Readiness 'blocked' iff Task1 blocks Task2` — the
+        // Halpin-subscript join must bind the consequent `Task` to the SECOND
+        // ring position (task-B), not the first. This is queryable, correct.
+        let readiness1 = ast::fetch_cell_seq("Task_has_Task_Readiness", &s1);
+        let b_blocked = readiness1.as_seq().map(|fs| fs.iter().any(|f|
+            ast::binding(f, "Task") == Some("task-B")
+            && ast::binding(f, "Task Readiness") == Some("blocked"))).unwrap_or(false);
+        let a_blocked = readiness1.as_seq().map(|fs| fs.iter().any(|f|
+            ast::binding(f, "Task") == Some("task-A")
+            && ast::binding(f, "Task Readiness") == Some("blocked"))).unwrap_or(false);
+        assert!(b_blocked,
+            "blocked-status-sm-1: derivation must tag the BLOCKED task (pos-1, \
+             task-B) 'blocked'; readiness={:?}", readiness1);
+        assert!(!a_blocked,
+            "blocked-status-sm-1: the BLOCKER (pos-0, task-A) must NOT be tagged \
+             'blocked' — proves the join distinguishes Task1 from Task2; \
+             readiness={:?}", readiness1);
+
+        // ── (3) A SECOND, independent pair must coexist (no clobber). ─────
+        // `Task task-B blocks Task task-C` appended onto the post-(1) state.
+        let cmd2 = Command::AssertFact {
+            fact_type: "Task_blocks_Task".to_string(),
+            pairs: vec![
+                RolePair { role: "Task".to_string(), value: "task-B".to_string() },
+                RolePair { role: "Task".to_string(), value: "task-C".to_string() },
+            ],
+            sender: None,
+            signature: None,
+        };
+        let r2 = apply_command_defs(&def_obj, &cmd2, &s1);
+        assert!(!r2.rejected,
+            "blocked-status-sm-1: second distinct ring pair must NOT bottom/reject; \
+             violations={:?}", r2.violations);
+        let s2 = ast::merge_states(&s1, &r2.state);
+
+        let ring2 = positional_tuples(&ast::fetch_cell_seq("Task_blocks_Task", &s2));
+        let has_ab = ring2.iter().any(|t| t ==
+            &vec![("Task".to_string(), "task-A".to_string()),
+                  ("Task".to_string(), "task-B".to_string())]);
+        let has_bc = ring2.iter().any(|t| t ==
+            &vec![("Task".to_string(), "task-B".to_string()),
+                  ("Task".to_string(), "task-C".to_string())]);
+        assert!(has_ab && has_bc,
+            "blocked-status-sm-1: BOTH ring tuples must coexist after the second \
+             assert (the first must not be clobbered); got {:?}", ring2);
+
+        // ── (4) A self-loop on the same noun is still REJECTED. ───────────
+        // `Task task-X blocks Task task-X` violates the irreflexive ring
+        // constraint: it must reject (D'=D) and never materialize. This
+        // proves the positive path materializes only VALID ring tuples.
+        let cmd3 = Command::AssertFact {
+            fact_type: "Task_blocks_Task".to_string(),
+            pairs: vec![
+                RolePair { role: "Task".to_string(), value: "task-X".to_string() },
+                RolePair { role: "Task".to_string(), value: "task-X".to_string() },
+            ],
+            sender: None,
+            signature: None,
+        };
+        let r3 = apply_command_defs(&def_obj, &cmd3, &s2);
+        assert!(r3.rejected && r3.violations.iter().any(|v| v.alethic),
+            "blocked-status-sm-1: same-noun SELF-LOOP must be rejected by the \
+             irreflexive ring constraint; violations={:?}", r3.violations);
+        assert!(ast::cells_iter(&r3.state).is_empty(),
+            "blocked-status-sm-1: a rejected self-loop must emit an empty delta \
+             (D'=D); delta cells={:?}", ast::cells_iter(&r3.state));
+        let s3 = ast::merge_states(&s2, &r3.state);
+        let ring3 = positional_tuples(&ast::fetch_cell_seq("Task_blocks_Task", &s3));
+        let has_xx = ring3.iter().any(|t| t.iter().all(|(_, v)| v == "task-X"));
+        assert!(!has_xx,
+            "blocked-status-sm-1: the self-loop tuple must NOT have landed; \
+             ring={:?}", ring3);
+    }
+
     // ── task-crudl-deploy-readpath tests ─────────────────────────────
 
     /// task-crudl-deploy-readpath (smoke): the new Command variants deserialize
