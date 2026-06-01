@@ -57,13 +57,33 @@
 // `#[cfg(feature = "repl")]`). The source returns `Option<u32>` —
 // `Some(codepoint)` or `None` when drained.
 //
+// Device-fd reads (#537)
+// -----------------------
+// Beyond fd 0 (stdin), a process can `openat` a `/dev/*` special device
+// (#537 — `/dev/null`, `/dev/zero`, `/dev/random`), which lands a
+// `FdEntry::Synthetic { path }` in the per-process fd table. A `read` of
+// such an fd routes through the device's behaviour (`synthetic_fs::
+// device_behavior`): `/dev/null` returns EOF (0 bytes), `/dev/zero`
+// fills the buffer with zeros, `/dev/random` fills it with CSPRNG bytes.
+// The fill is sourced from `synthetic_fs::device_read` (the single
+// device-table source of truth) and copied into the caller's buffer via
+// the same identity-mapped `core::ptr::write` pattern the keyboard path
+// uses. Non-device synthetic fds (`/proc/*`, `/sys/*`) and File-cell fds
+// are out of #537 scope and still return `-EBADF` here (the full VFS
+// read lands in a later track) — this slice wires the device subtree
+// only, which is what `/dev/null`-style behaviour needs.
+//
 // errno values used
 // -----------------
-//   EBADF  =  9  — fd is not 0 (stdin). #508 scope is fd 0 only; file
-//                  reads (#560 VFS) land in a later track.
+//   EBADF  =  9  — fd is not 0 (stdin) and not a readable `/dev/*`
+//                  device fd. #508 scope was fd 0 only; #537 adds the
+//                  device-fd path; the full VFS read lands later.
 //   EFAULT = 14  — null buf with non-zero count.
 
+use crate::process::current_process_fd_table;
+use crate::process::fd_table::FdEntry;
 use crate::syscall::dispatch::{EBADF, EFAULT};
+use crate::synthetic_fs;
 
 /// Linux x86_64 syscall number for `read(fd, buf, count)`. Source:
 /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_read` (= 0).
@@ -100,16 +120,85 @@ pub const STDIN_FD: u64 = 0;
 /// mistake; a non-null but unmapped address would fault under real page
 /// tables (future #527 / #561 add the validate step).
 pub fn handle(fd: u64, buf: u64, count: u64) -> i64 {
-    if fd != STDIN_FD {
-        return -EBADF;
-    }
+    // POSIX no-op: a zero-length read returns 0 without touching `buf`,
+    // regardless of which fd it targets (so a probe `read(fd, NULL, 0)`
+    // succeeds). Checked before the fd dispatch so every fd shares the
+    // short-circuit.
     if count == 0 {
         return 0;
     }
     if buf == 0 {
         return -EFAULT;
     }
-    do_read(buf, count, &mut keyboard_source())
+
+    if fd == STDIN_FD {
+        return do_read(buf, count, &mut keyboard_source());
+    }
+
+    // Beyond stdin: a `/dev/*` device fd opened via `openat` (#537).
+    // Resolve the fd in the per-process fd table; if it's a synthetic
+    // device path, fill per the device's read behaviour. Anything else
+    // (non-device synthetic, File-cell fd, unknown fd) → -EBADF.
+    read_device_fd(fd, buf, count)
+}
+
+/// Read from a `/dev/*` device fd (#537). Looks the fd up in the current
+/// process's fd table; when it resolves to a `Synthetic` device path,
+/// fills the caller's buffer per the device's `ReadKind` (`/dev/null` →
+/// EOF, `/dev/zero` → zeros, `/dev/random` → CSPRNG bytes) and returns
+/// the byte count written. Returns `-EBADF` for any fd that isn't a
+/// readable device (unknown fd, File-cell fd, non-device synthetic path,
+/// or no process installed).
+///
+/// SAFETY: same identity-mapped buffer write as `do_read` — `buf` is
+/// non-null (caller checked) and the fill never exceeds `count` bytes.
+fn read_device_fd(fd: u64, buf: u64, count: u64) -> i64 {
+    // i32 is the fd-table key width; a fd that doesn't fit (e.g. a huge
+    // u64 from a malformed call) can't be in the table → -EBADF.
+    let Ok(fd_i32) = i32::try_from(fd) else {
+        return -EBADF;
+    };
+
+    // Extract the device path out of the fd table inside the lock, then
+    // drop the lock before sourcing bytes (the CSPRNG fill for
+    // `/dev/random` takes its own lock — don't nest).
+    let path = current_process_fd_table(|maybe_table| {
+        let table = maybe_table?;
+        match table.lookup(fd_i32) {
+            Some(FdEntry::Synthetic { path }) => Some(path.clone()),
+            _ => None,
+        }
+    });
+    let Some(path) = path else {
+        return -EBADF;
+    };
+
+    // Bound the request the same way `do_read` does (the slice / pointer
+    // arithmetic needs `count <= isize::MAX`).
+    if count > isize::MAX as u64 {
+        return -EFAULT;
+    }
+
+    // Source the device bytes from the single device-table entry point.
+    // `None` means the synthetic path isn't a `/dev/*` device (e.g. a
+    // `/proc/*` fd) — out of #537 scope, return -EBADF.
+    let Some(bytes) = synthetic_fs::device_read(&path, count as usize) else {
+        return -EBADF;
+    };
+
+    // Copy the filled bytes into the caller's buffer via the identity-
+    // mapped pointer write (same pattern as `do_read` / `getrandom::
+    // fill_userspace`). `bytes.len() <= count` by construction so no
+    // out-of-bounds write is possible.
+    for (i, &b) in bytes.iter().enumerate() {
+        // SAFETY: `buf` is non-null (caller checked), `i < bytes.len()
+        // <= count <= isize::MAX`, and tier-1's identity mapping makes
+        // the address valid kernel memory.
+        unsafe {
+            core::ptr::write((buf + i as u64) as *mut u8, b);
+        }
+    }
+    bytes.len() as i64
 }
 
 /// Production keystroke source: pops from the UEFI keyboard ring.
@@ -465,5 +554,133 @@ mod tests {
         );
         assert_eq!(result, count as i64);
         assert_eq!(&heap_buf[..count], expected);
+    }
+
+    // ---------------------------------------------------------------
+    // /dev/* device-fd read tests (#537)
+    // ---------------------------------------------------------------
+    //
+    // These exercise the fd → fd-table → device-read dispatch added in
+    // #537. They allocate a device fd directly through the fd table
+    // (`synthetic("/dev/...")`) rather than via `openat` to keep the
+    // test focused on `read::handle`; the openat→fd-table wiring is
+    // covered by the openat tests.
+
+    use crate::process::address_space::AddressSpace;
+    use crate::process::fd_table::synthetic;
+    use crate::process::process::CURRENT_PROCESS_TEST_LOCK;
+    use crate::process::{current_process_install, current_process_uninstall, Process};
+
+    /// Install a fresh Process and allocate a device fd against `path`.
+    /// Returns the fd. Caller must hold `CURRENT_PROCESS_TEST_LOCK`.
+    fn install_with_device_fd(path: &str) -> i32 {
+        let address_space = AddressSpace::new(0x40_1000);
+        let proc = Process::new(7, address_space);
+        current_process_install(proc);
+        current_process_fd_table(|t| {
+            t.expect("process installed")
+                .allocate(synthetic(path))
+                .expect("allocate device fd")
+        })
+    }
+
+    /// `read` of a `/dev/null` fd returns 0 (EOF) and does not touch the
+    /// buffer — matches `/dev/null`'s read contract.
+    #[test]
+    fn read_dev_null_fd_returns_eof() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let fd = install_with_device_fd("/dev/null");
+        let mut buf = [0xAAu8; 16];
+        let result = handle(fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64);
+        assert_eq!(result, 0, "/dev/null read must return 0 (EOF)");
+        // Buffer untouched (no bytes written).
+        assert!(buf.iter().all(|&b| b == 0xAA), "buffer must be untouched");
+        current_process_uninstall();
+    }
+
+    /// `read` of a `/dev/zero` fd fills the whole buffer with zero bytes
+    /// and returns the count.
+    #[test]
+    fn read_dev_zero_fd_fills_with_zeros() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let fd = install_with_device_fd("/dev/zero");
+        let mut buf = [0xFFu8; 32];
+        let result = handle(fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64);
+        assert_eq!(result, 32, "/dev/zero read must fill the whole request");
+        assert!(buf.iter().all(|&b| b == 0), "every byte must be 0x00");
+        current_process_uninstall();
+    }
+
+    /// `read` of a `/dev/random` fd fills the buffer with random bytes
+    /// (returns the count). Uses a deterministic entropy source so the
+    /// CSPRNG fill is reproducible and non-zero — the assertion pins the
+    /// exact keystream so a regression in csprng / the device wiring
+    /// shows up as a diff, not a flake.
+    #[test]
+    fn read_dev_random_fd_fills_with_random_bytes() {
+        use arest::entropy::{self, DeterministicSource};
+
+        // Serialise entropy install/body/uninstall against concurrent
+        // tests touching the global CSPRNG (same rationale as
+        // getrandom::tests::TEST_ENTROPY_LOCK).
+        static TEST_ENTROPY_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+        let _entropy_guard = TEST_ENTROPY_LOCK.lock();
+        let _proc_guard = CURRENT_PROCESS_TEST_LOCK.lock();
+
+        entropy::install(alloc::boxed::Box::new(DeterministicSource::new([11u8; 32])));
+        arest::csprng::reseed();
+
+        let fd = install_with_device_fd("/dev/random");
+        let mut buf = [0u8; 16];
+        let result = handle(fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64);
+        assert_eq!(result, 16, "/dev/random read must fill the whole request");
+        // The fill must have replaced the zero-init buffer with entropy.
+        assert!(
+            buf.iter().any(|&b| b != 0),
+            "/dev/random read must produce non-zero bytes"
+        );
+
+        current_process_uninstall();
+        entropy::uninstall();
+        arest::csprng::reseed();
+    }
+
+    /// `read` of an unknown fd (not stdin, not a device fd) returns
+    /// `-EBADF` — the fd-table lookup misses.
+    #[test]
+    fn read_unknown_fd_returns_ebadf() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        // Install a process but allocate no fds; fd 7 is not in the table.
+        let address_space = AddressSpace::new(0x40_1000);
+        let proc = Process::new(7, address_space);
+        current_process_install(proc);
+        let mut buf = [0u8; 16];
+        let result = handle(7, buf.as_mut_ptr() as u64, buf.len() as u64);
+        assert_eq!(result, -EBADF);
+        current_process_uninstall();
+    }
+
+    /// A non-device synthetic fd (`/proc/cpuinfo`) is out of #537 read
+    /// scope — `read` returns `-EBADF` (the full VFS read lands later).
+    #[test]
+    fn read_non_device_synthetic_fd_returns_ebadf() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let fd = install_with_device_fd("/proc/cpuinfo");
+        let mut buf = [0u8; 16];
+        let result = handle(fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64);
+        assert_eq!(result, -EBADF);
+        current_process_uninstall();
+    }
+
+    /// `read(dev_fd, NULL, n>0)` returns `-EFAULT` — a null buffer is
+    /// rejected before the device fill (the device path doesn't bypass
+    /// the buffer-validity check).
+    #[test]
+    fn read_dev_zero_null_buf_returns_efault() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let fd = install_with_device_fd("/dev/zero");
+        let result = handle(fd as u64, 0, 16);
+        assert_eq!(result, -EFAULT);
+        current_process_uninstall();
     }
 }

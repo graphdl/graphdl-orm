@@ -66,7 +66,10 @@
 use core::slice;
 use core::str;
 
+use crate::process::current_process_fd_table;
+use crate::process::fd_table::FdEntry;
 use crate::syscall::dispatch::{EBADF, EFAULT};
+use crate::synthetic_fs::{self, WriteKind};
 
 /// File-descriptor number for stdout per POSIX
 /// (`<unistd.h>:STDOUT_FILENO`). Linux libc defines it as 1; the
@@ -102,18 +105,25 @@ pub const STDERR_FD: u64 = 2;
 /// handler dereferences it directly. Once #527 lands real page tables,
 /// the deref needs to route through the per-process AddressSpace.
 pub fn handle(fd: u64, buf: u64, count: u64) -> i64 {
-    // Accept stdout (fd 1) and stderr (fd 2) — both route to the kernel
-    // serial console in tier-1 (single output stream). fd 0 is read-only
-    // (handled by read::handle / #508); all other fds return -EBADF.
-    if fd != STDOUT_FD && fd != STDERR_FD {
-        return -EBADF;
-    }
     // Fast-path: zero-length write is a no-op per POSIX. Doing this
-    // check before the buf-null check lets the test suite exercise
-    // `write(1, NULL, 0)` without panicking on a null deref.
+    // check before the fd / buf checks lets the test suite exercise
+    // `write(1, NULL, 0)` without panicking on a null deref, and a
+    // zero-length write to a device fd succeeds as a no-op too.
     if count == 0 {
         return 0;
     }
+
+    // Beyond the standard streams: a `/dev/*` device fd opened via
+    // `openat` (#537). A write to a discard device (`/dev/null`,
+    // `/dev/zero`) consumes the bytes and reports the full count; a
+    // write to a read-only device (`/dev/random`) returns -EBADF. This
+    // is dispatched before the buf-null check because a discard device
+    // still validates its buffer (a real `write(fd, NULL, n>0)` is
+    // -EFAULT even to /dev/null).
+    if fd != STDOUT_FD && fd != STDERR_FD {
+        return write_device_fd(fd, buf, count);
+    }
+
     if buf == 0 {
         return -EFAULT;
     }
@@ -142,6 +152,64 @@ pub fn handle(fd: u64, buf: u64, count: u64) -> i64 {
             }
         }
     })
+}
+
+/// Write to a `/dev/*` device fd (#537). Looks the fd up in the current
+/// process's fd table; when it resolves to a `Synthetic` device path,
+/// applies the device's write behaviour:
+///
+///   * `WriteKind::Discard` (`/dev/null`, `/dev/zero`) — the bytes are
+///     consumed and the full `count` is reported as written (a real
+///     `/dev/null` accepts any volume and discards it). The buffer is
+///     still validated (null `buf` with `count > 0` → `-EFAULT`) so a
+///     bad pointer surfaces the same way it would for a real write.
+///   * `WriteKind::Reject` (`/dev/random`) — `-EBADF`. The device is
+///     read-only; the fd was opened `O_RDONLY` and writing to it is the
+///     same error Linux returns for a write to a read-only fd.
+///
+/// Returns `-EBADF` for any fd that isn't a `/dev/*` device fd (unknown
+/// fd, File-cell fd, non-device synthetic path, no process installed) —
+/// preserving the pre-#537 "only fd 1/2 are writable" surface for
+/// everything outside the device subtree.
+fn write_device_fd(fd: u64, buf: u64, count: u64) -> i64 {
+    let Ok(fd_i32) = i32::try_from(fd) else {
+        return -EBADF;
+    };
+
+    // Pull the synthetic path out of the fd table inside the lock.
+    let path = current_process_fd_table(|maybe_table| {
+        let table = maybe_table?;
+        match table.lookup(fd_i32) {
+            Some(FdEntry::Synthetic { path }) => Some(path.clone()),
+            _ => None,
+        }
+    });
+    let Some(path) = path else {
+        return -EBADF;
+    };
+
+    // Consult the single device-table predicate for the write behaviour.
+    // `None` → the synthetic path isn't a `/dev/*` device (e.g. a
+    // `/proc/*` fd, which is read-only anyway) → -EBADF.
+    let Some(behavior) = synthetic_fs::device_behavior(&path) else {
+        return -EBADF;
+    };
+
+    match behavior.write {
+        WriteKind::Discard => {
+            // Validate the buffer the same way a real write would: a
+            // null `buf` with non-zero count is -EFAULT even for the bit
+            // bucket. (`count == 0` was already short-circuited in
+            // `handle`.)
+            if buf == 0 {
+                return -EFAULT;
+            }
+            // Discard the bytes — nothing reads them — but report the
+            // full count as written, which is `/dev/null`'s contract.
+            count as i64
+        }
+        WriteKind::Reject => -EBADF,
+    }
 }
 
 /// Shared work for the write handler — separated from `handle` so the
@@ -294,5 +362,118 @@ mod tests {
         });
         assert_eq!(result, 4);
         assert_eq!(recorded.as_slice(), &payload);
+    }
+
+    // ---------------------------------------------------------------
+    // /dev/* device-fd write tests (#537)
+    // ---------------------------------------------------------------
+    //
+    // Exercise the fd → fd-table → device-write dispatch added in #537.
+    // Device fds are allocated directly through the fd table to keep the
+    // test focused on `write::handle`.
+
+    use crate::process::address_space::AddressSpace;
+    use crate::process::fd_table::synthetic;
+    use crate::process::process::CURRENT_PROCESS_TEST_LOCK;
+    use crate::process::{current_process_install, current_process_uninstall, Process};
+
+    /// Install a fresh Process and allocate a device fd against `path`.
+    /// Caller must hold `CURRENT_PROCESS_TEST_LOCK`.
+    fn install_with_device_fd(path: &str) -> i32 {
+        let address_space = AddressSpace::new(0x40_1000);
+        let proc = Process::new(7, address_space);
+        current_process_install(proc);
+        current_process_fd_table(|t| {
+            t.expect("process installed")
+                .allocate(synthetic(path))
+                .expect("allocate device fd")
+        })
+    }
+
+    /// `write` to a `/dev/null` fd discards the bytes and returns the
+    /// full count — the bit-bucket contract.
+    #[test]
+    fn write_dev_null_fd_discards_and_returns_count() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let fd = install_with_device_fd("/dev/null");
+        let payload = b"this goes nowhere";
+        let result = handle(fd as u64, payload.as_ptr() as u64, payload.len() as u64);
+        assert_eq!(
+            result,
+            payload.len() as i64,
+            "/dev/null write must report the full count"
+        );
+        current_process_uninstall();
+    }
+
+    /// `write` to a `/dev/zero` fd also discards and returns the count
+    /// (zero is write-discard, read-zeros).
+    #[test]
+    fn write_dev_zero_fd_discards_and_returns_count() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let fd = install_with_device_fd("/dev/zero");
+        let payload = b"discarded";
+        let result = handle(fd as u64, payload.as_ptr() as u64, payload.len() as u64);
+        assert_eq!(result, payload.len() as i64);
+        current_process_uninstall();
+    }
+
+    /// A large `write` to `/dev/null` reports the full count — the
+    /// device accepts any volume (no short write).
+    #[test]
+    fn write_dev_null_large_count_reports_full_count() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let fd = install_with_device_fd("/dev/null");
+        let payload = alloc::vec![0xABu8; 65536];
+        let result = handle(fd as u64, payload.as_ptr() as u64, payload.len() as u64);
+        assert_eq!(result, payload.len() as i64);
+        current_process_uninstall();
+    }
+
+    /// `write` to a `/dev/random` fd returns `-EBADF` — the device is
+    /// read-only (write-reject).
+    #[test]
+    fn write_dev_random_fd_returns_ebadf() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let fd = install_with_device_fd("/dev/random");
+        let payload = b"nope";
+        let result = handle(fd as u64, payload.as_ptr() as u64, payload.len() as u64);
+        assert_eq!(result, -EBADF, "/dev/random is read-only");
+        current_process_uninstall();
+    }
+
+    /// `write(/dev/null, NULL, 0)` is a POSIX no-op — returns 0 (the
+    /// zero-count short-circuit fires before the device dispatch).
+    #[test]
+    fn write_dev_null_zero_count_returns_zero() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let fd = install_with_device_fd("/dev/null");
+        let result = handle(fd as u64, 0, 0);
+        assert_eq!(result, 0);
+        current_process_uninstall();
+    }
+
+    /// `write(/dev/null, NULL, n>0)` returns `-EFAULT` — a discard
+    /// device still validates its buffer (a bad pointer is an error even
+    /// to the bit bucket).
+    #[test]
+    fn write_dev_null_null_buf_returns_efault() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let fd = install_with_device_fd("/dev/null");
+        let result = handle(fd as u64, 0, 16);
+        assert_eq!(result, -EFAULT);
+        current_process_uninstall();
+    }
+
+    /// A non-device synthetic fd (`/proc/cpuinfo`) is read-only — a
+    /// `write` to it returns `-EBADF`.
+    #[test]
+    fn write_non_device_synthetic_fd_returns_ebadf() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let fd = install_with_device_fd("/proc/cpuinfo");
+        let payload = b"x";
+        let result = handle(fd as u64, payload.as_ptr() as u64, payload.len() as u64);
+        assert_eq!(result, -EBADF);
+        current_process_uninstall();
     }
 }

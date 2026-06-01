@@ -190,8 +190,16 @@ pub fn handle(dirfd: i32, pathname: u64, flags: u32, _mode: u32) -> i64 {
     // (synthetic-fs only matches `/proc/*`, `/sys/*`, `/dev/*`; the
     // File-cell graph is keyed on whatever name a user uploaded).
     if synthetic_fs::resolve(&path).is_some() {
-        // Synthetic-fs entries are read-only; reject write modes.
-        if access != O_RDONLY {
+        // Most synthetic-fs entries (`/proc/*`, `/sys/*`) are read-only
+        // — reject write modes with -EACCES. The exception is a `/dev/*`
+        // device whose write behaviour accepts writes (`/dev/null`,
+        // `/dev/zero` discard; `/dev/random` rejects). For a writable
+        // device, an `O_WRONLY` / `O_RDWR` open is legitimate (a process
+        // redirecting output to `/dev/null` opens it for writing); the
+        // write handler then discards the bytes. We consult the device
+        // table's `WriteKind` rather than special-casing the path here,
+        // so adding a future writable device needs no openat change.
+        if access != O_RDONLY && !device_accepts_write(&path) {
             return -EACCES;
         }
         return allocate_synthetic(&path);
@@ -249,6 +257,20 @@ pub fn read_pathname(ptr: u64) -> Result<String, i64> {
     }
     // Read PATH_MAX bytes without seeing NUL — too long.
     Err(-EFAULT)
+}
+
+/// True when `path` is a `/dev/*` device whose write behaviour accepts
+/// an `O_WRONLY` / `O_RDWR` open — i.e. the write handler will consume
+/// (discard) writes rather than reject them. `/dev/null` and `/dev/zero`
+/// return true; `/dev/random` (read-only) and every non-device synthetic
+/// path return false. Drives openat's access-mode check off the device
+/// table's `WriteKind` so a future writable device needs no change here.
+fn device_accepts_write(path: &str) -> bool {
+    use crate::synthetic_fs::WriteKind;
+    matches!(
+        synthetic_fs::device_behavior(path),
+        Some(b) if b.write == WriteKind::Discard
+    )
 }
 
 /// Allocate an fd backed by a synthetic-fs path. Returns the
@@ -430,6 +452,65 @@ mod tests {
         let path = cstring("/proc/cpuinfo");
         let result = handle(AT_FDCWD, path.as_ptr() as u64, O_RDWR, 0);
         assert_eq!(result, -EACCES);
+        current_process_uninstall();
+    }
+
+    /// `openat(AT_FDCWD, "/dev/null", O_WRONLY, 0)` succeeds (#537):
+    /// `/dev/null` is a writable device (writes discarded), so opening
+    /// it for writing is legitimate — a process redirecting output to
+    /// `/dev/null` does exactly this. Returns a valid fd, not -EACCES.
+    #[test]
+    fn open_dev_null_wronly_succeeds() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        install_test_process();
+        let path = cstring("/dev/null");
+        let fd = handle(AT_FDCWD, path.as_ptr() as u64, O_WRONLY, 0);
+        assert!(fd >= 3, "/dev/null O_WRONLY should return a valid fd, got {}", fd);
+        use crate::process::fd_table::FdEntry;
+        let lookup = current_process_fd_table(|t| t.and_then(|t| t.lookup(fd as i32).cloned()));
+        assert_eq!(
+            lookup,
+            Some(FdEntry::Synthetic {
+                path: "/dev/null".into()
+            })
+        );
+        current_process_uninstall();
+    }
+
+    /// `openat(AT_FDCWD, "/dev/zero", O_RDWR, 0)` succeeds — `/dev/zero`
+    /// is writable (discard) + readable (zeros), so O_RDWR is allowed.
+    #[test]
+    fn open_dev_zero_rdwr_succeeds() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        install_test_process();
+        let path = cstring("/dev/zero");
+        let fd = handle(AT_FDCWD, path.as_ptr() as u64, O_RDWR, 0);
+        assert!(fd >= 3, "/dev/zero O_RDWR should return a valid fd, got {}", fd);
+        current_process_uninstall();
+    }
+
+    /// `openat(AT_FDCWD, "/dev/random", O_WRONLY, 0)` returns `-EACCES`
+    /// — `/dev/random` is a read-only device; opening it for writing is
+    /// forbidden (its write behaviour rejects).
+    #[test]
+    fn open_dev_random_wronly_returns_minus_eacces() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        install_test_process();
+        let path = cstring("/dev/random");
+        let result = handle(AT_FDCWD, path.as_ptr() as u64, O_WRONLY, 0);
+        assert_eq!(result, -EACCES, "/dev/random is read-only");
+        current_process_uninstall();
+    }
+
+    /// `openat(AT_FDCWD, "/dev/null", O_RDONLY, 0)` succeeds — a device
+    /// opens read-only as well (reads return EOF for null).
+    #[test]
+    fn open_dev_null_rdonly_succeeds() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        install_test_process();
+        let path = cstring("/dev/null");
+        let fd = handle(AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0);
+        assert!(fd >= 3, "/dev/null O_RDONLY should return a valid fd, got {}", fd);
         current_process_uninstall();
     }
 

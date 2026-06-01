@@ -45,9 +45,12 @@
 use alloc::vec::Vec;
 
 pub mod cpuinfo;
+pub mod dev;
 pub mod meminfo;
 pub mod proc;
 pub mod proc_pid;
+
+pub use dev::{device_read, DeviceBehavior, ReadKind, WriteKind};
 
 /// Top-level resolver. Returns `Some(bytes)` for any path the
 /// synthetic-fs table recognises, `None` otherwise. The caller is
@@ -63,7 +66,24 @@ pub fn resolve(path: &str) -> Option<Vec<u8>> {
     if path.starts_with("/proc/") {
         return proc::render_proc_file(path);
     }
+    if path.starts_with("/dev/") {
+        // Device snapshots are the bounded "does this path resolve?"
+        // view (empty bytes for all three #537 devices) — the streaming
+        // fd read/write semantics live in `dev::device_read` + the
+        // syscall handlers' `device_behavior` consult. See dev.rs.
+        return dev::snapshot(path);
+    }
     None
+}
+
+/// Look up the streaming behaviour of a `/dev/*` device (how reads fill,
+/// how writes are handled). Returns `None` for any path that is not a
+/// modelled device. The `read` / `write` syscall handlers consult this
+/// to drive their byte-level semantics off the device table rather than
+/// a path-string compare; `openat` consults it to decide whether a
+/// device may be opened for writing. See `dev::lookup`.
+pub fn device_behavior(path: &str) -> Option<DeviceBehavior> {
+    dev::lookup(path)
 }
 
 // Inline tests are gated on `cfg(target_os = "linux")` for the same
@@ -95,10 +115,33 @@ mod tests {
     fn resolve_unknown_path_returns_none() {
         assert!(resolve("/etc/passwd").is_none());
         assert!(resolve("/sys/class/net").is_none());
-        assert!(resolve("/dev/null").is_none());
+        // `/dev/sda` is under the `/dev/` prefix but is not a modelled
+        // device — the dev resolver returns None, so the top-level
+        // resolver passes through.
+        assert!(resolve("/dev/sda").is_none());
         // Bare `/proc` (no slash) does not match the prefix arm —
         // future readdir-shaped lookup will handle the directory case.
         assert!(resolve("/proc").is_none());
+    }
+
+    #[test]
+    fn resolve_dev_devices_dispatch() {
+        // The three #537 devices resolve (existence signal for openat /
+        // HTTP); their streaming bytes come from the fd read/write path,
+        // so the snapshot is empty.
+        for p in ["/dev/null", "/dev/zero", "/dev/random"] {
+            let snap = resolve(p).unwrap_or_else(|| panic!("{} must resolve", p));
+            assert!(snap.is_empty(), "{} snapshot must be empty", p);
+        }
+    }
+
+    #[test]
+    fn device_behavior_exposed_for_devices() {
+        // The top-level `device_behavior` accessor surfaces the device
+        // table for the syscall handlers.
+        assert_eq!(device_behavior("/dev/null").map(|b| b.write), Some(WriteKind::Discard));
+        assert_eq!(device_behavior("/dev/random").map(|b| b.read), Some(ReadKind::Random));
+        assert!(device_behavior("/proc/cpuinfo").is_none());
     }
 
     #[test]
