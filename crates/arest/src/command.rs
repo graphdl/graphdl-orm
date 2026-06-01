@@ -9184,14 +9184,20 @@ Transition 'place' is defined in State Machine Definition 'Order'.
     ///
     /// The trigger cells are driven here by asserting the trigger Fact Types
     /// directly — the SAME facts blocked-proto's `Job is blocked` /
-    /// `Job is unblocked` derivations are meant to produce. (Those
-    /// multi-antecedent rules whose consequent role comes from an antecedent
-    /// currently compile to phi — a SEPARATE derivation-compilation limit,
-    /// ORTHOGONAL to the reconciliation step under test, which only has to
-    /// fire the right transition off whatever the trigger cell says.)
-    /// Asserting `Job_is_blocked` exercises the `assert_fact_via_defs`
-    /// reconcile call site end-to-end; the idle + unblock checks drive
-    /// `reconcile_derived_transitions` directly.
+    /// `Job is unblocked` derivations produce. (Those multi-antecedent
+    /// self-ring derivations DO compile + fire correctly — the eq:join
+    /// `RingJoinPlan` binds the consequent role positionally from the Halpin
+    /// subscripts; proven end-to-end by
+    /// `compile_explicit_derivation_tests::\
+    ///  blocked_proto_full_context_blocked_cell_materializes_correct_jobs`.
+    /// We assert the trigger Fact Types directly here only to ISOLATE the
+    /// reconciliation step under test and to keep `extract_sm_status` honest:
+    /// driving the SM-status cell through real command threading fragments the
+    /// keyed Map across `merge_delta` in this harness, an ORTHOGONAL keyed-cell
+    /// interaction. The reconcile only has to fire the right transition off
+    /// whatever the trigger cell says.) Asserting `Job_is_blocked` exercises
+    /// the `assert_fact_via_defs` reconcile call site end-to-end; the idle +
+    /// unblock checks drive `reconcile_derived_transitions` directly.
     #[test]
     fn blocked_proto_reconciles_block_then_unblock_bounded() {
         const JOB_READINGS: &str = r#"
@@ -9268,9 +9274,11 @@ Job Status enumerates 'pending', 'in_progress', 'blocked', 'completed', 'deleted
 
 ## Derivation Rules
 
-# The intended blocked-proto trigger derivations (kept for documentation —
-# these unary, antecedent-role-consequent rules currently compile to phi, so
-# the test drives the trigger cells by asserting the Fact Types directly):
+# The blocked-proto trigger derivations (the literal app uses three positive
+# `Job1 has Job Status '<open>'` variants + a positive universal for unblock).
+# They compile + fire (eq:join RingJoinPlan); see
+# blocked_proto_full_context_blocked_cell_materializes_correct_jobs. This test
+# asserts the trigger Fact Types directly only to isolate the reconcile step:
 #   Job is blocked   iff some open Job blocks the Job.
 #   Job is unblocked iff the Job is blocked and every blocker completed.
 "#;

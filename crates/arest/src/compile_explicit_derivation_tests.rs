@@ -1186,6 +1186,246 @@ Task has Alert.
         "forward chain must derive `t1 has Alert 'raised'`; got {:?}", pairs);
 }
 
+// ─── Category 13d: multi-antecedent self-ring whose CONSEQUENT binds the
+//                  ring's SECOND (un-subscripted) role — blocked-status-sm-3 ─
+//
+// apps/blocked-proto's block trigger:
+//   `* Job is blocked iff some Job1 blocks the Job and
+//      Job1 has Job Status 'pending'.`
+//
+// `Job blocks Job` is a self-ring (both roles share base noun `Job`). The
+// JOIN key is `Job1` (role 0 of the ring, recurring into `Job1 has Job
+// Status`); the CONSEQUENT subject is `the Job` — the ring's SECOND role
+// (role 1), written UN-subscripted (just the bare base noun). This is the
+// MIRROR of `readiness_blocked_propagates_through_forward_chain_over_subscript_ring`
+// (whose consequent binds the FIRST / subscripted ring role); here it binds
+// the OTHER ring role, named only by the bare base noun.
+//
+// blocked-status-sm-3 logged this rule as compiling to φ. It does NOT: the
+// eq:join `RingJoinPlan` (commit 11fa32e1) resolves the consequent role
+// positionally from the subscripts (`consequent_positions = [Some((0,1))]` —
+// ring role 1), and the literal `'pending'` is applied as an antecedent
+// filter. The two halves below pin the ACTUAL derived-cell contents.
+//
+// Part A — isolated single-rule Func: B(pending)-blocks-A ⇒ A derived blocked
+//          (bound to ring role 1), B (the blocker / role 0) NOT blocked.
+#[test]
+fn blocked_proto_selfring_blocked_rule_binds_second_ring_role() {
+    let src = r#"# Blocked Proto repro
+Job(.id) is an entity type.
+Job Status is a value type.
+
+## Fact Types
+Job has Job Status.
+Job is blocked.
+Job blocks Job.
+
+## Derivation Rules
+* Job is blocked iff some Job1 blocks the Job and Job1 has Job Status 'pending'.
+"#;
+
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    let data = compile::cell_index_from_state(&state);
+    let blocked_rule = data.derivation_rules.iter()
+        .find(|r| r.consequent_cell.literal_id() == "Job_is_blocked")
+        .cloned()
+        .expect("a `Job is blocked` derivation rule must exist");
+
+    // Routing + plan: the ring rule is a positional Join whose consequent
+    // role draws from the ring's SECOND slot (antecedent 0, role 1).
+    assert_eq!(blocked_rule.kind, DerivationKind::Join,
+        "multi-antecedent self-ring blocked rule must route to a positional Join; got {:?}",
+        blocked_rule.kind);
+    let rj = blocked_rule.ring_join.as_ref()
+        .expect("blocked rule must carry a RingJoinPlan (eq:join)");
+    assert_eq!(rj.consequent_positions, vec![Some((0usize, 1usize))],
+        "the `Job is blocked` consequent must bind the ring's SECOND role \
+         (antecedent 0, role 1 — the blocked job), got {:?}", rj.consequent_positions);
+
+    let model = compile::compile(&state);
+    let cd = model.derivations.iter().find(|d| d.id == blocked_rule.id)
+        .expect("compiled `Job is blocked` derivation");
+
+    // POSITIVE: B (pending) blocks A → A derived blocked.
+    let out = apply_to_facts(&cd.func, &[
+        ("Job_blocks_Job", &[("Job", "B"), ("Job", "A")]),
+        ("Job_has_Job_Status", &[("Job", "B"), ("Job Status", "pending")]),
+    ]);
+    let blocked_jobs: Vec<String> = decode_derived(&out).into_iter()
+        .filter(|(ft, _, _)| ft == "Job_is_blocked")
+        .flat_map(|(_, _, b)| b.into_iter())
+        .filter(|(k, _)| k == "Job").map(|(_, v)| v).collect();
+    assert_eq!(blocked_jobs, vec!["A".to_string()],
+        "A (blocked by pending B) MUST be the SOLE derived `Job is blocked` — \
+         bound to ring role 1, NOT B (the blocker, role 0); got {:?}", blocked_jobs);
+
+    // NEGATIVE: B no longer pending (completed) → the 'pending' rule's literal
+    // filter excludes B's status row → NO join → A is NOT blocked.
+    let out_neg = apply_to_facts(&cd.func, &[
+        ("Job_blocks_Job", &[("Job", "B"), ("Job", "A")]),
+        ("Job_has_Job_Status", &[("Job", "B"), ("Job Status", "completed")]),
+    ]);
+    let blocked_neg: Vec<String> = decode_derived(&out_neg).into_iter()
+        .filter(|(ft, _, _)| ft == "Job_is_blocked")
+        .flat_map(|(_, _, b)| b.into_iter())
+        .filter(|(k, _)| k == "Job").map(|(_, v)| v).collect();
+    assert!(blocked_neg.is_empty(),
+        "with the blocker B 'completed' (not pending), the 'pending' rule must \
+         derive NOTHING; got {:?}", blocked_neg);
+}
+
+// Part B — the SAME ring rule end-to-end in the FULL blocked-proto context:
+// multiple `Job is blocked` rules (pending / in_progress / blocked), the
+// `Job has Job Status` SM re-key rule, the `every`-universal unblock rule,
+// and the Job SM — parsed exactly as the substrate does
+// (`parse_to_state_with_nouns` over the metamodel corpus + `merge_states`).
+// Asserts the MATERIALIZED `Job_is_blocked` cell contents over two
+// populations: a pending blocker tags the blocked job; a completed blocker
+// does not. (The end-to-end forward chain over the real app — including the
+// SM-status→Job-Status re-key — is exercised by the CLI; here we drive the
+// compiled blocked Funcs over a controlled `Job_has_Job_Status` to isolate
+// the derivation under test from the orthogonal SM-status plumbing.)
+#[test]
+fn blocked_proto_full_context_blocked_cell_materializes_correct_jobs() {
+    use crate::ast::{self, fact_from_pairs};
+
+    const JOB_READINGS: &str = r#"
+# Blocked Proto (full)
+
+## Entity Types
+
+Job(.id) is an entity type.
+
+## Value Types
+
+Job Subject is a value type.
+Job Status is a value type.
+
+## Fact Types
+
+Job has Job Subject.
+  Each Job has at most one Job Subject.
+
+Job has Job Status. **
+  Each Job has at most one Job Status.
+
+Job is blocked. **
+
+Job is unblocked. **
+
+Job blocks Job.
+  Job blocks Job is irreflexive.
+  Job blocks Job is asymmetric.
+
+Job is started.
+Job is finished.
+
+## State Machine
+
+State Machine Definition 'Job SM' is for Noun 'Job'.
+Status 'pending' is initial in State Machine Definition 'Job SM'.
+
+Transition 'start' is defined in State Machine Definition 'Job SM'.
+Transition 'start' is from Status 'pending'.
+Transition 'start' is to Status 'in_progress'.
+Transition 'start' is triggered by Fact Type 'Job is started'.
+
+Transition 'block' is defined in State Machine Definition 'Job SM'.
+Transition 'block' is from Status 'in_progress'.
+Transition 'block' is to Status 'blocked'.
+Transition 'block' is triggered by Fact Type 'Job is blocked'.
+
+Transition 'unblock' is defined in State Machine Definition 'Job SM'.
+Transition 'unblock' is from Status 'blocked'.
+Transition 'unblock' is to Status 'in_progress'.
+Transition 'unblock' is triggered by Fact Type 'Job is unblocked'.
+
+## Constraints
+
+Job Status enumerates 'pending', 'in_progress', 'blocked', 'completed', 'deleted'.
+
+## Derivation Rules
+
+State Machine is currently in Status.
+
+* Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.
+
+* Job has Job Status iff that Resource is currently in some Status and Job Status is Status and Job is Resource.
+
+* Job is blocked iff some Job1 blocks the Job and Job1 has Job Status 'pending'.
+
+* Job is blocked iff some Job1 blocks the Job and Job1 has Job Status 'in_progress'.
+
+* Job is blocked iff some Job1 blocks the Job and Job1 has Job Status 'blocked'.
+
+* Job is unblocked iff the Job has Job Status 'blocked' and every Job1 that blocks the Job has Job Status 'completed'.
+"#;
+
+    let meta = crate::parse_forml2::parse_to_state(&crate::metamodel_corpus())
+        .expect("metamodel parse");
+    let jobs = crate::parse_forml2::parse_to_state_with_nouns(JOB_READINGS, &meta)
+        .expect("job readings parse");
+    let state = ast::merge_states(&meta, &jobs);
+    let data = compile::cell_index_from_state(&state);
+
+    // Every `Job is blocked` rule in the full context routes to a positional
+    // Join with the correct ring plan (consequent binds ring role 1).
+    let blocked_rules: Vec<_> = data.derivation_rules.iter()
+        .filter(|r| r.consequent_cell.literal_id() == "Job_is_blocked")
+        .cloned().collect();
+    assert_eq!(blocked_rules.len(), 3,
+        "the three Job-is-blocked trigger rules (pending/in_progress/blocked) \
+         must all survive parsing; got {}", blocked_rules.len());
+    for r in blocked_rules.iter() {
+        assert_eq!(r.kind, DerivationKind::Join,
+            "blocked rule `{}` must route to a positional Join in the full context; got {:?}",
+            r.text, r.kind);
+        let rj = r.ring_join.as_ref()
+            .unwrap_or_else(|| panic!("blocked rule `{}` lost its RingJoinPlan", r.text));
+        assert_eq!(rj.consequent_positions, vec![Some((0usize, 1usize))],
+            "blocked rule `{}` consequent must bind ring role 1; got {:?}",
+            r.text, rj.consequent_positions);
+    }
+
+    let model = compile::compile(&state);
+
+    // Helper: run ALL `Job is blocked` Funcs over a Job_has_Job_Status
+    // population and collect the resulting blocked-Job ids.
+    let blocked_over = |status_rows: &[(&str, &str)]| -> Vec<String> {
+        let mut st = ast::Object::phi();
+        st = ast::cell_push("Job_blocks_Job",
+            fact_from_pairs(&[("Job", "B"), ("Job", "A")]), &st);
+        for (job, status) in status_rows {
+            st = ast::cell_push("Job_has_Job_Status",
+                fact_from_pairs(&[("Job", job), ("Job Status", status)]), &st);
+        }
+        let pop = ast::encode_state(&st);
+        let mut out: Vec<String> = Vec::new();
+        for br in blocked_rules.iter() {
+            let cd = model.derivations.iter().find(|d| d.id == br.id)
+                .expect("compiled blocked derivation");
+            for (ft, _, b) in decode_derived(&ast::apply(&cd.func, &pop, &st)) {
+                if ft == "Job_is_blocked" {
+                    for (k, v) in b { if k == "Job" { out.push(v); } }
+                }
+            }
+        }
+        out.sort(); out.dedup(); out
+    };
+
+    // POSITIVE: B (pending) blocks A → A blocked (and ONLY A — not the blocker B).
+    let pos = blocked_over(&[("B", "pending")]);
+    assert_eq!(pos, vec!["A".to_string()],
+        "FULL context: a Job blocked by a PENDING blocker IS tagged blocked \
+         (A blocked, B not); got {:?}", pos);
+
+    // NEGATIVE: B (completed) blocks A → NO blocked rule fires → A NOT blocked.
+    let neg = blocked_over(&[("B", "completed")]);
+    assert!(neg.is_empty(),
+        "FULL context: once the blocker B is no longer open (completed), the \
+         blocked job A is NOT tagged blocked; got {:?}", neg);
+}
+
 /// task-924: SM-status → normalized-property bridge hop 2. The tasks
 /// app re-keys `Resource is currently in Status` into `Task has Task
 /// Status` via a 1-antecedent rule with identity-binding clauses
