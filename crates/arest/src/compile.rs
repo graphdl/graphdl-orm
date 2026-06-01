@@ -11745,6 +11745,88 @@ mod schema_tests {
             "stored Item_has_C_Val must be {{Item:i1, C Val:c1}}; got {:?}", facts[0]);
     }
 
+    /// ANTI-MASKING invariant (sql-over-cells-cellfold-divergence): the
+    /// `sql` verb is a relational-algebra EXECUTOR over cells, not a
+    /// parallel store — `SELECT * FROM ft_<X>` MUST equal what `cells get
+    /// <X>` reads from the SAME stored cell, by construction. Pre-fix the
+    /// two could DISAGREE: a `*`-marked (View) derived cell was left empty
+    /// in the substrate (the eager fold skipped it) while `sql` re-derived
+    /// it via the `resolve_view` fallback in
+    /// `sql.rs::materialize_fact_type_tables`, so `cells get` returned "no
+    /// such cell" while `sql` returned {i1,c1}. That divergence MASKED the
+    /// empty cell. With ae72ebf3 the cell is materialized, so `resolve_view`
+    /// is not consulted and the two CANNOT diverge.
+    ///
+    /// This test pins the agreement directly: drive the SAME live dirs
+    /// compile `arest-cli <dir> --db` runs, then assert the STORED cell —
+    /// read exactly as `cells get` reads it (`ast::fetch`) — and the `sql`
+    /// projection (`crate::sql::sql_query`) report the IDENTICAL tuple set,
+    /// AND that it is the expected NON-EMPTY {Item:i1, C Val:c1} (not the
+    /// vacuous empty==empty that a regressed fold would also satisfy).
+    #[test]
+    #[cfg(feature = "local")]
+    fn sql_projection_equals_stored_cell_for_star_marked_value_join() {
+        // Same `*`-marked value-type bridge join as the materialization
+        // test above — the historical masking shape (apps/deriv-probe).
+        let app = "\
+            Item(.id) is an entity type.\n\
+            A Val is a value type.\n\
+              The possible values of A Val are 'a1', 'a2'.\n\
+            B Val is a value type.\n\
+              The possible values of B Val are 'b1', 'b2'.\n\
+            C Val is a value type.\n\
+              The possible values of C Val are 'c1', 'c2'.\n\
+            Item has A Val.\n\
+              Each Item has at most one A Val.\n\
+            Item has B Val.\n\
+              Each Item has at most one B Val.\n\
+            Item has C Val. *\n\
+              Each Item has at most one C Val.\n\
+            A Val and B Val map to C Val.\n\
+              For each A Val and B Val, at most one C Val maps from that A Val and that B Val.\n\
+            A Val 'a1' and B Val 'b1' map to C Val 'c1'.\n\
+            Item 'i1' has A Val 'a1'.\n\
+            Item 'i1' has B Val 'b1'.\n\
+            Item has C Val iff Item has A Val and Item has B Val and that A Val and that B Val map to that C Val.\n\
+        ";
+        let new_d = live_compile_dirs_pipeline(app);
+
+        // (Item, C Val) pairs from the STORED cell, read as `cells get` does.
+        let mut cell_pairs: Vec<(String, String)> = ast::fetch_cell_seq("Item_has_C_Val", &new_d)
+            .as_seq()
+            .map(|s| s.iter().filter_map(|f| {
+                Some((ast::binding(f, "Item")?.to_string(), ast::binding(f, "C Val")?.to_string()))
+            }).collect())
+            .unwrap_or_default();
+        cell_pairs.sort();
+
+        // (Item, C Val) pairs from the SQL projection over the same state.
+        // Column names are sanitized (space → underscore): C Val → C_Val.
+        let env = crate::sql::sql_query(&new_d, r#"SELECT "Item", "C_Val" FROM ft_Item_has_C_Val"#);
+        let parsed: serde_json::Value = serde_json::from_str(&env)
+            .unwrap_or_else(|_| panic!("sql envelope must be JSON; got: {}", env));
+        let mut sql_pairs: Vec<(String, String)> = parsed.get("rows")
+            .and_then(|r| r.as_array())
+            .map(|rows| rows.iter().filter_map(|r| {
+                Some((
+                    r.get("Item")?.as_str()?.to_string(),
+                    r.get("C_Val")?.as_str()?.to_string(),
+                ))
+            }).collect())
+            .unwrap_or_else(|| panic!("sql envelope must carry rows; got: {}", env));
+        sql_pairs.sort();
+
+        // Agreement: sql IS a projection of cells, so the sets are equal.
+        assert_eq!(cell_pairs, sql_pairs,
+            "`cells get Item_has_C_Val` and `SELECT * FROM ft_Item_has_C_Val` MUST agree \
+             (sql projects from cells; a disagreement is the masking this task removes). \
+             cell={:?} sql={:?} sql_envelope={}", cell_pairs, sql_pairs, env);
+        // …and the agreed-upon set is the expected non-empty tuple, so this
+        // is a real agreement, not a vacuous empty==empty.
+        assert_eq!(cell_pairs, vec![("i1".to_string(), "c1".to_string())],
+            "the agreed Item_has_C_Val population must be {{i1,c1}}, not empty; got {:?}", cell_pairs);
+    }
+
     /// Faithful in-process replication of the `arest-cli <readings_dir>
     /// --db` dirs-compile pipeline (cli/entry.rs ~L733-1108), returning
     /// the post-forward-chain state `new_d`. Folds the bundled metamodel
