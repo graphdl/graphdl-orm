@@ -2605,17 +2605,15 @@ Task is recommended.
             .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &d)))
             .collect()
     };
+    // Single-stratum: negation-stratification retired, so only the
+    // positive `derivation:` stratum exists (no `derivation_strat2:`
+    // producer). One fixpoint over the positive rules.
     let stratum1 = collect_stratum("derivation");
-    let stratum2 = collect_stratum("derivation_strat2");
     let s1: Vec<(&str, &ast::Func)> = stratum1.iter().map(|(n, f)| (n.as_str(), f)).collect();
-    let s2: Vec<(&str, &ast::Func)> = stratum2.iter().map(|(n, f)| (n.as_str(), f)).collect();
 
-    let (post_s1, _) = if s1.is_empty() {
+    let (post, _) = if s1.is_empty() {
         (pop_state.clone(), Vec::new())
     } else { crate::evaluate::forward_chain_defs_state(&s1, &pop_state) };
-    let (post, _) = if s2.is_empty() {
-        (post_s1, Vec::new())
-    } else { crate::evaluate::forward_chain_defs_state(&s2, &post_s1) };
 
     let rec_cell = ast::fetch_or_phi("Task_is_recommended", &post);
     let recs: Vec<String> = match &rec_cell {
@@ -2628,9 +2626,8 @@ Task is recommended.
     let para_cell = ast::fetch_or_phi("Task_is_parallelizable", &post);
     assert!(recs.contains(&"a".to_string()),
         "After defs_to_state + metacompose round-trip: Task 'a' must \
-         be recommended. recs={:?}, parallelizable={:?}, s1_count={}, \
-         s2_count={}",
-        recs, para_cell, s1.len(), s2.len());
+         be recommended. recs={:?}, parallelizable={:?}, s1_count={}",
+        recs, para_cell, s1.len());
 }
 
 // ─── #927 — tight repro: cross-noun variable unification in

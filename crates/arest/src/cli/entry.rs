@@ -1046,13 +1046,10 @@ pub fn main_entry() {
                 // Status 'pending'.` populates Task_has_Task_Readiness
                 // alongside the parsed Task_has_Task_Status cell).
                 //
-                // Stratification (#826b): rules whose antecedent reads
-                // another rule's consequent cell negatively are emitted
-                // under `derivation_strat2:<id>`. Run positive rules
-                // (`derivation:rule_*`) to fixpoint first, then the
-                // negation rules — otherwise an AbsenceOf guard
-                // evaluates against an empty consequent cell in round 1
-                // and fires for entries that should be filtered out.
+                // Negation-stratification retired: only the positive
+                // `derivation:rule_*` stratum exists (no producer emits
+                // `derivation_strat2:`), so this is one fixpoint over the
+                // positive rules (see the single-pass call below).
                 let collect_derivs = |prefix: &str, state: &ast::Object| -> Vec<(String, ast::Func)> {
                     ast::cells_iter(state).into_iter()
                         .filter(|(n, _)| n.starts_with(prefix))

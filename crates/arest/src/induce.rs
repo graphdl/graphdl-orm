@@ -396,13 +396,13 @@ pub fn candidate_derives(
     // candidate cell.
     let chained_input = crate::ast::merge_states(defs, &state_with_candidate);
 
-    // Collect derivation refs from defs. Cover both stratum-1
-    // (positive) and stratum-2 (negation-guarded) prefixes — same
-    // dispatch shape `command::create_via_defs` uses, so the
-    // candidate-check sees the same rule surface a regular create
+    // Collect derivation refs from defs — the positive `derivation:`
+    // stratum (negation-stratification retired; no `derivation_strat2:`
+    // producer). Same dispatch shape `command::create_via_defs` uses, so
+    // the candidate-check sees the same rule surface a regular create
     // would.
     let refs_owned: Vec<(String, crate::ast::Func)> = crate::ast::cells_iter(defs).into_iter()
-        .filter(|(n, _)| n.starts_with("derivation:") || n.starts_with("derivation_strat2:"))
+        .filter(|(n, _)| n.starts_with("derivation:"))
         .map(|(n, contents)| (n.to_string(), crate::ast::metacompose(contents, defs)))
         .collect();
     let refs: Vec<(&str, &crate::ast::Func)> = refs_owned.iter()
@@ -575,12 +575,13 @@ fn score_candidate(
     // candidate_derives uses for its forward-chain pass.
     let chained_input = crate::ast::merge_states(defs, &state_prime);
 
-    // Collect derivation refs from defs — both stratum-1 and stratum-2.
-    // User-authored Scoring Rules compile to `derivation:rule_<hash>`
-    // defs (per the standard derivation pipeline); they're read off the
-    // same prefix candidate_derives uses.
+    // Collect derivation refs from defs — the positive `derivation:`
+    // stratum (negation-stratification retired; no `derivation_strat2:`
+    // producer). User-authored Scoring Rules compile to
+    // `derivation:rule_<hash>` defs (per the standard derivation
+    // pipeline); they're read off the same prefix candidate_derives uses.
     let refs_owned: Vec<(String, crate::ast::Func)> = crate::ast::cells_iter(defs).into_iter()
-        .filter(|(n, _)| n.starts_with("derivation:") || n.starts_with("derivation_strat2:"))
+        .filter(|(n, _)| n.starts_with("derivation:"))
         .map(|(n, contents)| (n.to_string(), crate::ast::metacompose(contents, defs)))
         .collect();
     let refs: Vec<(&str, &crate::ast::Func)> = refs_owned.iter()

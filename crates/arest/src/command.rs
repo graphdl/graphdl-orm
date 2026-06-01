@@ -937,9 +937,11 @@ fn assert_fact_via_defs(
     // Append the new fact to the cell.
     let post_assert = ast::cell_push(fact_type, fact, state);
 
-    // ── derive: 2-stratum forward chain ────────────────────────────────
+    // ── derive: single-stratum forward chain ───────────────────────────
     // Mirror the same gating as create_via_defs: all rules (no per-noun
     // filter) so cross-noun bridge derivations (e.g. Task Readiness) fire.
+    // Negation-stratification retired: only the positive `derivation:`
+    // stratum exists (no producer ever emits `derivation_strat2:`).
     let collect_stratum_all = |prefix: &str| -> Vec<(String, ast::Func)> {
         let cell_prefix = alloc::format!("{}:", prefix);
         ast::cells_iter(d).into_iter()
@@ -948,7 +950,6 @@ fn assert_fact_via_defs(
             .collect()
     };
     let stratum1 = collect_stratum_all("derivation");
-    let stratum2 = collect_stratum_all("derivation_strat2");
 
     // Seed the incremental chainer with the just-written cell.
     let seed: hashbrown::HashSet<String> = core::iter::once(fact_type.to_string()).collect();
@@ -963,24 +964,14 @@ fn assert_fact_via_defs(
         }).collect()
     };
     let s1_packed = build_seeded_refs(&stratum1);
-    let s2_packed = build_seeded_refs(&stratum2);
 
     let mut activated_rule_defs: hashbrown::HashSet<String> = hashbrown::HashSet::new();
-    let (post_s1, mut derived) = if stratum1.is_empty() {
+    let (derived_state, derived) = if stratum1.is_empty() {
         (post_assert.clone(), Vec::new())
     } else {
         let refs = to_seeded_refs(&s1_packed);
         crate::evaluate::forward_chain_defs_state_seeded_tracked(
             &refs, seed.clone(), &post_assert, 100, &mut activated_rule_defs)
-    };
-    let derived_state = if stratum2.is_empty() {
-        post_s1
-    } else {
-        let refs = to_seeded_refs(&s2_packed);
-        let (post_s2, more) = crate::evaluate::forward_chain_defs_state_seeded_tracked(
-            &refs, seed.clone(), &post_s1, 100, &mut activated_rule_defs);
-        derived.extend(more);
-        post_s2
     };
 
     // blocked-status-sm-2 — bounded reconciliation of derived (Fact-Type)
@@ -1589,13 +1580,9 @@ fn create_via_defs(
             .map(|s| s.split(',').map(|id| id.to_string()).collect())
             .unwrap_or_default()
     };
-    // 2-stratum forward chain (#828): stratum 1 = `derivation:rule_*`
-    // (positive rules), stratum 2 = `derivation_strat2:rule_*`
-    // (negation-guarded rules). Mirrors `cli/entry.rs::run_load`.
-    // Without this split a stratum-2 AbsenceOf guard fires in round 1
-    // before the positive rule its negative dependency reads has
-    // populated, so the consequent fires for entries that should be
-    // filtered out.
+    // Single-stratum forward chain: only the positive `derivation:rule_*`
+    // stratum exists. Negation-stratification retired (no producer ever
+    // emits `derivation_strat2:`). Mirrors `cli/entry.rs::run_load`.
     let collect_stratum = |prefix: &str| -> Vec<(String, ast::Func)> {
         let cell_prefix = alloc::format!("{}:", prefix);
         ast::cells_iter(d).into_iter()
@@ -1624,12 +1611,9 @@ fn create_via_defs(
             .collect()
     };
     let stratum1 = collect_stratum("derivation");
-    let stratum2 = collect_stratum("derivation_strat2");
-    diag!("[profile] derivation gating: {}/{} stratum-1, {}/{} stratum-2 rules for noun '{}'",
+    diag!("[profile] derivation gating: {}/{} stratum-1 rules for noun '{}'",
         stratum1.len(),
         ast::cells_iter(d).into_iter().filter(|(n, _)| n.starts_with("derivation:")).count(),
-        stratum2.len(),
-        ast::cells_iter(d).into_iter().filter(|(n, _)| n.starts_with("derivation_strat2:")).count(),
         noun);
 
     // task-3 phase 2 / DB-task-929: incremental forward chain. See the
@@ -1649,7 +1633,6 @@ fn create_via_defs(
         }).collect()
     };
     let s1_packed = build_seeded_refs(&stratum1);
-    let s2_packed = build_seeded_refs(&stratum2);
 
     // #836 — drop derived consequent cells from `resolved` before
     // forward-chain so the LFP recomputes against the current
@@ -1730,21 +1713,12 @@ fn create_via_defs(
     seed.extend(drop_writer_reads);
 
     let mut activated_rule_defs: hashbrown::HashSet<String> = hashbrown::HashSet::new();
-    let (post_s1, mut derived) = if stratum1.is_empty() {
+    let (derived_state, derived) = if stratum1.is_empty() {
         (resolved.clone(), Vec::new())
     } else {
         let refs = to_seeded_refs(&s1_packed);
         crate::evaluate::forward_chain_defs_state_seeded_tracked(
             &refs, seed.clone(), &resolved, 100, &mut activated_rule_defs)
-    };
-    let derived_state = if stratum2.is_empty() {
-        post_s1
-    } else {
-        let refs = to_seeded_refs(&s2_packed);
-        let (post_s2, more) = crate::evaluate::forward_chain_defs_state_seeded_tracked(
-            &refs, seed.clone(), &post_s1, 100, &mut activated_rule_defs);
-        derived.extend(more);
-        post_s2
     };
 
     // Bridge-clobber restore: for any dropped cell whose producing rule
@@ -2816,7 +2790,6 @@ fn transition_via_defs(
                 .collect()
         };
         let stratum1 = collect_stratum("derivation");
-        let stratum2 = collect_stratum("derivation_strat2");
         // #836 — clear derived consequent cells before forward-chain
         // (LFP per request, AREST.tex §4.3) so a transition that flips
         // Status doesn't leave stale derived facts that the chain
@@ -2856,22 +2829,14 @@ fn transition_via_defs(
                 ast::Object::Map(new_map.into())
             }
         };
-        let (post_s1, mut derived) = if stratum1.is_empty() {
+        let (post_s1, derived) = if stratum1.is_empty() {
             (resolved, Vec::new())
         } else {
             let refs: Vec<(&str, &ast::Func)> = stratum1.iter().map(|(n, f)| (n.as_str(), f)).collect();
             crate::evaluate::forward_chain_defs_state(&refs, &resolved)
         };
-        let post_s2 = if stratum2.is_empty() {
-            post_s1
-        } else {
-            let refs: Vec<(&str, &ast::Func)> = stratum2.iter().map(|(n, f)| (n.as_str(), f)).collect();
-            let (s2_state, more) = crate::evaluate::forward_chain_defs_state(&refs, &post_s1);
-            derived.extend(more);
-            s2_state
-        };
         let count = derived.len();
-        (post_s2, count)
+        (post_s1, count)
     } else {
         (new_state, 0)
     };
@@ -3333,7 +3298,6 @@ fn update_via_defs(
             .collect()
     };
     let stratum1 = collect_stratum("derivation");
-    let stratum2 = collect_stratum("derivation_strat2");
 
     // task-3 phase 2 / DB-task-929: incremental forward chain via
     // `forward_chain_defs_state_seeded`. Round 1 only runs rules whose
@@ -3374,7 +3338,6 @@ fn update_via_defs(
         }).collect()
     };
     let s1_packed = build_seeded_refs(&stratum1);
-    let s2_packed = build_seeded_refs(&stratum2);
 
     // #836 — clear derived consequent cells before forward-chain
     // (LFP per request, AREST.tex §4.3). task-929: noun-scope the
@@ -3458,21 +3421,12 @@ fn update_via_defs(
     seed.extend(drop_writer_reads);
 
     let mut activated_rule_defs: hashbrown::HashSet<String> = hashbrown::HashSet::new();
-    let (new_state, mut derived) = if stratum1.is_empty() {
+    let (new_state, derived) = if stratum1.is_empty() {
         (new_state, alloc::vec::Vec::new())
     } else {
         let refs = to_seeded_refs(&s1_packed);
         crate::evaluate::forward_chain_defs_state_seeded_tracked(
             &refs, seed.clone(), &new_state, 100, &mut activated_rule_defs)
-    };
-    let new_state = if stratum2.is_empty() {
-        new_state
-    } else {
-        let refs = to_seeded_refs(&s2_packed);
-        let (post_s2, more) = crate::evaluate::forward_chain_defs_state_seeded_tracked(
-            &refs, seed.clone(), &new_state, 100, &mut activated_rule_defs);
-        derived.extend(more);
-        post_s2
     };
 
     // Restore cells whose producing rule was never activated. Bare rule

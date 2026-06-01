@@ -1642,18 +1642,14 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
 
     // Derivation rules â€" Î±(derivation â†' def)
     //
-    // Stratification (#826b): rules whose antecedent reads another
-    // rule's consequent cell negatively (`<noun> has no <FT clause>`)
-    // emit under `derivation_strat2:<id>` so callers run a 2-stratum
-    // forward chain — positive rules to fixpoint, then negation
-    // rules. Without that, the AbsenceOf guard fires in round 1
-    // before its negative-dependency cell has been populated, and
-    // the consequent fires for entries that should be filtered out.
+    // Negation-stratification retired: every rule emits under the
+    // single positive `derivation:<id>` prefix. The old #826b 2-stratum
+    // `derivation_strat2:` split was dead (`uses_negation` was never set
+    // true) and has been removed.
     // task-930 v2: split Stored vs View materialization at def
     // emission.
-    //   * Stored rules emit under `derivation:{id}` (or
-    //     `derivation_strat2:{id}` for negation-guarded) so the
-    //     forward chain runs them eagerly per apply.
+    //   * Stored rules emit under `derivation:{id}` so the forward
+    //     chain runs them eagerly per apply.
     //   * View rules emit under `view:{cell_name}` so the read-side
     //     (Func::Fetch / Func::FetchOrPhi → resolve_view) can
     //     evaluate them lazily on demand. The chain skips them
@@ -1670,8 +1666,6 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         .filter(|d| matches!(d.materialization,
             crate::types::MaterializationPolicy::Stored))
         .map(|d| {
-            // negation-strat-reroute: uses_negation is never set true, so
-            // the strat2 prefix was dead — always emit `derivation:`.
             (format!("derivation:{}", d.id), d.func.clone())
         }));
     // task-934-1: group View rules by consequent_cell and Concat their

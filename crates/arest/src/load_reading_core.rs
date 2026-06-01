@@ -1203,10 +1203,10 @@ fn apply_alethic_migration_filter(
 ///      recomputes them from primary facts — the LFP-per-request
 ///      contract (#836). Without this, a stale derived fact whose
 ///      primary support changed would survive.
-///   3. Run a 2-stratum forward chain to the least fixed point:
-///      stratum 1 = positive `derivation:rule_*` rules, stratum 2 =
-///      negation-guarded `derivation_strat2:rule_*` rules. Mirrors the
-///      `re_derive` FFI's stratum split.
+///   3. Run a single-stratum forward chain to the least fixed point
+///      over the positive `derivation:rule_*` rules. Mirrors the
+///      `re_derive` FFI (negation-stratification retired — no producer
+///      emits `derivation_strat2:`).
 ///   4. Project back to a *population* state: return the input
 ///      population's cells (with derived consequent cells refreshed),
 ///      dropping the transient compile-only def cells (`derivation:*`,
@@ -1259,9 +1259,10 @@ fn re_derive_population(population: &Object) -> Object {
         ast::Object::map(new_map)
     };
 
-    // Step 3: 2-stratum forward chain to the least fixed point.
-    // Mirrors the `re_derive` FFI (lib.rs): positive rules first, then
-    // negation-guarded rules over the resulting state.
+    // Step 3: single-stratum forward chain to the least fixed point.
+    // Mirrors the `re_derive` FFI (lib.rs): only the positive
+    // `derivation:rule_*` stratum exists (negation-stratification
+    // retired — no producer emits `derivation_strat2:`).
     let collect_stratum = |prefix: &str, state: &ast::Object| -> Vec<(String, ast::Func)> {
         let cell_prefix = alloc::format!("{}:", prefix);
         ast::cells_iter(state)
@@ -1271,20 +1272,12 @@ fn re_derive_population(population: &Object) -> Object {
             .collect()
     };
     let stratum1 = collect_stratum("derivation", &d);
-    let stratum2 = collect_stratum("derivation_strat2", &d);
-    let post_s1 = if stratum1.is_empty() {
+    let chained = if stratum1.is_empty() {
         d
     } else {
         let refs: Vec<(&str, &ast::Func)> =
             stratum1.iter().map(|(n, f)| (n.as_str(), f)).collect();
         crate::evaluate::forward_chain_defs_state(&refs, &d).0
-    };
-    let chained = if stratum2.is_empty() {
-        post_s1
-    } else {
-        let refs: Vec<(&str, &ast::Func)> =
-            stratum2.iter().map(|(n, f)| (n.as_str(), f)).collect();
-        crate::evaluate::forward_chain_defs_state(&refs, &post_s1).0
     };
 
     // Step 4: project back to a population state. Keep every cell that

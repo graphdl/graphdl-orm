@@ -1869,12 +1869,11 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
     // trigger for hosts that want derivations to fire over federated
     // or runtime-ingested facts.
     if key == "re_derive" {
-        // 2-stratum forward chain (#828): mirror cli/entry and the
-        // apply path. Stratum 1 = `derivation:rule_*` (positive
-        // rules, run to fixpoint). Stratum 2 = `derivation_strat2:rule_*`
-        // (negation-guarded). Without this split, AbsenceOf guards
-        // evaluate against unpopulated consequent cells in round 1
-        // and fire for entries that should be filtered out.
+        // Single-stratum forward chain: mirror cli/entry and the apply
+        // path. Only the positive `derivation:rule_*` stratum exists —
+        // negation-stratification retired (no producer ever emits
+        // `derivation_strat2:`), so this is one fixpoint over the
+        // positive rules.
         let mut st = tenant.write();
         let snapshot = st.snapshot_d();
         let collect_stratum = |prefix: &str| -> Vec<(String, ast::Func)> {
@@ -1885,20 +1884,11 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
                 .collect()
         };
         let stratum1 = collect_stratum("derivation");
-        let stratum2 = collect_stratum("derivation_strat2");
-        let (post_s1, mut derived) = if stratum1.is_empty() {
+        let (new_d, derived) = if stratum1.is_empty() {
             (snapshot.clone(), Vec::new())
         } else {
             let refs: Vec<(&str, &ast::Func)> = stratum1.iter().map(|(n, f)| (n.as_str(), f)).collect();
             crate::evaluate::forward_chain_defs_state(&refs, &snapshot)
-        };
-        let new_d = if stratum2.is_empty() {
-            post_s1
-        } else {
-            let refs: Vec<(&str, &ast::Func)> = stratum2.iter().map(|(n, f)| (n.as_str(), f)).collect();
-            let (post_s2, more) = crate::evaluate::forward_chain_defs_state(&refs, &post_s1);
-            derived.extend(more);
-            post_s2
         };
         st.replace_d(new_d);
         return format!("{}", derived.len());
