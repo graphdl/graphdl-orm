@@ -4981,7 +4981,7 @@ pub fn merge_states(target: &Object, source: &Object) -> Object {
             return;
         }
         let entry = map.get_mut(name).expect("checked above");
-        *entry = concat_dedup(entry, contents);
+        *entry = concat_dedup(name, entry, contents);
     });
     Object::Map(map.into())
 }
@@ -5001,7 +5001,7 @@ pub fn merge_states(target: &Object, source: &Object) -> Object {
 /// dropped — this handles the case where one file declares a noun fully
 /// and another references it, producing two Noun facts that differ in
 /// bindings but represent the same entity.
-fn concat_dedup(a: &Object, b: &Object) -> Object {
+fn concat_dedup(name: &str, a: &Object, b: &Object) -> Object {
     // task-928: extract values from Map inputs so merge_states preserves
     // Map-backed apply-emitted population across recompile / in-process
     // compile. Map structure itself isn't preserved through merge
@@ -5027,6 +5027,25 @@ fn concat_dedup(a: &Object, b: &Object) -> Object {
     for item in b_items {
         if out.iter().any(|existing| same_identity(existing, &item)) { continue; }
         out.push(item);
+    }
+    // task-932 (W7-a): preserve Map SHAPE when either input was already a
+    // folded Map cell. Only FT-image cells are Map post-W2/W4 (schema/meta
+    // cells are Seq and must NEVER fold), so "an input was already a Map"
+    // is exactly the guard that restricts re-folding to FT-image cells.
+    // Pre-fix this returned Object::Seq UNCONDITIONALLY, silently demoting
+    // a folded Map cell to Seq on EVERY merge — fired on every recompile
+    // (entry.rs:764,838) and every in-process compile. We re-fold the
+    // deduped Vec back into a Map keyed by `synthesize_fact_id` — the
+    // keyless, content-addressed fold μ_n (`cell_put_folded`'s key). That
+    // key is a pure FNV-1a over the fact's sorted bindings, so it is
+    // idempotent at the fixpoint (unlike task-932-5's entity-id keying,
+    // which co-mingled content-addressed and entity-id rows and grew
+    // unbounded). Pure Seq+Seq inputs stay Seq.
+    if matches!(a, Object::Map(_)) || matches!(b, Object::Map(_)) {
+        let folded: HashMap<String, Object> = out.into_iter()
+            .map(|fact| (synthesize_fact_id(name, &fact), fact))
+            .collect();
+        return Object::Map(folded.into());
     }
     Object::Seq(out.into())
 }
@@ -6855,11 +6874,17 @@ mod tests {
         assert!(facts.contains(&customer));
     }
 
-    // task-928: when prior cell is Map-backed (cell_put_keyed apply
-    // population) and we merge in a Seq from parse, the prior Map
-    // contents must survive. Pre-fix: concat_dedup's a.as_seq() returned
-    // None for Map, all prior contents silently dropped, apps_compile
-    // wiped ~700 Task_has_Task_Subject entries down to 1.
+    // task-928 + task-932 (W7-a): when prior cell is Map-backed
+    // (cell_put_keyed apply population) and we merge in a Seq from parse,
+    // the prior Map contents must survive AND the cell must stay a Map.
+    // Pre-928: concat_dedup's a.as_seq() returned None for Map, all prior
+    // contents silently dropped, apps_compile wiped ~700
+    // Task_has_Task_Subject entries down to 1. Pre-W7-a: concat_dedup
+    // preserved the CONTENTS but demoted the SHAPE to Seq on every merge,
+    // re-firing the fold→demote→re-fold churn on every recompile. W7-a
+    // re-folds the deduped Vec back into a Map keyed by synthesize_fact_id
+    // whenever either input was already a Map, so a folded FT-image cell
+    // keeps its Map shape across merge.
     #[test]
     fn merge_states_preserves_map_cell_when_merging_with_seq() {
         let t1 = fact_from_pairs(&[("Task", "1"), ("Task Subject", "first")]);
@@ -6883,12 +6908,15 @@ mod tests {
 
         let merged = merge_states(&prior, &from_parse);
         let merged_cell = fetch("Task_has_Task_Subject", &merged);
-        let merged_seq = merged_cell.as_seq()
-            .expect("merge demotes to Seq, but contents must survive");
-        let subjects: Vec<String> = merged_seq.iter()
+        // W7-a: the folded Map cell must KEEP its Map shape, not demote to Seq.
+        assert!(matches!(merged_cell, Object::Map(_)),
+            "merge of a Map cell with a Seq must preserve Map shape; got {:?}",
+            merged_cell);
+        // All entries must still be present (read shape-tolerantly).
+        let subjects: Vec<String> = cell_facts_iter(&merged_cell)
             .filter_map(|f| binding(f, "Task Subject").map(String::from))
             .collect();
-        assert_eq!(merged_seq.len(), 4,
+        assert_eq!(cell_fact_count(&merged_cell), 4,
             "all 3 prior Map entries + 1 new Seq entry must survive merge; \
              got {:?}", subjects);
         for expected in ["first", "second", "third", "fourth"] {
@@ -11899,6 +11927,7 @@ Base 'b1' has Tag 'hot'.\n";
         assert!(same_identity(&fact_atom, &fact_phi),
             "Atom(φ) and phi() forms of the same unary fact must share identity");
         let merged = concat_dedup(
+            "Task_is_finished",
             &Object::seq(vec![fact_atom.clone()]),
             &Object::seq(vec![fact_phi.clone()]));
         assert_eq!(merged.as_seq().map(|s| s.len()), Some(1),
