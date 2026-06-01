@@ -5868,35 +5868,33 @@ fn parse_to_state_via_stage12_impl(
     map.insert("EnumValues".to_string(), Object::Seq(enum_values_facts.into()));
     map.insert("UnresolvedClause".to_string(), Object::Seq(unresolved_clause_facts.into()));
     map.insert("UnresolvedInstanceFact".to_string(), Object::Seq(unresolved_instance_fact_facts.into()));
+    // #932 W4: these three groups are FT-image cells (RMAP images of
+    // declared Fact Types — per-field instance-fact cells keyed by the
+    // canonical FT id, and `Noun_has_X` reference-scheme component cells).
+    // Emit them in the folded-3NF Map shape (`fold_ft_cell_facts`, keyed
+    // by `synthesize_fact_id`) instead of Seq, so the materializer's
+    // output matches the canonical fold the apply + forward-chain emit
+    // paths already produce (eq:cellfold D1/D3/D4). Set semantics from the
+    // hash key make the prior `single_part`/`per_field` dedup loops
+    // redundant — `fold_ft_cell_facts` collapses identical tuples by key.
+    // The metamodel schema cells inserted directly above (Noun, FactType,
+    // Role, Constraint, DerivationRule, InstanceFact, EnumValues,
+    // Unresolved*) are NOT images of declared FTs and stay Seq (D2).
     for (cell_name, facts) in compound_cells {
-        map.insert(cell_name, Object::Seq(facts.into()));
+        let folded = fold_ft_cell_facts(&cell_name, map.get(&cell_name), &facts);
+        map.insert(cell_name, folded);
     }
     // task-737 single-part synthesised cells. Merge with any existing
     // entry (the user may have declared `Noun has X` and pushed
-    // instance facts already, in which case those rows survive).
+    // instance facts already, in which case those rows survive — they are
+    // re-keyed into the fold by `fold_ft_cell_facts`).
     for (cell_name, facts) in single_part_cells {
-        map.entry(cell_name)
-            .and_modify(|existing| {
-                let mut all: Vec<Object> = existing.as_seq()
-                    .map(|s| s.to_vec()).unwrap_or_default();
-                for f in facts.iter() {
-                    if !all.iter().any(|e| e == f) {
-                        all.push(f.clone());
-                    }
-                }
-                *existing = Object::Seq(all.into());
-            })
-            .or_insert_with(|| Object::Seq(facts.into()));
+        let folded = fold_ft_cell_facts(&cell_name, map.get(&cell_name), &facts);
+        map.insert(cell_name, folded);
     }
     for (cell_name, facts) in per_field_cells {
-        map.entry(cell_name)
-            .and_modify(|existing| {
-                let mut all: Vec<Object> = existing.as_seq()
-                    .map(|s| s.to_vec()).unwrap_or_default();
-                all.extend(facts.iter().cloned());
-                *existing = Object::Seq(all.into());
-            })
-            .or_insert_with(|| Object::Seq(facts.into()));
+        let folded = fold_ft_cell_facts(&cell_name, map.get(&cell_name), &facts);
+        map.insert(cell_name, folded);
     }
     Ok(Object::Map(map.into()))
 }
@@ -5992,6 +5990,49 @@ fn constraint_facts_have_ss_autofill(_constraint_facts: &[Object]) -> bool {
         }
     }
     false
+}
+
+/// #932 phase-2 W4 (task 932-2): fold a per-FT-cell materialized fact
+/// group into the same keyed-Map shape `ast::cell_put_folded` produces —
+/// each fact keyed by `synthesize_fact_id(cell_name, fact)` over its full
+/// sorted (role,value) tuple. Realizes the keyless cell fold `μ_n`
+/// (`eq:cellfold`): D1 (keyless key = full natural tuple, FNV over all
+/// roles — dup-role-name-safe for ring fact types), D3 (the Map's
+/// canonical key-sorted flatten lives in `fetch_cell_seq`), and D4 (set
+/// semantics — a byte-identical re-emit collapses to the same key, every
+/// structurally-distinct row gets its own key).
+///
+/// D2 CONTRACT — call ONLY at an FT-aware materializer where `cell_name`
+/// is the RMAP image of a DECLARED Fact Type: the per-field instance-fact
+/// cells (`fieldName` = canonical FT id) and the reference-scheme
+/// component cells (`Noun_has_X`). These names never contain a colon, so
+/// they can never collide with a def cell (`view:` / `derivation:` /
+/// `machine:` / `transitions:` / `validate:` / `nav:` / `populate:` /
+/// `allowed_writes:`) or a meta cell. NEVER fold the metamodel schema
+/// cells (`Noun` / `FactType` / `Role` / `Constraint` / `DerivationRule`
+/// / `InstanceFact` / …) emitted directly above — those are the metamodel,
+/// not images of it.
+///
+/// `prior` carries any facts already placed under this cell name by an
+/// earlier contributor (e.g. a user-declared `Noun has X` row, or another
+/// reference-scheme component pass) so a second contributor folds into the
+/// same Map; the prior facts are re-keyed by the identical hash, so a
+/// prior Seq entry migrates to Map exactly as `cell_put_folded` migrates
+/// a pre-existing Seq cell.
+fn fold_ft_cell_facts(cell_name: &str, prior: Option<&Object>, facts: &[Object]) -> Object {
+    let mut keyed: HashMap<String, Object> = HashMap::new();
+    let mut absorb = |f: &Object| {
+        keyed.insert(crate::ast::synthesize_fact_id(cell_name, f), f.clone());
+    };
+    if let Some(p) = prior {
+        for f in crate::ast::cell_facts_iter(p) {
+            absorb(f);
+        }
+    }
+    for f in facts {
+        absorb(f);
+    }
+    Object::Map(keyed.into())
 }
 
 /// task-737 — for every single-part reference-scheme entity-type
@@ -8141,7 +8182,10 @@ mod tests {
         }
         let state = super::parse_to_state_via_stage12(&src)
             .expect("parse_to_state_via_stage12");
-        let cell = fetch_or_phi("Task_has_Task_Subject", &state);
+        // #932 W4: the per-field FT-image cell is now emitted folded (Map),
+        // so read it through fetch_cell_seq (deterministic key-sorted
+        // flatten) — a raw fetch_or_phi(...).as_seq() yields None on a Map.
+        let cell = fetch_cell_seq("Task_has_Task_Subject", &state);
         let entries: Vec<&Object> = cell.as_seq()
             .map(|s| s.iter().collect())
             .unwrap_or_default();
@@ -10307,7 +10351,11 @@ mod tests {
         // *does* declare the cell — boot fallback is not enough, and
         // (b) every kind in boot is covered by the grammar.
         let state = grammar_state();
-        let cell = fetch_or_phi("Classification_has_Translator", &state);
+        // #932 W4: this FT-image cell is now emitted folded (Map); read it
+        // through fetch_cell_seq (Map-tolerant, key-sorted flatten) just as
+        // the production reader StatementTranslatorTable::from_grammar_state
+        // does — a raw fetch_or_phi(...).as_seq() yields None on a Map.
+        let cell = fetch_cell_seq("Classification_has_Translator", &state);
         let facts = cell.as_seq().expect(
             "grammar must declare the Classification_has_Translator \
              cell — fact-based dispatch (per #833 / AREST.tex §3 eq:sys) cannot \
@@ -10317,11 +10365,27 @@ mod tests {
              grammar must populate it with one row per (kind, translator) pair");
         let table = super::StatementTranslatorTable::from_grammar_state(&state);
         let boot = super::StatementTranslatorTable::boot();
+        // #932 W4 (D4 set semantics): Classification_has_Translator is an M:N
+        // junction cell — the SET of (Classification, Translator) pairs the
+        // grammar declares. Folded-3NF storage (eq:cellfold) keys it by
+        // synthesize_fact_id, so fetch_cell_seq surfaces facts in canonical
+        // KEY order, not declaration order. That is sound: production Stage-2
+        // dispatch order is the HARD-CODED Rust call sequence in
+        // parse_to_state_via_stage12_impl (translate_nouns → … →
+        // translate_fact_types → … → translate_derivation_mode_facts), NOT
+        // this cell's order — from_grammar_state is consumed only by these
+        // tests. So the eq:sys invariant this test guards is "the grammar
+        // declares exactly the same (kind, translator) pairs as boot", an
+        // order-FREE set equality. Compare per-kind translators as sorted
+        // multisets so the canonical-key reorder is not a false failure while
+        // still catching a missing / extra / typo'd pair.
         for kind in boot.kinds() {
-            let from_grammar = table.translators_for(kind);
-            let from_boot = boot.translators_for(kind);
+            let mut from_grammar = table.translators_for(kind);
+            let mut from_boot = boot.translators_for(kind);
+            from_grammar.sort_unstable();
+            from_boot.sort_unstable();
             assert_eq!(from_grammar, from_boot,
-                "kind {kind:?} translators differ: grammar {from_grammar:?} vs boot {from_boot:?}");
+                "kind {kind:?} translators differ (as sets): grammar {from_grammar:?} vs boot {from_boot:?}");
         }
     }
 }

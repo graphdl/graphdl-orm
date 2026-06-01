@@ -2235,8 +2235,10 @@ Order 'o1' has Order Status 'pending'.
             .expect("v1 loads");
 
         // Sanity: the primary fact is present, the derived cell is not
-        // yet populated (no rule in v1).
-        let status_v1 = ast::fetch_or_phi("Order_has_Order_Status", &v1.new_state);
+        // yet populated (no rule in v1). #932 W4: the FT-image cell is
+        // emitted folded (Map), so read via fetch_cell_seq (Map-tolerant);
+        // a raw fetch_or_phi(...).as_seq() yields None on a Map.
+        let status_v1 = ast::fetch_cell_seq("Order_has_Order_Status", &v1.new_state);
         assert!(
             status_v1.as_seq().map(|s| !s.is_empty()).unwrap_or(false),
             "v1 must carry the primary Order Status 'pending' fact"
@@ -2311,8 +2313,10 @@ Order 'o1' has Order Status 'pending'.
         let outcome = unload_reading(&loaded.new_state, "rules", UnloadPolicy::Migrate)
             .expect("Migrate unload must succeed (preserve P)");
 
-        // Population preserved: the primary fact survives.
-        let status_after = ast::fetch_or_phi("Order_has_Order_Status", &outcome.new_state);
+        // Population preserved: the primary fact survives. #932 W4: the
+        // FT-image cell is emitted folded (Map), so read via fetch_cell_seq
+        // (Map-tolerant); a raw fetch_or_phi(...).as_seq() yields None on a Map.
+        let status_after = ast::fetch_cell_seq("Order_has_Order_Status", &outcome.new_state);
         assert!(
             status_after.as_seq().map(|s| !s.is_empty()).unwrap_or(false),
             "Migrate unload must preserve the population's primary facts; \
