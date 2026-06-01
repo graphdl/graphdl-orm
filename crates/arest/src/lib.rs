@@ -1762,7 +1762,17 @@ fn system_impl(handle: u32, key: &str, input: &str) -> String {
         }
         let mut st = tenant.write();
         let snapshot = st.snapshot_d();
-        let cell = ast::fetch_or_phi(ft_name, &snapshot);
+        // #932 W6: `ft_name` is an arbitrary FT-image cell (the live tenant
+        // folds instance-fact / reference-scheme cells to `Object::Map`).
+        // A raw `fetch_or_phi(ft_name, &snapshot).as_seq()` returns None on a
+        // Map, so this retract silently returned "⊥" for every fact in a
+        // folded cell. `fetch_cell_seq` flattens Map -> key-sorted Seq (and
+        // passes a legacy Seq through) so the row match below runs.
+        // NOTE: the write-back below builds a fresh Seq delta and lets
+        // `merge_delta` replace the cell (merge_map_cell_contents falls back
+        // to delta-replace when the delta is a Seq) — pre-existing behaviour,
+        // unchanged here; it flips the cell to Seq shape on retract.
+        let cell = ast::fetch_cell_seq(ft_name, &snapshot);
         let items: Vec<ast::Object> = match cell.as_seq() {
             Some(it) => it.to_vec(),
             None => return "⊥".into(),

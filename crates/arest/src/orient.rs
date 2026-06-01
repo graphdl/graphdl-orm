@@ -124,7 +124,12 @@ struct TaskCounts {
 /// the three counters — the suggested_next template handles the
 /// "no tasks at all" path.
 fn compute_task_counts(state: &Object) -> TaskCounts {
-    let cell = ast::fetch("Task_has_Task_Status", state);
+    // #932 W6: `Task_has_Task_Status` is a per-field FT-image instance-fact
+    // cell — the parse materializer folds it to `Object::Map` (and the
+    // runtime keyed-entity path keeps it Map). A raw `fetch(...).as_seq()`
+    // returns None on a Map, silently zeroing every count. `fetch_cell_seq`
+    // flattens Map -> key-sorted Seq (and passes a legacy Seq through).
+    let cell = ast::fetch_cell_seq("Task_has_Task_Status", state);
     let Some(facts) = cell.as_seq() else { return TaskCounts::default() };
     let mut counts = TaskCounts::default();
     for fact in facts {

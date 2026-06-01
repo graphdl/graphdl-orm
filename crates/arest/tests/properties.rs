@@ -2160,15 +2160,21 @@ Thing 'alice-1' has Label 'foo'.
     let defs = compile::compile_to_defs_state(&state);
     let d = ast::defs_to_state(&defs, &state);
 
-    // Component facts should exist from parse-time decomposition
-    let owner_cell = ast::fetch_or_phi("Thing_has_Owner", &d);
+    // Component facts should exist from parse-time decomposition.
+    // #932 W6: the compound reference-scheme component cells are FT-image
+    // cells the parse materializer folds to Object::Map (eq:cellfold), so
+    // read them through fetch_cell_seq (Map-tolerant key-sorted flatten) —
+    // a raw fetch_or_phi(...).as_seq() yields None on a Map and the
+    // `.expect(...)` would panic. (The sibling runtime-create test below
+    // already reads these same cells via fetch_cell_seq.)
+    let owner_cell = ast::fetch_cell_seq("Thing_has_Owner", &d);
     let owner_facts = owner_cell.as_seq().expect("Thing_has_Owner cell should exist");
     assert!(owner_facts.iter().any(|f|
         ast::binding(f, "Thing") == Some("alice-1") &&
         ast::binding(f, "Owner") == Some("alice")
     ), "Owner component should be decomposed from 'alice-1'");
 
-    let seq_cell = ast::fetch_or_phi("Thing_has_Seq", &d);
+    let seq_cell = ast::fetch_cell_seq("Thing_has_Seq", &d);
     let seq_facts = seq_cell.as_seq().expect("Thing_has_Seq cell should exist");
     assert!(seq_facts.iter().any(|f|
         ast::binding(f, "Thing") == Some("alice-1") &&
