@@ -2814,16 +2814,23 @@ Source 'src1' has Hue 'red'.
     let defs = compile::compile_to_defs_state(&state);
     let d = ast::defs_to_state(&defs, &state);
 
-    // task-930 v2: views emit ONLY under `view:` (chain skips them);
-    // extract_facts_from_pop now consults views via Func::FetchOrPhi
-    // → resolve_view, so downstream rules see view-derived bindings
-    // without the v1 eager-emit workaround.
+    // eud-valuetype-bridge-join: View rules now emit BOTH a
+    // `derivation:{id}` def (so the EAGER fold materializes the stored
+    // cell — the cell-graph is the storage substrate per AREST.tex, and
+    // stored cells are the single source of truth) AND a `view:{cell}`
+    // def (the lazy read-side fallback). PRE-FIX a View rule emitted ONLY
+    // the `view:` def and was skipped by the eager fold, which left the
+    // STORED cell empty after a live `arest-cli <dir> --db` compile while
+    // `sql ft_...` still showed the right rows via the masking
+    // resolve_view fallback (the apps/deriv-probe `Item has C Val. *`
+    // symptom). The lazy-read path below still works regardless.
     let derivation_def = ast::fetch_raw(
         &format!("derivation:{}", bar_color_rule.id), &d);
-    assert!(matches!(derivation_def, ast::Object::Bottom),
-        "View rule must NOT emit derivation: def; got {:?}", derivation_def);
+    assert!(!matches!(derivation_def, ast::Object::Bottom),
+        "View rule must ALSO emit a derivation: def so the eager fold \
+         materializes the stored cell; got Bottom");
 
-    // Sanity: view def IS present.
+    // The view def IS also present (lazy read-side fallback).
     let view_def = ast::fetch_raw("view:Bar_has_Color", &d);
     assert!(!matches!(view_def, ast::Object::Bottom),
         "View def missing for Bar_has_Color");
@@ -2904,15 +2911,17 @@ Source 'src1' has Hue 'red'.
         "Bar is colorful must be Stored (downstream of view); got {:?}",
         colorful_rule.materialization);
 
-    // Build the def-state and prove the v2 layout: NO derivation:
-    // def for the view, only a view: def.
+    // Build the def-state. eud-valuetype-bridge-join: a View rule now
+    // emits BOTH a `derivation:{id}` def (eager fold materializes the
+    // stored cell — the substrate's single source of truth) AND a
+    // `view:{cell}` def (lazy read-side fallback).
     let defs = compile::compile_to_defs_state(&state);
     let d = ast::defs_to_state(&defs, &state);
     let view_derivation_def = ast::fetch_raw(
         &format!("derivation:{}", bar_color_rule.id), &d);
-    assert!(matches!(view_derivation_def, ast::Object::Bottom),
-        "View rule must NOT emit a derivation: def under v2; got {:?}",
-        view_derivation_def);
+    assert!(!matches!(view_derivation_def, ast::Object::Bottom),
+        "View rule must ALSO emit a derivation: def so the eager fold \
+         materializes its stored cell; got Bottom");
     let view_def = ast::fetch_raw("view:Bar_has_Color", &d);
     assert!(!matches!(view_def, ast::Object::Bottom),
         "View def missing for Bar_has_Color");
@@ -3708,13 +3717,17 @@ ViewElement 'e2' renders Fact Type 'ft2'.
     let defs = compile::compile_to_defs_state(&state);
     let d = ast::defs_to_state(&defs, &state);
 
-    // (b) NO `derivation:` def may exist for any of the three rules
-    //     (View rules must NOT be emitted into the forward chain).
+    // (b) eud-valuetype-bridge-join: these widget rules bind `ViewElement`
+    //     from the `renders` antecedent (an EXISTING role, NOT a fresh
+    //     skolem `(E)` head like the menu-view derivations), so the eager
+    //     fold materializes them — each emits a `derivation:{id}` def in
+    //     addition to the shared `view:` def. (Skolem-head View rules stay
+    //     lazy-only; see func_mints_skolem in compile.rs.)
     for r in &view_rules {
         let derivation_def = ast::fetch_raw(&format!("derivation:{}", r.id), &d);
-        assert!(matches!(derivation_def, ast::Object::Bottom),
-            "View rule '{}' must NOT emit a derivation: def; got {:?}",
-            r.text, derivation_def);
+        assert!(!matches!(derivation_def, ast::Object::Bottom),
+            "non-skolem View rule '{}' must ALSO emit a derivation: def so the \
+             eager fold materializes its stored cell; got Bottom", r.text);
     }
 
     // (c) A single `view:ViewElement_has_Component_Role` def MUST be

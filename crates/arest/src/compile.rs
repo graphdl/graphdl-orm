@@ -1392,6 +1392,31 @@ fn ring_kind_to_norma_type(kind: &str) -> Option<&'static str> {
     }
 }
 
+/// eud-valuetype-bridge-join: true iff `f`'s tree mints a fresh skolem id —
+/// i.e. it contains a `Func::Platform("skolem")` node. The ONLY producer of
+/// that node is `compile_join_derivation`'s skolem-head branch (one fresh
+/// entity id per join tuple). Used by `compile_to_defs_state` to keep
+/// skolem-head View rules lazy-ONLY (no eager `derivation:{id}` def): eagerly
+/// folding them over the SM/Transition/Noun metamodel mints unbounded
+/// synthetic ids — the "metamodel-hang" the menu-view derivations guard
+/// against — and such heads are consumed on-read via resolve_view, never
+/// needing a stored cell. Plain value-join View rules (no skolem head, e.g.
+/// apps/deriv-probe's `Item has C Val. *`) ARE eagerly materialized so their
+/// stored cell — the substrate's single source of truth — is populated.
+fn func_mints_skolem(f: &Func) -> bool {
+    match f {
+        Func::Platform(name) => name == "skolem",
+        Func::Compose(a, b) => func_mints_skolem(a) || func_mints_skolem(b),
+        Func::Construction(fs) => fs.iter().any(func_mints_skolem),
+        Func::Condition(p, t, e) =>
+            func_mints_skolem(p) || func_mints_skolem(t) || func_mints_skolem(e),
+        Func::ApplyToAll(g) | Func::Insert(g) | Func::Filter(g) | Func::FoldL(g)
+            | Func::BinaryToUnary(g, _) => func_mints_skolem(g),
+        Func::While(p, g) => func_mints_skolem(p) || func_mints_skolem(g),
+        _ => false,
+    }
+}
+
 pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> {
     let t = profile_timer::now();
     let model = compile(state);
@@ -1646,25 +1671,47 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // single positive `derivation:<id>` prefix. The old #826b 2-stratum
     // `derivation_strat2:` split was dead (`uses_negation` was never set
     // true) and has been removed.
-    // task-930 v2: split Stored vs View materialization at def
-    // emission.
-    //   * Stored rules emit under `derivation:{id}` so the forward
-    //     chain runs them eagerly per apply.
-    //   * View rules emit under `view:{cell_name}` so the read-side
-    //     (Func::Fetch / Func::FetchOrPhi → resolve_view) can
-    //     evaluate them lazily on demand. The chain skips them
-    //     entirely — `extract_facts_from_pop` now composes
-    //     Func::FetchOrPhi, which consults the view def when the
-    //     antecedent cell isn't already in the encoded pop, so a
-    //     downstream rule whose antecedent is a `*`-marked FT sees
-    //     the view-derived bindings even though the chain didn't
-    //     materialize the cell.
+    // task-930 v2 + eud-valuetype-bridge-join: Stored vs View def emission.
+    //   * Stored rules emit `derivation:{id}` — the eager fold runs them.
+    //   * View rules emit `view:{cell_name}` for the lazy read-side
+    //     (Func::Fetch / Func::FetchOrPhi → resolve_view), AND — when the
+    //     rule has NO skolem head — ALSO emit `derivation:{id}` so the
+    //     eager fold materializes the consequent into the STORED cell.
+    //     Per AREST.tex the cell-graph IS the storage substrate
+    //     (`D' = foldₗ μ D E`) and the stored cells are the single source
+    //     of truth, so a derived FT's population must land in its stored
+    //     cell regardless of read-side policy. The lazy `view:` def then
+    //     becomes a redundant fallback for the now-materialized cell, not
+    //     the sole population source.
+    //
+    // eud-valuetype-bridge-join (the fix): PRE-FIX only Stored rules emitted
+    // `derivation:{id}`, so a `fully-derived` (`*`-marked) FT like
+    // apps/deriv-probe's `Item has C Val. *` compiled to View → emitted
+    // ONLY `view:Item_has_C_Val` and was SKIPPED by the eager fold. The
+    // live `arest-cli <dir> --db` compile therefore left
+    // `cells get Item_has_C_Val` empty (no stored cell) even though
+    // `sql ft_Item_has_C_Val` returned {i1,c1} via the masking
+    // `resolve_view` fallback in sql.rs::materialize_fact_type_tables. The
+    // value-join logic was correct in both paths all along — the divergence
+    // was purely that the eager fold never ran the rule.
+    //
+    // SKOLEM-HEAD CARVE-OUT: a View rule whose consequent mints a FRESH
+    // entity id per join tuple (`skolem_head_roles` non-empty — the
+    // ViewElement (E) menu-view derivations) stays lazy-ONLY. Eagerly
+    // folding those over the SM/Transition/Noun metamodel mints unbounded
+    // synthetic ids and is the exact "metamodel-hang" the menu-view tests
+    // guard against; such heads are consumed on-read via resolve_view and
+    // never need a stored cell. Plain value-joins like deriv-probe (head
+    // binds only existing roles) materialize eagerly.
     //
     // Default policy is Stored; existing readings without explicit
     // `is a view iff` keep eager materialization.
+    let eager_materializable = |d: &CompiledDerivation| -> bool {
+        matches!(d.materialization, crate::types::MaterializationPolicy::Stored)
+            || !func_mints_skolem(&d.func)
+    };
     defs.extend(model.derivations.iter()
-        .filter(|d| matches!(d.materialization,
-            crate::types::MaterializationPolicy::Stored))
+        .filter(|d| eager_materializable(d))
         .map(|d| {
             (format!("derivation:{}", d.id), d.func.clone())
         }));
@@ -11381,6 +11428,186 @@ mod schema_tests {
             (ast::binding(facts[0], "Item"), ast::binding(facts[0], "C Val")),
             (Some("i1"), Some("c1")),
             "Item_has_C_Val must be {{Item:i1, C Val:c1}}; got {:?}", facts[0]);
+    }
+
+    /// eud-valuetype-bridge-join LIVE-COMPILE-PATH regression: the bug
+    /// the two tests above could NOT catch. apps/deriv-probe marks its
+    /// consequent FT `*` (`Item has C Val. *`), which compiles to
+    /// `Derivation Mode 'fully-derived'` → `MaterializationPolicy::View`.
+    /// PRE-FIX the def emitter gave View rules ONLY a `view:{cell}` def
+    /// (lazy, read-side) and NO `derivation:{id}` def, so the eager
+    /// forward chain SKIPPED the rule and `cells get Item_has_C_Val`
+    /// was empty after a live compile — even though `sql ft_Item_has_C_Val`
+    /// returned {i1,c1} via the masking `resolve_view` fallback in
+    /// sql.rs::materialize_fact_type_tables. The two passing tests above
+    /// used the UNMARKED FT (Stored policy) so they never exercised this.
+    ///
+    /// This drives the SAME `arest-cli <dir> --db` dirs pipeline the CLI
+    /// runs (cli/entry.rs ~L733-1108): per-reading fold of
+    /// metamodel_readings() ++ the `*`-marked app, seeded with the global
+    /// noun catalog; tree-shake; drop derived consequent cells; forward-
+    /// chain over `derivation:rule_*`. It asserts the STORED cell — read
+    /// the same way `cells get` reads it — materializes {Item:i1, C Val:c1},
+    /// which fails unless the eager fold runs the `*`-marked rule.
+    #[test]
+    fn valuetype_bridge_join_star_marked_materializes_via_live_compile() {
+        // `Item has C Val. *` — the `*` (fully-derived) marker is the
+        // bug trigger: it routes the rule to View materialization.
+        let app = "\
+            Item(.id) is an entity type.\n\
+            A Val is a value type.\n\
+              The possible values of A Val are 'a1', 'a2'.\n\
+            B Val is a value type.\n\
+              The possible values of B Val are 'b1', 'b2'.\n\
+            C Val is a value type.\n\
+              The possible values of C Val are 'c1', 'c2'.\n\
+            Item has A Val.\n\
+              Each Item has at most one A Val.\n\
+            Item has B Val.\n\
+              Each Item has at most one B Val.\n\
+            Item has C Val. *\n\
+              Each Item has at most one C Val.\n\
+            A Val and B Val map to C Val.\n\
+              For each A Val and B Val, at most one C Val maps from that A Val and that B Val.\n\
+            A Val 'a1' and B Val 'b1' map to C Val 'c1'.\n\
+            Item 'i1' has A Val 'a1'.\n\
+            Item 'i1' has B Val 'b1'.\n\
+            Item has C Val iff Item has A Val and Item has B Val and that A Val and that B Val map to that C Val.\n\
+        ";
+        let new_d = live_compile_dirs_pipeline(app);
+
+        // GUARD: the rule must be classified fully-derived (View) — i.e.
+        // this test actually exercises the bug path, not the Stored path.
+        let mode_fully_derived = ast::fetch_cell_seq("InstanceFact", &new_d).as_seq()
+            .map(|fs| fs.iter().any(|f|
+                ast::binding(f, "subjectValue") == Some("Item has C Val")
+                    && ast::binding(f, "fieldName") == Some("Derivation Mode")
+                    && ast::binding(f, "objectValue") == Some("fully-derived")))
+            .unwrap_or(false);
+        assert!(mode_fully_derived,
+            "test must exercise the View path: `Item has C Val. *` should emit \
+             Derivation Mode 'fully-derived'");
+
+        // The eager fold MUST have materialized the stored cell — read it
+        // exactly as `cells get` does (ast::fetch → Bottom == no such cell).
+        let raw = ast::fetch("Item_has_C_Val", &new_d);
+        assert!(!matches!(raw, ast::Object::Bottom),
+            "live compile left Item_has_C_Val unmaterialized (no such cell): a \
+             `*`-marked (fully-derived/View) rule must STILL be run by the eager \
+             fold so the stored cell — the single source of truth — is populated; \
+             the lazy `view:` def is only a fallback");
+        let cell = ast::fetch_cell_seq("Item_has_C_Val", &new_d);
+        let facts: Vec<&ast::Object> = cell.as_seq()
+            .map(|s| s.iter().collect()).unwrap_or_default();
+        assert_eq!(facts.len(), 1,
+            "stored Item_has_C_Val must hold exactly one fact; got {} (cell={:?})",
+            facts.len(), cell);
+        assert_eq!(
+            (ast::binding(facts[0], "Item"), ast::binding(facts[0], "C Val")),
+            (Some("i1"), Some("c1")),
+            "stored Item_has_C_Val must be {{Item:i1, C Val:c1}}; got {:?}", facts[0]);
+    }
+
+    /// Faithful in-process replication of the `arest-cli <readings_dir>
+    /// --db` dirs-compile pipeline (cli/entry.rs ~L733-1108), returning
+    /// the post-forward-chain state `new_d`. Folds the bundled metamodel
+    /// readings ahead of `app` (seeded with the global noun catalog),
+    /// tree-shakes unreached domain FTs, drops derived consequent cells
+    /// (LFP per request), then forward-chains the `derivation:rule_*` /
+    /// `_sm_*` strata. Used by the live-compile-path regressions so they
+    /// catch divergences (e.g. View-policy def emission) that a direct
+    /// `forward_chain_defs_state` over an isolated parse cannot.
+    fn live_compile_dirs_pipeline(app: &str) -> ast::Object {
+        let all_readings: Vec<(&str, &str)> = crate::metamodel_readings().into_iter()
+            .map(|r| (r.0, r.1))
+            .chain(core::iter::once(("app-under-test", app)))
+            .collect();
+        // noun_seed: parse the full corpus once, keep just the Noun cell so
+        // every slice resolves against the complete noun catalog.
+        let noun_seed: ast::Object = {
+            let corpus: String = all_readings.iter()
+                .map(|(_, t)| *t).collect::<Vec<_>>().join("\n\n");
+            let full = crate::parse_forml2::parse_to_state_from(&corpus, &ast::Object::phi())
+                .expect("corpus parse");
+            let mut m: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+            m.insert("Noun".to_string(), ast::fetch_cell_seq("Noun", &full));
+            ast::Object::map(m)
+        };
+        let parsed_fresh = all_readings.iter().fold(noun_seed, |merged, (_, text)| {
+            let this = crate::parse_forml2::parse_to_state_from(text, &merged)
+                .expect("reading parse");
+            ast::merge_states(&merged, &this)
+        });
+        // prior_population is empty (fresh DB), so state == parsed_fresh.
+        let state = parsed_fresh;
+
+        // Tree-shake: prune unreached domain FTs (entry.rs:849-875).
+        let state = {
+            let ft_ids = |st: &ast::Object| -> hashbrown::HashSet<String> {
+                ast::fetch_cell_seq("FactType", st).as_seq()
+                    .map(|fs| fs.iter()
+                        .filter_map(|f| ast::binding(f, "id").map(|s| s.to_string()))
+                        .collect())
+                    .unwrap_or_default()
+            };
+            let all_ft_ids = ft_ids(&state);
+            let base_ft_ids = ft_ids(crate::metamodel_state());
+            let domain_ft_ids = crate::compile::bundled_domain_fact_type_ids();
+            let roots: hashbrown::HashSet<String> =
+                all_ft_ids.difference(&base_ft_ids).cloned().collect();
+            let idx = crate::compile::cell_index_from_state(&state);
+            let reachable = crate::compile::reachable_fact_types(&idx, &roots);
+            let keep: hashbrown::HashSet<String> = all_ft_ids.iter()
+                .filter(|id| !domain_ft_ids.contains(*id) || reachable.contains(*id))
+                .cloned().collect();
+            crate::compile::prune_unreachable_fact_types(&state, &keep)
+        };
+
+        let compile_defs = compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&compile_defs, &state);
+
+        // Drop derived consequent cells (entry.rs:992-1042).
+        let derived_cells: hashbrown::HashSet<String> = {
+            let mut out = hashbrown::HashSet::new();
+            let drule = ast::fetch_cell_seq("DerivationRule", &d);
+            if let Some(facts) = drule.as_seq() {
+                for fact in facts.iter() {
+                    if let Some(enc) = ast::binding(fact, "consequentFactTypeId") {
+                        let cn = crate::types::ConsequentCellSource::decode(enc)
+                            .literal_id().to_string();
+                        if !cn.is_empty() { out.insert(cn); }
+                    }
+                }
+            }
+            out
+        };
+        let d = if derived_cells.is_empty() { d } else {
+            let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+            for (name, contents) in ast::cells_iter(&d).into_iter() {
+                if derived_cells.contains(name) {
+                    new_map.insert(name.to_string(), ast::Object::phi());
+                } else {
+                    new_map.insert(name.to_string(), contents.clone());
+                }
+            }
+            ast::Object::map(new_map)
+        };
+
+        // Forward-chain (entry.rs:1082-1108): rule_ + _sm_* derivs.
+        let collect = |prefix: &str, st: &ast::Object| -> Vec<(String, ast::Func)> {
+            ast::cells_iter(st).into_iter()
+                .filter(|(n, _)| n.starts_with(prefix))
+                .map(|(n, c)| (n.to_string(), ast::metacompose(c, st)))
+                .collect()
+        };
+        let mut stratum1 = collect("derivation:rule_", &d);
+        stratum1.extend(collect("derivation:_sm_init_", &d));
+        stratum1.extend(collect("derivation:_sm_event_fold_", &d));
+        stratum1.extend(collect("derivation:_sm_for_resource_backfill_", &d));
+        let refs: Vec<(&str, &ast::Func)> = stratum1.iter()
+            .map(|(n, f)| (n.as_str(), f)).collect();
+        let (new_d, _) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+        new_d
     }
 
     /// Single-antecedent ring FT consequent binding: when an
