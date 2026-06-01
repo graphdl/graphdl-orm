@@ -3634,6 +3634,39 @@ pub(crate) fn validate_model_data_classified(ir: &CellIndex) -> Vec<ModelViolati
             fact_type_id: None,
         }));
 
+    // 7. Range-unrestricted derivation rule (derivation-cardinality-count
+    // follow-up). A rule whose ONLY antecedent is an `at most N` count premise
+    // (`Item is unguarded clear iff Item is marked by at most 0 Tag`) binds its
+    // head variable solely through that count — no positive guard supplies the
+    // variable's universe. `compile_explicit_derivation` correctly SUPPRESSES
+    // such a rule to φ (materializing it from the bridge rows would emit the
+    // complement — the cardinality bug), but that suppression is otherwise
+    // SILENT: the consequent cell simply never appears. Surface it as a deontic
+    // warning (the compile proceeds; the rule is well-formed FORML, just not
+    // range-restricted) through the same `[model warning]` channel the modality
+    // findings use. The predicate mirrors the φ-suppression site exactly: a
+    // single antecedent carrying an `at most N` cardinality. (Guarded
+    // cardinality rules carry ≥2 antecedents, route to `compile_join_derivation`
+    // as a count guard, and are NOT flagged — no false positives.)
+    ir.derivation_rules.iter()
+        .filter(|rule| rule.antecedent_sources.len() == 1)
+        .filter_map(|rule| rule.antecedent_cardinalities.first()
+            .filter(|card| card.at_most)
+            .map(|card| (rule, card)))
+        .for_each(|(rule, card)| violations.push(ModelViolation {
+            message: format!(
+                "derivation rule '{}' is range-unrestricted: variable '{}' is \
+                 bound only by a count/negation premise; materialization \
+                 suppressed — add a positive guard binding '{}' (e.g. a unary \
+                 fact or '{} has some {}') to range-restrict it.",
+                rule.text, card.group_key_role, card.group_key_role,
+                card.group_key_role, card.group_key_role),
+            // Deontic: the rule is well-formed FORML; we warn and proceed
+            // (D' = D''). No population cell to drop.
+            alethic: false,
+            fact_type_id: None,
+        }));
+
     violations
 }
 
@@ -14525,6 +14558,80 @@ mod model_validation_modality_tests {
             .expect("UC underspanning a ternary must surface a violation");
         assert!(!v.alethic,
             "task-807: empty/unknown modality must default to warning (deontic / non-blocking); got {:?}", v);
+    }
+
+    /// derivation-cardinality-count follow-up (range-unrestricted-rule-warning):
+    /// the φ-suppression `compile_explicit_derivation` applies to an UNGUARDED
+    /// `at most N` rule (head var bound only by the count premise) must no
+    /// longer be SILENT. The classified model validator surfaces a deontic
+    /// `[model warning]` naming the rule and the unbound variable, while a
+    /// GUARDED cardinality rule (positive guard antecedent supplies the
+    /// universe → routes to `compile_join_derivation`, materializes correctly)
+    /// is NOT flagged. This drives the SAME `parse_to_state` → `cell_index_from_state`
+    /// → `validate_model_classified_from_state` path the compile pipeline runs,
+    /// so the predicate stays welded to the actual parser output.
+    #[test]
+    fn range_unrestricted_at_most_rule_warns_guarded_does_not() {
+        use crate::parse_forml2::parse_to_state;
+
+        // UNGUARDED: `Item` is bound ONLY by the `at most 0 Tag` count premise.
+        // Mirrors safety-probe's `Item is unguarded clear` rule.
+        let unguarded = "\
+Item(.id) is an entity type.
+Tag(.id) is an entity type.
+Item is marked by Tag.
+Item is unguarded clear. *
+
+* Item is unguarded clear iff Item is marked by at most 0 Tag.
+";
+        let state = parse_to_state(unguarded).expect("parse unguarded");
+        // Sanity: the parser must actually produce the single-antecedent
+        // `at most` cardinality shape this check keys on (else the test would
+        // pass vacuously).
+        let data = cell_index_from_state(&state);
+        let rule = data.derivation_rules.iter()
+            .find(|r| r.text.contains("unguarded clear"))
+            .expect("unguarded rule must parse");
+        assert_eq!(rule.antecedent_sources.len(), 1,
+            "fixture precondition: unguarded rule must have exactly one \
+             antecedent (the count bridge); got {:?}", rule.antecedent_sources);
+        assert!(rule.antecedent_cardinalities.first().map(|c| c.at_most).unwrap_or(false),
+            "fixture precondition: unguarded rule must carry an `at most` \
+             cardinality; got {:?}", rule.antecedent_cardinalities);
+
+        let violations = validate_model_classified_from_state(&state);
+        let w = violations.iter()
+            .find(|v| v.message.contains("range-unrestricted")
+                && v.message.contains("unguarded clear"))
+            .unwrap_or_else(|| panic!(
+                "range-unrestricted `at most` rule MUST surface a diagnostic; \
+                 got {:?}", violations));
+        assert!(!w.alethic,
+            "range-unrestricted warning is deontic (warn, compile proceeds); \
+             got alethic={:?}", w);
+        assert!(w.message.contains("Item"),
+            "diagnostic must name the unbound variable 'Item'; got {:?}", w.message);
+        assert!(w.message.contains("positive guard"),
+            "diagnostic must tell the user to add a positive guard; got {:?}", w.message);
+
+        // GUARDED: `Item is named` positively binds `Item` before the count.
+        // Mirrors safety-probe's `Item is guarded clear` rule. Must NOT warn.
+        let guarded = "\
+Item(.id) is an entity type.
+Tag(.id) is an entity type.
+Item is named.
+Item is marked by Tag.
+Item is guarded clear. *
+
+* Item is guarded clear iff Item is named and Item is marked by at most 0 Tag.
+";
+        let state_g = parse_to_state(guarded).expect("parse guarded");
+        let violations_g = validate_model_classified_from_state(&state_g);
+        let false_positive = violations_g.iter()
+            .find(|v| v.message.contains("range-unrestricted"));
+        assert!(false_positive.is_none(),
+            "GUARDED cardinality rule must NOT trigger the range-unrestricted \
+             warning (no false positives); got {:?}", false_positive);
     }
 }
 

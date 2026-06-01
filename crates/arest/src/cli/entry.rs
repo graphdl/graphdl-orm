@@ -955,6 +955,23 @@ pub fn main_entry() {
                 let compile_defs = crate::compile::compile_to_defs_state(&state);
                 let d = ast::defs_to_state(&compile_defs, &d);
 
+                // Surface deontic (non-blocking) structural findings on the
+                // dirs-compile path. `platform_compile` (the runtime `compile`
+                // SYSTEM verb / `apps.compile`) already emits these as
+                // `[model warning] …` (ast.rs ~3310); the dirs path parses +
+                // persists directly without routing through it, so without this
+                // the warnings would be invisible from `arest-cli <dir> --db`.
+                // Reuse the SAME classified validator and the SAME
+                // `[model warning]` prefix — no parallel channel. Currently the
+                // only deontic finding produced here is the range-unrestricted
+                // derivation-rule warning (an `at most N` rule whose head var is
+                // bound only by the count premise → suppressed to φ by
+                // `compile_explicit_derivation`); making it loud is the point.
+                crate::compile::validate_model_classified_from_state(&state)
+                    .iter()
+                    .filter(|v| !v.alethic)
+                    .for_each(|v| eprintln!("[model warning] {}", v.message));
+
                 // task-951: `--export-norma <file>` short-circuits here.
                 // `compile_to_defs_state` has just built the `norma:model`
                 // def cell (compile.rs:2912) from the `norma` generator; we
