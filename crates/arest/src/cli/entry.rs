@@ -499,6 +499,58 @@ fn load_and_compile(conn: &rusqlite::Connection) -> ast::Object {
     d
 }
 
+/// read-path-fast-path: keys whose CLI dispatch is a *pure read-only
+/// projection* over the loaded cell graph and therefore does NOT need
+/// the write-only compile work (`population_only` strip + recompile +
+/// `defs_to_state`) that `load_and_compile` performs.
+///
+/// `sql` (sql.rs), `cells` (cells_introspect.rs) and `orient`
+/// (orient.rs) are the three read-only intercepts in `system()` above
+/// (entry.rs:221/231/240): each takes `&d`, returns `d.clone()`
+/// unchanged, and reads only POPULATION cells plus — for `sql`'s
+/// empty-stored view fact types — the persisted `view:` def cells. All
+/// of those are loaded verbatim by `db::load_state` (the persisted
+/// `defs` table is the compiler's own output cache: a tasks-scale DB
+/// carries the `schema:`/`view:`/`derivation:` families pre-built — see
+/// the 8.6k-row `defs` table), so a read can serve straight off the
+/// loaded snapshot and skip the ~1.3s recompile entirely.
+///
+/// Write keys (`apply`, `compile`, `retract:`/`assert:` families, the
+/// REPL's mixed stream) keep the full `load_and_compile`: they mutate D
+/// and the recompile-from-population discipline is load-bearing there
+/// (it strips a stale persisted def so it can't reach the apply forward
+/// chain — cli-apply-large-tasksdb-nonterminating).
+#[cfg(feature = "local")]
+fn is_read_only_cli_key(key: &str) -> bool {
+    matches!(key, "sql" | "cells" | "orient")
+}
+
+/// read-path-fast-path: lighter load for the read-only verbs.
+///
+/// Just `db::load_state` — the persisted population cells AND the
+/// persisted compiled-def cells (`view:`, `schema:`, `derivation:`, …),
+/// merged into one `Object::Map`. This is precisely the snapshot the
+/// read-only intercepts consume; it skips the `population_only` strip,
+/// `compile::compile_to_defs_state`, and `ast::defs_to_state` that only
+/// the write path needs. `load_state` already dominates the residual
+/// cost (~0.9s, mostly `Object::parse` over the rows); dropping the
+/// recompile is the ~1.3s win.
+///
+/// Escape hatch: set `AREST_READ_FASTPATH=0` to force the full
+/// `load_and_compile` even for a read key (A/B timing, or a fallback if
+/// a stale on-disk `defs` cache is ever suspected — a recompile then
+/// regenerates the def families from the loaded population).
+#[cfg(feature = "local")]
+fn load_for_read(conn: &rusqlite::Connection) -> ast::Object {
+    if std::env::var("AREST_READ_FASTPATH").as_deref() == Ok("0") {
+        return load_and_compile(conn);
+    }
+    let t = std::time::Instant::now();
+    let d = db::load_state(conn);
+    eprintln!("[profile] load_state (read fast-path, compile skipped): {:?}", t.elapsed());
+    d
+}
+
 /// Extract `--db <path>` from `tokens`, returning the chosen path
 /// (defaulting to `arest.db`) and the residual args. Mirrors the
 /// inline `--db` parser in `main_entry()` but in a form the subcommand
@@ -1236,10 +1288,25 @@ pub fn main_entry() {
 
             // arest <key> <input> — single SYSTEM call
             (true, n) if n >= 2 => {
-                let d = load_and_compile(&conn);
-                let d = if no_validate { ast::install_skip_validate(&d) } else { d };
                 let key = &non_dirs[0];
                 let input = &non_dirs[1];
+                // read-path-fast-path: `sql`/`cells`/`orient` are pure
+                // read-only projections (system() returns D unchanged) and
+                // serve straight off the loaded snapshot — skip the
+                // write-only recompile via the lighter `load_for_read`.
+                let d = if is_read_only_cli_key(key) {
+                    load_for_read(&conn)
+                } else {
+                    load_and_compile(&conn)
+                };
+                // `--no-validate` only affects the compile path of a write
+                // key (a read never validates), so it's a no-op on the
+                // fast-load branch — apply it only when we actually compiled.
+                let d = if no_validate && !is_read_only_cli_key(key) {
+                    ast::install_skip_validate(&d)
+                } else {
+                    d
+                };
                 let t = std::time::Instant::now();
                 let (output, new_d) = system(key, input, &d);
                 eprintln!("[{:?}]", t.elapsed());
@@ -1347,5 +1414,31 @@ mod stale_def_tests {
         assert_eq!(ast::fetch("Task", &pop), ast::Object::atom("task-pop"));
         assert_eq!(ast::fetch("Task_has_Task_Description", &pop), ast::Object::atom("desc-pop"));
         assert_eq!(ast::fetch("DerivationRule", &pop), ast::Object::atom("rules-pop"));
+    }
+
+    /// read-path-fast-path guard. The single-SYSTEM dispatch routes
+    /// `sql`/`cells`/`orient` through the lighter `load_for_read` (skip
+    /// the write-only recompile) and EVERYTHING else through the full
+    /// `load_and_compile`. These three are the only read-only intercepts
+    /// in `system()` (entry.rs:221/231/240) — each returns D unchanged —
+    /// so they're exactly the keys safe to serve off the loaded snapshot.
+    /// Write keys (`apply`, `compile`, the `retract:`/`assert:` families)
+    /// and any unknown key MUST fall through to the full compile so the
+    /// recompile-from-population (stale-def strip) discipline still runs.
+    #[test]
+    fn is_read_only_cli_key_selects_only_pure_read_verbs() {
+        // The read-only projection verbs.
+        assert!(is_read_only_cli_key("sql"));
+        assert!(is_read_only_cli_key("cells"));
+        assert!(is_read_only_cli_key("orient"));
+        // Write / mutating keys must keep the full load_and_compile.
+        assert!(!is_read_only_cli_key("apply"));
+        assert!(!is_read_only_cli_key("compile"));
+        assert!(!is_read_only_cli_key("retract:Task_blocks_Task"));
+        assert!(!is_read_only_cli_key("assert:Task_is_epic"));
+        // Unknown keys default to the safe (full-compile) path.
+        assert!(!is_read_only_cli_key(""));
+        assert!(!is_read_only_cli_key("sqlx"));
+        assert!(!is_read_only_cli_key("query"));
     }
 }
