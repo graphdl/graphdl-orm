@@ -1510,6 +1510,27 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         }).collect())
         .unwrap_or_default();
 
+    // task-951-b: source-file provenance for ORM elements. The dirs-compile
+    // path (cli/entry.rs) attaches a `Provenance` cell — facts shaped
+    // `<<element,X>,<kind,K>,<sourceFile,F.md>>` — recording which readings
+    // file first declared each Noun / FactType / Constraint. The NORMA
+    // generator below uses it to emit one ORMDiagram (a NORMA tab) per source
+    // file. Absent the cell (single-blob parse paths, e.g. the test helper
+    // `parse_to_state_via_stage12`) this is empty and the exporter emits a
+    // single diagram — the prior whole-model behavior, unchanged.
+    //
+    // Keyed by (kind, element) since Noun names and FactType/Constraint ids
+    // share no namespace but are looked up by-kind in the exporter.
+    let c_provenance: HashMap<(String, String), String> =
+        fetch_cell_seq("Provenance", state).as_seq()
+            .map(|facts| facts.iter().filter_map(|f| {
+                let kind = binding(f, "kind")?.to_string();
+                let element = binding(f, "element")?.to_string();
+                let file = binding(f, "sourceFile")?.to_string();
+                Some(((kind, element), file))
+            }).collect())
+            .unwrap_or_default();
+
     // c_derivation_rules: Vec<DerivationRuleDef>
     let c_derivation_rules: Vec<DerivationRuleDef> = rule_cell.as_seq()
         .map(|facts| facts.iter().map(|f| {
@@ -2636,6 +2657,10 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         c_ref_schemes: &HashMap<String, Vec<String>>,
         c_supertypes: &HashMap<String, String>,
         c_enum_values: &HashMap<String, Vec<String>>,
+        // task-951-b: (kind, element) → source readings file. Drives
+        // per-file ORMDiagram tabs (one diagram per domain). Empty ⇒ single
+        // diagram (prior whole-model behavior).
+        c_provenance: &HashMap<(String, String), String>,
     ) -> String {
         fn xesc(s: &str) -> String {
             s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
@@ -3129,12 +3154,39 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             }
             col_base = last_col + 2;
         }
-        let mut shapes = String::new();
+        // task-951-b: per-file ORMDiagram tabs. Each shape (object or fact)
+        // carries the source readings file of its underlying element (via
+        // `c_provenance`); we bucket shapes by that file and emit one
+        // `<ormDiagram:ORMDiagram>` (a NORMA tab) per file. The ORMModel
+        // itself stays single — elements are shared and a NORMA diagram is a
+        // VIEW over the model — so only the diagrams partition. Layout (`pos`)
+        // is computed globally above so an element sits at the same
+        // coordinates in whichever tab shows it.
+        //
+        // Provenance lookup is by (kind, identity): nouns by `name`, fact
+        // types by `id`. A shape whose element has no provenance entry (none
+        // when the `Provenance` cell is absent, e.g. single-blob parse) falls
+        // into a sentinel bucket so nothing is silently dropped; with the cell
+        // present that bucket is empty for real models. The bucket KEY is the
+        // file; an ordered (sorted) walk keeps tab order deterministic.
+        let noun_file = |n: &str| c_provenance
+            .get(&("Noun".to_string(), n.to_string()))
+            .cloned();
+        let ft_file = |id: &str| c_provenance
+            .get(&("FactType".to_string(), id.to_string()))
+            .cloned();
+        // file → accumulated shape XML for that tab. BTreeMap = deterministic
+        // tab order (alphabetical by file). The sentinel "" sorts first.
+        let mut per_file_shapes: alloc::collections::BTreeMap<String, String> =
+            alloc::collections::BTreeMap::new();
+        const UNATTRIBUTED: &str = "";
         for &(n, _) in &nouns {
             if let Some(&(x, y)) = pos.get(n) {
-                shapes.push_str(&format!(
+                let shape = format!(
                     "\n      <ormDiagram:ObjectTypeShape id=\"{}\" IsExpanded=\"true\" AbsoluteBounds=\"{:.3}, {:.3}, 1.2, 0.4\">\n        <ormDiagram:Subject ref=\"{}\" />\n      </ormDiagram:ObjectTypeShape>",
-                    guid(&format!("shp:obj:{}", n)), x, y, oid(n)));
+                    guid(&format!("shp:obj:{}", n)), x, y, oid(n));
+                let file = noun_file(n).unwrap_or_else(|| UNATTRIBUTED.to_string());
+                per_file_shapes.entry(file).or_default().push_str(&shape);
             }
         }
         for &(ft, def) in &fts {
@@ -3142,9 +3194,17 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             if let (Some(&(x0, y0)), Some(&(x1, y1))) =
                 (pos.get(&def.roles[0].noun_name), pos.get(&def.roles[1].noun_name)) {
                 let (fx, fy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0 + 0.5);
-                shapes.push_str(&format!(
+                let shape = format!(
                     "\n      <ormDiagram:FactTypeShape id=\"{}\" IsExpanded=\"true\" AbsoluteBounds=\"{:.3}, {:.3}, 0.6, 0.25\">\n        <ormDiagram:RelativeShapes>\n          <ormDiagram:ReadingShape id=\"{}\" IsExpanded=\"true\" AbsoluteBounds=\"{:.3}, {:.3}, 0.6, 0.15\">\n            <ormDiagram:Subject ref=\"{}\" />\n          </ormDiagram:ReadingShape>\n        </ormDiagram:RelativeShapes>\n        <ormDiagram:Subject ref=\"{}\" />\n      </ormDiagram:FactTypeShape>",
-                    guid(&format!("shp:fact:{}", ft)), fx, fy, guid(&format!("shp:rdg:{}", ft)), fx, fy + 0.3, guid(&format!("rdgord:{}", ft)), guid(&format!("fact:{}", ft))));
+                    guid(&format!("shp:fact:{}", ft)), fx, fy, guid(&format!("shp:rdg:{}", ft)), fx, fy + 0.3, guid(&format!("rdgord:{}", ft)), guid(&format!("fact:{}", ft)));
+                // Attribute a fact's shape to the fact type's own file; fall
+                // back to a role player's file (the fact connects them and
+                // some FT ids are synthesized) so it still lands on a real tab.
+                let file = ft_file(ft)
+                    .or_else(|| noun_file(&def.roles[0].noun_name))
+                    .or_else(|| noun_file(&def.roles[1].noun_name))
+                    .unwrap_or_else(|| UNATTRIBUTED.to_string());
+                per_file_shapes.entry(file).or_default().push_str(&shape);
             }
         }
         let constraints_xml = if constraints_block.is_empty() { String::new() } else {
@@ -3163,11 +3223,35 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             format!("\n      <orm:TrueOrFalseLogicalDataType id=\"{}\" />", bool_dt_ref)
         };
         let model_id = guid("model");
+        // Build the diagram(s). With no provenance the whole model is one tab
+        // named "ArestModel" (prior behavior, byte-identical). With provenance
+        // each source file becomes a tab named after the file (sans `.md`),
+        // shown in alphabetical order; the sentinel bucket (shapes with no
+        // provenance) is emitted only if non-empty, named "(unattributed)".
+        let has_provenance = !c_provenance.is_empty();
+        let diagrams: String = if !has_provenance {
+            let all_shapes: String = per_file_shapes.values().map(|s| s.as_str()).collect();
+            format!(
+                "\n  <ormDiagram:ORMDiagram id=\"{dg}\" IsCompleteView=\"false\" Name=\"ArestModel\" BaseFontName=\"Tahoma\" BaseFontSize=\"0.0972222238779068\">\n    <ormDiagram:Shapes>{s}\n    </ormDiagram:Shapes>\n    <ormDiagram:Subject ref=\"{m}\" />\n  </ormDiagram:ORMDiagram>",
+                dg = guid("diagram"), s = all_shapes, m = model_id)
+        } else {
+            per_file_shapes.iter().map(|(file, shapes)| {
+                let tab_name = if file == UNATTRIBUTED {
+                    "(unattributed)".to_string()
+                } else {
+                    // Display the bare domain name: strip a trailing `.md`.
+                    file.strip_suffix(".md").unwrap_or(file).to_string()
+                };
+                format!(
+                    "\n  <ormDiagram:ORMDiagram id=\"{dg}\" IsCompleteView=\"false\" Name=\"{nm}\" BaseFontName=\"Tahoma\" BaseFontSize=\"0.0972222238779068\">\n    <ormDiagram:Shapes>{s}\n    </ormDiagram:Shapes>\n    <ormDiagram:Subject ref=\"{m}\" />\n  </ormDiagram:ORMDiagram>",
+                    dg = guid(&format!("diagram:{}", file)), nm = xesc(&tab_name), s = shapes, m = model_id)
+            }).collect()
+        };
         format!(
-            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<ormRoot:ORM2 xmlns:orm=\"http://schemas.neumont.edu/ORM/2006-04/ORMCore\" xmlns:ormDiagram=\"http://schemas.neumont.edu/ORM/2006-04/ORMDiagram\" xmlns:ormRoot=\"http://schemas.neumont.edu/ORM/2006-04/ORMRoot\">\n  <orm:ORMModel id=\"{m}\" Name=\"ArestModel\">\n    <orm:Objects>{o}\n    </orm:Objects>\n    <orm:Facts>{f}\n    </orm:Facts>{c}\n    <orm:DataTypes>\n      <orm:VariableLengthTextDataType id=\"{d}\" />{bd}\n    </orm:DataTypes>\n  </orm:ORMModel>\n  <ormDiagram:ORMDiagram id=\"{dg}\" IsCompleteView=\"false\" Name=\"ArestModel\" BaseFontName=\"Tahoma\" BaseFontSize=\"0.0972222238779068\">\n    <ormDiagram:Shapes>{s}\n    </ormDiagram:Shapes>\n    <ormDiagram:Subject ref=\"{m}\" />\n  </ormDiagram:ORMDiagram>\n</ormRoot:ORM2>",
-            m = model_id, o = objects, f = facts, c = constraints_xml, d = dt_text, bd = bool_dt_decl, dg = guid("diagram"), s = shapes)
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<ormRoot:ORM2 xmlns:orm=\"http://schemas.neumont.edu/ORM/2006-04/ORMCore\" xmlns:ormDiagram=\"http://schemas.neumont.edu/ORM/2006-04/ORMDiagram\" xmlns:ormRoot=\"http://schemas.neumont.edu/ORM/2006-04/ORMRoot\">\n  <orm:ORMModel id=\"{m}\" Name=\"ArestModel\">\n    <orm:Objects>{o}\n    </orm:Objects>\n    <orm:Facts>{f}\n    </orm:Facts>{c}\n    <orm:DataTypes>\n      <orm:VariableLengthTextDataType id=\"{d}\" />{bd}\n    </orm:DataTypes>\n  </orm:ORMModel>{dg}\n</ormRoot:ORM2>",
+            m = model_id, o = objects, f = facts, c = constraints_xml, d = dt_text, bd = bool_dt_decl, dg = diagrams)
     }
-    let norma_orm = build_norma_orm(&c_nouns, &c_fact_types, &c_constraints, &c_ref_schemes, &c_supertypes, &c_enum_values);
+    let norma_orm = build_norma_orm(&c_nouns, &c_fact_types, &c_constraints, &c_ref_schemes, &c_supertypes, &c_enum_values, &c_provenance);
     #[cfg(not(feature = "no_std"))]
     if std::env::var("AREST_DUMP_NORMA").is_ok() {
         eprintln!("===NORMA-ORM-START===\n{}\n===NORMA-ORM-END===", norma_orm);
@@ -10329,6 +10413,129 @@ mod schema_tests {
             !orm.contains("IsImplicitBooleanValue"),
             "a model with no unary fact types must not emit an implicit-boolean \
              ValueType; got:\n{}", orm);
+    }
+
+    /// task-951-b: parse `src`, attach a `Provenance` cell built from
+    /// `prov` ([(kind, element, sourceFile)]), compile, and return the
+    /// `norma:model` .orm. Lets the per-file-tab tests drive the exporter
+    /// with an explicit provenance map (the dirs-compile path builds the
+    /// same cell from the readings fold).
+    fn norma_orm_from_state_with_provenance(src: &str, prov: &[(&str, &str, &str)]) -> String {
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse");
+        let prov_facts: alloc::vec::Vec<Object> = prov.iter()
+            .map(|(kind, element, file)| fact_from_pairs(&[
+                ("element", element), ("kind", kind), ("sourceFile", file),
+            ]))
+            .collect();
+        let state = crate::ast::store("Provenance", Object::Seq(prov_facts.into()), &state);
+        let defs = compile_to_defs_state(&state);
+        let func = defs.iter().find(|(name, _)| name == "norma:model")
+            .map(|(_, f)| f.clone())
+            .expect("compile_to_defs_state must emit a `norma:model` cell");
+        match func {
+            crate::ast::Func::Constant(obj) =>
+                obj.as_atom().expect("norma:model is a constant atom").to_string(),
+            other => panic!("norma:model must be a constant atom, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn no_provenance_emits_single_arestmodel_diagram() {
+        // Regression guard: absent a Provenance cell the exporter keeps the
+        // prior whole-model behavior — exactly ONE ORMDiagram named
+        // "ArestModel". (The single-blob test helper never builds provenance,
+        // so every other NORMA test exercises this path.)
+        let src = "\
+            Person(.id) is an entity type.\n\
+            City(.id) is an entity type.\n\
+            \n\
+            ## Fact Types\n\
+            Person has City.\n";
+        let orm = norma_orm_from_src(src);
+        assert_eq!(orm.matches("<ormDiagram:ORMDiagram ").count(), 1,
+            "no-provenance export must emit exactly one diagram; got:\n{}", orm);
+        assert!(orm.contains("Name=\"ArestModel\""),
+            "the single diagram must be named ArestModel; got:\n{}", orm);
+    }
+
+    #[test]
+    fn provenance_emits_one_orm_diagram_tab_per_source_file() {
+        // task-951-b deliverable: with a Provenance cell mapping elements to
+        // their readings file, the exporter emits one ORMDiagram (a NORMA
+        // tab) per file, named after the file (sans `.md`). Two domains:
+        // orders.md (Order, Customer, Order has Customer) and
+        // shipping.md (Shipment). The fact type id is derived from the
+        // reading; resolve both FT ids from the compiled FactType cell so the
+        // provenance map keys match exactly what the exporter emits.
+        let src = "\
+            Order(.id) is an entity type.\n\
+            Customer(.id) is an entity type.\n\
+            Shipment(.id) is an entity type.\n\
+            \n\
+            ## Fact Types\n\
+            Order has Customer.\n\
+            Shipment has Order.\n";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse");
+        // FT ids straight from the compiled schema (keyed however the parser
+        // names them) so provenance keys are exact.
+        let ft_ids: alloc::vec::Vec<String> = fetch_cell_seq("FactType", &state).as_seq()
+            .map(|fs| fs.iter().filter_map(|f| binding(f, "id").map(str::to_string)).collect())
+            .unwrap_or_default();
+        let order_ft = ft_ids.iter().find(|id| id.contains("Order_has_Customer"))
+            .cloned().unwrap_or_default();
+        let ship_ft = ft_ids.iter().find(|id| id.contains("Shipment_has_Order"))
+            .cloned().unwrap_or_default();
+
+        let prov: alloc::vec::Vec<(&str, &str, &str)> = alloc::vec![
+            ("Noun", "Order", "orders.md"),
+            ("Noun", "Customer", "orders.md"),
+            ("Noun", "Shipment", "shipping.md"),
+            ("FactType", order_ft.as_str(), "orders.md"),
+            ("FactType", ship_ft.as_str(), "shipping.md"),
+        ];
+        let orm = norma_orm_from_state_with_provenance(src, &prov);
+
+        // Two source files ⇒ two diagram tabs.
+        assert_eq!(orm.matches("<ormDiagram:ORMDiagram ").count(), 2,
+            "expected one diagram per source file (2); got:\n{}", orm);
+        // Tabs are named after the files (sans `.md`).
+        assert!(orm.contains("Name=\"orders\""),
+            "expected an `orders` diagram tab; got:\n{}", orm);
+        assert!(orm.contains("Name=\"shipping\""),
+            "expected a `shipping` diagram tab; got:\n{}", orm);
+        // The single shared model is still emitted once.
+        assert_eq!(orm.matches("<orm:ORMModel ").count(), 1,
+            "the ORMModel must remain single (diagrams are views over it); got:\n{}", orm);
+
+        // Each Order/Customer ObjectTypeShape lands on the orders tab, and
+        // Shipment's on the shipping tab. Verify by splitting on the diagram
+        // boundary: the orders tab's shape block must reference the Order
+        // object id and NOT the Shipment object id.
+        let oid = |n: &str| {
+            // mirror build_norma_orm's `guid("obj:{n}")` — recompute here so
+            // the test asserts on the actual ref the exporter writes.
+            fn fnv(s: &str, seed: u64) -> u64 {
+                let mut h = seed;
+                for b in s.bytes() { h ^= b as u64; h = h.wrapping_mul(0x0000_0100_0000_01b3); }
+                h
+            }
+            let key = alloc::format!("obj:{}", n);
+            let a = fnv(&key, 0xcbf2_9ce4_8422_2325);
+            let b = fnv(&key, 0x8422_2325_cbf2_9ce4);
+            alloc::format!("_{:08X}-{:04X}-{:04X}-{:04X}-{:012X}",
+                (a >> 32) as u32, (a >> 16) as u16, a as u16,
+                (b >> 48) as u16, b & 0xFFFF_FFFF_FFFF)
+        };
+        let orders_tab_start = orm.find("Name=\"orders\"").expect("orders tab");
+        let orders_tab = &orm[orders_tab_start..orm[orders_tab_start..]
+            .find("</ormDiagram:ORMDiagram>").map(|i| orders_tab_start + i)
+            .unwrap_or(orm.len())];
+        assert!(orders_tab.contains(&format!("ref=\"{}\"", oid("Order"))),
+            "orders tab must show the Order object shape; tab:\n{}", orders_tab);
+        assert!(!orders_tab.contains(&format!("ref=\"{}\"", oid("Shipment"))),
+            "orders tab must NOT show the Shipment object shape; tab:\n{}", orders_tab);
     }
 
     #[test]

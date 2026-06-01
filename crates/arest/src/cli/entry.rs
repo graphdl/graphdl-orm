@@ -425,6 +425,105 @@ fn read_readings(dirs: &[String]) -> Vec<(String, String)> {
     app_md.into_iter().chain(readings).collect()
 }
 
+// task-951-b: source-file → ORM-element provenance.
+//
+// Compiled cells (Noun / FactType / Constraint) carry NO record of which
+// readings file declared each element — the per-file fold at `main_entry`
+// concatenates every file's parse into one state via `merge_states`, so by
+// the time `compile_to_defs_state` builds the NORMA model the file boundary
+// is gone. The NORMA exporter needs that boundary to emit one ORMDiagram
+// (a NORMA "tab") per source file: a domain = a readings file.
+//
+// The AREST-aligned fix is a model-carried cell: `Provenance`, a Seq of
+// facts `<<element, X>, <kind, K>, <sourceFile, F.md>>` where K ∈ {Noun,
+// FactType, Constraint} and `element` is that element's identity (Noun
+// `name`, FactType/Constraint `id`). It is built by replaying the SAME
+// fold the loader uses — each file is parsed in the accumulated context,
+// and every Noun/FactType/Constraint identity the file INTRODUCES (absent
+// from the running accumulator) is attributed to that file. First-declarer
+// wins, mirroring `merge_states`' identity-keyed dedup, so the provenance
+// of a noun referenced by many files is the file that first declared it.
+//
+// `compile_to_defs_state` reads this cell (when present) to partition ORM
+// elements into per-file diagrams; absent it (e.g. the single-blob
+// `parse_to_state_via_stage12` test path) the exporter falls back to one
+// diagram, so this is purely additive.
+
+/// The identity-binding key for a fact in cell `cell` — the value the
+/// provenance map keys on. Mirrors `merge_states`/`concat_dedup`'s
+/// identity discipline (Noun by `name`, everything else by `id`).
+#[cfg(feature = "local")]
+fn provenance_id_key(cell: &str) -> &'static str {
+    match cell {
+        "Noun" => "name",
+        _ => "id",
+    }
+}
+
+/// Replay the loader's fold purely to attribute each ORM element to the
+/// readings file that first declared it. `all_readings` is the SAME
+/// `(name, text)` sequence the loader folds (metamodel slices + user
+/// files), and `seed` is the same global-noun seed, so the per-file parse
+/// context matches the real load exactly. Returns a `Provenance` cell
+/// (a Seq of `<<element,..>,<kind,..>,<sourceFile,..>>` facts).
+///
+/// Cost: one extra parse per file. Only paid on the dirs-compile path
+/// (the only caller that has file boundaries), and the parses are the
+/// same ones the loader already does — provenance is the delta-capture,
+/// not new parsing semantics.
+#[cfg(feature = "local")]
+fn build_provenance_cell(all_readings: &[(&str, &str)], seed: &ast::Object) -> ast::Object {
+    const KINDS: [&str; 3] = ["Noun", "FactType", "Constraint"];
+    // Per kind: the set of element identities already seen, so a file is
+    // only credited with elements it INTRODUCES (first-declarer wins).
+    //
+    // `seen` is NOT pre-seeded from `seed`'s noun catalog: that catalog is
+    // the WHOLE-corpus noun parse (every noun in every file), used only as
+    // parse CONTEXT so cross-file references resolve regardless of fold
+    // order. Pre-seeding from it would mark every noun "already seen" and
+    // leave every Noun unattributed (no file ever credited). A per-file
+    // parse's output Noun cell holds only the nouns that file's own text
+    // declares (parse_to_state_via_stage12 builds it from `raw_nouns`, not
+    // from `extra_nouns`), so the unseeded first-declarer walk attributes
+    // each noun to the file that introduces it.
+    let mut seen: hashbrown::HashMap<&'static str, hashbrown::HashSet<String>> =
+        KINDS.iter().map(|k| (*k, hashbrown::HashSet::new())).collect();
+    let mut facts: Vec<ast::Object> = Vec::new();
+    // Accumulate parse context across files exactly as the loader's fold
+    // does (later files see earlier files' nouns + fact types), seeded with
+    // the global noun catalog so references resolve fold-order-independently.
+    let mut merged = seed.clone();
+    for (name, text) in all_readings {
+        let this = match parse_forml2::parse_to_state_from(text, &merged) {
+            Ok(s) => s,
+            // A parse error here is reported (fatally) by the real fold the
+            // caller runs right after; provenance must not be the thing that
+            // exits the process, so skip this file and let the loader surface
+            // the diagnostic with its own message.
+            Err(_) => continue,
+        };
+        for kind in KINDS {
+            let key = provenance_id_key(kind);
+            let set = seen.get_mut(kind).expect("seen has an entry per KIND");
+            if let Some(cell_facts) = ast::fetch_cell_seq(kind, &this).as_seq() {
+                for f in cell_facts {
+                    if let Some(id) = ast::binding(f, key) {
+                        if set.insert(id.to_string()) {
+                            facts.push(ast::fact_from_pairs(&[
+                                ("element", id),
+                                ("kind", kind),
+                                ("sourceFile", name),
+                            ]));
+                        }
+                    }
+                }
+            }
+        }
+        merged = ast::merge_states(&merged, &this);
+    }
+    ast::Object::Seq(facts.into())
+}
+
 /// Load population from SQLite, compile defs in memory.
 /// Compile takes ~500ms and produces the full D for SYSTEM calls.
 ///
@@ -879,6 +978,13 @@ pub fn main_entry() {
                     m.insert("Noun".to_string(), ast::fetch_cell_seq("Noun", &full));
                     ast::Object::map(m)
                 };
+                // task-951-b: build the source-file → ORM-element provenance
+                // map (a `Provenance` cell) by replaying this same fold with
+                // the same seed/context, capturing per-file element deltas.
+                // Built here, before the fold MOVES `noun_seed`, so the
+                // provenance fold sees the identical seed. Attached to `state`
+                // below for the NORMA exporter's per-file ORMDiagram tabs.
+                let provenance_cell = build_provenance_cell(&all_readings, &noun_seed);
                 let parsed_fresh = all_readings.iter().fold(
                     noun_seed,
                     |merged, (name, text)| {
@@ -1074,6 +1180,13 @@ pub fn main_entry() {
                 // emits cells for instance facts but never fires literal-
                 // iff rules, leaving consequent FT cells empty (#822 in
                 // apps/tasks).
+                // task-951-b: attach the source-file provenance cell so
+                // `compile_to_defs_state`'s NORMA generator can emit one
+                // ORMDiagram (a NORMA tab) per source file. Stored directly
+                // (not via the fold/merge) so it bypasses the schema-cell
+                // drop + tree-shake above — it's a fresh, whole-corpus map
+                // rebuilt every compile, never persisted population.
+                let state = ast::store("Provenance", provenance_cell, &state);
                 let compile_defs = crate::compile::compile_to_defs_state(&state);
                 let d = ast::defs_to_state(&compile_defs, &d);
 
@@ -1440,5 +1553,103 @@ mod stale_def_tests {
         assert!(!is_read_only_cli_key(""));
         assert!(!is_read_only_cli_key("sqlx"));
         assert!(!is_read_only_cli_key("query"));
+    }
+
+    /// task-951-b. `build_provenance_cell` is the foundational deliverable:
+    /// from the per-file readings fold it must produce a `Provenance` cell
+    /// attributing each ORM element (Noun / FactType / Constraint) to the
+    /// readings file that FIRST declared it. This is exactly the map the
+    /// NORMA exporter consumes to split the model into per-file diagram tabs.
+    #[test]
+    fn build_provenance_cell_attributes_each_element_to_its_source_file() {
+        // Two domains, each in its own "file": orders.md declares Order +
+        // a binary fact; customers.md declares Customer. The nouns/fact
+        // types each file introduces must be credited to THAT file.
+        let orders = "\
+            Order(.id) is an entity type.\n\
+            Customer(.id) is an entity type.\n\
+            \n\
+            ## Fact Types\n\
+            Order is placed by Customer.\n";
+        let customers = "\
+            Customer(.id) is an entity type.\n\
+            Region(.id) is an entity type.\n\
+            \n\
+            ## Fact Types\n\
+            Customer lives in Region.\n";
+        let all_readings: Vec<(&str, &str)> =
+            vec![("orders.md", orders), ("customers.md", customers)];
+
+        let cell = build_provenance_cell(&all_readings, &ast::Object::phi());
+        let facts = cell.as_seq().expect("Provenance is a Seq cell");
+        assert!(!facts.is_empty(), "provenance map must not be empty");
+
+        // Helper: the sourceFile attributed to (kind, element), if any.
+        let file_of = |kind: &str, element: &str| -> Option<String> {
+            facts.iter().find_map(|f| {
+                (ast::binding(f, "kind") == Some(kind)
+                    && ast::binding(f, "element") == Some(element))
+                    .then(|| ast::binding(f, "sourceFile").unwrap_or("").to_string())
+            })
+        };
+
+        // Order is declared only in orders.md.
+        assert_eq!(file_of("Noun", "Order").as_deref(), Some("orders.md"),
+            "Order must be attributed to orders.md; facts: {:?}", facts);
+        // Region is declared only in customers.md.
+        assert_eq!(file_of("Noun", "Region").as_deref(), Some("customers.md"),
+            "Region must be attributed to customers.md; facts: {:?}", facts);
+        // Customer is referenced in both but FIRST declared in orders.md —
+        // first-declarer wins (mirrors merge_states identity dedup).
+        assert_eq!(file_of("Noun", "Customer").as_deref(), Some("orders.md"),
+            "Customer (first-declared in orders.md) must be attributed there; \
+             facts: {:?}", facts);
+
+        // Each fact type is attributed to the file whose `## Fact Types`
+        // section introduced it. Look them up by reading→kind FactType.
+        let ft_files: std::collections::BTreeSet<String> = facts.iter()
+            .filter(|f| ast::binding(f, "kind") == Some("FactType"))
+            .filter_map(|f| ast::binding(f, "sourceFile").map(str::to_string))
+            .collect();
+        assert!(ft_files.contains("orders.md") && ft_files.contains("customers.md"),
+            "fact types from both files must be attributed; got {:?}", ft_files);
+
+        // No element is attributed to more than one file (first-declarer wins
+        // ⇒ exactly one provenance fact per (kind, element)).
+        let mut keys: Vec<(&str, &str)> = facts.iter()
+            .filter_map(|f| Some((ast::binding(f, "kind")?, ast::binding(f, "element")?)))
+            .collect();
+        let n = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(keys.len(), n, "each (kind, element) must appear exactly once");
+
+        // Non-empty seed regression (the whole-corpus noun catalog the real
+        // loader passes): nouns MUST still be attributed. A prior version
+        // pre-seeded `seen` from this catalog, which marked every noun
+        // already-seen and left ALL ObjectTypeShapes unattributed in the
+        // NORMA export. With the catalog as `seed`, Order/Region must still
+        // map to their files.
+        let catalog_corpus = format!("{}\n\n{}", orders, customers);
+        let catalog = parse_forml2::parse_to_state_from(&catalog_corpus, &ast::Object::phi())
+            .expect("catalog parse");
+        let mut m: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+        m.insert("Noun".to_string(), ast::fetch_cell_seq("Noun", &catalog));
+        let seed = ast::Object::map(m);
+        let cell2 = build_provenance_cell(&all_readings, &seed);
+        let facts2 = cell2.as_seq().expect("Provenance is a Seq cell");
+        let file_of2 = |kind: &str, element: &str| -> Option<String> {
+            facts2.iter().find_map(|f| {
+                (ast::binding(f, "kind") == Some(kind)
+                    && ast::binding(f, "element") == Some(element))
+                    .then(|| ast::binding(f, "sourceFile").unwrap_or("").to_string())
+            })
+        };
+        assert_eq!(file_of2("Noun", "Order").as_deref(), Some("orders.md"),
+            "with the whole-corpus catalog as seed, Order must STILL be \
+             attributed (no pre-seed suppression); facts: {:?}", facts2);
+        assert_eq!(file_of2("Noun", "Region").as_deref(), Some("customers.md"),
+            "with the catalog seed, Region must STILL be attributed; \
+             facts: {:?}", facts2);
     }
 }
