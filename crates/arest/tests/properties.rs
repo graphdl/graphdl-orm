@@ -2421,12 +2421,14 @@ fn antecedent_clause_has_shape_constraint_declared_in_core_md() {
         "deontic constraint should surface as 'It is obligatory …'; got {text:?}");
 }
 
-/// #316: the four implicit derivation kinds (subtype inheritance,
-/// CWA negation, SS auto-fill, transitivity) are now declared as
-/// derivation rules in readings/core.md. The parser's anaphora +
-/// metamodel-cell push is #317's job; this test only pins the
-/// readings, so a future drift (rename, section move) surfaces as a
-/// failure instead of quietly rotting.
+/// #316: the implicit derivation kinds (subtype inheritance,
+/// SS auto-fill, transitivity) are now declared as derivation rules
+/// in readings/core.md. The parser's anaphora + metamodel-cell push
+/// is #317's job; this test only pins the readings, so a future drift
+/// (rename, section move) surfaces as a failure instead of quietly
+/// rotting. (CWA negation was dropped: post-#287 CWA is lazy/
+/// evaluation-time in `prove_from_state` and the readings rule's
+/// `complement of Fact Type` consequent was unconsumed — negation-docs-truthup.)
 #[test]
 fn implicit_derivations_landed_as_rules_in_core_md() {
     let core_src = include_str!("../../../readings/core/core.md");
@@ -2443,8 +2445,6 @@ fn implicit_derivations_landed_as_rules_in_core_md() {
     let anchors = [
         ("subtype inheritance",
             "Resource is inherited instance of Noun iff"),
-        ("CWA negation",
-            "Resource is in complement of Fact Type iff"),
         ("SS auto-fill",
             "Fact is in consequent Fact Type iff some Subset Constraint has autofill"),
         ("transitivity",

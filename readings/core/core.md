@@ -405,15 +405,6 @@ is a subtype of `Noun2` and a Fact uses a Resource whose Noun is
 
 * Resource is inherited instance of Noun iff Resource is instance of some subtype of that Noun.
 
-### Closed-world negation (CWA)
-
-For every (Noun, Fact Type) pair where the Noun plays a Role of the
-Fact Type, the complement cell `_cwa_negation:<ft_id>` carries every
-Noun instance that does *not* participate via that Role. This is what
-deontic "no X has Y" constraints evaluate against.
-
-* Resource is in complement of Fact Type iff Resource is instance of some Noun and Noun plays some Role of Fact Type and no Fact uses Resource for that Role.
-
 ### Subset Constraint auto-fill (SS)
 
 Each declared Subset Constraint whose `autofill` span marker is true
