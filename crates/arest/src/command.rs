@@ -1478,8 +1478,25 @@ fn create_via_defs(
 
     // ── resolve: compound ref scheme decomposition ──────────────────
     // Paper Eq. 6: resolve determines identity from the reference scheme.
-    // For compound schemes (.Owner, .Seq), split entity_id on '-' (rsplitn)
-    // and push component facts: Thing_has_Owner, Thing_has_Seq.
+    // For compound schemes (.Owner, .Seq), push one component fact per
+    // reference role: Thing_has_Owner, Thing_has_Seq.
+    //
+    // apply-composite-ref-id-shear — the component VALUE must be the
+    // value the caller SUPPLIED as a field (the resolve block above
+    // already pushed those, keyed), exactly as single-role references
+    // resolve. Only roles the caller did NOT supply fall back to the
+    // surrogate-id decomposition (rsplit on '-'), so an id-only create
+    // (no explicit ref fields) still grounds identity from its id.
+    // Pre-fix this block ALWAYS id-split, so a supplied `Layer='SPD1-7'`
+    // got shadowed by the id-shear `Layer='LS-SPD1-7'` (entity_id split
+    // on its last hyphen). Compounding the defect, the FT id was built
+    // as `format!("{}_has_{}", noun, …)` WITHOUT underscoring spaces in
+    // `noun`, so for a multi-word noun (`Layer State`) the shear fact
+    // landed in a PHANTOM cell `Layer State_has_Layer` (space) — distinct
+    // from the canonical, UC-keyed `Layer_State_has_Layer` — which never
+    // collided with the supplied value and polluted the get/list 3NF
+    // projection. Both are fixed here: underscore the noun for the
+    // canonical id, and prefer the supplied field over the id-split.
     let resolved = {
         let noun_cell = ast::fetch_cell_seq("Noun", &resolved);
         let ref_scheme: Option<Vec<String>> = noun_cell.as_seq()
@@ -1496,8 +1513,21 @@ fn create_via_defs(
                 // If fewer splits than parts, pad with empty strings.
                 let components: Vec<&str> = splits.into_iter().rev().collect();
                 parts.iter().enumerate().fold(resolved.clone(), |acc, (i, part)| {
+                    // A reference role the caller SUPPLIED as a field was
+                    // already pushed (keyed) by the resolve block — do not
+                    // overwrite it with an id-derived substring. Match the
+                    // field name case-insensitively, mirroring how
+                    // `resolve:{noun}` keys fields (other-role-noun
+                    // lower-cased).
+                    let supplied = fields.keys()
+                        .any(|k| k.eq_ignore_ascii_case(part));
+                    if supplied {
+                        return acc;
+                    }
                     let value = components.get(i).unwrap_or(&"");
-                    let ft_id = format!("{}_has_{}", noun, part.replace(' ', "_"));
+                    let ft_id = format!("{}_has_{}",
+                        noun.replace(' ', "_"),
+                        part.replace(' ', "_"));
                     let fact = ast::fact_from_pairs(&[(noun, &entity_id), (part, value)]);
                     push_with_uc_check(acc, &ft_id, fact, &key_roles, /*overwrite=*/false, &mut uc_violations)
                 })
@@ -9925,6 +9955,126 @@ Task blocks Task is asymmetric.
         assert!(!has_xx,
             "blocked-status-sm-1: the self-loop tuple must NOT have landed; \
              ring={:?}", ring3);
+    }
+
+    /// apply-composite-ref-id-shear fixture: a noun with a COMPOSITE
+    /// reference scheme over two value-type roles (Layer, Timestamp).
+    /// Mirrors the live SPD-1 `Layer State(.Layer, .Timestamp)` shape.
+    const COMPOSITE_REF_READINGS: &str = r#"
+# apply-composite-ref-id-shear fixture
+
+## Entity Types
+
+Layer State(.Layer, .Timestamp) is an entity type.
+
+## Value Types
+
+Layer is a value type.
+Timestamp is a value type.
+"#;
+
+    /// apply-composite-ref-id-shear — REGRESSION GUARD.
+    ///
+    /// Creating a composite-reference-scheme entity with a HYPHENATED
+    /// surrogate id (`LS-SPD1-7-s1`) AND explicit reference-role field
+    /// values (`Layer='SPD1-7'`, `Timestamp='2026-05-31T22:00'`) must
+    /// store/project the SUPPLIED field values for the reference roles —
+    /// NOT values SHEARED from the surrogate id by splitting it on its
+    /// hyphens.
+    ///
+    /// Pre-fix bug: `create_via_defs`'s compound-ref decomposition block
+    /// `entity_id.rsplitn(n, '-')` derives `Layer='LS-SPD1-7'`,
+    /// `Timestamp='s1'` from the id string and pushes those, so a later
+    /// `get` returns `Layer='LS-SPD1-7'` instead of the supplied
+    /// `'SPD1-7'`.
+    ///
+    /// Asserts BOTH the stored cell (`Layer_State_has_Layer`) AND the
+    /// projected `get` row carry the SUPPLIED value, so the test pins
+    /// down storage-vs-projection unambiguously.
+    #[test]
+    fn create_composite_ref_uses_supplied_fields_not_id_shear() {
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(COMPOSITE_REF_READINGS)
+            .expect("composite-ref readings must parse");
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        // The hyphenated surrogate id and the supplied reference-role
+        // fields. The id split on its last hyphen yields 'LS-SPD1-7'
+        // (the shear value); the supplied Layer is 'SPD1-7'. They MUST
+        // differ so a pass cannot be an accident of id == field.
+        let entity_id = "LS-SPD1-7-s1";
+        let supplied_layer = "SPD1-7";
+        let supplied_timestamp = "2026-05-31T22:00";
+
+        let create_cmd = Command::CreateEntity {
+            noun: "Layer State".to_string(),
+            domain: "".to_string(),
+            id: Some(entity_id.to_string()),
+            fields: {
+                let mut f = HashMap::new();
+                f.insert("Layer".to_string(), supplied_layer.to_string());
+                f.insert("Timestamp".to_string(), supplied_timestamp.to_string());
+                f
+            },
+            sender: None,
+            signature: None,
+        };
+        let result = apply_command_defs(&def_obj, &create_cmd, &state);
+        assert!(!result.rejected,
+            "create of composite-ref entity must not reject; violations={:?}",
+            result.violations);
+
+        let post = ast::merge_delta(&state, &result.state, None);
+
+        // ── STORAGE check ── No BASE cell may carry the id-sheared Layer
+        //    value 'LS-SPD1-7' for this subject. Pre-fix the compound-ref
+        //    decomposition pushed it (a) under the SUPPLIED-shadowing
+        //    canonical cell when names lined up, and (b) — for this
+        //    multi-word noun — under a PHANTOM cell `Layer State_has_Layer`
+        //    (a space in the noun, vs. the canonical underscored
+        //    `Layer_State_has_Layer`). Scan EVERY base cell so the phantom
+        //    cell can't hide the shear from a single-cell assertion.
+        let shear_value = "LS-SPD1-7"; // entity_id rsplit once on '-'
+        let mut layer_bindings_for_subject: Vec<(String, String)> = Vec::new();
+        for (cell_name, contents) in ast::cells_iter(&post) {
+            if cell_name.contains(':') { continue; }
+            for f in ast::cell_facts_iter(contents) {
+                if ast::binding(f, "Layer State") != Some(entity_id) { continue; }
+                if let Some(layer) = ast::binding(f, "Layer") {
+                    layer_bindings_for_subject.push((cell_name.to_string(), layer.to_string()));
+                }
+            }
+        }
+        assert!(!layer_bindings_for_subject.iter().any(|(_, v)| v == shear_value),
+            "STORAGE: no base cell may carry the id-sheared Layer '{}' for \
+             subject '{}' (surrogate id split on its last hyphen); the \
+             compound-ref path must use the SUPPLIED field, not an id-split. \
+             Layer bindings found = {:?}",
+            shear_value, entity_id, layer_bindings_for_subject);
+        assert!(layer_bindings_for_subject.iter().any(|(_, v)| v == supplied_layer),
+            "STORAGE: the SUPPLIED Layer '{}' must be stored for subject '{}'; \
+             Layer bindings found = {:?}",
+            supplied_layer, entity_id, layer_bindings_for_subject);
+        // No phantom space-in-noun cell may exist at all.
+        assert!(ast::cells_iter(&post).iter().all(|(n, _)| *n != "Layer State_has_Layer"),
+            "STORAGE: the phantom space-named cell 'Layer State_has_Layer' must \
+             not be created (canonical id underscores the noun); cells = {:?}",
+            ast::cells_iter(&post).iter().map(|(n, _)| n.to_string()).collect::<Vec<_>>());
+
+        // ── PROJECTION check: `get` must round-trip the SUPPLIED value.
+        let get_cmd = Command::GetEntity {
+            noun: "Layer State".to_string(),
+            entity_id: entity_id.to_string(),
+            sender: None,
+        };
+        let got = apply_command_defs(&def_obj, &get_cmd, &post);
+        assert_eq!(got.entities.len(), 1,
+            "get must return exactly the created entity; got {:?}", got.entities);
+        let projected_layer = got.entities[0].data.get("Layer").map(String::as_str);
+        assert_eq!(projected_layer, Some(supplied_layer),
+            "PROJECTION: get must return the SUPPLIED Layer '{}', not the \
+             id-sheared value; row data = {:?}",
+            supplied_layer, got.entities[0].data);
     }
 
     // ── task-crudl-deploy-readpath tests ─────────────────────────────
