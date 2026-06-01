@@ -242,8 +242,13 @@ thread_local! {
 /// Record the `rule` (Def name) at a frame that just bottomed out.
 /// No-op unless tracing is armed (the hot default). First writer wins —
 /// the innermost Def that bottomed names the rule.
+///
+/// `pub(crate)` so the forward-chain LFP loop (`evaluate`) can name the
+/// rule it was churning on when it aborts a non-terminating fixpoint
+/// (cli-apply-large-tasksdb-nonterminating) — the same ⊥-origin channel
+/// that `apply`'s `Def` frames feed.
 #[cfg(not(feature = "no_std"))]
-fn note_bottom_rule(name: &str) {
+pub(crate) fn note_bottom_rule(name: &str) {
     if !BOTTOM_TRACE_ARMED.with(|c| c.get()) {
         return;
     }
@@ -258,8 +263,12 @@ fn note_bottom_rule(name: &str) {
 /// Record the `cell` and the frame `binding` at the `Fetch`/`Store`
 /// frame where ⊥ first arose. No-op unless armed. First writer wins, so
 /// the DEEPEST (origin) cell access is the one named.
+///
+/// `pub(crate)` for the forward-chain abort path (see `note_bottom_rule`):
+/// the loop names the consequent cell whose rule was still firing when
+/// the chain's time budget ran out.
 #[cfg(not(feature = "no_std"))]
-fn note_bottom_cell(cell: &str, binding: &Object) {
+pub(crate) fn note_bottom_cell(cell: &str, binding: &Object) {
     if !BOTTOM_TRACE_ARMED.with(|c| c.get()) {
         return;
     }
@@ -277,9 +286,9 @@ fn note_bottom_cell(cell: &str, binding: &Object) {
 /// No_std shims: tracing is host-only, so under `no_std` the recording
 /// hooks compile to nothing (the kernel never renders ⊥ to a user).
 #[cfg(feature = "no_std")]
-fn note_bottom_rule(_name: &str) {}
+pub(crate) fn note_bottom_rule(_name: &str) {}
 #[cfg(feature = "no_std")]
-fn note_bottom_cell(_cell: &str, _binding: &Object) {}
+pub(crate) fn note_bottom_cell(_cell: &str, _binding: &Object) {}
 
 /// Evaluate `f` with ⊥-tracing armed, returning the result alongside the
 /// captured `BottomTrace` (`None` when nothing carried context). Arms the
@@ -3756,6 +3765,25 @@ fn ingest_population_into(d: &Object, population_json: &str) -> Object {
     state
 }
 
+/// Encode a `CommandResult`, but collapse to ⊥ when the command's
+/// forward-chain aborted on its time budget (a non-terminating
+/// derivation cycle — cli-apply-large-tasksdb-nonterminating). The chain
+/// already armed a ⊥-trace naming the offending rule/cell at the abort
+/// point; returning `Object::Bottom` here lets the dispatcher's
+/// `with_bottom_trace` boundary render that origin instead of persisting
+/// a half-derived partial state. `take_chain_abort` read-and-clears the
+/// thread-local so the flag never leaks past this command.
+///
+/// On the success path `take_chain_abort()` is `false` and this is just
+/// `encode_command_result` — no behavior or cost change.
+#[cfg(not(feature = "no_std"))]
+fn encode_command_result_or_bottom(result: &crate::command::CommandResult) -> Object {
+    if crate::evaluate::take_chain_abort() {
+        return Object::Bottom;
+    }
+    crate::command::encode_command_result(result)
+}
+
 /// Platform primitive: create entity from fact pairs (AREST Eq. 6).
 /// Key: "create:{noun}". Input: <<field, value>, ...> or <<id, val>, <field, val>, ...>.
 /// Returns the result as an Object containing the new state.
@@ -3771,7 +3799,7 @@ fn platform_create(noun: &str, x: &Object, d: &Object) -> Object {
         signature: None,
     };
     let result = crate::command::apply_command_defs(d, &command, d);
-    crate::command::encode_command_result(&result)
+    encode_command_result_or_bottom(&result)
 }
 
 /// Platform primitive: update entity from fact pairs.
@@ -3800,7 +3828,7 @@ fn platform_update(noun: &str, x: &Object, d: &Object) -> Object {
         force,
     };
     let result = crate::command::apply_command_defs(d, &command, d);
-    crate::command::encode_command_result(&result)
+    encode_command_result_or_bottom(&result)
 }
 
 /// Platform primitive: transition entity state machine.
@@ -3828,7 +3856,7 @@ fn platform_transition(_noun: &str, x: &Object, d: &Object) -> Object {
         signature: None,
     };
     let result = crate::command::apply_command_defs(d, &command, d);
-    crate::command::encode_command_result(&result)
+    encode_command_result_or_bottom(&result)
 }
 
 /// Extract (optional id, field map) from an Object of fact pairs.

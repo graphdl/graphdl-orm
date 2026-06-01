@@ -23,6 +23,186 @@ use alloc::{string::{String, ToString}, vec::Vec, boxed::Box, borrow::ToOwned};
 // Safety: the iteration bound prevents pathological rule sets from
 // producing unbounded intermediate populations. If the bound is hit,
 // the engine stops and returns what it has -- a partial fixed point.
+//
+// ── Non-termination guard (cli-apply-large-tasksdb-nonterminating) ───
+//
+// The round cap alone is NOT a wall-clock guard: a chain that fails to
+// converge (e.g. the alethic-UC re-fire pathology — a rule re-derives a
+// keyed fact whose stored value conflicts, `cell_put_keyed` drops it,
+// dedup never recognizes the dropped key, so the rule re-fires every
+// round) churns all `max_rounds` rounds, each doing the FULL
+// O(rules × population) apply pass. On the ~870-entity tasks.db that is
+// ~24 s/round × 100 rounds ≈ 40 minutes — observed: a `create:Task`
+// burned 8800+ CPU-s and never returned.
+//
+// The guard is a WALL-CLOCK deadline checked at each round boundary: a
+// chain gets a generous budget (`CHAIN_BUDGET`, default 3 min); once a
+// round boundary is crossed past the deadline the LFP is declared non-
+// terminating, the loop arms a ⊥-trace naming the rule/cell it was
+// churning on (`ast::note_bottom_*`), raises an out-of-band abort flag,
+// and returns the partial state. A healthy create converges in a handful
+// of rounds (seconds), never approaching the deadline, so the success
+// path is byte-for-byte unchanged — the only added cost is one
+// `Instant::now()` compare per ROUND (not per apply).
+//
+// WHY NOT the `apply` reduction counter (`ast::with_fuel`): setting a
+// non-`u64::MAX` budget makes `ast::fuel_is_bounded()` true, which forces
+// the parallel branches of α / Construction / Filter in `apply` onto the
+// SERIAL path (Rayon workers would escape a thread-local bound). Serial
+// recursion over the ~870-fact population blows the main-thread stack
+// (silent exit 255). The chain must stay parallel; a boundary-checked
+// wall-clock deadline bounds the runaway WITHOUT touching `apply`'s
+// recursion or its parallel/serial decision.
+
+/// Wall-clock budget a single forward-chain LFP run may spend before it
+/// is declared non-terminating and aborted with a traced ⊥.
+///
+/// Tuning (empirical, debug build, live tasks.db: ~870 Task entities, 69
+/// derivation rules — instrument with `AREST_CHAIN_FUEL_TRACE=1`): ONE
+/// full-width round over that population is ~24 s; a HEALTHY create
+/// converges in a handful of rounds whose active-rule set SHRINKS after
+/// the first (well under a minute). The RUNAWAY (alethic-UC re-fire)
+/// instead SUSTAINS/GROWS the active set every round (measured: 52 → 65 →
+/// … active) and would run all 100 rounds ≈ 40 min.
+///
+/// 3 minutes sits several × above the largest healthy multi-round create
+/// seen, so real apps finish comfortably under it even on a slow box,
+/// while the pathological chain trips the guard at ~3 min (vs the 40-min
+/// open-ended hang) and returns a traced ⊥ naming the churning rule.
+/// Raise it if a legitimate very-large app is ever observed to trip the
+/// guard — the traced ⊥ names the rule, making that a one-line diagnosis.
+///
+/// Only meaningful where `time_shim::Instant` is the real monotonic
+/// `std::time::Instant` (native host). On wasm32 / `no_std` the shim is a
+/// zero-sentinel with no clock, so the deadline guard compiles to a
+/// no-op there (those targets run small populations and never render ⊥).
+#[cfg(all(feature = "std-deps", not(target_arch = "wasm32"), not(feature = "no_std")))]
+pub(crate) const CHAIN_BUDGET: core::time::Duration = core::time::Duration::from_secs(180);
+
+#[cfg(not(feature = "no_std"))]
+thread_local! {
+    /// Set by a chain loop when it aborts on the deadline; read-and-
+    /// cleared by `take_chain_abort`. Out-of-band so the chain functions
+    /// keep their `(Object, Vec<DerivedFact>)` contract unchanged — the
+    /// ~80 call sites (incl. tests, induce, rebuild, grammar expansion)
+    /// see the partial state exactly as before; only the user-facing
+    /// write paths (`create`/`update`/`transition`) consult the flag and
+    /// translate it into a ⊥ for the dispatcher to render with the trace.
+    static CHAIN_ABORT: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+    /// Per-thread budget OVERRIDE. `None` ⇒ use `CHAIN_BUDGET`. Tests set
+    /// `Some(Duration::ZERO)` via `with_chain_budget` to force a
+    /// deterministic abort at the first round boundary without a real
+    /// long-running chain; production never sets it.
+    static CHAIN_BUDGET_OVERRIDE: core::cell::Cell<Option<core::time::Duration>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// Run `f` with the chain non-termination budget overridden to `budget`
+/// (restored on return). Used by the regression tests to force the
+/// deadline guard at the first round boundary deterministically — a
+/// `Duration::ZERO` budget means "every round boundary is already past
+/// the deadline". Production code never calls this; the default
+/// `CHAIN_BUDGET` applies.
+#[cfg(not(feature = "no_std"))]
+#[allow(dead_code)] // test-only override (used by the guard regression tests)
+pub(crate) fn with_chain_budget<T, F: FnOnce() -> T>(budget: core::time::Duration, f: F) -> T {
+    struct Restore(Option<core::time::Duration>);
+    impl Drop for Restore {
+        fn drop(&mut self) { CHAIN_BUDGET_OVERRIDE.with(|c| c.set(self.0)); }
+    }
+    let _g = CHAIN_BUDGET_OVERRIDE.with(|c| Restore(c.replace(Some(budget))));
+    f()
+}
+
+// ── Deadline helpers — two arms ──────────────────────────────────────
+// REAL arm (native host with a monotonic clock): compute and compare a
+// `std::time::Instant` deadline. NO-OP arm (wasm32 / no_std, where
+// `time_shim::Instant` is a clockless zero-sentinel with no `+`/`>=`):
+// the deadline never trips, so the guard is inert — correct for those
+// targets, which run small populations and never surface ⊥ to a user.
+
+/// The deadline a chain starting now must finish by: `now + budget`,
+/// where `budget` is the test override if set, else `CHAIN_BUDGET`.
+#[cfg(all(feature = "std-deps", not(target_arch = "wasm32"), not(feature = "no_std")))]
+fn chain_deadline() -> crate::time_shim::Instant {
+    let budget = CHAIN_BUDGET_OVERRIDE.with(|c| c.get())
+        .unwrap_or(CHAIN_BUDGET);
+    crate::time_shim::Instant::now() + budget
+}
+#[cfg(not(all(feature = "std-deps", not(target_arch = "wasm32"), not(feature = "no_std"))))]
+fn chain_deadline() -> crate::time_shim::Instant { crate::time_shim::Instant::now() }
+
+/// True once the wall-clock deadline has passed. Checked at round
+/// boundaries only — one `Instant::now()` per round, never per apply.
+#[cfg(all(feature = "std-deps", not(target_arch = "wasm32"), not(feature = "no_std")))]
+#[inline]
+fn chain_deadline_exceeded(deadline: crate::time_shim::Instant) -> bool {
+    crate::time_shim::Instant::now() >= deadline
+}
+#[cfg(not(all(feature = "std-deps", not(target_arch = "wasm32"), not(feature = "no_std"))))]
+#[inline]
+fn chain_deadline_exceeded(_deadline: crate::time_shim::Instant) -> bool { false }
+
+/// Raise the out-of-band "the last chain aborted on the deadline" flag.
+/// Paired with `take_chain_abort`. Host-only (the trace surface is
+/// host-only); under `no_std` the kernel never renders ⊥ to a user.
+#[cfg(not(feature = "no_std"))]
+fn note_chain_abort() { CHAIN_ABORT.with(|c| c.set(true)); }
+#[cfg(feature = "no_std")]
+fn note_chain_abort() {}
+
+/// Read and clear the chain-abort flag. A user-facing write path calls
+/// this immediately after running the chain: `true` means the LFP did
+/// not converge within `CHAIN_BUDGET` and the partial state must be
+/// rejected (the armed ⊥-trace, set at the same abort point, names the
+/// offending rule/cell). Auto-clearing keeps the flag from leaking into
+/// a later, unrelated chain on the same thread.
+#[cfg(not(feature = "no_std"))]
+pub(crate) fn take_chain_abort() -> bool { CHAIN_ABORT.with(|c| c.replace(false)) }
+#[cfg(feature = "no_std")]
+pub(crate) fn take_chain_abort() -> bool { false }
+
+/// Host-only, env-gated (`AREST_CHAIN_FUEL_TRACE`) per-round progress
+/// line: round index + active-rule count + elapsed time. Mirrors the
+/// `AREST_STAGE12_TRACE` knob (default-off path is a single
+/// `std::env::var` miss). Shows the spend RATE so "healthy" (few rounds,
+/// converges) is distinguishable from "runaway" (active set never
+/// shrinks, wall-clock climbs toward the deadline) — and is the data
+/// used to tune `CHAIN_BUDGET`.
+#[allow(unused_variables)]
+#[inline]
+fn chain_round_trace(tag: &str, round: usize, active: usize, started: crate::time_shim::Instant) {
+    #[cfg(not(feature = "no_std"))]
+    if std::env::var("AREST_CHAIN_FUEL_TRACE").is_ok() {
+        crate::diag!("[forward-chain] [{}] round {} entry: {} active, {:?} elapsed",
+            tag, round, active, started.elapsed());
+    }
+}
+
+/// Arm the ⊥-trace + abort flag + a loud diagnostic when a chain loop
+/// gives up on the deadline. `culprit` is the rule still firing in the
+/// round that overran (its consequent cell, if known, names the cell).
+/// The ⊥-trace recording is a no-op unless a caller armed it via
+/// `ast::with_bottom_trace` (the CLI dispatcher does); the diag and the
+/// abort flag fire unconditionally so the failure is never silent.
+#[allow(unused_variables)]
+fn abort_chain_nonterminating(round: usize, culprit: Option<(&str, &str)>) {
+    let (rule, cell) = culprit.unwrap_or(("<forward-chain>", ""));
+    ast::note_bottom_rule(rule);
+    if !cell.is_empty() {
+        ast::note_bottom_cell(cell, &ast::Object::atom("forward-chain LFP"));
+    }
+    note_chain_abort();
+    crate::diag!(
+        "[forward-chain] ABORT: LFP did not converge within its time \
+         budget after {} rounds — likely a non-terminating derivation \
+         cycle (e.g. alethic-UC re-fire). Churning rule `{}`{}. \
+         Returning partial state and a traced ⊥.",
+        round, rule,
+        if cell.is_empty() { alloc::string::String::new() }
+        else { alloc::format!(" over cell `{}`", cell) },
+    );
+}
 
 /// Forward-chain derivation rules to a fixed point.
 ///
@@ -400,7 +580,31 @@ fn semi_naive_inner(
     // gating from round 1 pass `Some(seed)` here via the
     // `forward_chain_defs_state_seeded` entry point.
     let mut dirty_cells: Option<HashSet<String>> = initial_dirty;
+    // Non-termination guard: a wall-clock deadline checked at each round
+    // boundary (see the guard note above `forward_chain_defs_state`). A
+    // chain that fails to converge stops at the next round boundary past
+    // the deadline instead of grinding through all `max_rounds`. The
+    // check is one `Instant::now()` per ROUND — zero per-apply cost, and
+    // it leaves `apply`'s parallel α/Construction path intact (the fuel
+    // counter could not: a bounded fuel budget forces serial recursion,
+    // which overflows the stack on a large population).
+    let deadline = chain_deadline();
+    let started = crate::time_shim::Instant::now();
     for round in 0..max_rounds {
+        // Deadline checked BEFORE another full O(rules × population) pass:
+        // once it is past, the LFP is declared non-terminating, the
+        // partial state is returned, and a traced ⊥ is armed naming the
+        // rule still firing.
+        if chain_deadline_exceeded(deadline) {
+            let culprit = derivation_defs.iter()
+                .find(|(_, _, cells)| match (&dirty_cells, cells) {
+                    (None, _) | (Some(_), None) => true,
+                    (Some(dirty), Some(reads)) => reads.iter().any(|c| dirty.contains(c)),
+                })
+                .map(|(n, _, _)| *n);
+            abort_chain_nonterminating(round, culprit.map(|n| (n, "")));
+            break;
+        }
         let active: Vec<(&str, &ast::Func)> = derivation_defs.iter()
             .filter(|(_, _, cells)| match (&dirty_cells, cells) {
                 (None, _) => true,                       // first round or filtering off
@@ -415,6 +619,7 @@ fn semi_naive_inner(
                 round, active.len(), derivation_defs.len());
         }
         record_chain_eval_count(active.len());
+        chain_round_trace("sn", round, active.len(), started);
         if let Some(ref mut acc) = activated_rules {
             for (name, _) in &active {
                 acc.insert((*name).to_string());
@@ -504,7 +709,25 @@ pub fn forward_chain_defs_state_bounded(
     // `compile_to_defs_state`); fact-type cells absent from the map
     // keep the legacy Seq-append path.
     let key_roles = read_cell_key_roles(d);
-    for _ in 0..max_rounds {
+    // Cell written by the most recent round — names the consequent in the
+    // traced ⊥ if the chain has to be aborted (the naive chainer has no
+    // per-rule antecedent metadata, so the last-written cell is the best
+    // available culprit). The rule slot falls back to the first def.
+    let mut last_round_cell: Option<String> = None;
+    // Wall-clock non-termination guard — see the note above
+    // `forward_chain_defs_state`. Same rationale and success-path cost
+    // (one `Instant::now()` per round) as `semi_naive_inner`; leaves the
+    // parallel apply path intact.
+    let deadline = chain_deadline();
+    let started = crate::time_shim::Instant::now();
+    for round in 0..max_rounds {
+        if chain_deadline_exceeded(deadline) {
+            let rule = derivation_defs.first().map(|(n, _)| *n).unwrap_or("<forward-chain>");
+            abort_chain_nonterminating(
+                round, Some((rule, last_round_cell.as_deref().unwrap_or(""))));
+            break;
+        }
+        chain_round_trace("naive", round, derivation_defs.len(), started);
         let new_facts = derive_one_round(derivation_defs, &current_state, &all_derived, d);
         if new_facts.is_empty() { break; }
         use hashbrown::HashMap;
@@ -516,6 +739,7 @@ pub fn forward_chain_defs_state_bounded(
             by_cell.entry(fact.fact_type_id.clone()).or_default()
                 .push(ast::fact_from_pairs(&pairs));
         }
+        last_round_cell = by_cell.keys().next().cloned();
         current_state = integrate_round_facts(current_state, by_cell, &key_roles);
         all_derived.extend(new_facts);
     }
@@ -1140,6 +1364,149 @@ mod tests {
              unknown-reads rule still fires (count=1). Got {}.",
             get_chain_eval_count(),
         );
+    }
+
+    // ── Forward-chain non-termination guard (cli-apply-large-tasksdb-
+    //    nonterminating) ──────────────────────────────────────────────
+    //
+    // Regression for the ~10 MB / ~870-entity tasks.db `create:Task` that
+    // ran 40+ min and never returned: a derivation rule re-fired every
+    // round (alethic-UC re-fire — `cell_put_keyed` drops a conflicting
+    // re-derivation whose key the dedup never recognizes), so the LFP
+    // churned all 100 rounds, each doing the full O(rules × population)
+    // pass. The guard puts a WALL-CLOCK deadline on the whole chain,
+    // checked at each round boundary; once it is past, the loop aborts
+    // with a traced ⊥ naming the churning rule — turning the hang into a
+    // fast, legible failure WITHOUT touching `apply`'s parallel recursion
+    // (a fuel/reduction bound would force serial α and overflow the
+    // stack). These tests pin: (1) a chain whose deadline has passed
+    // aborts with the ⊥-trace + abort flag set, on BOTH the naive and
+    // semi-naive loops; (2) a normal chain under the full budget converges
+    // with the guard completely dormant (no abort, identical derived
+    // facts) — the success path is untouched.
+    //
+    // The deadline is forced via `with_chain_budget(Duration::ZERO, …)`:
+    // a zero budget means "every round boundary is already past the
+    // deadline", reproducing "exceeded the bound" deterministically and
+    // instantly — no real long-running chain in a unit test.
+
+    /// A real, two-round-converging derivation rule + a population it
+    /// fires over. `big_city ⊣ city_has_population` (no filter): every
+    /// City row yields a Big City row, then round 2 dedups and the chain
+    /// settles. Reused by the guard tests.
+    fn chain_guard_fixture() -> (Vec<(String, ast::Func)>, ast::Object) {
+        let cells = city_population_cells(None);
+        let (_meta, defs, _def_map) = compile_cells(cells);
+        let mut pop = ast::Object::phi();
+        for i in 0..24 {
+            let city = alloc::format!("City{:02}", i);
+            pop = ast::cell_push(
+                "city_has_population",
+                ast::fact_from_pairs(&[("City", city.as_str()), ("Population", "1500000")]),
+                &pop,
+            );
+        }
+        (defs, pop)
+    }
+
+    #[test]
+    fn naive_chain_aborts_with_traced_bottom_when_deadline_exceeded() {
+        let (defs, pop) = chain_guard_fixture();
+        let dd = derivation_defs_from(&defs);
+        assert!(!dd.is_empty(), "fixture must compile at least one derivation rule");
+
+        // Run the NAIVE loop (forward_chain_defs_state → _bounded) with a
+        // ZERO time budget — the first round boundary is already past the
+        // deadline — and ⊥-tracing armed. The chain must abort, not spin.
+        let _ = take_chain_abort(); // clear any stray flag first.
+        let ((_state, _derived), trace) = ast::with_bottom_trace(|| {
+            with_chain_budget(core::time::Duration::ZERO,
+                || forward_chain_defs_state(&dd, &pop))
+        });
+
+        assert!(take_chain_abort(),
+            "naive chain past its deadline must raise the abort flag");
+        let trace = trace.expect(
+            "an armed ⊥-trace must be populated when the chain aborts");
+        let rule = trace.rule.as_deref().unwrap_or("");
+        assert!(rule.starts_with("derivation:"),
+            "the ⊥-trace must name the derivation rule the chain was churning on; \
+             got rule={:?} (full trace: {:?})", rule, trace);
+        // `describe()` must render a non-empty ⊥-origin string for the user.
+        assert!(trace.describe().map_or(false, |s| s.starts_with("⊥ origin:")),
+            "trace.describe() must produce a ⊥-origin line; got {:?}", trace.describe());
+    }
+
+    #[test]
+    fn semi_naive_chain_aborts_with_traced_bottom_when_deadline_exceeded() {
+        let (defs, pop) = chain_guard_fixture();
+        // Seeded entry point → semi_naive_inner (the path `create:Task`
+        // takes). Seed the antecedent cell so round 1 activates the rule.
+        let packed: Vec<(&str, &ast::Func, Option<&[String]>)> = defs.iter()
+            .filter(|(n, _)| n.starts_with("derivation:"))
+            .map(|(n, f)| (n.as_str(), f, None))
+            .collect();
+        assert!(!packed.is_empty(), "fixture must compile a derivation rule");
+        let mut seed = HashSet::new();
+        seed.insert("city_has_population".to_string());
+
+        let _ = take_chain_abort();
+        let ((_state, _derived), trace) = ast::with_bottom_trace(|| {
+            with_chain_budget(core::time::Duration::ZERO, || {
+                forward_chain_defs_state_seeded(&packed, seed.clone(), &pop, 100)
+            })
+        });
+
+        assert!(take_chain_abort(),
+            "semi-naive chain past its deadline must raise the abort flag");
+        let trace = trace.expect("armed ⊥-trace must be set on semi-naive abort");
+        assert!(trace.rule.as_deref().unwrap_or("").starts_with("derivation:"),
+            "semi-naive ⊥-trace must name the churning derivation rule; got {:?}", trace);
+    }
+
+    #[test]
+    fn healthy_chain_under_full_budget_does_not_trip_guard() {
+        let (defs, pop) = chain_guard_fixture();
+        let dd = derivation_defs_from(&defs);
+
+        // No `with_chain_budget`: the chain runs under the full 3-minute
+        // CHAIN_BUDGET. A 24-City population converges in two rounds in
+        // microseconds — the guard must stay completely dormant.
+        // (We assert on the ABORT FLAG, not the ⊥-trace: `apply` may arm
+        // the trace for an intermediate ⊥ that the chain legitimately
+        // absorbs — the trace is contractually meaningful only when the
+        // TOP-level result is ⊥, which a successful chain's is not. The
+        // abort flag is the definitive "did the guard fire" signal.)
+        let _ = take_chain_abort();
+        let (_state, derived) = forward_chain_defs_state(&dd, &pop);
+
+        assert!(!take_chain_abort(),
+            "a normal, converging chain must NOT raise the abort flag — \
+             the guard is a non-termination safety net, not a normal-path gate");
+        // And the rule actually fired: every City became a Big City.
+        let big = derived.iter().filter(|d| d.fact_type_id == "big_city").count();
+        assert_eq!(big, 24,
+            "healthy chain must derive one Big City per City (24); got {}", big);
+    }
+
+    #[test]
+    fn chain_abort_flag_auto_clears_between_runs() {
+        // The abort flag must not leak from an aborted chain into a later,
+        // unrelated one on the same thread: `take_chain_abort` read-and-
+        // clears, and a fresh healthy chain never re-sets it.
+        let (defs, pop) = chain_guard_fixture();
+        let dd = derivation_defs_from(&defs);
+
+        let _ = take_chain_abort();
+        let _ = with_chain_budget(core::time::Duration::ZERO,
+            || forward_chain_defs_state(&dd, &pop));
+        assert!(take_chain_abort(), "first (deadline-exceeded) run must set the flag");
+        // Second read with no chain in between: already cleared.
+        assert!(!take_chain_abort(), "take_chain_abort must clear the flag");
+        // A healthy run afterwards leaves it clear.
+        let _ = forward_chain_defs_state(&dd, &pop);
+        assert!(!take_chain_abort(),
+            "a healthy run after an aborted one must NOT carry the stale flag");
     }
 
     // Test-only SM fixture. The production SM compile path is fully

@@ -1135,6 +1135,18 @@ pub fn main_entry() {
                         .map(|(name, func)| (name.as_str(), func)).collect();
                     let (new_d, derived) =
                         crate::evaluate::forward_chain_defs_state(&pos_refs, &d);
+                    // cli-apply-large-tasksdb-nonterminating: consume the
+                    // chain-abort flag so it can't leak past this compile.
+                    // The chain already logged a traced ⊥ naming the
+                    // churning rule/cell; surface a clear compile-time
+                    // note too. Partial state is persisted (the chain's
+                    // pre-existing cap-hit behavior) rather than hanging.
+                    if crate::evaluate::take_chain_abort() {
+                        eprintln!("[load] WARNING: forward-chain did NOT converge \
+                            (aborted on its time budget — see the ⊥ trace above); \
+                            persisting a PARTIAL fixpoint. A derivation rule is \
+                            likely non-terminating (e.g. alethic-UC re-fire).");
+                    }
                     eprintln!("[load] forward-chain fixpoint: {} rules, {} facts derived",
                         stratum1.len(), derived.len());
                     new_d
