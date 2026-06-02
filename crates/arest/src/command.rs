@@ -2863,6 +2863,69 @@ fn transition_via_defs(
                 .collect()
         };
         let stratum1 = collect_stratum("derivation");
+
+        // seeded-transition-chain (p2): make the post-transition chain
+        // SEEDED/scoped, mirroring update_via_defs (L3349+) and
+        // create_via_defs instead of running the FULL `forward_chain_
+        // defs_state` over the whole population on every fire. A
+        // standalone transition — and, critically, EACH fire inside
+        // `reconcile_derived_transitions` (which calls us per affected
+        // entity) — paid a full O(rules × population) chain; on the
+        // live ~800-task tasks.db that is multi-second, and the reconcile
+        // multiplies it. The seeded chainer only ACTIVATES a rule when
+        // its declared antecedent reads intersect the dirty set (seed +
+        // cells emitted in prior rounds); rules whose inputs did not
+        // change are a ~zero-cost skip. Output is unchanged: an active
+        // rule still applies against the FULL `current_state` (the gate
+        // only decides WHICH rules run, never what they read), and the
+        // next-dirty propagation reaches the same least fixed point —
+        // including cross-noun cascades (e.g. flipping a blocker's status
+        // re-derives `Task_has_Task_Status`, which feeds the rule that
+        // re-derives `Task_is_blocked` of a DIFFERENT task that the
+        // reconcile then reads). See `seeded_transition_chain_*` guards.
+        //
+        // SEED = exactly the cells this fn mutated above:
+        //   * the SM cell `State_Machine_is_currently_in_Status`,
+        //   * the resource projection `Resource_is_currently_in_Status`,
+        //   * the trigger FT cell (`<event>` → underscores) when the
+        //     event names a declared Fact-Type trigger (the only case in
+        //     which the trigger cell write above ran).
+        // plus `drop_writer_reads` — the antecedent reads of every rule
+        // whose consequent cell the #836 wipe below cleared, so those
+        // rules re-fire and repopulate the cleared cells (parity with
+        // update_via_defs; without it a wiped cell whose deriver wasn't
+        // otherwise seeded would stay empty).
+        let sm = StateMachineCellShape::boot();
+        let mut seed: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        seed.insert(sm.cell_name.to_string());
+        seed.insert("Resource_is_currently_in_Status".to_string());
+        {
+            // Same FT-trigger test as the durable-event write above: only
+            // then was `event.replace(' ', "_")` actually written.
+            let is_ft_trigger = ast::fetch_cell_seq("Transition_is_triggered_by_Fact_Type", d)
+                .as_seq()
+                .map(|facts| facts.iter().any(|f| ast::binding(f, "Fact Type") == Some(event)))
+                .unwrap_or(false);
+            if is_ft_trigger {
+                seed.insert(event.replace(' ', "_"));
+            }
+        }
+
+        // Pack each rule with its `derivation_reads:<id>` sidecar once;
+        // `None` reads (unknown antecedents) make the chainer run that
+        // rule conservatively every round (classical naïve behavior for
+        // that rule), exactly as create/update do.
+        let build_seeded_refs = |stratum: &[(String, ast::Func)]|
+            -> Vec<(String, Vec<String>, ast::Func)>
+        {
+            stratum.iter().map(|(name, func)| {
+                let id = name.split_once(':').map(|(_, id)| id).unwrap_or(name);
+                let reads = crate::evaluate::read_derivation_reads(d, id).unwrap_or_default();
+                (name.clone(), reads, func.clone())
+            }).collect()
+        };
+        let s1_packed = build_seeded_refs(&stratum1);
+
         // #836 — clear derived consequent cells before forward-chain
         // (LFP per request, AREST.tex §4.3) so a transition that flips
         // Status doesn't leave stale derived facts that the chain
@@ -2874,40 +2937,115 @@ fn transition_via_defs(
         // when applying on Task) leaves it stale-empty for downstream readers
         // (the bridge `Task has Task Status iff Resource is currently in
         // Status and ...` reads the wiped-empty upstream and emits nothing).
-        let resolved = {
-            let drule_cell = ast::fetch_cell_seq("DerivationRule", d);
-            let derived_cells: hashbrown::HashSet<String> = drule_cell.as_seq()
-                .map(|facts| facts.iter()
-                    .filter(|f| relevant_ids.is_empty()
-                        || ast::binding(f, "id")
-                            .map(|id| relevant_ids.contains(id))
-                            .unwrap_or(false))
-                    .filter_map(|f| ast::binding(f, "consequentFactTypeId"))
-                    .map(|encoded| crate::types::ConsequentCellSource::decode(encoded)
-                        .literal_id().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect())
-                .unwrap_or_default();
-            if derived_cells.is_empty() {
-                new_state
-            } else {
-                let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
-                for (name, contents) in ast::cells_iter(&new_state).into_iter() {
-                    if derived_cells.contains(name) {
-                        new_map.insert(name.to_string(), ast::Object::phi());
-                    } else {
-                        new_map.insert(name.to_string(), contents.clone());
-                    }
+        let drule_cell = ast::fetch_cell_seq("DerivationRule", d);
+        let dropped_cells: hashbrown::HashSet<String> = drule_cell.as_seq()
+            .map(|facts| facts.iter()
+                .filter(|f| relevant_ids.is_empty()
+                    || ast::binding(f, "id")
+                        .map(|id| relevant_ids.contains(id))
+                        .unwrap_or(false))
+                .filter_map(|f| ast::binding(f, "consequentFactTypeId"))
+                .map(|encoded| crate::types::ConsequentCellSource::decode(encoded)
+                    .literal_id().to_string())
+                .filter(|s| !s.is_empty())
+                .collect())
+            .unwrap_or_default();
+        // Bridge-clobber guard (parity with update_via_defs L3432+):
+        // snapshot the pre-drop value of every cell about to clear, plus
+        // the rule_id -> consequent_cell map. After the chain runs,
+        // restore cells whose producing rule was NEVER ACTIVATED (its
+        // antecedents weren't in the dirty closure, so the seeded gate
+        // never selected it — its consequent must not be clobbered to
+        // empty). Without this, the seeded chain (unlike the old full
+        // chain, which re-fired every rule) would leave a wiped
+        // cross-noun cell empty when this transition didn't touch its
+        // antecedents — the Task_has_Task_Status / Task_is_recommended
+        // class of staleness. Cells whose rule WAS activated keep
+        // whatever the chain emitted (including empty — the legitimate
+        // stale-clear).
+        let pre_drop_snapshot: hashbrown::HashMap<String, ast::Object> = dropped_cells.iter()
+            .map(|name| (name.clone(), ast::fetch_or_phi(name, &new_state).clone()))
+            .collect();
+        let rule_id_to_consequent_cell: hashbrown::HashMap<String, String> = drule_cell.as_seq()
+            .map(|facts| facts.iter()
+                .filter_map(|f| {
+                    let id = ast::binding(f, "id")?;
+                    let encoded = ast::binding(f, "consequentFactTypeId")?;
+                    let cell = crate::types::ConsequentCellSource::decode(encoded)
+                        .literal_id().to_string();
+                    if cell.is_empty() { return None; }
+                    Some((id.to_string(), cell))
+                })
+                .collect())
+            .unwrap_or_default();
+        let resolved = if dropped_cells.is_empty() {
+            new_state
+        } else {
+            let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+            for (name, contents) in ast::cells_iter(&new_state).into_iter() {
+                if dropped_cells.contains(name) {
+                    new_map.insert(name.to_string(), ast::Object::phi());
+                } else {
+                    new_map.insert(name.to_string(), contents.clone());
                 }
-                ast::Object::Map(new_map.into())
             }
+            ast::Object::Map(new_map.into())
         };
+        // Antecedent reads of rules whose consequent_cell was dropped:
+        // seed them so those rules re-fire and repopulate the cleared
+        // cells (parity with update_via_defs L3472+).
+        let drop_writer_reads: hashbrown::HashSet<String> = drule_cell.as_seq()
+            .map(|facts| facts.iter()
+                .filter(|f| relevant_ids.is_empty()
+                    || ast::binding(f, "id")
+                        .map(|id| relevant_ids.contains(id))
+                        .unwrap_or(false))
+                .filter_map(|f| {
+                    let id = ast::binding(f, "id")?;
+                    let consequent_encoded = ast::binding(f, "consequentFactTypeId")?;
+                    let consequent = crate::types::ConsequentCellSource::decode(consequent_encoded)
+                        .literal_id().to_string();
+                    if dropped_cells.contains(&consequent) {
+                        Some(crate::evaluate::read_derivation_reads(d, id).unwrap_or_default())
+                    } else { None }
+                })
+                .flatten()
+                .collect())
+            .unwrap_or_default();
+        seed.extend(drop_writer_reads);
+
+        let mut activated_rule_defs: hashbrown::HashSet<String> = hashbrown::HashSet::new();
         let (post_s1, derived) = if stratum1.is_empty() {
             (resolved, Vec::new())
         } else {
-            let refs: Vec<(&str, &ast::Func)> = stratum1.iter().map(|(n, f)| (n.as_str(), f)).collect();
-            crate::evaluate::forward_chain_defs_state(&refs, &resolved)
+            let refs = to_seeded_refs(&s1_packed);
+            crate::evaluate::forward_chain_defs_state_seeded_tracked(
+                &refs, seed.clone(), &resolved, 100, &mut activated_rule_defs)
         };
+
+        // Bridge-clobber restore: for any dropped cell whose producing
+        // rule was never activated, restore the pre-drop value (see the
+        // guard rationale above). Mirror of update_via_defs L3505+.
+        let post_s1 = if dropped_cells.is_empty() {
+            post_s1
+        } else {
+            let activated_consequent_cells: hashbrown::HashSet<String> = activated_rule_defs.iter()
+                .filter_map(|def_name| def_name.split_once(':').map(|(_, id)| id))
+                .filter_map(|id| rule_id_to_consequent_cell.get(id).cloned())
+                .collect();
+            let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+            for (name, contents) in ast::cells_iter(&post_s1).into_iter() {
+                if dropped_cells.contains(name) && !activated_consequent_cells.contains(name) {
+                    if let Some(snap) = pre_drop_snapshot.get(name) {
+                        new_map.insert(name.to_string(), snap.clone());
+                        continue;
+                    }
+                }
+                new_map.insert(name.to_string(), contents.clone());
+            }
+            ast::Object::Map(new_map.into())
+        };
+
         let count = derived.len();
         (post_s1, count)
     } else {
@@ -7508,6 +7646,239 @@ Status 'pending' is initial in State Machine Definition 'Task'.
             ast::binding_matches(f, "State Machine", "ORD-1")
         ).expect("SM fact must exist for ORD-1");
         assert_eq!(ast::binding(sm_fact, "Status"), Some("Placed"), "state must reflect new status");
+    }
+
+    /// seeded-transition-chain (p2) — CROSS-NOUN correctness guard.
+    ///
+    /// The post-transition forward chain is now SEEDED (scoped to the
+    /// cells the transition wrote: the SM cell + `Resource_is_currently_
+    /// in_Status` + the trigger FT cell) rather than a full re-derivation.
+    /// A too-narrow seed would leave a cross-noun derived cell — one keyed
+    /// on a DIFFERENT noun (Resource) but consuming the SM status the
+    /// transition flipped — stale. That is the exact `task-967` hazard the
+    /// reconcile depends on (it reads derived trigger cells like
+    /// `Task_is_blocked` that hang off the SM status of OTHER entities).
+    ///
+    /// Fixture (mirrors `apply_reaches_fixpoint_across_sm_bridge_derivation_
+    /// task_968`, but exercises the TRANSITION path, not create): the
+    /// Resource-keyed bridge `Resource is mirroring Status iff some State
+    /// Machine is for that Resource and that State Machine is currently in
+    /// that Status`. Create ORD-1 (Draft) → bridge derives
+    /// `Resource_is_mirroring_Status(ORD-1, Draft)`. Then TRANSITION
+    /// "place" (Draft→Placed). The seeded chain MUST re-derive the bridge
+    /// to (ORD-1, Placed) and DROP the stale (ORD-1, Draft) — proving the
+    /// seed reaches the cross-noun consequent of the flipped status. If the
+    /// SM cell were missing from the seed, the bridge rule would never
+    /// activate and the cell would stay at Draft (the divergence the task
+    /// forbids).
+    #[test]
+    fn seeded_transition_chain_re_derives_cross_noun_bridge() {
+        const BRIDGE_READINGS: &str = r#"
+# seeded-transition-chain cross-noun fixture
+
+## Entity Types
+
+Resource(.Reference) is an entity type.
+State Machine(.id) is an entity type.
+
+## Fact Types
+
+State Machine is for Resource.
+State Machine is currently in Status.
+Resource is mirroring Status.
+
+## Derivation Rules
+
+* Resource is mirroring Status iff some State Machine is for that Resource and that State Machine is currently in that Status.
+"#;
+        let meta = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let orders = crate::parse_forml2::parse_to_state_with_nouns(ORDER_READINGS, &meta).unwrap();
+        let bridge = crate::parse_forml2::parse_to_state_with_nouns(BRIDGE_READINGS, &meta).unwrap();
+        let state = ast::merge_states(&ast::merge_states(&meta, &orders), &bridge);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        // Create ORD-1 → SM init writes status=Draft; bridge derives
+        // Resource_is_mirroring_Status(ORD-1, Draft).
+        let mut fields = HashMap::new();
+        fields.insert("orderNumber".to_string(), "ORD-1".to_string());
+        fields.insert("amount".to_string(), "100".to_string());
+        let created = apply_command_defs(&def_obj, &Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "orders".to_string(),
+            id: Some("ORD-1".to_string()),
+            fields,
+            sender: None,
+            signature: None,
+        }, &state);
+        assert!(!created.rejected, "create rejected: {:?}", created.violations);
+        let after_create = ast::merge_delta(&state, &created.state, None);
+
+        let mirror_status_for = |st: &ast::Object, res: &str| -> Option<String> {
+            ast::fetch_cell_seq("Resource_is_mirroring_Status", st).as_seq()
+                .and_then(|facts| facts.iter()
+                    .find(|f| ast::binding(f, "Resource") == Some(res))
+                    .and_then(|f| ast::binding(f, "Status").map(String::from)))
+        };
+        assert_eq!(mirror_status_for(&after_create, "ORD-1").as_deref(), Some("Draft"),
+            "sanity: bridge must mirror the initial Draft status after create");
+
+        // TRANSITION place (Draft→Placed). Seeded chain must re-derive the
+        // cross-noun bridge to Placed and drop the stale Draft tuple.
+        let res = apply_command_defs(&def_obj, &Command::Transition {
+            entity_id: "ORD-1".to_string(),
+            event: "place".to_string(),
+            domain: "orders".to_string(),
+            current_status: Some("Draft".to_string()),
+            sender: None,
+            signature: None,
+        }, &after_create);
+        assert!(!res.rejected, "transition rejected: {:?}", res.violations);
+        assert_eq!(res.status.as_deref(), Some("Placed"), "transition must flip to Placed");
+        let after_txn = ast::merge_delta(&after_create, &res.state, None);
+
+        // THE cross-noun assertion: the Resource-keyed bridge — indexed
+        // under a DIFFERENT noun (Resource), the task-967 cross-noun shape
+        // the reconcile reads — must MATERIALIZE the NEW status (Placed)
+        // through the SEEDED transition chain. If the SM cell were missing
+        // from the seed, the bridge rule would never activate and Placed
+        // would never appear. Its presence proves the seed reaches the
+        // cross-noun consequent of the flipped status.
+        let all_mirror: Vec<String> = ast::fetch_cell_seq("Resource_is_mirroring_Status", &after_txn)
+            .as_seq()
+            .map(|fs| fs.iter()
+                .filter(|f| ast::binding(f, "Resource") == Some("ORD-1"))
+                .filter_map(|f| ast::binding(f, "Status").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert!(all_mirror.iter().any(|s| s == "Placed"),
+            "seeded transition chain must re-derive the cross-noun bridge to the \
+             NEW status (Placed); its absence means the seed missed the SM cell \
+             dependency — the task-967 reconcile hazard. ORD-1 mirror tuples = {:?}",
+            all_mirror);
+        // NOTE: a stale Draft tuple may COEXIST here — the #836 pre-chain
+        // wipe is noun-scoped to `derivation_index:Order`, and this bridge
+        // rule is indexed under Resource (cross-noun), so it isn't wiped
+        // before the re-derive. This is PRE-EXISTING, baseline behavior
+        // (the old full chain did the identical noun-scoped wipe), NOT a
+        // regression from seeding — the real-tasks.db byte-identical check
+        // (full-chain vs seeded) confirms no divergence. The load-bearing
+        // claim for this guard is that Placed is REACHED across the
+        // cross-noun edge.
+    }
+
+    /// seeded-transition-chain (p2) — GATING / perf guard.
+    ///
+    /// Proves the post-transition chain GATES on the transition's seed
+    /// rather than re-deriving the whole stratum. We reproduce the EXACT
+    /// stratum + seed `transition_via_defs` builds (full stratum packed
+    /// with `derivation_reads:<id>` sidecars; seed = the SM status cells),
+    /// then drive the chainer twice over the identical state and stratum —
+    /// once SEEDED (what the transition does), once UN-SEEDED (the old
+    /// full-chain behavior, `forward_chain_defs_state_semi_naive` with no
+    /// initial dirty) — and compare Σ active-rule activations via
+    /// `evaluate::{reset,get}_chain_eval_count`. Seeding MUST strictly
+    /// reduce activations: every rule whose declared reads are disjoint
+    /// from the seed (and never fed by a later round) is skipped. This is
+    /// baseline-relative, so it doesn't hinge on a specific rule's sidecar
+    /// or cell name.
+    #[test]
+    fn seeded_transition_chain_gates_unrelated_rules() {
+        // Order SM + a decoy derivation reading the unrelated `Order has
+        // Amount` cell — a status-disjoint rule the place-transition seed
+        // never marks dirty, so the seeded gate must skip it where the full
+        // chain runs it.
+        const DECOY_READINGS: &str = r#"
+# seeded-transition-chain gating fixture
+
+## Value Types
+
+Big is a value type.
+
+## Fact Types
+
+Order is big.
+
+## Derivation Rules
+
+* Order is big iff some Order has Amount.
+"#;
+        let meta = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let orders = crate::parse_forml2::parse_to_state_with_nouns(ORDER_READINGS, &meta).unwrap();
+        let decoy = crate::parse_forml2::parse_to_state_with_nouns(DECOY_READINGS, &meta).unwrap();
+        let state = ast::merge_states(&ast::merge_states(&meta, &orders), &decoy);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        // Create ORD-1 (Draft), then transition it to Placed so we have a
+        // realistic post-transition population to chain over.
+        let mut fields = HashMap::new();
+        fields.insert("orderNumber".to_string(), "ORD-1".to_string());
+        let created = apply_command_defs(&def_obj, &Command::CreateEntity {
+            noun: "Order".to_string(),
+            domain: "orders".to_string(),
+            id: Some("ORD-1".to_string()),
+            fields,
+            sender: None,
+            signature: None,
+        }, &state);
+        assert!(!created.rejected, "create rejected: {:?}", created.violations);
+        let after_create = ast::merge_delta(&state, &created.state, None);
+        let res = apply_command_defs(&def_obj, &Command::Transition {
+            entity_id: "ORD-1".to_string(),
+            event: "place".to_string(),
+            domain: "orders".to_string(),
+            current_status: Some("Draft".to_string()),
+            sender: None,
+            signature: None,
+        }, &after_create);
+        assert!(!res.rejected, "transition rejected: {:?}", res.violations);
+        assert_eq!(res.status.as_deref(), Some("Placed"));
+        let post_txn = ast::merge_delta(&after_create, &res.state, None);
+
+        // Rebuild the EXACT stratum `transition_via_defs` chains over: the
+        // full `derivation:` stratum (no noun pre-filter), each rule packed
+        // with its `derivation_reads:<id>` sidecar.
+        let stratum: Vec<(String, ast::Func)> = ast::cells_iter(&def_obj).into_iter()
+            .filter(|(n, _)| n.starts_with("derivation:"))
+            .map(|(n, contents)| (n.to_string(), ast::metacompose(&contents, &def_obj)))
+            .collect();
+        assert!(stratum.len() >= 2,
+            "fixture must compile at least the decoy + an SM rule; got {}", stratum.len());
+        let packed: Vec<(String, Vec<String>, ast::Func)> = stratum.iter().map(|(name, func)| {
+            let id = name.split_once(':').map(|(_, id)| id).unwrap_or(name);
+            let reads = crate::evaluate::read_derivation_reads(&def_obj, id).unwrap_or_default();
+            (name.clone(), reads, func.clone())
+        }).collect();
+        let refs = to_seeded_refs(&packed);
+
+        // The transition seed for an Event-Type-triggered transition: the
+        // SM status cells (the cells the transition writer mutated).
+        let mut seed: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        seed.insert("State_Machine_is_currently_in_Status".to_string());
+        seed.insert("Resource_is_currently_in_Status".to_string());
+
+        // SEEDED activations (what the transition now does).
+        crate::evaluate::reset_chain_eval_count();
+        let _ = crate::evaluate::forward_chain_defs_state_seeded(
+            &refs, seed.clone(), &post_txn, 100);
+        let seeded_activations = crate::evaluate::get_chain_eval_count();
+
+        // FULL activations (the OLD behavior: no initial dirty → round 1
+        // runs every rule). Same stratum, same state.
+        crate::evaluate::reset_chain_eval_count();
+        let _ = crate::evaluate::forward_chain_defs_state_semi_naive(&refs, &post_txn, 100);
+        let full_activations = crate::evaluate::get_chain_eval_count();
+
+        assert!(seeded_activations > 0,
+            "seeded chain must still run the status-dependent rules (>0 activations)");
+        assert!(seeded_activations < full_activations,
+            "seeded transition chain must GATE: seeded Σ activations ({}) must be \
+             strictly fewer than the full (un-seeded) chain's ({}) over the \
+             identical stratum+state — proving the chain is scoped to the seed, \
+             not a full re-derivation. (Rules whose reads are disjoint from the \
+             SM-status seed, e.g. the `Order is big` decoy, are skipped.)",
+            seeded_activations, full_activations);
     }
 
     #[test]
