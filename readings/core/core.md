@@ -4,9 +4,9 @@
 
 Function(.id) is an entity type.
 Noun is a subtype of Function.
-  Fact Type is a subtype of Noun.
-  Status is a subtype of Noun.
-  {Fact Type, Status} are mutually exclusive subtypes of Noun.
+  Fact Type is a subtype of Resource.
+  Status is a subtype of Resource.
+  {Fact Type, Status, State Machine Definition, Constraint, Derivation Rule} are mutually exclusive subtypes of Resource.
 
 Reading(.id) is an entity type.
 
@@ -16,6 +16,7 @@ Verb is a subtype of Function.
   HTTP Method is a subtype of Verb.
 
 Constraint(.id) is an entity type.
+  Constraint is a subtype of Resource.
   Set Comparison Constraint is a subtype of Constraint.
   Frequency Constraint is a subtype of Constraint.
   {Set Comparison Constraint, Frequency Constraint} are mutually exclusive subtypes of Constraint.
@@ -25,6 +26,7 @@ Constraint Type(.code) is an entity type.
 Constraint Kind(.code) is an entity type.
 
 Derivation Rule(.id) is an entity type.
+  Derivation Rule is a subtype of Resource.
 
 Modality Type is a value type.
   The possible values of Modality Type are 'Alethic', 'Deontic'.
@@ -149,7 +151,7 @@ Noun is of schema:Thing.
   Each Noun is of at most one schema:Thing.
   It is possible that more than one Noun is of the same schema:Thing.
 Noun plays Role.
-  Each Noun plays some Role.
+  It is obligatory that each Noun plays some Role.
   For each Role, exactly one Noun plays that Role.
   It is possible that some Noun plays more than one Role.
 Noun is instantiable. **
@@ -272,6 +274,9 @@ Function has Header.
   Each Function has each Header at most once.
 Function has Scope.
   Each Function has at most one Scope.
+Function belongs to Domain.
+  Each Function belongs to at most one Domain.
+It is obligatory that each Function belongs to some Domain.
 
 ### Constraint
 Constraint is of Constraint Type.

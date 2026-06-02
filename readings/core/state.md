@@ -3,7 +3,8 @@
 ## Entity Types
 
 Status(.Name) is an entity type.
-State Machine Definition is a subtype of Status.
+State Machine Definition(.Name) is an entity type.
+State Machine Definition is a subtype of Resource.
 Transition(.id) is an entity type.
 Guard(.Name) is an entity type.
 
@@ -12,8 +13,6 @@ Stream(.id) is an entity type.
 ## Readings
 
 ### State Machine Definition
-State Machine Definition belongs to Domain.
-  Each State Machine Definition belongs to exactly one Domain.
 State Machine Definition is for Noun.
   Each State Machine Definition is for exactly one Noun.
 

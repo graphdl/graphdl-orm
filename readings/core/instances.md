@@ -3,8 +3,9 @@
 ## Entity Types
 
 Resource(.Reference) is an entity type.
+  Resource is a subtype of Noun.
 Fact is an entity type.
-  Fact is a subtype of Resource.
+  Fact is a subtype of Fact Type.
 State Machine(.id) is an entity type.
 Guard Run(.Name) is an entity type.
 Citation(.id) is an entity type.
@@ -46,8 +47,6 @@ Citation pins Cell Version Id.
   It is possible that more than one Citation pins the same Cell Version Id.
 
 ### Fact
-Fact belongs to Domain.
-  Each Fact belongs to exactly one Domain.
 Fact is of Fact Type.
   Each Fact is of exactly one Fact Type.
 Fact is completed.
@@ -62,8 +61,6 @@ Fact Type cites Citation.
   It is possible that more than one Fact Type cites the same Citation.
 
 ### Resource
-Resource belongs to Domain.
-  Each Resource belongs to exactly one Domain.
 Resource is instance of Noun.
   Each Resource is instance of exactly one Noun.
 Resource has Reference.
