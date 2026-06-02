@@ -72,9 +72,12 @@
 // match without adding information.
 //
 // What this module does NOT do (intentionally — see #473 epic):
-//   * `read(fd, ...)` — #499 (next slice). This module just stores
-//     enough state for the read handler to source bytes; it does not
-//     itself implement the byte-pull.
+//   * The byte-pull itself — `read(fd, ...)` lives in
+//     `syscall::read`. This module stores the per-fd state the read
+//     handler drives: a `File` fd carries its cell id plus a read
+//     cursor (`offset`) that #499's read handler advances via
+//     `lookup_mut`. The actual byte sourcing (File_has_ContentRef
+//     decode) is `file_serve::read_file_cell`, not here.
 //   * `dup` / `dup2` / `dup3` / `fcntl(F_DUPFD)` — those grow the
 //     allocation surface (a target fd, not just lowest-free); the
 //     foundation here is enough to add them as `allocate_at(fd)` /
@@ -82,10 +85,12 @@
 //   * `close-on-exec` (`O_CLOEXEC`, `FD_CLOEXEC`) — once `execve(2)`
 //     lands (#560-followups), the table grows a per-entry CLOEXEC bit
 //     that gets walked on exec.
-//   * Per-fd offset (the `lseek(2)` cursor). The `read` handler will
-//     introduce this when it lands — the `FdEntry` variants gain an
-//     offset field at that point. Today there's no `read` so no
-//     offset is needed.
+//   * `lseek(2)` (explicit cursor positioning). #499 added the
+//     per-fd read cursor to `FdEntry::File` (`offset`) so sequential
+//     reads walk the file and EOF is observable; an explicit `lseek`
+//     verb that *sets* the cursor (rather than only advancing it on
+//     read) is a later track. Synthetic fds are still whole-render
+//     reads, so they carry no cursor.
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -114,13 +119,19 @@ pub const MAX_OPEN_FDS: usize = 1024;
 pub enum FdEntry {
     /// fd backed by a File entity in the cell graph (#398). The
     /// `cell_id` is the AREST id (typically the hex blob hash) the
-    /// `File_has_*` facts are keyed on. The future `read` handler
-    /// (#499) walks `File_has_ContentRef` against this id to source
-    /// bytes; the future `write` handler (post-#499) walks the same
-    /// fact to source the destination.
+    /// `File_has_*` facts are keyed on. The `read` handler (#499)
+    /// walks `File_has_ContentRef` against this id to source bytes;
+    /// the future `write` handler (post-#499) walks the same fact to
+    /// source the destination.
     File {
         /// AREST cell id keying the `File_has_*` facts.
         cell_id: String,
+        /// Per-fd read cursor (the `lseek(2)` position). #499 advances
+        /// it by the number of bytes each `read` consumes so sequential
+        /// reads walk the file and a read at `offset == len` returns 0
+        /// (EOF). A fresh `openat` starts the cursor at 0; `lseek`
+        /// (a later track) will set it explicitly.
+        offset: u64,
     },
     /// fd backed by the synthetic-fs resolver (HHHHH's #534 —
     /// `/proc/cpuinfo`, `/proc/meminfo` today; the future `/sys/*` and
@@ -200,6 +211,15 @@ impl FdTable {
         self.entries.get(&fd)
     }
 
+    /// Mutable lookup of `fd`'s backing entry. Returns `None` for an
+    /// unknown fd. The `read` handler (#499) uses this to advance a
+    /// `File` fd's read cursor after consuming bytes, so subsequent
+    /// reads continue from where the last one stopped (and a read past
+    /// the end returns 0 / EOF).
+    pub fn lookup_mut(&mut self, fd: i32) -> Option<&mut FdEntry> {
+        self.entries.get_mut(&fd)
+    }
+
     /// Release `fd` from the table. Returns `Err(())` when `fd` is not
     /// open (the close handler maps that to `-EBADF`). On success the
     /// fd is freed and a future `allocate` may re-issue it.
@@ -244,10 +264,12 @@ pub fn synthetic(path: &str) -> FdEntry {
 /// Constructor helper — wraps a cell id into `FdEntry::File`. Same
 /// shape as `synthetic` above: the `String` allocation is hidden so
 /// call sites can write `fd_table::file("abc123")` rather than
-/// reaching for `ToString`.
+/// reaching for `ToString`. The read cursor starts at 0 (a freshly
+/// `openat`-ed file reads from the beginning).
 pub fn file(cell_id: &str) -> FdEntry {
     FdEntry::File {
         cell_id: cell_id.to_string(),
+        offset: 0,
     }
 }
 
@@ -303,7 +325,8 @@ mod tests {
         assert_eq!(
             t.lookup(fd_file),
             Some(&FdEntry::File {
-                cell_id: "abc123".into()
+                cell_id: "abc123".into(),
+                offset: 0,
             })
         );
     }
@@ -393,15 +416,37 @@ mod tests {
     }
 
     /// `file` helper produces an `FdEntry::File` with the expected
-    /// cell id.
+    /// cell id and a zero read cursor.
     #[test]
     fn file_helper_constructs_file_variant() {
         let entry = file("abc123");
         assert_eq!(
             entry,
             FdEntry::File {
-                cell_id: "abc123".into()
+                cell_id: "abc123".into(),
+                offset: 0,
             }
+        );
+    }
+
+    /// `lookup_mut` hands back a mutable reference the read handler
+    /// uses to advance a `File` fd's cursor; the mutation persists in
+    /// the table (a later `lookup` observes the new offset).
+    #[test]
+    fn lookup_mut_advances_file_offset() {
+        let mut t = FdTable::new();
+        let fd = t.allocate(file("abc")).expect("file");
+        if let Some(FdEntry::File { offset, .. }) = t.lookup_mut(fd) {
+            *offset += 5;
+        } else {
+            panic!("expected a File entry from lookup_mut");
+        }
+        assert_eq!(
+            t.lookup(fd),
+            Some(&FdEntry::File {
+                cell_id: "abc".into(),
+                offset: 5,
+            })
         );
     }
 }

@@ -262,7 +262,7 @@ fn collect_fd_snapshots(p: &Process) -> Vec<FdSnapshot> {
         if let Some(entry) = p.open_fds.lookup(fd) {
             let target = match entry {
                 OpenFdEntry::Synthetic { path } => path.clone(),
-                OpenFdEntry::File { cell_id } => format!("/file/{}", cell_id),
+                OpenFdEntry::File { cell_id, .. } => format!("/file/{}", cell_id),
             };
             out.push(FdSnapshot { fd, target });
         }

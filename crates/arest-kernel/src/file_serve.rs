@@ -492,6 +492,30 @@ fn sector_span(byte_len: u64) -> u64 {
     (byte_len + sec - 1) / sec
 }
 
+// ── Region byte source for the read(2) syscall (#499) ──────────────
+
+/// Read `[start..=end]` from a `<REGION,base,len>` ContentRef on the
+/// persistence disk. The general `read(2)` File-fd path (#499) calls
+/// this for the off-disk (>64 KiB) content shape; the inline (bare-hex
+/// / `<INLINE,..>`) shape is decoded directly in the kernel's
+/// `syscall::read` module (pure, no block device, so it stays host-
+/// testable). This region reader needs `block_storage` — UEFI x86_64
+/// only — so it lives here in the gated module rather than in `read`.
+///
+/// `cref` is the raw `ContentRef` atom (expected `<REGION,...>` form;
+/// any other shape returns `None`). `start`/`end` are inclusive byte
+/// offsets the caller has already clamped to the file's length.
+/// Returns `None` for a non-region atom or a block-storage read error.
+pub fn read_region_content(cref: &str, start: u64, end: u64) -> Option<Vec<u8>> {
+    let content = decode_content_ref(cref)?;
+    match content {
+        ContentRef::Region { .. } => read_range(&content, start, end).ok(),
+        // Inline is handled by the caller (read.rs); reaching here with
+        // an inline atom means the caller misrouted — return None.
+        ContentRef::Inline(_) => None,
+    }
+}
+
 // ── Synthetic-fs fallback (#534) ───────────────────────────────────
 
 /// Fallback for paths that did NOT match `/file/{id}/content`. Hands
