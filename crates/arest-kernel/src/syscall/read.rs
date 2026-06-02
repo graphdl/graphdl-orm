@@ -639,11 +639,23 @@ mod tests {
         current_process_uninstall();
     }
 
-    /// `read` of a `/dev/random` fd fills the buffer with random bytes
-    /// (returns the count). Uses a deterministic entropy source so the
-    /// CSPRNG fill is reproducible and non-zero — the assertion pins the
-    /// exact keystream so a regression in csprng / the device wiring
-    /// shows up as a diff, not a flake.
+    /// `read` of a `/dev/random` fd fills the buffer with cryptographically
+    /// secure random bytes (returns the count). Three properties are
+    /// pinned, matching #577's spec for a CSPRNG-backed `/dev/random`:
+    ///
+    ///   1. RETURNS THE FULL COUNT — a 16-byte read returns 16.
+    ///   2. BYTES COME FROM THE CSPRNG — under a deterministic entropy
+    ///      seed the device read is byte-for-byte equal to a direct
+    ///      `arest::csprng::random_bytes` draw from the same reseeded
+    ///      state. This proves the device is wired to the ChaCha20 CSPRNG
+    ///      (`getrandom(2)`'s source), not a weak/predictable stand-in:
+    ///      swap in a different source and the equality breaks. Comparing
+    ///      against a fresh draw avoids pinning a hand-computed keystream
+    ///      constant while still nailing provenance to the exact stream.
+    ///   3. READS ARE NON-REPEATING ACROSS CALLS — two successive reads
+    ///      on the same fd yield different bytes (the ChaCha20 counter
+    ///      advances). A fixed/zero source — the failure mode #577 guards
+    ///      against — would return identical buffers and fail here.
     #[test]
     fn read_dev_random_fd_fills_with_random_bytes() {
         use arest::entropy::{self, DeterministicSource};
@@ -655,17 +667,52 @@ mod tests {
         let _entropy_guard = TEST_ENTROPY_LOCK.lock();
         let _proc_guard = CURRENT_PROCESS_TEST_LOCK.lock();
 
+        // (2) Provenance reference: the exact bytes the kernel CSPRNG
+        // emits for the first 16-byte draw after a reseed under this
+        // deterministic seed. Computed here, then reproduced via the
+        // device path below — the two must match to the byte.
+        //
+        // `DeterministicSource` advances an internal counter per `fill`,
+        // and `csprng::reseed()` does NOT reset that counter — so to make
+        // the device read derive the SAME ChaCha20 key as `expected`, a
+        // FRESH source (counter at 0) is installed before each reseed.
         entropy::install(alloc::boxed::Box::new(DeterministicSource::new([11u8; 32])));
         arest::csprng::reseed();
+        let mut expected = [0u8; 16];
+        arest::csprng::random_bytes(&mut expected);
+        // A non-zero stream is a precondition for the equality check to
+        // be meaningful (a zero source would trivially "match" a zero
+        // device read), so assert it explicitly.
+        assert!(
+            expected.iter().any(|&b| b != 0),
+            "CSPRNG keystream for the test seed must be non-zero"
+        );
 
+        // Re-seed the CSPRNG from a fresh source at counter 0 so the
+        // device read below draws the same first 16 bytes as `expected`.
+        entropy::install(alloc::boxed::Box::new(DeterministicSource::new([11u8; 32])));
+        arest::csprng::reseed();
         let fd = install_with_device_fd("/dev/random");
+
+        // (1) First read fills the whole 16-byte request.
         let mut buf = [0u8; 16];
         let result = handle(fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64);
         assert_eq!(result, 16, "/dev/random read must fill the whole request");
-        // The fill must have replaced the zero-init buffer with entropy.
-        assert!(
-            buf.iter().any(|&b| b != 0),
-            "/dev/random read must produce non-zero bytes"
+        // (2) ...with the exact CSPRNG keystream — proves the bytes come
+        // from `arest::csprng`, not a weak source or a zero/fixed fill.
+        assert_eq!(
+            buf, expected,
+            "/dev/random must yield the kernel CSPRNG keystream byte-for-byte"
+        );
+
+        // (3) A second read on the same fd must advance the stream — the
+        // buffers must differ. A fixed or zero source would repeat here.
+        let mut buf2 = [0u8; 16];
+        let result2 = handle(fd as u64, buf2.as_mut_ptr() as u64, buf2.len() as u64);
+        assert_eq!(result2, 16, "second /dev/random read must also fill 16 bytes");
+        assert_ne!(
+            buf, buf2,
+            "/dev/random reads must be non-repeating across calls (not a fixed pattern)"
         );
 
         current_process_uninstall();

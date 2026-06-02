@@ -440,7 +440,12 @@ mod tests {
 
     // NOTE: `/dev/random`'s `device_read` exercises `arest::csprng::
     // random_bytes`, which panics if no entropy source is installed.
-    // The handler-level test (`read::tests`) installs a deterministic
-    // source before reading `/dev/random`; the pure-table tests here
-    // stay entropy-free so they need no entropy fixture.
+    // The handler-level test (`read::tests::read_dev_random_fd_fills_
+    // with_random_bytes`) installs a deterministic source and pins the
+    // three #577 properties: the read returns the full requested count,
+    // the bytes equal the kernel ChaCha20 CSPRNG keystream byte-for-byte
+    // (provenance — not a weak/zero source), and two successive reads
+    // differ (non-repeating). The pure-table tests here stay entropy-free
+    // so they need no entropy fixture; the randomness contract is proven
+    // once, at the handler seam that drives the real syscall path.
 }
