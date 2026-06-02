@@ -213,6 +213,10 @@ fn read_open_fd(fd: u64, buf: u64, count: u64) -> i64 {
                 cell_id: cell_id.clone(),
                 offset: *offset,
             }),
+            // A socket fd (#478a) has no file/device read target yet —
+            // recv() on a socket is a later task (#478e). Until then a
+            // read() on a socket fd resolves to no ReadTarget → -EBADF.
+            Some(FdEntry::Socket { .. }) => None,
             None => None,
         }
     });
