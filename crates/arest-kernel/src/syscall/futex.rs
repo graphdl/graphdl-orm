@@ -12,10 +12,11 @@
 // equals the caller's expected `val`, park the calling process on a
 // per-uaddr wait queue (`process::futex_table`); otherwise return
 // `-EAGAIN` so libc retries the lock-acquire fast-path. FUTEX_WAKE
-// (the symmetric "release N waiters" operation) is stubbed to return
-// 0 — #545 (separate task) ships the real implementation against the
-// same wait queue this slice populates. Every other FUTEX_* op
-// returns `-ENOSYS`.
+// (the symmetric "release N waiters" operation, #545) removes up to
+// `val` waiters from that same per-uaddr wait queue, marks the
+// current process runnable again if it was the one parked on `uaddr`,
+// and returns the number of waiters actually woken. Every other
+// FUTEX_* op returns `-ENOSYS`.
 //
 // futex_op encoding
 // -----------------
@@ -95,8 +96,8 @@ pub const FUTEX_CMD_MASK: u32 = 0x7F;
 pub const FUTEX_WAIT: u32 = 0;
 
 /// Wake up to `val` waiters parked on `uaddr`. Per
-/// `linux/include/uapi/linux/futex.h:FUTEX_WAKE`. Tier-1 stubs to 0
-/// — #545 (separate task) ships the real implementation against
+/// `linux/include/uapi/linux/futex.h:FUTEX_WAKE`. #545 ships the real
+/// implementation (`wake` below) against
 /// `process::futex_table::wake_n`.
 pub const FUTEX_WAKE: u32 = 1;
 
@@ -154,8 +155,9 @@ pub const ENOSYS: i64 = 38;
 ///                          CMP_REQUEUE; tier-1 returns -ENOSYS).
 ///
 /// Returns 0 on a successful WAIT (after enqueueing — tier-1 doesn't
-/// actually park yet) or 0 from the WAKE stub. Returns `-EAGAIN` /
-/// `-EFAULT` / `-EINVAL` / `-ENOSYS` per the errno table above.
+/// actually park yet), or the count of waiters woken (>= 0) from
+/// WAKE. Returns `-EAGAIN` / `-EFAULT` / `-EINVAL` / `-ENOSYS` per the
+/// errno table above.
 ///
 /// SAFETY: callers (the syscall dispatcher) treat `uaddr` as a
 /// userspace virtual address. Tier-1's identity mapping makes this
@@ -174,16 +176,7 @@ pub fn handle(
     let op = futex_op & FUTEX_CMD_MASK;
     match op {
         FUTEX_WAIT => wait(uaddr, val),
-        FUTEX_WAKE => {
-            // Stubbed to 0 — #545 ships the real implementation. Returning
-            // 0 (rather than -ENOSYS) is deliberate: a libc that probes
-            // futex availability via WAKE+0 (a common pattern in glibc's
-            // early-init `__libc_setup_tls`) sees "the syscall is
-            // present" and proceeds. The stub doesn't actually wake any
-            // waiters; tests that exercise the wake path use the
-            // `futex_table::wake_n` surface directly.
-            0
-        }
+        FUTEX_WAKE => wake(uaddr, val),
         // Tier-1 doesn't model the requeue family or the bitset
         // variants. Userspace libc treats -ENOSYS on optional futex
         // ops as "this kernel doesn't have it"; pthread_cond_broadcast
@@ -257,6 +250,79 @@ pub fn wait(uaddr: u64, val: u32) -> i64 {
     0
 }
 
+/// FUTEX_WAKE body. Remove up to `n` waiters from the `uaddr` wait
+/// queue, mark the current process runnable again if it was the one
+/// parked on `uaddr`, and return the number of waiters actually woken.
+///
+/// `n` is the `val` argument of `futex(uaddr, FUTEX_WAKE, val, ...)`:
+/// the maximum number of waiters to release. Linux's canonical
+/// `pthread_mutex_unlock` passes `1` (wake a single waiter);
+/// `pthread_cond_broadcast` passes `INT_MAX` (wake every waiter). A
+/// `val` of 0 wakes nobody and returns 0 — matching Linux's
+/// `futex(uaddr, FUTEX_WAKE, 0)` no-op.
+///
+/// Address validation mirrors `wait`: a null `uaddr` returns -EFAULT
+/// and an unaligned `uaddr` returns -EINVAL. Linux validates the
+/// address on the WAKE side too — the kernel hashes the futex key from
+/// `uaddr`, which requires the same alignment + non-null invariants the
+/// WAIT path enforces. (Unlike `wait`, WAKE does NOT dereference
+/// `*uaddr` — it only keys the wait queue by the address — so there's
+/// no value-compare / -EAGAIN path here.)
+///
+/// Return value: the count of pids drained from the queue, as a
+/// non-negative `i64`. Linux's FUTEX_WAKE returns the number woken;
+/// userspace `pthread_cond_signal` ignores it, but a libc that checks
+/// (e.g. an assertion that "exactly one waiter was present") sees the
+/// real count.
+///
+/// Tier-1 limitation: there is no scheduler (#530) to actually resume
+/// the woken pids on another CPU — the observable surface is the
+/// queue drain plus the current process's state transition back to
+/// `Running`. When #530 lands, the drained pids get pushed onto the
+/// scheduler's run queue here; the return value (the count) stays the
+/// same.
+pub fn wake(uaddr: u64, n: u32) -> i64 {
+    // Null-pointer guard — Linux rejects a null futex address on the
+    // WAKE side too (the futex-key derivation faults on a null deref).
+    if uaddr == 0 {
+        return -EFAULT;
+    }
+    // 4-byte-alignment guard — the futex word must be naturally
+    // aligned; Linux applies the same mask on WAKE as on WAIT.
+    if uaddr & 0b11 != 0 {
+        return -EINVAL;
+    }
+    // Drain up to `n` waiters from the per-uaddr queue. `wake_n`
+    // returns the released pids in FIFO order (Linux's fair wake
+    // convention) and prunes the queue entry when it empties. The
+    // count of released pids is what FUTEX_WAKE reports to userspace.
+    let woken = with_futex_table(|table| table.wake_n(uaddr, n as usize));
+    // If the kernel's currently-installed process is the one that was
+    // parked on this `uaddr`, transition it back to `Running` — the
+    // WAKE counterpart to WAIT's `BlockedFutex(uaddr)` transition.
+    // Tier-1 hosts one process at a time (no scheduler — #530), so the
+    // current process is the only one whose state can be made runnable
+    // here; the future scheduler will walk `woken` and mark every
+    // released task runnable on its run queue. We gate the transition
+    // on the pid actually appearing in `woken` so a WAKE that drained
+    // some *other* (placeholder / already-reaped) pid doesn't
+    // spuriously un-block the live process.
+    if !woken.is_empty() {
+        current_process_mut(|maybe_proc| {
+            if let Some(proc) = maybe_proc {
+                if proc.state == ProcessState::BlockedFutex(uaddr) && woken.contains(&proc.pid) {
+                    proc.state = ProcessState::Running;
+                }
+            }
+        });
+    }
+    // Linux raw-syscall convention: a successful FUTEX_WAKE returns the
+    // count woken as a non-negative integer. `woken.len()` is bounded
+    // by the queue length, which is far below `i64::MAX`, so the cast
+    // is lossless.
+    woken.len() as i64
+}
+
 /// Read a 4-byte little-endian u32 from a userspace virtual address.
 /// Mirrors the inline pointer-deref pattern `syscall::write::do_write`
 /// + `syscall::openat::read_pathname` use — direct deref under tier-1
@@ -315,7 +381,7 @@ mod tests {
                 // We can't iterate the BTreeMap directly from outside,
                 // so we use a probing pattern: peek each uaddr the
                 // tests in this file use.
-                let probes = [0_u64, 0x1000, 0x2000, 0x4040, 0xdead];
+                let probes = [0_u64, 0x1000, 0x2000, 0x4040, 0x9000, 0xdead];
                 for &uaddr in &probes {
                     t.wake_n(uaddr, usize::MAX);
                 }
@@ -326,6 +392,7 @@ mod tests {
                 0x1000,
                 0x2000,
                 0x4040,
+                0x9000,
                 0xdead,
             ];
             for &uaddr in &probes {
@@ -501,27 +568,255 @@ mod tests {
         drain_global_futex_table();
     }
 
-    /// FUTEX_WAKE returns 0 (stub for #545). Doesn't touch the wait
-    /// queue — the test confirms the queue is preserved across the
-    /// stub call.
+    /// FUTEX_WAKE with a null `uaddr` returns -EFAULT before touching
+    /// the wait queue. Linux rejects a null futex address on the WAKE
+    /// side too.
     #[test]
-    fn wake_returns_zero_under_stub() {
+    fn wake_null_uaddr_returns_efault() {
+        let result = handle(0, FUTEX_WAKE, 1, 0, 0, 0);
+        assert_eq!(result, -EFAULT);
+    }
+
+    /// FUTEX_WAKE with an unaligned `uaddr` returns -EINVAL. Same
+    /// natural-alignment requirement the WAIT path enforces.
+    #[test]
+    fn wake_unaligned_uaddr_returns_einval() {
+        assert_eq!(handle(0x4001, FUTEX_WAKE, 1, 0, 0, 0), -EINVAL);
+        assert_eq!(handle(0x4002, FUTEX_WAKE, 1, 0, 0, 0), -EINVAL);
+        assert_eq!(handle(0x4003, FUTEX_WAKE, 1, 0, 0, 0), -EINVAL);
+    }
+
+    /// FUTEX_WAKE on an empty (never-populated) queue returns 0 — no
+    /// waiters to release, no panic, no spurious entry creation.
+    #[test]
+    fn wake_empty_queue_returns_zero() {
         let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         drain_global_futex_table();
-        // Pre-populate a waiter via the table directly so we can
-        // confirm the stub leaves it alone.
-        with_futex_table(|t| t.enqueue(0x4040, 11));
 
         let result = handle(0x4040, FUTEX_WAKE, 1, 0, 0, 0);
-        assert_eq!(result, 0);
-
-        // Stub didn't drain the queue (#545 will).
+        assert_eq!(result, 0, "no waiters parked → 0 woken");
+        // The probe didn't create an entry for this uaddr. (Assert on
+        // the specific key, not the global live count — sibling tests
+        // share the process-wide table and may hold their own keys.)
         let waiters: alloc::vec::Vec<u32> =
             with_futex_table(|t| t.peek_waiters(0x4040).to_vec());
-        assert_eq!(waiters, alloc::vec![11]);
+        assert_eq!(waiters, alloc::vec![] as alloc::vec::Vec<u32>);
+
+        drain_global_futex_table();
+    }
+
+    /// FUTEX_WAKE wakes exactly one waiter and returns 1, leaving the
+    /// rest parked. The headline `pthread_mutex_unlock` shape (wake a
+    /// single waiter).
+    #[test]
+    fn wake_one_of_many_returns_one_and_drains_one() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        drain_global_futex_table();
+        // Park three waiters on the same uaddr via the table directly.
+        with_futex_table(|t| {
+            t.enqueue(0x4040, 7);
+            t.enqueue(0x4040, 11);
+            t.enqueue(0x4040, 13);
+        });
+        // No live process for this case — exercise the pure
+        // queue-drain surface.
+        current_process_uninstall();
+
+        let result = handle(0x4040, FUTEX_WAKE, 1, 0, 0, 0);
+        assert_eq!(result, 1, "wake count clamps to val=1");
+
+        // FIFO: pid 7 (first enqueued) was the one released.
+        let waiters: alloc::vec::Vec<u32> =
+            with_futex_table(|t| t.peek_waiters(0x4040).to_vec());
+        assert_eq!(waiters, alloc::vec![11, 13], "only the head waiter woke");
+
+        drain_global_futex_table();
+    }
+
+    /// FUTEX_WAKE waking N of M waiters returns N (the count actually
+    /// woken), not M and not the requested cap. Spec headline: wake N
+    /// of M waiters returns N.
+    #[test]
+    fn wake_n_of_m_returns_n() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        drain_global_futex_table();
+        // M = 5 waiters parked.
+        with_futex_table(|t| {
+            for pid in [1u32, 2, 3, 4, 5] {
+                t.enqueue(0x4040, pid);
+            }
+        });
+        current_process_uninstall();
+
+        // Wake N = 3.
+        let result = handle(0x4040, FUTEX_WAKE, 3, 0, 0, 0);
+        assert_eq!(result, 3, "N of M woken returns N");
+
+        // The two not-woken waiters (FIFO tail) remain parked.
+        let waiters: alloc::vec::Vec<u32> =
+            with_futex_table(|t| t.peek_waiters(0x4040).to_vec());
+        assert_eq!(waiters, alloc::vec![4, 5]);
+
+        drain_global_futex_table();
+    }
+
+    /// FUTEX_WAKE with `val` exceeding the queue length wakes (and
+    /// returns) every parked waiter — the queue empties and the entry
+    /// is pruned. The `pthread_cond_broadcast` shape (val = INT_MAX).
+    #[test]
+    fn wake_cap_exceeding_queue_wakes_all() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        drain_global_futex_table();
+        with_futex_table(|t| {
+            t.enqueue(0x4040, 7);
+            t.enqueue(0x4040, 11);
+        });
+        current_process_uninstall();
+
+        // val far larger than the 2 parked waiters.
+        let result = handle(0x4040, FUTEX_WAKE, u32::MAX, 0, 0, 0);
+        assert_eq!(result, 2, "returns the count actually woken, not val");
+
+        // This uaddr's queue is empty + pruned. (Check the specific
+        // key rather than the global live count — sibling tests share
+        // the process-wide table.)
+        let waiters: alloc::vec::Vec<u32> =
+            with_futex_table(|t| t.peek_waiters(0x4040).to_vec());
+        assert_eq!(waiters, alloc::vec![] as alloc::vec::Vec<u32>, "drained queue is empty");
+
+        drain_global_futex_table();
+    }
+
+    /// FUTEX_WAKE with `val == 0` wakes nobody and returns 0, leaving
+    /// the queue untouched. Matches Linux's `futex(uaddr, FUTEX_WAKE,
+    /// 0)` no-op.
+    #[test]
+    fn wake_zero_count_is_noop_returns_zero() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        drain_global_futex_table();
+        with_futex_table(|t| t.enqueue(0x4040, 7));
+        current_process_uninstall();
+
+        let result = handle(0x4040, FUTEX_WAKE, 0, 0, 0, 0);
+        assert_eq!(result, 0, "val=0 wakes nobody");
+
+        // Waiter still parked.
+        let waiters: alloc::vec::Vec<u32> =
+            with_futex_table(|t| t.peek_waiters(0x4040).to_vec());
+        assert_eq!(waiters, alloc::vec![7]);
+
+        drain_global_futex_table();
+    }
+
+    /// FUTEX_WAKE respects the uaddr key — a wake on one uaddr leaves
+    /// waiters parked on a different uaddr untouched. Spec headline:
+    /// wake respects the uaddr key.
+    #[test]
+    fn wake_respects_uaddr_key() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        drain_global_futex_table();
+        // Two distinct uaddrs, each with a parked waiter.
+        with_futex_table(|t| {
+            t.enqueue(0x1000, 7);
+            t.enqueue(0x2000, 11);
+        });
+        current_process_uninstall();
+
+        // Wake everything on 0x1000.
+        let result = handle(0x1000, FUTEX_WAKE, u32::MAX, 0, 0, 0);
+        assert_eq!(result, 1, "only 0x1000's lone waiter woke");
+
+        // 0x2000's waiter is still parked — the key isolated the wake.
+        let waiters_other: alloc::vec::Vec<u32> =
+            with_futex_table(|t| t.peek_waiters(0x2000).to_vec());
+        assert_eq!(waiters_other, alloc::vec![11], "other uaddr untouched");
+        // 0x1000 drained.
+        let waiters_woken: alloc::vec::Vec<u32> =
+            with_futex_table(|t| t.peek_waiters(0x1000).to_vec());
+        assert_eq!(waiters_woken, alloc::vec![] as alloc::vec::Vec<u32>);
+
+        drain_global_futex_table();
+    }
+
+    /// End-to-end WAIT → WAKE round-trip through the public `handle`
+    /// surface: a process parks via FUTEX_WAIT (state → BlockedFutex),
+    /// then FUTEX_WAKE drains it and transitions the process back to
+    /// `Running`. Proves the WAKE counterpart un-blocks the parked
+    /// process's state machine.
+    #[test]
+    fn wait_then_wake_round_trips_process_state() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let cell: u32 = 42;
+        let cell_addr = &cell as *const u32 as u64;
+        assert_eq!(cell_addr & 0b11, 0, "cell must be 4-byte aligned");
+
+        drain_global_futex_table();
+        install_test_process(7);
+
+        // WAIT: *uaddr == val → park, state becomes BlockedFutex.
+        let wait_result = handle(cell_addr, FUTEX_WAIT, 42, 0, 0, 0);
+        assert_eq!(wait_result, 0);
+        current_process_mut(|maybe_proc| {
+            let proc = maybe_proc.expect("process installed");
+            assert_eq!(proc.state, ProcessState::BlockedFutex(cell_addr));
+        });
+
+        // WAKE: drain the lone waiter (pid 7), state becomes Running.
+        let wake_result = handle(cell_addr, FUTEX_WAKE, 1, 0, 0, 0);
+        assert_eq!(wake_result, 1, "the parked pid was woken");
+        current_process_mut(|maybe_proc| {
+            let proc = maybe_proc.expect("process installed");
+            assert_eq!(
+                proc.state,
+                ProcessState::Running,
+                "woken process transitions back to Running"
+            );
+        });
+
+        // Queue drained.
+        let waiters: alloc::vec::Vec<u32> =
+            with_futex_table(|t| t.peek_waiters(cell_addr).to_vec());
+        assert_eq!(waiters, alloc::vec![] as alloc::vec::Vec<u32>);
 
         // Cleanup.
         drain_global_futex_table();
+        current_process_uninstall();
+    }
+
+    /// FUTEX_WAKE on a uaddr DIFFERENT from the one the current process
+    /// parked on does NOT transition the process out of BlockedFutex —
+    /// the state transition is gated on the uaddr key + the pid
+    /// appearing in the woken set.
+    #[test]
+    fn wake_other_uaddr_leaves_blocked_process_blocked() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let cell: u32 = 42;
+        let cell_addr = &cell as *const u32 as u64;
+        assert_eq!(cell_addr & 0b11, 0);
+
+        drain_global_futex_table();
+        install_test_process(7);
+
+        // Park pid 7 on cell_addr.
+        let wait_result = handle(cell_addr, FUTEX_WAIT, 42, 0, 0, 0);
+        assert_eq!(wait_result, 0);
+
+        // Pre-seed a waiter on a DIFFERENT uaddr so the wake there
+        // drains something (returns > 0) but must not touch pid 7's
+        // state.
+        with_futex_table(|t| t.enqueue(0x9000, 99));
+        let wake_result = handle(0x9000, FUTEX_WAKE, 1, 0, 0, 0);
+        assert_eq!(wake_result, 1);
+
+        // pid 7 is still BlockedFutex(cell_addr) — the wake on 0x9000
+        // didn't un-block it.
+        current_process_mut(|maybe_proc| {
+            let proc = maybe_proc.expect("process installed");
+            assert_eq!(proc.state, ProcessState::BlockedFutex(cell_addr));
+        });
+
+        drain_global_futex_table();
+        current_process_uninstall();
     }
 
     /// Unsupported futex ops (REQUEUE / CMP_REQUEUE / WAIT_BITSET /
