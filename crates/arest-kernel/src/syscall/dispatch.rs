@@ -207,8 +207,8 @@ pub const SYS_OPENAT: u64 = 257;
 /// pthread_mutex / pthread_cond implementation — userspace does the
 /// fast-path CAS, falls into the kernel only on contention. Routes
 /// to `futex::handle`, which dispatches on the operation discriminant
-/// (FUTEX_WAIT for the cornerstone block path, FUTEX_WAKE stubbed
-/// pending #545, all others -ENOSYS). Per #544 (Track YYYYY).
+/// (FUTEX_WAIT for the cornerstone block path, FUTEX_WAKE for the
+/// release path (#545), all others -ENOSYS). Per #544 (Track YYYYY).
 pub const SYS_FUTEX: u64 = 202;
 
 /// Linux x86_64 syscall number for `getrandom(buf, buflen, flags)`.
@@ -379,9 +379,10 @@ pub fn dispatch(
         SYS_FUTEX => {
             // futex(uaddr, futex_op, val, timeout, uaddr2, val3) per
             // `vendor/musl/arch/x86_64/syscall_arch.h:__syscall6`.
-            // Tier-1 only handles FUTEX_WAIT (block on value match) +
-            // a FUTEX_WAKE stub; #544 (Track YYYYY) ships this slice,
-            // #545 ships the real WAKE, #546+ ship REQUEUE / PI futex.
+            // Tier-1 handles FUTEX_WAIT (block on value match) +
+            // FUTEX_WAKE (release up to `val` waiters); #544 (Track
+            // YYYYY) shipped WAIT, #545 ships WAKE, #546+ ship
+            // REQUEUE / PI futex.
             futex::handle(rdi, rsi as u32, rdx as u32, r10, r8, r9 as u32)
         }
         SYS_GETRANDOM => {
@@ -705,6 +706,19 @@ mod tests {
         // before deref.
         let result = dispatch(SYS_FUTEX, 0, 0, 0, 0, 0, 0);
         assert_eq!(result, -14); // -EFAULT
+    }
+
+    /// `futex(uaddr, FUTEX_WAKE, n, ...)` on an empty queue routes
+    /// through the dispatcher to the WAKE handler (#545) and returns 0
+    /// — no waiters parked means zero woken. op = FUTEX_WAKE (1),
+    /// uaddr = a valid aligned non-null address, n = 1. Verifies the
+    /// dispatcher wires the WAKE op (not just WAIT) to futex::handle.
+    #[test]
+    fn dispatch_futex_wake_empty_queue_returns_zero() {
+        // uaddr 0x4040 is non-null + 4-byte aligned; nothing is parked
+        // there, so the wake count is 0.
+        let result = dispatch(SYS_FUTEX, 0x4040, 1, 1, 0, 0, 0);
+        assert_eq!(result, 0);
     }
 
     /// Unknown syscall numbers return `-ENOSYS`. musl + glibc both
