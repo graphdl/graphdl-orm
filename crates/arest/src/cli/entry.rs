@@ -154,6 +154,132 @@ mod db {
         ast::Object::map(map)
     }
 
+    /// read-path-defprune: walk an FFP `Object` body and push every atom
+    /// that names a known def into `out`. This is how a def body
+    /// REFERENCES another def — `metacompose_atom` resolves a bare atom by
+    /// `fetch(name, d)` first (ast.rs:6009), so any atom matching a def key
+    /// is a live edge in the def-dependency graph (the by-name reference
+    /// `Func::Def`/cell-fetch both serialize to a plain `Object::Atom`, see
+    /// `func_to_object` ast.rs:6213/6191). Scanning ALL atoms against the
+    /// def-name set is a sound over-approximation of reachability: it can
+    /// only ever pull in MORE defs than a read could touch, never fewer, so
+    /// the loaded snapshot is byte-identical to the full load on every
+    /// reachable path. (Population cells referenced by a body are already
+    /// loaded verbatim, so they need no edge here — `names` is the def set.)
+    fn collect_name_refs(
+        obj: &ast::Object,
+        names: &std::collections::HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        match obj {
+            ast::Object::Atom(s) => {
+                if names.contains(s.as_str()) {
+                    out.push(s.clone());
+                }
+            }
+            ast::Object::Seq(items) => {
+                for it in items.iter() {
+                    collect_name_refs(it, names, out);
+                }
+            }
+            ast::Object::Map(m) => {
+                for v in m.values() {
+                    collect_name_refs(v, names, out);
+                }
+            }
+            ast::Object::Bottom => {}
+        }
+    }
+
+    /// read-path-defprune: load the transitive-closure of defs REACHABLE
+    /// from a seed, instead of all of them.
+    ///
+    /// A tasks-scale DB persists ~8.6k compiled-def cells (generator
+    /// output: `query:`/`schema:`/`shard:`/`html:`/… families) but a
+    /// read-only verb resolves at most the 9 `view:` defs plus whatever
+    /// THOSE transitively reference. `load_state` parses every row up
+    /// front (~0.9s, dominated by `Object::parse` over the bulk); this
+    /// parses only the reachable set (~14 defs on tasks.db), cutting a
+    /// representative read roughly in half again.
+    ///
+    /// Closure, not a blunt prune: starting from the defs `seed_is`
+    /// selects, every atom in a loaded body that names another def is
+    /// followed (BFS) until no new def is discovered — so the snapshot
+    /// holds exactly the defs a read can reach and is byte-identical to
+    /// the full load on every reachable path. ALL population/schema cells
+    /// are loaded unconditionally (only ~221 rows, all the read verbs may
+    /// touch them, and they are cheap), so only the def table is pruned.
+    ///
+    /// Safe in general: it relies on no fragile "views never embed Def
+    /// refs" invariant — if a view's derivation DID reference a
+    /// `derivation:`/`schema:` def, the walk would simply load it too.
+    pub fn load_state_closure(
+        conn: &Connection,
+        seed_is: impl Fn(&str) -> bool,
+    ) -> ast::Object {
+        let mut map: hashbrown::HashMap<String, ast::Object> =
+            hashbrown::HashMap::new();
+
+        // All population/schema cells, verbatim (cheap; any read may read
+        // any of them, e.g. `sql` materializes FT tables from them).
+        if let Ok(mut stmt) = conn.prepare("SELECT name, contents FROM cells") {
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            }).unwrap_or_else(|e| { eprintln!("Failed to read cells: {}", e); std::process::exit(1); });
+            for r in rows.filter_map(|r| r.ok()) {
+                map.insert(r.0, ast::Object::parse(&r.1));
+            }
+        }
+
+        // The full set of def NAMES (key column only — no body parse), so
+        // the walk can recognise which atoms are def references and the
+        // seed predicate has the universe to select from.
+        let mut def_names: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        if let Ok(mut stmt) = conn.prepare("SELECT name FROM defs") {
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap_or_else(|e| { eprintln!("Failed to read def names: {}", e); std::process::exit(1); });
+            for n in rows.filter_map(|r| r.ok()) {
+                def_names.insert(n);
+            }
+        }
+
+        // BFS the def-dependency graph from the seed. `loaded` guards
+        // against re-parsing (and cycles); `frontier` holds names whose
+        // bodies still need scanning. One prepared statement, point
+        // lookups by primary key.
+        let mut body_stmt = match conn.prepare("SELECT func FROM defs WHERE name = ?1") {
+            Ok(s) => s,
+            Err(e) => { eprintln!("Failed to prepare def lookup: {}", e); std::process::exit(1); }
+        };
+        let mut loaded: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut frontier: Vec<String> = def_names.iter()
+            .filter(|n| seed_is(n))
+            .cloned()
+            .collect();
+        while let Some(name) = frontier.pop() {
+            if !loaded.insert(name.clone()) {
+                continue;
+            }
+            let body: Option<String> = body_stmt
+                .query_row([&name], |row| row.get::<_, String>(0))
+                .ok();
+            let Some(body) = body else { continue };
+            let obj = ast::Object::parse(&body);
+            let mut refs: Vec<String> = Vec::new();
+            collect_name_refs(&obj, &def_names, &mut refs);
+            for r in refs {
+                if !loaded.contains(&r) {
+                    frontier.push(r);
+                }
+            }
+            map.insert(name, obj);
+        }
+
+        ast::Object::map(map)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -626,27 +752,59 @@ fn is_read_only_cli_key(key: &str) -> bool {
 
 /// read-path-fast-path: lighter load for the read-only verbs.
 ///
-/// Just `db::load_state` — the persisted population cells AND the
-/// persisted compiled-def cells (`view:`, `schema:`, `derivation:`, …),
-/// merged into one `Object::Map`. This is precisely the snapshot the
-/// read-only intercepts consume; it skips the `population_only` strip,
+/// All three read keys skip the `population_only` strip,
 /// `compile::compile_to_defs_state`, and `ast::defs_to_state` that only
-/// the write path needs. `load_state` already dominates the residual
-/// cost (~0.9s, mostly `Object::parse` over the rows); dropping the
-/// recompile is the ~1.3s win.
+/// the write path needs (the ~1.3s recompile win). `sql` additionally
+/// prunes the def table to its reachable closure (read-path-defprune):
+///
+///   * `sql` — `db::load_state_closure` seeded with the `view:` defs
+///     (the only defs `sql` resolves, via `ast::resolve_view` for an
+///     empty-stored view FT) plus the colon-free platform singletons,
+///     then transitively closed over any def those bodies reference.
+///     On tasks.db the closure is ~14 defs vs the full 8.6k, so the
+///     `load_state` `Object::parse` cost drops from ~0.5s to a blink.
+///     Byte-identical: `sql` only ever reaches the loaded closure, and
+///     the closure load brings in exactly that (verified on tasks.db).
+///
+///   * `cells` / `orient` — `db::load_state` (FULL). Both are
+///     whole-snapshot consumers whose output is order- or
+///     enumeration-sensitive to the LOADED set, so pruning the defs
+///     would change the envelope even though it never changes
+///     correctness:
+///       - `cells list *` enumerates EVERY cell and `cells get <name>`
+///         can fetch any persisted def (cells_introspect.rs:93/126), so
+///         the whole def table is genuinely reachable.
+///       - `orient`'s `recent_changes` truncates an iteration over the
+///         loaded `Object::Map` to the first 10 (orient.rs:342); the
+///         `hashbrown` map's iteration order is a function of how many
+///         entries were inserted, so a pruned load reorders the sample.
+///         The population it reads is identical either way — only the
+///         arbitrary 10-of-N window would shift — but byte-identity is
+///         the contract, so `orient` keeps the full load. (The compile
+///         skip is the win it already had; the def-prune is sql-only.)
 ///
 /// Escape hatch: set `AREST_READ_FASTPATH=0` to force the full
 /// `load_and_compile` even for a read key (A/B timing, or a fallback if
 /// a stale on-disk `defs` cache is ever suspected — a recompile then
 /// regenerates the def families from the loaded population).
 #[cfg(feature = "local")]
-fn load_for_read(conn: &rusqlite::Connection) -> ast::Object {
+fn load_for_read(conn: &rusqlite::Connection, key: &str) -> ast::Object {
     if std::env::var("AREST_READ_FASTPATH").as_deref() == Ok("0") {
         return load_and_compile(conn);
     }
     let t = std::time::Instant::now();
-    let d = db::load_state(conn);
-    eprintln!("[profile] load_state (read fast-path, compile skipped): {:?}", t.elapsed());
+    let d = if key == "sql" {
+        // `sql`: load only the defs reachable from the `view:` +
+        // platform-singleton seed (transitively closed).
+        db::load_state_closure(conn, |name| {
+            name.starts_with("view:") || !name.contains(':')
+        })
+    } else {
+        // `cells` / `orient`: whole-snapshot consumers — load all defs
+        // so the enumerated / sampled output stays byte-identical.
+        db::load_state(conn)
+    };
+    eprintln!("[profile] load_for_read ({}, compile skipped): {:?}", key, t.elapsed());
     d
 }
 
@@ -1408,7 +1566,7 @@ pub fn main_entry() {
                 // serve straight off the loaded snapshot — skip the
                 // write-only recompile via the lighter `load_for_read`.
                 let d = if is_read_only_cli_key(key) {
-                    load_for_read(&conn)
+                    load_for_read(&conn, key)
                 } else {
                     load_and_compile(&conn)
                 };
@@ -1651,5 +1809,64 @@ mod stale_def_tests {
         assert_eq!(file_of2("Noun", "Region").as_deref(), Some("customers.md"),
             "with the catalog seed, Region must STILL be attributed; \
              facts: {:?}", facts2);
+    }
+
+    /// read-path-defprune. `db::load_state_closure` must load the
+    /// transitive closure of defs reachable from the seed and PRUNE the
+    /// rest, while keeping ALL population cells. The reachability edge is
+    /// a body atom that names another def (how `metacompose_atom`
+    /// resolves a reference, ast.rs:6009) — so a `view:` def that fetches
+    /// a populated cell pulls that nothing extra, but a `view:` def whose
+    /// body names ANOTHER def must transitively pull that def in.
+    #[test]
+    fn load_state_closure_loads_reachable_defs_and_prunes_the_rest() {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory sqlite");
+        db::ensure_meta_tables(&conn);
+
+        // Population cells — every one must survive (reads may touch any).
+        conn.execute("INSERT INTO cells (name, contents) VALUES (?1, ?2)",
+            rusqlite::params!["Task_has_Task_Status", "<<<status, open>>>"]).unwrap();
+        conn.execute("INSERT INTO cells (name, contents) VALUES (?1, ?2)",
+            rusqlite::params!["FactType", "<<<id, Task_has_Task_Status>>>"]).unwrap();
+
+        // Seed def `view:A` references population cell `Task_has_Task_Status`
+        // (already loaded) AND another def `derivation:shared` by name — the
+        // closure walk must follow that edge.
+        conn.execute("INSERT INTO defs (name, func) VALUES (?1, ?2)",
+            rusqlite::params!["view:A",
+                "<., ^?, <[, <', Task_has_Task_Status>, <', derivation:shared>>>"]).unwrap();
+        // `derivation:shared` is reachable ONLY transitively from view:A. Its
+        // own body references a further def `resolve:deep` — closure again.
+        conn.execute("INSERT INTO defs (name, func) VALUES (?1, ?2)",
+            rusqlite::params!["derivation:shared", "<', resolve:deep>"]).unwrap();
+        conn.execute("INSERT INTO defs (name, func) VALUES (?1, ?2)",
+            rusqlite::params!["resolve:deep", "id"]).unwrap();
+        // Platform singleton (colon-free) is part of the seed predicate.
+        conn.execute("INSERT INTO defs (name, func) VALUES (?1, ?2)",
+            rusqlite::params!["compile", "platform:compile"]).unwrap();
+        // UNREACHABLE generator def — referenced by NOTHING in the seed
+        // closure. Must be pruned (this is the 8.6k-row bulk on tasks.db).
+        conn.execute("INSERT INTO defs (name, func) VALUES (?1, ?2)",
+            rusqlite::params!["query:Unrelated", "<', Task_has_Task_Status>"]).unwrap();
+
+        let d = db::load_state_closure(&conn, |name| {
+            name.starts_with("view:") || !name.contains(':')
+        });
+
+        // Population cells: always present.
+        assert_ne!(ast::fetch("Task_has_Task_Status", &d), ast::Object::Bottom,
+            "population cells must always load");
+        assert_ne!(ast::fetch("FactType", &d), ast::Object::Bottom);
+        // Seed + transitively-reached defs: present.
+        assert_ne!(ast::fetch("view:A", &d), ast::Object::Bottom, "seed view def must load");
+        assert_ne!(ast::fetch("derivation:shared", &d), ast::Object::Bottom,
+            "def referenced by a loaded view body must be pulled in (closure)");
+        assert_ne!(ast::fetch("resolve:deep", &d), ast::Object::Bottom,
+            "transitively-referenced def must be pulled in (closure depth > 1)");
+        assert_ne!(ast::fetch("compile", &d), ast::Object::Bottom,
+            "colon-free platform singleton is in the seed");
+        // Unreachable bulk: pruned.
+        assert_eq!(ast::fetch("query:Unrelated", &d), ast::Object::Bottom,
+            "a def reachable from nothing in the seed closure must be pruned");
     }
 }
