@@ -142,6 +142,17 @@ pub mod back_action;
 // replacing the hardcoded silent drop that broke Up/Down history navigation.
 // No Slint, no UEFI, no `system::*` calls — host-testable.
 pub mod command_shortcut;
+// Virtio-input tablet detection — fact-driven device-capability model
+// (#972, split from #596). Pure classifier + cell-resolution functions
+// over `&Object`: `ev_abs_bitmap_indicates_tablet` classifies a live
+// `VirtIOInput::ev_bits(EV_ABS)` bitmap, `seed_input_device_cell` pushes
+// the `InputDevice_has_AbsAxes` fact, and `has_tablet_from_state` reads
+// it back. Extracted from `linuxkpi::virtio` (which is UEFI-gated) so the
+// detection logic is host-testable; `linuxkpi::virtio::has_tablet` is now
+// `system::with_state(has_tablet_from_state)` and the UEFI device-install
+// path seeds the cell from the real `ev_bits(EV_ABS)` query. No Slint, no
+// MMIO at resolve time — host-testable.
+pub mod linuxkpi_virtio_tablet;
 // `ui_apps` is the Slint-driven boot UI surface (Unified REPL,
 // launcher, keyboard, doom). Every submodule that touches the
 // runtime imports `slint::*`, and the launcher's `run(...)`
