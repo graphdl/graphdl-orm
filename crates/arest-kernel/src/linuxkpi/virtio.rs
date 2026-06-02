@@ -324,13 +324,23 @@ pub extern "C" fn virtio_find_vqs(
     // is exactly the scope #495 asked for. On failure we drop the
     // transport (it gets unwound by `VirtIOInput::new`'s error path
     // releasing any partially-set queues).
-    let driver = match VirtIOInput::new(transport) {
+    let mut driver = match VirtIOInput::new(transport) {
         Ok(d) => d,
         Err(e) => {
             crate::println!("  linuxkpi/virtio: VirtIOInput::new failed: {:?}", e);
             return -19;
         }
     };
+
+    // #972: record absolute-axis (tablet) capability from the live
+    // device's `EV_ABS` bitmap into the SYSTEM cell graph so
+    // `has_tablet()` reads it back. Keyed by the `vdev` pointer (the
+    // C-path device identity) so it never collides with the BDF-keyed
+    // slugs the pure-Rust `install_input_device_from_pci` path emits.
+    let abs_axes = device_advertises_abs_axes(&mut driver);
+    let slug = alloc::format!("vdev-{:#x}", vdev as usize);
+    record_input_device_capability(&slug, abs_axes);
+
     let driver = Arc::new(Mutex::new(InputCell(driver)));
 
     // Allocate per-queue C-shape handles. Box-leak so the C side's
@@ -672,13 +682,24 @@ pub fn install_input_device_from_pci(bus: u8, device: u8, function: u8) -> bool 
         );
         return false;
     }
-    let driver = match VirtIOInput::new(transport) {
+    let mut driver = match VirtIOInput::new(transport) {
         Ok(d) => d,
         Err(e) => {
             crate::println!("  linuxkpi/virtio: VirtIOInput::new failed: {:?}", e);
             return false;
         }
     };
+
+    // #972: detect absolute-axis (tablet) capability from the live
+    // device's `EV_ABS` config-space bitmap, and record it as an
+    // `InputDevice_has_AbsAxes` fact keyed by the PCI BDF slug so
+    // `has_tablet()` reads it back from the SYSTEM cell graph. Done
+    // here (before the driver moves into `InputCell`) because `ev_bits`
+    // needs `&mut` and this is the only point we hold the bare driver.
+    let abs_axes = device_advertises_abs_axes(&mut driver);
+    let slug = alloc::format!("pci-{:02x}:{:02x}.{}", bus, device, function);
+    record_input_device_capability(&slug, abs_axes);
+
     let driver = Arc::new(Mutex::new(InputCell(driver)));
 
     // Pure Rust path — no C-side `Virtqueue` handles to leak. The
@@ -704,42 +725,96 @@ pub fn install_input_device_from_pci(bus: u8, device: u8, function: u8) -> bool 
     true
 }
 
-/// True when at least one of the registered virtio-input devices is
-/// likely a tablet (absolute-positioning pointer device). On the
-/// foundation slice we don't yet read VIRTIO_INPUT_CFG_EV_BITS to
-/// discriminate keyboards from tablets at the per-device level
-/// (see `entry_uefi.rs`'s discovery loop comment for the rationale —
-/// the rcore `virtio-drivers` crate doesn't expose the raw config-
-/// space EV_BITS query through `VirtIOInput`'s public surface), so
-/// the heuristic mirrors the same enumeration-order convention the
-/// boot banner uses: keyboard first, tablet second per
-/// `Dockerfile.uefi`'s `-device virtio-keyboard-pci -device
-/// virtio-tablet-pci` ordering. Two-or-more registered devices →
-/// the second is the tablet.
+/// Read the `VIRTIO_INPUT_CFG_EV_BITS(EV_ABS)` bitmap off a live rcore
+/// `VirtIOInput` and decide whether the device is an absolute-
+/// positioning pointer (tablet / touchscreen).
+///
+/// `virtio-drivers` 0.11 exposes `VirtIOInput::ev_bits(event_type)` (a
+/// `VIRTIO_INPUT_CFG_EV_BITS` config-space query) returning the bitmap
+/// of supported codes for that `EV_*` type — so the per-device
+/// capability is genuinely queryable now (the old "the rcore crate
+/// doesn't expose EV_BITS" comment no longer holds). We query
+/// `EV_ABS` and hand the bitmap to
+/// `crate::linuxkpi_virtio_tablet::ev_abs_bitmap_indicates_tablet`,
+/// which is `true` iff `ABS_X` / `ABS_Y` are advertised — the same
+/// discriminator Linux's evdev layer uses for tablet-vs-mouse.
+///
+/// Returns `false` if the query errors (treated as "no absolute axes"
+/// — a relative mouse / keyboard, or a device whose config space we
+/// couldn't read). Takes `&mut` because `ev_bits` issues config-space
+/// writes (select / subsel) before the read.
+fn device_advertises_abs_axes(driver: &mut VirtIOInput) -> bool {
+    match driver.ev_bits(super::input::EV_ABS as u8) {
+        Ok(bitmap) => {
+            crate::linuxkpi_virtio_tablet::ev_abs_bitmap_indicates_tablet(&bitmap)
+        }
+        Err(e) => {
+            crate::println!(
+                "  linuxkpi/virtio: ev_bits(EV_ABS) query failed ({:?}); treating as non-tablet",
+                e
+            );
+            false
+        }
+    }
+}
+
+/// Record a discovered virtio-input device's absolute-axis capability
+/// into the SYSTEM cell graph as an `InputDevice_has_AbsAxes` fact (see
+/// `crate::linuxkpi_virtio_tablet`). `has_tablet()` reads these facts
+/// back, so this is what makes the detection real rather than a
+/// constant.
+///
+/// `device_slug` is a stable per-device label (the PCI BDF string on
+/// the install path). `abs_axes` comes from
+/// `device_advertises_abs_axes`. On `system::apply` failure we log and
+/// continue — a missed seed degrades to "no tablet" (the safe default)
+/// rather than taking down discovery.
+fn record_input_device_capability(device_slug: &str, abs_axes: bool) {
+    let new_state = crate::system::with_state(|state| {
+        crate::linuxkpi_virtio_tablet::seed_input_device_cell(device_slug, abs_axes, state)
+    });
+    let new_state = match new_state {
+        Some(s) => s,
+        // SYSTEM not initialised yet (capability recorded before
+        // `system::init`). Nothing to seed into; `has_tablet()` will
+        // read the empty graph as "no tablet" until a later boot seeds
+        // it. Shouldn't happen on the real path (discovery runs after
+        // `system::init`), but degrade cleanly rather than panic.
+        None => return,
+    };
+    if let Err(msg) = crate::system::apply(new_state) {
+        crate::println!(
+            "  linuxkpi/virtio: record_input_device_capability apply failed ({msg}) for {device_slug}"
+        );
+    }
+}
+
+/// True when at least one registered virtio-input device advertises
+/// absolute-axis (tablet / touchscreen) capability — i.e. the
+/// pointer/touch path can use absolute coordinates.
+///
+/// Reads the actual device registry, not a constant: each device's
+/// absolute-axis capability is recorded as an
+/// `InputDevice_has_AbsAxes` fact in the SYSTEM cell graph at install
+/// time (`install_input_device_from_pci` →
+/// `record_input_device_capability`, sourcing the verdict from the live
+/// `ev_bits(EV_ABS)` query via `device_advertises_abs_axes`). This
+/// function delegates to the pure, host-tested reader
+/// `crate::linuxkpi_virtio_tablet::has_tablet_from_state`.
 ///
 /// Returns `false` when:
-///   * `INPUTS` hasn't been initialised yet (`linuxkpi::init()` has
-///     not run — pre-boot or non-linuxkpi build path).
-///   * Fewer than 2 devices have been registered (keyboard-only
-///     boot, or the build path that hits the `-ENODEV` foundation-
-///     mode branch in `virtio_find_vqs` and never registers a
-///     `DeviceState`).
+///   * SYSTEM hasn't been initialised yet (`system::init` has not run
+///     — pre-boot), or
+///   * no registered device advertises absolute axes (keyboard /
+///     relative-mouse-only boot, or the `-ENODEV` foundation-mode path
+///     that never constructs a device).
 ///
-/// Cheap: one map-len read under a brief Mutex acquire. Designed to
+/// Cheap: one cell read under a brief `SYSTEM` read-lock. Designed to
 /// be called once at boot from the launcher's bootstrap (post-
 /// `system::init`, pre-super-loop) — not per-frame.
 pub fn has_tablet() -> bool {
-    // #595/#596 follow-up: returning `true` here triggers
-    // `apply_touch_mode_if_tablet_present()` which churns SYSTEM state
-    // and appears to stress the heap enough to surface a virtio-net
-    // descriptor corruption (panic in `virtio-drivers/net_buf.rs:76`
-    // with a length field interpreted as 2_883_584). Pointer events
-    // still flow through `drain_pointer_into_slint_window` regardless
-    // of touch mode — touch mode is purely a UI density preference.
-    // The user's stated preference is keyboard + mouse + Doom, not
-    // touch-mode density, so locking this to `false` matches their ask
-    // while we continue investigating the descriptor corruption.
-    false
+    crate::system::with_state(crate::linuxkpi_virtio_tablet::has_tablet_from_state)
+        .unwrap_or(false)
 }
 
 // ── Callback dispatch ──────────────────────────────────────────────
@@ -974,23 +1049,22 @@ mod tests {
         poll_all_vqs();
     }
 
-    /// `has_tablet()` returns `false` when no devices have been
-    /// registered (pre-boot, or the foundation-mode `-ENODEV` path
-    /// where `virtio_find_vqs` never builds a `DeviceState`).
-    /// `input_device_count()` agrees by returning 0 in the same
-    /// state — Track XXXXX #466's launcher-side touch-mode detection
-    /// relies on both reading "no devices" rather than panicking on
-    /// the empty map.
+    /// `has_tablet()` returns `false` when SYSTEM has not been
+    /// initialised / no `InputDevice_has_AbsAxes` fact has been seeded
+    /// (pre-boot, or the foundation-mode `-ENODEV` path where
+    /// `virtio_find_vqs` never builds a device and so never records a
+    /// capability). #972 moved the detection off `input_device_count`
+    /// and onto the SYSTEM cell graph; the host-target unit tests for
+    /// the classifier + cell reader live in
+    /// `crate::linuxkpi_virtio_tablet` (this module is UEFI-gated, so
+    /// its `#[cfg(test)]` block does not run under `cargo test --lib`
+    /// on the host). Here we only assert the no-device default: with no
+    /// SYSTEM state stood up, `system::with_state` yields `None` and
+    /// `has_tablet()` degrades to `false`.
     #[test]
     fn has_tablet_with_no_devices_is_false() {
         init();
-        // INPUTS may carry leftover state from sibling tests in this
-        // module; assert `has_tablet` agrees with `input_device_count`
-        // rather than asserting an absolute count, so test order
-        // doesn't matter. Both functions read the same map under the
-        // same lock so they always agree.
-        let count = input_device_count();
-        assert_eq!(has_tablet(), count >= 2);
+        assert!(!has_tablet());
     }
 
     /// `virtqueue_add_inbuf` returns -ENODEV without an attached
