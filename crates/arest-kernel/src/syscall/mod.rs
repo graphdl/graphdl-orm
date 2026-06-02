@@ -71,6 +71,7 @@ pub mod read;
 pub mod rt_sigaction;
 pub mod rt_sigprocmask;
 pub mod rt_sigreturn;
+pub mod socket;
 pub mod stat;
 pub mod write;
 

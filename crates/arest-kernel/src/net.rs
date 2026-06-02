@@ -24,6 +24,7 @@
 // one — the HTTP server can be smoke-tested against `127.0.0.1`
 // inside the kernel before any external packet flows exist.
 
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
@@ -32,6 +33,8 @@ use smoltcp::socket::{dhcpv4, tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Cidr};
 use spin::Mutex;
+
+use crate::net_socket::{SocketId, SocketIdAllocator};
 
 // `file_serve` / `file_upload` reach into `crate::block_storage`, which
 // is `cfg(all(target_os = "uefi", target_arch = "x86_64"))`-gated (see
@@ -230,6 +233,22 @@ struct NetState {
     /// is called; single-listener for now because the kernel's only
     /// HTTP surface is the HATEOAS site. poll() drives it each tick.
     http_listener: Option<HttpListener>,
+    /// Allocator for the kernel socket ids handed out by
+    /// `create_tcp_socket` (#478a). Monotonic + unique; the id is the
+    /// stable token the per-process fd table stores
+    /// (`FdEntry::Socket { socket_id }`) and `socket_registry` below
+    /// maps back to the live smoltcp `SocketHandle`. The bookkeeping
+    /// lives in `crate::net_socket` (host-tested) so the uniqueness /
+    /// monotonicity contract is verified without a live interface.
+    socket_ids: SocketIdAllocator,
+    /// Registry mapping each kernel `SocketId` to the smoltcp
+    /// `SocketHandle` the interface's `SocketSet` owns (#478a). Built so
+    /// the fd table can store a smoltcp-free `u64` id while the syscall
+    /// handlers (connect / read / write / close, future slices) resolve
+    /// that id back to the socket here. `socket()` (#478a) inserts one
+    /// entry per created socket and does no I/O; the entry is removed by
+    /// the future `close` handler when the socket fd is released.
+    socket_registry: BTreeMap<u64, SocketHandle>,
 }
 
 /// State for the kernel's single HTTP/1.1 listener (#264).
@@ -362,6 +381,11 @@ pub fn init(virtio: Option<VirtioPhy>) {
         dhcp_handle,
         lease: None,
         http_listener: None,
+        // Socket-id allocator + registry start empty — populated by
+        // `create_tcp_socket` as userspace `socket()` calls arrive
+        // (#478a).
+        socket_ids: SocketIdAllocator::new(),
+        socket_registry: BTreeMap::new(),
     });
 }
 
@@ -908,6 +932,127 @@ pub fn udp_recv_from(
         Ok((n, meta)) => Ok(Some((n, meta.endpoint))),
         Err(udp::RecvError::Exhausted) => Ok(None),
         Err(udp::RecvError::Truncated) => Err(UdpError::RecvBufferTooSmall),
+    }
+}
+
+// ── TCP socket creation (#478a — socket(AF_INET, SOCK_STREAM)) ──────
+//
+// `socket(2)` creates a TCP socket but does NO I/O — no connect, no
+// bind, no listen. It just constructs the smoltcp `tcp::Socket`, adds
+// it to the interface's `SocketSet` (so a future `poll` drives it once
+// it's connected/listening), allocates a kernel `SocketId`, records the
+// id → smoltcp-handle mapping in the registry, and returns the id. The
+// syscall handler (`crate::syscall::socket`) then allocates an fd in
+// the calling process's fd table and binds it to the id via
+// `FdEntry::Socket { socket_id }`.
+//
+// Buffer sizing: 4 KiB rx + 4 KiB tx, matching `register_http`'s listen
+// socket. The smoltcp `tcp::Socket` needs owned `'static` buffers to
+// live in the `SocketSet<'static>`; `Vec`-backed `SocketBuffer`s give
+// us that (same pattern `register_http` / `udp_bind` use). A freshly-
+// created (unconnected) socket holds these rings idle until a future
+// `connect` slice drives the handshake — the allocation is the cost of
+// "the fd exists and is wired to a real socket", which is the whole
+// point of `socket()` returning a usable fd before any I/O.
+
+/// Errors surfaced by [`create_tcp_socket`]. Mirrors the shape of
+/// [`UdpError`] — a single enum so the syscall handler doesn't have to
+/// know smoltcp's internals. Today the only failure mode is "the stack
+/// isn't up yet" (no `net::init`); the smoltcp `tcp::Socket::new` +
+/// `SocketSet::add` calls themselves don't fail (add panics only if the
+/// set's backing storage is exhausted, which the `Vec`-backed unbounded
+/// set never is).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketError {
+    /// `net::init` has not been called yet — there's no interface /
+    /// socket set to add the socket to. The `socket()` syscall handler
+    /// maps this to a negative errno (the kernel booted without a net
+    /// stack, or the call arrived before boot wired it).
+    NotInitialised,
+}
+
+/// Create a TCP socket on the kernel's network interface and return the
+/// kernel [`SocketId`] bound to it (#478a). No I/O is performed — the
+/// socket is created idle (not connected, not listening). The caller
+/// (the `socket()` syscall handler) allocates an fd and stores the
+/// returned id in the process's fd table.
+///
+/// Mirrors the shape of [`udp_bind`] / [`register_http`]: allocate the
+/// rx + tx rings on the heap (so they're `'static`, which
+/// `SocketSet<'static>` requires), construct the smoltcp `tcp::Socket`,
+/// add it to the global socket set, then mint a `SocketId` and record
+/// the id → handle mapping so later syscalls can find the socket.
+///
+/// Returns `Err(SocketError::NotInitialised)` when `net::init` hasn't
+/// run.
+pub fn create_tcp_socket() -> Result<SocketId, SocketError> {
+    // 4 KiB each, matching the HTTP listen socket. Enough for a small
+    // request/response without an immediate ring resize; a future
+    // setsockopt(SO_{RCV,SND}BUF) surface can make this tunable.
+    const RX_BYTES: usize = 4096;
+    const TX_BYTES: usize = 4096;
+
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(SocketError::NotInitialised)?;
+
+    // Owned (`Vec`-backed) buffers so the socket is `'static`-lifetime
+    // and lives in the static `SocketSet`. Same ownership story as
+    // `register_http`'s rx/tx buffers.
+    let rx_buffer = tcp::SocketBuffer::new(vec![0u8; RX_BYTES]);
+    let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TX_BYTES]);
+    let socket = tcp::Socket::new(rx_buffer, tx_buffer);
+    // Created idle — NO listen()/connect() here. `socket()` is creation
+    // only; the connect/bind/listen slices drive the state machine.
+
+    let handle = state.sockets.add(socket);
+
+    // Mint the kernel id and record the mapping. The id (not the smoltcp
+    // handle) is what the fd table stores.
+    let id = state.socket_ids.allocate();
+    state.socket_registry.insert(id.as_u64(), handle);
+    Ok(id)
+}
+
+/// Look up the smoltcp [`SocketHandle`] a kernel [`SocketId`] is bound
+/// to (#478a). Returns `None` when the id isn't in the registry (never
+/// created, or already closed) or when `net::init` hasn't run. The
+/// future connect / read / write / close handlers use this to resolve
+/// an fd's stored `socket_id` back to the live socket; it's exposed now
+/// so the socket-creation contract ("the id maps to a real handle") is
+/// testable and the later slices have their lookup seam ready.
+pub fn socket_handle(id: SocketId) -> Option<SocketHandle> {
+    NET.lock()
+        .as_ref()
+        .and_then(|s| s.socket_registry.get(&id.as_u64()).copied())
+}
+
+/// Number of sockets currently in the registry (#478a). Test / debug
+/// helper — lets the unit tests assert that `create_tcp_socket` grew
+/// the registry by exactly one without poking the private field.
+pub fn registered_socket_count() -> usize {
+    NET.lock().as_ref().map_or(0, |s| s.socket_registry.len())
+}
+
+/// Tear down the socket bound to `id` (#478a): remove it from both the
+/// kernel registry and the smoltcp `SocketSet`, freeing its ring
+/// buffers. No-op (returns without error) when the id isn't registered
+/// or `net::init` hasn't run.
+///
+/// Used by the `socket()` syscall handler on the rare failure path where
+/// the socket was created but the fd couldn't be allocated (table full)
+/// — so the orphaned socket doesn't leak. Because `socket()` does no
+/// I/O, the socket is always idle (not connected/listening) when this
+/// runs, so removing it is wire-invisible. The future `close` handler
+/// will call this same path once a socket fd is released.
+pub fn destroy_socket(id: SocketId) {
+    let mut guard = NET.lock();
+    let Some(state) = guard.as_mut() else { return };
+    if let Some(handle) = state.socket_registry.remove(&id.as_u64()) {
+        // `SocketSet::remove` returns the owned `Socket`; dropping it
+        // frees the rx/tx rings. Guard against a double-remove (the
+        // handle should always be present right after a registry hit,
+        // but a future concurrent path shouldn't panic).
+        let _ = state.sockets.remove(handle);
     }
 }
 

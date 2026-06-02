@@ -263,6 +263,13 @@ fn collect_fd_snapshots(p: &Process) -> Vec<FdSnapshot> {
             let target = match entry {
                 OpenFdEntry::Synthetic { path } => path.clone(),
                 OpenFdEntry::File { cell_id, .. } => format!("/file/{}", cell_id),
+                // Socket fds (#478a) render the Linux-style
+                // `socket:[<inode>]` symlink target — Linux puts the
+                // socket's inode number in the brackets; tier-1 uses the
+                // kernel socket id (which keys `crate::net`'s registry)
+                // as the stand-in inode. Matches what `ls -l /proc/<pid>/fd`
+                // shows for a socket fd on real Linux.
+                OpenFdEntry::Socket { socket_id } => format!("socket:[{}]", socket_id),
             };
             out.push(FdSnapshot { fd, target });
         }

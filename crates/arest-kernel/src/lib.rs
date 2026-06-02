@@ -246,6 +246,13 @@ pub mod block_storage;
 pub mod file_serve;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 pub mod file_upload;
+// `net_socket` (#478a). Host-testable decision logic for the
+// `socket(2)` syscall — argument validation + the monotonic socket-id
+// allocator. Unconditional `pub mod` (compiles + unit-tests on the host
+// target) so the smoltcp-bearing `net` wrapper and the gated syscall
+// path can both build on it. Mirror of #972's `linuxkpi_virtio_tablet`
+// split: decisions here, hardware glue in `net`.
+pub mod net_socket;
 pub mod net;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 pub mod virtio;

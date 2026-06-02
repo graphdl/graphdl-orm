@@ -67,6 +67,7 @@ use crate::syscall::read;
 use crate::syscall::rt_sigaction;
 use crate::syscall::rt_sigprocmask;
 use crate::syscall::rt_sigreturn;
+use crate::syscall::socket;
 use crate::syscall::stat;
 use crate::syscall::write;
 
@@ -301,6 +302,16 @@ pub const SYS_RT_SIGPROCMASK: u64 = 14;
 /// register frame) on return from a signal handler. Per #548.
 pub const SYS_RT_SIGRETURN: u64 = 15;
 
+/// Linux x86_64 syscall number for
+/// `socket(int domain, int type, int protocol)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_socket` (= 41).
+/// The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_socket`. Routes to
+/// `socket::handle`, which creates a TCP socket (`AF_INET` +
+/// `SOCK_STREAM`) on the kernel's smoltcp interface and allocates a
+/// per-process fd bound to it — creation only, no I/O. Per #478a.
+pub const SYS_SOCKET: u64 = 41;
+
 /// The dispatch entry point. Match on `rax` and forward the argument
 /// registers (rdi / rsi / rdx / r10 / r8 / r9) to the per-syscall
 /// handler. Handlers that take fewer than six args simply ignore the
@@ -448,6 +459,16 @@ pub fn dispatch(
             // registers; the tier-1 plumbing drives the per-process
             // saved-context slot instead. Args ignored. Per #548.
             rt_sigreturn::handle()
+        }
+        SYS_SOCKET => {
+            // socket(domain, type, protocol) — create a TCP socket and
+            // allocate a per-process fd bound to it. rdi = domain
+            // (AF_INET), rsi = type (SOCK_STREAM), rdx = protocol
+            // (IPPROTO_IP default | IPPROTO_TCP). Creation only — no
+            // connect / bind / listen / I/O. Returns the fd (≥ 3) or a
+            // negative errno (-EAFNOSUPPORT / -EPROTONOSUPPORT / -EINVAL
+            // / -EMFILE / -ENOSYS). Per #478a.
+            socket::handle(rdi, rsi, rdx)
         }
         SYS_EXIT | SYS_EXIT_GROUP => {
             // exit / exit_group both transition the Process state
@@ -608,6 +629,36 @@ mod tests {
     #[test]
     fn sys_ioctl_number_matches_linux_uapi() {
         assert_eq!(SYS_IOCTL, 16);
+    }
+
+    /// `SYS_SOCKET` is 41 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_socket`.
+    #[test]
+    fn sys_socket_number_matches_linux_uapi() {
+        assert_eq!(SYS_SOCKET, 41);
+    }
+
+    /// `dispatch(SYS_SOCKET, AF_INET6, SOCK_STREAM, 0, ...)` routes to
+    /// `socket::handle` and the address-family rejection fires →
+    /// `-EAFNOSUPPORT` (-97). Verifies the dispatcher wires syscall 41
+    /// to the socket handler. (AF_INET6 = 10, SOCK_STREAM = 1.) The
+    /// rejection happens before socket creation, so no process / net
+    /// stack is needed.
+    #[test]
+    fn dispatch_socket_af_inet6_returns_eafnosupport() {
+        // domain = AF_INET6 (10), type = SOCK_STREAM (1), protocol = 0.
+        let result = dispatch(SYS_SOCKET, 10, 1, 0, 0, 0, 0);
+        assert_eq!(result, -97);
+    }
+
+    /// `dispatch(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0, ...)` → -93
+    /// (-EPROTONOSUPPORT). UDP isn't served by the TCP-creation path.
+    /// Confirms the dispatcher routes 41 and the dgram rejection fires.
+    #[test]
+    fn dispatch_socket_dgram_returns_eprotonosupport() {
+        // domain = AF_INET (2), type = SOCK_DGRAM (2), protocol = 0.
+        let result = dispatch(SYS_SOCKET, 2, 2, 0, 0, 0, 0);
+        assert_eq!(result, -93);
     }
 
     /// `SYS_MMAP` is 9 — matches
