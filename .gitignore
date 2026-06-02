@@ -30,6 +30,9 @@ yarn-error.log*
 # worktrees
 .worktrees/
 
+# Claude Code agent state — session config + linked agent worktrees (.claude/worktrees/)
+.claude/
+
 # Visual Studio
 .vs/
 
