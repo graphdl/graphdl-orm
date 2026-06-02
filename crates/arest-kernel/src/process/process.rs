@@ -58,6 +58,7 @@ use arest::ast::{cell_push, fact_from_pairs, Object};
 use super::address_space::AddressSpace;
 use super::elf::ELF64_PHENT_SIZE;
 use super::fd_table::FdTable;
+use super::signal::SignalState;
 use super::stack::{AuxvEntry, AuxvType, InitialStack, StackBuilder, StackError};
 use super::trampoline::{self, TrampolineError};
 
@@ -305,6 +306,20 @@ pub struct Process {
     /// free list in tier-1 — documented no-op). A real allocator that
     /// tracks individual mappings is a future child task of #497.
     pub mmap_bump: u64,
+    /// Per-process signal state — the disposition table, the thread
+    /// signal mask, and the `rt_sigreturn` saved-context slot (#548).
+    /// Populated by `rt_sigaction` (install/replace a handler) and
+    /// `rt_sigprocmask` (block/unblock signals); the saved-context slot
+    /// is parked by the (future #549+) delivery path and consumed by
+    /// `rt_sigreturn`. Initialised to `SignalState::new()` in
+    /// `Process::new`: every signal at SIG_DFL, empty mask, no handler
+    /// executing — the disposition Linux boots a process with.
+    ///
+    /// Lives inline on the Process (like `fd_table` / `fs_base`) rather
+    /// than in a global table because all signal state is strictly
+    /// per-process; nothing here is shared kernel-wide (contrast the
+    /// `futex_table`, which is a kernel-wide rendezvous).
+    pub signals: SignalState,
 }
 
 impl Process {
@@ -361,6 +376,12 @@ impl Process {
             // install happens on this foundation slice — same
             // rationale as heap_break above.
             mmap_bump: crate::syscall::mmap::MMAP_BASE,
+            // Signal state starts at the Linux boot disposition: every
+            // signal at SIG_DFL, empty thread mask, no handler running.
+            // `rt_sigaction` / `rt_sigprocmask` (#548) mutate it; the
+            // delivery path (#549+) parks the saved context that
+            // `rt_sigreturn` restores.
+            signals: SignalState::new(),
         }
     }
 
@@ -558,6 +579,10 @@ impl Process {
                 &s,
             );
         }
+        // Compose the per-process signal state's facts (the blocked
+        // mask + any non-default dispositions + the handler-active
+        // flag). See `SignalState::record_into_cells` (#548).
+        s = self.signals.record_into_cells(process_id, &s);
         // Compose the address-space cells last so a debugger / cell
         // inspector sees them as children of the Process_has_State
         // / Process_has_Pid facts.
@@ -739,6 +764,32 @@ where
 {
     let mut guard = CURRENT_PROCESS.lock();
     f(guard.as_mut().map(|p| &mut p.open_fds))
+}
+
+/// Run a closure against the currently-installed Process's signal
+/// state (the per-process `SignalState` introduced by the signal
+/// plumbing, #548). Sibling of `current_process_fd_table` — same
+/// closure shape, same lock discipline, scoped to the signal state so
+/// the `rt_sigaction` / `rt_sigprocmask` / `rt_sigreturn` handlers
+/// don't have to ferry an `Option<&mut Process>` through their bodies
+/// just to reach the table + mask + saved-context slot.
+///
+/// The closure receives `Option<&mut SignalState>` — `Some` when a
+/// process is installed, `None` when not (kernel boot before any
+/// spawn, or test teardown). The caller is responsible for handling
+/// `None` — the signal handlers map it to `-ESRCH` (the Linux errno a
+/// signal syscall returns when there's no addressable task), keeping
+/// the surface honest about "called before any process is live".
+///
+/// Holds the singleton's `spin::Mutex` for the duration of the
+/// closure — same constraint as `current_process_mut`: don't park /
+/// await inside (no async in the kernel today).
+pub fn current_process_signals<F, R>(f: F) -> R
+where
+    F: FnOnce(Option<&mut SignalState>) -> R,
+{
+    let mut guard = CURRENT_PROCESS.lock();
+    f(guard.as_mut().map(|p| &mut p.signals))
 }
 
 #[cfg(test)]

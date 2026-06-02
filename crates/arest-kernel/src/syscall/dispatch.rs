@@ -64,6 +64,9 @@ use crate::syscall::ioctl;
 use crate::syscall::mmap;
 use crate::syscall::openat;
 use crate::syscall::read;
+use crate::syscall::rt_sigaction;
+use crate::syscall::rt_sigprocmask;
+use crate::syscall::rt_sigreturn;
 use crate::syscall::stat;
 use crate::syscall::write;
 
@@ -268,6 +271,36 @@ pub const SYS_ARCH_PRCTL: u64 = 158;
 /// unknown → -ENOTTY. Per #502.
 pub const SYS_IOCTL: u64 = 16;
 
+/// Linux x86_64 syscall number for `rt_sigaction(signum, act, oldact,
+/// sigsetsize)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_rt_sigaction`
+/// (= 13). The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:14`. Routes to
+/// `rt_sigaction::handle`, which installs/replaces the per-process
+/// disposition for a signal (or SIG_DFL/SIG_IGN) and returns the old
+/// action. The foundation for the signal family (#549/#550/#551). Per
+/// #548.
+pub const SYS_RT_SIGACTION: u64 = 13;
+
+/// Linux x86_64 syscall number for `rt_sigprocmask(how, set, oldset,
+/// sigsetsize)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_rt_sigprocmask`
+/// (= 14). The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:15`. Routes to
+/// `rt_sigprocmask::handle`, which blocks/unblocks/sets the thread's
+/// signal mask (SIG_BLOCK/UNBLOCK/SETMASK) and returns the old mask.
+/// Per #548.
+pub const SYS_RT_SIGPROCMASK: u64 = 14;
+
+/// Linux x86_64 syscall number for `rt_sigreturn()`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_rt_sigreturn`
+/// (= 15). The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:16`. Routes to
+/// `rt_sigreturn::handle`, which restores the saved context (signal
+/// mask + — on the future #549+ delivery track — the interrupted
+/// register frame) on return from a signal handler. Per #548.
+pub const SYS_RT_SIGRETURN: u64 = 15;
+
 /// The dispatch entry point. Match on `rax` and forward the argument
 /// registers (rdi / rsi / rdx / r10 / r8 / r9) to the per-syscall
 /// handler. Handlers that take fewer than six args simply ignore the
@@ -388,6 +421,32 @@ pub fn dispatch(
             // TCGETS (0x5401) fills a zeroed termios; unknown → -ENOTTY.
             // Per #502.
             ioctl::handle(rdi, rsi, rdx)
+        }
+        SYS_RT_SIGACTION => {
+            // rt_sigaction(signum, act, oldact, sigsetsize) — install /
+            // replace the per-process disposition for a signal. rdi =
+            // signum (i32), rsi = act pointer (const k_sigaction *),
+            // rdx = oldact pointer (k_sigaction *), r10 = sigsetsize
+            // (must be 8). Fourth syscall arg is r10 (not rcx) per the
+            // Linux x86_64 ABI. Returns the old action via oldact. Per
+            // #548.
+            rt_sigaction::handle(rdi as i32, rsi, rdx, r10)
+        }
+        SYS_RT_SIGPROCMASK => {
+            // rt_sigprocmask(how, set, oldset, sigsetsize) — block /
+            // unblock / set the thread signal mask. rdi = how
+            // (SIG_BLOCK/UNBLOCK/SETMASK), rsi = set pointer
+            // (const sigset_t *), rdx = oldset pointer (sigset_t *),
+            // r10 = sigsetsize (must be 8). Per #548.
+            rt_sigprocmask::handle(rdi as i32, rsi, rdx, r10)
+        }
+        SYS_RT_SIGRETURN => {
+            // rt_sigreturn() — return from a signal handler, restoring
+            // the saved context. Reads the rt_sigframe from the user
+            // stack (rsp) on real Linux rather than from argument
+            // registers; the tier-1 plumbing drives the per-process
+            // saved-context slot instead. Args ignored. Per #548.
+            rt_sigreturn::handle()
         }
         SYS_EXIT | SYS_EXIT_GROUP => {
             // exit / exit_group both transition the Process state
@@ -562,6 +621,36 @@ mod tests {
     #[test]
     fn sys_munmap_number_matches_linux_uapi() {
         assert_eq!(SYS_MUNMAP, 11);
+    }
+
+    /// `SYS_RT_SIGACTION` is 13 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_rt_sigaction`
+    /// (and `vendor/musl/arch/x86_64/bits/syscall.h.in:14`).
+    #[test]
+    fn sys_rt_sigaction_number_matches_linux_uapi() {
+        assert_eq!(SYS_RT_SIGACTION, 13);
+    }
+
+    /// `SYS_RT_SIGPROCMASK` is 14 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_rt_sigprocmask`
+    /// (and `vendor/musl/arch/x86_64/bits/syscall.h.in:15`).
+    #[test]
+    fn sys_rt_sigprocmask_number_matches_linux_uapi() {
+        assert_eq!(SYS_RT_SIGPROCMASK, 14);
+    }
+
+    /// `SYS_RT_SIGRETURN` is 15 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_rt_sigreturn`
+    /// (and `vendor/musl/arch/x86_64/bits/syscall.h.in:16`).
+    ///
+    /// (Dispatch *routing* for the three signal syscalls is covered by
+    /// the `dispatch_routes_*` tests in each handler module, which take
+    /// the `CURRENT_PROCESS_TEST_LOCK` so they don't race the shared
+    /// process singleton — a bare `dispatch(...)` here would observe a
+    /// sibling test's installed process and flake.)
+    #[test]
+    fn sys_rt_sigreturn_number_matches_linux_uapi() {
+        assert_eq!(SYS_RT_SIGRETURN, 15);
     }
 
     /// `dispatch(SYS_BRK, 0, ...)` (query form) returns 0 when no

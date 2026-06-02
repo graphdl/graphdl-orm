@@ -68,6 +68,9 @@ pub mod ioctl;
 pub mod mmap;
 pub mod openat;
 pub mod read;
+pub mod rt_sigaction;
+pub mod rt_sigprocmask;
+pub mod rt_sigreturn;
 pub mod stat;
 pub mod write;
 
