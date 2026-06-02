@@ -134,6 +134,22 @@ pub enum FdEntry {
         /// Absolute POSIX-style path the synthetic resolver matches.
         path: String,
     },
+    /// fd backed by a network socket (#478a — `socket(AF_INET,
+    /// SOCK_STREAM)`). The `socket_id` is the kernel-assigned monotonic
+    /// id (`net_socket::SocketId`) that keys the socket registry in
+    /// `crate::net` — the registry maps it to the smoltcp `SocketHandle`
+    /// the interface's `SocketSet` owns. We store the kernel id (a plain
+    /// `u64`) rather than the smoltcp handle itself so this module stays
+    /// free of the `smoltcp` dependency and keeps compiling on the host
+    /// test target (`cargo test --lib`), where there is no live
+    /// interface. The future `connect` / `bind` / `read` / `write` /
+    /// `close` handlers look the id up in the registry to reach the
+    /// underlying socket. `socket()` (#478a) creates the socket but does
+    /// no I/O — it just allocates the fd and binds it to the id here.
+    Socket {
+        /// Kernel-assigned socket id keying `crate::net`'s registry.
+        socket_id: u64,
+    },
 }
 
 /// Per-process file-descriptor table. Owns a sparse `BTreeMap` keyed by
@@ -249,6 +265,18 @@ pub fn file(cell_id: &str) -> FdEntry {
     FdEntry::File {
         cell_id: cell_id.to_string(),
     }
+}
+
+/// Constructor helper — wraps a kernel socket id into `FdEntry::Socket`
+/// (#478a). The `socket()` syscall handler calls this after
+/// `crate::net::create_tcp_socket` hands back the registry id, binding
+/// the freshly-created smoltcp socket to the fd the table allocates.
+/// Unlike `synthetic` / `file` there's no `String` to hide — the helper
+/// exists for call-site symmetry and so the `Socket` shape has a single
+/// construction point if the payload grows (e.g. a per-socket flags
+/// bitfield once `SOCK_NONBLOCK` / `SOCK_CLOEXEC` land).
+pub fn socket(socket_id: u64) -> FdEntry {
+    FdEntry::Socket { socket_id }
 }
 
 #[cfg(test)]
@@ -403,5 +431,65 @@ mod tests {
                 cell_id: "abc123".into()
             }
         );
+    }
+
+    /// `socket` helper produces an `FdEntry::Socket` carrying the
+    /// kernel socket id (#478a).
+    #[test]
+    fn socket_helper_constructs_socket_variant() {
+        let entry = socket(7);
+        assert_eq!(entry, FdEntry::Socket { socket_id: 7 });
+    }
+
+    /// A socket fd allocates the lowest free fd ≥ 3 just like the other
+    /// backing variants — the table is variant-agnostic about which
+    /// kind of resource an fd is open against. (#478a)
+    #[test]
+    fn allocate_socket_returns_first_user_fd() {
+        let mut t = FdTable::new();
+        let fd = t.allocate(socket(0)).expect("allocate socket fd");
+        assert_eq!(fd, FIRST_USER_FD);
+        assert_eq!(fd, 3);
+    }
+
+    /// `lookup` round-trips the socket id through the table — the
+    /// `socket()` handler stores the id at allocation time and the
+    /// future connect / read / write / close handlers read it back to
+    /// reach the smoltcp socket via `crate::net`'s registry. (#478a)
+    #[test]
+    fn lookup_returns_socket_with_stored_id() {
+        let mut t = FdTable::new();
+        let fd = t.allocate(socket(42)).expect("allocate");
+        assert_eq!(t.lookup(fd), Some(&FdEntry::Socket { socket_id: 42 }));
+    }
+
+    /// Socket fds interleave with synthetic / file fds in the same
+    /// lowest-free-fd allocation order — a process can hold a mix of
+    /// open files and sockets and the fd numbering stays monotonic
+    /// across the kinds. (#478a)
+    #[test]
+    fn socket_and_other_fds_share_allocation_order() {
+        let mut t = FdTable::new();
+        let fd_sock = t.allocate(socket(0)).expect("sock");
+        let fd_file = t.allocate(file("abc")).expect("file");
+        let fd_syn = t.allocate(synthetic("/proc/cpuinfo")).expect("syn");
+        assert_eq!(fd_sock, 3);
+        assert_eq!(fd_file, 4);
+        assert_eq!(fd_syn, 5);
+        // Each fd resolves to the variant it was populated with.
+        assert_eq!(t.lookup(fd_sock), Some(&FdEntry::Socket { socket_id: 0 }));
+        assert!(matches!(t.lookup(fd_file), Some(FdEntry::File { .. })));
+        assert!(matches!(t.lookup(fd_syn), Some(FdEntry::Synthetic { .. })));
+    }
+
+    /// Releasing a socket fd frees the slot for re-use, same as any
+    /// other backing variant. (#478a)
+    #[test]
+    fn release_socket_fd_frees_slot() {
+        let mut t = FdTable::new();
+        let fd = t.allocate(socket(99)).expect("allocate");
+        assert!(t.lookup(fd).is_some());
+        t.release(fd).expect("release");
+        assert!(t.lookup(fd).is_none());
     }
 }
