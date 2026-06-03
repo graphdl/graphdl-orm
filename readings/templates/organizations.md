@@ -5,7 +5,6 @@
 Organization(.Slug) is an entity type.
 App(.Slug) is an entity type.
 Domain(.Slug) is an entity type.
-User(.id) is an entity type.
 External System(.Name) is an entity type.
 Generator(.Name) is an entity type.
 

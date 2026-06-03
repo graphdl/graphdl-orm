@@ -13,15 +13,15 @@
 
 ## Overview
 
-An instance/detail View of a Noun projects its Fact Types into a form
+An instance/detail view-projection.View of a Noun projects its Fact Types into a form
 structure — one `ViewElement` per Fact Type the Noun participates in, with the
 widget chosen by the Fact Type's value-type. The derivation is lazy (resolved
 at fetch time via `resolve_view`) and uses a SKOLEM head variable so the
 `ViewElement` identity is deterministic and idempotent across re-reads.
 
 This is design-doc §3.2 (instance detail + form view) instantiated as a
-predicate reading. The join is a 4-antecedent chain over View→Noun, Fact
-Type→Role→Noun, yielding one ViewElement per (View, Fact Type) binding.
+predicate reading. The join is a 4-antecedent chain over view-projection.View→Noun, Fact
+Type→Role→Noun, yielding one ViewElement per (view-projection.View, Fact Type) binding.
 
 ## The Derivation (Predicate Reading Form)
 
@@ -30,8 +30,8 @@ The rule shape (using the `(E)` parenthesised existential syntax from
 
 ```
 * ViewElement (E) renders Fact Type (FT) iff
-    View is for Noun
-    and View has View Kind 'instance'
+    view-projection.View is for Noun
+    and view-projection.View has View Kind 'instance'
     and Fact Type (FT) has Role
     and Role is played by Noun.
 ```
@@ -40,38 +40,38 @@ and the companion widget rules (same frontier → same `E`):
 
 ```
 * ViewElement (E) has Component Role 'text-input' iff
-    View is for Noun
-    and View has View Kind 'instance'
+    view-projection.View is for Noun
+    and view-projection.View has View Kind 'instance'
     and Fact Type (FT) has Role
     and Role is played by Noun
     and Fact Type (FT) has Format 'text'.
 
 * ViewElement (E) has Component Role 'date-picker' iff
-    View is for Noun
-    and View has View Kind 'instance'
+    view-projection.View is for Noun
+    and view-projection.View has View Kind 'instance'
     and Fact Type (FT) has Role
     and Role is played by Noun
     and Fact Type (FT) has Format 'date'.
 
 * ViewElement (E) has Component Role 'checkbox' iff
-    View is for Noun
-    and View has View Kind 'instance'
+    view-projection.View is for Noun
+    and view-projection.View has View Kind 'instance'
     and Fact Type (FT) has Role
     and Role is played by Noun
     and Fact Type (FT) has Format 'boolean'.
 
 * ViewElement (E) has Component Role 'combo-box' iff
-    View is for Noun
-    and View has View Kind 'instance'
+    view-projection.View is for Noun
+    and view-projection.View has View Kind 'instance'
     and Fact Type (FT) has Role
     and Role is played by Noun
     and Fact Type (FT) has some Enum Values.
 ```
 
-All six rules carry `*` (lazy, `View` materialization policy — never enters
-the eager forward chain). The `View has View Kind 'instance'` antecedent is a
+All six rules carry `*` (lazy, `view-projection.View` materialization policy — never enters
+the eager forward chain). The `view-projection.View has View Kind 'instance'` antecedent is a
 literal-pinned filter. The six sibling rules share the identical entity-typed
-frontier `(View, Noun, Fact Type, Role)` so the invented `ve_<fnv>` id is
+frontier `(view-projection.View, Noun, Fact Type, Role)` so the invented `ve_<fnv>` id is
 shared across `renders Fact Type` and each `Component Role` head.
 
 The combo-box rule uses the eagerly-projected `Fact Type has Enum Values` cell
@@ -82,8 +82,8 @@ as the other widget rules.
 
 `ViewElement has Component Role` is already declared `*` (fully-derived) in
 `view-projection.md`. `ViewElement renders Fact Type` is declared there too
-(at most one, View-materialized via these rules). The `*` suffix marks them
-View-materialized so the forward chain never eager-evaluates the join over the
+(at most one, view-projection.View-materialized via these rules). The `*` suffix marks them
+view-projection.View-materialized so the forward chain never eager-evaluates the join over the
 ~593-FT metamodel.
 
 `Fact Type has Format` and `Fact Type has Enum Values` are declared `**`
@@ -114,15 +114,15 @@ One output row per value-typed Fact Type (linear, no combinatorial blowup).
 Six shared-frontier skolem rules (single-line registration form of the
 prose above). The `(E)` head variable is fresh (existential); the parser
 records a `SkolemHeadRole` and promotes the antecedent chain to a Join whose
-skolem frontier is the entity-typed antecedent nouns — `View`, `Noun`,
+skolem frontier is the entity-typed antecedent nouns — `view-projection.View`, `Noun`,
 `Fact Type`, `Role` — identical across all six rules so the invented
 `ve_<fnv>` id is shared. `Fact Type (FT)` carries the rendered fact type.
 
-* ViewElement (E) renders Fact Type (FT) iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun.
-* ViewElement (E) has Component Role 'text-input' iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has Format 'text'.
-* ViewElement (E) has Component Role 'date-picker' iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has Format 'date'.
-* ViewElement (E) has Component Role 'checkbox' iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has Format 'boolean'.
-* ViewElement (E) has Component Role 'combo-box' iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has some Enum Values.
+* ViewElement (E) renders Fact Type (FT) iff view-projection.View is for Noun and view-projection.View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun.
+* ViewElement (E) has Component Role 'text-input' iff view-projection.View is for Noun and view-projection.View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has Format 'text'.
+* ViewElement (E) has Component Role 'date-picker' iff view-projection.View is for Noun and view-projection.View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has Format 'date'.
+* ViewElement (E) has Component Role 'checkbox' iff view-projection.View is for Noun and view-projection.View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has Format 'boolean'.
+* ViewElement (E) has Component Role 'combo-box' iff view-projection.View is for Noun and view-projection.View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has some Enum Values.
 
 ## Metamodel Fact-Type Names (Verified)
 
@@ -131,8 +131,8 @@ and `readings/core/core.md`:
 
 | FORML 2 reading text                 | Cell name                        |
 |--------------------------------------|----------------------------------|
-| View is for Noun                     | `View_is_for_Noun`               |
-| View has View Kind 'instance'        | `View_has_View_Kind`             |
+| view-projection.View is for Noun                     | `View_is_for_Noun`               |
+| view-projection.View has View Kind 'instance'        | `View_has_View_Kind`             |
 | Fact Type has Role                   | `Fact_Type_has_Role`             |
 | Role is played by Noun               | `Noun_plays_Role` (inverse read) |
 | Noun has Object Type                 | `Noun_has_Object_Type`           |
@@ -176,8 +176,8 @@ Fact Type has some Role              (FT → Role_R)
 
 ### Base (renders) + widget rules:
 ```
-View is for Noun                          (View → Noun_N, entity-type)
-  ⋈ View has View Kind 'instance'        (View → View_Kind, filtered to 'instance')
+view-projection.View is for Noun                          (view-projection.View → Noun_N, entity-type)
+  ⋈ view-projection.View has View Kind 'instance'        (view-projection.View → View_Kind, filtered to 'instance')
   ⋈ Fact Type (FT) has Role              (FT → Role_R)
   ⋈ Role is played by Noun               (Role_R → Noun_N)     [join on Noun_N + Role_R]
 ```
@@ -193,18 +193,18 @@ For combo-box, additionally:
   ⋈ Fact Type (FT) has some Enum Values  (FT → Enum Values, materialized eagerly)
 ```
 
-Join keys: `View` (FTs 1+2), `Noun` (FTs 1+4), `Role` (FTs 3+4), `Fact Type` (FTs 3+5)
-Frontier (entity-typed antecedent nouns, in order): `View`, `Noun`, `Fact Type`, `Role`
-Frontier hash seed: `fnv1a64(View + "|" + Noun + "|" + Fact Type + "|" + Role)` → `ve_<16 hex>`.
+Join keys: `view-projection.View` (FTs 1+2), `Noun` (FTs 1+4), `Role` (FTs 3+4), `Fact Type` (FTs 3+5)
+Frontier (entity-typed antecedent nouns, in order): `view-projection.View`, `Noun`, `Fact Type`, `Role`
+Frontier hash seed: `fnv1a64(view-projection.View + "|" + Noun + "|" + Fact Type + "|" + Role)` → `ve_<16 hex>`.
 
-Because each View is for exactly one Noun (UC from view-projection.md), and
+Because each view-projection.View is for exactly one Noun (UC from view-projection.md), and
 each Role is played by exactly one Noun (UC from core.md), the
-`(View, Noun, Role)` combination collapses to `(View, Role)` as the
-discriminating prefix — one ViewElement per (View, Fact Type) pair.
+`(view-projection.View, Noun, Role)` combination collapses to `(view-projection.View, Role)` as the
+discriminating prefix — one ViewElement per (view-projection.View, Fact Type) pair.
 
 ## Skolem Head Properties
 
-- **Deterministic**: `ve_<fnv>` is a pure function of `(View, Noun, Fact Type, Role)`.
+- **Deterministic**: `ve_<fnv>` is a pure function of `(view-projection.View, Noun, Fact Type, Role)`.
   Re-reading the same population reproduces the same ids.
 - **Idempotent**: same frontier → same id → no duplicate `ViewElement` across
   re-read passes (semi-oblivious / Skolem chase correctness).
@@ -212,9 +212,9 @@ discriminating prefix — one ViewElement per (View, Fact Type) pair.
   Resolved via `resolve_view` at `Func::Fetch` / `Func::FetchOrPhi` time.
 - **Filter-correct**: only Views with View Kind = 'instance' produce
   ViewElements — the literal pin is applied as an antecedent predicate.
-- **Shared-frontier**: all six sibling rules share frontier `[View, Noun, Fact
+- **Shared-frontier**: all six sibling rules share frontier `[view-projection.View, Noun, Fact
   Type, Role]` so `renders Fact Type` and `Component Role` heads produce the
-  same `ve_<fnv>` id per (View, FT) binding.
+  same `ve_<fnv>` id per (view-projection.View, FT) binding.
 
 ## Remaining Work
 
@@ -235,10 +235,10 @@ Design: suppressing fields at fetch layer is not a derivation concern
 `crates/arest/src/compile_explicit_derivation_tests.rs`:
 - `instance_detail_view_derivation_compiled_from_authored_reading` — GREEN:
   proves (a) one VE per FT the Noun participates in, (b) 0 VEs for
-  collection-kind View (literal filter excludes it), (c) deterministic
+  collection-kind view-projection.View (literal filter excludes it), (c) deterministic
   `ve_<fnv>` ids, (d) idempotent across 2 passes, (e) Fact Type carried
   through, (f) shared frontier → same VE id across renders + Component Role
-  rules, (g) no eager `derivation:` def for View rules, (h) correct widget
+  rules, (g) no eager `derivation:` def for view-projection.View rules, (h) correct widget
   per Format ('text' → 'text-input', 'date' → 'date-picker', 'boolean' →
   'checkbox').
 - `instance_detail_view_real_data_format_projection` — GREEN:

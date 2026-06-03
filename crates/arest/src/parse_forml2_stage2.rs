@@ -3851,9 +3851,36 @@ fn resolve_reference_domain(
 fn defining_domains_by_name(ctx: &Object) -> hashbrown::HashMap<String, Vec<String>> {
     let mut map: hashbrown::HashMap<String, Vec<String>> = hashbrown::HashMap::new();
     let noun_cell = fetch_or_phi("Noun", ctx);
+    // ns-namespace-collision-cleanup: a SYNTHETIC ref-scheme value noun
+    // (`synthetic=refScheme`, materialized per-slice by
+    // `synthesize_ref_scheme_constraints` for every `Entity(.part)`
+    // declaration) is NOT an independent cross-domain declaration of
+    // `part` — it is a per-slice shadow of one shared value primitive.
+    // The universal primitives `id`, `Name`, `Title`, `code` are declared
+    // ONCE in `core` (readings/core/core.md); each slice that writes
+    // `Entity(.id)` re-synthesizes a local `id` value noun, which — before
+    // this guard — stamped a phantom per-slice home and made every bare
+    // `id` reference collide across ~14 domains. So when a name has a real
+    // (non-synthetic, explicitly declared) home anywhere in the context, the
+    // synthetic shadows defer to it: they do not contribute a domain. A bare
+    // reference then resolves UNIQUELY to the single core declaration (ns-5
+    // precedence 2), instead of being reported ambiguous. Names that are
+    // ONLY ever synthetic (no explicit declaration anywhere) keep their
+    // per-slice homes, so nothing about non-consolidated value types changes.
+    let mut has_explicit: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+    for f in crate::ast::cell_facts_iter(&noun_cell) {
+        if let Some(name) = binding(f, "name") {
+            if binding(f, "synthetic").is_none() {
+                has_explicit.insert(name.to_string());
+            }
+        }
+    }
     for f in crate::ast::cell_facts_iter(&noun_cell) {
         let (Some(name), Some(dom)) = (binding(f, "name"), binding(f, "homeDomain"))
             else { continue };
+        if binding(f, "synthetic").is_some() && has_explicit.contains(name) {
+            continue;
+        }
         let doms = map.entry(name.to_string()).or_default();
         if !doms.iter().any(|d| d == dom) {
             doms.push(dom.to_string());

@@ -764,10 +764,14 @@ fn domain_qualifier_before(text: &str, noun_start: usize) -> Option<(String, usi
     }
     let dot = noun_start - 1;
     // Walk back over identifier bytes to find the qualifier run start.
+    // Domain (slice) names are hyphenated by convention (`view-projection`,
+    // `sql-dialects`, `ifactr-android`, `agent-chat`), so the qualifier run
+    // admits `-` alongside alphanumerics + `_`; otherwise `view-projection.View`
+    // would capture only `projection` and the resolver would miss the domain.
     let mut q_start = dot;
     while q_start > 0 {
         let b = bytes[q_start - 1];
-        if b.is_ascii_alphanumeric() || b == b'_' {
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
             q_start -= 1;
         } else {
             break;

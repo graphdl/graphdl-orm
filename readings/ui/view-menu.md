@@ -44,14 +44,14 @@ and the companion rule (same frontier → same `E`):
     and Resource is instance of Noun (N).
 ```
 
-Both rules carry `*` (lazy, `View` materialization policy — never enters the
+Both rules carry `*` (lazy, `view-projection.View` materialization policy — never enters the
 eager forward chain that caused the task-934 metamodel hang).
 
 ## Fact Types
 
 `ViewElement has Component Role` is already declared `*` (fully-derived) in
 `view-projection.md`; only the menu-specific `renders Transition` link is
-declared here. The `*` suffix marks it View-materialized so the
+declared here. The `*` suffix marks it view-projection.View-materialized so the
 forward chain never eager-evaluates the 5-way join over the ~593-FT metamodel.
 
 ViewElement renders Transition. *
@@ -138,7 +138,7 @@ The basic menu (all legal transitions, no guard filter) is what is proven here.
 registered after `view-projection`. The full metamodel compiles green (no
 hang, no checker errors) — `handle_isolation_tests::create_impl_loads_metamodel`
 exercises the full `compile_to_defs_state` over the registered reading. The
-`*` View policy on `ViewElement renders Transition` keeps both rules out of
+`*` view-projection.View policy on `ViewElement renders Transition` keeps both rules out of
 the eager forward chain (`view:` defs only, no `derivation:` def).
 
 ### (4) Collection-list and detail views (934-2)

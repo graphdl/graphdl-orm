@@ -45,6 +45,8 @@ URL is a value type.
 Secret Reference is a value type.
 Reference Scheme is a value type.
 
+id is a value type.
+code is a value type.
 Arity is a value type.
 Position is a value type.
 Min Occurrence is a value type.

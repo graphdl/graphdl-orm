@@ -10,7 +10,7 @@
 
 ## Overview
 
-A collection View of a Noun lists its instances. Each row is a `ViewElement`
+A collection view-projection.View of a Noun lists its instances. Each row is a `ViewElement`
 that renders one `Resource` instance of that Noun. The derivation is lazy
 (resolved at fetch time via `resolve_view`) and uses a SKOLEM head variable so
 the `ViewElement` identity is deterministic and idempotent across re-reads.
@@ -26,8 +26,8 @@ The rule shape (using the `(E)` parenthesised existential syntax from
 
 ```
 * ViewElement (E) renders Resource (R) iff
-    View is for Noun
-    and View has View Kind 'collection'
+    view-projection.View is for Noun
+    and view-projection.View has View Kind 'collection'
     and Resource (R) is instance of Noun.
 ```
 
@@ -35,13 +35,13 @@ and the companion rule (same frontier → same `E`):
 
 ```
 * ViewElement (E) has Component Role 'list' iff
-    View is for Noun
-    and View has View Kind 'collection'
+    view-projection.View is for Noun
+    and view-projection.View has View Kind 'collection'
     and Resource (R) is instance of Noun.
 ```
 
-Both rules carry `*` (lazy, `View` materialization policy — never enters the
-eager forward chain). The `View has View Kind 'collection'` antecedent is a
+Both rules carry `*` (lazy, `view-projection.View` materialization policy — never enters the
+eager forward chain). The `view-projection.View has View Kind 'collection'` antecedent is a
 literal-pinned filter: the parser records it as `AntecedentRoleLiteral`
 (role = "View Kind", value = "collection") and the join compiler applies it as
 a per-antecedent predicate filter over the `View_has_View_Kind` cell.
@@ -50,7 +50,7 @@ a per-antecedent predicate filter over the `View_has_View_Kind` cell.
 
 `ViewElement has Component Role` is already declared `*` (fully-derived) in
 `view-projection.md`. The collection-specific `renders Resource` link is
-declared here. The `*` suffix marks it View-materialized so the forward chain
+declared here. The `*` suffix marks it view-projection.View-materialized so the forward chain
 never eager-evaluates the join over the ~593-FT metamodel.
 
 ViewElement renders Resource. *
@@ -60,18 +60,18 @@ ViewElement renders Resource. *
 The two shared-frontier skolem rules (single-line registration form of the
 prose above). The `(E)` head variable is fresh (existential); the parser
 records a `SkolemHeadRole` and promotes the 3-way `and`-chain to a Join whose
-skolem frontier is the entity-typed antecedent nouns — `View`, `Noun`,
-`Resource` (in order of first antecedent-FT-role occurrence). `View is for
-exactly one Noun` (UC in view-projection.md), so the (View, Noun, Resource)
-frontier effectively gives one ViewElement per (View, Resource) binding.
+skolem frontier is the entity-typed antecedent nouns — `view-projection.View`, `Noun`,
+`Resource` (in order of first antecedent-FT-role occurrence). `view-projection.View is for
+exactly one Noun` (UC in view-projection.md), so the (view-projection.View, Noun, Resource)
+frontier effectively gives one ViewElement per (view-projection.View, Resource) binding.
 
 Component Role 'list' is chosen because §3.1 of the design doc maps each
 collection row instance to the `list` Component (the `list` value is already
 in the `components.md` enum — no new value needed). The `list` role labels
 the row cell in the list view surface, matching iFactr's `IContentCell` shape.
 
-* ViewElement (E) renders Resource (R) iff View is for Noun and View has View Kind 'collection' and Resource (R) is instance of Noun.
-* ViewElement (E) has Component Role 'list' iff View is for Noun and View has View Kind 'collection' and Resource (R) is instance of Noun.
+* ViewElement (E) renders Resource (R) iff view-projection.View is for Noun and view-projection.View has View Kind 'collection' and Resource (R) is instance of Noun.
+* ViewElement (E) has Component Role 'list' iff view-projection.View is for Noun and view-projection.View has View Kind 'collection' and Resource (R) is instance of Noun.
 
 ## Metamodel Fact-Type Names (Verified)
 
@@ -80,36 +80,36 @@ and `readings/core/instances.md`:
 
 | FORML 2 reading text               | Cell name                      |
 |------------------------------------|-------------------------------|
-| View is for Noun                   | `View_is_for_Noun`            |
-| View has View Kind 'collection'    | `View_has_View_Kind`          |
+| view-projection.View is for Noun                   | `View_is_for_Noun`            |
+| view-projection.View has View Kind 'collection'    | `View_has_View_Kind`          |
 | Resource is instance of Noun       | `Resource_is_instance_of_Noun`|
 
 `View_is_for_Noun` and `View_has_View_Kind` are declared in `view-projection.md`.
 `Resource_is_instance_of_Noun` is declared in `readings/core/instances.md`.
 `View Kind` is a value type (not entity-typed) — it is excluded from the
-entity-typed frontier (only `View`, `Noun`, `Resource` enter the hash seed).
+entity-typed frontier (only `view-projection.View`, `Noun`, `Resource` enter the hash seed).
 
 ## Join Chain
 
 ```
-View is for Noun                          (View → Noun_N)
-  ⋈ View has View Kind 'collection'      (View → View_Kind, filtered to 'collection')
+view-projection.View is for Noun                          (view-projection.View → Noun_N)
+  ⋈ view-projection.View has View Kind 'collection'      (view-projection.View → View_Kind, filtered to 'collection')
   ⋈ Resource is instance of Noun         (Resource → Noun_N)     [join on Noun_N]
 ```
 
-Join keys (shared by ≥2 antecedents): `View` (appears in FTs 1+2), `Noun`
+Join keys (shared by ≥2 antecedents): `view-projection.View` (appears in FTs 1+2), `Noun`
 (appears in FTs 1+3).
-Frontier (entity-typed antecedent nouns, in order): `View`, `Noun`, `Resource`.
-Frontier hash seed: `fnv1a64(View + "|" + Noun + "|" + Resource)` → `ve_<16 hex>`.
+Frontier (entity-typed antecedent nouns, in order): `view-projection.View`, `Noun`, `Resource`.
+Frontier hash seed: `fnv1a64(view-projection.View + "|" + Noun + "|" + Resource)` → `ve_<16 hex>`.
 
-Because each View is for exactly one Noun (UC from view-projection.md), the
-`(View, Noun)` pair collapses to `(View)` as the discriminating prefix, so
-the effective granularity is one ViewElement per (View, Resource) pair —
+Because each view-projection.View is for exactly one Noun (UC from view-projection.md), the
+`(view-projection.View, Noun)` pair collapses to `(view-projection.View)` as the discriminating prefix, so
+the effective granularity is one ViewElement per (view-projection.View, Resource) pair —
 exactly the design-doc §3.1 intent.
 
 ## Skolem Head Properties
 
-- **Deterministic**: `ve_<fnv>` is a pure function of `(View, Noun, Resource)`.
+- **Deterministic**: `ve_<fnv>` is a pure function of `(view-projection.View, Noun, Resource)`.
   Re-reading the same population reproduces the same ids.
 - **Idempotent**: same frontier → same id → no duplicate `ViewElement` across
   re-read passes (semi-oblivious / Skolem chase correctness).
@@ -141,9 +141,9 @@ Design §4.6: suppressing draft/archived items requires negative antecedents
 
 `crates/arest/src/compile_explicit_derivation_tests.rs`:
 - `collection_list_view_derivation_compiled_from_authored_reading` — GREEN:
-  proves (a) 3 VEs for a Noun with 3 instances + a collection View,
+  proves (a) 3 VEs for a Noun with 3 instances + a collection view-projection.View,
   (b) 0 VEs for a Noun with 0 instances, (c) deterministic `ve_<fnv>` ids,
   (d) idempotent across 2 passes, (e) Resource carried through,
   (f) shared frontier → same VE id in both rules (renders + Component Role),
-  (g) no eager `derivation:` def, (h) literal filter — 'instance'-kind View
+  (g) no eager `derivation:` def, (h) literal filter — 'instance'-kind view-projection.View
   produces zero VEs.

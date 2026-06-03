@@ -613,9 +613,9 @@ fn is_ring_kind(k: &str) -> bool {
 }
 
 /// Layer 6 (ns-7, ns-ambiguity-verbalized-reject): reject a bare
-/// cross-namespace reference whose candidate domains declare it as
-/// CONFLICTING KINDS of thing (an entity in one, a value in another) —
-/// the genuinely unbindable case.
+/// cross-namespace reference whose head noun is declared in 2+ non-local
+/// domains — a genuine ambiguity the cell graph cannot bind to a single
+/// noun.
 ///
 /// ns-5 (parse_forml2_stage2::resolve_reference_domains) leaves the
 /// SIGNAL on the `Role_Reference_has_Ambiguous_Domain` cell — one fact
@@ -627,21 +627,22 @@ fn is_ring_kind(k: &str) -> bool {
 /// noun, list the colliding domains (sorted, deduped), and show the
 /// `<domain>.<Noun>` qualifier (ns-6) the author can pick.
 ///
-/// WHY THE KIND-CONFLICT GATE (the corpus-compat decision): ns-5 flags as
-/// ambiguous EVERY bare reference whose head noun is declared in 2+
-/// non-local domains. On the shipping metamodel that includes ubiquitous
-/// shared value-type primitives (`id`, `Name`, `Title`, `code`) declared
-/// identically in a dozen domains, and same-kind entities (`User`, `View`)
-/// the corpus references bare across slices. Rejecting on the raw signal
-/// would fail the bundled corpus — which the task forbids. A reference
-/// whose candidates AGREE on kind is bindable in principle (it is the same
-/// primitive value type, or a same-shaped entity resolvable by local
-/// precedence in its own slice); only a reference whose candidates
-/// DISAGREE on kind (e.g. `Order` = a value type in `core` but an entity
-/// type in `crm`) is a structural impossibility — the cell graph has no
-/// single noun to bind it to. That is the alethic case, and it is exactly
-/// what the task's worked example exhibits. Same-kind ambiguity is left
-/// for a later pass (and a future corpus cleanup) to arm.
+/// SCOPE OF THE REJECT: ns-5 flags as ambiguous EVERY bare reference whose
+/// head noun is declared in 2+ non-local domains, and this layer rejects
+/// every one of them. Same-kind ambiguity is just as genuine as a kind
+/// conflict: a bare `Name` declared as a value type in two domains has no
+/// single noun to bind to any more than a `value`-vs-`entity` `Order` does.
+/// The earlier staging that fired ONLY on a value-vs-entity kind conflict
+/// is gone (task `ns-namespace-collision-cleanup`): it existed only to keep
+/// the shipping corpus green while it still carried the per-domain duplicate
+/// declarations that produced same-kind collisions. That cleanup resolved
+/// them — the universal value primitives `id`, `Name`, `Title`, `code` are
+/// now declared ONCE in `core` (synthetic ref-scheme shadows defer to it in
+/// ns-5), `User` was unified onto one declaration, and the genuinely-distinct
+/// `View` references were qualified `view-projection.View` — so the bundled
+/// corpus emits NO ambiguity signal and this broadened gate validates it
+/// clean. A new same-kind 2-domain collision (in user readings or a future
+/// corpus edit) now (correctly) lights up.
 ///
 /// The diagnostic is `Level::Error` + `Source::Resolve`, which the
 /// load-time gate (`load_reading_core::validate_loaded_state`) routes to
@@ -650,19 +651,6 @@ fn is_ring_kind(k: &str) -> bool {
 /// The cell is empty for any parse without a namespaced collision (every
 /// legacy single-domain parse), so this layer is a no-op there.
 fn check_ambiguous_domain_references(state: &Object) -> Vec<ReadingDiagnostic> {
-    // (name, homeDomain) -> objectType ("entity" / "value"), from the
-    // Noun cell ns-4 stamped per domain. Used to decide whether the
-    // candidates for an ambiguous ref even agree on what KIND of thing
-    // the name denotes.
-    let mut kind_by_name_domain: hashbrown::HashMap<(String, String), String> =
-        hashbrown::HashMap::new();
-    for n in crate::ast::cell_facts_iter(&fetch_cell_seq("Noun", state)) {
-        let (Some(name), Some(dom)) = (binding(n, "name"), binding(n, "homeDomain"))
-            else { continue };
-        let kind = binding(n, "objectType").unwrap_or("").to_string();
-        kind_by_name_domain.insert((name.to_string(), dom.to_string()), kind);
-    }
-
     // Group per reference (the unit of one violation): head noun + the
     // set of candidate domains. Iterate refs in sorted order so emitted
     // diagnostics are deterministic regardless of cell/Map order.
@@ -680,35 +668,9 @@ fn check_ambiguous_domain_references(state: &Object) -> Vec<ReadingDiagnostic> {
             entry.1.push(dom.to_string());
         }
     }
-    by_ref.into_iter().filter_map(|(_rid, (noun, mut domains))| {
+    by_ref.into_iter().map(|(_rid, (noun, mut domains))| {
         domains.sort();
         domains.dedup();
-        // STAGED: fire only on a CONCRETE kind conflict — one candidate
-        // declares the name an `entity`, another a `value`. That reference
-        // is structurally unbindable (the candidates aren't even the same
-        // kind of thing) and is the worked example (`Order` = value in core,
-        // entity in crm). This is NOT a claim that same-kind collisions are
-        // acceptable: per design policy they ARE genuine ambiguities that
-        // SHOULD be flagged — `id`/`Name`/`Title`/`code` declared per-domain
-        // are duplicate declarations to CONSOLIDATE into one shared concept,
-        // and same-name entities like `User`/`View` are to UNIFY (or qualify
-        // if truly distinct). Flagging them now would (correctly) fail the
-        // shipping corpus, which still carries those duplicates — so the
-        // broadening is gated on that corpus cleanup (filed:
-        // ns-namespace-collision-cleanup). Until it lands, only the kind
-        // conflict fires; unknown-kind candidates never fire on their own.
-        let mut saw_entity = false;
-        let mut saw_value = false;
-        for d in &domains {
-            match kind_by_name_domain.get(&(noun.clone(), d.clone())).map(String::as_str) {
-                Some("entity") => saw_entity = true,
-                Some("value")  => saw_value = true,
-                _ => {}
-            }
-        }
-        if !(saw_entity && saw_value) {
-            return None;
-        }
         let defined_in = domains.iter()
             .map(|d| format!("`{}`", d))
             .collect::<Vec<_>>()
@@ -717,7 +679,7 @@ fn check_ambiguous_domain_references(state: &Object) -> Vec<ReadingDiagnostic> {
         // last is preceded by `or` (e.g. "`a.N` or `b.N`",
         // "`a.N`, `b.N`, or `c.N`").
         let qualified = join_qualified_choices(&domains, &noun);
-        Some(ReadingDiagnostic {
+        ReadingDiagnostic {
             line: 0,
             reading: noun.clone(),
             level: Level::Error,
@@ -730,7 +692,7 @@ fn check_ambiguous_domain_references(state: &Object) -> Vec<ReadingDiagnostic> {
                 "prefix the reference with one of the domains, e.g. `{}.{}`",
                 domains.first().map(String::as_str).unwrap_or(""), noun,
             )),
-        })
+        }
     }).collect()
 }
 
@@ -1543,27 +1505,15 @@ Personal Data Breach(.id) is breach of security leading to loss of Personal Data
 
     /// Direct-layer unit: feed a synthesized `Role_Reference_has_Ambiguous_Domain`
     /// cell with TWO refs — one with three candidate facts, one with two —
-    /// (plus a Noun cell whose candidates DISAGREE on kind so the
-    /// kind-conflict gate fires) and assert the layer groups per reference
-    /// into exactly TWO violations, each verbalizing its own head noun +
-    /// sorted candidates. Mirrors the ring-completeness unit-test style.
+    /// and assert the layer groups per reference into exactly TWO violations,
+    /// each verbalizing its own head noun + sorted candidates. Mirrors the
+    /// ring-completeness unit-test style. Post-broadening the gate no longer
+    /// consults the candidates' KIND, so no Noun cell is needed here — every
+    /// grouped reference is flagged.
     #[test]
     fn ns7_layer_groups_candidate_facts_into_one_violation_per_reference() {
         use crate::ast::{Object, fact_from_pairs, cell_push};
         let mut state = Object::phi();
-        // Noun cell: `Order` declared with CONFLICTING kinds across its
-        // three candidate domains (value in core, entity in crm/billing),
-        // and `Account` value-in-finance / entity-in-auth. Each conflict
-        // makes the bare reference structurally unbindable → it fires.
-        for (name, dom, kind) in [
-            ("Order", "core", "value"), ("Order", "crm", "entity"),
-            ("Order", "billing", "entity"),
-            ("Account", "finance", "value"), ("Account", "auth", "entity"),
-        ] {
-            state = cell_push("Noun", fact_from_pairs(&[
-                ("name", name), ("homeDomain", dom), ("objectType", kind),
-            ]), &state);
-        }
         // ref A: `Order` ambiguous across crm, core, billing (unsorted).
         for dom in ["crm", "core", "billing"] {
             state = cell_push("Role_Reference_has_Ambiguous_Domain",
@@ -1616,18 +1566,20 @@ Personal Data Breach(.id) is breach of security leading to loss of Personal Data
             "no ambiguity facts ⇒ no violations");
     }
 
-    /// Kind-AGREEMENT exemption (corpus-compat): when every candidate
-    /// domain declares the bare name as the SAME kind (e.g. a value-type
-    /// primitive like `id` declared in many domains, or a same-shaped
-    /// entity), the reference is bindable in principle and is NOT a hard
-    /// reject. This is what keeps the shipping metamodel (whose only
-    /// ambiguities are kind-agreeing — `id`, `Name`, `Title`, `code`,
-    /// `User`, `View`) validating clean.
+    /// BROADENING PROOF (ns-namespace-collision-cleanup): a GENUINE
+    /// same-kind 2-domain collision must now be FLAGGED. `id` declared as
+    /// a value type in BOTH domains is the case the old kind-conflict-only
+    /// staging deliberately EXEMPTED; the broadened gate rejects it, so the
+    /// broadening is proven (not made vacuous). The cleanup removed every
+    /// such collision from the bundled corpus (consolidating the universal
+    /// primitives to `core`, unifying `User`, qualifying `View`), so this
+    /// synthetic case stands in for the class the gate now guards against.
     #[test]
-    fn ns7_kind_agreeing_candidates_are_exempt() {
+    fn ns7_same_kind_2domain_collision_is_flagged() {
         use crate::ast::{Object, fact_from_pairs, cell_push};
         let mut state = Object::phi();
-        // `id` is a value type in BOTH domains — same kind, no conflict.
+        // `id` is a value type in BOTH domains — SAME kind, no conflict.
+        // Under the broadened gate this is a genuine ambiguity and rejects.
         for dom in ["core", "ui"] {
             state = cell_push("Noun", fact_from_pairs(&[
                 ("name", "id"), ("homeDomain", dom), ("objectType", "value"),
@@ -1641,40 +1593,54 @@ Personal Data Breach(.id) is breach of security leading to loss of Personal Data
                     ("Candidate_Domain", dom),
                 ]), &state);
         }
-        assert!(super::check_ambiguous_domain_references(&state).is_empty(),
-            "a value-type `id` declared identically across domains is the same \
-             primitive — kind-agreeing candidates must NOT trip the reject");
+        let viols = super::check_ambiguous_domain_references(&state);
+        assert_eq!(viols.len(), 1,
+            "a same-kind (value/value) bare `id` declared in two domains must \
+             raise exactly ONE alethic ambiguity violation under the broadened \
+             gate; got {:?}", viols);
+        assert!(viols[0].source == Source::Resolve && viols[0].level == Level::Error,
+            "the violation must be alethic (Source::Resolve, Level::Error)");
+        assert_eq!(viols[0].message,
+            "`id` is ambiguous: defined in `core`, `ui`. \
+             Qualify it as `core.id` or `ui.id`.",
+            "same-kind ambiguity verbalizes exactly like any other");
     }
 
-    /// Real-corpus guard (the task's explicit backward-compat check): the
-    /// bundled metamodel, folded through the actual per-file-domain loader
-    /// (`metamodel_state`, the same fold the CLI and kernel use), must NOT
-    /// trip the new ambiguity reject. NOTE: ns-5 DOES emit ambiguity
-    /// signals on the real corpus (the shared value-type primitives `id`,
-    /// `Name`, `Title`, `code` declared per-domain, and the same-kind
-    /// entities `User`, `View` referenced bare across slices) — local
-    /// precedence does NOT eliminate them. They stay clean here only
-    /// because every one of those ambiguities is kind-AGREEING, and the
-    /// reject fires solely on kind-CONFLICTING candidates (see
-    /// `check_ambiguous_domain_references`). If a future corpus edit
-    /// introduced a value-vs-entity collision on a bare reference, this
-    /// guard would (correctly) light up.
+    /// Real-corpus guard (ns-namespace-collision-cleanup): the bundled
+    /// metamodel, folded through the actual per-file-domain loader
+    /// (`metamodel_state`, the same fold the CLI and kernel use), must
+    /// validate CLEAN under the BROADENED gate — i.e. the cleanup resolved
+    /// EVERY cross-domain collision, so ns-5 emits NO ambiguity signal at
+    /// all and the gate finds nothing to reject.
+    ///
+    /// Before the cleanup ns-5 emitted ~537 ambiguity facts over 143
+    /// references (the universal value primitives `id`/`Name`/`Title`/`code`
+    /// declared per-domain, plus the same-kind entities `User`/`View`
+    /// referenced bare across slices). The cleanup consolidated each
+    /// primitive to ONE declaration in `core` (synthetic ref-scheme shadows
+    /// defer to it in `defining_domains_by_name`), unified `User` onto a
+    /// single declaration, and qualified the genuinely-distinct `View`
+    /// references as `view-projection.View`. The signal is therefore GONE —
+    /// which is exactly what lets the broadened gate (no kind-conflict
+    /// staging) validate the corpus clean. A future corpus edit that
+    /// re-introduced a bare cross-domain collision (same kind or not) would
+    /// (correctly) light this guard up.
     #[test]
     fn ns7_bundled_metamodel_corpus_has_no_ambiguity_violations() {
         let state = crate::metamodel_state();
-        // ns-5 DOES emit ambiguity signals on the real corpus (this guard
-        // is not vacuous): the shared value-type primitives + same-kind
-        // entities referenced bare across slices. Assert that, so a future
-        // resolver change that silenced the signal can't make this guard
-        // pass for the wrong reason.
+        // The cleanup resolved every collision, so ns-5 emits NO ambiguity
+        // signal on the bundled corpus.
         let raw_ambiguity_facts = crate::ast::cell_facts_iter(
             &fetch_cell_seq("Role_Reference_has_Ambiguous_Domain", state)).count();
-        assert!(raw_ambiguity_facts > 0,
-            "expected ns-5 to emit ambiguity signals on the bundled corpus");
-        // None of them is a kind-conflict, so none is rejected.
+        assert_eq!(raw_ambiguity_facts, 0,
+            "ns-namespace-collision-cleanup resolved every cross-domain \
+             collision; ns-5 must emit no ambiguity signal on the bundled \
+             corpus, got {} facts", raw_ambiguity_facts);
+        // And the broadened gate (which now flags ANY same-kind ambiguity)
+        // therefore finds nothing to reject.
         let viols = super::check_ambiguous_domain_references(state);
         assert!(viols.is_empty(),
-            "the bundled metamodel must validate clean (no kind-conflicting bare refs); got {:#?}",
+            "the bundled metamodel must validate clean under the broadened gate; got {:#?}",
             viols.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 }

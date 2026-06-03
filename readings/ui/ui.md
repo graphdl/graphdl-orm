@@ -73,7 +73,6 @@ View Renderer(.id) is an entity type.
 
 ## Value Types
 
-Title is a value type.
 Color is a value type.
 Font is a value type.
 Content Stretch is a value type.
