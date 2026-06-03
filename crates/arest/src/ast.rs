@@ -5299,12 +5299,23 @@ fn same_identity(a: &Object, b: &Object) -> bool {
     // (the Task_is_finished bloat, ~+653 rows/recompile). Compare φ-canonical
     // forms so such facts dedup regardless of φ representation.
     if canon_phi(a) == canon_phi(b) { return true; }
+    // ns-4 (namespace-keyed identity): when both facts carry a `homeDomain`
+    // (only domain-annotated Noun facts do — see annotate_noun_domain),
+    // identity is the (id/name, homeDomain) PAIR, so same-named nouns in
+    // different domains (core.Order value vs orders.Order entity) stay
+    // DISTINCT instead of merging by name. Facts without a homeDomain leave
+    // domain_mismatch false, so resource/command `domain` and every other
+    // cell are untouched.
+    let domain_mismatch = matches!(
+        (binding(a, "homeDomain"), binding(b, "homeDomain")),
+        (Some(da), Some(db)) if da != db
+    );
     const IDENTITY_KEYS: &[&str] = &["id", "name", "ruleId", "Change Id", "Signal Id"];
     for key in IDENTITY_KEYS {
         let av = binding(a, key);
         let bv = binding(b, key);
         if let (Some(av), Some(bv)) = (av, bv) {
-            return av == bv;
+            return av == bv && !domain_mismatch;
         }
     }
     false
@@ -5795,6 +5806,31 @@ pub fn stamp_file_domain(state: &Object, domain: &str) -> Object {
     let mut m: HashMap<String, Object> = HashMap::new();
     m.insert("Function_belongs_to_Domain".to_string(), Object::seq(facts));
     Object::map(m)
+}
+
+/// ns-4 (namespace-keyed identity): tag every fact in `state`'s Noun cell
+/// with a `homeDomain` binding (the file domain), so `same_identity` keys
+/// nouns by (name, homeDomain) and same-named nouns from different domains
+/// (core.Order value vs orders.Order entity) survive `merge_states` as
+/// distinct entries instead of collapsing by name. Idempotent (replaces any
+/// existing homeDomain); other cells pass through unchanged. Distinct from
+/// the createEntity `domain` command field, so resource handling is untouched.
+pub fn annotate_noun_domain(state: &Object, domain: &str) -> Object {
+    let mut map: HashMap<String, Object> = cells_iter(state).into_iter()
+        .map(|(n, c)| (n.to_string(), c.clone()))
+        .collect();
+    if let Some(facts) = map.get("Noun").and_then(|c| c.as_seq()).map(|s| s.to_vec()) {
+        let annotated: Vec<Object> = facts.iter().map(|f| {
+            let mut pairs: Vec<Object> = f.as_seq().map(|s| s.to_vec()).unwrap_or_default();
+            pairs.retain(|p| p.as_seq()
+                .and_then(|kv| kv.first())
+                .and_then(|x| x.as_atom()) != Some("homeDomain"));
+            pairs.push(Object::seq(vec![Object::atom("homeDomain"), Object::atom(domain)]));
+            Object::seq(pairs)
+        }).collect();
+        map.insert("Noun".to_string(), Object::seq(annotated));
+    }
+    Object::map(map)
 }
 
 /// Check if a named-tuple fact has a binding matching key=val.
@@ -6486,6 +6522,33 @@ mod tests {
             "expected >= 2 nouns + 1 fact type stamped; got {}: {:?}",
             facts.len(), facts
         );
+    }
+
+    #[test]
+    fn namespaced_nouns_stay_distinct_across_domains() {
+        // core.Order is a value type; orders.Order is an entity type. With
+        // homeDomain annotation + domain-aware same_identity, the merge keeps
+        // BOTH instead of collapsing them by name (the Order collision).
+        let core = annotate_noun_domain(
+            &crate::parse_forml2::parse_to_state("Order is a value type.").expect("core parses"),
+            "core");
+        let orders = annotate_noun_domain(
+            &crate::parse_forml2::parse_to_state("Order(.id) is an entity type.").expect("orders parses"),
+            "orders");
+        let merged = merge_states(&core, &orders);
+        let order_entries: Vec<Object> = fetch_cell_seq("Noun", &merged)
+            .as_seq().expect("Noun seq").iter()
+            .filter(|f| binding(f, "name") == Some("Order"))
+            .cloned()
+            .collect();
+        assert_eq!(order_entries.len(), 2,
+            "core.Order (value) and orders.Order (entity) must both survive the merge; got {:?}", order_entries);
+        assert!(order_entries.iter().any(|f|
+            binding(f, "objectType") == Some("value") && binding(f, "homeDomain") == Some("core")),
+            "core.Order should be the value type");
+        assert!(order_entries.iter().any(|f|
+            binding(f, "objectType") == Some("entity") && binding(f, "homeDomain") == Some("orders")),
+            "orders.Order should be the entity type");
     }
 
     #[test]

@@ -1152,6 +1152,8 @@ pub fn main_entry() {
                         // domain (the reading name) — same per-file binding as
                         // metamodel_state(). Flows into `state` at the Pass-2 assembly
                         // below, so dirs-compiled apps carry per-file domains.
+                        // ns-4: tag Noun facts with homeDomain for keyed identity.
+                        let this = ast::annotate_noun_domain(&this, name);
                         let this = ast::merge_states(&this, &ast::stamp_file_domain(&this, name));
                         ast::merge_states(&merged, &this)
                     },

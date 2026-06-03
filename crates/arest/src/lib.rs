@@ -1368,6 +1368,9 @@ fn metamodel_state() -> &'static ast::Object {
             // relies on the same), so each Function is stamped once with its home
             // domain, satisfying the ns-1 deontic `Function belongs to Domain`
             // obligation and giving ns-4 the (domain, name) key.
+            // ns-4 (keyed identity): tag this slice's Noun facts with homeDomain
+            // so merge_states keeps same-named nouns from different domains distinct.
+            let parsed = ast::annotate_noun_domain(&parsed, name);
             let parsed = ast::merge_states(&parsed, &ast::stamp_file_domain(&parsed, name));
             ast::merge_states(&acc, &parsed)
         });
