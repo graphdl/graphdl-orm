@@ -5773,6 +5773,30 @@ pub fn fact_from_pairs(pairs: &[(&str, &str)]) -> Object {
     }).collect())
 }
 
+/// ns-3 (per-file domain binding): stamp every declared Function in
+/// `state` — nouns and fact types — with `belongs to Domain 'domain'`,
+/// returning a one-cell state (`Function_belongs_to_Domain`) ready to
+/// `merge_states` into the per-file parse before the loader's fold merges
+/// it forward. Mirrors `build_provenance_cell`'s per-file cell walk; the
+/// (`Function`, `Domain`) role-noun keys follow the `fact_from_pairs`
+/// convention (cf. `Completion_belongs_to_Agent`). `domain` is resolved by
+/// the caller (file basename default, or an in-file `Domain 'X'` override).
+pub fn stamp_file_domain(state: &Object, domain: &str) -> Object {
+    let mut facts: Vec<Object> = Vec::new();
+    for (kind, id_key) in [("Noun", "name"), ("FactType", "id")] {
+        if let Some(cell_facts) = fetch_cell_seq(kind, state).as_seq() {
+            for f in cell_facts {
+                if let Some(id) = binding(f, id_key) {
+                    facts.push(fact_from_pairs(&[("Function", id), ("Domain", domain)]));
+                }
+            }
+        }
+    }
+    let mut m: HashMap<String, Object> = HashMap::new();
+    m.insert("Function_belongs_to_Domain".to_string(), Object::seq(facts));
+    Object::map(m)
+}
+
 /// Check if a named-tuple fact has a binding matching key=val.
 /// Replaces: fact.bindings.iter().any(|(k, v)| k == key && v == val)
 pub fn binding_matches(fact: &Object, key: &str, val: &str) -> bool {
@@ -6438,6 +6462,31 @@ impl fmt::Debug for Func {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stamp_file_domain_tags_declared_functions() {
+        let state = crate::parse_forml2::parse_to_state(
+            "Order(.id) is an entity type.\nCustomer(.id) is an entity type.\nOrder placed by Customer.",
+        )
+        .expect("fixture parses");
+        let stamped = stamp_file_domain(&state, "orders");
+        let cell = fetch_cell_seq("Function_belongs_to_Domain", &stamped);
+        let facts = cell.as_seq().expect("Function_belongs_to_Domain is a Seq");
+        let stamped_with = |noun: &str| {
+            facts.iter().any(|f| {
+                binding(f, "Function") == Some(noun) && binding(f, "Domain") == Some("orders")
+            })
+        };
+        assert!(stamped_with("Order"), "Order noun stamped with domain orders; got {:?}", facts);
+        assert!(stamped_with("Customer"), "Customer noun stamped; got {:?}", facts);
+        // The fact type is a Function too (Fact Type < Resource < Noun < Function),
+        // so it is stamped alongside the two nouns.
+        assert!(
+            facts.len() >= 3,
+            "expected >= 2 nouns + 1 fact type stamped; got {}: {:?}",
+            facts.len(), facts
+        );
+    }
 
     #[test]
     fn map_display_is_key_sorted_for_determinism() {

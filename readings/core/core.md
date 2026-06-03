@@ -5,7 +5,6 @@
 Function(.id) is an entity type.
 Noun is a subtype of Function.
   Fact Type is a subtype of Resource.
-  Status is a subtype of Resource.
   {Fact Type, Status, State Machine Definition, Constraint, Derivation Rule} are mutually exclusive subtypes of Resource.
 
 Reading(.id) is an entity type.

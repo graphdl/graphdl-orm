@@ -3,6 +3,7 @@
 ## Entity Types
 
 Status(.Name) is an entity type.
+Status is a subtype of Resource.
 State Machine Definition(.Name) is an entity type.
 State Machine Definition is a subtype of Resource.
 Transition(.id) is an entity type.

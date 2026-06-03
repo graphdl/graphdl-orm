@@ -1361,6 +1361,14 @@ fn metamodel_state() -> &'static ast::Object {
         let merged = metamodel_readings().iter().fold(ast::Object::phi(), |acc, (name, text)| {
             let parsed = parse_forml2::parse_to_state_from(text, &acc)
                 .unwrap_or_else(|e| panic!("metamodel parse failed at readings/{}.md: {}", name, e));
+            // ns-3 (per-file domain binding): stamp this slice's own declared
+            // Functions (nouns + fact types) with its file domain — the slice
+            // name (e.g. 'core', 'state'). The per-file parse's Noun/FactType
+            // cells hold only the slice's own declarations (build_provenance_cell
+            // relies on the same), so each Function is stamped once with its home
+            // domain, satisfying the ns-1 deontic `Function belongs to Domain`
+            // obligation and giving ns-4 the (domain, name) key.
+            let parsed = ast::merge_states(&parsed, &ast::stamp_file_domain(&parsed, name));
             ast::merge_states(&acc, &parsed)
         });
 
@@ -1390,6 +1398,43 @@ fn metamodel_state() -> &'static ast::Object {
         ]);
         ast::defs_to_state(&defs, &merged)
     })
+}
+
+#[cfg(all(test, not(feature = "no_std")))]
+mod ns3_domain_binding_tests {
+    use super::*;
+
+    /// ns-3: every metamodel Function carries exactly one Domain — its home
+    /// slice — proving the per-file stamp does not double-claim nouns that
+    /// appear via cross-file subtype edges (e.g. `Status is a subtype of
+    /// Resource` in core.md while Status is declared in state.md).
+    #[test]
+    fn metamodel_functions_carry_their_home_domain() {
+        let state = metamodel_state();
+        let cell = ast::fetch_cell_seq("Function_belongs_to_Domain", state);
+        let facts = cell.as_seq().expect("Function_belongs_to_Domain populated in metamodel_state");
+        let domains_of = |f: &str| -> Vec<&str> {
+            facts.iter()
+                .filter(|x| ast::binding(x, "Function") == Some(f))
+                .filter_map(|x| ast::binding(x, "Domain"))
+                .collect()
+        };
+        // Status is declared in state.md -> exactly its home domain 'state'
+        // (NOT also 'core', despite the core.md `subtype of Resource` edge).
+        assert_eq!(domains_of("Status"), vec!["state"],
+            "Status must carry exactly its home domain 'state'; got {:?}", domains_of("Status"));
+        // Order (core.md value type, the collision noun) -> 'core'.
+        assert_eq!(domains_of("Order"), vec!["core"],
+            "core.Order must carry domain 'core'; got {:?}", domains_of("Order"));
+        // Resource (instances.md) -> 'instances'.
+        assert_eq!(domains_of("Resource"), vec!["instances"],
+            "Resource must carry domain 'instances'; got {:?}", domains_of("Resource"));
+        // State Machine Definition (state.md) has NO cross-file subtype edge —
+        // only the core.md exclusion references it — so this isolates whether a
+        // constraint registers its referenced nouns (it must not).
+        assert_eq!(domains_of("State Machine Definition"), vec!["state"],
+            "SM Definition must carry domain 'state'; got {:?}", domains_of("State Machine Definition"));
+    }
 }
 
 #[cfg(not(feature = "no_std"))]
