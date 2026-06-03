@@ -5958,8 +5958,29 @@ fn parse_to_state_via_stage12_impl(
     // O(n²) on the growing cell vectors.
     let t_tok = Instant::now();
     let mut acc_cells: HashMap<String, Vec<Object>> = HashMap::new();
+    // p0 (parser-isolate-prose-and-fences-from-readings): track whether
+    // we're inside a fenced code block. Content between ``` (or ~~~)
+    // fences is documentation — illustrative rule shapes, jsonc samples,
+    // join-chain sketches — NOT FORML 2 readings. Tokenizing it would
+    // mint phantom Role References / FactTypes from incidental declared-
+    // noun mentions (and, worse, phantom cross-domain refs like
+    // `view-projection.View` inside a code sample). Mirrors the markdown
+    // `#`-heading exemption below: skip the fence marker line and every
+    // line until the closing fence. The marker test is `starts_with`
+    // (not `==`) so a language-tagged opener (```forml2, ```jsonc) and
+    // any closing whitespace are handled.
+    let mut in_fence = false;
     for (i, raw_line) in lines.iter().enumerate() {
         let line = raw_line.trim();
+        // Fence marker toggles fence state; the marker line itself is
+        // never a reading. CommonMark fences are ``` or ~~~.
+        if line.starts_with("```") || line.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -8787,6 +8808,106 @@ mod tests {
             .unwrap_or_default();
         assert!(pairs.contains(&("Dog".to_string(), "Animal".to_string())),
             "expected (Dog, Animal) in Subtype cell; got {:?}", pairs);
+    }
+
+    /// p0 (parser-isolate-prose-and-fences-from-readings): statements
+    /// inside a fenced code block (```) are documentation, not readings.
+    /// A declared noun mentioned inside a fence must NOT mint a FactType
+    /// / Role Reference, while a genuine statement OUTSIDE the fence on
+    /// the same nouns still parses. Mirrors the heading-exemption: the
+    /// fence is skipped at the same point in the per-line loop.
+    #[test]
+    fn fenced_code_block_statements_do_not_produce_fact_types() {
+        let src = "\
+# View Detail Derivation
+
+Foo is an entity type.
+Bar is an entity type.
+
+The rule shape (illustrative):
+
+```
+Foo wibbles Bar.
+```
+
+Foo has Bar.
+";
+        let state = super::parse_to_state_via_stage12(src)
+            .expect("parse_to_state_via_stage12");
+        let ft_cell = fetch_or_phi("FactType", &state);
+        let ft_ids: Vec<String> = ft_cell.as_seq()
+            .map(|s| s.iter().filter_map(|f| binding(f, "id").map(String::from)).collect())
+            .unwrap_or_default();
+        // The genuine statement outside the fence parses.
+        assert!(ft_ids.iter().any(|id| id == "Foo_has_Bar"),
+            "real `Foo has Bar.` outside the fence must parse; got {:?}", ft_ids);
+        // The fenced illustration does NOT mint a FactType.
+        assert!(!ft_ids.iter().any(|id| id.contains("wibbles")),
+            "`Foo wibbles Bar.` is inside a ``` fence and must NOT parse as a \
+             reading; got {:?}", ft_ids);
+        // The nouns themselves are still declared (declared OUTSIDE the fence).
+        let noun_cell = fetch_or_phi("Noun", &state);
+        let noun_names: Vec<String> = noun_cell.as_seq()
+            .map(|s| s.iter().filter_map(|f| binding(f, "name").map(String::from)).collect())
+            .unwrap_or_default();
+        assert!(noun_names.iter().any(|n| n == "Foo")
+                && noun_names.iter().any(|n| n == "Bar"),
+            "Foo and Bar declared outside the fence must still register; got {:?}",
+            noun_names);
+    }
+
+    /// p0 follow-on: a `~~~` fence is the CommonMark alternate fence
+    /// marker and must be excluded the same way as a ``` fence.
+    #[test]
+    fn tilde_fenced_code_block_statements_do_not_produce_fact_types() {
+        let src = "\
+Foo is an entity type.
+Bar is an entity type.
+
+~~~
+Foo wibbles Bar.
+~~~
+
+Foo has Bar.
+";
+        let state = super::parse_to_state_via_stage12(src)
+            .expect("parse_to_state_via_stage12");
+        let ft_cell = fetch_or_phi("FactType", &state);
+        let ft_ids: Vec<String> = ft_cell.as_seq()
+            .map(|s| s.iter().filter_map(|f| binding(f, "id").map(String::from)).collect())
+            .unwrap_or_default();
+        assert!(ft_ids.iter().any(|id| id == "Foo_has_Bar"),
+            "real `Foo has Bar.` outside the fence must parse; got {:?}", ft_ids);
+        assert!(!ft_ids.iter().any(|id| id.contains("wibbles")),
+            "`Foo wibbles Bar.` is inside a ~~~ fence and must NOT parse; got {:?}",
+            ft_ids);
+    }
+
+    /// p0: a ```language-tagged fence (e.g. ```forml2) is still a fence —
+    /// the info string after the opening backticks must not defeat the
+    /// exclusion.
+    #[test]
+    fn language_tagged_fence_is_still_excluded() {
+        let src = "\
+Foo is an entity type.
+Bar is an entity type.
+
+```forml2
+Foo wibbles Bar.
+```
+
+Foo has Bar.
+";
+        let state = super::parse_to_state_via_stage12(src)
+            .expect("parse_to_state_via_stage12");
+        let ft_cell = fetch_or_phi("FactType", &state);
+        let ft_ids: Vec<String> = ft_cell.as_seq()
+            .map(|s| s.iter().filter_map(|f| binding(f, "id").map(String::from)).collect())
+            .unwrap_or_default();
+        assert!(ft_ids.iter().any(|id| id == "Foo_has_Bar"),
+            "real `Foo has Bar.` outside the fence must parse; got {:?}", ft_ids);
+        assert!(!ft_ids.iter().any(|id| id.contains("wibbles")),
+            "```forml2-tagged fence must still be excluded; got {:?}", ft_ids);
     }
 
     // `diff_organization_fixture` was a legacy-vs-stage12 parity check
