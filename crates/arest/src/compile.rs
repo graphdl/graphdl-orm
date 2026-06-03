@@ -468,7 +468,19 @@ fn instances_of_noun_func(noun_name: &str) -> Func {
     );
     // For each ft entry in pop: vals_per_ft
     // Then concat all results
-    Func::compose(Func::Concat, Func::apply_to_all(vals_per_ft))
+    let all_vals = Func::compose(Func::Concat, Func::apply_to_all(vals_per_ft));
+    // ns (Order-isn't-parsing): drop degenerate/blank instance values. A
+    // compound reference whose components are empty joins to ", " (e.g. an
+    // empty Line Item(.Order, .Product) component), and a missing reference
+    // is "". Neither denotes a real entity instance, so enumerating them as
+    // instances mints a phantom "Order ', '" that trips the placed-by MC and
+    // seeds a phantom SM. Excluding them here fixes every consumer (MC
+    // enumeration, SM-init/event-fold, …) at the single shared source.
+    let non_blank = Func::compose(Func::Not, Func::compose(Func::Eq,
+        Func::construction(vec![Func::Id, Func::constant(Object::atom(", "))])));
+    let non_empty = Func::compose(Func::Not, Func::compose(Func::Eq,
+        Func::construction(vec![Func::Id, Func::constant(Object::atom(""))])));
+    Func::compose(Func::filter(non_blank), Func::compose(Func::filter(non_empty), all_vals))
 }
 
 /// Build a Func that extracts facts for multiple fact type IDs.
