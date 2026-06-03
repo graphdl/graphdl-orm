@@ -639,6 +639,7 @@ Binary Precision is a value type.
 Digit Count is a value type.
 JSON Type is a value type.
 JSON Format is a value type.
+Abstract SQL Type is a value type.
 
 ### Fact types
 
@@ -707,6 +708,9 @@ Conceptual Data Type has JSON Type.
 
 Conceptual Data Type has JSON Format.
   Each Conceptual Data Type has at most one JSON Format.
+
+Conceptual Data Type has Abstract SQL Type.
+  Each Conceptual Data Type has exactly one Abstract SQL Type.
 
 ## Instance Facts
 
@@ -831,6 +835,57 @@ Conceptual Data Type 'raw' has JSON Format 'byte'.
 Conceptual Data Type 'largeRaw' has JSON Format 'byte'.
 Conceptual Data Type 'picture' has JSON Format 'byte'.
 Conceptual Data Type 'oleObject' has JSON Format 'byte'.
+
+SQL/DDL projection of the catalog (#279 P2b). NORMA maps a Conceptual
+Data Type to SQL in two stages: first to an abstract SQL type (the
+DCIL layer — a SQL-standard "predefined type" name), then to the
+vendor type per dialect (`readings/templates/sql-dialects.md`). The
+Abstract SQL Type facts below are stage one. They absorb `abstractSqlType`
+onto the Conceptual Data Type cell via RMAP, the same way `jsonType`
+absorbs (P2a) and `conceptualDataType` absorbs onto Noun (P1). The
+generator's `AbstractSqlTypeTable` reads them back; its boot fallback
+mirrors this block one-for-one.
+
+Type-mapping only (P2b): the IDENTITY / auto-increment semantics of
+autoCounter / autoTimestamp and the unsigned-range CHECK constraints
+of the unsigned* leaves are deferred to a later phase — here they map
+to the abstract type that holds their VALUES (autoCounter / rowId /
+objectId → INTEGER; the unsigned* leaves → the smallest signed
+abstract type that fits, i.e. one width up where needed). uuid maps
+to the abstract UUID type; dialects without a native UUID fall back to
+CHARACTER in the vendor layer.
+
+Conceptual Data Type 'text' has Abstract SQL Type 'CHARACTER VARYING'.
+Conceptual Data Type 'fixedText' has Abstract SQL Type 'CHARACTER'.
+Conceptual Data Type 'largeText' has Abstract SQL Type 'CHARACTER LARGE OBJECT'.
+Conceptual Data Type 'smallInteger' has Abstract SQL Type 'SMALLINT'.
+Conceptual Data Type 'integer' has Abstract SQL Type 'INTEGER'.
+Conceptual Data Type 'largeInteger' has Abstract SQL Type 'BIGINT'.
+Conceptual Data Type 'unsignedTiny' has Abstract SQL Type 'SMALLINT'.
+Conceptual Data Type 'unsignedSmall' has Abstract SQL Type 'INTEGER'.
+Conceptual Data Type 'unsigned' has Abstract SQL Type 'BIGINT'.
+Conceptual Data Type 'unsignedLarge' has Abstract SQL Type 'BIGINT'.
+Conceptual Data Type 'autoCounter' has Abstract SQL Type 'INTEGER'.
+Conceptual Data Type 'singleFloat' has Abstract SQL Type 'REAL'.
+Conceptual Data Type 'doubleFloat' has Abstract SQL Type 'DOUBLE PRECISION'.
+Conceptual Data Type 'decimal' has Abstract SQL Type 'DECIMAL'.
+Conceptual Data Type 'money' has Abstract SQL Type 'DECIMAL'.
+Conceptual Data Type 'uuid' has Abstract SQL Type 'UUID'.
+Conceptual Data Type 'date' has Abstract SQL Type 'DATE'.
+Conceptual Data Type 'time' has Abstract SQL Type 'TIME'.
+Conceptual Data Type 'dateTime' has Abstract SQL Type 'TIMESTAMP'.
+Conceptual Data Type 'autoTimestamp' has Abstract SQL Type 'TIMESTAMP'.
+Conceptual Data Type 'boolean' has Abstract SQL Type 'BOOLEAN'.
+Conceptual Data Type 'yesNo' has Abstract SQL Type 'BOOLEAN'.
+Conceptual Data Type 'fixedRaw' has Abstract SQL Type 'BINARY'.
+Conceptual Data Type 'raw' has Abstract SQL Type 'BINARY VARYING'.
+Conceptual Data Type 'largeRaw' has Abstract SQL Type 'BINARY LARGE OBJECT'.
+Conceptual Data Type 'picture' has Abstract SQL Type 'BINARY VARYING'.
+Conceptual Data Type 'oleObject' has Abstract SQL Type 'BINARY VARYING'.
+Conceptual Data Type 'rowId' has Abstract SQL Type 'INTEGER'.
+Conceptual Data Type 'objectId' has Abstract SQL Type 'INTEGER'.
+Conceptual Data Type 'unspecified' has Abstract SQL Type 'CHARACTER VARYING'.
+Conceptual Data Type 'userDefined' has Abstract SQL Type 'CHARACTER VARYING'.
 
 ### Constraint Kinds (#747)
 

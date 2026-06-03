@@ -2323,9 +2323,24 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         // #896: lift dialect type maps to readings — read once per
         // compile and reuse across every (table × dialect) pair.
         let type_map = SqlTypeMappingTable::from_readings_state(state);
+        // #279 P2b: precompute column-snake → abstract SQL type once per
+        // compile (stage one of the NORMA two-stage projection). A value
+        // column's name is `to_snake(source value noun)`, so key the map
+        // by the snake of each Noun that carries a `conceptualDataType`
+        // whose code resolves in the catalog. `generate_ddl` then feeds
+        // the abstract type into `type_map` as the per-dialect base.
+        let abstract_sql_map = AbstractSqlTypeTable::from_readings_state(state);
+        let cdt_abstract_by_col: HashMap<String, String> = noun_cell.as_seq()
+            .map(|facts| facts.iter().filter_map(|f| {
+                let name = binding(f, "name")?;
+                let code = binding(f, "conceptualDataType")?;
+                let abstract_type = abstract_sql_map.resolve(code)?;
+                Some((crate::rmap::to_snake(name), abstract_type.to_string()))
+            }).collect())
+            .unwrap_or_default();
         for table_name in &names {
             for (dialect_name, dialect) in active_dialects.iter() {
-                let ddl = generate_ddl(&rmap_cells, table_name, dialect, &type_map);
+                let ddl = generate_ddl(&rmap_cells, table_name, dialect, &type_map, &cdt_abstract_by_col);
                 defs.push((
                     format!("sql:{}:{}", dialect_name, table_name),
                     Func::constant(Object::atom(&ddl)),
@@ -9949,52 +9964,169 @@ pub struct SqlTypeMappingTable {
 impl SqlTypeMappingTable {
     /// Boot table — must stay in sync with the `SQL Dialect maps Value
     /// Type to SQL Type` instance facts in
-    /// `readings/templates/sql-dialects.md`. Eight dialects × four
-    /// value types = 32 rows in the same declaration order as the
-    /// legacy `match dialect { ... match base { ... } }` cascade in
-    /// `generate_ddl`.
+    /// `readings/templates/sql-dialects.md`. Eight dialects; each
+    /// contributes the four legacy buckets (TEXT / INTEGER / REAL /
+    /// BOOLEAN — same order as the pre-#896 `match dialect { ... match
+    /// base { ... } }` cascade in `generate_ddl`) followed by the
+    /// SQL-standard abstract types a Conceptual Data Type resolves to
+    /// (#279 P2b). INTEGER / BOOLEAN double as both a legacy bucket and
+    /// an abstract type, so they appear once per dialect. The
+    /// `readings_corpus_round_trips_to_boot_table` parity test guards
+    /// this against drift from the readings file.
     pub fn boot() -> Self {
         let rows: Vec<(String, String, String)> = [
-            // Sqlite
-            ("Sqlite",     "TEXT",    "TEXT"),
-            ("Sqlite",     "INTEGER", "INTEGER"),
-            ("Sqlite",     "REAL",    "REAL"),
-            ("Sqlite",     "BOOLEAN", "INTEGER"),
-            // PostgreSql
-            ("PostgreSql", "TEXT",    "TEXT"),
-            ("PostgreSql", "INTEGER", "INTEGER"),
-            ("PostgreSql", "REAL",    "DOUBLE PRECISION"),
-            ("PostgreSql", "BOOLEAN", "BOOLEAN"),
-            // MySql
-            ("MySql",      "TEXT",    "VARCHAR(255)"),
-            ("MySql",      "INTEGER", "INT"),
-            ("MySql",      "REAL",    "DOUBLE"),
-            ("MySql",      "BOOLEAN", "TINYINT(1)"),
-            // SqlServer
-            ("SqlServer",  "TEXT",    "NVARCHAR(255)"),
-            ("SqlServer",  "INTEGER", "INT"),
-            ("SqlServer",  "REAL",    "FLOAT"),
-            ("SqlServer",  "BOOLEAN", "BIT"),
-            // Oracle
-            ("Oracle",     "TEXT",    "VARCHAR2(255)"),
-            ("Oracle",     "INTEGER", "NUMBER(10)"),
-            ("Oracle",     "REAL",    "NUMBER"),
-            ("Oracle",     "BOOLEAN", "NUMBER(1)"),
-            // Db2
-            ("Db2",        "TEXT",    "VARCHAR(255)"),
-            ("Db2",        "INTEGER", "INTEGER"),
-            ("Db2",        "REAL",    "DOUBLE"),
-            ("Db2",        "BOOLEAN", "SMALLINT"),
-            // ClickHouse
-            ("ClickHouse", "TEXT",    "String"),
-            ("ClickHouse", "INTEGER", "Int64"),
-            ("ClickHouse", "REAL",    "Float64"),
-            ("ClickHouse", "BOOLEAN", "UInt8"),
-            // Standard
-            ("Standard",   "TEXT",    "CHARACTER VARYING(255)"),
-            ("Standard",   "INTEGER", "INTEGER"),
-            ("Standard",   "REAL",    "DOUBLE PRECISION"),
-            ("Standard",   "BOOLEAN", "BOOLEAN"),
+            // ── Sqlite (storage classes TEXT/INTEGER/REAL/BLOB/NUMERIC) ──
+            ("Sqlite",     "TEXT",                   "TEXT"),
+            ("Sqlite",     "INTEGER",                "INTEGER"),
+            ("Sqlite",     "REAL",                   "REAL"),
+            ("Sqlite",     "BOOLEAN",                "INTEGER"),
+            ("Sqlite",     "CHARACTER VARYING",      "TEXT"),
+            ("Sqlite",     "CHARACTER",              "TEXT"),
+            ("Sqlite",     "CHARACTER LARGE OBJECT", "TEXT"),
+            ("Sqlite",     "SMALLINT",               "INTEGER"),
+            ("Sqlite",     "BIGINT",                 "INTEGER"),
+            ("Sqlite",     "DOUBLE PRECISION",       "REAL"),
+            ("Sqlite",     "DECIMAL",                "NUMERIC"),
+            ("Sqlite",     "UUID",                   "TEXT"),
+            ("Sqlite",     "BINARY",                 "BLOB"),
+            ("Sqlite",     "BINARY VARYING",         "BLOB"),
+            ("Sqlite",     "BINARY LARGE OBJECT",    "BLOB"),
+            ("Sqlite",     "DATE",                   "TEXT"),
+            ("Sqlite",     "TIME",                   "TEXT"),
+            ("Sqlite",     "TIMESTAMP",              "TEXT"),
+            // ── PostgreSql ──
+            ("PostgreSql", "TEXT",                   "TEXT"),
+            ("PostgreSql", "INTEGER",                "INTEGER"),
+            ("PostgreSql", "REAL",                   "DOUBLE PRECISION"),
+            ("PostgreSql", "BOOLEAN",                "BOOLEAN"),
+            ("PostgreSql", "CHARACTER VARYING",      "varchar"),
+            ("PostgreSql", "CHARACTER",              "char"),
+            ("PostgreSql", "CHARACTER LARGE OBJECT", "text"),
+            ("PostgreSql", "SMALLINT",               "smallint"),
+            ("PostgreSql", "BIGINT",                 "bigint"),
+            ("PostgreSql", "DOUBLE PRECISION",       "double precision"),
+            ("PostgreSql", "DECIMAL",                "numeric"),
+            ("PostgreSql", "UUID",                   "uuid"),
+            ("PostgreSql", "BINARY",                 "bytea"),
+            ("PostgreSql", "BINARY VARYING",         "bytea"),
+            ("PostgreSql", "BINARY LARGE OBJECT",    "bytea"),
+            ("PostgreSql", "DATE",                   "date"),
+            ("PostgreSql", "TIME",                   "time"),
+            ("PostgreSql", "TIMESTAMP",              "timestamp"),
+            // ── MySql ──
+            ("MySql",      "TEXT",                   "VARCHAR(255)"),
+            ("MySql",      "INTEGER",                "INT"),
+            ("MySql",      "REAL",                   "DOUBLE"),
+            ("MySql",      "BOOLEAN",                "TINYINT(1)"),
+            ("MySql",      "CHARACTER VARYING",      "VARCHAR(255)"),
+            ("MySql",      "CHARACTER",              "CHAR(255)"),
+            ("MySql",      "CHARACTER LARGE OBJECT", "LONGTEXT"),
+            ("MySql",      "SMALLINT",               "SMALLINT"),
+            ("MySql",      "BIGINT",                 "BIGINT"),
+            ("MySql",      "DOUBLE PRECISION",       "DOUBLE"),
+            ("MySql",      "DECIMAL",                "DECIMAL"),
+            ("MySql",      "UUID",                   "CHAR(36)"),
+            ("MySql",      "BINARY",                 "BINARY"),
+            ("MySql",      "BINARY VARYING",         "VARBINARY(255)"),
+            ("MySql",      "BINARY LARGE OBJECT",    "LONGBLOB"),
+            ("MySql",      "DATE",                   "DATE"),
+            ("MySql",      "TIME",                   "TIME"),
+            ("MySql",      "TIMESTAMP",              "DATETIME"),
+            // ── SqlServer ──
+            ("SqlServer",  "TEXT",                   "NVARCHAR(255)"),
+            ("SqlServer",  "INTEGER",                "INT"),
+            ("SqlServer",  "REAL",                   "FLOAT"),
+            ("SqlServer",  "BOOLEAN",                "BIT"),
+            ("SqlServer",  "CHARACTER VARYING",      "NVARCHAR(255)"),
+            ("SqlServer",  "CHARACTER",              "NCHAR(255)"),
+            ("SqlServer",  "CHARACTER LARGE OBJECT", "NVARCHAR(MAX)"),
+            ("SqlServer",  "SMALLINT",               "SMALLINT"),
+            ("SqlServer",  "BIGINT",                 "BIGINT"),
+            ("SqlServer",  "DOUBLE PRECISION",       "FLOAT"),
+            ("SqlServer",  "DECIMAL",                "DECIMAL"),
+            ("SqlServer",  "UUID",                   "UNIQUEIDENTIFIER"),
+            ("SqlServer",  "BINARY",                 "BINARY"),
+            ("SqlServer",  "BINARY VARYING",         "VARBINARY(255)"),
+            ("SqlServer",  "BINARY LARGE OBJECT",    "VARBINARY(MAX)"),
+            ("SqlServer",  "DATE",                   "DATE"),
+            ("SqlServer",  "TIME",                   "TIME"),
+            ("SqlServer",  "TIMESTAMP",              "DATETIME2"),
+            // ── Oracle ──
+            ("Oracle",     "TEXT",                   "VARCHAR2(255)"),
+            ("Oracle",     "INTEGER",                "NUMBER(10)"),
+            ("Oracle",     "REAL",                   "NUMBER"),
+            ("Oracle",     "BOOLEAN",                "NUMBER(1)"),
+            ("Oracle",     "CHARACTER VARYING",      "VARCHAR2(255)"),
+            ("Oracle",     "CHARACTER",              "CHAR(255)"),
+            ("Oracle",     "CHARACTER LARGE OBJECT", "CLOB"),
+            ("Oracle",     "SMALLINT",               "NUMBER(5)"),
+            ("Oracle",     "BIGINT",                 "NUMBER(19)"),
+            ("Oracle",     "DOUBLE PRECISION",       "BINARY_DOUBLE"),
+            ("Oracle",     "DECIMAL",                "NUMBER"),
+            ("Oracle",     "UUID",                   "RAW(16)"),
+            ("Oracle",     "BINARY",                 "RAW(2000)"),
+            ("Oracle",     "BINARY VARYING",         "RAW(2000)"),
+            ("Oracle",     "BINARY LARGE OBJECT",    "BLOB"),
+            ("Oracle",     "DATE",                   "DATE"),
+            ("Oracle",     "TIME",                   "TIMESTAMP"),
+            ("Oracle",     "TIMESTAMP",              "TIMESTAMP"),
+            // ── Db2 ──
+            ("Db2",        "TEXT",                   "VARCHAR(255)"),
+            ("Db2",        "INTEGER",                "INTEGER"),
+            ("Db2",        "REAL",                   "DOUBLE"),
+            ("Db2",        "BOOLEAN",                "SMALLINT"),
+            ("Db2",        "CHARACTER VARYING",      "VARCHAR(255)"),
+            ("Db2",        "CHARACTER",              "CHAR(255)"),
+            ("Db2",        "CHARACTER LARGE OBJECT", "CLOB"),
+            ("Db2",        "SMALLINT",               "SMALLINT"),
+            ("Db2",        "BIGINT",                 "BIGINT"),
+            ("Db2",        "DOUBLE PRECISION",       "DOUBLE"),
+            ("Db2",        "DECIMAL",                "DECIMAL"),
+            ("Db2",        "UUID",                   "CHAR(16) FOR BIT DATA"),
+            ("Db2",        "BINARY",                 "BINARY"),
+            ("Db2",        "BINARY VARYING",         "VARBINARY(255)"),
+            ("Db2",        "BINARY LARGE OBJECT",    "BLOB"),
+            ("Db2",        "DATE",                   "DATE"),
+            ("Db2",        "TIME",                   "TIME"),
+            ("Db2",        "TIMESTAMP",              "TIMESTAMP"),
+            // ── ClickHouse ──
+            ("ClickHouse", "TEXT",                   "String"),
+            ("ClickHouse", "INTEGER",                "Int64"),
+            ("ClickHouse", "REAL",                   "Float64"),
+            ("ClickHouse", "BOOLEAN",                "UInt8"),
+            ("ClickHouse", "CHARACTER VARYING",      "String"),
+            ("ClickHouse", "CHARACTER",              "String"),
+            ("ClickHouse", "CHARACTER LARGE OBJECT", "String"),
+            ("ClickHouse", "SMALLINT",               "Int16"),
+            ("ClickHouse", "BIGINT",                 "Int64"),
+            ("ClickHouse", "DOUBLE PRECISION",       "Float64"),
+            ("ClickHouse", "DECIMAL",                "Decimal"),
+            ("ClickHouse", "UUID",                   "UUID"),
+            ("ClickHouse", "BINARY",                 "String"),
+            ("ClickHouse", "BINARY VARYING",         "String"),
+            ("ClickHouse", "BINARY LARGE OBJECT",    "String"),
+            ("ClickHouse", "DATE",                   "Date"),
+            ("ClickHouse", "TIME",                   "String"),
+            ("ClickHouse", "TIMESTAMP",              "DateTime"),
+            // ── Standard ──
+            ("Standard",   "TEXT",                   "CHARACTER VARYING(255)"),
+            ("Standard",   "INTEGER",                "INTEGER"),
+            ("Standard",   "REAL",                   "DOUBLE PRECISION"),
+            ("Standard",   "BOOLEAN",                "BOOLEAN"),
+            ("Standard",   "CHARACTER VARYING",      "CHARACTER VARYING(255)"),
+            ("Standard",   "CHARACTER",              "CHARACTER(255)"),
+            ("Standard",   "CHARACTER LARGE OBJECT", "CHARACTER LARGE OBJECT"),
+            ("Standard",   "SMALLINT",               "SMALLINT"),
+            ("Standard",   "BIGINT",                 "BIGINT"),
+            ("Standard",   "DOUBLE PRECISION",       "DOUBLE PRECISION"),
+            ("Standard",   "DECIMAL",                "DECIMAL"),
+            ("Standard",   "UUID",                   "CHARACTER(36)"),
+            ("Standard",   "BINARY",                 "BINARY"),
+            ("Standard",   "BINARY VARYING",         "BINARY VARYING"),
+            ("Standard",   "BINARY LARGE OBJECT",    "BINARY LARGE OBJECT"),
+            ("Standard",   "DATE",                   "DATE"),
+            ("Standard",   "TIME",                   "TIME"),
+            ("Standard",   "TIMESTAMP",              "TIMESTAMP"),
         ].iter().map(|(d, v, s)| (d.to_string(), v.to_string(), s.to_string())).collect();
         SqlTypeMappingTable { rows }
     }
@@ -10046,6 +10178,109 @@ impl SqlTypeMappingTable {
     }
 }
 
+/// #279 P2b — stage one of the NORMA two-stage SQL projection: maps a
+/// Conceptual Data Type `code` to its abstract SQL type (the SQL-standard
+/// "predefined type" name — the DCIL layer). `generate_ddl` then feeds
+/// that abstract type into `SqlTypeMappingTable::resolve` as the `base`,
+/// yielding the dialect-native vendor type (stage two).
+///
+/// MIRRORS `generators::openapi::JsonTypeMappingTable` (the P2a JSON
+/// projection) and `SqlTypeMappingTable` (the #896 dialect lift): a
+/// `boot()` fallback hand-mirrors the readings one-for-one so a bare
+/// engine — or a snippet-parsed state that never merged core.md — types
+/// identically, and `from_readings_state` reads the catalog cell when
+/// present (the full-compile path). The catalog's single-valued
+/// `Conceptual_Data_Type_has_Abstract_SQL_Type` fact type keeps its own
+/// data cell, with the role players as bindings — the same shape the JSON
+/// and SQL-dialect tables read.
+#[derive(Debug, Clone)]
+pub struct AbstractSqlTypeTable {
+    /// One row per leaf: `(code, abstractSqlType)`. Order matches the
+    /// `Conceptual Data Type has Abstract SQL Type` instance facts in
+    /// `readings/core/core.md` (the #279 catalog area).
+    rows: Vec<(String, String)>,
+}
+
+impl AbstractSqlTypeTable {
+    /// Boot table — must stay in sync with the `Conceptual Data Type has
+    /// Abstract SQL Type` instance facts in `readings/core/core.md`. 31
+    /// leaf codes. A `core_md_declares_conceptual_data_type_abstract_sql_type`
+    /// text pin plus `abstract_sql_type_table_boot_matches_readings_state`
+    /// guard this against drift.
+    ///
+    /// Type-mapping only (P2b): autoCounter / rowId / objectId map to the
+    /// integer abstract type that holds their values (IDENTITY semantics
+    /// deferred); the unsigned* leaves map to a signed abstract type wide
+    /// enough to hold their range (unsigned-range CHECK deferred).
+    pub fn boot() -> Self {
+        // (code, abstractSqlType) in readings declaration order.
+        let rows: Vec<(String, String)> = [
+            ("text",          "CHARACTER VARYING"),
+            ("fixedText",     "CHARACTER"),
+            ("largeText",     "CHARACTER LARGE OBJECT"),
+            ("smallInteger",  "SMALLINT"),
+            ("integer",       "INTEGER"),
+            ("largeInteger",  "BIGINT"),
+            ("unsignedTiny",  "SMALLINT"),
+            ("unsignedSmall", "INTEGER"),
+            ("unsigned",      "BIGINT"),
+            ("unsignedLarge", "BIGINT"),
+            ("autoCounter",   "INTEGER"),
+            ("singleFloat",   "REAL"),
+            ("doubleFloat",   "DOUBLE PRECISION"),
+            ("decimal",       "DECIMAL"),
+            ("money",         "DECIMAL"),
+            ("uuid",          "UUID"),
+            ("date",          "DATE"),
+            ("time",          "TIME"),
+            ("dateTime",      "TIMESTAMP"),
+            ("autoTimestamp", "TIMESTAMP"),
+            ("boolean",       "BOOLEAN"),
+            ("yesNo",         "BOOLEAN"),
+            ("fixedRaw",      "BINARY"),
+            ("raw",           "BINARY VARYING"),
+            ("largeRaw",      "BINARY LARGE OBJECT"),
+            ("picture",       "BINARY VARYING"),
+            ("oleObject",     "BINARY VARYING"),
+            ("rowId",         "INTEGER"),
+            ("objectId",      "INTEGER"),
+            ("unspecified",   "CHARACTER VARYING"),
+            ("userDefined",   "CHARACTER VARYING"),
+        ].iter().map(|(c, t)| (c.to_string(), t.to_string())).collect();
+        AbstractSqlTypeTable { rows }
+    }
+
+    /// Build the table from the runtime
+    /// `Conceptual_Data_Type_has_Abstract_SQL_Type` cell in `state`.
+    /// Falls back to `boot()` when the cell is empty (bare engine, or a
+    /// snippet-parsed state that never merged core.md).
+    pub fn from_readings_state(state: &crate::ast::Object) -> Self {
+        let cell = fetch_cell_seq("Conceptual_Data_Type_has_Abstract_SQL_Type", state);
+        let rows: Vec<(String, String)> = cell.as_seq()
+            .map(|facts| facts.iter().filter_map(|f| {
+                let code = binding(f, "Conceptual Data Type")?.to_string();
+                let abstract_type = binding(f, "Abstract SQL Type")?.to_string();
+                Some((code, abstract_type))
+            }).collect())
+            .unwrap_or_default();
+        if rows.is_empty() {
+            Self::boot()
+        } else {
+            AbstractSqlTypeTable { rows }
+        }
+    }
+
+    /// Resolve a Conceptual Data Type `code` to its abstract SQL type.
+    /// Returns `None` when the code is absent from the catalog — the
+    /// caller then keeps the legacy SQL-derived typing (no regression
+    /// for untyped columns / unknown / future codes).
+    fn resolve<'a>(&'a self, code: &str) -> Option<&'a str> {
+        self.rows.iter()
+            .find(|(c, _)| c == code)
+            .map(|(_, t)| t.as_str())
+    }
+}
+
 /// Generate DDL for a table in the given SQL dialect. Reads the RMAP
 /// cells view directly (#325) — no TableDef allocation, no typed-IR
 /// round-trip. `table_name` is the snake_case name present in the
@@ -10053,11 +10288,21 @@ impl SqlTypeMappingTable {
 /// `SqlTypeMappingTable` resolved at the call site (#896) — generators
 /// build it once per compile from `SqlTypeMappingTable::from_readings_state`
 /// and reuse it across every (table × dialect) emission.
+///
+/// `cdt_abstract_by_col` (#279 P2b) maps a value column's snake-case name
+/// to the abstract SQL type its source noun's Conceptual Data Type
+/// resolves to (stage one of the NORMA two-stage projection, precomputed
+/// once per compile). When a non-FK column has an entry, the abstract
+/// type — not the RMAP coarse `col.col_type` (always `TEXT`) — is fed to
+/// `SqlTypeMappingTable::resolve` as the `base`, yielding the dialect's
+/// native vendor type (stage two). Columns absent from the map (untyped
+/// value types, FKs, future / unmapped codes) keep the pre-P2b typing.
 fn generate_ddl(
     cells: &crate::ast::Object,
     table_name: &str,
     dialect: &SqlDialect,
     type_map: &SqlTypeMappingTable,
+    cdt_abstract_by_col: &HashMap<String, String>,
 ) -> String {
     let q = |s: &str| match dialect {
         SqlDialect::MySql => format!("`{}`", s),
@@ -10080,7 +10325,17 @@ fn generate_ddl(
     let has_ucs = !ucs_vec.is_empty();
 
     let columns: String = columns_view.iter().enumerate().map(|(i, col)| {
-        let col_type = map_type(&col.col_type);
+        // #279 P2b: a value column whose source noun carries a Conceptual
+        // Data Type types from the catalog's abstract SQL type; otherwise
+        // fall back to the RMAP coarse base (`col.col_type`). FK columns
+        // keep their FK typing — never the CDT override.
+        let base: &str = col.references.as_ref()
+            .map_or_else(
+                || cdt_abstract_by_col.get(&col.name).map(String::as_str)
+                    .unwrap_or(col.col_type.as_str()),
+                |_| col.col_type.as_str(),
+            );
+        let col_type = map_type(base);
         let nullable = if col.nullable {
             match dialect { SqlDialect::ClickHouse => " Nullable", _ => "" }
         } else {
@@ -12928,30 +13183,37 @@ mod sql_type_mapping_tests {
     use super::*;
     use crate::ast::{Object, fact_from_pairs, store};
 
-    /// #896 — Boot table must mirror the legacy `match dialect {
-    /// match base { ... } }` cascade exactly. Eight dialects × four
-    /// value types = 32 rows in the same declaration order so the
-    /// per-dialect TEXT / INTEGER / REAL / BOOLEAN mappings round-trip
-    /// to `resolve`.
+    /// #896 / #279 P2b — Boot table groups by dialect in declaration
+    /// order. Each dialect contributes 18 rows: the four legacy buckets
+    /// (TEXT / INTEGER / REAL / BOOLEAN, same order as the pre-#896
+    /// cascade) first, then the SQL-standard abstract types a Conceptual
+    /// Data Type resolves to. Eight dialects × 18 rows = 144.
     #[test]
     fn boot_has_expected_dialect_mappings_in_declared_order() {
         let table = SqlTypeMappingTable::boot();
-        assert_eq!(table.rows.len(), 32,
-            "boot table must have 8 dialects × 4 value types");
+        const PER_DIALECT: usize = 18;
+        assert_eq!(table.rows.len(), 8 * PER_DIALECT,
+            "boot table must have 8 dialects × 18 value types");
 
         let expected_dialects = [
             "Sqlite", "PostgreSql", "MySql", "SqlServer",
             "Oracle", "Db2", "ClickHouse", "Standard",
         ];
-        let expected_value_types = ["TEXT", "INTEGER", "REAL", "BOOLEAN"];
+        // The four legacy buckets lead each dialect block, in order.
+        let leading_value_types = ["TEXT", "INTEGER", "REAL", "BOOLEAN"];
 
         for (dialect_i, dialect) in expected_dialects.iter().enumerate() {
-            for (vt_i, vt) in expected_value_types.iter().enumerate() {
-                let row = &table.rows[dialect_i * 4 + vt_i];
+            // Every row in this dialect's block names this dialect.
+            for offset in 0..PER_DIALECT {
+                let row = &table.rows[dialect_i * PER_DIALECT + offset];
                 assert_eq!(&row.0, dialect,
-                    "row {} dialect", dialect_i * 4 + vt_i);
+                    "row {} dialect", dialect_i * PER_DIALECT + offset);
+            }
+            // …and the first four are the legacy buckets, in order.
+            for (vt_i, vt) in leading_value_types.iter().enumerate() {
+                let row = &table.rows[dialect_i * PER_DIALECT + vt_i];
                 assert_eq!(&row.1, vt,
-                    "row {} value type", dialect_i * 4 + vt_i);
+                    "row {} value type", dialect_i * PER_DIALECT + vt_i);
             }
         }
 
@@ -12960,6 +13222,11 @@ mod sql_type_mapping_tests {
         assert_eq!(table.resolve(SqlDialect::MySql, "TEXT"), "VARCHAR(255)");
         assert_eq!(table.resolve(SqlDialect::Oracle, "INTEGER"), "NUMBER(10)");
         assert_eq!(table.resolve(SqlDialect::ClickHouse, "REAL"), "Float64");
+        // …and a few P2b abstract-type mappings.
+        assert_eq!(table.resolve(SqlDialect::PostgreSql, "DECIMAL"), "numeric");
+        assert_eq!(table.resolve(SqlDialect::PostgreSql, "TIMESTAMP"), "timestamp");
+        assert_eq!(table.resolve(SqlDialect::Sqlite, "UUID"), "TEXT");
+        assert_eq!(table.resolve(SqlDialect::Oracle, "BINARY LARGE OBJECT"), "BLOB");
     }
 
     /// #896 — `resolve(dialect, value_type)` covers every (dialect ×
@@ -13013,15 +13280,18 @@ mod sql_type_mapping_tests {
         assert_eq!(table.resolve(SqlDialect::Standard, "BOOLEAN"), "BOOLEAN");
 
         // Wildcard fallback: every legacy `_ =>` branch aliased the
-        // dialect's TEXT mapping. The accessor must preserve that.
-        assert_eq!(table.resolve(SqlDialect::Sqlite,     "DECIMAL"), "TEXT");
-        assert_eq!(table.resolve(SqlDialect::PostgreSql, "JSON"),    "TEXT");
-        assert_eq!(table.resolve(SqlDialect::MySql,      "DATE"),    "VARCHAR(255)");
-        assert_eq!(table.resolve(SqlDialect::SqlServer,  "UUID"),    "NVARCHAR(255)");
-        assert_eq!(table.resolve(SqlDialect::Oracle,     "BLOB"),    "VARCHAR2(255)");
-        assert_eq!(table.resolve(SqlDialect::Db2,        "TIMESTAMP"), "VARCHAR(255)");
-        assert_eq!(table.resolve(SqlDialect::ClickHouse, "Date"),    "String");
-        assert_eq!(table.resolve(SqlDialect::Standard,   "DECIMAL"), "CHARACTER VARYING(255)");
+        // dialect's TEXT mapping. The accessor must preserve that for
+        // value types that are neither a legacy bucket nor a P2b abstract
+        // type (DECIMAL / DATE / UUID / TIMESTAMP are now mapped, so the
+        // fallback probes use names the table genuinely lacks).
+        assert_eq!(table.resolve(SqlDialect::Sqlite,     "JSON"),       "TEXT");
+        assert_eq!(table.resolve(SqlDialect::PostgreSql, "JSON"),       "TEXT");
+        assert_eq!(table.resolve(SqlDialect::MySql,      "JSONB"),      "VARCHAR(255)");
+        assert_eq!(table.resolve(SqlDialect::SqlServer,  "GEOGRAPHY"),  "NVARCHAR(255)");
+        assert_eq!(table.resolve(SqlDialect::Oracle,     "BLOB"),       "VARCHAR2(255)");
+        assert_eq!(table.resolve(SqlDialect::Db2,        "XML"),        "VARCHAR(255)");
+        assert_eq!(table.resolve(SqlDialect::ClickHouse, "Date"),       "String");
+        assert_eq!(table.resolve(SqlDialect::Standard,   "INTERVAL"),   "CHARACTER VARYING(255)");
     }
 
     /// #896 — `from_readings_state` reads three parallel role
@@ -13164,16 +13434,226 @@ mod sql_type_mapping_tests {
             SqlDialect::SqlServer, SqlDialect::Oracle, SqlDialect::Db2,
             SqlDialect::ClickHouse, SqlDialect::Standard,
         ];
+        // No Conceptual Data Type in this fixture, so the P2b
+        // abstract-type override map is empty — every column types from
+        // its RMAP coarse base, exercising the legacy bucket path.
+        let no_cdt: HashMap<String, String> = HashMap::new();
         for dialect in dialects.iter() {
             let boot_ddl = generate_ddl(
-                &rmap_cells, "t", dialect, &boot_table);
+                &rmap_cells, "t", dialect, &boot_table, &no_cdt);
             let readings_ddl = generate_ddl(
-                &rmap_cells, "t", dialect, &readings_table);
+                &rmap_cells, "t", dialect, &readings_table, &no_cdt);
             assert_eq!(boot_ddl, readings_ddl,
                 "DDL for {:?} differs between boot and readings: \
                  boot={:?}, readings={:?}",
                 dialect.name(), boot_ddl, readings_ddl);
         }
+    }
+
+    // ── #279 P2b — Conceptual Data Type → Abstract SQL Type (stage one) ──
+
+    /// #279 P2b — the boot `AbstractSqlTypeTable` must mirror the
+    /// `Conceptual Data Type has Abstract SQL Type` instance facts in
+    /// `readings/core/core.md` for the representative leaves the mapping
+    /// pins. Unknown codes resolve to `None` so the DDL emitter keeps the
+    /// legacy typing for untyped / future codes.
+    #[test]
+    fn abstract_sql_type_table_boot_resolves_catalog() {
+        let t = AbstractSqlTypeTable::boot();
+        assert_eq!(t.resolve("text"),       Some("CHARACTER VARYING"));
+        assert_eq!(t.resolve("fixedText"),  Some("CHARACTER"));
+        assert_eq!(t.resolve("largeText"),  Some("CHARACTER LARGE OBJECT"));
+        assert_eq!(t.resolve("smallInteger"), Some("SMALLINT"));
+        assert_eq!(t.resolve("integer"),    Some("INTEGER"));
+        assert_eq!(t.resolve("largeInteger"), Some("BIGINT"));
+        assert_eq!(t.resolve("decimal"),    Some("DECIMAL"));
+        assert_eq!(t.resolve("money"),      Some("DECIMAL"));
+        assert_eq!(t.resolve("singleFloat"), Some("REAL"));
+        assert_eq!(t.resolve("doubleFloat"), Some("DOUBLE PRECISION"));
+        assert_eq!(t.resolve("uuid"),       Some("UUID"));
+        assert_eq!(t.resolve("date"),       Some("DATE"));
+        assert_eq!(t.resolve("time"),       Some("TIME"));
+        assert_eq!(t.resolve("dateTime"),   Some("TIMESTAMP"));
+        assert_eq!(t.resolve("boolean"),    Some("BOOLEAN"));
+        assert_eq!(t.resolve("raw"),        Some("BINARY VARYING"));
+        assert_eq!(t.resolve("fixedRaw"),   Some("BINARY"));
+        assert_eq!(t.resolve("largeRaw"),   Some("BINARY LARGE OBJECT"));
+        // Type-mapping-only deferrals: identity / unsigned leaves carry
+        // the abstract type that holds their values (P2b maps TYPE only).
+        assert_eq!(t.resolve("autoCounter"), Some("INTEGER"));
+        assert_eq!(t.resolve("rowId"),      Some("INTEGER"));
+        assert_eq!(t.resolve("objectId"),   Some("INTEGER"));
+        assert_eq!(t.resolve("unsignedTiny"), Some("SMALLINT"));
+        assert_eq!(t.resolve("unsigned"),   Some("BIGINT"));
+        // Unknown code → no mapping (caller falls back to legacy typing).
+        assert_eq!(t.resolve("notACode"),   None);
+    }
+
+    /// #279 P2b — `from_readings_state` reads the two role bindings
+    /// (`Conceptual Data Type`, `Abstract SQL Type`) out of the
+    /// `Conceptual_Data_Type_has_Abstract_SQL_Type` cell. Synthetic
+    /// state pins the role-binding reader independently of the parser.
+    #[test]
+    fn abstract_sql_type_from_readings_state_reads_role_bindings() {
+        let facts: alloc::vec::Vec<Object> = [
+            ("decimal", "DECIMAL"),
+            ("uuid",    "UUID"),
+        ].iter().map(|(c, t)| fact_from_pairs(&[
+            ("Conceptual Data Type", *c),
+            ("Abstract SQL Type", *t),
+        ])).collect();
+        let state = store(
+            "Conceptual_Data_Type_has_Abstract_SQL_Type",
+            Object::Seq(facts.into()),
+            &Object::phi(),
+        );
+        let table = AbstractSqlTypeTable::from_readings_state(&state);
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.resolve("decimal"), Some("DECIMAL"));
+        assert_eq!(table.resolve("uuid"), Some("UUID"));
+        assert_eq!(table.resolve("integer"), None,
+            "only the two synthetic rows are present");
+    }
+
+    /// #279 P2b — empty state falls back to `boot()` so a bare engine
+    /// (no core.md merged) still resolves the catalog.
+    #[test]
+    fn abstract_sql_type_falls_back_to_boot_on_empty_state() {
+        let table = AbstractSqlTypeTable::from_readings_state(&Object::phi());
+        let boot = AbstractSqlTypeTable::boot();
+        assert_eq!(table.rows.len(), boot.rows.len(),
+            "empty state must round-trip to the boot table");
+        for (code, ty) in boot.rows.iter() {
+            assert_eq!(table.resolve(code), Some(ty.as_str()),
+                "empty-state fallback disagrees with boot for '{}'", code);
+        }
+    }
+
+    /// #279 P2b — parity guard like the SQL table's
+    /// `from_readings_state_matches_boot`: the catalog cell compiled from
+    /// `readings/core/core.md` must agree with the hand-maintained boot
+    /// table on every one of the 31 leaf codes.
+    #[cfg(all(feature = "templates", not(feature = "no_std")))]
+    #[test]
+    fn abstract_sql_type_table_boot_matches_readings_state() {
+        let core_md = include_str!("../../../readings/core/core.md");
+        let state = crate::parse_forml2::parse_to_state_from(core_md, &Object::phi())
+            .expect("core.md must parse");
+        let readings = AbstractSqlTypeTable::from_readings_state(&state);
+        let boot = AbstractSqlTypeTable::boot();
+        assert_eq!(readings.rows.len(), 31,
+            "catalog must expose all 31 leaf codes; got {}", readings.rows.len());
+        for (code, ty) in boot.rows.iter() {
+            assert_eq!(readings.resolve(code), Some(ty.as_str()),
+                "readings disagree with boot for leaf '{}'", code);
+        }
+    }
+
+    /// #279 P2b — `core.md` text pin for the catalog instance fact the
+    /// mapping pins (mirrors P2a's
+    /// `core_md_declares_conceptual_data_type_json_projection`). Guards
+    /// the readings source against accidental deletion / rename.
+    #[cfg(all(feature = "templates", not(feature = "no_std")))]
+    #[test]
+    fn core_md_declares_conceptual_data_type_abstract_sql_type() {
+        let core_md = include_str!("../../../readings/core/core.md");
+        assert!(core_md.contains(
+            "Conceptual Data Type 'decimal' has Abstract SQL Type 'DECIMAL'."),
+            "core.md must declare the decimal → DECIMAL abstract-SQL fact");
+        assert!(core_md.contains("Conceptual Data Type has Abstract SQL Type."),
+            "core.md must declare the Abstract SQL Type fact type");
+    }
+
+    /// #279 P2b — two-stage projection at the `generate_ddl` layer: a
+    /// column whose source noun carries `conceptualDataType = decimal`
+    /// resolves CDT → DECIMAL (stage one) → the dialect's decimal type
+    /// (stage two). Drives the lifted accessor directly via the
+    /// `cdt_abstract_by_col` override map.
+    #[test]
+    fn generate_ddl_types_cdt_column_via_two_stages() {
+        let type_map = SqlTypeMappingTable::boot();
+        let rmap_cells = crate::ast::Object::map(
+            [(
+                "RMAPTable".to_string(),
+                Object::Seq(alloc::vec![
+                    fact_from_pairs(&[("name", "order"), ("position", "0")]),
+                ].into()),
+            ),
+            (
+                "RMAPColumn".to_string(),
+                Object::Seq(alloc::vec![
+                    // RMAP types every value column TEXT — the override
+                    // map is what lifts `amount` to the decimal type.
+                    // (RMAPColumn keys: `table` + `colType`, per
+                    // `rmap::columns_for_table` / `rmap_cells_from_state`.)
+                    fact_from_pairs(&[
+                        ("table", "order"), ("name", "amount"),
+                        ("colType", "TEXT"), ("position", "0"),
+                        ("nullable", "true"),
+                    ]),
+                ].into()),
+            )].into_iter().collect()
+        );
+        let mut cdt: HashMap<String, String> = HashMap::new();
+        cdt.insert("amount".to_string(), "DECIMAL".to_string());
+
+        // PostgreSql: DECIMAL → numeric.
+        let pg = generate_ddl(&rmap_cells, "order", &SqlDialect::PostgreSql, &type_map, &cdt);
+        assert!(pg.contains("\"amount\" numeric"),
+            "decimal column must type as PostgreSql numeric; got:\n{}", pg);
+        // MySql: DECIMAL → DECIMAL.
+        let my = generate_ddl(&rmap_cells, "order", &SqlDialect::MySql, &type_map, &cdt);
+        assert!(my.contains("`amount` DECIMAL"),
+            "decimal column must type as MySql DECIMAL; got:\n{}", my);
+        // Without the override, the same column falls back to TEXT typing.
+        let empty: HashMap<String, String> = HashMap::new();
+        let pg_untyped = generate_ddl(&rmap_cells, "order", &SqlDialect::PostgreSql, &type_map, &empty);
+        assert!(pg_untyped.contains("\"amount\" TEXT"),
+            "untyped fallback must keep the legacy TEXT typing; got:\n{}", pg_untyped);
+    }
+
+    /// #279 P2b — END-TO-END THROUGH THE REAL PARSER. A value type that
+    /// opts into a Conceptual Data Type (`The data type of Amount is
+    /// decimal.`) and absorbs as a functional column on the `order` table
+    /// (post-RMAP-fix single-role UC absorption) must surface in the
+    /// generated DDL with the dialect's decimal type — not the untyped
+    /// TEXT fallback. This is the RED→GREEN pin for the P2b wiring.
+    #[cfg(all(feature = "templates", not(feature = "no_std")))]
+    #[test]
+    fn ddl_value_column_typed_from_conceptual_data_type_end_to_end() {
+        let src = "Order(.code) is an entity type.\n\
+Amount is a value type.\n\
+The data type of Amount is decimal.\n\
+\n\
+## Fact Types\n\
+Order has Amount.\n\
+\n\
+## Constraints\n\
+Each Order has at most one Amount.\n";
+        let parsed = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("snippet must parse");
+        // Opt into the PostgreSql DDL generator for this compile.
+        let state = install_active_generators(&parsed, ["postgresql"]);
+        let defs = compile_to_defs_state(&state);
+
+        // The order table's DDL def must exist and carry an `amount`
+        // column typed as the PostgreSql decimal (numeric).
+        let ddl = defs.iter()
+            .find(|(name, _)| name == "sql:postgresql:order")
+            .map(|(_, f)| match f {
+                Func::Constant(o) => o.as_atom().unwrap_or("").to_string(),
+                _ => String::new(),
+            })
+            .unwrap_or_else(|| panic!(
+                "expected a sql:postgresql:order def; got: {:?}",
+                defs.iter().map(|(n, _)| n.as_str())
+                    .filter(|n| n.starts_with("sql:")).collect::<alloc::vec::Vec<_>>()));
+
+        assert!(ddl.contains("\"amount\""),
+            "order DDL must carry an amount column (RMAP absorption); got:\n{}", ddl);
+        assert!(ddl.contains("\"amount\" numeric"),
+            "amount column must type as PostgreSql numeric via the CDT \
+             two-stage projection, not the untyped TEXT fallback; got:\n{}", ddl);
     }
 }
 

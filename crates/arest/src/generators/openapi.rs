@@ -1855,6 +1855,64 @@ mod tests {
             "enum variants must survive; got: {}", size);
     }
 
+    // ── #279 P2b — JSON projection END-TO-END THROUGH THE REAL PARSER ──
+    //
+    // The P2a tests above drive hand-built cells because, pre-RMAP-fix,
+    // a single-role functional value attribute did not absorb as an
+    // entity column from a parsed snippet. Post-fix it does, so these
+    // pins validate the SAME projection end-to-end: parse FORML2 → the
+    // value column absorbs onto the entity table → the OpenAPI generator
+    // types it from the catalog (boot fallback covers the snippet, which
+    // carries no merged core.md). Regression pins for the P2a feature.
+
+    #[test]
+    fn openapi_value_column_typed_integer_end_to_end() {
+        let src = "Order(.code) is an entity type.\n\
+Quantity is a value type.\n\
+The data type of Quantity is integer.\n\
+\n\
+## Fact Types\n\
+Order has Quantity.\n\
+\n\
+## Constraints\n\
+Each Order has at most one Quantity.\n";
+        let state = parse(src);
+        let doc = openapi_for_app(&state, "test-app");
+        let props = doc["components"]["schemas"]["Order"]["properties"]
+            .as_object().expect("Order.properties must be an object");
+        let quantity = props.get("quantity").unwrap_or_else(|| panic!(
+            "Order must carry an absorbed 'quantity' column; got: {:?}",
+            props.keys().collect::<Vec<_>>()));
+        assert_eq!(quantity["type"], "integer",
+            "integer CDT must yield type:integer end-to-end; got: {}", quantity);
+        assert!(quantity.get("format").is_none(),
+            "integer carries no JSON format; got: {}", quantity);
+    }
+
+    #[test]
+    fn openapi_value_column_datetime_carries_format_end_to_end() {
+        let src = "Order(.code) is an entity type.\n\
+Placed At is a value type.\n\
+The data type of Placed At is dateTime.\n\
+\n\
+## Fact Types\n\
+Order has Placed At.\n\
+\n\
+## Constraints\n\
+Each Order has at most one Placed At.\n";
+        let state = parse(src);
+        let doc = openapi_for_app(&state, "test-app");
+        let props = doc["components"]["schemas"]["Order"]["properties"]
+            .as_object().expect("Order.properties must be an object");
+        let placed = props.get("placed_at").unwrap_or_else(|| panic!(
+            "Order must carry an absorbed 'placed_at' column; got: {:?}",
+            props.keys().collect::<Vec<_>>()));
+        assert_eq!(placed["type"], "string",
+            "dateTime maps to JSON type string; got: {}", placed);
+        assert_eq!(placed["format"], "date-time",
+            "dateTime carries format date-time end-to-end; got: {}", placed);
+    }
+
     #[test]
     fn json_type_mapping_table_boot_resolves_catalog() {
         // The boot fallback must mirror the readings one-for-one for the
