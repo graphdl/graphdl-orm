@@ -480,7 +480,15 @@ fn instances_of_noun_func(noun_name: &str) -> Func {
         Func::construction(vec![Func::Id, Func::constant(Object::atom(", "))])));
     let non_empty = Func::compose(Func::Not, Func::compose(Func::Eq,
         Func::construction(vec![Func::Id, Func::constant(Object::atom(""))])));
-    Func::compose(Func::filter(non_blank), Func::compose(Func::filter(non_empty), all_vals))
+    // phi-keyed-task-started-orphan-gc: also drop the literal "φ" token. canon_phi
+    // (ast.rs) treats Atom("φ"), Atom(""), and φ = Seq([]) alike as "no entity";
+    // this shared source caught "" and ", " but the fan-out's "φ" token slipped
+    // through and seeded a φ-keyed phantom in every consumer (MC enumeration, SM
+    // init, event-fold). Dropping it here closes them all at the single source.
+    let non_phi_token = Func::compose(Func::Not, Func::compose(Func::Eq,
+        Func::construction(vec![Func::Id, Func::constant(Object::atom("φ"))])));
+    Func::compose(Func::filter(non_phi_token),
+        Func::compose(Func::filter(non_blank), Func::compose(Func::filter(non_empty), all_vals)))
 }
 
 /// Build a Func that extracts facts for multiple fact type IDs.
@@ -7574,13 +7582,23 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
         // only catches φ = Seq([]); the Atom("") subject slips through it.
         let non_empty = Func::compose(Func::Not, Func::compose(Func::Eq,
             Func::construction(vec![Func::Id, Func::constant(Object::atom(""))])));
+        // …and the literal "φ" token (phi-keyed-task-started-orphan-gc): non_phi
+        // catches φ = Seq([]) and non_empty catches "", but the fan-out write
+        // form Atom("φ") slips both. Without this, a `<<Task, φ>>` event minted
+        // State_Machine_is_currently_in_Status [φ, <target>] — the null/φ
+        // in_progress board phantom, unretractable via the data API.
+        let non_phi_token = Func::compose(Func::Not, Func::compose(Func::Eq,
+            Func::construction(vec![Func::Id, Func::constant(Object::atom("φ"))])));
         let resources = Func::compose(
-            Func::filter(non_empty),
+            Func::filter(non_phi_token),
             Func::compose(
-                Func::filter(non_phi),
+                Func::filter(non_empty),
                 Func::compose(
-                    Func::Concat,
-                    Func::compose(Func::apply_to_all(extract_resource_per_fact), event_facts),
+                    Func::filter(non_phi),
+                    Func::compose(
+                        Func::Concat,
+                        Func::compose(Func::apply_to_all(extract_resource_per_fact), event_facts),
+                    ),
                 ),
             ),
         );

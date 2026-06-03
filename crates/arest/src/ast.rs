@@ -5377,8 +5377,9 @@ pub fn cells_iter(state: &Object) -> Vec<(&str, &Object)> {
 ///      `State Machine is currently in Status` row carrying only
 ///      `<Status, 'Proposed'>` with no `State Machine` binding at all (the
 ///      subject role is absent, so SQL materializes it as NULL).
-///   2. **Empty subject.** First `<role,value>` binding has an empty-string
-///      or φ value.
+///   2. **Empty subject.** First `<role,value>` binding has a degenerate value:
+///      empty-string `""`, the literal `"φ"` token, or φ = empty Seq — the
+///      three `canon_phi` "no-entity" encodings.
 ///
 /// Arity is the modal (max) binding-count among the cell's *own* facts, so a
 /// uniformly unary cell keeps all its rows and we never need the schema. Every
@@ -5473,7 +5474,13 @@ pub(crate) fn drop_empty_subject_facts(contents: &Object) -> Object {
 /// return true (left untouched). Shared by the subjectless-GC variants.
 fn has_nonempty_subject(f: &Object) -> bool {
     match f.as_seq().and_then(|pairs| pairs.first()).and_then(|p| p.as_seq()) {
-        Some(kv) if kv.len() == 2 => matches!(kv[1].as_atom(), Some(v) if !v.is_empty()),
+        // phi-keyed-task-started-orphan-gc: drop "φ" (the fan-out's literal
+        // token) as a degenerate subject, alongside "" and φ = Seq([]) (whose
+        // as_atom() is None, so matches! is already false here). These are
+        // canon_phi's three "no-entity" encodings; without the "φ" arm a
+        // `<<Task, φ>>` relic survives every persist GC pass and re-seeds the
+        // phantom in_progress SM.
+        Some(kv) if kv.len() == 2 => matches!(kv[1].as_atom(), Some(v) if !v.is_empty() && v != "φ"),
         _ => true,
     }
 }
@@ -6592,12 +6599,20 @@ mod tests {
             Object::seq(vec![Object::atom("State Machine"), Object::atom("")]),
             Object::seq(vec![Object::atom("Status"), Object::atom("Proposed")]),
         ]);
-        // φ subject — dropped.
+        // φ subject (empty Seq) — dropped.
         let phi_subject = Object::seq(vec![
             Object::seq(vec![Object::atom("State Machine"), Object::phi()]),
             Object::seq(vec![Object::atom("Status"), Object::atom("in_progress")]),
         ]);
-        let cell = Object::seq(vec![valid.clone(), empty_subject, phi_subject]);
+        // φ-TOKEN subject — Atom("φ"), the fan-out write form (NOT the empty
+        // Seq above). phi-keyed-task-started-orphan-gc: this leaked the GC
+        // because !"φ".is_empty() held, so a `<<Task, φ>>` relic survived every
+        // persist and re-seeded the phantom in_progress SM; now dropped.
+        let phi_token_subject = Object::seq(vec![
+            Object::seq(vec![Object::atom("State Machine"), Object::atom("φ")]),
+            Object::seq(vec![Object::atom("Status"), Object::atom("in_progress")]),
+        ]);
+        let cell = Object::seq(vec![valid.clone(), empty_subject, phi_subject, phi_token_subject]);
         let rows = drop_subjectless_facts_with_arity(&cell, None);
         let rows = rows.as_seq().expect("seq");
         assert_eq!(rows.len(), 1, "only the valid fact survives; got {:?}", rows);

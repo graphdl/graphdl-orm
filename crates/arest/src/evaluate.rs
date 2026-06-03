@@ -2174,6 +2174,80 @@ mod tests {
             derived.iter().filter(|d| d.fact_type_id == "State_Machine_is_currently_in_Status").collect::<Vec<_>>());
     }
 
+    /// phi-keyed-task-started-orphan-gc: the sibling of the test above for the
+    /// *token* φ encoding. `canon_phi` documents three φ forms in a subject
+    /// slot — `phi()` (empty Seq, post-SQLite-round-trip), `Atom("φ")` (the
+    /// fan-out's literal token), `Atom("")` (the apply/SM blank). The fold
+    /// filters caught phi() (NullTest) and "" (Eq) but NOT the `Atom("φ")`
+    /// token, so a `<<Order, atom("φ")>>` event leaked the gate and event-fold
+    /// minted `State_Machine_is_currently_in_Status [φ, Placed]` — the phantom
+    /// that surfaced as a null/φ in_progress task on the live tasks.db board
+    /// (and is unretractable via the data API). A real instance must still get
+    /// its initial; only the φ token is dropped.
+    #[test]
+    fn sm_fold_drops_phi_token_subject_event() {
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "Order", &make_noun("entity"));
+        cells = with_noun(cells, "Name", &make_noun("value"));
+        cells = with_ft(cells, "Order_has_Name", &FactTypeDef {
+            schema_id: String::new(), reading: "Order has Name".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Order".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Name".to_string(), role_index: 1 },
+            ],
+        });
+        cells = with_ft(cells, "Order_was_placed", &FactTypeDef {
+            schema_id: String::new(), reading: "Order was placed".to_string(), readings: vec![],
+            roles: vec![RoleDef { noun_name: "Order".to_string(), role_index: 0 }],
+        });
+        cells = with_state_machine(cells, "OrderSM", &StateMachineDef {
+            noun_name: "Order".to_string(),
+            statuses: vec!["Draft".to_string(), "Placed".to_string(), "Shipped".to_string()],
+            transitions: vec![
+                TransitionDef { from: "Draft".to_string(), to: "Placed".to_string(), event: "Order_was_placed".to_string(), guard: None },
+                TransitionDef { from: "Placed".to_string(), to: "Shipped".to_string(), event: "Order_was_shipped".to_string(), guard: None },
+            ],
+            initial: "Draft".to_string(),
+        });
+        // Real instance o1.
+        cells.entry("Order_has_Name".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Order", "o1"), ("Name", "Widget")]));
+        // A φ-TOKEN event fact: <<Order, atom("φ")>> — the literal token, NOT
+        // the empty-Seq phi() of the sibling test. This is the fan-out write
+        // form before a SQLite round-trip canonicalizes it to phi().
+        cells.entry("Order_was_placed".to_string()).or_default().push(
+            ast::Object::seq(vec![
+                ast::Object::seq(vec![ast::Object::atom("Order"), ast::Object::atom("φ")]),
+            ]));
+
+        let (state, defs, _def_map) = compile_cells(cells);
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &state);
+
+        // The φ token must NOT mint ANY SM status keyed on "φ" (or "").
+        let phi_status: Vec<_> = derived.iter()
+            .filter(|d| d.fact_type_id == "State_Machine_is_currently_in_Status")
+            .filter(|d| d.bindings.iter().any(|(k, v)|
+                k == "State Machine" && (v == "φ" || v.is_empty())))
+            .collect();
+        assert!(phi_status.is_empty(),
+            "φ-token event subject must not mint a φ-keyed SM status; got: {:?}",
+            phi_status);
+
+        // …and the real instance o1 still gets its initial 'Draft' (the token
+        // is filtered out, the fold does not collapse to Bottom).
+        let got_draft = derived.iter()
+            .filter(|d| d.fact_type_id == "State_Machine_is_currently_in_Status")
+            .any(|d| {
+                let sm = d.bindings.iter().find(|(k, _)| k == "State Machine").map(|(_, v)| v.as_str());
+                let st = d.bindings.iter().find(|(k, _)| k == "Status").map(|(_, v)| v.as_str());
+                sm == Some("o1") && st == Some("Draft")
+            });
+        assert!(got_draft,
+            "real instance o1 must still get initial 'Draft'; got: {:?}",
+            derived.iter().filter(|d| d.fact_type_id == "State_Machine_is_currently_in_Status").collect::<Vec<_>>());
+    }
+
     #[test]
     fn test_initial_status_empty_when_cyclic() {
         // Fully cyclic machine: every status is both source and target.
