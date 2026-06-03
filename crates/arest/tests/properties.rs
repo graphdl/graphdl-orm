@@ -276,32 +276,6 @@ mod compat {
     }
 }
 
-// ── Metamodel ────────────────────────────────────────────────────────
-// The state machine primitives. Parsed first so business domains
-// can use them as instance facts without redeclaring.
-
-const STATE_METAMODEL: &str = r#"
-# State
-
-## Entity Types
-
-Status(.Name) is an entity type.
-State Machine Definition is a subtype of Status.
-Transition(.id) is an entity type.
-Fact Type(.id) is an entity type.
-Noun is an entity type.
-Name is a value type.
-
-## Fact Types
-
-State Machine Definition is for Noun.
-Status is initial in State Machine Definition.
-Transition is defined in State Machine Definition.
-Transition is from Status.
-Transition is to Status.
-Transition is triggered by Fact Type.
-"#;
-
 // ── Sample Domain ────────────────────────────────────────────────────
 // An Order domain expanded to exercise all AREST properties.
 
@@ -417,29 +391,67 @@ fn merge_state_into(base: &ast::Object, extension: &ast::Object) -> ast::Object 
     state
 }
 
-fn compile_orders() -> (ast::Object, ast::Object) {
-    let meta_ir = compat::parse_markdown(STATE_METAMODEL).unwrap();
-    let meta_state = compat::domain_to_state(&meta_ir);
-    let orders_state = parse_forml2::parse_to_state_with_nouns(ORDERS_DOMAIN, &meta_state).unwrap();
-    let state = merge_state_into(&meta_state, &orders_state);
+// Build the Orders state the way production (cli/entry.rs run_load)
+// does: fold the REAL bundled metamodel readings + the Order domain via
+// parse_to_state_from + merge_states. This carries the SM fact types AND
+// the metamodel SM-reifying derivations ("Status is defined in SM",
+// "Resource is currently in Status"), so the applicative SM
+// (foldl transition s0 E) assembles and its fold output materializes as
+// facts on the forward chain. The prior hand-rolled STATE_METAMODEL
+// predated the #759-763 cell-driven SM migration: it declared the bare
+// SM fact types but none of the derivations, so the SM compiled to zero
+// — the root cause of the 17 properties.rs SM regressions
+// (testbins-runtime-drift).
+fn orders_state_and_chain(gens: Option<&[&str]>) -> (ast::Object, ast::Object) {
+    // CORE_READINGS only (Theorem 1-5 backbone: core + state + instances
+    // + outcomes + validation) — carries the SM machinery without the
+    // evolution/ui/access/os/template scopes whose constraints would
+    // over-reject the minimal Order fixtures.
+    let all_readings: Vec<(&str, &str)> = arest::CORE_READINGS.iter().copied()
+        .chain(std::iter::once(("orders", ORDERS_DOMAIN)))
+        .collect();
+    let mut state = all_readings.iter().fold(ast::Object::phi(), |merged, (name, text)| {
+        let this = parse_forml2::parse_to_state_from(text, &merged)
+            .unwrap_or_else(|e| panic!("parse {}: {}", name, e));
+        // ns-3/ns-4: stamp + annotate this slice's Functions with its domain
+        // (the slice name, e.g. 'core' / 'orders') so core.Order (value) and
+        // orders.Order (entity) stay distinct via the (name, homeDomain) merge
+        // identity instead of collapsing by name (the Order-isnt-parsing bug).
+        let this = ast::annotate_noun_domain(&this, name);
+        let this = ast::merge_states(&this, &ast::stamp_file_domain(&this, name));
+        ast::merge_states(&merged, &this)
+    });
+    // H3 (#691): generator override is a state cell installed before
+    // compile_to_defs_state.
+    if let Some(g) = gens {
+        state = compile::install_active_generators(&state, g);
+    }
     let defs = compile::compile_to_defs_state(&state);
     let d = ast::defs_to_state(&defs, &state);
+    // Forward-chain over every derivation:* def — user rules + the
+    // synthetic SM derivations (_sm_init_ / _sm_event_fold_ /
+    // _sm_for_resource_backfill_) + the metamodel SM-reifying rules — so
+    // the foldl's current-status output lands as facts (mirrors
+    // cli/entry.rs:1492-1514).
+    let deriv: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, c)| (n.to_string(), ast::metacompose(c, &d)))
+        .collect();
+    let d = if deriv.is_empty() { d } else {
+        let refs: Vec<(&str, &ast::Func)> = deriv.iter()
+            .map(|(n, f)| (n.as_str(), f)).collect();
+        let (nd, _) = arest::evaluate::forward_chain_defs_state(&refs, &d);
+        nd
+    };
     (state, d)
 }
 
+fn compile_orders() -> (ast::Object, ast::Object) {
+    orders_state_and_chain(None)
+}
+
 fn compile_orders_with_generators(gens: &[&str]) -> (ast::Object, ast::Object) {
-    // H3 (#691): generator override is now a state cell, not a
-    // process-global thread-local. Install on `state` before
-    // compile_to_defs_state — no restore needed because the policy
-    // is local to the state we own here.
-    let meta_ir = compat::parse_markdown(STATE_METAMODEL).unwrap();
-    let meta_state = compat::domain_to_state(&meta_ir);
-    let orders_state = parse_forml2::parse_to_state_with_nouns(ORDERS_DOMAIN, &meta_state).unwrap();
-    let state = merge_state_into(&meta_state, &orders_state);
-    let state = compile::install_active_generators(&state, gens);
-    let defs = compile::compile_to_defs_state(&state);
-    let d = ast::defs_to_state(&defs, &state);
-    (state, d)
+    orders_state_and_chain(Some(gens))
 }
 
 // ── Theorem 1: Grammar Unambiguity ───────────────────────────────────
