@@ -3681,6 +3681,13 @@ struct StmtIndex {
     role_pos_by_ref: hashbrown::HashMap<String, String>,
     role_head_noun_by_ref: hashbrown::HashMap<String, String>,
     role_literal_by_ref: hashbrown::HashMap<String, String>,
+    /// ns-6 (ns-reverse-dot-syntax): the EXPLICIT cross-namespace
+    /// qualifier per role ref (`core` from `core.Order`), indexed from
+    /// the Stage-1 `Role_Reference_has_Domain` cell exactly as the head
+    /// noun is indexed from `Role_Reference_has_Head_Noun`. Present only
+    /// for domain-qualified refs; ns-5's resolver consumes it to BYPASS
+    /// bare-name resolution (an explicit qualifier wins outright).
+    role_domain_by_ref: hashbrown::HashMap<String, String>,
     verbs: hashbrown::HashMap<String, String>,
     /// Wrapped in `Arc` so `collect_statement_ids` does a refcount
     /// bump rather than cloning 506 heap-allocated `String`s on
@@ -3733,6 +3740,9 @@ fn build_stmt_index(state: &Object) -> StmtIndex {
         &mut idx.role_head_noun_by_ref);
     index_single("Role_Reference_has_Literal_Value", "Role_Reference", "Literal_Value",
         &mut idx.role_literal_by_ref);
+    // ns-6/ns-5: the explicit `<domain>.` qualifier (Stage-1 output).
+    index_single("Role_Reference_has_Domain", "Role_Reference", "Domain",
+        &mut idx.role_domain_by_ref);
     index_single("Statement_has_Verb", "Statement", "Verb", &mut idx.verbs);
     if let Some(seq) = fetch_cell_seq("Statement", state).as_seq() {
         idx.statement_ids = alloc::sync::Arc::new(seq.iter()
@@ -3740,6 +3750,176 @@ fn build_stmt_index(state: &Object) -> StmtIndex {
             .collect());
     }
     idx
+}
+
+// ─── ns-5 (ns-local-precedence-resolver): bare-reference domain ──────
+//
+// A reading in one domain may reference a noun that another domain
+// declares. ns-6 already recognises an EXPLICIT qualifier (`core.Order`)
+// and carries it on the Role Reference (`Role_Reference_has_Domain`); a
+// BARE reference (`Order`) carries no qualifier and must be resolved to
+// a domain by PRECEDENCE:
+//
+//   1. LOCAL — the reference's own file/domain (ns-3) declares the name
+//      → bind locally (a same-domain reference always wins, even when
+//      other domains also declare the name).
+//   2. UNIQUE — the local domain does NOT declare it, but exactly ONE
+//      other domain does → bind to that unique domain. This is what
+//      keeps every pre-existing unqualified cross-domain reference
+//      working (e.g. an `orders` reading referencing core's `Status`
+//      resolves to the single `core` definition).
+//   3. AMBIGUOUS — two or more domains declare it and none is local →
+//      resolution is genuinely ambiguous and qualification is required.
+//      ns-5 does NOT reject/verbalize; it emits a marker that ns-7
+//      consumes and turns into an alethic violation.
+//
+// An EXPLICIT qualifier (ns-6) BYPASSES the precedence walk entirely —
+// the author has already named the domain, so we honour it verbatim.
+//
+// `Unknown` (no domain declares the name) is left untouched: a typo /
+// undeclared-noun is a separate concern handled elsewhere, and emitting
+// nothing here preserves today's behaviour for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DomainResolution {
+    /// Explicit `<domain>.` qualifier (ns-6) — used verbatim, no walk.
+    Qualified(String),
+    /// Precedence 1: the local domain declares the bare name.
+    Local(String),
+    /// Precedence 2: exactly one OTHER domain declares the bare name.
+    Unique(String),
+    /// Precedence 3: 2+ domains declare it, none local → ns-7 must
+    /// reject. `candidates` is the sorted set of conflicting domains.
+    Ambiguous { candidates: Vec<String> },
+    /// No domain declares the name — out of ns-5's scope, left as-is.
+    Unknown,
+}
+
+/// Pure precedence resolver for a single reference. `explicit_qualifier`
+/// is the ns-6 `Role_Reference_has_Domain` value when present (and wins
+/// outright); `local_domain` is `Some(d)` IFF the bare name is declared
+/// in the reference's own file/domain `d` (ns-3) — the caller passes
+/// `None` when the name is not locally declared (or the local domain is
+/// unknown); `defining_domains` is the set of OTHER domains that DECLARE
+/// the bare name (from the (name, homeDomain) identity — see
+/// `annotate_noun_domain`). Note the local domain need not appear in
+/// `defining_domains`: a single-file parse declares its own nouns in the
+/// text being parsed, not in the (prior-files) context the map is built
+/// from. Total and side-effect free so it can be unit-tested directly,
+/// mirroring ns-6.
+fn resolve_reference_domain(
+    explicit_qualifier: Option<&str>,
+    local_domain: Option<&str>,
+    defining_domains: &[String],
+) -> DomainResolution {
+    // ns-6 explicit qualifier bypasses bare-name resolution entirely.
+    if let Some(q) = explicit_qualifier {
+        return DomainResolution::Qualified(q.to_string());
+    }
+    // Precedence 1: the name is declared in the local domain → bind
+    // locally, full stop (wins even when other domains also declare it).
+    if let Some(local) = local_domain {
+        return DomainResolution::Local(local.to_string());
+    }
+    // Precedence 2 / 3: only OTHER domains declare it (the name is not
+    // local), so every candidate here is a NON-local definition.
+    match defining_domains.len() {
+        0 => DomainResolution::Unknown,
+        1 => DomainResolution::Unique(defining_domains[0].clone()),
+        _ => {
+            let mut candidates = defining_domains.to_vec();
+            candidates.sort();
+            candidates.dedup();
+            // A single distinct domain after dedup is still unique
+            // (the name declared twice in the same domain is not a
+            // cross-domain collision).
+            if candidates.len() == 1 {
+                DomainResolution::Unique(candidates.remove(0))
+            } else {
+                DomainResolution::Ambiguous { candidates }
+            }
+        }
+    }
+}
+
+/// ns-5: build the bare-name → set-of-defining-domains map from a parse
+/// context's Noun cell. Each Noun fact carries a `homeDomain` binding
+/// (stamped per file by `annotate_noun_domain`, ns-4); a name maps to
+/// every distinct domain that declares it. Nouns with no `homeDomain`
+/// (un-annotated legacy/context facts) contribute nothing, so a parse
+/// run with no domain annotations produces an empty map and the resolver
+/// is a no-op — today's behaviour is preserved.
+fn defining_domains_by_name(ctx: &Object) -> hashbrown::HashMap<String, Vec<String>> {
+    let mut map: hashbrown::HashMap<String, Vec<String>> = hashbrown::HashMap::new();
+    let noun_cell = fetch_or_phi("Noun", ctx);
+    for f in crate::ast::cell_facts_iter(&noun_cell) {
+        let (Some(name), Some(dom)) = (binding(f, "name"), binding(f, "homeDomain"))
+            else { continue };
+        let doms = map.entry(name.to_string()).or_default();
+        if !doms.iter().any(|d| d == dom) {
+            doms.push(dom.to_string());
+        }
+    }
+    map
+}
+
+/// ns-5: emit the per-reference resolution markers for a parse. For each
+/// Role Reference, run the precedence resolver and record the outcome on
+/// two intermediate cells consumed downstream:
+///
+///   * `Role_Reference_has_Resolved_Domain { Role_Reference, Domain }` —
+///     the resolved home domain for Qualified / Local / Unique. Lets a
+///     later pass bind the bare reference to the right namespaced noun.
+///   * `Role_Reference_has_Ambiguous_Domain { Role_Reference, Head_Noun,
+///     Candidate_Domain }` — ONE fact per conflicting candidate domain
+///     for an Ambiguous reference (precedence 3). This is the signal
+///     ns-7 consumes to raise the alethic "qualification required"
+///     violation; ns-5 itself neither rejects nor verbalizes.
+///
+/// `local_names` is the set of bare names declared in the file being
+/// parsed (its local domain, ns-3); a reference whose head noun is in
+/// that set has its local domain available for precedence 1. `defining`
+/// is the cross-domain map from `defining_domains_by_name`.
+fn resolve_reference_domains(
+    idx: &StmtIndex,
+    defining: &hashbrown::HashMap<String, Vec<String>>,
+    local_names: &hashbrown::HashSet<String>,
+    local_domain: Option<&str>,
+) -> (Vec<Object>, Vec<Object>) {
+    let mut resolved: Vec<Object> = Vec::new();
+    let mut ambiguous: Vec<Object> = Vec::new();
+    // Stable iteration: sort role-ref ids so emitted markers are
+    // deterministic regardless of HashMap order.
+    let mut ref_ids: Vec<&String> = idx.role_head_noun_by_ref.keys().collect();
+    ref_ids.sort();
+    for rid in ref_ids {
+        let Some(name) = idx.role_head_noun_by_ref.get(rid) else { continue };
+        let explicit = idx.role_domain_by_ref.get(rid).map(|s| s.as_str());
+        // The local domain is available for THIS reference only when its
+        // head noun is one of the file's own declared nouns.
+        let local = if local_names.contains(name) { local_domain } else { None };
+        let empty: Vec<String> = Vec::new();
+        let defining_domains = defining.get(name).unwrap_or(&empty);
+        match resolve_reference_domain(explicit, local, defining_domains) {
+            DomainResolution::Qualified(d)
+            | DomainResolution::Local(d)
+            | DomainResolution::Unique(d) => {
+                resolved.push(fact_from_pairs(&[
+                    ("Role_Reference", rid.as_str()), ("Domain", d.as_str()),
+                ]));
+            }
+            DomainResolution::Ambiguous { candidates } => {
+                for cand in &candidates {
+                    ambiguous.push(fact_from_pairs(&[
+                        ("Role_Reference", rid.as_str()),
+                        ("Head_Noun", name.as_str()),
+                        ("Candidate_Domain", cand.as_str()),
+                    ]));
+                }
+            }
+            DomainResolution::Unknown => {}
+        }
+    }
+    (resolved, ambiguous)
 }
 
 /// Translate `Instance Fact` classifications into `InstanceFact` cell
@@ -5617,7 +5797,7 @@ fn cached_grammar_state() -> Result<&'static Object, String> {
 
 /// Public entry point: parse FORML 2 source with no external context.
 pub fn parse_to_state_via_stage12(text: &str) -> Result<Object, String> {
-    parse_to_state_via_stage12_impl(text, &[], &[])
+    parse_to_state_via_stage12_impl(text, &[], &[], &hashbrown::HashMap::new(), None)
 }
 
 /// Context-aware parse (#285). Used by `parse_to_state_from` and
@@ -5638,6 +5818,24 @@ pub fn parse_to_state_via_stage12_with_context(
     text: &str,
     ctx: &Object,
 ) -> Result<Object, String> {
+    parse_to_state_via_stage12_with_context_domain(text, ctx, None)
+}
+
+/// ns-5 (ns-local-precedence-resolver): context-aware parse that ALSO
+/// knows the reference site's own/local domain (ns-3, the file domain).
+/// `parse_to_state_via_stage12_with_context` routes here with `None`,
+/// so every existing caller is byte-for-byte unchanged. The loader fold
+/// (which alone knows the file domain — it stamps it via
+/// `annotate_noun_domain` AFTER parse) can pass `Some(name)` so a bare
+/// reference whose name is also declared LOCALLY resolves to the local
+/// domain (precedence 1) instead of being reported as a cross-domain
+/// collision. The cross-domain defining map is read from `ctx`'s
+/// `homeDomain`-annotated Noun cell (ns-4 identity).
+pub fn parse_to_state_via_stage12_with_context_domain(
+    text: &str,
+    ctx: &Object,
+    local_domain: Option<&str>,
+) -> Result<Object, String> {
     let extra_nouns: Vec<String> = fetch_cell_seq("Noun", ctx).as_seq()
         .map(|facts| facts.iter()
             .filter_map(|f| binding(f, "name").map(String::from))
@@ -5656,13 +5854,23 @@ pub fn parse_to_state_via_stage12_with_context(
     let extra_ft_facts: Vec<Object> = crate::ast::cell_facts_iter(&ft_cell)
         .cloned()
         .collect();
-    parse_to_state_via_stage12_impl(text, &extra_nouns, &extra_ft_facts)
+    // ns-5: the bare-name → defining-domains map comes from the CONTEXT's
+    // namespaced Noun cell (each fact's `homeDomain`). Built once here so
+    // the per-reference resolver is an O(1) lookup.
+    let defining = defining_domains_by_name(ctx);
+    parse_to_state_via_stage12_impl(
+        text, &extra_nouns, &extra_ft_facts, &defining, local_domain)
 }
 
 fn parse_to_state_via_stage12_impl(
     text: &str,
     extra_nouns: &[String],
     extra_ft_facts: &[Object],
+    // ns-5: bare-name → set-of-defining-domains (from ctx homeDomain).
+    defining_domains: &HashMap<String, Vec<String>>,
+    // ns-5: the reference site's own/local domain (ns-3 file domain), or
+    // None when the caller doesn't know it (every legacy caller).
+    local_domain: Option<&str>,
 ) -> Result<Object, String> {
     // Trace gate — std-host reads `AREST_STAGE12_TRACE`; no_std builds
     // compile out the trace branches entirely.
@@ -5835,6 +6043,19 @@ fn parse_to_state_via_stage12_impl(
     // `trailing_marker_for` / `derivation_marker_for`) take `&StmtIndex`
     // directly; no implicit ambient state.
     let idx = build_stmt_index(&classified);
+    // ns-5 (ns-local-precedence-resolver): resolve each bare Role
+    // Reference to its home domain by precedence (local → unique-other →
+    // ambiguous), and surface the ambiguity SIGNAL for ns-7. The set of
+    // names declared by THIS file (its local domain, ns-3) is exactly the
+    // text's own declared nouns — NOT the ctx-merged `nouns` list, which
+    // also carries other domains' names via `extra_nouns`. A bare ref to
+    // a locally-declared name therefore takes precedence 1 even when the
+    // same name is declared elsewhere. Explicit `<domain>.` qualifiers
+    // (ns-6) bypass the walk inside `resolve_reference_domain`.
+    let local_names: hashbrown::HashSet<String> =
+        extract_declared_noun_names(text).into_iter().collect();
+    let (resolved_domain_facts, ambiguous_domain_facts) = resolve_reference_domains(
+        &idx, defining_domains, &local_names, local_domain);
     macro_rules! tt { ($name:expr, $e:expr) => {{
         let t = Instant::now();
         let v = $e;
@@ -6023,6 +6244,18 @@ fn parse_to_state_via_stage12_impl(
     map.insert("DataType".to_string(), Object::Seq(data_type_facts.into()));
     map.insert("UnresolvedClause".to_string(), Object::Seq(unresolved_clause_facts.into()));
     map.insert("UnresolvedInstanceFact".to_string(), Object::Seq(unresolved_instance_fact_facts.into()));
+    // ns-5 (ns-local-precedence-resolver): the per-reference resolution
+    // outcome. `Resolved_Domain` is the bound home domain for explicit /
+    // local / unique refs; `Ambiguous_Domain` is the SIGNAL (one fact per
+    // conflicting candidate) for a bare ref that 2+ non-local domains
+    // declare. ns-7 consumes the latter to raise an alethic "qualification
+    // required" violation — ns-5 itself does not reject or verbalize.
+    // Both cells are empty for a parse with no namespaced context, so
+    // legacy single-domain parses are unchanged.
+    map.insert("Role_Reference_has_Resolved_Domain".to_string(),
+        Object::Seq(resolved_domain_facts.into()));
+    map.insert("Role_Reference_has_Ambiguous_Domain".to_string(),
+        Object::Seq(ambiguous_domain_facts.into()));
     // #932 W4: these three groups are FT-image cells (RMAP images of
     // declared Fact Types — per-field instance-fact cells keyed by the
     // canonical FT id, and `Noun_has_X` reference-scheme component cells).
@@ -10341,6 +10574,248 @@ mod tests {
             assert!(cells.get("Role_Reference_has_Domain").is_none(),
                 "line {:?} must emit no Role_Reference_has_Domain facts", line);
         }
+    }
+
+    // ─── ns-5 (ns-local-precedence-resolver): bare-ref domain ──────────
+    //
+    // ns-6 carries an EXPLICIT `<domain>.` qualifier on a Role Reference.
+    // ns-5 resolves a BARE (unqualified) reference to its home domain by
+    // precedence — local → unique-other → ambiguous — and surfaces the
+    // ambiguity SIGNAL ns-7 consumes. The pure `resolve_reference_domain`
+    // is exercised directly (mirroring the stage-1 tokenizer-cell tests);
+    // the parse-path tests then confirm the markers land on the output
+    // state via `parse_to_state_via_stage12_with_context_domain`.
+
+    fn doms(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Precedence 1: when the name is declared in the LOCAL domain
+    /// (`local_domain = Some(d)`), a bare ref binds locally — full stop.
+    #[test]
+    fn ns5_local_defined_resolves_local() {
+        assert_eq!(
+            super::resolve_reference_domain(None, Some("orders"), &doms(&[])),
+            super::DomainResolution::Local("orders".into()));
+    }
+
+    /// Precedence 2: the name is NOT local (`local_domain = None`), but
+    /// exactly ONE other domain declares it → bind to that unique domain.
+    /// This is the backward-compat case that keeps every pre-existing
+    /// unqualified cross-domain reference (e.g. `shipping` → core's
+    /// `Status`) working.
+    #[test]
+    fn ns5_unique_other_resolves_to_that_domain() {
+        assert_eq!(
+            super::resolve_reference_domain(None, None, &doms(&["core"])),
+            super::DomainResolution::Unique("core".into()));
+    }
+
+    /// Precedence 3: the name is NOT local and 2+ other domains declare
+    /// it → AMBIGUOUS. Candidates come back sorted+deduped (stable marker).
+    #[test]
+    fn ns5_ambiguous_when_multiple_nonlocal() {
+        assert_eq!(
+            super::resolve_reference_domain(None, None, &doms(&["crm", "core"])),
+            super::DomainResolution::Ambiguous { candidates: doms(&["core", "crm"]) });
+    }
+
+    /// Precedence 1 dominates: a locally-declared name resolves LOCAL even
+    /// when OTHER domains also declare it — the caller signals "local" by
+    /// passing `Some(d)`, so it is never reported ambiguous.
+    #[test]
+    fn ns5_local_wins_even_when_others_define() {
+        assert_eq!(
+            super::resolve_reference_domain(None, Some("orders"),
+                &doms(&["core", "crm"])),
+            super::DomainResolution::Local("orders".into()));
+    }
+
+    /// An explicit ns-6 qualifier BYPASSES the precedence walk — it wins
+    /// outright, regardless of what the defining set or local domain say.
+    #[test]
+    fn ns5_explicit_qualifier_bypasses_resolution() {
+        // Qualifier wins even over an otherwise-ambiguous defining set
+        // and even when the name is also local.
+        assert_eq!(
+            super::resolve_reference_domain(Some("core"), None,
+                &doms(&["crm", "billing"])),
+            super::DomainResolution::Qualified("core".into()));
+        assert_eq!(
+            super::resolve_reference_domain(Some("core"), Some("orders"),
+                &doms(&["crm", "billing"])),
+            super::DomainResolution::Qualified("core".into()));
+    }
+
+    /// A name no domain declares (not local, empty defining set) is out
+    /// of scope — left Unknown (no marker), so today's undeclared-noun
+    /// handling is untouched.
+    #[test]
+    fn ns5_unknown_when_no_domain_defines() {
+        assert_eq!(
+            super::resolve_reference_domain(None, None, &doms(&[])),
+            super::DomainResolution::Unknown);
+    }
+
+    /// The same name declared TWICE in one other domain is not a
+    /// cross-domain collision — it dedups to a single unique domain.
+    #[test]
+    fn ns5_same_domain_twice_is_unique_not_ambiguous() {
+        assert_eq!(
+            super::resolve_reference_domain(None, None, &doms(&["core", "core"])),
+            super::DomainResolution::Unique("core".into()));
+    }
+
+    /// `defining_domains_by_name` groups each bare name by the distinct
+    /// `homeDomain`s that declare it (the (name, homeDomain) identity).
+    #[test]
+    fn ns5_defining_domains_by_name_groups_by_homedomain() {
+        let core = crate::ast::annotate_noun_domain(
+            &parse_to_state("Order is a value type.\nStatus is a value type.")
+                .expect("core parses"),
+            "core");
+        let crm = crate::ast::annotate_noun_domain(
+            &parse_to_state("Order(.id) is an entity type.").expect("crm parses"),
+            "crm");
+        let merged = crate::ast::merge_states(&core, &crm);
+        let map = super::defining_domains_by_name(&merged);
+        let mut order = map.get("Order").cloned().unwrap_or_default();
+        order.sort();
+        assert_eq!(order, doms(&["core", "crm"]),
+            "`Order` is declared in both core and crm");
+        assert_eq!(map.get("Status").cloned().unwrap_or_default(), doms(&["core"]),
+            "`Status` is declared only in core");
+    }
+
+    // ── parse-path integration: markers land on the output state ──
+
+    /// Build a namespaced context state: one Noun cell carrying the named
+    /// nouns, each homeDomain-stamped with `domain` (ns-4 annotation).
+    fn ns5_ctx(domain: &str, decls: &str) -> Object {
+        crate::ast::annotate_noun_domain(
+            &parse_to_state(decls).expect("ctx decls parse"), domain)
+    }
+
+    fn ns5_resolved(state: &Object, role_id: &str) -> Option<String> {
+        fetch_cell_seq("Role_Reference_has_Resolved_Domain", state).as_seq()
+            .and_then(|s| s.iter()
+                .find(|f| binding(f, "Role_Reference") == Some(role_id))
+                .and_then(|f| binding(f, "Domain").map(String::from)))
+    }
+
+    fn ns5_ambiguous_candidates(state: &Object, head_noun: &str) -> Vec<String> {
+        let mut got: Vec<String> = fetch_cell_seq("Role_Reference_has_Ambiguous_Domain", state)
+            .as_seq()
+            .map(|s| s.iter()
+                .filter(|f| binding(f, "Head_Noun") == Some(head_noun))
+                .filter_map(|f| binding(f, "Candidate_Domain").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        got.sort();
+        got.dedup();
+        got
+    }
+
+    /// Precedence 1 over the parse path: a bare ref whose head noun is
+    /// declared in the SAME file (local domain) resolves LOCAL even though
+    /// another domain (`crm`) also declares `Order`. No ambiguity marker.
+    #[test]
+    fn ns5_local_defined_reference_resolves_to_local_via_parse() {
+        let ctx = ns5_ctx("crm", "Order(.id) is an entity type.");
+        // This file (domain `orders`) declares its own `Order` and uses it.
+        let state = super::parse_to_state_via_stage12_with_context_domain(
+            "Order(.id) is an entity type.\nOrder is placed.",
+            &ctx, Some("orders")).expect("parses");
+        // Some role ref for the bare `Order` resolves to the LOCAL domain.
+        let resolved_to_orders = fetch_cell_seq("Role_Reference_has_Resolved_Domain", &state)
+            .as_seq().map(|s| s.iter()
+                .any(|f| binding(f, "Domain") == Some("orders")))
+            .unwrap_or(false);
+        assert!(resolved_to_orders,
+            "a locally-declared `Order` reference must resolve to the local domain `orders`");
+        assert!(ns5_ambiguous_candidates(&state, "Order").is_empty(),
+            "a locally-declared name must NOT be reported ambiguous");
+    }
+
+    /// Precedence 2 / backward-compat: a bare ref to a name declared in
+    /// exactly ONE other domain still resolves to that domain (this is
+    /// what every pre-existing unqualified cross-domain reference relies
+    /// on). The local file declares NO `Status`.
+    #[test]
+    fn ns5_unique_other_reference_resolves_via_parse() {
+        let ctx = ns5_ctx("core", "Status is a value type.\nOrder(.id) is an entity type.");
+        let state = super::parse_to_state_via_stage12_with_context_domain(
+            "Shipment(.id) is an entity type.\nShipment has Status.",
+            &ctx, Some("shipping")).expect("parses");
+        // The bare `Status` (only core declares it) resolves to core.
+        let resolved_to_core = fetch_cell_seq("Role_Reference_has_Resolved_Domain", &state)
+            .as_seq().map(|s| s.iter()
+                .any(|f| binding(f, "Domain") == Some("core")))
+            .unwrap_or(false);
+        assert!(resolved_to_core,
+            "a bare `Status` declared only in core must resolve to core (unique-other)");
+        assert!(ns5_ambiguous_candidates(&state, "Status").is_empty(),
+            "a unique cross-domain reference is NOT ambiguous");
+    }
+
+    /// Precedence 3: a bare ref to a name 2+ OTHER domains declare (none
+    /// local) emits the AMBIGUITY MARKER ns-7 consumes — one fact per
+    /// candidate domain. ns-5 does NOT reject; the parse still succeeds.
+    #[test]
+    fn ns5_ambiguous_reference_emits_marker_via_parse() {
+        // Both core and crm declare `Order`; the local file (domain
+        // `reports`) does NOT declare it, only references it.
+        let core = ns5_ctx("core", "Order is a value type.");
+        let crm = ns5_ctx("crm", "Order(.id) is an entity type.");
+        let ctx = crate::ast::merge_states(&core, &crm);
+        let state = super::parse_to_state_via_stage12_with_context_domain(
+            "Report(.id) is an entity type.\nReport references Order.",
+            &ctx, Some("reports")).expect("parse still succeeds — ns-5 does not reject");
+        assert_eq!(ns5_ambiguous_candidates(&state, "Order"), doms(&["core", "crm"]),
+            "a bare `Order` declared by both core and crm must emit the ambiguity \
+             marker for ns-7, listing both candidate domains");
+        // It must NOT have been (mis)resolved to a single domain.
+        assert!(ns5_resolved(&state, "s2:role:1").is_none()
+            || ns5_resolved(&state, "s2:role:1").as_deref() != Some("core"),
+            "an ambiguous bare ref is not silently resolved");
+    }
+
+    /// An explicit `<domain>.<Noun>` (ns-6) qualifier resolves to the
+    /// qualifier's domain via the parse path — bypassing the precedence
+    /// walk — and emits NO ambiguity marker even though `Order` collides.
+    #[test]
+    fn ns5_explicit_qualified_reference_resolves_to_qualifier_via_parse() {
+        let core = ns5_ctx("core", "Order is a value type.");
+        let crm = ns5_ctx("crm", "Order(.id) is an entity type.");
+        let ctx = crate::ast::merge_states(&core, &crm);
+        let state = super::parse_to_state_via_stage12_with_context_domain(
+            "Report(.id) is an entity type.\nReport references core.Order.",
+            &ctx, Some("reports")).expect("parses");
+        let resolved_to_core = fetch_cell_seq("Role_Reference_has_Resolved_Domain", &state)
+            .as_seq().map(|s| s.iter()
+                .any(|f| binding(f, "Domain") == Some("core")))
+            .unwrap_or(false);
+        assert!(resolved_to_core,
+            "explicit `core.Order` must resolve to core, bypassing precedence");
+        assert!(ns5_ambiguous_candidates(&state, "Order").is_empty(),
+            "an explicitly-qualified reference is never ambiguous");
+    }
+
+    /// Backward-compat: a plain single-domain parse with NO namespaced
+    /// context emits NO resolution markers at all — today's behaviour for
+    /// every non-namespaced schema is byte-for-byte preserved.
+    #[test]
+    fn ns5_single_domain_parse_emits_no_markers() {
+        let state = parse_to_state(
+            "Order(.id) is an entity type.\nCustomer(.id) is an entity type.\n\
+             Customer places Order.")
+            .expect("parses");
+        assert!(fetch_cell_seq("Role_Reference_has_Ambiguous_Domain", &state)
+            .as_seq().map(|s| s.is_empty()).unwrap_or(true),
+            "no namespaced context ⇒ no ambiguity markers");
+        assert!(fetch_cell_seq("Role_Reference_has_Resolved_Domain", &state)
+            .as_seq().map(|s| s.is_empty()).unwrap_or(true),
+            "no namespaced context ⇒ no resolved-domain markers");
     }
 
     /// Coupled regression: `strip_role_literals` (line 2272) ALSO scans

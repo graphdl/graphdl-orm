@@ -979,6 +979,22 @@ pub fn parse_to_state_from(input: &str, d: &crate::ast::Object) -> Result<crate:
     crate::parse_forml2_stage2::parse_to_state_via_stage12_with_context(input, d)
 }
 
+/// ns-5 (ns-local-precedence-resolver): like `parse_to_state_from`, but
+/// the caller also names the reference site's own/local domain (ns-3,
+/// the file domain it is about to stamp via `annotate_noun_domain`). A
+/// bare reference whose noun is declared LOCALLY then resolves to this
+/// domain (precedence 1) rather than being treated as a cross-domain
+/// collision. `parse_to_state_from` is the `local_domain = None` form, so
+/// every existing caller is unchanged.
+pub fn parse_to_state_from_in_domain(
+    input: &str,
+    d: &crate::ast::Object,
+    local_domain: &str,
+) -> Result<crate::ast::Object, String> {
+    crate::parse_forml2_stage2::parse_to_state_via_stage12_with_context_domain(
+        input, d, Some(local_domain))
+}
+
 /// Alias for `parse_to_state_from` kept for API compatibility. Legacy
 /// took only nouns; stage12's context path accepts the full state and
 /// extracts what it needs.

@@ -1146,7 +1146,10 @@ pub fn main_entry() {
                 let parsed_fresh = all_readings.iter().fold(
                     noun_seed,
                     |merged, (name, text)| {
-                        let this = parse_forml2::parse_to_state_from(text, &merged)
+                        // ns-5: parse knowing this slice's local domain (ns-3
+                        // file domain = reading name) so a bare reference to a
+                        // locally-declared noun resolves locally (precedence 1).
+                        let this = parse_forml2::parse_to_state_from_in_domain(text, &merged, name)
                             .unwrap_or_else(|e| { eprintln!("{}: {}", name, e); std::process::exit(1); });
                         // ns-3: stamp this slice's declared Functions with its file
                         // domain (the reading name) — same per-file binding as

@@ -1359,7 +1359,11 @@ fn metamodel_state() -> &'static ast::Object {
         // `templates`); `metamodel_readings()` assembles them in the
         // canonical load order (core → templates → ui → os).
         let merged = metamodel_readings().iter().fold(ast::Object::phi(), |acc, (name, text)| {
-            let parsed = parse_forml2::parse_to_state_from(text, &acc)
+            // ns-5: parse knowing this slice's own/local domain (ns-3 file
+            // domain = slice name), so a bare reference to a locally-declared
+            // noun resolves locally (precedence 1) instead of colliding with a
+            // same-named noun in an already-folded slice.
+            let parsed = parse_forml2::parse_to_state_from_in_domain(text, &acc, name)
                 .unwrap_or_else(|e| panic!("metamodel parse failed at readings/{}.md: {}", name, e));
             // ns-3 (per-file domain binding): stamp this slice's own declared
             // Functions (nouns + fact types) with its file domain — the slice
