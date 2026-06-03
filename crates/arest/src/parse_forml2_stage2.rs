@@ -10261,6 +10261,88 @@ mod tests {
              got {:?}", cataloged);
     }
 
+    // ─── ns-6 (ns-reverse-dot-syntax): cross-namespace refs, Stage-1/2 ──
+    //
+    // The `Role_Reference_*` cells are Stage-1 OUTPUT consumed by
+    // `classify_statements` / `build_stmt_index`; they are intermediate
+    // and don't persist to the final parsed state (which holds Noun /
+    // FactType / Constraint / …). ns-5's resolver hooks in at this same
+    // intermediate layer (reading `Role_Reference_has_Domain` exactly as
+    // `build_stmt_index` reads `Role_Reference_has_Head_Noun`). These
+    // tests therefore assert on the Stage-1 tokenizer cells — the layer
+    // that carries the qualifier — mirroring the other stage2 tests that
+    // inspect Role_Reference via `tokenize_statement`.
+
+    fn s2_role_domain(cells: &HashMap<String, Vec<Object>>, role_id: &str)
+        -> Option<String>
+    {
+        cells.get("Role_Reference_has_Domain")?
+            .iter()
+            .find(|f| binding(f, "Role_Reference") == Some(role_id))
+            .and_then(|f| binding(f, "Domain").map(String::from))
+    }
+
+    /// `<domain>.<Noun>` carries its qualifier onto the Role Reference's
+    /// Domain cell via the production cell-driven vocab path (the path
+    /// `parse_to_state_via_stage12_impl` uses per line), while the Head
+    /// Noun stays the bare noun. SCOPE is parse-only — no resolution.
+    #[test]
+    fn domain_qualified_reference_carries_domain_via_vocab_path() {
+        let vocab = crate::parse_forml2_stage1::Vocab::from_grammar_state(
+            &grammar_state());
+        let sorted: Vec<&str> = alloc::vec!["Order"];
+        let buckets = crate::parse_forml2_stage1::NounBuckets::from_sorted(&sorted);
+        let cells = crate::parse_forml2_stage1::tokenize_statement_with_buckets_vocab(
+            "s1", "core.Order is placed.", &buckets, &vocab);
+        assert_eq!(s2_role_domain(&cells, "s1:role:0").as_deref(), Some("core"),
+            "qualified `core.Order` must record Domain 'core' via the vocab path");
+        let hn = cells.get("Role_Reference_has_Head_Noun")
+            .and_then(|f| f.first())
+            .and_then(|f| binding(f, "Head_Noun").map(String::from));
+        assert_eq!(hn.as_deref(), Some("Order"),
+            "qualified ref's head noun must be the bare `Order`");
+    }
+
+    /// `core.Order` vs `crm.Order` are distinct qualified references.
+    #[test]
+    fn domain_qualified_reference_distinguishes_domains_via_vocab_path() {
+        let vocab = crate::parse_forml2_stage1::Vocab::from_grammar_state(
+            &grammar_state());
+        let sorted: Vec<&str> = alloc::vec!["Order"];
+        let buckets = crate::parse_forml2_stage1::NounBuckets::from_sorted(&sorted);
+        let core = crate::parse_forml2_stage1::tokenize_statement_with_buckets_vocab(
+            "s1", "core.Order is placed.", &buckets, &vocab);
+        let crm = crate::parse_forml2_stage1::tokenize_statement_with_buckets_vocab(
+            "s1", "crm.Order is placed.", &buckets, &vocab);
+        assert_eq!(s2_role_domain(&core, "s1:role:0").as_deref(), Some("core"));
+        assert_eq!(s2_role_domain(&crm, "s1:role:0").as_deref(), Some("crm"));
+        assert_ne!(s2_role_domain(&core, "s1:role:0"),
+                   s2_role_domain(&crm, "s1:role:0"));
+    }
+
+    /// ns-6 no-clash regression at the vocab-path level: a ref-scheme
+    /// declaration (`Order(.col)`) and a plain binary fact carry NO
+    /// `Role_Reference_has_Domain` facts — the `(.col)` dot (which
+    /// FOLLOWS the noun, inside parens) is never mistaken for a
+    /// `<domain>.` qualifier (which PRECEDES the noun).
+    #[test]
+    fn ref_scheme_and_plain_facts_emit_no_domain_via_vocab_path() {
+        let vocab = crate::parse_forml2_stage1::Vocab::from_grammar_state(
+            &grammar_state());
+        let sorted: Vec<&str> = alloc::vec!["Customer", "Order"];
+        let buckets = crate::parse_forml2_stage1::NounBuckets::from_sorted(&sorted);
+        for line in [
+            "Order(.id) is an entity type.",
+            "Customer places Order.",
+            "Order's Role is mandatory.",
+        ] {
+            let cells = crate::parse_forml2_stage1::tokenize_statement_with_buckets_vocab(
+                "s1", line, &buckets, &vocab);
+            assert!(cells.get("Role_Reference_has_Domain").is_none(),
+                "line {:?} must emit no Role_Reference_has_Domain facts", line);
+        }
+    }
+
     /// Coupled regression: `strip_role_literals` (line 2272) ALSO scans
     /// for the close-quote of role literals — this time to STRIP them
     /// before reconstructing the canonical FT id. Without dispatching

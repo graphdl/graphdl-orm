@@ -519,6 +519,15 @@ pub fn tokenize_statement_with_buckets_vocab(
                 ("Role_Reference", role_id.as_str()), ("Literal_Value", lit.as_str()),
             ]));
         }
+        // ns-6 (ns-reverse-dot-syntax): carry the explicit cross-namespace
+        // qualifier (`core` from `core.Order`) so ns-5's resolver can bind
+        // the reference to the noun in that domain. Emitted only when the
+        // reference was domain-qualified — unqualified refs are unchanged.
+        if let Some(dom) = rr.domain.as_ref() {
+            push(&mut cells, "Role_Reference_has_Domain", fact_from_pairs(&[
+                ("Role_Reference", role_id.as_str()), ("Domain", dom.as_str()),
+            ]));
+        }
     }
 
     cells
@@ -706,7 +715,16 @@ fn strip_ref_scheme_parens(body: &str) -> Cow<'_, str> {
 struct RoleRef {
     noun: String,
     literal: Option<String>,
-    /// Byte offset where the noun match starts in the body.
+    /// ns-6 (ns-reverse-dot-syntax): the explicit cross-namespace
+    /// qualifier when the noun was written `<domain>.<Noun>` (e.g.
+    /// `core` for `core.Order`). `None` for an unqualified reference.
+    /// Parse-only — the qualifier is recognised and carried here so
+    /// ns-5's resolver can bind it; resolution semantics live there.
+    domain: Option<String>,
+    /// Byte offset where the noun match starts in the body. For a
+    /// domain-qualified reference this is the start of the BARE noun
+    /// (just past the `<domain>.` qualifier), so verb extraction and
+    /// nesting checks key off the noun span as before.
     start: usize,
     /// Byte offset where the noun match ends (exclusive). Excludes any
     /// following `'literal'` — that's tracked by `span_end`.
@@ -715,6 +733,63 @@ struct RoleRef {
     /// by the verb extractor so `Customer 'alice' places Order` yields
     /// verb = "places", not "'alice' places".
     span_end: usize,
+}
+
+/// ns-6 (ns-reverse-dot-syntax): detect an explicit cross-namespace
+/// qualifier written immediately before a noun match — `<domain>.<Noun>`
+/// (e.g. `core.Order`). `noun_start` is the byte offset where the bare
+/// noun match begins; this looks at the bytes *before* it for a
+/// `<ident>.` prefix and returns the qualifier (`core`) when present.
+///
+/// The qualifier is recognised POSITIONALLY (no domain catalog is
+/// threaded into Stage-1): a run of identifier bytes `[A-Za-z0-9_]`
+/// directly followed by a single `.` directly followed by the noun,
+/// where the run itself starts at a word boundary. This is what makes
+/// the form unambiguous against the two existing dotted/possessive
+/// shapes, both of which FOLLOW the noun:
+///   * ref-scheme `Order(.col)` — the dot sits INSIDE parens after the
+///     noun and is stripped (`strip_ref_scheme_parens`) before matching,
+///     so the matcher never sees it; and the byte before a qualifier run
+///     can never be `(` here.
+///   * possessive `Order's Role` — the marker is `'s ` (no dot), so no
+///     `<ident>.` prefix exists before `Role`.
+/// Whether `<ident>` is a *declared* domain is decided later by ns-5's
+/// resolver; Stage-1 only carries the syntactic qualifier.
+fn domain_qualifier_before(text: &str, noun_start: usize) -> Option<(String, usize)> {
+    let bytes = text.as_bytes();
+    // Need at least `x.` before the noun: the byte just before the noun
+    // must be the `.` separator.
+    if noun_start < 2 || bytes[noun_start - 1] != b'.' {
+        return None;
+    }
+    let dot = noun_start - 1;
+    // Walk back over identifier bytes to find the qualifier run start.
+    let mut q_start = dot;
+    while q_start > 0 {
+        let b = bytes[q_start - 1];
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            q_start -= 1;
+        } else {
+            break;
+        }
+    }
+    // Empty run (e.g. a bare leading `.Noun` or `..Noun`) is not a
+    // qualifier — leave it to the existing boundary handling.
+    if q_start == dot {
+        return None;
+    }
+    // The run must itself begin at a word boundary (start of text, or a
+    // non-identifier char before it). A leading `.` already broke the
+    // identifier run above, so `q_start` is the boundary by construction;
+    // this guard documents the invariant and is cheap.
+    let at_boundary = q_start == 0 || {
+        let prev = bytes[q_start - 1];
+        !prev.is_ascii_alphanumeric() && prev != b'_'
+    };
+    if !at_boundary {
+        return None;
+    }
+    Some((text[q_start..dot].to_string(), q_start))
 }
 
 fn match_role_references(text: &str, buckets: &NounBuckets<'_>) -> Vec<RoleRef> {
@@ -759,10 +834,17 @@ fn match_role_references(text: &str, buckets: &NounBuckets<'_>) -> Vec<RoleRef> 
             // Skip if this match is entirely inside an earlier match.
             let nested = refs.iter().any(|r| start >= r.start && end <= r.end);
             if !nested {
+                // ns-6: a `<domain>.` qualifier directly before this noun
+                // makes it an explicit cross-namespace reference. `start`
+                // stays on the bare noun so verb/nesting spans are
+                // unchanged; the qualifier is carried separately.
+                let domain = domain_qualifier_before(text, start)
+                    .map(|(d, _)| d);
                 let (literal, span_end) = extract_following_literal_span(text, end);
                 refs.push(RoleRef {
                     noun: (*noun).to_string(),
                     literal,
+                    domain,
                     start,
                     end,
                     span_end,
@@ -1530,6 +1612,114 @@ mod tests {
             .and_then(|f| binding(f, "Deontic_Operator").map(String::from));
         assert_eq!(op.as_deref(), Some("obligatory"),
             "expected 'obligatory' Deontic Operator from cell-driven vocab");
+    }
+
+    // ─── ns-6 (ns-reverse-dot-syntax): explicit cross-namespace refs ───
+    //
+    // A reading in one domain can reference a noun defined in another by
+    // qualifying it `<domain>.<Noun>` (e.g. `core.Order` vs `crm.Order`).
+    // Stage-1 recognises the qualifier and carries it on the Role
+    // Reference (`Role_Reference_has_Domain`) so ns-5's resolver can
+    // consume it later. SCOPE here is parse-only: recognise + carry. The
+    // qualifier PRECEDES the noun, so it is positionally distinct from
+    // the two existing dotted/possessive forms that FOLLOW the noun —
+    // the ref-scheme `Order(.col)` (dot inside parens) and the
+    // possessive `Order's Role` (`'s ` marker). The three tests below
+    // pin all three so the new form can't be confused with either.
+
+    fn role_domain_of(cells: &Cells, role_id: &str) -> Option<String> {
+        cells.get("Role_Reference_has_Domain")?
+            .iter()
+            .find(|f| binding(f, "Role_Reference") == Some(role_id))
+            .and_then(|f| binding(f, "Domain").map(String::from))
+    }
+
+    #[test]
+    fn domain_qualified_noun_carries_domain_on_role_reference() {
+        // `core.Order` is a reference to noun `Order` qualified by domain
+        // `core`. Head Noun is the bare noun (`Order`); the qualifier is
+        // carried separately on the Role Reference.
+        let c = tokenize_statement("s1", "core.Order is placed.",
+                                   &nouns(&["Order"]));
+        assert_eq!(stmt_binding(&c, "Statement_has_Head_Noun", "Head_Noun").as_deref(),
+                   Some("Order"),
+                   "head noun is the bare noun, not the qualified token");
+        assert_eq!(role_domain_of(&c, "s1:role:0").as_deref(), Some("core"),
+                   "the `core.` qualifier must be carried on the role ref");
+    }
+
+    #[test]
+    fn domain_qualified_noun_distinguishes_domains() {
+        // `core.Order` and `crm.Order` are DISTINCT references — same
+        // noun, different qualifying domain.
+        let c_core = tokenize_statement("s1", "core.Order is placed.",
+                                        &nouns(&["Order"]));
+        let c_crm = tokenize_statement("s1", "crm.Order is placed.",
+                                       &nouns(&["Order"]));
+        assert_eq!(role_domain_of(&c_core, "s1:role:0").as_deref(), Some("core"));
+        assert_eq!(role_domain_of(&c_crm, "s1:role:0").as_deref(), Some("crm"));
+        assert_ne!(role_domain_of(&c_core, "s1:role:0"),
+                   role_domain_of(&c_crm, "s1:role:0"),
+                   "distinct domains must produce distinct qualified references");
+    }
+
+    #[test]
+    fn domain_qualified_noun_in_second_role_position() {
+        // The qualifier works on any role, not just the head. Here the
+        // SECOND role (`crm.Customer`) is qualified; the first (`Order`)
+        // is not.
+        let c = tokenize_statement("s1", "Order placed by crm.Customer.",
+                                   &nouns(&["Order", "Customer"]));
+        assert_eq!(c.get("Role_Reference").map(|v| v.len()), Some(2));
+        assert_eq!(role_domain_of(&c, "s1:role:0"), None,
+                   "the unqualified first role must carry no domain");
+        assert_eq!(role_domain_of(&c, "s1:role:1").as_deref(), Some("crm"));
+    }
+
+    #[test]
+    fn unqualified_noun_carries_no_domain() {
+        // Regression: a bare `Order` reference parses exactly as today —
+        // no Domain fact at all.
+        let c = tokenize_statement("s1", "Order is placed.", &nouns(&["Order"]));
+        assert_eq!(stmt_binding(&c, "Statement_has_Head_Noun", "Head_Noun").as_deref(),
+                   Some("Order"));
+        assert!(c.get("Role_Reference_has_Domain").is_none(),
+                "an unqualified reference must emit no Domain fact");
+    }
+
+    #[test]
+    fn ref_scheme_parens_not_mistaken_for_domain_qualifier() {
+        // Regression / no-clash: `Order(.OrderId)` is an ORM 2 reference
+        // scheme — the `.OrderId` sits INSIDE parens AFTER the noun and
+        // is stripped before role matching. It must NOT be read as a
+        // domain qualifier (which precedes the noun), and the trailing
+        // marker must still survive.
+        let c = tokenize_statement("s1", "Order(.OrderId) is an entity type.",
+                                   &nouns(&["Order"]));
+        assert_eq!(stmt_binding(&c, "Statement_has_Head_Noun", "Head_Noun").as_deref(),
+                   Some("Order"));
+        assert_eq!(stmt_binding(&c, "Statement_has_Trailing_Marker", "Trailing_Marker").as_deref(),
+                   Some("is an entity type"));
+        assert!(c.get("Role_Reference_has_Domain").is_none(),
+                "a ref-scheme `(.col)` must never produce a Domain qualifier");
+    }
+
+    #[test]
+    fn possessive_marker_not_mistaken_for_domain_qualifier() {
+        // Regression / no-clash: `Order's Role` is the possessive form —
+        // the `'s ` marker FOLLOWS the noun. It must parse as two plain
+        // role refs (Order, Role) with no domain qualifier on either.
+        let c = tokenize_statement("s1", "Order's Role is mandatory.",
+                                   &nouns(&["Order", "Role"]));
+        assert!(c.get("Role_Reference_has_Domain").is_none(),
+                "possessive `'s ` must never produce a Domain qualifier");
+        let head_nouns: Vec<String> = c.get("Role_Reference_has_Head_Noun")
+            .map(|fs| fs.iter()
+                .filter_map(|f| binding(f, "Head_Noun").map(String::from))
+                .collect())
+            .unwrap_or_default();
+        assert!(head_nouns.iter().any(|n| n == "Order"));
+        assert!(head_nouns.iter().any(|n| n == "Role"));
     }
 
     #[test]
