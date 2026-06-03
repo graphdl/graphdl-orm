@@ -1837,17 +1837,24 @@ Transition 'ship' is triggered by Fact Type 'Order_was_shipped'.
 // they classify as Join and the Domain value propagates onto the
 // consequent — these FIRE through forward-chain (asserted below).
 //
-// The Resource/Fact rules relate via the subtype noun (`Noun`, `Fact
-// Type`) while `belongs to Domain` is declared on the supertype
-// `Function`; the parser's noun-name-keyed join detector
-// (resolve_derivation_rule) does not yet resolve a subtype-subject
-// `belongs to Domain` clause to the Function FT, so they document the
-// single-sourcing intent without yet materialising facts — the same
-// documented-but-deferred status as core.md's "Implicit Derivation
-// Rules". What this task GUARANTEES for all four is that NO domain is
-// stored on the population/outcome: the consequent Fact Types carry the
-// `*` fully-derived marker and the prior stored bindings on Violation /
-// Failure are removed (asserted below).
+// The Resource/Fact rules' natural relating clause binds the subtype
+// noun (`Noun`, `Fact Type`) while `belongs to Domain` is declared on
+// the supertype `Function`; that clause shares no role NOUN-NAME with
+// the Function-keyed domain FT and does not resolve to it, so the bare
+// single-clause form does NOT join (pinned negatively by
+// `ns2_resource_and_fact_domain_rules_compile_and_store_no_domain`).
+// instances.md FIXES this readings-only via a single-sourcing FUNCTION
+// BRIDGE: a Noun / Fact Type IS a Function (same identity), so a
+// fully-derived `Resource is of Function` / `Fact is of Function`
+// re-labels that value under a `Function` role (computed-binding
+// rename), and the domain rule then joins on `Function` exactly like
+// Violation/Failure — so all four now FIRE (the Resource/Fact pair is
+// pinned by `ns2_{resource,fact}_derives_domain_*_via_function_bridge`).
+// What this task GUARANTEES for all four is that NO domain is stored on
+// the population/outcome: the consequent Fact Types carry the `*`
+// fully-derived marker, the bridge FTs store no domain (they re-project
+// only), and the prior stored bindings on Violation / Failure are
+// removed (asserted below).
 
 #[test]
 fn ns2_outcomes_md_declares_violation_failure_domain_as_derived_not_stored() {
@@ -1896,25 +1903,51 @@ fn ns2_outcomes_md_declares_violation_failure_domain_as_derived_not_stored() {
 fn ns2_instances_md_declares_resource_fact_domain_as_derived_not_stored() {
     let instances_md = include_str!("../../../readings/core/instances.md");
 
-    let resource_rule = "Resource belongs to Domain iff Resource is instance of Noun and that Noun belongs to Domain.";
-    let fact_rule = "Fact belongs to Domain iff Fact is of Fact Type and that Fact Type belongs to Domain.";
+    // The domain rules relate via the Function BRIDGE (`is of Function`)
+    // so they JOIN on `Function` with `Function belongs to Domain` — the
+    // Violation/Failure shape — and the Domain value propagates. (The
+    // pre-fix single-clause forms `… iff Resource is instance of Noun and
+    // that Noun belongs to Domain` could not join: the subtype-noun
+    // relating clause shares no role with the Function-keyed domain FT.)
+    let resource_rule = "Resource belongs to Domain iff Resource is of Function and that Function belongs to Domain.";
+    let fact_rule = "Fact belongs to Domain iff Fact is of Function and that Function belongs to Domain.";
     assert!(
         instances_md.contains(resource_rule),
-        "readings/core/instances.md must contain the Resource domain-derivation rule (ns-2)\n\
+        "readings/core/instances.md must contain the bridged Resource domain-derivation rule (ns-2)\n\
          expected substring: `{}`",
         resource_rule,
     );
     assert!(
         instances_md.contains(fact_rule),
-        "readings/core/instances.md must contain the Fact domain-derivation rule (ns-2)\n\
+        "readings/core/instances.md must contain the bridged Fact domain-derivation rule (ns-2)\n\
          expected substring: `{}`",
         fact_rule,
+    );
+
+    // The single-sourcing bridge rules: a 1-antecedent ModusPonens that
+    // re-labels the Noun / Fact Type a Resource / Fact relates to as the
+    // SAME-identity Function (computed-binding rename). They store NO
+    // domain — they only let the domain rules above join on `Function`.
+    let resource_bridge = "Resource is of Function iff Resource is instance of Noun and Function is Noun.";
+    let fact_bridge = "Fact is of Function iff Fact is of Fact Type and Function is Fact Type.";
+    assert!(
+        instances_md.contains(resource_bridge),
+        "readings/core/instances.md must contain the Resource→Function bridge rule (ns-2)\n\
+         expected substring: `{}`",
+        resource_bridge,
+    );
+    assert!(
+        instances_md.contains(fact_bridge),
+        "readings/core/instances.md must contain the Fact→Function bridge rule (ns-2)\n\
+         expected substring: `{}`",
+        fact_bridge,
     );
 
     // Consequent FTs marked fully-derived (`*`). Resource/Fact never
     // stored a domain, so there is no prior binding to remove — the `*`
     // marker is the single-sourcing guarantee: a domain is only ever
-    // derived for these, never written.
+    // derived for these, never written. The bridge FTs are fully-derived
+    // too (they re-project, never store).
     assert!(
         instances_md.contains("Resource belongs to Domain. *"),
         "Resource belongs to Domain must be declared as fully-derived (`*`) in instances.md",
@@ -1922,6 +1955,14 @@ fn ns2_instances_md_declares_resource_fact_domain_as_derived_not_stored() {
     assert!(
         instances_md.contains("Fact belongs to Domain. *"),
         "Fact belongs to Domain must be declared as fully-derived (`*`) in instances.md",
+    );
+    assert!(
+        instances_md.contains("Resource is of Function. *"),
+        "Resource is of Function bridge FT must be declared as fully-derived (`*`) in instances.md",
+    );
+    assert!(
+        instances_md.contains("Fact is of Function. *"),
+        "Fact is of Function bridge FT must be declared as fully-derived (`*`) in instances.md",
     );
 }
 
@@ -2040,14 +2081,22 @@ fn ns2_failure_derives_domain_from_the_function_operation_it_is_against() {
 
 #[test]
 fn ns2_resource_and_fact_domain_rules_compile_and_store_no_domain() {
-    // The Resource/Fact rules relate via the subtype noun while
-    // `belongs to Domain` is on the supertype `Function`; the parser's
-    // noun-name-keyed join detector does not yet bridge that subtype
-    // gap, so these rules do not yet materialise facts (documented gap,
-    // same family as core.md's "Implicit Derivation Rules"). What this
-    // test pins is the load-bearing ns-2 guarantee that survives the
-    // gap: both rules PARSE/COMPILE, and the consequent carries NO
-    // stored domain — a Resource/Fact domain is only ever derived.
+    // NEGATIVE pin (the rationale for the Function bridge): the
+    // UN-bridged single-clause shape — relating via the subtype noun
+    // (`is instance of Noun` / `is of Fact Type`) while `belongs to
+    // Domain` is declared on the supertype `Function` — does NOT
+    // materialise a domain. The subtype-noun relating clause shares no
+    // role NOUN-NAME with the Function-keyed `Function belongs to Domain`
+    // FT and the clause `that Noun belongs to Domain` does not resolve to
+    // it (the SchemaCatalog is keyed by role noun-SET; `[Domain, Noun]`
+    // is not a declared FT), so no join forms and the rule degrades to a
+    // 1-antecedent ModusPonens that copies only the relating fact's
+    // (Resource, Noun) / (Fact, Fact Type) bindings — never a Domain.
+    // This is the un-firing baseline the bridged rules in instances.md
+    // FIX (see `ns2_resource_derives_domain_from_its_noun_via_function_bridge`
+    // / `ns2_fact_derives_domain_from_its_fact_type_via_function_bridge`).
+    // What this test pins: both un-bridged rules PARSE/COMPILE, and the
+    // consequent carries NO domain — never a stored / divergent value.
     let state = ns2_fixture(
         "Resource is instance of Noun.\nResource belongs to Domain. *\n\
          Fact is of Fact Type.\nFact belongs to Domain. *",
@@ -2059,25 +2108,99 @@ fn ns2_resource_and_fact_domain_rules_compile_and_store_no_domain() {
          Fact 'f1' is of Fact Type 'OrderPlaced'.",
     );
 
-    // No stored domain leaked onto a Resource/Fact that wasn't derived:
-    // the cells exist only as derived consequents. Because the join
-    // doesn't yet fire, the derived domain is currently None — and
-    // crucially it is NEVER a stored duplicate. (When the parser's
-    // subtype-subject resolution lands, these flip to Some("orders")
-    // with no other change.)
+    // The un-bridged join does not fire, so NO domain is derived — and
+    // crucially it is NEVER a stored duplicate. The bridged form in
+    // instances.md is what flips these to Some("orders").
     let res_dom = ns2_derived_domain("Resource_belongs_to_Domain", "Resource", "r1", &state);
     let fact_dom = ns2_derived_domain("Fact_belongs_to_Domain", "Fact", "f1", &state);
-    assert!(
-        res_dom.is_none() || res_dom.as_deref() == Some("orders"),
-        "Resource domain must be either underived (None, current parser gap) or the \
-         single-sourced 'orders' — never a divergent stored value; got {:?}",
+    assert_eq!(
+        res_dom, None,
+        "un-bridged Resource rule must NOT materialise a domain (subtype-noun \
+         relating clause shares no role with the Function-keyed domain FT); \
+         the bridge is what makes it fire. Got {:?}",
         res_dom,
     );
-    assert!(
-        fact_dom.is_none() || fact_dom.as_deref() == Some("orders"),
-        "Fact domain must be either underived (None, current parser gap) or the \
-         single-sourced 'orders' — never a divergent stored value; got {:?}",
+    assert_eq!(
+        fact_dom, None,
+        "un-bridged Fact rule must NOT materialise a domain (subtype-noun \
+         relating clause shares no role with the Function-keyed domain FT); \
+         the bridge is what makes it fire. Got {:?}",
         fact_dom,
+    );
+}
+
+// ns-2 (ns-derive-population-domains) FORWARD-CHAIN, STRICT: a Resource
+// of a Noun in domain D derives D; a Fact of a Fact Type in domain D
+// derives D. These pin the readings-only fix that flips the
+// documented-but-deferred Resource/Fact rules to FIRING.
+//
+// THE GAP (diagnosed): the forward-chain JOIN keys on a shared role
+// NOUN-NAME. `belongs to Domain` is declared on `Function`, so the
+// Violation/Failure rules join (`is against Function` + `Function
+// belongs to Domain` both carry `Function`). The Resource/Fact relating
+// clauses bind `Noun` / `Fact Type` (subtypes of Function); a clause
+// `that Noun belongs to Domain` does NOT resolve to the Function-keyed
+// `Function belongs to Domain` FT (the SchemaCatalog is keyed by noun-
+// SET — `[Domain, Noun]` is not a declared FT), so the second antecedent
+// never forms and the rule degrades to a 1-antecedent ModusPonens that
+// copies the relating fact's (Resource, Noun) bindings — no Domain.
+//
+// THE FIX (readings-only, single-sourced): introduce a derived bridge FT
+// that RE-LABELS the relating clause's Function-subtype value into a
+// `Function` role, so the domain rule's relating clause shares `Function`
+// with `Function belongs to Domain` — exactly the Violation/Failure
+// shape. `Resource is of Function iff Resource is instance of Noun and
+// Function is Noun` is a 1-antecedent ModusPonens with a computed-binding
+// rename (Noun → Function); it stores NO domain — it only re-projects the
+// existing instance fact's noun value as the (same-identity) Function
+// reference. Then `Resource belongs to Domain iff Resource is of Function
+// and that Function belongs to Domain` is a Join on `Function`, and the
+// Domain propagates. The Fact path is identical via `Fact is of
+// Function`. Domain stays single-sourced on Function throughout.
+
+#[test]
+fn ns2_resource_derives_domain_from_its_noun_via_function_bridge() {
+    // Resource r1 is an instance of Noun 'Order'; Function 'Order'
+    // belongs to Domain 'orders'. The bridge re-labels 'Order' as a
+    // Function so the join on `Function` fires and r1 DERIVES 'orders'.
+    let state = ns2_fixture(
+        "Resource is instance of Noun.\n\
+         Resource is of Function. *\n\
+         Resource belongs to Domain. *",
+        "* Resource is of Function iff Resource is instance of Noun and Function is Noun.\n\
+         * Resource belongs to Domain iff Resource is of Function and that Function belongs to Domain.",
+        "Function 'Order' belongs to Domain 'orders'.\n\
+         Resource 'r1' is instance of Noun 'Order'.",
+    );
+    assert_eq!(
+        ns2_derived_domain("Resource_belongs_to_Domain", "Resource", "r1", &state).as_deref(),
+        Some("orders"),
+        "Resource r1 must DERIVE Domain 'orders' from the Noun it is an instance of \
+         (single-sourced on Function, bridged via `Resource is of Function`), got cells: {:?}",
+        crate::ast::cells_iter(&state).iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn ns2_fact_derives_domain_from_its_fact_type_via_function_bridge() {
+    // Fact f1 is of Fact Type 'OrderPlaced'; Function 'OrderPlaced'
+    // belongs to Domain 'orders'. The bridge re-labels 'OrderPlaced' as a
+    // Function so the join on `Function` fires and f1 DERIVES 'orders'.
+    let state = ns2_fixture(
+        "Fact is of Fact Type.\n\
+         Fact is of Function. *\n\
+         Fact belongs to Domain. *",
+        "* Fact is of Function iff Fact is of Fact Type and Function is Fact Type.\n\
+         * Fact belongs to Domain iff Fact is of Function and that Function belongs to Domain.",
+        "Function 'OrderPlaced' belongs to Domain 'orders'.\n\
+         Fact 'f1' is of Fact Type 'OrderPlaced'.",
+    );
+    assert_eq!(
+        ns2_derived_domain("Fact_belongs_to_Domain", "Fact", "f1", &state).as_deref(),
+        Some("orders"),
+        "Fact f1 must DERIVE Domain 'orders' from the Fact Type it is of \
+         (single-sourced on Function, bridged via `Fact is of Function`), got cells: {:?}",
+        crate::ast::cells_iter(&state).iter().map(|(n, _)| *n).collect::<Vec<_>>(),
     );
 }
 

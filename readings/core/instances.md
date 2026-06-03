@@ -49,6 +49,16 @@ Citation pins Cell Version Id.
 ### Fact
 Fact is of Fact Type.
   Each Fact is of exactly one Fact Type.
+Fact is of Function. *
+  <!-- ns-2 (ns-derive-population-domains): the single-sourcing BRIDGE for a
+       Fact's domain. A Fact Type IS a Function (Fact Type < Resource < Noun <
+       Function; same identity, same id), so this fully-derived FT re-labels
+       the Fact Type a Fact is of as that same Function. It stores NO domain —
+       it only re-projects the existing `Fact is of Fact Type` value under a
+       `Function` role so the domain rule below can JOIN on `Function` (the
+       role `Function belongs to Domain` carries), exactly as Violation/Failure
+       join on the Function they are against. See the rule under
+       "## Derivation Rules". -->
 Fact belongs to Domain. *
   <!-- ns-2 (ns-derive-population-domains): a Fact does NOT store its own
        domain — it DERIVES it from its Fact Type, keeping domain single-sourced
@@ -71,6 +81,16 @@ Fact Type cites Citation.
 ### Resource
 Resource is instance of Noun.
   Each Resource is instance of exactly one Noun.
+Resource is of Function. *
+  <!-- ns-2 (ns-derive-population-domains): the single-sourcing BRIDGE for a
+       Resource's domain. A Noun IS a Function (Noun < Function; same identity,
+       same id), so this fully-derived FT re-labels the Noun a Resource is an
+       instance of as that same Function. It stores NO domain — it only
+       re-projects the existing `Resource is instance of Noun` value under a
+       `Function` role so the domain rule below can JOIN on `Function` (the
+       role `Function belongs to Domain` carries), exactly as Violation/Failure
+       join on the Function they are against. See the rule under
+       "## Derivation Rules". -->
 Resource belongs to Domain. *
   <!-- ns-2 (ns-derive-population-domains): a Resource does NOT store its own
        domain — it DERIVES it from the Noun it is an instance of, keeping
@@ -152,30 +172,47 @@ Guard Run has Result.
 
 <!-- ns-2 (ns-derive-population-domains): instance-level populations DERIVE
      their home Domain from their associated Function-subtype, keeping domain
-     single-sourced on Function (core.md "Function belongs to Domain"). The
-     shape is the standard existential-over-join derivation
-     (`<X> belongs to Domain iff <X> <relates to> some <Y> and <Y> belongs to
-     Domain`), mirroring the outcomes.md Violation / Failure rules.
+     single-sourced on Function (core.md "Function belongs to Domain"). These
+     rules FIRE through forward-chain (mirroring the outcomes.md Violation /
+     Failure rules), via a single-sourcing FUNCTION BRIDGE.
 
-     PARSER NOTE (gap — same family as core.md's "Implicit Derivation Rules"):
-     The forward-chaining JOIN that propagates the Domain value only forms when
-     the relating Fact Type and `belongs to Domain` share a role NOUN-NAME. The
-     outcomes rules join because `is against Function` and `Function belongs to
-     Domain` both carry a `Function` role. These two rules relate via the
-     subtype noun (`Noun`, `Fact Type`), and `belongs to Domain` is declared on
-     the supertype `Function`, so `resolve_derivation_rule`
-     (crates/arest/src/parse_forml2.rs) does not yet resolve a subtype-subject
-     `<Noun|Fact Type> belongs to Domain` clause to the Function FT, nor widen
-     `is instance of Function` to `is instance of Noun`. Until that subtype-
-     subject resolution lands, these rules document the single-sourcing intent
-     (Resource ← its Noun's domain; Fact ← its Fact Type's domain) but do not
-     yet materialise facts — exactly the documented-but-deferred status of the
-     structural rules in core.md §"Implicit Derivation Rules". They store NO
-     domain on Resource / Fact regardless. -->
+     WHY THE BRIDGE: the forward-chaining JOIN that propagates the Domain value
+     only forms when the relating Fact Type and `belongs to Domain` share a
+     role NOUN-NAME, and the relating clause must resolve to a declared FT (the
+     SchemaCatalog is keyed by role noun-SET). The outcomes rules join directly
+     because `is against Function` and `Function belongs to Domain` both carry a
+     `Function` role. A Resource's natural relating fact is `is instance of
+     Noun` and a Fact's is `is of Fact Type` — those carry a `Noun` / `Fact
+     Type` role, and a clause `that Noun belongs to Domain` neither resolves to
+     the Function-keyed `Function belongs to Domain` FT (noun-set `[Domain,
+     Noun]` is not declared) nor shares its `Function` role, so no join forms.
 
-* Resource belongs to Domain iff Resource is instance of Noun and that Noun belongs to Domain.
+     A Noun IS a Function and a Fact Type IS a Function (Fact Type < Resource <
+     Noun < Function), with the SAME identity / id. So the fully-derived bridge
+     FTs `Resource is of Function` / `Fact is of Function` (declared above)
+     re-label that same value under a `Function` role — a 1-antecedent
+     ModusPonens with a computed-binding rename (`Function is Noun` /
+     `Function is Fact Type`); they STORE NO domain. The domain rules then relate
+     via `is of Function` and JOIN on `Function` with `Function belongs to
+     Domain` — byte-for-byte the Violation / Failure shape — and the Domain
+     value propagates onto the Resource / Fact consequent. Domain stays
+     single-sourced on Function throughout (the only Domain-valued fact lives on
+     the Function; Resource / Fact / the bridge store none).
 
-* Fact belongs to Domain iff Fact is of Fact Type and that Fact Type belongs to Domain.
+     A future engine fix (filed task `derivation-subtype-join-resolution`) that
+     resolves a subtype-subject `belongs to Domain` clause to the Function FT
+     and widens the join across the subtype lattice would let the relating
+     clause be the natural `is instance of Noun` / `is of Fact Type` directly
+     and retire the bridge; until then the bridge is the readings-only form
+     that materialises the single-sourced domain. -->
+
+* Resource is of Function iff Resource is instance of Noun and Function is Noun.
+
+* Resource belongs to Domain iff Resource is of Function and that Function belongs to Domain.
+
+* Fact is of Function iff Fact is of Fact Type and Function is Fact Type.
+
+* Fact belongs to Domain iff Fact is of Function and that Function belongs to Domain.
 
 ## Instance Facts
 
