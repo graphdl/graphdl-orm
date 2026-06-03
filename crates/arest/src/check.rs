@@ -7,14 +7,14 @@
 // Func tree applied via ast::apply, not Rust control flow. Its top
 // level is
 //
-//   check_readings_func = Concat ∘ [ layer₁, …, layer₅ ]
+//   check_readings_func = Concat ∘ [ layer₁, …, layer₆ ]
 //
 // where each layerᵢ reads one or more cells from D and emits a
 // sequence of diagnostic Objects. Rust only parses the raw text,
 // applies the Func, and decodes the diagnostic sequence back to the
 // public `Vec<ReadingDiagnostic>` shape at the API boundary.
 //
-// The five layer bodies remain Rust functions for now (each wrapped
+// The six layer bodies remain Rust functions for now (each wrapped
 // in a Func::Native leaf) because they read multiple cells and
 // format messages; the composition itself is the Func tree. Further
 // FFP lowering can push per-layer logic (`ApplyToAll`, `Filter`,
@@ -117,7 +117,7 @@ where F: Fn(&Object) -> Vec<ReadingDiagnostic> + Send + Sync + 'static {
 /// check_readings as a Func tree. Reads cells from the state (passed
 /// as apply's operand) and returns a Seq of diagnostic Maps.
 ///
-///   check_readings_func = Concat ∘ [ layer₁, layer₂, layer₃, layer₄ ]
+///   check_readings_func = Concat ∘ [ layer₁, … , layer₆ ]
 ///
 /// The composition is explicit FFP; layer bodies stay Native for now
 /// because several read multiple cells and format messages. Future
@@ -137,6 +137,7 @@ pub fn check_readings_func() -> Func {
             layer_native(check_ring_validity),
             layer_native(check_ring_completeness),
             layer_native(check_atom_ids),
+            layer_native(check_ambiguous_domain_references),
         ]),
     )
 }
@@ -609,6 +610,143 @@ fn check_atom_ids(state: &Object) -> Vec<ReadingDiagnostic> {
 /// Ring-constraint kinds per ORM 2. Shared between layers.
 fn is_ring_kind(k: &str) -> bool {
     matches!(k, "IR" | "AS" | "AT" | "SY" | "IT" | "TR" | "AC" | "RF")
+}
+
+/// Layer 6 (ns-7, ns-ambiguity-verbalized-reject): reject a bare
+/// cross-namespace reference whose candidate domains declare it as
+/// CONFLICTING KINDS of thing (an entity in one, a value in another) —
+/// the genuinely unbindable case.
+///
+/// ns-5 (parse_forml2_stage2::resolve_reference_domains) leaves the
+/// SIGNAL on the `Role_Reference_has_Ambiguous_Domain` cell — one fact
+/// per `{Role_Reference, Head_Noun, Candidate_Domain}` — but neither
+/// rejects nor verbalizes. This layer does both: it groups the
+/// per-candidate facts by `Role_Reference` and raises ONE diagnostic per
+/// reference whose MESSAGE IS the reading/guidance (per cor:verbalize —
+/// the violation text is itself the fix-it instruction): name the head
+/// noun, list the colliding domains (sorted, deduped), and show the
+/// `<domain>.<Noun>` qualifier (ns-6) the author can pick.
+///
+/// WHY THE KIND-CONFLICT GATE (the corpus-compat decision): ns-5 flags as
+/// ambiguous EVERY bare reference whose head noun is declared in 2+
+/// non-local domains. On the shipping metamodel that includes ubiquitous
+/// shared value-type primitives (`id`, `Name`, `Title`, `code`) declared
+/// identically in a dozen domains, and same-kind entities (`User`, `View`)
+/// the corpus references bare across slices. Rejecting on the raw signal
+/// would fail the bundled corpus — which the task forbids. A reference
+/// whose candidates AGREE on kind is bindable in principle (it is the same
+/// primitive value type, or a same-shaped entity resolvable by local
+/// precedence in its own slice); only a reference whose candidates
+/// DISAGREE on kind (e.g. `Order` = a value type in `core` but an entity
+/// type in `crm`) is a structural impossibility — the cell graph has no
+/// single noun to bind it to. That is the alethic case, and it is exactly
+/// what the task's worked example exhibits. Same-kind ambiguity is left
+/// for a later pass (and a future corpus cleanup) to arm.
+///
+/// The diagnostic is `Level::Error` + `Source::Resolve`, which the
+/// load-time gate (`load_reading_core::validate_loaded_state`) routes to
+/// the ALETHIC bucket — a hard reject.
+///
+/// The cell is empty for any parse without a namespaced collision (every
+/// legacy single-domain parse), so this layer is a no-op there.
+fn check_ambiguous_domain_references(state: &Object) -> Vec<ReadingDiagnostic> {
+    // (name, homeDomain) -> objectType ("entity" / "value"), from the
+    // Noun cell ns-4 stamped per domain. Used to decide whether the
+    // candidates for an ambiguous ref even agree on what KIND of thing
+    // the name denotes.
+    let mut kind_by_name_domain: hashbrown::HashMap<(String, String), String> =
+        hashbrown::HashMap::new();
+    for n in crate::ast::cell_facts_iter(&fetch_cell_seq("Noun", state)) {
+        let (Some(name), Some(dom)) = (binding(n, "name"), binding(n, "homeDomain"))
+            else { continue };
+        let kind = binding(n, "objectType").unwrap_or("").to_string();
+        kind_by_name_domain.insert((name.to_string(), dom.to_string()), kind);
+    }
+
+    // Group per reference (the unit of one violation): head noun + the
+    // set of candidate domains. Iterate refs in sorted order so emitted
+    // diagnostics are deterministic regardless of cell/Map order.
+    let mut by_ref: alloc::collections::BTreeMap<String, (String, Vec<String>)> =
+        alloc::collections::BTreeMap::new();
+    for f in crate::ast::cell_facts_iter(&fetch_cell_seq("Role_Reference_has_Ambiguous_Domain", state)) {
+        let (Some(rid), Some(noun), Some(dom)) = (
+            binding(f, "Role_Reference"),
+            binding(f, "Head_Noun"),
+            binding(f, "Candidate_Domain"),
+        ) else { continue };
+        let entry = by_ref.entry(rid.to_string())
+            .or_insert_with(|| (noun.to_string(), Vec::new()));
+        if !entry.1.iter().any(|d| d == dom) {
+            entry.1.push(dom.to_string());
+        }
+    }
+    by_ref.into_iter().filter_map(|(_rid, (noun, mut domains))| {
+        domains.sort();
+        domains.dedup();
+        // STAGED: fire only on a CONCRETE kind conflict — one candidate
+        // declares the name an `entity`, another a `value`. That reference
+        // is structurally unbindable (the candidates aren't even the same
+        // kind of thing) and is the worked example (`Order` = value in core,
+        // entity in crm). This is NOT a claim that same-kind collisions are
+        // acceptable: per design policy they ARE genuine ambiguities that
+        // SHOULD be flagged — `id`/`Name`/`Title`/`code` declared per-domain
+        // are duplicate declarations to CONSOLIDATE into one shared concept,
+        // and same-name entities like `User`/`View` are to UNIFY (or qualify
+        // if truly distinct). Flagging them now would (correctly) fail the
+        // shipping corpus, which still carries those duplicates — so the
+        // broadening is gated on that corpus cleanup (filed:
+        // ns-namespace-collision-cleanup). Until it lands, only the kind
+        // conflict fires; unknown-kind candidates never fire on their own.
+        let mut saw_entity = false;
+        let mut saw_value = false;
+        for d in &domains {
+            match kind_by_name_domain.get(&(noun.clone(), d.clone())).map(String::as_str) {
+                Some("entity") => saw_entity = true,
+                Some("value")  => saw_value = true,
+                _ => {}
+            }
+        }
+        if !(saw_entity && saw_value) {
+            return None;
+        }
+        let defined_in = domains.iter()
+            .map(|d| format!("`{}`", d))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // The qualified `<domain>.<Noun>` choices, joined naturally so the
+        // last is preceded by `or` (e.g. "`a.N` or `b.N`",
+        // "`a.N`, `b.N`, or `c.N`").
+        let qualified = join_qualified_choices(&domains, &noun);
+        Some(ReadingDiagnostic {
+            line: 0,
+            reading: noun.clone(),
+            level: Level::Error,
+            source: Source::Resolve,
+            message: format!(
+                "`{}` is ambiguous: defined in {}. Qualify it as {}.",
+                noun, defined_in, qualified,
+            ),
+            suggestion: Some(format!(
+                "prefix the reference with one of the domains, e.g. `{}.{}`",
+                domains.first().map(String::as_str).unwrap_or(""), noun,
+            )),
+        })
+    }).collect()
+}
+
+/// Render the `<domain>.<Noun>` qualifier choices as a natural English
+/// list with `or` before the final item. `domains` is assumed sorted +
+/// deduped by the caller.
+fn join_qualified_choices(domains: &[String], noun: &str) -> String {
+    let forms: Vec<String> = domains.iter()
+        .map(|d| format!("`{}.{}`", d, noun))
+        .collect();
+    match forms.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, [first])) => format!("{} or {}", first, last),
+        Some((last, head)) => format!("{}, or {}", head.join(", "), last),
+    }
 }
 
 #[cfg(test)]
@@ -1127,8 +1265,8 @@ Customer wrote Review.
                 assert!(matches!(**outer, Func::Concat),
                     "top-level must compose Concat onto the construction");
                 match &**inner {
-                    Func::Construction(layers) => assert_eq!(layers.len(), 5,
-                        "check_readings_func must expose exactly 5 layer Funcs"),
+                    Func::Construction(layers) => assert_eq!(layers.len(), 6,
+                        "check_readings_func must expose exactly 6 layer Funcs"),
                     other => panic!("inner must be Construction, got {:?}", other),
                 }
             }
@@ -1270,5 +1408,273 @@ Personal Data Breach(.id) is breach of security leading to loss of Personal Data
         assert!(target_role_nouns.iter().any(|n| n == "Personal Data"),
             "second role must bind to compound noun `Personal Data`; got {:?}",
             target_role_nouns);
+    }
+
+    // ── ns-7 (ns-ambiguity-verbalized-reject) ───────────────────────────
+    //
+    // ns-5 emits `Role_Reference_has_Ambiguous_Domain {Role_Reference,
+    // Head_Noun, Candidate_Domain}` — one fact per candidate domain — for
+    // a bare ref that 2+ non-local domains declare. ns-7's check layer
+    // groups those per-candidate facts into ONE alethic violation per
+    // reference whose verbalized message tells the author to qualify the
+    // name. Alethic = Source::Resolve at Level::Error, which the
+    // load-time gate (load_reading_core::validate_loaded_state) routes
+    // into the alethic-violation bucket (a hard reject).
+
+    /// Build a namespaced context state: a Noun cell of `decls` nouns each
+    /// homeDomain-stamped with `domain` (ns-4 annotation). Mirrors the
+    /// `ns5_ctx` helper in parse_forml2_stage2's tests.
+    fn ns7_ctx(domain: &str, decls: &str) -> Object {
+        crate::ast::annotate_noun_domain(
+            &parse_to_state(decls).expect("ctx decls parse"), domain)
+    }
+
+    /// Drive parse → ns-5 over a file in `local_domain` against `ctx`,
+    /// then run the full checker Func tree and decode the diagnostics. The
+    /// checker runs over the MERGED state (ctx ⊕ this slice's parse) — the
+    /// same shape the real loader validates, so the Noun cell carries every
+    /// domain's (homeDomain-keyed) declarations the layer joins against.
+    fn ns7_diags(text: &str, ctx: &Object, local_domain: &str) -> Vec<ReadingDiagnostic> {
+        let parsed = crate::parse_forml2_stage2::parse_to_state_via_stage12_with_context_domain(
+            text, ctx, Some(local_domain)).expect("parses — ns-5 does not reject");
+        let state = crate::ast::merge_states(ctx, &parsed);
+        let obj = crate::ast::apply(&check_readings_func(), &state, &state);
+        decode_diags(&obj)
+    }
+
+    /// An ambiguous bare reference (declared by 2+ other domains, none
+    /// local) yields EXACTLY ONE alethic violation whose verbalized
+    /// message lists the candidate domains and the qualify-with-`<domain>.`
+    /// guidance. RED→GREEN driver for the new layer.
+    #[test]
+    fn ns7_ambiguous_reference_yields_one_alethic_qualify_violation() {
+        let core = ns7_ctx("core", "Order is a value type.");
+        let crm = ns7_ctx("crm", "Order(.id) is an entity type.");
+        let ctx = crate::ast::merge_states(&core, &crm);
+        // The local file (domain `reports`) only references `Order`.
+        let diags = ns7_diags(
+            "Report(.id) is an entity type.\nReport references Order.",
+            &ctx, "reports");
+        let ambig: Vec<_> = diags.iter()
+            .filter(|d| d.source == Source::Resolve
+                && d.level == Level::Error
+                && d.message.contains("ambiguous"))
+            .collect();
+        assert_eq!(ambig.len(), 1,
+            "an ambiguous bare `Order` must raise exactly ONE alethic violation; got {:?}",
+            diags);
+        let msg = &ambig[0].message;
+        // Verbalizes the head noun, both candidate domains (sorted), and
+        // the per-candidate `<domain>.<Noun>` qualify guidance.
+        assert!(msg.contains("Order"), "message names the head noun: {msg}");
+        assert!(msg.contains("core") && msg.contains("crm"),
+            "message lists both candidate domains: {msg}");
+        assert!(msg.contains("core.Order") && msg.contains("crm.Order"),
+            "message shows the qualified forms to choose from: {msg}");
+        assert!(msg.to_lowercase().contains("qualif"),
+            "message gives qualify-with-`<domain>.` guidance: {msg}");
+        // Candidate domains appear in sorted order (deterministic): the
+        // first mention of `core` precedes the first mention of `crm`.
+        let i_core = msg.find("core").expect("core named");
+        let i_crm = msg.find("crm").expect("crm named");
+        assert!(i_core < i_crm, "candidate domains must be sorted (core before crm): {msg}");
+        // Exact verbalization contract (the task's worked example, in the
+        // checker's backtick house style). The message IS the reading: it
+        // tells the author precisely how to disambiguate.
+        assert_eq!(msg,
+            "`Order` is ambiguous: defined in `core`, `crm`. \
+             Qualify it as `core.Order` or `crm.Order`.",
+            "exact verbalized message");
+    }
+
+    /// End-to-end alethic routing: the genuine ambiguity must surface in
+    /// the load-time gate's ALETHIC bucket (a hard reject), not the deontic
+    /// one. Proves the `Source::Resolve` + `Level::Error` partition wired
+    /// in `load_reading_core::validate_loaded_state`.
+    #[test]
+    fn ns7_ambiguity_routes_to_alethic_reject_bucket() {
+        let core = ns7_ctx("core", "Order is a value type.");
+        let crm = ns7_ctx("crm", "Order(.id) is an entity type.");
+        let ctx = crate::ast::merge_states(&core, &crm);
+        let parsed = crate::parse_forml2_stage2::parse_to_state_via_stage12_with_context_domain(
+            "Report(.id) is an entity type.\nReport references Order.",
+            &ctx, Some("reports")).expect("parses");
+        let state = crate::ast::merge_states(&ctx, &parsed);
+        let report = crate::load_reading_core::validate_loaded_state(&state);
+        assert!(!report.passes,
+            "an unqualified kind-conflicting reference must fail the load gate");
+        assert!(report.alethic_violations.iter().any(|d| d.message.contains("ambiguous")),
+            "the ambiguity violation must land in the ALETHIC bucket; got alethic={:?} deontic={:?}",
+            report.alethic_violations.iter().map(|d| &d.message).collect::<Vec<_>>(),
+            report.deontic_violations.iter().map(|d| &d.message).collect::<Vec<_>>());
+        assert!(!report.deontic_violations.iter().any(|d| d.message.contains("ambiguous")),
+            "the ambiguity violation must NOT be deontic");
+    }
+
+    /// A bare reference uniquely resolved (declared in exactly one other
+    /// domain) is NOT ambiguous → no ambiguity violation. Guards against a
+    /// false positive on every pre-existing unqualified cross-domain ref.
+    #[test]
+    fn ns7_unique_reference_yields_no_ambiguity_violation() {
+        let ctx = ns7_ctx("core", "Status is a value type.\nOrder(.id) is an entity type.");
+        let diags = ns7_diags(
+            "Shipment(.id) is an entity type.\nShipment has Status.",
+            &ctx, "shipping");
+        assert!(!diags.iter().any(|d| d.message.contains("ambiguous")),
+            "a uniquely-resolved bare `Status` must not raise an ambiguity violation; got {:?}",
+            diags);
+    }
+
+    /// An explicit `<domain>.<Noun>` (ns-6) qualifier resolves outright —
+    /// ns-5 marks it resolved, not ambiguous — so no ambiguity violation
+    /// even when the bare name collides across domains.
+    #[test]
+    fn ns7_explicitly_qualified_reference_yields_no_ambiguity_violation() {
+        let core = ns7_ctx("core", "Order is a value type.");
+        let crm = ns7_ctx("crm", "Order(.id) is an entity type.");
+        let ctx = crate::ast::merge_states(&core, &crm);
+        let diags = ns7_diags(
+            "Report(.id) is an entity type.\nReport references core.Order.",
+            &ctx, "reports");
+        assert!(!diags.iter().any(|d| d.message.contains("ambiguous")),
+            "an explicitly-qualified `core.Order` must not raise an ambiguity violation; got {:?}",
+            diags);
+    }
+
+    /// Direct-layer unit: feed a synthesized `Role_Reference_has_Ambiguous_Domain`
+    /// cell with TWO refs — one with three candidate facts, one with two —
+    /// (plus a Noun cell whose candidates DISAGREE on kind so the
+    /// kind-conflict gate fires) and assert the layer groups per reference
+    /// into exactly TWO violations, each verbalizing its own head noun +
+    /// sorted candidates. Mirrors the ring-completeness unit-test style.
+    #[test]
+    fn ns7_layer_groups_candidate_facts_into_one_violation_per_reference() {
+        use crate::ast::{Object, fact_from_pairs, cell_push};
+        let mut state = Object::phi();
+        // Noun cell: `Order` declared with CONFLICTING kinds across its
+        // three candidate domains (value in core, entity in crm/billing),
+        // and `Account` value-in-finance / entity-in-auth. Each conflict
+        // makes the bare reference structurally unbindable → it fires.
+        for (name, dom, kind) in [
+            ("Order", "core", "value"), ("Order", "crm", "entity"),
+            ("Order", "billing", "entity"),
+            ("Account", "finance", "value"), ("Account", "auth", "entity"),
+        ] {
+            state = cell_push("Noun", fact_from_pairs(&[
+                ("name", name), ("homeDomain", dom), ("objectType", kind),
+            ]), &state);
+        }
+        // ref A: `Order` ambiguous across crm, core, billing (unsorted).
+        for dom in ["crm", "core", "billing"] {
+            state = cell_push("Role_Reference_has_Ambiguous_Domain",
+                fact_from_pairs(&[
+                    ("Role_Reference", "s2:role:0"),
+                    ("Head_Noun", "Order"),
+                    ("Candidate_Domain", dom),
+                ]), &state);
+        }
+        // ref B: `Account` ambiguous across two domains.
+        for dom in ["finance", "auth"] {
+            state = cell_push("Role_Reference_has_Ambiguous_Domain",
+                fact_from_pairs(&[
+                    ("Role_Reference", "s2:role:1"),
+                    ("Head_Noun", "Account"),
+                    ("Candidate_Domain", dom),
+                ]), &state);
+        }
+        let diags = super::check_ambiguous_domain_references(&state);
+        assert_eq!(diags.len(), 2,
+            "two distinct ambiguous refs ⇒ exactly two violations (grouped per ref); got {:?}",
+            diags);
+        // Every emitted diagnostic is an alethic (Resolve/Error) reject.
+        assert!(diags.iter().all(|d| d.source == Source::Resolve && d.level == Level::Error),
+            "ambiguity violations must be alethic (Source::Resolve, Level::Error); got {:?}",
+            diags);
+        let order = diags.iter().find(|d| d.message.contains("Order"))
+            .expect("a violation for `Order`");
+        // Candidates deduped + sorted: billing, core, crm.
+        assert!(order.message.contains("billing") && order.message.contains("core")
+            && order.message.contains("crm"),
+            "Order violation lists all three sorted candidates: {}", order.message);
+        let i_billing = order.message.find("billing").unwrap();
+        let i_core = order.message.find("core").unwrap();
+        let i_crm = order.message.find("crm").unwrap();
+        assert!(i_billing < i_core && i_core < i_crm,
+            "candidates must be sorted (billing < core < crm): {}", order.message);
+        let account = diags.iter().find(|d| d.message.contains("Account"))
+            .expect("a violation for `Account`");
+        assert!(account.message.contains("auth") && account.message.contains("finance"),
+            "Account violation lists both candidates: {}", account.message);
+    }
+
+    /// An empty ambiguity cell (the common case — no namespaced collision)
+    /// yields no violations, so legacy single-domain parses are unaffected.
+    #[test]
+    fn ns7_no_ambiguity_facts_yield_no_violations() {
+        let empty = Object::phi();
+        assert!(super::check_ambiguous_domain_references(&empty).is_empty(),
+            "no ambiguity facts ⇒ no violations");
+    }
+
+    /// Kind-AGREEMENT exemption (corpus-compat): when every candidate
+    /// domain declares the bare name as the SAME kind (e.g. a value-type
+    /// primitive like `id` declared in many domains, or a same-shaped
+    /// entity), the reference is bindable in principle and is NOT a hard
+    /// reject. This is what keeps the shipping metamodel (whose only
+    /// ambiguities are kind-agreeing — `id`, `Name`, `Title`, `code`,
+    /// `User`, `View`) validating clean.
+    #[test]
+    fn ns7_kind_agreeing_candidates_are_exempt() {
+        use crate::ast::{Object, fact_from_pairs, cell_push};
+        let mut state = Object::phi();
+        // `id` is a value type in BOTH domains — same kind, no conflict.
+        for dom in ["core", "ui"] {
+            state = cell_push("Noun", fact_from_pairs(&[
+                ("name", "id"), ("homeDomain", dom), ("objectType", "value"),
+            ]), &state);
+        }
+        for dom in ["core", "ui"] {
+            state = cell_push("Role_Reference_has_Ambiguous_Domain",
+                fact_from_pairs(&[
+                    ("Role_Reference", "s9:role:1"),
+                    ("Head_Noun", "id"),
+                    ("Candidate_Domain", dom),
+                ]), &state);
+        }
+        assert!(super::check_ambiguous_domain_references(&state).is_empty(),
+            "a value-type `id` declared identically across domains is the same \
+             primitive — kind-agreeing candidates must NOT trip the reject");
+    }
+
+    /// Real-corpus guard (the task's explicit backward-compat check): the
+    /// bundled metamodel, folded through the actual per-file-domain loader
+    /// (`metamodel_state`, the same fold the CLI and kernel use), must NOT
+    /// trip the new ambiguity reject. NOTE: ns-5 DOES emit ambiguity
+    /// signals on the real corpus (the shared value-type primitives `id`,
+    /// `Name`, `Title`, `code` declared per-domain, and the same-kind
+    /// entities `User`, `View` referenced bare across slices) — local
+    /// precedence does NOT eliminate them. They stay clean here only
+    /// because every one of those ambiguities is kind-AGREEING, and the
+    /// reject fires solely on kind-CONFLICTING candidates (see
+    /// `check_ambiguous_domain_references`). If a future corpus edit
+    /// introduced a value-vs-entity collision on a bare reference, this
+    /// guard would (correctly) light up.
+    #[test]
+    fn ns7_bundled_metamodel_corpus_has_no_ambiguity_violations() {
+        let state = crate::metamodel_state();
+        // ns-5 DOES emit ambiguity signals on the real corpus (this guard
+        // is not vacuous): the shared value-type primitives + same-kind
+        // entities referenced bare across slices. Assert that, so a future
+        // resolver change that silenced the signal can't make this guard
+        // pass for the wrong reason.
+        let raw_ambiguity_facts = crate::ast::cell_facts_iter(
+            &fetch_cell_seq("Role_Reference_has_Ambiguous_Domain", state)).count();
+        assert!(raw_ambiguity_facts > 0,
+            "expected ns-5 to emit ambiguity signals on the bundled corpus");
+        // None of them is a kind-conflict, so none is rejected.
+        let viols = super::check_ambiguous_domain_references(state);
+        assert!(viols.is_empty(),
+            "the bundled metamodel must validate clean (no kind-conflicting bare refs); got {:#?}",
+            viols.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 }
