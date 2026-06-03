@@ -7613,6 +7613,26 @@ mod tests {
             "core.md must declare the integer→numeric membership");
     }
 
+    /// #279 P2a: the JSON-Schema projection of the catalog must be
+    /// declared in core.md — the fact types plus a representative type
+    /// and format instance fact. A rename of `jsonType`/`jsonFormat` or
+    /// a dropped leaf-projection fact is caught here (mirrors the P1 pin
+    /// above and the SQL-dialect readings pins).
+    #[test]
+    fn core_md_declares_conceptual_data_type_json_projection() {
+        let core = include_str!("../../../readings/core/core.md");
+        assert!(core.contains("Conceptual Data Type has JSON Type."),
+            "core.md must declare the Conceptual Data Type has JSON Type fact type");
+        assert!(core.contains("Conceptual Data Type has JSON Format."),
+            "core.md must declare the Conceptual Data Type has JSON Format fact type");
+        assert!(core.contains(
+            "Conceptual Data Type 'integer' has JSON Type 'integer'."),
+            "core.md must project the integer leaf to JSON Type integer");
+        assert!(core.contains(
+            "Conceptual Data Type 'dateTime' has JSON Format 'date-time'."),
+            "core.md must project the dateTime leaf to JSON Format date-time");
+    }
+
     #[test]
     fn partition_declaration_is_classified() {
         let stmt = stage1_state(

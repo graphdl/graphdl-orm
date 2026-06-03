@@ -161,6 +161,25 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
         .map(|n| (rmap::to_snake(n), n.clone()))
         .collect();
 
+    // #279 P2a: noun_name -> Conceptual Data Type code (from the
+    // "conceptualDataType" binding on the Noun cell, absorbed by P1's
+    // `The data type of <VT> is <code>.`). Mirrors the objectType /
+    // enumValues maps above. A value-type property whose source noun has
+    // a code is typed from the catalog instead of the SQL-derived scalar.
+    let noun_data_types: HashMap<String, String> = nouns_seq.iter()
+        .filter_map(|n| {
+            let name = binding(n, "name")?.to_string();
+            let code = binding(n, "conceptualDataType")?.to_string();
+            Some((name, code))
+        })
+        .collect();
+
+    // #279 P2a: code -> (JSON Type, JSON Format?) catalog projection.
+    // Read from the `Conceptual_Data_Type_has_JSON_Type` / `...Format`
+    // cells when present (full compile), else the boot fallback — same
+    // dual-path discipline as `compile::SqlTypeMappingTable`.
+    let json_type_map = JsonTypeMappingTable::from_readings_state(state);
+
     // InstanceFact cell for general_instance_facts (plural / app description)
     let inst_cell = fetch_cell_seq("InstanceFact", state);
     let inst_seq = inst_cell.as_seq().unwrap_or(&[]);
@@ -171,7 +190,9 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
             let table_name = rmap::to_snake(name);
             let cols = rmap::columns_for_table(&cells, &table_name);
             if cols.is_empty() { return None; }
-            Some((name.clone(), component_schema_from_state(name, &cols, &noun_by_snake, &enum_values, state)))
+            Some((name.clone(), component_schema_from_state(
+                name, &cols, &noun_by_snake, &enum_values,
+                &noun_data_types, &json_type_map, state)))
         })
         .collect();
 
@@ -862,10 +883,13 @@ fn component_schema_from_state(
     columns: &[ColumnView],
     noun_by_snake: &HashMap<String, String>,
     enum_values: &HashMap<String, Vec<String>>,
+    noun_data_types: &HashMap<String, String>,
+    json_type_map: &JsonTypeMappingTable,
     state: &Object,
 ) -> serde_json::Value {
     let column_props = columns.iter()
-        .map(|col| (col.name.clone(), column_property_from_state(col, noun_by_snake, enum_values)));
+        .map(|col| (col.name.clone(), column_property_from_state(
+            col, noun_by_snake, enum_values, noun_data_types, json_type_map)));
 
     // SM-derived "status" property, if this noun has a state machine.
     let statuses = sm_statuses(state, noun_name);
@@ -900,32 +924,54 @@ fn component_schema_from_state(
 /// Map a RMAP column to a JSON Schema property.
 ///
 /// FK columns emit `$ref` into `components.schemas.{Target}`. Value-type
-/// columns with declared enum values emit `{type, enum}`. Other value
-/// columns emit a scalar type derived from the SQL `col_type`.
-/// State-based variant of `column_property`. Uses `enum_values` HashMap
-/// derived directly from the Noun cell rather than `domain.enum_values`.
+/// columns type from their source noun's Conceptual Data Type via the
+/// catalog (`json_type_map`) when one is declared (#279 P2a) — `{type}`
+/// plus `format` for the temporal / binary / uuid leaves — and otherwise
+/// fall back to the coarse scalar derived from the SQL `col_type`
+/// (pre-P2a behavior; RMAP types every value column `TEXT`, so untyped
+/// value columns stay `string`). Declared enum values still layer on
+/// top as `{..., enum}`, regardless of which typing path produced the
+/// base — matching the prior enum behavior.
+///
+/// State-based variant of `column_property`. Uses `enum_values` /
+/// `noun_data_types` HashMaps derived directly from the Noun cell rather
+/// than `domain.*`.
 fn column_property_from_state(
     col: &ColumnView,
     noun_by_snake: &HashMap<String, String>,
     enum_values: &HashMap<String, Vec<String>>,
+    noun_data_types: &HashMap<String, String>,
+    json_type_map: &JsonTypeMappingTable,
 ) -> serde_json::Value {
-    col.references.as_ref()
-        .map(|target| serde_json::json!({
+    if let Some(target) = col.references.as_ref() {
+        return serde_json::json!({
             "$ref": format!("#/components/schemas/{}", target),
-        }))
-        .unwrap_or_else(|| {
-            let source_noun = noun_by_snake.get(&col.name);
-            let enum_vals = source_noun.and_then(|n| enum_values.get(n));
-            match enum_vals {
-                Some(vals) => serde_json::json!({
-                    "type": sql_type_to_json(&col.col_type),
-                    "enum": vals,
-                }),
-                None => serde_json::json!({
-                    "type": sql_type_to_json(&col.col_type),
-                }),
-            }
-        })
+        });
+    }
+    let source_noun = noun_by_snake.get(&col.name);
+
+    // #279 P2a: prefer the Conceptual Data Type projection; fall back to
+    // the legacy SQL-derived scalar when the source noun has no code or
+    // the code isn't in the catalog (keeps untyped value types / future
+    // codes on their pre-P2a schema).
+    let cdt = source_noun
+        .and_then(|n| noun_data_types.get(n))
+        .and_then(|code| json_type_map.resolve(code));
+    let (json_type, json_format): (&str, Option<&str>) = match cdt {
+        Some((t, f)) => (t, f),
+        None => (sql_type_to_json(&col.col_type), None),
+    };
+
+    let mut prop = serde_json::Map::new();
+    prop.insert("type".to_string(), serde_json::Value::from(json_type));
+    if let Some(fmt) = json_format {
+        prop.insert("format".to_string(), serde_json::Value::from(fmt));
+    }
+    // Enum constraint layers on top of whichever base type was chosen.
+    if let Some(vals) = source_noun.and_then(|n| enum_values.get(n)) {
+        prop.insert("enum".to_string(), serde_json::json!(vals));
+    }
+    serde_json::Value::Object(prop)
 }
 
 /// Map a SQL type string to a JSON Schema scalar type.
@@ -938,6 +984,125 @@ fn sql_type_to_json(sql_type: &str) -> &'static str {
         "REAL" | "NUMERIC" | "DECIMAL" | "DOUBLE" | "FLOAT" => "number",
         "BOOLEAN" | "BOOL" => "boolean",
         _ => "string",
+    }
+}
+
+/// #279 P2a — the value-type → JSON Schema projection lifts from a
+/// hardcoded match into a typed table reading the catalog at compile
+/// time. Each row encodes one `(Conceptual Data Type code, JSON Type,
+/// JSON Format?)` triple sourced from the `Conceptual Data Type has
+/// JSON Type` / `... has JSON Format` instance facts in
+/// `readings/core/core.md`; lookup is O(rows) — fine for a 31-leaf
+/// catalog walked once per value-type property.
+///
+/// This MIRRORS `compile::SqlTypeMappingTable` (the #896 SQL-dialect
+/// lift): a `boot()` fallback hand-mirrors the readings one-for-one so a
+/// bare engine — or a snippet-parsed state that never merged core.md —
+/// types identically, and `from_readings_state` reads the two catalog
+/// fact-type cells when present (the full-compile path). The catalog's
+/// binary single-valued fact types keep their own data cells
+/// (`Conceptual_Data_Type_has_JSON_Type` / `...has_JSON_Format`), with
+/// the role players as bindings — exactly the shape the SQL table reads.
+#[derive(Debug, Clone)]
+pub(crate) struct JsonTypeMappingTable {
+    /// One row per leaf: `(code, jsonType, jsonFormat?)`. Order matches
+    /// the `Conceptual Data Type has JSON Type` instance facts in
+    /// `readings/core/core.md` (the #279 catalog area).
+    rows: Vec<(String, String, Option<String>)>,
+}
+
+impl JsonTypeMappingTable {
+    /// Boot table — must stay in sync with the `Conceptual Data Type has
+    /// JSON Type` / `... has JSON Format` instance facts in
+    /// `readings/core/core.md`. 31 leaf codes; the formatted leaves
+    /// (temporal, raw, uuid) additionally carry a JSON format. A
+    /// `core_md_declares_conceptual_data_type_json_projection` text pin
+    /// plus `json_type_mapping_table_boot_matches_readings_state` guard
+    /// this against drift.
+    pub(crate) fn boot() -> Self {
+        // (code, jsonType, jsonFormat?) in readings declaration order.
+        let rows: Vec<(String, String, Option<String>)> = [
+            ("text",          "string",  None),
+            ("fixedText",     "string",  None),
+            ("largeText",     "string",  None),
+            ("smallInteger",  "integer", None),
+            ("integer",       "integer", None),
+            ("largeInteger",  "integer", None),
+            ("unsignedTiny",  "integer", None),
+            ("unsignedSmall", "integer", None),
+            ("unsigned",      "integer", None),
+            ("unsignedLarge", "integer", None),
+            ("autoCounter",   "integer", None),
+            ("singleFloat",   "number",  None),
+            ("doubleFloat",   "number",  None),
+            ("decimal",       "number",  None),
+            ("money",         "number",  None),
+            ("uuid",          "string",  Some("uuid")),
+            ("date",          "string",  Some("date")),
+            ("time",          "string",  Some("time")),
+            ("dateTime",      "string",  Some("date-time")),
+            ("autoTimestamp", "string",  Some("date-time")),
+            ("boolean",       "boolean", None),
+            ("yesNo",         "boolean", None),
+            ("fixedRaw",      "string",  Some("byte")),
+            ("raw",           "string",  Some("byte")),
+            ("largeRaw",      "string",  Some("byte")),
+            ("picture",       "string",  Some("byte")),
+            ("oleObject",     "string",  Some("byte")),
+            ("rowId",         "integer", None),
+            ("objectId",      "integer", None),
+            ("unspecified",   "string",  None),
+            ("userDefined",   "string",  None),
+        ].iter()
+            .map(|(c, t, f)| (c.to_string(), t.to_string(), f.map(str::to_string)))
+            .collect();
+        JsonTypeMappingTable { rows }
+    }
+
+    /// Build the table from the runtime `Conceptual_Data_Type_has_JSON_Type`
+    /// and `Conceptual_Data_Type_has_JSON_Format` cells in `state`. Falls
+    /// back to `boot()` when the type cell is empty (bare engine, or a
+    /// snippet-parsed state that never merged core.md).
+    pub(crate) fn from_readings_state(state: &Object) -> Self {
+        let type_cell = fetch_cell_seq("Conceptual_Data_Type_has_JSON_Type", state);
+        let type_rows: Vec<(String, String)> = type_cell.as_seq()
+            .map(|facts| facts.iter().filter_map(|f| {
+                let code = binding(f, "Conceptual Data Type")?.to_string();
+                let json_type = binding(f, "JSON Type")?.to_string();
+                Some((code, json_type))
+            }).collect())
+            .unwrap_or_default();
+        if type_rows.is_empty() {
+            return Self::boot();
+        }
+        // Format is optional (at-most-one) — index it by code, join in.
+        let fmt_cell = fetch_cell_seq("Conceptual_Data_Type_has_JSON_Format", state);
+        let fmt_rows: Vec<(String, String)> = fmt_cell.as_seq()
+            .map(|facts| facts.iter().filter_map(|f| {
+                let code = binding(f, "Conceptual Data Type")?.to_string();
+                let json_format = binding(f, "JSON Format")?.to_string();
+                Some((code, json_format))
+            }).collect())
+            .unwrap_or_default();
+        let rows: Vec<(String, String, Option<String>)> = type_rows.into_iter()
+            .map(|(code, json_type)| {
+                let fmt = fmt_rows.iter()
+                    .find(|(c, _)| *c == code)
+                    .map(|(_, f)| f.clone());
+                (code, json_type, fmt)
+            })
+            .collect();
+        JsonTypeMappingTable { rows }
+    }
+
+    /// Resolve a Conceptual Data Type `code` to `(jsonType, jsonFormat?)`.
+    /// Returns `None` when the code is absent from the catalog — the
+    /// caller then keeps the legacy SQL-derived typing (no regression
+    /// for unknown / future codes).
+    fn resolve<'a>(&'a self, code: &str) -> Option<(&'a str, Option<&'a str>)> {
+        self.rows.iter()
+            .find(|(c, _, _)| c == code)
+            .map(|(_, t, f)| (t.as_str(), f.as_deref()))
     }
 }
 
@@ -1559,6 +1724,166 @@ mod tests {
             assert!(props.contains_key(required),
                 "component must describe '{required}'; got props: {:?}",
                 props.keys().collect::<Vec<_>>());
+        }
+    }
+
+    // ── #279 P2a — Conceptual Data Type → JSON Schema projection ─────
+    //
+    // A value type that opts into a Conceptual Data Type
+    // (`The data type of <VT> is <code>.`) types its property from the
+    // catalog instead of defaulting to "string". The mapping is data
+    // (readings/core.md), read via `JsonTypeMappingTable`; the boot
+    // fallback covers states that don't carry the catalog cell — which
+    // is the case for these snippet-parsed fixtures (no core.md merged).
+
+    /// Build a compiled-shape state directly so a value attribute
+    /// surfaces as a functional RMAP column on the entity table.
+    ///
+    /// The high-level FORML2 path can't drive this fixture: stage12's
+    /// span-enrichment duplicates a single-role UC's span into a
+    /// pseudo-compound `[role, role]` form, which `rmap()` then routes to
+    /// a junction table — so `Product has <attr>` never absorbs as an
+    /// entity column from a parsed snippet. Hand-built cells (the same
+    /// approach `sql.rs` tests use) give a clean single-span UC so RMAP
+    /// absorbs `<attr>` as a `product.<attr_snake>` column whose source
+    /// noun carries the optional `conceptualDataType` under test.
+    ///
+    /// `extra` pushes additional pairs onto the value noun (e.g. an
+    /// `enumValues` binding) so back-compat layering can be exercised.
+    fn entity_state_with_value_attr(
+        attr: &str, code: Option<&str>, extra: &[(&str, &str)],
+    ) -> Object {
+        use alloc::string::ToString;
+        let ft_id = format!("Product_has_{}", attr.replace(' ', "_"));
+        let reading = format!("Product has {}", attr);
+        let mut attr_pairs: Vec<(&str, &str)> = vec![("name", attr), ("objectType", "value")];
+        if let Some(c) = code { attr_pairs.push(("conceptualDataType", c)); }
+        attr_pairs.extend_from_slice(extra);
+        let nouns = Object::seq(vec![
+            fact_from_pairs(&[("name", "Product"), ("objectType", "entity")]),
+            fact_from_pairs(&attr_pairs),
+        ]);
+        let fts = Object::seq(vec![
+            fact_from_pairs(&[("id", ft_id.as_str()), ("reading", reading.as_str())]),
+        ]);
+        let roles = Object::seq(vec![
+            fact_from_pairs(&[("factType", ft_id.as_str()), ("nounName", "Product"), ("position", "0")]),
+            fact_from_pairs(&[("factType", ft_id.as_str()), ("nounName", attr), ("position", "1")]),
+        ]);
+        // Single-span UC + MC on the Product role (role 0) → a mandatory
+        // functional column, no spurious second span.
+        let cons = Object::seq(vec![
+            fact_from_pairs(&[("id", "uc0"), ("kind", "UC"),
+                ("span0_factTypeId", ft_id.as_str()), ("span0_roleIndex", "0")]),
+            fact_from_pairs(&[("id", "mc0"), ("kind", "MC"),
+                ("span0_factTypeId", ft_id.as_str()), ("span0_roleIndex", "0")]),
+        ]);
+        let mut m: HashMap<alloc::string::String, Object> = HashMap::new();
+        m.insert("Noun".to_string(), nouns);
+        m.insert("FactType".to_string(), fts);
+        m.insert("Role".to_string(), roles);
+        m.insert("Constraint".to_string(), cons);
+        Object::Map(m.into())
+    }
+
+    #[test]
+    fn value_type_property_typed_integer_from_conceptual_data_type() {
+        // `conceptualDataType == "integer"` → property `{ "type": "integer" }`.
+        let state = entity_state_with_value_attr("Quantity", Some("integer"), &[]);
+        let doc = openapi_for_app(&state, "test-app");
+        let props = doc["components"]["schemas"]["Product"]["properties"]
+            .as_object().expect("Product.properties must be an object");
+        let quantity = props.get("quantity")
+            .unwrap_or_else(|| panic!("Product must carry a 'quantity' property; got: {:?}",
+                props.keys().collect::<Vec<_>>()));
+        assert_eq!(quantity["type"], "integer",
+            "integer-typed value type must yield type:integer; got: {}", quantity);
+        assert!(quantity.get("format").is_none(),
+            "integer carries no JSON format; got: {}", quantity);
+    }
+
+    #[test]
+    fn value_type_property_datetime_carries_date_time_format() {
+        // `dateTime` → `{ "type": "string", "format": "date-time" }`.
+        let state = entity_state_with_value_attr("Created", Some("dateTime"), &[]);
+        let doc = openapi_for_app(&state, "test-app");
+        let props = doc["components"]["schemas"]["Product"]["properties"]
+            .as_object().expect("Product.properties must be an object");
+        let created = props.get("created")
+            .unwrap_or_else(|| panic!("Product must carry a 'created' property; got: {:?}",
+                props.keys().collect::<Vec<_>>()));
+        assert_eq!(created["type"], "string",
+            "dateTime maps to JSON type string; got: {}", created);
+        assert_eq!(created["format"], "date-time",
+            "dateTime carries format date-time; got: {}", created);
+    }
+
+    #[test]
+    fn untyped_value_type_property_keeps_string_default() {
+        // Backward-compat: a value type with NO Conceptual Data Type
+        // keeps the pre-P2a schema (the coarse SQL-derived scalar, which
+        // for an untyped value column is "string") and gains no format.
+        let state = entity_state_with_value_attr("Nickname", None, &[]);
+        let doc = openapi_for_app(&state, "test-app");
+        let props = doc["components"]["schemas"]["Product"]["properties"]
+            .as_object().expect("Product.properties must be an object");
+        let nickname = props.get("nickname")
+            .unwrap_or_else(|| panic!("Product must carry a 'nickname' property; got: {:?}",
+                props.keys().collect::<Vec<_>>()));
+        assert_eq!(nickname["type"], "string",
+            "untyped value type keeps the string default; got: {}", nickname);
+        assert!(nickname.get("format").is_none(),
+            "untyped value type gains no format; got: {}", nickname);
+    }
+
+    #[test]
+    fn enum_value_type_still_layers_enum_when_untyped() {
+        // Backward-compat: an enum-bearing value type with no Conceptual
+        // Data Type keeps `{ type, enum }` exactly as before P2a.
+        let state = entity_state_with_value_attr(
+            "Size", None, &[("enumValues", "small,large")]);
+        let doc = openapi_for_app(&state, "test-app");
+        let props = doc["components"]["schemas"]["Product"]["properties"]
+            .as_object().expect("Product.properties must be an object");
+        let size = props.get("size")
+            .unwrap_or_else(|| panic!("Product must carry a 'size' property; got: {:?}",
+                props.keys().collect::<Vec<_>>()));
+        assert_eq!(size["type"], "string");
+        let variants = size["enum"].as_array().expect("size must keep its enum");
+        assert!(variants.iter().any(|v| v == "small")
+            && variants.iter().any(|v| v == "large"),
+            "enum variants must survive; got: {}", size);
+    }
+
+    #[test]
+    fn json_type_mapping_table_boot_resolves_catalog() {
+        // The boot fallback must mirror the readings one-for-one for the
+        // representative leaves the projection mapping pins.
+        let t = JsonTypeMappingTable::boot();
+        assert_eq!(t.resolve("integer"), Some(("integer", None)));
+        assert_eq!(t.resolve("decimal"), Some(("number", None)));
+        assert_eq!(t.resolve("boolean"), Some(("boolean", None)));
+        assert_eq!(t.resolve("dateTime"), Some(("string", Some("date-time"))));
+        assert_eq!(t.resolve("uuid"), Some(("string", Some("uuid"))));
+        assert_eq!(t.resolve("raw"), Some(("string", Some("byte"))));
+        assert_eq!(t.resolve("text"), Some(("string", None)));
+        // Unknown code → no mapping (caller falls back to legacy typing).
+        assert_eq!(t.resolve("notACode"), None);
+    }
+
+    #[test]
+    fn json_type_mapping_table_boot_matches_readings_state() {
+        // Parity guard like the SQL table's
+        // `from_readings_state_*_matches_boot` tests: the catalog cell
+        // compiled from core.md must agree with the hand-maintained boot
+        // table on every leaf code.
+        let readings = JsonTypeMappingTable::from_readings_state(crate::metamodel_state());
+        let boot = JsonTypeMappingTable::boot();
+        assert_eq!(readings.rows.len(), 31,
+            "catalog must expose all 31 leaf codes; got {}", readings.rows.len());
+        for (code, ty, fmt) in boot.rows.iter() {
+            assert_eq!(readings.resolve(code), Some((ty.as_str(), fmt.as_deref())),
+                "readings disagree with boot for leaf '{}'", code);
         }
     }
 }

@@ -637,6 +637,8 @@ Alias is a value type.
 Length is a value type.
 Binary Precision is a value type.
 Digit Count is a value type.
+JSON Type is a value type.
+JSON Format is a value type.
 
 ### Fact types
 
@@ -699,6 +701,12 @@ Conceptual Data Type is in Data Type Group.
 
 Noun has Conceptual Data Type.
   Each Noun has at most one Conceptual Data Type.
+
+Conceptual Data Type has JSON Type.
+  Each Conceptual Data Type has exactly one JSON Type.
+
+Conceptual Data Type has JSON Format.
+  Each Conceptual Data Type has at most one JSON Format.
 
 ## Instance Facts
 
@@ -772,6 +780,57 @@ Conceptual Data Type 'rowId' is in Data Type Group 'other'.
 Conceptual Data Type 'objectId' is in Data Type Group 'other'.
 Conceptual Data Type 'unspecified' is in Data Type Group 'unspecified'.
 Conceptual Data Type 'userDefined' is in Data Type Group 'userDefined'.
+
+JSON-Schema projection of the catalog (#279 P2a). Each leaf carries one
+JSON Type (the `type` keyword the OpenAPI / JSON-Schema generator emits
+for a value-type property) and, for temporal / binary / uuid leaves, a
+JSON Format. These absorb `jsonType` / `jsonFormat` onto the Conceptual
+Data Type cell via RMAP, the same way `conceptualDataType` absorbs onto
+Noun. The generator's `JsonTypeMappingTable` reads them back; its boot
+fallback mirrors this block one-for-one.
+
+Conceptual Data Type 'text' has JSON Type 'string'.
+Conceptual Data Type 'fixedText' has JSON Type 'string'.
+Conceptual Data Type 'largeText' has JSON Type 'string'.
+Conceptual Data Type 'smallInteger' has JSON Type 'integer'.
+Conceptual Data Type 'integer' has JSON Type 'integer'.
+Conceptual Data Type 'largeInteger' has JSON Type 'integer'.
+Conceptual Data Type 'unsignedTiny' has JSON Type 'integer'.
+Conceptual Data Type 'unsignedSmall' has JSON Type 'integer'.
+Conceptual Data Type 'unsigned' has JSON Type 'integer'.
+Conceptual Data Type 'unsignedLarge' has JSON Type 'integer'.
+Conceptual Data Type 'autoCounter' has JSON Type 'integer'.
+Conceptual Data Type 'singleFloat' has JSON Type 'number'.
+Conceptual Data Type 'doubleFloat' has JSON Type 'number'.
+Conceptual Data Type 'decimal' has JSON Type 'number'.
+Conceptual Data Type 'money' has JSON Type 'number'.
+Conceptual Data Type 'uuid' has JSON Type 'string'.
+Conceptual Data Type 'date' has JSON Type 'string'.
+Conceptual Data Type 'time' has JSON Type 'string'.
+Conceptual Data Type 'dateTime' has JSON Type 'string'.
+Conceptual Data Type 'autoTimestamp' has JSON Type 'string'.
+Conceptual Data Type 'boolean' has JSON Type 'boolean'.
+Conceptual Data Type 'yesNo' has JSON Type 'boolean'.
+Conceptual Data Type 'fixedRaw' has JSON Type 'string'.
+Conceptual Data Type 'raw' has JSON Type 'string'.
+Conceptual Data Type 'largeRaw' has JSON Type 'string'.
+Conceptual Data Type 'picture' has JSON Type 'string'.
+Conceptual Data Type 'oleObject' has JSON Type 'string'.
+Conceptual Data Type 'rowId' has JSON Type 'integer'.
+Conceptual Data Type 'objectId' has JSON Type 'integer'.
+Conceptual Data Type 'unspecified' has JSON Type 'string'.
+Conceptual Data Type 'userDefined' has JSON Type 'string'.
+
+Conceptual Data Type 'uuid' has JSON Format 'uuid'.
+Conceptual Data Type 'date' has JSON Format 'date'.
+Conceptual Data Type 'time' has JSON Format 'time'.
+Conceptual Data Type 'dateTime' has JSON Format 'date-time'.
+Conceptual Data Type 'autoTimestamp' has JSON Format 'date-time'.
+Conceptual Data Type 'fixedRaw' has JSON Format 'byte'.
+Conceptual Data Type 'raw' has JSON Format 'byte'.
+Conceptual Data Type 'largeRaw' has JSON Format 'byte'.
+Conceptual Data Type 'picture' has JSON Format 'byte'.
+Conceptual Data Type 'oleObject' has JSON Format 'byte'.
 
 ### Constraint Kinds (#747)
 
