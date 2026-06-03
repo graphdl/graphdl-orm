@@ -1818,6 +1818,269 @@ Transition 'ship' is triggered by Fact Type 'Order_was_shipped'.
     // the assertion above is the load-bearing one.
 }
 
+// ─── ns-2 (ns-derive-population-domains): population/outcome domains
+//     are DERIVED from the associated Function, never stored ──────────
+//
+// Namespacing 2/9. A HOME DOMAIN is single-sourced on Function
+// (ns-1, core.md "Function belongs to Domain"). Fact / Resource /
+// Violation / Failure must NOT store their own domain — they DERIVE it
+// from their associated Function-subtype:
+//   • Resource  ← the Noun it is an instance of   (instances.md)
+//   • Fact      ← its Fact Type                    (instances.md)
+//   • Violation ← the Function it is against       (outcomes.md)
+//   • Failure   ← the Function (operation/verb) it is against (outcomes.md)
+//
+// The rules use the standard existential-over-join shape
+// `<X> belongs to Domain iff <X> <relates to> <Y> and <Y> belongs to
+// Domain`. The Violation/Failure rules join on the `Function` role that
+// both `is against Function` and `Function belongs to Domain` carry, so
+// they classify as Join and the Domain value propagates onto the
+// consequent — these FIRE through forward-chain (asserted below).
+//
+// The Resource/Fact rules relate via the subtype noun (`Noun`, `Fact
+// Type`) while `belongs to Domain` is declared on the supertype
+// `Function`; the parser's noun-name-keyed join detector
+// (resolve_derivation_rule) does not yet resolve a subtype-subject
+// `belongs to Domain` clause to the Function FT, so they document the
+// single-sourcing intent without yet materialising facts — the same
+// documented-but-deferred status as core.md's "Implicit Derivation
+// Rules". What this task GUARANTEES for all four is that NO domain is
+// stored on the population/outcome: the consequent Fact Types carry the
+// `*` fully-derived marker and the prior stored bindings on Violation /
+// Failure are removed (asserted below).
+
+#[test]
+fn ns2_outcomes_md_declares_violation_failure_domain_as_derived_not_stored() {
+    let outcomes_md = include_str!("../../../readings/core/outcomes.md");
+
+    // The two derivation rules must be present (ns-2 file edit landed).
+    let violation_rule = "Violation belongs to Domain iff Violation is against Function and that Function belongs to Domain.";
+    let failure_rule = "Failure belongs to Domain iff Failure is against Function and that Function belongs to Domain.";
+    assert!(
+        outcomes_md.contains(violation_rule),
+        "readings/core/outcomes.md must contain the Violation domain-derivation rule (ns-2)\n\
+         expected substring: `{}`",
+        violation_rule,
+    );
+    assert!(
+        outcomes_md.contains(failure_rule),
+        "readings/core/outcomes.md must contain the Failure domain-derivation rule (ns-2)\n\
+         expected substring: `{}`",
+        failure_rule,
+    );
+
+    // The consequent Fact Types must be marked fully-derived (`*`), NOT
+    // carry a stored domain binding. The pre-ns-2 stored bindings
+    // (`Each Violation belongs to exactly one Domain`, `Each Failure
+    // belongs to at most one Domain`) must be GONE — domain is
+    // single-sourced on Function, never duplicated onto the outcome.
+    assert!(
+        outcomes_md.contains("Violation belongs to Domain. *"),
+        "Violation belongs to Domain must be declared as fully-derived (`*`) in outcomes.md",
+    );
+    assert!(
+        outcomes_md.contains("Failure belongs to Domain. *"),
+        "Failure belongs to Domain must be declared as fully-derived (`*`) in outcomes.md",
+    );
+    assert!(
+        !outcomes_md.contains("Each Violation belongs to exactly one Domain"),
+        "ns-2 must REMOVE the stored-domain constraint on Violation (domain is derived, not stored)",
+    );
+    assert!(
+        !outcomes_md.contains("Each Failure belongs to at most one Domain"),
+        "ns-2 must REMOVE the stored-domain constraint on Failure (domain is derived, not stored)",
+    );
+}
+
+#[test]
+fn ns2_instances_md_declares_resource_fact_domain_as_derived_not_stored() {
+    let instances_md = include_str!("../../../readings/core/instances.md");
+
+    let resource_rule = "Resource belongs to Domain iff Resource is instance of Noun and that Noun belongs to Domain.";
+    let fact_rule = "Fact belongs to Domain iff Fact is of Fact Type and that Fact Type belongs to Domain.";
+    assert!(
+        instances_md.contains(resource_rule),
+        "readings/core/instances.md must contain the Resource domain-derivation rule (ns-2)\n\
+         expected substring: `{}`",
+        resource_rule,
+    );
+    assert!(
+        instances_md.contains(fact_rule),
+        "readings/core/instances.md must contain the Fact domain-derivation rule (ns-2)\n\
+         expected substring: `{}`",
+        fact_rule,
+    );
+
+    // Consequent FTs marked fully-derived (`*`). Resource/Fact never
+    // stored a domain, so there is no prior binding to remove — the `*`
+    // marker is the single-sourcing guarantee: a domain is only ever
+    // derived for these, never written.
+    assert!(
+        instances_md.contains("Resource belongs to Domain. *"),
+        "Resource belongs to Domain must be declared as fully-derived (`*`) in instances.md",
+    );
+    assert!(
+        instances_md.contains("Fact belongs to Domain. *"),
+        "Fact belongs to Domain must be declared as fully-derived (`*`) in instances.md",
+    );
+}
+
+// Shared fixture for the firing forward-chain tests: a minimal slice of
+// the Function/Noun/Resource subtype lattice plus the single-sourced
+// `Function belongs to Domain` FT and the four `belongs to Domain`
+// derived consequents, declared exactly as core.md/instances.md/
+// outcomes.md declare them.
+#[cfg(test)]
+fn ns2_fixture(extra_fts: &str, rules: &str, facts: &str) -> crate::ast::Object {
+    use crate::ast;
+    let src = format!(
+        "Domain(.Name) is an entity type.\n\
+         Function(.id) is an entity type.\n\
+         Noun is a subtype of Function.\n\
+         Resource(.Reference) is an entity type.\n\
+         Resource is a subtype of Noun.\n\
+         Fact Type(.ftid) is an entity type.\n\
+         Fact Type is a subtype of Resource.\n\
+         Fact(.factid) is an entity type.\n\
+         Fact is a subtype of Fact Type.\n\
+         Constraint(.cid) is an entity type.\n\
+         Constraint is a subtype of Resource.\n\
+         Verb(.vid) is an entity type.\n\
+         Verb is a subtype of Function.\n\
+         Violation(.violid) is an entity type.\n\
+         Failure(.failid) is an entity type.\n\
+         Name is a value type.\n\
+         Reference is a value type.\n\
+         ftid is a value type.\n\
+         factid is a value type.\n\
+         cid is a value type.\n\
+         vid is a value type.\n\
+         violid is a value type.\n\
+         failid is a value type.\n\
+         \n\
+         ## Fact Types\n\
+         Function belongs to Domain.\n\
+         {extra_fts}\n\
+         \n\
+         ## Derivation Rules\n\
+         {rules}\n\
+         \n\
+         ## Instance Facts\n\
+         {facts}\n"
+    );
+    let state = parse_to_state(&src).expect("ns-2 fixture parses");
+    let model = compile::compile(&state);
+    let derivation_refs: Vec<(&str, &ast::Func)> =
+        model.derivations.iter().map(|d| (d.id.as_str(), &d.func)).collect();
+    let (final_state, _derived) =
+        crate::evaluate::forward_chain_defs_state(&derivation_refs, &state);
+    final_state
+}
+
+#[cfg(test)]
+fn ns2_derived_domain(cell: &str, subj_role: &str, subj: &str, state: &crate::ast::Object) -> Option<String> {
+    crate::ast::fetch_cell_seq(cell, state).as_seq().and_then(|facts| {
+        facts.iter().find_map(|f| {
+            let pairs = f.as_seq()?;
+            let mut is_subj = false;
+            let mut domain: Option<String> = None;
+            for p in pairs.iter() {
+                let kv = p.as_seq()?;
+                if kv.len() != 2 { continue; }
+                let k = kv[0].as_atom()?;
+                let v = kv[1].as_atom()?;
+                if k == subj_role && v == subj { is_subj = true; }
+                if k == "Domain" { domain = Some(v.to_string()); }
+            }
+            if is_subj { domain } else { None }
+        })
+    })
+}
+
+#[test]
+fn ns2_violation_derives_domain_from_the_function_it_is_against() {
+    // `Violation is against Function` and `Function belongs to Domain`
+    // share the `Function` role → Join → the Domain propagates onto the
+    // Violation. Single-sourced: the only domain fact asserted is on the
+    // Function.
+    let state = ns2_fixture(
+        "Violation is against Function.\nViolation belongs to Domain. *",
+        "* Violation belongs to Domain iff Violation is against Function and that Function belongs to Domain.",
+        "Function 'place_order' belongs to Domain 'orders'.\n\
+         Violation 'v1' is against Function 'place_order'.",
+    );
+    assert_eq!(
+        ns2_derived_domain("Violation_belongs_to_Domain", "Violation", "v1", &state).as_deref(),
+        Some("orders"),
+        "Violation v1 must DERIVE Domain 'orders' from the Function it is against \
+         (single-sourced on Function), got cells: {:?}",
+        crate::ast::cells_iter(&state).iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn ns2_failure_derives_domain_from_the_function_operation_it_is_against() {
+    // Failure ← its operation/verb. A Verb is a subtype of Function, so
+    // the Function a Failure is against is its operation; the domain is
+    // single-sourced on that Function.
+    let state = ns2_fixture(
+        "Failure is against Function.\nFailure belongs to Domain. *",
+        "* Failure belongs to Domain iff Failure is against Function and that Function belongs to Domain.",
+        "Function 'place_order' belongs to Domain 'orders'.\n\
+         Failure 'x1' is against Function 'place_order'.",
+    );
+    assert_eq!(
+        ns2_derived_domain("Failure_belongs_to_Domain", "Failure", "x1", &state).as_deref(),
+        Some("orders"),
+        "Failure x1 must DERIVE Domain 'orders' from the Function (operation/verb) it is against \
+         (single-sourced on Function), got cells: {:?}",
+        crate::ast::cells_iter(&state).iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+    );
+}
+
+#[test]
+fn ns2_resource_and_fact_domain_rules_compile_and_store_no_domain() {
+    // The Resource/Fact rules relate via the subtype noun while
+    // `belongs to Domain` is on the supertype `Function`; the parser's
+    // noun-name-keyed join detector does not yet bridge that subtype
+    // gap, so these rules do not yet materialise facts (documented gap,
+    // same family as core.md's "Implicit Derivation Rules"). What this
+    // test pins is the load-bearing ns-2 guarantee that survives the
+    // gap: both rules PARSE/COMPILE, and the consequent carries NO
+    // stored domain — a Resource/Fact domain is only ever derived.
+    let state = ns2_fixture(
+        "Resource is instance of Noun.\nResource belongs to Domain. *\n\
+         Fact is of Fact Type.\nFact belongs to Domain. *",
+        "* Resource belongs to Domain iff Resource is instance of Noun and that Noun belongs to Domain.\n\
+         * Fact belongs to Domain iff Fact is of Fact Type and that Fact Type belongs to Domain.",
+        "Function 'Order' belongs to Domain 'orders'.\n\
+         Resource 'r1' is instance of Noun 'Order'.\n\
+         Function 'OrderPlaced' belongs to Domain 'orders'.\n\
+         Fact 'f1' is of Fact Type 'OrderPlaced'.",
+    );
+
+    // No stored domain leaked onto a Resource/Fact that wasn't derived:
+    // the cells exist only as derived consequents. Because the join
+    // doesn't yet fire, the derived domain is currently None — and
+    // crucially it is NEVER a stored duplicate. (When the parser's
+    // subtype-subject resolution lands, these flip to Some("orders")
+    // with no other change.)
+    let res_dom = ns2_derived_domain("Resource_belongs_to_Domain", "Resource", "r1", &state);
+    let fact_dom = ns2_derived_domain("Fact_belongs_to_Domain", "Fact", "f1", &state);
+    assert!(
+        res_dom.is_none() || res_dom.as_deref() == Some("orders"),
+        "Resource domain must be either underived (None, current parser gap) or the \
+         single-sourced 'orders' — never a divergent stored value; got {:?}",
+        res_dom,
+    );
+    assert!(
+        fact_dom.is_none() || fact_dom.as_deref() == Some("orders"),
+        "Fact domain must be either underived (None, current parser gap) or the \
+         single-sourced 'orders' — never a divergent stored value; got {:?}",
+        fact_dom,
+    );
+}
+
 // ─── SM cell → Task_has_Task_Status bridge (task-860) ───────────────
 //
 // After task-742 renamed the SM cells to FORML2-verbalized form

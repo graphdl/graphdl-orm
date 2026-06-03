@@ -49,6 +49,14 @@ Citation pins Cell Version Id.
 ### Fact
 Fact is of Fact Type.
   Each Fact is of exactly one Fact Type.
+Fact belongs to Domain. *
+  <!-- ns-2 (ns-derive-population-domains): a Fact does NOT store its own
+       domain — it DERIVES it from its Fact Type, keeping domain single-sourced
+       on Function (a Fact Type is a subtype of Function via Resource < Noun <
+       Function; core.md "Function belongs to Domain"). The `*` marks this Fact
+       Type as fully derived; the rule is under "## Derivation Rules" below.
+       Fact never stored a domain, so nothing is removed — this only adds the
+       derivation so a Fact's domain is the domain of its Fact Type. -->
 Fact is completed.
 Fact is example.
 Fact cites Citation.
@@ -63,6 +71,17 @@ Fact Type cites Citation.
 ### Resource
 Resource is instance of Noun.
   Each Resource is instance of exactly one Noun.
+Resource belongs to Domain. *
+  <!-- ns-2 (ns-derive-population-domains): a Resource does NOT store its own
+       domain — it DERIVES it from the Noun it is an instance of, keeping
+       domain single-sourced on Function (a Noun is a subtype of Function;
+       core.md "Function belongs to Domain"). The `*` marks this Fact Type as
+       fully derived; the rule is under "## Derivation Rules" below. Resource
+       never stored a domain, so nothing is removed — this only adds the
+       derivation so a Resource's domain is the domain of its Noun. Distinct
+       from the createEntity `domain` command field (ast.rs `same_identity` /
+       `annotate_noun_domain`), which is the per-FILE namespace tag, not a
+       stored population-level domain fact. -->
 Resource has Reference.
   Each Resource has at most one Reference.
 Resource has Value.
@@ -128,6 +147,35 @@ Guard Run references Fact.
   For each combination of Guard Run and Fact, that Guard Run references that Fact at most once.
 Guard Run has Result.
   Each Guard Run has at most one Result.
+
+## Derivation Rules
+
+<!-- ns-2 (ns-derive-population-domains): instance-level populations DERIVE
+     their home Domain from their associated Function-subtype, keeping domain
+     single-sourced on Function (core.md "Function belongs to Domain"). The
+     shape is the standard existential-over-join derivation
+     (`<X> belongs to Domain iff <X> <relates to> some <Y> and <Y> belongs to
+     Domain`), mirroring the outcomes.md Violation / Failure rules.
+
+     PARSER NOTE (gap — same family as core.md's "Implicit Derivation Rules"):
+     The forward-chaining JOIN that propagates the Domain value only forms when
+     the relating Fact Type and `belongs to Domain` share a role NOUN-NAME. The
+     outcomes rules join because `is against Function` and `Function belongs to
+     Domain` both carry a `Function` role. These two rules relate via the
+     subtype noun (`Noun`, `Fact Type`), and `belongs to Domain` is declared on
+     the supertype `Function`, so `resolve_derivation_rule`
+     (crates/arest/src/parse_forml2.rs) does not yet resolve a subtype-subject
+     `<Noun|Fact Type> belongs to Domain` clause to the Function FT, nor widen
+     `is instance of Function` to `is instance of Noun`. Until that subtype-
+     subject resolution lands, these rules document the single-sourcing intent
+     (Resource ← its Noun's domain; Fact ← its Fact Type's domain) but do not
+     yet materialise facts — exactly the documented-but-deferred status of the
+     structural rules in core.md §"Implicit Derivation Rules". They store NO
+     domain on Resource / Fact regardless. -->
+
+* Resource belongs to Domain iff Resource is instance of Noun and that Noun belongs to Domain.
+
+* Fact belongs to Domain iff Fact is of Fact Type and that Fact Type belongs to Domain.
 
 ## Instance Facts
 
