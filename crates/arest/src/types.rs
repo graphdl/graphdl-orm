@@ -1042,6 +1042,9 @@ fn consequent_aggregate_write(out: &mut String, a: &ConsequentAggregate) {
         out.push_str(",\"joinFactTypeId\":");
         json_escape(out, &a.join_fact_type_id);
     }
+    if a.enum_global {
+        out.push_str(",\"enumGlobal\":true");
+    }
     out.push('}');
 }
 
@@ -1318,6 +1321,20 @@ pub struct ConsequentAggregate {
     /// both the group key and the folded value).
     #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "String::is_empty"))]
     pub join_fact_type_id: String,
+    /// task-recommendation cascade — when set, the aggregate folds over the
+    /// WHOLE source set as a SINGLE GLOBAL group (no per-subject grouping):
+    /// `g_key` becomes a constant, so every source fact lands in one group
+    /// and the fold yields the population-wide extremum. The derived fact
+    /// then carries ONLY the winning value (`<agg.role, value>`), with no
+    /// group-key binding — the consequent is a SINGLETON marker FT whose
+    /// sole role is the value type (e.g. `Task Priority is recommended`).
+    /// This is the POSITIVE global enum-superlative: `<V> is recommended iff
+    /// some <E> has the highest <V> among <E>s …` derives the single top
+    /// value, which a downstream positive equi-join re-attaches to each
+    /// qualifying member. Reverse reading: "no <E> has a higher <V>" — same
+    /// fact, no negation antecedent. Only meaningful with `enum_rank`.
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "core::ops::Not::not"))]
+    pub enum_global: bool,
 }
 
 /// One literal-equality predicate over the entity being aggregated, sourced
@@ -1781,7 +1798,7 @@ mod canonical_json_tests {
                 source_fact_type_id: "Fact_Type_has_Role".to_string(),
                 group_key_role: "Fact Type".to_string(),
                 group_key_index: None, target_index: None, filters: alloc::vec![],
-                enum_rank: false, join_fact_type_id: String::new(),
+                enum_rank: false, join_fact_type_id: String::new(), enum_global: false,
             }],
             consequent_universals: alloc::vec![],
             unresolved_clauses: alloc::vec!["weird".to_string()],
@@ -2034,6 +2051,7 @@ mod canonical_json_tests {
                 filters: Vec::new(),
                 enum_rank: true,
                 join_fact_type_id: "Merge_concerns_Commit".to_string(),
+                enum_global: false,
             }],
             consequent_universals: Vec::new(),
             unresolved_clauses: Vec::new(),

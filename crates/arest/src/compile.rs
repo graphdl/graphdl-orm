@@ -4755,11 +4755,26 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
                 Func::apply_to_all(role_value(entity_idx)),
                 Func::compose(Func::filter(lit_matches), ref_facts),
             );
-            // <<f1, H>, <f2, H>, ...> ; keep where t_val(f) ∈ H ; strip H.
+            // The source-fact value we membership-test against the haystack
+            // is the role matching the filter's ENTITY (`filt.entity_role`),
+            // NOT necessarily `target_idx`. For a count/sum aggregate the
+            // counted entity IS the target role, so these coincide. For an
+            // ENUM SUPERLATIVE the target role is the folded VALUE
+            // (`Task Priority`) while the filtered entity is a distinct role
+            // (`Task`); semi-joining on `target_idx` there would compare
+            // priority values against the entity haystack (a type mismatch
+            // that drops every fact). Resolve the entity's index on the
+            // SOURCE FT by name; fall back to `target_idx` when the source FT
+            // doesn't carry it (e.g. a synthesised join source).
+            let source_entity_idx = source_ft
+                .and_then(|ft| ft.roles.iter().find(|r| r.noun_name == filt.entity_role))
+                .map(|r| r.role_index)
+                .unwrap_or(target_idx);
+            // <<f1, H>, <f2, H>, ...> ; keep where entity_val(f) ∈ H ; strip H.
             let member_pred = Func::compose(
                 Func::HasMember,
                 Func::construction(vec![
-                    Func::compose(role_value(target_idx), Func::Selector(1)),
+                    Func::compose(role_value(source_entity_idx), Func::Selector(1)),
                     Func::Selector(2),
                 ]),
             );
@@ -4775,7 +4790,17 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
             )
         })
     };
-    let g_key = role_value(group_key_idx);
+    // task-recommendation cascade — GLOBAL group key. When `enum_global`,
+    // the fold runs over the WHOLE source set as ONE group: `g_key` is a
+    // constant, so `key_matches` (inner g_key == outer g_key) is always
+    // true and every source fact joins the single group. The extremum is
+    // then the population-wide winner. The anchor value is arbitrary (it is
+    // never projected — the global derived fact carries only the value).
+    let g_key = if agg.enum_global {
+        Func::constant(Object::atom("\u{1}global"))
+    } else {
+        role_value(group_key_idx)
+    };
     let t_val = role_value(target_idx);
 
     // Codd image-set: pair outer fact's group key with every inner fact.
@@ -4897,21 +4922,35 @@ fn compile_aggregate_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> C
     }
     };
 
-    // Derived fact: <derived_id, reading, <<group_key_role, key>, <agg_role, value>>>
-    let derive_with_context = Func::construction(vec![
-        Func::constant(Object::atom(&consequent_id)),
-        Func::constant(Object::atom(&consequent_reading)),
+    // Derived fact bindings. The non-global aggregate carries the group
+    // key plus the folded value:
+    //   <derived_id, reading, <<group_key_role, key>, <agg_role, value>>>
+    // The GLOBAL aggregate (task-recommendation cascade) has no per-subject
+    // group — its consequent is a SINGLETON marker FT whose sole role is the
+    // value type — so it carries ONLY the winning value:
+    //   <derived_id, reading, <<agg_role, value>>>
+    // (emitting a spurious `<group_key_role, anchor>` would corrupt the
+    // unary marker, since group_key_role == agg.role for a global super.)
+    let value_binding = Func::construction(vec![
+        Func::constant(Object::atom(&agg.role)),
+        agg_value,
+    ]);
+    let bindings = if agg.enum_global {
+        Func::construction(vec![value_binding])
+    } else {
         Func::construction(vec![
             Func::construction(vec![
                 Func::constant(Object::atom(&agg.group_key_role)),
                 // group key = g_key applied to outer fact (Selector(1))
                 Func::compose(g_key.clone(), Func::Selector(1)),
             ]),
-            Func::construction(vec![
-                Func::constant(Object::atom(&agg.role)),
-                agg_value,
-            ]),
-        ]),
+            value_binding,
+        ])
+    };
+    let derive_with_context = Func::construction(vec![
+        Func::constant(Object::atom(&consequent_id)),
+        Func::constant(Object::atom(&consequent_reading)),
+        bindings,
     ]);
 
     // Î±(derive_with_context) . DistR . [source_facts, source_facts]

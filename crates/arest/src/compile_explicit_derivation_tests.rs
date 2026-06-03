@@ -7913,3 +7913,247 @@ fn ss_autofill_create_path_indexes_rule_under_participating_nouns() {
     }
 }
 
+// ─── Task-recommendation priority cascade (user goal, RED first) ────
+//
+// USER GOAL: recommend from the HIGHEST priority that has pending
+// tasks — cascade p0→p1→p2→p3. A pending pX task is recommended iff NO
+// pending task has a higher priority (lower p-number). Keep the
+// 'pending' status guard.
+//
+// Population: pending p1 + pending p2, no p0 → ONLY the p1 task is
+// recommended (p2 excluded). Then add a pending p0 → ONLY the p0 task
+// is recommended (p1/p2 excluded).
+//
+// Compiles the whole readings the way `command.rs` does (single
+// positive `derivation:` stratum forward chain) so any helper rule the
+// cascade introduces (e.g. a derived "top pending priority") feeds
+// `Task_is_recommended` in the same fixpoint.
+fn recommended_tasks_for(src: &str, facts: &[(&str, &[(&str, &str)])]) -> Vec<String> {
+    let state = parse_to_state(src).expect("parse");
+    let defs = compile::compile_to_defs_state(&state);
+    let d = ast::defs_to_state(&defs, &state);
+
+    // Seed the population on top of the def-bearing state.
+    let mut pop = d.clone();
+    for (cell, pairs) in facts {
+        pop = ast::cell_push(cell, ast::fact_from_pairs(pairs), &pop);
+    }
+
+    // Single positive stratum, exactly like command.rs::collect_stratum.
+    let stratum: Vec<(String, Func)> = ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, contents)| (n.to_string(), ast::metacompose(contents, &d)))
+        .collect();
+    let refs: Vec<(&str, &Func)> = stratum.iter().map(|(n, f)| (n.as_str(), f)).collect();
+    let (post, _) = crate::evaluate::forward_chain_defs_state(&refs, &pop);
+
+    let cell = ast::fetch_or_phi("Task_is_recommended", &post);
+    match &cell {
+        Object::Seq(items) => items.iter()
+            .filter_map(|f| ast::binding(f, "Task").map(String::from)).collect(),
+        Object::Map(m) => m.values()
+            .filter_map(|f| ast::binding(f, "Task").map(String::from)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+// USER GOAL, now GREEN via a PURELY POSITIVE enum-superlative cascade
+// (no negation antecedent). The cascade "a pending pX is recommended
+// iff its priority is the highest among the pending tasks" is the
+// POSITIVE reading of "no pending task has a higher priority" (the
+// reverse reading is the same fact). It lowers to TWO positive rules:
+//
+//   (A) a GLOBAL enum-ordered superlative that derives the single top
+//       pending Task Priority value — `Task Priority is recommended iff
+//       some Task has the highest Task Priority among Tasks that have
+//       Task Status 'pending'`. This is the task-953 superlative with a
+//       GLOBAL (non-subject) group key: the min enum-rank is folded over
+//       the WHOLE pending population (one group), not per-subject, so it
+//       yields exactly one winning value. The "among … that have Task
+//       Status 'pending'" clause becomes an aggregate filter so only
+//       pending tasks contribute to the global max.
+//   (B) a positive equi-join that recommends every pending Task whose
+//       priority equals that derived global top — `Task is recommended
+//       iff Task has Task Status 'pending' and Task has Task Priority
+//       and Task Priority is recommended` (join on Task and on the
+//       shared Task Priority value).
+//
+// The GAP the old comment pinned (the superlative grouped by the
+// consequent subject `Task`, making each Task its own singleton group →
+// trivially highest-among-itself → every pending task fired) is closed
+// by the global group key in (A): one group over all pending tasks, so
+// the fold picks the population-wide top, and (B) re-joins it onto each
+// member. No `AbsenceOf`/negation antecedent is introduced.
+#[test]
+fn task_recommendation_cascades_to_highest_pending_priority() {
+    // Mirrors the apps/tasks schema surface: Task Priority enumerates
+    // p0..p3 (declaration order = urgency), Task Status enumerates the
+    // lifecycle states. UCs force Map storage like production.
+    // `Task Priority is recommended` is the unary singleton marker FT
+    // carrying the global top pending priority value (its sole role is
+    // the value type `Task Priority`).
+    let src = r#"# Task recommendation cascade (engine TDD)
+Task(.id) is an entity type.
+Task Priority is a value type.
+Task Status is a value type.
+Task Priority enumerates 'p0', 'p1', 'p2', 'p3'.
+Task Status enumerates 'pending', 'in_progress', 'blocked', 'completed', 'deleted'.
+
+## Fact Types
+Task has Task Priority.
+  Each Task has at most one Task Priority.
+Task has Task Status.
+  Each Task has at most one Task Status.
+Task Priority is recommended.
+Task is recommended.
+
+## Derivation Rules
+* Task Priority is recommended iff some Task has the highest Task Priority among Tasks that have Task Status 'pending'.
+* Task is recommended iff Task has Task Status 'pending' and Task has Task Priority and Task Priority is recommended.
+"#;
+
+    // Case 1: pending p1 + pending p2, NO p0 → only the p1 task.
+    let recs = recommended_tasks_for(src, &[
+        ("Task_has_Task_Priority", &[("Task", "t-p1"), ("Task Priority", "p1")]),
+        ("Task_has_Task_Status",   &[("Task", "t-p1"), ("Task Status", "pending")]),
+        ("Task_has_Task_Priority", &[("Task", "t-p2"), ("Task Priority", "p2")]),
+        ("Task_has_Task_Status",   &[("Task", "t-p2"), ("Task Status", "pending")]),
+    ]);
+    assert!(recs.contains(&"t-p1".to_string()),
+        "no-p0 case: pending p1 must be recommended; got {:?}", recs);
+    assert!(!recs.contains(&"t-p2".to_string()),
+        "no-p0 case: pending p2 must NOT be recommended (p1 outranks it); got {:?}", recs);
+
+    // Case 2: add a pending p0 → only the p0 task (p1/p2 excluded).
+    let recs2 = recommended_tasks_for(src, &[
+        ("Task_has_Task_Priority", &[("Task", "t-p0"), ("Task Priority", "p0")]),
+        ("Task_has_Task_Status",   &[("Task", "t-p0"), ("Task Status", "pending")]),
+        ("Task_has_Task_Priority", &[("Task", "t-p1"), ("Task Priority", "p1")]),
+        ("Task_has_Task_Status",   &[("Task", "t-p1"), ("Task Status", "pending")]),
+        ("Task_has_Task_Priority", &[("Task", "t-p2"), ("Task Priority", "p2")]),
+        ("Task_has_Task_Status",   &[("Task", "t-p2"), ("Task Status", "pending")]),
+    ]);
+    assert!(recs2.contains(&"t-p0".to_string()),
+        "p0-present case: pending p0 must be recommended; got {:?}", recs2);
+    assert!(!recs2.contains(&"t-p1".to_string()),
+        "p0-present case: pending p1 must NOT be recommended (p0 outranks it); got {:?}", recs2);
+    assert!(!recs2.contains(&"t-p2".to_string()),
+        "p0-present case: pending p2 must NOT be recommended (p0 outranks it); got {:?}", recs2);
+}
+
+// The global superlative must restrict its fold to the `among … that have
+// Task Status 'pending'` set: a NON-pending higher-priority task must NOT
+// raise the recommended ceiling (else the cascade would recommend nobody
+// when the population's overall top priority has no pending task). Mirrors
+// the apps/tasks production schema surface more closely (extra Owner /
+// blocks FTs present so Rule B's join-key inference is exercised against a
+// richer catalog, exactly like app.md).
+#[test]
+fn task_recommendation_global_superlative_respects_pending_filter() {
+    let src = r#"# Task recommendation cascade — pending filter
+Task(.id) is an entity type.
+Owner is a value type.
+Task Priority is a value type.
+Task Status is a value type.
+Task Priority enumerates 'p0', 'p1', 'p2', 'p3'.
+Task Status enumerates 'pending', 'in_progress', 'blocked', 'completed', 'deleted'.
+
+## Fact Types
+Task has Task Priority.
+  Each Task has at most one Task Priority.
+Task has Task Status.
+  Each Task has at most one Task Status.
+Task has Owner.
+Task blocks Task.
+Task Priority is recommended.
+Task is recommended.
+
+## Derivation Rules
+* Task Priority is recommended iff some Task has the highest Task Priority among Tasks that have Task Status 'pending'.
+* Task is recommended iff Task has Task Status 'pending' and Task has Task Priority and Task Priority is recommended.
+"#;
+
+    // A COMPLETED p0 exists, but the only PENDING tasks are p1 and p2. The
+    // pending-filtered global max is p1, so only the pending p1 fires; the
+    // completed p0 must NOT pull the ceiling up to p0 (which would recommend
+    // nobody, since no pending p0 exists).
+    let recs = recommended_tasks_for(src, &[
+        ("Task_has_Task_Priority", &[("Task", "done-p0"), ("Task Priority", "p0")]),
+        ("Task_has_Task_Status",   &[("Task", "done-p0"), ("Task Status", "completed")]),
+        ("Task_has_Task_Priority", &[("Task", "t-p1"), ("Task Priority", "p1")]),
+        ("Task_has_Task_Status",   &[("Task", "t-p1"), ("Task Status", "pending")]),
+        ("Task_has_Task_Priority", &[("Task", "t-p2"), ("Task Priority", "p2")]),
+        ("Task_has_Task_Status",   &[("Task", "t-p2"), ("Task Status", "pending")]),
+    ]);
+    assert!(recs.contains(&"t-p1".to_string()),
+        "pending p1 must be recommended (pending-max is p1); got {:?}", recs);
+    assert!(!recs.contains(&"t-p2".to_string()),
+        "pending p2 must NOT be recommended (p1 outranks it); got {:?}", recs);
+    assert!(!recs.contains(&"done-p0".to_string()),
+        "completed p0 must NOT be recommended (not pending); got {:?}", recs);
+}
+
+// Parse-level guard for the positive recommendation cascade against a
+// RICH catalog mirroring apps/tasks/readings/app.md (UCs, extra unary
+// Task FTs `is epic`/event facts, `Task touches Source File`, the
+// `Task blocks Task` ring). Pins the IR the two app.md rules lower to:
+// Rule A is a GLOBAL enum-superlative (op=min, enum_rank+enum_global,
+// `Task Status 'pending'` filter) with no unresolved clauses; Rule B is
+// a positive equi-join keyed on exactly `Task` + `Task Priority` (no
+// spurious join keys, no value-FT mis-detection from the larger catalog).
+#[test]
+fn task_recommendation_cascade_parses_against_app_surface() {
+    let src = r#"# app surface
+Task(.id) is an entity type.
+Source File(.path) is an entity type.
+Task Subject is a value type.
+Owner is a value type.
+Task Status is a value type.
+Task Priority is a value type.
+Task Priority enumerates 'p0', 'p1', 'p2', 'p3'.
+Task Status enumerates 'pending', 'in_progress', 'blocked', 'completed', 'deleted'.
+
+## Fact Types
+Task has Task Subject.
+  Each Task has exactly one Task Subject.
+Task has Task Status.
+  Each Task has exactly one Task Status.
+Task has Owner.
+  Each Task has at most one Owner.
+Task has Task Priority.
+  Each Task has at most one Task Priority.
+Task is epic.
+Task Priority is recommended.
+Task is recommended.
+Task is blocked.
+Task blocks Task.
+Task touches Source File.
+Task is started.
+Task is finished.
+
+## Derivation Rules
+* Task Priority is recommended iff some Task has the highest Task Priority among Tasks that have Task Status 'pending'.
+* Task is recommended iff Task has Task Status 'pending' and Task has Task Priority and Task Priority is recommended.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let data = compile::cell_index_from_state(&state);
+    let ra = data.derivation_rules.iter()
+        .find(|r| r.consequent_cell.literal_id() == "Task_Priority_is_recommended")
+        .expect("rule A (global superlative) must be present");
+    let rb = data.derivation_rules.iter()
+        .find(|r| r.consequent_cell.literal_id() == "Task_is_recommended")
+        .expect("rule B (equi-join) must be present");
+    let agg = ra.consequent_aggregates.first().expect("Rule A must carry an aggregate");
+    assert!(agg.enum_global, "Rule A aggregate must be a GLOBAL group (enum_global)");
+    assert!(agg.enum_rank, "Rule A aggregate must be enum-ranked");
+    assert_eq!(agg.op, "min", "highest → min enum rank");
+    assert_eq!(agg.filters.len(), 1, "the `among … that have Task Status 'pending'` clause must become a filter");
+    assert_eq!(agg.filters[0].filter_role, "Task Status");
+    assert_eq!(agg.filters[0].value, "pending");
+    assert!(ra.unresolved_clauses.is_empty(),
+        "Rule A must have no unresolved clauses; got {:?}", ra.unresolved_clauses);
+    assert_eq!(rb.join_on, vec!["Task".to_string(), "Task Priority".to_string()],
+        "Rule B must equi-join on exactly Task + Task Priority");
+    assert!(rb.unresolved_clauses.is_empty(),
+        "Rule B must have no unresolved clauses; got {:?}", rb.unresolved_clauses);
+}

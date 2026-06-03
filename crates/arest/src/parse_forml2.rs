@@ -178,6 +178,18 @@ fn expand_that_relatives(
             {
                 return false;
             }
+            // Don't expand a `that` that belongs to a superlative's
+            // restriction set (`… has the highest <V> among <Y>s that
+            // have <R> '<lit>'`). The `among … that …` clause is
+            // classified whole by `try_parse_superlative_among_clause`
+            // (the `that`-restriction becomes an aggregate filter); a
+            // premature ` and ` split here would shatter the among-set
+            // into a stray conjunction (`… among Ys and <lastNoun> have
+            // …`) and the superlative would lose its filter. Detect by an
+            // ` among ` earlier in the current clause segment.
+            if clause_seg.contains(" among ") {
+                return false;
+            }
             // Only expand when the head — text up to this marker —
             // resolves to a declared FT. Otherwise leave the clause
             // for downstream classifiers to handle whole.
@@ -2000,6 +2012,7 @@ fn resolve_derivation_rule(
                     // values, not enum ranks, and sources from one FT.
                     enum_rank: false,
                     join_fact_type_id: String::new(),
+                    enum_global: false,
                 });
             }
             continue;
@@ -2012,7 +2025,7 @@ fn resolve_derivation_rule(
         // The "among <Ys> …" set is the join of the GROUP FT (consequent
         // subject ⋈ entity, e.g. `Merge concerns Commit`) with the VALUE
         // FT (`Commit has Security Posture`) on the shared entity.
-        if let Some((op, entity_noun, value_type, _among_rest)) =
+        if let Some((op, entity_noun, value_type, among_rest)) =
             try_parse_superlative_among_clause(part, &noun_names)
         {
             // Value FT: the declared FT whose roles are exactly the
@@ -2021,6 +2034,88 @@ fn resolve_derivation_rule(
                 let has = |n: &str| ft.roles.iter().any(|r| r.noun_name == n);
                 ft.roles.len() == 2 && has(&entity_noun) && has(&value_type)
             }).map(|(id, _)| id.clone());
+
+            // GLOBAL superlative (task-recommendation cascade). When the
+            // consequent FT is a SINGLETON MARKER whose SOLE role is the
+            // value type itself (`Task Priority is recommended`), the
+            // superlative is NOT grouped per-subject — it folds the global
+            // extremum over the WHOLE `among <Ys> …` set and derives one
+            // winning value. The "among <Ys> that have <R> '<lit>'" tail
+            // becomes an aggregate FILTER so only qualifying members feed
+            // the global max (e.g. only pending Tasks). This is the
+            // positive reading of "no <Y> has a higher <V>"; a downstream
+            // positive equi-join re-attaches the winner to each member.
+            let consequent_ft = fact_types_map.get(rule.consequent_cell.literal_id());
+            let is_global_singleton = consequent_ft.map_or(false, |ft| {
+                ft.roles.len() == 1 && ft.roles[0].noun_name == value_type
+            });
+            if is_global_singleton {
+                if let Some(value_ft_id) = value_ft.clone() {
+                    // Parse the `among <Ys> that have <R> '<lit>'` filter.
+                    // `among_rest` looks like `Tasks that have Task Status
+                    // 'pending'`; the predicate after `that ` is a literal
+                    // restriction over the entity. Resolve it to a ref FT
+                    // and capture (entity_role, filter_role, value), exactly
+                    // as the numeric-aggregate filter handler does.
+                    let mut filters: Vec<crate::types::AggregateFilter> = Vec::new();
+                    let pred = among_rest
+                        .find(" that ")
+                        .map(|i| among_rest[i + " that ".len()..].trim().to_string());
+                    if let Some(pred) = pred {
+                        if let Some((without_lit, lit)) =
+                            strip_trailing_quoted_literal(pred.trim())
+                        {
+                            // Re-form a resolvable clause by prefixing the
+                            // entity noun (`Task have Task Status` → FT via
+                            // the role-set fallback in `resolve_fact_type`).
+                            let clause = alloc::format!("{} {}", entity_noun, without_lit);
+                            let (clause_stripped, _) =
+                                split_antecedent_comparator(&clause);
+                            if let Some(ref_id) = resolve_fact_type(&clause_stripped) {
+                                if let Some(ref_ft) = fact_types_map.get(&ref_id) {
+                                    let entity_role = ref_ft.roles.iter()
+                                        .find(|r| r.noun_name == entity_noun)
+                                        .map(|r| r.noun_name.clone());
+                                    let filter_role =
+                                        ref_ft.roles.last().map(|r| r.noun_name.clone());
+                                    if let (Some(entity_role), Some(filter_role)) =
+                                        (entity_role, filter_role)
+                                    {
+                                        if entity_role != filter_role {
+                                            filters.push(crate::types::AggregateFilter {
+                                                ref_fact_type_id: ref_id,
+                                                entity_role,
+                                                filter_role,
+                                                value: lit,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    aggregates.push(crate::types::ConsequentAggregate {
+                        role: value_type.clone(),
+                        op,
+                        target_role: value_type.clone(),
+                        source_fact_type_id: value_ft_id,
+                        // Group key role is informational here (the global
+                        // fold ignores it); keep the value type for shape.
+                        group_key_role: value_type.clone(),
+                        group_key_index: None,
+                        target_index: None,
+                        filters,
+                        enum_rank: true,
+                        join_fact_type_id: String::new(),
+                        enum_global: true,
+                    });
+                    continue;
+                }
+                // Singleton consequent but value FT undeclared — fall
+                // through to the unresolved channel below.
+                rule.unresolved_clauses.push(part.to_string());
+                continue;
+            }
 
             // Group key = the consequent subject noun (`Merge`).
             let group_key = find_nouns(consequent_text, &noun_names).first()
@@ -2059,6 +2154,7 @@ fn resolve_derivation_rule(
                         filters: Vec::new(),
                         enum_rank: true,
                         join_fact_type_id: join_ft.unwrap_or_default(),
+                        enum_global: false,
                     });
                     continue;
                 }
