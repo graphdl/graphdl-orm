@@ -255,6 +255,7 @@ fn translator_function_registry() -> hashbrown::HashMap<&'static str, Translator
     m.insert("translate_deontic_constraints",    translate_deontic_constraints   as TranslatorFn);
     m.insert("translate_derivation_rules",       translate_derivation_rules      as TranslatorFn);
     m.insert("translate_enum_values",            translate_enum_values           as TranslatorFn);
+    m.insert("translate_data_types",             translate_data_types            as TranslatorFn);
     m
 }
 
@@ -2022,6 +2023,7 @@ impl StatementTranslatorTable {
                 ("Partition Declaration".to_string(),      "translate_nouns".to_string()),
                 ("Partition Declaration".to_string(),      "translate_partitions".to_string()),
                 ("Enum Values Declaration".to_string(),    "translate_enum_values".to_string()),
+                ("Data Type Declaration".to_string(),      "translate_data_types".to_string()),
                 ("Instance Fact".to_string(),              "translate_instance_facts".to_string()),
                 ("Fact Type Reading".to_string(),          "translate_fact_types".to_string()),
                 ("Fact Type Reading".to_string(),          "translate_derivation_mode_facts".to_string()),
@@ -2278,6 +2280,10 @@ fn translate_nouns(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     // schema generator all read them from there.
     let mut ref_schemes: BTreeMap<String, String> = BTreeMap::new();
     let mut enum_values: BTreeMap<String, String> = BTreeMap::new();
+    // #279 P1: Conceptual Data Type code per value-type noun, absorbed
+    // onto the Noun cell as `conceptualDataType` (the same way enum
+    // values are absorbed as `enumValues`).
+    let mut data_types: BTreeMap<String, String> = BTreeMap::new();
     let mut super_types: BTreeMap<String, String> = BTreeMap::new();
     // task-964: nouns explicitly opted into auto-generated ids. A
     // `<Noun> has an auto-generated id.` reading sets the `autoId` Noun
@@ -2355,6 +2361,18 @@ fn translate_nouns(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
                 }
             }
         }
+
+        // Conceptual Data Type: `The data type of Price is decimal.`
+        // (#279 P1). Stage-1 overrides the Verb so this statement is
+        // classified as a Data Type Declaration; re-extract the code
+        // from the Text cell, exactly like the enum-values block above.
+        if classifications_contains(idx,stmt_id, "Data Type Declaration") {
+            if let Some(text) = statement_text(idx,stmt_id) {
+                if let Some(code) = extract_data_type(&text) {
+                    data_types.insert(head.clone(), code);
+                }
+            }
+        }
     }
     by_noun.into_iter().map(|(name, ot)| {
         let mut pairs: Vec<(&str, &str)> = vec![
@@ -2370,6 +2388,9 @@ fn translate_nouns(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
         }
         if let Some(ev) = enum_values.get(&name) {
             pairs.push(("enumValues", ev.as_str()));
+        }
+        if let Some(dt) = data_types.get(&name) {
+            pairs.push(("conceptualDataType", dt.as_str()));
         }
         if auto_ids.contains(&name) {
             pairs.push(("autoId", "true"));
@@ -3186,6 +3207,18 @@ fn extract_enum_values(text: &str) -> Option<String> {
         rest = &after[close + 1..];
     }
     if vals.is_empty() { None } else { Some(vals.join(",")) }
+}
+
+/// Extract the Conceptual Data Type code from a `The data type of
+/// <ValueType> is <code>.` statement (#279 P1). Returns the trailing
+/// `<code>` token (e.g. `decimal`). Mirrors the Stage-1 detector of the
+/// same name; both pipelines re-extract from the canonical Text so the
+/// translator never has to thread the code through a separate cell.
+fn extract_data_type(text: &str) -> Option<String> {
+    let body = text.trim().trim_end_matches('.').trim();
+    let rest = body.strip_prefix("The data type of ")?;
+    let code = rest.rsplit_once(" is ")?.1.trim();
+    (!code.is_empty()).then(|| code.to_string())
 }
 
 /// Translate `Subtype Declaration` classifications into `Subtype` cell
@@ -4384,6 +4417,36 @@ fn translate_enum_values(classified_state: &Object, idx: &StmtIndex) -> Vec<Obje
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         out.push(fact_from_pairs(&pairs_ref));
+    }
+    out
+}
+
+/// Translate `Data Type Declaration` classifications into `DataType`
+/// cell facts (#279 P1). Each statement contributes one fact with
+/// `noun` bound to the Head Noun (the value type) and `dataType` bound
+/// to the assigned Conceptual Data Type code — the same absorbed-binding
+/// shape `translate_nouns` reads to write `conceptualDataType` onto the
+/// Noun cell (mirrors the `enumValues` path).
+///
+/// The Value Type `Noun` fact is still emitted by `translate_nouns` from
+/// the preceding `Price is a value type.` statement — this translator
+/// only contributes the data-type assignment.
+fn translate_data_types(_classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
+    let table = StatementTranslatorTable::boot();
+    let kinds: Vec<&str> = table.kinds_for("translate_data_types");
+    let statement_ids = collect_statement_ids(idx);
+    let mut out: Vec<Object> = Vec::new();
+    for stmt_id in statement_ids.iter() {
+        if !kinds.iter().any(|k| classifications_contains(idx, stmt_id, k)) {
+            continue;
+        }
+        let Some(noun) = head_noun_for(idx,stmt_id) else { continue };
+        let Some(text) = statement_text(idx,stmt_id) else { continue };
+        let Some(code) = extract_data_type(&text) else { continue };
+        out.push(fact_from_pairs(&[
+            ("noun", noun.as_str()),
+            ("dataType", code.as_str()),
+        ]));
     }
     out
 }
@@ -5787,6 +5850,7 @@ fn parse_to_state_via_stage12_impl(
     let unresolved_instance_fact_facts = tt!("unresolved_if",
         translate_unresolved_instance_facts(&classified, &idx, &declared_ft_ids));
     let enum_values_facts = tt!("enum_values", translate_enum_values(&classified, &idx));
+    let data_type_facts = tt!("data_types", translate_data_types(&classified, &idx));
     if trace { crate::diag!("[s12] translators: {:?}", t_tr.elapsed()); }
     if trace { crate::diag!("[s12] TOTAL: {:?}", t0.elapsed()); }
 
@@ -5867,6 +5931,7 @@ fn parse_to_state_via_stage12_impl(
     map.insert("DerivationRule".to_string(), Object::Seq(derivation_facts.into()));
     map.insert("InstanceFact".to_string(), Object::Seq(instance_fact_facts.into()));
     map.insert("EnumValues".to_string(), Object::Seq(enum_values_facts.into()));
+    map.insert("DataType".to_string(), Object::Seq(data_type_facts.into()));
     map.insert("UnresolvedClause".to_string(), Object::Seq(unresolved_clause_facts.into()));
     map.insert("UnresolvedInstanceFact".to_string(), Object::Seq(unresolved_instance_fact_facts.into()));
     // #932 W4: these three groups are FT-image cells (RMAP images of
@@ -7444,6 +7509,108 @@ mod tests {
         assert_eq!(binding(f, "value0"), Some("low"));
         assert_eq!(binding(f, "value1"), Some("medium"));
         assert_eq!(binding(f, "value2"), Some("high"));
+    }
+
+    #[test]
+    fn data_type_declaration_is_classified() {
+        // P1 #279: `The data type of <ValueType> is <code>.` mirrors the
+        // enum-values declaration — a leading-phrase form whose Verb is
+        // overridden in Stage-1 so the grammar's Data Type Declaration
+        // recognizer (keyed on Verb = 'the data type of') fires.
+        let stmt = stage1_state(
+            "s1", "The data type of Price is decimal.", &["Price"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let kinds = classifications_for(&idx(&classified),"s1");
+        assert!(kinds.iter().any(|k| k == "Data Type Declaration"),
+            "expected Data Type Declaration; got {:?}", kinds);
+    }
+
+    #[test]
+    fn translate_data_types_emits_data_type_for_noun() {
+        let stmt = stage1_state(
+            "s1", "The data type of Price is decimal.", &["Price"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let facts = super::translate_data_types(&classified, &idx(&classified));
+        assert_eq!(facts.len(), 1);
+        let f = &facts[0];
+        assert_eq!(binding(f, "noun"), Some("Price"));
+        assert_eq!(binding(f, "dataType"), Some("decimal"));
+    }
+
+    /// End-to-end (#279 P1): a value type carrying a data-type assignment
+    /// parses so the absorbed `conceptualDataType` binding lands on the
+    /// Noun cell (same absorption shape as `enumValues` / `objectType`).
+    #[test]
+    fn data_type_assignment_absorbs_onto_noun_cell() {
+        let state = super::parse_to_state_via_stage12(
+            "Price is a value type.\n\
+             The data type of Price is decimal.\n"
+        ).expect("parse_to_state_via_stage12");
+        // The standalone DataType cell carries the (noun, dataType) fact.
+        let dt_cell = fetch_or_phi("DataType", &state);
+        let dt = dt_cell.as_seq().expect("DataType cell").iter()
+            .find(|f| binding(f, "noun") == Some("Price"))
+            .expect("Price DataType fact");
+        assert_eq!(binding(dt, "dataType"), Some("decimal"));
+        // …and it is absorbed onto the Noun cell as conceptualDataType.
+        let noun_cell = fetch_or_phi("Noun", &state);
+        let price = noun_cell.as_seq().expect("Noun cell").iter()
+            .find(|f| binding(f, "name") == Some("Price"))
+            .expect("Price noun fact");
+        assert_eq!(binding(price, "objectType"), Some("value"),
+            "Price is still declared a value type");
+        assert_eq!(binding(price, "conceptualDataType"), Some("decimal"));
+    }
+
+    /// Backward-compat (#279 P1): an untyped value type keeps working and
+    /// carries no `conceptualDataType` binding.
+    #[test]
+    fn value_type_without_data_type_has_no_conceptual_data_type() {
+        let state = super::parse_to_state_via_stage12(
+            "Nickname is a value type.\n"
+        ).expect("parse_to_state_via_stage12");
+        let noun_cell = fetch_or_phi("Noun", &state);
+        let nick = noun_cell.as_seq().expect("Noun cell").iter()
+            .find(|f| binding(f, "name") == Some("Nickname"))
+            .expect("Nickname noun fact");
+        assert_eq!(binding(nick, "conceptualDataType"), None);
+    }
+
+    /// Catalog sanity (#279 P1): the Conceptual Data Type membership
+    /// facts parse into InstanceFacts with the expected (subject, group)
+    /// bindings. Drives the same `is in` fact type + leaf instance fact
+    /// the metamodel (core.md) declares, in a self-contained snippet so
+    /// the test doesn't depend on the full core.md load order.
+    #[test]
+    fn conceptual_data_type_catalog_membership_parses() {
+        let state = super::parse_to_state_via_stage12(
+            "Conceptual Data Type(.code) is an entity type.\n\
+             Data Type Group(.code) is an entity type.\n\
+             Conceptual Data Type is in Data Type Group.\n\
+             Conceptual Data Type 'integer' is in Data Type Group 'numeric'.\n"
+        ).expect("parse_to_state_via_stage12");
+        let if_cell = fetch_or_phi("InstanceFact", &state);
+        let membership = if_cell.as_seq().expect("InstanceFact cell").iter()
+            .find(|f| binding(f, "subjectNoun") == Some("Conceptual Data Type")
+                   && binding(f, "subjectValue") == Some("integer"))
+            .expect("integer membership fact");
+        assert_eq!(binding(membership, "objectNoun"), Some("Data Type Group"));
+        assert_eq!(binding(membership, "objectValue"), Some("numeric"));
+    }
+
+    /// The bundled metamodel text (core.md) must declare the catalog so a
+    /// rename of a leaf code is caught here (mirrors the state.md /
+    /// derivation.md "file must contain" pins).
+    #[test]
+    fn core_md_declares_conceptual_data_type_catalog() {
+        let core = include_str!("../../../readings/core/core.md");
+        assert!(core.contains("Conceptual Data Type(.code) is an entity type."),
+            "core.md must declare the Conceptual Data Type entity type");
+        assert!(core.contains("Noun has Conceptual Data Type."),
+            "core.md must declare the Noun has Conceptual Data Type fact type");
+        assert!(core.contains(
+            "Conceptual Data Type 'integer' is in Data Type Group 'numeric'."),
+            "core.md must declare the integer→numeric membership");
     }
 
     #[test]
@@ -10255,14 +10422,16 @@ mod tests {
         // Per AREST.tex §3: registered translators span every kind
         // declared by the grammar's classification vocabulary. The
         // boot table is the Rust-side fallback, so it must enumerate
-        // the same 20 classifications the grammar declares (19
-        // structural + Fact Type Reading).
+        // the same 21 classifications the grammar declares (20
+        // structural + Fact Type Reading; #279 added Data Type
+        // Declaration).
         let table = super::StatementTranslatorTable::boot();
         let kinds = table.kinds();
         let expected = [
             "Entity Type Declaration", "Value Type Declaration",
             "Subtype Declaration", "Abstract Declaration",
             "Partition Declaration", "Enum Values Declaration",
+            "Data Type Declaration",
             "Instance Fact", "Fact Type Reading", "Derivation Rule",
             "Uniqueness Constraint", "Mandatory Role Constraint",
             "Frequency Constraint", "Ring Constraint", "Subset Constraint",
@@ -10338,8 +10507,8 @@ mod tests {
             Object::Map(m.into())
         };
         let table = super::StatementTranslatorTable::from_grammar_state(&state);
-        // boot has all 20 kinds; empty cell would have 0.
-        assert_eq!(table.kinds().len(), 20);
+        // boot has all 21 kinds; empty cell would have 0.
+        assert_eq!(table.kinds().len(), 21);
     }
 
     #[test]

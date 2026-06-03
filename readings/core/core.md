@@ -625,6 +625,8 @@ Facet(.id) is an entity type.
 Value(.id) is an entity type.
 Unit(.Name) is an entity type.
 Dimension(.Name) is an entity type.
+Conceptual Data Type(.code) is an entity type.
+Data Type Group(.code) is an entity type.
 Textual Constraint is a subtype of Constraint.
 
 ### Value types
@@ -689,6 +691,15 @@ Noun has Alias.
 Fact Type has Alias.
   It is possible that more than one Fact Type has the same Alias.
 
+Data Type Group has Name.
+  Each Data Type Group has exactly one Name.
+
+Conceptual Data Type is in Data Type Group.
+  Each Conceptual Data Type is in exactly one Data Type Group.
+
+Noun has Conceptual Data Type.
+  Each Noun has at most one Conceptual Data Type.
+
 ## Instance Facts
 
 ### Constraint Types
@@ -709,6 +720,58 @@ Constraint Type 'IT' has Name 'Intransitive'.
 Constraint Type 'TR' has Name 'Transitive'.
 Constraint Type 'AC' has Name 'Acyclic'.
 Constraint Type 'VC' has Name 'ValueComparison'.
+
+### Conceptual Data Types (#279)
+
+NORMA's portable data-type catalog. Each leaf Conceptual Data Type is
+classified into exactly one of eight Data Type Groups (text, numeric,
+temporal, logical, raw, other, unspecified, userDefined). The `is in`
+facts below are the single source of truth for both the leaf codes and
+the group membership; the Data Type Group entities are populated by the
+group codes those facts reference (no separate Name is carried in P1).
+A value type opts into a data type with `The data type of <ValueType>
+is <code>.`, which absorbs `conceptualDataType` onto the Noun cell.
+
+Data Type Group 'text' has Name 'Text'.
+Data Type Group 'numeric' has Name 'Numeric'.
+Data Type Group 'temporal' has Name 'Temporal'.
+Data Type Group 'logical' has Name 'Logical'.
+Data Type Group 'raw' has Name 'Raw'.
+Data Type Group 'other' has Name 'Other'.
+Data Type Group 'unspecified' has Name 'Unspecified'.
+Data Type Group 'userDefined' has Name 'User Defined'.
+
+Conceptual Data Type 'text' is in Data Type Group 'text'.
+Conceptual Data Type 'fixedText' is in Data Type Group 'text'.
+Conceptual Data Type 'largeText' is in Data Type Group 'text'.
+Conceptual Data Type 'smallInteger' is in Data Type Group 'numeric'.
+Conceptual Data Type 'integer' is in Data Type Group 'numeric'.
+Conceptual Data Type 'largeInteger' is in Data Type Group 'numeric'.
+Conceptual Data Type 'unsignedTiny' is in Data Type Group 'numeric'.
+Conceptual Data Type 'unsignedSmall' is in Data Type Group 'numeric'.
+Conceptual Data Type 'unsigned' is in Data Type Group 'numeric'.
+Conceptual Data Type 'unsignedLarge' is in Data Type Group 'numeric'.
+Conceptual Data Type 'autoCounter' is in Data Type Group 'numeric'.
+Conceptual Data Type 'singleFloat' is in Data Type Group 'numeric'.
+Conceptual Data Type 'doubleFloat' is in Data Type Group 'numeric'.
+Conceptual Data Type 'decimal' is in Data Type Group 'numeric'.
+Conceptual Data Type 'money' is in Data Type Group 'numeric'.
+Conceptual Data Type 'uuid' is in Data Type Group 'numeric'.
+Conceptual Data Type 'date' is in Data Type Group 'temporal'.
+Conceptual Data Type 'time' is in Data Type Group 'temporal'.
+Conceptual Data Type 'dateTime' is in Data Type Group 'temporal'.
+Conceptual Data Type 'autoTimestamp' is in Data Type Group 'temporal'.
+Conceptual Data Type 'boolean' is in Data Type Group 'logical'.
+Conceptual Data Type 'yesNo' is in Data Type Group 'logical'.
+Conceptual Data Type 'fixedRaw' is in Data Type Group 'raw'.
+Conceptual Data Type 'raw' is in Data Type Group 'raw'.
+Conceptual Data Type 'largeRaw' is in Data Type Group 'raw'.
+Conceptual Data Type 'picture' is in Data Type Group 'raw'.
+Conceptual Data Type 'oleObject' is in Data Type Group 'raw'.
+Conceptual Data Type 'rowId' is in Data Type Group 'other'.
+Conceptual Data Type 'objectId' is in Data Type Group 'other'.
+Conceptual Data Type 'unspecified' is in Data Type Group 'unspecified'.
+Conceptual Data Type 'userDefined' is in Data Type Group 'userDefined'.
 
 ### Constraint Kinds (#747)
 

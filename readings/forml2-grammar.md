@@ -162,6 +162,7 @@ Classification 'Abstract Declaration' has Translator 'translate_nouns'.
 Classification 'Partition Declaration' has Translator 'translate_nouns'.
 Classification 'Partition Declaration' has Translator 'translate_partitions'.
 Classification 'Enum Values Declaration' has Translator 'translate_enum_values'.
+Classification 'Data Type Declaration' has Translator 'translate_data_types'.
 Classification 'Instance Fact' has Translator 'translate_instance_facts'.
 Classification 'Fact Type Reading' has Translator 'translate_fact_types'.
 Classification 'Fact Type Reading' has Translator 'translate_derivation_mode_facts'.
@@ -186,6 +187,7 @@ Classification 'Subtype Declaration' is a Classification.
 Classification 'Partition Declaration' is a Classification.
 Classification 'Abstract Declaration' is a Classification.
 Classification 'Enum Values Declaration' is a Classification.
+Classification 'Data Type Declaration' is a Classification.
 Classification 'Fact Type Reading' is a Classification.
 Classification 'Unary Fact Type Reading' is a Classification.
 Classification 'Derivation Rule' is a Classification.
@@ -226,6 +228,12 @@ Statement has Classification 'Abstract Declaration' iff Statement has Trailing M
      values of' so this classifier fires identically. There is no separate
      classifier rule for the shorthand. -->
 Statement has Classification 'Enum Values Declaration' iff Statement has Verb 'the possible values of'.
+
+<!-- #279 P1: `The data type of <ValueType> is <code>.` assigns a portable
+     Conceptual Data Type to a value type. Stage-1 recognises the leading
+     phrase and overrides Verb to 'the data type of' (mirroring the enum
+     declaration's Verb override), so this single recognizer fires. -->
+Statement has Classification 'Data Type Declaration' iff Statement has Verb 'the data type of'.
 
 Statement has Classification 'Derivation Rule' iff Statement has Keyword 'iff'.
 Statement has Classification 'Derivation Rule' iff Statement has Keyword 'if'.

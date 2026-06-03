@@ -357,6 +357,16 @@ pub fn tokenize_statement_with_buckets_vocab(
         verb = Some("the possible values of".to_string());
     }
 
+    // 6b. Conceptual Data Type leading-phrase override (#279 P1).
+    //     `The data type of <ValueType> is <code>.` — like the enum form
+    //     above, the signalling phrase sits BEFORE the noun, so override
+    //     Verb to 'the data type of' to let the grammar's Data Type
+    //     Declaration recognizer fire. The code itself is re-extracted in
+    //     Stage-2 from the Statement's Text cell.
+    if extract_data_type(body).is_some() {
+        verb = Some("the data type of".to_string());
+    }
+
     // --- Statement cell ---
     push(&mut cells, "Statement", fact_from_pairs(&[
         ("id", statement_id), ("name", statement_id),
@@ -898,6 +908,18 @@ fn extract_enum_values(body: &str) -> Option<Vec<String>> {
             .map(String::from))
         .collect();
     (!values.is_empty()).then_some(values)
+}
+
+/// Recognise `The data type of <ValueType> is <code>.` and return the
+/// trailing `<code>` (the Conceptual Data Type code, e.g. `decimal`).
+/// Returns `None` for any other shape. Mirrors `extract_enum_values`'s
+/// role as a Stage-1 leading-phrase detector; the call site uses the
+/// `Some` result only to override Verb (Stage-2 re-extracts the code
+/// from the Text cell, just like the enum-values path).
+fn extract_data_type(body: &str) -> Option<String> {
+    let rest = body.strip_prefix("The data type of ")?;
+    let code = rest.rsplit_once(" is ")?.1.trim();
+    (!code.is_empty()).then(|| code.to_string())
 }
 
 fn extract_trailing_marker(text: &str, refs: &[RoleRef], vocab: &Vocab) -> Option<String> {
