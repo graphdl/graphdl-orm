@@ -1148,6 +1148,11 @@ pub fn main_entry() {
                     |merged, (name, text)| {
                         let this = parse_forml2::parse_to_state_from(text, &merged)
                             .unwrap_or_else(|e| { eprintln!("{}: {}", name, e); std::process::exit(1); });
+                        // ns-3: stamp this slice's declared Functions with its file
+                        // domain (the reading name) — same per-file binding as
+                        // metamodel_state(). Flows into `state` at the Pass-2 assembly
+                        // below, so dirs-compiled apps carry per-file domains.
+                        let this = ast::merge_states(&this, &ast::stamp_file_domain(&this, name));
                         ast::merge_states(&merged, &this)
                     },
                 );
