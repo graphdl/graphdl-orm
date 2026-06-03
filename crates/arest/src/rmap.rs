@@ -441,11 +441,30 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
             match c.kind.as_str() {
                 "UC" => {
                     c.spans.iter().for_each(|span| { ucs.entry(span.fact_type_id.clone()).or_default(); });
-                    let roles: Vec<usize> = c.spans.iter().map(|s| s.role_index).collect();
+                    // Roles this UC spans inside its OWNING fact type, with
+                    // identical-role duplicates collapsed. The parser's
+                    // `enrich_constraints_with_spans` mirrors a single-role
+                    // UC's span0 into span1 (the "legacy quirk"), so a real
+                    // parse yields `spans == [(ft,r),(ft,r)]`. Without this
+                    // dedup the arity test below (`uc.len() >= 2`) misreads
+                    // that single-role (functional) UC as a COMPOUND one and
+                    // routes the fact to its own junction table instead of
+                    // absorbing it as a column — contra Halpin §10.3 rule 2
+                    // (a functional role / simple UC absorbs into the entity
+                    // table). This mirrors `compile::resolve_key_roles_for_ft`,
+                    // which already dedups identical spans for the same reason.
                     c.spans.first()
-                        .map(|s| &s.fact_type_id)
+                        .map(|s| s.fact_type_id.clone())
                         .into_iter()
-                        .for_each(|ft_id| { ucs.entry(ft_id.clone()).or_default().push(roles.clone()); });
+                        .for_each(|ft_id| {
+                            let mut roles: Vec<usize> = c.spans.iter()
+                                .filter(|s| s.fact_type_id == ft_id)
+                                .map(|s| s.role_index)
+                                .collect();
+                            roles.sort_unstable();
+                            roles.dedup();
+                            ucs.entry(ft_id).or_default().push(roles);
+                        });
                 }
                 "MC" => {
                     mc.extend(c.spans.iter().map(|s| format!("{}:{}", s.fact_type_id, s.role_index)));
@@ -837,13 +856,22 @@ pub fn rmap_cell_map(state: &crate::ast::Object) -> HashMap<String, String> {
     let mut map = HashMap::new();
     let noun_name_set: HashSet<String> = nouns.keys().cloned().collect();
 
-    // Index UCs by fact type (same as RMAP step classification)
+    // Index UCs by fact type (same as RMAP step classification).
+    // Collapse identical-role duplicates so the parser's single-role-UC
+    // span mirror (`enrich_constraints_with_spans` pushes span0 == span1)
+    // is not misread as a compound UC by the `uc.len() >= 2` test below —
+    // the same dedup `rmap()` and `compile::resolve_key_roles_for_ft` apply.
     let ucs_by_ft: HashMap<String, Vec<Vec<usize>>> = constraints.iter()
         .filter(|c| c.kind == "UC")
         .fold(HashMap::new(), |mut acc, c| {
-            let roles: Vec<usize> = c.spans.iter().map(|s| s.role_index).collect();
-            c.spans.first().into_iter().for_each(|s| {
-                acc.entry(s.fact_type_id.clone()).or_default().push(roles.clone());
+            c.spans.first().map(|s| s.fact_type_id.clone()).into_iter().for_each(|ft_id| {
+                let mut roles: Vec<usize> = c.spans.iter()
+                    .filter(|s| s.fact_type_id == ft_id)
+                    .map(|s| s.role_index)
+                    .collect();
+                roles.sort_unstable();
+                roles.dedup();
+                acc.entry(ft_id).or_default().push(roles);
             });
             acc
         });
@@ -1165,6 +1193,53 @@ mod tests {
     use super::*;
     use crate::ast::{self, Object, fact_from_pairs};
     use crate::types::*;
+
+    /// RED (bug repro through the PARSER): a single-role functional
+    /// value attribute MUST absorb as a COLUMN on the entity's table
+    /// (Halpin §10.3 rule 2 / Fig 10.11 horse example: `Horse(horseName,
+    /// sex, weight)`), NOT become a junction table.
+    ///
+    /// The rmap/sql unit tests above all hand-build the Constraint cell
+    /// with a single span, bypassing the parser. The parser's
+    /// `enrich_constraints_with_spans` MIRRORS span0 into span1 for
+    /// single-role UC/MC (the "legacy quirk"), so a real parse yields a
+    /// UC with `spans == [(ft,0),(ft,0)]`. rmap then classifies any UC
+    /// with `spans.len() >= 2` as COMPOUND and routes the fact to its
+    /// own (junction) table. This test goes through the parser to pin
+    /// the canonical column-absorption result.
+    #[test]
+    fn parser_path_single_role_uc_value_absorbs_as_column_not_junction() {
+        let src = "\
+            Product(.code) is an entity type.\n\
+            Quantity is a value type.\n\
+            \n\
+            ## Fact Types\n\
+            Product has Quantity.\n\
+            \n\
+            ## Constraints\n\
+            Each Product has at most one Quantity.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let tables = rmap(&state);
+        let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+
+        // No junction table for an absorbed functional value attribute.
+        assert!(!names.iter().any(|n| n.contains("product_has_quantity")
+                || (n.contains("product") && n.contains("quantity"))),
+            "single-role UC value attribute must NOT produce a junction table; got tables {:?}",
+            names);
+
+        // Product table carries an absorbed `quantity` column.
+        let product = tables.iter().find(|t| t.name == "product")
+            .unwrap_or_else(|| panic!("expected a `product` table; got {:?}", names));
+        assert!(product.columns.iter().any(|c| c.name == "quantity"),
+            "Product must absorb a `quantity` column (Halpin §10.3 rule 2); got columns {:?}",
+            product.columns.iter().map(|c| &c.name).collect::<Vec<_>>());
+        // Value type => no FK reference.
+        let q = product.columns.iter().find(|c| c.name == "quantity").unwrap();
+        assert!(q.references.is_none(), "value attribute column must not be a FK");
+    }
 
     /// Build Object state for rmap input. Emits Noun, FactType, Role,
     /// Constraint cells directly — no Domain intermediate (#211).
