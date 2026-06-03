@@ -1063,7 +1063,7 @@ fn assert_fact_via_defs(
 ///
 /// Deterministic per (noun, state); platform-independent (no
 /// `SystemTime` so the function compiles on wasm32 / no_std).
-fn auto_generate_entity_id(noun: &str, state: &ast::Object) -> String {
+fn auto_generate_entity_id(noun: &str, state: &ast::Object, d: &ast::Object) -> String {
     // Distinct entity-role values for this noun across all FT cells.
     // A fact's "entity-id" for noun N is the value of any role binding
     // whose role name matches N. This mirrors `platform_list_noun`'s
@@ -1100,6 +1100,11 @@ fn auto_generate_entity_id(noun: &str, state: &ast::Object) -> String {
     // collision guard below bumps past any duplicate.
     let mut task_n_max: Option<u64> = None;
     let mut int_max: Option<u64> = None;
+    // task-P3a: collect the bare-integer id atoms so the next bare id is
+    // computed by the pure Backus-FP `gen:autocounter` reduction
+    // (`max + 1`) rather than imperatively. The prefixed-`N` bucket
+    // (`task_n_max`) and the scheme selection below are unchanged.
+    let mut int_atoms: Vec<ast::Object> = Vec::new();
     for val in seen.iter() {
         if let Some(suffix) = val.strip_prefix(&prefix_dash) {
             if let Ok(n) = suffix.parse::<u64>() {
@@ -1109,8 +1114,29 @@ fn auto_generate_entity_id(noun: &str, state: &ast::Object) -> String {
         }
         if let Ok(n) = val.parse::<u64>() {
             int_max = Some(int_max.map_or(n, |m| m.max(n)));
+            int_atoms.push(ast::Object::atom(val));
         }
     }
+
+    // task-P3a: next bare-integer id as the canonical FFP reduction
+    // `+ ∘ [ /max ∘ apndl ∘ [0̄, ids] , 1̄ ]` (`gen:autocounter`, see
+    // `ast::gen_autocounter` and its registration in
+    // `compile_to_defs_state`). Reproduces the imperative `int_max + 1`
+    // exactly: `/max` over the existing bare-int atoms is `int_max`, plus
+    // one. Only used in the bare-integer arms of the scheme match; the
+    // prefixed-`N` and collision-bump paths stay integer-arithmetic.
+    // Falls back to `int_max + 1` if the def is unreachable (no compiled
+    // DEFS in `d`) so bypass call sites that pass a bare state still work.
+    let next_int_via_ffp = |fallback: u64| -> String {
+        ast::apply(
+            &ast::Func::Def("gen:autocounter".to_string()),
+            &ast::Object::seq(int_atoms.clone()),
+            d,
+        )
+        .as_atom()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{}", fallback))
+    };
 
     // Empty cell — bootstrap with the prefix scheme (preserves the
     // legacy `task-1` convention for backward compat with #867).
@@ -1128,8 +1154,8 @@ fn auto_generate_entity_id(noun: &str, state: &ast::Object) -> String {
     let mut candidate = match (task_n_max, int_max) {
         (None, None) => format!("{prefix}-1"),
         (Some(t), None) => format!("{prefix}-{}", t + 1),
-        (None, Some(i)) => format!("{}", i + 1),
-        (Some(t), Some(i)) if i > t => format!("{}", i + 1),
+        (None, Some(i)) => next_int_via_ffp(i + 1),
+        (Some(t), Some(i)) if i > t => next_int_via_ffp(i + 1),
         (Some(t), Some(i)) => {
             // Tie or prefix dominates: bump above the global max
             // (so the new id can never collide with either bucket).
@@ -1362,7 +1388,7 @@ fn create_via_defs(
                 state: ast::Object::phi(),
             };
         }
-        auto_generate_entity_id(noun, state)
+        auto_generate_entity_id(noun, state, d)
     } else {
         entity_id
     };
@@ -6077,10 +6103,22 @@ Resource is mirroring Status.
     /// Preserves the legacy default established under #867 so existing
     /// downstream consumers (UI listings, hash-of-pop snapshots, audit
     /// summaries) still see the same first id.
+    /// `d` carrying the registered `gen:autocounter` def, so these
+    /// direct-call tests exercise the real FFP `max+1` path (not the
+    /// fallback). Mirrors the production `d` (compiled DEFS overlaid on
+    /// state) at the bare-integer arms of the scheme match.
+    fn autocounter_defs(state: &ast::Object) -> ast::Object {
+        ast::defs_to_state(
+            &[("gen:autocounter".to_string(), ast::gen_autocounter())],
+            state,
+        )
+    }
+
     #[test]
     fn auto_increment_id_empty_state_returns_task_1() {
         let state = ast::Object::phi();
-        let id = super::auto_generate_entity_id("Task", &state);
+        let d = autocounter_defs(&state);
+        let id = super::auto_generate_entity_id("Task", &state, &d);
         assert_eq!(id, "task-1",
             "empty cell must seed with the prefix scheme; got {id:?}");
     }
@@ -6096,7 +6134,8 @@ Resource is mirroring Status.
             ast::fact_from_pairs(&[("Task", "999"), ("Task Status", "pending")]),
             &state);
 
-        let id = super::auto_generate_entity_id("Task", &state);
+        let d = autocounter_defs(&state);
+        let id = super::auto_generate_entity_id("Task", &state, &d);
         // Bare-integer scheme dominates → expect bare integer 1000.
         assert_eq!(id, "1000",
             "single bare-integer id 999 → next must be 1000; got {id:?}");
@@ -6125,7 +6164,8 @@ Resource is mirroring Status.
             ast::fact_from_pairs(&[("Task", "task-3"), ("Task Status", "pending")]),
             &state);
 
-        let id = super::auto_generate_entity_id("Task", &state);
+        let d = autocounter_defs(&state);
+        let id = super::auto_generate_entity_id("Task", &state, &d);
         assert_eq!(id, "task-6",
             "task-1/task-3/task-5 → max=5, next must be task-6; got {id:?}");
     }
@@ -6145,7 +6185,8 @@ Resource is mirroring Status.
             ast::fact_from_pairs(&[("Task", "916"), ("Task Status", "pending")]),
             &state);
 
-        let id = super::auto_generate_entity_id("Task", &state);
+        let d = autocounter_defs(&state);
+        let id = super::auto_generate_entity_id("Task", &state, &d);
         // Bare-integer 916 strictly dominates task-3 → next is 917.
         assert_eq!(id, "917",
             "task-3 + bare 916 → bare-int dominant, next must be 917; got {id:?}");
@@ -6168,9 +6209,45 @@ Resource is mirroring Status.
             ast::fact_from_pairs(&[("Task", "10"), ("Task Status", "pending")]),
             &state);
 
-        let id = super::auto_generate_entity_id("Task", &state);
+        let d = autocounter_defs(&state);
+        let id = super::auto_generate_entity_id("Task", &state, &d);
         assert_eq!(id, "task-51",
             "task-50 dominates bare 10 → task-51; got {id:?}");
+    }
+
+    /// task-P3a: the bare-integer next-id comes from the registered
+    /// `gen:autocounter` FFP def reachable in a *compiled* `d`, not just
+    /// a hand-built one. Compiles a real model (so `compile_to_defs_state`
+    /// seeds `gen:autocounter`), then drives the bare-int-dominant arm and
+    /// asserts the canonical `max+1`. Guards that step-3 registration and
+    /// step-3 wiring agree end-to-end.
+    #[test]
+    fn auto_increment_bare_int_uses_registered_gen_autocounter_def() {
+        let src = "\
+            Task(.id) is an entity type.\n\
+            Task has an auto-generated id.\n\
+            Task Status is a value type.\n\
+            Task has Task Status.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_map = ast::defs_to_state(&defs, &state);
+        // The compiled DEFS must carry the generator def.
+        assert_ne!(ast::fetch("gen:autocounter", &def_map), ast::Object::Bottom,
+            "compile_to_defs_state must register gen:autocounter");
+
+        // Populate a bare-integer-dominant population: <482, 497>.
+        let ft_id = "Task has Task Status";
+        let mut pop = state.clone();
+        pop = ast::cell_push(ft_id,
+            ast::fact_from_pairs(&[("Task", "482"), ("Task Status", "pending")]), &pop);
+        pop = ast::cell_push(ft_id,
+            ast::fact_from_pairs(&[("Task", "497"), ("Task Status", "pending")]), &pop);
+
+        let id = super::auto_generate_entity_id("Task", &pop, &def_map);
+        assert_eq!(id, "498",
+            "bare-int <482,497> via registered gen:autocounter must be 498; got {id:?}");
     }
 
     /// task-735 (acceptance 1, integration): assert `id='999'`

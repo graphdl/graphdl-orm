@@ -3561,6 +3561,14 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         ));
     }
 
+    // Identity generators (Conceptual Data Type, P3a). `gen:autocounter`
+    // is the pure Backus-FP "next integer id" reduction
+    // `+ ∘ [ /max ∘ apndl ∘ [0̄, ids] , 1̄ ]` (see `ast::gen_autocounter`).
+    // Model-independent, so it is registered unconditionally; the create
+    // path resolves it by name (`Func::Def("gen:autocounter")`) to compute
+    // the next bare-integer id from the noun's existing numeric ids.
+    defs.push(("gen:autocounter".to_string(), crate::ast::gen_autocounter()));
+
     // Algebraic rewrite pass (Backus Â§12). Normalize every emitted Func
     // to its smallest equivalent form before it enters D. Rewrites are
     // observational equivalences, so runtime semantics are unchanged;

@@ -6330,6 +6330,51 @@ fn register_theta1_into(defs: &mut Vec<(String, Func)>) {
     defs.push(("compose_rel".to_string(), Func::Platform("compose_rel".to_string())));
 }
 
+// ── Identity generators (Conceptual Data Type, P3a) ─────────────────
+//
+// `gen:autocounter` — the canonical Backus reduction for "next integer
+// id". Takes a Seq of the noun's existing numeric id atoms and returns
+// the next id (max + 1; the empty Seq yields "1"). It is the pure FFP
+// program
+//
+//   + ∘ [ /max ∘ apndl ∘ [0̄, ids] , 1̄ ]
+//
+// where `max:<a,b> = (a ≥ b → a ; b)` and `/max` is Backus's right
+// insert. The seed `apndl:[0̄, ids]` prepends a `0` so `/max` always has
+// a base element — `max` has no unit in `unit_of`, so `/max:<>` would be
+// ⊥; with the seed `/max:<0> = 0` and the empty population correctly
+// yields `+:<0,1> = 1`. `Ge`/`Add` parse atom operands as numbers (see
+// `apply_compare` / `apply_arithmetic`), so the result is the
+// integer-string atom that the bare-integer id scheme expects.
+
+/// Build the `gen:autocounter` Func: `<existing numeric id atoms>` → next
+/// id atom (max + 1; `<>` → "1"). See the module comment above for the
+/// algebra. This is model-independent, so a single shared definition is
+/// registered once into the compiled DEFS (`compile_to_defs_state`) and
+/// resolved by name via `Func::Def("gen:autocounter")`.
+pub fn gen_autocounter() -> Func {
+    Func::compose(
+        Func::Add,                                            // +:<max, 1>
+        Func::construction(vec![
+            Func::compose(
+                Func::Insert(Box::new(Func::Condition(        // /max  (right insert/reduce)
+                    Box::new(Func::Ge),                       // max:<a,b> = (a≥b → a ; b)
+                    Box::new(Func::Selector(1)),
+                    Box::new(Func::Selector(2)),
+                ))),
+                Func::compose(
+                    Func::ApndL,                              // <0, id1, ..., idn>
+                    Func::construction(vec![
+                        Func::constant(Object::atom("0")),
+                        Func::Id,                             // the input Seq of id atoms
+                    ]),
+                ),
+            ),
+            Func::constant(Object::atom("1")),
+        ]),
+    )
+}
+
 // H4 (#692): the `_register_theta1_native_legacy` reference body —
 // 130 lines of Func::Native(Arc::new(closure)) reproductions of the
 // Codd θ₁ ops that previously documented the pre-Platform escape
@@ -8067,6 +8112,44 @@ mod tests {
             .unwrap_or_default();
         assert!(!names.contains(&"second".to_string()),
             "defs_to_state-derived names must NOT be in the runtime registry; got {:?}", names);
+    }
+
+    // ── gen:autocounter (Conceptual Data Type, P3a) ──────────────
+    // The auto-counter id generator expressed as a pure Backus-FP
+    // reduction: + ∘ [ /max ∘ apndl ∘ [0̄, ids] , 1̄ ]. Asserts the
+    // canonical cases both against the directly-built Func and through
+    // a registered `Func::Def("gen:autocounter")` resolution.
+
+    #[test]
+    fn gen_autocounter_func_computes_max_plus_one() {
+        let f = gen_autocounter();
+        // Empty population → "1" (the apndl seed gives /max a base, then +1).
+        assert_eq!(apply(&f, &Object::phi(), &Object::phi()), Object::atom("1"),
+            "<> must yield the first id \"1\"");
+        // <1,2,3> → max 3 → 4.
+        let ids = Object::seq(vec![Object::atom("1"), Object::atom("2"), Object::atom("3")]);
+        assert_eq!(apply(&f, &ids, &Object::phi()), Object::atom("4"),
+            "<1,2,3> must yield max+1 = \"4\"");
+        // <482,497> → max 497 → 498.
+        let ids = Object::seq(vec![Object::atom("482"), Object::atom("497")]);
+        assert_eq!(apply(&f, &ids, &Object::phi()), Object::atom("498"),
+            "<482,497> must yield max+1 = \"498\"");
+    }
+
+    #[test]
+    fn gen_autocounter_resolves_as_named_def() {
+        // Mirror the production wiring: the def is registered into D and
+        // reached by name via Func::Def, exactly as the create path does.
+        let d = defs_to_state(&[("gen:autocounter".to_string(), gen_autocounter())], &Object::phi());
+        let def = Func::Def("gen:autocounter".to_string());
+        assert_eq!(apply(&def, &Object::phi(), &d), Object::atom("1"),
+            "Func::Def(\"gen:autocounter\"):<> must resolve to \"1\"");
+        let ids = Object::seq(vec![Object::atom("1"), Object::atom("2"), Object::atom("3")]);
+        assert_eq!(apply(&def, &ids, &d), Object::atom("4"),
+            "Func::Def(\"gen:autocounter\"):<1,2,3> must resolve to \"4\"");
+        let ids = Object::seq(vec![Object::atom("482"), Object::atom("497")]);
+        assert_eq!(apply(&def, &ids, &d), Object::atom("498"),
+            "Func::Def(\"gen:autocounter\"):<482,497> must resolve to \"498\"");
     }
 
     // ── Citation provenance (E3 / #305) ─────────────────────────
