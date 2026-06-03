@@ -174,6 +174,19 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
         })
         .collect();
 
+    // #279 P4: noun_name -> maxLength, from the `maxLength` binding the
+    // parser absorbs for a `text with length <n>` data-type assignment
+    // (reusing the existing Max Length value attribute). Surfaces as JSON
+    // Schema `maxLength` on the value-type property. precision / scale
+    // have no JSON Schema representation and are intentionally omitted.
+    let noun_max_lengths: HashMap<String, u64> = nouns_seq.iter()
+        .filter_map(|n| {
+            let name = binding(n, "name")?.to_string();
+            let len: u64 = binding(n, "maxLength")?.parse().ok()?;
+            Some((name, len))
+        })
+        .collect();
+
     // #279 P2a: code -> (JSON Type, JSON Format?) catalog projection.
     // Read from the `Conceptual_Data_Type_has_JSON_Type` / `...Format`
     // cells when present (full compile), else the boot fallback — same
@@ -192,7 +205,7 @@ fn openapi_from_state(state: &Object, app_name: &str) -> serde_json::Value {
             if cols.is_empty() { return None; }
             Some((name.clone(), component_schema_from_state(
                 name, &cols, &noun_by_snake, &enum_values,
-                &noun_data_types, &json_type_map, state)))
+                &noun_data_types, &noun_max_lengths, &json_type_map, state)))
         })
         .collect();
 
@@ -884,12 +897,13 @@ fn component_schema_from_state(
     noun_by_snake: &HashMap<String, String>,
     enum_values: &HashMap<String, Vec<String>>,
     noun_data_types: &HashMap<String, String>,
+    noun_max_lengths: &HashMap<String, u64>,
     json_type_map: &JsonTypeMappingTable,
     state: &Object,
 ) -> serde_json::Value {
     let column_props = columns.iter()
         .map(|col| (col.name.clone(), column_property_from_state(
-            col, noun_by_snake, enum_values, noun_data_types, json_type_map)));
+            col, noun_by_snake, enum_values, noun_data_types, noun_max_lengths, json_type_map)));
 
     // SM-derived "status" property, if this noun has a state machine.
     let statuses = sm_statuses(state, noun_name);
@@ -941,6 +955,7 @@ fn column_property_from_state(
     noun_by_snake: &HashMap<String, String>,
     enum_values: &HashMap<String, Vec<String>>,
     noun_data_types: &HashMap<String, String>,
+    noun_max_lengths: &HashMap<String, u64>,
     json_type_map: &JsonTypeMappingTable,
 ) -> serde_json::Value {
     if let Some(target) = col.references.as_ref() {
@@ -970,6 +985,14 @@ fn column_property_from_state(
     // Enum constraint layers on top of whichever base type was chosen.
     if let Some(vals) = source_noun.and_then(|n| enum_values.get(n)) {
         prop.insert("enum".to_string(), serde_json::json!(vals));
+    }
+    // #279 P4: a text `length` facet surfaces as JSON Schema `maxLength`
+    // (only meaningful on string-typed properties). precision / scale
+    // have no JSON Schema representation, so they are not emitted.
+    if json_type == "string" {
+        if let Some(len) = source_noun.and_then(|n| noun_max_lengths.get(n)) {
+            prop.insert("maxLength".to_string(), serde_json::json!(len));
+        }
     }
     serde_json::Value::Object(prop)
 }
@@ -1911,6 +1934,60 @@ Each Order has at most one Placed At.\n";
             "dateTime maps to JSON type string; got: {}", placed);
         assert_eq!(placed["format"], "date-time",
             "dateTime carries format date-time end-to-end; got: {}", placed);
+    }
+
+    /// #279 P4: a text value type's `maxLength` facet (absorbed onto the
+    /// Noun cell) surfaces as JSON Schema `maxLength` on a string-typed
+    /// property. precision / scale have no JSON representation, so a
+    /// number-typed property gains no size keyword.
+    #[test]
+    fn value_type_property_text_carries_max_length() {
+        let state = entity_state_with_value_attr(
+            "Code", Some("text"), &[("maxLength", "50")]);
+        let doc = openapi_for_app(&state, "test-app");
+        let props = doc["components"]["schemas"]["Product"]["properties"]
+            .as_object().expect("Product.properties must be an object");
+        let code = props.get("code")
+            .unwrap_or_else(|| panic!("Product must carry a 'code' property; got: {:?}",
+                props.keys().collect::<Vec<_>>()));
+        assert_eq!(code["type"], "string");
+        assert_eq!(code["maxLength"], 50,
+            "text length facet must surface as JSON maxLength; got: {}", code);
+
+        // A decimal property carrying precision/scale gains NO size keyword
+        // (no JSON Schema representation for precision/scale).
+        let dec = entity_state_with_value_attr(
+            "Amount", Some("decimal"), &[("precision", "10"), ("scale", "2")]);
+        let doc = openapi_for_app(&dec, "test-app");
+        let amount = doc["components"]["schemas"]["Product"]["properties"]["amount"].clone();
+        assert_eq!(amount["type"], "number");
+        assert!(amount.get("maxLength").is_none(),
+            "decimal precision/scale must not emit maxLength; got: {}", amount);
+    }
+
+    /// #279 P4 — END-TO-END THROUGH THE REAL PARSER. `text with length 50`
+    /// surfaces as JSON Schema `maxLength: 50` on the absorbed column.
+    #[test]
+    fn openapi_text_length_carries_max_length_end_to_end() {
+        let src = "Order(.code) is an entity type.\n\
+Label is a value type.\n\
+The data type of Label is text with length 50.\n\
+\n\
+## Fact Types\n\
+Order has Label.\n\
+\n\
+## Constraints\n\
+Each Order has at most one Label.\n";
+        let state = parse(src);
+        let doc = openapi_for_app(&state, "test-app");
+        let props = doc["components"]["schemas"]["Order"]["properties"]
+            .as_object().expect("Order.properties must be an object");
+        let label = props.get("label").unwrap_or_else(|| panic!(
+            "Order must carry an absorbed 'label' column; got: {:?}",
+            props.keys().collect::<Vec<_>>()));
+        assert_eq!(label["type"], "string");
+        assert_eq!(label["maxLength"], 50,
+            "text length facet must surface as maxLength end-to-end; got: {}", label);
     }
 
     #[test]

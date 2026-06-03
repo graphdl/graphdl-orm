@@ -2284,6 +2284,11 @@ fn translate_nouns(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
     // onto the Noun cell as `conceptualDataType` (the same way enum
     // values are absorbed as `enumValues`).
     let mut data_types: BTreeMap<String, String> = BTreeMap::new();
+    // #279 P4: per-value-type NORMA facets carried by the same data-type
+    // declaration (`… with precision 10 and scale 2` / `… with length
+    // 50`), absorbed onto the Noun cell as `precision` / `scale` /
+    // `maxLength` (text length reuses the existing Max Length field).
+    let mut facets: BTreeMap<String, DataTypeFacets> = BTreeMap::new();
     let mut super_types: BTreeMap<String, String> = BTreeMap::new();
     // task-964: nouns explicitly opted into auto-generated ids. A
     // `<Noun> has an auto-generated id.` reading sets the `autoId` Noun
@@ -2371,9 +2376,26 @@ fn translate_nouns(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
                 if let Some(code) = extract_data_type(&text) {
                     data_types.insert(head.clone(), code);
                 }
+                // #279 P4: capture any trailing facet clause from the same
+                // declaration. Stored only when non-empty so an unfaceted
+                // assignment absorbs nothing (backward-compat).
+                let f = extract_facets(&text);
+                if !f.is_empty() {
+                    facets.insert(head.clone(), f);
+                }
             }
         }
     }
+    // #279 P4: stringify the captured facet numbers up front so the
+    // `&str` bindings below borrow from owned storage that outlives the
+    // builder closure (matching `enumValues` / `conceptualDataType`,
+    // which borrow from `BTreeMap<String, String>`).
+    let facet_strs: BTreeMap<String, (Option<String>, Option<String>, Option<String>)> =
+        facets.iter().map(|(n, f)| (n.clone(), (
+            f.precision.map(|v| v.to_string()),
+            f.scale.map(|v| v.to_string()),
+            f.length.map(|v| v.to_string()),
+        ))).collect();
     by_noun.into_iter().map(|(name, ot)| {
         let mut pairs: Vec<(&str, &str)> = vec![
             ("name", name.as_str()),
@@ -2391,6 +2413,13 @@ fn translate_nouns(classified_state: &Object, idx: &StmtIndex) -> Vec<Object> {
         }
         if let Some(dt) = data_types.get(&name) {
             pairs.push(("conceptualDataType", dt.as_str()));
+        }
+        // #279 P4: facet bindings. `length` reuses the existing Max Length
+        // absorbed field (`maxLength`); precision / scale get their own.
+        if let Some((p, s, l)) = facet_strs.get(&name) {
+            if let Some(p) = p { pairs.push(("precision", p.as_str())); }
+            if let Some(s) = s { pairs.push(("scale", s.as_str())); }
+            if let Some(l) = l { pairs.push(("maxLength", l.as_str())); }
         }
         if auto_ids.contains(&name) {
             pairs.push(("autoId", "true"));
@@ -3217,8 +3246,68 @@ fn extract_enum_values(text: &str) -> Option<String> {
 fn extract_data_type(text: &str) -> Option<String> {
     let body = text.trim().trim_end_matches('.').trim();
     let rest = body.strip_prefix("The data type of ")?;
-    let code = rest.rsplit_once(" is ")?.1.trim();
+    let after_is = rest.rsplit_once(" is ")?.1.trim();
+    // #279 P4: strip any trailing facet clause (`… with precision 10 and
+    // scale 2`); the bare code is everything before ` with `.
+    let code = after_is.split(" with ").next().unwrap_or(after_is).trim();
     (!code.is_empty()).then(|| code.to_string())
+}
+
+/// The numeric facets a `The data type of <VT> is <code> with …`
+/// declaration may carry (#279 P4). All optional; an unfaceted
+/// declaration yields the all-`None` value. `precision` / `scale`
+/// parameterize the decimal families; `length` (the text/binary size)
+/// reuses the existing `Max Length` absorbed field (`maxLength`).
+#[derive(Debug, Default, Clone, PartialEq)]
+struct DataTypeFacets {
+    precision: Option<u32>,
+    scale: Option<u32>,
+    length: Option<u32>,
+}
+
+impl DataTypeFacets {
+    fn is_empty(&self) -> bool {
+        self.precision.is_none() && self.scale.is_none() && self.length.is_none()
+    }
+}
+
+/// Extract NORMA facets from a `The data type of <VT> is <code> with
+/// <facets>.` statement (#279 P4). Recognises the keyword/number pairs
+/// `precision <n>`, `scale <n>`, `length <n>` in the trailing `with …`
+/// clause (joined by ` and ` / `,`), in any order. Returns the all-`None`
+/// `DataTypeFacets` for an unfaceted assignment (no `with` clause) — the
+/// caller absorbs nothing in that case (backward-compat).
+fn extract_facets(text: &str) -> DataTypeFacets {
+    let mut facets = DataTypeFacets::default();
+    let body = text.trim().trim_end_matches('.').trim();
+    // Only look past the data-type ` with ` clause delimiter.
+    let Some((_, tail)) = body.split_once(" with ") else { return facets };
+    let lower = tail.to_ascii_lowercase();
+    // Scan for each `<keyword> <number>` pair independently so order /
+    // separators (` and `, `,`) don't matter. The number is the run of
+    // ASCII digits immediately following the keyword (after whitespace).
+    for (keyword, slot) in [
+        ("precision", 0usize), ("scale", 1), ("length", 2),
+    ] {
+        if let Some(n) = scan_keyword_number(&lower, keyword) {
+            match slot {
+                0 => facets.precision = Some(n),
+                1 => facets.scale = Some(n),
+                _ => facets.length = Some(n),
+            }
+        }
+    }
+    facets
+}
+
+/// Find `<keyword>` in `haystack` (already lowercased) and parse the run
+/// of ASCII digits that follows it (skipping intervening whitespace).
+/// Returns `None` if the keyword is absent or not followed by digits.
+fn scan_keyword_number(haystack: &str, keyword: &str) -> Option<u32> {
+    let after = &haystack[haystack.find(keyword)? + keyword.len()..];
+    let digits: String = after.trim_start()
+        .chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
 }
 
 /// Translate `Subtype Declaration` classifications into `Subtype` cell
@@ -7574,6 +7663,113 @@ mod tests {
             .find(|f| binding(f, "name") == Some("Nickname"))
             .expect("Nickname noun fact");
         assert_eq!(binding(nick, "conceptualDataType"), None);
+    }
+
+    /// #279 P4: `extract_facets` / `extract_data_type` contract. The bare
+    /// code is stripped of the facet tail; the numbers are parsed from the
+    /// `with …` clause in any order / separator, and an unfaceted form
+    /// yields the empty facet set.
+    #[test]
+    fn extract_facets_parses_the_with_clause() {
+        // precision + scale, ` and ` separator.
+        let f = super::extract_facets(
+            "The data type of Price is decimal with precision 10 and scale 2.");
+        assert_eq!(f.precision, Some(10));
+        assert_eq!(f.scale, Some(2));
+        assert_eq!(f.length, None);
+        assert_eq!(super::extract_data_type(
+            "The data type of Price is decimal with precision 10 and scale 2."),
+            Some("decimal".to_string()), "bare code must drop the facet tail");
+        // length only.
+        let f = super::extract_facets(
+            "The data type of Code is text with length 50.");
+        assert_eq!(f.length, Some(50));
+        assert_eq!(f.precision, None);
+        // precision only.
+        let f = super::extract_facets(
+            "The data type of N is decimal with precision 8.");
+        assert_eq!(f.precision, Some(8));
+        assert_eq!(f.scale, None);
+        // unfaceted → empty.
+        assert!(super::extract_facets("The data type of Price is decimal.").is_empty());
+    }
+
+    /// #279 P4: a `decimal` data-type assignment carrying a facet tail
+    /// (`with precision 10 and scale 2`) absorbs `precision` / `scale`
+    /// onto the Noun cell alongside `conceptualDataType` — the bare code
+    /// stays `decimal` (the facet clause is stripped from it), and the
+    /// numeric facets land as their own absorbed bindings.
+    #[test]
+    fn decimal_facets_absorb_onto_noun_cell() {
+        let state = super::parse_to_state_via_stage12(
+            "Price is a value type.\n\
+             The data type of Price is decimal with precision 10 and scale 2.\n"
+        ).expect("parse_to_state_via_stage12");
+        let noun_cell = fetch_or_phi("Noun", &state);
+        let price = noun_cell.as_seq().expect("Noun cell").iter()
+            .find(|f| binding(f, "name") == Some("Price"))
+            .expect("Price noun fact");
+        // Bare code is unchanged — the facet tail is not folded into it.
+        assert_eq!(binding(price, "conceptualDataType"), Some("decimal"));
+        assert_eq!(binding(price, "precision"), Some("10"));
+        assert_eq!(binding(price, "scale"), Some("2"));
+    }
+
+    /// #279 P4: a `text` data-type assignment carrying `with length 50`
+    /// absorbs the size as `maxLength` onto the Noun cell — reusing the
+    /// existing `Max Length` value attribute rather than a parallel one.
+    #[test]
+    fn text_length_facet_absorbs_as_max_length() {
+        let state = super::parse_to_state_via_stage12(
+            "Code is a value type.\n\
+             The data type of Code is text with length 50.\n"
+        ).expect("parse_to_state_via_stage12");
+        let noun_cell = fetch_or_phi("Noun", &state);
+        let code = noun_cell.as_seq().expect("Noun cell").iter()
+            .find(|f| binding(f, "name") == Some("Code"))
+            .expect("Code noun fact");
+        assert_eq!(binding(code, "conceptualDataType"), Some("text"));
+        assert_eq!(binding(code, "maxLength"), Some("50"));
+        // No spurious decimal facets.
+        assert_eq!(binding(code, "precision"), None);
+        assert_eq!(binding(code, "scale"), None);
+    }
+
+    /// #279 P4 backward-compat: an unfaceted data-type assignment carries
+    /// no facet bindings (only `conceptualDataType`).
+    #[test]
+    fn unfaceted_data_type_has_no_facet_bindings() {
+        let state = super::parse_to_state_via_stage12(
+            "Amount is a value type.\n\
+             The data type of Amount is decimal.\n"
+        ).expect("parse_to_state_via_stage12");
+        let noun_cell = fetch_or_phi("Noun", &state);
+        let amount = noun_cell.as_seq().expect("Noun cell").iter()
+            .find(|f| binding(f, "name") == Some("Amount"))
+            .expect("Amount noun fact");
+        assert_eq!(binding(amount, "conceptualDataType"), Some("decimal"));
+        assert_eq!(binding(amount, "precision"), None);
+        assert_eq!(binding(amount, "scale"), None);
+        assert_eq!(binding(amount, "maxLength"), None);
+    }
+
+    /// #279 P4: core.md must declare the facet value types + the absorbed
+    /// `Noun has Precision` / `Noun has Scale` functional fact types a
+    /// faceted data-type assignment writes into (a rename pin, mirroring
+    /// `core_md_declares_conceptual_data_type_catalog`).
+    #[test]
+    fn core_md_declares_facet_fact_types() {
+        let core = include_str!("../../../readings/core/core.md");
+        assert!(core.contains("Precision is a value type."),
+            "core.md must declare the Precision value type");
+        assert!(core.contains("Scale is a value type."),
+            "core.md must declare the Scale value type");
+        assert!(core.contains("Noun has Precision."),
+            "core.md must declare the Noun has Precision fact type");
+        assert!(core.contains("Noun has Scale."),
+            "core.md must declare the Noun has Scale fact type");
+        assert!(core.contains("Noun has Max Length."),
+            "core.md must declare Noun has Max Length (text length reuses it)");
     }
 
     /// Catalog sanity (#279 P1): the Conceptual Data Type membership

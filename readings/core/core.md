@@ -637,6 +637,8 @@ Alias is a value type.
 Length is a value type.
 Binary Precision is a value type.
 Digit Count is a value type.
+Precision is a value type.
+Scale is a value type.
 JSON Type is a value type.
 JSON Format is a value type.
 Abstract SQL Type is a value type.
@@ -703,6 +705,12 @@ Conceptual Data Type is in Data Type Group.
 Noun has Conceptual Data Type.
   Each Noun has at most one Conceptual Data Type.
 
+Noun has Precision.
+  Each Noun has at most one Precision.
+
+Noun has Scale.
+  Each Noun has at most one Scale.
+
 Conceptual Data Type has JSON Type.
   Each Conceptual Data Type has exactly one JSON Type.
 
@@ -743,6 +751,17 @@ the group membership; the Data Type Group entities are populated by the
 group codes those facts reference (no separate Name is carried in P1).
 A value type opts into a data type with `The data type of <ValueType>
 is <code>.`, which absorbs `conceptualDataType` onto the Noun cell.
+
+The declaration may carry NORMA facets in a trailing clause (#279 P4):
+`The data type of Price is decimal with precision 10 and scale 2.` and
+`The data type of Code is text with length 50.`. These absorb onto the
+Noun cell as `precision` / `scale` (via `Noun has Precision` / `Noun has
+Scale` above) and `maxLength` (via the existing `Noun has Max Length`,
+which text `length` reuses). Facets parameterize the projected DDL:
+`DECIMAL(precision, scale)`, `CHARACTER VARYING(length)`, etc. The
+`Facet` entity (with its own `Length` / `Digit Count` / `Binary
+Precision`) models per-instance facet rows for a future supertype /
+units pass and is independent of these absorbed Noun fields.
 
 Data Type Group 'text' has Name 'Text'.
 Data Type Group 'numeric' has Name 'Numeric'.

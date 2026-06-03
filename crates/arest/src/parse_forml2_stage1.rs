@@ -918,7 +918,12 @@ fn extract_enum_values(body: &str) -> Option<Vec<String>> {
 /// from the Text cell, just like the enum-values path).
 fn extract_data_type(body: &str) -> Option<String> {
     let rest = body.strip_prefix("The data type of ")?;
-    let code = rest.rsplit_once(" is ")?.1.trim();
+    let after_is = rest.rsplit_once(" is ")?.1.trim();
+    // #279 P4: a faceted assignment (`decimal with precision 10 and
+    // scale 2` / `text with length 50`) carries the facets in a trailing
+    // `with …` clause. The bare Conceptual Data Type code is everything
+    // before that clause; the numbers are re-extracted in Stage-2.
+    let code = after_is.split(" with ").next().unwrap_or(after_is).trim();
     (!code.is_empty()).then(|| code.to_string())
 }
 

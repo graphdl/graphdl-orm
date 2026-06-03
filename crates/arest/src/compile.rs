@@ -2338,9 +2338,26 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                 Some((crate::rmap::to_snake(name), abstract_type.to_string()))
             }).collect())
             .unwrap_or_default();
+        // #279 P4: per-column NORMA facets, read from the same Noun cell
+        // (the parser absorbs `precision` / `scale` / `maxLength` onto the
+        // source value-type fact). Keyed by the snake column name like
+        // `cdt_abstract_by_col`; `generate_ddl` parameterizes the vendor
+        // type from these. Only nouns carrying at least one facet appear.
+        let facets_by_col: HashMap<String, ColumnFacets> = noun_cell.as_seq()
+            .map(|facts| facts.iter().filter_map(|f| {
+                let name = binding(f, "name")?;
+                let cf = ColumnFacets {
+                    precision: binding(f, "precision").and_then(|v| v.parse().ok()),
+                    scale: binding(f, "scale").and_then(|v| v.parse().ok()),
+                    length: binding(f, "maxLength").and_then(|v| v.parse().ok()),
+                };
+                if cf.is_empty() { return None; }
+                Some((crate::rmap::to_snake(name), cf))
+            }).collect())
+            .unwrap_or_default();
         for table_name in &names {
             for (dialect_name, dialect) in active_dialects.iter() {
-                let ddl = generate_ddl(&rmap_cells, table_name, dialect, &type_map, &cdt_abstract_by_col);
+                let ddl = generate_ddl(&rmap_cells, table_name, dialect, &type_map, &cdt_abstract_by_col, &facets_by_col);
                 defs.push((
                     format!("sql:{}:{}", dialect_name, table_name),
                     Func::constant(Object::atom(&ddl)),
@@ -10289,6 +10306,100 @@ impl AbstractSqlTypeTable {
     }
 }
 
+/// #279 P4 — the NORMA facets a value column carries, sourced from the
+/// `precision` / `scale` / `maxLength` bindings the parser absorbs onto
+/// the source value-type Noun cell. `generate_ddl` parameterizes the
+/// resolved vendor type from these (e.g. `numeric(precision, scale)`,
+/// `varchar(length)`) for the dialects that take size parameters.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ColumnFacets {
+    pub precision: Option<u32>,
+    pub scale: Option<u32>,
+    pub length: Option<u32>,
+}
+
+impl ColumnFacets {
+    fn is_empty(&self) -> bool {
+        self.precision.is_none() && self.scale.is_none() && self.length.is_none()
+    }
+}
+
+/// The parameterization family of an abstract SQL type — decides which
+/// facet shape (if any) a column's vendor type takes.
+enum FacetFamily { Decimal, Character, Binary, None }
+
+fn facet_family(abstract_base: &str) -> FacetFamily {
+    match abstract_base {
+        "DECIMAL" => FacetFamily::Decimal,
+        // The sized character family (NOT CHARACTER LARGE OBJECT, which
+        // is unsized in every dialect's vendor mapping).
+        "CHARACTER" | "CHARACTER VARYING" => FacetFamily::Character,
+        // The sized binary family (NOT BINARY LARGE OBJECT).
+        "BINARY" | "BINARY VARYING" => FacetFamily::Binary,
+        _ => FacetFamily::None,
+    }
+}
+
+/// Strip a single trailing `(…)` size suffix from a vendor type so a new
+/// facet suffix replaces (not doubles) a baked-in default — e.g. MySql's
+/// `VARCHAR(255)` → `VARCHAR`. Leaves a type with no trailing parens (pg
+/// `numeric`, `varchar`) untouched. A non-trailing `(…)` (none occur in
+/// the boot vendor types for the sized families) is left alone.
+fn strip_trailing_size(vendor: &str) -> &str {
+    if vendor.ends_with(')') {
+        if let Some(open) = vendor.rfind('(') {
+            return vendor[..open].trim_end();
+        }
+    }
+    vendor
+}
+
+/// #279 P4 — parameterize a resolved vendor type from a column's facets.
+///
+/// The decision is per `(dialect, abstract-base family)`: a dialect whose
+/// vendor type for that family takes size parameters gets `(...)`; one
+/// that stores the family unsized (SQLite's storage classes; ClickHouse's
+/// `String`; PostgreSql's `bytea`) keeps the bare vendor type. The facet
+/// numbers come from the source value-type's absorbed bindings; the
+/// abstract base (`DECIMAL` / `CHARACTER VARYING` / …) classifies the
+/// family. Returns the vendor type unchanged when no relevant facet is
+/// present (typed-but-unfaceted columns stay bare — backward-compat).
+fn parameterize_vendor_type(
+    dialect: &SqlDialect,
+    abstract_base: &str,
+    vendor: &str,
+    facets: &ColumnFacets,
+) -> String {
+    if facets.is_empty() { return vendor.to_string(); }
+    let suffix: Option<String> = match facet_family(abstract_base) {
+        // DECIMAL(precision[, scale]). Scale alone is meaningless without
+        // precision, so a scale-only facet set is ignored (stays bare).
+        FacetFamily::Decimal => match dialect {
+            // SQLite's NUMERIC storage class is unparameterized.
+            SqlDialect::Sqlite => None,
+            _ => facets.precision.map(|p| match facets.scale {
+                Some(s) => format!("({},{})", p, s),
+                None => format!("({})", p),
+            }),
+        },
+        // CHARACTER[ VARYING](length) / BINARY[ VARYING](length).
+        FacetFamily::Character | FacetFamily::Binary => match dialect {
+            // Unsized storage in these dialects' vendor mappings.
+            SqlDialect::Sqlite | SqlDialect::ClickHouse => None,
+            // PostgreSql binary is `bytea` (unsized); its char family IS
+            // sized, so only suppress for the binary family.
+            SqlDialect::PostgreSql
+                if matches!(facet_family(abstract_base), FacetFamily::Binary) => None,
+            _ => facets.length.map(|l| format!("({})", l)),
+        },
+        FacetFamily::None => None,
+    };
+    match suffix {
+        Some(sfx) => format!("{}{}", strip_trailing_size(vendor), sfx),
+        None => vendor.to_string(),
+    }
+}
+
 /// Generate DDL for a table in the given SQL dialect. Reads the RMAP
 /// cells view directly (#325) — no TableDef allocation, no typed-IR
 /// round-trip. `table_name` is the snake_case name present in the
@@ -10311,6 +10422,7 @@ fn generate_ddl(
     dialect: &SqlDialect,
     type_map: &SqlTypeMappingTable,
     cdt_abstract_by_col: &HashMap<String, String>,
+    facets_by_col: &HashMap<String, ColumnFacets>,
 ) -> String {
     let q = |s: &str| match dialect {
         SqlDialect::MySql => format!("`{}`", s),
@@ -10343,7 +10455,22 @@ fn generate_ddl(
                     .unwrap_or(col.col_type.as_str()),
                 |_| col.col_type.as_str(),
             );
-        let col_type = map_type(base);
+        let vendor = map_type(base);
+        // #279 P4: parameterize the vendor type from the column's facets.
+        // Only value columns typed via the CDT override carry a known
+        // abstract `base` to classify the facet family — FK columns and
+        // untyped columns (base == col.col_type) stay bare. The
+        // per-dialect policy inside `parameterize_vendor_type` keeps
+        // unsized dialects (SQLite, etc.) on the bare vendor type.
+        let col_type: String = match (
+            col.references.is_none(),
+            cdt_abstract_by_col.get(&col.name),
+            facets_by_col.get(&col.name),
+        ) {
+            (true, Some(abstract_base), Some(f)) =>
+                parameterize_vendor_type(dialect, abstract_base, vendor, f),
+            _ => vendor.to_string(),
+        };
         let nullable = if col.nullable {
             match dialect { SqlDialect::ClickHouse => " Nullable", _ => "" }
         } else {
@@ -13447,10 +13574,11 @@ mod sql_type_mapping_tests {
         // its RMAP coarse base, exercising the legacy bucket path.
         let no_cdt: HashMap<String, String> = HashMap::new();
         for dialect in dialects.iter() {
+            let no_facets: HashMap<String, ColumnFacets> = HashMap::new();
             let boot_ddl = generate_ddl(
-                &rmap_cells, "t", dialect, &boot_table, &no_cdt);
+                &rmap_cells, "t", dialect, &boot_table, &no_cdt, &no_facets);
             let readings_ddl = generate_ddl(
-                &rmap_cells, "t", dialect, &readings_table, &no_cdt);
+                &rmap_cells, "t", dialect, &readings_table, &no_cdt, &no_facets);
             assert_eq!(boot_ddl, readings_ddl,
                 "DDL for {:?} differs between boot and readings: \
                  boot={:?}, readings={:?}",
@@ -13605,19 +13733,74 @@ mod sql_type_mapping_tests {
         let mut cdt: HashMap<String, String> = HashMap::new();
         cdt.insert("amount".to_string(), "DECIMAL".to_string());
 
+        let no_facets: HashMap<String, ColumnFacets> = HashMap::new();
         // PostgreSql: DECIMAL → numeric.
-        let pg = generate_ddl(&rmap_cells, "order", &SqlDialect::PostgreSql, &type_map, &cdt);
+        let pg = generate_ddl(&rmap_cells, "order", &SqlDialect::PostgreSql, &type_map, &cdt, &no_facets);
         assert!(pg.contains("\"amount\" numeric"),
             "decimal column must type as PostgreSql numeric; got:\n{}", pg);
         // MySql: DECIMAL → DECIMAL.
-        let my = generate_ddl(&rmap_cells, "order", &SqlDialect::MySql, &type_map, &cdt);
+        let my = generate_ddl(&rmap_cells, "order", &SqlDialect::MySql, &type_map, &cdt, &no_facets);
         assert!(my.contains("`amount` DECIMAL"),
             "decimal column must type as MySql DECIMAL; got:\n{}", my);
         // Without the override, the same column falls back to TEXT typing.
         let empty: HashMap<String, String> = HashMap::new();
-        let pg_untyped = generate_ddl(&rmap_cells, "order", &SqlDialect::PostgreSql, &type_map, &empty);
+        let pg_untyped = generate_ddl(&rmap_cells, "order", &SqlDialect::PostgreSql, &type_map, &empty, &HashMap::new());
         assert!(pg_untyped.contains("\"amount\" TEXT"),
             "untyped fallback must keep the legacy TEXT typing; got:\n{}", pg_untyped);
+    }
+
+    /// #279 P4 — `generate_ddl` parameterizes the vendor type from a
+    /// per-column facet map (precision/scale for DECIMAL families, length
+    /// for the CHARACTER family). Unit-level pin of the parameterization
+    /// independent of the parser; the dialect-appropriate base comes from
+    /// `cdt_abstract_by_col` exactly as the two-stage test above.
+    #[test]
+    fn generate_ddl_parameterizes_vendor_type_from_facets() {
+        let type_map = SqlTypeMappingTable::boot();
+        let rmap_cells = crate::ast::Object::map(
+            [(
+                "RMAPTable".to_string(),
+                Object::Seq(alloc::vec![
+                    fact_from_pairs(&[("name", "order"), ("position", "0")]),
+                ].into()),
+            ),
+            (
+                "RMAPColumn".to_string(),
+                Object::Seq(alloc::vec![
+                    fact_from_pairs(&[
+                        ("table", "order"), ("name", "amount"),
+                        ("colType", "TEXT"), ("position", "0"),
+                        ("nullable", "true"),
+                    ]),
+                    fact_from_pairs(&[
+                        ("table", "order"), ("name", "code"),
+                        ("colType", "TEXT"), ("position", "1"),
+                        ("nullable", "true"),
+                    ]),
+                ].into()),
+            )].into_iter().collect()
+        );
+        let mut cdt: HashMap<String, String> = HashMap::new();
+        cdt.insert("amount".to_string(), "DECIMAL".to_string());
+        cdt.insert("code".to_string(), "CHARACTER VARYING".to_string());
+        let mut facets: HashMap<String, ColumnFacets> = HashMap::new();
+        facets.insert("amount".to_string(),
+            ColumnFacets { precision: Some(10), scale: Some(2), length: None });
+        facets.insert("code".to_string(),
+            ColumnFacets { precision: None, scale: None, length: Some(50) });
+
+        let pg = generate_ddl(&rmap_cells, "order", &SqlDialect::PostgreSql, &type_map, &cdt, &facets);
+        assert!(pg.contains("\"amount\" numeric(10,2)"),
+            "decimal facets → numeric(10,2); got:\n{}", pg);
+        assert!(pg.contains("\"code\" varchar(50)"),
+            "length facet → varchar(50); got:\n{}", pg);
+
+        // Sqlite ignores size params (storage classes are unparameterized).
+        let lite = generate_ddl(&rmap_cells, "order", &SqlDialect::Sqlite, &type_map, &cdt, &facets);
+        assert!(lite.contains("\"amount\" NUMERIC") && !lite.contains("NUMERIC("),
+            "Sqlite must not parameterize NUMERIC; got:\n{}", lite);
+        assert!(lite.contains("\"code\" TEXT") && !lite.contains("TEXT("),
+            "Sqlite must not parameterize TEXT; got:\n{}", lite);
     }
 
     /// #279 P2b — END-TO-END THROUGH THE REAL PARSER. A value type that
@@ -13662,6 +13845,106 @@ Each Order has at most one Amount.\n";
         assert!(ddl.contains("\"amount\" numeric"),
             "amount column must type as PostgreSql numeric via the CDT \
              two-stage projection, not the untyped TEXT fallback; got:\n{}", ddl);
+    }
+
+    /// #279 P4 — END-TO-END THROUGH THE REAL PARSER. A value type whose
+    /// data-type assignment carries decimal facets (`decimal with
+    /// precision 10 and scale 2`) must surface in the generated DDL with
+    /// the dialect's parameterized decimal type: `numeric(10,2)` on
+    /// PostgreSql, `DECIMAL(10,2)` on MySql. RED→GREEN pin for the P4
+    /// facet → DDL parameterization wiring.
+    #[cfg(all(feature = "templates", not(feature = "no_std")))]
+    #[test]
+    fn ddl_decimal_facets_parameterize_vendor_type_end_to_end() {
+        let src = "Order(.code) is an entity type.\n\
+Amount is a value type.\n\
+The data type of Amount is decimal with precision 10 and scale 2.\n\
+\n\
+## Fact Types\n\
+Order has Amount.\n\
+\n\
+## Constraints\n\
+Each Order has at most one Amount.\n";
+        let parsed = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("snippet must parse");
+        let state = install_active_generators(&parsed, ["postgresql", "mysql"]);
+        let defs = compile_to_defs_state(&state);
+        let ddl_for = |key: &str| defs.iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, f)| match f {
+                Func::Constant(o) => o.as_atom().unwrap_or("").to_string(),
+                _ => String::new(),
+            })
+            .unwrap_or_else(|| panic!("expected a {} def", key));
+
+        let pg = ddl_for("sql:postgresql:order");
+        assert!(pg.contains("\"amount\" numeric(10,2)"),
+            "PostgreSql decimal facets must parameterize numeric; got:\n{}", pg);
+        let my = ddl_for("sql:mysql:order");
+        assert!(my.contains("`amount` DECIMAL(10,2)"),
+            "MySql decimal facets must parameterize DECIMAL; got:\n{}", my);
+    }
+
+    /// #279 P4 — END-TO-END THROUGH THE REAL PARSER. A `text with length
+    /// 50` data-type assignment must surface as the dialect's
+    /// parameterized character-varying type: `varchar(50)` on PostgreSql.
+    #[cfg(all(feature = "templates", not(feature = "no_std")))]
+    #[test]
+    fn ddl_text_length_facet_parameterizes_varchar_end_to_end() {
+        let src = "Item(.code) is an entity type.\n\
+Label is a value type.\n\
+The data type of Label is text with length 50.\n\
+\n\
+## Fact Types\n\
+Item has Label.\n\
+\n\
+## Constraints\n\
+Each Item has at most one Label.\n";
+        let parsed = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("snippet must parse");
+        let state = install_active_generators(&parsed, ["postgresql"]);
+        let defs = compile_to_defs_state(&state);
+        let ddl = defs.iter()
+            .find(|(name, _)| name == "sql:postgresql:item")
+            .map(|(_, f)| match f {
+                Func::Constant(o) => o.as_atom().unwrap_or("").to_string(),
+                _ => String::new(),
+            })
+            .expect("expected a sql:postgresql:item def");
+        assert!(ddl.contains("\"label\" varchar(50)"),
+            "text length facet must parameterize PostgreSql varchar; got:\n{}", ddl);
+    }
+
+    /// #279 P4 backward-compat: a typed-but-UNFACETED decimal column still
+    /// emits the bare vendor type (no `(p,s)` suffix), and an untyped
+    /// column is unchanged. Guards against the parameterization firing
+    /// when no facets are present.
+    #[cfg(all(feature = "templates", not(feature = "no_std")))]
+    #[test]
+    fn ddl_unfaceted_decimal_stays_bare_end_to_end() {
+        let src = "Order(.code) is an entity type.\n\
+Amount is a value type.\n\
+The data type of Amount is decimal.\n\
+\n\
+## Fact Types\n\
+Order has Amount.\n\
+\n\
+## Constraints\n\
+Each Order has at most one Amount.\n";
+        let parsed = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("snippet must parse");
+        let state = install_active_generators(&parsed, ["postgresql"]);
+        let defs = compile_to_defs_state(&state);
+        let ddl = defs.iter()
+            .find(|(name, _)| name == "sql:postgresql:order")
+            .map(|(_, f)| match f {
+                Func::Constant(o) => o.as_atom().unwrap_or("").to_string(),
+                _ => String::new(),
+            })
+            .expect("expected a sql:postgresql:order def");
+        assert!(ddl.contains("\"amount\" numeric")
+                && !ddl.contains("numeric("),
+            "unfaceted decimal must stay bare numeric (no params); got:\n{}", ddl);
     }
 }
 
