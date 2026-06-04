@@ -1,0 +1,97 @@
+# crates/arest-kernel/Dockerfile.uefi-mini
+#
+# Mini-profile variant of Dockerfile.uefi (Profile-6b, #631). Builds the
+# kernel with `--no-default-features --features mini,static-ip`. The
+# `mini` feature composes `server + slint + ui-bundle` (and `slint`
+# pulls `repl`), so the smoke gets a UI- and REPL-capable build that
+# still runs the headless HATEOAS net-loop (server runtime gate). It
+# deliberately omits linuxkpi / wine / doom, so the .efi drops the
+# virtio-input wire-up and the doom layer entirely — this image is the
+# guard that the mini profile doesn't accidentally pull those back in.
+#
+# static-ip rides along (as in Dockerfile.uefi-server) so the host-curl
+# probe is deterministic rather than waiting on a DHCPv4 settle.
+#
+# Usage from repo root:
+#   docker build -t arest-kernel-mini -f crates/arest-kernel/Dockerfile.uefi-mini .
+#   docker run --rm -p 8080:8080 arest-kernel-mini
+
+FROM rust:latest AS builder
+
+# Pin to the known-good nightly from crates/arest-kernel/rust-toolchain.toml
+# (nightly-2026-04-21). Keep in sync with the sibling UEFI Dockerfiles.
+RUN rustup toolchain install nightly-2026-04-21 --profile minimal \
+    && rustup component add rust-src --toolchain nightly-2026-04-21 \
+    && rustup target add x86_64-unknown-uefi --toolchain nightly-2026-04-21 \
+    && rustup target add aarch64-unknown-uefi --toolchain nightly-2026-04-21
+
+WORKDIR /build
+
+COPY crates/arest-kernel/Cargo.toml crates/arest-kernel/Cargo.toml
+COPY crates/arest-kernel/build.rs crates/arest-kernel/build.rs
+COPY crates/arest-kernel/src/ crates/arest-kernel/src/
+COPY crates/arest-kernel/rust-toolchain.toml crates/arest-kernel/rust-toolchain.toml
+COPY crates/arest-kernel/ui/ crates/arest-kernel/ui/
+COPY crates/arest-kernel/assets/ crates/arest-kernel/assets/
+# mini composes `ui-bundle`, so build.rs bakes the ui.do React bundle into
+# the .efi — the dist/ tree must be in the build context. (The server
+# profile drops this COPY; mini needs it back.)
+COPY apps/ui.do/dist/ apps/ui.do/dist/
+COPY crates/arest-kernel/doom_assets/ crates/arest-kernel/doom_assets/
+COPY crates/arest/Cargo.toml crates/arest/Cargo.toml
+COPY crates/arest/src/ crates/arest/src/
+COPY crates/arest-foundation/Cargo.toml crates/arest-foundation/Cargo.toml
+COPY crates/arest-foundation/src/ crates/arest-foundation/src/
+COPY readings/ readings/
+COPY crates/arest-kernel/vendor/ crates/arest-kernel/vendor/
+
+# Mini build: --no-default-features --features mini,static-ip.
+# `--no-default-features` drops the `slint` *default* alias, then `mini`
+# re-pulls slint (+ repl) + server + ui-bundle by composition — the lean
+# profile split from #627/#628 with the UI surface back on. static-ip
+# pins QEMU SLiRP's 10.0.2.15/24 so the host curl is deterministic.
+# poly1305_force_soft: the LLVM-SIGILL workaround the sibling Dockerfiles
+# document (libLLVM 22.1 -O miscompiles poly1305 SIMD on this host vCPU).
+RUN cd crates/arest-kernel \
+    && RUSTFLAGS="--cfg poly1305_force_soft" cargo +nightly-2026-04-21 build --target x86_64-unknown-uefi --release \
+       --no-default-features --features mini,static-ip
+
+FROM debian:bookworm-slim AS runner
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    qemu-system-x86 \
+    ovmf \
+    dosfstools \
+    mtools \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/crates/arest-kernel/target/x86_64-unknown-uefi/release/arest-kernel.efi /arest-kernel.efi
+
+RUN dd if=/dev/zero of=/uefi-disk.img bs=1M count=64 status=none \
+    && mkfs.fat -F 32 /uefi-disk.img >/dev/null \
+    && mmd -i /uefi-disk.img ::/EFI \
+    && mmd -i /uefi-disk.img ::/EFI/BOOT \
+    && mcopy -i /uefi-disk.img /arest-kernel.efi ::/EFI/BOOT/BOOTX64.EFI
+
+RUN dd if=/dev/zero of=/disk.img bs=1M count=10 status=none
+
+EXPOSE 8080
+
+# Mini profile QEMU args: keep virtio-gpu (mini carries the Slint UI
+# surface), but DROP virtio-keyboard / virtio-tablet — mini has no
+# linuxkpi, so there's no virtio-input driver and the mini banner omits
+# the virtio-input lines (per #631). virtio-net (HTTP) + virtio-blk
+# (checkpoint round-trip) + virtio-rng (entropy) stay.
+CMD ["qemu-system-x86_64", \
+     "-bios", "/usr/share/ovmf/OVMF.fd", \
+     "-drive", "format=raw,file=/uefi-disk.img,if=ide", \
+     "-netdev", "user,id=net0,hostfwd=tcp::8080-:80", \
+     "-device", "virtio-net-pci,netdev=net0,disable-legacy=on", \
+     "-drive", "file=/disk.img,format=raw,if=none,id=disk0", \
+     "-device", "virtio-blk-pci,drive=disk0,disable-legacy=on", \
+     "-device", "virtio-gpu-pci", \
+     "-object", "rng-random,id=rng0,filename=/dev/urandom", \
+     "-device", "virtio-rng-pci,rng=rng0,disable-legacy=on", \
+     "-serial", "stdio", \
+     "-display", "none", \
+     "-no-reboot", "-no-shutdown"]
