@@ -2799,6 +2799,24 @@ fn transition_via_defs(
             let mut viols: Vec<crate::types::Violation> = Vec::new();
             let mut st = new_state.clone();
             for res in &resources {
+                // transition-retract-stale-resource-projection: the resource
+                // projection is the cross-noun intermediate the #836 wipe does
+                // NOT clear (it's keyed under Resource, not the transition
+                // noun). `push_with_uc_check(overwrite)` only displaces a
+                // *keyed* collision — but a stale tuple stored FOLDED (full-
+                // tuple `cell_put_folded` hash key, e.g. legacy data written
+                // before this FT carried a UC, or any state whose forward chain
+                // could not see `_CellKeyRoles`) sits at a DIFFERENT key than
+                // the entity-keyed write below, so the two coexist and the
+                // bridge that reads this cell re-derives BOTH the stale and the
+                // fresh status. Drop every prior entry for THIS resource first
+                // (cell_filter is folded/keyed-shape tolerant), scoped to the
+                // transitioned resource so untouched resources are preserved,
+                // then write the fresh keyed entry.
+                let res_owned = res.clone();
+                let for_role = sm.for_resource_role;
+                st = ast::cell_filter(RESOURCE_STATUS_CELL,
+                    move |f| ast::binding(f, for_role) != Some(res_owned.as_str()), &st);
                 let fact = ast::fact_from_pairs(&[
                     (sm.for_resource_role,   res.as_str()),
                     (sm.current_status_role, status.as_str()),
@@ -3061,7 +3079,55 @@ fn transition_via_defs(
                 .collect();
             let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
             for (name, contents) in ast::cells_iter(&post_s1).into_iter() {
-                if dropped_cells.contains(name) && !activated_consequent_cells.contains(name) {
+                if dropped_cells.contains(name) {
+                    if activated_consequent_cells.contains(name) {
+                        // transition-retract-partial-folded: this cell was
+                        // WIPED and its producing rule was ACTIVATED, so the
+                        // seeded chain authoritatively RE-DERIVED its full
+                        // contents for EVERY entity (the #836 wipe cleared it
+                        // whole; `drop_writer_reads` seeded its deriver so it
+                        // re-fires across all entities, not just the
+                        // transitioned one). The returned delta must therefore
+                        // REPLACE this cell on the caller's `merge_delta`, never
+                        // UNION it.
+                        //
+                        // Why this is the bug: `transition_via_defs` returns
+                        // `diff_cells(state, new_state)` and every caller commits
+                        // it via `merge_delta`, whose `merge_map_cell_contents`
+                        // UNIONS two Map cells (task-922, so per-entity user
+                        // cells aren't clobbered). A derived consequent that lost
+                        // ONE entity's tuple — a task leaving `pending` dropping
+                        // from `Task_is_recommended` while peers stay pending,
+                        // or its `Task_has_Task_Status` row changing value — is a
+                        // PARTIAL retraction: the recomputed cell is non-empty,
+                        // so the union layers the shrunk delta onto the stale
+                        // base and RESURRECTS the dropped/old tuple (a folded
+                        // cell keys the old and new tuples DISTINCTLY, so they
+                        // coexist; a full retraction that empties the cell is
+                        // already handled because an empty delta value is not a
+                        // Map and merge then replaces). This is the reported
+                        // bridge-lag / "completed task still recommended"
+                        // staleness, and it also surfaces on legacy DBs whose
+                        // UC-bearing cells were stored folded (written before the
+                        // cell carried a UC, or re-folded across a recompile).
+                        //
+                        // Fix: emit the authoritative recompute as a flattened
+                        // Seq (key-ordered, deterministic). `merge_delta`
+                        // replaces — rather than unions — a cell whose delta
+                        // value is not a Map, so the committed cell becomes
+                        // exactly the recompute. SCOPED to wiped+fully-recomputed
+                        // consequents (the `dropped_cells ∩ activated` set), so
+                        // it is NOT the rejected "broaden the wipe to all derived
+                        // cells + force-replace" shortcut: peers ARE present in
+                        // the recompute (their deriver re-fired), so the replace
+                        // cannot drop untouched entities, and user per-entity
+                        // (non-dropped) cells keep the task-922 union. A
+                        // genuinely entity-keyed cell re-keys itself on the next
+                        // `cell_put_keyed` write, so UC enforcement is unaffected.
+                        new_map.insert(name.to_string(),
+                            ast::fetch_cell_seq(name, &post_s1));
+                        continue;
+                    }
                     if let Some(snap) = pre_drop_snapshot.get(name) {
                         new_map.insert(name.to_string(), snap.clone());
                         continue;
@@ -8005,9 +8071,6 @@ Order is big.
     /// Task has Task Status 'pending'`. UCs on the bridge cells mirror
     /// apps/tasks (entity-keyed storage).
     #[test]
-    #[ignore = "CONFIRMED open bug: transitions don't retract stale cross-noun \
-                derived tuples (bridge-lag); fix deferred per STOP condition — \
-                needs per-entity cascade retraction. See doc comment."]
     fn transition_refreshes_cross_noun_derived_cells() {
         const TASK_BRIDGE_READINGS: &str = r#"
 # Tasks bridge
