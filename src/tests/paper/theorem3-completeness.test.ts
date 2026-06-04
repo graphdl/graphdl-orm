@@ -68,7 +68,10 @@ describe('Theorem 3 — Forward Chaining to Least Fixed Point', () => {
 
   it('create command returns derivedCount (forward chain ran)', () => {
     const result = apply(orders.handle, {
-      type: 'createEntity', noun: 'Order', domain: 'test',
+      // Order's reference scheme (.OrderId) is not auto-generated, so
+      // createEntity must carry an explicit reference value at the
+      // command's top-level `id` (engine #964 id_required, command.rs).
+      type: 'createEntity', noun: 'Order', domain: 'test', id: 'O-fc1',
       fields: { customer: 'Alice', priority: 'High' },
     })
     expect(result.derivedCount).toBeDefined()
@@ -77,7 +80,7 @@ describe('Theorem 3 — Forward Chaining to Least Fixed Point', () => {
 
   it('create command derivedCount is non-negative (forward chain terminates)', () => {
     const result = apply(orders.handle, {
-      type: 'createEntity', noun: 'Order', domain: 'test',
+      type: 'createEntity', noun: 'Order', domain: 'test', id: 'O-fc2',
       fields: { customer: 'Bob' },
     })
     expect(result.derivedCount).toBeGreaterThanOrEqual(0)
@@ -86,9 +89,16 @@ describe('Theorem 3 — Forward Chaining to Least Fixed Point', () => {
   // ── 2. Idempotence ────────────────────────────────────────────────────────
 
   it('forward chain is idempotent — same create command twice gives same derivedCount', () => {
-    const cmd = { type: 'createEntity', noun: 'Order', domain: 'test', fields: { customer: 'Idem' } }
-    const first = apply(orders.handle, cmd)
-    const second = apply(orders.handle, cmd)
+    // Determinism of the forward chain: two structurally-identical
+    // creates must derive the same number of facts. We vary only the
+    // explicit reference value (`id`) — required because Order's
+    // reference scheme is not auto-generated and re-using one id would
+    // make the second call a no-op update (derivedCount 0) rather than
+    // an equivalent create, which is not what idempotence-of-derivation
+    // is asserting.
+    const mkCmd = (id: string) => ({ type: 'createEntity', noun: 'Order', domain: 'test', id, fields: { customer: 'Idem' } })
+    const first = apply(orders.handle, mkCmd('O-idem-1'))
+    const second = apply(orders.handle, mkCmd('O-idem-2'))
     expect(first.derivedCount).toBe(second.derivedCount)
   })
 
@@ -105,7 +115,7 @@ describe('Theorem 3 — Forward Chaining to Least Fixed Point', () => {
 
     // Monotonic: create never reduces the entity count
     const result = apply(orders.handle, {
-      type: 'createEntity', noun: 'Order', domain: 'test',
+      type: 'createEntity', noun: 'Order', domain: 'test', id: 'O-mono',
       fields: { customer: 'Mono', priority: 'High' },
     })
     // derivedCount is non-negative (adding facts never removes derived facts)
@@ -144,7 +154,7 @@ describe('Theorem 3 — Constraint Evaluation', () => {
     // Create two orders, then check that violations are detected
     // The UC "Each Order has at most one Priority" is validated by the create pipeline
     const result = apply(orders.handle, {
-      type: 'createEntity', noun: 'Order', domain: 'test',
+      type: 'createEntity', noun: 'Order', domain: 'test', id: 'O-conflict',
       fields: { customer: 'Conflict', priority: 'High' },
     })
     // First create succeeds — no violation
@@ -165,7 +175,7 @@ describe('Theorem 3 — Constraint Evaluation', () => {
     })
     // Valid create: one customer, one priority — no violations
     const result = apply(orders.handle, {
-      type: 'createEntity', noun: 'Order', domain: 'test',
+      type: 'createEntity', noun: 'Order', domain: 'test', id: 'O-valid',
       fields: { customer: 'Valid', priority: 'High' },
     })
     expect(result.rejected).toBe(false)

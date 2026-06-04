@@ -174,10 +174,22 @@ describe('Theorem 1 — Family (a): Quantified constraints', () => {
     })
 
     it('IR does not contain MC from a pure at-most-one reading', () => {
-      // at-most-one is uniqueness only, not mandatory
-      const kinds = constraintKinds(compiled)
-      // MC should not appear here — only UC
-      expect(kinds).not.toContain('MC')
+      // at-most-one is uniqueness only, not mandatory.
+      //
+      // Scope the assertion to the AT-MOST-ONE FACT TYPE's own
+      // constraints ("Author has Version"). The other MCs in the IR
+      // ("Each Author has at least one AuthorId", "Each Version has at
+      // least one VersionId") are emitted by the engine's REFERENCE
+      // SCHEMES (mandatory primary-key roles) — those are correct and
+      // unrelated to the "Each Author has at most one Version" reading
+      // under test. The whole-domain kinds list therefore legitimately
+      // contains MC; only the fact type under test must be MC-free.
+      const versionFactConstraints = compiled.ir.constraints.filter(c =>
+        /author/i.test(c.text) && /\bversion\b/i.test(c.text),
+      )
+      const kindsForVersionFact = versionFactConstraints.map(c => c.kind)
+      expect(kindsForVersionFact).toContain('UC')
+      expect(kindsForVersionFact).not.toContain('MC')
     })
 
     afterAll(() => { if (compiled?.handle >= 0) releaseDomain(compiled.handle) })

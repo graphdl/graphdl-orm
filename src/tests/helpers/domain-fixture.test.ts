@@ -9,6 +9,7 @@ import { describe, it, expect, afterAll } from 'vitest'
 import {
   compileDomain,
   ORDER_READINGS,
+  STATE_READINGS,
   SUPPORT_READINGS,
   releaseDomain,
   type CompiledDomain,
@@ -18,7 +19,14 @@ describe('compileDomain(ORDER_READINGS, "orders")', () => {
   let compiled: CompiledDomain
 
   it('compiles without throwing and returns a valid handle', () => {
-    compiled = compileDomain(ORDER_READINGS, 'orders')
+    // ORDER_READINGS' "Instance Facts" block references state-machine
+    // metamodel nouns (State Machine Definition, Status, Transition,
+    // Fact Type, Noun); supply STATE_READINGS as the prereq so those
+    // nouns are declared before ORDER_READINGS compiles. Passing a bare
+    // domain-name string ("orders") instead left the Instance Facts
+    // referencing undeclared nouns, which the engine correctly rejects
+    // (⊥), producing an empty IR. This mirrors theorem3/corollary2.
+    compiled = compileDomain(ORDER_READINGS, STATE_READINGS)
     expect(compiled).toBeDefined()
     expect(compiled.handle).toBeGreaterThanOrEqual(0)
   })

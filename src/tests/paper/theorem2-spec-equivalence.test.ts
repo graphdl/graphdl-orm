@@ -15,6 +15,7 @@ import {
   compileDomain,
   evaluate,
   ORDER_READINGS,
+  STATE_READINGS,
   SUPPORT_READINGS,
   releaseDomain,
   type CompiledDomain,
@@ -28,7 +29,11 @@ describe('Theorem 2 — Specification Equivalence', () => {
 
   // compile once before assertions
   it('ORDER_READINGS compiles without error', () => {
-    orderCompiled = compileDomain(ORDER_READINGS, 'orders')
+    // STATE_READINGS prereq declares the state-machine metamodel nouns
+    // that ORDER_READINGS' "Instance Facts" block references; a bare
+    // domain-name string left them undeclared and the engine rejected
+    // the compile (empty IR). Same compile path as theorem3/corollary2.
+    orderCompiled = compileDomain(ORDER_READINGS, STATE_READINGS)
     expect(orderCompiled).toBeDefined()
     expect(orderCompiled.handle).toBeGreaterThanOrEqual(0)
   })

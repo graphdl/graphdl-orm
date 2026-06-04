@@ -152,12 +152,19 @@ describe('Corollary 2 — Grammar (Theorem 1) holds for the new Warehouse constr
   })
 
   it('the new Warehouse UC parses as exactly one UC constraint', () => {
-    // Isolate the Warehouse-specific constraint from all constraints in the extended domain
+    // Isolate the USER-AUTHORED Warehouse constraint ("Each Order is
+    // shipped from at most one Warehouse"). The other /warehouse/-
+    // matching constraints in the IR ("Each WarehouseId has at most one
+    // Warehouse" UC + "Each Warehouse has at least one WarehouseId" MC)
+    // are the engine's REFERENCE SCHEME for the Warehouse(.WarehouseId)
+    // entity — correct, but not the constraint under test. Scope to the
+    // Order↔Warehouse fact type so only the authored UC is counted.
     const { constraints } = extended.ir
     const warehouseUCs = constraints.filter(c =>
-      /warehouse/i.test(c.text) || /warehouse/i.test(c.kind)
+      /order/i.test(c.text) && /warehouse/i.test(c.text)
     )
     expect(warehouseUCs.length).toBe(1)
+    expect(warehouseUCs[0].kind).toBe('UC')
   })
 
   it('the Warehouse UC constraint text preserves FORML2 quantifier vocabulary', () => {
