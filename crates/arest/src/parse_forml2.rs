@@ -1030,13 +1030,21 @@ pub fn re_resolve_rules_pub(
     nouns: &HashMap<String, NounDef>,
     fact_types: &HashMap<String, FactTypeDef>,
 ) {
-    re_resolve_rules(rules, nouns, fact_types);
+    // Public test wrapper: callers that don't model subtypes get the
+    // empty (no subtype→supertype) chain. The subtype-aware production
+    // path is `re_resolve_rules` with the schema's subtypes map.
+    re_resolve_rules(rules, nouns, fact_types, &HashMap::new());
 }
 
 pub(crate) fn re_resolve_rules(
     rules: &mut Vec<DerivationRuleDef>,
     nouns: &HashMap<String, NounDef>,
     fact_types: &HashMap<String, FactTypeDef>,
+    // subtype → supertype (one parent per noun; mirrors `CellIndex.subtypes`).
+    // Lets `resolve_derivation_rule` bridge a subtype-keyed join clause UP
+    // to a supertype-declared fact type (subtype instances ARE supertype
+    // instances).
+    subtypes: &HashMap<String, String>,
 ) {
     let mut noun_names: Vec<String> = nouns.keys().cloned().collect();
     noun_names.sort_by(|a, b| b.len().cmp(&a.len()));
@@ -1062,7 +1070,7 @@ pub(crate) fn re_resolve_rules(
     });
 
     rules.iter_mut().for_each(|rule| {
-        resolve_derivation_rule(rule, nouns, fact_types, &catalog);
+        resolve_derivation_rule(rule, nouns, fact_types, &catalog, subtypes);
     });
 }
 
@@ -1450,7 +1458,32 @@ fn resolve_derivation_rule(
     nouns_map: &HashMap<String, NounDef>,
     fact_types_map: &HashMap<String, FactTypeDef>,
     catalog: &SchemaCatalog,
+    // subtype → supertype chain (one parent per noun). Empty in the
+    // public test wrapper; populated from `CellIndex.subtypes` in the
+    // production `cell_index_from_state` path.
+    subtypes: &HashMap<String, String>,
 ) {
+    // Walk the subtype→supertype chain from `noun`, returning every
+    // proper ancestor in order (nearest parent first). Bounded by the
+    // number of declared nouns to defend against a malformed cyclic
+    // declaration. Used to bridge a subtype-keyed clause / join key UP
+    // to a fact type declared on a supertype: subtype instances ARE
+    // supertype instances, so a clause `that <Sub> <verb> <Y>` resolves
+    // to a FT keyed on `<Sup>` and the equi-join links the `<Sub>` role
+    // to the `<Sup>` role.
+    let supertype_chain = |noun: &str| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut cur = noun.to_string();
+        let mut guard = 0usize;
+        while let Some(sup) = subtypes.get(&cur) {
+            if out.iter().any(|s| s == sup) { break; } // cycle guard
+            out.push(sup.clone());
+            cur = sup.clone();
+            guard += 1;
+            if guard > subtypes.len() + 1 { break; }
+        }
+        out
+    };
     // task-930: marker strip moved to translate_derivation_rules_with_matrix
     // in parse_forml2_stage2 (the layer that writes DR cell facts).
     // resolve_derivation_rule receives an already-normalized rule.text;
@@ -1622,6 +1655,43 @@ fn resolve_derivation_rule(
             // noun-set mismatch, so the binding never forms; fall back to a
             // superset-by-one reading-prefix match.
             .or_else(|| catalog.resolve_objectified_abbrev(&role_refs, &cleaned))
+            // subtype-join → supertype FT: a clause keyed on a SUBTYPE noun
+            // (`that Noun belongs to Domain`, Noun < Function) resolves to a
+            // fact type declared on the SUPERTYPE (`Function belongs to
+            // Domain`). The lookups above miss because the catalog keys on
+            // the supertype noun set. Subtype instances ARE supertype
+            // instances, so substitute each clause noun with one of its
+            // supertypes (one role at a time) and retry the rho-lookup.
+            //
+            // Walk the WHOLE chain and prefer the FARTHEST (most-general /
+            // root-most) supertype that resolves: a base relation is
+            // declared at the most general type it applies to, whereas a
+            // same-verb FT on a NEARER supertype is typically a DERIVED
+            // specialization (e.g. with `Fact Type < Resource < … <
+            // Function`, both `Resource belongs to Domain` (a derived
+            // consequent) and `Function belongs to Domain` (the asserted
+            // base relation) resolve — the root-most `Function` one is the
+            // declaration we want). Verb-specific only — the fuzzy role-set
+            // fallback is NOT retried under substitution, so this can only
+            // bind a clause to a same-verb FT on a genuine supertype, never
+            // fabricate a cross-verb match.
+            .or_else(|| {
+                if subtypes.is_empty() { return None; }
+                let mut best: Option<String> = None;
+                for i in 0..base_refs.len() {
+                    // supertype_chain is nearest→farthest; the LAST hit is
+                    // the root-most resolving substitution for this role.
+                    for sup in supertype_chain(&base_refs[i]) {
+                        let mut subst: Vec<&str> = role_refs.clone();
+                        subst[i] = sup.as_str();
+                        if let Some(id) = catalog.resolve(&subst, verb_opt) {
+                            best = Some(id);
+                        }
+                    }
+                    if best.is_some() { break; }
+                }
+                best
+            })
     };
 
     // A derivation CONSEQUENT must name a fact type that actually exists.
@@ -1708,12 +1778,34 @@ fn resolve_derivation_rule(
     // antecedent parts become join keys. Mutable because the #914
     // cross-antecedent-comparison branch below can append synthesised
     // shared-noun keys when promoting a rule to Join classification.
+    //
+    // At each `that ` site take the LONGEST matching noun: with multi-word
+    // nouns a shorter noun can be a prefix of a longer one (`that Fact` ⊂
+    // `that Fact Type`), and the naive substring test would record BOTH —
+    // injecting a spurious join key (`Fact`) that fans the equi-join onto
+    // the wrong role. `noun_names` is sorted longest-first; the first hit
+    // whose match ends on a word boundary is the intended anaphor.
+    let is_word_boundary = |b: Option<u8>| -> bool {
+        match b { None => true, Some(c) => !(c.is_ascii_alphanumeric() || c == b'_') }
+    };
     let mut join_keys: Vec<String> = antecedent_parts.iter()
         .flat_map(|part| {
-            noun_names.iter().filter_map(|noun| {
-                let pattern = format!("that {}", noun);
-                part.contains(&pattern).then(|| noun.clone())
-            }).collect::<Vec<_>>()
+            let bytes = part.as_bytes();
+            let mut keys: Vec<String> = Vec::new();
+            // Scan every `that ` occurrence; bind it to one noun (longest).
+            let mut search_from = 0usize;
+            while let Some(rel) = part[search_from..].find("that ") {
+                let noun_start = search_from + rel + "that ".len();
+                let after = &part[noun_start..];
+                if let Some(noun) = noun_names.iter().find(|noun| {
+                    after.starts_with(noun.as_str())
+                        && is_word_boundary(bytes.get(noun_start + noun.len()).copied())
+                }) {
+                    if !keys.contains(noun) { keys.push(noun.clone()); }
+                }
+                search_from = noun_start;
+            }
+            keys
         })
         .collect::<Vec<_>>();
 
@@ -2854,6 +2946,74 @@ fn resolve_derivation_rule(
             .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
             .unwrap_or_default();
     });
+
+    // subtype-join → supertype FT (join-matching bridge). The standard
+    // join classification above keys on a join NOUN appearing as a role on
+    // ≥2 antecedent FTs by EXACT noun name. A subtype-keyed join clause
+    // (`that Noun belongs to Domain`, Noun < Function) resolves (via the
+    // `resolve_fact_type` supertype retry) to a FT declared on the
+    // SUPERTYPE (`Function belongs to Domain`), whose role is `Function`,
+    // not `Noun` — so the exact-name match never links the two antecedents
+    // and the join collapses. Subtype instances ARE supertype instances,
+    // so bridge it: for each join key that is carried DIRECTLY by some
+    // antecedent FT and, on another antecedent FT, only by a role whose
+    // noun is a SUPERTYPE of the key, emit an asymmetric `match_on` pair
+    // `(key, supertype_role_noun)`. `compile_join_derivation`'s match-pair
+    // path (which already supports cross-name pairs) then equi-joins the
+    // subtype role to the supertype role. Narrow by construction: only
+    // fires when a direct holder AND a supertype holder both exist, so it
+    // can only complete a join the author already wrote (via `that <Sub>`),
+    // never fabricate one.
+    if !subtypes.is_empty() && rule.antecedent_sources.len() >= 2 {
+        let role_nouns_of = |ft_id: &str| -> Vec<String> {
+            if ft_id.is_empty() { return Vec::new(); }
+            fact_types_map.get(ft_id)
+                .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+                .unwrap_or_default()
+        };
+        let mut bridge_pairs: Vec<(String, String)> = Vec::new();
+        for key in rule.join_on.iter() {
+            // A direct holder carries the key noun verbatim as a role.
+            let has_direct_holder = rule.antecedent_sources.iter().any(|s| {
+                role_nouns_of(s.fact_type_id()).iter().any(|n| n == key)
+            });
+            if !has_direct_holder { continue; }
+            // Supertype chain of the key noun, for membership tests.
+            let key_supers = supertype_chain(key);
+            if key_supers.is_empty() { continue; }
+            // A supertype holder lacks the key noun but carries one of its
+            // supertypes as a role — the FT the subtype clause bridged to.
+            for s in rule.antecedent_sources.iter() {
+                let roles = role_nouns_of(s.fact_type_id());
+                if roles.iter().any(|n| n == key) { continue; } // it's a direct holder
+                if let Some(sup) = key_supers.iter().find(|sup| roles.iter().any(|n| &n == sup)) {
+                    let pair = (key.clone(), sup.clone());
+                    if !bridge_pairs.contains(&pair) {
+                        bridge_pairs.push(pair);
+                    }
+                }
+            }
+        }
+        if !bridge_pairs.is_empty() {
+            rule.kind = DerivationKind::Join;
+            for pair in bridge_pairs {
+                // Avoid a degenerate self-pair `(k, k)` from the standard
+                // block shadowing the asymmetric bridge: drop any `(k, k)`
+                // for a key we are bridging (its only direct holder can't
+                // self-join the supertype antecedent).
+                rule.match_on.retain(|(a, b)| !(a == &pair.0 && b == &pair.0));
+                if !rule.match_on.contains(&pair) {
+                    rule.match_on.push(pair);
+                }
+            }
+            if rule.consequent_bindings.is_empty() {
+                rule.consequent_bindings = fact_types_map
+                    .get(rule.consequent_cell.literal_id())
+                    .map(|ft| ft.roles.iter().map(|r| r.noun_name.clone()).collect())
+                    .unwrap_or_default();
+            }
+        }
+    }
 
     // Ring / self-join (whitepaper eq:join): when a Halpin numeric
     // subscript (`Person2`) recurs across >=2 antecedent clauses it is a

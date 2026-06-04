@@ -4188,7 +4188,7 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
                 && r.consequent_universals.is_empty()
         );
         if needs_resolve {
-            crate::parse_forml2::re_resolve_rules(&mut rules, &nouns, &fact_types);
+            crate::parse_forml2::re_resolve_rules(&mut rules, &nouns, &fact_types, &subtypes);
         }
         // task-930: honor Halpin's derivation-mode marker on FTs.
         // `Fact Type X has Derivation Mode 'fully-derived'` (from the

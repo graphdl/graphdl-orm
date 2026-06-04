@@ -1839,17 +1839,20 @@ Transition 'ship' is triggered by Fact Type 'Order_was_shipped'.
 //
 // The Resource/Fact rules' natural relating clause binds the subtype
 // noun (`Noun`, `Fact Type`) while `belongs to Domain` is declared on
-// the supertype `Function`; that clause shares no role NOUN-NAME with
-// the Function-keyed domain FT and does not resolve to it, so the bare
-// single-clause form does NOT join (pinned negatively by
-// `ns2_resource_and_fact_domain_rules_compile_and_store_no_domain`).
-// instances.md FIXES this readings-only via a single-sourcing FUNCTION
-// BRIDGE: a Noun / Fact Type IS a Function (same identity), so a
-// fully-derived `Resource is of Function` / `Fact is of Function`
-// re-labels that value under a `Function` role (computed-binding
-// rename), and the domain rule then joins on `Function` exactly like
-// Violation/Failure — so all four now FIRE (the Resource/Fact pair is
-// pinned by `ns2_{resource,fact}_derives_domain_*_via_function_bridge`).
+// the supertype `Function`. `resolve_derivation_rule` bridges this
+// subtype→supertype (subtype instances ARE supertype instances): it
+// resolves `that Noun belongs to Domain` UP to the Function-keyed domain
+// FT and emits an asymmetric `match_on` linking the subtype role (`Noun`)
+// to the supertype role (`Function`), so the bare single-clause form now
+// JOINS and FIRES (pinned positively by
+// `ns2_resource_and_fact_domain_rules_derive_domain_via_subtype_bridge`).
+// instances.md ALSO offers a readings-only single-sourcing FUNCTION
+// BRIDGE — a fully-derived `Resource is of Function` / `Fact is of
+// Function` that re-labels the value under a `Function` role
+// (computed-binding rename) so the domain rule joins on `Function`
+// exactly like Violation/Failure (pinned by
+// `ns2_{resource,fact}_derives_domain_*_via_function_bridge`); both the
+// native bridge and the explicit workaround land the same Domain.
 // What this task GUARANTEES for all four is that NO domain is stored on
 // the population/outcome: the consequent Fact Types carry the `*`
 // fully-derived marker, the bridge FTs store no domain (they re-project
@@ -2080,23 +2083,25 @@ fn ns2_failure_derives_domain_from_the_function_operation_it_is_against() {
 }
 
 #[test]
-fn ns2_resource_and_fact_domain_rules_compile_and_store_no_domain() {
-    // NEGATIVE pin (the rationale for the Function bridge): the
-    // UN-bridged single-clause shape — relating via the subtype noun
-    // (`is instance of Noun` / `is of Fact Type`) while `belongs to
-    // Domain` is declared on the supertype `Function` — does NOT
-    // materialise a domain. The subtype-noun relating clause shares no
-    // role NOUN-NAME with the Function-keyed `Function belongs to Domain`
-    // FT and the clause `that Noun belongs to Domain` does not resolve to
-    // it (the SchemaCatalog is keyed by role noun-SET; `[Domain, Noun]`
-    // is not a declared FT), so no join forms and the rule degrades to a
-    // 1-antecedent ModusPonens that copies only the relating fact's
-    // (Resource, Noun) / (Fact, Fact Type) bindings — never a Domain.
-    // This is the un-firing baseline the bridged rules in instances.md
-    // FIX (see `ns2_resource_derives_domain_from_its_noun_via_function_bridge`
-    // / `ns2_fact_derives_domain_from_its_fact_type_via_function_bridge`).
-    // What this test pins: both un-bridged rules PARSE/COMPILE, and the
-    // consequent carries NO domain — never a stored / divergent value.
+fn ns2_resource_and_fact_domain_rules_derive_domain_via_subtype_bridge() {
+    // POSITIVE pin (subtype-join → supertype FT). The DIRECT single-clause
+    // shape — relating via the subtype noun (`is instance of Noun` / `is
+    // of Fact Type`) while `belongs to Domain` is declared on the
+    // supertype `Function` (Noun < Function, Fact Type < … < Function) —
+    // now materialises a domain WITHOUT an explicit re-labelling bridge FT.
+    //
+    // Subtype instances ARE supertype instances, so `resolve_derivation_rule`
+    // (a) resolves the subtype-keyed clause `that Noun belongs to Domain` UP
+    // to the Function-keyed `Function belongs to Domain` FT, and (b) bridges
+    // the equi-join from the subtype role (`Noun`) to the supertype role
+    // (`Function`) via an asymmetric `match_on` pair. The join therefore
+    // forms and the Domain propagates onto the Resource / Fact — the same
+    // result the explicit `Resource is of Function` workaround produces (see
+    // `ns2_resource_derives_domain_from_its_noun_via_function_bridge`), but
+    // straight from the natural rule.
+    //
+    // (Was the negative baseline `…_compile_and_store_no_domain`, which
+    // pinned the un-firing pre-fix behaviour.)
     let state = ns2_fixture(
         "Resource is instance of Noun.\nResource belongs to Domain. *\n\
          Fact is of Fact Type.\nFact belongs to Domain. *",
@@ -2108,23 +2113,22 @@ fn ns2_resource_and_fact_domain_rules_compile_and_store_no_domain() {
          Fact 'f1' is of Fact Type 'OrderPlaced'.",
     );
 
-    // The un-bridged join does not fire, so NO domain is derived — and
-    // crucially it is NEVER a stored duplicate. The bridged form in
-    // instances.md is what flips these to Some("orders").
+    // The subtype-bridged join fires, so the Domain is derived on each
+    // consequent — single-sourced on the Function fact throughout.
     let res_dom = ns2_derived_domain("Resource_belongs_to_Domain", "Resource", "r1", &state);
     let fact_dom = ns2_derived_domain("Fact_belongs_to_Domain", "Fact", "f1", &state);
     assert_eq!(
-        res_dom, None,
-        "un-bridged Resource rule must NOT materialise a domain (subtype-noun \
-         relating clause shares no role with the Function-keyed domain FT); \
-         the bridge is what makes it fire. Got {:?}",
+        res_dom.as_deref(), Some("orders"),
+        "Resource r1 must DERIVE Domain 'orders' from the Noun it is an instance of, \
+         bridged subtype→supertype (Noun < Function) to the Function-keyed domain FT; \
+         got {:?}",
         res_dom,
     );
     assert_eq!(
-        fact_dom, None,
-        "un-bridged Fact rule must NOT materialise a domain (subtype-noun \
-         relating clause shares no role with the Function-keyed domain FT); \
-         the bridge is what makes it fire. Got {:?}",
+        fact_dom.as_deref(), Some("orders"),
+        "Fact f1 must DERIVE Domain 'orders' from the Fact Type it is of, \
+         bridged subtype→supertype (Fact Type < … < Function) to the Function-keyed \
+         domain FT; got {:?}",
         fact_dom,
     );
 }
@@ -7478,6 +7482,98 @@ Vehicle has Color.
         "anaphoric metamodel back-references must NOT produce additional \
          antecedent sources; extra sources={:#?}", non_subtype_sources,
     );
+}
+
+// ─── Subtype-join → supertype FT (resolver gap) ─────────────────────
+//
+// `resolve_derivation_rule` forms a forward-chain join by matching a
+// shared role NOUN-NAME between antecedent FTs. When a join clause has a
+// SUBTYPE subject (`that Noun belongs to Domain`) but the target FT is
+// declared on the SUPERTYPE (`Function belongs to Domain`, Noun <
+// Function), the subtype-keyed clause does not resolve to the
+// supertype-keyed FT, so the FT never enters `antecedent_sources` and
+// the join never forms — the rule collapses to a single-antecedent shape
+// that derives the wrong (or no) facts.
+//
+// Subtype instances ARE supertype instances, so the clause must resolve
+// UP to the supertype FT and the equi-join must bridge the subtype role
+// (`Noun`) to the supertype role (`Function`). This is the focused
+// shape-level pin for that fix.
+#[test]
+fn shape_subtype_subject_join_resolves_to_supertype_ft_and_fires() {
+    let src = r#"# Test
+Function(.id) is an entity type.
+Domain(.id) is an entity type.
+Resource(.id) is an entity type.
+Noun is a subtype of Function.
+
+## Fact Types
+Function belongs to Domain.
+Resource is instance of Noun.
+Resource belongs to Domain.
+
+## Derivation Rules
+* Resource belongs to Domain iff Resource is instance of Noun and that Noun belongs to Domain.
+"#;
+    let state = parse_to_state(src).expect("parse");
+    let data = compile::cell_index_from_state(&state);
+
+    // task-982 injects the subtype-inheritance rule, so find the user rule.
+    let rule = data.derivation_rules.iter()
+        .find(|r| r.text.contains("Resource belongs to Domain iff"))
+        .unwrap_or_else(|| panic!(
+            "user rule `Resource belongs to Domain iff ...` not found; rules={:#?}",
+            data.derivation_rules.iter().map(|r| r.text.as_str()).collect::<Vec<_>>()));
+
+    // (1) The `that Noun belongs to Domain` clause must NOT be dropped as
+    //     unresolved — it resolves UP to the supertype FT.
+    assert!(rule.unresolved_clauses.is_empty(),
+        "`that Noun belongs to Domain` must resolve to the supertype FT \
+         (Function_belongs_to_Domain), not land as UnresolvedClause; got: {:?}",
+        rule.unresolved_clauses);
+
+    // (2) Two antecedent sources: Resource_is_instance_of_Noun AND
+    //     Function_belongs_to_Domain (the subtype clause bridged up).
+    let src_ids: Vec<&str> = rule.antecedent_sources.iter()
+        .map(|s| s.fact_type_id()).collect();
+    assert_eq!(rule.antecedent_sources.len(), 2,
+        "two antecedents expected (the subtype clause bridges up to the \
+         supertype FT); sources={:#?}", rule.antecedent_sources);
+    assert!(src_ids.contains(&"Function_belongs_to_Domain"),
+        "antecedent must include the supertype FT `Function_belongs_to_Domain` \
+         (resolved from the subtype-keyed clause); sources={:?}", src_ids);
+    assert!(src_ids.contains(&"Resource_is_instance_of_Noun"),
+        "antecedent must include `Resource_is_instance_of_Noun`; sources={:?}", src_ids);
+
+    // (3) Routed as a Join.
+    assert_eq!(rule.kind, DerivationKind::Join,
+        "subtype-bridged join must route to DerivationKind::Join; got {:?}",
+        rule.kind);
+
+    // (4) Materialisation: Resource 'r1' is instance of Noun 'n1', and that
+    //     Noun (a Function) 'n1' belongs to Domain 'd1' ⇒ Resource 'r1'
+    //     belongs to Domain 'd1'.
+    let model = compile::compile(&state);
+    let cd = model.derivations.iter().find(|d| d.id == rule.id)
+        .unwrap_or_else(|| panic!("compiled derivation for rule `{}` missing", rule.id));
+    let out = apply_to_facts(&cd.func, &[
+        ("Resource_is_instance_of_Noun",
+            &[("Resource", "r1"), ("Noun", "n1")]),
+        ("Function_belongs_to_Domain",
+            &[("Function", "n1"), ("Domain", "d1")]),
+    ]);
+    let derived = decode_derived(&out);
+    assert_eq!(derived.len(), 1,
+        "one derived fact expected from the subtype-bridged join, got {:#?}", derived);
+    let (ft, _reading, bindings) = &derived[0];
+    assert_eq!(ft, "Resource_belongs_to_Domain",
+        "derived fact lands in the consequent cell, got {}", ft);
+    let resource = bindings.iter().find(|(r, _)| r == "Resource").map(|(_, v)| v.as_str());
+    let domain = bindings.iter().find(|(r, _)| r == "Domain").map(|(_, v)| v.as_str());
+    assert_eq!(resource, Some("r1"),
+        "Resource binding must be r1; bindings={:?}", bindings);
+    assert_eq!(domain, Some("d1"),
+        "Domain binding must be d1 (bridged from the supertype FT); bindings={:?}", bindings);
 }
 
 /// task 981 (subtype-join-antecedent child 4): end-to-end POSITIVE equivalence test.

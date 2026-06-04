@@ -247,6 +247,18 @@ name = "cross_antecedent_value_comparison_e2e"
 path = "tests/cross_antecedent_value_comparison_e2e.rs"
 required-features = ["test-bins"]
 
+# Subtype-join → supertype FT derivation-resolver gap. A derivation
+# whose join clause has a SUBTYPE subject (`that Noun belongs to Domain`)
+# but whose target FT is declared on the SUPERTYPE (`Function belongs to
+# Domain`, Noun < Function) must resolve the clause UP to the supertype
+# FT and form the forward-chain join (subtype instances ARE supertype
+# instances). Asserts `Resource_belongs_to_Domain` materialises the
+# expected tuple via the bridged join.
+[[test]]
+name = "subtype_join_antecedent_supertype_ft_e2e"
+path = "tests/subtype_join_antecedent_supertype_ft_e2e.rs"
+required-features = ["test-bins"]
+
 [features]
 # `test-bins` (#684/#650a) — opt-in flag that lets each integration
 # `[[test]]` entry compile. Off by default so `cargo test --lib`
