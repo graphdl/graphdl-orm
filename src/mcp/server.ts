@@ -46,7 +46,7 @@ import { z } from 'zod'
 import { readFileSync, writeFileSync, readdirSync, existsSync } from 'fs'
 import { resolve, dirname, join } from 'path'
 import { fileURLToPath } from 'url'
-import { spawn } from 'child_process'
+import { spawn, execFileSync } from 'child_process'
 import {
   buildAppCompileArgs,
   checkArestApps,
@@ -72,6 +72,7 @@ import {
 import { tutorSystemCall, resetSandbox, parseEngineRaw } from './tutor-sandbox.js'
 import { resolveArestCli } from './cli-resolver.js'
 import { checkCliStaleness } from './cli-staleness.js'
+import { compareEngineVersion } from './engine-version.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(__dirname, '..', '..')
@@ -573,6 +574,23 @@ function runArestCli(args: string[]): Promise<string> {
 
 function cliSystemCall(key: string, input: string, scope?: CallScope): Promise<string> {
   return runArestCli(['--db', currentDbPath(scope), key, input])
+}
+
+// Read the repo's current HEAD SHA for the engine_version staleness
+// check. Synchronous + bounded: this is a one-shot diagnostic, not a
+// hot path. Returns "unknown" when git is unavailable or the directory
+// isn't a repo, so compareEngineVersion can report "indeterminate"
+// rather than throw.
+function readHeadSha(): string {
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: REPO_ROOT,
+      encoding: 'utf8',
+      windowsHide: true,
+    }).trim()
+  } catch {
+    return 'unknown'
+  }
 }
 
 function compileAppReadings(app: ArestApp): Promise<string> {
@@ -1702,6 +1720,52 @@ server.registerTool(
       body: JSON.stringify(envelope),
     })
     return textResult(data)
+  },
+)
+
+// ── 2f. engine_version: is the LIVE engine current? ──────────────────
+//
+// The MCP pins AREST_CLI at startup (server.ts:AREST_CLI) and re-spawns
+// that exact path on every call. If the startup resolver picked a
+// binary from a different build profile than the one being rebuilt, the
+// server keeps spawning a STALE engine while the operator believes a
+// fresh build is live. cli-staleness.ts only compares the resolved
+// exe's MTIME to source, so it is blind to that profile mismatch. The
+// unambiguous fix is the RUNNING binary self-reporting its provenance:
+// `arest-cli version` prints the git SHA + build time it was compiled
+// from, and this verb compares that against the repo's current HEAD.
+//
+// NOTE: like cli-staleness, this answers about the binary the server is
+// ALREADY pinned to — a rebuild does not take effect until the MCP is
+// relaunched. That is precisely the footgun it detects.
+server.registerTool(
+  'engine_version',
+  {
+    description:
+      'Provenance + staleness of the LIVE AREST engine — "which engine is actually running, and is it current with the repo?" in ONE call. WHEN: after a `cargo build` of arest-cli, to confirm the freshly built binary is the one the MCP is actually spawning (the server PINS AREST_CLI at startup and re-spawns that exact path every call, so a rebuild does NOT take effect until relaunch); or any time a "deployed + verified" claim needs to be trusted. HOW: shells the pinned `arest-cli version` (which prints the git SHA + build timestamp it was compiled from, embedded at build time via build.rs), reads the repo HEAD via `git rev-parse HEAD`, and returns {live_sha, live_built, head_sha, pkg, up_to_date, behind_message}. up_to_date is true ONLY when the live binary\'s SHA equals HEAD. GOTCHA: when up_to_date is false the fix is REBUILD **then RELAUNCH the MCP** — the running server cannot pick up a new binary mid-session (this verb is the detector for exactly that situation). A "unknown" live_sha means the running binary predates this subcommand (relaunch after rebuild). ALTERNATIVE: orient for session re-orientation (apps + activity), apps.check for per-app DB health — neither reports the binary\'s git provenance. Local mode only; remote/cloudflare runs WASM/HTTP, not a pinned CLI.',
+    inputSchema: {},
+  },
+  async () => {
+    if (AREST_MODE !== 'local') {
+      return textResult({
+        mode: AREST_MODE,
+        up_to_date: null,
+        behind_message:
+          'engine_version reports the LOCAL pinned arest-cli binary; in ' +
+          `${AREST_MODE} mode the engine runs as WASM/HTTP and has no pinned CLI to interrogate.`,
+      })
+    }
+    let versionJson: string
+    try {
+      versionJson = await runArestCli(['version'])
+    } catch (err) {
+      // Old binary without the `version` subcommand, or a spawn failure.
+      // Surface as an unknown live SHA so the comparison flags it.
+      versionJson = JSON.stringify({ sha: 'unknown', built: 'unknown', pkg: 'unknown' })
+      if (AREST_DEBUG) console.error('[engine_version] arest-cli version failed:', err)
+    }
+    const comparison = compareEngineVersion(versionJson, readHeadSha())
+    return textResult({ ...comparison, cli_path: AREST_CLI })
   },
 )
 

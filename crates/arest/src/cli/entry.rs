@@ -899,6 +899,25 @@ pub fn main_entry() {
     // own exit code; unmatched first args fall through to the legacy
     // single-arg form (`arest <readings_dir>` etc.) below.
     if let Some(verb) = args.first() {
+        if verb == "version" || verb == "--version" || verb == "-V" {
+            // `arest-cli version` — emit the build provenance embedded by
+            // build.rs so the MCP (or an operator) can tell WHICH engine
+            // is actually live and whether it matches the repo HEAD. The
+            // MCP pins this binary's path at startup and re-spawns it every
+            // call, so a stale pin runs a stale engine undetected; this is
+            // the running binary self-reporting to close that gap. Feature-
+            // independent (no `local`/SQLite reach) and side-effect-free:
+            // reads env!() compile-time constants and prints JSON. Shape:
+            //   {"sha":"<git HEAD at build>","built":"<UTC>","pkg":"<ver>"}
+            // `sha` is "unknown" when git was unavailable at build time.
+            println!(
+                "{{\"sha\":\"{}\",\"built\":\"{}\",\"pkg\":\"{}\"}}",
+                env!("AREST_GIT_SHA"),
+                env!("AREST_BUILD_TIME"),
+                env!("CARGO_PKG_VERSION"),
+            );
+            std::process::exit(0);
+        }
         if verb == "reload" {
             // `arest reload <file.md>` (#561 / DynRdg-T2) — runtime reading
             // load via SystemVerb::LoadReading. Reads the body off disk,
@@ -1878,5 +1897,48 @@ mod stale_def_tests {
         // Unreachable bulk: pruned.
         assert_eq!(ast::fetch("query:Unrelated", &d), ast::Object::Bottom,
             "a def reachable from nothing in the seed closure must be pruned");
+    }
+}
+
+// build.rs / `version`-subcommand embedding smoke check. Feature-
+// independent (the `version` verb itself is) so it runs on the default
+// `cargo test --lib` without --features local. Asserts the build script
+// actually populated the provenance env vars that the subcommand prints
+// via env!(): a non-empty git SHA (real 40-hex when git is on PATH, or
+// the literal "unknown" graceful-degrade fallback) and a build time.
+// This is the Rust-side guard that the MCP's engine_version verb gets a
+// parseable, non-empty payload.
+#[cfg(test)]
+mod version_embedding_tests {
+    #[test]
+    fn build_rs_embeds_a_nonempty_git_sha() {
+        let sha = env!("AREST_GIT_SHA");
+        assert!(!sha.is_empty(), "AREST_GIT_SHA must be embedded by build.rs");
+        // Either a 40-char lowercase hex commit, or the documented
+        // graceful-degrade sentinel when git was unavailable at build.
+        let is_hex_sha = sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit());
+        assert!(
+            is_hex_sha || sha == "unknown",
+            "AREST_GIT_SHA should be a 40-hex commit or \"unknown\", got {sha:?}"
+        );
+    }
+
+    #[test]
+    fn build_rs_embeds_a_build_time() {
+        let built = env!("AREST_BUILD_TIME");
+        assert!(!built.is_empty(), "AREST_BUILD_TIME must be embedded by build.rs");
+        // Format is YYYY-MM-DDTHH:MM:SSZ (or "unknown" if SystemTime failed).
+        assert!(
+            built == "unknown"
+                || (built.len() == 20 && built.ends_with('Z') && built.as_bytes()[10] == b'T'),
+            "AREST_BUILD_TIME should be RFC3339-ish UTC or \"unknown\", got {built:?}"
+        );
+    }
+
+    #[test]
+    fn pkg_version_is_present() {
+        // The subcommand reads CARGO_PKG_VERSION, set by cargo for every
+        // build — guard it so the printed JSON's `pkg` field is never empty.
+        assert!(!env!("CARGO_PKG_VERSION").is_empty());
     }
 }
