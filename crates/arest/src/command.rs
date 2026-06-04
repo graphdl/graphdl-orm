@@ -7958,6 +7958,243 @@ Order is big.
             seeded_activations, full_activations);
     }
 
+    /// bridge-lag repro (this task) — CONFIRMED-FAILING, documents an open
+    /// engine bug; `#[ignore]`d so it doesn't break the suite (see the
+    /// `STOP` note in the task report). A TRANSITION runs the forward chain
+    /// (derivedCount > 0 — the "derivedCount=0 / transitions skip the chain"
+    /// premise is stale; the chain was already wired in at HEAD via the
+    /// `forward_chain_defs_state_seeded_tracked` call in `transition_via_
+    /// defs`). The residual bug is RETRACTION: a transition does NOT drop
+    /// the STALE derived tuples of the transitioned entity across the
+    /// cross-noun cascade.
+    ///
+    /// Exact live symptoms reproduced here (drive a REAL transition through
+    /// `apply_command_defs` + the production `merge_delta` persist step):
+    ///   * `Task_has_Task_Status` (task-957 SM→FT bridge) keeps the stale
+    ///     status tuple (e.g. a `block`ed Task still carries `in_progress`).
+    ///   * `Task_is_recommended` keeps the stale tuple — a `complete`d Task
+    ///     stays recommended.
+    ///
+    /// Root cause (diagnosed, not hypothetical): the stale tuples survive
+    /// because the keying is INCONSISTENT across the four layers a
+    /// transition touches —
+    ///   1. the #836 pre-chain wipe is noun-scoped (`derivation_index:Task`),
+    ///      so cross-noun INTERMEDIATES like `Resource_is_currently_in_Status`
+    ///      (keyed under Resource) are never cleared;
+    ///   2. the incremental seeded chain only recomputes the DIRTY entity's
+    ///      tuples (correct for perf), so an un-wiped intermediate keeps its
+    ///      stale tuple, which CASCADES into the bridge and `recommended`;
+    ///   3. the bridge-clobber RESTORE re-instates non-activated cells from a
+    ///      pre-drop snapshot that still holds the stale tuple;
+    ///   4. `merge_delta`'s `merge_map_cell_contents` UNIONs Map cells (task-
+    ///      922, needed for per-entity user cells) — and folded derived cells
+    ///      are keyed by the full-tuple hash (`cell_put_folded`), so a value
+    ///      CHANGE (same entity, new status) lands at a NEW key and coexists
+    ///      with the old instead of replacing it.
+    /// A naive whole-cell wipe + Seq-replace fixes the single-entity case but
+    /// DROPS untouched entities (the incremental chain doesn't recompute
+    /// them) — see the multi-entity guard below. A correct fix needs
+    /// per-entity retraction across the cascade (or consistent entity-keying
+    /// in all four layers), which is the larger change the task's STOP
+    /// condition defers.
+    ///
+    /// Fixture models the real apps/tasks shape: Task SM pending →
+    /// in_progress (start) → completed (complete) / blocked (block); the
+    /// `Task has Task Status` SM→FT bridge over the
+    /// `Resource is currently in Status` re-key; `Task is recommended iff
+    /// Task has Task Status 'pending'`. UCs on the bridge cells mirror
+    /// apps/tasks (entity-keyed storage).
+    #[test]
+    #[ignore = "CONFIRMED open bug: transitions don't retract stale cross-noun \
+                derived tuples (bridge-lag); fix deferred per STOP condition — \
+                needs per-entity cascade retraction. See doc comment."]
+    fn transition_refreshes_cross_noun_derived_cells() {
+        const TASK_BRIDGE_READINGS: &str = r#"
+# Tasks bridge
+
+## Entity Types
+
+Task(.id) is an entity type.
+Resource(.id) is an entity type.
+State Machine(.id) is an entity type.
+
+## Value Types
+
+Status is a value type.
+Task Status is a value type.
+
+## Fact Types
+
+State Machine is for Resource.
+State Machine is currently in Status.
+Resource is currently in Status.
+  Each Resource is currently in at most one Status.
+Task has Task Status.
+  Each Task has at most one Task Status.
+Task is recommended.
+
+## Derivation Rules
+
+* Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.
+* Task has Task Status iff that Resource is currently in some Status and Task Status is Status and Task is Resource.
+* Task is recommended iff Task has Task Status 'pending'.
+
+## Instance Facts
+
+State Machine Definition 'Task' is for Noun 'Task'.
+Status 'pending' is initial in State Machine Definition 'Task'.
+
+Transition 'start' is defined in State Machine Definition 'Task'.
+  Transition 'start' is from Status 'pending'.
+  Transition 'start' is to Status 'in_progress'.
+  Transition 'start' is triggered by Event Type 'start'.
+
+Transition 'complete' is defined in State Machine Definition 'Task'.
+  Transition 'complete' is from Status 'in_progress'.
+  Transition 'complete' is to Status 'completed'.
+  Transition 'complete' is triggered by Event Type 'complete'.
+
+Transition 'block' is defined in State Machine Definition 'Task'.
+  Transition 'block' is from Status 'in_progress'.
+  Transition 'block' is to Status 'blocked'.
+  Transition 'block' is triggered by Event Type 'block'.
+"#;
+        let meta = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let tasks = crate::parse_forml2::parse_to_state_with_nouns(TASK_BRIDGE_READINGS, &meta).unwrap();
+        let state = ast::merge_states(&meta, &tasks);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        // Helpers: read the cross-noun derived cells for a given Task.
+        let bridge_status = |st: &ast::Object, task: &str| -> Option<String> {
+            ast::fetch_cell_seq("Task_has_Task_Status", st).as_seq()
+                .and_then(|fs| fs.iter()
+                    .find(|f| ast::binding(f, "Task") == Some(task))
+                    .and_then(|f| ast::binding(f, "Task Status").map(String::from)))
+        };
+        let is_recommended = |st: &ast::Object, task: &str| -> bool {
+            ast::fetch_cell_seq("Task_is_recommended", st).as_seq()
+                .map(|fs| fs.iter().any(|f| ast::binding(f, "Task") == Some(task)))
+                .unwrap_or(false)
+        };
+
+        // CREATE t-1 → SM inits to pending; forward chain derives the
+        // bridge (pending) and marks it recommended. (Establishes the
+        // baseline that CREATE re-derives, per the diagnosis.)
+        let mut fields = HashMap::new();
+        fields.insert("id".to_string(), "t-1".to_string());
+        let created = apply_command_defs(&def_obj, &Command::CreateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            id: Some("t-1".to_string()),
+            fields,
+            sender: None,
+            signature: None,
+        }, &state);
+        assert!(!created.rejected, "create rejected: {:?}", created.violations);
+        let after_c1 = ast::merge_delta(&state, &created.state, None);
+
+        // Create a SECOND task t-2 that STAYS pending — multi-entity guard:
+        // transitioning t-1 must NOT drop t-2's derived bridge/recommended
+        // tuples (the broadened pre-chain wipe clears every derived cell, so
+        // the chain must recompute ALL entities, and the Seq-flatten/replace
+        // must not lose untouched entities).
+        let mut fields2 = HashMap::new();
+        fields2.insert("id".to_string(), "t-2".to_string());
+        let created2 = apply_command_defs(&def_obj, &Command::CreateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            id: Some("t-2".to_string()),
+            fields: fields2,
+            sender: None,
+            signature: None,
+        }, &after_c1);
+        assert!(!created2.rejected, "create t-2 rejected: {:?}", created2.violations);
+        let after_create = ast::merge_delta(&after_c1, &created2.state, None);
+        assert_eq!(bridge_status(&after_create, "t-1").as_deref(), Some("pending"),
+            "sanity: bridge must read pending after create");
+        assert!(is_recommended(&after_create, "t-1"),
+            "sanity: a pending task must be recommended after create");
+        assert_eq!(bridge_status(&after_create, "t-2").as_deref(), Some("pending"),
+            "sanity: t-2 bridge must read pending after create");
+
+        // TRANSITION start (pending → in_progress). The bridge must
+        // refresh to in_progress and the task must drop from recommended.
+        let started = apply_command_defs(&def_obj, &Command::Transition {
+            entity_id: "t-1".to_string(),
+            event: "start".to_string(),
+            domain: "tasks".to_string(),
+            current_status: Some("pending".to_string()),
+            sender: None,
+            signature: None,
+        }, &after_create);
+        assert!(!started.rejected, "start transition rejected: {:?}", started.violations);
+        assert_eq!(started.status.as_deref(), Some("in_progress"));
+        let after_start = ast::merge_delta(&after_create, &started.state, None);
+        assert_eq!(bridge_status(&after_start, "t-1").as_deref(), Some("in_progress"),
+            "BRIDGE-LAG: Task_has_Task_Status must refresh to in_progress after \
+             the start transition — the transition must run the forward chain. \
+             Stale value here is the reported symptom.");
+        // Multi-entity guard: t-2 (untouched, still pending) must keep its
+        // derived bridge + recommended tuples through t-1's transition.
+        assert_eq!(bridge_status(&after_start, "t-2").as_deref(), Some("pending"),
+            "transitioning t-1 must NOT drop t-2's bridge tuple — the broadened \
+             wipe recomputes all entities; an untouched entity's derived fact \
+             must survive.");
+        assert!(is_recommended(&after_start, "t-2"),
+            "t-2 (still pending) must remain recommended after t-1's transition");
+        assert!(!is_recommended(&after_start, "t-1"),
+            "Task_is_recommended must DROP t-1 once it leaves pending — the \
+             transition must re-derive the recommended cell.");
+
+        // TRANSITION complete (in_progress → completed): the completed
+        // Task must be GONE from Task_is_recommended (the reported symptom:
+        // a completed Task is still listed as recommended).
+        let completed = apply_command_defs(&def_obj, &Command::Transition {
+            entity_id: "t-1".to_string(),
+            event: "complete".to_string(),
+            domain: "tasks".to_string(),
+            current_status: Some("in_progress".to_string()),
+            sender: None,
+            signature: None,
+        }, &after_start);
+        assert!(!completed.rejected, "complete transition rejected: {:?}", completed.violations);
+        assert_eq!(completed.status.as_deref(), Some("completed"));
+        let after_complete = ast::merge_delta(&after_start, &completed.state, None);
+        assert_eq!(bridge_status(&after_complete, "t-1").as_deref(), Some("completed"),
+            "Task_has_Task_Status must read completed after the complete transition");
+        assert!(!is_recommended(&after_complete, "t-1"),
+            "a COMPLETED task must NOT be listed as recommended — the transition \
+             must re-derive Task_is_recommended off the new status. This is the \
+             exact reported staleness.");
+
+        // TRANSITION block — separately drive in_progress → blocked and
+        // assert the bridge reads 'blocked' (the reported `blocked` case).
+        let started2 = apply_command_defs(&def_obj, &Command::Transition {
+            entity_id: "t-1".to_string(),
+            event: "start".to_string(),
+            domain: "tasks".to_string(),
+            current_status: Some("pending".to_string()),
+            sender: None,
+            signature: None,
+        }, &after_create);
+        let after_start2 = ast::merge_delta(&after_create, &started2.state, None);
+        let blocked = apply_command_defs(&def_obj, &Command::Transition {
+            entity_id: "t-1".to_string(),
+            event: "block".to_string(),
+            domain: "tasks".to_string(),
+            current_status: Some("in_progress".to_string()),
+            sender: None,
+            signature: None,
+        }, &after_start2);
+        assert!(!blocked.rejected, "block transition rejected: {:?}", blocked.violations);
+        assert_eq!(blocked.status.as_deref(), Some("blocked"));
+        let after_block = ast::merge_delta(&after_start2, &blocked.state, None);
+        assert_eq!(bridge_status(&after_block, "t-1").as_deref(), Some("blocked"),
+            "BRIDGE-LAG: blocking a Task must make Task_has_Task_Status read \
+             'blocked'; a stale 'in_progress' here is the reported bug.");
+    }
+
     #[test]
     fn query_command_returns_matches() {
         let (def_map, _) = setup_order_defs();
