@@ -3331,6 +3331,63 @@ fn translate_subtypes(classified_state: &Object, idx: &StmtIndex) -> Vec<Object>
     }).collect()
 }
 
+/// parser-prose-form-classification-tightening — true when `stmt_id`'s
+/// canonical text is a NON-fenced prose sentence rather than a real
+/// FORML 2 fact-type reading, so it must NOT mint a `FactType` (a
+/// reference).
+///
+/// A real reading begins directly with its declared head noun
+/// (`Customer places Order.`). Prose scaffolds the sentence with a
+/// leading article or demonstrative (`The Customer reviews each
+/// Order.`, `This Order belongs to that Customer.`). The two shapes
+/// are structurally identical at the role-reference level — both carry
+/// `Statement_has_Role_Reference` tokens for the declared nouns — so
+/// the `ends_like_statement` period-gate cannot separate them and the
+/// prose slips through to be classified as `Fact Type Reading`.
+///
+/// The distinguishing signal: the canonical text does NOT start with
+/// the matched head noun AND its leading whitespace-delimited token is
+/// an article / demonstrative drawn from `ProseStopwordTable`
+/// (`The`, `A`, `An`, `This`, `That`).
+///
+/// Scope is deliberately the article / demonstrative SUBSET of
+/// `ProseStopwordTable`, NOT the whole table. The quantifier /
+/// conditional stopwords (`Each`, `Every`, `Some`, `No`, `If`, `When`,
+/// `Then`) legitimately LEAD real constraint and derivation statements
+/// — `Each Wine App has exactly one Compat Rating.`,
+/// `No App extends itself.` — which already carry their own structural
+/// classification (Cardinality / Ring / …) and are therefore excluded
+/// from FT minting by the caller's `exclude` list before this check is
+/// ever consulted. Treating those as prose here would risk dropping a
+/// real reading that happens to classify only as Fact Type Reading, so
+/// they are intentionally left out.
+///
+/// The "head noun not at offset 0" guard preserves a multi-word noun
+/// whose declared name happens to begin with an article
+/// (`The Hague places Order.` — head noun `The Hague` sits at offset 0,
+/// so it is a real reading, not prose).
+fn is_prose_led_non_reading(idx: &StmtIndex, stmt_id: &str) -> bool {
+    // Articles + demonstratives: the prose-scaffold subset of
+    // `ProseStopwordTable` that no real FORML 2 reading begins with.
+    // Whole-token, case-sensitive — same membership semantics as the
+    // table's `contains`. The lead token must be in BOTH this safe
+    // subset AND the declared `ProseStopwordTable` (intersection), so a
+    // future grammar edit that drops one of these words from the
+    // `Prose Stopword` enum also narrows this gate.
+    const LEADING_PROSE: &[&str] = &["The", "A", "An", "This", "That"];
+    let Some(text) = statement_text(idx, stmt_id) else { return false; };
+    let trimmed = text.trim();
+    // Real reading: canonical text starts with the declared head noun.
+    if let Some(head) = head_noun_for(idx, stmt_id) {
+        if trimmed.starts_with(head.as_str()) {
+            return false;
+        }
+    }
+    let lead = trimmed.split_whitespace().next().unwrap_or("");
+    let stopwords = ProseStopwordTable::boot();
+    LEADING_PROSE.contains(&lead) && stopwords.contains(lead)
+}
+
 /// Translate statements carrying an ORM 2 derivation marker (`*` /
 /// `**` / `+`) into `Fact Type has Derivation Mode` instance facts,
 /// matching legacy's `emit_instance_fact(ir, "Fact Type", <reading>,
@@ -3370,6 +3427,13 @@ fn translate_derivation_mode_facts(classified_state: &Object, idx: &StmtIndex) -
             continue;
         }
         if classifications_contains_any(idx, stmt_id, &exclude) {
+            continue;
+        }
+        // parser-prose-form-classification-tightening — mirror
+        // translate_fact_types: article / demonstrative-led prose is
+        // not a real Fact Type reading, so it must not spawn a
+        // `Fact Type has Derivation Mode` instance fact either.
+        if is_prose_led_non_reading(idx, stmt_id) {
             continue;
         }
         let Some(mode) = derivation_marker_for(idx,stmt_id) else { continue };
@@ -3459,6 +3523,15 @@ fn translate_fact_types(classified_state: &Object, idx: &StmtIndex) -> (Vec<Obje
             continue;
         }
         if classifications_contains_any(idx, stmt_id, &exclude) {
+            continue;
+        }
+        // parser-prose-form-classification-tightening — a non-fenced
+        // prose sentence ending in '.' that mentions declared nouns
+        // (`The Customer reviews each Order.`) classifies as Fact Type
+        // Reading just like a real reading, so the period-gate lets it
+        // through. Skip article / demonstrative-led prose so it does
+        // NOT mint a spurious reference.
+        if is_prose_led_non_reading(idx, stmt_id) {
             continue;
         }
         let roles = role_refs_for(idx,stmt_id);
@@ -7401,6 +7474,97 @@ mod tests {
         let classified = classify_statements(&stmt, &grammar_state());
         let (ft, _) = super::translate_fact_types(&classified, &idx(&classified));
         assert!(ft.is_empty());
+    }
+
+    // ── parser-prose-form-classification-tightening ─────────────────
+    //
+    // A NON-fenced prose sentence that ends in '.' and mentions
+    // declared nouns is structurally indistinguishable from a real
+    // binary reading at the role-reference level, so it slips past the
+    // `ends_like_statement` period-gate and `translate_fact_types`
+    // mints a spurious FactType (a reference). The distinguishing
+    // signal real FORML2 readings never use: a leading article /
+    // demonstrative (`The`, `A`, `An`, `This`, `That`). A real reading
+    // begins directly with its declared head noun
+    // (`Customer places Order.`), never with prose scaffolding.
+    //
+    // RED test: `The Customer reviews each Order.` currently mints a
+    // `FactType` even though it is prose. After the fix it must emit
+    // nothing.
+    #[test]
+    fn translate_fact_types_skips_article_led_prose_sentence() {
+        let stmt = stage1_state(
+            "s1", "The Customer reviews each Order.",
+            &["Customer", "Order"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let (ft, roles) = super::translate_fact_types(&classified, &idx(&classified));
+        assert!(ft.is_empty(),
+            "article-led prose must not mint a FactType; got {:?}", ft);
+        assert!(roles.is_empty(),
+            "article-led prose must not mint Role facts; got {:?}", roles);
+    }
+
+    // Companion prose shapes: demonstrative-led (`This`/`That`) prose
+    // sentences that mention declared nouns must also be skipped. These
+    // are drawn from real corpus prose
+    // (`This is design-doc §4.5 ... instantiated as a predicate
+    // reading.`, `The form STRUCTURE ... is established here.`).
+    #[test]
+    fn translate_fact_types_skips_demonstrative_led_prose_sentence() {
+        for text in [
+            "This Order belongs to that Customer.",
+            "That Customer reviews each Order.",
+            "A Customer reviews the Order.",
+            "An Order belongs to a Customer.",
+        ] {
+            let stmt = stage1_state("s1", text, &["Customer", "Order"]);
+            let classified = classify_statements(&stmt, &grammar_state());
+            let (ft, _) = super::translate_fact_types(&classified, &idx(&classified));
+            assert!(ft.is_empty(),
+                "prose {:?} must not mint a FactType; got {:?}", text, ft);
+        }
+    }
+
+    // GUARD: real fact-type readings of BOTH shapes MUST survive the
+    // prose-tightening. The bare binary `Customer places Order.` and a
+    // longer multi-word verb reading must still mint their FactType +
+    // Role facts exactly as before. (The single-statement binary case
+    // is also covered by `translate_fact_types_emits_ft_and_role_facts_for_binary`;
+    // this guard pins the multi-word + ternary shapes alongside it so a
+    // future prose-gate tweak can't silently swallow a real reading
+    // that happens to embed a stopword in a NON-leading position.)
+    #[test]
+    fn translate_fact_types_preserves_real_readings_after_prose_tightening() {
+        // (a) bare binary reading — starts directly with the head noun.
+        let bare = stage1_state(
+            "s1", "Customer places Order.", &["Customer", "Order"]);
+        let classified = classify_statements(&bare, &grammar_state());
+        let (ft, roles) = super::translate_fact_types(&classified, &idx(&classified));
+        assert_eq!(ft.len(), 1, "bare reading must mint exactly one FactType");
+        assert_eq!(binding(&ft[0], "id"), Some("Customer_places_Order"));
+        assert_eq!(roles.len(), 2);
+
+        // (b) multi-word verb reading with an embedded stopword NOT in
+        // leading position (`reviews each` mid-sentence). A real reading
+        // is allowed to contain prose words internally; only a LEADING
+        // article/demonstrative marks prose.
+        let multiword = stage1_state(
+            "s1", "Customer places urgent Order.", &["Customer", "Order"]);
+        let classified = classify_statements(&multiword, &grammar_state());
+        let (ft, roles) = super::translate_fact_types(&classified, &idx(&classified));
+        assert_eq!(ft.len(), 1, "multi-word reading must still mint a FactType");
+        assert_eq!(binding(&ft[0], "reading"), Some("Customer places urgent Order"));
+        assert_eq!(roles.len(), 2);
+
+        // (c) ternary reading — three declared role nouns, starts with
+        // the head noun. Must survive untouched.
+        let ternary = stage1_state(
+            "s1", "Customer places Order for Product.",
+            &["Customer", "Order", "Product"]);
+        let classified = classify_statements(&ternary, &grammar_state());
+        let (ft, roles) = super::translate_fact_types(&classified, &idx(&classified));
+        assert_eq!(ft.len(), 1, "ternary reading must still mint a FactType");
+        assert_eq!(roles.len(), 3);
     }
 
     #[test]
