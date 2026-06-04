@@ -8258,6 +8258,156 @@ Transition 'block' is defined in State Machine Definition 'Task'.
              'blocked'; a stale 'in_progress' here is the reported bug.");
     }
 
+    /// REPRO (recommend-cascade-enum-global-scale, p1): the LIVE recommendation
+    /// CASCADE (enum-global superlative `Task Priority is recommended` + the
+    /// equi-join `Task is recommended`), driven through the REAL command path
+    /// (`apply_command_defs` create/transition + `merge_delta` persist), exactly
+    /// like apps/tasks. Live trigger: pending p0/p1/p2 exist; COMPLETE the only
+    /// pending p0 so the recommended ceiling must PROMOTE to p1. After the
+    /// transition, ONLY pending p1 must be recommended; the completed p0 and the
+    /// lower p2 must NOT be. The reported defect is that every pending tier
+    /// stays recommended after such a re-derive.
+    #[test]
+    fn transition_recommendation_cascade_promotes_ceiling() {
+        const TASK_PRIO_READINGS: &str = r#"
+# Tasks priority cascade
+
+## Entity Types
+
+Task(.id) is an entity type.
+Resource(.id) is an entity type.
+State Machine(.id) is an entity type.
+
+## Value Types
+
+Status is a value type.
+Task Status is a value type.
+Task Priority is a value type.
+
+## Fact Types
+
+State Machine is for Resource.
+State Machine is currently in Status.
+Resource is currently in Status.
+  Each Resource is currently in at most one Status.
+Task has Task Status.
+  Each Task has at most one Task Status.
+Task has Task Priority.
+  Each Task has at most one Task Priority.
+Task Priority is recommended.
+Task is recommended.
+
+## Constraints
+
+Task Priority enumerates 'p0', 'p1', 'p2', 'p3'.
+
+## Derivation Rules
+
+* Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.
+* Task has Task Status iff that Resource is currently in some Status and Task Status is Status and Task is Resource.
+* Task Priority is recommended iff some Task has the highest Task Priority among Tasks that have Task Status 'pending'.
+* Task is recommended iff Task has Task Status 'pending' and Task has Task Priority and Task Priority is recommended.
+
+## Instance Facts
+
+State Machine Definition 'Task' is for Noun 'Task'.
+Status 'pending' is initial in State Machine Definition 'Task'.
+
+Transition 'start' is defined in State Machine Definition 'Task'.
+  Transition 'start' is from Status 'pending'.
+  Transition 'start' is to Status 'in_progress'.
+  Transition 'start' is triggered by Event Type 'start'.
+
+Transition 'complete' is defined in State Machine Definition 'Task'.
+  Transition 'complete' is from Status 'in_progress'.
+  Transition 'complete' is to Status 'completed'.
+  Transition 'complete' is triggered by Event Type 'complete'.
+"#;
+        let meta = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let tasks = crate::parse_forml2::parse_to_state_with_nouns(TASK_PRIO_READINGS, &meta).unwrap();
+        let state = ast::merge_states(&meta, &tasks);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        let is_recommended = |st: &ast::Object, task: &str| -> bool {
+            ast::fetch_cell_seq("Task_is_recommended", st).as_seq()
+                .map(|fs| fs.iter().any(|f| ast::binding(f, "Task") == Some(task)))
+                .unwrap_or(false)
+        };
+        let recommended_priority = |st: &ast::Object| -> Vec<String> {
+            let mut v: Vec<String> = ast::fetch_cell_seq("Task_Priority_is_recommended", st).as_seq()
+                .map(|fs| fs.iter()
+                    .filter_map(|f| ast::binding(f, "Task Priority").map(String::from))
+                    .collect())
+                .unwrap_or_default();
+            v.sort(); v.dedup(); v
+        };
+
+        // Create three pending tasks at p0, p1, p2.
+        let mut st = state.clone();
+        for (id, prio) in [("t-p0", "p0"), ("t-p1", "p1"), ("t-p2", "p2")] {
+            let mut fields = HashMap::new();
+            fields.insert("id".to_string(), id.to_string());
+            fields.insert("Task Priority".to_string(), prio.to_string());
+            let created = apply_command_defs(&def_obj, &Command::CreateEntity {
+                noun: "Task".to_string(),
+                domain: "tasks".to_string(),
+                id: Some(id.to_string()),
+                fields,
+                sender: None,
+                signature: None,
+            }, &st);
+            assert!(!created.rejected, "create {} rejected: {:?}", id, created.violations);
+            st = ast::merge_delta(&st, &created.state, None);
+        }
+
+        // Baseline: only pending p0 is recommended (ceiling = p0).
+        assert_eq!(recommended_priority(&st), vec!["p0".to_string()],
+            "baseline: recommended priority must be exactly p0; got {:?}", recommended_priority(&st));
+        assert!(is_recommended(&st, "t-p0"), "baseline: pending p0 recommended");
+        assert!(!is_recommended(&st, "t-p1"), "baseline: p1 not recommended while p0 pending");
+        assert!(!is_recommended(&st, "t-p2"), "baseline: p2 not recommended while p0 pending");
+
+        // Drive t-p0 pending → in_progress → completed (the live trigger:
+        // clear the only pending p0 so the ceiling must promote to p1).
+        let started = apply_command_defs(&def_obj, &Command::Transition {
+            entity_id: "t-p0".to_string(),
+            event: "start".to_string(),
+            domain: "tasks".to_string(),
+            current_status: Some("pending".to_string()),
+            sender: None,
+            signature: None,
+        }, &st);
+        assert!(!started.rejected, "start rejected: {:?}", started.violations);
+        st = ast::merge_delta(&st, &started.state, None);
+
+        let completed = apply_command_defs(&def_obj, &Command::Transition {
+            entity_id: "t-p0".to_string(),
+            event: "complete".to_string(),
+            domain: "tasks".to_string(),
+            current_status: Some("in_progress".to_string()),
+            sender: None,
+            signature: None,
+        }, &st);
+        assert!(!completed.rejected, "complete rejected: {:?}", completed.violations);
+        assert_eq!(completed.status.as_deref(), Some("completed"));
+        st = ast::merge_delta(&st, &completed.state, None);
+
+        // After completing p0, the recommended ceiling must PROMOTE to p1.
+        assert_eq!(recommended_priority(&st), vec!["p1".to_string()],
+            "PROMOTION: after completing the only pending p0, recommended priority \
+             must be exactly p1 (NOT all tiers); got {:?}", recommended_priority(&st));
+        assert!(!is_recommended(&st, "t-p0"),
+            "completed p0 must NOT be recommended; got recommended priorities {:?}",
+            recommended_priority(&st));
+        assert!(is_recommended(&st, "t-p1"),
+            "pending p1 must be recommended after ceiling promotes; got recommended priorities {:?}",
+            recommended_priority(&st));
+        assert!(!is_recommended(&st, "t-p2"),
+            "pending p2 must NOT be recommended (p1 outranks); got recommended priorities {:?}",
+            recommended_priority(&st));
+    }
+
     #[test]
     fn query_command_returns_matches() {
         let (def_map, _) = setup_order_defs();

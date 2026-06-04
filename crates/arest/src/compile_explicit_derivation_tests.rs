@@ -8041,6 +8041,185 @@ Task is recommended.
         "p0-present case: pending p2 must NOT be recommended (p0 outranks it); got {:?}", recs2);
 }
 
+// REPRO (recommend-cascade-enum-global-scale, p1): the LIVE defect — at
+// scale, with MANY pending tasks across every tier p0..p3, the cascade
+// recommends ALL pending tiers instead of only the single highest-present
+// tier. Two scaled cases:
+//   Case A (live trigger): NO pending p0; pending work at p1/p2/p3, plus
+//     a completed p0. Expected recommended ceiling = p1 → ONLY the pending
+//     p1 tasks fire. p2/p3 must NOT.
+//   Case B: pending p0 present alongside p1/p2/p3 → ONLY pending p0 tasks.
+// Multiple tasks per tier and a mix of non-pending statuses exercise the
+// fold over a larger global group than the existing single-task-per-tier
+// fixtures (which pass).
+#[test]
+fn task_recommendation_only_highest_tier_at_scale() {
+    let src = r#"# Task recommendation cascade — scale repro
+Task(.id) is an entity type.
+Owner is a value type.
+Task Priority is a value type.
+Task Status is a value type.
+Task Priority enumerates 'p0', 'p1', 'p2', 'p3'.
+Task Status enumerates 'pending', 'in_progress', 'blocked', 'completed', 'deleted'.
+
+## Fact Types
+Task has Task Priority.
+  Each Task has at most one Task Priority.
+Task has Task Status.
+  Each Task has at most one Task Status.
+Task has Owner.
+Task blocks Task.
+Task Priority is recommended.
+Task is recommended.
+
+## Derivation Rules
+* Task Priority is recommended iff some Task has the highest Task Priority among Tasks that have Task Status 'pending'.
+* Task is recommended iff Task has Task Status 'pending' and Task has Task Priority and Task Priority is recommended.
+"#;
+
+    // ── Case A: live trigger — no pending p0, pending p1/p2/p3 present,
+    // completed p0 present. Ceiling must PROMOTE to p1.
+    let recs_a = recommended_tasks_for(src, &[
+        // completed p0 (must not raise ceiling, must not be recommended)
+        ("Task_has_Task_Priority", &[("Task", "done-p0a"), ("Task Priority", "p0")]),
+        ("Task_has_Task_Status",   &[("Task", "done-p0a"), ("Task Status", "completed")]),
+        ("Task_has_Task_Priority", &[("Task", "done-p0b"), ("Task Priority", "p0")]),
+        ("Task_has_Task_Status",   &[("Task", "done-p0b"), ("Task Status", "completed")]),
+        // pending p1 (the expected winners) — multiple
+        ("Task_has_Task_Priority", &[("Task", "t-p1a"), ("Task Priority", "p1")]),
+        ("Task_has_Task_Status",   &[("Task", "t-p1a"), ("Task Status", "pending")]),
+        ("Task_has_Task_Priority", &[("Task", "t-p1b"), ("Task Priority", "p1")]),
+        ("Task_has_Task_Status",   &[("Task", "t-p1b"), ("Task Status", "pending")]),
+        // pending p2 (must NOT be recommended)
+        ("Task_has_Task_Priority", &[("Task", "t-p2a"), ("Task Priority", "p2")]),
+        ("Task_has_Task_Status",   &[("Task", "t-p2a"), ("Task Status", "pending")]),
+        ("Task_has_Task_Priority", &[("Task", "t-p2b"), ("Task Priority", "p2")]),
+        ("Task_has_Task_Status",   &[("Task", "t-p2b"), ("Task Status", "pending")]),
+        // pending p3 (must NOT be recommended)
+        ("Task_has_Task_Priority", &[("Task", "t-p3a"), ("Task Priority", "p3")]),
+        ("Task_has_Task_Status",   &[("Task", "t-p3a"), ("Task Status", "pending")]),
+    ]);
+    let mut sorted_a = recs_a.clone();
+    sorted_a.sort();
+    sorted_a.dedup();
+    assert!(recs_a.contains(&"t-p1a".to_string()) && recs_a.contains(&"t-p1b".to_string()),
+        "Case A: both pending p1 tasks must be recommended (ceiling promotes to p1); got {:?}", sorted_a);
+    assert!(!recs_a.iter().any(|t| t.starts_with("t-p2")),
+        "Case A: NO pending p2 may be recommended (p1 outranks); got {:?}", sorted_a);
+    assert!(!recs_a.iter().any(|t| t.starts_with("t-p3")),
+        "Case A: NO pending p3 may be recommended (p1 outranks); got {:?}", sorted_a);
+    assert!(!recs_a.iter().any(|t| t.starts_with("done-p0")),
+        "Case A: completed p0 may not be recommended; got {:?}", sorted_a);
+
+    // ── Case B: pending p0 present → only pending p0 wins.
+    let recs_b = recommended_tasks_for(src, &[
+        ("Task_has_Task_Priority", &[("Task", "t-p0a"), ("Task Priority", "p0")]),
+        ("Task_has_Task_Status",   &[("Task", "t-p0a"), ("Task Status", "pending")]),
+        ("Task_has_Task_Priority", &[("Task", "t-p0b"), ("Task Priority", "p0")]),
+        ("Task_has_Task_Status",   &[("Task", "t-p0b"), ("Task Status", "pending")]),
+        ("Task_has_Task_Priority", &[("Task", "t-p1a"), ("Task Priority", "p1")]),
+        ("Task_has_Task_Status",   &[("Task", "t-p1a"), ("Task Status", "pending")]),
+        ("Task_has_Task_Priority", &[("Task", "t-p2a"), ("Task Priority", "p2")]),
+        ("Task_has_Task_Status",   &[("Task", "t-p2a"), ("Task Status", "pending")]),
+        ("Task_has_Task_Priority", &[("Task", "t-p3a"), ("Task Priority", "p3")]),
+        ("Task_has_Task_Status",   &[("Task", "t-p3a"), ("Task Status", "pending")]),
+    ]);
+    let mut sorted_b = recs_b.clone();
+    sorted_b.sort();
+    sorted_b.dedup();
+    assert!(recs_b.contains(&"t-p0a".to_string()) && recs_b.contains(&"t-p0b".to_string()),
+        "Case B: both pending p0 tasks must be recommended; got {:?}", sorted_b);
+    assert!(!recs_b.iter().any(|t| t.starts_with("t-p1") || t.starts_with("t-p2") || t.starts_with("t-p3")),
+        "Case B: only pending p0 may be recommended; got {:?}", sorted_b);
+}
+
+// REPRO (recommend-cascade-enum-global-scale, p1) — LIVE PATH. Unlike the
+// fixtures above, `Task has Task Status` is NOT a base fact: it is DERIVED
+// by the SM→status bridge (app.md lines 159-163), exactly as in production.
+// The recommendation cascade runs in the SAME forward-chain fixpoint as the
+// bridge. Status is populated via the SM cells. Live trigger: no pending p0
+// (its SM is in 'completed'), pending p1/p2/p3 → expected ceiling p1 → only
+// pending p1 recommended.
+#[test]
+fn task_recommendation_only_highest_tier_via_sm_bridge() {
+    let src = r#"# Task recommendation cascade — SM-bridge live path
+Task(.id) is an entity type.
+State Machine(.id) is an entity type.
+Resource(.Reference) is an entity type.
+
+Task is a subtype of Resource.
+
+Task Priority is a value type.
+Task Status is a value type.
+Status is a value type.
+Task Priority enumerates 'p0', 'p1', 'p2', 'p3'.
+Task Status enumerates 'pending', 'in_progress', 'blocked', 'completed', 'deleted'.
+
+## Fact Types
+Task has Task Priority.
+  Each Task has at most one Task Priority.
+Task has Task Status.
+Resource is currently in Status.
+State Machine is for Resource.
+State Machine is currently in Status.
+Task Priority is recommended.
+Task is recommended.
+
+## Derivation Rules
+* Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.
+* Task has Task Status iff that Resource is currently in some Status and Task Status is Status and Task is Resource.
+* Task Priority is recommended iff some Task has the highest Task Priority among Tasks that have Task Status 'pending'.
+* Task is recommended iff Task has Task Status 'pending' and Task has Task Priority and Task Priority is recommended.
+
+## Instance Facts
+Task 'done-p0' has Task Priority 'p0'.
+Task 't-p1a' has Task Priority 'p1'.
+Task 't-p1b' has Task Priority 'p1'.
+Task 't-p2a' has Task Priority 'p2'.
+Task 't-p3a' has Task Priority 'p3'.
+
+State Machine 'sm-done-p0' is for Resource 'done-p0'.
+State Machine 'sm-done-p0' is currently in Status 'completed'.
+State Machine 'sm-p1a' is for Resource 't-p1a'.
+State Machine 'sm-p1a' is currently in Status 'pending'.
+State Machine 'sm-p1b' is for Resource 't-p1b'.
+State Machine 'sm-p1b' is currently in Status 'pending'.
+State Machine 'sm-p2a' is for Resource 't-p2a'.
+State Machine 'sm-p2a' is currently in Status 'pending'.
+State Machine 'sm-p3a' is for Resource 't-p3a'.
+State Machine 'sm-p3a' is currently in Status 'pending'.
+"#;
+    let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+    let model = crate::compile::compile(&state);
+    let derivation_refs: Vec<(&str, &crate::ast::Func)> =
+        model.derivations.iter().map(|d| (d.id.as_str(), &d.func)).collect();
+    let (final_state, _derived) =
+        crate::evaluate::forward_chain_defs_state(&derivation_refs, &state);
+
+    let recs: Vec<String> = {
+        let cell = ast::fetch_or_phi("Task_is_recommended", &final_state);
+        match &cell {
+            Object::Seq(items) => items.iter()
+                .filter_map(|f| ast::binding(f, "Task").map(String::from)).collect(),
+            Object::Map(m) => m.values()
+                .filter_map(|f| ast::binding(f, "Task").map(String::from)).collect(),
+            _ => Vec::new(),
+        }
+    };
+    let mut sorted = recs.clone();
+    sorted.sort();
+    sorted.dedup();
+    // Sanity: the bridge populated pending status for the p1/p2/p3 tasks.
+    assert!(recs.contains(&"t-p1a".to_string()) && recs.contains(&"t-p1b".to_string()),
+        "SM-bridge live path: both pending p1 tasks must be recommended (ceiling promotes to p1); got {:?}", sorted);
+    assert!(!recs.iter().any(|t| t.starts_with("t-p2")),
+        "SM-bridge live path: NO pending p2 may be recommended (p1 outranks); got {:?}", sorted);
+    assert!(!recs.iter().any(|t| t.starts_with("t-p3")),
+        "SM-bridge live path: NO pending p3 may be recommended (p1 outranks); got {:?}", sorted);
+    assert!(!recs.iter().any(|t| t.starts_with("done-p0")),
+        "SM-bridge live path: completed p0 may not be recommended; got {:?}", sorted);
+}
+
 // The global superlative must restrict its fold to the `among … that have
 // Task Status 'pending'` set: a NON-pending higher-priority task must NOT
 // raise the recommended ceiling (else the cascade would recommend nobody

@@ -1442,6 +1442,44 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     let model = compile(state);
     diag!("[profile] compile: {:?}", t.elapsed());
 
+    // recommend-cascade-enum-global-scale: the `c_derivation_rules`
+    // reconstruction below decodes rules from the `DerivationRule` cell with
+    // `consequent_aggregates: vec![]` (lossy — the cell JSON doesn't carry the
+    // aggregate IR). The `derivation_index` builder therefore can't see an
+    // aggregate rule's INPUT fact types (source value FT, join FT, filter ref
+    // FTs), which live only in the aggregate IR — not in `antecedent_sources`.
+    // Without them an aggregate whose consequent noun differs from the data it
+    // folds (`Task Priority is recommended`, consequent noun `Task Priority`,
+    // folding `Task has Task Priority` filtered by `Task has Task Status`) is
+    // indexed ONLY under the consequent noun, so a `Task` transition never
+    // drops its stale consequent and the global superlative coexists with the
+    // new value. Recover the per-rule aggregate FT ids from the FULL CellIndex
+    // (which DOES carry the aggregate IR) so the index builder can key these
+    // rules under the nouns they actually read.
+    let agg_ft_ids_by_rule: HashMap<String, Vec<String>> = {
+        let data = cell_index_from_state(state);
+        data.derivation_rules.iter()
+            .filter(|r| !r.id.is_empty() && !r.consequent_aggregates.is_empty())
+            .map(|r| {
+                let mut ids: Vec<String> = Vec::new();
+                for agg in &r.consequent_aggregates {
+                    if !agg.source_fact_type_id.is_empty() {
+                        ids.push(agg.source_fact_type_id.clone());
+                    }
+                    if !agg.join_fact_type_id.is_empty() {
+                        ids.push(agg.join_fact_type_id.clone());
+                    }
+                    for filt in &agg.filters {
+                        if !filt.ref_fact_type_id.is_empty() {
+                            ids.push(filt.ref_fact_type_id.clone());
+                        }
+                    }
+                }
+                (r.id.clone(), ids)
+            })
+            .collect()
+    };
+
     // Domain eliminated (#211): all generators below read from cell-based
     // collections (c_nouns, c_fact_types, c_constraints, etc.) or call
     // state-based shims (rmap_from_state, rmap_cell_map_from_state).
@@ -1959,8 +1997,26 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                 // lookup chain skips them via `.fact_type_id()` which
                 // returns the empty string (filtered out below).
                 let consequent_literal = rule.consequent_cell.literal_id().to_string();
-                let ante_ft_ids: Vec<String> = rule.antecedent_sources.iter()
+                let mut ante_ft_ids: Vec<String> = rule.antecedent_sources.iter()
                     .map(|s| s.fact_type_id().to_string()).collect();
+                // recommend-cascade-enum-global-scale: an AGGREGATE rule's
+                // input FTs (source value FT, any join FT, each filter's ref
+                // FT) live in the aggregate IR, NOT in `antecedent_sources`,
+                // and the lossy `c_derivation_rules` cell-reconstruction drops
+                // that IR. `agg_ft_ids_by_rule` (built above from the full
+                // CellIndex) carries them so an aggregate whose consequent noun
+                // differs from the data it folds (`Task Priority is
+                // recommended` over `Task has Task Priority` filtered by `Task
+                // has Task Status`) is also indexed under the read nouns
+                // (`Task`, `Task Status`). Without this the rule is indexed
+                // ONLY under its consequent noun (`Task Priority`), so a `Task`
+                // transition never drops its consequent cell and the global
+                // superlative's stale tuple coexists with the new value (folded
+                // cells key distinct values separately) — the "all priority
+                // tiers recommended" defect.
+                if let Some(agg_fts) = agg_ft_ids_by_rule.get(did) {
+                    ante_ft_ids.extend(agg_fts.iter().cloned());
+                }
                 for ft_id in ante_ft_ids.iter()
                     .chain(core::iter::once(&consequent_literal))
                     .filter(|s| !s.is_empty())
