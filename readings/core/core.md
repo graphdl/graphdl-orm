@@ -55,7 +55,15 @@ Name is a value type.
 Plural is a value type.
 Object Type is a value type.
   The possible values of Object Type are 'entity', 'value'.
-Format is a value type.
+<!-- `Format` was a value type here (legacy widget Format: 'text', 'date',
+     'boolean'). It is PROMOTED to a first-class, extensible entity type
+     `Format(.Name)` in the NORMA Value Domain section below (alongside
+     `Conceptual Data Type`), so new presentation Formats are added by
+     declaring instances rather than editing a closed enumeration. The
+     `Noun has Format` binary at :109 is unchanged in surface syntax but is
+     now an entity-valued refinement link (Noun -> Format entity). No live
+     reading or app ever populated `Noun has Format`, so the promotion is
+     data-safe. See "## NORMA Value Domain" -> Format. -->
 Enum Values is a value type.
 Minimum is a value type.
 Maximum is a value type.
@@ -629,6 +637,7 @@ Unit(.Name) is an entity type.
 Dimension(.Name) is an entity type.
 Conceptual Data Type(.code) is an entity type.
 Data Type Group(.code) is an entity type.
+Format(.Name) is an entity type.
 Textual Constraint is a subtype of Constraint.
 
 ### Value types
@@ -721,6 +730,31 @@ Conceptual Data Type has JSON Format.
 
 Conceptual Data Type has Abstract SQL Type.
   Each Conceptual Data Type has exactly one Abstract SQL Type.
+
+Format is built on Conceptual Data Type.
+  Each Format is built on exactly one Conceptual Data Type.
+  <!-- Format-on-Conceptual-Data-Type (Phase 1). A `Format` is a
+       first-class, extensible REFINEMENT layered ON TOP of exactly one
+       base Conceptual Data Type. The base CDT supplies the portable
+       skeleton — JSON Type, the base JSON Format, and the Abstract SQL
+       Type; the Format refines the *presentation* (a narrower JSON
+       Format and an optional validation Pattern) without re-deriving the
+       skeleton. The legacy widget Formats ('text', 'date', 'boolean',
+       'enum') are seeded below as Format instances built on the matching
+       CDT leaf. -->
+
+Format has JSON Format.
+  Each Format has at most one JSON Format.
+  <!-- The Format's own JSON-Schema `format` keyword, REFINING the base
+       CDT's JSON Format (`Conceptual Data Type has JSON Format` above).
+       Effective JSON Format of a value type = its Format's JSON Format
+       when it declares a Format, ELSE its base CDT's JSON Format. -->
+
+Format has Pattern.
+  Each Format has at most one Pattern.
+  <!-- Optional regex `pattern` keyword for the Format (reuses the core
+       `Pattern` value type at :67). Surfaces in the derived JSON Schema
+       as `pattern`; absent when the Format imposes no lexical shape. -->
 
 ## Instance Facts
 

@@ -4402,6 +4402,160 @@ ViewElement 'e2' renders Fact Type 'ft2'.
          Got pairs: {:?}", widget_pairs);
 }
 
+// ─── Format-on-Conceptual-Data-Type (Phase 1) — effective widget ─────────
+//
+// Coverage for the additive widget layer in `readings/ui/view-projection.md`
+// and the `Format` entity-type promotion + `Format is built on Conceptual
+// Data Type` / `Format has JSON Format` fact types in
+// `readings/core/core.md`.
+//
+// Mirrors the LIVE model fragment (self-contained so it does not depend on
+// the bundled metamodel): `Format` is a first-class entity built on exactly
+// one base Conceptual Data Type; a base widget is implied per CDT and a
+// refinement widget per Format; `Noun has effective Component Role` resolves
+// Format-else-CDT through two lazy (`*` / View) derivation rules — the same
+// resolution shape `view_projection_section_4_2_lazy_widget_rules_merge`
+// exercises.
+//
+// Asserts:
+//   (a) Both effective-widget rules compile with materialization = View.
+//   (b) The `Format is built on Conceptual Data Type` cell populates (a
+//       Format built on a CDT), and the Format + base CDT both carry the
+//       JSON Format needed for effective-JSON resolution.
+//   (c) A value type WITH a Format resolves to its Format's widget
+//       (TitleT -> 'text-input', whose Format 'text' also pins the
+//       refinement) AND its Format carries the refining JSON Format.
+//   (d) A value type with ONLY a base CDT resolves to the CDT's base widget
+//       (PlainT -> 'text-input' via `Conceptual Data Type implies Component
+//       Role`), falling back to the base CDT's JSON Format.
+#[test]
+fn format_on_cdt_effective_widget_resolves_format_else_cdt() {
+    let src = r#"# Format-on-CDT phase-1 effective-widget test
+Noun(.id) is an entity type.
+Conceptual Data Type(.code) is an entity type.
+Format(.Name) is an entity type.
+Component Role is a value type.
+JSON Format is a value type.
+code is a value type.
+Name is a value type.
+
+## Fact Types
+Noun has Format.
+  Each Noun has at most one Format.
+Noun has Conceptual Data Type.
+  Each Noun has at most one Conceptual Data Type.
+Format is built on Conceptual Data Type.
+  Each Format is built on exactly one Conceptual Data Type.
+Format has JSON Format.
+  Each Format has at most one JSON Format.
+Conceptual Data Type has JSON Format.
+  Each Conceptual Data Type has at most one JSON Format.
+Conceptual Data Type implies Component Role.
+  Each Conceptual Data Type implies at most one Component Role.
+Format implies Component Role.
+  Each Format implies at most one Component Role.
+Noun has effective Component Role. *
+
+## Derivation Rules
+* Noun has effective Component Role (CR) if Noun has some Format and that Format implies Component Role (CR).
+* Noun has effective Component Role (CR) if Noun has some Conceptual Data Type and that Conceptual Data Type implies Component Role (CR).
+
+## Instance Facts
+Format 'text' is built on Conceptual Data Type 'text'.
+Format 'date' is built on Conceptual Data Type 'date'.
+Format 'date' has JSON Format 'date'.
+Conceptual Data Type 'date' has JSON Format 'date'.
+Format 'text' implies Component Role 'text-input'.
+Format 'date' implies Component Role 'date-picker'.
+Conceptual Data Type 'text' implies Component Role 'text-input'.
+Conceptual Data Type 'date' implies Component Role 'date-picker'.
+"#;
+    let state = parse_to_state(src).expect("parse");
+
+    // (a) Both effective-widget rules must compile with View materialization.
+    let model = compile::compile(&state);
+    let eff_rules: Vec<&compile::CompiledDerivation> = model.derivations.iter()
+        .filter(|d| d.text.contains("has effective Component Role"))
+        .collect();
+    assert_eq!(eff_rules.len(), 2,
+        "expected exactly 2 effective-widget rules, got {}: {:#?}",
+        eff_rules.len(),
+        model.derivations.iter().map(|d| d.text.as_str()).collect::<Vec<_>>());
+    for r in &eff_rules {
+        assert!(matches!(r.materialization, crate::types::MaterializationPolicy::View),
+            "effective-widget rule '{}' must be lazy (View); got {:?}",
+            r.text, r.materialization);
+    }
+
+    // Build the full def-state, then push the catalog + value-type population.
+    let defs = compile::compile_to_defs_state(&state);
+    let base = ast::defs_to_state(&defs, &state);
+
+    let push = |s, cell: &str, pairs: &[(&str, &str)]|
+        ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+    // Catalog: Formats built on CDTs, with implied widgets + JSON formats.
+    let s = base.clone();
+    let s = push(s, "Format_is_built_on_Conceptual_Data_Type", &[("Format", "text"), ("Conceptual Data Type", "text")]);
+    let s = push(s, "Format_is_built_on_Conceptual_Data_Type", &[("Format", "date"), ("Conceptual Data Type", "date")]);
+    let s = push(s, "Format_has_JSON_Format", &[("Format", "date"), ("JSON Format", "date")]);
+    let s = push(s, "Conceptual_Data_Type_has_JSON_Format", &[("Conceptual Data Type", "date"), ("JSON Format", "date")]);
+    let s = push(s, "Format_implies_Component_Role", &[("Format", "text"), ("Component Role", "text-input")]);
+    let s = push(s, "Format_implies_Component_Role", &[("Format", "date"), ("Component Role", "date-picker")]);
+    let s = push(s, "Conceptual_Data_Type_implies_Component_Role", &[("Conceptual Data Type", "text"), ("Component Role", "text-input")]);
+    let s = push(s, "Conceptual_Data_Type_implies_Component_Role", &[("Conceptual Data Type", "date"), ("Component Role", "date-picker")]);
+    // Value type WITH a Format (refinement): TitleT -> Format 'text' (+ base CDT 'text').
+    let s = push(s, "Noun_has_Format", &[("Noun", "TitleT"), ("Format", "text")]);
+    let s = push(s, "Noun_has_Conceptual_Data_Type", &[("Noun", "TitleT"), ("Conceptual Data Type", "text")]);
+    // Value type with ONLY a base CDT (no Format): PlainT -> CDT 'text'.
+    let s = push(s, "Noun_has_Conceptual_Data_Type", &[("Noun", "PlainT"), ("Conceptual Data Type", "text")]);
+    let d = s;
+
+    // (b) The `is built on` cell populated — a Format built on a CDT.
+    let built_on = ast::fetch_raw("Format_is_built_on_Conceptual_Data_Type", &d);
+    let built_on_pairs: Vec<(String, String)> = match &built_on {
+        Object::Seq(items) => items.iter().filter_map(|f| {
+            Some((ast::binding(f, "Format")?.to_string(),
+                  ast::binding(f, "Conceptual Data Type")?.to_string()))
+        }).collect(),
+        _ => Vec::new(),
+    };
+    assert!(built_on_pairs.iter().any(|(f, c)| f == "text" && c == "text"),
+        "Format 'text' must be built on Conceptual Data Type 'text'; got {:?}", built_on_pairs);
+    assert!(built_on_pairs.iter().any(|(f, c)| f == "date" && c == "date"),
+        "Format 'date' must be built on Conceptual Data Type 'date'; got {:?}", built_on_pairs);
+
+    // (b cont.) Format 'date' carries the refining JSON Format, and base CDT 'date' too.
+    let fmt_json = ast::fetch_raw("Format_has_JSON_Format", &d);
+    let fmt_json_has = matches!(&fmt_json, Object::Seq(items) if items.iter().any(|f|
+        ast::binding(f, "Format").as_deref() == Some("date")
+        && ast::binding(f, "JSON Format").as_deref() == Some("date")));
+    assert!(fmt_json_has, "Format 'date' must have JSON Format 'date'; got {:?}", fmt_json);
+
+    // Lazy resolution of the effective widget via Func::Fetch (no forward chain).
+    let fetch_input = Object::seq(vec![
+        Object::atom("Noun_has_effective_Component_Role"),
+        d.clone(),
+    ]);
+    let result = ast::apply(&ast::Func::Fetch, &fetch_input, &d);
+    let eff_pairs: Vec<(String, String)> = match &result {
+        Object::Seq(items) => items.iter().filter_map(|f| {
+            Some((ast::binding(f, "Noun")?.to_string(),
+                  ast::binding(f, "Component Role")?.to_string()))
+        }).collect(),
+        _ => Vec::new(),
+    };
+
+    // (c) Value type WITH a Format resolves to its Format's widget.
+    assert!(eff_pairs.iter().any(|(n, cr)| n == "TitleT" && cr == "text-input"),
+        "TitleT (Format 'text') must resolve to effective widget 'text-input'.\n\
+         Got pairs: {:?}\nRaw Fetch: {:?}", eff_pairs, result);
+    // (d) Value type with ONLY a base CDT resolves to the CDT's base widget.
+    assert!(eff_pairs.iter().any(|(n, cr)| n == "PlainT" && cr == "text-input"),
+        "PlainT (only CDT 'text', no Format) must resolve to the base widget \
+         'text-input' via `Conceptual Data Type implies Component Role`.\n\
+         Got pairs: {:?}\nRaw Fetch: {:?}", eff_pairs, result);
+}
+
 // ─── task-970 — lazy existential / Skolem derivation head ────────────────
 //
 // The view-projection menu rule (design §4.5) has a head whose CONSEQUENT
