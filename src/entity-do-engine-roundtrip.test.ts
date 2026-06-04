@@ -57,7 +57,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import {
   EntityDB,
-  ENGINE_STATE_STORAGE_KEY,
+  CELL_CONTENTS_STORAGE_KEY,
   SEALED_CELL_PREFIX,
   aadVersionFor,
   cellAddressFor,
@@ -384,8 +384,12 @@ describe('EntityDB engine round-trip — chain-as-version-of-record (#769)', () 
     expect(blobA.length).toBeGreaterThan(0)
     const headA = aadVersionFor(handleA, cellName)
 
-    // (a) The persisted freeze blob is observable through DO storage.
-    const persistedBlob = await ctx.storage.get<string>(ENGINE_STATE_STORAGE_KEY)
+    // (a) The persisted cell is observable through DO storage. Post-#935
+    // `persistEngineState` writes THIS DO's cell JSON under
+    // `CELL_CONTENTS_STORAGE_KEY` (and deletes the legacy monolithic
+    // `ENGINE_STATE_STORAGE_KEY`), so that is the key the persisted blob
+    // lands under — and what `__test_persist` returns.
+    const persistedBlob = await ctx.storage.get<string>(CELL_CONTENTS_STORAGE_KEY)
     expect(persistedBlob).toBe(blobA)
 
     // (b) Tear down dbA and stand up a fresh EntityDB against the

@@ -826,8 +826,15 @@ export class EntityDB extends DurableObject {
         // Seed the worker's in-memory cell graph so reads round-trip
         // immediately (and stay correct even when the engine apply
         // replay below cannot extend the chain — e.g. vitest's wasm32
-        // SystemTime gap inside merge_delta).
-        this.getCellGraph().set(cell.id, cell)
+        // SystemTime gap inside merge_delta). Key by the DO routing
+        // identifier (`cellName`) — the same key `get`/`put`/
+        // `persistEngineState` use — NOT `cell.id`, which can differ
+        // from the DO id (e.g. a DO routed as `Order:ord-4` whose cell
+        // payload id is `ord-4`). Keying by `cell.id` left `get()`
+        // unable to find the hydrated cell on a cold-start recreate
+        // where `cell.id !== cellName` (#935).
+        const cellName = this.ctx.id.toString()
+        this.getCellGraph().set(cellName, cell)
         // Replay the cell into the engine so `fetch_cell`/`cell_pin`
         // see it on the chain (live workers). Best-effort: under the
         // vitest gap this apply panics on platform_now and we rely on
