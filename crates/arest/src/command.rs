@@ -3744,7 +3744,41 @@ fn update_via_defs(
             .collect();
         let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
         for (name, contents) in ast::cells_iter(&new_state).into_iter() {
-            if dropped_cells.contains(name) && !activated_consequent_cells.contains(name) {
+            if dropped_cells.contains(name) {
+                if activated_consequent_cells.contains(name) {
+                    // update-retract-partial-folded — mirror of the bdaae85a
+                    // fix in `transition_via_defs` (the `dropped ∩ activated`
+                    // branch). This cell was WIPED and its producing rule was
+                    // ACTIVATED, so the seeded chain authoritatively RE-DERIVED
+                    // its full contents for EVERY entity. The returned delta is
+                    // `diff_cells(state, new_state)` and the caller commits it
+                    // via `merge_delta`, whose `merge_map_cell_contents` UNIONs
+                    // two Map cells (task-922, so per-entity user cells aren't
+                    // clobbered). A folded derived consequent that lost ONE
+                    // entity's tuple — a task leaving 'pending' dropping from
+                    // `Task_is_recommended` while peers stay pending — is a
+                    // PARTIAL retraction: the recompute is non-empty, so the
+                    // union layers the shrunk delta onto the stale base and
+                    // RESURRECTS the dropped tuple (a folded cell keys the old
+                    // and new tuples DISTINCTLY, so they coexist; a FULL
+                    // retraction that empties the cell is already handled because
+                    // an empty delta value is not a Map and merge then replaces).
+                    //
+                    // Fix: emit the authoritative recompute as a flattened Seq
+                    // (key-ordered, deterministic). `merge_delta` replaces —
+                    // rather than unions — a cell whose delta value is not a Map,
+                    // so the committed cell becomes exactly the recompute. SCOPED
+                    // to wiped+fully-recomputed consequents (`dropped ∩
+                    // activated`): peers ARE present in the recompute (their
+                    // deriver re-fired), so the replace cannot drop untouched
+                    // entities, and user per-entity (non-dropped) cells keep the
+                    // task-922 union. A genuinely entity-keyed cell re-keys
+                    // itself on the next `cell_put_keyed` write, so UC
+                    // enforcement is unaffected.
+                    new_map.insert(name.to_string(),
+                        ast::fetch_cell_seq(name, &new_state));
+                    continue;
+                }
                 if let Some(snap) = pre_drop_snapshot.get(name) {
                     new_map.insert(name.to_string(), snap.clone());
                     continue;
@@ -8256,6 +8290,126 @@ Transition 'block' is defined in State Machine Definition 'Task'.
         assert_eq!(bridge_status(&after_block, "t-1").as_deref(), Some("blocked"),
             "BRIDGE-LAG: blocking a Task must make Task_has_Task_Status read \
              'blocked'; a stale 'in_progress' here is the reported bug.");
+    }
+
+    /// REPRO (update-partial-folded-retraction): the SAME defect bdaae85a fixed
+    /// on `transition_via_defs`, on the UPDATE path. A folded derived cell
+    /// holding >=2 tuples for a keyed group; an `update` flips ONE entity's
+    /// antecedent so the fold must DROP exactly that entity's tuple while the
+    /// other(s) remain. The dropped tuple resurrects because the update returns
+    /// `diff_cells(state, new_state)` and the caller commits it via
+    /// `merge_delta`, whose `merge_map_cell_contents` UNIONs Map-typed cells
+    /// (task-922) — a folded derived cell keys the dropped and kept tuples
+    /// DISTINCTLY, so the union layers the shrunk recompute onto the stale base
+    /// and re-merges the dropped tuple. FULL retraction (the cell empties) is
+    /// already correct: an empty delta value is not a Map, so merge replaces.
+    /// PARTIAL retraction (>=1 tuple survives) is the broken case this exercises.
+    ///
+    /// Mirrors `transition_refreshes_cross_noun_derived_cells` but drives
+    /// `update_via_defs`: a plain Task noun with NO state machine, so `update`
+    /// flows through `update_via_defs` and flips `Task Status` directly. The
+    /// derived cell `Task is recommended iff Task has Task Status 'pending'` is
+    /// keyless, so it folds via `cell_put_folded` (Map keyed by full tuple) —
+    /// the exact folded-Map shape the union resurrects.
+    #[test]
+    fn update_refreshes_partially_retracted_folded_derived_cell() {
+        const TASK_RECOMMEND_READINGS: &str = r#"
+# Tasks recommend (no state machine — update flips Status directly)
+
+## Entity Types
+
+Task(.id) is an entity type.
+
+## Value Types
+
+Task Status is a value type.
+
+## Fact Types
+
+Task has Task Status.
+  Each Task has at most one Task Status.
+Task is recommended.
+
+## Derivation Rules
+
+* Task is recommended iff Task has Task Status 'pending'.
+"#;
+        let meta = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let tasks = crate::parse_forml2::parse_to_state_with_nouns(TASK_RECOMMEND_READINGS, &meta).unwrap();
+        let state = ast::merge_states(&meta, &tasks);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        let is_recommended = |st: &ast::Object, task: &str| -> bool {
+            ast::fetch_cell_seq("Task_is_recommended", st).as_seq()
+                .map(|fs| fs.iter().any(|f| ast::binding(f, "Task") == Some(task)))
+                .unwrap_or(false)
+        };
+
+        // CREATE t-1 (pending) → forward chain marks it recommended.
+        let mut f1 = HashMap::new();
+        f1.insert("id".to_string(), "t-1".to_string());
+        f1.insert("Task Status".to_string(), "pending".to_string());
+        let c1 = apply_command_defs(&def_obj, &Command::CreateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            id: Some("t-1".to_string()),
+            fields: f1,
+            sender: None,
+            signature: None,
+        }, &state);
+        assert!(!c1.rejected, "create t-1 rejected: {:?}", c1.violations);
+        let after_c1 = ast::merge_delta(&state, &c1.state, None);
+
+        // CREATE t-2 (also pending) — the second folded tuple. Updating t-1
+        // must NOT drop t-2 (multi-entity guard) AND must drop t-1.
+        let mut f2 = HashMap::new();
+        f2.insert("id".to_string(), "t-2".to_string());
+        f2.insert("Task Status".to_string(), "pending".to_string());
+        let c2 = apply_command_defs(&def_obj, &Command::CreateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            id: Some("t-2".to_string()),
+            fields: f2,
+            sender: None,
+            signature: None,
+        }, &after_c1);
+        assert!(!c2.rejected, "create t-2 rejected: {:?}", c2.violations);
+        let after_create = ast::merge_delta(&after_c1, &c2.state, None);
+
+        // Sanity: the folded derived cell holds BOTH tuples (>=2 for the group).
+        assert!(is_recommended(&after_create, "t-1"),
+            "sanity: pending t-1 must be recommended after create");
+        assert!(is_recommended(&after_create, "t-2"),
+            "sanity: pending t-2 must be recommended after create");
+
+        // UPDATE t-1: pending → done. The fold must DROP t-1's tuple and KEEP
+        // t-2's. This is a PARTIAL folded retraction on the update path.
+        let mut upd = HashMap::new();
+        upd.insert("Task Status".to_string(), "done".to_string());
+        let updated = apply_command_defs(&def_obj, &Command::UpdateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            entity_id: "t-1".to_string(),
+            fields: upd,
+            force: false,
+            sender: None,
+            signature: None,
+        }, &after_create);
+        assert!(!updated.rejected, "update t-1 rejected: {:?}", updated.violations);
+        let after_update = ast::merge_delta(&after_create, &updated.state, None);
+
+        // The dropped tuple must be GONE; the kept tuple must remain.
+        assert!(!is_recommended(&after_update, "t-1"),
+            "PARTIAL-FOLDED-RETRACTION: updating t-1 to 'done' must DROP it from \
+             Task_is_recommended. It resurrects because update_via_defs returns the \
+             recompute as a folded Map and merge_delta UNIONs Map cells — the dropped \
+             tuple re-merges from the stale base. This is the bdaae85a defect on the \
+             update path.");
+        assert!(is_recommended(&after_update, "t-2"),
+            "multi-entity guard: t-2 (still pending) must remain recommended after \
+             t-1's update — the recompute keeps untouched entities and the \
+             Seq-flatten/replace fix must not drop them.");
     }
 
     /// REPRO (recommend-cascade-enum-global-scale, p1): the LIVE recommendation
