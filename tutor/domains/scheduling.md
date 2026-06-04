@@ -9,7 +9,7 @@ transitive ring constraints.
 Room(.Room Number) is an entity type.
 Meeting(.Meeting Id) is an entity type.
 Attendee(.Email) is an entity type.
-Booking(.id) is an entity type where Meeting is held in Room.
+Booking(.id) is an entity type.
 
 ## Value Types
 
@@ -22,6 +22,7 @@ End Time is a value type.
 Duration is a value type.
 Capacity is a value type.
 Floor is a value type.
+Room Name is a value type.
 Recurrence is a value type.
   The possible values of Recurrence are 'none', 'daily', 'weekly', 'biweekly', 'monthly'.
 Is Required is a value type.

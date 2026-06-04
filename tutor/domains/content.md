@@ -25,6 +25,8 @@ Media Type is a value type.
 File URL is a value type.
 Alt Text is a value type.
 Bio is a value type.
+Display Name is a value type.
+Avatar URL is a value type.
 Content Status is a value type.
   The possible values of Content Status are 'draft', 'review', 'published', 'archived'.
 

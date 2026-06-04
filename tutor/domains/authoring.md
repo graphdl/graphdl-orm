@@ -8,6 +8,8 @@ Domain Change preparation, and readings-first self-modification.
 Authoring Session(.Authoring Session Id) is an entity type.
 Authoring Step(.Authoring Step Name) is an entity type.
 Authoring Tool(.Authoring Tool Name) is an entity type.
+Domain Change(.id) is an entity type.
+Status(.Name) is an entity type.
 
 ## Value Types
 

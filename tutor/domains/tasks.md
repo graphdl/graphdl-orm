@@ -19,6 +19,8 @@ Project Code is a value type.
 Username is a value type.
 Milestone Name is a value type.
 Title is a value type.
+Display Name is a value type.
+Description is a value type.
 Body is a value type.
 Priority is a value type.
   The possible values of Priority are 'critical', 'high', 'medium', 'low'.

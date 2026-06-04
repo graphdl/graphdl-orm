@@ -10,7 +10,8 @@ Product(.SKU) is an entity type.
 Category(.Category Code) is an entity type.
 Brand(.Brand Name) is an entity type.
 Review(.id) is an entity type.
-ProductVariant(.id) is an entity type where Product has Size and Color.
+User(.id) is an entity type.
+ProductVariant(.id) is an entity type.
 
 ## Subtypes
 
@@ -22,6 +23,8 @@ PhysicalProduct is a subtype of Product.
 SKU is a value type.
 Category Code is a value type.
 Brand Name is a value type.
+Category Name is a value type.
+Logo URL is a value type.
 Product Name is a value type.
 Description is a value type.
 Price is a value type.

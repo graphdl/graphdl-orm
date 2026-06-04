@@ -178,8 +178,18 @@ export async function getSandboxHandle(): Promise<number> {
     return _sandboxHandle
   }
   const engine = await getEngine()
+  // Compile the whole tutor/domains/ set as ONE readings unit rather
+  // than one `compile` call per file. The domains cross-reference each
+  // other's nouns (e.g. orders' `LineItem is for Product` references
+  // catalog's Product) and only declare a noun once across the set, so
+  // they must be resolved together — a per-file compile validates each
+  // file against the metamodel + that file's own declarations only,
+  // rejecting the cross-file references and re-validating already-landed
+  // instance facts against each subsequent file's mandatory constraints.
+  // The single-unit compile matches the CLI path, which hands arest-cli
+  // the whole directory (`runArestCli([tutorDomainsDir(), …])`).
   const readings = loadTutorDomainReadings()
-  _sandboxHandle = engine.compileDomainReadings(...readings)
+  _sandboxHandle = engine.compileDomainReadings(readings.join('\n\n'))
   _wasmHashAtCompile = readingsHash()
   return _sandboxHandle
 }

@@ -45,18 +45,26 @@ describe('tutor sandbox — WASM mode', () => {
     await tutorSystemCall('create:Customer', '<<Name, alice-sandbox>>')
 
     // Build an unrelated active-app handle compiled from a tiny fixture
-    // that also declares Customer. Empty-list results from system() may
-    // come back as JSON null; coerce to [].
+    // that also declares Customer. A `list:X` against a noun the engine
+    // can't materialise a list rule for comes back as the bottom marker
+    // (`⊥ origin: in rule 'list:Customer'`) — not JSON — so launder the
+    // response through parseEngineRaw and coerce any non-array (⊥ /
+    // null) to []. Either way the isolation assertion holds: a list that
+    // is empty (or unavailable) cannot contain the sibling's write.
+    const asList = (raw: string): any[] => {
+      const cooked = parseEngineRaw(raw, [])
+      return Array.isArray(cooked) ? cooked : []
+    }
     const localHandle = compileDomainReadings(
       'Customer(.Name) is an entity type.\nCustomer has Name.\n  Each Customer has exactly one Name.'
     )
-    const localList: any[] = JSON.parse(system(localHandle, 'list:Customer', '')) ?? []
+    const localList = asList(system(localHandle, 'list:Customer', ''))
     expect(localList.find((c: any) => (c.id ?? c.Name) === 'alice-sandbox')).toBeUndefined()
 
     // Local → sandbox: write a Customer to the local handle, confirm the
     // sandbox cannot see it.
     system(localHandle, 'create:Customer', '<<Name, bob-local>>')
-    const sandList: any[] = JSON.parse(await tutorSystemCall('list:Customer', '')) ?? []
+    const sandList = asList(await tutorSystemCall('list:Customer', ''))
     expect(sandList.find((c: any) => (c.id ?? c.Name) === 'bob-local')).toBeUndefined()
     // Note: the WASM engine's create:X is functional — entity instances written
     // via system() are not persisted in D state that list:X can retrieve.

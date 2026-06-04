@@ -15,6 +15,8 @@ Preference(.id) is an entity type.
 Notification Id is a value type.
 Channel Name is a value type.
 Subject is a value type.
+Description is a value type.
+Urgency threshold is a value type.
 Message Body is a value type.
 Recipient Email is a value type.
 Sent At is a value type.

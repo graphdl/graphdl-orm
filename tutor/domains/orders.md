@@ -16,6 +16,7 @@ Coupon(.Coupon Code) is an entity type.
 ## Value Types
 
 Order Number is a value type.
+Name is a value type.
 Email is a value type.
 Tracking Number is a value type.
 Payment Id is a value type.
