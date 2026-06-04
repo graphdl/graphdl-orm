@@ -231,16 +231,122 @@ function activateApp(name: string): ArestApp {
   return activeApp
 }
 
-function currentReadingsDir(): string {
-  return activeApp.readingsDir || AREST_READINGS_DIR
+// ── Per-call app scoping (p0 mcp-active-app-isolation, option b) ──────
+//
+// Sub-agents share ONE stdio connection with no per-session id, so the
+// server can't isolate per session — a global `activeApp` (plus the
+// `.arest-active-app` marker) means one agent's `apps.use` silently
+// re-scopes another agent's reads/writes. Option (b) lets a single CALL
+// carry an optional `app` that resolves its OWN db + readings + engine
+// handle for THAT call only.
+//
+// Invariants (the bug-fix contract):
+//   1. resolveCallScope is PURE — it delegates to resolveArestApp (a
+//      pure fs read) and never assigns `activeApp`, calls activateApp,
+//      or writes the marker via writePersistedAppName. A per-call `app`
+//      therefore NEVER mutates the shared global or the on-disk marker.
+//   2. When `app` is omitted (scope === undefined) every helper falls
+//      back to the global path verbatim, so existing calls are byte-for-
+//      byte unchanged (additive + backward-compatible).
+//   3. The per-call engine handle lives in a SEPARATE keyed cache
+//      (`_perCallHandles`) so a second app never clobbers the global
+//      single-slot `_localHandle`.
+
+export interface CallScope {
+  name: string
+  dbPath: string
+  readingsDir: string
+  exists: boolean
 }
 
-function currentDbPath(): string {
-  return activeApp.dbPath || AREST_DB
+/**
+ * Resolve an optional per-call `app` override into a CallScope WITHOUT
+ * touching the global `activeApp` or the `.arest-active-app` marker.
+ * Pure: the only fs access is via resolveArestApp (read-only path
+ * discovery). Defaults `options` to the server's live registry options
+ * so a verb callback can call `resolveCallScope(app)` directly; tests
+ * pass an explicit `{ appsDir, cwd }` fixture so no live state is read.
+ */
+export function resolveCallScope(
+  app: string,
+  options: Parameters<typeof resolveArestApp>[1] = appRegistryOptions(),
+): CallScope {
+  const resolved = resolveArestApp(app, options)
+  return {
+    name: resolved.name,
+    dbPath: resolved.dbPath,
+    readingsDir: resolved.readingsDir,
+    exists: resolved.exists,
+  }
 }
 
-function shouldUseCliDb(): boolean {
-  return AREST_MODE === 'local' && APP_MODE_ENABLED && Boolean(currentDbPath())
+/**
+ * Db path for a call: the per-call scope's db when scoped, else the
+ * supplied global fallback (today's `currentDbPath()` value). Keeping
+ * the fallback as an argument makes the helper pure + testable.
+ */
+export function scopeDbPath(scope: CallScope | undefined, fallback: string): string {
+  return scope ? scope.dbPath : fallback
+}
+
+/**
+ * Readings dir for a call: the per-call scope's readings when scoped,
+ * else the supplied global fallback (today's `currentReadingsDir()`).
+ */
+export function scopeReadingsDir(scope: CallScope | undefined, fallback: string): string {
+  return scope ? scope.readingsDir : fallback
+}
+
+// Per-call engine handles, keyed by readings signature. The global app
+// keeps using the single-slot `_localHandle` fast path (untouched); a
+// per-call `app` gets/keeps its own compiled handle here so two apps
+// can coexist in one process without invalidating each other.
+const _perCallHandles = new Map<string, number>()
+
+/** Cold-cache miss ⇒ undefined; warm hit ⇒ the stored handle. Pure. */
+export function lookupHandleCache(
+  cache: Map<string, number>,
+  signature: string,
+): number | undefined {
+  return cache.get(signature)
+}
+
+/**
+ * Store (or replace) the handle for a readings signature. Replacing on
+ * the same signature means a recompile after a readings edit reuses the
+ * slot instead of leaking a second entry. Pure (mutates the passed map
+ * only).
+ */
+export function rememberHandleCache(
+  cache: Map<string, number>,
+  signature: string,
+  handle: number,
+): void {
+  cache.set(signature, handle)
+}
+
+function currentReadingsDir(scope?: CallScope): string {
+  return scopeReadingsDir(scope, activeApp.readingsDir || AREST_READINGS_DIR)
+}
+
+function currentDbPath(scope?: CallScope): string {
+  return scopeDbPath(scope, activeApp.dbPath || AREST_DB)
+}
+
+function shouldUseCliDb(scope?: CallScope): boolean {
+  return AREST_MODE === 'local' && APP_MODE_ENABLED && Boolean(currentDbPath(scope))
+}
+
+/**
+ * Verb-callback convenience: resolve the optional `app` argument into a
+ * CallScope, or `undefined` when `app` is omitted/empty (⇒ use the
+ * global active app, unchanged behavior). Resolution is via the pure
+ * resolveCallScope, so a per-call `app` never mutates `activeApp` or
+ * the marker.
+ */
+function callScope(app?: string): CallScope | undefined {
+  const trimmed = (app ?? '').trim()
+  return trimmed ? resolveCallScope(trimmed) : undefined
 }
 
 type AppDetail = 'summary' | 'full'
@@ -300,9 +406,21 @@ async function getLocalEngine() {
   return _localEngine
 }
 
-async function getLocalHandle(): Promise<number> {
-  const readingsDir = currentReadingsDir()
+async function getLocalHandle(scope?: CallScope): Promise<number> {
+  const readingsDir = currentReadingsDir(scope)
   const signature = readingsSignature(readingsDir)
+  // Per-call (`app` supplied): use the keyed cache so a second app gets
+  // its own handle instead of clobbering the global single-slot handle.
+  if (scope) {
+    const cached = lookupHandleCache(_perCallHandles, signature)
+    if (cached !== undefined && cached >= 0) return cached
+    const engine = await getLocalEngine()
+    const readings = loadReadingsFromDir(readingsDir)
+    const handle = engine.compileDomainReadings(...readings)
+    rememberHandleCache(_perCallHandles, signature, handle)
+    return handle
+  }
+  // Global (no `app`): unchanged fast path.
   if (_localHandle >= 0 && _localReadingsSignature === signature) return _localHandle
   const engine = await getLocalEngine()
   const readings = loadReadingsFromDir(readingsDir)
@@ -394,13 +512,13 @@ function normalizeTransitionRows(raw: string, noun: string, id: string): Array<R
 
 // ── Command dispatch (dual mode) ────────────────────────────────────
 
-async function dispatchCommand(command: any): Promise<any> {
-  if (shouldUseCliDb()) {
-    return cliApplyCommand(command)
+async function dispatchCommand(command: any, scope?: CallScope): Promise<any> {
+  if (shouldUseCliDb(scope)) {
+    return cliApplyCommand(command, scope)
   }
   if (AREST_MODE === 'local') {
     const engine = await getLocalEngine()
-    const handle = await getLocalHandle()
+    const handle = await getLocalHandle(scope)
     const raw = engine.system(handle, 'apply', JSON.stringify(command))
     try { return JSON.parse(raw) } catch { return { rejected: true, error: raw } }
   }
@@ -411,9 +529,9 @@ async function dispatchCommand(command: any): Promise<any> {
   })
 }
 
-async function dispatchRead(path: string): Promise<any> {
+async function dispatchRead(path: string, scope?: CallScope): Promise<any> {
   if (AREST_MODE === 'local') {
-    const raw = await systemCall('debug', '')
+    const raw = await systemCall('debug', '', scope)
     try { return JSON.parse(raw) } catch { return { raw } }
   }
   return httpRequest(path)
@@ -421,10 +539,10 @@ async function dispatchRead(path: string): Promise<any> {
 
 // ── Local system call helper ──────────────────────────────────────
 
-async function systemCall(key: string, input: string): Promise<string> {
-  if (shouldUseCliDb()) return cliSystemCall(key, input)
+async function systemCall(key: string, input: string, scope?: CallScope): Promise<string> {
+  if (shouldUseCliDb(scope)) return cliSystemCall(key, input, scope)
   const engine = await getLocalEngine()
-  const handle = await getLocalHandle()
+  const handle = await getLocalHandle(scope)
   return engine.system(handle, key, input)
 }
 
@@ -453,8 +571,8 @@ function runArestCli(args: string[]): Promise<string> {
   })
 }
 
-function cliSystemCall(key: string, input: string): Promise<string> {
-  return runArestCli(['--db', currentDbPath(), key, input])
+function cliSystemCall(key: string, input: string, scope?: CallScope): Promise<string> {
+  return runArestCli(['--db', currentDbPath(scope), key, input])
 }
 
 function compileAppReadings(app: ArestApp): Promise<string> {
@@ -528,7 +646,7 @@ export function buildApplyCommandForBatch(
   }
 }
 
-async function cliApplyCommand(command: any): Promise<any> {
+async function cliApplyCommand(command: any, scope?: CallScope): Promise<any> {
   let key = ''
   let input = ''
   switch (command?.type) {
@@ -538,7 +656,7 @@ async function cliApplyCommand(command: any): Promise<any> {
     // applies and lose atomicity. Forward the whole batch JSON as one
     // `apply` system call.
     case 'batch': {
-      const raw = await cliSystemCall('apply', JSON.stringify(command))
+      const raw = await cliSystemCall('apply', JSON.stringify(command), scope)
       try { return JSON.parse(raw) } catch { return { raw } }
     }
     case 'createEntity': {
@@ -562,7 +680,7 @@ async function cliApplyCommand(command: any): Promise<any> {
     default:
       return { rejected: true, error: `unsupported command type: ${command?.type || 'unknown'}` }
   }
-  const raw = await cliSystemCall(key, input)
+  const raw = await cliSystemCall(key, input, scope)
   try { return JSON.parse(raw) } catch { return { raw } }
 }
 
@@ -596,6 +714,7 @@ import {
 async function absorbFederatedIntoD(
   noun: string,
   result: FederatedFetchResult,
+  scope?: CallScope,
 ): Promise<string | null> {
   if (AREST_MODE !== 'local') return null
   if (!result.citation) return null
@@ -604,6 +723,7 @@ async function absorbFederatedIntoD(
     const citeId = await systemCall(
       `federated_ingest:${noun}`,
       JSON.stringify(payload),
+      scope,
     )
     return citeId && citeId !== '⊥' ? citeId : null
   } catch {
@@ -612,10 +732,10 @@ async function absorbFederatedIntoD(
 }
 
 /** Check if a noun has a populate def and return its config. */
-async function getFederationConfig(noun: string): Promise<FederationConfig | null> {
+async function getFederationConfig(noun: string, scope?: CallScope): Promise<FederationConfig | null> {
   if (AREST_MODE !== 'local') return null
   try {
-    const raw = await systemCall(`populate:${noun}`, '')
+    const raw = await systemCall(`populate:${noun}`, '', scope)
     // ⊥ may surface as FFP glyphs or JSON "null" depending on encoding path.
     if (!raw || raw === 'null' || raw === '"null"' || raw.startsWith('⊥') || raw === 'φ') return null
     const config = parseFederationConfig(raw)
@@ -642,6 +762,19 @@ server.registerTool = ((name: string, config: any, callback: any) => {
 export function listRegisteredTools(): string[] {
   return [..._registeredTools].sort()
 }
+
+// Shared description for the optional per-call `app` override (p0
+// mcp-active-app-isolation, option b). Threaded into the READ/WRITE
+// verbs that otherwise resolve their DB/readings through the shared
+// global active app. Mirrors the ergonomics of `orient`'s active_app
+// arg, but actually re-scopes the engine handle for THAT call only.
+const APP_OVERRIDE_FIELD_DESCRIPTION =
+  'Optional per-call app override (p0 isolation). When set, THIS call resolves ' +
+  'its own readings + DB + engine handle for that app only — without changing the ' +
+  'session\'s active app (no apps.use side effect, no .arest-active-app marker write). ' +
+  'Use it when sub-agents share one MCP connection and must not clobber each other\'s ' +
+  'active app. Omit to use the current active app (apps.use remains the ergonomic ' +
+  'default for single-app sessions).'
 
 function loadPrompt(name: string): string {
   try {
@@ -947,20 +1080,23 @@ server.registerTool(
     inputSchema: {
       id: z.string().optional().describe('Entity ID. If omitted, lists all entities of the noun type.'),
       noun: z.string().optional().describe('Noun type (e.g. "Order"). Required when listing, optional when getting by ID (inferred from population).'),
+      app: z.string().optional().describe(APP_OVERRIDE_FIELD_DESCRIPTION),
     },
   },
-  async ({ id, noun }) => {
+  async ({ id, noun, app }) => {
     if (!noun) return textResult({ error: 'Provide noun to get or list.' })
+    const scope = callScope(app)
+    const scopeName = scope ? scope.name : activeApp.name
 
     // Check if this noun is backed by an external system (data federation).
-    const fedConfig = await getFederationConfig(noun)
+    const fedConfig = await getFederationConfig(noun, scope)
     if (fedConfig) {
       const data = await federatedFetch(fedConfig, id || undefined)
       // Absorb fetched facts + Citation into P so downstream constraints
       // and derivations over the unified population see the federated
       // data. Errors are non-fatal — the fetched result is still
       // returned to the caller either way.
-      const citeId = await absorbFederatedIntoD(noun, data)
+      const citeId = await absorbFederatedIntoD(noun, data, scope)
       if (citeId) {
         return textResult(enrichResponseWithCitation(data, citeId, '/arest/default'))
       }
@@ -970,11 +1106,11 @@ server.registerTool(
     // Local population
     if (AREST_MODE === 'local') {
       if (id) {
-        const raw = await systemCall(`get:${noun}`, id)
-        return textResult(parseGetResponse(raw, noun, activeApp.name))
+        const raw = await systemCall(`get:${noun}`, id, scope)
+        return textResult(parseGetResponse(raw, noun, scopeName))
       }
-      const raw = await systemCall(`list:${noun}`, '')
-      return textResult(parseGetResponse(raw, noun, activeApp.name))
+      const raw = await systemCall(`list:${noun}`, '', scope)
+      return textResult(parseGetResponse(raw, noun, scopeName))
     }
     const path = id
       ? `/arest/default/${encodeURIComponent(noun)}/${encodeURIComponent(id)}`
@@ -1050,12 +1186,14 @@ server.registerTool(
     inputSchema: {
       fact_type: z.string().describe('Fact type ID (e.g. "Order_was_placed_by_Customer", "Case_has_Observation")'),
       filter: z.record(z.string(), z.string()).optional().describe('Filter by role bindings (e.g. {"Case": "The Speckled Band"})'),
+      app: z.string().optional().describe(APP_OVERRIDE_FIELD_DESCRIPTION),
     },
   },
-  async ({ fact_type, filter }) => {
+  async ({ fact_type, filter, app }) => {
+    const scope = callScope(app)
     if (AREST_MODE === 'local') {
       const filterStr = filter ? JSON.stringify(filter) : ''
-      const raw = await systemCall(`query:${fact_type}`, filterStr)
+      const raw = await systemCall(`query:${fact_type}`, filterStr, scope)
       return textResult(parseQueryResponse(raw))
     }
     const data = await httpRequest(`/arest/default/query/${encodeURIComponent(fact_type)}`, {
@@ -1101,11 +1239,13 @@ server.registerTool(
       'Read-only SQL SELECT over the relational substrate (#864). Each FactType cell is exposed as table ft_<FactType_id> with columns = role names (spaces→underscores). Example: `SELECT t.Task FROM ft_Task_has_Task_Priority t WHERE t.Task_Priority = \'p0\'`. WHEN: cross-FT JOINs, aggregates (COUNT/GROUP BY), NOT EXISTS / EXISTS subqueries, or any projection more expressive than one-FT-plus-one-equality-filter. ALTERNATIVE: query when one FT with simple role-equality filters is enough (cheaper, no SQL string to build); cells mode=get when you only want the raw contents of a single cell. GOTCHA: SELECT-only — INSERT / UPDATE / DELETE are refused on purpose so derivation + validation always run through `apply`. Returns `{rows:[...]}` on success or `{error:"..."}` envelope on parse / exec failure (no thrown exceptions). Local-mode only — without the std-deps engine feature the verb returns `{error:"engine returned ⊥"}`. Quote identifiers per SQL standard. NEXT: pipe rows into `get noun=<X> id=<row-value>` for per-entity context, or apply for mutations.',
     inputSchema: {
       query: z.string().describe('A SQL SELECT statement. Tables are ft_<FactType_id> (e.g. ft_Task_has_Task_Priority); columns are role names with spaces replaced by underscores. Quote both identifiers and string values per SQL standard.'),
+      app: z.string().optional().describe(APP_OVERRIDE_FIELD_DESCRIPTION),
     },
   },
-  async ({ query }) => {
+  async ({ query, app }) => {
+    const scope = callScope(app)
     if (AREST_MODE === 'local') {
-      const raw = await systemCall('sql', query)
+      const raw = await systemCall('sql', query, scope)
       return textResult(parseSqlResponse(raw))
     }
     const data = await httpRequest('/arest/default/sql', {
@@ -1171,16 +1311,19 @@ server.registerTool(
       name: z.string().optional().describe('Exact cell name for `get` (e.g. "FactType", "Task_has_Task_Priority"). Required for get mode.'),
       rule_id: z.string().optional().describe('Exact match on a DerivationRule.id for `trace` mode. Provide either rule_id or rule_pattern.'),
       rule_pattern: z.string().optional().describe('Substring match on a DerivationRule.text for `trace` mode. First match wins.'),
+      app: z.string().optional().describe(APP_OVERRIDE_FIELD_DESCRIPTION),
     },
   },
-  async ({ mode, pattern, name, rule_id, rule_pattern }) => {
+  async ({ mode, pattern, name, rule_id, rule_pattern, app }) => {
+    const scope = callScope(app)
+    // `app` scopes the call; it is NOT part of the engine `cells` envelope.
     const envelope: Record<string, string> = { mode }
     if (pattern !== undefined) envelope.pattern = pattern
     if (name !== undefined) envelope.name = name
     if (rule_id !== undefined) envelope.rule_id = rule_id
     if (rule_pattern !== undefined) envelope.rule_pattern = rule_pattern
     if (AREST_MODE === 'local') {
-      const raw = await systemCall('cells', JSON.stringify(envelope))
+      const raw = await systemCall('cells', JSON.stringify(envelope), scope)
       return textResult(parseCellsResponse(raw))
     }
     const data = await httpRequest('/arest/default/cells', {
@@ -1597,9 +1740,18 @@ server.registerTool(
         role: z.string(),
         value: z.string(),
       })).optional().describe('task-971: Ordered role/value pairs for ring fact assertion. Repeated role names are allowed — required for same-noun ring facts (e.g. [{role:"Task",value:"A"},{role:"Task",value:"B"}] asserts Task A blocks Task B). Use with `fact_type`.'),
+      app: z.string().optional().describe(APP_OVERRIDE_FIELD_DESCRIPTION),
     },
   },
-  async ({ context_receipt, operation, noun, id, fields, event, ops, sender, signature, fields_only_replace, force, fact_type, pairs }) => {
+  async ({ context_receipt, operation, noun, id, fields, event, ops, sender, signature, fields_only_replace, force, fact_type, pairs, app }) => {
+    // p0 isolation: a per-call `app` scopes THIS mutation to its own
+    // db/readings/handle without touching the shared active app or the
+    // marker. Note the mutation gate's context_receipt is still minted
+    // against the SESSION's active app; an app-scoped mutation therefore
+    // bypasses the per-app receipt binding by design (the caller asked
+    // to act on a specific app for one call). Omit `app` for the
+    // default receipt-bound active-app behavior.
+    const scope = callScope(app)
     // ── task-930: bulk / collection-shaped apply ──────────────────────
     // When `ops` is supplied, build ONE batch command and route it
     // through the engine's `apply` verb (platform_apply_command), which
@@ -1613,7 +1765,7 @@ server.registerTool(
       if (blockedBatch) return blockedBatch
       const commands = ops.map(op => buildApplyCommandForBatch(op, { sender, signature }))
       const batch = { type: 'batch', commands }
-      const result = await dispatchCommand(batch)
+      const result = await dispatchCommand(batch, scope)
       return textResult(result)
     }
 
@@ -1626,7 +1778,7 @@ server.registerTool(
       if (AREST_MODE === 'local') {
         const escapeAtom = (s: string) => s.replace(/[\\<>,]/g, ch => '\\' + ch)
         const input = `<${pairs.map(({ role, value }) => `<${escapeAtom(role)}, ${escapeAtom(value)}>`).join(', ')}>`
-        const raw = await systemCall(`assert:${fact_type}`, input)
+        const raw = await systemCall(`assert:${fact_type}`, input, scope)
         const ok = raw === 'ok'
         return textResult(ok ? { status: 'ok', fact_type, pairs } : { error: raw, fact_type })
       }
@@ -1664,7 +1816,7 @@ server.registerTool(
     if (operation === 'update' && AREST_MODE === 'local' && force !== true) {
       let schema: { stateMachines?: Array<{ noun?: string }> } | null = null
       try {
-        const rawSchema = await systemCall('debug', '')
+        const rawSchema = await systemCall('debug', '', scope)
         const parsed = JSON.parse(rawSchema)
         // `debug` may emit either a JSON-string atom (debug-def feature
         // on) or an FFP-shaped Seq summary (feature off). We only want
@@ -1687,13 +1839,13 @@ server.registerTool(
         let transitionsList: Array<{ event: string }> = []
         if (id) {
           try {
-            const smRaw = await systemCall('get:State Machine', id)
+            const smRaw = await systemCall('get:State Machine', id, scope)
             const sm = JSON.parse(smRaw)
             const status = sm && typeof sm === 'object' && typeof sm.Status === 'string'
               ? sm.Status
               : ''
             if (status) {
-              const rawTransitions = await systemCall(`transitions:${noun}`, status)
+              const rawTransitions = await systemCall(`transitions:${noun}`, status, scope)
               const parsedT = JSON.parse(rawTransitions)
               if (Array.isArray(parsedT)) {
                 transitionsList = parsedT
@@ -1730,7 +1882,7 @@ server.registerTool(
         case 'create': {
           const pairs = Object.entries(fields || {}).map(([k, v]) => `<${escapeAtom(k)}, ${escapeAtom(v)}>`).join(', ')
           const idPair = id ? `<id, ${escapeAtom(id)}>, ` : ''
-          const raw = await systemCall(`create:${noun}`, `<${idPair}${pairs}>`)
+          const raw = await systemCall(`create:${noun}`, `<${idPair}${pairs}>`, scope)
           return localApplyResult(raw, { operation, noun, id, fields })
         }
         case 'update': {
@@ -1743,7 +1895,7 @@ server.registerTool(
           if (id && Object.keys(outboundFields).length > 0) {
             let existing: Record<string, unknown> | null = null
             try {
-              const rawExisting = await systemCall(`get:${noun}`, id)
+              const rawExisting = await systemCall(`get:${noun}`, id, scope)
               const parsed = JSON.parse(rawExisting)
               if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
                 existing = parsed as Record<string, unknown>
@@ -1767,11 +1919,11 @@ server.registerTool(
             }
           }
           const pairs = Object.entries(outboundFields).map(([k, v]) => `<${escapeAtom(k)}, ${escapeAtom(v)}>`).join(', ')
-          const raw = await systemCall(`update:${noun}`, `<<id, ${escapeAtom(id || '')}>${pairs ? `, ${pairs}` : ''}>`)
+          const raw = await systemCall(`update:${noun}`, `<<id, ${escapeAtom(id || '')}>${pairs ? `, ${pairs}` : ''}>`, scope)
           return localApplyResult(raw, { operation, noun, id, fields: outboundFields })
         }
         case 'transition': {
-          const raw = await systemCall(`transition:${noun}`, `<${escapeAtom(id || '')}, ${escapeAtom(event || '')}>`)
+          const raw = await systemCall(`transition:${noun}`, `<${escapeAtom(id || '')}, ${escapeAtom(event || '')}>`, scope)
           return localApplyResult(raw, { operation, noun, id })
         }
       }
@@ -1800,9 +1952,11 @@ server.registerTool(
         role: z.string(),
         value: z.string(),
       })).optional().describe('Ordered role/value pairs for exact tuple matching, including repeated role names.'),
+      app: z.string().optional().describe(APP_OVERRIDE_FIELD_DESCRIPTION),
     },
   },
-  async ({ context_receipt, fact_type, roles, pairs }) => {
+  async ({ context_receipt, fact_type, roles, pairs, app }) => {
+    const scope = callScope(app)
     const blocked = mutationGateResult('retract', context_receipt, { fact_type, roles, pairs })
     if (blocked) return blocked
 
@@ -1815,7 +1969,7 @@ server.registerTool(
       : Object.entries(roles || {})
 
     const input = `<${entries.map(([role, value]) => `<${escapeAtom(role)}, ${escapeAtom(value)}>`).join(', ')}>`
-    const raw = await systemCall(`retract:${fact_type}`, input)
+    const raw = await systemCall(`retract:${fact_type}`, input, scope)
     return textResult(parseJsonResult(raw))
   },
 )
@@ -1831,9 +1985,11 @@ server.registerTool(
       noun: z.string().describe('Entity noun type'),
       id: z.string().describe('Entity ID'),
       status: z.string().optional().describe('Current SM status (resolved from state if omitted)'),
+      app: z.string().optional().describe(APP_OVERRIDE_FIELD_DESCRIPTION),
     },
   },
-  async ({ noun, id, status }) => {
+  async ({ noun, id, status, app }) => {
+    const scope = callScope(app)
     if (AREST_MODE === 'local') {
       const parseOr = <T>(raw: string, fallback: T): T | any => {
         try { const v = JSON.parse(raw); return v ?? fallback } catch { return fallback }
@@ -1843,14 +1999,14 @@ server.registerTool(
       // outgoing edges, otherwise it returns [].
       let resolvedStatus = status || ''
       if (!resolvedStatus) {
-        const smRaw = await systemCall(`get:State Machine`, id)
+        const smRaw = await systemCall(`get:State Machine`, id, scope)
         const sm = parseOr(smRaw, null)
         if (sm && typeof sm === 'object' && typeof sm.Status === 'string') {
           resolvedStatus = sm.Status
         }
       }
-      const rawTransitions = await systemCall(`transitions:${noun}`, resolvedStatus)
-      const rawEntity = await systemCall(`get:${noun}`, id)
+      const rawTransitions = await systemCall(`transitions:${noun}`, resolvedStatus, scope)
+      const rawEntity = await systemCall(`get:${noun}`, id, scope)
       const parsedTransitions = parseOr(rawTransitions, null)
       return textResult({
         entity: id,
@@ -1877,12 +2033,14 @@ server.registerTool(
       id: z.string().describe('Entity ID'),
       noun: z.string().optional().describe('Entity noun type'),
       fact: z.string().optional().describe('Specific fact to explain (e.g. "status", "Hypothesis_explains_Observation")'),
+      app: z.string().optional().describe(APP_OVERRIDE_FIELD_DESCRIPTION),
     },
   },
-  async ({ id, noun, fact }) => {
+  async ({ id, noun, fact, app }) => {
+    const scope = callScope(app)
     if (AREST_MODE === 'local') {
       // Audit trail for this entity
-      const auditRaw = await systemCall('audit', '0')
+      const auditRaw = await systemCall('audit', '0', scope)
       let audit: any[] = []
       try {
         const parsed = JSON.parse(auditRaw)
@@ -1892,7 +2050,7 @@ server.registerTool(
       // If a specific fact type is requested, query it
       let factData: any = []
       if (fact) {
-        const raw = await systemCall(`query:${fact}`, JSON.stringify(noun ? { [noun]: id } : {}))
+        const raw = await systemCall(`query:${fact}`, JSON.stringify(noun ? { [noun]: id } : {}), scope)
         try {
           const parsed = JSON.parse(raw)
           factData = parsed ?? []
@@ -1948,10 +2106,14 @@ server.registerTool(
   {
     description:
       'Dump the FULL formal model: every Noun, FactType, Constraint, State Machine, Derivation Rule, plus reference schemes. WHEN: you need the canonical model surface — agent is composing readings and wants to verify naming conventions, or a downstream tool needs the complete picture. ALTERNATIVE: cells mode=list pattern=<glob> for targeted lookups (much smaller payload, faster); query fact_type=FactType to enumerate just the FT cell; orient when you want activity + apps overview not the model. GOTCHA: this is a LARGE payload — for any apps beyond a small toy domain it can run to many KB. Prefer cells/query whenever you have a specific name in mind. Returns the engine\'s raw schema envelope (no contextual receipt needed — read-only). NEXT: pick a specific FT name from the response and call cells mode=get name=<X> for contents, or query fact_type=<X> for a filtered tuple list.',
+    inputSchema: {
+      app: z.string().optional().describe(APP_OVERRIDE_FIELD_DESCRIPTION),
+    },
   },
-  async () => {
+  async ({ app }) => {
+    const scope = callScope(app)
     if (AREST_MODE === 'local') {
-      const data = await dispatchRead('/schema')
+      const data = await dispatchRead('/schema', scope)
       return textResult(data)
     }
     const data = await httpRequest('/arest/default/schema')

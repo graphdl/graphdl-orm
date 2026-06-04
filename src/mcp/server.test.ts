@@ -8,8 +8,9 @@
 import { describe, it, expect } from 'vitest'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
-import { readFileSync } from 'fs'
-import { resolve, dirname } from 'path'
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'fs'
+import { resolve, dirname, join } from 'path'
+import { tmpdir } from 'os'
 import { fileURLToPath } from 'url'
 import {
   parseQueryResponse,
@@ -26,6 +27,11 @@ import {
   activeAppStateFile,
   shouldPersistResolvedApp,
   parseGetResponse,
+  resolveCallScope,
+  scopeDbPath,
+  scopeReadingsDir,
+  lookupHandleCache,
+  rememberHandleCache,
 } from './server.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -939,4 +945,162 @@ describe('#873 verb descriptions teach when / why / gotchas / next', () => {
       expect(config, `${verb}: missing 'NEXT:' marker`).toContain('NEXT:')
     })
   }
+})
+
+// =====================================================================
+// p0 mcp-active-app-isolation (option b) — per-call `app` override.
+//
+// The MCP server's active app is a module-level global (`activeApp`) plus
+// an on-disk marker (`.arest-active-app`). Sub-agents share ONE stdio
+// connection, so a global active app can't isolate per session — one
+// agent's `apps.use` silently re-scopes another's reads/writes. Option
+// (b): let a single CALL carry an optional `app` that resolves its own
+// DB + readings + engine handle for THAT call only, never mutating the
+// shared global or the marker.
+//
+// server.test.ts deliberately avoids the side-effectful engine path, so
+// the per-call mechanism is structured as EXPORTED PURE HELPERS tested
+// here (resolution + handle cache) plus source-string assertions that
+// the threading is wired into every targeted verb.
+// =====================================================================
+
+describe('per-call app scoping (p0 mcp-active-app-isolation, option b)', () => {
+  // A throwaway apps workspace with two distinct apps. Each gets a
+  // readings/ dir and a discoverable <name>.db so resolveArestApp
+  // returns a real dbPath/readingsDir we can assert against — WITHOUT
+  // touching any live .db.
+  let appsDir: string
+  beforeAll(() => {
+    appsDir = mkdtempSync(join(tmpdir(), 'arest-percall-'))
+    for (const name of ['alpha', 'beta']) {
+      const root = join(appsDir, name)
+      mkdirSync(join(root, 'readings'), { recursive: true })
+      writeFileSync(join(root, 'readings', 'app.md'), `# ${name}\n`, 'utf8')
+      // A discoverable DB so resolveArestApp.dbPath points at a real file.
+      writeFileSync(join(root, `${name}.db`), '', 'utf8')
+    }
+  })
+  afterAll(() => {
+    try { rmSync(appsDir, { recursive: true, force: true }) } catch {}
+  })
+
+  describe('resolveCallScope — pure per-call resolution', () => {
+    it('resolves the per-call app to its own DB + readings dir', () => {
+      const alpha = resolveCallScope('alpha', { appsDir, cwd: appsDir })
+      const beta = resolveCallScope('beta', { appsDir, cwd: appsDir })
+      expect(alpha.name).toBe('alpha')
+      expect(alpha.dbPath).toBe(join(appsDir, 'alpha', 'alpha.db'))
+      expect(alpha.readingsDir).toBe(join(appsDir, 'alpha', 'readings'))
+      expect(alpha.exists).toBe(true)
+      // The two apps resolve to genuinely different scopes — the whole
+      // point is that a per-call `app` reads/writes a different UoD.
+      expect(beta.dbPath).not.toBe(alpha.dbPath)
+      expect(beta.readingsDir).not.toBe(alpha.readingsDir)
+      expect(beta.dbPath).toBe(join(appsDir, 'beta', 'beta.db'))
+    })
+
+    it('returns exists=false for an unknown app (no throw, caller can branch)', () => {
+      const missing = resolveCallScope('does-not-exist', { appsDir, cwd: appsDir })
+      expect(missing.name).toBe('does-not-exist')
+      expect(missing.exists).toBe(false)
+    })
+
+    it('scopeDbPath / scopeReadingsDir prefer the scope, else fall back', () => {
+      const scope = resolveCallScope('alpha', { appsDir, cwd: appsDir })
+      // With a scope: the scope's paths win.
+      expect(scopeDbPath(scope, '/fallback/db')).toBe(scope.dbPath)
+      expect(scopeReadingsDir(scope, '/fallback/readings')).toBe(scope.readingsDir)
+      // Without a scope (undefined ⇒ omitted `app`): the global fallback
+      // is returned verbatim, so the no-`app` path is byte-identical to
+      // today's behavior.
+      expect(scopeDbPath(undefined, '/fallback/db')).toBe('/fallback/db')
+      expect(scopeReadingsDir(undefined, '/fallback/readings')).toBe('/fallback/readings')
+    })
+  })
+
+  describe('per-call handle cache (keyed by readings signature)', () => {
+    it('returns undefined on a cold cache, the stored handle on a warm hit', () => {
+      const cache = new Map<string, number>()
+      const sig = 'alpha:1700000000000:0|/r/app.md:1700000000000:12'
+      expect(lookupHandleCache(cache, sig)).toBeUndefined()
+      rememberHandleCache(cache, sig, 7)
+      expect(lookupHandleCache(cache, sig)).toBe(7)
+    })
+
+    it('keys distinct signatures to distinct handles (a 2nd app gets its own)', () => {
+      // The shared `_localHandle` is a single slot keyed by ONE readings
+      // signature, so a per-call second app MUST get its own cache entry
+      // or it would collide with the global app's handle.
+      const cache = new Map<string, number>()
+      rememberHandleCache(cache, 'alpha-sig', 1)
+      rememberHandleCache(cache, 'beta-sig', 2)
+      expect(lookupHandleCache(cache, 'alpha-sig')).toBe(1)
+      expect(lookupHandleCache(cache, 'beta-sig')).toBe(2)
+      // Re-storing under the same signature replaces (stale readings ⇒
+      // recompiled handle) rather than leaking a second entry.
+      rememberHandleCache(cache, 'alpha-sig', 99)
+      expect(lookupHandleCache(cache, 'alpha-sig')).toBe(99)
+      expect(cache.size).toBe(2)
+    })
+  })
+
+  // ── Source assertions: the `app` override is wired into every
+  // targeted verb + the resolution NEVER mutates the global/marker. ──
+  describe('source wiring (every targeted verb threads `app`; global untouched)', () => {
+    const SRC = SERVER_TS.replace(/\r\n/g, '\n')
+    const sliceConfig = (verb: string): string => {
+      const head = SRC.indexOf(`server.registerTool(\n  '${verb}',\n`)
+      expect(head, `registerTool('${verb}', ...) block not found`).toBeGreaterThan(0)
+      const tail = SRC.indexOf('server.registerTool(', head + 1)
+      return SRC.slice(head, tail > 0 ? tail : SRC.length)
+    }
+
+    // The READ/WRITE verbs that resolve their DB/readings through the
+    // global active app and therefore need the per-call override.
+    const SCOPED_VERBS = [
+      'get', 'query', 'sql', 'cells',
+      'apply', 'retract', 'schema', 'actions', 'explain',
+    ] as const
+
+    for (const verb of SCOPED_VERBS) {
+      it(`'${verb}' input schema exposes an optional \`app\` override`, () => {
+        const config = sliceConfig(verb)
+        // The schema must declare `app: z.string().optional()` so a call
+        // can scope itself without `apps.use`.
+        expect(config, `${verb}: missing app input field`)
+          .toMatch(/app:\s*z\.string\(\)\.optional\(\)/)
+      })
+    }
+
+    it('resolveCallScope NEVER writes the global activeApp or the marker', () => {
+      // The whole bug is a shared mutated global. The per-call resolver
+      // must be pure: it may call resolveArestApp (a pure fs read) but
+      // must not assign `activeApp =`, call `activateApp(`, or write the
+      // `.arest-active-app` marker via writePersistedAppName.
+      const fnStart = SRC.indexOf('export function resolveCallScope')
+      expect(fnStart, 'resolveCallScope not found').toBeGreaterThan(0)
+      const fnBody = SRC.slice(fnStart, SRC.indexOf('\n}', fnStart) + 2)
+      expect(fnBody).not.toMatch(/activeApp\s*=/)
+      expect(fnBody).not.toMatch(/activateApp\(/)
+      expect(fnBody).not.toMatch(/writePersistedAppName\(/)
+    })
+
+    it('systemCall threads an optional per-call scope through to db/readings', () => {
+      // systemCall is the single chokepoint every scoped verb funnels
+      // through. It must accept an optional scope and pass it to BOTH
+      // the CLI-db path and the in-process engine-handle path so the
+      // override reaches whichever backend is active.
+      const sigStart = SRC.indexOf('async function systemCall(')
+      expect(sigStart, 'systemCall not found').toBeGreaterThan(0)
+      const sig = SRC.slice(sigStart, SRC.indexOf(')', sigStart) + 1)
+      expect(sig).toMatch(/scope\??:/)
+    })
+
+    it('the per-call engine handle is cached separately from the global _localHandle', () => {
+      // A keyed cache (Map) holds per-call handles so a second app does
+      // not clobber the global app's single _localHandle slot.
+      expect(SRC).toMatch(/_perCallHandles\s*[:=]/)
+      expect(SRC).toMatch(/new Map<string, number>\(\)/)
+    })
+  })
 })
