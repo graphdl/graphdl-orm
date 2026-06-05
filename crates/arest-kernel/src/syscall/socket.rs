@@ -54,9 +54,14 @@
 // (`crate::syscall::openat`).
 
 use crate::net;
-use crate::net_socket::{validate_socket_args, SocketId};
+use crate::net_socket::{
+    validate_socket_args, SocketId, EADDRINUSE, EAGAIN, ECONNREFUSED, EFAULT, EINPROGRESS, EINVAL,
+    EISCONN, ENOTCONN, ENOTSOCK,
+};
 use crate::process::current_process_fd_table;
 use crate::process::fd_table::socket as fd_socket;
+use crate::process::fd_table::FdEntry;
+use crate::syscall::dispatch::EBADF;
 use crate::syscall::openat::{EMFILE, ENOSYS};
 
 /// Linux x86_64 syscall number for `socket(domain, type, protocol)`.
@@ -107,6 +112,14 @@ pub fn handle(domain: u64, type_: u64, protocol: u64) -> i64 {
         // pre-process state. In production `net::init` runs at boot, so
         // this only fires on the host test target / a mis-ordered boot.
         Err(net::SocketError::NotInitialised) => return -ENOSYS,
+        // `create_tcp_socket` mints its own id and does no I/O, so it can
+        // only fail with `NotInitialised` — the other `SocketError`
+        // variants are produced exclusively by the bind/listen/connect/
+        // send/recv wrappers (#529-#533), never here. The catch-all keeps
+        // the match exhaustive as the error enum grows; map it to the
+        // same pre-stack sentinel rather than inventing an errno for a
+        // case that can't arise.
+        Err(_) => return -ENOSYS,
     };
 
     // (3) Allocate the fd and bind it to the socket id.
@@ -142,6 +155,136 @@ fn bind_socket_fd(socket_id: SocketId) -> i64 {
         net::destroy_socket(socket_id);
     }
     result
+}
+
+// ── Shared glue for the socket-operation handlers (#529-#533) ───────
+//
+// bind / listen / connect / accept / sendto / recvfrom all start the
+// same way: take an fd, resolve it to the kernel `SocketId` the fd-table
+// `FdEntry::Socket` stores, then drive a `net::tcp_*` wrapper and map its
+// `SocketError` onto a Linux errno. These three helpers — the fd→id
+// resolver, the userspace `sockaddr` reader, and the error mapper — are
+// factored here (in the socket module) so each per-operation handler
+// stays a thin, well-documented sequence rather than re-deriving the
+// plumbing. They're `pub(crate)` so the sibling `syscall::bind` /
+// `syscall::listen` / … modules can call them.
+
+/// Resolve `fd` to the kernel [`SocketId`] its fd-table entry stores.
+/// Returns:
+///   * `Ok(SocketId)` — `fd` is a live `FdEntry::Socket`.
+///   * `Err(-ENOSYS)` — no process is installed (the pre-spawn boot
+///     state, same sentinel `socket()` / `openat` use).
+///   * `Err(-EBADF)` — `fd` isn't open at all (no such entry, or `fd`
+///     doesn't fit the `i32` table key width).
+///   * `Err(-ENOTSOCK)` — `fd` is open but backs a `File` / `Synthetic`
+///     resource, not a socket. Linux returns `ENOTSOCK` for a socket op
+///     on a non-socket fd.
+///
+/// The fd-table lock is taken and released entirely within this call —
+/// the returned `SocketId` is a plain value, so the subsequent `net::`
+/// call doesn't nest the fd-table lock inside the `NET` lock.
+pub(crate) fn resolve_socket_fd(fd: i32) -> Result<SocketId, i64> {
+    current_process_fd_table(|maybe_table| {
+        let Some(table) = maybe_table else {
+            // No current process — pre-spawn boot state.
+            return Err(-ENOSYS);
+        };
+        match table.lookup(fd) {
+            Some(FdEntry::Socket { socket_id }) => Ok(SocketId(*socket_id)),
+            // Open, but not a socket — File/Synthetic fd.
+            Some(_) => Err(-ENOTSOCK),
+            // Not open at all.
+            None => Err(-EBADF),
+        }
+    })
+}
+
+/// Read `addrlen` bytes of a `struct sockaddr` from userspace pointer
+/// `addr` into an owned `Vec<u8>`, for the pure
+/// [`crate::net_socket::parse_sockaddr_in`] to decode. Returns:
+///   * `Ok(bytes)` — copied `addrlen` bytes.
+///   * `Err(-EFAULT)` — `addr` is null (with `addrlen > 0`), or `addrlen`
+///     exceeds a sane cap (a malformed call), guarding the slice
+///     construction the same way `write::do_write` guards `count`.
+///
+/// SAFETY: `addr` is treated as a kernel pointer under tier-1's identity
+/// mapping (same model as `write` / `read` / `openat`). The null check
+/// guards the common mistake; once #527 lands real page tables this
+/// gains a `validate_userspace_range` pre-check. `addrlen` is bounded so
+/// the `from_raw_parts` length is always `<= isize::MAX`.
+pub(crate) fn read_sockaddr(addr: u64, addrlen: u64) -> Result<alloc::vec::Vec<u8>, i64> {
+    // A null pointer is -EFAULT for any non-zero length. (addrlen == 0 is
+    // handled by the parser, which rejects an undersized buffer with
+    // -EINVAL; we still must not deref null, so guard here too.)
+    if addr == 0 {
+        return Err(-EFAULT);
+    }
+    // Bound the length: a sockaddr is tiny (16 bytes for IPv4, 28 for
+    // IPv6, 110 for AF_UNIX). Anything beyond `sockaddr_storage` (128
+    // bytes) is a malformed call — reject with -EFAULT rather than copy a
+    // huge span. This also keeps the slice length well under isize::MAX.
+    const SOCKADDR_STORAGE_LEN: u64 = 128;
+    if addrlen > SOCKADDR_STORAGE_LEN {
+        return Err(-EFAULT);
+    }
+    let len = addrlen as usize;
+    let mut out = alloc::vec::Vec::with_capacity(len);
+    // SAFETY: `addr` is non-null (checked) and `len <= 128 <= isize::MAX`;
+    // tier-1's identity mapping makes the span valid kernel memory.
+    let slice = unsafe { core::slice::from_raw_parts(addr as *const u8, len) };
+    out.extend_from_slice(slice);
+    Ok(out)
+}
+
+/// Map a [`net::SocketError`] from a `tcp_*` wrapper onto the Linux errno
+/// a socket syscall returns. `op` selects the few cases where the same
+/// `SocketError` means different errnos for different operations
+/// (`InvalidState` is `-EISCONN` for `connect` but `-EINVAL` for
+/// `bind`; `Unaddressable` is `-EADDRNOTAVAIL`-ish but we use `-EINVAL`
+/// for the zero-port `listen`/`bind` and `-EADDRNOTAVAIL` is not in the
+/// tier-1 set, so `connect` to 0.0.0.0 maps to `-EINVAL` too). Returning
+/// the negative errno keeps the call sites a single `?`-free match.
+pub(crate) fn socket_error_to_errno(err: net::SocketError, op: SocketOp) -> i64 {
+    use net::SocketError::*;
+    match err {
+        // Net stack not up — same sentinel the rest of the surface uses
+        // for "this kernel can't right now".
+        NotInitialised => -ENOSYS,
+        // Dangling socket fd — the id resolved but isn't a live socket.
+        UnknownSocket => -EBADF,
+        AddrInUse => -EADDRINUSE,
+        ConnectionRefused => -ECONNREFUSED,
+        NotConnected => -ENOTCONN,
+        WouldBlock => -EAGAIN,
+        ConnectInProgress => -EINPROGRESS,
+        // State / address mismatches: the errno depends on the operation.
+        InvalidState => match op {
+            // `connect` on an already-open socket → already connected.
+            SocketOp::Connect => -EISCONN,
+            // `listen` on an already-open (connected) socket → the local
+            // address is effectively in use for listening.
+            SocketOp::Listen => -EADDRINUSE,
+            // `bind` after the socket is open → invalid argument.
+            SocketOp::Bind => -EINVAL,
+        },
+        Unaddressable => match op {
+            // A zero / 0.0.0.0 connect target is an invalid argument in
+            // the tier-1 errno set (no EADDRNOTAVAIL exposed yet).
+            SocketOp::Connect => -EINVAL,
+            // A zero local port for bind/listen → invalid argument.
+            SocketOp::Bind | SocketOp::Listen => -EINVAL,
+        },
+    }
+}
+
+/// Which socket operation is mapping a [`net::SocketError`], so
+/// [`socket_error_to_errno`] can pick the operation-specific errno for
+/// the ambiguous `InvalidState` / `Unaddressable` cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SocketOp {
+    Bind,
+    Listen,
+    Connect,
 }
 
 #[cfg(test)]

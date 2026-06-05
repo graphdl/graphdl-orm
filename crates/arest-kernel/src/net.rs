@@ -249,6 +249,27 @@ struct NetState {
     /// entry per created socket and does no I/O; the entry is removed by
     /// the future `close` handler when the socket fd is released.
     socket_registry: BTreeMap<u64, SocketHandle>,
+    /// Local endpoint recorded by `bind(2)` for each socket id, consulted
+    /// by `listen(2)` (#529). smoltcp's `tcp::Socket` has no standalone
+    /// bind step — the local endpoint is supplied at `listen`/`connect`
+    /// time — so POSIX `bind` is modelled here as "remember the endpoint
+    /// the next `listen` should use". Keyed by the same `u64` socket id
+    /// the registry uses; an entry is absent until `bind` runs and is
+    /// removed by `destroy_socket` so a re-used id (impossible today —
+    /// ids are monotonic) couldn't inherit a stale binding.
+    socket_bindings: BTreeMap<u64, BoundEndpoint>,
+}
+
+/// The local endpoint a `bind(2)` recorded for a socket (#529). Both
+/// fields are host-order: `addr` is the IPv4 address as a `u32`
+/// (`0` = INADDR_ANY, "any local address"), `port` the local port
+/// (`0` = "ephemeral / unbound"). `tcp_listen` reads `port` to drive
+/// smoltcp's `listen`; `addr` is recorded for a future bind-to-specific-
+/// address refinement (tier-1 listens on all local addresses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BoundEndpoint {
+    addr: u32,
+    port: u16,
 }
 
 /// State for the kernel's single HTTP/1.1 listener (#264).
@@ -386,6 +407,9 @@ pub fn init(virtio: Option<VirtioPhy>) {
         // (#478a).
         socket_ids: SocketIdAllocator::new(),
         socket_registry: BTreeMap::new(),
+        // `bind` bookkeeping (#529) starts empty — populated as userspace
+        // `bind()` calls arrive.
+        socket_bindings: BTreeMap::new(),
     });
 }
 
@@ -969,6 +993,48 @@ pub enum SocketError {
     /// maps this to a negative errno (the kernel booted without a net
     /// stack, or the call arrived before boot wired it).
     NotInitialised,
+    /// The kernel `SocketId` isn't in the registry — the fd resolved to
+    /// a socket id that was never created or has been closed. Surfaced by
+    /// the bind/listen/connect/send/recv wrappers (#529-#533); the
+    /// handler maps it to `-EBADF` (a dangling socket fd). `socket()`'s
+    /// own creation path can't hit this — it mints the id itself.
+    UnknownSocket,
+    /// smoltcp rejected the local endpoint because the port is already in
+    /// use (or the socket was already open with a different endpoint).
+    /// `bind` / `listen` map this to `-EADDRINUSE`.
+    AddrInUse,
+    /// The operation needs the socket in a different state than it's in:
+    /// a `connect` / `listen` on an already-open socket, a `bind` after
+    /// the socket is already bound/connected. Maps to `-EISCONN` for
+    /// `connect` (already connected) and `-EINVAL` for `bind`/`listen`
+    /// (wrong state) per the operation. Mirrors smoltcp's
+    /// `*Error::InvalidState`.
+    InvalidState,
+    /// A required address (the connect target, or the local port for a
+    /// bind/listen) was unspecified / zero where smoltcp requires a
+    /// concrete value. Maps to `-EADDRNOTAVAIL` for connect (0.0.0.0
+    /// target) / `-EINVAL` for a zero port. Mirrors smoltcp's
+    /// `*Error::Unaddressable`.
+    Unaddressable,
+    /// A non-blocking `connect` has kicked off the TCP handshake (SYN
+    /// sent) but it hasn't completed. The handler maps this to
+    /// `-EINPROGRESS` — the canonical "poll for writability" signal a
+    /// non-blocking `connect` returns. Tier-1 sockets are always
+    /// non-blocking (no scheduler to park on — #530).
+    ConnectInProgress,
+    /// The TCP connection was refused by the peer (RST in response to our
+    /// SYN) or reset underneath an established connection. Maps to
+    /// `-ECONNREFUSED`.
+    ConnectionRefused,
+    /// `send` / `recv` was issued on a socket with no established
+    /// connection (never connected, or already closed). Maps to
+    /// `-ENOTCONN`.
+    NotConnected,
+    /// A non-blocking operation can't complete right now without
+    /// blocking: a `send` whose tx ring is full, or a `recv` with no
+    /// bytes pending on a still-open connection. Maps to `-EAGAIN`
+    /// (`EWOULDBLOCK`). The caller retries on a later `net::poll()`.
+    WouldBlock,
 }
 
 /// Create a TCP socket on the kernel's network interface and return the
@@ -1054,6 +1120,136 @@ pub fn destroy_socket(id: SocketId) {
         // but a future concurrent path shouldn't panic).
         let _ = state.sockets.remove(handle);
     }
+    // Drop any `bind`-recorded endpoint (#529) so a (hypothetically
+    // re-used) id can't inherit a stale binding. No-op when the socket
+    // was never bound.
+    state.socket_bindings.remove(&id.as_u64());
+}
+
+// ── TCP socket operations (#529-#533 — userspace socket syscalls) ───
+//
+// These wrappers are the gated smoltcp surface the bind / listen /
+// connect / send / recv syscall handlers drive once they've resolved an
+// fd → `SocketId`. Each follows the SAME shape as `create_tcp_socket` /
+// `udp_send_to`: lock `NET`, resolve the `SocketId` to its smoltcp
+// `SocketHandle` via the registry, fetch the `tcp::Socket` out of the
+// `SocketSet`, perform the one smoltcp call, and translate smoltcp's
+// per-call error enum into a `SocketError`. On the host test target the
+// loopback stack (`init(None)`) makes these runnable end-to-end; before
+// `net::init` runs they return `NotInitialised`, matching
+// `create_tcp_socket`.
+//
+// Why TCP `bind` records the port rather than calling smoltcp
+// -----------------------------------------------------------
+// smoltcp's `tcp::Socket` has no separate `bind` step — a listening
+// socket takes its local endpoint in `listen(endpoint)`, and a
+// connecting socket takes it in `connect(.., local)`. POSIX `bind`
+// followed by `listen` (the server path) therefore can't map 1:1 onto a
+// smoltcp call at `bind` time. We model `bind` as "remember the local
+// endpoint the next `listen` should use": the bound endpoint is stored
+// in the registry alongside the handle, and `listen` consults it. A
+// `bind` with no following `listen` (the rare `bind`-then-`connect`
+// client that wants a fixed source port) records the port for the
+// future `connect` slice to honour; tier-1 `connect` currently picks an
+// ephemeral local port and ignores a prior bind (documented on
+// `tcp_connect`).
+
+/// Resolve `id` to its smoltcp `SocketHandle`, or `UnknownSocket` if the
+/// id isn't registered. Shared preamble for the operation wrappers.
+/// Caller holds the `NET` lock (passes the live `&mut NetState`).
+fn resolve_tcp_handle(state: &NetState, id: SocketId) -> Result<SocketHandle, SocketError> {
+    state
+        .socket_registry
+        .get(&id.as_u64())
+        .copied()
+        .ok_or(SocketError::UnknownSocket)
+}
+
+/// `bind(2)` for a TCP socket (#529). Records the local endpoint
+/// (`addr` host-order IPv4 word + `port`) the socket should use, so a
+/// following `listen` binds to it. Does NOT touch smoltcp — smoltcp
+/// takes the local endpoint at `listen`/`connect` time, so `bind` is
+/// pure bookkeeping in this stack (see the module-section note above).
+///
+/// Returns:
+///   * `Ok(())` — the endpoint was recorded.
+///   * `Err(NotInitialised)` — `net::init` hasn't run.
+///   * `Err(UnknownSocket)` — `id` isn't a live socket.
+///   * `Err(InvalidState)` — the socket is already open (already
+///     listening / connected); Linux returns `-EINVAL` for a `bind`
+///     after the socket is in use.
+///
+/// `addr` is the host-order IPv4 word (`0` = INADDR_ANY) and `port` the
+/// host-order port (`0` = "pick an ephemeral port at listen time").
+/// Both are stored verbatim; `tcp_listen` interprets them.
+pub fn tcp_bind(id: SocketId, addr: u32, port: u16) -> Result<(), SocketError> {
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(SocketError::NotInitialised)?;
+    let handle = resolve_tcp_handle(state, id)?;
+
+    // A bind only makes sense on a fresh (unopened) socket. If the socket
+    // is already listening or connected, Linux returns -EINVAL.
+    let socket = state.sockets.get::<tcp::Socket>(handle);
+    if socket.is_open() {
+        return Err(SocketError::InvalidState);
+    }
+
+    state
+        .socket_bindings
+        .insert(id.as_u64(), BoundEndpoint { addr, port });
+    Ok(())
+}
+
+/// `listen(2)` for a TCP socket (#529). Transitions the socket into the
+/// LISTEN state on the endpoint a prior `tcp_bind` recorded (or on "any
+/// address, the bound port" when only a port was bound). The `backlog`
+/// argument Linux carries is accepted but ignored — tier-1's single
+/// smoltcp listen socket has an implicit backlog of one (a future
+/// multi-socket accept queue, #530, will honour it).
+///
+/// smoltcp's `listen(endpoint)` takes an `IpListenEndpoint` — we pass
+/// just the port (address `None` = listen on every local address), which
+/// is exactly what `register_http` does for the kernel's HTTP listener.
+/// A bound concrete address is recorded but tier-1 listens on all local
+/// addresses regardless (the loopback / single-NIC interface has one
+/// address anyway); honouring a specific bind address is a follow-up.
+///
+/// Returns:
+///   * `Ok(())` — the socket is now listening.
+///   * `Err(NotInitialised)` / `Err(UnknownSocket)` — as `tcp_bind`.
+///   * `Err(Unaddressable)` — the (bound) port is 0; smoltcp can't
+///     listen on port 0. Handler maps to `-EINVAL`.
+///   * `Err(InvalidState)` — the socket was already open in a
+///     non-matching state (already connected). Handler maps to
+///     `-EADDRINUSE`.
+///
+/// If no prior `bind` recorded a port, the socket has no port to listen
+/// on — that's `Unaddressable` (`-EINVAL`), matching Linux's `listen`
+/// without a preceding `bind` on a fresh socket (which has no local
+/// address). A future autobind could assign an ephemeral port here.
+pub fn tcp_listen(id: SocketId) -> Result<(), SocketError> {
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(SocketError::NotInitialised)?;
+    let handle = resolve_tcp_handle(state, id)?;
+
+    // The port comes from a prior `bind`. No bind → no port → can't
+    // listen (Unaddressable). smoltcp also rejects port 0.
+    let port = state
+        .socket_bindings
+        .get(&id.as_u64())
+        .map(|b| b.port)
+        .unwrap_or(0);
+    if port == 0 {
+        return Err(SocketError::Unaddressable);
+    }
+
+    let socket = state.sockets.get_mut::<tcp::Socket>(handle);
+    // `listen` takes the port (addr None = all local addresses), the same
+    // call `register_http` makes for the HTTP listener.
+    socket.listen(port).map_err(|e| match e {
+        tcp::ListenError::Unaddressable => SocketError::Unaddressable,
+        tcp::ListenError::InvalidState => SocketError::InvalidState,
+    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────

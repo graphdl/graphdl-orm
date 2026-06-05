@@ -53,6 +53,7 @@
 // tier-1 the negative return is enough.
 
 use crate::syscall::arch_prctl;
+use crate::syscall::bind;
 use crate::syscall::brk;
 use crate::syscall::close;
 use crate::syscall::exit;
@@ -61,6 +62,7 @@ use crate::syscall::getrandom;
 use crate::syscall::getpid;
 use crate::syscall::identity;
 use crate::syscall::ioctl;
+use crate::syscall::listen;
 use crate::syscall::mmap;
 use crate::syscall::openat;
 use crate::syscall::read;
@@ -312,6 +314,24 @@ pub const SYS_RT_SIGRETURN: u64 = 15;
 /// per-process fd bound to it — creation only, no I/O. Per #478a.
 pub const SYS_SOCKET: u64 = 41;
 
+/// Linux x86_64 syscall number for
+/// `bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)`.
+/// Source: `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_bind`
+/// (= 49). The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_bind`. Routes to
+/// `bind::handle`, which records the socket's local endpoint (IPv4 addr
+/// + port from the `sockaddr_in`) for a following `listen`. Per #529.
+pub const SYS_BIND: u64 = 49;
+
+/// Linux x86_64 syscall number for `listen(int sockfd, int backlog)`.
+/// Source: `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_listen`
+/// (= 50). The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_listen`. Routes to
+/// `listen::handle`, which transitions the socket into the LISTEN state
+/// on its bound port (the `backlog` is accepted but ignored — tier-1 has
+/// an implicit backlog of one). Per #529.
+pub const SYS_LISTEN: u64 = 50;
+
 /// The dispatch entry point. Match on `rax` and forward the argument
 /// registers (rdi / rsi / rdx / r10 / r8 / r9) to the per-syscall
 /// handler. Handlers that take fewer than six args simply ignore the
@@ -469,6 +489,23 @@ pub fn dispatch(
             // negative errno (-EAFNOSUPPORT / -EPROTONOSUPPORT / -EINVAL
             // / -EMFILE / -ENOSYS). Per #478a.
             socket::handle(rdi, rsi, rdx)
+        }
+        SYS_BIND => {
+            // bind(sockfd, addr, addrlen) — assign a local address to a
+            // socket. rdi = sockfd (i32), rsi = addr pointer (const
+            // struct sockaddr *), rdx = addrlen (socklen_t). Records the
+            // IPv4 addr + port for a following listen. Returns 0 or a
+            // negative errno (-EBADF / -EFAULT / -EINVAL / -ENOTSOCK /
+            // -EAFNOSUPPORT / -EADDRINUSE / -ENOSYS). Per #529.
+            bind::handle(rdi as i32, rsi, rdx)
+        }
+        SYS_LISTEN => {
+            // listen(sockfd, backlog) — mark a bound socket passive.
+            // rdi = sockfd (i32), rsi = backlog (i32, accepted but
+            // ignored — tier-1 backlog is one). Returns 0 or a negative
+            // errno (-EBADF / -EINVAL / -ENOTSOCK / -EADDRINUSE /
+            // -ENOSYS). Per #529.
+            listen::handle(rdi as i32, rsi as i32)
         }
         SYS_EXIT | SYS_EXIT_GROUP => {
             // exit / exit_group both transition the Process state
@@ -659,6 +696,32 @@ mod tests {
         // domain = AF_INET (2), type = SOCK_DGRAM (2), protocol = 0.
         let result = dispatch(SYS_SOCKET, 2, 2, 0, 0, 0, 0);
         assert_eq!(result, -93);
+    }
+
+    /// `SYS_BIND` is 49 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_bind`.
+    #[test]
+    fn sys_bind_number_matches_linux_uapi() {
+        assert_eq!(SYS_BIND, 49);
+    }
+
+    /// `SYS_LISTEN` is 50 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_listen`.
+    #[test]
+    fn sys_listen_number_matches_linux_uapi() {
+        assert_eq!(SYS_LISTEN, 50);
+    }
+
+    /// `dispatch(SYS_BIND, fd, NULL, 16, ...)` routes to `bind::handle`
+    /// and the null-sockaddr rejection fires → `-EFAULT` (-14). Verifies
+    /// the dispatcher wires syscall 49 to the bind handler. The rejection
+    /// happens before any fd / net touch, so no process / stack is
+    /// needed.
+    #[test]
+    fn dispatch_bind_null_addr_returns_efault() {
+        // sockfd = 3, addr = NULL, addrlen = 16.
+        let result = dispatch(SYS_BIND, 3, 0, 16, 0, 0, 0);
+        assert_eq!(result, -14);
     }
 
     /// `SYS_MMAP` is 9 — matches

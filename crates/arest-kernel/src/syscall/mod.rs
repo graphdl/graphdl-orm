@@ -56,6 +56,7 @@
 #![allow(dead_code)]
 
 pub mod arch_prctl;
+pub mod bind;
 pub mod brk;
 pub mod close;
 pub mod dispatch;
@@ -65,6 +66,7 @@ pub mod getrandom;
 pub mod getpid;
 pub mod identity;
 pub mod ioctl;
+pub mod listen;
 pub mod mmap;
 pub mod openat;
 pub mod read;
