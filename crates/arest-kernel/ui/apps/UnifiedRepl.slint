@@ -626,11 +626,10 @@ export component UnifiedRepl inherits Window {
                         // Each row is one clickable affordance —
                         // clicks jump the current cell to the chosen
                         // target.
-                        Rectangle {
+                        VerticalLayout {
                             min-height: 80px;
                             Card {
                                 width: 100%;
-                                height: 100%;
                                 title: "Navigate";
                                 if root.navigation-targets.length == 0 : Text {
                                     text: "Nothing to navigate from here. Try the actions below or type 'help'.";
@@ -665,11 +664,10 @@ export component UnifiedRepl inherits Window {
                         // transition's event name. Disabled transitions
                         // (guard violations) render greyed out + show
                         // their violation text in a hover tooltip.
-                        Rectangle {
+                        VerticalLayout {
                             min-height: 80px;
                             Card {
                                 width: 100%;
-                                height: 100%;
                                 title: "Actions";
                                 if root.system-actions.length == 0 : Text {
                                     text: "(no SYSTEM actions for this cell — try the REPL prompt below)";
@@ -788,11 +786,10 @@ export component UnifiedRepl inherits Window {
                         // current cell to its target — this counts as
                         // a navigation event (pushes a fresh history
                         // entry), so the user can `back` out.
-                        Rectangle {
+                        VerticalLayout {
                             min-height: 80px;
                             Card {
                                 width: 100%;
-                                height: 100%;
                                 title: "Bookmarks";
                                 Button {
                                     text: "+ Bookmark current cell";

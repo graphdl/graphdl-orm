@@ -112,6 +112,18 @@ try {
     } else {
         Write-Host "WARN: POST /input returned '$iresp' but ptr-dbg not seen in serial." -ForegroundColor Yellow
     }
+
+    # Post-input snapshot: re-shoot /screen so the cursor sprite at the
+    # driven position (640,400) is captured -- verifies the cursor tracks
+    # where the agent drives it (the original "cursor doesn't track" check).
+    Start-Sleep -Milliseconds 1500
+    $outAfter = Join-Path $repoRoot "target/screen-probe/screen-after-input.png"
+    $codeA = (& curl.exe -s -m 5 -o $outAfter -w "%{http_code}" "http://127.0.0.1:8080/screen" 2>$null)
+    if ($LASTEXITCODE -eq 0 -and (Test-Path $outAfter) -and (Get-Item $outAfter).Length -gt 0) {
+        Write-Host "Post-input /screen -> HTTP $codeA, saved to $outAfter (cursor should be at 640,400)." -ForegroundColor Green
+    } else {
+        Write-Host "Post-input /screen capture failed (code $codeA)." -ForegroundColor Yellow
+    }
 } finally {
     if (-not $p.HasExited) { $p.Kill() }
 }
