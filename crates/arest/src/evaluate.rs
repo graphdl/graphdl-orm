@@ -2116,6 +2116,62 @@ mod tests {
             "bare o1 must get initial 'Draft'; got {:?}", status_of("o1"));
     }
 
+    /// REPRO (task sm-fold-as-predicate): the COMPILED event-fold must respect
+    /// each transition's `from` status, mirroring the abstract run_machine fold
+    /// (test_valid_transitions_from_status). o1 carries ONLY `Order_was_shipped`
+    /// (from=Placed) but was never placed, so it is in Draft and shipped must
+    /// NOT fire. The unguarded fold (compile.rs:7719 discards `from`) wrongly
+    /// emits Shipped.
+    #[test]
+    #[ignore = "RED until sm-fold-as-predicate lands"]
+    fn event_fold_respects_from_status() {
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "Order", &make_noun("entity"));
+        cells = with_noun(cells, "Name", &make_noun("value"));
+        cells = with_ft(cells, "Order_has_Name", &FactTypeDef {
+            schema_id: String::new(), reading: "Order has Name".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Order".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Name".to_string(), role_index: 1 },
+            ],
+        });
+        cells = with_ft(cells, "Order_was_placed", &FactTypeDef {
+            schema_id: String::new(), reading: "Order was placed".to_string(), readings: vec![],
+            roles: vec![RoleDef { noun_name: "Order".to_string(), role_index: 0 }],
+        });
+        cells = with_ft(cells, "Order_was_shipped", &FactTypeDef {
+            schema_id: String::new(), reading: "Order was shipped".to_string(), readings: vec![],
+            roles: vec![RoleDef { noun_name: "Order".to_string(), role_index: 0 }],
+        });
+        cells = with_state_machine(cells, "OrderSM", &StateMachineDef {
+            noun_name: "Order".to_string(),
+            statuses: vec!["Draft".to_string(), "Placed".to_string(), "Shipped".to_string()],
+            transitions: vec![
+                TransitionDef { from: "Draft".to_string(), to: "Placed".to_string(), event: "Order_was_placed".to_string(), guard: None },
+                TransitionDef { from: "Placed".to_string(), to: "Shipped".to_string(), event: "Order_was_shipped".to_string(), guard: None },
+            ],
+            initial: "Draft".to_string(),
+        });
+        cells.entry("Order_has_Name".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Order", "o1"), ("Name", "Widget")]));
+        cells.entry("Order_was_shipped".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Order", "o1")]));
+
+        let (state, defs, _def_map) = compile_cells(cells);
+        let dd = derivation_defs_from(&defs);
+        let (_new_state, derived) = forward_chain_defs_state(&dd, &state);
+
+        let statuses: Vec<String> = derived.iter()
+            .filter(|d| d.fact_type_id == "State_Machine_is_currently_in_Status")
+            .filter(|d| d.bindings.iter().any(|(k, v)| k == "State Machine" && v == "o1"))
+            .filter_map(|d| d.bindings.iter().find(|(k, _)| k == "Status").map(|(_, v)| v.clone()))
+            .collect();
+        assert!(!statuses.iter().any(|s| s == "Shipped"),
+            "event-fold must respect `from`: o1 was never Placed, so a shipped event (from=Placed) must not fire from Draft. Got: {:?}", statuses);
+        assert!(statuses.iter().any(|s| s == "Draft"),
+            "o1 must remain in initial Draft. Got: {:?}", statuses);
+    }
+
     /// task-6 / #6 ROOT-CAUSE repro: a transition trigger-FT cell that
     /// contains a fact with a φ (phi) value in the SM-noun role — e.g.
     /// `<<Task, φ>>` in Task_is_started (the live tasks.db has these).
