@@ -172,6 +172,7 @@ pub mod linuxkpi_virtio_tablet;
 pub mod ui_apps;
 pub mod framebuffer;
 pub mod screenshot;
+pub mod input_drive;
 pub mod composer;
 pub mod component_binding;
 pub mod toolkit_loop;
@@ -349,6 +350,39 @@ pub fn arest_http_handler(req: &http::Request) -> http::Response {
             }
         }
         return http::Response::not_found();
+    }
+
+    // POST /input -- drive-half of the see-and-drive surface. Parses the
+    // body's line commands (move/click/button/scroll) into pointer
+    // actions and feeds them to the kernel's pointer ring / cursor
+    // position, so the agent can move, click, and scroll without a
+    // physical mouse. Every feed emits a serial `ptr-dbg:` line, so the
+    // drive is verifiable even in server mode (no UI loop draining the
+    // ring). Gated to uefi because it reaches arch::uefi::pointer; the
+    // pure parser (input_drive) is host-tested on its own.
+    #[cfg(target_os = "uefi")]
+    if req.method == "POST" && (req.path == "/input" || req.path.starts_with("/input?")) {
+        use arch::uefi::pointer::{self, PointerEvent};
+        let in_body = core::str::from_utf8(&req.body).unwrap_or("");
+        let actions = input_drive::parse_input(in_body);
+        let n = actions.len();
+        for a in &actions {
+            match *a {
+                input_drive::InputAction::Move { x, y } => pointer::set_position(x, y),
+                input_drive::InputAction::Button { button, pressed } => {
+                    pointer::push_pointer_event(PointerEvent::Button { button, pressed })
+                }
+                input_drive::InputAction::Scroll { delta } => {
+                    pointer::push_pointer_event(PointerEvent::Scroll { delta })
+                }
+            }
+        }
+        // One Sync barrier so a consumer drain commits the batch as a frame.
+        pointer::push_pointer_event(PointerEvent::Sync);
+        return http::Response::ok(
+            "application/json",
+            alloc::format!("{{\"applied\":{}}}\n", n).into_bytes(),
+        );
     }
 
     // /arest/parse — registry stats (#611/#612). Mirror of the

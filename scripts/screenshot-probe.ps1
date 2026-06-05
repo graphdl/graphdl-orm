@@ -93,6 +93,20 @@ try {
         Write-Host "--- serial tail ---"
         Get-Content $serialAbs -Tail 30 -ErrorAction SilentlyContinue
     }
+
+    # Drive-half check: POST /input, then confirm the pointer ring saw it
+    # via the serial ptr-dbg trace (works in server mode -- no UI drain needed).
+    $driveFile = Join-Path $stageAbs "drive.txt"
+    "move 640 400`nclick left`nscroll -2" | Out-File -FilePath $driveFile -Encoding ascii -NoNewline
+    $iresp = (& curl.exe -s -m 5 -X POST --data-binary "@$driveFile" "http://127.0.0.1:8080/input" 2>$null)
+    Start-Sleep -Milliseconds 1500
+    $log2 = (Get-Content $serialAbs -Raw -ErrorAction SilentlyContinue)
+    if ($null -eq $log2) { $log2 = "" }
+    if ($log2 -match "pointer::set_position" -and $log2 -match "pointer::push") {
+        Write-Host "PASS: POST /input -> ptr-dbg observed (set_position + push). Response: $iresp" -ForegroundColor Green
+    } else {
+        Write-Host "WARN: POST /input returned '$iresp' but ptr-dbg not seen in serial." -ForegroundColor Yellow
+    }
 } finally {
     if (-not $p.HasExited) { $p.Kill() }
 }
