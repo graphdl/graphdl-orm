@@ -341,19 +341,18 @@ pub(crate) fn resolve_key_roles_for_ft(
         // form before #821b). Compare in lower-case so both paths
         // see the same modality.
         if !c.modality.eq_ignore_ascii_case("alethic") { continue; }
-        // Roles this UC spans inside *this* fact type. Dedup
-        // duplicate spans the parser may emit (`Each Task has at
-        // most one Task Readiness` lands as two identical Span
-        // rows on role 0 because span-enrichment pushes one entry
-        // per recogniser). Without dedup the "spanning UC" check
-        // below misreads a single-role UC as a full-arity one and
-        // drops it, leaving the cell unkeyed.
+        // Roles this UC spans inside *this* fact type. The parser now
+        // emits one real span per role (the former `span1_* == span0_*`
+        // single-role mirror in `enrich_constraints_with_spans` is gone),
+        // so a single-role UC carries a single span here — no dedup needed
+        // to recover its true arity. `sort_unstable` stays only for a
+        // deterministic smallest-key tie-break below; genuine composite
+        // UCs span distinct roles and are unaffected.
         let mut roles_here: Vec<usize> = c.spans.iter()
             .filter(|s| s.fact_type_id == ft_id)
             .map(|s| s.role_index)
             .collect();
         roles_here.sort_unstable();
-        roles_here.dedup();
         if roles_here.is_empty() { continue; }
         // Subset-autofill spans (cross-FT) — not yet handled in key
         // analysis; skip for now to keep the first pass conservative.
@@ -3761,13 +3760,48 @@ pub(crate) fn validate_model_data_classified(ir: &CellIndex) -> Vec<ModelViolati
                 ir.fact_types.get(&ft_id).map(|ft| (ft_id, ft))
             }).map(|(ft_id, ft)| {
                 let arity = ft.roles.len();
-                let uc_span = c.spans.len();
-                // For ternary+, UC must span at least n-1 roles
-                if arity >= 3 && uc_span < arity - 1 {
+                // Count DISTINCT spanned roles, not raw span entries. The
+                // parser's former single-role span mirror inflated
+                // `spans.len()` to 2 (same role twice); now that the mirror
+                // is gone this counts the real spanned-role set either way,
+                // so the n-1 rule no longer rides on the duplication.
+                let uc_span = {
+                    let mut rs: alloc::vec::Vec<usize> = c.spans.iter()
+                        .filter(|s| s.fact_type_id == ft_id)
+                        .map(|s| s.role_index)
+                        .collect();
+                    rs.sort_unstable();
+                    rs.dedup();
+                    rs.len()
+                };
+                // Measure the requirement against the number of DISTINCT
+                // role-PLAYERS (nouns), not the raw role count. A genuine
+                // n-ary names n distinct players, so a single-role UC
+                // under-identifies (reject). But a fact type whose roles
+                // repeat a noun is NOT a true n-ary for this rule: e.g. the
+                // parser over-splits the compound object of a binary
+                // `Task has Task Status` (Status also a declared entity)
+                // into ternary roles `(Task, Task, Status)` — two distinct
+                // players, so the functional `Each Task has at most one
+                // Task Status` UC (one role) identifies it fine and must
+                // NOT be flagged. Counting distinct players makes the rule
+                // robust to that over-split while still catching real
+                // under-spanning on `(A, B, C)`.
+                let distinct_players = {
+                    let mut ns: alloc::vec::Vec<&str> = ft.roles.iter()
+                        .map(|r| r.noun_name.as_str())
+                        .collect();
+                    ns.sort_unstable();
+                    ns.dedup();
+                    ns.len()
+                };
+                // For genuine ternary+ (>= 3 distinct players), UC must span
+                // at least n-1 roles.
+                if distinct_players >= 3 && uc_span < distinct_players - 1 {
                     violations.push(ModelViolation {
                         message: format!(
                             "UC '{}' spans {} roles on {}-ary fact type '{}' -- must span at least {} (arity decomposition rule)",
-                            c.text, uc_span, arity, ft.reading, arity - 1),
+                            c.text, uc_span, arity, ft.reading, distinct_players - 1),
                         alethic: modality_is_alethic(&c.modality),
                         fact_type_id: Some(ft_id),
                     });

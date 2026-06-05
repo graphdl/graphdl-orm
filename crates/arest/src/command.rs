@@ -7231,90 +7231,19 @@ Function 'place_verb' has callback URI '{}'.
             Task has Status.\n\
             Each Task has at most one Status.\n\
         ";
-        let parsed = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
             .expect("parse must succeed");
-        // Two pre-task-822 quirks in the parser/compile boundary keep
-        // `_CellKeyRoles` empty for this kind of UC. Both are localized
-        // by the test helper — `compile.rs` is off-limits per the
-        // task-822 constraints, but the helper edits live on the
-        // parser-output state before `compile_to_defs_state` runs.
-        //
-        //   1. `parse_forml2_stage2::enrich_constraints_with_spans` mirrors
-        //      `span0_*` into `span1_*` for UC/MC/VC/FC ("legacy quirk"
-        //      — comment at parse_forml2_stage2.rs:2310). That gives a
-        //      role-1 UC two spans on the same role; `compile.rs::
-        //      resolve_key_roles_for_ft` then counts `roles_here.len()
-        //      == ft.roles.len()` and treats it as a spanning UC
-        //      (returns None).
-        //   2. The parser emits `modality = "alethic"` (lowercase) but
-        //      `resolve_key_roles_for_ft` compares with `"Alethic"`
-        //      (capital). All UCs miss the filter.
-        //
-        // Strip the redundant `span1_*` pair and lift the modality
-        // case. Net effect: the metamodel state the test passes to
-        // `compile_to_defs_state` looks like one a future-fixed parser
-        // would produce, and `_CellKeyRoles` registers `Task_has_Status
-        // → ["Task"]`.
-        let state = rewrite_constraint_cell_for_uc_key_resolution(&parsed);
+        // The parser now emits this single-role UC with ONE real span
+        // (the `span1_* == span0_*` mirror in
+        // `enrich_constraints_with_spans` was removed at the source), and
+        // `compile::resolve_key_roles_for_ft` compares modality
+        // case-insensitively — so the raw parser output already keys
+        // `Task_has_Status → ["Task"]`. No test-local fix-up needed; this
+        // is exactly the state the (now actually-fixed) parser produces.
         let defs = crate::compile::compile_to_defs_state(&state);
         let def_map = ast::defs_to_state(&defs, &state);
         (def_map, state)
     }
-
-    /// Test-only fix-up over the parser's `Constraint` cell so that
-    /// `compile.rs::resolve_key_roles_for_ft` picks the cell's alethic
-    /// UCs as the FT's `key_roles`. Localized rewrite — see the
-    /// rationale block in `setup_task_uc_defs`.
-    fn rewrite_constraint_cell_for_uc_key_resolution(state: &ast::Object) -> ast::Object {
-        let cell = ast::fetch_or_phi("Constraint", state);
-        let Some(facts) = cell.as_seq() else { return state.clone() };
-        let rewritten: Vec<ast::Object> = facts.iter().map(|fact| {
-            let Some(pairs) = fact.as_seq() else { return fact.clone() };
-            // Drop the parser's mirror span1_* pair when it duplicates
-            // span0_* (the UC/MC quirk at parse_forml2_stage2.rs:2388).
-            let span0_ft: Option<String> = pairs.iter().find_map(|p| {
-                let kv = p.as_seq()?;
-                (kv.first()?.as_atom()? == "span0_factTypeId")
-                    .then(|| kv.get(1)?.as_atom().map(|s| s.to_string()))?
-            });
-            let span0_role: Option<String> = pairs.iter().find_map(|p| {
-                let kv = p.as_seq()?;
-                (kv.first()?.as_atom()? == "span0_roleIndex")
-                    .then(|| kv.get(1)?.as_atom().map(|s| s.to_string()))?
-            });
-            let new_pairs: Vec<ast::Object> = pairs.iter().filter_map(|p| {
-                let kv = match p.as_seq() { Some(kv) => kv, None => return Some(p.clone()) };
-                let key = kv.first().and_then(|k| k.as_atom()).unwrap_or("");
-                // Lift `alethic` / `deontic` to `Alethic` / `Deontic`.
-                if key == "modality" {
-                    let val = kv.get(1).and_then(|v| v.as_atom()).unwrap_or("");
-                    let lifted = match val {
-                        "alethic" => "Alethic",
-                        "deontic" => "Deontic",
-                        other => other,
-                    };
-                    return Some(ast::Object::seq(vec![
-                        ast::Object::atom(key),
-                        ast::Object::atom(lifted),
-                    ]));
-                }
-                // Drop span1_* when it byte-equals the span0_* pair —
-                // this is the UC/MC mirror the parser injects.
-                if key == "span1_factTypeId" {
-                    let val = kv.get(1).and_then(|v| v.as_atom()).unwrap_or("");
-                    if Some(val) == span0_ft.as_deref() { return None; }
-                }
-                if key == "span1_roleIndex" {
-                    let val = kv.get(1).and_then(|v| v.as_atom()).unwrap_or("");
-                    if Some(val) == span0_role.as_deref() { return None; }
-                }
-                Some(p.clone())
-            }).collect();
-            ast::Object::Seq(new_pairs.into())
-        }).collect();
-        ast::store("Constraint", ast::Object::Seq(rewritten.into()), state)
-    }
-
 
     /// task-822 acceptance #1: two `apply operation=create` with the
     /// same key role value and different non-key role value produce a

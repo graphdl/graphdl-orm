@@ -441,18 +441,16 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
             match c.kind.as_str() {
                 "UC" => {
                     c.spans.iter().for_each(|span| { ucs.entry(span.fact_type_id.clone()).or_default(); });
-                    // Roles this UC spans inside its OWNING fact type, with
-                    // identical-role duplicates collapsed. The parser's
-                    // `enrich_constraints_with_spans` mirrors a single-role
-                    // UC's span0 into span1 (the "legacy quirk"), so a real
-                    // parse yields `spans == [(ft,r),(ft,r)]`. Without this
-                    // dedup the arity test below (`uc.len() >= 2`) misreads
-                    // that single-role (functional) UC as a COMPOUND one and
-                    // routes the fact to its own junction table instead of
-                    // absorbing it as a column — contra Halpin §10.3 rule 2
-                    // (a functional role / simple UC absorbs into the entity
-                    // table). This mirrors `compile::resolve_key_roles_for_ft`,
-                    // which already dedups identical spans for the same reason.
+                    // Roles this UC spans inside its OWNING fact type. The
+                    // parser now emits one real span per role (the former
+                    // single-role `span0`→`span1` mirror in
+                    // `enrich_constraints_with_spans` was removed at the
+                    // source), so a single-role functional UC already
+                    // carries one role here and absorbs as a column —
+                    // Halpin §10.3 rule 2. The `dedup()` is retained purely
+                    // as cheap belt-and-suspenders: if any future path ever
+                    // re-introduces an identical-role duplicate it must not
+                    // be misread by the `uc.len() >= 2` compound test below.
                     c.spans.first()
                         .map(|s| s.fact_type_id.clone())
                         .into_iter()
@@ -857,10 +855,12 @@ pub fn rmap_cell_map(state: &crate::ast::Object) -> HashMap<String, String> {
     let noun_name_set: HashSet<String> = nouns.keys().cloned().collect();
 
     // Index UCs by fact type (same as RMAP step classification).
-    // Collapse identical-role duplicates so the parser's single-role-UC
-    // span mirror (`enrich_constraints_with_spans` pushes span0 == span1)
-    // is not misread as a compound UC by the `uc.len() >= 2` test below —
-    // the same dedup `rmap()` and `compile::resolve_key_roles_for_ft` apply.
+    // The parser no longer emits the single-role-UC span mirror
+    // (`enrich_constraints_with_spans` used to push span0 == span1), so a
+    // single-role UC already presents one role. The `dedup()` below is
+    // kept only as cheap belt-and-suspenders against any future
+    // re-introduction of an identical-role duplicate that the
+    // `uc.len() >= 2` compound test would otherwise misread.
     let ucs_by_ft: HashMap<String, Vec<Vec<usize>>> = constraints.iter()
         .filter(|c| c.kind == "UC")
         .fold(HashMap::new(), |mut acc, c| {

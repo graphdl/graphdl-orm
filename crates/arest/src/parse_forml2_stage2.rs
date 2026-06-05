@@ -2604,7 +2604,10 @@ fn synthesize_ref_scheme_constraints(
             // (position 1, the RefPart) and the MC scope is the
             // Noun role (position 0). `enrich_constraints_with_spans`
             // sees `span0_factTypeId` already present and leaves the
-            // synthetic constraint alone.
+            // synthetic constraint alone. Both are single-role, so we
+            // emit ONLY span0 — no `span1_* == span0_*` mirror (same
+            // root fix as the enrich single-FT path: one real span, true
+            // arity-1 for `decode_constraint_spans`).
             let uc_id = alloc::format!("synth_uc_{}_{}", name, part);
             let uc_text = alloc::format!(
                 "Each {} has at most one {}.", part, name);
@@ -2616,8 +2619,6 @@ fn synthesize_ref_scheme_constraints(
                 ("entity",            name),
                 ("span0_factTypeId",  ft_id.as_str()),
                 ("span0_roleIndex",   "1"),
-                ("span1_factTypeId",  ft_id.as_str()),
-                ("span1_roleIndex",   "1"),
                 ("synthetic",         "refScheme"),
             ]));
             let mc_id = alloc::format!("synth_mc_{}_{}", name, part);
@@ -2631,8 +2632,6 @@ fn synthesize_ref_scheme_constraints(
                 ("entity",            name),
                 ("span0_factTypeId",  ft_id.as_str()),
                 ("span0_roleIndex",   "0"),
-                ("span1_factTypeId",  ft_id.as_str()),
-                ("span1_roleIndex",   "0"),
                 ("synthetic",         "refScheme"),
             ]));
         }
@@ -2642,10 +2641,13 @@ fn synthesize_ref_scheme_constraints(
 }
 
 /// Post-translator enrichment: emit `span0_factTypeId`/`span0_roleIndex`
-/// (plus `span1_*` mirroring span0 for the UC/MC/VC/FC legacy quirk)
-/// on every Constraint fact so `check.rs`, `command.rs`, and
+/// (and, for genuine multi-role SS/EQ subset-equality and composite
+/// "Each X, Y …" UCs, the further `span1_*..spanN_*`) on every
+/// Constraint fact so `check.rs`, `command.rs`, and
 /// `compile.rs::collect_enum_values` can attach the constraint to the
-/// right fact type.
+/// right fact type. Single-role constraints (UC/MC/VC/FC/ring) emit
+/// exactly ONE span — the former span0→span1 mirror was pure
+/// duplication and has been removed.
 ///
 /// Resolution preference:
 ///   1. Full noun-sequence match against declared FTs — parity with
@@ -2852,10 +2854,20 @@ fn enrich_constraints_with_spans(
         let push = |np: &mut Vec<Object>, k: &str, v: &str| {
             np.push(Object::seq(vec![Object::atom(k), Object::atom(v)]));
         };
+        // Single-role constraint (UC/MC/VC/FC/ring): emit ONLY the real
+        // span. The historic `span1_* == span0_*` mirror (the "legacy
+        // quirk") was pure duplication — `decode_constraint_spans` read it
+        // back as a bogus `[(ft,r),(ft,r)]`, which the rmap / compile /
+        // command code then had to sort+dedup or strip to recover the true
+        // arity-1 shape. Emitting one span here is the root fix: the
+        // decoded `ConstraintDef.spans` now carries true arity, so the
+        // `uc.len() >= 2` compound-UC tests and the n-1 arity-decomposition
+        // check read the real role count with no workaround. Genuine
+        // multi-role constraints never reach this path — SS/EQ resolve via
+        // `resolve_constraint_span_seq` and composite "Each X, Y …" UCs via
+        // `parse_spanning_uc` above, both emitting their own DISTINCT spans.
         push(&mut new_pairs, "span0_factTypeId", &ft_id);
         push(&mut new_pairs, "span0_roleIndex", &pos);
-        push(&mut new_pairs, "span1_factTypeId", &ft_id);
-        push(&mut new_pairs, "span1_roleIndex", &pos);
         Object::Seq(new_pairs.into())
     }).collect()
 }
@@ -6236,11 +6248,11 @@ fn parse_to_state_via_stage12_impl(
     constraint_facts.extend(tt!("deontic",
         translate_deontic_constraints_with_table(&classified, &idx, &deontic_shapes)));
     // Enrich each constraint with span0_factTypeId / span0_roleIndex
-    // (and span1_*) bindings derived from the Role cell. Legacy emits
-    // these at constraint-translation time; check.rs, command.rs and
-    // the RMAP-attached-constraints code path all read them. Single-
-    // role UC/MC/VC get span0 and span1 both pointing at the same
-    // role (legacy quirk preserved for byte-level parity).
+    // (and, for genuine multi-role constraints, span1_*..spanN_*)
+    // bindings derived from the Role cell. check.rs, command.rs and the
+    // RMAP-attached-constraints code path all read them. Single-role
+    // UC/MC/VC/FC/ring constraints get exactly ONE real span — the
+    // historic span0→span1 mirror was pure duplication and is gone.
     constraint_facts = tt!("enrich_spans",
         enrich_constraints_with_spans(&constraint_facts, &role_facts, &ft_facts));
     // #940 pt2: consequent resolution must see CONTEXT fact types too, not
@@ -8599,6 +8611,143 @@ mod tests {
             "second combo noun (Toolkit) maps to role 1");
         assert_ne!(binding(c, "span0_roleIndex"), binding(c, "span1_roleIndex"),
             "composite UC spans must be distinct roles, not the head-role duplicate");
+    }
+
+    /// Decode the contiguous `span{i}_factTypeId`/`span{i}_roleIndex`
+    /// pairs of an enriched constraint into `(ft, role)` tuples — the
+    /// same contiguous-from-0 walk `compile::decode_constraint_spans`
+    /// performs. Lets these unit tests assert the TRUE span arity a
+    /// downstream `ConstraintDef.spans` would carry.
+    fn decode_spans_of(c: &Object) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        loop {
+            let ft = match binding(c, &alloc::format!("span{}_factTypeId", i)) {
+                Some(v) => v.to_string(),
+                None => break,
+            };
+            let role = binding(c, &alloc::format!("span{}_roleIndex", i))
+                .unwrap_or("0").to_string();
+            out.push((ft, role));
+            i += 1;
+        }
+        out
+    }
+
+    /// ROOT-FIX guard (single-role): a single-role UC ("Each Task has at
+    /// most one Status" over the binary `Task_has_Status`) must enrich to
+    /// EXACTLY ONE span — the real one — NOT the historic `span0 == span1`
+    /// mirror. `decode_constraint_spans` must therefore yield arity 1, so
+    /// the rmap/compile/command dedup workarounds that collapsed the
+    /// mirror become unnecessary.
+    #[test]
+    fn enrich_single_role_uc_yields_one_span() {
+        let text = "Each Task has at most one Status";
+        let uc = fact_from_pairs(&[
+            ("id", text),
+            ("kind", "UC"),
+            ("modality", "alethic"),
+            ("text", text),
+            ("entity", "Status"),
+        ]);
+        let role_facts = alloc::vec![
+            fact_from_pairs(&[("nounName", "Task"), ("factType", "Task_has_Status"), ("position", "0")]),
+            fact_from_pairs(&[("nounName", "Status"), ("factType", "Task_has_Status"), ("position", "1")]),
+        ];
+        let ft_facts = alloc::vec![
+            fact_from_pairs(&[("id", "Task_has_Status"), ("reading", "Task has Status"), ("arity", "2")]),
+        ];
+        let enriched = super::enrich_constraints_with_spans(&[uc], &role_facts, &ft_facts);
+        assert_eq!(enriched.len(), 1);
+        let c = &enriched[0];
+        // span0 resolves to the owning FT. The exact role index is the
+        // resolver's single-FT head-role pick (here role 0) and is
+        // orthogonal to the mirror removal — what this guard pins is the
+        // ARITY: one real span, no duplicate.
+        assert_eq!(binding(c, "span0_factTypeId"), Some("Task_has_Status"),
+            "span0 must bind the owning fact type");
+        let span0_role = binding(c, "span0_roleIndex").map(str::to_string);
+        assert!(span0_role.is_some(), "span0 must carry a role index");
+        // The mirror is gone: there is NO span1 pair at all.
+        assert_eq!(binding(c, "span1_factTypeId"), None,
+            "single-role UC must not emit a mirrored span1 (root-fix)");
+        assert_eq!(binding(c, "span1_roleIndex"), None,
+            "single-role UC must not emit a mirrored span1 roleIndex (root-fix)");
+        // True decoded arity is exactly 1, on the owning FT.
+        let decoded = decode_spans_of(c);
+        assert_eq!(decoded.len(), 1,
+            "decode_constraint_spans must yield a single real span");
+        assert_eq!(decoded[0].0, "Task_has_Status".to_string());
+        assert_eq!(Some(decoded[0].1.clone()), span0_role,
+            "the single decoded span must equal span0 (no second mirrored entry)");
+    }
+
+    /// ROOT-FIX guard (single-role): same invariant for a single-role MC
+    /// ("Each Task has some Status"). One real span, no mirror.
+    #[test]
+    fn enrich_single_role_mc_yields_one_span() {
+        let text = "Each Task has some Status";
+        let mc = fact_from_pairs(&[
+            ("id", text),
+            ("kind", "MC"),
+            ("modality", "alethic"),
+            ("text", text),
+            ("entity", "Task"),
+        ]);
+        let role_facts = alloc::vec![
+            fact_from_pairs(&[("nounName", "Task"), ("factType", "Task_has_Status"), ("position", "0")]),
+            fact_from_pairs(&[("nounName", "Status"), ("factType", "Task_has_Status"), ("position", "1")]),
+        ];
+        let ft_facts = alloc::vec![
+            fact_from_pairs(&[("id", "Task_has_Status"), ("reading", "Task has Status"), ("arity", "2")]),
+        ];
+        let enriched = super::enrich_constraints_with_spans(&[mc], &role_facts, &ft_facts);
+        assert_eq!(enriched.len(), 1);
+        let c = &enriched[0];
+        assert_eq!(binding(c, "span0_factTypeId"), Some("Task_has_Status"));
+        assert_eq!(binding(c, "span1_factTypeId"), None,
+            "single-role MC must not emit a mirrored span1 (root-fix)");
+        assert_eq!(decode_spans_of(c).len(), 1,
+            "decode_constraint_spans must yield a single real span for a single-role MC");
+    }
+
+    /// ROOT-FIX safety guard (multi-role, cross-FT): re-pin that an SS
+    /// subset across DISTINCT fact types still decodes to its two real,
+    /// DISTINCT spans after the single-role mirror is removed. This must
+    /// hold BEFORE and AFTER the fix — proof the change did not collapse
+    /// a genuine multi-role span. (Companion to
+    /// `enrich_set_constraint_spans_resolves_two_distinct_fts`, asserted
+    /// here through the decode walk for symmetry with the single-role
+    /// guards.)
+    #[test]
+    fn enrich_multi_role_ss_keeps_distinct_spans_after_root_fix() {
+        let text = "If some Task has some Note then that Task has some Mark";
+        let ss = fact_from_pairs(&[
+            ("id", text),
+            ("kind", "SS"),
+            ("modality", "alethic"),
+            ("text", text),
+            ("entity", "Task"),
+        ]);
+        let role_facts = alloc::vec![
+            fact_from_pairs(&[("nounName", "Task"), ("factType", "Task_has_Note"), ("position", "0")]),
+            fact_from_pairs(&[("nounName", "Note"), ("factType", "Task_has_Note"), ("position", "1")]),
+            fact_from_pairs(&[("nounName", "Task"), ("factType", "Task_has_Mark"), ("position", "0")]),
+            fact_from_pairs(&[("nounName", "Mark"), ("factType", "Task_has_Mark"), ("position", "1")]),
+        ];
+        let ft_facts = alloc::vec![
+            fact_from_pairs(&[("id", "Task_has_Note"), ("reading", "Task has Note"), ("arity", "2")]),
+            fact_from_pairs(&[("id", "Task_has_Mark"), ("reading", "Task has Mark"), ("arity", "2")]),
+        ];
+        let enriched = super::enrich_constraints_with_spans(&[ss], &role_facts, &ft_facts);
+        let spans = decode_spans_of(&enriched[0]);
+        assert_eq!(spans, alloc::vec![
+            ("Task_has_Note".to_string(), "0".to_string()),
+            ("Task_has_Mark".to_string(), "0".to_string()),
+        ], "cross-FT subset must keep its two distinct real spans (no collapse, no mirror)");
+        // The two spans are on DIFFERENT fact types — not a same-FT mirror.
+        assert_ne!(spans[0].0, spans[1].0,
+            "SS spans must remain on DISTINCT fact types");
     }
 
     #[test]
