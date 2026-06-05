@@ -48,6 +48,8 @@
 // The fd / state errnos come from the shared helpers + `net::tcp_listen`.
 
 use crate::net;
+use crate::net_socket::EOPNOTSUPP;
+use crate::syscall::dispatch::{EBADF, ENOSYS};
 use crate::syscall::socket::{resolve_socket_fd, socket_error_to_errno, SocketOp};
 
 /// Linux x86_64 syscall number for `listen(sockfd, backlog)`. Source:
@@ -64,7 +66,12 @@ pub const SYS_LISTEN: u64 = 50;
 /// Steps, in order:
 ///   1. Resolve `sockfd` to its kernel `SocketId`. Unknown fd → `-EBADF`;
 ///      non-socket fd → `-ENOTSOCK`; no process → `-ENOSYS`.
-///   2. Transition the socket to LISTEN via `net::tcp_listen` (which
+///   2. Require a TCP socket — `listen` is meaningless on a UDP
+///      (connectionless) socket, so a `SOCK_DGRAM` fd → `-EOPNOTSUPP`
+///      (#533). This guard ALSO prevents a wrong-type smoltcp downcast
+///      (`tcp_listen` would `get_mut::<tcp::Socket>` a UDP handle and
+///      panic).
+///   3. Transition the socket to LISTEN via `net::tcp_listen` (which
 ///      reads the port a prior `bind` recorded); map any `SocketError`
 ///      to its errno. No bound port → `-EINVAL`.
 ///
@@ -78,7 +85,18 @@ pub fn handle(sockfd: i32, _backlog: i32) -> i64 {
         Err(errno) => return errno,
     };
 
-    // (2) Transition to LISTEN; map any failure to its errno.
+    // (2) `listen` is a TCP-only operation. Reject UDP with -EOPNOTSUPP
+    //     (also guards against a wrong-type smoltcp downcast in
+    //     `tcp_listen`). An id with no kind is a dangling socket fd.
+    match net::socket_kind(socket_id) {
+        Some(net::SocketKind::Tcp) => {}
+        Some(net::SocketKind::Udp) => return -EOPNOTSUPP,
+        None => {
+            return if net::is_online() { -EBADF } else { -ENOSYS };
+        }
+    }
+
+    // (3) Transition to LISTEN; map any failure to its errno.
     match net::tcp_listen(socket_id) {
         Ok(()) => 0,
         Err(e) => socket_error_to_errno(e, SocketOp::Listen),

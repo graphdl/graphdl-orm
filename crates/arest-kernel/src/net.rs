@@ -266,6 +266,34 @@ struct NetState {
     /// is fine for tier-1 — there's no port-reuse pressure with the
     /// handful of sockets a single guest opens.
     next_ephemeral_port: u16,
+    /// Transport kind (TCP vs UDP) of each registered socket id (#533).
+    /// `socket()` records the kind at creation (`create_tcp_socket` →
+    /// `Tcp`, `create_udp_socket` → `Udp`); the bind / sendto / recvfrom
+    /// handlers query it via `socket_kind` to route to the right smoltcp
+    /// path (a UDP socket binds its local port directly, takes a per-
+    /// packet destination on send, and reports the source on recv — the
+    /// opposite shape from TCP). Parallel to `socket_registry` rather
+    /// than folded into its value so the existing TCP call sites
+    /// (`socket_handle`, `resolve_tcp_handle`) keep their `SocketHandle`
+    /// return shape unchanged. Removed alongside the registry entry by
+    /// `destroy_socket`.
+    socket_kinds: BTreeMap<u64, SocketKind>,
+}
+
+/// Transport kind of a registered socket (#533). Stored per socket id in
+/// `NetState::socket_kinds` so the syscall handlers know whether an fd's
+/// `SocketId` resolves to a smoltcp `tcp::Socket` or `udp::Socket` and
+/// can route bind / sendto / recvfrom accordingly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocketKind {
+    /// A connection-mode TCP socket (`SOCK_STREAM`). Created by
+    /// `create_tcp_socket`; driven by `tcp_bind` / `tcp_listen` /
+    /// `tcp_connect` / `tcp_send` / `tcp_recv`.
+    Tcp,
+    /// A connectionless UDP socket (`SOCK_DGRAM`, #533). Created by
+    /// `create_udp_socket`; driven by `udp_bind_socket` / `udp_sendto` /
+    /// `udp_recvfrom`.
+    Udp,
 }
 
 /// First port of the IANA-registered ephemeral / dynamic range
@@ -427,6 +455,9 @@ pub fn init(virtio: Option<VirtioPhy>) {
         // Ephemeral local-port allocator (#531) starts at the base of the
         // IANA dynamic range.
         next_ephemeral_port: EPHEMERAL_PORT_BASE,
+        // Per-socket transport kind (#533) starts empty — populated by
+        // `create_tcp_socket` / `create_udp_socket`.
+        socket_kinds: BTreeMap::new(),
     });
 }
 
@@ -1093,6 +1124,54 @@ pub fn create_tcp_socket() -> Result<SocketId, SocketError> {
     // handle) is what the fd table stores.
     let id = state.socket_ids.allocate();
     state.socket_registry.insert(id.as_u64(), handle);
+    // Record the transport kind so the bind/send/recv handlers route to
+    // the TCP path for this id (#533).
+    state.socket_kinds.insert(id.as_u64(), SocketKind::Tcp);
+    Ok(id)
+}
+
+/// Create an UNBOUND UDP socket on the kernel's network interface and
+/// return the kernel [`SocketId`] bound to it (#533). The datagram
+/// sibling of [`create_tcp_socket`]: `socket(AF_INET, SOCK_DGRAM)`
+/// creates the socket but binds no local port and sends no packet — the
+/// `bind` syscall later assigns the port (`udp_bind_socket`), and
+/// `sendto` / `recvfrom` move datagrams.
+///
+/// Buffer sizing mirrors [`udp_bind`]: 16 packets × 1500 bytes per ring
+/// per direction (the Ethernet-MTU rationale on the UDP-helpers section
+/// above). The rings are `Vec`-backed so the socket is `'static`-lifetime
+/// and lives in the static `SocketSet`, the same ownership story every
+/// socket-creation path here uses.
+///
+/// Returns `Err(SocketError::NotInitialised)` when `net::init` hasn't
+/// run. (Like `create_tcp_socket`, the smoltcp `udp::Socket::new` +
+/// `SocketSet::add` calls themselves don't fail.)
+pub fn create_udp_socket() -> Result<SocketId, SocketError> {
+    const PACKET_COUNT: usize = 16;
+    const PACKET_BYTES: usize = 1500;
+
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(SocketError::NotInitialised)?;
+
+    // Heterogeneous metadata + payload rings, same construction as
+    // `udp_bind`. Owned (`Vec`-backed) so the socket is `'static`.
+    let rx_meta = vec![udp::PacketMetadata::EMPTY; PACKET_COUNT];
+    let rx_payload = vec![0u8; PACKET_COUNT * PACKET_BYTES];
+    let tx_meta = vec![udp::PacketMetadata::EMPTY; PACKET_COUNT];
+    let tx_payload = vec![0u8; PACKET_COUNT * PACKET_BYTES];
+    let rx_buffer = udp::PacketBuffer::new(rx_meta, rx_payload);
+    let tx_buffer = udp::PacketBuffer::new(tx_meta, tx_payload);
+    // Created UNBOUND — no `bind()` here. The `bind` syscall assigns the
+    // local port via `udp_bind_socket`; `socket()` is creation only.
+    let socket = udp::Socket::new(rx_buffer, tx_buffer);
+
+    let handle = state.sockets.add(socket);
+
+    let id = state.socket_ids.allocate();
+    state.socket_registry.insert(id.as_u64(), handle);
+    // Record the transport kind so the bind/send/recv handlers route to
+    // the UDP path for this id (#533).
+    state.socket_kinds.insert(id.as_u64(), SocketKind::Udp);
     Ok(id)
 }
 
@@ -1141,6 +1220,19 @@ pub fn destroy_socket(id: SocketId) {
     // re-used) id can't inherit a stale binding. No-op when the socket
     // was never bound.
     state.socket_bindings.remove(&id.as_u64());
+    // Drop the transport-kind record too (#533).
+    state.socket_kinds.remove(&id.as_u64());
+}
+
+/// The transport kind (TCP / UDP) of the socket bound to `id` (#533), or
+/// `None` when the id isn't registered (never created / already closed)
+/// or `net::init` hasn't run. The bind / sendto / recvfrom syscall
+/// handlers call this to route an fd's `SocketId` to the right smoltcp
+/// path — a TCP id goes through `tcp_*`, a UDP id through `udp_*`.
+pub fn socket_kind(id: SocketId) -> Option<SocketKind> {
+    NET.lock()
+        .as_ref()
+        .and_then(|s| s.socket_kinds.get(&id.as_u64()).copied())
 }
 
 // ── TCP socket operations (#529-#533 — userspace socket syscalls) ───
@@ -1425,6 +1517,149 @@ pub fn tcp_recv(id: SocketId, data: &mut [u8]) -> Result<usize, SocketError> {
         Err(tcp::RecvError::Finished) => Ok(0),
         // Receive half not open — never connected.
         Err(tcp::RecvError::InvalidState) => Err(SocketError::NotConnected),
+    }
+}
+
+// ── UDP socket operations (#533 — SOCK_DGRAM sendto/recvfrom) ───────
+//
+// The datagram siblings of the `tcp_*` wrappers. A UDP socket created by
+// `create_udp_socket` is unbound; `udp_bind_socket` assigns its local
+// port (a real smoltcp `udp::Socket::bind`, unlike TCP's bookkeeping-
+// only bind), and `udp_sendto` / `udp_recvfrom` move datagrams with a
+// per-packet peer endpoint. Same lock-resolve-call-map shape as the TCP
+// wrappers; the registry resolution is shared (`resolve_tcp_handle` —
+// the name says "tcp" but it just maps a `SocketId` to its
+// `SocketHandle`, which is kind-agnostic, so it serves UDP too; the
+// `state.sockets.get_mut::<udp::Socket>(handle)` downcast is what binds
+// the handle to the UDP socket type).
+
+/// `bind(2)` for a UDP socket (#533). Binds the smoltcp `udp::Socket` to
+/// the local `port` (a real datagram bind — UDP has a concrete bind
+/// step, unlike TCP's `tcp_bind` bookkeeping). The `addr` is accepted for
+/// signature symmetry with `tcp_bind` but ignored: smoltcp's `udp::bind`
+/// takes only a port (binds on every local address), matching tier-1's
+/// "listen on all addresses" stance.
+///
+/// Returns:
+///   * `Ok(())` — the socket is bound to `port`.
+///   * `Err(NotInitialised)` / `Err(UnknownSocket)` — as the TCP
+///     wrappers.
+///   * `Err(Unaddressable)` — `port` is 0 (smoltcp rejects a zero port).
+///     Handler maps to `-EINVAL`.
+///   * `Err(InvalidState)` — the socket was already bound/open. smoltcp's
+///     `udp::BindError::InvalidState`. Handler maps to `-EINVAL` for
+///     bind.
+pub fn udp_bind_socket(id: SocketId, _addr: u32, port: u16) -> Result<(), SocketError> {
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(SocketError::NotInitialised)?;
+    let handle = resolve_tcp_handle(state, id)?;
+
+    let socket = state.sockets.get_mut::<udp::Socket>(handle);
+    socket.bind(port).map_err(|e| match e {
+        udp::BindError::Unaddressable => SocketError::Unaddressable,
+        udp::BindError::InvalidState => SocketError::InvalidState,
+    })
+}
+
+/// `sendto(2)` for a UDP socket (#533). Enqueues one datagram of `data`
+/// to the peer `(dst_addr, dst_port)` (both host-order). Non-blocking:
+/// the packet lands in the tx ring and the next `net::poll()` frames it.
+///
+/// Returns:
+///   * `Ok(n)` — `n` bytes enqueued (the whole datagram; UDP doesn't
+///     short-write — `send_slice` either takes the packet or refuses).
+///   * `Err(WouldBlock)` — the tx ring is full (`udp::SendError::
+///     BufferFull`). Handler → `-EAGAIN`; retry after a `poll()`.
+///   * `Err(Unaddressable)` — the socket isn't bound to a local port, or
+///     the destination address/port is unspecified (`udp::SendError::
+///     Unaddressable`). Handler → `-EINVAL`.
+///   * `Err(NotInitialised)` / `Err(UnknownSocket)` — as the others.
+///
+/// A UDP socket must be bound (have a local port) before it can send;
+/// smoltcp enforces that and surfaces it as `Unaddressable`. The caller
+/// guarantees a non-empty `data` (zero-length is a syscall-layer no-op),
+/// though a zero-length UDP datagram is itself legal — tier-1 just
+/// short-circuits it before reaching here.
+pub fn udp_sendto(
+    id: SocketId,
+    dst_addr: u32,
+    dst_port: u16,
+    data: &[u8],
+) -> Result<usize, SocketError> {
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(SocketError::NotInitialised)?;
+    let handle = resolve_tcp_handle(state, id)?;
+
+    let [a, b, c, d] = dst_addr.to_be_bytes();
+    let peer = IpEndpoint::new(IpAddress::v4(a, b, c, d), dst_port);
+
+    let socket = state.sockets.get_mut::<udp::Socket>(handle);
+    match socket.send_slice(data, peer) {
+        Ok(()) => Ok(data.len()),
+        Err(udp::SendError::BufferFull) => Err(SocketError::WouldBlock),
+        Err(udp::SendError::Unaddressable) => Err(SocketError::Unaddressable),
+    }
+}
+
+/// `recvfrom(2)` for a UDP socket (#533). Dequeues the next pending
+/// datagram into `data` and returns the byte count plus the source
+/// endpoint (decoded to a host-order [`SockAddrIn`] so the handler can
+/// fill the caller's `src_addr` without importing smoltcp).
+///
+/// Returns:
+///   * `Ok((n, src))` — `n` bytes received from `src`.
+///   * `Err(WouldBlock)` — the rx ring is empty (`udp::RecvError::
+///     Exhausted`). Handler → `-EAGAIN`; retry after a `poll()`. UDP has
+///     no EOF (it's connectionless), so unlike TCP there's no 0-byte
+///     "orderly shutdown" return — an empty ring is always "try again".
+///   * `Err(WouldBlock)` is also returned for a truncated datagram
+///     (`udp::RecvError::Truncated` — `data` was smaller than the
+///     pending packet; smoltcp drops it). The caller should size `data`
+///     to the 1500-byte MTU. (Linux would return the truncated bytes +
+///     set `MSG_TRUNC`; tier-1's simpler "drop + try again" is documented
+///     here and is safe — no partial-packet corruption.)
+///   * `Err(NotInitialised)` / `Err(UnknownSocket)` — as the others.
+///
+/// The caller guarantees a non-empty `data`.
+pub fn udp_recvfrom(
+    id: SocketId,
+    data: &mut [u8],
+) -> Result<(usize, crate::net_socket::SockAddrIn), SocketError> {
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(SocketError::NotInitialised)?;
+    let handle = resolve_tcp_handle(state, id)?;
+
+    let socket = state.sockets.get_mut::<udp::Socket>(handle);
+    match socket.recv_slice(data) {
+        Ok((n, meta)) => {
+            // Decode smoltcp's source IpEndpoint back to a host-order
+            // SockAddrIn. tier-1 is IPv4-only; a non-IPv4 source (which
+            // can't arise on the IPv4 interface) decodes its address as 0.
+            let src = ip_endpoint_to_sockaddr(meta.endpoint);
+            Ok((n, src))
+        }
+        Err(udp::RecvError::Exhausted) => Err(SocketError::WouldBlock),
+        // Truncated: the datagram was larger than `data`; smoltcp dropped
+        // it. Surface as "try again" (the packet is gone). See docstring.
+        Err(udp::RecvError::Truncated) => Err(SocketError::WouldBlock),
+    }
+}
+
+/// Decode a smoltcp [`IpEndpoint`] into a host-order
+/// [`crate::net_socket::SockAddrIn`] (#533). IPv4 addresses map to their
+/// `a.b.c.d` host-order word; a non-IPv4 endpoint (unreachable on the
+/// tier-1 IPv4 interface) yields address 0. Used by `udp_recvfrom` to
+/// report the datagram source without leaking smoltcp types to the
+/// syscall handler.
+fn ip_endpoint_to_sockaddr(ep: IpEndpoint) -> crate::net_socket::SockAddrIn {
+    let addr = match ep.addr {
+        IpAddress::Ipv4(v4) => u32::from_be_bytes(v4.octets()),
+        #[allow(unreachable_patterns)]
+        _ => 0,
+    };
+    crate::net_socket::SockAddrIn {
+        addr,
+        port: ep.port,
     }
 }
 

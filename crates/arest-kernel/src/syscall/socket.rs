@@ -56,7 +56,7 @@
 use crate::net;
 use crate::net_socket::{
     validate_socket_args, SocketId, EADDRINUSE, EAGAIN, ECONNREFUSED, EFAULT, EINPROGRESS, EINVAL,
-    EISCONN, ENOTCONN, ENOTSOCK,
+    EISCONN, ENOTCONN, ENOTSOCK, SOCK_DGRAM, SOCK_TYPE_MASK,
 };
 use crate::process::current_process_fd_table;
 use crate::process::fd_table::socket as fd_socket;
@@ -103,16 +103,23 @@ pub fn handle(domain: u64, type_: u64, protocol: u64) -> i64 {
         return errno;
     }
 
-    // (2) Create the smoltcp TCP socket (creation only — no I/O). The
-    //     returned id is the token the fd table will store.
-    let socket_id = match net::create_tcp_socket() {
+    // (2) Create the smoltcp socket (creation only — no I/O). The masked
+    //     type picks TCP vs UDP (validation above already guaranteed it's
+    //     one of SOCK_STREAM / SOCK_DGRAM with a compatible protocol).
+    //     The returned id is the token the fd table will store.
+    let create = if type_ & SOCK_TYPE_MASK == SOCK_DGRAM {
+        net::create_udp_socket() // SOCK_DGRAM → UDP (#533)
+    } else {
+        net::create_tcp_socket() // SOCK_STREAM → TCP (#478a)
+    };
+    let socket_id = match create {
         Ok(id) => id,
         // Net stack not initialised (no `net::init`) — surface the same
         // "this kernel can't right now" errno `openat` uses for the
         // pre-process state. In production `net::init` runs at boot, so
         // this only fires on the host test target / a mis-ordered boot.
         Err(net::SocketError::NotInitialised) => return -ENOSYS,
-        // `create_tcp_socket` mints its own id and does no I/O, so it can
+        // The create paths mint their own id and do no I/O, so they can
         // only fail with `NotInitialised` — the other `SocketError`
         // variants are produced exclusively by the bind/listen/connect/
         // send/recv wrappers (#529-#533), never here. The catch-all keeps
@@ -344,20 +351,22 @@ mod tests {
         assert_eq!(result, -97);
     }
 
-    /// `socket(AF_INET, SOCK_DGRAM, 0)` → `-EPROTONOSUPPORT` (93). UDP
-    /// isn't served by this TCP-creation path.
-    #[test]
-    fn socket_dgram_returns_eprotonosupport() {
-        let result = handle(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-        assert_eq!(result, -93);
-    }
-
     /// `socket(AF_INET, SOCK_STREAM, IPPROTO_UDP)` → `-EPROTONOSUPPORT`
     /// (93). A stream socket with a non-TCP protocol is rejected.
     #[test]
     fn socket_stream_wrong_protocol_returns_eprotonosupport() {
         const IPPROTO_UDP: u64 = 17;
         let result = handle(AF_INET, SOCK_STREAM, IPPROTO_UDP);
+        assert_eq!(result, -93);
+    }
+
+    /// `socket(AF_INET, SOCK_DGRAM, IPPROTO_TCP)` → `-EPROTONOSUPPORT`
+    /// (93). A datagram socket with a non-UDP protocol is rejected (#533).
+    /// The validation fires before any creation, so no process / stack is
+    /// needed.
+    #[test]
+    fn socket_dgram_wrong_protocol_returns_eprotonosupport() {
+        let result = handle(AF_INET, SOCK_DGRAM, IPPROTO_TCP);
         assert_eq!(result, -93);
     }
 
@@ -443,6 +452,38 @@ mod tests {
             "fd must bind to FdEntry::Socket, got {:?}",
             entry
         );
+        current_process_uninstall();
+    }
+
+    /// `socket(AF_INET, SOCK_DGRAM, 0)` over the loopback stack creates a
+    /// UDP socket and binds a real fd (#533). The fd resolves to
+    /// `FdEntry::Socket`, the socket id is live in the registry, and its
+    /// transport kind is `Udp` — proving the SOCK_DGRAM accept path routes
+    /// to `create_udp_socket`, not the TCP path.
+    #[test]
+    fn socket_dgram_creates_udp_socket_and_binds_fd() {
+        let _net_guard = SOCKET_NET_TEST_LOCK.lock();
+        let _proc_guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        net::init(None);
+        install_test_process();
+
+        let fd = handle(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+        assert!(fd >= 3, "SOCK_DGRAM socket() must return a valid fd, got {}", fd);
+        let entry = current_process_fd_table(|t| t.and_then(|t| t.lookup(fd as i32).cloned()));
+        match entry {
+            Some(FdEntry::Socket { socket_id }) => {
+                assert!(
+                    net::socket_handle(SocketId(socket_id)).is_some(),
+                    "the UDP fd's socket id must be live in net's registry"
+                );
+                assert_eq!(
+                    net::socket_kind(SocketId(socket_id)),
+                    Some(net::SocketKind::Udp),
+                    "a SOCK_DGRAM socket must be registered as UDP"
+                );
+            }
+            other => panic!("fd {} must bind to FdEntry::Socket, got {:?}", fd, other),
+        }
         current_process_uninstall();
     }
 

@@ -54,7 +54,8 @@
 //   * `-ENOSYS` (38) — no process is installed, or the net stack isn't up.
 
 use crate::net;
-use crate::net_socket::{parse_sockaddr_in, validate_connect_target};
+use crate::net_socket::{parse_sockaddr_in, validate_connect_target, EOPNOTSUPP};
+use crate::syscall::dispatch::{EBADF, ENOSYS};
 use crate::syscall::socket::{read_sockaddr, resolve_socket_fd, socket_error_to_errno, SocketOp};
 
 /// Linux x86_64 syscall number for `connect(sockfd, addr, addrlen)`.
@@ -106,6 +107,20 @@ pub fn handle(sockfd: i32, addr: u64, addrlen: u64) -> i64 {
         Ok(id) => id,
         Err(errno) => return errno,
     };
+
+    // (3b) `connect` here is the TCP active open. Linux lets a UDP socket
+    //      `connect` to set a default peer, but tier-1's UDP path doesn't
+    //      model connected datagram sockets — reject with -EOPNOTSUPP
+    //      (#533). This guard ALSO prevents a wrong-type smoltcp downcast
+    //      (`tcp_connect` would `get_mut::<tcp::Socket>` a UDP handle and
+    //      panic).
+    match net::socket_kind(socket_id) {
+        Some(net::SocketKind::Tcp) => {}
+        Some(net::SocketKind::Udp) => return -EOPNOTSUPP,
+        None => {
+            return if net::is_online() { -EBADF } else { -ENOSYS };
+        }
+    }
 
     // (4) Start the handshake; map any outcome to its errno. A
     //     successfully-started non-blocking connect surfaces as

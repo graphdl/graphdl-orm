@@ -56,6 +56,8 @@
 
 use crate::net;
 use crate::net_socket::parse_sockaddr_in;
+use crate::syscall::dispatch::ENOSYS;
+use crate::syscall::dispatch::EBADF;
 use crate::syscall::socket::{read_sockaddr, resolve_socket_fd, socket_error_to_errno, SocketOp};
 
 /// Linux x86_64 syscall number for `bind(sockfd, addr, addrlen)`.
@@ -103,8 +105,25 @@ pub fn handle(sockfd: i32, addr: u64, addrlen: u64) -> i64 {
         Err(errno) => return errno,
     };
 
-    // (4) Record the local endpoint; map any failure to its errno.
-    match net::tcp_bind(socket_id, sockaddr.addr, sockaddr.port) {
+    // (4) Bind, routing on the socket's transport kind (#533): a UDP
+    //     socket binds its local port for real in smoltcp; a TCP socket
+    //     records the endpoint for a following `listen`. An id with no
+    //     recorded kind is a dangling socket fd → -EBADF.
+    let result = match net::socket_kind(socket_id) {
+        Some(net::SocketKind::Udp) => {
+            net::udp_bind_socket(socket_id, sockaddr.addr, sockaddr.port)
+        }
+        Some(net::SocketKind::Tcp) => net::tcp_bind(socket_id, sockaddr.addr, sockaddr.port),
+        // Net stack down → -ENOSYS; otherwise the id isn't a live socket
+        // → -EBADF (the same UnknownSocket mapping the wrappers give).
+        None => {
+            if net::is_online() {
+                return -EBADF;
+            }
+            return -ENOSYS;
+        }
+    };
+    match result {
         Ok(()) => 0,
         Err(e) => socket_error_to_errno(e, SocketOp::Bind),
     }

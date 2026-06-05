@@ -60,9 +60,13 @@
 use core::slice;
 
 use crate::net;
-use crate::net_socket::validate_stream_sendto_dest;
-use crate::syscall::dispatch::EFAULT;
-use crate::syscall::socket::{resolve_socket_fd, socket_error_to_errno, SocketOp};
+use crate::net_socket::{
+    parse_sockaddr_in, validate_dgram_sendto_dest, validate_stream_sendto_dest,
+};
+use crate::syscall::dispatch::{EBADF, ENOSYS, EFAULT};
+use crate::syscall::socket::{
+    read_sockaddr, resolve_socket_fd, socket_error_to_errno, SocketOp,
+};
 
 /// Linux x86_64 syscall number for `sendto(sockfd, buf, len, flags,
 /// dest_addr, addrlen)`. Source:
@@ -80,15 +84,25 @@ pub const SYS_SENDTO: u64 = 44;
 ///
 /// Steps, in order:
 ///   1. `len == 0` → return 0 (POSIX no-op), without touching `buf`.
-///   2. Validate the destination: a non-null `dest_addr` on a stream
-///      socket is `-EISCONN` (connection-mode sockets don't name a
-///      per-call peer). The null-addr form is the plain `send`.
-///   3. `buf == 0` (with `len > 0`) → `-EFAULT`; oversized `len` →
+///   2. `buf == 0` (with `len > 0`) → `-EFAULT`; oversized `len` →
 ///      `-EFAULT`.
-///   4. Resolve `sockfd` to its `SocketId`. Unknown → `-EBADF`;
+///   3. Resolve `sockfd` to its `SocketId`. Unknown → `-EBADF`;
 ///      non-socket → `-ENOTSOCK`; no process → `-ENOSYS`.
-///   5. Enqueue the bytes via `net::tcp_send`; map the result
-///      (`NotConnected` → `-ENOTCONN`, `WouldBlock` → `-EAGAIN`).
+///   4. Route on the socket's transport kind (#533):
+///        * TCP — a non-null `dest_addr` is `-EISCONN` (connection-mode
+///          sockets don't name a per-call peer; the null-addr form is
+///          plain `send`); then enqueue via `net::tcp_send`.
+///        * UDP — a null `dest_addr` is `-EDESTADDRREQ` (a datagram needs
+///          a destination); parse the `sockaddr_in` and enqueue via
+///          `net::udp_sendto`.
+///      Either path maps `NotConnected` → `-ENOTCONN`, `WouldBlock` →
+///      `-EAGAIN`.
+///
+/// NOTE the dest-address check moved AFTER fd resolution (vs the #532
+/// TCP-only handler): the rule is opposite for TCP vs UDP, so the socket
+/// kind must be known first. A `sendto` with a bad dest on a non-existent
+/// fd therefore now surfaces the fd error (`-EBADF`/`-ENOSYS`) rather
+/// than the dest error — matching Linux, which validates the fd first.
 ///
 /// SAFETY: `buf` is treated as a kernel pointer under tier-1's identity
 /// mapping (same model as `write`). The null + oversized-`len` guards
@@ -100,20 +114,14 @@ pub fn handle(
     len: u64,
     _flags: u32,
     dest_addr: u64,
-    _addrlen: u64,
+    addrlen: u64,
 ) -> i64 {
     // (1) Zero-length send is a POSIX no-op — return 0 without deref.
     if len == 0 {
         return 0;
     }
 
-    // (2) Connection-mode rule: a TCP sendto must not name a destination
-    //     (pure, host-tested). The null-addr form is the plain send.
-    if let Err(errno) = validate_stream_sendto_dest(dest_addr) {
-        return errno;
-    }
-
-    // (3) Validate the buffer. Null with len > 0 → EFAULT; an oversized
+    // (2) Validate the buffer. Null with len > 0 → EFAULT; an oversized
     //     len would overflow the slice constructor → EFAULT (same guard
     //     `write::do_write` uses).
     if buf == 0 {
@@ -123,7 +131,7 @@ pub fn handle(
         return -EFAULT;
     }
 
-    // (4) Resolve the fd to a socket id.
+    // (3) Resolve the fd to a socket id.
     let socket_id = match resolve_socket_fd(sockfd) {
         Ok(id) => id,
         Err(errno) => return errno,
@@ -135,10 +143,49 @@ pub fn handle(
     // memory.
     let data: &[u8] = unsafe { slice::from_raw_parts(buf as *const u8, len as usize) };
 
-    // (5) Enqueue; map any failure to its errno.
-    match net::tcp_send(socket_id, data) {
-        Ok(n) => n as i64,
-        Err(e) => socket_error_to_errno(e, SocketOp::Send),
+    // (4) Route on the socket's transport kind (#533). The destination-
+    //     address rule is OPPOSITE for the two: a TCP (connection-mode)
+    //     sendto must NOT name a destination (the null-addr `send` form,
+    //     else -EISCONN); a UDP (connectionless) sendto MUST name one
+    //     (else -EDESTADDRREQ), which is then parsed and used per packet.
+    match net::socket_kind(socket_id) {
+        Some(net::SocketKind::Tcp) => {
+            // Connection-mode rule (pure, host-tested), then enqueue.
+            if let Err(errno) = validate_stream_sendto_dest(dest_addr) {
+                return errno;
+            }
+            match net::tcp_send(socket_id, data) {
+                Ok(n) => n as i64,
+                Err(e) => socket_error_to_errno(e, SocketOp::Send),
+            }
+        }
+        Some(net::SocketKind::Udp) => {
+            // Connectionless rule: a destination is required.
+            if let Err(errno) = validate_dgram_sendto_dest(dest_addr) {
+                return errno;
+            }
+            // Parse the per-packet destination sockaddr_in.
+            let dest_bytes = match read_sockaddr(dest_addr, addrlen) {
+                Ok(b) => b,
+                Err(errno) => return errno,
+            };
+            let dest = match parse_sockaddr_in(&dest_bytes) {
+                Ok(sa) => sa,
+                Err(errno) => return errno,
+            };
+            match net::udp_sendto(socket_id, dest.addr, dest.port, data) {
+                Ok(n) => n as i64,
+                Err(e) => socket_error_to_errno(e, SocketOp::Send),
+            }
+        }
+        // No kind → dangling socket fd (net up) or stack down.
+        None => {
+            if net::is_online() {
+                -EBADF
+            } else {
+                -ENOSYS
+            }
+        }
     }
 }
 
@@ -174,20 +221,8 @@ mod tests {
         assert_eq!(handle(3, 0, 0, 0, 0, 0), 0);
     }
 
-    /// `sendto(fd, buf, n, 0, dest, 16)` — a non-null destination on a
-    /// stream socket is `-EISCONN`, before the fd is resolved (the dest
-    /// rule is pure). Uses an arbitrary non-null dest pointer.
-    #[test]
-    fn sendto_with_dest_addr_returns_eisconn() {
-        let payload = b"hi";
-        let dest = 0x5000_u64; // non-null stand-in for a dest_addr
-        let result = handle(3, payload.as_ptr() as u64, payload.len() as u64, 0, dest, 16);
-        assert_eq!(result, -106);
-    }
-
-    /// `send(fd, NULL, n>0, 0)` (null-dest form) with a null buf →
-    /// `-EFAULT`. The dest check passes (null dest = plain send), then the
-    /// buffer check fires.
+    /// `send(fd, NULL, n>0, 0)` with a null buf → `-EFAULT`. The buffer
+    /// check fires before fd resolution, so no process is needed.
     #[test]
     fn sendto_null_buf_returns_efault() {
         assert_eq!(handle(3, 0, 16, 0, 0, 0), -14);
@@ -273,5 +308,127 @@ mod tests {
         let result = handle(fd, payload.as_ptr() as u64, payload.len() as u64, 0, 0, 0);
         assert_eq!(result, -9);
         current_process_uninstall();
+    }
+
+    /// `sendto` on a TCP socket WITH a non-null destination → `-EISCONN`.
+    /// The connection-mode rule fires AFTER the kind is resolved (a TCP
+    /// socket can't name a per-call peer). Uses an arbitrary non-null
+    /// dest pointer; the rule trips before the dest is dereferenced.
+    #[test]
+    fn sendto_tcp_with_dest_addr_returns_eisconn() {
+        let _net_guard = SENDTO_NET_TEST_LOCK.lock();
+        let _proc_guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        net::init(None);
+        install_test_process();
+        let id = net::create_tcp_socket().expect("create tcp socket");
+        let fd = current_process_fd_table(|t| {
+            t.expect("proc").allocate(fd_socket(id.as_u64())).expect("alloc fd")
+        });
+        let payload = b"hi";
+        let dest = 0x5000_u64; // non-null stand-in for a dest_addr
+        let result = handle(fd, payload.as_ptr() as u64, payload.len() as u64, 0, dest, 16);
+        assert_eq!(result, -106, "TCP sendto with a destination must be -EISCONN");
+        current_process_uninstall();
+        net::destroy_socket(id);
+    }
+
+    // -- UDP (SOCK_DGRAM) sendto paths (#533) --------------------------
+
+    /// Build a 16-byte `sockaddr_in` for `addr:port` (UDP destination).
+    fn sockaddr_in(octets: [u8; 4], port: u16) -> [u8; crate::net_socket::SOCKADDR_IN_LEN] {
+        use crate::net_socket::{AF_INET, SOCKADDR_IN_LEN};
+        let mut buf = [0u8; SOCKADDR_IN_LEN];
+        buf[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+        buf[2..4].copy_from_slice(&port.to_be_bytes());
+        buf[4..8].copy_from_slice(&octets);
+        buf
+    }
+
+    /// Allocate an installed-process UDP socket fd over loopback. Returns
+    /// (socket id, fd). Caller holds both test locks + has called
+    /// `net::init(None)` + installed a process.
+    fn udp_socket_fd() -> (crate::net_socket::SocketId, i32) {
+        let id = net::create_udp_socket().expect("create udp socket");
+        let fd = current_process_fd_table(|t| {
+            t.expect("proc").allocate(fd_socket(id.as_u64())).expect("alloc fd")
+        });
+        (id, fd)
+    }
+
+    /// `sendto` on a UDP socket with a NULL destination → `-EDESTADDRREQ`.
+    /// A datagram socket needs a per-packet destination; the
+    /// connectionless rule fires after the kind is resolved.
+    #[test]
+    fn sendto_udp_null_dest_returns_edestaddrreq() {
+        let _net_guard = SENDTO_NET_TEST_LOCK.lock();
+        let _proc_guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        net::init(None);
+        install_test_process();
+        let (id, fd) = udp_socket_fd();
+        let payload = b"datagram";
+        // dest_addr = 0 (null) on a UDP socket → EDESTADDRREQ (89).
+        let result = handle(fd, payload.as_ptr() as u64, payload.len() as u64, 0, 0, 0);
+        assert_eq!(result, -89, "UDP sendto with no destination must be -EDESTADDRREQ");
+        current_process_uninstall();
+        net::destroy_socket(id);
+    }
+
+    /// `sendto` on an UNBOUND UDP socket (with a valid destination) →
+    /// `-EINVAL`. smoltcp refuses to send from a socket with no local
+    /// port (Unaddressable), which the wrapper → handler maps to EINVAL.
+    /// A UDP socket must be `bind`-ed before it can send.
+    #[test]
+    fn sendto_udp_unbound_returns_einval() {
+        let _net_guard = SENDTO_NET_TEST_LOCK.lock();
+        let _proc_guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        net::init(None);
+        install_test_process();
+        let (id, fd) = udp_socket_fd();
+        let dest = sockaddr_in([127, 0, 0, 1], 5000);
+        let payload = b"datagram";
+        let result = handle(
+            fd,
+            payload.as_ptr() as u64,
+            payload.len() as u64,
+            0,
+            dest.as_ptr() as u64,
+            crate::net_socket::SOCKADDR_IN_LEN as u64,
+        );
+        assert_eq!(result, -22, "UDP sendto from an unbound socket must be -EINVAL");
+        current_process_uninstall();
+        net::destroy_socket(id);
+    }
+
+    /// `sendto` on a BOUND UDP socket to a concrete loopback peer
+    /// succeeds, returning the full payload length. Binds a local port
+    /// first (`net::udp_bind_socket`), then sends — the full UDP send
+    /// contract end-to-end over the loopback stack.
+    #[test]
+    fn sendto_udp_bound_to_peer_succeeds() {
+        let _net_guard = SENDTO_NET_TEST_LOCK.lock();
+        let _proc_guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        net::init(None);
+        install_test_process();
+        let (id, fd) = udp_socket_fd();
+        // Bind a local port so the socket can send.
+        net::udp_bind_socket(id, 0, 6000).expect("bind udp local port");
+        let dest = sockaddr_in([127, 0, 0, 1], 5000);
+        let payload = b"datagram";
+        let result = handle(
+            fd,
+            payload.as_ptr() as u64,
+            payload.len() as u64,
+            0,
+            dest.as_ptr() as u64,
+            crate::net_socket::SOCKADDR_IN_LEN as u64,
+        );
+        assert_eq!(
+            result,
+            payload.len() as i64,
+            "bound UDP sendto must return the payload length, got {}",
+            result
+        );
+        current_process_uninstall();
+        net::destroy_socket(id);
     }
 }

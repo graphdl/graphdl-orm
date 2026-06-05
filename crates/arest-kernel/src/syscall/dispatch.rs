@@ -749,13 +749,16 @@ mod tests {
         assert_eq!(result, -97);
     }
 
-    /// `dispatch(SYS_SOCKET, AF_INET, SOCK_DGRAM, 0, ...)` → -93
-    /// (-EPROTONOSUPPORT). UDP isn't served by the TCP-creation path.
-    /// Confirms the dispatcher routes 41 and the dgram rejection fires.
+    /// `dispatch(SYS_SOCKET, AF_INET, SOCK_DGRAM, IPPROTO_TCP, ...)` → -93
+    /// (-EPROTONOSUPPORT). A datagram socket with a non-UDP protocol is
+    /// rejected (#533 — SOCK_DGRAM itself is now accepted, but only with
+    /// IPPROTO_IP / IPPROTO_UDP). Confirms the dispatcher routes 41 and
+    /// the protocol-mismatch rejection fires before any creation (so no
+    /// process / stack is needed). domain=AF_INET(2), type=SOCK_DGRAM(2),
+    /// protocol=IPPROTO_TCP(6).
     #[test]
-    fn dispatch_socket_dgram_returns_eprotonosupport() {
-        // domain = AF_INET (2), type = SOCK_DGRAM (2), protocol = 0.
-        let result = dispatch(SYS_SOCKET, 2, 2, 0, 0, 0, 0);
+    fn dispatch_socket_dgram_wrong_protocol_returns_eprotonosupport() {
+        let result = dispatch(SYS_SOCKET, 2, 2, 6, 0, 0, 0);
         assert_eq!(result, -93);
     }
 
@@ -827,24 +830,15 @@ mod tests {
         assert_eq!(result, 0);
     }
 
-    /// `dispatch(SYS_SENDTO, fd, buf, n, 0, dest, 16)` — a non-null
-    /// destination (r8) on a stream socket → `-EISCONN` (-106). Verifies
-    /// the dispatcher passes r8 (dest_addr) through to the handler and the
-    /// connection-mode rule fires before any fd touch.
+    /// `dispatch(SYS_SENDTO, fd, NULL, n>0, ...)` — a null buf with
+    /// non-zero len → `-EFAULT` (-14). Verifies the dispatcher routes
+    /// syscall 44 to the sendto handler (the buffer check fires before fd
+    /// resolution, so no process is needed). The 6-arg threading itself
+    /// is also covered by the zero-len no-op test above.
     #[test]
-    fn dispatch_sendto_with_dest_returns_eisconn() {
-        // buf non-null + len>0 so the dest check is reached; dest=0x5000.
-        let payload = b"x";
-        let result = dispatch(
-            SYS_SENDTO,
-            3,
-            payload.as_ptr() as u64,
-            payload.len() as u64,
-            0,
-            0x5000,
-            16,
-        );
-        assert_eq!(result, -106);
+    fn dispatch_sendto_null_buf_returns_efault() {
+        let result = dispatch(SYS_SENDTO, 3, 0, 16, 0, 0, 0);
+        assert_eq!(result, -14);
     }
 
     /// `dispatch(SYS_RECVFROM, fd, NULL, n>0, ...)` routes to

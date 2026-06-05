@@ -33,14 +33,21 @@
 //
 // src_addr / addrlen handling for tier-1
 // --------------------------------------
-// On a connection-mode (TCP) socket the source of every byte is the one
-// connected peer, so `src_addr` is rarely used (libc programs typically
-// pass NULL). Tier-1 does NOT report the peer address: when `addrlen` is
-// a non-null pointer we write 0 to it (meaning "no address returned"),
-// matching the kernel contract that `*addrlen` is updated to the length
-// actually stored. Reporting the concrete peer endpoint needs the gated
-// `remote_endpoint` plumbing and is a follow-up; the null-`src_addr`
-// recv form — the primary contract of this slice — is fully served.
+// The two socket kinds differ here:
+//   * TCP (connection-mode) — every byte comes from the one connected
+//     peer, so `src_addr` is rarely used (libc programs typically pass
+//     NULL). Tier-1 does NOT report the peer address on a TCP recv: when
+//     `addrlen` is a non-null pointer we write 0 to it ("no address
+//     returned"). Reporting the concrete TCP peer needs the gated
+//     `remote_endpoint` plumbing and is a follow-up.
+//   * UDP (connectionless, #533) — each datagram carries its own source,
+//     which `recvfrom` is expected to report. When `src_addr` is
+//     non-null we write the source as a 16-byte `sockaddr_in` and set
+//     `*addrlen` to 16; a null `src_addr` discards the source (the plain
+//     `recv` form). This is the per-packet source `net::udp_recvfrom`
+//     hands back.
+// In all cases `*addrlen` is updated only when its pointer is non-null,
+// matching the kernel contract.
 //
 // Buffer / pointer model (same as `read`)
 // ---------------------------------------
@@ -68,7 +75,8 @@
 use core::slice;
 
 use crate::net;
-use crate::syscall::dispatch::EFAULT;
+use crate::net_socket::{SockAddrIn, AF_INET, SOCKADDR_IN_LEN};
+use crate::syscall::dispatch::{EBADF, ENOSYS, EFAULT};
 use crate::syscall::socket::{resolve_socket_fd, socket_error_to_errno, SocketOp};
 
 /// Linux x86_64 syscall number for `recvfrom(sockfd, buf, len, flags,
@@ -107,7 +115,7 @@ pub fn handle(
     buf: u64,
     len: u64,
     _flags: u32,
-    _src_addr: u64,
+    src_addr: u64,
     addrlen: u64,
 ) -> i64 {
     // (1) Zero-length recv is a POSIX no-op — return 0 without deref.
@@ -132,28 +140,96 @@ pub fn handle(
     // Form a mutable byte slice over the caller's buffer.
     // SAFETY: `buf` is non-null (checked) and `len <= isize::MAX`
     // (checked); tier-1's identity mapping makes the span valid kernel
-    // memory. `tcp_recv` writes only up to `len` bytes.
+    // memory. The recv wrappers write only up to `len` bytes.
     let data: &mut [u8] = unsafe { slice::from_raw_parts_mut(buf as *mut u8, len as usize) };
 
-    // (4) Dequeue; map any failure to its errno. `Ok(0)` is EOF.
-    let received = match net::tcp_recv(socket_id, data) {
-        Ok(n) => n as i64,
-        Err(e) => return socket_error_to_errno(e, SocketOp::Recv),
-    };
-
-    // (5) Report "no source address available" if the caller asked for
-    //     one. tier-1 doesn't fill `src_addr`; the kernel contract is to
-    //     update `*addrlen` to the length stored (0 here).
-    if addrlen != 0 {
-        // SAFETY: `addrlen` is non-null; tier-1's identity mapping makes
-        // it valid kernel memory. `socklen_t` is a 32-bit unsigned int on
-        // Linux x86_64.
-        unsafe {
-            core::ptr::write(addrlen as *mut u32, 0);
+    // (4) Dequeue, routing on the socket's transport kind (#533):
+    //       * TCP — `net::tcp_recv`; `Ok(0)` is EOF. tier-1 doesn't
+    //         report the peer address (the source is the one connected
+    //         peer), so `*addrlen` is set to 0.
+    //       * UDP — `net::udp_recvfrom` returns the datagram source; we
+    //         write a `sockaddr_in` into `src_addr` and set `*addrlen`.
+    //         UDP has no EOF (connectionless), so there's no 0-byte
+    //         orderly-shutdown return.
+    match net::socket_kind(socket_id) {
+        Some(net::SocketKind::Tcp) => {
+            let received = match net::tcp_recv(socket_id, data) {
+                Ok(n) => n as i64,
+                Err(e) => return socket_error_to_errno(e, SocketOp::Recv),
+            };
+            // TCP: no peer address reported — update *addrlen to 0.
+            write_addrlen(addrlen, 0);
+            received
+        }
+        Some(net::SocketKind::Udp) => {
+            let (n, src) = match net::udp_recvfrom(socket_id, data) {
+                Ok(pair) => pair,
+                Err(e) => return socket_error_to_errno(e, SocketOp::Recv),
+            };
+            // UDP: fill the caller's src_addr with the datagram source
+            // (when requested) and update *addrlen to what was stored.
+            write_source_sockaddr(src_addr, addrlen, &src);
+            n as i64
+        }
+        // No kind → dangling socket fd (net up) or stack down.
+        None => {
+            if net::is_online() {
+                -EBADF
+            } else {
+                -ENOSYS
+            }
         }
     }
+}
 
-    received
+/// Write `value` to the `socklen_t *addrlen` out-pointer if it's non-null
+/// (a `recvfrom` caller may pass `addrlen == NULL` — then there's nothing
+/// to update). `socklen_t` is a 32-bit unsigned int on Linux x86_64.
+///
+/// SAFETY: writes only after a non-null check; tier-1's identity mapping
+/// makes a non-null `addrlen` valid kernel memory.
+fn write_addrlen(addrlen: u64, value: u32) {
+    if addrlen != 0 {
+        unsafe {
+            core::ptr::write(addrlen as *mut u32, value);
+        }
+    }
+}
+
+/// Write the datagram source `src` as a 16-byte `struct sockaddr_in` into
+/// the caller's `src_addr` buffer and update `*addrlen` to 16 (#533).
+/// A null `src_addr` means the caller doesn't want the source — then
+/// nothing is written (and `*addrlen` is left untouched, matching Linux,
+/// which only updates `addrlen` when `src_addr` is provided). The
+/// `sockaddr_in` is laid out exactly as `parse_sockaddr_in` reads it:
+/// `sin_family` host-order at offset 0, `sin_port` network-order at 2,
+/// `sin_addr` network-order at 4, `sin_zero` (8 bytes) zeroed at 8.
+///
+/// SAFETY: each write is guarded by a non-null check on its pointer;
+/// tier-1's identity mapping makes a non-null pointer valid kernel
+/// memory. The 16 bytes written match `SOCKADDR_IN_LEN`. Note we write
+/// the full 16-byte `sockaddr_in` regardless of the caller's incoming
+/// `addrlen` value — tier-1 trusts that a caller passing a non-null
+/// `src_addr` provided a `sockaddr`-sized buffer (the universal libc
+/// convention); a stricter "clamp to the incoming `*addrlen`" is a
+/// follow-up once `copy_to_user` (#561) validates the span.
+fn write_source_sockaddr(src_addr: u64, addrlen: u64, src: &SockAddrIn) {
+    if src_addr == 0 {
+        // Caller doesn't want the source — leave both untouched.
+        return;
+    }
+    // Build the 16-byte sockaddr_in.
+    let mut buf = [0u8; SOCKADDR_IN_LEN];
+    buf[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+    buf[2..4].copy_from_slice(&src.port.to_be_bytes());
+    buf[4..8].copy_from_slice(&src.octets());
+    // SAFETY: `src_addr` is non-null (checked); identity mapping makes the
+    // 16-byte span valid kernel memory.
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), src_addr as *mut u8, SOCKADDR_IN_LEN);
+    }
+    // Report the stored length.
+    write_addrlen(addrlen, SOCKADDR_IN_LEN as u32);
 }
 
 #[cfg(test)]
@@ -303,5 +379,62 @@ mod tests {
         let result = handle(fd, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0);
         assert_eq!(result, -9);
         current_process_uninstall();
+    }
+
+    // -- UDP (SOCK_DGRAM) recvfrom paths (#533) ------------------------
+
+    /// `recvfrom` on a bound UDP socket with an EMPTY rx ring → `-EAGAIN`.
+    /// UDP is connectionless (no EOF), so an empty ring is always "try
+    /// again", never a 0-byte orderly-shutdown. Binds a local port (a
+    /// UDP socket must be bound to be useful) then recvs with nothing
+    /// pending. Also passes a non-null `addrlen` sentinel and asserts it's
+    /// untouched on this error path.
+    #[test]
+    fn recvfrom_udp_empty_ring_returns_eagain() {
+        let _net_guard = RECVFROM_NET_TEST_LOCK.lock();
+        let _proc_guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        net::init(None);
+        install_test_process();
+        let id = net::create_udp_socket().expect("create udp socket");
+        let fd = current_process_fd_table(|t| {
+            t.expect("proc").allocate(fd_socket(id.as_u64())).expect("alloc fd")
+        });
+        net::udp_bind_socket(id, 0, 7000).expect("bind udp local port");
+        let mut buf = [0u8; 16];
+        let mut addrlen: u32 = 0xDEAD_BEEF;
+        let result = handle(
+            fd,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+            0,
+            (&mut addrlen as *mut u32) as u64,
+        );
+        assert_eq!(result, -11, "empty UDP recv must be -EAGAIN");
+        assert_eq!(addrlen, 0xDEAD_BEEF, "addrlen untouched on the EAGAIN path");
+        current_process_uninstall();
+        net::destroy_socket(id);
+    }
+
+    /// `recvfrom` on an UNBOUND UDP socket with an empty ring is also
+    /// `-EAGAIN` — an unbound UDP socket simply has no packets pending
+    /// (smoltcp's recv on it is Exhausted), so the "try again" signal is
+    /// correct. (Unlike send, recv on an unbound UDP socket isn't an
+    /// addressing error — there's just nothing to read.)
+    #[test]
+    fn recvfrom_udp_unbound_empty_returns_eagain() {
+        let _net_guard = RECVFROM_NET_TEST_LOCK.lock();
+        let _proc_guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        net::init(None);
+        install_test_process();
+        let id = net::create_udp_socket().expect("create udp socket");
+        let fd = current_process_fd_table(|t| {
+            t.expect("proc").allocate(fd_socket(id.as_u64())).expect("alloc fd")
+        });
+        let mut buf = [0u8; 16];
+        let result = handle(fd, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0);
+        assert_eq!(result, -11, "empty unbound UDP recv must be -EAGAIN");
+        current_process_uninstall();
+        net::destroy_socket(id);
     }
 }

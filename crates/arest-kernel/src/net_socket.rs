@@ -131,6 +131,11 @@ pub const IPPROTO_IP: u64 = 0;
 /// `IPPROTO_IP` default for a `SOCK_STREAM` socket. Per `<netinet/in.h>`.
 pub const IPPROTO_TCP: u64 = 6;
 
+/// Linux `IPPROTO_UDP` (= 17) — explicit UDP. Accepted alongside the
+/// `IPPROTO_IP` default for a `SOCK_DGRAM` socket (#533). Per
+/// `<netinet/in.h>`.
+pub const IPPROTO_UDP: u64 = 17;
+
 /// Linux errno `EAFNOSUPPORT` (= 97) — "Address family not supported by
 /// protocol". Returned for any `domain` other than `AF_INET`. Per
 /// `<asm-generic/errno.h>`.
@@ -164,6 +169,15 @@ pub const EFAULT: i64 = 14;
 /// (a `File` / `Synthetic` fd). The fd is open, just not a socket. Per
 /// `<asm-generic/errno.h>`.
 pub const ENOTSOCK: i64 = 88;
+
+/// Linux errno `EDESTADDRREQ` (= 89) — "Destination address required".
+/// Returned by a `sendto` on an unconnected datagram (UDP) socket with a
+/// null `dest_addr` — a UDP `send` needs a per-call destination (unless
+/// the socket was `connect`-ed to a default peer, which tier-1's UDP
+/// path doesn't model). The mirror of the TCP rule, where a non-null
+/// dest on a connected stream socket is `-EISCONN`. Per
+/// `<asm-generic/errno.h>`.
+pub const EDESTADDRREQ: i64 = 89;
 
 /// Linux errno `EOPNOTSUPP` (= 95) — "Operation not supported". Returned
 /// by `listen` / `accept` when invoked on a socket that doesn't support
@@ -371,22 +385,55 @@ pub fn validate_stream_sendto_dest(dest_addr: u64) -> Result<(), i64> {
     Ok(())
 }
 
+/// Decide whether a `sendto(2)` is allowed given its destination-address
+/// pointer, for a connectionless (UDP) socket (#533) — the mirror of
+/// [`validate_stream_sendto_dest`].
+///
+///   * `dest_addr != 0`          → `Ok(())`
+///       — a UDP `sendto` names the per-packet destination; this is the
+///       normal form. (The handler then parses the `sockaddr_in` at the
+///       pointer.)
+///   * `dest_addr == 0` (NULL)  → `Err(-EDESTADDRREQ)`
+///       — a datagram socket has no fixed peer (tier-1's UDP path
+///       doesn't model a `connect`-ed default destination), so a `send`
+///       with no destination has nowhere to go. Linux returns
+///       `EDESTADDRREQ` ("destination address required") for exactly
+///       this.
+///
+/// Pure function — operates on the pointer value alone, no deref — so
+/// the connectionless rule is host-unit-testable. The handler calls this
+/// (selected by the socket's UDP kind) before parsing the destination.
+pub fn validate_dgram_sendto_dest(dest_addr: u64) -> Result<(), i64> {
+    if dest_addr == 0 {
+        return Err(-EDESTADDRREQ);
+    }
+    Ok(())
+}
+
 /// Validate the `(domain, type_, protocol)` triple a `socket(2)` call
-/// carries. Returns `Ok(())` when tier-1 can create the socket
-/// (`AF_INET` + `SOCK_STREAM` + (`IPPROTO_IP` | `IPPROTO_TCP`)), or
+/// carries. Returns `Ok(())` when tier-1 can create the socket — `AF_INET`
+/// + (`SOCK_STREAM` + (`IPPROTO_IP` | `IPPROTO_TCP`)) for TCP, or
+/// (`SOCK_DGRAM` + (`IPPROTO_IP` | `IPPROTO_UDP`)) for UDP (#533) — or
 /// `Err(-errno)` with the Linux errno for the specific rejection:
 ///
 ///   * `domain != AF_INET`                  → `-EAFNOSUPPORT`
 ///   * type (masked) not a known socket type → `-EINVAL`
-///   * type is `SOCK_DGRAM`                  → `-EPROTONOSUPPORT`
-///       (UDP goes through `net::udp_bind`, not this TCP path)
 ///   * type is `SOCK_STREAM` but protocol is
 ///     neither `IPPROTO_IP` nor `IPPROTO_TCP` → `-EPROTONOSUPPORT`
+///   * type is `SOCK_DGRAM` but protocol is
+///     neither `IPPROTO_IP` nor `IPPROTO_UDP` → `-EPROTONOSUPPORT`
 ///
 /// The `type_` argument is masked with `SOCK_TYPE_MASK` first so a
 /// `SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC` request is accepted as a
 /// plain stream socket (the flag bits are recognised but ignored in
-/// tier-1 — there's no per-socket flag state yet).
+/// tier-1 — there's no per-socket flag state yet); the same masking
+/// applies to `SOCK_DGRAM`.
+///
+/// Both `SOCK_STREAM` (TCP) and `SOCK_DGRAM` (UDP) are accepted as of
+/// #533 — UDP creation routes to `net::create_udp_socket` (an unbound
+/// smoltcp UDP socket in the same registry as TCP), bound by `bind(2)`
+/// and driven by `sendto`/`recvfrom`. The handler picks the create path
+/// on the (masked) type.
 ///
 /// Pure function — no global state, no allocation. This is the whole of
 /// the `socket()` argument-acceptance decision, lifted out of the gated
@@ -411,11 +458,16 @@ pub fn validate_socket_args(domain: u64, type_: u64, protocol: u64) -> Result<()
                 Err(-EPROTONOSUPPORT)
             }
         }
-        // UDP is a recognised type but not served by this path — the
-        // kernel's UDP surface is `net::udp_bind`. Return the protocol-
-        // not-supported errno so libc sees a definite "no" for this
-        // (domain, type) rather than a generic invalid-argument.
-        SOCK_DGRAM => Err(-EPROTONOSUPPORT),
+        // UDP (#533). Accept the libc default (IPPROTO_IP == 0) and an
+        // explicit IPPROTO_UDP; reject any other protocol. The handler
+        // routes a SOCK_DGRAM accept to `net::create_udp_socket`.
+        SOCK_DGRAM => {
+            if protocol == IPPROTO_IP || protocol == IPPROTO_UDP {
+                Ok(())
+            } else {
+                Err(-EPROTONOSUPPORT)
+            }
+        }
         // Any other type value is not a socket type Linux defines (after
         // the flag bits are masked off) — invalid argument.
         _ => Err(-EINVAL),
@@ -693,6 +745,28 @@ mod tests {
         assert_eq!(validate_stream_sendto_dest(0x4000), Err(-EISCONN));
     }
 
+    // -- validate_dgram_sendto_dest (#533) ----------------------------
+
+    /// A non-null `dest_addr` on a datagram (UDP) socket is accepted —
+    /// this is the normal UDP `sendto` form (the destination is required).
+    #[test]
+    fn validate_dgram_sendto_dest_accepts_non_null() {
+        assert_eq!(validate_dgram_sendto_dest(0x4000), Ok(()));
+    }
+
+    /// A null `dest_addr` on a datagram socket is rejected with
+    /// `-EDESTADDRREQ` — a UDP send needs somewhere to go.
+    #[test]
+    fn validate_dgram_sendto_dest_rejects_null_with_edestaddrreq() {
+        assert_eq!(validate_dgram_sendto_dest(0), Err(-EDESTADDRREQ));
+    }
+
+    /// `EDESTADDRREQ` is 89 — matches `<asm-generic/errno.h>`.
+    #[test]
+    fn edestaddrreq_value_matches_linux_uapi() {
+        assert_eq!(EDESTADDRREQ, 89);
+    }
+
     // -- validate_socket_args: the accept path -----------------------
 
     /// `socket(AF_INET, SOCK_STREAM, 0)` — the canonical libc call (TCP,
@@ -755,15 +829,36 @@ mod tests {
         );
     }
 
-    /// `socket(AF_INET, SOCK_DGRAM, 0)` returns `-EPROTONOSUPPORT` — UDP
-    /// is a recognised type but isn't served by the tier-1 `socket()`
-    /// TCP path (the kernel's UDP surface is `net::udp_bind`).
+    /// `socket(AF_INET, SOCK_DGRAM, 0)` is ACCEPTED as of #533 — the
+    /// default protocol (IPPROTO_IP) on a datagram socket is UDP, which
+    /// tier-1 now creates via `net::create_udp_socket`.
     #[test]
-    fn validate_rejects_dgram_with_eprotonosupport() {
+    fn validate_accepts_af_inet_dgram_default_protocol() {
+        assert_eq!(validate_socket_args(AF_INET, SOCK_DGRAM, IPPROTO_IP), Ok(()));
+    }
+
+    /// `socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)` — explicit UDP — is
+    /// accepted (#533).
+    #[test]
+    fn validate_accepts_af_inet_dgram_explicit_udp() {
+        assert_eq!(validate_socket_args(AF_INET, SOCK_DGRAM, IPPROTO_UDP), Ok(()));
+    }
+
+    /// A `SOCK_DGRAM` socket with a non-UDP protocol (here IPPROTO_TCP =
+    /// 6) returns `-EPROTONOSUPPORT` — TCP is the wrong protocol for a
+    /// datagram socket. (#533)
+    #[test]
+    fn validate_rejects_dgram_with_wrong_protocol() {
         assert_eq!(
-            validate_socket_args(AF_INET, SOCK_DGRAM, IPPROTO_IP),
+            validate_socket_args(AF_INET, SOCK_DGRAM, IPPROTO_TCP),
             Err(-EPROTONOSUPPORT)
         );
+    }
+
+    /// `IPPROTO_UDP` is 17 — matches `<netinet/in.h>`.
+    #[test]
+    fn ipproto_udp_value_matches_linux_uapi() {
+        assert_eq!(IPPROTO_UDP, 17);
     }
 
     /// An `AF_INET` + `SOCK_STREAM` socket with a nonsense protocol
