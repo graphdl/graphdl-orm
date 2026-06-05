@@ -266,6 +266,11 @@ pub(crate) fn socket_error_to_errno(err: net::SocketError, op: SocketOp) -> i64 
             SocketOp::Listen => -EADDRINUSE,
             // `bind` after the socket is open → invalid argument.
             SocketOp::Bind => -EINVAL,
+            // send/recv never surface raw `InvalidState` (the wrappers
+            // map smoltcp's send/recv `InvalidState` to `NotConnected`),
+            // but keep the match total: a state mismatch on a data op is
+            // "not connected".
+            SocketOp::Send | SocketOp::Recv => -ENOTCONN,
         },
         Unaddressable => match op {
             // A zero / 0.0.0.0 connect target is an invalid argument in
@@ -273,6 +278,10 @@ pub(crate) fn socket_error_to_errno(err: net::SocketError, op: SocketOp) -> i64 
             SocketOp::Connect => -EINVAL,
             // A zero local port for bind/listen → invalid argument.
             SocketOp::Bind | SocketOp::Listen => -EINVAL,
+            // send/recv don't carry an address (the null-addr form), so
+            // `Unaddressable` can't arise; map to invalid argument for
+            // totality.
+            SocketOp::Send | SocketOp::Recv => -EINVAL,
         },
     }
 }
@@ -285,6 +294,8 @@ pub(crate) enum SocketOp {
     Bind,
     Listen,
     Connect,
+    Send,
+    Recv,
 }
 
 #[cfg(test)]

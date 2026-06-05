@@ -1349,6 +1349,85 @@ pub fn tcp_connect(id: SocketId, dst_addr: u32, dst_port: u16) -> Result<(), Soc
     }
 }
 
+/// `send(2)` for a TCP socket (#532). Enqueues as many of `data`'s bytes
+/// as the tx ring has room for and returns the count actually enqueued
+/// (a short write — the caller loops for the rest, the same contract as
+/// Linux's non-blocking `send`). The bytes go on the wire on later
+/// `net::poll()` ticks.
+///
+/// Returns:
+///   * `Ok(n)` with `n >= 1` — `n` bytes enqueued.
+///   * `Err(NotConnected)` — the transmit half isn't open (the socket
+///     was never connected, or is closing). smoltcp's
+///     `SendError::InvalidState`. Handler → `-ENOTCONN`.
+///   * `Err(WouldBlock)` — connected, but the tx ring is full right now
+///     (smoltcp enqueued 0 bytes). Handler → `-EAGAIN`; the caller
+///     retries after a `poll()`. Tier-1 sockets are non-blocking.
+///   * `Err(NotInitialised)` / `Err(UnknownSocket)` — as the other
+///     wrappers.
+///
+/// The caller (the `sendto` handler) must pass a non-empty `data` — a
+/// zero-length `send` is a POSIX no-op handled at the syscall layer, so
+/// this never sees `data.is_empty()` (a smoltcp `Ok(0)` from this call
+/// therefore unambiguously means "ring full" → `WouldBlock`, not "you
+/// asked to send nothing").
+pub fn tcp_send(id: SocketId, data: &[u8]) -> Result<usize, SocketError> {
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(SocketError::NotInitialised)?;
+    let handle = resolve_tcp_handle(state, id)?;
+
+    let socket = state.sockets.get_mut::<tcp::Socket>(handle);
+    match socket.send_slice(data) {
+        // 0 bytes enqueued on a non-empty send means the tx ring is full
+        // (the caller guarantees `data` is non-empty). Non-blocking →
+        // "try again later".
+        Ok(0) => Err(SocketError::WouldBlock),
+        Ok(n) => Ok(n),
+        // Transmit half not open — never connected / already closing.
+        Err(tcp::SendError::InvalidState) => Err(SocketError::NotConnected),
+    }
+}
+
+/// `recv(2)` for a TCP socket (#532). Dequeues up to `data.len()` bytes
+/// from the rx ring into `data` and returns the count.
+///
+/// Returns:
+///   * `Ok(n)` with `n >= 1` — `n` bytes received.
+///   * `Ok(0)` — END OF STREAM: the peer closed its send half (FIN) and
+///     all buffered bytes have been delivered. This is the POSIX
+///     orderly-shutdown signal (`recv` returns 0), distinct from
+///     `WouldBlock`. smoltcp's `RecvError::Finished`.
+///   * `Err(WouldBlock)` — connected and open, but no bytes are pending
+///     right now (smoltcp dequeued 0). Handler → `-EAGAIN`; the caller
+///     retries after a `poll()`.
+///   * `Err(NotConnected)` — the receive half isn't open (never
+///     connected). smoltcp's `RecvError::InvalidState`. Handler →
+///     `-ENOTCONN`.
+///   * `Err(NotInitialised)` / `Err(UnknownSocket)` — as the others.
+///
+/// The caller must pass a non-empty `data` (a zero-length `recv` is a
+/// POSIX no-op handled at the syscall layer), so an `Ok(0)` from smoltcp
+/// here unambiguously means "no data pending" → `WouldBlock`; the only
+/// path that yields a 0-byte return is the `Finished` (EOF) case above.
+pub fn tcp_recv(id: SocketId, data: &mut [u8]) -> Result<usize, SocketError> {
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(SocketError::NotInitialised)?;
+    let handle = resolve_tcp_handle(state, id)?;
+
+    let socket = state.sockets.get_mut::<tcp::Socket>(handle);
+    match socket.recv_slice(data) {
+        // 0 bytes dequeued on a non-empty recv means no data is pending
+        // (the connection is still open). Non-blocking → "try again".
+        Ok(0) => Err(SocketError::WouldBlock),
+        Ok(n) => Ok(n),
+        // Peer closed gracefully and the buffer is drained — EOF. Report
+        // as a 0-byte read, the POSIX orderly-shutdown signal.
+        Err(tcp::RecvError::Finished) => Ok(0),
+        // Receive half not open — never connected.
+        Err(tcp::RecvError::InvalidState) => Err(SocketError::NotConnected),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────
 //
 // `arest-kernel`'s bin target has `test = false` (Cargo.toml L47),

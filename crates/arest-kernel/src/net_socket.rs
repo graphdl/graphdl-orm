@@ -344,6 +344,33 @@ pub fn validate_connect_target(addr: &SockAddrIn) -> Result<(), i64> {
     Ok(())
 }
 
+/// Decide whether a `sendto(2)` is allowed given its destination-address
+/// pointer, for a connection-mode (TCP) socket (#532). The `dest_addr`
+/// is the raw userspace pointer the syscall carried (`0` = NULL).
+///
+///   * `dest_addr == 0` (NULL)  → `Ok(())`
+///       — this is the plain `send(2)` form (libc's `send` is `sendto`
+///       with a null address); the bytes go to the already-connected
+///       peer.
+///   * `dest_addr != 0`          → `Err(-EISCONN)`
+///       — a TCP socket is connection-mode: once connected it has a
+///       fixed peer, so naming a per-call destination is an error. Linux
+///       returns `EISCONN` for `sendto` with a non-null address on a
+///       connected socket. (A UDP socket, #533, takes the opposite
+///       rule — there the destination is required; that path doesn't go
+///       through this TCP helper.)
+///
+/// Pure function — operates on the pointer value alone, no deref, no
+/// state — so the connection-mode rule is host-unit-testable. The
+/// handler calls this before resolving the fd so a misused `sendto` on a
+/// stream socket is rejected with the right errno.
+pub fn validate_stream_sendto_dest(dest_addr: u64) -> Result<(), i64> {
+    if dest_addr != 0 {
+        return Err(-EISCONN);
+    }
+    Ok(())
+}
+
 /// Validate the `(domain, type_, protocol)` triple a `socket(2)` call
 /// carries. Returns `Ok(())` when tier-1 can create the socket
 /// (`AF_INET` + `SOCK_STREAM` + (`IPPROTO_IP` | `IPPROTO_TCP`)), or
@@ -647,6 +674,23 @@ mod tests {
     fn validate_connect_target_rejects_zero_port() {
         let sa = SockAddrIn { addr: 0x0102_0304, port: 0 };
         assert_eq!(validate_connect_target(&sa), Err(-EINVAL));
+    }
+
+    // -- validate_stream_sendto_dest (#532) ---------------------------
+
+    /// A null `dest_addr` (the plain `send` form) is accepted on a stream
+    /// socket.
+    #[test]
+    fn validate_stream_sendto_dest_accepts_null() {
+        assert_eq!(validate_stream_sendto_dest(0), Ok(()));
+    }
+
+    /// A non-null `dest_addr` on a stream (TCP) socket is rejected with
+    /// `-EISCONN` — a connected socket can't name a per-call destination.
+    #[test]
+    fn validate_stream_sendto_dest_rejects_non_null_with_eisconn() {
+        // Any non-zero pointer value stands in for a supplied dest_addr.
+        assert_eq!(validate_stream_sendto_dest(0x4000), Err(-EISCONN));
     }
 
     // -- validate_socket_args: the accept path -----------------------

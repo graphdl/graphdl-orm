@@ -67,9 +67,11 @@ use crate::syscall::listen;
 use crate::syscall::mmap;
 use crate::syscall::openat;
 use crate::syscall::read;
+use crate::syscall::recvfrom;
 use crate::syscall::rt_sigaction;
 use crate::syscall::rt_sigprocmask;
 use crate::syscall::rt_sigreturn;
+use crate::syscall::sendto;
 use crate::syscall::socket;
 use crate::syscall::stat;
 use crate::syscall::write;
@@ -325,6 +327,26 @@ pub const SYS_SOCKET: u64 = 41;
 /// handshake returns `-EINPROGRESS`. Per #531.
 pub const SYS_CONNECT: u64 = 42;
 
+/// Linux x86_64 syscall number for `sendto(int sockfd, const void *buf,
+/// size_t len, int flags, const struct sockaddr *dest_addr, socklen_t
+/// addrlen)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_sendto` (= 44). The
+/// vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_sendto`. Routes to
+/// `sendto::handle`, which enqueues the bytes on the socket's tx ring.
+/// `send(2)` is this with a null `dest_addr`. Per #532.
+pub const SYS_SENDTO: u64 = 44;
+
+/// Linux x86_64 syscall number for `recvfrom(int sockfd, void *buf,
+/// size_t len, int flags, struct sockaddr *src_addr, socklen_t
+/// *addrlen)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_recvfrom` (= 45).
+/// The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_recvfrom`. Routes to
+/// `recvfrom::handle`, which dequeues bytes from the socket's rx ring (0
+/// = EOF). `recv(2)` is this with a null `src_addr`. Per #532.
+pub const SYS_RECVFROM: u64 = 45;
+
 /// Linux x86_64 syscall number for
 /// `bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)`.
 /// Source: `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_bind`
@@ -509,6 +531,25 @@ pub fn dispatch(
             // -EINPROGRESS; other outcomes -EBADF / -EFAULT / -EINVAL /
             // -ENOTSOCK / -EAFNOSUPPORT / -EISCONN / -ENOSYS. Per #531.
             connect::handle(rdi as i32, rsi, rdx)
+        }
+        SYS_SENDTO => {
+            // sendto(sockfd, buf, len, flags, dest_addr, addrlen) — send
+            // bytes on a (connected) socket. rdi = sockfd (i32), rsi =
+            // buf, rdx = len, r10 = flags, r8 = dest_addr, r9 = addrlen.
+            // `send(2)` is this with dest_addr = 0. Fourth+ args are r10
+            // / r8 / r9 per the Linux x86_64 ABI. Returns the byte count
+            // (possibly short) or -EBADF / -EFAULT / -ENOTSOCK / -EISCONN
+            // / -ENOTCONN / -EAGAIN / -ENOSYS. Per #532.
+            sendto::handle(rdi as i32, rsi, rdx, r10 as u32, r8, r9)
+        }
+        SYS_RECVFROM => {
+            // recvfrom(sockfd, buf, len, flags, src_addr, addrlen) —
+            // receive bytes from a (connected) socket. rdi = sockfd
+            // (i32), rsi = buf, rdx = len, r10 = flags, r8 = src_addr,
+            // r9 = addrlen pointer. `recv(2)` is this with src_addr = 0.
+            // Returns the byte count (0 = EOF) or -EBADF / -EFAULT /
+            // -ENOTSOCK / -ENOTCONN / -EAGAIN / -ENOSYS. Per #532.
+            recvfrom::handle(rdi as i32, rsi, rdx, r10 as u32, r8, r9)
         }
         SYS_BIND => {
             // bind(sockfd, addr, addrlen) — assign a local address to a
@@ -758,6 +799,60 @@ mod tests {
     #[test]
     fn dispatch_connect_null_addr_returns_efault() {
         let result = dispatch(SYS_CONNECT, 3, 0, 16, 0, 0, 0);
+        assert_eq!(result, -14);
+    }
+
+    /// `SYS_SENDTO` is 44 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_sendto`.
+    #[test]
+    fn sys_sendto_number_matches_linux_uapi() {
+        assert_eq!(SYS_SENDTO, 44);
+    }
+
+    /// `SYS_RECVFROM` is 45 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_recvfrom`.
+    #[test]
+    fn sys_recvfrom_number_matches_linux_uapi() {
+        assert_eq!(SYS_RECVFROM, 45);
+    }
+
+    /// `dispatch(SYS_SENDTO, fd, buf, 0, ...)` routes to `sendto::handle`;
+    /// a zero-length send is a POSIX no-op returning 0. Verifies the
+    /// dispatcher wires syscall 44 (and threads the 6 args), with no
+    /// process / stack needed (the count==0 short-circuit fires first).
+    #[test]
+    fn dispatch_sendto_zero_len_returns_zero() {
+        // sockfd=3, buf=0, len=0, flags=0, dest_addr=0, addrlen=0.
+        let result = dispatch(SYS_SENDTO, 3, 0, 0, 0, 0, 0);
+        assert_eq!(result, 0);
+    }
+
+    /// `dispatch(SYS_SENDTO, fd, buf, n, 0, dest, 16)` — a non-null
+    /// destination (r8) on a stream socket → `-EISCONN` (-106). Verifies
+    /// the dispatcher passes r8 (dest_addr) through to the handler and the
+    /// connection-mode rule fires before any fd touch.
+    #[test]
+    fn dispatch_sendto_with_dest_returns_eisconn() {
+        // buf non-null + len>0 so the dest check is reached; dest=0x5000.
+        let payload = b"x";
+        let result = dispatch(
+            SYS_SENDTO,
+            3,
+            payload.as_ptr() as u64,
+            payload.len() as u64,
+            0,
+            0x5000,
+            16,
+        );
+        assert_eq!(result, -106);
+    }
+
+    /// `dispatch(SYS_RECVFROM, fd, NULL, n>0, ...)` routes to
+    /// `recvfrom::handle`; a null buf with non-zero len → `-EFAULT`
+    /// (-14). Verifies the dispatcher wires syscall 45.
+    #[test]
+    fn dispatch_recvfrom_null_buf_returns_efault() {
+        let result = dispatch(SYS_RECVFROM, 3, 0, 16, 0, 0, 0);
         assert_eq!(result, -14);
     }
 
