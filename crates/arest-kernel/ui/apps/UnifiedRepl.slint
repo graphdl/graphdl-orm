@@ -463,6 +463,8 @@ export component UnifiedRepl inherits Window {
                         Rectangle {
                             width: root.resources-col-width;
                             Card {
+                                width: 100%;
+                                height: 100%;
                                 title: "Apps";
                                 if root.resources.length == 0 : Text {
                                     text: "Loading...";
@@ -484,6 +486,8 @@ export component UnifiedRepl inherits Window {
                         Rectangle {
                             horizontal-stretch: 1;
                             Card {
+                                width: 100%;
+                                height: 100%;
                                 title: root.selected-resource-index >= 0
                                     ? "Instances"
                                     : "Pick a resource";
@@ -517,6 +521,8 @@ export component UnifiedRepl inherits Window {
                         Rectangle {
                             width: root.detail-col-width;
                             Card {
+                                width: 100%;
+                                height: 100%;
                                 title: "Detail";
                                 if root.detail-lines.length == 0 : Text {
                                     text: "Click an instance.";
@@ -560,6 +566,8 @@ export component UnifiedRepl inherits Window {
                             min-height: root.typed-surface-min-height;
                             vertical-stretch: 1;
                             Card {
+                                width: 100%;
+                                height: 100%;
                                 // Header: cell label, with the
                                 // selected Component triple appended
                                 // when a Component matched. When the
@@ -621,6 +629,8 @@ export component UnifiedRepl inherits Window {
                         Rectangle {
                             min-height: 80px;
                             Card {
+                                width: 100%;
+                                height: 100%;
                                 title: "Navigate";
                                 if root.navigation-targets.length == 0 : Text {
                                     text: "Nothing to navigate from here. Try the actions below or type 'help'.";
@@ -658,6 +668,8 @@ export component UnifiedRepl inherits Window {
                         Rectangle {
                             min-height: 80px;
                             Card {
+                                width: 100%;
+                                height: 100%;
                                 title: "Actions";
                                 if root.system-actions.length == 0 : Text {
                                     text: "(no SYSTEM actions for this cell — try the REPL prompt below)";
@@ -779,6 +791,8 @@ export component UnifiedRepl inherits Window {
                         Rectangle {
                             min-height: 80px;
                             Card {
+                                width: 100%;
+                                height: 100%;
                                 title: "Bookmarks";
                                 Button {
                                     text: "+ Bookmark current cell";
@@ -821,6 +835,8 @@ export component UnifiedRepl inherits Window {
                             vertical-stretch: root.scrollback-vert-stretch;
                             clip: true;
                             Card {
+                                width: 100%;
+                                height: 100%;
                                 title: "REPL";
                                 scroll := Flickable {
                                     // `clip: true` on the Rectangle
