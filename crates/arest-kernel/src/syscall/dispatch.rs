@@ -56,6 +56,7 @@ use crate::syscall::arch_prctl;
 use crate::syscall::bind;
 use crate::syscall::brk;
 use crate::syscall::close;
+use crate::syscall::connect;
 use crate::syscall::exit;
 use crate::syscall::futex;
 use crate::syscall::getrandom;
@@ -315,6 +316,16 @@ pub const SYS_RT_SIGRETURN: u64 = 15;
 pub const SYS_SOCKET: u64 = 41;
 
 /// Linux x86_64 syscall number for
+/// `connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)`.
+/// Source: `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_connect`
+/// (= 42). The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_connect`. Routes to
+/// `connect::handle`, which initiates the active-open TCP handshake to
+/// the peer named by the `sockaddr_in`. Non-blocking: a started
+/// handshake returns `-EINPROGRESS`. Per #531.
+pub const SYS_CONNECT: u64 = 42;
+
+/// Linux x86_64 syscall number for
 /// `bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen)`.
 /// Source: `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_bind`
 /// (= 49). The vendored musl tree confirms at
@@ -489,6 +500,15 @@ pub fn dispatch(
             // negative errno (-EAFNOSUPPORT / -EPROTONOSUPPORT / -EINVAL
             // / -EMFILE / -ENOSYS). Per #478a.
             socket::handle(rdi, rsi, rdx)
+        }
+        SYS_CONNECT => {
+            // connect(sockfd, addr, addrlen) — active-open TCP handshake
+            // to the peer named by the sockaddr_in. rdi = sockfd (i32),
+            // rsi = addr pointer (const struct sockaddr *), rdx = addrlen
+            // (socklen_t). Non-blocking: a started handshake returns
+            // -EINPROGRESS; other outcomes -EBADF / -EFAULT / -EINVAL /
+            // -ENOTSOCK / -EAFNOSUPPORT / -EISCONN / -ENOSYS. Per #531.
+            connect::handle(rdi as i32, rsi, rdx)
         }
         SYS_BIND => {
             // bind(sockfd, addr, addrlen) — assign a local address to a
@@ -721,6 +741,23 @@ mod tests {
     fn dispatch_bind_null_addr_returns_efault() {
         // sockfd = 3, addr = NULL, addrlen = 16.
         let result = dispatch(SYS_BIND, 3, 0, 16, 0, 0, 0);
+        assert_eq!(result, -14);
+    }
+
+    /// `SYS_CONNECT` is 42 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_connect`.
+    #[test]
+    fn sys_connect_number_matches_linux_uapi() {
+        assert_eq!(SYS_CONNECT, 42);
+    }
+
+    /// `dispatch(SYS_CONNECT, fd, NULL, 16, ...)` routes to
+    /// `connect::handle` and the null-sockaddr rejection fires →
+    /// `-EFAULT` (-14). Verifies the dispatcher wires syscall 42. The
+    /// rejection precedes any fd / net touch.
+    #[test]
+    fn dispatch_connect_null_addr_returns_efault() {
+        let result = dispatch(SYS_CONNECT, 3, 0, 16, 0, 0, 0);
         assert_eq!(result, -14);
     }
 

@@ -258,7 +258,21 @@ struct NetState {
     /// removed by `destroy_socket` so a re-used id (impossible today —
     /// ids are monotonic) couldn't inherit a stale binding.
     socket_bindings: BTreeMap<u64, BoundEndpoint>,
+    /// Next ephemeral local port `tcp_connect` (#531) hands out for an
+    /// outbound connection whose socket wasn't `bind`-ed to a fixed port.
+    /// Walks the IANA ephemeral range (49152..=65535) and wraps. smoltcp
+    /// requires a concrete non-zero local port for `connect`; this is the
+    /// kernel-side allocator for it. A monotonic walk (rather than random)
+    /// is fine for tier-1 — there's no port-reuse pressure with the
+    /// handful of sockets a single guest opens.
+    next_ephemeral_port: u16,
 }
+
+/// First port of the IANA-registered ephemeral / dynamic range
+/// (49152–65535, RFC 6335). `tcp_connect` allocates outbound local ports
+/// from here upward, wrapping back to the start at 65535. Below this
+/// range live the well-known + registered ports a server might `bind`.
+const EPHEMERAL_PORT_BASE: u16 = 49152;
 
 /// The local endpoint a `bind(2)` recorded for a socket (#529). Both
 /// fields are host-order: `addr` is the IPv4 address as a `u32`
@@ -410,6 +424,9 @@ pub fn init(virtio: Option<VirtioPhy>) {
         // `bind` bookkeeping (#529) starts empty — populated as userspace
         // `bind()` calls arrive.
         socket_bindings: BTreeMap::new(),
+        // Ephemeral local-port allocator (#531) starts at the base of the
+        // IANA dynamic range.
+        next_ephemeral_port: EPHEMERAL_PORT_BASE,
     });
 }
 
@@ -1250,6 +1267,86 @@ pub fn tcp_listen(id: SocketId) -> Result<(), SocketError> {
         tcp::ListenError::Unaddressable => SocketError::Unaddressable,
         tcp::ListenError::InvalidState => SocketError::InvalidState,
     })
+}
+
+/// Allocate the next ephemeral local port (49152..=65535, wrapping).
+/// Used by `tcp_connect` for an outbound socket that wasn't `bind`-ed to
+/// a fixed source port. Caller holds the `NET` lock (mutates
+/// `next_ephemeral_port`).
+fn alloc_ephemeral_port(state: &mut NetState) -> u16 {
+    let port = state.next_ephemeral_port;
+    // Advance, wrapping back to the base at the top of the range.
+    state.next_ephemeral_port = if port >= u16::MAX {
+        EPHEMERAL_PORT_BASE
+    } else {
+        port + 1
+    };
+    port
+}
+
+/// `connect(2)` for a TCP socket (#531). Kicks off the active-open
+/// handshake to `(dst_addr, dst_port)` (both host-order). The local port
+/// is the one a prior `tcp_bind` recorded, or a freshly-allocated
+/// ephemeral port (49152..=65535) when the socket wasn't bound.
+///
+/// smoltcp's `connect(cx, remote, local)` sends the SYN and moves the
+/// socket to `SynSent` — it does NOT block for the handshake to finish.
+/// Tier-1 sockets are inherently non-blocking (no scheduler to park on,
+/// #530), so a successfully-*started* connect returns
+/// `Err(ConnectInProgress)` → the handler maps it to `-EINPROGRESS`, the
+/// canonical non-blocking-connect signal libc polls on. The connection
+/// completes on later `net::poll()` ticks; a future `getsockopt(SO_ERROR)`
+/// / writable-`poll` surface lets userspace observe completion.
+///
+/// Returns:
+///   * `Err(ConnectInProgress)` — SYN sent, handshake in progress
+///     (the success-shaped outcome for a non-blocking connect).
+///   * `Err(NotInitialised)` / `Err(UnknownSocket)` — as the other
+///     wrappers.
+///   * `Err(InvalidState)` — the socket is already open (already
+///     connected / listening). Handler maps to `-EISCONN`.
+///   * `Err(Unaddressable)` — smoltcp rejected the endpoint (unspecified
+///     remote, or a port of 0). Handler maps to `-EINVAL`. (The handler
+///     also pre-screens the target via
+///     `net_socket::validate_connect_target`, so this is the
+///     belt-and-braces backstop.)
+///
+/// `dst_addr` is the host-order IPv4 word; `dst_port` the host-order
+/// port. The remote is built as `IpEndpoint::new(IpAddress::v4(a,b,c,d),
+/// port)` from the address octets.
+pub fn tcp_connect(id: SocketId, dst_addr: u32, dst_port: u16) -> Result<(), SocketError> {
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(SocketError::NotInitialised)?;
+    let handle = resolve_tcp_handle(state, id)?;
+
+    // Local port: a prior bind's port, else an ephemeral one. (A bound
+    // port of 0 means "unbound", so treat it as "allocate ephemeral".)
+    let bound_port = state.socket_bindings.get(&id.as_u64()).map(|b| b.port);
+    let local_port = match bound_port {
+        Some(p) if p != 0 => p,
+        _ => alloc_ephemeral_port(state),
+    };
+
+    // Build the remote endpoint from the host-order address word.
+    let [a, b, c, d] = dst_addr.to_be_bytes();
+    let remote = IpEndpoint::new(IpAddress::v4(a, b, c, d), dst_port);
+
+    // smoltcp needs both the socket (out of the SocketSet) and the
+    // interface context. They're disjoint fields of NetState, so split
+    // the borrow: bind `iface` and `sockets` as separate locals.
+    let NetState {
+        ref mut iface,
+        ref mut sockets,
+        ..
+    } = *state;
+    let socket = sockets.get_mut::<tcp::Socket>(handle);
+    match socket.connect(iface.context(), remote, local_port) {
+        // SYN sent — handshake started but not complete. Non-blocking
+        // connect reports this as "in progress".
+        Ok(()) => Err(SocketError::ConnectInProgress),
+        Err(tcp::ConnectError::InvalidState) => Err(SocketError::InvalidState),
+        Err(tcp::ConnectError::Unaddressable) => Err(SocketError::Unaddressable),
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────

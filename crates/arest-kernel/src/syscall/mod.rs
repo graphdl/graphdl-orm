@@ -59,6 +59,7 @@ pub mod arch_prctl;
 pub mod bind;
 pub mod brk;
 pub mod close;
+pub mod connect;
 pub mod dispatch;
 pub mod exit;
 pub mod futex;

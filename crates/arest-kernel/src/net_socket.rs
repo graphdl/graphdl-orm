@@ -315,6 +315,35 @@ pub fn parse_sockaddr_in(addr: &[u8]) -> Result<SockAddrIn, i64> {
     })
 }
 
+/// Validate a parsed [`SockAddrIn`] as a `connect(2)` *destination*
+/// (#531). A connect target must name a concrete peer:
+///
+///   * `addr == 0` (INADDR_ANY, `0.0.0.0`)  → `-EINVAL`
+///       — `0.0.0.0` is "any local address", not a routable destination;
+///       you can't open a TCP connection *to* the wildcard. (Linux
+///       returns `EADDRNOTAVAIL` here; tier-1's errno set doesn't expose
+///       that, so `-EINVAL` is the closest "this address is wrong for a
+///       connect" signal — the same errno the gated wrapper's
+///       `Unaddressable` case maps to for connect.)
+///   * `port == 0`                          → `-EINVAL`
+///       — port 0 is the "pick any port" sentinel for bind, never a
+///       valid connect target; smoltcp also rejects it.
+///
+/// `Ok(())` otherwise — the address + port name a concrete peer the
+/// gated `net::tcp_connect` can hand to smoltcp. Pure function, no
+/// state, host-unit-tested: lifts the connect-target sanity check out of
+/// the gated wrapper so the accept/reject decision is verifiable without
+/// a live interface (the same split `validate_socket_args` follows).
+pub fn validate_connect_target(addr: &SockAddrIn) -> Result<(), i64> {
+    if addr.addr == 0 {
+        return Err(-EINVAL);
+    }
+    if addr.port == 0 {
+        return Err(-EINVAL);
+    }
+    Ok(())
+}
+
 /// Validate the `(domain, type_, protocol)` triple a `socket(2)` call
 /// carries. Returns `Ok(())` when tier-1 can create the socket
 /// (`AF_INET` + `SOCK_STREAM` + (`IPPROTO_IP` | `IPPROTO_TCP`)), or
@@ -585,6 +614,39 @@ mod tests {
         let mut buf = [0u8; 4];
         buf[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
         assert_eq!(parse_sockaddr_in(&buf), Err(-EINVAL));
+    }
+
+    // -- validate_connect_target (#531) -------------------------------
+
+    /// A concrete `1.2.3.4:80` target is accepted as a connect
+    /// destination.
+    #[test]
+    fn validate_connect_target_accepts_concrete_peer() {
+        let sa = SockAddrIn { addr: 0x0102_0304, port: 80 };
+        assert_eq!(validate_connect_target(&sa), Ok(()));
+    }
+
+    /// `127.0.0.1:8080` (loopback) is a valid connect target.
+    #[test]
+    fn validate_connect_target_accepts_loopback() {
+        let sa = SockAddrIn { addr: 0x7f00_0001, port: 8080 };
+        assert_eq!(validate_connect_target(&sa), Ok(()));
+    }
+
+    /// A `0.0.0.0:80` target is rejected with `-EINVAL` — the wildcard
+    /// address isn't a routable connect destination.
+    #[test]
+    fn validate_connect_target_rejects_wildcard_addr() {
+        let sa = SockAddrIn { addr: 0, port: 80 };
+        assert_eq!(validate_connect_target(&sa), Err(-EINVAL));
+    }
+
+    /// A `1.2.3.4:0` target is rejected with `-EINVAL` — port 0 is never
+    /// a valid connect destination.
+    #[test]
+    fn validate_connect_target_rejects_zero_port() {
+        let sa = SockAddrIn { addr: 0x0102_0304, port: 0 };
+        assert_eq!(validate_connect_target(&sa), Err(-EINVAL));
     }
 
     // -- validate_socket_args: the accept path -----------------------
