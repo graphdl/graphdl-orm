@@ -83,6 +83,14 @@ pub mod x86_64;
 // foundation slice — `#[allow(dead_code)]` inside the module itself
 // guards the public surface until the consumer lands.
 pub mod pointer;
+// PS/2 mouse hardware driver (#598 pointer producer) — the 8042 aux
+// device on IRQ 12, feeding `pointer` via the host-tested
+// `crate::ps2_mouse` logic. Gated on `feature = "slint"`: the only
+// consumer of the pointer ring is the slint launcher's per-frame
+// dispatch, so headless `server` builds elide the driver, leave IRQ 12
+// masked, and keep IDT vector 44 at the default EOI-only stub.
+#[cfg(feature = "slint")]
+pub mod mouse;
 mod serial;
 // Slint software-renderer → GOP framebuffer adapter (#427). Adds the
 // `LineBufferProvider` impl + the `Platform` impl that Slint needs to

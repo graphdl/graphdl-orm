@@ -80,6 +80,13 @@ impl InterruptIndex {
     }
 }
 
+/// IRQ 12 (PS/2 mouse, aux device) → vector 44 on the slave PIC.
+/// Kept a free const rather than an `InterruptIndex` variant because
+/// it's gated on `feature = "slint"` (the only pointer-ring consumer),
+/// and a cfg'd enum variant would muddy `as_u8`. From #598.
+#[cfg(feature = "slint")]
+const MOUSE_VECTOR: u8 = PIC_2_OFFSET + 4;
+
 /// Cascaded PIC pair under a spin lock. Same construction the BIOS
 /// arm uses — UEFI firmware does NOT permanently disable the legacy
 /// 8259 PIC on QEMU+OVMF; it leaves the PIC physically present but
@@ -175,6 +182,15 @@ pub fn init_interrupts() {
             idt[vec].set_handler_fn(default_irq_handler);
         }
 
+        // IRQ 12 — PS/2 mouse (#598). Overrides the defensive stub the
+        // loop above just set on vector 44 (aux device, slave PIC).
+        // Gated on `feature = "slint"`: the pointer ring it feeds is
+        // drained only by the slint launcher. With slint off, vector 44
+        // keeps the EOI-only stub and IRQ 12 stays masked (see
+        // `pic_init`), so there's no path to reach `mouse_handler`.
+        #[cfg(feature = "slint")]
+        idt[MOUSE_VECTOR].set_handler_fn(mouse_handler);
+
         // Defensive: vectors 48..255 get a spurious-IRQ stub. Covers
         // any stray APIC / IPI / firmware leftover that we don't
         // know about — better an immediate iretq than a triple-fault
@@ -219,45 +235,55 @@ pub fn pic_init() {
     #[cfg(feature = "repl")]
     super::keyboard::init();
 
+    // Bring the PS/2 aux (mouse) device online before its IRQ line
+    // opens (#598). Gated on `feature = "slint"` — the pointer ring it
+    // feeds is slint-only. Bounded polls inside, so a missing aux
+    // device can't wedge boot. Mirrors the keyboard decoder bootstrap
+    // above: configure the device before the mask clears so the first
+    // packet has somewhere to land.
+    #[cfg(feature = "slint")]
+    super::mouse::init();
+
     // SAFETY: ICW programming sequence — driven entirely through the
     // PIC's documented port pair. No memory state is touched. Same
     // call the BIOS arm makes from `init_pic`.
     unsafe {
         let mut pics = PICS.lock();
         pics.initialize();
-        // PIC1 mask byte (bit set = MASKED, bit clear = unmasked):
-        //   `feature = "repl"` ON  → 0xFC = 1111_1100 — unmask IRQ 0
-        //                            (timer) AND IRQ 1 (keyboard).
-        //                            Bit 0 = 0 → IRQ 0 enabled; bit 1
-        //                            = 0 → IRQ 1 enabled. Same mask
-        //                            byte the BIOS arm writes (see
-        //                            `arch::x86_64::interrupts::init_pic`)
-        //                            so the keyboard wakes the same
-        //                            way on both boot paths.
-        //   `feature = "repl"` OFF → 0xFE = 1111_1110 — IRQ 0 only.
-        //                            Bit 0 = 0 → IRQ 0 (timer) enabled;
-        //                            bit 1 = 1 → IRQ 1 (keyboard) MASKED.
-        //                            Keyboard line stays masked since
-        //                            no consumer would drain the ring;
-        //                            also keeps vector 33 from firing
-        //                            into an unpopulated IDT slot
-        //                            (`init_interrupts` only installs
-        //                            `keyboard_handler` under the same
-        //                            gate, see #628). #655 fixed the
-        //                            byte (was 0xFD = mask IRQ 0,
-        //                            unmask IRQ 1 — the inverse): on
-        //                            `--no-default-features --features
-        //                            server` builds the PIT timer line
-        //                            stayed masked, `arch::time::now_ms`
-        //                            never advanced, and smoltcp's
-        //                            DHCPv4 retry / TCP retransmit
-        //                            timers were frozen at t=0 forever.
-        // 0xFF on PIC2 — keep RTC/mouse/etc all masked.
+        // PIC mask bytes (bit set = MASKED, bit clear = unmasked).
+        // Computed per feature so each profile opens exactly the lines
+        // it has both a handler and a consumer for:
+        //
+        //   * IRQ 0  (timer, PIC1 bit 0) — ALWAYS open. #655: keeping
+        //     bit 0 clear is load-bearing — a masked timer freezes
+        //     `arch::time::now_ms`, stalling smoltcp's DHCPv4 / TCP
+        //     retransmit timers at t=0 forever.
+        //   * IRQ 1  (keyboard, PIC1 bit 1) — open with `repl`. With
+        //     repl off, the decoder + IDT vector 33 are both absent
+        //     (#628), so the line stays masked and no scancode fires
+        //     into an unpopulated slot.
+        //   * IRQ 2  (cascade, PIC1 bit 2) + IRQ 12 (mouse, PIC2 bit 4)
+        //     — open with `slint` (#598). The mouse hangs off the slave
+        //     PIC, so its packets reach the CPU only if the master's
+        //     IRQ 2 cascade is ALSO open; opening PIC2 bit 4 alone would
+        //     silently drop every mouse IRQ.
+        //
+        // Every other line stays masked so a stray RTC / COM IRQ doesn't
+        // burn cycles in the defensive stub.
+        #[allow(unused_mut)]
+        let mut pic1: u8 = 0xFE; // IRQ 0 (timer) open
+        #[allow(unused_mut)]
+        let mut pic2: u8 = 0xFF;
         #[cfg(feature = "repl")]
-        let pic1_mask: u8 = 0xFC;
-        #[cfg(not(feature = "repl"))]
-        let pic1_mask: u8 = 0xFE;
-        pics.write_masks(pic1_mask, 0xFF);
+        {
+            pic1 &= !0x02; // IRQ 1 keyboard
+        }
+        #[cfg(feature = "slint")]
+        {
+            pic1 &= !0x04; // IRQ 2 cascade (required for any slave IRQ)
+            pic2 &= !0x10; // IRQ 12 mouse
+        }
+        pics.write_masks(pic1, pic2);
     }
 }
 
@@ -382,6 +408,30 @@ extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
     unsafe {
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
+    }
+}
+
+/// PS/2 mouse (IRQ 12, vector 44) handler (#598). Reads the aux byte
+/// from port 0x60, feeds it to the `arch::uefi::mouse` accumulator
+/// (which pushes `PointerEvent`s on a completed packet), then EOIs.
+/// IRQ 12 is on the slave PIC, so `notify_end_of_interrupt` routes the
+/// EOI to both the slave and the master chip.
+///
+/// Same in-ISR discipline as `keyboard_handler`: one port read + a
+/// bounded feed, EOI last. Gated on `feature = "slint"` to match the
+/// `arch::uefi::mouse` module and the IRQ 12 unmask in `pic_init`.
+#[cfg(feature = "slint")]
+extern "x86-interrupt" fn mouse_handler(_stack_frame: InterruptStackFrame) {
+    // SAFETY: 0x60 is the shared PS/2 data port; for an aux IRQ it
+    // returns the next mouse-packet byte. Single read; clears the
+    // controller output buffer.
+    let mut port = Port::<u8>::new(0x60);
+    let byte: u8 = unsafe { port.read() };
+    super::mouse::handle_aux_byte(byte);
+    // SAFETY: standard PIC EOI. For a slave-PIC vector the chained
+    // impl sends the EOI to both PIC2 and PIC1.
+    unsafe {
+        PICS.lock().notify_end_of_interrupt(MOUSE_VECTOR);
     }
 }
 

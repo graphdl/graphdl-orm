@@ -118,6 +118,12 @@ pub mod launcher_app_set;
 // `crate::unified_repl_regions::seed_region_cells` before the
 // super-loop and uses `region_layout_for` to populate Slint props.
 pub mod unified_repl_regions;
+// Pure PS/2 mouse packet logic (#598 pointer producer). Host-testable
+// parse / assembly / button-edge core; the UEFI hardware driver in
+// `arch::uefi::mouse` owns the 8042 + IRQ 12 wiring and calls in. Split
+// out (like `unified_repl_regions`) so the logic runs under the hosted
+// `cargo test` target — `arch::uefi` is gated on `target_os = "uefi"`.
+pub mod ps2_mouse;
 // Cell-driven ThemePref extraction (Task U3a). Pure functions over
 // `&Object` that seed and read `ThemePref_has_Mode` cells and expose
 // a `Send`-safe `PENDING_THEME_MODE` `AtomicU8` staging slot for the
