@@ -52,6 +52,7 @@
 // unknown syscall is logged rather than silently failing — but for
 // tier-1 the negative return is enough.
 
+use crate::syscall::accept;
 use crate::syscall::arch_prctl;
 use crate::syscall::bind;
 use crate::syscall::brk;
@@ -327,6 +328,15 @@ pub const SYS_SOCKET: u64 = 41;
 /// handshake returns `-EINPROGRESS`. Per #531.
 pub const SYS_CONNECT: u64 = 42;
 
+/// Linux x86_64 syscall number for
+/// `accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)`.
+/// Source: `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_accept`
+/// (= 43). The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:__NR_accept`. Routes to
+/// `accept::handle`, which pulls the next completed inbound connection
+/// off a listening socket and returns a new fd for it. Per #530.
+pub const SYS_ACCEPT: u64 = 43;
+
 /// Linux x86_64 syscall number for `sendto(int sockfd, const void *buf,
 /// size_t len, int flags, const struct sockaddr *dest_addr, socklen_t
 /// addrlen)`. Source:
@@ -531,6 +541,16 @@ pub fn dispatch(
             // -EINPROGRESS; other outcomes -EBADF / -EFAULT / -EINVAL /
             // -ENOTSOCK / -EAFNOSUPPORT / -EISCONN / -ENOSYS. Per #531.
             connect::handle(rdi as i32, rsi, rdx)
+        }
+        SYS_ACCEPT => {
+            // accept(sockfd, addr, addrlen) — pull the next completed
+            // connection off a listening socket. rdi = sockfd (i32), rsi
+            // = addr pointer (struct sockaddr *, may be NULL), rdx =
+            // addrlen pointer (socklen_t *). Returns the new connected fd
+            // (≥ 3) or -EAGAIN (nothing pending) / -EBADF / -EINVAL (not
+            // listening) / -ENOTSOCK / -EOPNOTSUPP (UDP) / -EMFILE /
+            // -ENOSYS. Per #530.
+            accept::handle(rdi as i32, rsi, rdx)
         }
         SYS_SENDTO => {
             // sendto(sockfd, buf, len, flags, dest_addr, addrlen) — send
@@ -803,6 +823,20 @@ mod tests {
     fn dispatch_connect_null_addr_returns_efault() {
         let result = dispatch(SYS_CONNECT, 3, 0, 16, 0, 0, 0);
         assert_eq!(result, -14);
+    }
+
+    /// `SYS_ACCEPT` is 43 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_accept`.
+    /// (Dispatch *routing* for accept is covered by the
+    /// `syscall::accept` handler tests, which take the
+    /// `CURRENT_PROCESS_TEST_LOCK` — a bare `dispatch(SYS_ACCEPT, ...)`
+    /// here would observe a sibling test's installed process and flake,
+    /// since accept resolves the fd before any process-independent
+    /// check, the same reason the signal-syscall routing tests live in
+    /// their handler modules.)
+    #[test]
+    fn sys_accept_number_matches_linux_uapi() {
+        assert_eq!(SYS_ACCEPT, 43);
     }
 
     /// `SYS_SENDTO` is 44 — matches

@@ -264,6 +264,8 @@ pub(crate) fn socket_error_to_errno(err: net::SocketError, op: SocketOp) -> i64 
         NotConnected => -ENOTCONN,
         WouldBlock => -EAGAIN,
         ConnectInProgress => -EINPROGRESS,
+        // `accept` on a socket that isn't listening → invalid argument.
+        NotListening => -EINVAL,
         // State / address mismatches: the errno depends on the operation.
         InvalidState => match op {
             // `connect` on an already-open socket → already connected.
@@ -276,8 +278,11 @@ pub(crate) fn socket_error_to_errno(err: net::SocketError, op: SocketOp) -> i64 
             // send/recv never surface raw `InvalidState` (the wrappers
             // map smoltcp's send/recv `InvalidState` to `NotConnected`),
             // but keep the match total: a state mismatch on a data op is
-            // "not connected".
+            // "not connected". `accept` surfaces its own `NotListening`
+            // rather than `InvalidState`, but map it to invalid-argument
+            // for totality.
             SocketOp::Send | SocketOp::Recv => -ENOTCONN,
+            SocketOp::Accept => -EINVAL,
         },
         Unaddressable => match op {
             // A zero / 0.0.0.0 connect target is an invalid argument in
@@ -285,10 +290,10 @@ pub(crate) fn socket_error_to_errno(err: net::SocketError, op: SocketOp) -> i64 
             SocketOp::Connect => -EINVAL,
             // A zero local port for bind/listen → invalid argument.
             SocketOp::Bind | SocketOp::Listen => -EINVAL,
-            // send/recv don't carry an address (the null-addr form), so
-            // `Unaddressable` can't arise; map to invalid argument for
+            // send/recv/accept don't carry an address that smoltcp would
+            // reject as `Unaddressable`; map to invalid argument for
             // totality.
-            SocketOp::Send | SocketOp::Recv => -EINVAL,
+            SocketOp::Send | SocketOp::Recv | SocketOp::Accept => -EINVAL,
         },
     }
 }
@@ -303,6 +308,7 @@ pub(crate) enum SocketOp {
     Connect,
     Send,
     Recv,
+    Accept,
 }
 
 #[cfg(test)]

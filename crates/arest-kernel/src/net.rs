@@ -1079,10 +1079,15 @@ pub enum SocketError {
     /// `-ENOTCONN`.
     NotConnected,
     /// A non-blocking operation can't complete right now without
-    /// blocking: a `send` whose tx ring is full, or a `recv` with no
-    /// bytes pending on a still-open connection. Maps to `-EAGAIN`
+    /// blocking: a `send` whose tx ring is full, a `recv` with no
+    /// bytes pending on a still-open connection, or an `accept` with no
+    /// completed inbound connection waiting. Maps to `-EAGAIN`
     /// (`EWOULDBLOCK`). The caller retries on a later `net::poll()`.
     WouldBlock,
+    /// `accept` was issued on a socket that isn't listening (never
+    /// `listen`-ed, or already torn down) (#530). Maps to `-EINVAL` —
+    /// Linux returns `EINVAL` for `accept` on a non-listening socket.
+    NotListening,
 }
 
 /// Create a TCP socket on the kernel's network interface and return the
@@ -1518,6 +1523,114 @@ pub fn tcp_recv(id: SocketId, data: &mut [u8]) -> Result<usize, SocketError> {
         // Receive half not open — never connected.
         Err(tcp::RecvError::InvalidState) => Err(SocketError::NotConnected),
     }
+}
+
+/// `accept(2)` for a TCP listening socket (#530). If a peer has completed
+/// the handshake on the listening socket `id`, "accept" it: the now-
+/// connected smoltcp socket becomes the accepted connection (a fresh
+/// kernel `SocketId` is minted for it), and a NEW smoltcp listen socket
+/// is armed on the same local port so `id` keeps accepting. Returns the
+/// accepted `(SocketId, peer SockAddrIn)`.
+///
+/// Why the socket swap
+/// -------------------
+/// smoltcp has no separate accept queue — a `tcp::Socket` in `Listen`
+/// *becomes* the connection when a SYN arrives (it leaves `Listen` for
+/// `SynReceived`/`Established`). So to model POSIX accept (which returns a
+/// NEW fd and leaves the listener listening), we hand the established
+/// smoltcp handle to a freshly-minted accepted id, then add a brand-new
+/// smoltcp socket, re-`listen` it on the same port, and re-point the
+/// listening id at it. The same "re-listen a socket on its port" move the
+/// kernel's HTTP listener (`drive_http`) makes when its connection
+/// closes — here generalised to keep the original listening fd valid.
+///
+/// Returns:
+///   * `Ok((accepted_id, peer))` — a connection was accepted; `peer` is
+///     its remote endpoint as a host-order [`SockAddrIn`].
+///   * `Err(WouldBlock)` — the socket is listening but no connection has
+///     completed yet. Handler → `-EAGAIN` (tier-1 is non-blocking).
+///   * `Err(NotListening)` — `id` isn't in a listening state (never
+///     `listen`-ed). Handler → `-EINVAL`.
+///   * `Err(NotInitialised)` / `Err(UnknownSocket)` — as the others.
+///
+/// NOTE the happy path (an actually-established inbound connection) is
+/// the gated live-smoltcp path — it requires a real peer + `poll()`
+/// cycles to drive the handshake, so it is exercised in production, not
+/// by the host unit tests (which cover the `WouldBlock` / `NotListening`
+/// / errno surface, per the #478a host-testable-split methodology).
+pub fn tcp_accept(id: SocketId) -> Result<(SocketId, crate::net_socket::SockAddrIn), SocketError> {
+    const RX_BYTES: usize = 4096;
+    const TX_BYTES: usize = 4096;
+
+    let mut guard = NET.lock();
+    let state = guard.as_mut().ok_or(SocketError::NotInitialised)?;
+    let listen_handle = resolve_tcp_handle(state, id)?;
+
+    // Inspect the listening socket's state + peer.
+    let (is_listening, is_active, remote) = {
+        let socket = state.sockets.get::<tcp::Socket>(listen_handle);
+        (socket.is_listening(), socket.is_active(), socket.remote_endpoint())
+    };
+
+    // Still passively listening with no peer yet → nothing to accept.
+    if is_listening {
+        return Err(SocketError::WouldBlock);
+    }
+    // Not listening AND not an active (accepted) connection → the socket
+    // was never put into LISTEN. accept on a non-listening socket is
+    // -EINVAL.
+    if !is_active {
+        return Err(SocketError::NotListening);
+    }
+    // An active connection with no known remote shouldn't happen for an
+    // accepted socket, but guard rather than unwrap: treat as "not ready".
+    let Some(remote) = remote else {
+        return Err(SocketError::WouldBlock);
+    };
+
+    // The local port to re-listen on: from the listening socket's bound
+    // endpoint (recorded by `bind`). If somehow absent, fall back to the
+    // socket's own local endpoint port.
+    let port = state
+        .socket_bindings
+        .get(&id.as_u64())
+        .map(|b| b.port)
+        .filter(|p| *p != 0)
+        .or_else(|| {
+            state
+                .sockets
+                .get::<tcp::Socket>(listen_handle)
+                .local_endpoint()
+                .map(|ep| ep.port)
+        })
+        .unwrap_or(0);
+
+    // Mint a fresh listen socket and arm it on the same port so the
+    // listening fd keeps accepting. If re-listen fails (port 0 — should
+    // not happen for a socket that was listening), we still hand off the
+    // accepted connection but leave the listener un-rearmed; the next
+    // accept would then see a non-listening socket. Best-effort re-arm.
+    let new_listen = {
+        let rx_buffer = tcp::SocketBuffer::new(vec![0u8; RX_BYTES]);
+        let tx_buffer = tcp::SocketBuffer::new(vec![0u8; TX_BYTES]);
+        let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
+        if port != 0 {
+            let _ = socket.listen(port);
+        }
+        state.sockets.add(socket)
+    };
+
+    // Re-point the listening id at the fresh listen socket; the original
+    // (now-established) handle is handed to the accepted id.
+    state.socket_registry.insert(id.as_u64(), new_listen);
+
+    // Mint the accepted connection's id, pointing at the established
+    // handle, kind TCP.
+    let accepted_id = state.socket_ids.allocate();
+    state.socket_registry.insert(accepted_id.as_u64(), listen_handle);
+    state.socket_kinds.insert(accepted_id.as_u64(), SocketKind::Tcp);
+
+    Ok((accepted_id, ip_endpoint_to_sockaddr(remote)))
 }
 
 // ── UDP socket operations (#533 — SOCK_DGRAM sendto/recvfrom) ───────

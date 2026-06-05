@@ -55,6 +55,7 @@
 
 #![allow(dead_code)]
 
+pub mod accept;
 pub mod arch_prctl;
 pub mod bind;
 pub mod brk;
