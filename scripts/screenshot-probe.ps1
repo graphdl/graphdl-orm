@@ -77,6 +77,11 @@ try {
     }
     if (-not $ready) { Write-Host "WARN: HTTP beacon not seen in 150s; attempting curl anyway." -ForegroundColor Yellow }
 
+    # Let the launcher paint a few frames before snapshotting -- a UI
+    # profile renders over the first seconds of its super-loop, so an
+    # immediate /screen can catch a pre-paint (black) frame.
+    Start-Sleep -Seconds 8
+
     New-Item -ItemType Directory -Force -Path (Split-Path $outAbs -Parent) | Out-Null
     $curlOk = $false
     $deadlineC = (Get-Date).AddSeconds(60)

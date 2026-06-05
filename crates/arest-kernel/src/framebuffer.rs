@@ -558,6 +558,46 @@ pub fn presents() -> u64 {
     FB.lock().as_ref().map(|d| d.presents).unwrap_or(0)
 }
 
+/// The firmware GOP framebuffer (raw MMIO ptr + its surface info),
+/// captured at boot independent of the `FB` Driver singleton. The Slint
+/// launcher renders straight into this surface via its own `*mut u8`
+/// view -- entry_uefi hands `launcher::run` the original GOP ptr, while
+/// `FB` may have switched its front to a secondary virtio-gpu DMA
+/// surface -- and QEMU's SDL primary display is this GOP, so it's what
+/// `/screen` must read to capture the live UI.
+static GOP_SCREEN: Mutex<Option<(usize, FrameBufferInfo)>> = Mutex::new(None);
+
+/// Record the GOP MMIO base + its surface info for `/screen` snapshots.
+/// Called once at boot with the same `gop_ptr` handed to `launcher::run`,
+/// so a snapshot reads exactly the surface the launcher paints.
+pub fn set_gop_screen(ptr: usize, info: FrameBufferInfo) {
+    *GOP_SCREEN.lock() = Some((ptr, info));
+}
+
+/// Snapshot the live GOP screen as tightly-packed RGB8 (`width*height*3`)
+/// for the `/screen` see-and-drive endpoint -- the launcher's actual
+/// render target, decoded per its pixel format. `None` until
+/// `set_gop_screen` has run (no GOP at boot, or on the host test build).
+pub fn snapshot_gop_rgb() -> Option<(Vec<u8>, usize, usize)> {
+    let snap = *GOP_SCREEN.lock();
+    let (ptr, info) = snap?;
+    if ptr == 0 {
+        return None;
+    }
+    // SAFETY: `ptr` + `info.byte_len` describe the firmware-mapped GOP
+    // MMIO captured at boot (lives 'static, single-threaded). Read-only.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, info.byte_len) };
+    let rgb = crate::screenshot::framebuffer_to_rgb(
+        bytes,
+        info.width,
+        info.height,
+        info.stride,
+        info.bytes_per_pixel,
+        info.pixel_format,
+    );
+    Some((rgb, info.width, info.height))
+}
+
 // ── Cursor sprite (#596) ─────────────────────────────────────────────
 //
 // The cursor-sprite painter lives here (rather than in

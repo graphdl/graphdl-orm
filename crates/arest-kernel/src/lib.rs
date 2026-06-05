@@ -328,21 +328,7 @@ pub fn arest_http_handler(req: &http::Request) -> http::Response {
     // drops. Sits right after the asset tier so it isn't mistaken for a
     // HATEOAS slug by the generic fallback below.
     if req.method == "GET" && (req.path == "/screen" || req.path.starts_with("/screen?")) {
-        let snap = framebuffer::with_back(|b| {
-            let info = b.info();
-            (
-                screenshot::framebuffer_to_rgb(
-                    &b.bytes,
-                    info.width,
-                    info.height,
-                    info.stride,
-                    info.bytes_per_pixel,
-                    info.pixel_format,
-                ),
-                info.width,
-                info.height,
-            )
-        });
+        let snap = framebuffer::snapshot_gop_rgb();
         if let Some((rgb, w, h)) = snap {
             let png = screenshot::encode_png_rgb(&rgb, w, h);
             if !png.is_empty() {

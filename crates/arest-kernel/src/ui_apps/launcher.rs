@@ -877,8 +877,16 @@ pub fn run(
         // initGame, since the panic reproduces just after the doom
         // initGame banner lands). Skipping net::poll keeps the launcher
         // alive and visible — HTTP/DHCP unavailable while the launcher
-        // is the active path; the launcher is the user-visible win.
-        // crate::net::poll();
+        // is the active path. That corruption is tracked by
+        // `virtio-net-touchmode-corruption` and is tied to Doom's WASM
+        // heap churn, so net::poll is re-enabled for every profile that
+        // does NOT build doom -- the launcher then gets a live HTTP/DHCP
+        // surface alongside the UI, so the /screen + /input see-and-drive
+        // endpoints (task kernel-see-drive-surface) work while the
+        // launcher is the active path. Doom builds keep it skipped until
+        // #595 is root-caused.
+        #[cfg(not(feature = "doom"))]
+        crate::net::poll();
 
         // 4. Repaint. `draw_if_needed` is a no-op when the active
         //    window's Slint state hasn't changed (Slint tracks dirty

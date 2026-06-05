@@ -842,6 +842,14 @@ fn kernel_run_uefi(
             // a reference into that MMIO region at this point.
             unsafe { crate::framebuffer::install(info, gop_ptr as *mut u8, gop_size) };
 
+            // Record the GOP MMIO base + info for /screen snapshots (task
+            // kernel-see-drive-surface): this is the surface the Slint
+            // launcher paints via its own view (launcher::run is handed
+            // this same gop_ptr) and QEMU's SDL primary display, so
+            // /screen reads it even after FB switches its front to the
+            // secondary virtio-gpu surface below.
+            crate::framebuffer::set_gop_screen(gop_ptr, info);
+
             // Triple-buffer paint smoke — mirrors kernel_run's #269
             // paint smoke (main.rs line ~299), including the second
             // present that rotates to the other back buffer. The
