@@ -171,6 +171,7 @@ pub mod linuxkpi_virtio_tablet;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64", feature = "slint"))]
 pub mod ui_apps;
 pub mod framebuffer;
+pub mod screenshot;
 pub mod composer;
 pub mod component_binding;
 pub mod toolkit_loop;
@@ -316,6 +317,38 @@ pub fn arest_http_handler(req: &http::Request) -> http::Response {
             asset.cache_control,
             asset.body,
         );
+    }
+
+    // GET /screen -- headless see-and-drive debug surface (task
+    // kernel-see-drive-surface). Returns the live back buffer as a PNG
+    // the agent can Read, closing the loop that previously needed a
+    // human watching a QEMU boot. The snapshot + dims are copied out
+    // under the framebuffer lock; the PNG is encoded after the lock
+    // drops. Sits right after the asset tier so it isn't mistaken for a
+    // HATEOAS slug by the generic fallback below.
+    if req.method == "GET" && (req.path == "/screen" || req.path.starts_with("/screen?")) {
+        let snap = framebuffer::with_back(|b| {
+            let info = b.info();
+            (
+                screenshot::framebuffer_to_rgb(
+                    &b.bytes,
+                    info.width,
+                    info.height,
+                    info.stride,
+                    info.bytes_per_pixel,
+                    info.pixel_format,
+                ),
+                info.width,
+                info.height,
+            )
+        });
+        if let Some((rgb, w, h)) = snap {
+            let png = screenshot::encode_png_rgb(&rgb, w, h);
+            if !png.is_empty() {
+                return http::Response::ok("image/png", png);
+            }
+        }
+        return http::Response::not_found();
     }
 
     // /arest/parse — registry stats (#611/#612). Mirror of the

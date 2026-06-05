@@ -608,6 +608,13 @@ cc = "1.0"
 # if we drop the hand-rolled writer) has an obvious home.
 [target.'cfg(all(target_os = "uefi", target_arch = "aarch64"))'.dependencies]
 
+[dev-dependencies]
+# Host-only PNG decoder (task kernel-see-drive-surface) used to round-
+# trip-verify the no_std `crate::screenshot` encoder under `cargo test`.
+# A dev-dependency is never linked into the .efi -- only the host test
+# build pulls it (the same png 0.17 the slint-probe scratch crate used).
+png = "0.17"
+
 [profile.dev]
 panic = "abort"
 
