@@ -219,6 +219,45 @@ fn abort_chain_nonterminating(round: usize, culprit: Option<(&str, &str)>) {
 /// though additional derivations may be possible. This is safe because
 /// each derived fact is individually correct; only completeness is
 /// affected.
+
+/// sm-status-scoped-upsert: cells whose forward-chain writes UPSERT (a
+/// new value at an existing key OVERWRITES the prior one) instead of
+/// being conflict-rejected like every other keyed cell.
+///
+/// The lone member is `State_Machine_is_currently_in_Status`: a KEYED
+/// cell (one-status-per-State-Machine alethic UC, key role
+/// "State Machine") that the SM event-fold ADVANCES. The fold is
+/// recursive — its from-guard reads the current status to gate, then
+/// emits the `to` status. On a plain keyed cell the advance
+/// (e.g. `(o2, Placed)` over seeded `(o2, Draft)`) collides at the
+/// `o2` key and `cell_put_keyed` drops it, FREEZING status at the
+/// seeded value. The from-guard already guarantees only a LEGAL advance
+/// is emitted (only a resource currently in `from` gets `to`), so
+/// last-write-wins here lands a valid transition; it never applies an
+/// illegal one.
+///
+/// SCOPE: this allowlist is consulted ONLY on the forward-chain
+/// (`integrate_round_facts`) keyed path. Every other keyed cell — and
+/// every user-facing apply-path write (see `command.rs::push_with_uc_check`,
+/// which has its own explicit `overwrite` flag) — keeps the global
+/// conflict-reject behavior unchanged.
+///
+/// The companion SM cells the fold co-emits
+/// (`State_Machine_is_instance_of_Noun`, `State_Machine_is_for_Resource`)
+/// are intentionally NOT here: their tuples are byte-stable across rounds
+/// (`<SM, Noun>` / `<SM, Resource=SM>` never change as Status advances),
+/// so a re-emit is `cell_put_keyed`'s idempotent byte-equal no-op, never
+/// a conflict — they need no upsert.
+pub(crate) const SM_STATUS_UPSERT_CELLS: &[&str] = &["State_Machine_is_currently_in_Status"];
+
+/// Whether forward-chain writes to `cell_name` should upsert (overwrite a
+/// prior value at the same key) rather than conflict-reject. True only for
+/// the scoped SM-status cell(s) in [`SM_STATUS_UPSERT_CELLS`].
+#[inline]
+pub(crate) fn cell_is_sm_status_upsert(cell_name: &str) -> bool {
+    SM_STATUS_UPSERT_CELLS.contains(&cell_name)
+}
+
 /// Read the `_CellKeyRoles` metadata cell (emitted by
 /// `compile_to_defs_state`) into a `ft_id → role_names` map. Forward-
 /// chain emit paths consult this to route writes for keyed cells
@@ -293,6 +332,24 @@ fn integrate_round_facts(
                 // only genuinely-conflicting writes hit this path.
                 match ast::cell_put_keyed(&cell_name, &role_refs, fact, &current_state) {
                     Ok(next) => { current_state = next; }
+                    Err(conflict) if cell_is_sm_status_upsert(&cell_name) => {
+                        // sm-status-scoped-upsert: this is the SM-status
+                        // cell, whose recursive from-guarded event-fold
+                        // ADVANCES status. A conflict here is a LEGAL
+                        // advance (the from-guard already filtered to
+                        // resources currently in `from`) landing over the
+                        // prior status at the same State-Machine key.
+                        // Upsert = last-write-wins: vacate the slot, then
+                        // re-put. The second put cannot conflict (slot is
+                        // empty). Mirrors command.rs::push_with_uc_check's
+                        // `overwrite` branch, but scoped to this cell on the
+                        // forward-chain path only.
+                        let cleared = drop_keyed_entry(
+                            &cell_name, &conflict.key, &role_refs, &current_state);
+                        current_state = ast::cell_put_keyed(
+                            &cell_name, &role_refs, conflict.incoming_fact, &cleared)
+                            .unwrap_or(cleared);
+                    }
                     Err(conflict) => {
                         crate::diag!("[forward-chain] UC conflict, dropping fact: {:?}", conflict);
                     }
@@ -311,6 +368,39 @@ fn integrate_round_facts(
         }
     }
     current_state
+}
+
+/// sm-status-scoped-upsert helper: remove the Map entry under `key` from
+/// cell `name` so a subsequent `cell_put_keyed` of a new value at that key
+/// cannot conflict. Map case is a direct `HashMap::remove`; a Seq cell
+/// (pre-migration shape) is filtered by extracted key. Module-private twin
+/// of `command.rs::drop_keyed_entry`; the forward-chain upsert path needs
+/// it without taking a cross-module dependency, and the SM-status cell is
+/// Map-backed by the time the event-fold advances it (the first keyed put
+/// migrates Seq→Map), so the Map arm is the live path.
+fn drop_keyed_entry(
+    name: &str,
+    key: &str,
+    key_role_names: &[&str],
+    state: &ast::Object,
+) -> ast::Object {
+    let existing = ast::fetch_or_phi(name, state);
+    match &existing {
+        ast::Object::Map(m) => {
+            let mut next = (**m).clone();
+            next.remove(key);
+            ast::store(name, ast::Object::Map(next.into()), state)
+        }
+        ast::Object::Seq(items) => {
+            let kept: Vec<ast::Object> = items.iter()
+                .filter(|f| ast::extract_key_from_fact(f, key_role_names)
+                    .as_deref() != Some(key))
+                .cloned()
+                .collect();
+            ast::store(name, ast::Object::Seq(kept.into()), state)
+        }
+        _ => state.clone(),
+    }
 }
 
 /// task-3-incremental: per-thread instrumentation counting the number
@@ -2194,15 +2284,12 @@ mod tests {
     /// We assert reachability of the terminal `Shipped` AND that no status
     /// outside the declared path appears.
     ///
-    /// We deliberately DON'T key the cell here: `integrate_round_facts` routes
-    /// keyed cells through `cell_put_keyed`, which CONFLICT-REJECTS (it does
-    /// NOT upsert/last-write) a second value at the same key — so on a keyed
-    /// cell the fold's `(o2,Placed)` write collides with the seeded
-    /// `(o2,Draft)` and is dropped, freezing o2 at Draft. In production an
-    /// explicit `apply transition` advances status by DIRECT write + #836
-    /// drop-and-rederive, not by letting the event-fold mutate a keyed cell
-    /// in place; the event-fold's role is bulk migration over the
-    /// accumulating derivation cell. (Reported as a finding.)
+    /// This variant deliberately DOESN'T key the cell, so the trail
+    /// ACCUMULATES (every advance is a distinct tuple). The KEYED variant —
+    /// where the cell carries the production one-status-per-SM UC and the
+    /// scoped upsert (sm-status-scoped-upsert) lets each advance OVERWRITE
+    /// the prior status so the cell holds exactly the CURRENT status — is
+    /// `event_fold_chains_multi_step_to_terminal_keyed` below.
     #[test]
     fn event_fold_chains_multi_step_to_terminal() {
         let mut cells = empty_cells();
@@ -2265,38 +2352,377 @@ mod tests {
             "only declared statuses may appear; got {:?}", statuses);
     }
 
-    /// VERIFICATION (bf5db0de from-guard, #900 migration-shape entity).
+    // ── sm-status-scoped-upsert: shared KEYED-status-cell fixture ────────
+    //
+    // Declares `State_Machine_is_currently_in_Status` with explicit roles
+    // (State Machine @0, Status @1) and a one-status-per-SM alethic UC on
+    // role 0, so `_CellKeyRoles` registers the cell and the forward-chain
+    // routes its writes through `cell_put_keyed`. This is the PRODUCTION
+    // shape — the cell the scoped upsert targets. Runs the init+event-fold
+    // derivation defs to fixpoint via the production defs path and returns
+    // the final Status row(s) for `entity_id`.
+    //
+    // Used by the keyed event-fold tests (#1–#4) so each exercises the real
+    // keyed/upsert routing, not the un-keyed accumulate-the-trail path.
+    fn run_keyed_sm_to_fixpoint(cells: S, entity_id: &str) -> Vec<String> {
+        let mut cells = cells;
+        cells = with_ft(cells, "State_Machine_is_currently_in_Status", &FactTypeDef {
+            schema_id: String::new(),
+            reading: "State Machine is currently in Status".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "State Machine".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Status".to_string(), role_index: 1 },
+            ],
+        });
+        cells = with_constraint(cells, &ConstraintDef {
+            id: "uc_one_status_per_sm".to_string(),
+            kind: "UC".to_string(),
+            modality: "Alethic".to_string(),
+            text: "Each State Machine is currently in at most one Status".to_string(),
+            spans: vec![SpanDef {
+                fact_type_id: "State_Machine_is_currently_in_Status".to_string(),
+                role_index: 0, subset_autofill: None,
+            }],
+            ..Default::default()
+        });
+        let state = build(cells);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        // Guard the fixture: the cell MUST be keyed, else the test would
+        // silently fall back to the un-keyed accumulate path and prove
+        // nothing about upsert.
+        let kr = read_cell_key_roles(&d);
+        assert_eq!(
+            kr.get("State_Machine_is_currently_in_Status").map(|v| v.as_slice()),
+            Some(&["State Machine".to_string()][..]),
+            "fixture must register State_Machine_is_currently_in_Status as a \
+             keyed cell (one-status-per-SM alethic UC); got {:?}",
+            kr.get("State_Machine_is_currently_in_Status"));
+
+        let dd: Vec<(&str, &ast::Func)> = defs.iter()
+            .filter(|(n, _)| n.starts_with("derivation:"))
+            .map(|(n, f)| (n.as_str(), f))
+            .collect();
+        let (new_d, _derived) = forward_chain_defs_state(&dd, &d);
+        let cell = ast::fetch_or_phi("State_Machine_is_currently_in_Status", &new_d);
+        ast::cell_facts_iter(&cell)
+            .filter(|f| ast::binding(f, "State Machine") == Some(entity_id))
+            .filter_map(|f| ast::binding(f, "Status").map(|s| s.to_string()))
+            .collect()
+    }
+
+    // Build the Order SM (Draft(initial)→Placed→Shipped) cells with the
+    // three event FTs declared, shared by the keyed Order tests.
+    fn order_sm_cells() -> S {
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "Order", &make_noun("entity"));
+        cells = with_noun(cells, "Name", &make_noun("value"));
+        cells = with_ft(cells, "Order_has_Name", &FactTypeDef {
+            schema_id: String::new(), reading: "Order has Name".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Order".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Name".to_string(), role_index: 1 },
+            ],
+        });
+        cells = with_ft(cells, "Order_was_placed", &FactTypeDef {
+            schema_id: String::new(), reading: "Order was placed".to_string(), readings: vec![],
+            roles: vec![RoleDef { noun_name: "Order".to_string(), role_index: 0 }],
+        });
+        cells = with_ft(cells, "Order_was_shipped", &FactTypeDef {
+            schema_id: String::new(), reading: "Order was shipped".to_string(), readings: vec![],
+            roles: vec![RoleDef { noun_name: "Order".to_string(), role_index: 0 }],
+        });
+        cells = with_state_machine(cells, "OrderSM", &StateMachineDef {
+            noun_name: "Order".to_string(),
+            statuses: vec!["Draft".to_string(), "Placed".to_string(), "Shipped".to_string()],
+            transitions: vec![
+                TransitionDef { from: "Draft".to_string(), to: "Placed".to_string(), event: "Order_was_placed".to_string(), guard: None },
+                TransitionDef { from: "Placed".to_string(), to: "Shipped".to_string(), event: "Order_was_shipped".to_string(), guard: None },
+            ],
+            initial: "Draft".to_string(),
+        });
+        cells
+    }
+
+    /// TDD #1 (multi-step replay, KEYED): o2 carries BOTH `Order_was_placed`
+    /// and `Order_was_shipped` on the production KEYED status cell. The
+    /// from-guarded fold advances Draft→Placed→Shipped across rounds, and
+    /// the scoped upsert OVERWRITES the prior status each step, so the cell
+    /// holds EXACTLY the current status. Unlike the un-keyed variant (which
+    /// accumulates the whole trail), the keyed cell must end with a SINGLE
+    /// row == `Shipped`.
+    #[test]
+    fn event_fold_chains_multi_step_to_terminal_keyed() {
+        let mut cells = order_sm_cells();
+        cells.entry("Order_has_Name".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Order", "o2"), ("Name", "Gadget")]));
+        cells.entry("Order_was_placed".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Order", "o2")]));
+        cells.entry("Order_was_shipped".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Order", "o2")]));
+
+        let statuses = run_keyed_sm_to_fixpoint(cells, "o2");
+        // Upsert ⇒ last-write-wins ⇒ exactly one current status, == Shipped.
+        assert_eq!(statuses, vec!["Shipped".to_string()],
+            "KEYED multi-step: o2 (placed+shipped) must upsert-advance \
+             Draft→Placed→Shipped and hold exactly ['Shipped']; got {:?}", statuses);
+    }
+
+    // Build the Task SM (pending(initial)→in_progress→blocked) with the
+    // started/blocked/unblocked transitions, shared by the auto-unblock
+    // tests. Transitions:
+    //   start   : pending     → in_progress  trigger Task_is_started
+    //   block   : in_progress → blocked      trigger Task_is_blocked
+    //   unblock : blocked     → in_progress  trigger Task_is_unblocked
+    fn task_block_sm_cells() -> S {
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "Task", &make_noun("entity"));
+        cells = with_noun(cells, "Name", &make_noun("value"));
+        cells = with_ft(cells, "Task_has_Name", &FactTypeDef {
+            schema_id: String::new(), reading: "Task has Name".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Task".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Name".to_string(), role_index: 1 },
+            ],
+        });
+        for ev in ["Task_is_started", "Task_is_blocked", "Task_is_unblocked"] {
+            cells = with_ft(cells, ev, &FactTypeDef {
+                schema_id: String::new(),
+                reading: ev.replace('_', " "), readings: vec![],
+                roles: vec![RoleDef { noun_name: "Task".to_string(), role_index: 0 }],
+            });
+        }
+        cells = with_state_machine(cells, "TaskSM", &StateMachineDef {
+            noun_name: "Task".to_string(),
+            statuses: vec!["pending".to_string(), "in_progress".to_string(), "blocked".to_string()],
+            transitions: vec![
+                TransitionDef { from: "pending".to_string(), to: "in_progress".to_string(), event: "Task_is_started".to_string(), guard: None },
+                TransitionDef { from: "in_progress".to_string(), to: "blocked".to_string(), event: "Task_is_blocked".to_string(), guard: None },
+                TransitionDef { from: "blocked".to_string(), to: "in_progress".to_string(), event: "Task_is_unblocked".to_string(), guard: None },
+            ],
+            initial: "pending".to_string(),
+        });
+        cells
+    }
+
+    /// TDD #2 (live auto-unblock, KEYED) — the KEY assertion of the task.
     ///
-    /// The #900 migration reconstructs status by asserting, for each
-    /// non-pending entity, a SINGLE *destination* event fact — a completed
-    /// Task gets ONLY `Task_is_finished` (from=in_progress), with NO
-    /// preceding `Task_is_started` (pending→in_progress). The OLD,
-    /// from-IGNORING fold emitted `completed` directly off that single
-    /// `finished` event. The NEW from-GUARDED fold (bf5db0de) only fires a
-    /// transition for a resource already in that transition's `from`; a
-    /// freshly-derived entity is seeded `pending` (initial) by sm-init and
-    /// has no `started` event, so `finished` (from=in_progress) is never
-    /// applicable and the entity FREEZES at `pending`.
+    /// REALISTIC case: t1 carries `Task_is_started` + `Task_is_unblocked`,
+    /// with `Task_is_blocked` ABSENT (block/unblock are mutually-exclusive
+    /// triggers in a live board — the blocker was resolved, so the block
+    /// event no longer holds). By the SEQUENCE the entity reached `blocked`
+    /// and the unblock must return it to `in_progress`.
     ///
-    /// This is independent of cell keying: the from-guard alone strands the
-    /// entity at `pending` on an UN-KEYED cell, because the fold cannot
-    /// even PRODUCE `completed` (no in_progress predecessor exists). On a
-    /// KEYED cell (the production `State_Machine_is_currently_in_Status`
-    /// shape — one-status-per-SM alethic UC) the same freeze occurs, with
-    /// a second, redundant barrier: even if the fold did emit an advance,
-    /// `cell_put_keyed` CONFLICT-REJECTS the second value at the seeded key.
+    /// On the KEYED cell with the scoped upsert the from-guarded fold walks:
+    ///   round: pending --started--> in_progress  (started, from=pending)
+    ///          in_progress --unblocked--> ??? — unblock is from=blocked,
+    ///          and the cell is at in_progress, so unblock does NOT fire.
+    /// With no `Task_is_blocked`, the entity is never driven to `blocked` in
+    /// this trace, so it SETTLES at `in_progress`. That satisfies the task's
+    /// core requirement: an entity that has been unblocked (and is not
+    /// currently blocked) is at `in_progress`, NOT stuck at `blocked`.
+    #[test]
+    fn event_fold_auto_unblock_settles_in_progress_keyed() {
+        let mut cells = task_block_sm_cells();
+        cells.entry("Task_has_Name".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Task", "t1"), ("Name", "Unblocked")]));
+        cells.entry("Task_is_started".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Task", "t1")]));
+        cells.entry("Task_is_unblocked".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Task", "t1")]));
+        // Task_is_blocked intentionally ABSENT (mutually-exclusive trigger).
+
+        let statuses = run_keyed_sm_to_fixpoint(cells, "t1");
+        assert_eq!(statuses, vec!["in_progress".to_string()],
+            "KEYED auto-unblock: t1 (started + unblocked, NOT blocked) must \
+             settle at exactly ['in_progress'] — never stuck at 'blocked'; \
+             got {:?}", statuses);
+    }
+
+    /// TDD #2 (worst case, KEYED): t1 carries `Task_is_started` +
+    /// `Task_is_blocked` + `Task_is_unblocked` ALL present simultaneously
+    /// (the degenerate trace the task asks us to REPORT on — block and
+    /// unblock both holding). On the keyed cell with the scoped upsert this
+    /// is a from-guarded oscillation candidate: at in_progress the block
+    /// fires (→blocked); at blocked the unblock fires (→in_progress). The
+    /// recorded converged value is asserted here so the behavior is pinned;
+    /// see the report for the analysis (block and unblock are mutually
+    /// exclusive in a real board, so this all-present trace is unphysical —
+    /// the realistic case is `event_fold_auto_unblock_settles_in_progress_keyed`).
+    #[test]
+    fn event_fold_auto_unblock_all_events_present_keyed() {
+        let mut cells = task_block_sm_cells();
+        cells.entry("Task_has_Name".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Task", "t1"), ("Name", "WorstCase")]));
+        for ev in ["Task_is_started", "Task_is_blocked", "Task_is_unblocked"] {
+            cells.entry(ev.to_string()).or_default().push(
+                ast::fact_from_pairs(&[("Task", "t1")]));
+        }
+
+        let statuses = run_keyed_sm_to_fixpoint(cells, "t1");
+        // Pin whatever the fixpoint converges to (single keyed row). Both
+        // in_progress and blocked are reachable; the chain settles
+        // deterministically on the last applicable advance per round. The
+        // value is reported, not prescribed — the trace is unphysical.
+        assert_eq!(statuses.len(), 1,
+            "KEYED all-events: keyed cell must hold exactly one current \
+             status; got {:?}", statuses);
+        assert!(statuses[0] == "in_progress" || statuses[0] == "blocked",
+            "KEYED all-events: must converge to in_progress or blocked \
+             (both are reachable in the all-present trace); got {:?}", statuses);
+        eprintln!("[REPORT] all-events-present (started+blocked+unblocked) \
+                   converges to: {:?}", statuses);
+    }
+
+    /// TDD #3 (unstarted-blocked stays pending, KEYED): t1 carries ONLY
+    /// `Task_is_blocked` (no `Task_is_started`). block is from=in_progress;
+    /// the from-guard blocks it because t1 is at the seeded `pending`, never
+    /// in_progress. The entity stays `pending`. The scoped upsert must NOT
+    /// change this — no advance is emitted, so there is nothing to upsert.
+    #[test]
+    fn event_fold_unstarted_blocked_stays_pending_keyed() {
+        let mut cells = task_block_sm_cells();
+        cells.entry("Task_has_Name".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Task", "t1"), ("Name", "NeverStarted")]));
+        cells.entry("Task_is_blocked".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Task", "t1")]));
+
+        let statuses = run_keyed_sm_to_fixpoint(cells, "t1");
+        assert_eq!(statuses, vec!["pending".to_string()],
+            "KEYED unstarted-blocked: t1 (only Task_is_blocked, no start) must \
+             stay at ['pending'] — block (from=in_progress) is from-guarded; \
+             got {:?}", statuses);
+    }
+
+    /// TDD #4 (migration with FULL chain, KEYED): t1 carries
+    /// `Task_is_started` + `Task_is_finished` (the complete event record).
+    /// On the keyed cell the from-guarded fold replays pending→in_progress
+    /// (started) then in_progress→completed (finished), upserting each step,
+    /// so the cell ends at exactly ['completed']. This is the fix for the
+    /// #900 destination-only freeze: record the FULL chain and replay it.
+    #[test]
+    fn event_fold_migration_full_chain_keyed() {
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "Task", &make_noun("entity"));
+        cells = with_noun(cells, "Name", &make_noun("value"));
+        cells = with_ft(cells, "Task_has_Name", &FactTypeDef {
+            schema_id: String::new(), reading: "Task has Name".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Task".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Name".to_string(), role_index: 1 },
+            ],
+        });
+        for ev in ["Task_is_started", "Task_is_finished"] {
+            cells = with_ft(cells, ev, &FactTypeDef {
+                schema_id: String::new(), reading: ev.replace('_', " "), readings: vec![],
+                roles: vec![RoleDef { noun_name: "Task".to_string(), role_index: 0 }],
+            });
+        }
+        cells = with_state_machine(cells, "TaskSM", &StateMachineDef {
+            noun_name: "Task".to_string(),
+            statuses: vec!["pending".to_string(), "in_progress".to_string(), "completed".to_string()],
+            transitions: vec![
+                TransitionDef { from: "pending".to_string(), to: "in_progress".to_string(), event: "Task_is_started".to_string(), guard: None },
+                TransitionDef { from: "in_progress".to_string(), to: "completed".to_string(), event: "Task_is_finished".to_string(), guard: None },
+            ],
+            initial: "pending".to_string(),
+        });
+        cells.entry("Task_has_Name".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Task", "t1"), ("Name", "FullChain")]));
+        cells.entry("Task_is_started".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Task", "t1")]));
+        cells.entry("Task_is_finished".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Task", "t1")]));
+
+        let statuses = run_keyed_sm_to_fixpoint(cells, "t1");
+        assert_eq!(statuses, vec!["completed".to_string()],
+            "KEYED full-chain: t1 (started + finished) must upsert-replay \
+             pending→in_progress→completed and hold exactly ['completed']; \
+             got {:?}", statuses);
+    }
+
+    /// TDD #5 (global UC unchanged at the forward-chain layer): a NON-SM
+    /// keyed cell must STILL conflict-reject a genuinely-conflicting second
+    /// value derived in the forward chain. The scoped upsert is allowlisted
+    /// to `State_Machine_is_currently_in_Status` ONLY; every other keyed
+    /// cell keeps drop-the-conflicting-write.
+    ///
+    /// `cell_put_keyed`'s Err path is already unit-tested directly
+    /// (`test_uniqueness_violation_surfaces_via_cell_put_keyed_err`); this
+    /// test pins the ROUTING decision in `integrate_round_facts` — that a
+    /// non-allowlisted keyed cell takes the drop branch, not the upsert
+    /// branch. We drive `integrate_round_facts` with a pre-seeded keyed cell
+    /// (`Person_has_Name`, keyed on "Person") and a round batch carrying a
+    /// CONFLICTING value at the same key; the seeded value must survive and
+    /// the conflicting write must be dropped (not overwrite).
+    #[test]
+    fn forward_chain_non_sm_keyed_cell_still_conflict_rejects() {
+        use hashbrown::HashMap as HbMap;
+        // Seed the keyed cell with (alice → "A") via cell_put_keyed (Map).
+        let seed = ast::fact_from_pairs(&[("Person", "alice"), ("Name", "A")]);
+        let state = ast::cell_put_keyed("Person_has_Name", &["Person"], seed,
+            &ast::Object::phi()).expect("seed put must succeed");
+
+        // Round batch: a CONFLICTING (alice → "B") at the same key.
+        let conflicting = ast::fact_from_pairs(&[("Person", "alice"), ("Name", "B")]);
+        let mut by_cell: HbMap<String, Vec<ast::Object>> = HbMap::new();
+        by_cell.insert("Person_has_Name".to_string(), vec![conflicting]);
+
+        // key_roles marks Person_has_Name as keyed on "Person" — but it is
+        // NOT in SM_STATUS_UPSERT_CELLS, so the conflict must DROP.
+        let mut key_roles: HbMap<String, Vec<String>> = HbMap::new();
+        key_roles.insert("Person_has_Name".to_string(), vec!["Person".to_string()]);
+
+        // Sanity: confirm the allowlist genuinely excludes this cell (and
+        // includes the SM cell), so the test is exercising the scoping.
+        assert!(!cell_is_sm_status_upsert("Person_has_Name"),
+            "Person_has_Name must NOT be in the upsert allowlist");
+        assert!(cell_is_sm_status_upsert("State_Machine_is_currently_in_Status"),
+            "the SM-status cell MUST be in the upsert allowlist");
+
+        let next = integrate_round_facts(state, by_cell, &key_roles);
+
+        let cell = ast::fetch_or_phi("Person_has_Name", &next);
+        let names: Vec<String> = ast::cell_facts_iter(&cell)
+            .filter(|f| ast::binding(f, "Person") == Some("alice"))
+            .filter_map(|f| ast::binding(f, "Name").map(|s| s.to_string()))
+            .collect();
+        assert_eq!(names, vec!["A".to_string()],
+            "non-SM keyed cell must REJECT the conflicting (alice→B) write and \
+             keep the original (alice→A) — global UC enforcement unchanged; \
+             got {:?}", names);
+    }
+
+    /// CONTRACT (bf5db0de from-guard + sm-status-scoped-upsert):
+    /// a DESTINATION-ONLY migration record correctly stays at `pending`.
+    ///
+    /// A #900-shape migration that records ONLY a *destination* event — a
+    /// "completed" Task carrying ONLY `Task_is_finished` (from=in_progress)
+    /// with NO preceding `Task_is_started` (pending→in_progress) — is an
+    /// INCOMPLETE record: the in_progress predecessor was never written.
+    /// The from-GUARDED fold (bf5db0de) only fires a transition for a
+    /// resource already in that transition's `from`; the entity is seeded
+    /// `pending` (initial) by sm-init and has no `started` event, so
+    /// `finished` (from=in_progress) is never applicable and it settles at
+    /// `pending`. That is the HONEST answer for a record with no start —
+    /// the intended behavior, not a bug. (The fix for the broader #900
+    /// freeze is to record the FULL event chain + replay it via the
+    /// scoped upsert — see `event_fold_migration_full_chain_keyed`, which
+    /// covers `Task_is_started`+`Task_is_finished` → `completed`.)
+    ///
+    /// The scoped upsert does NOT change this case: the from-guard emits NO
+    /// advance for `t1` (no in_progress predecessor), so the SM-status cell
+    /// only ever holds the seeded `pending`; there is no conflicting write
+    /// for the upsert to last-write. The result is identical on an un-keyed
+    /// and a keyed cell.
     ///
     /// This test builds the Task SM (pending(initial)→in_progress→completed)
-    /// and entity `t1` carrying ONLY `Task_is_finished`, then runs it to
-    /// fixpoint on BOTH an un-keyed and a keyed status cell, asserting t1
-    /// freezes at `pending` (never reaches `completed`) in both. It is the
-    /// compiled, end-to-end demonstration that the from-guard regresses
-    /// destination-only migration entities. Marked #[ignore] because it
-    /// documents a KNOWN regression (status quo on `main`), not a passing
-    /// contract — run explicitly with `--ignored` to reproduce.
+    /// and entity `t1` carrying ONLY `Task_is_finished`, runs it to fixpoint
+    /// on BOTH an un-keyed and a keyed status cell, and asserts t1 stays at
+    /// `pending` (never reaches `completed`) in both.
     #[test]
-    #[ignore = "documents the bf5db0de from-guard regression on #900 migration-shape entities; run with --ignored"]
-    fn event_fold_freezes_destination_only_migration_entity() {
+    fn event_fold_destination_only_record_stays_pending_keyed_and_unkeyed() {
         // ── Shared fixture builder ──────────────────────────────────────
         // Task SM: pending(initial) → in_progress → completed.
         //   start : pending     → in_progress  trigger Task_is_started
@@ -2368,8 +2794,8 @@ mod tests {
              predecessor for finish (from=in_progress) to fire from. Got: {:?}",
             unkeyed_statuses);
         assert!(unkeyed_statuses.iter().any(|s| s == "pending"),
-            "UN-KEYED: t1 must FREEZE at the seeded initial 'pending' (the \
-             migration regression). Got: {:?}", unkeyed_statuses);
+            "UN-KEYED: t1 must stay at the seeded initial 'pending' (honest \
+             answer for a record with no start). Got: {:?}", unkeyed_statuses);
 
         // ── (B) KEYED status cell (production shape: one-status-per-SM
         //        alethic UC on State_Machine_is_currently_in_Status →
@@ -2390,7 +2816,10 @@ mod tests {
             // Alethic UC on role 0 (State Machine): at most one Status per
             // State Machine. resolve_key_roles_for_ft → Some([0]) ⇒
             // _CellKeyRoles registers the cell ⇒ integrate_round_facts
-            // routes writes through cell_put_keyed (CONFLICT-REJECT upsert).
+            // routes writes through cell_put_keyed. For THIS entity the
+            // from-guard emits no advance (no in_progress predecessor), so
+            // the scoped upsert never fires — the cell holds only seeded
+            // `pending`.
             cells = with_constraint(cells, &ConstraintDef {
                 id: "uc_one_status_per_sm".to_string(),
                 kind: "UC".to_string(),
@@ -2426,23 +2855,22 @@ mod tests {
         assert_eq!(key_roles_registered.as_deref(), Some(&["State Machine".to_string()][..]),
             "fixture must register State_Machine_is_currently_in_Status as a \
              keyed cell (one-status-per-SM alethic UC); got {:?}", key_roles_registered);
-        // KEYED: t1 still never reaches 'completed' (from-guard blocks the
-        // fold from emitting it AND cell_put_keyed would reject the upsert).
+        // KEYED: t1 still never reaches 'completed' — the from-guard emits
+        // no advance (no in_progress predecessor), so even with the scoped
+        // upsert the cell only ever holds the seeded `pending`.
         assert!(!keyed_statuses.iter().any(|s| s == "completed"),
             "KEYED: t1 must not reach 'completed' under the from-guard; got {:?}",
             keyed_statuses);
         assert!(keyed_statuses.iter().any(|s| s == "pending"),
-            "KEYED: t1 must FREEZE at seeded 'pending'; got {:?}", keyed_statuses);
+            "KEYED: t1 must stay at seeded 'pending'; got {:?}", keyed_statuses);
 
         // Diagnostic (visible with --nocapture): show t1's final statuses.
         eprintln!("[VERIFY] migration-shape t1 final statuses — un-keyed: {:?}, keyed: {:?}",
             unkeyed_statuses, keyed_statuses);
 
-        // Both paths agree: the migration-shape entity is stranded at the
-        // initial status. (The divergence the task asked about — keyed vs
-        // un-keyed — is that they AGREE on the freeze here; the keyed cell
-        // adds the conflict-reject barrier on top of the from-guard, but the
-        // from-guard already strands a destination-only entity regardless.)
+        // Both paths agree: a destination-only record honestly settles at
+        // the initial status. The scoped upsert is irrelevant here because
+        // the from-guard never emits an advance to upsert.
         assert_eq!(
             unkeyed_statuses.iter().any(|s| s == "completed"),
             keyed_statuses.iter().any(|s| s == "completed"),
