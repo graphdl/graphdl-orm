@@ -8049,6 +8049,505 @@ fn ss_autofill_pairs_binds_antecedent_and_consequent_fact_types() {
     );
 }
 
+// ─── Reachable-sink SM current-status reformulation (research TDD) ──────
+//
+// GOAL: validate a DECLARATIVE replacement for the imperative
+// `compile_sm_event_fold` (compile.rs) — which is buggy because it
+// ignores each transition's `from` status — expressed as FORML2
+// derivation readings that converge to the SM's current status.
+//
+// The "reachable-sink" fold: a SM's current status is the unique status
+// reachable from `initial` via *applicable* transitions that has no
+// applicable way out (the sink). A transition is "applicable" iff its
+// trigger fact-type holds for the SM's resource. We model "trigger
+// holds for resource" as a SUPPLIED fact type `Fact Type holds for
+// Resource` (asserted manually here as instance facts).
+//
+// We use a DISTINCT consequent cell — `State Machine is settled in
+// Status` — so it does NOT collide with the still-live imperative
+// `State Machine is currently in Status`.
+//
+// CRUCIAL ENGINE FACT this test discovered/encodes (see report):
+// AbsenceOf / negation in derivation antecedents was REMOVED from the
+// engine (compile.rs:151 "task-7: AbsenceOf has been removed"; parser
+// parse_forml2.rs:2305 "AbsenceOf detection removed 2026-05-19" — the
+// `has no` / `is not` / `does not` / leading `no` / `where …` markers
+// no longer resolve to an antecedent; the clause is silently DROPPED
+// and the rule degrades to its positive antecedents). Therefore the
+// `State Machine is settled in Status iff … can not advance …` rule
+// CANNOT express the sink-negation: its negation clause vanishes and
+// `settled` collapses to `can reach` (every reachable status), not the
+// single sink. This test is `#[ignore]`d to document the gap; the
+// assertions below capture what the formulation WOULD need and the
+// inline notes record what the engine actually produces when run.
+//
+// Anaphora convention used (verified against
+// `shape_subscript_join_two_hop_self_ring_fires`): two bindings of one
+// noun in a derivation are disambiguated by REPEATED Halpin subscripts
+// (`Status1`/`Status2`), which the parser routes to a positional Join.
+// The metamodel's own `Status is terminal …` rule (state.md:57) is the
+// model for `no Transition … where …`, but per state.md:112-122 that
+// negation is likewise stripped today.
+
+/// Extract the set of `(State Machine, Status)` pairs from a named cell
+/// in a forward-chained state. Tolerates Seq- and Map-backed cells.
+#[cfg(test)]
+fn sm_status_pairs(state: &Object, cell: &str) -> Vec<(String, String)> {
+    let c = crate::ast::fetch_cell_seq(cell, state);
+    let rows: Vec<&Object> = crate::ast::cell_facts_iter(&c).collect();
+    let mut out: Vec<(String, String)> = rows.iter().filter_map(|f| {
+        let sm = crate::ast::binding(f, "State Machine").map(String::from)?;
+        let st = crate::ast::binding(f, "Status").map(String::from)?;
+        Some((sm, st))
+    }).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The five reachable-sink readings under test, sharing one metamodel
+/// surface. `instance_facts` is appended into the `## Instance Facts`
+/// section so each scenario can assert its own SM + triggers.
+#[cfg(test)]
+fn reachable_sink_src(instance_facts: &str) -> String {
+    // NOTE on the recursive `can reach` rule: the second `Status`
+    // binding is disambiguated with the repeated-subscript join
+    // convention (`Status1` = prior reached status, `Status2` = newly
+    // reached status). `Transition is from Status1` + `Transition is to
+    // Status2` shares the `Transition` join var with `… can reach
+    // Status1`, threading the recursion. The `settled` rule's negation
+    // (`can not advance`) is the load-bearing clause that the engine
+    // drops (see header).
+    format!(r#"# Reachable-sink SM current-status (research TDD)
+## Entity Types
+Status(.Name) is an entity type.
+State Machine Definition(.Name) is an entity type.
+Transition(.id) is an entity type.
+Fact Type(.id) is an entity type.
+Noun(.Name) is an entity type.
+Resource(.id) is an entity type.
+State Machine(.id) is an entity type.
+
+## Fact Types
+State Machine Definition is for Noun.
+Transition is defined in State Machine Definition.
+Transition is from Status.
+Transition is to Status.
+Transition is triggered by Fact Type.
+Status is initial in State Machine Definition.
+State Machine is for Resource.
+State Machine is instance of Noun.
+Fact Type holds for Resource.
+Transition is applicable for State Machine. *
+State Machine has reached Status. *
+State Machine can advance from Status. *
+State Machine is settled in Status. *
+
+## Derivation Rules
+* Transition is applicable for State Machine iff that State Machine is instance of some Noun and some State Machine Definition is for that Noun and that Transition is defined in that State Machine Definition and that Transition is triggered by some Fact Type and that State Machine is for some Resource and that Fact Type holds for that Resource.
+
+* State Machine has reached Status iff that State Machine is instance of some Noun and some State Machine Definition is for that Noun and that Status is initial in that State Machine Definition.
+
+* State Machine has reached Status2 iff that State Machine has reached Status1 and some Transition is from Status1 and that Transition is to Status2 and that Transition is applicable for that State Machine.
+
+* State Machine can advance from Status iff that State Machine has reached that Status and some Transition is from that Status and that Transition is applicable for that State Machine.
+
+* State Machine is settled in Status iff that State Machine has reached that Status and that State Machine can not advance from that Status.
+
+## Instance Facts
+{}
+"#, instance_facts)
+}
+
+/// Run a reachable-sink scenario to fixpoint and return the final
+/// state plus diagnostics for every intermediate cell so the report can
+/// record exactly what the engine produces.
+#[cfg(test)]
+fn run_reachable_sink(instance_facts: &str) -> Object {
+    let src = reachable_sink_src(instance_facts);
+    let state = crate::parse_forml2::parse_to_state(&src).expect("reachable-sink parse");
+    let model = crate::compile::compile(&state);
+    let refs: Vec<(&str, &crate::ast::Func)> =
+        model.derivations.iter().map(|d| (d.id.as_str(), &d.func)).collect();
+    // forward_chain_defs_state loops to its internal fixpoint (≤100
+    // rounds), so the `can reach` recursion is driven to the least
+    // fixed point in a single call. Negation, were it honored, would
+    // require the two-stratum `forward_chain_stratified`; since the
+    // engine drops the negation clause entirely, the plain monotonic
+    // chainer is the faithful evaluator for what actually compiles.
+    let (final_state, _derived) =
+        crate::evaluate::forward_chain_defs_state(&refs, &state);
+    final_state
+}
+
+/// Isolation probe (not the deliverable): does `State Machine can reach
+/// Status` resolve as a consequent when it is the ONLY [State Machine,
+/// Status]-role-set FT (no advance/settled siblings)? Pins whether the
+/// empty-consequent failure is a 3-way role-set collision vs. the verb
+/// `can reach` itself.
+#[test]
+#[ignore = "isolation probe for the reachable-sink investigation; run with --ignored"]
+fn reachable_sink_probe_can_reach_consequent_resolution() {
+    let one = r#"# probe: can reach alone
+## Entity Types
+Status(.Name) is an entity type.
+State Machine Definition(.Name) is an entity type.
+Noun(.Name) is an entity type.
+State Machine(.id) is an entity type.
+
+## Fact Types
+State Machine Definition is for Noun.
+Status is initial in State Machine Definition.
+State Machine is instance of Noun.
+State Machine can reach Status. *
+
+## Derivation Rules
+* State Machine can reach Status iff that State Machine is instance of some Noun and some State Machine Definition is for that Noun and that Status is initial in that State Machine Definition.
+
+## Instance Facts
+State Machine Definition 'OrderSM' is for Noun 'Order'.
+Status 'Draft' is initial in State Machine Definition 'OrderSM'.
+State Machine 'o1' is instance of Noun 'Order'.
+"#;
+    let state = crate::parse_forml2::parse_to_state(one).expect("parse");
+    let data = crate::compile::cell_index_from_state(&state);
+    for r in data.derivation_rules.iter() {
+        eprintln!("PROBE rule consequent={:?} antecedents={:?} unresolved={:?}",
+            r.consequent_cell,
+            r.antecedent_sources.iter().map(|a| format!("{:?}", a)).collect::<Vec<_>>(),
+            r.unresolved_clauses);
+    }
+    let model = crate::compile::compile(&state);
+    let refs: Vec<(&str, &crate::ast::Func)> =
+        model.derivations.iter().map(|d| (d.id.as_str(), &d.func)).collect();
+    let (fin, _d) = crate::evaluate::forward_chain_defs_state(&refs, &state);
+    eprintln!("PROBE can_reach rows: {:?}",
+        sm_status_pairs(&fin, "State_Machine_can_reach_Status"));
+
+    // Verb-variant sweep: which consequent verbs RESOLVE to a non-empty
+    // cell? Each declares one FT with role-set [State Machine, Status]
+    // plus a base rule, in isolation, and reports the resolved cell.
+    let verb_variant = |verb: &str, ft_reading: &str, cell: &str| {
+        let src = format!(r#"# probe verb
+## Entity Types
+Status(.Name) is an entity type.
+State Machine Definition(.Name) is an entity type.
+Noun(.Name) is an entity type.
+State Machine(.id) is an entity type.
+
+## Fact Types
+State Machine Definition is for Noun.
+Status is initial in State Machine Definition.
+State Machine is instance of Noun.
+{ft_reading}. *
+
+## Derivation Rules
+* {ft_reading} iff that State Machine is instance of some Noun and some State Machine Definition is for that Noun and that Status is initial in that State Machine Definition.
+
+## Instance Facts
+State Machine Definition 'OrderSM' is for Noun 'Order'.
+Status 'Draft' is initial in State Machine Definition 'OrderSM'.
+State Machine 'o1' is instance of Noun 'Order'.
+"#, ft_reading = ft_reading);
+        let st = crate::parse_forml2::parse_to_state(&src).expect("parse variant");
+        let data = crate::compile::cell_index_from_state(&st);
+        let cons = data.derivation_rules.first()
+            .map(|r| format!("{:?}", r.consequent_cell)).unwrap_or_default();
+        let model = crate::compile::compile(&st);
+        let refs: Vec<(&str, &crate::ast::Func)> =
+            model.derivations.iter().map(|d| (d.id.as_str(), &d.func)).collect();
+        let (fin, _d) = crate::evaluate::forward_chain_defs_state(&refs, &st);
+        let rows = sm_status_pairs(&fin, cell);
+        eprintln!("VERB[{:<22}] consequent={:<42} rows={:?}", verb, cons, rows);
+    };
+    verb_variant("can reach", "State Machine can reach Status", "State_Machine_can_reach_Status");
+    verb_variant("reaches", "State Machine reaches Status", "State_Machine_reaches_Status");
+    verb_variant("can advance from", "State Machine can advance from Status", "State_Machine_can_advance_from_Status");
+    verb_variant("is settled in", "State Machine is settled in Status", "State_Machine_is_settled_in_Status");
+    verb_variant("has reached", "State Machine has reached Status", "State_Machine_has_reached_Status");
+    verb_variant("is reachable to", "State Machine is reachable to Status", "State_Machine_is_reachable_to_Status");
+
+    // ── RECURSION PROBE: does the `has reached` self-join propagate one
+    // hop past the initial status? Two transitions Draft→Placed (placed)
+    // and Placed→Shipped (shipped), BOTH applicable. A correct recursive
+    // closure yields has_reached = {Draft, Placed, Shipped}. Try the
+    // repeated-subscript form vs. a distinct role-noun alias to see
+    // whether EITHER makes the multi-FT self-join recurse.
+    let recursion_probe = |label: &str, recursive_rule: &str| {
+        let src = format!(r#"# recursion probe
+## Entity Types
+Status(.Name) is an entity type.
+State Machine Definition(.Name) is an entity type.
+Transition(.id) is an entity type.
+Fact Type(.id) is an entity type.
+Noun(.Name) is an entity type.
+Resource(.id) is an entity type.
+State Machine(.id) is an entity type.
+
+## Fact Types
+State Machine Definition is for Noun.
+Transition is defined in State Machine Definition.
+Transition is from Status.
+Transition is to Status.
+Transition is triggered by Fact Type.
+Status is initial in State Machine Definition.
+State Machine is for Resource.
+State Machine is instance of Noun.
+Fact Type holds for Resource.
+Transition is applicable for State Machine. *
+State Machine has reached Status. *
+
+## Derivation Rules
+* Transition is applicable for State Machine iff that State Machine is instance of some Noun and some State Machine Definition is for that Noun and that Transition is defined in that State Machine Definition and that Transition is triggered by some Fact Type and that State Machine is for some Resource and that Fact Type holds for that Resource.
+
+* State Machine has reached Status iff that State Machine is instance of some Noun and some State Machine Definition is for that Noun and that Status is initial in that State Machine Definition.
+
+{recursive_rule}
+
+## Instance Facts
+State Machine Definition 'OrderSM' is for Noun 'Order'.
+Transition 'placed' is defined in State Machine Definition 'OrderSM'.
+Transition 'placed' is from Status 'Draft'.
+Transition 'placed' is to Status 'Placed'.
+Transition 'placed' is triggered by Fact Type 'Order_was_placed'.
+Transition 'shipped' is defined in State Machine Definition 'OrderSM'.
+Transition 'shipped' is from Status 'Placed'.
+Transition 'shipped' is to Status 'Shipped'.
+Transition 'shipped' is triggered by Fact Type 'Order_was_shipped'.
+Status 'Draft' is initial in State Machine Definition 'OrderSM'.
+State Machine 'o2' is for Resource 'o2'.
+State Machine 'o2' is instance of Noun 'Order'.
+Fact Type 'Order_was_placed' holds for Resource 'o2'.
+Fact Type 'Order_was_shipped' holds for Resource 'o2'.
+"#, recursive_rule = recursive_rule);
+        let st = crate::parse_forml2::parse_to_state(&src).expect("parse recursion probe");
+        let data = crate::compile::cell_index_from_state(&st);
+        let rec = data.derivation_rules.iter()
+            .find(|r| r.text.contains("Status2") || r.text.contains("Prior Status")
+                || r.text.contains("Next Status"));
+        if let Some(r) = rec {
+            eprintln!("RECURSION[{}] kind={:?} consequent={:?}\n  antecedents={:?}\n  unresolved={:?}",
+                label, r.kind, r.consequent_cell,
+                r.antecedent_sources.iter().map(|a| format!("{:?}", a)).collect::<Vec<_>>(),
+                r.unresolved_clauses);
+        }
+        let model = crate::compile::compile(&st);
+        let refs: Vec<(&str, &crate::ast::Func)> =
+            model.derivations.iter().map(|d| (d.id.as_str(), &d.func)).collect();
+        let (fin, _d) = crate::evaluate::forward_chain_defs_state(&refs, &st);
+        eprintln!("RECURSION[{}] has_reached = {:?}",
+            label, sm_status_pairs(&fin, "State_Machine_has_reached_Status"));
+    };
+    recursion_probe("subscript Status1/Status2",
+        "* State Machine has reached Status2 iff that State Machine has reached Status1 and some Transition is from Status1 and that Transition is to Status2 and that Transition is applicable for that State Machine.");
+    recursion_probe("role-noun Prior Status",
+        "* State Machine has reached Status iff that State Machine has reached some Prior Status and some Transition is from that Prior Status and that Transition is to that Status and that Transition is applicable for that State Machine.");
+    recursion_probe("transition-threaded that-anaphora",
+        "* State Machine has reached Status iff some Transition is to that Status and that Transition is applicable for that State Machine and that State Machine has reached some Source Status and that Transition is from that Source Status.");
+}
+
+/// Investigative + gap-documenting test for the reachable-sink
+/// reformulation. `#[ignore]`d because the formulation cannot be
+/// expressed under the current engine — it hits TWO independent gaps
+/// (see the report and the `#[ignore]` reason):
+///
+///   GAP 1 (recursion does not propagate): the recursive `has reached`
+///   rule — a self-join that threads the prior reached status into the
+///   `from` role of a Transition and emits the `to` role as a NEW
+///   reached status — compiles as `DerivationKind::Join` with the
+///   correct consequent, but does NOT add the `to` status to the
+///   `has reached` cell. `has reached` stays pinned to the INITIAL
+///   status across all wordings tried (repeated Halpin subscripts
+///   `Status1`/`Status2`, a distinct role-noun `Prior Status`, and a
+///   transition-threaded `that`-anaphora form — see the sibling probe
+///   `reachable_sink_probe_can_reach_consequent_resolution`). A
+///   multi-FT recursive join whose fresh output variable differs from
+///   the join variable is not evaluated to the transitive fixpoint.
+///
+///   GAP 2 (sink-negation is unexpressible): the `settled` rule needs
+///   `… and that State Machine can not advance from that Status`, but
+///   derivation-antecedent negation was REMOVED from the engine
+///   (compile.rs:151 "task-7: AbsenceOf has been removed";
+///   parse_forml2.rs:2305 "AbsenceOf detection removed 2026-05-19").
+///   The `can not advance` clause is silently dropped, so `settled`
+///   collapses to `has reached` (every reached status), never the
+///   single sink.
+///
+/// Run with `--ignored --nocapture` to see each scenario's actual
+/// cell contents on stderr. The assertions below encode the INTENDED
+/// converged semantics (and therefore fail under both gaps).
+#[test]
+#[ignore = "reachable-sink reformulation is unexpressible under the current engine: \
+(1) the recursive `has reached` self-join does not propagate past the initial status \
+(multi-FT recursive join with a fresh output var ≠ join var never reaches the \
+transitive fixpoint, across subscript / role-noun / that-anaphora wordings); \
+(2) the sink-negation `can not advance` is dropped (derivation-antecedent negation \
+removed, task-7). See test doc-comment + report."]
+fn reachable_sink_sm_current_status_reformulation() {
+    // ── Scenario 1: respects `from` (the imperative fold's bug) ──────
+    // OrderSM/Order: Draft(initial) -> Placed -> Shipped.
+    //   placed: Draft->Placed  trigger Order_was_placed
+    //   shipped: Placed->Shipped trigger Order_was_shipped
+    // o1: Order_was_shipped holds, Order_was_placed does NOT.
+    // EXPECT (if negation worked): settled = {Draft} only — shipped is
+    // not applicable FROM Draft (you must be in Placed first), and o1
+    // never placed. This is exactly the from-guard the imperative fold
+    // gets wrong.
+    let s1_facts = r#"State Machine Definition 'OrderSM' is for Noun 'Order'.
+Transition 'placed' is defined in State Machine Definition 'OrderSM'.
+Transition 'placed' is from Status 'Draft'.
+Transition 'placed' is to Status 'Placed'.
+Transition 'placed' is triggered by Fact Type 'Order_was_placed'.
+Transition 'shipped' is defined in State Machine Definition 'OrderSM'.
+Transition 'shipped' is from Status 'Placed'.
+Transition 'shipped' is to Status 'Shipped'.
+Transition 'shipped' is triggered by Fact Type 'Order_was_shipped'.
+Status 'Draft' is initial in State Machine Definition 'OrderSM'.
+State Machine 'o1' is for Resource 'o1'.
+State Machine 'o1' is instance of Noun 'Order'.
+Fact Type 'Order_was_shipped' holds for Resource 'o1'."#;
+    let st1 = run_reachable_sink(s1_facts);
+    let s1_reach = sm_status_pairs(&st1, "State_Machine_has_reached_Status");
+    let s1_adv = sm_status_pairs(&st1, "State_Machine_can_advance_from_Status");
+    let s1_settled = sm_status_pairs(&st1, "State_Machine_is_settled_in_Status");
+    let s1_applicable = {
+        let c = crate::ast::fetch_cell_seq("Transition_is_applicable_for_State_Machine", &st1);
+        crate::ast::cell_facts_iter(&c).filter_map(|f| {
+            let t = crate::ast::binding(f, "Transition").map(String::from)?;
+            let sm = crate::ast::binding(f, "State Machine").map(String::from)?;
+            Some((sm, t))
+        }).collect::<Vec<_>>()
+    };
+    eprintln!("\n=== Scenario 1 (o1: respects-from) ===");
+    eprintln!("  applicable: {:?}", s1_applicable);
+    eprintln!("  can reach:  {:?}", s1_reach);
+    eprintln!("  can advance:{:?}", s1_adv);
+    eprintln!("  SETTLED:    {:?}", s1_settled);
+
+    // ── Scenario 2: full advance to the sink ─────────────────────────
+    // o2: both Order_was_placed AND Order_was_shipped hold.
+    // INTENDED: has_reached = {Draft, Placed, Shipped}, can_advance =
+    // {Draft, Placed}, settled = {Shipped} (the sink). ACTUAL: GAP 1
+    // pins has_reached={Draft} (recursion never fires), so settled={Draft}.
+    let s2_facts = r#"State Machine Definition 'OrderSM' is for Noun 'Order'.
+Transition 'placed' is defined in State Machine Definition 'OrderSM'.
+Transition 'placed' is from Status 'Draft'.
+Transition 'placed' is to Status 'Placed'.
+Transition 'placed' is triggered by Fact Type 'Order_was_placed'.
+Transition 'shipped' is defined in State Machine Definition 'OrderSM'.
+Transition 'shipped' is from Status 'Placed'.
+Transition 'shipped' is to Status 'Shipped'.
+Transition 'shipped' is triggered by Fact Type 'Order_was_shipped'.
+Status 'Draft' is initial in State Machine Definition 'OrderSM'.
+State Machine 'o2' is for Resource 'o2'.
+State Machine 'o2' is instance of Noun 'Order'.
+Fact Type 'Order_was_placed' holds for Resource 'o2'.
+Fact Type 'Order_was_shipped' holds for Resource 'o2'."#;
+    let st2 = run_reachable_sink(s2_facts);
+    let s2_reach = sm_status_pairs(&st2, "State_Machine_has_reached_Status");
+    let s2_adv = sm_status_pairs(&st2, "State_Machine_can_advance_from_Status");
+    let s2_settled = sm_status_pairs(&st2, "State_Machine_is_settled_in_Status");
+    eprintln!("\n=== Scenario 2 (o2: full advance) ===");
+    eprintln!("  can reach:  {:?}", s2_reach);
+    eprintln!("  can advance:{:?}", s2_adv);
+    eprintln!("  SETTLED:    {:?}", s2_settled);
+
+    // ── Scenario 3: auto-unblock convergence (the real target) ───────
+    // TaskSM/Task: pending(initial) -> in_progress -> blocked, with an
+    // unblock edge back blocked -> in_progress.
+    //   start:   pending->in_progress    trigger Task_is_started
+    //   block:   in_progress->blocked     trigger Task_is_blocked
+    //   unblock: blocked->in_progress     trigger Task_is_unblocked
+    // t1: Task_is_started, Task_is_blocked, AND Task_is_unblocked all
+    // hold (it was started, was blocked, now all blockers done so
+    // unblock applies — but `block` is ALSO still applicable as a fact).
+    // EXPECT (if negation worked): the reachable graph is
+    // pending->in_progress->blocked->in_progress; settled should be
+    // {in_progress} and NOT {blocked} — but with BOTH block and unblock
+    // applicable, `can advance from in_progress` is true (block) AND
+    // `can advance from blocked` is true (unblock), so NO status is a
+    // sink → settled = {} (empty). This is the key finding: the
+    // formulation only converges if block/unblock are mutually
+    // exclusive (the real tasks model keys block on "∃ incomplete
+    // blocker" and unblock on "all blockers done").
+    let s3_facts = r#"State Machine Definition 'TaskSM' is for Noun 'Task'.
+Transition 'start' is defined in State Machine Definition 'TaskSM'.
+Transition 'start' is from Status 'pending'.
+Transition 'start' is to Status 'in_progress'.
+Transition 'start' is triggered by Fact Type 'Task_is_started'.
+Transition 'block' is defined in State Machine Definition 'TaskSM'.
+Transition 'block' is from Status 'in_progress'.
+Transition 'block' is to Status 'blocked'.
+Transition 'block' is triggered by Fact Type 'Task_is_blocked'.
+Transition 'unblock' is defined in State Machine Definition 'TaskSM'.
+Transition 'unblock' is from Status 'blocked'.
+Transition 'unblock' is to Status 'in_progress'.
+Transition 'unblock' is triggered by Fact Type 'Task_is_unblocked'.
+Status 'pending' is initial in State Machine Definition 'TaskSM'.
+State Machine 't1' is for Resource 't1'.
+State Machine 't1' is instance of Noun 'Task'.
+Fact Type 'Task_is_started' holds for Resource 't1'.
+Fact Type 'Task_is_blocked' holds for Resource 't1'.
+Fact Type 'Task_is_unblocked' holds for Resource 't1'."#;
+    let st3 = run_reachable_sink(s3_facts);
+    let s3_reach = sm_status_pairs(&st3, "State_Machine_has_reached_Status");
+    let s3_adv = sm_status_pairs(&st3, "State_Machine_can_advance_from_Status");
+    let s3_settled = sm_status_pairs(&st3, "State_Machine_is_settled_in_Status");
+    eprintln!("\n=== Scenario 3 (t1: auto-unblock) ===");
+    eprintln!("  can reach:  {:?}", s3_reach);
+    eprintln!("  can advance:{:?}", s3_adv);
+    eprintln!("  SETTLED:    {:?}", s3_settled);
+
+    // ── Assertions ───────────────────────────────────────────────────
+    //
+    // These encode the INTENDED converged semantics. They FAIL under the
+    // current engine (hence `#[ignore]`). Empirically observed cell
+    // contents (from `--ignored --nocapture`, transcribed into the
+    // report):
+    //   S1 o1: has_reached={Draft}        settled={Draft}   ← matches!*
+    //   S2 o2: has_reached={Draft}        settled={Draft}   ← WRONG (want Shipped)
+    //   S3 t1: has_reached={pending}      settled={pending} ← stuck at initial
+    // (*S1 matches only by coincidence: the recursion-not-propagating GAP 1
+    //  keeps has_reached at the initial Draft, which happens to BE the
+    //  correct answer for o1; it is not evidence the formulation works.)
+    //
+    // GAP 1 (recursion) explains why S2/S3 never leave the initial status;
+    // GAP 2 (negation drop) means `settled` == `has reached` regardless.
+
+    // Scenario 1: settled must be exactly {(o1, Draft)} — respects from.
+    // NB: this assertion PASSES today, but for the wrong reason (GAP 1);
+    // it is kept to document the respects-`from` requirement.
+    assert_eq!(
+        s1_settled, vec![("o1".to_string(), "Draft".to_string())],
+        "Scenario 1: with only Order_was_shipped holding, `shipped` is \
+         not applicable FROM Draft, so o1 stays settled in Draft. \
+         has_reached={:?} can_advance={:?} settled={:?}",
+        s1_reach, s1_adv, s1_settled,
+    );
+
+    // Scenario 2: settled must be exactly {(o2, Shipped)} — the sink.
+    assert_eq!(
+        s2_settled, vec![("o2".to_string(), "Shipped".to_string())],
+        "Scenario 2: both triggers hold, so the SM advances Draft→Placed→ \
+         Shipped and settles in the sink Shipped. \
+         has_reached={:?} can_advance={:?} settled={:?}",
+        s2_reach, s2_adv, s2_settled,
+    );
+
+    // Scenario 3: with both block AND unblock applicable there is NO
+    // sink among reachable statuses (in_progress can advance via block,
+    // blocked can advance via unblock), so a correct sink-fold yields
+    // settled = {} — proving the formulation needs trigger exclusivity.
+    assert_eq!(
+        s3_settled, Vec::<(String, String)>::new(),
+        "Scenario 3: block and unblock both applicable ⇒ no reachable \
+         status is a sink ⇒ settled empty (formulation requires \
+         block/unblock mutual exclusivity to converge to a single \
+         status). has_reached={:?} can_advance={:?} settled={:?}",
+        s3_reach, s3_adv, s3_settled,
+    );
+}
+
 /// ss-autofill-retire-2 — ORACLE-EQUIVALENCE scope-guard.
 ///
 /// Pins the reading-driven SS-autofill Func (the `compile_explicit_derivation`
