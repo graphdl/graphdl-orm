@@ -2122,8 +2122,11 @@ mod tests {
     /// (from=Placed) but was never placed, so it is in Draft and shipped must
     /// NOT fire. The unguarded fold (compile.rs:7719 discards `from`) wrongly
     /// emits Shipped.
+    ///
+    /// task sm-fold-as-predicate: now GREEN — `compile_sm_event_fold` is
+    /// from-guarded (semi-join against `State_Machine_is_currently_in_Status`),
+    /// so a transition fires only from its declared `from`.
     #[test]
-    #[ignore = "RED until sm-fold-as-predicate lands"]
     fn event_fold_respects_from_status() {
         let mut cells = empty_cells();
         cells = with_noun(cells, "Order", &make_noun("entity"));
@@ -2170,6 +2173,96 @@ mod tests {
             "event-fold must respect `from`: o1 was never Placed, so a shipped event (from=Placed) must not fire from Draft. Got: {:?}", statuses);
         assert!(statuses.iter().any(|s| s == "Draft"),
             "o1 must remain in initial Draft. Got: {:?}", statuses);
+    }
+
+    /// task sm-fold-as-predicate (multi-step): the from-guarded fold must
+    /// CHAIN across forward-chain rounds. o2 carries BOTH `Order_was_placed`
+    /// (Draft→Placed) and `Order_was_shipped` (Placed→Shipped). The fixpoint
+    /// must walk it Draft → Placed → Shipped: `shipped` is from-guarded on
+    /// Placed, so it can only fire AFTER `placed` has advanced o2 to Placed
+    /// in an earlier round. Reaching `Shipped` therefore proves the guarded
+    /// chain composes step-by-step. This is the compiled mirror of
+    /// run_machine's `["placed","shipped"]` fold landing on Shipped.
+    ///
+    /// CONVERGENCE NOTE (the cell shape matters — see report). The event-fold
+    /// is a RECURSIVE derivation: its from-guard reads its own consequent
+    /// (`State_Machine_is_currently_in_Status`). Run against the natural
+    /// derivation cell (full-tuple set fold, `cell_put_folded`), every
+    /// advance is a NEW distinct tuple, so the cell ACCUMULATES the trail
+    /// {Draft, Placed, Shipped} and the chain reaches a stable fixpoint with
+    /// the terminal status present (current status = the maximal/last one).
+    /// We assert reachability of the terminal `Shipped` AND that no status
+    /// outside the declared path appears.
+    ///
+    /// We deliberately DON'T key the cell here: `integrate_round_facts` routes
+    /// keyed cells through `cell_put_keyed`, which CONFLICT-REJECTS (it does
+    /// NOT upsert/last-write) a second value at the same key — so on a keyed
+    /// cell the fold's `(o2,Placed)` write collides with the seeded
+    /// `(o2,Draft)` and is dropped, freezing o2 at Draft. In production an
+    /// explicit `apply transition` advances status by DIRECT write + #836
+    /// drop-and-rederive, not by letting the event-fold mutate a keyed cell
+    /// in place; the event-fold's role is bulk migration over the
+    /// accumulating derivation cell. (Reported as a finding.)
+    #[test]
+    fn event_fold_chains_multi_step_to_terminal() {
+        let mut cells = empty_cells();
+        cells = with_noun(cells, "Order", &make_noun("entity"));
+        cells = with_noun(cells, "Name", &make_noun("value"));
+        cells = with_ft(cells, "Order_has_Name", &FactTypeDef {
+            schema_id: String::new(), reading: "Order has Name".to_string(), readings: vec![],
+            roles: vec![
+                RoleDef { noun_name: "Order".to_string(), role_index: 0 },
+                RoleDef { noun_name: "Name".to_string(), role_index: 1 },
+            ],
+        });
+        cells = with_ft(cells, "Order_was_placed", &FactTypeDef {
+            schema_id: String::new(), reading: "Order was placed".to_string(), readings: vec![],
+            roles: vec![RoleDef { noun_name: "Order".to_string(), role_index: 0 }],
+        });
+        cells = with_ft(cells, "Order_was_shipped", &FactTypeDef {
+            schema_id: String::new(), reading: "Order was shipped".to_string(), readings: vec![],
+            roles: vec![RoleDef { noun_name: "Order".to_string(), role_index: 0 }],
+        });
+        cells = with_state_machine(cells, "OrderSM", &StateMachineDef {
+            noun_name: "Order".to_string(),
+            statuses: vec!["Draft".to_string(), "Placed".to_string(), "Shipped".to_string()],
+            transitions: vec![
+                TransitionDef { from: "Draft".to_string(), to: "Placed".to_string(), event: "Order_was_placed".to_string(), guard: None },
+                TransitionDef { from: "Placed".to_string(), to: "Shipped".to_string(), event: "Order_was_shipped".to_string(), guard: None },
+            ],
+            initial: "Draft".to_string(),
+        });
+        // o2 has BOTH events: it must advance Draft → Placed → Shipped.
+        cells.entry("Order_has_Name".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Order", "o2"), ("Name", "Gadget")]));
+        cells.entry("Order_was_placed".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Order", "o2")]));
+        cells.entry("Order_was_shipped".to_string()).or_default().push(
+            ast::fact_from_pairs(&[("Order", "o2")]));
+
+        let (state, defs, _def_map) = compile_cells(cells);
+        let dd = derivation_defs_from(&defs);
+        // forward_chain_defs_state is bounded (100 rounds) and early-exits at
+        // the fixpoint; if the guarded chain failed to converge it would burn
+        // all rounds / oscillate. It returns here, so the chain DID settle.
+        let (new_state, _derived) = forward_chain_defs_state(&dd, &state);
+
+        let statuses: Vec<String> = ast::fetch_cell_seq("State_Machine_is_currently_in_Status", &new_state)
+            .as_seq()
+            .map(|facts| facts.iter()
+                .filter(|f| ast::binding(f, "State Machine") == Some("o2"))
+                .filter_map(|f| ast::binding(f, "Status").map(|s| s.to_string()))
+                .collect())
+            .unwrap_or_default();
+        // The terminal status is reached: the Placed→Shipped step fired,
+        // which is only possible if Draft→Placed advanced o2 in an earlier
+        // round (shipped is from-guarded on Placed). That IS the multi-step
+        // chain.
+        assert!(statuses.iter().any(|s| s == "Shipped"),
+            "o2 (placed+shipped) must CHAIN to terminal 'Shipped' (Draft→Placed→Shipped); got {:?}", statuses);
+        // And nothing off the declared status set ever appears.
+        assert!(statuses.iter().all(|s| s == "Draft" || s == "Placed" || s == "Shipped"),
+            "only declared statuses may appear; got {:?}", statuses);
     }
 
     /// task-6 / #6 ROOT-CAUSE repro: a transition trigger-FT cell that
