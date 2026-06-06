@@ -2265,6 +2265,191 @@ mod tests {
             "only declared statuses may appear; got {:?}", statuses);
     }
 
+    /// VERIFICATION (bf5db0de from-guard, #900 migration-shape entity).
+    ///
+    /// The #900 migration reconstructs status by asserting, for each
+    /// non-pending entity, a SINGLE *destination* event fact — a completed
+    /// Task gets ONLY `Task_is_finished` (from=in_progress), with NO
+    /// preceding `Task_is_started` (pending→in_progress). The OLD,
+    /// from-IGNORING fold emitted `completed` directly off that single
+    /// `finished` event. The NEW from-GUARDED fold (bf5db0de) only fires a
+    /// transition for a resource already in that transition's `from`; a
+    /// freshly-derived entity is seeded `pending` (initial) by sm-init and
+    /// has no `started` event, so `finished` (from=in_progress) is never
+    /// applicable and the entity FREEZES at `pending`.
+    ///
+    /// This is independent of cell keying: the from-guard alone strands the
+    /// entity at `pending` on an UN-KEYED cell, because the fold cannot
+    /// even PRODUCE `completed` (no in_progress predecessor exists). On a
+    /// KEYED cell (the production `State_Machine_is_currently_in_Status`
+    /// shape — one-status-per-SM alethic UC) the same freeze occurs, with
+    /// a second, redundant barrier: even if the fold did emit an advance,
+    /// `cell_put_keyed` CONFLICT-REJECTS the second value at the seeded key.
+    ///
+    /// This test builds the Task SM (pending(initial)→in_progress→completed)
+    /// and entity `t1` carrying ONLY `Task_is_finished`, then runs it to
+    /// fixpoint on BOTH an un-keyed and a keyed status cell, asserting t1
+    /// freezes at `pending` (never reaches `completed`) in both. It is the
+    /// compiled, end-to-end demonstration that the from-guard regresses
+    /// destination-only migration entities. Marked #[ignore] because it
+    /// documents a KNOWN regression (status quo on `main`), not a passing
+    /// contract — run explicitly with `--ignored` to reproduce.
+    #[test]
+    #[ignore = "documents the bf5db0de from-guard regression on #900 migration-shape entities; run with --ignored"]
+    fn event_fold_freezes_destination_only_migration_entity() {
+        // ── Shared fixture builder ──────────────────────────────────────
+        // Task SM: pending(initial) → in_progress → completed.
+        //   start : pending     → in_progress  trigger Task_is_started
+        //   finish: in_progress → completed    trigger Task_is_finished
+        // Entity t1 carries ONLY Task_is_finished (the migration's single
+        // destination event) — NO Task_is_started.
+        let build_cells = || -> S {
+            let mut cells = empty_cells();
+            cells = with_noun(cells, "Task", &make_noun("entity"));
+            cells = with_noun(cells, "Name", &make_noun("value"));
+            cells = with_ft(cells, "Task_has_Name", &FactTypeDef {
+                schema_id: String::new(), reading: "Task has Name".to_string(), readings: vec![],
+                roles: vec![
+                    RoleDef { noun_name: "Task".to_string(), role_index: 0 },
+                    RoleDef { noun_name: "Name".to_string(), role_index: 1 },
+                ],
+            });
+            cells = with_ft(cells, "Task_is_started", &FactTypeDef {
+                schema_id: String::new(), reading: "Task is started".to_string(), readings: vec![],
+                roles: vec![RoleDef { noun_name: "Task".to_string(), role_index: 0 }],
+            });
+            cells = with_ft(cells, "Task_is_finished", &FactTypeDef {
+                schema_id: String::new(), reading: "Task is finished".to_string(), readings: vec![],
+                roles: vec![RoleDef { noun_name: "Task".to_string(), role_index: 0 }],
+            });
+            cells = with_state_machine(cells, "TaskSM", &StateMachineDef {
+                noun_name: "Task".to_string(),
+                statuses: vec!["pending".to_string(), "in_progress".to_string(), "completed".to_string()],
+                transitions: vec![
+                    TransitionDef { from: "pending".to_string(), to: "in_progress".to_string(), event: "Task_is_started".to_string(), guard: None },
+                    TransitionDef { from: "in_progress".to_string(), to: "completed".to_string(), event: "Task_is_finished".to_string(), guard: None },
+                ],
+                initial: "pending".to_string(),
+            });
+            // t1 exists, and carries ONLY the destination event Task_is_finished.
+            cells.entry("Task_has_Name".to_string()).or_default().push(
+                ast::fact_from_pairs(&[("Task", "t1"), ("Name", "Migrated")]));
+            cells.entry("Task_is_finished".to_string()).or_default().push(
+                ast::fact_from_pairs(&[("Task", "t1")]));
+            cells
+        };
+
+        // Collect every Status the fold/init ended up associating with t1
+        // in the final State_Machine_is_currently_in_Status cell, regardless
+        // of Seq- or Map-backed storage shape.
+        let t1_statuses = |new_state: &ast::Object| -> Vec<String> {
+            let cell = ast::fetch_or_phi("State_Machine_is_currently_in_Status", new_state);
+            ast::cell_facts_iter(&cell)
+                .filter(|f| ast::binding(f, "State Machine") == Some("t1"))
+                .filter_map(|f| ast::binding(f, "Status").map(|s| s.to_string()))
+                .collect()
+        };
+
+        // ── (A) UN-KEYED status cell (compile_cells → bare compile, no
+        //        _CellKeyRoles ⇒ folded/Seq storage) ─────────────────────
+        let unkeyed_statuses = {
+            let cells = build_cells();
+            let (state, defs, _def_map) = compile_cells(cells);
+            let dd = derivation_defs_from(&defs);
+            let (new_state, _derived) = forward_chain_defs_state(&dd, &state);
+            t1_statuses(&new_state)
+        };
+        // The from-guard alone strands t1: it is seeded `pending`, has no
+        // `started`, so `finished` (from=in_progress) never applies. The
+        // fold cannot synthesize the missing in_progress predecessor.
+        assert!(!unkeyed_statuses.iter().any(|s| s == "completed"),
+            "UN-KEYED: from-guard must prevent t1 (only Task_is_finished, no \
+             Task_is_started) from reaching 'completed' — it has no in_progress \
+             predecessor for finish (from=in_progress) to fire from. Got: {:?}",
+            unkeyed_statuses);
+        assert!(unkeyed_statuses.iter().any(|s| s == "pending"),
+            "UN-KEYED: t1 must FREEZE at the seeded initial 'pending' (the \
+             migration regression). Got: {:?}", unkeyed_statuses);
+
+        // ── (B) KEYED status cell (production shape: one-status-per-SM
+        //        alethic UC on State_Machine_is_currently_in_Status →
+        //        _CellKeyRoles registers it → cell_put_keyed routing) ─────
+        let (keyed_statuses, key_roles_registered) = {
+            let mut cells = build_cells();
+            // Declare the status FT explicitly so the schema carries known
+            // role names (State Machine @0, Status @1) — this is the same
+            // tuple shape the synthetic event-fold/init emit.
+            cells = with_ft(cells, "State_Machine_is_currently_in_Status", &FactTypeDef {
+                schema_id: String::new(),
+                reading: "State Machine is currently in Status".to_string(), readings: vec![],
+                roles: vec![
+                    RoleDef { noun_name: "State Machine".to_string(), role_index: 0 },
+                    RoleDef { noun_name: "Status".to_string(), role_index: 1 },
+                ],
+            });
+            // Alethic UC on role 0 (State Machine): at most one Status per
+            // State Machine. resolve_key_roles_for_ft → Some([0]) ⇒
+            // _CellKeyRoles registers the cell ⇒ integrate_round_facts
+            // routes writes through cell_put_keyed (CONFLICT-REJECT upsert).
+            cells = with_constraint(cells, &ConstraintDef {
+                id: "uc_one_status_per_sm".to_string(),
+                kind: "UC".to_string(),
+                modality: "Alethic".to_string(),
+                text: "Each State Machine is currently in at most one Status".to_string(),
+                spans: vec![SpanDef {
+                    fact_type_id: "State_Machine_is_currently_in_Status".to_string(),
+                    role_index: 0, subset_autofill: None,
+                }],
+                ..Default::default()
+            });
+            let state = build(cells);
+            // Production defs path so _CellKeyRoles lands in the overlay.
+            let defs = crate::compile::compile_to_defs_state(&state);
+            let d = ast::defs_to_state(&defs, &state);
+
+            // Confirm the cell is actually keyed (else the test proves nothing).
+            let kr = read_cell_key_roles(&d);
+            let registered = kr.get("State_Machine_is_currently_in_Status").cloned();
+
+            // Run only the derivation defs (init + event-fold) to fixpoint;
+            // forward_chain_defs_state reads _CellKeyRoles from `d` and routes
+            // the keyed cell through cell_put_keyed.
+            let dd: Vec<(&str, &ast::Func)> = defs.iter()
+                .filter(|(n, _)| n.starts_with("derivation:"))
+                .map(|(n, f)| (n.as_str(), f))
+                .collect();
+            let (new_d, _derived) = forward_chain_defs_state(&dd, &d);
+            (t1_statuses(&new_d), registered)
+        };
+
+        // Sanity: the cell must really be keyed on "State Machine".
+        assert_eq!(key_roles_registered.as_deref(), Some(&["State Machine".to_string()][..]),
+            "fixture must register State_Machine_is_currently_in_Status as a \
+             keyed cell (one-status-per-SM alethic UC); got {:?}", key_roles_registered);
+        // KEYED: t1 still never reaches 'completed' (from-guard blocks the
+        // fold from emitting it AND cell_put_keyed would reject the upsert).
+        assert!(!keyed_statuses.iter().any(|s| s == "completed"),
+            "KEYED: t1 must not reach 'completed' under the from-guard; got {:?}",
+            keyed_statuses);
+        assert!(keyed_statuses.iter().any(|s| s == "pending"),
+            "KEYED: t1 must FREEZE at seeded 'pending'; got {:?}", keyed_statuses);
+
+        // Diagnostic (visible with --nocapture): show t1's final statuses.
+        eprintln!("[VERIFY] migration-shape t1 final statuses — un-keyed: {:?}, keyed: {:?}",
+            unkeyed_statuses, keyed_statuses);
+
+        // Both paths agree: the migration-shape entity is stranded at the
+        // initial status. (The divergence the task asked about — keyed vs
+        // un-keyed — is that they AGREE on the freeze here; the keyed cell
+        // adds the conflict-reject barrier on top of the from-guard, but the
+        // from-guard already strands a destination-only entity regardless.)
+        assert_eq!(
+            unkeyed_statuses.iter().any(|s| s == "completed"),
+            keyed_statuses.iter().any(|s| s == "completed"),
+            "both keyed and un-keyed must agree t1 never reaches 'completed' \
+             (un-keyed {:?} vs keyed {:?})", unkeyed_statuses, keyed_statuses);
+    }
+
     /// task-6 / #6 ROOT-CAUSE repro: a transition trigger-FT cell that
     /// contains a fact with a φ (phi) value in the SM-noun role — e.g.
     /// `<<Task, φ>>` in Task_is_started (the live tasks.db has these).
