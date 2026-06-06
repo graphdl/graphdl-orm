@@ -1407,6 +1407,53 @@ fn metamodel_state() -> &'static ast::Object {
     })
 }
 
+/// perf-metamodel-parse-cache: the PARSE-ONLY metamodel state, folded with a
+/// GLOBAL metamodel-noun SEED so cross-slice circular references resolve
+/// regardless of fold order (e.g. `core.md` uses `Transition`, declared later
+/// in `state.md`). This is the same role the CLI dirs-compile path's
+/// full-corpus `noun_seed` plays — but seeded with ONLY metamodel nouns, so
+/// the result is APP-INDEPENDENT and therefore cacheable. (The plain
+/// `metamodel_state`/`metamodel_parsed` fold seeds progressively, with no
+/// noun catalog, so it mints the `Verb_is_performed_during_Transition` phantom
+/// that the dirs-compile seed exists to prevent — which is why a naive cache
+/// of THAT fold broke. This seeded fold is the correct, cacheable parse.)
+///
+/// Cached per-process here; the cross-process win (loading instead of parsing
+/// on each cold `arest-cli` spawn) is layered on by the disk cache keyed by
+/// the binary's git SHA.
+// `#[allow(dead_code)]`: the only caller is the `local`-gated CLI dirs-compile
+// path (cli/entry.rs), so a `--lib`/no-`local` build sees no use. It is live in
+// the shipping `arest-cli` (built with `--features local`).
+#[cfg(not(feature = "no_std"))]
+#[allow(dead_code)]
+static METAMODEL_PARSED_SEEDED: OnceLock<ast::Object> = OnceLock::new();
+
+#[cfg(not(feature = "no_std"))]
+#[allow(dead_code)]
+pub(crate) fn metamodel_parsed_state_seeded() -> &'static ast::Object {
+    METAMODEL_PARSED_SEEDED.get_or_init(|| {
+        // Build the metamodel noun catalog once (a bare noun seed), then fold
+        // every metamodel slice with it in scope so forward/circular noun
+        // references resolve no matter the slice order.
+        let corpus: String = metamodel_readings().iter()
+            .map(|(_, t)| *t).collect::<Vec<_>>().join("\n\n");
+        let noun_seed: ast::Object = {
+            let full = parse_forml2::parse_to_state_from(&corpus, &ast::Object::phi())
+                .unwrap_or_else(|e| panic!("metamodel corpus parse (noun seed): {}", e));
+            let mut m: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+            m.insert("Noun".to_string(), ast::fetch_cell_seq("Noun", &full));
+            ast::Object::map(m)
+        };
+        metamodel_readings().iter().fold(noun_seed, |acc, (name, text)| {
+            let parsed = parse_forml2::parse_to_state_from_in_domain(text, &acc, name)
+                .unwrap_or_else(|e| panic!("metamodel parse failed at readings/{}.md: {}", name, e));
+            let parsed = ast::annotate_noun_domain(&parsed, name);
+            let parsed = ast::merge_states(&parsed, &ast::stamp_file_domain(&parsed, name));
+            ast::merge_states(&acc, &parsed)
+        })
+    })
+}
+
 #[cfg(all(test, not(feature = "no_std")))]
 mod ns3_domain_binding_tests {
     use super::*;

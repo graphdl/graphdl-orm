@@ -4100,6 +4100,20 @@ pub fn prune_unreachable_fact_types(
 /// already in std-only contexts.
 #[cfg(not(feature = "no_std"))]
 pub fn bundled_domain_fact_type_ids() -> hashbrown::HashSet<String> {
+    bundled_domain_fact_type_ids_from(crate::metamodel_state())
+}
+
+/// Like [`bundled_domain_fact_type_ids`] but reads the metamodel Noun catalog
+/// from `noun_source` rather than forcing `crate::metamodel_state()`. Only the
+/// `Noun` cell is consumed (as the parse seed), so any state carrying the
+/// metamodel nouns works. perf-metamodel-parse-cache: the CLI dirs-compile
+/// path passes its already-cached seeded metamodel parse here, so tree-shake
+/// does NOT trigger the cold `metamodel_state()` fold+compile (~8-9s/process)
+/// merely to enumerate the bundled domain FT ids.
+#[cfg(not(feature = "no_std"))]
+pub fn bundled_domain_fact_type_ids_from(
+    noun_source: &crate::ast::Object,
+) -> hashbrown::HashSet<String> {
     const DOMAIN_MODULES: &[&str] = &[
         "ui", "design", "monoview", "components", "render",
         "filesystem", "organizations", "agents", "sql-dialects", "wine",
@@ -4107,7 +4121,7 @@ pub fn bundled_domain_fact_type_ids() -> hashbrown::HashSet<String> {
     let seed = {
         let mut m: hashbrown::HashMap<String, crate::ast::Object> = hashbrown::HashMap::new();
         m.insert("Noun".to_string(),
-            crate::ast::fetch_cell_seq("Noun", crate::metamodel_state()));
+            crate::ast::fetch_cell_seq("Noun", noun_source));
         crate::ast::Object::map(m)
     };
     let corpus: String = crate::metamodel_readings().into_iter()

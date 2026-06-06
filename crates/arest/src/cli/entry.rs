@@ -328,6 +328,74 @@ mod db {
 }
 
 // =========================================================================
+// perf-metamodel-parse-cache (cross-process). Grounded in AREST.tex
+// §Conclusion: "cacheability because the representation is a deterministic
+// function of P and S" (Thm. Derivability); the FILE store of eq:pop
+// (`P = ⋃ ↑FILE:D_n`) is the persistence medium; and "versioning is the
+// event stream" — the cache is CONTENT-ADDRESSED by a hash of the bundled
+// metamodel readings, so it auto-invalidates the instant those readings
+// change (≈ a rebuild). The seeded metamodel parse is a deterministic
+// function of those (binary-constant) readings, so a cold `arest-cli` spawn
+// can LOAD it (~1-2s) instead of re-folding it (~15s). Determinism
+// (Constraint Consensus — deterministic replay) is what guarantees the warm
+// load equals the cold fold; the cold-vs-warm 6249/838 gate verifies it.
+// =========================================================================
+
+/// Content hash (FNV-1a) of the bundled metamodel readings — the cache key.
+#[cfg(feature = "local")]
+fn metamodel_readings_signature() -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for entry in crate::metamodel_readings() {
+        for b in entry.0.bytes() { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+        h ^= 0x1f; h = h.wrapping_mul(0x100000001b3);
+        for b in entry.1.bytes() { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+        h ^= 0x1e; h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// FILE path of the metamodel parse cache for the current readings signature.
+#[cfg(feature = "local")]
+fn metamodel_parse_cache_path() -> std::path::PathBuf {
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("arest-metamodel-parse-{:016x}.db", metamodel_readings_signature()));
+    dir
+}
+
+/// Load the cached deterministic metamodel parse from FILE, or None if absent
+/// / unreadable / empty (→ caller rebuilds). The signature is encoded in the
+/// filename, so a present, populated file IS by construction the parse of the
+/// current readings — no separate version check needed.
+#[cfg(feature = "local")]
+fn load_metamodel_parse_cache() -> Option<ast::Object> {
+    let path = metamodel_parse_cache_path();
+    if !path.exists() { return None; }
+    let conn = rusqlite::Connection::open(&path).ok()?;
+    let loaded = db::load_state(&conn);
+    // A populated Noun cell confirms a usable cache (guards a torn/empty file).
+    let usable = ast::fetch_cell_seq("Noun", &loaded).as_seq().map_or(false, |s| !s.is_empty());
+    usable.then_some(loaded)
+}
+
+/// Persist the deterministic metamodel parse to FILE for cross-process reuse.
+/// Writes to a per-process temp then atomically renames, so concurrent
+/// compilers (different apps, same binary) never observe a torn file; the
+/// content is deterministic, so racing writers emit byte-identical files.
+#[cfg(feature = "local")]
+fn store_metamodel_parse_cache(cells: &ast::Object) {
+    let path = metamodel_parse_cache_path();
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    if let Ok(conn) = rusqlite::Connection::open(&tmp) {
+        db::ensure_meta_tables(&conn);
+        db::persist_state(&conn, cells);
+        drop(conn);
+        let _ = std::fs::rename(&tmp, &path);
+    }
+    let _ = std::fs::remove_file(&tmp);
+}
+
+// =========================================================================
 // SYSTEM is the only function
 // =========================================================================
 
@@ -1132,51 +1200,78 @@ pub fn main_entry() {
                     .map(|r| (r.0, r.1))
                     .chain(readings.iter().map(|(n, t)| (n.as_str(), t.as_str())))
                     .collect();
-                // Pass 1: parse fresh to discover which cell names are
-                // readings-derived. This is the structural authority
-                // for "what does the parser write?" — no hardcoded list.
-                // Seed the fold with the GLOBAL noun catalog so every slice
-                // sees all declared nouns regardless of fold order. The #932
-                // metamodel split declares `Transition` in state.md but uses
-                // it in core.md (folded earlier); the deps are circular
-                // (state.md uses `Verb` from core.md), so no fold order works.
-                // Without the global seed, the earlier slice tokenizes the
-                // unrecognized role noun into `fact_type_id_from_reading`'s
-                // lowercased tail and mints a divergent phantom FT
-                // (`Verb_is_performed_during_transition`) that case-collides
-                // with the canonical `…_Transition` cell and breaks SQL
-                // materialization on recompile of an existing app DB.
-                let noun_seed: ast::Object = {
-                    let corpus: String = all_readings.iter()
-                        .map(|(_, t)| *t).collect::<Vec<_>>().join("\n\n");
-                    let full = parse_forml2::parse_to_state_from(&corpus, &ast::Object::phi())
-                        .unwrap_or_else(|e| { eprintln!("metamodel corpus parse: {}", e); std::process::exit(1); });
-                    let mut m: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
-                    m.insert("Noun".to_string(), ast::fetch_cell_seq("Noun", &full));
-                    ast::Object::map(m)
+                // perf-metamodel-parse-cache (Step 1 — correctness): fold ONLY
+                // the app readings onto the SEEDED, app-independent metamodel
+                // parse (`metamodel_parsed_state_seeded`), rather than re-parsing
+                // every metamodel slice each compile.
+                //
+                // The metamodel's circular deps (e.g. core.md uses `Transition`
+                // from state.md) were resolved by the metamodel-NOUN seed when the
+                // cache was folded — so the phantom that broke the earlier attempt
+                // (which cached the UN-seeded fold) cannot arise. App slices are
+                // still parsed against the GLOBAL noun catalog (cached metamodel
+                // nouns + every app noun) so cross-app-file forward refs resolve
+                // exactly as the old full-corpus seed allowed. Gated by the
+                // 6254-fact / 838-completed / full-suite equivalence checks; if a
+                // metamodel slice genuinely needed an APP noun, those catch it.
+                //
+                // Step 2 (cross-process): a cold `arest-cli` LOADS the seeded
+                // parse from its content-addressed FILE cache (~1-2s) instead of
+                // re-folding it (~15s); only a cache MISS (first compile per
+                // binary) pays the fold and writes the cache. See the
+                // perf-metamodel-parse-cache block above mod `system`.
+                let mm_parsed_cached: ast::Object;
+                let mm_parsed: &ast::Object = match load_metamodel_parse_cache() {
+                    Some(cells) => {
+                        eprintln!("[load] metamodel parse: FILE cache hit");
+                        mm_parsed_cached = cells;
+                        &mm_parsed_cached
+                    }
+                    None => {
+                        let fresh = crate::metamodel_parsed_state_seeded();
+                        store_metamodel_parse_cache(fresh);
+                        eprintln!("[load] metamodel parse: cache miss, folded + stored");
+                        fresh
+                    }
                 };
-                // task-951-b: build the source-file → ORM-element provenance
-                // map (a `Provenance` cell) by replaying this same fold with
-                // the same seed/context, capturing per-file element deltas.
-                // Built here, before the fold MOVES `noun_seed`, so the
-                // provenance fold sees the identical seed. Attached to `state`
-                // below for the NORMA exporter's per-file ORMDiagram tabs.
-                let provenance_cell = build_provenance_cell(&all_readings, &noun_seed);
-                let parsed_fresh = all_readings.iter().fold(
-                    noun_seed,
+                let app_noun_seed: ast::Object = {
+                    let corpus: String = readings.iter()
+                        .map(|(_, t)| t.as_str()).collect::<Vec<_>>().join("\n\n");
+                    if corpus.trim().is_empty() {
+                        ast::Object::phi()
+                    } else {
+                        let full = parse_forml2::parse_to_state_from(&corpus, &ast::Object::phi())
+                            .unwrap_or_else(|e| { eprintln!("app corpus parse: {}", e); std::process::exit(1); });
+                        let mut m: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+                        m.insert("Noun".to_string(), ast::fetch_cell_seq("Noun", &full));
+                        ast::Object::map(m)
+                    }
+                };
+                // Global Noun-only seed (cached metamodel nouns + app nouns) — the
+                // shape `build_provenance_cell` expects.
+                let global_noun_seed: ast::Object = {
+                    let mut m: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
+                    m.insert("Noun".to_string(), ast::fetch_cell_seq("Noun", mm_parsed));
+                    ast::merge_states(&ast::Object::map(m), &app_noun_seed)
+                };
+                // task-951-b: source-file → ORM-element provenance map for the
+                // NORMA exporter's per-file ORMDiagram tabs. Still over every file.
+                let provenance_cell = build_provenance_cell(&all_readings, &global_noun_seed);
+                // Fold base = cached (seeded) metamodel cells + the app noun
+                // catalog; fold ONLY the app readings on top.
+                let fold_base = ast::merge_states(mm_parsed, &app_noun_seed);
+                let parsed_fresh = readings.iter().fold(
+                    fold_base,
                     |merged, (name, text)| {
                         // ns-5: parse knowing this slice's local domain (ns-3
                         // file domain = reading name) so a bare reference to a
                         // locally-declared noun resolves locally (precedence 1).
-                        let this = parse_forml2::parse_to_state_from_in_domain(text, &merged, name)
+                        let this = parse_forml2::parse_to_state_from_in_domain(text.as_str(), &merged, name.as_str())
                             .unwrap_or_else(|e| { eprintln!("{}: {}", name, e); std::process::exit(1); });
-                        // ns-3: stamp this slice's declared Functions with its file
-                        // domain (the reading name) — same per-file binding as
-                        // metamodel_state(). Flows into `state` at the Pass-2 assembly
-                        // below, so dirs-compiled apps carry per-file domains.
+                        // ns-3: stamp declared Functions with their file domain.
                         // ns-4: tag Noun facts with homeDomain for keyed identity.
-                        let this = ast::annotate_noun_domain(&this, name);
-                        let this = ast::merge_states(&this, &ast::stamp_file_domain(&this, name));
+                        let this = ast::annotate_noun_domain(&this, name.as_str());
+                        let this = ast::merge_states(&this, &ast::stamp_file_domain(&this, name.as_str()));
                         ast::merge_states(&merged, &this)
                     },
                 );
@@ -1270,8 +1365,17 @@ pub fn main_entry() {
                             .unwrap_or_default()
                     };
                     let all_ft_ids = ft_ids(&state);
-                    let base_ft_ids = ft_ids(crate::metamodel_state());
-                    let domain_ft_ids = crate::compile::bundled_domain_fact_type_ids();
+                    // perf-metamodel-parse-cache: enumerate the metamodel's FT
+                    // ids and bundled-domain FT ids from the already-cached
+                    // seeded parse (`mm_parsed`) instead of forcing the cold
+                    // `metamodel_state()` fold+compile (~8-9s/process) — both of
+                    // these previously triggered it just to read FT/Noun cells.
+                    // The metamodel FactType/Noun cells are identical between the
+                    // seeded parse and metamodel_state (FT enumeration is
+                    // parse-determined), so `roots`/`keep` are unchanged — gated
+                    // by the unchanged pruned-count + 6249/838.
+                    let base_ft_ids = ft_ids(mm_parsed);
+                    let domain_ft_ids = crate::compile::bundled_domain_fact_type_ids_from(mm_parsed);
                     // App roots = fact types the app itself declares (not base).
                     let roots: hashbrown::HashSet<String> =
                         all_ft_ids.difference(&base_ft_ids).cloned().collect();
@@ -1466,7 +1570,37 @@ pub fn main_entry() {
                     }
                     out
                 };
-                let d = if derived_cells.is_empty() { d } else {
+                // delta-lfp-noop-skip: the derivation output is a deterministic
+                // function of (readings, population, binary) — AREST.tex
+                // cacheability / Thm. Derivability. The population's derived
+                // facts are kept consistent by `apply` (it re-derives on every
+                // mutation), so the persisted derived cells — carried into `d` by
+                // the cor:closure merge — are ALREADY the valid LFP whenever the
+                // READINGS and BINARY are unchanged: `#836`'s drop + re-derive
+                // would reproduce them byte-for-byte. Hash both; if the sig
+                // matches the one the last *converged* compile stored, skip the
+                // drop + chain (the ~14s app SM-fold). Any readings/binary change
+                // → full re-derive. Gated by warm-recompile == cold (838).
+                let compile_sig: String = {
+                    let mut h: u64 = 0xcbf29ce484222325;
+                    for r in &readings {
+                        for b in r.0.bytes().chain(r.1.bytes()) { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+                        h ^= 0x1e; h = h.wrapping_mul(0x100000001b3);
+                    }
+                    for b in env!("AREST_GIT_SHA").bytes() { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+                    alloc::format!("{:016x}", h)
+                };
+                let prior_sig = ast::fetch_or_phi("_CompileSig", &d).as_atom().map(|s| s.to_string());
+                // Only skip when prior derived state actually exists (a populated
+                // consequent cell) — never on a first/empty compile.
+                let has_derived = derived_cells.iter().any(|c|
+                    ast::fetch_cell_seq(c, &d).as_seq().map_or(false, |s| !s.is_empty()));
+                let inputs_unchanged = prior_sig.as_deref() == Some(compile_sig.as_str()) && has_derived;
+                if inputs_unchanged {
+                    eprintln!("[load] derivation skipped: readings+binary unchanged since last \
+                               converged compile (delta-LFP no-op)");
+                }
+                let d = if derived_cells.is_empty() || inputs_unchanged { d } else {
                     eprintln!("[load] dropping {} derived cells before forward-chain (LFP per request, #836): {:?}",
                         derived_cells.len(), derived_cells);
                     let mut new_map: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
@@ -1536,18 +1670,46 @@ pub fn main_entry() {
                 // and `forward_chain_stratified_n(positive, [], …)` reduces
                 // to a single `forward_chain_defs_state` over the positive
                 // rules (see evaluate.rs:683-684). Call that directly.
-                let d = if stratum1.is_empty() { d } else {
-                    let pos_refs: Vec<(&str, &ast::Func)> = stratum1.iter()
-                        .map(|(name, func)| (name.as_str(), func)).collect();
+                let (d, chain_converged) = if stratum1.is_empty() || inputs_unchanged {
+                    // delta-lfp-noop-skip: nothing to derive (no rules) OR inputs
+                    // unchanged → the kept derived cells are the valid LFP. Treat
+                    // as converged so the input sig is (re)persisted below.
+                    (d, true)
+                } else {
+                    // perf-chain-seminaive: run the full-compile chain through
+                    // the SEMI-NAIVE chainer (the apply path already does this —
+                    // command.rs). Each rule is packed with its
+                    // `derivation_reads:<id>` sidecar (compile.rs emits one per
+                    // rule, incl. the SM event-fold), so a round only re-runs
+                    // rules whose antecedent cells were written last round. A
+                    // rule with NO sidecar maps to `None` and runs EVERY round —
+                    // identical to the prior naive chainer — so the change can
+                    // only ever SHRINK work, never alter the fixpoint. Round 0
+                    // runs every rule (`dirty_cells` starts `None`), so a full
+                    // compile still materializes the complete LFP; the
+                    // self-referential SM event-fold (reads + writes the status
+                    // cell) re-fires each round it advances and converges as
+                    // before. Net: the tasks-app chain drops from ~19s (89 rules
+                    // × every round) to a few seconds.
+                    let packed: Vec<(&str, &ast::Func, Option<Vec<String>>)> = stratum1.iter()
+                        .map(|(name, func)| {
+                            let id = name.split_once(':').map(|(_, id)| id).unwrap_or(name.as_str());
+                            (name.as_str(), func, crate::evaluate::read_derivation_reads(&d, id))
+                        })
+                        .collect();
+                    let sn_refs: Vec<(&str, &ast::Func, Option<&[String]>)> = packed.iter()
+                        .map(|(name, func, reads)| (*name, *func, reads.as_deref()))
+                        .collect();
                     let (new_d, derived) =
-                        crate::evaluate::forward_chain_defs_state(&pos_refs, &d);
+                        crate::evaluate::forward_chain_defs_state_semi_naive(&sn_refs, &d, 100);
                     // cli-apply-large-tasksdb-nonterminating: consume the
                     // chain-abort flag so it can't leak past this compile.
                     // The chain already logged a traced ⊥ naming the
                     // churning rule/cell; surface a clear compile-time
                     // note too. Partial state is persisted (the chain's
                     // pre-existing cap-hit behavior) rather than hanging.
-                    if crate::evaluate::take_chain_abort() {
+                    let aborted = crate::evaluate::take_chain_abort();
+                    if aborted {
                         eprintln!("[load] WARNING: forward-chain did NOT converge \
                             (aborted on its time budget — see the ⊥ trace above); \
                             persisting a PARTIAL fixpoint. A derivation rule is \
@@ -1555,8 +1717,17 @@ pub fn main_entry() {
                     }
                     eprintln!("[load] forward-chain fixpoint: {} rules, {} facts derived",
                         stratum1.len(), derived.len());
-                    new_d
+                    (new_d, !aborted)
                 };
+                // delta-lfp-noop-skip: persist the input sig so a FUTURE no-op
+                // recompile can skip — but ONLY after a COMPLETE LFP (converged),
+                // never after a partial/aborted chain (so the next compile
+                // re-derives). On the skip path `d` already carries a matching
+                // sig (from the prior compile, via the cor:closure merge); we
+                // re-store it harmlessly.
+                let d = if chain_converged {
+                    ast::store("_CompileSig", ast::Object::atom(&compile_sig), &d)
+                } else { d };
 
                 // Final subjectless-GC: extend cor:closure sanitation to the
                 // compiled output. The preserve-time GC (above) only cleans

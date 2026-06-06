@@ -314,46 +314,34 @@ fn integrate_round_facts(
     let mut current_state = state;
     for (cell_name, facts) in by_cell {
         if let Some(roles) = key_roles.get(&cell_name) {
-            // Map-backed cell: each fact is upserted by its named-role
-            // key. Multiple facts in the same round at the same key
-            // collapse to the last-write — matches the alethic-UC
-            // semantics (only one tuple per key is structurally
-            // permitted). The first write also migrates any pre-existing
-            // Seq contents into the Map (see `cell_put_keyed`).
+            // Map-backed cell: the round's facts are upserted by their
+            // named-role key in ONE map clone (perf-cellput-on2). Multiple
+            // facts in the same round at the same key collapse to the
+            // last-write for the SM-status upsert cell, and to the FIRST
+            // (later ones conflict-drop) for every other keyed cell —
+            // matching the alethic-UC semantics (one tuple per key). The
+            // batch also migrates any pre-existing Seq contents into the
+            // Map (see `cell_put_keyed_batch`).
+            //
+            // sm-status-scoped-upsert: for `State_Machine_is_currently_in_Status`
+            // the recursive from-guarded event-fold ADVANCES status, so a
+            // same-key conflict is a LEGAL advance (the from-guard already
+            // filtered to resources in `from`). `upsert=true` makes that
+            // last-write-wins; every other keyed cell keeps the global
+            // conflict-reject (`upsert=false`).
+            //
+            // task-820: a conflicting write on a non-upsert cell is logged
+            // (loud + noisy, debug-only) and DROPPED so one misbehaving
+            // rule can't kill the whole compile — never fatal. Idempotent
+            // re-emission is filtered by the `existing_keys + round_keys`
+            // dedup upstream, so only genuine conflicts surface here.
             let role_refs: Vec<&str> = roles.iter().map(|s| s.as_str()).collect();
-            for fact in facts {
-                // task-820: KeyConflict means a rule emitted a fact
-                // that collides with an existing keyed entry. Log to
-                // stderr and skip the emit so a single misbehaving
-                // rule doesn't kill the whole compile. The diagnostic
-                // is preserved (loud and noisy on stderr) but no
-                // longer fatal. Idempotent re-emission is filtered by
-                // the `existing_keys + round_keys` dedup upstream;
-                // only genuinely-conflicting writes hit this path.
-                match ast::cell_put_keyed(&cell_name, &role_refs, fact, &current_state) {
-                    Ok(next) => { current_state = next; }
-                    Err(conflict) if cell_is_sm_status_upsert(&cell_name) => {
-                        // sm-status-scoped-upsert: this is the SM-status
-                        // cell, whose recursive from-guarded event-fold
-                        // ADVANCES status. A conflict here is a LEGAL
-                        // advance (the from-guard already filtered to
-                        // resources currently in `from`) landing over the
-                        // prior status at the same State-Machine key.
-                        // Upsert = last-write-wins: vacate the slot, then
-                        // re-put. The second put cannot conflict (slot is
-                        // empty). Mirrors command.rs::push_with_uc_check's
-                        // `overwrite` branch, but scoped to this cell on the
-                        // forward-chain path only.
-                        let cleared = drop_keyed_entry(
-                            &cell_name, &conflict.key, &role_refs, &current_state);
-                        current_state = ast::cell_put_keyed(
-                            &cell_name, &role_refs, conflict.incoming_fact, &cleared)
-                            .unwrap_or(cleared);
-                    }
-                    Err(conflict) => {
-                        crate::diag!("[forward-chain] UC conflict, dropping fact: {:?}", conflict);
-                    }
-                }
+            let upsert = cell_is_sm_status_upsert(&cell_name);
+            let (next, conflicts) = ast::cell_put_keyed_batch(
+                &cell_name, &role_refs, facts, upsert, &current_state);
+            current_state = next;
+            for conflict in conflicts {
+                crate::diag!("[forward-chain] UC conflict, dropping fact: {:?}", conflict);
             }
         } else {
             // #932 phase-2: keyless fact cells fold to a Map keyed by the
@@ -361,47 +349,18 @@ fn integrate_round_facts(
             // — rather than an un-folded Seq append. Re-derivation of an
             // identical fact is an idempotent no-op; distinct tuples (incl.
             // ring fact types whose duplicate role names a by-name key
-            // cannot tell apart) each get their own row.
-            for fact in facts {
-                current_state = ast::cell_put_folded(&cell_name, fact, &current_state);
-            }
+            // cannot tell apart) each get their own row. The whole round's
+            // facts integrate in ONE map clone (perf-cellput-on2).
+            current_state = ast::cell_put_folded_batch(&cell_name, facts, &current_state);
         }
     }
     current_state
 }
 
-/// sm-status-scoped-upsert helper: remove the Map entry under `key` from
-/// cell `name` so a subsequent `cell_put_keyed` of a new value at that key
-/// cannot conflict. Map case is a direct `HashMap::remove`; a Seq cell
-/// (pre-migration shape) is filtered by extracted key. Module-private twin
-/// of `command.rs::drop_keyed_entry`; the forward-chain upsert path needs
-/// it without taking a cross-module dependency, and the SM-status cell is
-/// Map-backed by the time the event-fold advances it (the first keyed put
-/// migrates Seq→Map), so the Map arm is the live path.
-fn drop_keyed_entry(
-    name: &str,
-    key: &str,
-    key_role_names: &[&str],
-    state: &ast::Object,
-) -> ast::Object {
-    let existing = ast::fetch_or_phi(name, state);
-    match &existing {
-        ast::Object::Map(m) => {
-            let mut next = (**m).clone();
-            next.remove(key);
-            ast::store(name, ast::Object::Map(next.into()), state)
-        }
-        ast::Object::Seq(items) => {
-            let kept: Vec<ast::Object> = items.iter()
-                .filter(|f| ast::extract_key_from_fact(f, key_role_names)
-                    .as_deref() != Some(key))
-                .cloned()
-                .collect();
-            ast::store(name, ast::Object::Seq(kept.into()), state)
-        }
-        _ => state.clone(),
-    }
-}
+// perf-cellput-on2: the former `drop_keyed_entry` helper (a Map clone +
+// remove, used by the per-fact upsert conflict arm) is gone — the
+// sm-status last-write-wins is now a single in-place `HashMap::insert`
+// inside `ast::cell_put_keyed_batch`, so no separate vacate step exists.
 
 /// task-3-incremental: per-thread instrumentation counting the number
 /// of rule activations across all rounds of the most recent
@@ -2692,6 +2651,78 @@ mod tests {
             "non-SM keyed cell must REJECT the conflicting (alice→B) write and \
              keep the original (alice→A) — global UC enforcement unchanged; \
              got {:?}", names);
+    }
+
+    /// perf-cellput-on2 O(n²) regression GUARD (keyless/folded path):
+    /// `integrate_round_facts` must deep-clone each cell's backing Map a
+    /// CONSTANT number of times per round, independent of how many facts
+    /// the round adds. The pre-fix per-fact loop cloned once PER fact, so
+    /// the clone count grew with N — the O(n²) that made a single 7378-fact
+    /// classification round take ~29s. Reverting to a per-fact loop makes
+    /// the count scale with N and fails this deterministically (no timing).
+    #[test]
+    fn integrate_round_facts_folded_clones_cell_once_per_round_not_per_fact() {
+        use hashbrown::HashMap as HbMap;
+        let clones_for = |n: usize| -> usize {
+            // Seed the cell as a Map (keyless/folded). Seed clone is OUTSIDE
+            // the measured window — counter is reset after it.
+            let seed_fact = ast::fact_from_pairs(&[("App", "seed"), ("Generator", "g0")]);
+            let state = ast::cell_put_folded("App_uses_Generator", seed_fact, &ast::Object::phi());
+            let facts: Vec<ast::Object> = (0..n).map(|i| {
+                let g = alloc::format!("g{}", i + 1);
+                ast::fact_from_pairs(&[("App", "seed"), ("Generator", g.as_str())])
+            }).collect();
+            let mut by_cell: HbMap<String, Vec<ast::Object>> = HbMap::new();
+            by_cell.insert("App_uses_Generator".to_string(), facts);
+            let key_roles: HbMap<String, Vec<String>> = HbMap::new(); // keyless → folded
+            ast::reset_cell_map_clone_count();
+            let _ = integrate_round_facts(state, by_cell, &key_roles);
+            ast::get_cell_map_clone_count()
+        };
+        let small = clones_for(8);
+        let large = clones_for(512);
+        assert_eq!(small, large,
+            "integrate_round_facts must clone each cell's Map a CONSTANT number of \
+             times per round (O(n) integration); got {} clones for 8 facts and {} \
+             for 512 — a per-fact O(n²) integration regressed", small, large);
+        assert_eq!(large, 1,
+            "batched integration clones the cell Map exactly ONCE per round; got {} \
+             (0 ⇒ counter not wired / vacuous test; >1 ⇒ per-fact regression)", large);
+    }
+
+    /// perf-cellput-on2 O(n²) regression GUARD (keyed/Map-UC path): same
+    /// invariant for the keyed integration branch — one Map clone per round
+    /// regardless of batch size.
+    #[test]
+    fn integrate_round_facts_keyed_clones_cell_once_per_round_not_per_fact() {
+        use hashbrown::HashMap as HbMap;
+        let clones_for = |n: usize| -> usize {
+            let seed = ast::cell_put_keyed(
+                "Task_has_Status", &["Task"],
+                ast::fact_from_pairs(&[("Task", "seed"), ("Status", "pending")]),
+                &ast::Object::phi()).expect("seed write");
+            // n DISTINCT keys → n fresh inserts, no conflict-drops.
+            let facts: Vec<ast::Object> = (0..n).map(|i| {
+                let t = alloc::format!("t{}", i);
+                ast::fact_from_pairs(&[("Task", t.as_str()), ("Status", "pending")])
+            }).collect();
+            let mut by_cell: HbMap<String, Vec<ast::Object>> = HbMap::new();
+            by_cell.insert("Task_has_Status".to_string(), facts);
+            let mut key_roles: HbMap<String, Vec<String>> = HbMap::new();
+            key_roles.insert("Task_has_Status".to_string(), vec!["Task".to_string()]);
+            ast::reset_cell_map_clone_count();
+            let _ = integrate_round_facts(seed, by_cell, &key_roles);
+            ast::get_cell_map_clone_count()
+        };
+        let small = clones_for(8);
+        let large = clones_for(512);
+        assert_eq!(small, large,
+            "integrate_round_facts (keyed) must clone the cell Map a CONSTANT number \
+             of times per round; got {} for 8 facts and {} for 512 — per-fact O(n²) \
+             regression", small, large);
+        assert_eq!(large, 1,
+            "batched keyed integration clones the cell Map exactly ONCE per round; \
+             got {} (0 ⇒ counter not wired / vacuous test; >1 ⇒ per-fact regression)", large);
     }
 
     /// CONTRACT (bf5db0de from-guard + sm-status-scoped-upsert):

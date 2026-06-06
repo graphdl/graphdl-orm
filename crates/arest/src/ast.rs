@@ -4871,6 +4871,44 @@ pub struct KeyConflict {
     pub incoming_fact: Object,
 }
 
+/// perf-cellput-on2: test-only instrumentation counting how many times a
+/// cell's backing `HashMap` is deep-cloned (`(**m).clone()`) across the
+/// cell-put family. This is the operation whose per-fact repetition made
+/// `integrate_round_facts` O(n²) (each `cell_put_*` re-cloned the whole
+/// growing Map). The batched integrators clone ONCE per cell per round, so
+/// the count is CONSTANT in the batch size — the O(n²)-regression guards
+/// (`integrate_round_facts_*_clones_cell_once_per_round_not_per_fact`)
+/// assert exactly that invariant. Mirrors `evaluate::chain_eval_counter`:
+/// thread-local (parallel-test-safe), compiled only under test/test-bins,
+/// and a zero-cost empty `record_*` in production no_std builds.
+#[cfg(any(test, feature = "test-bins"))]
+mod cell_map_clone_counter {
+    use core::cell::Cell;
+    std::thread_local! {
+        pub static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+}
+
+/// Reset the cell-Map deep-clone counter. Call before the measured window.
+#[cfg(any(test, feature = "test-bins"))]
+pub fn reset_cell_map_clone_count() {
+    cell_map_clone_counter::COUNT.with(|c| c.set(0));
+}
+
+/// Read the cell-Map deep-clone counter accumulated since the last reset.
+#[cfg(any(test, feature = "test-bins"))]
+pub fn get_cell_map_clone_count() -> usize {
+    cell_map_clone_counter::COUNT.with(|c| c.get())
+}
+
+/// Record one cell-Map deep-clone. No-op (and trivially inlined away) in
+/// non-test builds, so the production hot path pays nothing.
+#[inline]
+fn record_cell_map_clone() {
+    #[cfg(any(test, feature = "test-bins"))]
+    cell_map_clone_counter::COUNT.with(|c| c.set(c.get() + 1));
+}
+
 /// task-744 / #743: write a fact into a cell that is keyed by its
 /// reference-scheme roles (`key_roles`). The cell contents become an
 /// `Object::Map<key, fact>` where key is the concatenation of the
@@ -4916,7 +4954,7 @@ pub fn cell_put_keyed(
     };
     let existing = fetch_or_phi(name, state);
     let mut map: HashMap<String, Object> = match &existing {
-        Object::Map(m) => (**m).clone(),
+        Object::Map(m) => { record_cell_map_clone(); (**m).clone() }
         Object::Seq(items) if items.is_empty() => HashMap::new(),
         Object::Seq(items) => {
             // Migration: existing Seq contents rebuild into Map keyed
@@ -4997,7 +5035,7 @@ pub fn cell_put_folded(name: &str, fact: Object, state: &Object) -> Object {
     let key = synthesize_fact_id(name, &fact);
     let existing = fetch_or_phi(name, state);
     let mut map: HashMap<String, Object> = match &existing {
-        Object::Map(m) => (**m).clone(),
+        Object::Map(m) => { record_cell_map_clone(); (**m).clone() }
         Object::Seq(items) => items
             .iter()
             .map(|f| (synthesize_fact_id(name, f), f.clone()))
@@ -5006,6 +5044,111 @@ pub fn cell_put_folded(name: &str, fact: Object, state: &Object) -> Object {
     };
     map.insert(key, fact);
     store(name, Object::Map(map.into()), state)
+}
+
+/// Batched counterpart to [`cell_put_folded`]: fold MANY facts into a
+/// keyless cell with a SINGLE map clone + `store`, instead of one clone
+/// per fact. Behavior-identical to folding `cell_put_folded` over
+/// `facts` (set semantics; full-tuple key via `synthesize_fact_id`;
+/// idempotent re-assert collapses), but O(n) where the per-fact loop was
+/// O(n²) — every `cell_put_folded` re-cloned the whole growing Map
+/// (ast.rs:5000), so integrating N facts cost Σⁿ clones.
+///
+/// perf-cellput-on2: the 8001-line tasks readings drove ~7378
+/// classification facts into a single cell in ONE forward-chain round;
+/// the per-fact path then spent ~29s re-cloning that Map (see
+/// `evaluate::integrate_round_facts`, the sole caller). One clone here
+/// collapses that round to ~milliseconds.
+pub fn cell_put_folded_batch(name: &str, facts: Vec<Object>, state: &Object) -> Object {
+    if facts.is_empty() {
+        return state.clone();
+    }
+    let existing = fetch_or_phi(name, state);
+    let mut map: HashMap<String, Object> = match &existing {
+        Object::Map(m) => { record_cell_map_clone(); (**m).clone() }
+        Object::Seq(items) => items
+            .iter()
+            .map(|f| (synthesize_fact_id(name, f), f.clone()))
+            .collect(),
+        _ => HashMap::new(),
+    };
+    for fact in facts {
+        let key = synthesize_fact_id(name, &fact);
+        map.insert(key, fact);
+    }
+    store(name, Object::Map(map.into()), state)
+}
+
+/// Batched counterpart to [`cell_put_keyed`]: integrate MANY facts into a
+/// keyed (alethic-UC) cell with a SINGLE map clone + `store`. Returns the
+/// new state and the conflicts that were DROPPED (so the caller can log
+/// them exactly as the per-fact path did).
+///
+/// Semantics mirror `cell_put_keyed` plus the conflict handling that
+/// lived in `integrate_round_facts`, per fact:
+///   * key absent              → insert
+///   * key present, == fact     → idempotent no-op
+///   * key present, != fact:
+///       - `upsert == true`     → last-write-wins (overwrite); not a conflict
+///       - `upsert == false`    → keep existing; return the `KeyConflict`
+/// Within one batch, two facts at the same key resolve the same way two
+/// sequential calls would: non-upsert keeps the FIRST (later ones
+/// conflict), upsert keeps the LAST. The `upsert` arm subsumes the old
+/// `drop_keyed_entry` + re-put (a SECOND full clone per conflicting
+/// write) with a single in-place `HashMap::insert`. O(n) vs O(n²).
+pub fn cell_put_keyed_batch(
+    name: &str,
+    key_role_names: &[&str],
+    facts: Vec<Object>,
+    upsert: bool,
+    state: &Object,
+) -> (Object, Vec<KeyConflict>) {
+    if facts.is_empty() {
+        return (state.clone(), Vec::new());
+    }
+    let existing = fetch_or_phi(name, state);
+    let mut map: HashMap<String, Object> = match &existing {
+        Object::Map(m) => { record_cell_map_clone(); (**m).clone() }
+        Object::Seq(items) if items.is_empty() => HashMap::new(),
+        Object::Seq(items) => {
+            // Migration: rebuild a pre-existing Seq cell into the Map
+            // keyed by the same roles (later wins on key clash, matching
+            // `cell_put_keyed`'s migration arm).
+            let mut m = HashMap::new();
+            for f in items.iter() {
+                if let Some(k) = extract_key_from_fact(f, key_role_names) {
+                    m.insert(k, f.clone());
+                }
+            }
+            m
+        }
+        _ => HashMap::new(),
+    };
+    let mut conflicts: Vec<KeyConflict> = Vec::new();
+    for fact in facts {
+        let Some(key) = extract_key_from_fact(&fact, key_role_names) else {
+            continue;
+        };
+        // `.cloned()` releases the immutable borrow of `map` before the
+        // insert in the fall-through arm; the clone only happens on the
+        // rare key-present path, not the common fresh-insert path.
+        match map.get(&key).cloned() {
+            Some(existing_fact) if existing_fact == fact => { /* idempotent no-op */ }
+            Some(existing_fact) if !upsert => {
+                conflicts.push(KeyConflict {
+                    name: name.into(),
+                    key,
+                    existing_fact,
+                    incoming_fact: fact,
+                });
+            }
+            // None (fresh insert) OR upsert overwrite (last-write-wins).
+            _ => {
+                map.insert(key, fact);
+            }
+        }
+    }
+    (store(name, Object::Map(map.into()), state), conflicts)
 }
 
 /// Iterate over the facts in a cell regardless of storage shape.
@@ -5231,6 +5374,36 @@ pub fn merge_states(target: &Object, source: &Object) -> Object {
 // names in THAT state are exactly the readings-derived cells. Prior
 // state's cells matching those names get dropped before merge.
 
+/// Canonical identity bindings, in priority order. Two facts that both
+/// carry one of these with an equal value are the SAME entity (modulo
+/// homeDomain — see `same_identity`). Module-level so `same_identity` and
+/// the `concat_dedup` bucket index share one source of truth.
+const IDENTITY_KEYS: &[&str] = &["id", "name", "ruleId", "Change Id", "Signal Id"];
+
+/// perf-mergededup-on2: the identity buckets a fact belongs to, for the
+/// O(n) `concat_dedup` index. A fact is bucketed under (a) its φ-canonical
+/// structural key (captures `same_identity`'s `a==b` and
+/// `canon_phi(a)==canon_phi(b)` branches) and (b) one key per IDENTITY_KEY
+/// it carries (bucketing under EVERY such key guarantees two facts that
+/// match on the first key they share land in a common bucket). So
+/// `same_identity(x,y)` can hold only if x,y share at least one of these
+/// keys — the union of a fact's buckets is a sound candidate superset, and
+/// the final verdict is still the unchanged `same_identity` predicate.
+fn identity_bucket_keys(cell_name: &str, fact: &Object) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::with_capacity(IDENTITY_KEYS.len() + 1);
+    // Structural bucket, φ-canonicalized so Atom("φ") and Seq([]) collide
+    // (matching same_identity's canon_phi branch — the task-956 φ-bloat fix).
+    keys.push(synthesize_fact_id(cell_name, &canon_phi(fact)));
+    // Identity-key buckets. The \u{1} prefix keeps these disjoint from the
+    // synthesize_fact_id structural namespace.
+    for key in IDENTITY_KEYS {
+        if let Some(v) = binding(fact, key) {
+            keys.push(alloc::format!("\u{1}{}\u{1f}{}", key, v));
+        }
+    }
+    keys
+}
+
 /// Concatenate two sequences and drop duplicates, identity-aware.
 /// Preserves first-occurrence order. When two facts share an identity
 /// key (`id`, `name`, or `ruleId`), the first is kept and the second
@@ -5259,9 +5432,34 @@ fn concat_dedup(name: &str, a: &Object, b: &Object) -> Object {
     } else {
         vec![b.clone()]
     };
-    let mut out = a_items;
+    // perf-mergededup-on2: index facts by identity bucket so each new fact
+    // is compared (via the unchanged `same_identity`) only against the
+    // handful of prior facts that could match it — not the whole
+    // accumulator. Result is byte-identical to the prior
+    // `out.iter().any(same_identity)` scan, but O(n) instead of O(n²) (the
+    // ~226s parse-fold sink on the tasks app).
+    let mut out: Vec<Object> = Vec::with_capacity(a_items.len() + b_items.len());
+    let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
+    // `a` is kept unconditionally (mirrors the prior `out = a_items`, which
+    // never deduped within `a`); index each for `b`'s lookups.
+    for item in a_items {
+        let idx = out.len();
+        for k in identity_bucket_keys(name, &item) {
+            buckets.entry(k).or_default().push(idx);
+        }
+        out.push(item);
+    }
     for item in b_items {
-        if out.iter().any(|existing| same_identity(existing, &item)) { continue; }
+        let keys = identity_bucket_keys(name, &item);
+        let is_dup = keys.iter().any(|k| {
+            buckets.get(k).is_some_and(|cands|
+                cands.iter().any(|&ci| same_identity(&out[ci], &item)))
+        });
+        if is_dup { continue; }
+        let idx = out.len();
+        for k in keys {
+            buckets.entry(k).or_default().push(idx);
+        }
         out.push(item);
     }
     // task-932 (W7-a): preserve Map SHAPE when either input was already a
@@ -5286,10 +5484,42 @@ fn concat_dedup(name: &str, a: &Object, b: &Object) -> Object {
     Object::Seq(out.into())
 }
 
+/// perf-mergededup-on2: test-only counter of `same_identity` calls — the
+/// O(n²) signal in `concat_dedup` (which, pre-fix, scanned the whole
+/// accumulator per appended fact). The indexed dedup buckets candidates
+/// by identity so this stays ~O(n); the guard test
+/// (`concat_dedup_same_identity_calls_stay_linear`) asserts the call
+/// count does not grow quadratically with cell size. Mirrors
+/// `cell_map_clone_counter`: thread-local, test/test-bins only, zero-cost
+/// empty `record_*` in production.
+#[cfg(any(test, feature = "test-bins"))]
+mod same_identity_counter {
+    use core::cell::Cell;
+    std::thread_local! {
+        pub static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+}
+/// Reset the `same_identity` call counter. Call before the measured window.
+#[cfg(any(test, feature = "test-bins"))]
+pub fn reset_same_identity_count() {
+    same_identity_counter::COUNT.with(|c| c.set(0));
+}
+/// Read the `same_identity` call count accumulated since the last reset.
+#[cfg(any(test, feature = "test-bins"))]
+pub fn get_same_identity_count() -> usize {
+    same_identity_counter::COUNT.with(|c| c.get())
+}
+#[inline]
+fn record_same_identity_call() {
+    #[cfg(any(test, feature = "test-bins"))]
+    same_identity_counter::COUNT.with(|c| c.set(c.get() + 1));
+}
+
 /// Two facts share identity when they have the same value at a canonical
 /// identity binding (`id`, `name`, or `ruleId`), or — falling back —
 /// when they are structurally equal.
 fn same_identity(a: &Object, b: &Object) -> bool {
+    record_same_identity_call();
     if a == b { return true; }
     // task-956: the fan-out writes a unary predicate's object value as
     // Object::Atom("φ"), but a recompile round-trips it through SQLite where
@@ -5310,7 +5540,6 @@ fn same_identity(a: &Object, b: &Object) -> bool {
         (binding(a, "homeDomain"), binding(b, "homeDomain")),
         (Some(da), Some(db)) if da != db
     );
-    const IDENTITY_KEYS: &[&str] = &["id", "name", "ruleId", "Change Id", "Signal Id"];
     for key in IDENTITY_KEYS {
         let av = binding(a, key);
         let bv = binding(b, key);
@@ -9932,6 +10161,250 @@ mod tests {
         let m = fetch_or_phi("Task_blocks_Task", &s).as_map().cloned()
             .expect("folded cell is a Map");
         assert_eq!(m.len(), 2, "two distinct ring tuples must coexist");
+    }
+
+    // ── perf-cellput-on2: batched cell-put equals the per-fact fold ──
+    //
+    // The batched integrators (`cell_put_folded_batch`,
+    // `cell_put_keyed_batch`) collapse a round's worth of facts into ONE
+    // Map clone. These tests pin that they are BEHAVIOR-IDENTICAL to the
+    // per-fact `cell_put_folded` / `cell_put_keyed` they replace in
+    // `evaluate::integrate_round_facts` — same final cell, same conflict
+    // outcomes — so the O(n²)→O(n) change is provably side-effect-free.
+
+    #[test]
+    fn cell_put_folded_batch_equals_sequential_fold() {
+        let facts = vec![
+            fact_from_pairs(&[("App", "a1"), ("Generator", "solidity")]),
+            fact_from_pairs(&[("App", "a1"), ("Generator", "openapi")]),
+            fact_from_pairs(&[("App", "a1"), ("Generator", "solidity")]), // dup
+            fact_from_pairs(&[("App", "a2"), ("Generator", "norma")]),
+        ];
+        // Sequential per-fact fold (the path being replaced).
+        let mut seq = Object::phi();
+        for f in &facts {
+            seq = cell_put_folded("App_uses_Generator", f.clone(), &seq);
+        }
+        let seq_map = fetch_or_phi("App_uses_Generator", &seq)
+            .as_map().cloned().expect("seq Map");
+        // Batched fold.
+        let batch = cell_put_folded_batch("App_uses_Generator", facts.clone(), &Object::phi());
+        let batch_map = fetch_or_phi("App_uses_Generator", &batch)
+            .as_map().cloned().expect("batch Map");
+        assert_eq!(batch_map, seq_map,
+            "batched fold must equal the per-fact fold; got {:?} vs {:?}",
+            batch_map, seq_map);
+        assert_eq!(batch_map.len(), 3, "one duplicate collapses → 3 distinct rows");
+    }
+
+    #[test]
+    fn cell_put_folded_batch_empty_is_noop() {
+        let seed = cell_put_folded("C", fact_from_pairs(&[("X", "1")]), &Object::phi());
+        let after = cell_put_folded_batch("C", Vec::new(), &seed);
+        assert_eq!(fetch_or_phi("C", &after), fetch_or_phi("C", &seed),
+            "empty batch leaves the cell untouched");
+    }
+
+    #[test]
+    fn cell_put_keyed_batch_nonupsert_keeps_first_and_reports_conflict() {
+        let f_pending = fact_from_pairs(&[("Task", "t1"), ("Status", "pending")]);
+        let f_done = fact_from_pairs(&[("Task", "t1"), ("Status", "done")]);
+        let f_t2 = fact_from_pairs(&[("Task", "t2"), ("Status", "pending")]);
+        // Two facts at key t1 (pending then a CONFLICTING done) + a fresh t2.
+        let (state, conflicts) = cell_put_keyed_batch(
+            "Task_has_Status", &["Task"],
+            vec![f_pending.clone(), f_done.clone(), f_t2.clone()],
+            false, &Object::phi());
+        let m = fetch_or_phi("Task_has_Status", &state).as_map().cloned().expect("Map");
+        assert_eq!(m.get("t1"), Some(&f_pending),
+            "non-upsert keeps the FIRST write at t1; the conflicting later one drops");
+        assert_eq!(m.get("t2"), Some(&f_t2));
+        assert_eq!(m.len(), 2);
+        assert_eq!(conflicts.len(), 1, "exactly one dropped conflict reported");
+        assert_eq!(conflicts[0].key, "t1");
+        assert_eq!(conflicts[0].existing_fact, f_pending);
+        assert_eq!(conflicts[0].incoming_fact, f_done);
+    }
+
+    #[test]
+    fn cell_put_keyed_batch_upsert_last_write_wins_no_conflict() {
+        // SM-status-shaped: one State Machine advancing pending→…→completed
+        // in a single round. upsert=true ⇒ last-write-wins, no conflict.
+        let f_pending = fact_from_pairs(&[("State Machine", "sm1"), ("Status", "pending")]);
+        let f_inprog = fact_from_pairs(&[("State Machine", "sm1"), ("Status", "in_progress")]);
+        let f_done = fact_from_pairs(&[("State Machine", "sm1"), ("Status", "completed")]);
+        let (state, conflicts) = cell_put_keyed_batch(
+            "State_Machine_is_currently_in_Status", &["State Machine"],
+            vec![f_pending, f_inprog, f_done.clone()],
+            true, &Object::phi());
+        let m = fetch_or_phi("State_Machine_is_currently_in_Status", &state)
+            .as_map().cloned().expect("Map");
+        assert_eq!(m.get("sm1"), Some(&f_done),
+            "upsert last-write-wins → the round's final status (completed)");
+        assert_eq!(m.len(), 1);
+        assert!(conflicts.is_empty(), "upsert resolves same-key writes, reports no conflict");
+    }
+
+    #[test]
+    fn cell_put_keyed_batch_migrates_seq_and_idempotent_reassert_is_no_conflict() {
+        // Pre-existing Seq cell (pre-Map-migration shape) holding (t1→pending).
+        let f1 = fact_from_pairs(&[("Task", "t1"), ("Status", "pending")]);
+        let seq_state = store("Task_has_Status", Object::seq(vec![f1.clone()]), &Object::phi());
+        // Batch re-asserts the SAME f1 (idempotent) and adds a fresh t2.
+        let f2 = fact_from_pairs(&[("Task", "t2"), ("Status", "done")]);
+        let (state, conflicts) = cell_put_keyed_batch(
+            "Task_has_Status", &["Task"],
+            vec![f1.clone(), f2.clone()],
+            false, &seq_state);
+        let m = fetch_or_phi("Task_has_Status", &state).as_map().cloned()
+            .expect("Seq migrated to Map");
+        assert_eq!(m.get("t1"), Some(&f1), "migrated entry preserved");
+        assert_eq!(m.get("t2"), Some(&f2), "fresh entry inserted");
+        assert_eq!(m.len(), 2);
+        assert!(conflicts.is_empty(),
+            "re-asserting the byte-identical existing fact is NOT a conflict");
+    }
+
+    // ── perf-cellput-on2: O(n²) regression GUARDS ───────────────────
+    //
+    // These do NOT time anything (timing is flaky). They assert a
+    // STRUCTURAL invariant via the `cell_map_clone_counter`: integrating
+    // a round's facts into a Map-backed cell must deep-clone that cell's
+    // Map a CONSTANT number of times — ONE — no matter how many facts the
+    // round carries. The pre-fix per-fact loop cloned once PER fact, so
+    // the count grew with N (the O(n²) that made a 7378-fact round ~29s).
+    // If anyone reverts the batched integrators to a per-fact loop, the
+    // clone count scales with N again and these fail deterministically.
+
+    #[test]
+    fn cell_put_folded_batch_clones_cell_map_once_regardless_of_n() {
+        let clones_for = |n: usize| -> usize {
+            // Seed so the cell is Map-backed; this seed clone is OUTSIDE
+            // the measured window (counter reset after it).
+            let seed = cell_put_folded(
+                "C", fact_from_pairs(&[("K", "seed"), ("V", "v0")]), &Object::phi());
+            let facts: Vec<Object> = (0..n).map(|i| {
+                let v = alloc::format!("v{}", i + 1);
+                fact_from_pairs(&[("K", "seed"), ("V", v.as_str())])
+            }).collect();
+            reset_cell_map_clone_count();
+            let _ = cell_put_folded_batch("C", facts, &seed);
+            get_cell_map_clone_count()
+        };
+        let small = clones_for(8);
+        let large = clones_for(512);
+        assert_eq!(small, large,
+            "folded batch must clone the cell Map a CONSTANT number of times, \
+             independent of batch size; got {} for n=8 and {} for n=512 \
+             (per-fact O(n²) regression?)", small, large);
+        assert_eq!(large, 1,
+            "one batched fold = exactly one Map clone; got {}", large);
+    }
+
+    #[test]
+    fn cell_put_keyed_batch_clones_cell_map_once_regardless_of_n() {
+        let clones_for = |n: usize, upsert: bool| -> usize {
+            let seed = cell_put_keyed(
+                "T_has_S", &["T"],
+                fact_from_pairs(&[("T", "seed"), ("S", "s")]), &Object::phi())
+                .expect("seed write");
+            // n DISTINCT keys → n fresh inserts (no conflicts), so the only
+            // clone is the single batch-entry Map clone.
+            let facts: Vec<Object> = (0..n).map(|i| {
+                let k = alloc::format!("t{}", i);
+                fact_from_pairs(&[("T", k.as_str()), ("S", "s")])
+            }).collect();
+            reset_cell_map_clone_count();
+            let _ = cell_put_keyed_batch("T_has_S", &["T"], facts, upsert, &seed);
+            get_cell_map_clone_count()
+        };
+        for upsert in [false, true] {
+            let small = clones_for(8, upsert);
+            let large = clones_for(512, upsert);
+            assert_eq!(small, large,
+                "keyed batch (upsert={}) must clone the cell Map a CONSTANT number \
+                 of times; got {} for n=8 and {} for n=512", upsert, small, large);
+            assert_eq!(large, 1,
+                "one batched keyed integration = exactly one Map clone (upsert={}); \
+                 got {}", upsert, large);
+        }
+    }
+
+    // ── perf-mergededup-on2: concat_dedup behavior + O(n) guard ─────
+
+    #[test]
+    fn concat_dedup_dedups_identity_key_first_occurrence_wins() {
+        // id-bearing facts: same id (even with a different non-key field)
+        // collapse to the FIRST; a fresh id is kept.
+        let a = Object::seq(vec![fact_from_pairs(&[("id", "1"), ("reading", "A")])]);
+        let b = Object::seq(vec![
+            fact_from_pairs(&[("id", "1"), ("reading", "A-changed")]), // same id → dropped
+            fact_from_pairs(&[("id", "2"), ("reading", "B")]),          // new id → kept
+        ]);
+        let m = concat_dedup("FactType", &a, &b);
+        let ids: Vec<String> = cell_facts_iter(&m)
+            .filter_map(|f| binding(f, "id").map(|s| s.to_string())).collect();
+        assert_eq!(ids, vec!["1".to_string(), "2".to_string()]);
+        let r1 = cell_facts_iter(&m).find(|f| binding(f, "id") == Some("1"))
+            .and_then(|f| binding(f, "reading").map(|s| s.to_string()));
+        assert_eq!(r1, Some("A".to_string()), "first occurrence of id=1 wins");
+    }
+
+    #[test]
+    fn concat_dedup_dedups_keyless_structural_and_keeps_distinct() {
+        // Keyless (no id/name/ruleId) facts dedup by structural identity.
+        let dup = fact_from_pairs(&[("subjectValue", "t1"), ("fieldName", "Task_is_finished")]);
+        let other = fact_from_pairs(&[("subjectValue", "t2"), ("fieldName", "Task_is_finished")]);
+        let a = Object::seq(vec![dup.clone()]);
+        let b = Object::seq(vec![dup.clone(), other.clone()]);
+        let m = concat_dedup("InstanceFact", &a, &b);
+        assert_eq!(cell_facts_iter(&m).count(), 2, "structural dup dropped, distinct kept");
+    }
+
+    #[test]
+    fn concat_dedup_preserves_homedomain_identity() {
+        // Same name + DIFFERENT homeDomain stay DISTINCT (domain_mismatch);
+        // a same-domain repeat dedups. The indexed dedup buckets both under
+        // name=Order but must still defer to same_identity for the verdict.
+        let a = Object::seq(vec![fact_from_pairs(&[("name", "Order"), ("homeDomain", "core")])]);
+        let b = Object::seq(vec![
+            fact_from_pairs(&[("name", "Order"), ("homeDomain", "orders")]), // diff domain → kept
+            fact_from_pairs(&[("name", "Order"), ("homeDomain", "core")]),   // same → dropped
+        ]);
+        let m = concat_dedup("Noun", &a, &b);
+        let homes: Vec<String> = cell_facts_iter(&m)
+            .filter(|f| binding(f, "name") == Some("Order"))
+            .filter_map(|f| binding(f, "homeDomain").map(|s| s.to_string())).collect();
+        assert_eq!(homes.len(), 2,
+            "Order@core and Order@orders are distinct; the Order@core repeat is dropped");
+    }
+
+    #[test]
+    fn concat_dedup_same_identity_calls_stay_linear() {
+        // O(n²) regression guard (perf-mergededup-on2): deduping a cell
+        // against itself must call `same_identity` ~O(n) (one bucket hit per
+        // fact), NOT O(n²) (a full-accumulator scan per fact). Pre-fix this
+        // was n² and made the parse fold ~226s on the tasks app.
+        let calls_for = |n: usize| -> (usize, usize) {
+            let facts: Vec<Object> = (0..n).map(|i| {
+                let s = alloc::format!("s{}", i);
+                fact_from_pairs(&[("subjectValue", "t"), ("objectValue", s.as_str())])
+            }).collect();
+            let cell = Object::seq(facts);
+            reset_same_identity_count();
+            let merged = concat_dedup("InstanceFact", &cell, &cell); // self-merge → all dups
+            (get_same_identity_count(), cell_facts_iter(&merged).count())
+        };
+        let (c_small, k_small) = calls_for(40);
+        let (c_large, k_large) = calls_for(400);
+        assert_eq!(k_small, 40, "self-merge dedups back to n distinct facts");
+        assert_eq!(k_large, 400, "self-merge dedups back to n distinct facts");
+        assert!(c_large <= 8 * 400,
+            "concat_dedup must call same_identity ~O(n) (got {} for n=400; O(n²) would be ~80000)",
+            c_large);
+        assert!(c_large <= c_small * 20,
+            "same_identity calls must scale ~linearly: {} (n=40) vs {} (n=400) — 10× the facts \
+             should be ~10× the calls, not ~100× (O(n²))", c_small, c_large);
     }
 
     // ── ⊥-trace (derivation-bottom-trace) ───────────────────────────
