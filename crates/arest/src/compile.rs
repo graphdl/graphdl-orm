@@ -4320,7 +4320,7 @@ fn compile_data_with_state(
     // them in round 1 is cheap; the cost forward_chain_defs_state_seeded
     // attacks is the long-tail user-rule cardinality (~75 user rules on
     // the live tasks.db corpus).
-    let derivation_positive_reads: HashMap<String, Vec<String>> = data.derivation_rules.iter()
+    let mut derivation_positive_reads: HashMap<String, Vec<String>> = data.derivation_rules.iter()
         .filter(|r| !r.id.is_empty())
         .map(|r| {
             let reads: Vec<String> = r.antecedent_sources.iter()
@@ -4337,6 +4337,20 @@ fn compile_data_with_state(
             (r.id.clone(), reads)
         })
         .collect();
+
+    // task sm-fold-as-predicate: declare the synthetic SM event-fold's
+    // positive reads so the semi-naive/seeded chainer re-fires it when the
+    // current-status cell OR a trigger cell changes. The fold is now
+    // from-guarded (it reads `State_Machine_is_currently_in_Status` to gate
+    // each transition), so it must re-run after sm-init seeds `initial` and
+    // after every advance — otherwise the seeded path (command.rs apply)
+    // stops at the first step and downstream status goes stale. Keyed by
+    // the fold's rule id (`_sm_event_fold_<noun>`) so the
+    // `derivation_reads:<id>` sidecar matches the `derivation:<id>` def.
+    for sm in state_machines.iter() {
+        derivation_positive_reads
+            .insert(format!("_sm_event_fold_{}", sm.noun_name), sm_event_fold_read_cells(sm));
+    }
 
     let t4 = profile_timer::now();
     let schemas = compile_schemas(data);
@@ -7546,59 +7560,39 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
             ),
         );
 
-        let extract_for_resource = Func::compose(
-            Func::apply_to_all(Func::Selector(2)),
-            Func::filter(Func::compose(Func::Eq, Func::construction(vec![
-                Func::Selector(1),
-                Func::constant(Object::atom("Resource")),
-            ]))),
-        );
-        // task-741: extend "existing resources" to ALSO include any
-        // resource that has an event fact in a trigger FT cell. If a
-        // Task has `Task is finished` recorded, event-fold will derive
-        // its Status = 'completed' — init must skip the same resource
-        // to avoid double-emitting 'pending' alongside event-fold's
-        // 'completed' and surfacing a UC violation. The resource is
-        // at the role under sm.noun_name (e.g. "Task") in each
-        // trigger FT cell.
+        // task sm-fold-as-predicate: init's "already covered" set is now
+        // keyed on the CURRENT-STATUS cell, not on for_Resource ∪ events.
         //
-        // Build one extractor per trigger FT (after canonical
-        // space→underscore normalization, matching event-fold's
-        // lookup). Concat all the per-cell resource Seqs together
-        // with the for_Resource Seq → the union of "already covered"
-        // resources.
-        let extract_sm_noun_role = Func::compose(
+        // With the from-guarded event-fold, EVERY resource must be seeded
+        // with `initial` exactly once — that's the `from` the fold advances
+        // away from. The old guard treated "has any event fact" as covered,
+        // which broke a resource like o1 that carries an event NOT
+        // applicable from `initial` (e.g. `Order_was_shipped`, from=Placed):
+        // init skipped it (it has an event) AND the fold couldn't advance it
+        // (shipped isn't reachable from Draft), so it ended up with no
+        // status at all.
+        //
+        // Keying on `State_Machine_is_currently_in_Status` instead makes
+        // init idempotent and fold-compatible:
+        //   • round 1: status cell empty ⇒ every instance is "new" ⇒ init
+        //     seeds `initial` for all (incl. o1);
+        //   • round 2+: every instance now has a status row ⇒ init skips all
+        //     ⇒ it never re-emits `initial` to fight the fold's advances.
+        // The resource of a currently_in_Status fact is its `State Machine`
+        // role value.
+        let extract_sm_role = Func::compose(
             Func::apply_to_all(Func::Selector(2)),
             Func::filter(Func::compose(Func::Eq, Func::construction(vec![
                 Func::Selector(1),
-                Func::constant(Object::atom(&sm_noun)),
+                Func::constant(Object::atom("State Machine")),
             ]))),
         );
-        let mut existing_sources: Vec<Func> = vec![
-            Func::compose(
-                Func::Concat,
-                Func::compose(
-                    Func::apply_to_all(extract_for_resource),
-                    extract_facts_from_pop("State_Machine_is_for_Resource"),
-                ),
-            ),
-        ];
-        let mut seen_event_fts: hashbrown::HashSet<String> = hashbrown::HashSet::new();
-        for (_, _, event_ft) in sm.transition_table.iter() {
-            let canonical = event_ft.replace(' ', "_");
-            if seen_event_fts.insert(canonical.clone()) {
-                existing_sources.push(Func::compose(
-                    Func::Concat,
-                    Func::compose(
-                        Func::apply_to_all(extract_sm_noun_role.clone()),
-                        extract_facts_from_pop(&canonical),
-                    ),
-                ));
-            }
-        }
         let get_existing = Func::compose(
             Func::Concat,
-            Func::construction(existing_sources),
+            Func::compose(
+                Func::apply_to_all(extract_sm_role),
+                extract_facts_from_pop("State_Machine_is_currently_in_Status"),
+            ),
         );
 
         // task-744 / task-817: convert the existing-resources Seq into
@@ -7716,8 +7710,9 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
     // value (the binding under role_name == sm_noun), and emits the
     // 3-fact _is_instance_of_Noun + _is_for_Resource +
     // _is_currently_in_Status tuple.
-    let inner_funcs: Vec<Func> = sm.transition_table.iter().map(|(_from, to, event_ft)| {
+    let inner_funcs: Vec<Func> = sm.transition_table.iter().map(|(from, to, event_ft)| {
         let to_obj = Object::atom(to);
+        let from_obj = Object::atom(from);
         let sm_noun_obj = Object::atom(&sm_noun);
         // transition_table stores the Fact Type's human-readable form
         // (e.g. "Task is started") because that's the binding value in
@@ -7758,16 +7753,95 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
         // in_progress board phantom, unretractable via the data API.
         let non_phi_token = Func::compose(Func::Not, Func::compose(Func::Eq,
             Func::construction(vec![Func::Id, Func::constant(Object::atom("φ"))])));
-        let resources = Func::compose(
-            Func::filter(non_phi_token),
+        let resources_with_event = Func::compose(
+            Func::filter(non_phi_token.clone()),
             Func::compose(
-                Func::filter(non_empty),
+                Func::filter(non_empty.clone()),
                 Func::compose(
-                    Func::filter(non_phi),
+                    Func::filter(non_phi.clone()),
                     Func::compose(
                         Func::Concat,
                         Func::compose(Func::apply_to_all(extract_resource_per_fact), event_facts),
                     ),
+                ),
+            ),
+        );
+
+        // ── sm-fold-as-predicate from-guard ──────────────────────────
+        // The fold must mirror the abstract run_machine fold
+        // (test_valid_transitions_from_status): a transition fires for a
+        // resource ONLY when that resource is currently in `from`.
+        // Without this guard the fold emits `to` for ANY resource that
+        // merely has the trigger-event fact (compile.rs discarding
+        // `_from`), so e.g. an Order carrying `Order_was_shipped`
+        // (from=Placed) but never placed wrongly jumps Draft→Shipped.
+        //
+        // Build the set of resources whose CURRENT status == `from` by
+        // reading the `State_Machine_is_currently_in_Status` cell and
+        // keeping the `State Machine` value of every fact whose `Status`
+        // role equals this transition's `from`. The forward-chain
+        // fixpoint refreshes that cell each round (keyed last-write per
+        // State Machine), so as a resource advances `from` tracks its
+        // live status and the next applicable transition can fire.
+        //
+        //   currently_in_Status fact = <<"State Machine", R>, <"Status", S>>
+        // A fact is "in `from`" iff it contains the pair <"Status", from>.
+        // For matching facts, project the `State Machine` value (the role
+        // whose name == "State Machine", value side via Selector(2)).
+        let status_facts = extract_facts_from_pop("State_Machine_is_currently_in_Status");
+        let fact_in_from = Func::compose(Func::HasMember, Func::construction(vec![
+            Func::constant(Object::seq(vec![
+                Object::atom("Status"),
+                from_obj.clone(),
+            ])),
+            Func::Id,
+        ]));
+        let extract_sm_value_per_fact = Func::compose(
+            Func::apply_to_all(Func::Selector(2)),
+            Func::filter(Func::compose(Func::Eq, Func::construction(vec![
+                Func::Selector(1),
+                Func::constant(Object::atom("State Machine")),
+            ]))),
+        );
+        // Resources currently in `from`: filter status facts to those at
+        // `from`, project each to its State Machine value, flatten, drop
+        // φ / "" / "φ"-token degenerate subjects so SetFromSeq (which
+        // ⊥s on any non-atom) stays total over dirty status rows.
+        let resources_in_from = Func::compose(
+            Func::filter(non_phi_token.clone()),
+            Func::compose(
+                Func::filter(non_empty.clone()),
+                Func::compose(
+                    Func::filter(non_phi.clone()),
+                    Func::compose(
+                        Func::Concat,
+                        Func::compose(
+                            Func::apply_to_all(extract_sm_value_per_fact),
+                            Func::compose(Func::filter(fact_in_from), status_facts),
+                        ),
+                    ),
+                ),
+            ),
+        );
+        // Map<resource, T> for O(1) membership; mirrors init's
+        // get_existing_set. Empty cell → empty Map → nothing passes the
+        // semi-join, so in round 1 (before any status exists) the fold
+        // emits nothing and sm-init seeds `initial` first.
+        let in_from_set = Func::compose(Func::SetFromSeq, resources_in_from);
+        // Semi-join `resources_with_event` against `in_from_set`: pair
+        // each candidate resource with the set (DistR), keep those PRESENT
+        // (is_present = Not . NullTest . FetchOrPhi — the inverse of
+        // init's is_new), then project the resource back out. This is the
+        // from-guard: only resources whose live status == `from` survive.
+        let is_present = Func::compose(Func::Not,
+            Func::compose(Func::NullTest, Func::FetchOrPhi));
+        let resources = Func::compose(
+            Func::apply_to_all(Func::Selector(1)),
+            Func::compose(
+                Func::filter(is_present),
+                Func::compose(
+                    Func::DistR,
+                    Func::construction(vec![resources_with_event, in_from_set]),
                 ),
             ),
         );
@@ -7817,12 +7891,50 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
         Func::compose(Func::Concat, Func::construction(inner_funcs))
     };
 
-    // SM event-fold writes State_Machine_is_currently_in_Status + companions;
-    // no AbsenceOf antecedents. Leave dep metadata empty.
-    let (consequent_cell, _, _) =
-        derivation_dep_metadata_synth(String::new());
+    // SM event-fold's primary consequent is State_Machine_is_currently_in_Status
+    // (it also emits the _is_instance_of_Noun / _is_for_Resource companions,
+    // but the status cell is the one downstream rules — the
+    // Resource_is_currently_in_Status bridge → Task_has_Task_Status — read,
+    // and the one the from-guard re-reads to advance). Declaring it lets the
+    // stratifier sequence this fold against the bridge cascade. The positive
+    // antecedent reads (currently_in_Status + each trigger cell) are injected
+    // into `derivation_positive_reads` in `compile_data_with_state` via
+    // `sm_event_fold_read_cells`, which emits the `derivation_reads:` sidecar
+    // the semi-naive gate consults.
+    let consequent_cell = "State_Machine_is_currently_in_Status".to_string();
     CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func,         consequent_cell,
         materialization: crate::types::MaterializationPolicy::Stored }
+}
+
+/// task sm-fold-as-predicate: the cells `compile_sm_event_fold` reads.
+///
+/// The fold now reads `State_Machine_is_currently_in_Status` (the
+/// from-guard semi-join — see `compile_sm_event_fold`) PLUS each
+/// transition's trigger-event cell (the canonical underscore form of
+/// `event_ft`). The semi-naive chainer gates re-firing on these: when the
+/// status cell changes (a resource advanced one step) the fold re-fires to
+/// take the next guarded step, and when a trigger cell changes a fresh
+/// event can fire. Without `State_Machine_is_currently_in_Status` in this
+/// set the fold would not be re-selected after sm-init seeds `initial`, so
+/// the first advance never happens under the seeded/semi-naive paths.
+///
+/// `compile_data_with_state` injects the result into
+/// `model.derivation_positive_reads` keyed by the fold's rule id
+/// (`_sm_event_fold_<noun>`), which `compile_to_defs_state` emits as the
+/// `derivation_reads:<id>` sidecar that `read_derivation_reads` decodes.
+fn sm_event_fold_read_cells(sm: &CompiledStateMachine) -> Vec<String> {
+    let mut reads: Vec<String> = vec![
+        "State_Machine_is_currently_in_Status".to_string(),
+    ];
+    let mut seen: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+    seen.insert(reads[0].clone());
+    for (_, _, event_ft) in sm.transition_table.iter() {
+        let canonical = event_ft.replace(' ', "_");
+        if seen.insert(canonical.clone()) {
+            reads.push(canonical);
+        }
+    }
+    reads
 }
 
 /// task-922-sm-init-projection — for_Resource backfill.
