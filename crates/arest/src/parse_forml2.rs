@@ -2986,7 +2986,21 @@ fn resolve_derivation_rule(
             for s in rule.antecedent_sources.iter() {
                 let roles = role_nouns_of(s.fact_type_id());
                 if roles.iter().any(|n| n == key) { continue; } // it's a direct holder
-                if let Some(sup) = key_supers.iter().find(|sup| roles.iter().any(|n| &n == sup)) {
+                // subtype-join-bridge over-match guard: never bridge `key` to a
+                // supertype role whose noun is ITSELF a join key of this rule.
+                // When `key` (e.g. Status) and its supertype `sup` (e.g.
+                // Resource, with Status < Resource) are BOTH distinct join
+                // variables, the supertype antecedent's `sup` role belongs to
+                // the `sup` variable — not to `key`. Bridging would equi-join
+                // Status to Resource (`in_progress == t-1`), collapsing the join
+                // to ∅ (the SM→status bridge `Resource is currently in Status
+                // iff some State Machine is for that Resource and that State
+                // Machine is currently in that Status`). The legitimate
+                // subtype-join bridges a key whose supertype is NOT a join key —
+                // a role the `that <Sub>` clause merely resolved up to.
+                if let Some(sup) = key_supers.iter().find(|sup|
+                    roles.iter().any(|n| &n == sup)
+                        && !rule.join_on.iter().any(|k| k == *sup)) {
                     let pair = (key.clone(), sup.clone());
                     if !bridge_pairs.contains(&pair) {
                         bridge_pairs.push(pair);
@@ -3438,6 +3452,20 @@ pub(crate) fn constraint_to_fact_test(c: &ConstraintDef) -> crate::ast::Object {
 
 
 
+/// Collapse a fact type's role list when re-declaration concatenated it into an
+/// exact k≥2 repetition of a period-p tile (`[A, B, A, B] → [A, B]`). Only tiles
+/// of period ≥ 2 collapse; a period-1 list (`[Task, Task]`) is a legitimate
+/// same-noun ring and is returned unchanged. See `SchemaCatalog::register`.
+fn collapse_redeclared_roles<'a>(roles: &[&'a str]) -> Vec<&'a str> {
+    let n = roles.len();
+    for p in 2..=n / 2 {
+        if n % p == 0 && (0..n).all(|i| roles[i] == roles[i % p]) {
+            return roles[..p].to_vec();
+        }
+    }
+    roles.to_vec()
+}
+
 /// Schema catalog for rho-lookup: noun set -> Fact Type ID.
 /// The noun set is the key. The catalog is the DEFS cell.
 struct SchemaCatalog {
@@ -3451,7 +3479,18 @@ impl SchemaCatalog {
     }
 
     fn register(&mut self, schema_id: &str, role_nouns: &[&str], verb: &str, reading: &str) {
-        let mut key: Vec<String> = role_nouns.iter().map(|n| {
+        // redeclared-ft-role-doubling: a fact type re-declared in the readings
+        // (e.g. `State Machine is for Resource` declared as a base FT AND again
+        // as a derived `*` FT — readings/core/instances.md:121,123) concatenates
+        // its role list, yielding `[A, B, A, B]` for a binary. The 4-element
+        // catalog key (`[resource, resource, state machine, state machine]`)
+        // then never matches a real 2-role clause lookup, so derivation rules
+        // referencing the FT silently lose it as an antecedent. Collapse an
+        // exact k≥2 repetition of a period-p tile (p≥2) back to one tile so the
+        // key reflects the FT's true arity. A period-1 tile (`[Task, Task]`) is
+        // a legitimate same-noun ring and is left intact.
+        let collapsed = collapse_redeclared_roles(role_nouns);
+        let mut key: Vec<String> = collapsed.iter().map(|n| {
             let (base, _) = parse_role_token(n);
             base.to_lowercase()
         }).collect();

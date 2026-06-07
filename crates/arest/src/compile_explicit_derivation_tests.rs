@@ -2931,6 +2931,123 @@ State Machine 't-orphan' is currently in Status 'completed'.
     );
 }
 
+/// REGRESSION (redeclared-ft-role-doubling + subtype-join over-match): the
+/// SM→status metamodel bridge must derive under the dirs-compile stratum when
+/// SM status is produced by the EVENT-FOLD (the live board shape) rather than a
+/// direct instance fact. Chain:
+///   _sm_event_fold_            → State_Machine_is_currently_in_Status (keyed)
+///   _sm_for_resource_backfill_ → State_Machine_is_for_Resource
+///   rule_ (bridge 1)           → Resource_is_currently_in_Status
+///   rule_ (bridge 2)           → Task_has_Task_Status
+///
+/// Two PRE-EXISTING bugs (NOT the perf commit) broke this on the REAL bundled
+/// metamodel, where `Status` is a subtype of `Resource` and
+/// `State Machine is for Resource` is declared twice (base + derived `*`,
+/// readings/core/instances.md:121,123):
+///  1. The double declaration concatenated the FT's roles → a 4-noun catalog
+///     key, so `resolve_fact_type` missed the 2-role clause and the antecedent
+///     re-join collapsed the bridge's two antecedents into one. Fixed by
+///     `collapse_redeclared_roles` in `SchemaCatalog::register`.
+///  2. The subtype-join bridge equi-joined the `Status` key to antecedent 0's
+///     `Resource` role (Status < Resource) → `in_progress == t-1` → ∅. Fixed by
+///     the over-match guard in `resolve_derivation_rule`.
+///
+/// Live impact this guards: every dirs-compile recompile (apps.compile / load)
+/// otherwise wipes the tasks board's Resource_is_currently_in_Status /
+/// Task_has_Task_Status / Task_is_blocked / Task_is_recommended (894→0). Other
+/// bridge tests use DIRECT instance facts + lattice-free hand metamodels, so
+/// they miss both triggers; this one loads the real corpus + drives the fold.
+#[test]
+fn sm_fold_to_bridge_derives_task_has_status_through_event_fold() {
+    use crate::ast::cells_iter;
+    // Use the REAL bundled metamodel so the Status ⊆ Resource ⊆ Noun
+    // subtype lattice is intact (readings/core/state.md: `Status is a
+    // subtype of Resource`). That lattice is the trigger a hand-built
+    // lattice-free metamodel lacks; it's why the dirs-compile bridge join
+    // fails to derive Resource_is_currently_in_Status. This mirrors the
+    // `arest <readings>` binary load over app.md + 1 task (resource_status=0).
+    let meta_state = crate::parse_forml2::parse_to_state(&crate::metamodel_corpus())
+        .expect("parse bundled metamodel");
+    let domain = r#"# minimal task app (event-fold -> bridge)
+## Entity Types
+Task(.id) is an entity type.
+
+Task is a subtype of Resource.
+
+## Value Types
+Task Status is a value type.
+
+## Fact Types
+Task has Task Status.
+Task is started.
+
+## State Machine
+State Machine Definition 'Task SM' is for Noun 'Task'.
+Status 'pending' is initial in State Machine Definition 'Task SM'.
+Transition 'start' is defined in State Machine Definition 'Task SM'.
+Transition 'start' is from Status 'pending'.
+Transition 'start' is to Status 'in_progress'.
+Transition 'start' is triggered by Fact Type 'Task is started'.
+
+## Derivation Rules
+* Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.
+* Task has Task Status iff that Resource is currently in some Status and Task Status is Status and Task is Resource.
+
+## Instance Facts
+Task 't-1' is started.
+"#;
+    let domain_state = crate::parse_forml2::parse_to_state_with_nouns(domain, &meta_state)
+        .expect("parse domain");
+    let state = crate::ast::merge_states(&meta_state, &domain_state);
+    let defs = crate::compile::compile_to_defs_state(&state);
+    let d = crate::ast::defs_to_state(&defs, &state);
+
+    // Collect the EXACT dirs-compile stratum (cli/entry.rs run_load:1655):
+    // user rules + SM init + event-fold + for_Resource backfill, each
+    // metacomposed (the serialized-def round-trip the live load uses).
+    let stratum: Vec<(String, crate::ast::Func)> = cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:rule_")
+            || n.starts_with("derivation:_sm_init_")
+            || n.starts_with("derivation:_sm_event_fold_")
+            || n.starts_with("derivation:_sm_for_resource_backfill_"))
+        .map(|(n, contents)| (n.to_string(), crate::ast::metacompose(contents, &d)))
+        .collect();
+    let refs: Vec<(&str, &crate::ast::Func)> =
+        stratum.iter().map(|(n, f)| (n.as_str(), f)).collect();
+    let (final_state, _) = crate::evaluate::forward_chain_defs_state(&refs, &state);
+
+    let has_pair = |name: &str, role: &str, val: &str| -> bool {
+        crate::ast::fetch_cell_seq(name, &final_state).as_seq().map(|facts| {
+            facts.iter().any(|f| f.as_seq().map(|pairs| pairs.iter().any(|p| {
+                p.as_seq().map(|kv| kv.len() == 2
+                    && kv[0].as_atom() == Some(role)
+                    && kv[1].as_atom() == Some(val)).unwrap_or(false)
+            })).unwrap_or(false))
+        }).unwrap_or(false)
+    };
+
+    // Pre-condition: the event-fold advanced t-1 pending→in_progress (keyed).
+    assert!(
+        has_pair("State_Machine_is_currently_in_Status", "Status", "in_progress"),
+        "pre-condition: event-fold must advance t-1 to in_progress. cells: {:?}\n\
+         State_Machine_is_currently_in_Status: {:?}",
+        cells_iter(&final_state).iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+        crate::ast::fetch_cell_seq("State_Machine_is_currently_in_Status", &final_state),
+    );
+
+    // THE bug: the bridge must project that fold-produced status all the way
+    // into Task_has_Task_Status. Live (dirs-compile) this is empty.
+    assert!(
+        has_pair("Task_has_Task_Status", "Task", "t-1")
+            && has_pair("Task_has_Task_Status", "Task Status", "in_progress"),
+        "fold->bridge: Task_has_Task_Status must contain (Task=t-1, Task Status=in_progress), \
+         derived via Resource_is_currently_in_Status from the EVENT-FOLD status.\n\
+         Resource_is_currently_in_Status: {:?}\nTask_has_Task_Status: {:?}",
+        crate::ast::fetch_cell_seq("Resource_is_currently_in_Status", &final_state),
+        crate::ast::fetch_cell_seq("Task_has_Task_Status", &final_state),
+    );
+}
+
 // ─── Category 18: Existential-over-join fans out per X (#814) ───────
 //
 // Shape: `* X has Y 'lit' iff X concerns some Z that has Y 'lit'.`
