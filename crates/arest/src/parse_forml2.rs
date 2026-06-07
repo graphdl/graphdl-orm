@@ -3304,15 +3304,20 @@ fn derivation_consequent_text(rule_text: &str) -> &str {
     }
 }
 
-/// Resolve a self-ring / ring-FT Join derivation's positional join plan
+/// Resolve a numeric-subscript Join derivation's positional join plan
 /// (whitepaper eq:join — `s_sh` selects the shared roles BY POSITION)
 /// from the rule's Halpin numeric subscripts. Returns `None` (so the
 /// caller leaves the rule on its existing path) unless every antecedent
-/// resolves to a fact type, at least one antecedent is a self-ring (a
-/// base noun fills >1 role), a SUBSCRIPTED variable recurs across >=2
-/// antecedents (the join key), and clause tokenisation lines up with the
-/// fact-type role arities. The subscript gate keeps "that"-anaphora and
-/// noun-name joins on their existing path.
+/// resolves to a fact type, a SUBSCRIPTED variable recurs across >=2
+/// DISTINCT antecedents (the numeric-subscript join key — this admits
+/// BOTH self-ring FTs, where a base noun fills >1 role, AND cross-FT
+/// recursive subscript joins, e.g. the SM `has reached` transitive
+/// fixpoint), and clause tokenisation lines up with the fact-type role
+/// arities. The subscript gate keeps "that"-anaphora and plain noun-name
+/// joins on their existing path. Every variable (subscripted or plain
+/// noun) occupying >=2 antecedents becomes an equi-join key, so a
+/// subscript-join rule's unsubscripted threading variable also constrains
+/// the join.
 ///
 /// `antecedent_clauses[i]` is the resolved text of `antecedent_sources[i]`
 /// (same index alignment the #914 comparison pass relies on); the k-th
@@ -3343,15 +3348,11 @@ fn compute_ring_join_plan(
 
     // token -> (antecedent_index, role_index) occurrences.
     let mut token_positions: Vec<(String, Vec<(usize, usize)>)> = Vec::new();
-    let mut any_self_ring = false;
     for i in 0..n {
         let ft_id = antecedent_sources[i].fact_type_id();
         if ft_id.is_empty() { return None; }
         let ft = fact_types.get(ft_id)?;
-        let mut bases: Vec<&str> = ft.roles.iter().map(|r| r.noun_name.as_str()).collect();
-        let role_count = bases.len();
-        bases.sort_unstable();
-        if bases.windows(2).any(|w| w[0] == w[1]) { any_self_ring = true; }
+        let role_count = ft.roles.len();
         let toks = tokens_in_order(&antecedent_clauses[i]);
         if toks.len() != role_count { return None; }
         for (role_idx, tok) in toks.into_iter().enumerate() {
@@ -3361,17 +3362,36 @@ fn compute_ring_join_plan(
             }
         }
     }
-    if !any_self_ring { return None; }
+    let distinct_ants = |ps: &[(usize, usize)]| -> usize {
+        let mut a: Vec<usize> = ps.iter().map(|(x, _)| *x).collect();
+        a.sort_unstable();
+        a.dedup();
+        a.len()
+    };
 
-    // Join keys: SUBSCRIPTED variables occupying >=2 DISTINCT antecedents.
+    // Gate: this rule joins via Halpin numeric SUBSCRIPTS (not noun-name
+    // "that"-anaphora) iff some SUBSCRIPTED variable recurs across >=2
+    // DISTINCT antecedents. This keeps ordinary noun-name joins on their
+    // existing (`join_on`) path while admitting BOTH self-ring FTs (the
+    // base noun fills >1 role) AND cross-FT recursive subscript joins —
+    // e.g. the SM `has reached` transitive fixpoint, where `Status1`
+    // recurs across `… has reached Status1` and `Transition is from
+    // Status1`. (Self-ring detection was the prior gate; it was too narrow
+    // — it rejected this recursive cross-FT shape even though it is driven
+    // by the same numeric-subscript join mechanism.)
+    let has_subscripted_join_var = token_positions.iter()
+        .any(|(tok, ps)| is_subscripted(tok) && distinct_ants(ps) >= 2);
+    if !has_subscripted_join_var { return None; }
+
+    // Join keys: EVERY variable (subscripted OR plain noun) occupying >=2
+    // DISTINCT antecedents is an equi-join key. Plain shared nouns are now
+    // included (not just subscripted ones) so a subscript-join rule's
+    // UNSUBSCRIPTED threading variable also constrains the join — e.g.
+    // `State Machine`, shared by `… has reached` and `Transition is
+    // applicable for that State Machine`, must equi-join, else the
+    // recursive fixpoint cross-products across every state machine.
     let join_groups: Vec<Vec<(usize, usize)>> = token_positions.iter()
-        .filter(|(tok, ps)| {
-            if !is_subscripted(tok) { return false; }
-            let mut ants: Vec<usize> = ps.iter().map(|(a, _)| *a).collect();
-            ants.sort_unstable();
-            ants.dedup();
-            ants.len() >= 2
-        })
+        .filter(|(_, ps)| distinct_ants(ps) >= 2)
         .map(|(_, ps)| ps.clone())
         .collect();
     if join_groups.is_empty() { return None; }

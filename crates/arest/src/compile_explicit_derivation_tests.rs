@@ -8180,6 +8180,49 @@ fn run_reachable_sink(instance_facts: &str) -> Object {
     final_state
 }
 
+/// GAP 1 (sm-fold-as-predicate): a RECURSIVE multi-FT join whose output
+/// role is a FRESH subscript (`Status2`, the transition's `to`) must reach
+/// the TRANSITIVE FIXPOINT, not re-emit the seed. OrderSM
+/// Draft->Placed->Shipped; o2 has both Order_was_placed + Order_was_shipped
+/// (`holds for o2`), so every transition is applicable and the reachable
+/// set is {Draft, Placed, Shipped}.
+///
+/// Pre-fix: `compile_join_derivation` bound the consequent `Status` by
+/// noun-name-first-match -> the FIRST antecedent carrying a `Status` role
+/// is `State Machine has reached Status1` (the recursion input / `from`),
+/// so the rule re-emitted the seed `Draft` every round and never advanced.
+/// The fix binds the consequent role to the subscript-resolved antecedent
+/// slot (`Status2` -> `Transition is to Status2`), like the ring_join
+/// positional path; the forward-chain fixpoint then walks the chain.
+#[test]
+fn recursive_join_with_subscripted_output_reaches_transitive_fixpoint() {
+    let facts = r#"State Machine Definition 'OrderSM' is for Noun 'Order'.
+Transition 'placed' is defined in State Machine Definition 'OrderSM'.
+Transition 'placed' is from Status 'Draft'.
+Transition 'placed' is to Status 'Placed'.
+Transition 'placed' is triggered by Fact Type 'Order_was_placed'.
+Transition 'shipped' is defined in State Machine Definition 'OrderSM'.
+Transition 'shipped' is from Status 'Placed'.
+Transition 'shipped' is to Status 'Shipped'.
+Transition 'shipped' is triggered by Fact Type 'Order_was_shipped'.
+Status 'Draft' is initial in State Machine Definition 'OrderSM'.
+State Machine 'o2' is for Resource 'o2'.
+State Machine 'o2' is instance of Noun 'Order'.
+Fact Type 'Order_was_placed' holds for Resource 'o2'.
+Fact Type 'Order_was_shipped' holds for Resource 'o2'."#;
+    let st = run_reachable_sink(facts);
+    let mut reached: Vec<String> = sm_status_pairs(&st, "State_Machine_has_reached_Status")
+        .into_iter().filter(|(sm, _)| sm == "o2").map(|(_, s)| s).collect();
+    reached.sort();
+    assert_eq!(
+        reached,
+        vec!["Draft".to_string(), "Placed".to_string(), "Shipped".to_string()],
+        "recursive `has reached` must reach the transitive fixpoint \
+         {{Draft, Placed, Shipped}} by binding the consequent Status to the \
+         transition's `to` (Status2), not re-emitting the seed; got {:?}",
+        reached);
+}
+
 /// Isolation probe (not the deliverable): does `State Machine can reach
 /// Status` resolve as a consequent when it is the ONLY [State Machine,
 /// Status]-role-set FT (no advance/settled siblings)? Pins whether the
