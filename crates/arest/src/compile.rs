@@ -168,6 +168,49 @@ fn derivation_dep_metadata_synth(consequent_cell: String) -> (
     (consequent_cell, Vec::new(), Vec::new())
 }
 
+/// upsert-safe-propagation: compute the cells whose forward-chain keyed
+/// writes UPSERT (last-write-wins) instead of conflict-rejecting —
+/// replacing the hand-maintained `SM_STATUS_UPSERT_CELLS` allowlist with a
+/// value derived from the rule graph.
+///
+/// `seed` is the consequent cell(s) of the recursive from-guarded SM
+/// event-fold: the cell(s) GUARANTEED monotone-advancing, where a same-key
+/// "conflict" is a legal advance, not a UC violation. `deps` is
+/// `(consequent_cell, antecedent_cells)` for every derivation. A cell is
+/// upsert-safe iff it is a seed OR its derivation reads an upsert-safe cell
+/// — a monotone PROJECTION of an advancing cell is itself advancing.
+/// Computed as the least fixpoint of that rule so a projection chain
+/// (fold -> `Resource_is_currently_in_Status` -> `Task_has_Task_Status`)
+/// inherits upsert-safety, while a keyed cell with no fold ancestor keeps
+/// conflict-reject so a genuine UC clash is still surfaced. This is the
+/// oscillation guard the allowlist provided (upsert only where progress is
+/// guaranteed), now propagated structurally instead of pinned by name.
+pub(crate) fn compute_upsert_safe_cells(
+    seed: &[String],
+    deps: &[(String, Vec<String>)],
+) -> alloc::collections::BTreeSet<String> {
+    let mut safe: alloc::collections::BTreeSet<String> = seed.iter().cloned().collect();
+    // Least fixpoint: keep absorbing any consequent that reads an
+    // already-safe cell until a full pass adds nothing. Each pass adds
+    // >=1 cell or terminates, so it converges in <= deps.len() passes.
+    loop {
+        let mut added = false;
+        for (consequent, antecedents) in deps {
+            if consequent.is_empty() || safe.contains(consequent) {
+                continue;
+            }
+            if antecedents.iter().any(|a| safe.contains(a)) {
+                safe.insert(consequent.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    safe
+}
+
 /// A compiled state machine. func is the transition function: <state, event> -> state'.
 /// statuses retained for introspection (machine:{noun}:statuses could expose it).
 #[allow(dead_code)]
@@ -3540,6 +3583,52 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
                 "_CellKeyRoles".to_string(),
                 Func::constant(crate::ast::Object::Seq(entries.into())),
             ));
+        }
+    }
+
+    // upsert-safe-propagation: emit `_UpsertSafeCells` — the keyed cells
+    // whose forward-chain writes UPSERT (last-write-wins) instead of
+    // conflict-rejecting. Replaces the hand-maintained
+    // `evaluate::SM_STATUS_UPSERT_CELLS` allowlist with a value COMPUTED
+    // from the rule graph: SEED = the SM init/event-fold's own consequent
+    // (the from-guarded monotone advancer), PROPAGATED to any cell that
+    // projects an upsert-safe cell (a monotone projection of an advancing
+    // cell is itself advancing). So the SM->Resource bridge and the
+    // Resource->Task bridge inherit upsert (their status follows the fold's
+    // advance instead of freezing at the seeded `initial`), while a keyed
+    // cell with no fold ancestor keeps conflict-reject — a genuine UC clash
+    // is still surfaced, not silently overwritten. `integrate_round_facts`
+    // reads this cell exactly as it reads `_CellKeyRoles`. Entry shape:
+    // `<<name, cell_id>>`, matching `SyntheticDerivedCells`.
+    {
+        let seed: Vec<String> = model.derivations.iter()
+            .filter(|d| d.id.starts_with("_sm_event_fold_")
+                     || d.id.starts_with("_sm_init_"))
+            .map(|d| d.consequent_cell.clone())
+            .filter(|c| !c.is_empty())
+            .collect();
+        if !seed.is_empty() {
+            let deps: Vec<(String, Vec<String>)> = model.derivations.iter()
+                .map(|d| (
+                    d.consequent_cell.clone(),
+                    model.derivation_positive_reads.get(&d.id).cloned().unwrap_or_default(),
+                ))
+                .collect();
+            let safe = compute_upsert_safe_cells(&seed, &deps);
+            let entries: Vec<crate::ast::Object> = safe.iter()
+                .map(|name| crate::ast::Object::seq(vec![
+                    crate::ast::Object::seq(vec![
+                        crate::ast::Object::atom("name"),
+                        crate::ast::Object::atom(name),
+                    ]),
+                ]))
+                .collect();
+            if !entries.is_empty() {
+                defs.push((
+                    "_UpsertSafeCells".to_string(),
+                    Func::constant(crate::ast::Object::Seq(entries.into())),
+                ));
+            }
         }
     }
 
@@ -12331,6 +12420,47 @@ mod schema_tests {
                 .map(|(n, _)| n.to_string())
                 .filter(|n| n.starts_with("derivation:"))
                 .collect::<Vec<_>>());
+    }
+
+    /// upsert-safe-propagation: the computed upsert-safe set replaces the
+    /// hand-maintained SM_STATUS_UPSERT_CELLS allowlist. A keyed cell is
+    /// upsert-safe (last-write-wins, so the from-guarded advance lands)
+    /// iff it is a seed (the SM event-fold's own consequent) OR it
+    /// transitively PROJECTS an upsert-safe cell. The bridge
+    /// `Resource_is_currently_in_Status` projects the fold cell, and
+    /// `Task_has_Task_Status` projects the bridge, so both inherit
+    /// upsert-safety; a keyed cell with no fold ancestor
+    /// (`Person_has_Name`) must NOT, so it keeps conflict-reject and a
+    /// genuine UC clash is still surfaced rather than silently advanced.
+    #[test]
+    fn upsert_safe_propagates_from_fold_seed_through_projections() {
+        let seed = vec!["State_Machine_is_currently_in_Status".to_string()];
+        let deps: Vec<(String, Vec<String>)> = vec![
+            // bridge: Resource_is_currently_in_Status iff SM is for Resource
+            //         and SM is currently in Status  (projects the fold cell)
+            ("Resource_is_currently_in_Status".to_string(), vec![
+                "State_Machine_is_for_Resource".to_string(),
+                "State_Machine_is_currently_in_Status".to_string(),
+            ]),
+            // task bridge: Task_has_Task_Status iff Resource is currently in
+            //              Status ...  (transitively projects the fold)
+            ("Task_has_Task_Status".to_string(), vec![
+                "Resource_is_currently_in_Status".to_string(),
+            ]),
+            // unrelated keyed cell whose antecedent never reaches a fold
+            ("Person_has_Name".to_string(), vec![
+                "Person_has_Raw_Name".to_string(),
+            ]),
+        ];
+        let safe = compute_upsert_safe_cells(&seed, &deps);
+        assert!(safe.contains("State_Machine_is_currently_in_Status"),
+            "the fold's own consequent (the seed) is upsert-safe");
+        assert!(safe.contains("Resource_is_currently_in_Status"),
+            "the bridge projecting the fold cell must inherit upsert-safety");
+        assert!(safe.contains("Task_has_Task_Status"),
+            "a transitive projection of the fold must inherit upsert-safety");
+        assert!(!safe.contains("Person_has_Name"),
+            "a keyed cell with no fold ancestor must stay conflict-reject");
     }
 
     /// task-957: minimal repro of the SM->FT bridge re-key (task-922).

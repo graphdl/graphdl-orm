@@ -220,42 +220,46 @@ fn abort_chain_nonterminating(round: usize, culprit: Option<(&str, &str)>) {
 /// each derived fact is individually correct; only completeness is
 /// affected.
 
-/// sm-status-scoped-upsert: cells whose forward-chain writes UPSERT (a
-/// new value at an existing key OVERWRITES the prior one) instead of
-/// being conflict-rejected like every other keyed cell.
+/// upsert-safe-propagation: read the `_UpsertSafeCells` metadata cell
+/// (emitted by `compile::compile_to_defs_state`) into the set of cell ids
+/// whose forward-chain keyed writes UPSERT (last-write-wins) rather than
+/// conflict-reject.
 ///
-/// The lone member is `State_Machine_is_currently_in_Status`: a KEYED
-/// cell (one-status-per-State-Machine alethic UC, key role
-/// "State Machine") that the SM event-fold ADVANCES. The fold is
-/// recursive — its from-guard reads the current status to gate, then
-/// emits the `to` status. On a plain keyed cell the advance
-/// (e.g. `(o2, Placed)` over seeded `(o2, Draft)`) collides at the
-/// `o2` key and `cell_put_keyed` drops it, FREEZING status at the
-/// seeded value. The from-guard already guarantees only a LEGAL advance
-/// is emitted (only a resource currently in `from` gets `to`), so
-/// last-write-wins here lands a valid transition; it never applies an
-/// illegal one.
+/// This REPLACES the former hand-maintained `SM_STATUS_UPSERT_CELLS`
+/// allowlist. Compile now COMPUTES the set: it seeds the SM event-fold's
+/// own (from-guarded, monotone-advancing) consequent cell and propagates
+/// upsert-safety along the derivation graph to every keyed cell that
+/// PROJECTS an upsert-safe cell — a monotone projection of an advancing
+/// cell is itself advancing. So the SM->Resource bridge
+/// (`Resource_is_currently_in_Status`) and the Resource->Task bridge
+/// (`Task_has_Task_Status`) inherit upsert and FOLLOW the advance instead
+/// of freezing at the seeded `initial`, while a keyed cell with no fold
+/// ancestor keeps conflict-reject (a genuine UC clash is still dropped +
+/// surfaced, never silently overwritten — the oscillation guard the
+/// allowlist provided, now derived structurally instead of pinned by name).
 ///
-/// SCOPE: this allowlist is consulted ONLY on the forward-chain
-/// (`integrate_round_facts`) keyed path. Every other keyed cell — and
-/// every user-facing apply-path write (see `command.rs::push_with_uc_check`,
-/// which has its own explicit `overwrite` flag) — keeps the global
-/// conflict-reject behavior unchanged.
-///
-/// The companion SM cells the fold co-emits
-/// (`State_Machine_is_instance_of_Noun`, `State_Machine_is_for_Resource`)
-/// are intentionally NOT here: their tuples are byte-stable across rounds
-/// (`<SM, Noun>` / `<SM, Resource=SM>` never change as Status advances),
-/// so a re-emit is `cell_put_keyed`'s idempotent byte-equal no-op, never
-/// a conflict — they need no upsert.
-pub(crate) const SM_STATUS_UPSERT_CELLS: &[&str] = &["State_Machine_is_currently_in_Status"];
-
-/// Whether forward-chain writes to `cell_name` should upsert (overwrite a
-/// prior value at the same key) rather than conflict-reject. True only for
-/// the scoped SM-status cell(s) in [`SM_STATUS_UPSERT_CELLS`].
-#[inline]
-pub(crate) fn cell_is_sm_status_upsert(cell_name: &str) -> bool {
-    SM_STATUS_UPSERT_CELLS.contains(&cell_name)
+/// Cells absent from the set keep the global conflict-reject. Same
+/// `<atom("'"), seq>` wrapper-unwrap as `read_cell_key_roles`; each entry
+/// is a named-tuple `<<name, cell_id>>`.
+pub(crate) fn read_upsert_safe_cells(d: &ast::Object) -> hashbrown::HashSet<String> {
+    use hashbrown::HashSet;
+    let cell = ast::fetch_or_phi("_UpsertSafeCells", d);
+    let entries: Vec<ast::Object> = cell.as_seq()
+        .and_then(|items| {
+            if items.len() == 2 && items[0].as_atom() == Some("'") {
+                items[1].as_seq().map(|s| s.to_vec())
+            } else {
+                Some(items.to_vec())
+            }
+        })
+        .unwrap_or_default();
+    let mut out: HashSet<String> = HashSet::with_capacity(entries.len());
+    for fact in entries.iter() {
+        if let Some(name) = ast::binding(fact, "name") {
+            out.insert(name.to_string());
+        }
+    }
+    out
 }
 
 /// Read the `_CellKeyRoles` metadata cell (emitted by
@@ -310,6 +314,7 @@ fn integrate_round_facts(
     state: ast::Object,
     by_cell: hashbrown::HashMap<String, Vec<ast::Object>>,
     key_roles: &hashbrown::HashMap<String, Vec<String>>,
+    upsert_safe: &hashbrown::HashSet<String>,
 ) -> ast::Object {
     let mut current_state = state;
     for (cell_name, facts) in by_cell {
@@ -336,7 +341,7 @@ fn integrate_round_facts(
             // re-emission is filtered by the `existing_keys + round_keys`
             // dedup upstream, so only genuine conflicts surface here.
             let role_refs: Vec<&str> = roles.iter().map(|s| s.as_str()).collect();
-            let upsert = cell_is_sm_status_upsert(&cell_name);
+            let upsert = upsert_safe.contains(&cell_name);
             let (next, conflicts) = ast::cell_put_keyed_batch(
                 &cell_name, &role_refs, facts, upsert, &current_state);
             current_state = next;
@@ -615,6 +620,7 @@ fn semi_naive_inner(
     // writes through `cell_put_keyed`. Same metadata-cell pattern as
     // `forward_chain_defs_state_bounded` — read once, consult per cell.
     let key_roles = read_cell_key_roles(d);
+    let upsert_safe = read_upsert_safe_cells(d);
     // Base set of fact keys in `d`. Built once here and updated
     // incrementally as rounds emit new facts — on core.md this cut
     // ~3ms per round of re-hashing the unchanged grammar portion of
@@ -691,7 +697,7 @@ fn semi_naive_inner(
             existing_keys.insert(fact_key(fact));
         }
         let next_dirty: HashSet<String> = by_cell.keys().cloned().collect();
-        current_state = integrate_round_facts(current_state, by_cell, &key_roles);
+        current_state = integrate_round_facts(current_state, by_cell, &key_roles, &upsert_safe);
         all_derived.extend(new_facts);
         dirty_cells = Some(next_dirty);
     }
@@ -758,6 +764,7 @@ pub fn forward_chain_defs_state_bounded(
     // `compile_to_defs_state`); fact-type cells absent from the map
     // keep the legacy Seq-append path.
     let key_roles = read_cell_key_roles(d);
+    let upsert_safe = read_upsert_safe_cells(d);
     // Cell written by the most recent round — names the consequent in the
     // traced ⊥ if the chain has to be aborted (the naive chainer has no
     // per-rule antecedent metadata, so the last-written cell is the best
@@ -789,7 +796,7 @@ pub fn forward_chain_defs_state_bounded(
                 .push(ast::fact_from_pairs(&pairs));
         }
         last_round_cell = by_cell.keys().next().cloned();
-        current_state = integrate_round_facts(current_state, by_cell, &key_roles);
+        current_state = integrate_round_facts(current_state, by_cell, &key_roles, &upsert_safe);
         all_derived.extend(new_facts);
     }
     (current_state, all_derived)
@@ -2628,19 +2635,23 @@ mod tests {
         let mut by_cell: HbMap<String, Vec<ast::Object>> = HbMap::new();
         by_cell.insert("Person_has_Name".to_string(), vec![conflicting]);
 
-        // key_roles marks Person_has_Name as keyed on "Person" — but it is
-        // NOT in SM_STATUS_UPSERT_CELLS, so the conflict must DROP.
+        // key_roles marks Person_has_Name as keyed on "Person". The
+        // computed upsert-safe set does NOT contain it (no SM-fold
+        // ancestor), so the conflicting write must DROP — conflict-reject
+        // is preserved for any keyed cell that isn't a monotone projection
+        // of an advancing fold.
         let mut key_roles: HbMap<String, Vec<String>> = HbMap::new();
         key_roles.insert("Person_has_Name".to_string(), vec!["Person".to_string()]);
 
-        // Sanity: confirm the allowlist genuinely excludes this cell (and
-        // includes the SM cell), so the test is exercising the scoping.
-        assert!(!cell_is_sm_status_upsert("Person_has_Name"),
-            "Person_has_Name must NOT be in the upsert allowlist");
-        assert!(cell_is_sm_status_upsert("State_Machine_is_currently_in_Status"),
-            "the SM-status cell MUST be in the upsert allowlist");
+        // upsert-safe-propagation: the set the forward chain consults
+        // (post-allowlist) carries the SM-fold seed cell but NOT
+        // Person_has_Name, so Person_has_Name keeps global conflict-reject.
+        let mut upsert_safe: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        upsert_safe.insert("State_Machine_is_currently_in_Status".to_string());
+        assert!(!upsert_safe.contains("Person_has_Name"),
+            "Person_has_Name must NOT be upsert-safe (no fold ancestor)");
 
-        let next = integrate_round_facts(state, by_cell, &key_roles);
+        let next = integrate_round_facts(state, by_cell, &key_roles, &upsert_safe);
 
         let cell = ast::fetch_or_phi("Person_has_Name", &next);
         let names: Vec<String> = ast::cell_facts_iter(&cell)
@@ -2651,6 +2662,51 @@ mod tests {
             "non-SM keyed cell must REJECT the conflicting (alice→B) write and \
              keep the original (alice→A) — global UC enforcement unchanged; \
              got {:?}", names);
+    }
+
+    /// upsert-safe-propagation (POSITIVE counterpart to
+    /// `forward_chain_non_sm_keyed_cell_still_conflict_rejects`): a keyed
+    /// cell that IS upsert-safe — a monotone projection of the SM fold,
+    /// e.g. the `Resource_is_currently_in_Status` / `Task_has_Task_Status`
+    /// bridges — must ADVANCE across rounds. Round 1 establishes the seeded
+    /// `pending`; a later round re-derives the fold-advanced `completed`
+    /// from more-converged inputs. Pre-fix (the name allowlist) this cell
+    /// was NOT upsert and the advance conflict-dropped, FREEZING the
+    /// projection at `pending` — exactly the live-board symptom (912 tasks
+    /// stuck `pending` while their state machines read `completed`).
+    /// Last-write-wins lands the converged status.
+    #[test]
+    fn forward_chain_upsert_safe_keyed_cell_advances_across_rounds() {
+        use hashbrown::HashMap as HbMap;
+        // Round 1 already established (x -> pending) on the keyed cell.
+        let seed = ast::fact_from_pairs(&[("Resource", "x"), ("Status", "pending")]);
+        let state = ast::cell_put_keyed("Resource_is_currently_in_Status", &["Resource"],
+            seed, &ast::Object::phi()).expect("seed put must succeed");
+
+        // A later round re-derives the fold-advanced (x -> completed).
+        let advanced = ast::fact_from_pairs(&[("Resource", "x"), ("Status", "completed")]);
+        let mut by_cell: HbMap<String, Vec<ast::Object>> = HbMap::new();
+        by_cell.insert("Resource_is_currently_in_Status".to_string(), vec![advanced]);
+        let mut key_roles: HbMap<String, Vec<String>> = HbMap::new();
+        key_roles.insert("Resource_is_currently_in_Status".to_string(),
+            vec!["Resource".to_string()]);
+
+        // The cell IS upsert-safe (projects the fold), so the advance must
+        // OVERWRITE the seeded value — not conflict-drop.
+        let mut upsert_safe: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+        upsert_safe.insert("Resource_is_currently_in_Status".to_string());
+
+        let next = integrate_round_facts(state, by_cell, &key_roles, &upsert_safe);
+
+        let statuses: Vec<String> = ast::cell_facts_iter(
+            &ast::fetch_or_phi("Resource_is_currently_in_Status", &next))
+            .filter(|f| ast::binding(f, "Resource") == Some("x"))
+            .filter_map(|f| ast::binding(f, "Status").map(|s| s.to_string()))
+            .collect();
+        assert_eq!(statuses, vec!["completed".to_string()],
+            "an upsert-safe keyed projection must ADVANCE to the converged \
+             status (last-write-wins), not freeze at the first-written \
+             value; got {:?}", statuses);
     }
 
     /// perf-cellput-on2 O(n²) regression GUARD (keyless/folded path):
@@ -2675,8 +2731,9 @@ mod tests {
             let mut by_cell: HbMap<String, Vec<ast::Object>> = HbMap::new();
             by_cell.insert("App_uses_Generator".to_string(), facts);
             let key_roles: HbMap<String, Vec<String>> = HbMap::new(); // keyless → folded
+            let upsert_safe: hashbrown::HashSet<String> = hashbrown::HashSet::new();
             ast::reset_cell_map_clone_count();
-            let _ = integrate_round_facts(state, by_cell, &key_roles);
+            let _ = integrate_round_facts(state, by_cell, &key_roles, &upsert_safe);
             ast::get_cell_map_clone_count()
         };
         let small = clones_for(8);
@@ -2710,8 +2767,9 @@ mod tests {
             by_cell.insert("Task_has_Status".to_string(), facts);
             let mut key_roles: HbMap<String, Vec<String>> = HbMap::new();
             key_roles.insert("Task_has_Status".to_string(), vec!["Task".to_string()]);
+            let upsert_safe: hashbrown::HashSet<String> = hashbrown::HashSet::new();
             ast::reset_cell_map_clone_count();
-            let _ = integrate_round_facts(seed, by_cell, &key_roles);
+            let _ = integrate_round_facts(seed, by_cell, &key_roles, &upsert_safe);
             ast::get_cell_map_clone_count()
         };
         let small = clones_for(8);
