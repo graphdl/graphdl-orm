@@ -2987,7 +2987,7 @@ Status 'pending' is initial in State Machine Definition 'Task SM'.
 Transition 'start' is defined in State Machine Definition 'Task SM'.
 Transition 'start' is from Status 'pending'.
 Transition 'start' is to Status 'in_progress'.
-Transition 'start' is triggered by Fact Type 'Task is started'.
+Transition 'start' is triggered by Event Type 'Task is started'.
 
 ## Derivation Rules
 * Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.

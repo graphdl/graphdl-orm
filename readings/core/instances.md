@@ -4,8 +4,10 @@
 
 Resource(.Reference) is an entity type.
   Resource is a subtype of Noun.
+Event is an entity type.
+  Event is a subtype of Resource.
 Fact is an entity type.
-  Fact is a subtype of Fact Type.
+  Fact is a subtype of Event.
 State Machine(.id) is an entity type.
 Guard Run(.Name) is an entity type.
 Citation(.id) is an entity type.
@@ -71,6 +73,23 @@ Fact is completed.
 Fact is example.
 Fact cites Citation.
   For each pair of Fact and Citation, that Fact cites that Citation at most once.
+
+### Event
+Event is of Event Type.
+  Each Event is of exactly one Event Type.
+Event occurred at Timestamp.
+  Each Event occurred at exactly one Timestamp.
+Event is created by State Machine.
+  Each Event is created by at most one State Machine.
+  It is possible that more than one Event is created by the same State Machine.
+
+### Event Type
+Event Type publishes to Stream.
+  Each Event Type publishes to at most one Stream.
+  It is possible that more than one Event Type publishes to the same Stream.
+Event Type can be created by Verb.
+  It is possible that some Event Type can be created by more than one Verb and that some Verb can create more than one Event Type.
+  For each combination of Event Type and Verb, that Event Type can be created by that Verb at most once.
 
 ### Fact Type Citation
 Fact Type cites Citation.
@@ -149,15 +168,15 @@ Resource is currently in Status.
 State Machine is currently in Status.
   Each State Machine is currently in exactly one Status.
 
-### Fact Triggered Transition (objectification of "Fact triggered Transition for Resource")
-Fact triggered Transition for Resource.
-  In each population of Fact triggered Transition for Resource, each Fact, Transition, Resource combination occurs at most once.
-  This association with Fact, Transition, Resource provides the preferred identification scheme for Fact Triggered Transition.
+### Event Caused Transition (objectification of "Event caused Transition in State Machine")
+Event caused Transition in State Machine.
+  In each population of Event caused Transition in State Machine, each Event, Transition, State Machine combination occurs at most once.
+  This association with Event, Transition, State Machine provides the preferred identification scheme for Event Caused Transition.
 
 ## Subset Constraints
 
-If some Fact triggered some Transition for some Resource then that Fact is of some Fact Type
-  where that Transition is triggered by that Fact Type.
+If some Event caused some Transition in some State Machine then that Event is of some Event Type
+  where that Transition is triggered by that Event Type.
 
 ### Guard Run
 Guard Run is for Guard.

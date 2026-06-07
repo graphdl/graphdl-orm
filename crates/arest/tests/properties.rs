@@ -351,27 +351,27 @@ Status 'In Cart' is initial in State Machine Definition 'Order'.
 Transition 'place' is defined in State Machine Definition 'Order'.
   Transition 'place' is from Status 'In Cart'.
   Transition 'place' is to Status 'Placed'.
-  Transition 'place' is triggered by Fact Type 'place'.
+  Transition 'place' is triggered by Event Type 'place'.
 
 Transition 'ship' is defined in State Machine Definition 'Order'.
   Transition 'ship' is from Status 'Placed'.
   Transition 'ship' is to Status 'Shipped'.
-  Transition 'ship' is triggered by Fact Type 'ship'.
+  Transition 'ship' is triggered by Event Type 'ship'.
 
 Transition 'deliver' is defined in State Machine Definition 'Order'.
   Transition 'deliver' is from Status 'Shipped'.
   Transition 'deliver' is to Status 'Delivered'.
-  Transition 'deliver' is triggered by Fact Type 'deliver'.
+  Transition 'deliver' is triggered by Event Type 'deliver'.
 
 Transition 'cancel' is defined in State Machine Definition 'Order'.
   Transition 'cancel' is from Status 'In Cart'.
   Transition 'cancel' is to Status 'Cancelled'.
-  Transition 'cancel' is triggered by Fact Type 'cancel'.
+  Transition 'cancel' is triggered by Event Type 'cancel'.
 
 Transition 'cancel-placed' is defined in State Machine Definition 'Order'.
   Transition 'cancel-placed' is from Status 'Placed'.
   Transition 'cancel-placed' is to Status 'Cancelled'.
-  Transition 'cancel-placed' is triggered by Fact Type 'cancel'.
+  Transition 'cancel-placed' is triggered by Event Type 'cancel'.
 
 Customer 'Acme' has Email 'acme@example.com'.
 Customer 'Globex' has Email 'globex@example.com'.

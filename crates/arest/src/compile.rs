@@ -7868,7 +7868,7 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
         let sm_noun_obj = Object::atom(&sm_noun);
         // transition_table stores the Fact Type's human-readable form
         // (e.g. "Task is started") because that's the binding value in
-        // `Transition_is_triggered_by_Fact_Type`. Cell ids are the
+        // `Transition_is_triggered_by_Event_Type`. Cell ids are the
         // canonical underscore-separated form (e.g. "Task_is_started")
         // — normalize spaces → underscores so the extractor reads the
         // right cell.
@@ -10150,7 +10150,7 @@ fn compile_state_machine(
 ///   * `Transition_is_defined_in_State_Machine_Definition` — owning SM
 ///   * `Transition_is_from_Status` / `Transition_is_to_Status` —
 ///     transition endpoints
-///   * `Transition_is_triggered_by_Fact_Type` — event name
+///   * `Transition_is_triggered_by_Event_Type` — event name
 ///
 /// `noun_name` is the Noun whose SM to compile. Returns `Some` when
 /// at least one `State_Machine_Definition_is_for_Noun` fact binds an
@@ -10267,10 +10267,10 @@ fn compile_state_machine_from_cells(
             }).collect()
         }).unwrap_or_default();
     let t_event_pairs: Vec<(String, String)> = fetch_cell_seq(
-        "Transition_is_triggered_by_Fact_Type", cells).as_seq().map(|facts| {
+        "Transition_is_triggered_by_Event_Type", cells).as_seq().map(|facts| {
             facts.iter().filter_map(|f| {
                 let t = binding(f, "Transition")?;
-                let e = binding(f, "Fact Type")?;
+                let e = binding(f, "Event Type")?;
                 Some((t.to_string(), e.to_string()))
             }).collect()
         }).unwrap_or_default();
@@ -16222,8 +16222,8 @@ mod cell_driven_sm_tests {
                 .push(fact_from_pairs(&[("Transition", t), ("Status", from)]));
             cells.entry("Transition_is_to_Status".into()).or_default()
                 .push(fact_from_pairs(&[("Transition", t), ("Status", to)]));
-            cells.entry("Transition_is_triggered_by_Fact_Type".into()).or_default()
-                .push(fact_from_pairs(&[("Transition", t), ("Fact Type", ev)]));
+            cells.entry("Transition_is_triggered_by_Event_Type".into()).or_default()
+                .push(fact_from_pairs(&[("Transition", t), ("Event Type", ev)]));
         }
         Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect::<hashbrown::HashMap<_, _>>().into())
     }
@@ -16324,8 +16324,8 @@ mod cell_driven_sm_tests {
                 .push(fact_from_pairs(&[("Transition", t), ("Status", from)]));
             cells.entry("Transition_is_to_Status".into()).or_default()
                 .push(fact_from_pairs(&[("Transition", t), ("Status", to)]));
-            cells.entry("Transition_is_triggered_by_Fact_Type".into()).or_default()
-                .push(fact_from_pairs(&[("Transition", t), ("Fact Type", ev)]));
+            cells.entry("Transition_is_triggered_by_Event_Type".into()).or_default()
+                .push(fact_from_pairs(&[("Transition", t), ("Event Type", ev)]));
         }
         Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect::<hashbrown::HashMap<_, _>>().into())
     }
@@ -16467,8 +16467,8 @@ mod cell_driven_sm_tests {
             .push(fact_from_pairs(&[("Transition", "approve_dc"), ("Status", "Proposed")]));
         cells.entry("Transition_is_to_Status".into()).or_default()
             .push(fact_from_pairs(&[("Transition", "approve_dc"), ("Status", "Approved")]));
-        cells.entry("Transition_is_triggered_by_Fact_Type".into()).or_default()
-            .push(fact_from_pairs(&[("Transition", "approve_dc"), ("Fact Type", "User_approves_DC")]));
+        cells.entry("Transition_is_triggered_by_Event_Type".into()).or_default()
+            .push(fact_from_pairs(&[("Transition", "approve_dc"), ("Event Type", "User_approves_DC")]));
         // Merge statuses: Proposed → Facts Populated → Merged.
         for s in &["Proposed", "Facts Populated", "Merged"] {
             cells.entry("Status_is_defined_in_State_Machine_Definition".into()).or_default()
@@ -16486,8 +16486,8 @@ mod cell_driven_sm_tests {
             .push(fact_from_pairs(&[("Transition", "populate_facts"), ("Status", "Proposed")]));
         cells.entry("Transition_is_to_Status".into()).or_default()
             .push(fact_from_pairs(&[("Transition", "populate_facts"), ("Status", "Facts Populated")]));
-        cells.entry("Transition_is_triggered_by_Fact_Type".into()).or_default()
-            .push(fact_from_pairs(&[("Transition", "populate_facts"), ("Fact Type", "Merge_facts_populated")]));
+        cells.entry("Transition_is_triggered_by_Event_Type".into()).or_default()
+            .push(fact_from_pairs(&[("Transition", "populate_facts"), ("Event Type", "Merge_facts_populated")]));
         Object::Map(cells.into_iter().map(|(k, v)| (k, Object::Seq(v.into()))).collect::<hashbrown::HashMap<_, _>>().into())
     }
 

@@ -2500,7 +2500,7 @@ fn record_reconcile_passes(passes: usize) {
 /// cells:
 ///   Transition_is_defined_in_State_Machine_Definition (T → SM def)
 ///   State_Machine_Definition_is_for_Noun              (SM def → Noun)
-///   Transition_is_triggered_by_Fact_Type              (T → Fact Type)
+///   Transition_is_triggered_by_Event_Type              (T → Fact Type)
 /// Shared by `reconcile_derived_transitions` and the batch-tail gate so
 /// both agree on which cells are SM triggers.
 fn sm_fact_triggers(d: &ast::Object) -> Vec<(String, String, String)> {
@@ -2509,7 +2509,7 @@ fn sm_fact_triggers(d: &ast::Object) -> Vec<(String, String, String)> {
     let sm_for_noun = ast::fetch_cell_seq(
         "State_Machine_Definition_is_for_Noun", d);
     let t_trigger_ft = ast::fetch_cell_seq(
-        "Transition_is_triggered_by_Fact_Type", d);
+        "Transition_is_triggered_by_Event_Type", d);
 
     let sm_to_noun: Vec<(String, String)> = sm_for_noun.as_seq()
         .map(|facts| facts.iter().filter_map(|f| {
@@ -2529,7 +2529,7 @@ fn sm_fact_triggers(d: &ast::Object) -> Vec<(String, String, String)> {
     t_trigger_ft.as_seq()
         .map(|facts| facts.iter().filter_map(|f| {
             let t = ast::binding(f, "Transition")?;
-            let reading = ast::binding(f, "Fact Type")?;
+            let reading = ast::binding(f, "Event Type")?;
             let sm = t_to_sm.iter().find_map(|(tt, s)| (tt == t).then(|| s.clone()))?;
             let noun = sm_to_noun.iter().find_map(|(s, n)| (s == &sm).then(|| n.clone()))?;
             let cell = reading.replace(' ', "_");
@@ -2843,9 +2843,9 @@ fn transition_via_defs(
     // and are skipped). Idempotent so repeated transitions don't bloat the
     // event cell; the fold is latest-wins so a present fact is harmless.
     if new_status.is_some() && !noun.is_empty() {
-        let is_ft_trigger = ast::fetch_cell_seq("Transition_is_triggered_by_Fact_Type", d)
+        let is_ft_trigger = ast::fetch_cell_seq("Transition_is_triggered_by_Event_Type", d)
             .as_seq()
-            .map(|facts| facts.iter().any(|f| ast::binding(f, "Fact Type") == Some(event)))
+            .map(|facts| facts.iter().any(|f| ast::binding(f, "Event Type") == Some(event)))
             .unwrap_or(false);
         if is_ft_trigger {
             // FT cell id is the reading with spaces → underscores; the
@@ -2946,9 +2946,9 @@ fn transition_via_defs(
         {
             // Same FT-trigger test as the durable-event write above: only
             // then was `event.replace(' ', "_")` actually written.
-            let is_ft_trigger = ast::fetch_cell_seq("Transition_is_triggered_by_Fact_Type", d)
+            let is_ft_trigger = ast::fetch_cell_seq("Transition_is_triggered_by_Event_Type", d)
                 .as_seq()
-                .map(|facts| facts.iter().any(|f| ast::binding(f, "Fact Type") == Some(event)))
+                .map(|facts| facts.iter().any(|f| ast::binding(f, "Event Type") == Some(event)))
                 .unwrap_or(false);
             if is_ft_trigger {
                 seed.insert(event.replace(' ', "_"));
@@ -10340,32 +10340,32 @@ Status 'pending' is initial in State Machine Definition 'Job SM'.
 Transition 'start' is defined in State Machine Definition 'Job SM'.
 Transition 'start' is from Status 'pending'.
 Transition 'start' is to Status 'in_progress'.
-Transition 'start' is triggered by Fact Type 'Job is started'.
+Transition 'start' is triggered by Event Type 'Job is started'.
 
 Transition 'finish' is defined in State Machine Definition 'Job SM'.
 Transition 'finish' is from Status 'in_progress'.
 Transition 'finish' is to Status 'completed'.
-Transition 'finish' is triggered by Fact Type 'Job is finished'.
+Transition 'finish' is triggered by Event Type 'Job is finished'.
 
 Transition 'block' is defined in State Machine Definition 'Job SM'.
 Transition 'block' is from Status 'in_progress'.
 Transition 'block' is to Status 'blocked'.
-Transition 'block' is triggered by Fact Type 'Job is blocked'.
+Transition 'block' is triggered by Event Type 'Job is blocked'.
 
 Transition 'unblock' is defined in State Machine Definition 'Job SM'.
 Transition 'unblock' is from Status 'blocked'.
 Transition 'unblock' is to Status 'in_progress'.
-Transition 'unblock' is triggered by Fact Type 'Job is unblocked'.
+Transition 'unblock' is triggered by Event Type 'Job is unblocked'.
 
 Transition 'reopen' is defined in State Machine Definition 'Job SM'.
 Transition 'reopen' is from Status 'completed'.
 Transition 'reopen' is to Status 'pending'.
-Transition 'reopen' is triggered by Fact Type 'Job is reopened'.
+Transition 'reopen' is triggered by Event Type 'Job is reopened'.
 
 Transition 'delete-from-progress' is defined in State Machine Definition 'Job SM'.
 Transition 'delete-from-progress' is from Status 'in_progress'.
 Transition 'delete-from-progress' is to Status 'deleted'.
-Transition 'delete-from-progress' is triggered by Fact Type 'Job is deleted'.
+Transition 'delete-from-progress' is triggered by Event Type 'Job is deleted'.
 
 ## Constraints
 
@@ -10542,17 +10542,17 @@ Status 'pending' is initial in State Machine Definition 'Job SM'.
 Transition 'start' is defined in State Machine Definition 'Job SM'.
 Transition 'start' is from Status 'pending'.
 Transition 'start' is to Status 'in_progress'.
-Transition 'start' is triggered by Fact Type 'Job is started'.
+Transition 'start' is triggered by Event Type 'Job is started'.
 
 Transition 'finish' is defined in State Machine Definition 'Job SM'.
 Transition 'finish' is from Status 'in_progress'.
 Transition 'finish' is to Status 'completed'.
-Transition 'finish' is triggered by Fact Type 'Job is finished'.
+Transition 'finish' is triggered by Event Type 'Job is finished'.
 
 Transition 'reopen' is defined in State Machine Definition 'Job SM'.
 Transition 'reopen' is from Status 'completed'.
 Transition 'reopen' is to Status 'pending'.
-Transition 'reopen' is triggered by Fact Type 'Job is reopened'.
+Transition 'reopen' is triggered by Event Type 'Job is reopened'.
 
 ## Constraints
 

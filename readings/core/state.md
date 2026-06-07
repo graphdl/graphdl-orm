@@ -30,8 +30,8 @@ Transition is from Status.
   Each Transition is from exactly one Status.
 Transition is to Status.
   Each Transition is to exactly one Status.
-Transition is triggered by Fact Type.
-  Each Transition is triggered by exactly one Fact Type.
+Transition is triggered by Event Type.
+  Each Transition is triggered by exactly one Event Type.
 Verb is performed during Transition.
   Each Verb is performed during at most one Transition.
 
@@ -46,9 +46,9 @@ Status is rooted in State Machine Definition. *
 Guard references Fact Type.
   It is possible that some Guard references more than one Fact Type and that for some Fact Type, more than one Guard references that Fact Type.
   For each combination of Guard and Fact Type, that Guard references that Fact Type at most once.
-Guard prevents Transition.
-  Each Guard prevents at most one Transition.
-  It is possible that more than one Guard prevents the same Transition.
+Guard guards Transition.
+  Each Guard guards at most one Transition.
+  It is possible that more than one Guard guards the same Transition.
 
 ## Derivation Rules
 

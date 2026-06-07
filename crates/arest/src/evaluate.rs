@@ -1766,7 +1766,7 @@ mod tests {
                     ("Transition", t_name),
                     ("Status", t.to.as_str()),
                 ]));
-            cells.entry("Transition_is_triggered_by_Fact_Type".into()).or_default()
+            cells.entry("Transition_is_triggered_by_Event_Type".into()).or_default()
                 .push(ast::fact_from_pairs(&[
                     ("Transition", t_name),
                     ("Fact Type", t.event.as_str()),

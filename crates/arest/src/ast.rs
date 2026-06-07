@@ -1275,6 +1275,17 @@ pub enum Func {
     /// for O(1) probes (`IndexBy(keyfn) ∘ right`, then `FetchOrPhi:<key, idx>`).
     IndexBy(Box<Func>),
 
+    /// OrderBy (sort-by-key extension — NOT in Backus's θ₁; Codd's relational
+    /// algebra is unordered, §6 Table 1). `OrderBy(keyfn):<e₁,…,eₙ>` returns the
+    /// elements stably sorted ascending by the atom key `keyfn:eᵢ` — numeric
+    /// keys compare numerically (epoch / recorded-at), else lexicographically
+    /// (ISO timestamps). Non-atom keys sort first and are retained (total +
+    /// stable). The general primitive that orders an unordered event SET into
+    /// the chronological STREAM E that the SM fold `foldl transition s₀ E`
+    /// (AREST.tex eq:sm, "latest-wins per resource") consumes. Read-only — no
+    /// Store capability gate.
+    OrderBy(Box<Func>),
+
     /// Named definition: references a function by name from the definition set.
     Def(String),
 
@@ -2003,6 +2014,8 @@ fn normalize_children(f: &Func) -> Func {
             Func::FoldL(Box::new(normalize(g))),
         Func::IndexBy(g) =>
             Func::IndexBy(Box::new(normalize(g))),
+        Func::OrderBy(g) =>
+            Func::OrderBy(Box::new(normalize(g))),
         leaf => leaf.clone(),
     }
 }
@@ -2176,6 +2189,7 @@ fn variant_name(f: &Func) -> &'static str {
         Func::While(_, _) => "While",
         Func::FoldL(_) => "FoldL",
         Func::IndexBy(_) => "IndexBy",
+        Func::OrderBy(_) => "OrderBy",
         Func::Def(_) => "Def",
         Func::Platform(_) => "Platform",
         Func::Native(_) => "Native",
@@ -2995,6 +3009,32 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                     Object::map(groups.into_iter()
                         .map(|(k, v)| (k, Object::Seq(v.into())))
                         .collect())
+                }
+                _ => Object::Bottom,
+            }
+        }
+
+        Func::OrderBy(keyfn) => {
+            // sort x's elements stably-ascending by the atom key keyfn:elem.
+            // Numeric keys (epoch / recorded-at) compare numerically; else
+            // lexicographic (ISO timestamps). A non-atom key → "" (sorts
+            // first), retained — total + stable so a latest-wins fold over the
+            // ordered stream is deterministic. AREST.tex eq:sm.
+            match x.as_seq() {
+                Some(items) => {
+                    let mut keyed: Vec<(String, Object)> = items.iter()
+                        .map(|e| {
+                            let k = apply(keyfn, e, d);
+                            (k.as_atom().map(|s| s.to_string()).unwrap_or_default(), e.clone())
+                        })
+                        .collect();
+                    keyed.sort_by(|(ka, _), (kb, _)|
+                        match (ka.parse::<f64>(), kb.parse::<f64>()) {
+                            (Ok(a), Ok(b)) =>
+                                a.partial_cmp(&b).unwrap_or(core::cmp::Ordering::Equal),
+                            _ => ka.cmp(kb),
+                        });
+                    Object::seq(keyed.into_iter().map(|(_, e)| e).collect())
                 }
                 _ => Object::Bottom,
             }
@@ -4293,6 +4333,7 @@ pub mod forms {
     pub const WHILE: &str = "W";
     pub const FOLDL: &str = "\\";
     pub const INDEX_BY: &str = "ix";
+    pub const ORDER_BY: &str = "ob";
     pub const CONST: &str = "'";
 }
 
@@ -6454,6 +6495,11 @@ fn metacompose_sequence(items: &[Object], d: &Object) -> Func {
             let f = metacompose(&items[1], d);
             Func::IndexBy(Box::new(f))
         }
+        forms::ORDER_BY if items.len() == 2 => {
+            // <ORDER_BY, keyfn> → OrderBy(keyfn)
+            let f = metacompose(&items[1], d);
+            Func::OrderBy(Box::new(f))
+        }
         forms::BU if items.len() == 3 => {
             // <BU, f, x> → (bu f x)
             let f = metacompose(&items[1], d);
@@ -6556,6 +6602,7 @@ pub fn func_to_object(func: &Func) -> Object {
         Func::Insert(f) => Object::seq(vec![Object::atom(forms::INSERT), func_to_object(f)]),
         Func::FoldL(f) => Object::seq(vec![Object::atom(forms::FOLDL), func_to_object(f)]),
         Func::IndexBy(f) => Object::seq(vec![Object::atom(forms::INDEX_BY), func_to_object(f)]),
+        Func::OrderBy(f) => Object::seq(vec![Object::atom(forms::ORDER_BY), func_to_object(f)]),
         Func::BinaryToUnary(f, x) => Object::seq(vec![
             Object::atom(forms::BU), func_to_object(f), x.clone(),
         ]),
@@ -6758,7 +6805,7 @@ impl Func {
             Func::Construction(fs) => fs.iter().any(|f| f.has_native()),
             Func::Condition(p, f, g) => p.has_native() || f.has_native() || g.has_native(),
             Func::ApplyToAll(f) | Func::Insert(f) | Func::Filter(f) | Func::FoldL(f)
-            | Func::IndexBy(f) => f.has_native(),
+            | Func::IndexBy(f) | Func::OrderBy(f) => f.has_native(),
             Func::While(p, f) => p.has_native() || f.has_native(),
             Func::BinaryToUnary(f, _) => f.has_native(),
             _ => false,
@@ -6823,6 +6870,7 @@ impl fmt::Debug for Func {
             Func::Insert(g) => write!(f, "/{:?}", g),
             Func::FoldL(g) => write!(f, "foldl({:?})", g),
             Func::IndexBy(g) => write!(f, "indexby({:?})", g),
+            Func::OrderBy(g) => write!(f, "orderby({:?})", g),
             Func::Filter(p) => write!(f, "Filter({:?})", p),
             Func::BinaryToUnary(g, x) => write!(f, "(bu {:?} {:?})", g, x),
             Func::While(p, g) => write!(f, "(while {:?} {:?})", p, g),
@@ -9781,6 +9829,76 @@ mod tests {
         let d_prime = store("FILE", new_pop.clone(), &d);
         assert_eq!(fetch("FILE", &d_prime), new_pop);
         assert_eq!(fetch("defs", &d_prime), definitions); // defs unchanged
+    }
+
+    // ── OrderBy (sort-by-key extension; sm-fold-as-predicate) ─────
+    //
+    // OrderBy(keyfn):<e₁,…,eₙ> = the eᵢ stably sorted ascending by the
+    // atom key keyfn:eᵢ. The general primitive that turns an unordered
+    // event *set* into the chronological *stream* E that the SM fold
+    // `foldl transition s₀ E` (AREST.tex eq:sm) consumes latest-wins.
+    // Numeric keys compare numerically (epoch / recorded-at), else
+    // lexicographically (ISO timestamps). Stable, total, retains all
+    // elements (non-atom keys sort first, stably).
+
+    #[test]
+    fn order_by_sorts_by_numeric_key() {
+        // OrderBy(s₁) over <<3,a>,<1,b>,<2,c>> → <<1,b>,<2,c>,<3,a>>.
+        // Keys "3","1","2" must compare NUMERICALLY (not "1"<"2"<"3"
+        // lexicographically, which would mis-order e.g. "10" < "9").
+        let d = defs();
+        let f = Func::OrderBy(Box::new(Func::Selector(1)));
+        let x = Object::seq(vec![
+            Object::seq(vec![Object::atom("3"), Object::atom("a")]),
+            Object::seq(vec![Object::atom("1"), Object::atom("b")]),
+            Object::seq(vec![Object::atom("10"), Object::atom("d")]),
+            Object::seq(vec![Object::atom("2"), Object::atom("c")]),
+        ]);
+        let expected = Object::seq(vec![
+            Object::seq(vec![Object::atom("1"), Object::atom("b")]),
+            Object::seq(vec![Object::atom("2"), Object::atom("c")]),
+            Object::seq(vec![Object::atom("3"), Object::atom("a")]),
+            Object::seq(vec![Object::atom("10"), Object::atom("d")]),
+        ]);
+        assert_eq!(apply(&f, &x, &d), expected);
+    }
+
+    #[test]
+    fn order_by_is_stable_for_equal_keys() {
+        // Equal keys preserve input order (latest-wins downstream relies
+        // on stability when timestamps collide).
+        let d = defs();
+        let f = Func::OrderBy(Box::new(Func::Selector(1)));
+        let x = Object::seq(vec![
+            Object::seq(vec![Object::atom("1"), Object::atom("a")]),
+            Object::seq(vec![Object::atom("1"), Object::atom("b")]),
+            Object::seq(vec![Object::atom("1"), Object::atom("c")]),
+        ]);
+        assert_eq!(apply(&f, &x, &d), x);
+    }
+
+    #[test]
+    fn order_by_roundtrips_through_metacompose() {
+        // ρ<ob, "1"> = OrderBy(Selector(1)); and func_to_object is its
+        // left inverse (Backus 13.3.2 decomposition).
+        let d = defs();
+        let obj = Object::seq(vec![
+            Object::atom(forms::ORDER_BY),
+            Object::atom("1"),
+        ]);
+        let f = metacompose(&obj, &d);
+        let x = Object::seq(vec![
+            Object::seq(vec![Object::atom("c"), Object::atom("x")]),
+            Object::seq(vec![Object::atom("a"), Object::atom("y")]),
+            Object::seq(vec![Object::atom("b"), Object::atom("z")]),
+        ]);
+        let expected = Object::seq(vec![
+            Object::seq(vec![Object::atom("a"), Object::atom("y")]),
+            Object::seq(vec![Object::atom("b"), Object::atom("z")]),
+            Object::seq(vec![Object::atom("c"), Object::atom("x")]),
+        ]);
+        assert_eq!(apply(&f, &x, &d), expected);
+        assert_eq!(func_to_object(&Func::OrderBy(Box::new(Func::Selector(1)))), obj);
     }
 
     // ── FFP: ρ and metacomposition (Backus 13) ──────────────────

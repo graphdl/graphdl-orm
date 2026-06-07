@@ -77,12 +77,12 @@ Status 'Closed' is terminal in State Machine Definition 'Agent Chat'.
 Transition 'append-message' is defined in State Machine Definition 'Agent Chat'.
 Transition 'append-message' is from Status 'Open'.
 Transition 'append-message' is to Status 'Open'.
-Transition 'append-message' is triggered by Fact Type 'Chat Message belongs to Agent Chat'.
+Transition 'append-message' is triggered by Event Type 'Chat Message belongs to Agent Chat'.
 
 Transition 'close' is defined in State Machine Definition 'Agent Chat'.
 Transition 'close' is from Status 'Open'.
 Transition 'close' is to Status 'Closed'.
-Transition 'close' is triggered by Fact Type 'User closes Agent Chat'.
+Transition 'close' is triggered by Event Type 'User closes Agent Chat'.
 
 Domain 'agent-chat' has Access 'public'.
 Domain 'agent-chat' has Description 'Multi-turn conversations between a User and an Agent. Models messages, tool calls, and streaming mode. Builds on templates/agents.md.'.
