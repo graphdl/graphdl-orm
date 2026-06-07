@@ -5974,6 +5974,48 @@ pub fn parse_to_state_via_stage12_with_context_domain(
         text, &extra_nouns, &extra_ft_facts, &defining, local_domain)
 }
 
+/// Strip HTML-style block comments (`<!-- ... -->`) from reading source
+/// BEFORE statement extraction. Comments may span multiple lines and
+/// interior blank lines. Each comment span's characters are replaced with
+/// spaces while NEWLINES are preserved, so line numbers (and thus
+/// statement ids / diagnostics) stay stable and the blanked body cannot
+/// form a statement. A first `-->` closes the comment (HTML comments do
+/// not nest); an unterminated `<!--` blanks to end-of-input.
+///
+/// Why this is a phase, not a per-line skip: the metamodel readings use
+/// `<!-- ... -->` for multi-paragraph prose, but the statement extractor
+/// has no comment phase, so a prose line that happens to look like a
+/// reading (ends in '.', mentions declared nouns) leaks and mints a
+/// spurious fact type — e.g. instances.md's
+/// `Function;_..._the_bridge_store_none)`. One up-front strip makes every
+/// `<!-- -->` block a reliable block comment instead of requiring authors
+/// to `#`-comment every individual prose line.
+fn strip_block_comments(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start..];
+        match after_open[4..].find("-->") {
+            Some(rel) => {
+                let span = &after_open[..4 + rel + 3];
+                for c in span.chars() {
+                    out.push(if c == '\n' { '\n' } else { ' ' });
+                }
+                rest = &after_open[4 + rel + 3..];
+            }
+            None => {
+                for c in after_open.chars() {
+                    out.push(if c == '\n' { '\n' } else { ' ' });
+                }
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn parse_to_state_via_stage12_impl(
     text: &str,
     extra_nouns: &[String],
@@ -5984,6 +6026,15 @@ fn parse_to_state_via_stage12_impl(
     // None when the caller doesn't know it (every legacy caller).
     local_domain: Option<&str>,
 ) -> Result<Object, String> {
+    // block-comments: strip HTML `<!-- ... -->` spans (multi-line,
+    // blank-line-spanning) up front, BEFORE statement extraction, so
+    // commented prose / readings never mint spurious fact types. Preserves
+    // newlines (line numbers stay stable) and blanks the comment body.
+    // Shadowing `text` routes every downstream consumer
+    // (reject_reserved_noun_declarations, extract_declared_noun_names, the
+    // stage-1/2 statement split) through the cleaned source.
+    let stripped_text = strip_block_comments(text);
+    let text: &str = &stripped_text;
     // Trace gate — std-host reads `AREST_STAGE12_TRACE`; no_std builds
     // compile out the trace branches entirely.
     // task-931-1: no_std gate, MUST KEEP — std arm reads AREST_STAGE12_TRACE env var.
@@ -7071,6 +7122,35 @@ mod tests {
     fn grammar_state() -> Object {
         let grammar = include_str!("../../../readings/forml2-grammar.md");
         parse_to_state(grammar).expect("grammar must parse")
+    }
+
+    /// block-comments: an HTML `<!-- ... -->` comment spanning multiple
+    /// lines (incl. interior BLANK lines), in the `## Derivation Rules`
+    /// section where prose IS sentence-parsed, must be fully stripped
+    /// before statement extraction. The live `readings/core/instances.md`
+    /// block at lines 173-207 leaks its prose line 200 into the parser,
+    /// minting the bogus fact type
+    /// `Function;_Resource_/_Fact_/_the_bridge_store_none)` — which is what
+    /// fails `bundled_metamodel_passes_validate_model`. Pin it on the real
+    /// reading so the fix is verified against the actual artifact.
+    #[test]
+    fn instances_md_prose_inside_block_comment_is_not_minted_as_fact_type() {
+        let src = include_str!("../../../readings/core/instances.md");
+        let state = parse_to_state(src).expect("instances.md must parse");
+        let bad: Vec<String> = crate::ast::fetch_cell_seq("FactType", &state)
+            .as_seq()
+            .map(|s| s.iter()
+                .filter_map(|f| crate::ast::binding(f, "id").map(String::from))
+                .filter(|id| id.contains("Function;")
+                    || id.contains("bridge_store")
+                    || id.contains("the_bridge"))
+                .collect())
+            .unwrap_or_default();
+        assert!(
+            bad.is_empty(),
+            "prose inside a <!-- --> block in instances.md must NOT mint a \
+             fact type (block comments must be stripped before statement \
+             extraction); got: {:?}", bad);
     }
 
     #[test]
