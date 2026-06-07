@@ -1251,6 +1251,127 @@ pub fn check_readings_with_metamodel(user_text: &str) -> Vec<check::ReadingDiagn
         .collect()
 }
 
+// ── Format-on-Conceptual-Data-Type (#Format-on-CDT): layering guards ─
+//
+// SALVAGED layering-invariant coverage for the Format-on-CDT model
+// (Conceptual Data Type + Format catalogs in readings/core/core.md; the
+// value-type -> widget projection — `Format implies Component Role`, the
+// base-fallback `Conceptual Data Type implies Component Role` — in
+// readings/ui/view-projection.md, kept OUT of core so the always-compiled
+// core never references the UI-only `Component Role` noun).
+//
+// These three tests are MODEL-AGNOSTIC: they pin the load-bearing
+// LAYERING invariant (the feature composes cleanly and never leaks a
+// UI-only noun into core) WITHOUT asserting the specific entity/value
+// shape of the catalogs. The feature's BEHAVIOUR — widget resolution,
+// the seeded formats, the as-shipped CDT-as-entity-catalog vocabulary —
+// is covered against the actual shipped model in
+// compile_explicit_derivation_tests.rs
+// (format_on_cdt_effective_widget_resolves_format_else_cdt,
+// view_projection_section_4_2_lazy_widget_rules_merge, et al.), so it is
+// intentionally not duplicated (nor re-pinned to a superseded shape)
+// here.
+#[cfg(test)]
+mod format_on_cdt_tests {
+    use super::*;
+
+    const CORE_MD: &str = include_str!("../../../readings/core/core.md");
+    const COMPONENTS_MD: &str = include_str!("../../../readings/ui/components.md");
+    const VIEW_PROJECTION_MD: &str =
+        include_str!("../../../readings/ui/view-projection.md");
+
+    /// LAYERING — core.md alone (the pure-data / `ui-readings`-off build)
+    /// carries NO alethic (structural) validate_model violation that
+    /// references the UI-only `Component Role` noun. This is the
+    /// load-bearing guarantee that the Format-on-CDT widget projection was
+    /// NOT pushed into core: if core.md declared any `... implies Component
+    /// Role` fact type, validating it standalone would flag `Component
+    /// Role` (declared only in readings/ui/components.md) as an undeclared
+    /// role noun (compile.rs validate_model rule 1, alethic).
+    ///
+    /// Scoped to `Component Role` rather than asserting zero violations
+    /// outright: core.md legitimately references cross-reading supertypes
+    /// (`Resource` / `Status`, declared in state.md / instances.md), which
+    /// raise standalone alethic violations unrelated to this boundary.
+    #[test]
+    fn core_md_alone_leaks_no_component_role_into_core() {
+        let state = parse_forml2::parse_to_state(CORE_MD)
+            .expect("core.md parses standalone");
+        let violations = crate::compile::validate_model_classified_from_state(&state);
+        let leaked: Vec<&str> = violations.iter()
+            .filter(|v| v.alethic)
+            .map(|v| v.message.as_str())
+            .filter(|m| m.contains("Component Role"))
+            .collect();
+        assert!(leaked.is_empty(),
+            "core.md (standalone) must not reference the UI-only `Component \
+             Role` noun — the Format-on-CDT widget projection belongs in \
+             view-projection.md. Got {} leak(s):\n{}",
+            leaked.len(), leaked.join("\n"));
+    }
+
+    /// SURVIVAL — the full bundled metamodel corpus (default features,
+    /// so core + components + view-projection are all present) gains NO
+    /// alethic (structural) validate_model violation attributable to the
+    /// Format-on-CDT additions. This proves the UI layer's `Conceptual
+    /// Data Type implies Component Role` / `Format implies Component
+    /// Role` fact types resolve `Component Role` (from components.md) and
+    /// `Conceptual Data Type` / `Format` (from core.md) cleanly when
+    /// composed — none of the new nouns is left as an undeclared role.
+    ///
+    /// The corpus carries a small set of PRE-EXISTING alethic violations
+    /// from whole-corpus span resolution (UC arity on the 4-ary
+    /// `Verb is performed during/in …` and `Webhook Event Type yields …`
+    /// fact types; a SY ring mis-resolved onto `Fact Type has Title`).
+    /// Those are unrelated to this task — see the per-file-merge
+    /// `bundled_metamodel_passes_validate_model` (tests/properties.rs)
+    /// for the corpus's own zero-violation guarantee. This test asserts
+    /// the FORMAT-ON-CDT delta is clean: zero violations mention any
+    /// noun this task introduced.
+    #[test]
+    fn full_corpus_gains_no_format_on_cdt_alethic_violations() {
+        let corpus = metamodel_corpus();
+        let state = parse_forml2::parse_to_state(&corpus)
+            .expect("bundled metamodel corpus parses");
+        let violations = crate::compile::validate_model_classified_from_state(&state);
+        let new_nouns = [
+            "Conceptual Data Type", "Format", "JSON Type", "JSON Format",
+            "Component Role",
+        ];
+        let mine: Vec<&str> = violations.iter()
+            .filter(|v| v.alethic)
+            .map(|v| v.message.as_str())
+            .filter(|m| new_nouns.iter().any(|n| m.contains(n)))
+            .collect();
+        assert!(mine.is_empty(),
+            "Format-on-CDT introduced {} alethic validate_model \
+             violation(s) referencing a new noun:\n{}",
+            mine.len(), mine.join("\n"));
+    }
+
+    /// SURVIVAL — adding view-projection.md introduces no new checker
+    /// Error diagnostics over the core+components baseline. Mirrors the
+    /// render_reading.rs baseline-count discipline.
+    #[test]
+    fn view_projection_adds_no_new_checker_errors() {
+        let fold = |bodies: &[&str]| -> String {
+            bodies.iter().fold(String::new(), |mut a, b| {
+                a.push_str(b); a.push_str("\n\n"); a
+            })
+        };
+        let baseline_errors = check::check_readings(&fold(&[CORE_MD, COMPONENTS_MD]))
+            .into_iter().filter(|d| matches!(d.level, check::Level::Error)).count();
+        let with_vp_errors = check::check_readings(
+            &fold(&[CORE_MD, COMPONENTS_MD, VIEW_PROJECTION_MD]))
+            .into_iter().filter(|d| matches!(d.level, check::Level::Error)).count();
+        assert!(with_vp_errors <= baseline_errors,
+            "view-projection.md introduced {} new checker Error(s); \
+             with_vp={} baseline={}",
+            with_vp_errors.saturating_sub(baseline_errors),
+            with_vp_errors, baseline_errors);
+    }
+}
+
 #[cfg(test)]
 mod check_metamodel_tests {
     use super::*;
