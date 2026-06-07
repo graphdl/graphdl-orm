@@ -934,8 +934,19 @@ fn assert_fact_via_defs(
         .map(|p| p.role.clone())
         .collect();
 
-    // Append the new fact to the cell.
-    let post_assert = ast::cell_push(fact_type, fact, state);
+    // Append the new fact to the cell — SHAPE-PRESERVING (same #932 W6
+    // discipline as the `retract:` write-back). The live tenant folds
+    // every FT-image cell to an `Object::Map` once it holds facts, and a
+    // plain `cell_push` is Map-blind (`existing.as_seq()` is `None` for a
+    // Map, so it REPLACES the whole folded cell with a single-fact Seq —
+    // silently dropping every pre-existing ring fact). Route a Map cell
+    // through `cell_put_folded`, which keys by the full tuple
+    // (dup-role-name-safe for ring facts) and preserves the Map; a legacy
+    // Seq / absent cell keeps the O(1) Seq append.
+    let post_assert = match ast::fetch_or_phi(fact_type, state) {
+        ast::Object::Map(_) => ast::cell_put_folded(fact_type, fact, state),
+        _ => ast::cell_push(fact_type, fact, state),
+    };
 
     // ── derive: single-stratum forward chain ───────────────────────────
     // Mirror the same gating as create_via_defs: all rules (no per-noun
@@ -11130,6 +11141,86 @@ Task blocks Task is asymmetric.
         assert!(!has_xx,
             "blocked-status-sm-1: the self-loop tuple must NOT have landed; \
              ring={:?}", ring3);
+    }
+
+    /// ring-folded-map-bottom — the LIVE-APP reproduction. In production the
+    /// `Task_blocks_Task` cell is a FOLDED `Object::Map` (every FT-image cell
+    /// folds to a keyed Map once it holds facts — see
+    /// `ast::cell_put_folded` / `fetch_cell_seq`). Asserting a SECOND ring
+    /// fact onto that Map must APPEND (preserve the existing rows) — NOT
+    /// clobber the Map with a one-element Seq, and NOT bottom.
+    ///
+    /// ROOT CAUSE this pins: `assert_fact_via_defs` appended via
+    /// `ast::cell_push`, whose `existing.as_seq()` arm returns `None` for an
+    /// `Object::Map` (Map-blind), so it REPLACED the whole folded cell with a
+    /// single-fact `Seq` — dropping every pre-existing ring fact. The
+    /// sibling `assert_fact_ring_*` tests never caught it because they start
+    /// from an EMPTY (phi → Seq) cell. This is the SAME bug class the
+    /// `retract:` FFI already fixed (#932 W6: "a raw `fetch_or_phi(..)
+    /// .as_seq()` returns None on a Map").
+    #[test]
+    fn assert_fact_ring_appends_onto_folded_map_cell() {
+        let (def_obj, state) = setup_ring_defs();
+
+        // Pre-fold the ring cell to a Map holding ONE existing fact —
+        // exactly the shape the live tenant carries (folded FT-image cell).
+        let seed = ast::fact_from_pairs(&[("Task", "task-A"), ("Task", "task-B")]);
+        let state = ast::cell_put_folded("Task_blocks_Task", seed, &state);
+        assert!(matches!(
+            ast::fetch_or_phi("Task_blocks_Task", &state), ast::Object::Map(_)),
+            "precondition: the ring cell must be a folded Map before the assert");
+
+        // Assert a SECOND, distinct ring fact via the same code path.
+        let cmd = Command::AssertFact {
+            fact_type: "Task_blocks_Task".to_string(),
+            pairs: vec![
+                RolePair { role: "Task".to_string(), value: "task-B".to_string() },
+                RolePair { role: "Task".to_string(), value: "task-C".to_string() },
+            ],
+            sender: None,
+            signature: None,
+        };
+        let r = apply_command_defs(&def_obj, &cmd, &state);
+        assert!(!r.rejected,
+            "asserting onto a folded Map cell must NOT bottom/reject; \
+             violations={:?}", r.violations);
+
+        // BOTH ring facts must be present after the append — the pre-existing
+        // (A,B) must NOT have been clobbered by the Map-blind cell_push.
+        //
+        // Observe via `merge_delta` (the PRODUCTION commit path used by both
+        // `system_impl` and the CLI `system()`), NOT `merge_states`:
+        // `merge_states` concats/unions cells (it would mask a clobber by
+        // re-adding the dropped fact from the base), whereas `merge_delta`
+        // takes the delta's cell as the new latest version — exactly what a
+        // reader sees post-commit. If `cell_push` clobbered the Map with a
+        // 1-element Seq, the committed cell holds ONLY (B,C) and the
+        // `has_ab` assertion below fails.
+        let merged = ast::merge_delta(&state, &r.state, None);
+        let cell = ast::fetch_cell_seq("Task_blocks_Task", &merged);
+        let tuples: Vec<Vec<(String, String)>> = cell.as_seq()
+            .map(|facts| facts.iter().filter_map(|f| {
+                let pairs = f.as_seq()?;
+                Some(pairs.iter().filter_map(|p| {
+                    let kv = p.as_seq()?;
+                    Some((kv.first()?.as_atom()?.to_string(),
+                          kv.get(1)?.as_atom()?.to_string()))
+                }).collect::<Vec<(String, String)>>())
+            }).collect())
+            .unwrap_or_default();
+        let has_ab = tuples.iter().any(|t| t ==
+            &vec![("Task".to_string(), "task-A".to_string()),
+                  ("Task".to_string(), "task-B".to_string())]);
+        let has_bc = tuples.iter().any(|t| t ==
+            &vec![("Task".to_string(), "task-B".to_string()),
+                  ("Task".to_string(), "task-C".to_string())]);
+        assert!(has_ab,
+            "the PRE-EXISTING ring fact (A,B) must survive the append onto the \
+             folded Map cell — Map-blind cell_push clobbered it; got {tuples:?}");
+        assert!(has_bc,
+            "the newly-asserted ring fact (B,C) must land; got {tuples:?}");
+        assert_eq!(tuples.len(), 2,
+            "exactly two ring facts must coexist after the append; got {tuples:?}");
     }
 
     /// apply-composite-ref-id-shear fixture: a noun with a COMPOSITE

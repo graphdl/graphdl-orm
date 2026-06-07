@@ -502,6 +502,52 @@ fn system(key: &str, input: &str, d: &ast::Object) -> (String, ast::Object) {
         return ("ok".into(), new_d);
     }
 
+    // task-971 — `assert:<ft_name>` appends one exact fact tuple to the
+    // named FactType cell. The SYMMETRIC counterpart to `retract:` above,
+    // and the CLI mirror of the engine-side intercept in
+    // `lib.rs::system_impl` so the CLI shell-out path the MCP shim uses
+    // lands the fact instead of bottoming. Without this branch the key
+    // falls through to `apply(Func::Def("assert:<ft>"), …)` below — there
+    // is no such Def, so it returns ⊥ and the armed bottom-trace surfaces
+    // `⊥ origin: … in rule `assert:<ft>`` (the reported same-noun-ring
+    // failure). Repeated role names ARE allowed (ring facts). Write path:
+    // returns ("ok", new_d) on success so the caller persists; an alethic
+    // violation (e.g. an irreflexive self-loop) is rejected with D'=D
+    // ("⊥", D unchanged).
+    if let Some(ft_name) = key.strip_prefix("assert:") {
+        let input_obj = ast::Object::parse(input);
+        let pairs: Vec<crate::command::RolePair> = match input_obj.as_seq() {
+            Some(items) if !items.is_empty() => items.iter()
+                .filter_map(|item| {
+                    let kv = item.as_seq()?;
+                    if kv.len() != 2 { return None; }
+                    let role = kv[0].as_atom()?.to_string();
+                    let value = kv[1].as_atom()?.to_string();
+                    Some(crate::command::RolePair { role, value })
+                })
+                .collect(),
+            _ => return ("⊥".into(), d.clone()),
+        };
+        if pairs.is_empty() {
+            return ("⊥".into(), d.clone());
+        }
+        // Dispatch through the full assert_fact pipeline (derive+validate),
+        // exactly as `system_impl` does. An alethic violation rejects with
+        // D'=D; otherwise merge the delta so chain entries land and persist.
+        let cmd = crate::command::Command::AssertFact {
+            fact_type: ft_name.to_string(),
+            pairs,
+            sender: None,
+            signature: None,
+        };
+        let result = crate::command::apply_command_defs(d, &cmd, d);
+        if result.rejected {
+            return ("⊥".into(), d.clone());
+        }
+        let new_d = ast::merge_delta(d, &result.state, None);
+        return ("ok".into(), new_d);
+    }
+
     let obj = ast::Object::parse(input);
     // ⊥-trace: arm why-NOT provenance around the dispatch apply. ZERO
     // cost on the success path — the trace materializes only if the
@@ -1911,6 +1957,130 @@ mod stale_def_tests {
         assert!(!is_read_only_cli_key(""));
         assert!(!is_read_only_cli_key("sqlx"));
         assert!(!is_read_only_cli_key("query"));
+    }
+
+    /// ring-ffi-bottom — the headline repro+fix. The CLI `system()` is the
+    /// path the MCP shim shells out to (`arest-cli --db <db> assert:<ft>
+    /// "<<…>>"`). Asserting a SAME-NOUN ring fact (`Task blocks Task`, the
+    /// noun `Task` filling BOTH roles) must LAND the fact — NOT bottom with
+    /// `⊥ origin: … in rule `assert:Task_blocks_Task``.
+    ///
+    /// PRE-FIX: `system()` had a `retract:` intercept but NO `assert:`
+    /// intercept, so the key fell through to `apply(Func::Def("assert:\
+    /// Task_blocks_Task"), …)`; no such Def exists, so it returned ⊥ and the
+    /// armed bottom-trace stamped the rule name from the key — the exact
+    /// reported failure, and D was left unchanged (the fact never landed).
+    /// POST-FIX: the new `assert:` intercept dispatches `Command::AssertFact`
+    /// and merges the delta.
+    #[test]
+    fn assert_cli_same_noun_ring_lands_in_cell_not_bottom() {
+        // Compile a minimal ring model (Task blocks Task + the cross-noun
+        // bridge derivation + the irreflexive/asymmetric ring constraints)
+        // into a def-state — exactly the shape `load_and_compile` hands to
+        // `system()` for a write key.
+        let readings = "\
+Task(.id) is an entity type.
+Task Readiness is a value type.
+Task blocks Task.
+Task has Task Readiness.
+Task blocks Task is irreflexive.
+Task blocks Task is asymmetric.
+* Task2 has Task Readiness 'blocked' iff Task1 blocks Task2.
+";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(readings)
+            .expect("ring readings must parse");
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        // The live CLI verb shape: ordered (role, value) pairs, the role
+        // name `Task` repeated for both ends of the ring.
+        let (out, d1) = system(
+            "assert:Task_blocks_Task",
+            "<<Task, task-A>, <Task, task-B>>",
+            &d,
+        );
+        // PRE-FIX this was `⊥ origin: … in rule `assert:Task_blocks_Task``.
+        assert!(!out.starts_with('\u{22a5}'),
+            "assert:<ft> CLI verb must NOT bottom on a same-noun ring fact; got: {out}");
+        assert_eq!(out, "ok",
+            "assert:<ft> CLI verb must return ok after landing the ring fact; got: {out}");
+        // State must have advanced (the fact was committed, NOT D'=D).
+        assert_ne!(d1, d,
+            "a successful assert must change D so the caller persists it");
+
+        // The fact must ACTUALLY be in the cell — exact ordered tuple, two
+        // DISTINCT same-noun values (anti-collapse proof).
+        let cell = ast::fetch_cell_seq("Task_blocks_Task", &d1);
+        let tuples: Vec<Vec<(String, String)>> = cell.as_seq()
+            .map(|facts| facts.iter().filter_map(|f| {
+                let pairs = f.as_seq()?;
+                Some(pairs.iter().filter_map(|p| {
+                    let kv = p.as_seq()?;
+                    Some((kv.first()?.as_atom()?.to_string(),
+                          kv.get(1)?.as_atom()?.to_string()))
+                }).collect::<Vec<(String, String)>>())
+            }).collect())
+            .unwrap_or_default();
+        assert_eq!(tuples.len(), 1,
+            "exactly one ring fact must be present after the assert; got {tuples:?}");
+        assert_eq!(tuples[0],
+            vec![("Task".to_string(), "task-A".to_string()),
+                 ("Task".to_string(), "task-B".to_string())],
+            "the materialized tuple must be the EXACT ordered <<Task,task-A>,\
+             <Task,task-B>> (no same-noun collapse); got {:?}", tuples[0]);
+
+        // The cross-noun bridge derivation must have fired: task-B blocked.
+        let readiness = ast::fetch_cell_seq("Task_has_Task_Readiness", &d1);
+        let b_blocked = readiness.as_seq().map(|fs| fs.iter().any(|f|
+            ast::binding(f, "Task") == Some("task-B")
+            && ast::binding(f, "Task Readiness") == Some("blocked"))).unwrap_or(false);
+        assert!(b_blocked,
+            "CLI assert must drive the derivation — task-B must be 'blocked'; \
+             readiness={readiness:?}");
+
+        // A SECOND, independent ring pair must coexist (no clobber) — this
+        // is the folded-Map append path (after the first commit the cell may
+        // fold), the live-tasks.db data-loss guard.
+        let (out2, d2) = system(
+            "assert:Task_blocks_Task",
+            "<<Task, task-B>, <Task, task-C>>",
+            &d1,
+        );
+        assert_eq!(out2, "ok",
+            "the second distinct ring pair must also land; got: {out2}");
+        let cell2 = ast::fetch_cell_seq("Task_blocks_Task", &d2);
+        let tuples2: Vec<Vec<(String, String)>> = cell2.as_seq()
+            .map(|facts| facts.iter().filter_map(|f| {
+                let pairs = f.as_seq()?;
+                Some(pairs.iter().filter_map(|p| {
+                    let kv = p.as_seq()?;
+                    Some((kv.first()?.as_atom()?.to_string(),
+                          kv.get(1)?.as_atom()?.to_string()))
+                }).collect::<Vec<(String, String)>>())
+            }).collect())
+            .unwrap_or_default();
+        let has_ab = tuples2.iter().any(|t| t ==
+            &vec![("Task".to_string(), "task-A".to_string()),
+                  ("Task".to_string(), "task-B".to_string())]);
+        let has_bc = tuples2.iter().any(|t| t ==
+            &vec![("Task".to_string(), "task-B".to_string()),
+                  ("Task".to_string(), "task-C".to_string())]);
+        assert!(has_ab && has_bc,
+            "BOTH ring tuples must coexist after the second assert (the first \
+             must NOT be clobbered); got {tuples2:?}");
+
+        // A self-loop on the same noun is still REJECTED by the irreflexive
+        // ring constraint: the verb returns ⊥ and D is left unchanged.
+        let (loop_out, d3) = system(
+            "assert:Task_blocks_Task",
+            "<<Task, task-X>, <Task, task-X>>",
+            &d2,
+        );
+        assert!(loop_out.starts_with('\u{22a5}'),
+            "a same-noun self-loop must be rejected (⊥) by the irreflexive \
+             ring constraint; got: {loop_out}");
+        assert_eq!(d3, d2,
+            "a rejected self-loop must leave D unchanged (D'=D)");
     }
 
     /// task-951-b. `build_provenance_cell` is the foundational deliverable:

@@ -9245,3 +9245,174 @@ Task is finished.
     assert!(rb.unresolved_clauses.is_empty(),
         "Rule B must have no unresolved clauses; got {:?}", rb.unresolved_clauses);
 }
+
+// ─── SM reconstruction-fold ⇆ event-fold PARITY (sm-reconstruction-fold) ─
+//
+// `compile_sm_reconstruction_fold` is a second, independent compilation of
+// the SM current-status fold (it adds an `OrderBy`-by-timestamp audit step
+// and routes the emitted target through `sm.func`, the shared transition).
+// It MUST produce byte-identical `State_Machine_is_currently_in_Status`
+// output to the registered `compile_sm_event_fold`. This test pins that.
+//
+// Both folds rely on the from-guard + the forward-chain round-loop
+// FIXPOINT: a transition fires for a resource only when that resource has
+// the trigger event AND is currently in the transition's `from` status,
+// and the chainer re-fires the rule each round so a resource advances one
+// guarded step per round. We run each fold ALONGSIDE `compile_sm_init_for`
+// (which seeds `initial` round 1 — the `from` the first transition leaves)
+// exactly as the live load path does.
+//
+// Sample Order SM: initial `pending`; placed(pending→placed, trigger
+// `Order_was_placed`); shipped(placed→shipped, trigger `Order_was_shipped`).
+//   • o2 has BOTH placed + shipped  ⇒ must reach `shipped`
+//     (round 1: init→pending; round 2: pending→placed; round 3:
+//      placed→shipped — the out-of-order/timeless events resolve via the
+//      from-guarded fixpoint, NOT via event ordering).
+//   • o1 has ONLY shipped (never placed) ⇒ must STAY `pending`
+//     (the from-guard blocks shipped because o1 was never in `placed`).
+
+/// Build the unguarded transition Func `<current_status, trigger> ->
+/// next_status` for the sample Order SM, mirroring the fold built in
+/// `compile_state_machine_from_cells` (Condition chain, Selector(1)
+/// fallback = "stay put").
+#[cfg(test)]
+fn order_sm_transition_func() -> Func {
+    // placed: <pending, Order_was_placed> -> placed
+    // shipped: <placed,  Order_was_shipped> -> shipped
+    // fallback: Selector(1) (return current status unchanged)
+    let match_pred = |from: &str, event: &str| {
+        Func::compose(
+            Func::Eq,
+            Func::construction(vec![
+                Func::Id,
+                Func::constant(Object::seq(vec![
+                    Object::atom(from),
+                    Object::atom(event),
+                ])),
+            ]),
+        )
+    };
+    Func::condition(
+        match_pred("pending", "Order_was_placed"),
+        Func::constant(Object::atom("placed")),
+        Func::condition(
+            match_pred("placed", "Order_was_shipped"),
+            Func::constant(Object::atom("shipped")),
+            Func::Selector(1),
+        ),
+    )
+}
+
+/// Normalize a cell's facts to a sorted, deduped list of sorted
+/// (role,value) pair-lists — an order-independent canonical form for a
+/// byte-level "the two cells are identical" comparison.
+#[cfg(test)]
+fn canonical_cell_facts(state: &Object, cell: &str) -> Vec<Vec<(String, String)>> {
+    let c = crate::ast::fetch_cell_seq(cell, state);
+    let mut facts: Vec<Vec<(String, String)>> = crate::ast::cell_facts_iter(&c)
+        .filter_map(|f| {
+            let pairs = f.as_seq()?;
+            let mut kvs: Vec<(String, String)> = pairs.iter().filter_map(|p| {
+                let kv = p.as_seq()?;
+                if kv.len() != 2 { return None; }
+                Some((kv[0].as_atom()?.to_string(), kv[1].as_atom()?.to_string()))
+            }).collect();
+            kvs.sort();
+            Some(kvs)
+        })
+        .collect();
+    facts.sort();
+    facts.dedup();
+    facts
+}
+
+#[test]
+fn sm_reconstruction_fold_matches_event_fold_byte_identical() {
+    use crate::ast::{fact_from_pairs, cell_push};
+
+    // Build the CompiledStateMachine directly (no parse pipeline) so the
+    // two folds compile from the SAME source-of-truth SM.
+    let sm = crate::compile::make_compiled_state_machine_for_test(
+        "Order".to_string(),
+        vec!["pending".to_string(), "placed".to_string(), "shipped".to_string()],
+        "pending".to_string(),
+        order_sm_transition_func(),
+        vec![
+            ("pending".to_string(), "placed".to_string(),  "Order_was_placed".to_string()),
+            ("placed".to_string(),  "shipped".to_string(), "Order_was_shipped".to_string()),
+        ],
+    );
+
+    // Shared population: o2 has BOTH events, o1 has ONLY shipped. We add a
+    // `Timestamp` role to o2's events deliberately OUT OF CHRONOLOGICAL
+    // ORDER relative to their causal order is irrelevant — but we give the
+    // `shipped` event an EARLIER timestamp than `placed` to prove the
+    // reconstruction fold's `OrderBy` (which would, if correctness depended
+    // on order, mis-sort shipped-before-placed) does NOT change the result:
+    // correctness is the from-guard + fixpoint, not the ordering.
+    let build_population = || {
+        let s = Object::phi();
+        // o2: placed (ts=200) and shipped (ts=100, earlier on the clock).
+        let s = cell_push("Order_was_placed",
+            fact_from_pairs(&[("Order", "o2"), ("Timestamp", "200")]), &s);
+        let s = cell_push("Order_was_shipped",
+            fact_from_pairs(&[("Order", "o2"), ("Timestamp", "100")]), &s);
+        // o1: shipped only, no placed — and no timestamp at all (events may
+        // lack a timestamp; OrderBy must tolerate the keyless element).
+        let s = cell_push("Order_was_shipped",
+            fact_from_pairs(&[("Order", "o1")]), &s);
+        s
+    };
+
+    // ── Event-fold run (init + event-fold) ──────────────────────────────
+    let ef_init = crate::compile::compile_sm_init_for_for_test(&sm);
+    let ef_fold = crate::compile::compile_sm_event_fold_for_test(&sm);
+    let ef_refs: Vec<(&str, &Func)> = vec![
+        (ef_init.id.as_str(), &ef_init.func),
+        (ef_fold.id.as_str(), &ef_fold.func),
+    ];
+    let (ef_state, _) =
+        crate::evaluate::forward_chain_defs_state(&ef_refs, &build_population());
+
+    // ── Reconstruction-fold run (init + reconstruction-fold) ────────────
+    let rf_init = crate::compile::compile_sm_init_for_for_test(&sm);
+    let rf_fold = crate::compile::compile_sm_reconstruction_fold_for_test(&sm);
+    let rf_refs: Vec<(&str, &Func)> = vec![
+        (rf_init.id.as_str(), &rf_init.func),
+        (rf_fold.id.as_str(), &rf_fold.func),
+    ];
+    let (rf_state, _) =
+        crate::evaluate::forward_chain_defs_state(&rf_refs, &build_population());
+
+    // ── Expected current-status outcomes (the from-guard semantics) ─────
+    let ef_pairs = sm_status_pairs(&ef_state, "State_Machine_is_currently_in_Status");
+    let rf_pairs = sm_status_pairs(&rf_state, "State_Machine_is_currently_in_Status");
+
+    assert!(ef_pairs.contains(&("o2".to_string(), "shipped".to_string())),
+        "event-fold: o2 (placed+shipped) must reach `shipped`; got {:?}", ef_pairs);
+    assert!(ef_pairs.contains(&("o1".to_string(), "pending".to_string())),
+        "event-fold: o1 (shipped only, never placed) must STAY `pending` \
+         (from-guard blocks shipped); got {:?}", ef_pairs);
+    assert!(!ef_pairs.iter().any(|(sm, st)| sm == "o1" && st == "shipped"),
+        "event-fold: o1 must NOT be `shipped`; got {:?}", ef_pairs);
+
+    assert!(rf_pairs.contains(&("o2".to_string(), "shipped".to_string())),
+        "reconstruction-fold: o2 must reach `shipped`; got {:?}", rf_pairs);
+    assert!(rf_pairs.contains(&("o1".to_string(), "pending".to_string())),
+        "reconstruction-fold: o1 must STAY `pending`; got {:?}", rf_pairs);
+
+    // ── PARITY: the two current-status SETS must be IDENTICAL ───────────
+    assert_eq!(ef_pairs, rf_pairs,
+        "reconstruction-fold and event-fold must produce identical \
+         (State Machine, Status) sets.\n  event-fold:        {:?}\n  reconstruction:    {:?}",
+        ef_pairs, rf_pairs);
+
+    // ── STRONGER: the raw cell contents (canonicalized) must be identical
+    // — i.e. byte-identical facts in State_Machine_is_currently_in_Status.
+    let ef_cell = canonical_cell_facts(&ef_state, "State_Machine_is_currently_in_Status");
+    let rf_cell = canonical_cell_facts(&rf_state, "State_Machine_is_currently_in_Status");
+    assert_eq!(ef_cell, rf_cell,
+        "reconstruction-fold and event-fold State_Machine_is_currently_in_Status \
+         cell facts must be byte-identical.\n  event-fold:     {:?}\n  reconstruction: {:?}",
+        ef_cell, rf_cell);
+}

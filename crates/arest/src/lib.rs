@@ -4064,6 +4064,104 @@ Task has Task Priority.
         release_impl(h);
     }
 
+    /// ring-ffi-bottom — the `assert:<FT>` FFI write-path (the live MCP
+    /// `apply` host calls `system(h, "assert:Task_blocks_Task", "<<...>>")`)
+    /// must LAND a SAME-NOUN ring fact into the FT cell — NOT bottom with
+    /// `⊥ origin: … in rule `assert:Task_blocks_Task``.
+    ///
+    /// The `Command::AssertFact` core path (exercised by
+    /// `command::tests::assert_fact_ring_*`) is already green, so this test
+    /// pins the FFI surface that wraps it — the `system_impl` `assert:`
+    /// strip-prefix branch. Pre-fix the host saw a ⊥ that traced to a rule
+    /// named after the very key (`assert:Task_blocks_Task`), which only
+    /// happens when the key falls through the `assert:` branch into the
+    /// generic write dispatch (`apply(Func::Def(key))`) — there is no such
+    /// Def, so the fetch bottoms and `note_bottom_rule(key)` stamps the
+    /// trace with the key. This test reproduces that and proves the fix.
+    #[test]
+    fn assert_ffi_same_noun_ring_lands_in_cell_not_bottom() {
+        let h = create_bare_impl();
+        let readings = "\
+Task(.id) is an entity type.
+Task Readiness is a value type.
+Task blocks Task.
+Task has Task Readiness.
+Task blocks Task is irreflexive.
+Task blocks Task is asymmetric.
+* Task2 has Task Readiness 'blocked' iff Task1 blocks Task2.
+";
+        let compile_out = system_impl(h, "compile", readings);
+        assert!(!compile_out.starts_with('\u{22a5}'),
+            "compile must not reject the ring schema, got: {compile_out}");
+
+        // The live FFI shape: ordered (role, value) pairs, repeated role
+        // name `Task` for both ends of the ring.
+        let out = system_impl(
+            h,
+            "assert:Task_blocks_Task",
+            "<<Task, task-A>, <Task, task-B>>",
+        );
+        // PRE-FIX: `out` is a `⊥`-flavoured string whose origin names the
+        // rule `assert:Task_blocks_Task`. POST-FIX: "ok".
+        assert!(!out.starts_with('\u{22a5}'),
+            "assert:<FT> FFI must NOT bottom on a same-noun ring fact; got: {out}");
+        assert_eq!(out, "ok",
+            "assert:<FT> FFI must return ok after landing the ring fact; got: {out}");
+
+        // The fact must ACTUALLY be in the cell, two distinct same-noun
+        // values in insertion order (anti-collapse).
+        let d = peek(h).expect("handle live after assert");
+        let cell = ast::fetch_cell_seq("Task_blocks_Task", &d);
+        let tuples: Vec<Vec<(String, String)>> = cell.as_seq()
+            .map(|facts| facts.iter().filter_map(|f| {
+                let pairs = f.as_seq()?;
+                Some(pairs.iter().filter_map(|p| {
+                    let kv = p.as_seq()?;
+                    Some((kv.first()?.as_atom()?.to_string(),
+                          kv.get(1)?.as_atom()?.to_string()))
+                }).collect::<Vec<(String, String)>>())
+            }).collect())
+            .unwrap_or_default();
+        assert_eq!(tuples.len(), 1,
+            "exactly one ring fact must be present after the FFI assert; got {tuples:?}");
+        assert_eq!(tuples[0],
+            vec![("Task".to_string(), "task-A".to_string()),
+                 ("Task".to_string(), "task-B".to_string())],
+            "the materialized tuple must be the EXACT ordered <<Task,task-A>,\
+             <Task,task-B>> (no same-noun collapse); got {:?}", tuples[0]);
+
+        // The cross-noun bridge derivation must have fired: task-B blocked.
+        let readiness = ast::fetch_cell_seq("Task_has_Task_Readiness", &d);
+        let b_blocked = readiness.as_seq().map(|fs| fs.iter().any(|f|
+            ast::binding(f, "Task") == Some("task-B")
+            && ast::binding(f, "Task Readiness") == Some("blocked"))).unwrap_or(false);
+        assert!(b_blocked,
+            "FFI assert must drive the derivation — task-B must be 'blocked'; \
+             readiness={readiness:?}");
+
+        // Self-loop is still rejected by the irreflexive ring constraint:
+        // the FFI returns ⊥ and D' = D (the loop never lands).
+        let loop_out = system_impl(
+            h,
+            "assert:Task_blocks_Task",
+            "<<Task, task-X>, <Task, task-X>>",
+        );
+        assert!(loop_out.starts_with('\u{22a5}'),
+            "a same-noun self-loop must be rejected (⊥) by the irreflexive \
+             ring constraint; got: {loop_out}");
+        let d2 = peek(h).expect("handle live after rejected self-loop");
+        let cell2 = ast::fetch_cell_seq("Task_blocks_Task", &d2);
+        let has_xx = cell2.as_seq().map(|fs| fs.iter().any(|f| {
+            let pairs = match f.as_seq() { Some(p) => p, None => return false };
+            pairs.iter().all(|p| p.as_seq()
+                .and_then(|kv| kv.get(1)?.as_atom()) == Some("task-X"))
+        })).unwrap_or(false);
+        assert!(!has_xx,
+            "the rejected self-loop must NOT persist in the cell; got: {cell2:?}");
+
+        release_impl(h);
+    }
+
     // ── #770 — per-entity cells (paper §196 + §462 eq:cellfold) ─────────
     //
     // Each entity is a cell whose contents is the 3NF row that Halpin's
