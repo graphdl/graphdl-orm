@@ -1267,6 +1267,14 @@ pub enum Func {
     /// stateful computations (running totals, state machine transitions).
     FoldL(Box<Func>),
 
+    /// IndexBy (perf-hashjoin): `IndexBy(keyfn):<e₁,...,eₙ>` builds a Map that
+    /// groups each `eᵢ` under the atom key `keyfn:eᵢ` → `<eᵢ...>`. Read-only —
+    /// unlike `Store` it has NO capability gate, so a derivation Func can build
+    /// a hash index for an O(n) equi-join instead of an O(n²) cross product.
+    /// Elements whose key is not an atom are skipped. Pairs with `FetchOrPhi`
+    /// for O(1) probes (`IndexBy(keyfn) ∘ right`, then `FetchOrPhi:<key, idx>`).
+    IndexBy(Box<Func>),
+
     /// Named definition: references a function by name from the definition set.
     Def(String),
 
@@ -1993,6 +2001,8 @@ fn normalize_children(f: &Func) -> Func {
             Func::While(Box::new(normalize(p)), Box::new(normalize(body))),
         Func::FoldL(g) =>
             Func::FoldL(Box::new(normalize(g))),
+        Func::IndexBy(g) =>
+            Func::IndexBy(Box::new(normalize(g))),
         leaf => leaf.clone(),
     }
 }
@@ -2165,6 +2175,7 @@ fn variant_name(f: &Func) -> &'static str {
         Func::Filter(_) => "Filter",
         Func::While(_, _) => "While",
         Func::FoldL(_) => "FoldL",
+        Func::IndexBy(_) => "IndexBy",
         Func::Def(_) => "Def",
         Func::Platform(_) => "Platform",
         Func::Native(_) => "Native",
@@ -2866,9 +2877,25 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                     unit_of(f).unwrap_or(Object::Bottom),
                 Some(items) if items.len() == 1 => items[0].clone(),
                 Some(items) if items.len() >= 2 => {
-                    let rest = Object::Seq(items[1..].into());
-                    let reduced = apply(&Func::Insert(f.clone()), &rest, d);
-                    apply(f, &Object::seq(vec![items[0].clone(), reduced]), d)
+                    // Right fold, ITERATIVE. Was recursive on the tail
+                    // (`apply(Insert(f), items[1..])`), so `/f` over an
+                    // N-element STORED sequence cost N nested apply() frames —
+                    // proportional to entity count, overflowing rayon worker
+                    // stacks on bulk derivations (aggregates / `every`
+                    // universals over ~900 facts). The data is stored; walk it
+                    // in a loop, O(1) stack. Right-fold identity:
+                    //   /f:<x1,...,xn> = f:<x1, f:<x2, ... f:<x_{n-1}, x_n>>>
+                    // seed with the last element and fold leftward. ⊥ short-
+                    // circuits, matching the recursive form's ⊥-propagation
+                    // (Object::seq is ⊥-preserving, so f:<x, ⊥> = ⊥ either way).
+                    let mut acc = items[items.len() - 1].clone();
+                    for x in items[..items.len() - 1].iter().rev() {
+                        acc = apply(f, &Object::seq(vec![x.clone(), acc]), d);
+                        if acc.is_bottom() {
+                            return Object::Bottom;
+                        }
+                    }
+                    acc
                 }
                 _ => Object::Bottom,
             }
@@ -2945,6 +2972,29 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
                         let result = apply(f, &Object::seq(vec![acc, element.clone()]), d);
                         if result.is_bottom() { Err(Object::Bottom) } else { Ok(result) }
                     }).unwrap_or(Object::Bottom)
+                }
+                _ => Object::Bottom,
+            }
+        }
+
+        Func::IndexBy(keyfn) => {
+            // perf-hashjoin: group x's elements by the atom key keyfn:elem into
+            // a Map<key, <elem...>>. Read-only (no Store capability gate), so a
+            // derivation Func can build a hash index for an O(n) equi-join.
+            // Non-atom keys are skipped (mirrors the SM fold's pre-SetFromSeq
+            // φ-key filtering).
+            match x.as_seq() {
+                Some(items) => {
+                    let mut groups: HashMap<String, Vec<Object>> = HashMap::new();
+                    for element in items.iter() {
+                        let k = apply(keyfn, element, d);
+                        if let Some(ks) = k.as_atom() {
+                            groups.entry(ks.to_string()).or_default().push(element.clone());
+                        }
+                    }
+                    Object::map(groups.into_iter()
+                        .map(|(k, v)| (k, Object::Seq(v.into())))
+                        .collect())
                 }
                 _ => Object::Bottom,
             }
@@ -4242,6 +4292,7 @@ pub mod forms {
     pub const FILTER: &str = "#";
     pub const WHILE: &str = "W";
     pub const FOLDL: &str = "\\";
+    pub const INDEX_BY: &str = "ix";
     pub const CONST: &str = "'";
 }
 
@@ -6398,6 +6449,11 @@ fn metacompose_sequence(items: &[Object], d: &Object) -> Func {
             let f = metacompose(&items[1], d);
             Func::FoldL(Box::new(f))
         }
+        forms::INDEX_BY if items.len() == 2 => {
+            // <INDEX_BY, keyfn> → IndexBy(keyfn)
+            let f = metacompose(&items[1], d);
+            Func::IndexBy(Box::new(f))
+        }
         forms::BU if items.len() == 3 => {
             // <BU, f, x> → (bu f x)
             let f = metacompose(&items[1], d);
@@ -6499,6 +6555,7 @@ pub fn func_to_object(func: &Func) -> Object {
         Func::ApplyToAll(f) => Object::seq(vec![Object::atom(forms::ALPHA), func_to_object(f)]),
         Func::Insert(f) => Object::seq(vec![Object::atom(forms::INSERT), func_to_object(f)]),
         Func::FoldL(f) => Object::seq(vec![Object::atom(forms::FOLDL), func_to_object(f)]),
+        Func::IndexBy(f) => Object::seq(vec![Object::atom(forms::INDEX_BY), func_to_object(f)]),
         Func::BinaryToUnary(f, x) => Object::seq(vec![
             Object::atom(forms::BU), func_to_object(f), x.clone(),
         ]),
@@ -6700,7 +6757,8 @@ impl Func {
             Func::Compose(f, g) => f.has_native() || g.has_native(),
             Func::Construction(fs) => fs.iter().any(|f| f.has_native()),
             Func::Condition(p, f, g) => p.has_native() || f.has_native() || g.has_native(),
-            Func::ApplyToAll(f) | Func::Insert(f) | Func::Filter(f) | Func::FoldL(f) => f.has_native(),
+            Func::ApplyToAll(f) | Func::Insert(f) | Func::Filter(f) | Func::FoldL(f)
+            | Func::IndexBy(f) => f.has_native(),
             Func::While(p, f) => p.has_native() || f.has_native(),
             Func::BinaryToUnary(f, _) => f.has_native(),
             _ => false,
@@ -6764,6 +6822,7 @@ impl fmt::Debug for Func {
             Func::ApplyToAll(g) => write!(f, "α{:?}", g),
             Func::Insert(g) => write!(f, "/{:?}", g),
             Func::FoldL(g) => write!(f, "foldl({:?})", g),
+            Func::IndexBy(g) => write!(f, "indexby({:?})", g),
             Func::Filter(p) => write!(f, "Filter({:?})", p),
             Func::BinaryToUnary(g, x) => write!(f, "(bu {:?} {:?})", g, x),
             Func::While(p, g) => write!(f, "(while {:?} {:?})", p, g),

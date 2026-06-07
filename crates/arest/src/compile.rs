@@ -7318,9 +7318,58 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
         ).to_func();
 
         // Pipeline: Filter(join_pred) . Concat . Î±(DistL) . DistR . [current, ft_j]
-        Func::compose(Func::filter(join_pred), Func::compose(Func::Concat,
-            Func::compose(Func::apply_to_all(Func::DistL),
-                Func::compose(Func::DistR, Func::construction(vec![current, ft_j])))))
+        // perf-hashjoin: replace the O(|current|*|ft_j|) cross-product pair
+        // generator with an O(n) hash join when there is at least one equi-key
+        // (and not a ring join, whose key positions are bespoke). The old
+        // generator (Concat . alpha(DistL) . DistR . [current, ft_j]) builds
+        // EVERY pair before `join_pred` culls it -- on a bulk equi-join over
+        // ~900 entities (the SM->status bridge) that is ~830k intermediate
+        // tuples whose recursive eval overflows the stack. Instead build a hash
+        // index of ft_j on the FIRST equi-key (FoldL + Store into a
+        // Map<key, <fact...>>) and probe it per `current` fact (FetchOrPhi), so
+        // only key-matching candidate pairs are formed. The `join_pred` Filter
+        // is kept UNCHANGED -- it still re-checks every key + match-pair, so the
+        // index only narrows the candidate set, never the result (identical
+        // semantics to the cross product).
+        let pairs = if !join_key_specs.is_empty() {
+            // Index on the FIRST equi-key. join_key_specs is built identically
+            // for ring joins (from ring_join.join_groups) and ordinary joins
+            // (from join_keys), so a ring self-join (e.g. `Task is blocked iff
+            // some Task1 blocks the Task and Task1 has Task Status 'pending'`)
+            // hash-joins too -- the join_pred Filter still re-checks the bespoke
+            // ring positions, so narrowing by key[0] is always sound.
+            let (ref_accessor, ref_role, j_role) = &join_key_specs[0];
+            // index : ft_j -> Map<jkey, <ft_j fact...>>. IndexBy is read-only
+            // (no Store capability gate), so it is legal inside a derivation
+            // Func that the (cap-less) forward chain evaluates.
+            let index = Func::compose(
+                Func::IndexBy(alloc::boxed::Box::new(role_value(*j_role))),
+                ft_j,
+            );
+            // refkey:<ci, index> -> ci's ref-antecedent join value. ref_accessor
+            // does Selector(1)->ci then navigates to the ref fact; role_value
+            // projects the value.
+            let refkey = Func::compose(role_value(*ref_role), ref_accessor.clone());
+            // probe_one:<ci, index> = DistL:<ci, FetchOrPhi:<refkey, index>>
+            let probe_one = Func::compose(Func::DistL, Func::construction(vec![
+                Func::Selector(1),
+                Func::compose(Func::FetchOrPhi, Func::construction(vec![
+                    refkey,
+                    Func::Selector(2),
+                ])),
+            ]));
+            Func::compose(Func::Concat,
+                Func::compose(Func::apply_to_all(probe_one),
+                    Func::compose(Func::DistR, Func::construction(vec![current, index]))))
+        } else {
+            // Cross-product fallback: no equi-key to index on (a pure
+            // match-pair / cross-antecedent-comparison join). These are small
+            // by construction, so O(n^2) is acceptable here.
+            Func::compose(Func::Concat,
+                Func::compose(Func::apply_to_all(Func::DistL),
+                    Func::compose(Func::DistR, Func::construction(vec![current, ft_j]))))
+        };
+        Func::compose(Func::filter(join_pred), pairs)
     });
 
     // #907 — cross-antecedent role comparisons. Each entry compares two
