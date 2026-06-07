@@ -3981,14 +3981,49 @@ fn schema_role_names(ft_id: &str, d: &ast::Object) -> Vec<String> {
 /// Ingesting readings is an application of SYSTEM where the operation is
 /// compile ∘ parse. The new FFP objects are stored via ↓DEFS.
 /// Mirrors platform_compile in ast.rs — same pipeline, structured result.
+/// ns-5 loading-domain precedence: drop `Role_Reference_has_Ambiguous_Domain`
+/// facts for any reference whose candidate-domain set INCLUDES `domain`.
+/// Loading INTO `domain`, such a reference resolves to `domain.<Noun>`
+/// (precedence 1), not a cross-domain collision. References whose candidates
+/// do NOT include the load domain are genuinely ambiguous and preserved, so
+/// the load gate still rejects real collisions.
+fn suppress_load_domain_ambiguity(state: ast::Object, domain: &str) -> ast::Object {
+    let cell = ast::fetch_cell_seq("Role_Reference_has_Ambiguous_Domain", &state);
+    let facts: Vec<ast::Object> = ast::cell_facts_iter(&cell).cloned().collect();
+    if facts.is_empty() {
+        return state;
+    }
+    // References resolvable by loading-domain precedence: their candidate set
+    // contains the target load domain.
+    let local_refs: hashbrown::HashSet<String> = facts.iter()
+        .filter(|f| ast::binding(f, "Candidate_Domain") == Some(domain))
+        .filter_map(|f| ast::binding(f, "Role_Reference").map(|s| s.to_string()))
+        .collect();
+    if local_refs.is_empty() {
+        return state;
+    }
+    let kept: Vec<ast::Object> = facts.into_iter()
+        .filter(|f| ast::binding(f, "Role_Reference")
+            .map_or(true, |r| !local_refs.contains(r)))
+        .collect();
+    ast::store("Role_Reference_has_Ambiguous_Domain", ast::Object::seq(kept), &state)
+}
+
 fn apply_load_readings(
     markdown: &str,
     domain: &str,
     d: &ast::Object,
     state: &ast::Object,
 ) -> CommandResult {
-    // Parse with context from D (same as platform_compile)
-    let parsed = match crate::parse_forml2::parse_to_state_from(markdown, d) {
+    // Parse with context from D (same as platform_compile), threading the
+    // TARGET domain as the ns-5 local domain (ns-local-precedence-resolver):
+    // readings loaded INTO `domain` resolve a bare reference whose noun is
+    // also defined locally to THIS domain (precedence 1) instead of being
+    // rejected as a cross-domain collision. Without this, loading
+    // `Order has Reason.` into `orders` was rejected because `Order` is also
+    // a core value type (`core.md`: the Fact-Type ordinal) — the
+    // self_evolution_* regression.
+    let parsed = match crate::parse_forml2::parse_to_state_from_in_domain(markdown, d, domain) {
         Ok(s) => s,
         Err(e) => {
             return CommandResult {
@@ -4024,6 +4059,16 @@ fn apply_load_readings(
 
     // Merge: foldl(concat_cell, D, cells(parsed))
     let merged_state = ast::merge_states(d, &parsed);
+    // ns-5 loading-domain precedence at the LOAD GATE: a reference whose
+    // candidate domains include the TARGET load `domain` unambiguously
+    // means `domain.<Noun>` (precedence 1), so drop its recorded
+    // cross-domain ambiguity before validation. Without this, loading
+    // `Order has Reason.` into `orders` is rejected because `Order` is also
+    // a `core` value type (the Fact-Type ordinal) — yet in the orders
+    // domain the reference is unambiguous. ns-5's PARSE-time local
+    // precedence only covers nouns DECLARED in the loaded slice; this
+    // covers nouns already defined in the target domain in D.
+    let merged_state = suppress_load_domain_ambiguity(merged_state, domain);
 
     // D3 (#705): mirror the singular `load_reading_handler` validation
     // gate. Either alethic (Source::Parse / ::Resolve) or deontic
