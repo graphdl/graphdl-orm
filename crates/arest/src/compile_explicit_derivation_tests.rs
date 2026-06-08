@@ -9416,3 +9416,81 @@ fn sm_reconstruction_fold_matches_event_fold_byte_identical() {
          cell facts must be byte-identical.\n  event-fold:     {:?}\n  reconstruction: {:?}",
         ef_cell, rf_cell);
 }
+
+// sm-retire-imperative-fold: with `compile_sm_init_for` retired from the live
+// path, the reconstruction fold must seed s0 (`initial`) ITSELF — i.e. run
+// ALONE (no separate `_sm_init_` derivation) and still:
+//   • seed every instance to `initial` round 1 (o1, never transitioned, ends
+//     `pending` PURELY from the folded-in seed — the from-guard blocks its lone
+//     `shipped` event), and
+//   • fold events to current status (o2: placed+shipped ⇒ `shipped`).
+// The result must stay byte-identical to the golden `[init + event-fold]` run,
+// proving the seed folded into the fold == the old standalone init derivation.
+#[test]
+fn sm_reconstruction_fold_seeds_s0_alone_byte_identical_to_init_plus_event_fold() {
+    use crate::ast::{fact_from_pairs, cell_push};
+
+    let sm = crate::compile::make_compiled_state_machine_for_test(
+        "Order".to_string(),
+        vec!["pending".to_string(), "placed".to_string(), "shipped".to_string()],
+        "pending".to_string(),
+        order_sm_transition_func(),
+        vec![
+            ("pending".to_string(), "placed".to_string(),  "Order_was_placed".to_string()),
+            ("placed".to_string(),  "shipped".to_string(), "Order_was_shipped".to_string()),
+        ],
+    );
+
+    let build_population = || {
+        let s = Object::phi();
+        let s = cell_push("Order_was_placed",
+            fact_from_pairs(&[("Order", "o2"), ("Timestamp", "200")]), &s);
+        let s = cell_push("Order_was_shipped",
+            fact_from_pairs(&[("Order", "o2"), ("Timestamp", "100")]), &s);
+        let s = cell_push("Order_was_shipped",
+            fact_from_pairs(&[("Order", "o1")]), &s);
+        s
+    };
+
+    // ── GOLDEN reference: the retired pair `[init + event-fold]` ─────────
+    let g_init = crate::compile::compile_sm_init_for_for_test(&sm);
+    let g_fold = crate::compile::compile_sm_event_fold_for_test(&sm);
+    let g_refs: Vec<(&str, &Func)> = vec![
+        (g_init.id.as_str(), &g_init.func),
+        (g_fold.id.as_str(), &g_fold.func),
+    ];
+    let (g_state, _) =
+        crate::evaluate::forward_chain_defs_state(&g_refs, &build_population());
+
+    // ── NEW live path: the reconstruction fold ALONE (seeds s0 itself) ──
+    let rf_fold = crate::compile::compile_sm_reconstruction_fold_for_test(&sm);
+    let rf_refs: Vec<(&str, &Func)> = vec![(rf_fold.id.as_str(), &rf_fold.func)];
+    let (rf_state, _) =
+        crate::evaluate::forward_chain_defs_state(&rf_refs, &build_population());
+
+    let g_pairs = sm_status_pairs(&g_state, "State_Machine_is_currently_in_Status");
+    let rf_pairs = sm_status_pairs(&rf_state, "State_Machine_is_currently_in_Status");
+
+    assert!(rf_pairs.contains(&("o2".to_string(), "shipped".to_string())),
+        "fold-alone: o2 (placed+shipped) must reach `shipped`; got {:?}", rf_pairs);
+    assert!(rf_pairs.contains(&("o1".to_string(), "pending".to_string())),
+        "fold-alone: o1 must be seeded to `pending` by the folded-in s0 (its lone \
+         `shipped` is from-guard-blocked); got {:?}", rf_pairs);
+
+    assert_eq!(g_pairs, rf_pairs,
+        "reconstruction-fold ALONE must match the retired [init + event-fold] \
+         status set.\n  [init+event-fold]: {:?}\n  fold-alone:        {:?}",
+        g_pairs, rf_pairs);
+
+    // Byte-identical across ALL three seeded fact types, not just the status.
+    for cell in ["State_Machine_is_currently_in_Status",
+                 "State_Machine_is_instance_of_Noun",
+                 "State_Machine_is_for_Resource"] {
+        let g_cell = canonical_cell_facts(&g_state, cell);
+        let rf_cell = canonical_cell_facts(&rf_state, cell);
+        assert_eq!(g_cell, rf_cell,
+            "fold-alone vs [init+event-fold]: `{}` cell facts must be byte-identical.\
+             \n  [init+event-fold]: {:?}\n  fold-alone:        {:?}",
+            cell, g_cell, rf_cell);
+    }
+}

@@ -1838,48 +1838,49 @@ fn transitions_def_returns_available_from_status() {
     assert!(terminal_items.is_empty(), "Terminal state should have no transitions");
 }
 
-// ---- SM init derivation debugging ----
+// ---- SM seed (s0) derivation ----
 
+// sm-retire-imperative-fold: the standalone `_sm_init_` derivation is retired;
+// its seed (s0) is folded INTO `_sm_event_fold_<noun>` as that fold's first
+// branch. So the seed facts (initial status + instance_of_Noun + for_Resource
+// for a freshly-created instance) are now produced by the fold itself. This
+// test pins that: applying the Order fold to a population with one Order and an
+// empty status cell yields the seed facts.
 #[test]
-fn sm_init_derivation_produces_facts() {
+fn sm_fold_seeds_initial_status_facts() {
     use arest::ast::{self, Func, Object};
 
     let (state, d) = compile_orders();
 
     let defs: Vec<(String, Func)> = compile::compile_to_defs_state(&state);
 
-    // Find the SM init derivation
-    let sm_init = defs.iter().find(|(n, _)| n.contains("sm_init")).expect("SM init def should exist");
-    eprintln!("SM init def name: {}", sm_init.0);
+    // The seed lives in the fold; the standalone `_sm_init_` def is gone.
+    assert!(defs.iter().all(|(n, _)| !n.contains("sm_init")),
+        "retired: no standalone _sm_init_ def should be registered");
+    let sm_fold = defs.iter()
+        .find(|(n, _)| n.contains("_sm_event_fold_"))
+        .expect("SM fold def (carrying the folded-in seed) should exist");
+    eprintln!("SM fold def name: {}", sm_fold.0);
 
-    // Build a minimal state with one Order entity
+    // Build a minimal state with one Order entity and NO status yet.
     let mut test_state = state.clone();
     test_state = ast::cell_push("Order_has_customer",
         ast::fact_from_pairs(&[("Order", "ord-1"), ("customer", "Acme")]),
         &test_state);
 
-    // Encode state as population object and apply derivation
-    let test_pop = test_state.clone();
-    let pop_obj = ast::encode_state(&test_pop);
+    // Encode state as population object and apply the fold.
+    let pop_obj = ast::encode_state(&test_state);
+    let result = ast::apply(&sm_fold.1, &pop_obj, &d);
+    eprintln!("SM fold raw result: {}", result);
 
-    // Test derive_facts on <ord-1> — task-742: renamed cell + role.
-    let make_one_fact = ast::Func::construction(vec![
-        ast::Func::constant(Object::atom("State_Machine_is_for_Resource")),
-        ast::Func::constant(Object::atom("test")),
-        ast::Func::construction(vec![
-            ast::Func::construction(vec![ast::Func::constant(Object::atom("SM")), ast::Func::Id]),
-            ast::Func::construction(vec![ast::Func::constant(Object::atom("Resource")), ast::Func::Id]),
-        ]),
-    ]);
-    let one_fact_result = ast::apply(&make_one_fact, &Object::atom("ord-1"), &d);
-    eprintln!("make_one_fact : ord-1 = {}", one_fact_result);
-
-    let result = ast::apply(&sm_init.1, &pop_obj, &d);
-    eprintln!("SM init raw result: {}", result);
-
-    // Check it is not empty
-    assert!(!matches!(result, Object::Seq(ref v) if v.is_empty()), "SM init should produce derived facts");
-    assert!(!matches!(result, Object::Bottom), "SM init should not produce bottom");
+    // The fold's seed branch must emit the s0 facts for ord-1.
+    assert!(!matches!(result, Object::Seq(ref v) if v.is_empty()),
+        "SM fold should seed derived facts for a new, status-less instance");
+    assert!(!matches!(result, Object::Bottom), "SM fold should not produce bottom");
+    // Specifically, the seeded current-status fact must be present.
+    let text = format!("{}", result);
+    assert!(text.contains("State_Machine_is_currently_in_Status"),
+        "SM fold seed must emit an initial currently_in_Status fact; got {}", text);
 }
 
 // ---- #38+#41: create via DEFS, no CompiledModel ----

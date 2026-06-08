@@ -4423,7 +4423,7 @@ fn compile_data_with_state(
     // them in round 1 is cheap; the cost forward_chain_defs_state_seeded
     // attacks is the long-tail user-rule cardinality (~75 user rules on
     // the live tasks.db corpus).
-    let mut derivation_positive_reads: HashMap<String, Vec<String>> = data.derivation_rules.iter()
+    let derivation_positive_reads: HashMap<String, Vec<String>> = data.derivation_rules.iter()
         .filter(|r| !r.id.is_empty())
         .map(|r| {
             let reads: Vec<String> = r.antecedent_sources.iter()
@@ -4441,19 +4441,20 @@ fn compile_data_with_state(
         })
         .collect();
 
-    // task sm-fold-as-predicate: declare the synthetic SM event-fold's
-    // positive reads so the semi-naive/seeded chainer re-fires it when the
-    // current-status cell OR a trigger cell changes. The fold is now
-    // from-guarded (it reads `State_Machine_is_currently_in_Status` to gate
-    // each transition), so it must re-run after sm-init seeds `initial` and
-    // after every advance — otherwise the seeded path (command.rs apply)
-    // stops at the first step and downstream status goes stale. Keyed by
-    // the fold's rule id (`_sm_event_fold_<noun>`) so the
-    // `derivation_reads:<id>` sidecar matches the `derivation:<id>` def.
-    for sm in state_machines.iter() {
-        derivation_positive_reads
-            .insert(format!("_sm_event_fold_{}", sm.noun_name), sm_event_fold_read_cells(sm));
-    }
+    // sm-retire-imperative-fold: the SM fold is deliberately registered with
+    // NO positive-reads sidecar, so the seeded chainer (evaluate.rs:663-668)
+    // treats it as `cells == None` and runs it UNCONDITIONALLY every round —
+    // precisely the always-active behavior of the retired `_sm_init_`, which is
+    // what the folded-in s0 seed needs. A create dirties only the new entity's
+    // PRIMARY FT cell, whose id varies with the noun's reference scheme and the
+    // resolve id mapping; no fixed read-set can name it across nouns, so gating
+    // the fold on specific cells silently drops the initial-status seed (the
+    // regression that bit transition_updates_state_status et al.: the 1-field
+    // create's primary cell wasn't in the declared reads). The fold is
+    // idempotent — from-guarded with a keyed status cell — so running it every
+    // round is correct and converges via "no new facts"; the seeded apply/create
+    // chain is short, and the load path runs every rule per round regardless,
+    // so this matches `_sm_init_`'s prior cost rather than adding one.
 
     let t4 = profile_timer::now();
     let schemas = compile_schemas(data);
@@ -4611,15 +4612,15 @@ fn compile_derivations(data: &CellIndex, state_machines: &[CompiledStateMachine]
     // realized lazily by `evaluate::prove_from_state` at the point a
     // negation is queried — no synthetic complement cells.
 
-    // Implicit: state machine initialization from cell-driven SM defs.
-    // MC3b-e (#763): SMs come from `compile_state_machine_from_cells`,
-    // not from `derive_state_machines_from_facts`/JSON-blob.
-    let sm_init_derivations: Vec<_> = state_machines.iter().map(|sm| {
-        diag!("  [profile] compiling SM init for noun={} initial={}", sm.noun_name, sm.initial);
-        compile_sm_init_for(sm)
-    }).collect();
-    diag!("  [profile] {} SM init derivations", sm_init_derivations.len());
-    derivations.extend(sm_init_derivations);
+    // sm-retire-imperative-fold: the imperative SM init derivation
+    // (`compile_sm_init_for`) is RETIRED from the live path. Its seed (s0) is
+    // now folded INTO `compile_sm_reconstruction_fold` as that fold's first
+    // branch (`sm_seed_func`) — a single derivation seeds `initial` round 1
+    // (idempotent on the status cell) and then advances to fixpoint, with no
+    // separate `_sm_init_` cell. The standalone init survives only as the
+    // byte-identical parity-test reference (test-only). MC3b-e (#763): SMs
+    // come from `compile_state_machine_from_cells`, not from
+    // `derive_state_machines_from_facts`/JSON-blob.
 
     // task-740: event-fold derivations. For each SM, build a rule
     // that reads each transition's trigger-fact-type cell and emits
@@ -7686,15 +7687,25 @@ fn compile_join_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> Compil
 /// exists in the population but no State Machine is for that entity, derive:
 ///   - State Machine instance (_is_instance_of_Noun, _is_for_Resource,
 ///     _is_currently_in_Status = initial) — the canonical post-task-742 cells.
-fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
+/// The SM SEED (s0) as a reusable Func: emit (instance_of_Noun,
+/// currently_in_Status = `initial`, for_Resource) for every instance of the
+/// noun that has NO current status yet. Idempotent — keyed on the
+/// State_Machine_is_currently_in_Status cell, so it seeds round 1 and skips
+/// thereafter, never fighting the fold's advances.
+///
+/// sm-retire-imperative-fold: extracted from the (now test-only)
+/// `compile_sm_init_for` so the live `compile_sm_reconstruction_fold` can fold
+/// the seed in AS its s0 — the imperative init derivation is retired and the
+/// fold is the single source of current status. Both callers share this
+/// byte-for-byte, which is what keeps the fold-alone result identical to the
+/// retired `[init + event-fold]` pair.
+fn sm_seed_func(sm: &CompiledStateMachine) -> Func {
         let sm_noun = sm.noun_name.clone();
         // Use the cell-driven initial — explicit `Status is initial in SM`
         // declaration, falling back to graph topology (Pass 4 unique
         // source-never-target). Empty when ambiguous; the runtime fails
         // visibly at first SM call.
         let initial_status = sm.initial.clone();
-        let id_str = format!("_sm_init_{}", sm_noun);
-        let text_str = format!("SM init for {}", sm_noun);
 
         // Drop φ (non-atom) values. Trigger-FT cells can carry facts
         // whose SM-noun role is φ (e.g. `<<Task, φ>>` in Task_is_started
@@ -7816,14 +7827,26 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
             ]),
         ]));
 
-        let func = Func::compose(Func::Concat, Func::compose(derive_facts, new_instances));
+        Func::compose(Func::Concat, Func::compose(derive_facts, new_instances))
+}
 
+/// `compile_sm_init_for` — the imperative SM init derivation, RETIRED from the
+/// live path (sm-retire-imperative-fold). `compile()` no longer registers it;
+/// `compile_sm_reconstruction_fold` folds `sm_seed_func` in as its s0 instead.
+/// Kept ONLY as the byte-identical parity reference for the fold-alone test
+/// (`[init + event-fold]` is the golden run the seeded fold must match), hence
+/// test-only in non-test builds.
+#[cfg_attr(not(test), allow(dead_code))]
+fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
+        let id_str = format!("_sm_init_{}", sm.noun_name);
+        let text_str = format!("SM init for {}", sm.noun_name);
+        let func = sm_seed_func(sm);
         // SM init fans out to multiple FT cells; no AbsenceOf antecedents.
         // Leave dep metadata empty so the stratifier doesn't try to
         // sequence this against user-rule negation cascades.
         let (consequent_cell, _, _) =
             derivation_dep_metadata_synth(String::new());
-        CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func,             consequent_cell,
+        CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func, consequent_cell,
             materialization: crate::types::MaterializationPolicy::Stored }
 }
 
@@ -8057,11 +8080,10 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
     // but the status cell is the one downstream rules — the
     // Resource_is_currently_in_Status bridge → Task_has_Task_Status — read,
     // and the one the from-guard re-reads to advance). Declaring it lets the
-    // stratifier sequence this fold against the bridge cascade. The positive
-    // antecedent reads (currently_in_Status + each trigger cell) are injected
-    // into `derivation_positive_reads` in `compile_data_with_state` via
-    // `sm_event_fold_read_cells`, which emits the `derivation_reads:` sidecar
-    // the semi-naive gate consults.
+    // stratifier sequence this fold against the bridge cascade.
+    // (sm-retire-imperative-fold: the live reconstruction fold registers NO
+    // positive-reads sidecar — it runs unconditionally, like the retired
+    // `_sm_init_`; see the rationale in `compile_data_with_state`.)
     let consequent_cell = "State_Machine_is_currently_in_Status".to_string();
     CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func,         consequent_cell,
         materialization: crate::types::MaterializationPolicy::Stored }
@@ -8310,12 +8332,20 @@ fn compile_sm_reconstruction_fold(sm: &CompiledStateMachine) -> CompiledDerivati
         )
     }).collect();
 
-    let func = if inner_funcs.is_empty() {
-        Func::constant(Object::phi())
-    } else if inner_funcs.len() == 1 {
-        inner_funcs.into_iter().next().unwrap()
+    // sm-retire-imperative-fold: fold the SEED (s0) in as the FIRST branch so
+    // this single derivation IS the whole fold — `initial` is seeded round 1
+    // (idempotent on the status cell), then the transition branches advance to
+    // fixpoint. This replaces the retired standalone `_sm_init_` derivation;
+    // byte-identical to the old `[_sm_init_ + event-fold]` pair. The seed runs
+    // even for a 0-transition SM (a noun with an initial status but no
+    // transitions still needs its instances seeded — `_sm_init_` used to do
+    // that unconditionally).
+    let mut branches = vec![sm_seed_func(sm)];
+    branches.extend(inner_funcs);
+    let func = if branches.len() == 1 {
+        branches.into_iter().next().unwrap()
     } else {
-        Func::compose(Func::Concat, Func::construction(inner_funcs))
+        Func::compose(Func::Concat, Func::construction(branches))
     };
 
     let consequent_cell = "State_Machine_is_currently_in_Status".to_string();
@@ -8354,37 +8384,6 @@ pub(crate) fn make_compiled_state_machine_for_test(
     transition_table: Vec<(String, String, String)>,
 ) -> CompiledStateMachine {
     CompiledStateMachine { noun_name, statuses, initial, func, transition_table }
-}
-
-/// task sm-fold-as-predicate: the cells `compile_sm_event_fold` reads.
-///
-/// The fold now reads `State_Machine_is_currently_in_Status` (the
-/// from-guard semi-join — see `compile_sm_event_fold`) PLUS each
-/// transition's trigger-event cell (the canonical underscore form of
-/// `event_ft`). The semi-naive chainer gates re-firing on these: when the
-/// status cell changes (a resource advanced one step) the fold re-fires to
-/// take the next guarded step, and when a trigger cell changes a fresh
-/// event can fire. Without `State_Machine_is_currently_in_Status` in this
-/// set the fold would not be re-selected after sm-init seeds `initial`, so
-/// the first advance never happens under the seeded/semi-naive paths.
-///
-/// `compile_data_with_state` injects the result into
-/// `model.derivation_positive_reads` keyed by the fold's rule id
-/// (`_sm_event_fold_<noun>`), which `compile_to_defs_state` emits as the
-/// `derivation_reads:<id>` sidecar that `read_derivation_reads` decodes.
-fn sm_event_fold_read_cells(sm: &CompiledStateMachine) -> Vec<String> {
-    let mut reads: Vec<String> = vec![
-        "State_Machine_is_currently_in_Status".to_string(),
-    ];
-    let mut seen: hashbrown::HashSet<String> = hashbrown::HashSet::new();
-    seen.insert(reads[0].clone());
-    for (_, _, event_ft) in sm.transition_table.iter() {
-        let canonical = event_ft.replace(' ', "_");
-        if seen.insert(canonical.clone()) {
-            reads.push(canonical);
-        }
-    }
-    reads
 }
 
 /// task-922-sm-init-projection — for_Resource backfill.
