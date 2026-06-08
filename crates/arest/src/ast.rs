@@ -4873,13 +4873,33 @@ pub fn fetch_or_phi(name: &str, state: &Object) -> Object {
 /// Replaces: population.facts.entry("key").or_default().push(fact)
 pub fn cell_push(name: &str, fact: Object, state: &Object) -> Object {
     let existing = fetch_or_phi(name, state);
-    let new_contents = match existing.as_seq() {
-        Some(items) => {
+    let new_contents = match &existing {
+        Object::Seq(items) => {
             let mut v = items.to_vec();
             v.push(fact);
             Object::Seq(v.into())
         }
-        None => Object::seq(vec![fact]),
+        // sm-status-bridge-projection-lag: a Map (folded / keyed D_n, #932) cell
+        // holds its facts as VALUES, and `as_seq()` is None for a Map — so the
+        // legacy `None => Seq([fact])` branch SILENTLY DROPPED every existing
+        // entry. `cell_filter` is already Map-tolerant, so the transition
+        // handler's `cell_filter` (keeps every OTHER machine) + `cell_push`
+        // (this) round-tripped a keyed `State_Machine_is_currently_in_Status`
+        // Map down to a single-entry Seq, wiping all OTHER machines' statuses.
+        // The from-guarded fold then re-seeded those machines to `initial`,
+        // reverting an unrelated entity's status mid-transition (a completed
+        // blocker flipped back to in_progress, re-blocking its dependent).
+        // Preserve the Map's facts and append the new one. Sorted by the
+        // content-addressed fact id so the resulting Seq is deterministic (the
+        // cell is re-keyed downstream by integrate_round_facts, but determinism
+        // keeps any intermediate persisted bytes stable).
+        Object::Map(m) => {
+            let mut v: Vec<Object> = m.values().cloned().collect();
+            v.sort_by_cached_key(|f| synthesize_fact_id(name, f));
+            v.push(fact);
+            Object::Seq(v.into())
+        }
+        _ => Object::seq(vec![fact]),
     };
     store(name, new_contents, state)
 }
@@ -11638,6 +11658,38 @@ mod tests {
         let state = cell_push("B", Object::atom("2"), &state);
         assert_eq!(fetch_or_phi("A", &state), Object::seq(vec![Object::atom("1")]));
         assert_eq!(fetch_or_phi("B", &state), Object::seq(vec![Object::atom("2")]));
+    }
+
+    #[test]
+    fn cell_push_preserves_map_cell_entries() {
+        // sm-status-bridge-projection-lag regression: pushing onto a Map (folded
+        // / keyed D_n, #932) cell MUST preserve existing entries. The legacy
+        // cell_push read the cell via `as_seq()` (None for a Map) and the
+        // `None => Seq([fact])` branch replaced the whole cell with a single-entry
+        // Seq, wiping every OTHER entry. The transition handler's `cell_filter`
+        // (Map-tolerant) + `cell_push` on the keyed
+        // `State_Machine_is_currently_in_Status` Map thus dropped all OTHER
+        // machines' statuses; the from-guarded fold then re-seeded them to
+        // `initial`, reverting an unrelated entity's status mid-transition (a
+        // completed blocker flipped back to in_progress, re-blocking its
+        // dependent). Root cause found by stepping the apply path on a faithful
+        // metamodel_state() reproduction.
+        let fact_a = fact_from_pairs(&[("State Machine", "A"), ("Status", "completed")]);
+        let mut m: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        m.insert("A".to_string(), fact_a);
+        let state = store("SM", Object::Map(m.into()), &Object::phi());
+
+        let fact_b = fact_from_pairs(&[("State Machine", "B"), ("Status", "in_progress")]);
+        let after = cell_push("SM", fact_b, &state);
+
+        let facts = fetch_cell_seq("SM", &after);
+        let seq = facts.as_seq().expect("cell should be a Seq after a push onto a Map");
+        let present = |sm: &str, st: &str| seq.iter().any(|f|
+            binding(f, "State Machine") == Some(sm) && binding(f, "Status") == Some(st));
+        assert!(present("A", "completed"),
+            "cell_push onto a Map MUST preserve existing entry A=completed; got {:?}", seq);
+        assert!(present("B", "in_progress"),
+            "cell_push must add the new entry B=in_progress; got {:?}", seq);
     }
 
     // ── Security #22: Evolution state machine trace ──────────────
