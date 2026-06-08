@@ -2901,16 +2901,20 @@ fn transition_via_defs(
             let trigger_cell = event.replace(' ', "_");
             // sm-fold-as-predicate: stamp occurred-at so the reconstruction fold
             // orders this event chronologically. The cell stays keyed by the SM
-            // noun role (functional, latest-wins), so re-firing the same event
-            // updates the timestamp — letting a re-cycle (block->unblock->block)
-            // fold to the LATEST event's target instead of a rank-only tie.
+            // noun role (functional). upsert=true (last-write-wins) is essential:
+            // re-firing an event must UPDATE its occurred-at, letting a re-cycle
+            // (block->unblock->block) fold to the LATEST event's target. Plain
+            // cell_put_keyed treats the new-timestamp fact as a KeyConflict and
+            // keeps the STALE timestamp, so the re-block would never out-sort the
+            // intervening unblock. cell_put_keyed_batch(upsert) overwrites by key.
             let occurred = next_occurred_at();
-            new_state = ast::cell_put_keyed(
+            let (s, _conflicts) = ast::cell_put_keyed_batch(
                 &trigger_cell,
                 &[noun.as_str()],
-                ast::fact_from_pairs(&[(noun.as_str(), entity_id), ("Timestamp", occurred.as_str())]),
-                &new_state)
-                .unwrap_or(new_state);
+                vec![ast::fact_from_pairs(&[(noun.as_str(), entity_id), ("Timestamp", occurred.as_str())])],
+                true,
+                &new_state);
+            new_state = s;
         }
     }
 
@@ -10616,6 +10620,75 @@ Transition 'start' is triggered by Event Type 'Job is started'.
         assert!(stamped,
             "the `Job is started` event for A must carry an occurred-at Timestamp; got {:?}",
             started);
+    }
+
+    // sm-fold-as-predicate (occurred-at): re-firing an event must UPDATE its
+    // occurred-at (last-write-wins upsert), not keep the stale one. Without the
+    // upsert, a re-block's event-write is a KeyConflict and the first block's
+    // earlier timestamp survives, so the re-block can never out-sort the
+    // intervening unblock and the task wrongly folds to in_progress.
+    #[test]
+    fn transition_recycle_updates_event_occurred_at_latest_wins() {
+        const READINGS: &str = r#"
+# Re-cycle SM
+
+## Entity Types
+
+Job(.id) is an entity type.
+
+## Fact Types
+
+Job is started.
+Job is blocked.
+Job is unblocked.
+
+## State Machine
+
+State Machine Definition 'Job SM' is for Noun 'Job'.
+Status 'pending' is initial in State Machine Definition 'Job SM'.
+
+Transition 'start' is defined in State Machine Definition 'Job SM'.
+Transition 'start' is from Status 'pending'.
+Transition 'start' is to Status 'in_progress'.
+Transition 'start' is triggered by Event Type 'Job is started'.
+
+Transition 'block' is defined in State Machine Definition 'Job SM'.
+Transition 'block' is from Status 'in_progress'.
+Transition 'block' is to Status 'blocked'.
+Transition 'block' is triggered by Event Type 'Job is blocked'.
+
+Transition 'unblock' is defined in State Machine Definition 'Job SM'.
+Transition 'unblock' is from Status 'blocked'.
+Transition 'unblock' is to Status 'in_progress'.
+Transition 'unblock' is triggered by Event Type 'Job is unblocked'.
+"#;
+        let meta = crate::parse_forml2::parse_to_state(&crate::metamodel_corpus())
+            .expect("metamodel parse");
+        let jobs = crate::parse_forml2::parse_to_state_with_nouns(READINGS, &meta)
+            .expect("job readings parse");
+        let state = ast::merge_states(&meta, &jobs);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        let mut st = ast::cell_push("State_Machine_is_currently_in_Status",
+            ast::fact_from_pairs(&[("State Machine", "A"), ("Status", "pending")]), &state);
+        for event in ["Job is started", "Job is blocked", "Job is unblocked", "Job is blocked"] {
+            let res = transition_via_defs(&d, "A", event, "", None, &st);
+            assert!(!res.rejected, "{event} rejected: {:?}", res.violations);
+            st = ast::merge_delta(&st, &res.state, None);
+        }
+
+        let ts_of = |cell: &str, st: &ast::Object| -> Option<String> {
+            ast::fetch_cell_seq(cell, st).as_seq().and_then(|fs|
+                fs.iter().find(|f| ast::binding(f, "Job") == Some("A"))
+                    .and_then(|f| ast::binding(f, "Timestamp").map(String::from)))
+        };
+        let blocked_ts = ts_of("Job_is_blocked", &st);
+        let unblocked_ts = ts_of("Job_is_unblocked", &st);
+        assert!(
+            blocked_ts.is_some() && unblocked_ts.is_some() && blocked_ts > unblocked_ts,
+            "the re-block's occurred-at must UPDATE past the intervening unblock's \
+             (latest-wins upsert): blocked={blocked_ts:?} unblocked={unblocked_ts:?}");
     }
 
     /// cli-apply-large-tasksdb-nonterminating (Bug B). A single entity that
