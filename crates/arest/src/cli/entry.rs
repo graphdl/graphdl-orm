@@ -945,6 +945,29 @@ fn take_db_flag(tokens: &[String]) -> (String, Vec<String>) {
     (db, rest)
 }
 
+/// Pure stack-size resolver: maps an optional `AREST_STACK_MB` value (in
+/// megabytes) to a worker-thread stack size in bytes. A missing, empty,
+/// non-numeric, or zero override falls back to the 512 MiB default. Split out
+/// from `desired_stack_bytes` so the parse/default logic is unit-testable
+/// without mutating the process environment.
+pub fn stack_bytes_from_env(override_mb: Option<String>) -> usize {
+    const DEFAULT_MB: usize = 512;
+    let mb = override_mb
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&mb| mb > 0)
+        .unwrap_or(DEFAULT_MB);
+    mb.saturating_mul(1024 * 1024)
+}
+
+/// Worker-thread stack size for the CLI entry, in bytes. The Windows MSVC main
+/// thread reserves only 1 MiB — too small for the engine's deep forward-chain
+/// recursion on large apps (support.auto.dev: 670 rules over 6461 fact types
+/// overflowed mid-fixpoint). `main.rs` runs `main_entry` on a thread sized by
+/// this. Override the default with `AREST_STACK_MB` (megabytes).
+pub fn desired_stack_bytes() -> usize {
+    stack_bytes_from_env(std::env::var("AREST_STACK_MB").ok())
+}
+
 /// CLI entry point. Called from src/main.rs's `fn main()` shim.
 pub fn main_entry() {
     // Install host entropy source (#591 / #574) BEFORE any subcommand
@@ -2281,5 +2304,36 @@ mod version_embedding_tests {
         // The subcommand reads CARGO_PKG_VERSION, set by cargo for every
         // build — guard it so the printed JSON's `pkg` field is never empty.
         assert!(!env!("CARGO_PKG_VERSION").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod stack_size_tests {
+    use super::stack_bytes_from_env;
+
+    const MB: usize = 1024 * 1024;
+
+    #[test]
+    fn defaults_to_512_mib_when_unset() {
+        assert_eq!(stack_bytes_from_env(None), 512 * MB);
+    }
+
+    #[test]
+    fn honors_a_valid_megabyte_override() {
+        assert_eq!(stack_bytes_from_env(Some("256".to_string())), 256 * MB);
+        assert_eq!(stack_bytes_from_env(Some("1024".to_string())), 1024 * MB);
+    }
+
+    #[test]
+    fn trims_surrounding_whitespace() {
+        assert_eq!(stack_bytes_from_env(Some("  768  ".to_string())), 768 * MB);
+    }
+
+    #[test]
+    fn falls_back_to_default_on_zero_or_garbage() {
+        // 0 would mean "no stack" — nonsensical; fall back rather than honor it.
+        assert_eq!(stack_bytes_from_env(Some("0".to_string())), 512 * MB);
+        assert_eq!(stack_bytes_from_env(Some("abc".to_string())), 512 * MB);
+        assert_eq!(stack_bytes_from_env(Some("".to_string())), 512 * MB);
     }
 }
