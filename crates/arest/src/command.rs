@@ -2706,6 +2706,33 @@ fn reconcile_derived_transitions(
     (running, fired)
 }
 
+/// sm-fold-as-predicate (occurred-at): a process-monotonic, cross-session-ordered
+/// timestamp for SM event facts, stamped at RESOLVE time (never inside a
+/// derivation — occurred-at is an EFFECT). Format `<epoch_ms:013>-<seq:012>`:
+/// the wall-clock base orders events ACROSS processes/sessions; the atomic
+/// sequence breaks within-process (same-millisecond) ties so a burst of
+/// sequentially-fired transitions still gets STRICTLY increasing keys. The
+/// embedded '-' keeps OrderBy on its LEXICOGRAPHIC path (a pure-digit key would
+/// parse as a lossy f64 and mis-sort at this width). no_std/wasm has no wall
+/// clock, so the base is 0 there — the kernel image never re-cycles live SM
+/// state, so the in-process sequence alone suffices. The reconstruction fold's
+/// double-sort (Timestamp outer, transition-rank inner) consumes this: timeless
+/// historical events (key "") sort before any stamped event, new events sort
+/// chronologically, and same-key ties fall back to causal rank.
+fn next_occurred_at() -> String {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    #[cfg(not(feature = "no_std"))]
+    let base = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    #[cfg(feature = "no_std")]
+    let base = 0u64;
+    format!("{:013}-{:012}", base, seq)
+}
+
 fn transition_via_defs(
     d: &ast::Object,
     entity_id: &str,
@@ -2872,10 +2899,16 @@ fn transition_via_defs(
             // cell_put_keyed enforces it structurally. On the defensive
             // KeyConflict path (identical re-fire) keep prior state.
             let trigger_cell = event.replace(' ', "_");
+            // sm-fold-as-predicate: stamp occurred-at so the reconstruction fold
+            // orders this event chronologically. The cell stays keyed by the SM
+            // noun role (functional, latest-wins), so re-firing the same event
+            // updates the timestamp — letting a re-cycle (block->unblock->block)
+            // fold to the LATEST event's target instead of a rank-only tie.
+            let occurred = next_occurred_at();
             new_state = ast::cell_put_keyed(
                 &trigger_cell,
                 &[noun.as_str()],
-                ast::fact_from_pairs(&[(noun.as_str(), entity_id)]),
+                ast::fact_from_pairs(&[(noun.as_str(), entity_id), ("Timestamp", occurred.as_str())]),
                 &new_state)
                 .unwrap_or(new_state);
         }
@@ -10525,6 +10558,64 @@ Job Status enumerates 'pending', 'in_progress', 'blocked', 'completed', 'deleted
             "STEP 3b: post-unblock reconcile must be idle; fired={:?}", fired3b);
         assert_eq!(extract_sm_status(&s3b, "A").as_deref(), Some("in_progress"),
             "STEP 3b: A must remain 'in_progress' at the fixpoint");
+    }
+
+    // sm-fold-as-predicate (occurred-at): the resolve-time clock must be
+    // strictly monotonic so sequentially-fired transitions get ordered keys.
+    #[test]
+    fn next_occurred_at_strictly_increases() {
+        let a = super::next_occurred_at();
+        let b = super::next_occurred_at();
+        assert!(b > a, "occurred-at must strictly increase: {a:?} then {b:?}");
+    }
+
+    // sm-fold-as-predicate (occurred-at): firing a transition must STAMP the
+    // event fact with a Timestamp role so the reconstruction fold can order it.
+    #[test]
+    fn transition_stamps_event_with_occurred_at() {
+        const READINGS: &str = r#"
+# Occurred-at stamping SM
+
+## Entity Types
+
+Job(.id) is an entity type.
+
+## Fact Types
+
+Job is started.
+
+## State Machine
+
+State Machine Definition 'Job SM' is for Noun 'Job'.
+Status 'pending' is initial in State Machine Definition 'Job SM'.
+
+Transition 'start' is defined in State Machine Definition 'Job SM'.
+Transition 'start' is from Status 'pending'.
+Transition 'start' is to Status 'in_progress'.
+Transition 'start' is triggered by Event Type 'Job is started'.
+"#;
+        let meta = crate::parse_forml2::parse_to_state(&crate::metamodel_corpus())
+            .expect("metamodel parse");
+        let jobs = crate::parse_forml2::parse_to_state_with_nouns(READINGS, &meta)
+            .expect("job readings parse");
+        let state = ast::merge_states(&meta, &jobs);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        // Seed Job A at pending, then fire 'start' through the real writer.
+        let st = ast::cell_push("State_Machine_is_currently_in_Status",
+            ast::fact_from_pairs(&[("State Machine", "A"), ("Status", "pending")]), &state);
+        let res = transition_via_defs(&d, "A", "Job is started", "", None, &st);
+        assert!(!res.rejected, "start transition rejected: {:?}", res.violations);
+        let after = ast::merge_delta(&st, &res.state, None);
+
+        let started = ast::fetch_cell_seq("Job_is_started", &after);
+        let stamped = started.as_seq().map(|fs| fs.iter().any(|f|
+            ast::binding(f, "Job") == Some("A") && ast::binding(f, "Timestamp").is_some()
+        )).unwrap_or(false);
+        assert!(stamped,
+            "the `Job is started` event for A must carry an occurred-at Timestamp; got {:?}",
+            started);
     }
 
     /// cli-apply-large-tasksdb-nonterminating (Bug B). A single entity that
