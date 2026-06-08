@@ -9618,3 +9618,27 @@ fn sm_fold_step_folds_trigger_stream_from_s0() {
     let res = out.as_seq().and_then(|s| s.get(1)).and_then(|o| o.as_atom()).map(String::from);
     assert_eq!(res, Some("t1".to_string()), "resource threaded through the fold");
 }
+
+// sm-fold-as-predicate (collision guard): the detection flags a DERIVED marker
+// that collides with an SM trigger-event cell (the `Task is blocked` bug class),
+// but NOT a legitimate event->event backfill, the SM fold, or a renamed marker.
+#[test]
+fn sm_trigger_consequent_collision_flags_marker_not_backfill() {
+    let triggers: std::collections::HashSet<String> =
+        ["Task_is_started", "Task_is_blocked", "Task_is_finished", "Task_is_unblocked"]
+            .iter().map(|s| s.to_string()).collect();
+    let rules: Vec<(String, Vec<String>)> = vec![
+        // MARKER: writes the block trigger from NON-event antecedents → FLAG.
+        ("Task_is_blocked".into(), vec!["Task_blocks_Task".into(), "Task_has_Task_Status".into()]),
+        // BACKFILL: writes the start trigger from an EVENT antecedent → not flagged.
+        ("Task_is_started".into(), vec!["Task_is_finished".into()]),
+        // SM fold: consequent is not a trigger cell → not flagged.
+        ("State_Machine_is_currently_in_Status".into(), vec!["Task_is_started".into()]),
+        // Renamed marker (the fix): consequent is not a trigger cell → not flagged.
+        ("Task_is_dependency_blocked".into(), vec!["Task_blocks_Task".into()]),
+    ];
+    let hits = crate::compile::sm_trigger_consequent_collisions(&triggers, &rules);
+    assert_eq!(hits, vec!["Task_is_blocked".to_string()],
+        "only the marker (trigger consequent + non-event antecedent) is flagged; the \
+         event->event backfill, the SM fold, and the renamed dependency marker are not");
+}

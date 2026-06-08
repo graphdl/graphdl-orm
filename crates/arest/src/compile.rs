@@ -1887,6 +1887,33 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
             (format!("derivation_reads:{}", id), Func::constant(reads_obj))
         }));
 
+    // sm-fold-as-predicate (collision guard): warn when a derivation consequent
+    // cell is ALSO an SM trigger-event cell AND the rule reads a NON-event
+    // antecedent — the `Task is blocked` marker/event collision class, where a
+    // derived hint is folded as a real SM event and corrupts status. Event→event
+    // backfills (migration rules reading other trigger cells) are intentional and
+    // NOT flagged. Warning only (no reject) so existing fleet apps still compile;
+    // the fix is to rename the marker (e.g. `... is dependency blocked`).
+    let sm_trigger_cells: std::collections::HashSet<String> = model.state_machines.iter()
+        .flat_map(|sm| sm.transition_table.iter().map(|(_, _, ev)| ev.replace(' ', "_")))
+        .collect();
+    if !sm_trigger_cells.is_empty() {
+        let guard_rules: Vec<(String, Vec<String>)> = model.derivations.iter()
+            .filter(|d| !d.consequent_cell.is_empty())
+            .map(|d| (
+                d.consequent_cell.clone(),
+                model.derivation_positive_reads.get(&d.id).cloned().unwrap_or_default(),
+            ))
+            .collect();
+        for cell in sm_trigger_consequent_collisions(&sm_trigger_cells, &guard_rules) {
+            diag!("[warn] derivation consequent `{}` collides with an SM trigger-event cell \
+                   of the same name: the reconstruction fold consumes these DERIVED facts as \
+                   real SM events (the marker/event collision class). Rename the derived \
+                   marker (e.g. `... is dependency blocked`) so it does not feed the fold.",
+                  cell);
+        }
+    }
+
     // Migration rules (#349). One derivation-shaped def per Migration
     // instance in the population. Fires inside forward_chain alongside
     // the classical derivations, emitting MigrationApplication facts +
@@ -8146,6 +8173,30 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
 /// sm-retire-imperative-fold: this is now THE registered SM current-status fold
 /// in `compile()` (it replaced `compile_sm_event_fold`, proven byte-identical by
 /// the parity test `sm_reconstruction_fold_matches_event_fold_byte_identical`).
+/// sm-fold-as-predicate (collision guard): of the given derivation rules
+/// `(consequent_cell, antecedent_cells)`, return the consequent cells that are
+/// ALSO SM trigger-event cells AND have at least one NON-trigger antecedent.
+/// That is the `Task is blocked` marker class — a DERIVED hint that compiles to
+/// the same cell as an SM event and is then folded as a real event, corrupting
+/// reconstruction. An event→event backfill (every antecedent is itself a trigger
+/// cell, e.g. the migration `Task is started iff Task is finished`) is
+/// intentional and excluded, as is any derivation whose consequent is not a
+/// trigger cell (the SM folds, the bridge, ordinary markers). Sorted + deduped.
+pub(crate) fn sm_trigger_consequent_collisions(
+    trigger_cells: &std::collections::HashSet<String>,
+    rules: &[(String, Vec<String>)],
+) -> Vec<String> {
+    let mut hits: Vec<String> = rules.iter()
+        .filter(|(consequent, antecedents)|
+            trigger_cells.contains(consequent.as_str())
+            && !antecedents.iter().all(|a| trigger_cells.contains(a.as_str())))
+        .map(|(c, _)| c.clone())
+        .collect();
+    hits.sort();
+    hits.dedup();
+    hits
+}
+
 /// BFS depth of each status from `sm.initial` along the transition graph.
 /// Used to synthesize a causal ORDER for timeless events in the reconstruction
 /// fold (events fire in increasing from-status depth: started < blocked <
