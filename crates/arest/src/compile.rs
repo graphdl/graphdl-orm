@@ -8146,6 +8146,216 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
 /// sm-retire-imperative-fold: this is now THE registered SM current-status fold
 /// in `compile()` (it replaced `compile_sm_event_fold`, proven byte-identical by
 /// the parity test `sm_reconstruction_fold_matches_event_fold_byte_identical`).
+/// BFS depth of each status from `sm.initial` along the transition graph.
+/// Used to synthesize a causal ORDER for timeless events in the reconstruction
+/// fold (events fire in increasing from-status depth: started < blocked <
+/// unblocked < …). Unreachable statuses are absent; callers default them.
+fn sm_status_bfs_depths(sm: &CompiledStateMachine) -> std::collections::HashMap<String, usize> {
+    let mut depth: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    depth.insert(sm.initial.clone(), 0);
+    queue.push_back(sm.initial.clone());
+    while let Some(s) = queue.pop_front() {
+        let d = depth.get(&s).copied().unwrap_or(0);
+        for (from, to, _) in sm.transition_table.iter() {
+            if from == &s && !depth.contains_key(to) {
+                depth.insert(to.clone(), d + 1);
+                queue.push_back(to.clone());
+            }
+        }
+    }
+    depth
+}
+
+/// sm-fold-as-predicate: the ordered-left-fold branch of the SM reconstruction
+/// fold. For each resource it gathers events across ALL trigger cells, orders
+/// them by `occurred at Timestamp` (timeless events fall back to "" and keep
+/// input order, stable), and `FoldL(sm.func)` from s0 — so the resource's
+/// CURRENT status is the terminal accumulator of a genuine left fold (the LAST
+/// applicable event's target). This is correct for CYCLIC (block↔unblock) and
+/// COMPETING (finish vs delete) histories where the retired per-round
+/// from-guarded set-application oscillated / raced.
+///
+/// The from-guard is now INTRINSIC to the fold: `sm.func:<status, trigger>`
+/// falls through to `Selector(1)` (the current status) for any `<from, trigger>`
+/// pair with no matching transition, so an event inapplicable from the current
+/// status is a NO-OP in the fold — never a wipe — exactly the property the old
+/// per-round guard enforced, but now order-correct.
+///
+/// Tuple shape per event: `<<resource>, trigger, <timestamp>>`. resource and
+/// timestamp are 1-element projection SEQs (or `<>` when the role is absent),
+/// NOT scalars: `Construction` is ⊥-preserving (ast.rs), so a scalar projection
+/// that bottomed out on a missing role would collapse the whole tuple and drop
+/// a timeless event. Carried as seqs they never bottom; `Selector(1)` unwraps
+/// them to the atom at use sites, and a dirty (role-less) fact yields a non-atom
+/// IndexBy key that is skipped — the same φ-tolerance the old fold had.
+fn sm_ordered_fold_branch(sm: &CompiledStateMachine) -> Func {
+    let sm_noun = sm.noun_name.clone();
+    let sm_noun_obj = Object::atom(&sm_noun);
+    let initial_obj = Object::atom(&sm.initial);
+
+    // Per-fact projections (kept as SEQs — see the doc comment).
+    let resource_proj = Func::compose(
+        Func::apply_to_all(Func::Selector(2)),
+        Func::filter(Func::compose(Func::Eq, Func::construction(vec![
+            Func::Selector(1),
+            Func::constant(sm_noun_obj.clone()),
+        ]))),
+    );
+    let ts_proj = Func::compose(
+        Func::apply_to_all(Func::Selector(2)),
+        Func::filter(Func::compose(Func::Eq, Func::construction(vec![
+            Func::Selector(1),
+            Func::constant(Object::atom("Timestamp")),
+        ]))),
+    );
+
+    // Tagged event stream, Concat'd across DISTINCT trigger cells. A trigger
+    // shared by several transitions (delete-from-{pending,progress,completed}
+    // all fire on `Task is deleted`) is read ONCE so its events aren't
+    // multiplied.
+    let mut seen: Vec<String> = Vec::new();
+    for (_, _, event_ft) in sm.transition_table.iter() {
+        if !seen.iter().any(|e| e == event_ft) { seen.push(event_ft.clone()); }
+    }
+    let tagged_cells: Vec<Func> = seen.iter().map(|event_ft| {
+        let cell = event_ft.replace(' ', "_");
+        let tag_one = Func::construction(vec![
+            resource_proj.clone(),
+            Func::constant(Object::atom(event_ft)),
+            ts_proj.clone(),
+        ]);
+        Func::compose(Func::apply_to_all(tag_one), extract_facts_from_pop(&cell))
+    }).collect();
+    let all_tagged = Func::compose(Func::Concat, Func::construction(tagged_cells));
+
+    // Resource atom of a tuple: Selector(1) of the resource projection seq.
+    let resource_key = Func::compose(Func::Selector(1), Func::Selector(1));
+    // Drop dirty subjects BEFORE grouping: a φ-token ("φ") or empty ("")
+    // subject is a real atom (so IndexBy would NOT skip it) but must not mint a
+    // φ-keyed SM status — the old fold filtered these explicitly. A truly absent
+    // (role-less) subject yields a non-atom key that IndexBy already skips.
+    let keep_clean = Func::compose(Func::Not, Func::compose(Func::Or,
+        Func::construction(vec![
+            Func::compose(Func::Eq, Func::construction(vec![
+                resource_key.clone(), Func::constant(Object::atom("φ"))])),
+            Func::compose(Func::Eq, Func::construction(vec![
+                resource_key.clone(), Func::constant(Object::atom(""))])),
+        ])));
+    let clean_tagged = Func::compose(Func::filter(keep_clean), all_tagged);
+    let grouped = Func::compose(Func::IndexBy(Box::new(resource_key)), clean_tagged);
+
+    // ── Synthetic transition-rank for ORDERING timeless events (the live db and
+    // migration readings carry no occurred-at timestamps). rank(event) = BFS
+    // depth of the event's FROM status from `initial`, with events whose target
+    // is TERMINAL (no outgoing transition, e.g. `deleted`) pushed AFTER all
+    // non-terminal events so a terminal event folds LAST. Real timestamps, when
+    // present, dominate (the double OrderBy below); rank is the tie-break that
+    // makes a timeless `started→blocked→unblocked` history fold in CAUSAL order
+    // rather than cell-concat order.
+    let depth = sm_status_bfs_depths(sm);
+    let max_depth = depth.values().copied().max().unwrap_or(0);
+    let has_outgoing: std::collections::HashSet<&String> =
+        sm.transition_table.iter().map(|(f, _, _)| f).collect();
+    let mut rank: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (from, to, event_ft) in sm.transition_table.iter() {
+        let from_depth = depth.get(from).copied().unwrap_or(max_depth);
+        let to_terminal = !has_outgoing.contains(to);
+        let r = if to_terminal { max_depth + 1 + from_depth } else { from_depth };
+        let slot = rank.entry(event_ft.clone()).or_insert(0);
+        if r > *slot { *slot = r; }
+    }
+    // rank_chain: trigger atom -> rank decimal string (OrderBy parses it
+    // numerically). Fallback "9999" sorts any unknown trigger last.
+    let mut rank_chain = Func::constant(Object::atom("9999"));
+    for event_ft in seen.iter().rev() {
+        let r = rank.get(event_ft).copied().unwrap_or(9999);
+        rank_chain = Func::condition(
+            Func::compose(Func::Eq, Func::construction(vec![
+                Func::Id, Func::constant(Object::atom(event_ft))])),
+            Func::constant(Object::atom(&r.to_string())),
+            rank_chain,
+        );
+    }
+    let rank_key = Func::compose(rank_chain, Func::Selector(2));
+
+    // Per-resource fold step: `<<status, resource>, trigger>` ->
+    //   `<sm.func:<status, trigger>, resource>`.
+    let step = {
+        let acc = Func::Selector(1);
+        let status = Func::compose(Func::Selector(1), acc.clone());
+        let resource = Func::compose(Func::Selector(2), acc);
+        let trigger = Func::Selector(2);
+        let next_status = Func::compose(sm.func.clone(),
+            Func::construction(vec![status, trigger]));
+        Func::construction(vec![next_status, resource])
+    };
+
+    // Order a resource's group, project to the trigger stream, fold from
+    // `<initial, resource>`. STABLE double-sort: by synthetic rank FIRST (inner)
+    // then by occurred-at Timestamp (outer, stable) — so real timestamps
+    // dominate when present and timeless events fall back to causal rank. The ts
+    // key is Selector(1) of the ts projection ("" / non-atom → sorts first,
+    // before any real timestamp: historical-before-new).
+    let ts_key = Func::compose(Func::Selector(1), Func::Selector(3));
+    let ordered_group = Func::compose(
+        Func::OrderBy(Box::new(ts_key)),
+        Func::OrderBy(Box::new(rank_key)),
+    );
+    let ordered_triggers = Func::compose(
+        Func::apply_to_all(Func::Selector(2)),
+        ordered_group,
+    );
+    let resource_of_group = Func::compose(
+        Func::Selector(1),
+        Func::compose(Func::Selector(1), Func::Selector(1)),
+    );
+    let seed_pair = Func::construction(vec![
+        Func::constant(initial_obj.clone()),
+        resource_of_group,
+    ]);
+    let folded_pair = Func::compose(
+        Func::FoldL(Box::new(step)),
+        Func::construction(vec![seed_pair, ordered_triggers]),
+    );
+
+    // Emit the 3-fact shape from `<final_status, resource>`.
+    let st = Func::Selector(1);
+    let res = Func::Selector(2);
+    let emit = Func::construction(vec![
+        Func::construction(vec![
+            Func::constant(Object::atom("State_Machine_is_instance_of_Noun")),
+            Func::constant(Object::atom("State Machine is instance of Noun (reconstruction-fold)")),
+            Func::construction(vec![
+                Func::construction(vec![Func::constant(Object::atom("State Machine")), res.clone()]),
+                Func::construction(vec![Func::constant(Object::atom("Noun")), Func::constant(sm_noun_obj.clone())]),
+            ]),
+        ]),
+        Func::construction(vec![
+            Func::constant(Object::atom("State_Machine_is_currently_in_Status")),
+            Func::constant(Object::atom("State Machine is currently in Status (reconstruction-fold)")),
+            Func::construction(vec![
+                Func::construction(vec![Func::constant(Object::atom("State Machine")), res.clone()]),
+                Func::construction(vec![Func::constant(Object::atom("Status")), st]),
+            ]),
+        ]),
+        Func::construction(vec![
+            Func::constant(Object::atom("State_Machine_is_for_Resource")),
+            Func::constant(Object::atom("State Machine is for Resource (reconstruction-fold)")),
+            Func::construction(vec![
+                Func::construction(vec![Func::constant(Object::atom("State Machine")), res.clone()]),
+                Func::construction(vec![Func::constant(Object::atom("Resource")), res.clone()]),
+            ]),
+        ]),
+    ]);
+    let fold_one_resource = Func::compose(emit, folded_pair);
+
+    // grouped (Map) -> per-resource emit (ApplyToAll iterates Map values) ->
+    // Concat to a flat fact stream.
+    Func::compose(Func::Concat,
+        Func::compose(Func::apply_to_all(fold_one_resource), grouped))
+}
+
 fn compile_sm_reconstruction_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
     let sm_noun = sm.noun_name.clone();
     // Drop-in id: registered under `_sm_event_fold_<noun>` — the id the rest of the
@@ -8156,213 +8366,44 @@ fn compile_sm_reconstruction_fold(sm: &CompiledStateMachine) -> CompiledDerivati
     let id_str = format!("_sm_event_fold_{}", sm_noun);
     let text_str = format!("SM reconstruction-fold for {}", sm_noun);
 
-    // Empty def for compile-time evaluation of sm.func: the transition
-    // Func is a pure Condition/Eq/Selector tree (no cell reads) for an
-    // unguarded transition, so an empty store suffices to resolve
-    // `sm.func:<from, event>` to its target atom.
-    let empty_defs = Object::phi();
-
-    let inner_funcs: Vec<Func> = sm.transition_table.iter().map(|(from, to, event_ft)| {
-        // ── Resolve the target status THROUGH sm.func (reuse the shared
-        // transition). For the matching <from, event> pair sm.func returns
-        // `to`; fall back to the literal `to` if it doesn't yield an atom
-        // (guarded transition needing live data) so we stay byte-identical
-        // to the guard-agnostic event-fold.
-        let resolved_to = {
-            let probe = Object::seq(vec![Object::atom(from), Object::atom(event_ft)]);
-            match crate::ast::apply(&sm.func, &probe, &empty_defs).as_atom() {
-                Some(s) => s.to_string(),
-                None => to.clone(),
-            }
-        };
-        let to_obj = Object::atom(&resolved_to);
-        let from_obj = Object::atom(from);
-        let sm_noun_obj = Object::atom(&sm_noun);
-
-        // transition_table stores the Fact Type's human-readable reading
-        // (the binding value in `Transition_is_triggered_by_Fact_Type`);
-        // cell ids are the underscore form. Normalize spaces → underscores.
-        let event_ft_canonical = event_ft.replace(' ', "_");
-        let event_facts = extract_facts_from_pop(&event_ft_canonical);
-
-        // ── OrderBy: stable sort each resource's trigger-event facts by an
-        // `occurred at Timestamp` role WHERE PRESENT (tie-break/audit only;
-        // correctness is from the from-guard + fixpoint, never order).
-        // Key per fact = the value of the pair whose role name == "Timestamp"
-        // (φ / "" when the event carries no timestamp). `Selector(1)` picks
-        // the single projected value; on the empty projection it yields a
-        // non-atom, which OrderBy treats as the "" key (keyless, stable).
-        let timestamp_key = Func::compose(
-            Func::Selector(1),
-            Func::compose(
-                Func::apply_to_all(Func::Selector(2)),
-                Func::filter(Func::compose(Func::Eq, Func::construction(vec![
-                    Func::Selector(1),
-                    Func::constant(Object::atom("Timestamp")),
-                ]))),
-            ),
-        );
-        let ordered_event_facts = Func::compose(
-            Func::OrderBy(Box::new(timestamp_key)),
-            event_facts,
-        );
-
-        // Per-fact extractor: project the value of the pair whose role name
-        // == sm_noun (the resource), mirroring the event-fold.
-        let extract_resource_per_fact = Func::compose(
-            Func::apply_to_all(Func::Selector(2)),
-            Func::filter(Func::compose(Func::Eq, Func::construction(vec![
-                Func::Selector(1),
-                Func::constant(sm_noun_obj.clone()),
-            ]))),
-        );
-        // φ / "" / "φ"-token degenerate-subject filters (identical to the
-        // event-fold) so SetFromSeq stays total over dirty event rows.
-        let non_phi = Func::compose(Func::Not, Func::NullTest);
-        let non_empty = Func::compose(Func::Not, Func::compose(Func::Eq,
-            Func::construction(vec![Func::Id, Func::constant(Object::atom(""))])));
-        let non_phi_token = Func::compose(Func::Not, Func::compose(Func::Eq,
-            Func::construction(vec![Func::Id, Func::constant(Object::atom("φ"))])));
-        let resources_with_event = Func::compose(
-            Func::filter(non_phi_token.clone()),
-            Func::compose(
-                Func::filter(non_empty.clone()),
-                Func::compose(
-                    Func::filter(non_phi.clone()),
-                    Func::compose(
-                        Func::Concat,
-                        Func::compose(
-                            Func::apply_to_all(extract_resource_per_fact),
-                            ordered_event_facts,
-                        ),
-                    ),
-                ),
-            ),
-        );
-
-        // ── from-guard (identical to the event-fold): build the set of
-        // resources whose CURRENT status == `from` by reading
-        // State_Machine_is_currently_in_Status, keeping the State Machine
-        // value of every fact carrying the pair <"Status", from>. The
-        // forward-chain fixpoint refreshes that cell each round, so `from`
-        // tracks each resource's live status and the next applicable
-        // transition fires on the following round.
-        let status_facts = extract_facts_from_pop("State_Machine_is_currently_in_Status");
-        let fact_in_from = Func::compose(Func::HasMember, Func::construction(vec![
-            Func::constant(Object::seq(vec![
-                Object::atom("Status"),
-                from_obj.clone(),
-            ])),
-            Func::Id,
-        ]));
-        let extract_sm_value_per_fact = Func::compose(
-            Func::apply_to_all(Func::Selector(2)),
-            Func::filter(Func::compose(Func::Eq, Func::construction(vec![
-                Func::Selector(1),
-                Func::constant(Object::atom("State Machine")),
-            ]))),
-        );
-        let resources_in_from = Func::compose(
-            Func::filter(non_phi_token.clone()),
-            Func::compose(
-                Func::filter(non_empty.clone()),
-                Func::compose(
-                    Func::filter(non_phi.clone()),
-                    Func::compose(
-                        Func::Concat,
-                        Func::compose(
-                            Func::apply_to_all(extract_sm_value_per_fact),
-                            Func::compose(Func::filter(fact_in_from), status_facts),
-                        ),
-                    ),
-                ),
-            ),
-        );
-        let in_from_set = Func::compose(Func::SetFromSeq, resources_in_from);
-        // Semi-join resources_with_event against in_from_set: keep those
-        // PRESENT (live status == from), then project the resource back out.
-        let is_present = Func::compose(Func::Not,
-            Func::compose(Func::NullTest, Func::FetchOrPhi));
-        let resources = Func::compose(
-            Func::apply_to_all(Func::Selector(1)),
-            Func::compose(
-                Func::filter(is_present),
-                Func::compose(
-                    Func::DistR,
-                    Func::construction(vec![resources_with_event, in_from_set]),
-                ),
-            ),
-        );
-
-        // Per-resource emit: same 3-fact shape as the event-fold / SM init
-        // so the status cell is byte-identical. Text labels differ only in
-        // the parenthetical provenance tag, which is NOT part of a fact's
-        // identity (facts are keyed on cell id + role/value bindings), so
-        // parity on State_Machine_is_currently_in_Status is unaffected.
-        let derive_for_resource = Func::construction(vec![
-            Func::construction(vec![
-                Func::constant(Object::atom("State_Machine_is_instance_of_Noun")),
-                Func::constant(Object::atom("State Machine is instance of Noun (reconstruction-fold)")),
-                Func::construction(vec![
-                    Func::construction(vec![Func::constant(Object::atom("State Machine")), Func::Id]),
-                    Func::construction(vec![Func::constant(Object::atom("Noun")), Func::constant(sm_noun_obj.clone())]),
-                ]),
-            ]),
-            Func::construction(vec![
-                Func::constant(Object::atom("State_Machine_is_currently_in_Status")),
-                Func::constant(Object::atom(&format!("State Machine is currently in Status (reconstruction-fold to {})", resolved_to))),
-                Func::construction(vec![
-                    Func::construction(vec![Func::constant(Object::atom("State Machine")), Func::Id]),
-                    Func::construction(vec![Func::constant(Object::atom("Status")), Func::constant(to_obj.clone())]),
-                ]),
-            ]),
-            Func::construction(vec![
-                Func::constant(Object::atom("State_Machine_is_for_Resource")),
-                Func::constant(Object::atom("State Machine is for Resource (reconstruction-fold)")),
-                Func::construction(vec![
-                    Func::construction(vec![Func::constant(Object::atom("State Machine")), Func::Id]),
-                    Func::construction(vec![Func::constant(Object::atom("Resource")), Func::Id]),
-                ]),
-            ]),
-        ]);
-
-        Func::compose(
-            Func::Concat,
-            Func::compose(Func::apply_to_all(derive_for_resource), resources),
-        )
-    }).collect();
-
-    // sm-retire-imperative-fold: fold the SEED (s0) in as the FIRST branch so
-    // this single derivation IS the whole fold — `initial` is seeded round 1
-    // (idempotent on the status cell), then the transition branches advance to
-    // fixpoint. This replaces the retired standalone `_sm_init_` derivation;
-    // byte-identical to the old `[_sm_init_ + event-fold]` pair. The seed runs
-    // even for a 0-transition SM (a noun with an initial status but no
-    // transitions still needs its instances seeded — `_sm_init_` used to do
-    // that unconditionally).
-    let mut branches = vec![sm_seed_func(sm)];
-    branches.extend(inner_funcs);
-    let func = if branches.len() == 1 {
-        branches.into_iter().next().unwrap()
-    } else {
-        Func::compose(Func::Concat, Func::construction(branches))
-    };
+    // sm-fold-as-predicate (reopened 2026-06-08): a GENUINE per-resource ordered
+    // left-fold replaces the retired per-round, from-guarded SET-application,
+    // which OSCILLATED on cyclic transitions (block↔unblock: each fixpoint round
+    // flipped the status, so the terminal value depended on iteration parity)
+    // and RACED on competing transitions (finish vs delete from the same `from`
+    // both emitted, the "exactly one Status" upsert resolving nondeterministically).
+    //
+    // The seed (s0) is the first branch: it seeds `initial` for every instance,
+    // idempotent on the status cell, and is the ONLY source of status for an
+    // eventless resource (and for a 0-transition SM). The ordered-fold branch
+    // (`sm_ordered_fold_branch`) reconstructs each resource's CURRENT status by
+    // folding `sm.func` over its timestamp-ordered event stream — so the terminal
+    // status is the LAST applicable event's target, deterministically. Concat
+    // unions the two fact streams; the status cell's upsert-safety (keyed on the
+    // `_sm_event_fold_` id + State Machine, see compute_upsert_safe_cells)
+    // collapses seed+folded to the folded value downstream.
+    let branches = vec![sm_seed_func(sm), sm_ordered_fold_branch(sm)];
+    let func = Func::compose(Func::Concat, Func::construction(branches));
 
     let consequent_cell = "State_Machine_is_currently_in_Status".to_string();
     CompiledDerivation { id: id_str, text: text_str, kind: DerivationKind::SubtypeInheritance, func,         consequent_cell,
         materialization: crate::types::MaterializationPolicy::Stored }
 }
 
-/// Test-only accessors so the sibling `compile_explicit_derivation_tests`
-/// module (declared at the crate root, not as a child of `mod compile`)
-/// can drive the two private SM folds for the byte-identical parity test.
-/// These forward verbatim — the originals are left untouched.
+/// Test-only accessors for the two RETIRED imperative SM folds. The
+/// byte-identical parity tests that drove them are gone (sm-fold-as-predicate
+/// reopened: the live fold is now the ordered FoldL, which intentionally
+/// diverges from the event-fold on cyclic/competing histories). Kept
+/// `#[allow(dead_code)]` as the historical reference impls; full deletion is a
+/// tidy-up follow-up.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn compile_sm_init_for_for_test(sm: &CompiledStateMachine) -> CompiledDerivation {
     compile_sm_init_for(sm)
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn compile_sm_event_fold_for_test(sm: &CompiledStateMachine) -> CompiledDerivation {
     compile_sm_event_fold(sm)
 }

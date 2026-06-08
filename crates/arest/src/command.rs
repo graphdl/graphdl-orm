@@ -10422,9 +10422,21 @@ Job Status enumerates 'pending', 'in_progress', 'blocked', 'completed', 'deleted
             st = ast::cell_filter("State_Machine_is_currently_in_Status", |_| false, &st);
             st = ast::cell_filter("Job_is_blocked", |_| false, &st);
             st = ast::cell_filter("Job_is_unblocked", |_| false, &st);
+            st = ast::cell_filter("Job_is_started", |_| false, &st);
             for (id, status) in statuses {
                 st = ast::cell_push("State_Machine_is_currently_in_Status",
                     ast::fact_from_pairs(&[("State Machine", id), ("Status", status)]), &st);
+                // sm-fold-as-predicate: the SM status is now RECONSTRUCTED from
+                // events (FoldL sm.func over the event stream), not read as a
+                // stored value. A non-`pending` status therefore needs its
+                // prerequisite `started` event in the population, or the fold
+                // reconstructs the entity back to `pending` (a lone block/unblock
+                // trigger is a no-op from pending). The old from-guarded fold read
+                // the directly-set status, so this backfill was unnecessary then.
+                if *status != "pending" {
+                    st = ast::cell_push("Job_is_started",
+                        ast::fact_from_pairs(&[("Job", id)]), &st);
+                }
             }
             for id in blocked {
                 st = ast::cell_push("Job_is_blocked",

@@ -9327,11 +9327,14 @@ fn canonical_cell_facts(state: &Object, cell: &str) -> Vec<Vec<(String, String)>
 }
 
 #[test]
-fn sm_reconstruction_fold_matches_event_fold_byte_identical() {
+fn sm_reconstruction_fold_orders_events_by_timestamp() {
     use crate::ast::{fact_from_pairs, cell_push};
 
-    // Build the CompiledStateMachine directly (no parse pipeline) so the
-    // two folds compile from the SAME source-of-truth SM.
+    // sm-fold-as-predicate (reopened): the reconstruction fold is a GENUINE
+    // ordered left-fold, so the terminal status DEPENDS on event order — the
+    // deliberate behavior change from the retired (order-independent,
+    // oscillation-prone) event-fold. Build the Order SM directly (no parse
+    // pipeline).
     let sm = crate::compile::make_compiled_state_machine_for_test(
         "Order".to_string(),
         vec!["pending".to_string(), "placed".to_string(), "shipped".to_string()],
@@ -9342,92 +9345,58 @@ fn sm_reconstruction_fold_matches_event_fold_byte_identical() {
             ("placed".to_string(),  "shipped".to_string(), "Order_was_shipped".to_string()),
         ],
     );
+    let fold = crate::compile::compile_sm_reconstruction_fold_for_test(&sm);
+    let refs: Vec<(&str, &Func)> = vec![(fold.id.as_str(), &fold.func)];
 
-    // Shared population: o2 has BOTH events, o1 has ONLY shipped. We add a
-    // `Timestamp` role to o2's events deliberately OUT OF CHRONOLOGICAL
-    // ORDER relative to their causal order is irrelevant — but we give the
-    // `shipped` event an EARLIER timestamp than `placed` to prove the
-    // reconstruction fold's `OrderBy` (which would, if correctness depended
-    // on order, mis-sort shipped-before-placed) does NOT change the result:
-    // correctness is the from-guard + fixpoint, not the ordering.
-    let build_population = || {
+    // ── Chronological history: placed(100) THEN shipped(200) → shipped. o1 has
+    // only `shipped` (never placed) → `shipped` is inapplicable from pending
+    // (sm.func no-op), so o1 stays `pending`.
+    let chrono = {
         let s = Object::phi();
-        // o2: placed (ts=200) and shipped (ts=100, earlier on the clock).
         let s = cell_push("Order_was_placed",
-            fact_from_pairs(&[("Order", "o2"), ("Timestamp", "200")]), &s);
-        let s = cell_push("Order_was_shipped",
             fact_from_pairs(&[("Order", "o2"), ("Timestamp", "100")]), &s);
-        // o1: shipped only, no placed — and no timestamp at all (events may
-        // lack a timestamp; OrderBy must tolerate the keyless element).
+        let s = cell_push("Order_was_shipped",
+            fact_from_pairs(&[("Order", "o2"), ("Timestamp", "200")]), &s);
         let s = cell_push("Order_was_shipped",
             fact_from_pairs(&[("Order", "o1")]), &s);
         s
     };
+    let (state, _) = crate::evaluate::forward_chain_defs_state(&refs, &chrono);
+    let pairs = sm_status_pairs(&state, "State_Machine_is_currently_in_Status");
+    assert!(pairs.contains(&("o2".to_string(), "shipped".to_string())),
+        "chronological placed→shipped must fold to `shipped`; got {:?}", pairs);
+    assert!(pairs.contains(&("o1".to_string(), "pending".to_string())),
+        "o1 (shipped only, never placed) stays `pending` — shipped is a no-op \
+         from pending; got {:?}", pairs);
+    assert!(!pairs.iter().any(|(m, st)| m == "o1" && st == "shipped"),
+        "o1 must NOT be `shipped`; got {:?}", pairs);
 
-    // ── Event-fold run (init + event-fold) ──────────────────────────────
-    let ef_init = crate::compile::compile_sm_init_for_for_test(&sm);
-    let ef_fold = crate::compile::compile_sm_event_fold_for_test(&sm);
-    let ef_refs: Vec<(&str, &Func)> = vec![
-        (ef_init.id.as_str(), &ef_init.func),
-        (ef_fold.id.as_str(), &ef_fold.func),
-    ];
-    let (ef_state, _) =
-        crate::evaluate::forward_chain_defs_state(&ef_refs, &build_population());
-
-    // ── Reconstruction-fold run (init + reconstruction-fold) ────────────
-    let rf_init = crate::compile::compile_sm_init_for_for_test(&sm);
-    let rf_fold = crate::compile::compile_sm_reconstruction_fold_for_test(&sm);
-    let rf_refs: Vec<(&str, &Func)> = vec![
-        (rf_init.id.as_str(), &rf_init.func),
-        (rf_fold.id.as_str(), &rf_fold.func),
-    ];
-    let (rf_state, _) =
-        crate::evaluate::forward_chain_defs_state(&rf_refs, &build_population());
-
-    // ── Expected current-status outcomes (the from-guard semantics) ─────
-    let ef_pairs = sm_status_pairs(&ef_state, "State_Machine_is_currently_in_Status");
-    let rf_pairs = sm_status_pairs(&rf_state, "State_Machine_is_currently_in_Status");
-
-    assert!(ef_pairs.contains(&("o2".to_string(), "shipped".to_string())),
-        "event-fold: o2 (placed+shipped) must reach `shipped`; got {:?}", ef_pairs);
-    assert!(ef_pairs.contains(&("o1".to_string(), "pending".to_string())),
-        "event-fold: o1 (shipped only, never placed) must STAY `pending` \
-         (from-guard blocks shipped); got {:?}", ef_pairs);
-    assert!(!ef_pairs.iter().any(|(sm, st)| sm == "o1" && st == "shipped"),
-        "event-fold: o1 must NOT be `shipped`; got {:?}", ef_pairs);
-
-    assert!(rf_pairs.contains(&("o2".to_string(), "shipped".to_string())),
-        "reconstruction-fold: o2 must reach `shipped`; got {:?}", rf_pairs);
-    assert!(rf_pairs.contains(&("o1".to_string(), "pending".to_string())),
-        "reconstruction-fold: o1 must STAY `pending`; got {:?}", rf_pairs);
-
-    // ── PARITY: the two current-status SETS must be IDENTICAL ───────────
-    assert_eq!(ef_pairs, rf_pairs,
-        "reconstruction-fold and event-fold must produce identical \
-         (State Machine, Status) sets.\n  event-fold:        {:?}\n  reconstruction:    {:?}",
-        ef_pairs, rf_pairs);
-
-    // ── STRONGER: the raw cell contents (canonicalized) must be identical
-    // — i.e. byte-identical facts in State_Machine_is_currently_in_Status.
-    let ef_cell = canonical_cell_facts(&ef_state, "State_Machine_is_currently_in_Status");
-    let rf_cell = canonical_cell_facts(&rf_state, "State_Machine_is_currently_in_Status");
-    assert_eq!(ef_cell, rf_cell,
-        "reconstruction-fold and event-fold State_Machine_is_currently_in_Status \
-         cell facts must be byte-identical.\n  event-fold:     {:?}\n  reconstruction: {:?}",
-        ef_cell, rf_cell);
+    // ── Impossible/out-of-order history: shipped(100) BEFORE placed(200). The
+    // ordered fold applies shipped first (inapplicable from pending → no-op),
+    // then placed → `placed`. PINS the order-dependence: the retired event-fold
+    // returned `shipped` here regardless of order.
+    let reversed = {
+        let s = Object::phi();
+        let s = cell_push("Order_was_shipped",
+            fact_from_pairs(&[("Order", "o2"), ("Timestamp", "100")]), &s);
+        let s = cell_push("Order_was_placed",
+            fact_from_pairs(&[("Order", "o2"), ("Timestamp", "200")]), &s);
+        s
+    };
+    let (state2, _) = crate::evaluate::forward_chain_defs_state(&refs, &reversed);
+    let pairs2 = sm_status_pairs(&state2, "State_Machine_is_currently_in_Status");
+    assert!(pairs2.contains(&("o2".to_string(), "placed".to_string())),
+        "out-of-order shipped(100)→placed(200) folds to `placed` (premature \
+         shipped is a no-op from pending); got {:?}", pairs2);
+    assert!(!pairs2.iter().any(|(m, st)| m == "o2" && st == "shipped"),
+        "o2 must NOT be `shipped` when shipped precedes placed; got {:?}", pairs2);
 }
 
-// sm-retire-imperative-fold: with `compile_sm_init_for` retired from the live
-// path, the reconstruction fold must seed s0 (`initial`) ITSELF — i.e. run
-// ALONE (no separate `_sm_init_` derivation) and still:
-//   • seed every instance to `initial` round 1 (o1, never transitioned, ends
-//     `pending` PURELY from the folded-in seed — the from-guard blocks its lone
-//     `shipped` event), and
-//   • fold events to current status (o2: placed+shipped ⇒ `shipped`).
-// The result must stay byte-identical to the golden `[init + event-fold]` run,
-// proving the seed folded into the fold == the old standalone init derivation.
+// sm-fold-as-predicate / sm-retire-imperative-fold: the reconstruction fold runs
+// ALONE (no separate `_sm_init_` derivation) and must BOTH seed s0 for every
+// instance AND fold events to the current status, emitting the full 3-fact shape.
 #[test]
-fn sm_reconstruction_fold_seeds_s0_alone_byte_identical_to_init_plus_event_fold() {
+fn sm_reconstruction_fold_alone_seeds_s0_and_folds_events() {
     use crate::ast::{fact_from_pairs, cell_push};
 
     let sm = crate::compile::make_compiled_state_machine_for_test(
@@ -9441,56 +9410,211 @@ fn sm_reconstruction_fold_seeds_s0_alone_byte_identical_to_init_plus_event_fold(
         ],
     );
 
+    // o2: placed(100) → shipped(200) ⇒ shipped. o1: shipped only ⇒ seeded to
+    // `pending` (its lone shipped is a no-op from pending).
     let build_population = || {
         let s = Object::phi();
         let s = cell_push("Order_was_placed",
-            fact_from_pairs(&[("Order", "o2"), ("Timestamp", "200")]), &s);
-        let s = cell_push("Order_was_shipped",
             fact_from_pairs(&[("Order", "o2"), ("Timestamp", "100")]), &s);
+        let s = cell_push("Order_was_shipped",
+            fact_from_pairs(&[("Order", "o2"), ("Timestamp", "200")]), &s);
         let s = cell_push("Order_was_shipped",
             fact_from_pairs(&[("Order", "o1")]), &s);
         s
     };
 
-    // ── GOLDEN reference: the retired pair `[init + event-fold]` ─────────
-    let g_init = crate::compile::compile_sm_init_for_for_test(&sm);
-    let g_fold = crate::compile::compile_sm_event_fold_for_test(&sm);
-    let g_refs: Vec<(&str, &Func)> = vec![
-        (g_init.id.as_str(), &g_init.func),
-        (g_fold.id.as_str(), &g_fold.func),
-    ];
-    let (g_state, _) =
-        crate::evaluate::forward_chain_defs_state(&g_refs, &build_population());
-
-    // ── NEW live path: the reconstruction fold ALONE (seeds s0 itself) ──
     let rf_fold = crate::compile::compile_sm_reconstruction_fold_for_test(&sm);
     let rf_refs: Vec<(&str, &Func)> = vec![(rf_fold.id.as_str(), &rf_fold.func)];
     let (rf_state, _) =
         crate::evaluate::forward_chain_defs_state(&rf_refs, &build_population());
 
-    let g_pairs = sm_status_pairs(&g_state, "State_Machine_is_currently_in_Status");
     let rf_pairs = sm_status_pairs(&rf_state, "State_Machine_is_currently_in_Status");
-
     assert!(rf_pairs.contains(&("o2".to_string(), "shipped".to_string())),
-        "fold-alone: o2 (placed+shipped) must reach `shipped`; got {:?}", rf_pairs);
+        "fold-alone: o2 (placed→shipped) must fold to `shipped`; got {:?}", rf_pairs);
     assert!(rf_pairs.contains(&("o1".to_string(), "pending".to_string())),
-        "fold-alone: o1 must be seeded to `pending` by the folded-in s0 (its lone \
-         `shipped` is from-guard-blocked); got {:?}", rf_pairs);
+        "fold-alone: o1 must be seeded to `pending` by the folded-in s0; got {:?}",
+        rf_pairs);
 
-    assert_eq!(g_pairs, rf_pairs,
-        "reconstruction-fold ALONE must match the retired [init + event-fold] \
-         status set.\n  [init+event-fold]: {:?}\n  fold-alone:        {:?}",
-        g_pairs, rf_pairs);
+    // The fold emits the full 3-fact shape: o2 gets a for_Resource row too (so
+    // the Resource↔Status bridge can join). canonical_cell_facts gives an
+    // order-independent view of the cell.
+    let for_resource = canonical_cell_facts(&rf_state, "State_Machine_is_for_Resource");
+    assert!(for_resource.iter().any(|f| f.iter().any(|(r, v)| r == "Resource" && v == "o2")),
+        "fold-alone must emit State_Machine_is_for_Resource for o2; got {:?}",
+        for_resource);
+}
 
-    // Byte-identical across ALL three seeded fact types, not just the status.
-    for cell in ["State_Machine_is_currently_in_Status",
-                 "State_Machine_is_instance_of_Noun",
-                 "State_Machine_is_for_Resource"] {
-        let g_cell = canonical_cell_facts(&g_state, cell);
-        let rf_cell = canonical_cell_facts(&rf_state, cell);
-        assert_eq!(g_cell, rf_cell,
-            "fold-alone vs [init+event-fold]: `{}` cell facts must be byte-identical.\
-             \n  [init+event-fold]: {:?}\n  fold-alone:        {:?}",
-            cell, g_cell, rf_cell);
-    }
+// ───────────────────────────────────────────────────────────────────────────
+// sm-fold-as-predicate (reopened): the reconstruction fold must be a GENUINE
+// per-resource ordered left-fold `FoldL(sm.func) over order_τ(events) from s0`,
+// not the per-round from-guarded SET-application it currently is. The set-
+// application is correct ONLY for monotone (acyclic, non-competing) event
+// streams; it breaks on:
+//   • CYCLIC transitions (block↔unblock): each round the lone applicable
+//     transition flips the status, so the terminal value depends on fixpoint
+//     iteration parity, not on the event history. A task started→blocked→
+//     unblocked must end `in_progress` (its LAST event), but the set-app
+//     oscillates and (on the live tasks.db) settled on `blocked`.
+//   • COMPETING transitions (finish vs delete from the same `from`): both
+//     branches emit, and the "exactly one Status" upsert resolves the race
+//     nondeterministically. A task started→finished→deleted must end `deleted`
+//     (delete-from-completed), but the race left it `completed` on the live db.
+// Both fixtures give events REAL timestamps in causal order, so ONLY an
+// order-respecting fold reconstructs them correctly. These are RED against the
+// current fold and GREEN once it becomes the ordered FoldL.
+
+/// Transition Func `<current_status, trigger> -> next_status` for the full
+/// Task lifecycle SM (start/block/unblock/finish/delete-from-{pending,
+/// progress,completed}), mirroring `compile_state_machine_from_cells`:
+/// a Condition chain with `Selector(1)` (stay put) as the fallback, so an
+/// event inapplicable from the current status is a NO-OP, never a wipe.
+#[cfg(test)]
+fn task_lifecycle_sm_transition_func() -> Func {
+    let match_pred = |from: &str, event: &str| {
+        Func::compose(
+            Func::Eq,
+            Func::construction(vec![
+                Func::Id,
+                Func::constant(Object::seq(vec![
+                    Object::atom(from),
+                    Object::atom(event),
+                ])),
+            ]),
+        )
+    };
+    Func::condition(match_pred("pending", "Task_is_started"), Func::constant(Object::atom("in_progress")),
+    Func::condition(match_pred("in_progress", "Task_is_blocked"), Func::constant(Object::atom("blocked")),
+    Func::condition(match_pred("blocked", "Task_is_unblocked"), Func::constant(Object::atom("in_progress")),
+    Func::condition(match_pred("in_progress", "Task_is_finished"), Func::constant(Object::atom("completed")),
+    Func::condition(match_pred("pending", "Task_is_deleted"), Func::constant(Object::atom("deleted")),
+    Func::condition(match_pred("in_progress", "Task_is_deleted"), Func::constant(Object::atom("deleted")),
+    Func::condition(match_pred("completed", "Task_is_deleted"), Func::constant(Object::atom("deleted")),
+    Func::Selector(1))))))))
+}
+
+/// Build the full Task lifecycle CompiledStateMachine (shared by the Stage-0
+/// reproduction tests). Note `Task_is_deleted` is the trigger for THREE
+/// transitions (delete-from-pending/progress/completed).
+#[cfg(test)]
+fn task_lifecycle_sm() -> crate::compile::CompiledStateMachine {
+    crate::compile::make_compiled_state_machine_for_test(
+        "Task".to_string(),
+        ["pending", "in_progress", "blocked", "completed", "deleted"]
+            .iter().map(|s| s.to_string()).collect(),
+        "pending".to_string(),
+        task_lifecycle_sm_transition_func(),
+        [
+            ("pending", "in_progress", "Task_is_started"),
+            ("in_progress", "blocked", "Task_is_blocked"),
+            ("blocked", "in_progress", "Task_is_unblocked"),
+            ("in_progress", "completed", "Task_is_finished"),
+            ("pending", "deleted", "Task_is_deleted"),
+            ("in_progress", "deleted", "Task_is_deleted"),
+            ("completed", "deleted", "Task_is_deleted"),
+        ].iter().map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string())).collect(),
+    )
+}
+
+#[test]
+fn sm_reconstruction_fold_block_unblock_cycle_ends_in_progress() {
+    use crate::ast::{fact_from_pairs, cell_push};
+    let sm = task_lifecycle_sm();
+    // t1: started(ts=1) → blocked(ts=2) → unblocked(ts=3). Last event is
+    // `unblocked`, so the resource ends `in_progress`.
+    let build_pop = || {
+        let s = Object::phi();
+        let s = cell_push("Task_is_started",
+            fact_from_pairs(&[("Task", "t1"), ("Timestamp", "1")]), &s);
+        let s = cell_push("Task_is_blocked",
+            fact_from_pairs(&[("Task", "t1"), ("Timestamp", "2")]), &s);
+        let s = cell_push("Task_is_unblocked",
+            fact_from_pairs(&[("Task", "t1"), ("Timestamp", "3")]), &s);
+        s
+    };
+    let fold = crate::compile::compile_sm_reconstruction_fold_for_test(&sm);
+    let refs: Vec<(&str, &Func)> = vec![(fold.id.as_str(), &fold.func)];
+    let (state, _) = crate::evaluate::forward_chain_defs_state(&refs, &build_pop());
+    let pairs = sm_status_pairs(&state, "State_Machine_is_currently_in_Status");
+
+    assert!(pairs.contains(&("t1".to_string(), "in_progress".to_string())),
+        "started→blocked→unblocked must reconstruct to `in_progress` (the LAST \
+         event is unblock); got {:?}", pairs);
+    assert!(!pairs.iter().any(|(m, st)| m == "t1" && st == "blocked"),
+        "t1 must NOT remain `blocked` after a later unblock — the oscillation \
+         bug; got {:?}", pairs);
+}
+
+#[test]
+fn sm_reconstruction_fold_delete_from_completed_ends_deleted() {
+    use crate::ast::{fact_from_pairs, cell_push};
+    let sm = task_lifecycle_sm();
+    // t1: started(ts=1) → finished(ts=2) → deleted(ts=3). The delete fires from
+    // `completed` (delete-from-completed), so the resource ends `deleted`.
+    let build_pop = || {
+        let s = Object::phi();
+        let s = cell_push("Task_is_started",
+            fact_from_pairs(&[("Task", "t1"), ("Timestamp", "1")]), &s);
+        let s = cell_push("Task_is_finished",
+            fact_from_pairs(&[("Task", "t1"), ("Timestamp", "2")]), &s);
+        let s = cell_push("Task_is_deleted",
+            fact_from_pairs(&[("Task", "t1"), ("Timestamp", "3")]), &s);
+        s
+    };
+    let fold = crate::compile::compile_sm_reconstruction_fold_for_test(&sm);
+    let refs: Vec<(&str, &Func)> = vec![(fold.id.as_str(), &fold.func)];
+    let (state, _) = crate::evaluate::forward_chain_defs_state(&refs, &build_pop());
+    let pairs = sm_status_pairs(&state, "State_Machine_is_currently_in_Status");
+
+    assert!(pairs.contains(&("t1".to_string(), "deleted".to_string())),
+        "started→finished→deleted must reconstruct to `deleted` (delete-from-\
+         completed); got {:?}", pairs);
+    assert!(!pairs.iter().any(|(m, st)| m == "t1" && st == "completed"),
+        "t1 must NOT remain `completed` after a later delete — the competing-\
+         transition race; got {:?}", pairs);
+}
+
+#[test]
+fn sm_fold_step_folds_trigger_stream_from_s0() {
+    use crate::ast::apply;
+    // The per-resource fold step used by sm_ordered_fold_branch, built inline:
+    //   <<status, resource>, trigger> -> <sm.func:<status,trigger>, resource>.
+    // Pins the core fold algebra (accumulator threading + sm.func reuse) in
+    // isolation, so a full-fold failure localizes to grouping/ordering, not here.
+    let smfunc = task_lifecycle_sm_transition_func();
+    let acc = Func::Selector(1);
+    let status = Func::compose(Func::Selector(1), acc.clone());
+    let resource = Func::compose(Func::Selector(2), acc);
+    let trigger = Func::Selector(2);
+    let next_status = Func::compose(smfunc, Func::construction(vec![status, trigger]));
+    let step = Func::construction(vec![next_status, resource]);
+    let fold = Func::FoldL(Box::new(step));
+
+    let run = |events: &[&str]| -> String {
+        let seed = Object::seq(vec![Object::atom("pending"), Object::atom("t1")]);
+        let stream = Object::seq(events.iter().map(|e| Object::atom(*e)).collect());
+        let out = apply(&fold, &Object::seq(vec![seed, stream]), &Object::phi());
+        out.as_seq()
+            .and_then(|s| s.get(0))
+            .and_then(|o| o.as_atom())
+            .map(String::from)
+            .unwrap_or_else(|| format!("non-atom: {:?}", out))
+    };
+
+    assert_eq!(run(&[]), "pending", "empty stream folds to s0");
+    assert_eq!(run(&["Task_is_started"]), "in_progress");
+    assert_eq!(run(&["Task_is_started", "Task_is_blocked", "Task_is_unblocked"]), "in_progress",
+        "block then unblock ends in_progress (the LAST event wins)");
+    assert_eq!(run(&["Task_is_started", "Task_is_finished", "Task_is_deleted"]), "deleted",
+        "delete-from-completed");
+    assert_eq!(run(&["Task_is_started", "Task_is_deleted"]), "deleted",
+        "delete-from-progress");
+    assert_eq!(run(&["Task_is_finished"]), "pending",
+        "finish is inapplicable from pending -> no-op (sm.func Selector(1) fallback)");
+
+    // resource is threaded unchanged through the fold (position 2 of the pair).
+    let seed = Object::seq(vec![Object::atom("pending"), Object::atom("t1")]);
+    let stream = Object::seq(vec![Object::atom("Task_is_started")]);
+    let out = apply(&fold, &Object::seq(vec![seed, stream]), &Object::phi());
+    let res = out.as_seq().and_then(|s| s.get(1)).and_then(|o| o.as_atom()).map(String::from);
+    assert_eq!(res, Some("t1".to_string()), "resource threaded through the fold");
 }
