@@ -2549,11 +2549,26 @@ fn sm_fact_triggers(d: &ast::Object) -> Vec<(String, String, String)> {
         .unwrap_or_default()
 }
 
+#[allow(unreachable_code)]
 fn reconcile_derived_transitions(
     d: &ast::Object,
     state: &ast::Object,
     touched_nouns: &hashbrown::HashSet<String>,
 ) -> (ast::Object, Vec<(String, String)>) {
+    // sm-fold-as-predicate (2026-06-08): DISABLED — no-op. With the ordered
+    // reconstruction fold (compile_sm_reconstruction_fold) as the canonical
+    // status source, this mechanism is obsolete AND harmful. It re-fires a
+    // transition for any entity whose trigger cell carries the event, but the
+    // fold already reconstructs status from ALL events — so re-firing a PERSISTED
+    // block event (one a later unblock superseded) wrongly re-blocks an
+    // in_progress task and writes a spurious event. Its only legitimate input was
+    // a DERIVATION populating a trigger cell (the marker/event collision) — the
+    // very anti-pattern the new collision guard flags and cell-separation removes.
+    // Auto-transitions must be EXPLICIT (the agent fires them), not derived
+    // re-fires. The body below is retained (unreachable) for the blocked-proto
+    // auto-block redesign — see task `blocked-proto-marker-collision`.
+    return (state.clone(), Vec::new());
+
     // Restrict to triggers whose owning SM noun is in `touched_nouns`
     // (the gate: a trigger cell can only have changed for a noun the
     // command touched). When the caller can't name the SM noun (the batch
@@ -10337,16 +10352,19 @@ Transition 'place' is defined in State Machine Definition 'Order'.
     /// subscripts; proven end-to-end by
     /// `compile_explicit_derivation_tests::\
     ///  blocked_proto_full_context_blocked_cell_materializes_correct_jobs`.
-    /// We assert the trigger Fact Types directly here only to ISOLATE the
-    /// reconciliation step under test and to keep `extract_sm_status` honest:
-    /// driving the SM-status cell through real command threading fragments the
-    /// keyed Map across `merge_delta` in this harness, an ORTHOGONAL keyed-cell
-    /// interaction. The reconcile only has to fire the right transition off
-    /// whatever the trigger cell says.) Asserting `Job_is_blocked` exercises
-    /// the `assert_fact_via_defs` reconcile call site end-to-end; the idle +
-    /// unblock checks drive `reconcile_derived_transitions` directly.
+    /// sm-fold-as-predicate (2026-06-08): reconcile_derived_transitions is now
+    /// DISABLED (a no-op). The ordered reconstruction fold is the canonical
+    /// status source, so derived re-firing of SM transitions is obsolete — and
+    /// harmful: it re-blocks a task whose block a later unblock already
+    /// superseded (the live-board corruption this disables). This test, formerly
+    /// `blocked_proto_reconciles_block_then_unblock_bounded` (which asserted the
+    /// reconcile FIRING block/unblock), now pins the no-op: a live trigger does
+    /// NOT auto-fire. The setup still builds the blocked-proto Job SM so the
+    /// machine func + cell shapes are exercised. blocked-proto's auto-block
+    /// redesign (auto-transition via explicit events, not derived re-fire) is
+    /// tracked as task `blocked-proto-marker-collision`.
     #[test]
-    fn blocked_proto_reconciles_block_then_unblock_bounded() {
+    fn reconcile_derived_transitions_disabled_is_noop() {
         const JOB_READINGS: &str = r#"
 # Blocked Proto (ported)
 
@@ -10500,68 +10518,31 @@ Job Status enumerates 'pending', 'in_progress', 'blocked', 'completed', 'deleted
         assert_eq!(mfn("blocked", "Job is blocked").as_deref(), Some("blocked"),
             "block must be illegal (no-op) from 'blocked' (self-loop / no edge)");
 
-        // ── STEP 1 ────────────────────────────────────────────────────────
-        // A started (in_progress), B pending, B blocks A → A's `Job is
-        // blocked` trigger is live. Assert it through the real command path
-        // (assert_fact_via_defs), whose TAIL reconcile must fire `block`
-        // (in_progress→blocked) → A.status == 'blocked'. The CommandResult's
-        // `status` carries the post-transition status the reconcile produced.
+        // ── reconcile is DISABLED (sm-fold-as-predicate, 2026-06-08) ───────
+        // The ordered reconstruction fold is the canonical status source, so
+        // reconcile_derived_transitions is now a NO-OP. A LIVE `Job is blocked`
+        // trigger for an in_progress A must NOT auto-fire `block`: the reconcile
+        // returns the state unchanged and fires nothing. (Auto-block is now an
+        // explicit transition / a query hint, never a derived re-fire — a re-fire
+        // re-blocks a task whose block a later unblock already superseded, which
+        // is the live-board corruption this disables. blocked-proto's auto-block
+        // redesign is tracked as task `blocked-proto-marker-collision`.)
         let s1 = mk_state(&[("A", "in_progress"), ("B", "pending")], &["A"], &[]);
-        let res1 = apply_command_defs(&d, &Command::AssertFact {
-            fact_type: "Job_is_blocked".to_string(),
-            pairs: vec![RolePair { role: "Job".to_string(), value: "A".to_string() }],
-            sender: None, signature: None,
-        }, &s1);
-        assert!(!res1.rejected, "STEP 1 assert rejected: {:?}", res1.violations);
-        let s1_after = ast::merge_delta(&s1, &res1.state, None);
-        assert_eq!(extract_sm_status(&s1_after, "A").as_deref(), Some("blocked"),
-            "STEP 1: asserting `Job is blocked` must drive A to 'blocked' via \
-             the assert-tail reconcile\n{}", dump(&s1_after, "step1"));
-        assert!(last_reconcile_passes() >= 1 && last_reconcile_passes() <= 3,
-            "STEP 1: reconcile must converge in ≤3 passes; got {}",
-            last_reconcile_passes());
+        let (s1_after, fired) = reconcile_derived_transitions(&d, &s1, &touched_job);
+        assert!(fired.is_empty(),
+            "disabled reconcile must fire NOTHING even with a live `Job is blocked` \
+             trigger; fired={:?}\n{}", fired, dump(&s1_after, "noop"));
+        assert_eq!(extract_sm_status(&s1_after, "A").as_deref(), Some("in_progress"),
+            "disabled reconcile must leave A in_progress, not auto-block it");
 
-        // ── STEP 2 ────────────────────────────────────────────────────────
-        // A blocked, B still open → `Job is blocked` live, `Job is unblocked`
-        // NOT live. reconcile must fire NOTHING and settle in a single idle
-        // pass: `block` is illegal from `blocked`, `unblock` has no trigger.
-        // This is the no-loop property — the whole point of the bound.
-        let s2 = mk_state(&[("A", "blocked"), ("B", "pending")], &["A"], &[]);
-        let (s2_after, fired2) = reconcile_derived_transitions(&d, &s2, &touched_job);
-        assert!(fired2.is_empty(),
-            "STEP 2: reconcile must fire nothing while A blocked & B open \
-             (no block⇄unblock loop); fired={:?}\n{}", fired2, dump(&s2, "step2"));
-        assert_eq!(last_reconcile_passes(), 1,
-            "STEP 2: an idle reconcile is exactly one (no-op) pass; got {}",
-            last_reconcile_passes());
-        assert_eq!(extract_sm_status(&s2_after, "A").as_deref(), Some("blocked"),
-            "STEP 2: A must STAY 'blocked' (block illegal from blocked — no loop)");
-
-        // ── STEP 3 ────────────────────────────────────────────────────────
-        // B completes → A's `Job is unblocked` trigger is live (and the now-
-        // false `Job is blocked` is cleared). reconcile must fire `unblock`
-        // (blocked→in_progress) → A.status == 'in_progress', then self-
-        // extinguish (unblock's guard 'own status == blocked' is now false).
+        // A blocked entity with a live `Job is unblocked` trigger likewise does
+        // NOT auto-unblock — status is fold-driven, not reconcile-driven.
         let s3 = mk_state(&[("A", "blocked"), ("B", "completed")], &[], &["A"]);
         let (s3_after, fired3) = reconcile_derived_transitions(&d, &s3, &touched_job);
-        assert_eq!(extract_sm_status(&s3_after, "A").as_deref(), Some("in_progress"),
-            "STEP 3: with `Job is unblocked` live, reconcile must drive A to \
-             'in_progress' (unblock fired, self-extinguished); fired={:?}\n{}",
-            fired3, dump(&s3_after, "step3"));
-        assert_eq!(fired3.len(), 1,
-            "STEP 3: exactly one transition (unblock on A) must fire; got {:?}", fired3);
-        assert!(last_reconcile_passes() >= 1 && last_reconcile_passes() <= 3,
-            "STEP 3: unblock reconcile must converge in ≤3 passes; got {}",
-            last_reconcile_passes());
-
-        // STEP 3b: re-running reconcile on the post-unblock state fires
-        // nothing — the fixpoint is stable (unblock self-extinguished, no
-        // block trigger live). Proves termination + idempotence.
-        let (s3b, fired3b) = reconcile_derived_transitions(&d, &s3_after, &touched_job);
-        assert!(fired3b.is_empty(),
-            "STEP 3b: post-unblock reconcile must be idle; fired={:?}", fired3b);
-        assert_eq!(extract_sm_status(&s3b, "A").as_deref(), Some("in_progress"),
-            "STEP 3b: A must remain 'in_progress' at the fixpoint");
+        assert!(fired3.is_empty(),
+            "disabled reconcile must not auto-unblock; fired={:?}", fired3);
+        assert_eq!(extract_sm_status(&s3_after, "A").as_deref(), Some("blocked"),
+            "disabled reconcile must leave A blocked (no auto-unblock cascade)");
     }
 
     // sm-fold-as-predicate (occurred-at): the resolve-time clock must be
