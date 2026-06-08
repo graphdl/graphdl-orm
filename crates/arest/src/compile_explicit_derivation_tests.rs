@@ -9573,6 +9573,47 @@ fn sm_reconstruction_fold_delete_from_completed_ends_deleted() {
          transition race; got {:?}", pairs);
 }
 
+// REGRESSION (reconcile-vs-fold session, 2026-06-08): the LIVE tasks.db board
+// collapsed to 896 `pending` / 26 `deleted` after a real re-derive — 843 tasks
+// with started+finished events stuck at `pending`, 18 started-only stuck at
+// `pending`, yet all 26 deleted-bearing tasks correctly reached `deleted`.
+// The discriminator was NOT timestamps (both started and deleted events are
+// un-stamped historical facts) — it was the TRIGGER. Every fold test above
+// STAMPS its applicable events; the only un-stamped event tested (o1's lone
+// `shipped`) is INAPPLICABLE from pending (a no-op), so the "applicable +
+// un-stamped" path was never asserted. This fixture mirrors the live shape
+// exactly: `<<Task, id>>` with no Timestamp role.
+#[test]
+fn sm_reconstruction_fold_unstamped_applicable_events_fold_forward() {
+    use crate::ast::{fact_from_pairs, cell_push};
+    let sm = task_lifecycle_sm();
+    let build_pop = || {
+        let s = Object::phi();
+        // t_started: un-stamped started only ⇒ MUST be in_progress.
+        let s = cell_push("Task_is_started", fact_from_pairs(&[("Task", "t_started")]), &s);
+        // t_done: un-stamped started + finished ⇒ MUST be completed.
+        let s = cell_push("Task_is_started", fact_from_pairs(&[("Task", "t_done")]), &s);
+        let s = cell_push("Task_is_finished", fact_from_pairs(&[("Task", "t_done")]), &s);
+        // t_deleted: un-stamped deleted only ⇒ deleted. CONTROL — this folds on
+        // the live board, so it must stay green; the bug is started/finished.
+        let s = cell_push("Task_is_deleted", fact_from_pairs(&[("Task", "t_deleted")]), &s);
+        s
+    };
+    let fold = crate::compile::compile_sm_reconstruction_fold_for_test(&sm);
+    let refs: Vec<(&str, &Func)> = vec![(fold.id.as_str(), &fold.func)];
+    let (state, _) = crate::evaluate::forward_chain_defs_state(&refs, &build_pop());
+    let pairs = sm_status_pairs(&state, "State_Machine_is_currently_in_Status");
+
+    assert!(pairs.contains(&("t_deleted".to_string(), "deleted".to_string())),
+        "control: un-stamped deleted folds (matches live board); got {:?}", pairs);
+    assert!(pairs.contains(&("t_started".to_string(), "in_progress".to_string())),
+        "un-stamped APPLICABLE started must fold pending→in_progress (live board \
+         left 18 such tasks wrongly `pending`); got {:?}", pairs);
+    assert!(pairs.contains(&("t_done".to_string(), "completed".to_string())),
+        "un-stamped started+finished must fold to `completed` (live board left \
+         843 such tasks wrongly `pending`); got {:?}", pairs);
+}
+
 #[test]
 fn sm_fold_step_folds_trigger_stream_from_s0() {
     use crate::ast::apply;

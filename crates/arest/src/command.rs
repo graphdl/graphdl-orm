@@ -1719,6 +1719,14 @@ fn create_via_defs(
             .filter(|s| !s.is_empty())
             .collect())
         .unwrap_or_default();
+    // sm-trigger-cell guard (reconcile-vs-fold, 2026-06-08): drop SM trigger cells
+    // back OUT of dropped_cells — they hold real transition events and must never
+    // be wiped (see sm_trigger_cell_set). All downstream uses (snapshot, wipe,
+    // drop_writer_reads, restore) consume this filtered set.
+    let dropped_cells: hashbrown::HashSet<String> = {
+        let sm_triggers = sm_trigger_cell_set(d);
+        dropped_cells.into_iter().filter(|c| !sm_triggers.contains(c.as_str())).collect()
+    };
     // Bridge-clobber guard (mirror of update_via_defs's fix from
     // b4cfcb6f): snapshot the pre-drop value of every cell about to
     // clear, plus the rule_id -> consequent_cell map. After the chain
@@ -2549,6 +2557,24 @@ fn sm_fact_triggers(d: &ast::Object) -> Vec<(String, String, String)> {
         .unwrap_or_default()
 }
 
+/// The set of SM trigger cell names (`sm_fact_triggers`' cell field) — cells the
+/// #836 drop-derived-consequents step must NEVER wipe.
+///
+/// An SM trigger cell (e.g. `Task_is_started`) holds the REAL transition events
+/// the reconstruction fold reconstructs status from. A migration/invariant
+/// DerivationRule may ALSO produce facts for it (e.g. `Task is started iff Task
+/// is finished`), which makes the cell a DerivationRule consequent — but it is
+/// NOT a pure derived cell. Clearing it on an unrelated apply loses the real
+/// events (the backfill only re-mints the subset implied by surviving events),
+/// so the fold reads an emptied event stream and collapses status to the initial
+/// (the live tasks all-`pending` board bug). Excluding these cells from the drop
+/// keeps the events; the backfill rules still ADD (idempotently) when their own
+/// antecedents change. See
+/// command::tests::apply_update_does_not_wipe_sm_trigger_cell_collapsing_status.
+fn sm_trigger_cell_set(d: &ast::Object) -> hashbrown::HashSet<String> {
+    sm_fact_triggers(d).into_iter().map(|(_, _, cell)| cell).collect()
+}
+
 #[allow(unreachable_code)]
 fn reconcile_derived_transitions(
     d: &ast::Object,
@@ -3057,6 +3083,14 @@ fn transition_via_defs(
                 .filter(|s| !s.is_empty())
                 .collect())
             .unwrap_or_default();
+        // sm-trigger-cell guard (reconcile-vs-fold, 2026-06-08): drop SM trigger
+        // cells back OUT of dropped_cells — they hold real transition events and
+        // must never be wiped (see sm_trigger_cell_set). All downstream uses
+        // (snapshot, wipe, drop_writer_reads, restore) consume this filtered set.
+        let dropped_cells: hashbrown::HashSet<String> = {
+            let sm_triggers = sm_trigger_cell_set(d);
+            dropped_cells.into_iter().filter(|c| !sm_triggers.contains(c.as_str())).collect()
+        };
         // Bridge-clobber guard (parity with update_via_defs L3432+):
         // snapshot the pre-drop value of every cell about to clear, plus
         // the rule_id -> consequent_cell map. After the chain runs,
@@ -3722,6 +3756,14 @@ fn update_via_defs(
             .filter(|s| !s.is_empty())
             .collect())
         .unwrap_or_default();
+    // sm-trigger-cell guard (reconcile-vs-fold, 2026-06-08): drop SM trigger cells
+    // back OUT of dropped_cells — they hold real transition events and must never
+    // be wiped (see sm_trigger_cell_set). All downstream uses (snapshot, wipe,
+    // drop_writer_reads, restore) consume this filtered set.
+    let dropped_cells: hashbrown::HashSet<String> = {
+        let sm_triggers = sm_trigger_cell_set(d);
+        dropped_cells.into_iter().filter(|c| !sm_triggers.contains(c.as_str())).collect()
+    };
     // Bridge-clobber guard (this session): snapshot the pre-drop value
     // of every cell we're about to clear, plus the rule_id ->
     // consequent_cell map. After the chain runs, cells whose producing
@@ -8327,6 +8369,152 @@ Transition 'block' is defined in State Machine Definition 'Task'.
         assert_eq!(bridge_status(&after_block, "t-1").as_deref(), Some("blocked"),
             "BRIDGE-LAG: blocking a Task must make Task_has_Task_Status read \
              'blocked'; a stale 'in_progress' here is the reported bug.");
+    }
+
+    /// REPRO (reconcile-vs-fold session, 2026-06-08): an `apply update` of a
+    /// BENIGN field on a Task collapses every started/finished Task's SM status to
+    /// `pending` on the live tasks board. ROOT CAUSE: the migration backfill rule
+    /// `Task is started iff Task is finished` (and ...blocked/...unblocked) makes
+    /// `Task_is_started` — an SM TRIGGER cell holding REAL transition events — a
+    /// DerivationRule CONSEQUENT. The #836 drop-derived-consequents step then WIPES
+    /// `Task_is_started` before the gated re-derive, so the SM reconstruction fold
+    /// reads an EMPTY event cell and folds the task to `pending` (a lone `finished`
+    /// is a no-op from `pending`). `deleted` survives because `Task_is_deleted` is
+    /// not a derived consequent — matching the live cross-tab exactly.
+    ///
+    /// A started-ONLY (in_progress) task is the unambiguous probe: with no
+    /// finish/block/unblock event the backfill can NEVER re-mint its wiped
+    /// `started`, so the wipe is pure loss regardless of fixpoint-round gating.
+    ///
+    /// FIX: the drop step (create_via_defs / update_via_defs / transition_via_defs)
+    /// EXCLUDES SM trigger cells (`sm_fact_triggers`) from `dropped_cells` — an SM
+    /// event cell is transition-written, never a wipe-and-rederive derived cell.
+    #[test]
+    fn apply_update_does_not_wipe_sm_trigger_cell_collapsing_status() {
+        const TASK_SM_BACKFILL_READINGS: &str = r#"
+# Tasks (SM trigger cell is also a derivation consequent — the live tasks bug)
+
+## Entity Types
+
+Task(.id) is an entity type.
+Resource(.id) is an entity type.
+State Machine(.id) is an entity type.
+
+## Value Types
+
+Status is a value type.
+Task Status is a value type.
+
+## Fact Types
+
+State Machine is for Resource.
+State Machine is currently in Status.
+Resource is currently in Status.
+  Each Resource is currently in at most one Status.
+Task has Task Status.
+  Each Task has at most one Task Status.
+Task has Task Priority.
+Task is started.
+Task is finished.
+Task is deleted.
+
+## Derivation Rules
+
+* Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.
+* Task has Task Status iff that Resource is currently in some Status and Task Status is Status and Task is Resource.
+* Task is started iff Task is finished.
+
+## Instance Facts
+
+State Machine Definition 'Task' is for Noun 'Task'.
+Status 'pending' is initial in State Machine Definition 'Task'.
+
+Transition 'start' is defined in State Machine Definition 'Task'.
+  Transition 'start' is from Status 'pending'.
+  Transition 'start' is to Status 'in_progress'.
+  Transition 'start' is triggered by Event Type 'Task is started'.
+
+Transition 'finish' is defined in State Machine Definition 'Task'.
+  Transition 'finish' is from Status 'in_progress'.
+  Transition 'finish' is to Status 'completed'.
+  Transition 'finish' is triggered by Event Type 'Task is finished'.
+
+Transition 'delete-from-pending' is defined in State Machine Definition 'Task'.
+  Transition 'delete-from-pending' is from Status 'pending'.
+  Transition 'delete-from-pending' is to Status 'deleted'.
+  Transition 'delete-from-pending' is triggered by Event Type 'Task is deleted'.
+"#;
+        let meta = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let tasks = crate::parse_forml2::parse_to_state_with_nouns(TASK_SM_BACKFILL_READINGS, &meta).unwrap();
+        let state = ast::merge_states(&meta, &tasks);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let def_obj = ast::defs_to_state(&defs, &state);
+
+        let sm_status = |st: &ast::Object, task: &str| -> Option<String> {
+            ast::fetch_cell_seq("State_Machine_is_currently_in_Status", st).as_seq()
+                .and_then(|fs| fs.iter()
+                    .find(|f| ast::binding(f, "State Machine") == Some(task))
+                    .and_then(|f| ast::binding(f, "Status").map(String::from)))
+        };
+        let started_has = |st: &ast::Object, task: &str| -> bool {
+            ast::fetch_cell_seq("Task_is_started", st).as_seq()
+                .map(|fs| fs.iter().any(|f| ast::binding(f, "Task") == Some(task)))
+                .unwrap_or(false)
+        };
+
+        // Seed the live cell shape directly (a Transition in this harness does
+        // not write a durable trigger fact; the live app's Fact-Type-triggered SM
+        // does). Two probes:
+        //   t-prog: started-ONLY (in_progress) — no finish/block/unblock, so the
+        //     backfill can NEVER re-mint its `started`; the wipe is pure loss
+        //     (the deterministic discriminator, immune to fixpoint-round gating).
+        //   t-done: started+finished (completed) — the visible status collapse:
+        //     after the wipe its sole surviving event is `finished`, a no-op from
+        //     `pending`, so the fold reconstructs `pending`.
+        let seed = |st: ast::Object, cell: &str, pairs: &[(&str, &str)]| -> ast::Object {
+            ast::cell_push(cell, ast::fact_from_pairs(pairs), &st)
+        };
+        let base = state;
+        let base = seed(base, "Task_is_started", &[("Task", "t-prog")]);
+        let base = seed(base, "State_Machine_is_currently_in_Status",
+            &[("State Machine", "t-prog"), ("Status", "in_progress")]);
+        let base = seed(base, "Task_has_Task_Priority", &[("Task", "t-prog"), ("Task Priority", "p2")]);
+        let base = seed(base, "Task_is_started", &[("Task", "t-done")]);
+        let base = seed(base, "Task_is_finished", &[("Task", "t-done")]);
+        let base = seed(base, "State_Machine_is_currently_in_Status",
+            &[("State Machine", "t-done"), ("Status", "completed")]);
+        let base = seed(base, "Task_has_Task_Priority", &[("Task", "t-done"), ("Task Priority", "p2")]);
+
+        assert!(started_has(&base, "t-prog"), "sanity: t-prog seeded started event");
+        assert_eq!(sm_status(&base, "t-prog").as_deref(), Some("in_progress"), "sanity: t-prog in_progress");
+        assert_eq!(sm_status(&base, "t-done").as_deref(), Some("completed"), "sanity: t-done completed");
+
+        // The bug trigger: an UPDATE of a benign field on t-prog. The #836 drop
+        // wipes Task_is_started (a backfill consequent) noun-wide.
+        let mut upd = HashMap::new();
+        upd.insert("Task Priority".to_string(), "p1".to_string());
+        let updated = apply_command_defs(&def_obj, &Command::UpdateEntity {
+            noun: "Task".to_string(), domain: "tasks".to_string(),
+            entity_id: "t-prog".to_string(), fields: upd,
+            sender: None, signature: None, force: false,
+        }, &base);
+        assert!(!updated.rejected, "update rejected: {:?}", updated.violations);
+        let after = ast::merge_delta(&base, &updated.state, None);
+
+        // DETERMINISTIC: t-prog's real started event must survive an unrelated
+        // update — Task_is_started is an SM trigger cell, never a wipe-and-rederive
+        // derived cell.
+        assert!(started_has(&after, "t-prog"),
+            "REGRESSION: an unrelated Task update WIPED the SM trigger cell \
+             Task_is_started — it holds real transition events and must never be \
+             cleared by the #836 drop-derived-consequents step");
+        assert_eq!(sm_status(&after, "t-prog").as_deref(), Some("in_progress"),
+            "t-prog must remain in_progress after an unrelated update");
+        // SYMPTOM: the completed task must NOT collapse to pending.
+        assert_eq!(sm_status(&after, "t-done").as_deref(), Some("completed"),
+            "REGRESSION: t-done collapsed off completed after an unrelated update — \
+             the SM fold read a wiped Task_is_started cell (the live all-pending \
+             board collapse)");
     }
 
     /// REPRO (update-partial-folded-retraction): the SAME defect bdaae85a fixed
