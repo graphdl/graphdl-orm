@@ -4628,13 +4628,18 @@ fn compile_derivations(data: &CellIndex, state_machines: &[CompiledStateMachine]
     // event-fact occurrence. SM init's `is_new` guard filters out
     // resources event-fold has already initialized, so we don't
     // double-emit 'initial' alongside the event-derived status.
-    let sm_event_fold_derivations: Vec<_> = state_machines.iter().map(|sm| {
-        diag!("  [profile] compiling SM event-fold for noun={} ({} transitions)",
+    // sm-retire-imperative-fold: the live current-status fold is now
+    // `compile_sm_reconstruction_fold` (a from-guarded fixpoint reusing `sm.func`
+    // + `OrderBy` on occurred-at), proven byte-identical to the now-retired
+    // `compile_sm_event_fold` by the parity test. The event-fold remains only as
+    // that test's reference (test-only; see its dead_code attr).
+    let sm_fold_derivations: Vec<_> = state_machines.iter().map(|sm| {
+        diag!("  [profile] compiling SM reconstruction-fold for noun={} ({} transitions)",
             sm.noun_name, sm.transition_table.len());
-        compile_sm_event_fold(sm)
+        compile_sm_reconstruction_fold(sm)
     }).collect();
-    diag!("  [profile] {} SM event-fold derivations", sm_event_fold_derivations.len());
-    derivations.extend(sm_event_fold_derivations);
+    diag!("  [profile] {} SM reconstruction-fold derivations", sm_fold_derivations.len());
+    derivations.extend(sm_fold_derivations);
 
     // task-922-sm-init-projection: for_Resource backfill derivations.
     //
@@ -7852,6 +7857,10 @@ fn compile_sm_init_for(sm: &CompiledStateMachine) -> CompiledDerivation {
 /// SM init's `is_new` guard filters out resources already in
 /// State_Machine_is_for_Resource — so init won't double-emit
 /// 'initial' for resources event-fold has already covered.
+// sm-retire-imperative-fold: RETIRED from the live path (compile() now registers
+// compile_sm_reconstruction_fold). Kept ONLY as the parity-test reference, hence
+// test-only in non-test builds.
+#[cfg_attr(not(test), allow(dead_code))]
 fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
     let sm_noun = sm.noun_name.clone();
     let id_str = format!("_sm_event_fold_{}", sm_noun);
@@ -8112,13 +8121,17 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
 /// so the two folds' `State_Machine_is_currently_in_Status` sets compare
 /// equal byte-for-byte.
 ///
-/// Added alongside `compile_sm_event_fold` for the parity TDD; it is NOT
-/// wired into `compile()` (the event-fold remains the registered fold),
-/// so outside `cfg(test)` it is intentionally dead.
-#[cfg_attr(not(test), allow(dead_code))]
+/// sm-retire-imperative-fold: this is now THE registered SM current-status fold
+/// in `compile()` (it replaced `compile_sm_event_fold`, proven byte-identical by
+/// the parity test `sm_reconstruction_fold_matches_event_fold_byte_identical`).
 fn compile_sm_reconstruction_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
     let sm_noun = sm.noun_name.clone();
-    let id_str = format!("_sm_reconstruction_fold_{}", sm_noun);
+    // Drop-in id: registered under `_sm_event_fold_<noun>` — the id the rest of the
+    // engine keys on (upsert-safety seeding in compute_upsert_safe_cells, the
+    // positive-reads sidecar at compile() ~4455, and the load/rebuild stratum
+    // collection in cli/entry.rs + rebuild.rs). Reusing it makes this fold a
+    // transparent replacement for the retired event-fold; the reads are identical.
+    let id_str = format!("_sm_event_fold_{}", sm_noun);
     let text_str = format!("SM reconstruction-fold for {}", sm_noun);
 
     // Empty def for compile-time evaluation of sm.func: the transition
