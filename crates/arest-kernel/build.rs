@@ -866,19 +866,23 @@ fn build_musl_libc(
         .flag_if_supported("-fno-builtin")
         .define("_XOPEN_SOURCE", Some("700"));
 
-    // Cross-target flag for the Windows host case. Linux/macOS hosts
-    // building for x86_64-pc-linux-gnu (the default cc target) end
-    // up emitting Linux ABI directly, which is what musl wants.
+    // Cross-target flag for the Windows host case. musl is a Linux
+    // LP64 libc: its generated `bits/alltypes.h` defines `size_t` via
+    // `_Addr` (= `long`, 64-bit on Linux). Building it for
+    // `x86_64-pc-windows-msvc` (LLP64, `long` = 32-bit) makes that
+    // `size_t` collide with clang's 64-bit `__SIZE_TYPE__`
+    // (`unsigned long long`) — the "typedef redefinition with different
+    // types ('unsigned long' vs 'unsigned long long')" error. So target
+    // the SAME `x86_64-unknown-linux-musl` ABI the busybox guest pass
+    // uses: clang emits Linux-ELF objects under the LP64 model musl
+    // expects, and the resulting libc.a is link-compatible with the
+    // static ELF guests (#525+ busybox / ash) that consume it. The
+    // archive is NOT linked into the kernel `.efi` (per Cargo.toml's
+    // musl-libc feature note) — it is the libc the Linux-ELF guests
+    // link. (Linux/macOS hosts already default to an LP64 linux-gnu
+    // target, so only the Windows host needs this override.)
     if cfg!(target_os = "windows") {
-        // UEFI target uses Microsoft x64 ABI; clang emits PE32+
-        // objects compatible with the .efi link. The musl-internal
-        // syscall asm still uses the SysV `syscall` instruction —
-        // that's fine because the `syscall` opcode is identical
-        // regardless of which ABI's calling-convention sets up its
-        // arguments; what matters at runtime is that the AREST
-        // syscall handler picks them out of RAX/RDI/RSI/RDX/R10/R8/R9
-        // exactly the way musl placed them.
-        build.flag_if_supported("--target=x86_64-pc-windows-msvc");
+        build.flag_if_supported("--target=x86_64-unknown-linux-musl");
     }
 
     // Suppress noise that would otherwise drown the build log. Musl
