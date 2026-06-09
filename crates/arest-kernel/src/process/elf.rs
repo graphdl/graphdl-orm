@@ -611,7 +611,22 @@ pub fn load_segments_at_base(
         .checked_add(load_bias)
         .ok_or(LoaderError::SegmentMathOverflow)?;
     let mut address_space = AddressSpace::new(biased_entry);
+    push_load_segments(&mut address_space, parsed, bytes, load_bias)?;
+    Ok(address_space)
+}
 
+/// Push every PT_LOAD segment of `parsed` into `address_space` at
+/// `vaddr + load_bias`, slicing payloads from `bytes`. The shared loop
+/// behind `load_segments_at_base` (one image) and `load_dynamic` (a
+/// program + its interpreter in one space). Overlap with an already-
+/// pushed segment is rejected by `push_segment`, so loading the
+/// interpreter into the program's space catches a base that collides.
+fn push_load_segments(
+    address_space: &mut AddressSpace,
+    parsed: &ParsedElf,
+    bytes: &[u8],
+    load_bias: u64,
+) -> Result<(), LoadOrParseError> {
     for ph in parsed.load_segments() {
         // Derive the permission shape. W^X violations and bare PF_X
         // are rejected before we allocate — no point carving pages
@@ -660,8 +675,91 @@ pub fn load_segments_at_base(
             .ok_or(LoaderError::SegmentMathOverflow)?;
         address_space.push_segment(biased_vaddr, mem_size, perm, file_content)?;
     }
+    Ok(())
+}
 
-    Ok(address_space)
+/// Alignment for the interpreter load base — 2 MiB, the conventional
+/// ELF load-base / hugepage boundary. Keeps `AT_BASE` on the same grid
+/// real loaders use.
+const INTERP_BASE_ALIGN: u64 = 0x20_0000;
+
+/// Choose a load base for the program interpreter (ld-musl) that cannot
+/// overlap the program's own segments: the program's highest loaded
+/// address rounded up to a 2 MiB boundary, plus a 2 MiB gap. Pure and
+/// deterministic — tier-1 has no ASLR, so the same program always
+/// places its interpreter at the same base (a future #552/ASLR pass
+/// randomizes this within the high half). Returns a 2 MiB-aligned base
+/// strictly above every program PT_LOAD.
+pub fn pick_interp_base(program: &ParsedElf) -> u64 {
+    // Highest byte any program PT_LOAD occupies (exclusive end). 0 when
+    // the program has no loadable segments (degenerate — the gap below
+    // still yields a valid non-zero base).
+    let highest_end = program
+        .load_segments()
+        .map(|ph| ph.vaddr.saturating_add(ph.memsz))
+        .max()
+        .unwrap_or(0);
+    // Round that end up to the 2 MiB grid, then add one more 2 MiB unit
+    // of gap so the interpreter's first page can never touch the
+    // program's last page.
+    let rounded = highest_end
+        .saturating_add(INTERP_BASE_ALIGN - 1)
+        & !(INTERP_BASE_ALIGN - 1);
+    rounded.saturating_add(INTERP_BASE_ALIGN)
+}
+
+/// The result of loading a dynamically-linked program together with its
+/// interpreter — the #522 dynamic-linker image. The kernel begins
+/// execution at `address_space.entry_point` (the interpreter's biased
+/// entry); the interpreter relocates itself relative to `interp_base`,
+/// maps the program's shared objects, and finally transfers to the
+/// program's own entry (published to userspace via auxv `AT_ENTRY` =
+/// `program_entry`, with `AT_BASE` = `interp_base`).
+pub struct DynamicImage {
+    /// Program + interpreter PT_LOADs in one space; `entry_point` is the
+    /// interpreter's biased entry (where the kernel starts).
+    pub address_space: AddressSpace,
+    /// auxv `AT_BASE` — the interpreter's load base.
+    pub interp_base: u64,
+    /// auxv `AT_ENTRY` — the program's own entry. The program loads at
+    /// bias 0, so this is `program.entry` verbatim.
+    pub program_entry: u64,
+}
+
+/// Load a dynamically-linked program and its interpreter into one
+/// address space: the program at its own vaddrs (bias 0) and the
+/// interpreter at `pick_interp_base(program)`. The combined space's
+/// entry point is the interpreter's biased entry — the kernel jumps
+/// there first. Returns the image plus the `AT_BASE` / `AT_ENTRY` auxv
+/// values `Process::spawn` must publish.
+///
+/// This is the *load* half of #522. Resolving the interpreter bytes
+/// from `program.interp_path()` against the kernel filesystem, and
+/// wiring the entry redirect + auxv into `Process::spawn`, are separate
+/// follow-on slices that build on this.
+pub fn load_dynamic(
+    program: &ParsedElf,
+    program_bytes: &[u8],
+    interp: &ParsedElf,
+    interp_bytes: &[u8],
+) -> Result<DynamicImage, LoadOrParseError> {
+    let interp_base = pick_interp_base(program);
+    let interp_entry = interp
+        .entry
+        .checked_add(interp_base)
+        .ok_or(LoaderError::SegmentMathOverflow)?;
+    // Execution starts at the interpreter's entry.
+    let mut address_space = AddressSpace::new(interp_entry);
+    // Program at its own vaddrs (bias 0), then the interpreter at the
+    // chosen high base. push_segment rejects overlap, so a bad base
+    // surfaces here rather than corrupting the image.
+    push_load_segments(&mut address_space, program, program_bytes, 0)?;
+    push_load_segments(&mut address_space, interp, interp_bytes, interp_base)?;
+    Ok(DynamicImage {
+        address_space,
+        interp_base,
+        program_entry: program.entry,
+    })
 }
 
 // -- Internal helpers ----------------------------------------------
@@ -1146,6 +1244,49 @@ mod tests {
             result.err(),
             Some(LoadOrParseError::Load(LoaderError::DynamicLoaderRequired)),
             "the raw loader must not apply the static-only PT_INTERP rejection"
+        );
+    }
+
+    /// `pick_interp_base` lands strictly above the program's PT_LOADs
+    /// (so the interpreter can't overlap) and on a 2 MiB boundary.
+    #[test]
+    fn pick_interp_base_lands_above_program_aligned() {
+        let prog = parse(TINY_ELF).expect("TINY_ELF must parse");
+        let base = pick_interp_base(&prog);
+        // TINY_ELF's single PT_LOAD is vaddr 0x40_1000, memsz 16 → end
+        // 0x40_1010; the base must clear it.
+        assert!(base > 0x0040_1010, "interp base must clear the program (got {:#x})", base);
+        assert_eq!(base & (0x0020_0000 - 1), 0, "interp base must be 2 MiB-aligned");
+    }
+
+    /// `load_dynamic` places the program (bias 0) and the interpreter
+    /// (at `pick_interp_base`) into one address space, disjoint, with
+    /// the entry point at the interpreter's biased entry and the
+    /// AT_BASE / AT_ENTRY auxv values populated. TINY_ELF stands in for
+    /// both images (the real interpreter is ld-musl).
+    #[test]
+    fn load_dynamic_loads_program_and_interp_disjoint() {
+        let prog = parse(TINY_ELF).expect("TINY_ELF must parse");
+        let interp = parse(TINY_ELF).expect("TINY_ELF must parse");
+        let img = load_dynamic(&prog, TINY_ELF, &interp, TINY_ELF)
+            .expect("dynamic load must succeed (program + interp are disjoint)");
+
+        let base = pick_interp_base(&prog);
+        // The kernel starts at the interpreter's biased entry.
+        assert_eq!(img.address_space.entry_point, base + 0x0040_1000);
+        // auxv values spawn must publish.
+        assert_eq!(img.interp_base, base);
+        assert_eq!(img.program_entry, 0x0040_1000);
+        // Both PT_LOADs present and disjoint: program at 0x40_1000,
+        // interpreter at base + 0x40_1000.
+        assert_eq!(img.address_space.segments.len(), 2);
+        assert!(
+            img.address_space.segments.iter().any(|s| s.vaddr == 0x0040_1000),
+            "program segment present at its own vaddr"
+        );
+        assert!(
+            img.address_space.segments.iter().any(|s| s.vaddr == base + 0x0040_1000),
+            "interpreter segment present at the load base"
         );
     }
 }

@@ -71,7 +71,10 @@ pub mod trampoline;
 // Keeps the cross-module path short for the eventual #525 ld-musl:
 //   use crate::process::{load_segments, AddressSpace, Process};
 pub use address_space::{AddressSpace, LoadedSegment, LoaderError, SegmentPerm};
-pub use elf::{load_segments, load_segments_at_base, LoadOrParseError};
+pub use elf::{
+    load_dynamic, load_segments, load_segments_at_base, pick_interp_base, DynamicImage,
+    LoadOrParseError,
+};
 pub use process::{
     current_process_fd_table, current_process_id, current_process_install,
     current_process_mut, current_process_signals, current_process_uninstall, FdEntry,
