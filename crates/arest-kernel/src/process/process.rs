@@ -58,7 +58,7 @@ use arest::ast::{cell_push, fact_from_pairs, Object};
 use super::address_space::AddressSpace;
 use super::elf::ELF64_PHENT_SIZE;
 use super::fd_table::FdTable;
-use super::signal::{SignalDelivery, SignalState};
+use super::signal::{SigInfo, SignalDelivery, SignalState, SIGSEGV};
 use super::stack::{AuxvEntry, AuxvType, InitialStack, StackBuilder, StackError};
 use super::trampoline::{self, TrampolineError};
 
@@ -632,6 +632,34 @@ impl Process {
             self.state = ProcessState::Killed(signum);
         }
         Some(decision)
+    }
+
+    /// Raise SIGSEGV against this process for a page fault at
+    /// `fault_addr` — the #550 fault-delivery path. `present` is the
+    /// #PF error-code present-bit (`true` ⇒ a mapped-but-protected
+    /// access → `SEGV_ACCERR`; `false` ⇒ an unmapped address →
+    /// `SEGV_MAPERR`).
+    ///
+    /// Builds the `SigInfo` a SA_SIGINFO handler reads (`si_addr` =
+    /// the fault address) and drives delivery through
+    /// `deliver_signal(SIGSEGV)`, so the default disposition (no
+    /// handler) dumps core + terminates (`CoreDump` →
+    /// `Killed(SIGSEGV)`, #549) while an installed handler is reported
+    /// as `RunHandler` WITHOUT terminating — letting a JIT or language
+    /// runtime recover from a speculative fault. Returns the
+    /// `(decision, siginfo)` pair: the caller — the x86_64 #PF handler,
+    /// gated on the ring-3 descent (#552) — drives the ring-3 handler
+    /// redirect for `RunHandler` and the core-file write for
+    /// `CoreDump`.
+    pub fn raise_segv(&mut self, fault_addr: u64, present: bool) -> (SignalDelivery, SigInfo) {
+        let info = SigInfo::segv(fault_addr, present);
+        // SIGSEGV is always a valid signum, so `deliver_signal` is
+        // `Some`; the CoreDump/Terminate → Killed transition lives
+        // there (#549), so a defaulted SIGSEGV terminates here.
+        let decision = self
+            .deliver_signal(SIGSEGV)
+            .expect("SIGSEGV is a valid signal number");
+        (decision, info)
     }
 }
 
@@ -1228,7 +1256,10 @@ mod tests {
 
     // -- #549: signal-driven process termination ---------------------
 
-    use crate::process::signal::{SigAction, SignalDelivery, SIGCHLD, SIGKILL, SIGTERM};
+    use crate::process::signal::{
+        SigAction, SigInfo, SignalDelivery, SEGV_ACCERR, SEGV_MAPERR, SIGCHLD, SIGKILL, SIGSEGV,
+        SIGTERM,
+    };
 
     /// Delivering SIGTERM (default disposition, no handler installed)
     /// transitions the process to `Killed(SIGTERM)` and reports the
@@ -1308,6 +1339,50 @@ mod tests {
         let serialised = format!("{:?}", recorded);
         assert!(serialised.contains("Process_has_State"));
         assert!(serialised.contains("Killed"), "state cell must render Killed");
+    }
+
+    // -- #550: SIGSEGV from a page fault -----------------------------
+
+    /// A page fault at an unmapped address with no SIGSEGV handler:
+    /// `raise_segv` reports CoreDump (default action = core + terminate),
+    /// transitions the process to `Killed(SIGSEGV)`, and the returned
+    /// siginfo carries the fault address + `SEGV_MAPERR`.
+    #[test]
+    fn raise_segv_default_dumps_core_and_kills() {
+        let address_space = AddressSpace::new(0x40_1000);
+        let mut proc = Process::new(11, address_space);
+        let (delivery, info): (SignalDelivery, SigInfo) = proc.raise_segv(0xdead_0000, false);
+        assert_eq!(delivery, SignalDelivery::CoreDump);
+        assert_eq!(proc.state, ProcessState::Killed(SIGSEGV));
+        assert_eq!(info.signo, SIGSEGV);
+        assert_eq!(info.addr, 0xdead_0000);
+        assert_eq!(info.code, SEGV_MAPERR);
+    }
+
+    /// A page fault when the process installed a SIGSEGV handler (the
+    /// JIT / language-runtime recovery case): `raise_segv` reports
+    /// RunHandler, does NOT terminate the process, and the siginfo
+    /// carries the fault address + `SEGV_ACCERR` (mapped-but-protected)
+    /// for the handler to inspect via `si_addr`.
+    #[test]
+    fn raise_segv_with_handler_runs_handler_without_killing() {
+        let address_space = AddressSpace::new(0x40_1000);
+        let mut proc = Process::new(11, address_space);
+        proc.signals
+            .set_action(
+                SIGSEGV,
+                SigAction { handler: 0x6000_0000, flags: 0, restorer: 0, mask: 0 },
+            )
+            .unwrap();
+        let (delivery, info): (SignalDelivery, SigInfo) = proc.raise_segv(0x4020_0000, true);
+        assert_eq!(delivery, SignalDelivery::RunHandler(0x6000_0000));
+        assert_eq!(
+            proc.state,
+            ProcessState::Created,
+            "a handled SIGSEGV must not terminate the process"
+        );
+        assert_eq!(info.addr, 0x4020_0000);
+        assert_eq!(info.code, SEGV_ACCERR);
     }
 
     // -- Integration: SPAWN_ELF end-to-end ---------------------------

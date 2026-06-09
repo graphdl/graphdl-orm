@@ -664,6 +664,56 @@ pub enum SignalDelivery {
     Continue,
 }
 
+/// `si_code` for SIGSEGV when the faulting address is not mapped at
+/// all — `SEGV_MAPERR` (1). Source: `man 2 sigaction` / Linux
+/// `arch/x86/include/uapi/asm/siginfo.h`. The page-fault handler sets
+/// this when the #PF error-code present-bit is clear (no PTE for the
+/// page).
+pub const SEGV_MAPERR: i32 = 1;
+
+/// `si_code` for SIGSEGV when the address IS mapped but the access
+/// violated its permissions — `SEGV_ACCERR` (2). Set when the #PF
+/// error-code present-bit is set (e.g. a write to a read-only page).
+pub const SEGV_ACCERR: i32 = 2;
+
+/// The SIGSEGV-relevant subset of Linux's `siginfo_t` — the fields a
+/// SA_SIGINFO fault handler reads. The real `siginfo_t` is a 128-byte
+/// tagged union; this models the three fields a page fault populates
+/// (`si_signo`, `si_code`, and the `_sigfault.si_addr` union member).
+/// The ring-3 delivery track (#552) marshals these into the full
+/// 128-byte layout when it copies the siginfo onto the handler's
+/// stack — exactly as `rt_sigaction` marshals `k_sigaction` — so this
+/// stays an internal model, NOT `repr(C)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SigInfo {
+    /// `si_signo` — the delivered signal number (SIGSEGV for a fault).
+    pub signo: i32,
+    /// `si_code` — `SEGV_MAPERR` / `SEGV_ACCERR` for a fault (why it
+    /// happened). Other signals carry their own codes (SI_USER, …);
+    /// #550 only mints the SIGSEGV ones.
+    pub code: i32,
+    /// `si_addr` — the faulting memory address (CR2 on x86_64). What a
+    /// JIT / language runtime reads to decide whether the fault is
+    /// recoverable (e.g. a guard-page probe) or fatal.
+    pub addr: u64,
+}
+
+impl SigInfo {
+    /// Build the SIGSEGV siginfo for a page fault at `addr`. `present`
+    /// is the #PF error-code present-bit: `true` ⇒ the page was mapped
+    /// but the access violated permissions (`SEGV_ACCERR`), `false` ⇒
+    /// no mapping exists (`SEGV_MAPERR`). A pure constructor — the
+    /// page-fault handler reads CR2 for `addr` and the pushed error
+    /// code for `present`, then hands both here.
+    pub fn segv(addr: u64, present: bool) -> Self {
+        Self {
+            signo: SIGSEGV,
+            code: if present { SEGV_ACCERR } else { SEGV_MAPERR },
+            addr,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1066,5 +1116,24 @@ mod tests {
         let s = SignalState::new();
         assert!(s.delivery_decision(0).is_none());
         assert!(s.delivery_decision(65).is_none());
+    }
+
+    // -- #550: SIGSEGV siginfo ---------------------------------------
+
+    /// `SigInfo::segv` carries the faulting address and the
+    /// not-mapped (SEGV_MAPERR) vs protection (SEGV_ACCERR) code —
+    /// the fields the page-fault handler fills from CR2 + the #PF
+    /// error code so a SA_SIGINFO handler can read `si_addr`.
+    #[test]
+    fn siginfo_segv_carries_fault_addr_and_code() {
+        let not_mapped = SigInfo::segv(0xdead_beef, false);
+        assert_eq!(not_mapped.signo, SIGSEGV);
+        assert_eq!(not_mapped.code, SEGV_MAPERR);
+        assert_eq!(not_mapped.addr, 0xdead_beef);
+
+        let protection = SigInfo::segv(0x4000_0000, true);
+        assert_eq!(protection.signo, SIGSEGV);
+        assert_eq!(protection.code, SEGV_ACCERR);
+        assert_eq!(protection.addr, 0x4000_0000);
     }
 }
