@@ -383,7 +383,7 @@ fn copy_to_user(buf: u64, bytes: &[u8]) {
 /// UEFI x86_64 only; there it is delegated to
 /// `file_serve::read_region_content`, and on every other target a
 /// region blob reads as `None` (the host has no persistence disk).
-fn read_file_cell_bytes(
+pub fn read_file_cell_bytes(
     cell_id: &str,
     offset: u64,
     count: u64,
