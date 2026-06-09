@@ -204,7 +204,7 @@ pub fn seed_region_cells(state: &Object) -> Object {
 /// this function) rather than literal pixel values.
 pub fn region_layouts_from_cells(state: &Object) -> Vec<RegionLayout> {
     // Collect PixelWidth bindings: region_name → u32.
-    let pw_cell = ast::fetch_or_phi("UnifiedReplRegion_has_PixelWidth", state);
+    let pw_cell = ast::fetch_cell_seq("UnifiedReplRegion_has_PixelWidth", state);
     let mut pixel_widths: alloc::collections::BTreeMap<String, u32> =
         alloc::collections::BTreeMap::new();
     if let Some(facts) = pw_cell.as_seq() {
@@ -219,7 +219,7 @@ pub fn region_layouts_from_cells(state: &Object) -> Vec<RegionLayout> {
     }
 
     // Collect MinHeightPx bindings: region_name → u32.
-    let mh_cell = ast::fetch_or_phi("UnifiedReplRegion_has_MinHeightPx", state);
+    let mh_cell = ast::fetch_cell_seq("UnifiedReplRegion_has_MinHeightPx", state);
     let mut min_heights: alloc::collections::BTreeMap<String, u32> =
         alloc::collections::BTreeMap::new();
     if let Some(facts) = mh_cell.as_seq() {
@@ -234,7 +234,7 @@ pub fn region_layouts_from_cells(state: &Object) -> Vec<RegionLayout> {
     }
 
     // Collect VertStretch bindings: region_name → u32.
-    let vs_cell = ast::fetch_or_phi("UnifiedReplRegion_has_VertStretch", state);
+    let vs_cell = ast::fetch_cell_seq("UnifiedReplRegion_has_VertStretch", state);
     let mut vert_stretches: alloc::collections::BTreeMap<String, u32> =
         alloc::collections::BTreeMap::new();
     if let Some(facts) = vs_cell.as_seq() {
@@ -609,7 +609,7 @@ mod tests {
         let monoview_md = include_str!("../../../readings/ui/monoview.md");
         let state = arest::parse_forml2::parse_to_state(monoview_md)
             .expect("monoview.md must parse");
-        let cell = arest::ast::fetch_or_phi("UnifiedReplRegion_has_PixelWidth", &state);
+        let cell = arest::ast::fetch_cell_seq("UnifiedReplRegion_has_PixelWidth", &state);
         assert!(
             cell.as_seq().map(|s| !s.is_empty()).unwrap_or(false),
             "UnifiedReplRegion_has_PixelWidth cell must be non-empty after parsing monoview.md"
