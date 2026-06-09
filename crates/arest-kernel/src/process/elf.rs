@@ -581,7 +581,36 @@ pub fn load_segments(
         return Err(LoaderError::DynamicLoaderRequired.into());
     }
 
-    let mut address_space = AddressSpace::new(parsed.entry);
+    // Static binary: load at the binary's own vaddrs (bias 0).
+    load_segments_at_base(parsed, bytes, 0)
+}
+
+/// Load every PT_LOAD segment at `parsed.vaddr + load_bias`, with the
+/// address-space entry point biased likewise. The low-level loader
+/// primitive behind both PIE/ET_DYN placement and the #522 dynamic-
+/// linker pass: the ld-musl interpreter is an ET_DYN image the kernel
+/// must place at a kernel-chosen high base (then jump to `interp_entry
+/// + bias` and set auxv `AT_BASE = bias`). `load_segments` is exactly
+/// `load_segments_at_base(.., 0)` plus the static-only PT_INTERP
+/// rejection.
+///
+/// Unlike `load_segments`, this does NOT reject a PT_INTERP-bearing
+/// image — it is a raw segment loader; the orchestration that decides
+/// *what* to load *where* (load the program, load the interpreter at a
+/// high base, wire auxv) owns the interp policy. Overflow of `vaddr +
+/// load_bias` (or `entry + load_bias`) is rejected with
+/// `LoaderError::SegmentMathOverflow`, the same variant `push_segment`
+/// uses for `vaddr + mem_size` overflow.
+pub fn load_segments_at_base(
+    parsed: &ParsedElf,
+    bytes: &[u8],
+    load_bias: u64,
+) -> Result<AddressSpace, LoadOrParseError> {
+    let biased_entry = parsed
+        .entry
+        .checked_add(load_bias)
+        .ok_or(LoaderError::SegmentMathOverflow)?;
+    let mut address_space = AddressSpace::new(biased_entry);
 
     for ph in parsed.load_segments() {
         // Derive the permission shape. W^X violations and bare PF_X
@@ -620,7 +649,16 @@ pub fn load_segments(
             }
         };
 
-        address_space.push_segment(ph.vaddr, mem_size, perm, file_content)?;
+        // Place the segment at its biased vaddr. For a static image
+        // `load_bias` is 0 (identity); for an ET_DYN image (PIE program
+        // or the ld-musl interpreter) it's the kernel-chosen base. A
+        // bias that overflows the segment's vaddr is rejected here
+        // rather than wrapping into a bogus low address.
+        let biased_vaddr = ph
+            .vaddr
+            .checked_add(load_bias)
+            .ok_or(LoaderError::SegmentMathOverflow)?;
+        address_space.push_segment(biased_vaddr, mem_size, perm, file_content)?;
     }
 
     Ok(address_space)
@@ -1060,5 +1098,54 @@ mod tests {
     fn load_or_parse_error_from_loader_error() {
         let err: LoadOrParseError = LoaderError::OverlappingSegments.into();
         assert_eq!(err, LoadOrParseError::Load(LoaderError::OverlappingSegments));
+    }
+
+    /// `load_segments_at_base(.., 0)` reproduces `load_segments` for a
+    /// static binary: same entry, same segment vaddrs. The bias-0
+    /// identity that lets `load_segments` delegate to it.
+    #[test]
+    fn load_at_base_zero_matches_load_segments() {
+        let elf = parse(TINY_ELF).expect("TINY_ELF must parse");
+        let a = load_segments_at_base(&elf, TINY_ELF, 0).expect("load must succeed");
+        assert_eq!(a.entry_point, 0x0040_1000);
+        assert_eq!(a.segments.len(), 1);
+        assert_eq!(a.segments[0].vaddr, 0x0040_1000);
+    }
+
+    /// A non-zero load bias shifts BOTH the entry point and every
+    /// segment's vaddr by exactly the bias — the placement arithmetic
+    /// the #522 interpreter load (an ET_DYN image at a high base)
+    /// depends on.
+    #[test]
+    fn load_at_base_shifts_entry_and_segments() {
+        let bias: u64 = 0x0000_1000_0000_0000; // a canonical high interp base
+        let elf = parse(TINY_ELF).expect("TINY_ELF must parse");
+        let a = load_segments_at_base(&elf, TINY_ELF, bias).expect("load must succeed");
+        assert_eq!(a.entry_point, 0x0040_1000 + bias, "entry biased");
+        assert_eq!(a.segments[0].vaddr, 0x0040_1000 + bias, "segment vaddr biased");
+    }
+
+    /// A load bias that would overflow `entry + bias` / `vaddr + bias`
+    /// is rejected with `SegmentMathOverflow` rather than wrapping.
+    #[test]
+    fn load_at_base_overflow_is_rejected() {
+        let elf = parse(TINY_ELF).expect("TINY_ELF must parse");
+        let err = load_segments_at_base(&elf, TINY_ELF, u64::MAX - 0x10).unwrap_err();
+        assert_eq!(err, LoadOrParseError::Load(LoaderError::SegmentMathOverflow));
+    }
+
+    /// `load_segments_at_base` is the raw primitive: it does NOT apply
+    /// the static-only PT_INTERP rejection `load_segments` enforces, so
+    /// the #522 orchestration can use it to place a dynamically-linked
+    /// program + its interpreter. Contrast `load_segments_rejects_pt_interp`.
+    #[test]
+    fn load_at_base_does_not_reject_pt_interp() {
+        let elf = parse(INTERP_ELF).expect("INTERP_ELF must parse");
+        let result = load_segments_at_base(&elf, INTERP_ELF, 0);
+        assert_ne!(
+            result.err(),
+            Some(LoadOrParseError::Load(LoaderError::DynamicLoaderRequired)),
+            "the raw loader must not apply the static-only PT_INTERP rejection"
+        );
     }
 }
