@@ -154,10 +154,16 @@ pub fn run_command(words: &[&str]) -> alloc::string::String {
     // Minimal environment: a PATH so shell builtins that re-exec
     // (`command -p`, scripts) resolve applets back through /bin.
     let envp: &[&[u8]] = &[b"PATH=/bin", b"HOME=/"];
-    match exec_path(&path, 1, &argv, envp) {
+    let report = match exec_path(&path, 1, &argv, envp) {
         Ok(()) => format!("exec {path}: returned to kernel (unexpected)"),
         Err((e, _process)) => format!("exec {path} failed: {e:?}"),
-    }
+    };
+    // Mirror the report to the kernel console: the unified REPL renders
+    // the returned string into its GPU-only scrollback, which a headless
+    // QEMU smoke (serial assertions) never sees. The guest's own fd 1/2
+    // writes already land on serial via syscall::write → crate::print!.
+    crate::println!("{report}");
+    report
 }
 
 #[cfg(test)]

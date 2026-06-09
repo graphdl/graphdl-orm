@@ -38,13 +38,29 @@
 .PARAMETER Keep
   Leave the staging workdir (ESP, firmware copies, serial.log) in place
   for inspection instead of reporting just the log tail.
+
+.PARAMETER TypeLine
+  After the boot banner completes, inject this line into the kernel's
+  REPL as PS/2 keystrokes via QMP send-key (a-z, 0-9, space, slash,
+  minus, dot, underscore), terminated with Enter. Typing mode drops the
+  virtio-keyboard-pci device: QEMU routes send-key events to it when
+  present, but the kernel REPL drains the i8042 PS/2 ring — without the
+  drop, injected keys would vanish into the unclaimed virtio device.
+
+.PARAMETER ExpectAfter
+  Extra serial-log phrases that must appear AFTER the TypeLine has been
+  injected (e.g. the guest program's output). Asserted in -Smoke mode in
+  addition to the boot-banner set; in non-smoke mode they only extend
+  the post-type wait.
 #>
 [CmdletBinding()]
 param(
   [switch]$Smoke,
   [switch]$SkipBuild,
   [int]$TimeoutSec = 60,
-  [switch]$Keep
+  [switch]$Keep,
+  [string]$TypeLine,
+  [string[]]$ExpectAfter = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -93,6 +109,12 @@ $fs = [System.IO.File]::Create($disk); $fs.SetLength(16MB); $fs.Close()
 
 $qemuArgs = @(
   '-machine','q35',
+  # `-cpu max`: TCG's fullest feature set, including functional RDRAND /
+  # RDSEED. The default qemu64 model leaves them absent/exhausted, which
+  # boots fine (the entropy probe passes via the boot-time path) but
+  # panics the csprng reseed the first time a spawn's AT_RANDOM fill
+  # draws entropy (HardwareUnavailable at csprng reseed).
+  '-cpu','max',
   '-m','512',
   '-drive', "if=pflash,format=raw,unit=0,readonly=on,file=$code",
   '-drive', "if=pflash,format=raw,unit=1,file=$vars",
@@ -101,12 +123,71 @@ $qemuArgs = @(
   '-device','virtio-net-pci,netdev=net0,disable-legacy=on',
   '-drive', "file=$disk,format=raw,if=none,id=disk0",
   '-device','virtio-blk-pci,drive=disk0,disable-legacy=on',
-  '-device','virtio-gpu-pci',
-  '-device','virtio-keyboard-pci',
+  '-device','virtio-gpu-pci'
+)
+$qmpPort = 4444
+if ($TypeLine) {
+  # Typing mode: PS/2 keyboard only (see .PARAMETER TypeLine) + a QMP
+  # socket for send-key. virtio-tablet stays — pointer events don't
+  # contend with keyboard routing.
+  $qemuArgs += @('-qmp', "tcp:127.0.0.1:${qmpPort},server,nowait")
+} else {
+  $qemuArgs += @('-device','virtio-keyboard-pci')
+}
+$qemuArgs += @(
   '-device','virtio-tablet-pci',
   '-serial', "file:$serial",
   '-display','none','-no-reboot','-no-shutdown'
 )
+
+# Map one character to its QMP QKeyCode (US layout, unshifted subset the
+# REPL grammar needs). Returns $null for unsupported characters.
+function Get-QKeyCode([char]$c) {
+  switch -CaseSensitive ($c) {
+    { $_ -ge 'a' -and $_ -le 'z' } { return [string]$_ }
+    { $_ -ge '0' -and $_ -le '9' } { return [string]$_ }
+    ' ' { return 'spc' }
+    '/' { return 'slash' }
+    '-' { return 'minus' }
+    '.' { return 'dot' }
+    default { return $null }
+  }
+}
+
+# Inject $line + Enter as PS/2 scancodes through the QMP socket; then
+# (optionally) capture a PNG of the guest screen via QMP screendump —
+# the Unified REPL renders its scrollback on the virtio-gpu surface, so
+# the screen is the only place a UI-side response is observable from a
+# headless harness.
+function Send-QmpLine([int]$port, [string]$line, [string]$screendumpTo) {
+  $client = New-Object System.Net.Sockets.TcpClient('127.0.0.1', $port)
+  try {
+    $stream = $client.GetStream()
+    $reader = New-Object System.IO.StreamReader($stream)
+    $writer = New-Object System.IO.StreamWriter($stream)
+    $writer.AutoFlush = $true
+    $null = $reader.ReadLine()                       # QMP greeting
+    $writer.WriteLine('{"execute":"qmp_capabilities"}')
+    $null = $reader.ReadLine()                       # {"return": {}}
+    foreach ($c in $line.ToCharArray()) {
+      $q = Get-QKeyCode $c
+      if (-not $q) { throw "TypeLine: unsupported character '$c' (no QKeyCode mapping)" }
+      $writer.WriteLine('{"execute":"send-key","arguments":{"keys":[{"type":"qcode","data":"' + $q + '"}]}}')
+      $null = $reader.ReadLine()
+      Start-Sleep -Milliseconds 60                   # let the i8042 ring drain
+    }
+    $writer.WriteLine('{"execute":"send-key","arguments":{"keys":[{"type":"qcode","data":"ret"}]}}')
+    $null = $reader.ReadLine()
+    if ($screendumpTo) {
+      Start-Sleep -Seconds 6                         # let the guest render/run
+      $png = $screendumpTo -replace '\\','/'
+      $writer.WriteLine('{"execute":"screendump","arguments":{"filename":"' + $png + '","format":"png"}}')
+      $null = $reader.ReadLine()
+    }
+  } finally {
+    $client.Close()
+  }
+}
 
 # Banner phrases the kernel writes pre- + post-ExitBootServices. The
 # terminal phrase ("launcher running") is the last line, so its presence
@@ -131,12 +212,33 @@ $required = @(
 Write-Host "Booting arest-kernel.efi under QEMU + OVMF (no Docker, ${TimeoutSec}s cap)..." -ForegroundColor Cyan
 $p = Start-Process -FilePath $qemu -ArgumentList $qemuArgs -PassThru -NoNewWindow
 $deadline = (Get-Date).AddSeconds($TimeoutSec)
+$bannerSeen = $false
 while ((Get-Date) -lt $deadline) {
   Start-Sleep -Milliseconds 1000
   if ($p.HasExited) { break }
   if (Test-Path $serial) {
     $txt = Get-Content $serial -Raw -ErrorAction SilentlyContinue
-    if ($txt -and ($txt -match 'launcher running')) { break }
+    if ($txt -and ($txt -match 'launcher running')) { $bannerSeen = $true; break }
+  }
+}
+if ($TypeLine -and $bannerSeen -and -not $p.HasExited) {
+  # Give the REPL drain loop a beat past the banner, then type.
+  Start-Sleep -Milliseconds 1500
+  Write-Host "Typing into REPL via QMP send-key: $TypeLine" -ForegroundColor Cyan
+  Send-QmpLine $qmpPort $TypeLine (Join-Path $wd 'screen.png')
+  # Wait for the post-type phrases (or the deadline).
+  $typeDeadline = (Get-Date).AddSeconds([Math]::Max(20, $TimeoutSec / 3))
+  while ((Get-Date) -lt $typeDeadline) {
+    Start-Sleep -Milliseconds 1000
+    if ($p.HasExited) { break }
+    $txt = Get-Content $serial -Raw -ErrorAction SilentlyContinue
+    if ($txt) {
+      $allSeen = $true
+      foreach ($phrase in $ExpectAfter) {
+        if ($txt -notmatch [regex]::Escape($phrase)) { $allSeen = $false; break }
+      }
+      if ($allSeen -and $ExpectAfter.Count -gt 0) { break }
+    }
   }
 }
 if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
@@ -151,7 +253,8 @@ if (-not $Smoke) {
   return
 }
 
-# Smoke: assert every required banner phrase.
+# Smoke: assert every required banner phrase (+ the post-type set).
+if ($TypeLine) { $required = @($required) + @($ExpectAfter) }
 $missing = @($required | Where-Object { $log -notmatch [regex]::Escape($_) })
 if ($missing.Count -eq 0) {
   Write-Host "PASS: all $($required.Count) banner phrases observed; kernel reached the REPL on UEFI (no Docker)." -ForegroundColor Green
