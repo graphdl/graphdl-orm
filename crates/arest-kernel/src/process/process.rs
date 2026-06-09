@@ -58,7 +58,7 @@ use arest::ast::{cell_push, fact_from_pairs, Object};
 use super::address_space::AddressSpace;
 use super::elf::ELF64_PHENT_SIZE;
 use super::fd_table::FdTable;
-use super::signal::{SigInfo, SignalDelivery, SignalState, SIGSEGV};
+use super::signal::{SigInfo, SignalDelivery, SignalState, SIGCHLD, SIGSEGV};
 use super::stack::{AuxvEntry, AuxvType, InitialStack, StackBuilder, StackError};
 use super::trampoline::{self, TrampolineError};
 
@@ -332,6 +332,15 @@ pub struct Process {
     /// per-process; nothing here is shared kernel-wide (contrast the
     /// `futex_table`, which is a kernel-wide rendezvous).
     pub signals: SignalState,
+    /// Parent process id — the pid `fork(2)` / `clone(2)` (the future
+    /// #530 process-creation surface) records on the child. `None` for
+    /// a process with no parent: the initial process the kernel
+    /// hand-spawns (tier-1's single resident process) and, on Linux,
+    /// any process re-parented to init after its parent dies. The
+    /// SIGCHLD path (#551) reads it to decide whom to notify when this
+    /// process exits; the process-table lookup that turns the pid into
+    /// the live parent Process rides the scheduler (#530).
+    pub parent_pid: Option<u32>,
 }
 
 impl Process {
@@ -394,7 +403,19 @@ impl Process {
             // delivery path (#549+) parks the saved context that
             // `rt_sigreturn` restores.
             signals: SignalState::new(),
+            // No parent until fork(2)/clone(2) (#530) records one. The
+            // initial hand-spawned process is parentless; #551 reads
+            // this to decide whom SIGCHLD wakes on exit.
+            parent_pid: None,
         }
+    }
+
+    /// True when this process is a child of `parent_pid` — the
+    /// predicate the SIGCHLD path (#551) uses to confirm a candidate
+    /// parent before delivering the signal. False for a parentless
+    /// process (the initial / re-parented-to-init case).
+    pub fn is_child_of(&self, parent_pid: u32) -> bool {
+        self.parent_pid == Some(parent_pid)
     }
 
     /// Spawn the process — allocate the initial stack page,
@@ -574,6 +595,16 @@ impl Process {
             fact_from_pairs(&[("Process", process_id), ("State", state_atom)]),
             &s,
         );
+        // Parent linkage (#551) — sparse: a parentless process (the
+        // initial process / re-parented-to-init) earns no fact.
+        if let Some(ppid) = self.parent_pid {
+            let parent_atom = format!("{}", ppid);
+            s = cell_push(
+                "Process_has_Parent",
+                fact_from_pairs(&[("Process", process_id), ("Parent", &parent_atom)]),
+                &s,
+            );
+        }
         for (fd, entry) in self.fd_table.iter().enumerate() {
             if matches!(entry, FdEntry::Closed) {
                 continue;
@@ -660,6 +691,29 @@ impl Process {
             .deliver_signal(SIGSEGV)
             .expect("SIGSEGV is a valid signal number");
         (decision, info)
+    }
+
+    /// Notify this process's parent that the process exited, by
+    /// delivering SIGCHLD to `parent` — the #551 child-reaping path.
+    /// `parent` is the candidate parent the kernel resolved from
+    /// `self.parent_pid` (the process-table lookup that finds it rides
+    /// the scheduler #530); the method guards on `is_child_of`, so a
+    /// mismatched parent — or a parentless process — signals no one and
+    /// returns `None`. On a match it returns the parent's SIGCHLD
+    /// delivery decision: `Ignore` under the POSIX default (no handler
+    /// installed — the parent's state is untouched, SIGCHLD's default
+    /// being Ignore), or `RunHandler` when the parent registered a
+    /// SIGCHLD handler (the shell / service-supervisor reap path that
+    /// wait()s the child).
+    ///
+    /// The wait() / waitpid() wakeup that unblocks a parent sleeping on
+    /// its child is the #531 surface; this handles the signal half (the
+    /// asynchronous notification) only.
+    pub fn notify_parent_exit(&self, parent: &mut Process) -> Option<SignalDelivery> {
+        if !self.is_child_of(parent.pid) {
+            return None;
+        }
+        parent.deliver_signal(SIGCHLD)
     }
 }
 
@@ -1383,6 +1437,110 @@ mod tests {
         );
         assert_eq!(info.addr, 0x4020_0000);
         assert_eq!(info.code, SEGV_ACCERR);
+    }
+
+    // -- #551: SIGCHLD parent linkage --------------------------------
+
+    /// A fresh process has no parent — `parent_pid` defaults to None
+    /// (the initial process the kernel hand-spawns; fork(2) sets one
+    /// on real children).
+    #[test]
+    fn new_process_has_no_parent() {
+        let address_space = AddressSpace::new(0x40_1000);
+        let proc = Process::new(2, address_space);
+        assert_eq!(proc.parent_pid, None);
+        assert!(!proc.is_child_of(1));
+    }
+
+    /// Setting a parent pid makes `is_child_of` true for that pid and
+    /// false for any other.
+    #[test]
+    fn is_child_of_reflects_parent_pid() {
+        let address_space = AddressSpace::new(0x40_1000);
+        let mut proc = Process::new(7, address_space);
+        proc.parent_pid = Some(1);
+        assert!(proc.is_child_of(1));
+        assert!(!proc.is_child_of(2));
+    }
+
+    /// `record_into_cells` emits Process_has_Parent when a parent is
+    /// set and elides it for a parentless process.
+    #[test]
+    fn record_into_cells_emits_parent_when_set() {
+        let address_space = AddressSpace::new(0x40_1000);
+        let mut child = Process::new(7, address_space);
+        child.parent_pid = Some(1);
+        let with_parent = format!("{:?}", child.record_into_cells("p7", &Object::phi()));
+        assert!(with_parent.contains("Process_has_Parent"));
+
+        let orphan_space = AddressSpace::new(0x40_1000);
+        let orphan = Process::new(1, orphan_space);
+        let without = format!("{:?}", orphan.record_into_cells("p1", &Object::phi()));
+        assert!(!without.contains("Process_has_Parent"));
+    }
+
+    /// When a child exits, notifying its parent delivers SIGCHLD. With
+    /// no handler installed the parent's default disposition is Ignore
+    /// (SIGCHLD's POSIX default) — the delivery is reported but the
+    /// parent's state is untouched.
+    #[test]
+    fn notify_parent_exit_delivers_sigchld_default_ignore() {
+        let child_space = AddressSpace::new(0x40_1000);
+        let mut child = Process::new(7, child_space);
+        child.parent_pid = Some(1);
+        let parent_space = AddressSpace::new(0x40_1000);
+        let mut parent = Process::new(1, parent_space);
+        let outcome = child.notify_parent_exit(&mut parent);
+        assert_eq!(outcome, Some(SignalDelivery::Ignore));
+        assert_eq!(parent.state, ProcessState::Created);
+    }
+
+    /// A parent that installed a SIGCHLD handler gets RunHandler — the
+    /// shell / service-supervisor reaping path (the handler runs to
+    /// wait() the child).
+    #[test]
+    fn notify_parent_exit_runs_parent_handler() {
+        let child_space = AddressSpace::new(0x40_1000);
+        let mut child = Process::new(7, child_space);
+        child.parent_pid = Some(1);
+        let parent_space = AddressSpace::new(0x40_1000);
+        let mut parent = Process::new(1, parent_space);
+        parent
+            .signals
+            .set_action(
+                SIGCHLD,
+                SigAction { handler: 0x7000_0000, flags: 0, restorer: 0, mask: 0 },
+            )
+            .unwrap();
+        assert_eq!(
+            child.notify_parent_exit(&mut parent),
+            Some(SignalDelivery::RunHandler(0x7000_0000))
+        );
+    }
+
+    /// Notifying a process that is NOT the child's parent delivers
+    /// nothing and leaves it untouched — the kernel signals only the
+    /// real parent.
+    #[test]
+    fn notify_parent_exit_wrong_parent_is_none() {
+        let child_space = AddressSpace::new(0x40_1000);
+        let mut child = Process::new(7, child_space);
+        child.parent_pid = Some(1);
+        let other_space = AddressSpace::new(0x40_1000);
+        let mut other = Process::new(99, other_space);
+        let before = other.signals.action(SIGCHLD);
+        assert_eq!(child.notify_parent_exit(&mut other), None);
+        assert_eq!(other.signals.action(SIGCHLD), before);
+    }
+
+    /// A parentless (orphan / init) child notifies no one — None.
+    #[test]
+    fn notify_parent_exit_orphan_is_none() {
+        let child_space = AddressSpace::new(0x40_1000);
+        let child = Process::new(1, child_space);
+        let other_space = AddressSpace::new(0x40_1000);
+        let mut other = Process::new(2, other_space);
+        assert_eq!(child.notify_parent_exit(&mut other), None);
     }
 
     // -- Integration: SPAWN_ELF end-to-end ---------------------------
