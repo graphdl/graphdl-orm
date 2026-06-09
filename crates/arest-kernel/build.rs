@@ -1229,6 +1229,62 @@ fn collect_musl_sources(
 ///
 /// See the block comment in `main()` immediately above the
 /// `CARGO_FEATURE_BUSYBOX` gate for the full design rationale.
+/// Enumerate every busybox config option name, so autoconf.h can
+/// `#define ENABLE_<NAME>` (0/1) for ALL of them — not just the handful
+/// listed in our minimal `.config`. busybox's common headers (libbb.h)
+/// reference `ENABLE_FEATURE_*` for the WHOLE option universe; an
+/// undefined one is a hard compile error (`use of undeclared
+/// identifier`), so a real `make` writes one #define per option. We
+/// reproduce that by walking the option declarations: `//config:config
+/// NAME` / `//config:menuconfig NAME` blocks in the `.c` sources, plus
+/// bare `config NAME` / `menuconfig NAME` in the `Config.in` /
+/// `Config.src` files.
+fn collect_busybox_config_options(root: &Path) -> std::collections::BTreeSet<String> {
+    let mut opts = std::collections::BTreeSet::new();
+    fn walk(dir: &Path, opts: &mut std::collections::BTreeSet<String>) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, opts);
+                continue;
+            }
+            let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let is_c = fname.ends_with(".c");
+            let is_cfg = fname == "Config.in" || fname == "Config.src";
+            if !is_c && !is_cfg {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&p) else { continue };
+            for line in text.lines() {
+                let l = line.trim_start();
+                // In .c sources the declarations live in `//config:`
+                // comment blocks; in Config.in/.src they are bare lines.
+                let body: Option<&str> = if is_c {
+                    l.strip_prefix("//config:").map(|s| s.trim_start())
+                } else {
+                    Some(l)
+                };
+                let Some(body) = body else { continue };
+                for kw in ["config ", "menuconfig "] {
+                    if let Some(rest) = body.strip_prefix(kw) {
+                        let name: String = rest
+                            .trim()
+                            .chars()
+                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                            .collect();
+                        if !name.is_empty() {
+                            opts.insert(name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    walk(root, &mut opts);
+    opts
+}
+
 fn build_busybox(
     manifest_dir: &Path,
     busybox_root: &Path,
@@ -1280,16 +1336,29 @@ fn build_busybox(
     autoconf.push_str("#define BB_VER \"1.36.1\"\n");
     autoconf.push_str("#define BB_BT \"\"\n");
     autoconf.push_str("#define AUTOCONF_TIMESTAMP \"\"\n");
-    autoconf.push_str("\n/* Bool flags from .config */\n");
-    for name in &enabled {
-        autoconf.push_str(&format!("#define ENABLE_{} 1\n", name));
-        autoconf.push_str(&format!("#define IF_{}(...) __VA_ARGS__\n", name));
-        autoconf.push_str(&format!("#define IF_NOT_{}(...)\n", name));
-    }
-    for name in &disabled {
-        autoconf.push_str(&format!("#define ENABLE_{} 0\n", name));
-        autoconf.push_str(&format!("#define IF_{}(...)\n", name));
-        autoconf.push_str(&format!("#define IF_NOT_{}(...) __VA_ARGS__\n", name));
+    // Bool flags: emit ENABLE_/IF_/IF_NOT_ for the ENTIRE option
+    // universe busybox declares (libbb.h references options far beyond
+    // our minimal .config; an undefined ENABLE_xxx is a hard compile
+    // error). Default every option to 0; the .config's `=y` set flips
+    // to 1. Mirrors what `make`'s generated autoconf.h does.
+    autoconf.push_str("\n/* Bool flags: full option universe (0), .config =y overrides (1). */\n");
+    let enabled_set: std::collections::HashSet<&str> =
+        enabled.iter().map(|s| s.as_str()).collect();
+    let mut universe = collect_busybox_config_options(busybox_root);
+    // Belt-and-suspenders: ensure every name the .config mentions is in
+    // the universe even if the source walk missed its declaration.
+    universe.extend(enabled.iter().cloned());
+    universe.extend(disabled.iter().cloned());
+    for name in &universe {
+        if enabled_set.contains(name.as_str()) {
+            autoconf.push_str(&format!("#define ENABLE_{} 1\n", name));
+            autoconf.push_str(&format!("#define IF_{}(...) __VA_ARGS__\n", name));
+            autoconf.push_str(&format!("#define IF_NOT_{}(...)\n", name));
+        } else {
+            autoconf.push_str(&format!("#define ENABLE_{} 0\n", name));
+            autoconf.push_str(&format!("#define IF_{}(...)\n", name));
+            autoconf.push_str(&format!("#define IF_NOT_{}(...) __VA_ARGS__\n", name));
+        }
     }
     // Numeric / string CONFIG_xxx values lifted verbatim. These are
     // a tiny set in our tier-1 .config (FEATURE_COPYBUF_KB=4,
