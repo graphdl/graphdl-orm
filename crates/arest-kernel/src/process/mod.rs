@@ -60,6 +60,7 @@
 
 pub mod address_space;
 pub mod elf;
+pub mod exec;
 pub mod fd_table;
 pub mod futex_table;
 pub mod interp_resolve;
@@ -76,6 +77,7 @@ pub use elf::{
     load_dynamic, load_program, load_segments, load_segments_at_base, pick_interp_base,
     DynamicImage, LoadOrParseError, LoadedImage,
 };
+pub use exec::{argv_from_words, exec_path, prepare_process_in, ExecError};
 pub use interp_resolve::{resolve_interp_bytes, resolve_interp_bytes_in};
 pub use process::{
     current_process_fd_table, current_process_id, current_process_install,

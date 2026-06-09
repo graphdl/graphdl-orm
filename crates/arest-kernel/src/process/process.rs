@@ -1037,7 +1037,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::process::address_space::SegmentPerm;
     use arest::entropy::{self, DeterministicSource};
@@ -1080,7 +1080,9 @@ mod tests {
     /// in parallel.
     static TEST_ENTROPY_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
-    fn with_deterministic_entropy<F: FnOnce()>(seed: [u8; 32], body: F) {
+    // pub(crate): shared with sibling test modules (process::exec) so
+    // every entropy-touching test serializes on the same lock.
+    pub(crate) fn with_deterministic_entropy<F: FnOnce()>(seed: [u8; 32], body: F) {
         let _guard = TEST_ENTROPY_LOCK.lock();
         entropy::install(alloc::boxed::Box::new(DeterministicSource::new(seed)));
         arest::csprng::reseed();
