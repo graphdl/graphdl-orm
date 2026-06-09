@@ -795,12 +795,18 @@ fn build_musl_libc(
             if name == "include" {
                 continue; // headers only
             }
-            if name == "malloc" {
-                // Only the mallocng subdir, per Makefile's
-                // `MALLOC_DIR = mallocng` default.
-                subsys_dirs.push(p.join("mallocng"));
-                continue;
-            }
+            // src/malloc needs BOTH the top-level *.c (the public
+            // `malloc`/`free`/`realloc`/`calloc`/`__libc_malloc` wrappers
+            // in free.c/realloc.c/calloc.c/lite_malloc.c) AND the selected
+            // allocator backend's *.c (mallocng, which provides the
+            // `__libc_*_impl`/`__libc_free`/`__libc_realloc` internals the
+            // wrappers call). Upstream's Makefile gets both via
+            // `SRC_DIRS = src/* src/malloc/$(MALLOC_DIR)`. Pushing the
+            // top-level dir here lets the recursive walker pick up the
+            // wrappers + descend into mallocng/, while `oldmalloc` stays
+            // excluded via `exclude_archs`. (Previously only mallocng/ was
+            // pushed, so the public wrappers were missing and any static
+            // link against libc.a failed with undefined malloc/free/etc.)
             subsys_dirs.push(p);
         }
     }
@@ -2085,34 +2091,100 @@ extern char bb_common_bufsiz1[];\n\
     }
 
     println!("cargo:rustc-check-cfg=cfg(busybox_built)");
-    match build.try_compile("busybox") {
-        Ok(()) => {
-            // The cc::Build emits libbusybox.a under $OUT_DIR — the
-            // archive of every compiled .o. The brief asks for a
-            // `busybox` static binary; producing the archive is the
-            // load-bearing first step (proves the toolchain works).
-            // The final link step (musl crt1 + libc.a + libbusybox.a
-            // -> ELF) is a follow-up: it needs the kernel-side ELF
-            // loader (#472) wired enough to give us a usable target,
-            // and a host `ld` invocation that emits a Linux ELF (vs
-            // the host's default PE32+/Mach-O), which is more
-            // toolchain plumbing than this commit's "prove the build
-            // wiring" scope.
-            println!(
-                "cargo:rustc-link-search=native={}",
-                out_dir.display(),
-            );
-            println!("cargo:rustc-cfg=busybox_built");
-            println!(
-                "cargo:warning=busybox: built libbusybox.a ({} sources, {} applets enabled) under {} — final ELF link is a #527 follow-up",
-                sources.len(),
-                chosen_applets.len(),
-                out_dir.display(),
-            );
-            Ok(())
-        }
-        Err(e) => Err(format!("{}", e)),
+    if let Err(e) = build.try_compile("busybox") {
+        return Err(format!("{}", e));
     }
+    // The cc::Build emits libbusybox.a under $OUT_DIR — the archive of
+    // every compiled .o. The brief asks for a `busybox` static BINARY:
+    // link it now. Static-link recipe per musl's own ldflags:
+    //   crt1.o crti.o --start-group libbusybox.a libc.a --end-group crtn.o
+    // (the group because libbb ↔ libc reference each other: e.g. libc's
+    // vfscanf needs realloc which pulls the wrappers, which need
+    // mallocng, while busybox objects need libc everything).
+    let crt_dir = out_dir.join("busybox").join("crt");
+    fs::create_dir_all(&crt_dir).map_err(|e| format!("create {}: {}", crt_dir.display(), e))?;
+    let crt1_o = crt_dir.join("crt1.o");
+    let crti_o = crt_dir.join("crti.o");
+    let crtn_o = crt_dir.join("crtn.o");
+    // crt1.c builds with the same musl include layout the libc pass uses;
+    // crti/crtn are the x86_64 asm stubs. Plain `clang` driver invocations
+    // (not cc::Build) so nothing host-flavoured (-m64 --target=msvc, /MD,
+    // debug flags) sneaks in.
+    let musl_config_dir = manifest_dir.join("musl_config");
+    let crt_cc = |srcs: &[&Path], out: &Path, full_cflags: bool| -> Result<(), String> {
+        let mut cmd = std::process::Command::new("clang");
+        cmd.arg("--target=x86_64-unknown-linux-musl");
+        if full_cflags {
+            cmd.args(["-std=c99", "-ffreestanding", "-nostdinc", "-fno-builtin", "-Os"])
+                .arg("-D_XOPEN_SOURCE=700")
+                .arg("-I").arg(musl_root.join("arch").join("x86_64"))
+                .arg("-I").arg(musl_root.join("arch").join("generic"))
+                .arg("-I").arg(musl_root.join("src").join("include"))
+                .arg("-I").arg(musl_root.join("src").join("internal"))
+                .arg("-I").arg(&musl_gen_include)
+                .arg("-I").arg(&musl_main_include)
+                .arg("-I").arg(&musl_config_dir);
+        }
+        cmd.arg("-c");
+        for s in srcs {
+            cmd.arg(s);
+        }
+        cmd.arg("-o").arg(out);
+        let st = cmd
+            .status()
+            .map_err(|e| format!("spawn clang for {}: {}", out.display(), e))?;
+        if st.success() {
+            Ok(())
+        } else {
+            Err(format!("compiling {} failed: {}", out.display(), st))
+        }
+    };
+    crt_cc(&[&musl_root.join("crt").join("crt1.c")], &crt1_o, true)?;
+    crt_cc(&[&musl_root.join("crt").join("x86_64").join("crti.s")], &crti_o, false)?;
+    crt_cc(&[&musl_root.join("crt").join("x86_64").join("crtn.s")], &crtn_o, false)?;
+
+    // `busybox.elf`, not `busybox`: $OUT_DIR/busybox/ is already the
+    // generated-include/host-tool directory tree above.
+    let busybox_elf = out_dir.join("busybox.elf");
+    let libbusybox_a = out_dir.join("libbusybox.a");
+    let libc_a = out_dir.join("libc.a");
+    // Windows quirk: CreateProcess treats `.lld` as the file extension of
+    // `ld.lld`, so it does NOT append `.exe` and "program not found"s even
+    // with the LLVM bin on PATH. Spell out the .exe there; unix hosts keep
+    // the bare name.
+    let ld_lld = if cfg!(target_os = "windows") {
+        "ld.lld.exe"
+    } else {
+        "ld.lld"
+    };
+    let st = std::process::Command::new(ld_lld)
+        .arg("-static")
+        .arg("-o")
+        .arg(&busybox_elf)
+        .arg(&crt1_o)
+        .arg(&crti_o)
+        .arg("--start-group")
+        .arg(&libbusybox_a)
+        .arg(&libc_a)
+        .arg("--end-group")
+        .arg(&crtn_o)
+        .status()
+        .map_err(|e| format!("spawn ld.lld for busybox link: {}", e))?;
+    if !st.success() {
+        return Err(format!("busybox static link failed: {}", st));
+    }
+    let elf_len = fs::metadata(&busybox_elf).map(|m| m.len()).unwrap_or(0);
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-cfg=busybox_built");
+    println!(
+        "cargo:warning=busybox: linked static ELF ({} bytes, {} sources, {} applets) at {}",
+        elf_len,
+        sources.len(),
+        chosen_applets.len(),
+        busybox_elf.display(),
+    );
+    Ok(())
 }
 
 fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
