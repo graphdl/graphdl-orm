@@ -1894,7 +1894,7 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
     // backfills (migration rules reading other trigger cells) are intentional and
     // NOT flagged. Warning only (no reject) so existing fleet apps still compile;
     // the fix is to rename the marker (e.g. `... is dependency blocked`).
-    let sm_trigger_cells: std::collections::HashSet<String> = model.state_machines.iter()
+    let sm_trigger_cells: HashSet<String> = model.state_machines.iter()
         .flat_map(|sm| sm.transition_table.iter().map(|(_, _, ev)| ev.replace(' ', "_")))
         .collect();
     if !sm_trigger_cells.is_empty() {
@@ -8183,7 +8183,7 @@ fn compile_sm_event_fold(sm: &CompiledStateMachine) -> CompiledDerivation {
 /// intentional and excluded, as is any derivation whose consequent is not a
 /// trigger cell (the SM folds, the bridge, ordinary markers). Sorted + deduped.
 pub(crate) fn sm_trigger_consequent_collisions(
-    trigger_cells: &std::collections::HashSet<String>,
+    trigger_cells: &HashSet<String>,
     rules: &[(String, Vec<String>)],
 ) -> Vec<String> {
     let mut hits: Vec<String> = rules.iter()
@@ -8201,9 +8201,9 @@ pub(crate) fn sm_trigger_consequent_collisions(
 /// Used to synthesize a causal ORDER for timeless events in the reconstruction
 /// fold (events fire in increasing from-status depth: started < blocked <
 /// unblocked < …). Unreachable statuses are absent; callers default them.
-fn sm_status_bfs_depths(sm: &CompiledStateMachine) -> std::collections::HashMap<String, usize> {
-    let mut depth: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+fn sm_status_bfs_depths(sm: &CompiledStateMachine) -> HashMap<String, usize> {
+    let mut depth: HashMap<String, usize> = HashMap::new();
+    let mut queue: alloc::collections::VecDeque<String> = alloc::collections::VecDeque::new();
     depth.insert(sm.initial.clone(), 0);
     queue.push_back(sm.initial.clone());
     while let Some(s) = queue.pop_front() {
@@ -8306,9 +8306,9 @@ fn sm_ordered_fold_branch(sm: &CompiledStateMachine) -> Func {
     // rather than cell-concat order.
     let depth = sm_status_bfs_depths(sm);
     let max_depth = depth.values().copied().max().unwrap_or(0);
-    let has_outgoing: std::collections::HashSet<&String> =
+    let has_outgoing: HashSet<&String> =
         sm.transition_table.iter().map(|(f, _, _)| f).collect();
-    let mut rank: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut rank: HashMap<String, usize> = HashMap::new();
     for (from, to, event_ft) in sm.transition_table.iter() {
         let from_depth = depth.get(from).copied().unwrap_or(max_depth);
         let to_terminal = !has_outgoing.contains(to);

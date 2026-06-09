@@ -9747,7 +9747,7 @@ fn sm_fold_step_folds_trigger_stream_from_s0() {
 // but NOT a legitimate event->event backfill, the SM fold, or a renamed marker.
 #[test]
 fn sm_trigger_consequent_collision_flags_marker_not_backfill() {
-    let triggers: std::collections::HashSet<String> =
+    let triggers: hashbrown::HashSet<String> =
         ["Task_is_started", "Task_is_blocked", "Task_is_finished", "Task_is_unblocked"]
             .iter().map(|s| s.to_string()).collect();
     let rules: Vec<(String, Vec<String>)> = vec![
