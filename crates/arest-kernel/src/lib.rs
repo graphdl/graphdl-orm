@@ -83,6 +83,12 @@ pub mod doom_bin;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64", feature = "doom"))]
 pub mod doom_wad;
 
+// Baked busybox static ELF (#525/#526). The module body is
+// `#![cfg(busybox_built)]`-gated — present exactly when the build
+// script's busybox pass linked the binary. All targets (host included):
+// the host-side tests exercise the boot seeding round-trip.
+pub mod busybox_bin;
+
 // `arch` is shared across all UEFI entries. On x86_64 UEFI it supplies
 // the full 16550 / GDT / IDT / paging / PIT / PS-2 surface
 // post-ExitBootServices; on aarch64 / armv7 UEFI it supplies the PL011

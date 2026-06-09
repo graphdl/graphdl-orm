@@ -329,6 +329,16 @@ pub fn init() {
         // shape and the handoff note for #581.
         initial = seed_ui_bundle_cells(initial);
 
+        // #525/#526 — seed the baked busybox static ELF as a File
+        // fact at "/bin/busybox", reachable through the same
+        // File_has_Name surface `openat`/`execve` resolve against.
+        // Compiled exactly when the build script's busybox pass
+        // linked the binary (cfg(busybox_built)).
+        #[cfg(busybox_built)]
+        {
+            initial = seed_busybox_file_cells(initial);
+        }
+
         // Box::leak gives us the `&'static Object` the slot stores.
         // The leak is intentional: the legacy `state()` shim returns
         // `&'static Object`, and `apply()`'s atomic-pointer-swap
@@ -405,6 +415,50 @@ pub fn seed_ui_bundle_cells(state: Object) -> Object {
         );
     }
     acc
+}
+
+/// Seed the baked busybox static ELF (#525/#526) into the supplied
+/// state's File cell graph as `/bin/busybox`.
+///
+/// Pushes the #398 pair the exec path resolves:
+///
+///   * `File_has_Name<File, Name>` — "/bin/busybox", matched VERBATIM
+///     by `openat::lookup_file_cell_id_in` (tier-1 does no path
+///     canonicalisation, so callers must use this exact string)
+///   * `File_has_ContentRef<File, ContentRef>` — hex-encoded inline
+///     ELF bytes, decoded by `read::read_file_cell_bytes`
+///
+/// plus `File_has_Size`/`File_has_MimeType` for parity with the
+/// upload path's fact shape. One File id (`busybox-bin`), one content
+/// blob: busybox is a multi-call binary, so `sh`/`ls`/`cat`… arrive as
+/// argv[0] aliases at exec time, NOT as extra Files (which would
+/// duplicate the ~400 KB blob per name).
+#[cfg(busybox_built)]
+pub fn seed_busybox_file_cells(state: Object) -> Object {
+    let elf = crate::busybox_bin::BUSYBOX_ELF;
+    let file_id = "busybox-bin";
+    let cref = assets::encode_inline_hex(elf);
+    let size = format!("{}", elf.len());
+    let mut acc = ast::cell_push(
+        "File_has_Name",
+        ast::fact_from_pairs(&[("File", file_id), ("Name", "/bin/busybox")]),
+        &state,
+    );
+    acc = ast::cell_push(
+        "File_has_ContentRef",
+        ast::fact_from_pairs(&[("File", file_id), ("ContentRef", &cref)]),
+        &acc,
+    );
+    acc = ast::cell_push(
+        "File_has_MimeType",
+        ast::fact_from_pairs(&[("File", file_id), ("MimeType", "application/x-executable")]),
+        &acc,
+    );
+    ast::cell_push(
+        "File_has_Size",
+        ast::fact_from_pairs(&[("File", file_id), ("Size", &size)]),
+        &acc,
+    )
 }
 
 /// Dispatch a parsed HTTP request through the baked SYSTEM.
@@ -1383,6 +1437,32 @@ pub(crate) mod tests {
         let asset = assets::lookup_from_state(&after, http_path)
             .expect("seeded entry must round-trip via lookup_from_state");
         assert_eq!(asset.body, body.to_vec());
+    }
+
+    // ── #525/#526 seed_busybox_file_cells round-trip ────────────────
+
+    /// The baked busybox.elf must be reachable through the SAME File
+    /// surface `openat`/`execve` resolve against: `File_has_Name`
+    /// "/bin/busybox" → cell id → `read_file_cell_bytes` returns the
+    /// exact embedded ELF bytes. Compiled only when the busybox pass
+    /// actually linked the ELF (cfg emitted by build.rs).
+    #[cfg(busybox_built)]
+    #[test]
+    fn seed_busybox_file_cells_serves_elf_at_bin_busybox() {
+        let elf = crate::busybox_bin::BUSYBOX_ELF;
+        assert!(!elf.is_empty(), "busybox_built implies a non-empty blob");
+        let state = seed_busybox_file_cells(Object::phi());
+        let id = crate::syscall::openat::lookup_file_cell_id_in("/bin/busybox", &state)
+            .expect("File_has_Name '/bin/busybox' fact must exist");
+        let bytes = crate::syscall::read::read_file_cell_bytes(
+            &id,
+            0,
+            elf.len() as u64,
+            &state,
+        )
+        .expect("ContentRef bytes must decode");
+        assert_eq!(&bytes[..4], b"\x7fELF", "embedded blob must be an ELF");
+        assert_eq!(bytes.as_slice(), elf, "round-trip must be byte-exact");
     }
 
     /// A subscriber that calls `unsubscribe(its_own_id)` from
