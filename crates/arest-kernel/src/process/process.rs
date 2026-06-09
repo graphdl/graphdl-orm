@@ -56,7 +56,7 @@ use alloc::vec::Vec;
 use arest::ast::{cell_push, fact_from_pairs, Object};
 
 use super::address_space::AddressSpace;
-use super::elf::ELF64_PHENT_SIZE;
+use super::elf::{DynamicImage, ELF64_PHENT_SIZE};
 use super::fd_table::FdTable;
 use super::signal::{SigInfo, SignalDelivery, SignalState, SIGCHLD, SIGSEGV};
 use super::stack::{AuxvEntry, AuxvType, InitialStack, StackBuilder, StackError};
@@ -361,6 +361,64 @@ pub struct Process {
     /// the head pointer + the in-band `futex_offset` to walk. `0` until
     /// `set_robust_list` runs.
     pub robust_list_len: u64,
+    /// For a dynamically-linked image (#522): the load base of the
+    /// program interpreter (ld-musl), published to userspace as auxv
+    /// `AT_BASE`. `None` for a statically-linked image, which omits
+    /// AT_BASE. Set by `Process::from_dynamic_image` from the
+    /// `DynamicImage` the loader produced; `spawn` emits the AT_BASE row
+    /// only when it is `Some`.
+    pub interp_base: Option<u64>,
+    /// For a dynamically-linked image (#522): the *program's* own entry
+    /// point (auxv `AT_ENTRY`), which differs from
+    /// `address_space.entry_point` — the latter is the *interpreter's*
+    /// entry, where the kernel actually starts execution. `None` for a
+    /// static image, where AT_ENTRY is just `entry_point`. Set by
+    /// `Process::from_dynamic_image`.
+    pub program_entry: Option<u64>,
+}
+
+/// Assemble the auxiliary vector `Process::spawn` pushes onto the
+/// initial stack. The AT_NULL terminator is appended by
+/// `StackBuilder::finalize`, so it is NOT included here.
+///
+/// For a statically-linked image `interp_base` / `program_entry` are
+/// `None` and the result is the System V AMD64 minimum (AT_PHDR /
+/// PHENT / PHNUM / PAGESZ / ENTRY / RANDOM). For a dynamically-linked
+/// image (#522), `interp_base` is `Some(base)` and AT_BASE is emitted
+/// (the interpreter's load base, which the interpreter relocates
+/// itself against), and `program_entry` is `Some(e)` so AT_ENTRY
+/// carries the PROGRAM's own entry rather than the jump target
+/// (`entry_point`, which for a dynamic image is the *interpreter's*
+/// entry). Order follows the static fast path with AT_BASE slotted in
+/// before AT_ENTRY.
+fn build_auxv(
+    phdr_addr: u64,
+    phdr_count: u64,
+    random_addr: u64,
+    entry_point: u64,
+    interp_base: Option<u64>,
+    program_entry: Option<u64>,
+) -> Vec<AuxvEntry> {
+    let mut auxv = Vec::with_capacity(8);
+    auxv.push(AuxvEntry::new(AuxvType::Phdr, phdr_addr));
+    auxv.push(AuxvEntry::new(AuxvType::Phent, ELF64_PHENT_SIZE as u64));
+    auxv.push(AuxvEntry::new(AuxvType::Phnum, phdr_count));
+    auxv.push(AuxvEntry::new(AuxvType::Pagesz, SYS_PAGESZ));
+    // AT_BASE only for a dynamically-linked image — the interpreter
+    // relocates itself relative to this base. Slotted before AT_ENTRY.
+    if let Some(base) = interp_base {
+        auxv.push(AuxvEntry::new(AuxvType::Base, base));
+    }
+    // AT_ENTRY is the PROGRAM's entry. For a static image that's the
+    // jump target (`entry_point`); for a dynamic image the jump target
+    // is the interpreter's entry, so the program entry is supplied
+    // separately via `program_entry`.
+    auxv.push(AuxvEntry::new(
+        AuxvType::Entry,
+        program_entry.unwrap_or(entry_point),
+    ));
+    auxv.push(AuxvEntry::new(AuxvType::Random, random_addr));
+    auxv
 }
 
 impl Process {
@@ -435,7 +493,25 @@ impl Process {
             // pthreads binary populates this early.
             robust_list_head: 0,
             robust_list_len: 0,
+            // Static image by default — no interpreter. `from_dynamic_image`
+            // sets these for a dynamically-linked program (#522).
+            interp_base: None,
+            program_entry: None,
         }
+    }
+
+    /// Build a Process around a `DynamicImage` (a dynamically-linked
+    /// program loaded together with its interpreter — #522). The
+    /// address space is the combined program + interpreter image (its
+    /// `entry_point` is the interpreter's entry, where the kernel starts
+    /// execution); `interp_base` (auxv `AT_BASE`) and `program_entry`
+    /// (auxv `AT_ENTRY`) are carried so `spawn` publishes them to the C
+    /// startup. Everything else matches `new`.
+    pub fn from_dynamic_image(pid: u32, image: DynamicImage) -> Self {
+        let mut proc = Self::new(pid, image.address_space);
+        proc.interp_base = Some(image.interp_base);
+        proc.program_entry = Some(image.program_entry);
+        proc
     }
 
     /// True when this process is a child of `parent_pid` — the
@@ -514,20 +590,19 @@ impl Process {
             .unwrap_or(0);
         let entry = self.address_space.entry_point;
         let random_addr = self.at_random.as_ptr() as u64;
-        let auxv: [AuxvEntry; 7] = [
-            AuxvEntry::new(AuxvType::Phdr, phdr_addr),
-            AuxvEntry::new(AuxvType::Phent, ELF64_PHENT_SIZE as u64),
-            AuxvEntry::new(AuxvType::Phnum, phdr_count),
-            AuxvEntry::new(AuxvType::Pagesz, SYS_PAGESZ),
-            AuxvEntry::new(AuxvType::Entry, entry),
-            AuxvEntry::new(AuxvType::Random, random_addr),
-            // AT_NULL is appended by `StackBuilder::finalize` — do
-            // NOT emit it explicitly (the builder's contract is to
-            // own the terminator).
-            // Sentinel hint to the reader: this is the LAST real
-            // entry; the trailing AT_NULL terminator is implicit.
-            AuxvEntry::new(AuxvType::Null, 0),
-        ];
+        // For a static image `interp_base` / `program_entry` are `None`
+        // (the System V minimum, AT_ENTRY == entry); for a dynamically-
+        // linked image (#522) they carry AT_BASE + the program-entry
+        // AT_ENTRY. `build_auxv` does NOT emit AT_NULL — `finalize`
+        // owns the terminator.
+        let auxv = build_auxv(
+            phdr_addr,
+            phdr_count,
+            random_addr,
+            entry,
+            self.interp_base,
+            self.program_entry,
+        );
 
         // Step 2: build the stack. Walk argv / envp / auxv in order;
         // `StackBuilder::finalize` allocates + populates the stack
@@ -539,11 +614,10 @@ impl Process {
         for var in envp {
             builder = builder.push_envp(var);
         }
-        // Skip the trailing AT_NULL sentinel — `StackBuilder::finalize`
-        // owns the terminator. We slice the array to drop the last
-        // entry (index 6 = AT_NULL placeholder) before pushing.
-        for entry in &auxv[..auxv.len() - 1] {
-            builder = builder.push_auxv(*entry);
+        // `build_auxv` returns the real entries only (no AT_NULL —
+        // `StackBuilder::finalize` owns the terminator), so push them all.
+        for aux in &auxv {
+            builder = builder.push_auxv(*aux);
         }
         let stack = builder.finalize().map_err(SpawnError::from)?;
 
@@ -1671,5 +1745,70 @@ mod tests {
             1 << 9,
             "RFLAGS must have IF set"
         );
+    }
+
+    /// `build_auxv` for a static image (no interpreter) emits the System
+    /// V minimum with AT_ENTRY == the entry point and NO AT_BASE — and
+    /// no AT_NULL (the stack builder owns the terminator).
+    #[test]
+    fn build_auxv_static_omits_base_entry_is_entry_point() {
+        let auxv = build_auxv(0x1000, 2, 0x2000, 0x0040_1000, None, None);
+        assert!(
+            !auxv.iter().any(|e| e.a_type == AuxvType::Base as u64),
+            "a static image omits AT_BASE"
+        );
+        assert!(
+            !auxv.iter().any(|e| e.a_type == AuxvType::Null as u64),
+            "build_auxv omits AT_NULL (finalize owns it)"
+        );
+        let at_entry = auxv
+            .iter()
+            .find(|e| e.a_type == AuxvType::Entry as u64)
+            .expect("AT_ENTRY present");
+        assert_eq!(at_entry.a_val, 0x0040_1000);
+    }
+
+    /// `build_auxv` for a dynamic image (#522) emits AT_BASE = the
+    /// interpreter load base, and AT_ENTRY = the PROGRAM's entry — NOT
+    /// the jump target (`entry_point`, which is the interpreter's entry).
+    #[test]
+    fn build_auxv_dynamic_emits_base_and_program_entry() {
+        let interp_entry = 0x0000_1000_0040_1000; // jump target = interp entry
+        let prog_entry = 0x0040_1000;
+        let base = 0x0000_1000_0000_0000;
+        let auxv = build_auxv(0x1000, 2, 0x2000, interp_entry, Some(base), Some(prog_entry));
+        let at_base = auxv
+            .iter()
+            .find(|e| e.a_type == AuxvType::Base as u64)
+            .expect("AT_BASE present for a dynamic image");
+        assert_eq!(at_base.a_val, base);
+        let at_entry = auxv
+            .iter()
+            .find(|e| e.a_type == AuxvType::Entry as u64)
+            .expect("AT_ENTRY present");
+        assert_eq!(
+            at_entry.a_val, prog_entry,
+            "AT_ENTRY is the program entry, not the interpreter jump target"
+        );
+    }
+
+    /// `Process::from_dynamic_image` carries the `DynamicImage`'s
+    /// AT_BASE / AT_ENTRY onto the Process and adopts the combined
+    /// program+interpreter address space (whose entry_point is the
+    /// interpreter's entry — the kernel's jump target).
+    #[test]
+    fn from_dynamic_image_carries_base_and_program_entry() {
+        let space = AddressSpace::new(0xdead_0000);
+        let img = DynamicImage {
+            address_space: space,
+            interp_base: 0x7f00_0000,
+            program_entry: 0x0040_1000,
+        };
+        let proc = Process::from_dynamic_image(9, img);
+        assert_eq!(proc.interp_base, Some(0x7f00_0000));
+        assert_eq!(proc.program_entry, Some(0x0040_1000));
+        assert_eq!(proc.address_space.entry_point, 0xdead_0000);
+        // A from_dynamic_image process starts Created, like new().
+        assert_eq!(proc.state, ProcessState::Created);
     }
 }
