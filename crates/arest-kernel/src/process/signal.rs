@@ -373,6 +373,50 @@ impl SignalState {
         taken
     }
 
+    /// Decide what happens when `signum` is delivered to this process
+    /// *right now* — a pure *reading* over the disposition table plus
+    /// the signal's intrinsic default. Returns `None` for an
+    /// out-of-range signal (the caller maps it to -EINVAL at the
+    /// future kill(2) surface).
+    ///
+    /// The decision order encodes the un-catchable invariant (#549):
+    /// SIGKILL and SIGSTOP bypass the disposition table entirely —
+    /// neither a handler nor SIG_IGN can intercept them, so they
+    /// resolve to Terminate / Stop regardless of what `actions[]`
+    /// holds. Every other signal consults its installed disposition
+    /// (real handler → `RunHandler`, SIG_IGN → `Ignore`) and falls
+    /// back to the intrinsic `default_action` (Term/Core/Ign/Stop/Cont)
+    /// when it is at SIG_DFL.
+    pub fn delivery_decision(&self, signum: i32) -> Option<SignalDelivery> {
+        if !Self::is_valid_signum(signum) {
+            return None;
+        }
+        // Un-catchable signals bypass the disposition table — a handler
+        // or SIG_IGN parked against them is powerless; the kernel
+        // honours the signal's intrinsic action no matter what.
+        if signum == SIGKILL {
+            return Some(SignalDelivery::Terminate);
+        }
+        if signum == SIGSTOP {
+            return Some(SignalDelivery::Stop);
+        }
+        let action = self.actions[(signum - 1) as usize];
+        if action.has_handler() {
+            return Some(SignalDelivery::RunHandler(action.handler));
+        }
+        if action.is_ignored() {
+            return Some(SignalDelivery::Ignore);
+        }
+        // SIG_DFL — take the signal's intrinsic default.
+        Some(match default_action(signum) {
+            DefaultAction::Terminate => SignalDelivery::Terminate,
+            DefaultAction::Ignore => SignalDelivery::Ignore,
+            DefaultAction::CoreDump => SignalDelivery::CoreDump,
+            DefaultAction::Stop => SignalDelivery::Stop,
+            DefaultAction::Continue => SignalDelivery::Continue,
+        })
+    }
+
     /// Compose this signal state's facts onto `state` and return the
     /// new state. Same shape as `AddressSpace::record_into_cells` /
     /// `Process::record_into_cells` — a pure projection the caller can
@@ -461,6 +505,164 @@ pub const SIGSTOP: i32 = 19;
 /// resulting blocked mask and rejected by `rt_sigaction`'s disposition
 /// change. `1 << 8` (SIGKILL=9) | `1 << 18` (SIGSTOP=19).
 pub const UNBLOCKABLE_MASK: u64 = (1u64 << (SIGKILL - 1)) | (1u64 << (SIGSTOP - 1));
+
+// -- #549: standard signal numbers + default-disposition table ------
+//
+// The full standard-signal numbering for x86_64 Linux (matches musl's
+// `vendor/musl/arch/x86_64/bits/signal.h` and the `man 7 signal`
+// "Standard signals" table). SIGKILL (9) and SIGSTOP (19) are already
+// declared above — they have a second role in `UNBLOCKABLE_MASK`. The
+// rest are introduced here as the `default_action` table's vocabulary:
+// the delivery path (`SignalState::delivery_decision`, #549) reads
+// `default_action(signum)` when a signal arrives with neither a
+// handler nor SIG_IGN installed.
+
+/// SIGHUP — controlling-terminal hangup. Default: Term.
+pub const SIGHUP: i32 = 1;
+/// SIGINT — interrupt from keyboard (Ctrl-C). Default: Term.
+pub const SIGINT: i32 = 2;
+/// SIGQUIT — quit from keyboard (Ctrl-\). Default: Core.
+pub const SIGQUIT: i32 = 3;
+/// SIGILL — illegal instruction. Default: Core.
+pub const SIGILL: i32 = 4;
+/// SIGTRAP — trace / breakpoint trap. Default: Core.
+pub const SIGTRAP: i32 = 5;
+/// SIGABRT — abort(3). Default: Core.
+pub const SIGABRT: i32 = 6;
+/// SIGBUS — bus error (bad memory access). Default: Core.
+pub const SIGBUS: i32 = 7;
+/// SIGFPE — floating-point exception. Default: Core.
+pub const SIGFPE: i32 = 8;
+// SIGKILL (9) is declared above (UNBLOCKABLE_MASK). Default: Term.
+/// SIGUSR1 — user-defined signal 1. Default: Term.
+pub const SIGUSR1: i32 = 10;
+/// SIGSEGV — invalid memory reference. Default: Core. (#550 delivers
+/// it from the page-fault handler.)
+pub const SIGSEGV: i32 = 11;
+/// SIGUSR2 — user-defined signal 2. Default: Term.
+pub const SIGUSR2: i32 = 12;
+/// SIGPIPE — write to a pipe with no reader. Default: Term.
+pub const SIGPIPE: i32 = 13;
+/// SIGALRM — timer signal from alarm(2). Default: Term.
+pub const SIGALRM: i32 = 14;
+/// SIGTERM — termination request. Default: Term. The #549 headliner:
+/// catchable (a handler runs if installed), else the process exits.
+pub const SIGTERM: i32 = 15;
+/// SIGSTKFLT — stack fault on coprocessor (unused on Linux). Term.
+pub const SIGSTKFLT: i32 = 16;
+/// SIGCHLD — child stopped or terminated. Default: Ignore. This is
+/// why #551 is a silent no-op for a parent with no handler installed.
+pub const SIGCHLD: i32 = 17;
+/// SIGCONT — continue if stopped. Default: Continue.
+pub const SIGCONT: i32 = 18;
+// SIGSTOP (19) is declared above (UNBLOCKABLE_MASK). Default: Stop.
+/// SIGTSTP — stop typed at terminal (Ctrl-Z). Default: Stop.
+pub const SIGTSTP: i32 = 20;
+/// SIGTTIN — background process attempted terminal read. Default: Stop.
+pub const SIGTTIN: i32 = 21;
+/// SIGTTOU — background process attempted terminal write. Default: Stop.
+pub const SIGTTOU: i32 = 22;
+/// SIGURG — urgent data on socket. Default: Ignore.
+pub const SIGURG: i32 = 23;
+/// SIGXCPU — CPU-time limit exceeded. Default: Core.
+pub const SIGXCPU: i32 = 24;
+/// SIGXFSZ — file-size limit exceeded. Default: Core.
+pub const SIGXFSZ: i32 = 25;
+/// SIGVTALRM — virtual (process-time) alarm. Default: Term.
+pub const SIGVTALRM: i32 = 26;
+/// SIGPROF — profiling timer expired. Default: Term.
+pub const SIGPROF: i32 = 27;
+/// SIGWINCH — controlling-terminal window resize. Default: Ignore.
+pub const SIGWINCH: i32 = 28;
+/// SIGIO / SIGPOLL — asynchronous I/O now possible. Default: Term.
+pub const SIGIO: i32 = 29;
+/// SIGPWR — power failure imminent. Default: Term.
+pub const SIGPWR: i32 = 30;
+/// SIGSYS — bad system call (seccomp / invalid syscall). Default: Core.
+pub const SIGSYS: i32 = 31;
+
+/// First real-time signal on musl x86_64 (`SIGRTMIN`). Real-time
+/// signals run `SIGRTMIN..=SIGRTMAX` (34..=64); none carry a special
+/// default — Linux terminates. Exposed so the delivery path can reason
+/// about the RT range without a magic number.
+pub const SIGRTMIN: i32 = 34;
+
+/// The kernel's built-in action for a signal whose disposition is
+/// SIG_DFL — what Linux does when the process installed neither a
+/// userspace handler nor SIG_IGN. Source: `man 7 signal` "Standard
+/// signals" table. The delivery decision (`SignalState::
+/// delivery_decision`, #549) maps this to a concrete `SignalDelivery`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultAction {
+    /// Terminate the process, no core file (`Term`). The majority
+    /// default — SIGTERM, SIGINT, SIGKILL, SIGHUP, SIGALRM, the user
+    /// signals, every real-time signal, and any unnamed number.
+    Terminate,
+    /// Discard the signal with no effect (`Ign`). SIGCHLD, SIGURG,
+    /// SIGWINCH.
+    Ignore,
+    /// Terminate AND dump core (`Core`). SIGSEGV, SIGABRT, SIGQUIT,
+    /// SIGILL, SIGTRAP, SIGBUS, SIGFPE, SIGSYS, SIGXCPU, SIGXFSZ. #550
+    /// writes the core file; the process still dies, so for the
+    /// process-state transition this is a termination like `Term`.
+    CoreDump,
+    /// Suspend the process (`Stop`). SIGSTOP, SIGTSTP, SIGTTIN,
+    /// SIGTTOU. Realised by the job-control / scheduler track (#530).
+    Stop,
+    /// Resume a stopped process (`Cont`). SIGCONT.
+    Continue,
+}
+
+/// The default disposition for `signum` — the action Linux takes when
+/// the signal is delivered to a process that installed neither a
+/// handler nor SIG_IGN. Numbers the standard table doesn't name
+/// (real-time signals `SIGRTMIN..=64`, and any out-of-range value)
+/// default to `Terminate`, matching the kernel's treatment of
+/// real-time + unknown signals. A pure *reading*: no process state,
+/// just the signal's intrinsic default.
+pub fn default_action(signum: i32) -> DefaultAction {
+    match signum {
+        SIGQUIT | SIGILL | SIGTRAP | SIGABRT | SIGBUS | SIGFPE | SIGSEGV | SIGXCPU | SIGXFSZ
+        | SIGSYS => DefaultAction::CoreDump,
+        SIGCHLD | SIGURG | SIGWINCH => DefaultAction::Ignore,
+        SIGCONT => DefaultAction::Continue,
+        SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU => DefaultAction::Stop,
+        // SIGHUP, SIGINT, SIGKILL, SIGUSR1/2, SIGPIPE, SIGALRM,
+        // SIGTERM, SIGSTKFLT, SIGVTALRM, SIGPROF, SIGIO, SIGPWR, every
+        // real-time signal, and any unnamed/out-of-range number.
+        _ => DefaultAction::Terminate,
+    }
+}
+
+/// The concrete outcome of delivering a signal to a process —
+/// `SignalState::delivery_decision`'s return. Distinct from
+/// `DefaultAction` (the signal's *intrinsic* default) because delivery
+/// also accounts for the process's installed disposition: a signal
+/// whose default is Term still resolves to `RunHandler` when the
+/// process installed one, and to `Ignore` under SIG_IGN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalDelivery {
+    /// Run the userspace handler at this address. The ring-3 delivery
+    /// track (#549 follow-up) snapshots the interrupted context
+    /// (`push_context`) and redirects execution here.
+    RunHandler(u64),
+    /// Discard the signal — SIG_IGN, or a default-Ignore signal
+    /// (SIGCHLD / SIGURG / SIGWINCH) at SIG_DFL.
+    Ignore,
+    /// Terminate the process, no core (default `Term`, or the
+    /// un-catchable SIGKILL). #549 maps this to the
+    /// `ProcessState::Killed` transition.
+    Terminate,
+    /// Terminate the process AND dump core (default `Core`). #550
+    /// writes the core file; the process-state transition is the same
+    /// termination `Terminate` drives.
+    CoreDump,
+    /// Suspend the process (default `Stop`, or the un-catchable
+    /// SIGSTOP). Realised by the job-control / scheduler track (#530).
+    Stop,
+    /// Resume a stopped process (SIGCONT). Realised by #530.
+    Continue,
+}
 
 #[cfg(test)]
 mod tests {
@@ -713,5 +915,156 @@ mod tests {
         });
         let active = format!("{:?}", s.record_into_cells("p", &Object::phi()));
         assert!(active.contains("Process_has_SignalHandlerActive"));
+    }
+
+    // -- #549: default-disposition table -----------------------------
+
+    /// The signals whose SIG_DFL default is to terminate the process
+    /// without a core dump (`man 7 signal` "Standard signals", action
+    /// `Term`). SIGTERM + SIGKILL are the #549 headliners.
+    #[test]
+    fn default_action_terminate_signals() {
+        for sig in [SIGHUP, SIGINT, SIGKILL, SIGUSR1, SIGUSR2, SIGPIPE, SIGALRM, SIGTERM] {
+            assert_eq!(
+                default_action(sig),
+                DefaultAction::Terminate,
+                "signal {} defaults to Term",
+                sig
+            );
+        }
+    }
+
+    /// The signals whose SIG_DFL default is terminate-plus-core
+    /// (action `Core`). #550 (SIGSEGV) consumes this arm to decide
+    /// "dump core then terminate".
+    #[test]
+    fn default_action_core_signals() {
+        for sig in [SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGSEGV, SIGSYS] {
+            assert_eq!(
+                default_action(sig),
+                DefaultAction::CoreDump,
+                "signal {} defaults to Core",
+                sig
+            );
+        }
+    }
+
+    /// Ignore / Stop / Continue defaults. SIGCHLD's Ignore default is
+    /// what makes #551 a no-op for a parent that didn't install a
+    /// handler; SIGCONT/SIGSTOP/SIGTSTP drive the future job-control
+    /// (scheduler #530) track.
+    #[test]
+    fn default_action_ignore_stop_continue_signals() {
+        assert_eq!(default_action(SIGCHLD), DefaultAction::Ignore);
+        assert_eq!(default_action(SIGURG), DefaultAction::Ignore);
+        assert_eq!(default_action(SIGWINCH), DefaultAction::Ignore);
+        assert_eq!(default_action(SIGCONT), DefaultAction::Continue);
+        assert_eq!(default_action(SIGSTOP), DefaultAction::Stop);
+        assert_eq!(default_action(SIGTSTP), DefaultAction::Stop);
+        assert_eq!(default_action(SIGTTIN), DefaultAction::Stop);
+        assert_eq!(default_action(SIGTTOU), DefaultAction::Stop);
+    }
+
+    /// Real-time signals (SIGRTMIN..=SIGRTMAX — 34..=64 on musl
+    /// x86_64) carry no special default: Linux terminates. So does any
+    /// number the named table doesn't cover.
+    #[test]
+    fn default_action_realtime_defaults_to_terminate() {
+        for sig in [34, 40, 64] {
+            assert_eq!(default_action(sig), DefaultAction::Terminate);
+        }
+    }
+
+    // -- #549: delivery decision -------------------------------------
+
+    /// A signal at SIG_DFL whose default is Term resolves to a
+    /// Terminate delivery — the SIGTERM-with-no-handler path.
+    #[test]
+    fn delivery_default_term_signal_terminates() {
+        let s = SignalState::new();
+        assert_eq!(s.delivery_decision(SIGTERM), Some(SignalDelivery::Terminate));
+        assert_eq!(s.delivery_decision(SIGINT), Some(SignalDelivery::Terminate));
+    }
+
+    /// A signal with a userspace handler installed resolves to
+    /// RunHandler carrying the handler address — the catchable path
+    /// SIGTERM takes when the process installed a handler.
+    #[test]
+    fn delivery_with_handler_runs_handler() {
+        let mut s = SignalState::new();
+        s.set_action(
+            SIGTERM,
+            SigAction { handler: 0x4040_1000, flags: 0, restorer: 0, mask: 0 },
+        )
+        .unwrap();
+        assert_eq!(
+            s.delivery_decision(SIGTERM),
+            Some(SignalDelivery::RunHandler(0x4040_1000))
+        );
+    }
+
+    /// SIG_IGN resolves to an Ignore delivery — the signal is dropped.
+    #[test]
+    fn delivery_ignored_signal_is_dropped() {
+        let mut s = SignalState::new();
+        s.set_action(
+            SIGTERM,
+            SigAction { handler: SIG_IGN, ..SigAction::default_action() },
+        )
+        .unwrap();
+        assert_eq!(s.delivery_decision(SIGTERM), Some(SignalDelivery::Ignore));
+    }
+
+    /// SIGKILL is uncatchable: even with a handler forced into the
+    /// table (set_action trusts the caller, bypassing the rt_sigaction
+    /// guard), delivery still Terminates. SIG_IGN is equally powerless.
+    /// The headline #549 invariant.
+    #[test]
+    fn delivery_sigkill_uncatchable_even_with_handler() {
+        let mut s = SignalState::new();
+        s.set_action(
+            SIGKILL,
+            SigAction { handler: 0xdead_0000, flags: 0, restorer: 0, mask: 0 },
+        )
+        .unwrap();
+        assert_eq!(s.delivery_decision(SIGKILL), Some(SignalDelivery::Terminate));
+        s.set_action(
+            SIGKILL,
+            SigAction { handler: SIG_IGN, ..SigAction::default_action() },
+        )
+        .unwrap();
+        assert_eq!(s.delivery_decision(SIGKILL), Some(SignalDelivery::Terminate));
+    }
+
+    /// SIGSTOP is likewise uncatchable: a handler in the table is
+    /// ignored and delivery resolves to Stop.
+    #[test]
+    fn delivery_sigstop_uncatchable_even_with_handler() {
+        let mut s = SignalState::new();
+        s.set_action(
+            SIGSTOP,
+            SigAction { handler: 0xbeef_0000, flags: 0, restorer: 0, mask: 0 },
+        )
+        .unwrap();
+        assert_eq!(s.delivery_decision(SIGSTOP), Some(SignalDelivery::Stop));
+    }
+
+    /// Default Core / Ignore signals resolve to CoreDump / Ignore —
+    /// the substrate #550 (SIGSEGV→Core) and #551 (SIGCHLD→Ignore)
+    /// build on.
+    #[test]
+    fn delivery_default_core_and_ignore() {
+        let s = SignalState::new();
+        assert_eq!(s.delivery_decision(SIGSEGV), Some(SignalDelivery::CoreDump));
+        assert_eq!(s.delivery_decision(SIGCHLD), Some(SignalDelivery::Ignore));
+    }
+
+    /// An out-of-range signal number has no delivery (None → the
+    /// caller maps to -EINVAL at the future kill(2) surface).
+    #[test]
+    fn delivery_invalid_signum_is_none() {
+        let s = SignalState::new();
+        assert!(s.delivery_decision(0).is_none());
+        assert!(s.delivery_decision(65).is_none());
     }
 }

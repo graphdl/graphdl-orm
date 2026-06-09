@@ -58,7 +58,7 @@ use arest::ast::{cell_push, fact_from_pairs, Object};
 use super::address_space::AddressSpace;
 use super::elf::ELF64_PHENT_SIZE;
 use super::fd_table::FdTable;
-use super::signal::SignalState;
+use super::signal::{SignalDelivery, SignalState};
 use super::stack::{AuxvEntry, AuxvType, InitialStack, StackBuilder, StackError};
 use super::trampoline::{self, TrampolineError};
 
@@ -77,11 +77,13 @@ pub(crate) const AT_RANDOM_WIDTH: usize = 16;
 /// emission. C startup reads this via `sysconf(_SC_PAGESIZE)`.
 const SYS_PAGESZ: u64 = 4096;
 
-/// Per-process state machine. Tier-1 currently models construction
-/// → spawn handoff (`Created` → `Running`) plus the userspace exit
-/// path (`Running` → `Exited`, populated by the syscall surface in
-/// #473a). Stop / Killed / Zombied transitions land alongside the
-/// scheduler (#530) and waitpid surface (#531).
+/// Per-process state machine. Tier-1 models construction → spawn
+/// handoff (`Created` → `Running`), the userspace exit path
+/// (`Running` → `Exited`, populated by the syscall surface in #473a),
+/// and signal-driven termination (`Killed`, #549 — set when a fatal
+/// signal's default action fires). Stop (job control) + Zombied
+/// (reaping) transitions land alongside the scheduler (#530) and
+/// waitpid surface (#531).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessState {
     /// Process struct constructed, address space live, stack not yet
@@ -118,6 +120,16 @@ pub enum ProcessState {
     /// honest about "the process asked to block" without requiring the
     /// full park-then-resume mechanism.
     BlockedFutex(u64),
+    /// A fatal signal terminated the process (#549). The carried `i32`
+    /// is the terminating signal number — Linux's `WTERMSIG`, what a
+    /// future `wait(2)` (#531) reports as the cause of death (distinct
+    /// from `Exited`'s voluntary `exit_status`). Set by
+    /// `Process::deliver_signal` when the delivery decision is
+    /// `Terminate` (SIGTERM / SIGKILL / any default-Term signal) or
+    /// `CoreDump` (SIGSEGV / SIGABRT / … — #550 writes the core file;
+    /// the process still dies). SIGKILL reaches here un-catchably: the
+    /// delivery decision honours no handler parked against it.
+    Killed(i32),
 }
 
 /// File-descriptor table entry. Tier-1 shape — just a tag plus an
@@ -543,17 +555,19 @@ impl Process {
             fact_from_pairs(&[("Process", process_id), ("Pid", &pid_atom)]),
             state,
         );
-        // BlockedFutex is rendered as "BlockedFutex" without the
-        // uaddr — the cell shape stays a single string for forward-
-        // compat with the existing Process_has_State consumers (the
-        // uaddr is recorded separately in the future #545's
-        // Futex_has_Waiter cell once that handler lands).
+        // BlockedFutex / Killed render as the bare variant name without
+        // their payload — the cell shape stays a single string for
+        // forward-compat with the existing Process_has_State consumers
+        // (BlockedFutex's uaddr lands in #545's Futex_has_Waiter cell;
+        // Killed's terminating signal stays on the state variant for
+        // the future wait(2) surface, #531).
         let state_atom = match self.state {
             ProcessState::Created => "Created",
             ProcessState::Running => "Running",
             ProcessState::SpawnFailed => "SpawnFailed",
             ProcessState::Exited => "Exited",
             ProcessState::BlockedFutex(_) => "BlockedFutex",
+            ProcessState::Killed(_) => "Killed",
         };
         s = cell_push(
             "Process_has_State",
@@ -587,6 +601,37 @@ impl Process {
         // inspector sees them as children of the Process_has_State
         // / Process_has_Pid facts.
         self.address_space.record_into_cells(process_id, &s)
+    }
+
+    /// Deliver signal `signum` to this process and apply the part #549
+    /// owns. Computes the pure delivery decision
+    /// (`SignalState::delivery_decision`) against this process's own
+    /// disposition table, then enacts the termination transition: a
+    /// `Terminate` or `CoreDump` outcome moves the process to
+    /// `ProcessState::Killed(signum)`, carrying the terminating signal
+    /// for the future `wait(2)` surface (#531).
+    ///
+    /// Returns the decision so the caller can drive the outcomes #549
+    /// does NOT yet enact: the ring-3 handler redirect for
+    /// `RunHandler` (#549 follow-up), the core-file write for
+    /// `CoreDump` (#550 — the state transition here already kills the
+    /// process; #550 only adds the dump), and job-control suspend /
+    /// resume for `Stop` / `Continue` (#530). `Ignore` and an
+    /// out-of-range signal (`None`) leave the state untouched.
+    ///
+    /// The un-catchable invariant lives in `delivery_decision`: SIGKILL
+    /// resolves to `Terminate` even with a handler in the table, so
+    /// this method terminates regardless — there is no "catch SIGKILL"
+    /// branch to forget here.
+    pub fn deliver_signal(&mut self, signum: i32) -> Option<SignalDelivery> {
+        let decision = self.signals.delivery_decision(signum)?;
+        if matches!(
+            decision,
+            SignalDelivery::Terminate | SignalDelivery::CoreDump
+        ) {
+            self.state = ProcessState::Killed(signum);
+        }
+        Some(decision)
     }
 }
 
@@ -1179,6 +1224,90 @@ mod tests {
         // → two `Backend` pairs in the recorded Object.
         let count = serialised.matches("Backend").count();
         assert_eq!(count, 2, "Closed fd 1 must elide; expected one Backend pair per remaining fd (0 + 2)");
+    }
+
+    // -- #549: signal-driven process termination ---------------------
+
+    use crate::process::signal::{SigAction, SignalDelivery, SIGCHLD, SIGKILL, SIGTERM};
+
+    /// Delivering SIGTERM (default disposition, no handler installed)
+    /// transitions the process to `Killed(SIGTERM)` and reports the
+    /// Terminate outcome — the catchable-but-uncaught path.
+    #[test]
+    fn deliver_sigterm_transitions_to_killed() {
+        let address_space = AddressSpace::new(0x40_1000);
+        let mut proc = Process::new(7, address_space);
+        let outcome = proc.deliver_signal(SIGTERM);
+        assert_eq!(outcome, Some(SignalDelivery::Terminate));
+        assert_eq!(proc.state, ProcessState::Killed(SIGTERM));
+    }
+
+    /// SIGKILL is uncatchable end-to-end: even with a userspace handler
+    /// forced into the process's signal table, delivering SIGKILL still
+    /// terminates the process. The #549 headline through the Process
+    /// surface.
+    #[test]
+    fn deliver_sigkill_uncatchable_terminates() {
+        let address_space = AddressSpace::new(0x40_1000);
+        let mut proc = Process::new(9, address_space);
+        proc.signals
+            .set_action(
+                SIGKILL,
+                SigAction { handler: 0x4444_0000, flags: 0, restorer: 0, mask: 0 },
+            )
+            .unwrap();
+        let outcome = proc.deliver_signal(SIGKILL);
+        assert_eq!(outcome, Some(SignalDelivery::Terminate));
+        assert_eq!(proc.state, ProcessState::Killed(SIGKILL));
+    }
+
+    /// SIGTERM with a handler installed is *caught*: delivery reports
+    /// RunHandler and the process is NOT terminated (the handler-run
+    /// ring-3 redirect is the #549 follow-up track, but the termination
+    /// transition must not fire for a caught signal).
+    #[test]
+    fn deliver_sigterm_with_handler_does_not_kill() {
+        let address_space = AddressSpace::new(0x40_1000);
+        let mut proc = Process::new(15, address_space);
+        proc.signals
+            .set_action(
+                SIGTERM,
+                SigAction { handler: 0x5555_0000, flags: 0, restorer: 0, mask: 0 },
+            )
+            .unwrap();
+        let outcome = proc.deliver_signal(SIGTERM);
+        assert_eq!(outcome, Some(SignalDelivery::RunHandler(0x5555_0000)));
+        assert_eq!(
+            proc.state,
+            ProcessState::Created,
+            "a caught signal must not terminate the process"
+        );
+    }
+
+    /// A default-Ignore signal (SIGCHLD) delivered to a process with no
+    /// handler is a silent no-op: Ignore outcome, state unchanged.
+    #[test]
+    fn deliver_ignored_signal_leaves_state() {
+        let address_space = AddressSpace::new(0x40_1000);
+        let mut proc = Process::new(17, address_space);
+        let outcome = proc.deliver_signal(SIGCHLD);
+        assert_eq!(outcome, Some(SignalDelivery::Ignore));
+        assert_eq!(proc.state, ProcessState::Created);
+    }
+
+    /// A `Killed` process projects its state cell as "Killed". The
+    /// terminating signal stays on the state variant for the future
+    /// wait(2) surface; the cell renders the name, matching the
+    /// `BlockedFutex` precedent.
+    #[test]
+    fn killed_state_records_into_state_cell() {
+        let address_space = AddressSpace::new(0x40_1000);
+        let mut proc = Process::new(15, address_space);
+        proc.deliver_signal(SIGTERM);
+        let recorded = proc.record_into_cells("proc15", &Object::phi());
+        let serialised = format!("{:?}", recorded);
+        assert!(serialised.contains("Process_has_State"));
+        assert!(serialised.contains("Killed"), "state cell must render Killed");
     }
 
     // -- Integration: SPAWN_ELF end-to-end ---------------------------

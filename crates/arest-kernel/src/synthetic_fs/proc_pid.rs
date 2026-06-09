@@ -549,7 +549,10 @@ fn comm_basename(snapshot: &ProcPidSnapshot) -> Vec<u8> {
 ///   * S = Sleeping (interruptible wait)
 ///   * D = Disk sleep (uninterruptible wait — futex park is the only
 ///         tier-1 producer)
-///   * Z = Zombie (exited but not yet reaped)
+///   * Z = Zombie (exited OR signal-killed, not yet reaped — both
+///         dead-awaiting-wait(2) states project the same way; the
+///         exit-code vs terminating-signal distinction surfaces in
+///         wait(2), #531, not procfs)
 ///   * X = Dead (the failed-spawn state — Linux uses X for tasks the
 ///         kernel killed before they could run)
 fn state_letter(state: ProcessState) -> char {
@@ -558,6 +561,7 @@ fn state_letter(state: ProcessState) -> char {
         ProcessState::Running => 'R',
         ProcessState::SpawnFailed => 'X',
         ProcessState::Exited => 'Z',
+        ProcessState::Killed(_) => 'Z',
         ProcessState::BlockedFutex(_) => 'D',
     }
 }
@@ -571,6 +575,7 @@ fn state_word(state: ProcessState) -> &'static str {
         ProcessState::Running => "running",
         ProcessState::SpawnFailed => "dead",
         ProcessState::Exited => "zombie",
+        ProcessState::Killed(_) => "zombie",
         ProcessState::BlockedFutex(_) => "disk sleep",
     }
 }
