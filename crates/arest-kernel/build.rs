@@ -1377,27 +1377,31 @@ fn collect_busybox_config_options(root: &Path) -> std::collections::BTreeSet<Str
     opts
 }
 
-/// Resolve the libbb object set the way upstream Kbuild does, so we compile
-/// the support layer the chosen applets actually need — no more, no less.
+/// Resolve one source directory's object set the way upstream Kbuild does,
+/// so we compile what the enabled config actually needs — no more, no less.
 ///
-/// `libbb/Kbuild.src` lists the unconditional base (`lib-y += foo.o`) and
-/// config-gated extras (`lib-$(CONFIG_BAR) += baz.o`); its `INSERT` line is
-/// filled from `//kbuild:` directives scanned out of the libbb sources
-/// (same scan-and-substitute used for applets.h/usage.h). We evaluate each
-/// line against the enabled-config set and map every selected `X.o` back to
-/// its source — `X.c` if present, else `X.S` (the optional x86 hash asm).
-fn select_libbb_sources(
-    libbb_dir: &Path,
+/// Each busybox source dir carries a `Kbuild.src` listing the unconditional
+/// base (`lib-y += foo.o`) and config-gated extras
+/// (`lib-$(CONFIG_BAR) += baz.o`); its `INSERT` line is filled from
+/// `//kbuild:` directives scanned out of that dir's sources (same
+/// scan-and-substitute used for applets.h/usage.h). We evaluate each line
+/// against the enabled-config set and map every selected `X.o` back to its
+/// source — `X.c` if present, else `X.S` (the optional x86 hash asm).
+/// Used for libbb (support layer), coreutils (applets + the ash-builtin
+/// objects like `lib-$(CONFIG_ASH_TEST) += test.o`), and shell
+/// (`lib-$(CONFIG_SHELL_ASH) += ash.o ash_ptr_hack.o shell_common.o`).
+fn select_kbuild_sources(
+    src_dir: &Path,
     enabled: &std::collections::HashSet<&str>,
 ) -> Result<Vec<PathBuf>, String> {
-    let kbuild = libbb_dir.join("Kbuild.src");
+    let kbuild = src_dir.join("Kbuild.src");
     let mut text = fs::read_to_string(&kbuild)
         .map_err(|e| format!("read {}: {}", kbuild.display(), e))?
         .replace("\r\n", "\n");
-    // Fill the INSERT slot with the //kbuild: directives the libbb sources
-    // declare about themselves (capability.c, ping helpers, etc.).
+    // Fill the INSERT slot with the //kbuild: directives the dir's sources
+    // declare about themselves (applet objects, capability.c, etc.).
     let mut inserted = String::new();
-    if let Ok(entries) = fs::read_dir(libbb_dir) {
+    if let Ok(entries) = fs::read_dir(src_dir) {
         for e in entries.flatten() {
             let p = e.path();
             if p.extension().and_then(|x| x.to_str()) != Some("c") {
@@ -1448,8 +1452,8 @@ fn select_libbb_sources(
 
     let mut sources = Vec::new();
     for stem in stems {
-        let c = libbb_dir.join(format!("{}.c", stem));
-        let s = libbb_dir.join(format!("{}.S", stem));
+        let c = src_dir.join(format!("{}.c", stem));
+        let s = src_dir.join(format!("{}.S", stem));
         if c.is_file() {
             sources.push(c);
         } else if s.is_file() {
@@ -1458,12 +1462,6 @@ fn select_libbb_sources(
         // An object with neither source is an upstream Kbuild artifact we
         // don't carry (e.g. generated); silently skipping matches Kbuild's
         // own behaviour of only building what exists.
-    }
-    if sources.is_empty() {
-        return Err(format!(
-            "no libbb sources selected from {} — Kbuild.src parse or config set is wrong",
-            kbuild.display(),
-        ));
     }
     Ok(sources)
 }
@@ -1742,10 +1740,28 @@ extern char bb_common_bufsiz1[];\n\
     let template = fs::read_to_string(&applets_src)
         .map_err(|e| format!("read {}: {}", applets_src.display(), e))?
         .replace("\r\n", "\n");
+    // Directive scan surface: every .c in the dirs we compile applets
+    // from. Upstream scans the WHOLE tree ($srctree/*/*.c) and lets the
+    // IF_xxx() config macros erase disabled applets' entries; restricting
+    // the scan to the compiled dirs keeps the same semantics (an applet
+    // enabled in .config but living outside these dirs would fail the
+    // link loudly, not silently vanish). Sorted for deterministic output.
+    let applet_src_dirs = [busybox_root.join("coreutils"), busybox_root.join("shell")];
+    let mut applet_scan_files: Vec<PathBuf> = Vec::new();
+    for dir in &applet_src_dirs {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("c") {
+                    applet_scan_files.push(p);
+                }
+            }
+        }
+    }
+    applet_scan_files.sort();
     let mut directives = String::new();
-    for stem in ["cat", "echo", "head", "ls", "tail", "wc"] {
-        let src = busybox_root.join("coreutils").join(format!("{}.c", stem));
-        let text = fs::read_to_string(&src)
+    for src in &applet_scan_files {
+        let text = fs::read_to_string(src)
             .map_err(|e| format!("read {}: {}", src.display(), e))?;
         for line in text.lines() {
             if let Some(d) = line.strip_prefix("//applet:") {
@@ -1850,9 +1866,8 @@ extern char bb_common_bufsiz1[];\n\
     // the result into usage.src.h's `INSERT` slot (it carries the BB_USAGE_H
     // guard + shared helper macros the fragments may reference).
     let mut directives = String::new();
-    for stem in ["cat", "echo", "head", "ls", "tail", "wc"] {
-        let src = busybox_root.join("coreutils").join(format!("{}.c", stem));
-        let text = fs::read_to_string(&src)
+    for src in &applet_scan_files {
+        let text = fs::read_to_string(src)
             .map_err(|e| format!("read {}: {}", src.display(), e))?
             .replace("\r\n", "\n");
         for line in text.lines() {
@@ -1947,25 +1962,28 @@ extern char bb_common_bufsiz1[];\n\
     fs::write(gen_include.join("usage_compressed.h"), &uc)
         .map_err(|e| format!("write usage_compressed.h: {}", e))?;
 
-    // 4. Select the sources to compile. libbb is NOT a blind glob: upstream
-    //    Kbuild compiles the unconditional `lib-y` base set plus the
-    //    `lib-$(CONFIG_x)` entries whose option is enabled. Globbing every
-    //    libbb/*.c instead pulls in feature-gated files like capability.c
-    //    (CONFIG_FEATURE_SETPRIV_CAPABILITIES / CONFIG_RUN_INIT — both off
-    //    here) that `#include <linux/capability.h>` and other uapi headers
-    //    musl does not ship, breaking the build. Mirror Kbuild's selection.
-    //    The 6 chosen applets come from coreutils; the dispatcher
+    // 4. Select the sources to compile — Kbuild-style, .config-driven, NOT
+    //    a blind glob. Upstream compiles each dir's unconditional `lib-y`
+    //    base plus the `lib-$(CONFIG_x)` entries whose option is enabled
+    //    (globbing instead pulls in feature-gated files like libbb's
+    //    capability.c, which #include <linux/...> uapi headers musl does
+    //    not ship). The same selection applied to coreutils yields the
+    //    enabled applets (lib-$(CONFIG_CAT) += cat.o ...) plus ash-builtin
+    //    objects (lib-$(CONFIG_ASH_TEST) += test.o ...), and applied to
+    //    shell yields ash (lib-$(CONFIG_SHELL_ASH) += ash.o ash_ptr_hack.o
+    //    shell_common.o, math.o via FEATURE_SH_MATH). The dispatcher
     //    `applets/applets.c` becomes the multi-call binary's main loop.
     let libbb_dir = busybox_root.join("libbb");
-    let coreutils_dir = busybox_root.join("coreutils");
     let applets_dir = busybox_root.join("applets");
-    let mut sources: Vec<PathBuf> = select_libbb_sources(&libbb_dir, &enabled_set)?;
-    let chosen_applets: &[&str] = &["cat", "echo", "head", "ls", "tail", "wc"];
-    for stem in chosen_applets {
-        let p = coreutils_dir.join(format!("{}.c", stem));
-        if p.is_file() {
-            sources.push(p);
-        }
+    let mut sources: Vec<PathBuf> = select_kbuild_sources(&libbb_dir, &enabled_set)?;
+    if sources.is_empty() {
+        return Err(format!(
+            "no libbb sources selected from {} — Kbuild.src parse or config set is wrong",
+            libbb_dir.display(),
+        ));
+    }
+    for dir in &applet_src_dirs {
+        sources.extend(select_kbuild_sources(dir, &enabled_set)?);
     }
     let dispatcher = applets_dir.join("applets.c");
     if dispatcher.is_file() {
@@ -2174,6 +2192,15 @@ extern char bb_common_bufsiz1[];\n\
         return Err(format!("busybox static link failed: {}", st));
     }
     let elf_len = fs::metadata(&busybox_elf).map(|m| m.len()).unwrap_or(0);
+    // Applet count per the generated NUM_APPLETS.h — the host tool's truth.
+    let num_applets = fs::read_to_string(&num_applets_h)
+        .ok()
+        .and_then(|t| {
+            t.split_whitespace()
+                .last()
+                .and_then(|n| n.parse::<u32>().ok())
+        })
+        .unwrap_or(0);
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-cfg=busybox_built");
@@ -2181,7 +2208,7 @@ extern char bb_common_bufsiz1[];\n\
         "cargo:warning=busybox: linked static ELF ({} bytes, {} sources, {} applets) at {}",
         elf_len,
         sources.len(),
-        chosen_applets.len(),
+        num_applets,
         busybox_elf.display(),
     );
     Ok(())
