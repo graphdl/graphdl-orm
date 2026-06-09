@@ -111,6 +111,14 @@ pub enum AuxvType {
     /// AT_PAGESZ = 6. System page size. Always 4096 — see
     /// `super::address_space::PAGE_SIZE`.
     Pagesz = 6,
+    /// AT_BASE = 7. Load address of the program interpreter (the
+    /// dynamic linker, e.g. `/lib/ld-musl-x86_64.so.1`). The kernel
+    /// loads the interpreter at this base and the interpreter relocates
+    /// itself relative to it; a statically-linked program omits AT_BASE
+    /// (or sets it to 0). Populated by `Process::spawn` for dynamic
+    /// binaries once #522 loads the interpreter; static binaries don't
+    /// emit it.
+    Base = 7,
     /// AT_ENTRY = 9. Process entry-point virtual address. Same value
     /// the trampoline jumps to — the C startup uses this to detect
     /// "I'm being invoked directly" vs. "via the dynamic linker."
@@ -786,6 +794,7 @@ mod tests {
         assert_eq!(AuxvType::Phent as u64, 4);
         assert_eq!(AuxvType::Phnum as u64, 5);
         assert_eq!(AuxvType::Pagesz as u64, 6);
+        assert_eq!(AuxvType::Base as u64, 7);
         assert_eq!(AuxvType::Entry as u64, 9);
         assert_eq!(AuxvType::Random as u64, 25);
     }

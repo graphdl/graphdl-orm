@@ -286,6 +286,34 @@ impl ParsedElf {
             .iter()
             .find(|ph| matches!(ph.kind, SegmentKind::Interp))
     }
+
+    /// Read the interpreter path string from the PT_INTERP segment of
+    /// the original ELF `bytes` — what #522 reads to find the dynamic
+    /// linker (e.g. `/lib/ld-musl-x86_64.so.1`). Returns `None` for a
+    /// static binary (no PT_INTERP) or when the segment's `[offset,
+    /// offset + filesz)` range is out of bounds for `bytes` (a
+    /// truncated blob — the parser bounds-checks PT_INTERP, but a
+    /// caller could pass a different slice than the one it parsed).
+    ///
+    /// PT_INTERP content is a NUL-terminated path and `p_filesz`
+    /// counts the terminator; the returned slice is trimmed at the
+    /// first NUL. It is a `&[u8]`, not `&str` — interpreter paths are
+    /// bytes, not guaranteed UTF-8. `ParsedElf` deliberately does not
+    /// retain the input bytes (see the type docstring), so the caller
+    /// passes the same slice it parsed.
+    pub fn interp_path<'a>(&self, bytes: &'a [u8]) -> Option<&'a [u8]> {
+        let ph = self.interp_segment()?;
+        let start = usize::try_from(ph.offset).ok()?;
+        let len = usize::try_from(ph.filesz).ok()?;
+        let end = start.checked_add(len)?;
+        let raw = bytes.get(start..end)?;
+        // Trim at the first NUL — PT_INTERP is a C string padded to
+        // p_filesz (which counts the terminator).
+        Some(match raw.iter().position(|&b| b == 0) {
+            Some(nul) => &raw[..nul],
+            None => raw,
+        })
+    }
 }
 
 // -- Parser --------------------------------------------------------
@@ -701,6 +729,65 @@ mod tests {
     fn interp_segment_absent_on_static_binary() {
         let elf = parse(TINY_ELF).expect("TINY_ELF must parse");
         assert!(elf.interp_segment().is_none());
+    }
+
+    /// `interp_path` returns the NUL-trimmed interpreter path from the
+    /// PT_INTERP segment's bytes — what #522 reads to find the dynamic
+    /// linker (ld-musl). p_filesz includes the NUL terminator; the
+    /// returned slice does not.
+    #[test]
+    fn interp_path_extracts_nul_trimmed_path() {
+        let path = b"/lib/ld-musl-x86_64.so.1\0";
+        let mut bytes = [0u8; 0x200];
+        let off = 0x100usize;
+        bytes[off..off + path.len()].copy_from_slice(path);
+        let elf = ParsedElf {
+            elf_type: ET_DYN,
+            machine: EM_X86_64,
+            entry: 0,
+            osabi: ELFOSABI_LINUX,
+            program_headers: alloc::vec![ProgramHeader {
+                kind: SegmentKind::Interp,
+                flags: PF_R,
+                offset: off as u64,
+                vaddr: 0,
+                paddr: 0,
+                filesz: path.len() as u64,
+                memsz: path.len() as u64,
+                align: 1,
+            }],
+        };
+        assert_eq!(elf.interp_path(&bytes), Some(&b"/lib/ld-musl-x86_64.so.1"[..]));
+    }
+
+    /// `interp_path` is None on a static binary (no PT_INTERP segment).
+    #[test]
+    fn interp_path_none_on_static_binary() {
+        let elf = parse(TINY_ELF).expect("TINY_ELF must parse");
+        assert_eq!(elf.interp_path(TINY_ELF), None);
+    }
+
+    /// `interp_path` is None when the PT_INTERP byte range exceeds the
+    /// supplied slice — defensive against a truncated blob.
+    #[test]
+    fn interp_path_none_when_out_of_range() {
+        let elf = ParsedElf {
+            elf_type: ET_DYN,
+            machine: EM_X86_64,
+            entry: 0,
+            osabi: ELFOSABI_LINUX,
+            program_headers: alloc::vec![ProgramHeader {
+                kind: SegmentKind::Interp,
+                flags: PF_R,
+                offset: 0x1000,
+                vaddr: 0,
+                paddr: 0,
+                filesz: 16,
+                memsz: 16,
+                align: 1,
+            }],
+        };
+        assert_eq!(elf.interp_path(&[0u8; 64]), None);
     }
 
     /// Empty input is `Truncated`, not a panic.
