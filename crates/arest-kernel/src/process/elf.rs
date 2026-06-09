@@ -715,6 +715,7 @@ pub fn pick_interp_base(program: &ParsedElf) -> u64 {
 /// maps the program's shared objects, and finally transfers to the
 /// program's own entry (published to userspace via auxv `AT_ENTRY` =
 /// `program_entry`, with `AT_BASE` = `interp_base`).
+#[derive(Debug)]
 pub struct DynamicImage {
     /// Program + interpreter PT_LOADs in one space; `entry_point` is the
     /// interpreter's biased entry (where the kernel starts).
@@ -760,6 +761,65 @@ pub fn load_dynamic(
         interp_base,
         program_entry: program.entry,
     })
+}
+
+/// The outcome of loading a program image (#522): either a statically-
+/// linked binary (one address space, no interpreter) or a dynamically-
+/// linked one (program + interpreter co-loaded). The kernel's spawn
+/// path consumes the matching arm — `Process::new` for `Static`,
+/// `Process::from_dynamic_image` for `Dynamic`.
+#[derive(Debug)]
+pub enum LoadedImage {
+    /// A statically-linked program: its own segments, no interpreter.
+    Static(AddressSpace),
+    /// A dynamically-linked program co-loaded with its interpreter.
+    Dynamic(DynamicImage),
+}
+
+/// Load a program ELF, handling the static-vs-dynamic split. A program
+/// with no PT_INTERP is loaded statically (`load_segments`). A program
+/// that names an interpreter has `resolve_interp` called with the
+/// interpreter path (the NUL-trimmed PT_INTERP string) to fetch the
+/// interpreter ELF's bytes; the interpreter is parsed and co-loaded via
+/// `load_dynamic`.
+///
+/// `resolve_interp` is INJECTED so the *source* of interpreter binaries
+/// — a synthetic `/lib` mount, a vendored kernel asset, the
+/// loaded-readings ring, the ESP — is the caller's decision, not baked
+/// into the loader. It returns `None` when the named interpreter isn't
+/// available, surfaced as `LoaderError::InterpreterUnavailable`.
+///
+/// This is the top-level loader entry the eventual `arest run <binary>`
+/// path (gated on #552's ring-3 descent) will call; the rest of the
+/// #522 chain (load_segments / load_dynamic / from_dynamic_image) hangs
+/// off the two arms.
+pub fn load_program<R>(
+    program: &ParsedElf,
+    program_bytes: &[u8],
+    resolve_interp: R,
+) -> Result<LoadedImage, LoadOrParseError>
+where
+    R: FnOnce(&[u8]) -> Option<alloc::vec::Vec<u8>>,
+{
+    match program.interp_segment() {
+        // No interpreter: a statically-linked program loads at its own
+        // vaddrs. The resolver is never consulted.
+        None => Ok(LoadedImage::Static(load_segments(program, program_bytes)?)),
+        // PT_INTERP present: fetch the interpreter's bytes via the
+        // injected resolver, parse them, and co-load.
+        Some(_) => {
+            // The parser bounds-checked PT_INTERP, so the path is
+            // normally readable; treat an unreadable one as "can't
+            // obtain the interpreter" too.
+            let path = program
+                .interp_path(program_bytes)
+                .ok_or(LoaderError::InterpreterUnavailable)?;
+            let interp_bytes = resolve_interp(path).ok_or(LoaderError::InterpreterUnavailable)?;
+            let interp = parse(&interp_bytes)?;
+            let image = load_dynamic(program, program_bytes, &interp, &interp_bytes)?;
+            Ok(LoadedImage::Dynamic(image))
+        }
+    }
 }
 
 // -- Internal helpers ----------------------------------------------
@@ -1287,6 +1347,62 @@ mod tests {
         assert!(
             img.address_space.segments.iter().any(|s| s.vaddr == base + 0x0040_1000),
             "interpreter segment present at the load base"
+        );
+    }
+
+    /// `load_program` on a static binary (no PT_INTERP) returns
+    /// `Static` and never calls the resolver.
+    #[test]
+    fn load_program_static_returns_static_image() {
+        let prog = parse(TINY_ELF).expect("TINY_ELF must parse");
+        let img = load_program(&prog, TINY_ELF, |_path| {
+            panic!("resolver must NOT be called for a static binary")
+        })
+        .expect("static load must succeed");
+        match img {
+            LoadedImage::Static(space) => assert_eq!(space.entry_point, 0x0040_1000),
+            LoadedImage::Dynamic(_) => panic!("expected a static image"),
+        }
+    }
+
+    /// `load_program` on a dynamically-linked binary calls the resolver
+    /// with the interpreter path and co-loads the returned interpreter
+    /// image via `load_dynamic`. INTERP_ELF is the program; TINY_ELF
+    /// stands in for the resolved interpreter.
+    #[test]
+    fn load_program_dynamic_resolves_and_coloads() {
+        let prog = parse(INTERP_ELF).expect("INTERP_ELF must parse");
+        let mut seen_path = false;
+        let img = load_program(&prog, INTERP_ELF, |path| {
+            // The resolver receives the (NUL-trimmed) PT_INTERP path.
+            seen_path = !path.is_empty();
+            Some(TINY_ELF.to_vec())
+        })
+        .expect("dynamic load must succeed");
+        assert!(seen_path, "resolver was called with a non-empty interp path");
+        match img {
+            LoadedImage::Dynamic(dyn_img) => {
+                // Interpreter (TINY) placed at the chosen base; the
+                // program's own entry is published as AT_ENTRY.
+                assert_eq!(dyn_img.interp_base, pick_interp_base(&prog));
+                assert_eq!(dyn_img.program_entry, prog.entry);
+                // Combined image carries both program and interpreter
+                // PT_LOADs (program ≥ 1, interpreter exactly TINY's 1).
+                assert!(dyn_img.address_space.segments.len() >= 2);
+            }
+            LoadedImage::Static(_) => panic!("expected a dynamic image"),
+        }
+    }
+
+    /// `load_program` errors `InterpreterUnavailable` when the program
+    /// names an interpreter but the resolver can't supply it.
+    #[test]
+    fn load_program_missing_interpreter_errors() {
+        let prog = parse(INTERP_ELF).expect("INTERP_ELF must parse");
+        let err = load_program(&prog, INTERP_ELF, |_path| None).unwrap_err();
+        assert_eq!(
+            err,
+            LoadOrParseError::Load(LoaderError::InterpreterUnavailable)
         );
     }
 }

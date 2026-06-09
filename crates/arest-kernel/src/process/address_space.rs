@@ -179,6 +179,13 @@ pub enum LoaderError {
     /// `alloc::alloc::alloc` returned null — the talc heap is
     /// exhausted. Maps to Linux's `ENOMEM`.
     OutOfMemory,
+    /// The program names a PT_INTERP, but the interpreter binary it
+    /// points at couldn't be obtained — the resolver `load_program`
+    /// was given returned `None` (the named interpreter isn't present
+    /// in whatever file source the caller wired), or the PT_INTERP path
+    /// string itself was unreadable. Maps to Linux's `ENOENT` on the
+    /// interpreter open. #522.
+    InterpreterUnavailable,
 }
 
 /// One PT_LOAD segment after it has been loaded into the kernel's

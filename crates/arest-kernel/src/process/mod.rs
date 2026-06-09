@@ -72,8 +72,8 @@ pub mod trampoline;
 //   use crate::process::{load_segments, AddressSpace, Process};
 pub use address_space::{AddressSpace, LoadedSegment, LoaderError, SegmentPerm};
 pub use elf::{
-    load_dynamic, load_segments, load_segments_at_base, pick_interp_base, DynamicImage,
-    LoadOrParseError,
+    load_dynamic, load_program, load_segments, load_segments_at_base, pick_interp_base,
+    DynamicImage, LoadOrParseError, LoadedImage,
 };
 pub use process::{
     current_process_fd_table, current_process_id, current_process_install,
