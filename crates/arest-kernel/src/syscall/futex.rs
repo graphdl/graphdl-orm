@@ -137,6 +137,162 @@ pub const EINVAL: i64 = 22;
 /// doesn't yet handle (REQUEUE, CMP_REQUEUE, WAIT_BITSET, etc).
 pub const ENOSYS: i64 = 38;
 
+/// FUTEX_LOCK_PI — acquire a priority-inheritance mutex. Per
+/// `linux/include/uapi/linux/futex.h:FUTEX_LOCK_PI`. The futex word
+/// holds the owner TID in its low 30 bits; userspace CASes 0<->TID for
+/// the uncontended path and enters the kernel (this op) only on
+/// contention or robust recovery. #547.
+pub const FUTEX_LOCK_PI: u32 = 6;
+
+/// FUTEX_UNLOCK_PI — release a PI mutex, handing off to the next
+/// waiter. Per `linux/include/uapi/linux/futex.h:FUTEX_UNLOCK_PI`. #547.
+pub const FUTEX_UNLOCK_PI: u32 = 7;
+
+/// FUTEX_TRYLOCK_PI — non-blocking PI acquire. Per
+/// `linux/include/uapi/linux/futex.h:FUTEX_TRYLOCK_PI`. #547.
+pub const FUTEX_TRYLOCK_PI: u32 = 8;
+
+/// Bit 31 of the futex word — set by the kernel to tell the owner
+/// "there are waiters; release via FUTEX_UNLOCK_PI rather than a bare
+/// userspace store-zero". Per `...:FUTEX_WAITERS`.
+pub const FUTEX_WAITERS: u32 = 0x8000_0000;
+
+/// Bit 30 of the futex word — set when the lock owner died while
+/// holding it (robust mutexes). The next LOCK_PI / TRYLOCK_PI hands
+/// ownership to the caller and returns -EOWNERDEAD so userspace runs
+/// recovery. Per `...:FUTEX_OWNER_DIED`.
+pub const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+
+/// Low-30-bit mask isolating the owner TID (the top two bits are
+/// FUTEX_OWNER_DIED + FUTEX_WAITERS). Per `...:FUTEX_TID_MASK`.
+pub const FUTEX_TID_MASK: u32 = 0x3FFF_FFFF;
+
+/// Linux errno "Operation not permitted". FUTEX_UNLOCK_PI returns this
+/// when the caller is not the lock owner. `<asm-generic/errno-base.h>
+/// :EPERM`.
+pub const EPERM: i64 = 1;
+
+/// Linux errno "Resource deadlock avoided". FUTEX_LOCK_PI / TRYLOCK_PI
+/// return this when the caller already owns the lock.
+/// `<asm-generic/errno.h>:EDEADLK`.
+pub const EDEADLK: i64 = 35;
+
+/// Linux errno "Owner died". FUTEX_LOCK_PI / TRYLOCK_PI return this
+/// when the previous owner died holding the lock — the caller becomes
+/// the new owner but MUST run robust-mutex recovery.
+/// `<asm-generic/errno.h>:EOWNERDEAD`.
+pub const EOWNERDEAD: i64 = 130;
+
+/// Parsed owner-state of a PI futex word — `parse_futex_word`'s return.
+/// The owner TID lives in the low 30 bits (`FUTEX_TID_MASK`); the top
+/// two bits are flags (OWNER_DIED, WAITERS). A pure *reading* of the
+/// word the PI handlers branch on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FutexWordState {
+    /// Owner bits are zero — the lock is free.
+    Unlocked,
+    /// Owned by this (live) TID.
+    LockedBy(u32),
+    /// The OWNER_DIED flag is set; carries the dead owner's TID. The
+    /// next acquirer takes ownership and must run robust recovery.
+    OwnerDied(u32),
+}
+
+/// Classify a PI futex word into its owner-state. Pure — the handlers
+/// read the userspace word via `read_u32` and hand the value here.
+pub fn parse_futex_word(word: u32) -> FutexWordState {
+    let tid = word & FUTEX_TID_MASK;
+    if word & FUTEX_OWNER_DIED != 0 {
+        FutexWordState::OwnerDied(tid)
+    } else if tid == 0 {
+        FutexWordState::Unlocked
+    } else {
+        FutexWordState::LockedBy(tid)
+    }
+}
+
+/// True when the futex word's FUTEX_WAITERS bit is set — the kernel
+/// has parked at least one waiter, so the owner must release through
+/// FUTEX_UNLOCK_PI (hand-off) rather than a bare userspace store-zero.
+pub fn has_waiters(word: u32) -> bool {
+    word & FUTEX_WAITERS != 0
+}
+
+/// The outcome of attempting to acquire a PI futex — shared by
+/// FUTEX_LOCK_PI and FUTEX_TRYLOCK_PI (they differ only on how they
+/// treat `Contended`: LOCK_PI blocks, TRYLOCK_PI reports -EAGAIN).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PiAcquire {
+    /// The lock was free; the caller now owns it. Carries the new word
+    /// (the caller's TID).
+    Acquired(u32),
+    /// The previous owner died holding the lock; the caller takes
+    /// ownership (new word = caller TID, OWNER_DIED cleared) but the
+    /// handler returns -EOWNERDEAD so userspace runs recovery.
+    AcquiredOwnerDied(u32),
+    /// Owned by a live other task. Carries the word with FUTEX_WAITERS
+    /// set (LOCK_PI writes it then blocks; TRYLOCK_PI ignores it and
+    /// returns -EAGAIN without registering a waiter).
+    Contended(u32),
+    /// The caller already owns the lock — a deadlock (-EDEADLK).
+    Deadlock,
+}
+
+/// Decide the acquire outcome for a PI futex `word` and `caller_tid`.
+/// Pure — no memory writes, no queue effects; the handler enacts the
+/// result. Priority inheritance (boosting the owner to the caller's
+/// priority) is deferred to the scheduler (#530), which owns the
+/// priority model; this decides the ownership transition only.
+pub fn pi_acquire(word: u32, caller_tid: u32) -> PiAcquire {
+    match parse_futex_word(word) {
+        FutexWordState::Unlocked => PiAcquire::Acquired(caller_tid),
+        FutexWordState::OwnerDied(_) => PiAcquire::AcquiredOwnerDied(caller_tid),
+        FutexWordState::LockedBy(owner) if owner == caller_tid => PiAcquire::Deadlock,
+        FutexWordState::LockedBy(_) => PiAcquire::Contended(word | FUTEX_WAITERS),
+    }
+}
+
+/// The outcome of releasing a PI futex — `pi_unlock`'s return.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PiUnlock {
+    /// The caller is not the lock owner — rejected (-EPERM).
+    NotOwner,
+    /// No waiters; the lock is cleared (new word = 0).
+    Cleared,
+    /// Handed off to the next waiter. Carries the new word: the next
+    /// owner's TID, with FUTEX_WAITERS set iff more waiters remain.
+    HandedOff(u32),
+}
+
+/// Decide the release outcome for a PI futex. `caller_tid` must match
+/// the word's current owner (else `NotOwner`). `next_waiter` is the
+/// waiter the kernel dequeued to hand off to (None => no waiters);
+/// `more_waiters` whether any remain after it (=> keep FUTEX_WAITERS on
+/// the new owner word). Pure — the handler does the dequeue + word
+/// write. Highest-priority-waiter selection is the scheduler's (#530);
+/// tier-1 hands off in FIFO order via the existing wait queue.
+pub fn pi_unlock(
+    word: u32,
+    caller_tid: u32,
+    next_waiter: Option<u32>,
+    more_waiters: bool,
+) -> PiUnlock {
+    if word & FUTEX_TID_MASK != caller_tid {
+        return PiUnlock::NotOwner;
+    }
+    match next_waiter {
+        None => PiUnlock::Cleared,
+        Some(next) => {
+            let new_word = if more_waiters {
+                next | FUTEX_WAITERS
+            } else {
+                next
+            };
+            PiUnlock::HandedOff(new_word)
+        }
+    }
+}
+
 /// Handle a `futex(uaddr, futex_op, val, timeout, uaddr2, val3)`
 /// syscall. Match on `futex_op & FUTEX_CMD_MASK` and dispatch to the
 /// per-op implementation. The high-bit flags (PRIVATE / CLOCK) are
@@ -177,6 +333,9 @@ pub fn handle(
     match op {
         FUTEX_WAIT => wait(uaddr, val),
         FUTEX_WAKE => wake(uaddr, val),
+        FUTEX_LOCK_PI => lock_pi(uaddr),
+        FUTEX_UNLOCK_PI => unlock_pi(uaddr),
+        FUTEX_TRYLOCK_PI => trylock_pi(uaddr),
         // Tier-1 doesn't model the requeue family or the bitset
         // variants. Userspace libc treats -ENOSYS on optional futex
         // ops as "this kernel doesn't have it"; pthread_cond_broadcast
@@ -323,6 +482,138 @@ pub fn wake(uaddr: u64, n: u32) -> i64 {
     woken.len() as i64
 }
 
+/// The calling process's pid — the futex "TID" in tier-1's
+/// single-thread model. Returns 0 when no process is installed (the
+/// same placeholder `wait` uses pre-spawn / in the test harness).
+fn current_pid() -> u32 {
+    current_process_mut(|maybe| maybe.map(|p| p.pid).unwrap_or(0))
+}
+
+/// FUTEX_LOCK_PI body (#547). Acquire the priority-inheritance mutex at
+/// `uaddr`. The futex word holds the owner TID in its low 30 bits:
+///
+///   * free word        -> acquire (word = caller TID), return 0.
+///   * dead owner       -> acquire + return -EOWNERDEAD (robust recovery).
+///   * caller is owner  -> -EDEADLK.
+///   * owned (live)     -> set FUTEX_WAITERS, enqueue the caller, mark it
+///                         BlockedFutex, return 0.
+///
+/// Tier-1 limitation: like `wait`, this does NOT actually park the
+/// caller or perform the priority-inheritance boost — both ride the
+/// scheduler (#530), which owns the run queue + the priority model. The
+/// observable surface is the word write + the queue / state transition.
+pub fn lock_pi(uaddr: u64) -> i64 {
+    if uaddr == 0 {
+        return -EFAULT;
+    }
+    if uaddr & 0b11 != 0 {
+        return -EINVAL;
+    }
+    let caller_tid = current_pid();
+    let word = read_u32(uaddr);
+    match pi_acquire(word, caller_tid) {
+        PiAcquire::Acquired(nw) => {
+            write_u32(uaddr, nw);
+            0
+        }
+        PiAcquire::AcquiredOwnerDied(nw) => {
+            write_u32(uaddr, nw);
+            -EOWNERDEAD
+        }
+        PiAcquire::Deadlock => -EDEADLK,
+        PiAcquire::Contended(nw) => {
+            // Tell the owner there are waiters (its release must hand off).
+            write_u32(uaddr, nw);
+            current_process_mut(|maybe| {
+                if let Some(proc) = maybe {
+                    proc.state = ProcessState::BlockedFutex(uaddr);
+                }
+            });
+            with_futex_table(|table| table.enqueue(uaddr, caller_tid));
+            0
+        }
+    }
+}
+
+/// FUTEX_TRYLOCK_PI body (#547). Non-blocking PI acquire: identical to
+/// `lock_pi` on a free / dead-owner / self-owned word, but a contended
+/// futex returns -EAGAIN WITHOUT registering a waiter or touching the
+/// word (trylock never blocks, so it never sets FUTEX_WAITERS).
+pub fn trylock_pi(uaddr: u64) -> i64 {
+    if uaddr == 0 {
+        return -EFAULT;
+    }
+    if uaddr & 0b11 != 0 {
+        return -EINVAL;
+    }
+    let caller_tid = current_pid();
+    let word = read_u32(uaddr);
+    match pi_acquire(word, caller_tid) {
+        PiAcquire::Acquired(nw) => {
+            write_u32(uaddr, nw);
+            0
+        }
+        PiAcquire::AcquiredOwnerDied(nw) => {
+            write_u32(uaddr, nw);
+            -EOWNERDEAD
+        }
+        PiAcquire::Deadlock => -EDEADLK,
+        PiAcquire::Contended(_) => -EAGAIN,
+    }
+}
+
+/// FUTEX_UNLOCK_PI body (#547). Release the PI mutex at `uaddr`. The
+/// caller must be the current owner (else -EPERM). If waiters are
+/// parked, hand the lock to the next one (FIFO in tier-1; the scheduler
+/// #530 picks the highest priority) and keep FUTEX_WAITERS set iff more
+/// remain; otherwise clear the word to 0.
+pub fn unlock_pi(uaddr: u64) -> i64 {
+    if uaddr == 0 {
+        return -EFAULT;
+    }
+    if uaddr & 0b11 != 0 {
+        return -EINVAL;
+    }
+    let caller_tid = current_pid();
+    let word = read_u32(uaddr);
+    // Ownership check before disturbing the wait queue.
+    if word & FUTEX_TID_MASK != caller_tid {
+        return -EPERM;
+    }
+    // Dequeue the hand-off target (if any) + note whether more remain.
+    let (next, more) = with_futex_table(|table| {
+        let drained = table.wake_n(uaddr, 1);
+        let next = drained.first().copied();
+        let more = !table.peek_waiters(uaddr).is_empty();
+        (next, more)
+    });
+    match pi_unlock(word, caller_tid, next, more) {
+        // Pre-checked above; defensive.
+        PiUnlock::NotOwner => -EPERM,
+        PiUnlock::Cleared => {
+            write_u32(uaddr, 0);
+            0
+        }
+        PiUnlock::HandedOff(nw) => {
+            write_u32(uaddr, nw);
+            // If the handed-off waiter is the currently-installed process,
+            // make it runnable (tier-1; #530 walks the run queue).
+            if let Some(next_tid) = next {
+                current_process_mut(|maybe| {
+                    if let Some(proc) = maybe {
+                        if proc.state == ProcessState::BlockedFutex(uaddr)
+                            && proc.pid == next_tid
+                        {
+                            proc.state = ProcessState::Running;
+                        }
+                    }
+                });
+            }
+            0
+        }
+    }
+}
+
 /// Read a 4-byte little-endian u32 from a userspace virtual address.
 /// Mirrors the inline pointer-deref pattern `syscall::write::do_write`
 /// + `syscall::openat::read_pathname` use — direct deref under tier-1
@@ -344,6 +635,21 @@ pub fn read_u32(addr: u64) -> u32 {
     // VA; `read_volatile` ensures the optimiser doesn't elide / hoist
     // the read across the userspace-CAS / kernel-block boundary.
     unsafe { core::ptr::read_volatile(addr as *const u32) }
+}
+
+/// Write a 4-byte little-endian u32 to a userspace virtual address —
+/// the PI-futex counterpart to `read_u32`. The PI ops (#547) own the
+/// futex word (unlike basic FUTEX_WAIT/WAKE where userspace CASes it),
+/// so the kernel writes the new owner TID / FUTEX_WAITERS bit here.
+///
+/// SAFETY: the caller (`lock_pi` / `unlock_pi` / `trylock_pi`) has
+/// validated `addr != 0` and 4-byte alignment. Under tier-1 identity
+/// mapping the userspace VA doubles as a kernel VA; `write_volatile`
+/// keeps the store from being elided / reordered across the
+/// userspace-visible boundary. Once #527 lands real page tables this
+/// routes through `process::address_space` / #561 copy_to_user.
+pub fn write_u32(addr: u64, value: u32) {
+    unsafe { core::ptr::write_volatile(addr as *mut u32, value) }
 }
 
 #[cfg(test)]
@@ -896,6 +1202,247 @@ mod tests {
 
         // Cleanup.
         drain_global_futex_table();
+        current_process_uninstall();
+    }
+
+    // -- #547: PI-futex word codec + decision logic ------------------
+
+    /// PI op-codes + word bit constants match the Linux uapi values.
+    #[test]
+    fn pi_op_constants_match_linux_uapi() {
+        assert_eq!(FUTEX_LOCK_PI, 6);
+        assert_eq!(FUTEX_UNLOCK_PI, 7);
+        assert_eq!(FUTEX_TRYLOCK_PI, 8);
+        assert_eq!(FUTEX_WAITERS, 0x8000_0000);
+        assert_eq!(FUTEX_OWNER_DIED, 0x4000_0000);
+        assert_eq!(FUTEX_TID_MASK, 0x3FFF_FFFF);
+    }
+
+    /// `parse_futex_word` classifies the owner state from the word's
+    /// low bits + the OWNER_DIED flag; the WAITERS bit is orthogonal.
+    #[test]
+    fn parse_futex_word_classifies_owner_state() {
+        assert_eq!(parse_futex_word(0), FutexWordState::Unlocked);
+        assert_eq!(parse_futex_word(42), FutexWordState::LockedBy(42));
+        assert_eq!(
+            parse_futex_word(42 | FUTEX_WAITERS),
+            FutexWordState::LockedBy(42)
+        );
+        assert_eq!(
+            parse_futex_word(42 | FUTEX_OWNER_DIED),
+            FutexWordState::OwnerDied(42)
+        );
+    }
+
+    /// `has_waiters` reads the FUTEX_WAITERS bit.
+    #[test]
+    fn has_waiters_reads_the_waiters_bit() {
+        assert!(!has_waiters(42));
+        assert!(has_waiters(42 | FUTEX_WAITERS));
+    }
+
+    /// `pi_acquire` on a free word acquires it for the caller.
+    #[test]
+    fn pi_acquire_on_free_word_acquires() {
+        assert_eq!(pi_acquire(0, 7), PiAcquire::Acquired(7));
+    }
+
+    /// `pi_acquire` on a word owned by a live other task is contended —
+    /// the returned word gains the FUTEX_WAITERS bit (LOCK_PI then
+    /// blocks; TRYLOCK_PI reports busy without writing it).
+    #[test]
+    fn pi_acquire_on_other_owner_is_contended_with_waiters_bit() {
+        assert_eq!(pi_acquire(9, 7), PiAcquire::Contended(9 | FUTEX_WAITERS));
+    }
+
+    /// `pi_acquire` on a dead-owner word makes the caller the new owner
+    /// (OWNER_DIED cleared) but flags robust recovery (-EOWNERDEAD).
+    #[test]
+    fn pi_acquire_on_owner_died_acquires_with_eownerdead() {
+        assert_eq!(
+            pi_acquire(9 | FUTEX_OWNER_DIED, 7),
+            PiAcquire::AcquiredOwnerDied(7)
+        );
+    }
+
+    /// `pi_acquire` where the caller already owns the lock is a
+    /// deadlock (-EDEADLK).
+    #[test]
+    fn pi_acquire_on_self_owned_is_deadlock() {
+        assert_eq!(pi_acquire(7, 7), PiAcquire::Deadlock);
+    }
+
+    /// `pi_unlock` by a non-owner is rejected (-EPERM).
+    #[test]
+    fn pi_unlock_by_non_owner_is_not_owner() {
+        assert_eq!(pi_unlock(9, 7, None, false), PiUnlock::NotOwner);
+    }
+
+    /// `pi_unlock` by the owner with no waiters clears the lock (word→0).
+    #[test]
+    fn pi_unlock_owner_no_waiters_clears() {
+        assert_eq!(pi_unlock(7, 7, None, false), PiUnlock::Cleared);
+    }
+
+    /// `pi_unlock` by the owner hands the lock to the next waiter; the
+    /// new owner word keeps FUTEX_WAITERS only when more remain.
+    #[test]
+    fn pi_unlock_owner_hands_off_to_next_waiter() {
+        assert_eq!(
+            pi_unlock(7 | FUTEX_WAITERS, 7, Some(11), false),
+            PiUnlock::HandedOff(11)
+        );
+        assert_eq!(
+            pi_unlock(7 | FUTEX_WAITERS, 7, Some(11), true),
+            PiUnlock::HandedOff(11 | FUTEX_WAITERS)
+        );
+    }
+
+    // -- #547: PI-futex syscall handlers -----------------------------
+
+    /// lock_pi rejects a null / unaligned uaddr like the basic ops.
+    #[test]
+    fn lock_pi_validates_uaddr() {
+        let _g = CURRENT_PROCESS_TEST_LOCK.lock();
+        assert_eq!(lock_pi(0), -EFAULT);
+        assert_eq!(lock_pi(0x1001), -EINVAL);
+    }
+
+    /// lock_pi on a free futex acquires it: returns 0, the word now
+    /// holds the caller's pid.
+    #[test]
+    fn lock_pi_on_free_word_acquires() {
+        let _g = CURRENT_PROCESS_TEST_LOCK.lock();
+        drain_global_futex_table();
+        install_test_process(7);
+        let mut cell: u32 = 0;
+        let uaddr = &mut cell as *mut u32 as u64;
+        assert_eq!(lock_pi(uaddr), 0);
+        assert_eq!(cell, 7);
+        current_process_uninstall();
+    }
+
+    /// lock_pi on a futex owned by another live task is contended: the
+    /// caller enqueues + goes BlockedFutex, the word gains the WAITERS
+    /// bit, the call returns 0 (tier-1 "blocks"; #530 does the real park
+    /// + priority boost).
+    #[test]
+    fn lock_pi_on_contended_word_enqueues_and_sets_waiters() {
+        let _g = CURRENT_PROCESS_TEST_LOCK.lock();
+        drain_global_futex_table();
+        install_test_process(7);
+        let mut cell: u32 = 9; // owned by tid 9
+        let uaddr = &mut cell as *mut u32 as u64;
+        assert_eq!(lock_pi(uaddr), 0);
+        assert_eq!(cell, 9 | FUTEX_WAITERS);
+        let waiters = with_futex_table(|t| t.peek_waiters(uaddr).to_vec());
+        assert_eq!(waiters, alloc::vec![7]);
+        current_process_mut(|p| {
+            assert_eq!(p.unwrap().state, ProcessState::BlockedFutex(uaddr))
+        });
+        with_futex_table(|t| {
+            t.wake_n(uaddr, usize::MAX);
+        });
+        current_process_uninstall();
+    }
+
+    /// lock_pi where the caller already owns the lock is a deadlock.
+    #[test]
+    fn lock_pi_self_owned_is_deadlock() {
+        let _g = CURRENT_PROCESS_TEST_LOCK.lock();
+        drain_global_futex_table();
+        install_test_process(7);
+        let mut cell: u32 = 7; // already owned by caller
+        let uaddr = &mut cell as *mut u32 as u64;
+        assert_eq!(lock_pi(uaddr), -EDEADLK);
+        assert_eq!(cell, 7); // unchanged
+        current_process_uninstall();
+    }
+
+    /// lock_pi on a dead-owner futex hands ownership to the caller and
+    /// returns -EOWNERDEAD; the word becomes the caller's pid
+    /// (OWNER_DIED cleared).
+    #[test]
+    fn lock_pi_owner_died_acquires_with_eownerdead() {
+        let _g = CURRENT_PROCESS_TEST_LOCK.lock();
+        drain_global_futex_table();
+        install_test_process(7);
+        let mut cell: u32 = 9 | FUTEX_OWNER_DIED;
+        let uaddr = &mut cell as *mut u32 as u64;
+        assert_eq!(lock_pi(uaddr), -EOWNERDEAD);
+        assert_eq!(cell, 7);
+        current_process_uninstall();
+    }
+
+    /// trylock_pi acquires a free futex (0, word=pid); on a contended
+    /// one it returns -EAGAIN and does NOT write the word or enqueue.
+    #[test]
+    fn trylock_pi_acquires_or_reports_busy() {
+        let _g = CURRENT_PROCESS_TEST_LOCK.lock();
+        drain_global_futex_table();
+        install_test_process(7);
+        let mut free: u32 = 0;
+        let free_addr = &mut free as *mut u32 as u64;
+        assert_eq!(trylock_pi(free_addr), 0);
+        assert_eq!(free, 7);
+
+        let mut held: u32 = 9;
+        let held_addr = &mut held as *mut u32 as u64;
+        assert_eq!(trylock_pi(held_addr), -EAGAIN);
+        assert_eq!(held, 9); // unchanged, no WAITERS bit
+        assert!(with_futex_table(|t| t.peek_waiters(held_addr).is_empty()));
+        current_process_uninstall();
+    }
+
+    /// unlock_pi by a non-owner is -EPERM; by the owner with no waiters
+    /// clears the word to 0.
+    #[test]
+    fn unlock_pi_perm_and_clear() {
+        let _g = CURRENT_PROCESS_TEST_LOCK.lock();
+        drain_global_futex_table();
+        install_test_process(7);
+        let mut not_mine: u32 = 9;
+        let nm_addr = &mut not_mine as *mut u32 as u64;
+        assert_eq!(unlock_pi(nm_addr), -EPERM);
+        assert_eq!(not_mine, 9);
+
+        let mut mine: u32 = 7;
+        let mine_addr = &mut mine as *mut u32 as u64;
+        assert_eq!(unlock_pi(mine_addr), 0);
+        assert_eq!(mine, 0);
+        current_process_uninstall();
+    }
+
+    /// unlock_pi by the owner with a waiter hands the lock off: the word
+    /// becomes the next waiter's tid and the call returns 0.
+    #[test]
+    fn unlock_pi_hands_off_to_waiter() {
+        let _g = CURRENT_PROCESS_TEST_LOCK.lock();
+        drain_global_futex_table();
+        install_test_process(7);
+        let mut cell: u32 = 7 | FUTEX_WAITERS;
+        let uaddr = &mut cell as *mut u32 as u64;
+        with_futex_table(|t| t.enqueue(uaddr, 11));
+        assert_eq!(unlock_pi(uaddr), 0);
+        assert_eq!(cell, 11); // handed to 11; no more waiters → WAITERS clear
+        assert!(with_futex_table(|t| t.peek_waiters(uaddr).is_empty()));
+        current_process_uninstall();
+    }
+
+    /// The dispatcher routes the PI op-codes to their handlers.
+    #[test]
+    fn handle_dispatches_pi_ops() {
+        let _g = CURRENT_PROCESS_TEST_LOCK.lock();
+        drain_global_futex_table();
+        install_test_process(7);
+        let mut cell: u32 = 0;
+        let uaddr = &mut cell as *mut u32 as u64;
+        assert_eq!(handle(uaddr, FUTEX_LOCK_PI, 0, 0, 0, 0), 0);
+        assert_eq!(cell, 7);
+        assert_eq!(handle(uaddr, FUTEX_UNLOCK_PI, 0, 0, 0, 0), 0);
+        assert_eq!(cell, 0);
+        assert_eq!(handle(uaddr, FUTEX_TRYLOCK_PI, 0, 0, 0, 0), 0);
+        assert_eq!(cell, 7);
         current_process_uninstall();
     }
 }
