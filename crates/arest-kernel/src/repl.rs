@@ -123,9 +123,11 @@ pub fn dispatch(line: &str) -> String {
         "help" => {
             [
                 "Built-in commands:",
-                "  help  — show this message",
-                "  heap  — print allocator stats",
-                "  quit  — halt the kernel",
+                "  help                       — show this message",
+                "  heap                       — print allocator stats",
+                "  run <applet|/path> [args…] — exec a File-fact binary (#527)",
+                "                               e.g. `run ls /`, `run sh`",
+                "  quit                       — halt the kernel",
                 "",
                 "AREST engine not yet linked.",
                 "Once the `arest` crate is added to Cargo.toml,",
@@ -156,6 +158,19 @@ pub fn dispatch(line: &str) -> String {
         }
 
         _ => {
+            // `run <words…>` — exec a File-fact binary (#527). All
+            // parse/exec/report logic lives in the target-agnostic
+            // `process::exec::run_command` (host-tested there); this
+            // arm only splits the words. On UEFI a successful exec
+            // diverges into ring 3, so a returned string is always a
+            // failure report.
+            if let Some(rest) = line.strip_prefix("run") {
+                if rest.is_empty() || rest.starts_with(' ') {
+                    let words: alloc::vec::Vec<&str> =
+                        rest.split_whitespace().collect();
+                    return crate::process::exec::run_command(&words);
+                }
+            }
             // arest engine not linked yet.
             alloc::format!(
                 "unknown command: `{line}`\n\
@@ -201,4 +216,9 @@ mod tests {
         assert!(evaluate_line("").is_empty());
         assert!(evaluate_line("   ").is_empty());
     }
+
+    // The `run` arm's parse/exec/report logic — including its tests —
+    // lives in `process::exec::run_command`: this module is gated to
+    // `target_os = "uefi"` + `feature = "repl"`, so tests here can
+    // never execute on a host target. The arm below is a passthrough.
 }

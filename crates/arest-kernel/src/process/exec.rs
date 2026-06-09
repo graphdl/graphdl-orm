@@ -119,6 +119,47 @@ pub fn argv_from_words(words: &[&str]) -> Vec<Vec<u8>> {
     words.iter().map(|w| w.as_bytes().to_vec()).collect()
 }
 
+/// The REPL `run` command (#527): parse the words after `run`, exec,
+/// and render the outcome as a printable report.
+///
+/// Path rule:
+///   * `run /path/bin args…` — leading `/` is an explicit File path;
+///     argv is the words verbatim (argv[0] = the path, whose basename
+///     busybox's dispatcher inspects).
+///   * `run ls /` / `run busybox ls /` — no leading `/` means the
+///     busybox multi-call form: path is `/bin/busybox`, argv is the
+///     words verbatim so argv[0] names the applet (or `busybox`, whose
+///     dispatcher then reads argv[1]).
+///
+/// On UEFI a successful exec DIVERGES into ring 3 — the report string
+/// is only ever produced for failures (and on host targets, where the
+/// trampoline structurally refuses). Tier-1 has no scheduler: a guest
+/// that exits halts the machine (`syscall::exit`), so "return to the
+/// prompt after the program ran" is #530 follow-on work, not this arm.
+pub fn run_command(words: &[&str]) -> alloc::string::String {
+    use alloc::format;
+    if words.is_empty() {
+        return "usage: run <applet|/path> [args…]\n\
+                e.g.  run ls /        (busybox applet form)\n\
+                      run /bin/busybox sh"
+            .into();
+    }
+    let path: alloc::string::String = if words[0].starts_with('/') {
+        words[0].into()
+    } else {
+        "/bin/busybox".into()
+    };
+    let argv_owned = argv_from_words(words);
+    let argv: Vec<&[u8]> = argv_owned.iter().map(|v| v.as_slice()).collect();
+    // Minimal environment: a PATH so shell builtins that re-exec
+    // (`command -p`, scripts) resolve applets back through /bin.
+    let envp: &[&[u8]] = &[b"PATH=/bin", b"HOME=/"];
+    match exec_path(&path, 1, &argv, envp) {
+        Ok(()) => format!("exec {path}: returned to kernel (unexpected)"),
+        Err((e, _process)) => format!("exec {path} failed: {e:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +220,48 @@ mod tests {
             process.interp_base, None,
             "static busybox must not co-load an interpreter"
         );
+    }
+
+    // ── #527 `run` command parse/report ─────────────────────────────
+
+    /// Bare `run` prints usage, not an exec attempt.
+    #[test]
+    fn run_without_args_prints_usage() {
+        let out = run_command(&[]);
+        assert!(out.contains("usage"), "missing usage: {out}");
+        assert!(out.contains("run "), "usage must show the form: {out}");
+    }
+
+    /// `run` against a path with no File fact reports the exec error
+    /// (host tests run with no SYSTEM state installed, so resolution
+    /// fails as FileNotFound — same shape as an unknown binary).
+    #[test]
+    fn run_unknown_binary_reports_exec_failure() {
+        let out = run_command(&["/bin/definitely-not-here"]);
+        assert!(out.contains("exec"), "missing exec marker: {out}");
+        assert!(
+            out.contains("FileNotFound"),
+            "missing FileNotFound detail: {out}"
+        );
+    }
+
+    /// Applet-style invocation (`run ls /`) targets /bin/busybox with
+    /// argv[0] = the applet name — the multi-call contract. The exec
+    /// fails on host either way (no state → FileNotFound; state
+    /// installed by a sibling test's `system::init` → SpawnFailed at
+    /// the trampoline), and the report must name the busybox path it
+    /// resolved. Entropy fixture covers the second shape's AT_RANDOM
+    /// fill.
+    #[test]
+    fn run_applet_style_targets_busybox() {
+        use super::super::process::tests::with_deterministic_entropy;
+        with_deterministic_entropy([11u8; 32], || {
+            let out = run_command(&["ls", "/"]);
+            assert!(
+                out.contains("/bin/busybox"),
+                "applet form must resolve via /bin/busybox: {out}"
+            );
+        });
     }
 
     /// Spawning the prepared busybox on a HOST target walks the whole
