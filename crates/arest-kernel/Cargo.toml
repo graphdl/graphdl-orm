@@ -515,6 +515,18 @@ arest = { path = "../arest", features = [
 # on those arms reaches the doom path).
 [target.'cfg(all(target_os = "uefi", target_arch = "x86_64"))'.dependencies]
 wasmi = { version = "0.50", default-features = false, features = ["hash-collections"] }
+# Force sha2's portable (soft) backend on the UEFI target. sha2's
+# x86 SIMD/SHA-NI backend hits the same nightly-LLVM split-codegen
+# error poly1305 does (see .cargo/config.toml's poly1305_force_soft
+# note) — `rustc-LLVM ERROR: Do not know how to split the result of
+# this operator!`. Unlike poly1305 (a `--cfg`), sha2 opts out via a
+# Cargo `force-soft` feature, so we inject a direct dep here purely to
+# turn that feature on; cargo unifies it with arest's transitive
+# `sha2` dep so the whole UEFI graph gets the scalar backend. Scoped
+# to the x86_64-UEFI target so the host-test build keeps SHA-NI. The
+# soft backend is also the right call for a kernel that doesn't set up
+# SIMD register state for save/restore.
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 # Slint UI toolkit (#426) — picked over egui per the Track II
 # decision recorded in `docs/24-ui-toolkit-decision.md` (commit
 # `75f1022`). Only the UEFI x86_64 build wires Slint into a render

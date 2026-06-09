@@ -21,3 +21,23 @@ target = "x86_64-unknown-uefi"
 [alias]
 t = "test --lib --target x86_64-pc-windows-msvc"
 c = "check --lib --target x86_64-pc-windows-msvc"
+
+# Force the portable (soft) backends of the RustCrypto stack on the
+# UEFI x86_64 target. poly1305's AVX2/SSE backend fails to codegen for
+# x86_64-unknown-uefi under the current nightly — `rustc-LLVM ERROR: Do
+# not know how to split the result of this operator!` — because the
+# wide-vector lowering can't be legalized for this target. The `soft`
+# backend is scalar, so it sidesteps the bad codegen entirely; it is
+# also the correct choice for a kernel that does not set up AVX state
+# for save/restore. cpufeatures still picks soft at runtime when SIMD
+# isn't available, so this only removes the un-buildable code path.
+# chacha20 needs the same treatment: its AVX2 backend codegens fine as
+# its own crate but triggers the split-codegen error once inlined into
+# a consumer (arest-foundation, via chacha20poly1305's AEAD). Forcing
+# its soft backend too keeps the whole chacha20poly1305 path scalar.
+# (sha2's equivalent opt-out is a Cargo `force-soft` feature, injected
+# in Cargo.toml rather than here — see that file.)
+# Scoped to the UEFI target so the host-test build (`cargo t`, the
+# windows-msvc target) keeps its native SIMD backends. #(UEFI build)
+[target.x86_64-unknown-uefi]
+rustflags = ["--cfg", "poly1305_force_soft", "--cfg", "chacha20_force_soft"]
