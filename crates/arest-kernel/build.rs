@@ -827,6 +827,14 @@ fn build_musl_libc(
     // cc auto-discover.
     if cfg!(target_os = "windows") {
         build.compiler("clang");
+        // No archiver override: the windows-msvc target's archive tools
+        // (MSVC lib.exe AND llvm-lib) are COFF-only and reject the
+        // Linux-ELF objects clang emits for x86_64-unknown-linux-musl
+        // (lib.exe exit 1107, llvm-lib exit 1). The archive is done
+        // manually with llvm-ar (GNU syntax, ELF-capable) after
+        // `try_compile_intermediates` below. clang + llvm-ar ship in
+        // VS's "C++ Clang tools" component (VC\Tools\Llvm\x64\bin),
+        // which must be on PATH for this build.
     }
 
     // Include path order, identical to upstream's CFLAGS_ALL line in
@@ -916,8 +924,19 @@ fn build_musl_libc(
     // Pull in the AREST-specific syscall + arch overrides via
     // -include, AFTER the per-arch syscall.h so any redefine wins.
     // arch.h is pulled in early (before musl arch headers).
+    //
+    // The syscall override is named `syscall-override.h`, NOT
+    // `syscall.h`: `-Imusl_config` is first on the include search path
+    // (so musl_config/version.h substitutes for the build-generated
+    // src/internal/version.h), which means a file named `syscall.h`
+    // here would be found by the 296 musl sources that `#include
+    // "syscall.h"` BEFORE musl's real src/internal/syscall.h — shadowing
+    // it and stripping `__syscall` + every `SYS_*` from the TU. The
+    // override is force-included (-include) regardless of its name, so
+    // renaming it off the colliding name fixes the shadow without
+    // losing the override hook.
     let arch_override = musl_config_dir.join("arch.h");
-    let syscall_override = musl_config_dir.join("syscall.h");
+    let syscall_override = musl_config_dir.join("syscall-override.h");
     if arch_override.is_file() {
         build.flag_if_supported(&format!(
             "-include{}",
@@ -937,33 +956,65 @@ fn build_musl_libc(
     }
 
     println!("cargo:rustc-check-cfg=cfg(musl_libc_built)");
-    match build.try_compile("c") {
-        Ok(()) => {
-            // cc::Build emits libc.a (or `libc.lib` on MSVC, but
-            // since we forced clang above on Windows we still get
-            // libc.a) under $OUT_DIR. Surface the search path so
-            // future tracks (#525 busybox / ash / hello-world) can
-            // pull it in via `-l static=c`.
-            println!(
-                "cargo:rustc-link-search=native={}",
-                out_dir.display(),
-            );
-            println!("cargo:rustc-cfg=musl_libc_built");
-            // Don't `cargo:rustc-link-lib=` here — the kernel binary
-            // doesn't link musl yet (#524 brief: "Do NOT actually
-            // link musl into the kernel binary yet — that's #525
-            // onward"). The archive sits in $OUT_DIR waiting for a
-            // future static-guest build to consume it.
-            println!(
-                "cargo:warning=musl-libc: built libc.a ({} sources, {} arch-overridden) under {}",
-                sources.len(),
-                replaced.len(),
-                out_dir.display(),
-            );
-            Ok(())
-        }
-        Err(e) => Err(format!("{}", e)),
+    // Compile to objects only (NOT cc's compile(), which would archive
+    // with the windows-msvc target's COFF-only `lib` tool); then bundle
+    // the Linux-ELF objects ourselves with llvm-ar. See the no-archiver
+    // note in the windows block above.
+    let objects = build
+        .try_compile_intermediates()
+        .map_err(|e| format!("musl object compile: {}", e))?;
+    let libc_a = out_dir.join("libc.a");
+    // Fresh archive each run: remove any stale one so re-builds don't
+    // accrete dropped objects, then `crs` = create + insert + symbol
+    // index.
+    let _ = fs::remove_file(&libc_a);
+    let ar_tool = if cfg!(target_os = "windows") { "llvm-ar" } else { "ar" };
+    // Windows caps the command line (~32 KB); hundreds of objects with
+    // long absolute paths overflow it (os error 206). Pass the object
+    // list via an ar @response-file instead. Forward-slash every path:
+    // ar's response-file parser treats backslash as an escape, which
+    // would corrupt C:\... paths.
+    let rsp = out_dir.join("libc-objects.rsp");
+    let mut rsp_body = String::new();
+    for obj in &objects {
+        rsp_body.push_str(&obj.to_string_lossy().replace('\\', "/"));
+        rsp_body.push('\n');
     }
+    fs::write(&rsp, &rsp_body).map_err(|e| format!("write {}: {}", rsp.display(), e))?;
+    let mut ar_cmd = std::process::Command::new(ar_tool);
+    ar_cmd
+        .arg("crs")
+        .arg(&libc_a)
+        .arg(format!("@{}", rsp.to_string_lossy().replace('\\', "/")));
+    let status = ar_cmd.status().map_err(|e| {
+        format!(
+            "spawn {}: {} (VS C++ Clang tools / binutils must be on PATH)",
+            ar_tool, e
+        )
+    })?;
+    if !status.success() {
+        return Err(format!(
+            "{} failed to archive {} musl objects (exit {:?})",
+            ar_tool,
+            objects.len(),
+            status.code()
+        ));
+    }
+    // Surface the search path so future static-guest builds (#525
+    // busybox / ash / hello-world) can pull it in via `-l static=c`.
+    // Don't `cargo:rustc-link-lib=` — the kernel binary doesn't link
+    // musl yet (#524 brief: "Do NOT actually link musl into the kernel
+    // binary yet — that's #525 onward"); the archive sits in $OUT_DIR.
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-cfg=musl_libc_built");
+    println!(
+        "cargo:warning=musl-libc: archived libc.a ({} objects, {} sources, {} arch-overridden) under {}",
+        objects.len(),
+        sources.len(),
+        replaced.len(),
+        out_dir.display(),
+    );
+    Ok(())
 }
 
 /// Generate `bits/alltypes.h` from the per-arch + generic templates,
