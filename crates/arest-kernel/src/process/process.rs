@@ -1811,4 +1811,48 @@ mod tests {
         // A from_dynamic_image process starts Created, like new().
         assert_eq!(proc.state, ProcessState::Created);
     }
+
+    /// End-to-end (#522): spawning a Process built from a DynamicImage
+    /// lands AT_BASE (= the interpreter load base) AND AT_ENTRY (= the
+    /// PROGRAM entry, not the interpreter jump target) on the actual
+    /// initial stack. This verifies the seam the unit tests don't:
+    /// from_dynamic_image → build_auxv → spawn push → StackBuilder
+    /// finalize all compose so the dynamic auxv reaches userspace.
+    #[test]
+    fn spawn_dynamic_image_lands_at_base_on_stack() {
+        with_deterministic_entropy([7u8; 32], || {
+            // entry_point is the interpreter's entry (the jump target);
+            // interp_base / program_entry are the dynamic auxv values.
+            let mut address_space = AddressSpace::new(0x8000_4000);
+            address_space
+                .push_segment(0x0040_1000, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
+                .expect("program .text push");
+            let img = DynamicImage {
+                address_space,
+                interp_base: 0x8000_0000,
+                program_entry: 0x0040_1000,
+            };
+            let mut proc = Process::from_dynamic_image(1, img);
+            let _ = proc.spawn(&[], &[]); // tier-1: trampoline fails after stack build
+            let stack = proc.initial_stack.as_ref().unwrap();
+            let pop = stack.populated();
+            let rd = |off: usize| {
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&pop[off..off + 8]);
+                u64::from_le_bytes(b)
+            };
+            // Empty argv/envp → header is argc(8)+argvNULL(8)+envpNULL(8)
+            // = 24. Dynamic auxv order: PHDR, PHENT, PHNUM, PAGESZ, BASE,
+            // ENTRY, RANDOM. AT_BASE is the 5th entry → 24 + 4*16 = 88.
+            assert_eq!(rd(88), AuxvType::Base as u64, "AT_BASE key present for dynamic image");
+            assert_eq!(rd(96), 0x8000_0000, "AT_BASE value == interpreter load base");
+            // AT_ENTRY is the 6th entry → 24 + 5*16 = 104.
+            assert_eq!(rd(104), AuxvType::Entry as u64, "AT_ENTRY key follows AT_BASE");
+            assert_eq!(
+                rd(112),
+                0x0040_1000,
+                "AT_ENTRY value == program entry, NOT the interpreter jump target (0x8000_4000)"
+            );
+        });
+    }
 }
