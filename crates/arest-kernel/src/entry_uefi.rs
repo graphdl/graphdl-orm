@@ -569,6 +569,19 @@ fn kernel_run_uefi(
     #[cfg(not(feature = "repl"))]
     println!("  kbd:      skipped (no repl feature; PS/2 driver elided, IRQ 1 masked)");
 
+    // Diagnostic timeline probe (#527 input-pipeline investigation):
+    // the PIT's IRQ-driven now_ms freezes ~1.25 s into boot; stamping
+    // each init step localises which one kills interrupt delivery.
+    // Cheap (one atomic read per call) and boot-only — the launcher's
+    // periodic diag line takes over from there.
+    fn tstamp(label: &str) {
+        crate::println!(
+            "  t:        now_ms={} after {}",
+            crate::arch::time::now_ms(),
+            label,
+        );
+    }
+
     // Proves the page-table singleton is live post-EBS: going
     // through `memory::usable_frame_count()` forces a `FRAME_ALLOCATOR.lock()`
     // + a pass over the descriptor iterator, so a hung lock or a
@@ -588,6 +601,7 @@ fn kernel_run_uefi(
     // in `kernel_run` (main.rs).
     crate::arch::breakpoint();
     println!("  idt:      int3 round-tripped through UEFI IDT");
+    tstamp("idt");
 
     // DMA pool carve smoke (ed869c4). `arch::init_memory` on UEFI
     // now mirrors the BIOS arm: carves a 2 MiB contiguous region out
@@ -603,6 +617,7 @@ fn kernel_run_uefi(
         "  dma:      pool {} (2 MiB UEFI memory-map carve for virtio)",
         if dma_ok { "live" } else { "NONE (carve failed)" }
     );
+    tstamp("dma");
 
     // virtio statics + PCI walker smoke (#344/#345). Seeds the virtio
     // HAL's phys_offset (= 0 under UEFI's identity mapping) and walks
@@ -645,6 +660,7 @@ fn kernel_run_uefi(
             None => alloc::string::String::from("none"),
         },
     );
+    tstamp("pci");
 
     // Actually drive the virtio devices the PCI walker found. Both
     // `try_init_*` functions return None when no device is present
@@ -678,8 +694,10 @@ fn kernel_run_uefi(
     // to. Polling-only — the timer IRQ doesn't drive smoltcp yet (the
     // BIOS arm runs the same way for now).
     let virtio_phy = virtio_net_dev.map(crate::virtio::VirtioPhy::new);
+            tstamp("virtio-net");
     crate::net::init(virtio_phy);
     println!("  net:      smoltcp interface live (DHCPv4 pending)");
+    tstamp("net");
 
     // #360: register the kernel's HTTP handler on :80, mirroring the
     // BIOS path's `kernel_run` (main.rs L369). Without this, the
@@ -694,6 +712,7 @@ fn kernel_run_uefi(
     // on `net::register_http` LLL flagged.
     crate::net::register_http(80, crate::arest_http_handler);
     println!("  http:     handler registered on :80");
+    tstamp("http");
 
     let virtio_blk_dev = crate::virtio::try_init_virtio_blk();
     match &virtio_blk_dev {
@@ -706,6 +725,7 @@ fn kernel_run_uefi(
             println!(
                 "  virtio-blk: driver online, {sectors} sectors ({cap_kib} KiB), {mode}"
             );
+            tstamp("virtio-blk");
         }
         None => println!("  virtio-blk: no device / init failed"),
     }
@@ -947,6 +967,7 @@ fn kernel_run_uefi(
                 println!(
                     "  virtio-gpu: driver online, {w}x{h} (B8G8R8A8UNORM, {buf_len} bytes)"
                 );
+            tstamp("virtio-gpu");
                 // Park the driver so framebuffer's present() can call
                 // back through `flush_active_surface()`, then re-borrow
                 // the DMA surface for the framebuffer install. The
@@ -981,6 +1002,7 @@ fn kernel_run_uefi(
                     crate::framebuffer::install_virtio_gpu(info, fb_ptr, fb_len);
                 }
                 println!("  fb:       virtio-gpu surface installed");
+            tstamp("virtio-gpu-surface-done");
             }
             Err(e) => {
                 println!("  virtio-gpu: init failed ({e:?}); GOP fallback retained");
@@ -1165,6 +1187,7 @@ fn kernel_run_uefi(
     let test_vec: alloc::vec::Vec<u32> = (0..16u32).collect();
     let sum: u32 = test_vec.iter().sum();
     println!("  alloc:    post-EBS heap live (sum 0..16 = {sum})");
+    tstamp("alloc");
 
     // Step 4d wave 4: initialise the AREST engine under UEFI.
     // `system::init()` stands up the baked metamodel + single-
@@ -1177,6 +1200,7 @@ fn kernel_run_uefi(
     // regression, surfaced via missing banner + smoke timeout.
     crate::system::init();
     println!("  engine:   system::init() completed (arest engine live on UEFI)");
+    tstamp("engine");
 
     // #560 (DynRdg-T1) + #589: walk the loaded-readings ring on
     // the persistence disk and replay each record through
@@ -1226,6 +1250,7 @@ fn kernel_run_uefi(
         .expect("get main");
     let answer = main_fn.call(&mut store, ()).expect("call main");
     println!("  wasmi:    tiny module executed, main() = {answer} (runtime live on UEFI)");
+    tstamp("wasmi");
 
     // Doom host-shim binding smoke (#270/#271, scaffold f3be6d4).
     // Creates a Linker<KernelDoomHost>, binds all 10 Doom imports

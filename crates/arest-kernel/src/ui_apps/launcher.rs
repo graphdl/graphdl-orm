@@ -677,6 +677,21 @@ pub fn run(
             }
         }
 
+        // 0c. Poll the i8042 directly (#527). Under QEMU TCG on a
+        //     Windows host, IRQ-1 delivery proved unreliable — the
+        //     i8259 sees the line raises but vector 33 never runs, so
+        //     scancodes rot in the controller's output buffer. The
+        //     poll feeds the same decode path the ISR uses and is
+        //     harmless when IRQs work (OBF is then already empty).
+        crate::arch::uefi::keyboard::poll_i8042();
+
+        // 0d. Poll COM1 RX (#527): the serial-console input fallback.
+        //     Characters received on the 16550 become Unicode
+        //     keystrokes on the same ring, so a `-serial tcp:` QEMU
+        //     harness (or a real serial console) can type into the
+        //     REPL without any emulated keyboard hardware at all.
+        crate::arch::uefi::keyboard::poll_serial_rx();
+
         // 1. Drain the keyboard ring. When an app is active, intercept
         //    Esc for back-to-launcher; otherwise forward all keys to
         //    the active Slint window via the existing
@@ -917,23 +932,60 @@ pub fn run(
         //     frame; the `println!` only fires every 600th tick).
         if tick_count % 600 == 0 {
             let kbd_pending = crate::arch::uefi::keyboard::pending();
+            // Monotonic counters bracket the input pipeline for the
+            // headless smoke: kbd_total counts keystrokes that ever
+            // ARRIVED (IRQ + synthetic producers), eval_total counts
+            // lines that reached the REPL dispatcher. pending() alone
+            // can't distinguish "never arrived" from "arrived and was
+            // drained" — the per-frame drain keeps it at 0 either way.
+            let kbd_total = crate::arch::uefi::keyboard::total_enqueued();
+            // irq1 = ISR invocations (the guest actually serviced the
+            // vector); now_ms advancing across diag lines = the PIT
+            // ISR is alive too (IRQ servicing is not globally dead).
+            let irq1 = crate::arch::uefi::interrupts::IRQ1_COUNT
+                .load(core::sync::atomic::Ordering::Relaxed);
+            let now_ms = crate::arch::time::now_ms();
+            #[cfg(feature = "repl")]
+            let eval_total =
+                crate::repl::EVAL_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+            #[cfg(not(feature = "repl"))]
+            let eval_total = 0u64;
             let ptr_pending = pointer::pending();
             let (cx, cy) = pointer::current_position();
             #[cfg(feature = "linuxkpi")]
             let inputs = crate::linuxkpi::virtio::input_device_count();
             #[cfg(not(feature = "linuxkpi"))]
             let inputs = 0usize;
+            let (if_on, imr, isr, irr) = crate::arch::uefi::interrupts::pic_diag();
             crate::println!(
-                "  diag:     tick={tick_count} kbd_pending={kbd_pending} \
-                 ptr_pending={ptr_pending} cursor=({cx},{cy}) inputs={inputs}"
+                "  diag:     tick={tick_count} now_ms={now_ms} irq1={irq1} \
+                 if={if_on} imr={imr:#04x} isr={isr:#04x} irr={irr:#04x} \
+                 kbd_pending={kbd_pending} kbd_total={kbd_total} \
+                 eval_total={eval_total} ptr_pending={ptr_pending} \
+                 cursor=({cx},{cy}) inputs={inputs}"
             );
         }
 
-        // 5. Idle. `pause` hints the CPU we're busy-waiting,
-        //    reducing power draw and SMT-sibling contention without
-        //    blocking IRQs (the PIT IRQ 0 + keyboard IRQ 1 still
-        //    fire on schedule). Same shape GGG's drainer used.
-        unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+        // 5. Idle: `sti; hlt` — sleep until the next interrupt (the
+        //    1 kHz PIT bounds the wait at ~1 ms).
+        //
+        //    This replaces the old `pause` spin, which starved QEMU's
+        //    single-threaded TCG: the vCPU thread holds the BQL while
+        //    translating/executing guest code, and a tight pause-loop
+        //    with no VM exits gives the QEMU main loop almost no
+        //    service. Observed effect: PIT ticks at 0.4–18 Hz instead
+        //    of 1 kHz, and EVERY host→guest path starves — serial RX
+        //    bytes, PS/2 + virtio-input events, and virtio-net rx
+        //    (the long-standing "DHCPv4 pending forever under the
+        //    launcher" / #595-adjacent gap) — while guest→host output
+        //    keeps flowing, because each port-I/O exit briefly yields
+        //    the BQL. `hlt` exits the vCPU loop properly, the main
+        //    loop runs timers/chardev/net, and the next PIT tick
+        //    resumes us — also the correct power story on real
+        //    hardware. IF is guaranteed enabled here (the PIT banner
+        //    proved delivery at boot, and nothing in the super-loop
+        //    runs with IF cleared), so the hlt always wakes.
+        x86_64::instructions::interrupts::enable_and_hlt();
     }
 }
 

@@ -108,8 +108,17 @@ pub fn process_key(ch: char) {
 /// `process_key` unchanged means GGG's #365 wiring in `entry_uefi.rs`
 /// keeps working without coordination from this track.
 pub fn evaluate_line(line: &str) -> String {
+    EVAL_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     dispatch(line.trim())
 }
+
+/// Cumulative count of `evaluate_line` invocations. Diagnostic: with
+/// `keyboard::total_enqueued()` it brackets the input pipeline — keys
+/// that arrived vs lines that actually reached the dispatcher — so a
+/// headless smoke can localise a dead keystroke path from the periodic
+/// launcher diag line alone.
+pub static EVAL_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// Dispatch a trimmed input line and return a response string.
 ///

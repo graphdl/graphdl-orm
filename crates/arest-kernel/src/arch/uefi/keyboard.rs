@@ -54,6 +54,15 @@ const RING_CAP: usize = 64;
 /// expected to be a single REPL pump (#365 scope) — no fan-out today.
 static RING: Mutex<VecDeque<DecodedKey>> = Mutex::new(VecDeque::new());
 
+/// Cumulative count of every `DecodedKey` ever enqueued (IRQ path +
+/// synthetic `push_keystroke`s). Unlike `pending()` — which a per-frame
+/// drainer keeps at 0 — this is monotonic, so a headless smoke can
+/// tell "no keystrokes ever arrived" (QEMU input routing / i8042 / IRQ
+/// problem) apart from "keystrokes arrived and were drained" (consumer-
+/// side problem) from the periodic diag line alone.
+static TOTAL_ENQUEUED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Initialise the keyboard decoder singleton. Idempotent — a second
 /// call is a no-op. Called from `arch::uefi::interrupts::pic_init`
 /// alongside the PIC remap, before the IRQ 1 mask is cleared, so
@@ -95,6 +104,7 @@ pub fn handle_scancode(scancode: u8) {
                 ring.pop_front();
             }
             ring.push_back(decoded);
+            TOTAL_ENQUEUED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -136,6 +146,98 @@ pub fn push_keystroke(decoded: DecodedKey) {
         ring.pop_front();
     }
     ring.push_back(decoded);
+    TOTAL_ENQUEUED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Monotonic count of every keystroke ever enqueued — see
+/// `TOTAL_ENQUEUED`. Reads relaxed; diagnostic use only.
+pub fn total_enqueued() -> u64 {
+    TOTAL_ENQUEUED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Poll the 16550 COM1 receive side and feed any pending characters
+/// onto the keyboard ring as `DecodedKey::Unicode` — the serial-console
+/// input fallback the entry_uefi hand-off comment reserves.
+///
+/// Why (#527): headless QEMU typing proved undeliverable through the
+/// emulated input devices on the bundled QEMU dev build — PS/2
+/// send-key never reaches the i8042 (OBF stays empty, i8259 IRR never
+/// latches), device-addressed input-send-event aborts QEMU under a
+/// headless console, and virtio-input events never surface either.
+/// The serial line has none of those problems: `-serial tcp:...` (or
+/// stdio) feeds COM1 RX directly, and this poll turns received bytes
+/// into exactly the keystrokes the Slint REPL drain already consumes.
+/// CR maps to '\n' (TCP line discipline sends \r on Enter); LF passes
+/// through; DEL (0x7f) maps to backspace.
+///
+/// Bounded at 64 bytes per call (the ring's own capacity) so a babbling
+/// sender can't wedge the super-loop tick.
+pub fn poll_serial_rx() {
+    use x86_64::instructions::port::Port;
+    const COM1: u16 = 0x3F8;
+    let mut lsr = Port::<u8>::new(COM1 + 5);
+    let mut rbr = Port::<u8>::new(COM1);
+    for _ in 0..64 {
+        // SAFETY: LSR read is side-effect-free; RBR read pops the
+        // received byte the DR bit just reported. Documented 16550
+        // ports; single-threaded access (super-loop only).
+        let status: u8 = unsafe { lsr.read() };
+        if status & 0x01 == 0 {
+            break; // no data ready
+        }
+        let byte: u8 = unsafe { rbr.read() };
+        let ch = match byte {
+            b'\r' => '\n',
+            0x7f => '\u{8}', // DEL → backspace (Slint edits on \u{8})
+            other => other as char,
+        };
+        push_keystroke(DecodedKey::Unicode(ch));
+    }
+}
+
+/// Poll the i8042 output buffer and feed any pending bytes through the
+/// same decode path the IRQ-1 ISR uses. Keyboard bytes go to
+/// `handle_scancode`; aux (mouse) bytes route to
+/// `super::mouse::handle_aux_byte` — exactly what the IRQ-12 ISR would
+/// have done.
+///
+/// Why this exists (#527): under QEMU TCG on a Windows host, i8042 IRQ
+/// delivery to the guest proved unreliable — `info irq` shows the
+/// i8259 receiving the line raises, but the vector-33 ISR never runs
+/// (kbd_total stayed 0 across a whole typed line) even with IF=1,
+/// IMR=0xf8 and an empty ISR/IRR. The keystrokes sit in the i8042
+/// output buffer. Polling the status port each super-loop tick drains
+/// them regardless of IRQ behaviour, and is harmless when IRQs DO work
+/// (the ISR usually wins; the poll then sees OBF clear). Same approach
+/// as the boot-time "kbd: poll idle" smoke, made continuous.
+///
+/// Bounded: at most 16 bytes per call so a wedged status bit can't
+/// spin the super-loop forever.
+pub fn poll_i8042() {
+    use x86_64::instructions::port::Port;
+    let mut status_port = Port::<u8>::new(0x64);
+    let mut data_port = Port::<u8>::new(0x60);
+    for _ in 0..16 {
+        // SAFETY: 0x64 status read is side-effect-free; 0x60 read pops
+        // the output buffer byte the status bit just reported. Both
+        // are documented PC-architecture ports, single-threaded here.
+        let status: u8 = unsafe { status_port.read() };
+        if status & 0x01 == 0 {
+            break; // output buffer empty
+        }
+        let byte: u8 = unsafe { data_port.read() };
+        if status & 0x20 != 0 {
+            // AUXB: byte is from the aux (mouse) channel. The mouse
+            // module is slint-gated (this module is repl-gated, which
+            // slint composes but server-style profiles may not).
+            #[cfg(feature = "slint")]
+            super::mouse::handle_aux_byte(byte);
+            #[cfg(not(feature = "slint"))]
+            let _ = byte;
+        } else {
+            handle_scancode(byte);
+        }
+    }
 }
 
 /// Number of pending keystrokes in the ring. Useful for the boot

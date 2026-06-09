@@ -52,6 +52,13 @@
   injected (e.g. the guest program's output). Asserted in -Smoke mode in
   addition to the boot-banner set; in non-smoke mode they only extend
   the post-type wait.
+
+.PARAMETER EfiPath
+  Boot this .efi instead of the default debug-profile build product —
+  e.g. target\x86_64-unknown-uefi\release\arest-kernel.efi for a
+  release-profile run (the Slint software renderer is dramatically
+  faster there, which matters under TCG). Implies the caller built it;
+  combine with -SkipBuild.
 #>
 [CmdletBinding()]
 param(
@@ -60,13 +67,14 @@ param(
   [int]$TimeoutSec = 60,
   [switch]$Keep,
   [string]$TypeLine,
-  [string[]]$ExpectAfter = @()
+  [string[]]$ExpectAfter = @(),
+  [string]$EfiPath
 )
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path "$PSScriptRoot\..").Path
 $kernelDir = Join-Path $repoRoot 'crates\arest-kernel'
-$efi = Join-Path $kernelDir 'target\x86_64-unknown-uefi\debug\arest-kernel.efi'
+$efi = if ($EfiPath) { $EfiPath } else { Join-Path $kernelDir 'target\x86_64-unknown-uefi\debug\arest-kernel.efi' }
 
 # --- locate QEMU + OVMF firmware -------------------------------------
 $qemu = (Get-Command qemu-system-x86_64 -ErrorAction SilentlyContinue).Source
@@ -127,63 +135,94 @@ $qemuArgs = @(
 )
 $qmpPort = 4444
 if ($TypeLine) {
-  # Typing mode: PS/2 keyboard only (see .PARAMETER TypeLine) + a QMP
-  # socket for send-key. virtio-tablet stays — pointer events don't
-  # contend with keyboard routing.
+  # Typing mode: QMP socket for send-key. The virtio-keyboard stays
+  # attached — QEMU routes send-key events to it as the preferred
+  # keyboard handler, and the kernel's linuxkpi virtio-input driver
+  # (build with `--features linuxkpi`) translates the EV_KEY events
+  # into the keyboard ring. (Empirically on the bundled QEMU dev
+  # build + `-display none`, send-key events never reach the i8042:
+  # the guest-side PS/2 poll sees an empty output buffer and the
+  # i8259 never latches IRQ 1, so the PS/2 route is a dead end for
+  # headless typing.)
   $qemuArgs += @('-qmp', "tcp:127.0.0.1:${qmpPort},server,nowait")
-} else {
-  $qemuArgs += @('-device','virtio-keyboard-pci')
 }
+$serialPort = 4448
 $qemuArgs += @(
-  '-device','virtio-tablet-pci',
-  '-serial', "file:$serial",
-  '-display','none','-no-reboot','-no-shutdown'
+  '-device','virtio-keyboard-pci,id=vkbd',
+  '-device','virtio-tablet-pci'
 )
+if ($TypeLine) {
+  # Typing mode: the serial console is BIDIRECTIONAL over TCP. The
+  # harness pumps socket→serial.log (so every assert below reads the
+  # same file as the file: path) and writes the TypeLine + CR into the
+  # socket; the kernel's super-loop polls COM1 RX and feeds received
+  # characters onto the keyboard ring (`keyboard::poll_serial_rx`).
+  # This bypasses QEMU's emulated-input layer entirely — on the
+  # bundled dev build, headless send-key never reaches the i8042 OR
+  # the virtio-keyboard, and device-addressed input-send-event aborts
+  # QEMU (object_property_find_err: 'qemu-fixed-text-console.device').
+  $qemuArgs += @('-serial', "tcp:127.0.0.1:${serialPort},server,nowait")
+} else {
+  $qemuArgs += @('-serial', "file:$serial")
+}
+$qemuArgs += @('-display','none','-no-reboot','-no-shutdown')
 
-# Map one character to its QMP QKeyCode (US layout, unshifted subset the
-# REPL grammar needs). Returns $null for unsupported characters.
-function Get-QKeyCode([char]$c) {
-  switch -CaseSensitive ($c) {
-    { $_ -ge 'a' -and $_ -le 'z' } { return [string]$_ }
-    { $_ -ge '0' -and $_ -le '9' } { return [string]$_ }
-    ' ' { return 'spc' }
-    '/' { return 'slash' }
-    '-' { return 'minus' }
-    '.' { return 'dot' }
-    default { return $null }
+# --- serial-over-TCP plumbing (typing mode) ---------------------------
+$script:serialStream = $null
+$script:serialFs = $null
+$script:serialBuf = New-Object byte[] 65536
+
+# Drain any bytes QEMU has emitted on the serial socket into the
+# serial.log file, so the banner-wait/assert logic reads one source of
+# truth regardless of transport.
+function Pump-Serial {
+  if (-not $script:serialStream) { return }
+  while ($script:serialStream.DataAvailable) {
+    $n = $script:serialStream.Read($script:serialBuf, 0, $script:serialBuf.Length)
+    if ($n -le 0) { break }
+    $script:serialFs.Write($script:serialBuf, 0, $n)
+    $script:serialFs.Flush()
   }
 }
 
-# Inject $line + Enter as PS/2 scancodes through the QMP socket; then
-# (optionally) capture a PNG of the guest screen via QMP screendump —
-# the Unified REPL renders its scrollback on the virtio-gpu surface, so
-# the screen is the only place a UI-side response is observable from a
-# headless harness.
-function Send-QmpLine([int]$port, [string]$line, [string]$screendumpTo) {
+function Connect-Serial([int]$port) {
+  for ($i = 0; $i -lt 30; $i++) {
+    try {
+      $c = New-Object System.Net.Sockets.TcpClient('127.0.0.1', $port)
+      $script:serialStream = $c.GetStream()
+      $script:serialFs = [System.IO.File]::Open($serial, 'Append', 'Write', 'Read')
+      return
+    } catch { Start-Sleep -Milliseconds 500 }
+  }
+  throw "could not connect to QEMU serial TCP port $port"
+}
+
+function Send-SerialLine([string]$line) {
+  $bytes = [System.Text.Encoding]::ASCII.GetBytes($line + "`r")
+  $script:serialStream.Write($bytes, 0, $bytes.Length)
+  $script:serialStream.Flush()
+}
+
+# Capture a PNG of the guest display via QMP screendump — the Unified
+# REPL renders its scrollback on the virtio-gpu surface, so the screen
+# is the only place a UI-side response is observable from a headless
+# harness. (Typing itself goes over the serial console; QEMU's
+# emulated-input injection is unreliable headless — see the -serial
+# tcp note above.)
+function Send-QmpScreendump([int]$port, [string]$screendumpTo) {
   $client = New-Object System.Net.Sockets.TcpClient('127.0.0.1', $port)
   try {
     $stream = $client.GetStream()
+    $stream.ReadTimeout = 5000
     $reader = New-Object System.IO.StreamReader($stream)
     $writer = New-Object System.IO.StreamWriter($stream)
     $writer.AutoFlush = $true
     $null = $reader.ReadLine()                       # QMP greeting
     $writer.WriteLine('{"execute":"qmp_capabilities"}')
     $null = $reader.ReadLine()                       # {"return": {}}
-    foreach ($c in $line.ToCharArray()) {
-      $q = Get-QKeyCode $c
-      if (-not $q) { throw "TypeLine: unsupported character '$c' (no QKeyCode mapping)" }
-      $writer.WriteLine('{"execute":"send-key","arguments":{"keys":[{"type":"qcode","data":"' + $q + '"}]}}')
-      $null = $reader.ReadLine()
-      Start-Sleep -Milliseconds 60                   # let the i8042 ring drain
-    }
-    $writer.WriteLine('{"execute":"send-key","arguments":{"keys":[{"type":"qcode","data":"ret"}]}}')
+    $png = $screendumpTo -replace '\\','/'
+    $writer.WriteLine('{"execute":"screendump","arguments":{"filename":"' + $png + '","format":"png"}}')
     $null = $reader.ReadLine()
-    if ($screendumpTo) {
-      Start-Sleep -Seconds 6                         # let the guest render/run
-      $png = $screendumpTo -replace '\\','/'
-      $writer.WriteLine('{"execute":"screendump","arguments":{"filename":"' + $png + '","format":"png"}}')
-      $null = $reader.ReadLine()
-    }
   } finally {
     $client.Close()
   }
@@ -211,10 +250,12 @@ $required = @(
 
 Write-Host "Booting arest-kernel.efi under QEMU + OVMF (no Docker, ${TimeoutSec}s cap)..." -ForegroundColor Cyan
 $p = Start-Process -FilePath $qemu -ArgumentList $qemuArgs -PassThru -NoNewWindow
+if ($TypeLine) { Connect-Serial $serialPort }
 $deadline = (Get-Date).AddSeconds($TimeoutSec)
 $bannerSeen = $false
 while ((Get-Date) -lt $deadline) {
   Start-Sleep -Milliseconds 1000
+  Pump-Serial
   if ($p.HasExited) { break }
   if (Test-Path $serial) {
     $txt = Get-Content $serial -Raw -ErrorAction SilentlyContinue
@@ -224,12 +265,14 @@ while ((Get-Date) -lt $deadline) {
 if ($TypeLine -and $bannerSeen -and -not $p.HasExited) {
   # Give the REPL drain loop a beat past the banner, then type.
   Start-Sleep -Milliseconds 1500
-  Write-Host "Typing into REPL via QMP send-key: $TypeLine" -ForegroundColor Cyan
-  Send-QmpLine $qmpPort $TypeLine (Join-Path $wd 'screen.png')
+  Pump-Serial
+  Write-Host "Typing into REPL via serial console: $TypeLine" -ForegroundColor Cyan
+  Send-SerialLine $TypeLine
   # Wait for the post-type phrases (or the deadline).
   $typeDeadline = (Get-Date).AddSeconds([Math]::Max(20, $TimeoutSec / 3))
   while ((Get-Date) -lt $typeDeadline) {
     Start-Sleep -Milliseconds 1000
+    Pump-Serial
     if ($p.HasExited) { break }
     $txt = Get-Content $serial -Raw -ErrorAction SilentlyContinue
     if ($txt) {
@@ -240,9 +283,13 @@ if ($TypeLine -and $bannerSeen -and -not $p.HasExited) {
       if ($allSeen -and $ExpectAfter.Count -gt 0) { break }
     }
   }
+  # Final screen capture for the GPU-side story (best-effort).
+  try { Send-QmpScreendump $qmpPort (Join-Path $wd 'screen.png') } catch {}
 }
+if ($TypeLine) { Pump-Serial }
 if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Milliseconds 500
+if ($TypeLine) { Pump-Serial; if ($script:serialFs) { $script:serialFs.Close() } }
 
 $log = if (Test-Path $serial) { (Get-Content $serial -Raw) -replace "`r","" } else { '' }
 

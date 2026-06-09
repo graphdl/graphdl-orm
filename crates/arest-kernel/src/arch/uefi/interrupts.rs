@@ -97,6 +97,36 @@ const MOUSE_VECTOR: u8 = PIC_2_OFFSET + 4;
 /// Constructed with `new_contiguous(PIC_1_OFFSET)` so PIC1 owns
 /// vectors 32..39 and PIC2 owns 40..47 — `notify_end_of_interrupt`
 /// then routes the EOI to the right PIC for any vector in the pair.
+/// Diagnostic: how many times the IRQ-1 keyboard ISR has actually run.
+/// Splits "QEMU raised the line" (visible host-side via `info irq`)
+/// from "the guest serviced the vector" — the missing middle of the
+/// input pipeline the launcher's periodic diag line brackets with
+/// `keyboard::total_enqueued()` / `repl::EVAL_COUNT`.
+pub static IRQ1_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Diagnostic snapshot of the interrupt-delivery state: (IF, master-PIC
+/// IMR, ISR, IRR). IMR = masked lines; ISR = lines marked in-service
+/// (a stuck bit here means a missing EOI is blocking that priority and
+/// everything below it); IRR = lines raised and waiting. Read via the
+/// standard OCW3 sequence on the master PIC's command port.
+pub fn pic_diag() -> (bool, u8, u8, u8) {
+    let if_on = x86_64::instructions::interrupts::are_enabled();
+    let mut cmd = Port::<u8>::new(0x20);
+    let mut data = Port::<u8>::new(0x21);
+    // SAFETY: standard 8259A OCW3 reads — port 0x21 IMR read is
+    // side-effect-free; writing 0x0a / 0x0b to 0x20 selects IRR / ISR
+    // for the next read of 0x20. All documented PC-architecture ports.
+    unsafe {
+        let imr: u8 = data.read();
+        cmd.write(0x0au8);
+        let irr: u8 = cmd.read();
+        cmd.write(0x0bu8);
+        let isr: u8 = cmd.read();
+        (if_on, imr, isr, irr)
+    }
+}
+
 pub static PICS: Mutex<ChainedPics> =
     Mutex::new(unsafe { ChainedPics::new_contiguous(PIC_1_OFFSET) });
 
@@ -392,6 +422,9 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
 /// path to reach this function in that profile.
 #[cfg(feature = "repl")]
 extern "x86-interrupt" fn keyboard_handler(_stack_frame: InterruptStackFrame) {
+    // Diagnostic: monotonic ISR-invocation count (see `irq1_count`).
+    // Relaxed suffices — single CPU, read only by the diag line.
+    IRQ1_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     // SAFETY: 0x60 is the PS/2 keyboard data port — a documented
     // PC-architecture port that returns the most recent scancode
     // byte. Single read, no side effects beyond clearing the
