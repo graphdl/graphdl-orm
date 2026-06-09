@@ -172,6 +172,7 @@ dependencies = [
  "pc-keyboard",
  "pic8259",
  "png 0.17.16",
+ "sha2",
  "slint",
  "slint-build",
  "smoltcp",
