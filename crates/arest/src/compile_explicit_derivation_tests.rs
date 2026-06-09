@@ -835,6 +835,88 @@ Doc has Status.
         urgent_docs, derived);
 }
 
+// derivation-drops-literal-antecedent (RESOLVED — regression guard).
+// The live tasks recommendation (`... iff Task has Task Status 'pending'
+// and Task has Task Priority 'p0'`) matched completed-p0 tasks — one
+// literal apparently dropped. But that was observed THROUGH THE MCP,
+// i.e. on the months-stale DEPLOYED engine; the literal-drop was already
+// fixed in source by #814b (compile_join_derivation now mirrors the
+// explicit path's preds_by_idx — see compile.rs:7229). This guards the
+// specific suspected-but-disproven failure mode: VALUE-TYPE names that
+// contain the join noun ("Task Status"/"Task Priority" both contain
+// "Task"), in the exact IMPLICIT phrasing the live rule used. Both
+// literals apply; only the (pending, p0) tuple derives. The live symptom
+// is the stale deploy (p0 live-engine-deploy-current-code), not a source
+// bug.
+#[test]
+fn shape_join_literal_filters_with_noun_prefixed_value_types() {
+    let src = r#"# Test
+Task(.ID) is an entity type.
+ID is a value type.
+Task Status is a value type.
+Task Priority is a value type.
+Task Rank is a value type.
+
+## Fact Types
+Task has ID.
+Task has Task Status.
+Task has Task Priority.
+Task has Task Rank.
+
+## Derivation Rules
+* Task has Task Rank 'new-p0' iff Task has Task Status 'pending' and Task has Task Priority 'p0'.
+"#;
+    let (rule, func) = parse_and_compile(src);
+
+    assert_eq!(rule.kind, DerivationKind::Join,
+        "expected Join routing, got {:?}", rule.kind);
+    assert_eq!(rule.antecedent_sources.len(), 2,
+        "two antecedents expected, got {:#?}", rule.antecedent_sources);
+
+    // Parse shape: BOTH noun-prefixed literals must survive with the
+    // right role + value. (If one is missing here, the bug is in parse.)
+    assert!(
+        rule.antecedent_role_literals.iter().any(|l|
+            l.role == "Task Status" && l.value == "pending"),
+        "expected Task Status='pending' literal, got {:#?}",
+        rule.antecedent_role_literals,
+    );
+    assert!(
+        rule.antecedent_role_literals.iter().any(|l|
+            l.role == "Task Priority" && l.value == "p0"),
+        "expected Task Priority='p0' literal, got {:#?}",
+        rule.antecedent_role_literals,
+    );
+
+    // Population:
+    //   t-yes:       Status=pending   Priority=p0  → DERIVE
+    //   t-no-status: Status=completed Priority=p0  → no derive (Status filter)
+    //   t-no-pri:    Status=pending   Priority=p1  → no derive (Priority filter)
+    let out = apply_to_facts(&func, &[
+        ("Task_has_Task_Status",   &[("Task", "t-yes"),       ("Task Status", "pending")]),
+        ("Task_has_Task_Priority", &[("Task", "t-yes"),       ("Task Priority", "p0")]),
+        ("Task_has_Task_Status",   &[("Task", "t-no-status"), ("Task Status", "completed")]),
+        ("Task_has_Task_Priority", &[("Task", "t-no-status"), ("Task Priority", "p0")]),
+        ("Task_has_Task_Status",   &[("Task", "t-no-pri"),    ("Task Status", "pending")]),
+        ("Task_has_Task_Priority", &[("Task", "t-no-pri"),    ("Task Priority", "p1")]),
+    ]);
+    let derived = decode_derived(&out);
+    let ranked: Vec<String> = derived.iter()
+        .flat_map(|(_, _, b)| b.iter())
+        .filter(|(k, _)| k == "Task")
+        .map(|(_, v)| v.clone())
+        .collect();
+
+    assert!(ranked.iter().any(|d| d == "t-yes"),
+        "t-yes (pending, p0) MUST derive; got {:?}\nderived: {:#?}", ranked, derived);
+    assert!(!ranked.iter().any(|d| d == "t-no-status"),
+        "t-no-status (completed) must NOT derive — Task Status literal dropped?\n\
+         got {:?}\nderived: {:#?}", ranked, derived);
+    assert!(!ranked.iter().any(|d| d == "t-no-pri"),
+        "t-no-pri (p1) must NOT derive — Task Priority literal dropped?\n\
+         got {:?}\nderived: {:#?}", ranked, derived);
+}
+
 // ─── Category 12: Single-antecedent + `some` + multi-word literal ───
 //
 // Shape: `* X has Y 'liftable' iff some X has Z 'in code only'` —
