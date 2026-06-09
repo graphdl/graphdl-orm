@@ -1239,6 +1239,92 @@ fn collect_musl_sources(
 /// NAME` / `//config:menuconfig NAME` blocks in the `.c` sources, plus
 /// bare `config NAME` / `menuconfig NAME` in the `Config.in` /
 /// `Config.src` files.
+/// Locate a POSIX-capable host C compiler for busybox's host tools
+/// (applet_tables / usage), which use `unistd.h` / `open` / `dup2`.
+/// On Windows that's MinGW gcc (the choco `mingw` package); MSVC clang
+/// lacks `unistd.h`. Prefer the choco MinGW-w64 install path, then a
+/// bare `gcc` on PATH (Linux/macOS host, or gcc already on PATH).
+fn find_host_cc() -> std::ffi::OsString {
+    if cfg!(target_os = "windows") {
+        for cand in [
+            r"C:\ProgramData\mingw64\mingw64\bin\gcc.exe",
+            r"C:\ProgramData\chocolatey\bin\gcc.exe",
+        ] {
+            if Path::new(cand).is_file() {
+                return cand.into();
+            }
+        }
+    }
+    "gcc".into()
+}
+
+/// Adapt a busybox host code-generator (e.g. `applets/applet_tables.c`)
+/// so it runs on a non-POSIX host. The tools redirect stdout to a temp
+/// file via `open` + `dup2`, then `rename` it into place — MinGW's
+/// emulation of that dance fails silently (the tool returns 1 with no
+/// output). Rewrite the redirect to `freopen(argv[1], "w", stdout)` and
+/// neutralise the `rename(...)` calls to `0` (so `if (rename(...))` is a
+/// no-op). All substitutions are exact single-line matches against the
+/// vendored 1.36.1 sources; if upstream changes the I/O shape, the
+/// busybox build fails loudly at the host-tool run rather than silently
+/// miscompiling.
+fn patch_busybox_host_tool(src: &str) -> String {
+    let mut s = src.to_string();
+    // open(tmp1, ...) -> freopen(argv[1]); keep the `if (i < 0)` check as
+    // the freopen-failure guard (i = -1 on failure, 1 on success).
+    s = s.replace(
+        "i = open(tmp1, O_WRONLY | O_TRUNC | O_CREAT, 0666);",
+        "i = (freopen(argv[1], \"w\", stdout) ? 1 : -1);",
+    );
+    // stdout is already the target file; the dup2 is a no-op now.
+    s = s.replace("dup2(i, 1);", "(void)0;");
+    // The secondary output (applet_tables.c's NUM_APPLETS.h) is written to a
+    // `argv[2].PID.new` temp then renamed; write it straight to argv[2] so
+    // the neutralised rename below is correct rather than orphaning it.
+    s = s.replace("fp = fopen(tmp2, \"w\");", "fp = fopen(argv[2], \"w\");");
+    // Drop the temp-file renames (stdout went straight to argv[1]/argv[2]).
+    s = s.replace("rename(tmp1, argv[1])", "0");
+    s = s.replace("rename(tmp2, argv[2])", "0");
+    s
+}
+
+/// Adapt busybox's `applets/usage.c` host tool to emit its concatenated
+/// usage text to a file given as `argv[1]`, opened in BINARY mode. The
+/// upstream tool `write(STDOUT_FILENO, ...)`s to fd 1, but on Windows fd 1
+/// is in text mode by default, so MinGW would translate every `\n` in the
+/// help text to `\r\n` and corrupt the byte stream we octal-escape into
+/// `usage_compressed.h`. Routing through `fopen(argv[1], "wb")` + `fwrite`
+/// gives us the exact bytes. All matches are exact against the vendored
+/// 1.36.1 source; an upstream shape change fails loudly at compile/run.
+fn patch_busybox_usage_tool(src: &str) -> String {
+    let mut s = src.replace("\r\n", "\n");
+    // stdio for fopen/fwrite (usage.c only pulls in unistd/stdlib/string).
+    s = s.replace(
+        "#include <unistd.h>",
+        "#include <stdio.h>\n#include <unistd.h>",
+    );
+    // main() needs argv to name the output file.
+    s = s.replace("int main(void)", "int main(int argc, char **argv)");
+    // Open the binary output sink right after num_messages is computed.
+    s = s.replace(
+        "int num_messages = sizeof(usage_array) / sizeof(usage_array[0]);",
+        "int num_messages = sizeof(usage_array) / sizeof(usage_array[0]);\n\
+\tFILE *bb_out = (argc > 1) ? fopen(argv[1], \"wb\") : stdout;\n\
+\tif (!bb_out) return 1;",
+    );
+    // Write each NUL-terminated usage string to the binary sink.
+    s = s.replace(
+        "write(STDOUT_FILENO, usage_array[i].usage, strlen(usage_array[i].usage) + 1);",
+        "fwrite(usage_array[i].usage, 1, strlen(usage_array[i].usage) + 1, bb_out);",
+    );
+    // Flush/close before the final return (matches only the trailing one).
+    s = s.replace(
+        "return 0;\n}",
+        "if (bb_out != stdout) fclose(bb_out);\n\treturn 0;\n}",
+    );
+    s
+}
+
 fn collect_busybox_config_options(root: &Path) -> std::collections::BTreeSet<String> {
     let mut opts = std::collections::BTreeSet::new();
     fn walk(dir: &Path, opts: &mut std::collections::BTreeSet<String>) {
@@ -1283,6 +1369,217 @@ fn collect_busybox_config_options(root: &Path) -> std::collections::BTreeSet<Str
     }
     walk(root, &mut opts);
     opts
+}
+
+/// Resolve the libbb object set the way upstream Kbuild does, so we compile
+/// the support layer the chosen applets actually need — no more, no less.
+///
+/// `libbb/Kbuild.src` lists the unconditional base (`lib-y += foo.o`) and
+/// config-gated extras (`lib-$(CONFIG_BAR) += baz.o`); its `INSERT` line is
+/// filled from `//kbuild:` directives scanned out of the libbb sources
+/// (same scan-and-substitute used for applets.h/usage.h). We evaluate each
+/// line against the enabled-config set and map every selected `X.o` back to
+/// its source — `X.c` if present, else `X.S` (the optional x86 hash asm).
+fn select_libbb_sources(
+    libbb_dir: &Path,
+    enabled: &std::collections::HashSet<&str>,
+) -> Result<Vec<PathBuf>, String> {
+    let kbuild = libbb_dir.join("Kbuild.src");
+    let mut text = fs::read_to_string(&kbuild)
+        .map_err(|e| format!("read {}: {}", kbuild.display(), e))?
+        .replace("\r\n", "\n");
+    // Fill the INSERT slot with the //kbuild: directives the libbb sources
+    // declare about themselves (capability.c, ping helpers, etc.).
+    let mut inserted = String::new();
+    if let Ok(entries) = fs::read_dir(libbb_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("c") {
+                continue;
+            }
+            if let Ok(src) = fs::read_to_string(&p) {
+                for line in src.replace("\r\n", "\n").lines() {
+                    if let Some(rest) = line.strip_prefix("//kbuild:") {
+                        inserted.push_str(rest);
+                        inserted.push('\n');
+                    }
+                }
+            }
+        }
+    }
+    text = text.replace("\nINSERT\n", &format!("\n{}\n", inserted));
+
+    let mut stems: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        // Two accepted shapes:
+        //   lib-y += a.o b.o
+        //   lib-$(CONFIG_NAME) += a.o
+        let after_eq: Option<&str> = if let Some(r) = l.strip_prefix("lib-y") {
+            // Skip the `lib-y:=` reset; only the `+=` appends carry objects.
+            r.trim_start().strip_prefix("+=")
+        } else if let Some(r) = l.strip_prefix("lib-$(CONFIG_") {
+            r.find(')').and_then(|close| {
+                let name = &r[..close];
+                if enabled.contains(name) {
+                    r[close + 1..].trim_start().strip_prefix("+=")
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        let Some(objs) = after_eq else { continue };
+        for tok in objs.split_whitespace() {
+            if let Some(stem) = tok.strip_suffix(".o") {
+                stems.push(stem.to_string());
+            }
+        }
+    }
+    stems.sort();
+    stems.dedup();
+
+    let mut sources = Vec::new();
+    for stem in stems {
+        let c = libbb_dir.join(format!("{}.c", stem));
+        let s = libbb_dir.join(format!("{}.S", stem));
+        if c.is_file() {
+            sources.push(c);
+        } else if s.is_file() {
+            sources.push(s);
+        }
+        // An object with neither source is an upstream Kbuild artifact we
+        // don't carry (e.g. generated); silently skipping matches Kbuild's
+        // own behaviour of only building what exists.
+    }
+    if sources.is_empty() {
+        return Err(format!(
+            "no libbb sources selected from {} — Kbuild.src parse or config set is wrong",
+            kbuild.display(),
+        ));
+    }
+    Ok(sources)
+}
+
+/// Collect the Kconfig `default` value for every scalar (int/hex/string)
+/// option declared in the tree, keyed by option name.
+///
+/// busybox code references int/hex/string options directly as `CONFIG_<NAME>`
+/// (e.g. `if (SHA3_SMALL)` where `SHA3_SMALL` ≡ `CONFIG_SHA3_SMALL`), unlike
+/// bool options which go through `ENABLE_<NAME>`. A real `make oldconfig`
+/// writes each option's resolved value (default if unset) into `.config`, so
+/// autoconf.h defines them all. Our minimal hand-written `.config` only lists
+/// a handful, leaving the rest undefined → hard compile errors. We recover
+/// the defaults straight from the Kconfig declarations the same way kconfig
+/// would, so any scalar option absent from `.config` still gets its default.
+///
+/// Declarations live either in `Config.in`/`Config.src` (bare lines) or in
+/// `//config:` comment blocks inside the `.c` sources. The value extraction
+/// is deliberately simple: first unconditional `default`, first token for
+/// numerics, first quoted run for strings — which covers every scalar option
+/// busybox actually declares. bool/tristate options are skipped (ENABLE_).
+fn collect_busybox_scalar_config_defaults(
+    root: &Path,
+) -> std::collections::BTreeMap<String, String> {
+    use std::collections::BTreeMap;
+    let mut defaults: BTreeMap<String, String> = BTreeMap::new();
+
+    fn extract_default(rest: &str) -> Option<String> {
+        // Drop a trailing `if <cond>` and `# comment` tail first.
+        let mut v = rest.trim();
+        if let Some(idx) = v.find(" if ") {
+            v = v[..idx].trim();
+        }
+        if v.starts_with('"') {
+            // String default: take the first quoted run, quotes included.
+            if let Some(end) = v[1..].find('"') {
+                return Some(v[..end + 2].to_string());
+            }
+            return Some(v.to_string());
+        }
+        // Numeric default: first whitespace token (handles `1  # note`).
+        v.split_whitespace().next().map(|t| t.to_string())
+    }
+
+    fn finalize(
+        cur: &mut Option<(String, Option<String>, Option<String>)>,
+        defaults: &mut BTreeMap<String, String>,
+    ) {
+        if let Some((name, ty, def)) = cur.take() {
+            match ty.as_deref() {
+                Some("int") | Some("hex") => {
+                    let v = def.filter(|d| {
+                        d.starts_with("0x") || d.chars().all(|c| c.is_ascii_digit() || c == '-')
+                    });
+                    defaults.insert(name, v.unwrap_or_else(|| "0".to_string()));
+                }
+                Some("string") => {
+                    let v = def.filter(|d| d.starts_with('"'));
+                    defaults.insert(name, v.unwrap_or_else(|| "\"\"".to_string()));
+                }
+                _ => {} // bool / tristate / unknown → handled via ENABLE_.
+            }
+        }
+    }
+
+    fn walk(dir: &Path, defaults: &mut BTreeMap<String, String>) {
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, defaults);
+                continue;
+            }
+            let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let is_c = fname.ends_with(".c");
+            let is_cfg = fname == "Config.in" || fname == "Config.src";
+            if !is_c && !is_cfg {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&p) else { continue };
+            let mut cur: Option<(String, Option<String>, Option<String>)> = None;
+            for line in text.lines() {
+                let logical: Option<&str> = if is_c {
+                    line.trim_start().strip_prefix("//config:")
+                } else {
+                    Some(line)
+                };
+                let Some(logical) = logical else { continue };
+                let l = logical.trim_start();
+                if let Some(rest) = l
+                    .strip_prefix("config ")
+                    .or_else(|| l.strip_prefix("menuconfig "))
+                {
+                    finalize(&mut cur, defaults);
+                    let name: String = rest
+                        .trim()
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    cur = if name.is_empty() {
+                        None
+                    } else {
+                        Some((name, None, None))
+                    };
+                    continue;
+                }
+                let Some((_, ty, def)) = cur.as_mut() else { continue };
+                let first = l.split_whitespace().next().unwrap_or("");
+                if ty.is_none() && matches!(first, "int" | "hex" | "string" | "bool" | "tristate") {
+                    *ty = Some(first.to_string());
+                } else if def.is_none() {
+                    if let Some(rest) = l.strip_prefix("default ") {
+                        *def = extract_default(rest);
+                    }
+                }
+            }
+            finalize(&mut cur, defaults);
+        }
+    }
+
+    walk(root, &mut defaults);
+    defaults
 }
 
 fn build_busybox(
@@ -1365,6 +1662,8 @@ fn build_busybox(
     // BUSYBOX_EXEC_PATH="/bin/busybox", PREFIX, CROSS_COMPILER_PREFIX,
     // SYSROOT, EXTRA_CFLAGS, EXTRA_LDFLAGS, EXTRA_LDLIBS,
     // SUID_CONFIG_FILE, PID_FILE_PATH).
+    let mut scalar_from_config: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for line in cfg_text.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix("CONFIG_") {
@@ -1373,8 +1672,21 @@ fn build_busybox(
                 let val = rest[eq + 1..].trim();
                 if val != "y" && !val.is_empty() {
                     autoconf.push_str(&format!("#define CONFIG_{} {}\n", name, val));
+                    scalar_from_config.insert(name.to_string());
                 }
             }
+        }
+    }
+    // Scalar (int/hex/string) options the .config omits still get referenced
+    // directly as CONFIG_xxx in code (e.g. SHA3_SMALL/MD5_SMALL in
+    // hash_md5_sha.c, FEATURE_EDITING_* in lineedit.c). A real `make
+    // oldconfig` writes each option's resolved default into .config; we
+    // recover those defaults from the Kconfig declarations so the same set
+    // is defined. Only fill the gaps — never redefine what .config set.
+    autoconf.push_str("\n/* Scalar option Kconfig defaults (for options absent from .config). */\n");
+    for (name, val) in collect_busybox_scalar_config_defaults(busybox_root) {
+        if !scalar_from_config.contains(&name) {
+            autoconf.push_str(&format!("#define CONFIG_{} {}\n", name, val));
         }
     }
     autoconf.push_str("\n#endif /* BB_AUTOCONF_H */\n");
@@ -1404,63 +1716,244 @@ extern char bb_common_bufsiz1[];\n\
     fs::write(&common_bufsiz_path, common_bufsiz)
         .map_err(|e| format!("write {}: {}", common_bufsiz_path.display(), e))?;
 
-    // 3. Generate `$OUT_DIR/busybox/include/applets.h` — the table
-    //    `applets/applets.c` walks at startup. Upstream Kbuild
-    //    greps every .c for `//applet:` directives; for our closed
-    //    6-applet set we hand-emit the table. Keeping this in sync
-    //    with `busybox_config/.config` is straightforward — every
-    //    new applet adds one entry here AND one `CONFIG_<APPLET>=y`
-    //    line in the .config.
-    let mut applets = String::new();
-    applets.push_str("/* Generated by build.rs — do not edit. */\n");
-    applets.push_str("/* Hand-emitted from the closed 6-applet set in busybox_config/.config */\n\n");
-    // Re-emit the upstream applets.src.h preamble verbatim — it
-    // defines the APPLET / APPLET_NOEXEC / APPLET_NOFORK /
-    // APPLET_ODDNAME / APPLET_SCRIPTED macros + the BB_DIR_xxx /
-    // BB_SUID_xxx enum values that the table entries reference.
-    applets.push_str("#include \"applet_metadata.h\"\n\n");
-    applets.push_str("#if defined(PROTOTYPES)\n");
-    applets.push_str("# define APPLET(name,l,s)                    int name##_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;\n");
-    applets.push_str("# define APPLET_ODDNAME(name,main,l,s,help)  int main##_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;\n");
-    applets.push_str("# define APPLET_NOEXEC(name,main,l,s,help)   int main##_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;\n");
-    applets.push_str("# define APPLET_NOFORK(name,main,l,s,help)   int main##_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;\n");
-    applets.push_str("# define APPLET_SCRIPTED(name,main,l,s,help)\n");
-    applets.push_str("#else\n");
-    applets.push_str("# define APPLET(name,l,s)                    { #name, #name, l, s },\n");
-    applets.push_str("# define APPLET_ODDNAME(name,main,l,s,help)  { #name, #main, l, s },\n");
-    applets.push_str("# define APPLET_NOEXEC(name,main,l,s,help)   { #name, #main, l, s, 1 },\n");
-    applets.push_str("# define APPLET_NOFORK(name,main,l,s,help)   { #name, #main, l, s, 1, 1 },\n");
-    applets.push_str("# define APPLET_SCRIPTED(name,main,l,s,help) { #name, #main, l, s },\n");
-    applets.push_str("#endif\n\n");
-    // The 6-applet table. Order matches the .config layout for
-    // diff-friendliness.
-    applets.push_str("IF_CAT(APPLET_NOFORK(cat, cat, BB_DIR_BIN, BB_SUID_DROP, cat))\n");
-    applets.push_str("IF_ECHO(APPLET_NOFORK(echo, echo, BB_DIR_BIN, BB_SUID_DROP, echo))\n");
-    applets.push_str("IF_HEAD(APPLET_NOEXEC(head, head, BB_DIR_USR_BIN, BB_SUID_DROP, head))\n");
-    applets.push_str("IF_LS(APPLET_NOEXEC(ls, ls, BB_DIR_BIN, BB_SUID_DROP, ls))\n");
-    applets.push_str("IF_TAIL(APPLET_NOEXEC(tail, tail, BB_DIR_USR_BIN, BB_SUID_DROP, tail))\n");
-    applets.push_str("IF_WC(APPLET_NOEXEC(wc, wc, BB_DIR_USR_BIN, BB_SUID_DROP, wc))\n");
+    // 3. Generate `$OUT_DIR/busybox/include/applets.h` from upstream's
+    //    multi-mode template `include/applets.src.h`, substituting its
+    //    `INSERT` placeholder with the `//applet:` directives scanned
+    //    from the chosen applets' sources — exactly what upstream Kbuild
+    //    does. The template carries EVERY include mode the build needs:
+    //    PROTOTYPES (appletlib.c's `<applet>_main` decls), MAKE_USAGE
+    //    (the usage host tool), and the default `static struct bb_applet
+    //    applets[] = { ... }` array (the applet_tables host tool). An
+    //    earlier hand-rolled applets.h baked in only the PROTOTYPES +
+    //    array macros and omitted the array wrapper + the other modes —
+    //    it satisfied the target dispatcher but broke the host tools.
+    //    Driving from the template fixes both.
+    let applets_src = busybox_root.join("include").join("applets.src.h");
+    // Normalize CRLF → LF: this vendored file carries Windows line
+    // endings, so the literal `"\nINSERT\n"` placeholder match below
+    // would otherwise miss (`\r\nINSERT\r\n`). The emitted applets.h is
+    // LF, which the C compiler is happy with.
+    let template = fs::read_to_string(&applets_src)
+        .map_err(|e| format!("read {}: {}", applets_src.display(), e))?
+        .replace("\r\n", "\n");
+    let mut directives = String::new();
+    for stem in ["cat", "echo", "head", "ls", "tail", "wc"] {
+        let src = busybox_root.join("coreutils").join(format!("{}.c", stem));
+        let text = fs::read_to_string(&src)
+            .map_err(|e| format!("read {}: {}", src.display(), e))?;
+        for line in text.lines() {
+            if let Some(d) = line.strip_prefix("//applet:") {
+                directives.push_str(d);
+                directives.push('\n');
+            }
+        }
+    }
+    if !directives.contains("APPLET") {
+        return Err("no //applet: directives scanned for the chosen applets".into());
+    }
+    // The template has a bare `INSERT` line as the placeholder.
+    let applets = template.replace("\nINSERT\n", &format!("\n{}\n", directives.trim_end()));
+    if !applets.contains(&directives.trim_end().to_string()) {
+        return Err("applets.src.h INSERT placeholder not found — template changed?".into());
+    }
     let applets_path = gen_include.join("applets.h");
     fs::write(&applets_path, &applets)
         .map_err(|e| format!("write {}: {}", applets_path.display(), e))?;
 
-    // 4. Walk the source tree for the bits we want to compile.
-    //    libbb is unconditional (the runtime support layer the applet
-    //    sources call into); the 6 chosen applets come from coreutils;
-    //    the dispatcher `applets/applets.c` becomes the multi-call
-    //    binary's main loop.
-    let libbb_dir = busybox_root.join("libbb");
-    let coreutils_dir = busybox_root.join("coreutils");
-    let applets_dir = busybox_root.join("applets");
-    let mut sources: Vec<PathBuf> = Vec::new();
-    if let Ok(entries) = fs::read_dir(&libbb_dir) {
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("c") {
-                sources.push(p);
+    // 3b. Generate `$OUT_DIR/busybox/include/applet_tables.h` by running
+    //     busybox's `applets/applet_tables.c` HOST tool (the genuine
+    //     upstream table: applet_names[] / APPLET_NO_* / applet_main[],
+    //     so it link-matches libbb's appletlib.c). It's a POSIX program
+    //     (open/dup2/getpid), so it needs a POSIX host compiler — MinGW
+    //     gcc on Windows. Two adaptations make it portable:
+    //       * its relative `../include/X` includes resolve against a
+    //         synthesized `$OUT_DIR/busybox/{applets,include}` layout
+    //         (autoconf.h / applets.h / common_bufsiz.h are generated in
+    //         `include`; applet_metadata.h is copied in);
+    //       * `patch_busybox_host_tool` rewrites the open/dup2 stdout
+    //         redirect to `freopen(argv[1],"w",stdout)` and neutralises
+    //         the temp-file `rename()` tail — MinGW's open/dup2/rename
+    //         emulation makes the unpatched tool return 1 silently.
+    fs::copy(
+        busybox_root.join("include").join("applet_metadata.h"),
+        gen_include.join("applet_metadata.h"),
+    )
+    .map_err(|e| format!("copy applet_metadata.h: {}", e))?;
+    let tool_dir = out_dir.join("busybox").join("applets");
+    fs::create_dir_all(&tool_dir)
+        .map_err(|e| format!("create {}: {}", tool_dir.display(), e))?;
+    let at_src = busybox_root.join("applets").join("applet_tables.c");
+    let at_text = fs::read_to_string(&at_src)
+        .map_err(|e| format!("read {}: {}", at_src.display(), e))?;
+    let at_patched = patch_busybox_host_tool(&at_text);
+    let at_c = tool_dir.join("applet_tables.c");
+    fs::write(&at_c, &at_patched)
+        .map_err(|e| format!("write {}: {}", at_c.display(), e))?;
+    let host_cc = find_host_cc();
+    let at_exe = tool_dir.join("applet_tables.exe");
+    let st = std::process::Command::new(&host_cc)
+        .arg(&at_c)
+        .arg("-o")
+        .arg(&at_exe)
+        .status()
+        .map_err(|e| format!("spawn host cc {:?} for applet_tables: {}", host_cc, e))?;
+    if !st.success() {
+        return Err(format!(
+            "compiling applet_tables host tool failed (cc={:?}): {}",
+            host_cc, st
+        ));
+    }
+    //     The tool emits TWO headers: the main dispatch table (argv[1]) and
+    //     `NUM_APPLETS.h` (argv[2], a single `#define NUM_APPLETS N` that
+    //     libbb/lineedit.c and vfork_daemon_rexec.c include).
+    let applet_tables_h = gen_include.join("applet_tables.h");
+    let num_applets_h = gen_include.join("NUM_APPLETS.h");
+    let st = std::process::Command::new(&at_exe)
+        .arg(&applet_tables_h)
+        .arg(&num_applets_h)
+        .status()
+        .map_err(|e| format!("run applet_tables tool: {}", e))?;
+    if !st.success() {
+        return Err(format!("applet_tables host tool run failed: {}", st));
+    }
+
+    // 3c. Generate `$OUT_DIR/busybox/include/usage_compressed.h`, which
+    //     libbb/appletlib.c includes unconditionally for `bb_show_usage()`.
+    //     Upstream's recipe runs the `applets/usage` host tool and pipes it
+    //     through `od|sed|bzip2` (the `applets/usage_compressed` script).
+    //     We keep the host tool but skip the fragile shell pipeline:
+    //       * our .config has FEATURE_COMPRESS_USAGE=0 and the 6-applet
+    //         usage text is well under the 4 KiB compression threshold
+    //         (appletlib.c:81), so only UNPACKED_USAGE is ever referenced
+    //         — no bzip2, no PACKED_USAGE bytes needed;
+    //       * `usage.h` (the `<applet>_trivial/full_usage` string macros)
+    //         is itself generated, by stripping `//usage:` directives from
+    //         the chosen sources — the same scan-and-substitute upstream's
+    //         gen_build_files.sh does for the full tree;
+    //       * the `usage` tool's output is octal-escaped into a C string
+    //         literal here in Rust rather than via `od`, dodging Windows
+    //         CRLF translation and MSYS quirks.
+    //
+    // The `//usage:` directives are NOT plain lines: a `#define foo`
+    // directive and its indented string-fragment continuation lines must
+    // be fused into a single logical macro body. gen_build_files.sh does
+    // this with two sed substitutions — append ` \` to every line, and
+    // prepend a blank line before each line that does NOT start with
+    // space/tab (i.e. each `#define`/`#if`/`#endif`), which terminates the
+    // previous macro's continuation. We reproduce that exactly, then splice
+    // the result into usage.src.h's `INSERT` slot (it carries the BB_USAGE_H
+    // guard + shared helper macros the fragments may reference).
+    let mut directives = String::new();
+    for stem in ["cat", "echo", "head", "ls", "tail", "wc"] {
+        let src = busybox_root.join("coreutils").join(format!("{}.c", stem));
+        let text = fs::read_to_string(&src)
+            .map_err(|e| format!("read {}: {}", src.display(), e))?
+            .replace("\r\n", "\n");
+        for line in text.lines() {
+            let content = match line.strip_prefix("//usage:") {
+                Some(c) => c,
+                None => continue,
+            };
+            if content.is_empty() {
+                continue;
+            }
+            if content.starts_with(' ') || content.starts_with('\t') {
+                // Continuation/string-fragment line: just continue it.
+                directives.push_str(content);
+                directives.push_str(" \\\n");
+            } else {
+                // New directive: blank line first to end the prior macro.
+                directives.push('\n');
+                directives.push_str(content);
+                directives.push_str(" \\\n");
             }
         }
     }
+    if !directives.contains("_trivial_usage") {
+        return Err("no //usage: directives scanned for the chosen applets".into());
+    }
+    let usage_src = busybox_root.join("include").join("usage.src.h");
+    let usage_tmpl = fs::read_to_string(&usage_src)
+        .map_err(|e| format!("read {}: {}", usage_src.display(), e))?
+        .replace("\r\n", "\n");
+    let usage_h = usage_tmpl.replace("\nINSERT\n", &format!("\n{}\n", directives));
+    if !usage_h.contains(directives.trim()) {
+        return Err("usage.src.h INSERT placeholder not found — template changed?".into());
+    }
+    fs::write(gen_include.join("usage.h"), &usage_h)
+        .map_err(|e| format!("write usage.h: {}", e))?;
+
+    // Build + run the `usage` host tool: it includes autoconf.h, usage.h
+    // and applets.h (MAKE_USAGE mode) and prints the sorted, NUL-separated
+    // usage strings. It's a POSIX program built with the host cc (no musl
+    // sysroot, no -nostdinc — it links the host libc), patched to write the
+    // bytes to argv[1] in binary mode.
+    let usage_src = busybox_root.join("applets").join("usage.c");
+    let usage_text = fs::read_to_string(&usage_src)
+        .map_err(|e| format!("read {}: {}", usage_src.display(), e))?;
+    let usage_patched = patch_busybox_usage_tool(&usage_text);
+    let usage_c = tool_dir.join("usage.c");
+    fs::write(&usage_c, &usage_patched)
+        .map_err(|e| format!("write {}: {}", usage_c.display(), e))?;
+    let usage_exe = tool_dir.join("usage.exe");
+    let st = std::process::Command::new(&host_cc)
+        .arg(&usage_c)
+        .arg("-I")
+        .arg(&gen_include)
+        .arg("-o")
+        .arg(&usage_exe)
+        .status()
+        .map_err(|e| format!("spawn host cc {:?} for usage: {}", host_cc, e))?;
+    if !st.success() {
+        return Err(format!(
+            "compiling usage host tool failed (cc={:?}): {}",
+            host_cc, st
+        ));
+    }
+    let usage_out = tool_dir.join("usage.txt");
+    let st = std::process::Command::new(&usage_exe)
+        .arg(&usage_out)
+        .status()
+        .map_err(|e| format!("run usage tool: {}", e))?;
+    if !st.success() {
+        return Err(format!("usage host tool run failed: {}", st));
+    }
+    let usage_bytes = fs::read(&usage_out)
+        .map_err(|e| format!("read {}: {}", usage_out.display(), e))?;
+
+    // Octal-escape every byte into adjacent string literals (C concatenates
+    // them), exactly as upstream's `usage_compressed` emits. PACKED_USAGE is
+    // defined defensively but never referenced (COMPRESS_USAGE=0).
+    let mut uc = String::from("#define UNPACKED_USAGE \"\" \\\n");
+    for chunk in usage_bytes.chunks(48) {
+        uc.push('"');
+        for &b in chunk {
+            uc.push_str(&format!("\\{:03o}", b));
+        }
+        uc.push_str("\" \\\n");
+    }
+    uc.push_str("\"\"\n");
+    uc.push_str(&format!(
+        "#define UNPACKED_USAGE_LENGTH {}\n",
+        usage_bytes.len()
+    ));
+    uc.push_str("#define PACKED_USAGE 0\n");
+    fs::write(gen_include.join("usage_compressed.h"), &uc)
+        .map_err(|e| format!("write usage_compressed.h: {}", e))?;
+
+    // 4. Select the sources to compile. libbb is NOT a blind glob: upstream
+    //    Kbuild compiles the unconditional `lib-y` base set plus the
+    //    `lib-$(CONFIG_x)` entries whose option is enabled. Globbing every
+    //    libbb/*.c instead pulls in feature-gated files like capability.c
+    //    (CONFIG_FEATURE_SETPRIV_CAPABILITIES / CONFIG_RUN_INIT — both off
+    //    here) that `#include <linux/capability.h>` and other uapi headers
+    //    musl does not ship, breaking the build. Mirror Kbuild's selection.
+    //    The 6 chosen applets come from coreutils; the dispatcher
+    //    `applets/applets.c` becomes the multi-call binary's main loop.
+    let libbb_dir = busybox_root.join("libbb");
+    let coreutils_dir = busybox_root.join("coreutils");
+    let applets_dir = busybox_root.join("applets");
+    let mut sources: Vec<PathBuf> = select_libbb_sources(&libbb_dir, &enabled_set)?;
     let chosen_applets: &[&str] = &["cat", "echo", "head", "ls", "tail", "wc"];
     for stem in chosen_applets {
         let p = coreutils_dir.join(format!("{}.c", stem));
@@ -1493,6 +1986,12 @@ extern char bb_common_bufsiz1[];\n\
         // loads via the #472 ELF loader, so it needs SysV-AMD64 + ELF
         // output.
         build.flag_if_supported("--target=x86_64-unknown-linux-musl");
+        // The objects are ELF, so the archive must be a Unix `ar` archive.
+        // cc::Build infers the archiver from the cargo TARGET
+        // (x86_64-pc-windows-msvc) and would otherwise reach for MSVC
+        // `lib.exe`, which only understands COFF and rejects ELF objects
+        // (exit 1107). llvm-ar ships beside clang in the VS LLVM toolchain.
+        build.archiver("llvm-ar");
     }
 
     // Include path order matching upstream's Makefile.flags
