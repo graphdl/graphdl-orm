@@ -69,6 +69,7 @@ use crate::syscall::mmap;
 use crate::syscall::openat;
 use crate::syscall::read;
 use crate::syscall::recvfrom;
+use crate::syscall::robust_list;
 use crate::syscall::rt_sigaction;
 use crate::syscall::rt_sigprocmask;
 use crate::syscall::rt_sigreturn;
@@ -217,6 +218,26 @@ pub const SYS_OPENAT: u64 = 257;
 /// (FUTEX_WAIT for the cornerstone block path, FUTEX_WAKE for the
 /// release path (#545), all others -ENOSYS). Per #544 (Track YYYYY).
 pub const SYS_FUTEX: u64 = 202;
+
+/// Linux x86_64 syscall number for `set_robust_list(struct
+/// robust_list_head *head, size_t len)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_set_robust_list`
+/// (= 273). The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:274`. Routes to
+/// `robust_list::set_robust_list`, which records the calling thread's
+/// robust-futex list head so the kernel can run owner-death recovery
+/// when the thread exits. glibc/musl register it during thread
+/// bring-up (`vendor/musl/src/thread/pthread_create.c`). Per #546.
+pub const SYS_SET_ROBUST_LIST: u64 = 273;
+
+/// Linux x86_64 syscall number for `get_robust_list(int pid, struct
+/// robust_list_head **head_ptr, size_t *len_ptr)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_get_robust_list`
+/// (= 274). The vendored musl tree confirms at
+/// `vendor/musl/arch/x86_64/bits/syscall.h.in:275`. Routes to
+/// `robust_list::get_robust_list`, which reports the registered head +
+/// len back through the out-pointers. Per #546.
+pub const SYS_GET_ROBUST_LIST: u64 = 274;
 
 /// Linux x86_64 syscall number for `getrandom(buf, buflen, flags)`.
 /// Source: `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_getrandom`
@@ -459,6 +480,20 @@ pub fn dispatch(
             // REQUEUE / PI futex.
             futex::handle(rdi, rsi as u32, rdx as u32, r10, r8, r9 as u32)
         }
+        SYS_SET_ROBUST_LIST => {
+            // set_robust_list(head, len) — register the calling thread's
+            // robust-futex list head. rdi = head (struct
+            // robust_list_head *), rsi = len (size_t, must be 24). Per
+            // #546.
+            robust_list::set_robust_list(rdi, rsi)
+        }
+        SYS_GET_ROBUST_LIST => {
+            // get_robust_list(pid, head_ptr, len_ptr) — report the
+            // registered robust-list head + len. rdi = pid (0 = self),
+            // rsi = head_ptr (struct robust_list_head **), rdx = len_ptr
+            // (size_t *). Per #546.
+            robust_list::get_robust_list(rdi, rsi, rdx)
+        }
         SYS_GETRANDOM => {
             // getrandom(buf, buflen, flags) per Linux's
             // `linux/include/uapi/linux/random.h`. Three-arg syscall:
@@ -691,6 +726,41 @@ mod tests {
     #[test]
     fn sys_getrandom_number_matches_linux_uapi() {
         assert_eq!(SYS_GETRANDOM, 318);
+    }
+
+    /// `SYS_SET_ROBUST_LIST` is 273 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_set_robust_list`
+    /// (and `vendor/musl/arch/x86_64/bits/syscall.h.in:274`).
+    #[test]
+    fn sys_set_robust_list_number_matches_linux_uapi() {
+        assert_eq!(SYS_SET_ROBUST_LIST, 273);
+    }
+
+    /// `SYS_GET_ROBUST_LIST` is 274 — matches
+    /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_get_robust_list`
+    /// (and `vendor/musl/arch/x86_64/bits/syscall.h.in:275`).
+    #[test]
+    fn sys_get_robust_list_number_matches_linux_uapi() {
+        assert_eq!(SYS_GET_ROBUST_LIST, 274);
+    }
+
+    /// `set_robust_list(head, 8)` — a wrong length — routes through the
+    /// dispatcher (syscall 273) to the handler and the length check
+    /// fires → `-EINVAL` (-22), without needing a process installed
+    /// (the length guard precedes the process touch).
+    #[test]
+    fn dispatch_set_robust_list_wrong_len_returns_einval() {
+        let result = dispatch(SYS_SET_ROBUST_LIST, 0xdead_0000, 8, 0, 0, 0, 0);
+        assert_eq!(result, -EINVAL);
+    }
+
+    /// `get_robust_list(0, NULL, NULL)` routes through the dispatcher
+    /// (syscall 274) and the null-out-pointer guard fires → `-EFAULT`
+    /// (-14).
+    #[test]
+    fn dispatch_get_robust_list_null_out_returns_efault() {
+        let result = dispatch(SYS_GET_ROBUST_LIST, 0, 0, 0, 0, 0, 0);
+        assert_eq!(result, -14);
     }
 
     /// `SYS_GETPID` is 39 — matches

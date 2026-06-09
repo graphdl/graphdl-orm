@@ -73,6 +73,7 @@ pub mod mmap;
 pub mod openat;
 pub mod read;
 pub mod recvfrom;
+pub mod robust_list;
 pub mod rt_sigaction;
 pub mod rt_sigprocmask;
 pub mod rt_sigreturn;

@@ -98,12 +98,26 @@ pub fn handle(status: i32) -> ! {
 /// its prerequisite is initialised; callers that need the prerequisite
 /// initialised guard at the call site.
 pub fn mark_exited(status: i32) {
-    current_process_mut(|maybe_proc| {
+    // Capture the robust-list registration while we hold the process
+    // lock, then run the death-walk OUTSIDE the closure: the walk reaches
+    // the kernel-wide `futex_table` (a separate lock) to wake recovery
+    // waiters and reads/writes guest memory, so doing it after the
+    // process-lock closure returns avoids nesting the two locks. (#546)
+    let robust = current_process_mut(|maybe_proc| {
         if let Some(proc) = maybe_proc {
             proc.state = ProcessState::Exited;
             proc.exit_status = Some(status);
+            Some((proc.robust_list_head, proc.robust_list_len, proc.pid))
+        } else {
+            None
         }
     });
+    if let Some((head, len, pid)) = robust {
+        // A thread exiting while still holding robust mutexes must hand
+        // each one off as owner-dead so the next acquirer runs recovery.
+        // No-op when no list was registered (head == 0). (#546)
+        crate::syscall::robust_list::walk_on_death(head, len, pid);
+    }
 }
 
 #[cfg(test)]

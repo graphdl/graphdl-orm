@@ -341,6 +341,26 @@ pub struct Process {
     /// process exits; the process-table lookup that turns the pid into
     /// the live parent Process rides the scheduler (#530).
     pub parent_pid: Option<u32>,
+    /// Userspace VA of the thread's robust-futex list head — the
+    /// `struct robust_list_head *` registered via `set_robust_list(2)`
+    /// (SYS_SET_ROBUST_LIST = 273, #546). `0` means no list is
+    /// registered (the default; `get_robust_list` reports it back as a
+    /// null head). On thread death the kernel walks this list and stamps
+    /// `FUTEX_OWNER_DIED` on every robust mutex the dying thread still
+    /// holds so the next acquirer runs recovery
+    /// (`syscall::robust_list::walk_on_death`).
+    ///
+    /// Per-thread on real Linux (each `task_struct` has its own
+    /// `robust_list`); tier-1's single-thread model collapses thread and
+    /// process, so it lives on the Process like `fs_base` / `heap_break`.
+    pub robust_list_head: u64,
+    /// Byte length the thread passed to `set_robust_list(2)` alongside
+    /// `robust_list_head`. Linux requires it equal
+    /// `sizeof(struct robust_list_head)` (24 on LP64) and reports it back
+    /// verbatim from `get_robust_list(2)`; the kernel itself only uses
+    /// the head pointer + the in-band `futex_offset` to walk. `0` until
+    /// `set_robust_list` runs.
+    pub robust_list_len: u64,
 }
 
 impl Process {
@@ -407,6 +427,14 @@ impl Process {
             // initial hand-spawned process is parentless; #551 reads
             // this to decide whom SIGCHLD wakes on exit.
             parent_pid: None,
+            // No robust-futex list until `set_robust_list(2)` (#546)
+            // registers one. `0` is the "no list" sentinel: the
+            // exit-time walk no-ops and `get_robust_list` reports a null
+            // head. glibc/musl call `set_robust_list` from their thread
+            // bring-up (`__pthread_init` / `__init_tp`), so a real
+            // pthreads binary populates this early.
+            robust_list_head: 0,
+            robust_list_len: 0,
         }
     }
 
@@ -661,6 +689,21 @@ impl Process {
             SignalDelivery::Terminate | SignalDelivery::CoreDump
         ) {
             self.state = ProcessState::Killed(signum);
+            // A thread killed by a fatal signal while holding robust
+            // mutexes must still run owner-death recovery — Linux reaches
+            // `exit_robust_list` from `do_exit`, which BOTH a clean
+            // exit(2) and a fatal-signal death funnel through. Walk the
+            // registered robust list here so `FUTEX_OWNER_DIED` is
+            // stamped on the kill path too, not just the exit syscall
+            // (#546). No-op when no list is registered (head == 0), which
+            // is the case for every process that never called
+            // `set_robust_list` — so the signal unit tests are
+            // unaffected.
+            crate::syscall::robust_list::walk_on_death(
+                self.robust_list_head,
+                self.robust_list_len,
+                self.pid,
+            );
         }
         Some(decision)
     }
