@@ -1074,6 +1074,20 @@ fn assert_fact_via_defs(
 ///
 /// Deterministic per (noun, state); platform-independent (no
 /// `SystemTime` so the function compiles on wasm32 / no_std).
+/// Canonical fallback FT id when the `resolve:{noun}` chain misses:
+/// `<Noun>_has_<Field>` with EVERY space underscored, matching the
+/// parser's id-formation for declared fact types. Without the
+/// underscoring, a resolve miss on a multi-word field writes a
+/// PHANTOM cell (`Task_has_Task Description`, space) that is distinct
+/// from the declared, projected `Task_has_Task_Description` — facts
+/// land invisibly outside every ft_ view and 3NF projection. Same
+/// defect class the composite-ref id-shear fix documented for
+/// multi-word NOUNS (`Layer State_has_Layer`); this helper closes the
+/// field side at every fallback site.
+fn fallback_ft_id(noun: &str, field: &str) -> String {
+    format!("{}_has_{}", noun.replace(' ', "_"), field.replace(' ', "_"))
+}
+
 fn auto_generate_entity_id(noun: &str, state: &ast::Object, d: &ast::Object) -> String {
     // Distinct entity-role values for this noun across all FT cells.
     // A fact's "entity-id" for noun N is the value of any role binding
@@ -1445,7 +1459,7 @@ fn create_via_defs(
                 // downstream consumers see one constraint family for
                 // both pre-check and storage-layer rejections.
                 let first_part = scheme.split(',').next().unwrap_or("id").trim();
-                let primary_ft = format!("{}_has_{}", noun, first_part);
+                let primary_ft = fallback_ft_id(noun, first_part);
                 let viol = crate::types::Violation {
                     constraint_id: format!("uc:{}", primary_ft),
                     constraint_text: format!(
@@ -1506,7 +1520,7 @@ fn create_via_defs(
         // the available path.)
         let ft_id = match ft_id_obj.as_atom() {
             Some(s) if s != lower => s.to_string(),
-            _ => format!("{}_has_{}", noun, field_name),
+            _ => fallback_ft_id(noun, field_name),
         };
         fact_events.push(ft_id.clone());
         let fact = ast::fact_from_pairs(&[(noun, &entity_id), (field_name, value)]);
@@ -3645,7 +3659,7 @@ fn update_via_defs(
         // as a no-mapping and fall through to `<Noun>_has_<Field>`.
         let ft_id = match resolved.and_then(|o| o.as_atom().map(|s| s.to_string())) {
             Some(s) if s != lower => s,
-            _ => format!("{}_has_{}", noun, field_name),
+            _ => fallback_ft_id(noun, field_name),
         };
         let fact = ast::fact_from_pairs(&[(noun, entity_id), (field_name.as_str(), value.as_str())]);
         if key_roles.contains_key(&ft_id) {
@@ -3724,7 +3738,7 @@ fn update_via_defs(
                 .map(|f| ast::apply(&f, &ast::Object::atom(&lower), d));
             match resolved.and_then(|o| o.as_atom().map(|s| s.to_string())) {
                 Some(s) if s != lower => s,
-                _ => alloc::format!("{}_has_{}", noun, field_name),
+                _ => fallback_ft_id(noun, field_name),
             }
         })
         .collect();
@@ -7826,6 +7840,185 @@ Status 'pending' is initial in State Machine Definition 'Task'.
             .unwrap();
         assert_eq!(status, "pending",
             "SM status must remain pending after a no-op Status echo");
+    }
+
+    /// update-merge-duplicate-accretion: sequential UpdateEntity calls
+    /// on a single-valued ("Each Task has at most one ...") fact must
+    /// leave EXACTLY ONE stored row carrying the NEWEST value.
+    /// Observed live on the tasks board (2026-06-09/10): updates left
+    /// duplicate Subject/Priority/Description rows, and in the 539
+    /// incident the newest description was absent from storage while
+    /// the stale value sat there twice. This test runs the pure
+    /// engine lifecycle (create, then two updates, each threading the
+    /// PRIOR result state forward); if it passes, the engine path is
+    /// clean and the accretion lives in the MCP merge layer.
+    #[test]
+    fn apply_sequential_updates_keep_single_valued_fact_single() {
+        let meta_state = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let readings = r#"
+# Tasks
+
+## Entity Types
+
+Task(.id) is an entity type.
+
+## Value Types
+
+Task Description is a value type.
+Task Priority is a value type.
+
+## Fact Types
+
+Task has Task Description.
+  Each Task has at most one Task Description.
+
+Task has Task Priority.
+  Each Task has at most one Task Priority.
+"#;
+        let tasks_state = crate::parse_forml2::parse_to_state_with_nouns(readings, &meta_state).unwrap();
+        let merged = ast::merge_states(&meta_state, &tasks_state);
+        let defs = crate::compile::compile_to_defs_state(&merged);
+        let def_map = ast::defs_to_state(&defs, &merged);
+
+        // Lifecycle step 1: create with the original description.
+        let mut fields = HashMap::new();
+        fields.insert("Task Description".to_string(), "original".to_string());
+        let create = Command::CreateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            id: Some("t-539".to_string()),
+            fields,
+            sender: None,
+            signature: None,
+        };
+        let r1 = apply_command_defs(&def_map, &create, &merged);
+        assert!(!r1.rejected, "create rejected: {:?}", r1.violations);
+        // CommandResult.state is a DELTA (diff_cells); thread it
+        // forward the way the persistence layer does, via merge_delta.
+        let s1 = ast::merge_delta(&merged, &r1.state, None);
+
+        let desc_rows = |s: &ast::Object| -> Vec<String> {
+            let cell = ast::fetch_or_phi("Task_has_Task_Description", s);
+            ast::cell_facts_iter(&cell)
+                .filter(|f| ast::binding_matches(f, "Task", "t-539"))
+                .filter_map(|f| ast::binding(f, "Task Description").map(String::from))
+                .collect()
+        };
+        let delta_cells: Vec<String> = ast::cells_iter(&r1.state)
+            .into_iter().map(|(n, _)| n.to_string()).collect();
+        assert_eq!(
+            desc_rows(&s1), vec!["original".to_string()],
+            "create must land exactly one description row; delta cells: {:?}",
+            delta_cells,
+        );
+
+        // Lifecycle step 2: first update rewrites the description.
+        let mut fields = HashMap::new();
+        fields.insert("Task Description".to_string(), "resolved v2".to_string());
+        let u1 = Command::UpdateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            entity_id: "t-539".to_string(),
+            fields,
+            sender: None,
+            signature: None,
+            force: false,
+        };
+        let r2 = apply_command_defs(&def_map, &u1, &s1);
+        assert!(!r2.rejected, "update 1 rejected: {:?}", r2.violations);
+        let s2 = ast::merge_delta(&s1, &r2.state, None);
+        assert_eq!(
+            desc_rows(&s2), vec!["resolved v2".to_string()],
+            "update 1 must replace the description with the newest value"
+        );
+
+        // Lifecycle step 3: second update touches a DIFFERENT field
+        // (the live incident's shape: the description should ride
+        // along untouched, not re-assert or duplicate).
+        let mut fields = HashMap::new();
+        fields.insert("Task Priority".to_string(), "p2".to_string());
+        let u2 = Command::UpdateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            entity_id: "t-539".to_string(),
+            fields,
+            sender: None,
+            signature: None,
+            force: false,
+        };
+        let r3 = apply_command_defs(&def_map, &u2, &s2);
+        assert!(!r3.rejected, "update 2 rejected: {:?}", r3.violations);
+        let s3 = ast::merge_delta(&s2, &r3.state, None);
+
+        // The stored cell must hold exactly one description for
+        // t-539, and it must be the newest value.
+        let cell = ast::fetch_or_phi("Task_has_Task_Description", &s3);
+        let rows: Vec<String> = ast::cell_facts_iter(&cell)
+            .filter(|f| ast::binding_matches(f, "Task", "t-539"))
+            .filter_map(|f| ast::binding(f, "Task Description").map(String::from))
+            .collect();
+        assert_eq!(
+            rows, vec!["resolved v2".to_string()],
+            "single-valued description must be exactly one row with the \
+             newest value after sequential updates; got {:?}",
+            rows,
+        );
+    }
+
+    /// fallback_ft_id: when `resolve:{noun}` misses (here: the value
+    /// types are deliberately NOT declared, so the FT has no Role rows
+    /// and the resolve chain echoes), the fallback cell id must still
+    /// be the CANONICAL underscored form. Pre-fix the raw
+    /// `format!("{}_has_{}", noun, field)` wrote a phantom
+    /// `Task_has_Task Description` (space) cell, invisible to every
+    /// ft_ view and 3NF projection.
+    #[test]
+    fn resolve_miss_fallback_writes_canonical_underscored_cell() {
+        let meta_state = crate::parse_forml2::parse_to_state(STATE_METAMODEL).unwrap();
+        let readings = r#"
+# Tasks
+
+## Entity Types
+
+Task(.id) is an entity type.
+
+## Fact Types
+
+Task has Task Description.
+"#;
+        let tasks_state = crate::parse_forml2::parse_to_state_with_nouns(readings, &meta_state).unwrap();
+        let merged = ast::merge_states(&meta_state, &tasks_state);
+        let defs = crate::compile::compile_to_defs_state(&merged);
+        let def_map = ast::defs_to_state(&defs, &merged);
+
+        let mut fields = HashMap::new();
+        fields.insert("Task Description".to_string(), "landed".to_string());
+        let create = Command::CreateEntity {
+            noun: "Task".to_string(),
+            domain: "tasks".to_string(),
+            id: Some("t-1".to_string()),
+            fields,
+            sender: None,
+            signature: None,
+        };
+        let r = apply_command_defs(&def_map, &create, &merged);
+        assert!(!r.rejected, "create rejected: {:?}", r.violations);
+        let s = ast::merge_delta(&merged, &r.state, None);
+
+        // The canonical underscored cell carries the fact...
+        let canonical = ast::fetch_or_phi("Task_has_Task_Description", &s);
+        let hit = ast::cell_facts_iter(&canonical)
+            .any(|f| ast::binding_matches(f, "Task", "t-1"));
+        // ...and the spaced phantom does not exist.
+        let phantom = ast::fetch_or_phi("Task_has_Task Description", &s);
+        let phantom_rows = ast::cell_facts_iter(&phantom).count();
+        assert!(
+            hit && phantom_rows == 0,
+            "resolve-miss fallback must write Task_has_Task_Description \
+             (underscored), not a spaced phantom; canonical hit={}, \
+             phantom rows={}",
+            hit, phantom_rows,
+        );
     }
 
     /// task-861 acceptance #3: `apply transition noun=Task id=t-1

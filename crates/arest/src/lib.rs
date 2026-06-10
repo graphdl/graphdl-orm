@@ -3925,13 +3925,13 @@ Task has Task Priority.
 
         // Both rows must be in the FT cell after the second apply.
         // Cell name preserves spaces verbatim ("Task has Task Priority"
-        // → "Task_has_Task Priority").
+        // → "Task_has_Task_Priority").
         let snapshot = peek(h).expect("handle live after applies");
-        let ft = ast::fetch_or_phi("Task_has_Task Priority", &snapshot);
+        let ft = ast::fetch_or_phi("Task_has_Task_Priority", &snapshot);
         let count = ast::cell_fact_count(&ft);
         assert_eq!(
             count, 2,
-            "Task_has_Task Priority must hold both t-1 and t-2 after \
+            "Task_has_Task_Priority must hold both t-1 and t-2 after \
              two consecutive applies; got {} fact(s). \
              Pre-fix the second apply's Map-form delta REPLACED the \
              cell with just its one entry (t-1's row lost from view).\n\
@@ -3944,9 +3944,9 @@ Task has Task Priority.
             .filter_map(|f| ast::binding(f, "Task").map(|s| s.to_string()))
             .collect();
         assert!(task_ids.contains(&"t-1".to_string()),
-            "t-1 must be present in Task_has_Task Priority; got ids = {task_ids:?}");
+            "t-1 must be present in Task_has_Task_Priority; got ids = {task_ids:?}");
         assert!(task_ids.contains(&"t-2".to_string()),
-            "t-2 must be present in Task_has_Task Priority; got ids = {task_ids:?}");
+            "t-2 must be present in Task_has_Task_Priority; got ids = {task_ids:?}");
 
         release_impl(h);
     }
@@ -3978,11 +3978,11 @@ Task has Task Priority.
         }
 
         let snapshot = peek(h).expect("handle live after three applies");
-        let ft = ast::fetch_or_phi("Task_has_Task Priority", &snapshot);
+        let ft = ast::fetch_or_phi("Task_has_Task_Priority", &snapshot);
         let count = ast::cell_fact_count(&ft);
         assert_eq!(
             count, 3,
-            "Task_has_Task Priority must hold all three entities after \
+            "Task_has_Task_Priority must hold all three entities after \
              three consecutive applies; got {} fact(s). The pre-fix \
              merge_delta replaced the cell on each apply, so only the \
              last entity (a-3) survived the visible view.\n\
@@ -4026,7 +4026,7 @@ Task has Task Priority.
 
         // Precondition: the cell IS a Map holding both rows before retract.
         let before = peek(h).expect("handle live after applies");
-        let cell_before = ast::fetch_or_phi("Task_has_Task Priority", &before);
+        let cell_before = ast::fetch_or_phi("Task_has_Task_Priority", &before);
         assert!(matches!(cell_before, ast::Object::Map(_)),
             "FT-image cell must be folded to a Map before retract; got: {cell_before:?}");
         assert_eq!(ast::cell_fact_count(&cell_before), 2,
@@ -4036,7 +4036,7 @@ Task has Task Priority.
         // (`Task`, `Task Priority`); arity 2 == the binary FT's arity.
         let retract_out = system_impl(
             h,
-            "retract:Task_has_Task Priority",
+            "retract:Task_has_Task_Priority",
             "<<Task, t-1>, <Task Priority, p0>>",
         );
         assert_eq!(retract_out, "ok",
@@ -4046,7 +4046,7 @@ Task has Task Priority.
         //   (1) the cell is STILL an Object::Map (NOT demoted to Seq), and
         //   (2) the retracted row is gone (only t-2 remains).
         let after = peek(h).expect("handle live after retract");
-        let cell_after = ast::fetch_or_phi("Task_has_Task Priority", &after);
+        let cell_after = ast::fetch_or_phi("Task_has_Task_Priority", &after);
         assert!(matches!(cell_after, ast::Object::Map(_)),
             "retract MUST preserve the Map shape of a folded FT-image cell; \
              got: {cell_after:?}");
@@ -4412,7 +4412,7 @@ Task has Task Status.
         let snapshot = peek(h).expect("handle live after apply");
         // Task FT cells follow the convention `Task_has_<Role>` where
         // the role name preserves spaces verbatim (e.g.
-        // `Task_has_Task Subject`). Filter to those plus the per-entity
+        // `Task_has_Task_Subject`). Filter to those plus the per-entity
         // cell `Task` (or `Task:<id>` if materialised).
         let task_cells: Vec<(String, ast::Object)> = ast::cells_iter(&snapshot).into_iter()
             .filter(|(name, _)| name.starts_with("Task_has_"))
@@ -4547,7 +4547,7 @@ Transition 'complete' is defined in State Machine Definition 'Task'.
         // the role name preserves spaces verbatim, only the head noun
         // and `_has_` suffix are joined with underscores.
         let pre = peek(h).expect("handle live after create");
-        let pre_status_cell = ast::fetch_cell_seq("Task_has_Task Status", &pre);
+        let pre_status_cell = ast::fetch_cell_seq("Task_has_Task_Status", &pre);
         let pre_status: Option<String> = pre_status_cell.as_seq().and_then(|facts|
             facts.iter().find_map(|f| {
                 if ast::binding_matches(f, "Task", "t1") {
@@ -4582,23 +4582,23 @@ Transition 'complete' is defined in State Machine Definition 'Task'.
             })
         };
 
-        let post_desc = read_field("Task_has_Task Description", "Task Description");
+        let post_desc = read_field("Task_has_Task_Description", "Task Description");
         assert_eq!(post_desc.as_deref(), Some("new"),
             "post-update Description must be 'new'; got: {post_desc:?}");
 
-        let post_status = read_field("Task_has_Task Status", "Task Status");
+        let post_status = read_field("Task_has_Task_Status", "Task Status");
         assert_eq!(post_status.as_deref(), Some("completed"),
             "#868: post-update Status must be PRESERVED at 'completed' \
              when the update payload omits Status. Pre-fix the engine \
              reverted Status to its initial value ('pending'), losing \
              the prior fact. Got: {post_status:?}");
 
-        let post_prio = read_field("Task_has_Task Priority", "Task Priority");
+        let post_prio = read_field("Task_has_Task_Priority", "Task Priority");
         assert_eq!(post_prio.as_deref(), Some("p0"),
             "#868: post-update Priority must be PRESERVED at 'p0' when \
              the update payload omits Priority; got: {post_prio:?}");
 
-        let post_subj = read_field("Task_has_Task Subject", "Task Subject");
+        let post_subj = read_field("Task_has_Task_Subject", "Task Subject");
         assert_eq!(post_subj.as_deref(), Some("write report"),
             "#868: post-update Subject must be PRESERVED at 'write report' \
              when the update payload omits Subject; got: {post_subj:?}");
