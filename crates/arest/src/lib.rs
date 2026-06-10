@@ -3504,30 +3504,18 @@ Transition 'advance-to-step2' is to Status 'step2-populate'.
 Transition 'advance-to-step2' is triggered by Event Type 'Schema Design notes elementary facts'.
 "#;
 
-    /// IGNORED — executable acceptance spec; the blocker has narrowed
-    /// TWICE. 2026-06-10 state: (1) schema reflection landed
-    /// (`reflect_schema_cells`); (2) the missing `view:ViewElement_
-    /// renders_Fact_Type` def is FIXED (view-projection.md now stars the
-    /// FIRST `ViewElement renders Fact Type.` declaration — duplicate FT
-    /// declarations dedupe to the first, so the star on view-detail.md's
-    /// re-declaration was dropped and the rule compiled Stored; pinned by
-    /// compile::reflect_schema_cells_tests::renders_fact_type_rule_is_
-    /// view_materialized). REMAINING BLOCKER (last link): the ANTECEDENT
-    /// resolver mis-handles `Noun (Var) verb …` clauses — `Fact Type
-    /// (FT) has Role` resolves via the fuzzy role-set fallback to
-    /// Noun_plays_Role (the rule's compiled antecedents are
-    /// [View_is_for_Noun, View_has_View_Kind, Noun_plays_Role,
-    /// Noun_plays_Role] — no Fact_Type_has_Role), so derived rows carry
-    /// no "Fact Type" binding and view_via_rho's element filter drops
-    /// them all. Second instance: the WORKING renders_Transition sibling
-    /// carries a mangled antecedent id ("Resource_,_Transition_)`") from
-    /// `Transition (Tr) is from Status`. Fix locus: strip ` (Var)`
-    /// tokens before antecedent clause resolution (parse_forml2.rs,
-    /// near resolve_consequent_strict's var handling). Tracked on
-    /// compile-reflect-schema-as-facts; when antecedents resolve, remove
-    /// #[ignore] — this test then IS the §5.2 zero-glue proof.
+    /// THE §5.2 zero-glue proof, passing since 2026-06-10. Three layers
+    /// had to land (each found by running this spec and instrumenting):
+    /// (1) `reflect_schema_cells` — the compiler reflects the schema
+    /// into the schema-as-facts population (Fact_Type_has_Role /
+    /// Noun_plays_Role / Noun_has_Object_Type) at every compile;
+    /// (2) view-projection.md stars the FIRST `ViewElement renders Fact
+    /// Type.` declaration (duplicate-declaration dedupe dropped the
+    /// view-detail re-declaration's star, leaving the rule Stored with
+    /// no view: def); (3) `strip_role_variables` — rule clauses like
+    /// `Fact Type (FT) has Role` resolve the declared verb instead of
+    /// "(FT) has" (which fell to the ambiguous role-set fallback).
     #[test]
-    #[ignore = "antecedent resolver mis-handles `Noun (Var) verb` clauses (Fact Type (FT) has Role -> Noun_plays_Role); see compile-reflect-schema-as-facts"]
     fn never_seen_app_renders_through_the_generic_seam() {
         crate::platform::render_html::install();
 

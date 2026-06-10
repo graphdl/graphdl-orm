@@ -4473,6 +4473,27 @@ mod reflect_schema_cells_tests {
             "the (E) head variable must register as a skolem role");
     }
 
+    /// FAILING-FIRST pin for the antecedent `Noun (Var) verb …` fix:
+    /// `Fact Type (FT) has Role` must resolve to Fact_Type_has_Role —
+    /// not fall through the fuzzy role-set fallback onto Noun_plays_Role
+    /// (which leaves derived rows without a "Fact Type" binding, so
+    /// view_via_rho's element filter drops them all and the instance
+    /// view never synthesizes; pb-zero-glue-acceptance blocker).
+    #[test]
+    fn renders_fact_type_rule_antecedents_resolve_fact_type_has_role() {
+        let corpus = crate::metamodel_corpus();
+        let state = crate::parse_forml2::parse_to_state(&corpus).expect("corpus parses");
+        let data = cell_index_from_state(&state);
+        let rule = data.derivation_rules.iter()
+            .find(|r| r.consequent_cell.literal_id() == "ViewElement_renders_Fact_Type")
+            .expect("the view-detail renders-Fact-Type rule compiles");
+        let ids: Vec<String> = rule.antecedent_sources.iter()
+            .map(|s| alloc::format!("{:?}", s)).collect();
+        assert!(ids.iter().any(|s| s.contains("Fact_Type_has_Role")),
+            "antecedent `Fact Type (FT) has Role` must resolve to \
+             Fact_Type_has_Role; compiled antecedents: {:?}", ids);
+    }
+
     /// The reflection regenerates schema-as-facts rows from the parsed
     /// Role/Noun cells: one Fact_Type_has_Role + Noun_plays_Role row per
     /// role (deterministic `{ft}#{position}` role ids, the active-voice

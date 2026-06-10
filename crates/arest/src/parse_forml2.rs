@@ -1625,8 +1625,18 @@ fn resolve_derivation_rule(
     // Resolve a text fragment to a Fact Type ID via rho-lookup through the catalog.
     // Strips subscripts (Person1 â†’ Person) before catalog lookup â€” find_nouns
     // captures the subscripted token, but the catalog keys are base nouns.
+    //
+    // Role-variable tokens (`Fact Type (FT) has Role`, `Transition (Tr) is
+    // from Status`) are stripped before verb extraction: the variable sits
+    // between the first noun and the verb, so without the strip the verb
+    // comes out as “(FT) has” — the verb-specific catalog match misses and
+    // the clause falls to the role-set fallback, which returns None whenever
+    // the noun set is ambiguous (e.g. {fact type, role} also keys the
+    // `Fact_Type_where_…_plays_a_Role` template entry). The variables
+    // themselves are consumed by the skolem/join machinery from the
+    // ORIGINAL rule text — only this local resolution view drops them.
     let resolve_fact_type = |fragment: &str| -> Option<String> {
-        let cleaned = strip_anaphora(fragment);
+        let cleaned = strip_role_variables(&strip_anaphora(fragment));
         let found_nouns: Vec<(usize, usize, String)> = find_nouns(&cleaned, &noun_names);
         if found_nouns.is_empty() { return None; }
         let base_refs: Vec<String> = found_nouns.iter()
@@ -1704,7 +1714,10 @@ fn resolve_derivation_rule(
     // verb-specifically ONLY (no role-set fallback); an unresolved head is
     // handled by the caller (recorded + consequent left empty = rule dropped).
     let resolve_consequent_strict = |fragment: &str| -> Option<String> {
-        let cleaned = strip_anaphora(fragment);
+        // Same role-variable strip as `resolve_fact_type` — a head like
+        // `ViewElement (E) renders Fact Type (FT)` must extract verb
+        // "renders", not "(E) renders".
+        let cleaned = strip_role_variables(&strip_anaphora(fragment));
         let found_nouns: Vec<(usize, usize, String)> = find_nouns(&cleaned, &noun_names);
         if found_nouns.is_empty() { return None; }
         let base_refs: Vec<String> = found_nouns.iter()
@@ -3589,6 +3602,44 @@ impl SchemaCatalog {
     }
 }
 
+
+/// Strip parenthesized role-variable tokens — `Fact Type (FT) has Role`
+/// → `Fact Type has Role`. A role variable is the FORML2 rule-head/body
+/// binder convention: a short (≤4 chars) alphanumeric token starting
+/// with an uppercase letter, alone in parentheses. Quoted literals,
+/// ring-kind annotations (those trail the declaration period, never a
+/// rule clause), and longer parentheticals are untouched. Used by the
+/// FT-resolution views of rule clauses so verb extraction sees the
+/// declared verb; the variables themselves are read from the original
+/// text by the skolem/join machinery.
+pub(crate) fn strip_role_variables(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'(' {
+            // Find the closing paren within a short window.
+            if let Some(close_rel) = text[i + 1..].find(')') {
+                let inner = &text[i + 1..i + 1 + close_rel];
+                let is_var = (1..=4).contains(&inner.len())
+                    && inner.chars().next().map_or(false, |c| c.is_ascii_uppercase())
+                    && inner.chars().all(|c| c.is_ascii_alphanumeric());
+                if is_var {
+                    // Drop the token plus ONE adjacent space so
+                    // `Type (FT) has` collapses to `Type has`.
+                    if out.ends_with(' ') { out.pop(); }
+                    i = i + 1 + close_rel + 1;
+                    continue;
+                }
+            }
+        }
+        // Advance one char (UTF-8 safe: copy the full char).
+        let ch_len = text[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&text[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
 
 /// Parse a role token into (base_noun_name, full_token_with_subscript).
 /// "Person1" -> ("Person", "Person1"). "User" -> ("User", "User").
