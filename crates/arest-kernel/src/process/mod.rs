@@ -82,8 +82,8 @@ pub use exec::{argv_from_words, exec_path, prepare_process_in, run_command, Exec
 pub use interp_resolve::{resolve_interp_bytes, resolve_interp_bytes_in};
 pub use process::{
     current_process_fd_table, current_process_id, current_process_install,
-    current_process_mut, current_process_signals, current_process_uninstall, FdEntry,
-    Process, ProcessState, SpawnError,
+    current_process_mut, current_process_signals, current_process_spawn,
+    current_process_uninstall, FdEntry, Process, ProcessState, SpawnError,
 };
 pub use signal::{SavedContext, SigAction, SignalState};
 pub use stack::{AuxvEntry, AuxvType, InitialStack, StackBuilder, StackError};

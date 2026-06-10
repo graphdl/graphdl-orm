@@ -98,16 +98,29 @@ pub fn exec_path(
     envp: &[&[u8]],
 ) -> Result<(), (ExecError, Option<Process>)> {
     let prepared = crate::system::with_state(|state| prepare_process_in(path, pid, state));
-    let mut process = match prepared {
+    let process = match prepared {
         Some(Ok(p)) => p,
         Some(Err(e)) => return Err((e, None)),
         None => return Err((ExecError::FileNotFound, None)),
     };
-    match process.spawn(argv, envp) {
+    // #527: the Process must be reachable through CURRENT_PROCESS
+    // BEFORE the trampoline diverges — post-spawn syscall handlers
+    // (brk / mmap / openat / exit bookkeeping) reach process state
+    // exclusively via that static. Install first, then spawn the
+    // installed value (`current_process_spawn` releases the lock
+    // before the iretq so the first ring-3 syscall can re-take it).
+    crate::process::current_process_install(process);
+    match crate::process::current_process_spawn(argv, envp) {
         // Structurally impossible on UEFI (spawn diverges); kept for
         // signature honesty on hosts.
         Ok(()) => Ok(()),
-        Err(e) => Err((ExecError::Spawn(e), Some(process))),
+        // Failure: reclaim the process from the static so the caller
+        // can inspect it (REPL report, host tests) and no half-spawned
+        // process lingers installed.
+        Err(e) => Err((
+            ExecError::Spawn(e),
+            crate::process::current_process_uninstall(),
+        )),
     }
 }
 
@@ -261,6 +274,12 @@ mod tests {
     #[test]
     fn run_applet_style_targets_busybox() {
         use super::super::process::tests::with_deterministic_entropy;
+        // exec_path now installs the prepared Process into
+        // CURRENT_PROCESS around the spawn attempt (#527) — serialize
+        // with every other test touching that static. Lock order:
+        // CURRENT_PROCESS_TEST_LOCK, then the entropy lock inside the
+        // fixture (no test takes them in the reverse order).
+        let _guard = crate::process::process::CURRENT_PROCESS_TEST_LOCK.lock();
         with_deterministic_entropy([11u8; 32], || {
             let out = run_command(&["ls", "/"]);
             assert!(

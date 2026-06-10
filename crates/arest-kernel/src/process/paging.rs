@@ -75,10 +75,11 @@ pub enum PagingError {
     Unaligned,
     /// The 48-bit canonical range was exceeded.
     VaddrOutOfRange,
-    /// A walk met an entry shape it can't transform (e.g. a
-    /// non-present interior entry on a path the boot tables were
-    /// expected to cover — tier-1 maps user ranges into existing
-    /// identity territory only).
+    /// A walk met an entry shape it can't transform. Currently
+    /// unreachable — non-present interiors get fresh tables (the
+    /// mmap territory at 0x7000_0000_0000 is absent from the boot
+    /// view by construction) and huge leaves split. Kept for future
+    /// walk shapes that CAN refuse.
     UnexpectedEntry,
 }
 
@@ -145,6 +146,54 @@ impl ProcessPageTables {
         let frame = PhysFrame::containing_address(PhysAddr::new(self.root_phys()));
         unsafe { Cr3::write(frame, Cr3Flags::empty()) };
     }
+
+    /// Extend an already-built (possibly CR3-ACTIVE) tree with one
+    /// more user mapping — the post-spawn anonymous-mmap path
+    /// (#497-c). Same validation contract as `build`.
+    ///
+    /// Live-tree safety: a new translation flips entries from
+    /// non-present to present, which the TLB never caches (SDM
+    /// 4.10.2.3), so no flush is needed for the fresh-table case.
+    /// Splits / permission bumps of PRESENT entries DO leave stale
+    /// TLB + paging-structure-cache state, so the UEFI arm flushes
+    /// the mapped range per page regardless — cheap at mmap rates
+    /// and unconditionally correct.
+    pub fn map_additional(&mut self, m: &UserMapping) -> Result<(), PagingError> {
+        let end = check_mapping(m)?;
+        let mut page = m.vaddr;
+        let mut phys = m.phys;
+        while page < end {
+            map_user_page(self, page, phys, m.writable)?;
+            page += PAGE_SIZE;
+            phys += PAGE_SIZE;
+        }
+        #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+        {
+            let mut page = m.vaddr;
+            while page < end {
+                x86_64::instructions::tlb::flush(x86_64::VirtAddr::new(page));
+                page += PAGE_SIZE;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Shared per-mapping validation: alignment + 48-bit canonical range.
+/// Returns the exclusive end address on success.
+fn check_mapping(m: &UserMapping) -> Result<u64, PagingError> {
+    if m.len == 0 || m.vaddr % PAGE_SIZE != 0 || m.phys % PAGE_SIZE != 0 || m.len % PAGE_SIZE != 0
+    {
+        return Err(PagingError::Unaligned);
+    }
+    let end = m
+        .vaddr
+        .checked_add(m.len)
+        .ok_or(PagingError::VaddrOutOfRange)?;
+    if end > 1u64 << 48 {
+        return Err(PagingError::VaddrOutOfRange);
+    }
+    Ok(end)
 }
 
 /// Flags every interior entry on a user path gets: permissive parent,
@@ -180,20 +229,7 @@ pub fn build(
     };
 
     for m in mappings {
-        if m.len == 0
-            || m.vaddr % PAGE_SIZE != 0
-            || m.phys % PAGE_SIZE != 0
-            || m.len % PAGE_SIZE != 0
-        {
-            return Err(PagingError::Unaligned);
-        }
-        let end = m
-            .vaddr
-            .checked_add(m.len)
-            .ok_or(PagingError::VaddrOutOfRange)?;
-        if end > 1u64 << 48 {
-            return Err(PagingError::VaddrOutOfRange);
-        }
+        let end = check_mapping(m)?;
         let mut page = m.vaddr;
         let mut phys = m.phys;
         while page < end {
@@ -229,10 +265,14 @@ fn map_user_page(
 
     // ── PML4 → PDPT ────────────────────────────────────────────────
     let (pml4e_addr, pml4e_flags) = entry_parts(&tree.root, pml4_i);
-    if !pml4e_flags.contains(F::PRESENT) {
-        return Err(PagingError::UnexpectedEntry);
-    }
-    let pdpt_addr = if tree.owned_table(pml4e_addr).is_some() {
+    let pdpt_addr = if !pml4e_flags.contains(F::PRESENT) {
+        // Absent from the boot view (the mmap territory at
+        // 0x7000_0000_0000 by construction): fresh process-owned
+        // PDPT, private from birth — nothing to clone or share.
+        let addr = push_owned(tree, Box::new(PageTable::new()));
+        tree.root[pml4_i].set_addr(PhysAddr::new(addr), interior_user_flags());
+        addr
+    } else if tree.owned_table(pml4e_addr).is_some() {
         pml4e_addr
     } else {
         // Boot-shared PDPT: clone before touching.
@@ -255,10 +295,12 @@ fn map_user_page(
 
     // ── PDPT → PD (split 1 GiB leaves) ─────────────────────────────
     let (pdpte_addr, pdpte_flags) = read_owned(tree, pdpt_addr, pdpt_i);
-    if !pdpte_flags.contains(F::PRESENT) {
-        return Err(PagingError::UnexpectedEntry);
-    }
-    let pd_addr = if pdpte_flags.contains(F::HUGE_PAGE) {
+    let pd_addr = if !pdpte_flags.contains(F::PRESENT) {
+        // Absent: fresh process-owned PD (same rationale as PML4).
+        let addr = push_owned(tree, Box::new(PageTable::new()));
+        write_owned(tree, pdpt_addr, pdpt_i, addr, interior_user_flags());
+        addr
+    } else if pdpte_flags.contains(F::HUGE_PAGE) {
         // 1 GiB leaf → 512 × 2 MiB leaves preserving flags.
         let mut pd = Box::new(PageTable::new());
         let base = pdpte_addr;
@@ -297,10 +339,12 @@ fn map_user_page(
 
     // ── PD → PT (split 2 MiB leaves) ───────────────────────────────
     let (pde_addr, pde_flags) = read_owned(tree, pd_addr, pd_i);
-    if !pde_flags.contains(F::PRESENT) {
-        return Err(PagingError::UnexpectedEntry);
-    }
-    let pt_addr = if pde_flags.contains(F::HUGE_PAGE) {
+    let pt_addr = if !pde_flags.contains(F::PRESENT) {
+        // Absent: fresh process-owned PT (same rationale as PML4).
+        let addr = push_owned(tree, Box::new(PageTable::new()));
+        write_owned(tree, pd_addr, pd_i, addr, interior_user_flags());
+        addr
+    } else if pde_flags.contains(F::HUGE_PAGE) {
         // 2 MiB leaf → 512 × 4 KiB PTEs. HUGE_PAGE must be DROPPED in
         // PTEs (bit 7 is PAT at PT level).
         let mut pt = Box::new(PageTable::new());
@@ -558,5 +602,66 @@ mod tests {
         assert_eq!(walk(&tree, 0x20_5000)[3].0, 0xb000);
         // Same PT table on both paths.
         assert_eq!(walk(&tree, 0x20_0000)[2].0, walk(&tree, 0x20_5000)[2].0);
+    }
+
+    /// The mmap territory (0x7000_0000_0000, PML4 slot 224) is ABSENT
+    /// from the boot identity view — the builder must allocate fresh
+    /// process-owned interior tables down the whole path rather than
+    /// erroring (#497-c: anonymous mmap backing lives here).
+    #[test]
+    fn maps_into_absent_pml4_slot_with_fresh_tables() {
+        let (pml4, _keep) = synthetic_boot();
+        let m = UserMapping {
+            vaddr: 0x7000_0000_0000,
+            phys: 0xc000,
+            len: 0x2000,
+            writable: true,
+        };
+        let tree = build(&pml4, &[m]).expect("absent territory must build");
+        let path = walk(&tree, 0x7000_0000_0000);
+        for (lvl, (_, f)) in path.iter().enumerate() {
+            assert!(f.contains(F::PRESENT), "level {lvl} missing PRESENT");
+            assert!(
+                f.contains(F::USER_ACCESSIBLE),
+                "level {lvl} missing USER: {f:?}"
+            );
+        }
+        assert_eq!(path[3].0, 0xc000);
+        assert_eq!(walk(&tree, 0x7000_0000_1000)[3].0, 0xd000);
+        // The boot view is untouched: PML4 slot 224 was and stays
+        // empty in the SOURCE tree (the process tree owns the new
+        // subtree privately).
+        assert!(!pml4[224].flags().contains(F::PRESENT));
+    }
+
+    /// `map_additional` extends an already-built tree — the post-spawn
+    /// mmap path. The original mappings stay intact and the new range
+    /// resolves with a full USER path.
+    #[test]
+    fn map_additional_extends_built_tree() {
+        let (pml4, _keep) = synthetic_boot();
+        let seg = UserMapping { vaddr: 0x20_0000, phys: 0xa000, len: 0x1000, writable: true };
+        let mut tree = build(&pml4, &[seg]).expect("build");
+        let mm = UserMapping {
+            vaddr: 0x7000_0000_0000,
+            phys: 0xe000,
+            len: 0x1000,
+            writable: true,
+        };
+        tree.map_additional(&mm).expect("extension must map");
+        // Old mapping intact.
+        assert_eq!(walk(&tree, 0x20_0000)[3].0, 0xa000);
+        // New mapping live, full USER path.
+        let path = walk(&tree, 0x7000_0000_0000);
+        assert_eq!(path[3].0, 0xe000);
+        for (lvl, (_, f)) in path.iter().enumerate() {
+            assert!(
+                f.contains(F::USER_ACCESSIBLE) && f.contains(F::PRESENT),
+                "level {lvl} not a live user path: {f:?}"
+            );
+        }
+        // Alignment contract holds on the extension path too.
+        let bad = UserMapping { vaddr: 0x123, phys: 0, len: 0x1000, writable: true };
+        assert_eq!(tree.map_additional(&bad).unwrap_err(), PagingError::Unaligned);
     }
 }

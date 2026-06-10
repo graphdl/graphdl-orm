@@ -31,11 +31,14 @@
 //      callee-saved slot.
 //   3. Marshal the syscall args from Linux's SYSCALL ABI registers
 //      (rax = number, rdi/rsi/rdx/r10/r8/r9 = args 1-6) into the
-//      SysV-ABI argument registers our dispatcher expects
-//      (rdi/rsi/rdx/rcx/r8/r9 + stack for arg 7). Linux uses r10
-//      for arg 4 because rcx is clobbered by `syscall`.
-//   4. Call `crate::syscall::dispatch::dispatch`. The return value
-//      lands in rax — exactly where the Linux ABI wants the
+//      SysV-ABI argument registers (rdi/rsi/rdx/rcx/r8/r9 + stack
+//      for arg 7). Linux uses r10 for arg 4 because rcx is
+//      clobbered by `syscall`.
+//   4. Call `dispatch_sysv64` — the `extern "sysv64"` shim around
+//      `crate::syscall::dispatch::dispatch` (which, as a plain
+//      Rust-ABI fn, takes args Win64-style on this target and must
+//      not be called from this marshaling directly). The return
+//      value lands in rax — exactly where the Linux ABI wants the
 //      syscall result.
 //   5. Restore callee-saved + user RFLAGS + user RIP.
 //   6. Build an IRETQ frame on the user's stack and execute IRETQ
@@ -73,6 +76,35 @@
 //     jmp / etc.).
 
 use core::arch::naked_asm;
+
+/// ABI shim between the asm stub and the dispatcher (#527).
+///
+/// `dispatch::dispatch` is a plain `extern "Rust"` fn, and on
+/// x86_64-unknown-uefi the Rust ABI passes integer args
+/// Win64-style — rcx / rdx / r8 / r9 + stack — NOT the SysV order
+/// the stub marshals into. `sym`-calling `dispatch` directly
+/// therefore scrambled every syscall: the number was read from rcx
+/// (= user rdx, usually 0 → everything dispatched as read) and the
+/// args shifted one register over. Observed live in the #527 QEMU
+/// smoke: musl's `arch_prctl(ARCH_SET_FS, tp)` "succeeded" as a
+/// zero-count read without programming FSBASE, and the first
+/// fs:-relative access #PF'd at cr2=0.
+///
+/// Declaring the boundary `extern "sysv64"` turns the stub's
+/// register layout into a compiler-enforced contract. Host tests
+/// keep calling `dispatch` directly (any-ABI from Rust), so this
+/// shim is the ONLY caller-visible difference on the UEFI target.
+extern "sysv64" fn dispatch_sysv64(
+    rax: u64,
+    rdi: u64,
+    rsi: u64,
+    rdx: u64,
+    r10: u64,
+    r8: u64,
+    r9: u64,
+) -> i64 {
+    crate::syscall::dispatch::dispatch(rax, rdi, rsi, rdx, r10, r8, r9)
+}
 
 /// SYSCALL entry stub. IA32_LSTAR points here. NEVER call this
 /// from Rust code — it's reachable only via the `syscall`
@@ -121,8 +153,11 @@ pub unsafe extern "C" fn syscall_entry() {
         // -------- Phase 2: marshal args for dispatch --------
         // Linux x86_64 SYSCALL ABI:
         //   rax = number, rdi/rsi/rdx/r10/r8/r9 = args 1..6
-        // Our dispatcher signature (`dispatch::dispatch`):
-        //   fn dispatch(rax, rdi, rsi, rdx, r10, r8, r9) -> i64
+        // The dispatch boundary (`dispatch_sysv64` above) is pinned
+        // to `extern "sysv64"` — see its docstring for why plain
+        // `extern "Rust"` (Win64-style on this target) must NOT be
+        // called from this marshaling.
+        //   fn dispatch_sysv64(rax, rdi, rsi, rdx, r10, r8, r9) -> i64
         // SysV-C ABI register order for 7 args:
         //   rdi, rsi, rdx, rcx, r8, r9, [rsp]
         //
@@ -153,8 +188,9 @@ pub unsafe extern "C" fn syscall_entry() {
         // (return address) for a total of 80 bytes. 80 % 16 = 0, so
         // we're 16-byte aligned at the call site — SysV ABI happy.
         //
-        // The dispatcher is a Rust fn `dispatch::dispatch`. Use
-        // `sym` to resolve the mangled name at link time.
+        // The dispatcher boundary is the `extern "sysv64"` shim
+        // `dispatch_sysv64`. Use `sym` to resolve the mangled name
+        // at link time.
         "call {dispatch}",
         // After return: rax = i64 return value (the syscall result
         // userspace will see in rax).
@@ -209,7 +245,7 @@ pub unsafe extern "C" fn syscall_entry() {
 
         "iretq",
 
-        dispatch = sym crate::syscall::dispatch::dispatch,
+        dispatch = sym dispatch_sysv64,
         user_cs = const super::gdt::USER_CS as i64,
         user_ss = const super::gdt::USER_SS as i64,
     )

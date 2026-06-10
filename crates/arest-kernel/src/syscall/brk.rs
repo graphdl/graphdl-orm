@@ -156,6 +156,18 @@ pub fn handle(addr: u64) -> i64 {
             return proc.heap_break as i64;
         }
 
+        // #527: refuse to advance an UNANCHORED heap. heap_break == 0
+        // means no loader recorded an image end yet — recording an
+        // advance would hand userspace [0, addr), i.e. the null page,
+        // as writable heap territory under the per-process page
+        // tables. Returning the current break (0) is the Linux "no"
+        // (the libc wrapper synthesises ENOMEM from the mismatch) and
+        // musl's mallocng falls back to its mmap path, which IS
+        // backed (#497-c).
+        if proc.heap_break == 0 {
+            return 0;
+        }
+
         // Validate the requested address.
         if addr < HEAP_FLOOR || addr > BRK_MAX_ADDR {
             // Invalid address — return current break unchanged.
@@ -201,12 +213,14 @@ mod tests {
     }
 
     /// `brk(valid_addr)` stores the new break in Process::heap_break
-    /// and returns the address.
+    /// and returns the address. (Anchored first — an unanchored break
+    /// refuses to advance, see `brk_unanchored_break_refuses_to_advance`.)
     #[test]
     fn brk_valid_addr_sets_heap_break_and_returns_addr() {
         let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         let address_space = AddressSpace::new(0x40_1000);
-        let proc = Process::new(2, address_space);
+        let mut proc = Process::new(2, address_space);
+        proc.heap_break = 0x40_2000; // anchored: loader-recorded image end
         current_process_install(proc);
 
         let new_break: u64 = 0x0000_7fff_0000_0000;
@@ -227,7 +241,8 @@ mod tests {
     fn brk_zero_after_set_returns_stored_break() {
         let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         let address_space = AddressSpace::new(0x40_1000);
-        let proc = Process::new(3, address_space);
+        let mut proc = Process::new(3, address_space);
+        proc.heap_break = 0x40_2000; // anchored
         current_process_install(proc);
 
         let new_break: u64 = 0x1234_5000;
@@ -249,7 +264,8 @@ mod tests {
     fn brk_multiple_advances_store_latest_break() {
         let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         let address_space = AddressSpace::new(0x40_1000);
-        let proc = Process::new(4, address_space);
+        let mut proc = Process::new(4, address_space);
+        proc.heap_break = 0x40_2000; // anchored
         current_process_install(proc);
 
         let first: u64 = 0x1000_0000;
@@ -274,7 +290,8 @@ mod tests {
     fn brk_overflow_addr_returns_current_break_unchanged() {
         let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         let address_space = AddressSpace::new(0x40_1000);
-        let proc = Process::new(5, address_space);
+        let mut proc = Process::new(5, address_space);
+        proc.heap_break = 0x40_2000; // anchored
         current_process_install(proc);
 
         // Set a baseline break first.
@@ -307,13 +324,40 @@ mod tests {
         assert_eq!(handle(0x1000_0000), 0);
     }
 
+    /// #527: an UNANCHORED heap (heap_break == 0 — no loader recorded
+    /// an image end yet) refuses to advance. Recording the advance
+    /// would hand userspace [0, addr) — the null page — as writable
+    /// heap territory under the per-process page tables. Returning
+    /// the current break (0) is the Linux "no" (the libc wrapper
+    /// synthesises ENOMEM) and musl's mallocng falls back to mmap.
+    #[test]
+    fn brk_unanchored_break_refuses_to_advance() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        let address_space = AddressSpace::new(0x40_1000);
+        let proc = Process::new(7, address_space);
+        current_process_install(proc);
+
+        assert_eq!(
+            handle(0x2000),
+            0,
+            "advance from unanchored break must refuse"
+        );
+        crate::process::current_process_mut(|maybe_proc| {
+            let p = maybe_proc.expect("process");
+            assert_eq!(p.heap_break, 0, "refusal must not record the address");
+        });
+
+        current_process_uninstall();
+    }
+
     /// Shrink: `brk(addr < current_break)` is valid — the break is
     /// lowered and the new (lower) value is returned.
     #[test]
     fn brk_shrink_lowers_break_and_returns_new_break() {
         let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
         let address_space = AddressSpace::new(0x40_1000);
-        let proc = Process::new(6, address_space);
+        let mut proc = Process::new(6, address_space);
+        proc.heap_break = 0x40_2000; // anchored
         current_process_install(proc);
 
         let high: u64 = 0x4000_0000;

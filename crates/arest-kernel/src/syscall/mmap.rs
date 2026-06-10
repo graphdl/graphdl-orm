@@ -75,8 +75,9 @@
 // tasks are:
 //   • #497-a  mmap file-backed: MAP_ANONYMOUS clear, fd valid — needs VFS.
 //   • #497-b  munmap frame tracking: per-mapping tombstone list + real free.
-//   • #497-c  mmap page-table install: physical frame alloc + PTE install
-//             for UEFI target (depends on #527 frame allocator landing).
+//   • #497-c  mmap page-table install — LANDED with #527: `map_mmap_pages`
+//             allocates zeroed kernel-heap backing and extends the live
+//             process tree (`ProcessPageTables::map_additional`).
 //
 // errno values used
 // -----------------
@@ -144,28 +145,63 @@ pub const ENOMEM: i64 = 12;
 /// when `len == 0` (mmap(2) requires len > 0).
 pub const EINVAL: i64 = 22;
 
-/// Install page-table mappings for a newly-allocated anonymous mmap region
-/// on the real x86_64-UEFI target. On host/non-UEFI builds this is a
-/// no-op — the bookkeeping bump is the only necessary operation for unit
-/// tests. Mirrors `brk::map_heap_pages`.
+/// Back a newly-allocated anonymous mmap region with real memory on
+/// the x86_64-UEFI target (#497-c): allocate a zeroed, page-aligned
+/// kernel-heap block (identity-mapped, so its address IS the physical
+/// frame range) and extend the process's LIVE page-table tree with
+/// USER+WRITABLE leaves translating `[base, base+len)` to it.
 ///
-/// SAFETY (future UEFI arm): caller has already validated `base` is
-/// page-aligned and `[base, base+len)` lies within `[MMAP_BASE, MMAP_CEIL)`.
-/// CPL 0 invariant holds throughout.
+/// The backing is deliberately leaked on success: it must live as
+/// long as the process address space — tier-1's `munmap` is a
+/// documented no-op and `exit` halts the machine, so "as long as the
+/// process" is "forever" until the #530 scheduler brings reaping.
+///
+/// `Err(())` (→ -ENOMEM at the syscall surface) when the process has
+/// no page tables (spawn's build failed), the allocation fails, or
+/// the tree refuses the mapping.
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-fn map_mmap_pages(_base: u64, _len: u64) {
-    // Boot-integration TODO (#497-c): walk [base, base+len) in PAGE_SIZE
-    // steps, allocate physical frames from the frame allocator, and install
-    // PTE mappings in the process CR3. Stubbed so the bookkeeping lands
-    // independently and is verifiable on host.
+fn map_mmap_pages(
+    proc: &mut crate::process::Process,
+    base: u64,
+    len: u64,
+) -> Result<(), ()> {
+    use crate::process::paging::UserMapping;
+    use alloc::alloc::{alloc_zeroed, dealloc, Layout};
+    let Some(tables) = proc.page_tables.as_mut() else {
+        return Err(());
+    };
+    let Ok(layout) = Layout::from_size_align(len as usize, PAGE_SIZE as usize) else {
+        return Err(());
+    };
+    // Zero-filled per the MAP_ANONYMOUS contract (mmap(2)).
+    // SAFETY: len > 0 (caller validated) and the layout is non-zero,
+    // page-aligned.
+    let backing = unsafe { alloc_zeroed(layout) };
+    if backing.is_null() {
+        return Err(());
+    }
+    match tables.map_additional(&UserMapping {
+        vaddr: base,
+        phys: backing as u64,
+        len,
+        writable: true,
+    }) {
+        Ok(()) => Ok(()), // backing intentionally leaked — see docstring
+        Err(_) => {
+            // SAFETY: same layout the allocation used; the mapping
+            // failed, so no PTE references the backing.
+            unsafe { dealloc(backing, layout) };
+            Err(())
+        }
+    }
 }
 
-/// No-op shim for host unit-test builds. The bump bookkeeping tests only
-/// need `Process::mmap_bump` to advance; no real page allocation is needed.
+/// Bookkeeping-only shim for host unit-test builds: the bump tests
+/// need `Process::mmap_bump` to advance; there is no CR3-active tree
+/// to extend and no identity heap to lean on.
 #[cfg(not(all(target_os = "uefi", target_arch = "x86_64")))]
-#[allow(dead_code)]
-fn map_mmap_pages(_base: u64, _len: u64) {
-    // No page tables on host — storage-only path for unit tests.
+fn map_mmap_pages(_proc: &mut crate::process::Process, _base: u64, _len: u64) -> Result<(), ()> {
+    Ok(())
 }
 
 /// Handle an `mmap(addr, len, prot, flags, fd, off)` syscall.
@@ -176,9 +212,13 @@ fn map_mmap_pages(_base: u64, _len: u64) {
 /// 2. Round `len` up to the next PAGE_SIZE (4096) boundary.
 /// 3. Check overflow: returns `-ENOMEM` if `mmap_bump + rounded_len`
 ///    would exceed `MMAP_CEIL`.
-/// 4. Record `base = mmap_bump`, advance `mmap_bump += rounded_len`.
-/// 5. Call the (no-op on host) `map_mmap_pages(base, rounded_len)` shim.
-/// 6. Return `base as i64` — a non-negative page-aligned address.
+/// 4. Record `base = mmap_bump`.
+/// 5. Back + map the range via `map_mmap_pages` — real zeroed
+///    allocation + USER PTE install into the live process tree on
+///    UEFI (#497-c), bookkeeping-only `Ok` on hosts. On failure
+///    return `-ENOMEM` without burning address space.
+/// 6. Commit `mmap_bump = base + rounded_len` and return `base as
+///    i64` — a non-negative page-aligned address.
 ///
 /// # File-backed mapping (flags & MAP_ANONYMOUS == 0)
 ///
@@ -224,11 +264,14 @@ pub fn handle_mmap(_addr: u64, len: u64, _prot: u64, flags: u64, _fd: u64, _off:
         }
 
         let base = proc.mmap_bump;
-        proc.mmap_bump += rounded;
 
-        // map_mmap_pages is a no-op in tests; on the UEFI target it will
-        // walk [base, base+rounded) and install PTEs (future #497-c).
-        map_mmap_pages(base, rounded);
+        // #497-c: back + map the range BEFORE committing the bump —
+        // a failed backing must not burn address space. On hosts the
+        // shim always succeeds (bookkeeping-only tests).
+        if map_mmap_pages(proc, base, rounded).is_err() {
+            return -ENOMEM;
+        }
+        proc.mmap_bump = base + rounded;
 
         base as i64
     })

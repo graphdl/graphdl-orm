@@ -170,6 +170,10 @@ pub enum SpawnError {
     /// because the prerequisites for the actual ring-3 jump haven't
     /// landed (#526/#527).
     Trampoline(TrampolineError),
+    /// `current_process_spawn` found no installed process — the
+    /// caller skipped `current_process_install`. An exec-path
+    /// orchestration bug, not a userspace-visible condition.
+    NoCurrentProcess,
 }
 
 impl From<StackError> for SpawnError {
@@ -318,6 +322,14 @@ pub struct Process {
     /// free list in tier-1 — documented no-op). A real allocator that
     /// tracks individual mappings is a future child task of #497.
     pub mmap_bump: u64,
+    /// The per-process page-table tree `spawn` builds + activates
+    /// (#527). Held ON the Process — which `exec_path` installs into
+    /// `CURRENT_PROCESS` before spawning — so post-spawn syscalls can
+    /// EXTEND the live tree (anonymous mmap backing, #497-c) while
+    /// CR3 keeps pointing at it. `None` until spawn, and always on
+    /// hosts (no CR3 to activate; the type itself is host-buildable
+    /// for the structural tests in `paging::tests`).
+    pub page_tables: Option<super::paging::ProcessPageTables>,
     /// Per-process signal state — the disposition table, the thread
     /// signal mask, and the `rt_sigreturn` saved-context slot (#548).
     /// Populated by `rt_sigaction` (install/replace a handler) and
@@ -497,6 +509,9 @@ impl Process {
             // sets these for a dynamically-linked program (#522).
             interp_base: None,
             program_entry: None,
+            // Built + activated by `spawn` on the UEFI target (#527);
+            // stays None on hosts.
+            page_tables: None,
         }
     }
 
@@ -631,67 +646,20 @@ impl Process {
         // Kernel-side syscall handlers run under the same CR3, so
         // user-pointer arguments resolve without copyin glue.
         //
-        // The binding must stay alive past the trampoline: on success
-        // iretq diverges and this frame is abandoned-but-never-freed,
-        // which keeps the tables allocated exactly as long as the CR3
-        // points at them.
+        // The tree must stay alive past the trampoline. It lives on
+        // `self` — which `exec_path` has installed into
+        // CURRENT_PROCESS — so (a) the allocation outlives the
+        // diverging iretq for exactly as long as the CR3 points at
+        // it, and (b) post-spawn syscalls (anonymous mmap, #497-c)
+        // can extend the LIVE tree via `current_process_mut`.
         #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-        let _page_tables: Option<super::paging::ProcessPageTables> = {
-            use super::paging::{build_for_current, UserMapping};
-            let mut maps: alloc::vec::Vec<UserMapping> = alloc::vec::Vec::new();
-            for seg in &self.address_space.segments {
-                // Aligned-down vaddr page ↔ page-aligned backing base
-                // (the loader keeps the vaddr's page offset inside the
-                // allocation — see LoadedSegment::mapping_base).
-                maps.push(UserMapping {
-                    vaddr: seg.vaddr & !0xfff,
-                    phys: seg.mapping_base(),
-                    len: seg.mapping_len() as u64,
-                    writable: matches!(seg.perm, super::SegmentPerm::ReadWrite),
-                });
-            }
-            let stack_base = stack.top() - stack.size() as u64;
-            maps.push(UserMapping {
-                vaddr: stack_base,
-                phys: stack_base,
-                len: stack.size() as u64,
-                writable: true,
-            });
-            // AT_RANDOM points into this Box — map its (whole) page
-            // read-only at the identity address the auxv recorded.
-            let rand_page = (self.at_random.as_ptr() as u64) & !0xfff;
-            maps.push(UserMapping {
-                vaddr: rand_page,
-                phys: rand_page,
-                len: 0x1000,
-                writable: false,
-            });
-            match build_for_current(&maps) {
-                Ok(tables) => {
-                    // SMAP would fault every kernel access to the now-
-                    // USER stack/segment pages from the syscall path;
-                    // SMEP is harmless (kernel never executes user
-                    // pages) but clear both for a known-good tier-1
-                    // baseline if the firmware enabled them.
-                    unsafe {
-                        use x86_64::registers::control::{Cr4, Cr4Flags};
-                        Cr4::update(|f| {
-                            f.remove(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION);
-                            f.remove(Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION);
-                        });
-                        tables.activate();
-                    }
-                    Some(tables)
-                }
-                Err(e) => {
-                    crate::println!(
-                        "  spawn:    page-table build failed: {e:?} — invoking without user mappings"
-                    );
-                    None
-                }
-            }
-        };
-
+        {
+            self.page_tables = build_process_page_tables(
+                &self.address_space,
+                &stack,
+                self.at_random.as_ptr() as u64,
+            );
+        }
         // Step 3: invoke the trampoline. Diverges (returns `!`) on
         // success; returns `Err(...)` if the prerequisites aren't met.
         // For tier-1 this always returns `NotYetImplemented` (x86_64)
@@ -969,6 +937,74 @@ impl Process {
 /// have to retrofit the lock; the cost is minimal (single-CPU lock
 /// = no contention) and the API matches the rest of the kernel's
 /// global mutable singletons.
+/// Build (and ACTIVATE) the per-process page tables for a prepared
+/// image (#527): kernel identity view copied supervisor-verbatim, plus
+/// USER 4 KiB mappings translating each ELF segment's vaddr range to
+/// its heap backing, the initial stack and the AT_RANDOM page at their
+/// identity addresses. Returns `None` (and logs) when the build fails
+/// — the spawn proceeds without user mappings and ring 3 faults loudly
+/// through the named #PF handler instead of double-faulting.
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn build_process_page_tables(
+    address_space: &AddressSpace,
+    stack: &InitialStack,
+    at_random_addr: u64,
+) -> Option<super::paging::ProcessPageTables> {
+    use super::paging::{build_for_current, UserMapping};
+    let mut maps: alloc::vec::Vec<UserMapping> = alloc::vec::Vec::new();
+    for seg in &address_space.segments {
+        // Aligned-down vaddr page ↔ page-aligned backing base
+        // (the loader keeps the vaddr's page offset inside the
+        // allocation — see LoadedSegment::mapping_base).
+        maps.push(UserMapping {
+            vaddr: seg.vaddr & !0xfff,
+            phys: seg.mapping_base(),
+            len: seg.mapping_len() as u64,
+            writable: matches!(seg.perm, super::SegmentPerm::ReadWrite),
+        });
+    }
+    let stack_base = stack.top() - stack.size() as u64;
+    maps.push(UserMapping {
+        vaddr: stack_base,
+        phys: stack_base,
+        len: stack.size() as u64,
+        writable: true,
+    });
+    // AT_RANDOM points into the Process's Box — map its (whole) page
+    // read-only at the identity address the auxv recorded.
+    let rand_page = at_random_addr & !0xfff;
+    maps.push(UserMapping {
+        vaddr: rand_page,
+        phys: rand_page,
+        len: 0x1000,
+        writable: false,
+    });
+    match build_for_current(&maps) {
+        Ok(tables) => {
+            // SMAP would fault every kernel access to the now-USER
+            // stack/segment pages from the syscall path; SMEP is
+            // harmless (kernel never executes user pages) but clear
+            // both for a known-good tier-1 baseline if the firmware
+            // enabled them.
+            unsafe {
+                use x86_64::registers::control::{Cr4, Cr4Flags};
+                Cr4::update(|f| {
+                    f.remove(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION);
+                    f.remove(Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION);
+                });
+                tables.activate();
+            }
+            Some(tables)
+        }
+        Err(e) => {
+            crate::println!(
+                "  spawn:    page-table build failed: {e:?} — invoking without user mappings"
+            );
+            None
+        }
+    }
+}
+
 static CURRENT_PROCESS: spin::Mutex<Option<Process>> = spin::Mutex::new(None);
 
 /// Run a closure against the currently-installed Process, returning
@@ -1012,6 +1048,43 @@ pub fn current_process_install(proc: Process) {
 /// (#530) to reap exited processes.
 pub fn current_process_uninstall() -> Option<Process> {
     CURRENT_PROCESS.lock().take()
+}
+
+/// Spawn the INSTALLED current process — the #552 ring-3 gate's
+/// production sequence: `current_process_install(p)` then this. The
+/// Process must live in `CURRENT_PROCESS` *before* the iretq because
+/// every post-spawn kernel re-entry (syscall handlers: brk / mmap /
+/// openat / exit bookkeeping) reaches process state exclusively
+/// through that static — a process abandoned on the diverged spawn
+/// frame is unreachable, observed live in the #527 QEMU smoke as
+/// `brk(0) = 0` + `mmap = -ENOMEM` ("no current process" sentinels)
+/// → musl malloc failure.
+///
+/// The lock dance: take a raw `*mut Process` under the guard, RELEASE
+/// the guard, then spawn through the pointer. A guard held across the
+/// diverging iretq would deadlock the first ring-3 syscall (it locks
+/// `CURRENT_PROCESS` on a single-core spin mutex).
+///
+/// SAFETY of the unlocked `&mut`: tier-1 is single-core with no
+/// kernel preemption. Between the release and the divergence (or the
+/// error return) nothing else dereferences `CURRENT_PROCESS` — IRQ
+/// handlers touch only their rings/counters. After the iretq the
+/// spawn frame is abandoned and the `&mut` is never used again;
+/// syscall handlers re-derive access through the mutex. `Process`
+/// values never move inside the static (the `Option` lives in a
+/// `static spin::Mutex`), so the pointer stays valid while held.
+pub fn current_process_spawn(argv: &[&[u8]], envp: &[&[u8]]) -> Result<(), SpawnError> {
+    let ptr: *mut Process = {
+        let mut guard = CURRENT_PROCESS.lock();
+        match guard.as_mut() {
+            Some(p) => p as *mut Process,
+            None => return Err(SpawnError::NoCurrentProcess),
+        }
+    };
+    // SAFETY: see the function docstring — single-core, no concurrent
+    // accessor between unlock and divergence/return, value pinned in
+    // the static.
+    unsafe { (*ptr).spawn(argv, envp) }
 }
 
 /// Test-only serialisation lock for the process-global
@@ -1187,6 +1260,45 @@ pub(crate) mod tests {
         let address_space = AddressSpace::new(0xDEAD_BEEF);
         let proc = Process::new(1, address_space);
         assert_eq!(proc.address_space.entry_point, 0xDEAD_BEEF);
+    }
+
+    /// `current_process_spawn` with nothing installed names the
+    /// orchestration bug (`NoCurrentProcess`) instead of panicking —
+    /// exec_path's install-then-spawn contract (#527).
+    #[test]
+    fn current_process_spawn_without_install_errors() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        current_process_uninstall();
+        let argv: &[&[u8]] = &[b"x"];
+        assert_eq!(
+            current_process_spawn(argv, &[]).unwrap_err(),
+            SpawnError::NoCurrentProcess
+        );
+    }
+
+    /// The #552 production sequence on a host: install, spawn the
+    /// installed process (fails at the trampoline), and the process is
+    /// still reachable through the static with the failure recorded —
+    /// the state post-spawn syscalls would see on the real target.
+    #[test]
+    fn current_process_spawn_runs_installed_process_in_place() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        with_deterministic_entropy([5u8; 32], || {
+            let mut address_space = AddressSpace::new(0x40_1000);
+            address_space
+                .push_segment(0x40_1000, 0x10, SegmentPerm::ReadExecute, &[0x90; 8])
+                .expect(".text push");
+            current_process_install(Process::new(9, address_space));
+            let argv: &[&[u8]] = &[b"/bin/true"];
+            let err = current_process_spawn(argv, &[]).unwrap_err();
+            assert!(matches!(err, SpawnError::Trampoline(_)));
+            current_process_mut(|p| {
+                let p = p.expect("process must still be installed after failed spawn");
+                assert_eq!(p.state, ProcessState::SpawnFailed);
+                assert!(p.initial_stack.is_some(), "stack preserved in place");
+            });
+            current_process_uninstall();
+        });
     }
 
     /// `Process::spawn` populates the initial stack and transitions
