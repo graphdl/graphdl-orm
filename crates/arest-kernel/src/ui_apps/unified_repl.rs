@@ -1500,6 +1500,25 @@ pub fn build_app() -> Result<UnifiedReplApp, slint::PlatformError> {
     // persistence.
     window.on_theme_toggled(|| {});
 
+    // ---- Docked virtual keyboard (#598) ---------------------------
+    // Each tap on the docked KeyboardPanel pushes the codepoint onto
+    // the kernel keyboard ring, exactly as the former fullscreen
+    // Keyboard Window's glue did (ui_apps/keyboard.rs, deleted with
+    // #598). The ring is the single input funnel: the next super-loop
+    // tick drains the keystroke into THIS window's TextInput via
+    // `drain_keyboard_into_slint_window`, so a virtual "a" lands in
+    // the prompt the same way an IRQ-decoded "a" does, and the user
+    // sees the echo next to the keys that produced it.
+    window.on_vk_key_pressed(|codepoint| {
+        let Some(c) = codepoint.as_str().chars().next() else {
+            crate::println!("vk: empty codepoint on key-pressed; dropping");
+            return;
+        };
+        crate::arch::uefi::keyboard::push_keystroke(
+            pc_keyboard::DecodedKey::Unicode(c),
+        );
+    });
+
     // ---- Live-update plumbing (mirrors hateoas pattern) -----------
     {
         let id_slot: alloc::sync::Arc<spin::Mutex<Option<SubscriberId>>> =

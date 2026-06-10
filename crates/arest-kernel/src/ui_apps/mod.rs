@@ -23,7 +23,6 @@
 // entry; #431 (Boot UI launcher) decides which app(s) actually go on
 // screen at boot.
 
-pub mod keyboard;
 pub mod launcher;
 pub mod registry;
 // Cell-as-screen rendering helpers (#511, EPIC #496). Pure functions

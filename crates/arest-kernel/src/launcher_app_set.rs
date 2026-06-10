@@ -29,7 +29,8 @@
 // `LAUNCHER_APP_SLUGS` is the kernel's ordered list of navigable app
 // slugs. Its order determines the index mapping for
 // `app-selected(idx)`: position 0 is unified-repl, position 1 is
-// doom (cfg-gated), position 2 is keyboard. Adding a new app
+// doom (cfg-gated). (#598: keyboard left the list — it docks inside
+// UnifiedRepl now rather than launching as an app.) Adding a new app
 // requires adding its slug here AND a navigation arm in the
 // `ui_apps::launcher` switch.
 //
@@ -55,7 +56,6 @@ use arest::ast::{self, Object};
 pub const LAUNCHER_APP_SLUGS: &[&str] = &[
     "unified-repl", // idx 0 → Active::UnifiedRepl
     "doom",         // idx 1 → Active::Doom (cfg-gated in navigation switch)
-    "keyboard",     // idx 2 → Active::Keyboard
 ];
 
 /// Read the `LaunchableApp_has_Symbol` cell from `state` and return the
@@ -103,7 +103,6 @@ pub fn launcher_app_slugs_from_cells(state: &Object) -> Vec<String> {
 ///
 /// Examples:
 ///   "unified-repl"  → "Unified Repl"
-///   "keyboard"      → "Keyboard"
 ///   "doom"          → "Doom"
 pub fn slug_to_display_name(slug: &str) -> String {
     slug.split('-')
@@ -156,13 +155,12 @@ mod tests {
         )
     }
 
-    /// Seed only the non-doom apps (app-launcher, unified-repl, keyboard)
+    /// Seed only the non-doom apps (app-launcher, unified-repl)
     /// so tests that run without `--features doom` exercise the filter.
     fn seed_non_doom_apps() -> Object {
         let s = Object::phi();
         let s = seed_app("app-launcher", "AppLauncher", &s);
-        let s = seed_app("unified-repl", "UnifiedRepl", &s);
-        seed_app("keyboard", "Keyboard", &s)
+        seed_app("unified-repl", "UnifiedRepl", &s)
     }
 
     // ── Slug extraction ───────────────────────────────────────────────
@@ -186,8 +184,7 @@ mod tests {
         );
     }
 
-    /// unified-repl + keyboard seeded → both appear in LAUNCHER_APP_SLUGS
-    /// order (unified-repl before keyboard).
+    /// unified-repl seeded → it appears in LAUNCHER_APP_SLUGS order.
     #[test]
     fn non_doom_apps_appear_in_canonical_order() {
         let state = seed_non_doom_apps();
@@ -196,18 +193,6 @@ mod tests {
         assert!(
             slugs.iter().any(|s| s == "unified-repl"),
             "unified-repl missing: {slugs:?}"
-        );
-        // keyboard must appear.
-        assert!(
-            slugs.iter().any(|s| s == "keyboard"),
-            "keyboard missing: {slugs:?}"
-        );
-        // unified-repl before keyboard (LAUNCHER_APP_SLUGS order).
-        let ur_pos = slugs.iter().position(|s| s == "unified-repl").unwrap();
-        let kb_pos = slugs.iter().position(|s| s == "keyboard").unwrap();
-        assert!(
-            ur_pos < kb_pos,
-            "unified-repl ({ur_pos}) must come before keyboard ({kb_pos})"
         );
     }
 
@@ -261,7 +246,6 @@ mod tests {
     #[test]
     fn slug_to_display_name_titlecases_words() {
         assert_eq!(slug_to_display_name("unified-repl"), "Unified Repl");
-        assert_eq!(slug_to_display_name("keyboard"), "Keyboard");
         assert_eq!(slug_to_display_name("doom"), "Doom");
         assert_eq!(slug_to_display_name("app-launcher"), "App Launcher");
     }
@@ -285,8 +269,7 @@ mod tests {
         }
     }
 
-    /// Seeding unified-repl and keyboard produces display names
-    /// "Unified Repl" and "Keyboard" in that order.
+    /// Seeding unified-repl produces the display name "Unified Repl".
     #[test]
     fn display_names_for_non_doom_set_match_expected() {
         let state = seed_non_doom_apps();
@@ -294,10 +277,6 @@ mod tests {
         assert!(
             names.iter().any(|n| n == "Unified Repl"),
             "expected 'Unified Repl': {names:?}"
-        );
-        assert!(
-            names.iter().any(|n| n == "Keyboard"),
-            "expected 'Keyboard': {names:?}"
         );
     }
 }

@@ -98,7 +98,7 @@ use crate::arch::uefi::slint_backend::{
 };
 use crate::arch::uefi::slint_input::drain_keyboard_into_slint_window;
 use crate::toolkit_loop;
-use crate::ui_apps::{keyboard as kbd_app, unified_repl};
+use crate::ui_apps::unified_repl;
 #[cfg(feature = "doom")]
 use crate::ui_apps::doom;
 
@@ -194,7 +194,6 @@ fn active_for_app_index(idx: i32, slugs: &[String]) -> Option<Active> {
     let slug = slugs.get(idx as usize)?;
     match slug.as_str() {
         "unified-repl" => Some(Active::UnifiedRepl),
-        "keyboard" => Some(Active::Keyboard),
         #[cfg(feature = "doom")]
         "doom" => Some(Active::Doom),
         _ => None,
@@ -210,7 +209,8 @@ fn active_for_app_index(idx: i32, slugs: &[String]) -> Option<Active> {
 /// `Active::Doom` is gated behind `cfg(feature = "doom")` in
 /// `active_for_app_index` — when the feature is off the slug is
 /// filtered from the display list so the index is never reachable.
-/// The `Keyboard` variant (Track QQQQ #465) is always available.
+/// (#598: the former `Keyboard` variant is gone — the on-screen
+/// keyboard is now a panel docked inside UnifiedRepl, not an app.)
 ///
 /// Track #510: the prior `Hateoas` + `Repl` variants are folded into
 /// a single `UnifiedRepl` variant. Track #709 (Task U1): the
@@ -221,7 +221,6 @@ fn active_for_app_index(idx: i32, slugs: &[String]) -> Option<Active> {
 enum Active {
     Launcher,
     UnifiedRepl,
-    Keyboard,
     #[cfg(feature = "doom")]
     Doom,
 }
@@ -354,14 +353,6 @@ pub fn run(
     // callback.
     let launcher = AppLauncher::new()
         .expect("AppLauncher::new() failed under installed Slint platform");
-    // Track QQQQ #465: virtual keyboard. Always constructed (no
-    // feature gate); the on-screen QWERTY is the path to making
-    // AREST usable on a touch-only display under QEMU. Touch / pointer
-    // events on key cells push synthesised `DecodedKey::Unicode(c)`
-    // values onto the kernel keyboard ring (see
-    // `crate::ui_apps::keyboard::build_app` for the full flow).
-    let keyboard_app = kbd_app::build_app()
-        .expect("Keyboard construction failed");
     // Track VVV (#455 + #456): Doom is feature-gated. When the
     // feature is off, `doom_app` is never constructed and doom's
     // slug is filtered from the cell-derived display list so the
@@ -443,7 +434,6 @@ pub fn run(
         let nav = nav.clone();
         let launcher_weak = launcher.as_weak();
         let unified_weak = unified_repl_app.window.as_weak();
-        let keyboard_weak = keyboard_app.window.as_weak();
         #[cfg(feature = "doom")]
         let doom_weak = doom_app.window.as_weak();
         let slugs = app_slugs.clone();
@@ -455,11 +445,6 @@ pub fn run(
                 Active::UnifiedRepl => {
                     if let Some(unified) = unified_weak.upgrade() {
                         let _ = unified.show();
-                    }
-                }
-                Active::Keyboard => {
-                    if let Some(kw) = keyboard_weak.upgrade() {
-                        let _ = kw.show();
                     }
                 }
                 #[cfg(feature = "doom")]
@@ -594,7 +579,6 @@ pub fn run(
     // the unified REPL last so it wins the renderer's "active
     // component" slot.
     let _ = launcher.hide();
-    let _ = keyboard_app.window.hide();
     #[cfg(feature = "doom")]
     let _ = doom_app.window.hide();
 
@@ -659,9 +643,9 @@ pub fn run(
         // Updating one component's global instance updates the shared
         // global state for the whole rendered frame — but to be safe
         // (and to match the spec's "launcher AND the visible landing
-        // component") we set it on both. The Doom and Keyboard apps also
-        // bind the Theme global; we set those too so a future navigation
-        // into those apps sees the right mode without a separate toggle.
+        // component") we set it on both. The Doom app also
+        // binds the Theme global; we set that too so a future navigation
+        // into it sees the right mode without a separate toggle.
         {
             let pending = PENDING_THEME_MODE.swap(0, core::sync::atomic::Ordering::Relaxed);
             if let Some(mode) = pending_to_mode(pending) {
@@ -671,7 +655,6 @@ pub fn run(
                 };
                 launcher.global::<Theme>().set_mode(slint_mode);
                 unified_repl_app.window.global::<Theme>().set_mode(slint_mode);
-                keyboard_app.window.global::<Theme>().set_mode(slint_mode);
                 #[cfg(feature = "doom")]
                 doom_app.window.global::<Theme>().set_mode(slint_mode);
             }
@@ -731,25 +714,6 @@ pub fn run(
                 if drain_keyboard_with_esc_intercept(&unified_repl_app.window.window()) {
                     dispatch_shortcut(BACK_SHORTCUT_KEY, &nav, &launcher, || {
                         let _ = unified_repl_app.window.hide();
-                    });
-                }
-            }
-            // Track QQQQ #465: when the on-screen Keyboard is active
-            // we run the same Esc-intercept drain the other apps
-            // use. The Keyboard's own Slint window doesn't read
-            // keystrokes from the ring (it's the *producer* — taps
-            // on its key cells push synthesised entries onto the
-            // ring); the ring entries that reach the drain are
-            // either real keystrokes from a host keyboard (when
-            // present) or feedback loops where the user has somehow
-            // gotten the Keyboard to receive its own taps (not
-            // possible under the current single-Window pattern but
-            // worth defending against). Esc routes back via the
-            // unified `dispatch_shortcut` helper (Task U3b).
-            Active::Keyboard => {
-                if drain_keyboard_with_esc_intercept(&keyboard_app.window.window()) {
-                    dispatch_shortcut(BACK_SHORTCUT_KEY, &nav, &launcher, || {
-                        let _ = keyboard_app.window.hide();
                     });
                 }
             }
@@ -828,9 +792,6 @@ pub fn run(
             }
             Active::UnifiedRepl => {
                 drain_pointer_into_slint_window(&unified_repl_app.window.window());
-            }
-            Active::Keyboard => {
-                drain_pointer_into_slint_window(&keyboard_app.window.window());
             }
             #[cfg(feature = "doom")]
             Active::Doom => {
@@ -1546,7 +1507,7 @@ fn seed_command_shortcut_into_system() {
 ///   3. Ignores unrecognised actions (cell absent or key not mapped).
 ///
 /// This removes the previously-duplicated "hide/show/set-nav" block
-/// that appeared once per active-app arm (UnifiedRepl, Keyboard, Doom).
+/// that appeared once per active-app arm (UnifiedRepl, Doom).
 /// A single fact-driven lookup replaces three identical procedural
 /// bodies, exactly as the build directive requires.
 ///

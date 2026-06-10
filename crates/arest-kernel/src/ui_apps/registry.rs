@@ -389,18 +389,6 @@ fn launcher_apps() -> Vec<LauncherAppSpec> {
             slint_symbol: "Doom",
             description: "Doom WASM guest surface (#455 + #456, Track VVV; --features doom).",
         },
-        // From `ui/apps/Keyboard.slint` — touch-driven on-screen
-        // QWERTY (Track QQQQ #465). Always loadable; the
-        // foundation for AREST being usable on a touch-only
-        // display under QEMU. Touch / pointer events on key cells
-        // synthesise `DecodedKey::Unicode(c)` values onto the
-        // kernel keyboard ring via
-        // `arch::uefi::keyboard::push_keystroke`.
-        LauncherAppSpec {
-            name: "keyboard",
-            slint_symbol: "Keyboard",
-            description: "Touch-driven on-screen QWERTY virtual keyboard (#465, Track QQQQ).",
-        },
     ]
 }
 

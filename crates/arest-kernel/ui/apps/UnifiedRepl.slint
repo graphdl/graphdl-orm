@@ -54,13 +54,17 @@ import { List, ListItem } from "../components/List.slint";
 // these by name from `crate::arch::uefi::slint_backend::*`.
 import { AppLauncher } from "./AppLauncher.slint";
 import { Doom } from "./Doom.slint";
-import { Keyboard } from "./Keyboard.slint";
+// #598: the on-screen keyboard is no longer a separate Window the
+// launcher swaps to — it is a panel docked inside this surface (see
+// the right pane below), so the user sees the keys and the prompt at
+// the same time. The reusable layout lives in components/.
+import { KeyboardPanel } from "../components/KeyboardPanel.slint";
 
 // Re-export AppShell + Theme + the launcher apps so existing callsites
 // (slint_backend.rs's smoke test for AppShell, and `crate::ui_apps::
-// {launcher,doom,keyboard}` for the three side apps) keep compiling
-// without touching the generated symbol path.
-export { AppShell, Theme, ThemeMode, AppLauncher, Doom, Keyboard }
+// {launcher,doom}` for the side apps) keep compiling without touching
+// the generated symbol path.
+export { AppShell, Theme, ThemeMode, AppLauncher, Doom }
 
 export component UnifiedRepl inherits Window {
     // ---- Region layout props (#710 Task U2, EPIC #496) --------------
@@ -285,6 +289,25 @@ export component UnifiedRepl inherits Window {
     // `bookmarks`. Kernel resolves the row → label and jumps the
     // current cell to the bookmarked target.
     callback bookmark-goto(int);
+
+    // ---- Docked virtual keyboard (#598) ------------------------------
+
+    // Whether the on-screen keyboard panel is docked below the input
+    // row. Visible by default: the docked keyboard exists so a
+    // touch-only surface is usable out of the box, and the toggle row
+    // stays available to reclaim the vertical space. Pure UI state
+    // (the toggle button flips it); exposed in-out so the Rust glue
+    // could persist a preference later.
+    in-out property <bool> keyboard-visible: true;
+
+    // One tap on a virtual key. Payload is the codepoint string
+    // (same contract the former Keyboard Window exposed). Rust glue
+    // decodes the first char and pushes `DecodedKey::Unicode(c)`
+    // onto the kernel keyboard ring via
+    // `arch::uefi::keyboard::push_keystroke`, so every ring consumer
+    // (REPL pump, Esc intercept, Doom) sees virtual keys exactly as
+    // IRQ-decoded ones.
+    callback vk-key-pressed(string);
 
     // ---- Window chrome ----------------------------------------------
 
@@ -562,7 +585,18 @@ export component UnifiedRepl inherits Window {
                         // ---- Typed surface (cell-as-screen) -------
                         // min-height driven from `typed-surface-min-height`
                         // cell property (#710 Task U2).
-                        Rectangle {
+                        //
+                        // #598 typing mode: while the docked keyboard
+                        // is up, the typed-surface / Navigate /
+                        // Actions / Bookmarks cards collapse so the
+                        // pane is scrollback + prompt + keys — their
+                        // combined min-heights would otherwise push
+                        // the input row and the keyboard past the
+                        // 800px window (observed in the screendump
+                        // smoke). Hiding the keyboard restores the
+                        // full card stack; both worlds are one tap
+                        // apart, mirroring mobile keyboard behaviour.
+                        if !root.keyboard-visible : Rectangle {
                             min-height: root.typed-surface-min-height;
                             vertical-stretch: 1;
                             Card {
@@ -625,8 +659,8 @@ export component UnifiedRepl inherits Window {
                         // consumed/produced cells, SM → next-state).
                         // Each row is one clickable affordance —
                         // clicks jump the current cell to the chosen
-                        // target.
-                        VerticalLayout {
+                        // target. (Collapsed in #598 typing mode.)
+                        if !root.keyboard-visible : VerticalLayout {
                             min-height: 80px;
                             Card {
                                 width: 100%;
@@ -664,7 +698,8 @@ export component UnifiedRepl inherits Window {
                         // transition's event name. Disabled transitions
                         // (guard violations) render greyed out + show
                         // their violation text in a hover tooltip.
-                        VerticalLayout {
+                        // (Collapsed in #598 typing mode.)
+                        if !root.keyboard-visible : VerticalLayout {
                             min-height: 80px;
                             Card {
                                 width: 100%;
@@ -786,7 +821,8 @@ export component UnifiedRepl inherits Window {
                         // current cell to its target — this counts as
                         // a navigation event (pushes a fresh history
                         // entry), so the user can `back` out.
-                        VerticalLayout {
+                        // (Collapsed in #598 typing mode.)
+                        if !root.keyboard-visible : VerticalLayout {
                             min-height: 80px;
                             Card {
                                 width: 100%;
@@ -947,6 +983,27 @@ export component UnifiedRepl inherits Window {
                                     }
                                 }
                             }
+                        }
+
+                        // ---- Docked virtual keyboard (#598) --------
+                        // Slides in directly under the input row so
+                        // the prompt and the keys are visible at the
+                        // same time (the former fullscreen Keyboard
+                        // Window forced blind typing). The slim toggle
+                        // row stays visible either way so the panel's
+                        // vertical space can be reclaimed.
+                        HorizontalLayout {
+                            alignment: end;
+                            Button {
+                                text: root.keyboard-visible ? "Hide keyboard" : "Show keyboard";
+                                variant: ButtonVariant.ghost;
+                                clicked => {
+                                    root.keyboard-visible = !root.keyboard-visible;
+                                }
+                            }
+                        }
+                        if root.keyboard-visible : KeyboardPanel {
+                            key-pressed(s) => { root.vk-key-pressed(s); }
                         }
                     }
                 }
