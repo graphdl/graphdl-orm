@@ -208,6 +208,22 @@ pub const SYS_EXIT_GROUP: u64 = 231;
 /// graph (#398) and allocates a per-process fd.
 pub const SYS_OPENAT: u64 = 257;
 
+/// Linux x86_64 syscall number for the LEGACY `open(pathname, flags,
+/// mode)`. Source: `linux/arch/x86/include/uapi/asm/unistd_64.h:
+/// __NR_open` (= 2). Kernel-side it is exactly
+/// `openat(AT_FDCWD, ...)` (`fs/open.c`); busybox applets issue raw
+/// #2 even where libc would use #257, so the dispatcher adapts it
+/// onto `openat::handle` (getdents64-file-population — the `ls /`
+/// smoke died -ENOSYS here).
+pub const SYS_OPEN: u64 = 2;
+
+/// Linux x86_64 syscall number for `lstat(pathname, statbuf)`. Source:
+/// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_lstat` (= 6).
+/// Tier-1 models no symlinks, so it routes to the same path-classified
+/// `stat::handle_stat` (getdents64-file-population — busybox ls lstats
+/// every dirent for display classification).
+pub const SYS_LSTAT: u64 = 6;
+
 /// Linux x86_64 syscall number for `futex(uaddr, futex_op, val,
 /// timeout, uaddr2, val3)`. Source:
 /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_futex` (= 202).
@@ -475,8 +491,17 @@ pub fn dispatch(
         SYS_STAT => {
             // stat(pathname, statbuf) — fill struct stat at statbuf.
             // rdi = pathname pointer (const char *), rsi = statbuf pointer.
-            // Tier-1: no VFS — returns a char-device stub for any non-null
-            // path. Returns -EFAULT for null pathname or statbuf. Per #500.
+            // Path-classified since getdents64-file-population (directory /
+            // regular-file / char-device stub). Per #500.
+            stat::handle_stat(rdi, rsi)
+        }
+        SYS_LSTAT => {
+            // lstat(pathname, statbuf) — stat without following a final
+            // symlink. Tier-1 models no symlinks, so lstat ≡ stat
+            // (`fs/stat.c` differs only in LOOKUP_FOLLOW). busybox ls
+            // lstats every dirent getdents64 returns to classify it for
+            // display — without this arm each child prints
+            // "Function not implemented" instead of its name.
             stat::handle_stat(rdi, rsi)
         }
         SYS_FSTAT => {
@@ -488,6 +513,18 @@ pub fn dispatch(
             stat::handle_fstat(rdi, rsi)
         }
         SYS_OPENAT => openat::handle(rdi as i32, rsi, rdx as u32, r10 as u32),
+        SYS_OPEN => {
+            // open(pathname, flags, mode) — the LEGACY x86_64 open(2).
+            // Identical to openat(AT_FDCWD, pathname, flags, mode) per
+            // Linux (`fs/open.c:SYSCALL_DEFINE3(open)` forwards to
+            // do_sys_open(AT_FDCWD, ...)). musl routes libc open()
+            // through #257, but busybox applets issue raw #2 (the ls
+            // smoke traced `sys: #2(path, 0x98000, 0) = -ENOSYS` right
+            // after the directory stat) — without this arm `ls /` dies
+            // "Function not implemented" after stat says directory.
+            // rdi = pathname, rsi = flags, rdx = mode.
+            openat::handle(openat::AT_FDCWD, rdi, rsi as u32, rdx as u32)
+        }
         SYS_FUTEX => {
             // futex(uaddr, futex_op, val, timeout, uaddr2, val3) per
             // `vendor/musl/arch/x86_64/syscall_arch.h:__syscall6`.
