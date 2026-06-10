@@ -259,7 +259,7 @@ fn normalize_dir_path(path: &str) -> String {
 /// under `dir` (with a `/` boundary) — i.e. the File graph implies the
 /// directory exists. `/` is the parent of every File name (they are
 /// absolute), so it returns true whenever any File exists.
-fn path_has_file_children(dir: &str) -> bool {
+pub(crate) fn path_has_file_children(dir: &str) -> bool {
     crate::system::with_state(|state| path_has_file_children_in(dir, state))
         .unwrap_or(false)
 }

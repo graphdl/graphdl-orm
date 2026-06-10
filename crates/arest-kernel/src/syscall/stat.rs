@@ -100,6 +100,19 @@ pub const ENOENT: i64 = 2;
 /// character devices on Linux.
 pub const S_IFCHR: u32 = 0o020000;
 
+/// File mode bit: directory. Value: `0o040000`. Source:
+/// `<linux/stat.h>:S_IFDIR`. Returned for paths/fds the directory
+/// resolution recognizes (getdents64-file-population) — busybox ls
+/// stats its operand FIRST and only opens + getdents64s it when the
+/// mode says directory; the prior char-device stub made `ls /` print
+/// `/` as a plain name and exit.
+pub const S_IFDIR: u32 = 0o040000;
+
+/// File mode bit: regular file. Value: `0o100000`. Source:
+/// `<linux/stat.h>:S_IFREG`. Returned for exact `File_has_Name`
+/// matches.
+pub const S_IFREG: u32 = 0o100000;
+
 /// Linux x86_64 syscall number for `stat(pathname, statbuf)`. Source:
 /// `linux/arch/x86/include/uapi/asm/unistd_64.h:__NR_stat` (= 4).
 /// The vendored musl tree confirms at
@@ -239,8 +252,11 @@ pub fn handle_fstat(fd: u64, statbuf: u64) -> i64 {
     if statbuf == 0 {
         return -EFAULT;
     }
-    // Only recognise the three standard streams in tier-1. Any other
-    // fd returns -EBADF — there is no real fd table to consult yet.
+    // The three standard streams keep the tty stub. fds ≥ 3 consult the
+    // per-process fd table (getdents64-file-population): a Directory fd
+    // reports S_IFDIR (busybox ls fstats the directory it just opened —
+    // an -EBADF here would abort the listing), a File fd S_IFREG, a
+    // Synthetic fd the char-device stub. Unknown fds stay -EBADF.
     match fd {
         0 | 1 | 2 => {
             let s = tty_stat(fd);
@@ -249,7 +265,31 @@ pub fn handle_fstat(fd: u64, statbuf: u64) -> i64 {
             unsafe { core::ptr::write(statbuf as *mut Stat, s) };
             0
         }
-        _ => -EBADF,
+        _ => {
+            use crate::process::current_process_fd_table;
+            use crate::process::fd_table::FdEntry;
+            let mode = current_process_fd_table(|maybe| {
+                maybe.and_then(|table| match table.lookup(fd as i32) {
+                    Some(FdEntry::Directory { .. }) => Some(S_IFDIR | 0o755),
+                    Some(FdEntry::File { .. }) => Some(S_IFREG | 0o644),
+                    Some(FdEntry::Synthetic { .. }) => Some(S_IFCHR | 0o666),
+                    _ => None,
+                })
+            });
+            match mode {
+                Some(st_mode) => {
+                    let mut s = tty_stat(fd);
+                    s.st_mode = st_mode;
+                    if st_mode & S_IFDIR != 0 {
+                        s.st_size = 4096; // conventional directory size
+                    }
+                    // SAFETY: statbuf is non-null (checked above).
+                    unsafe { core::ptr::write(statbuf as *mut Stat, s) };
+                    0
+                }
+                None => -EBADF,
+            }
+        }
     }
 }
 
@@ -274,15 +314,37 @@ pub fn handle_fstat(fd: u64, statbuf: u64) -> i64 {
 /// the tier-1 identity mapping (see module-level note on the
 /// identity-mapped pointer model).
 pub fn handle_stat(pathname: u64, statbuf: u64) -> i64 {
-    // Guard both pointers; pathname != 0 is required even though we
-    // don't dereference it in tier-1 (it would be a logic error to
-    // stat the null path).
+    // Guard both pointers; pathname != 0 is required even though the
+    // fallback arm doesn't dereference it (it would be a logic error
+    // to stat the null path).
     if pathname == 0 || statbuf == 0 {
         return -EFAULT;
     }
-    // Tier-1 stub: return a character-device stat for any path.
-    // inode 1 (same as fd 0) — arbitrary synthetic value.
-    let s = tty_stat(0);
+    // Path classification (getdents64-file-population): resolve the
+    // pathname and report the REAL file type for the surfaces tier-1
+    // models — directory (the openat directory predicate: synthetic-fs
+    // children or File-graph prefix), regular file (exact
+    // File_has_Name match), else the legacy char-device stub. The stub
+    // fallback is deliberate: ash and friends stat console-adjacent
+    // and $PATH entries during boot, and an -ENOENT here would change
+    // working behavior — narrowing the stub to ENOENT is the #500
+    // VFS follow-up's call, not this slice's.
+    let mut s = tty_stat(0);
+    if let Ok(path) = crate::syscall::openat::read_pathname(pathname) {
+        let dir = if path.len() > 1 && path.ends_with('/') {
+            alloc::string::String::from(&path[..path.len() - 1])
+        } else {
+            path.clone()
+        };
+        if crate::synthetic_fs::list_children(&dir).is_some()
+            || crate::syscall::openat::path_has_file_children(&dir)
+        {
+            s.st_mode = S_IFDIR | 0o755;
+            s.st_size = 4096; // conventional directory size
+        } else if crate::syscall::openat::lookup_file_cell_id(&path).is_some() {
+            s.st_mode = S_IFREG | 0o644;
+        }
+    }
     // SAFETY: statbuf is non-null (checked above) and points to a
     // valid buffer in the tier-1 identity-mapped address space.
     unsafe { core::ptr::write(statbuf as *mut Stat, s) };
