@@ -7378,6 +7378,13 @@ fn render_subscription_delivers_via_notify_effect() {
             &[("Render Subscription", "sub-3"), ("Noun", "Task")]);
         let s = push(s, "Render_Subscription_renders_via_Render_Target",
             &[("Render Subscription", "sub-3"), ("Render Target", "pdf")]);
+        // sub-4: COLLECTION subscription (no watched id) — delivers the
+        // mutated member on same-noun mutations (fall-through) and the
+        // entity-less structural render on cross-noun dirtiness.
+        let s = push(s, "Render_Subscription_is_for_Noun",
+            &[("Render Subscription", "sub-4"), ("Noun", "Task")]);
+        let s = push(s, "Render_Subscription_renders_via_Render_Target",
+            &[("Render Subscription", "sub-4"), ("Render Target", "html")]);
         s
     };
 
@@ -7392,13 +7399,16 @@ fn render_subscription_delivers_via_notify_effect() {
     crate::command::deliver_render_subscriptions(&d, "Task", "task-1", &vp);
 
     let captured = CAPTURED.lock().unwrap().clone();
-    assert_eq!(captured.len(), 1,
-        "exactly sub-1 delivers (sub-2 watches another id, sub-3's \
-         target has no rendering); got {:?}", captured);
-    assert!(captured[0].contains("render-subscription sub-1 Task task-1"),
-        "payload names the subscription + entity: {}", captured[0]);
-    assert!(captured[0].contains("value=\"fresh value\""),
-        "payload carries the FRESH rendering: {}", captured[0]);
+    assert_eq!(captured.len(), 2,
+        "sub-1 (watching task-1) and sub-4 (collection, no watch) deliver; \
+         sub-2 watches another id, sub-3's target has no rendering; got {:?}",
+        captured);
+    assert!(captured.iter().any(|m| m.contains("render-subscription sub-1 Task task-1")
+            && m.contains("value=\"fresh value\"")),
+        "sub-1's payload names the entity + carries the FRESH rendering: {:?}",
+        captured);
+    assert!(captured.iter().any(|m| m.contains("render-subscription sub-4 Task task-1")),
+        "the collection sub receives the mutated member's render: {:?}", captured);
 
     // A different noun delivers nothing (the dirty signal is the
     // mutation's own noun/id).
@@ -7424,16 +7434,20 @@ fn render_subscription_delivers_via_notify_effect() {
         ["Fact_Type_has_Format".to_string()].into_iter().collect();
     crate::command::deliver_cross_noun_subscriptions(&d, &touched_relevant, "Fact Type");
     let cross = CAPTURED.lock().unwrap().clone();
-    // A view-read cell change re-renders EVERY instance watcher of the
-    // affected views (a Format flip re-widgets all of them) — sub-1 AND
-    // sub-2 deliver; sub-3 (no rendering for its target) stays silent.
-    assert_eq!(cross.len(), 2,
-        "both instance watchers re-deliver on a view-read cell change; got {:?}",
+    // A view-read cell change re-renders EVERY watcher of the affected
+    // views (a Format flip re-widgets all of them): both instance
+    // watchers + the collection sub (entity-less structural render);
+    // sub-3 (no rendering for its target) stays silent.
+    assert_eq!(cross.len(), 3,
+        "both instance watchers + the collection sub re-deliver; got {:?}",
         cross);
     assert!(cross.iter().any(|m| m.contains("sub-1 Task task-1")),
         "sub-1 delivery targets its watched entity: {:?}", cross);
     assert!(cross.iter().any(|m| m.contains("sub-2 Task task-OTHER")),
         "sub-2 delivery targets ITS watched entity: {:?}", cross);
+    assert!(cross.iter().any(|m| m.contains("render-subscription sub-4 Task :")
+            && m.contains("data-entity=\"\"")),
+        "the collection sub gets the entity-less structural render: {:?}", cross);
 
     CAPTURED.lock().unwrap().clear();
     let touched_irrelevant: hashbrown::HashSet<String> =

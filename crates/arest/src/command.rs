@@ -5443,40 +5443,61 @@ pub fn deliver_render_subscriptions(
                 continue;
             }
         }
-        let Some(target) = lookup(
-            "Render_Subscription_renders_via_Render_Target", "Render Target", sub)
-        else { continue };
-        let Some(body) = view.representations.get(target.as_str()) else {
-            diag!("[render-subscription] {} wants target '{}' but no \
-                   rendering was produced (no installed body?)", sub, target);
-            continue;
-        };
-        let tag = |name: &str, v: &str| ast::Object::seq(alloc::vec![
-            ast::Object::atom(name), ast::Object::atom(v),
-        ]);
-        let outcome = if let Some(uri) = lookup(
-            "Render_Subscription_delivers_to_callback_URI", "callback URI", sub)
-        {
-            ast::apply(
-                &ast::Func::Platform("http_fetch".to_string()),
-                &ast::Object::seq(alloc::vec![
-                    tag("url", &uri), tag("method", "POST"), tag("body", body),
-                ]),
-                d,
-            )
-        } else {
-            ast::apply(
-                &ast::Func::Platform("notify".to_string()),
-                &ast::Object::seq(alloc::vec![tag("message", &alloc::format!(
-                    "render-subscription {} {} {}: {}", sub, noun, entity_id, body
-                ))]),
-                d,
-            )
-        };
-        if matches!(outcome, ast::Object::Bottom) {
-            diag!("[render-subscription] delivery for '{}' bottomed \
-                   (deontic — mutation unaffected)", sub);
-        }
+        deliver_to_subscription(d, sub, noun, entity_id, view);
+    }
+}
+
+/// Send ONE subscription its rendering: pick the sub's Render Target
+/// key out of `view.representations`, route via callback URI
+/// (`http_fetch` POST) or the `notify` effect. Deontic — a Bottom
+/// outcome logs and returns. Shared by the same-noun walker above and
+/// the cross-noun walker (which must deliver per-sub, not re-fan
+/// across every matching sub per entity).
+fn deliver_to_subscription(
+    d: &ast::Object, sub: &str, noun: &str, entity_id: &str, view: &ViewProjection,
+) {
+    let lookup = |cell: &str, role: &str| -> Option<String> {
+        ast::fetch_cell_seq(cell, d).as_seq().and_then(|facts| {
+            facts.iter().find_map(|f| {
+                (ast::binding(f, "Render Subscription") == Some(sub))
+                    .then(|| ast::binding(f, role).map(String::from))
+                    .flatten()
+            })
+        })
+    };
+    let Some(target) = lookup(
+        "Render_Subscription_renders_via_Render_Target", "Render Target")
+    else { return };
+    let Some(body) = view.representations.get(target.as_str()) else {
+        diag!("[render-subscription] {} wants target '{}' but no \
+               rendering was produced (no installed body?)", sub, target);
+        return;
+    };
+    let tag = |name: &str, v: &str| ast::Object::seq(alloc::vec![
+        ast::Object::atom(name), ast::Object::atom(v),
+    ]);
+    let outcome = if let Some(uri) = lookup(
+        "Render_Subscription_delivers_to_callback_URI", "callback URI")
+    {
+        ast::apply(
+            &ast::Func::Platform("http_fetch".to_string()),
+            &ast::Object::seq(alloc::vec![
+                tag("url", &uri), tag("method", "POST"), tag("body", body),
+            ]),
+            d,
+        )
+    } else {
+        ast::apply(
+            &ast::Func::Platform("notify".to_string()),
+            &ast::Object::seq(alloc::vec![tag("message", &alloc::format!(
+                "render-subscription {} {} {}: {}", sub, noun, entity_id, body
+            ))]),
+            d,
+        )
+    };
+    if matches!(outcome, ast::Object::Bottom) {
+        diag!("[render-subscription] delivery for '{}' bottomed \
+               (deontic — mutation unaffected)", sub);
     }
 }
 
@@ -5539,8 +5560,14 @@ pub fn deliver_cross_noun_subscriptions(
         if sub_noun == mutated_noun {
             continue; // same-noun hook already delivered
         }
-        // Instance subscriptions only in this slice — a collection
-        // subscription (no watched id) is slice (b).
+        // Collection subscriptions (no watched id) re-render the view
+        // STRUCTURE for the noun (entity-less: view_via_rho is
+        // structure-only and ignores the id; fields empty) — the
+        // subscriber treats it as a refresh signal. Instance
+        // subscriptions re-render their watched entity. (Same-noun
+        // collection delivery — the mutated member's fresh instance
+        // render — already falls out of deliver_render_subscriptions'
+        // no-watch fall-through on the mutation paths.)
         let watched = ast::fetch_cell_seq("Render_Subscription_watches_Entity_Id", d)
             .as_seq()
             .and_then(|facts| facts.iter().find_map(|f| {
@@ -5548,7 +5575,7 @@ pub fn deliver_cross_noun_subscriptions(
                     .then(|| ast::binding(f, "Entity Id").map(String::from))
                     .flatten()
             }));
-        let Some(entity_id) = watched else { continue };
+        let entity_id = watched.unwrap_or_default();
         let Some(mut vp) = view_via_rho(d, sub_noun, &entity_id) else { continue };
         let fields: hashbrown::HashMap<String, String> = ast::apply(
             &ast::Func::Platform(alloc::format!("get_noun:{}", sub_noun)),
@@ -5567,7 +5594,10 @@ pub fn deliver_cross_noun_subscriptions(
         let transitions = hateoas_via_rho(d, sub_noun, &entity_id, status.as_deref());
         let reps = render_via_targets(d, &vp, &entity_id, sub_noun, &fields, &transitions);
         vp.representations = reps;
-        deliver_render_subscriptions(d, sub_noun, &entity_id, &vp);
+        // Per-SUB delivery — this loop already selected the recipient;
+        // fanning through deliver_render_subscriptions here would
+        // re-deliver every matching sub once per outer row (N×M dupes).
+        deliver_to_subscription(d, sub, sub_noun, &entity_id, &vp);
     }
 }
 
