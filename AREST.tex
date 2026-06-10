@@ -33,16 +33,13 @@
 \maketitle
 
 \begin{abstract}
-Domain knowledge enters software as natural language requirements, is re-encoded as schemas, validation logic, state machines, and API routes, and drifts out of sync in production. The informal layer between specification and execution is where bugs live and where automated agents hallucinate. We show that a single set of FORML\,2 declarations can define a database schema, constraint rules, state machine workflows, and a REST API with hypermedia navigation, producing a complete application from domain facts alone. We formalize this as AREST, a Backus AST system~\cite{backus78} whose definitions are compiled FORML\,2 readings~\cite{halpin01} and whose state is Codd's named set~\cite{codd70} of ORM\,2 elementary facts. REST endpoints are applications of a single system function. Ingesting new readings is self-modification. Five theorems establish that the grammar is unambiguous, that specifications and executables are the same object, that state transfer is complete, that HATEOAS links are projections of the population, and that every value in the API is derived from facts. Together, they eliminate the informal layer entirely.
+Domain knowledge enters software as natural language requirements, is re-encoded as schemas, validation logic, state machines, and API routes, and drifts out of sync in production. The informal layer between specification and execution is where bugs live and where automated agents hallucinate. We show that a single set of FORML\,2 declarations can define a database schema, constraint rules, state machine workflows, and a REST API with hypermedia navigation, producing a complete application from domain facts alone. We formalize this as AREST, a Backus AST system~\cite{backus78} whose definitions are compiled FORML\,2 readings~\cite{halpin01} and whose state is Codd's named set~\cite{codd70} of ORM\,2 elementary facts. REST endpoints are applications of a single system function. Ingesting new readings is self-modification. Five theorems establish that the grammar is unambiguous, that specifications and executables are the same object up to a computable canonical form, that state transfer is complete, that HATEOAS links are projections of the population, and that every value in the API is derived from facts. Together they do not eliminate informality so much as corner it: everything informal is localized to the registered platform layer, an enumerable surface that is itself a queryable fact set.
 \end{abstract}
 
-% =====================================================================
-% ACT 1: THE GAP
-% =====================================================================
 
 \section{Introduction}
 
-Software is increasingly written and consumed by agents. An LLM writing code produces a specification it cannot verify against the resulting executable; an LLM reading an API navigates documentation that may have drifted from the endpoints. In both cases the informal layer between specification and execution is where the agent hallucinates. The rest of this paper shows why that layer need not exist.
+Software is increasingly written and consumed by agents. An LLM writing code produces a specification it cannot verify against the resulting executable; an LLM reading an API navigates documentation that may have drifted from the endpoints. In both cases the informal layer between specification and execution is where the agent hallucinates. The rest of this paper shows how that layer is cornered: compiled out of the domain entirely, and localized at the platform boundary to a surface the system itself enumerates.
 
 Domain knowledge begins in someone's head. It is re-encoded as schemas, validation logic, state machines, and API routes. When these are distinct artifacts, their equivalence is not preserved by construction.
 
@@ -52,9 +49,6 @@ AREST identifies what was never separate to begin with. A FORML\,2 reading is si
 
 Three terms carry overloaded abbreviations. \emph{AST} follows Backus's usage (Applicative State Transition, 1978), not the compiler term. \emph{ORM} follows Halpin's usage (Object-Role Modeling, 2008), not the persistence pattern. \emph{FP} follows Backus's usage (Function-level Programming), not the broader tradition. \emph{FFP} is Backus's extension of FP with named definitions and a representation function $\rho$ that maps objects to the functions they denote~\cite[Sec.\,13]{backus78}.
 
-% =====================================================================
-% ACT 2: THE INSIGHT
-% =====================================================================
 
 \section{Definition}
 
@@ -124,7 +118,7 @@ The response includes links derived from $P'$:
       "method": "POST" } } }
 \end{lstlisting}
 
-\noindent Following ``place'' advances the state machine. The new representation contains $\{\mathit{ship}\}$, not $\{\mathit{place}\}$, because the status is now Placed. If a second command assigns a different Customer to the same Order, the restriction produces a non-empty violation set and the command is rejected. The violation is returned as the original reading.
+\noindent Following ``place'' advances the state machine. The new representation contains $\{\mathit{ship}\}$, not $\{\mathit{place}\}$, because the status is now Placed. If a second command assigns a different Customer to the same Order, the restriction produces a non-empty violation set and the command is rejected. The violation is returned as the canonical reading of the violated constraint.
 
 The constraint, the state machine, the API response, and the HATEOAS links above are different views of the same data. The mechanism that makes this possible is metacomposition. A fact type~\cite[Ch.\,3]{halpin01} is a constructor of roles~\cite[Sec.\,11.2.4]{backus78}. Populate the roles with instances and you get a fact: $\langle\mathit{ft}, o_1, \ldots, o_n\rangle$. Metacomposition~\cite[Sec.\,13.3.2]{backus78} resolves a fact by looking up its fact type:
 \begin{align}
@@ -132,9 +126,6 @@ The constraint, the state machine, the API response, and the HATEOAS links above
 \end{align}
 The fact is a function: $\lambda f.\, f(o_1, \ldots, o_n)$, accepting an operation and applying it to its own objects. The constraint reading, the state machine transition, and the API response above are all $\rho$-applications over the same facts. The sections that follow show why they cannot be anything else.
 
-% =====================================================================
-% ACT 3: THE MACHINE
-% =====================================================================
 
 \section{The System Function}
 
@@ -154,14 +145,14 @@ A \textsc{Create} command:
 \begin{align}
 \mathit{create} &= \mathit{emit} \circ \mathit{validate} \circ \mathit{derive} \circ \mathit{resolve} \label{eq:create}
 \end{align}
-$\mathit{resolve}$ determines identity from the reference scheme~\cite[Ch.\,5]{halpin01}. $\mathit{derive}$ forward-chains derivation rules to the least fixed point. $\mathit{validate}$ applies every constraint as a restriction over the population, producing violation sets. $\mathit{emit}$ always runs. An alethic violation rejects ($D' = D$). A deontic violation warns but succeeds ($D' = D''$). The violation message is the original reading (Corollary~\ref{cor:verbalize}).
+$\mathit{resolve}$ determines identity from the reference scheme~\cite[Ch.\,5]{halpin01}. $\mathit{derive}$ forward-chains derivation rules to the least fixed point. $\mathit{validate}$ applies every constraint as a restriction over the population, producing violation sets. $\mathit{emit}$ always runs. An alethic violation rejects ($D' = D$). A deontic violation warns but succeeds ($D' = D''$). The violation message is the canonical reading (Corollary~\ref{cor:verbalize}).
 
 A state machine processes events chronologically:
 \begin{align}
 \mathit{machine}(s_0, E) &= \mathit{foldl}\;\mathit{transition}\;s_0\;(\mathit{order}_\tau\,E) \label{eq:sm} \\
 \mathit{transition}(s, e) &= (p \to \bar{s'} ;\; \bar{s})\!:\!\langle s, e \rangle \label{eq:trans}
 \end{align}
-The transition function is a chain of conditions~\cite[Sec.\,11.2.4]{backus78}: $p$ tests whether $\langle s, e\rangle$ matches a declared transition, $f$ returns the target state, $g$ tries the next or returns $\bar{s}$ as fallback. $\mathit{order}_\tau$ sorts $E$ by each event's occurrence timestamp $\tau$---present for every recorded fact, since a fact \emph{is} an event. Equation~(\ref{eq:sm}) is \emph{reconstruction}: a replay of the whole stream from the initial state, for migration and audit. The \emph{live} status is not recomputed on each read but maintained incrementally---each new event folds forward from the stored status (the cell fold,~\ref{eq:cellfold}). Both are the one fold, differing only in base: $s_0$ over the ordered stream, or the stored state over the new events. Neither has side effects.
+The transition function is a chain of conditions~\cite[Sec.\,11.2.4]{backus78}: $p$ tests whether $\langle s, e\rangle$ matches a declared transition, $f$ returns the target state, $g$ tries the next or returns $\bar{s}$ as fallback. $\mathit{order}_\tau$ sorts $E$ by each event's occurrence timestamp $\tau$, present for every recorded fact, since a fact \emph{is} an event. Equation~(\ref{eq:sm}) is \emph{reconstruction}: a replay of the whole stream from the initial state, for migration and audit. The \emph{live} status is not recomputed on each read but maintained incrementally; each new event folds forward from the stored status (the cell fold,~\ref{eq:cellfold}). Both are the one fold, differing only in base: $s_0$ over the ordered stream, or the stored state over the new events. Neither has side effects.
 
 \smallskip\noindent\textbf{Facts as events.} Creating a fact fires an event: a recorded fact \emph{is} an event and a fact type \emph{is} an event type (each a subtype), so the event carries the fact's occurrence timestamp and its arguments are the role bindings. A transition that declares its trigger as a fact type fires automatically when that fact enters $P$. The metamodel reifies this as \emph{Event caused Transition in State Machine}, joining each event to the transitions its event type triggers; the machine's \emph{currently-in Status} is the latest-wins fold of those transitions per machine, maintained incrementally. Reconstruction~(\ref{eq:sm}) is that fold replayed from $s_0$; the derivations expose the fold's inputs and output as ordinary facts subject to constraints, derivation rules, and HATEOAS projection. During $\mathit{create}$~(\ref{eq:create}), $\mathit{resolve}$ and $\mathit{derive}$ push facts into $P$; each produces an event that the machine fold~(\ref{eq:sm}) consumes. An entity whose facts satisfy all outgoing transition guards advances from its initial status to its terminal status in a single $\mathit{SYSTEM}$ call. External events from a message queue, a webhook, or a peer enter the same stream without requiring a local fact: an inbound webhook is itself a fact (\emph{Webhook Event Type yields Fact Type with Role from JSON Path}), and the runtime materializes the yielded facts into $P$ before the fold runs. The machine does not distinguish between fact-fired and externally fired events; both are elements of $E$ in the fold~(\ref{eq:sm}).
 
@@ -201,9 +192,6 @@ For each cell $\langle\mathit{CELL}, n, c\rangle$ in $D$, at most one $\mu$ appl
 
 \noindent RMAP assigns each entity to its own cell whose fold is independent. A single-threaded runtime satisfies Definition~\ref{def:isolation} trivially. A distributed system requires one writer per cell. Without isolation, two concurrent $\mathit{create}$ operations on the same cell may both pass $\mathit{validate}$ against stale $P$ and produce inconsistent state without an error.
 
-% =====================================================================
-% ACT 4: THE ALGEBRA
-% =====================================================================
 
 \section{Formal Foundations}
 
@@ -293,7 +281,7 @@ R \cdot S &\equiv \pi_{1s}(R \mathbin{*} S) \label{eq:rcomp} \\
 \end{align}
 \noindent where $s_{\mathit{sh}}$ selects the shared roles. $P$ is a named set of relations in normal form (ORM\,2 elementary facts are 5NF by construction~\cite[Ch.\,12]{halpin01}). Halpin shows that $\theta_1 = \{\text{projection, natural join, restriction, tie}\}$ is adequate for the named set of ORM\,2 elementary facts~\cite[Ch.\,12]{halpin01}. The combining forms that query the population are the same combining forms that evaluate constraints and derive facts. There is no separate query language.
 
-\subsection{Execution Semantics}
+\subsection{Execution Semantics}\label{sec:exec}
 
 $\mu$ evaluates by applicative-order $\beta$-reduction~\cite[Sec.\,13.3.1]{backus78}, repeatedly replacing $(x\!:\!y)$ with $(\rho\,x)\!:\!y$ under definitions $D$. Three constraints govern execution:
 \begin{enumerate}[nosep]
@@ -302,17 +290,16 @@ $\mu$ evaluates by applicative-order $\beta$-reduction~\cite[Sec.\,13.3.1]{backu
 \item \textbf{Derivation:} forward chaining, monotonic, evaluated to the least fixed point per request. Derivation only adds facts over finite $P$; the fixed point exists by Knaster-Tarski and is reached in $\leq |P_{\max}| - |P|$ steps. The derivation chain is recorded and available on demand.
 \end{enumerate}
 
+\smallskip\noindent\textbf{Remark} (Cost model). The fixed point is the specification, not the execution plan. Because $P$ is append-only (deletion is a terminal state, Corollary~\ref{cor:delete}), $\mathit{lfp}(F_S, \cdot)$ admits maintenance as a materialized view across the event stream rather than recomputation per request: insertion-only semi-naive evaluation fires a rule only on the previous round's delta~\cite{bancilhon86}, and the one controlled non-monotonicity, the current-status projection a new event logically retracts, is classical incremental view maintenance~\cite{gupta93}. Per-request cost is then proportional to the new derivations and the representation touched, not to a re-chase of the partition (which RMAP already confines); Knaster-Tarski guarantees the cheaper path agrees with the specification.
+
 The system operates over facts~$(P)$, computations~$(O$ via $\rho)$, and inputs~$(I)$. Time is an input fact, not hidden state. Effects are directives in the output. Identity follows from the reference scheme; $\mathit{resolve}$~(\ref{eq:create}) applies it. The world assumption per noun~\cite[Ch.\,7]{halpin01} governs incompleteness: under CWA, a fact not in $P$ is false; under OWA, it is unknown.
 
-\smallskip\noindent\textbf{Remark} (World assumption on populating functions). All populating functions are runtime functions registered in $\mathit{DEFS}$. A function that exhaustively enumerates its domain operates under CWA. One that cannot operates under OWA. Deontic constraints over OWA-populated facts are sound but not complete: a reported violation is genuine, but the absence of a violation is not a guarantee.
+\smallskip\noindent\textbf{Remark} (World assumption on populating functions). All populating functions are runtime functions registered in $\mathit{DEFS}$. A function that exhaustively enumerates its domain operates under CWA. One that cannot operates under OWA. Deontic constraints over OWA-populated facts are sound but not complete: a reported violation is genuine, but the absence of a violation is not a guarantee. This is the population-side view of the registered boundary that Corollary~\ref{cor:boundary} makes enumerable.
 
-% =====================================================================
-% ACT 5: THE PROOF
-% =====================================================================
 
 \section{Properties}
 
-The five theorems form a chain. Each depends on the previous one and eliminates one source of failure in the path from domain knowledge to running software.
+The five theorems form a chain. Each depends on the previous one and eliminates one source of failure in the path from domain knowledge to running software. They are not all of one register, and we say so up front: Theorems~\ref{thm:grammar}--\ref{thm:hateoas} have proof content, while Theorem~\ref{thm:derive} is true by construction (a closure invariant of the definition of $\mathit{repr}$) and is stated in the chain because it is the guarantee the agent argument consumes. The genre is Fielding's: an architecture justified by exhibiting its own construction.
 
 \begin{theorem}[Grammar Unambiguity]\label{thm:grammar}
 Let $N$ be a declared set of object type names and $F$ a declared set of predicate readings, such that no element of $N$ contains a formal item of the grammar as a substring. Then each FORML\,2 sentence over $(N, F)$ has exactly one parse.
@@ -328,7 +315,7 @@ $[\mathit{modal}] \;\; \mathit{quant}_1 \;\; n_1 \;\; r \;\; \mathit{quant}_2 \;
 \noindent where $\mathit{modal} \in \{$``It is obligatory that'', ``It is forbidden that'', ``It is permitted that'', ``It is impossible that'', ``It is possible that'', $\varepsilon\}$; $\mathit{quant}_1 \in \{$``Each'', ``For each'', ``the same'', ``No'', $\varepsilon\}$; $\mathit{quant}_2 \in \{$``at most one'', ``some'', ``exactly one'', ``at least $k$ and at most $m$'', ``more than one'', ``no'', $\varepsilon\}$. Noun positions are resolved by longest-first matching. Each structural position admits exactly one parse because (i)~modal prefixes are pairwise non-overlapping, (ii)~quantifier phrases are pairwise distinct, (iii)~no $n \in N$ contains a formal item as a substring, and (iv)~longest-first matching is deterministic. The constraint kind is determined by $(\mathit{quant}_1, \mathit{quant}_2)$.
 
 \smallskip\noindent
-\textit{(b) Conditional constraints.} The ``If\ldots then'' frame splits unambiguously on ``then''. Ring constraints are identified by all noun bases being the same type. Subset constraints by existential ``some'' in the antecedent and anaphoric ``that'' in the consequent. Derivation rules occupy the remainder.
+\textit{(b) Conditional constraints.} The ``If\ldots then'' frame splits unambiguously on ``then''. Ring constraints are identified by all noun bases being the same type. Subset constraints by existential ``some'' in the antecedent and anaphoric ``that'' in the consequent. Derivation rules occupy the remainder, and ``remainder'' is a partition claim, not a default: the two constraint markers are pairwise-disjoint syntactic criteria, a conditional sentence carrying neither marker parses as a derivation rule only if its consequent matches a declared predicate reading, and a conditional matching none of the three is rejected by the compiler rather than guessed at. The accepted conditional sentences are partitioned by construction.
 
 \smallskip\noindent
 \textit{(c) Multi-clause constraints.} Keyword-delimited: ``if and only if'' (EQ), ``exactly one of the following holds'' (XO), ``at most one of the following holds'' (XC), ``at least one of the following holds'' (OR). The keyword is unambiguous.
@@ -340,18 +327,20 @@ The three families are distinguished by their sentence prefix at position~(1). W
 \noindent The hypothesis on $N$ is enforced by the compiler, which rejects any declared name containing a formal item of the grammar as a substring.
 
 \begin{theorem}[Specification Equivalence]\label{thm:spec}
-Let $\mathit{parse}: R \to \Phi$ and $\mathit{compile}: \Phi \to O$ be injective, with $R$ the set of FORML\,2 readings, $\Phi$ the set of FOL formulas, and $O$ the set of FFP objects. Then:
+Let $\mathit{parse}: R \to \Phi$ and $\mathit{compile}: \Phi \to O$ be the parse and compile maps, with $R$ the set of FORML\,2 readings over $(N, F)$, $\Phi$ the set of FOL formulas, and $O$ the set of FFP objects. Define \emph{reading equivalence} as the kernel of the pipeline: $r_1 \sim r_2$ iff $\mathit{compile}(\mathit{parse}(r_1)) = \mathit{compile}(\mathit{parse}(r_2))$. Then $\mathit{compile} \circ \mathit{parse}$ is injective on $R/{\sim}$, and the quotient has a computable section that lands inside the grammar: with $\mathit{verbalize}$ the Halpin--Curland primary-reading verbalization~\cite{halpin06},
 \begin{align}
-\mathit{parse}^{-1} \circ\, \mathit{compile}^{-1} \circ\, \mathit{compile} \circ \mathit{parse} &= \mathit{id}_R \label{eq:spec}
+\mathit{nf} &= \mathit{verbalize} \circ \mathit{compile} \circ \mathit{parse} \label{eq:spec}
 \end{align}
-and $\rho(\mathit{compile}(\mathit{parse}(r)))$ is the executable for every $r \in R$.
+is an idempotent normalizer ($\mathit{nf} \circ \mathit{nf} = \mathit{nf}$) with $\mathit{nf}(r) \sim r$ for every $r \in R$, and $\rho(\mathit{compile}(\mathit{parse}(r)))$ is the executable for every $r \in R$.
 \end{theorem}
 
 \begin{proof}
-$\mathit{parse}$ is injective by Theorem~\ref{thm:grammar}. $\mathit{compile}$ is injective: each constraint kind compiles to a restriction~(\ref{eq:restrict}) with a predicate from one of two families parameterized by distinct tuples. Both have left inverses ($\mathit{compile}^{-1}$ is Halpin and Curland's verbalization algorithm~\cite{halpin06}); composing yields $\mathit{id}_R$. Executability: $\rho$ maps the compiled object to a function by~\cite[Sec.\,13.4]{backus78}.
+Injectivity on the quotient is immediate: $R/{\sim}$ is the kernel quotient of $\mathit{compile} \circ \mathit{parse}$. The content is the section. $\mathit{parse}$ is total and well-defined on $R$ by Theorem~\ref{thm:grammar}: one parse \emph{per sentence}, not one sentence per formula. Inverse readings such as ``Order is placed by Customer'' / ``Customer places Order'' are distinct elements of $R$ with the same compiled object, which is exactly what $\sim$ absorbs. $\mathit{compile}$ maps each parse to a restriction~(\ref{eq:restrict}) whose predicate comes from one of two families parameterized by the constraint tuple. $\mathit{verbalize}$ emits the primary reading of a compiled object~\cite{halpin06}; the primary reading is a sentence of the grammar, so it parses by Theorem~\ref{thm:grammar}, and it re-compiles to the object it verbalizes. Hence $\mathit{nf}(r) \sim r$, $\mathit{nf}$ fixes exactly the canonical readings, and $\mathit{nf} \circ \mathit{nf} = \mathit{nf}$. Executability: $\rho$ maps the compiled object to a function by~\cite[Sec.\,13.4]{backus78}.
 \end{proof}
 
-\noindent\textbf{Remark} (Surjectivity). $\mathit{compile}$ is not surjective. Runtime-registered functions occupy the complement. FORML\,2 readings cover the domain layer; registered functions cover the platform layer. Together they span $\mathit{DEFS}$.
+\noindent The executable is the equivalence class; the primary reading is its canonical name; surface variants are presentations of the same object. ``Specification and executable are the same object'' is exact in this sense.
+
+\smallskip\noindent\textbf{Remark} (Surjectivity). $\mathit{compile}$ is not surjective. Runtime-registered functions occupy the complement. FORML\,2 readings cover the domain layer; registered functions cover the platform layer. Together they span $\mathit{DEFS}$, and the partition itself is a fact (Corollary~\ref{cor:boundary}).
 
 \begin{theorem}[Completeness of State Transfer]\label{thm:complete}
 Let $F_S : 2^P \to 2^P$ be the monotonic operator that applies all derivation rules in schema $S$ to a population, and let $C_S$ be the set of constraint objects in $S$. Under Definition~\ref{def:isolation}, $\mathit{create}$~(\ref{eq:create}) applied to input $I$ and state $D$ produces $\langle o, D'\rangle$ such that:
@@ -404,6 +393,8 @@ The full link set:
 \textit{(b)} Each component of $\mathit{nav}$ is a projection over a restriction. The predicate composes $\mathit{eq}$ with selector and constant, all primitives from Table~\ref{tab:ffp}. All components of $\mathit{links}_{\mathit{full}}$ are $\theta_1$ operations on $S$ and $P$.
 \end{proof}
 
+\noindent\textbf{Remark} (Prior formal models). Finite-state models of RESTful systems exist~\cite{zuzak11}; they model the client's traversal as a machine over received representations. Theorem~\ref{thm:hateoas} works on the other side of the interface: it derives the affordance set itself from the schema's uniqueness-constraint structure and the population, the part of hypermedia Fielding left informal.
+
 \begin{theorem}[Derivability]\label{thm:derive}
 Define the \emph{representation} of an entity $e$ in population $P$ under schema $S$ as:
 \begin{align*}
@@ -420,10 +411,20 @@ Each component is a $\rho$-application by construction. Selectors extract attrib
 \end{proof}
 
 \begin{corollary}[Violation Verbalization]\label{cor:verbalize}
-If $(\rho\,c)\!:\!P'' \neq \emptyset$ for constraint $c$ compiled from reading $r$, the violation output is $\mathit{compile}^{-1}(c)$, recovering $r$ by Theorem~\ref{thm:spec}. The error message is the original reading.
+If $(\rho\,c)\!:\!P'' \neq \emptyset$ for constraint $c$ compiled from reading $r$, the violation output is $\mathit{verbalize}(c) = \mathit{nf}(r)$ (Theorem~\ref{thm:spec}). The error message is the canonical reading, deterministic regardless of which surface variant of $r$ the author typed.
 \end{corollary}
 
 \noindent Halpin and Curland~\cite{halpin06} give the automated verbalization algorithm. Composed $\theta_1$ operations verbalize via FORML\,2 qualified readings, which parse unambiguously by Theorem~\ref{thm:grammar}.
+
+\begin{corollary}[Enumerable Trust Boundary]\label{cor:boundary}
+Let every definition entering $\mathit{DEFS}$ carry the fact type \emph{Definition has Origin}, $\mathit{Origin} \in \{\mathit{compiled}, \mathit{registered}\}$, recorded by $\downarrow\!\mathit{DEFS}$ at entry. The informal surface of the system is
+\begin{align*}
+\mathit{Filter}(\mathit{eq} \circ [s_{\mathit{origin}}, \overline{\mathit{registered}}]) : \mathit{DEFS},
+\end{align*}
+a $\theta_1$ restriction over $\mathit{DEFS}$-as-population, itself a $\rho$-application (Theorem~\ref{thm:derive}).
+\end{corollary}
+
+\noindent The surjectivity remark (Theorem~\ref{thm:spec}) and the world-assumption remark (Section~\ref{sec:exec}) are the same boundary seen from the definition side and the population side: both name the compiled/registered partition of $\mathit{DEFS}$. Making the partition a fact type turns two concessions into an audit query. Informality is not eliminated; it is localized to an enumerable surface that is itself a queryable fact set, self-describing by construction.
 
 \begin{corollary}[Deletion as Terminal State]\label{cor:delete}
 A state with no outgoing transitions produces $\mathit{links}(s) = \emptyset$ by Theorem~\ref{thm:hateoas}. The entity is excluded from query results by $\mathit{Filter}(p_{\mathit{live}}) : P$.
@@ -434,12 +435,12 @@ After applying $\mathit{SYSTEM}$ with operation $\mathit{compile} \circ \mathit{
 \end{corollary}
 
 \begin{proof}
-Theorem~\ref{thm:grammar} depends on the grammar, not on $D$. Theorem~\ref{thm:spec} depends on injective stateless functions. New definitions enter $\mathit{DEFS}$ via $\downarrow\!\mathit{DEFS}$. Theorems~\ref{thm:complete}--\ref{thm:derive} operate over $P$ and $S$, both of which include the new content. No theorem's proof depends on $D$ being fixed at initialization.
+Theorem~\ref{thm:grammar} depends on the grammar, not on $D$. Theorem~\ref{thm:spec} depends on the grammar and the kernel quotient, neither of which varies with $D$. New definitions enter $\mathit{DEFS}$ via $\downarrow\!\mathit{DEFS}$. Theorems~\ref{thm:complete}--\ref{thm:derive} operate over $P$ and $S$, both of which include the new content. No theorem's proof depends on $D$ being fixed at initialization.
 \end{proof}
 
 \smallskip\noindent\textbf{Remark} (Self-hosting). This is the property the formalism turns on: AREST ingests schemas that extend its own schema, and every theorem in the chain continues to apply. The system is not merely specified by readings; it is extended by them.
 
-\smallskip\noindent\textbf{Remark} (Migration). The compile op is itself a $\mathit{SYSTEM}$ application and subject to $\mathit{validate}$~(\ref{eq:create}). If an ingested schema introduces an alethic constraint that $P$ violates, the ingestion is rejected ($D' = D$). Migration readings that transform $P$ must therefore land in the same ingestion --- as derivation rules, transition triggers, or deontic rather than alethic constraints --- or as a staged sequence whose intermediate readings produce compliant $P$ before the stricter constraint is introduced.
+\smallskip\noindent\textbf{Remark} (Migration). The compile op is itself a $\mathit{SYSTEM}$ application and subject to $\mathit{validate}$~(\ref{eq:create}). If an ingested schema introduces an alethic constraint that $P$ violates, the ingestion is rejected ($D' = D$). Migration readings that transform $P$ must therefore land in the same ingestion (as derivation rules, transition triggers, or deontic rather than alethic constraints) or as a staged sequence whose intermediate readings produce compliant $P$ before the stricter constraint is introduced.
 
 \begin{corollary}[Constraint Consensus]\label{cor:consensus}
 For two peers sharing population $P$, one proposes event $e$ and the other applies $\mathit{validate}$~(\ref{eq:create}) to $P \cup \mathit{resolve}(S, e)$. The event is accepted iff $V$ contains no alethic violation. The constraint set $C_S$ is the consensus predicate.
@@ -447,9 +448,6 @@ For two peers sharing population $P$, one proposes event $e$ and the other appli
 
 \noindent For $n > 2$ peers, a total ordering over the shared event log is additionally required. Safety follows from deterministic replay; liveness from the single-writer cell (Definition~\ref{def:isolation}).
 
-% =====================================================================
-% ACT 6: THE WORLD AFTER
-% =====================================================================
 
 \section{Distributed Evaluation}
 
@@ -481,7 +479,7 @@ The five theorems form a dependency chain from unambiguous grammar to full deriv
 
 The five properties compose into a guarantee for automated agents. An LLM writing FORML\,2 readings produces unambiguous specifications (Theorem~\ref{thm:grammar}) that are the executables (Theorem~\ref{thm:spec}). An LLM consuming the API reads values that are $\rho$-applications over $P$ (Theorem~\ref{thm:derive}) and discovers every valid action via HATEOAS links (Theorem~\ref{thm:hateoas}). There are no undocumented endpoints, no hidden middleware, no informal contracts to hallucinate through. The forward chainer evaluates derivation rules to the least fixed point (Theorem~\ref{thm:complete}), and the LLM reads conclusions, not premises. The logical chain was evaluated deterministically by the engine. When the chain itself is needed, the derivation trace is available on demand.
 
-The algebraic laws of FP~\cite[Sec.\,12.2]{backus78} are equations between functional forms. Since FFP objects represent the same forms via $\rho$, an FFP object can be transformed to an equivalent object by applying these laws. Ahead-of-time compilation from objects to optimized evaluation trees is one such transformation.
+The algebraic laws of FP~\cite[Sec.\,12.2]{backus78} are equations between functional forms. Since FFP objects represent the same forms via $\rho$, an FFP object can be transformed to an equivalent object by applying these laws. Ahead-of-time compilation from objects to optimized evaluation trees is one such transformation, and so is semi-naive evaluation~\cite{bancilhon86}: the cost model of Section~\ref{sec:exec} is a program transformation in the same genre.
 
 Common operational concerns map directly to the formalism: versioning is the event stream, migration is ingestion of new readings, backward compatibility is preserved by construction, and auditability is the derivation trace.
 
@@ -492,10 +490,13 @@ The gap between domain knowledge and running software is the gap where requireme
 Claude (Anthropic) was used as a programming assistant during implementation and as a drafting aid during manuscript preparation. All architectural decisions and the composition of FFP/AST with REST were made by the human author.
 
 \bibliographystyle{plain}
-\begin{thebibliography}{8}
+\begin{thebibliography}{11}
 
 \bibitem{backus78}
 J. Backus, ``Can Programming Be Liberated from the von Neumann Style? A Functional Style and Its Algebra of Programs,'' \emph{Commun.\ ACM}, 21(8):613--641, 1978.
+
+\bibitem{bancilhon86}
+F. Bancilhon and R. Ramakrishnan, ``An Amateur's Introduction to Recursive Query Processing Strategies,'' in \emph{Proc.\ ACM SIGMOD}, pp.~16--52, 1986.
 
 \bibitem{codd70}
 E.F. Codd, ``A Relational Model of Data for Large Shared Data Banks,'' \emph{Commun.\ ACM}, 13(6):377--387, 1970.
@@ -505,6 +506,9 @@ E.F. Codd, ``Relational Completeness of Data Base Sublanguages,'' in R. Rustin, 
 
 \bibitem{fielding00}
 R.T. Fielding, ``Architectural Styles and the Design of Network-based Software Architectures,'' Ph.D. dissertation, Univ.\ of California, Irvine, 2000.
+
+\bibitem{gupta93}
+A. Gupta, I.S. Mumick, and V.S. Subrahmanian, ``Maintaining Views Incrementally,'' in \emph{Proc.\ ACM SIGMOD}, pp.~157--166, 1993.
 
 \bibitem{halpin01}
 T. Halpin, \emph{Information Modeling and Relational Databases}, Morgan Kaufmann, 2001.
@@ -517,6 +521,9 @@ T.~Halpin and M.~Curland, NORMA (Natural Object-Role Modeling Architect), open-s
 
 \bibitem{arest}
 S.~Lippert, AREST, open-source reference implementation, \url{https://github.com/graphdl/arest}.
+
+\bibitem{zuzak11}
+I. Zu\v{z}ak, I. Budiseli\'{c}, and G. Dela\v{c}, ``Formal Modeling of RESTful Systems Using Finite-State Machines,'' in \emph{Proc.\ ICWE}, LNCS 6757, pp.~346--360, 2011.
 
 \end{thebibliography}
 
