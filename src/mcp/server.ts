@@ -547,13 +547,19 @@ async function systemCall(key: string, input: string, scope?: CallScope): Promis
   return engine.system(handle, key, input)
 }
 
-function runArestCli(args: string[]): Promise<string> {
+function runArestCli(args: string[], stdinPayload?: string): Promise<string> {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(AREST_CLI, args, {
       cwd: REPO_ROOT,
       env: process.env,
       windowsHide: true,
     })
+    // Always close stdin: the CLI only reads it under `--stdin-input`,
+    // and an open pipe would hang that read at EOF-never.
+    if (stdinPayload !== undefined) {
+      child.stdin.write(stdinPayload, 'utf8')
+    }
+    child.stdin.end()
     let stdout = ''
     let stderr = ''
     child.stdout.setEncoding('utf8')
@@ -572,8 +578,33 @@ function runArestCli(args: string[]): Promise<string> {
   })
 }
 
+/**
+ * mcp-apply-stdin-payload (arc-agi-3 issue 4): Windows caps a spawned
+ * command line at ~32 KB TOTAL, so passing the SYSTEM input on argv
+ * capped `apply` batches at ~50 ops (task-930 advertises 4096) and
+ * spawn ENAMETOOLONG'd beyond it — chunked workarounds forfeited batch
+ * atomicity. Above the threshold the payload rides STDIN and argv
+ * carries `--stdin-input` instead (arest-cli reads stdin to EOF).
+ * Small payloads keep the argv path: zero behavior change for the
+ * common case, and compatibility with older binaries everywhere the
+ * old path would have worked at all.
+ */
+export const STDIN_INPUT_THRESHOLD_BYTES = 8192
+
+export function cliCallPlan(
+  dbPath: string,
+  key: string,
+  input: string,
+): { args: string[]; stdin?: string } {
+  if (Buffer.byteLength(input, 'utf8') <= STDIN_INPUT_THRESHOLD_BYTES) {
+    return { args: ['--db', dbPath, key, input] }
+  }
+  return { args: ['--db', dbPath, key, '--stdin-input'], stdin: input }
+}
+
 function cliSystemCall(key: string, input: string, scope?: CallScope): Promise<string> {
-  return runArestCli(['--db', currentDbPath(scope), key, input])
+  const plan = cliCallPlan(currentDbPath(scope), key, input)
+  return runArestCli(plan.args, plan.stdin)
 }
 
 // Read the repo's current HEAD SHA for the engine_version staleness
@@ -1180,9 +1211,19 @@ server.registerTool(
  *
  * Other JSON.parse failures still surface as { raw } so genuinely
  * malformed engine responses aren't swallowed silently.
+ *
+ * query-bottom-origin-envelope: the engine's ⊥-trace decorates Bottom
+ * with an origin frame ("⊥ origin: in rule `query:<ft>`"), so an
+ * exact `raw === '⊥'` match leaked the raw envelope for unknown FTs
+ * (arc-agi-3 issue 6). Bottom is recognized by PREFIX — any ⊥-leading
+ * response is "no def by that name", origin trace or not.
  */
+export function isBottomRaw(raw: string): boolean {
+  return raw.trim().startsWith('⊥')
+}
+
 export function parseQueryResponse(raw: string): unknown {
-  if (raw === '⊥') return []
+  if (isBottomRaw(raw)) return []
   try {
     const parsed = JSON.parse(raw)
     return parsed ?? []
@@ -1200,18 +1241,19 @@ export function parseQueryResponse(raw: string): unknown {
  * this fix, the MCP runtime returned `{ raw: '⊥' }`, which looks like
  * data loss when the data is fine and just lives in a different app.
  *
- * The envelope here keeps the bare `raw: '⊥'` so existing tooling that
- * matched against it still sees it, but adds an `error` + `hint` that
- * names the active app and points at apps_list / apps_use. The warning
- * is intentionally framed as "possible cause" -- bare `⊥` can also be
- * an engine internal -- so this never falsely asserts.
+ * The envelope keeps the engine's raw ⊥ string (origin trace and all,
+ * per query-bottom-origin-envelope — Bottom is matched by PREFIX) so
+ * existing tooling that matched against it still sees it, but adds an
+ * `error` + `hint` that names the active app and points at apps_list /
+ * apps_use. The warning is intentionally framed as "possible cause" --
+ * a ⊥ can also be an engine internal -- so this never falsely asserts.
  */
 export function parseGetResponse(raw: string, noun: string, activeAppName: string): unknown {
-  if (raw === '⊥') {
+  if (isBottomRaw(raw)) {
     return {
       error: `Bottom: get/list for '${noun}' returned ⊥ in active app '${activeAppName}'`,
       hint: `'${noun}' is most likely not declared in '${activeAppName}'. Try \`apps_list\` to see other apps and \`apps_use <name>\` to switch UoDs -- the entity may be in a different app.`,
-      raw: '⊥',
+      raw,
     }
   }
   try {

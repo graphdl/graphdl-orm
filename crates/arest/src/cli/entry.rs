@@ -1252,8 +1252,16 @@ pub fn main_entry() {
 
     // Parse flags.
     let no_validate = args.iter().any(|a| a == "--no-validate");
+    // mcp-apply-stdin-payload: `--stdin-input` reads the <input>
+    // argument from STDIN (to EOF) instead of argv. Windows caps a
+    // spawned command line at ~32 KB, which capped MCP `apply` batches
+    // at ~50 ops (task-930 advertises 4096 atomic ops) and forced bulk
+    // loads into independently-committed chunks — forfeiting the
+    // all-or-nothing contract. The MCP shim switches to this flag for
+    // large payloads; argv stays the path for small ones.
+    let stdin_input = args.iter().any(|a| a == "--stdin-input");
     let (db_path, mut rest, _) = args.iter()
-        .filter(|a| !matches!(a.as_str(), "--no-validate" | "--strict"))
+        .filter(|a| !matches!(a.as_str(), "--no-validate" | "--strict" | "--stdin-input"))
         .fold(
         ("arest.db".to_string(), Vec::<String>::new(), false),
         |(db, mut rest, expect_db), arg| match (expect_db, arg.as_str()) {
@@ -1270,6 +1278,7 @@ pub fn main_entry() {
                 println!("  --no-validate      skip constraint validation during compile");
                 println!("  --strict           reject undeclared nouns (no auto-creation)");
                 println!("  --export-norma <f> compile, write NORMA .orm to <f>, exit (no persist)");
+                println!("  --stdin-input      read <input> from stdin (avoids the Windows argv cap)");
                 std::process::exit(0);
             }
             (false, _) => { rest.push(arg.clone()); (db, rest, false) }
@@ -1904,10 +1913,26 @@ pub fn main_entry() {
                 eprintln!("Compiled {} readings into {}", compiled, &db_path);
             }
 
-            // arest <key> <input> — single SYSTEM call
-            (true, n) if n >= 2 => {
+            // arest <key> <input> — single SYSTEM call. With
+            // `--stdin-input` the input rides STDIN and argv carries
+            // only the key (mcp-apply-stdin-payload — Windows argv cap).
+            (true, n) if n >= 2 || (stdin_input && n >= 1) => {
                 let key = &non_dirs[0];
-                let input = &non_dirs[1];
+                let stdin_owned;
+                let input: &String = if stdin_input {
+                    use std::io::Read;
+                    let mut buf = String::new();
+                    if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+                        eprintln!("--stdin-input: failed to read stdin: {}", e);
+                        std::process::exit(2);
+                    }
+                    // Pipes append a trailing newline; the payload is
+                    // JSON / an id, where trailing whitespace is noise.
+                    stdin_owned = buf.trim_end().to_string();
+                    &stdin_owned
+                } else {
+                    &non_dirs[1]
+                };
                 // read-path-fast-path: `sql`/`cells`/`orient` are pure
                 // read-only projections (system() returns D unchanged) and
                 // serve straight off the loaded snapshot — skip the

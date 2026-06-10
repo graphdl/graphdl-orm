@@ -13,6 +13,8 @@ import { resolve, dirname, join } from 'path'
 import { tmpdir } from 'os'
 import { fileURLToPath } from 'url'
 import {
+  cliCallPlan,
+  STDIN_INPUT_THRESHOLD_BYTES,
   parseQueryResponse,
   parseSqlResponse,
   parseCellsResponse,
@@ -92,6 +94,55 @@ describe('active-app persistence (AREST_PERSIST_ACTIVE_APP)', () => {
 
   it('parseGetResponse falls back to raw on non-JSON, non-⊥ output', () => {
     expect(parseGetResponse('not json', 'Order', 'orders')).toEqual({ raw: 'not json' })
+  })
+
+  // query-bottom-origin-envelope (arc-agi-3 issue 6): the engine's
+  // ⊥-trace decorates Bottom with an origin frame, so the parsers must
+  // recognize Bottom by PREFIX, not exact equality — an unknown FT
+  // still answers [] / the wrong-UoD envelope, never a raw leak.
+  it('parseQueryResponse maps decorated ⊥-origin output to []', () => {
+    expect(parseQueryResponse('⊥')).toEqual([])
+    expect(
+      parseQueryResponse('⊥ origin: in rule `query:Action_Type_has_Action_Semantic`'),
+    ).toEqual([])
+    expect(parseQueryResponse(' ⊥ origin: whatever')).toEqual([])
+  })
+
+  it('parseGetResponse surfaces the wrong-UoD warning for decorated ⊥-origin output too', () => {
+    const decorated = '⊥ origin: in rule `get:Run`'
+    const out = parseGetResponse(decorated, 'Run', 'arc-agi-3') as Record<string, unknown>
+    expect(out.error).toMatch(/Bottom: get.list for 'Run'/)
+    expect(out.hint).toMatch(/apps_use/)
+    // The raw envelope keeps the decorated string so the origin trace
+    // survives for diagnostics.
+    expect(out.raw).toBe(decorated)
+  })
+
+  // mcp-apply-stdin-payload (arc-agi-3 issue 4): payloads above the
+  // threshold ride STDIN (argv carries --stdin-input) so Windows's
+  // ~32 KB command-line cap no longer ENAMETOOLONGs large atomic
+  // batches; small payloads keep the argv path byte-for-byte.
+  it('cliCallPlan keeps small payloads on argv', () => {
+    const plan = cliCallPlan('C:/x/app.db', 'apply', '{"ops":[]}')
+    expect(plan.args).toEqual(['--db', 'C:/x/app.db', 'apply', '{"ops":[]}'])
+    expect(plan.stdin).toBeUndefined()
+  })
+
+  it('cliCallPlan routes large payloads through stdin with --stdin-input', () => {
+    const big = JSON.stringify({ ops: Array.from({ length: 500 }, (_, i) => ({ operation: 'create', noun: 'Level', id: `lvl-${i}`, fields: { Name: `Level ${i}` } })) })
+    expect(Buffer.byteLength(big, 'utf8')).toBeGreaterThan(STDIN_INPUT_THRESHOLD_BYTES)
+    const plan = cliCallPlan('C:/x/app.db', 'apply', big)
+    expect(plan.args).toEqual(['--db', 'C:/x/app.db', 'apply', '--stdin-input'])
+    expect(plan.stdin).toBe(big)
+  })
+
+  it('cliCallPlan measures the threshold in BYTES, not chars (multibyte payloads)', () => {
+    // ⊥ is 3 UTF-8 bytes — a string of N chars can exceed the byte
+    // threshold at N/3 chars. The plan must switch on byte length.
+    const multibyte = '⊥'.repeat(Math.ceil(STDIN_INPUT_THRESHOLD_BYTES / 3) + 1)
+    expect(multibyte.length).toBeLessThan(STDIN_INPUT_THRESHOLD_BYTES)
+    const plan = cliCallPlan('C:/x/app.db', 'query', multibyte)
+    expect(plan.args).toContain('--stdin-input')
   })
 
   // task-959 fix #1: the gate that decides whether to write the
