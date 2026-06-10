@@ -3085,12 +3085,22 @@ fn apply_nonbottom(func: &Func, x: &Object, d: &Object) -> Object {
             }
         }
 
-        // Platform primitives require serde_json + std modules; not available
-        // in the no_std kernel build. Return Bottom so apply() stays total.
+        // Platform primitives mostly require serde_json + std modules and are
+        // not available in the no_std kernel build — they return Bottom so
+        // apply() stays total (kernel code RELIES on that, e.g. the `extract`
+        // verb's Bottom → 503 seam). The PURE alloc-only leaves are the
+        // exception: `skolem` (task-970 value invention) is evaluated by
+        // every skolem-head view rule, and the §5.2 in-kernel Slint surface
+        // resolves those rules at fetch time (viewproj-client-render — the
+        // first QEMU boot drew an EMPTY form because this arm bottomed the
+        // ve_<fnv> mint while the host build minted fine).
         #[cfg(not(feature = "no_std"))]
         Func::Platform(name) => apply_platform(name, x, d),
         #[cfg(feature = "no_std")]
-        Func::Platform(_) => Object::Bottom,
+        Func::Platform(name) => match name.as_str() {
+            "skolem" => platform_skolem(x),
+            _ => Object::Bottom,
+        },
 
         Func::Native(f) => f(x),
     }
@@ -6328,7 +6338,10 @@ pub fn synthesize_fact_id(ft_id: &str, fact: &Object) -> String {
 /// The `ve_` prefix and `|` separator are fixed in this minimal version;
 /// a future generalisation parameterises them so the one primitive serves
 /// any existential head (`<prefix, frontier…>` input shape).
-#[cfg(not(feature = "no_std"))]
+///
+/// UNGATED (no `no_std` cfg): pure alloc-only FNV — the no_std Platform
+/// arm dispatches it directly so skolem-head view rules mint ids in the
+/// kernel too (§5.2 viewproj-client-render).
 fn platform_skolem(x: &Object) -> Object {
     let items = match x.as_seq() {
         Some(items) => items,
