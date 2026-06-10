@@ -2621,7 +2621,7 @@ fn sm_fact_triggers(d: &ast::Object) -> Vec<(String, String, String)> {
 /// keeps the events; the backfill rules still ADD (idempotently) when their own
 /// antecedents change. See
 /// command::tests::apply_update_does_not_wipe_sm_trigger_cell_collapsing_status.
-fn sm_trigger_cell_set(d: &ast::Object) -> hashbrown::HashSet<String> {
+pub(crate) fn sm_trigger_cell_set(d: &ast::Object) -> hashbrown::HashSet<String> {
     sm_fact_triggers(d).into_iter().map(|(_, _, cell)| cell).collect()
 }
 

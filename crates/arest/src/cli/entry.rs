@@ -341,6 +341,105 @@ mod db {
 // load equals the cold fold; the cold-vs-warm 6249/838 gate verifies it.
 // =========================================================================
 
+/// The #836 derived-cell wipe set for the LOAD path: DerivationRule
+/// consequents ∪ SyntheticDerivedCells, MINUS the SM trigger cells.
+///
+/// run-load-chain-wipes-sm-trigger-cells: SM trigger cells hold REAL
+/// transition events and must never be wiped — the same exclusion the
+/// apply path applies (`command::sm_trigger_cell_set`). They land in
+/// the derived set because the event→event migration backfills
+/// (`Task is started iff Task is finished`) make them DerivationRule
+/// consequents; wiping them here re-derived starts only for FINISHED
+/// entities (duplicates) and LOST them for started-not-finished ones,
+/// folding those back to the initial status on every recompile (the
+/// live board's in-progress tasks reset to pending twice on 2026-06-10
+/// before this fix).
+#[cfg(feature = "local")]
+pub(crate) fn derived_wipe_set(d: &ast::Object) -> hashbrown::HashSet<String> {
+    let mut out: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+    let drule_cell = ast::fetch_cell_seq("DerivationRule", d);
+    if let Some(facts) = drule_cell.as_seq() {
+        for fact in facts.iter() {
+            let Some(encoded) = ast::binding(fact, "consequentFactTypeId") else { continue };
+            let cell_name = crate::types::ConsequentCellSource::decode(encoded)
+                .literal_id().to_string();
+            if !cell_name.is_empty() { out.insert(cell_name); }
+        }
+    }
+    // #905/task-740: synthetic-rule consequents (SM init, SM event-fold,
+    // etc.) declared in the SyntheticDerivedCells meta cell from
+    // compile.rs. User rules contribute via DerivationRule above;
+    // synthetic rules via this cell. No hand-curated list here.
+    //
+    // The cell is emitted via `defs.push(..., Func::constant(seq))` which
+    // `func_to_object` stores as a 2-elem Seq `<atom("'"), entries>` —
+    // the FFP const-fn wrapper. Unwrap before iterating.
+    let synth_cell = ast::fetch_cell_seq("SyntheticDerivedCells", d);
+    let synth_entries = synth_cell.as_seq()
+        .and_then(|items| {
+            if items.len() == 2 && items[0].as_atom() == Some("'") {
+                items[1].as_seq().map(|s| s.to_vec())
+            } else {
+                Some(items.to_vec())
+            }
+        })
+        .unwrap_or_default();
+    for fact in synth_entries.iter() {
+        let Some(name) = ast::binding(fact, "name") else { continue };
+        if !name.is_empty() { out.insert(name.to_string()); }
+    }
+    let sm_triggers = crate::command::sm_trigger_cell_set(d);
+    let excluded: Vec<&String> = out.iter()
+        .filter(|c| sm_triggers.contains(c.as_str())).collect();
+    if !excluded.is_empty() {
+        eprintln!("[load] excluding {} SM trigger cell(s) from the #836 wipe \
+                   (real events, never re-derivable): {:?}",
+            excluded.len(), excluded);
+    }
+    out.retain(|c| !sm_triggers.contains(c.as_str()));
+    out
+}
+
+#[cfg(all(test, feature = "local"))]
+mod derived_wipe_set_tests {
+    use super::*;
+    use crate::ast;
+
+    /// The load-path wipe set excludes SM trigger cells: a backfill
+    /// rule makes `Task_is_started` a DerivationRule consequent, but
+    /// the SM trio (transition → SMD → noun, transition → event type)
+    /// marks it a trigger — so it must survive the wipe while an
+    /// ordinary derived cell is wiped. This is the load-path twin of
+    /// command.rs's apply-path guard
+    /// (apply_update_does_not_wipe_sm_trigger_cell_collapsing_status).
+    #[test]
+    fn excludes_sm_trigger_cells_from_the_wipe() {
+        let push = |s: ast::Object, cell: &str, pairs: &[(&str, &str)]|
+            ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+        let d = {
+            let s = ast::Object::phi();
+            // Two derivation consequents: the backfilled trigger + an
+            // ordinary derived marker.
+            let s = push(s, "DerivationRule",
+                &[("id", "rule_backfill"), ("consequentFactTypeId", "Task_is_started")]);
+            let s = push(s, "DerivationRule",
+                &[("id", "rule_marker"), ("consequentFactTypeId", "Task_is_dependency_blocked")]);
+            // The SM trio that makes 'Task is started' a trigger cell.
+            let s = push(s, "Transition_is_defined_in_State_Machine_Definition",
+                &[("Transition", "start"), ("State Machine Definition", "Task SM")]);
+            let s = push(s, "State_Machine_Definition_is_for_Noun",
+                &[("State Machine Definition", "Task SM"), ("Noun", "Task")]);
+            push(s, "Transition_is_triggered_by_Event_Type",
+                &[("Transition", "start"), ("Event Type", "Task is started")])
+        };
+        let set = derived_wipe_set(&d);
+        assert!(set.contains("Task_is_dependency_blocked"),
+            "ordinary derived cells stay in the wipe set; got {:?}", set);
+        assert!(!set.contains("Task_is_started"),
+            "SM trigger cells must be excluded from the wipe (real events); got {:?}", set);
+    }
+}
+
 /// Content hash (FNV-1a) of the bundled metamodel readings — the cache key.
 #[cfg(feature = "local")]
 fn metamodel_readings_signature() -> u64 {
@@ -1617,44 +1716,7 @@ pub fn main_entry() {
                 // cor:closure preserves derived facts whose primary
                 // support has changed, leaving stale conclusions in
                 // the population (the #772 stuck-blocked symptom).
-                let derived_cells: hashbrown::HashSet<String> = {
-                    let mut out: hashbrown::HashSet<String> = hashbrown::HashSet::new();
-                    let drule_cell = ast::fetch_cell_seq("DerivationRule", &d);
-                    if let Some(facts) = drule_cell.as_seq() {
-                        for fact in facts.iter() {
-                            let Some(encoded) = ast::binding(fact, "consequentFactTypeId") else { continue };
-                            let cell_name = crate::types::ConsequentCellSource::decode(encoded)
-                                .literal_id().to_string();
-                            if !cell_name.is_empty() { out.insert(cell_name); }
-                        }
-                    }
-                    // #905/task-740: synthetic-rule consequents (SM init,
-                    // SM event-fold, etc.) declared in
-                    // SyntheticDerivedCells meta cell from compile.rs.
-                    // User rules contribute via DerivationRule above;
-                    // synthetic rules via this cell. No hand-curated
-                    // list in the dispatcher.
-                    //
-                    // The cell is emitted via `defs.push(..., Func::constant(seq))`
-                    // which `func_to_object` stores as a 2-elem Seq
-                    // `<atom("'"), seq_of_entries>` — the FFP const-fn
-                    // wrapper. Unwrap the wrapper before iterating.
-                    let synth_cell = ast::fetch_cell_seq("SyntheticDerivedCells", &d);
-                    let synth_entries = synth_cell.as_seq()
-                        .and_then(|items| {
-                            if items.len() == 2 && items[0].as_atom() == Some("'") {
-                                items[1].as_seq().map(|s| s.to_vec())
-                            } else {
-                                Some(items.to_vec())
-                            }
-                        })
-                        .unwrap_or_default();
-                    for fact in synth_entries.iter() {
-                        let Some(name) = ast::binding(fact, "name") else { continue };
-                        if !name.is_empty() { out.insert(name.to_string()); }
-                    }
-                    out
-                };
+                let derived_cells: hashbrown::HashSet<String> = derived_wipe_set(&d);
                 // delta-lfp-noop-skip: the derivation output is a deterministic
                 // function of (readings, population, binary) — AREST.tex
                 // cacheability / Thm. Derivability. The population's derived
