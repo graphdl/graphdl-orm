@@ -3450,6 +3450,122 @@ mod external_browse_tests {
 // Cross-runtime coverage: src/tests/security/authorization.test.ts exercises
 // the same invariants through the TS/WASM boundary via compileDomainReadings
 // / releaseDomain / systemRaw under `describe('Handle isolation', ...)`.
+// ── pb-zero-glue-acceptance — §5.2: a never-seen app renders with no wiring ─
+//
+// THE acceptance test from the platform-binding epic: a brand-new app
+// (an inline subset of apps/csdp — Schema Design + Design Note + its SM,
+// an app no engine code has ever named) composes with the generic render
+// seam through the PUBLIC handle API: compile readings → create entity →
+// getEntity → the response carries a synthesized ViewProjection whose
+// widget derives from the value-type layer, rendered to markup by
+// render:html, with the entity's current-step SM affordance riding as a
+// rel=transition anchor. Zero csdp-specific code anywhere — if this test
+// ever needs an app name added to a renderer or dispatch path, THE SEAM
+// LEAKED.
+#[cfg(all(test, not(feature = "no_std")))]
+mod zero_glue_acceptance_tests {
+    use super::*;
+
+    /// Faithful subset of apps/csdp/readings/app.md (entity + value type
+    /// + single-valued FT + the SM's first step), plus the Render Target
+    /// population — which is exactly what the bundled render-target.md
+    /// reading declares; restated here because the test compiles ONE
+    /// readings document over the metamodel handle.
+    const CSDP_SUBSET: &str = r#"# CSDP (zero-glue acceptance subset)
+
+## Entity Types
+
+Schema Design(.name) is an entity type.
+
+## Value Types
+
+Design Note is a value type.
+The data type of Design Note is text.
+
+## Fact Types
+
+Schema Design has Design Note.
+  Each Schema Design has at most one Design Note.
+
+Schema Design notes elementary facts.
+
+## Instance Facts
+
+Noun 'Design Note' has Format 'text'.
+
+## State Machine
+
+State Machine Definition 'CSDP' is for Noun 'Schema Design'.
+Status 'step1-elementary-facts' is initial in State Machine Definition 'CSDP'.
+
+Transition 'advance-to-step2' is defined in State Machine Definition 'CSDP'.
+Transition 'advance-to-step2' is from Status 'step1-elementary-facts'.
+Transition 'advance-to-step2' is to Status 'step2-populate'.
+Transition 'advance-to-step2' is triggered by Event Type 'Schema Design notes elementary facts'.
+"#;
+
+    /// IGNORED — executable acceptance spec, blocked on
+    /// compile-reflect-schema-as-facts (board). Diagnosis 2026-06-10:
+    /// everything DOWNSTREAM works (SM affordance derives for the
+    /// never-seen noun; the render dispatch is integration-tested over
+    /// fixtures), but NO production path reflects compiled fact types
+    /// into the schema-as-facts population — `Fact_Type_has_Role` /
+    /// `Role_is_played_by_Noun` are populated ONLY by test fixtures, so
+    /// the eager `Fact Type has Format` projection and the lazy
+    /// ViewElement rules (readings/ui/view-detail.md) have nothing to
+    /// join over and `view_via_rho` yields None for every real app.
+    /// "Facts all the way down" currently stops at the compiler's
+    /// internal FactType/Role schema cells. When the reflection lands,
+    /// remove #[ignore] — this test then IS the §5.2 zero-glue proof.
+    #[test]
+    #[ignore = "blocked on compile-reflect-schema-as-facts: compiler does not yet reflect FTs into Fact_Type_has_Role / Role_is_played_by_Noun rows"]
+    fn never_seen_app_renders_through_the_generic_seam() {
+        crate::platform::render_html::install();
+
+        let h = create_impl();
+        let compiled = system_impl(h, "compile", CSDP_SUBSET);
+        assert!(!compiled.contains("\"rejected\":true"),
+            "csdp subset must compile over the metamodel; got: {}",
+            &compiled[..compiled.len().min(300)]);
+
+        let created = system_impl(h, "apply",
+            r#"{"command":{"type":"createEntity","noun":"Schema Design","domain":"","id":"sd-pb4","fields":{"Design Note":"first pass facts"}},"population":""}"#);
+        assert!(!created.contains("\"rejected\":true"),
+            "Schema Design create must land; got: {}",
+            &created[..created.len().min(300)]);
+
+        let got = system_impl(h, "apply",
+            r#"{"command":{"type":"getEntity","noun":"Schema Design","entityId":"sd-pb4"},"population":""}"#);
+        release_impl(h);
+
+        // The view layer must ride the get: a synthesized instance view
+        // for a noun the engine had never heard of before this test.
+        assert!(got.contains("\"view\""),
+            "getEntity must carry the ViewProjection; got: {}",
+            &got[..got.len().min(500)]);
+        assert!(got.contains("instance-view-Schema Design"),
+            "synthesized View id for the never-seen noun; got: {}",
+            &got[..got.len().min(800)]);
+
+        // §5.2: the html Render Target (declared in readings, body
+        // installed at boot) renders the projection — the widget derives
+        // from the value-type layer, the field value rides in, and the
+        // current step's affordance is a transition anchor.
+        assert!(got.contains("\"representations\""),
+            "render dispatch must produce representations; got: {}",
+            &got[..got.len().min(800)]);
+        for needle in [
+            "data-entity=\\\"sd-pb4\\\"",
+            "first pass facts",
+            "rel=\\\"transition\\\"",
+            "Schema Design notes elementary facts",
+        ] {
+            assert!(got.contains(needle),
+                "rendered representation missing {:?}; got: {}", needle, got);
+        }
+    }
+}
+
 #[cfg(test)]
 mod handle_isolation_tests {
     use super::*;
