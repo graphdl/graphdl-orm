@@ -165,6 +165,12 @@ pub mod command_shortcut;
 // path seeds the cell from the real `ev_bits(EV_ABS)` query. No Slint, no
 // MMIO at resolve time — host-testable.
 pub mod linuxkpi_virtio_tablet;
+// §5.2 viewproj-client-render widget-form projection (label, widget,
+// value rows from `arest::viewproj::view_via_rho` + the noun's own
+// cells). Extracted from `ui_apps::unified_repl` (which is UEFI +
+// slint gated) so the projection logic is host-testable — same move
+// as `unified_repl_regions` / `linuxkpi_virtio_tablet` above.
+pub mod view_form;
 // `ui_apps` is the Slint-driven boot UI surface (Unified REPL,
 // launcher, keyboard, doom). Every submodule that touches the
 // runtime imports `slint::*`, and the launcher's `run(...)`

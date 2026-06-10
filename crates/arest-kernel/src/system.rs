@@ -143,6 +143,24 @@ static SYSTEM: Once<RwLock<&'static Object>> = Once::new();
 /// lock-free.
 pub fn init() {
     SYSTEM.call_once(|| {
+        let initial = build_boot_state();
+
+        // Box::leak gives us the `&'static Object` the slot stores.
+        // The leak is intentional: the legacy `state()` shim returns
+        // `&'static Object`, and `apply()`'s atomic-pointer-swap
+        // story requires that all live snapshots remain valid for
+        // the kernel lifetime.
+        let leaked: &'static Object = Box::leak(Box::new(initial));
+        RwLock::new(leaked)
+    });
+}
+
+/// The full boot-time state build `init()` installs — extracted so
+/// host tests exercise the EXACT state the UEFI boot serves (the
+/// §5.2 view-form integration test caught a host-fixture/boot-state
+/// divergence precisely because the original fixture only mimicked
+/// a SLICE of this build).
+pub(crate) fn build_boot_state() -> Object {
         // Two demo defs. The banner text lives in the `welcome`
         // Constant so the HTTP handler's dispatch is a single
         // ρ-application and not a Rust string.push.
@@ -339,14 +357,15 @@ pub fn init() {
             initial = seed_busybox_file_cells(initial);
         }
 
-        // Box::leak gives us the `&'static Object` the slot stores.
-        // The leak is intentional: the legacy `state()` shim returns
-        // `&'static Object`, and `apply()`'s atomic-pointer-swap
-        // story requires that all live snapshots remain valid for
-        // the kernel lifetime.
-        let leaked: &'static Object = Box::leak(Box::new(initial));
-        RwLock::new(leaked)
-    });
+        // §5.2 viewproj-client-render — view-projection demo seed (see
+        // fn doc): the instance-detail view RULES go through the real
+        // engine path (no_std stage12 parse + compile_to_defs_state →
+        // `view:` defs), the schema rows they join over are hand-staged
+        // like the Organization / Support Request seeds above. Gives
+        // the UnifiedRepl Detail pane a widget form on a bare boot.
+        initial = seed_view_projection_demo(initial);
+
+        initial
 }
 
 /// Seed the build-time ui.do bundle into the supplied state's File
@@ -459,6 +478,150 @@ pub fn seed_busybox_file_cells(state: Object) -> Object {
         ast::fact_from_pairs(&[("File", file_id), ("Size", &size)]),
         &acc,
     )
+}
+
+/// §5.2 viewproj-client-render — boot-seed the instance-detail view
+/// projection so a bare kernel boot renders a widget form in the
+/// UnifiedRepl Detail pane.
+///
+/// The kernel's metamodel-loaded path is still pending (task-780
+/// sweep item 5), so like the Organization / Support Request seeds
+/// in `init()` this hand-stages the SCHEMA rows the view rules join
+/// over — but the RULES themselves take the real engine path: the
+/// baked FORML2 reading below is parsed by the no_std stage12 parser
+/// and compiled by `compile_to_defs_state`, so the `view:` defs that
+/// `arest::viewproj::view_via_rho` resolves are the same lazy
+/// skolem-join machinery every other Render Target consumer uses.
+/// The mini-metamodel + rules mirror the fixture proven GREEN by
+/// `instance_detail_view_derivation_compiled_from_authored_reading`
+/// in `compile_explicit_derivation_tests.rs` (plus view-detail.md's
+/// combo-box rule over `Fact Type has Enum Values`).
+///
+/// Schema rows use PRODUCTION-style Fact Type ids (`App_has_Name`,
+/// role `App_has_Name#1`) so `unified_repl::view_fields_for` derives
+/// labels by stripping the `App_has_` prefix and reads instance
+/// values straight from the seeded `App_has_*` cells.
+///
+/// NOTE the local `Role is played by Noun.` declaration yields the
+/// `Role_is_played_by_Noun` cell — the production metamodel's
+/// active-voice `Noun_plays_Role` reflection (PB4) is NOT loaded
+/// here; within this baked context the rule antecedent and the
+/// staged rows agree, which is all the join needs. The divergence
+/// dissolves when task-780 item 5 replaces this seed with the real
+/// metamodel load.
+///
+/// On parse failure the state is returned unchanged apart from the
+/// `viewseed:status` marker cell (colon-named so `discover_nouns`
+/// never lists it; type `cell viewseed:status` in the REPL to read
+/// it) — a demo seed must never kill the boot.
+pub(crate) fn seed_view_projection_demo(state: Object) -> Object {
+    // The fixture mini-metamodel: entity types the skolem frontier is
+    // built from, the value types the literal filters pin, the four
+    // antecedent FTs, and the six shared-frontier lazy rules
+    // (`*` = View materialization — resolved by `resolve_view` at
+    // fetch time, never eager-chained).
+    //
+    // DELIBERATELY constraint-free (unlike the test fixture): every
+    // sub-line like `Each Fact Type has some Role.` would become a
+    // LIVE alethic constraint on the kernel state — and the apply
+    // path auto-mints role-less FactType rows for every applied fact
+    // type (File_has_* in the syscall tests), which such a mandatory
+    // would reject. The lazy skolem join needs only the FT shapes,
+    // not the constraints.
+    const READING: &str = r#"# kernel boot view-detail seed (viewproj-client-render)
+Noun(.NounName) is an entity type.
+NounName is a value type.
+Role(.RoleName) is an entity type.
+RoleName is a value type.
+Fact Type(.FTName) is an entity type.
+FTName is a value type.
+View(.Name) is an entity type.
+Name is a value type.
+ViewElement(.veid) is an entity type.
+veid is a value type.
+View Kind is a value type.
+Component Role is a value type.
+Format is a value type.
+Enum Values is a value type.
+
+## Fact Types
+View is for Noun.
+View has View Kind.
+Fact Type has Role.
+Role is played by Noun.
+Fact Type has Format.
+Fact Type has Enum Values.
+ViewElement renders Fact Type. *
+ViewElement has Component Role. *
+
+## Derivation Rules
+* ViewElement (E) renders Fact Type (FT) iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun.
+* ViewElement (E) has Component Role 'text-input' iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has Format 'text'.
+* ViewElement (E) has Component Role 'date-picker' iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has Format 'date'.
+* ViewElement (E) has Component Role 'checkbox' iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has Format 'boolean'.
+* ViewElement (E) has Component Role 'combo-box' iff View is for Noun and View has View Kind 'instance' and Fact Type (FT) has Role and Role is played by Noun and Fact Type (FT) has some Enum Values.
+"#;
+
+    let parsed = match arest::parse_forml2::parse_to_state_from(READING, &state) {
+        Ok(p) => p,
+        Err(e) => {
+            return ast::cell_push(
+                "viewseed:status",
+                Object::atom(&format!("parse failed: {e}")),
+                &state,
+            );
+        }
+    };
+    let merged = ast::merge_states(&state, &parsed);
+
+    // Compile the merged schema + DerivationRule cells into defs and
+    // fold them back in — installs the `view:ViewElement_renders_…`
+    // / `view:ViewElement_has_Component_Role` defs `resolve_view`
+    // dispatches on (plus dormant implicit-derivation defs whose
+    // antecedent cells never exist in this population).
+    let defs = arest::compile::compile_to_defs_state(&merged);
+    let mut acc = ast::defs_to_state(&defs, &merged);
+
+    let push = |s: &Object, cell: &str, pairs: &[(&str, &str)]| {
+        ast::cell_push(cell, ast::fact_from_pairs(pairs), s)
+    };
+
+    // Schema rows for the App noun's five demo FTs — one entity-side
+    // Role per FT, played by App; Format picks the widget (§4.2
+    // value-type → widget mapping), Enum Values presence picks the
+    // combo-box. `view_via_rho` injects the synthesized View +
+    // View Kind rows per read, so none are staged here.
+    for (ft, format) in [
+        ("App_has_Name", Some("text")),
+        ("App_has_Description", Some("text")),
+        ("App_has_Install_Date", Some("date")),
+        ("App_has_Active", Some("boolean")),
+        ("App_has_Channel", None), // enum — widget via Enum Values below
+    ] {
+        let role = format!("{ft}#1");
+        acc = push(&acc, "Fact_Type_has_Role", &[("Fact Type", ft), ("Role", &role)]);
+        acc = push(&acc, "Role_is_played_by_Noun", &[("Role", &role), ("Noun", "App")]);
+        if let Some(f) = format {
+            acc = push(&acc, "Fact_Type_has_Format", &[("Fact Type", ft), ("Format", f)]);
+        }
+    }
+    acc = push(
+        &acc,
+        "Fact_Type_has_Enum_Values",
+        &[("Fact Type", "App_has_Channel"), ("Enum Values", "stable, beta, dev")],
+    );
+
+    // Instance values so the form renders FILLED widgets for both
+    // seeded App entities (Name / Description facts already staged in
+    // `init()`).
+    acc = push(&acc, "App_has_Install_Date", &[("App", "demo"), ("Install Date", "2026-01-15")]);
+    acc = push(&acc, "App_has_Install_Date", &[("App", "tasks"), ("Install Date", "2026-05-11")]);
+    acc = push(&acc, "App_has_Active", &[("App", "demo"), ("Active", "true")]);
+    acc = push(&acc, "App_has_Active", &[("App", "tasks"), ("Active", "true")]);
+    acc = push(&acc, "App_has_Channel", &[("App", "demo"), ("Channel", "stable")]);
+    acc = push(&acc, "App_has_Channel", &[("App", "tasks"), ("Channel", "beta")]);
+
+    ast::cell_push("viewseed:status", Object::atom("ok"), &acc)
 }
 
 /// Dispatch a parsed HTTP request through the baked SYSTEM.

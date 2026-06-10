@@ -618,26 +618,11 @@ fn discover_nouns(state: &Object) -> Vec<String> {
     set.into_iter().collect()
 }
 
-/// Extract the leading `<Noun>` token from a `<Noun>_has_<Attribute>`
-/// cell name. Returns `None` when the cell name doesn't contain
-/// `_has_`.
-fn noun_of(cell_name: &str) -> Option<&str> {
-    cell_name.split_once("_has_").map(|(noun, _)| noun)
-}
-
-/// Every cell that belongs to `noun` in `state`, returned as
-/// `(attribute, &cell_contents)` pairs.
-fn cells_for_noun<'a>(noun: &str, state: &'a Object) -> Vec<(&'a str, &'a Object)> {
-    let prefix_full = format!("{noun}_has_");
-    let mut out: Vec<(&str, &Object)> = Vec::new();
-    for (cell_name, contents) in ast::cells_iter(state) {
-        if let Some(attr) = cell_name.strip_prefix(&prefix_full[..]) {
-            out.push((attr, contents));
-        }
-    }
-    out.sort_by(|a, b| a.0.cmp(b.0));
-    out
-}
+// `noun_of` / `cells_for_noun` / `view_fields_for` moved to
+// `crate::view_form` (§5.2) so the projection logic is host-testable
+// — `ui_apps` is UEFI + slint gated and its `#[cfg(test)]` mod never
+// compiles on the host target.
+use crate::view_form::{cells_for_noun, noun_of, view_fields_for};
 
 /// Every distinct instance identifier for `noun` in `state`.
 fn instances_of(noun: &str, state: &Object) -> Vec<String> {
@@ -651,62 +636,6 @@ fn instances_of(noun: &str, state: &Object) -> Vec<String> {
         }
     }
     set.into_iter().collect()
-}
-
-/// §5.2 viewproj-client-render: the synthesized instance view's widget
-/// rows for one entity — `(label, widget, value)` triples the Slint
-/// `ViewField` form renders. Structure from the engine's
-/// `view_via_rho` (the same lazy view: rules every other render target
-/// consumes — the kernel is just another Render Target consumer);
-/// values from the noun's own cells. Empty when the noun derives no
-/// view (ui-readings carry the rules; value types need their Format
-/// declared — see render-target.md / the csdp precedent).
-fn view_fields_for(
-    noun: &str,
-    instance: &str,
-    state: &Object,
-) -> Vec<(String, String, String)> {
-    let Some(vp) = arest::viewproj::view_via_rho(state, noun, instance) else {
-        return Vec::new();
-    };
-    let noun_prefix = format!("{}_has_", noun.replace(' ', "_"));
-    let cells = cells_for_noun(noun, state);
-    let value_of = |attr: &str| -> String {
-        let spaced = attr.replace('_', " ");
-        for (cell_attr, cell) in &cells {
-            if *cell_attr != attr {
-                continue;
-            }
-            let Some(facts) = cell.as_seq() else { continue };
-            for fact in facts {
-                if ast::binding(fact, noun) != Some(instance) {
-                    continue;
-                }
-                // Fact role keys may be spaced ("Task Description") or
-                // underscored depending on the writer — try both.
-                if let Some(v) = ast::binding(fact, &spaced)
-                    .or_else(|| ast::binding(fact, attr))
-                {
-                    return v.to_string();
-                }
-            }
-        }
-        String::new()
-    };
-    vp.elements
-        .iter()
-        .map(|el| {
-            let attr = el
-                .fact_type
-                .strip_prefix(noun_prefix.as_str())
-                .unwrap_or(&el.fact_type);
-            (
-                attr.replace('_', " "),
-                el.component_role.clone(),
-                value_of(attr),
-            )
-        })
-        .collect()
 }
 
 /// Build the detail view for one instance of `noun`.
@@ -2448,4 +2377,8 @@ mod tests {
         assert_eq!(s.breadcrumb.len(), len_before + 1);
         assert_eq!(s.current_cell, CurrentCell::Noun { noun: "File".into() });
     }
+
+    // §5.2 viewproj-client-render: the boot-seed → widget-form
+    // integration tests live in `crate::view_form` (host-runnable;
+    // this mod is UEFI-gated and never compiles on the host target).
 }

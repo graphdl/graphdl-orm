@@ -39,6 +39,15 @@
   Leave the staging workdir (ESP, firmware copies, serial.log) in place
   for inspection instead of reporting just the log tail.
 
+.PARAMETER Display
+  Show the QEMU guest display window instead of the default headless
+  `-display none` — for SUPERVISED sessions where a human watches the
+  Slint surface (e.g. the §5.2 UnifiedRepl widget-form demo) and
+  drives the keyboard/tablet interactively. The window outlives the
+  banner wait: the TimeoutSec cap still applies, so pass a generous
+  value (e.g. -TimeoutSec 900) for a hands-on session. Combines with
+  -TypeLine (the typed line lands first, then the human takes over).
+
 .PARAMETER TypeLine
   After the boot banner completes, inject this line into the kernel's
   REPL as PS/2 keystrokes via QMP send-key (a-z, 0-9, space, slash,
@@ -79,6 +88,7 @@ param(
   [switch]$SkipBuild,
   [int]$TimeoutSec = 60,
   [switch]$Keep,
+  [switch]$Display,
   [string]$TypeLine,
   [string[]]$ThenType = @(),
   [string[]]$ExpectAfter = @(),
@@ -205,7 +215,14 @@ if ($TypeLine) {
 } else {
   $qemuArgs += @('-serial', "file:$serial")
 }
-$qemuArgs += @('-display','none','-no-reboot','-no-shutdown')
+if ($Display) {
+  # Supervised mode: show the guest display (GTK/SDL — whatever the
+  # QEMU build defaults to). The virtio-tablet + virtio-keyboard
+  # devices above make the window interactive.
+  $qemuArgs += @('-no-reboot','-no-shutdown')
+} else {
+  $qemuArgs += @('-display','none','-no-reboot','-no-shutdown')
+}
 
 # --- serial-over-TCP plumbing (typing mode) ---------------------------
 $script:serialStream = $null
@@ -334,6 +351,16 @@ if ($TypeLine -and $bannerSeen -and -not $p.HasExited) {
   }
   # Final screen capture for the GPU-side story (best-effort).
   try { Send-QmpScreendump $qmpPort (Join-Path $wd 'screen.png') } catch {}
+}
+if ($Display -and -not $p.HasExited) {
+  # Supervised session: leave the window up until the human closes it
+  # (or the TimeoutSec safety cap fires). The banner/TypeLine phases
+  # above already ran; from here the human drives.
+  Write-Host "Supervised display session — close the QEMU window (or wait for the ${TimeoutSec}s cap) to end." -ForegroundColor Cyan
+  while ((Get-Date) -lt $deadline -and -not $p.HasExited) {
+    Start-Sleep -Milliseconds 1000
+    Pump-Serial
+  }
 }
 if ($TypeLine) { Pump-Serial }
 if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
