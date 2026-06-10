@@ -66,6 +66,18 @@ doom = ["slint"]
 # to enable. Available on x86_64 UEFI only — the C compile for the
 # vendored Linux source assumes amd64 calling convention.
 linuxkpi = []
+# wine (#633 / Profile-leaf). Wine compat factored as a clean cargo
+# feature. Composes `linuxkpi` (Wine compat reuses its library-
+# loading path — conceptually separate, mechanically entangled) and
+# flips the arest engine's `wine` feature, which gates the
+# readings/compat/wine.md ingestion tuple in `metamodel_readings()`
+# — so non-wine kernels never populate Wine App cells and the CLI-
+# side `cli::wine_*` surface (gated in crates/arest) stays out of
+# the graph. OFF under every current profile (default / mini /
+# server); the future `full` profile (#632's
+# boot-kernel-uefi-full.ps1 harness) composes it. Until then the
+# opt-in is `--features wine`.
+wine = ["linuxkpi", "arest/wine"]
 # qt-adapter (#487 Track GGGG, second adapter slice). Loads
 # libqt6widgets.so.6 + libqt6core.so.6 via the linuxkpi shim's library-
 # loading path and registers the 12 Qt 6 widget classes (QPushButton /

@@ -56,23 +56,30 @@
 // Future verbs (`arest install`, `arest exec`, …) plug in here so
 // main.rs doesn't grow another giant `match` arm per subcommand.
 
-#[cfg(not(feature = "no_std"))]
+// Wine compat surface (#481-#506), factored behind `feature = "wine"`
+// (task 633): the `run` subcommand, prefix bootstrap, winetricks /
+// overrides, installer fetch+run, launch+monitor. `installer_*` and
+// `process_monitor` are wine-only by usage (their sole consumers are
+// wine_install / wine_launch), so they ride the same gate. Non-wine
+// builds drop the whole surface; `cli::entry`'s `run` verb already
+// carries a `not(wine)` arm that names the rebuild flag.
+#[cfg(all(not(feature = "no_std"), feature = "wine"))]
 pub mod run;
-#[cfg(not(feature = "no_std"))]
+#[cfg(all(not(feature = "no_std"), feature = "wine"))]
 pub mod wine_bootstrap;
-#[cfg(not(feature = "no_std"))]
+#[cfg(all(not(feature = "no_std"), feature = "wine"))]
 pub mod wine_overrides;
-#[cfg(not(feature = "no_std"))]
+#[cfg(all(not(feature = "no_std"), feature = "wine"))]
 pub mod winetricks;
-#[cfg(not(feature = "no_std"))]
+#[cfg(all(not(feature = "no_std"), feature = "wine"))]
 pub mod wine_install;
-#[cfg(not(feature = "no_std"))]
+#[cfg(all(not(feature = "no_std"), feature = "wine"))]
 pub mod installer_fetch;
-#[cfg(not(feature = "no_std"))]
+#[cfg(all(not(feature = "no_std"), feature = "wine"))]
 pub mod installer_run;
-#[cfg(not(feature = "no_std"))]
+#[cfg(all(not(feature = "no_std"), feature = "wine"))]
 pub mod process_monitor;
-#[cfg(not(feature = "no_std"))]
+#[cfg(all(not(feature = "no_std"), feature = "wine"))]
 pub mod wine_launch;
 // `entropy_host` (#574) — host-OS `EntropySource` adapter delegating to
 // `getrandom` (Linux/FreeBSD getrandom(2), macOS arc4random_buf, Windows
