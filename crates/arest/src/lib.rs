@@ -1140,6 +1140,7 @@ pub const UI_READINGS: &[(&str, &str)] = &[
     ("view-detail",      include_str!("../../../readings/ui/view-detail.md")),
     ("ifactr-android",   include_str!("../../../readings/ui/ifactr-android.md")),
     ("render-target",    include_str!("../../../readings/ui/render-target.md")),
+    ("render-subscription", include_str!("../../../readings/ui/render-subscription.md")),
 ];
 
 /// Access-control SUBSTRATE (server-enforced, no UI). Declares Operation /
@@ -1430,6 +1431,34 @@ mod render_target_reading_tests {
             assert!(txt.contains(needle),
                 "parsed render-target.md state missing {:?}", needle);
         }
+    }
+
+    /// SURVIVAL — render-subscription.md (pb-live-binding-reeval slice 1)
+    /// introduces no new checker Errors over the core+components+
+    /// render-target baseline (it references Render Target). Named
+    /// `Render Subscription` (not `View Subscription`) deliberately:
+    /// a `View `-prefixed noun re-introduces the bare-`View` tokenizer
+    /// ambiguity (declared in both `ui` and `view-projection`) that the
+    /// ns-namespace-collision-cleanup resolved — ns7 guards it.
+    #[test]
+    fn render_subscription_adds_no_new_checker_errors() {
+        const RENDER_SUBSCRIPTION_MD: &str =
+            include_str!("../../../readings/ui/render-subscription.md");
+        let fold = |bodies: &[&str]| -> String {
+            bodies.iter().fold(String::new(), |mut a, b| {
+                a.push_str(b); a.push_str("\n\n"); a
+            })
+        };
+        let baseline = check::check_readings(
+            &fold(&[CORE_MD, COMPONENTS_MD, RENDER_TARGET_MD]))
+            .into_iter().filter(|d| matches!(d.level, check::Level::Error)).count();
+        let with_rs = check::check_readings(
+            &fold(&[CORE_MD, COMPONENTS_MD, RENDER_TARGET_MD, RENDER_SUBSCRIPTION_MD]))
+            .into_iter().filter(|d| matches!(d.level, check::Level::Error)).count();
+        assert!(with_rs <= baseline,
+            "render-subscription.md introduced {} new checker Error(s); \
+             with={} baseline={}",
+            with_rs.saturating_sub(baseline), with_rs, baseline);
     }
 }
 
