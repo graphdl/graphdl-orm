@@ -148,11 +148,11 @@ fn materialize_fact_type_tables(conn: &Connection, state: &Object) -> rusqlite::
         };
         let effective: &Object = resolved.as_ref().unwrap_or(&stored);
         let table = format!("ft_{}", sanitize_identifier(ft_id));
-        let columns = column_names_for(ft_id, effective, &role_map);
-        if columns.is_empty() {
+        let cols = column_names_for(ft_id, effective, &role_map);
+        if cols.columns.is_empty() {
             continue;
         }
-        create_and_populate_table(conn, &table, &columns, effective)?;
+        create_and_populate_table(conn, &table, &cols, effective)?;
     }
     Ok(())
 }
@@ -222,11 +222,22 @@ fn collect_role_map(state: &Object) -> BTreeMap<String, Vec<String>> {
 /// where both roles are named "Theme") get a `_<position>` suffix on
 /// the second-and-later occurrence so SQLite's
 /// "duplicate column name" error doesn't sink the whole materializer.
+/// Column plan for one ft_ table: the (disambiguated) column names,
+/// plus whether a trailing `Timestamp` column was APPENDED for the SM
+/// occurred-at stamp. Appended means populated BY KEY (the stamp pair
+/// can be absent on pre-stamp historical facts), in contrast to the
+/// declared-role prefix, which stays positional (duplicate role names
+/// — ring facts — make by-key extraction ambiguous there).
+struct FtColumns {
+    columns: Vec<String>,
+    timestamp_appended: bool,
+}
+
 fn column_names_for(
     cell_name: &str,
     contents: &Object,
     role_map: &BTreeMap<String, Vec<String>>,
-) -> Vec<String> {
+) -> FtColumns {
     let raw: Vec<String> = if let Some(roles) = role_map.get(cell_name) {
         if !roles.is_empty() {
             roles.iter().map(|r| sanitize_identifier(r)).collect()
@@ -254,7 +265,44 @@ fn column_names_for(
                 .collect::<Vec<_>>())
             .unwrap_or_default()
     };
-    disambiguate_columns(&raw)
+    let mut columns = disambiguate_columns(&raw);
+    // sm-event-timestamp-persistence: SM trigger-event facts carry an
+    // UNDECLARED trailing <Timestamp, key> pair (`transition_via_defs`
+    // stamps occurred-at; commits 6f7161a0/fd580ce8). The Role cell
+    // never declares it, so the declared-role projection above hides
+    // it and `SELECT Timestamp` errors. Append it as a trailing
+    // column when any fact in the cell is stamped and no declared
+    // role already claims the name (a declared Timestamp role keeps
+    // its positional column untouched).
+    let timestamp_appended = !columns.iter().any(|c| c == "Timestamp")
+        && cell_has_timestamp_pair(contents);
+    if timestamp_appended {
+        columns.push("Timestamp".to_string());
+    }
+    FtColumns { columns, timestamp_appended }
+}
+
+/// True when any fact in the cell carries a `Timestamp`-keyed pair —
+/// the SM occurred-at stamp. Stops at the first stamped fact.
+fn cell_has_timestamp_pair(contents: &Object) -> bool {
+    ast::cell_facts_iter(contents).any(|fact| fact_timestamp(&fact).is_some())
+}
+
+/// Extract the `Timestamp` pair's value from a fact, if stamped. By
+/// KEY, not position: pre-stamp historical facts have no such pair
+/// and project NULL.
+fn fact_timestamp(fact: &Object) -> Option<String> {
+    let pairs = fact.as_seq()?;
+    pairs.iter().find_map(|p| {
+        let kv = p.as_seq()?;
+        if kv.len() != 2 {
+            return None;
+        }
+        if kv[0].as_atom()? != "Timestamp" {
+            return None;
+        }
+        kv[1].as_atom().map(String::from)
+    })
 }
 
 /// Append `_<n>` to repeated names so the resulting list is unique
@@ -303,9 +351,10 @@ fn sanitize_identifier(raw: &str) -> String {
 fn create_and_populate_table(
     conn: &Connection,
     table: &str,
-    columns: &[String],
+    cols: &FtColumns,
     contents: &Object,
 ) -> rusqlite::Result<()> {
+    let columns = &cols.columns;
     let cols_ddl = columns.iter()
         .map(|c| format!("\"{}\" TEXT", c))
         .collect::<Vec<_>>()
@@ -329,17 +378,26 @@ fn create_and_populate_table(
     // populated. `cell_facts_iter` walks both shapes; the per-fact
     // role-pair structure inside each fact is still Seq-encoded by
     // `fact_from_pairs`, so the position-mapping below is unchanged.
+    // The declared-role prefix maps POSITIONALLY (pair idx <-> column
+    // idx — duplicate role names make by-key ambiguous); an appended
+    // Timestamp column maps BY KEY (the stamp pair may be absent on
+    // pre-stamp facts, and its position is by-convention-last, not
+    // declared).
+    let positional_len = columns.len() - usize::from(cols.timestamp_appended);
     for fact in ast::cell_facts_iter(contents) {
         let pairs = match fact.as_seq() {
             Some(p) => p,
             None => continue,
         };
-        let values: Vec<Option<String>> = (0..columns.len())
+        let mut values: Vec<Option<String>> = (0..positional_len)
             .map(|idx| pairs.get(idx)
                 .and_then(|p| p.as_seq())
                 .filter(|kv| kv.len() == 2)
                 .and_then(|kv| kv[1].as_atom().map(String::from)))
             .collect();
+        if cols.timestamp_appended {
+            values.push(fact_timestamp(&fact));
+        }
         let params: Vec<&dyn rusqlite::ToSql> = values.iter()
             .map(|v| v as &dyn rusqlite::ToSql).collect();
         stmt.execute(rusqlite::params_from_iter(params))?;
@@ -460,6 +518,87 @@ mod tests {
         let state = Object::phi();
         let env = sql_query(&state, "DROP TABLE ft_x");
         assert!(parse_error(&env).contains("SELECT"));
+    }
+
+    // ── SM occurred-at Timestamp exposure (sm-event-timestamp-persistence) ──
+
+    /// An SM trigger-event cell carries an UNDECLARED trailing
+    /// `<Timestamp, key>` pair on each fact (`transition_via_defs`
+    /// stamps it at transition time — commits 6f7161a0/fd580ce8). The
+    /// ft_ view must expose it as a trailing Timestamp column;
+    /// `SELECT Timestamp FROM ft_Task_is_started` errored before this.
+    #[test]
+    fn undeclared_timestamp_pair_becomes_trailing_column() {
+        let state = state_with(
+            &[("Task_is_started", &["Task"])],
+            &[("Task_is_started", &[
+                &[("Task", "1"), ("Timestamp", "0000000000042-000000000007")],
+            ])],
+        );
+        let env = sql_query(&state, "SELECT Task, Timestamp FROM ft_Task_is_started");
+        let rows = parse_rows(&env);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("Task").and_then(|v| v.as_str()), Some("1"));
+        assert_eq!(
+            rows[0].get("Timestamp").and_then(|v| v.as_str()),
+            Some("0000000000042-000000000007")
+        );
+    }
+
+    /// Mixed cell: pre-stamp historical facts (no Timestamp pair)
+    /// project NULL in the Timestamp column — no error, no shifting of
+    /// the declared-role columns.
+    #[test]
+    fn stampless_facts_project_null_timestamp() {
+        let state = state_with(
+            &[("Task_is_started", &["Task"])],
+            &[("Task_is_started", &[
+                &[("Task", "old")],
+                &[("Task", "new"), ("Timestamp", "0000000000099-000000000001")],
+            ])],
+        );
+        let env = sql_query(
+            &state,
+            "SELECT Task, Timestamp FROM ft_Task_is_started ORDER BY Task",
+        );
+        let rows = parse_rows(&env);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get("Task").and_then(|v| v.as_str()), Some("new"));
+        assert_eq!(
+            rows[0].get("Timestamp").and_then(|v| v.as_str()),
+            Some("0000000000099-000000000001")
+        );
+        assert_eq!(rows[1].get("Task").and_then(|v| v.as_str()), Some("old"));
+        assert!(rows[1].get("Timestamp").map_or(false, |v| v.is_null()));
+    }
+
+    /// A cell with NO stamped fact gains no Timestamp column — the
+    /// existing projection shape is unchanged for ordinary FTs.
+    #[test]
+    fn unstamped_cells_gain_no_timestamp_column() {
+        let state = state_with(
+            &[("Task_has_Task_Priority", &["Task", "Task Priority"])],
+            &[("Task_has_Task_Priority", &[
+                &[("Task", "1"), ("Task Priority", "p1")],
+            ])],
+        );
+        let env = sql_query(&state, "SELECT Timestamp FROM ft_Task_has_Task_Priority");
+        let err = parse_error(&env);
+        assert!(err.contains("Timestamp"), "expected no-such-column, got: {}", err);
+    }
+
+    /// A DECLARED role named Timestamp keeps its positional column —
+    /// no duplicate appended column, values resolve as before.
+    #[test]
+    fn declared_timestamp_role_not_duplicated() {
+        let state = state_with(
+            &[("Event_has_Timestamp", &["Event", "Timestamp"])],
+            &[("Event_has_Timestamp", &[&[("Event", "e1"), ("Timestamp", "t1")]])],
+        );
+        let env = sql_query(&state, "SELECT Event, Timestamp FROM ft_Event_has_Timestamp");
+        let rows = parse_rows(&env);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get("Timestamp").and_then(|v| v.as_str()), Some("t1"));
     }
 
     #[test]
