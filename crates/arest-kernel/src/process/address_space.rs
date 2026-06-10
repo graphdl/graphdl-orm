@@ -231,6 +231,11 @@ pub struct LoadedSegment {
     /// to reconstruct the layout from `mem_size` + `PAGE_SIZE` on
     /// drop, which would mask any future change to the alignment.
     layout: Layout,
+    /// The vaddr's offset into its page (`vaddr % 4096`). The live
+    /// segment bytes start this far into `pages`, so the aligned-down
+    /// vaddr page range maps 1:1 onto the allocation — see
+    /// `mapping_base` / `mapping_len`.
+    page_offset: usize,
 }
 
 // SAFETY: `LoadedSegment` owns its `NonNull<u8>` exclusively —
@@ -244,15 +249,21 @@ unsafe impl Send for LoadedSegment {}
 
 impl LoadedSegment {
     /// Borrow the segment's payload as a read-only slice. Length is
-    /// `mem_size` — both the file-content prefix and the BSS tail are
-    /// reachable from this slice. Used by the cell-recording path to
-    /// hash / fingerprint segments and by the future #521 trampoline
-    /// to memcpy the bytes into a real page-table mapping.
+    /// `mem_size`, starting at the VADDR byte (`page_offset` into the
+    /// backing allocation) — both the file-content prefix and the BSS
+    /// tail are reachable from this slice. Used by the cell-recording
+    /// path to hash / fingerprint segments; byte 0 is always the byte
+    /// the binary placed at `vaddr`, regardless of the vaddr's page
+    /// alignment.
     pub fn pages_view(&self) -> &[u8] {
-        // SAFETY: `pages` is a valid allocation of `mem_size` bytes
-        // produced by `AddressSpace::push`, and the borrow lifetime is
-        // tied to `&self` so no concurrent `pages_view_mut` can alias.
-        unsafe { slice::from_raw_parts(self.pages.as_ptr(), self.mem_size) }
+        // SAFETY: `pages` is a valid allocation of at least
+        // `page_offset + mem_size` bytes produced by
+        // `AddressSpace::push_segment` (step 2 rounds that exact sum
+        // up), and the borrow lifetime is tied to `&self` so no
+        // concurrent `pages_view_mut` can alias.
+        unsafe {
+            slice::from_raw_parts(self.pages.as_ptr().add(self.page_offset), self.mem_size)
+        }
     }
 
     /// Borrow the segment's payload as a writable slice. Used only by
@@ -261,9 +272,27 @@ impl LoadedSegment {
     /// as immutable post-load.
     #[cfg(test)]
     pub fn pages_view_mut(&mut self) -> &mut [u8] {
-        // SAFETY: `&mut self` guarantees exclusive access; `pages` is
-        // a valid allocation of `mem_size` bytes (see Drop's invariant).
-        unsafe { slice::from_raw_parts_mut(self.pages.as_ptr(), self.mem_size) }
+        // SAFETY: `&mut self` guarantees exclusive access; same range
+        // invariant as `pages_view`.
+        unsafe {
+            slice::from_raw_parts_mut(self.pages.as_ptr().add(self.page_offset), self.mem_size)
+        }
+    }
+
+    /// Page-aligned base of the backing allocation — the physical
+    /// address the #527 page-table mapper points the ALIGNED-DOWN
+    /// vaddr page at. `vaddr - (vaddr % 4096)` ↔ `mapping_base()` is
+    /// the 1:1 correspondence; the vaddr byte sits `page_offset`
+    /// into both.
+    pub fn mapping_base(&self) -> u64 {
+        self.pages.as_ptr() as u64
+    }
+
+    /// Whole-page length of the backing allocation —
+    /// `round_up(page_offset + mem_size)`. Together with
+    /// `mapping_base` this is the exact `UserMapping` extent.
+    pub fn mapping_len(&self) -> usize {
+        self.layout.size()
     }
 }
 
@@ -346,10 +375,19 @@ impl AddressSpace {
         }
 
         // Step 2: page-round the in-memory size so the allocation is
-        // a whole number of pages. Future page-table install needs
-        // page boundaries; rounding here keeps the upgrade path
-        // transparent.
-        let pages_rounded = match round_up_to_page(mem_size) {
+        // a whole number of pages — INCLUDING the vaddr's offset into
+        // its page. ELF only guarantees `p_vaddr ≡ p_offset (mod
+        // 4096)`, so PT_LOADs routinely start mid-page (busybox's
+        // data segment does); keeping that offset inside the backing
+        // allocation lets the #527 page-table mapper map the aligned-
+        // down vaddr range 1:1 onto the allocation (`mapping_base` /
+        // `mapping_len`), with the vaddr byte sitting `page_offset`
+        // bytes in — exactly where the vaddr sits in its own page.
+        let page_offset = (vaddr % PAGE_SIZE as u64) as usize;
+        let pages_rounded = match page_offset
+            .checked_add(mem_size)
+            .and_then(round_up_to_page)
+        {
             Some(v) => v,
             None => return Err(LoaderError::SegmentMathOverflow),
         };
@@ -402,33 +440,27 @@ impl AddressSpace {
             None => return Err(LoaderError::OutOfMemory),
         };
 
-        // Step 7: copy the file content into the allocation, then
-        // zero the rest. Two slice writes — bounds-checked by the
-        // slice constructor lengths.
+        // Step 7: zero the head padding (the bytes below the vaddr's
+        // page offset), copy the file content at `page_offset`, then
+        // zero the rest (BSS + page-boundary tail). One pass over the
+        // whole allocation keeps it deterministic for the cell-
+        // recording fingerprint.
         // SAFETY: `pages` is a fresh `pages_rounded`-byte allocation
-        // and `mem_size <= pages_rounded` (round_up_to_page returns
-        // a value >= mem_size). The two slice writes do not alias
-        // because `file_content.len() <= mem_size` and the second
-        // slice starts at `file_content.len()`.
+        // and `page_offset + mem_size <= pages_rounded` (step 2
+        // rounded that exact sum up). The writes are sequential
+        // sub-ranges of one exclusive borrow — no aliasing.
         unsafe {
-            let dest = slice::from_raw_parts_mut(pages.as_ptr(), mem_size);
-            // First file_size bytes: copy from the ELF blob.
-            dest[..file_content.len()].copy_from_slice(file_content);
-            // Remaining mem_size - file_size bytes: zero (BSS).
-            for byte in &mut dest[file_content.len()..] {
+            let dest = slice::from_raw_parts_mut(pages.as_ptr(), pages_rounded);
+            // Head padding: [0, page_offset).
+            for byte in &mut dest[..page_offset] {
                 *byte = 0;
             }
-            // Zero the tail beyond mem_size up to pages_rounded too
-            // (no semantic meaning — that's "padding to the page
-            // boundary" — but keeps the allocation in a deterministic
-            // state for the cell-recording fingerprint and for any
-            // future test that inspects the trailing bytes).
-            if pages_rounded > mem_size {
-                let tail =
-                    slice::from_raw_parts_mut(pages.as_ptr().add(mem_size), pages_rounded - mem_size);
-                for byte in tail {
-                    *byte = 0;
-                }
+            // File content at the vaddr byte's in-page position.
+            dest[page_offset..page_offset + file_content.len()]
+                .copy_from_slice(file_content);
+            // BSS + tail: everything after the file content.
+            for byte in &mut dest[page_offset + file_content.len()..] {
+                *byte = 0;
             }
         }
 
@@ -442,6 +474,7 @@ impl AddressSpace {
             perm,
             pages,
             layout,
+            page_offset,
         });
         self.total_bytes = new_total;
         Ok(())
@@ -578,6 +611,61 @@ mod tests {
             perm_from_p_flags(PF_X).unwrap_err(),
             LoaderError::WriteExecuteSegment,
         );
+    }
+
+    /// A PT_LOAD whose vaddr is NOT page-aligned (the normal ELF
+    /// `p_vaddr ≡ p_offset (mod 4096)` shape — busybox's data segment
+    /// does this) must keep its page offset inside the backing
+    /// allocation: byte 0 of `pages_view()` is still the vaddr byte,
+    /// but it sits `vaddr % 4096` into the allocation so the #527
+    /// page-table mapper can map the ALIGNED-DOWN page range 1:1.
+    #[test]
+    fn push_segment_unaligned_vaddr_keeps_page_offset() {
+        let mut as_ = AddressSpace::new(0x40_1000);
+        let bytes = [0x11, 0x22, 0x33];
+        let vaddr = 0x40_2e08u64; // offset 0xe08 into its page
+        as_.push_segment(vaddr, 0x100, SegmentPerm::ReadWrite, &bytes)
+            .expect("push must succeed");
+        let seg = &as_.segments[0];
+        // The live view still starts at the vaddr byte.
+        assert_eq!(&seg.pages_view()[..3], &bytes);
+        // Mapping surface: page-aligned base, page-rounded len that
+        // covers [vaddr_aligned_down, vaddr + mem_size).
+        assert_eq!(seg.mapping_base() % (PAGE_SIZE as u64), 0);
+        assert_eq!(seg.mapping_len() % PAGE_SIZE, 0);
+        assert_eq!(
+            seg.mapping_len(),
+            PAGE_SIZE, // 0xe08 + 0x100 = 0xf08 fits one page
+            "offset+size within one page maps one page"
+        );
+        // The vaddr byte's offset within the mapping equals the
+        // vaddr's offset within its page — that's the 1:1 contract
+        // the mapper relies on (phys = mapping_base + page_offset
+        // lines up with vaddr).
+        let view_ptr = seg.pages_view().as_ptr() as u64;
+        assert_eq!(view_ptr - seg.mapping_base(), vaddr % (PAGE_SIZE as u64));
+        // Head padding (the bytes before the vaddr byte) is zeroed.
+        // SAFETY: mapping_base..view_ptr is inside the allocation.
+        let head = unsafe {
+            core::slice::from_raw_parts(
+                seg.mapping_base() as *const u8,
+                (view_ptr - seg.mapping_base()) as usize,
+            )
+        };
+        assert!(head.iter().all(|b| *b == 0), "pre-vaddr padding zeroed");
+    }
+
+    /// An aligned segment's mapping surface degenerates to the
+    /// backing itself (offset 0) — the accessors exist for both
+    /// shapes uniformly.
+    #[test]
+    fn push_segment_aligned_vaddr_mapping_surface_is_identity() {
+        let mut as_ = AddressSpace::new(0x40_1000);
+        as_.push_segment(0x40_2000, 0x100, SegmentPerm::Read, &[0xee])
+            .expect("push");
+        let seg = &as_.segments[0];
+        assert_eq!(seg.mapping_base(), seg.pages_view().as_ptr() as u64);
+        assert_eq!(seg.mapping_len(), PAGE_SIZE);
     }
 
     /// Push a single PT_LOAD-shaped segment, verify file content

@@ -64,6 +64,7 @@ pub mod exec;
 pub mod fd_table;
 pub mod futex_table;
 pub mod interp_resolve;
+pub mod paging;
 pub mod process;
 pub mod signal;
 pub mod stack;

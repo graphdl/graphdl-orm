@@ -171,6 +171,13 @@ pub fn init_interrupts() {
         // fault the box, but that's the same baseline as the
         // firmware-only state we replaced.
         idt.double_fault.set_handler_fn(double_fault_handler);
+        // #PF + #GP (#527): wired so early-userspace faults name
+        // themselves. Before this, vector 14 was unpopulated and a
+        // ring-3 instruction fetch on a supervisor-only identity page
+        // escalated into an undiagnosable DOUBLE FAULT.
+        idt.page_fault.set_handler_fn(page_fault_handler);
+        idt.general_protection_fault
+            .set_handler_fn(general_protection_handler);
 
         // IRQ 0 — PIT timer. The handler bumps the ms counter and
         // EOIs. Vector 32 because of the PIC remap done by
@@ -373,6 +380,37 @@ extern "x86-interrupt" fn double_fault_handler(
     _error_code: u64,
 ) -> ! {
     panic!("EXCEPTION: DOUBLE FAULT\n{stack_frame:#?}");
+}
+
+/// Page-fault (#PF, vector 14) handler. Prints CR2 (the faulting
+/// address) + the architectural error-code decode + the frame, then
+/// panics — tier-1 has no demand paging and exactly one process, so
+/// any #PF is a kernel bug or an unmapped/unauthorised guest access;
+/// "loud and precise" beats the prior behaviour, where the unwired
+/// vector escalated every #PF (e.g. ring-3's first instruction fetch
+/// on a supervisor-only identity page) into an undiagnosable DOUBLE
+/// FAULT.
+extern "x86-interrupt" fn page_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: x86_64::structures::idt::PageFaultErrorCode,
+) {
+    let cr2 = x86_64::registers::control::Cr2::read_raw();
+    panic!(
+        "EXCEPTION: PAGE FAULT\ncr2 (accessed address): {cr2:#x}\nerror: {error_code:?}\n{stack_frame:#?}"
+    );
+}
+
+/// General-protection (#GP, vector 13) handler. Same rationale as
+/// #PF above: the common early-userspace faults (bad segment use,
+/// privileged instruction at CPL3, non-canonical access) should name
+/// themselves instead of double-faulting.
+extern "x86-interrupt" fn general_protection_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    panic!(
+        "EXCEPTION: GENERAL PROTECTION FAULT\nerror code: {error_code:#x}\n{stack_frame:#?}"
+    );
 }
 
 /// PIT timer (IRQ 0, vector 32) handler. Bumps the millisecond

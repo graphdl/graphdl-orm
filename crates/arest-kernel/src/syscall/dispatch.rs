@@ -423,7 +423,7 @@ pub fn dispatch(
     r8: u64,
     r9: u64,
 ) -> i64 {
-    match rax {
+    let ret: i64 = match rax {
         SYS_READ => {
             // read(fd, buf, count) — keyboard ring → user buffer.
             // rdi = fd (must be 0 for stdin), rsi = buf pointer,
@@ -632,7 +632,17 @@ pub fn dispatch(
             exit::handle(rdi as i32)
         }
         _ => -ENOSYS,
-    }
+    };
+    // #527 bring-up trace: one serial line per syscall. The guest's
+    // own fd-1/2 writes also land on serial, so the interleaving
+    // reads as a primitive strace. Bounded noise: tier-1 runs one
+    // short-lived process at a time. Gated UEFI-only — host tests
+    // call dispatch() in tight loops and don't want stdout spam.
+    #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+    crate::println!(
+        "  sys:      #{rax}({rdi:#x}, {rsi:#x}, {rdx:#x}) = {ret:#x}"
+    );
+    ret
 }
 
 #[cfg(test)]

@@ -621,6 +621,77 @@ impl Process {
         }
         let stack = builder.finalize().map_err(SpawnError::from)?;
 
+        // Step 2b (#527): build + activate the process page tables.
+        // The iretq target is the ELF's literal vaddr while the
+        // loader placed the bytes in heap allocations — the process
+        // CR3 is what makes the two meet: kernel identity view copied
+        // verbatim (supervisor), plus USER 4 KiB mappings translating
+        // each segment's vaddr range to its heap backing, the initial
+        // stack and the AT_RANDOM page at their identity addresses.
+        // Kernel-side syscall handlers run under the same CR3, so
+        // user-pointer arguments resolve without copyin glue.
+        //
+        // The binding must stay alive past the trampoline: on success
+        // iretq diverges and this frame is abandoned-but-never-freed,
+        // which keeps the tables allocated exactly as long as the CR3
+        // points at them.
+        #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+        let _page_tables: Option<super::paging::ProcessPageTables> = {
+            use super::paging::{build_for_current, UserMapping};
+            let mut maps: alloc::vec::Vec<UserMapping> = alloc::vec::Vec::new();
+            for seg in &self.address_space.segments {
+                // Aligned-down vaddr page ↔ page-aligned backing base
+                // (the loader keeps the vaddr's page offset inside the
+                // allocation — see LoadedSegment::mapping_base).
+                maps.push(UserMapping {
+                    vaddr: seg.vaddr & !0xfff,
+                    phys: seg.mapping_base(),
+                    len: seg.mapping_len() as u64,
+                    writable: matches!(seg.perm, super::SegmentPerm::ReadWrite),
+                });
+            }
+            let stack_base = stack.top() - stack.size() as u64;
+            maps.push(UserMapping {
+                vaddr: stack_base,
+                phys: stack_base,
+                len: stack.size() as u64,
+                writable: true,
+            });
+            // AT_RANDOM points into this Box — map its (whole) page
+            // read-only at the identity address the auxv recorded.
+            let rand_page = (self.at_random.as_ptr() as u64) & !0xfff;
+            maps.push(UserMapping {
+                vaddr: rand_page,
+                phys: rand_page,
+                len: 0x1000,
+                writable: false,
+            });
+            match build_for_current(&maps) {
+                Ok(tables) => {
+                    // SMAP would fault every kernel access to the now-
+                    // USER stack/segment pages from the syscall path;
+                    // SMEP is harmless (kernel never executes user
+                    // pages) but clear both for a known-good tier-1
+                    // baseline if the firmware enabled them.
+                    unsafe {
+                        use x86_64::registers::control::{Cr4, Cr4Flags};
+                        Cr4::update(|f| {
+                            f.remove(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION);
+                            f.remove(Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION);
+                        });
+                        tables.activate();
+                    }
+                    Some(tables)
+                }
+                Err(e) => {
+                    crate::println!(
+                        "  spawn:    page-table build failed: {e:?} — invoking without user mappings"
+                    );
+                    None
+                }
+            }
+        };
+
         // Step 3: invoke the trampoline. Diverges (returns `!`) on
         // success; returns `Err(...)` if the prerequisites aren't met.
         // For tier-1 this always returns `NotYetImplemented` (x86_64)
