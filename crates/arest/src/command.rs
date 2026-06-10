@@ -342,47 +342,12 @@ pub struct NavigationLink {
     pub href: String,
 }
 
-/// One element of a projected `View` — an abstract widget bound to a Fact
-/// Type. The iFactr/MonoTouch.Dialog "member-type → Element" analogue, but
-/// keyed off the rendered Fact Type's value-type Format rather than a CLR
-/// member type. Platform-neutral: the `component_role` is bound to a native
-/// widget at render time via `select_component` (the iFactr binding layer).
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ViewElementProjection {
-    /// The `ve_<fnv>` ViewElement id (deterministic over the skolem frontier).
-    pub id: String,
-    /// The rendered Fact Type.
-    pub fact_type: String,
-    /// The widget kind ('text-input', 'date-picker', 'checkbox', 'combo-box').
-    pub component_role: String,
-}
-
-/// The abstract control tree projected for a fetched entity — the
-/// iFactr/MonoView "abstract UI" half of the Theorem-4 HATEOAS
-/// representation. `source` records which override tier produced it:
-/// 'synthesized' (iFactr default, auto from value types), 'authored'
-/// (MonoView abstract override declared in the population), or 'platform'
-/// (MonoCross IoC, a `Func::Platform` custom view — reserved).
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ViewProjection {
-    /// The View id (synthesized slug or authored View name).
-    pub view: String,
-    /// View Kind — 'instance' (form) for the per-entity detail view.
-    pub kind: String,
-    /// Which override tier produced this view.
-    pub source: String,
-    /// The widgets, ordered by rendered Fact Type.
-    pub elements: Vec<ViewElementProjection>,
-    /// §5.2 Platform Binding (pb-render-fn-contract): rendered output per
-    /// Render Target, keyed by the target slug ('html' → markup). One entry
-    /// per `Render Target has Platform Function Name` fact whose Platform fn
-    /// has an installed body (`render_via_targets`); empty when no targets
-    /// are declared, no bodies are installed, or under no_std.
-    #[serde(default, skip_serializing_if = "alloc::collections::BTreeMap::is_empty")]
-    pub representations: alloc::collections::BTreeMap<String, String>,
-}
+// The View projection types + view_via_rho moved to `crate::viewproj`
+// (no_std-clean) so the kernel's Slint surface can consume them
+// (viewproj-client-render); re-exported here so every existing
+// `command::ViewProjection` / `command::view_via_rho` reference and
+// the serialized CommandResult shape stay byte-identical.
+pub use crate::viewproj::{view_via_rho, ViewElementProjection, ViewProjection};
 
 // -- Encode/decode bridge (Object ↔ CommandResult) --------------------
 
@@ -5281,69 +5246,7 @@ fn nav_links_via_rho(d: &ast::Object, noun: &str, entity_id: &str) -> Vec<Naviga
 /// compiled out (no `view:` defs → `resolve_view` yields None), so a pure-CRM
 /// engine no-ops cleanly. Structure only (field + widget); instance VALUES are
 /// filled at render time (view-detail.md "Remaining Work (2)").
-pub fn view_via_rho(d: &ast::Object, noun: &str, _entity_id: &str) -> Option<ViewProjection> {
-    // Tier 2 vs 3: is there an AUTHORED instance View for this Noun?
-    let authored = ast::fetch_cell_seq("View_is_for_Noun", d).as_seq()
-        .and_then(|facts| facts.iter().find_map(|f| {
-            if ast::binding(f, "Noun") != Some(noun) { return None; }
-            let v = ast::binding(f, "View")?;
-            (view_kind_of(d, v).as_deref() == Some("instance")).then(|| v.to_string())
-        }));
-
-    let synth_id = format!("instance-view-{}", noun);
-    let (view_id, source): (String, &str) = match authored {
-        Some(v) => (v, "authored"),
-        None    => (synth_id, "synthesized"),
-    };
-
-    // Synthesized tier injects a transient instance View so the SAME lazy
-    // view-detail rules fire; the authored tier reads the population as-is.
-    let injected;
-    let pop: &ast::Object = if source == "synthesized" {
-        let s = ast::cell_push("View_is_for_Noun",
-            ast::fact_from_pairs(&[("View", view_id.as_str()), ("Noun", noun)]), d);
-        injected = ast::cell_push("View_has_View_Kind",
-            ast::fact_from_pairs(&[("View", view_id.as_str()), ("View Kind", "instance")]), &s);
-        &injected
-    } else {
-        d
-    };
-
-    // Resolve the lazy view: rules. None here ⇒ ui-readings off ⇒ no view.
-    let renders = ast::resolve_view("ViewElement_renders_Fact_Type", pop, pop)?;
-    let roles = ast::resolve_view("ViewElement_has_Component_Role", pop, pop)
-        .unwrap_or_else(ast::Object::phi);
-
-    // ViewElement → Component Role (the widget per element).
-    let role_of: hashbrown::HashMap<String, String> = roles.as_seq()
-        .map(|items| items.iter().filter_map(|f| Some((
-            ast::binding(f, "ViewElement")?.to_string(),
-            ast::binding(f, "Component Role")?.to_string(),
-        ))).collect())
-        .unwrap_or_default();
-
-    // Keep only elements rendered under OUR View; join the widget role.
-    let mut elements: Vec<ViewElementProjection> = renders.as_seq()
-        .map(|items| items.iter().filter_map(|f| {
-            if ast::binding(f, "View") != Some(view_id.as_str()) { return None; }
-            let id = ast::binding(f, "ViewElement")?.to_string();
-            let fact_type = ast::binding(f, "Fact Type")?.to_string();
-            let component_role = role_of.get(&id).cloned().unwrap_or_default();
-            Some(ViewElementProjection { id, fact_type, component_role })
-        }).collect())
-        .unwrap_or_default();
-
-    if elements.is_empty() { return None; }
-    // Deterministic order: the reading carries an optional `Order`; absent at
-    // this slice, the rendered Fact Type name is the stable tiebreak.
-    elements.sort_by(|a, b| a.fact_type.cmp(&b.fact_type));
-
-    Some(ViewProjection {
-        view: view_id, kind: "instance".to_string(),
-        source: source.to_string(), elements,
-        representations: Default::default(),
-    })
-}
+// (body moved to crate::viewproj::view_via_rho — re-exported above.)
 
 // ── §5.2 Platform Binding: render dispatch (pb-render-fn-contract) ───
 //
@@ -5634,15 +5537,6 @@ pub fn render_via_targets(
         }
     }
     out
-}
-
-/// The View Kind bound to a View id (scans `View_has_View_Kind`).
-fn view_kind_of(d: &ast::Object, view: &str) -> Option<String> {
-    ast::fetch_cell_seq("View_has_View_Kind", d).as_seq()
-        .and_then(|facts| facts.iter().find_map(|f| {
-            (ast::binding(f, "View") == Some(view))
-                .then(|| ast::binding(f, "View Kind").map(String::from)).flatten()
-        }))
 }
 
 fn extract_sm_status(state: &ast::Object, sm_id: &str) -> Option<String> {

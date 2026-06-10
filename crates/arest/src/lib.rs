@@ -224,6 +224,10 @@ pub mod load_reading_core;
 #[cfg(not(feature = "no_std"))]
 pub mod command;
 pub mod entity_uc;
+// View projection (Theorem 4 view layer) — no_std-clean so the kernel
+// Slint surface consumes it directly (viewproj-client-render); command
+// re-exports it for the std API surface.
+pub mod viewproj;
 // CLI subcommand handlers (#543) — `arest run <app>`, future
 // `arest install`, etc. std-only because the dispatchers print to
 // stdout/stderr and read process argv.
