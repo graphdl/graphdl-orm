@@ -27,6 +27,7 @@ import {
   activeAppStateFile,
   shouldPersistResolvedApp,
   parseGetResponse,
+  parseGetEntityResponse,
   resolveCallScope,
   scopeDbPath,
   scopeReadingsDir,
@@ -117,6 +118,140 @@ describe('active-app persistence (AREST_PERSIST_ACTIVE_APP)', () => {
     expect(shouldPersistResolvedApp({
       persistEnabled: true, appsDir: '/abs/apps', appExists: false,
     })).toBe(false)
+  })
+})
+
+// =====================================================================
+// mcp-get-surface-view-representations — the `get` tool's single-id
+// local-mode branch now reads through the engine's FULL read path
+// (Command::GetEntity dispatched through the `apply` def, the same
+// calling convention the apply tool's batch path uses) so the Theorem-4
+// representation — HATEOAS `transitions` + the ui-readings `view`
+// layer (elements + per-target representations) — rides WITH the
+// flattened 3NF row. parseGetEntityResponse is the focused translator:
+// it re-flattens the CommandResult to the EXACT row shape the legacy
+// get:{noun} path produces (both bottom out in the engine's
+// get_noun:{noun} platform primitive) and signals "fall back" with
+// null whenever the command read misses. The tests below feed raw
+// engine-response strings into the parser — the same systemCall-output
+// mocking the neighboring parse* suites use; no engine is booted.
+// =====================================================================
+
+describe('mcp-get-surface-view-representations — parseGetEntityResponse', () => {
+  // A CommandResult as the live binary (engine HEAD a5a5330e) emits it:
+  // serde camelCase, `transitions` always present (possibly empty),
+  // `view` omitted entirely (skip_serializing_if) when the ui-readings
+  // metamodel projects nothing for the noun.
+  const baseResult = {
+    entities: [{
+      id: '656',
+      type: 'Task',
+      data: { 'Task Status': 'completed', 'Task Subject': 'X' },
+    }],
+    status: 'completed',
+    transitions: [
+      {
+        event: 'Task is reopened',
+        targetStatus: 'pending',
+        method: 'GET',
+        href: '/api/entities/Task/656/transition?event=Task%20is%20reopened',
+      },
+    ],
+    violations: [],
+    derivedCount: 0,
+    rejected: false,
+  }
+
+  it('(a) WITH view: flattened row + transitions + verbatim view incl. representations', () => {
+    const view = {
+      view: 'task-instance',
+      kind: 'instance',
+      source: 'synthesized',
+      elements: [
+        { id: 've_9f3a01', factType: 'Task_has_Task_Subject', componentRole: 'text-input' },
+        { id: 've_77b2c4', factType: 'Task_has_Task_Status', componentRole: 'combo-box' },
+      ],
+      representations: { html: '<form><input name="Task Subject"/></form>' },
+    }
+    const raw = JSON.stringify({ ...baseResult, view })
+    const out = parseGetEntityResponse(raw) as Record<string, unknown>
+    expect(out).not.toBeNull()
+    // The flattened 3NF base row — entity data fields + id, exactly the
+    // legacy shape.
+    expect(out.id).toBe('656')
+    expect(out['Task Status']).toBe('completed')
+    expect(out['Task Subject']).toBe('X')
+    // HATEOAS affordances surface beside the row…
+    expect(out.transitions).toEqual(baseResult.transitions)
+    // …and the view layer passes through VERBATIM, representations
+    // (per-target rendered HTML) included.
+    expect(out.view).toEqual(view)
+    expect((out.view as { representations: Record<string, string> }).representations.html)
+      .toContain('<form>')
+  })
+
+  it("(b) WITHOUT view: shape identical to today's legacy get:{noun} row", () => {
+    // No view + no transitions ⇒ the output must be deep-equal to what
+    // parseGetResponse produces from the legacy row for the same
+    // entity: both paths bottom out in get_noun:{noun}, so data+id IS
+    // the row. This is the zero-regression pin for SM-less nouns.
+    const raw = JSON.stringify({ ...baseResult, transitions: [] })
+    const legacyRow = JSON.stringify({ 'Task Status': 'completed', 'Task Subject': 'X', id: '656' })
+    expect(parseGetEntityResponse(raw)).toEqual(parseGetResponse(legacyRow, 'Task', 'tasks'))
+  })
+
+  it('(b′) empty transitions are NOT attached (no `transitions: []` noise on SM-less nouns)', () => {
+    const raw = JSON.stringify({ ...baseResult, transitions: [] })
+    const out = parseGetEntityResponse(raw) as Record<string, unknown>
+    expect('transitions' in out).toBe(false)
+    expect('view' in out).toBe(false)
+  })
+
+  it('(b″) transitions surface without a view (SM noun, ui-readings compiled out)', () => {
+    const out = parseGetEntityResponse(JSON.stringify(baseResult)) as Record<string, unknown>
+    expect(out.transitions).toEqual(baseResult.transitions)
+    expect('view' in out).toBe(false)
+  })
+
+  it('(c) malformed / ⊥ / rejected / empty-entities → null (caller falls back to get:{noun})', () => {
+    // ⊥: handle not dispatched, or an older binary whose Command enum
+    // predates getEntity ("⊥ unknown variant `getEntity` …").
+    expect(parseGetEntityResponse('⊥')).toBeNull()
+    expect(parseGetEntityResponse('⊥ unknown variant `getEntity`, expected one of …')).toBeNull()
+    // Non-JSON noise.
+    expect(parseGetEntityResponse('not json')).toBeNull()
+    // JSON, but not a CommandResult object.
+    expect(parseGetEntityResponse('null')).toBeNull()
+    expect(parseGetEntityResponse('[]')).toBeNull()
+    // A rejected command result must not shadow the legacy diagnostic.
+    expect(parseGetEntityResponse(JSON.stringify({ ...baseResult, rejected: true }))).toBeNull()
+    // Unknown id: the engine returns a clean empty result (the read
+    // path is not alethic) — the legacy path owns the task-959
+    // wrong-UoD hint, so the parser must defer to it.
+    expect(parseGetEntityResponse(JSON.stringify({ ...baseResult, entities: [] }))).toBeNull()
+    // Defensive: an entity missing its id can't be flattened.
+    expect(parseGetEntityResponse(JSON.stringify({ ...baseResult, entities: [{ data: { A: '1' } }] })))
+      .toBeNull()
+  })
+
+  // Source wiring: the single-id local branch dispatches getEntity
+  // through the `apply` def and KEEPS the legacy call as its fallback;
+  // the list branch and remote/federation branches are untouched.
+  it('get handler wires getEntity-with-fallback into the single-id local branch only', () => {
+    const SRC = SERVER_TS.replace(/\r\n/g, '\n')
+    const head = SRC.indexOf(`server.registerTool(\n  'get',\n`)
+    expect(head, "registerTool('get', ...) block not found").toBeGreaterThan(0)
+    const tail = SRC.indexOf('server.registerTool(', head + 1)
+    const block = SRC.slice(head, tail)
+    // The command envelope rides the same `apply` system call the apply
+    // tool's batch path uses.
+    expect(block).toMatch(/type:\s*'getEntity'/)
+    expect(block).toMatch(/systemCall\('apply'/)
+    expect(block).toMatch(/parseGetEntityResponse/)
+    // The legacy single-id call survives as the fallback…
+    expect(block).toMatch(/systemCall\(`get:\$\{noun\}`, id, scope\)/)
+    // …and the list path still goes through list:{noun} + parseGetResponse.
+    expect(block).toMatch(/systemCall\(`list:\$\{noun\}`, '', scope\)/)
   })
 })
 

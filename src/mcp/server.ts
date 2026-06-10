@@ -1094,7 +1094,7 @@ server.registerTool(
   'get',
   {
     description:
-      'Fetch a 3NF view of ONE entity by id, OR list every entity of a noun (omit id). Returns fields + HATEOAS links. WHEN: you already know "give me Order ord-1 with all its current single-valued facts" — get assembles the per-entity row across every fact type the noun participates in. Listing (no id) returns one row per entity instance of the noun. ALTERNATIVE: query when you want rows of ONE fact type filtered by role binding (e.g. "every Task with Priority p0"); sql when you need joins / aggregates / NOT EXISTS across multiple FTs; actions when you specifically want the legal SM transitions for one entity. GOTCHA: federation-aware — if the noun is bound to an external system, get fetches from there and absorbs the result into the local population with a Citation. Multi-valued facts come back as arrays; single-valued facts come back as scalar strings. NEXT: actions noun=<N> id=<X> to see what transitions are legal, or apply operation=update to modify.',
+      'Fetch a 3NF view of ONE entity by id, OR list every entity of a noun (omit id). Returns fields + HATEOAS links; a single-id get additionally carries `transitions` (the legal SM events) and the engine-projected `view` (ui-readings elements + per-target representations) when the engine surfaces them. WHEN: you already know "give me Order ord-1 with all its current single-valued facts" — get assembles the per-entity row across every fact type the noun participates in. Listing (no id) returns one row per entity instance of the noun. ALTERNATIVE: query when you want rows of ONE fact type filtered by role binding (e.g. "every Task with Priority p0"); sql when you need joins / aggregates / NOT EXISTS across multiple FTs; actions when you specifically want the legal SM transitions for one entity. GOTCHA: federation-aware — if the noun is bound to an external system, get fetches from there and absorbs the result into the local population with a Citation. Multi-valued facts come back as arrays; single-valued facts come back as scalar strings. NEXT: actions noun=<N> id=<X> to see what transitions are legal, or apply operation=update to modify.',
     inputSchema: {
       id: z.string().optional().describe('Entity ID. If omitted, lists all entities of the noun type.'),
       noun: z.string().optional().describe('Noun type (e.g. "Order"). Required when listing, optional when getting by ID (inferred from population).'),
@@ -1124,6 +1124,31 @@ server.registerTool(
     // Local population
     if (AREST_MODE === 'local') {
       if (id) {
+        // mcp-get-surface-view-representations: route the single-id read
+        // through the engine's FULL read path — Command::GetEntity
+        // dispatched through the `apply` def, the same calling
+        // convention the apply tool's batch path uses — so the
+        // Theorem-4 representation rides WITH the row: HATEOAS
+        // `transitions` plus the ui-readings `view` layer (elements +
+        // per-target representations). The compiled get:{noun} def can
+        // never carry these — it returns ONLY the flattened 3NF row.
+        // parseGetEntityResponse re-flattens the CommandResult to that
+        // exact row shape (additive enrichment only) and returns null
+        // whenever the command read misses (older binary, ⊥, rejected,
+        // unknown entity) — then we fall through to the legacy path
+        // unchanged, so the task-959 wrong-UoD diagnostic still fires.
+        try {
+          const envelope = JSON.stringify({
+            command: { type: 'getEntity', noun, entityId: id },
+            population: '',
+          })
+          const rawCommand = await systemCall('apply', envelope, scope)
+          const enriched = parseGetEntityResponse(rawCommand)
+          if (enriched !== null) return textResult(enriched)
+        } catch {
+          // getEntity dispatch failure is non-fatal — the legacy
+          // get:{noun} path below answers exactly as before.
+        }
         const raw = await systemCall(`get:${noun}`, id, scope)
         return textResult(parseGetResponse(raw, noun, scopeName))
       }
@@ -1194,6 +1219,63 @@ export function parseGetResponse(raw: string, noun: string, activeAppName: strin
   } catch {
     return { raw }
   }
+}
+
+/**
+ * Translate the engine's `getEntity` CommandResult — the FULL Theorem-4
+ * read path, dispatched through the `apply` def — into the same
+ * flattened 3NF row `get:{noun}` returns today, enriched with the
+ * HATEOAS + view layers (mcp-get-surface-view-representations).
+ *
+ * Both paths bottom out in the engine's `get_noun:{noun}` platform
+ * primitive (compile.rs binds `get:{noun}` to exactly that Platform
+ * func; command.rs's get_entity_via_defs calls it directly), so
+ * `{...data, id}` reconstructs the legacy row field-for-field —
+ * existing consumers see an identical base shape. On top of that:
+ *
+ *   - `transitions` — the legal SM events (serde camelCase
+ *     TransitionAction: {event, targetStatus, method, href,
+ *     componentRole?}) — attached only when non-empty, so SM-less
+ *     nouns keep today's exact shape (serde always emits the array).
+ *   - `view` — the ui-readings projection ({view, kind, source,
+ *     elements:[{id, factType, componentRole}], representations:
+ *     {<target>: "<html>"}}) — passed through VERBATIM when present
+ *     (serde skip_serializing_if omits it otherwise).
+ *
+ * Returns null when the caller must FALL BACK to the legacy get:{noun}
+ * path: non-JSON / ⊥ output (e.g. an older binary without the
+ * getEntity command), rejected:true, or a missing/empty entities list
+ * (unknown id — the read path is not alethic, and the legacy path's
+ * task-959 wrong-UoD envelope owns that diagnostic).
+ */
+export function parseGetEntityResponse(raw: string): Record<string, unknown> | null {
+  let parsed: unknown
+  try { parsed = JSON.parse(raw) } catch { return null }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+  const result = parsed as {
+    entities?: unknown
+    rejected?: unknown
+    transitions?: unknown
+    view?: unknown
+  }
+  if (result.rejected === true) return null
+  if (!Array.isArray(result.entities) || result.entities.length === 0) return null
+  const entity = result.entities[0] as { id?: unknown; data?: unknown }
+  if (!entity || typeof entity.id !== 'string' || entity.id === '') return null
+  const data = entity.data && typeof entity.data === 'object' && !Array.isArray(entity.data)
+    ? entity.data as Record<string, unknown>
+    : {}
+  // Same row shape as the legacy path: data fields + id. The engine
+  // already excludes 'id' from data, so the spread cannot clobber it —
+  // and putting id last keeps the entity id authoritative if it ever did.
+  const flattened: Record<string, unknown> = { ...data, id: entity.id }
+  if (Array.isArray(result.transitions) && result.transitions.length > 0) {
+    flattened.transitions = result.transitions
+  }
+  if (result.view !== undefined && result.view !== null) {
+    flattened.view = result.view
+  }
+  return flattened
 }
 
 server.registerTool(
