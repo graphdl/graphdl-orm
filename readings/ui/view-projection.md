@@ -67,8 +67,17 @@ View has View Kind.
 
 ViewElement belongs to View.
   Each ViewElement belongs to exactly one View.
-ViewElement renders Fact Type.
+ViewElement renders Fact Type. *
   Each ViewElement renders at most one Fact Type.
+  <!-- `*` (fully-derived / View-materialized): the renders link is
+       derived lazily by view-detail.md's skolem rule. This FIRST
+       declaration must carry the star — view-detail.md re-declares the
+       FT with `*`, but duplicate declarations dedupe to the first one,
+       dropping the re-declaration's Derivation Mode marker; without the
+       star here the rule compiles Stored, never gets its
+       `view:ViewElement_renders_Fact_Type` def, and `resolve_view`
+       returns None for every instance view (the pb-zero-glue-acceptance
+       blocker, 2026-06-10). -->
 ViewElement has Component Role. *
 ViewElement has Order.
   Each ViewElement has at most one Order.

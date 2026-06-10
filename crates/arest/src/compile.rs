@@ -4450,6 +4450,29 @@ mod reflect_schema_cells_tests {
     use super::*;
     use crate::ast::{self, Object};
 
+    /// Regression pin for the view-projection.md `*` fix: the
+    /// `ViewElement renders Fact Type` rule must compile View-
+    /// materialized (the FIRST declaration of the FT carries the star;
+    /// duplicate declarations dedupe to the first, so a star only on
+    /// view-detail.md's re-declaration was silently dropped and the
+    /// rule compiled Stored — never getting its view: def, leaving
+    /// view_via_rho None for every real app).
+    #[test]
+    fn renders_fact_type_rule_is_view_materialized() {
+        let corpus = crate::metamodel_corpus();
+        let state = crate::parse_forml2::parse_to_state(&corpus).expect("corpus parses");
+        let data = cell_index_from_state(&state);
+        let rule = data.derivation_rules.iter()
+            .find(|r| r.consequent_cell.literal_id() == "ViewElement_renders_Fact_Type")
+            .expect("the view-detail renders-Fact-Type rule compiles");
+        assert!(matches!(rule.materialization, crate::types::MaterializationPolicy::View),
+            "rule must be View-materialized (got {:?}) — check the `*` on \
+             view-projection.md's `ViewElement renders Fact Type.` declaration",
+            rule.materialization);
+        assert_eq!(rule.skolem_head_roles.len(), 1,
+            "the (E) head variable must register as a skolem role");
+    }
+
     /// The reflection regenerates schema-as-facts rows from the parsed
     /// Role/Noun cells: one Fact_Type_has_Role + Noun_plays_Role row per
     /// role (deterministic `{ft}#{position}` role ids, the active-voice
