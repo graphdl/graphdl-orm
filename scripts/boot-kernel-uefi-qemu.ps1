@@ -41,8 +41,8 @@
 
 .PARAMETER Display
   Show the QEMU guest display window instead of the default headless
-  `-display none` — for SUPERVISED sessions where a human watches the
-  Slint surface (e.g. the §5.2 UnifiedRepl widget-form demo) and
+  `-display none` - for SUPERVISED sessions where a human watches the
+  Slint surface (e.g. the sec-5.2 UnifiedRepl widget-form demo) and
   drives the keyboard/tablet interactively. The window outlives the
   banner wait: the TimeoutSec cap still applies, so pass a generous
   value (e.g. -TimeoutSec 900) for a hands-on session. Combines with
@@ -216,7 +216,7 @@ if ($TypeLine) {
   $qemuArgs += @('-serial', "file:$serial")
 }
 if ($Display) {
-  # Supervised mode: show the guest display (GTK/SDL — whatever the
+  # Supervised mode: show the guest display (GTK/SDL - whatever the
   # QEMU build defaults to). The virtio-tablet + virtio-keyboard
   # devices above make the window interactive.
   $qemuArgs += @('-no-reboot','-no-shutdown')
@@ -356,7 +356,7 @@ if ($Display -and -not $p.HasExited) {
   # Supervised session: leave the window up until the human closes it
   # (or the TimeoutSec safety cap fires). The banner/TypeLine phases
   # above already ran; from here the human drives.
-  Write-Host "Supervised display session — close the QEMU window (or wait for the ${TimeoutSec}s cap) to end." -ForegroundColor Cyan
+  Write-Host "Supervised display session - close the QEMU window (or wait for the ${TimeoutSec}s cap) to end." -ForegroundColor Cyan
   while ((Get-Date) -lt $deadline -and -not $p.HasExited) {
     Start-Sleep -Milliseconds 1000
     Pump-Serial
