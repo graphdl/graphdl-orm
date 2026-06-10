@@ -33,7 +33,7 @@
 \maketitle
 
 \begin{abstract}
-Domain knowledge enters software as natural language requirements, is re-encoded as schemas, validation logic, state machines, and API routes, and drifts out of sync in production. The informal layer between specification and execution is where bugs live and where automated agents hallucinate. We show that a single set of FORML\,2 declarations can define a database schema, constraint rules, state machine workflows, and a REST API with hypermedia navigation, producing a complete application from domain facts alone. We formalize this as AREST, a Backus AST system~\cite{backus78} whose definitions are compiled FORML\,2 readings~\cite{halpin01} and whose state is Codd's named set~\cite{codd70} of ORM\,2 elementary facts. REST endpoints are applications of a single system function. Ingesting new readings is self-modification. Five theorems establish that the grammar is unambiguous, that specifications and executables are the same object up to a computable canonical form, that state transfer is complete, that HATEOAS links are projections of the population, and that every value in the API is derived from facts. Together they do not eliminate informality so much as corner it: everything informal is localized to the registered platform layer, an enumerable surface that is itself a queryable fact set.
+Domain knowledge enters software as natural language requirements, is re-encoded as schemas, validation logic, state machines, and API routes, and drifts out of sync in production. The informal layer between specification and execution is where bugs live and where automated agents hallucinate. We show that a single set of FORML\,2 declarations can define a database schema, constraint rules, state machine workflows, and a REST API with hypermedia navigation, producing a complete application from domain facts alone. We formalize this as AREST, a Backus AST system~\cite{backus78} whose definitions are compiled FORML\,2 readings~\cite{halpin10} and whose state is Codd's named set~\cite{codd70} of ORM\,2 elementary facts~\cite{halpin01}. REST endpoints are applications of a single system function. Ingesting new readings is self-modification. Five theorems establish that the grammar is unambiguous, that specifications and executables are the same object up to a computable canonical form, that state transfer is complete, that HATEOAS links are projections of the population, and that every value in the API is derived from facts. Together they do not eliminate informality so much as corner it: everything informal is localized to the registered platform layer, an enumerable surface that is itself a queryable fact set.
 \end{abstract}
 
 
@@ -47,7 +47,7 @@ AREST identifies what was never separate to begin with. A FORML\,2 reading is si
 
 \section{Terminology}
 
-Three terms carry overloaded abbreviations. \emph{AST} follows Backus's usage (Applicative State Transition, 1978), not the compiler term. \emph{ORM} follows Halpin's usage (Object-Role Modeling, 2008), not the persistence pattern. \emph{FP} follows Backus's usage (Function-level Programming), not the broader tradition. \emph{FFP} is Backus's extension of FP with named definitions and a representation function $\rho$ that maps objects to the functions they denote~\cite[Sec.\,13]{backus78}.
+Three terms carry overloaded abbreviations. \emph{AST} follows Backus's usage (Applicative State Transition, 1978), not the compiler term. \emph{ORM} follows Halpin's usage (Object-Role Modeling, 2001), not the persistence pattern. \emph{FP} follows Backus's usage (Function-level Programming), not the broader tradition. \emph{FFP} is Backus's extension of FP with named definitions and a representation function $\rho$ that maps objects to the functions they denote~\cite[Sec.\,13]{backus78}.
 
 
 \section{Definition}
@@ -56,7 +56,7 @@ Three terms carry overloaded abbreviations. \emph{AST} follows Backus's usage (A
 An \emph{Applicative REpresentational State Transfer} system is an AST system~\cite[Sec.\,14]{backus78} whose state $D$ satisfies:
 \begin{itemize}[nosep]
 \item The $\mathit{FILE}$ cell contains a population $P = \uparrow\!\mathit{FILE}\!:\!D$, a named set of relations~\cite[Sec.\,1.6]{codd70} whose elements are ORM\,2 elementary facts~\cite[Ch.\,3]{halpin01}
-\item The $\mathit{DEFS}$ cells contain FFP objects~\cite[Sec.\,13.2]{backus78}: readings compiled from FORML\,2 declarations~\cite{halpin01}, and functions registered by the runtime
+\item The $\mathit{DEFS}$ cells contain FFP objects~\cite[Sec.\,13.2]{backus78}: readings compiled from FORML\,2 declarations~\cite{halpin10}, and functions registered by the runtime
 \end{itemize}
 The \emph{schema} $S$ is the set of compiled objects in $\mathit{DEFS}$: fact type constructors, constraint objects, derivation rules, and state machine definitions. The representation function $\rho$~\cite[Sec.\,13.3.2]{backus78} maps an object to the function it represents. Given a fact type, $\rho$ looks it up in $\mathit{DEFS}$ and returns the functional form. The system function $\mathit{SYSTEM}\!:\!x = \langle o, D'\rangle$~\cite[Sec.\,14.3.1]{backus78} is defined by the definitions in $D$. REST endpoints are applications of $\mathit{SYSTEM}$ with distinct inputs. A reference implementation is available~\cite{arest}.
 \end{definition}
@@ -184,7 +184,7 @@ The approach requires no ETL, no integration middleware, and no separate query l
 
 \subsection{State and Cells}
 
-The state $D$ is a sequence of cells $\langle\mathit{CELL}, n, c\rangle$ with Backus's fetch ($\uparrow\!n\!:\!D \to c$) and store ($\downarrow\!n\!:\!\langle x, D\rangle \to D'$) operators~\cite[Sec.\,14.3]{backus78}. $\mathit{FILE}$ is a cell whose contents is~$P$. RMAP~\cite[Ch.\,10]{halpin01} determines which facts belong to which cell from the schema's uniqueness constraints: the result is a 3NF row, the complete set of facts that depend on one entity's key. Each entity is a cell. Cells may contain sub-stores~\cite[Sec.\,14.7]{backus78}.
+The state $D$ is a sequence of cells $\langle\mathit{CELL}, n, c\rangle$ with Backus's fetch ($\uparrow\!n\!:\!D \to c$) and store ($\downarrow\!n\!:\!\langle x, D\rangle \to D'$) operators~\cite[Secs.\,13.3.4, 14.3]{backus78}. $\mathit{FILE}$ is a cell whose contents is~$P$. RMAP~\cite[Ch.\,10]{halpin01} determines which facts belong to which cell from the schema's uniqueness constraints: the result is a 3NF row, the complete set of facts that depend on one entity's key. Each entity is a cell. Cells may contain sub-stores~\cite[Sec.\,14.7]{backus78}.
 
 \begin{definition}[Cell Isolation]\label{def:isolation}
 For each cell $\langle\mathit{CELL}, n, c\rangle$ in $D$, at most one $\mu$ application that writes to $n$ may be in progress at any time. Concurrent $\mu$ applications over disjoint cells are permitted.
@@ -231,7 +231,7 @@ Two derived forms:
 \begin{align}
 \mathit{Filter}(p) &\equiv \mathit{compact} \circ \alpha\,(p \to \mathit{id} ;\; \bot) \label{eq:filter-def}
 \end{align}
-$\alpha$ applies the condition to each element, yielding $\bot$ where $p$ does not hold. $\mathit{compact}$ removes $\bot$ elements, producing a proper subsequence. FFP systems choose their primitive set~\cite[Sec.\,11.4.4]{backus78}; $\mathit{compact}$ is an AREST primitive analogous to APL compress.
+$\alpha$ applies the condition to each element, yielding $\bot$ where $p$ does not hold. $\mathit{compact}$ removes $\bot$ elements, producing a proper subsequence. FFP systems choose their primitive set~\cite[Sec.\,13.4]{backus78}; $\mathit{compact}$ is an AREST primitive analogous to APL compress.
 
 \begin{align}
 \mathit{foldl}\;f\;z\;\langle\rangle &= z \notag \\
@@ -279,7 +279,7 @@ R_{L|_M}\!S &\equiv \mathit{Filter}(p) : R \label{eq:restrict} \\
 R \cdot S &\equiv \pi_{1s}(R \mathbin{*} S) \label{eq:rcomp} \\
 \gamma(R) &\equiv \mathit{Filter}(\mathit{eq} \circ [s_1, s_n]) : R \label{eq:tie}
 \end{align}
-\noindent where $s_{\mathit{sh}}$ selects the shared roles. $P$ is a named set of relations in normal form (ORM\,2 elementary facts are 5NF by construction~\cite[Ch.\,12]{halpin01}). Halpin shows that $\theta_1 = \{\text{projection, natural join, restriction, tie}\}$ is adequate for the named set of ORM\,2 elementary facts~\cite[Ch.\,12]{halpin01}. The combining forms that query the population are the same combining forms that evaluate constraints and derive facts. There is no separate query language.
+\noindent where $s_{\mathit{sh}}$ selects the shared roles. $P$ is a named set of relations in normal form (ORM\,2 elementary facts are 5NF by construction~\cite[Ch.\,12]{halpin01}). Codd's adequacy result therefore applies directly: $\theta_1 = \{\text{projection, natural join, tie, restriction}\}$ is adequate for a named set of relations in normal form~\cite[Sec.\,2.2]{codd70}, with the elementary-fact populations as the named relations. The combining forms that query the population are the same combining forms that evaluate constraints and derive facts. There is no separate query language.
 
 \subsection{Execution Semantics}\label{sec:exec}
 
@@ -475,7 +475,7 @@ Traditional middleware (authentication, validation, rate limiting, transformatio
 
 \section{Conclusion}
 
-The five theorems form a dependency chain from unambiguous grammar to full derivability, each eliminating one source of failure between domain knowledge and running application. Self-modification preserves all five (Corollary~\ref{cor:closure}). Fielding's remaining architectural constraints follow: statelessness holds because each application of $\mathit{SYSTEM}$ is a pure transition on $D$; cacheability because the representation is a deterministic function of $P$ and $S$ (Theorem~\ref{thm:derive}); layered system because cells are location-independent; code-on-demand because self-modification via ingesting readings preserves the theorems.
+The five theorems form a dependency chain from unambiguous grammar to full derivability, each eliminating one source of failure between domain knowledge and running application. Self-modification preserves all five (Corollary~\ref{cor:closure}). Fielding's remaining architectural constraints~\cite{fielding00} follow: statelessness holds because each application of $\mathit{SYSTEM}$ is a pure transition on $D$; cacheability because the representation is a deterministic function of $P$ and $S$ (Theorem~\ref{thm:derive}); layered system because cells are location-independent; code-on-demand because self-modification via ingesting readings preserves the theorems.
 
 The five properties compose into a guarantee for automated agents. An LLM writing FORML\,2 readings produces unambiguous specifications (Theorem~\ref{thm:grammar}) that are the executables (Theorem~\ref{thm:spec}). An LLM consuming the API reads values that are $\rho$-applications over $P$ (Theorem~\ref{thm:derive}) and discovers every valid action via HATEOAS links (Theorem~\ref{thm:hateoas}). There are no undocumented endpoints, no hidden middleware, no informal contracts to hallucinate through. The forward chainer evaluates derivation rules to the least fixed point (Theorem~\ref{thm:complete}), and the LLM reads conclusions, not premises. The logical chain was evaluated deterministically by the engine. When the chain itself is needed, the derivation trace is available on demand.
 
@@ -501,9 +501,6 @@ F. Bancilhon and R. Ramakrishnan, ``An Amateur's Introduction to Recursive Query
 \bibitem{codd70}
 E.F. Codd, ``A Relational Model of Data for Large Shared Data Banks,'' \emph{Commun.\ ACM}, 13(6):377--387, 1970.
 
-\bibitem{codd72}
-E.F. Codd, ``Relational Completeness of Data Base Sublanguages,'' in R. Rustin, ed., \emph{Data Base Systems}, Prentice-Hall, pp.~65--98, 1972.
-
 \bibitem{fielding00}
 R.T. Fielding, ``Architectural Styles and the Design of Network-based Software Architectures,'' Ph.D. dissertation, Univ.\ of California, Irvine, 2000.
 
@@ -515,6 +512,9 @@ T. Halpin, \emph{Information Modeling and Relational Databases}, Morgan Kaufmann
 
 \bibitem{halpin06}
 T. Halpin and M. Curland, ``Automated Verbalization for ORM 2,'' in \emph{OTM Workshops}, pp.~1181--1190, 2006.
+
+\bibitem{halpin10}
+T. Halpin and J.P. Wijbenga, ``FORML 2,'' in \emph{Enterprise, Business-Process and Information Systems Modeling (EMMSAD)}, LNBIP 50, pp.~247--260, 2010.
 
 \bibitem{norma}
 T.~Halpin and M.~Curland, NORMA (Natural Object-Role Modeling Architect), open-source reference implementation, \url{https://github.com/ormsolutions/NORMA}.
