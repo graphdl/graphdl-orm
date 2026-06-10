@@ -1104,9 +1104,17 @@ pub const CORE_READINGS: &[(&str, &str)] = &[
 /// the deontic gate that requires Human-sourced approvals for changes
 /// to root-tier domains. An app that doesn't model proposing schema
 /// edits doesn't need this slice. Kernel + arest-cli enable by default.
+///
+/// csdp.md rides the same slice (user directive 2026-06-10: CSDP is
+/// framework machinery, not an app): Halpin's 7-step CSDP + 3-step
+/// Rmap as executable state machines over Schema Design / Relational
+/// Mapping — CSDP is how a schema comes to BE, Domain Change is how
+/// it CHANGES. Every UoD with this slice carries its own design
+/// procedure as HATEOAS affordances.
 #[cfg(feature = "evolution-readings")]
 pub const EVOLUTION_READINGS: &[(&str, &str)] = &[
     ("evolution",     include_str!("../../../readings/core/evolution.md")),
+    ("csdp",          include_str!("../../../readings/core/csdp.md")),
 ];
 
 /// JS library imports as a federation primitive (analogous to
