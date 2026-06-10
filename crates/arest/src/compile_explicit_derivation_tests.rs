@@ -7406,6 +7406,41 @@ fn render_subscription_delivers_via_notify_effect() {
     crate::command::deliver_render_subscriptions(&d, "Gadget", "g-1", &vp);
     assert!(CAPTURED.lock().unwrap().is_empty(),
         "unrelated noun must not deliver");
+
+    // ── pb-live-binding-reeval (a): cross-noun dirtiness ──────────────
+    // A mutation on ANOTHER noun whose delta touches a cell the view
+    // rules read (Noun_has_Format is in every widget rule's sidecar)
+    // re-delivers the Task subscription; a delta touching only cells
+    // the views never read delivers nothing.
+    // The fixture's widget rules read Fact_Type_has_Format (the
+    // metamodel's analog is Noun_has_Format) — assert the computed
+    // read-set self-identifies it, then drive the cross delivery.
+    let read_set = crate::command::view_rule_read_set(&d);
+    assert!(read_set.contains("Fact_Type_has_Format"),
+        "view read-set must include the widget rules' Format read; got {:?}",
+        read_set);
+    CAPTURED.lock().unwrap().clear();
+    let touched_relevant: hashbrown::HashSet<String> =
+        ["Fact_Type_has_Format".to_string()].into_iter().collect();
+    crate::command::deliver_cross_noun_subscriptions(&d, &touched_relevant, "Fact Type");
+    let cross = CAPTURED.lock().unwrap().clone();
+    // A view-read cell change re-renders EVERY instance watcher of the
+    // affected views (a Format flip re-widgets all of them) — sub-1 AND
+    // sub-2 deliver; sub-3 (no rendering for its target) stays silent.
+    assert_eq!(cross.len(), 2,
+        "both instance watchers re-deliver on a view-read cell change; got {:?}",
+        cross);
+    assert!(cross.iter().any(|m| m.contains("sub-1 Task task-1")),
+        "sub-1 delivery targets its watched entity: {:?}", cross);
+    assert!(cross.iter().any(|m| m.contains("sub-2 Task task-OTHER")),
+        "sub-2 delivery targets ITS watched entity: {:?}", cross);
+
+    CAPTURED.lock().unwrap().clear();
+    let touched_irrelevant: hashbrown::HashSet<String> =
+        ["Gadget_has_Sprocket".to_string()].into_iter().collect();
+    crate::command::deliver_cross_noun_subscriptions(&d, &touched_irrelevant, "Gadget");
+    assert!(CAPTURED.lock().unwrap().is_empty(),
+        "a delta the views never read must not deliver");
 }
 
 // ─── task-934-2 — real-data format projection ────────────────────────────────

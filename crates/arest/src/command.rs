@@ -4045,6 +4045,17 @@ fn update_via_defs(
     // emit an empty delta (no cells change); otherwise diff new_state
     // against the input state so only touched FT cells ship.
     let delta = if rejected { ast::Object::phi() } else { ast::diff_cells(state, &new_state) };
+    // pb-live-binding-reeval (a): cross-noun delivery — subscriptions on
+    // OTHER nouns re-deliver when this delta touched a cell the view
+    // rules read (e.g. a value type's Format flip re-widgets every view
+    // that joins it). Same-noun watchers were delivered above.
+    if !rejected {
+        let touched: hashbrown::HashSet<String> = ast::cells_iter(&delta)
+            .into_iter().map(|(n, _)| n.to_string()).collect();
+        if !touched.is_empty() {
+            deliver_cross_noun_subscriptions(d, &touched, noun);
+        }
+    }
     CommandResult {
         entities: vec![EntityResult {
             id: entity_id.to_string(),
@@ -5466,6 +5477,97 @@ pub fn deliver_render_subscriptions(
             diag!("[render-subscription] delivery for '{}' bottomed \
                    (deontic — mutation unaffected)", sub);
         }
+    }
+}
+
+/// pb-live-binding-reeval (a): the STATIC read-set of the lazy view
+/// rules. A mutation whose delta touches any of these cells may change
+/// WHAT a synthesized view renders for entities of OTHER nouns (e.g.
+/// flipping a value type's `Noun has Format` re-widgets every view
+/// that joins it), so it dirties cross-noun subscriptions. Computed
+/// per call from cells — no runtime capture, no registry.
+pub(crate) fn view_rule_read_set(d: &ast::Object) -> hashbrown::HashSet<String> {
+    // Lazy view rules SELF-IDENTIFY by their reads: every synthesized-
+    // instance-view rule joins through the injected View pair
+    // (`View_is_for_Noun` + `View_has_View_Kind` — view-detail.md's
+    // shared-frontier rules; view_via_rho injects the pair per render).
+    // Walking the `derivation_reads:` sidecars for that signature
+    // avoids the rule→consequent mapping entirely (the DerivationRule
+    // cell's consequent binding only carries a value after a persist
+    // round-trip; fixture-fresh states have it empty). The View pair
+    // itself is excluded from the result — injected per render, never
+    // a population signal.
+    let mut out: hashbrown::HashSet<String> = hashbrown::HashSet::new();
+    for (name, _) in ast::cells_iter(d).into_iter() {
+        let Some(id) = name.strip_prefix("derivation_reads:") else { continue };
+        let Some(reads) = crate::evaluate::read_derivation_reads(d, id) else { continue };
+        if !reads.iter().any(|c| c == "View_is_for_Noun") {
+            continue;
+        }
+        out.extend(reads.into_iter().filter(|c|
+            c != "View_is_for_Noun" && c != "View_has_View_Kind"));
+    }
+    out
+}
+
+/// pb-live-binding-reeval (a): cross-noun delivery. After a mutation,
+/// subscriptions on OTHER nouns are dirty when the delta touched a
+/// cell the view rules read (`view_rule_read_set`). Each dirty
+/// subscription re-projects + re-renders its watched entity (fields
+/// via the `get_noun:` primitive) and delivers through the effect
+/// seam. The mutated entity's own subscriptions are the caller's
+/// same-noun hook; they are excluded here to avoid double delivery.
+pub fn deliver_cross_noun_subscriptions(
+    d: &ast::Object,
+    touched_cells: &hashbrown::HashSet<String>,
+    mutated_noun: &str,
+) {
+    let subs = ast::fetch_cell_seq("Render_Subscription_is_for_Noun", d);
+    let Some(rows) = subs.as_seq() else { return };
+    if rows.is_empty() {
+        return;
+    }
+    let read_set = view_rule_read_set(d);
+    if read_set.is_disjoint(touched_cells) {
+        return; // nothing the views read changed
+    }
+    for row in rows {
+        let (Some(sub), Some(sub_noun)) = (
+            ast::binding(row, "Render Subscription"),
+            ast::binding(row, "Noun"),
+        ) else { continue };
+        if sub_noun == mutated_noun {
+            continue; // same-noun hook already delivered
+        }
+        // Instance subscriptions only in this slice — a collection
+        // subscription (no watched id) is slice (b).
+        let watched = ast::fetch_cell_seq("Render_Subscription_watches_Entity_Id", d)
+            .as_seq()
+            .and_then(|facts| facts.iter().find_map(|f| {
+                (ast::binding(f, "Render Subscription") == Some(sub))
+                    .then(|| ast::binding(f, "Entity Id").map(String::from))
+                    .flatten()
+            }));
+        let Some(entity_id) = watched else { continue };
+        let Some(mut vp) = view_via_rho(d, sub_noun, &entity_id) else { continue };
+        let fields: hashbrown::HashMap<String, String> = ast::apply(
+            &ast::Func::Platform(alloc::format!("get_noun:{}", sub_noun)),
+            &ast::Object::atom(&entity_id),
+            d,
+        )
+        .as_atom()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|val| val.as_object().cloned())
+        .map(|obj| obj.iter()
+            .filter(|(k, _)| k.as_str() != "id")
+            .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect())
+        .unwrap_or_default();
+        let status = extract_sm_status(d, &entity_id);
+        let transitions = hateoas_via_rho(d, sub_noun, &entity_id, status.as_deref());
+        let reps = render_via_targets(d, &vp, &entity_id, sub_noun, &fields, &transitions);
+        vp.representations = reps;
+        deliver_render_subscriptions(d, sub_noun, &entity_id, &vp);
     }
 }
 
