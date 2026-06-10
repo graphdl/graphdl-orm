@@ -192,6 +192,12 @@ For each cell $\langle\mathit{CELL}, n, c\rangle$ in $D$, at most one $\mu$ appl
 
 \noindent RMAP assigns each entity to its own cell whose fold is independent. A single-threaded runtime satisfies Definition~\ref{def:isolation} trivially. A distributed system requires one writer per cell. Without isolation, two concurrent $\mathit{create}$ operations on the same cell may both pass $\mathit{validate}$ against stale $P$ and produce inconsistent state without an error.
 
+\begin{definition}[Constraint Scope]\label{def:scope}
+The \emph{scope} of a constraint $c$ is the set of cells its restriction reads: $\mathit{scope}(c) = \{\,n \mid (\rho\,c)\!:\!P \text{ reads } \uparrow\!n\,\}$. Two commits \emph{conflict} on $c$ when both write cells in $\mathit{scope}(c)$.
+\end{definition}
+
+\noindent Cell Isolation serializes only the constraints whose scope is a single cell; the constraints worth having span cells, and there the model admits write skew. For ``each Customer places at most 3 Orders,'' two concurrent creates in distinct Order cells each validate against a $P$ that lacks the other's pending insert, and both commit, jointly violating a constraint neither violated alone. The model therefore imposes an obligation rather than resolving one: commits that conflict on a constraint's scope must serialize. Any of the standard mechanisms discharges it: a designated serialization cell per cross-cell constraint (single writer per scope, generalizing Definition~\ref{def:isolation}), commit-time conflict detection over the validate read set (the derivation chain already records what was read), or the total event order of Corollary~\ref{cor:consensus}. A single-threaded runtime discharges it trivially. Theorem~\ref{thm:complete} assumes scope-serialized commits below.
+
 
 \section{Formal Foundations}
 
@@ -279,7 +285,7 @@ R_{L|_M}\!S &\equiv \mathit{Filter}(p) : R \label{eq:restrict} \\
 R \cdot S &\equiv \pi_{1s}(R \mathbin{*} S) \label{eq:rcomp} \\
 \gamma(R) &\equiv \mathit{Filter}(\mathit{eq} \circ [s_1, s_n]) : R \label{eq:tie}
 \end{align}
-\noindent where $s_{\mathit{sh}}$ selects the shared roles. $P$ is a named set of relations in normal form (ORM\,2 elementary facts are 5NF by construction~\cite[Ch.\,12]{halpin01}). Codd's adequacy result therefore applies directly: $\theta_1 = \{\text{projection, natural join, tie, restriction}\}$ is adequate for a named set of relations in normal form~\cite[Sec.\,2.2]{codd70}, with the elementary-fact populations as the named relations. The combining forms that query the population are the same combining forms that evaluate constraints and derive facts. There is no separate query language.
+\noindent where $s_{\mathit{sh}}$ selects the shared roles. $P$ is a named set of relations in normal form (ORM\,2 elementary facts are 5NF by construction~\cite[Ch.\,12]{halpin01}). Codd's adequacy result therefore applies directly: $\theta_1 = \{\text{projection, natural join, tie, restriction}\}$ is adequate for a named set of relations in normal form~\cite[Sec.\,2.2]{codd70}, with the elementary-fact populations as the named relations. The adequacy claim is scoped deliberately. Codd's restriction takes dyadic comparisons, and the navigation layer stays inside it: every predicate in Theorem~\ref{thm:hateoas} composes $\mathit{eq}$ with selectors and constants. The constraint layer generalizes the restriction predicate (the uniqueness example of Section~\ref{sec:example} filters on $\mathit{count}(s_1) > 1$), and counting sits outside the algebra Codd proved adequate; the algebra-with-aggregates equivalence is Klug's~\cite{klug82}. Navigation is $\theta_1$ in Codd's own operators; constraints are $\theta_1$ with an FFP predicate parameter. The combining forms that query the population are the same combining forms that evaluate constraints and derive facts. There is no separate query language.
 
 \subsection{Execution Semantics}\label{sec:exec}
 
@@ -287,7 +293,7 @@ $\mu$ evaluates by applicative-order $\beta$-reduction~\cite[Sec.\,13.3.1]{backu
 \begin{enumerate}[nosep]
 \item \textbf{Reduction order:} applicative (call-by-value).
 \item \textbf{Scope:} confined to the request-local partition of $D$ determined by RMAP.
-\item \textbf{Derivation:} forward chaining, monotonic, evaluated to the least fixed point per request. Derivation only adds facts over finite $P$; the fixed point exists by Knaster-Tarski and is reached in $\leq |P_{\max}| - |P|$ steps. The derivation chain is recorded and available on demand.
+\item \textbf{Derivation:} forward chaining, monotonic (rules are positive by the grammar's derivation family; negation is confined to constraint rendering), evaluated to the least fixed point per request. Derivation only adds facts over finite $P$; the fixed point exists by Knaster-Tarski and is reached in $\leq |P_{\max}| - |P|$ steps. The derivation chain is recorded and available on demand.
 \end{enumerate}
 
 \smallskip\noindent\textbf{Remark} (Cost model). The fixed point is the specification, not the execution plan. Because $P$ is append-only (deletion is a terminal state, Corollary~\ref{cor:delete}), $\mathit{lfp}(F_S, \cdot)$ admits maintenance as a materialized view across the event stream rather than recomputation per request: insertion-only semi-naive evaluation fires a rule only on the previous round's delta~\cite{bancilhon86}, and the one controlled non-monotonicity, the current-status projection a new event logically retracts, is classical incremental view maintenance~\cite{gupta93}. Per-request cost is then proportional to the new derivations and the representation touched, not to a re-chase of the partition (which RMAP already confines); Knaster-Tarski guarantees the cheaper path agrees with the specification.
@@ -302,7 +308,7 @@ The system operates over facts~$(P)$, computations~$(O$ via $\rho)$, and inputs~
 The five theorems form a chain. Each depends on the previous one and eliminates one source of failure in the path from domain knowledge to running software. They are not all of one register, and we say so up front: Theorems~\ref{thm:grammar}--\ref{thm:hateoas} have proof content, while Theorem~\ref{thm:derive} is true by construction (a closure invariant of the definition of $\mathit{repr}$) and is stated in the chain because it is the guarantee the agent argument consumes. The genre is Fielding's: an architecture justified by exhibiting its own construction.
 
 \begin{theorem}[Grammar Unambiguity]\label{thm:grammar}
-Let $N$ be a declared set of object type names and $F$ a declared set of predicate readings, such that no element of $N$ contains a formal item of the grammar as a substring. Then each FORML\,2 sentence over $(N, F)$ has exactly one parse.
+Let $N$ be a declared set of object type names and $F$ a declared set of predicate readings, such that no element of $N$ contains a formal item of the grammar as a substring. Then each sentence of the AREST fragment of FORML\,2 over $(N, F)$ (the three structural families below, which are exactly the sentences the compiler accepts) has exactly one parse.
 \end{theorem}
 
 \begin{proof}
@@ -324,7 +330,7 @@ $[\mathit{modal}] \;\; \mathit{quant}_1 \;\; n_1 \;\; r \;\; \mathit{quant}_2 \;
 The three families are distinguished by their sentence prefix at position~(1). Within each family, the parse is deterministic. The reference implementation~\cite{norma} constructively demonstrates unambiguous round-trip parsing for all 17 constraint kinds.
 \end{proof}
 
-\noindent The hypothesis on $N$ is enforced by the compiler, which rejects any declared name containing a formal item of the grammar as a substring.
+\noindent The hypothesis on $N$ is enforced by the compiler, which rejects any declared name containing a formal item of the grammar as a substring. The fragment is a proper subset of Halpin's full FORML\,2: mixfix predicates of arbitrary arity, pronoun-correlated clauses, and nested objectification lie outside it and are rejected rather than guessed at. Ambiguity in controlled natural languages lives in attachment and scope, not tokenization; the families above are chosen so that neither arises, and the theorem claims nothing about sentences outside the fragment.
 
 \begin{theorem}[Specification Equivalence]\label{thm:spec}
 Let $\mathit{parse}: R \to \Phi$ and $\mathit{compile}: \Phi \to O$ be the parse and compile maps, with $R$ the set of FORML\,2 readings over $(N, F)$, $\Phi$ the set of FOL formulas, and $O$ the set of FFP objects. Define \emph{reading equivalence} as the kernel of the pipeline: $r_1 \sim r_2$ iff $\mathit{compile}(\mathit{parse}(r_1)) = \mathit{compile}(\mathit{parse}(r_2))$. Then $\mathit{compile} \circ \mathit{parse}$ is injective on $R/{\sim}$, and the quotient has a computable section that lands inside the grammar: with $\mathit{verbalize}$ the Halpin--Curland primary-reading verbalization~\cite{halpin06},
@@ -343,7 +349,7 @@ Injectivity on the quotient is immediate: $R/{\sim}$ is the kernel quotient of $
 \smallskip\noindent\textbf{Remark} (Surjectivity). $\mathit{compile}$ is not surjective. Runtime-registered functions occupy the complement. FORML\,2 readings cover the domain layer; registered functions cover the platform layer. Together they span $\mathit{DEFS}$, and the partition itself is a fact (Corollary~\ref{cor:boundary}).
 
 \begin{theorem}[Completeness of State Transfer]\label{thm:complete}
-Let $F_S : 2^P \to 2^P$ be the monotonic operator that applies all derivation rules in schema $S$ to a population, and let $C_S$ be the set of constraint objects in $S$. Under Definition~\ref{def:isolation}, $\mathit{create}$~(\ref{eq:create}) applied to input $I$ and state $D$ produces $\langle o, D'\rangle$ such that:
+Let $F_S : 2^P \to 2^P$ be the monotonic operator that applies all derivation rules in schema $S$ to a population (positive by the grammar: the derivation-rule family of Theorem~\ref{thm:grammar} compiles positive bodies, and negation is confined to constraint rendering), and let $C_S$ be the set of constraint objects in $S$. Under Definition~\ref{def:isolation} with scope-serialized commits (Definition~\ref{def:scope}), $\mathit{create}$~(\ref{eq:create}) applied to input $I$ and state $D$ produces $\langle o, D'\rangle$ such that:
 \begin{enumerate}[nosep]
 \item $P' = P \cup \mathit{resolve}(S, I)$ contains all entity facts entailed by $(S, I)$;
 \item $P'' = \mathit{lfp}(F_S, P')$, the least fixed point of $F_S$ above $P'$;
@@ -353,7 +359,7 @@ Let $F_S : 2^P \to 2^P$ be the monotonic operator that applies all derivation ru
 \end{theorem}
 
 \begin{proof}
-$P$ is finite. $F_S$ is monotonic. By Knaster-Tarski, $\mathit{lfp}(F_S, P')$ exists and is unique. $\mathit{validate}$ applies every $c \in C_S$ as a restriction over the fixed point. $\mathit{emit}$ constructs $o$ from $P''$, $V$, and $\mathit{links}(s)$ (Theorem~\ref{thm:hateoas}). Definition~\ref{def:isolation} ensures no concurrent write to the same cell.
+$P$ is finite. $F_S$ is monotonic because every rule is positive; a rule with negation under a CWA noun would break monotonicity, and the grammar's derivation family excludes it (stratified or well-founded extensions are future work, outside this theorem). By Knaster-Tarski, $\mathit{lfp}(F_S, P')$ exists and is unique. $\mathit{validate}$ applies every $c \in C_S$ as a restriction over the fixed point. $\mathit{emit}$ constructs $o$ from $P''$, $V$, and $\mathit{links}(s)$ (Theorem~\ref{thm:hateoas}). Definition~\ref{def:isolation} ensures no concurrent write to the same cell, and scope serialization (Definition~\ref{def:scope}) ensures no write skew across the cells a constraint reads.
 \end{proof}
 
 \begin{theorem}[HATEOAS as Projection]\label{thm:hateoas}\label{thm:nav}
@@ -395,6 +401,8 @@ The full link set:
 
 \noindent\textbf{Remark} (Prior formal models). Finite-state models of RESTful systems exist~\cite{zuzak11}; they model the client's traversal as a machine over received representations. Theorem~\ref{thm:hateoas} works on the other side of the interface: it derives the affordance set itself from the schema's uniqueness-constraint structure and the population, the part of hypermedia Fielding left informal.
 
+\smallskip\noindent\textbf{Remark} (Selection). The theorem enumerates affordances and deliberately says nothing about choosing among them: when $|\mathit{links}(s)| > 1$, an agent needs a choice function, and the formalism leaves that joint open by design. Any principled selector that reads facts (weights, preferences, valuation fact types over the link set) is itself a projection over a restriction of $P$, so selection extends the architecture from inside $\theta_1$ rather than escaping it.
+
 \begin{theorem}[Derivability]\label{thm:derive}
 Define the \emph{representation} of an entity $e$ in population $P$ under schema $S$ as:
 \begin{align*}
@@ -424,7 +432,7 @@ Let every definition entering $\mathit{DEFS}$ carry the fact type \emph{Definiti
 a $\theta_1$ restriction over $\mathit{DEFS}$-as-population, itself a $\rho$-application (Theorem~\ref{thm:derive}).
 \end{corollary}
 
-\noindent The surjectivity remark (Theorem~\ref{thm:spec}) and the world-assumption remark (Section~\ref{sec:exec}) are the same boundary seen from the definition side and the population side: both name the compiled/registered partition of $\mathit{DEFS}$. Making the partition a fact type turns two concessions into an audit query. Informality is not eliminated; it is localized to an enumerable surface that is itself a queryable fact set, self-describing by construction.
+\noindent The surjectivity remark (Theorem~\ref{thm:spec}) and the world-assumption remark (Section~\ref{sec:exec}) are the same boundary seen from the definition side and the population side: both name the compiled/registered partition of $\mathit{DEFS}$. Making the partition a fact type turns two concessions into an audit query. Informality is not eliminated; it is localized to an enumerable surface that is itself a queryable fact set, self-describing by construction. The same query names the kernel: $\mathit{parse}$, $\mathit{compile}$, and $\mathit{verbalize}$ are themselves registered code that the theorems quantify over but do not verify, an LCF-style trusted kernel. The trusted base is exactly the compiler plus the registered layer, and the restriction above enumerates it.
 
 \begin{corollary}[Deletion as Terminal State]\label{cor:delete}
 A state with no outgoing transitions produces $\mathit{links}(s) = \emptyset$ by Theorem~\ref{thm:hateoas}. The entity is excluded from query results by $\mathit{Filter}(p_{\mathit{live}}) : P$.
@@ -465,7 +473,7 @@ P &= \textstyle\bigcup_n \uparrow\!\mathit{FILE}\!:\!D_n \label{eq:pop}
 \end{align}
 Adding cells to the cluster scales $\mathit{SYSTEM}$ horizontally without changing its definition.
 
-A browser runtime is a node in the same model. Cells replicated locally fold events with zero latency, syncing asynchronously. Because the fold is deterministic, two nodes folding the same events reach the same state (Corollary~\ref{cor:consensus}). Local constraints (cardinality, value) evaluate immediately. Cross-cell constraints (subset, external uniqueness) evaluate against committed state after sync. Local evaluation is optimistic feedback, not a security boundary: acceptance is decided at commit, where $\mathit{validate}$ runs against the authoritative $P$ (Corollary~\ref{cor:consensus}).
+A browser runtime is a node in the same model. Cells replicated locally fold events with zero latency, syncing asynchronously. Because the fold is deterministic, two nodes folding the same events reach the same state (Corollary~\ref{cor:consensus}). Local constraints (cardinality, value) evaluate immediately. Cross-cell constraints (subset, external uniqueness) evaluate against committed state after sync, and their commits serialize per Definition~\ref{def:scope}. Local evaluation is optimistic feedback, not a security boundary: acceptance is decided at commit, where $\mathit{validate}$ runs against the authoritative $P$ (Corollary~\ref{cor:consensus}).
 
 For anonymous peers, events carry cryptographic signatures for identity, schema modifications require authorization (a deontic constraint), and every peer validates independently (Corollary~\ref{cor:consensus}). The hash chain provides ordering, constraints provide validity, signatures provide identity, and authorization provides permission, all composed from the existing formalism: validity is Theorem~\ref{thm:complete}, representation is Theorem~\ref{thm:derive}.
 
@@ -515,6 +523,9 @@ T. Halpin and M. Curland, ``Automated Verbalization for ORM 2,'' in \emph{OTM Wo
 
 \bibitem{halpin10}
 T. Halpin and J.P. Wijbenga, ``FORML 2,'' in \emph{Enterprise, Business-Process and Information Systems Modeling (EMMSAD)}, LNBIP 50, pp.~247--260, 2010.
+
+\bibitem{klug82}
+A. Klug, ``Equivalence of Relational Algebra and Relational Calculus Query Languages Having Aggregate Functions,'' \emph{J.\ ACM}, 29(3):699--717, 1982.
 
 \bibitem{norma}
 T.~Halpin and M.~Curland, NORMA (Natural Object-Role Modeling Architect), open-source reference implementation, \url{https://github.com/ormsolutions/NORMA}.
