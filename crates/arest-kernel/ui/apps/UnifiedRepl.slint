@@ -48,6 +48,17 @@ import { AppShell, Theme, ThemeMode } from "../AppShell.slint";
 import { Button, ButtonVariant } from "../components/Button.slint";
 import { Card } from "../components/Card.slint";
 import { List, ListItem } from "../components/List.slint";
+
+// §5.2 viewproj-client-render: one synthesized-view widget row. The
+// engine's view_via_rho derives the element list (fact type + Component
+// Role) from the value-type layer; the Rust glue fills label/value and
+// the Detail card renders each row as its widget's SHAPE (read-only
+// this slice — mutation rides the Actions card's affordances).
+export struct ViewField {
+    label: string,
+    widget: string,   // "text-input" | "date-picker" | "checkbox" | "combo-box" | other
+    value: string,
+}
 // Re-exported launcher app surfaces. The slint compiler walks these
 // imports and emits each Window-derived component into the single
 // generated `UnifiedRepl.rs`. The launcher (Track UUU #431) instantiates
@@ -110,6 +121,10 @@ export component UnifiedRepl inherits Window {
     // Detail panel: each line is one binding (`role = value`) or one
     // back-reference. Rust glue formats; Slint just renders.
     in property <[string]> detail-lines;
+
+    // §5.2: the synthesized instance view's widget rows (view_via_rho).
+    // Empty when no instance is selected or the noun derives no view.
+    in property <[ViewField]> view-fields;
 
     // Breadcrumbs across the top of the left pane.
     in property <[string]> breadcrumbs;
@@ -553,6 +568,72 @@ export component UnifiedRepl inherits Window {
                                     font-family: Theme.type-body.family;
                                     font-size: Theme.type-body.size;
                                     wrap: word-wrap;
+                                }
+                                // ---- §5.2 view form: one widget row per
+                                // synthesized ViewElement. Custom primitives
+                                // in house style (no std-widgets dependency);
+                                // read-only render — the widget SHAPE carries
+                                // the Component Role semantics.
+                                for field[fidx] in root.view-fields : VerticalLayout {
+                                    spacing: 2px;
+                                    Text {
+                                        text: field.label;
+                                        color: Theme.text-muted;
+                                        font-family: Theme.type-body.family;
+                                        font-size: Theme.type-body.size - 2px;
+                                    }
+                                    if field.widget == "checkbox" : HorizontalLayout {
+                                        spacing: 6px;
+                                        Text {
+                                            text: field.value == "true" ? "☑" : "☐";
+                                            color: Theme.text-primary;
+                                            font-size: Theme.type-body.size + 2px;
+                                        }
+                                        Text {
+                                            text: field.value == "true" ? "yes" : "no";
+                                            color: Theme.text-primary;
+                                            font-family: Theme.type-body.family;
+                                            font-size: Theme.type-body.size;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    if field.widget != "checkbox" : Rectangle {
+                                        height: 26px;
+                                        border-width: 1px;
+                                        border-color: Theme.text-muted;
+                                        border-radius: 4px;
+                                        background: Theme.neutral-100;
+                                        HorizontalLayout {
+                                            padding-left: 6px;
+                                            padding-right: 6px;
+                                            Text {
+                                                text: field.value == "" ? " " : field.value;
+                                                color: Theme.text-primary;
+                                                font-family: Theme.type-code.family;
+                                                font-size: Theme.type-code.size;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                            }
+                                            if field.widget == "combo-box" : Text {
+                                                text: "▾";
+                                                color: Theme.text-muted;
+                                                font-size: Theme.type-body.size;
+                                                vertical-alignment: center;
+                                                horizontal-stretch: 0;
+                                            }
+                                            if field.widget == "date-picker" : Text {
+                                                text: "📅";
+                                                font-size: Theme.type-body.size - 2px;
+                                                vertical-alignment: center;
+                                                horizontal-stretch: 0;
+                                            }
+                                        }
+                                    }
+                                }
+                                if root.view-fields.length > 0 : Rectangle {
+                                    height: 1px;
+                                    background: Theme.text-muted;
+                                    opacity: 0.3;
                                 }
                                 for line[idx] in root.detail-lines : Text {
                                     text: line;

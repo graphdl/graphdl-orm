@@ -653,6 +653,62 @@ fn instances_of(noun: &str, state: &Object) -> Vec<String> {
     set.into_iter().collect()
 }
 
+/// §5.2 viewproj-client-render: the synthesized instance view's widget
+/// rows for one entity — `(label, widget, value)` triples the Slint
+/// `ViewField` form renders. Structure from the engine's
+/// `view_via_rho` (the same lazy view: rules every other render target
+/// consumes — the kernel is just another Render Target consumer);
+/// values from the noun's own cells. Empty when the noun derives no
+/// view (ui-readings carry the rules; value types need their Format
+/// declared — see render-target.md / the csdp precedent).
+fn view_fields_for(
+    noun: &str,
+    instance: &str,
+    state: &Object,
+) -> Vec<(String, String, String)> {
+    let Some(vp) = arest::viewproj::view_via_rho(state, noun, instance) else {
+        return Vec::new();
+    };
+    let noun_prefix = format!("{}_has_", noun.replace(' ', "_"));
+    let cells = cells_for_noun(noun, state);
+    let value_of = |attr: &str| -> String {
+        let spaced = attr.replace('_', " ");
+        for (cell_attr, cell) in &cells {
+            if *cell_attr != attr {
+                continue;
+            }
+            let Some(facts) = cell.as_seq() else { continue };
+            for fact in facts {
+                if ast::binding(fact, noun) != Some(instance) {
+                    continue;
+                }
+                // Fact role keys may be spaced ("Task Description") or
+                // underscored depending on the writer — try both.
+                if let Some(v) = ast::binding(fact, &spaced)
+                    .or_else(|| ast::binding(fact, attr))
+                {
+                    return v.to_string();
+                }
+            }
+        }
+        String::new()
+    };
+    vp.elements
+        .iter()
+        .map(|el| {
+            let attr = el
+                .fact_type
+                .strip_prefix(noun_prefix.as_str())
+                .unwrap_or(&el.fact_type);
+            (
+                attr.replace('_', " "),
+                el.component_role.clone(),
+                value_of(attr),
+            )
+        })
+        .collect()
+}
+
 /// Build the detail view for one instance of `noun`.
 fn detail_lines_for(noun: &str, instance: &str, state: &Object) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -734,6 +790,8 @@ struct Snapshot {
     instances: Vec<String>,
     selected_instance_index: i32,
     detail_lines: Vec<String>,
+    /// §5.2: widget rows (label, widget, value) for the selected instance.
+    view_fields: Vec<(String, String, String)>,
     breadcrumbs: Vec<String>,
     /// Status fragment for HATEOAS half (combined with REPL fragment
     /// in `redraw`).
@@ -754,6 +812,7 @@ impl Snapshot {
             detail_lines: vec![
                 "SYSTEM not initialised \u{2014} call system::init() first.".to_string(),
             ],
+            view_fields: Vec::new(),
             breadcrumbs: vec!["Resources".to_string()],
             hateoas_status: "system::init() not yet called".to_string(),
             rendered: RenderedScreen {
@@ -810,6 +869,14 @@ impl Snapshot {
             _ => Vec::new(),
         };
 
+        // §5.2: the widget-shaped view rows for the selected instance.
+        let view_fields: Vec<(String, String, String)> = match ui.current_nav() {
+            Breadcrumb::Instance { noun, instance } => {
+                view_fields_for(noun, instance, state)
+            }
+            _ => Vec::new(),
+        };
+
         let breadcrumbs: Vec<String> = ui.nav_stack.iter().map(|c| c.label()).collect();
 
         let hateoas_status = match ui.current_nav() {
@@ -828,6 +895,7 @@ impl Snapshot {
             instances,
             selected_instance_index,
             detail_lines,
+            view_fields,
             breadcrumbs,
             hateoas_status,
             rendered,
@@ -869,6 +937,19 @@ fn redraw(window: &UnifiedRepl, ui: &mut UnifiedReplState) {
         snap.detail_lines.iter().map(SharedString::from),
     ));
     window.set_detail_lines(detail_model);
+
+    // §5.2: the widget-shaped view rows (ViewField is the slint-generated
+    // struct exported by UnifiedRepl.slint via include_modules!).
+    let view_fields_model = ModelRc::new(VecModel::from_iter(
+        snap.view_fields.iter().map(|(label, widget, value)| {
+            crate::arch::uefi::slint_backend::ViewField {
+                label: SharedString::from(label.as_str()),
+                widget: SharedString::from(widget.as_str()),
+                value: SharedString::from(value.as_str()),
+            }
+        }),
+    ));
+    window.set_view_fields(view_fields_model);
 
     let crumbs_model: StringModel = ModelRc::new(VecModel::from_iter(
         snap.breadcrumbs.iter().map(SharedString::from),
