@@ -13176,20 +13176,26 @@ mod tests {
     /// Fixture mirrors `sql::tests::view_fact_type_resolves_derivation_on_sql_read`.
     #[test]
     fn query_ft_resolves_view_backed_fact_type() {
+        // bridge-identity-binding-untyped: head-noun membership row (identity
+        // renames are typed now) — `Thing has Name.` + `Thing 'b1' has Name 'n1'.`
+        // stage b1 as an instance of head noun Thing.
         let src = "Thing(.id) is an entity type.\n\
 Base(.id) is an entity type.\n\
 Tag is a value type.\n\
 Thing Tag is a value type.\n\
+Name is a value type.\n\
 \n\
 ## Fact Types\n\
 Base has Tag.\n\
 Thing has Thing Tag. *\n\
+Thing has Name.\n\
 \n\
 ## Derivation Rules\n\
 * Thing has Thing Tag iff that Base has some Tag and Thing Tag is Tag and Thing is Base.\n\
 \n\
 ## Instance Facts\n\
-Base 'b1' has Tag 'hot'.\n";
+Base 'b1' has Tag 'hot'.\n\
+Thing 'b1' has Name 'n1'.\n";
         let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src).expect("parse");
         let defs = crate::compile::compile_to_defs_state(&state);
         let d = defs_to_state(&defs, &state);

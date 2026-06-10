@@ -5512,6 +5512,80 @@ fn consequent_role_subscripts(
     out
 }
 
+/// bridge-identity-binding-untyped (arc-agi-3 issue 1): TYPE the bridge's
+/// identity renames. An identity computed binding (`Run is Resource` — a
+/// bare `ArithExpr::RoleRef`, no arithmetic) re-keys an antecedent value
+/// into an ENTITY-typed head role with no population check, so a shared
+/// carrier cell (the multi-SM `Resource_is_currently_in_Status`) leaked
+/// every OTHER noun's resources into the head noun's derived cell. This
+/// wrapper filters the compiled func's emitted facts to those whose head
+/// value is an instance of the head noun, FFP-composed from the same
+/// membership machinery `sm_seed_func` uses:
+///
+///   pop → [facts, instance_set]   (Construction over the original func
+///                                  + SetFromSeq · instances_of_noun)
+///       → DistR                    [[fact, set], …]
+///       → Filter(member)           member = ¬null · FetchOrPhi:<value, set>
+///       → α(Selector(1))           unwrap back to the facts
+///
+/// Value-typed renames (`Game State is Status`) are untouched — value
+/// types carry no instance population; their rename is pure. A fact
+/// whose head binding is missing FetchOrPhi's to ⊥ and Filter drops it
+/// (total — never Bottoms the round). A head noun with NO instances in
+/// the population derives nothing, which is the typed reading: no Runs,
+/// no Run facts. Single-noun bridges (the tasks app) see every carrier
+/// row pass — pinned by
+/// `bridge_identity_binding_passes_full_population_single_sm`.
+fn guard_identity_bindings_by_noun_population(
+    data: &CellIndex,
+    rule: &DerivationRuleDef,
+    func: Func,
+) -> Func {
+    let entity_identity_roles: Vec<&str> = rule.consequent_computed_bindings.iter()
+        .filter(|cb| matches!(cb.expr, crate::types::ArithExpr::RoleRef(_)))
+        .filter(|cb| data.nouns.get(&cb.role)
+            .map(|nd| nd.object_type != "value")
+            .unwrap_or(false))
+        .map(|cb| cb.role.as_str())
+        .collect();
+    entity_identity_roles.into_iter().fold(func, |inner, head_role| {
+        let non_phi = Func::compose(Func::Not, Func::NullTest);
+        let instance_set = Func::compose(
+            Func::SetFromSeq,
+            Func::compose(Func::filter(non_phi), instances_of_noun_func(head_role)),
+        );
+        // Item shape after DistR: <fact, set>; fact = <ft, reading, bindings>.
+        let bindings_of_fact = Func::compose(Func::Selector(3), Func::Selector(1));
+        let value_of_head = Func::compose(
+            Func::Selector(1),
+            Func::compose(
+                Func::apply_to_all(Func::Selector(2)),
+                Func::filter(Func::compose(Func::Eq, Func::construction(vec![
+                    Func::Selector(1),
+                    Func::constant(Object::atom(head_role)),
+                ]))),
+            ),
+        );
+        let is_member = Func::compose(
+            Func::compose(Func::Not, Func::NullTest),
+            Func::compose(
+                Func::FetchOrPhi,
+                Func::construction(vec![
+                    Func::compose(value_of_head, bindings_of_fact),
+                    Func::Selector(2),
+                ]),
+            ),
+        );
+        Func::compose(
+            Func::apply_to_all(Func::Selector(1)),
+            Func::compose(
+                Func::filter(is_member),
+                Func::compose(Func::DistR, Func::construction(vec![inner, instance_set])),
+            ),
+        )
+    })
+}
+
 /// population Seq. Requires a fold-based search (Insert + Condition) that
 /// would be more complex than the direct Object traversal below.
 pub(crate) fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRuleDef) -> CompiledDerivation {
@@ -6417,7 +6491,10 @@ pub(crate) fn compile_explicit_derivation(data: &CellIndex, rule: &DerivationRul
                 Func::compose(Func::Concat,
                     Func::compose(Func::apply_to_all(guarded), extract(0, ft_id)))
             };
-            per_fact
+            // bridge-identity-binding-untyped: entity-typed identity
+            // renames restrict to the head noun's population (see the
+            // wrapper's doc for the FFP shape + the leak this closes).
+            guard_identity_bindings_by_noun_population(data, rule, per_fact)
         }
         _ => {
             // Subscript-driven join (#826, generalised in #866-c):
@@ -13008,15 +13085,21 @@ mod schema_tests {
     /// write is the cause (and is the regression gate for the fix).
     #[test]
     fn bridge_rekey_modus_ponens_materializes_keyed_consequent() {
+        // bridge-identity-binding-untyped: head-noun membership row (identity
+        // renames are typed now) — `Task has Name.` + `Task 'r1' has Name 'n1'.`
+        // stage r1 as an instance of head noun Task.
         let src = "\
             Resource(.id) is an entity type.\n\
             Task(.id) is an entity type.\n\
             Status is a value type.\n\
             Task Status is a value type.\n\
+            Name is a value type.\n\
             Resource has Status.\n\
             Task has Task Status.\n\
               Each Task has exactly one Task Status.\n\
+            Task has Name.\n\
             Resource 'r1' has Status 'pending'.\n\
+            Task 'r1' has Name 'n1'.\n\
             Task has Task Status iff Resource has Status and Task Status is Status and Task is Resource.\n\
         ";
         let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
@@ -13044,17 +13127,23 @@ mod schema_tests {
     /// the live bridge's 0.
     #[test]
     fn bridge_rekey_over_derived_antecedent_materializes() {
+        // bridge-identity-binding-untyped: head-noun membership row (identity
+        // renames are typed now) — `Task has Name.` + `Task 'r1' has Name 'n1'.`
+        // stage r1 as an instance of head noun Task.
         let src = "\
             Resource(.id) is an entity type.\n\
             Task(.id) is an entity type.\n\
             Raw is a value type.\n\
             Status is a value type.\n\
             Task Status is a value type.\n\
+            Name is a value type.\n\
             Resource has Raw.\n\
             Resource has Status.\n\
             Task has Task Status.\n\
               Each Task has exactly one Task Status.\n\
+            Task has Name.\n\
             Resource 'r1' has Raw 'pending'.\n\
+            Task 'r1' has Name 'n1'.\n\
             Resource has Status iff Resource has Raw and Status is Raw.\n\
             Task has Task Status iff Resource has Status and Task Status is Status and Task is Resource.\n\
         ";
@@ -13088,19 +13177,25 @@ mod schema_tests {
     /// (engine-fixable) vs purely environmental (cor:closure/#836/tree-shake).
     #[test]
     fn bridge_rekey_over_join_derived_antecedent_materializes() {
+        // bridge-identity-binding-untyped: head-noun membership row (identity
+        // renames are typed now) — `Task has Name.` + `Task 'r1' has Name 'n1'.`
+        // stage r1 as an instance of head noun Task.
         let src = "\
             Resource(.id) is an entity type.\n\
             Task(.id) is an entity type.\n\
             State Machine(.id) is an entity type.\n\
             Status is a value type.\n\
             Task Status is a value type.\n\
+            Name is a value type.\n\
             State Machine is for Resource.\n\
             State Machine is currently in Status.\n\
             Resource is currently in Status.\n\
             Task has Task Status.\n\
               Each Task has exactly one Task Status.\n\
+            Task has Name.\n\
             State Machine 'sm1' is for Resource 'r1'.\n\
             State Machine 'sm1' is currently in Status 'pending'.\n\
+            Task 'r1' has Name 'n1'.\n\
             Resource is currently in Status iff some State Machine is for that Resource and that State Machine is currently in that Status.\n\
             Task has Task Status iff that Resource is currently in some Status and Task Status is Status and Task is Resource.\n\
         ";

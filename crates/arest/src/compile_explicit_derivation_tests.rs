@@ -307,17 +307,22 @@ Order has Total.
 
 #[test]
 fn shape_bridge_derivation_emits_fact_with_consequent_ft_arity() {
+    // bridge-identity-binding-untyped: the reading stages `Task has
+    // Subject.` so task-1 can be made an instance of head noun Task
+    // (identity renames are typed now).
     let src = r#"# Test
 Resource(.Reference) is an entity type.
 Reference is a value type.
 Status is a value type.
 Task(.id) is an entity type.
 id is a value type.
+Subject is a value type.
 Task Status is a value type.
 
 ## Fact Types
 Resource has Reference.
 Resource is currently in Status.
+Task has Subject.
 Task has Task Status.
 
 ## Derivation Rules
@@ -351,6 +356,8 @@ Task has Task Status.
     let out = apply_to_facts(&func, &[
         ("Resource_is_currently_in_Status",
             &[("Resource", "task-1"), ("Status", "in_progress")]),
+        // bridge-identity-binding-untyped: head-noun membership row (identity renames are typed now)
+        ("Task_has_Subject", &[("Task", "task-1"), ("Subject", "x")]),
     ]);
     let derived = decode_derived(&out);
     assert_eq!(derived.len(), 1, "one derived fact expected, got {:#?}", derived);
@@ -370,6 +377,109 @@ Task has Task Status.
     assert_eq!(bindings[1], ("Task Status".to_string(), "in_progress".to_string()),
         "second binding must be <Task Status, in_progress>, got {:?}",
         bindings[1]);
+}
+
+// ─── Category 5c: Bridge identity binding is TYPED ───────────────────
+//
+// bridge-identity-binding-untyped (arc-agi-3 issue 1): the bridge's
+// identity rename `X is Resource` must restrict to noun X's OWN
+// population. With two state machines sharing one
+// `Resource_is_currently_in_Status` carrier cell, the pre-fix bridge
+// emitted a `Run has Game State` row for EVERY SM-governed resource —
+// Scorecard ids landed in the Run cell with Scorecard statuses
+// ('open'), silently wrong derived facts in every multi-SM app that
+// copies the tasks bridge. The single-SM tasks app never exposed it.
+//
+// Contract: an identity computed binding (bare RoleRef, no arithmetic)
+// whose consequent role is an ENTITY-typed noun filters emitted facts
+// to values that are instances of that noun (membership over the
+// noun's own cells in the population). Value-typed renames (`Game
+// State is Status`) stay pure renames — value types carry no instance
+// population.
+
+#[test]
+fn bridge_identity_binding_restricts_to_head_noun_population() {
+    let src = r#"# Test
+Resource(.Reference) is an entity type.
+Reference is a value type.
+Status is a value type.
+Run(.id) is an entity type.
+id is a value type.
+Name is a value type.
+Game State is a value type.
+
+## Fact Types
+Resource is currently in Status.
+Run has Name.
+Run has Game State.
+
+## Derivation Rules
+* Run has Game State iff that Resource is currently in some Status and Game State is Status and Run is Resource.
+"#;
+    let (rule, func) = parse_and_compile(src);
+    assert_eq!(rule.consequent_computed_bindings.len(), 2,
+        "two computed-binding renames expected (Game State is Status, Run is Resource), got {:#?}",
+        rule.consequent_computed_bindings);
+
+    // run-1 IS a Run (it has a Run_has_Name row). sc-1 is an
+    // SM-governed resource of some OTHER noun — it appears only in the
+    // shared SM carrier cell, never in any Run cell.
+    let out = apply_to_facts(&func, &[
+        ("Resource_is_currently_in_Status", &[("Resource", "run-1"), ("Status", "WIN")]),
+        ("Resource_is_currently_in_Status", &[("Resource", "sc-1"), ("Status", "open")]),
+        ("Run_has_Name", &[("Run", "run-1"), ("Name", "First")]),
+    ]);
+    let derived = decode_derived(&out);
+    let run_rows: Vec<&(String, String, Vec<(String, String)>)> = derived.iter()
+        .filter(|(ft, _, _)| ft == "Run_has_Game_State")
+        .collect();
+    assert_eq!(run_rows.len(), 1,
+        "ONLY run-1 may derive a Game State — sc-1 is not in noun Run's population; \
+         got {:#?}", run_rows);
+    let bindings = &run_rows[0].2;
+    assert!(bindings.contains(&("Run".to_string(), "run-1".to_string())),
+        "the surviving row must be run-1's, got {:?}", bindings);
+    assert!(bindings.contains(&("Game State".to_string(), "WIN".to_string())),
+        "run-1 carries Status WIN through the rename, got {:?}", bindings);
+}
+
+/// The single-noun shape must keep working UNGUARDED in effect: when
+/// every SM-governed resource IS an instance of the head noun (the
+/// tasks app — one SM), the membership filter passes everything
+/// through. Pins the no-regression contract for the existing bridge.
+#[test]
+fn bridge_identity_binding_passes_full_population_single_sm() {
+    let src = r#"# Test
+Resource(.Reference) is an entity type.
+Reference is a value type.
+Status is a value type.
+Task(.id) is an entity type.
+id is a value type.
+Subject is a value type.
+Task Status is a value type.
+
+## Fact Types
+Resource is currently in Status.
+Task has Subject.
+Task has Task Status.
+
+## Derivation Rules
+* Task has Task Status iff that Resource is currently in some Status and Task Status is Status and Task is Resource.
+"#;
+    let (_rule, func) = parse_and_compile(src);
+    let out = apply_to_facts(&func, &[
+        ("Resource_is_currently_in_Status", &[("Resource", "t-1"), ("Status", "pending")]),
+        ("Resource_is_currently_in_Status", &[("Resource", "t-2"), ("Status", "in_progress")]),
+        ("Task_has_Subject", &[("Task", "t-1"), ("Subject", "First")]),
+        ("Task_has_Subject", &[("Task", "t-2"), ("Subject", "Second")]),
+    ]);
+    let derived = decode_derived(&out);
+    let task_rows: Vec<_> = derived.iter()
+        .filter(|(ft, _, _)| ft == "Task_has_Task_Status")
+        .collect();
+    assert_eq!(task_rows.len(), 2,
+        "both Tasks are in noun Task's population — both bridge rows must survive; \
+         got {:#?}", task_rows);
 }
 
 // ─── Category 8: Multi-antecedent `and` chain ───────────────────────
@@ -1517,15 +1627,20 @@ State Machine is currently in Status.
 /// re-key into Task_has_Task_Status.
 #[test]
 fn sm_status_bridge_rekeys_into_task_has_task_status() {
+    // bridge-identity-binding-untyped: head-noun membership row (identity
+    // renames are typed now) — the reading stages `Task has Name.` +
+    // `Task 't1' has Name 'n1'.` so t1 is an instance of head noun Task.
     let src = r#"# bridge repro
 Task(.id) is an entity type.
 Resource(.id) is an entity type.
 Status is a value type.
 Task Status is a value type.
+Name is a value type.
 
 ## Fact Types
 Resource is currently in Status.
 Task has Task Status.
+Task has Name.
 
 ## Constraints
 Each Resource is currently in at most one Status.
@@ -1535,6 +1650,7 @@ Each Resource is currently in at most one Status.
 
 ## Instance Facts
 Resource 't1' is currently in Status 'Active'.
+Task 't1' has Name 'n1'.
 "#;
     let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src).expect("parse");
     let defs = crate::compile::compile_to_defs_state(&state);
@@ -2344,6 +2460,9 @@ fn sm_derivation_bridge_projects_currently_in_status_into_task_has_task_status()
     // populate the SM cells directly via the SM cell's natural FT
     // readings so the test doesn't depend on the SM-init derivation
     // firing — we want to test the bridge in isolation.
+    // bridge-identity-binding-untyped: head-noun membership row (identity
+    // renames are typed now) — the reading stages `Task has Name.` +
+    // `Task 't-1' has Name 'n1'.` so t-1 is an instance of head noun Task.
     let src = r#"# Bridge test (task-860)
 Task(.id) is an entity type.
 State Machine(.id) is an entity type.
@@ -2353,9 +2472,11 @@ Task is a subtype of Resource.
 
 Task Status is a value type.
 Status is a value type.
+Name is a value type.
 
 ## Fact Types
 Task has Task Status.
+Task has Name.
 Resource is currently in Status.
 State Machine is for Resource.
 State Machine is currently in Status.
@@ -2367,6 +2488,7 @@ State Machine is currently in Status.
 ## Instance Facts
 State Machine 'sm-1' is for Resource 't-1'.
 State Machine 'sm-1' is currently in Status 'pending'.
+Task 't-1' has Name 'n1'.
 "#;
     let state = crate::parse_forml2::parse_to_state(src).expect("parse");
     let model = crate::compile::compile(&state);
@@ -3470,21 +3592,27 @@ Task is recommended.
 // Color is Hue` — Bar binds to Source, Color binds to Hue.
 #[test]
 fn cross_noun_variable_unification_in_derivation_body() {
+    // bridge-identity-binding-untyped: head-noun membership row (identity
+    // renames are typed now) — the reading stages `Bar has Name.` +
+    // `Bar 'src1' has Name 'n1'.` so src1 is an instance of head noun Bar.
     let src = r#"# task-927 tight repro
 Source(.id) is an entity type.
 Bar(.id) is an entity type.
 Hue is a value type.
 Color is a value type.
+Name is a value type.
 
 ## Fact Types
 Source has Hue.
 Bar has Color.
+Bar has Name.
 
 ## Derivation Rules
 * Bar has Color iff Source has Hue and Bar is Source and Color is Hue.
 
 ## Instance Facts
 Source 'src1' has Hue 'red'.
+Bar 'src1' has Name 'n1'.
 "#;
     let state = parse_to_state(src).expect("parse");
     let model = compile::compile(&state);
@@ -3543,17 +3671,24 @@ Source 'src1' has Hue 'red'.
 // apps/tasks symptom.
 #[test]
 fn cross_noun_unification_with_derived_upstream_antecedent() {
+    // bridge-identity-binding-untyped: head-noun membership rows (identity
+    // renames are typed now) — the reading stages `Source 'o1' has Name`
+    // and `Bar 'o1' has Name` so o1 is an instance of BOTH head nouns
+    // (`Source is Origin` heads Source; `Bar is Source` heads Bar).
     let src = r#"# task-927 chain repro
 Origin(.id) is an entity type.
 Source(.id) is an entity type.
 Bar(.id) is an entity type.
 Hue is a value type.
 Color is a value type.
+Name is a value type.
 
 ## Fact Types
 Origin has Hue.
 Source has Hue.
 Bar has Color.
+Source has Name.
+Bar has Name.
 
 ## Derivation Rules
 * Source has Hue iff Origin has Hue and Source is Origin.
@@ -3561,6 +3696,8 @@ Bar has Color.
 
 ## Instance Facts
 Origin 'o1' has Hue 'red'.
+Source 'o1' has Name 'n1'.
+Bar 'o1' has Name 'n2'.
 "#;
     let state = parse_to_state(src).expect("parse");
     let model = compile::compile(&state);
@@ -3610,21 +3747,27 @@ Origin 'o1' has Hue 'red'.
 // facts.
 #[test]
 fn view_materialization_computes_lazily_on_read() {
+    // bridge-identity-binding-untyped: head-noun membership row (identity
+    // renames are typed now) — the reading stages `Bar has Name.` +
+    // `Bar 'src1' has Name 'n1'.` so src1 is an instance of head noun Bar.
     let src = r#"# task-930 view repro
 Source(.id) is an entity type.
 Bar(.id) is an entity type.
 Hue is a value type.
 Color is a value type.
+Name is a value type.
 
 ## Fact Types
 Source has Hue.
 Bar has Color. *
+Bar has Name.
 
 ## Derivation Rules
 * Bar has Color iff Source has Hue and Bar is Source and Color is Hue.
 
 ## Instance Facts
 Source 'src1' has Hue 'red'.
+Bar 'src1' has Name 'n1'.
 "#;
     let state = parse_to_state(src).expect("parse");
     let data = compile::cell_index_from_state(&state);
@@ -3700,16 +3843,21 @@ Source 'src1' has Hue 'red'.
 // fires for src1 (Hue=red).
 #[test]
 fn downstream_rule_sees_view_derived_facts_via_lazy_eval() {
+    // bridge-identity-binding-untyped: head-noun membership row (identity
+    // renames are typed now) — the reading stages `Bar has Name.` +
+    // `Bar 'src1' has Name 'n1'.` so src1 is an instance of head noun Bar.
     let src = r#"# task-930 v2 downstream-view-read repro
 Source(.id) is an entity type.
 Bar(.id) is an entity type.
 Hue is a value type.
 Color is a value type.
+Name is a value type.
 
 ## Fact Types
 Source has Hue.
 Bar has Color. *
 Bar is colorful.
+Bar has Name.
 
 ## Derivation Rules
 * Bar has Color iff Source has Hue and Bar is Source and Color is Hue.
@@ -3717,6 +3865,7 @@ Bar is colorful iff Bar has Color 'red'.
 
 ## Instance Facts
 Source 'src1' has Hue 'red'.
+Bar 'src1' has Name 'n1'.
 "#;
     let state = parse_to_state(src).expect("parse");
     let data = compile::cell_index_from_state(&state);
@@ -3803,16 +3952,21 @@ Source 'src1' has Hue 'red'.
 // the view producing valid derivations from upstream antecedents.
 #[test]
 fn downstream_rule_sees_view_facts_even_when_view_cell_is_empty_in_pop() {
+    // bridge-identity-binding-untyped: head-noun membership row (identity
+    // renames are typed now) — the reading stages `Bar has Name.` +
+    // `Bar 'src1' has Name 'n1'.` so src1 is an instance of head noun Bar.
     let src = r#"# task-930 v2 empty-cell short-circuit repro
 Source(.id) is an entity type.
 Bar(.id) is an entity type.
 Hue is a value type.
 Color is a value type.
+Name is a value type.
 
 ## Fact Types
 Source has Hue.
 Bar has Color. *
 Bar is colorful.
+Bar has Name.
 
 ## Derivation Rules
 * Bar has Color iff Source has Hue and Bar is Source and Color is Hue.
@@ -3820,6 +3974,7 @@ Bar is colorful iff Bar has Color 'red'.
 
 ## Instance Facts
 Source 'src1' has Hue 'red'.
+Bar 'src1' has Name 'n1'.
 "#;
     let state = parse_to_state(src).expect("parse");
     let model = compile::compile(&state);
@@ -3885,21 +4040,27 @@ Source 'src1' has Hue 'red'.
 // to isolate.
 #[test]
 fn cross_noun_unification_with_that_some_quantifier() {
+    // bridge-identity-binding-untyped: head-noun membership row (identity
+    // renames are typed now) — the reading stages `Bar has Name.` +
+    // `Bar 'src1' has Name 'n1'.` so src1 is an instance of head noun Bar.
     let src = r#"# task-924 quantifier repro
 Source(.id) is an entity type.
 Bar(.id) is an entity type.
 Hue is a value type.
 Color is a value type.
+Name is a value type.
 
 ## Fact Types
 Source has Hue.
 Bar has Color.
+Bar has Name.
 
 ## Derivation Rules
 * Bar has Color iff that Source has some Hue and Bar is Source and Color is Hue.
 
 ## Instance Facts
 Source 'src1' has Hue 'red'.
+Bar 'src1' has Name 'n1'.
 "#;
     let state = parse_to_state(src).expect("parse");
     let model = compile::compile(&state);
@@ -3951,12 +4112,14 @@ Source(.id) is an entity type.
 Bar(.id) is an entity type.
 Hue is a value type.
 Color is a value type.
+Name is a value type.
 
 ## Fact Types
 Source has Hue.
   Each Source has at most one Hue.
 Bar has Color.
   Each Bar has at most one Color.
+Bar has Name.
 
 ## Derivation Rules
 * Bar has Color iff Source has Hue and Bar is Source and Color is Hue.
@@ -3976,6 +4139,12 @@ Bar has Color.
         ast::fact_from_pairs(&[("Source", "src1"), ("Hue", "red")]),
         &state,
     ).unwrap();
+    // bridge-identity-binding-untyped: head-noun membership row (identity renames are typed now)
+    state = ast::cell_push(
+        "Bar_has_Name",
+        ast::fact_from_pairs(&[("Bar", "src1"), ("Name", "n1")]),
+        &state,
+    );
     // Sanity: cell is Map.
     let sh_cell = ast::fetch("Source_has_Hue", &state);
     assert!(matches!(sh_cell, Object::Map(_)),
