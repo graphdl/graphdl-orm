@@ -29,3 +29,5 @@ pub mod zip;
 pub mod mime;
 pub mod search;
 pub mod render_html;
+pub mod http_fetch;
+pub mod notify;

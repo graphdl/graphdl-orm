@@ -1820,6 +1820,14 @@ pub const APPROVED_PLATFORM_FN_NAMES: &[&str] = &[
     // (readings/ui/render-target.md); installed at CLI boot beside the
     // rebuild fns.
     "render:html",
+    // pb-effect-fns-canonical (§5.2 EFFECTS): the canonical effect bodies
+    // (platform/{http_fetch,notify}.rs). `http_fetch` = outbound HTTP via
+    // the same bounded transport as the task-919 callback branch (5 s
+    // deadlines, 64 KB cap, http/https only); `notify` = one stderr line,
+    // no other reach. Both Bottom on malformed operand; dispatched by
+    // Verb→Function_has_Name facts (transition_via_defs) or direct apply.
+    "http_fetch",
+    "notify",
 ];
 
 /// Sorted names currently installed in `PLATFORM_FALLBACK`. Reads from

@@ -2238,6 +2238,22 @@ fn http_post_callback(
     body: &[u8],
     headers: &[(String, String)],
 ) -> Result<u16, String> {
+    http_request("POST", url, body, headers).map(|(code, _)| code)
+}
+
+/// pb-effect-fns-canonical: the same synchronous transport, generalized —
+/// method parameter + the response BODY captured and returned alongside
+/// the status code. `http_post_callback` (the task-919 SM-dispatch hook)
+/// wraps this discarding the body; the `http_fetch` Platform fn
+/// (`platform/http_fetch.rs`) returns both to the caller. Same 5 s
+/// deadlines, same 64 KB response cap, same target gates.
+#[cfg(all(not(feature = "no_std"), not(target_arch = "wasm32"), not(target_os = "uefi")))]
+pub(crate) fn http_request(
+    method: &str,
+    url: &str,
+    body: &[u8],
+    headers: &[(String, String)],
+) -> Result<(u16, String), String> {
     use std::io::{Read, Write};
 
     // Parse the URL. Accept `http://host[:port][/path]` or
@@ -2275,7 +2291,7 @@ fn http_post_callback(
     // of the same name, and the dispatch surface is small enough that
     // we don't bother enforcing uniqueness.
     let mut req = Vec::with_capacity(256 + body.len());
-    req.extend_from_slice(format!("POST {} HTTP/1.1\r\n", path).as_bytes());
+    req.extend_from_slice(format!("{} {} HTTP/1.1\r\n", method, path).as_bytes());
     req.extend_from_slice(format!("Host: {}\r\n", authority).as_bytes());
     req.extend_from_slice(b"Content-Type: application/json\r\n");
     req.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
@@ -2324,7 +2340,14 @@ fn http_post_callback(
         .ok_or_else(|| format!("no status code in '{}'", status_line))?
         .parse::<u16>()
         .map_err(|e| format!("bad status code in '{}': {}", status_line, e))?;
-    Ok(code)
+    // Response body: everything after the header/body separator. Headers
+    // (incl. transfer-encoding) are not interpreted — the 64 KB cap above
+    // bounds the worst case, and the canonical consumers parse JSON
+    // bodies where trailing chunked-framing noise fails cleanly.
+    let body_text = head.split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    Ok((code, body_text))
 }
 
 /// task-919-http: marker trait for the two callback transport flavours.

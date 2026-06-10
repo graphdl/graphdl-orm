@@ -1034,6 +1034,13 @@ pub fn main_entry() {
     // (readings/ui/render-target.md declares the 'html' target under
     // the ui-readings gate).
     crate::platform::render_html::install();
+    // pb-effect-fns-canonical (§5.2) production wiring: the canonical
+    // effect bodies. Inert until a Verb's `Function has Name` fact (or a
+    // direct apply) names them; both pre-approved (sec-2 audit). The
+    // wasm32/uefi targets never reach this entry point, so the
+    // http_fetch submodule's target gate matches.
+    crate::platform::http_fetch::install();
+    crate::platform::notify::install();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
 
