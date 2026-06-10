@@ -2053,9 +2053,13 @@ fn create_via_defs(
         .map(|(k, v)| (k.to_string(), v.to_string())).collect();
     // pb-render-fn-contract (§5.2): apply every declared Render Target's
     // installed render fn to the projected view; outputs ride on the view.
+    // pb-live-binding-reeval: a freshly CREATED entity is dirty by
+    // definition — deliver to any standing subscription watching it
+    // (same hook as update_via_defs; deontic, never rejects).
     if let Some(ref mut v) = view {
         let reps = render_via_targets(d, v, &entity_id, noun, &entity_data, &transitions);
         v.representations = reps;
+        deliver_render_subscriptions(d, noun, &entity_id, v);
     }
     let entities = core::iter::once(EntityResult {
         id: entity_id.clone(), entity_type: noun.to_string(), data: entity_data,
