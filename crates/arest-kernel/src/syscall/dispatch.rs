@@ -77,6 +77,7 @@ use crate::syscall::sendto;
 use crate::syscall::socket;
 use crate::syscall::stat;
 use crate::syscall::write;
+use crate::syscall::writev;
 
 /// Linux errno value for "Bad file descriptor". Returned by `write`
 /// when the fd isn't open (anything other than 0/1/2 in tier-1) and
@@ -432,6 +433,13 @@ pub fn dispatch(
             read::handle(rdi, rsi, rdx)
         }
         SYS_WRITE => write::handle(rdi, rsi, rdx),
+        writev::SYS_WRITEV => {
+            // writev(fd, iov, iovcnt) — scatter-gather write (#476e).
+            // musl stdio's flush path (ash's PROMPT) lands here; each
+            // iovec delegates to write::handle so the per-fd story
+            // can't drift. rdi=fd, rsi=iov array, rdx=iovcnt.
+            writev::handle(rdi, rsi, rdx)
+        }
         SYS_MMAP => {
             // mmap(addr, len, prot, flags, fd, off) — anonymous mapping.
             // rdi=addr, rsi=len, rdx=prot, r10=flags, r8=fd, r9=off.

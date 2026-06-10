@@ -81,6 +81,7 @@ pub mod sendto;
 pub mod socket;
 pub mod stat;
 pub mod write;
+pub mod writev;
 
 // Re-export the dispatcher as the public surface — this is what the
 // future #552 SYSCALL MSR entry (`arch::uefi::syscall_entry` or
