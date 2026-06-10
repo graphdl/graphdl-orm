@@ -7232,6 +7232,96 @@ fn render_dispatch_renders_the_lazily_projected_view() {
     }
 }
 
+// ─── pb-live-binding-reeval slice 2 — subscription delivery ──────────────────
+//
+// "A subscriber is a ρ-application not yet evaluated": a Render
+// Subscription fact + an effect fired on dirtiness. Over the same
+// fixture as the render-dispatch test: subscriptions for the watched
+// entity deliver the freshly rendered representation through the
+// `notify` effect (no callback URI declared); a subscription watching a
+// DIFFERENT entity id delivers nothing; a subscription whose Render
+// Target produced no rendering is skipped. The capturing notify body
+// keeps the real body's echo semantics so the platform::notify dispatch
+// test stays green under parallel runs.
+#[test]
+#[cfg(not(feature = "no_std"))]
+fn render_subscription_delivers_via_notify_effect() {
+    use std::sync::Mutex;
+    static CAPTURED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let capture: ast::PlatformFn = std::sync::Arc::new(|x: &ast::Object, _d| {
+        // Echo semantics identical to platform/notify.rs, plus capture.
+        let msg = x.as_atom().map(str::to_string).or_else(|| {
+            x.as_seq()?.iter().find_map(|s| {
+                let pair = s.as_seq()?;
+                (pair.first()?.as_atom()? == "message")
+                    .then(|| pair.get(1)?.as_atom().map(str::to_string))?
+            })
+        });
+        match msg {
+            Some(m) => {
+                CAPTURED.lock().unwrap().push(m.clone());
+                ast::Object::atom(&m)
+            }
+            None => ast::Object::Bottom,
+        }
+    });
+    ast::install_platform_fn("notify", capture);
+    crate::platform::render_html::install();
+
+    let push = |s: ast::Object, cell: &str, pairs: &[(&str, &str)]|
+        ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+    let d = {
+        let s = viewproj_fixture_base();
+        let s = push(s, "Render_Target_has_Platform_Function_Name",
+            &[("Render Target", "html"), ("Platform Function Name", "render:html")]);
+        // sub-1 watches task-1 (delivers); sub-2 watches task-OTHER (filtered);
+        // sub-3 wants an uninstalled target (skipped).
+        let s = push(s, "Render_Subscription_is_for_Noun",
+            &[("Render Subscription", "sub-1"), ("Noun", "Task")]);
+        let s = push(s, "Render_Subscription_watches_Entity_Id",
+            &[("Render Subscription", "sub-1"), ("Entity Id", "task-1")]);
+        let s = push(s, "Render_Subscription_renders_via_Render_Target",
+            &[("Render Subscription", "sub-1"), ("Render Target", "html")]);
+        let s = push(s, "Render_Subscription_is_for_Noun",
+            &[("Render Subscription", "sub-2"), ("Noun", "Task")]);
+        let s = push(s, "Render_Subscription_watches_Entity_Id",
+            &[("Render Subscription", "sub-2"), ("Entity Id", "task-OTHER")]);
+        let s = push(s, "Render_Subscription_renders_via_Render_Target",
+            &[("Render Subscription", "sub-2"), ("Render Target", "html")]);
+        let s = push(s, "Render_Subscription_is_for_Noun",
+            &[("Render Subscription", "sub-3"), ("Noun", "Task")]);
+        let s = push(s, "Render_Subscription_renders_via_Render_Target",
+            &[("Render Subscription", "sub-3"), ("Render Target", "pdf")]);
+        s
+    };
+
+    let mut vp = crate::command::view_via_rho(&d, "Task", "task-1")
+        .expect("fixture projects");
+    let mut fields = hashbrown::HashMap::new();
+    fields.insert("ft-title".to_string(), "fresh value".to_string());
+    vp.representations = crate::command::render_via_targets(
+        &d, &vp, "task-1", "Task", &fields, &[]);
+
+    CAPTURED.lock().unwrap().clear();
+    crate::command::deliver_render_subscriptions(&d, "Task", "task-1", &vp);
+
+    let captured = CAPTURED.lock().unwrap().clone();
+    assert_eq!(captured.len(), 1,
+        "exactly sub-1 delivers (sub-2 watches another id, sub-3's \
+         target has no rendering); got {:?}", captured);
+    assert!(captured[0].contains("render-subscription sub-1 Task task-1"),
+        "payload names the subscription + entity: {}", captured[0]);
+    assert!(captured[0].contains("value=\"fresh value\""),
+        "payload carries the FRESH rendering: {}", captured[0]);
+
+    // A different noun delivers nothing (the dirty signal is the
+    // mutation's own noun/id).
+    CAPTURED.lock().unwrap().clear();
+    crate::command::deliver_render_subscriptions(&d, "Gadget", "g-1", &vp);
+    assert!(CAPTURED.lock().unwrap().is_empty(),
+        "unrelated noun must not deliver");
+}
+
 // ─── task-934-2 — real-data format projection ────────────────────────────────
 //
 // Proves that `Fact_Type_has_Format` and `Fact_Type_has_Enum_Values` are

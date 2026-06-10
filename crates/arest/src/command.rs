@@ -3988,6 +3988,24 @@ fn update_via_defs(
     let transitions = hateoas_via_rho(d, noun, entity_id, status.as_deref());
     let navigation = nav_links_via_rho(d, noun, entity_id);
 
+    // pb-live-binding-reeval slice 2: project + render the post-update
+    // view (structure from the schema cells in d; VALUES from the fresh
+    // `merged` fields) and deliver it to any standing Render
+    // Subscription watching this entity. Mirrors the create/get attach
+    // points, so update responses now carry `view` too. Skipped when
+    // rejected (D' = D — nothing changed, nothing to deliver).
+    let view = if rejected {
+        None
+    } else {
+        let mut v = view_via_rho(d, noun, entity_id);
+        if let Some(ref mut vp) = v {
+            let reps = render_via_targets(d, vp, entity_id, noun, &merged, &transitions);
+            vp.representations = reps;
+            deliver_render_subscriptions(d, noun, entity_id, vp);
+        }
+        v
+    };
+
     // #209: return only the cells this update modified. When rejected,
     // emit an empty delta (no cells change); otherwise diff new_state
     // against the input state so only touched FT cells ship.
@@ -4004,7 +4022,7 @@ fn update_via_defs(
         violations,
         derived_count: derived.len(),
         rejected,
-        view: None,
+        view,
         crudl: Vec::new(),
         state: delta,
     }
@@ -5329,6 +5347,91 @@ pub fn encode_render_input(
                 ast::Object::atom(&t.href),
             ])).collect())),
     ])
+}
+
+/// pb-live-binding-reeval slice 2 (§5.2 LIVE half): deliver a freshly
+/// rendered view to every standing `Render Subscription` watching this
+/// entity. "A subscriber is a ρ-application not yet evaluated" — the
+/// subscription facts (readings/ui/render-subscription.md) name WHAT
+/// (Noun + optional Entity Id), HOW (Render Target → a key into
+/// `view.representations`), and WHERE (callback URI → the `http_fetch`
+/// effect; absent → the `notify` effect). Delivery failure is DEONTIC:
+/// a Bottom from the effect logs and continues — it must never reject
+/// the mutation that triggered it. Zero overhead when no subscriptions
+/// exist (first fetch short-circuits).
+///
+/// Dirtiness, slice 2: the caller invokes this from the mutation emit
+/// path for the entity the mutation touched — same-noun/-id match IS
+/// the dirty signal. Cross-noun view dependencies (a view whose lazy
+/// rules read ANOTHER noun's cells) refine later via the static
+/// `derivation_reads:` sidecars — see the board task.
+pub fn deliver_render_subscriptions(
+    d: &ast::Object, noun: &str, entity_id: &str, view: &ViewProjection,
+) {
+    let subs = ast::fetch_cell_seq("Render_Subscription_is_for_Noun", d);
+    let Some(rows) = subs.as_seq() else { return };
+    if rows.is_empty() {
+        return;
+    }
+    let lookup = |cell: &str, role: &str, sub: &str| -> Option<String> {
+        ast::fetch_cell_seq(cell, d).as_seq().and_then(|facts| {
+            facts.iter().find_map(|f| {
+                (ast::binding(f, "Render Subscription") == Some(sub))
+                    .then(|| ast::binding(f, role).map(String::from))
+                    .flatten()
+            })
+        })
+    };
+    for row in rows {
+        let (Some(sub), Some(sub_noun)) = (
+            ast::binding(row, "Render Subscription"),
+            ast::binding(row, "Noun"),
+        ) else { continue };
+        if sub_noun != noun {
+            continue;
+        }
+        if let Some(watched) =
+            lookup("Render_Subscription_watches_Entity_Id", "Entity Id", sub)
+        {
+            if watched != entity_id {
+                continue;
+            }
+        }
+        let Some(target) = lookup(
+            "Render_Subscription_renders_via_Render_Target", "Render Target", sub)
+        else { continue };
+        let Some(body) = view.representations.get(target.as_str()) else {
+            diag!("[render-subscription] {} wants target '{}' but no \
+                   rendering was produced (no installed body?)", sub, target);
+            continue;
+        };
+        let tag = |name: &str, v: &str| ast::Object::seq(alloc::vec![
+            ast::Object::atom(name), ast::Object::atom(v),
+        ]);
+        let outcome = if let Some(uri) = lookup(
+            "Render_Subscription_delivers_to_callback_URI", "callback URI", sub)
+        {
+            ast::apply(
+                &ast::Func::Platform("http_fetch".to_string()),
+                &ast::Object::seq(alloc::vec![
+                    tag("url", &uri), tag("method", "POST"), tag("body", body),
+                ]),
+                d,
+            )
+        } else {
+            ast::apply(
+                &ast::Func::Platform("notify".to_string()),
+                &ast::Object::seq(alloc::vec![tag("message", &alloc::format!(
+                    "render-subscription {} {} {}: {}", sub, noun, entity_id, body
+                ))]),
+                d,
+            )
+        };
+        if matches!(outcome, ast::Object::Bottom) {
+            diag!("[render-subscription] delivery for '{}' bottomed \
+                   (deontic — mutation unaffected)", sub);
+        }
+    }
 }
 
 /// Apply every declared Render Target's Platform fn to the view — the
