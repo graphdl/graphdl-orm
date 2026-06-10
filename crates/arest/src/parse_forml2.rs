@@ -3060,6 +3060,7 @@ fn resolve_derivation_rule(
             &noun_names,
             fact_types_map,
             &rule.consequent_role_literals,
+            &rule.antecedent_role_literals,
         ) {
             rule.kind = DerivationKind::Join;
             rule.ring_join = Some(plan);
@@ -3343,6 +3344,7 @@ fn compute_ring_join_plan(
     noun_names: &[String],
     fact_types: &HashMap<String, FactTypeDef>,
     consequent_role_literals: &[crate::types::ConsequentRoleLiteral],
+    antecedent_role_literals: &[crate::types::AntecedentRoleLiteral],
 ) -> Option<crate::types::RingJoinPlan> {
     let n = antecedent_sources.len();
     if n < 2 || antecedent_clauses.len() < n { return None; }
@@ -3403,9 +3405,31 @@ fn compute_ring_join_plan(
     // `State Machine`, shared by `… has reached` and `Transition is
     // applicable for that State Machine`, must equi-join, else the
     // recursive fixpoint cross-products across every state machine.
+    //
+    // ring-join-blocker-side-consequent: a LITERAL-PINNED occurrence is a
+    // FILTER, not a join variable — drop it from join-group membership.
+    // Two antecedents restricting the same value-type noun to DIFFERENT
+    // literals (`Task1 has Task Status 'in_progress' and the Task has
+    // Task Status 'pending'`) otherwise mint a spurious equi-join on the
+    // value ('in_progress' = 'pending') that empties the rule. The
+    // literal itself is still enforced by compile_join_derivation's
+    // antecedent_role_literals path (#814), so no constraint is lost; a
+    // group whose unpinned occurrences span <2 antecedents is no key.
+    let literal_pinned = |i: usize, role_idx: usize| -> bool {
+        let ft_id = antecedent_sources[i].fact_type_id();
+        fact_types.get(ft_id).map_or(false, |ft| {
+            ft.roles.get(role_idx).map_or(false, |r| {
+                antecedent_role_literals.iter().any(|l|
+                    l.antecedent_index == i && l.role == r.noun_name)
+            })
+        })
+    };
     let join_groups: Vec<Vec<(usize, usize)>> = token_positions.iter()
-        .filter(|(_, ps)| distinct_ants(ps) >= 2)
-        .map(|(_, ps)| ps.clone())
+        .map(|(_, ps)| ps.iter()
+            .filter(|(i, ri)| !literal_pinned(*i, *ri))
+            .cloned()
+            .collect::<Vec<(usize, usize)>>())
+        .filter(|ps| distinct_ants(ps) >= 2)
         .collect();
     if join_groups.is_empty() { return None; }
 

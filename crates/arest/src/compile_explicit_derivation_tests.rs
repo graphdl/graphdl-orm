@@ -7240,14 +7240,16 @@ fn render_dispatch_renders_the_lazily_projected_view() {
 // unsubscripted); the subscripted Task1 is the blocked WIP item. The
 // live tasks app compiled this rule but materialized 0 rows; this
 // fixture reproduces the shape minimally to locate/fix the binding.
-/// IGNORED — executable spec for ring-join-blocker-side-consequent
-/// (board): the CONTROL (blocked-side consequent) passes, proving the
-/// fixture; every blocker-side orientation materializes zero rows.
-/// Un-ignore when the RingJoinPlan binds the consequent subject by
-/// token position instead of hardwiring the second ring role; the
-/// tasks app's blocker-first recommendation tier goes live with it.
+/// Executable spec for ring-join-blocker-side-consequent, PASSING since
+/// the literal-pinned join-key fix: the original symptom read as a
+/// consequent-binding gap, but instrumentation showed the real cause —
+/// the plain-noun join-key promotion treated two LITERAL-pinned
+/// occurrences of `Task Status` (pinned to DIFFERENT values across two
+/// antecedents) as an equi-join key, demanding 'in_progress' =
+/// 'pending' and emptying the rule. Literal-pinned occurrences are now
+/// filters, not join variables (`compute_ring_join_plan`). The CONTROL
+/// doubles as the no-regression pin for blocked-side ring rules.
 #[test]
-#[ignore = "RingJoinPlan cannot bind a blocker-side consequent subject; see ring-join-blocker-side-consequent"]
 fn blocker_of_wip_ring_rule_materializes() {
     let variants: &[(&str, &str)] = &[
         // CONTROL — the proven blocked-proto orientation (consequent
