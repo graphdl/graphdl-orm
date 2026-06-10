@@ -136,6 +136,7 @@ pub fn dispatch(line: &str) -> String {
                 "  heap                       — print allocator stats",
                 "  run <applet|/path> [args…] — exec a File-fact binary (#527)",
                 "                               e.g. `run ls /`, `run sh`",
+                "  shell                      — interactive ash session (#476d)",
                 "  quit                       — halt the kernel",
                 "",
                 "AREST engine not yet linked.",
@@ -154,6 +155,14 @@ pub fn dispatch(line: &str) -> String {
                 x86_64::instructions::hlt();
             }
         }
+
+        // #476d end state: `arest> shell` lands in an interactive ash
+        // prompt. Pure alias for `run sh` — all exec logic stays in
+        // the target-agnostic `run_command`. (This whole match table
+        // is a named conversion target of `procedural-code-to-
+        // substrate`: REPL commands should become facts dispatched
+        // via ρ, not Rust arms. Keep additions alias-thin.)
+        "shell" => crate::process::exec::run_command(&["sh"]),
 
         "heap" => {
             // The UEFI arm's per-entry talc allocator (see

@@ -83,7 +83,12 @@ param(
   [string[]]$ThenType = @(),
   [string[]]$ExpectAfter = @(),
   [string]$EfiPath,
-  [string]$Features
+  # [string[]] so BOTH invocation styles work: direct `& script.ps1
+  # -Features busybox,musl-libc` (PowerShell parses the bare commas
+  # as an array) AND `powershell -File script.ps1 -Features
+  # "busybox,musl-libc"` (one literal string). Joined back to
+  # cargo's comma syntax below.
+  [string[]]$Features = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -126,7 +131,7 @@ if (-not $SkipBuild) {
     $env:PATH = "$mingw;$env:PATH"
   }
   $featureArgs = @()
-  if ($Features) { $featureArgs = @('--features', $Features) }
+  if ($Features.Count -gt 0) { $featureArgs = @('--features', ($Features -join ',')) }
   Write-Host "Building arest-kernel.efi (cargo +nightly build --target x86_64-unknown-uefi $($featureArgs -join ' '))..." -ForegroundColor Cyan
   Push-Location $kernelDir
   $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
