@@ -7078,8 +7078,11 @@ ViewElement has Component Role. *
 //     chose: synthesized default, authored override.
 // This is the seam the kernel HATEOAS browser / ui.do worker consume to render
 // a form for an entity. Returns None where ui-readings is off (no view: defs).
-#[test]
-fn view_via_rho_synthesizes_default_and_honors_authored_override() {
+/// Shared fixture for the view-projection + §5.2 render-dispatch tests:
+/// the view-detail lazy rules compiled to defs, plus a 'Task' Noun
+/// population with three value-typed Fact Types (text/date/boolean
+/// Formats). NO View authored — the synthesized tier projects.
+fn viewproj_fixture_base() -> ast::Object {
     let src = r#"# task-viewproj projection test — view-detail rules
 Noun(.NounName) is an entity type.
 NounName is a value type.
@@ -7121,22 +7124,27 @@ ViewElement has Component Role. *
     let defs = compile::compile_to_defs_state(&state);
     let d0 = ast::defs_to_state(&defs, &state);
 
+    let push = |s: ast::Object, cell: &str, pairs: &[(&str, &str)]|
+        ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+    let s = d0;
+    let s = push(s, "Fact_Type_has_Role", &[("Fact Type", "ft-title"),  ("Role", "r-title")]);
+    let s = push(s, "Fact_Type_has_Role", &[("Fact Type", "ft-due"),    ("Role", "r-due")]);
+    let s = push(s, "Fact_Type_has_Role", &[("Fact Type", "ft-active"), ("Role", "r-active")]);
+    let s = push(s, "Role_is_played_by_Noun", &[("Role", "r-title"),  ("Noun", "Task")]);
+    let s = push(s, "Role_is_played_by_Noun", &[("Role", "r-due"),    ("Noun", "Task")]);
+    let s = push(s, "Role_is_played_by_Noun", &[("Role", "r-active"), ("Noun", "Task")]);
+    let s = push(s, "Fact_Type_has_Format", &[("Fact Type", "ft-title"),  ("Format", "text")]);
+    let s = push(s, "Fact_Type_has_Format", &[("Fact Type", "ft-due"),    ("Format", "date")]);
+    let s = push(s, "Fact_Type_has_Format", &[("Fact Type", "ft-active"), ("Format", "boolean")]);
+    s
+}
+
+#[test]
+fn view_via_rho_synthesizes_default_and_honors_authored_override() {
     // Base population: Noun 'Task' with 3 value-typed FTs. NO View authored.
     let push = |s: ast::Object, cell: &str, pairs: &[(&str, &str)]|
         ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
-    let base = {
-        let s = d0.clone();
-        let s = push(s, "Fact_Type_has_Role", &[("Fact Type", "ft-title"),  ("Role", "r-title")]);
-        let s = push(s, "Fact_Type_has_Role", &[("Fact Type", "ft-due"),    ("Role", "r-due")]);
-        let s = push(s, "Fact_Type_has_Role", &[("Fact Type", "ft-active"), ("Role", "r-active")]);
-        let s = push(s, "Role_is_played_by_Noun", &[("Role", "r-title"),  ("Noun", "Task")]);
-        let s = push(s, "Role_is_played_by_Noun", &[("Role", "r-due"),    ("Noun", "Task")]);
-        let s = push(s, "Role_is_played_by_Noun", &[("Role", "r-active"), ("Noun", "Task")]);
-        let s = push(s, "Fact_Type_has_Format", &[("Fact Type", "ft-title"),  ("Format", "text")]);
-        let s = push(s, "Fact_Type_has_Format", &[("Fact Type", "ft-due"),    ("Format", "date")]);
-        let s = push(s, "Fact_Type_has_Format", &[("Fact Type", "ft-active"), ("Format", "boolean")]);
-        s
-    };
+    let base = viewproj_fixture_base();
 
     // ── Tier 1: synthesized default (no authored View) ──
     let vp = crate::command::view_via_rho(&base, "Task", "task-1")
@@ -7166,6 +7174,62 @@ ViewElement has Component Role. *
     assert_eq!(vp2.elements.len(), 3, "authored View derives the same 3 widgets; got {:#?}", vp2.elements);
     let widget2 = |ft: &str| vp2.elements.iter().find(|e| e.fact_type == ft).map(|e| e.component_role.as_str());
     assert_eq!(widget2("ft-due"), Some("date-picker"), "widgets still value-type-driven under override");
+}
+
+// ─── pb-render-fn-contract — §5.2 render dispatch over the projected view ────
+//
+// The render seam end-to-end over the SAME view-detail fixture as the
+// projection test above: the real lazy `view:` rules derive the elements
+// (skolem ids, value-type-driven widgets), a `Render Target has Platform
+// Function Name` fact names the target, the installed reference body
+// (`platform/render_html.rs`) turns the projection into markup, and the
+// output lands keyed by target slug — exactly what the get path attaches
+// to `ViewProjection.representations`. The renderer learns the noun and
+// fields only through the operand: zero app knowledge (the §5.2 contract;
+// pb-zero-glue-acceptance scales this to a whole app).
+#[test]
+#[cfg(not(feature = "no_std"))]
+fn render_dispatch_renders_the_lazily_projected_view() {
+    crate::platform::render_html::install();
+
+    // Fixture + the render-target population: 'html' → 'render:html'.
+    let d = ast::cell_push("Render_Target_has_Platform_Function_Name",
+        ast::fact_from_pairs(&[
+            ("Render Target", "html"),
+            ("Platform Function Name", "render:html"),
+        ]), &viewproj_fixture_base());
+
+    // Real projection through the lazy view: rules (synthesized tier).
+    let vp = crate::command::view_via_rho(&d, "Task", "task-1")
+        .expect("instance view projects over the fixture");
+    assert_eq!(vp.elements.len(), 3, "fixture derives 3 widgets; got {:#?}", vp.elements);
+
+    // Dispatch: one rendering, keyed by the target slug.
+    let mut fields = hashbrown::HashMap::new();
+    fields.insert("ft-title".to_string(), "Ship the seam".to_string());
+    let transitions = vec![crate::command::TransitionAction {
+        event: "Task is started".to_string(),
+        target_status: "in_progress".to_string(),
+        method: "GET".to_string(),
+        href: "/api/entities/Task/task-1/transition?event=Task%20is%20started".to_string(),
+        component_role: None,
+    }];
+    let reps = crate::command::render_via_targets(
+        &d, &vp, "task-1", "Task", &fields, &transitions);
+
+    assert_eq!(reps.keys().collect::<Vec<_>>(), vec!["html"],
+        "exactly the declared+installed target renders");
+    let html = &reps["html"];
+    for needle in [
+        "data-view=\"instance-view-Task\"",            // the synthesized View id
+        "data-entity=\"task-1\"",
+        "<input type=\"text\" name=\"ft-title\" value=\"Ship the seam\">", // derived widget + field value
+        "<input type=\"date\" name=\"ft-due\"",        // date Format → date-picker
+        "<input type=\"checkbox\" name=\"ft-active\"", // boolean Format → checkbox
+        "<a rel=\"transition\" href=\"/api/entities/Task/task-1/transition?event=Task%20is%20started\">Task is started</a>",
+    ] {
+        assert!(html.contains(needle), "missing {:?} in rendering:\n{}", needle, html);
+    }
 }
 
 // ─── task-934-2 — real-data format projection ────────────────────────────────
