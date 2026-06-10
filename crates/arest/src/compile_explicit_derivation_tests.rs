@@ -7232,6 +7232,90 @@ fn render_dispatch_renders_the_lazily_projected_view() {
     }
 }
 
+// ─── blocker-first recommendation (tasks app, user direction 2026-06-10) ─────
+//
+// `Task unblocks work in progress iff the Task blocks some Task1 and
+// Task1 has Task Status 'in_progress' and the Task has Task Status
+// 'pending'` — the consequent subject is the BLOCKER (ring position 0,
+// unsubscripted); the subscripted Task1 is the blocked WIP item. The
+// live tasks app compiled this rule but materialized 0 rows; this
+// fixture reproduces the shape minimally to locate/fix the binding.
+/// IGNORED — executable spec for ring-join-blocker-side-consequent
+/// (board): the CONTROL (blocked-side consequent) passes, proving the
+/// fixture; every blocker-side orientation materializes zero rows.
+/// Un-ignore when the RingJoinPlan binds the consequent subject by
+/// token position instead of hardwiring the second ring role; the
+/// tasks app's blocker-first recommendation tier goes live with it.
+#[test]
+#[ignore = "RingJoinPlan cannot bind a blocker-side consequent subject; see ring-join-blocker-side-consequent"]
+fn blocker_of_wip_ring_rule_materializes() {
+    let variants: &[(&str, &str)] = &[
+        // CONTROL — the proven blocked-proto orientation (consequent
+        // subject = the BLOCKED side, subscripted blocker at pos 0).
+        ("control-blocked-side",
+         "* Task unblocks work in progress iff some Task1 blocks the Task and Task1 has Task Status 'pending'."),
+        // A: the live phrasing (consequent subject = BLOCKER, pos 0).
+        ("a-blocker-subject",
+         "* Task unblocks work in progress iff the Task blocks some Task1 and Task1 has Task Status 'in_progress' and the Task has Task Status 'pending'."),
+        // B: subscripted consequent subject, blocked side plain.
+        ("b-subscripted-subject",
+         "* Task1 unblocks work in progress iff Task1 blocks the Task and the Task has Task Status 'in_progress' and Task1 has Task Status 'pending'."),
+        // C: ring clause last.
+        ("c-ring-last",
+         "* Task unblocks work in progress iff the Task has Task Status 'pending' and Task1 has Task Status 'in_progress' and the Task blocks some Task1."),
+    ];
+    let mut results: Vec<(String, Vec<String>)> = Vec::new();
+    for (label, rule) in variants {
+        let src = alloc::format!(r#"# blocker-first probe
+Task(.id) is an entity type.
+Task Status is a value type.
+
+## Fact Types
+Task has Task Status.
+  Each Task has at most one Task Status.
+Task unblocks work in progress.
+Task blocks Task.
+  Task blocks Task is irreflexive.
+
+## Derivation Rules
+{}
+"#, rule);
+        let state = parse_to_state(&src).expect("parse");
+        let defs = compile::compile_to_defs_state(&state);
+        let d0 = ast::defs_to_state(&defs, &state);
+        let push = |s: ast::Object, cell: &str, pairs: &[(&str, &str)]|
+            ast::cell_push(cell, ast::fact_from_pairs(pairs), &s);
+        let d = {
+            let s = d0;
+            let s = push(s, "Task_has_Task_Status", &[("Task", "blocker"), ("Task Status", "pending")]);
+            let s = push(s, "Task_has_Task_Status", &[("Task", "wip"), ("Task Status", "in_progress")]);
+            push(s, "Task_blocks_Task", &[("Task", "blocker"), ("Task", "wip")])
+        };
+        let stratum: Vec<(String, ast::Func)> = ast::cells_iter(&d).into_iter()
+            .filter(|(n, _)| n.starts_with("derivation:"))
+            .map(|(n, c)| (n.to_string(), ast::metacompose(c, &d)))
+            .collect();
+        let refs: Vec<(&str, &ast::Func)> = stratum.iter()
+            .map(|(n, f)| (n.as_str(), f)).collect();
+        let (chained, _) = crate::evaluate::forward_chain_defs_state(&refs, &d);
+        let rows = ast::fetch_cell_seq("Task_unblocks_work_in_progress", &chained);
+        let got: Vec<String> = rows.as_seq().map(|s| s.iter()
+            .filter_map(|f| ast::binding(f, "Task").map(String::from)).collect())
+            .unwrap_or_default();
+        std::eprintln!("[blocker-diag] {} -> {:?}", label, got);
+        results.push((label.to_string(), got));
+    }
+    // The CONTROL must work (proven shape) and at least one
+    // blocker-subject variant must yield exactly ["blocker"].
+    let control_ok = results.iter().any(|(l, g)|
+        l == "control-blocked-side" && !g.is_empty());
+    assert!(control_ok, "even the proven control shape failed: {:?}", results);
+    let winner = results.iter().find(|(l, g)|
+        l != "control-blocked-side" && g == &vec!["blocker".to_string()]);
+    assert!(winner.is_some(),
+        "no blocker-subject phrasing materialized exactly the blocker: {:?}", results);
+}
+
 // ─── pb-live-binding-reeval slice 2 — subscription delivery ──────────────────
 //
 // "A subscriber is a ρ-application not yet evaluated": a Render
