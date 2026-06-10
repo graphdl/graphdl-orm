@@ -237,6 +237,12 @@ fn read_open_fd(fd: u64, buf: u64, count: u64) -> i64 {
             // recv() on a socket is a later task (#478e). Until then a
             // read() on a socket fd resolves to no ReadTarget → -EBADF.
             Some(FdEntry::Socket { .. }) => None,
+            // read(2) on a directory is -EISDIR on Linux; tier-1
+            // collapses to the same no-target → -EBADF path (the
+            // enumeration surface is getdents64, not read). Listed
+            // explicitly so a future Directory-aware read is a
+            // conscious change, not a fall-through.
+            Some(FdEntry::Directory { .. }) => None,
             None => None,
         }
     });

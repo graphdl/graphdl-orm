@@ -161,6 +161,23 @@ pub enum FdEntry {
         /// Kernel-assigned socket id keying `crate::net`'s registry.
         socket_id: u64,
     },
+    /// fd backed by a DIRECTORY path (getdents64-file-population). A
+    /// directory in tier-1 is a projection, not a stored object: its
+    /// children are synthesized on read from the `File_has_Name` facts
+    /// (path-prefix next segments) plus the synthetic-fs tables
+    /// (`/dev/*` devices, `/proc/*` files). `openat` allocates this
+    /// variant for any path that is `/`, a synthetic-fs directory, or
+    /// a strict prefix of at least one File name; `getdents64` (#217)
+    /// pages through the synthesized child list via `cursor`.
+    Directory {
+        /// Absolute POSIX-style path, no trailing slash (except `/`).
+        path: String,
+        /// Index of the next child entry `getdents64` will emit. A
+        /// fresh open starts at 0; each getdents64 call advances it by
+        /// the number of entries serialized; cursor == children.len()
+        /// reads as end-of-directory (return 0).
+        cursor: u64,
+    },
 }
 
 /// Per-process file-descriptor table. Owns a sparse `BTreeMap` keyed by
@@ -286,6 +303,17 @@ pub fn file(cell_id: &str) -> FdEntry {
     FdEntry::File {
         cell_id: cell_id.to_string(),
         offset: 0,
+    }
+}
+
+/// Constructor helper — wraps a directory path into `FdEntry::Directory`
+/// (getdents64-file-population). Same `String`-hiding shape as
+/// `synthetic` / `file`; the getdents64 cursor starts at 0 (a freshly
+/// opened directory enumerates from its first child).
+pub fn directory(path: &str) -> FdEntry {
+    FdEntry::Directory {
+        path: path.to_string(),
+        cursor: 0,
     }
 }
 

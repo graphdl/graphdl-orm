@@ -270,6 +270,10 @@ fn collect_fd_snapshots(p: &Process) -> Vec<FdSnapshot> {
                 // as the stand-in inode. Matches what `ls -l /proc/<pid>/fd`
                 // shows for a socket fd on real Linux.
                 OpenFdEntry::Socket { socket_id } => format!("socket:[{}]", socket_id),
+                // Directory fds (getdents64-file-population) render the
+                // directory path itself — matching Linux's
+                // `/proc/<pid>/fd` symlink for an opendir()'d directory.
+                OpenFdEntry::Directory { path, .. } => path.clone(),
             };
             out.push(FdSnapshot { fd, target });
         }

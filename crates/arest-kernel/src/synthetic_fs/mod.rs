@@ -86,6 +86,48 @@ pub fn device_behavior(path: &str) -> Option<DeviceBehavior> {
     dev::lookup(path)
 }
 
+/// The kind of a synthesized directory child — maps onto getdents64's
+/// `d_type` byte at the syscall layer (DT_DIR / DT_REG / DT_CHR).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildKind {
+    Dir,
+    File,
+    CharDevice,
+}
+
+/// The readdir-shaped lookup the resolver's doc comment promised
+/// (getdents64-file-population): enumerate the synthetic-fs CHILDREN
+/// of a directory path. Returns `None` when the path is not a
+/// synthetic directory — the caller unions this with the File-cell
+/// graph's prefix children (`syscall::getdents64`).
+///
+/// Coverage mirrors the resolve tables exactly — one row per known
+/// entry, no invented paths:
+///   * `/`     → the synthetic roots (`dev`, `proc`) as directories.
+///   * `/dev`  → `dev::PATHS` basenames as character devices.
+///   * `/proc` → the two rendered files (`cpuinfo`, `meminfo`).
+pub fn list_children(path: &str) -> Option<Vec<(alloc::string::String, ChildKind)>> {
+    use alloc::string::ToString;
+    match path {
+        "/" => Some(alloc::vec![
+            ("dev".to_string(), ChildKind::Dir),
+            ("proc".to_string(), ChildKind::Dir),
+        ]),
+        "/dev" => Some(
+            dev::PATHS
+                .iter()
+                .filter_map(|p| p.strip_prefix("/dev/"))
+                .map(|name| (name.to_string(), ChildKind::CharDevice))
+                .collect(),
+        ),
+        "/proc" => Some(alloc::vec![
+            ("cpuinfo".to_string(), ChildKind::File),
+            ("meminfo".to_string(), ChildKind::File),
+        ]),
+        _ => None,
+    }
+}
+
 // Inline tests are gated on `cfg(target_os = "linux")` for the same
 // reason `composer` / `slint_backend` / `doom` gate theirs: the
 // `arest-kernel` bin sets `test = false` in Cargo.toml, so the only

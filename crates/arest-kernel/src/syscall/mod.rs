@@ -64,6 +64,7 @@ pub mod connect;
 pub mod dispatch;
 pub mod exit;
 pub mod futex;
+pub mod getdents64;
 pub mod getrandom;
 pub mod getpid;
 pub mod identity;

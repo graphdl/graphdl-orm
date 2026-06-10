@@ -60,6 +60,7 @@ use crate::syscall::close;
 use crate::syscall::connect;
 use crate::syscall::exit;
 use crate::syscall::futex;
+use crate::syscall::getdents64;
 use crate::syscall::getrandom;
 use crate::syscall::getpid;
 use crate::syscall::identity;
@@ -463,6 +464,14 @@ pub fn dispatch(
             brk::handle(rdi)
         }
         SYS_CLOSE => close::handle(rdi as i32),
+        getdents64::SYS_GETDENTS64 => {
+            // getdents64(fd, dirp, count) — directory enumeration over
+            // the synthesized child list (synthetic-fs tables ∪
+            // File_has_Name next segments). rdi=fd, rsi=dirp buffer,
+            // rdx=count. Per getdents64-file-population; pairs with
+            // openat's Directory fds.
+            getdents64::handle(rdi, rsi, rdx)
+        }
         SYS_STAT => {
             // stat(pathname, statbuf) — fill struct stat at statbuf.
             // rdi = pathname pointer (const char *), rsi = statbuf pointer.

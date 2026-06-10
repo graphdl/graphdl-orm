@@ -90,7 +90,9 @@ use alloc::vec::Vec;
 use arest::ast::{self, Object};
 
 use crate::process::current_process_fd_table;
-use crate::process::fd_table::{file as fd_file, synthetic as fd_synthetic};
+use crate::process::fd_table::{
+    directory as fd_directory, file as fd_file, synthetic as fd_synthetic,
+};
 use crate::syscall::dispatch::{EFAULT, EINVAL};
 use crate::synthetic_fs;
 
@@ -131,6 +133,10 @@ pub const EACCES: i64 = 13;
 /// process fd table is full (1024 entries). Per `<asm-generic/errno-
 /// base.h>:EMFILE`.
 pub const EMFILE: i64 = 24;
+
+/// `EISDIR = 21` — write-mode open of a directory, per
+/// `<asm-generic/errno-base.h>:EISDIR` (getdents64-file-population).
+pub const EISDIR: i64 = 21;
 
 /// Linux errno for "Function not implemented". Returned when the
 /// (dirfd, relative-path) combo is something tier-1 doesn't yet
@@ -218,8 +224,75 @@ pub fn handle(dirfd: i32, pathname: u64, flags: u32, _mode: u32) -> i64 {
         return allocate_file(&cell_id);
     }
 
+    // Directory case (getdents64-file-population): the path is a
+    // DIRECTORY when the synthetic-fs table lists children for it
+    // (`/`, `/dev`, `/proc`) or at least one File name lives strictly
+    // under it. A directory in tier-1 is a projection over the
+    // `File_has_Name` facts — nothing is stored; getdents64
+    // synthesizes the children on read. Directories open read-only
+    // (a write-mode open of a directory is -EISDIR per Linux).
+    let dir_path = normalize_dir_path(&path);
+    if crate::synthetic_fs::list_children(&dir_path).is_some()
+        || path_has_file_children(&dir_path)
+    {
+        if access != O_RDONLY {
+            return -EISDIR;
+        }
+        return allocate_directory(&dir_path);
+    }
+
     // No resolver matched — the path doesn't exist.
     -ENOENT
+}
+
+/// Strip a trailing `/` (except for the root itself) so `/proc/` and
+/// `/proc` resolve to the same directory fd payload.
+fn normalize_dir_path(path: &str) -> String {
+    if path.len() > 1 && path.ends_with('/') {
+        path[..path.len() - 1].into()
+    } else {
+        path.into()
+    }
+}
+
+/// True when at least one `File_has_Name` fact names a path STRICTLY
+/// under `dir` (with a `/` boundary) — i.e. the File graph implies the
+/// directory exists. `/` is the parent of every File name (they are
+/// absolute), so it returns true whenever any File exists.
+fn path_has_file_children(dir: &str) -> bool {
+    crate::system::with_state(|state| path_has_file_children_in(dir, state))
+        .unwrap_or(false)
+}
+
+/// Pure-state version of `path_has_file_children` (same shape as
+/// `lookup_file_cell_id_in`, for fixture-state unit tests).
+pub fn path_has_file_children_in(dir: &str, state: &Object) -> bool {
+    let prefix = if dir == "/" {
+        String::from("/")
+    } else {
+        alloc::format!("{}/", dir)
+    };
+    let cell = ast::fetch_or_phi("File_has_Name", state);
+    cell.as_seq().map_or(false, |facts| {
+        facts.iter().any(|fact| {
+            ast::binding(fact, "Name")
+                .map_or(false, |name| name.starts_with(prefix.as_str())
+                    && name.len() > prefix.len())
+        })
+    })
+}
+
+/// Allocate a `Directory` fd for `path`. Same shape as
+/// `allocate_synthetic` / `allocate_file` — returns fd or negative
+/// errno.
+fn allocate_directory(path: &str) -> i64 {
+    current_process_fd_table(|maybe_table| match maybe_table {
+        Some(table) => match table.allocate(fd_directory(path)) {
+            Ok(fd) => fd as i64,
+            Err(()) => -EMFILE,
+        },
+        None => -ENOSYS,
+    })
 }
 
 /// Read a NUL-terminated C string out of userspace at `ptr`. Returns
@@ -444,6 +517,53 @@ mod tests {
         let result = handle(AT_FDCWD, path.as_ptr() as u64, O_WRONLY, 0);
         assert_eq!(result, -EACCES);
         current_process_uninstall();
+    }
+
+    /// Directory opens (getdents64-file-population): `/dev` (and the
+    /// trailing-slash spelling) resolves to an `FdEntry::Directory`
+    /// with a zeroed getdents64 cursor; a write-mode open of a
+    /// directory is `-EISDIR`.
+    #[test]
+    fn open_directory_allocates_directory_fd() {
+        let _guard = CURRENT_PROCESS_TEST_LOCK.lock();
+        install_test_process();
+        let path = cstring("/dev/");
+        let fd = handle(AT_FDCWD, path.as_ptr() as u64, O_RDONLY, 0);
+        assert!(fd >= 3, "directory fd should be >= 3, got {}", fd);
+        let lookup = current_process_fd_table(|t| {
+            t.and_then(|t| t.lookup(fd as i32).cloned())
+        });
+        use crate::process::fd_table::FdEntry;
+        assert_eq!(
+            lookup,
+            Some(FdEntry::Directory {
+                path: "/dev".into(), // trailing slash normalized away
+                cursor: 0,
+            })
+        );
+        let wr = handle(AT_FDCWD, path.as_ptr() as u64, O_WRONLY, 0);
+        assert_eq!(wr, -EISDIR, "write-mode directory open is -EISDIR");
+        current_process_uninstall();
+    }
+
+    /// The File-graph implies directories: with a File named
+    /// `/etc/conf/a.toml` in the fixture state,
+    /// `path_has_file_children_in` confirms `/etc` and `/etc/conf`
+    /// (boundary-correct: `/et` is NOT a directory).
+    #[test]
+    fn file_children_imply_directories() {
+        let mut s = Object::phi();
+        s = cell_push(
+            "File_has_Name",
+            fact_from_pairs(&[("File", "c1"), ("Name", "/etc/conf/a.toml")]),
+            &s,
+        );
+        assert!(path_has_file_children_in("/", &s));
+        assert!(path_has_file_children_in("/etc", &s));
+        assert!(path_has_file_children_in("/etc/conf", &s));
+        assert!(!path_has_file_children_in("/et", &s), "no /-boundary match");
+        assert!(!path_has_file_children_in("/etc/conf/a.toml", &s),
+            "a file is not a directory");
     }
 
     /// `openat(AT_FDCWD, "/proc/cpuinfo", O_RDWR, 0)` returns
