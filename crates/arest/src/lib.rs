@@ -3504,21 +3504,25 @@ Transition 'advance-to-step2' is to Status 'step2-populate'.
 Transition 'advance-to-step2' is triggered by Event Type 'Schema Design notes elementary facts'.
 "#;
 
-    /// IGNORED — executable acceptance spec, blocked on
-    /// compile-reflect-schema-as-facts (board). Diagnosis 2026-06-10:
-    /// everything DOWNSTREAM works (SM affordance derives for the
-    /// never-seen noun; the render dispatch is integration-tested over
-    /// fixtures), but NO production path reflects compiled fact types
-    /// into the schema-as-facts population — `Fact_Type_has_Role` /
-    /// `Role_is_played_by_Noun` are populated ONLY by test fixtures, so
-    /// the eager `Fact Type has Format` projection and the lazy
-    /// ViewElement rules (readings/ui/view-detail.md) have nothing to
-    /// join over and `view_via_rho` yields None for every real app.
-    /// "Facts all the way down" currently stops at the compiler's
-    /// internal FactType/Role schema cells. When the reflection lands,
-    /// remove #[ignore] — this test then IS the §5.2 zero-glue proof.
+    /// IGNORED — executable acceptance spec; the blocker has NARROWED.
+    /// 2026-06-10 progress: `platform_compile` now reflects the compiled
+    /// schema into the schema-as-facts population (compile.rs
+    /// `reflect_schema_cells` — Fact_Type_has_Role / Noun_plays_Role /
+    /// Noun_has_Object_Type rows verified present in the handle state
+    /// for the never-seen app), and the SM affordance half passes.
+    /// REMAINING BLOCKER: readings/ui/view-detail.md:117's
+    /// `ViewElement (E) renders Fact Type (FT)` rule never compiles to
+    /// its `view:ViewElement_renders_Fact_Type` def — its siblings
+    /// (renders_Transition, renders_Resource, ViewElement_has_Component_
+    /// Role) all appear in the view: def list; only the renders-Fact-Type
+    /// rule is missing, so `resolve_view` returns None and the view tier
+    /// never synthesizes. Suspect the (E)+(FT) two-variable head's
+    /// consequent-cell resolution (empty consequent_cell is filtered at
+    /// the view-def fold, compile.rs ~1853). Tracked on
+    /// compile-reflect-schema-as-facts; when the def compiles, remove
+    /// #[ignore] — this test then IS the §5.2 zero-glue proof.
     #[test]
-    #[ignore = "blocked on compile-reflect-schema-as-facts: compiler does not yet reflect FTs into Fact_Type_has_Role / Role_is_played_by_Noun rows"]
+    #[ignore = "view-detail.md's `ViewElement (E) renders Fact Type (FT)` rule does not compile to view:ViewElement_renders_Fact_Type (two-variable head); see compile-reflect-schema-as-facts"]
     fn never_seen_app_renders_through_the_generic_seam() {
         crate::platform::render_html::install();
 

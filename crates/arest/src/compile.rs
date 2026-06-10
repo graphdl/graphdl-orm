@@ -4393,6 +4393,108 @@ pub fn cell_index_from_state(state: &crate::ast::Object) -> CellIndex {
         violation_templates }
 }
 
+/// compile-reflect-schema-as-facts (§5.2 / procedural-code-to-substrate):
+/// reflect the compiler's internal schema cells into the SCHEMA-AS-FACTS
+/// population — `Fact_Type_has_Role`, `Role_is_played_by_Noun`, and
+/// `Noun_has_Object_Type` rows, one per compiled role / noun. These are
+/// the cells the view-projection pipeline joins over (the eager
+/// `** Fact Type has Format` projection and the lazy ViewElement rules,
+/// readings/ui/view-detail.md); before this pass they were populated
+/// only by test fixtures, so `view_via_rho` was None for every real app.
+///
+/// Pure function of the `Role` / `Noun` cells (the readings-derived
+/// schema), so the returned cells are REGENERATED wholesale on every
+/// compile — set-replace semantics, idempotent across recompiles (the
+/// same closure rule that regenerates Noun/FactType themselves).
+///
+/// Role ids are deterministic: `{ft_id}#{position}` — stable across
+/// recompiles, unique per (FT, position), and never colliding with
+/// entity ids (the `#` separator does not appear in FT ids).
+pub fn reflect_schema_cells(state: &crate::ast::Object) -> Vec<(String, crate::ast::Object)> {
+    use crate::ast::{fetch_cell_seq, binding, fact_from_pairs, Object};
+    let mut ft_has_role: Vec<Object> = Vec::new();
+    let mut role_played: Vec<Object> = Vec::new();
+    if let Some(rows) = fetch_cell_seq("Role", state).as_seq() {
+        for r in rows {
+            let (Some(ft), Some(noun)) = (binding(r, "factType"), binding(r, "nounName"))
+            else { continue };
+            if ft.is_empty() || noun.is_empty() { continue; }
+            let role_id = alloc::format!("{}#{}", ft, binding(r, "position").unwrap_or("0"));
+            ft_has_role.push(fact_from_pairs(&[("Fact Type", ft), ("Role", role_id.as_str())]));
+            // The metamodel canonicalizes `Role is played by Noun` to the
+            // active-voice id `Noun_plays_Role` (see core.md; the compiled
+            // §4.2 widget rules' `derivation_reads` sidecars name it) —
+            // emit that id, not the passive reading's.
+            role_played.push(fact_from_pairs(&[("Noun", noun), ("Role", role_id.as_str())]));
+        }
+    }
+    let noun_types: Vec<Object> = fetch_cell_seq("Noun", state).as_seq()
+        .map(|rows| rows.iter().filter_map(|n| {
+            let name = binding(n, "name")?;
+            if name.is_empty() { return None; }
+            Some(fact_from_pairs(&[
+                ("Noun", name),
+                ("Object Type", binding(n, "objectType").unwrap_or("entity")),
+            ]))
+        }).collect())
+        .unwrap_or_default();
+    alloc::vec![
+        ("Fact_Type_has_Role".to_string(),   Object::Seq(ft_has_role.into())),
+        ("Noun_plays_Role".to_string(),      Object::Seq(role_played.into())),
+        ("Noun_has_Object_Type".to_string(), Object::Seq(noun_types.into())),
+    ]
+}
+
+#[cfg(test)]
+mod reflect_schema_cells_tests {
+    use super::*;
+    use crate::ast::{self, Object};
+
+    /// The reflection regenerates schema-as-facts rows from the parsed
+    /// Role/Noun cells: one Fact_Type_has_Role + Noun_plays_Role row per
+    /// role (deterministic `{ft}#{position}` role ids, the active-voice
+    /// cell id the compiled §4.2 widget rules read), one
+    /// Noun_has_Object_Type row per noun.
+    #[test]
+    fn reflects_roles_and_object_types_from_parsed_schema() {
+        let src = "Widget(.id) is an entity type.\nLabel is a value type.\n\nWidget has Label.\n  Each Widget has at most one Label.\n";
+        let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+        let cells = reflect_schema_cells(&state);
+        let get = |name: &str| cells.iter().find(|(n, _)| n == name)
+            .map(|(_, c)| c.clone()).unwrap_or(Object::Bottom);
+
+        let ftr = get("Fact_Type_has_Role");
+        let rows = ftr.as_seq().expect("Fact_Type_has_Role seq");
+        assert!(rows.iter().any(|r|
+            ast::binding(r, "Fact Type") == Some("Widget_has_Label")
+                && ast::binding(r, "Role").map(|x| x.starts_with("Widget_has_Label#")) == Some(true)),
+            "expected a Widget_has_Label role row; got {:?}", rows);
+
+        let npr = get("Noun_plays_Role");
+        let prows = npr.as_seq().expect("Noun_plays_Role seq");
+        for noun in ["Widget", "Label"] {
+            assert!(prows.iter().any(|r| ast::binding(r, "Noun") == Some(noun)),
+                "expected {} to play a role; got {:?}", noun, prows);
+        }
+
+        let ot = get("Noun_has_Object_Type");
+        let orows = ot.as_seq().expect("Noun_has_Object_Type seq");
+        let ot_of = |noun: &str| orows.iter().find_map(|r|
+            (ast::binding(r, "Noun") == Some(noun))
+                .then(|| ast::binding(r, "Object Type").map(str::to_string))?);
+        assert_eq!(ot_of("Widget").as_deref(), Some("entity"));
+        assert_eq!(ot_of("Label").as_deref(), Some("value"));
+    }
+
+    /// Idempotent set-replace: reflecting twice yields identical cells.
+    #[test]
+    fn reflection_is_deterministic() {
+        let src = "Gizmo(.id) is an entity type.\nNote is a value type.\n\nGizmo has Note.\n";
+        let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+        assert_eq!(reflect_schema_cells(&state), reflect_schema_cells(&state));
+    }
+}
+
 pub(crate) fn compile(state: &crate::ast::Object) -> CompiledModel {
     let td = profile_timer::now();
     let data = cell_index_from_state(state);

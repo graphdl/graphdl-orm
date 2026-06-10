@@ -3649,6 +3649,19 @@ fn platform_compile(x: &Object, d: &Object) -> Object {
     // `platform_cidr_contains` for the input/output shape contract.
     defs.push(("cidr_contains".to_string(), Func::Platform("cidr_contains".to_string())));
     let new_d = defs_to_state(&defs, &merged_state);
+    // compile-reflect-schema-as-facts: regenerate the schema-as-facts
+    // population (Fact_Type_has_Role / Role_is_played_by_Noun /
+    // Noun_has_Object_Type) from the freshly merged schema cells —
+    // set-replace, idempotent, what the view-projection rules join over.
+    let new_d = {
+        let mut map: HashMap<String, Object> = cells_iter(&new_d).into_iter()
+            .map(|(name, contents)| (name.to_string(), contents.clone()))
+            .collect();
+        for (name, contents) in crate::compile::reflect_schema_cells(&merged_state) {
+            map.insert(name, contents);
+        }
+        Object::Map(map.into())
+    };
 
     // Validate: ρ(validate) applied to merged state. Alethic violations reject.
     // Skipped when the Policy_skip_validate cell holds atom "T" — installed
