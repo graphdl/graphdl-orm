@@ -65,6 +65,13 @@
   "busybox,musl-libc,repl" for the #527 typed-exec smoke — `run echo
   hello` needs the baked busybox ELF + its /bin/busybox seed, which
   only exist under those features). Ignored with -SkipBuild.
+
+.PARAMETER ThenType
+  Additional lines to send into the serial console AFTER -TypeLine,
+  with a settle pause before each. Once -TypeLine has exec'd a guest
+  (e.g. `run sh`), the REPL is gone — these lines feed the GUEST's
+  blocking stdin read (#476e): `-TypeLine "run sh" -ThenType "echo
+  hi" -ExpectAfter "hi"` drives an interactive ash session.
 #>
 [CmdletBinding()]
 param(
@@ -73,6 +80,7 @@ param(
   [int]$TimeoutSec = 60,
   [switch]$Keep,
   [string]$TypeLine,
+  [string[]]$ThenType = @(),
   [string[]]$ExpectAfter = @(),
   [string]$EfiPath,
   [string]$Features
@@ -295,6 +303,15 @@ if ($TypeLine -and $bannerSeen -and -not $p.HasExited) {
   Pump-Serial
   Write-Host "Typing into REPL via serial console: $TypeLine" -ForegroundColor Cyan
   Send-SerialLine $TypeLine
+  # Follow-up lines (guest stdin, #476e): give the exec'd guest a beat
+  # to reach its blocking read, then feed each line. Debug-profile
+  # musl/ash startup under TCG is slow — 6 s settle is empirical.
+  foreach ($line in $ThenType) {
+    Start-Sleep -Milliseconds 6000
+    Pump-Serial
+    Write-Host "Typing into guest stdin: $line" -ForegroundColor Cyan
+    Send-SerialLine $line
+  }
   # Wait for the post-type phrases (or the deadline).
   $typeDeadline = (Get-Date).AddSeconds([Math]::Max(20, $TimeoutSec / 3))
   while ((Get-Date) -lt $typeDeadline) {

@@ -23,9 +23,12 @@
 //
 // What this stub does
 // -------------------
-//   1. Save the syscall-clobberable register set on the stack:
-//      first the user's RIP (in rcx) and RFLAGS (in r11), then
-//      the callee-saved set (r12-r15, rbx, rbp).
+//   1. Save the user's register state on the stack: RIP (in rcx),
+//      RFLAGS (in r11), the callee-saved set (r12-r15, rbx, rbp),
+//      AND the syscall-arg registers (rdi/rsi/rdx/r10/r8/r9) — the
+//      Linux SYSCALL ABI preserves everything except rax/rcx/r11,
+//      and compiled userspace keeps values live in arg registers
+//      across `syscall` (musl clobbers only rax/rcx/r11).
 //   2. Capture the user's RSP (which is `entry_RSP` — the value
 //      the user had in RSP when `syscall` executed) into a
 //      callee-saved slot.
@@ -130,25 +133,38 @@ pub unsafe extern "C" fn syscall_entry() {
         // construct the IRETQ frame on return.
         "push rcx",                  // saved user RIP
         "push r11",                  // saved user RFLAGS
-        // Save the rest of the callee-saved + caller-saved regs the
-        // user expects to find unchanged. Per the syscall ABI,
-        // every register EXCEPT rax/rcx/r11 is preserved. We've
-        // dealt with rcx and r11; rax holds the syscall number
-        // (which becomes our return value slot, so we don't need
-        // to preserve it for the user). The args (rdi/rsi/rdx/r10/
-        // r8/r9) are by-definition clobberable — they're the
-        // syscall arguments. So we save the remaining callee-saved
-        // (r12-r15, rbx, rbp). We also need to preserve the user's
-        // RSP for the IRETQ frame at the end — we don't push it
-        // explicitly because after all pops it's where RSP itself
-        // points (entry RSP), which we recover via `lea rcx, [rsp +
-        // 40]` after sub-ing the IRETQ frame slot.
+        // Save EVERY other register the user expects unchanged. Per
+        // the Linux SYSCALL ABI, the kernel preserves every register
+        // EXCEPT rax (return value), rcx (RIP) and r11 (RFLAGS) —
+        // INCLUDING the argument registers rdi/rsi/rdx/r10/r8/r9.
+        // musl's inline-syscall constraints clobber only rax/rcx/r11,
+        // so the compiler freely keeps values live in arg registers
+        // across the `syscall` instruction. Observed when this stub
+        // treated args as "by-definition clobberable": musl's
+        // __libc_sigaction kept `sa` in r8 across its inlined
+        // rt_sigprocmask(SIG_UNBLOCK, SIGCANCEL) syscall, got back
+        // garbage (=1), and `testb $0x10, 0x8b(%r8)` #PF'd at
+        // cr2=0x8c — killing ash startup in the #476e smoke.
+        //
+        // We also need to preserve the user's RSP for the IRETQ frame
+        // at the end — not pushed explicitly because after all pops
+        // it's where RSP itself points (entry RSP), recovered via
+        // `lea rcx, [rsp + 40]` after sub-ing the IRETQ frame slot.
         "push r15",
         "push r14",
         "push r13",
         "push r12",
         "push rbp",
         "push rbx",
+        // User syscall-arg registers (restored before IRETQ — see
+        // the ABI note above). Pushing leaves the registers intact
+        // for the phase-2 marshaling below.
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push r10",
+        "push r8",
+        "push r9",
 
         // -------- Phase 2: marshal args for dispatch --------
         // Linux x86_64 SYSCALL ABI:
@@ -181,12 +197,20 @@ pub unsafe extern "C" fn syscall_entry() {
         //   entry RSP - 48  : saved user r12
         //   entry RSP - 56  : saved user rbp
         //   entry RSP - 64  : saved user rbx
-        //   entry RSP - 72  : dispatcher 7th arg (r9 value)
-        //   entry RSP - 72  : <-- current RSP
+        //   entry RSP - 72  : saved user rdi
+        //   entry RSP - 80  : saved user rsi
+        //   entry RSP - 88  : saved user rdx
+        //   entry RSP - 96  : saved user r10
+        //   entry RSP - 104 : saved user r8
+        //   entry RSP - 112 : saved user r9
+        //   entry RSP - 120 : dispatcher 7th arg (r9 value)
+        //   entry RSP - 120 : <-- current RSP
         //
-        // 9 pushes × 8 = 72 bytes. The `call` will push 8 more
-        // (return address) for a total of 80 bytes. 80 % 16 = 0, so
-        // we're 16-byte aligned at the call site — SysV ABI happy.
+        // 15 pushes × 8 = 120 bytes + 8 for the `call`'s return
+        // address. Alignment relative to the (caller-controlled,
+        // unaligned-in-general) entry RSP is moot: the
+        // x86_64-unknown-uefi target compiles without SSE
+        // (soft-float), so no callee emits 16-byte-aligned spills.
         //
         // The dispatcher boundary is the `extern "sysv64"` shim
         // `dispatch_sysv64`. Use `sym` to resolve the mangled name
@@ -201,7 +225,15 @@ pub unsafe extern "C" fn syscall_entry() {
         // overwritten by the user RFLAGS pop anyway).
         "pop rcx",                   // discard pushed-r9 slot
 
-        // Restore callee-saved regs in reverse-push order.
+        // Restore the user's syscall-arg registers (Linux preserves
+        // them across SYSCALL — see the phase-1 ABI note), then the
+        // callee-saved set, in reverse-push order.
+        "pop r9",
+        "pop r8",
+        "pop r10",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
         "pop rbx",
         "pop rbp",
         "pop r12",

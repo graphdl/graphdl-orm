@@ -21,18 +21,29 @@
 //     (modifier-only, media keys, etc.); there's no meaningful byte
 //     representation in the Linux TTY model.
 //
-// Returns the number of bytes written into the buffer (0 if the ring
-// was empty — non-blocking, no busy-loop).
+// Returns the number of bytes written into the buffer.
 //
-// POSIX non-blocking behaviour
-// ----------------------------
-// Linux `read(0, buf, n)` on a non-blocking file descriptor returns 0
-// immediately when there's nothing to read (or -EAGAIN in O_NONBLOCK
-// mode). The keyboard ring is inherently non-blocking — it's a fixed-
-// size `VecDeque` populated by an IRQ handler; there's no blocking wait
-// primitive in tier-1. We return 0 (empty read) to signal EOF/no-data,
-// which glibc / musl handle by treating stdin as exhausted for the
-// current call and retrying on the next select/poll cycle.
+// Blocking semantics (#476e)
+// --------------------------
+// On the live UEFI x86_64 + `repl` target, an EMPTY ring BLOCKS the
+// caller until at least one byte arrives — `block_until_stdin` pumps
+// the serial-RX + i8042 transports into the ring and idles on
+// `sti; hlt` between polls. POSIX: a read on a blocking fd returns at
+// least 1 byte or EOF; returning 0 here would tell the guest "stdin
+// closed", which made `run sh` exit instantly (ash read EOF before
+// the user could type — the #476e interactive-shell blocker). The
+// pump must live INSIDE the read: the launcher super-loop that
+// normally drains serial RX is gone once exec diverges into ring 3,
+// so the blocked read is the only place input can move. The `sti;
+// hlt` idle (not a pause-spin) is the 6229f9a1 lesson: under
+// single-threaded TCG an exit-free guest loop holds the BQL and
+// starves QEMU's chardev/timer main loop — serial bytes would never
+// be delivered to the very poll waiting for them.
+//
+// On every other build (host unit tests, aarch64 / armv7 — no live
+// keyboard ring) the empty-ring read returns 0 immediately, exactly
+// the old non-blocking behaviour: there is no input transport to
+// pump, so blocking would hang forever. Host tests pin this arm.
 //
 // Tier-1 identity-mapped pointer model
 // -------------------------------------
@@ -124,8 +135,9 @@ pub const STDIN_FD: u64 = 0;
 ///   kernel keyboard ring. Each `DecodedKey::Unicode(c)` is encoded as
 ///   UTF-8 and appended to the caller's buffer up to `count` bytes.
 ///   `DecodedKey::RawKey(_)` entries are skipped (no byte-level
-///   representation). Returns the number of bytes written (0 if the
-///   ring was empty — non-blocking).
+///   representation). Returns the number of bytes written. On the live
+///   UEFI target an empty ring BLOCKS until input arrives (#476e —
+///   see the module docs); on host/test builds it returns 0.
 ///
 /// * `fd != 0`: resolve the fd in the per-process fd table. A
 ///   `/dev/*` device fd (#537) fills per the device's read behaviour;
@@ -155,7 +167,15 @@ pub fn handle(fd: u64, buf: u64, count: u64) -> i64 {
     }
 
     if fd == STDIN_FD {
-        return do_read(buf, count, &mut keyboard_source());
+        let n = do_read(buf, count, &mut keyboard_source());
+        // #476e: an empty ring BLOCKS on the live target — see the
+        // module docs. Host/test builds keep the non-blocking return
+        // (no transport to pump; blocking would hang the test runner).
+        #[cfg(all(target_os = "uefi", target_arch = "x86_64", feature = "repl"))]
+        if n == 0 {
+            return block_until_stdin(buf, count);
+        }
+        return n;
     }
 
     // Beyond stdin: an fd opened via `openat`. Resolve it in the
@@ -517,6 +537,44 @@ fn hex_nibble(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+/// BLOCK until at least one stdin byte lands in the caller's buffer
+/// (#476e — the interactive-shell read). The launcher super-loop that
+/// normally pumps input transports into the keyboard ring is gone once
+/// exec diverges into ring 3, so the blocked read pumps for itself:
+///
+///   1. `poll_serial_rx` — COM1 RX → ring (the headless-QEMU typing
+///      path; CR→'\n', DEL→backspace).
+///   2. `poll_i8042` — PS/2 OBF → ring (real-hardware belt and
+///      suspenders; on headless QEMU send-key never reaches it, per
+///      the 6229f9a1 investigation).
+///   3. Drain the ring into the buffer; return on the first byte(s).
+///   4. `sti; hlt` — sleep until the next interrupt (the 1 kHz PIT
+///      bounds the wait). NOT a pause-spin: under single-threaded TCG
+///      an exit-free guest loop holds the BQL and starves QEMU's
+///      chardev/timer main loop, so the serial bytes this loop waits
+///      for would never be delivered (the 6229f9a1 root cause). The
+///      SYSCALL entry masked IF (FMASK); `enable_and_hlt` restores it
+///      so the PIT/keyboard IRQs (and EOIs) keep flowing while the
+///      guest sleeps. IF stays set after return — the iretq pops the
+///      user's saved RFLAGS, so the guest resumes with its own state.
+///
+/// Never returns 0: the only exits are delivered bytes. (A future
+/// signal-delivery track adds -EINTR here; tier-1 has no signals to
+/// deliver mid-read.)
+#[cfg(all(target_os = "uefi", target_arch = "x86_64", feature = "repl"))]
+fn block_until_stdin(buf: u64, count: u64) -> i64 {
+    use crate::arch::uefi::keyboard::{poll_i8042, poll_serial_rx};
+    loop {
+        poll_serial_rx();
+        poll_i8042();
+        let n = do_read(buf, count, &mut keyboard_source());
+        if n != 0 {
+            return n;
+        }
+        x86_64::instructions::interrupts::enable_and_hlt();
     }
 }
 
