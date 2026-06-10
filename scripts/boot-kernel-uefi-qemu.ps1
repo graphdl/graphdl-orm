@@ -59,6 +59,12 @@
   release-profile run (the Slint software renderer is dramatically
   faster there, which matters under TCG). Implies the caller built it;
   combine with -SkipBuild.
+
+.PARAMETER Features
+  Cargo feature list for the build step (e.g.
+  "busybox,musl-libc,repl" for the #527 typed-exec smoke — `run echo
+  hello` needs the baked busybox ELF + its /bin/busybox seed, which
+  only exist under those features). Ignored with -SkipBuild.
 #>
 [CmdletBinding()]
 param(
@@ -68,7 +74,8 @@ param(
   [switch]$Keep,
   [string]$TypeLine,
   [string[]]$ExpectAfter = @(),
-  [string]$EfiPath
+  [string]$EfiPath,
+  [string]$Features
 )
 
 $ErrorActionPreference = 'Stop'
@@ -92,10 +99,30 @@ foreach ($f in @($codeSrc, $varsSrc)) {
 
 # --- build (unless skipped) ------------------------------------------
 if (-not $SkipBuild) {
-  Write-Host "Building arest-kernel.efi (cargo +nightly build --target x86_64-unknown-uefi)..." -ForegroundColor Cyan
+  # The busybox/musl bake DEGRADES GRACEFULLY (and the /bin/busybox
+  # File-fact seed silently vanishes from the kernel — observed as
+  # `exec /bin/busybox failed: FileNotFound` in the #527 smoke) when
+  # the cross-toolchain is missing from PATH. Non-interactive shells
+  # often lack the user's PATH entries, so prepend the known host
+  # locations when the tools aren't already visible:
+  #   * clang — target compiles (musl objects, busybox objects).
+  #   * MinGW gcc — busybox HOST tools (applet_tables/usage); its bin
+  #     dir must be on PATH for the runtime DLLs even though build.rs
+  #     finds gcc.exe by absolute path.
+  if (-not (Get-Command clang -ErrorAction SilentlyContinue)) {
+    $llvm = 'C:\Program Files\Microsoft Visual Studio\18\Professional\VC\Tools\Llvm\x64\bin'
+    if (Test-Path (Join-Path $llvm 'clang.exe')) { $env:PATH = "$llvm;$env:PATH" }
+  }
+  $mingw = 'C:\ProgramData\mingw64\mingw64\bin'
+  if ((Test-Path (Join-Path $mingw 'gcc.exe')) -and ($env:PATH -notlike "*$mingw*")) {
+    $env:PATH = "$mingw;$env:PATH"
+  }
+  $featureArgs = @()
+  if ($Features) { $featureArgs = @('--features', $Features) }
+  Write-Host "Building arest-kernel.efi (cargo +nightly build --target x86_64-unknown-uefi $($featureArgs -join ' '))..." -ForegroundColor Cyan
   Push-Location $kernelDir
   $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-  try { & cargo +nightly build --target x86_64-unknown-uefi } finally { $ErrorActionPreference = $prev; Pop-Location }
+  try { & cargo +nightly build --target x86_64-unknown-uefi @featureArgs } finally { $ErrorActionPreference = $prev; Pop-Location }
   if ($LASTEXITCODE -ne 0) { throw "cargo build failed (exit $LASTEXITCODE)" }
 }
 if (-not (Test-Path $efi)) { throw "kernel .efi missing: $efi (drop -SkipBuild to build it)." }
