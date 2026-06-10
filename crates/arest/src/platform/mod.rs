@@ -28,3 +28,4 @@
 pub mod zip;
 pub mod mime;
 pub mod search;
+pub mod render_html;

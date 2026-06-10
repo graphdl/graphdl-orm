@@ -1813,6 +1813,13 @@ pub const APPROVED_PLATFORM_FN_NAMES: &[&str] = &[
     "rebuild_verify",
     "rebuild_apply_bulk",
     "rebuild_init",
+    // pb-render-fn-contract (§5.2 Platform Binding): the reference HTML
+    // render function (platform/render_html.rs). PURE — no filesystem,
+    // network, or state reach; operand in, markup Atom out, Bottom on
+    // malformed input. Dispatched per Render Target facts
+    // (readings/ui/render-target.md); installed at CLI boot beside the
+    // rebuild fns.
+    "render:html",
 ];
 
 /// Sorted names currently installed in `PLATFORM_FALLBACK`. Reads from

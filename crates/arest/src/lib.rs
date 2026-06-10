@@ -229,6 +229,14 @@ pub mod entity_uc;
 // stdout/stderr and read process argv.
 #[cfg(not(feature = "no_std"))]
 pub mod cli;
+// Engine-level Platform fn bodies (zip codec #404, MIME sniffing #402,
+// file search #408, the §5.2 reference HTML renderer). The long-noted
+// "engine-owner wires `pub mod platform;` in a follow-up" (Cargo.toml
+// [[test]] platform_zip comment) — landed with pb-render-fn-contract;
+// the #[path]-including test binaries keep working unchanged. The
+// module gates its whole body on `#![cfg(not(feature = "no_std"))]`.
+#[cfg(not(feature = "no_std"))]
+pub mod platform;
 #[cfg(not(feature = "no_std"))]
 pub use arest_foundation::crypto;  // #686 stage 5 — moved out of arest
 #[cfg(not(feature = "no_std"))]
@@ -1131,6 +1139,7 @@ pub const UI_READINGS: &[(&str, &str)] = &[
     ("view-list",        include_str!("../../../readings/ui/view-list.md")),
     ("view-detail",      include_str!("../../../readings/ui/view-detail.md")),
     ("ifactr-android",   include_str!("../../../readings/ui/ifactr-android.md")),
+    ("render-target",    include_str!("../../../readings/ui/render-target.md")),
 ];
 
 /// Access-control SUBSTRATE (server-enforced, no UI). Declares Operation /
@@ -1369,6 +1378,58 @@ mod format_on_cdt_tests {
              with_vp={} baseline={}",
             with_vp_errors.saturating_sub(baseline_errors),
             with_vp_errors, baseline_errors);
+    }
+}
+
+// ── Render Target (§5.2 Platform Binding render seam): layering guard ─
+//
+// readings/ui/render-target.md reifies the render-function registry
+// (Render Target -> Platform Function Name / MimeType). Same survival
+// discipline as the view-projection guard above: the reading composes
+// onto the corpus without new checker Errors. Behavioural coverage
+// (render dispatch over the Render Target population) lives with the
+// engine glue, not here.
+#[cfg(test)]
+mod render_target_reading_tests {
+    use super::*;
+
+    const CORE_MD: &str = include_str!("../../../readings/core/core.md");
+    const COMPONENTS_MD: &str = include_str!("../../../readings/ui/components.md");
+    const RENDER_TARGET_MD: &str =
+        include_str!("../../../readings/ui/render-target.md");
+
+    /// SURVIVAL — adding render-target.md introduces no new checker
+    /// Error diagnostics over the core+components baseline.
+    #[test]
+    fn render_target_adds_no_new_checker_errors() {
+        let fold = |bodies: &[&str]| -> String {
+            bodies.iter().fold(String::new(), |mut a, b| {
+                a.push_str(b); a.push_str("\n\n"); a
+            })
+        };
+        let baseline_errors = check::check_readings(&fold(&[CORE_MD, COMPONENTS_MD]))
+            .into_iter().filter(|d| matches!(d.level, check::Level::Error)).count();
+        let with_rt_errors = check::check_readings(
+            &fold(&[CORE_MD, COMPONENTS_MD, RENDER_TARGET_MD]))
+            .into_iter().filter(|d| matches!(d.level, check::Level::Error)).count();
+        assert!(with_rt_errors <= baseline_errors,
+            "render-target.md introduced {} new checker Error(s); \
+             with_rt={} baseline={}",
+            with_rt_errors.saturating_sub(baseline_errors),
+            with_rt_errors, baseline_errors);
+    }
+
+    /// The Render Target population parses out of the reading: the
+    /// reference 'html' target carries its DEFS name and mime type.
+    #[test]
+    fn render_target_html_instance_parses() {
+        let state = parse_forml2::parse_to_state(RENDER_TARGET_MD)
+            .expect("render-target.md parses standalone");
+        let txt = format!("{:?}", state);
+        for needle in ["Render Target", "render:html", "text/html"] {
+            assert!(txt.contains(needle),
+                "parsed render-target.md state missing {:?}", needle);
+        }
     }
 }
 

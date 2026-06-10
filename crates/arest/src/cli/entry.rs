@@ -1026,6 +1026,15 @@ pub fn main_entry() {
         }
     }
 
+    // pb-render-fn-contract (§5.2) production wiring: install the
+    // reference HTML render function unconditionally — it is PURE
+    // (operand in, markup Atom out; no filesystem/network/state reach),
+    // pre-approved in `ast::APPROVED_PLATFORM_FN_NAMES`, and inert
+    // until a `Render Target` population names `render:html`
+    // (readings/ui/render-target.md declares the 'html' target under
+    // the ui-readings gate).
+    crate::platform::render_html::install();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // ── Subcommand dispatch ────────────────────────────────────────────

@@ -375,6 +375,13 @@ pub struct ViewProjection {
     pub source: String,
     /// The widgets, ordered by rendered Fact Type.
     pub elements: Vec<ViewElementProjection>,
+    /// §5.2 Platform Binding (pb-render-fn-contract): rendered output per
+    /// Render Target, keyed by the target slug ('html' → markup). One entry
+    /// per `Render Target has Platform Function Name` fact whose Platform fn
+    /// has an installed body (`render_via_targets`); empty when no targets
+    /// are declared, no bodies are installed, or under no_std.
+    #[serde(default, skip_serializing_if = "alloc::collections::BTreeMap::is_empty")]
+    pub representations: alloc::collections::BTreeMap<String, String>,
 }
 
 // -- Encode/decode bridge (Object ↔ CommandResult) --------------------
@@ -2035,7 +2042,7 @@ fn create_via_defs(
     // task-viewproj: project the entity's abstract control tree so it rides
     // WITH the get response (the thin HATEOAS wrapper). None where ui-readings
     // is compiled out; populated in kernel / ui.do builds.
-    let view = view_via_rho(d, noun, &entity_id);
+    let mut view = view_via_rho(d, noun, &entity_id);
     // task-crudl-deploy (d): the permission-gated CRUDL action menu for this
     // instance — projected at the HATEOAS level (beside transitions + nav) from
     // the substrate `authorized` predicate, gated on the sender. "instance" view
@@ -2044,6 +2051,12 @@ fn create_via_defs(
 
     let entity_data: hashbrown::HashMap<String, String> = fields_with_domain.iter()
         .map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    // pb-render-fn-contract (§5.2): apply every declared Render Target's
+    // installed render fn to the projected view; outputs ride on the view.
+    if let Some(ref mut v) = view {
+        let reps = render_via_targets(d, v, &entity_id, noun, &entity_data, &transitions);
+        v.representations = reps;
+    }
     let entities = core::iter::once(EntityResult {
         id: entity_id.clone(), entity_type: noun.to_string(), data: entity_data,
     }).chain(status.as_ref().map(|st| {
@@ -4868,7 +4881,12 @@ fn get_entity_via_defs(
     let transitions = hateoas_via_rho(d, noun, entity_id, status.as_deref());
     let navigation = nav_links_via_rho(d, noun, entity_id);
     // View projection (ui-readings gate — None when ui-readings not compiled in).
-    let view = view_via_rho(d, noun, entity_id);
+    let mut view = view_via_rho(d, noun, entity_id);
+    // pb-render-fn-contract (§5.2): render dispatch over declared Render Targets.
+    if let Some(ref mut v) = view {
+        let reps = render_via_targets(d, v, entity_id, noun, &entity_data, &transitions);
+        v.representations = reps;
+    }
     // task-crudl-deploy-readpath: "instance" CRUDL menu — gated on sender.
     let crudl = crudl_menu(d, noun, "instance", sender.unwrap_or(""));
     CommandResult {
@@ -5236,7 +5254,93 @@ pub fn view_via_rho(d: &ast::Object, noun: &str, _entity_id: &str) -> Option<Vie
     Some(ViewProjection {
         view: view_id, kind: "instance".to_string(),
         source: source.to_string(), elements,
+        representations: Default::default(),
     })
+}
+
+// ── §5.2 Platform Binding: render dispatch (pb-render-fn-contract) ───
+//
+// A Render Target (readings/ui/render-target.md) is one registered
+// render function: `Render Target has Platform Function Name` names the
+// DEFS binding, the host installs the body (`install_platform_fn`), and
+// this dispatch is a fact walk over that population — ρ over Render
+// Target facts, never a hard-coded match. Targets without an installed
+// body apply to Bottom and are skipped (the externals.rs discipline),
+// so declaring a target in readings is always safe.
+
+/// Encode the render operand: everything a §5.2 render function may
+/// consume, as one Object. Kept in lockstep with the reference decoder
+/// (`platform/render_html.rs`) by its unit tests.
+///
+/// `< <'view', <id, kind, source>>, <'entity', <id, noun>>,
+///    <'elements', <<id, fact_type, component_role>, ...>>,
+///    <'fields', <<name, value>, ...>>,
+///    <'affordances', <<event, target_status, href>, ...>> >`
+pub fn encode_render_input(
+    view: &ViewProjection, entity_id: &str, noun: &str,
+    fields: &[(String, String)], transitions: &[TransitionAction],
+) -> ast::Object {
+    let tag = |name: &str, body: ast::Object| ast::Object::seq(alloc::vec![
+        ast::Object::atom(name), body,
+    ]);
+    ast::Object::seq(alloc::vec![
+        tag("view", ast::Object::seq(alloc::vec![
+            ast::Object::atom(&view.view), ast::Object::atom(&view.kind),
+            ast::Object::atom(&view.source),
+        ])),
+        tag("entity", ast::Object::seq(alloc::vec![
+            ast::Object::atom(entity_id), ast::Object::atom(noun),
+        ])),
+        tag("elements", ast::Object::Seq(view.elements.iter().map(|e|
+            ast::Object::seq(alloc::vec![
+                ast::Object::atom(&e.id), ast::Object::atom(&e.fact_type),
+                ast::Object::atom(&e.component_role),
+            ])).collect())),
+        tag("fields", ast::Object::Seq(fields.iter().map(|(k, v)|
+            ast::Object::seq(alloc::vec![
+                ast::Object::atom(k), ast::Object::atom(v),
+            ])).collect())),
+        tag("affordances", ast::Object::Seq(transitions.iter().map(|t|
+            ast::Object::seq(alloc::vec![
+                ast::Object::atom(&t.event), ast::Object::atom(&t.target_status),
+                ast::Object::atom(&t.href),
+            ])).collect())),
+    ])
+}
+
+/// Apply every declared Render Target's Platform fn to the view — the
+/// §5.2 render dispatch. Returns `target slug → rendered output` for
+/// the targets whose fn produced an Atom; Bottom (no installed body,
+/// or a body that declined the operand) skips the target. Fields are
+/// name-sorted so the operand — and therefore every rendering — is
+/// deterministic regardless of map iteration order upstream.
+pub fn render_via_targets(
+    d: &ast::Object, view: &ViewProjection, entity_id: &str, noun: &str,
+    fields: &hashbrown::HashMap<String, String>,
+    transitions: &[TransitionAction],
+) -> alloc::collections::BTreeMap<String, String> {
+    let mut out = alloc::collections::BTreeMap::new();
+    let Some(rows) = ast::fetch_cell_seq(
+        "Render_Target_has_Platform_Function_Name", d).as_seq().map(|s| s.to_vec())
+    else { return out };
+
+    let mut sorted_fields: Vec<(String, String)> = fields.iter()
+        .map(|(k, v)| (k.clone(), v.clone())).collect();
+    sorted_fields.sort();
+    let input = encode_render_input(view, entity_id, noun, &sorted_fields, transitions);
+
+    for f in &rows {
+        let (Some(target), Some(fn_name)) = (
+            ast::binding(f, "Render Target"),
+            ast::binding(f, "Platform Function Name"),
+        ) else { continue };
+        let rendered = ast::apply(
+            &ast::Func::Platform(fn_name.to_string()), &input, d);
+        if let Some(body) = rendered.as_atom() {
+            out.insert(target.to_string(), body.to_string());
+        }
+    }
+    out
 }
 
 /// The View Kind bound to a View id (scans `View_has_View_Kind`).
