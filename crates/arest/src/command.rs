@@ -3408,6 +3408,37 @@ fn transition_via_defs(
     let transitions = hateoas_via_rho(d, &noun, entity_id, status.as_deref());
     let navigation = nav_links_via_rho(d, &noun, entity_id);
 
+    // pb-live-binding-reeval: a TRANSITION is the change a standing
+    // subscription most wants pushed (the status flip re-shapes the
+    // affordances). Fields assemble via the read path's `get_noun:`
+    // primitive (a JSON row of the entity's current single-valued
+    // facts); Bottom (unknown id / primitive absent) skips the view —
+    // delivery stays deontic and the transition emit is unchanged.
+    let view = if rejected {
+        None
+    } else {
+        let mut v = view_via_rho(d, &noun, entity_id);
+        if let Some(ref mut vp) = v {
+            let fields: hashbrown::HashMap<String, String> = ast::apply(
+                &ast::Func::Platform(alloc::format!("get_noun:{}", noun)),
+                &ast::Object::atom(entity_id),
+                d,
+            )
+            .as_atom()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .and_then(|val| val.as_object().cloned())
+            .map(|obj| obj.iter()
+                .filter(|(k, _)| k.as_str() != "id")
+                .filter_map(|(k, val)| val.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect())
+            .unwrap_or_default();
+            let reps = render_via_targets(d, vp, entity_id, &noun, &fields, &transitions);
+            vp.representations = reps;
+            deliver_render_subscriptions(d, &noun, entity_id, vp);
+        }
+        v
+    };
+
     // #209: return only the status-cell delta, not the full D. When a
     // deontic alethic violation rejects the transition, emit an empty
     // delta — the rewrite happened in `new_state` but must NOT ship to
@@ -3425,7 +3456,7 @@ fn transition_via_defs(
         violations,
         derived_count,
         rejected,
-        view: None,
+        view,
         crudl: Vec::new(),
         state: delta,
     }
