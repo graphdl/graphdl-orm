@@ -11,6 +11,7 @@ import { useArestOne } from '../hooks/useArestResource'
 import { useOpenApiSchema } from '../schema'
 import { humanize } from '../schema/openApiSchema'
 import { SchemaDisplay } from './schemaDisplay'
+import { ViewForm } from './ViewForm'
 
 export interface GenericShowViewProps {
   noun: string
@@ -28,6 +29,13 @@ export function GenericShowView(props: GenericShowViewProps): ReactElement {
   const schema = useOpenApiSchema(noun, { baseUrl, app })
   const isLoading = entity.isLoading || schema.isLoading
   const record = entity.data?.data
+  // §5.2 viewproj-client-render: the engine-emitted View projection,
+  // when the worker surface carries it. Renders ABOVE the schema dl —
+  // same layout as the kernel's UnifiedRepl Detail pane (widget form,
+  // then raw fields). The dl stays as the always-available fallback
+  // until the projection is the only source (the 934-2/934-3
+  // remove-hand-coded-renderer endgame).
+  const view = entity.data?.view
 
   const resolvedTitle = title ?? `${humanize(noun)}: ${id}`
 
@@ -39,6 +47,9 @@ export function GenericShowView(props: GenericShowViewProps): ReactElement {
       actions={actions}
       aside={aside}
     >
+      {record && view && view.elements.length > 0 ? (
+        <ViewForm view={view} record={record as Record<string, unknown>} noun={noun} />
+      ) : null}
       {record ? (
         <dl data-testid="generic-show-dl" style={{ display: 'grid', gridTemplateColumns: 'max-content 1fr', rowGap: '0.5rem', columnGap: '1rem' }}>
           {schema.fields.map((f) => (

@@ -28,7 +28,51 @@ export interface GetListResult<T> {
 }
 
 export interface GetOneParams { id: Identifier }
-export interface GetOneResult<T> { data: T }
+/**
+ * §5.2 viewproj-client-render — one element of the engine-emitted View
+ * projection: an abstract widget bound to a Fact Type. Mirrors
+ * `crates/arest/src/viewproj.rs::ViewElementProjection` (serde
+ * camelCase). The `componentRole` is the platform-neutral widget kind
+ * ('text-input' | 'date-picker' | 'checkbox' | 'combo-box') that the
+ * web binding maps onto a native element (components.md registry).
+ */
+export interface ViewElementProjection {
+  /** Deterministic `ve_<fnv>` ViewElement id (skolem frontier hash). */
+  id: string
+  /** The rendered Fact Type (e.g. "Task_has_Task_Subject"). */
+  factType: string
+  /** Widget kind chosen by the §4.2 value-type → widget rules. */
+  componentRole: string
+}
+
+/**
+ * The abstract control tree the engine projects for a fetched entity —
+ * the Theorem-4 view layer (`crates/arest/src/viewproj.rs::
+ * ViewProjection`, serde camelCase). `source` records the override
+ * tier: 'synthesized' (auto from value types), 'authored' (a declared
+ * View), or 'platform' (IoC custom view — reserved). `representations`
+ * carries per-Render-Target rendered output ('html' → markup) when
+ * Render Target platform fns are installed server-side.
+ */
+export interface ViewProjection {
+  view: string
+  kind: string
+  source: string
+  elements: ViewElementProjection[]
+  representations?: Record<string, string>
+}
+
+export interface GetOneResult<T> {
+  data: T
+  /**
+   * Engine-emitted View projection for the fetched entity, when the
+   * worker surface carries it (additive — absent on older workers and
+   * on the legacy cell-read path). Consumed by GenericShowView's
+   * ViewForm to render the §5.2 widget form instead of hand-mapped
+   * schema fields.
+   */
+  view?: ViewProjection
+}
 
 export interface GetManyParams { ids: Identifier[] }
 export interface GetManyResult<T> { data: T[] }

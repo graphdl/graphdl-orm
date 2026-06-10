@@ -170,6 +170,73 @@ describe('GenericShowView', () => {
     // SchemaDisplay: booleans get a ✓ / ✗ glyph.
     expect(screen.getByTestId('field-active').textContent).toMatch(/Yes/)
   })
+
+  it('renders the engine-emitted view form when the envelope carries view (§5.2)', async () => {
+    // The serde-camelCase ViewProjection the worker forwards from the
+    // engine's getEntity — same four §4.2 widget kinds the kernel
+    // Slint surface proved (view_form.rs fixture, QEMU-verified).
+    const view = {
+      view: 'instance-view-Organization',
+      kind: 'instance',
+      source: 'synthesized',
+      elements: [
+        { id: 've_0000000000000001', factType: 'Organization_has_Active', componentRole: 'checkbox' },
+        { id: 've_0000000000000002', factType: 'Organization_has_Channel', componentRole: 'combo-box' },
+        { id: 've_0000000000000003', factType: 'Organization_has_Founded', componentRole: 'date-picker' },
+        { id: 've_0000000000000004', factType: 'Organization_has_Name', componentRole: 'text-input' },
+      ],
+    }
+    stubFetch((req) => {
+      if (req.url.includes('/api/openapi.json')) return json(openapi)
+      return json({
+        data: { id: 'acme', name: 'Acme', Active: 'true', Channel: 'stable', Founded: '2026-01-15', Name: 'Acme' },
+        view,
+        _links: {},
+      })
+    })
+
+    render(wrap(<GenericShowView noun="Organization" id="acme" baseUrl={baseUrl} />))
+
+    await waitFor(() => expect(screen.getByTestId('view-form')).toBeDefined())
+    const form = screen.getByTestId('view-form')
+    expect(form.getAttribute('data-view-source')).toBe('synthesized')
+
+    // Widget kind per element, value joined from the record.
+    const active = screen.getByTestId('view-field-Organization_has_Active')
+    expect(active.getAttribute('data-widget')).toBe('checkbox')
+    expect((active.querySelector('input') as HTMLInputElement).checked).toBe(true)
+
+    const channel = screen.getByTestId('view-field-Organization_has_Channel')
+    expect(channel.getAttribute('data-widget')).toBe('combo-box')
+    expect((channel.querySelector('select') as HTMLSelectElement).value).toBe('stable')
+
+    const founded = screen.getByTestId('view-field-Organization_has_Founded')
+    expect(founded.getAttribute('data-widget')).toBe('date-picker')
+    expect((founded.querySelector('input') as HTMLInputElement).value).toBe('2026-01-15')
+
+    const name = screen.getByTestId('view-field-Organization_has_Name')
+    expect(name.getAttribute('data-widget')).toBe('text-input')
+    expect((name.querySelector('input') as HTMLInputElement).value).toBe('Acme')
+
+    // The schema dl still renders below — fallback surface stays until
+    // the remove-hand-coded-renderer endgame.
+    expect(screen.getByTestId('generic-show-dl')).toBeDefined()
+  })
+
+  it('omits the view form when the envelope has no view block', async () => {
+    stubFetch((req) => {
+      if (req.url.includes('/api/openapi.json')) return json(openapi)
+      return json({
+        data: { id: 'acme', name: 'Acme', tier: 'Pro', active: true },
+        _links: {},
+      })
+    })
+
+    render(wrap(<GenericShowView noun="Organization" id="acme" baseUrl={baseUrl} />))
+
+    await waitFor(() => expect(screen.getByTestId('generic-show-dl')).toBeDefined())
+    expect(screen.queryByTestId('view-form')).toBeNull()
+  })
 })
 
 describe('GenericEditView', () => {

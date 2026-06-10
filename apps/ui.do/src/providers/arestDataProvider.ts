@@ -31,6 +31,8 @@ import type {
   UpdateManyResult,
   UpdateParams,
   UpdateResult,
+  ViewElementProjection,
+  ViewProjection,
 } from './types'
 
 export interface ArestDataProviderOptions {
@@ -167,6 +169,54 @@ function unwrap<T>(body: unknown): T {
   return merged as T
 }
 
+/**
+ * §5.2 viewproj-client-render — lift the engine-emitted View
+ * projection off a get-one envelope when present. Additive contract:
+ * older workers / the legacy cell-read path simply omit `view`, and a
+ * malformed block (wrong shapes) is dropped rather than thrown — the
+ * schema-driven fallback rendering must never be blocked by the view
+ * layer. Mirrors `ViewProjection` in providers/types.ts (the serde
+ * camelCase of `crates/arest/src/viewproj.rs`).
+ */
+function extractViewProjection(body: unknown): ViewProjection | undefined {
+  if (!isRecord(body) || !isRecord(body.view)) return undefined
+  const v = body.view
+  if (
+    typeof v.view !== 'string' ||
+    typeof v.kind !== 'string' ||
+    typeof v.source !== 'string' ||
+    !Array.isArray(v.elements)
+  ) {
+    return undefined
+  }
+  const elements: ViewElementProjection[] = []
+  for (const el of v.elements) {
+    if (
+      !isRecord(el) ||
+      typeof el.id !== 'string' ||
+      typeof el.factType !== 'string' ||
+      typeof el.componentRole !== 'string'
+    ) {
+      return undefined
+    }
+    elements.push({ id: el.id, factType: el.factType, componentRole: el.componentRole })
+  }
+  const representations = isRecord(v.representations)
+    ? Object.fromEntries(
+        Object.entries(v.representations).filter(
+          (entry): entry is [string, string] => typeof entry[1] === 'string',
+        ),
+      )
+    : undefined
+  return {
+    view: v.view,
+    kind: v.kind,
+    source: v.source,
+    elements,
+    ...(representations ? { representations } : {}),
+  }
+}
+
 function normalizeList<T>(body: unknown): GetListResult<T> {
   if (!isRecord(body)) return { data: [] as T[] }
 
@@ -243,7 +293,8 @@ export function createArestDataProvider(
   ): Promise<GetOneResult<T>> => {
     const url = `${baseUrl}/${resource}/${encodeId(params.id)}`
     const body = await request(url, { method: 'GET' }, fetchImpl)
-    return { data: unwrap<T>(body) }
+    const view = extractViewProjection(body)
+    return view ? { data: unwrap<T>(body), view } : { data: unwrap<T>(body) }
   }
 
   const getMany = async <T = unknown>(
