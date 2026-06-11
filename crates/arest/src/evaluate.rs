@@ -806,6 +806,20 @@ pub fn forward_chain_defs_state_bounded(
 fn parse_derived_fact(item: &ast::Object, derived_by: &str) -> Option<DerivedFact> {
     let fact_items = item.as_seq().filter(|f| f.len() >= 3)?;
     let ft_id = fact_items[0].as_atom()?.to_string();
+    // empty-consequent-cell-mint (arc-agi-3 forensics): a derived item
+    // whose fact-type id is EMPTY is undeliverable — it comes from a
+    // rule whose consequent never resolved to a declared fact type
+    // (ConsequentCellSource skeleton `Literal("")`; the core corpus
+    // carries ~39 such aspirational rules) or from a dynamic consequent
+    // whose role value was missing at eval time. Pre-guard, the chain
+    // stored these under the empty-string CELL NAME — arc-agi-3's db
+    // grew a `""` cell holding the full Fact_Type_has_Role ⋈
+    // Noun_plays_Role join product, re-minted after every compile-time
+    // GC. Drop at the parse chokepoint so every chain variant (eager,
+    // seeded, bounded, semi-naive) is covered.
+    if ft_id.is_empty() {
+        return None;
+    }
     let reading = fact_items[1].as_atom()?.to_string();
     let bindings: Vec<(String, String)> = fact_items[2].as_seq()
         .unwrap_or(&[])
@@ -2609,6 +2623,49 @@ mod tests {
     }
 
     /// TDD #5 (global UC unchanged at the forward-chain layer): a NON-SM
+    /// empty-consequent-cell-mint (arc-agi-3 forensics): a rule whose
+    /// func emits derived items with an EMPTY fact-type id (consequent
+    /// never resolved — the core corpus carries ~39 such skeleton
+    /// rules) must contribute NOTHING to the chain. Pre-guard, the
+    /// items were stored under the empty-string cell name, growing a
+    /// `""` cell in app DBs that compile-time GC dropped and the next
+    /// apply re-minted, forever. The identically-shaped item WITH a
+    /// real fact-type id must still land — pins that the guard drops
+    /// exactly the undeliverable case.
+    #[test]
+    fn empty_fact_type_id_derived_items_are_dropped_not_stored_under_empty_cell() {
+        let mk_item = |ft: &str| ast::Object::seq(vec![
+            ast::Object::atom(ft),
+            ast::Object::atom("ghost join reading"),
+            ast::Object::seq(vec![
+                ast::Object::seq(vec![ast::Object::atom("Fact Type"),
+                    ast::Object::atom("Constraint_has_Text")]),
+                ast::Object::seq(vec![ast::Object::atom("Role"),
+                    ast::Object::atom("Constraint_has_Text#0")]),
+                ast::Object::seq(vec![ast::Object::atom("Noun"),
+                    ast::Object::atom("Constraint")]),
+            ]),
+        ]);
+        let ghost = ast::Func::constant(ast::Object::seq(vec![mk_item("")]));
+        let real  = ast::Func::constant(ast::Object::seq(vec![mk_item("Ghost_Join_Product")]));
+        let defs: Vec<(&str, &ast::Func)> = vec![
+            ("derivation:rule_ghost", &ghost),
+            ("derivation:rule_real",  &real),
+        ];
+        let d = ast::Object::phi();
+        let (state, derived) = forward_chain_defs_state(&defs, &d);
+
+        assert!(derived.iter().all(|f| !f.fact_type_id.is_empty()),
+            "no derived fact may carry an empty fact-type id; got {:?}",
+            derived.iter().map(|f| &f.fact_type_id).collect::<Vec<_>>());
+        let cell_names: Vec<&str> = ast::cells_iter(&state)
+            .into_iter().map(|(n, _)| n).collect();
+        assert!(!cell_names.contains(&""),
+            "the empty-string cell must never be minted; cells: {cell_names:?}");
+        assert!(derived.iter().any(|f| f.fact_type_id == "Ghost_Join_Product"),
+            "the identically-shaped item WITH a fact-type id must still derive");
+    }
+
     /// keyed cell must STILL conflict-reject a genuinely-conflicting second
     /// value derived in the forward chain. The scoped upsert is allowlisted
     /// to `State_Machine_is_currently_in_Status` ONLY; every other keyed
