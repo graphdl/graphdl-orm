@@ -41,6 +41,22 @@ pub struct TableColumn {
     pub nullable: bool,
     #[cfg_attr(feature = "std-deps", serde(skip_serializing_if = "Option::is_none"))]
     pub references: Option<String>,
+    /// rmap-3nf-tables Stage 1b — PROVENANCE for the row projection:
+    /// the population cell this column's values come from. None for
+    /// synthesized columns (the PK id, xo discriminators). Together
+    /// with `source_subject_role` / `source_value_role` the persist
+    /// path can replay exactly this column's data out of the cell
+    /// graph without re-deriving (and drifting from) the final
+    /// decorated name.
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub source_cell: Option<String>,
+    /// The role (noun name) whose binding keys the row — the absorbing
+    /// entity's role in the source fact.
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub source_subject_role: Option<String>,
+    /// The role (noun name) whose binding supplies this column's value.
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub source_value_role: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -575,6 +591,11 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
                 col_type: "TEXT".to_string(),
                 nullable: false,
                 references: if is_entity { Some(to_snake(&role.noun_name)) } else { None },
+                // Junction row projection: every column reads ITS role
+                // from the same compound-FT cell; no subject key.
+                source_cell: Some((*ft_id).to_string()),
+                source_subject_role: None,
+                source_value_role: Some(role.noun_name.clone()),
             }
         }).collect();
         let pk_cols: Vec<String> = ft.roles.iter()
@@ -631,6 +652,9 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
                         col_type: "TEXT".to_string(),
                         nullable: if is_subtype { true } else { !is_mandatory },
                         references: if is_entity { Some(to_snake(&role.noun_name)) } else { None },
+                        source_cell: Some((*ft_id).to_string()),
+                        source_subject_role: Some(source_role.noun_name.clone()),
+                        source_value_role: Some(role.noun_name.clone()),
                     };
                     let vc_key = format!("{}:{}", ft_id, role.role_index);
                     let check_values = vcs_by_ft_role.get(&vc_key).cloned();
@@ -691,6 +715,9 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
             col_type: "TEXT".to_string(),
             nullable: !is_mandatory,
             references: if is_target_entity { Some(to_snake(fk_target)) } else { None },
+            source_cell: Some((*ft_id).to_string()),
+            source_subject_role: Some(near_noun.clone()),
+            source_value_role: Some(fk_target.clone()),
         };
         let phase1 = decorated_column_name(&nouns, &ft.reading, near_noun, fk_target);
         Some((absorb_into, column, None, phase1))
@@ -705,6 +732,7 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
                     col_type: "TEXT".to_string(),
                     nullable: *nullable,
                     references: None,
+                    ..Default::default()
                 };
                 (resolved.clone(), column, Some(values.clone()), None)
             }).collect::<Vec<_>>()
@@ -829,6 +857,7 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
                     col_type: "TEXT".to_string(),
                     nullable: false,
                     references: Some(to_snake(parent_name)),
+                    ..Default::default()
                 };
                 let mut all = vec![id_col];
                 all.extend(columns.iter().cloned());
@@ -840,6 +869,7 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
                     col_type: "TEXT".to_string(),
                     nullable: false,
                     references: None,
+                    ..Default::default()
                 };
                 let mut all = vec![id_col];
                 all.extend(columns.iter().cloned());
@@ -877,7 +907,7 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
         .for_each(|ref_table| {
             tables.push(TableDef {
                 name: ref_table.clone(),
-                columns: vec![TableColumn { name: "id".to_string(), col_type: "TEXT".to_string(), nullable: false, references: None }],
+                columns: vec![TableColumn { name: "id".to_string(), col_type: "TEXT".to_string(), nullable: false, references: None, ..Default::default() }],
                 primary_key: vec!["id".to_string()], checks: None, unique_constraints: None,
             });
             emitted.insert(ref_table);

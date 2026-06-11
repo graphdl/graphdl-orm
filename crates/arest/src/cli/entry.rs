@@ -153,8 +153,128 @@ mod db {
                 ).unwrap_or_else(|e| { eprintln!("Failed to store def {}: {}", name, e); std::process::exit(1); });
             });
 
+        // rmap-3nf-tables Stage 1b: refresh the 3NF projection rows in
+        // the same transaction. Cells remain the source of truth.
+        project_population_rows(&tx, d);
+
         tx.commit()
             .unwrap_or_else(|e| { eprintln!("Commit failed: {}", e); std::process::exit(1); });
+    }
+
+    /// rmap-3nf-tables Stage 1b — project population cells into the
+    /// 3NF RMAP tables (wholesale refresh, mirroring the cells
+    /// DELETE+reINSERT above; the tables are a PROJECTION, cells are
+    /// the source of truth).
+    ///
+    /// Row assembly per `TableDef`, driven by the Stage-1b provenance
+    /// the rmap columns now carry (`source_cell` / `source_subject_role`
+    /// / `source_value_role` — the same final DECORATED names the DDL
+    /// used, so projection can never drift from the schema):
+    ///
+    ///   * entity tables (synthetic `id` PK): one row per subject id,
+    ///     each provenance column's value joined from its source cell
+    ///     by (subject binding = id, value binding = column value);
+    ///   * junction/compound tables: one row per fact of the (shared)
+    ///     source cell — extracted POSITIONALLY so same-noun rings
+    ///     (`Task blocks Task`: two `Task` bindings) land both roles,
+    ///     with a by-name fallback when the fact's arity differs.
+    ///
+    /// Best-effort per row: a NOT NULL miss or constraint failure
+    /// warns and skips that row (mandatory enforcement lives in
+    /// ρ(validate), not here). Tables without provenance (independent
+    /// id-only tables) project the distinct subject ids found across
+    /// the cell graph's references — deferred until a consumer needs
+    /// them; today they stay empty.
+    pub fn project_population_rows(conn: &Connection, d: &ast::Object) {
+        let tables = crate::rmap::rmap_from_state(d);
+        for table in &tables {
+            // Skip tables that were never created (paranoia — apply_ddl
+            // warns on its own).
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                params![table.name], |r| r.get::<_, i64>(0)).map(|n| n > 0).unwrap_or(false);
+            if !exists { continue; }
+            let _ = conn.execute(&format!("DELETE FROM \"{}\"", table.name), []);
+
+            let is_entity_table = table.primary_key == ["id".to_string()];
+            if is_entity_table {
+                // id → (column → value)
+                let mut rows: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+                    std::collections::HashMap::new();
+                for col in &table.columns {
+                    let (Some(cell), Some(subj), Some(val)) =
+                        (&col.source_cell, &col.source_subject_role, &col.source_value_role)
+                    else { continue };
+                    let contents = ast::fetch_cell_seq(cell, d);
+                    for fact in ast::cell_facts_iter(&contents) {
+                        if let (Some(id), Some(v)) = (ast::binding(fact, subj), ast::binding(fact, val)) {
+                            rows.entry(id.to_string()).or_default()
+                                .insert(col.name.clone(), v.to_string());
+                        }
+                    }
+                }
+                for (id, cols) in rows {
+                    let mut names: Vec<String> = vec!["id".to_string()];
+                    let mut values: Vec<String> = vec![id];
+                    for (k, v) in cols {
+                        names.push(format!("\"{}\"", k.replace('"', "")));
+                        values.push(v);
+                    }
+                    let placeholders: Vec<String> =
+                        (1..=values.len()).map(|i| format!("?{}", i)).collect();
+                    let sql = format!(
+                        "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
+                        table.name, names.join(", "), placeholders.join(", "));
+                    if let Err(e) = conn.execute(&sql, rusqlite::params_from_iter(values.iter())) {
+                        eprintln!("Warning: row projection failed for {}: {}", table.name, e);
+                    }
+                }
+            } else {
+                // Junction/compound: every provenance column shares the
+                // source cell; one row per fact, positional extraction.
+                let Some(cell) = table.columns.iter()
+                    .find_map(|c| c.source_cell.clone()) else { continue };
+                let proj_cols: Vec<&crate::rmap::TableColumn> = table.columns.iter()
+                    .filter(|c| c.source_cell.is_some())
+                    .collect();
+                let contents = ast::fetch_cell_seq(&cell, d);
+                for fact in ast::cell_facts_iter(&contents) {
+                    let pairs: Vec<(String, String)> = fact.as_seq()
+                        .map(|items| items.iter().filter_map(|p| {
+                            let kv = p.as_seq()?;
+                            if kv.len() != 2 { return None; }
+                            Some((kv[0].as_atom()?.to_string(), kv[1].as_atom()?.to_string()))
+                        }).collect())
+                        .unwrap_or_default();
+                    let mut names: Vec<String> = Vec::new();
+                    let mut values: Vec<String> = Vec::new();
+                    if pairs.len() == proj_cols.len() {
+                        // Positional: role order == column order (rings safe).
+                        for (col, (_, v)) in proj_cols.iter().zip(pairs.iter()) {
+                            names.push(format!("\"{}\"", col.name.replace('"', "")));
+                            values.push(v.clone());
+                        }
+                    } else {
+                        for col in proj_cols.iter() {
+                            let Some(role) = &col.source_value_role else { continue };
+                            if let Some((_, v)) = pairs.iter().find(|(k, _)| k == role) {
+                                names.push(format!("\"{}\"", col.name.replace('"', "")));
+                                values.push(v.clone());
+                            }
+                        }
+                    }
+                    if names.is_empty() { continue; }
+                    let placeholders: Vec<String> =
+                        (1..=values.len()).map(|i| format!("?{}", i)).collect();
+                    let sql = format!(
+                        "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
+                        table.name, names.join(", "), placeholders.join(", "));
+                    if let Err(e) = conn.execute(&sql, rusqlite::params_from_iter(values.iter())) {
+                        eprintln!("Warning: row projection failed for {}: {}", table.name, e);
+                    }
+                }
+            }
+        }
     }
 
     /// Load state D from SQLite.
