@@ -115,9 +115,19 @@ mod db {
         let plan = crate::rmap::projection_plan(d);
         let plan_by_name: hashbrown::HashMap<&str, &crate::rmap::TableDef> =
             plan.tables.iter().map(|t| (t.name.as_str(), t)).collect();
+        // DDL reshaping must not be hostage to FK enforcement or
+        // populated children: a silently-failing DROP strands the OLD
+        // table shape and every new-shape insert fails "no column
+        // named" (the live noun.has_object_type_4 fossil). FKs off for
+        // the DDL phase only; Phase 4's delete+insert re-establishes
+        // row-level consistency under whatever enforcement the
+        // connection has. Drop failures are LOUD now.
+        let _ = conn.execute_batch("PRAGMA foreign_keys=OFF;");
         for name in plan.order.iter().rev() {
-            let _ = conn.execute_batch(
-                &format!("DROP TABLE IF EXISTS {};", crate::rmap::qid(name)));
+            if let Err(e) = conn.execute_batch(
+                &format!("DROP TABLE IF EXISTS {};", crate::rmap::qid(name))) {
+                eprintln!("Warning: plan DROP failed for {}: {}", name, e);
+            }
         }
         for name in &plan.order {
             let Some(t) = plan_by_name.get(name.as_str()) else { continue };
@@ -125,6 +135,7 @@ mod db {
                 eprintln!("Warning: plan DDL failed for {}: {}", t.name, e);
             });
         }
+        let _ = conn.execute_batch("PRAGMA foreign_keys=ON;");
         // CREATE TABLE from sql:sqlite:* cells
         ast::cells_iter(d).into_iter()
             .filter(|(name, _)| name.starts_with("sql:sqlite:"))
@@ -600,7 +611,34 @@ mod derived_wipe_set_tests {
     }
 }
 
-/// Content hash (FNV-1a) of the bundled metamodel readings — the cache key.
+/// FNV-1a of THIS BINARY's bytes — the definitive engine identity.
+///
+/// rmap-3nf-tables Stage 3 (cache-key hardening): both the metamodel
+/// parse cache and the `_CompileSig` delta-LFP skip used to key on
+/// content that does NOT change for working-tree rebuilds
+/// (`AREST_GIT_SHA` moves only on commit; the readings hash only on
+/// readings edits) — so a rebuilt parser served STALE cached parses
+/// and skipped re-derivation until a commit landed or the caches were
+/// hand-cleared. Bit twice live this session (a new backfill
+/// derivation silently didn't fire; a parser fix didn't take). The
+/// binary hashing itself is f(code) exactly; ~10ms once per process
+/// via OnceLock.
+#[cfg(feature = "local")]
+fn binary_self_hash() -> u64 {
+    static HASH: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *HASH.get_or_init(|| {
+        let bytes = std::env::current_exe().ok()
+            .and_then(|p| std::fs::read(p).ok())
+            .unwrap_or_default();
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in bytes { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+        h
+    })
+}
+
+/// Content hash (FNV-1a) of the bundled metamodel readings PLUS the
+/// binary self-hash — the cache key. A parse cache is a function of
+/// (readings, parser); either changing must miss.
 #[cfg(feature = "local")]
 fn metamodel_readings_signature() -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -610,7 +648,7 @@ fn metamodel_readings_signature() -> u64 {
         for b in entry.1.bytes() { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
         h ^= 0x1e; h = h.wrapping_mul(0x100000001b3);
     }
-    h
+    h ^ binary_self_hash()
 }
 
 /// FILE path of the metamodel parse cache for the current readings signature.
@@ -1909,7 +1947,12 @@ pub fn main_entry() {
                         for b in r.0.bytes().chain(r.1.bytes()) { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
                         h ^= 0x1e; h = h.wrapping_mul(0x100000001b3);
                     }
-                    for b in env!("AREST_GIT_SHA").bytes() { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+                    // Stage-3 cache-key hardening: the BINARY SELF-HASH,
+                    // not AREST_GIT_SHA — the SHA only moves on commit,
+                    // so working-tree rebuilds (new derivations, parser
+                    // fixes) skipped the re-derive and served stale
+                    // state until a commit landed (bit twice live).
+                    h ^= binary_self_hash();
                     alloc::format!("{:016x}", h)
                 };
                 let prior_sig = ast::fetch_or_phi("_CompileSig", &d).as_atom().map(|s| s.to_string());

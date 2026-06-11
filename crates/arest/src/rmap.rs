@@ -861,6 +861,16 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
     for (key, col, _, _) in all_additions.iter() {
         *phase0_counts.entry((key.clone(), col.name.clone())).or_insert(0) += 1;
     }
+    #[cfg(feature = "std-deps")]
+    if std::env::var("RMAP_DBG_COLLIDERS").is_ok() {
+        for (key, col, _, p1) in all_additions.iter() {
+            if phase0_counts.get(&(key.clone(), col.name.clone())).map_or(false, |n| *n > 1) {
+                std::eprintln!("[rmap-collide] table={} col={} src_cell={:?} subj={:?} val={:?} phase1={:?}",
+                    key, col.name, col.source_cell, col.source_subject_role,
+                    col.source_value_role, p1);
+            }
+        }
+    }
     // Pass 2: resolve final names + fold.
     let mut taken: HashMap<String, HashSet<String>> = HashMap::new();
     let entity_columns: HashMap<String, (Vec<TableColumn>, HashSet<String>, Vec<String>)> =
