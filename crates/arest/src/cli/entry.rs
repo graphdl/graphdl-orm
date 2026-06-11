@@ -1895,6 +1895,57 @@ pub fn main_entry() {
                     .filter(|v| !v.alethic)
                     .for_each(|v| eprintln!("[model warning] {}", v.message));
 
+                // arc-agi-3 engine-issue 2: ALSO run the layered check
+                // battery (check_readings_func, layers 1–8) here and print
+                // the diagnostics the APP introduced. The dynamic
+                // load_reading gate (`validate_loaded_state`) rejects on
+                // errors but swallows warnings, and this dirs path never
+                // ran the battery at all — so check-layer warnings (layer-7
+                // unbound computed bindings, layer-8 widget drift, …) were
+                // invisible from `apps.compile` even after the MCP
+                // diagnostics channel landed. `[check …]` lines pass the
+                // MCP stderr filter.
+                //
+                // DIFFERENTIAL, not raw: the battery over the merged state
+                // also sees the bundled substrate readings, whose ~350
+                // pre-existing layer-1 resolver warnings would flood the
+                // MCP's 100-line diagnostics cap and bury the app's own
+                // signal. Baseline = the battery over the cached seeded
+                // metamodel parse (`mm_parsed`, no app); only diagnostics
+                // NEW relative to that baseline print. Population-caused
+                // findings (atom ids, widget drift) survive the diff — the
+                // bare substrate has no app population to fire them.
+                {
+                    let diag_key = |d: &crate::check::ReadingDiagnostic| {
+                        format!("{:?}|{:?}|{}|{}", d.level, d.source, d.reading, d.message)
+                    };
+                    let baseline: hashbrown::HashSet<String> =
+                        crate::load_reading_core::check_state_diagnostics(mm_parsed)
+                            .iter().map(&diag_key).collect();
+                    let mut suppressed = 0usize;
+                    for d in crate::load_reading_core::check_state_diagnostics(&state) {
+                        if baseline.contains(&diag_key(&d)) {
+                            suppressed += 1;
+                            continue;
+                        }
+                        let loc = if d.line > 0 {
+                            format!(" line {}", d.line)
+                        } else {
+                            String::new()
+                        };
+                        let fix = d.suggestion.as_deref()
+                            .map(|s| format!(" (fix: {})", s))
+                            .unwrap_or_default();
+                        eprintln!("[check {:?} {:?}]{}: {}{}",
+                            d.level, d.source, loc, d.message, fix);
+                    }
+                    if suppressed > 0 {
+                        eprintln!("[check] {} substrate-baseline diagnostics suppressed \
+                                   (they fire on the bundled readings alone — not \
+                                   app-actionable)", suppressed);
+                    }
+                }
+
                 // task-951: `--export-norma <file>` short-circuits here.
                 // `compile_to_defs_state` has just built the `norma:model`
                 // def cell (compile.rs:2912) from the `norma` generator; we

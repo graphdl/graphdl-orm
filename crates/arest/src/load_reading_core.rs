@@ -798,12 +798,7 @@ pub fn load_reading(
 /// REPL or a UI preview pane). Same gate, same result.
 pub fn validate_loaded_state(state: &Object) -> LoadValidationReport {
     use crate::check::{Level, Source};
-    let diag_obj = crate::ast::apply(
-        &crate::check::check_readings_func(),
-        state,
-        state,
-    );
-    let diags = decode_diagnostics(&diag_obj);
+    let diags = check_state_diagnostics(state);
     let mut alethic_violations: Vec<crate::check::ReadingDiagnostic> = Vec::new();
     let mut deontic_violations: Vec<crate::check::ReadingDiagnostic> = Vec::new();
     for d in diags.into_iter() {
@@ -824,6 +819,29 @@ pub fn validate_loaded_state(state: &Object) -> LoadValidationReport {
         deontic_violations,
         passes,
     }
+}
+
+/// Run the FULL check battery (`check_readings_func`, layers 1–8)
+/// against an already-loaded state and return EVERY diagnostic —
+/// errors, warnings, AND hints.
+///
+/// Introspection counterpart of `validate_loaded_state`: the gate
+/// keeps only `Level::Error` rows for its reject decision and
+/// silently discards warnings, and the dirs-compile path
+/// (`arest-cli <dir> --db`, i.e. `apps.compile`) historically never
+/// ran the battery at all — so check-layer warnings (e.g. layer-7
+/// "computed bindings in a multi-antecedent rule are not evaluated",
+/// layer-8 widget-agreement drift) were invisible from the app
+/// ingestion path (arc-agi-3 engine-issue 2). The dirs path now calls
+/// this and prints each row to stderr with a `[check …]` prefix so
+/// the MCP diagnostics filter surfaces them.
+pub fn check_state_diagnostics(state: &Object) -> Vec<crate::check::ReadingDiagnostic> {
+    let diag_obj = crate::ast::apply(
+        &crate::check::check_readings_func(),
+        state,
+        state,
+    );
+    decode_diagnostics(&diag_obj)
 }
 
 /// Inverse of `load_reading` — drop a previously-loaded reading from
@@ -3212,5 +3230,53 @@ Order has Order Readiness 'ready' iff Order has Order Status 'pending'.
              from the preserved primary 'pending' fact; \
              Order_has_Order_Readiness after = {cell_after:?}"
         );
+    }
+
+    /// arc-agi-3 engine-issue 2: `check_state_diagnostics` is the
+    /// introspection surface the dirs-compile path prints from — it
+    /// must return check-layer WARNINGS (with suggestion intact
+    /// through the encode/decode round-trip), while the reject gate
+    /// (`validate_loaded_state`) on the SAME state still passes.
+    /// Pins the warning-vs-reject split: warnings are surfaced, never
+    /// swallowed, never escalated to a load rejection.
+    #[test]
+    fn check_state_diagnostics_surfaces_warnings_the_gate_passes() {
+        // The layer-7 footgun shape: computed bindings + a second
+        // real antecedent (same fixture as check.rs's
+        // computed_bindings_in_multi_antecedent_rule_warn).
+        let input = r#"# Test
+Resource(.Reference) is an entity type.
+Reference is a value type.
+Status is a value type.
+Run(.id) is an entity type.
+id is a value type.
+Game is a value type.
+Game State is a value type.
+
+## Fact Types
+Resource is currently in Status.
+Run plays Game.
+Run has Game State.
+
+## Derivation Rules
+* Run has Game State iff that Resource is currently in some Status and Game State is Status and Run is Resource and the Run plays some Game.
+"#;
+        let state = crate::parse_forml2::parse_to_state(input)
+            .expect("footgun fixture parses clean — the shape compiles, it just derives empty");
+
+        let diags = check_state_diagnostics(&state);
+        let hits: Vec<&crate::check::ReadingDiagnostic> = diags.iter()
+            .filter(|d| d.message.contains("multi-antecedent rule are NOT"))
+            .collect();
+        assert_eq!(hits.len(), 1,
+            "the layer-7 warning must come through the state-level surface; got {diags:?}");
+        assert!(matches!(hits[0].level, crate::check::Level::Warning));
+        assert!(hits[0].suggestion.as_deref().unwrap_or("").contains("single-antecedent bridge"),
+            "suggestion must survive the encode/decode round-trip; got {:?}", hits[0].suggestion);
+
+        let gate = validate_loaded_state(&state);
+        assert!(gate.passes,
+            "warnings must NOT reject the load — alethic {:?} / deontic {:?}",
+            gate.alethic_violations, gate.deontic_violations);
     }
 }
