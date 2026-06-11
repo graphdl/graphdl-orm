@@ -71,6 +71,16 @@ pub struct TableDef {
     /// Additional UNIQUE constraints (each inner Vec is a set of column names)
     #[cfg_attr(feature = "std-deps", serde(skip_serializing_if = "Option::is_none"))]
     pub unique_constraints: Option<Vec<Vec<String>>>,
+    /// rmap-3nf-tables Stage 1b — the REFERENCE-SCHEME value column of
+    /// an entity table (e.g. `reference` on `resource` from
+    /// `Resource(.Reference)`), when the entity has a single-noun ref
+    /// scheme and the column was absorbed. The row projection defaults
+    /// it to the row's id when no explicit fact carries it: the
+    /// synthetic id IS the reference-scheme value (Halpin — the
+    /// reference mode identifies the entity), so populations that
+    /// store bare ids still satisfy the NOT NULL refmode column.
+    #[cfg_attr(feature = "std-deps", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub ref_value_column: Option<String>,
 }
 
 // -- Helpers ----------------------------------------------------------
@@ -604,7 +614,7 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
             .collect();
 
         let table_name = compound_table_name(&ft.reading, &ft.roles, &noun_name_set);
-        TableDef { name: table_name, columns, primary_key: pk_cols, checks: None, unique_constraints: None }
+        TableDef { name: table_name, columns, primary_key: pk_cols, checks: None, unique_constraints: None, ref_value_column: None }
     }).collect();
     emitted.extend(compound_tables.iter().map(|t| t.name.clone()));
     tables.extend(compound_tables);
@@ -879,12 +889,21 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
             // Feature #57: Attach external UC as UNIQUE constraints
             let ext_ucs = external_ucs.get(entity_name).cloned();
 
+            // Stage 1b: the absorbed reference-scheme value column (the
+            // row projection defaults it to the id when no explicit
+            // fact carries it — the id IS the refmode value).
+            let ref_value_column = ref_schemes.get(entity_name)
+                .filter(|schemes| schemes.len() == 1)
+                .map(|schemes| column_name_for_target(&nouns, &schemes[0]))
+                .filter(|col| all_cols.iter().any(|c| &c.name == col));
+
             TableDef {
                 name: table_name,
                 columns: all_cols,
                 primary_key: pk,
                 checks: if checks.is_empty() { None } else { Some(checks.clone()) },
                 unique_constraints: ext_ucs,
+                ref_value_column,
             }
         })
         .collect();
@@ -908,7 +927,7 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
             tables.push(TableDef {
                 name: ref_table.clone(),
                 columns: vec![TableColumn { name: "id".to_string(), col_type: "TEXT".to_string(), nullable: false, references: None, ..Default::default() }],
-                primary_key: vec!["id".to_string()], checks: None, unique_constraints: None,
+                primary_key: vec!["id".to_string()], checks: None, unique_constraints: None, ref_value_column: None,
             });
             emitted.insert(ref_table);
         });

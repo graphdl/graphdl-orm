@@ -186,20 +186,35 @@ mod db {
     /// the cell graph's references — deferred until a consumer needs
     /// them; today they stay empty.
     pub fn project_population_rows(conn: &Connection, d: &ast::Object) {
-        let tables = crate::rmap::rmap_from_state(d);
-        for table in &tables {
-            // Skip tables that were never created (paranoia — apply_ddl
-            // warns on its own).
-            let exists: bool = conn.query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                params![table.name], |r| r.get::<_, i64>(0)).map(|n| n > 0).unwrap_or(false);
-            if !exists { continue; }
-            let _ = conn.execute(&format!("DELETE FROM \"{}\"", table.name), []);
+        // SAVEPOINT isolation: the projection must NEVER poison the
+        // cells/defs persist — a deferred-FK commit failure here once
+        // rolled back the WHOLE transaction (caught live). Any terminal
+        // projection error rolls back to this savepoint and the persist
+        // proceeds without the projection.
+        if conn.execute_batch("SAVEPOINT rmap_projection;").is_err() { return; }
+        let ok = project_population_rows_inner(conn, d);
+        if ok {
+            let _ = conn.execute_batch("RELEASE rmap_projection;");
+        } else {
+            eprintln!("Warning: 3NF row projection rolled back (cells/defs persist unaffected)");
+            let _ = conn.execute_batch("ROLLBACK TO rmap_projection; RELEASE rmap_projection;");
+        }
+    }
 
+    fn project_population_rows_inner(conn: &Connection, d: &ast::Object) -> bool {
+        type Row = std::collections::BTreeMap<String, String>;
+        let tables = crate::rmap::rmap_from_state(d);
+        let by_name: std::collections::HashMap<String, &crate::rmap::TableDef> =
+            tables.iter().map(|t| (t.name.clone(), t)).collect();
+
+        // ── Phase 1: collect every table's rows IN MEMORY ──────────────
+        let mut collected: std::collections::HashMap<String, Vec<Row>> =
+            std::collections::HashMap::new();
+        for table in &tables {
             let is_entity_table = table.primary_key == ["id".to_string()];
+            let mut out: Vec<Row> = Vec::new();
             if is_entity_table {
-                // id → (column → value)
-                let mut rows: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
+                let mut rows: std::collections::HashMap<String, Row> =
                     std::collections::HashMap::new();
                 for col in &table.columns {
                     let (Some(cell), Some(subj), Some(val)) =
@@ -213,25 +228,20 @@ mod db {
                         }
                     }
                 }
-                for (id, cols) in rows {
-                    let mut names: Vec<String> = vec!["id".to_string()];
-                    let mut values: Vec<String> = vec![id];
-                    for (k, v) in cols {
-                        names.push(format!("\"{}\"", k.replace('"', "")));
-                        values.push(v);
+                for (id, mut cols) in rows {
+                    // Refscheme defaulting: the synthetic id IS the
+                    // reference-mode value when no explicit fact
+                    // carries it (resource.reference = the task id).
+                    if let Some(ref_col) = &table.ref_value_column {
+                        cols.entry(ref_col.clone()).or_insert_with(|| id.clone());
                     }
-                    let placeholders: Vec<String> =
-                        (1..=values.len()).map(|i| format!("?{}", i)).collect();
-                    let sql = format!(
-                        "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
-                        table.name, names.join(", "), placeholders.join(", "));
-                    if let Err(e) = conn.execute(&sql, rusqlite::params_from_iter(values.iter())) {
-                        eprintln!("Warning: row projection failed for {}: {}", table.name, e);
-                    }
+                    cols.insert("id".to_string(), id);
+                    out.push(cols);
                 }
             } else {
-                // Junction/compound: every provenance column shares the
-                // source cell; one row per fact, positional extraction.
+                // Junction/compound: one row per fact, positional
+                // extraction (same-noun rings land both roles), by-name
+                // fallback on arity mismatch.
                 let Some(cell) = table.columns.iter()
                     .find_map(|c| c.source_cell.clone()) else { continue };
                 let proj_cols: Vec<&crate::rmap::TableColumn> = table.columns.iter()
@@ -246,35 +256,121 @@ mod db {
                             Some((kv[0].as_atom()?.to_string(), kv[1].as_atom()?.to_string()))
                         }).collect())
                         .unwrap_or_default();
-                    let mut names: Vec<String> = Vec::new();
-                    let mut values: Vec<String> = Vec::new();
+                    let mut row: Row = Row::new();
                     if pairs.len() == proj_cols.len() {
-                        // Positional: role order == column order (rings safe).
                         for (col, (_, v)) in proj_cols.iter().zip(pairs.iter()) {
-                            names.push(format!("\"{}\"", col.name.replace('"', "")));
-                            values.push(v.clone());
+                            row.insert(col.name.clone(), v.clone());
                         }
                     } else {
                         for col in proj_cols.iter() {
                             let Some(role) = &col.source_value_role else { continue };
                             if let Some((_, v)) = pairs.iter().find(|(k, _)| k == role) {
-                                names.push(format!("\"{}\"", col.name.replace('"', "")));
-                                values.push(v.clone());
+                                row.insert(col.name.clone(), v.clone());
                             }
                         }
                     }
-                    if names.is_empty() { continue; }
-                    let placeholders: Vec<String> =
-                        (1..=values.len()).map(|i| format!("?{}", i)).collect();
-                    let sql = format!(
-                        "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
-                        table.name, names.join(", "), placeholders.join(", "));
-                    if let Err(e) = conn.execute(&sql, rusqlite::params_from_iter(values.iter())) {
-                        eprintln!("Warning: row projection failed for {}: {}", table.name, e);
+                    if !row.is_empty() { out.push(row); }
+                }
+            }
+            collected.insert(table.name.clone(), out);
+        }
+
+        // ── Phase 2: derive PARENT rows from FK values in memory ───────
+        // Every distinct id referenced by a collected FK column
+        // materializes a row in its parent (id-only parents, entities
+        // whose only appearance is being pointed at). The refscheme
+        // column defaults to the id per Halpin.
+        let mut extra: std::collections::HashMap<String, std::collections::HashSet<String>> =
+            std::collections::HashMap::new();
+        for table in &tables {
+            let Some(rows) = collected.get(&table.name) else { continue };
+            for col in &table.columns {
+                let Some(parent) = &col.references else { continue };
+                if !by_name.contains_key(parent) { continue; }
+                for row in rows {
+                    if let Some(v) = row.get(&col.name) {
+                        extra.entry(parent.clone()).or_default().insert(v.clone());
                     }
                 }
             }
         }
+        for (parent, ids) in extra {
+            let parent_def = by_name[&parent];
+            let rows = collected.entry(parent.clone()).or_default();
+            let existing: std::collections::HashSet<String> = rows.iter()
+                .filter_map(|r| r.get("id").cloned())
+                .collect();
+            for id in ids {
+                if existing.contains(&id) { continue; }
+                let mut row: Row = Row::new();
+                if let Some(ref_col) = &parent_def.ref_value_column {
+                    row.insert(ref_col.clone(), id.clone());
+                }
+                row.insert("id".to_string(), id);
+                rows.push(row);
+            }
+        }
+
+        // ── Phase 3: dependency order (parents before children) ───────
+        // Kahn over the references graph; self-references and cycles
+        // fall out at the end (their FK misses warn-and-skip per row).
+        let mut order: Vec<&crate::rmap::TableDef> = Vec::new();
+        let mut placed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut remaining: Vec<&crate::rmap::TableDef> = tables.iter().collect();
+        while !remaining.is_empty() {
+            let before = remaining.len();
+            let (ready, rest): (Vec<_>, Vec<_>) = remaining.into_iter().partition(|t| {
+                t.columns.iter()
+                    .filter_map(|c| c.references.as_ref())
+                    .all(|p| p == &t.name || placed.contains(p) || !by_name.contains_key(p))
+            });
+            for t in &ready { placed.insert(t.name.clone()); }
+            order.extend(ready);
+            remaining = rest;
+            if remaining.len() == before {
+                // Cycle: append the rest in name order (deterministic).
+                let mut rest_sorted = remaining;
+                rest_sorted.sort_by(|a, b| a.name.cmp(&b.name));
+                order.extend(rest_sorted);
+                break;
+            }
+        }
+
+        // ── Phase 4: execute — delete children-first, insert parents-first.
+        for table in order.iter().rev() {
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                params![table.name], |r| r.get::<_, i64>(0)).map(|n| n > 0).unwrap_or(false);
+            if !exists { continue; }
+            if let Err(e) = conn.execute(&format!("DELETE FROM \"{}\"", table.name), []) {
+                eprintln!("Warning: projection clear failed for {}: {}", table.name, e);
+            }
+        }
+        for table in &order {
+            let Some(rows) = collected.get(&table.name) else { continue };
+            if rows.is_empty() { continue; }
+            let exists: bool = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                params![table.name], |r| r.get::<_, i64>(0)).map(|n| n > 0).unwrap_or(false);
+            if !exists { continue; }
+            for row in rows {
+                let mut names: Vec<String> = Vec::new();
+                let mut values: Vec<&String> = Vec::new();
+                for (k, v) in row.iter() {
+                    names.push(format!("\"{}\"", k.replace('"', "")));
+                    values.push(v);
+                }
+                let placeholders: Vec<String> =
+                    (1..=values.len()).map(|i| format!("?{}", i)).collect();
+                let sql = format!(
+                    "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({})",
+                    table.name, names.join(", "), placeholders.join(", "));
+                if let Err(e) = conn.execute(&sql, rusqlite::params_from_iter(values.iter())) {
+                    eprintln!("Warning: row projection failed for {}: {}", table.name, e);
+                }
+            }
+        }
+        true
     }
 
     /// Load state D from SQLite.
