@@ -8,6 +8,23 @@ Domain(.Slug) is an entity type.
 External System(.Name) is an entity type.
 Generator(.Name) is an entity type.
 
+<!-- Connector-registry nouns (rmap-3nf-tables Stage 3 / arc issue 8
+     gate 2): the Instance Facts below assert Noun_has_URI /
+     Noun_is_backed_by_External_System facts about these nouns, but
+     they were never DECLARED — undeclared, they minted Noun-role
+     values with no Object Type, and `Each Noun has exactly one
+     Object Type` fired on every full-scope validate. External ids
+     are the reference scheme. -->
+API Product(.id) is an entity type.
+Stripe Customer(.id) is an entity type.
+Stripe Subscription(.id) is an entity type.
+Stripe Invoice(.id) is an entity type.
+Stripe Charge(.id) is an entity type.
+Stripe Payment Method(.id) is an entity type.
+Stripe Price(.id) is an entity type.
+Stripe Product(.id) is an entity type.
+Stripe Payment Intent(.id) is an entity type.
+
 ## Value Types
 
 Slug is a value type.
