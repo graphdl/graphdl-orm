@@ -73,6 +73,25 @@ mod db {
                 _ => None,
             }
         };
+        // The RMAP tables are a PROJECTION of the cell graph (readings
+        // are the source of truth), so a recompile REPLACES them: the
+        // generated DDL uses CREATE TABLE IF NOT EXISTS, which would
+        // silently keep a stale shape from a prior compile (observed:
+        // a fixed column rename never landing because the bad table
+        // survived). Drop each projection object first; Stage 1b's row
+        // projection re-populates from cells on persist.
+        ast::cells_iter(d).into_iter()
+            .filter_map(|(name, _)| name.strip_prefix("sql:trigger:"))
+            .for_each(|trigger| {
+                let _ = conn.execute_batch(
+                    &format!("DROP TRIGGER IF EXISTS \"{}\";", trigger.replace('"', "")));
+            });
+        ast::cells_iter(d).into_iter()
+            .filter_map(|(name, _)| name.strip_prefix("sql:sqlite:"))
+            .for_each(|table| {
+                let _ = conn.execute_batch(
+                    &format!("DROP TABLE IF EXISTS \"{}\";", table.replace('"', "")));
+            });
         // CREATE TABLE from sql:sqlite:* cells
         ast::cells_iter(d).into_iter()
             .filter(|(name, _)| name.starts_with("sql:sqlite:"))

@@ -2809,7 +2809,7 @@ fn enrich_constraints_with_spans(
         if kind == "UC" && text.contains("combination occurs at most once") {
             if let Some((combo, reading)) = parse_spanning_uc(text) {
                 if let Some((ft_id, _)) =
-                    resolve_constraint_span_ft(&reading, &roles_by_ft, &declared_nouns)
+                    resolve_constraint_span_ft(&reading, &roles_by_ft, &readings_by_ft, &declared_nouns)
                 {
                     if let Some(ft_roles) = roles_by_ft.get(&ft_id) {
                         let combo_nouns = find_noun_sequence(&combo, &declared_nouns);
@@ -2839,7 +2839,7 @@ fn enrich_constraints_with_spans(
             }
         }
 
-        let resolved = resolve_constraint_span_ft(text, &roles_by_ft, &declared_nouns);
+        let resolved = resolve_constraint_span_ft(text, &roles_by_ft, &readings_by_ft, &declared_nouns);
         // Preference 2: fall back to entity-based first-match.
         let fallback = || -> Option<(String, String)> {
             let entity = binding(c, "entity")?;
@@ -2926,27 +2926,71 @@ fn parse_spanning_uc(text: &str) -> Option<(String, String)> {
 fn resolve_constraint_span_ft(
     text: &str,
     roles_by_ft: &hashbrown::HashMap<String, Vec<(usize, String)>>,
+    readings_by_ft: &hashbrown::HashMap<String, String>,
     sorted_nouns_longest_first: &[String],
 ) -> Option<(String, String)> {
     let found_nouns = constraint_clause_nouns(text, sorted_nouns_longest_first);
     if found_nouns.len() < 2 { return None; }
 
-    // Find an FT whose role noun sequence matches the found noun sequence.
-    for (ft_id, roles) in roles_by_ft {
-        if roles.len() != found_nouns.len() { continue; }
-        let role_nouns: Vec<&str> = roles.iter().map(|(_, n)| n.as_str()).collect();
-        if role_nouns.iter().zip(found_nouns.iter())
-            .all(|(a, b)| a == &b.as_str())
-        {
-            let first = found_nouns[0].as_str();
-            let role_index = roles.iter()
-                .find(|(_, n)| n == first)
-                .map(|(p, _)| *p)
-                .unwrap_or(0);
-            return Some((ft_id.clone(), alloc::format!("{}", role_index)));
+    // All FTs whose role noun sequence matches the found noun sequence.
+    // rmap-3nf-tables: SAME-SIGNATURE pairs (`Transition is from Status`
+    // vs `Transition is to Status`, both [Transition, Status]) used to
+    // resolve to whichever FT a HashMap yielded FIRST — both UCs
+    // attached to one FT (non-deterministically!), the other FT lost
+    // its functional UC, and downstream RMAP absorbed two identically-
+    // decorated columns. Disambiguate by the PREDICATE TEXT, mirroring
+    // the SS/EQ role-sequence resolver's readings_by_ft rationale:
+    // every inter-player segment of the FT's reading must appear in
+    // the constraint clause (`is to` matches only the is-to FT).
+    let mut candidates: Vec<(&String, &Vec<(usize, String)>)> = roles_by_ft.iter()
+        .filter(|(_, roles)| {
+            roles.len() == found_nouns.len()
+                && roles.iter().map(|(_, n)| n.as_str())
+                    .zip(found_nouns.iter())
+                    .all(|(a, b)| a == b.as_str())
+        })
+        .collect();
+    // Deterministic regardless of HashMap iteration order.
+    candidates.sort_by(|a, b| a.0.cmp(b.0));
+    let (ft_id, roles) = match candidates.len() {
+        0 => return None,
+        1 => candidates[0],
+        _ => *candidates.iter()
+            .find(|(ft_id, _)| readings_by_ft.get(ft_id.as_str())
+                .map_or(false, |reading|
+                    reading_segments_contained(reading, &found_nouns, text)))
+            .unwrap_or(&candidates[0]),
+    };
+    let first = found_nouns[0].as_str();
+    let role_index = roles.iter()
+        .find(|(_, n)| n == first)
+        .map(|(p, _)| *p)
+        .unwrap_or(0);
+    Some((ft_id.clone(), alloc::format!("{}", role_index)))
+}
+
+/// Split `reading` on the player nouns in order; every non-empty text
+/// segment between/around them must appear verbatim in `clause`. The
+/// same-signature disambiguator for `resolve_constraint_span_ft` —
+/// "Transition is from Status" segments to ["is from"], which the
+/// clause "Each Transition is from exactly one Status" contains and
+/// the is-to clause does not.
+fn reading_segments_contained(reading: &str, players: &[String], clause: &str) -> bool {
+    let mut rest = reading;
+    let mut segments: Vec<&str> = Vec::new();
+    for p in players {
+        match rest.find(p.as_str()) {
+            Some(idx) => {
+                let seg = rest[..idx].trim();
+                if !seg.is_empty() { segments.push(seg); }
+                rest = &rest[idx + p.len()..];
+            }
+            None => return false,
         }
     }
-    None
+    let tail = rest.trim();
+    if !tail.is_empty() { segments.push(tail); }
+    !segments.is_empty() && segments.iter().all(|seg| clause.contains(seg))
 }
 
 /// Shared text-normalisation for constraint-clause resolution: strip

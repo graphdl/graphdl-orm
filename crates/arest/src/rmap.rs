@@ -86,6 +86,59 @@ fn column_name_for_target(nouns: &HashMap<String, crate::types::NounDef>, noun_n
     }
 }
 
+/// rmap-3nf-tables: NORMA's phase-1 column name — PREDICATE-TEXT
+/// DECORATION (user-ratified: "the name just becomes fromStatus; use
+/// the NORMA logic"; reference NameGeneration.cs `GenerateColumnName`
+/// phase 0/1 + `decorateWithPredicateText`). When two absorbed columns
+/// in one table collide on the phase-0 name (two functional FTs
+/// absorbing the same target noun — `Transition is from Status` and
+/// `Transition is to Status` both yielding `status_id`), the colliding
+/// columns regenerate with the predicate text between the role players:
+/// the reading minus the near player, minus the far player, minus
+/// leading copula stop-words — `is from` → `from` → `from_status_id`.
+///
+/// Returns None when the reading doesn't contain both players in
+/// order, or when nothing remains after the strip (a bare copula like
+/// `has` keeps the stop-word so `has_url` still disambiguates against
+/// a sibling like `pins_url`).
+fn decorated_column_name(
+    nouns: &HashMap<String, crate::types::NounDef>,
+    reading: &str,
+    near_noun: &str,
+    far_noun: &str,
+) -> Option<String> {
+    let near_idx = reading.find(near_noun)?;
+    let after_near = near_idx + near_noun.len();
+    let far_rel = reading[after_near..].find(far_noun)?;
+    let middle = reading[after_near..after_near + far_rel].trim();
+    // NORMA also appends the post-placeholder reading text
+    // (NameGeneration.cs ~728: the tail after the far role) — that's
+    // where qualifier-tail readings carry their disambiguator:
+    // `Material Touch Target has Dp as minimum width` → tail
+    // `as minimum width` → dp_as_minimum_width.
+    let tail = reading[after_near + far_rel + far_noun.len()..]
+        .trim().trim_end_matches('.').trim();
+    if middle.is_empty() && tail.is_empty() {
+        return None;
+    }
+    const COPULAS: &[&str] = &["is", "has", "was", "are", "were", "does"];
+    let words: Vec<&str> = middle.split_whitespace().collect();
+    let mut kept: Vec<&str> = words.iter()
+        .skip_while(|w| COPULAS.contains(&w.to_lowercase().as_str()))
+        .copied()
+        .collect();
+    if kept.is_empty() && tail.is_empty() {
+        // Pure copula predicate (`has`) with no tail — keep it rather
+        // than emitting nothing: `has_url` vs `pins_url` still
+        // disambiguates.
+        kept = words;
+    }
+    let mut parts: Vec<String> = kept.iter().map(|w| to_snake(w)).collect();
+    parts.push(column_name_for_target(nouns, far_noun));
+    parts.extend(tail.split_whitespace().map(to_snake));
+    Some(parts.join("_"))
+}
+
 fn compound_table_name(reading: &str, roles: &[crate::types::RoleDef], noun_names: &HashSet<String>) -> String {
     let words: Vec<&str> = reading.split_whitespace().collect();
     let has_verbs = words.iter().any(|w| !noun_names.contains(*w));
@@ -545,7 +598,10 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
         .flat_map(|ft| ft.roles.iter().map(|r| r.noun_name.as_str()))
         .fold(HashMap::new(), |mut acc, name| { *acc.entry(name).or_insert(0) += 1; acc });
 
-    let functional_additions: Vec<(String, TableColumn, Option<String>)> = functional_facts.iter()
+    // Addition tuples: (table, column, CHECK values, NORMA phase-1
+    // alternate name). The phase-1 name engages only when phase-0
+    // names collide within a table (see the fold below).
+    let functional_additions: Vec<(String, TableColumn, Option<Vec<String>>, Option<String>)> = functional_facts.iter()
         .filter(|ft_id| !one_to_one_ft_ids.contains(**ft_id))
         .flat_map(|ft_id| {
             let ft = &fact_types[*ft_id];
@@ -577,11 +633,11 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
                         references: if is_entity { Some(to_snake(&role.noun_name)) } else { None },
                     };
                     let vc_key = format!("{}:{}", ft_id, role.role_index);
-                    let check = vcs_by_ft_role.get(&vc_key).map(|vals| {
-                        let quoted = vals.iter().map(|v| format!("'{}'", v)).collect::<Vec<_>>().join(", ");
-                        format!("{} IN ({})", col_name, quoted)
-                    });
-                    (entity_key.clone(), column, check)
+                    let check_values = vcs_by_ft_role.get(&vc_key).cloned();
+                    // NORMA phase-1 alternate, used only on collision.
+                    let phase1 = decorated_column_name(
+                        &nouns, &ft.reading, &source_role.noun_name, &role.noun_name);
+                    (entity_key.clone(), column, check_values, phase1)
                 })
                 .collect::<Vec<_>>()
         })
@@ -589,7 +645,7 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
 
     // 1:1 absorption: direction bias via pure if-expression chain.
     // (Control flow has no side effects â€” returns a tuple, inputs â†’ output.)
-    let one_to_one_additions: Vec<(String, TableColumn, Option<String>)> = one_to_one_ft_ids.iter().filter_map(|ft_id| {
+    let one_to_one_additions: Vec<(String, TableColumn, Option<Vec<String>>, Option<String>)> = one_to_one_ft_ids.iter().filter_map(|ft_id| {
         let ft = &fact_types[ft_id];
         // 1:1 absorption is a binary-only collapse: pick whichever
         // entity role is mandatory (or has more participation) and
@@ -606,26 +662,26 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
         let mc0 = mc_set.contains(&format!("{}:{}", ft_id, role0.role_index));
         let mc1 = mc_set.contains(&format!("{}:{}", ft_id, role1.role_index));
 
-        let (absorb_into, fk_target, is_mandatory) = if mc0 && !mc1 {
-            (resolve_entity(&role0.noun_name), &role1.noun_name, true)
+        let (absorb_into, near_noun, fk_target, is_mandatory) = if mc0 && !mc1 {
+            (resolve_entity(&role0.noun_name), &role0.noun_name, &role1.noun_name, true)
         } else if mc1 && !mc0 {
-            (resolve_entity(&role1.noun_name), &role0.noun_name, true)
+            (resolve_entity(&role1.noun_name), &role1.noun_name, &role0.noun_name, true)
         } else {
             let is_entity0 = nouns.get(&role0.noun_name).map_or(false, |n| n.object_type == "entity");
             let is_entity1 = nouns.get(&role1.noun_name).map_or(false, |n| n.object_type == "entity");
             let both_mandatory = mc0 && mc1;
             if is_entity0 && !is_entity1 {
-                (resolve_entity(&role0.noun_name), &role1.noun_name, both_mandatory)
+                (resolve_entity(&role0.noun_name), &role0.noun_name, &role1.noun_name, both_mandatory)
             } else if is_entity1 && !is_entity0 {
-                (resolve_entity(&role1.noun_name), &role0.noun_name, both_mandatory)
+                (resolve_entity(&role1.noun_name), &role1.noun_name, &role0.noun_name, both_mandatory)
             } else {
                 let count0 = noun_ft_count.get(role0.noun_name.as_str()).copied().unwrap_or(0);
                 let count1 = noun_ft_count.get(role1.noun_name.as_str()).copied().unwrap_or(0);
                 if count1 > count0 {
-                    (resolve_entity(&role1.noun_name), &role0.noun_name, both_mandatory)
+                    (resolve_entity(&role1.noun_name), &role1.noun_name, &role0.noun_name, both_mandatory)
                 } else {
                     // count0 >= count1 -- default to role0 (reading direction)
-                    (resolve_entity(&role0.noun_name), &role1.noun_name, both_mandatory)
+                    (resolve_entity(&role0.noun_name), &role0.noun_name, &role1.noun_name, both_mandatory)
                 }
             }
         };
@@ -636,10 +692,11 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
             nullable: !is_mandatory,
             references: if is_target_entity { Some(to_snake(fk_target)) } else { None },
         };
-        Some((absorb_into, column, None))
+        let phase1 = decorated_column_name(&nouns, &ft.reading, near_noun, fk_target);
+        Some((absorb_into, column, None, phase1))
     }).collect();
 
-    let xo_additions: Vec<(String, TableColumn, Option<String>)> = xo_columns.iter()
+    let xo_additions: Vec<(String, TableColumn, Option<Vec<String>>, Option<String>)> = xo_columns.iter()
         .flat_map(|(entity_name, xo_cols)| {
             let resolved = resolve_entity(entity_name);
             xo_cols.iter().map(move |(col_name, values, nullable)| {
@@ -649,20 +706,60 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
                     nullable: *nullable,
                     references: None,
                 };
-                let quoted = values.iter().map(|v| format!("'{}'", v)).collect::<Vec<_>>().join(", ");
-                let check = format!("{} IN ({})", col_name, quoted);
-                (resolved.clone(), column, Some(check))
+                (resolved.clone(), column, Some(values.clone()), None)
             }).collect::<Vec<_>>()
         })
         .collect();
 
-    // Foldl all additions into entity_columns.
-    // fold's accumulator mutation IS the insert combining form (Backus, FP Â§11).
-    let entity_columns: HashMap<String, (Vec<TableColumn>, HashSet<String>, Vec<String>)> =
+    // Foldl all additions into entity_columns — with NORMA's two-phase
+    // collision resolution (rmap-3nf-tables): phase-0 names that
+    // collide WITHIN a table all switch to their phase-1
+    // predicate-decorated alternates (`Transition is from Status` +
+    // `Transition is to Status` → from_status_id + to_status_id, never
+    // a bare duplicated status_id). Residual collisions (duplicate FT
+    // declarations yielding identical decorations) take a
+    // deterministic numeric suffix so the CREATE TABLE always lands.
+    // CHECK constraints format AFTER final naming so they track the
+    // decorated column.
+    let all_additions: Vec<(String, TableColumn, Option<Vec<String>>, Option<String>)> =
         functional_additions.into_iter()
             .chain(one_to_one_additions.into_iter())
             .chain(xo_additions.into_iter())
-            .fold(HashMap::new(), |mut map, (key, col, check)| {
+            .collect();
+    // Pass 1: phase-0 name counts per table.
+    let mut phase0_counts: HashMap<(String, String), usize> = HashMap::new();
+    for (key, col, _, _) in all_additions.iter() {
+        *phase0_counts.entry((key.clone(), col.name.clone())).or_insert(0) += 1;
+    }
+    // Pass 2: resolve final names + fold.
+    let mut taken: HashMap<String, HashSet<String>> = HashMap::new();
+    let entity_columns: HashMap<String, (Vec<TableColumn>, HashSet<String>, Vec<String>)> =
+        all_additions.into_iter()
+            .fold(HashMap::new(), |mut map, (key, mut col, check_values, phase1)| {
+                let collides = phase0_counts
+                    .get(&(key.clone(), col.name.clone()))
+                    .map_or(false, |n| *n > 1);
+                if collides {
+                    if let Some(p1) = phase1 {
+                        col.name = p1;
+                    }
+                }
+                // Deterministic suffix for anything STILL colliding in
+                // this table (identical decorations / duplicate FTs).
+                let taken_for_table = taken.entry(key.clone()).or_default();
+                if taken_for_table.contains(&col.name) {
+                    let base = col.name.clone();
+                    let mut n = 2usize;
+                    while taken_for_table.contains(&format!("{}_{}", base, n)) {
+                        n += 1;
+                    }
+                    col.name = format!("{}_{}", base, n);
+                }
+                taken_for_table.insert(col.name.clone());
+                let check = check_values.map(|vals| {
+                    let quoted = vals.iter().map(|v| format!("'{}'", v)).collect::<Vec<_>>().join(", ");
+                    format!("{} IN ({})", col.name, quoted)
+                });
                 let entry = map.entry(key).or_insert_with(|| (Vec::new(), HashSet::new(), Vec::new()));
                 entry.0.push(col);
                 check.into_iter().for_each(|chk| entry.2.push(chk));
@@ -1193,6 +1290,40 @@ mod tests {
     use super::*;
     use crate::ast::{self, Object, fact_from_pairs};
     use crate::types::*;
+
+    /// rmap-3nf-tables, NORMA two-phase column naming: two functional
+    /// FTs absorbing the SAME target into one table (`is from Status` /
+    /// `is to Status`) must decorate BOTH colliding columns with their
+    /// predicate text — from_stage_id + to_stage_id, never a bare
+    /// duplicate and never one reading decorating both columns.
+    #[test]
+    fn colliding_absorbed_columns_decorate_with_their_own_predicate_text() {
+        let src = "\
+            Hop(.hid) is an entity type.\n\
+            Stage(.sid) is an entity type.\n\
+            hid is a value type.\n\
+            sid is a value type.\n\
+            \n\
+            ## Fact Types\n\
+            Hop is from Stage.\n\
+              Each Hop is from exactly one Stage.\n\
+            Hop is to Stage.\n\
+              Each Hop is to exactly one Stage.\n\
+        ";
+        let state = crate::parse_forml2_stage2::parse_to_state_via_stage12(src)
+            .expect("parse must succeed");
+        let tables = rmap(&state);
+        let t2 = tables.iter().find(|t| t.name == "hop")
+            .expect("hop entity table must exist");
+        let mut cols: Vec<&str> = t2.columns.iter().map(|c| c.name.as_str()).collect();
+        cols.sort();
+        assert!(cols.contains(&"from_stage_id"),
+            "the is-from column must decorate with ITS predicate (from); got {:?}", cols);
+        assert!(cols.contains(&"to_stage_id"),
+            "the is-to column must decorate with ITS predicate (to); got {:?}", cols);
+        assert!(!cols.iter().any(|c| c.ends_with("_id_2")),
+            "no numeric-suffix fallback when predicate decoration disambiguates; got {:?}", cols);
+    }
 
     /// RED (bug repro through the PARSER): a single-role functional
     /// value attribute MUST absorb as a COLUMN on the entity's table
@@ -2025,3 +2156,4 @@ mod tests {
         }
     }
 }
+
