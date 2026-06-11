@@ -4560,18 +4560,24 @@ pub fn reflect_schema_cells(state: &crate::ast::Object) -> Vec<(String, crate::a
             ]))
         }).collect())
         .unwrap_or_default();
-    // task-987 onion: reflect each fact type's READING TEXT and each
-    // role's reading usage as schema-as-facts rows — the metamodel
-    // declares `Fact Type has Reading` and `Role is used in Reading`,
-    // and the totality probe showed their population empty (×1198 gaps
-    // each). Owned map (not a borrow of the FactType rows) so the Role
-    // loop below can consult it while the cell is re-fetched.
+    // task-987 onion: reflect the READING layer as schema-as-facts rows.
+    // The metamodel models Reading as an ENTITY (`Reading(.id)`) whose
+    // string lives in `Reading has Text` — so the reflections bind the
+    // Reading ID everywhere and the text exactly once:
+    //   Fact_Type_has_Reading:    <<Fact Type, ft>, <Reading, ft>>
+    //   Reading_has_Text:         <<Reading, ft>, <Text, reading text>>
+    //   Role_is_used_in_Reading:  <<Role, ft#pos>, <Reading, ft>>
+    // Reading id = the owning FT id: deterministic, collision-free
+    // while each FT carries one primary reading (revisit when alternate
+    // readings land — core.md allows several Readings per Verb). The
+    // totality probe showed all three populations empty (×1198 gaps).
     //
     // Re-landed from the reverted 2026-06-10 WIP batch after the
-    // arc-agi-3 issue-13 forensics: the re-authored increment passes
-    // both suites and the arc-shape fixture (12 readings-loaded m:n
-    // proposal rows survive a recompile; the original batch's failures
-    // were artifacts of its lost implementation).
+    // arc-agi-3 issue-13 forensics; the entity-id shape replaced the
+    // first re-landing's text-valued bindings before anything consumed
+    // them (model consistency: `Each Reading has exactly one Text`
+    // needs the id/text split, and `It is possible that more than one
+    // Reading has the same Text` forbids text-as-identity).
     let reading_by_ft: hashbrown::HashMap<String, String> =
         fetch_cell_seq("FactType", state).as_seq()
             .map(|rows| rows.iter()
@@ -4580,16 +4586,17 @@ pub fn reflect_schema_cells(state: &crate::ast::Object) -> Vec<(String, crate::a
                     binding(f, "reading").unwrap_or("").to_string())))
                 .collect())
             .unwrap_or_default();
-    let ft_readings: Vec<Object> = fetch_cell_seq("FactType", state).as_seq()
-        .map(|rows| rows.iter()
-            .filter_map(|f| {
-                let id = binding(f, "id")?;
-                let reading = binding(f, "reading").unwrap_or("");
-                if id.is_empty() || reading.is_empty() { return None; }
-                Some(fact_from_pairs(&[("Fact Type", id), ("Reading", reading)]))
-            })
-            .collect())
-        .unwrap_or_default();
+    let mut ft_readings: Vec<Object> = Vec::new();
+    let mut reading_texts: Vec<Object> = Vec::new();
+    if let Some(rows) = fetch_cell_seq("FactType", state).as_seq() {
+        for f in rows {
+            let Some(id) = binding(f, "id") else { continue };
+            let reading = binding(f, "reading").unwrap_or("");
+            if id.is_empty() || reading.is_empty() { continue; }
+            ft_readings.push(fact_from_pairs(&[("Fact Type", id), ("Reading", id)]));
+            reading_texts.push(fact_from_pairs(&[("Reading", id), ("Text", reading)]));
+        }
+    }
     let role_used: Vec<Object> = fetch_cell_seq("Role", state).as_seq()
         .map(|rows| rows.iter()
             .filter_map(|r| {
@@ -4597,7 +4604,7 @@ pub fn reflect_schema_cells(state: &crate::ast::Object) -> Vec<(String, crate::a
                 let reading = reading_by_ft.get(ft)?;
                 if reading.is_empty() { return None; }
                 let role_id = alloc::format!("{}#{}", ft, binding(r, "position").unwrap_or("0"));
-                Some(fact_from_pairs(&[("Role", role_id.as_str()), ("Reading", reading.as_str())]))
+                Some(fact_from_pairs(&[("Role", role_id.as_str()), ("Reading", ft)]))
             })
             .collect())
         .unwrap_or_default();
@@ -4608,6 +4615,7 @@ pub fn reflect_schema_cells(state: &crate::ast::Object) -> Vec<(String, crate::a
         ("Noun_has_Conceptual_Data_Type".to_string(), Object::Seq(noun_cdts.into())),
         ("Noun_has_World_Assumption".to_string(), Object::Seq(noun_was.into())),
         ("Fact_Type_has_Reading".to_string(), Object::Seq(ft_readings.into())),
+        ("Reading_has_Text".to_string(), Object::Seq(reading_texts.into())),
         ("Role_is_used_in_Reading".to_string(), Object::Seq(role_used.into())),
     ]
 }
@@ -4705,13 +4713,14 @@ mod reflect_schema_cells_tests {
         assert_eq!(reflect_schema_cells(&state), reflect_schema_cells(&state));
     }
 
-    /// task-987 onion: the reflection populates the metamodel's
-    /// `Fact Type has Reading` and `Role is used in Reading` — one
-    /// Reading row per FT carrying its reading TEXT, one row per role
-    /// (deterministic `{ft}#{position}` ids) carrying the owning FT's
-    /// reading. Re-landed from the reverted 2026-06-10 WIP batch after
-    /// the issue-13 forensics cleared it (both suites green, arc-shape
-    /// fixture recompile-safe).
+    /// task-987 onion: the reflection populates the metamodel's Reading
+    /// layer with the ENTITY-ID shape — Reading is `Reading(.id)` and
+    /// its string lives solely in `Reading has Text`, so
+    /// Fact_Type_has_Reading / Role_is_used_in_Reading bind the Reading
+    /// id (= the owning FT id while each FT has one primary reading)
+    /// and Reading_has_Text carries the text exactly once. Re-landed
+    /// from the reverted 2026-06-10 WIP batch after the issue-13
+    /// forensics cleared it.
     #[test]
     fn reflects_fact_type_readings_and_role_usage() {
         let src = "Widget(.id) is an entity type.\nLabel is a value type.\n\nWidget has Label.\n";
@@ -4724,16 +4733,26 @@ mod reflect_schema_cells_tests {
         let rows = ftr.as_seq().expect("Fact_Type_has_Reading seq");
         assert!(rows.iter().any(|r|
             ast::binding(r, "Fact Type") == Some("Widget_has_Label")
-                && ast::binding(r, "Reading") == Some("Widget has Label")),
-            "expected the Widget_has_Label reading row; got {:?}", rows);
+                && ast::binding(r, "Reading") == Some("Widget_has_Label")),
+            "Fact_Type_has_Reading binds the Reading ENTITY ID (= ft id), \
+             not the text; got {:?}", rows);
+
+        let texts = get("Reading_has_Text");
+        let trows = texts.as_seq().expect("Reading_has_Text seq");
+        assert!(trows.iter().any(|r|
+            ast::binding(r, "Reading") == Some("Widget_has_Label")
+                && ast::binding(r, "Text") == Some("Widget has Label")),
+            "Reading_has_Text carries the reading string once per Reading \
+             entity; got {:?}", trows);
 
         let used = get("Role_is_used_in_Reading");
         let urows = used.as_seq().expect("Role_is_used_in_Reading seq");
         for role_id in ["Widget_has_Label#0", "Widget_has_Label#1"] {
             assert!(urows.iter().any(|r|
                 ast::binding(r, "Role") == Some(role_id)
-                    && ast::binding(r, "Reading") == Some("Widget has Label")),
-                "expected role {} used in the reading; got {:?}", role_id, urows);
+                    && ast::binding(r, "Reading") == Some("Widget_has_Label")),
+                "expected role {} used in Reading entity Widget_has_Label; got {:?}",
+                role_id, urows);
         }
     }
 }
