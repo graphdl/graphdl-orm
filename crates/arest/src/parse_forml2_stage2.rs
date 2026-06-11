@@ -3740,6 +3740,27 @@ fn translate_fact_types(classified_state: &Object, idx: &StmtIndex) -> (Vec<Obje
         // roles lowercases. Keeps `Noun_has_reference_scheme_Noun`
         // matching legacy (the reading text has capital `Reference
         // Scheme` but the id lowercases).
+        // rmap-3nf-tables Stage 3 (prose-leak gate): a legit FORML
+        // reading is noun phrases + verb words — letters, digits,
+        // spaces, apostrophes, hyphens, underscores. Markdown prose
+        // that survives the comment/fence strips (inline-code
+        // backticks, pipes, commas from "For each pair of X and Y, …"
+        // constraint tails, parenthesized asides, path/anchor
+        // references) used to mint junk fact types whose tables then
+        // polluted every app db (33 of 448 live FTs carried backtick /
+        // comma / paren names). Skip them at the single minting
+        // chokepoint.
+        // (Parens stay LEGAL: inline reference-mode declarations ride
+        // inside readings — `… loss of Personal Data(.id).` — and the
+        // `(… semantics)` annotations are stripped before this point.
+        // The paren-bearing junk all carries commas/backticks too.)
+        if reading.chars().any(|ch| matches!(ch,
+            '`' | ',' | '|' | '<' | '>' | '{' | '}' |
+            '[' | ']' | ':' | ';' | '/' | '\\' | '#' | '*' | '=' |
+            '—' | '→' | '"'))
+        {
+            continue;
+        }
         let id = fact_type_id_from_reading(&reading, &roles);
         ft_facts.push(fact_from_pairs(&[
             ("id", id.as_str()),
@@ -7827,6 +7848,35 @@ mod tests {
             "article-led prose must not mint a FactType; got {:?}", ft);
         assert!(roles.is_empty(),
             "article-led prose must not mint Role facts; got {:?}", roles);
+    }
+
+    /// rmap-3nf-tables Stage 3 (prose-leak gate): readings carrying
+    /// markdown machinery — inline-code backticks, commas (the "For
+    /// each pair of X and Y, …" constraint tails), parens, pipes —
+    /// are not FORML readings and must not mint fact types. Drawn from
+    /// the 33 live junk FTs (`Fact_Type_has_Role_\`_(:164)…`,
+    /// `Fact_and_Citation_\,_that_Fact_cites…`).
+    #[test]
+    fn translate_fact_types_skips_markdown_machinery_readings() {
+        for (sid, text) in [
+            ("s1", "Customer reviews `Order` anchors."),
+            ("s2", "Customer and Order, that Customer reviews that Order at most once."),
+            ("s3", "Customer reviews Order in `components.md:63` style."),
+            ("s4", "Customer | Order discriminator."),
+        ] {
+            let stmt = stage1_state(sid, text, &["Customer", "Order"]);
+            let classified = classify_statements(&stmt, &grammar_state());
+            let (ft, _roles) = super::translate_fact_types(&classified, &idx(&classified));
+            assert!(ft.is_empty(),
+                "markdown-machinery reading {:?} must not mint a FactType; got {:?}",
+                text, ft);
+        }
+        // Control: a real reading with the legit alphabet still mints.
+        let stmt = stage1_state("s5", "Customer reviews Order.", &["Customer", "Order"]);
+        let classified = classify_statements(&stmt, &grammar_state());
+        let (ft, _) = super::translate_fact_types(&classified, &idx(&classified));
+        assert_eq!(ft.len(), 1,
+            "the control reading must still mint exactly one FactType; got {:?}", ft);
     }
 
     // Companion prose shapes: demonstrative-led (`This`/`That`) prose
