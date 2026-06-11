@@ -52,11 +52,31 @@ mod db {
     }
 
     /// Execute DDL from sql:sqlite:* defs.
+    ///
+    /// rmap-3nf-tables: the generator stores each DDL def as a
+    /// `Func::Constant(Object::atom(ddl))` — `func_to_object`-encoded,
+    /// so the cell contents is the constant-func WRAPPER, not a bare
+    /// atom. The old `.as_atom()` filter therefore matched NOTHING and
+    /// every CREATE TABLE was silently skipped — the 3NF RMAP tables
+    /// the sqlite generator has been emitting never landed in any app
+    /// db (population persisted only into the cells/defs blobs).
+    /// Unwrap through `metacompose` and take the constant's atom.
     pub fn apply_ddl(conn: &Connection, d: &ast::Object) {
+        let ddl_of = |contents: &ast::Object| -> Option<String> {
+            // Bare atom (legacy shape) first, then the encoded
+            // constant-func wrapper.
+            if let Some(s) = contents.as_atom() {
+                return Some(s.to_string());
+            }
+            match ast::metacompose(contents, d) {
+                ast::Func::Constant(obj) => obj.as_atom().map(|s| s.to_string()),
+                _ => None,
+            }
+        };
         // CREATE TABLE from sql:sqlite:* cells
         ast::cells_iter(d).into_iter()
             .filter(|(name, _)| name.starts_with("sql:sqlite:"))
-            .filter_map(|(_, contents)| contents.as_atom().map(|s| s.to_string()))
+            .filter_map(|(_, contents)| ddl_of(contents))
             .for_each(|ddl| {
                 conn.execute_batch(&ddl).unwrap_or_else(|e| {
                     eprintln!("Warning: DDL failed: {}", e);
@@ -65,7 +85,7 @@ mod db {
         // CREATE TRIGGER from sql:trigger:* cells
         ast::cells_iter(d).into_iter()
             .filter(|(name, _)| name.starts_with("sql:trigger:"))
-            .filter_map(|(_, contents)| contents.as_atom().map(|s| s.to_string()))
+            .filter_map(|(_, contents)| ddl_of(contents))
             .for_each(|ddl| {
                 conn.execute_batch(&ddl).unwrap_or_else(|e| {
                     eprintln!("Warning: Trigger failed: {}", e);
