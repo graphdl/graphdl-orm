@@ -244,7 +244,8 @@ export async function handleArestRequest(input: ArestRequestInput): Promise<any>
   }
 
   if (resolved.level === 'entity' && method === 'GET') {
-    const entity = await getStub(resolved.id!).get().catch(() => null)
+    const stub = getStub(resolved.id!)
+    const entity = await stub.get().catch(() => null)
     if (!entity) return null
 
     const collectionPath = buildBasePath(resolved.segments.map((s, i) =>
@@ -263,10 +264,29 @@ export async function handleArestRequest(input: ArestRequestInput): Promise<any>
       parentPath,
     })
 
+    // §5.2 viewproj-client-render (worker half): enrich with the
+    // engine-emitted Theorem-4 representation — the ui-readings `view`
+    // layer ui.do's ViewForm renders. Best-effort: the DO method is
+    // additive and returns null on Bottom / older engines / unknown
+    // entities, and a stub without the RPC method (older DO build)
+    // lands in the catch — the flat shape below is unchanged either
+    // way. The cell read stays the data source of truth; only the
+    // representation layers ride on top.
+    const rep = typeof stub.getEntityRepresentation === 'function'
+      ? await stub.getEntityRepresentation(resolved.noun!, resolved.id!).catch(() => null)
+      : null
+
     // Flatten data fields onto the top-level response. Consumers don't
     // need to know about the EntityDB cell envelope — they want
     // `body.name`, not `body.data.name`. Matches the fallback shape.
-    return { id: entity.id, type: entity.type, ...(entity.data || {}), _links: links }
+    return {
+      id: entity.id,
+      type: entity.type,
+      ...(entity.data || {}),
+      ...(rep?.view ? { view: rep.view } : {}),
+      ...(rep?.transitions ? { transitions: rep.transitions } : {}),
+      _links: links,
+    }
   }
 
   if (resolved.level === 'collection' && method === 'GET') {

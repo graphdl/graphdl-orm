@@ -233,6 +233,76 @@ describe('handleArestRequest', () => {
     expect(result._links.self.href).toBe('/arest/organizations/acme')
     expect(result._links.apps).toBeDefined()
     expect(result._links.apps.factType).toBe('App_belongs_to_Organization')
+    // The plain stub has no getEntityRepresentation — the body must
+    // not grow a view/transitions key (additive contract).
+    expect(result.view).toBeUndefined()
+    expect(result.transitions).toBeUndefined()
+  })
+
+  // §5.2 viewproj-client-render (worker half): when the EntityDB stub
+  // exposes getEntityRepresentation, the engine-emitted Theorem-4
+  // layers ride the entity body — `view` (ui.do's ViewForm input) and
+  // non-empty `transitions`. Best-effort: a null representation or a
+  // stub without the method leaves today's flat shape untouched.
+  it('merges the engine view representation into the entity body when the stub provides it', async () => {
+    const view = {
+      view: 'instance-view-Organization',
+      kind: 'instance',
+      source: 'synthesized',
+      elements: [
+        { id: 've_1', factType: 'Organization_has_Name', componentRole: 'text-input' },
+      ],
+    }
+    const stubWithRep = (id: string) => ({
+      ...mockGetStub(id),
+      getEntityRepresentation: async (noun: string, entityId: string) => {
+        expect(noun).toBe('Organization')
+        expect(entityId).toBe('acme')
+        return { view, transitions: [{ event: 'archive', targetStatus: 'archived' }] }
+      },
+    })
+    const result = await handleArestRequest({
+      path: '/arest/organizations/acme',
+      method: 'GET',
+      ir: testSchema,
+      registry: mockRegistry as any,
+      getStub: stubWithRep as any,
+    })
+    expect(result.view).toEqual(view)
+    expect(result.transitions).toEqual([{ event: 'archive', targetStatus: 'archived' }])
+    // The flat data shape + links stay intact alongside the enrichment.
+    expect(result.name).toBe('Acme Corp')
+    expect(result._links.self.href).toBe('/arest/organizations/acme')
+  })
+
+  it('serves the flat shape unchanged when the representation read fails or is null', async () => {
+    const stubNull = (id: string) => ({
+      ...mockGetStub(id),
+      getEntityRepresentation: async () => null,
+    })
+    const okNull = await handleArestRequest({
+      path: '/arest/organizations/acme',
+      method: 'GET',
+      ir: testSchema,
+      registry: mockRegistry as any,
+      getStub: stubNull as any,
+    })
+    expect(okNull.view).toBeUndefined()
+    expect(okNull.id).toBe('acme')
+
+    const stubThrows = (id: string) => ({
+      ...mockGetStub(id),
+      getEntityRepresentation: async () => { throw new Error('engine trap') },
+    })
+    const okThrow = await handleArestRequest({
+      path: '/arest/organizations/acme',
+      method: 'GET',
+      ir: testSchema,
+      registry: mockRegistry as any,
+      getStub: stubThrows as any,
+    })
+    expect(okThrow.view).toBeUndefined()
+    expect(okThrow.id).toBe('acme')
   })
 
   it('returns collection with _schema at collection level', async () => {

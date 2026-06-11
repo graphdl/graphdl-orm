@@ -1144,6 +1144,51 @@ export class EntityDB extends DurableObject {
     }
   }
 
+  /** §5.2 viewproj-client-render (worker half) — the Theorem-4
+   *  representation for one entity, read THROUGH the engine: dispatches
+   *  `Command::GetEntity` via the same `apply` system verb the write
+   *  path uses (`writeCellThroughEngine` above is the shape mirror; the
+   *  MCP `get` verb established the calling convention in 504fa358).
+   *  The CommandResult carries the ui-readings `view` layer (elements +
+   *  per-target representations) and the HATEOAS `transitions` — the
+   *  pieces the cell read at `EntityDB.get` can never produce.
+   *
+   *  READ-ONLY: no `persistEngineState` (getEntity mutates nothing; the
+   *  lazy view rules resolve at fetch time). Best-effort by contract:
+   *  Bottom / rejected / parse failure / an engine predating getEntity
+   *  all return null, and the caller serves today's flat shape
+   *  unchanged — the view layer is additive enrichment, never a
+   *  blocker (mirrors ui.do's extractViewProjection tolerance). */
+  async getEntityRepresentation(
+    type: string,
+    id: string,
+  ): Promise<{ view?: unknown; transitions?: unknown[] } | null> {
+    await this.hydrateEngine()
+    const envelope = JSON.stringify({
+      command: { type: 'getEntity', noun: type, entityId: id },
+      population: '',
+    })
+    let raw: string
+    try {
+      raw = system(this.engineHandle, 'apply', envelope)
+    } catch {
+      return null
+    }
+    try {
+      const parsed = JSON.parse(raw)
+      if (!parsed || typeof parsed !== 'object' || parsed.rejected) return null
+      const out: { view?: unknown; transitions?: unknown[] } = {}
+      if (parsed.view && typeof parsed.view === 'object') out.view = parsed.view
+      if (Array.isArray(parsed.transitions) && parsed.transitions.length > 0) {
+        out.transitions = parsed.transitions
+      }
+      return out.view || out.transitions ? out : null
+    } catch {
+      // ⊥ / non-JSON — older engine or unknown entity; enrich nothing.
+      return null
+    }
+  }
+
   /** Test hook — exposes the hydrate path to the unit suite without
    *  having to drive it through one of the user-facing methods.
    *  Returns the engine handle (always `>= 0` after the call).

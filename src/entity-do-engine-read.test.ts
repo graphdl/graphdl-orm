@@ -353,4 +353,28 @@ describe('EntityDB engine-routed cell reads (#765)', () => {
     expect(result!.id).toBe('sync-1')
     expect(result!.data.v).toBe('sync')
   })
+
+  // ── §5.2 viewproj-client-render: engine-read representation ────────
+  //
+  // getEntityRepresentation dispatches Command::GetEntity through the
+  // same `apply` system verb the write path uses, READ-ONLY (no
+  // persistEngineState — the lazy view rules resolve at fetch time).
+  // The best-effort contract is the load-bearing part: an unknown
+  // noun/entity (engine answers ⊥ or a rejected CommandResult) yields
+  // null and never throws — the router then serves the flat cell
+  // shape unchanged. getEntity is a read command, so the #885 wasm32
+  // SystemTime panic (merge_delta, write path) is not in play here.
+  it(
+    'getEntityRepresentation returns null gracefully for an unknown entity',
+    async () => {
+      const rep = await db.getEntityRepresentation('NoSuchNoun', 'ghost-1')
+      expect(rep).toBeNull()
+      // Read-only: the engine-state storage key must not have been
+      // written by the read (persistEngineState writes through
+      // ctx.storage.put — absent key means no persist happened).
+      const persisted = await ctx.storage.get('engine_state_bytes')
+      expect(persisted).toBeUndefined()
+    },
+    COMPILE_TIMEOUT_MS,
+  )
 })
