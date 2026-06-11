@@ -15986,6 +15986,61 @@ mod mandatory_role_alethic_rejection_tests {
             leftover.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>());
     }
 
+    /// Phase 2(c) TOTALITY: every Format a value type USES must be built
+    /// on a base Conceptual Data Type — `If some Noun has some Format
+    /// then that Format is built on some Conceptual Data Type.` An
+    /// ungrounded Format breaks the refinement chain (no base widget, no
+    /// JSON-Format fallback). The four seeded Formats are grounded
+    /// (view-projection.md `is built on` rows); a custom Format used
+    /// without grounding must flag, with the noun-side declarations kept
+    /// CONFORMING so the totality constraint is isolated from Phase
+    /// 2(a)'s noun-subset.
+    #[test]
+    #[cfg(not(feature = "no_std"))]
+    fn ungrounded_format_violates_totality_subset_constraint() {
+        let corpus = crate::metamodel_corpus();
+        let violating = format!(
+            "{corpus}\n\nCustom Probe is a value type.\nThe data type of Custom Probe is text.\nNoun 'Custom Probe' has Format 'bespoke'.\n",
+        );
+        let state = crate::parse_forml2::parse_to_state(&violating).expect("parse violating");
+        let d = reflect_then_defs(&state);
+        let ctx = ast::encode_eval_context_state("", None, &d);
+        let violations = ast::decode_violations(
+            &ast::apply(&ast::Func::Def("validate".to_string()), &ctx, &d));
+        let totality_hits: Vec<&crate::types::Violation> = violations.iter()
+            .filter(|v| v.constraint_text.contains(
+                "If some Noun has some Format then that Format is built on some Conceptual Data Type"))
+            .collect();
+        assert!(!totality_hits.is_empty(),
+            "an ungrounded Format ('bespoke', no is-built-on row) must violate \
+             totality; got constraint_texts {:?}",
+            violations.iter().map(|v| v.constraint_text.as_str()).collect::<Vec<_>>());
+        // The noun-subset constraint (Phase 2a) must NOT fire — Custom
+        // Probe declares its CDT; only the Format-side grounding is absent.
+        assert!(!violations.iter().any(|v|
+                v.constraint_text.contains(
+                    "then that Noun has some Conceptual Data Type")
+                && v.detail.contains("Custom Probe")),
+            "the noun-subset constraint must stay quiet (CDT declared); got {:?}",
+            violations.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>());
+
+        // Seeded Formats are grounded — the same fragment with Format
+        // 'text' (built on CDT 'text' per view-projection.md) is clean.
+        let conforming = format!(
+            "{corpus}\n\nSeeded Probe is a value type.\nThe data type of Seeded Probe is text.\nNoun 'Seeded Probe' has Format 'text'.\n",
+        );
+        let state_ok = crate::parse_forml2::parse_to_state(&conforming).expect("parse conforming");
+        let d_ok = reflect_then_defs(&state_ok);
+        let ctx_ok = ast::encode_eval_context_state("", None, &d_ok);
+        let violations_ok = ast::decode_violations(
+            &ast::apply(&ast::Func::Def("validate".to_string()), &ctx_ok, &d_ok));
+        assert!(!violations_ok.iter().any(|v|
+                v.constraint_text.contains("is built on some Conceptual Data Type")
+                && v.detail.contains("Seeded Probe")),
+            "a seeded, grounded Format must satisfy totality; got {:?}",
+            violations_ok.iter().map(|v| v.detail.as_str()).collect::<Vec<_>>());
+    }
+
     /// Silent-MC gap: if an MC arrives with no resolvable spans (e.g.
     /// the FT id cannot be matched by `enrich_constraints_with_spans`),
     /// `compile_mandatory_ast` falls through to `Func::constant(phi())`

@@ -352,6 +352,7 @@ If some Guard Run is for some Guard and that Guard Run references some Fact then
 If some State Machine is currently in some Status then that Status is defined in some State Machine Definition where that State Machine is instance of that State Machine Definition.
 If some API accepts some Noun as parameter and some other Noun is subtype of that Noun then that API accepts that subtype Noun as parameter.
 If some Noun has some Format then that Noun has some Conceptual Data Type.
+If some Noun has some Format then that Format is built on some Conceptual Data Type.
 
 ## Ring Constraints
 
