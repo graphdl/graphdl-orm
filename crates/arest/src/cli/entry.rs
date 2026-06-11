@@ -1641,6 +1641,20 @@ pub fn main_entry() {
                             .unwrap_or_else(|e| { eprintln!("app corpus parse: {}", e); std::process::exit(1); });
                         let mut m: hashbrown::HashMap<String, ast::Object> = hashbrown::HashMap::new();
                         m.insert("Noun".to_string(), ast::fetch_cell_seq("Noun", &full));
+                        // arc-agi-3 engine-issue 14: ALSO seed the app's
+                        // FactType + Role catalogs. The per-file fold below
+                        // parses each file against the ACCUMULATED context,
+                        // so an instance fact in an alphabetically-early
+                        // file could not resolve a fact type declared in a
+                        // later file — it mis-filed under its raw verb and
+                        // never reached the FT cell (silent data loss, one
+                        // layer-1b warning per fact). The full-corpus parse
+                        // above already pays for this; extracting the FT
+                        // catalog into the seed makes instance-fact
+                        // resolution file-order independent, exactly as the
+                        // Noun seed already did for noun references.
+                        m.insert("FactType".to_string(), ast::fetch_cell_seq("FactType", &full));
+                        m.insert("Role".to_string(), ast::fetch_cell_seq("Role", &full));
                         ast::Object::map(m)
                     }
                 };

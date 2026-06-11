@@ -8945,6 +8945,63 @@ mod tests {
         assert_eq!(binding(c, "setComparisonArgumentLength"), Some("3"));
     }
 
+    /// arc-agi-3 engine-issue 14: instance-fact resolution must be
+    /// file-order INDEPENDENT. The dirs compile folds files
+    /// alphabetically, parsing each against the accumulated context —
+    /// so a fact file sorting BEFORE its declarations file mis-filed
+    /// every instance fact under its raw verb (silent data loss).
+    /// entry.rs now seeds the fold context with the full-corpus
+    /// FactType + Role catalogs; this pins the mechanism that fix
+    /// rides on: a file containing ONLY instance facts, parsed with
+    /// the catalog as context, resolves cleanly (no
+    /// UnresolvedInstanceFact rows) — while the same file against an
+    /// empty context mis-files (the negative control proving the test
+    /// can fail).
+    #[test]
+    fn instance_facts_resolve_against_context_fact_types_regardless_of_file_order() {
+        let decls = "Case(.id) is an entity type.\n\
+                     Hypothesis(.id) is an entity type.\n\n\
+                     ## Fact Types\n\n\
+                     Case proposes Hypothesis.\n";
+        let facts = "## Instance Facts\n\n\
+                     Case 'c1' proposes Hypothesis 'h1'.\n";
+
+        // The corpus seed entry.rs builds: parse the WHOLE corpus once,
+        // keep Noun + FactType + Role.
+        let corpus = alloc::format!("{facts}\n\n{decls}");
+        let full = crate::parse_forml2::parse_to_state(&corpus).expect("corpus parses");
+        let mut m: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        for cell in ["Noun", "FactType", "Role"] {
+            m.insert(cell.to_string(), crate::ast::fetch_cell_seq(cell, &full));
+        }
+        let seed = Object::map(m);
+
+        // Wrong order: the facts file parses FIRST — only the seed as
+        // context (its declarations file has not folded yet).
+        let parsed = crate::parse_forml2::parse_to_state_from_in_domain(
+            facts, &seed, "a-cases.md").expect("facts file parses");
+        let unresolved = crate::ast::fetch_cell_seq("UnresolvedInstanceFact", &parsed);
+        let miss_count = unresolved.as_seq().map(|s| s.len()).unwrap_or(0);
+        assert_eq!(miss_count, 0,
+            "with the corpus FT catalog in context the instance fact must \
+             resolve; got unresolved rows {unresolved:?}");
+
+        // Negative control: same file against a NOUN-ONLY context (the
+        // pre-fix entry.rs seed — nouns resolve, fact types don't) must
+        // mis-file — proving the assertion above is load-bearing. This
+        // is exactly arc's situation: the Noun seed existed, the FT
+        // catalog didn't.
+        let mut noun_only: hashbrown::HashMap<String, Object> = hashbrown::HashMap::new();
+        noun_only.insert("Noun".to_string(), crate::ast::fetch_cell_seq("Noun", &full));
+        let bare = crate::parse_forml2::parse_to_state_from_in_domain(
+            facts, &Object::map(noun_only), "a-cases.md").expect("noun-only parse");
+        let bare_unresolved = crate::ast::fetch_cell_seq("UnresolvedInstanceFact", &bare);
+        let bare_miss = bare_unresolved.as_seq().map(|s| s.len()).unwrap_or(0);
+        assert!(bare_miss > 0,
+            "negative control: with nouns but no FT catalog the fact must \
+             mis-file (otherwise this test cannot detect the regression)");
+    }
+
     /// The "for each <Z>" / "per <Z>" SUFFIX UC on an n-ary fact type
     /// is the ORM pair-UC verbalization: "Each Fact uses at most one
     /// Resource for each Role" = per (Fact, Role), at most one
