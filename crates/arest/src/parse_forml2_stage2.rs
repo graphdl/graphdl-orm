@@ -2991,8 +2991,16 @@ fn enrich_constraints_with_spans(
         push(&mut new_pairs, "span0_factTypeId", &ft_id);
         push(&mut new_pairs, "span0_roleIndex", &pos);
         if kind == "UC" {
-            if let Some(idx) = text.rfind(" for each ") {
-                let suffix = text[idx + " for each ".len()..]
+            // " per <Z>" is the same pair-UC verbalization as
+            // " for each <Z>" ("Each Fact uses at most one Resource
+            // per Role") — emit the suffix noun's role as the second
+            // span for both keywords. Re-landed with the task-987
+            // reflections from the reverted 2026-06-10 WIP batch.
+            let suffix_hit = text.rfind(" for each ")
+                .map(|idx| (idx, " for each ".len()))
+                .or_else(|| text.rfind(" per ").map(|idx| (idx, " per ".len())));
+            if let Some((idx, klen)) = suffix_hit {
+                let suffix = text[idx + klen..]
                     .trim_end_matches('.').trim();
                 let pos_usize: Option<usize> = pos.parse().ok();
                 if let Some(roles) = roles_by_ft.get(&ft_id) {
@@ -4878,7 +4886,22 @@ fn translate_unresolved_clauses(
                 .any(|w| {
                     // Strip trailing digits (subscripted `Order1`).
                     let base: String = w.trim_end_matches(|c: char| c.is_ascii_digit()).into();
-                    !declared_words.contains(&base) && !declared_words.contains(w)
+                    // Plural-aware membership: the enum-superlative
+                    // verbalization quantifies over the PLURAL ("the
+                    // highest Task Priority among Tasks that …"), and
+                    // the bare word-set check flagged `Tasks` as an
+                    // unknown Title-case token — a layer-1 false
+                    // positive on a working rule (the tasks-app
+                    // recommendation superlative, surfaced the moment
+                    // the check battery reached apps.compile). Accept
+                    // a word when its naive singular (-s / -es) is a
+                    // declared-noun word.
+                    let sing_s = base.strip_suffix('s').unwrap_or(&base);
+                    let sing_es = base.strip_suffix("es").unwrap_or(&base);
+                    !declared_words.contains(&base)
+                        && !declared_words.contains(w)
+                        && !declared_words.contains(sing_s)
+                        && !declared_words.contains(sing_es)
                 });
             if has_unknown_titlecase {
                 out.push(fact_from_pairs(&[
@@ -8920,6 +8943,52 @@ mod tests {
         assert_eq!(binding(c, "span4_roleIndex"), Some("1"));
         assert_eq!(binding(c, "span5_roleIndex"), Some("2"));
         assert_eq!(binding(c, "setComparisonArgumentLength"), Some("3"));
+    }
+
+    /// The "for each <Z>" / "per <Z>" SUFFIX UC on an n-ary fact type
+    /// is the ORM pair-UC verbalization: "Each Fact uses at most one
+    /// Resource for each Role" = per (Fact, Role), at most one
+    /// Resource. Both keywords must emit the suffix noun's role as a
+    /// real second span (the for-each form is the arc-agi-3 issue-8
+    /// fix, shipped without a direct unit pin; the " per " variant
+    /// re-landed with the task-987 reflections). The two keywords must
+    /// produce IDENTICAL span sets.
+    #[test]
+    fn suffix_pair_uc_emits_second_span_for_both_keywords() {
+        let role_facts = alloc::vec![
+            fact_from_pairs(&[("nounName", "Fact"), ("factType", "Fact_uses_Resource_for_Role"), ("position", "0")]),
+            fact_from_pairs(&[("nounName", "Resource"), ("factType", "Fact_uses_Resource_for_Role"), ("position", "1")]),
+            fact_from_pairs(&[("nounName", "Role"), ("factType", "Fact_uses_Resource_for_Role"), ("position", "2")]),
+        ];
+        let ft_facts = alloc::vec![
+            fact_from_pairs(&[("id", "Fact_uses_Resource_for_Role"), ("reading", "Fact uses Resource for Role"), ("arity", "3")]),
+        ];
+        let enrich = |text: &str| {
+            let uc = fact_from_pairs(&[
+                ("id", text),
+                ("kind", "UC"),
+                ("modality", "alethic"),
+                ("text", text),
+                ("entity", "Fact"),
+            ]);
+            let enriched = super::enrich_constraints_with_spans(&[uc], &role_facts, &ft_facts);
+            let c = enriched.into_iter().next().expect("one constraint out");
+            (
+                binding(&c, "span0_roleIndex").map(str::to_string),
+                binding(&c, "span1_factTypeId").map(str::to_string),
+                binding(&c, "span1_roleIndex").map(str::to_string),
+            )
+        };
+        let for_each = enrich("Each Fact uses at most one Resource for each Role.");
+        let per      = enrich("Each Fact uses at most one Resource per Role.");
+        assert_eq!(for_each.1.as_deref(), Some("Fact_uses_Resource_for_Role"),
+            "for-each suffix must emit a second span; got {for_each:?}");
+        assert_eq!(for_each.2.as_deref(), Some("2"),
+            "the second span is the suffix noun's role (Role @ 2); got {for_each:?}");
+        assert_ne!(for_each.0, for_each.2,
+            "the pair-UC spans two DISTINCT roles; got {for_each:?}");
+        assert_eq!(per, for_each,
+            "' per ' must verbalize the same pair-UC as ' for each '");
     }
 
     #[test]

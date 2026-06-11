@@ -939,6 +939,45 @@ Task has Task Status.
         assert!(resolve_warnings[0].message.contains("antecedent"));
     }
 
+    /// Plural-aware layer-1 membership: the enum-superlative
+    /// verbalization quantifies over the PLURAL ("among Tasks that
+    /// …"). The bare word-set heuristic flagged `Tasks` as an unknown
+    /// Title-case token — a false positive on the tasks-app
+    /// recommendation rule, surfaced the moment the check battery
+    /// reached apps.compile. A plural of a DECLARED noun must pass;
+    /// a plural of an UNDECLARED noun must still flag.
+    #[test]
+    fn plural_of_declared_noun_in_antecedent_does_not_warn() {
+        let input = "Task(.Id) is an entity type.\n\
+                     Task Priority is a value type.\n\
+                     Task Status is a value type.\n\
+                     ## Fact Types\n\
+                     Task has Task Priority.\n\
+                     Task has Task Status.\n\
+                     Task Priority is recommended. +\n\
+                     ## Derivation Rules\n\
+                     + Task Priority is recommended if some Task has the highest Task Priority among Tasks that have Task Status 'in_progress'.";
+        let diags = check_readings(input);
+        let plural_flags: Vec<_> = diags.iter()
+            .filter(|d| d.source == Source::Resolve && d.level == Level::Warning)
+            .filter(|d| d.message.contains("among Tasks"))
+            .collect();
+        assert!(plural_flags.is_empty(),
+            "`Tasks` is the plural of the declared `Task` — the superlative \
+             antecedent must not flag. Full diags: {:#?}", diags);
+
+        let undeclared = "Order(.Id) is an entity type.\n\
+                          ## Fact Types\n\
+                          Order has Amount.\n\
+                          ## Derivation Rules\n\
+                          + Order has Amount if Order has Amount among Mysteries that exist.";
+        let diags2 = check_readings(undeclared);
+        assert!(diags2.iter().any(|d| d.source == Source::Resolve
+                && d.level == Level::Warning
+                && d.message.contains("Mysteries")),
+            "an UNDECLARED plural must still flag; got {:#?}", diags2);
+    }
+
     /// #274 Category A — unary derived FT (one role + predicate + `*`/`+`
     /// marker) used as an antecedent in another rule. Before this fix the
     /// resolver required binary-or-higher fact types and rejected unary

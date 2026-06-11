@@ -4491,12 +4491,55 @@ pub fn reflect_schema_cells(state: &crate::ast::Object) -> Vec<(String, crate::a
             ]))
         }).collect())
         .unwrap_or_default();
+    // task-987 onion: reflect each fact type's READING TEXT and each
+    // role's reading usage as schema-as-facts rows — the metamodel
+    // declares `Fact Type has Reading` and `Role is used in Reading`,
+    // and the totality probe showed their population empty (×1198 gaps
+    // each). Owned map (not a borrow of the FactType rows) so the Role
+    // loop below can consult it while the cell is re-fetched.
+    //
+    // Re-landed from the reverted 2026-06-10 WIP batch after the
+    // arc-agi-3 issue-13 forensics: the re-authored increment passes
+    // both suites and the arc-shape fixture (12 readings-loaded m:n
+    // proposal rows survive a recompile; the original batch's failures
+    // were artifacts of its lost implementation).
+    let reading_by_ft: hashbrown::HashMap<String, String> =
+        fetch_cell_seq("FactType", state).as_seq()
+            .map(|rows| rows.iter()
+                .filter_map(|f| Some((
+                    binding(f, "id")?.to_string(),
+                    binding(f, "reading").unwrap_or("").to_string())))
+                .collect())
+            .unwrap_or_default();
+    let ft_readings: Vec<Object> = fetch_cell_seq("FactType", state).as_seq()
+        .map(|rows| rows.iter()
+            .filter_map(|f| {
+                let id = binding(f, "id")?;
+                let reading = binding(f, "reading").unwrap_or("");
+                if id.is_empty() || reading.is_empty() { return None; }
+                Some(fact_from_pairs(&[("Fact Type", id), ("Reading", reading)]))
+            })
+            .collect())
+        .unwrap_or_default();
+    let role_used: Vec<Object> = fetch_cell_seq("Role", state).as_seq()
+        .map(|rows| rows.iter()
+            .filter_map(|r| {
+                let ft = binding(r, "factType")?;
+                let reading = reading_by_ft.get(ft)?;
+                if reading.is_empty() { return None; }
+                let role_id = alloc::format!("{}#{}", ft, binding(r, "position").unwrap_or("0"));
+                Some(fact_from_pairs(&[("Role", role_id.as_str()), ("Reading", reading.as_str())]))
+            })
+            .collect())
+        .unwrap_or_default();
     alloc::vec![
         ("Fact_Type_has_Role".to_string(),   Object::Seq(ft_has_role.into())),
         ("Noun_plays_Role".to_string(),      Object::Seq(role_played.into())),
         ("Noun_has_Object_Type".to_string(), Object::Seq(noun_types.into())),
         ("Noun_has_Conceptual_Data_Type".to_string(), Object::Seq(noun_cdts.into())),
         ("Noun_has_World_Assumption".to_string(), Object::Seq(noun_was.into())),
+        ("Fact_Type_has_Reading".to_string(), Object::Seq(ft_readings.into())),
+        ("Role_is_used_in_Reading".to_string(), Object::Seq(role_used.into())),
     ]
 }
 
@@ -4591,6 +4634,38 @@ mod reflect_schema_cells_tests {
         let src = "Gizmo(.id) is an entity type.\nNote is a value type.\n\nGizmo has Note.\n";
         let state = crate::parse_forml2::parse_to_state(src).expect("parse");
         assert_eq!(reflect_schema_cells(&state), reflect_schema_cells(&state));
+    }
+
+    /// task-987 onion: the reflection populates the metamodel's
+    /// `Fact Type has Reading` and `Role is used in Reading` — one
+    /// Reading row per FT carrying its reading TEXT, one row per role
+    /// (deterministic `{ft}#{position}` ids) carrying the owning FT's
+    /// reading. Re-landed from the reverted 2026-06-10 WIP batch after
+    /// the issue-13 forensics cleared it (both suites green, arc-shape
+    /// fixture recompile-safe).
+    #[test]
+    fn reflects_fact_type_readings_and_role_usage() {
+        let src = "Widget(.id) is an entity type.\nLabel is a value type.\n\nWidget has Label.\n";
+        let state = crate::parse_forml2::parse_to_state(src).expect("parse");
+        let cells = reflect_schema_cells(&state);
+        let get = |name: &str| cells.iter().find(|(n, _)| n == name)
+            .map(|(_, c)| c.clone()).unwrap_or(Object::Bottom);
+
+        let ftr = get("Fact_Type_has_Reading");
+        let rows = ftr.as_seq().expect("Fact_Type_has_Reading seq");
+        assert!(rows.iter().any(|r|
+            ast::binding(r, "Fact Type") == Some("Widget_has_Label")
+                && ast::binding(r, "Reading") == Some("Widget has Label")),
+            "expected the Widget_has_Label reading row; got {:?}", rows);
+
+        let used = get("Role_is_used_in_Reading");
+        let urows = used.as_seq().expect("Role_is_used_in_Reading seq");
+        for role_id in ["Widget_has_Label#0", "Widget_has_Label#1"] {
+            assert!(urows.iter().any(|r|
+                ast::binding(r, "Role") == Some(role_id)
+                    && ast::binding(r, "Reading") == Some("Widget has Label")),
+                "expected role {} used in the reading; got {:?}", role_id, urows);
+        }
     }
 }
 
