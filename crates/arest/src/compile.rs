@@ -220,6 +220,11 @@ pub(crate) struct CompiledStateMachine {
     pub(crate) initial: String,
     pub(crate) func: crate::ast::Func,
     pub(crate) transition_table: Vec<(String, String, String)>,
+    /// rmap-3nf-tables (iii): the State Machine Definition id this SM
+    /// was compiled from (`State_Machine_Definition_is_for_Noun`).
+    /// Empty when the noun has no SMD fact (degenerate/test SMs) —
+    /// the instance-of-definition backfill skips those.
+    pub(crate) definition_id: String,
 }
 
 /// Index for fast noun lookups during synthesis.
@@ -4874,6 +4879,24 @@ fn compile_derivations(data: &CellIndex, state_machines: &[CompiledStateMachine]
         sm_for_resource_backfill_derivations.len());
     derivations.extend(sm_for_resource_backfill_derivations);
 
+    // rmap-3nf-tables (iii): instance-of-definition backfill — the
+    // mandatory `State Machine is instance of State Machine Definition`
+    // FT had NO writer (seed, event-fold, and imperative paths all skip
+    // it), so the 3NF state_machine table's NOT NULL definition column
+    // zeroed the whole family. One emit per SM instance, noun-scoped,
+    // definition resolved at compile time. SMs without an SMD fact
+    // (empty definition_id) are skipped.
+    let sm_instance_of_def_derivations: Vec<_> = state_machines.iter()
+        .filter(|sm| !sm.definition_id.is_empty())
+        .map(|sm| {
+            diag!("  [profile] compiling SM instance-of-definition backfill for noun={}",
+                sm.noun_name);
+            compile_sm_instance_of_definition_backfill_for(sm)
+        }).collect();
+    diag!("  [profile] {} SM instance-of-definition backfill derivations",
+        sm_instance_of_def_derivations.len());
+    derivations.extend(sm_instance_of_def_derivations);
+
     derivations
 }
 
@@ -8729,7 +8752,8 @@ pub(crate) fn make_compiled_state_machine_for_test(
     func: Func,
     transition_table: Vec<(String, String, String)>,
 ) -> CompiledStateMachine {
-    CompiledStateMachine { noun_name, statuses, initial, func, transition_table }
+    CompiledStateMachine { noun_name, statuses, initial, func, transition_table,
+        definition_id: String::new() }
 }
 
 /// task-922-sm-init-projection — for_Resource backfill.
@@ -8851,6 +8875,96 @@ fn compile_sm_for_resource_backfill_for(sm: &CompiledStateMachine) -> CompiledDe
         kind: DerivationKind::SubtypeInheritance,
         func,
                 consequent_cell: consequent_cell_md,
+        materialization: crate::types::MaterializationPolicy::Stored,
+    }
+}
+
+/// rmap-3nf-tables (iii) — instance-of-definition backfill.
+///
+/// `State Machine is instance of State Machine Definition` (instances.md)
+/// is mandatory-total, but NOTHING populated it: the SM seed emits
+/// is_instance_of_Noun / is_for_Resource / currently_in_Status only, and
+/// the imperative create/transition paths likewise. The 3NF projection
+/// reads the FT as `state_machine.state_machine_definition_id NOT NULL`,
+/// so every state_machine row (and the state_machine_is_for_resource
+/// junction FK'ing it) warn-skipped — 953+953 rows on the live board.
+///
+/// Same shape as `compile_sm_for_resource_backfill_for` directly above,
+/// with two deltas: candidates are NOUN-SCOPED (the emitted SMD id is
+/// per-noun — an unscoped candidate set would stamp every noun's SMs
+/// with THIS noun's definition), and the emit pairs the State Machine
+/// id with the COMPILE-TIME-resolved definition id (Step 1 of
+/// `compile_state_machine_from_cells`). Idempotent: the existing-set
+/// subtraction emits at most one fact per SM, and the "exactly one"
+/// UC keys the upsert.
+fn compile_sm_instance_of_definition_backfill_for(sm: &CompiledStateMachine) -> CompiledDerivation {
+    let sm_noun = sm.noun_name.clone();
+    let definition_id = sm.definition_id.clone();
+    let id_str = format!("_sm_instance_of_def_backfill_{}", sm_noun);
+    let text_str = format!("SM instance-of-definition backfill for {}", sm_noun);
+
+    // Candidates: THIS noun's instances (SM id == entity id, the SM
+    // cell convention). φ / empty-string guarded like sm_seed_func.
+    let non_phi = Func::compose(Func::Not, Func::NullTest);
+    let non_empty = Func::compose(Func::Not, Func::compose(Func::Eq,
+        Func::construction(vec![Func::Id, Func::constant(Object::atom(""))])));
+    let candidates = Func::compose(
+        Func::filter(non_empty),
+        Func::compose(
+            Func::filter(non_phi.clone()),
+            instances_of_noun_func(&sm_noun),
+        ),
+    );
+
+    // Existing set: "State Machine" role values already bound to a
+    // definition.
+    let extract_state_machine = Func::compose(
+        Func::apply_to_all(Func::Selector(2)),
+        Func::filter(Func::compose(Func::Eq, Func::construction(vec![
+            Func::Selector(1),
+            Func::constant(Object::atom("State Machine")),
+        ]))),
+    );
+    let existing = Func::compose(
+        Func::Concat,
+        Func::compose(
+            Func::apply_to_all(extract_state_machine),
+            extract_facts_from_pop("State_Machine_is_instance_of_State_Machine_Definition"),
+        ),
+    );
+    let existing_set = Func::compose(
+        Func::SetFromSeq,
+        Func::compose(Func::filter(non_phi), existing),
+    );
+
+    let is_new = Func::compose(Func::NullTest, Func::FetchOrPhi);
+    let pairs = Func::construction(vec![candidates, existing_set]);
+    let missing = Func::compose(
+        Func::apply_to_all(Func::Selector(1)),
+        Func::compose(Func::filter(is_new), Func::compose(Func::DistR, pairs)),
+    );
+
+    let definition_obj = Object::atom(&definition_id);
+    let derive_instance_of = Func::construction(vec![
+        Func::constant(Object::atom("State_Machine_is_instance_of_State_Machine_Definition")),
+        Func::constant(Object::atom("State Machine is instance of State Machine Definition (backfill)")),
+        Func::construction(vec![
+            Func::construction(vec![Func::constant(Object::atom("State Machine")), Func::Id]),
+            Func::construction(vec![Func::constant(Object::atom("State Machine Definition")),
+                Func::constant(definition_obj)]),
+        ]),
+    ]);
+
+    let func = Func::compose(Func::apply_to_all(derive_instance_of), missing);
+
+    let (consequent_cell_md, _, _) = derivation_dep_metadata_synth(
+        "State_Machine_is_instance_of_State_Machine_Definition".to_string());
+    CompiledDerivation {
+        id: id_str,
+        text: text_str,
+        kind: DerivationKind::SubtypeInheritance,
+        func,
+        consequent_cell: consequent_cell_md,
         materialization: crate::types::MaterializationPolicy::Stored,
     }
 }
@@ -10638,6 +10752,7 @@ fn compile_state_machine(
     transitions: &[TransitionDef],
     declared_initial: &str,
     constraints: &[CompiledConstraint],
+    definition_id: &str,
 ) -> CompiledStateMachine {
     // Build constraint ID -> func index for guard lookup
     let constraint_by_id: HashMap<&str, &crate::ast::Func> = constraints.iter()
@@ -10792,6 +10907,7 @@ fn compile_state_machine(
         initial,
         transition_table,
         func: sm_func,
+        definition_id: definition_id.to_string(),
     }
 }
 
@@ -10991,6 +11107,7 @@ fn compile_state_machine_from_cells(
         &transitions,
         &initial,
         constraints,
+        &sm_name,
     ))
 }
 

@@ -2089,6 +2089,12 @@ pub fn main_entry() {
                 // stratum 1 alongside init + event-fold so the bridge
                 // derivation in stratum 2 sees the complete pair.
                 stratum1.extend(collect_derivs("derivation:_sm_for_resource_backfill_", &d));
+                // rmap-3nf-tables (iii): instance-of-definition backfill
+                // (compile.rs::compile_sm_instance_of_definition_backfill_for)
+                // — populates the mandatory State_Machine_is_instance_of_
+                // State_Machine_Definition FT the 3NF state_machine table's
+                // NOT NULL definition column projects from.
+                stratum1.extend(collect_derivs("derivation:_sm_instance_of_def_backfill_", &d));
                 // negation-strat-reroute: the negation-stratification
                 // subsystem is dead — `uses_negation` is never set true
                 // (every CompiledDerivation hardcodes `false`), so the

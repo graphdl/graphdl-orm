@@ -3135,6 +3135,128 @@ State Machine 't-orphan' is currently in Status 'completed'.
     );
 }
 
+// ─── instance-of-definition backfill binds every SM to its SMD ──────
+//
+// rmap-3nf-tables (iii): `State Machine is instance of State Machine
+// Definition` (instances.md) is mandatory-total but had NO writer —
+// the SM seed emits is_instance_of_Noun / is_for_Resource /
+// currently_in_Status only, and the imperative create/transition paths
+// likewise. The 3NF projection reads the FT as
+// `state_machine.state_machine_definition_id NOT NULL`, so every
+// state_machine row (and the state_machine_is_for_resource junction
+// FK'ing it) warn-skipped — 953+953 rows on the live board. The
+// backfill mirrors the task-922 for_Resource shape, noun-scoped, with
+// the definition id resolved at compile time from
+// `State_Machine_Definition_is_for_Noun`.
+
+#[test]
+fn sm_instance_of_definition_backfill_binds_sm_to_its_definition() {
+    let meta = r#"# State metamodel
+## Entity Types
+Status(.Name) is an entity type.
+State Machine Definition is a subtype of Status.
+Transition(.id) is an entity type.
+Fact Type(.id) is an entity type.
+Noun is an entity type.
+Name is a value type.
+
+## Fact Types
+State Machine Definition is for Noun.
+Status is initial in State Machine Definition.
+Transition is defined in State Machine Definition.
+Transition is from Status.
+Transition is to Status.
+Transition is triggered by Fact Type.
+"#;
+    let domain = r#"# SM instance-of-definition backfill (rmap-3nf-tables iii)
+## Entity Types
+Task(.id) is an entity type.
+State Machine(.id) is an entity type.
+Resource(.Reference) is an entity type.
+
+Task is a subtype of Resource.
+
+## Value Types
+Status is a value type.
+
+## Fact Types
+Task is started.
+State Machine is currently in Status.
+State Machine is for Resource.
+State Machine is instance of State Machine Definition.
+
+## Instance Facts
+State Machine Definition 'Task SM' is for Noun 'Task'.
+Status 'pending' is initial in State Machine Definition 'Task SM'.
+
+Transition 'start' is defined in State Machine Definition 'Task SM'.
+Transition 'start' is from Status 'pending'.
+Transition 'start' is to Status 'in_progress'.
+Transition 'start' is triggered by Fact Type 'Task is started'.
+
+Task 't-1' is started.
+"#;
+    let meta_state = crate::parse_forml2::parse_to_state(meta).expect("parse metamodel");
+    let domain_state = crate::parse_forml2::parse_to_state_with_nouns(domain, &meta_state)
+        .expect("parse domain");
+    let state = crate::ast::merge_states(&meta_state, &domain_state);
+    let defs = crate::compile::compile_to_defs_state(&state);
+    let d = crate::ast::defs_to_state(&defs, &state);
+
+    let strata: Vec<_> = crate::ast::cells_iter(&d).into_iter()
+        .filter(|(n, _)| n.starts_with("derivation:_sm_init_")
+            || n.starts_with("derivation:_sm_event_fold_")
+            || n.starts_with("derivation:_sm_for_resource_backfill_")
+            || n.starts_with("derivation:_sm_instance_of_def_backfill_"))
+        .map(|(n, contents)| (n.to_string(), crate::ast::metacompose(contents, &d)))
+        .collect();
+    assert!(
+        strata.iter().any(|(n, _)| n.contains("instance_of_def_backfill")),
+        "compile_to_defs_state must emit a `_sm_instance_of_def_backfill_<Noun>` \
+         derivation for every SM whose noun carries an SMD fact. Got defs: {:?}",
+        strata.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+    );
+    let s1_refs: Vec<(&str, &crate::ast::Func)> = strata.iter()
+        .map(|(n, f)| (n.as_str(), f)).collect();
+    let (final_state, _) = crate::evaluate::forward_chain_defs_state(&s1_refs, &state);
+
+    let cell = crate::ast::fetch_cell_seq(
+        "State_Machine_is_instance_of_State_Machine_Definition", &final_state);
+    let bound = |cell: &crate::ast::Object| -> usize {
+        cell.as_seq().map(|s| s.iter().filter(|f| {
+            let pairs = match f.as_seq() { Some(p) => p, None => return false };
+            let mut sm: Option<&str> = None;
+            let mut def: Option<&str> = None;
+            for p in pairs.iter() {
+                let kv = match p.as_seq() { Some(kv) => kv, None => continue };
+                if kv.len() != 2 { continue; }
+                match (kv[0].as_atom(), kv[1].as_atom()) {
+                    (Some("State Machine"), Some(v)) => sm = Some(v),
+                    (Some("State Machine Definition"), Some(v)) => def = Some(v),
+                    _ => {}
+                }
+            }
+            sm == Some("t-1") && def == Some("Task SM")
+        }).count()).unwrap_or(0)
+    };
+    assert_eq!(
+        bound(&cell), 1,
+        "the backfill must bind <SM=t-1, State Machine Definition=Task SM> \
+         exactly once. Got cell: {:?}", cell,
+    );
+
+    // Idempotency: a second pass must not duplicate the binding (the
+    // existing-set subtraction is the guard, like task-922's).
+    let (final_state_2, _) = crate::evaluate::forward_chain_defs_state(&s1_refs, &final_state);
+    let cell_2 = crate::ast::fetch_cell_seq(
+        "State_Machine_is_instance_of_State_Machine_Definition", &final_state_2);
+    assert_eq!(
+        bound(&cell_2), 1,
+        "forward chain must be idempotent — a second pass must not duplicate \
+         the instance-of-definition binding. Got: {:?}", cell_2,
+    );
+}
+
 /// REGRESSION (redeclared-ft-role-doubling + subtype-join over-match): the
 /// SM→status metamodel bridge must derive under the dirs-compile stratum when
 /// SM status is produced by the EVENT-FOLD (the live board shape) rather than a

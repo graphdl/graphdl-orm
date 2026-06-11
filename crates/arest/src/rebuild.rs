@@ -417,6 +417,9 @@ fn rebuild_init(apps_dir: &Path, x: &Object, d: &Object) -> Object {
     strat.extend(collect("derivation:_sm_init_", &state));
     strat.extend(collect("derivation:_sm_event_fold_", &state));
     strat.extend(collect("derivation:_sm_for_resource_backfill_", &state));
+    // rmap-3nf-tables (iii): instance-of-definition backfill (parity
+    // with the cli/entry.rs load stratum).
+    strat.extend(collect("derivation:_sm_instance_of_def_backfill_", &state));
     if !strat.is_empty() {
         let refs: Vec<(&str, &ast::Func)> =
             strat.iter().map(|(n, f)| (n.as_str(), f)).collect();
