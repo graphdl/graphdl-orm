@@ -135,37 +135,77 @@ Format implies Component Role.
   <!-- REFINEMENT widget. A Format overrides the base CDT widget for the
        value types that declare it. -->
 
+Candidate Specificity Rank is a value type.
+Winning Specificity Rank is a value type.
+  <!-- The specificity PRECEDENCE as a numeric rank: '1' = Format
+       (refinement, most specific), '2' = Conceptual Data Type (base).
+       Lower rank wins via the min aggregate — the SUPERLATIVE discipline
+       (procedural-code-to-substrate: "derivations stay positive
+       (superlatives)"); no negation guard, no suppression operator. -->
+
+Noun prefers Component Role. **
+Noun defaults to Component Role. **
+  <!-- Per-SOURCE widget candidates (Phase 2(b)): `prefers` = the Format
+       refinement's widget, `defaults to` = the base CDT's. Distinct FTs
+       (distinct cells) over the SAME `Component Role` value noun, so the
+       effective-resolution joins below carry the widget by the proven
+       Phase-1 name-match (a synthetic per-source value noun would break
+       the by-name binding emission on the join path). -->
+
+Noun has Candidate Specificity Rank. **
+Noun has Winning Specificity Rank. **
+  <!-- The whole candidate/rank chain is EAGER (`**`): linear per-noun
+       rows (one per Format/CDT-bearing value type — the view-detail.md
+       Fact_Type_has_Format precedent, no combinatorial blowup), and the
+       lazy effective rules below must see ALL their antecedent cells
+       materialized — resolve_view does no lazy-on-lazy chaining, so a
+       lazy input anywhere in the chain would silently empty the
+       resolution. -->
+
 Noun has effective Component Role. *
-  <!-- The RESOLVED widget for a value-type Noun: its Format's implied
-       Component Role when it declares a Format (refinement), ELSE its
-       base Conceptual Data Type's implied Component Role (base). Lazy
-       (`*`, View materialization) so the resolution never eager-folds
-       over the whole metamodel — the same discipline as the §4.2 rules. -->
+  <!-- The RESOLVED widget for a value-type Noun: most-specific source
+       wins — its Format's implied Component Role when it declares a
+       Format (refinement, rank 1), ELSE its base Conceptual Data Type's
+       implied Component Role (base, rank 2). Lazy (`*`) so the final
+       resolution never eager-folds over the whole metamodel — the same
+       discipline as the §4.2 rules. -->
 
-### Derivation Rules — effective widget resolves Format-else-CDT
+### Derivation Rules — most-specific source wins (Phase 2(b))
 
-# Modeled on the effective-Pane-Mode override/fallback idiom
-# (`readings/ui/monoview.md`: a PanePreference overrides a MonoView's
-# default Pane Mode). The REFINEMENT rule fires for value types that
-# declare a Format; the BASE rule supplies the Conceptual-Data-Type
-# default. FORML 2 negation was removed as an antecedent kind
-# (readings/core/derivation.md, 2026-05-19), so the "else" is NOT a
-# negation guard: where a value type carries both a Format and a base
-# CDT, both rules populate `Noun has effective Component Role`, and the
-# Format-sourced row is the refinement the projection/renderer prefers
-# (the same specific-wins-at-resolve-time discipline the post-negation
-# codebase uses, and the same place a PanePreference override is picked
-# over a MonoView default). A first-class suppression operator that makes
-# the base row drop automatically when a refinement exists is a Phase-2
-# need (see below).
+# Phase 1 shipped BOTH-FIRE semantics here (each source populated
+# `Noun has effective Component Role` directly; the renderer preferred
+# the Format row at read time). Phase 2(b) replaces that with modeled
+# most-specific resolution using only positive machinery:
+#
+#   1. per-source candidate rows (lazy),
+#   2. a numeric Candidate Specificity Rank per source (eager,
+#      literal-pinned: Format = '1', CDT = '2'),
+#   3. Winning Specificity Rank = the MIN candidate rank (the legacy
+#      Halpin aggregate `<V> is the min of <T> where <X> has <T>` —
+#      the superlative-as-aggregate discipline, task-953 lineage),
+#   4. effective = a positive JOIN of the per-source candidate with the
+#      winning rank, literal-pinned per source.
+#
+# A Format-bearing noun wins at rank 1 and its base-CDT row never
+# fires (rank 2 is not the winner); a CDT-only noun resolves at rank 2.
+# No suppression operator, no negation — Clark-completion OR over the
+# two effective bodies, decided by the winning-rank literal.
 
-* Noun has effective Component Role (CR)
+** Noun prefers Component Role (CR)
     if Noun has some Format
     and that Format implies Component Role (CR).
 
-* Noun has effective Component Role (CR)
+** Noun defaults to Component Role (CR)
     if Noun has some Conceptual Data Type
     and that Conceptual Data Type implies Component Role (CR).
+
+** Noun has Candidate Specificity Rank '1' iff Noun has some Format and that Format implies some Component Role.
+** Noun has Candidate Specificity Rank '2' iff Noun has some Conceptual Data Type and that Conceptual Data Type implies some Component Role.
+
+** Noun has Winning Specificity Rank iff Winning Specificity Rank is the min of Candidate Specificity Rank where Noun has Candidate Specificity Rank.
+
+* Noun has effective Component Role (CR) iff Noun prefers Component Role (CR) and Noun has Winning Specificity Rank '1'.
+* Noun has effective Component Role (CR) iff Noun defaults to Component Role (CR) and Noun has Winning Specificity Rank '2'.
 
 ## Instance Facts — seed the four legacy widget Formats (Phase 1)
 
@@ -196,3 +236,13 @@ Format 'text'    implies Component Role 'text-input'.
 Format 'date'    implies Component Role 'date-picker'.
 Format 'boolean' implies Component Role 'checkbox'.
 Format 'enum'    implies Component Role 'combo-box'.
+
+Conceptual Data Type 'text'    implies Component Role 'text-input'.
+Conceptual Data Type 'date'    implies Component Role 'date-picker'.
+Conceptual Data Type 'boolean' implies Component Role 'checkbox'.
+  <!-- Phase 2(b) gap-fix: Phase 1 declared the BASE widget FT but never
+       seeded it — the CDT branch of the resolution (and Phase 1's
+       both-fire CDT rule before it) had zero rows, so CDT-only value
+       types derived no widget at all. Seed the three base leaves the
+       Formats above are built on; further CDT leaves opt in as the
+       catalog grows. -->.

@@ -4423,6 +4423,107 @@ Merge has derived Security Posture.
         "the superlative clause must be consumed; got {:#?}", rule.unresolved_clauses);
 }
 
+// ─── audit-entity-datatype-norma-vs-view Phase 2(b) ─────────────────────────
+//
+// Most-specific source wins for the effective widget: Phase 1's both-fire
+// rules (Format row AND base-CDT row both landed in `Noun has effective
+// Component Role`; the renderer preferred Format at read time) are replaced
+// by modeled resolution over POSITIVE machinery only — per-source candidate
+// rows, a numeric Candidate Specificity Rank ('1' Format / '2' CDT), the
+// winning rank via the legacy min aggregate (superlative-as-aggregate
+// discipline), and effective = candidate ⋈ winning-rank, literal-pinned per
+// source. No suppression operator, no negation (procedural-code-to-substrate
+// corollary: derivations stay positive — superlatives).
+
+/// A value type with BOTH a Format refinement and a base CDT resolves to
+/// the Format's widget ONLY (rank 1 wins; the base row never fires); a
+/// CDT-only value type falls back to the base widget (rank 2 is its
+/// winning rank). Driven over the full metamodel corpus through the
+/// production read path: reflect → compile → eager forward chain →
+/// resolve_view on the lazy effective cell.
+#[test]
+#[cfg(not(feature = "no_std"))]
+fn effective_component_role_most_specific_source_wins() {
+    use crate::ast::resolve_view;
+
+    let corpus = crate::metamodel_corpus();
+    // `date` Format implies date-picker (refinement); CDT `text` implies
+    // text-input (base). The refined noun carries BOTH sources with
+    // DIFFERENT widgets so a both-fire regression is visible; the
+    // fallback noun carries only the CDT.
+    let fragment = "\nRefined Probe is a value type.\nThe data type of Refined Probe is text.\nNoun 'Refined Probe' has Format 'date'.\n\nFallback Probe is a value type.\nThe data type of Fallback Probe is text.\n";
+    let src = format!("{corpus}{fragment}");
+    let state = crate::parse_forml2::parse_to_state(&src).expect("corpus+fragment parses");
+
+    // Production shape: reflected schema-as-facts (Noun_has_Conceptual_
+    // Data_Type rows come from the reflection) + compiled defs + the
+    // EAGER chain (candidate + rank + winning rows are `**`).
+    let reflected = {
+        let mut map: std::collections::HashMap<String, crate::ast::Object> =
+            ast::cells_iter(&state).into_iter()
+                .map(|(n, c)| (n.to_string(), c.clone()))
+                .collect();
+        for (name, contents) in compile::reflect_schema_cells(&state) {
+            map.insert(name, contents);
+        }
+        Object::Map(map.into_iter()
+            .collect::<hashbrown::HashMap<_, _>>().into())
+    };
+    let defs = compile::compile_to_defs_state(&reflected);
+    let d = ast::defs_to_state(&defs, &reflected);
+    let stratum: Vec<(&str, &Func)> = defs.iter()
+        .filter(|(n, _)| n.starts_with("derivation:"))
+        .map(|(n, f)| (n.as_str(), f))
+        .collect();
+    let (chained, _) = crate::evaluate::forward_chain_defs_state(&stratum, &d);
+
+    // The eager rank chain materialized: Refined Probe carries ranks 1+2,
+    // its winning rank is 1; Fallback Probe carries only rank 2.
+    let winning = ast::fetch_cell_seq("Noun_has_Winning_Specificity_Rank", &chained);
+    let rank_of = |noun: &str| -> Option<String> {
+        winning.as_seq().and_then(|rows| rows.iter().find_map(|f| {
+            (ast::binding(f, "Noun") == Some(noun))
+                .then(|| ast::binding(f, "Winning Specificity Rank").map(String::from))
+                .flatten()
+        }))
+    };
+    assert_eq!(rank_of("Refined Probe").as_deref(), Some("1"),
+        "Format-bearing noun's winning rank must be 1 (most specific); cell: {:?}",
+        winning);
+    assert_eq!(rank_of("Fallback Probe").as_deref(), Some("2"),
+        "CDT-only noun's winning rank must be 2 (base); cell: {:?}", winning);
+
+    // The eager per-source candidate rows materialized (the lazy
+    // effective join below reads them — no lazy-on-lazy).
+    let fmt_candidates = ast::fetch_cell_seq("Noun_prefers_Component_Role", &chained);
+    assert!(fmt_candidates.as_seq().map(|r| r.iter().any(|f|
+            ast::binding(f, "Noun") == Some("Refined Probe"))).unwrap_or(false),
+        "Refined Probe must carry an eager Format-refinement candidate row; cell: {:?}",
+        fmt_candidates);
+
+    // The lazy effective resolution: exactly ONE row per noun, sourced by
+    // its winning rank — the both-fire regression would show two rows
+    // with different widgets for Refined Probe.
+    let effective = resolve_view("Noun_has_effective_Component_Role", &chained, &chained)
+        .expect("effective Component Role view: def must resolve");
+    let widgets_of = |noun: &str| -> Vec<String> {
+        effective.as_seq().map(|rows| rows.iter().filter_map(|f| {
+            (ast::binding(f, "Noun") == Some(noun))
+                .then(|| ast::binding(f, "effective Component Role")
+                    .or_else(|| ast::binding(f, "Component Role"))
+                    .map(String::from))
+                .flatten()
+        }).collect()).unwrap_or_default()
+    };
+    assert_eq!(widgets_of("Refined Probe"), vec!["date-picker".to_string()],
+        "the Format refinement (date → date-picker) must be the ONLY effective \
+         widget — the base CDT text-input row must NOT fire (most-specific wins); \
+         got {:?}", widgets_of("Refined Probe"));
+    assert_eq!(widgets_of("Fallback Probe"), vec!["text-input".to_string()],
+        "the CDT-only noun must fall back to the base widget; got {:?}",
+        widgets_of("Fallback Probe"));
+}
+
 // ─── task-953 — enum-declaration-order superlative comparators ────────────
 //
 // A superlative (`highest`/`lowest`) `… among …` over an ENUM-valued noun
