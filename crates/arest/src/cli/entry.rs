@@ -104,12 +104,23 @@ mod db {
         // pass below then only creates NON-plan tables (its CREATE ...
         // IF NOT EXISTS no-ops on plan-covered names) and the triggers
         // attach last, after every table exists.
-        let plan_tables = crate::rmap::rmap_from_state(d);
-        for t in &plan_tables {
+        // Children-first DROP / parents-first CREATE: with SQLite FK
+        // enforcement on, dropping a parent that still has populated
+        // referencing children fails — an unsorted drop pass stranded
+        // OLD-shaped tables (live hit: noun kept its pre-dedup
+        // has_object_type shape, every new-shape insert failed
+        // "no column named object_type", cascading through resource /
+        // role). The projection plan's Kahn order gives both
+        // directions.
+        let plan = crate::rmap::projection_plan(d);
+        let plan_by_name: hashbrown::HashMap<&str, &crate::rmap::TableDef> =
+            plan.tables.iter().map(|t| (t.name.as_str(), t)).collect();
+        for name in plan.order.iter().rev() {
             let _ = conn.execute_batch(
-                &format!("DROP TABLE IF EXISTS {};", crate::rmap::qid(&t.name)));
+                &format!("DROP TABLE IF EXISTS {};", crate::rmap::qid(name)));
         }
-        for t in &plan_tables {
+        for name in &plan.order {
+            let Some(t) = plan_by_name.get(name.as_str()) else { continue };
             conn.execute_batch(&crate::rmap::create_table_sql(t)).unwrap_or_else(|e| {
                 eprintln!("Warning: plan DDL failed for {}: {}", t.name, e);
             });

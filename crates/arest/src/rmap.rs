@@ -516,6 +516,19 @@ pub fn rmap(state: &crate::ast::Object) -> Vec<TableDef> {
     ) = constraints.iter().fold(
         (HashMap::new(), HashSet::new(), HashMap::new()),
         |(mut ucs, mut mc, mut vcs), c| {
+            // rmap-3nf-tables Stage 3: only ALETHIC constraints shape
+            // the relational schema. A deontic UC/MC is advisory
+            // ("ought", violations possible) — letting it mint PKs /
+            // NOT NULLs was the material_* family: deontic
+            // `It is obligatory that each Material Spacing Token has
+            // some Dp …` lines made dp columns NOT NULL and every
+            // token row warn-skipped. Modality is the policy (user
+            // ruling): deontic never rejects, so it never constrains
+            // DDL either. EMPTY modality = alethic (the historic
+            // default — synth / hand-built ConstraintDefs omit it).
+            if !(c.modality.is_empty() || c.modality.eq_ignore_ascii_case("alethic")) {
+                return (ucs, mc, vcs);
+            }
             match c.kind.as_str() {
                 "UC" => {
                     c.spans.iter().for_each(|span| { ucs.entry(span.fact_type_id.clone()).or_default(); });

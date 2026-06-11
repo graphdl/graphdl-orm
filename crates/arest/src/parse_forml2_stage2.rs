@@ -2902,9 +2902,59 @@ fn enrich_constraints_with_spans(
         }
 
         let resolved = resolve_constraint_span_ft(text, &roles_by_ft, &readings_by_ft, &declared_nouns);
-        // Preference 2: fall back to entity-based first-match.
+        // Preference 2: fall back to entity-based first-match — DENIED
+        // for the rmap-structural kinds (rmap-3nf-tables Stage 3).
+        // Every live span mis-attachment traced to this fallback
+        // arbitrarily picking "the first FT with a role of the
+        // constrained entity": the disjunctive Status MC landed on
+        // Verb_is_performed_in_Status (status.verb_id NOT NULL zeroed
+        // the projection family, fixed for the For-each form in
+        // 5d50da25), and `Each Noun has at most one Plural` + two
+        // deontic participation MCs + a stray synth UC all landed on
+        // Noun_has_Object_Type — THREE spurious single-role UCs whose
+        // absorptions minted the noun.has_object_type_2/_3 phantom
+        // columns. Span-less beats arbitrary (the standing ruling): a
+        // UC/MC that full resolution cannot place emits NO span and
+        // stays inert. VC/FC/ring kinds keep the fallback — a
+        // single-noun value/frequency constraint legitimately attaches
+        // via its entity's role.
         let fallback = || -> Option<(String, String)> {
+            // ALETHIC UC/MC: the entity-first-match is replaced by an
+            // ORDER-FREE tier — constraint prose often inverts the
+            // reading's role order ("Each Status has at least one Verb
+            // performed in it" vs reading "Verb is performed in
+            // Status"), which the strict-order resolver cannot see.
+            // When exactly ONE fact type matches the clause nouns as a
+            // MULTISET, the attachment is unambiguous: use it, span on
+            // the ENTITY's role. Anything else stays span-less —
+            // arbitrary first-match attachments are exactly what
+            // minted status.verb_id NOT NULL and the
+            // noun.has_object_type_2/_3 phantom columns. Deontic and
+            // VC/FC/ring kinds keep the entity fallback (their
+            // evaluators key on the entity's FT legitimately).
             let entity = binding(c, "entity")?;
+            let alethic = binding(c, "modality")
+                .map_or(true, |m| m.eq_ignore_ascii_case("alethic"));
+            if alethic && (kind == "UC" || kind == "MC") {
+                let found = constraint_clause_nouns(text, &declared_nouns);
+                if found.len() < 2 { return None; }
+                let mut want: Vec<&str> = found.iter().map(|s| s.as_str()).collect();
+                want.sort_unstable();
+                let mut ms: Vec<(&String, &Vec<(usize, String)>)> = roles_by_ft.iter()
+                    .filter(|(_, roles)| {
+                        if roles.len() != want.len() { return false; }
+                        let mut have: Vec<&str> =
+                            roles.iter().map(|(_, n)| n.as_str()).collect();
+                        have.sort_unstable();
+                        have == want
+                    })
+                    .collect();
+                ms.sort_by(|a, b| a.0.cmp(b.0));
+                if ms.len() != 1 { return None; }
+                let (ft_id, roles) = ms.into_iter().next().unwrap();
+                let pos = roles.iter().find(|(_, n)| n == entity).map(|(p, _)| *p)?;
+                return Some((ft_id.clone(), alloc::format!("{}", pos)));
+            }
             roles_by_noun.get(entity).cloned()
         };
         let (ft_id, pos) = match resolved.or_else(fallback) {
