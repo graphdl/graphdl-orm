@@ -681,7 +681,15 @@ async function localApplyResult(
 // batch wraps a Vec of these. `sender`/`signature` ride on each member
 // so per-op identity/auth still flows (the engine reads them per op).
 export function buildApplyCommandForBatch(
-  op: { operation: 'create' | 'update' | 'transition'; noun?: string; id?: string; fields?: Record<string, string>; event?: string },
+  op: {
+    operation: 'create' | 'update' | 'transition' | 'assertFact'
+    noun?: string
+    id?: string
+    fields?: Record<string, string>
+    event?: string
+    fact_type?: string
+    pairs?: Array<{ role: string; value: string }>
+  },
   ctx: { sender?: string; signature?: string },
 ): any {
   const { sender, signature } = ctx
@@ -692,6 +700,12 @@ export function buildApplyCommandForBatch(
       return { type: 'updateEntity', noun: op.noun, domain: '', entityId: op.id, fields: op.fields || {}, sender, signature }
     case 'transition':
       return { type: 'transition', noun: op.noun, entityId: op.id, event: op.event, domain: '', sender, signature }
+    // apply-pairs-arbitrary-cells: exact-tuple assertion as a batch
+    // member — same Command::AssertFact the flat fact_type+pairs path
+    // dispatches (serde camelCase factType), so n-ary / same-signature
+    // / multi-row facts ride the atomic batch alongside entity ops.
+    case 'assertFact':
+      return { type: 'assertFact', factType: op.fact_type, pairs: op.pairs || [], sender, signature }
   }
 }
 
@@ -823,7 +837,12 @@ const APP_OVERRIDE_FIELD_DESCRIPTION =
   'session\'s active app (no apps.use side effect, no .arest-active-app marker write). ' +
   'Use it when sub-agents share one MCP connection and must not clobber each other\'s ' +
   'active app. Omit to use the current active app (apps.use remains the ergonomic ' +
-  'default for single-app sessions).'
+  'default for single-app sessions). RECEIPT NOTE (context-receipt-override-scope, ' +
+  'BY DESIGN): mutating calls with an app override ride the SESSION receipt — the ' +
+  'context_receipt validates against the session\'s active app, and the override ' +
+  'does not invalidate or re-scope it (only apps.use does). The receipt attests ' +
+  '"this agent read the modeling rules", which are app-agnostic; the override is a ' +
+  'routing convenience, not a scope escalation.'
 
 function loadPrompt(name: string): string {
   try {
@@ -898,7 +917,7 @@ server.registerTool(
   'context',
   {
     description:
-      'Load AREST modeling rules + prompt manifest and mint a context_receipt token. WHEN: call FIRST in any session that will mutate state (apply / retract / compile / propose) — those verbs refuse to run without a fresh receipt. Also useful as a cheap "what does AREST consider good practice?" reference. ALTERNATIVE: orient for a one-screen "where are we" snapshot (apps + recent activity, no rules); schema for the formal model surface. GOTCHA: the receipt is scoped to the currently active app — `apps.use` invalidates the prior receipt, so re-call context after switching apps. detail=summary returns rule text + prompt digests (cheap); detail=full also inlines prompt bodies (larger). NEXT: read the returned rules / anti_patterns / how_to, then call apply / compile / propose with context_receipt set to the receipt field of this response.',
+      'Load AREST modeling rules + prompt manifest and mint a context_receipt token. WHEN: call FIRST in any session that will mutate state (apply / retract / compile / propose) — those verbs refuse to run without a fresh receipt. Also useful as a cheap "what does AREST consider good practice?" reference. ALTERNATIVE: orient for a one-screen "where are we" snapshot (apps + recent activity, no rules); schema for the formal model surface. GOTCHA: the receipt is scoped to the currently active app — `apps.use` invalidates the prior receipt, so re-call context after switching apps. Per-call `app:` OVERRIDES are different (by design): they ride the session receipt without re-scoping it — the receipt attests the agent read the (app-agnostic) modeling rules, so an override mutation does not need a receipt minted under the override app. detail=summary returns rule text + prompt digests (cheap); detail=full also inlines prompt bodies (larger). NEXT: read the returned rules / anti_patterns / how_to, then call apply / compile / propose with context_receipt set to the receipt field of this response.',
     inputSchema: {
       detail: z.enum(['summary', 'full']).optional().describe('summary returns rules and prompt digests. full also includes prompt text.'),
     },
@@ -1908,26 +1927,32 @@ server.registerTool(
       fields: z.record(z.string(), z.string()).optional().describe('Fact pairs for create/update (e.g. {"Name": "Acme", "customer": "alice"})'),
       event: z.string().optional().describe('SM event for transition (e.g. "place", "ship")'),
       ops: z.array(z.object({
-        operation: z.enum(['create', 'update', 'transition']).describe('Operation type for this collection member.'),
+        operation: z.enum(['create', 'update', 'transition', 'assertFact']).describe('Operation type for this collection member.'),
         noun: z.string().optional().describe('Entity noun type. Required for create/update; for transition the engine resolves the SM by entity id.'),
         id: z.string().optional().describe('Entity ID for this op.'),
         fields: z.record(z.string(), z.string()).optional().describe('Fact pairs for create/update.'),
         event: z.string().optional().describe('SM event for transition.'),
-      })).optional().describe('task-930 COLLECTION shape — an array of ops applied atomically as ONE request (Backus α). One derive→validate→emit pass over the combined population; an alethic violation in ANY op rolls back the WHOLE batch (D\' = D). A single op is the natural 1-element collection. When present, the flat operation/noun/id/fields/event are ignored.'),
+        fact_type: z.string().optional().describe('assertFact member: fact-type cell name (any cell — n-ary, same-signature, ring).'),
+        pairs: z.array(z.object({ role: z.string(), value: z.string() })).optional().describe('assertFact member: ordered role/value pairs (repeated role names allowed).'),
+      })).optional().describe('task-930 COLLECTION shape — an array of ops applied atomically as ONE request (Backus α). One derive→validate→emit pass over the combined population; an alethic violation in ANY op rolls back the WHOLE batch (D\' = D). A single op is the natural 1-element collection. When present, the flat operation/noun/id/fields/event are ignored. apply-pairs-arbitrary-cells: members may also be {operation:\'assertFact\', fact_type, pairs} — exact-tuple assertions (n-ary FTs, same-role-signature FTs, m:n multi-row) ride the SAME atomic batch as entity ops, so e.g. one Frame\'s 4 available Action Types land all-or-nothing.'),
       sender: z.string().optional().describe('Caller identity for authorization'),
       signature: z.string().optional().describe('HMAC-SHA256 signature'),
       fields_only_replace: z.boolean().optional().describe('Opt-out (#872) — when true, the MCP skips the merge-with-existing pre-fetch on update and sends ONLY the payload fields to the engine. Use this for the rare case the agent intentionally wants the old replace-only behavior; default (false) is safer (#868 belt-and-suspenders).'),
       force: z.boolean().optional().describe('Opt-out (#904) — when true, the MCP skips the SM-bypass guard on update and lets the call go through even if a payload field is the Status of an SM-governed noun. Use this for migration scripts or other legitimate direct-mutation cases (rare); default (false) refuses the call and points the agent at `apply transition` instead.'),
-      // task-971: same-noun ring fact assertion (e.g. "Task blocks Task").
-      // The entity-oriented paths use a MAP for fields (unique keys), so
-      // they CANNOT express a fact where the same role name appears twice
-      // (both blocker and blocked project to "Task"). Use fact_type +
-      // pairs for the ordered-tuple assertion path instead.
-      fact_type: z.string().optional().describe('task-971: Fact type cell name for a same-noun ring assertion (e.g. "Task_blocks_Task"). Use with `pairs` — not with `operation`/`noun`.'),
+      // task-971 + apply-pairs-arbitrary-cells: exact-tuple assertion
+      // into ANY fact-type cell. The entity-oriented paths use a MAP for
+      // fields (unique keys), so they cannot express: same-noun rings
+      // (role name appears twice), n-ary FTs whose role set is ambiguous
+      // against a sibling FT on the same noun, two FTs sharing a role
+      // signature (the cell NAME disambiguates), or m:n multi-row
+      // assertions. fact_type + pairs reaches all of them — the engine's
+      // assert: path appends the exact tuple and runs the full
+      // derive→validate→emit pipeline.
+      fact_type: z.string().optional().describe('Exact-tuple assertion: fact-type cell name — ANY cell, not just rings (e.g. "Task_blocks_Task", ternary "Run_took_Action_Count_on_Level", or one of two FTs sharing a role signature, where the cell name disambiguates). Use with `pairs` — not with `operation`/`noun`. For multi-row m:n assertions or mixing with entity ops atomically, use `ops` with {operation:"assertFact", fact_type, pairs} members instead.'),
       pairs: z.array(z.object({
         role: z.string(),
         value: z.string(),
-      })).optional().describe('task-971: Ordered role/value pairs for ring fact assertion. Repeated role names are allowed — required for same-noun ring facts (e.g. [{role:"Task",value:"A"},{role:"Task",value:"B"}] asserts Task A blocks Task B). Use with `fact_type`.'),
+      })).optional().describe('Ordered role/value pairs for the exact-tuple assertion. Repeated role names are allowed (same-noun rings: [{role:"Task",value:"A"},{role:"Task",value:"B"}] asserts Task A blocks Task B); n-ary tuples list every role in declared order (e.g. Run/Action Count/Level). Use with `fact_type`.'),
       app: z.string().optional().describe(APP_OVERRIDE_FIELD_DESCRIPTION),
     },
   },

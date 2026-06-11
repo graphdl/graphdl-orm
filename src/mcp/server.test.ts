@@ -456,6 +456,48 @@ describe('AREST MCP Server', () => {
       const json = JSON.parse(JSON.stringify(batch))
       expect(json.commands[0].type).toBe('createEntity')
     })
+
+    // apply-pairs-arbitrary-cells (arc-agi-3 issue 5): assertFact as a
+    // batch member — exact-tuple assertions (n-ary FTs, same-signature
+    // FTs, m:n multi-row) ride the SAME atomic batch as entity ops.
+    // The engine's apply_command_batch dispatches every member through
+    // apply_command_defs, which handles Command::AssertFact (serde
+    // camelCase factType, same as the flat remote path).
+    it('buildApplyCommandForBatch maps assertFact members to Command::AssertFact', () => {
+      const af = buildApplyCommandForBatch(
+        {
+          operation: 'assertFact',
+          fact_type: 'Frame_makes_available_Action_Type',
+          pairs: [
+            { role: 'Frame', value: 'f1' },
+            { role: 'Action Type', value: 'ACTION1' },
+          ],
+        },
+        { sender: 'agent@example.com', signature: undefined },
+      )
+      expect(af).toMatchObject({
+        type: 'assertFact',
+        factType: 'Frame_makes_available_Action_Type',
+        pairs: [
+          { role: 'Frame', value: 'f1' },
+          { role: 'Action Type', value: 'ACTION1' },
+        ],
+        sender: 'agent@example.com',
+      })
+    })
+
+    it('assertFact members mix with entity ops in one batch JSON', () => {
+      const ops = [
+        { operation: 'create' as const, noun: 'Frame', id: 'f1', fields: { Name: 'first' } },
+        { operation: 'assertFact' as const, fact_type: 'Frame_makes_available_Action_Type', pairs: [{ role: 'Frame', value: 'f1' }, { role: 'Action Type', value: 'A1' }] },
+        { operation: 'assertFact' as const, fact_type: 'Frame_makes_available_Action_Type', pairs: [{ role: 'Frame', value: 'f1' }, { role: 'Action Type', value: 'A2' }] },
+      ]
+      const batch = { type: 'batch', commands: ops.map(o => buildApplyCommandForBatch(o, {})) }
+      const json = JSON.parse(JSON.stringify(batch))
+      expect(json.commands.map((c: { type: string }) => c.type))
+        .toEqual(['createEntity', 'assertFact', 'assertFact'])
+      expect(json.commands[1].factType).toBe('Frame_makes_available_Action_Type')
+    })
   })
 })
 
