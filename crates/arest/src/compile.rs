@@ -3626,6 +3626,75 @@ pub fn compile_to_defs_state(state: &crate::ast::Object) -> Vec<(String, Func)> 
         }
     }
 
+    // task-984 (vc-modality-on-derived-paths): emit `_CellValueConstraints`
+    // — one entry per (fact type, role) carrying a value constraint, so
+    // the forward-chain emit path can enforce VCs on DERIVED rows. The
+    // user ruling (arc-agi-3 issue 3): the constraint's MODALITY is the
+    // policy — alethic VC → violating derived/loaded rows are rejected
+    // (never emitted) with a loud diagnostic; deontic VC → rows land and
+    // a warning is recorded. Apply-time validate already enforces this;
+    // pre-984 the derive/load chain skipped VCs entirely (arc's leak:
+    // derived 'open'/'closed' rows in an enum-constrained Game State).
+    //
+    // Entry shape: `<<ftId, X>, <role, Name>, <values, v1␟v2…>,
+    // <modality, alethic|deontic>>`. Values are US-separated (\x1f) —
+    // enum values may legally contain commas. Allowed values resolve
+    // from the VC's entity noun's absorbed `enumValues` (the same
+    // source rmap's CHECK fold reads); VCs whose entity carries no
+    // enum list emit nothing (nothing to enforce).
+    {
+        use crate::ast::binding;
+        let noun_cell = crate::ast::fetch_or_phi("Noun", state);
+        let enum_values: HashMap<String, Vec<String>> =
+            crate::ast::cell_facts_iter(&noun_cell)
+                .filter_map(|f| Some((
+                    binding(f, "name")?.to_string(),
+                    binding(f, "enumValues")?.split(',').map(|s| s.to_string()).collect())))
+                .collect();
+        let constraint_cell = crate::ast::fetch_or_phi("Constraint", state);
+        let mut entries: Vec<crate::ast::Object> = Vec::new();
+        for f in crate::ast::cell_facts_iter(&constraint_cell) {
+            if binding(f, "kind") != Some("VC") { continue; }
+            let modality = match binding(f, "modality").unwrap_or("") {
+                m if m.is_empty() || m.eq_ignore_ascii_case("alethic") => "alethic",
+                _ => "deontic",
+            };
+            let Some(vals) = binding(f, "entity").and_then(|e| enum_values.get(e)) else { continue };
+            if vals.is_empty() { continue; }
+            let joined = vals.join("\u{1f}");
+            let get = |key: &str| binding(f, key).map(|s| s.to_string());
+            for span in decode_constraint_spans(&get) {
+                let Some(role_name) = model.schemas.get(&span.fact_type_id)
+                    .and_then(|s| s.role_names.get(span.role_index))
+                else { continue };
+                entries.push(crate::ast::Object::seq(vec![
+                    crate::ast::Object::seq(vec![
+                        crate::ast::Object::atom("ftId"),
+                        crate::ast::Object::atom(&span.fact_type_id),
+                    ]),
+                    crate::ast::Object::seq(vec![
+                        crate::ast::Object::atom("role"),
+                        crate::ast::Object::atom(role_name),
+                    ]),
+                    crate::ast::Object::seq(vec![
+                        crate::ast::Object::atom("values"),
+                        crate::ast::Object::atom(&joined),
+                    ]),
+                    crate::ast::Object::seq(vec![
+                        crate::ast::Object::atom("modality"),
+                        crate::ast::Object::atom(modality),
+                    ]),
+                ]));
+            }
+        }
+        if !entries.is_empty() {
+            defs.push((
+                "_CellValueConstraints".to_string(),
+                Func::constant(crate::ast::Object::Seq(entries.into())),
+            ));
+        }
+    }
+
     // upsert-safe-propagation: emit `_UpsertSafeCells` — the keyed cells
     // whose forward-chain writes UPSERT (last-write-wins) instead of
     // conflict-rejecting. Replaces the hand-maintained

@@ -299,6 +299,94 @@ pub(crate) fn read_cell_key_roles(d: &ast::Object) -> hashbrown::HashMap<String,
     out
 }
 
+/// task-984 (vc-modality-on-derived-paths): one value-constraint row
+/// from the `_CellValueConstraints` metadata cell — the role it pins,
+/// the allowed value set, and whether the constraint is alethic
+/// (violations reject the derived row) or deontic (violations land
+/// with a recorded warning). Modality IS the policy (user ruling,
+/// arc-agi-3 issue 3) — no separate strictness knob.
+pub(crate) struct CellValueConstraint {
+    pub(crate) role: String,
+    pub(crate) values: hashbrown::HashSet<String>,
+    pub(crate) alethic: bool,
+}
+
+/// Read the `_CellValueConstraints` metadata cell (emitted by
+/// `compile_to_defs_state`) into a `ft_id → [CellValueConstraint]`
+/// map. Same `<atom("'"), seq>` wrapper-unwrap as
+/// `read_cell_key_roles`; each entry is a named-tuple
+/// `<<ftId, X>, <role, Name>, <values, v1␟v2…>, <modality, …>>`
+/// (values US-separated — enum values may legally contain commas).
+pub(crate) fn read_cell_value_constraints(
+    d: &ast::Object,
+) -> hashbrown::HashMap<String, Vec<CellValueConstraint>> {
+    use hashbrown::HashMap;
+    let cell = ast::fetch_or_phi("_CellValueConstraints", d);
+    let entries: Vec<ast::Object> = cell.as_seq()
+        .and_then(|items| {
+            if items.len() == 2 && items[0].as_atom() == Some("'") {
+                items[1].as_seq().map(|s| s.to_vec())
+            } else {
+                Some(items.to_vec())
+            }
+        })
+        .unwrap_or_default();
+    let mut out: HashMap<String, Vec<CellValueConstraint>> = HashMap::new();
+    for fact in entries.iter() {
+        let Some(ft_id) = ast::binding(fact, "ftId") else { continue };
+        let Some(role) = ast::binding(fact, "role") else { continue };
+        let Some(values_joined) = ast::binding(fact, "values") else { continue };
+        let values: hashbrown::HashSet<String> = values_joined.split('\u{1f}')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        if values.is_empty() { continue; }
+        let alethic = ast::binding(fact, "modality") != Some("deontic");
+        out.entry(ft_id.to_string()).or_default().push(CellValueConstraint {
+            role: role.to_string(), values, alethic,
+        });
+    }
+    out
+}
+
+/// task-984: enforce value constraints on a batch of derived-fact
+/// candidates — the chain-side counterpart of apply-time validate.
+/// Alethic violation → the row is DROPPED (never emitted) with a loud
+/// diagnostic; deontic violation → the row is kept and a warning line
+/// is recorded. Returns the surviving candidates. Called from
+/// `derive_one_round_with_keys`, the chokepoint every forward-chain
+/// variant (eager, seeded, bounded, semi-naive) funnels through, so
+/// apply-, derive- and load-path emissions are all covered.
+fn enforce_value_constraints_on_candidates(
+    candidates: Vec<DerivedFact>,
+    vcs: &hashbrown::HashMap<String, Vec<CellValueConstraint>>,
+) -> Vec<DerivedFact> {
+    if vcs.is_empty() { return candidates; }
+    candidates.into_iter()
+        .filter(|cand| {
+            let Some(constraints) = vcs.get(&cand.fact_type_id) else { return true };
+            for vc in constraints {
+                let Some((_, v)) = cand.bindings.iter().find(|(r, _)| r == &vc.role)
+                else { continue };
+                if vc.values.contains(v) { continue; }
+                if vc.alethic {
+                    crate::diag!(
+                        "[chain] alethic value constraint rejected derived row: \
+                         {} {}='{}' not in the declared value set",
+                        cand.fact_type_id, vc.role, v);
+                    return false;
+                }
+                crate::diag!(
+                    "[chain deontic warning] derived row violates value \
+                     constraint: {} {}='{}' not in the declared value set \
+                     (row lands; deontic = warn)",
+                    cand.fact_type_id, vc.role, v);
+            }
+            true
+        })
+        .collect()
+}
+
 /// Integrate one round's `(cell_name → facts)` batch into `state`,
 /// routing each cell write through `cell_put_keyed` when `key_roles`
 /// names that cell as a Map-backed (alethic-UC-keyed) cell, and through
@@ -485,6 +573,13 @@ fn derive_one_round_with_keys(
                 .collect::<Vec<_>>()
         })
         .collect();
+    // task-984: enforce value constraints on the candidate batch —
+    // alethic violations drop here (never emitted), deontic violations
+    // land with a recorded warning. The map build is a linear scan of
+    // the small `_CellValueConstraints` metadata cell, comparable to
+    // the per-round `derived_keys` rebuild above.
+    let candidates = enforce_value_constraints_on_candidates(
+        candidates, &read_cell_value_constraints(d));
     if trace { crate::diag!("    [rnd] apply {} defs: {:?} ({} candidates)",
         derivation_defs.len(), t_ap.elapsed(), candidates.len()); }
     let t_dd = crate::time_shim::Instant::now();
@@ -2623,6 +2718,105 @@ mod tests {
     }
 
     /// TDD #5 (global UC unchanged at the forward-chain layer): a NON-SM
+    /// task-984 unit: the modality split at the candidate chokepoint.
+    /// Alethic VC violation → candidate dropped; deontic VC violation →
+    /// candidate kept (the warning rides the diagnostic stream);
+    /// in-set values pass under both modalities; unconstrained roles
+    /// and unconstrained fact types are untouched.
+    #[test]
+    fn value_constraint_candidates_alethic_drops_deontic_keeps() {
+        let cand = |ft: &str, v: &str| DerivedFact {
+            fact_type_id: ft.to_string(),
+            reading: String::new(),
+            bindings: vec![("Run".to_string(), "r1".to_string()),
+                           ("Game State".to_string(), v.to_string())],
+            derived_by: "test".to_string(),
+            confidence: Confidence::Definitive,
+        };
+        let vc = |alethic: bool| {
+            let mut m: hashbrown::HashMap<String, Vec<CellValueConstraint>> =
+                hashbrown::HashMap::new();
+            m.insert("Run_has_Game_State".to_string(), vec![CellValueConstraint {
+                role: "Game State".to_string(),
+                values: ["WIN".to_string(), "GAME_OVER".to_string()].into_iter().collect(),
+                alethic,
+            }]);
+            m
+        };
+
+        // Alethic: 'open' drops, 'WIN' passes.
+        let out = enforce_value_constraints_on_candidates(
+            vec![cand("Run_has_Game_State", "open"), cand("Run_has_Game_State", "WIN")],
+            &vc(true));
+        let vals: Vec<&str> = out.iter()
+            .filter_map(|c| c.bindings.iter().find(|(r, _)| r == "Game State"))
+            .map(|(_, v)| v.as_str()).collect();
+        assert_eq!(vals, vec!["WIN"],
+            "alethic VC must reject the out-of-set derived row; got {vals:?}");
+
+        // Deontic: 'open' LANDS (warn-only).
+        let out = enforce_value_constraints_on_candidates(
+            vec![cand("Run_has_Game_State", "open")], &vc(false));
+        assert_eq!(out.len(), 1,
+            "deontic VC must keep the violating row (modality is the policy)");
+
+        // Unconstrained FT: untouched.
+        let out = enforce_value_constraints_on_candidates(
+            vec![cand("Run_has_Raw_State", "open")], &vc(true));
+        assert_eq!(out.len(), 1, "unconstrained fact types pass through");
+    }
+
+    /// task-984 e2e (arc-agi-3 issue 3's exact shape): `The possible
+    /// values of Game State are 'WIN', 'GAME_OVER'.` declares an
+    /// (alethic-default) VC; a bridge derivation copies Raw State into
+    /// Game State; the out-of-set 'open' row must be REJECTED by the
+    /// chain while the in-set 'WIN' row derives. Pre-984 both landed
+    /// silently — VCs bound at apply time only.
+    #[test]
+    fn alethic_value_constraint_rejects_out_of_set_derived_rows_end_to_end() {
+        const READINGS: &str = "Run(.id) is an entity type.\n\
+            Game State is a value type.\n\
+            Raw State is a value type.\n\
+            The possible values of Game State are 'WIN', 'GAME_OVER'.\n\
+            ## Fact Types\n\
+            Run has Game State.\n\
+            Run has Raw State.\n\
+            ## Derivation Rules\n\
+            * Run has Game State iff Run has Raw State and Game State is Raw State.\n";
+        let state = crate::parse_forml2::parse_to_state(READINGS).expect("parse");
+        let state = ast::cell_push("Run_has_Raw_State",
+            ast::fact_from_pairs(&[("Run", "r1"), ("Raw State", "open")]), &state);
+        let state = ast::cell_push("Run_has_Raw_State",
+            ast::fact_from_pairs(&[("Run", "r2"), ("Raw State", "WIN")]), &state);
+        let defs = crate::compile::compile_to_defs_state(&state);
+        let d = ast::defs_to_state(&defs, &state);
+
+        // Sanity: the sidecar must register the constraint (else this
+        // test proves nothing about the chain).
+        let vcs = read_cell_value_constraints(&d);
+        let registered = vcs.get("Run_has_Game_State")
+            .and_then(|v| v.first());
+        assert!(registered.map(|c| c.alethic && c.values.contains("WIN")).unwrap_or(false),
+            "fixture must register an alethic VC on Run_has_Game_State; got {:?}",
+            vcs.keys().collect::<Vec<_>>());
+
+        let dd: Vec<(&str, &ast::Func)> = defs.iter()
+            .filter(|(n, _)| n.starts_with("derivation:"))
+            .map(|(n, f)| (n.as_str(), f))
+            .collect();
+        let (new_d, derived) = forward_chain_defs_state(&dd, &d);
+        let cell = ast::fetch_or_phi("Run_has_Game_State", &new_d);
+        let states: Vec<(String, String)> = ast::cell_facts_iter(&cell)
+            .filter_map(|f| Some((
+                ast::binding(f, "Run")?.to_string(),
+                ast::binding(f, "Game State")?.to_string())))
+            .collect();
+        assert!(states.contains(&("r2".to_string(), "WIN".to_string())),
+            "in-set derived row must land; got {states:?} (derived: {derived:?})");
+        assert!(!states.iter().any(|(_, v)| v == "open"),
+            "out-of-set derived row must be rejected by the alethic VC; got {states:?}");
+    }
+
     /// empty-consequent-cell-mint (arc-agi-3 forensics): a rule whose
     /// func emits derived items with an EMPTY fact-type id (consequent
     /// never resolved — the core corpus carries ~39 such skeleton
