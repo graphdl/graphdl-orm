@@ -138,6 +138,7 @@ pub fn check_readings_func() -> Func {
             layer_native(check_ring_completeness),
             layer_native(check_atom_ids),
             layer_native(check_ambiguous_domain_references),
+            layer_native(check_computed_bindings_in_multi_antecedent_rules),
         ]),
     )
 }
@@ -696,6 +697,67 @@ fn check_ambiguous_domain_references(state: &Object) -> Vec<ReadingDiagnostic> {
     }).collect()
 }
 
+/// Layer 7: computed bindings in multi-antecedent rules
+/// (computed-binding-join-silent-empty, arc-agi-3 issue 2).
+///
+/// Identity/arith computed bindings (`Run is Resource`) are consumed
+/// ONLY by the single-antecedent ModusPonens compile branch — the
+/// multi-antecedent paths (subscript join, existence-AND) never
+/// consult `consequent_computed_bindings`, so the head role never
+/// binds and the derived cell is silently EMPTY while the compile
+/// reports ok. The worst failure mode for an author: a type-guard
+/// antecedent added to a working bridge kills it without a sound.
+///
+/// Until the join paths learn computed bindings, surface the shape
+/// LOUDLY as a Resolve warning with the blessed decomposition: keep
+/// the 1-antecedent bridge (identity renames are now TYPED — the
+/// membership guard restricts to the head noun's population, so the
+/// guard antecedent that motivated the multi-antecedent form is no
+/// longer needed for typing) and move any remaining condition into a
+/// downstream positive join over the bridged cell.
+///
+/// Warning, not Error: an Error-level Resolve diagnostic is alethic
+/// to `validate_loaded_state` and would REJECT existing apps that
+/// carry the (already-inert) shape on their next recompile. The
+/// complaint this answers is the SILENCE, not the load.
+fn check_computed_bindings_in_multi_antecedent_rules(state: &Object) -> Vec<ReadingDiagnostic> {
+    let data = crate::compile::cell_index_from_state(state);
+    data.derivation_rules.iter()
+        .filter(|rule| !rule.consequent_computed_bindings.is_empty())
+        .filter(|rule| {
+            // Count REAL fact-type antecedents; InstancesOfNoun
+            // sentinels (subtype lifts) don't make a rule a join.
+            let ft_antecedents = rule.antecedent_sources.iter()
+                .filter(|s| !s.fact_type_id().is_empty())
+                .count();
+            ft_antecedents >= 2
+        })
+        .map(|rule| {
+            let renames = rule.consequent_computed_bindings.iter()
+                .map(|cb| format!("`{}`", cb.role))
+                .collect::<Vec<_>>()
+                .join(", ");
+            ReadingDiagnostic {
+                line: 0,
+                reading: rule.text.clone(),
+                level: Level::Warning,
+                source: Source::Resolve,
+                message: format!(
+                    "computed bindings ({renames}) in a multi-antecedent rule are NOT \
+                     evaluated — the join paths never consult them, so this rule derives \
+                     an EMPTY cell despite compiling clean",
+                ),
+                suggestion: Some(
+                    "split the rule: keep the single-antecedent bridge (identity renames \
+                     are typed — emitted facts are restricted to the head noun's \
+                     population), then express the extra condition as a separate positive \
+                     rule joining over the bridged cell".to_string(),
+                ),
+            }
+        })
+        .collect()
+}
+
 /// Render the `<domain>.<Noun>` qualifier choices as a natural English
 /// list with `or` before the final item. `domains` is assumed sorted +
 /// deduped by the caller.
@@ -721,6 +783,84 @@ mod tests {
         let input = "Order(.Order Id) is an entity type.\n## Fact Types\nOrder has Amount.\n## Instance Facts\nOrder 'ord-1' has Amount '100'.";
         let diags = check_readings(input);
         assert!(diags.is_empty(), "expected no diagnostics, got {:?}", diags);
+    }
+
+    // ── computed-binding-join-silent-empty (arc-agi-3 issue 2) ──────
+
+    /// The footgun shape: computed bindings + a second antecedent.
+    /// The join paths never consult the bindings, so the rule derives
+    /// an empty cell — the checker must say so LOUDLY.
+    #[test]
+    fn computed_bindings_in_multi_antecedent_rule_warn() {
+        let input = r#"# Test
+Resource(.Reference) is an entity type.
+Reference is a value type.
+Status is a value type.
+Run(.id) is an entity type.
+id is a value type.
+Game is a value type.
+Game State is a value type.
+
+## Fact Types
+Resource is currently in Status.
+Run plays Game.
+Run has Game State.
+
+## Derivation Rules
+* Run has Game State iff that Resource is currently in some Status and Game State is Status and Run is Resource and the Run plays some Game.
+"#;
+        let diags = check_readings(input);
+        let hits: Vec<&ReadingDiagnostic> = diags.iter()
+            .filter(|d| d.message.contains("multi-antecedent rule are NOT"))
+            .collect();
+        assert_eq!(hits.len(), 1,
+            "the computed-binding + join shape must surface exactly one warning; got {:?}",
+            diags);
+        assert_eq!(hits[0].level, Level::Warning);
+        assert_eq!(hits[0].source, Source::Resolve);
+        assert!(hits[0].message.contains("`Run`") && hits[0].message.contains("`Game State`"),
+            "the warning names the dead renames; got {}", hits[0].message);
+        assert!(hits[0].suggestion.as_deref().unwrap_or("").contains("single-antecedent bridge"),
+            "the suggestion names the blessed decomposition; got {:?}", hits[0].suggestion);
+    }
+
+    /// The blessed 1-antecedent bridge stays silent — computed
+    /// bindings there ARE evaluated (the ModusPonens branch).
+    #[test]
+    fn computed_bindings_in_single_antecedent_bridge_do_not_warn() {
+        let input = r#"# Test
+Resource(.Reference) is an entity type.
+Reference is a value type.
+Status is a value type.
+Task(.id) is an entity type.
+id is a value type.
+Task Status is a value type.
+
+## Fact Types
+Resource is currently in Status.
+Task has Task Status.
+
+## Derivation Rules
+* Task has Task Status iff that Resource is currently in some Status and Task Status is Status and Task is Resource.
+"#;
+        let diags = check_readings(input);
+        assert!(diags.iter().all(|d| !d.message.contains("multi-antecedent rule are NOT")),
+            "the single-antecedent bridge is the supported shape — no warning; got {:?}",
+            diags);
+    }
+
+    /// The bundled metamodel must be free of the shape — otherwise
+    /// every app load would warn on framework readings.
+    #[test]
+    #[cfg(not(feature = "no_std"))]
+    fn bundled_metamodel_has_no_dead_computed_binding_rules() {
+        let corpus = crate::metamodel_corpus();
+        let state = parse_to_state(&corpus).expect("metamodel corpus parses");
+        let diags = check_computed_bindings_in_multi_antecedent_rules(&state);
+        assert!(diags.is_empty(),
+            "bundled metamodel readings must not carry computed bindings in \
+             multi-antecedent rules; got {:#?}",
+            diags.iter().map(|d| &d.reading).collect::<Vec<_>>());
     }
 
     #[test]
@@ -1216,19 +1356,21 @@ Customer wrote Review.
     #[test]
     fn check_readings_func_top_level_is_concat_of_construction() {
         // Structural assertion — the top-level Func must remain
-        // Concat ∘ Construction([…]) with exactly 5 layers. This is
+        // Concat ∘ Construction([…]) with exactly 7 layers. This is
         // the paper-aligned shape (Backus Concat + Construction).
         // MC4b (#751) dropped the singular-naming layer; the
         // equivalent diagnostic now flows from the deontic constraint
         // path into the violations stream.
+        // computed-binding-join-silent-empty added layer 7 (computed
+        // bindings in multi-antecedent rules warn loudly).
         let func = check_readings_func();
         match &func {
             Func::Compose(outer, inner) => {
                 assert!(matches!(**outer, Func::Concat),
                     "top-level must compose Concat onto the construction");
                 match &**inner {
-                    Func::Construction(layers) => assert_eq!(layers.len(), 6,
-                        "check_readings_func must expose exactly 6 layer Funcs"),
+                    Func::Construction(layers) => assert_eq!(layers.len(), 7,
+                        "check_readings_func must expose exactly 7 layer Funcs"),
                     other => panic!("inner must be Construction, got {:?}", other),
                 }
             }
